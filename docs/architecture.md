@@ -120,29 +120,46 @@ only that function.
 Decided (2026-11-02): a Go-style content-addressed cache at declaration
 granularity.
 
-- **Unit cache key** = hash(zap version, target and options, the unit's ZIR
-  bytes made position-independent, the stable hashes of its inputs).
+- **Unit cache key** = hash(zap version, target and options, the unit's
+  stable key, its declaration's `src_hash`, and for instantiations the stable
+  hashes of its comptime arguments).
 - **Entry** = the unit's result (serialized canonically, referencing other
   items by stable hash) plus the list of dependencies with the result hash
   each had when the entry was made.
-- **Validation** is red-green: a unit whose ZIR is unchanged is green if every
-  recorded dependency is still green with the same result hash; otherwise it
-  is re-analyzed, and if its new result hash equals the old one its dependents
-  stay green (early cutoff).
-- Entries live in a global cache directory shared across projects, so std's
-  functions compiled for one project are cache hits for the next one, the way
-  Go reuses compiled std packages. A small per-project manifest lists the
-  units the last build used, so a warm build starts validation without
-  re-deriving the reachable set.
+- **Change detection.** AstGen already computes a 128-bit hash per
+  declaration from its source bytes and starting column, independent of its
+  line (`Zir.Inst.Declaration.src_hash`; `fields_hash` for container fields).
+  That is each unit's own-code hash; zap does not hash ZIR itself.
+- **Edit-rebuilds are push-based.** A per-project manifest, one mmap-able
+  file, holds last build's units, their result hashes, and the dependency
+  graph with reverse edges. A rebuild stats the input files, re-lowers only
+  the changed ones, compares their declarations' `src_hash` with the
+  manifest to find changed units, and walks reverse edges from those alone.
+  A re-analyzed unit whose result hash is unchanged stops the walk (early
+  cutoff). The cost is proportional to the edit, not to the program; a
+  rebuild with no edit costs the stats and the manifest load.
+- **The global store is pull-based.** Entries live in a global cache
+  directory shared across projects, so std's functions compiled for one
+  project are hits for the next, the way Go reuses compiled std packages.
+  With no manifest (a project's first build), Sema looks up each unit it
+  reaches; an entry is valid if its `src_hash` matches and each recorded
+  dependency still has the recorded result hash (red-green). That build pays
+  per reached unit, which is acceptable because it would otherwise analyze
+  them all.
 - InternPool contents are rebuilt lazily on a warm build: only units that
   must be re-analyzed load the types and values they reference.
 
 What the cache must get right, or edit-rebuilds will not be Go-class:
 
-- **Validation cost.** Go validates per package; zap validates per
-  declaration, which means tens of thousands of entries for std plus a real
-  project. Entries are stored packed (a few large files, read with mmap), not
-  one file per unit, and validating an unchanged unit is a hash comparison.
+- **Validation cost.** Go re-checks hundreds of packages per build; checking
+  tens of thousands of declarations the same way would put a floor of tens of
+  milliseconds under every rebuild, which is why edit-rebuilds walk from the
+  edit instead. Entries are stored packed (a few large files, read with
+  mmap), not one file per unit. Target: a no-edit rebuild of the libvaxis
+  example in under 10 ms beyond process start.
+- **Namespace-level dependencies.** Adding or removing a declaration must
+  invalidate the units that looked that name up or reflected over the whole
+  namespace (`@typeInfo(T).decls`), and no others.
 - **Fine-grained dependencies.** Comptime reflection must record exactly what
   it observed: `@hasDecl(root, "x")` depends on whether `root` has `x`, not
   on all of `root`'s declarations; `root.std_options` depends on that value.
