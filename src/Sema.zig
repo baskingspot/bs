@@ -6747,8 +6747,14 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const param_types = try sema.arena.alloc(Index, params.len);
     for (params, param_types, 0..) |p, *t, k| {
         t.* = p.ty;
-        if (p.is_comptime) comptime_bits |= @as(u32, 1) << @intCast(k);
-        if (p.is_comptime or p.ty == .generic_poison_type) is_generic = true;
+        // Parameters of comptime-only types are implicitly comptime.
+        const is_comptime = p.is_comptime or (p.ty != .generic_poison_type and Type.isComptimeOnly(ip, p.ty));
+        if (is_comptime) {
+            // Like upstream, only the first 32 parameters can be comptime.
+            if (k >= 32) return sema.fail(block, src, "zap does not support comptime parameters after the 32nd", .{});
+            comptime_bits |= @as(u32, 1) << @intCast(k);
+        }
+        if (is_comptime or p.ty == .generic_poison_type) is_generic = true;
     }
     const fn_ty = try sema.intern(.{ .func_type = .{
         .param_types = param_types,
@@ -7187,7 +7193,8 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) 
         break :blk try sema.calleeRetTy(&callee_block, src, func);
     };
     for (args, comptime_args, 0..) |a, *ca, k| {
-        if ((generic_ty.comptime_bits >> @intCast(k)) & 1 != 0) {
+        // An `anytype` argument of a comptime-only type is comptime.
+        if ((k < 32 and (generic_ty.comptime_bits >> @intCast(k)) & 1 != 0) or Type.isComptimeOnly(ip, sema.typeOf(a))) {
             ca.* = try sema.resolveConstValue(caller, src, a, "argument to comptime parameter must be comptime-known");
         } else {
             ca.* = .none;
