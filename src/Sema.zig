@@ -58,6 +58,8 @@ peers_comptime_known: bool = false,
 branch_quota: u32 = 1000,
 branch_count: u32 = 0,
 last_dbg_stmt: ?Ir.Inst.Index = null,
+/// Nesting of runtime inline calls, to fail on unbounded inline recursion.
+inline_depth: u32 = 0,
 /// Anonymous types this unit has created so far, for their stable keys.
 anon_types: u32 = 0,
 
@@ -112,12 +114,13 @@ pub const Block = struct {
         brs: std.ArrayList(Ir.Inst.Index) = .empty,
     };
 
-    /// A comptime call being evaluated.
+    /// A comptime call, or a runtime inline call, being evaluated.
     pub const Inlining = struct {
         func: Index,
         ret_ty: Index,
         result: Ref = .none,
-        /// Comptime arguments, for naming types the call returns.
+        /// Comptime arguments (`none` for runtime ones), for naming types
+        /// the call returns.
         args: []const Index,
         /// Anonymous types created by this call so far.
         anon_types: u32 = 0,
@@ -1126,7 +1129,8 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
 
             // Instructions with no result.
             .dbg_stmt => {
-                if (!block.is_comptime) try sema.addDbgStmt(block, data.dbg_stmt.line, data.dbg_stmt.column);
+                // Lines in an inlined body are relative to another declaration.
+                if (!block.is_comptime and block.inlining == null) try sema.addDbgStmt(block, data.dbg_stmt.line, data.dbg_stmt.column);
                 i += 1;
                 continue;
             },
@@ -1425,14 +1429,27 @@ fn zirCondbr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!?[]
 
 fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src) CompileError!void {
     if (b.inlining) |inlining| {
+        // An inlined function's inferred error set is what its returns
+        // produce.
+        var ty = inlining.ret_ty;
+        if (sema.ip.indexToKey(ty) == .error_union_type and sema.ip.indexToKey(ty).error_union_type.error_set_type == .adhoc_inferred_error_set_type) {
+            const op_ty = sema.typeOf(operand);
+            const set: Index = switch (Type.class(sema.ip, op_ty)) {
+                .error_union => sema.ip.indexToKey(op_ty).error_union_type.error_set_type,
+                .error_set => op_ty,
+                else => try sema.intern(.{ .error_set_type = &.{} }),
+            };
+            ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = set, .payload_type = sema.ip.indexToKey(ty).error_union_type.payload_type } });
+        }
+        const coerced = try sema.coerce(b, ty, operand, src);
         if (inlining.merges) |merges| {
-            const coerced = try sema.coerce(b, inlining.ret_ty, operand, src);
+            if (b.is_comptime) return sema.fail(b, src, "function called at runtime cannot return value at comptime", .{});
             const br = try sema.addInst(b, .{ .tag = .br, .data = .{ .br = .{ .block_inst = merges.block_inst, .operand = coerced } } });
             try merges.results.append(sema.gpa, coerced);
             try merges.brs.append(sema.gpa, br.toIndex().?);
             return;
         }
-        inlining.result = try sema.coerce(b, inlining.ret_ty, operand, src);
+        inlining.result = coerced;
         return error.ComptimeReturn;
     }
     if (b.is_comptime) return sema.fail(b, src, "function called at runtime cannot return value at comptime", .{});
@@ -6992,7 +7009,7 @@ fn analyzeCall(
         return .fromInterned(try sema.callComptime(block, src, func, vals));
     }
 
-    if (fn_ty.cc == .@"inline") if (try sema.inlineCall(block, src, func, args)) |result| return result;
+    if (fn_ty.cc == .@"inline" or modifier == .always_inline) return sema.inlineCall(block, src, func, args);
 
     var callee_func = func;
     var call_args = args;
@@ -7097,11 +7114,12 @@ fn mapCalleeParams(sema: *Sema, callee_block: *Block, caller: *Block, src: Src, 
 /// A runtime call of inline function `func`: its body analyzed in the
 /// caller with its parameters bound to `args`, as upstream. The result is
 /// comptime-known when the body's only exit returns a comptime-known value.
-/// Null for functions with an inferred error set, which are still called
-/// like other functions.
-fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) CompileError!?Ref {
+fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) CompileError!Ref {
     const ip = sema.ip;
     const gpa = sema.gpa;
+    if (sema.inline_depth >= 1000) return sema.fail(caller, src, "inline call depth exceeded", .{});
+    sema.inline_depth += 1;
+    defer sema.inline_depth -= 1;
     const f = ip.indexToKey(func).func;
     const fn_ty = ip.indexToKey(f.ty).func_type;
     const saved = CalleeScope.enter(sema, func);
@@ -7126,13 +7144,14 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) C
             else => continue,
         }
         comptime_args[i] = sema.resolveValue(args[i]) orelse .none;
-        const is_comptime = tag == .param_comptime or tag == .param_anytype_comptime;
+        const is_comptime = tag == .param_comptime or tag == .param_anytype_comptime or Type.isComptimeOnly(ip, sema.typeOf(args[i]));
         if (is_comptime and comptime_args[i] == .none) return sema.fail(caller, src, "unable to resolve comptime value: argument to comptime parameter must be comptime-known", .{});
         try sema.inst_map.put(gpa, inst, args[i]);
         i += 1;
     }
+    // With an inferred error set, the result's error set is what the
+    // returns produce (see `analyzeRet`).
     const ret_ty = try sema.calleeRetTy(&ct_block, src, func);
-    if (ip.indexToKey(ret_ty) == .error_union_type and ip.indexToKey(ret_ty).error_union_type.error_set_type == .adhoc_inferred_error_set_type) return null;
     try sema.declareDependency(.{ .func_body = func });
 
     var merges: Block.Merges = .{ .block_inst = try sema.reserveInst() };
@@ -7152,7 +7171,7 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) C
     };
     defer child.instructions.deinit(gpa);
     try sema.analyzeBodyInner(&child, fn_info.body);
-    return try sema.resolveBlock(caller, src, &child, &merges);
+    return sema.resolveBlock(caller, src, &child, &merges);
 }
 
 /// The type of the parameter of generic `func` after `prior` arguments,
