@@ -137,6 +137,29 @@ granularity.
 - InternPool contents are rebuilt lazily on a warm build: only units that
   must be re-analyzed load the types and values they reference.
 
+What the cache must get right, or edit-rebuilds will not be Go-class:
+
+- **Validation cost.** Go validates per package; zap validates per
+  declaration, which means tens of thousands of entries for std plus a real
+  project. Entries are stored packed (a few large files, read with mmap), not
+  one file per unit, and validating an unchanged unit is a hash comparison.
+- **Fine-grained dependencies.** Comptime reflection must record exactly what
+  it observed: `@hasDecl(root, "x")` depends on whether `root` has `x`, not
+  on all of `root`'s declarations; `root.std_options` depends on that value.
+  Otherwise adding a function to the root file invalidates much of std.
+- **Nothing order-dependent in Atoms.** Values the whole compilation assigns,
+  such as error codes in the global error set, are symbolic in Atoms and
+  resolved at link time, so one new error name does not invalidate every
+  function that returns an error.
+- **Inferred error sets** are part of a function's signature but come from
+  its body; early cutoff keeps callers green when an edit leaves the set
+  unchanged.
+
+The cache makes warm and edit-rebuild builds fast, and makes a new project
+fast when its std code is already cached. It does not make a build with an
+empty cache fast; that depends on Sema and comptime throughput, parallel
+analysis, and the single-pass backend.
+
 Rejected alternative: upstream-style persistence of the whole InternPool and
 dependency graph as one mmap-able snapshot per project. It loads faster but
 shares nothing across projects and ties the file format to in-memory layout.
