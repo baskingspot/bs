@@ -717,6 +717,50 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const src = try cg.memOf(data.ty_op.operand);
             try cg.copyMem(dst, offsetMem(src, layout.tag_offset), layout.tag_size);
         },
+        .memcpy, .memmove => {
+            const elem_size = try cg.memDest(.rdi, .rcx, data.bin_op.lhs);
+            if (elem_size != 1) try cg.e.imul(.qword, .rcx, .{ .reg = .rcx }, @intCast(elem_size));
+            try cg.load(.rsi, data.bin_op.rhs);
+            if (tag == .memcpy) return cg.e.repMovsb();
+            // Copy backwards when the destination is above the source.
+            const forward = try cg.e.newLabel();
+            const done = try cg.e.newLabel();
+            try cg.e.alu(.cmp, .qword, .{ .reg = .rdi }, .{ .reg = .rsi });
+            try cg.e.jcc(.be, .{ .label = forward });
+            try cg.e.lea(.qword, .rsi, .{ .base = .{ .reg = .rsi }, .index = .{ .reg = .rcx, .scale = .@"1" }, .disp = -1 });
+            try cg.e.lea(.qword, .rdi, .{ .base = .{ .reg = .rdi }, .index = .{ .reg = .rcx, .scale = .@"1" }, .disp = -1 });
+            try cg.e.setDirection(true);
+            try cg.e.repMovsb();
+            try cg.e.setDirection(false);
+            try cg.e.jmp(.{ .label = done });
+            cg.e.bind(forward);
+            try cg.e.repMovsb();
+            cg.e.bind(done);
+        },
+        .memset => {
+            const elem = data.bin_op.rhs;
+            const elem_ty = cg.typeOf(elem);
+            if (Type.abiSize(ip, elem_ty) == 1) {
+                _ = try cg.memDest(.rdi, .rcx, data.bin_op.lhs);
+                try cg.load(.rax, elem);
+                return cg.e.repStosb();
+            }
+            // Store the first element, then let an overlapping forward
+            // `rep movsb` replicate it through the rest.
+            const elem_size = try cg.memDest(.r8, .r9, data.bin_op.lhs);
+            const done = try cg.e.newLabel();
+            try cg.e.@"test"(.qword, .{ .reg = .r9 }, .{ .reg = .r9 });
+            try cg.e.jcc(.e, .{ .label = done });
+            if (elem.toInterned()) |v| if (ip.indexToKey(v) == .undef) {
+                try cg.fillMem(Mem.at(.r8, 0), elem_size, 0xaa);
+            } else try cg.copyTo(Mem.at(.r8, 0), elem) else try cg.copyTo(Mem.at(.r8, 0), elem);
+            try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .reg = .r8 });
+            try cg.e.lea(.qword, .rdi, Mem.at(.r8, @intCast(elem_size)));
+            try cg.e.lea(.qword, .rcx, Mem.at(.r9, -1));
+            try cg.e.imul(.qword, .rcx, .{ .reg = .rcx }, @intCast(elem_size));
+            try cg.e.repMovsb();
+            cg.e.bind(done);
+        },
         .set_union_tag => {
             const layout = Type.unionLayout(ip, Type.ptrInfo(ip, cg.typeOf(data.bin_op.lhs)).child);
             if (layout.tag_size == 0) return;
@@ -760,6 +804,24 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .assembly => try cg.assembly(inst, data),
     }
+}
+
+/// Loads the pointer of `@memcpy`/`@memset` destination `dest` (a slice
+/// or `*[N]T`) into `ptr` and its length in elements into `len`, and
+/// returns the element size. May use rax.
+fn memDest(cg: *CodeGen, ptr: Reg, len: Reg, dest: Ref) Error!u64 {
+    const ip = cg.ip;
+    const p = Type.ptrInfo(ip, cg.typeOf(dest));
+    if (p.flags.size == .slice) {
+        const m = try cg.memOf(dest);
+        try cg.e.mov(.qword, .{ .reg = ptr }, .{ .mem = m });
+        try cg.e.mov(.qword, .{ .reg = len }, .{ .mem = offsetMem(m, 8) });
+        return Type.abiSize(ip, p.child);
+    }
+    const a = ip.indexToKey(p.child).array_type;
+    try cg.load(ptr, dest);
+    try cg.e.mov(.qword, .{ .reg = len }, .{ .imm = @intCast(a.len) });
+    return Type.abiSize(ip, a.child);
 }
 
 /// The bit operations into rax. The baseline x86_64 CPU has no lzcnt,

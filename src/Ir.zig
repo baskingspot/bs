@@ -274,6 +274,15 @@ pub const Inst = struct {
         get_union_tag,
         /// `bin_op`: store tag `rhs` into the union `lhs` points to.
         set_union_tag,
+        /// `bin_op`: copy the elements `rhs` points to into `lhs`. `lhs` is a
+        /// slice or `*[N]T` and gives the length; `rhs` is a many-pointer or
+        /// `*[N]T` of the same element type. A comptime-known length is not 0.
+        /// For `memcpy` the regions do not overlap; for `memmove` they may.
+        memcpy,
+        memmove,
+        /// `bin_op`: store element `rhs` to every element of slice or `*[N]T`
+        /// `lhs`. A comptime-known length is not 0.
+        memset,
         /// `ty_op`: the name (`[:0]const u8`) of enum value `operand`, which
         /// is one of its type's named tags.
         tag_name,
@@ -499,7 +508,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .union_init,
         .assembly,
         => data.ty_pl.ty,
-        .store, .set_union_tag, .dbg_stmt => .void_type,
+        .store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt => .void_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),

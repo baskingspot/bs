@@ -1738,6 +1738,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .try_ptr => sema.failUnsupported(block, block.nodeSrc(data.pl_node.src_node), "try through a pointer"),
         .switch_block => sema.zirSwitchBlock(block, inst),
         .switch_block_err_union => sema.zirSwitchBlockErrUnion(block, inst),
+        .memcpy => sema.zirMemcpy(block, inst, .memcpy),
+        .memmove => sema.zirMemcpy(block, inst, .memmove),
+        .memset => sema.zirMemset(block, inst),
         .switch_block_ref => sema.failUnsupported(block, block.nodeSrc(data.pl_node.src_node), @tagName(tag)),
 
         // Initialization.
@@ -5085,6 +5088,127 @@ fn fieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) Co
 }
 
 /// The many-pointer type of a slice's `ptr` field.
+/// The element type of a pointer that `@memcpy` and `@memset` accept,
+/// and its length (comptime-known for `*[N]T`), or `.none` for a
+/// many-pointer.
+fn memOperand(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!struct { elem: Index, len: Ref } {
+    const ip = sema.ip;
+    const ty = sema.typeOf(ptr);
+    if (Type.class(ip, ty) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ty)});
+    const p = Type.ptrInfo(ip, ty);
+    return switch (p.flags.size) {
+        .slice => .{ .elem = p.child, .len = try sema.sliceLen(block, ptr) },
+        .many, .c => .{ .elem = p.child, .len = .none },
+        .one => switch (ip.indexToKey(p.child)) {
+            .array_type => |a| .{ .elem = a.child, .len = .fromInterned(try sema.intValue(.usize_type, a.len)) },
+            else => sema.fail(block, src, "type '{f}' is not an indexable pointer", .{sema.fmtType(ty)}),
+        },
+    };
+}
+
+/// The many-pointer or array pointer inside a `@memcpy` operand.
+fn memRawPtr(sema: *Sema, block: *Block, ptr: Ref) CompileError!Ref {
+    if (Type.ptrInfo(sema.ip, sema.typeOf(ptr)).flags.size == .slice) return sema.slicePtr(block, ptr);
+    return ptr;
+}
+
+fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag) CompileError!Ref {
+    const ip = sema.ip;
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const extra = sema.code.extraData(Zir.Inst.Bin, data.payload_index).data;
+    const src = block.nodeSrc(data.src_node);
+    var dest = sema.resolveInst(extra.lhs);
+    var source = sema.resolveInst(extra.rhs);
+    const d = try sema.memOperand(block, src, dest);
+    const s = try sema.memOperand(block, src, source);
+    if (Type.ptrInfo(ip, sema.typeOf(dest)).flags.is_const) return sema.fail(block, src, "cannot copy to constant pointer", .{});
+    if (d.len == .none and s.len == .none) return sema.fail(block, src, "unknown copy length", .{});
+    if (d.elem != s.elem) return sema.fail(block, src, "pointer element type '{f}' cannot coerce into element type '{f}'", .{ sema.fmtType(s.elem), sema.fmtType(d.elem) });
+    try sema.resolveLayout(block, src, d.elem);
+
+    var len = if (d.len != .none) d.len else s.len;
+    if (d.len != .none and s.len != .none) {
+        if (sema.resolveValue(d.len)) |dl| if (sema.resolveValue(s.len)) |sl| {
+            if (dl != sl) return sema.fail(block, src, "non-matching copy lengths", .{});
+        };
+        if (sema.resolveValue(d.len) == null) {
+            if (sema.resolveValue(s.len) != null) len = s.len;
+            if (block.want_safety and !block.is_comptime) {
+                const ok = try sema.addBinOp(block, .cmp_eq, d.len, s.len);
+                try sema.addSafetyCheck(block, ok, .copy_len_mismatch, .none, .none);
+            }
+        }
+    }
+    if (!Type.hasRuntimeBits(ip, d.elem) and !Type.isComptimeOnly(ip, d.elem)) return .void_value;
+    const len_val = sema.resolveValue(len);
+    if (len_val != null and ip.intValue(u64, len_val.?).? == 0) return .void_value;
+
+    // Comptime: copy element by element (all loads first, for `@memmove`).
+    if (sema.resolveValue(dest)) |dv| if (sema.resolveValue(source)) |sv| if (len_val) |lv| {
+        const n = ip.intValue(u64, lv).?;
+        const raw_dest = (try sema.memRawPtr(block, .fromInterned(dv))).toInterned().?;
+        if (!sema.isUndef(raw_dest) and try sema.comptimePtrRoot(raw_dest) == .comptime_alloc) {
+            const raw_src = (try sema.memRawPtr(block, .fromInterned(sv))).toInterned().?;
+            if (sema.isUndef(raw_src)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+            const elems = try sema.arena.alloc(Index, @intCast(n));
+            for (elems, 0..) |*e, i| e.* = try sema.comptimeLoad(block, src, try sema.ptrElemPtrVal(raw_src, i));
+            for (elems, 0..) |e, i| try sema.comptimeStore(block, src, try sema.ptrElemPtrVal(raw_dest, i), e);
+            return .void_value;
+        }
+    };
+    try sema.requireRuntime(block, src);
+    if (Type.isComptimeOnly(ip, d.elem)) return sema.fail(block, src, "cannot copy comptime-only type '{f}' at runtime", .{sema.fmtType(d.elem)});
+
+    // The IR form: `dest` gives the length, `source` is a pointer.
+    if (d.len == .none) {
+        const dp = Type.ptrInfo(ip, sema.typeOf(dest));
+        const slice_ty = try sema.ptrType(.{ .child = d.elem, .flags = .{ .size = .slice, .is_const = dp.flags.is_const, .is_volatile = dp.flags.is_volatile } });
+        dest = try sema.makeSlice(block, slice_ty, try sema.coercePtrTo(block, dest, try sema.ptrType(.{ .child = d.elem, .flags = .{ .size = .many, .is_volatile = dp.flags.is_volatile } })), len);
+    }
+    source = try sema.memRawPtr(block, source);
+
+    if (tag == .memcpy and block.want_safety) {
+        // The regions must not overlap: dest + bytes <= src or src + bytes <= dest.
+        const elem_size: Ref = .fromInterned(try sema.intValue(.usize_type, Type.abiSize(ip, d.elem)));
+        const bytes = try sema.addBinOp(block, .mul_wrap, len, elem_size);
+        const da = try sema.addUnOp(block, .int_from_ptr, try sema.memRawPtr(block, dest));
+        const sa = try sema.addUnOp(block, .int_from_ptr, source);
+        const ok1 = try sema.addBinOp(block, .cmp_gte, sa, try sema.addBinOp(block, .add_wrap, da, bytes));
+        const ok2 = try sema.addBinOp(block, .cmp_gte, da, try sema.addBinOp(block, .add_wrap, sa, bytes));
+        try sema.addSafetyCheck(block, try sema.addBinOp(block, .bit_or, ok1, ok2), .memcpy_alias, .none, .none);
+    }
+    _ = try sema.addBinOp(block, tag, dest, source);
+    return .void_value;
+}
+
+fn zirMemset(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const ip = sema.ip;
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const extra = sema.code.extraData(Zir.Inst.Bin, data.payload_index).data;
+    const src = block.nodeSrc(data.src_node);
+    const dest = sema.resolveInst(extra.lhs);
+    const d = try sema.memOperand(block, src, dest);
+    if (Type.ptrInfo(ip, sema.typeOf(dest)).flags.is_const) return sema.fail(block, src, "cannot memset constant pointer", .{});
+    if (d.len == .none) return sema.fail(block, src, "unknown @memset length", .{});
+    try sema.resolveLayout(block, src, d.elem);
+    const elem = try sema.coerce(block, d.elem, sema.resolveInst(extra.rhs), src);
+    if (!Type.hasRuntimeBits(ip, d.elem) and !Type.isComptimeOnly(ip, d.elem)) return .void_value;
+    const len_val = sema.resolveValue(d.len);
+    if (len_val != null and ip.intValue(u64, len_val.?).? == 0) return .void_value;
+
+    if (sema.resolveValue(dest)) |dv| if (len_val) |lv| if (sema.resolveValue(elem)) |ev| {
+        const raw_dest = (try sema.memRawPtr(block, .fromInterned(dv))).toInterned().?;
+        if (!sema.isUndef(raw_dest) and try sema.comptimePtrRoot(raw_dest) == .comptime_alloc) {
+            for (0..@intCast(ip.intValue(u64, lv).?)) |i| try sema.comptimeStore(block, src, try sema.ptrElemPtrVal(raw_dest, i), ev);
+            return .void_value;
+        }
+    };
+    try sema.requireRuntime(block, src);
+    if (Type.isComptimeOnly(ip, d.elem)) return sema.fail(block, src, "cannot store comptime-only element '{f}' at runtime", .{sema.fmtType(d.elem)});
+    _ = try sema.addBinOp(block, .memset, dest, elem);
+    return .void_value;
+}
+
 fn elemValueType(sema: *Sema, slice_ty: Index) !Index {
     const p = Type.ptrInfo(sema.ip, slice_ty);
     return sema.ptrType(.{ .child = p.child, .sentinel = p.sentinel, .flags = .{ .size = .many, .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
