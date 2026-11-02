@@ -1,0 +1,1830 @@
+{
+ "schema": 1,
+ "generated": "2026-11-02T20:51:49+00:00",
+ "harness_commit": "fb02f27",
+ "machine": {
+  "note": "Amp orb (E2B), 4 vCPU,",
+  "logical_cpus": 4,
+  "kernel": "6.1.158+",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python": "3.11.6",
+  "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "mem_total_gib": 7.8
+ },
+ "compiler": {
+  "path": "/home/user/.local/bin/zig",
+  "realpath": "/home/user/.cache/zap/zig-0.17.0/zig",
+  "version": "0.17.0",
+  "default_backend": "stage2_x86_64",
+  "default_mode": "debug",
+  "object_format": "elf"
+ },
+ "runs": 10,
+ "cold_runs": 5,
+ "build_cold_runs": 3,
+ "scenario_descriptions": {
+  "cold": "empty local and global caches",
+  "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+  "warm": "rebuild, no change",
+  "edit-root": "rebuild after a one-line edit to a function body in the root file",
+  "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+  "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+  "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+  "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+  "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+ },
+ "calibration_s": {
+  "start": 0.10418094999977257,
+  "end": 0.08849055200016664
+ },
+ "workloads": {
+  "hello": {
+   "description": "hello world through std.debug.print",
+   "commands": {
+    "build-exe": {
+     "cwd": "hello",
+     "argv": [
+      "zig",
+      "build-exe",
+      "hello.zig",
+      "--zig-lib-dir",
+      "zig-lib",
+      "--cache-dir",
+      "cache/local",
+      "--global-cache-dir",
+      "cache/global"
+     ]
+    }
+   },
+   "edits": {
+    "root": {
+     "file": "hello/hello.zig",
+     "anchor": "    std.debug.print(\"Hello, world!\\n\", .{});",
+     "line": 4
+    },
+    "lib": {
+     "file": "hello/zig-lib/std/debug.zig",
+     "anchor": "    stderr.file_writer.interface.print(fmt, args) catch return;",
+     "line": 330
+    }
+   }
+  },
+  "vaxis": {
+   "description": "libvaxis 0620b34e091d examples/text_input.zig",
+   "commands": {
+    "build-exe": {
+     "cwd": "vaxis/libvaxis",
+     "argv": [
+      "zig",
+      "build-exe",
+      "--dep",
+      "vaxis",
+      "-Mroot=examples/text_input.zig",
+      "--dep",
+      "zigimg",
+      "--dep",
+      "uucode",
+      "-Mvaxis=src/main.zig",
+      "-Mzigimg=zig-pkg/zigimg-0.1.0-8_eo2sBLGACBebrhQZUwRliZNSUyDn6szp99eip_6-Rw/zigimg.zig",
+      "--dep",
+      "types.zig",
+      "--dep",
+      "config.zig",
+      "--dep",
+      "tables",
+      "-Muucode=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/root.zig",
+      "-Mtypes.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/types.zig",
+      "--dep",
+      "types.zig",
+      "--dep",
+      "storage.zig",
+      "-Mconfig.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/config.zig",
+      "--dep",
+      "config.zig",
+      "--dep",
+      "storage.zig",
+      "--dep",
+      "build_config",
+      "-Mtables=../gen/tables.zig",
+      "--dep",
+      "config.zig",
+      "-Mstorage.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/storage.zig",
+      "--dep",
+      "config.zig",
+      "--dep",
+      "storage.zig",
+      "-Mbuild_config=../gen/build_config.zig",
+      "--name",
+      "example-text_input",
+      "--cache-dir",
+      "../cache/local",
+      "--global-cache-dir",
+      "../cache/global"
+     ]
+    },
+    "zig-build": {
+     "cwd": "vaxis/wrapper",
+     "argv": [
+      "zig",
+      "build",
+      "--cache-dir",
+      "../build-cache/local"
+     ],
+     "env": {
+      "ZIG_GLOBAL_CACHE_DIR": "../build-cache/global"
+     }
+    }
+   },
+   "edits": {
+    "root": {
+     "file": "vaxis/libvaxis/examples/text_input.zig",
+     "anchor": "    const alloc = init.gpa;",
+     "line": 23
+    },
+    "lib": {
+     "file": "vaxis/libvaxis/src/Vaxis.zig",
+     "anchor": "    var started: bool = false;",
+     "line": 407
+    }
+   },
+   "libvaxis": {
+    "url": "https://github.com/rockorager/libvaxis",
+    "commit": "0620b34e091deaa6f64608922be3814147128dfb",
+    "patched": false
+   }
+  }
+ },
+ "results": [
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "cold",
+   "runs": [
+    {
+     "wall_s": 4.287690577999911,
+     "cpu_s": 4.701116,
+     "maxrss_kb": 302404
+    },
+    {
+     "wall_s": 4.243427763,
+     "cpu_s": 4.612504,
+     "maxrss_kb": 305196
+    },
+    {
+     "wall_s": 4.210174069999994,
+     "cpu_s": 4.570797000000001,
+     "maxrss_kb": 304052
+    },
+    {
+     "wall_s": 4.24458010699982,
+     "cpu_s": 4.62879,
+     "maxrss_kb": 304664
+    },
+    {
+     "wall_s": 4.255207279999922,
+     "cpu_s": 4.628251,
+     "maxrss_kb": 305952
+    }
+   ],
+   "stats": {
+    "n": 5,
+    "median_s": 4.24458010699982,
+    "min_s": 4.210174069999994,
+    "max_s": 4.287690577999911,
+    "mean_s": 4.248215959599929,
+    "stdev_s": 0.02779593348811339,
+    "cpu_median_s": 4.628251,
+    "maxrss_median_kb": 304664,
+    "maxrss_max_kb": 305952
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "cold-local",
+   "runs": [
+    {
+     "wall_s": 0.3522774789998948,
+     "cpu_s": 0.716879,
+     "maxrss_kb": 131404
+    },
+    {
+     "wall_s": 0.34868948500025,
+     "cpu_s": 0.70592,
+     "maxrss_kb": 131024
+    },
+    {
+     "wall_s": 0.3498533669999233,
+     "cpu_s": 0.703139,
+     "maxrss_kb": 131340
+    },
+    {
+     "wall_s": 0.349011487000098,
+     "cpu_s": 0.703181,
+     "maxrss_kb": 130880
+    },
+    {
+     "wall_s": 0.3620388880003702,
+     "cpu_s": 0.735451,
+     "maxrss_kb": 132788
+    },
+    {
+     "wall_s": 0.35598060599977543,
+     "cpu_s": 0.717903,
+     "maxrss_kb": 131300
+    },
+    {
+     "wall_s": 0.35015187199996944,
+     "cpu_s": 0.7193379999999999,
+     "maxrss_kb": 131452
+    },
+    {
+     "wall_s": 0.3460165359997518,
+     "cpu_s": 0.6973269999999999,
+     "maxrss_kb": 131480
+    },
+    {
+     "wall_s": 0.35200274299995726,
+     "cpu_s": 0.7106709999999999,
+     "maxrss_kb": 130880
+    },
+    {
+     "wall_s": 0.34726187599972036,
+     "cpu_s": 0.7005459999999999,
+     "maxrss_kb": 131772
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.3500026194999464,
+    "min_s": 0.3460165359997518,
+    "max_s": 0.3620388880003702,
+    "mean_s": 0.35132843389997104,
+    "stdev_s": 0.004694648000078106,
+    "cpu_median_s": 0.7082955,
+    "maxrss_median_kb": 131372.0,
+    "maxrss_max_kb": 132788
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "warm",
+   "runs": [
+    {
+     "wall_s": 0.35593186300002344,
+     "cpu_s": 0.7239669999999999,
+     "maxrss_kb": 131528
+    },
+    {
+     "wall_s": 0.3572780189997502,
+     "cpu_s": 0.720707,
+     "maxrss_kb": 131740
+    },
+    {
+     "wall_s": 0.3532850849996976,
+     "cpu_s": 0.7077699999999999,
+     "maxrss_kb": 131504
+    },
+    {
+     "wall_s": 0.36549531600030605,
+     "cpu_s": 0.729635,
+     "maxrss_kb": 131844
+    },
+    {
+     "wall_s": 0.3459056550000241,
+     "cpu_s": 0.70246,
+     "maxrss_kb": 130868
+    },
+    {
+     "wall_s": 0.35071735900010026,
+     "cpu_s": 0.707226,
+     "maxrss_kb": 131204
+    },
+    {
+     "wall_s": 0.3505748500001573,
+     "cpu_s": 0.7040379999999999,
+     "maxrss_kb": 131380
+    },
+    {
+     "wall_s": 0.3451776189999691,
+     "cpu_s": 0.702305,
+     "maxrss_kb": 132664
+    },
+    {
+     "wall_s": 0.35258893900027033,
+     "cpu_s": 0.714777,
+     "maxrss_kb": 131912
+    },
+    {
+     "wall_s": 0.3471642000004067,
+     "cpu_s": 0.70248,
+     "maxrss_kb": 132500
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.3516531490001853,
+    "min_s": 0.3451776189999691,
+    "max_s": 0.36549531600030605,
+    "mean_s": 0.3524118905000705,
+    "stdev_s": 0.006114549547357904,
+    "cpu_median_s": 0.707498,
+    "maxrss_median_kb": 131634.0,
+    "maxrss_max_kb": 132664
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "edit-root",
+   "runs": [
+    {
+     "wall_s": 0.35783524500038766,
+     "cpu_s": 0.7148999999999999,
+     "maxrss_kb": 131264
+    },
+    {
+     "wall_s": 0.35451922800029934,
+     "cpu_s": 0.7388459999999999,
+     "maxrss_kb": 132120
+    },
+    {
+     "wall_s": 0.3514987469998232,
+     "cpu_s": 0.716965,
+     "maxrss_kb": 131492
+    },
+    {
+     "wall_s": 0.4018159970000852,
+     "cpu_s": 0.797508,
+     "maxrss_kb": 131492
+    },
+    {
+     "wall_s": 0.3457331179997709,
+     "cpu_s": 0.704393,
+     "maxrss_kb": 131452
+    },
+    {
+     "wall_s": 0.3528732959998706,
+     "cpu_s": 0.7070449999999999,
+     "maxrss_kb": 131348
+    },
+    {
+     "wall_s": 0.34610857000006945,
+     "cpu_s": 0.704595,
+     "maxrss_kb": 131468
+    },
+    {
+     "wall_s": 0.34310520200006067,
+     "cpu_s": 0.699541,
+     "maxrss_kb": 132240
+    },
+    {
+     "wall_s": 0.35075268800028425,
+     "cpu_s": 0.706669,
+     "maxrss_kb": 131080
+    },
+    {
+     "wall_s": 0.3465257840002778,
+     "cpu_s": 0.703155,
+     "maxrss_kb": 131708
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.3511257175000537,
+    "min_s": 0.34310520200006067,
+    "max_s": 0.4018159970000852,
+    "mean_s": 0.3550767875000929,
+    "stdev_s": 0.01703917334737055,
+    "cpu_median_s": 0.706857,
+    "maxrss_median_kb": 131480.0,
+    "maxrss_max_kb": 132240
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "edit-lib",
+   "runs": [
+    {
+     "wall_s": 3.6103581769998527,
+     "cpu_s": 4.016541999999999,
+     "maxrss_kb": 235840
+    },
+    {
+     "wall_s": 3.6452999299999647,
+     "cpu_s": 4.025246,
+     "maxrss_kb": 238732
+    },
+    {
+     "wall_s": 3.6808834200001,
+     "cpu_s": 4.032045,
+     "maxrss_kb": 237444
+    },
+    {
+     "wall_s": 3.6358686430003218,
+     "cpu_s": 4.015344,
+     "maxrss_kb": 238440
+    },
+    {
+     "wall_s": 3.6068209390000447,
+     "cpu_s": 4.0442979999999995,
+     "maxrss_kb": 235032
+    },
+    {
+     "wall_s": 3.552306131000023,
+     "cpu_s": 3.930795,
+     "maxrss_kb": 238724
+    },
+    {
+     "wall_s": 3.745681287000025,
+     "cpu_s": 4.107845999999999,
+     "maxrss_kb": 240740
+    },
+    {
+     "wall_s": 3.5762019499998132,
+     "cpu_s": 3.933188,
+     "maxrss_kb": 239500
+    },
+    {
+     "wall_s": 3.616953070999898,
+     "cpu_s": 3.972673,
+     "maxrss_kb": 239484
+    },
+    {
+     "wall_s": 3.608976852000069,
+     "cpu_s": 3.9593719999999997,
+     "maxrss_kb": 241440
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 3.6136556239998754,
+    "min_s": 3.552306131000023,
+    "max_s": 3.745681287000025,
+    "mean_s": 3.627935040000011,
+    "stdev_s": 0.0544293665377635,
+    "cpu_median_s": 4.015943,
+    "maxrss_median_kb": 238728.0,
+    "maxrss_max_kb": 241440
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "incr-cli-edit-root",
+   "runs": [
+    {
+     "wall_s": 0.4649903599997742,
+     "cpu_s": 0.9730479999999999,
+     "maxrss_kb": 123684
+    },
+    {
+     "wall_s": 0.47691311000016867,
+     "cpu_s": 1.009572,
+     "maxrss_kb": 125188
+    },
+    {
+     "wall_s": 0.4746113889996195,
+     "cpu_s": 0.9816199999999999,
+     "maxrss_kb": 124208
+    },
+    {
+     "wall_s": 0.4712143130000186,
+     "cpu_s": 1.001504,
+     "maxrss_kb": 124368
+    },
+    {
+     "wall_s": 0.48401496400038013,
+     "cpu_s": 1.012308,
+     "maxrss_kb": 124564
+    },
+    {
+     "wall_s": 0.4935007100002622,
+     "cpu_s": 1.01783,
+     "maxrss_kb": 124320
+    },
+    {
+     "wall_s": 0.529831404000106,
+     "cpu_s": 1.09026,
+     "maxrss_kb": 124276
+    },
+    {
+     "wall_s": 0.4671807770000669,
+     "cpu_s": 0.9788199999999999,
+     "maxrss_kb": 125948
+    },
+    {
+     "wall_s": 0.46010566599989033,
+     "cpu_s": 0.963464,
+     "maxrss_kb": 124684
+    },
+    {
+     "wall_s": 0.48543836199996804,
+     "cpu_s": 0.999344,
+     "maxrss_kb": 125124
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.4757622494998941,
+    "min_s": 0.46010566599989033,
+    "max_s": 0.529831404000106,
+    "mean_s": 0.4807801055000255,
+    "stdev_s": 0.020017238896624236,
+    "cpu_median_s": 1.000424,
+    "maxrss_median_kb": 124466.0,
+    "maxrss_max_kb": 125948
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "incr-cli-edit-lib",
+   "runs": [
+    {
+     "wall_s": 3.6576087160001407,
+     "cpu_s": 4.172236,
+     "maxrss_kb": 238336
+    },
+    {
+     "wall_s": 3.740792763999707,
+     "cpu_s": 4.276772,
+     "maxrss_kb": 237832
+    },
+    {
+     "wall_s": 3.784481589999814,
+     "cpu_s": 4.289699,
+     "maxrss_kb": 237632
+    },
+    {
+     "wall_s": 3.7272788440000113,
+     "cpu_s": 4.252343,
+     "maxrss_kb": 238032
+    },
+    {
+     "wall_s": 3.7142919529997016,
+     "cpu_s": 4.244826,
+     "maxrss_kb": 238964
+    },
+    {
+     "wall_s": 3.695275509000112,
+     "cpu_s": 4.204852,
+     "maxrss_kb": 241096
+    },
+    {
+     "wall_s": 3.7215939039997465,
+     "cpu_s": 4.217213,
+     "maxrss_kb": 239004
+    },
+    {
+     "wall_s": 3.6602535439997155,
+     "cpu_s": 4.143426,
+     "maxrss_kb": 237304
+    },
+    {
+     "wall_s": 3.6993244049999703,
+     "cpu_s": 4.206046000000001,
+     "maxrss_kb": 237120
+    },
+    {
+     "wall_s": 3.613828216999991,
+     "cpu_s": 4.117408,
+     "maxrss_kb": 240812
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 3.706808178999836,
+    "min_s": 3.613828216999991,
+    "max_s": 3.784481589999814,
+    "mean_s": 3.701472944599891,
+    "stdev_s": 0.04832682723925346,
+    "cpu_median_s": 4.211629500000001,
+    "maxrss_median_kb": 238184.0,
+    "maxrss_max_kb": 241096
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "incr-edit-root",
+   "runs": [
+    {
+     "wall_s": 0.012411705999966216,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    },
+    {
+     "wall_s": 0.010506286999770964,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    },
+    {
+     "wall_s": 0.009167000000161352,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    },
+    {
+     "wall_s": 0.009109491999879538,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    },
+    {
+     "wall_s": 0.009123450000060984,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    },
+    {
+     "wall_s": 0.008688660999723652,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    },
+    {
+     "wall_s": 0.008481604999815318,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    },
+    {
+     "wall_s": 0.008615611000095669,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    },
+    {
+     "wall_s": 0.009089888999824325,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    },
+    {
+     "wall_s": 0.00858525700004975,
+     "cpu_s": null,
+     "maxrss_kb": 130060
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.009099690499851931,
+    "min_s": 0.008481604999815318,
+    "max_s": 0.012411705999966216,
+    "mean_s": 0.009377895799934777,
+    "stdev_s": 0.0012123996151462862,
+    "cpu_median_s": null,
+    "maxrss_median_kb": 130060.0,
+    "maxrss_max_kb": 130060
+   },
+   "extra": {
+    "initial_update_s": 0.4448082130002149,
+    "session_cpu_s": 1.089585,
+    "session_maxrss_kb": 130060
+   }
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "incr-edit-lib",
+   "runs": [
+    {
+     "wall_s": 0.055061002999991615,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    },
+    {
+     "wall_s": 0.04944225099961841,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    },
+    {
+     "wall_s": 0.048963761999857525,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    },
+    {
+     "wall_s": 0.046292704999814305,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    },
+    {
+     "wall_s": 0.045542979999936506,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    },
+    {
+     "wall_s": 0.04988186999980826,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    },
+    {
+     "wall_s": 0.047787003999928857,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    },
+    {
+     "wall_s": 0.051874462999876414,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    },
+    {
+     "wall_s": 0.046472463000100106,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    },
+    {
+     "wall_s": 0.04683644800024922,
+     "cpu_s": null,
+     "maxrss_kb": 137428
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.04837538299989319,
+    "min_s": 0.045542979999936506,
+    "max_s": 0.055061002999991615,
+    "mean_s": 0.04881549489991812,
+    "stdev_s": 0.0029335920483717546,
+    "cpu_median_s": null,
+    "maxrss_median_kb": 137428.0,
+    "maxrss_max_kb": 137428
+   },
+   "extra": {
+    "initial_update_s": 0.44771042399997896,
+    "session_cpu_s": 2.006164,
+    "session_maxrss_kb": 137428
+   }
+  },
+  {
+   "workload": "vaxis",
+   "mode": "build-exe",
+   "scenario": "cold",
+   "runs": [
+    {
+     "wall_s": 4.77195003099996,
+     "cpu_s": 5.578167,
+     "maxrss_kb": 354216
+    },
+    {
+     "wall_s": 4.709058540000115,
+     "cpu_s": 5.418096,
+     "maxrss_kb": 356628
+    },
+    {
+     "wall_s": 4.7404254810003295,
+     "cpu_s": 5.453328999999999,
+     "maxrss_kb": 355764
+    },
+    {
+     "wall_s": 4.741057069999897,
+     "cpu_s": 5.469068,
+     "maxrss_kb": 351536
+    },
+    {
+     "wall_s": 4.779737697000201,
+     "cpu_s": 5.488664,
+     "maxrss_kb": 353188
+    }
+   ],
+   "stats": {
+    "n": 5,
+    "median_s": 4.741057069999897,
+    "min_s": 4.709058540000115,
+    "max_s": 4.779737697000201,
+    "mean_s": 4.748445763800101,
+    "stdev_s": 0.028292696897492708,
+    "cpu_median_s": 5.469068,
+    "maxrss_median_kb": 354216,
+    "maxrss_max_kb": 356628
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "build-exe",
+   "scenario": "cold-local",
+   "runs": [
+    {
+     "wall_s": 0.9859153329998662,
+     "cpu_s": 1.5856919999999999,
+     "maxrss_kb": 192340
+    },
+    {
+     "wall_s": 0.9856455770000139,
+     "cpu_s": 1.56657,
+     "maxrss_kb": 191856
+    },
+    {
+     "wall_s": 0.9886527529997693,
+     "cpu_s": 1.577451,
+     "maxrss_kb": 191712
+    },
+    {
+     "wall_s": 0.9883423559999756,
+     "cpu_s": 1.584666,
+     "maxrss_kb": 191936
+    },
+    {
+     "wall_s": 0.9962837400003082,
+     "cpu_s": 1.564686,
+     "maxrss_kb": 192176
+    },
+    {
+     "wall_s": 0.9792122379999455,
+     "cpu_s": 1.58252,
+     "maxrss_kb": 192140
+    },
+    {
+     "wall_s": 1.0576364439998542,
+     "cpu_s": 1.6362229999999998,
+     "maxrss_kb": 191860
+    },
+    {
+     "wall_s": 0.9795765559997562,
+     "cpu_s": 1.5715379999999999,
+     "maxrss_kb": 191984
+    },
+    {
+     "wall_s": 0.99484643400001,
+     "cpu_s": 1.566473,
+     "maxrss_kb": 191692
+    },
+    {
+     "wall_s": 0.9976242269999602,
+     "cpu_s": 1.5940759999999998,
+     "maxrss_kb": 191752
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.9884975544998724,
+    "min_s": 0.9792122379999455,
+    "max_s": 1.0576364439998542,
+    "mean_s": 0.995373565799946,
+    "stdev_s": 0.022784670692785378,
+    "cpu_median_s": 1.5799854999999998,
+    "maxrss_median_kb": 191898.0,
+    "maxrss_max_kb": 192340
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "build-exe",
+   "scenario": "warm",
+   "runs": [
+    {
+     "wall_s": 0.8540802110001096,
+     "cpu_s": 1.361138,
+     "maxrss_kb": 163716
+    },
+    {
+     "wall_s": 0.8503538469999512,
+     "cpu_s": 1.3565809999999998,
+     "maxrss_kb": 162844
+    },
+    {
+     "wall_s": 0.8684879440002078,
+     "cpu_s": 1.369661,
+     "maxrss_kb": 163340
+    },
+    {
+     "wall_s": 0.8683417610000106,
+     "cpu_s": 1.378871,
+     "maxrss_kb": 164020
+    },
+    {
+     "wall_s": 0.8677072450000196,
+     "cpu_s": 1.37709,
+     "maxrss_kb": 163404
+    },
+    {
+     "wall_s": 0.8603690859999915,
+     "cpu_s": 1.370748,
+     "maxrss_kb": 163032
+    },
+    {
+     "wall_s": 0.8684354289998737,
+     "cpu_s": 1.388158,
+     "maxrss_kb": 162664
+    },
+    {
+     "wall_s": 0.8587201339996682,
+     "cpu_s": 1.362844,
+     "maxrss_kb": 162644
+    },
+    {
+     "wall_s": 0.8624677699999665,
+     "cpu_s": 1.3614629999999999,
+     "maxrss_kb": 162672
+    },
+    {
+     "wall_s": 0.8574557350002578,
+     "cpu_s": 1.3610360000000001,
+     "maxrss_kb": 163052
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.861418427999979,
+    "min_s": 0.8503538469999512,
+    "max_s": 0.8684879440002078,
+    "mean_s": 0.8616419162000056,
+    "stdev_s": 0.006563019239777492,
+    "cpu_median_s": 1.3662524999999999,
+    "maxrss_median_kb": 163042.0,
+    "maxrss_max_kb": 164020
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "build-exe",
+   "scenario": "edit-root",
+   "runs": [
+    {
+     "wall_s": 0.8704314829997202,
+     "cpu_s": 1.359083,
+     "maxrss_kb": 163508
+    },
+    {
+     "wall_s": 0.8695957909999379,
+     "cpu_s": 1.359152,
+     "maxrss_kb": 163240
+    },
+    {
+     "wall_s": 0.8531088780000573,
+     "cpu_s": 1.3669159999999998,
+     "maxrss_kb": 162768
+    },
+    {
+     "wall_s": 0.8677011930003573,
+     "cpu_s": 1.373768,
+     "maxrss_kb": 162888
+    },
+    {
+     "wall_s": 0.8629547370001092,
+     "cpu_s": 1.3745180000000001,
+     "maxrss_kb": 163692
+    },
+    {
+     "wall_s": 0.8775226560001101,
+     "cpu_s": 1.383281,
+     "maxrss_kb": 163928
+    },
+    {
+     "wall_s": 0.8765203699999802,
+     "cpu_s": 1.371197,
+     "maxrss_kb": 162768
+    },
+    {
+     "wall_s": 0.8600016359996516,
+     "cpu_s": 1.361105,
+     "maxrss_kb": 164096
+    },
+    {
+     "wall_s": 0.8716316159998314,
+     "cpu_s": 1.372669,
+     "maxrss_kb": 163740
+    },
+    {
+     "wall_s": 0.8604552159999912,
+     "cpu_s": 1.360666,
+     "maxrss_kb": 164296
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.8686484920001476,
+    "min_s": 0.8531088780000573,
+    "max_s": 0.8775226560001101,
+    "mean_s": 0.8669923575999746,
+    "stdev_s": 0.007767157455884272,
+    "cpu_median_s": 1.3690565,
+    "maxrss_median_kb": 163600.0,
+    "maxrss_max_kb": 164296
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "build-exe",
+   "scenario": "edit-lib",
+   "runs": [
+    {
+     "wall_s": 0.8844743509998807,
+     "cpu_s": 1.388169,
+     "maxrss_kb": 162788
+    },
+    {
+     "wall_s": 0.8523645929999475,
+     "cpu_s": 1.3570499999999999,
+     "maxrss_kb": 163404
+    },
+    {
+     "wall_s": 0.867210808999971,
+     "cpu_s": 1.3724189999999998,
+     "maxrss_kb": 163716
+    },
+    {
+     "wall_s": 0.8677988370000094,
+     "cpu_s": 1.38103,
+     "maxrss_kb": 164048
+    },
+    {
+     "wall_s": 0.8722278309996909,
+     "cpu_s": 1.386021,
+     "maxrss_kb": 163144
+    },
+    {
+     "wall_s": 0.8652899359999537,
+     "cpu_s": 1.3763349999999999,
+     "maxrss_kb": 163552
+    },
+    {
+     "wall_s": 0.8539109719999942,
+     "cpu_s": 1.362815,
+     "maxrss_kb": 164292
+    },
+    {
+     "wall_s": 0.8593384089999745,
+     "cpu_s": 1.368657,
+     "maxrss_kb": 163224
+    },
+    {
+     "wall_s": 0.8604852769999525,
+     "cpu_s": 1.369502,
+     "maxrss_kb": 163360
+    },
+    {
+     "wall_s": 0.8771490859999176,
+     "cpu_s": 1.4004219999999998,
+     "maxrss_kb": 163188
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.8662503724999624,
+    "min_s": 0.8523645929999475,
+    "max_s": 0.8844743509998807,
+    "mean_s": 0.8660250100999292,
+    "stdev_s": 0.010090960408769226,
+    "cpu_median_s": 1.374377,
+    "maxrss_median_kb": 163382.0,
+    "maxrss_max_kb": 164292
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "build-exe",
+   "scenario": "incr-cli-edit-root",
+   "runs": [
+    {
+     "wall_s": 1.1191857860003438,
+     "cpu_s": 1.9453690000000001,
+     "maxrss_kb": 154168
+    },
+    {
+     "wall_s": 1.1231897679999747,
+     "cpu_s": 1.998233,
+     "maxrss_kb": 153940
+    },
+    {
+     "wall_s": 1.1724392740002259,
+     "cpu_s": 2.003228,
+     "maxrss_kb": 153664
+    },
+    {
+     "wall_s": 1.149082687000373,
+     "cpu_s": 2.005873,
+     "maxrss_kb": 155120
+    },
+    {
+     "wall_s": 1.1321785939999245,
+     "cpu_s": 1.9771800000000002,
+     "maxrss_kb": 153876
+    },
+    {
+     "wall_s": 1.2466746499999317,
+     "cpu_s": 2.13961,
+     "maxrss_kb": 153488
+    },
+    {
+     "wall_s": 1.137526280000202,
+     "cpu_s": 1.9889350000000001,
+     "maxrss_kb": 153692
+    },
+    {
+     "wall_s": 1.1824693200001093,
+     "cpu_s": 2.057692,
+     "maxrss_kb": 154508
+    },
+    {
+     "wall_s": 1.1431115290001799,
+     "cpu_s": 1.9897,
+     "maxrss_kb": 153784
+    },
+    {
+     "wall_s": 1.1543310329998349,
+     "cpu_s": 2.015231,
+     "maxrss_kb": 152984
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 1.1460971080002764,
+    "min_s": 1.1191857860003438,
+    "max_s": 1.2466746499999317,
+    "mean_s": 1.15601889210011,
+    "stdev_s": 0.03763870047330618,
+    "cpu_median_s": 2.0007305,
+    "maxrss_median_kb": 153830.0,
+    "maxrss_max_kb": 155120
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "build-exe",
+   "scenario": "incr-cli-edit-lib",
+   "runs": [
+    {
+     "wall_s": 1.1578751219999504,
+     "cpu_s": 2.047742,
+     "maxrss_kb": 155412
+    },
+    {
+     "wall_s": 1.1431571570001324,
+     "cpu_s": 1.9929839999999999,
+     "maxrss_kb": 154140
+    },
+    {
+     "wall_s": 1.1526869290000832,
+     "cpu_s": 2.014053,
+     "maxrss_kb": 156056
+    },
+    {
+     "wall_s": 1.160440818999632,
+     "cpu_s": 2.022351,
+     "maxrss_kb": 154060
+    },
+    {
+     "wall_s": 1.1430216230000951,
+     "cpu_s": 1.9986009999999998,
+     "maxrss_kb": 153504
+    },
+    {
+     "wall_s": 1.1875947970002017,
+     "cpu_s": 2.0919540000000003,
+     "maxrss_kb": 153980
+    },
+    {
+     "wall_s": 1.1623565970003256,
+     "cpu_s": 2.0837299999999996,
+     "maxrss_kb": 154656
+    },
+    {
+     "wall_s": 1.14576087200021,
+     "cpu_s": 2.003727,
+     "maxrss_kb": 154476
+    },
+    {
+     "wall_s": 1.155270277999989,
+     "cpu_s": 2.034029,
+     "maxrss_kb": 155388
+    },
+    {
+     "wall_s": 1.125860793999891,
+     "cpu_s": 1.988116,
+     "maxrss_kb": 154528
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 1.1539786035000361,
+    "min_s": 1.125860793999891,
+    "max_s": 1.1875947970002017,
+    "mean_s": 1.153402498800051,
+    "stdev_s": 0.016167531433933718,
+    "cpu_median_s": 2.018202,
+    "maxrss_median_kb": 154502.0,
+    "maxrss_max_kb": 156056
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "build-exe",
+   "scenario": "incr-edit-root",
+   "runs": [
+    {
+     "wall_s": 0.016537959000288538,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    },
+    {
+     "wall_s": 0.014130919999843172,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    },
+    {
+     "wall_s": 0.01384342800020022,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    },
+    {
+     "wall_s": 0.01361236299999291,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    },
+    {
+     "wall_s": 0.013475722999828577,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    },
+    {
+     "wall_s": 0.013493033000031573,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    },
+    {
+     "wall_s": 0.013279716999932134,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    },
+    {
+     "wall_s": 0.013216689999808295,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    },
+    {
+     "wall_s": 0.013607634999971197,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    },
+    {
+     "wall_s": 0.012926664000133314,
+     "cpu_s": null,
+     "maxrss_kb": 164548
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.013550334000001385,
+    "min_s": 0.012926664000133314,
+    "max_s": 0.016537959000288538,
+    "mean_s": 0.013812413200002992,
+    "stdev_s": 0.001013877574434979,
+    "cpu_median_s": null,
+    "maxrss_median_kb": 164548.0,
+    "maxrss_max_kb": 164548
+   },
+   "extra": {
+    "initial_update_s": 1.124234559999877,
+    "session_cpu_s": 2.160124,
+    "session_maxrss_kb": 164548
+   }
+  },
+  {
+   "workload": "vaxis",
+   "mode": "build-exe",
+   "scenario": "incr-edit-lib",
+   "runs": [
+    {
+     "wall_s": 0.031130974999996397,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    },
+    {
+     "wall_s": 0.034430424999754905,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    },
+    {
+     "wall_s": 0.033284657999956835,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    },
+    {
+     "wall_s": 0.027386923999983992,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    },
+    {
+     "wall_s": 0.028218351999839797,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    },
+    {
+     "wall_s": 0.026953206000143837,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    },
+    {
+     "wall_s": 0.031194669999877078,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    },
+    {
+     "wall_s": 0.029273784999986674,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    },
+    {
+     "wall_s": 0.026977078000072652,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    },
+    {
+     "wall_s": 0.027307801999995718,
+     "cpu_s": null,
+     "maxrss_kb": 166148
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.028746068499913235,
+    "min_s": 0.026953206000143837,
+    "max_s": 0.034430424999754905,
+    "mean_s": 0.02961578749996079,
+    "stdev_s": 0.0027456340581913604,
+    "cpu_median_s": null,
+    "maxrss_median_kb": 166148.0,
+    "maxrss_max_kb": 166148
+   },
+   "extra": {
+    "initial_update_s": 1.1413912509997317,
+    "session_cpu_s": 2.354056,
+    "session_maxrss_kb": 166148
+   }
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "cold",
+   "runs": [
+    {
+     "wall_s": 88.2649826779998,
+     "cpu_s": 89.589378,
+     "maxrss_kb": 949724
+    },
+    {
+     "wall_s": 86.06514151700003,
+     "cpu_s": 87.281203,
+     "maxrss_kb": 929296
+    },
+    {
+     "wall_s": 87.36862153899983,
+     "cpu_s": 88.560153,
+     "maxrss_kb": 916312
+    }
+   ],
+   "stats": {
+    "n": 3,
+    "median_s": 87.36862153899983,
+    "min_s": 86.06514151700003,
+    "max_s": 88.2649826779998,
+    "mean_s": 87.23291524466656,
+    "stdev_s": 1.1061814643847792,
+    "cpu_median_s": 88.560153,
+    "maxrss_median_kb": 929296,
+    "maxrss_max_kb": 949724
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "cold-local",
+   "runs": [
+    {
+     "wall_s": 5.260725915999956,
+     "cpu_s": 6.595592,
+     "maxrss_kb": 308812
+    },
+    {
+     "wall_s": 5.226573740999811,
+     "cpu_s": 6.494382,
+     "maxrss_kb": 306560
+    },
+    {
+     "wall_s": 5.166765460000079,
+     "cpu_s": 6.444701,
+     "maxrss_kb": 309768
+    },
+    {
+     "wall_s": 5.178451662000043,
+     "cpu_s": 6.461754,
+     "maxrss_kb": 305716
+    },
+    {
+     "wall_s": 5.197623967999789,
+     "cpu_s": 6.50418,
+     "maxrss_kb": 308372
+    },
+    {
+     "wall_s": 5.298283726999671,
+     "cpu_s": 6.654214,
+     "maxrss_kb": 313380
+    },
+    {
+     "wall_s": 5.191592850999768,
+     "cpu_s": 6.478075,
+     "maxrss_kb": 308220
+    },
+    {
+     "wall_s": 5.153127415000199,
+     "cpu_s": 6.48362,
+     "maxrss_kb": 312632
+    },
+    {
+     "wall_s": 5.189288342000054,
+     "cpu_s": 6.470121,
+     "maxrss_kb": 314992
+    },
+    {
+     "wall_s": 5.277812971999992,
+     "cpu_s": 6.563592,
+     "maxrss_kb": 309932
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 5.194608409499779,
+    "min_s": 5.153127415000199,
+    "max_s": 5.298283726999671,
+    "mean_s": 5.214024605399937,
+    "stdev_s": 0.04955179631966843,
+    "cpu_median_s": 6.489001,
+    "maxrss_median_kb": 309290.0,
+    "maxrss_max_kb": 314992
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "warm",
+   "runs": [
+    {
+     "wall_s": 0.01975280799979373,
+     "cpu_s": 0.020316999999999998,
+     "maxrss_kb": 39764
+    },
+    {
+     "wall_s": 0.01802831299983154,
+     "cpu_s": 0.018125,
+     "maxrss_kb": 39756
+    },
+    {
+     "wall_s": 0.01796689899992998,
+     "cpu_s": 0.018373999999999998,
+     "maxrss_kb": 39764
+    },
+    {
+     "wall_s": 0.017888023000068642,
+     "cpu_s": 0.018235,
+     "maxrss_kb": 39764
+    },
+    {
+     "wall_s": 0.017626931999984663,
+     "cpu_s": 0.018108,
+     "maxrss_kb": 39764
+    },
+    {
+     "wall_s": 0.016989398000077927,
+     "cpu_s": 0.01724,
+     "maxrss_kb": 39764
+    },
+    {
+     "wall_s": 0.01727762399968924,
+     "cpu_s": 0.017697,
+     "maxrss_kb": 39764
+    },
+    {
+     "wall_s": 0.01698379500021474,
+     "cpu_s": 0.017546,
+     "maxrss_kb": 39760
+    },
+    {
+     "wall_s": 0.017043919000116148,
+     "cpu_s": 0.017412999999999998,
+     "maxrss_kb": 39760
+    },
+    {
+     "wall_s": 0.016989537999961613,
+     "cpu_s": 0.017523999999999998,
+     "maxrss_kb": 39764
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.01745227799983695,
+    "min_s": 0.01698379500021474,
+    "max_s": 0.01975280799979373,
+    "mean_s": 0.017654724899966823,
+    "stdev_s": 0.0008527565265359138,
+    "cpu_median_s": 0.017902500000000002,
+    "maxrss_median_kb": 39764.0,
+    "maxrss_max_kb": 39764
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "edit-root",
+   "runs": [
+    {
+     "wall_s": 0.9174557970000023,
+     "cpu_s": 1.412855,
+     "maxrss_kb": 163092
+    },
+    {
+     "wall_s": 0.9172133570000369,
+     "cpu_s": 1.4101029999999999,
+     "maxrss_kb": 163996
+    },
+    {
+     "wall_s": 0.8903468559997236,
+     "cpu_s": 1.3802999999999999,
+     "maxrss_kb": 162928
+    },
+    {
+     "wall_s": 0.8981241280002905,
+     "cpu_s": 1.395072,
+     "maxrss_kb": 163356
+    },
+    {
+     "wall_s": 0.9168980009999359,
+     "cpu_s": 1.405348,
+     "maxrss_kb": 162952
+    },
+    {
+     "wall_s": 0.905346093999924,
+     "cpu_s": 1.4201199999999998,
+     "maxrss_kb": 162856
+    },
+    {
+     "wall_s": 0.8909306160003325,
+     "cpu_s": 1.382811,
+     "maxrss_kb": 163756
+    },
+    {
+     "wall_s": 0.8895962430001418,
+     "cpu_s": 1.390565,
+     "maxrss_kb": 163696
+    },
+    {
+     "wall_s": 0.8894193569999516,
+     "cpu_s": 1.388738,
+     "maxrss_kb": 162888
+    },
+    {
+     "wall_s": 1.005723493000005,
+     "cpu_s": 1.5404,
+     "maxrss_kb": 163960
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.9017351110001073,
+    "min_s": 0.8894193569999516,
+    "max_s": 1.005723493000005,
+    "mean_s": 0.9121053942000344,
+    "stdev_s": 0.035002099823828126,
+    "cpu_median_s": 1.40021,
+    "maxrss_median_kb": 163224.0,
+    "maxrss_max_kb": 163996
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "edit-lib",
+   "runs": [
+    {
+     "wall_s": 0.9002700689998164,
+     "cpu_s": 1.408522,
+     "maxrss_kb": 162828
+    },
+    {
+     "wall_s": 0.8890179559998614,
+     "cpu_s": 1.3869390000000001,
+     "maxrss_kb": 163332
+    },
+    {
+     "wall_s": 0.8602341040000283,
+     "cpu_s": 1.375572,
+     "maxrss_kb": 163396
+    },
+    {
+     "wall_s": 0.8775658489998932,
+     "cpu_s": 1.371772,
+     "maxrss_kb": 163228
+    },
+    {
+     "wall_s": 0.8912899719998677,
+     "cpu_s": 1.389484,
+     "maxrss_kb": 163028
+    },
+    {
+     "wall_s": 0.8959975689999737,
+     "cpu_s": 1.4127109999999998,
+     "maxrss_kb": 163252
+    },
+    {
+     "wall_s": 0.8969883019999543,
+     "cpu_s": 1.3943640000000002,
+     "maxrss_kb": 163456
+    },
+    {
+     "wall_s": 0.8976838190001217,
+     "cpu_s": 1.401002,
+     "maxrss_kb": 163344
+    },
+    {
+     "wall_s": 0.8940814230004435,
+     "cpu_s": 1.387858,
+     "maxrss_kb": 163752
+    },
+    {
+     "wall_s": 0.8946834140001556,
+     "cpu_s": 1.397771,
+     "maxrss_kb": 163712
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.8943824185002995,
+    "min_s": 0.8602341040000283,
+    "max_s": 0.9002700689998164,
+    "mean_s": 0.8897812477000115,
+    "stdev_s": 0.012159502726997659,
+    "cpu_median_s": 1.391924,
+    "maxrss_median_kb": 163338.0,
+    "maxrss_max_kb": 163752
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "incr-cli-edit-root",
+   "runs": [
+    {
+     "wall_s": 4.699554903000262,
+     "cpu_s": 5.523883,
+     "maxrss_kb": 311020
+    },
+    {
+     "wall_s": 4.706267552999634,
+     "cpu_s": 5.501183,
+     "maxrss_kb": 312260
+    },
+    {
+     "wall_s": 4.656961510999736,
+     "cpu_s": 5.436268999999999,
+     "maxrss_kb": 318204
+    },
+    {
+     "wall_s": 4.342934968000009,
+     "cpu_s": 5.047838,
+     "maxrss_kb": 313536
+    },
+    {
+     "wall_s": 4.097086774000218,
+     "cpu_s": 4.880126,
+     "maxrss_kb": 310168
+    },
+    {
+     "wall_s": 4.223966152999765,
+     "cpu_s": 4.936189000000001,
+     "maxrss_kb": 318828
+    },
+    {
+     "wall_s": 4.208049566000227,
+     "cpu_s": 4.98461,
+     "maxrss_kb": 311736
+    },
+    {
+     "wall_s": 4.258087304000128,
+     "cpu_s": 5.058425,
+     "maxrss_kb": 314820
+    },
+    {
+     "wall_s": 4.182392157999857,
+     "cpu_s": 4.902227,
+     "maxrss_kb": 313204
+    },
+    {
+     "wall_s": 4.200144257000375,
+     "cpu_s": 4.958102,
+     "maxrss_kb": 321860
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 4.241026728499946,
+    "min_s": 4.097086774000218,
+    "max_s": 4.706267552999634,
+    "mean_s": 4.357544514700021,
+    "stdev_s": 0.23613035917277708,
+    "cpu_median_s": 5.016223999999999,
+    "maxrss_median_kb": 313370.0,
+    "maxrss_max_kb": 321860
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "incr-cli-edit-lib",
+   "runs": [
+    {
+     "wall_s": 4.049324305000027,
+     "cpu_s": 4.768162,
+     "maxrss_kb": 313508
+    },
+    {
+     "wall_s": 4.13794827799984,
+     "cpu_s": 4.908504,
+     "maxrss_kb": 312668
+    },
+    {
+     "wall_s": 4.0368732830002045,
+     "cpu_s": 4.736667,
+     "maxrss_kb": 309652
+    },
+    {
+     "wall_s": 4.003399756999897,
+     "cpu_s": 4.722288,
+     "maxrss_kb": 312220
+    },
+    {
+     "wall_s": 4.287404109000363,
+     "cpu_s": 5.067919,
+     "maxrss_kb": 313008
+    },
+    {
+     "wall_s": 4.145521396999811,
+     "cpu_s": 4.869965,
+     "maxrss_kb": 309692
+    },
+    {
+     "wall_s": 4.057000448000053,
+     "cpu_s": 4.788411,
+     "maxrss_kb": 313300
+    },
+    {
+     "wall_s": 4.10000265599956,
+     "cpu_s": 4.818277,
+     "maxrss_kb": 310392
+    },
+    {
+     "wall_s": 4.145714678999866,
+     "cpu_s": 4.86952,
+     "maxrss_kb": 315360
+    },
+    {
+     "wall_s": 4.237769970000045,
+     "cpu_s": 5.001830999999999,
+     "maxrss_kb": 308788
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 4.1189754669997,
+    "min_s": 4.003399756999897,
+    "max_s": 4.287404109000363,
+    "mean_s": 4.120095888199967,
+    "stdev_s": 0.09030694302853876,
+    "cpu_median_s": 4.8438985,
+    "maxrss_median_kb": 312444.0,
+    "maxrss_max_kb": 315360
+   },
+   "extra": {}
+  }
+ ],
+ "skipped": [
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "incr-edit-root",
+   "reason": "In-process incremental through `zig build` needs `--watch`, which the harness does not drive; on Linux older than 6.5 it panics after the first build anyway (lib/compiler/Maker/Watch.zig calls name_to_handle_at with AT_HANDLE_FID, the kernel returns EINVAL, std.posix treats that as unreachable). The build-exe incr-* rows use the same compiler protocol `--watch` uses"
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "incr-edit-lib",
+   "reason": "In-process incremental through `zig build` needs `--watch`, which the harness does not drive; on Linux older than 6.5 it panics after the first build anyway (lib/compiler/Maker/Watch.zig calls name_to_handle_at with AT_HANDLE_FID, the kernel returns EINVAL, std.posix treats that as unreachable). The build-exe incr-* rows use the same compiler protocol `--watch` uses"
+  }
+ ]
+}
