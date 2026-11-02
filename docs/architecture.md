@@ -172,6 +172,26 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   symbol-table lookups take most of the rest. Shrinking relocation records
   is the lever if relinks need to get closer to memcpy speed.
 
+### compiler_rt (decided 2026-11-02)
+
+- Upstream compiles all of `lib/compiler_rt.zig` as a separate compilation
+  and links it into every binary (about 5,400 symbols even in a no-std
+  program); it is 3.9 s of upstream's cold hello world, and editing any std
+  file it imports rebuilds it.
+- zap makes compiler_rt a module of the same compilation instead, analyzed
+  lazily like everything else: when CodeGen or Sema needs a helper (for
+  example `__udivti3`, float conversions, f128 arithmetic), it references the
+  helper's declaration in the compiler_rt module, and only that function and
+  what it reaches are analyzed, generated, and cached. compiler_rt's
+  `comptime` export blocks are not analyzed; zap maps helper symbol names to
+  their declarations (upstream names the function after its symbol, e.g.
+  `pub fn __udivti3` in `compiler_rt/udivmod.zig`).
+- `@memcpy`, `@memset`, and `@memmove` are inlined by CodeGen
+  (`rep movsb`, `rep stosb`, and a direction check for overlap), not calls.
+- Consequence: zap binaries contain only the compiler_rt symbols they use.
+  Code that calls compiler_rt or `memcpy` by name gets them through the same
+  lazy reference, so it still links.
+
 ## The on-disk cache (milestone 6, designed now)
 
 Decided (2026-11-02): a Go-style content-addressed cache at declaration
