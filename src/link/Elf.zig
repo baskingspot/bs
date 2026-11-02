@@ -99,21 +99,21 @@ pub fn emit(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options) E
     return out.buf;
 }
 
-const MemoryOutput = struct {
+pub const MemoryOutput = struct {
     gpa: Allocator,
     buf: []u8 = &.{},
 
-    fn buffer(o: *MemoryOutput, _: std.Io, len: usize) Error![]u8 {
+    pub fn buffer(o: *MemoryOutput, _: std.Io, len: usize) Error![]u8 {
         o.buf = try o.gpa.alloc(u8, len);
         return o.buf;
     }
 };
 
-const FileOutput = struct {
+pub const FileOutput = struct {
     file: std.Io.File,
     map: []align(std.heap.page_size_min) u8 = &.{},
 
-    fn buffer(o: *FileOutput, io: std.Io, len: usize) ![]u8 {
+    pub fn buffer(o: *FileOutput, io: std.Io, len: usize) ![]u8 {
         try o.file.setLength(io, len);
         o.map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, o.file.handle, 0);
         return o.map;
@@ -678,7 +678,7 @@ const Link = struct {
 
 /// Runs `task(ctx, i, thread)` for every i < n_tasks on up to `n_threads`
 /// threads, the calling thread included.
-fn parallel(io: std.Io, n_threads: usize, n_tasks: usize, ctx: anytype, comptime task: fn (@TypeOf(ctx), usize, usize) void) std.Io.Cancelable!void {
+pub fn parallel(io: std.Io, n_threads: usize, n_tasks: usize, ctx: anytype, comptime task: fn (@TypeOf(ctx), usize, usize) void) std.Io.Cancelable!void {
     const Ctx = @TypeOf(ctx);
     const Worker = struct {
         fn work(c: Ctx, next: *std.atomic.Value(usize), total: usize, thread: usize) void {
@@ -722,7 +722,7 @@ pub fn populate(bytes: []u8) void {
     if (begin < end) std.posix.madvise(@ptrFromInt(begin), end - begin, MADV_POPULATE_WRITE) catch {};
 }
 
-fn prefetchSlice(comptime T: type, slice: []const T) void {
+pub fn prefetchSlice(comptime T: type, slice: []const T) void {
     const bytes = std.mem.sliceAsBytes(slice);
     var off: usize = 0;
     while (off < bytes.len) : (off += 64) @prefetch(bytes.ptr + off, .{});
@@ -733,17 +733,17 @@ fn prefetchSlice(comptime T: type, slice: []const T) void {
 /// uniformly distributed: their top bits pick a partition, so that threads
 /// can fill partitions independently, and their low bits the slot within
 /// it.
-const SymbolTable = struct {
+pub const SymbolTable = struct {
     entries: []Entry,
     partition_shift: u8,
     slot_mask: usize,
 
-    const Entry = struct { key: SymbolKey, value: u64, used: bool };
+    pub const Entry = struct { key: SymbolKey, value: u64, used: bool };
 
     /// Mapped directly, so it starts zeroed (all entries unused) and can ask
     /// for huge pages: lookups are random, and with 4 KiB pages most of them
     /// would also miss the TLB. See `populate`.
-    fn init(max_count: usize, n_partitions: usize) Allocator.Error!SymbolTable {
+    pub fn init(max_count: usize, n_partitions: usize) Allocator.Error!SymbolTable {
         // Partitions fill unevenly; the slack keeps small ones from filling
         // up, and hashed keys make a partition twice its expected size
         // practically impossible for large ones.
@@ -758,7 +758,7 @@ const SymbolTable = struct {
         };
     }
 
-    fn deinit(t: *SymbolTable) void {
+    pub fn deinit(t: *SymbolTable) void {
         std.heap.page_allocator.free(t.entries);
     }
 
@@ -767,17 +767,17 @@ const SymbolTable = struct {
     /// replaces it, and that replacement flushes the TLB of every CPU
     /// running the other threads. Threads populate their own partitions, so
     /// the kernel zeroes them in parallel.
-    fn populate(t: *const SymbolTable, partition_index: usize) void {
+    pub fn populate(t: *const SymbolTable, partition_index: usize) void {
         Elf.populate(std.mem.sliceAsBytes(t.partitionEntries(partition_index)));
     }
 
-    fn partitionEntries(t: *const SymbolTable, partition_index: usize) []Entry {
+    pub fn partitionEntries(t: *const SymbolTable, partition_index: usize) []Entry {
         return t.entries[partition_index * (t.slot_mask + 1) ..][0 .. t.slot_mask + 1];
     }
 
     const huge_page: std.mem.Alignment = .fromByteUnits(2 << 20);
 
-    fn partition(t: *const SymbolTable, key: SymbolKey) usize {
+    pub fn partition(t: *const SymbolTable, key: SymbolKey) usize {
         return if (t.partition_shift == 128) 0 else @intCast(@backingInt(key) >> @intCast(t.partition_shift));
     }
 
@@ -787,7 +787,7 @@ const SymbolTable = struct {
 
     /// The entry for `key`: used if `key` is present, else the free slot to
     /// fill in.
-    fn getOrPut(t: *const SymbolTable, key: SymbolKey) *Entry {
+    pub fn getOrPut(t: *const SymbolTable, key: SymbolKey) *Entry {
         const first = t.partition(key) * (t.slot_mask + 1);
         var slot: usize = @as(usize, @truncate(@backingInt(key))) & t.slot_mask;
         while (true) : (slot = (slot + 1) & t.slot_mask) {
@@ -796,11 +796,11 @@ const SymbolTable = struct {
         }
     }
 
-    fn prefetch(t: *const SymbolTable, key: SymbolKey) void {
+    pub fn prefetch(t: *const SymbolTable, key: SymbolKey) void {
         @prefetch(&t.entries[t.home(key)], .{});
     }
 
-    fn get(t: *const SymbolTable, key: SymbolKey) ?u64 {
+    pub fn get(t: *const SymbolTable, key: SymbolKey) ?u64 {
         const e = t.getOrPut(key);
         return if (e.used) e.value else null;
     }
@@ -825,11 +825,11 @@ fn nonAlloc(name: u32, ty: elf.SHT, offset: u64, size: u64) elf.Elf64.Shdr {
     return .{ .name = name, .type = ty, .flags = .{ .shf = .{} }, .addr = 0, .offset = offset, .size = size, .link = 0, .info = 0, .addralign = 1, .entsize = 0 };
 }
 
-fn writeStruct(dst: []u8, s: anytype) void {
+pub fn writeStruct(dst: []u8, s: anytype) void {
     @memcpy(dst[0..@sizeOf(@TypeOf(s))], std.mem.asBytes(&s));
 }
 
-fn identical(a: *const Atom, b: *const Atom) bool {
+pub fn identical(a: *const Atom, b: *const Atom) bool {
     if (a.section != b.section or a.alignment != b.alignment or a.size() != b.size() or
         a.targets.len != b.targets.len or a.relocs.len != b.relocs.len) return false;
     if (!std.mem.eql(u8, a.bytes, b.bytes)) return false;

@@ -213,7 +213,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   output file once. No incremental patching of output files; a full relink is
   a memcpy-dominated pass over cached Atoms.
 - x86_64-linux: static ELF first. aarch64-macos: Mach-O against libSystem,
-  ad-hoc code signature.
+  ad-hoc code signature. The Mach-O linker (`src/link/MachO.zig`) has the
+  same phases as the ELF linker and shares its thread pool, symbol table,
+  and output buffers.
 - The ELF linker (`src/link/Elf.zig`) builds the whole file in one buffer
   (for `link`, a shared mapping of the new file, which replaces any old file
   instead of truncating it). Segments: R (headers, .rodata), RX (.text), RW
@@ -266,6 +268,30 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   Stripped emit got about 1.5–2 ms slower on one thread (35.6–37.8 →
   37.4–39.5 ms) because Atoms grew from 104 to 160 bytes to hold `Debug`
   inline.
+- Mach-O output is a PIE: __PAGEZERO, __TEXT (header, __text, __stubs,
+  __const), __DATA_CONST (__got, and __const for `.rodata` atoms holding
+  absolute addresses), __DATA (__data, __bss), __LINKEDIT, all on 16 KiB
+  pages. Imports (`Options.imports`, all from libSystem) each get a GOT
+  slot and a stub; branch26 to an import goes to the stub, the GOT forms
+  load the slot, and absolute addresses of imports in data are binds.
+  Rebases and binds are chained fixups (`DYLD_CHAINED_PTR_64_OFFSET`, as
+  ld64 emits for arm64 since macOS 12), linked into per-page chains in one
+  serial pass; there are no dyld opcodes. The file ends in an ld64-style
+  "linker-signed" ad-hoc signature: one CodeDirectory with a SHA-256 hash
+  per 4 KiB page, hashed in parallel; the UUID comes from the same hashes,
+  so the file is read once for both. `link` must invalidate its mapping of
+  the output before unmapping it, or macOS kills every run of the file
+  despite a valid signature (golang/go#42684). It ignores Atoms' `debug`
+  for now; Mach-O debug info comes later.
+- Measured Mach-O link throughput (2026-11-02, Apple M4 Max, 12+4 cores,
+  `zig build bench-link -- macho`, best of 15): the same 100k atoms with
+  aarch64 relocations (970k: a constant reference is an adrp/add pair) and
+  64 imports; output 26.9 MiB. Emit takes 22.5 ms on one thread (7.3x the
+  1-thread floor of 3.1 ms; stripped ELF on the same machine: 11.0 ms) and
+  3.1 ms on 16 (ELF: 2.0 ms); linking to a file takes 12.4 ms (ELF, with
+  DWARF: 13.3 ms). SHA-256 of the 27 MiB output alone takes 8.8 ms on one
+  thread, most of the gap to stripped ELF; the rest is the extra
+  relocations.
 
 ### compiler_rt (decided 2026-11-02)
 

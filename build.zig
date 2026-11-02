@@ -49,7 +49,9 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     }) });
     b.step("bench-intern", "Measure InternPool get() throughput on a Sema-like key mix").dependOn(&b.addRunArtifact(bench_intern).step);
-    b.step("bench-link", "Measure ELF link throughput on ~100k synthetic atoms").dependOn(&b.addRunArtifact(bench_link).step);
+    const bench_link_run = b.addRunArtifact(bench_link);
+    bench_link_run.addPassthruArgs();
+    b.step("bench-link", "Measure link throughput on ~100k synthetic atoms (args: elf (default) or macho)").dependOn(&bench_link_run.step);
 }
 
 /// Each `test/run/*.zig` program (other than the shared `rt.zig`) starts
