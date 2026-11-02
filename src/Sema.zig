@@ -1551,10 +1551,10 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const body = sema.code.bodySlice(extra.end, extra.data.body_len);
             var child = block.child();
             defer child.instructions.deinit(sema.gpa);
-            // The operand is analyzed for its type only; any IR it emits is
-            // never referenced by a body.
+            // The operand is analyzed for its type only, as runtime code even
+            // in a comptime scope (like upstream); any IR it emits is never
+            // referenced by a body.
             child.is_comptime = false;
-            if (block.is_comptime) child.is_comptime = true;
             const operand = try sema.resolveInlineBody(&child, body, inst);
             break :blk .fromInterned(sema.typeOf(operand));
         },
@@ -4331,10 +4331,14 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
                 const b_int = kb.ptr.base == .int;
                 // Addresses from integers compare by value; an address of
                 // memory is never 0.
-                const known: ?bool = if (a_int and b_int)
+                const known: ?bool = if (a == b)
+                    true
+                else if (a_int and b_int)
                     ka.ptr.byte_offset == kb.ptr.byte_offset
                 else if ((a_int and ka.ptr.byte_offset == 0) or (b_int and kb.ptr.byte_offset == 0))
                     false
+                else if (!a_int and !b_int)
+                    sema.comptimePtrsEqual(ka.ptr, kb.ptr)
                 else
                     null;
                 if (known) |eq| return .fromInterned(boolValue(eq == (op == .eq)));
@@ -4524,6 +4528,7 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
         }
     }
     try sema.requireRuntime(block, src);
+    try sema.resolveLayout(block, src, info.child);
     if (!Type.hasRuntimeBits(ip, info.child)) return;
     _ = try sema.addBinOp(block, .store, ptr, operand);
 }
@@ -4537,11 +4542,11 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
         if (try sema.comptimeLoadOrNull(block, src, pv)) |v| return .fromInterned(v);
     }
     try sema.requireRuntime(block, src);
+    try sema.resolveLayout(block, src, info.child);
     if (!Type.hasRuntimeBits(ip, info.child)) {
         if (info.child == .void_type) return .void_value;
         if (Type.isComptimeOnly(ip, info.child)) return sema.fail(block, src, "unable to load comptime-only type '{f}' at runtime", .{sema.fmtType(info.child)});
     }
-    try sema.resolveLayout(block, src, info.child);
     return sema.addTyOp(block, .load, info.child, ptr);
 }
 
@@ -4601,6 +4606,28 @@ fn comptimePtrRoot(sema: *Sema, ptr: Index) !PtrRoot {
             else => return .int,
         }
     }
+}
+
+/// Whether two comptime-known pointers into memory (not from integers)
+/// are equal, or null if zap cannot tell without their layouts.
+fn comptimePtrsEqual(sema: *Sema, a: InternPool.Ptr, b: InternPool.Ptr) ?bool {
+    if (std.meta.eql(a.base, b.base) and a.byte_offset == b.byte_offset) return true;
+    // Pointers into different allocations differ.
+    const ra = sema.ptrRootBase(a);
+    const rb = sema.ptrRootBase(b);
+    if (!std.meta.eql(ra, rb)) return false;
+    return null;
+}
+
+/// The allocation a comptime pointer points into.
+fn ptrRootBase(sema: *Sema, ptr: InternPool.Ptr) InternPool.Ptr.BaseAddr {
+    var k = ptr;
+    while (true) switch (k.base) {
+        .field => |f| k = sema.ip.indexToKey(f.base).ptr,
+        .elem => |e| k = sema.ip.indexToKey(e.base).ptr,
+        .uav => |u| return .{ .uav = .{ .val = u.val, .orig_ty = .none } },
+        else => return k.base,
+    };
 }
 
 /// Loads through a comptime-known pointer, or returns null if the memory is
@@ -4744,7 +4771,7 @@ fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) C
                     return sema.comptimeStore(block, src, e.base, try sema.intern(.{ .aggregate = .{ .ty = parent_ty, .storage = .{ .elems = elems } } }));
                 }
             }
-            if (e.index >= a.len or val_ty != a.child) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+            if (e.index >= a.lenIncludingSentinel() or val_ty != a.child) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
             try sema.comptimeStore(block, src, e.base, try sema.withElem(parent, e.index, val));
         },
         else => return sema.fail(block, src, "unable to store to this memory at comptime", .{}),
@@ -5483,9 +5510,9 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                     // A pointer to the subarray starting at element `e.index`.
                     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = k.base } }));
                 },
-                else => {},
+                // The same address viewed as an array pointer.
+                else => return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = k.base, .byte_offset = k.byte_offset } })),
             }
-            return sema.failUnsupported(block, src, "comptime slicing of this pointer");
         }
         return sema.addTyOp(block, .bitcast, result_ty, new_ptr);
     };
