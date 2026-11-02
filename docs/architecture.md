@@ -201,6 +201,25 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   4 ms applying relocations, about 5 ms of symbol-table output, and about
   5 ms of dedup, layout, and address resolution. Keys resolved to dense
   indices once in the on-disk cache (milestone 6) could remove the probes.
+- Debug info (`src/link/Dwarf.zig`, shared with the Mach-O linker later) is
+  DWARF 5 with one compile unit for the whole output: .debug_abbrev, a
+  .debug_info subprogram entry per function with `debug` (name, low_pc,
+  high_pc, decl_file, decl_line), and one .debug_line sequence per such
+  function. Per-atom sizes depend only on the atom (the file index is a
+  padded ULEB128), so layout computes them per chunk and the copy phase
+  writes them in place; each chunk dedups its atoms' file paths and a serial
+  step merges them into the file table, whose directories are resolved
+  against `comp_dir`. gdb (`break file.zig:N`, `break fn`, `bt`) and
+  std.debug's ElfFile/Dwarf read it; std.debug requires a .debug_str, so
+  it holds the producer string. No CFI yet: debuggers unwind through the
+  rbp frame chain. Per-module compile units, types, variables, and rbrace
+  (epilogue) rows come later. Cost (bench-link with a line row every
+  8..40 bytes, 3.4 MiB of fragments, output 27.4 → 35.7 MiB): emit +6.5–8 ms
+  on one thread (37–39 → 44–47 ms) and +2.3–3.3 ms on four (13–14 →
+  15–17.5 ms); about 2–5 µs of the 55–90 µs link of each run test.
+  Stripped emit got about 1.5–2 ms slower on one thread (35.6–37.8 →
+  37.4–39.5 ms) because Atoms grew from 104 to 160 bytes to hold `Debug`
+  inline.
 
 ### compiler_rt (decided 2026-11-02)
 

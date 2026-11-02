@@ -90,7 +90,10 @@ pub fn finish(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !b
         try values.append(emit.gpa, .{ .key = errorKey(ip, name), .value = try ip.errorValue(name) });
     }
     var diag: Elf.Diagnostic = .{};
-    Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = entry_key, .values = values.items, .diag = &diag }) catch |err| {
+    // Source paths are as the compiler opened them, relative to the cwd.
+    const cwd = try std.process.currentPathAlloc(io, emit.gpa);
+    defer emit.gpa.free(cwd);
+    Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = entry_key, .values = values.items, .diag = &diag, .comp_dir = cwd }) catch |err| {
         std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
         return false;
     };
