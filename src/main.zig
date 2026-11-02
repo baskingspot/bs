@@ -155,4 +155,5 @@ pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
 
 test {
     _ = Frontend;
+    _ = @import("link/Atom.zig");
 }
