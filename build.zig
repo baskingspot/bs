@@ -40,6 +40,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     }) });
+    const bench_intern = b.addExecutable(.{ .name = "bench-intern", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/bench_intern.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }) });
+    b.step("bench-intern", "Measure InternPool get() throughput on a Sema-like key mix").dependOn(&b.addRunArtifact(bench_intern).step);
     b.step("bench-link", "Measure ELF link throughput on ~100k synthetic atoms").dependOn(&b.addRunArtifact(bench_link).step);
 }
 

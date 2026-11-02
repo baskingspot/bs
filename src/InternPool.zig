@@ -576,17 +576,20 @@ const Local = struct {
 
 const Shard = struct {
     mutex: Io.Mutex = .init,
-    map: std.HashMapUnmanaged(Index, void, IndexContext, 80) = .empty,
+    /// Entries carry the low 64 bits of the item's stable hash, so a probe
+    /// rejects non-matching entries without loading the item.
+    map: std.HashMapUnmanaged(Entry, void, EntryContext, 80) = .empty,
     string_map: std.HashMapUnmanaged(String, void, StringContext, 80) = .empty,
 };
 
-const IndexContext = struct {
-    ip: *const InternPool,
-    pub fn hash(ctx: IndexContext, i: Index) u64 {
-        return @truncate(ctx.ip.stableHash(i));
+const Entry = struct { hash: u64, index: Index };
+
+const EntryContext = struct {
+    pub fn hash(_: EntryContext, e: Entry) u64 {
+        return e.hash;
     }
-    pub fn eql(_: IndexContext, a: Index, b: Index) bool {
-        return a == b;
+    pub fn eql(_: EntryContext, a: Entry, b: Entry) bool {
+        return a.index == b.index;
     }
 };
 
@@ -596,8 +599,8 @@ const KeyAdapter = struct {
     pub fn hash(ka: KeyAdapter, _: Key) u64 {
         return @truncate(ka.key_hash);
     }
-    pub fn eql(ka: KeyAdapter, key: Key, i: Index) bool {
-        return ka.ip.stableHash(i) == ka.key_hash and keyEql(ka.ip, key, ka.ip.indexToKey(i));
+    pub fn eql(ka: KeyAdapter, key: Key, e: Entry) bool {
+        return e.hash == @as(u64, @truncate(ka.key_hash)) and keyEql(ka.ip, key, ka.ip.indexToKey(e.index));
     }
 };
 
@@ -767,14 +770,30 @@ pub fn errorValue(ip: *InternPool, name: String) !u32 {
 // ---------------------------------------------------------------------------
 // Interning
 
-pub fn get(ip: *InternPool, tid: Tid, key: Key) Allocator.Error!Index {
+/// The dedup shard of a key. Chosen by the hash's high bits; the shard's
+/// map uses the low bits, which would otherwise be equal within a shard.
+fn shardOf(ip: *InternPool, key_hash: Hash) *Shard {
+    return &ip.shards[@as(usize, @truncate(key_hash >> 64)) & (ip.shards.len - 1)];
+}
+
+/// The index of `key` if it is interned.
+pub fn find(ip: *InternPool, key: Key) ?Index {
     const key_hash = ip.hashKey(key);
-    const shard = &ip.shards[@as(usize, @truncate(key_hash)) & (ip.shards.len - 1)];
+    const shard = ip.shardOf(key_hash);
     shard.mutex.lockUncancelable(ip.io);
     defer shard.mutex.unlock(ip.io);
-    const gop = try shard.map.getOrPutContextAdapted(ip.gpa, key, KeyAdapter{ .ip = ip, .key_hash = key_hash }, .{ .ip = ip });
-    if (gop.found_existing) return gop.key_ptr.*;
-    errdefer _ = shard.map.removeContext(gop.key_ptr.*, .{ .ip = ip });
+    const e = shard.map.getKeyAdapted(key, KeyAdapter{ .ip = ip, .key_hash = key_hash }) orelse return null;
+    return e.index;
+}
+
+pub fn get(ip: *InternPool, tid: Tid, key: Key) Allocator.Error!Index {
+    const key_hash = ip.hashKey(key);
+    const shard = ip.shardOf(key_hash);
+    shard.mutex.lockUncancelable(ip.io);
+    defer shard.mutex.unlock(ip.io);
+    const gop = try shard.map.getOrPutContextAdapted(ip.gpa, key, KeyAdapter{ .ip = ip, .key_hash = key_hash }, .{});
+    if (gop.found_existing) return gop.key_ptr.index;
+    errdefer _ = shard.map.removeContext(gop.key_ptr.*, .{});
     const local = &ip.locals[@backingInt(tid)];
     const item = try ip.encode(local, key);
     try local.hashes.ensureUnused(ip.gpa, 1);
@@ -782,7 +801,7 @@ pub fn get(ip: *InternPool, tid: Tid, key: Key) Allocator.Error!Index {
     _ = try local.hashes.append(ip.gpa, key_hash);
     assert(local.hashes.len.raw == local.items.len.raw);
     const index: Index = @fromBackingInt(ip.wrap(tid, i));
-    gop.key_ptr.* = index;
+    gop.key_ptr.* = .{ .hash = @truncate(key_hash), .index = index };
     return index;
 }
 
@@ -993,25 +1012,61 @@ pub fn stableHash(ip: *const InternPool, index: Index) Hash {
 // ---------------------------------------------------------------------------
 // Stable hashing and key equality
 
+/// Builds a 128-bit stable hash, the format of cache keys. Fields are
+/// appended to a small buffer that is hashed in one call (chained for long
+/// inputs): per-field streaming updates cost more than the hash itself for
+/// typical keys.
 pub const Hasher = struct {
-    h: std.crypto.auth.siphash.SipHash128(1, 3),
+    buf: [buf_len]u8 = undefined,
+    len: usize = 0,
+    chain: Hash = 0,
+
+    const buf_len = 128;
 
     pub fn init(domain: []const u8) Hasher {
-        var hasher: Hasher = .{ .h = .init(&@splat(0)) };
+        var hasher: Hasher = .{};
         hasher.bytes(domain);
         return hasher;
     }
     pub fn bytes(hasher: *Hasher, b: []const u8) void {
         hasher.int(u64, b.len);
-        hasher.h.update(b);
+        if (b.len <= buf_len - hasher.len) {
+            @memcpy(hasher.buf[hasher.len..][0..b.len], b);
+            hasher.len += b.len;
+            return;
+        }
+        var d = b;
+        while (d.len > 0) {
+            if (hasher.len == buf_len) hasher.flush();
+            const n = @min(d.len, buf_len - hasher.len);
+            @memcpy(hasher.buf[hasher.len..][0..n], d[0..n]);
+            hasher.len += n;
+            d = d[n..];
+        }
     }
     pub fn int(hasher: *Hasher, comptime T: type, v: T) void {
-        hasher.h.update(std.mem.asBytes(&v));
+        const n = @sizeOf(T);
+        if (hasher.len + n > buf_len) hasher.flush();
+        hasher.buf[hasher.len..][0..n].* = std.mem.toBytes(v);
+        hasher.len += n;
     }
     pub fn final(hasher: *Hasher) Hash {
-        return std.mem.readInt(u128, &hasher.h.finalResult(), .little);
+        return hash128(hasher.chain, hasher.buf[0..hasher.len]);
+    }
+    fn flush(hasher: *Hasher) void {
+        hasher.chain = hash128(hasher.chain, hasher.buf[0..hasher.len]);
+        hasher.len = 0;
     }
 };
+
+/// Two seeded Wyhash passes. Not cryptographic: stable hashes identify
+/// content, they do not defend against chosen collisions. Measured against
+/// SipHash128 with `zig build bench-intern`.
+fn hash128(seed: Hash, data: []const u8) Hash {
+    const lo = std.hash.Wyhash.hash(@truncate(seed), data);
+    const hi = std.hash.Wyhash.hash(@as(u64, @truncate(seed >> 64)) ^ 0x9e3779b97f4a7c15, data);
+    return @as(Hash, hi) << 64 | lo;
+}
 
 fn hashIndex(ip: *const InternPool, hasher: *Hasher, i: Index) void {
     hasher.int(Hash, if (i == .none) 0 else ip.stableHash(i));
@@ -1026,7 +1081,8 @@ fn hashString(ip: *const InternPool, hasher: *Hasher, s: String) void {
     hasher.bytes(ip.stringSlice(s));
 }
 
-fn hashKey(ip: *const InternPool, key: Key) Hash {
+/// The stable hash of `key`, which is also its dedup hash.
+pub fn hashKey(ip: *const InternPool, key: Key) Hash {
     var h: Hasher = .init(@tagName(key));
     switch (key) {
         .int_type => |t| {
