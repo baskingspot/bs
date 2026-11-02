@@ -224,7 +224,14 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     // Within the value body, the `declaration` instruction refers to the type.
     if (decl_ty != .none) try sema.inst_map.put(sema.gpa, nav.zir_inst, .fromInterned(decl_ty));
     var val_ref = try sema.resolveInlineBody(&block, decl.value_body.?, nav.zir_inst);
-    if (decl_ty != .none) val_ref = try sema.coerce(&block, decl_ty, val_ref, src);
+    if (decl_ty != .none) {
+        const tree = &zcu.file(nav.file).tree;
+        const init_src: Src = if (tree.fullVarDecl(decl.src_node)) |vd|
+            if (vd.ast.init_node.unwrap()) |n| .{ .base = decl.src_node, .loc = .{ .node_abs = n } } else src
+        else
+            src;
+        val_ref = try sema.coerce(&block, decl_ty, val_ref, init_src);
+    }
     const val = try sema.resolveConstValue(&block, src, val_ref, "global variable initializer must be comptime-known");
     nav.val = val;
     nav.ty = sema.ip.typeOf(val);
@@ -1168,7 +1175,7 @@ fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src) CompileError!void 
         return error.ComptimeReturn;
     }
     if (b.is_comptime) return sema.fail(b, src, "function called at runtime cannot return value at comptime", .{});
-    try sema.recordInferredErrors(operand);
+    try sema.recordInferredErrors(b, src, operand);
     const coerced = try sema.coerce(b, sema.fn_ret_ty, operand, src);
     _ = try sema.addUnOp(b, .ret, coerced);
 }
@@ -1905,16 +1912,27 @@ fn errorSetType(sema: *Sema, names: []InternPool.String) !Index {
 
 /// The names of an explicit error set, or null for `anyerror` and
 /// inferred error sets.
-fn errorSetNames(sema: *Sema, ty: Index) ?[]const InternPool.String {
+/// The names in error set `ty`, or null if it is `anyerror` or not yet
+/// known (the inferred error set of the function being analyzed). Resolving
+/// another function's inferred error set analyzes that function's body.
+fn errorSetNames(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!?[]const InternPool.String {
     return switch (sema.ip.indexToKey(ty)) {
         .error_set_type => |names| names,
+        .inferred_error_set_type => |func| {
+            if (func == sema.func) return null;
+            try sema.declareDependency(.{ .func_ies = func });
+            return sema.zcu.ensureFuncIes(func) catch |err| switch (err) {
+                error.DependencyLoop => return sema.fail(block, src, "unable to resolve inferred error set", .{}),
+                else => |e| return e,
+            };
+        },
         else => null,
     };
 }
 
 fn mergeErrorSets(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileError!Index {
-    const an = sema.errorSetNames(a) orelse return if (a == .anyerror_type) .anyerror_type else sema.failUnsupported(block, src, "merging inferred error sets");
-    const bn = sema.errorSetNames(b) orelse return if (b == .anyerror_type) .anyerror_type else sema.failUnsupported(block, src, "merging inferred error sets");
+    const an = (try sema.errorSetNames(block, src, a)) orelse return if (a == .anyerror_type) .anyerror_type else sema.failUnsupported(block, src, "merging inferred error sets");
+    const bn = (try sema.errorSetNames(block, src, b)) orelse return if (b == .anyerror_type) .anyerror_type else sema.failUnsupported(block, src, "merging inferred error sets");
     const names = try sema.arena.alloc(InternPool.String, an.len + bn.len);
     @memcpy(names[0..an.len], an);
     @memcpy(names[an.len..], bn);
@@ -1926,7 +1944,7 @@ fn currentRetTy(sema: *Sema, block: *Block) Index {
     return sema.fn_ret_ty;
 }
 
-fn recordInferredErrors(sema: *Sema, operand: Ref) !void {
+fn recordInferredErrors(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!void {
     if (sema.func == .none) return;
     const ret = sema.ip.indexToKey(sema.fn_ret_ty);
     if (ret != .error_union_type) return;
@@ -1937,12 +1955,12 @@ fn recordInferredErrors(sema: *Sema, operand: Ref) !void {
         .error_union_type => |e| e.error_set_type,
         else => return,
     };
-    try sema.addInferredErrors(set);
+    try sema.addInferredErrors(block, src, set);
 }
 
 /// Adds the errors of `set` to the current function's inferred error set.
-fn addInferredErrors(sema: *Sema, set: Index) !void {
-    const names = sema.errorSetNames(set) orelse return;
+fn addInferredErrors(sema: *Sema, block: *Block, src: Src, set: Index) CompileError!void {
+    const names = (try sema.errorSetNames(block, src, set)) orelse return;
     const gop = try sema.zcu.inferred_errors.getOrPut(sema.gpa, sema.func);
     if (!gop.found_existing) gop.value_ptr.* = .empty;
     outer: for (names) |n| {
@@ -2075,7 +2093,7 @@ fn errorSetCoercible(sema: *Sema, block: *Block, src: Src, src_ty: Index, dest_t
     switch (ip.indexToKey(dest_ty)) {
         .inferred_error_set_type => |func| {
             if (func == sema.func) {
-                if (sema.errorSetNames(src_ty)) |_| try sema.addInferredErrors(src_ty) else if (ip.indexToKey(src_ty) != .inferred_error_set_type) {
+                if (try sema.errorSetNames(block, src, src_ty)) |_| try sema.addInferredErrors(block, src, src_ty) else if (ip.indexToKey(src_ty) != .inferred_error_set_type) {
                     return sema.fail(block, src, "zap does not support coercing '{f}' into an inferred error set yet", .{sema.fmtType(src_ty)});
                 }
             }
@@ -2083,13 +2101,13 @@ fn errorSetCoercible(sema: *Sema, block: *Block, src: Src, src_ty: Index, dest_t
         },
         else => {},
     }
-    const dest_names = sema.errorSetNames(dest_ty).?;
+    const dest_names = (try sema.errorSetNames(block, src, dest_ty)) orelse return false;
     if (val != .none and ip.indexToKey(val) == .err) {
         const name = ip.indexToKey(val).err.name;
         for (dest_names) |n| if (n == name) return true;
         return false;
     }
-    const src_names = sema.errorSetNames(src_ty) orelse return false;
+    const src_names = (try sema.errorSetNames(block, src, src_ty)) orelse return false;
     outer: for (src_names) |s| {
         for (dest_names) |d| if (d == s) continue :outer;
         return false;
@@ -3037,13 +3055,16 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
             if (p.flags.size != .one) return sema.fail(block, src, "type '{f}' does not support field access", .{sema.fmtType(ty)});
             switch (Type.class(ip, p.child)) {
                 .array => if (std.mem.eql(u8, name, "len")) return .fromInterned(try sema.intValue(.usize_type, ip.indexToKey(p.child).array_type.len)),
-                .@"struct", .tuple => return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
+                .tuple => if (std.mem.eql(u8, name, "len")) return .fromInterned(try sema.intValue(.comptime_int_type, ip.indexToKey(p.child).tuple_type.types.len)) else return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
+                .@"struct" => return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
                 .pointer, .type => return sema.fieldVal(block, src, try sema.analyzeLoad(block, src, lhs), name),
                 else => {},
             }
             return sema.fail(block, src, "no member named '{s}' in '{f}'", .{ name, sema.fmtType(p.child) });
         },
         .@"struct", .tuple => {
+            if (ip.indexToKey(ty) == .tuple_type and std.mem.eql(u8, name, "len"))
+                return .fromInterned(try sema.intValue(.comptime_int_type, ip.indexToKey(ty).tuple_type.types.len));
             const i = try sema.structFieldIndex(block, src, ty, name);
             if (ip.indexToKey(ty) == .tuple_type) return sema.tupleField(block, lhs, i);
             if (sema.resolveValue(lhs)) |v| return .fromInterned(try sema.fieldValue(v, i));
@@ -3060,7 +3081,7 @@ fn namespaceLookupVal(sema: *Sema, block: *Block, src: Src, container: Index, na
     const ip = sema.ip;
     if (Type.class(ip, container) == .error_set) {
         const n = try sema.getString(name);
-        if (sema.errorSetNames(container)) |names| {
+        if (try sema.errorSetNames(block, src, container)) |names| {
             for (names) |x| if (x == n) return .fromInterned(try sema.intern(.{ .err = .{ .ty = container, .name = n } }));
             return sema.fail(block, src, "no error named '{s}' in '{f}'", .{ name, sema.fmtType(container) });
         }
@@ -4330,7 +4351,7 @@ fn zirCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const src = block.nodeSrc(data.src_node);
     const extra = sema.code.extraData(Zir.Inst.Call, data.payload_index);
     const callee = sema.resolveInst(extra.data.callee);
-    const modifier: std.lang.CallModifier = @enumFromInt(extra.data.flags.packed_modifier);
+    const modifier: std.lang.CallModifier = @fromBackingInt(@intCast(extra.data.flags.packed_modifier));
     return sema.analyzeCall(block, src, callee, .none, .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len }, modifier);
 }
 
@@ -4341,7 +4362,7 @@ fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const extra = sema.code.extraData(Zir.Inst.FieldCall, data.payload_index);
     const name = sema.zirString(extra.data.field_name_start);
     const obj = sema.resolveInst(extra.data.obj_ptr);
-    const modifier: std.lang.CallModifier = @enumFromInt(extra.data.flags.packed_modifier);
+    const modifier: std.lang.CallModifier = @fromBackingInt(@intCast(extra.data.flags.packed_modifier));
     const args: @FieldType(CallArgs, "zir") = .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len };
     const obj_ty = sema.typeOf(obj);
     if (obj_ty == .type_type) {
@@ -4456,7 +4477,15 @@ fn analyzeCall(
     try sema.zcu.queueFunc(callee_func);
     for (callee_fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
     try sema.resolveLayout(block, src, callee_fn_ty.return_type);
-    const payload = try sema.addExtra(Ir.Call{ .args_len = @intCast(call_args.len) });
+    var call_ret_ty = callee_fn_ty.return_type;
+    if (ip.indexToKey(call_ret_ty) == .error_union_type) {
+        const eu = ip.indexToKey(call_ret_ty).error_union_type;
+        if (eu.error_set_type == .adhoc_inferred_error_set_type) {
+            const ies = try sema.intern(.{ .inferred_error_set_type = callee_func });
+            call_ret_ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = ies, .payload_type = eu.payload_type } });
+        }
+    }
+    const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len) });
     try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(call_args));
     return sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = .fromInterned(callee_func), .payload = payload } } });
 }
@@ -4531,7 +4560,10 @@ fn calleeRetTy(sema: *Sema, callee_block: *Block, src: Src, func: Index) Compile
     const ret = ip.indexToKey(f.ty).func_type.return_type;
     if (ret != .generic_poison_type) return ret;
     const fn_info = sema.code.getFnInfo(f.zir_inst);
-    var ty = try sema.analyzeAsType(callee_block, src, try sema.resolveInlineBody(callee_block, fn_info.ret_ty_body, f.zir_inst));
+    var ty = if (fn_info.ret_ty_body.len != 0)
+        try sema.analyzeAsType(callee_block, src, try sema.resolveInlineBody(callee_block, fn_info.ret_ty_body, f.zir_inst))
+    else
+        try sema.resolveType(callee_block, src, fn_info.ret_ty_ref);
     if (fn_info.inferred_error_set) {
         ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = .adhoc_inferred_error_set_type, .payload_type = ty } });
     }
@@ -4628,4 +4660,242 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) 
         .comptime_args = comptime_args,
     } });
     return .{ .func = instance, .runtime_args = runtime_args.items };
+}
+
+// ---------------------------------------------------------------------------
+// Tests: analyze a source file and compare the IR dump or the errors.
+
+const Frontend = @import("Frontend.zig");
+
+fn testAnalyze(source: []const u8) ![]u8 {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data = source });
+    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/t.zig", .{tmp.sub_path});
+    defer gpa.free(root);
+    var fe: Frontend = try .init(gpa, io, "/nonexistent", root);
+    defer fe.deinit();
+    var fe_errors: std.zig.ErrorBundle.Wip = try .init(gpa);
+    defer fe_errors.deinit();
+    try std.testing.expect(try fe.loadAll(&fe_errors));
+
+    var zcu: Zcu = try .init(gpa, io, &fe);
+    defer zcu.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const Sink = struct {
+        w: *std.Io.Writer,
+        pub fn function(s: *@This(), z: *Zcu, ir: *const Ir) !void {
+            try print.dump(ir, &z.ip, s.w);
+        }
+    };
+    var sink: Sink = .{ .w = &out.writer };
+    try zcu.analyzeAll(&sink);
+    for (zcu.errors.items) |e| {
+        const loc = std.zig.findLineColumn(source, e.span.main);
+        try out.writer.print("error({d}:{d}): {s}\n", .{ loc.line + 1, loc.column + 1, e.msg });
+    }
+    return out.toOwnedSlice();
+}
+
+fn expectAnalysis(source: []const u8, expected: []const u8) !void {
+    const actual = try testAnalyze(source);
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "dump: runtime add gets an overflow check, comptime operands fold" {
+    try expectAnalysis(
+        \\export fn f(a: u8) u8 {
+        \\    return a + comptime (2 * 3);
+        \\}
+    ,
+        \\fn root:t.zig:f(u8) u8 callconv(.c) {
+        \\  %0 = arg(u8, 0)
+        \\  %1 = dbg_stmt(2:14)
+        \\  %2 = add_with_overflow(struct { u8, u1 }, %0, <u8, 6>)
+        \\  %3 = struct_field_val(u8, %2, 0)
+        \\  %4 = struct_field_val(u1, %2, 1)
+        \\  %5 = cmp_eq(%4, <u1, 0>)
+        \\  %7 = block(void, {
+        \\    %9 = cond_br(%5, {
+        \\      %8 = br(%7, <void, void>)
+        \\    }, {
+        \\      %6 = panic(integer_overflow)
+        \\    })
+        \\  })
+        \\  %10 = dbg_stmt(2:5)
+        \\  %11 = ret(%3)
+        \\}
+        \\
+    );
+}
+
+test "dump: slice indexing gets a bounds check" {
+    try expectAnalysis(
+        \\export fn f(s: [*]const u8, n: usize, i: usize) u8 {
+        \\    return s[0..n][i];
+        \\}
+    ,
+        \\fn root:t.zig:f([*]const u8, usize, usize) u8 callconv(.c) {
+        \\  %0 = arg([*]const u8, 0)
+        \\  %1 = arg(usize, 1)
+        \\  %2 = arg(usize, 2)
+        \\  %3 = alloc(*const [*]const u8)
+        \\  %4 = store(%3, %0)
+        \\  %5 = dbg_stmt(2:13)
+        \\  %6 = load([*]const u8, %3)
+        \\  %7 = cmp_lte(<usize, 0>, %1)
+        \\  %9 = block(void, {
+        \\    %11 = cond_br(%7, {
+        \\      %10 = br(%9, <void, void>)
+        \\    }, {
+        \\      %8 = panic(start_greater_than_end, <usize, 0>, %1)
+        \\    })
+        \\  })
+        \\  %12 = sub_wrap(%1, <usize, 0>)
+        \\  %13 = slice([]const u8, %6, %12)
+        \\  %14 = alloc(*const []const u8)
+        \\  %15 = store(%14, %13)
+        \\  %16 = dbg_stmt(2:19)
+        \\  %17 = load([]const u8, %14)
+        \\  %18 = slice_len(usize, %17)
+        \\  %19 = cmp_lt(%2, %18)
+        \\  %21 = block(void, {
+        \\    %23 = cond_br(%19, {
+        \\      %22 = br(%21, <void, void>)
+        \\    }, {
+        \\      %20 = panic(out_of_bounds, %2, %18)
+        \\    })
+        \\  })
+        \\  %24 = slice_elem_ptr(*const u8, %17, %2)
+        \\  %25 = load(u8, %24)
+        \\  %26 = dbg_stmt(2:5)
+        \\  %27 = ret(%25)
+        \\}
+        \\
+    );
+}
+
+test "dump: generic instances are shared and comptime calls fold" {
+    try expectAnalysis(
+        \\fn max(comptime T: type, a: T, b: T) T {
+        \\    return if (a > b) a else b;
+        \\}
+        \\fn fib(n: u32) u32 {
+        \\    return if (n < 2) n else fib(n - 1) + fib(n - 2);
+        \\}
+        \\export fn f(a: u16) u16 {
+        \\    return max(u16, a, comptime fib(10)) + max(u16, 1, a);
+        \\}
+    ,
+        \\fn root:t.zig:f(u16) u16 callconv(.c) {
+        \\  %0 = arg(u16, 0)
+        \\  %1 = dbg_stmt(2:15)
+        \\  %2 = call(<fn (u16, u16) u16, root:t.zig:max[u16]>, [%0, <u16, 55>])
+        \\  %3 = dbg_stmt(2:47)
+        \\  %4 = call(<fn (u16, u16) u16, root:t.zig:max[u16]>, [<u16, 1>, %0])
+        \\  %5 = dbg_stmt(2:42)
+        \\  %6 = add_with_overflow(struct { u16, u1 }, %2, %4)
+        \\  %7 = struct_field_val(u16, %6, 0)
+        \\  %8 = struct_field_val(u1, %6, 1)
+        \\  %9 = cmp_eq(%8, <u1, 0>)
+        \\  %11 = block(void, {
+        \\    %13 = cond_br(%9, {
+        \\      %12 = br(%11, <void, void>)
+        \\    }, {
+        \\      %10 = panic(integer_overflow)
+        \\    })
+        \\  })
+        \\  %14 = dbg_stmt(2:5)
+        \\  %15 = ret(%7)
+        \\}
+        \\fn root:t.zig:max[u16](u16, u16) u16 {
+        \\  %0 = arg(u16, 0)
+        \\  %1 = arg(u16, 1)
+        \\  %2 = dbg_stmt(2:16)
+        \\  %3 = block(u16, {
+        \\    %4 = cmp_gt(%0, %1)
+        \\    %7 = cond_br(%4, {
+        \\      %5 = br(%3, %0)
+        \\    }, {
+        \\      %6 = br(%3, %1)
+        \\    })
+        \\  })
+        \\  %8 = dbg_stmt(2:5)
+        \\  %9 = ret(%3)
+        \\}
+        \\
+    );
+}
+
+test "dump: inferred error sets resolve through the callee's body" {
+    try expectAnalysis(
+        \\fn g(x: u8) !u8 {
+        \\    if (x == 0) return error.Zero;
+        \\    return x;
+        \\}
+        \\export fn f(x: u8) u8 {
+        \\    return g(x) catch |err| switch (err) {
+        \\        error.Zero => 1,
+        \\    };
+        \\}
+    ,
+        \\fn root:t.zig:f(u8) u8 callconv(.c) {
+        \\  %0 = arg(u8, 0)
+        \\  %1 = dbg_stmt(2:13)
+        \\  %2 = call(<fn (u8) (inferred error set)!u8, root:t.zig:g>, [%0])
+        \\  %3 = dbg_stmt(2:12)
+        \\  %4 = is_non_err(%2)
+        \\  %5 = block(u8, {
+        \\    %14 = cond_br(%4, {
+        \\      %6 = unwrap_errunion_payload(u8, %2)
+        \\      %7 = br(%5, %6)
+        \\    }, {
+        \\      %8 = unwrap_errunion_err(@typeInfo(@typeInfo(@TypeOf(root:t.zig:g)).@"fn".return_type.?).error_union.error_set, %2)
+        \\      %9 = block(u8, {
+        \\        %12 = switch_br(%8, [<@typeInfo(@typeInfo(@TypeOf(root:t.zig:g)).@"fn".return_type.?).error_union.error_set, error.Zero>] => {
+        \\          %10 = br(%9, <u8, 1>)
+        \\        }, else => {
+        \\          %11 = panic(corrupt_switch)
+        \\        })
+        \\      })
+        \\      %13 = br(%5, %9)
+        \\    })
+        \\  })
+        \\  %15 = dbg_stmt(2:5)
+        \\  %16 = ret(%5)
+        \\}
+        \\fn root:t.zig:g(u8) (inferred error set)!u8 {
+        \\  %0 = arg(u8, 0)
+        \\  %1 = dbg_stmt(2:9)
+        \\  %2 = block(void, {
+        \\    %3 = cmp_eq(%0, <u8, 0>)
+        \\    %7 = cond_br(%3, {
+        \\      %4 = dbg_stmt(2:17)
+        \\      %5 = ret(<@typeInfo(@typeInfo(@TypeOf(root:t.zig:g)).@"fn".return_type.?).error_union.error_set!u8, error.Zero>)
+        \\    }, {
+        \\      %6 = br(%2, <void, void>)
+        \\    })
+        \\  })
+        \\  %8 = dbg_stmt(3:5)
+        \\  %9 = wrap_errunion_payload(@typeInfo(@typeInfo(@TypeOf(root:t.zig:g)).@"fn".return_type.?).error_union.error_set!u8, %0)
+        \\  %10 = ret(%9)
+        \\}
+        \\
+    );
+}
+
+test "errors: comptime-known values out of range" {
+    try expectAnalysis(
+        \\const x: u8 = 300;
+        \\export fn f() u8 {
+        \\    return x;
+        \\}
+    ,
+        \\error(1:15): type 'u8' cannot represent integer value '300'
+        \\
+    );
 }

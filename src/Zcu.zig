@@ -33,6 +33,10 @@ deps: std.AutoArrayHashMapUnmanaged(AnalUnit, []const Dependee) = .empty,
 /// Analysis state of runtime function bodies.
 funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, FuncState) = .empty,
 func_queue: std.ArrayList(InternPool.Index) = .empty,
+next_func: usize = 0,
+/// Function bodies analyzed out of queue order (to resolve an inferred
+/// error set), waiting to be passed to the sink.
+ready_irs: std.ArrayList(Ir) = .empty,
 /// `comptime` declarations, analyzed once each.
 comptime_decls: std.AutoArrayHashMapUnmanaged(ComptimeDecl, enum { queued, done }) = .empty,
 /// Memoized comptime calls, keyed by `Sema.comptimeCallKey`.
@@ -124,6 +128,8 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.deps.deinit(gpa);
     zcu.funcs.deinit(gpa);
     zcu.func_queue.deinit(gpa);
+    for (zcu.ready_irs.items) |*ir| ir.deinit(gpa);
+    zcu.ready_irs.deinit(gpa);
     zcu.comptime_decls.deinit(gpa);
     zcu.comptime_memo.deinit(gpa);
     var it = zcu.inferred_errors.valueIterator();
@@ -321,6 +327,29 @@ pub fn ensureStructLayout(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!voi
     };
 }
 
+/// Resolves the inferred error set of function instance `func`, analyzing
+/// its body if that has not happened yet.
+pub fn ensureFuncIes(zcu: *Zcu, func: InternPool.Index) Sema.CompileError![]const InternPool.String {
+    const gop = try zcu.funcs.getOrPut(zcu.gpa, func);
+    if (!gop.found_existing) gop.value_ptr.* = .queued;
+    switch (gop.value_ptr.*) {
+        .done => {},
+        .failed => return error.AnalysisFail,
+        .in_progress => return error.DependencyLoop,
+        .queued => {
+            gop.value_ptr.* = .in_progress;
+            var ir = Sema.analyzeFuncBody(zcu, func) catch |err| {
+                zcu.funcs.getPtr(func).?.* = .failed;
+                return err;
+            };
+            errdefer ir.deinit(zcu.gpa);
+            zcu.funcs.getPtr(func).?.* = .done;
+            try zcu.ready_irs.append(zcu.gpa, ir);
+        },
+    }
+    return if (zcu.inferred_errors.get(func)) |list| list.items else &.{};
+}
+
 pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !void {
     const gop = try zcu.funcs.getOrPut(zcu.gpa, func);
     if (gop.found_existing) return;
@@ -354,7 +383,15 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
             };
             continue;
         }
-        const func = zcu.func_queue.pop() orelse break;
+        if (zcu.ready_irs.items.len != 0) {
+            var ir = zcu.ready_irs.orderedRemove(0);
+            defer ir.deinit(zcu.gpa);
+            try sink.function(zcu, &ir);
+            continue;
+        }
+        if (zcu.next_func == zcu.func_queue.items.len) break;
+        const func = zcu.func_queue.items[zcu.next_func];
+        zcu.next_func += 1;
         const state = zcu.funcs.getPtr(func).?;
         if (state.* != .queued) continue;
         state.* = .in_progress;

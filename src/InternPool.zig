@@ -238,7 +238,6 @@ pub const Nav = struct {
     val: Index = .none,
     is_const: bool = true,
     linkage: Zir.Inst.Declaration.Unwrapped.Linkage = .normal,
-
 };
 
 /// The fields and layout of a declared struct type. Owned by the struct's
@@ -261,7 +260,6 @@ pub const StructInfo = struct {
         }
         return null;
     }
-
 };
 
 // ---------------------------------------------------------------------------

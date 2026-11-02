@@ -311,6 +311,9 @@ pub const SwitchBr = struct {
 
 /// Trailing: `args_len` `Ref`s.
 pub const Call = struct {
+    /// The callee's return type, with an inferred error set resolved to
+    /// the callee's own (`inferred_error_set_type`).
+    ret_ty: InternPool.Index,
     args_len: u32,
 };
 
@@ -422,10 +425,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .int_from_bool => .u1_type,
         .int_from_ptr => .usize_type,
         .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap, .panic => .noreturn_type,
-        .call => blk: {
-            const callee_ty = ir.typeOf(data.pl_op.operand, ip);
-            break :blk ip.indexToKey(callee_ty).func_type.return_type;
-        },
+        .call => ir.extraData(Call, data.pl_op.payload).data.ret_ty,
         .ptr_elem_val => blk: {
             const ptr = ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).ptr_type;
             break :blk switch (ptr.flags.size) {

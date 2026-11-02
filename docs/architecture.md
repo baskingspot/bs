@@ -52,7 +52,10 @@ before anything persists them.
 
 Function bodies depend on the *signatures* of the functions they call, not on
 their bodies. Editing a function body therefore re-analyzes and re-generates
-only that function.
+only that function. The one exception is an inferred error set: a caller
+that needs the callee's resolved set (to switch on it or coerce it to an
+explicit set) depends on it (`Dependee.func_ies`), and resolving it analyzes
+the callee's body first. Early cutoff on the set keeps such callers green.
 
 ### InternPool
 

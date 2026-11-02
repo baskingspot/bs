@@ -16,20 +16,9 @@ const Inst = Ir.Inst;
 
 pub fn dump(ir: *const Ir, ip: *const InternPool, w: *Writer) Writer.Error!void {
     const func = ip.indexToKey(ir.func).func;
-    const nav = ip.getNav(func.owner_nav);
     const fn_ty = ip.indexToKey(func.ty).func_type;
-    try w.print("fn {s}", .{ip.stringSlice(nav.fqn)});
-    if (func.comptime_args.len != 0) {
-        try w.writeAll("[");
-        var first = true;
-        for (func.comptime_args) |arg| {
-            if (arg == .none) continue;
-            if (!first) try w.writeAll(", ");
-            first = false;
-            try printValue(ip, arg, w);
-        }
-        try w.writeAll("]");
-    }
+    try w.writeAll("fn ");
+    try printFuncName(ip, ir.func, w);
     try w.writeAll("(");
     for (fn_ty.param_types, 0..) |p, i| {
         if (i != 0) try w.writeAll(", ");
@@ -386,7 +375,24 @@ pub fn printValue(ip: *const InternPool, val: InternPool.Index, w: *Writer) Writ
                 try w.writeAll(if (elems.len == 0) "}" else " }");
             },
         },
-        .func => |f| try w.writeAll(ip.stringSlice(ip.getNav(f.owner_nav).fqn)),
+        .func => try printFuncName(ip, val, w),
         else => try printType(ip, val, w),
     }
+}
+
+/// A function's declaration name, followed by the comptime arguments of a
+/// generic instance in brackets.
+fn printFuncName(ip: *const InternPool, func_index: InternPool.Index, w: *Writer) Writer.Error!void {
+    const func = ip.indexToKey(func_index).func;
+    try w.writeAll(ip.stringSlice(ip.getNav(func.owner_nav).fqn));
+    if (func.comptime_args.len == 0) return;
+    try w.writeAll("[");
+    var first = true;
+    for (func.comptime_args) |arg| {
+        if (arg == .none) continue;
+        if (!first) try w.writeAll(", ");
+        first = false;
+        try printValue(ip, arg, w);
+    }
+    try w.writeAll("]");
 }
