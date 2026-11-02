@@ -45,6 +45,15 @@ declaration's name path (for example `std:array_list.zig:Aligned.append`), plus
 the hashes of comptime arguments and captured values for instantiations and
 anonymous types. The same key, rendered, becomes the linker symbol name.
 
+Anonymous types (a `struct {}` expression inside a declaration or function
+body) are keyed by the enclosing unit's key plus the type's ordinal among the
+anonymous types that unit creates, never by a ZIR index: ZIR indices shift when
+unrelated code above changes. The ordinal only shifts when the enclosing
+declaration's own source changes, and then that unit is re-analyzed anyway.
+The *display name* is separate from the key and follows upstream exactly
+(`Parent__struct_<n>`), because `@typeName` results are observable and
+`test/behavior` checks them.
+
 When a unit reads another unit's result (a declaration's value, a type's
 layout, a function's signature) it goes through one Sema function that records
 the dependency. Sema records dependencies from the first skeleton onward, even
@@ -67,6 +76,19 @@ the callee's body first. Early cutoff on the set keeps such callers green.
 - Designed for concurrent use from the start: per-thread shards for appends
   and lock-free reads of published items. The skeleton can run one thread, but
   its API takes the per-thread handle so parallelism is not a retrofit.
+- Error codes. `anyerror` integers are assigned per compilation and live only
+  in memory; IR and Atoms refer to errors by name, and machine code gets the
+  integers through link-time value relocations. A unit whose result depends on
+  an integer (comptime `@intFromError`, or an error integer folded into a
+  constant) records an `error_code(name)` dependency. The per-project manifest
+  keeps last build's name-to-code assignment and only appends new names, so
+  existing codes, and units that depend on them, stay stable across rebuilds.
+- Pointers into comptime-mutable memory (`comptime var`, comptime
+  allocations) are local to the unit that created them. They are excluded from
+  stable hashing and persistence and must not escape a unit's result; an
+  escape is upstream's "runtime value contains reference to comptime var"
+  error. Memoized comptime calls don't memoize when an argument or the result
+  points into comptime-mutable memory.
 
 ### Typed IR (`Ir`)
 
@@ -229,6 +251,9 @@ shares nothing across projects and ties the file format to in-memory layout.
   arena. A unit's state (unresolved, in progress by worker N, done) is the only
   synchronization point; a worker that needs a unit another worker holds
   waits, and a wait cycle is reported as a dependency loop, as upstream does.
+- Resolving an inferred error set is one such synchronization point: a
+  worker that needs a callee's resolved set waits on the worker analyzing that
+  body, or analyzes it itself if nobody has started it.
 - CodeGen runs on the worker that analyzed the function, right after Sema,
   while the IR is hot in cache.
 - Linking starts when all Atoms exist.
