@@ -28,8 +28,9 @@
 //! file. The UUID is derived from the same page hashes.
 //!
 //! Not implemented yet: TLS (`__thread_vars`, `__thread_data`,
-//! `__thread_bss`), and debug info: atoms' `debug` is ignored, and there is
-//! no DWARF (in macOS's scheme, a debug map of N_OSO stabs or a dSYM).
+//! `__thread_bss`), and debug info: it takes no `Atom.Debug` entries, and
+//! there is no DWARF (in macOS's scheme, a debug map of N_OSO stabs or a
+//! dSYM).
 
 const std = @import("std");
 const builtin = @import("builtin");

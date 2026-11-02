@@ -1,11 +1,11 @@
 //! DWARF 5 debug info for the linkers: one compile unit for the whole
-//! output, with a subprogram entry and a line-number sequence per function
-//! atom that has `Atom.debug`. Type and variable info come later.
+//! output, with a subprogram entry and a line-number sequence per
+//! `Atom.Debug` entry. Type and variable info come later.
 //!
 //! The headers depend only on the file table and are built serially; the
-//! per-atom parts have sizes known from the atom alone, so threads can write
-//! them in place, and a sequence is mostly a copy of the atom's own line
-//! program fragment (`Atom.Debug.lines`).
+//! per-function parts have sizes known from their `Atom.Debug` alone, so
+//! threads can write them in place, and a sequence is mostly a copy of the
+//! function's own line program fragment (`Atom.Debug.lines`).
 
 const std = @import("std");
 const DW = std.dwarf;
@@ -131,8 +131,9 @@ pub fn subprogramSize(debug: *const Atom.Debug) u64 {
     return 1 + debug.name.len + 1 + 8 + 4 + 4 + 4;
 }
 
-/// Writes `a`'s subprogram entry at the start of `out` and returns its size.
-pub fn writeSubprogram(out: []u8, a: *const Atom, debug: *const Atom.Debug, addr: u64, file: u32) usize {
+/// Writes the subprogram entry of the `size`-byte function at `addr` at the
+/// start of `out`, and returns its size.
+pub fn writeSubprogram(out: []u8, debug: *const Atom.Debug, addr: u64, size: u64, file: u32) usize {
     var at: usize = 0;
     out[at] = abbrev_subprogram;
     at += 1;
@@ -140,7 +141,7 @@ pub fn writeSubprogram(out: []u8, a: *const Atom, debug: *const Atom.Debug, addr
     out[at + debug.name.len] = 0;
     at += debug.name.len + 1;
     std.mem.writeInt(u64, out[at..][0..8], addr, .little);
-    std.mem.writeInt(u32, out[at + 8 ..][0..4], @intCast(a.bytes.len), .little);
+    std.mem.writeInt(u32, out[at + 8 ..][0..4], @intCast(size), .little);
     std.mem.writeInt(u32, out[at + 12 ..][0..4], file, .little);
     std.mem.writeInt(u32, out[at + 16 ..][0..4], debug.base_line + 1, .little);
     return at + 20;
@@ -155,10 +156,11 @@ const set_address_len = 11;
 /// depend on the file table.
 const set_file_len = 4;
 
-/// Writes `a`'s line-number sequence at the start of `out`, and returns its
-/// size: start at the atom with the line registers its fragment expects,
-/// copy the fragment, and end the sequence at the end of the atom.
-pub fn writeSequence(out: []u8, a: *const Atom, debug: *const Atom.Debug, addr: u64, file: u32) usize {
+/// Writes the line-number sequence of the `size`-byte function at `addr` at
+/// the start of `out`, and returns its size: start at the function with the
+/// line registers its fragment expects, copy the fragment, and end the
+/// sequence at the end of the function.
+pub fn writeSequence(out: []u8, debug: *const Atom.Debug, addr: u64, size: u64, file: u32) usize {
     setAddress(out[0..set_address_len], addr);
     var at: usize = set_address_len;
     out[at..][0..set_file_len].* = .{ DW.LNS.set_file, @as(u8, @truncate(file)) | 0x80, @as(u8, @truncate(file >> 7)) | 0x80, @intCast(file >> 14) };
@@ -168,7 +170,7 @@ pub fn writeSequence(out: []u8, a: *const Atom, debug: *const Atom.Debug, addr: 
     at += writeSleb(out[at..], debug.base_line);
     @memcpy(out[at..][0..debug.lines.len], debug.lines);
     at += debug.lines.len;
-    setAddress(out[at..][0..set_address_len], addr + a.bytes.len);
+    setAddress(out[at..][0..set_address_len], addr + size);
     at += set_address_len;
     out[at..][0..3].* = .{ 0, 1, DW.LNE.end_sequence };
     return at + 3;

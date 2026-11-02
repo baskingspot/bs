@@ -9,13 +9,14 @@
 //!   RX  .text
 //!   RW  .data, then .bss (memory only)
 //!       .debug_abbrev, .debug_info, .debug_line, .debug_str (not loaded;
-//!       present if any atom has `debug` and `strip` is off)
+//!       present if `Options.debug` is not empty)
 //!       .symtab, .strtab, .shstrtab, section headers (not loaded)
 //!
 //! Debug info is DWARF 5 with one compile unit for the whole output: one
-//! subprogram entry per function with `debug`, and one line-number
-//! sequence per such function, wrapping the atom's own fragment. Each
-//! chunk writes its own atoms' entries and sequences, like their bytes.
+//! subprogram entry and one line-number sequence, wrapping the function's
+//! own fragment, per entry of `Options.debug`. The entries come separately
+//! from the atoms, so that linking without them never reads them, and with
+//! them the debug passes stream through them in chunks of their own.
 //!
 //! TLS is not implemented. `.tdata` and `.tbss` will go at the start of the
 //! RW segment, before `.data`, covered by a PT_TLS program header, with
@@ -46,11 +47,12 @@ pub const Options = struct {
     threads: ?usize = null,
     /// Filled in when linking fails with a symbol-related error.
     diag: ?*Diagnostic = null,
+    /// Debug info for functions, sorted by `Atom.Debug.atom`; empty to leave
+    /// debug info out.
+    debug: []const Atom.Debug = &.{},
     /// The directory relative source paths in debug info are relative to
     /// (DW_AT_comp_dir).
     comp_dir: []const u8 = ".",
-    /// Leave out debug info.
-    strip: bool = false,
 };
 
 pub const Value = struct { key: SymbolKey, value: u64 };
@@ -71,6 +73,8 @@ pub const Error = Allocator.Error || std.Io.Cancelable || error{
     InvalidRelocation,
     /// An atom's alignment is above 4 MiB.
     AlignmentTooLarge,
+    /// A debug entry names no text atom, or entries are out of order.
+    InvalidDebugInfo,
 };
 
 /// Links `atoms` and writes the executable to `sub_path` in `dir`. The
@@ -183,16 +187,23 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     populate(std.mem.sliceAsBytes(keys));
     const chunks = try gpa.alloc(Chunk, n_chunks);
     defer gpa.free(chunks);
-    for (chunks) |*c| c.files = .empty;
-    defer for (chunks) |*c| c.files.deinit(gpa);
-    const file_of = try gpa.alloc(u32, if (options.strip) 0 else atoms.len);
+    const debug = options.debug;
+    const n_debug_chunks = std.math.divCeil(usize, debug.len, chunk_len) catch unreachable;
+    const debug_chunks = try gpa.alloc(DebugChunk, n_debug_chunks);
+    defer gpa.free(debug_chunks);
+    for (debug_chunks) |*c| c.files = .empty;
+    defer for (debug_chunks) |*c| c.files.deinit(gpa);
+    const file_of = try gpa.alloc(u32, debug.len);
     defer gpa.free(file_of);
-    const failures = try gpa.alloc(?Failure, @max(n_chunks, n_partitions));
+    // Atom chunks, then debug chunks.
+    const failures = try gpa.alloc(?Failure, @max(n_chunks + n_debug_chunks, n_partitions));
     defer gpa.free(failures);
     var l: Link = .{
         .gpa = gpa,
-        .debug = !options.strip,
+        .debug = debug,
+        .debug_chunks = debug_chunks,
         .file_of = file_of,
+        .n_partitions = n_partitions,
         .atoms = atoms,
         .places = places,
         .keys = keys,
@@ -213,9 +224,6 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     var n_syms: u32 = 1;
     var strtab_len: u64 = 1;
     var max_targets: usize = 0;
-    var info_len: u64 = 0;
-    var line_len: u64 = 0;
-    var n_chunk_files: usize = 0;
     for (chunks) |*c| {
         for (&sizes, &aligns, &c.bases, &c.lead_gaps, c.sizes, c.aligns) |*size, *alignment, *chunk_base, *lead_gap, chunk_size, chunk_align| {
             chunk_base.* = chunk_align.forward(size.*);
@@ -228,32 +236,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         n_syms += c.n_syms;
         strtab_len += c.str_len;
         max_targets = @max(max_targets, c.max_targets);
-        c.info_off = info_len;
-        c.line_off = line_len;
-        info_len += c.info_len;
-        line_len += c.line_len;
-        n_chunk_files += c.files.count();
     }
-
-    // The file table: the chunks' files in first-use order.
-    var files: std.StringArrayHashMapUnmanaged(void) = .empty;
-    defer files.deinit(gpa);
-    const file_map = try gpa.alloc(u32, n_chunk_files);
-    defer gpa.free(file_map);
-    {
-        var at: usize = 0;
-        for (chunks) |*c| {
-            c.file_map = file_map[at..][0..c.files.count()];
-            at += c.files.count();
-            for (c.files.keys(), c.file_map) |f, *global| {
-                global.* = @intCast((try files.getOrPut(gpa, f)).index);
-            }
-        }
-    }
-    // The set_file operand is a fixed-width ULEB128.
-    if (files.count() >= 1 << 21) return error.OutOfMemory;
-    var dwarf: Dwarf = if (files.count() > 0) try .init(gpa, files.keys(), options.comp_dir) else .{};
-    defer dwarf.deinit(gpa);
     if (symbols.get(options.entry) == null) {
         diag.* = .{ .target = options.entry };
         return error.UndefinedSymbol;
@@ -283,7 +266,39 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const base = options.base_address;
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
     l.base = base;
-    try parallel(io, n_threads, n_partitions, &l, Link.resolveAddrs);
+    try parallel(io, n_threads, n_partitions + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
+    try l.check(diag);
+
+    // Place the debug chunks, and build the file table from their files in
+    // first-use order.
+    var info_len: u64 = 0;
+    var line_len: u64 = 0;
+    var n_chunk_files: usize = 0;
+    for (debug_chunks) |*c| {
+        c.info_off = info_len;
+        c.line_off = line_len;
+        info_len += c.info_len;
+        line_len += c.line_len;
+        n_chunk_files += c.files.count();
+    }
+    var files: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer files.deinit(gpa);
+    const file_map = try gpa.alloc(u32, n_chunk_files);
+    defer gpa.free(file_map);
+    {
+        var at: usize = 0;
+        for (debug_chunks) |*c| {
+            c.file_map = file_map[at..][0..c.files.count()];
+            at += c.files.count();
+            for (c.files.keys(), c.file_map) |f, *global| {
+                global.* = @intCast((try files.getOrPut(gpa, f)).index);
+            }
+        }
+    }
+    // The set_file operand is a fixed-width ULEB128.
+    if (files.count() >= 1 << 21) return error.OutOfMemory;
+    var dwarf: Dwarf = if (files.count() > 0) try .init(gpa, files.keys(), options.comp_dir) else .{};
+    defer dwarf.deinit(gpa);
 
     const has_debug = files.count() > 0;
     const abbrev_off = file_end;
@@ -336,8 +351,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     l.max_targets = max_targets;
     l.info_off = info_off + dwarf.info_header.len;
     l.line_off = line_off + dwarf.line_header.len;
-    l.debug = has_debug;
-    try parallel(io, n_threads, n_chunks, &l, Link.copy);
+    try parallel(io, n_threads, n_chunks + n_debug_chunks, &l, Link.copyAll);
     try l.check(diag);
 
     // Headers.
@@ -421,12 +435,6 @@ const Chunk = struct {
     n_syms: u32,
     str_len: u32,
     max_targets: u32,
-    /// Bytes of the chunk's subprogram entries and line sequences.
-    info_len: u64,
-    line_len: u64,
-    /// Source files of the chunk's atoms, in first-use order; `Link.file_of`
-    /// indexes it.
-    files: std.StringArrayHashMapUnmanaged(void),
     // Filled in serially after `Link.layOut`.
     /// Where the chunk's atoms of each section start, within the section.
     bases: [4]u64,
@@ -435,6 +443,18 @@ const Chunk = struct {
     /// The chunk's first symbol in .symtab and first byte in .strtab.
     sym: u32,
     str: u32,
+};
+
+/// One `chunk_len` run of consecutive debug entries.
+const DebugChunk = struct {
+    // Filled in by `Link.layOutDebug`.
+    /// Bytes of the chunk's subprogram entries and line sequences.
+    info_len: u64,
+    line_len: u64,
+    /// Source files of the chunk's entries, in first-use order;
+    /// `Link.file_of` indexes it.
+    files: std.StringArrayHashMapUnmanaged(void),
+    // Filled in serially after `Link.layOutDebug`.
     /// Where the chunk's entries and sequences start, after the headers.
     info_off: u64,
     line_off: u64,
@@ -447,11 +467,11 @@ const Failure = struct { atom: usize, err: Error, diag: Diagnostic };
 /// State shared by the threads of `emit`.
 const Link = struct {
     gpa: Allocator,
-    /// Whether to emit debug info: in `layOut`, unless stripped; in `copy`,
-    /// if any atom has it.
-    debug: bool,
-    /// Index into its chunk's `files` of each atom with debug info.
+    debug: []const Atom.Debug,
+    debug_chunks: []DebugChunk,
+    /// Index into its chunk's `files` of each debug entry, or `skip`.
     file_of: []u32,
+    n_partitions: usize,
     atoms: []const Atom,
     places: []Place,
     /// The atoms' keys, packed, so that every partition can scan them.
@@ -541,21 +561,12 @@ const Link = struct {
             .n_syms = 0,
             .str_len = 0,
             .max_targets = 0,
-            .info_len = 0,
-            .line_len = 0,
-            .files = l.chunks[chunk].files,
             .bases = undefined,
             .lead_gaps = undefined,
             .sym = undefined,
             .str = undefined,
-            .info_off = undefined,
-            .line_off = undefined,
-            .file_map = undefined,
         };
         defer l.chunks[chunk] = c;
-        // Atoms from one file usually share its path's bytes, so a cache by
-        // address saves hashing the path for most atoms.
-        var recent: [256]struct { file: []const u8, index: u32 } = @splat(.{ .file = "", .index = 0 });
         for (atoms, l.places[begin..][0..atoms.len], begin..) |*a, *p, i| {
             if (i + 16 < l.keys.len) l.symbols.prefetch(l.keys[i + 16]);
             const kept = l.symbols.get(l.keys[i]).?;
@@ -586,19 +597,103 @@ const Link = struct {
             c.n_syms += 1;
             if (a.name.len > 0) c.str_len += @intCast(a.name.len + 1);
             c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
-            if (!l.debug or a.section != .text) continue;
-            const d = if (a.debug) |*d| d else continue;
-            const r = &recent[@as(u8, @truncate(@intFromPtr(d.file.ptr) >> 3))];
-            if (d.file.ptr != r.file.ptr or d.file.len != r.file.len) {
-                const gop = c.files.getOrPut(l.gpa, d.file) catch {
-                    l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
-                    continue;
-                };
-                r.* = .{ .file = d.file, .index = @intCast(gop.index) };
+        }
+    }
+
+    const skip = std.math.maxInt(u32);
+
+    fn resolveAddrsAndLayOutDebug(l: *Link, task: usize, thread: usize) void {
+        if (task < l.n_partitions) l.resolveAddrs(task, thread) else l.layOutDebug(task - l.n_partitions);
+    }
+
+    /// Sizes one chunk's debug entries and collects their files. Entries
+    /// for atoms that were deduplicated away are skipped.
+    fn layOutDebug(l: *Link, chunk: usize) void {
+        const begin = chunk * chunk_len;
+        const entries = l.debug[begin..@min(l.debug.len, begin + chunk_len)];
+        const c = &l.debug_chunks[chunk];
+        c.info_len = 0;
+        c.line_len = 0;
+        // Functions from one file usually share its path's bytes, so a
+        // table by address saves hashing the path for most entries.
+        var by_addr: FilesByAddr = .{};
+        const task = l.chunks.len + chunk;
+        for (entries, l.file_of[begin..][0..entries.len], begin..) |*d, *file_of, j| {
+            file_of.* = skip;
+            if (d.atom >= l.atoms.len or (j > 0 and l.debug[j - 1].atom >= d.atom)) {
+                return l.fail(task, @min(d.atom, l.atoms.len), error.InvalidDebugInfo, .{});
             }
-            l.file_of[i] = r.index;
+            const place = l.places[d.atom];
+            if (place.isDuplicate()) continue;
+            if (place.section != @backingInt(Atom.Section.text)) {
+                return l.fail(task, d.atom, error.InvalidDebugInfo, .{ .atom = l.atoms[d.atom].name });
+            }
+            file_of.* = by_addr.get(d.file) orelse index: {
+                const gop = c.files.getOrPut(l.gpa, d.file) catch return l.fail(task, d.atom, error.OutOfMemory, .{});
+                by_addr.put(d.file, @intCast(gop.index));
+                break :index @intCast(gop.index);
+            };
             c.info_len += Dwarf.subprogramSize(d);
             c.line_len += Dwarf.sequenceSize(d);
+        }
+    }
+
+    /// Open addressing from a path's address and length to its index in a
+    /// chunk's `files`. Holds up to 3/4 of its slots; paths past that are
+    /// looked up by contents every time.
+    const FilesByAddr = struct {
+        slots: [1024]Slot = @splat(.{ .ptr = 0, .len = 0, .index = 0 }),
+        count: usize = 0,
+
+        const Slot = struct { ptr: usize, len: usize, index: u32 };
+
+        fn home(file: []const u8) usize {
+            return @intCast((@intFromPtr(file.ptr) *% 0x9e3779b97f4a7c15) >> 54);
+        }
+
+        fn get(t: *const FilesByAddr, file: []const u8) ?u32 {
+            var i = home(file);
+            while (t.slots[i].ptr != 0) : (i = (i + 1) % t.slots.len) {
+                if (t.slots[i].ptr == @intFromPtr(file.ptr) and t.slots[i].len == file.len) return t.slots[i].index;
+            }
+            return null;
+        }
+
+        fn put(t: *FilesByAddr, file: []const u8, index: u32) void {
+            if (t.count >= t.slots.len / 4 * 3) return;
+            var i = home(file);
+            while (t.slots[i].ptr != 0) i = (i + 1) % t.slots.len;
+            t.slots[i] = .{ .ptr = @intFromPtr(file.ptr), .len = file.len, .index = index };
+            t.count += 1;
+        }
+    };
+
+    fn copyAll(l: *Link, task: usize, thread: usize) void {
+        if (task < l.chunks.len) l.copy(task, thread) else l.copyDebug(task - l.chunks.len);
+    }
+
+    /// Writes one chunk's subprogram entries and line sequences.
+    fn copyDebug(l: *Link, chunk: usize) void {
+        const begin = chunk * chunk_len;
+        const entries = l.debug[begin..@min(l.debug.len, begin + chunk_len)];
+        const c = &l.debug_chunks[chunk];
+        var info_off = l.info_off + c.info_off;
+        var line_off = l.line_off + c.line_off;
+        for (entries, l.file_of[begin..][0..entries.len], 0..) |*d, file_of, j| {
+            // The entries stream; their fragments, names, and atoms do not.
+            if (j + 12 < entries.len) {
+                const n = &entries[j + 12];
+                prefetchSlice(u8, n.lines);
+                prefetchSlice(u8, n.name);
+                @prefetch(&l.atoms[n.atom].bytes.len, .{});
+                @prefetch(&l.places[n.atom], .{});
+            }
+            if (file_of == skip) continue;
+            const addr = l.atomAddr(d.atom);
+            const size = l.atoms[d.atom].bytes.len;
+            const file = c.file_map[file_of];
+            info_off += Dwarf.writeSubprogram(l.buf[info_off..], d, addr, size, file);
+            line_off += Dwarf.writeSequence(l.buf[line_off..], d, addr, size, file);
         }
     }
 
@@ -616,8 +711,6 @@ const Link = struct {
         const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
         var sym_off = l.symtab_off + @as(u64, c.sym) * @sizeOf(elf.Elf64.Sym);
         var str_off = c.str;
-        var info_off = l.info_off + c.info_off;
-        var line_off = l.line_off + c.line_off;
         for (atoms, l.places[begin..][0..atoms.len], begin..) |*a, place, i| {
             // An atom's bytes, targets, relocations, and name, and its
             // targets' `symbols` entries, are scattered in memory; start
@@ -628,10 +721,6 @@ const Link = struct {
                 prefetchSlice(SymbolKey, n.targets);
                 prefetchSlice(Atom.Reloc, n.relocs);
                 prefetchSlice(u8, n.name);
-                if (l.debug) if (n.debug) |*d| {
-                    prefetchSlice(u8, d.lines);
-                    prefetchSlice(u8, d.name);
-                };
             }
             if (i + 2 < l.atoms.len) for (l.atoms[i + 2].targets) |t| l.symbols.prefetch(t);
             if (place.isDuplicate()) continue;
@@ -650,11 +739,6 @@ const Link = struct {
                 }
                 var diag: Diagnostic = .{};
                 applyRelocs(a, dst, addr, res, &diag) catch |err| return l.fail(chunk, i, err, diag);
-                if (l.debug and a.section == .text) if (a.debug) |*d| {
-                    const file = c.file_map[l.file_of[i]];
-                    info_off += Dwarf.writeSubprogram(l.buf[info_off..], a, d, addr, file);
-                    line_off += Dwarf.writeSequence(l.buf[line_off..], a, d, addr, file);
-                };
             }
             var name: u32 = 0;
             if (a.name.len > 0) {
@@ -840,43 +924,50 @@ pub fn identical(a: *const Atom, b: *const Atom) bool {
 /// Applies `a`'s relocations to its copy `dst` at address `p_base`, with
 /// `resolved` holding the address or value of each of `a.targets`.
 fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const u64, diag: *Diagnostic) Error!void {
+    // One dispatch per relocation: each arm checks its own field width, and
+    // another architecture's kind falls through to the error.
     for (a.relocs) |r| {
-        const width: u4 = switch (r.info.kind) {
-            .x86_64_abs64, .value64 => 8,
-            .x86_64_pc32, .value32 => 4,
-            .value16 => 2,
-            .value8 => 1,
-            // Another architecture's kind.
-            else => {
-                diag.* = .{ .atom = a.name };
-                return error.InvalidRelocation;
-            },
-        };
-        if (r.offset + @as(u64, width) > dst.len or r.info.target >= resolved.len) {
-            diag.* = .{ .atom = a.name };
-            return error.InvalidRelocation;
-        }
-        const field = dst[r.offset..];
+        if (r.info.target >= resolved.len) return invalidReloc(a, diag);
         const s = resolved[r.info.target];
         switch (r.info.kind) {
-            .x86_64_abs64 => std.mem.writeInt(u64, field[0..8], s +% @as(u64, @bitCast(@as(i64, r.addend))), .little),
             .x86_64_pc32 => {
+                const f = try relocField(a, dst, r.offset, 4, diag);
                 const v = @as(i64, @bitCast(s -% (p_base + r.offset))) +% r.addend;
-                std.mem.writeInt(i32, field[0..4], std.math.cast(i32, v) orelse return overflow(a, r, diag), .little);
+                std.mem.writeInt(i32, f, std.math.cast(i32, v) orelse return overflow(a, r, diag), .little);
             },
-            .value8, .value16, .value32, .value64 => {
-                const v = @as(i128, s) + r.addend;
-                switch (r.info.kind) {
-                    .value8 => field[0] = std.math.cast(u8, v) orelse return overflow(a, r, diag),
-                    .value16 => std.mem.writeInt(u16, field[0..2], std.math.cast(u16, v) orelse return overflow(a, r, diag), .little),
-                    .value32 => std.mem.writeInt(u32, field[0..4], std.math.cast(u32, v) orelse return overflow(a, r, diag), .little),
-                    .value64 => std.mem.writeInt(u64, field[0..8], std.math.cast(u64, v) orelse return overflow(a, r, diag), .little),
-                    else => unreachable,
-                }
+            .x86_64_abs64 => {
+                const f = try relocField(a, dst, r.offset, 8, diag);
+                std.mem.writeInt(u64, f, s +% @as(u64, @bitCast(@as(i64, r.addend))), .little);
             },
-            else => unreachable,
+            .value32 => {
+                const f = try relocField(a, dst, r.offset, 4, diag);
+                std.mem.writeInt(u32, f, std.math.cast(u32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
+            },
+            .value64 => {
+                const f = try relocField(a, dst, r.offset, 8, diag);
+                std.mem.writeInt(u64, f, std.math.cast(u64, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
+            },
+            .value16 => {
+                const f = try relocField(a, dst, r.offset, 2, diag);
+                std.mem.writeInt(u16, f, std.math.cast(u16, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
+            },
+            .value8 => {
+                const f = try relocField(a, dst, r.offset, 1, diag);
+                f[0] = std.math.cast(u8, @as(i128, s) + r.addend) orelse return overflow(a, r, diag);
+            },
+            else => return invalidReloc(a, diag),
         }
     }
+}
+
+inline fn relocField(a: *const Atom, dst: []u8, offset: u32, comptime width: comptime_int, diag: *Diagnostic) Error!*[width]u8 {
+    if (@as(u64, offset) + width > dst.len) return invalidReloc(a, diag);
+    return dst[offset..][0..width];
+}
+
+fn invalidReloc(a: *const Atom, diag: *Diagnostic) Error {
+    diag.* = .{ .atom = a.name };
+    return error.InvalidRelocation;
 }
 
 fn overflow(a: *const Atom, r: Atom.Reloc, diag: *Diagnostic) Error {
@@ -995,6 +1086,7 @@ test "links many chunks of atoms the same way on any number of threads" {
     }.f;
 
     var atoms: std.ArrayList(Atom) = .empty;
+    var debug: std.ArrayList(Atom.Debug) = .empty;
     var expected: u32 = 0;
     const files = [_][]const u8{ "a.zig", "dir/b.zig", "/abs/c.zig", "dir/d.zig" };
     for (0..n) |i| {
@@ -1012,8 +1104,9 @@ test "links many chunks of atoms the same way on any number of threads" {
         expected +%= @intCast(i % 50 + 1);
         const alignments = [_]std.mem.Alignment{ .@"1", .@"16", .@"64" };
         // Files change every 1000 functions, so chunks share some.
-        const debug: Atom.Debug = .{ .file = files[i / 1000 % files.len], .name = try std.fmt.allocPrint(arena, "f{d}", .{i}), .base_line = @intCast(i), .lines = e.lines.bytes.items };
-        try atoms.append(arena, .{ .key = fkey(i), .name = debug.name, .section = .text, .alignment = alignments[i % 3], .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items, .debug = debug });
+        const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
+        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = e.lines.bytes.items });
+        try atoms.append(arena, .{ .key = fkey(i), .name = name, .section = .text, .alignment = alignments[i % 3], .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items });
         try atoms.append(arena, constants[i % 50]);
         if (i % 7 == 0) try atoms.append(arena, .{ .key = fkey(n + i), .name = "pad", .section = .bss, .alignment = .@"8", .zero_fill = i % 13 });
     }
@@ -1037,9 +1130,9 @@ test "links many chunks of atoms the same way on any number of threads" {
     s.finish();
     try atoms.append(arena, .{ .key = start, .name = "_start", .section = .text, .bytes = s.code.items, .targets = s.refs.targets.keys(), .relocs = s.refs.relocs.items });
 
-    const one = try emit(gpa, io, atoms.items, .{ .entry = start, .threads = 1, .comp_dir = "/w" });
+    const one = try emit(gpa, io, atoms.items, .{ .entry = start, .threads = 1, .debug = debug.items, .comp_dir = "/w" });
     defer gpa.free(one);
-    const four = try emit(gpa, io, atoms.items, .{ .entry = start, .threads = 4, .comp_dir = "/w" });
+    const four = try emit(gpa, io, atoms.items, .{ .entry = start, .threads = 4, .debug = debug.items, .comp_dir = "/w" });
     defer gpa.free(four);
     try std.testing.expectEqualSlices(u8, one, four);
 
@@ -1098,14 +1191,19 @@ test "line programs decode with std.debug.Dwarf" {
     for (rows) |r| try lp.addRow(arena, r.offset, r.line, r.column);
     const code: [400]u8 = @splat(0xcc);
     const key: SymbolKey = .fromName("f");
-    const debug: Atom.Debug = .{ .file = "src/f.zig", .name = "f", .base_line = 1000, .lines = lp.bytes.items };
-    const g_debug: Atom.Debug = .{ .file = "g.zig", .name = "g", .base_line = 0, .lines = &.{} };
     const atoms = [_]Atom{
         .{ .key = .fromName("no debug"), .name = "h", .section = .text, .bytes = &.{ 0xc3, 0xc3, 0xc3 } },
-        .{ .key = key, .name = "root:f", .section = .text, .alignment = .@"16", .bytes = &code, .debug = debug },
-        .{ .key = .fromName("g"), .name = "root:g", .section = .text, .bytes = &.{0xc3}, .debug = g_debug },
+        .{ .key = key, .name = "root:f", .section = .text, .alignment = .@"16", .bytes = &code },
+        .{ .key = .fromName("g"), .name = "root:g", .section = .text, .bytes = &.{0xc3} },
+        .{ .key = .fromName("g"), .name = "root:g", .section = .text, .bytes = &.{0xc3} },
     };
-    const out = try emit(gpa, io, &atoms, .{ .entry = key, .comp_dir = "/work" });
+    const debug = [_]Atom.Debug{
+        .{ .atom = 1, .file = "src/f.zig", .name = "f", .base_line = 1000, .lines = lp.bytes.items },
+        .{ .atom = 2, .file = "g.zig", .name = "g", .base_line = 0, .lines = &.{} },
+        // The duplicate's entry goes with it.
+        .{ .atom = 3, .file = "g.zig", .name = "g again", .base_line = 0, .lines = &.{} },
+    };
+    const out = try emit(gpa, io, &atoms, .{ .entry = key, .debug = &debug, .comp_dir = "/work" });
     defer gpa.free(out);
 
     var ef = try testElfFile(io, out);
@@ -1133,7 +1231,8 @@ test "line programs decode with std.debug.Dwarf" {
     const g = try testSymbolize(di, arena, f_addr + code.len);
     try std.testing.expectEqualStrings("g", g.name);
 
-    const stripped = try emit(gpa, io, &atoms, .{ .entry = key, .strip = true });
+    try std.testing.expectError(error.InvalidDebugInfo, emit(gpa, io, &atoms, .{ .entry = key, .debug = &.{ debug[1], debug[0] } }));
+    const stripped = try emit(gpa, io, &atoms, .{ .entry = key });
     defer gpa.free(stripped);
     try std.testing.expect(std.mem.indexOf(u8, stripped, ".debug_") == null);
 }

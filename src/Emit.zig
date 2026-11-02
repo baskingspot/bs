@@ -23,6 +23,8 @@ gpa: Allocator,
 arena: std.heap.ArenaAllocator,
 zcu: *Zcu,
 atoms: std.ArrayList(Atom) = .empty,
+/// Debug info of the function atoms, in atom order.
+debug: std.ArrayList(Atom.Debug) = .empty,
 /// Content-addressed atoms already emitted.
 content_keys: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty,
 /// Declarations whose data the code refers to; lowered by `finish`.
@@ -42,6 +44,7 @@ pub fn init(gpa: Allocator, zcu: *Zcu) Emit {
 pub fn deinit(emit: *Emit) void {
     const gpa = emit.gpa;
     emit.atoms.deinit(gpa);
+    emit.debug.deinit(gpa);
     emit.content_keys.deinit(gpa);
     emit.navs.deinit(gpa);
     emit.errors.deinit(gpa);
@@ -93,7 +96,7 @@ pub fn finish(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !b
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
-    Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = entry_key, .values = values.items, .diag = &diag, .comp_dir = cwd }) catch |err| {
+    Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = entry_key, .values = values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd }) catch |err| {
         std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
         return false;
     };
@@ -106,6 +109,15 @@ pub fn allocator(emit: *Emit) Allocator {
 
 pub fn addAtom(emit: *Emit, atom: Atom) !void {
     try emit.atoms.append(emit.gpa, atom);
+}
+
+/// Adds a function's atom and its debug info.
+pub fn addFunction(emit: *Emit, atom: Atom, debug: Atom.Debug) !void {
+    try emit.debug.ensureUnusedCapacity(emit.gpa, 1);
+    var d = debug;
+    d.atom = @intCast(emit.atoms.items.len);
+    try emit.addAtom(atom);
+    emit.debug.appendAssumeCapacity(d);
 }
 
 /// Adds a content-addressed rodata atom for `bytes` and its sorted `relocs`

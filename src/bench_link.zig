@@ -19,8 +19,8 @@
 //!   neighboring functions (string literals), the rest uniformly random.
 //!
 //! Every function has debug info: one of 500 files, and a line row every
-//! 8..40 bytes. Each emit is also timed stripped, to show its cost. Mach-O
-//! does not emit debug info yet and ignores it.
+//! 8..40 bytes. Each emit is also timed without it, to show its cost.
+//! Mach-O does not emit debug info yet.
 
 const std = @import("std");
 const Atom = @import("link/Atom.zig");
@@ -75,7 +75,7 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
     const cpus = std.Thread.getCpuCount() catch 1;
     for ([_]Mode{ .random, .mixed }) |mode| {
         var prng: std.Random.DefaultPrng = .init(0x5eed);
-        const atoms = try generate(arena, prng.random(), keys, names, mode, format, &imports);
+        const atoms, const debug = try generate(arena, prng.random(), keys, names, mode, format, &imports);
         var content_bytes: usize = 0;
         var n_relocs: usize = 0;
         var n_targets: usize = 0;
@@ -85,9 +85,7 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
             n_targets += a.targets.len;
         }
         var debug_bytes: usize = 0;
-        for (atoms) |a| if (a.debug) |d| {
-            debug_bytes += d.lines.len;
-        };
+        for (debug) |d| debug_bytes += d.lines.len;
         var single: L.Options = .{ .entry = keys[0], .threads = 1 };
         switch (format) {
             .elf => single.comp_dir = "/bench",
@@ -100,11 +98,11 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
         var parallel = single;
         parallel.threads = null;
         // Mach-O has no debug info yet, so stripping changes nothing.
-        var single_strip = single;
-        var parallel_strip = parallel;
+        const single_strip = single;
+        const parallel_strip = parallel;
         if (format == .elf) {
-            single_strip.strip = true;
-            parallel_strip.strip = true;
+            single.debug = debug;
+            parallel.debug = debug;
         }
 
         // Threads must not change the output.
@@ -215,8 +213,10 @@ fn rate(n: usize, ns: u64) f64 {
     return @as(f64, @floatFromInt(n)) / (@as(f64, @floatFromInt(ns)) / 1e9);
 }
 
-fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.SymbolKey, names: []const []const u8, mode: Mode, format: Format, imports: []const MachO.Import) ![]Atom {
+fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.SymbolKey, names: []const []const u8, mode: Mode, format: Format, imports: []const MachO.Import) !struct { []Atom, []Atom.Debug } {
     var atoms: std.ArrayList(Atom) = .empty;
+    // Each function's debug info, by its index in `atoms` before shuffling.
+    var debug: std.ArrayList(Atom.Debug) = .empty;
     var targets: std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
     // Each atom's name, bytes, relocations, and targets are allocated
     // together, as CodeGen's arena or a cache entry would hold them, and the
@@ -275,8 +275,8 @@ fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.Symbo
             try lines.addRow(arena, offset, line, rand.intRangeAtMost(u32, 4, 40));
             line += rand.intRangeAtMost(u32, 1, 3);
         }
-        const debug: Atom.Debug = .{ .file = files[i % files.len], .name = name[std.mem.lastIndexOfScalar(u8, name, ':').? + 1 ..], .base_line = rand.uintLessThan(u32, 5000), .lines = lines.bytes.items };
-        try atoms.append(arena, .{ .key = keys[i], .name = name, .section = .text, .alignment = .@"16", .bytes = bytes, .targets = try arena.dupe(Atom.SymbolKey, targets.keys()), .relocs = relocs.items, .debug = debug });
+        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i % files.len], .name = name[std.mem.lastIndexOfScalar(u8, name, ':').? + 1 ..], .base_line = rand.uintLessThan(u32, 5000), .lines = lines.bytes.items });
+        try atoms.append(arena, .{ .key = keys[i], .name = name, .section = .text, .alignment = .@"16", .bytes = bytes, .targets = try arena.dupe(Atom.SymbolKey, targets.keys()), .relocs = relocs.items });
     }
     // Constants: 8..128 bytes; every fourth one is emitted twice, as two
     // functions producing the same content-addressed constant would.
@@ -306,8 +306,23 @@ fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.Symbo
     }
     // Shuffle so that sections are interleaved in the input, as they are when
     // parallel CodeGen workers finish in arbitrary order.
-    rand.shuffle(Atom, atoms.items);
-    return atoms.items;
+    // The debug entries follow their atoms, in the new atom order.
+    const order = try arena.alloc(u32, atoms.items.len);
+    for (order, 0..) |*o, j| o.* = @intCast(j);
+    rand.shuffle(u32, order);
+    const shuffled = try arena.alloc(Atom, atoms.items.len);
+    const new_index = try arena.alloc(u32, atoms.items.len);
+    for (order, shuffled, 0..) |o, *a, j| {
+        a.* = atoms.items[o];
+        new_index[o] = @intCast(j);
+    }
+    for (debug.items) |*d| d.atom = new_index[d.atom];
+    std.mem.sort(Atom.Debug, debug.items, {}, struct {
+        fn lt(_: void, a: Atom.Debug, b: Atom.Debug) bool {
+            return a.atom < b.atom;
+        }
+    }.lt);
+    return .{ shuffled, debug.items };
 }
 
 fn elapsed(io: std.Io, start: std.Io.Timestamp) u64 {

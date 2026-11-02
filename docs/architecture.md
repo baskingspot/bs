@@ -178,13 +178,17 @@ the callee's body first. Early cutoff on the set keeps such callers green.
     holding the kind and the index of the target in that table. The record
     is a third of the 32 bytes a full key would need, and the linker
     resolves each distinct key once per atom instead of once per use;
-  - for functions, debug info (`Atom.Debug`): source path, simple name,
-    the declaration's base line, and the function's DWARF line-number
-    program fragment, already encoded by the encoder from the IR's
-    `dbg_stmt` rows with lines relative to the base line. Moving a
-    declaration changes only the base line; the linker copies the fragment
-    unchanged and only writes the sequence around it (start address, file
-    index, base line, end address).
+  - debug info is not part of the Atom. For functions, CodeGen produces an
+    `Atom.Debug` next to it: source path, simple name, the declaration's
+    base line, and the function's DWARF line-number program fragment,
+    already encoded from the IR's `dbg_stmt` rows with lines relative to
+    the base line. Moving a declaration changes only the base line; the
+    linker copies the fragment unchanged and only writes the sequence
+    around it (start address, file index, base line, end address). The
+    linker takes these as a separate slice (`Options.debug`) sorted by the
+    index of their atom (`Debug.atom`, set by `Emit.addFunction`), so
+    layout, which walks every Atom, never loads debug data, and the debug
+    passes stream the slice in order without a pointer chase per atom.
 - The symbol key is 128 bits: a hash of the rendered unit key for
   declarations, or of the contents for anonymous constants. Atoms with equal
   keys are one symbol; the linker keeps one and rejects a key whose atoms
@@ -259,21 +263,40 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   DWARF 5 with one compile unit for the whole output: .debug_abbrev, a
   .debug_info subprogram entry per function with `debug` (name, low_pc,
   high_pc, decl_file, decl_line), and one .debug_line sequence per such
-  function. Per-atom sizes depend only on the atom (the file index is a
-  padded ULEB128), so layout computes them per chunk and the copy phase
-  writes them in place; each chunk dedups its atoms' file paths and a serial
-  step merges them into the file table, whose directories are resolved
-  against `comp_dir`. gdb (`break file.zig:N`, `break fn`, `bt`) and
+  function. Per-entry sizes depend only on the entry (the file index is a
+  padded ULEB128), so a pass over chunks of 2048 `Debug` entries, run in
+  the same parallel step as address resolution, sizes them and dedups their
+  file paths; a serial step merges the paths into the file table, whose
+  directories are resolved against `comp_dir`; the debug chunks are then
+  written in place as extra tasks of the copy step. Entries whose atom lost
+  to a duplicate are skipped. gdb (`break file.zig:N`, `break fn`, `bt`) and
   std.debug's ElfFile/Dwarf read it; std.debug requires a .debug_str, so
   it holds the producer string. No CFI yet: debuggers unwind through the
   rbp frame chain. Per-module compile units, types, variables, and rbrace
   (epilogue) rows come later. Cost (bench-link with a line row every
-  8..40 bytes, 3.4 MiB of fragments, output 27.4 → 35.7 MiB): emit +6.5–8 ms
-  on one thread (37–39 → 44–47 ms) and +2.3–3.3 ms on four (13–14 →
-  15–17.5 ms); about 2–5 µs of the 55–90 µs link of each run test.
-  Stripped emit got about 1.5–2 ms slower on one thread (35.6–37.8 →
-  37.4–39.5 ms) because Atoms grew from 104 to 160 bytes to hold `Debug`
-  inline.
+  8..40 bytes, 3.4 MiB of fragments, output 27.4 → 35.7 MiB): emit
+  +10–11 ms on one thread and +3.5–4.5 ms on four in the session below
+  (+6.5–8 and +2.3–3.3 ms on a quieter orb); about 2–5 µs of the 55–90 µs
+  link of each run test. Keeping `Debug` out of the 96-byte Atom (it was
+  inline, making Atoms 160 bytes) removed the 1.5–2 ms that debug info had
+  cost stripped links. Wall-clock differences this small drown in orb
+  noise, so the comparison uses instructions counted by callgrind for three
+  single-thread emits (random targets) next to interleaved best-of-15
+  timings from one session (medians of 4 rounds, ms):
+
+  | | before DWARF (e17b8b7) | `Debug` inline (7d78d66) | `Debug` slice |
+  |---|---|---|---|
+  | stripped, instructions | 316.0M | 320.7M | 312.6M |
+  | with debug, instructions | | 424.0M | 406.4M |
+  | stripped, random, 1 / 4 threads | 38.5 / 17.3 | 41.0 / 18.9 | 38.9 / 18.3 |
+  | stripped, mixed, 1 / 4 threads | 37.4 / 17.3 | 39.5 / 18.3 | 37.7 / 17.6 |
+  | debug, random, 1 / 4 threads | | 49.9 / 22.8 | 50.3 / 22.6 |
+  | debug, mixed, 1 / 4 threads | | 48.2 / 21.6 | 47.5 / 21.1 |
+
+  (The e17b8b7 bench predates the debug variant; the new code runs that
+  bench at 312.3M instructions and 38.1 / 17.7, 36.8 / 17.7 ms. Part of
+  the gain is applying each relocation with one dispatch on its kind
+  instead of two, which the aarch64 kinds had made slower.)
 - Mach-O output is a PIE: __PAGEZERO, __TEXT (header, __text, __stubs,
   __const), __DATA_CONST (__got, and __const for `.rodata` atoms holding
   absolute addresses), __DATA (__data, __bss), __LINKEDIT, all on 16 KiB
@@ -287,8 +310,8 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   per 4 KiB page, hashed in parallel; the UUID comes from the same hashes,
   so the file is read once for both. `link` must invalidate its mapping of
   the output before unmapping it, or macOS kills every run of the file
-  despite a valid signature (golang/go#42684). It ignores Atoms' `debug`
-  for now; Mach-O debug info comes later.
+  despite a valid signature (golang/go#42684). It takes no `Atom.Debug`
+  yet; Mach-O debug info comes later.
 - Measured Mach-O link throughput (2026-11-02, Apple M4 Max, 12+4 cores,
   `zig build bench-link -- macho`, best of 15): the same 100k atoms with
   aarch64 relocations (970k: a constant reference is an adrp/add pair) and

@@ -27,10 +27,6 @@ zero_fill: u64 = 0,
 targets: []const SymbolKey = &.{},
 /// Sorted by offset. Must be empty for `.bss`.
 relocs: []const Reloc = &.{},
-/// Source information for debug info, or null for code and data without
-/// it (runtime helpers, and data until variables get debug info).
-debug: ?Debug = null,
-
 /// 128-bit stable identity of a symbol. Derived from the unit key for
 /// declarations (`fromName`) and from the contents for anonymous constants
 /// (`fromContents`), never from in-memory indices. Two atoms with the same key
@@ -183,8 +179,13 @@ pub const RelocList = struct {
 };
 
 /// What the linkers need to emit DWARF for a function: a compile unit
-/// entry and a line-number program.
+/// entry and a line-number program. Linkers take these apart from the
+/// atoms, as a slice sorted by `atom`, so that a link without debug info
+/// never reads them and one with it streams through them.
 pub const Debug = struct {
+    /// Index of the function's atom in the link's atoms. Set by whoever
+    /// assembles the link's input (`Emit.addFunction`), not by CodeGen.
+    atom: u32 = undefined,
     /// Path of the source file as the compiler opened it: absolute, or
     /// relative to the linker's `comp_dir`.
     file: []const u8,

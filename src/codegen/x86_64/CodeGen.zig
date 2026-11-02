@@ -132,7 +132,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .base_line = file.zir.getDeclaration(nav.zir_inst).src_line,
         .lines = try arena.dupe(u8, cg.e.lines.bytes.items),
     };
-    try emit.addAtom(.{
+    try emit.addFunction(.{
         .key = try emit.funcKey(ir.func),
         .name = name,
         .section = .text,
@@ -140,8 +140,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .bytes = try arena.dupe(u8, cg.e.code.items),
         .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
-        .debug = debug,
-    });
+    }, debug);
 }
 
 fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
