@@ -10,7 +10,7 @@ const std = @import("std");
 
 const Atom = @This();
 
-/// Identifies the atom's symbol; relocations name their target by key.
+/// Identifies the atom's symbol; other atoms reference it by key.
 key: SymbolKey,
 /// Symbol name written to the output's symbol table. For declarations this is
 /// the rendered unit key; content-addressed atoms may use any name.
@@ -21,6 +21,10 @@ alignment: std.mem.Alignment = .@"1",
 bytes: []const u8 = &.{},
 /// Size of a `.bss` atom. Must be 0 for other sections.
 zero_fill: u64 = 0,
+/// The distinct symbols (or link-time values) this atom references, each
+/// once. Relocations refer to them by index, which keeps relocation records
+/// small and lets the linker resolve each key once per atom.
+targets: []const SymbolKey = &.{},
 /// Sorted by offset. Must be empty for `.bss`.
 relocs: []const Reloc = &.{},
 /// Source line of the declaration's first line. `lines` are relative to it,
@@ -50,6 +54,7 @@ pub const SymbolKey = enum(u128) {
         section: Section,
         alignment: std.mem.Alignment,
         bytes: []const u8,
+        targets: []const SymbolKey,
         relocs: []const Reloc,
     ) SymbolKey {
         var h = Hasher.init(&hash_key);
@@ -58,8 +63,8 @@ pub const SymbolKey = enum(u128) {
         h.update(bytes);
         for (relocs) |r| {
             h.update(std.mem.asBytes(&r.offset));
-            h.update(&.{@backingInt(r.kind)});
-            h.update(std.mem.asBytes(&@backingInt(r.target)));
+            h.update(&.{@backingInt(r.info.kind)});
+            h.update(std.mem.asBytes(&@backingInt(targets[r.info.target])));
             h.update(std.mem.asBytes(&r.addend));
         }
         return @fromBackingInt(@intCast(h.finalInt()));
@@ -78,12 +83,23 @@ pub const Section = enum(u8) {
     bss,
 };
 
-pub const Reloc = struct {
+/// 12 bytes: relocation records are about as numerous as instructions that
+/// reference other symbols, so their size is a large part of link time.
+pub const Reloc = extern struct {
     /// Byte offset of the patched field within the atom.
     offset: u32,
-    kind: Kind,
-    target: SymbolKey,
-    addend: i64,
+    addend: i32,
+    info: Info,
+
+    pub const Info = packed struct(u32) {
+        /// Index into the atom's `targets`.
+        target: u24,
+        kind: Kind,
+    };
+
+    pub fn init(offset: u32, kind: Kind, target: u24, addend: i32) Reloc {
+        return .{ .offset = offset, .addend = addend, .info = .{ .target = target, .kind = kind } };
+    }
 
     /// Address kinds are target-specific; kinds for other architectures are
     /// added alongside.
@@ -95,14 +111,52 @@ pub const Reloc = struct {
         /// it with A = -4 - (bytes after the field in the instruction).
         x86_64_pc32,
         /// V + A as a little-endian unsigned integer of 1, 2, 4, or 8 bytes,
-        /// where V is the integer the whole compilation assigns to `target`
-        /// (for example an error's code in the global error set). V comes
-        /// from the linker's `values` option, not from an atom, so atoms do
-        /// not change when the assignment does.
+        /// checked for overflow. V is the integer the whole compilation
+        /// assigns to the target (for example an error's code in the global
+        /// error set), from the linker's `values` option rather than from an
+        /// atom, so atoms do not change when the assignment does. A target
+        /// that names a symbol gives its address instead.
         value8,
         value16,
         value32,
         value64,
+    };
+};
+
+/// Builds an atom's `targets` and `relocs`, adding each target once. Used by
+/// the encoder and by data lowering.
+pub const RelocList = struct {
+    /// `targets.keys()` is the atom's `targets`, in first-use order.
+    targets: std.ArrayHashMapUnmanaged(SymbolKey, void, KeyContext, false) = .empty,
+    relocs: std.ArrayList(Reloc) = .empty,
+
+    pub fn deinit(l: *RelocList, gpa: std.mem.Allocator) void {
+        l.targets.deinit(gpa);
+        l.relocs.deinit(gpa);
+    }
+
+    pub fn append(l: *RelocList, gpa: std.mem.Allocator, offset: u32, kind: Reloc.Kind, target: SymbolKey, addend: i64) !void {
+        const gop = try l.targets.getOrPut(gpa, target);
+        try l.relocs.append(gpa, .init(offset, kind, @intCast(gop.index), @intCast(addend)));
+    }
+
+    /// Orders `relocs` by offset, as `Atom.relocs` requires.
+    pub fn sort(l: *RelocList) void {
+        std.mem.sort(Reloc, l.relocs.items, {}, struct {
+            fn lt(_: void, a: Reloc, b: Reloc) bool {
+                return a.offset < b.offset;
+            }
+        }.lt);
+    }
+
+    const KeyContext = struct {
+        // Keys are already uniformly distributed hashes.
+        pub fn hash(_: KeyContext, k: SymbolKey) u32 {
+            return @truncate(@backingInt(k));
+        }
+        pub fn eql(_: KeyContext, a: SymbolKey, b: SymbolKey, _: usize) bool {
+            return a == b;
+        }
     };
 };
 
@@ -114,6 +168,10 @@ pub const Line = struct {
     column: u32,
 };
 
+comptime {
+    std.debug.assert(@sizeOf(Reloc) == 12);
+}
+
 pub fn size(a: *const Atom) u64 {
     return if (a.section == .bss) a.zero_fill else a.bytes.len;
 }
@@ -122,8 +180,9 @@ test "content keys distinguish relocation targets" {
     const a: SymbolKey = .fromName("a");
     const b: SymbolKey = .fromName("b");
     const bytes: [8]u8 = @splat(0);
-    const ka = SymbolKey.fromContents(.rodata, .@"8", &bytes, &.{.{ .offset = 0, .kind = .x86_64_abs64, .target = a, .addend = 0 }});
-    const kb = SymbolKey.fromContents(.rodata, .@"8", &bytes, &.{.{ .offset = 0, .kind = .x86_64_abs64, .target = b, .addend = 0 }});
+    const relocs: []const Reloc = &.{.init(0, .x86_64_abs64, 0, 0)};
+    const ka = SymbolKey.fromContents(.rodata, .@"8", &bytes, &.{a}, relocs);
+    const kb = SymbolKey.fromContents(.rodata, .@"8", &bytes, &.{b}, relocs);
     try std.testing.expect(ka != kb);
-    try std.testing.expectEqual(ka, SymbolKey.fromContents(.rodata, .@"8", &bytes, &.{.{ .offset = 0, .kind = .x86_64_abs64, .target = a, .addend = 0 }}));
+    try std.testing.expectEqual(ka, SymbolKey.fromContents(.rodata, .@"8", &bytes, &.{a}, relocs));
 }

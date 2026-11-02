@@ -105,11 +105,11 @@ pub fn addAtom(emit: *Emit, atom: Atom) !void {
     try emit.atoms.append(emit.gpa, atom);
 }
 
-/// Adds a content-addressed rodata atom for `bytes` and `relocs` unless an
-/// identical one exists, and returns its key.
-pub fn contentAtom(emit: *Emit, alignment: u64, bytes: []const u8, relocs: []const Atom.Reloc) !SymbolKey {
+/// Adds a content-addressed rodata atom for `bytes` and its sorted `relocs`
+/// unless an identical one exists, and returns its key.
+pub fn contentAtom(emit: *Emit, alignment: u64, bytes: []const u8, targets: []const SymbolKey, relocs: []const Atom.Reloc) !SymbolKey {
     const a: std.mem.Alignment = .fromByteUnits(@max(alignment, 1));
-    const key: SymbolKey = .fromContents(.rodata, a, bytes, relocs);
+    const key: SymbolKey = .fromContents(.rodata, a, bytes, targets, relocs);
     const gop = try emit.content_keys.getOrPut(emit.gpa, key);
     if (gop.found_existing) return key;
     const arena = emit.allocator();
@@ -119,6 +119,7 @@ pub fn contentAtom(emit: *Emit, alignment: u64, bytes: []const u8, relocs: []con
         .section = .rodata,
         .alignment = a,
         .bytes = try arena.dupe(u8, bytes),
+        .targets = try arena.dupe(SymbolKey, targets),
         .relocs = try arena.dupe(Atom.Reloc, relocs),
     });
     return key;
@@ -158,10 +159,11 @@ pub fn uavKey(emit: *Emit, val: Index) !SymbolKey {
     const size = Type.abiSize(ip, ty);
     const bytes = try emit.gpa.alloc(u8, size);
     defer emit.gpa.free(bytes);
-    var relocs: std.ArrayList(Atom.Reloc) = .empty;
-    defer relocs.deinit(emit.gpa);
-    try CodeGen.lowerValue(emit, val, bytes, &relocs, 0);
-    return emit.contentAtom(Type.abiAlignment(ip, ty), bytes, relocs.items);
+    var refs: Atom.RelocList = .{};
+    defer refs.deinit(emit.gpa);
+    try CodeGen.lowerValue(emit, val, bytes, &refs, 0);
+    refs.sort();
+    return emit.contentAtom(Type.abiAlignment(ip, ty), bytes, refs.targets.keys(), refs.relocs.items);
 }
 
 fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
@@ -171,19 +173,17 @@ fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
     if (!Type.hasRuntimeBits(ip, ty)) return;
     const arena = emit.allocator();
     const bytes = try arena.alloc(u8, Type.abiSize(ip, ty));
-    var relocs: std.ArrayList(Atom.Reloc) = .empty;
-    try CodeGen.lowerValue(emit, nav.val, bytes, &relocs, 0);
-    std.mem.sort(Atom.Reloc, relocs.items, {}, struct {
-        fn lt(_: void, a: Atom.Reloc, b: Atom.Reloc) bool {
-            return a.offset < b.offset;
-        }
-    }.lt);
+    var refs: Atom.RelocList = .{};
+    defer refs.deinit(emit.gpa);
+    try CodeGen.lowerValue(emit, nav.val, bytes, &refs, 0);
+    refs.sort();
     try emit.addAtom(.{
         .key = .fromName(try emit.unitName(.{ .nav_val = nav_index })),
         .name = ip.stringSlice(nav.fqn),
         .section = if (nav.is_const) .rodata else .data,
         .alignment = .fromByteUnits(Type.abiAlignment(ip, ty)),
         .bytes = bytes,
-        .relocs = relocs.items,
+        .targets = try arena.dupe(SymbolKey, refs.targets.keys()),
+        .relocs = try arena.dupe(Atom.Reloc, refs.relocs.items),
     });
 }

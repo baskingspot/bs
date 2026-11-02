@@ -15,7 +15,8 @@ const Encoder = @This();
 
 gpa: Allocator,
 code: std.ArrayList(u8) = .empty,
-relocs: std.ArrayList(Atom.Reloc) = .empty,
+/// The atom's `targets` (`refs.targets.keys()`) and `relocs` (`refs.relocs.items`).
+refs: Atom.RelocList = .{},
 /// Offset each label is bound to, or `unbound`.
 labels: std.ArrayList(u32) = .empty,
 /// rel32 fields that branch to a label not yet bound when they were emitted.
@@ -149,7 +150,7 @@ pub fn init(gpa: Allocator) Encoder {
 
 pub fn deinit(e: *Encoder) void {
     e.code.deinit(e.gpa);
-    e.relocs.deinit(e.gpa);
+    e.refs.deinit(e.gpa);
     e.labels.deinit(e.gpa);
     e.fixups.deinit(e.gpa);
 }
@@ -211,6 +212,16 @@ pub fn movAbsSym(e: *Encoder, dst: Reg, sym: SymbolKey, addend: i64) !void {
     e.byte(0xb8 | @as(u8, dst.low()));
     try e.reloc(.x86_64_abs64, sym, addend);
     e.int(u64, 0);
+}
+
+/// `mov r32, imm32` with the immediate set at link time to the 32-bit
+/// value of `key` (a `.value32` relocation), zero-extended into `dst`.
+pub fn movImmValue(e: *Encoder, dst: Reg, key: SymbolKey) !void {
+    try e.reserve();
+    e.prefixes(.{ .b = ext(@backingInt(dst)) }, .{});
+    e.byte(0xb8 | @as(u8, dst.low()));
+    try e.reloc(.value32, key, 0);
+    e.int(u32, 0);
 }
 
 pub fn lea(e: *Encoder, size: Size, dst: Reg, src: Mem) !void {
@@ -533,7 +544,7 @@ fn scalarPrefix(ty: Float) u8 {
 }
 
 fn reloc(e: *Encoder, kind: Atom.Reloc.Kind, target: SymbolKey, addend: i64) !void {
-    try e.relocs.append(e.gpa, .{ .offset = @intCast(e.code.items.len), .kind = kind, .target = target, .addend = addend });
+    try e.refs.append(e.gpa, @intCast(e.code.items.len), kind, target, addend);
 }
 
 fn rel32(e: *Encoder, target: Target) !void {
@@ -706,7 +717,21 @@ test "encodings with special cases match GNU as" {
     var buf: [expected.len / 2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
     // The immediate after the field shifts the addend: 8 - 4 - 4.
-    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.{ .offset = 0x55, .kind = .x86_64_pc32, .target = foo, .addend = 0 }}, e.relocs.items);
+    try std.testing.expectEqualSlices(SymbolKey, &.{foo}, e.refs.targets.keys());
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.init(0x55, .x86_64_pc32, 0, 0)}, e.refs.relocs.items);
+    // Further references share the target table entry.
+    const bar: SymbolKey = .fromName("bar");
+    try e.call(.{ .sym = bar });
+    try e.jmp(.{ .sym = foo });
+    try e.movImmValue(.r9, bar); // 41 b9 <value32 bar>
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0xb9, 0, 0, 0, 0 }, e.code.items[0x67..]);
+    try std.testing.expectEqualSlices(SymbolKey, &.{ foo, bar }, e.refs.targets.keys());
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{
+        .init(0x55, .x86_64_pc32, 0, 0),
+        .init(0x5e, .x86_64_pc32, 1, -4),
+        .init(0x63, .x86_64_pc32, 0, -4),
+        .init(0x69, .value32, 1, 0),
+    }, e.refs.relocs.items);
 }
 
 test "branches to labels bound before and after them" {
@@ -723,5 +748,5 @@ test "branches to labels bound before and after them" {
     try e.ret();
     e.finish();
     try std.testing.expectEqualSlices(u8, &.{ 0x0f, 0x84, 0x06, 0, 0, 0, 0xcc, 0xe9, 0xf4, 0xff, 0xff, 0xff, 0xc3 }, e.code.items);
-    try std.testing.expectEqual(0, e.relocs.items.len);
+    try std.testing.expectEqual(0, e.refs.relocs.items.len);
 }

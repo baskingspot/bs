@@ -130,7 +130,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .section = .text,
         .alignment = .@"16",
         .bytes = try arena.dupe(u8, cg.e.code.items),
-        .relocs = try arena.dupe(Atom.Reloc, cg.e.relocs.items),
+        .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
+        .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
     });
 }
 
@@ -301,9 +302,7 @@ fn loadMem(cg: *CodeGen, reg: Reg, m: Mem, ty: Index) Error!void {
 
 fn loadError(cg: *CodeGen, reg: Reg, name: InternPool.String) Error!void {
     const key = try cg.emit.useError(name);
-    // `mov r32, imm32`; the immediate is the last four bytes.
-    try cg.e.mov(.dword, .{ .reg = reg }, .{ .imm = 0x7fff_ffff });
-    try cg.e.relocs.append(cg.gpa, .{ .offset = @intCast(cg.e.code.items.len - 4), .kind = .value32, .target = key, .addend = 0 });
+    try cg.e.movImmValue(reg, key);
 }
 
 /// Stores the low `size` bytes of `reg` to `m`.
@@ -895,7 +894,7 @@ const panic_write_dec = "__zap_panic_write_dec";
 const panic_abort = "__zap_panic_abort";
 
 fn panicWriteStr(cg: *CodeGen, s: []const u8) Error!void {
-    const key = try cg.emit.contentAtom(1, s, &.{});
+    const key = try cg.emit.contentAtom(1, s, &.{}, &.{});
     try cg.e.lea(.qword, .rdi, Mem.sym(key, 0));
     try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .imm = @intCast(s.len) });
     try cg.e.call(.{ .sym = .fromName(panic_write) });
@@ -1223,7 +1222,7 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
 
 /// Writes the bytes of comptime-known `val` into `out` (its ABI size), with
 /// relocations at `base_off + offset`.
-pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *std.ArrayList(Atom.Reloc), base_off: u32) Error!void {
+pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, base_off: u32) Error!void {
     const ip = &emit.zcu.ip;
     const gpa = emit.gpa;
     const ty = ip.typeOf(val);
@@ -1239,7 +1238,7 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *std.ArrayList(Ato
         .simple_value => |s| out[0] = @intFromBool(s == .true),
         .err => |e| {
             @memset(out, 0);
-            try relocs.append(gpa, .{ .offset = base_off, .kind = .value16, .target = try emit.useError(e.name), .addend = 0 });
+            try relocs.append(gpa, base_off, .value16, try emit.useError(e.name), 0);
         },
         .ptr => |p| {
             if (p.base == .int) {
@@ -1247,7 +1246,7 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *std.ArrayList(Ato
             } else {
                 const t = try ptrTarget(emit, val);
                 @memset(out[0..8], 0);
-                try relocs.append(gpa, .{ .offset = base_off, .kind = .x86_64_abs64, .target = t.key, .addend = t.off });
+                try relocs.append(gpa, base_off, .x86_64_abs64, t.key, t.off);
             }
         },
         .slice => |s| {
@@ -1267,7 +1266,7 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *std.ArrayList(Ato
             const layout = Type.errorUnionLayout(ip, ty);
             @memset(out, 0);
             switch (eu.val) {
-                .err_name => |name| try relocs.append(gpa, .{ .offset = base_off + @as(u32, @intCast(layout.err_offset)), .kind = .value16, .target = try emit.useError(name), .addend = 0 }),
+                .err_name => |name| try relocs.append(gpa, base_off + @as(u32, @intCast(layout.err_offset)), .value16, try emit.useError(name), 0),
                 .payload => |pl| {
                     const size = Type.abiSize(ip, ip.typeOf(pl));
                     const off: u32 = @intCast(layout.payload_offset);

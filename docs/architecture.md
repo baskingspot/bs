@@ -134,7 +134,11 @@ the callee's body first. Early cutoff on the set keeps such callers green.
 - Output is an **Atom**, defined in `src/link/Atom.zig`:
   - stable symbol key and name, section kind, alignment;
   - code or data bytes (or a size for zero-fill sections);
-  - relocations: offset, kind, target symbol key, addend;
+  - a target table listing each symbol key the atom references once, and
+    relocations of 12 bytes each: offset (u32), addend (i32), and a u32
+    holding the kind and the index of the target in that table. The record
+    is a third of the 32 bytes a full key would need, and the linker
+    resolves each distinct key once per atom instead of once per use;
   - line table and debug info fragments, relative to the declaration's first
     line, so that moving a declaration only patches its base line.
 - The symbol key is 128 bits: a hash of the rendered unit key for
@@ -159,18 +163,39 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   a memcpy-dominated pass over cached Atoms.
 - x86_64-linux: static ELF first. aarch64-macos: Mach-O against libSystem,
   ad-hoc code signature.
-- The ELF linker (`src/link/Elf.zig`) builds the whole file in one buffer,
-  walking the Atoms in input order: deduplicate and place, assign addresses,
-  copy bytes and apply relocations, write the symbol table. Segments: R
-  (headers, .rodata), RX (.text), RW (.data, .bss). TLS will add .tdata and
-  .tbss at the start of RW with a PT_TLS header.
-- Measured link throughput (2026-11-02, orb, `zig build bench-link`): 100k
-  synthetic atoms (22 MiB of bytes, 650k relocations, uniformly random
-  targets) link in about 3.4x the time of copying their bytes into a fresh
-  buffer. Copying and page faults on the output take under half of it;
-  relocation records (32 bytes each, as large in total as the code) and
-  symbol-table lookups take most of the rest. Shrinking relocation records
-  is the lever if relinks need to get closer to memcpy speed.
+- The ELF linker (`src/link/Elf.zig`) builds the whole file in one buffer
+  (for `link`, a shared mapping of the new file, which replaces any old file
+  instead of truncating it). Segments: R (headers, .rodata), RX (.text), RW
+  (.data, .bss). TLS will add .tdata and .tbss at the start of RW with a
+  PT_TLS header.
+- Phases, each split into tasks over a thread pool: insert every key into a
+  symbol table partitioned by the key's top bits (one thread per partition,
+  first occurrence in input order wins); lay out chunks of 2048 atoms
+  relative to the chunk; place chunks per section serially; replace atom
+  indices in the table with addresses; fault in the output once; then per
+  chunk copy bytes, resolve the atom's targets, apply its relocations, and
+  write its symbol-table entries. The output is byte-identical for any
+  thread count, and errors report the lowest failing atom.
+- Measured link throughput (2026-11-02, orb with 4 CPUs, `zig build
+  bench-link`, best of 15): 100k synthetic atoms (22 MiB of bytes, 650k
+  relocations). Floors copy the same bytes into a fresh buffer.
+
+  | | before (32-byte relocs, serial) | after |
+  |---|---|---|
+  | emit, 1 thread, random targets | 46–48 ms (3.9–4.3x floor) | 37 ms (3.4x) |
+  | emit, 4 threads, random targets | 46 ms | 14.6 ms (1.35x the 1-thread floor, 3.3x the 4-thread floor) |
+  | emit, 4 threads, mixed targets | 46–51 ms | 14.7 ms |
+  | link to a file, 4 threads | 111–119 ms | 28–33 ms |
+
+  "Mixed" sends half the references to 512 hot symbols, a fifth to nearby
+  constants, and the rest to random atoms; it is an assumption, not a
+  measured distribution. What remains in single-thread emit, beyond the
+  roughly 11 ms of copying and first-touch faults the floor also pays: about
+  9 ms of symbol-table probes (cache misses on random keys), about 6 ms of
+  stalls loading each atom's scattered targets, relocations, and name, about
+  4 ms applying relocations, about 5 ms of symbol-table output, and about
+  5 ms of dedup, layout, and address resolution. Keys resolved to dense
+  indices once in the on-disk cache (milestone 6) could remove the probes.
 
 ### compiler_rt (decided 2026-11-02)
 
