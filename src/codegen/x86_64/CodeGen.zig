@@ -1003,6 +1003,8 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
             try cg.load(.rax, operand);
         }
     }
+    // The epilogue belongs to the closing brace, as in upstream's line tables.
+    try cg.e.line(cg.ir.rbrace_line, cg.ir.rbrace_column);
     try cg.e.mov(.qword, .{ .reg = .rsp }, .{ .reg = .rbp });
     try cg.e.pop(.rbp);
     try cg.e.ret();

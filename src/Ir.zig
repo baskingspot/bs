@@ -20,6 +20,10 @@ extra: []const u32,
 func: InternPool.Index,
 /// Index into `extra` of the main body's `Block` payload.
 main_block: u32,
+/// The function's closing brace, relative to its declaration like
+/// `dbg_stmt`, for the epilogue's line row.
+rbrace_line: u32 = 0,
+rbrace_column: u32 = 0,
 
 pub fn deinit(ir: *Ir, gpa: std.mem.Allocator) void {
     ir.instructions.deinit(gpa);

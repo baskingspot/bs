@@ -582,6 +582,10 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
         // A naked function falls off its end into whatever follows.
     }
 
+    // `Func.SrcLocs` follows the body in `extra`.
+    const body_end = (@intFromPtr(fn_info.body.ptr) - @intFromPtr(sema.code.extra.ptr)) / @sizeOf(u32) + fn_info.body.len;
+    const src_locs = sema.code.extraData(Zir.Inst.Func.SrcLocs, body_end).data;
+
     const main_block: u32 = @intCast(sema.ir_extra.items.len);
     try sema.ir_extra.append(gpa, @intCast(block.instructions.items.len));
     try sema.ir_extra.appendSlice(gpa, @ptrCast(block.instructions.items));
@@ -591,6 +595,8 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
         .extra = try sema.ir_extra.toOwnedSlice(gpa),
         .func = func_index,
         .main_block = main_block,
+        .rbrace_line = src_locs.rbrace_line,
+        .rbrace_column = @as(u16, @truncate(src_locs.columns >> 16)),
     };
     _ = &ir;
     return ir;
