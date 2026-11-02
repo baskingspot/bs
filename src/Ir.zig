@@ -1,0 +1,441 @@
+//! The typed IR of one function instance, produced by Sema and consumed by
+//! CodeGen, then freed. Never persisted (see docs/architecture.md).
+//!
+//! Flat arrays in SSA form, like upstream AIR: an instruction's operands are
+//! other instructions or InternPool values. Control flow is structured:
+//! `block`/`br`, `loop`/`repeat`, `cond_br`, and `switch_br` nest bodies, and
+//! every body ends with a `noreturn` instruction. Safety checks are explicit
+//! (`cond_br` to a `panic`), so CodeGen never decides semantics. The IR is
+//! target-independent and precise enough to interpret.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const InternPool = @import("InternPool.zig");
+
+const Ir = @This();
+
+instructions: std.MultiArrayList(Inst).Slice,
+extra: []const u32,
+/// The function instance this IR is the body of.
+func: InternPool.Index,
+/// Index into `extra` of the main body's `Block` payload.
+main_block: u32,
+
+pub fn deinit(ir: *Ir, gpa: std.mem.Allocator) void {
+    ir.instructions.deinit(gpa);
+    gpa.free(ir.extra);
+    ir.* = undefined;
+}
+
+pub const Inst = struct {
+    tag: Tag,
+    data: Data,
+
+    pub const Index = enum(u32) {
+        _,
+
+        pub fn toRef(i: Index) Ref {
+            return @fromBackingInt(@backingInt(i) | ref_inst_bit);
+        }
+    };
+
+    /// An instruction result or an interned value. The top bit selects an
+    /// instruction; InternPool indices use only 31 bits.
+    pub const Ref = enum(u32) {
+        none = std.math.maxInt(u32),
+        _,
+
+        pub fn toIndex(r: Ref) ?Index {
+            assert(r != .none);
+            const raw = @backingInt(r);
+            return if (raw & ref_inst_bit != 0) @fromBackingInt(raw & ~ref_inst_bit) else null;
+        }
+
+        pub fn toInterned(r: Ref) ?InternPool.Index {
+            assert(r != .none);
+            const raw = @backingInt(r);
+            return if (raw & ref_inst_bit == 0) @fromBackingInt(raw) else null;
+        }
+
+        pub fn fromInterned(i: InternPool.Index) Ref {
+            assert(@backingInt(i) & ref_inst_bit == 0);
+            return @fromBackingInt(@backingInt(i));
+        }
+
+        pub const void_value: Ref = .fromInterned(.void_value);
+        pub const unreachable_value: Ref = .fromInterned(.unreachable_value);
+        pub const zero: Ref = .fromInterned(.zero);
+        pub const zero_u1: Ref = .fromInterned(.zero_u1);
+    };
+
+    const ref_inst_bit: u32 = 1 << 31;
+
+    pub const Tag = enum(u8) {
+        /// Function parameter `arg.index` of type `arg.ty`. Only at the start
+        /// of the main body.
+        arg,
+        /// A stack allocation. `ty` is the resulting pointer type.
+        alloc,
+        /// `ty_op`: load a `ty` from pointer `operand`.
+        load,
+        /// `bin_op`: store `rhs` through pointer `lhs`. An undefined `rhs`
+        /// fills the memory with 0xaa, as upstream does in Debug builds.
+        store,
+
+        /// `bin_op`: two's complement wrapping arithmetic on integers of the
+        /// operand type.
+        add_wrap,
+        sub_wrap,
+        mul_wrap,
+        /// `ty_pl` with `Bin`: result is a tuple `{ T, u1 }` of the wrapped
+        /// result and whether the operation overflowed.
+        add_with_overflow,
+        sub_with_overflow,
+        mul_with_overflow,
+        /// `bin_op`: integer division and remainder. The divisor is non-zero
+        /// and the quotient fits; Sema emits the checks.
+        div_trunc,
+        div_floor,
+        rem,
+        mod,
+        /// `bin_op`: bitwise operations on integers or bools.
+        bit_and,
+        bit_or,
+        xor,
+        /// `bin_op`: shifts. `rhs` is less than the bit width of `lhs`'s type.
+        /// `shr` is arithmetic for signed types.
+        shl,
+        shr,
+        /// `ty_op`: bitwise NOT for integers, logical NOT for bools.
+        not,
+        /// `bin_op`: comparisons of integers, bools, or pointers; result `bool`.
+        cmp_lt,
+        cmp_lte,
+        cmp_eq,
+        cmp_gte,
+        cmp_gt,
+        cmp_neq,
+
+        /// `ty_op`: integer conversion that preserves the value (checked by
+        /// Sema when it might not).
+        intcast,
+        /// `ty_op`: keep the low bits of an integer.
+        trunc,
+        /// `ty_op`: reinterpret the bits of a value of the same size.
+        bitcast,
+        /// `un_op`: `bool` to `u1`.
+        int_from_bool,
+        /// `un_op`: pointer to `usize`.
+        int_from_ptr,
+        /// `ty_op`: `usize` to pointer.
+        ptr_from_int,
+
+        /// `ty_pl` with `Block`: a body that `br` instructions exit with a
+        /// value of type `ty`.
+        block,
+        /// `ty_pl` with `Block`: a body that `repeat` restarts. Exits only
+        /// through `br` to an enclosing block, `ret`, or other `noreturn`.
+        loop,
+        /// `repeat`: jump back to the start of `loop_inst`.
+        repeat,
+        /// `br`: exit `block_inst` with `operand`.
+        br,
+        /// `pl_op` with `CondBr`: `operand` is a `bool`.
+        cond_br,
+        /// `pl_op` with `SwitchBr`: `operand` is an integer or bool.
+        switch_br,
+        /// `un_op`: return from the function.
+        ret,
+        /// `no_op`: reaching this is undefined behavior (no safety check).
+        unreach,
+        /// `no_op`: `@trap()`.
+        trap,
+        /// `panic`: a safety check failed.
+        panic,
+
+        /// `pl_op` with `Call`: `operand` is the callee function value.
+        call,
+
+        /// `ty_pl` with `StructField`: pointer to a field of the struct (or
+        /// tuple) `operand` points to.
+        struct_field_ptr,
+        /// `ty_pl` with `StructField`: a field of struct value `operand`.
+        struct_field_val,
+        /// `ty_pl` with `Bin`: pointer to element `rhs` of what pointer `lhs`
+        /// points to (`*[N]T` or `[*]T`).
+        ptr_elem_ptr,
+        /// `bin_op`: load element `rhs` through `*[N]T` or `[*]T` `lhs`.
+        ptr_elem_val,
+        /// `ty_pl` with `Bin`: pointer to element `rhs` of slice `lhs`.
+        slice_elem_ptr,
+        /// `bin_op`: element `rhs` of slice `lhs`.
+        slice_elem_val,
+        /// `bin_op`: element `rhs` of array value `lhs`.
+        array_elem_val,
+        /// `ty_op`: the pointer of a slice.
+        slice_ptr,
+        /// `ty_op`: the length of a slice.
+        slice_len,
+        /// `ty_pl` with `Bin`: build a slice from pointer `lhs` and length `rhs`.
+        slice,
+        /// `ty_pl` with `Bin`: advance pointer `lhs` by `rhs` elements.
+        ptr_add,
+
+        /// `un_op`: whether an optional is null / non-null.
+        is_null,
+        is_non_null,
+        /// `ty_op`: the payload of a non-null optional.
+        optional_payload,
+        /// `ty_op`: pointer to the payload of the optional `operand` points to.
+        optional_payload_ptr,
+        /// `ty_op`: like `optional_payload_ptr`, also marking it non-null.
+        optional_payload_ptr_set,
+        /// `ty_op`: wrap a payload into a non-null optional.
+        wrap_optional,
+        /// `un_op`: whether an error union holds an error / a payload.
+        is_err,
+        is_non_err,
+        /// `ty_op`: the payload of an error union holding a payload.
+        unwrap_errunion_payload,
+        /// `ty_op`: the error of an error union.
+        unwrap_errunion_err,
+        /// `ty_op`: pointer to the payload / error of what `operand` points to.
+        unwrap_errunion_payload_ptr,
+        unwrap_errunion_err_ptr,
+        /// `ty_op`: like `unwrap_errunion_payload_ptr`, also clearing the error.
+        errunion_payload_ptr_set,
+        /// `ty_op`: build an error union from a payload / an error.
+        wrap_errunion_payload,
+        wrap_errunion_err,
+
+        /// `ty_pl` with `Aggregate`: build an array, struct, or tuple value.
+        aggregate_init,
+        /// `ty_pl` with `Asm`: inline assembly.
+        assembly,
+        /// `dbg_stmt`: a statement starts at this line and column, relative
+        /// to the function's declaration.
+        dbg_stmt,
+    };
+
+    pub const Data = union {
+        no_op: void,
+        un_op: Ref,
+        bin_op: struct { lhs: Ref, rhs: Ref },
+        ty: InternPool.Index,
+        arg: struct { ty: InternPool.Index, index: u32 },
+        ty_op: struct { ty: InternPool.Index, operand: Ref },
+        ty_pl: struct { ty: InternPool.Index, payload: u32 },
+        pl_op: struct { operand: Ref, payload: u32 },
+        br: struct { block_inst: Index, operand: Ref },
+        repeat: struct { loop_inst: Index },
+        dbg_stmt: struct { line: u32, column: u32 },
+        /// `payload` is a `Bin` for the formatted panics (see `PanicId`),
+        /// else unused.
+        panic: struct { id: PanicId, payload: u32 },
+    };
+};
+
+/// The safety checks Sema emits. Messages match upstream's `std.debug`
+/// panic handler. (Milestone 3 calls `std.builtin.panic` instead.)
+pub const PanicId = enum(u32) {
+    reached_unreachable,
+    unwrap_null,
+    cast_to_null,
+    incorrect_alignment,
+    invalid_error_code,
+    integer_out_of_bounds,
+    integer_overflow,
+    shl_overflow,
+    shr_overflow,
+    divide_by_zero,
+    exact_division_remainder,
+    integer_part_out_of_bounds,
+    corrupt_switch,
+    shift_rhs_too_big,
+    invalid_enum_value,
+    for_len_mismatch,
+    copy_len_mismatch,
+    memcpy_alias,
+    noreturn_returned,
+    /// Formatted with the `Bin` payload: index, len.
+    out_of_bounds,
+    /// Formatted with the `Bin` payload: start, end.
+    start_greater_than_end,
+    /// Formatted with the error's name; payload is `Bin` with `lhs` the error.
+    unwrap_error,
+
+    pub fn message(id: PanicId) []const u8 {
+        return switch (id) {
+            .reached_unreachable => "reached unreachable code",
+            .unwrap_null => "attempt to use null value",
+            .cast_to_null => "cast causes pointer to be null",
+            .incorrect_alignment => "incorrect alignment",
+            .invalid_error_code => "invalid error code",
+            .integer_out_of_bounds => "integer does not fit in destination type",
+            .integer_overflow => "integer overflow",
+            .shl_overflow => "left shift overflowed bits",
+            .shr_overflow => "right shift overflowed bits",
+            .divide_by_zero => "division by zero",
+            .exact_division_remainder => "exact division produced remainder",
+            .integer_part_out_of_bounds => "integer part of floating point value out of bounds",
+            .corrupt_switch => "switch on corrupt value",
+            .shift_rhs_too_big => "shift amount is greater than the type size",
+            .invalid_enum_value => "invalid enum value",
+            .for_len_mismatch => "for loop over objects with non-equal lengths",
+            .copy_len_mismatch => "source and destination arguments have non-equal lengths",
+            .memcpy_alias => "@memcpy arguments alias",
+            .noreturn_returned => "'noreturn' function returned",
+            .out_of_bounds => "index out of bounds",
+            .start_greater_than_end => "start index is larger than end index",
+            .unwrap_error => "attempt to unwrap error",
+        };
+    }
+};
+
+pub const Block = struct {
+    body_len: u32,
+};
+
+/// Trailing: then body, else body.
+pub const CondBr = struct {
+    then_body_len: u32,
+    else_body_len: u32,
+};
+
+/// Trailing: for each case: `items_len`, `body_len`, items (`Ref`, comptime
+/// known), body; then the else body.
+pub const SwitchBr = struct {
+    cases_len: u32,
+    else_body_len: u32,
+};
+
+/// Trailing: `args_len` `Ref`s.
+pub const Call = struct {
+    args_len: u32,
+};
+
+pub const Bin = struct {
+    lhs: Inst.Ref,
+    rhs: Inst.Ref,
+};
+
+pub const StructField = struct {
+    operand: Inst.Ref,
+    index: u32,
+};
+
+/// Trailing: `len` `Ref`s.
+pub const Aggregate = struct {
+    len: u32,
+};
+
+/// Trailing: `outputs_len` `Asm.Operand`s, then `inputs_len` `Asm.Operand`s.
+/// An output whose `operand` is `.none` is the result of the instruction
+/// (`-> T`); otherwise `operand` is a pointer to store the output to.
+pub const Asm = struct {
+    source: InternPool.String,
+    outputs_len: u32,
+    inputs_len: u32,
+    is_volatile: u32,
+
+    pub const Operand = struct {
+        name: InternPool.String,
+        constraint: InternPool.String,
+        operand: Inst.Ref,
+    };
+};
+
+pub fn extraData(ir: *const Ir, comptime T: type, index: usize) struct { data: T, end: usize } {
+    const info = @typeInfo(T).@"struct";
+    var result: T = undefined;
+    inline for (info.field_names, info.field_types, 0..) |name, Field, i| {
+        const word = ir.extra[index + i];
+        @field(result, name) = switch (Field) {
+            u32 => word,
+            else => @fromBackingInt(word),
+        };
+    }
+    return .{ .data = result, .end = index + info.field_names.len };
+}
+
+pub fn bodySlice(ir: *const Ir, start: usize, len: usize) []const Inst.Index {
+    return @ptrCast(ir.extra[start..][0..len]);
+}
+
+pub fn refSlice(ir: *const Ir, start: usize, len: usize) []const Inst.Ref {
+    return @ptrCast(ir.extra[start..][0..len]);
+}
+
+pub fn mainBody(ir: *const Ir) []const Inst.Index {
+    const block = ir.extraData(Block, ir.main_block);
+    return ir.bodySlice(block.end, block.data.body_len);
+}
+
+/// The type of an instruction's result or of an interned value.
+pub fn typeOf(ir: *const Ir, ref: Inst.Ref, ip: *const InternPool) InternPool.Index {
+    if (ref.toInterned()) |i| return ip.typeOf(i);
+    return ir.typeOfIndex(ref.toIndex().?, ip);
+}
+
+pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) InternPool.Index {
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .arg => data.arg.ty,
+        .alloc => data.ty,
+        .load,
+        .not,
+        .intcast,
+        .trunc,
+        .bitcast,
+        .ptr_from_int,
+        .slice_ptr,
+        .slice_len,
+        .optional_payload,
+        .optional_payload_ptr,
+        .optional_payload_ptr_set,
+        .wrap_optional,
+        .unwrap_errunion_payload,
+        .unwrap_errunion_err,
+        .unwrap_errunion_payload_ptr,
+        .unwrap_errunion_err_ptr,
+        .errunion_payload_ptr_set,
+        .wrap_errunion_payload,
+        .wrap_errunion_err,
+        => data.ty_op.ty,
+        .add_with_overflow,
+        .sub_with_overflow,
+        .mul_with_overflow,
+        .block,
+        .loop,
+        .struct_field_ptr,
+        .struct_field_val,
+        .ptr_elem_ptr,
+        .slice_elem_ptr,
+        .slice,
+        .ptr_add,
+        .aggregate_init,
+        .assembly,
+        => data.ty_pl.ty,
+        .store, .dbg_stmt => .void_type,
+        .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => .bool_type,
+        .int_from_bool => .u1_type,
+        .int_from_ptr => .usize_type,
+        .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap, .panic => .noreturn_type,
+        .call => blk: {
+            const callee_ty = ir.typeOf(data.pl_op.operand, ip);
+            break :blk ip.indexToKey(callee_ty).func_type.return_type;
+        },
+        .ptr_elem_val => blk: {
+            const ptr = ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).ptr_type;
+            break :blk switch (ptr.flags.size) {
+                .one => ip.indexToKey(ptr.child).array_type.child,
+                else => ptr.child,
+            };
+        },
+        .slice_elem_val => ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).ptr_type.child,
+        .array_elem_val => ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).array_type.child,
+    };
+}
+
+pub const dump = @import("Ir/print.zig").dump;

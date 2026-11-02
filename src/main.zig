@@ -2,6 +2,8 @@ const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
 const Frontend = @import("Frontend.zig");
+const Zcu = @import("Zcu.zig");
+const Ir = @import("Ir.zig");
 
 pub const zig_version = "0.17.0";
 
@@ -38,6 +40,9 @@ pub const Options = struct {
     test_filters: []const []const u8 = &.{},
     /// `zap test` only: build the test binary without running it.
     test_no_exec: bool = false,
+    /// Print the typed IR of every analyzed function to stdout
+    /// (`--debug-dump-ir`, for zap's own tests and debugging).
+    dump_ir: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -83,9 +88,37 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.assert(ok);
 
-    // Semantic analysis, code generation, and linking are not implemented yet.
-    fatal("{s}: semantic analysis is not implemented yet ({d} files lowered to ZIR)", .{ @tagName(command), fe.files.items.len });
+    var zcu: Zcu = try .init(init.gpa, init.io, &fe);
+    defer zcu.deinit();
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buf);
+    var sink: DumpSink = .{ .w = &stdout.interface, .enabled = opts.dump_ir };
+    try zcu.analyzeAll(&sink);
+    try stdout.interface.flush();
+    if (zcu.errors.items.len > 0) {
+        var wip: std.zig.ErrorBundle.Wip = try .init(init.gpa);
+        defer wip.deinit();
+        try zcu.renderErrors(&wip);
+        var sema_errors = try wip.toOwnedBundle("");
+        defer sema_errors.deinit(init.gpa);
+        try sema_errors.renderToStderr(init.io, .{}, .auto);
+        std.process.exit(1);
+    }
+    if (opts.dump_ir) return;
+
+    // Code generation and linking are not implemented yet.
+    fatal("{s}: code generation is not implemented yet", .{@tagName(command)});
 }
+
+const DumpSink = struct {
+    w: *Io.Writer,
+    enabled: bool,
+
+    pub fn function(s: *DumpSink, zcu: *Zcu, ir: *const Ir) !void {
+        if (!s.enabled) return;
+        try @import("Ir/print.zig").dump(ir, &zcu.ip, s.w);
+    }
+};
 
 fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []const u8) !Options {
     var root: ?[]const u8 = null;
@@ -115,6 +148,8 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
         } else if (std.mem.eql(u8, arg, "--test-no-exec")) {
             if (command != .@"test") fatal("{s} is only valid for 'zap test'", .{arg});
             opts.test_no_exec = true;
+        } else if (std.mem.eql(u8, arg, "--debug-dump-ir")) {
+            opts.dump_ir = true;
         } else if (std.mem.eql(u8, arg, "-ODebug")) {
             // The only mode zap supports.
         } else if (std.mem.startsWith(u8, arg, "-O")) {
@@ -158,4 +193,8 @@ test {
     _ = @import("link/Atom.zig");
     _ = @import("link/Elf.zig");
     _ = @import("codegen/x86_64/Encoder.zig");
+    _ = @import("InternPool.zig");
+    _ = Zcu;
+    _ = @import("Sema.zig");
+    _ = Ir;
 }
