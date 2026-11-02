@@ -2,14 +2,15 @@
 //! on-disk cache" in docs/architecture.md). This is the storage layer only:
 //! it knows keys, hashes, dependency edges, and Atoms, not Sema.
 //!
-//! - `Store`: the global store, one file per entry, shared by all projects.
+//! - `Store`: the global store, immutable packs of entries with sorted key
+//!   indexes, shared by all projects.
 //! - `Manifest`: one compilation's units, result hashes, dependency graph,
 //!   input stats, and error codes; one mapped, pointer-free file.
 //! - `Pack`: the Atoms that compilation last linked, in one append-only file.
 //!
 //! Layout:
 //!
-//!   <global cache>/zap/units/<2 hex>/<32 hex>   Store entries
+//!   <global cache>/zap/store/<32 hex>.zsp       Store packs
 //!   <local cache>/zap/c/<32 hex>/               one compilation (`compilationDir`)
 //!       lock, manifest, manifest.log, pack
 //!

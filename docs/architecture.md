@@ -399,10 +399,12 @@ granularity.
   per reached unit, which is acceptable because it would otherwise analyze
   them all.
 - **Storage.** Two layers, split by who reads them:
-  - The global store holds one file per entry, named by its key, written to
-    an unnamed temporary file and linked into place, like Go's build cache. Concurrent
-    zap processes need no locks, and old entries are removed by age. Only a
-    project's first build and units re-analyzed after an edit touch it.
+  - The global store holds entries in immutable packs, git-style: each
+    build writes its new entries as one pack file with a sorted key index,
+    and lookups binary-search the mapped indexes of all packs. Concurrent
+    zap processes need no locks to write, and old packs are removed by age.
+    Only a project's first build and units re-analyzed after an edit touch
+    it. (Go's one file per entry was measured and rejected, below.)
   - The project's local cache holds the manifest and a pack: one file with
     every Atom the last build linked. A rebuild maps the pack, appends the
     Atoms it regenerated, and links from it, so the link reads one file. The
@@ -423,8 +425,9 @@ dependency edges, and Atoms, not Sema: nodes carry an opaque `tag`, and a
 store entry's result is an opaque payload until Sema serializes one.
 
 ```
-<global cache>/zap/units/<2 hex>/<32 hex>   Store entries (shared by all projects)
-<global cache>/zap/units/trim               when entries were last trimmed
+<global cache>/zap/store/<32 hex>.zsp       Store packs (shared by all projects)
+<global cache>/zap/store/lock               flock held by maintenance (merging, trimming)
+<global cache>/zap/store/trim               when packs were last trimmed
 <local cache>/zap/c/<32 hex>/               one compilation, keyed by root, target, options, output
     lock          flock held by the build that owns the directory
     manifest      base: mapped, pointer-free, replaced whole
@@ -435,17 +438,27 @@ store entry's result is an opaque payload until Sema serializes one.
 - **Atom records** (`cache/atoms.zig`): 16-byte aligned, a 64-byte header,
   then targets, relocations, an optional debug header, then bytes, name, and
   debug strings. `decode` is zero-copy: the `Atom`'s slices point into the
-  record. Debug info is a self-contained tail so that only `encode` and
-  `decode` change when debug info moves to a parallel array
-  (`link-debug-soa`).
-- **Store** (`cache/Store.zig`): `put(key, {src_hash, result_hash, deps,
-  atoms, payload})` writes `Header`, `[]Dep{key, result_hash}`, atom
-  records, and the payload with one `writev`, then links the file into
-  place; losing a race to another writer of the same key is success. `get`
-  reads entries up to 64 KiB and maps larger ones; `Entry.isValid` is the
-  red-green check against a caller-supplied result-hash lookup. Entries
-  unused for 5 days are trimmed at most once a day; `get` refreshes an
-  entry's mtime at most once an hour.
+  record. A function's debug info is the record's tail, so an Atom and its
+  debug info are cached and replaced together; `decode` returns them
+  apart, and `Pack.decodeAll` builds the linker's `[]Atom.Debug`, sorted by
+  atom index, alongside the Atoms.
+- **Store** (`cache/Store.zig`): each worker fills a `Batch`
+  (`put(key, {src_hash, result_hash, deps, atoms, debug, payload})`), and
+  `commit` writes all of a build's batches as one pack: a 64-byte header,
+  the entries (`Header`, `[]Dep{key, result_hash}`, atom records, payload),
+  then the keys sorted, their locations, and a 257-entry fan-out table on
+  the keys' top byte. Large packs are written from several threads; the
+  file is placed with O_TMPFILE and link under a random name, so concurrent
+  writers never collide. `open` maps every pack; `get` searches them in
+  decreasing `order` (when their newest entry was written) without a
+  system call, so a key's newest entry wins, and `Entry.isValid` is the
+  red-green check. Past 16 packs, `commit` merges, under a non-blocking
+  lock, the run of packs adjacent in lookup order with the fewest bytes,
+  down to 8, so lookup order is kept and large packs are rarely rewritten.
+  A pack records its last use in its mtime (refreshed at most hourly) and
+  is deleted after 5 days unused; a hit in a pack older than 2.5 days is
+  written again by the build's `commit`, so live entries move to young
+  packs and one used entry does not keep an old pack alive.
 - **Manifest** (`cache/Manifest.zig`): nodes (80 bytes: key, result hash,
   `src_hash`, ranges into the edge, reverse-edge, and atom-reference
   arrays, `tag`), an open-addressing key table, edges, reverse edges, atom
@@ -482,21 +495,32 @@ pack 55 MiB.
 | Open manifest with 15 log records, gather atom refs | 0.24 ms |
 | Edit storage work: append one unit's Atoms, log record | 0.02 ms |
 | Dependents walk over 29,978 nodes (no early cutoff) | 1.9–2.5 ms |
-| Relink: map pack, decode 103,750 Atoms on 4 threads | 2.0–3.4 ms |
-| `Elf.emit` from the mapped pack (from memory) | 12–26 ms (11–22 ms) |
+| Relink: map pack, decode 103,750 Atoms and debug on 4 threads | 3.1–5.2 ms |
+| `Elf.emit` from the mapped pack (from memory) | 10.8–12.8 ms (10.0–12.2 ms) |
 | Cold save: pack append, manifest base | 100–120 ms, 30–44 ms |
 | Fold log into a new base | 22–58 ms |
 | Compaction, 166 → 55 MiB | 80–164 ms |
-| Store put of 30k entries, 1 thread / 4 threads | 760–950 ms / 320–540 ms |
-| Store get, validate, decode, per entry | 3–4 µs |
+| Store, first build: 30k puts on 4 threads, then commit (68 MiB) | 17–23 ms, 43–48 ms |
+| Store get, validate, decode, per entry, with 1 / 8 / 64 packs | 0.25 / 0.3–0.5 / 0.7–0.9 µs |
+| Store miss, per key, with 1 / 8 / 64 packs | 0.06 / 0.2 / 1.0 µs |
+| Store open with 1 / 8 / 64 packs | 0.02 / 0.08 / 0.5 ms |
+| Store trim scan of 8 packs; of 64 with a merge of 57 | 0.14 ms; 95–109 ms |
+| Store, 4 concurrent builds each writing 30k entries | 163–203 ms |
 
 The no-edit target (10 ms beyond process start) holds with room to spare.
 An edit rebuild's storage cost is the walk plus the relink, and the relink
-is `Elf.emit`, the linker's own cost, not the cache's. Creating a file costs
-~25–30 µs on this ext4 orb whichever way it is placed (O_TMPFILE and link or
-create and rename), so a project's first build with an empty global store
-pays ~1 s of file creation per 30k units on one thread; Sema should put
-entries from its worker threads.
+is `Elf.emit`, the linker's own cost, not the cache's.
+
+Rejected (measured 2026-11-02): one store file per entry, like Go's. Creating
+a file costs ~25–30 µs on this ext4 orb whichever way it is placed (O_TMPFILE
+and link, or create and rename), so a first build's 30k puts took 650–740 ms
+on one thread and 215–390 ms on four, four concurrent builds 1.4–1.9 s (the
+journal serializes them), a lookup 2.8–3.6 µs (open, read, close), and a trim
+scan of 60k entries 65–77 ms. Packs need one file per build. A first build
+writes its Atoms twice, once in the global store and once in the project's
+pack; that costs ~45 ms of the commit, and the project pack could refer to
+store packs instead, at the price of depending on files other builds merge
+and delete.
 
 What the cache must get right, or edit-rebuilds will not be Go-class:
 

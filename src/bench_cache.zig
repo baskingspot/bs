@@ -9,8 +9,9 @@
 //!   mapping (checked against an emit of the original Atoms);
 //! - edit rebuild storage work: append a unit's new Atoms, find its
 //!   dependents, write the next manifest;
-//! - compaction, and the global store (put, then get every entry as a
-//!   project's first build would).
+//! - compaction, and the global store (a first build's puts and commit,
+//!   lookups as a project's first build would do them, maintenance, and
+//!   concurrent builds).
 //!
 //! Works in /tmp/zap-bench-cache, with a warm page cache.
 
@@ -238,80 +239,6 @@ pub fn main(init: std.process.Init) !void {
         compacted_size = p.len;
     }
 
-    // ---- Global store.
-    var store: Store = try .open(io, work);
-    defer store.close(io);
-    const store_keys = try arena.alloc(Store.Key, n_units);
-    const dep_list = try arena.alloc(Store.Dep, deps_per_unit);
-    for (dep_list) |*d| d.* = .{ .key = rand.int(u128), .result_hash = rand.int(u128) };
-    const payload: [64]u8 = @splat(7);
-    // Each unit's debug entries, renumbered from its first atom.
-    const unit_debug = try arena.alloc([]Atom.Debug, n_units);
-    {
-        var next: usize = 0;
-        for (unit_debug, 0..) |*ud, u| {
-            const lo = u * atoms.len / n_units;
-            const hi = (u + 1) * atoms.len / n_units;
-            const start = next;
-            while (next < debug.len and debug[next].atom < hi) next += 1;
-            ud.* = try arena.dupe(Atom.Debug, debug[start..next]);
-            for (ud.*) |*d| d.atom -= @intCast(lo);
-        }
-    }
-    t = now(io);
-    for (store_keys, 0..) |*k, u| {
-        k.* = rand.int(u128);
-        const lo = u * atoms.len / n_units;
-        const hi = (u + 1) * atoms.len / n_units;
-        try store.put(gpa, io, k.*, .{ .src_hash = 1, .result_hash = 2, .deps = dep_list, .atoms = atoms[lo..hi], .debug = unit_debug[u], .payload = &payload });
-    }
-    const t_put = since(io, t);
-    // Sema will put entries from its worker threads; measure that too, with
-    // fresh keys so every put creates a file.
-    const par_keys = try arena.alloc(Store.Key, n_units);
-    for (par_keys) |*k| k.* = rand.int(u128);
-    const PutChunk = struct {
-        fn run(st: *const Store, a: std.mem.Allocator, io_: Io, chunk_keys: []const Store.Key, first: usize, all_atoms: []const Atom, all_debug: []const []Atom.Debug, deps: []const Store.Dep, pl: []const u8) void {
-            for (chunk_keys, first..) |k, u| {
-                const lo = u * all_atoms.len / n_units;
-                const hi = (u + 1) * all_atoms.len / n_units;
-                st.put(a, io_, k, .{ .src_hash = 1, .result_hash = 2, .deps = deps, .atoms = all_atoms[lo..hi], .debug = all_debug[u], .payload = pl }) catch @panic("put failed");
-            }
-        }
-    };
-    const n_put_threads = std.Thread.getCpuCount() catch 1;
-    t = now(io);
-    {
-        var group: Io.Group = .init;
-        for (0..n_put_threads) |i| {
-            const lo = i * n_units / n_put_threads;
-            const hi = (i + 1) * n_units / n_put_threads;
-            group.async(io, PutChunk.run, .{ &store, gpa, io, par_keys[lo..hi], lo, atoms, unit_debug, dep_list, &payload });
-        }
-        try group.await(io);
-    }
-    const t_put_par = since(io, t);
-    const AllValid = struct {
-        deps: []const Store.Dep,
-        pub fn resultHash(c: @This(), key: cache.Hash) ?cache.Hash {
-            for (c.deps) |d| if (d.key == key) return d.result_hash;
-            return null;
-        }
-    };
-    var pull: Stats = .{};
-    var entry_atoms: [64]Atom = undefined;
-    var entry_debug: [64]Atom.Debug = undefined;
-    for (0..3) |_| {
-        const t0 = now(io);
-        for (store_keys) |k| {
-            var e = (try store.get(gpa, io, k)).?;
-            if (!e.isValid(1, AllValid{ .deps = dep_list })) @panic("invalid entry");
-            _ = try e.decodeAtoms(entry_atoms[0..e.atomCount()], &entry_debug);
-            e.close(gpa, io);
-        }
-        pull.add(.{ ns(t0, now(io)), 0, 0, 0 });
-    }
-
     var n_relocs: usize = 0;
     var n_edges: usize = 0;
     for (atoms) |a| n_relocs += a.relocs.len;
@@ -340,9 +267,183 @@ pub fn main(init: std.process.Init) !void {
         runs, @as(f64, @floatFromInt(log_size)) / 1024, ms(open_logged.median(0)), ms(fold_ns),
     });
     print("compaction: {d:.1} -> {d:.1} MiB in {d:.2} ms\n", .{ mib(uncompacted_size), mib(compacted_size), ms(compaction_ns) });
-    print("global store: put {d} entries {d:.1} ms on one thread, {d:.1} ms on {d}; get, check, and decode all (median) {d:.1} ms ({d:.1} us each)\n", .{
-        n_units, ms(t_put), ms(t_put_par), n_put_threads, ms(pull.median(0)), ms(pull.median(0)) * 1000 / n_units,
-    });
+    try benchStores(gpa, io, arena, rand, work, atoms, debug);
+}
+
+/// The global store: a first build's 30k puts and commit, lookups with 1,
+/// 8, and 64 packs, maintenance, and concurrent builds writing at once.
+fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: std.Random, work: Io.Dir, atoms: []const Atom, debug: []const Atom.Debug) !void {
+    const print = std.debug.print;
+    const n_threads = std.Thread.getCpuCount() catch 1;
+    const dep_list = try arena.alloc(Store.Dep, deps_per_unit);
+    for (dep_list) |*d| d.* = .{ .key = rand.int(u128), .result_hash = rand.int(u128) };
+    const payload: [64]u8 = @splat(7);
+    // Each unit's debug entries, renumbered from its first atom.
+    const unit_debug = try arena.alloc([]Atom.Debug, n_units);
+    {
+        var next: usize = 0;
+        for (unit_debug, 0..) |*ud, u| {
+            const lo = u * atoms.len / n_units;
+            const hi = (u + 1) * atoms.len / n_units;
+            const start = next;
+            while (next < debug.len and debug[next].atom < hi) next += 1;
+            ud.* = try arena.dupe(Atom.Debug, debug[start..next]);
+            for (ud.*) |*d| d.atom -= @intCast(lo);
+        }
+    }
+    const Units = struct {
+        atoms: []const Atom,
+        debug: []const []Atom.Debug,
+        deps: []const Store.Dep,
+        payload: []const u8,
+
+        fn contents(us: @This(), u: usize) Store.Contents {
+            const lo = u * us.atoms.len / n_units;
+            const hi = (u + 1) * us.atoms.len / n_units;
+            return .{ .src_hash = 1, .result_hash = 2, .deps = us.deps, .atoms = us.atoms[lo..hi], .debug = us.debug[u], .payload = us.payload };
+        }
+    };
+    const units: Units = .{ .atoms = atoms, .debug = unit_debug, .deps = dep_list, .payload = &payload };
+    const AllValid = struct {
+        deps: []const Store.Dep,
+        pub fn resultHash(c: @This(), key: cache.Hash) ?cache.Hash {
+            for (c.deps) |d| if (d.key == key) return d.result_hash;
+            return null;
+        }
+    };
+    const n_builds = n_threads;
+    // keys[b][u]: build b's key for unit u.
+    const keys = try arena.alloc([]Store.Key, n_builds + 1);
+    for (keys) |*ks| {
+        ks.* = try arena.alloc(Store.Key, n_units);
+        for (ks.*) |*k| k.* = rand.int(u128);
+    }
+    var entry_atoms: [64]Atom = undefined;
+    var entry_debug: [64]Atom.Debug = undefined;
+
+    // ---- Packs.
+    {
+        const PutBatch = struct {
+            fn run(b: *Store.Batch, a: std.mem.Allocator, us: Units, ks: []const Store.Key, first: usize) void {
+                for (ks, first..) |k, u| b.put(a, k, us.contents(u)) catch @panic("put failed");
+            }
+        };
+        const root = try work.createDirPathOpen(io, "packs", .{});
+        var store: Store = try .open(gpa, io, root);
+        var batch: Store.Batch = .{};
+        defer batch.deinit(gpa);
+        var t = now(io);
+        for (keys[0], 0..) |k, u| try batch.put(gpa, k, units.contents(u));
+        const t_put_1 = since(io, t);
+        batch.clear();
+        // One batch per worker, as Sema's workers will have.
+        const batches = try arena.alloc(Store.Batch, n_threads);
+        for (batches) |*b| b.* = .{};
+        defer for (batches) |*b| b.deinit(gpa);
+        t = now(io);
+        {
+            var group: Io.Group = .init;
+            for (batches, 0..) |*b, i| {
+                const lo = i * n_units / n_threads;
+                const hi = (i + 1) * n_units / n_threads;
+                group.async(io, PutBatch.run, .{ b, gpa, units, keys[0][lo..hi], lo });
+            }
+            try group.await(io);
+        }
+        const t_put_n = since(io, t);
+        var pack_bytes: usize = 0;
+        for (batches) |b| pack_bytes += b.bytes.items.len;
+        t = now(io);
+        try store.commit(gpa, io, batches);
+        const t_commit = since(io, t);
+        store.close(gpa, io);
+        print("store, packs: first build 30k puts into a batch {d:.0} ms on 1 thread, {d:.0} ms on {d}, then commit ({d:.1} MiB) {d:.0} ms\n", .{
+            ms(t_put_1), ms(t_put_n), n_threads, mib(pack_bytes), ms(t_commit),
+        });
+
+        // Lookups with the 30k entries spread over k packs.
+        for ([_]usize{ 1, 8, 64 }) |k| {
+            const sub = try std.fmt.allocPrint(arena, "packs-{d}", .{k});
+            const kroot = try work.createDirPathOpen(io, sub, .{});
+            {
+                var w: Store = try .open(gpa, io, kroot);
+                defer w.close(gpa, io);
+                for (0..k) |i| {
+                    const lo = i * n_units / k;
+                    const hi = (i + 1) * n_units / k;
+                    for (keys[0][lo..hi], lo..) |key, u| try batch.put(gpa, key, units.contents(u));
+                    try w.write(gpa, io, (&batch)[0..1]);
+                }
+            }
+            var open_s: Stats = .{};
+            var get: Stats = .{};
+            var miss: Stats = .{};
+            for (0..5) |_| {
+                const t0 = now(io);
+                var st: Store = try .open(gpa, io, kroot);
+                const t1 = now(io);
+                if (st.packs.len != k) @panic("pack count");
+                for (keys[0]) |key| {
+                    const e = (try st.get(gpa, io, key)).?;
+                    if (!e.isValid(1, AllValid{ .deps = dep_list })) @panic("invalid entry");
+                    _ = try e.decodeAtoms(entry_atoms[0..e.atomCount()], &entry_debug);
+                }
+                const t2 = now(io);
+                for (keys[2]) |key| if (try st.get(gpa, io, key) != null) @panic("unexpected hit");
+                const t3 = now(io);
+                st.close(gpa, io);
+                open_s.add(.{ ns(t0, t1), 0, 0, 0 });
+                get.add(.{ ns(t1, t2), 0, 0, 0 });
+                miss.add(.{ ns(t2, t3), 0, 0, 0 });
+            }
+            print("  {d:>2} packs: open {d:.3} ms; get+check+decode {d:.2} us, miss {d:.3} us each (medians)\n", .{
+                k, ms(open_s.median(0)), ms(get.median(0)) * 1000 / n_units, ms(miss.median(0)) * 1000 / n_units,
+            });
+            if (k == 8) {
+                const sdir = try kroot.openDir(io, "zap/store", .{ .iterate = true });
+                t = now(io);
+                const r = try Store.maintain(gpa, io, sdir, .{ .trim = true, .now = Io.Clock.real.now(io) });
+                const trim = since(io, t);
+                if (r.deleted != 0 or r.merged != 0) @panic("trimmed");
+                print("  trim scan of 8 packs: {d:.3} ms\n", .{ms(trim)});
+            }
+            if (k == 64) {
+                // Trimming scans the packs; merging 57 of them takes the store
+                // back to 8.
+                const sdir = try kroot.openDir(io, "zap/store", .{ .iterate = true });
+                t = now(io);
+                const r1 = try Store.maintain(gpa, io, sdir, .{ .trim = true, .now = Io.Clock.real.now(io) });
+                const trim = since(io, t);
+                if (r1.deleted != 0) @panic("trimmed");
+                print("  trim scan of 64 packs with merge to {d}: {d:.0} ms ({d} merged)\n", .{ Store.max_packs / 2, ms(trim), r1.merged });
+            }
+        }
+
+        // Concurrent builds: each writes its own 30k entries on one thread
+        // and commits.
+        const BuildRun = struct {
+            fn run(a: std.mem.Allocator, io_: Io, dir: Io.Dir, us: Units, ks: []const Store.Key) void {
+                var st: Store = Store.open(a, io_, dir) catch @panic("open failed");
+                defer st.close(a, io_);
+                var b: Store.Batch = .{};
+                defer b.deinit(a);
+                for (ks, 0..) |k, u| b.put(a, k, us.contents(u)) catch @panic("put failed");
+                st.commit(a, io_, (&b)[0..1]) catch @panic("commit failed");
+            }
+        };
+        const croot = try work.createDirPathOpen(io, "packs-concurrent", .{});
+        t = now(io);
+        {
+            var group: Io.Group = .init;
+            for (0..n_builds) |b| group.async(io, BuildRun.run, .{ gpa, io, croot, units, keys[b] });
+            try group.await(io);
+        }
+        const concurrent = since(io, t);
+        var st: Store = try .open(gpa, io, croot);
+        defer st.close(gpa, io);
+        for (keys[0..n_builds]) |ks| for (ks) |k| if (try st.get(gpa, io, k) == null) @panic("lost an entry");
+        print("  {d} concurrent builds of 30k puts and a commit: {d:.0} ms\n", .{ n_builds, ms(concurrent) });
+    }
 }
 
 /// Up to `runs` samples of four timings.
