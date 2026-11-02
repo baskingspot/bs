@@ -27,12 +27,9 @@ zero_fill: u64 = 0,
 targets: []const SymbolKey = &.{},
 /// Sorted by offset. Must be empty for `.bss`.
 relocs: []const Reloc = &.{},
-/// Source line of the declaration's first line. `lines` are relative to it,
-/// so moving a declaration changes only this field.
-base_line: u32 = 0,
-/// Line-table fragment for the atom's code. The ELF linker does not read it
-/// yet; DWARF emission will.
-lines: []const Line = &.{},
+/// Source information for debug info, or null for code and data without
+/// it (runtime helpers, and data until variables get debug info).
+debug: ?Debug = null,
 
 /// 128-bit stable identity of a symbol. Derived from the unit key for
 /// declarations (`fromName`) and from the contents for anonymous constants
@@ -160,12 +157,105 @@ pub const RelocList = struct {
     };
 };
 
-pub const Line = struct {
-    /// Offset of the first instruction of the row within `bytes`.
-    offset: u32,
-    /// Line relative to `base_line`.
-    line: u32,
-    column: u32,
+/// What the linkers need to emit DWARF for a function: a compile unit
+/// entry and a line-number program.
+pub const Debug = struct {
+    /// Path of the source file as the compiler opened it: absolute, or
+    /// relative to the linker's `comp_dir`.
+    file: []const u8,
+    /// Simple name of the declaration, as debuggers and stack traces show
+    /// it (DW_AT_name). The symbol table keeps the atom's `name`.
+    name: []const u8,
+    /// Zero-based line of the declaration's first line. `lines` is relative
+    /// to it, so moving a declaration changes only this field.
+    base_line: u32,
+    /// DWARF line-number program fragment for the atom's code, built with
+    /// `LineProgram`. It starts from address = the atom's start, line =
+    /// `base_line` + 1, column 0, and uses the standard opcodes and the
+    /// special-opcode parameters of `LineProgram`; the linker wraps it in a
+    /// sequence and copies it unchanged.
+    lines: []const u8,
+};
+
+/// Builds `Debug.lines` from rows in increasing code offset.
+pub const LineProgram = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    /// Registers after the last row, relative to the atom.
+    state: State = .{},
+    /// Registers before the last row, and where it starts in `bytes`, so a
+    /// row at the same offset can replace it.
+    prev: State = .{},
+    prev_len: usize = 0,
+
+    const State = struct { offset: u32 = 0, line: u32 = 0, column: u32 = 0 };
+
+    // As upstream Zig's DWARF emitter. The linkers write the header.
+    pub const line_base = -5;
+    pub const line_range = 14;
+    pub const opcode_base = 13;
+
+    pub fn deinit(lp: *LineProgram, gpa: std.mem.Allocator) void {
+        lp.bytes.deinit(gpa);
+    }
+
+    /// Adds a row: the code at `offset` comes from zero-based `line`
+    /// (relative to the declaration) and zero-based `column`. A row at the
+    /// offset of the previous one replaces it.
+    pub fn addRow(lp: *LineProgram, gpa: std.mem.Allocator, offset: u32, line: u32, column: u32) !void {
+        if (lp.bytes.items.len > 0 and offset == lp.state.offset) {
+            lp.bytes.items.len = lp.prev_len;
+            lp.state = lp.prev;
+        }
+        std.debug.assert(offset >= lp.state.offset);
+        lp.prev = lp.state;
+        lp.prev_len = lp.bytes.items.len;
+        // Worst case: set_column, advance_line, advance_pc, special opcode.
+        try lp.bytes.ensureUnusedCapacity(gpa, 1 + 5 + 1 + 10 + 1 + 5 + 1);
+        const out = &lp.bytes;
+        const dwarf_column = column + 1;
+        if (dwarf_column != lp.state.column) {
+            out.appendAssumeCapacity(std.dwarf.LNS.set_column);
+            appendUleb(out, dwarf_column);
+        }
+        var line_delta = @as(i64, line) - lp.state.line;
+        if (line_delta < line_base or line_delta >= line_base + line_range) {
+            out.appendAssumeCapacity(std.dwarf.LNS.advance_line);
+            appendSleb(out, line_delta);
+            line_delta = 0;
+        }
+        var addr_delta: u64 = offset - lp.state.offset;
+        const max_special_addr: u64 = @intCast(@divTrunc(255 - opcode_base - (line_delta - line_base), line_range));
+        if (addr_delta > max_special_addr) {
+            // const_add_pc adds the address advance of special opcode 255.
+            const const_add = (255 - opcode_base) / line_range;
+            if (addr_delta - const_add <= max_special_addr) {
+                out.appendAssumeCapacity(std.dwarf.LNS.const_add_pc);
+                addr_delta -= const_add;
+            } else {
+                out.appendAssumeCapacity(std.dwarf.LNS.advance_pc);
+                appendUleb(out, addr_delta);
+                addr_delta = 0;
+            }
+        }
+        out.appendAssumeCapacity(@intCast((line_delta - line_base) + line_range * @as(i64, @intCast(addr_delta)) + opcode_base));
+        lp.state = .{ .offset = offset, .line = line, .column = dwarf_column };
+    }
+
+    fn appendUleb(out: *std.ArrayList(u8), value: u64) void {
+        var v = value;
+        while (v >= 0x80) : (v >>= 7) out.appendAssumeCapacity(@as(u8, @truncate(v)) | 0x80);
+        out.appendAssumeCapacity(@intCast(v));
+    }
+
+    fn appendSleb(out: *std.ArrayList(u8), value: i64) void {
+        var v = value;
+        while (true) {
+            const b: u8 = @as(u7, @truncate(@as(u64, @bitCast(v))));
+            v >>= 7;
+            if ((v == 0 and b & 0x40 == 0) or (v == -1 and b & 0x40 != 0)) return out.appendAssumeCapacity(b);
+            out.appendAssumeCapacity(b | 0x80);
+        }
+    }
 };
 
 comptime {

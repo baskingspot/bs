@@ -99,6 +99,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     }
     @memset(cg.homes, .none);
 
+    // The prologue belongs to the declaration's line.
+    try cg.e.line(0, 0);
     const naked = cg.fn_ty.cc == .naked;
     var frame_patch: usize = 0;
     if (!naked) {
@@ -123,7 +125,13 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     for (emit.zcu.exports.items) |x| {
         if (x.nav == func.owner_nav and func.generic_owner == .none) name = ip.stringSlice(x.name);
     }
-    _ = nav;
+    const file = emit.zcu.file(nav.file);
+    const debug: Atom.Debug = .{
+        .file = file.display_path,
+        .name = ip.stringSlice(nav.name),
+        .base_line = file.zir.getDeclaration(nav.zir_inst).src_line,
+        .lines = try arena.dupe(u8, cg.e.lines.bytes.items),
+    };
     try emit.addAtom(.{
         .key = try emit.funcKey(ir.func),
         .name = name,
@@ -132,6 +140,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .bytes = try arena.dupe(u8, cg.e.code.items),
         .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
+        .debug = debug,
     });
 }
 
@@ -428,7 +437,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         else => return cg.fail("'{t}' in a naked function", .{tag}),
     };
     switch (tag) {
-        .arg, .dbg_stmt => {},
+        .arg => {},
+        .dbg_stmt => try cg.e.line(data.dbg_stmt.line, data.dbg_stmt.column),
         .alloc => {
             const child = Type.ptrInfo(ip, data.ty).child;
             const off = try cg.allocSlot(@max(Type.abiSize(ip, child), 1), Type.abiAlignment(ip, child));

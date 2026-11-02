@@ -17,6 +17,8 @@ gpa: Allocator,
 code: std.ArrayList(u8) = .empty,
 /// The atom's `targets` (`refs.targets.keys()`) and `relocs` (`refs.relocs.items`).
 refs: Atom.RelocList = .{},
+/// The atom's `Debug.lines` (`lines.bytes.items`).
+lines: Atom.LineProgram = .{},
 /// Offset each label is bound to, or `unbound`.
 labels: std.ArrayList(u32) = .empty,
 /// rel32 fields that branch to a label not yet bound when they were emitted.
@@ -151,6 +153,7 @@ pub fn init(gpa: Allocator) Encoder {
 pub fn deinit(e: *Encoder) void {
     e.code.deinit(e.gpa);
     e.refs.deinit(e.gpa);
+    e.lines.deinit(e.gpa);
     e.labels.deinit(e.gpa);
     e.fixups.deinit(e.gpa);
 }
@@ -212,6 +215,12 @@ pub fn movAbsSym(e: *Encoder, dst: Reg, sym: SymbolKey, addend: i64) !void {
     e.byte(0xb8 | @as(u8, dst.low()));
     try e.reloc(.x86_64_abs64, sym, addend);
     e.int(u64, 0);
+}
+
+/// Records that the code from here on comes from zero-based `line_`,
+/// relative to the declaration, and zero-based `column`.
+pub fn line(e: *Encoder, line_: u32, column: u32) !void {
+    try e.lines.addRow(e.gpa, @intCast(e.code.items.len), line_, column);
 }
 
 /// `mov r32, imm32` with the immediate set at link time to the 32-bit

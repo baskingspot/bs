@@ -139,8 +139,13 @@ the callee's body first. Early cutoff on the set keeps such callers green.
     holding the kind and the index of the target in that table. The record
     is a third of the 32 bytes a full key would need, and the linker
     resolves each distinct key once per atom instead of once per use;
-  - line table and debug info fragments, relative to the declaration's first
-    line, so that moving a declaration only patches its base line.
+  - for functions, debug info (`Atom.Debug`): source path, simple name,
+    the declaration's base line, and the function's DWARF line-number
+    program fragment, already encoded by the encoder from the IR's
+    `dbg_stmt` rows with lines relative to the base line. Moving a
+    declaration changes only the base line; the linker copies the fragment
+    unchanged and only writes the sequence around it (start address, file
+    index, base line, end address).
 - The symbol key is 128 bits: a hash of the rendered unit key for
   declarations, or of the contents for anonymous constants. Atoms with equal
   keys are one symbol; the linker keeps one and rejects a key whose atoms
