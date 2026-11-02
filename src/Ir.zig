@@ -96,6 +96,8 @@ pub const Inst = struct {
         /// and the quotient fits; Sema emits the checks.
         div_trunc,
         div_floor,
+        /// Rounds toward positive infinity.
+        div_ceil,
         rem,
         mod,
         /// `bin_op`: bitwise operations on integers or bools.
@@ -123,6 +125,14 @@ pub const Inst = struct {
         trunc,
         /// `ty_op`: reinterpret the bits of a value of the same size.
         bitcast,
+        /// `ty_op`: count leading / trailing zeros, count ones, of integer
+        /// `operand`; the result has type `ty`.
+        clz,
+        ctz,
+        popcount,
+        /// `ty_op`: reverse the bytes / bits of integer `operand`.
+        byte_swap,
+        bit_reverse,
         /// `un_op`: `bool` to `u1`.
         int_from_bool,
         /// `un_op`: pointer to `usize`.
@@ -153,7 +163,8 @@ pub const Inst = struct {
         /// `panic`: a safety check failed.
         panic,
 
-        /// `pl_op` with `Call`: `operand` is the callee function value.
+        /// `pl_op` with `Call`: `operand` is the callee function value, or a
+        /// function pointer for an indirect call.
         call,
 
         /// `ty_pl` with `StructField`: pointer to a field of the struct (or
@@ -210,6 +221,17 @@ pub const Inst = struct {
 
         /// `ty_pl` with `Aggregate`: build an array, struct, or tuple value.
         aggregate_init,
+        /// `ty_pl` with `StructField`: a union value with field `index`
+        /// active, holding `operand`. (`struct_field_ptr`/`struct_field_val`
+        /// also address union payloads.)
+        union_init,
+        /// `ty_op`: the tag of union value `operand`.
+        get_union_tag,
+        /// `bin_op`: store tag `rhs` into the union `lhs` points to.
+        set_union_tag,
+        /// `ty_op`: the name (`[:0]const u8`) of enum value `operand`, which
+        /// is one of its type's named tags.
+        tag_name,
         /// `ty_pl` with `Asm`: inline assembly.
         assembly,
         /// `dbg_stmt`: a statement starts at this line and column, relative
@@ -257,6 +279,7 @@ pub const PanicId = enum(u32) {
     copy_len_mismatch,
     memcpy_alias,
     noreturn_returned,
+    inactive_union_field,
     /// Formatted with the `Bin` payload: index, len.
     out_of_bounds,
     /// Formatted with the `Bin` payload: start, end.
@@ -285,6 +308,7 @@ pub const PanicId = enum(u32) {
             .copy_len_mismatch => "source and destination arguments have non-equal lengths",
             .memcpy_alias => "@memcpy arguments alias",
             .noreturn_returned => "'noreturn' function returned",
+            .inactive_union_field => "access of inactive union field",
             .out_of_bounds => "index out of bounds",
             .start_greater_than_end => "start index is larger than end index",
             .unwrap_error => "attempt to unwrap error",
@@ -404,6 +428,13 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .errunion_payload_ptr_set,
         .wrap_errunion_payload,
         .wrap_errunion_err,
+        .get_union_tag,
+        .tag_name,
+        .clz,
+        .ctz,
+        .popcount,
+        .byte_swap,
+        .bit_reverse,
         => data.ty_op.ty,
         .add_with_overflow,
         .sub_with_overflow,
@@ -417,10 +448,11 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .slice,
         .ptr_add,
         .aggregate_init,
+        .union_init,
         .assembly,
         => data.ty_pl.ty,
-        .store, .dbg_stmt => .void_type,
-        .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
+        .store, .set_union_tag, .dbg_stmt => .void_type,
+        .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => .bool_type,
         .int_from_bool => .u1_type,
         .int_from_ptr => .usize_type,

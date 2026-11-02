@@ -223,7 +223,7 @@ pub const String = enum(u32) {
 };
 
 pub const NavIndex = enum(u32) { none = std.math.maxInt(u32), _ };
-pub const StructInfoIndex = enum(u32) { _ };
+pub const ContainerInfoIndex = enum(u32) { _ };
 
 pub const Nav = struct {
     /// Simple name of the declaration.
@@ -248,24 +248,36 @@ pub const Nav = struct {
     linkage: Zir.Inst.Declaration.Unwrapped.Linkage = .normal,
 };
 
-/// The fields and layout of a declared struct type. Owned by the struct's
-/// `type_layout` analysis unit; read by others only after it resolves.
-pub const StructInfo = struct {
+/// The fields and layout of a declared container type (struct, enum, union,
+/// or opaque). Owned by the type's `type_layout` analysis unit; read by
+/// others only after it resolves.
+pub const ContainerInfo = struct {
     namespace: u32,
     layout: std.lang.Type.ContainerLayout,
     status: enum { none, field_types_wip, have_field_types, layout_wip, have_layout, failed } = .none,
     field_names: []const String = &.{},
+    /// Struct and union fields. Empty for enums.
     field_types: []const Index = &.{},
-    /// `.none` for fields without a default.
+    /// Structs: the default value, `.none` for fields without one.
+    /// Enums: the tag value of each field, of type `tag_type`.
     field_defaults: []const Index = &.{},
+    /// Structs only.
     field_offsets: []const u64 = &.{},
+    /// Enums: the integer tag type. Tagged unions: the enum tag type.
+    /// Otherwise `.none`.
+    tag_type: Index = .none,
+    /// Enums only: whether the enum is non-exhaustive (`_`).
+    nonexhaustive: bool = false,
+    /// Unions: whether the union carries a tag at runtime, either declared
+    /// or the hidden safety tag of an untagged auto-layout union in Debug.
+    has_runtime_tag: bool = false,
     size: u64 = 0,
     alignment: u64 = 1,
     /// Cache for `Type.isComptimeOnly`, which recurses through pointers and
     /// so must stop at self-referential structs.
     comptime_only: enum { unknown, computing, yes, no } = .unknown,
 
-    pub fn fieldIndex(info: *const StructInfo, ip: *const InternPool, name: []const u8) ?u32 {
+    pub fn fieldIndex(info: *const ContainerInfo, ip: *const InternPool, name: []const u8) ?u32 {
         for (info.field_names, 0..) |n, i| {
             if (std.mem.eql(u8, ip.stringSlice(n), name)) return @intCast(i);
         }
@@ -354,7 +366,8 @@ pub const ArrayType = struct {
     }
 };
 
-pub const StructType = struct {
+/// A declared struct, enum, union, or opaque type. The key's tag says which.
+pub const ContainerType = struct {
     file: u32,
     zir_inst: Zir.Inst.Index,
     /// Values captured from enclosing scopes; part of the type's identity.
@@ -365,7 +378,7 @@ pub const StructType = struct {
     /// The fully qualified name for declared types; for anonymous types the
     /// enclosing unit's key plus an ordinal (see docs/architecture.md).
     key: String,
-    info: StructInfoIndex,
+    info: ContainerInfoIndex,
 };
 
 pub const TupleType = struct {
@@ -454,7 +467,10 @@ pub const Key = union(enum) {
     anyframe_type: Index,
     error_union_type: struct { error_set_type: Index, payload_type: Index },
     simple_type: SimpleType,
-    struct_type: StructType,
+    struct_type: ContainerType,
+    enum_type: ContainerType,
+    union_type: ContainerType,
+    opaque_type: ContainerType,
     tuple_type: TupleType,
     /// Names sorted by their bytes.
     error_set_type: []const String,
@@ -468,6 +484,11 @@ pub const Key = union(enum) {
     err: struct { ty: Index, name: String },
     error_union: struct { ty: Index, val: union(enum) { err_name: String, payload: Index } },
     enum_literal: String,
+    /// A value of an enum type: `int` is the tag value, of the tag type.
+    enum_tag: struct { ty: Index, int: Index },
+    /// A value of a union type. `tag` is the active field's `enum_tag` value
+    /// (for untagged unions, of the union's field index as a `u32`).
+    un: struct { ty: Index, tag: Index, val: Index },
     ptr: Ptr,
     slice: struct { ty: Index, ptr: Index, len: Index },
     /// `val == .none` is null.
@@ -493,6 +514,9 @@ const Tag = enum(u8) {
     type_error_set,
     type_inferred_error_set,
     type_struct,
+    type_enum,
+    type_union,
+    type_opaque,
     type_tuple,
     type_func,
     simple_value,
@@ -504,6 +528,8 @@ const Tag = enum(u8) {
     error_union_err,
     error_union_payload,
     enum_literal,
+    enum_tag,
+    un,
     ptr,
     slice,
     opt_null,
@@ -578,7 +604,7 @@ const Local = struct {
     strings: List([]const u8) = .{},
     limbs: List([]const Limb) = .{},
     navs: List(*Nav) = .{},
-    structs: List(*StructInfo) = .{},
+    structs: List(*ContainerInfo) = .{},
     /// Owns string bytes, limbs, navs, and struct infos.
     arena: std.heap.ArenaAllocator,
 };
@@ -747,17 +773,26 @@ pub fn getNav(ip: *const InternPool, nav: NavIndex) *Nav {
     return u.local.navs.view()[u.index];
 }
 
-pub fn createStructInfo(ip: *InternPool, tid: Tid, info: StructInfo) !StructInfoIndex {
+pub fn createContainerInfo(ip: *InternPool, tid: Tid, info: ContainerInfo) !ContainerInfoIndex {
     const local = &ip.locals[@backingInt(tid)];
-    const ptr = try local.arena.allocator().create(StructInfo);
+    const ptr = try local.arena.allocator().create(ContainerInfo);
     ptr.* = info;
     const i = try local.structs.append(ip.gpa, ptr);
     return @fromBackingInt(ip.wrap(tid, i));
 }
 
-pub fn structInfo(ip: *const InternPool, ty: Index) *StructInfo {
-    const u = ip.unwrapIndex(@backingInt(ip.indexToKey(ty).struct_type.info));
+/// The info of a declared container type of any kind.
+pub fn structInfo(ip: *const InternPool, ty: Index) *ContainerInfo {
+    const u = ip.unwrapIndex(@backingInt(ip.containerType(ty).?.info));
     return u.local.structs.view()[u.index];
+}
+
+/// The container key of a declared struct, enum, union, or opaque type.
+pub fn containerType(ip: *const InternPool, ty: Index) ?ContainerType {
+    return switch (ip.indexToKey(ty)) {
+        .struct_type, .enum_type, .union_type, .opaque_type => |c| c,
+        else => null,
+    };
 }
 
 /// Arena for long-lived data owned by thread `tid` (struct field lists).
@@ -844,10 +879,15 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
             return .{ .tag = .type_error_set, .data = start };
         },
         .inferred_error_set_type => |f| return .{ .tag = .type_inferred_error_set, .data = idx(f) },
-        .struct_type => |t| {
+        .struct_type, .enum_type, .union_type, .opaque_type => |t| {
             const start = try ip.addExtra(local, &.{ t.file, @backingInt(t.zir_inst), @backingInt(t.name), @backingInt(t.info), @intCast(t.captures.len), @backingInt(t.key) });
             _ = try ip.addExtra(local, @ptrCast(t.captures));
-            return .{ .tag = .type_struct, .data = start };
+            return .{ .tag = switch (key) {
+                .struct_type => .type_struct,
+                .enum_type => .type_enum,
+                .union_type => .type_union,
+                else => .type_opaque,
+            }, .data = start };
         },
         .tuple_type => |t| {
             assert(t.types.len == t.values.len);
@@ -882,6 +922,8 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
             .payload => |p| return .{ .tag = .error_union_payload, .data = try ip.addExtra(local, &.{ idx(e.ty), idx(p) }) },
         },
         .enum_literal => |s| return .{ .tag = .enum_literal, .data = @backingInt(s) },
+        .enum_tag => |e| return .{ .tag = .enum_tag, .data = try ip.addExtra(local, &.{ idx(e.ty), idx(e.int) }) },
+        .un => |u| return .{ .tag = .un, .data = try ip.addExtra(local, &.{ idx(u.ty), idx(u.tag), idx(u.val) }) },
         .ptr => |p| {
             const tag: u32, const a: u32, const b: u64 = switch (p.base) {
                 .nav => |n| .{ 0, @backingInt(n), 0 },
@@ -945,14 +987,22 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         .type_error_union => .{ .error_union_type = .{ .error_set_type = I.i(extra[d]), .payload_type = I.i(extra[d + 1]) } },
         .type_error_set => .{ .error_set_type = @ptrCast(extra[d + 1 ..][0..extra[d]]) },
         .type_inferred_error_set => .{ .inferred_error_set_type = I.i(d) },
-        .type_struct => .{ .struct_type = .{
-            .file = extra[d],
-            .zir_inst = @fromBackingInt(extra[d + 1]),
-            .name = I.s(extra[d + 2]),
-            .info = @fromBackingInt(extra[d + 3]),
-            .key = I.s(extra[d + 5]),
-            .captures = @ptrCast(extra[d + 6 ..][0..extra[d + 4]]),
-        } },
+        .type_struct, .type_enum, .type_union, .type_opaque => blk: {
+            const c: ContainerType = .{
+                .file = extra[d],
+                .zir_inst = @fromBackingInt(extra[d + 1]),
+                .name = I.s(extra[d + 2]),
+                .info = @fromBackingInt(extra[d + 3]),
+                .key = I.s(extra[d + 5]),
+                .captures = @ptrCast(extra[d + 6 ..][0..extra[d + 4]]),
+            };
+            break :blk switch (item.tag) {
+                .type_struct => .{ .struct_type = c },
+                .type_enum => .{ .enum_type = c },
+                .type_union => .{ .union_type = c },
+                else => .{ .opaque_type = c },
+            };
+        },
         .type_tuple => blk: {
             const len = extra[d];
             break :blk .{ .tuple_type = .{
@@ -984,6 +1034,8 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         .error_union_err => .{ .error_union = .{ .ty = I.i(extra[d]), .val = .{ .err_name = I.s(extra[d + 1]) } } },
         .error_union_payload => .{ .error_union = .{ .ty = I.i(extra[d]), .val = .{ .payload = I.i(extra[d + 1]) } } },
         .enum_literal => .{ .enum_literal = I.s(d) },
+        .enum_tag => .{ .enum_tag = .{ .ty = I.i(extra[d]), .int = I.i(extra[d + 1]) } },
+        .un => .{ .un = .{ .ty = I.i(extra[d]), .tag = I.i(extra[d + 1]), .val = I.i(extra[d + 2]) } },
         .ptr => blk: {
             const a = extra[d + 2];
             const b = I.u64of(extra[d + 3], extra[d + 4]);
@@ -1131,7 +1183,7 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
         },
         // A declared type's identity in-memory is its ZIR instruction, but
         // its stable hash is its stable key plus captures.
-        .struct_type => |t| {
+        .struct_type, .enum_type, .union_type, .opaque_type => |t| {
             ip.hashString(&h, t.key);
             ip.hashIndices(&h, t.captures);
         },
@@ -1184,6 +1236,15 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
             }
         },
         .enum_literal => |s| ip.hashString(&h, s),
+        .enum_tag => |e| {
+            ip.hashIndex(&h, e.ty);
+            ip.hashIndex(&h, e.int);
+        },
+        .un => |u| {
+            ip.hashIndex(&h, u.ty);
+            ip.hashIndex(&h, u.tag);
+            ip.hashIndex(&h, u.val);
+        },
         .ptr => |p| {
             ip.hashIndex(&h, p.ty);
             h.int(u8, @backingInt(std.meta.activeTag(p.base)));
@@ -1252,8 +1313,13 @@ fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
         .undef => |x| x == b.undef,
         .error_union_type => |x| x.error_set_type == b.error_union_type.error_set_type and x.payload_type == b.error_union_type.payload_type,
         .error_set_type => |x| eqlIdx(String, x, b.error_set_type),
-        .struct_type => |x| x.file == b.struct_type.file and x.zir_inst == b.struct_type.zir_inst and
-            eqlIdx(Index, x.captures, b.struct_type.captures),
+        .struct_type, .enum_type, .union_type, .opaque_type => |x| {
+            const y = switch (b) {
+                .struct_type, .enum_type, .union_type, .opaque_type => |c| c,
+                else => unreachable,
+            };
+            return x.file == y.file and x.zir_inst == y.zir_inst and eqlIdx(Index, x.captures, y.captures);
+        },
         .tuple_type => |x| eqlIdx(Index, x.types, b.tuple_type.types) and eqlIdx(Index, x.values, b.tuple_type.values),
         .func_type => |x| {
             const y = b.func_type;
@@ -1282,6 +1348,8 @@ fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
             };
         },
         .enum_literal => |x| x == b.enum_literal,
+        .enum_tag => |x| x.ty == b.enum_tag.ty and x.int == b.enum_tag.int,
+        .un => |x| x.ty == b.un.ty and x.tag == b.un.tag and x.val == b.un.val,
         .ptr => |x| {
             const y = b.ptr;
             if (x.ty != y.ty or x.byte_offset != y.byte_offset) return false;
@@ -1336,6 +1404,9 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
             .error_union_type,
             .simple_type,
             .struct_type,
+            .enum_type,
+            .union_type,
+            .opaque_type,
             .tuple_type,
             .error_set_type,
             .inferred_error_set_type,
@@ -1347,6 +1418,8 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
             .err => |x| x.ty,
             .error_union => |x| x.ty,
             .enum_literal => .enum_literal_type,
+            .enum_tag => |x| x.ty,
+            .un => |x| x.ty,
             .ptr => |x| x.ty,
             .slice => |x| x.ty,
             .opt => |x| x.ty,

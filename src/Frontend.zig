@@ -38,6 +38,8 @@ files: std.ArrayList(File) = .empty,
 /// Maps `"<module index>:<sub_path>"` to its file.
 file_map: std.StringHashMapUnmanaged(File.Index) = .empty,
 modules: std.ArrayList(Module) = .empty,
+/// The module whose tests `zap test` runs; `root` outside of tests.
+main_module: Module.Index = .root,
 /// What the last `loadAll` did, for `ZAP_FRONTEND_TIMING`.
 stats: Stats = .{},
 
@@ -57,6 +59,7 @@ pub const Module = struct {
     pub const Index = enum(u32) {
         root,
         std,
+        builtin,
         _,
     };
 };
@@ -108,23 +111,46 @@ pub const Stats = struct {
     finish_ns: u64 = 0,
 };
 
-pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, root_src_path: []const u8) !Frontend {
+pub const Options = struct {
+    /// Root source file of the root module (the test runner under `zap test`).
+    root_src_path: []const u8,
+    /// Directory holding the generated `builtin.zig`.
+    builtin_dir: []const u8,
+    /// `zap test` only: root source file of the module under test.
+    main_src_path: ?[]const u8 = null,
+};
+
+pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
     var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir };
     errdefer fe.deinit();
-    const root_dir = std.fs.path.dirname(root_src_path) orelse ".";
-    try fe.modules.append(gpa, .{
-        .name = "root",
-        .root_dir = try gpa.dupe(u8, root_dir),
-        .root_file = try gpa.dupe(u8, std.fs.path.basename(root_src_path)),
-        .cache = .local,
-    });
+    try fe.addModule("root", options.root_src_path, .local);
     try fe.modules.append(gpa, .{
         .name = "std",
         .root_dir = try std.fs.path.join(gpa, &.{ zig_lib_dir, "std" }),
         .root_file = try gpa.dupe(u8, "std.zig"),
         .cache = .global,
     });
+    // Content-addressed in the global cache, like std.
+    try fe.modules.append(gpa, .{
+        .name = "builtin",
+        .root_dir = try gpa.dupe(u8, options.builtin_dir),
+        .root_file = try gpa.dupe(u8, "builtin.zig"),
+        .cache = .global,
+    });
+    if (options.main_src_path) |path| {
+        fe.main_module = @fromBackingInt(@intCast(fe.modules.items.len));
+        try fe.addModule("main", path, .local);
+    }
     return fe;
+}
+
+fn addModule(fe: *Frontend, name: []const u8, root_src_path: []const u8, cache: CacheKind) !void {
+    try fe.modules.append(fe.gpa, .{
+        .name = name,
+        .root_dir = try fe.gpa.dupe(u8, std.fs.path.dirname(root_src_path) orelse "."),
+        .root_file = try fe.gpa.dupe(u8, std.fs.path.basename(root_src_path)),
+        .cache = cache,
+    });
 }
 
 pub fn deinit(fe: *Frontend) void {
@@ -816,6 +842,12 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     defer l.deinit(moved);
 
     const root_job = try l.getJob(.root, fe.module(.root).root_file);
+    // `zap test` also analyzes the module under test and std.
+    var extra_roots: [2]?*Job = @splat(null);
+    if (fe.main_module != .root) extra_roots = .{
+        try l.getJob(fe.main_module, fe.module(fe.main_module).root_file),
+        try l.getJob(.std, fe.module(.std).root_file),
+    };
     l.work(.main);
     l.group.await(io) catch {};
     if (l.failure) |err| return err;
@@ -827,6 +859,12 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     defer order.deinit(gpa);
     root_job.index = @fromBackingInt(0);
     order.appendAssumeCapacity(root_job);
+    for (extra_roots) |opt| {
+        const job = opt orelse continue;
+        if (job.index != null) continue;
+        job.index = @fromBackingInt(@intCast(order.items.len));
+        order.appendAssumeCapacity(job);
+    }
     var i: usize = 0;
     while (i < order.items.len) : (i += 1) {
         const job = order.items[i];
@@ -1004,9 +1042,9 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
 }
 
 /// The files that `f`, which imports `names` (see `Summary`), makes the
-/// frontend load: `.zig` paths, `std`, and `root`. `builtin` is generated
-/// from the target by Sema's driver; unknown modules are reported by Sema
-/// only if the import is actually analyzed, matching upstream.
+/// frontend load: `.zig` paths, `std`, `root`, and `builtin`. Unknown
+/// modules are reported by Sema only if the import is actually analyzed,
+/// matching upstream.
 fn collectImports(fe: *const Frontend, f: *const File, names: []const u8) ![]Import {
     const gpa = fe.gpa;
     var list: std.ArrayList(Import) = .empty;
@@ -1021,6 +1059,8 @@ fn collectImports(fe: *const Frontend, f: *const File, names: []const u8) ![]Imp
             .{ .module = .std, .sub_path = try gpa.dupe(u8, fe.module(.std).root_file) }
         else if (std.mem.eql(u8, name, "root"))
             .{ .module = .root, .sub_path = try gpa.dupe(u8, fe.module(.root).root_file) }
+        else if (std.mem.eql(u8, name, "builtin"))
+            .{ .module = .builtin, .sub_path = try gpa.dupe(u8, fe.module(.builtin).root_file) }
         else
             // TODO: ZON imports go through ZonGen, not AstGen.
             continue;
@@ -1059,7 +1099,7 @@ test "loads a file and its imports" {
     const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/main.zig", .{tmp.sub_path});
     defer gpa.free(root);
 
-    var fe: Frontend = try .init(gpa, io, "/nonexistent", root);
+    var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent" });
     defer fe.deinit();
     var errors: std.zig.ErrorBundle.Wip = try .init(gpa);
     defer errors.deinit();
@@ -1094,7 +1134,7 @@ test "reuses cached ZIR, drops stale guessed imports, and reports errors in cach
         ok: bool,
 
         fn init(r: *@This(), root_path: []const u8, cache_path: []const u8) !void {
-            r.fe = try .init(gpa, io, "/nonexistent", root_path);
+            r.fe = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root_path, .builtin_dir = "/nonexistent" });
             errdefer r.fe.deinit();
             try r.fe.enableCache(.{ .local = cache_path, .global = cache_path });
             r.errors = try .init(gpa);

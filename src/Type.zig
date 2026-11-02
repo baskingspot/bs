@@ -25,6 +25,8 @@ pub const Class = enum {
     array,
     vector,
     @"struct",
+    @"enum",
+    @"union",
     tuple,
     optional,
     error_union,
@@ -50,6 +52,9 @@ pub fn class(ip: *const InternPool, ty: Index) Class {
         .error_union_type => .error_union,
         .error_set_type, .inferred_error_set_type => .error_set,
         .struct_type => .@"struct",
+        .enum_type => .@"enum",
+        .union_type => .@"union",
+        .opaque_type => .@"opaque",
         .tuple_type => .tuple,
         .func_type => .@"fn",
         .simple_type => |s| switch (s) {
@@ -96,6 +101,19 @@ pub fn intInfo(ip: *const InternPool, ty: Index) IntInfo {
             else => unreachable,
         },
         .error_set_type, .inferred_error_set_type => .{ .signedness = .unsigned, .bits = 16 },
+        // An enum is represented by its integer tag.
+        .enum_type => intInfo(ip, ip.structInfo(ty).tag_type),
+        else => unreachable,
+    };
+}
+
+pub fn floatBits(ip: *const InternPool, ty: Index) u16 {
+    return switch (ip.indexToKey(ty).simple_type) {
+        .f16 => 16,
+        .f32 => 32,
+        .f64 => 64,
+        .f80, .c_longdouble => 80,
+        .f128 => 128,
         else => unreachable,
     };
 }
@@ -149,7 +167,7 @@ fn comptimeOnly(ip: *const InternPool, ty: Index, hit_cycle: *bool) bool {
             for (t.types, t.values) |ft, fv| if (fv == .none and comptimeOnly(ip, ft, hit_cycle)) return true;
             return false;
         },
-        .@"struct" => {
+        .@"struct", .@"union" => {
             const info = ip.structInfo(ty);
             switch (info.comptime_only) {
                 .yes => return true,
@@ -182,9 +200,9 @@ pub fn hasRuntimeBits(ip: *const InternPool, ty: Index) bool {
     if (isComptimeOnly(ip, ty)) return false;
     return switch (class(ip, ty)) {
         .void, .noreturn, .@"opaque" => false,
-        .int => intInfo(ip, ty).bits != 0,
+        .int, .@"enum" => intInfo(ip, ty).bits != 0,
         .array => ip.indexToKey(ty).array_type.lenIncludingSentinel() != 0 and hasRuntimeBits(ip, childType(ip, ty)),
-        .@"struct", .tuple => abiSize(ip, ty) != 0,
+        .@"struct", .tuple, .@"union" => abiSize(ip, ty) != 0,
         else => true,
     };
 }
@@ -205,7 +223,7 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
     return switch (class(ip, ty)) {
         .void, .noreturn, .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined, .@"fn", .special, .@"opaque" => 0,
         .bool => 1,
-        .int, .error_set => intAbiSize(intInfo(ip, ty).bits),
+        .int, .error_set, .@"enum" => intAbiSize(intInfo(ip, ty).bits),
         .float => switch (ip.indexToKey(ty).simple_type) {
             .f16 => 2,
             .f32 => 4,
@@ -234,7 +252,7 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
             const layout = errorUnionLayout(ip, ty);
             break :blk layout.size;
         },
-        .@"struct" => blk: {
+        .@"struct", .@"union" => blk: {
             const info = ip.structInfo(ty);
             assert(info.status == .have_layout);
             break :blk info.size;
@@ -247,7 +265,7 @@ pub fn abiAlignment(ip: *const InternPool, ty: Index) u64 {
     return switch (class(ip, ty)) {
         .void, .noreturn, .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined, .@"fn", .special, .@"opaque" => 1,
         .bool => 1,
-        .int, .error_set => intAbiAlignment(intInfo(ip, ty).bits),
+        .int, .error_set, .@"enum" => intAbiAlignment(intInfo(ip, ty).bits),
         .float => @min(abiSize(ip, ty), 16),
         .pointer, .@"anyframe" => 8,
         .array => abiAlignment(ip, childType(ip, ty)),
@@ -258,7 +276,7 @@ pub fn abiAlignment(ip: *const InternPool, ty: Index) u64 {
             break :blk abiAlignment(ip, child);
         },
         .error_union => errorUnionLayout(ip, ty).alignment,
-        .@"struct" => blk: {
+        .@"struct", .@"union" => blk: {
             const info = ip.structInfo(ty);
             assert(info.status == .have_layout);
             break :blk info.alignment;
@@ -294,6 +312,43 @@ pub fn errorUnionLayout(ip: *const InternPool, ty: Index) ErrorUnionLayout {
     };
 }
 
+pub const UnionLayout = struct {
+    tag_offset: u64,
+    payload_offset: u64,
+    /// 0 if the union has no runtime tag.
+    tag_size: u64,
+    payload_size: u64,
+};
+
+/// Upstream's union layout: the tag goes first unless the payload is more
+/// aligned than it.
+pub fn unionLayout(ip: *const InternPool, ty: Index) UnionLayout {
+    const info = ip.structInfo(ty);
+    var payload_size: u64 = 0;
+    var payload_align: u64 = 1;
+    for (info.field_types) |ft| {
+        if (class(ip, ft) == .noreturn) continue;
+        if (hasRuntimeBits(ip, ft)) payload_size = @max(payload_size, abiSize(ip, ft));
+        payload_align = @max(payload_align, abiAlignment(ip, ft));
+    }
+    if (!info.has_runtime_tag) return .{ .tag_offset = 0, .payload_offset = 0, .tag_size = 0, .payload_size = payload_size };
+    const tag_size = abiSize(ip, info.tag_type);
+    if (abiAlignment(ip, info.tag_type) < payload_align)
+        return .{ .tag_offset = payload_size, .payload_offset = 0, .tag_size = tag_size, .payload_size = payload_size };
+    return .{ .tag_offset = 0, .payload_offset = tag_size, .tag_size = tag_size, .payload_size = payload_size };
+}
+
+/// The runtime tag value of union field `field`: its enum tag, or for a
+/// hidden safety tag the field index.
+pub fn unionFieldTag(ip: *const InternPool, ty: Index, field: u32) u64 {
+    const info = ip.structInfo(ty);
+    if (ip.indexToKey(info.tag_type) != .enum_type) return field;
+    const tag_info = ip.structInfo(info.tag_type);
+    const i = tag_info.fieldIndex(ip, ip.stringSlice(info.field_names[field])).?;
+    const v = tag_info.field_defaults[i];
+    return ip.intValue(u64, v) orelse @bitCast(ip.intValue(i64, v).?);
+}
+
 pub const TupleLayout = struct { size: u64, alignment: u64, field_offset: u64 };
 
 /// Layout of a tuple; also returns the offset of field `field` if given.
@@ -318,7 +373,7 @@ pub fn tupleLayout(ip: *const InternPool, ty: Index, field: ?usize) TupleLayout 
 
 pub fn fieldCount(ip: *const InternPool, ty: Index) usize {
     return switch (ip.indexToKey(ty)) {
-        .struct_type => ip.structInfo(ty).field_types.len,
+        .struct_type, .union_type => ip.structInfo(ty).field_types.len,
         .tuple_type => |t| t.types.len,
         .array_type => |a| a.len,
         else => unreachable,
@@ -327,7 +382,7 @@ pub fn fieldCount(ip: *const InternPool, ty: Index) usize {
 
 pub fn fieldType(ip: *const InternPool, ty: Index, i: usize) Index {
     return switch (ip.indexToKey(ty)) {
-        .struct_type => ip.structInfo(ty).field_types[i],
+        .struct_type, .union_type => ip.structInfo(ty).field_types[i],
         .tuple_type => |t| t.types[i],
         .array_type => |a| a.child,
         else => unreachable,
@@ -337,6 +392,7 @@ pub fn fieldType(ip: *const InternPool, ty: Index, i: usize) Index {
 pub fn fieldOffset(ip: *const InternPool, ty: Index, i: usize) u64 {
     return switch (ip.indexToKey(ty)) {
         .struct_type => ip.structInfo(ty).field_offsets[i],
+        .union_type => unionLayout(ip, ty).payload_offset,
         .tuple_type => tupleLayout(ip, ty, i).field_offset,
         .array_type => |a| i * abiSize(ip, a.child),
         else => unreachable,

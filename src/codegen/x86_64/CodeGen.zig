@@ -256,6 +256,7 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
             else => {},
         },
         .err => |e| return .{ .err = e.name },
+        .enum_tag => |e| return .{ .imm = intBits(ip, e.int) },
         .ptr => |p| if (!Type.isSlice(ip, ty)) {
             if (p.base == .int) return .{ .imm = p.byte_offset };
             const t = try ptrTarget(cg.emit, val);
@@ -279,7 +280,7 @@ fn intBits(ip: *const InternPool, val: Index) u64 {
 
 fn signed(cg: *CodeGen, ty: Index) bool {
     return switch (Type.class(cg.ip, ty)) {
-        .int => Type.intInfo(cg.ip, ty).signedness == .signed,
+        .int, .@"enum" => Type.intInfo(cg.ip, ty).signedness == .signed,
         else => false,
     };
 }
@@ -458,7 +459,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyTo(Mem.at(.r10, 0), val);
         },
 
-        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .rem, .mod => {
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
             const ty = cg.typeOf(data.bin_op.lhs);
             const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.binOp(tag, ty, data.bin_op.lhs, data.bin_op.rhs);
@@ -699,8 +700,133 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.copyTo(offsetMem(dst, off), elem);
             }
         },
+        .union_init => {
+            const ty = data.ty_pl.ty;
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+            const layout = Type.unionLayout(ip, ty);
+            try cg.copyTo(offsetMem(dst, layout.payload_offset), sf.operand);
+            if (layout.tag_size != 0) {
+                try cg.e.mov(.qword, .{ .reg = .rax }, .{ .imm = @bitCast(Type.unionFieldTag(ip, ty, sf.index)) });
+                try cg.storeReg(offsetMem(dst, layout.tag_offset), .rax, layout.tag_size);
+            }
+        },
+        .get_union_tag => {
+            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
+            const layout = Type.unionLayout(ip, cg.typeOf(data.ty_op.operand));
+            const src = try cg.memOf(data.ty_op.operand);
+            try cg.copyMem(dst, offsetMem(src, layout.tag_offset), layout.tag_size);
+        },
+        .set_union_tag => {
+            const layout = Type.unionLayout(ip, Type.ptrInfo(ip, cg.typeOf(data.bin_op.lhs)).child);
+            if (layout.tag_size == 0) return;
+            try cg.load(.r10, data.bin_op.lhs);
+            try cg.load(.rax, data.bin_op.rhs);
+            try cg.storeReg(Mem.at(.r10, @intCast(layout.tag_offset)), .rax, layout.tag_size);
+        },
+        .clz, .ctz, .popcount, .byte_swap, .bit_reverse => {
+            const ty = data.ty_op.ty;
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const bits = Type.intInfo(ip, cg.typeOf(data.ty_op.operand)).bits;
+            try cg.bitOp(tag, bits, data.ty_op.operand);
+            if (tag == .byte_swap or tag == .bit_reverse) try cg.normalize(.rax, ty);
+            try cg.storeReg(dst, .rax, Type.abiSize(ip, ty));
+        },
+        .tag_name => {
+            // A compare chain over the tags; each name is a content atom.
+            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
+            const enum_ty = cg.typeOf(data.ty_op.operand);
+            const info = ip.structInfo(enum_ty);
+            try cg.load(.rax, data.ty_op.operand);
+            const done = try cg.e.newLabel();
+            for (info.field_names, info.field_defaults) |name, v| {
+                const next = try cg.e.newLabel();
+                try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @bitCast(intBits(ip, v)) });
+                try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
+                try cg.e.jcc(.ne, .{ .label = next });
+                const bytes = ip.stringSlice(name);
+                const z = try cg.emit.allocator().alloc(u8, bytes.len + 1);
+                @memcpy(z[0..bytes.len], bytes);
+                z[bytes.len] = 0;
+                try cg.e.lea(.qword, .rcx, Mem.sym(try cg.emit.contentAtom(1, z, &.{}, &.{}), 0));
+                try cg.e.mov(.qword, .{ .mem = dst }, .{ .reg = .rcx });
+                try cg.e.mov(.qword, .{ .mem = offsetMem(dst, 8) }, .{ .imm = @intCast(bytes.len) });
+                try cg.e.jmp(.{ .label = done });
+                cg.e.bind(next);
+            }
+            try cg.e.ud2();
+            cg.e.bind(done);
+        },
         .assembly => try cg.assembly(inst, data),
     }
+}
+
+/// The bit operations into rax, with loops over the bits (the baseline
+/// x86_64 CPU has no lzcnt, tzcnt, or popcnt). Uses rcx, rdx, r11.
+fn bitOp(cg: *CodeGen, tag: Inst.Tag, bits: u16, operand: Ref) Error!void {
+    const e = &cg.e;
+    try cg.load(.rdx, operand);
+    if (bits < 64) {
+        // Only the operand's own bits.
+        try e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast((@as(u64, 1) << @intCast(bits)) - 1) });
+        try e.alu(.@"and", .qword, .{ .reg = .rdx }, .{ .reg = .r11 });
+    }
+    try e.alu(.xor, .dword, .{ .reg = .rax }, .{ .reg = .rax });
+    const top = try e.newLabel();
+    const done = try e.newLabel();
+    switch (tag) {
+        .popcount => {
+            // while (x != 0) { x &= x - 1; n += 1; }
+            e.bind(top);
+            try e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
+            try e.jcc(.e, .{ .label = done });
+            try e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rdx });
+            try e.alu(.sub, .qword, .{ .reg = .rcx }, .{ .imm = 1 });
+            try e.alu(.@"and", .qword, .{ .reg = .rdx }, .{ .reg = .rcx });
+            try e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
+            try e.jmp(.{ .label = top });
+        },
+        .ctz => {
+            // while (n < bits and x & 1 == 0) { x >>= 1; n += 1; }
+            e.bind(top);
+            try e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .imm = bits });
+            try e.jcc(.e, .{ .label = done });
+            try e.@"test"(.qword, .{ .reg = .rdx }, .{ .imm = 1 });
+            try e.jcc(.ne, .{ .label = done });
+            try e.shift(.shr, .qword, .{ .reg = .rdx }, 1);
+            try e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
+            try e.jmp(.{ .label = top });
+        },
+        .clz => {
+            // Align the operand's top bit with bit 63, then count.
+            if (bits != 64 and bits != 0) try e.shift(.shl, .qword, .{ .reg = .rdx }, @intCast(64 - bits));
+            e.bind(top);
+            try e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .imm = bits });
+            try e.jcc(.e, .{ .label = done });
+            try e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
+            try e.jcc(.s, .{ .label = done });
+            try e.shift(.shl, .qword, .{ .reg = .rdx }, 1);
+            try e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
+            try e.jmp(.{ .label = top });
+        },
+        .byte_swap, .bit_reverse => {
+            // Move the low unit of x to the bottom of n, `bits / unit` times.
+            const unit: u8 = if (tag == .byte_swap) 8 else 1;
+            try e.mov(.dword, .{ .reg = .rcx }, .{ .imm = bits / unit });
+            e.bind(top);
+            try e.@"test"(.dword, .{ .reg = .rcx }, .{ .reg = .rcx });
+            try e.jcc(.e, .{ .label = done });
+            try e.shift(.shl, .qword, .{ .reg = .rax }, unit);
+            try e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rdx });
+            try e.alu(.@"and", .qword, .{ .reg = .r11 }, .{ .imm = if (unit == 8) 0xff else 1 });
+            try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .reg = .r11 });
+            try e.shift(.shr, .qword, .{ .reg = .rdx }, unit);
+            try e.alu(.sub, .dword, .{ .reg = .rcx }, .{ .imm = 1 });
+            try e.jmp(.{ .label = top });
+        },
+        else => unreachable,
+    }
+    e.bind(done);
 }
 
 /// `reg = base + index * size`, where `base` is a pointer or, if `is_slice`,
@@ -737,7 +863,7 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void 
         .xor => try cg.e.alu(.xor, .qword, .{ .reg = .rax }, .{ .reg = .rcx }),
         .shl => try cg.e.shift(.shl, .qword, .{ .reg = .rax }, null),
         .shr => try cg.e.shift(if (s) .sar else .shr, .qword, .{ .reg = .rax }, null),
-        .div_trunc, .div_floor, .rem, .mod => {
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
             if (s) {
                 try cg.e.cqo(.qword);
                 try cg.e.unary(.idiv, .qword, .{ .reg = .rcx });
@@ -760,6 +886,20 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void 
                 } else {
                     try cg.e.alu(.add, .qword, .{ .reg = .rdx }, .{ .reg = .rcx });
                 }
+                cg.e.bind(done);
+            }
+            if (tag == .div_ceil) {
+                // Round up when the remainder is non-zero and the exact
+                // quotient is positive (dividend and divisor signs agree).
+                const done = try cg.e.newLabel();
+                try cg.e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
+                try cg.e.jcc(.e, .{ .label = done });
+                if (s) {
+                    try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rdx });
+                    try cg.e.alu(.xor, .qword, .{ .reg = .r11 }, .{ .reg = .rcx });
+                    try cg.e.jcc(.s, .{ .label = done });
+                }
+                try cg.e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
                 cg.e.bind(done);
             }
             if (tag == .rem or tag == .mod) try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
@@ -862,8 +1002,14 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ir = cg.ir;
     const extra = ir.extraData(Ir.Call, data.pl_op.payload);
     const args = ir.refSlice(extra.end, extra.data.args_len);
-    const callee = data.pl_op.operand.toInterned().?;
-    const callee_ty = ip.indexToKey(ip.typeOf(callee)).func_type;
+    const callee_ref = data.pl_op.operand;
+    const callee_val: ?Index = if (callee_ref.toInterned()) |v| switch (ip.indexToKey(v)) {
+        .func => v,
+        .ptr => |p| if (p.base == .nav and p.byte_offset == 0) ip.getNav(p.base.nav).val else null,
+        else => null,
+    } else null;
+    const callee_fn_ty = cg.typeOf(callee_ref);
+    const callee_ty = ip.indexToKey(if (Type.class(ip, callee_fn_ty) == .pointer) Type.ptrInfo(ip, callee_fn_ty).child else callee_fn_ty).func_type;
     const ret_ty = extra.data.ret_ty;
     const dst = try cg.resultMem(inst, ret_ty);
     if (callee_ty.cc == .c) {
@@ -887,7 +1033,13 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         cg.out_args_size = @max(cg.out_args_size, off);
         if (dst) |m| if (!cg.passInRegs(ret_ty)) try cg.e.lea(.qword, .rdi, m);
     }
-    try cg.e.call(.{ .sym = try cg.emit.funcKey(callee) });
+    if (callee_val) |f| {
+        try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
+    } else {
+        // r11 is not an argument register in either convention.
+        try cg.load(.r11, callee_ref);
+        try cg.e.callIndirect(.{ .reg = .r11 });
+    }
     if (dst) |m| if (cg.passInRegs(ret_ty)) try cg.storeReg(m, .rax, Type.abiSize(ip, ret_ty));
 }
 
@@ -1246,6 +1398,20 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
             @memcpy(out, buf[0..out.len]);
         },
         .simple_value => |s| out[0] = @intFromBool(s == .true),
+        .enum_tag => |e| try lowerValue(emit, e.int, out, relocs, base_off),
+        .un => |u| {
+            @memset(out, 0);
+            const layout = Type.unionLayout(ip, ty);
+            if (layout.tag_size != 0) {
+                const tag_int = if (ip.indexToKey(u.tag) == .enum_tag) ip.indexToKey(u.tag).enum_tag.int else u.tag;
+                try lowerValue(emit, tag_int, out[@intCast(layout.tag_offset)..][0..@intCast(layout.tag_size)], relocs, base_off + @as(u32, @intCast(layout.tag_offset)));
+            }
+            const pt = ip.typeOf(u.val);
+            if (Type.hasRuntimeBits(ip, pt)) {
+                const off: u32 = @intCast(layout.payload_offset);
+                try lowerValue(emit, u.val, out[off..][0..@intCast(Type.abiSize(ip, pt))], relocs, base_off + off);
+            }
+        },
         .err => |e| {
             @memset(out, 0);
             try relocs.append(gpa, base_off, .value16, try emit.useError(e.name), 0);

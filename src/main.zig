@@ -5,6 +5,7 @@ const Frontend = @import("Frontend.zig");
 const Zcu = @import("Zcu.zig");
 const Ir = @import("Ir.zig");
 const Emit = @import("Emit.zig");
+const Builtin = @import("Builtin.zig");
 
 pub const zig_version = "0.17.0";
 
@@ -79,13 +80,24 @@ pub fn main(init: std.process.Init) !void {
         } else fatal("unsupported target '{s}'; zap supports x86_64-linux and aarch64-macos", .{t});
     }
 
-    var fe: Frontend = try .init(init.gpa, init.io, zig_lib_dir, opts.root_src_path);
-    defer fe.deinit();
-    try fe.enableCache(Frontend.resolveCacheDirs(arena, init.io, init.environ_map, .{
+    const cache_dirs = Frontend.resolveCacheDirs(arena, init.io, init.environ_map, .{
         .local = opts.cache_dir,
         .global = opts.global_cache_dir,
         .local_is_global = command == .run,
-    }));
+    });
+    const is_test = command == .@"test";
+    const builtin_dir = try Builtin.writeToCache(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), .{
+        .output_mode = if (command == .build_obj) .Obj else .Exe,
+        .is_test = is_test,
+    });
+    const test_runner = opts.test_runner orelse try std.fs.path.join(arena, &.{ zig_lib_dir, "compiler", "test_runner.zig" });
+    var fe: Frontend = try .init(init.gpa, init.io, zig_lib_dir, .{
+        .root_src_path = if (is_test) test_runner else opts.root_src_path,
+        .builtin_dir = builtin_dir,
+        .main_src_path = if (is_test) opts.root_src_path else null,
+    });
+    defer fe.deinit();
+    try fe.enableCache(cache_dirs);
     var errors: std.zig.ErrorBundle.Wip = try .init(init.gpa);
     defer errors.deinit();
     const ok = try fe.loadAll(&errors);
@@ -100,6 +112,8 @@ pub fn main(init: std.process.Init) !void {
 
     var zcu: Zcu = try .init(init.gpa, init.io, &fe);
     defer zcu.deinit();
+    zcu.is_test = is_test;
+    zcu.test_filters = opts.test_filters;
     if (opts.dump_ir) {
         var stdout_buf: [4096]u8 = undefined;
         var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buf);
@@ -109,20 +123,41 @@ pub fn main(init: std.process.Init) !void {
         exitOnErrors(init, &zcu);
         return;
     }
-    if (command != .build_exe) fatal("{s}: zap only implements build-exe so far", .{@tagName(command)});
+    if (command != .build_exe and command != .@"test") fatal("{s}: zap only implements build-exe and test so far", .{@tagName(command)});
 
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
     try zcu.analyzeAll(&emit);
-    exitOnErrors(init, &zcu);
-    const out_path: []const u8 = switch (opts.emit_bin) {
-        .none => return,
-        .path => |p| p,
-        .default => opts.name orelse std.fs.path.stem(opts.root_src_path),
+    if (is_test) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
     };
+    exitOnErrors(init, &zcu);
+    const run_test = is_test and !opts.test_no_exec;
+    const stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path);
+    const out_path: []const u8 = switch (opts.emit_bin) {
+        .none => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else return,
+        .path => |p| p,
+        .default => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else stem,
+    };
+    if (run_test) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path).?);
     const linked = try emit.finish(init.io, Io.Dir.cwd(), out_path);
     exitOnErrors(init, &zcu);
     if (!linked) std.process.exit(1);
+    if (run_test) {
+        var child = try std.process.spawn(init.io, .{ .argv = &.{out_path} });
+        const term = try child.wait(init.io);
+        switch (term) {
+            .exited => |code| if (code != 0) std.process.exit(code),
+            else => fatal("the test binary terminated unexpectedly: {any}", .{term}),
+        }
+    }
+}
+
+fn testBinPath(arena: std.mem.Allocator, io: Io, cache_dir: []const u8, stem: []const u8) ![]const u8 {
+    var r: [8]u8 = undefined;
+    io.random(&r);
+    return std.fmt.allocPrint(arena, "{s}/tmp/{s}-{x}", .{ cache_dir, stem, &r });
 }
 
 fn exitOnErrors(init: std.process.Init, zcu: *Zcu) void {

@@ -44,6 +44,12 @@ comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, InternPool.Index) = .em
 /// Errors each function instance returns, for inferred error sets.
 inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, std.ArrayList(InternPool.String)) = .empty,
 exports: std.ArrayList(Export) = .empty,
+/// `zap test`: collect the main module's tests into `builtin.test_functions`.
+is_test: bool = false,
+/// `zap test --test-filter`: keep only named tests whose fqn contains one.
+test_filters: []const []const u8 = &.{},
+/// Test declarations to run, in discovery order.
+test_functions: std.ArrayList(InternPool.NavIndex) = .empty,
 errors: std.ArrayList(ErrorMsg) = .empty,
 /// Owns diagnostic text and namespace tables.
 arena: std.heap.ArenaAllocator,
@@ -90,6 +96,9 @@ pub const Dependee = union(enum) {
     /// by name lookups and `@hasDecl`, so adding an unrelated declaration
     /// does not invalidate the unit.
     namespace_name: struct { namespace: u32, name: InternPool.String },
+    /// The names of all declarations of namespace `namespace` (`@typeInfo`
+    /// lists them).
+    namespace: u32,
 };
 
 pub const Namespace = struct {
@@ -141,6 +150,7 @@ pub fn deinit(zcu: *Zcu) void {
     while (it.next()) |list| list.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
     zcu.exports.deinit(gpa);
+    zcu.test_functions.deinit(gpa);
     zcu.errors.deinit(gpa);
     zcu.file_root_types.deinit(gpa);
     zcu.ip.deinit();
@@ -154,10 +164,28 @@ pub fn file(zcu: *const Zcu, index: u32) *const Frontend.File {
 }
 
 /// The stable unit-key prefix of a file: module name and path within it.
-pub fn fileFqn(zcu: *Zcu, index: u32) ![]const u8 {
+pub fn fileKey(zcu: *Zcu, index: u32) ![]const u8 {
     const f = zcu.file(index);
     const mod = zcu.fe.module(f.module);
     return std.fmt.allocPrint(zcu.arena.allocator(), "{s}:{s}", .{ mod.name, f.sub_path });
+}
+
+/// The display name of a file's root struct, as upstream renders it: the path
+/// within its module, without extension, with slashes as dots.
+pub fn fileFqn(zcu: *Zcu, index: u32) ![]const u8 {
+    const sub_path = zcu.file(index).sub_path;
+    const noext = sub_path[0 .. sub_path.len - std.fs.path.extension(sub_path).len];
+    const fqn = try zcu.arena.allocator().dupe(u8, noext);
+    std.mem.replaceScalar(u8, fqn, '/', '.');
+    return fqn;
+}
+
+/// The root file of module `mod`, if anything loaded it.
+pub fn moduleRootFile(zcu: *Zcu, mod: @import("Frontend.zig").Module.Index) ?u32 {
+    var buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{d}:{s}", .{ @backingInt(mod), zcu.fe.module(mod).root_file }) catch return null;
+    const index = zcu.fe.file_map.get(key) orelse return null;
+    return @backingInt(index);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,17 +221,19 @@ pub fn renderErrors(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip) !void {
 /// The root struct type of a file, creating it (and its namespace) on first use.
 pub fn fileRootType(zcu: *Zcu, file_index: u32) !InternPool.Index {
     if (zcu.file_root_types.items[file_index] != .none) return zcu.file_root_types.items[file_index];
-    const fqn = try zcu.fileFqn(file_index);
-    const ty = try zcu.createStructType(file_index, .main_struct_inst, &.{}, fqn, fqn, Namespace.none);
+    const ty = try zcu.createContainerType(.@"struct", file_index, .main_struct_inst, &.{}, try zcu.fileFqn(file_index), try zcu.fileKey(file_index), Namespace.none);
     zcu.file_root_types.items[file_index] = ty;
     return ty;
 }
 
-/// Interns a declared struct type with display name `fqn` and stable key
-/// `key`. If it is new, creates its namespace and declarations and queues
-/// its `comptime` and exported declarations.
-pub fn createStructType(
+pub const ContainerKind = enum { @"struct", @"enum", @"union", @"opaque" };
+
+/// Interns a declared container type of `kind` with display name `fqn` and
+/// stable key `key`. If it is new, creates its namespace and declarations
+/// and queues its `comptime` and exported declarations.
+pub fn createContainerType(
     zcu: *Zcu,
+    kind: ContainerKind,
     file_index: u32,
     inst: Zir.Inst.Index,
     captures: []const InternPool.Index,
@@ -213,18 +243,35 @@ pub fn createStructType(
 ) !InternPool.Index {
     const ip = &zcu.ip;
     const zir = &zcu.file(file_index).zir;
-    const decl = zir.getStructDecl(inst);
+    const decls: []const Zir.Inst.Index, const layout: std.lang.Type.ContainerLayout = switch (kind) {
+        .@"struct" => blk: {
+            const d = zir.getStructDecl(inst);
+            break :blk .{ d.decls, d.layout };
+        },
+        .@"enum" => .{ zir.getEnumDecl(inst).decls, .auto },
+        .@"union" => blk: {
+            const d = zir.getUnionDecl(inst);
+            break :blk .{ d.decls, d.kind.layout() };
+        },
+        .@"opaque" => .{ zir.getOpaqueDecl(inst).decls, .auto },
+    };
     const name = try ip.getString(tid, fqn);
     // Look up first so an existing type keeps its namespace.
-    const info = try ip.createStructInfo(tid, .{ .namespace = Namespace.none, .layout = decl.layout });
-    const ty = try ip.get(tid, .{ .struct_type = .{
+    const info = try ip.createContainerInfo(tid, .{ .namespace = Namespace.none, .layout = layout });
+    const container: InternPool.ContainerType = .{
         .file = file_index,
         .zir_inst = inst,
         .captures = captures,
         .name = name,
         .key = try ip.getString(tid, key),
         .info = info,
-    } });
+    };
+    const ty = try ip.get(tid, switch (kind) {
+        .@"struct" => .{ .struct_type = container },
+        .@"enum" => .{ .enum_type = container },
+        .@"union" => .{ .union_type = container },
+        .@"opaque" => .{ .opaque_type = container },
+    });
     const si = ip.structInfo(ty);
     if (si.namespace != Namespace.none) return ty;
 
@@ -237,36 +284,59 @@ pub fn createStructType(
         .fqn = fqn,
         .key = key,
     });
+    const arena = zcu.arena.allocator();
+    const key_sep = if (parent_ns == Namespace.none) ":" else ".";
+    const collect_tests = zcu.is_test and zcu.file(file_index).module == zcu.fe.main_module;
     var comptime_ordinal: u32 = 0;
-    for (decl.decls) |decl_inst| {
+    var unnamed_tests: u32 = 0;
+    for (decls) |decl_inst| {
         const d = zir.getDeclaration(decl_inst);
-        switch (d.kind) {
+        const simple: []const u8 = switch (d.kind) {
             .@"comptime" => {
                 try zcu.comptime_decls.put(zcu.gpa, .{ .file = file_index, .inst = decl_inst, .namespace = ns_index, .ordinal = comptime_ordinal }, .queued);
                 comptime_ordinal += 1;
+                continue;
             },
-            .unnamed_test, .@"test", .decltest => {},
+            .unnamed_test, .@"test", .decltest => blk: {
+                if (!collect_tests) continue;
+                if (d.kind == .unnamed_test) {
+                    defer unnamed_tests += 1;
+                    break :blk try std.fmt.allocPrint(arena, "test_{d}", .{unnamed_tests});
+                }
+                break :blk try std.fmt.allocPrint(arena, "{t}.{s}", .{ d.kind, zir.nullTerminatedString(d.name) });
+            },
+            .@"const", .@"var" => zir.nullTerminatedString(d.name),
+        };
+        const decl_fqn = try std.fmt.allocPrint(arena, "{s}.{s}", .{ fqn, simple });
+        const decl_key = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ key, key_sep, simple });
+        var hasher: InternPool.Hasher = .init("nav");
+        hasher.bytes(decl_key);
+        const nav = try ip.createNav(tid, .{
+            .name = try ip.getString(tid, simple),
+            .fqn = try ip.getString(tid, decl_fqn),
+            .key = try ip.getString(tid, decl_key),
+            .file = file_index,
+            .zir_inst = decl_inst,
+            .namespace = ns_index,
+            .hash = hasher.final(),
+            .is_pub = d.is_pub,
+            .linkage = d.linkage,
+            .is_const = d.kind != .@"var",
+        });
+        switch (d.kind) {
             .@"const", .@"var" => {
-                const simple = zir.nullTerminatedString(d.name);
-                const sep = if (parent_ns == Namespace.none) ":" else ".";
-                const decl_fqn = try std.fmt.allocPrint(zcu.arena.allocator(), "{s}{s}{s}", .{ fqn, sep, simple });
-                const decl_key = try std.fmt.allocPrint(zcu.arena.allocator(), "{s}{s}{s}", .{ key, sep, simple });
-                var hasher: InternPool.Hasher = .init("nav");
-                hasher.bytes(decl_key);
-                const nav = try ip.createNav(tid, .{
-                    .name = try ip.getString(tid, simple),
-                    .fqn = try ip.getString(tid, decl_fqn),
-                    .key = try ip.getString(tid, decl_key),
-                    .file = file_index,
-                    .zir_inst = decl_inst,
-                    .namespace = ns_index,
-                    .hash = hasher.final(),
-                    .is_pub = d.is_pub,
-                    .linkage = d.linkage,
-                    .is_const = d.kind == .@"const",
-                });
                 try zcu.namespaces.items[ns_index].decls.put(zcu.gpa, ip.getNav(nav).name, nav);
                 if (d.linkage == .@"export") try zcu.exports.append(zcu.gpa, .{ .nav = nav, .name = ip.getNav(nav).name });
+            },
+            else => {
+                // Upstream's filter semantics: unnamed tests always run;
+                // named ones only if their fqn contains some filter.
+                if (d.kind != .unnamed_test and zcu.test_filters.len > 0) {
+                    for (zcu.test_filters) |filter| {
+                        if (std.mem.indexOf(u8, decl_fqn, filter) != null) break;
+                    } else continue;
+                }
+                try zcu.test_functions.append(zcu.gpa, nav);
             },
         }
     }
@@ -372,9 +442,14 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !void {
 /// everything they reach. Each runtime function body is passed to
 /// `sink.function(ir)` as soon as it is analyzed, then freed.
 pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
+    // Upstream's analysis roots: std (whose start code imports the root
+    // module) and, under `zap test`, the module under test.
     _ = try zcu.fileRootType(0);
+    if (zcu.moduleRootFile(.std)) |f| _ = try zcu.fileRootType(f);
+    if (zcu.moduleRootFile(zcu.fe.main_module)) |f| _ = try zcu.fileRootType(f);
     var done_exports: usize = 0;
     var done_comptime: usize = 0;
+    var done_tests: usize = 0;
     while (true) {
         if (done_comptime < zcu.comptime_decls.count()) {
             const c = zcu.comptime_decls.keys()[done_comptime];
@@ -392,6 +467,16 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {},
             };
+            continue;
+        }
+        if (done_tests < zcu.test_functions.items.len) {
+            const nav = zcu.test_functions.items[done_tests];
+            done_tests += 1;
+            zcu.ensureNavVal(nav) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            try zcu.queueFunc(zcu.ip.getNav(nav).val);
             continue;
         }
         if (zcu.ready_irs.items.len != 0) {
