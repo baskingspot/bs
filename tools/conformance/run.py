@@ -473,9 +473,9 @@ def upstream_target(zig, cfg, args, workdir):
 # ---------------------------------------------------------------- zap mode
 
 
-def build_zap(workdir):
+def build_zap(workdir, zig):
     prefix = workdir / "zap"
-    argv = ["zig", "build", "-Doptimize=ReleaseSafe", "-p", str(prefix)]
+    argv = [zig, "build", "-Doptimize=ReleaseSafe", "-p", str(prefix)]
     proc = subprocess.run(argv, cwd=REPO, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.exit(f"error: building zap failed:\n{proc.stderr}")
@@ -559,7 +559,7 @@ def main():
     p.add_argument("--upstream", action="store_true", help="compute the upstream baseline with zig instead of running zap")
     p.add_argument("--target", action="append", choices=sorted(TARGETS), help="target to run (repeatable; default: all)")
     p.add_argument("--zap", type=Path, help="zap executable (default: build zap with -Doptimize=ReleaseSafe)")
-    p.add_argument("--zig", default="zig", help="upstream zig 0.17.0 for --upstream (default: zig on PATH)")
+    p.add_argument("--zig", default="zig", help="upstream zig 0.17.0, used for --upstream and to build zap (default: zig on PATH)")
     p.add_argument("--test-runner", type=Path, default=HERE / "test_runner.zig", help="test runner passed to the compiler")
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
@@ -587,7 +587,7 @@ def main():
         if args.upstream:
             compiler = shutil.which(args.zig) or sys.exit(f"error: {args.zig} not found")
         else:
-            compiler = args.zap.resolve() if args.zap else build_zap(args.workdir)
+            compiler = args.zap.resolve() if args.zap else build_zap(args.workdir, args.zig)
     try:
         for name in targets:
             cfg = dict(TARGETS[name], name=name)
