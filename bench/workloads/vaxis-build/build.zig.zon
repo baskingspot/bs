@@ -1,0 +1,11 @@
+.{
+    .name = .vaxis_bench,
+    .version = "0.0.0",
+    .fingerprint = 0x4748f8e37ee5458d,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // The harness places this project next to the pinned libvaxis checkout.
+        .vaxis = .{ .path = "../libvaxis" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

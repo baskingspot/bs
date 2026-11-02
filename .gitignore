@@ -2,3 +2,4 @@
 zig-out/
 /upstream
 .amp/portals/*
+/bench/.work/
