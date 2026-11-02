@@ -147,7 +147,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
 fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     const ip = cg.ip;
     const nav = ip.getNav(ip.indexToKey(cg.ir.func).func.owner_nav);
-    const tree = &cg.emit.zcu.file(nav.file).tree;
+    const tree = try cg.emit.zcu.fe.tree(@fromBackingInt(nav.file));
     const decl = cg.emit.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst);
     try cg.emit.zcu.addError(nav.file, tree.nodeToSpan(decl.src_node), "zap codegen: " ++ fmt, args);
     return error.CodegenFail;

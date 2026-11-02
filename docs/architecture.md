@@ -23,11 +23,44 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
 - Like upstream, lowers every file reachable through `@import` eagerly, so
   syntax errors in unreferenced files are reported the same way upstream
   reports them.
-- Measured cost (2026-11-02, orb, 4 vCPU Xeon 2.6 GHz, zap ReleaseFast):
-  hello world reaches 559 files and takes 0.55 s to parse and lower on one
-  thread. That alone is too slow for Go-class builds, so ZIR is cached on disk
-  per file (keyed by file content hash, with a stat fast path) and lowered in
-  parallel on a miss. Upstream does the same; zap must not be slower here.
+- Files are discovered and lowered from a work queue: lowering a file
+  reveals its imports. File indices are assigned afterwards, breadth-first
+  in import order from the root, so they do not depend on thread timing.
+- ZIR is cached on disk per file, in `<cache>/zap/zir/` of the local cache
+  (the root module) and the global cache (std, shared by every project).
+  The directories are resolved like `zig build-exe`: `--cache-dir`,
+  `ZIG_LOCAL_CACHE_DIR`, or the `.zig-cache` next to the nearest `build.zig`,
+  else the global cache (always for `run`); `--global-cache-dir`,
+  `ZIG_GLOBAL_CACHE_DIR`, or `~/.cache/zig`.
+  - `<32 hex digits>`: one source text's ZIR, named by a 128-bit hash of
+    the source salted with the Zig version. A header and the file's import
+    names and error flag come first, then the ZIR arrays at their natural
+    alignment, so the file is mapped and used in place. Written to an
+    unnamed temporary file and linked into place; never modified.
+  - `index`: sorted fixed-size records (path hash, inode, size, mtime,
+    content hash), read whole at startup and replaced through a temporary
+    file when a build learns new stats. Concurrent builds lose at most
+    each other's new records, which costs a rehash, not correctness.
+    A file modified within 2 s of the build's start is recorded with an
+    mtime that never matches, so a same-tick edit cannot hide behind an
+    unchanged stat.
+- A file is first *probed*: stat it and, if the index matches, read the
+  blob's header with one `pread` and map the rest without touching it. A
+  probe miss reads and hashes the source; a known content hash is mapped,
+  otherwise the file is parsed and lowered into a per-thread arena, written
+  to the cache, and mapped. Only the main thread probes (mapping files from
+  several threads contended on the address-space lock and made a warm build
+  3x slower); helper threads start at the first miss and lower largest file
+  first. Sources and ASTs are not kept: `Frontend.tree`/`source` reload and
+  reparse a file when an error in it is rendered.
+- Measured (2026-11-02, orb: 2 cores / 4 threads Xeon 2.6 GHz, zap
+  ReleaseFast, hello world, 559 files, `ZAP_FRONTEND_TIMING=1`): before the
+  cache, every build spent 0.56–0.66 s here on one thread. Now a cold build
+  (empty caches) takes 0.22–0.25 s, a warm build 5–6 ms, and a build after a
+  one-line edit to `std/debug.zig` about 10 ms. Cold is bounded by the two
+  physical cores (the same build on one CPU takes as long as before); the
+  edited file's lowering is on the critical path of an edit build. std's
+  cached ZIR takes 41 MB.
 
 ### Analysis units
 
@@ -323,7 +356,7 @@ shares nothing across projects and ties the file format to in-memory layout.
 
 ## Parallelism (milestone 6, designed now)
 
-- Frontend: files lower in parallel.
+- Frontend: files lower in parallel (see Frontend above).
 - Sema: container-level units resolve on demand; runtime function bodies are
   queued and analyzed by a pool of workers, each with its own Sema instance and
   arena. A unit's state (unresolved, in progress by worker N, done) is the only

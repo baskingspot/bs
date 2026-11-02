@@ -33,6 +33,9 @@ pub const Options = struct {
     emit_bin: union(enum) { default, path: []const u8, none } = .default,
     target: ?[]const u8 = null,
     zig_lib_dir: ?[]const u8 = null,
+    /// `--cache-dir` and `--global-cache-dir`.
+    cache_dir: ?[]const u8 = null,
+    global_cache_dir: ?[]const u8 = null,
     /// Arguments after `--` for `zap run`.
     run_args: []const []const u8 = &.{},
     /// `zap test` only: the test runner's root source file (`--test-runner`).
@@ -78,9 +81,15 @@ pub fn main(init: std.process.Init) !void {
 
     var fe: Frontend = try .init(init.gpa, init.io, zig_lib_dir, opts.root_src_path);
     defer fe.deinit();
+    try fe.enableCache(Frontend.resolveCacheDirs(arena, init.io, init.environ_map, .{
+        .local = opts.cache_dir,
+        .global = opts.global_cache_dir,
+        .local_is_global = command == .run,
+    }));
     var errors: std.zig.ErrorBundle.Wip = try .init(init.gpa);
     defer errors.deinit();
     const ok = try fe.loadAll(&errors);
+    if (init.environ_map.get("ZAP_FRONTEND_TIMING") != null) fe.printStats();
     var bundle = try errors.toOwnedBundle("");
     defer bundle.deinit(init.gpa);
     if (bundle.errorMessageCount() > 0) {
@@ -160,6 +169,10 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
             opts.target = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = nextArg(args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--cache-dir")) {
+            opts.cache_dir = nextArg(args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--global-cache-dir")) {
+            opts.global_cache_dir = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--test-runner")) {
             opts.test_runner = nextTestArg(command, args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--test-filter")) {

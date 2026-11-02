@@ -154,6 +154,8 @@ pub const Src = struct {
         node: Ast.Node.Offset,
         token: Ast.TokenOffset,
         node_abs: Ast.Node.Index,
+        /// The initializer of the variable declaration `base`, or `base` if it has none.
+        var_init,
     },
 
     fn span(src: Src, tree: *const Ast) Ast.Span {
@@ -161,6 +163,7 @@ pub const Src = struct {
             .node => |off| tree.nodeToSpan(off.toAbsolute(src.base)),
             .node_abs => |n| tree.nodeToSpan(n),
             .token => |off| tree.tokenToSpan(off.toAbsolute(tree.firstToken(src.base))),
+            .var_init => tree.nodeToSpan(if (tree.fullVarDecl(src.base)) |vd| vd.ast.init_node.unwrap() orelse src.base else src.base),
         };
     }
 };
@@ -229,12 +232,7 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     if (decl_ty != .none) try sema.inst_map.put(sema.gpa, nav.zir_inst, .fromInterned(decl_ty));
     var val_ref = try sema.resolveInlineBody(&block, decl.value_body.?, nav.zir_inst);
     if (decl_ty != .none) {
-        const tree = &zcu.file(nav.file).tree;
-        const init_src: Src = if (tree.fullVarDecl(decl.src_node)) |vd|
-            if (vd.ast.init_node.unwrap()) |n| .{ .base = decl.src_node, .loc = .{ .node_abs = n } } else src
-        else
-            src;
-        val_ref = try sema.coerce(&block, decl_ty, val_ref, init_src);
+        val_ref = try sema.coerce(&block, decl_ty, val_ref, .{ .base = decl.src_node, .loc = .var_init });
     }
     const val = try sema.resolveConstValue(&block, src, val_ref, "global variable initializer must be comptime-known");
     nav.val = val;
@@ -393,7 +391,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
 
 pub fn fail(sema: *Sema, block: *const Block, src: Src, comptime fmt: []const u8, args: anytype) CompileError {
     _ = block;
-    const tree = &sema.zcu.file(sema.file).tree;
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     try sema.zcu.addError(sema.file, src.span(tree), fmt, args);
     return error.AnalysisFail;
 }

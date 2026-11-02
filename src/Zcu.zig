@@ -171,7 +171,7 @@ pub fn addError(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []cons
 pub fn renderErrors(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip) !void {
     for (zcu.errors.items) |e| {
         const f = zcu.file(e.file);
-        const loc = std.zig.findLineColumn(f.source, e.span.main);
+        const loc = std.zig.findLineColumn(try zcu.fe.source(@fromBackingInt(e.file)), e.span.main);
         try wip.addRootErrorMessage(.{
             .msg = try wip.addString(e.msg),
             .src_loc = try wip.addSourceLocation(.{
