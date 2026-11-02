@@ -117,8 +117,8 @@ only that function.
 
 ## The on-disk cache (milestone 6, designed now)
 
-Recommended model, pending the user's review: a Go-style content-addressed
-cache at declaration granularity.
+Decided (2026-11-02): a Go-style content-addressed cache at declaration
+granularity.
 
 - **Unit cache key** = hash(zap version, target and options, the unit's ZIR
   bytes made position-independent, the stable hashes of its inputs).
@@ -137,11 +137,9 @@ cache at declaration granularity.
 - InternPool contents are rebuilt lazily on a warm build: only units that
   must be re-analyzed load the types and values they reference.
 
-The alternative is upstream-style: persist the whole InternPool and dependency
-graph as one mmap-able snapshot per project. It loads faster but shares
-nothing across projects and ties the file format to in-memory layout. The
-skeleton's rules (stable hashes, unit keys, recorded dependencies, Atoms
-without indices) keep both options open.
+Rejected alternative: upstream-style persistence of the whole InternPool and
+dependency graph as one mmap-able snapshot per project. It loads faster but
+shares nothing across projects and ties the file format to in-memory layout.
 
 ## Parallelism (milestone 6, designed now)
 
