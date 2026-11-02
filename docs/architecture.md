@@ -280,8 +280,41 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   9 ms of symbol-table probes (cache misses on random keys), about 6 ms of
   stalls loading each atom's scattered targets, relocations, and name, about
   4 ms applying relocations, about 5 ms of symbol-table output, and about
-  5 ms of dedup, layout, and address resolution. Keys resolved to dense
-  indices once in the on-disk cache (milestone 6) could remove the probes.
+  5 ms of dedup, layout, and address resolution.
+- Numbered symbols (`Options.symbols`): the caller, the cache's manifest,
+  numbers every symbol densely and passes per atom its number and the
+  start of its targets' numbers in one u32 array (`NumberedAtom`, 8 bytes,
+  extern so a mapped manifest can be passed as is). The link then hashes
+  nothing: no key gathering, dedup, or probes; a chunked pass writes each
+  atom's address into a table indexed by number (u32 offsets from the base,
+  so 4 bytes per symbol: relocations index it at random), and the copy
+  pass reads targets from it. The atoms must have distinct keys; given the
+  atoms the key-based path keeps, in its order, the output is the same
+  bytes, which bench-link checks. Values (error codes) are numbers too.
+  Runs of target numbers can sit anywhere in the array, so a cache can
+  append the runs of an edit's new atoms and keep the rest. Measured
+  (2026-11-03, same session, best of 15; "packed" lays each atom's
+  targets, relocations, bytes, name, and line program out back to back in
+  link order, as a compacted pack does; "scattered" is the generator's
+  memory, atoms shuffled):
+
+  | random targets | 1 thread, debug / stripped | 4 threads, debug / stripped | link to a file |
+  |---|---|---|---|
+  | memcpy floor | 8.6–8.8 | 3.1–5.0 | |
+  | keys (current path) | 42.9–44.8 / 34.1–35.5 | 15.3–20.0 / 12.5–15.7 | 24.3–26.9 (40.5–42.1 before reuse) |
+  | numbered, scattered | 33.3–33.7 / 23.5–23.7 | 13.3–13.4 / 9.1–9.4 | 18.5–20.3 |
+  | numbered, packed | 22.2–23.2 / 15.2–15.3 | 9.8–10.0 / 6.3 | 14.3–15.4 |
+
+  Mixed targets give the same within noise. In a single-thread stripped
+  numbered packed emit, what remains is about 30% kernel time zeroing and
+  mapping fresh output pages (the floor pays it too), 23% copying atom
+  bytes, 31% the copy loop (relocations, reading the address table, symbol
+  table and string table output, prefetching), 6% layout, and 5% address
+  resolution and setup. Linking to a file adds page cache work per page
+  (page_mkwrite, dirtying, and tearing down the mapping). Against the
+  key-based path, the numbered code costs that path 0.5% more instructions
+  under callgrind (312.1M → 313.7M for three stripped emits), from code
+  layout; wall-clock time does not show it.
 - Debug info (`src/link/Dwarf.zig`, shared with the Mach-O linker later) is
   DWARF 5 with one compile unit for the whole output: .debug_abbrev, a
   .debug_info subprogram entry per function with `debug` (name, low_pc,

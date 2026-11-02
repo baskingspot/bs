@@ -21,6 +21,12 @@
 //! Every function has debug info: one of 500 files, and a line row every
 //! 8..40 bytes. Each emit is also timed without it, to show its cost.
 //! Mach-O does not emit debug info yet.
+//!
+//! ELF is also linked with numbered symbols (`Elf.Options.symbols`), as the
+//! cache's manifest would supply them: from the same scattered atoms, and
+//! from "packed" atoms whose records lie one after another in link order,
+//! as in a compacted pack (targets, relocations, bytes, name). Both must
+//! produce the same bytes as the key-based link.
 
 const std = @import("std");
 const Atom = @import("link/Atom.zig");
@@ -162,6 +168,7 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
             rate(atoms.len, best_parallel),      ms(best_parallel_strip),
             cpus,                                ms(with_write),
         });
+        if (format == .elf) try benchNumbered(gpa, io, arena, atoms, debug, single, out_n, stripped, cpus);
     }
     std.debug.print("(best of {d} runs each)\n", .{runs});
 }
@@ -199,6 +206,104 @@ fn floor(gpa: std.mem.Allocator, io: std.Io, atoms: []const Atom, threads: usize
     const ns = elapsed(io, t);
     gpa.free(out);
     return ns;
+}
+
+/// Times the numbered-symbol link of the atoms the key-based link keeps,
+/// scattered as generated and packed in link order.
+fn benchNumbered(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, all: []const Atom, all_debug: []const Atom.Debug, options: Elf.Options, expected: []const u8, expected_stripped: []const u8, cpus: usize) !void {
+    // Number the kept atoms in link order, as a first build's manifest would.
+    var numbers: std.AutoHashMapUnmanaged(Atom.SymbolKey, u32) = .empty;
+    var kept: std.ArrayList(Atom) = .empty;
+    const new_index = try arena.alloc(u32, all.len);
+    for (all, new_index) |a, *ni| {
+        const gop = try numbers.getOrPut(arena, a.key);
+        if (gop.found_existing) {
+            ni.* = std.math.maxInt(u32);
+            continue;
+        }
+        gop.value_ptr.* = @intCast(kept.items.len);
+        ni.* = @intCast(kept.items.len);
+        try kept.append(arena, a);
+    }
+    var debug: std.ArrayList(Atom.Debug) = .empty;
+    for (all_debug) |d| if (new_index[d.atom] != std.math.maxInt(u32)) {
+        var nd = d;
+        nd.atom = new_index[d.atom];
+        try debug.append(arena, nd);
+    };
+    const atom_numbers = try arena.alloc(Elf.NumberedAtom, kept.items.len);
+    var targets: std.ArrayList(u32) = .empty;
+    for (atom_numbers, kept.items, 0..) |*n, a, i| {
+        n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
+        for (a.targets) |t| try targets.append(arena, numbers.get(t).?);
+    }
+    var single = options;
+    single.symbols = .{ .atoms = atom_numbers, .targets = targets.items, .entry = numbers.get(options.entry).?, .len = @intCast(kept.items.len) };
+    single.debug = debug.items;
+
+    // The same atoms with their records back to back in link order, debug
+    // info last. Source paths stay shared, as if the cache interned them.
+    const packed_atoms = try arena.dupe(Atom, kept.items);
+    const packed_debug = try arena.dupe(Atom.Debug, debug.items);
+    var total: usize = 0;
+    for (packed_atoms) |a| total += 16 + 16 * a.targets.len + 12 * a.relocs.len + a.bytes.len + a.name.len;
+    for (packed_debug) |d| total += d.name.len + d.lines.len;
+    const pack = try arena.alignedAlloc(u8, .@"16", total);
+    var at: usize = 0;
+    var next_debug: usize = 0;
+    for (packed_atoms, 0..) |*a, i| {
+        const record = at;
+        a.targets = put(Atom.SymbolKey, pack, &at, a.targets);
+        a.relocs = put(Atom.Reloc, pack, &at, a.relocs);
+        a.bytes = put(u8, pack, &at, a.bytes);
+        a.name = put(u8, pack, &at, a.name);
+        if (next_debug < packed_debug.len and packed_debug[next_debug].atom == i) {
+            const d = &packed_debug[next_debug];
+            d.name = put(u8, pack, &at, d.name);
+            d.lines = put(u8, pack, &at, d.lines);
+            next_debug += 1;
+        }
+        at = record + std.mem.alignForward(usize, at - record, 16);
+    }
+
+    const variants = [_]struct { []const u8, []const Atom, []const Atom.Debug }{ .{ "scattered", kept.items, debug.items }, .{ "packed", packed_atoms, packed_debug } };
+    for (variants) |v| {
+        const name, const atoms, single.debug = v;
+        var parallel = single;
+        parallel.threads = null;
+        var single_strip = single;
+        single_strip.debug = &.{};
+        var parallel_strip = parallel;
+        parallel_strip.debug = &.{};
+        const out1 = try Elf.emit(gpa, io, atoms, single);
+        defer gpa.free(out1);
+        const out_n = try Elf.emit(gpa, io, atoms, parallel_strip);
+        defer gpa.free(out_n);
+        if (!std.mem.eql(u8, out1, expected) or !std.mem.eql(u8, out_n, expected_stripped)) @panic("numbered symbols changed the output");
+        var best: [4]u64 = @splat(std.math.maxInt(u64));
+        for (0..runs) |_| {
+            for (&best, [_]Elf.Options{ single, parallel, single_strip, parallel_strip }) |*b, o| b.* = @min(b.*, try timeEmit(Elf, gpa, io, atoms, o));
+        }
+        var with_write: u64 = std.math.maxInt(u64);
+        for (0..runs) |_| {
+            const t = std.Io.Timestamp.now(io, .awake);
+            try Elf.link(gpa, io, std.Io.Dir.cwd(), out_path, atoms, parallel);
+            with_write = @min(with_write, elapsed(io, t));
+        }
+        std.debug.print(
+            \\  numbered, {s}: emit {d:.2} ms on 1 thread, {d:.2} ms on {d}; stripped {d:.2} ms, {d:.2} ms; link to a file {d:.2} ms
+            \\
+        , .{ name, ms(best[0]), ms(best[1]), cpus, ms(best[2]), ms(best[3]), ms(with_write) });
+    }
+}
+
+fn put(comptime T: type, pack: []align(16) u8, at: *usize, items: []const T) []const T {
+    at.* = std.mem.alignForward(usize, at.*, @alignOf(T));
+    const bytes = std.mem.sliceAsBytes(items);
+    @memcpy(pack[at.*..][0..bytes.len], bytes);
+    const out: []const T = @ptrCast(@alignCast(pack[at.*..][0..bytes.len]));
+    at.* += bytes.len;
+    return out;
 }
 
 fn timeEmit(comptime L: type, gpa: std.mem.Allocator, io: std.Io, atoms: []const Atom, options: L.Options) !u64 {

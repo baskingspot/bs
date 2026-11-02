@@ -61,9 +61,47 @@ pub const Options = struct {
     /// The directory relative source paths in debug info are relative to
     /// (DW_AT_comp_dir).
     comp_dir: []const u8 = ".",
+    /// The atoms' symbols, already numbered by the caller, so that the link
+    /// looks up no keys. When set, `entry` is used only in diagnostics and
+    /// `values` not at all.
+    symbols: ?Symbols = null,
 };
 
 pub const Value = struct { key: SymbolKey, value: u64 };
+
+/// Symbols numbered densely by the caller, such as the cache's manifest,
+/// which keeps the numbering across builds so that a relink only numbers
+/// the new atoms' targets. With them, a link does no hashing or probing:
+/// every relocation target is an index into one address table.
+///
+/// The atoms must have distinct keys: deduplicating is the numbering's job.
+/// Given the atoms the key-based path keeps, in the same order, the output
+/// is byte-identical to that path's.
+pub const Symbols = struct {
+    /// One per atom.
+    atoms: []const NumberedAtom,
+    /// The numbers of the atoms' targets: `atoms[i].targets[j]` is
+    /// `targets[Symbols.atoms[i].targets + j]`. Atoms can share runs, and
+    /// runs need not be in atom order, so a cache can append new atoms'
+    /// runs and keep the old ones.
+    targets: []const u32,
+    /// Symbols whose value is a link-time integer (see the `value*`
+    /// relocation kinds). An atom with the same number takes precedence.
+    values: []const NumberedValue = &.{},
+    entry: u32,
+    /// Numbers are below this; numbers with no atom or value are
+    /// undefined, which is an error only if a relocation uses one.
+    len: u32,
+};
+
+pub const NumberedAtom = extern struct {
+    /// The atom's own number, distinct from every other atom's.
+    symbol: u32,
+    /// Index in `Symbols.targets` of its first target's number.
+    targets: u32,
+};
+
+pub const NumberedValue = struct { symbol: u32, value: u64 };
 
 pub const Diagnostic = struct {
     /// Atom whose definition or relocation failed.
@@ -83,6 +121,9 @@ pub const Error = Allocator.Error || std.Io.Cancelable || error{
     AlignmentTooLarge,
     /// A debug entry names no text atom, or entries are out of order.
     InvalidDebugInfo,
+    /// `Options.symbols` does not fit the atoms: wrong lengths, or a
+    /// number out of range.
+    InvalidSymbols,
 };
 
 /// Links `atoms` and writes the executable to `sub_path` in `dir`. The
@@ -218,6 +259,12 @@ const Place = packed struct(u64) {
 };
 /// Atoms per unit of work in placement and copying.
 const chunk_len = 2048;
+/// Address-table entries, with numbered symbols: an atom's address minus
+/// the base address, `value_tag` plus the index of a value in
+/// `Symbols.values`, or `unset` for a number with neither. 32 bits keep
+/// the table small, as relocations index it at random.
+const unset = std.math.maxInt(u32);
+const value_tag = 1 << 31;
 /// Section names. Outputs without debug info keep the prefix up to the
 /// names they use.
 const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_line\x00.debug_str\x00";
@@ -234,7 +281,8 @@ fn shName(comptime name: []const u8) u32 {
 /// depend on the thread count:
 ///  1. Deduplicate: the symbol table is partitioned by key, and each
 ///     partition takes its keys in input order, so the first atom with a key
-///     is the one kept.
+///     is the one kept. With `Options.symbols`, there is nothing to do, and
+///     step 2 records addresses by symbol number instead of by key.
 ///  2. Place: each chunk of consecutive atoms lays out its own atoms within
 ///     each section. A short serial step then places the chunks, so atoms
 ///     keep their input order within a section.
@@ -253,11 +301,16 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     // Every partition scans all atoms, so use no more than there are threads.
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
-    var symbols: SymbolTable = try .init(atoms.len, n_partitions);
+    const numbered = options.symbols;
+    if (numbered) |s| if (s.atoms.len != atoms.len or s.entry >= s.len) return error.InvalidSymbols;
+    var symbols: SymbolTable = if (numbered == null) try .init(atoms.len, n_partitions) else .empty;
     defer symbols.deinit();
+    // With numbered symbols, each number's address or value.
+    const addrs = try gpa.alloc(u32, if (numbered) |s| s.len else 0);
+    defer gpa.free(addrs);
     const places = try gpa.alloc(Place, atoms.len);
     defer gpa.free(places);
-    const keys = try gpa.alloc(SymbolKey, atoms.len);
+    const keys = try gpa.alloc(SymbolKey, if (numbered == null) atoms.len else 0);
     defer gpa.free(keys);
     populate(std.mem.sliceAsBytes(places));
     populate(std.mem.sliceAsBytes(keys));
@@ -280,6 +333,9 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         .debug_chunks = debug_chunks,
         .file_of = file_of,
         .n_partitions = n_partitions,
+        .n_resolve_tasks = if (numbered == null) n_partitions else n_chunks,
+        .numbered = numbered,
+        .addrs = addrs,
         .atoms = atoms,
         .places = places,
         .keys = keys,
@@ -289,9 +345,15 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     };
 
     @memset(failures, null);
-    try parallel(io, n_threads, n_chunks, &l, Link.gatherKeys);
-    try parallel(io, n_threads, n_partitions, &l, Link.dedup);
-    try parallel(io, n_threads, n_chunks, &l, Link.layOut);
+    if (numbered == null) {
+        try parallel(io, n_threads, n_chunks, &l, Link.gatherKeys);
+        try parallel(io, n_threads, n_partitions, &l, Link.dedup);
+    }
+    if (numbered == null) {
+        try parallel(io, n_threads, n_chunks, &l, Link.layOutKeyed);
+    } else {
+        try parallel(io, n_threads, n_chunks, &l, Link.layOutNumbered);
+    }
     try l.check(diag);
 
     // Place chunks within sections, and their symbols and names.
@@ -313,14 +375,24 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         strtab_len += c.str_len;
         max_targets = @max(max_targets, c.max_targets);
     }
-    if (symbols.get(options.entry) == null) {
-        diag.* = .{ .target = options.entry };
-        return error.UndefinedSymbol;
-    }
-
-    var values: SymbolTable = try .init(options.values.len, 1);
+    var values: SymbolTable = .empty;
     defer values.deinit();
-    for (options.values) |v| values.getOrPut(v.key).* = .{ .key = v.key, .value = v.value, .used = true };
+    if (numbered) |s| {
+        // Atoms, numbered in `resolveAddrs`, take precedence over values.
+        @memset(addrs, unset);
+        if (s.values.len >= unset - value_tag) return error.InvalidSymbols;
+        for (s.values, 0..) |v, i| {
+            if (v.symbol >= addrs.len) return error.InvalidSymbols;
+            addrs[v.symbol] = @intCast(value_tag + i);
+        }
+    } else {
+        if (symbols.get(options.entry) == null) {
+            diag.* = .{ .target = options.entry };
+            return error.UndefinedSymbol;
+        }
+        values = try .init(options.values.len, 1);
+        for (options.values) |v| values.getOrPut(v.key).* = .{ .key = v.key, .value = v.value, .used = true };
+    }
 
     // Section placement, as file offsets (for .bss, address - base).
     const has_rx = sizes[text] > 0;
@@ -350,10 +422,17 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     if (has_cfi and mem_end > std.math.maxInt(i32)) return error.OutOfMemory;
 
     const base = options.base_address;
+    // Numbered symbols keep addresses as 31-bit offsets from the base.
+    if (numbered != null and mem_end >= value_tag) return error.OutOfMemory;
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
     l.base = base;
-    try parallel(io, n_threads, n_partitions + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
+    try parallel(io, n_threads, l.n_resolve_tasks + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
     try l.check(diag);
+    const entry_addr = if (numbered) |s| l.numberedAddr(addrs[s.entry]) else symbols.get(options.entry).?;
+    if (entry_addr == null) {
+        diag.* = .{ .target = options.entry };
+        return error.UndefinedSymbol;
+    }
 
     // Place the debug chunks, and build the file table from their files in
     // first-use order.
@@ -462,7 +541,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         .type = .EXEC,
         .machine = .X86_64,
         .version = 1,
-        .entry = symbols.get(options.entry).?,
+        .entry = entry_addr.?,
         .phoff = @sizeOf(elf.Elf64.Ehdr),
         .shoff = shoff,
         .flags = .{ .int = 0 },
@@ -595,6 +674,12 @@ const Link = struct {
     /// Index into its chunk's `files` of each debug entry, or `skip`.
     file_of: []u32,
     n_partitions: usize,
+    /// `resolveAddrs` tasks: partitions of `symbols`, or with numbered
+    /// symbols, chunks.
+    n_resolve_tasks: usize,
+    numbered: ?Symbols,
+    /// With numbered symbols, where each is (see `unset`).
+    addrs: []u32,
     atoms: []const Atom,
     places: []Place,
     /// The atoms' keys, packed, so that every partition can scan them.
@@ -644,11 +729,28 @@ const Link = struct {
     }
 
     /// Replaces atom indices with addresses in one partition of `symbols`,
-    /// so that resolving a relocation target is one lookup.
-    fn resolveAddrs(l: *Link, partition: usize, _: usize) void {
-        for (l.symbols.partitionEntries(partition)) |*e| {
-            if (e.used) e.value = l.atomAddr(e.value);
+    /// so that resolving a relocation target is one lookup. With numbered
+    /// symbols, sets the addresses of one chunk's atoms' numbers instead.
+    fn resolveAddrs(l: *Link, task: usize, _: usize) void {
+        const s = l.numbered orelse {
+            for (l.symbols.partitionEntries(task)) |*e| {
+                if (e.used) e.value = l.atomAddr(e.value);
+            }
+            return;
+        };
+        const begin = task * chunk_len;
+        const end = @min(l.atoms.len, begin + chunk_len);
+        for (s.atoms[begin..end], begin..) |n, i| {
+            if (n.symbol >= l.addrs.len) return l.fail(task, i, error.InvalidSymbols, .{ .atom = l.atoms[i].name });
+            l.addrs[n.symbol] = @intCast(l.atomAddr(i) - l.base);
         }
+    }
+
+    /// The address or value an `addrs` entry stands for.
+    fn numberedAddr(l: *const Link, e: u32) ?u64 {
+        if (e < value_tag) return l.base + e;
+        if (e == unset) return null;
+        return l.numbered.?.values[e - value_tag].value;
     }
 
     fn populateOutput(l: *Link, part: usize, _: usize) void {
@@ -678,7 +780,17 @@ const Link = struct {
 
     /// Lays out one chunk's atoms within each section, as if the chunk's
     /// part of every section started at 0.
-    fn layOut(l: *Link, chunk: usize, _: usize) void {
+    fn layOutKeyed(l: *Link, chunk: usize, _: usize) void {
+        l.layOut(chunk, false);
+    }
+
+    fn layOutNumbered(l: *Link, chunk: usize, _: usize) void {
+        l.layOut(chunk, true);
+    }
+
+    /// The key-based and numbered paths are compiled apart, so that each
+    /// is as tight as if it were the only one.
+    fn layOut(l: *Link, chunk: usize, comptime numbered: bool) void {
         const begin = chunk * chunk_len;
         const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
         var c: Chunk = .{
@@ -694,12 +806,14 @@ const Link = struct {
         };
         defer l.chunks[chunk] = c;
         for (atoms, l.places[begin..][0..atoms.len], begin..) |*a, *p, i| {
-            if (i + 16 < l.keys.len) l.symbols.prefetch(l.keys[i + 16]);
-            const kept = l.symbols.get(l.keys[i]).?;
-            if (kept != i) {
-                if (!identical(&l.atoms[kept], a)) l.fail(chunk, i, error.DuplicateSymbol, .{ .atom = a.name, .target = a.key });
-                p.* = .duplicate;
-                continue;
+            if (!numbered) {
+                if (i + 16 < l.keys.len) l.symbols.prefetch(l.keys[i + 16]);
+                const kept = l.symbols.get(l.keys[i]).?;
+                if (kept != i) {
+                    if (!identical(&l.atoms[kept], a)) l.fail(chunk, i, error.DuplicateSymbol, .{ .atom = a.name, .target = a.key });
+                    p.* = .duplicate;
+                    continue;
+                }
             }
             if (a.section == .bss and (a.bytes.len != 0 or a.relocs.len != 0)) {
                 l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
@@ -729,7 +843,7 @@ const Link = struct {
     const skip = std.math.maxInt(u32);
 
     fn resolveAddrsAndLayOutDebug(l: *Link, task: usize, thread: usize) void {
-        if (task < l.n_partitions) l.resolveAddrs(task, thread) else l.layOutDebug(task - l.n_partitions);
+        if (task < l.n_resolve_tasks) l.resolveAddrs(task, thread) else l.layOutDebug(task - l.n_resolve_tasks);
     }
 
     /// Sizes one chunk's debug entries and collects their files. Entries
@@ -797,7 +911,8 @@ const Link = struct {
     };
 
     fn copyAll(l: *Link, task: usize, thread: usize) void {
-        if (task < l.chunks.len) l.copy(task, thread) else l.copyDebug(task - l.chunks.len);
+        if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len);
+        if (l.numbered == null) l.copy(task, thread, false) else l.copyNumbered(task, thread);
     }
 
     /// Writes one chunk's subprogram entries, line sequences, FDEs, and
@@ -838,9 +953,37 @@ const Link = struct {
         }
     }
 
+    /// Sets `res` to the addresses or values of the targets of `a`, atom
+    /// `i`, from `addrs`.
+    fn resolveNumbered(l: *Link, a: *const Atom, i: usize, chunk: usize, res: []u64) bool {
+        const s = l.numbered.?;
+        const first = s.atoms[i].targets;
+        if (first > s.targets.len or s.targets.len - first < a.targets.len) {
+            l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name });
+            return false;
+        }
+        for (s.targets[first..][0..a.targets.len], res, a.targets) |n, *r, t| {
+            if (n >= l.addrs.len) {
+                l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name, .target = t });
+                return false;
+            }
+            const e = l.addrs[n];
+            r.* = if (e < value_tag) l.base + e else l.numberedAddr(e) orelse {
+                l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
+                return false;
+            };
+        }
+        return true;
+    }
+
     /// Copies one chunk's atoms, applies their relocations, and writes
     /// their symbols.
-    fn copy(l: *Link, chunk: usize, thread: usize) void {
+    /// Out of line, so that the key-based `copy` compiles as if alone.
+    noinline fn copyNumbered(l: *Link, chunk: usize, thread: usize) void {
+        l.copy(chunk, thread, true);
+    }
+
+    fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
         const fills: [3]u8 = .{ 0xcc, 0, 0 };
         const c = &l.chunks[chunk];
         const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
@@ -859,11 +1002,13 @@ const Link = struct {
             if (i + 4 < l.atoms.len) {
                 const n = &l.atoms[i + 4];
                 prefetchSlice(u8, n.bytes[0..@min(n.bytes.len, 64)]);
-                prefetchSlice(SymbolKey, n.targets);
+                if (!numbered) prefetchSlice(SymbolKey, n.targets);
                 prefetchSlice(Atom.Reloc, n.relocs);
                 prefetchSlice(u8, n.name);
             }
-            if (i + 2 < l.atoms.len) for (l.atoms[i + 2].targets) |t| l.symbols.prefetch(t);
+            if (i + 2 < l.atoms.len) {
+                if (!numbered) for (l.atoms[i + 2].targets) |t| l.symbols.prefetch(t);
+            }
             if (place.isDuplicate()) continue;
             const addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
             if (place.section != @backingInt(Atom.Section.bss)) {
@@ -872,7 +1017,9 @@ const Link = struct {
                 const dst = l.buf[start..][0..a.bytes.len];
                 @memcpy(dst, a.bytes);
                 const res = resolved[0..a.targets.len];
-                for (a.targets, res) |t, *r| {
+                if (numbered) {
+                    if (!l.resolveNumbered(a, i, chunk, res)) return;
+                } else for (a.targets, res) |t, *r| {
                     r.* = l.symbols.get(t) orelse l.values.get(t) orelse {
                         l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
                         return;
@@ -964,6 +1111,9 @@ pub const SymbolTable = struct {
     slot_mask: usize,
 
     pub const Entry = struct { key: SymbolKey, value: u64, used: bool };
+
+    /// Holds nothing; for links that look up no keys.
+    pub const empty: SymbolTable = .{ .entries = &.{}, .partition_shift = 128, .slot_mask = 0 };
 
     /// Mapped directly, so it starts zeroed (all entries unused) and can ask
     /// for huge pages: lookups are random, and with 4 KiB pages most of them
@@ -1064,7 +1214,7 @@ pub fn identical(a: *const Atom, b: *const Atom) bool {
 
 /// Applies `a`'s relocations to its copy `dst` at address `p_base`, with
 /// `resolved` holding the address or value of each of `a.targets`.
-fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const u64, diag: *Diagnostic) Error!void {
+inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const u64, diag: *Diagnostic) Error!void {
     // One dispatch per relocation: each arm checks its own field width, and
     // another architecture's kind falls through to the error.
     for (a.relocs) |r| {
@@ -1176,6 +1326,27 @@ test "links and runs a program that writes from rodata and exits with 42" {
     defer gpa.free(bytes);
     try std.testing.expectEqual(1, std.mem.count(u8, bytes, msg_text));
 
+    // Numbered symbols give the same bytes for the atoms kept above.
+    const kept = atoms[0..5];
+    const numbering = [_]SymbolKey{ start, msg, write_msg, status, msg_ptr, exit_code };
+    var numbered_atoms: [kept.len]NumberedAtom = undefined;
+    var targets: std.ArrayList(u32) = .empty;
+    defer targets.deinit(gpa);
+    for (kept, &numbered_atoms, 0..) |a, *n, i| {
+        n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
+        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.indexOfScalar(SymbolKey, &numbering, t).?));
+    }
+    var symbols: Symbols = .{ .atoms = &numbered_atoms, .targets = targets.items, .values = &.{.{ .symbol = 5, .value = 42 }}, .entry = 0, .len = 6 };
+    const numbered = try emit(gpa, io, kept, .{ .entry = start, .symbols = symbols });
+    defer gpa.free(numbered);
+    try std.testing.expectEqualSlices(u8, bytes, numbered);
+    var diag: Diagnostic = .{};
+    symbols.values = &.{};
+    try std.testing.expectError(error.UndefinedSymbol, emit(gpa, io, kept, .{ .entry = start, .symbols = symbols, .diag = &diag }));
+    try std.testing.expectEqual(exit_code, diag.target.?);
+    symbols.len = 5;
+    try std.testing.expectError(error.InvalidSymbols, emit(gpa, io, kept, .{ .entry = start, .symbols = symbols }));
+
     // An old output is overwritten in place, every byte of it.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1198,7 +1369,6 @@ test "links and runs a program that writes from rodata and exits with 42" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, result.term);
 
     // The same key with different contents is a conflict, not a duplicate.
-    var diag: Diagnostic = .{};
     const conflicting = [_]Atom{ atoms[0], .{ .key = start, .name = "other", .section = .text, .bytes = "\xc3" } };
     try std.testing.expectError(error.DuplicateSymbol, emit(gpa, io, &conflicting, .{ .entry = start, .diag = &diag }));
     try std.testing.expectEqualStrings("other", diag.atom);
