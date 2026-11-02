@@ -27,6 +27,9 @@ builds. It does not track upstream: it compiles exactly one pinned Zig release
   - analyzing runtime function bodies in parallel;
   - a comptime evaluator that runs compiled bytecode instead of walking ZIR;
   - simple single-pass backends and linkers that write their output once.
+- Don't defer performance. When a measurable win is available, take it,
+  especially in formats and interfaces (Atoms, cache entries, IR) that get
+  harder to change once other code depends on them.
 - Compile-time speed is a feature. Track it with benchmarks against upstream
   `zig` 0.17.0 Debug builds (self-hosted x86_64 backend), and do not land
   regressions without saying so.
