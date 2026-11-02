@@ -86,22 +86,83 @@ pub const Error = Allocator.Error || std.Io.Cancelable || error{
 };
 
 /// Links `atoms` and writes the executable to `sub_path` in `dir`. The
-/// output is built directly in a shared mapping of the new file, so its
-/// bytes are written once, into the page cache.
+/// output is built directly in a shared mapping of the file, so its bytes
+/// are written once, into the page cache. The previous output is
+/// overwritten in place when that is safe (see `ReusedOutput`), which
+/// saves the kernel allocating and zeroing every page again.
 pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, atoms: []const Atom, options: Options) !void {
-    // Replace rather than truncate the old file: ext4 starts writeback of a
-    // truncated and rewritten file on close, and a running old executable
-    // keeps its own inode.
-    dir.deleteFile(io, sub_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| return e,
-    };
-    var out: FileOutput = .{ .file = try dir.createFile(io, sub_path, .{ .read = true, .permissions = .executable_file }) };
-    defer out.file.close(io);
+    var out: ReusedOutput = .{ .dir = dir, .sub_path = sub_path };
+    defer out.close(io);
     errdefer dir.deleteFile(io, sub_path) catch {};
-    defer if (out.map.len > 0) std.posix.munmap(out.map);
     try build(gpa, io, atoms, options, &out);
 }
+
+/// Overwrites the old output in place if it is a regular executable file
+/// with one link, not running (Linux refuses to open a running executable
+/// for writing), and mostly in the page cache, since writing to a page that
+/// is not would first read it from disk. Otherwise replaces it with a new
+/// file, so that a running old executable keeps its own inode. The size
+/// changes with `ftruncate`, never through 0: ext4 starts writeback of a
+/// file truncated to 0 and rewritten when it is closed.
+const ReusedOutput = struct {
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    file: ?std.Io.File = null,
+    map: []align(std.heap.page_size_min) u8 = &.{},
+
+    pub fn buffer(o: *ReusedOutput, io: std.Io, len: usize) ![]u8 {
+        if (builtin.os.tag == .linux) if (o.reuse(io, len)) |map| {
+            o.map = map;
+            return map;
+        };
+        o.dir.deleteFile(io, o.sub_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        o.file = try o.dir.createFile(io, o.sub_path, .{ .read = true, .permissions = .executable_file });
+        try o.file.?.setLength(io, len);
+        o.map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, o.file.?.handle, 0);
+        return o.map;
+    }
+
+    fn reuse(o: *ReusedOutput, io: std.Io, len: usize) ?[]align(std.heap.page_size_min) u8 {
+        const file = o.dir.openFile(io, o.sub_path, .{ .mode = .read_write, .follow_symlinks = false }) catch return null;
+        const st = file.stat(io) catch return closed(io, file);
+        if (st.kind != .file or st.nlink != 1 or @backingInt(st.permissions) & 0o111 == 0) return closed(io, file);
+        file.setLength(io, len) catch return closed(io, file);
+        const map = std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, file.handle, 0) catch return closed(io, file);
+        if (!mostlyCached(map[0..std.mem.alignBackward(usize, @min(len, st.size), std.heap.page_size_min)])) {
+            std.posix.munmap(map);
+            return closed(io, file);
+        }
+        o.file = file;
+        return map;
+    }
+
+    fn closed(io: std.Io, file: std.Io.File) ?[]align(std.heap.page_size_min) u8 {
+        file.close(io);
+        return null;
+    }
+
+    /// Whether at least 7/8 of the pages of `map` are in the page cache.
+    fn mostlyCached(map: []align(std.heap.page_size_min) u8) bool {
+        var vec: [4096]u8 = undefined;
+        var resident: usize = 0;
+        var at: usize = 0;
+        while (at < map.len) {
+            const n = @min(vec.len, (map.len - at) / std.heap.page_size_min);
+            std.posix.mincore(@alignCast(map[at..].ptr), n * std.heap.page_size_min, &vec) catch return false;
+            for (vec[0..n]) |v| resident += v & 1;
+            at += n * std.heap.page_size_min;
+        }
+        return resident * 8 >= map.len / std.heap.page_size_min * 7;
+    }
+
+    fn close(o: *ReusedOutput, io: std.Io) void {
+        if (o.map.len > 0) std.posix.munmap(o.map);
+        if (o.file) |f| f.close(io);
+    }
+};
 
 /// Links `atoms` into the bytes of an executable, owned by the caller.
 pub fn emit(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options) Error![]u8 {
@@ -1115,9 +1176,19 @@ test "links and runs a program that writes from rodata and exits with 42" {
     defer gpa.free(bytes);
     try std.testing.expectEqual(1, std.mem.count(u8, bytes, msg_text));
 
+    // An old output is overwritten in place, every byte of it.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const garbage = try gpa.alloc(u8, bytes.len + 3 * 4096 + 5);
+    defer gpa.free(garbage);
+    @memset(garbage, 0xa5);
+    try tmp.dir.writeFile(io, .{ .sub_path = "hello", .data = garbage, .flags = .{ .permissions = .executable_file } });
+    const old_inode = (try tmp.dir.statFile(io, "hello", .{})).inode;
     try link(gpa, io, tmp.dir, "hello", &atoms, options);
+    try std.testing.expectEqual(old_inode, (try tmp.dir.statFile(io, "hello", .{})).inode);
+    const written = try tmp.dir.readFileAlloc(io, "hello", gpa, .unlimited);
+    defer gpa.free(written);
+    try std.testing.expectEqualSlices(u8, bytes, written);
     const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/hello", .{tmp.sub_path});
     defer gpa.free(path);
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });

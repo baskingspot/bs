@@ -240,12 +240,20 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   ad-hoc code signature. The Mach-O linker (`src/link/MachO.zig`) has the
   same phases as the ELF linker and shares its thread pool, symbol table,
   and output buffers.
-- The ELF linker (`src/link/Elf.zig`) builds the whole file in one buffer
-  (for `link`, a shared mapping of the new file, which replaces any old file
-  instead of truncating it). Segments: R (headers, .rodata, and with debug info
-  .eh_frame and .eh_frame_hdr), RX (.text), RW
-  (.data, .bss). TLS will add .tdata and .tbss at the start of RW with a
-  PT_TLS header.
+- The ELF linker (`src/link/Elf.zig`) builds the whole file in one buffer:
+  for `link`, a shared mapping of the output file. The old output is
+  overwritten in place when it is a regular executable with one link, not
+  running (Linux refuses to open a running executable for writing), and at
+  least 7/8 in the page cache (mincore), resizing with ftruncate but never
+  through 0 (ext4 flushes a file truncated to 0 and rewritten on close);
+  otherwise it is replaced by a new file, so a running old binary keeps its
+  inode. Reuse skips allocating and zeroing every page cache page again:
+  on the orb, writing 38 MiB into a new file takes 31 ms, in place 11–15
+  ms, into fresh anonymous memory 10 ms. Mach-O keeps replacing, since
+  macOS kills signed binaries modified in place. Segments: R (headers,
+  .rodata, and with debug info .eh_frame and .eh_frame_hdr), RX (.text),
+  RW (.data, .bss). TLS will add .tdata and .tbss at the start of RW with
+  a PT_TLS header.
 - Phases, each split into tasks over a thread pool: insert every key into a
   symbol table partitioned by the key's top bits (one thread per partition,
   first occurrence in input order wins); lay out chunks of 2048 atoms
