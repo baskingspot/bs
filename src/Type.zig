@@ -132,20 +132,46 @@ pub fn optionalReprIsPtr(ip: *const InternPool, child: Index) bool {
 
 /// Whether values of this type exist only at compile time.
 pub fn isComptimeOnly(ip: *const InternPool, ty: Index) bool {
+    var hit_cycle = false;
+    return comptimeOnly(ip, ty, &hit_cycle);
+}
+
+/// Sets `hit_cycle` when the answer assumed that a struct already being
+/// examined is not comptime-only; such answers are not cached.
+fn comptimeOnly(ip: *const InternPool, ty: Index, hit_cycle: *bool) bool {
     return switch (class(ip, ty)) {
         .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined, .@"fn", .special => true,
-        .pointer => isComptimeOnly(ip, childType(ip, ty)) and class(ip, childType(ip, ty)) != .@"fn",
-        .array, .vector, .optional => isComptimeOnly(ip, childType(ip, ty)),
-        .error_union => isComptimeOnly(ip, ip.indexToKey(ty).error_union_type.payload_type),
+        .pointer => class(ip, childType(ip, ty)) != .@"fn" and comptimeOnly(ip, childType(ip, ty), hit_cycle),
+        .array, .vector, .optional => comptimeOnly(ip, childType(ip, ty), hit_cycle),
+        .error_union => comptimeOnly(ip, ip.indexToKey(ty).error_union_type.payload_type, hit_cycle),
         .tuple => {
             const t = ip.indexToKey(ty).tuple_type;
-            for (t.types, t.values) |ft, fv| if (fv == .none and isComptimeOnly(ip, ft)) return true;
+            for (t.types, t.values) |ft, fv| if (fv == .none and comptimeOnly(ip, ft, hit_cycle)) return true;
             return false;
         },
         .@"struct" => {
             const info = ip.structInfo(ty);
-            for (info.field_types) |ft| if (isComptimeOnly(ip, ft)) return true;
-            return false;
+            switch (info.comptime_only) {
+                .yes => return true,
+                .no => return false,
+                .computing => {
+                    hit_cycle.* = true;
+                    return false;
+                },
+                .unknown => {},
+            }
+            info.comptime_only = .computing;
+            var inner_cycle = false;
+            const result = for (info.field_types) |ft| {
+                if (comptimeOnly(ip, ft, &inner_cycle)) break true;
+            } else false;
+            const complete = switch (info.status) {
+                .have_field_types, .layout_wip, .have_layout => true,
+                else => false,
+            };
+            info.comptime_only = if (result) .yes else if (inner_cycle or !complete) .unknown else .no;
+            if (inner_cycle) hit_cycle.* = true;
+            return result;
         },
         else => false,
     };

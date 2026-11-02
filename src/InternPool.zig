@@ -255,6 +255,9 @@ pub const StructInfo = struct {
     field_offsets: []const u64 = &.{},
     size: u64 = 0,
     alignment: u64 = 1,
+    /// Cache for `Type.isComptimeOnly`, which recurses through pointers and
+    /// so must stop at self-referential structs.
+    comptime_only: enum { unknown, computing, yes, no } = .unknown,
 
     pub fn fieldIndex(info: *const StructInfo, ip: *const InternPool, name: []const u8) ?u32 {
         for (info.field_names, 0..) |n, i| {

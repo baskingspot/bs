@@ -67,6 +67,8 @@ pub fn build(b: *std.Build) void {
 /// with upstream zig, so every program is checked against the oracle.
 fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step) void {
     const io = b.graph.io;
+    // The headers are read here, while configuring.
+    b.dependOnDirectoryContents(b.path("test/run"));
     var dir = b.root.openDir(io, "test/run", .{ .iterate = true }) catch |err|
         std.debug.panic("unable to open test/run: {t}", .{err});
     defer dir.close(io);
