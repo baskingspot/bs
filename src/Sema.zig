@@ -3347,7 +3347,7 @@ fn coercePtrTo(sema: *Sema, block: *Block, ptr: Ref, ty: Index) CompileError!Ref
             .ptr => |p| {
                 const s = Type.ptrInfo(ip, src_ty);
                 const d = Type.ptrInfo(ip, ty);
-                if (s.flags.size == .one and d.flags.size != .one and ip.indexToKey(s.child) == .array_type) {
+                if (s.flags.size == .one and d.flags.size != .one and ip.indexToKey(s.child) == .array_type and p.base != .int) {
                     // Pointer to an array becomes a pointer to its first element.
                     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .elem = .{ .base = v, .index = 0 } } } }));
                 }
@@ -5448,7 +5448,8 @@ fn elemPtrOfManyPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) 
     const p = Type.ptrInfo(sema.ip, sema.typeOf(ptr));
     const result_ty = try sema.ptrType(.{ .child = p.child, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
     if (sema.resolveValue(ptr)) |pv| if (sema.resolveValue(index)) |iv| {
-        if (sema.ip.indexToKey(pv) == .ptr) return .fromInterned(try sema.ptrElemPtrVal(pv, sema.ip.intValue(u64, iv).?));
+        if (sema.ip.indexToKey(pv) == .ptr and try sema.comptimePtrRoot(pv) != .int)
+            return .fromInterned(try sema.ptrElemPtrVal(pv, sema.ip.intValue(u64, iv).?));
     };
     try sema.requireRuntime(block, src);
     return sema.addTyPlBin(block, .ptr_elem_ptr, result_ty, ptr, index);
@@ -5595,7 +5596,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         base
     else if (base_val != null and sema.isUndef(base_val.?))
         .fromInterned(try sema.undefValue(many_ty))
-    else if (base_val != null and start_val != null)
+    else if (base_val != null and start_val != null and try sema.comptimePtrRoot(base_val.?) != .int)
         try sema.coercePtrToMany(try sema.ptrElemPtrVal(base_val.?, ip.intValue(u64, start_val.?).?), many_ty)
     else
         try sema.addTyPlBin(block, .ptr_add, many_ty, base, start);
