@@ -1,36 +1,66 @@
 #!/usr/bin/env bash
 # Installs the pinned upstream Zig toolchain (used to build zap and as the
 # reference/oracle compiler) and the matching upstream source tree (for
-# test/behavior and reading Sema/InternPool). Idempotent.
+# test/behavior and reading Sema/InternPool). Idempotent. Runs on
+# x86_64-linux (orbs) and aarch64-macos (Mac satellites).
 set -euo pipefail
 
 ZIG_VERSION=0.17.0
-ZIG_BIN_SHA=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
 ZIG_SRC_SHA=b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd
+
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64)
+    ZIG_HOST=x86_64-linux
+    ZIG_BIN_SHA=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+    ;;
+  Darwin-arm64)
+    ZIG_HOST=aarch64-macos
+    ZIG_BIN_SHA=b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+    ;;
+  *)
+    echo "unsupported host: $(uname -s)-$(uname -m)" >&2
+    exit 1
+    ;;
+esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache="$HOME/.cache/zap"
 mkdir -p "$cache" "$HOME/.local/bin"
 
+sha256() { # file
+  if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi
+}
+
 fetch() { # url sha dest_dir
-  local url=$1 sha=$2 dest=$3 tmp
+  local url=$1 sha=$2 dest=$3 tmp got
   if [ -d "$dest" ]; then echo "have $dest"; return; fi
   echo "fetching $url"
   tmp="$(mktemp)"
   curl -fsSL "$url" -o "$tmp"
-  echo "$sha  $tmp" | sha256sum -c --quiet
+  got="$(sha256 "$tmp" | cut -d' ' -f1)"
+  if [ "$got" != "$sha" ]; then
+    echo "sha256 mismatch for $url: got $got, want $sha" >&2
+    rm -f "$tmp"
+    exit 1
+  fi
+  rm -rf "$dest.tmp"
   mkdir -p "$dest.tmp"
   tar -xJf "$tmp" -C "$dest.tmp" --strip-components=1
   mv "$dest.tmp" "$dest"
   rm -f "$tmp"
 }
 
-time fetch "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
-  "$ZIG_BIN_SHA" "$cache/zig-$ZIG_VERSION"
+# The x86_64-linux binary keeps its original directory name, so existing
+# orb snapshots stay valid.
+bin_dir="$cache/zig-$ZIG_VERSION"
+[ "$ZIG_HOST" = x86_64-linux ] || bin_dir="$cache/zig-$ZIG_HOST-$ZIG_VERSION"
+
+time fetch "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_HOST-$ZIG_VERSION.tar.xz" \
+  "$ZIG_BIN_SHA" "$bin_dir"
 time fetch "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_VERSION.tar.xz" \
   "$ZIG_SRC_SHA" "$cache/zig-$ZIG_VERSION-src"
 
-ln -sfn "$cache/zig-$ZIG_VERSION/zig" "$HOME/.local/bin/zig"
+ln -sfn "$bin_dir/zig" "$HOME/.local/bin/zig"
 ln -sfn "$cache/zig-$ZIG_VERSION-src" "$repo_root/upstream"
 
-zig version
+"$HOME/.local/bin/zig" version

@@ -67,6 +67,8 @@ pub fn build(b: *std.Build) void {
 /// with upstream zig, so every program is checked against the oracle.
 fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step) void {
     const io = b.graph.io;
+    const host = b.graph.host.result;
+    const host_runs_zap_output = host.cpu.arch == .x86_64 and host.os.tag == .linux;
     // The headers are read here, while configuring.
     b.dependOnDirectoryContents(b.path("test/run"));
     var dir = b.root.openDir(io, "test/run", .{ .iterate = true }) catch |err|
@@ -127,6 +129,12 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             };
             compile.addFileInput(b.path("test/run/rt.zig"));
             const bin = compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            if (!upstream and !host_runs_zap_output) {
+                // zap emits x86_64-linux executables; elsewhere only check
+                // that they compile.
+                test_step.dependOn(&compile.step);
+                continue;
+            }
             const run = std.Build.Step.Run.create(b, b.fmt("run {s}{s}", .{ name, if (upstream) " (upstream)" else "" }));
             run.addFileArg(bin);
             if (expect.stdout) |out| run.addCheck(.{ .expect_stdout_exact = out });
