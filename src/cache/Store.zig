@@ -149,6 +149,20 @@ const PackFile = struct {
 
 const Forward = struct { key: Key, bytes: []align(16) const u8 };
 
+pub const pack_header_len = @sizeOf(PackHeader);
+
+/// Where an entry's atom records start, relative to the entry.
+pub fn atomsOffset(deps_len: usize) usize {
+    return @sizeOf(Header) + @sizeOf(Dep) * deps_len;
+}
+
+pub const PackName = [32 + pack_ext.len]u8;
+
+/// The file name of pack `i` in `dir`.
+pub fn packName(store: *const Store, i: u32) []const u8 {
+    return &store.packs[i].name;
+}
+
 /// Maps every pack in `<global_cache>/zap/store`.
 pub fn open(gpa: Allocator, io: Io, global_cache: Io.Dir) !Store {
     const dir = try global_cache.createDirPathOpen(io, "zap/store", .{ .open_options = .{ .iterate = true } });
@@ -244,6 +258,9 @@ fn refreshUsed(store: *Store, io: Io) void {
 /// valid until the store is closed.
 pub const Entry = struct {
     bytes: []align(16) const u8,
+    /// Which of the store's packs holds it (`packName`), and where.
+    pack: u32 = 0,
+    offset: u64 = 0,
 
     fn header(e: Entry) *const Header {
         return @ptrCast(e.bytes.ptr);
@@ -313,11 +330,11 @@ pub const Entry = struct {
 /// The newest entry for `key`, or null if there is none or it is damaged.
 /// Thread-safe; makes no system calls.
 pub fn get(store: *Store, gpa: Allocator, io: Io, key: Key) Allocator.Error!?Entry {
-    for (store.packs) |*p| {
+    for (store.packs, 0..) |*p, pack_index| {
         const i = p.find(key) orelse continue;
         const bytes = p.entryBytes(i);
         if (bytes.len < @sizeOf(Header)) return null;
-        const e: Entry = .{ .bytes = bytes };
+        const e: Entry = .{ .bytes = bytes, .pack = @intCast(pack_index), .offset = @as(u64, p.locs[i].offset16) * 16 };
         const h = e.header();
         if (!std.mem.eql(u8, &h.magic, &entry_magic) or
             @sizeOf(Header) + @sizeOf(Dep) * @as(u64, h.deps_len) + h.atoms_bytes + h.payload_len != bytes.len)
@@ -362,7 +379,11 @@ pub const Batch = struct {
         b.index.deinit(gpa);
     }
 
-    pub fn put(b: *Batch, gpa: Allocator, key: Key, contents: Contents) Allocator.Error!void {
+    /// Adds an entry and returns its offset in the batch. In the pack
+    /// `commit` writes, batch `i`'s entries start at `pack_header_len` plus
+    /// the bytes of the batches before it; the entry's atom records start
+    /// `atomsOffset(deps.len)` into it, one after another.
+    pub fn put(b: *Batch, gpa: Allocator, key: Key, contents: Contents) Allocator.Error!usize {
         var atoms_len: usize = 0;
         var cursor: atoms_codec.DebugCursor = .{ .debug = contents.debug };
         for (contents.atoms, 0..) |*a, i| atoms_len += atoms_codec.encodedLen(a, cursor.of(i));
@@ -375,6 +396,7 @@ pub const Batch = struct {
             .result_hash = contents.result_hash,
         };
         const len = @sizeOf(Header) + @sizeOf(Dep) * contents.deps.len + atoms_len + contents.payload.len;
+        const start = b.bytes.items.len;
         const out = try b.reserve(gpa, key, len);
         @memcpy(out[0..@sizeOf(Header)], std.mem.asBytes(&header));
         var off: usize = @sizeOf(Header);
@@ -388,6 +410,7 @@ pub const Batch = struct {
             off += n;
         }
         @memcpy(out[off..], contents.payload);
+        return start;
     }
 
     fn putRaw(b: *Batch, gpa: Allocator, key: Key, bytes: []const u8) Allocator.Error!void {
@@ -415,14 +438,19 @@ pub const Batch = struct {
 /// packs, as one new pack, then merges or trims packs if due. Empties the
 /// batches. Of entries with the same key, the one in the earliest batch is
 /// kept.
-pub fn commit(store: *Store, gpa: Allocator, io: Io, batches: []Batch) !void {
-    try store.write(gpa, io, batches);
+/// Returns the new pack's file name, or null if there was nothing to
+/// write. With `keep`, the pack is written there first and then
+/// hard-linked (or, across file systems, copied) into the store, so that
+/// another build's maintenance cannot delete it before the caller has it.
+pub fn commit(store: *Store, gpa: Allocator, io: Io, batches: []Batch, keep: ?Io.Dir) !?PackName {
+    const name = try store.write(gpa, io, batches, keep);
     store.refreshUsed(io);
     try maintainIfDue(gpa, io, store.dir, store.packs.len + 1);
+    return name;
 }
 
 /// `commit` without the maintenance.
-pub fn write(store: *Store, gpa: Allocator, io: Io, batches: []Batch) !void {
+pub fn write(store: *Store, gpa: Allocator, io: Io, batches: []Batch, keep: ?Io.Dir) !?PackName {
     var forward: Batch = .{};
     defer forward.deinit(gpa);
     for (store.forward.items) |f| try forward.putRaw(gpa, f.key, f.bytes);
@@ -439,14 +467,20 @@ pub fn write(store: *Store, gpa: Allocator, io: Io, batches: []Batch) !void {
         parts[n_parts] = &forward;
         n_parts += 1;
     }
-    if (n_parts == 0) return;
+    if (n_parts == 0) return null;
     const now: i64 = @intCast(store.opened.toNanoseconds());
-    _ = try writePack(gpa, io, store.dir, parts[0..n_parts], now, now);
+    const k = keep orelse return try writePack(gpa, io, store.dir, parts[0..n_parts], now, now);
+    const name = try writePack(gpa, io, k, parts[0..n_parts], now, now);
+    k.hardLink(&name, store.dir, &name, io, .{}) catch |err| switch (err) {
+        error.CrossDevice, error.OperationUnsupported => try k.copyFile(&name, store.dir, &name, io, .{}),
+        else => |e| return e,
+    };
+    return name;
 }
 
 /// Writes the entries of `parts` as a pack, with the index sorted by key
 /// and, of repeated keys, only the first. Returns its name.
-fn writePack(gpa: Allocator, io: Io, dir: Io.Dir, parts: []const *const Batch, created: i64, order: i64) ![32 + pack_ext.len]u8 {
+fn writePack(gpa: Allocator, io: Io, dir: Io.Dir, parts: []const *const Batch, created: i64, order: i64) !PackName {
     var count: usize = 0;
     var entries_len: usize = 0;
     for (parts) |p| {
@@ -681,10 +715,10 @@ test "entries round-trip through packs, are checked, copied forward, merged, and
         try t.expectEqual(null, try store.get(gpa, io, 7));
         var batch: Batch = .{};
         defer batch.deinit(gpa);
-        try batch.put(gpa, 7, .{ .src_hash = 99, .result_hash = 100, .deps = &deps, .atoms = &atoms, .debug = &debug, .payload = "result" });
-        try batch.put(gpa, k2, .{ .src_hash = 1, .result_hash = 2, .payload = "x" });
-        try batch.put(gpa, 8, .{ .src_hash = 3, .result_hash = 4 });
-        try store.commit(gpa, io, (&batch)[0..1]);
+        _ = try batch.put(gpa, 7, .{ .src_hash = 99, .result_hash = 100, .deps = &deps, .atoms = &atoms, .debug = &debug, .payload = "result" });
+        _ = try batch.put(gpa, k2, .{ .src_hash = 1, .result_hash = 2, .payload = "x" });
+        _ = try batch.put(gpa, 8, .{ .src_hash = 3, .result_hash = 4 });
+        _ = try store.commit(gpa, io, (&batch)[0..1], null);
     }
     {
         var store: Store = try .open(gpa, io, tmp.dir);
@@ -725,8 +759,8 @@ test "entries round-trip through packs, are checked, copied forward, merged, and
         _ = try store.get(gpa, io, 7);
         var batch: Batch = .{};
         defer batch.deinit(gpa);
-        try batch.put(gpa, 8, .{ .src_hash = 3, .result_hash = 5 });
-        try store.commit(gpa, io, (&batch)[0..1]);
+        _ = try batch.put(gpa, 8, .{ .src_hash = 3, .result_hash = 5 });
+        _ = try store.commit(gpa, io, (&batch)[0..1], null);
     }
     {
         var store: Store = try .open(gpa, io, tmp.dir);
@@ -745,9 +779,9 @@ test "entries round-trip through packs, are checked, copied forward, merged, and
         defer store.close(gpa, io);
         var batch: Batch = .{};
         defer batch.deinit(gpa);
-        try batch.put(gpa, 8, .{ .src_hash = 3, .result_hash = 6 + i });
-        try batch.put(gpa, 1000 + i, .{ .src_hash = 0, .result_hash = 0 });
-        try store.commit(gpa, io, (&batch)[0..1]);
+        _ = try batch.put(gpa, 8, .{ .src_hash = 3, .result_hash = 6 + i });
+        _ = try batch.put(gpa, 1000 + i, .{ .src_hash = 0, .result_hash = 0 });
+        _ = try store.commit(gpa, io, (&batch)[0..1], null);
     }
     var store_dir = try tmp.dir.openDir(io, "zap/store", .{ .iterate = true });
     defer store_dir.close(io);

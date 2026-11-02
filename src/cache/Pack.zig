@@ -7,6 +7,15 @@
 //! live ones, `compact` rewrites the pack with only the live records, in
 //! link order, under a new id that the next manifest records.
 //!
+//! A pack can also have base packs: global store packs hard-linked into
+//! the compilation's directory (`linkBase`), whose entries hold the Atoms
+//! of the build that wrote them. A first build writes its Atoms once, to
+//! the store, and links the pack it wrote; the link keeps the file alive
+//! when the store merges or trims it. `AtomRef.pack` says which pack a
+//! record is in. Base packs also hold entry headers, dependencies, and
+//! other builds' entries; those count as dead bytes for `shouldCompact`,
+//! and `compact` moves every live record into the pack itself.
+//!
 //! The caller holds the compilation's lock (`cache.lock`).
 //!
 //! File: `Header`, then atom records (`cache.atoms`), each 16-byte aligned.
@@ -31,16 +40,24 @@ map: Io.File.MemoryMap,
 /// Mappings replaced by appends, kept until `close` so atoms decoded from
 /// them stay valid.
 retired: std.ArrayList(Io.File.MemoryMap) = .empty,
+/// Base packs, mapped: pack index `i` is `bases.items[i - 1]`.
+bases: std.ArrayList(Io.File.MemoryMap) = .empty,
 
-/// Where a record is: 8 bytes, since a manifest holds one per Atom.
+/// Where a record is: 12 bytes, since a manifest holds one per Atom.
 pub const AtomRef = extern struct {
     /// Offset in 16-byte units, so a pack can grow to 64 GiB.
     offset16: u32,
     len: u32,
+    /// 0 for the pack itself, else a base pack.
+    pack: u32 = 0,
 
     pub fn init(off: u64, len: u32) AtomRef {
+        return initIn(0, off, len);
+    }
+
+    pub fn initIn(pack: u32, off: u64, len: u32) AtomRef {
         std.debug.assert(off % atoms_codec.alignment == 0);
-        return .{ .offset16 = @intCast(off / atoms_codec.alignment), .len = len };
+        return .{ .offset16 = @intCast(off / atoms_codec.alignment), .len = len, .pack = pack };
     }
 
     pub fn offset(r: AtomRef) u64 {
@@ -91,6 +108,8 @@ pub fn create(io: Io, dir: Io.Dir) !Pack {
 pub fn close(p: *Pack, gpa: Allocator, io: Io) void {
     for (p.retired.items) |*m| m.destroy(io);
     p.retired.deinit(gpa);
+    for (p.bases.items) |*m| m.destroy(io);
+    p.bases.deinit(gpa);
     p.map.destroy(io);
     p.file.close(io);
 }
@@ -121,11 +140,48 @@ pub fn append(p: *Pack, gpa: Allocator, io: Io, atoms: []const Atom, debug: []co
 
 pub const DecodeError = atoms_codec.DecodeError;
 
+/// Hard-links `name` from `from` (the global store's directory) into
+/// `dir`, or copies it if they are on different file systems. Then maps it
+/// as the next base pack and returns its pack index.
+pub fn linkBase(p: *Pack, gpa: Allocator, io: Io, from: Io.Dir, name: []const u8, dir: Io.Dir) !u32 {
+    from.hardLink(name, dir, name, io, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        error.CrossDevice, error.OperationUnsupported => try from.copyFile(name, dir, name, io, .{}),
+        else => |e| return e,
+    };
+    return p.addBase(gpa, io, dir, name);
+}
+
+/// Maps `name` in `dir` as the next base pack and returns its pack index.
+pub fn addBase(p: *Pack, gpa: Allocator, io: Io, dir: Io.Dir, name: []const u8) !u32 {
+    try p.bases.ensureUnusedCapacity(gpa, 1);
+    const map = try cache.mapFile(io, dir, name) orelse return error.FileNotFound;
+    p.bases.appendAssumeCapacity(map);
+    return @intCast(p.bases.items.len);
+}
+
+/// The bytes of every pack, for `shouldCompact`.
+pub fn totalBytes(p: *const Pack) u64 {
+    var n: u64 = p.len - @sizeOf(Header);
+    for (p.bases.items) |m| n += m.memory.len;
+    return n;
+}
+
+fn record(p: *const Pack, ref: AtomRef) DecodeError![]align(16) const u8 {
+    const off = ref.offset();
+    const mem: []align(16) const u8, const start: u64 = if (ref.pack == 0)
+        .{ p.map.memory[0..p.len], @sizeOf(Header) }
+    else if (ref.pack <= p.bases.items.len)
+        .{ p.bases.items[ref.pack - 1].memory, 0 }
+    else
+        return error.CorruptAtom;
+    if (off < start or off + ref.len > mem.len) return error.CorruptAtom;
+    return @alignCast(mem[off..][0..ref.len]);
+}
+
 /// Decodes the record at `ref`. Its slices point into the mapping.
 pub fn decode(p: *const Pack, ref: AtomRef) DecodeError!atoms_codec.Decoded {
-    const off = ref.offset();
-    if (off < @sizeOf(Header) or off + ref.len > p.len) return error.CorruptAtom;
-    const d = try atoms_codec.decode(@alignCast(p.map.memory[off..][0..ref.len]));
+    const d = try atoms_codec.decode(try p.record(ref));
     if (d.len != ref.len) return error.CorruptAtom;
     return d;
 }
@@ -189,10 +245,11 @@ pub fn decodeAll(
     for (chunks[0..n]) |*c| debug.appendSliceAssumeCapacity(c.debug.items);
 }
 
-/// Whether `compact` would at least halve the pack, given the bytes of
-/// the records still referenced.
+/// Whether dead bytes (records no longer referenced, and the base packs'
+/// other contents) outweigh live ones, given the bytes of the records
+/// still referenced.
 pub fn shouldCompact(p: *const Pack, live_bytes: u64) bool {
-    return p.len - @sizeOf(Header) > 2 * live_bytes;
+    return p.totalBytes() > 2 * live_bytes;
 }
 
 pub fn liveBytes(refs: []const AtomRef) u64 {
@@ -202,10 +259,11 @@ pub fn liveBytes(refs: []const AtomRef) u64 {
 }
 
 /// Rewrites the pack with only the records at `refs`, in that order, under
-/// a new id, and updates `refs`. Atoms decoded before stay valid until
-/// `close`. The caller writes a manifest with the new refs and id next; a
-/// manifest left with the old id is ignored, which costs a rebuild from the
-/// global store but never a wrong link.
+/// a new id, moving records out of base packs, and updates `refs`. Atoms
+/// decoded before stay valid until `close`. The caller writes a manifest
+/// with the new refs and id, and no base packs, next, then deletes the
+/// base packs' links; a manifest left with the old id is ignored, which
+/// costs a rebuild from the global store but never a wrong link.
 pub fn compact(p: *Pack, gpa: Allocator, io: Io, dir: Io.Dir, refs: []AtomRef) !void {
     var header: Header = .{ .id = undefined };
     io.random(std.mem.asBytes(&header.id));
@@ -214,19 +272,20 @@ pub fn compact(p: *Pack, gpa: Allocator, io: Io, dir: Io.Dir, refs: []AtomRef) !
     @memcpy(buf[0..@sizeOf(Header)], std.mem.asBytes(&header));
     var off: u64 = @sizeOf(Header);
     for (refs) |*r| {
-        if (r.offset() + r.len > p.len) return error.CorruptAtom;
-        @memcpy(buf[off..][0..r.len], p.map.memory[r.offset()..][0..r.len]);
+        @memcpy(buf[off..][0..r.len], try p.record(r.*));
         r.* = .init(off, r.len);
         off += r.len;
     }
     try cache.writeReplace(io, dir, sub_path, &.{buf});
     const file = try dir.openFile(io, sub_path, .{ .mode = .read_write });
     errdefer file.close(io);
-    try p.retired.ensureUnusedCapacity(gpa, 1);
+    try p.retired.ensureUnusedCapacity(gpa, 1 + p.bases.items.len);
     const map = try cache.mapOpenFile(io, file, buf.len, false);
     p.retired.appendAssumeCapacity(p.map);
+    p.retired.appendSliceAssumeCapacity(p.bases.items);
+    p.bases.clearRetainingCapacity();
     p.file.close(io);
-    p.* = .{ .file = file, .id = header.id, .len = buf.len, .map = map, .retired = p.retired };
+    p.* = .{ .file = file, .id = header.id, .len = buf.len, .map = map, .retired = p.retired, .bases = p.bases };
 }
 
 test "append, reopen, decode, and compact" {
@@ -281,4 +340,43 @@ test "append, reopen, decode, and compact" {
     try atoms_codec.expectEqualDebug(&debug[0], &a.debug.?);
     // Decoded before compaction, still valid.
     try atoms_codec.expectEqualAtoms(atoms[2], decoded[2]);
+}
+
+test "base packs are linked, decoded, and compacted away" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store_dir = try tmp.dir.createDirPathOpen(io, "store", .{});
+    defer store_dir.close(io);
+    const dir = try tmp.dir.createDirPathOpen(io, "c", .{});
+    defer dir.close(io);
+
+    // A store pack: 48 bytes of something else, then a record.
+    const atom: Atom = .{ .key = .fromName("f"), .name = "t:f", .section = .text, .bytes = &.{0xc3} };
+    const debug: Atom.Debug = .{ .file = "t.zig", .name = "f", .base_line = 1, .lines = &.{1}, .frame = .frame_pointer };
+    const len = atoms_codec.encodedLen(&atom, &debug);
+    const bytes = try gpa.alloc(u8, 48 + len);
+    defer gpa.free(bytes);
+    @memset(bytes[0..48], 0x77);
+    atoms_codec.encode(&atom, &debug, bytes[48..]);
+    try store_dir.writeFile(io, .{ .sub_path = "p1.zsp", .data = bytes });
+
+    var p: Pack = try .open(io, dir);
+    defer p.close(gpa, io);
+    try std.testing.expectEqual(1, try p.linkBase(gpa, io, store_dir, "p1.zsp", dir));
+    // The link outlives the store's name.
+    try store_dir.deleteFile(io, "p1.zsp");
+    var refs = [_]AtomRef{.initIn(1, 48, @intCast(len))};
+    const d = try p.decode(refs[0]);
+    try atoms_codec.expectEqualAtoms(atom, d.atom);
+    try atoms_codec.expectEqualDebug(&debug, &d.debug.?);
+    try std.testing.expectError(error.CorruptAtom, p.decode(.initIn(2, 0, 64)));
+
+    // 48 foreign bytes against `len` live ones: not yet worth compacting.
+    try std.testing.expect(!p.shouldCompact(liveBytes(&refs)));
+    try p.compact(gpa, io, dir, &refs);
+    try std.testing.expectEqual(0, refs[0].pack);
+    try std.testing.expectEqual(0, p.bases.items.len);
+    try atoms_codec.expectEqualAtoms(atom, (try p.decode(refs[0])).atom);
 }

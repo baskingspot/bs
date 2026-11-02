@@ -46,6 +46,8 @@ map: Io.File.MemoryMap,
 id: Hash,
 /// The pack whose offsets the atom references hold.
 pack_id: Hash,
+/// The link's entry symbol (an `Atom.SymbolKey`), or 0.
+entry: Hash,
 nodes: []const Node,
 /// Open-addressing table from `Node.key` to node index + 1 (0: empty),
 /// a power of two long, at most half full.
@@ -58,6 +60,9 @@ atom_refs: []const Pack.AtomRef,
 inputs: []const Input,
 /// Error names in code order: the error with code `c` is `c - 1`.
 error_names: []const StrRef,
+/// The file names of the pack's base packs (see `Pack`), in pack index
+/// order from 1.
+bases: []const StrRef,
 strings: []const u8,
 overlay: Overlay,
 
@@ -110,10 +115,10 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN02".*;
+const magic = "ZAPMAN03".*;
 const log_magic = "ZAPMLG01".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
@@ -123,6 +128,7 @@ const Header = extern struct {
     unused: [8]u8 = @splat(0),
     id: Hash,
     pack_id: Hash,
+    entry: Hash,
     sections: [std.enums.values(Section).len]SectionRange,
 };
 
@@ -219,7 +225,7 @@ fn SectionType(comptime s: Section) type {
         .table, .edges, .redges => u32,
         .atom_refs => Pack.AtomRef,
         .inputs => Input,
-        .error_names => StrRef,
+        .error_names, .bases => StrRef,
         .strings => u8,
     };
 }
@@ -237,6 +243,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
     m.map = map;
     m.id = h.id;
     m.pack_id = h.pack_id;
+    m.entry = h.entry;
     m.overlay = .{};
     inline for (comptime std.enums.values(Section)) |s| {
         const T = SectionType(s);
@@ -408,6 +415,10 @@ pub fn allAtomRefs(m: *Manifest, gpa: Allocator) ![]const Pack.AtomRef {
     try refs.appendSlice(gpa, m.atom_refs[base_done..]);
     m.overlay.all_refs = try refs.toOwnedSlice(gpa);
     return m.overlay.all_refs.?;
+}
+
+pub fn basePack(m: *const Manifest, i: usize) []const u8 {
+    return m.string(m.bases[i]);
 }
 
 pub fn string(m: *const Manifest, s: StrRef) []const u8 {
@@ -589,7 +600,9 @@ pub const Builder = struct {
     atom_refs: std.ArrayList(Pack.AtomRef) = .empty,
     inputs: std.ArrayList(Input) = .empty,
     error_names: std.ArrayList(StrRef) = .empty,
+    bases: std.ArrayList(StrRef) = .empty,
     strings: std.ArrayList(u8) = .empty,
+    entry: Hash = 0,
     /// The manifest this one started from: finds its nodes, which keep their
     /// indices. Nodes added since are in `added`.
     base: ?*const Manifest = null,
@@ -602,6 +615,7 @@ pub const Builder = struct {
         b.atom_refs.deinit(gpa);
         b.inputs.deinit(gpa);
         b.error_names.deinit(gpa);
+        b.bases.deinit(gpa);
         b.strings.deinit(gpa);
         b.added.deinit(gpa);
     }
@@ -609,13 +623,14 @@ pub const Builder = struct {
     /// Starts from `base` with its log applied. `base` must stay open while
     /// the builder is used.
     pub fn initFrom(gpa: Allocator, base: *const Manifest) !Builder {
-        var b: Builder = .{ .gpa = gpa, .base = base };
+        var b: Builder = .{ .gpa = gpa, .base = base, .entry = base.entry };
         errdefer b.deinit();
         try b.nodes.appendSlice(gpa, base.nodes);
         try b.edges.appendSlice(gpa, base.edges);
         try b.atom_refs.appendSlice(gpa, base.atom_refs);
         try b.inputs.appendSlice(gpa, base.inputs);
         try b.error_names.appendSlice(gpa, base.error_names);
+        try b.bases.appendSlice(gpa, base.bases);
         try b.strings.appendSlice(gpa, base.strings);
         const o = &base.overlay;
         try b.nodes.resize(gpa, base.nodeCount());
@@ -705,6 +720,12 @@ pub const Builder = struct {
         return @intCast(b.error_names.items.len);
     }
 
+    /// Adds a base pack by file name; returns its pack index.
+    pub fn addBasePack(b: *Builder, name: []const u8) !u32 {
+        try b.bases.append(b.gpa, try b.addString(name));
+        return @intCast(b.bases.items.len);
+    }
+
     fn addString(b: *Builder, s: []const u8) !StrRef {
         const off: u32 = @intCast(b.strings.items.len);
         try b.strings.appendSlice(b.gpa, s);
@@ -774,7 +795,7 @@ pub const Builder = struct {
             table[slot] = @intCast(i + 1);
         }
 
-        var header: Header = .{ .id = undefined, .pack_id = pack_id, .sections = undefined };
+        var header: Header = .{ .id = undefined, .pack_id = pack_id, .entry = b.entry, .sections = undefined };
         io.random(std.mem.asBytes(&header.id));
         const parts: [std.enums.values(Section).len][]const u8 = .{
             @ptrCast(nodes),
@@ -784,6 +805,7 @@ pub const Builder = struct {
             @ptrCast(refs),
             @ptrCast(b.inputs.items),
             @ptrCast(b.error_names.items),
+            @ptrCast(b.bases.items),
             b.strings.items,
         };
         const zeros: [16]u8 = @splat(0);

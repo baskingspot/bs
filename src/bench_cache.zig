@@ -267,12 +267,12 @@ pub fn main(init: std.process.Init) !void {
         runs, @as(f64, @floatFromInt(log_size)) / 1024, ms(open_logged.median(0)), ms(fold_ns),
     });
     print("compaction: {d:.1} -> {d:.1} MiB in {d:.2} ms\n", .{ mib(uncompacted_size), mib(compacted_size), ms(compaction_ns) });
-    try benchStores(gpa, io, arena, rand, work, atoms, debug);
+    try benchStores(gpa, io, arena, rand, work, atoms, debug, keys[0]);
 }
 
 /// The global store: a first build's 30k puts and commit, lookups with 1,
 /// 8, and 64 packs, maintenance, and concurrent builds writing at once.
-fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: std.Random, work: Io.Dir, atoms: []const Atom, debug: []const Atom.Debug) !void {
+fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: std.Random, work: Io.Dir, atoms: []const Atom, debug: []const Atom.Debug, entry: Atom.SymbolKey) !void {
     const print = std.debug.print;
     const n_threads = std.Thread.getCpuCount() catch 1;
     const dep_list = try arena.alloc(Store.Dep, deps_per_unit);
@@ -325,7 +325,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
     {
         const PutBatch = struct {
             fn run(b: *Store.Batch, a: std.mem.Allocator, us: Units, ks: []const Store.Key, first: usize) void {
-                for (ks, first..) |k, u| b.put(a, k, us.contents(u)) catch @panic("put failed");
+                for (ks, first..) |k, u| _ = b.put(a, k, us.contents(u)) catch @panic("put failed");
             }
         };
         const root = try work.createDirPathOpen(io, "packs", .{});
@@ -333,7 +333,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
         var batch: Store.Batch = .{};
         defer batch.deinit(gpa);
         var t = now(io);
-        for (keys[0], 0..) |k, u| try batch.put(gpa, k, units.contents(u));
+        for (keys[0], 0..) |k, u| _ = try batch.put(gpa, k, units.contents(u));
         const t_put_1 = since(io, t);
         batch.clear();
         // One batch per worker, as Sema's workers will have.
@@ -354,12 +354,97 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
         var pack_bytes: usize = 0;
         for (batches) |b| pack_bytes += b.bytes.items.len;
         t = now(io);
-        try store.commit(gpa, io, batches);
+        _ = try store.commit(gpa, io, batches, null);
         const t_commit = since(io, t);
         store.close(gpa, io);
         print("store, packs: first build 30k puts into a batch {d:.0} ms on 1 thread, {d:.0} ms on {d}, then commit ({d:.1} MiB) {d:.0} ms\n", .{
             ms(t_put_1), ms(t_put_n), n_threads, mib(pack_bytes), ms(t_commit),
         });
+
+        // A first build that writes its Atoms once: the store pack is
+        // written into the compilation's directory and hard-linked into the
+        // store (copied when the store is on another file system, as
+        // /dev/shm is here), and the relink reads the Atoms from it.
+        {
+            const PutRec = struct {
+                fn run(b: *Store.Batch, a: std.mem.Allocator, us: Units, ks: []const Store.Key, first: usize, offs: []usize) void {
+                    for (ks, first..) |k, u| offs[u] = b.put(a, k, us.contents(u)) catch @panic("put failed");
+                }
+            };
+            const options: Elf.Options = .{ .entry = entry, .comp_dir = "/bench", .debug = debug };
+            const expected = try Elf.emit(gpa, io, atoms, options);
+            defer gpa.free(expected);
+            const offs = try arena.alloc(usize, n_units);
+            const refs = try arena.alloc(Pack.AtomRef, atoms.len);
+            const decoded = try gpa.alloc(Atom, atoms.len);
+            defer gpa.free(decoded);
+            var decoded_debug: std.ArrayList(Atom.Debug) = .empty;
+            defer decoded_debug.deinit(gpa);
+            const shm_ok = if (Io.Dir.cwd().access(io, "/dev/shm", .{})) true else |_| false;
+            for ([_]bool{ false, true }) |cross| {
+                if (cross and !shm_ok) continue;
+                const store_root = if (cross) shm: {
+                    Io.Dir.cwd().deleteTree(io, "/dev/shm/zap-bench-cache") catch {};
+                    break :shm try Io.Dir.cwd().createDirPathOpen(io, "/dev/shm/zap-bench-cache", .{});
+                } else try work.createDirPathOpen(io, if (cross) "x" else "hl-store", .{});
+                const cdir = try work.createDirPathOpen(io, if (cross) "hl-c-cross" else "hl-c", .{});
+                var st: Store = try .open(gpa, io, store_root);
+                var group: Io.Group = .init;
+                for (batches, 0..) |*b, i| {
+                    const lo = i * n_units / n_threads;
+                    const hi = (i + 1) * n_units / n_threads;
+                    group.async(io, PutRec.run, .{ b, gpa, units, keys[0][lo..hi], lo, offs });
+                }
+                try group.await(io);
+                // Where each batch starts in the pack.
+                const batch_base = try arena.alloc(u64, n_threads);
+                var base_off: u64 = Store.pack_header_len;
+                for (batches, batch_base) |b, *bb| {
+                    bb.* = base_off;
+                    base_off += b.bytes.items.len;
+                }
+                t = now(io);
+                const name = (try st.commit(gpa, io, batches, cdir)).?;
+                const t_keep = since(io, t);
+                st.close(gpa, io);
+                var p: Pack = try .open(io, cdir);
+                defer p.close(gpa, io);
+                const base = try p.addBase(gpa, io, cdir, &name);
+                for (0..n_threads) |i| {
+                    const lo = i * n_units / n_threads;
+                    const hi = (i + 1) * n_units / n_threads;
+                    for (lo..hi) |u| {
+                        const c = units.contents(u);
+                        var off = batch_base[i] + offs[u] + Store.atomsOffset(c.deps.len);
+                        var cursor: cache.atoms.DebugCursor = .{ .debug = c.debug };
+                        const first_atom = u * atoms.len / n_units;
+                        for (c.atoms, 0..) |*a, j| {
+                            const len = cache.atoms.encodedLen(a, cursor.of(j));
+                            refs[first_atom + j] = .initIn(base, off, @intCast(len));
+                            off += len;
+                        }
+                    }
+                }
+                var relink: Stats = .{};
+                for (0..5) |_| {
+                    const t0 = now(io);
+                    decoded_debug.clearRetainingCapacity();
+                    try p.decodeAll(gpa, io, refs, decoded, &decoded_debug);
+                    const t1 = now(io);
+                    var o = options;
+                    o.debug = decoded_debug.items;
+                    const out = try Elf.emit(gpa, io, decoded, o);
+                    const t2 = now(io);
+                    if (!std.mem.eql(u8, out, expected)) @panic("relink from the store pack differs");
+                    gpa.free(out);
+                    relink.add(.{ ns(t0, t1), ns(t1, t2), 0, 0 });
+                }
+                if (cross) Io.Dir.cwd().deleteTree(io, "/dev/shm/zap-bench-cache") catch {};
+                print("  first build writing Atoms once ({s}): commit into the compilation dir and {s} {d:.0} ms; relink from it: decode {d:.2} ms, Elf.emit {d:.2} ms (same output)\n", .{
+                    if (cross) "store on tmpfs" else "same file system", if (cross) "copy to the store" else "hard-link into the store", ms(t_keep), ms(relink.median(0)), ms(relink.median(1)),
+                });
+            }
+        }
 
         // Lookups with the 30k entries spread over k packs.
         for ([_]usize{ 1, 8, 64 }) |k| {
@@ -371,8 +456,8 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                 for (0..k) |i| {
                     const lo = i * n_units / k;
                     const hi = (i + 1) * n_units / k;
-                    for (keys[0][lo..hi], lo..) |key, u| try batch.put(gpa, key, units.contents(u));
-                    try w.write(gpa, io, (&batch)[0..1]);
+                    for (keys[0][lo..hi], lo..) |key, u| _ = try batch.put(gpa, key, units.contents(u));
+                    _ = try w.write(gpa, io, (&batch)[0..1], null);
                 }
             }
             var open_s: Stats = .{};
@@ -427,8 +512,8 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                 defer st.close(a, io_);
                 var b: Store.Batch = .{};
                 defer b.deinit(a);
-                for (ks, 0..) |k, u| b.put(a, k, us.contents(u)) catch @panic("put failed");
-                st.commit(a, io_, (&b)[0..1]) catch @panic("commit failed");
+                for (ks, 0..) |k, u| _ = b.put(a, k, us.contents(u)) catch @panic("put failed");
+                _ = st.commit(a, io_, (&b)[0..1], null) catch @panic("commit failed");
             }
         };
         const croot = try work.createDirPathOpen(io, "packs-concurrent", .{});
