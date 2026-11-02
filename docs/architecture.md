@@ -50,16 +50,22 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
   otherwise the file is parsed and lowered into a per-thread arena, written
   to the cache, and mapped. Only the main thread probes (mapping files from
   several threads contended on the address-space lock and made a warm build
-  3x slower); helper threads start at the first miss and lower largest file
-  first. Sources and ASTs are not kept: `Frontend.tree`/`source` reload and
+  3x slower), breadth-first so a changed file near the root is found early;
+  helper threads start one at a time when a file needs lowering and none is
+  idle, and lower largest file first. While a changed file is lowered, the
+  imports of its previous content (from its old cached summary) are probed
+  as guesses; guessed files it no longer imports are dropped when files are
+  numbered, and a missing file is an error only if it is reachable. Sources and ASTs are not kept: `Frontend.tree`/`source` reload and
   reparse a file when an error in it is rendered.
 - Measured (2026-11-02, orb: 2 cores / 4 threads Xeon 2.6 GHz, zap
   ReleaseFast, hello world, 559 files, `ZAP_FRONTEND_TIMING=1`): before the
   cache, every build spent 0.56–0.66 s here on one thread. Now a cold build
   (empty caches) takes 0.22–0.25 s, a warm build 5–6 ms, and a build after a
-  one-line edit to `std/debug.zig` about 10 ms. Cold is bounded by the two
-  physical cores (the same build on one CPU takes as long as before); the
-  edited file's lowering is on the critical path of an edit build. std's
+  one-line edit to `std/debug.zig` about 7.5 ms (9.7 ms before the guesses,
+  breadth-first probing, and on-demand helpers). Cold is bounded by the two
+  physical cores (the same build on one CPU takes as long as before). In an
+  edit build the edited file's own lowering (about 5 ms for `debug.zig`) is
+  the critical path. std's
   cached ZIR takes 41 MB.
 
 ### Analysis units

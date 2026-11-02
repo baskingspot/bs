@@ -97,6 +97,8 @@ pub const Stats = struct {
     content_hits: u32 = 0,
     /// Parsed and lowered.
     lowered: u32 = 0,
+    /// Loaded as a guessed import of an edited file but not imported by it.
+    guessed: u32 = 0,
     threads: u32 = 0,
     /// Wall time of `enableCache` (opening caches, reading their indexes),
     /// of `loadAll`, and of the part of `loadAll` after the work queue
@@ -331,21 +333,7 @@ const CacheDir = struct {
         const name = std.fmt.bytesToHex(hash, .lower);
         const f = try cd.dir.openFile(io, &name, .{});
         defer f.close(io);
-        try buf.resize(gpa, @max(buf.capacity, 4096));
-        buf.items.len = try f.readPositionalAll(io, buf.items, 0);
-        if (buf.items.len < @sizeOf(BlobHeader)) return error.CorruptCache;
-        const header = std.mem.bytesToValue(BlobHeader, buf.items[0..@sizeOf(BlobHeader)]);
-        if (!std.mem.eql(u8, &header.magic, &blob_magic)) return error.CorruptCache;
-        const layout = BlobLayout.of(header);
-        if (buf.items.len < layout.tags) {
-            const have = buf.items.len;
-            try buf.resize(gpa, layout.tags);
-            if (try f.readPositionalAll(io, buf.items[have..], have) != layout.tags - have) return error.CorruptCache;
-        }
-        const summary: Summary = .{
-            .has_errors = header.flags.has_errors,
-            .names = buf.items[layout.summary..][0..header.summary_len],
-        };
+        const header, const layout, const summary = try readSummary(f, gpa, io, buf);
         const len = try f.length(io);
         if (layout.total != len) return error.CorruptCache;
         var mm: Io.File.MemoryMap = try .create(io, f, .{
@@ -380,6 +368,33 @@ const CacheDir = struct {
         insts.ptrs[@backingInt(std.MultiArrayList(Zir.Inst).Field.tag)] = bytes.ptr + layout.tags;
         insts.ptrs[@backingInt(std.MultiArrayList(Zir.Inst).Field.data)] = bytes.ptr + layout.data;
         return .{ .{ .instructions = insts, .extra = extra, .string_bytes = string_bytes }, mm, summary };
+    }
+
+    /// The summary of the cached ZIR for `hash`, read into `buf`.
+    fn loadSummary(cd: *const CacheDir, gpa: Allocator, io: Io, hash: Hash, buf: *std.ArrayList(u8)) !Summary {
+        const name = std.fmt.bytesToHex(hash, .lower);
+        const f = try cd.dir.openFile(io, &name, .{});
+        defer f.close(io);
+        _, _, const summary = try readSummary(f, gpa, io, buf);
+        return summary;
+    }
+
+    fn readSummary(f: Io.File, gpa: Allocator, io: Io, buf: *std.ArrayList(u8)) !struct { BlobHeader, BlobLayout, Summary } {
+        try buf.resize(gpa, @max(buf.capacity, 4096));
+        buf.items.len = try f.readPositionalAll(io, buf.items, 0);
+        if (buf.items.len < @sizeOf(BlobHeader)) return error.CorruptCache;
+        const header = std.mem.bytesToValue(BlobHeader, buf.items[0..@sizeOf(BlobHeader)]);
+        if (!std.mem.eql(u8, &header.magic, &blob_magic)) return error.CorruptCache;
+        const layout = BlobLayout.of(header);
+        if (buf.items.len < layout.tags) {
+            const have = buf.items.len;
+            try buf.resize(gpa, layout.tags);
+            if (try f.readPositionalAll(io, buf.items[have..], have) != layout.tags - have) return error.CorruptCache;
+        }
+        return .{ header, layout, .{
+            .has_errors = header.flags.has_errors,
+            .names = buf.items[layout.summary..][0..header.summary_len],
+        } };
     }
 
     fn saveZir(cd: *const CacheDir, gpa: Allocator, io: Io, hash: Hash, zir: *const Zir, summary: Summary) !void {
@@ -543,6 +558,10 @@ const Job = struct {
     loaded: bool = false,
     how: enum { stat_hit, content_hit, lowered } = .lowered,
     has_errors: bool = false,
+    /// Why the file could not be read. Only fatal if the file turns out to
+    /// be reachable: speculative imports (see `Outcome`) may name files that
+    /// no longer exist.
+    missing: ?anyerror = null,
     /// From the probe, taken before the source is read: if the file changes
     /// in between, its index entry is stale and the next build rehashes it.
     stat: ?Io.File.Stat = null,
@@ -557,22 +576,26 @@ const Job = struct {
 /// lookup, map cached ZIR), which takes a few syscalls; files whose probe
 /// misses are *lowered* (read, hash, parse, AstGen). The main thread
 /// probes, because mapping files from several threads contends on the
-/// process's address-space lock and made a warm build 3x slower. Helper
-/// threads lower, largest file first: one starts at the first probe miss,
-/// the rest when a file first needs parsing. They probe only while the main
+/// process's address-space lock and made a warm build 3x slower. Probes run
+/// breadth-first, so a changed file near the root is found early. Helper
+/// threads lower, largest file first, and start one at a time when a file
+/// needs lowering and no helper is idle. They probe only while the main
 /// thread is lowering a file itself.
 const Loader = struct {
     fe: *Frontend,
     mutex: Io.Mutex = .init,
     main_cond: Io.Condition = .init,
     helper_cond: Io.Condition = .init,
+    /// A FIFO: `probe.items[probe_head..]` are waiting.
     probe: std.ArrayList(*Job) = .empty,
+    probe_head: usize = 0,
     lower: std.ArrayList(*Job) = .empty,
     /// Jobs taken off a queue and not finished yet.
     active: u32 = 0,
     helpers: u32 = 0,
-    /// Set once a file needs parsing and all helpers have started.
-    all_helpers: std.atomic.Value(bool) = .init(false),
+    /// Helpers waiting for work that no signal has claimed yet.
+    idle_helpers: u32 = 0,
+    max_helpers: u32,
     /// The main thread is lowering a file, so helpers probe in its place.
     main_lowering: bool = false,
     /// Every job by `file_map` key. Owns the keys.
@@ -584,14 +607,14 @@ const Loader = struct {
 
     const Role = enum { main, helper };
 
-    /// Frees the jobs and, unless `loadAll` moved them into the frontend,
-    /// their files and keys.
-    fn deinit(l: *Loader, free_files: bool) void {
+    /// Frees the jobs and the files and keys that `loadAll` did not move
+    /// into the frontend: all of them unless `moved`, else the unreachable ones.
+    fn deinit(l: *Loader, moved: bool) void {
         const gpa = l.fe.gpa;
         var it = l.jobs.iterator();
         while (it.next()) |e| {
             const job = e.value_ptr.*;
-            if (free_files) {
+            if (!moved or job.index == null) {
                 if (job.loaded) freeFile(gpa, l.fe.io, &job.file) else {
                     gpa.free(job.file.sub_path);
                     gpa.free(job.file.display_path);
@@ -641,7 +664,7 @@ const Loader = struct {
         if (fe.cacheFor(fe.module(mod_index)) != null) {
             try l.probe.append(gpa, job);
             l.main_cond.signal(fe.io);
-            if (l.main_lowering) l.helper_cond.signal(fe.io);
+            if (l.main_lowering) _ = l.wakeHelper();
         } else try l.pushLower(job);
         gop.value_ptr.* = job;
         return job;
@@ -649,8 +672,19 @@ const Loader = struct {
 
     fn pushLower(l: *Loader, job: *Job) !void {
         try l.lower.append(l.fe.gpa, job);
-        l.helper_cond.signal(l.fe.io);
         l.main_cond.signal(l.fe.io);
+        if (!l.wakeHelper() and l.helpers < l.max_helpers) {
+            l.group.concurrent(l.fe.io, work, .{ l, .helper }) catch return;
+            l.helpers += 1;
+        }
+    }
+
+    /// Wakes an idle helper, if there is one.
+    fn wakeHelper(l: *Loader) bool {
+        if (l.idle_helpers == 0) return false;
+        l.idle_helpers -= 1;
+        l.helper_cond.signal(l.fe.io);
+        return true;
     }
 
     /// Called with `mutex` held.
@@ -658,7 +692,10 @@ const Loader = struct {
 
     fn take(l: *Loader, role: Role) ?struct { *Job, Step } {
         if (l.failure != null) return null;
-        if (role == .main or l.main_lowering) if (l.probe.pop()) |job| return .{ job, .probe };
+        if ((role == .main or l.main_lowering) and l.probe_head < l.probe.items.len) {
+            l.probe_head += 1;
+            return .{ l.probe.items[l.probe_head - 1], .probe };
+        }
         if (l.lower.items.len == 0) return null;
         var max: usize = 0;
         for (l.lower.items, 0..) |job, i| {
@@ -690,9 +727,6 @@ const Loader = struct {
                 l.finishJob(job, result) catch |err| {
                     if (l.failure == null) l.failure = err;
                 };
-                // One helper takes lowering off the main thread's probing; the
-                // rest start once a file really needs parsing.
-                if (role == .main and l.helpers == 0 and l.lower.items.len > 0) l.spawnHelpers(1);
                 if (l.done()) {
                     l.main_cond.broadcast(io);
                     l.helper_cond.broadcast(io);
@@ -702,19 +736,27 @@ const Loader = struct {
             if (l.done()) return;
             switch (role) {
                 .main => l.main_cond.waitUncancelable(io, &l.mutex),
-                .helper => l.helper_cond.waitUncancelable(io, &l.mutex),
+                .helper => {
+                    l.idle_helpers += 1;
+                    l.helper_cond.waitUncancelable(io, &l.mutex);
+                },
             }
         }
     }
 
     /// Returns the files `job` imports, or null if its probe missed.
-    fn run(l: *Loader, job: *Job, step: Step, arena: *std.heap.ArenaAllocator, buf: *std.ArrayList(u8)) anyerror!?[]Import {
+    fn run(l: *Loader, job: *Job, step: Step, arena: *std.heap.ArenaAllocator, buf: *std.ArrayList(u8)) anyerror!Outcome {
         const summary = switch (step) {
-            .probe => try l.fe.probeFile(job, buf) orelse return null,
+            .probe => switch (try l.fe.probeFile(job, buf)) {
+                .hit => |summary| summary,
+                .miss => return .{ .imports = &.{}, .lower = true },
+                .missing => return .{ .imports = &.{}, .lower = false },
+                .changed => |old| return .{ .imports = try l.fe.collectImports(&job.file, old.names), .lower = true },
+            },
             .lower => try l.fe.lowerFile(l, job, arena, buf),
         };
         job.has_errors = summary.has_errors;
-        return try l.fe.collectImports(&job.file, summary.names);
+        return .{ .imports = try l.fe.collectImports(&job.file, summary.names), .lower = false };
     }
 
     fn size(job: *const Job) u64 {
@@ -722,24 +764,21 @@ const Loader = struct {
     }
 
     fn done(l: *const Loader) bool {
-        return l.active == 0 and (l.failure != null or (l.probe.items.len == 0 and l.lower.items.len == 0));
-    }
-
-    /// Starts helpers until there are `max` of them, or one per CPU besides
-    /// the main thread. Called with `mutex` held.
-    fn spawnHelpers(l: *Loader, max: u32) void {
-        const cpu_count = std.Thread.getCpuCount() catch 1;
-        while (l.helpers < max and l.helpers + 1 < cpu_count) : (l.helpers += 1) {
-            l.group.concurrent(l.fe.io, work, .{ l, .helper }) catch break;
-        }
+        return l.active == 0 and (l.failure != null or (l.probe_head == l.probe.items.len and l.lower.items.len == 0));
     }
 
     /// Queues the files `job` imports, or queues `job` for lowering if its
     /// probe missed. Called with `mutex` held.
-    fn finishJob(l: *Loader, job: *Job, result: anyerror!?[]Import) !void {
+    fn finishJob(l: *Loader, job: *Job, result: anyerror!Outcome) !void {
         const gpa = l.fe.gpa;
-        const imports = try result orelse return l.pushLower(job);
+        const outcome = try result;
+        const imports = outcome.imports;
         defer freeImports(gpa, imports);
+        if (outcome.lower) {
+            try l.pushLower(job);
+            for (imports) |imp| _ = try l.getJob(imp.module, imp.sub_path);
+            return;
+        }
         job.imports = try gpa.alloc(*Job, imports.len);
         for (job.imports, imports) |*dst, imp| {
             dst.* = try l.getJob(imp.module, imp.sub_path);
@@ -748,6 +787,13 @@ const Loader = struct {
 };
 
 const Import = struct { module: Module.Index, sub_path: []const u8 };
+
+/// The result of one step of a job. When `lower` is set the job goes on to
+/// be lowered, and `imports` are a guess: the imports of the file's
+/// previous content, from its cached summary. Queueing them now lets their
+/// probes overlap the lowering of an edited file. Guessed files that the
+/// file does not import after all are dropped when files are numbered.
+const Outcome = struct { imports: []Import, lower: bool };
 
 fn freeImports(gpa: Allocator, imports: []const Import) void {
     for (imports) |imp| gpa.free(imp.sub_path);
@@ -761,9 +807,13 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     const gpa = fe.gpa;
     const io = fe.io;
     const start = Io.Clock.awake.now(io);
-    var l: Loader = .{ .fe = fe, .start_ns = Io.Clock.real.now(io).toNanoseconds() };
-    var keep_files = false;
-    defer l.deinit(!keep_files);
+    var l: Loader = .{
+        .fe = fe,
+        .start_ns = Io.Clock.real.now(io).toNanoseconds(),
+        .max_helpers = @intCast(@max(std.Thread.getCpuCount() catch 1, 1) - 1),
+    };
+    var moved = false;
+    defer l.deinit(moved);
 
     const root_job = try l.getJob(.root, fe.module(.root).root_file);
     l.work(.main);
@@ -772,23 +822,25 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     const finish_start = Io.Clock.awake.now(io);
 
     // Number the files breadth-first in import order, as a serial load would.
+    var stats = fe.stats;
     var order: std.ArrayList(*Job) = try .initCapacity(gpa, l.jobs.count());
     defer order.deinit(gpa);
     root_job.index = @fromBackingInt(0);
     order.appendAssumeCapacity(root_job);
     var i: usize = 0;
     while (i < order.items.len) : (i += 1) {
-        for (order.items[i].imports) |imp| {
+        const job = order.items[i];
+        if (job.missing) |err| fatalFile(job.file.display_path, err);
+        for (job.imports) |imp| {
             if (imp.index != null) continue;
             imp.index = @fromBackingInt(@intCast(order.items.len));
             order.appendAssumeCapacity(imp);
         }
     }
-    assert(order.items.len == l.jobs.count());
+    stats.guessed = @intCast(l.jobs.count() - order.items.len);
 
     try fe.files.ensureTotalCapacityPrecise(gpa, order.items.len);
     try fe.file_map.ensureTotalCapacity(gpa, @intCast(order.items.len));
-    var stats = fe.stats;
     stats.files = @intCast(order.items.len);
     stats.threads = l.helpers + 1;
     for (order.items) |job| {
@@ -800,8 +852,11 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
         }
     }
     var it = l.jobs.iterator();
-    while (it.next()) |e| fe.file_map.putAssumeCapacityNoClobber(e.key_ptr.*, e.value_ptr.*.index.?);
-    keep_files = true;
+    while (it.next()) |e| {
+        const index = e.value_ptr.*.index orelse continue;
+        fe.file_map.putAssumeCapacityNoClobber(e.key_ptr.*, index);
+    }
+    moved = true;
 
     var ok = true;
     for (fe.files.items, order.items, 0..) |*f, job, index| {
@@ -848,22 +903,37 @@ fn pathHash(mod: *const Module, sub_path: []const u8) u64 {
 
 /// Maps a file's ZIR from the cache if the index says the file is unchanged.
 /// Returns null if the file must be lowered.
-fn probeFile(fe: *Frontend, job: *Job, buf: *std.ArrayList(u8)) !?Summary {
+fn probeFile(fe: *Frontend, job: *Job, buf: *std.ArrayList(u8)) !union(enum) {
+    hit: Summary,
+    miss,
+    /// The file could not be stat'ed (`Job.missing`).
+    missing,
+    /// The file changed; this is the summary of its previous content.
+    changed: Summary,
+} {
     const f = &job.file;
     const mod = fe.module(f.module);
     const cd = fe.cacheFor(mod).?;
-    const stat = Io.Dir.cwd().statFile(fe.io, f.display_path, .{}) catch |err| fatalFile(f.display_path, err);
+    const stat = Io.Dir.cwd().statFile(fe.io, f.display_path, .{}) catch |err| {
+        job.missing = err;
+        return .missing;
+    };
     job.stat = stat;
-    const entry = cd.lookup(pathHash(mod, f.sub_path)) orelse return null;
-    if (!entry.matches(stat)) return null;
+    const entry = cd.lookup(pathHash(mod, f.sub_path)) orelse return .miss;
+    if (!entry.matches(stat)) {
+        return .{ .changed = cd.loadSummary(fe.gpa, fe.io, entry.content_hash, buf) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .miss,
+        } };
+    }
     f.zir, f.mapping, const summary = cd.loadZir(fe.gpa, fe.io, entry.content_hash, buf) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
+        else => return .miss,
     };
     f.content_hash = entry.content_hash;
     job.how = .stat_hit;
     job.loaded = true;
-    return summary;
+    return .{ .hit = summary };
 }
 
 /// Loads a file's ZIR by hashing its source and mapping the cached ZIR of
@@ -879,7 +949,10 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
 
     const src = Io.Dir.cwd().readFileAllocOptions(io, f.display_path, arena, .unlimited, .of(u8), 0) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => fatalFile(f.display_path, err),
+        else => {
+            job.missing = err;
+            return .{ .has_errors = false, .names = "" };
+        },
     };
     f.content_hash = hashSource(src);
     if (cache) |cd| {
@@ -903,12 +976,6 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
         }
     }
 
-    if (!l.all_helpers.load(.monotonic)) {
-        l.mutex.lockUncancelable(io);
-        defer l.mutex.unlock(io);
-        if (!l.all_helpers.raw) l.spawnHelpers(std.math.maxInt(u32));
-        l.all_helpers.store(true, .monotonic);
-    }
     const ast = try Ast.parse(arena, src, .{ .mode = .zig });
     const zir = try AstGen.generate(arena, ast);
     const summary: Summary = try .of(arena, &zir);
@@ -975,10 +1042,10 @@ pub fn printStats(fe: *const Frontend) void {
         }
     }.f;
     std.debug.print("frontend: {d:.2} ms (open caches {d:.2}, load {d:.2}, of which finish {d:.2}), " ++
-        "{d} files: {d} stat hits, {d} content hits, {d} lowered; {d} threads\n", .{
+        "{d} files: {d} stat hits, {d} content hits, {d} lowered; {d} unused guesses; {d} threads\n", .{
         ms(s.open_ns + s.load_ns), ms(s.open_ns), ms(s.load_ns),  ms(s.finish_ns),
         s.files,                   s.stat_hits,   s.content_hits, s.lowered,
-        s.threads,
+        s.guessed,                 s.threads,
     });
 }
 
@@ -1001,17 +1068,19 @@ test "loads a file and its imports" {
     try std.testing.expectEqualStrings("a.zig", fe.file(@fromBackingInt(@intCast(1))).sub_path);
 }
 
-test "reuses cached ZIR and reports errors in cached files" {
+test "reuses cached ZIR, drops stale guessed imports, and reports errors in cached files" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const old: Io.File.SetTimestamp = .{ .new = .fromNanoseconds(1_000_000_000 * std.time.ns_per_s) };
     try tmp.dir.writeFile(io, .{ .sub_path = "main.zig", .data = "const a = @import(\"a.zig\");\npub fn main() void { a.f(); }\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub fn f() void {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "const c = @import(\"c.zig\");\npub fn f() void {\n    c.g();\n}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.zig", .data = "pub fn g() void {}\n" });
     // Old enough that the index trusts their stats.
     try tmp.dir.setTimestamps(io, "main.zig", .{ .modify_timestamp = old });
     try tmp.dir.setTimestamps(io, "a.zig", .{ .modify_timestamp = old });
+    try tmp.dir.setTimestamps(io, "c.zig", .{ .modify_timestamp = old });
     const base = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer gpa.free(base);
     const root = try std.fs.path.join(gpa, &.{ base, "main.zig" });
@@ -1049,12 +1118,12 @@ test "reuses cached ZIR and reports errors in cached files" {
     var cold: Run = undefined;
     try cold.init(root, cache);
     defer cold.deinit();
-    try std.testing.expectEqual(2, cold.fe.stats.lowered);
+    try std.testing.expectEqual(3, cold.fe.stats.lowered);
 
     var warm: Run = undefined;
     try warm.init(root, cache);
     defer warm.deinit();
-    try std.testing.expectEqual(2, warm.fe.stats.stat_hits);
+    try std.testing.expectEqual(3, warm.fe.stats.stat_hits);
     for (cold.fe.files.items, warm.fe.files.items) |c, w| {
         try std.testing.expectEqualStrings(c.sub_path, w.sub_path);
         try std.testing.expectEqualSlices(u8, @ptrCast(c.zir.instructions.items(.tag)), @ptrCast(w.zir.instructions.items(.tag)));
@@ -1062,14 +1131,19 @@ test "reuses cached ZIR and reports errors in cached files" {
         try std.testing.expectEqualSlices(u8, c.zir.string_bytes, w.zir.string_bytes);
     }
 
-    // An edit with an AstGen error is lowered and reported; the next build
-    // maps its ZIR and still reports the error.
+    // An edit that drops an import and has an AstGen error is lowered and
+    // reported. The import of its old content is guessed, but the deleted
+    // file is neither loaded nor an error. The next build maps the edited
+    // file's ZIR and still reports the error.
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "pub fn f() void {\n    var x = 1;\n}\n" });
+    try tmp.dir.deleteFile(io, "c.zig");
     var edited: Run = undefined;
     try edited.init(root, cache);
     defer edited.deinit();
     try std.testing.expectEqual(1, edited.fe.stats.stat_hits);
     try std.testing.expectEqual(1, edited.fe.stats.lowered);
+    try std.testing.expectEqual(1, edited.fe.stats.guessed);
+    try std.testing.expectEqual(2, edited.fe.files.items.len);
     const edit_errors = try edited.errorCount();
     try std.testing.expect(edit_errors > 0);
 
@@ -1077,5 +1151,6 @@ test "reuses cached ZIR and reports errors in cached files" {
     try again.init(root, cache);
     defer again.deinit();
     try std.testing.expectEqual(0, again.fe.stats.lowered);
+    try std.testing.expectEqual(0, again.fe.stats.guessed);
     try std.testing.expectEqual(edit_errors, try again.errorCount());
 }
