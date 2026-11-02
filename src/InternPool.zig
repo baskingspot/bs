@@ -39,6 +39,12 @@ error_names: std.ArrayList(String) = .empty,
 error_map: std.AutoHashMapUnmanaged(String, u32) = .empty,
 /// Source of unique ids for comptime allocations.
 next_comptime_alloc: std.atomic.Value(u32) = .init(0),
+/// Stable hashes of the static items, derived from their index alone. Static
+/// keys refer to static items interned after them (the slice types refer to
+/// `.zero_u8`), so content hashes would read hashes that don't exist yet.
+/// The static indices mirror `Zir.Inst.Ref` of the pinned Zig release, so
+/// their numbers are as stable as their contents.
+static_hashes: [static_len]Hash = undefined,
 
 pub const Hash = u128;
 
@@ -649,6 +655,11 @@ pub fn init(gpa: Allocator, io: Io, thread_count: u32) !InternPool {
     assert(empty == .empty);
     try ip.error_names.append(gpa, .empty);
 
+    for (&ip.static_hashes, 0..) |*h, i| {
+        var hasher: Hasher = .init("static");
+        hasher.int(u32, @intCast(i));
+        h.* = hasher.final();
+    }
     for (static_keys, 0..) |key, i| {
         const index = try ip.get(.main, key);
         assert(@backingInt(index) == i);
@@ -1008,7 +1019,9 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
 }
 
 pub fn stableHash(ip: *const InternPool, index: Index) Hash {
+    if (@backingInt(index) < static_len) return ip.static_hashes[@backingInt(index)];
     const u = ip.unwrapIndex(@backingInt(index));
+    assert(u.index < u.local.hashes.len.load(.acquire));
     return u.local.hashes.view()[u.index];
 }
 
