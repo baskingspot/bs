@@ -1408,7 +1408,11 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     } else if (ops[1] == .reg) {
         // AT&T order: source, destination.
         const dst = ops[1].reg;
-        const base = std.mem.trimEnd(u8, mnemonic, "bwlq");
+        // A size suffix, unless it is part of the name (`shl`, `sub`).
+        const known = [_][]const u8{ "mov", "add", "or", "and", "sub", "xor", "cmp", "rol", "ror", "shl", "sal", "shr", "sar", "xchg" };
+        const base = for (known) |k| {
+            if (mnemonic.len == k.len + 1 and std.mem.startsWith(u8, mnemonic, k) and std.mem.indexOfScalar(u8, "bwlq", mnemonic[k.len]) != null) break k;
+        } else mnemonic;
         const suffix_size: ?Size = if (mnemonic.len > base.len) switch (mnemonic[mnemonic.len - 1]) {
             'b' => .byte,
             'w' => .word,
@@ -1427,6 +1431,15 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .{ "add", .add }, .{ "or", .@"or" }, .{ "and", .@"and" }, .{ "sub", .sub }, .{ "xor", .xor }, .{ "cmp", .cmp },
         };
         for (alu_ops) |op| if (eql(u8, base, op[0])) return e.alu(op[1], size, .{ .reg = dst.reg }, src);
+        const shift_ops = [_]struct { []const u8, Encoder.ShiftOp }{
+            .{ "rol", .rol }, .{ "ror", .ror }, .{ "shl", .shl }, .{ "sal", .shl }, .{ "shr", .shr }, .{ "sar", .sar },
+        };
+        for (shift_ops) |op| if (eql(u8, base, op[0])) switch (ops[0]) {
+            .imm => |v| return e.shift(op[1], size, .{ .reg = dst.reg }, @truncate(@as(u64, @bitCast(v)))),
+            .reg => |r| if (r.reg == .rcx) return e.shift(op[1], size, .{ .reg = dst.reg }, null),
+            .sym => {},
+        };
+        if (eql(u8, base, "xchg") and ops[0] == .reg) return e.xchg(size, .{ .reg = dst.reg }, ops[0].reg.reg);
     }
     return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line});
 }

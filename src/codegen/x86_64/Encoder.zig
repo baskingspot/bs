@@ -408,6 +408,12 @@ pub fn bswap(e: *Encoder, size: Size, r: Reg) !void {
     e.bytes(&.{ 0x0f, 0xc8 | @as(u8, r.low()) });
 }
 
+/// Exchanges `a` with register `b`.
+pub fn xchg(e: *Encoder, size: Size, a: Rm, b: Reg) !void {
+    try e.reserve();
+    try e.gprRm(size, 0x86, 0x87, .{ .reg = b }, a, 0);
+}
+
 // ---------------------------------------------------------------- strings
 
 /// `rep movsb`: copies rcx bytes from [rsi] to [rdi], backwards if DF is set.
@@ -857,7 +863,7 @@ test "branches to labels bound before and after them" {
     try std.testing.expectEqual(0, e.refs.relocs.items.len);
 }
 
-test "bit scans, byte swaps, and string ops match GNU as" {
+test "bit scans, byte swaps, exchanges, and string ops match GNU as" {
     const gpa = std.testing.allocator;
     var e: Encoder = .init(gpa);
     defer e.deinit();
@@ -871,7 +877,11 @@ test "bit scans, byte swaps, and string ops match GNU as" {
     try e.bswap(.dword, .rax); // 0f c8
     try e.bswap(.qword, .r11); // 49 0f cb
     try e.bswap(.qword, .rdi); // 48 0f cf
-    const expected = "f3a4" ++ "f3aa" ++ "fd" ++ "fc" ++ "480fbdc1" ++ "450fbc0c24" ++ "66410fbdd2" ++ "0fc8" ++ "490fcb" ++ "480fcf";
+    try e.xchg(.qword, .{ .reg = .rbx }, .rbx); // 48 87 db
+    try e.xchg(.dword, .{ .mem = .at(.rax, 8) }, .r10); // 44 87 50 08
+    try e.xchg(.byte, .{ .reg = .rsi }, .rcx); // 40 86 ce
+    const expected = "f3a4" ++ "f3aa" ++ "fd" ++ "fc" ++ "480fbdc1" ++ "450fbc0c24" ++ "66410fbdd2" ++ "0fc8" ++ "490fcb" ++ "480fcf" ++
+        "4887db" ++ "44875008" ++ "4086ce";
     var buf: [expected.len / 2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
 }
