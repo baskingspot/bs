@@ -1994,9 +1994,26 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.pl_node.src_node);
             const ty = try sema.resolveType(block, src, extra.lhs);
             const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.rhs));
-            if (sema.ip.indexToKey(ty) != .struct_type) return sema.failUnsupported(block, src, "@hasField on this type");
-            try sema.resolveStructFields(block, src, ty);
-            break :blk .fromInterned(boolValue(sema.ip.structInfo(ty).fieldIndex(sema.ip, name) != null));
+            const ip = sema.ip;
+            break :blk .fromInterned(boolValue(switch (ip.indexToKey(ty)) {
+                .struct_type => has: {
+                    try sema.resolveStructFields(block, src, ty);
+                    break :has ip.structInfo(ty).fieldIndex(ip, name) != null;
+                },
+                .union_type, .enum_type => has: {
+                    try sema.resolveLayout(block, src, ty);
+                    break :has ip.structInfo(ty).fieldIndex(ip, name) != null;
+                },
+                .tuple_type => |t| has: {
+                    if (t.names.len != 0) {
+                        for (t.names) |n| if (std.mem.eql(u8, ip.stringSlice(n), name)) break :has true;
+                        break :has false;
+                    }
+                    const i = std.fmt.parseInt(u32, name, 10) catch break :has false;
+                    break :has i < t.types.len;
+                },
+                else => return sema.fail(block, src, "type '{f}' does not support '@hasField'", .{sema.fmtType(ty)}),
+            }));
         },
         else => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(tag)),
     };
@@ -5536,6 +5553,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     var base: Ref = undefined; // a many-pointer to element 0
     var len: Ref = .none;
     var is_const = Type.ptrInfo(ip, ptr_ty).flags.is_const;
+    var ptr_align = Type.ptrInfo(ip, ptr_ty).flags.alignment;
     var elem_ty: Index = undefined;
     switch (ip.indexToKey(child)) {
         .array_type => |a| {
@@ -5546,6 +5564,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         .ptr_type => |cp| {
             const obj = try sema.analyzeLoad(block, src, ptr);
             is_const = cp.flags.is_const;
+            ptr_align = cp.flags.alignment;
             switch (cp.flags.size) {
                 .one => {
                     const a = ip.indexToKey(cp.child).array_type;
@@ -5569,9 +5588,10 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     }
     const start = try sema.coerce(block, .usize_type, sema.resolveInst(start_ref), src);
     var end: Ref = undefined;
+    var slice_len: Ref = .none;
     if (len_ref != .none) {
-        const n = try sema.coerce(block, .usize_type, sema.resolveInst(len_ref), src);
-        end = try sema.analyzeArithmetic(block, src, .add, start, n);
+        slice_len = try sema.coerce(block, .usize_type, sema.resolveInst(len_ref), src);
+        end = try sema.analyzeArithmetic(block, src, .add, start, slice_len);
     } else if (end_ref != .none) {
         end = try sema.coerce(block, .usize_type, sema.resolveInst(end_ref), src);
     } else {
@@ -5590,6 +5610,14 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         try sema.addSafetyCheck(block, ok, .start_greater_than_end, start, end);
     }
 
+    // The result keeps an explicit alignment as far as the start allows.
+    const result_align: u6 = if (ptr_align == 0) 0 else a: {
+        const sv = if (start_val) |v| ip.intValue(u64, v).? else break :a 0;
+        const off = sv * Type.abiSize(ip, elem_ty);
+        const bytes: u64 = @as(u64, 1) << @intCast(ptr_align - 1);
+        const al = if (off == 0) bytes else @min(bytes, @as(u64, 1) << @intCast(@ctz(off)));
+        break :a if (sema.naturalAlignment(elem_ty) == al) 0 else @intCast(std.math.log2_int(u64, al) + 1);
+    };
     const many_ty = sema.typeOf(base);
     const base_val = sema.resolveValue(base);
     const new_ptr: Ref = if (start_val != null and ip.intValue(u64, start_val.?).? == 0)
@@ -5601,11 +5629,17 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     else
         try sema.addTyPlBin(block, .ptr_add, many_ty, base, start);
 
-    if (sema.resolveValue(start)) |sv| if (sema.resolveValue(end)) |ev| {
-        // Comptime-known bounds give a pointer to an array.
-        const n = ip.intValue(u64, ev).? - ip.intValue(u64, sv).?;
+    // A comptime-known length (`x[a..][0..4]`, or both bounds) gives a
+    // pointer to an array.
+    const known_len: ?u64 = if (slice_len != .none)
+        (if (sema.resolveValue(slice_len)) |v| ip.intValue(u64, v).? else null)
+    else if (start_val != null and end_val != null)
+        ip.intValue(u64, end_val.?).? - ip.intValue(u64, start_val.?).?
+    else
+        null;
+    if (known_len) |n| {
         const array_ty = try sema.intern(.{ .array_type = .{ .len = n, .child = elem_ty } });
-        const result_ty = try sema.ptrType(.{ .child = array_ty, .flags = .{ .is_const = is_const } });
+        const result_ty = try sema.ptrType(.{ .child = array_ty, .flags = .{ .is_const = is_const, .alignment = result_align } });
         if (sema.resolveValue(new_ptr)) |pv| {
             if (sema.isUndef(pv)) return .fromInterned(try sema.undefValue(result_ty));
             const k = ip.indexToKey(pv).ptr;
@@ -5620,8 +5654,8 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             }
         }
         return sema.addTyOp(block, .bitcast, result_ty, new_ptr);
-    };
-    const slice_ty = try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .slice, .is_const = is_const } });
+    }
+    const slice_ty = try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .slice, .is_const = is_const, .alignment = result_align } });
     const new_len = try sema.analyzeArithmetic(block, src, .subwrap, end, start);
     return sema.makeSlice(block, slice_ty, new_ptr, new_len);
 }
@@ -6527,7 +6561,7 @@ fn bitCastBits(sema: *Sema, ty: Index) ?u64 {
             if (eb != Type.abiSize(ip, a.child) * 8) break :blk null;
             break :blk eb * a.len;
         },
-        else => if (Type.class(ip, ty) == .float) Type.floatBits(ip, ty) else null,
+        else => if (Type.class(ip, ty) == .float) Type.floatBits(ip, ty) else if (ty == .bool_type) 1 else null,
     };
 }
 
@@ -6544,6 +6578,7 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) !void {
             return;
         },
         .float => try part.set(ip.indexToKey(v).float.bits()),
+        .bool => try part.set(@intFromBool(v == .bool_true)),
         else => {
             if (sema.isUndef(v)) return; // An undefined element: zeros.
             part = try sema.bigValue(v);
@@ -6572,6 +6607,7 @@ fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) 
             try part.truncate(&part, .unsigned, Type.floatBits(ip, ty));
             return sema.floatFromBits(ty, part.toConst().toInt(u128) catch unreachable);
         },
+        .bool => return boolValue(part.toConst().limbs[0] & 1 != 0),
         else => {
             const info = Type.intInfo(ip, ty);
             try part.truncate(&part, info.signedness, info.bits);
@@ -6610,8 +6646,47 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
     const d = Type.ptrInfo(sema.ip, dest_ty);
     const s = Type.ptrInfo(sema.ip, src_ty);
     if (s.flags.is_const and !d.flags.is_const and !flags.const_cast) return sema.fail(block, src, "@ptrCast discards const qualifier", .{});
-    if ((d.flags.size == .slice) != (s.flags.size == .slice)) return sema.failUnsupported(block, src, "pointer casts between slices and other pointers");
-    if (d.flags.size == .slice and Type.abiSize(sema.ip, d.child) != Type.abiSize(sema.ip, s.child)) return sema.failUnsupported(block, src, "slice casts that change the element size");
+    const ip = sema.ip;
+    if (s.flags.size == .slice and d.flags.size != .slice) {
+        // The slice's pointer.
+        const raw = try sema.slicePtr(block, operand);
+        return sema.coercePtrTo(block, raw, dest_ty);
+    }
+    if (d.flags.size == .slice and s.flags.size != .slice) {
+        // Only `*[N]T` provides a length.
+        if (s.flags.size != .one or ip.indexToKey(s.child) != .array_type) return sema.fail(block, src, "cannot infer length of slice from '{f}'", .{sema.fmtType(src_ty)});
+        const a = ip.indexToKey(s.child).array_type;
+        try sema.resolveLayout(block, src, d.child);
+        const bytes = a.len * Type.abiSize(ip, a.child);
+        const dsize = Type.abiSize(ip, d.child);
+        if (dsize == 0 or bytes % dsize != 0) return sema.fail(block, src, "type '{f}' does not divide exactly into destination elements", .{sema.fmtType(s.child)});
+        const many = try sema.coercePtrTo(block, operand, try sema.elemValueType(dest_ty));
+        return sema.makeSlice(block, dest_ty, many, .fromInterned(try sema.intValue(.usize_type, bytes / dsize)));
+    }
+    if (d.flags.size == .slice) {
+        try sema.resolveLayout(block, src, d.child);
+        try sema.resolveLayout(block, src, s.child);
+        const ssize = Type.abiSize(ip, s.child);
+        const dsize = Type.abiSize(ip, d.child);
+        if (ssize == dsize) return sema.coercePtrTo(block, operand, dest_ty);
+        if (dsize == 0) return sema.failUnsupported(block, src, "slice casts to zero-bit elements");
+        // The length scales by the element sizes.
+        const many = try sema.coercePtrTo(block, try sema.slicePtr(block, operand), try sema.elemValueType(dest_ty));
+        const len = try sema.sliceLen(block, operand);
+        if (sema.resolveValue(len)) |lv| {
+            const bytes = ip.intValue(u64, lv).? * ssize;
+            if (bytes % dsize != 0) return sema.fail(block, src, "slice length does not divide exactly into destination elements", .{});
+            return sema.makeSlice(block, dest_ty, many, .fromInterned(try sema.intValue(.usize_type, bytes / dsize)));
+        }
+        try sema.requireRuntime(block, src);
+        const bytes = try sema.addBinOp(block, .mul_wrap, len, .fromInterned(try sema.intValue(.usize_type, ssize)));
+        const new_len = try sema.addBinOp(block, .div_trunc, bytes, .fromInterned(try sema.intValue(.usize_type, dsize)));
+        if (block.want_safety and ssize % dsize != 0) {
+            const rem = try sema.addBinOp(block, .rem, bytes, .fromInterned(try sema.intValue(.usize_type, dsize)));
+            try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_eq, rem, .fromInterned(.zero_usize)), .exact_division_remainder, .none, .none);
+        }
+        return sema.makeSlice(block, dest_ty, many, new_len);
+    }
     return sema.coercePtrTo(block, operand, dest_ty);
 }
 
