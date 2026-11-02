@@ -375,8 +375,15 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   `comptime` export blocks are not analyzed; zap maps helper symbol names to
   their declarations (upstream names the function after its symbol, e.g.
   `pub fn __udivti3` in `compiler_rt/udivmod.zig`).
-- Mechanism: the Frontend loads `lib/compiler_rt.zig` and its imports as the
-  `compiler_rt` module (ZIR from the global cache). CodeGen calls a helper
+- Mechanism: `compiler_rt` is a module rooted at `lib/compiler_rt.zig`
+  (ZIR in the global cache), but `loadAll` does not load it: when
+  `Zcu.analyzeAll` resolves a request, `Frontend.loadFile` loads the
+  helper's file and the files it reaches that are not loaded yet, with the
+  same work queue, and numbers them after the loaded ones. A program that
+  calls no helper loads none of compiler_rt (a std-free hello: 2 files
+  instead of 701; 0.6 ms cold instead of 180–190 ms, 0.3–0.5 ms warm
+  instead of 5.6–5.8 ms). AstGen errors in files loaded this way are
+  reported with Sema's (`Frontend.late_errors`). CodeGen calls a helper
   through `Zcu.requestCompilerRt(file, name)`, which returns the stable key
   of the helper's function unit, `compiler_rt:compiler_rt/<file>:<name>`;
   that key is also the call's symbol. `Zcu.analyzeAll` resolves each new

@@ -22,7 +22,7 @@ const Zcu = @This();
 
 gpa: Allocator,
 io: Io,
-fe: *const Frontend,
+fe: *Frontend,
 ip: InternPool,
 /// Root struct type of each file, `.none` until imported.
 file_root_types: std.ArrayList(InternPool.Index) = .empty,
@@ -124,7 +124,7 @@ pub const ErrorMsg = struct {
     msg: []const u8,
 };
 
-pub fn init(gpa: Allocator, io: Io, fe: *const Frontend) !Zcu {
+pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
     var zcu: Zcu = .{
         .gpa = gpa,
         .io = io,
@@ -201,6 +201,7 @@ pub fn addError(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []cons
 }
 
 pub fn renderErrors(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip) !void {
+    for (zcu.fe.late_errors.items) |b| try wip.addBundleAsRoots(b);
     for (zcu.errors.items) |e| {
         const f = zcu.file(e.file);
         const loc = std.zig.findLineColumn(try zcu.fe.source(@fromBackingInt(e.file)), e.span.main);
@@ -461,10 +462,12 @@ fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
     const rest = key["compiler_rt:".len..];
     const colon = std.mem.lastIndexOfScalar(u8, rest, ':').?;
     const name = rest[colon + 1 ..];
-    var buf: [128]u8 = undefined;
-    const file_key = std.fmt.bufPrint(&buf, "{d}:{s}", .{ @backingInt(Frontend.Module.Index.compiler_rt), rest[0..colon] }) catch unreachable;
-    const file_index = zcu.fe.file_map.get(file_key) orelse
-        return zcu.addError(0, no_span, "compiler_rt file '{s}' is not loaded", .{rest[0..colon]});
+    // compiler_rt's files load on demand, like its analysis.
+    const file_index = zcu.fe.loadFile(.compiler_rt, rest[0..colon]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return zcu.addError(0, no_span, "unable to load compiler_rt file '{s}': {t}", .{ rest[0..colon], err }),
+    } orelse return zcu.addError(0, no_span, "compiler_rt file '{s}' not found", .{rest[0..colon]});
+    try zcu.file_root_types.appendNTimes(zcu.gpa, .none, zcu.fe.files.items.len - zcu.file_root_types.items.len);
     const ty = try zcu.fileRootType(@backingInt(file_index));
     const ns = zcu.ip.structInfo(ty).namespace;
     const nav = zcu.namespaces.items[ns].decls.get(try zcu.ip.getString(tid, name)) orelse

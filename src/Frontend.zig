@@ -40,8 +40,11 @@ file_map: std.StringHashMapUnmanaged(File.Index) = .empty,
 modules: std.ArrayList(Module) = .empty,
 /// The module whose tests `zap test` runs; `root` outside of tests.
 main_module: Module.Index = .root,
-/// What the last `loadAll` did, for `ZAP_FRONTEND_TIMING`.
+/// What `loadAll` and `loadFile` did, for `ZAP_FRONTEND_TIMING`.
 stats: Stats = .{},
+/// AstGen errors in files `loadFile` loaded, for the caller to report
+/// with its own.
+late_errors: std.ArrayList(std.zig.ErrorBundle) = .empty,
 
 pub const Module = struct {
     /// Name used in `@import("name")`.
@@ -175,6 +178,8 @@ pub fn deinit(fe: *Frontend) void {
     }
     fe.modules.deinit(gpa);
     for (&fe.caches) |*c| if (c.*) |*cd| cd.deinit(gpa, fe.io);
+    for (fe.late_errors.items) |*b| b.deinit(gpa);
+    fe.late_errors.deinit(gpa);
 }
 
 fn freeFile(gpa: Allocator, io: Io, f: *File) void {
@@ -604,6 +609,9 @@ const Job = struct {
     /// New stat index entry for the file's cache directory.
     index_update: ?IndexEntry = null,
     index: ?File.Index = null,
+    /// Loaded by an earlier `loadAll` or `loadFile`: `index` is set and
+    /// `file` is not used.
+    existing: bool = false,
 };
 
 /// The work queue of `loadAll`. A new file is first *probed* (stat, index
@@ -648,7 +656,9 @@ const Loader = struct {
         var it = l.jobs.iterator();
         while (it.next()) |e| {
             const job = e.value_ptr.*;
-            if (!moved or job.index == null) {
+            if (job.existing) {
+                gpa.free(e.key_ptr.*);
+            } else if (!moved or job.index == null) {
                 if (job.loaded) freeFile(gpa, l.fe.io, &job.file) else {
                     gpa.free(job.file.sub_path);
                     gpa.free(job.file.display_path);
@@ -683,6 +693,11 @@ const Loader = struct {
         }
         const job = try gpa.create(Job);
         errdefer gpa.destroy(job);
+        if (fe.file_map.get(key)) |index| {
+            job.* = .{ .file = undefined, .index = index, .existing = true };
+            gop.value_ptr.* = job;
+            return job;
+        }
         const owned_sub_path = try gpa.dupe(u8, sub_path);
         errdefer gpa.free(owned_sub_path);
         job.* = .{ .file = .{
@@ -838,6 +853,54 @@ fn freeImports(gpa: Allocator, imports: []const Import) void {
 /// through `@import`. Returns false and adds messages to `errors` if any file
 /// failed to lower. Call once.
 pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
+    var roots: [3]Root = undefined;
+    var n: usize = 0;
+    roots[n] = .{ .module = .root, .sub_path = fe.module(.root).root_file };
+    n += 1;
+    // `zap test` also analyzes the module under test and std.
+    if (fe.main_module != .root) {
+        roots[n] = .{ .module = fe.main_module, .sub_path = fe.module(fe.main_module).root_file };
+        roots[n + 1] = .{ .module = .std, .sub_path = fe.module(.std).root_file };
+        n += 2;
+    }
+    var indices: [3]?File.Index = undefined;
+    return fe.load(roots[0..n], indices[0..n], errors);
+}
+
+/// Loads `sub_path` of module `mod` and the files it reaches that are not
+/// loaded yet, after `loadAll`, for code analyzed on demand (compiler_rt).
+/// Returns its index, or null if it does not exist. If a newly loaded file
+/// has AstGen errors, their messages go to `late_errors` and this returns
+/// `error.AstGenFailed`. Grows `files`, so pointers to `File`s and their ZIR
+/// are invalid afterwards.
+pub fn loadFile(fe: *Frontend, mod: Module.Index, sub_path: []const u8) !?File.Index {
+    var buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{d}:{s}", .{ @backingInt(mod), sub_path }) catch return error.NameTooLong;
+    if (fe.file_map.get(key)) |index| return index;
+    var errors: std.zig.ErrorBundle.Wip = try .init(fe.gpa);
+    defer errors.deinit();
+    var index: [1]?File.Index = undefined;
+    const ok = try fe.load(&.{.{ .module = mod, .sub_path = sub_path, .optional = true }}, &index, &errors);
+    if (errors.root_list.items.len > 0) {
+        try fe.late_errors.ensureUnusedCapacity(fe.gpa, 1);
+        fe.late_errors.appendAssumeCapacity(try errors.toOwnedBundle(""));
+        return error.AstGenFailed;
+    }
+    std.debug.assert(ok);
+    return index[0];
+}
+
+const Root = struct {
+    module: Module.Index,
+    sub_path: []const u8,
+    /// A missing file is not an error: its index is null.
+    optional: bool = false,
+};
+
+/// Loads `roots` and every file they reach that is not loaded yet, and
+/// numbers the new files breadth-first after the loaded ones. Stores each
+/// root's index in `indices`.
+fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std.zig.ErrorBundle.Wip) !bool {
     const gpa = fe.gpa;
     const io = fe.io;
     const start = Io.Clock.awake.now(io);
@@ -849,37 +912,31 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     var moved = false;
     defer l.deinit(moved);
 
-    const root_job = try l.getJob(.root, fe.module(.root).root_file);
-    // `zap test` also analyzes the module under test and std.
-    var extra_roots: [3]?*Job = @splat(null);
-    if (fe.main_module != .root) extra_roots = .{
-        try l.getJob(fe.main_module, fe.module(fe.main_module).root_file),
-        try l.getJob(.std, fe.module(.std).root_file),
-        null,
-    };
-    extra_roots[2] = try l.getJob(.compiler_rt, fe.module(.compiler_rt).root_file);
+    var root_jobs: [3]*Job = undefined;
+    for (roots, root_jobs[0..roots.len]) |r, *j| j.* = try l.getJob(r.module, r.sub_path);
     l.work(.main);
     l.group.await(io) catch {};
     if (l.failure) |err| return err;
     const finish_start = Io.Clock.awake.now(io);
 
-    // Number the files breadth-first in import order, as a serial load would.
+    // Number the new files breadth-first in import order, as a serial load
+    // would.
     var stats = fe.stats;
+    const base = fe.files.items.len;
     var order: std.ArrayList(*Job) = try .initCapacity(gpa, l.jobs.count());
     defer order.deinit(gpa);
-    root_job.index = @fromBackingInt(0);
-    order.appendAssumeCapacity(root_job);
-    var rt_missing: u32 = 0;
-    for (extra_roots) |opt| {
-        const job = opt orelse continue;
-        if (job.index != null) continue;
-        // Without compiler_rt (unit tests), a helper fails when requested.
-        if (job.missing != null and job == extra_roots[2]) {
-            rt_missing = 1;
+    var skipped: u32 = 0;
+    for (roots, root_jobs[0..roots.len], indices) |r, job, *index| {
+        if (job.missing != null and r.optional) {
+            index.* = null;
+            skipped += 1;
             continue;
         }
-        job.index = @fromBackingInt(@intCast(order.items.len));
-        order.appendAssumeCapacity(job);
+        if (job.index == null) {
+            job.index = @fromBackingInt(@intCast(base + order.items.len));
+            order.appendAssumeCapacity(job);
+        }
+        index.* = job.index;
     }
     var i: usize = 0;
     while (i < order.items.len) : (i += 1) {
@@ -887,16 +944,19 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
         if (job.missing) |err| fatalFile(job.file.display_path, err);
         for (job.imports) |imp| {
             if (imp.index != null) continue;
-            imp.index = @fromBackingInt(@intCast(order.items.len));
+            imp.index = @fromBackingInt(@intCast(base + order.items.len));
             order.appendAssumeCapacity(imp);
         }
     }
-    stats.guessed = @intCast(l.jobs.count() - order.items.len - rt_missing);
+    var existing: u32 = 0;
+    var jit = l.jobs.valueIterator();
+    while (jit.next()) |job| existing += @intFromBool(job.*.existing);
+    stats.guessed += @intCast(l.jobs.count() - order.items.len - existing - skipped);
 
-    try fe.files.ensureTotalCapacityPrecise(gpa, order.items.len);
-    try fe.file_map.ensureTotalCapacity(gpa, @intCast(order.items.len));
-    stats.files = @intCast(order.items.len);
-    stats.threads = l.helpers + 1;
+    try fe.files.ensureUnusedCapacity(gpa, order.items.len);
+    try fe.file_map.ensureUnusedCapacity(gpa, @intCast(order.items.len));
+    stats.files += @intCast(order.items.len);
+    stats.threads = @max(stats.threads, l.helpers + 1);
     for (order.items) |job| {
         fe.files.appendAssumeCapacity(job.file);
         switch (job.how) {
@@ -907,13 +967,14 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     }
     var it = l.jobs.iterator();
     while (it.next()) |e| {
+        if (e.value_ptr.*.existing) continue;
         const index = e.value_ptr.*.index orelse continue;
         fe.file_map.putAssumeCapacityNoClobber(e.key_ptr.*, index);
     }
     moved = true;
 
     var ok = true;
-    for (fe.files.items, order.items, 0..) |*f, job, index| {
+    for (fe.files.items[base..], order.items, base..) |*f, job, index| {
         // Not `f.zir.hasCompileErrors()`: that would fault in a page of every file.
         if (!job.has_errors) continue;
         const syntax = try fe.syntaxOf(@fromBackingInt(@intCast(index)));
@@ -941,8 +1002,8 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     }
 
     const end = Io.Clock.awake.now(io);
-    stats.load_ns = @intCast(start.durationTo(end).toNanoseconds());
-    stats.finish_ns = @intCast(finish_start.durationTo(end).toNanoseconds());
+    stats.load_ns += @intCast(start.durationTo(end).toNanoseconds());
+    stats.finish_ns += @intCast(finish_start.durationTo(end).toNanoseconds());
     fe.stats = stats;
     return ok;
 }
@@ -1122,6 +1183,21 @@ test "loads a file and its imports" {
     try std.testing.expect(try fe.loadAll(&errors));
     try std.testing.expectEqual(2, fe.files.items.len);
     try std.testing.expectEqualStrings("a.zig", fe.file(@fromBackingInt(@intCast(1))).sub_path);
+
+    // On demand: b.zig and c.zig are new, a.zig is reused.
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "const a = @import(\"a.zig\");\nconst c = @import(\"c.zig\");\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.zig", .data = "pub const x = 1;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.zig", .data = "fn f() void { var x: u32 = 1; }\n" });
+    const b = (try fe.loadFile(.root, "b.zig")).?;
+    try std.testing.expectEqual(2, @backingInt(b));
+    try std.testing.expectEqual(4, fe.files.items.len);
+    try std.testing.expectEqualStrings("c.zig", fe.file(@fromBackingInt(@intCast(3))).sub_path);
+    try std.testing.expectEqual(b, (try fe.loadFile(.root, "b.zig")).?);
+    try std.testing.expectEqual(null, try fe.loadFile(.root, "missing.zig"));
+    try std.testing.expectEqual(4, fe.files.items.len);
+    try std.testing.expectError(error.AstGenFailed, fe.loadFile(.root, "d.zig"));
+    try std.testing.expectEqual(1, fe.late_errors.items.len);
+    try std.testing.expectEqual(1, fe.late_errors.items[0].errorMessageCount());
 }
 
 test "reuses cached ZIR, drops stale guessed imports, and reports errors in cached files" {
