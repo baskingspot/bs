@@ -122,6 +122,15 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   memory, which is also what debuggers expect in Debug builds. A small
   per-basic-block register cache may avoid redundant loads. No global
   register allocation.
+- Calling conventions: `.c` follows SysV for integer, bool, and pointer
+  parameters and results. Zap-to-zap calls (`.auto`) pass every argument in
+  memory at 8-byte aligned offsets of the caller's outgoing area, return
+  1-, 2-, 4-, and 8-byte results in rax, and return anything else through a
+  result pointer in rdi. Nothing outside zap observes `.auto`, so this can
+  change when a register allocator wants a different one.
+- Until milestone 3 routes safety panics to `std.builtin.panic`, a failed
+  check writes `panic: <upstream message>` to stderr through small runtime
+  helper Atoms and raises SIGABRT.
 - Output is an **Atom**, defined in `src/link/Atom.zig`:
   - stable symbol key and name, section kind, alignment;
   - code or data bytes (or a size for zero-fill sections);

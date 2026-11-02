@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const Frontend = @import("Frontend.zig");
 const Zcu = @import("Zcu.zig");
 const Ir = @import("Ir.zig");
+const Emit = @import("Emit.zig");
 
 pub const zig_version = "0.17.0";
 
@@ -90,32 +91,50 @@ pub fn main(init: std.process.Init) !void {
 
     var zcu: Zcu = try .init(init.gpa, init.io, &fe);
     defer zcu.deinit();
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buf);
-    var sink: DumpSink = .{ .w = &stdout.interface, .enabled = opts.dump_ir };
-    try zcu.analyzeAll(&sink);
-    try stdout.interface.flush();
-    if (zcu.errors.items.len > 0) {
-        var wip: std.zig.ErrorBundle.Wip = try .init(init.gpa);
-        defer wip.deinit();
-        try zcu.renderErrors(&wip);
-        var sema_errors = try wip.toOwnedBundle("");
-        defer sema_errors.deinit(init.gpa);
-        try sema_errors.renderToStderr(init.io, .{}, .auto);
-        std.process.exit(1);
+    if (opts.dump_ir) {
+        var stdout_buf: [4096]u8 = undefined;
+        var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buf);
+        var sink: DumpSink = .{ .w = &stdout.interface };
+        try zcu.analyzeAll(&sink);
+        try stdout.interface.flush();
+        exitOnErrors(init, &zcu);
+        return;
     }
-    if (opts.dump_ir) return;
+    if (command != .build_exe) fatal("{s}: zap only implements build-exe so far", .{@tagName(command)});
 
-    // Code generation and linking are not implemented yet.
-    fatal("{s}: code generation is not implemented yet", .{@tagName(command)});
+    var emit: Emit = .init(init.gpa, &zcu);
+    defer emit.deinit();
+    try zcu.analyzeAll(&emit);
+    exitOnErrors(init, &zcu);
+    const out_path: []const u8 = switch (opts.emit_bin) {
+        .none => return,
+        .path => |p| p,
+        .default => opts.name orelse std.fs.path.stem(opts.root_src_path),
+    };
+    const linked = try emit.finish(init.io, Io.Dir.cwd(), out_path);
+    exitOnErrors(init, &zcu);
+    if (!linked) std.process.exit(1);
+}
+
+fn exitOnErrors(init: std.process.Init, zcu: *Zcu) void {
+    if (zcu.errors.items.len == 0) return;
+    renderErrors(init, zcu) catch {};
+    std.process.exit(1);
+}
+
+fn renderErrors(init: std.process.Init, zcu: *Zcu) !void {
+    var wip: std.zig.ErrorBundle.Wip = try .init(init.gpa);
+    defer wip.deinit();
+    try zcu.renderErrors(&wip);
+    var bundle = try wip.toOwnedBundle("");
+    defer bundle.deinit(init.gpa);
+    try bundle.renderToStderr(init.io, .{}, .auto);
 }
 
 const DumpSink = struct {
     w: *Io.Writer,
-    enabled: bool,
 
     pub fn function(s: *DumpSink, zcu: *Zcu, ir: *const Ir) !void {
-        if (!s.enabled) return;
         try @import("Ir/print.zig").dump(ir, &zcu.ip, s.w);
     }
 };
@@ -197,4 +216,5 @@ test {
     _ = Zcu;
     _ = @import("Sema.zig");
     _ = Ir;
+    _ = Emit;
 }

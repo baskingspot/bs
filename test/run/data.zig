@@ -1,3 +1,5 @@
+//! exit: 5
+//! stdout: "65\n118\n17\n42\n32\n105\n5\n21\nzzzzzzz\nbc\n75\n9\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {

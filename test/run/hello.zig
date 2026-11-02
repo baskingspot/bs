@@ -1,3 +1,5 @@
+//! exit: 0
+//! stdout: "hello, world\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
