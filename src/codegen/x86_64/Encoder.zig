@@ -385,6 +385,13 @@ pub fn shift(e: *Encoder, op: ShiftOp, size: Size, dst: Rm, count: ?u8) !void {
     }
 }
 
+/// `shld dst, src, cl` (`left`) or `shrd dst, src, cl` on qwords: shifts
+/// `dst` by cl, filling with bits of `src`.
+pub fn shiftDouble(e: *Encoder, left: bool, dst: Rm, src: Reg) !void {
+    try e.reserve();
+    try e.modRm(.{ .w = true }, &.{ 0x0f, if (left) 0xa5 else 0xad }, @backingInt(src), rmGpr(dst), 0);
+}
+
 /// `bsf dst, src` (forward) or `bsr dst, src` (reverse): index of the lowest
 /// or highest set bit. Sets ZF and leaves `dst` undefined when `src` is 0.
 pub fn bitScan(e: *Encoder, reverse: bool, size: Size, dst: Reg, src: Rm) !void {
@@ -534,6 +541,63 @@ pub fn movFromXmm(e: *Encoder, size: Size, dst: Rm, src: Xmm) !void {
     assert(size == .dword or size == .qword);
     try e.reserve();
     try e.modRm(.{ .op16 = true, .w = size == .qword }, &.{ 0x0f, 0x7e }, @backingInt(src), rmGpr(dst), 0);
+}
+
+/// movups: all 128 bits, register to register, load, or store (unaligned).
+pub fn movups(e: *Encoder, dst: XmmRm, src: XmmRm) !void {
+    try e.reserve();
+    switch (dst) {
+        .reg => |d| try e.modRm(.{}, &.{ 0x0f, 0x10 }, @backingInt(d), rmXmm(src), 0),
+        .mem => try e.modRm(.{}, &.{ 0x0f, 0x11 }, @backingInt(src.reg), rmXmm(dst), 0),
+    }
+}
+
+// ---------------------------------------------------------------- x87
+
+/// Memory operand of an x87 load or store: f32, f64, or f80.
+pub const X87Mem = enum { m32, m64, m80 };
+
+/// fld: pushes a float from memory onto the x87 stack.
+pub fn fld(e: *Encoder, size: X87Mem, src: Mem) !void {
+    try e.reserve();
+    switch (size) {
+        .m32 => try e.modRm(.{}, &.{0xd9}, 0, .{ .mem = src }, 0),
+        .m64 => try e.modRm(.{}, &.{0xdd}, 0, .{ .mem = src }, 0),
+        .m80 => try e.modRm(.{}, &.{0xdb}, 5, .{ .mem = src }, 0),
+    }
+}
+
+/// fstp: pops st0 into memory, rounding to the memory format.
+pub fn fstp(e: *Encoder, size: X87Mem, dst: Mem) !void {
+    try e.reserve();
+    switch (size) {
+        .m32 => try e.modRm(.{}, &.{0xd9}, 3, .{ .mem = dst }, 0),
+        .m64 => try e.modRm(.{}, &.{0xdd}, 3, .{ .mem = dst }, 0),
+        .m80 => try e.modRm(.{}, &.{0xdb}, 7, .{ .mem = dst }, 0),
+    }
+}
+
+pub const X87Op = enum(u8) { add = 0xc1, mul = 0xc9, sub = 0xe9, div = 0xf9 };
+
+/// faddp, fmulp, fsubp, fdivp: `st1 = st1 op st0`, then pops.
+pub fn x87ArithPop(e: *Encoder, op: X87Op) !void {
+    try e.code.appendSlice(e.gpa, &.{ 0xde, @backingInt(op) });
+}
+
+/// fsqrt: `st0 = sqrt(st0)`.
+pub fn fsqrt(e: *Encoder) !void {
+    try e.code.appendSlice(e.gpa, &.{ 0xd9, 0xfa });
+}
+
+/// fucomip: compares st0 with st1, setting ZF, PF, CF as ucomis does, then
+/// pops.
+pub fn fucomip(e: *Encoder) !void {
+    try e.code.appendSlice(e.gpa, &.{ 0xdf, 0xe9 });
+}
+
+/// fstp st0: pops.
+pub fn fpop(e: *Encoder) !void {
+    try e.code.appendSlice(e.gpa, &.{ 0xdd, 0xd8 });
 }
 
 // ---------------------------------------------------------------- encoding core
@@ -808,6 +872,31 @@ test "bit scans, byte swaps, and string ops match GNU as" {
     try e.bswap(.qword, .r11); // 49 0f cb
     try e.bswap(.qword, .rdi); // 48 0f cf
     const expected = "f3a4" ++ "f3aa" ++ "fd" ++ "fc" ++ "480fbdc1" ++ "450fbc0c24" ++ "66410fbdd2" ++ "0fc8" ++ "490fcb" ++ "480fcf";
+    var buf: [expected.len / 2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
+}
+
+test "movups, x87 instructions, and double shifts match GNU as" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    try e.movups(.{ .reg = .xmm1 }, .{ .mem = .at(.rax, 0) }); // 0f 10 08
+    try e.movups(.{ .mem = .at(.rbp, -16) }, .{ .reg = .xmm9 }); // 44 0f 11 4d f0
+    try e.movups(.{ .reg = .xmm3 }, .{ .reg = .xmm2 }); // 0f 10 da
+    try e.fld(.m80, .at(.rsp, 8)); // db 6c 24 08
+    try e.fstp(.m80, .at(.rbp, -32)); // db 7d e0
+    try e.fld(.m80, .at(.r10, 0)); // 41 db 2a
+    try e.fld(.m32, .at(.rax, 0)); // d9 00
+    try e.fstp(.m64, .at(.rsp, 0)); // dd 1c 24
+    try e.x87ArithPop(.sub); // de e9
+    try e.x87ArithPop(.div); // de f9
+    try e.fsqrt(); // d9 fa
+    try e.fucomip(); // df e9
+    try e.fpop(); // dd d8
+    try e.shiftDouble(true, .{ .reg = .rax }, .rdx); // 48 0f a5 d0
+    try e.shiftDouble(false, .{ .reg = .r10 }, .r9); // 4d 0f ad ca
+    const expected = "0f1008" ++ "440f114df0" ++ "0f10da" ++ "db6c2408" ++ "db7de0" ++ "41db2a" ++ "d900" ++ "dd1c24" ++
+        "dee9" ++ "def9" ++ "d9fa" ++ "dfe9" ++ "ddd8" ++ "480fa5d0" ++ "4d0fadca";
     var buf: [expected.len / 2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
 }
