@@ -33,6 +33,14 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
     b.step("test", "Run zap's unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
+
+    // Always ReleaseFast: a Debug build of zap says nothing about its speed.
+    const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/bench_link.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }) });
+    b.step("bench-link", "Measure ELF link throughput on ~100k synthetic atoms").dependOn(&b.addRunArtifact(bench_link).step);
 }
 
 fn defaultZigLibDir(b: *std.Build) []const u8 {

@@ -97,15 +97,26 @@ only that function.
   memory, which is also what debuggers expect in Debug builds. A small
   per-basic-block register cache may avoid redundant loads. No global
   register allocation.
-- Output is an **Atom**, defined in `src/link/`:
+- Output is an **Atom**, defined in `src/link/Atom.zig`:
   - stable symbol key and name, section kind, alignment;
   - code or data bytes (or a size for zero-fill sections);
-  - relocations: offset, target-specific kind, target symbol key, addend;
+  - relocations: offset, kind, target symbol key, addend;
   - line table and debug info fragments, relative to the declaration's first
     line, so that moving a declaration only patches its base line.
+- The symbol key is 128 bits: a hash of the rendered unit key for
+  declarations, or of the contents for anonymous constants. Atoms with equal
+  keys are one symbol; the linker keeps one and rejects a key whose atoms
+  differ.
+- Relocation kinds are either target-specific addresses (x86_64: absolute
+  64-bit, PC-relative 32-bit) or link-time values: an integer of 1, 2, 4, or
+  8 bytes that the whole compilation assigns to the target key, such as an
+  error code, passed to the linker rather than stored in any Atom.
 - Atoms contain no InternPool indices. Constants a function needs (string
   literals, anonymous values) become their own Atoms with content-hash symbol
   keys, deduplicated by the linker.
+- The x86_64 encoder (`src/codegen/x86_64/Encoder.zig`) appends instructions
+  and produces an Atom's bytes and relocations; branches to local labels are
+  patched in place and never become relocations.
 
 ### Linkers (`src/link/`)
 
@@ -114,6 +125,18 @@ only that function.
   a memcpy-dominated pass over cached Atoms.
 - x86_64-linux: static ELF first. aarch64-macos: Mach-O against libSystem,
   ad-hoc code signature.
+- The ELF linker (`src/link/Elf.zig`) builds the whole file in one buffer,
+  walking the Atoms in input order: deduplicate and place, assign addresses,
+  copy bytes and apply relocations, write the symbol table. Segments: R
+  (headers, .rodata), RX (.text), RW (.data, .bss). TLS will add .tdata and
+  .tbss at the start of RW with a PT_TLS header.
+- Measured link throughput (2026-11-02, orb, `zig build bench-link`): 100k
+  synthetic atoms (22 MiB of bytes, 650k relocations, uniformly random
+  targets) link in about 3.4x the time of copying their bytes into a fresh
+  buffer. Copying and page faults on the output take under half of it;
+  relocation records (32 bytes each, as large in total as the code) and
+  symbol-table lookups take most of the rest. Shrinking relocation records
+  is the lever if relinks need to get closer to memcpy speed.
 
 ## The on-disk cache (milestone 6, designed now)
 
