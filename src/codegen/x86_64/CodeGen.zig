@@ -255,7 +255,7 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
             else => {},
         },
         .err => |e| return .{ .err = e.name },
-        .enum_tag => |e| return .{ .imm = intBits(ip, e.int) },
+        .enum_tag => |e| if (cg.passInRegs(ty)) return .{ .imm = intBits(ip, e.int) },
         .ptr => |p| if (!Type.isSlice(ip, ty)) {
             if (p.base == .int) return .{ .imm = p.byte_offset };
             const t = try ptrTarget(cg.emit, val);

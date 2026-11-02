@@ -363,7 +363,7 @@ pub fn unitKey(zcu: *Zcu, unit: AnalUnit, w: *std.Io.Writer) !void {
     const ip = &zcu.ip;
     switch (unit) {
         .nav_val => |nav| try w.writeAll(ip.stringSlice(ip.getNav(nav).key)),
-        .type_layout => |ty| try w.print("{s}@layout", .{ip.stringSlice(ip.indexToKey(ty).struct_type.key)}),
+        .type_layout => |ty| try w.print("{s}@layout", .{ip.stringSlice(ip.containerType(ty).?.key)}),
         .func => |func| {
             const f = ip.indexToKey(func).func;
             try w.writeAll(ip.stringSlice(ip.getNav(f.owner_nav).key));
