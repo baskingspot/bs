@@ -1761,7 +1761,19 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const val = try sema.zirStructInit(block, inst);
             break :blk if (tag == .struct_init_ref) sema.analyzeRef(block, block.nodeSrc(data.pl_node.src_node), val) else val;
         },
-        .struct_init_anon => sema.failUnsupported(block, block.nodeSrc(data.pl_node.src_node), "anonymous struct literals without a result type"),
+        .struct_init_anon => blk: {
+            const extra = sema.code.extraData(Zir.Inst.StructInitAnon, data.pl_node.payload_index);
+            const names = try sema.arena.alloc(InternPool.String, extra.data.fields_len);
+            const inits = try sema.arena.alloc(Ref, extra.data.fields_len);
+            var i = extra.end;
+            for (names, inits) |*n, *init| {
+                const item = sema.code.extraData(Zir.Inst.StructInitAnon.Item, i);
+                i = item.end;
+                n.* = try sema.getString(sema.zirString(item.data.field_name));
+                init.* = sema.resolveInst(item.data.init);
+            }
+            break :blk sema.anonStructInit(block, inst, data.pl_node.src_node, names, inits);
+        },
         .struct_init_field_type => blk: {
             const extra = sema.code.extraData(Zir.Inst.FieldType, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
@@ -2318,7 +2330,7 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             });
         },
         .@"struct", .tuple => blk: {
-            const is_tuple = class == .tuple;
+            const is_tuple = class == .tuple and ip.indexToKey(ty).tuple_type.names.len == 0;
             const n = Type.fieldCount(ip, ty);
             const attrs_ty = try sema.stdLangType(block, src, "Type.Struct.FieldAttributes");
             const names = try sema.arena.alloc(InternPool.String, n);
@@ -2328,9 +2340,10 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 types[i] = Type.fieldType(ip, ty, i);
                 var is_comptime = false;
                 var default: Index = .none;
-                if (is_tuple) {
-                    names[i] = try sema.getString(try std.fmt.allocPrint(sema.arena, "{d}", .{i}));
-                    default = ip.indexToKey(ty).tuple_type.values[i];
+                if (class == .tuple) {
+                    const t = ip.indexToKey(ty).tuple_type;
+                    names[i] = if (is_tuple) try sema.getString(try std.fmt.allocPrint(sema.arena, "{d}", .{i})) else t.names[i];
+                    default = t.values[i];
                     is_comptime = default != .none;
                 } else {
                     names[i] = ip.structInfo(ty).field_names[i];
@@ -2344,12 +2357,12 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const layout_ty = try sema.stdLangType(block, src, "Type.ContainerLayout");
             break :blk try sema.structValue(block, src, try sema.stdLangType(block, src, "Type.Struct"), &[_]S{
                 .{ "is_tuple", boolValue(is_tuple) },
-                .{ "layout", try sema.enumValueByName(block, src, layout_ty, if (is_tuple) "auto" else @tagName(ip.structInfo(ty).layout)) },
+                .{ "layout", try sema.enumValueByName(block, src, layout_ty, if (class == .tuple) "auto" else @tagName(ip.structInfo(ty).layout)) },
                 .{ "backing_integer", try sema.optValue(.type_type, .none) },
                 .{ "field_names", try sema.namesValue(names) },
                 .{ "field_types", try sema.sliceValue(.type_type, types) },
                 .{ "field_attrs", try sema.sliceValue(attrs_ty, attrs) },
-                .{ "decl_names", if (is_tuple) try sema.namesValue(&.{}) else try sema.declNamesValue(ip.structInfo(ty).namespace) },
+                .{ "decl_names", if (class == .tuple) try sema.namesValue(&.{}) else try sema.declNamesValue(ip.structInfo(ty).namespace) },
             });
         },
         .@"union" => blk: {
@@ -3021,7 +3034,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
         } else if (sc == .tuple) {
             const a = ip.indexToKey(dest_ty).array_type;
             const t = ip.indexToKey(src_ty).tuple_type;
-            if (t.types.len != a.len) return null;
+            if (t.types.len != a.len or t.names.len != 0) return null;
             const elems = try sema.arena.alloc(Ref, a.lenIncludingSentinel());
             for (0..t.types.len) |k| {
                 const field = try sema.tupleField(block, inst, @intCast(k));
@@ -4891,6 +4904,7 @@ fn fieldTypeByName(sema: *Sema, block: *Block, src: Src, ty: Index, name: []cons
         },
         .union_type => return ip.structInfo(ty).field_types[try sema.unionFieldIndex(block, src, ty, name)],
         .tuple_type => |t| {
+            if (t.names.len != 0) return t.types[try sema.structFieldIndex(block, src, ty, name)];
             const i = std.fmt.parseInt(u32, name, 10) catch return sema.fail(block, src, "no field named '{s}' in tuple '{f}'", .{ name, sema.fmtType(ty) });
             if (i >= t.types.len) return sema.fail(block, src, "index {d} outside tuple of length {d}", .{ i, t.types.len });
             return t.types[i];
@@ -4974,6 +4988,10 @@ fn structFieldIndex(sema: *Sema, block: *Block, src: Src, ty: Index, name: []con
                 sema.fail(block, src, "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) });
         },
         .tuple_type => |t| {
+            if (t.names.len != 0) {
+                for (t.names, 0..) |n, i| if (std.mem.eql(u8, ip.stringSlice(n), name)) return @intCast(i);
+                return sema.fail(block, src, "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) });
+            }
             const i = std.fmt.parseInt(u32, name, 10) catch return sema.fail(block, src, "no field named '{s}' in tuple '{f}'", .{ name, sema.fmtType(ty) });
             if (i >= t.types.len) return sema.fail(block, src, "index '{d}' out of bounds of tuple '{f}'", .{ i, sema.fmtType(ty) });
             return i;
@@ -5019,7 +5037,7 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
             return sema.fail(block, src, "no member named '{s}' in '{f}'", .{ name, sema.fmtType(p.child) });
         },
         .@"struct", .tuple => {
-            if (ip.indexToKey(ty) == .tuple_type and std.mem.eql(u8, name, "len"))
+            if (ip.indexToKey(ty) == .tuple_type and ip.indexToKey(ty).tuple_type.names.len == 0 and std.mem.eql(u8, name, "len"))
                 return .fromInterned(try sema.intValue(.comptime_int_type, ip.indexToKey(ty).tuple_type.types.len));
             const i = try sema.structFieldIndex(block, src, ty, name);
             if (ip.indexToKey(ty) == .tuple_type) return sema.tupleField(block, lhs, i);
@@ -6057,6 +6075,8 @@ fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref
 
 fn structInitEmpty(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!Ref {
     const ip = sema.ip;
+    // `.{}` without a result type is the empty tuple.
+    if (ty == .generic_poison_type) return .fromInterned(.empty_tuple);
     switch (ip.indexToKey(ty)) {
         .struct_type => {
             try sema.resolveStructFields(block, src, ty);
@@ -6098,7 +6118,16 @@ fn zirStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
         item.* = .{ .name = sema.zirString(ft.name_start), .init = sema.resolveInst(e.data.init) };
     }
     if (ty == .clobbers_type) return .fromInterned(try sema.undefValue(.clobbers_type));
-    if (ty == .generic_poison_type) return sema.failUnsupported(block, src, "anonymous struct literals without a result type");
+    if (ty == .generic_poison_type) {
+        // No result type: an anonymous struct literal.
+        const names = try sema.arena.alloc(InternPool.String, items.len);
+        const inits = try sema.arena.alloc(Ref, items.len);
+        for (items, names, inits) |item, *nm, *init| {
+            nm.* = try sema.getString(item.name);
+            init.* = item.init;
+        }
+        return sema.anonStructInit(block, inst, data.src_node, names, inits);
+    }
     if (ip.indexToKey(ty) == .union_type) {
         if (items.len != 1) return sema.fail(block, src, "union initialization expects exactly one field", .{});
         const fi = try sema.unionFieldIndex(block, src, ty, items[0].name);
@@ -6121,6 +6150,51 @@ fn zirStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
         e.* = .fromInterned(d);
     }
     return sema.aggregate(block, src, ty, elems);
+}
+
+/// `.{ .a = x, .b = y }` without a result type. Like upstream, its type is
+/// a struct equal by its literal and fields, with comptime-known fields
+/// as comptime fields, named `Parent__struct_<inst>`.
+fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: Ast.Node.Offset, names: []const InternPool.String, inits: []const Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const src = block.nodeSrc(src_node);
+    for (names, 0..) |n, i| for (names[0..i]) |m| if (m == n)
+        return sema.fail(block, src, "duplicate field name '{s}'", .{ip.stringSlice(n)});
+    const types = try sema.arena.alloc(Index, inits.len);
+    const values = try sema.arena.alloc(Index, inits.len);
+    for (inits, types, values) |init, *t, *v| {
+        t.* = sema.typeOf(init);
+        v.* = sema.resolveValue(init) orelse .none;
+        // A field referring to comptime-mutable memory cannot be a comptime field.
+        if (v.* != .none and ip.indexToKey(v.*) == .ptr and try sema.comptimePtrRoot(v.*) == .comptime_alloc) v.* = .none;
+    }
+
+    var site: std.Io.Writer.Allocating = .init(sema.arena);
+    var parent: std.Io.Writer.Allocating = .init(sema.arena);
+    const owner_nav: InternPool.NavIndex = if (block.inlining) |inl|
+        ip.indexToKey(inl.func).func.owner_nav
+    else switch (sema.owner) {
+        .func => |f| ip.indexToKey(f).func.owner_nav,
+        else => sema.owner_nav,
+    };
+    if (owner_nav != .none) {
+        site.writer.writeAll(ip.stringSlice(ip.getNav(owner_nav).key)) catch return error.OutOfMemory;
+        parent.writer.writeAll(ip.stringSlice(ip.getNav(owner_nav).fqn)) catch return error.OutOfMemory;
+    } else {
+        sema.zcu.unitKey(sema.owner, &site.writer) catch return error.OutOfMemory;
+        parent.writer.writeAll(sema.zcu.namespacePtr(block.namespace).fqn) catch return error.OutOfMemory;
+    }
+    site.writer.print("#lit{d}", .{@backingInt(src_node)}) catch return error.OutOfMemory;
+    parent.writer.print("__struct_{d}", .{@backingInt(inst)}) catch return error.OutOfMemory;
+
+    const ty = try sema.intern(.{ .tuple_type = .{
+        .types = types,
+        .values = values,
+        .names = names,
+        .site = try sema.getString(site.written()),
+        .name = try sema.getString(parent.written()),
+    } });
+    return sema.aggregate(block, src, ty, inits);
 }
 
 fn zirValidatePtrStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
@@ -6179,11 +6253,14 @@ fn zirArrayInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const src = block.nodeSrc(data.src_node);
     const extra = sema.code.extraData(Zir.Inst.MultiOp, data.payload_index);
     const args = sema.code.refSlice(extra.end, extra.data.operands_len);
-    if (tag == .array_init_anon) {
-        const types = try sema.arena.alloc(Index, args.len);
-        const values = try sema.arena.alloc(Index, args.len);
-        const elems = try sema.arena.alloc(Ref, args.len);
-        for (args, types, values, elems) |a, *t, *v, *e| {
+    const result_ty: Index = if (tag == .array_init_anon) .generic_poison_type else try sema.resolveType(block, src, args[0]);
+    if (result_ty == .generic_poison_type) {
+        // An anonymous array literal, or one whose result type is unknown: a tuple.
+        const operands = if (tag == .array_init_anon) args else args[1..];
+        const types = try sema.arena.alloc(Index, operands.len);
+        const values = try sema.arena.alloc(Index, operands.len);
+        const elems = try sema.arena.alloc(Ref, operands.len);
+        for (operands, types, values, elems) |a, *t, *v, *e| {
             e.* = sema.resolveInst(a);
             t.* = sema.typeOf(e.*);
             v.* = sema.resolveValue(e.*) orelse .none;
@@ -6191,8 +6268,7 @@ fn zirArrayInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
         const ty = try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } });
         return sema.aggregate(block, src, ty, elems);
     }
-    var ty = try sema.resolveType(block, src, args[0]);
-    if (ty == .generic_poison_type) return sema.failUnsupported(block, src, "array literals without a result type");
+    var ty = result_ty;
     const inits = args[1..];
     switch (ip.indexToKey(ty)) {
         .array_type => |a| {

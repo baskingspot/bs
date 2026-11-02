@@ -381,10 +381,19 @@ pub const ContainerType = struct {
     info: ContainerInfoIndex,
 };
 
+/// A tuple, or the type of an anonymous struct literal (`.{ .a = x }`),
+/// which upstream makes a struct type equal by its fields and literal.
+/// Both share layout and comptime fields, so they share this key.
 pub const TupleType = struct {
     types: []const Index,
     /// `.none` for runtime fields, else the comptime field value.
     values: []const Index,
+    /// Anonymous struct literals only: the field names (empty for a tuple),
+    /// the literal's stable site key (its declaration's key and source
+    /// node offset), and the type's name (`Parent__struct_<n>`).
+    names: []const String = &.{},
+    site: String = .empty,
+    name: String = .empty,
 };
 
 pub const FuncType = struct {
@@ -967,9 +976,14 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
         },
         .tuple_type => |t| {
             assert(t.types.len == t.values.len);
-            const start = try ip.addExtra(local, &.{@intCast(t.types.len)});
+            assert(t.names.len == 0 or t.names.len == t.types.len);
+            const start = try ip.addExtra(local, &.{ @intCast(t.types.len), @intFromBool(t.names.len != 0) });
             _ = try ip.addExtra(local, @ptrCast(t.types));
             _ = try ip.addExtra(local, @ptrCast(t.values));
+            if (t.names.len != 0) {
+                _ = try ip.addExtra(local, @ptrCast(t.names));
+                _ = try ip.addExtra(local, &.{ @backingInt(t.site), @backingInt(t.name) });
+            }
             return .{ .tag = .type_tuple, .data = start };
         },
         .func_type => |t| {
@@ -1095,9 +1109,14 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         },
         .type_tuple => blk: {
             const len = extra[d];
+            const named = extra[d + 1] != 0;
+            const rest = d + 2 + 2 * len;
             break :blk .{ .tuple_type = .{
-                .types = @ptrCast(extra[d + 1 ..][0..len]),
-                .values = @ptrCast(extra[d + 1 + len ..][0..len]),
+                .types = @ptrCast(extra[d + 2 ..][0..len]),
+                .values = @ptrCast(extra[d + 2 + len ..][0..len]),
+                .names = if (named) @ptrCast(extra[rest..][0..len]) else &.{},
+                .site = if (named) @fromBackingInt(extra[rest + len]) else .empty,
+                .name = if (named) @fromBackingInt(extra[rest + len + 1]) else .empty,
             } };
         },
         .type_func => blk: {
@@ -1292,6 +1311,10 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
         .tuple_type => |t| {
             ip.hashIndices(&h, t.types);
             ip.hashIndices(&h, t.values);
+            if (t.names.len != 0) {
+                for (t.names) |n| ip.hashString(&h, n);
+                ip.hashString(&h, t.site);
+            }
         },
         .func_type => |t| {
             ip.hashIndices(&h, t.param_types);
@@ -1427,7 +1450,8 @@ fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
             };
             return x.file == y.file and x.zir_inst == y.zir_inst and eqlIdx(Index, x.captures, y.captures);
         },
-        .tuple_type => |x| eqlIdx(Index, x.types, b.tuple_type.types) and eqlIdx(Index, x.values, b.tuple_type.values),
+        .tuple_type => |x| eqlIdx(Index, x.types, b.tuple_type.types) and eqlIdx(Index, x.values, b.tuple_type.values) and
+            eqlIdx(String, x.names, b.tuple_type.names) and x.site == b.tuple_type.site,
         .func_type => |x| {
             const y = b.func_type;
             return eqlIdx(Index, x.param_types, y.param_types) and x.return_type == y.return_type and

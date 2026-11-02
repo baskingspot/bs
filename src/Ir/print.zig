@@ -294,6 +294,7 @@ pub fn printType(ip: *const InternPool, ty: InternPool.Index, w: *Writer) Writer
         },
         .struct_type => |s| try w.writeAll(ip.stringSlice(s.name)),
         .tuple_type => |t| {
+            if (t.names.len != 0) return w.writeAll(ip.stringSlice(t.name));
             try w.writeAll("struct {");
             for (t.types, t.values, 0..) |ft, fv, i| {
                 try w.writeAll(if (i == 0) " " else ", ");
