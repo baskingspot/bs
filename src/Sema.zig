@@ -5876,6 +5876,10 @@ const SwitchCase = struct {
     ranges: [][2]Index,
     body: []const Zir.Inst.Index,
     capture: Zir.Inst.SwitchBlock.ProngInfo.Capture,
+    /// An inline prong has one comptime-known item per analysis.
+    is_inline: bool = false,
+    /// The instruction a union tag capture binds, or `none`.
+    tag_inst: Zir.Inst.OptionalIndex = .none,
 };
 
 fn zirSwitchBlock(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -5945,7 +5949,6 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     const gpa = sema.gpa;
     const sb = sema.code.getSwitchBlock(inst);
     if (sb.has_continue) return sema.failUnsupported(parent, src, "labeled switch continue");
-    if (sb.tag_capture_placeholder != .none) return sema.failUnsupported(parent, src, "switch tag captures");
     // A tagged union switches on its tag; prongs capture the payload.
     var cond = operand;
     if (Type.class(ip, sema.typeOf(operand)) == .@"union") {
@@ -5960,6 +5963,8 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     }
     if (Type.class(ip, operand_ty) == .@"enum") try sema.resolveLayout(parent, src, operand_ty);
     const capture_inst: Zir.Inst.Index = sb.payload_capture_placeholder.unwrap() orelse inst;
+    const tag_inst: Zir.Inst.Index = sb.tag_capture_placeholder.unwrap() orelse inst;
+    const is_union = Type.class(ip, sema.typeOf(operand)) == .@"union";
 
     // Evaluate the case items at comptime.
     var cases: std.ArrayList(SwitchCase) = .empty;
@@ -5970,7 +5975,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     var under_index: ?usize = null;
     var it = sb.iterateCases();
     while (it.next()) |case| {
-        if (case.prong_info.is_inline) return sema.failUnsupported(parent, src, "inline switch prongs");
+        if (case.prong_info.has_tag_capture and !is_union) return sema.fail(parent, src, "cannot capture tag of non-union type '{f}'", .{sema.fmtType(sema.typeOf(operand))});
         const body = sema.code.bodySlice(extra_index, case.prong_info.body_len);
         extra_index += body.len;
         var items: std.ArrayList(Index) = .empty;
@@ -5986,9 +5991,24 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
             range[0] = try sema.switchItem(&item_block, src, inst, pair[0], operand_ty, &extra_index);
             range[1] = try sema.switchItem(&item_block, src, inst, pair[1], operand_ty, &extra_index);
         }
-        try cases.append(sema.arena, .{ .items = items.items, .ranges = ranges, .body = body, .capture = case.prong_info.capture });
+        try cases.append(sema.arena, .{
+            .items = items.items,
+            .ranges = ranges,
+            .body = body,
+            .capture = case.prong_info.capture,
+            .is_inline = case.prong_info.is_inline,
+            .tag_inst = if (case.prong_info.has_tag_capture) tag_inst.toOptional() else .none,
+        });
     }
-    const else_case: ?SwitchCase = if (sb.else_case) |e| .{ .items = &.{}, .ranges = &.{}, .body = e.body, .capture = e.capture } else null;
+    var else_case: ?SwitchCase = if (sb.else_case) |e| .{
+        .items = &.{},
+        .ranges = &.{},
+        .body = e.body,
+        .capture = e.capture,
+        .is_inline = e.is_inline,
+        .tag_inst = if (e.has_tag_capture) tag_inst.toOptional() else .none,
+    } else null;
+    if (else_case) |e| if (e.tag_inst != .none and !is_union) return sema.fail(parent, src, "cannot capture tag of non-union type '{f}'", .{sema.fmtType(sema.typeOf(operand))});
     if (sb.has_under and (Type.class(ip, operand_ty) != .@"enum" or !ip.structInfo(operand_ty).nonexhaustive))
         return sema.fail(parent, src, "'_' prong only allowed when switching on non-exhaustive enums", .{});
     if (else_case == null and Type.class(ip, operand_ty) == .bool) {
@@ -6012,7 +6032,54 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     }
 
     // A `_` prong is the else prong of a non-exhaustive enum.
-    const under_case: ?SwitchCase = if (under_index) |k| cases.items[k] else else_case;
+    const under_prong: ?SwitchCase = if (under_index) |k| cases.items[k] else null;
+    if (else_case) |e| if (e.is_inline) {
+        // `inline else` becomes one inline prong per value no other prong
+        // handles.
+        const all = try sema.switchAllValues(parent, src, operand_ty);
+        for (all) |v| {
+            for (cases.items) |c| {
+                if (try sema.switchCaseMatches(c, v)) break;
+            } else {
+                const items = try sema.arena.alloc(Index, 1);
+                items[0] = v;
+                var c = e;
+                c.items = items;
+                try cases.append(sema.arena, c);
+            }
+        }
+        else_case = null;
+    };
+    {
+        // Split inline prongs into one prong per item.
+        var expanded: std.ArrayList(SwitchCase) = .empty;
+        for (cases.items) |c| {
+            if (!c.is_inline or (c.items.len == 1 and c.ranges.len == 0)) {
+                try expanded.append(sema.arena, c);
+                continue;
+            }
+            for (c.items) |item| {
+                var one = c;
+                one.items = try sema.arena.dupe(Index, &.{item});
+                one.ranges = &.{};
+                try expanded.append(sema.arena, one);
+            }
+            for (c.ranges) |r| {
+                const lo = sema.ip.intValue(i64, r[0]) orelse return sema.failUnsupported(parent, src, "large inline switch ranges");
+                const hi = sema.ip.intValue(i64, r[1]) orelse return sema.failUnsupported(parent, src, "large inline switch ranges");
+                if (hi - lo >= 1 << 12) return sema.failUnsupported(parent, src, "large inline switch ranges");
+                var x = lo;
+                while (x <= hi) : (x += 1) {
+                    var one = c;
+                    one.items = try sema.arena.dupe(Index, &.{try sema.intValue(operand_ty, x)});
+                    one.ranges = &.{};
+                    try expanded.append(sema.arena, one);
+                }
+            }
+        }
+        cases = expanded;
+    }
+    const under_case = under_prong orelse else_case;
 
     // Comptime-known operand: analyze only the matching prong.
     if (sema.resolveValue(cond)) |v| {
@@ -6020,13 +6087,42 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
             if (try sema.switchCaseMatches(c, v)) break c;
         } else under_case orelse return sema.fail(parent, src, "switch must handle all possibilities", .{});
         if (parent.is_comptime) {
-            try sema.inst_map.put(gpa, capture_inst, try sema.switchCapture(parent, src, chosen, operand));
+            try sema.bindSwitchCaptures(parent, src, chosen, operand, capture_inst);
             return sema.resolveInlineBody(parent, chosen.body, inst);
         }
         return sema.switchProngsRuntime(parent, src, inst, cond, operand, &.{chosen}, null, capture_inst);
     }
     try sema.requireRuntime(parent, src);
     return sema.switchProngsRuntime(parent, src, inst, cond, operand, cases.items, under_case, capture_inst);
+}
+
+/// Every value of `ty`, for `inline else`.
+fn switchAllValues(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError![]const Index {
+    const ip = sema.ip;
+    var vals: std.ArrayList(Index) = .empty;
+    switch (Type.class(ip, ty)) {
+        .bool => try vals.appendSlice(sema.arena, &.{ .bool_false, .bool_true }),
+        .@"enum" => {
+            const info = ip.structInfo(ty);
+            if (info.nonexhaustive) return sema.fail(block, src, "cannot enumerate values of type '{f}' for 'inline else'", .{sema.fmtType(ty)});
+            for (info.field_defaults) |fv| try vals.append(sema.arena, try sema.intern(.{ .enum_tag = .{ .ty = ty, .int = fv } }));
+        },
+        .error_set => switch (ip.indexToKey(ty)) {
+            .error_set_type => |names| for (names) |name| {
+                try vals.append(sema.arena, try sema.intern(.{ .err = .{ .ty = ty, .name = name } }));
+            },
+            else => return sema.fail(block, src, "cannot enumerate values of type '{f}' for 'inline else'", .{sema.fmtType(ty)}),
+        },
+        .int => {
+            const info = Type.intInfo(ip, ty);
+            if (info.bits > 12) return sema.fail(block, src, "cannot enumerate values of type '{f}' for 'inline else'", .{sema.fmtType(ty)});
+            var x = ip.intValue(i64, try sema.minIntValue(ty)).?;
+            const max = ip.intValue(i64, try sema.maxIntValue(ty)).?;
+            while (x <= max) : (x += 1) try vals.append(sema.arena, try sema.intValue(ty, x));
+        },
+        else => return sema.fail(block, src, "cannot enumerate values of type '{f}' for 'inline else'", .{sema.fmtType(ty)}),
+    }
+    return vals.items;
 }
 
 fn switchItem(sema: *Sema, block: *Block, src: Src, switch_inst: Zir.Inst.Index, info: Zir.Inst.SwitchBlock.ItemInfo, operand_ty: Index, extra_index: *usize) CompileError!Index {
@@ -6143,7 +6239,8 @@ fn switchProngsRuntime(
 fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: Ref) CompileError!Ref {
     const ip = sema.ip;
     const ty = sema.typeOf(operand);
-    if (Type.class(ip, ty) != .@"union" or c.items.len == 0) return operand;
+    if (Type.class(ip, ty) != .@"union") return if (c.is_inline) .fromInterned(c.items[0]) else operand;
+    if (c.items.len == 0) return operand;
     const info = ip.structInfo(ty);
     const name = sema.enumTagName(c.items[0]).?;
     const i = info.fieldIndex(ip, name).?;
@@ -6152,9 +6249,16 @@ fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: R
     return sema.addStructField(block, .struct_field_val, info.field_types[i], operand, i);
 }
 
+fn bindSwitchCaptures(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: Ref, capture_inst: Zir.Inst.Index) CompileError!void {
+    try sema.inst_map.put(sema.gpa, capture_inst, if (c.capture == .none) operand else try sema.switchCapture(block, src, c, operand));
+    if (c.tag_inst.unwrap()) |t| {
+        try sema.inst_map.put(sema.gpa, t, if (c.is_inline) .fromInterned(c.items[0]) else try sema.unionTag(block, src, operand));
+    }
+}
+
 fn analyzeProng(sema: *Sema, block: *Block, c: SwitchCase, operand: Ref, capture_inst: Zir.Inst.Index, switch_inst: Zir.Inst.Index) CompileError!void {
     if (c.capture == .by_ref) return sema.failUnsupported(block, block.nodeSrc(.zero), "switch captures by reference");
-    try sema.inst_map.put(sema.gpa, capture_inst, if (c.capture == .none) operand else try sema.switchCapture(block, block.nodeSrc(.zero), c, operand));
+    try sema.bindSwitchCaptures(block, block.nodeSrc(.zero), c, operand, capture_inst);
     if (try sema.analyzeInlineBody(block, c.body, switch_inst)) |result| {
         // A prong ended with a comptime break to the switch.
         try sema.addBr(block, block.label.?, result);
