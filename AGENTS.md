@@ -40,7 +40,8 @@ builds. It does not track upstream: it compiles exactly one pinned Zig release
   small program and compare zap's behavior and output with upstream's. Do not
   guess from memory.
 - Conformance measure: the share of `upstream/test/behavior` that zap compiles
-  and passes on each target. Keep that number visible.
+  and passes on each target. Keep that number visible. Measure it with
+  `tools/conformance/run.py` (see `docs/architecture.md`).
 - Upstream is MIT licensed. Copying upstream code is allowed, but keep the
   upstream copyright notice with the copied code. Never send changes upstream;
   Zig does not accept LLM-authored contributions.

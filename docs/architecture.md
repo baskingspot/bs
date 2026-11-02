@@ -217,3 +217,27 @@ shares nothing across projects and ties the file format to in-memory layout.
 - Conformance is measured per test: the number of `upstream/test/behavior`
   tests zap compiles and passes, divided by the number upstream 0.17.0 passes
   on the same target with the same backend.
+- `tools/conformance/run.py` measures it: it builds zap, prints one summary
+  line per target, and writes a per-file, per-test JSON breakdown to
+  `.zig-cache/conformance/<target>.json`. `run.py --upstream` recomputes the
+  committed upstream baseline, `tools/conformance/baseline/<target>.json`.
+  The `-target` is upstream's test-matrix entry: `x86_64-linux-none` (no libc,
+  baseline CPU, self-hosted backend) and `aarch64-macos-none` (Debug default
+  there is LLVM).
+- Each file `behavior.zig` imports is its own unit: one `zap test` compile and
+  one run, in parallel with the others, so a compile error, crash, or timeout
+  costs only that file. The root is a generated `behavior.zig` wrapper next to
+  a `behavior` symlink, so namespaces and test names (`behavior.basic.test.x`)
+  equal those of upstream's full build (`typename.zig` and
+  `string_literals.zig` check `@typeName` results that include the
+  namespace). `behavior.zig`'s own tests run from the real file with
+  `--test-filter behavior.test`. The baseline run also builds all of
+  `behavior.zig` at once and checks that the per-file results are identical.
+- The harness passes the compiler a test runner with `--test-runner`
+  (default `tools/conformance/test_runner.zig`) and parses only the runner's
+  `@zap-test` line protocol on stdout, documented in that file. A test that
+  crashes or times out is recorded and the binary is rerun with
+  `--start=<next>`. Until zap compiles the default runner, which mirrors
+  upstream's per-test setup (`testing.allocator`, `testing.io`), it can use a
+  smaller runner that speaks the same protocol; tests are matched to the
+  baseline by name, so zap must produce upstream's test names.
