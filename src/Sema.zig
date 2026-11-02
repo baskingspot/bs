@@ -2129,6 +2129,25 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .in_comptime => .fromInterned(boolValue(block.is_comptime)),
         // Instrumentation and intrinsics are not something zap emits.
         .disable_instrumentation, .disable_intrinsics => .void_value,
+        .reify_pointer_sentinel_ty => blk: {
+            const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
+            const elem_ty = try sema.resolveType(block, block.nodeSrc(extra.node), extra.operand);
+            // Opaque and null children cannot be optional; their sentinel is `?noreturn`.
+            break :blk .fromInterned(switch (Type.class(sema.ip, elem_ty)) {
+                .@"opaque", .null => try sema.optType(.noreturn_type),
+                else => try sema.optType(elem_ty),
+            });
+        },
+        .reify_pointer => sema.zirReifyPointer(block, ext),
+        .reify_tuple => blk: {
+            const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
+            const src = block.nodeSrc(extra.node);
+            const types = try sema.constSliceElems(block, src, try sema.coerce(block, .slice_const_type_type, sema.resolveInst(extra.operand), src), "tuple field types must be comptime-known");
+            for (types) |t| if (sema.isUndef(t)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+            const values = try sema.arena.alloc(Index, types.len);
+            @memset(values, .none);
+            break :blk .fromInterned(try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } }));
+        },
         .ptr_cast_full => blk: {
             const flags: Zir.Inst.FullPtrCastFlags = @bitCast(@as(u5, @truncate(ext.small)));
             break :blk sema.analyzePtrCast(block, inst, flags);
@@ -5155,6 +5174,73 @@ fn memOperand(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!struc
 fn memRawPtr(sema: *Sema, block: *Block, ptr: Ref) CompileError!Ref {
     if (Type.ptrInfo(sema.ip, sema.typeOf(ptr)).flags.size == .slice) return sema.slicePtr(block, ptr);
     return ptr;
+}
+
+/// The elements of comptime-known slice `slice`.
+fn constSliceElems(sema: *Sema, block: *Block, src: Src, slice: Ref, reason: []const u8) CompileError![]Index {
+    const ip = sema.ip;
+    const v = try sema.resolveConstValue(block, src, slice, reason);
+    if (sema.isUndef(v)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+    const s = ip.indexToKey(v).slice;
+    const elems = try sema.arena.alloc(Index, @intCast(ip.intValue(u64, s.len).?));
+    for (elems, 0..) |*e, i| e.* = try sema.comptimeLoad(block, src, try sema.ptrElemPtrVal(s.ptr, i));
+    return elems;
+}
+
+/// Field `name` of comptime-known struct value `val`.
+fn structFieldValue(sema: *Sema, val: Index, name: []const u8) !Index {
+    const ip = sema.ip;
+    return sema.fieldValue(val, ip.structInfo(ip.typeOf(val)).fieldIndex(ip, name).?);
+}
+
+/// `@Pointer(size, attrs, child, sentinel)`.
+fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) CompileError!Ref {
+    const ip = sema.ip;
+    const extra = sema.code.extraData(Zir.Inst.ReifyPointer, ext.operand).data;
+    const src = block.nodeSrc(extra.node);
+    const size_ty = try sema.stdLangType(block, src, "Type.Pointer.Size");
+    const attrs_ty = try sema.stdLangType(block, src, "Type.Pointer.Attributes");
+    const size_val = try sema.resolveConstValue(block, src, try sema.coerce(block, size_ty, sema.resolveInst(extra.size), src), "pointer size must be comptime-known");
+    const attrs = try sema.resolveConstValue(block, src, try sema.coerce(block, attrs_ty, sema.resolveInst(extra.attrs), src), "pointer attributes must be comptime-known");
+    if (sema.isUndef(size_val) or sema.isUndef(attrs)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+    const size_name = ip.stringSlice(ip.structInfo(size_ty).field_names[sema.enumTagIndex(size_val).?]);
+    const size = std.meta.stringToEnum(InternPool.PtrType.Size, size_name).?;
+    const elem_ty = try sema.resolveType(block, src, extra.elem_ty);
+    switch (Type.class(ip, elem_ty)) {
+        .noreturn => return sema.fail(block, src, "pointer to noreturn not allowed", .{}),
+        .null => return sema.fail(block, src, "cannot reify pointer to '@TypeOf(null)'", .{}),
+        .@"fn" => if (size != .one) return sema.fail(block, src, "function pointers must be single pointers", .{}),
+        .@"opaque" => if (size != .one) return sema.fail(block, src, "indexable pointer to opaque type '{f}' not allowed", .{sema.fmtType(elem_ty)}),
+        else => {},
+    }
+    var alignment: u6 = 0;
+    const align_val = try sema.structFieldValue(attrs, "align");
+    if (ip.indexToKey(align_val).opt.val != .none) {
+        const a = ip.intValue(u64, ip.indexToKey(align_val).opt.val).?;
+        if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
+        if (sema.naturalAlignment(elem_ty) != a) alignment = @intCast(std.math.log2_int(u64, a) + 1);
+    }
+    const addr_space = ip.indexToKey(try sema.structFieldValue(attrs, "addrspace")).opt.val;
+    if (addr_space != .none) {
+        const as_ty = ip.typeOf(addr_space);
+        if (!std.mem.eql(u8, ip.stringSlice(ip.structInfo(as_ty).field_names[sema.enumTagIndex(addr_space).?]), "generic"))
+            return sema.failUnsupported(block, src, "address spaces");
+    }
+    const sentinel_opt = try sema.resolveConstValue(block, src, try sema.coerce(block, try sema.optType(elem_ty), sema.resolveInst(extra.sentinel), src), "pointer sentinel must be comptime-known");
+    if (sema.isUndef(sentinel_opt)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+    const sentinel = ip.indexToKey(sentinel_opt).opt.val;
+    if (sentinel != .none and (size == .one or size == .c)) return sema.fail(block, src, "sentinels are only allowed on slices and unknown-length pointers", .{});
+    return .fromInterned(try sema.ptrType(.{
+        .child = elem_ty,
+        .sentinel = sentinel,
+        .flags = .{
+            .size = size,
+            .is_const = try sema.structFieldValue(attrs, "const") == .bool_true,
+            .is_volatile = try sema.structFieldValue(attrs, "volatile") == .bool_true,
+            .is_allowzero = try sema.structFieldValue(attrs, "allowzero") == .bool_true,
+            .alignment = alignment,
+        },
+    }));
 }
 
 fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag) CompileError!Ref {
