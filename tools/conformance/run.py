@@ -18,7 +18,7 @@ upstream's own test step reports (for example "behavior.basic.test.truncate"),
 which is what the compiler puts in builtin.test_functions.
 
 The compiler builds each unit with the test runner given by --test-runner
-(default: test_runner.zig next to this file); results are parsed from the
+(default: test_runner.zig for upstream, zap_runner.zig for zap); results are parsed from the
 runner's "@zap-test" line protocol, documented in test_runner.zig, so any
 runner that speaks it works. A crash or timeout marks the running test and
 the binary is rerun with --start=<next index> to run the rest.
@@ -560,7 +560,7 @@ def main():
     p.add_argument("--target", action="append", choices=sorted(TARGETS), help="target to run (repeatable; default: all)")
     p.add_argument("--zap", type=Path, help="zap executable (default: build zap with -Doptimize=ReleaseSafe)")
     p.add_argument("--zig", default="zig", help="upstream zig 0.17.0, used for --upstream and to build zap (default: zig on PATH)")
-    p.add_argument("--test-runner", type=Path, default=HERE / "test_runner.zig", help="test runner passed to the compiler")
+    p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, zap_runner.zig for zap until zap compiles test_runner.zig)")
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
     p.add_argument("--compile-timeout", type=float, default=300, help="seconds per file compile")
@@ -571,6 +571,8 @@ def main():
     p.add_argument("-v", "--verbose", action="store_true", help="print each file's result to stderr")
     args = p.parse_args()
 
+    if args.test_runner is None:
+        args.test_runner = HERE / ("test_runner.zig" if args.upstream else "zap_runner.zig")
     args.test_runner = args.test_runner.resolve()
     args.workdir = args.workdir.resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
