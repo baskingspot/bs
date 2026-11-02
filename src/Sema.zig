@@ -1986,6 +1986,14 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const operand = try sema.coerce(block, .usize_type, sema.resolveInst(extra.rhs), src);
             if (try sema.resolveDefinedValue(block, src, operand)) |v| {
                 const addr = sema.ip.intValue(u64, v).?;
+                // A non-null optional pointer is an `opt` around its pointer.
+                if (Type.class(sema.ip, ty) == .optional) {
+                    if (addr == 0) break :blk .fromInterned(try sema.intern(.{ .opt = .{ .ty = ty, .val = .none } }));
+                    const ptr = try sema.intern(.{ .ptr = .{ .ty = Type.childType(sema.ip, ty), .base = .int, .byte_offset = addr } });
+                    break :blk .fromInterned(try sema.intern(.{ .opt = .{ .ty = ty, .val = ptr } }));
+                }
+                if (addr == 0 and !Type.ptrInfo(sema.ip, ty).flags.is_allowzero and Type.ptrInfo(sema.ip, ty).flags.size != .c)
+                    return sema.fail(block, src, "pointer type '{f}' does not allow address zero", .{sema.fmtType(ty)});
                 break :blk .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .int, .byte_offset = addr } }));
             }
             break :blk sema.addTyOp(block, .ptr_from_int, ty, operand);
@@ -4306,6 +4314,63 @@ fn cmpFloat(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator, 
     return sema.addBinOp(block, cmpTag(op), try sema.coerce(block, dest_ty, lhs, src), try sema.coerce(block, dest_ty, rhs, src));
 }
 
+/// `==` and `!=` where an operand is optional: null equals only null, and
+/// payloads compare like their type.
+fn cmpOptional(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator, lhs: Ref, rhs: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const l_opt = Type.class(ip, sema.typeOf(lhs)) == .optional;
+    const r_opt = Type.class(ip, sema.typeOf(rhs)) == .optional;
+    const Side = struct { nn: ?Ref, payload: Ref };
+    const side = struct {
+        fn f(s: *Sema, b: *Block, sr: Src, r: Ref, is_opt: bool) CompileError!?Side {
+            if (!is_opt) return .{ .nn = null, .payload = r };
+            if (s.resolveValue(r)) |v| {
+                if (s.isUndef(v)) return s.fail(b, sr, "use of undefined value here causes illegal behavior", .{});
+                const pv = s.ip.indexToKey(v).opt.val;
+                // Comptime-known null.
+                if (pv == .none) return null;
+                return .{ .nn = null, .payload = .fromInterned(pv) };
+            }
+            return .{ .nn = try s.analyzeIsNonNull(b, sr, r), .payload = try s.optionalPayload(b, sr, r, false) };
+        }
+    }.f;
+    const l = try side(sema, block, src, lhs, l_opt);
+    const r = try side(sema, block, src, rhs, r_opt);
+    var eq: Ref = undefined;
+    if (l == null or r == null) {
+        // One side is null: equal when the other is null too.
+        const other = if (l == null) r else l;
+        eq = if (other == null) .fromInterned(.bool_true) else if (other.?.nn) |nn| try sema.boolNot(block, nn) else .fromInterned(.bool_false);
+    } else {
+        const pe = try sema.analyzeCmp(block, src, .eq, l.?.payload, r.?.payload);
+        if (l.?.nn != null and r.?.nn != null) {
+            // (nn_l == nn_r) and (!nn_l or payloads equal)
+            const same = try sema.analyzeCmp(block, src, .eq, l.?.nn.?, r.?.nn.?);
+            eq = try sema.boolOp(block, .bit_and, same, try sema.boolOp(block, .bit_or, try sema.boolNot(block, l.?.nn.?), pe));
+        } else if (l.?.nn orelse r.?.nn) |nn| {
+            eq = try sema.boolOp(block, .bit_and, nn, pe);
+        } else eq = pe;
+    }
+    return if (op == .eq) eq else sema.boolNot(block, eq);
+}
+
+fn boolNot(sema: *Sema, block: *Block, operand: Ref) CompileError!Ref {
+    if (sema.resolveValue(operand)) |v| if (!sema.isUndef(v)) return .fromInterned(boolValue(v != .bool_true));
+    return sema.addTyOp(block, .not, .bool_type, operand);
+}
+
+fn boolOp(sema: *Sema, block: *Block, tag: Ir.Inst.Tag, a: Ref, b: Ref) CompileError!Ref {
+    const av = sema.resolveValue(a);
+    const bv = sema.resolveValue(b);
+    const absorbing: Index = if (tag == .bit_and) .bool_false else .bool_true;
+    if (av == absorbing or bv == absorbing) return .fromInterned(absorbing);
+    if (av != null and bv != null) return .fromInterned(if (tag == .bit_and) boolValue(av == .bool_true and bv == .bool_true) else boolValue(av == .bool_true or bv == .bool_true));
+    // The identity element drops out.
+    if (av != null) return b;
+    if (bv != null) return a;
+    return sema.addBinOp(block, tag, a, b);
+}
+
 fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator, lhs: Ref, rhs: Ref) CompileError!Ref {
     const ip = sema.ip;
     const lt = sema.typeOf(lhs);
@@ -4327,17 +4392,23 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         if (sema.resolveValue(non_null)) |v| return .fromInterned(boolValue(v != .bool_true));
         return sema.addTyOp(block, .not, .bool_type, non_null);
     }
-    // An optional compared with a value of its payload type: null is
-    // unequal to every value.
-    if (is_eq and (lc == .optional) != (rc == .optional) and
-        !Type.optionalReprIsPtr(ip, Type.childType(ip, if (lc == .optional) lt else rt)))
+    if (is_eq and (lc == .optional or rc == .optional)) return sema.cmpOptional(block, src, op, lhs, rhs);
+    if (is_eq and lt == .void_type and rt == .void_type) return .fromInterned(boolValue(op == .eq));
+    if (is_eq and ((lc == .error_union and rc == .error_set) or (lc == .error_set and rc == .error_union))) {
+        // `eu == error.X`: the error union holds that error.
+        const eu = if (lc == .error_union) lhs else rhs;
+        const err = if (lc == .error_union) rhs else lhs;
+        const non_err = try sema.analyzeIsNonErr(block, src, eu);
+        if (sema.resolveValue(non_err)) |v| if (v == .bool_true) return .fromInterned(boolValue(op == .neq));
+        // At runtime, the error field of a payload is 0, never a valid
+        // error code.
+        return sema.analyzeCmp(block, src, op, try sema.errUnionCode(block, src, eu), err);
+    }
+    if (is_eq and ((lc == .pointer and Type.ptrInfo(ip, lt).flags.size == .c and (rc == .int or rc == .comptime_int)) or
+        (rc == .pointer and Type.ptrInfo(ip, rt).flags.size == .c and (lc == .int or lc == .comptime_int))))
     {
-        const opt = if (lc == .optional) lhs else rhs;
-        const non_null = try sema.analyzeIsNonNull(block, src, opt);
-        const nn = sema.resolveValue(non_null) orelse return sema.failUnsupported(block, src, "runtime comparisons of optionals with values");
-        if (nn != .bool_true) return .fromInterned(boolValue(op == .neq));
-        const payload = try sema.optionalPayload(block, src, opt, false);
-        return sema.analyzeCmp(block, src, op, if (lc == .optional) payload else lhs, if (lc == .optional) rhs else payload);
+        const ptr_ty = if (lc == .pointer) lt else rt;
+        return sema.analyzeCmp(block, src, op, try sema.coerce(block, ptr_ty, lhs, src), try sema.coerce(block, ptr_ty, rhs, src));
     }
     if (lt == .type_type and rt == .type_type and is_eq) {
         const a = try sema.resolveConstValue(block, src, lhs, "types must be comptime-known");
