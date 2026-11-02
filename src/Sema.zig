@@ -326,19 +326,6 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     info.field_types = types;
     info.status = .have_field_types;
 
-    // Defaults may refer to the struct itself (for example its size), so
-    // they are evaluated after the field types.
-    it = decl.iterateFields();
-    while (it.next()) |field| {
-        const body = field.default_body orelse continue;
-        // Within the default body, the struct instruction stands for the
-        // field type (the result type of the default value).
-        try sema.inst_map.put(sema.gpa, key.zir_inst, .fromInterned(types[field.idx]));
-        const ref = try sema.resolveInlineBody(&block, body, key.zir_inst);
-        const coerced = try sema.coerce(&block, types[field.idx], ref, block.nodeSrc(.zero));
-        defaults[field.idx] = try sema.resolveConstValue(&block, block.nodeSrc(.zero), coerced, "struct field default value must be comptime-known");
-    }
-    info.field_defaults = defaults;
 
     info.status = .layout_wip;
     var offset: u64 = 0;
@@ -359,6 +346,22 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     info.size = std.mem.alignForward(u64, offset, alignment);
     info.alignment = alignment;
     info.status = .have_layout;
+
+    // Defaults may refer to the struct itself (for example its size), so
+    // they are evaluated after the layout. Until then every field reads as
+    // having no default.
+    info.field_defaults = defaults;
+    it = decl.iterateFields();
+    while (it.next()) |field| {
+        const body = field.default_body orelse continue;
+        // Within the default body, the struct instruction stands for the
+        // field type (the result type of the default value).
+        try sema.inst_map.put(sema.gpa, key.zir_inst, .fromInterned(types[field.idx]));
+        const ref = try sema.resolveInlineBody(&block, body, key.zir_inst);
+        const coerced = try sema.coerce(&block, types[field.idx], ref, block.nodeSrc(.zero));
+        defaults[field.idx] = try sema.resolveConstValue(&block, block.nodeSrc(.zero), coerced, "struct field default value must be comptime-known");
+    }
+    info.field_defaults = defaults;
     try sema.finish();
 }
 
@@ -1390,8 +1393,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
     return switch (tag) {
         .int => .fromInterned(try sema.intValue(.comptime_int_type, data.int)),
         .int_big => blk: {
-            const limb_bytes = data.str.get(sema.code.*);
-            const limbs = try sema.arena.alloc(std.math.big.Limb, limb_bytes.len / @sizeOf(std.math.big.Limb));
+            // `str.len` counts limbs, and the bytes may contain zeros.
+            const limbs = try sema.arena.alloc(std.math.big.Limb, data.str.len);
+            const limb_bytes = sema.code.string_bytes[@backingInt(data.str.start)..][0 .. limbs.len * @sizeOf(std.math.big.Limb)];
             @memcpy(std.mem.sliceAsBytes(limbs), limb_bytes);
             break :blk .fromInterned(try sema.bigToValue(.comptime_int_type, .{ .limbs = limbs, .positive = true }));
         },
@@ -1676,8 +1680,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             const result_ty = try sema.resolveType(block, src, data.un_node.operand);
             if (tag != .struct_init_empty_ref_result) break :blk sema.structInitEmpty(block, src, result_ty);
-            if (result_ty == .generic_poison_type) break :blk sema.analyzeRef(block, src, .fromInterned(.empty_tuple));
-            const p = Type.ptrInfo(sema.ip, result_ty);
+            const ptr_ty = sema.unwrapOptEu(result_ty);
+            if (ptr_ty == .generic_poison_type or Type.class(sema.ip, ptr_ty) != .pointer) break :blk sema.analyzeRef(block, src, .fromInterned(.empty_tuple));
+            const p = Type.ptrInfo(sema.ip, ptr_ty);
             if (p.flags.size == .one) break :blk sema.analyzeRef(block, src, try sema.structInitEmpty(block, src, p.child));
             // `&.{}` as a slice or many-pointer: an empty array.
             const array_ty = try sema.intern(.{ .array_type = .{ .len = 0, .child = p.child, .sentinel = p.sentinel } });
@@ -1713,8 +1718,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .validate_array_init_ref_ty => blk: {
             const extra = sema.code.extraData(Zir.Inst.ArrayInitRefTy, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const ptr_ty = try sema.resolveType(block, src, extra.ptr_ty);
-            if (ptr_ty == .generic_poison_type) break :blk .fromInterned(.generic_poison_type);
+            const ptr_ty = sema.unwrapOptEu(try sema.resolveType(block, src, extra.ptr_ty));
+            if (ptr_ty == .generic_poison_type or Type.class(sema.ip, ptr_ty) != .pointer) break :blk .fromInterned(.generic_poison_type);
             const p = Type.ptrInfo(sema.ip, ptr_ty);
             if (p.flags.size == .one) break :blk .fromInterned(p.child);
             break :blk .fromInterned(try sema.intern(.{ .array_type = .{ .len = extra.elem_count, .child = p.child, .sentinel = p.sentinel } }));
@@ -2279,6 +2284,17 @@ fn stdCallingConvention(sema: *Sema, block: *Block, src: Src, cc_ty: Index, cc: 
     return sema.intern(.{ .un = .{ .ty = cc_ty, .tag = try sema.unionFieldTagValue(cc_ty, i), .val = payload } });
 }
 
+/// `ty` without optional and error union wrappers: the type that a result
+/// location of type `ty` initializes.
+fn unwrapOptEu(sema: *Sema, ty: Index) Index {
+    var t = ty;
+    while (true) switch (sema.ip.indexToKey(t)) {
+        .opt_type => |c| t = c,
+        .error_union_type => |e| t = e.payload_type,
+        else => return t,
+    };
+}
+
 /// The value of `std.lang.<path>`, where `path` may be dotted.
 fn stdLangDecl(sema: *Sema, block: *Block, src: Src, path: []const u8) CompileError!Ref {
     const std_file = sema.zcu.moduleRootFile(.std) orelse return sema.fail(block, src, "std.lang.{s} requires the std module", .{path});
@@ -2677,7 +2693,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 var space: [2]std.math.big.Limb = undefined;
                 return .fromInterned(try sema.bigToValue(dest_ty, ip.intToBig(v, &space)));
             }
-            if (dc == .comptime_int) return sema.fail(block, src, "unable to resolve comptime value", .{});
+            if (dc == .comptime_int or sc == .comptime_int) return sema.fail(block, src, "unable to resolve comptime value", .{});
             const s = Type.intInfo(ip, src_ty);
             const d = Type.intInfo(ip, dest_ty);
             const fits = if (s.signedness == d.signedness) d.bits >= s.bits else s.signedness == .unsigned and d.bits > s.bits;
@@ -3726,24 +3742,33 @@ fn comptimeLoadOrNull(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileE
         .comptime_alloc => |id| blk: {
             const alloc = sema.comptime_allocs.get(id) orelse
                 return sema.fail(block, src, "comptime variable is not accessible here", .{});
-            break :blk alloc.val;
+            break :blk try sema.loadAtOffset(alloc.val, key);
         },
-        .uav => |u| u.val,
+        .uav => |u| try sema.loadAtOffset(u.val, key),
         .nav => |n| blk: {
             try sema.ensureNavVal(block, src, n);
             const nav = ip.getNav(n);
             if (!nav.is_const) break :blk null;
-            break :blk nav.val;
+            break :blk try sema.loadAtOffset(nav.val, key);
         },
         .int => null,
         .field => |f| blk: {
             const parent = (try sema.comptimeLoadOrNull(block, src, f.base)) orelse break :blk null;
+            if (ip.typeOf(parent) != Type.ptrInfo(ip, ip.typeOf(f.base)).child)
+                return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
             break :blk try sema.fieldValue(parent, @intCast(f.index));
         },
         .elem => |e| blk: {
             const parent = (try sema.comptimeLoadOrNull(block, src, e.base)) orelse break :blk null;
             const parent_ty = Type.ptrInfo(ip, ip.typeOf(e.base)).child;
             if (ip.indexToKey(parent_ty) != .array_type) break :blk null;
+            if (ip.indexToKey(ip.typeOf(parent)) != .array_type) {
+                // A single item viewed as a one-element array (`*T` to `*[1]T`).
+                if (e.index == 0 and ip.typeOf(parent) == ip.indexToKey(parent_ty).array_type.child) break :blk parent;
+                return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+            }
+            if (ip.typeOf(parent) != parent_ty or e.index >= ip.indexToKey(parent_ty).array_type.lenIncludingSentinel())
+                return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
             const elem_ty = ip.indexToKey(parent_ty).array_type.child;
             const load_ty = Type.ptrInfo(ip, key.ty).child;
             if (load_ty != elem_ty and ip.indexToKey(load_ty) == .array_type and ip.indexToKey(load_ty).array_type.child == elem_ty) {
@@ -3758,6 +3783,26 @@ fn comptimeLoadOrNull(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileE
     };
 }
 
+/// The value pointer `key` loads from root value `val`: `val` itself, or an
+/// element of array `val` that a pointer with a byte offset (from a
+/// many-pointer or a cast to the element type) addresses. Null if the
+/// pointer reinterprets memory in a way zap does not model.
+fn loadAtOffset(sema: *Sema, val: Index, key: InternPool.Ptr) !?Index {
+    const ip = sema.ip;
+    if (val == .none) return val;
+    const p = Type.ptrInfo(ip, key.ty);
+    const load_ty = p.child;
+    const val_ty = ip.typeOf(val);
+    if (load_ty == val_ty or load_ty == .generic_poison_type or load_ty == .anyopaque_type) return if (key.byte_offset == 0) val else null;
+    if (ip.indexToKey(val_ty) != .array_type) return if (key.byte_offset == 0) val else null;
+    const a = ip.indexToKey(val_ty).array_type;
+    if (load_ty != a.child) return if (key.byte_offset == 0) val else null;
+    const size = Type.abiSize(ip, a.child);
+    if (size == 0) return try sema.elemValue(val, 0);
+    if (key.byte_offset % size != 0 or key.byte_offset / size > a.len) return null;
+    return try sema.elemValue(val, key.byte_offset / size);
+}
+
 fn comptimeLoad(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!Index {
     return (try sema.comptimeLoadOrNull(block, src, ptr)) orelse
         sema.fail(block, src, "unable to evaluate comptime expression: memory is runtime-known", .{});
@@ -3769,7 +3814,17 @@ fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) C
         .comptime_alloc => |id| {
             const alloc = sema.comptime_allocs.getPtr(id) orelse
                 return sema.fail(block, src, "comptime variable is not accessible here", .{});
-            alloc.val = val;
+            if (key.byte_offset == 0) {
+                alloc.val = val;
+            } else {
+                // An element addressed by offset (through a many-pointer).
+                const ip = sema.ip;
+                const arr_ty = ip.typeOf(alloc.val);
+                if (ip.indexToKey(arr_ty) != .array_type) return sema.fail(block, src, "unable to store to this memory at comptime", .{});
+                const size = Type.abiSize(ip, ip.indexToKey(arr_ty).array_type.child);
+                if (size == 0 or key.byte_offset % size != 0) return sema.fail(block, src, "unable to store to this memory at comptime", .{});
+                alloc.val = try sema.withElem(alloc.val, key.byte_offset / size, val);
+            }
         },
         .field => |f| {
             const parent = try sema.comptimeLoad(block, src, f.base);
@@ -3777,6 +3832,12 @@ fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) C
         },
         .elem => |e| {
             const parent = try sema.comptimeLoad(block, src, e.base);
+            const parent_ty = sema.ip.typeOf(parent);
+            if (sema.ip.indexToKey(parent_ty) != .array_type) {
+                // A single item viewed as a one-element array.
+                if (e.index == 0 and parent_ty == sema.ip.typeOf(val)) return sema.comptimeStore(block, src, e.base, val);
+                return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+            }
             try sema.comptimeStore(block, src, e.base, try sema.withElem(parent, e.index, val));
         },
         else => return sema.fail(block, src, "unable to store to this memory at comptime", .{}),
@@ -4147,6 +4208,7 @@ fn slicePtr(sema: *Sema, block: *Block, slice: Ref) CompileError!Ref {
 /// Emits `index < len` as a safety check.
 fn boundsCheck(sema: *Sema, block: *Block, src: Src, index: Ref, len: Ref, allow_eq: bool) CompileError!void {
     if (sema.resolveValue(index)) |i| if (sema.resolveValue(len)) |l| {
+        if (sema.isUndef(i) or sema.isUndef(l)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
         const iv = sema.ip.intValue(u64, i).?;
         const lv = sema.ip.intValue(u64, l).?;
         if (iv > lv or (iv == lv and !allow_eq)) return sema.fail(block, src, "index {d} outside array of length {d}", .{ iv, lv });

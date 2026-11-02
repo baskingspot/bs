@@ -249,7 +249,7 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
     if (!Type.hasRuntimeBits(ip, ty)) return .none;
     switch (ip.indexToKey(val)) {
         .undef => if (cg.passInRegs(ty)) return .{ .imm = 0xaaaa_aaaa_aaaa_aaaa },
-        .int => return .{ .imm = intBits(ip, val) },
+        .int => if (cg.passInRegs(ty)) return .{ .imm = intBits(ip, val) },
         .simple_value => |s| switch (s) {
             .true => return .{ .imm = 1 },
             .false => return .{ .imm = 0 },
@@ -441,6 +441,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .arg => {},
         .dbg_stmt => try cg.e.line(data.dbg_stmt.line, data.dbg_stmt.column),
         .alloc => {
+            // An inferred alloc whose initializer never completes.
+            if (data.ty == .none) return;
             const child = Type.ptrInfo(ip, data.ty).child;
             const off = try cg.allocSlot(@max(Type.abiSize(ip, child), 1), Type.abiAlignment(ip, child));
             cg.homes[@backingInt(inst)] = .{ .frame_addr = off };
@@ -1392,10 +1394,16 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
     switch (ip.indexToKey(val)) {
         .undef => @memset(out, 0xaa),
         .int => {
-            const bits = intBits(ip, val);
-            var buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &buf, bits, .little);
-            @memcpy(out, buf[0..out.len]);
+            // Two's complement, little-endian, sign- or zero-extended to the
+            // ABI size.
+            var space: [2]std.math.big.Limb = undefined;
+            const big = ip.intToBig(val, &space);
+            var m = try std.math.big.int.Managed.init(gpa);
+            defer m.deinit();
+            try m.ensureTwosCompCapacity(@intCast(out.len * 8));
+            var mut = m.toMutable();
+            mut.truncate(big, .unsigned, @intCast(out.len * 8));
+            mut.toConst().writeTwosComplement(out, .little);
         },
         .simple_value => |s| out[0] = @intFromBool(s == .true),
         .enum_tag => |e| try lowerValue(emit, e.int, out, relocs, base_off),

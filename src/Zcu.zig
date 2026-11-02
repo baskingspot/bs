@@ -281,8 +281,9 @@ pub fn createContainerType(
         .file = file_index,
         .parent = parent_ns,
         .owner_type = ty,
-        .fqn = fqn,
-        .key = key,
+        // The caller's names may live in a Sema arena.
+        .fqn = try zcu.arena.allocator().dupe(u8, fqn),
+        .key = try zcu.arena.allocator().dupe(u8, key),
     });
     const arena = zcu.arena.allocator();
     const key_sep = if (parent_ns == Namespace.none) ":" else ".";
@@ -491,15 +492,16 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
         const state = zcu.funcs.getPtr(func).?;
         if (state.* != .queued) continue;
         state.* = .in_progress;
+        // Analysis can grow `funcs`, so the state is looked up again after.
         var ir = Sema.analyzeFuncBody(zcu, func) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                state.* = .failed;
+                zcu.funcs.getPtr(func).?.* = .failed;
                 continue;
             },
         };
         defer ir.deinit(zcu.gpa);
-        state.* = .done;
+        zcu.funcs.getPtr(func).?.* = .done;
         try sink.function(zcu, &ir);
     }
 }
