@@ -113,7 +113,31 @@ pub fn floatBits(ip: *const InternPool, ty: Index) u16 {
         .f32 => 32,
         .f64 => 64,
         .f80, .c_longdouble => 80,
-        .f128 => 128,
+        .f128, .comptime_float => 128,
+        else => unreachable,
+    };
+}
+
+/// Bits of precision, counting the implicit leading bit.
+pub fn floatSignificandBits(ip: *const InternPool, ty: Index) u16 {
+    return switch (floatBits(ip, ty)) {
+        16 => 11,
+        32 => 24,
+        64 => 53,
+        80 => 64,
+        128 => 113,
+        else => unreachable,
+    };
+}
+
+/// The float type of `bits` bits (`c_longdouble` becomes `f80`).
+pub fn floatOfBits(bits: u16) Index {
+    return switch (bits) {
+        16 => .f16_type,
+        32 => .f32_type,
+        64 => .f64_type,
+        80 => .f80_type,
+        128 => .f128_type,
         else => unreachable,
     };
 }
@@ -137,6 +161,14 @@ pub fn childType(ip: *const InternPool, ty: Index) Index {
         .array_type => |a| a.child,
         .vector_type => |v| v.child,
         else => unreachable,
+    };
+}
+
+/// The element type of a vector type; any other type itself.
+pub fn scalarType(ip: *const InternPool, ty: Index) Index {
+    return switch (ip.indexToKey(ty)) {
+        .vector_type => |v| v.child,
+        else => ty,
     };
 }
 

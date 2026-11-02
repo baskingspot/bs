@@ -44,6 +44,9 @@ comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, InternPool.Index) = .em
 /// Errors each function instance returns, for inferred error sets.
 inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, std.ArrayList(InternPool.String)) = .empty,
 exports: std.ArrayList(Export) = .empty,
+/// compiler_rt functions that CodeGen calls, by the stable key of their
+/// declaration; `analyzeAll` resolves each and queues its body.
+rt_helpers: std.StringArrayHashMapUnmanaged(void) = .empty,
 /// `zap test`: collect the main module's tests into `builtin.test_functions`.
 is_test: bool = false,
 /// `zap test --test-filter`: keep only named tests whose fqn contains one.
@@ -150,6 +153,7 @@ pub fn deinit(zcu: *Zcu) void {
     while (it.next()) |list| list.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
     zcu.exports.deinit(gpa);
+    zcu.rt_helpers.deinit(gpa);
     zcu.test_functions.deinit(gpa);
     zcu.errors.deinit(gpa);
     zcu.file_root_types.deinit(gpa);
@@ -294,6 +298,7 @@ pub fn createContainerType(
         const d = zir.getDeclaration(decl_inst);
         const simple: []const u8 = switch (d.kind) {
             .@"comptime" => {
+                if (zcu.file(file_index).module == .compiler_rt) continue;
                 try zcu.comptime_decls.put(zcu.gpa, .{ .file = file_index, .inst = decl_inst, .namespace = ns_index, .ordinal = comptime_ordinal }, .queued);
                 comptime_ordinal += 1;
                 continue;
@@ -439,6 +444,38 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !void {
     try zcu.func_queue.append(zcu.gpa, func);
 }
 
+/// Requests compiler_rt function `name`, declared in `lib/compiler_rt/<file>`,
+/// and returns the stable key of its function unit (its symbol). Only that
+/// declaration and what it reaches are analyzed, never compiler_rt's
+/// `comptime` export blocks.
+pub fn requestCompilerRt(zcu: *Zcu, file_name: []const u8, name: []const u8) ![]const u8 {
+    var buf: [128]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "compiler_rt:compiler_rt/{s}:{s}", .{ file_name, name }) catch unreachable;
+    const gop = try zcu.rt_helpers.getOrPut(zcu.gpa, key);
+    if (!gop.found_existing) gop.key_ptr.* = try zcu.arena.allocator().dupe(u8, key);
+    return gop.key_ptr.*;
+}
+
+fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
+    const no_span: Ast.Span = .{ .start = 0, .end = 0, .main = 0 };
+    const rest = key["compiler_rt:".len..];
+    const colon = std.mem.lastIndexOfScalar(u8, rest, ':').?;
+    const name = rest[colon + 1 ..];
+    var buf: [128]u8 = undefined;
+    const file_key = std.fmt.bufPrint(&buf, "{d}:{s}", .{ @backingInt(Frontend.Module.Index.compiler_rt), rest[0..colon] }) catch unreachable;
+    const file_index = zcu.fe.file_map.get(file_key) orelse
+        return zcu.addError(0, no_span, "compiler_rt file '{s}' is not loaded", .{rest[0..colon]});
+    const ty = try zcu.fileRootType(@backingInt(file_index));
+    const ns = zcu.ip.structInfo(ty).namespace;
+    const nav = zcu.namespaces.items[ns].decls.get(try zcu.ip.getString(tid, name)) orelse
+        return zcu.addError(@backingInt(file_index), no_span, "compiler_rt has no function '{s}'", .{name});
+    zcu.ensureNavVal(nav) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    try zcu.queueFunc(zcu.ip.getNav(nav).val);
+}
+
 /// Analyzes the root file's `comptime` and exported declarations and
 /// everything they reach. Each runtime function body is passed to
 /// `sink.function(ir)` as soon as it is analyzed, then freed.
@@ -451,6 +488,7 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
     var done_exports: usize = 0;
     var done_comptime: usize = 0;
     var done_tests: usize = 0;
+    var done_rt: usize = 0;
     while (true) {
         if (done_comptime < zcu.comptime_decls.count()) {
             const c = zcu.comptime_decls.keys()[done_comptime];
@@ -478,6 +516,12 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
                 else => continue,
             };
             try zcu.queueFunc(zcu.ip.getNav(nav).val);
+            continue;
+        }
+        if (done_rt < zcu.rt_helpers.count()) {
+            const key = zcu.rt_helpers.keys()[done_rt];
+            done_rt += 1;
+            try zcu.resolveCompilerRt(key);
             continue;
         }
         if (zcu.ready_irs.items.len != 0) {

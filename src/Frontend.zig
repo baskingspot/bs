@@ -60,6 +60,7 @@ pub const Module = struct {
         root,
         std,
         builtin,
+        compiler_rt,
         _,
     };
 };
@@ -135,6 +136,13 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         .name = "builtin",
         .root_dir = try gpa.dupe(u8, options.builtin_dir),
         .root_file = try gpa.dupe(u8, "builtin.zig"),
+        .cache = .global,
+    });
+    // Its functions are analyzed only when CodeGen calls them.
+    try fe.modules.append(gpa, .{
+        .name = "compiler_rt",
+        .root_dir = try gpa.dupe(u8, zig_lib_dir),
+        .root_file = try gpa.dupe(u8, "compiler_rt.zig"),
         .cache = .global,
     });
     if (options.main_src_path) |path| {
@@ -843,11 +851,13 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
 
     const root_job = try l.getJob(.root, fe.module(.root).root_file);
     // `zap test` also analyzes the module under test and std.
-    var extra_roots: [2]?*Job = @splat(null);
+    var extra_roots: [3]?*Job = @splat(null);
     if (fe.main_module != .root) extra_roots = .{
         try l.getJob(fe.main_module, fe.module(fe.main_module).root_file),
         try l.getJob(.std, fe.module(.std).root_file),
+        null,
     };
+    extra_roots[2] = try l.getJob(.compiler_rt, fe.module(.compiler_rt).root_file);
     l.work(.main);
     l.group.await(io) catch {};
     if (l.failure) |err| return err;
@@ -859,9 +869,15 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     defer order.deinit(gpa);
     root_job.index = @fromBackingInt(0);
     order.appendAssumeCapacity(root_job);
+    var rt_missing: u32 = 0;
     for (extra_roots) |opt| {
         const job = opt orelse continue;
         if (job.index != null) continue;
+        // Without compiler_rt (unit tests), a helper fails when requested.
+        if (job.missing != null and job == extra_roots[2]) {
+            rt_missing = 1;
+            continue;
+        }
         job.index = @fromBackingInt(@intCast(order.items.len));
         order.appendAssumeCapacity(job);
     }
@@ -875,7 +891,7 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
             order.appendAssumeCapacity(imp);
         }
     }
-    stats.guessed = @intCast(l.jobs.count() - order.items.len);
+    stats.guessed = @intCast(l.jobs.count() - order.items.len - rt_missing);
 
     try fe.files.ensureTotalCapacityPrecise(gpa, order.items.len);
     try fe.file_map.ensureTotalCapacity(gpa, @intCast(order.items.len));

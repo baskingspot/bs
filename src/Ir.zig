@@ -92,14 +92,45 @@ pub const Inst = struct {
         add_with_overflow,
         sub_with_overflow,
         mul_with_overflow,
-        /// `bin_op`: integer division and remainder. The divisor is non-zero
-        /// and the quotient fits; Sema emits the checks.
+        /// `bin_op`: IEEE float arithmetic, rounding to nearest even.
+        add_float,
+        sub_float,
+        mul_float,
+        div_float,
+        /// `bin_op`: division and remainder of integers or floats. For
+        /// integers, the divisor is non-zero and the quotient fits; Sema
+        /// emits the checks. For floats, `div_trunc`/`div_floor`/`div_ceil`
+        /// round the IEEE quotient, `rem` has the sign of the dividend
+        /// (C `fmod`), and `mod` the sign of the divisor.
         div_trunc,
         div_floor,
         /// Rounds toward positive infinity.
         div_ceil,
         rem,
         mod,
+        /// `bin_op`: `@min` and `@max` of floats: a NaN operand yields the
+        /// other operand (C `fmin`/`fmax`).
+        min_float,
+        max_float,
+        /// `un_op`: unary float math on an operand of float type: negation
+        /// (sign flip), the `@sqrt`... `@round` builtins, and `@abs`.
+        neg_float,
+        sqrt,
+        sin,
+        cos,
+        tan,
+        exp,
+        exp2,
+        log,
+        log2,
+        log10,
+        abs_float,
+        floor,
+        ceil,
+        round,
+        trunc_float,
+        /// `pl_op` with `Bin`: `@mulAdd(lhs, rhs, operand)`, fused.
+        mul_add,
         /// `bin_op`: bitwise operations on integers or bools.
         bit_and,
         bit_or,
@@ -110,7 +141,9 @@ pub const Inst = struct {
         shr,
         /// `ty_op`: bitwise NOT for integers, logical NOT for bools.
         not,
-        /// `bin_op`: comparisons of integers, bools, or pointers; result `bool`.
+        /// `bin_op`: comparisons of integers, floats, bools, or pointers;
+        /// result `bool`. Float comparisons with a NaN are false, except
+        /// `cmp_neq`.
         cmp_lt,
         cmp_lte,
         cmp_eq,
@@ -123,6 +156,14 @@ pub const Inst = struct {
         intcast,
         /// `ty_op`: keep the low bits of an integer.
         trunc,
+        /// `ty_op`: convert a float to another float type, rounding to
+        /// nearest even when narrowing.
+        float_cast,
+        /// `ty_op`: integer to float, rounding to nearest even.
+        float_from_int,
+        /// `ty_op`: float to integer, truncating toward zero. The truncated
+        /// value fits the integer type; Sema emits the check.
+        int_from_float,
         /// `ty_op`: reinterpret the bits of a value of the same size.
         bitcast,
         /// `ty_op`: count leading / trailing zeros, count ones, of integer
@@ -413,6 +454,9 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .not,
         .intcast,
         .trunc,
+        .float_cast,
+        .float_from_int,
+        .int_from_float,
         .bitcast,
         .ptr_from_int,
         .slice_ptr,
@@ -453,6 +497,9 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         => data.ty_pl.ty,
         .store, .set_union_tag, .dbg_stmt => .void_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
+        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ir.typeOf(data.bin_op.lhs, ip),
+        .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),
+        .mul_add => ir.typeOf(data.pl_op.operand, ip),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => .bool_type,
         .int_from_bool => .u1_type,
         .int_from_ptr => .usize_type,

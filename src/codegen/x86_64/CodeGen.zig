@@ -13,7 +13,9 @@
 //!   aligned offsets of the outgoing area, read by the callee at rbp+16.
 //!   A result whose size is 1, 2, 4, or 8 bytes returns in rax; any other
 //!   result is written through a pointer the caller passes in rdi.
-//! - `.c`: SysV for integer, bool, and pointer parameters and results.
+//! - `.c`: SysV for scalars: integers, bools, and pointers in GPRs (16-byte
+//!   integers in pairs), f16/f32/f64/f128 in XMM registers, f80 in memory
+//!   and returned in st0; other values in memory.
 //! - `.naked`: no frame; only inline assembly and traps.
 //!
 //! Integers are kept normalized in memory: a value of a type narrower than
@@ -189,31 +191,22 @@ const c_arg_regs = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
 
 fn setupParams(cg: *CodeGen) Error!void {
     const ip = cg.ip;
+    if (cg.fn_ty.cc == .c) return cg.setupCParams();
     const ret_ty = cg.fn_ty.return_type;
     if (Type.hasRuntimeBits(ip, ret_ty) and !cg.passInRegs(ret_ty)) {
-        if (cg.fn_ty.cc == .c) return cg.fail("C calling convention results of type '{f}'", .{cg.fmtType(ret_ty)});
         const off = try cg.allocSlot(8, 8);
         try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, off) }, .{ .reg = .rdi });
         cg.ret_ptr_slot = off;
     }
     // `arg` instructions are at the start of the main body.
     var stack_off: i32 = 16;
-    var reg_i: usize = 0;
     for (cg.ir.mainBody()) |inst| {
         if (cg.ir.instructions.items(.tag)[@backingInt(inst)] != .arg) break;
         const ty = cg.ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
         if (!Type.hasRuntimeBits(ip, ty)) continue;
         const size = Type.abiSize(ip, ty);
-        if (cg.fn_ty.cc == .c) {
-            if (!cg.passInRegs(ty) or reg_i == c_arg_regs.len) return cg.fail("C calling convention parameters of type '{f}'", .{cg.fmtType(ty)});
-            const off = try cg.allocSlot(size, Type.abiAlignment(ip, ty));
-            try cg.e.mov(sizeOf(size), .{ .mem = Mem.at(.rbp, off) }, .{ .reg = c_arg_regs[reg_i] });
-            reg_i += 1;
-            cg.homes[@backingInt(inst)] = .{ .slot = off };
-        } else {
-            cg.homes[@backingInt(inst)] = .{ .slot = stack_off };
-            stack_off += @intCast(std.mem.alignForward(u64, size, 8));
-        }
+        cg.homes[@backingInt(inst)] = .{ .slot = stack_off };
+        stack_off += @intCast(std.mem.alignForward(u64, size, 8));
     }
 }
 
@@ -250,6 +243,7 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
     switch (ip.indexToKey(val)) {
         .undef => if (cg.passInRegs(ty)) return .{ .imm = 0xaaaa_aaaa_aaaa_aaaa },
         .int => if (cg.passInRegs(ty)) return .{ .imm = intBits(ip, val) },
+        .float => |f| if (cg.passInRegs(ty)) return .{ .imm = @truncate(f.bits()) },
         .simple_value => |s| switch (s) {
             .true => return .{ .imm = 1 },
             .false => return .{ .imm = 0 },
@@ -463,13 +457,22 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
 
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
             const ty = cg.typeOf(data.bin_op.lhs);
+            if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
+            if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
             const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.binOp(tag, ty, data.bin_op.lhs, data.bin_op.rhs);
             try cg.storeReg(dst, .rax, Type.abiSize(ip, ty));
         },
-        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => try cg.overflowOp(inst, tag, data),
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (cg.isWideInt(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)))
+            try cg.genWide(inst, tag, data)
+        else
+            try cg.overflowOp(inst, tag, data),
+        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float => try cg.genFloat(inst, tag, data),
+        .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .floor, .ceil, .round, .trunc_float => try cg.genFloat(inst, tag, data),
+        .mul_add, .float_cast, .float_from_int, .int_from_float => try cg.genFloat(inst, tag, data),
         .not => {
             const ty = data.ty_op.ty;
+            if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
             const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.load(.rax, data.ty_op.operand);
             if (ty == .bool_type) {
@@ -481,8 +484,10 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.storeReg(dst, .rax, Type.abiSize(ip, ty));
         },
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
-            const dst = try cg.resultMem(inst, .bool_type) orelse return;
             const ty = cg.typeOf(data.bin_op.lhs);
+            if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
+            if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
+            const dst = try cg.resultMem(inst, .bool_type) orelse return;
             try cg.load(.rax, data.bin_op.lhs);
             try cg.load(.rcx, data.bin_op.rhs);
             try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
@@ -500,6 +505,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .intcast, .trunc, .bitcast, .ptr_from_int => {
             const ty = data.ty_op.ty;
+            if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(cg.typeOf(data.ty_op.operand))) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
             const dst = try cg.resultMem(inst, ty) orelse return;
             const size = Type.abiSize(ip, ty);
             if (cg.passInRegs(ty) and cg.passInRegs(cg.typeOf(data.ty_op.operand))) {
@@ -728,6 +734,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .clz, .ctz, .popcount, .byte_swap, .bit_reverse => {
             const ty = data.ty_op.ty;
+            if (cg.isWideInt(cg.typeOf(data.ty_op.operand))) return cg.wideBitOp(inst, tag, data);
             const dst = try cg.resultMem(inst, ty) orelse return;
             const bits = Type.intInfo(ip, cg.typeOf(data.ty_op.operand)).bits;
             try cg.bitOp(tag, bits, data.ty_op.operand);
@@ -986,7 +993,9 @@ fn switchBr(cg: *CodeGen, data: Inst.Data) Error!void {
 
 fn ret(cg: *CodeGen, operand: Ref) Error!void {
     const ty = cg.fn_ty.return_type;
-    if (Type.hasRuntimeBits(cg.ip, ty)) {
+    if (cg.fn_ty.cc == .c) {
+        try cg.cRet(operand);
+    } else if (Type.hasRuntimeBits(cg.ip, ty)) {
         if (cg.ret_ptr_slot) |off| {
             try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, off) });
             try cg.copyTo(Mem.at(.r10, 0), operand);
@@ -1015,15 +1024,10 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ret_ty = extra.data.ret_ty;
     const dst = try cg.resultMem(inst, ret_ty);
     if (callee_ty.cc == .c) {
-        var reg_i: usize = 0;
-        for (args) |arg| {
-            const ty = cg.typeOf(arg);
-            if (!Type.hasRuntimeBits(ip, ty)) continue;
-            if (!cg.passInRegs(ty) or reg_i == c_arg_regs.len) return cg.fail("C calling convention arguments of type '{f}'", .{cg.fmtType(ty)});
-            try cg.load(c_arg_regs[reg_i], arg);
-            reg_i += 1;
-        }
-        if (dst != null and !cg.passInRegs(ret_ty)) return cg.fail("C calling convention results of type '{f}'", .{cg.fmtType(ret_ty)});
+        const vals = try cg.gpa.alloc(Val, args.len);
+        defer cg.gpa.free(vals);
+        for (args, vals) |arg, *v| v.* = try cg.valOf(arg);
+        try cg.cCallArgs(vals, ret_ty, dst);
     } else {
         var off: u32 = 0;
         for (args) |arg| {
@@ -1042,6 +1046,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         try cg.load(.r11, callee_ref);
         try cg.e.callIndirect(.{ .reg = .r11 });
     }
+    if (callee_ty.cc == .c) return cg.cCallResult(ret_ty, dst);
     if (dst) |m| if (cg.passInRegs(ret_ty)) try cg.storeReg(m, .rax, Type.abiSize(ip, ret_ty));
 }
 
@@ -1173,7 +1178,7 @@ pub fn emitPanicHelpers(emit: *Emit) Error!void {
 // register; `X`, `i`, and `n` inputs are substituted into the template as
 // symbols or immediates.
 
-const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64 };
+const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64, reg: ParsedReg };
 
 fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ip = cg.ip;
@@ -1193,9 +1198,28 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 
     var names: std.StringHashMapUnmanaged(AsmArg) = .empty;
     defer names.deinit(cg.gpa);
+    // `r` inputs get registers that no `{reg}` constraint names.
+    var used: u16 = 0;
+    for (ops) |op| {
+        const c = std.mem.trimStart(u8, ip.stringSlice(op.constraint), "=");
+        if (regConstraint(c)) |rn| if (parseReg(rn)) |r| {
+            used |= @as(u16, 1) << @backingInt(r.reg);
+        };
+    }
     for (inputs) |in| {
         const constraint = ip.stringSlice(in.constraint);
-        if (regConstraint(constraint)) |reg_name| {
+        const is_r = std.mem.eql(u8, constraint, "r") or (std.mem.eql(u8, constraint, "rm") and cg.passInRegs(cg.typeOf(in.operand)));
+        if (is_r) {
+            const in_size = Type.abiSize(ip, cg.typeOf(in.operand));
+            const reg = for ([_]Reg{ .r8, .r9, .r10, .r11, .rsi, .rdi, .rcx, .rdx, .rax }) |r| {
+                if (used & (@as(u16, 1) << @backingInt(r)) == 0) break r;
+            } else return cg.fail("asm with too many register operands", .{});
+            used |= @as(u16, 1) << @backingInt(reg);
+            try cg.load(reg, in.operand);
+            try names.put(cg.gpa, ip.stringSlice(in.name), .{ .reg = .{ .reg = reg, .size = sizeOf(in_size) } });
+        } else if (std.mem.eql(u8, constraint, "m") or std.mem.eql(u8, constraint, "rm")) {
+            // Only for templates that do not name the operand.
+        } else if (regConstraint(constraint)) |reg_name| {
             const reg = parseReg(reg_name) orelse return cg.fail("unknown register '{s}' in asm constraint", .{reg_name});
             try cg.load(reg.reg, in.operand);
         } else if (std.mem.eql(u8, constraint, "X") or std.mem.eql(u8, constraint, "i") or std.mem.eql(u8, constraint, "n")) {
@@ -1282,6 +1306,7 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
         return switch (arg) {
             .imm => |v| .{ .imm = v },
             .sym => |s| .{ .sym = .{ .key = s.key, .off = s.off } },
+            .reg => |r| .{ .reg = r },
         };
     }
     if (std.mem.startsWith(u8, tok, "%%") or std.mem.startsWith(u8, tok, "%")) {
@@ -1314,6 +1339,16 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .imm => {},
         };
         if ((eql(u8, mnemonic, "push") or eql(u8, mnemonic, "pushq")) and ops[0] == .reg) return e.push(ops[0].reg.reg);
+        if (ops[0] == .reg) {
+            const unary_ops = [_]struct { []const u8, Encoder.UnaryOp }{
+                .{ "div", .div }, .{ "idiv", .idiv }, .{ "mul", .mul }, .{ "neg", .neg }, .{ "not", .not },
+            };
+            for (unary_ops) |op| {
+                const suffixed = mnemonic.len == op[0].len + 1 and std.mem.indexOfScalar(u8, "bwlq", mnemonic[op[0].len]) != null;
+                if (std.mem.startsWith(u8, mnemonic, op[0]) and (mnemonic.len == op[0].len or suffixed))
+                    return e.unary(op[1], ops[0].reg.size, .{ .reg = ops[0].reg.reg });
+            }
+        }
         if ((eql(u8, mnemonic, "pop") or eql(u8, mnemonic, "popq")) and ops[0] == .reg) return e.pop(ops[0].reg.reg);
     } else if (ops[1] == .reg) {
         // AT&T order: source, destination.
@@ -1406,6 +1441,14 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
             mut.toConst().writeTwosComplement(out, .little);
         },
         .simple_value => |s| out[0] = @intFromBool(s == .true),
+        .float => |f| {
+            // f80 has 10 bytes of data in its 16-byte slot.
+            @memset(out, 0);
+            var bytes: [16]u8 = undefined;
+            std.mem.writeInt(u128, &bytes, f.bits(), .little);
+            const n = Type.floatBits(ip, ty) / 8;
+            @memcpy(out[0..n], bytes[0..n]);
+        },
         .enum_tag => |e| try lowerValue(emit, e.int, out, relocs, base_off),
         .un => |u| {
             @memset(out, 0);
@@ -1512,4 +1555,1057 @@ const FmtType = struct {
 
 fn fmtType(cg: *CodeGen, ty: Index) FmtType {
     return .{ .ip = cg.ip, .ty = ty };
+}
+
+// ---------------------------------------------------------------------------
+// Numerics
+//
+// f32 and f64 use scalar SSE. f16, f80, and f128 arithmetic, the float
+// operations SSE2 lacks (rounding, fmod, transcendental functions, fma),
+// and conversions that SSE2 cannot do call compiler_rt helpers by their
+// declaration, which `Zcu` analyzes lazily (see `rtCall`). Helpers use
+// libm's names: `__sinh` (f16), `sinf`, `sin`, `__sinx` (f80), `sinq`.
+
+/// A value as an operand: its type and where it can be read.
+const Val = struct { ty: Index, loc: Loc };
+
+fn valOf(cg: *CodeGen, ref: Ref) Error!Val {
+    return .{ .ty = cg.typeOf(ref), .loc = try cg.locOf(ref) };
+}
+
+fn memVal(ty: Index, m: Mem) Val {
+    return .{ .ty = ty, .loc = .{ .mem = m } };
+}
+
+fn loadVal(cg: *CodeGen, reg: Reg, v: Val) Error!void {
+    switch (v.loc) {
+        .none => try cg.e.mov(.dword, .{ .reg = reg }, .{ .imm = 0 }),
+        .imm => |x| try cg.e.mov(.qword, .{ .reg = reg }, .{ .imm = @bitCast(x) }),
+        .addr => |m| try cg.e.lea(.qword, reg, m),
+        .err => |name| try cg.loadError(reg, name),
+        .mem => |m| try cg.loadMem(reg, m, v.ty),
+    }
+}
+
+/// The memory holding `v`, materializing a register-only value into a
+/// scratch slot. Uses rax.
+fn valMem(cg: *CodeGen, v: Val) Error!Mem {
+    if (v.loc == .mem) return v.loc.mem;
+    const size = Type.abiSize(cg.ip, v.ty);
+    const m = Mem.at(.rbp, try cg.allocSlot(size, Type.abiAlignment(cg.ip, v.ty)));
+    if (v.loc == .imm and !cg.passInRegs(v.ty)) {
+        try cg.fillMem(m, size, 0xaa);
+    } else {
+        try cg.loadVal(.rax, v);
+        try cg.storeReg(m, .rax, size);
+    }
+    return m;
+}
+
+/// Loads a value of 2, 4, 8, or 16 bytes into the low bits of `x`. Uses rax.
+fn loadXmm(cg: *CodeGen, x: Encoder.Xmm, v: Val) Error!void {
+    const size = Type.abiSize(cg.ip, v.ty);
+    if (size == 16) return cg.e.movups(.{ .reg = x }, .{ .mem = try cg.valMem(v) });
+    if (v.loc == .mem and size != 2) return cg.e.movs(if (size == 4) .f32 else .f64, .{ .reg = x }, .{ .mem = v.loc.mem });
+    try cg.loadVal(.rax, v);
+    try cg.e.movToXmm(if (size == 8) .qword else .dword, x, .{ .reg = .rax });
+}
+
+/// Stores the low `size` bytes of `x`. Uses rax.
+fn storeXmm(cg: *CodeGen, dst: Mem, x: Encoder.Xmm, size: u64) Error!void {
+    switch (size) {
+        4 => try cg.e.movs(.f32, .{ .mem = dst }, .{ .reg = x }),
+        8 => try cg.e.movs(.f64, .{ .mem = dst }, .{ .reg = x }),
+        16 => try cg.e.movups(.{ .mem = dst }, .{ .reg = x }),
+        else => {
+            try cg.e.movFromXmm(.dword, .{ .reg = .rax }, x);
+            try cg.storeReg(dst, .rax, size);
+        },
+    }
+}
+
+// ---------------------------------------------------------------- C calls
+
+/// SysV classes of the values zap passes to and from C functions: scalars,
+/// 16-byte integers (two GPRs), and anything else in memory.
+const CClass = enum { none, int, int_pair, sse, x87, memory };
+
+fn cClass(cg: *CodeGen, ty: Index) CClass {
+    const ip = cg.ip;
+    if (!Type.hasRuntimeBits(ip, ty)) return .none;
+    if (Type.class(ip, ty) == .float) return if (Type.floatBits(ip, ty) == 80) .x87 else .sse;
+    if (cg.passInRegs(ty)) return .int;
+    if (Type.isInt(ip, ty) and Type.abiSize(ip, ty) == 16) return .int_pair;
+    return .memory;
+}
+
+const xmm_args = [_]Encoder.Xmm{ .xmm0, .xmm1, .xmm2, .xmm3, .xmm4, .xmm5, .xmm6, .xmm7 };
+
+const CArgLoc = union(enum) { none, gp: u8, sse: u8, stack: u32 };
+
+/// Places the arguments of a call to a C function: memory arguments in the
+/// outgoing area first (copies use rax, rsi, rdi, rcx), then SSE registers
+/// (rax), then GPRs. A result returned in memory goes to `dst`, passed in rdi.
+fn cCallArgs(cg: *CodeGen, args: []const Val, ret_ty: Index, dst: ?Mem) Error!void {
+    const ip = cg.ip;
+    const locs = try cg.gpa.alloc(CArgLoc, args.len);
+    defer cg.gpa.free(locs);
+    const sret = dst != null and cg.cClass(ret_ty) == .memory;
+    var gp: u8 = @intFromBool(sret);
+    var sse: u8 = 0;
+    var stack: u32 = 0;
+    for (args, locs) |a, *l| {
+        const class = cg.cClass(a.ty);
+        l.* = switch (class) {
+            .none => .none,
+            .int => if (gp < 6) blk: {
+                gp += 1;
+                break :blk .{ .gp = gp - 1 };
+            } else .{ .stack = 0 },
+            .int_pair => if (gp < 5) blk: {
+                gp += 2;
+                break :blk .{ .gp = gp - 2 };
+            } else .{ .stack = 0 },
+            .sse => if (sse < 8) blk: {
+                sse += 1;
+                break :blk .{ .sse = sse - 1 };
+            } else .{ .stack = 0 },
+            .x87, .memory => .{ .stack = 0 },
+        };
+        if (l.* == .stack) {
+            stack = std.mem.alignForward(u32, stack, if (Type.abiAlignment(ip, a.ty) >= 16) 16 else 8);
+            l.* = .{ .stack = stack };
+            stack += @intCast(std.mem.alignForward(u64, Type.abiSize(ip, a.ty), 8));
+        }
+    }
+    cg.out_args_size = @max(cg.out_args_size, stack);
+    for (args, locs) |a, l| if (l == .stack) {
+        try cg.copyMem(Mem.at(.rsp, @intCast(l.stack)), try cg.valMem(a), Type.abiSize(ip, a.ty));
+    };
+    for (args, locs) |a, l| if (l == .sse) try cg.loadXmm(xmm_args[l.sse], a);
+    for (args, locs) |a, l| if (l == .gp) {
+        if (cg.cClass(a.ty) == .int_pair) {
+            const m = try cg.valMem(a);
+            try cg.e.mov(.qword, .{ .reg = c_arg_regs[l.gp] }, .{ .mem = m });
+            try cg.e.mov(.qword, .{ .reg = c_arg_regs[l.gp + 1] }, .{ .mem = offsetMem(m, 8) });
+        } else {
+            try cg.loadVal(c_arg_regs[l.gp], a);
+        }
+    };
+    if (sret) try cg.e.lea(.qword, .rdi, dst.?);
+}
+
+/// Stores the result of a C call, of type `ret_ty`, to `dst`.
+fn cCallResult(cg: *CodeGen, ret_ty: Index, dst: ?Mem) Error!void {
+    const m = dst orelse return;
+    switch (cg.cClass(ret_ty)) {
+        .none, .memory => {},
+        .int => try cg.storeReg(m, .rax, Type.abiSize(cg.ip, ret_ty)),
+        .int_pair => {
+            try cg.e.mov(.qword, .{ .mem = m }, .{ .reg = .rax });
+            try cg.e.mov(.qword, .{ .mem = offsetMem(m, 8) }, .{ .reg = .rdx });
+        },
+        .sse => try cg.storeXmm(m, .xmm0, Type.abiSize(cg.ip, ret_ty)),
+        .x87 => try cg.e.fstp(.m80, m),
+    }
+}
+
+/// The callee side of the C convention: gives each `arg` a home, spilling
+/// register arguments to slots.
+fn setupCParams(cg: *CodeGen) Error!void {
+    const ip = cg.ip;
+    var gp: u8 = 0;
+    if (cg.cClass(cg.fn_ty.return_type) == .memory) {
+        const off = try cg.allocSlot(8, 8);
+        try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, off) }, .{ .reg = .rdi });
+        cg.ret_ptr_slot = off;
+        gp = 1;
+    }
+    var sse: u8 = 0;
+    var stack: u32 = 0;
+    for (cg.ir.mainBody()) |inst| {
+        if (cg.ir.instructions.items(.tag)[@backingInt(inst)] != .arg) break;
+        const ty = cg.ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
+        const size = Type.abiSize(ip, ty);
+        const in_reg = switch (cg.cClass(ty)) {
+            .none => continue,
+            .int => gp < 6,
+            .int_pair => gp < 5,
+            .sse => sse < 8,
+            .x87, .memory => false,
+        };
+        if (!in_reg) {
+            stack = std.mem.alignForward(u32, stack, if (Type.abiAlignment(ip, ty) >= 16) 16 else 8);
+            cg.homes[@backingInt(inst)] = .{ .slot = @intCast(16 + stack) };
+            stack += @intCast(std.mem.alignForward(u64, size, 8));
+            continue;
+        }
+        const m = Mem.at(.rbp, try cg.allocSlot(size, Type.abiAlignment(ip, ty)));
+        cg.homes[@backingInt(inst)] = .{ .slot = m.disp };
+        switch (cg.cClass(ty)) {
+            .int => {
+                try cg.storeReg(m, c_arg_regs[gp], size);
+                gp += 1;
+            },
+            .int_pair => {
+                try cg.e.mov(.qword, .{ .mem = m }, .{ .reg = c_arg_regs[gp] });
+                try cg.e.mov(.qword, .{ .mem = offsetMem(m, 8) }, .{ .reg = c_arg_regs[gp + 1] });
+                gp += 2;
+            },
+            .sse => {
+                try cg.storeXmm(m, xmm_args[sse], size);
+                sse += 1;
+            },
+            else => unreachable,
+        }
+    }
+}
+
+/// Returns `operand` from a C-convention function.
+fn cRet(cg: *CodeGen, operand: Ref) Error!void {
+    const ty = cg.fn_ty.return_type;
+    switch (cg.cClass(ty)) {
+        .none => {},
+        .int => try cg.load(.rax, operand),
+        .int_pair => {
+            const m = try cg.memOf(operand);
+            try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = m });
+            try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .mem = offsetMem(m, 8) });
+        },
+        .sse => try cg.loadXmm(.xmm0, try cg.valOf(operand)),
+        .x87 => try cg.e.fld(.m80, try cg.memOf(operand)),
+        .memory => {
+            try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
+            try cg.copyTo(Mem.at(.r10, 0), operand);
+            try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
+        },
+    }
+}
+
+/// Calls the compiler_rt function `name`, declared in
+/// `lib/compiler_rt/<file>`, with the C convention. Its symbol is the key of
+/// its function unit, which `Zcu` resolves and queues for analysis.
+fn rtCall(cg: *CodeGen, file: []const u8, name: []const u8, args: []const Val, ret_ty: Index, dst: ?Mem) Error!void {
+    const key: SymbolKey = .fromName(try cg.emit.zcu.requestCompilerRt(file, name));
+    try cg.cCallArgs(args, ret_ty, dst);
+    try cg.e.call(.{ .sym = key });
+    try cg.cCallResult(ret_ty, dst);
+}
+
+// ---------------------------------------------------------------- floats
+
+fn isFloat(cg: *CodeGen, ty: Index) bool {
+    return Type.class(cg.ip, ty) == .float;
+}
+
+/// The SSE type of f32 and f64; other floats go through compiler_rt.
+fn sseType(cg: *CodeGen, ty: Index) ?Encoder.Float {
+    return switch (Type.floatBits(cg.ip, ty)) {
+        32 => .f32,
+        64 => .f64,
+        else => null,
+    };
+}
+
+/// libm's name for operation `op` on floats of `bits` bits.
+fn libmName(cg: *CodeGen, op: []const u8, bits: u16) Error![]const u8 {
+    const arena = cg.emit.allocator();
+    return switch (bits) {
+        16 => std.fmt.allocPrint(arena, "__{s}h", .{op}),
+        32 => std.fmt.allocPrint(arena, "{s}f", .{op}),
+        64 => op,
+        80 => std.fmt.allocPrint(arena, "__{s}x", .{op}),
+        128 => std.fmt.allocPrint(arena, "{s}q", .{op}),
+        else => unreachable,
+    };
+}
+
+/// compiler_rt's abbreviation of a float type in helper names.
+fn rtFloatAbbrev(bits: u16) []const u8 {
+    return switch (bits) {
+        16 => "hf",
+        32 => "sf",
+        64 => "df",
+        80 => "xf",
+        128 => "tf",
+        else => unreachable,
+    };
+}
+
+/// Calls libm-style compiler_rt function `op` (in `file`, default
+/// `<op>.zig`) on operands of float type `ty`.
+fn libmCall(cg: *CodeGen, op: []const u8, file: ?[]const u8, ty: Index, args: []const Val, dst: Mem) Error!void {
+    const f = file orelse try std.fmt.allocPrint(cg.emit.allocator(), "{s}.zig", .{op});
+    try cg.rtCall(f, try cg.libmName(op, Type.floatBits(cg.ip, ty)), args, ty, dst);
+}
+
+fn floatArith(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Val, rhs: Val, dst: Mem) Error!void {
+    if (cg.sseType(ty)) |ft| {
+        try cg.loadXmm(.xmm0, lhs);
+        try cg.loadXmm(.xmm1, rhs);
+        try cg.e.sse(switch (tag) {
+            .add_float => .add,
+            .sub_float => .sub,
+            .mul_float => .mul,
+            .div_float => .div,
+            else => unreachable,
+        }, ft, .xmm0, .{ .reg = .xmm1 });
+        return cg.storeXmm(dst, .xmm0, Type.abiSize(cg.ip, ty));
+    }
+    const bits = Type.floatBits(cg.ip, ty);
+    if (bits == 80) {
+        // x87, as upstream: f80 is its native format.
+        try cg.e.fld(.m80, try cg.valMem(lhs));
+        try cg.e.fld(.m80, try cg.valMem(rhs));
+        try cg.e.x87ArithPop(switch (tag) {
+            .add_float => .add,
+            .sub_float => .sub,
+            .mul_float => .mul,
+            .div_float => .div,
+            else => unreachable,
+        });
+        return cg.e.fstp(.m80, dst);
+    }
+    const op: []const u8, const file: []const u8 = switch (tag) {
+        .add_float => .{ "add", "addf3.zig" },
+        .sub_float => .{ "sub", "addf3.zig" },
+        .mul_float => .{ "mul", "mulf3.zig" },
+        .div_float => .{ "div", switch (bits) {
+            16 => "divsf3.zig",
+            80 => "divxf3.zig",
+            else => "divtf3.zig",
+        } },
+        else => unreachable,
+    };
+    const name = try std.fmt.allocPrint(cg.emit.allocator(), "__{s}{s}3", .{ op, rtFloatAbbrev(bits) });
+    try cg.rtCall(file, name, &.{ lhs, rhs }, ty, dst);
+}
+
+/// Instructions on floats.
+fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
+    const ip = cg.ip;
+    switch (tag) {
+        .add_float, .sub_float, .mul_float, .div_float => {
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            try cg.floatArith(tag, ty, try cg.valOf(data.bin_op.lhs), try cg.valOf(data.bin_op.rhs), dst);
+        },
+        .div_trunc, .div_floor, .div_ceil => {
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            try cg.floatArith(.div_float, ty, try cg.valOf(data.bin_op.lhs), try cg.valOf(data.bin_op.rhs), dst);
+            const op: []const u8 = switch (tag) {
+                .div_trunc => "trunc",
+                .div_floor => "floor",
+                else => "ceil",
+            };
+            try cg.libmCall(op, if (tag == .div_trunc) "trunc.zig" else "floor_ceil.zig", ty, &.{memVal(ty, dst)}, dst);
+        },
+        .rem, .mod => {
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const rhs = try cg.valOf(data.bin_op.rhs);
+            try cg.libmCall("fmod", null, ty, &.{ try cg.valOf(data.bin_op.lhs), rhs }, dst);
+            if (tag == .rem) return;
+            // As upstream: a non-zero remainder whose sign differs from the
+            // divisor's gets the divisor added.
+            const done = try cg.e.newLabel();
+            const rhs_m = try cg.valMem(rhs);
+            const top: u64 = (Type.floatBits(ip, ty) - 1) / 8;
+            try cg.e.mov(.byte, .{ .reg = .rax }, .{ .mem = offsetMem(dst, top) });
+            try cg.e.alu(.xor, .byte, .{ .reg = .rax }, .{ .mem = offsetMem(rhs_m, top) });
+            try cg.e.jcc(.ns, .{ .label = done });
+            try cg.floatMagnitudeTest(dst, Type.floatBits(ip, ty));
+            try cg.e.jcc(.e, .{ .label = done });
+            try cg.floatArith(.add_float, ty, memVal(ty, dst), memVal(ty, rhs_m), dst);
+            cg.e.bind(done);
+        },
+        .min_float, .max_float => {
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const lhs = try cg.valOf(data.bin_op.lhs);
+            const rhs = try cg.valOf(data.bin_op.rhs);
+            if (cg.sseType(ty)) |ft| {
+                // minss/maxss return the second operand if either is NaN.
+                try cg.loadXmm(.xmm0, lhs);
+                try cg.loadXmm(.xmm1, rhs);
+                const done = try cg.e.newLabel();
+                try cg.e.ucomis(ft, .xmm1, .{ .reg = .xmm1 });
+                try cg.e.jcc(.p, .{ .label = done });
+                try cg.e.sse(if (tag == .min_float) .min else .max, ft, .xmm0, .{ .reg = .xmm1 });
+                cg.e.bind(done);
+                return cg.storeXmm(dst, .xmm0, Type.abiSize(ip, ty));
+            }
+            try cg.libmCall(if (tag == .min_float) "fmin" else "fmax", null, ty, &.{ lhs, rhs }, dst);
+        },
+        .neg_float, .abs_float => {
+            const ty = cg.typeOf(data.un_op);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            try cg.copyTo(dst, data.un_op);
+            const top: u64 = (Type.floatBits(ip, ty) - 1) / 8;
+            if (tag == .neg_float) {
+                try cg.e.alu(.xor, .byte, .{ .mem = offsetMem(dst, top) }, .{ .imm = -0x80 });
+            } else {
+                try cg.e.alu(.@"and", .byte, .{ .mem = offsetMem(dst, top) }, .{ .imm = 0x7f });
+            }
+        },
+        .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .floor, .ceil, .round, .trunc_float => {
+            const ty = cg.typeOf(data.un_op);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const operand = try cg.valOf(data.un_op);
+            if (tag == .sqrt) if (cg.sseType(ty)) |ft| {
+                try cg.loadXmm(.xmm0, operand);
+                try cg.e.sse(.sqrt, ft, .xmm0, .{ .reg = .xmm0 });
+                return cg.storeXmm(dst, .xmm0, Type.abiSize(ip, ty));
+            } else if (Type.floatBits(ip, ty) == 80) {
+                try cg.e.fld(.m80, try cg.valMem(operand));
+                try cg.e.fsqrt();
+                return cg.e.fstp(.m80, dst);
+            };
+            const op: []const u8 = if (tag == .trunc_float) "trunc" else @tagName(tag);
+            const file: ?[]const u8 = if (tag == .floor or tag == .ceil) "floor_ceil.zig" else null;
+            try cg.libmCall(op, file, ty, &.{operand}, dst);
+        },
+        .mul_add => {
+            const ty = cg.typeOf(data.pl_op.operand);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const bin = cg.ir.extraData(Ir.Bin, data.pl_op.payload).data;
+            try cg.libmCall("fma", null, ty, &.{ try cg.valOf(bin.lhs), try cg.valOf(bin.rhs), try cg.valOf(data.pl_op.operand) }, dst);
+        },
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+            const dst = try cg.resultMem(inst, .bool_type) orelse return;
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const lhs = try cg.valOf(data.bin_op.lhs);
+            const rhs = try cg.valOf(data.bin_op.rhs);
+            if (cg.sseType(ty) != null or Type.floatBits(ip, ty) == 80) {
+                // Unordered sets ZF, PF, and CF: `a`/`ae` are false for NaN,
+                // so `<` and `<=` compare the swapped operands.
+                const swap = tag == .cmp_lt or tag == .cmp_lte;
+                const a = if (swap) rhs else lhs;
+                const b = if (swap) lhs else rhs;
+                if (cg.sseType(ty)) |ft| {
+                    try cg.loadXmm(.xmm0, a);
+                    try cg.loadXmm(.xmm1, b);
+                    try cg.e.ucomis(ft, .xmm0, .{ .reg = .xmm1 });
+                } else {
+                    try cg.e.fld(.m80, try cg.valMem(b));
+                    try cg.e.fld(.m80, try cg.valMem(a));
+                    try cg.e.fucomip();
+                    try cg.e.fpop();
+                }
+                switch (tag) {
+                    .cmp_lt, .cmp_gt => try cg.e.setcc(.a, .{ .mem = dst }),
+                    .cmp_lte, .cmp_gte => try cg.e.setcc(.ae, .{ .mem = dst }),
+                    .cmp_eq, .cmp_neq => {
+                        const eq = tag == .cmp_eq;
+                        try cg.e.setcc(if (eq) .e else .ne, .{ .reg = .rax });
+                        try cg.e.setcc(if (eq) .np else .p, .{ .reg = .rcx });
+                        try cg.e.alu(if (eq) .@"and" else .@"or", .byte, .{ .reg = .rax }, .{ .reg = .rcx });
+                        try cg.storeReg(dst, .rax, 1);
+                    },
+                    else => unreachable,
+                }
+                return;
+            }
+            // `__cmp*f2` is 1 for unordered operands and `__ge*f2` is -1, so
+            // each comparison is false for NaN.
+            const bits = Type.floatBits(ip, ty);
+            const ge = tag == .cmp_gt or tag == .cmp_gte;
+            const name = try std.fmt.allocPrint(cg.emit.allocator(), "__{s}{s}2", .{ if (ge) "ge" else "cmp", rtFloatAbbrev(bits) });
+            const res = Mem.at(.rbp, try cg.allocSlot(4, 4));
+            try cg.rtCall("comparef.zig", name, &.{ lhs, rhs }, .i32_type, res);
+            try cg.e.alu(.cmp, .dword, .{ .mem = res }, .{ .imm = 0 });
+            try cg.e.setcc(switch (tag) {
+                .cmp_lt => .l,
+                .cmp_lte => .le,
+                .cmp_eq => .e,
+                .cmp_neq => .ne,
+                .cmp_gt => .g,
+                .cmp_gte => .ge,
+                else => unreachable,
+            }, .{ .mem = dst });
+        },
+        .float_cast => {
+            const ty = data.ty_op.ty;
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const src_ty = cg.typeOf(data.ty_op.operand);
+            const operand = try cg.valOf(data.ty_op.operand);
+            const from = Type.floatBits(ip, src_ty);
+            const to = Type.floatBits(ip, ty);
+            if (from == to) return cg.copyTo(dst, data.ty_op.operand);
+            if (cg.sseType(ty) != null and cg.sseType(src_ty) != null) {
+                try cg.loadXmm(.xmm0, operand);
+                try cg.e.cvts2s(cg.sseType(ty).?, .xmm0, .{ .reg = .xmm0 });
+                return cg.storeXmm(dst, .xmm0, Type.abiSize(ip, ty));
+            }
+            // Between f80 and f32 or f64: x87 loads and stores convert.
+            const x87_mem = struct {
+                fn f(bits: u16) ?Encoder.X87Mem {
+                    return switch (bits) {
+                        32 => .m32,
+                        64 => .m64,
+                        80 => .m80,
+                        else => null,
+                    };
+                }
+            }.f;
+            if ((from == 80 or to == 80) and x87_mem(from) != null and x87_mem(to) != null) {
+                try cg.e.fld(x87_mem(from).?, try cg.valMem(operand));
+                return cg.e.fstp(x87_mem(to).?, dst);
+            }
+            const widen = to > from;
+            const name = try std.fmt.allocPrint(cg.emit.allocator(), "__{s}{s}{s}2", .{ if (widen) "extend" else "trunc", rtFloatAbbrev(from), rtFloatAbbrev(to) });
+            try cg.rtCall(if (widen) "extendf.zig" else "truncf.zig", name, &.{operand}, ty, dst);
+        },
+        .float_from_int => try cg.floatFromInt(inst, data),
+        .int_from_float => try cg.intFromFloat(inst, data),
+        else => unreachable,
+    }
+}
+
+/// Sets ZF iff the float at `m` (of `bits` bits) is a zero of either sign.
+/// Uses rax and rcx.
+fn floatMagnitudeTest(cg: *CodeGen, m: Mem, bits: u16) Error!void {
+    const e = &cg.e;
+    switch (bits) {
+        16, 32, 64 => {
+            try cg.loadMem(.rax, m, switch (bits) {
+                16 => .u16_type,
+                32 => .u32_type,
+                else => .u64_type,
+            });
+            try e.shift(.shl, .qword, .{ .reg = .rax }, @intCast(65 - bits));
+        },
+        80 => {
+            try e.movzx(.dword, .rax, .word, .{ .mem = offsetMem(m, 8) });
+            try e.shift(.shl, .dword, .{ .reg = .rax }, 17);
+            try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .mem = m });
+        },
+        128 => {
+            try e.mov(.qword, .{ .reg = .rax }, .{ .mem = offsetMem(m, 8) });
+            try e.shift(.shl, .qword, .{ .reg = .rax }, 1);
+            try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .mem = m });
+        },
+        else => unreachable,
+    }
+}
+
+/// compiler_rt's abbreviation of an integer of `bits` bits, widened to the
+/// next helper width.
+fn rtIntAbbrev(bits: u16) ?[]const u8 {
+    if (bits <= 32) return "si";
+    if (bits <= 64) return "di";
+    if (bits <= 128) return "ti";
+    return null;
+}
+
+fn rtIntType(bits: u16, signedness: std.lang.Signedness) Index {
+    const s = signedness == .signed;
+    if (bits <= 32) return if (s) .i32_type else .u32_type;
+    if (bits <= 64) return if (s) .i64_type else .u64_type;
+    return if (s) .i128_type else .u128_type;
+}
+
+fn floatFromInt(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
+    const ip = cg.ip;
+    const ty = data.ty_op.ty;
+    const dst = try cg.resultMem(inst, ty) orelse return;
+    const int_ty = cg.typeOf(data.ty_op.operand);
+    const info = Type.intInfo(ip, int_ty);
+    const operand = try cg.valOf(data.ty_op.operand);
+    if (cg.sseType(ty)) |ft| if (info.bits <= 64) {
+        const e = &cg.e;
+        try cg.loadVal(.rax, operand);
+        if (info.bits == 64 and info.signedness == .unsigned) {
+            // Halve values with the top bit set, keeping the low bit for
+            // rounding, and double the result.
+            const big = try e.newLabel();
+            const done = try e.newLabel();
+            try e.@"test"(.qword, .{ .reg = .rax }, .{ .reg = .rax });
+            try e.jcc(.s, .{ .label = big });
+            try e.cvtsi2s(ft, .xmm0, .qword, .{ .reg = .rax });
+            try e.jmp(.{ .label = done });
+            e.bind(big);
+            try e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rax });
+            try e.shift(.shr, .qword, .{ .reg = .rcx }, 1);
+            try e.alu(.@"and", .dword, .{ .reg = .rax }, .{ .imm = 1 });
+            try e.alu(.@"or", .qword, .{ .reg = .rcx }, .{ .reg = .rax });
+            try e.cvtsi2s(ft, .xmm0, .qword, .{ .reg = .rcx });
+            try e.sse(.add, ft, .xmm0, .{ .reg = .xmm0 });
+            e.bind(done);
+        } else {
+            try e.cvtsi2s(ft, .xmm0, .qword, .{ .reg = .rax });
+        }
+        return cg.storeXmm(dst, .xmm0, Type.abiSize(ip, ty));
+    };
+    const abbrev = rtIntAbbrev(info.bits) orelse return cg.fail("converting {d}-bit integers to floats", .{info.bits});
+    const name = try std.fmt.allocPrint(cg.emit.allocator(), "__float{s}{s}{s}", .{ if (info.signedness == .unsigned) "un" else "", abbrev, rtFloatAbbrev(Type.floatBits(ip, ty)) });
+    // Loading the operand extends it to the helper's width.
+    try cg.rtCall("float_from_int.zig", name, &.{operand}, ty, dst);
+}
+
+fn intFromFloat(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
+    const ip = cg.ip;
+    const ty = data.ty_op.ty;
+    const dst = try cg.resultMem(inst, ty) orelse return;
+    const float_ty = cg.typeOf(data.ty_op.operand);
+    const info = Type.intInfo(ip, ty);
+    const operand = try cg.valOf(data.ty_op.operand);
+    const size = Type.abiSize(ip, ty);
+    if (cg.sseType(float_ty)) |ft| if (info.bits <= 64) {
+        const e = &cg.e;
+        try cg.loadXmm(.xmm0, operand);
+        if (info.bits == 64 and info.signedness == .unsigned) {
+            // Values from 2^63 convert after subtracting 2^63.
+            const big = try e.newLabel();
+            const done = try e.newLabel();
+            const two63: u64 = if (ft == .f32) @as(u32, @bitCast(@as(f32, 0x1p63))) else @bitCast(@as(f64, 0x1p63));
+            try e.mov(.qword, .{ .reg = .rax }, .{ .imm = @bitCast(two63) });
+            try e.movToXmm(if (ft == .f32) .dword else .qword, .xmm1, .{ .reg = .rax });
+            try e.ucomis(ft, .xmm0, .{ .reg = .xmm1 });
+            try e.jcc(.ae, .{ .label = big });
+            try e.cvtts2si(ft, .qword, .rax, .{ .reg = .xmm0 });
+            try e.jmp(.{ .label = done });
+            e.bind(big);
+            try e.sse(.sub, ft, .xmm0, .{ .reg = .xmm1 });
+            try e.cvtts2si(ft, .qword, .rax, .{ .reg = .xmm0 });
+            try e.mov(.qword, .{ .reg = .rcx }, .{ .imm = std.math.minInt(i64) });
+            try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
+            e.bind(done);
+        } else {
+            try e.cvtts2si(ft, .qword, .rax, .{ .reg = .xmm0 });
+        }
+        return cg.storeReg(dst, .rax, size);
+    };
+    const abbrev = rtIntAbbrev(info.bits) orelse return cg.fail("converting floats to {d}-bit integers", .{info.bits});
+    const name = try std.fmt.allocPrint(cg.emit.allocator(), "__fix{s}{s}{s}", .{ if (info.signedness == .unsigned) "uns" else "", rtFloatAbbrev(Type.floatBits(ip, float_ty)), abbrev });
+    const rt_ty = rtIntType(info.bits, info.signedness);
+    if (Type.abiSize(ip, rt_ty) == size) return cg.rtCall("int_from_float.zig", name, &.{operand}, rt_ty, dst);
+    // A narrower result: the value fits, so its low bytes are normalized.
+    const tmp = Mem.at(.rbp, try cg.allocSlot(Type.abiSize(ip, rt_ty), Type.abiAlignment(ip, rt_ty)));
+    try cg.rtCall("int_from_float.zig", name, &.{operand}, rt_ty, tmp);
+    try cg.copyMem(dst, tmp, size);
+}
+
+// ---------------------------------------------------------------- wide integers
+//
+// Integers wider than 64 bits live in memory as little-endian 64-bit limbs,
+// `abiSize / 8` of them, normalized like narrow integers: the bits above
+// the type's width are copies of the sign bit (signed) or zero. Operations
+// run limb by limb in rax, rcx, and rdx.
+
+fn isWideInt(cg: *CodeGen, ty: Index) bool {
+    return Type.isInt(cg.ip, ty) and Type.abiSize(cg.ip, ty) > 8;
+}
+
+fn limbCount(cg: *CodeGen, ty: Index) u32 {
+    return @intCast(Type.abiSize(cg.ip, ty) / 8);
+}
+
+fn limb(m: Mem, i: u32) Mem {
+    return offsetMem(m, @as(u64, i) * 8);
+}
+
+/// Loads limb `i` of integer `v` into `reg`; limbs past `v`'s own are its
+/// extension. Does not change the flags when `v` is in memory and `i` is
+/// one of its limbs.
+fn loadLimb(cg: *CodeGen, reg: Reg, v: Val, i: u32) Error!void {
+    const n = if (cg.passInRegs(v.ty)) 1 else cg.limbCount(v.ty);
+    if (i < n) {
+        if (n == 1) return cg.loadVal(reg, v);
+        return cg.e.mov(.qword, .{ .reg = reg }, .{ .mem = limb(v.loc.mem, i) });
+    }
+    if (!cg.signed(v.ty)) return cg.e.mov(.dword, .{ .reg = reg }, .{ .imm = 0 });
+    try cg.loadLimb(reg, v, n - 1);
+    try cg.e.shift(.sar, .qword, .{ .reg = reg }, 63);
+}
+
+/// `v` with a wide integer in memory (materializing an undefined constant).
+fn wideVal(cg: *CodeGen, ref: Ref) Error!Val {
+    const v = try cg.valOf(ref);
+    if (v.loc == .mem or cg.passInRegs(v.ty)) return v;
+    return memVal(v.ty, try cg.valMem(v));
+}
+
+/// Re-normalizes the wide integer of type `ty` at `m` after an operation
+/// that may have changed the bits above its width. Uses rax.
+fn normalizeWide(cg: *CodeGen, m: Mem, ty: Index) Error!void {
+    const info = Type.intInfo(cg.ip, ty);
+    const n = cg.limbCount(ty);
+    const top: u32 = (info.bits - 1) / 64;
+    const r: u8 = @intCast(info.bits % 64);
+    const s = info.signedness == .signed;
+    if (r == 0 and top == n - 1) return;
+    try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(m, top) });
+    if (r != 0) {
+        try cg.e.shift(.shl, .qword, .{ .reg = .rax }, 64 - r);
+        try cg.e.shift(if (s) .sar else .shr, .qword, .{ .reg = .rax }, 64 - r);
+        try cg.e.mov(.qword, .{ .mem = limb(m, top) }, .{ .reg = .rax });
+    }
+    if (top + 1 == n) return;
+    if (s) try cg.e.shift(.sar, .qword, .{ .reg = .rax }, 63) else try cg.e.alu(.xor, .dword, .{ .reg = .rax }, .{ .reg = .rax });
+    for (top + 1..n) |i| try cg.e.mov(.qword, .{ .mem = limb(m, @intCast(i)) }, .{ .reg = .rax });
+}
+
+/// Integer `v` converted to integer type `ty` at `dst`: truncated or
+/// extended.
+fn wideCast(cg: *CodeGen, dst: Mem, ty: Index, v: Val) Error!void {
+    if (!Type.isInt(cg.ip, v.ty)) {
+        // A float's bits.
+        try cg.copyMem(dst, try cg.valMem(v), Type.abiSize(cg.ip, ty));
+        return cg.normalizeWide(dst, ty);
+    }
+    if (cg.passInRegs(ty)) {
+        try cg.loadLimb(.rax, v, 0);
+        try cg.normalize(.rax, ty);
+        return cg.storeReg(dst, .rax, Type.abiSize(cg.ip, ty));
+    }
+    for (0..cg.limbCount(ty)) |i| {
+        try cg.loadLimb(.rax, v, @intCast(i));
+        try cg.e.mov(.qword, .{ .mem = limb(dst, @intCast(i)) }, .{ .reg = .rax });
+    }
+    try cg.normalizeWide(dst, ty);
+}
+
+/// `dst = lhs * rhs` over `n` limbs, wrapping. `dst` must not overlap the
+/// operands. Uses rax, rcx, rdx, r8.
+fn mulLimbs(cg: *CodeGen, dst: Mem, lhs: Mem, rhs: Mem, n: u32) Error!void {
+    const e = &cg.e;
+    try e.alu(.xor, .dword, .{ .reg = .rax }, .{ .reg = .rax });
+    for (0..n) |i| try e.mov(.qword, .{ .mem = limb(dst, @intCast(i)) }, .{ .reg = .rax });
+    for (0..n) |i| {
+        // r8 carries the high half into the next column.
+        try e.alu(.xor, .dword, .{ .reg = .r8 }, .{ .reg = .r8 });
+        for (0..n - i) |j| {
+            const k: u32 = @intCast(i + j);
+            try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(lhs, @intCast(i)) });
+            if (k == n - 1) {
+                // The last column keeps only the low half.
+                try e.imul(.qword, .rax, .{ .mem = limb(rhs, @intCast(j)) }, null);
+                try e.alu(.add, .qword, .{ .reg = .rax }, .{ .reg = .r8 });
+                try e.alu(.add, .qword, .{ .mem = limb(dst, k) }, .{ .reg = .rax });
+                continue;
+            }
+            try e.unary(.mul, .qword, .{ .mem = limb(rhs, @intCast(j)) });
+            try e.alu(.add, .qword, .{ .reg = .rax }, .{ .reg = .r8 });
+            try e.alu(.adc, .qword, .{ .reg = .rdx }, .{ .imm = 0 });
+            try e.alu(.add, .qword, .{ .mem = limb(dst, k) }, .{ .reg = .rax });
+            try e.alu(.adc, .qword, .{ .reg = .rdx }, .{ .imm = 0 });
+            try e.mov(.qword, .{ .reg = .r8 }, .{ .reg = .rdx });
+        }
+    }
+}
+
+/// Shifts the wide integer `v` of type `ty` by `amount` (less than its
+/// width) into `dst`, through a buffer that pads it with zeros (left) or
+/// its extension (right), so that each result limb is one double shift.
+fn shiftWide(cg: *CodeGen, left: bool, dst: Mem, ty: Index, v: Val, amount: Val) Error!void {
+    const e = &cg.e;
+    const n = cg.limbCount(ty);
+    const buf = Mem.at(.rbp, try cg.allocSlot(@as(u64, n) * 16, 8));
+    const src_half = if (left) limb(buf, n) else buf;
+    const pad_half = if (left) buf else limb(buf, n);
+    try cg.copyMem(src_half, v.loc.mem, @as(u64, n) * 8);
+    try cg.loadLimb(.rax, if (left) .{ .ty = .u64_type, .loc = .{ .imm = 0 } } else v, if (left) 0 else n);
+    for (0..n) |i| try e.mov(.qword, .{ .mem = limb(pad_half, @intCast(i)) }, .{ .reg = .rax });
+    // r10 = the limb the result starts from; cl = the bit shift.
+    try cg.loadVal(.rcx, amount);
+    try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rcx });
+    try e.shift(.shr, .qword, .{ .reg = .rdx }, 6);
+    try e.shift(.shl, .qword, .{ .reg = .rdx }, 3);
+    try e.lea(.qword, .r10, src_half);
+    if (left) try e.alu(.sub, .qword, .{ .reg = .r10 }, .{ .reg = .rdx }) else try e.alu(.add, .qword, .{ .reg = .r10 }, .{ .reg = .rdx });
+    try e.alu(.@"and", .dword, .{ .reg = .rcx }, .{ .imm = 63 });
+    for (0..n) |i| {
+        const d: i32 = @intCast(i * 8);
+        try e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.r10, d) });
+        try e.mov(.qword, .{ .reg = .rdx }, .{ .mem = Mem.at(.r10, if (left) d - 8 else d + 8) });
+        try e.shiftDouble(left, .{ .reg = .rax }, .rdx);
+        try e.mov(.qword, .{ .mem = limb(dst, @intCast(i)) }, .{ .reg = .rax });
+    }
+    try cg.normalizeWide(dst, ty);
+}
+
+/// Instructions on wide integers.
+fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
+    const ip = cg.ip;
+    const e = &cg.e;
+    switch (tag) {
+        .add_wrap, .sub_wrap, .bit_and, .bit_or, .xor => {
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const lhs = (try cg.wideVal(data.bin_op.lhs)).loc.mem;
+            const rhs = (try cg.wideVal(data.bin_op.rhs)).loc.mem;
+            for (0..cg.limbCount(ty)) |i_| {
+                const i: u32 = @intCast(i_);
+                try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(lhs, i) });
+                try e.alu(switch (tag) {
+                    .add_wrap => if (i == 0) .add else .adc,
+                    .sub_wrap => if (i == 0) .sub else .sbb,
+                    .bit_and => .@"and",
+                    .bit_or => .@"or",
+                    else => .xor,
+                }, .qword, .{ .reg = .rax }, .{ .mem = limb(rhs, i) });
+                try e.mov(.qword, .{ .mem = limb(dst, i) }, .{ .reg = .rax });
+            }
+            if (tag == .add_wrap or tag == .sub_wrap) try cg.normalizeWide(dst, ty);
+        },
+        .mul_wrap => {
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            try cg.mulLimbs(dst, (try cg.wideVal(data.bin_op.lhs)).loc.mem, (try cg.wideVal(data.bin_op.rhs)).loc.mem, cg.limbCount(ty));
+            try cg.normalizeWide(dst, ty);
+        },
+        .shl, .shr => {
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            try cg.shiftWide(tag == .shl, dst, ty, try cg.wideVal(data.bin_op.lhs), try cg.valOf(data.bin_op.rhs));
+        },
+        .not => {
+            const ty = data.ty_op.ty;
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const src = (try cg.wideVal(data.ty_op.operand)).loc.mem;
+            for (0..cg.limbCount(ty)) |i| {
+                try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(src, @intCast(i)) });
+                try e.unary(.not, .qword, .{ .reg = .rax });
+                try e.mov(.qword, .{ .mem = limb(dst, @intCast(i)) }, .{ .reg = .rax });
+            }
+            try cg.normalizeWide(dst, ty);
+        },
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+            const dst = try cg.resultMem(inst, .bool_type) orelse return;
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const n = cg.limbCount(ty);
+            var a = (try cg.wideVal(data.bin_op.lhs)).loc.mem;
+            var b = (try cg.wideVal(data.bin_op.rhs)).loc.mem;
+            if (tag == .cmp_eq or tag == .cmp_neq) {
+                try e.mov(.qword, .{ .reg = .rax }, .{ .mem = a });
+                try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .mem = b });
+                for (1..n) |i| {
+                    try e.mov(.qword, .{ .reg = .rcx }, .{ .mem = limb(a, @intCast(i)) });
+                    try e.alu(.xor, .qword, .{ .reg = .rcx }, .{ .mem = limb(b, @intCast(i)) });
+                    try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .reg = .rcx });
+                }
+                return e.setcc(if (tag == .cmp_eq) .e else .ne, .{ .mem = dst });
+            }
+            // The flags of `a - b` over all limbs: `>` and `<=` swap.
+            if (tag == .cmp_gt or tag == .cmp_lte) std.mem.swap(Mem, &a, &b);
+            for (0..n) |i| {
+                try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(a, @intCast(i)) });
+                try e.alu(if (i == 0) .cmp else .sbb, .qword, .{ .reg = .rax }, .{ .mem = limb(b, @intCast(i)) });
+            }
+            const s = cg.signed(ty);
+            try e.setcc(switch (tag) {
+                .cmp_lt, .cmp_gt => if (s) .l else .b,
+                else => if (s) .ge else .ae,
+            }, .{ .mem = dst });
+        },
+        .intcast, .trunc, .bitcast => {
+            const ty = data.ty_op.ty;
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            try cg.wideCast(dst, ty, try cg.wideVal(data.ty_op.operand));
+        },
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
+            const ty = cg.typeOf(data.bin_op.lhs);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            if (cg.limbCount(ty) != 2) return cg.fail("division of integers wider than 128 bits", .{});
+            const lhs = try cg.wideVal(data.bin_op.lhs);
+            const rhs = try cg.wideVal(data.bin_op.rhs);
+            const s = cg.signed(ty);
+            const rt_ty: Index = if (s) .i128_type else .u128_type;
+            const l: Val = .{ .ty = rt_ty, .loc = lhs.loc };
+            const r: Val = .{ .ty = rt_ty, .loc = rhs.loc };
+            const want_q = tag == .div_trunc or tag == .div_floor or tag == .div_ceil;
+            const adjust = tag == .div_ceil or (s and (tag == .div_floor or tag == .mod));
+            const q_name = if (s) "__divti3" else "__udivti3";
+            const r_name = if (s) "__modti3" else "__umodti3";
+            if (!adjust) return cg.rtCall("udivmod.zig", if (want_q) q_name else r_name, &.{ l, r }, rt_ty, dst);
+            const rem = if (want_q) Mem.at(.rbp, try cg.allocSlot(16, 16)) else dst;
+            try cg.rtCall("udivmod.zig", r_name, &.{ l, r }, rt_ty, rem);
+            if (want_q) try cg.rtCall("udivmod.zig", q_name, &.{ l, r }, rt_ty, dst);
+            // Adjust when the remainder is non-zero and, for floor and mod,
+            // its sign differs from the divisor's; for ceil, when the exact
+            // quotient is positive.
+            const done = try e.newLabel();
+            try e.mov(.qword, .{ .reg = .rax }, .{ .mem = rem });
+            try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .mem = limb(rem, 1) });
+            try e.jcc(.e, .{ .label = done });
+            if (s) {
+                try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(rem, 1) });
+                try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .mem = limb(rhs.loc.mem, 1) });
+                try e.jcc(if (tag == .div_ceil) .s else .ns, .{ .label = done });
+            }
+            switch (tag) {
+                .div_floor, .div_ceil => {
+                    try e.alu(if (tag == .div_floor) .sub else .add, .qword, .{ .mem = dst }, .{ .imm = 1 });
+                    try e.alu(if (tag == .div_floor) .sbb else .adc, .qword, .{ .mem = limb(dst, 1) }, .{ .imm = 0 });
+                },
+                else => {
+                    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = rhs.loc.mem });
+                    try e.alu(.add, .qword, .{ .mem = dst }, .{ .reg = .rax });
+                    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(rhs.loc.mem, 1) });
+                    try e.alu(.adc, .qword, .{ .mem = limb(dst, 1) }, .{ .reg = .rax });
+                },
+            }
+            e.bind(done);
+        },
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {
+            const bin = cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+            const tuple_ty = data.ty_pl.ty;
+            const ty = cg.typeOf(bin.lhs);
+            const dst = try cg.resultMem(inst, tuple_ty) orelse return;
+            const flag = offsetMem(dst, Type.fieldOffset(ip, tuple_ty, 1));
+            const n = cg.limbCount(ty);
+            const lhs = try cg.wideVal(bin.lhs);
+            const rhs = try cg.wideVal(bin.rhs);
+            const info = Type.intInfo(ip, ty);
+            const s = info.signedness == .signed;
+            // The exact result, in `n` limbs (add, sub) or `2n` (mul).
+            const wide_n = if (tag == .mul_with_overflow) 2 * n else n;
+            const raw = Mem.at(.rbp, try cg.allocSlot(@as(u64, wide_n) * 8, 8));
+            if (tag == .mul_with_overflow) {
+                // Products of the operands extended to 2n limbs are exact.
+                const a = Mem.at(.rbp, try cg.allocSlot(@as(u64, wide_n) * 8, 8));
+                const b = Mem.at(.rbp, try cg.allocSlot(@as(u64, wide_n) * 8, 8));
+                for (0..wide_n) |i| {
+                    try cg.loadLimb(.rax, lhs, @intCast(i));
+                    try e.mov(.qword, .{ .mem = limb(a, @intCast(i)) }, .{ .reg = .rax });
+                    try cg.loadLimb(.rax, rhs, @intCast(i));
+                    try e.mov(.qword, .{ .mem = limb(b, @intCast(i)) }, .{ .reg = .rax });
+                }
+                try cg.mulLimbs(raw, a, b, wide_n);
+            } else {
+                for (0..n) |i| {
+                    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(lhs.loc.mem, @intCast(i)) });
+                    try e.alu(if (tag == .add_with_overflow)
+                        (if (i == 0) .add else .adc)
+                    else
+                        (if (i == 0) .sub else .sbb), .qword, .{ .reg = .rax }, .{ .mem = limb(rhs.loc.mem, @intCast(i)) });
+                    try e.mov(.qword, .{ .mem = limb(raw, @intCast(i)) }, .{ .reg = .rax });
+                }
+            }
+            if (tag != .mul_with_overflow and info.bits == 64 * n) {
+                // Full limbs: the carry or overflow flag of the top limb.
+                try e.setcc(if (s) .o else .b, .{ .mem = flag });
+                return cg.copyMem(dst, raw, @as(u64, n) * 8);
+            }
+            // Overflowed iff the exact result differs from the truncated
+            // result extended back.
+            try cg.copyMem(dst, raw, @as(u64, n) * 8);
+            try cg.normalizeWide(dst, ty);
+            try e.alu(.xor, .dword, .{ .reg = .rcx }, .{ .reg = .rcx });
+            const res: Val = memVal(ty, dst);
+            for (0..wide_n) |i| {
+                try cg.loadLimb(.rax, res, @intCast(i));
+                try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .mem = limb(raw, @intCast(i)) });
+                try e.alu(.@"or", .qword, .{ .reg = .rcx }, .{ .reg = .rax });
+            }
+            try e.setcc(.ne, .{ .mem = flag });
+        },
+        else => unreachable,
+    }
+}
+
+/// `@clz`, `@ctz`, `@popCount`, `@byteSwap`, and `@bitReverse` of a wide
+/// integer.
+fn wideBitOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
+    const e = &cg.e;
+    const ty = data.ty_op.ty;
+    const dst = try cg.resultMem(inst, ty) orelse return;
+    const src_ty = cg.typeOf(data.ty_op.operand);
+    const src = (try cg.wideVal(data.ty_op.operand)).loc.mem;
+    const bits = Type.intInfo(cg.ip, src_ty).bits;
+    // Limbs holding the operand's bits, and the bits of the top one.
+    const n: u32 = (bits + 63) / 64;
+    const r: u8 = @intCast(bits - (n - 1) * 64);
+    const done = try e.newLabel();
+    switch (tag) {
+        .clz, .ctz => {
+            var labels: [64]Encoder.Label = undefined;
+            if (n > labels.len) return cg.fail("@clz and @ctz of integers wider than 4096 bits", .{});
+            for (0..n) |k| {
+                const i: u32 = @intCast(if (tag == .clz) n - 1 - k else k);
+                try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(src, i) });
+                if (tag == .clz and i == n - 1 and r != 64) {
+                    try e.shift(.shl, .qword, .{ .reg = .rax }, 64 - r);
+                    try e.shift(.shr, .qword, .{ .reg = .rax }, 64 - r);
+                }
+                labels[k] = try e.newLabel();
+                try e.bitScan(tag == .clz, .qword, .rcx, .{ .reg = .rax });
+                try e.jcc(.ne, .{ .label = labels[k] });
+            }
+            try e.mov(.dword, .{ .reg = .rax }, .{ .imm = bits });
+            try e.jmp(.{ .label = done });
+            for (0..n) |k| {
+                const i: u32 = @intCast(if (tag == .clz) n - 1 - k else k);
+                e.bind(labels[k]);
+                if (tag == .clz) {
+                    // bits - 1 - (64 i + bsr)
+                    try e.mov(.dword, .{ .reg = .rax }, .{ .imm = bits - 1 - 64 * i });
+                    try e.alu(.sub, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
+                } else {
+                    try e.lea(.qword, .rax, .{ .base = .{ .reg = .rcx }, .disp = @intCast(64 * i) });
+                }
+                try e.jmp(.{ .label = done });
+            }
+        },
+        .popcount => {
+            try e.alu(.xor, .dword, .{ .reg = .rax }, .{ .reg = .rax });
+            for (0..n) |i| {
+                try e.mov(.qword, .{ .reg = .rdx }, .{ .mem = limb(src, @intCast(i)) });
+                if (i == n - 1 and r != 64) {
+                    try e.shift(.shl, .qword, .{ .reg = .rdx }, 64 - r);
+                    try e.shift(.shr, .qword, .{ .reg = .rdx }, 64 - r);
+                }
+                // while (x != 0) { x &= x - 1; count += 1; }
+                const top = try e.newLabel();
+                const next = try e.newLabel();
+                e.bind(top);
+                try e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
+                try e.jcc(.e, .{ .label = next });
+                try e.lea(.qword, .rcx, .{ .base = .{ .reg = .rdx }, .disp = -1 });
+                try e.alu(.@"and", .qword, .{ .reg = .rdx }, .{ .reg = .rcx });
+                try e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
+                try e.jmp(.{ .label = top });
+                e.bind(next);
+            }
+        },
+        .byte_swap, .bit_reverse => {
+            // Reverse the n limbs, each reversed in itself, then shift the
+            // result down by the bits above the operand's width.
+            for (0..n) |i| {
+                try e.mov(.qword, .{ .reg = .rdx }, .{ .mem = limb(src, @intCast(n - 1 - i)) });
+                if (tag == .byte_swap) {
+                    try e.bswap(.qword, .rdx);
+                    try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
+                } else {
+                    try e.mov(.dword, .{ .reg = .rcx }, .{ .imm = 64 });
+                    const top = try e.newLabel();
+                    e.bind(top);
+                    try e.shift(.shr, .qword, .{ .reg = .rdx }, 1);
+                    try e.alu(.adc, .qword, .{ .reg = .rax }, .{ .reg = .rax });
+                    try e.alu(.sub, .dword, .{ .reg = .rcx }, .{ .imm = 1 });
+                    try e.jcc(.ne, .{ .label = top });
+                }
+                try e.mov(.qword, .{ .mem = limb(dst, @intCast(i)) }, .{ .reg = .rax });
+            }
+            if (r != 64) {
+                try e.mov(.dword, .{ .reg = .rcx }, .{ .imm = 64 - r });
+                for (0..n) |i| {
+                    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(dst, @intCast(i)) });
+                    if (i + 1 < n) {
+                        try e.mov(.qword, .{ .reg = .rdx }, .{ .mem = limb(dst, @intCast(i + 1)) });
+                        try e.shiftDouble(false, .{ .reg = .rax }, .rdx);
+                    } else {
+                        try e.shift(.shr, .qword, .{ .reg = .rax }, null);
+                    }
+                    try e.mov(.qword, .{ .mem = limb(dst, @intCast(i)) }, .{ .reg = .rax });
+                }
+            }
+            return cg.normalizeWide(dst, ty);
+        },
+        else => unreachable,
+    }
+    e.bind(done);
+    try cg.storeReg(dst, .rax, Type.abiSize(cg.ip, ty));
 }

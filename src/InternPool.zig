@@ -409,6 +409,37 @@ pub const Int = struct {
     };
 };
 
+/// A float value. The storage is fixed by the type: `f16`, `f32`, `f64`,
+/// `f80` (also `c_longdouble`), and `f128` (also `comptime_float`), so the
+/// canonical encoding, hash, and equality are the exact bits: `-0.0` and
+/// `0.0` are distinct values, and so are NaNs with different payloads, as
+/// upstream interns them.
+pub const Float = struct {
+    ty: Index,
+    storage: Storage,
+
+    pub const Storage = union(enum) {
+        f16: f16,
+        f32: f32,
+        f64: f64,
+        f80: f80,
+        f128: f128,
+    };
+
+    /// The bits of the value, zero-extended.
+    pub fn bits(f: Float) u128 {
+        return switch (f.storage) {
+            inline else => |v| @as(@Int(.unsigned, @bitSizeOf(@TypeOf(v))), @bitCast(v)),
+        };
+    }
+
+    pub fn toF128(f: Float) f128 {
+        return switch (f.storage) {
+            inline else => |v| v,
+        };
+    }
+};
+
 pub const Ptr = struct {
     ty: Index,
     base: BaseAddr,
@@ -481,6 +512,7 @@ pub const Key = union(enum) {
     simple_value: SimpleValue,
     undef: Index,
     int: Int,
+    float: Float,
     err: struct { ty: Index, name: String },
     error_union: struct { ty: Index, val: union(enum) { err_name: String, payload: Index } },
     enum_literal: String,
@@ -524,6 +556,13 @@ const Tag = enum(u8) {
     int_u64,
     int_i64,
     int_big,
+    /// `extra`: type, then the bits in 1 (f16, f32), 2 (f64), 3 (f80), or
+    /// 4 (f128) little-endian words.
+    float_f16,
+    float_f32,
+    float_f64,
+    float_f80,
+    float_f128,
     err,
     error_union_err,
     error_union_payload,
@@ -953,6 +992,20 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
                 return .{ .tag = .int_big, .data = try ip.addExtra(local, &.{ idx(int.ty), @intFromBool(big.positive), li }) };
             },
         },
+        .float => |f| {
+            const b = f.bits();
+            const words = [4]u32{ @truncate(b), @truncate(b >> 32), @truncate(b >> 64), @truncate(b >> 96) };
+            const tag: Tag, const n: usize = switch (f.storage) {
+                .f16 => .{ .float_f16, 1 },
+                .f32 => .{ .float_f32, 1 },
+                .f64 => .{ .float_f64, 2 },
+                .f80 => .{ .float_f80, 3 },
+                .f128 => .{ .float_f128, 4 },
+            };
+            const start = try ip.addExtra(local, &.{idx(f.ty)});
+            _ = try ip.addExtra(local, words[0..n]);
+            return .{ .tag = tag, .data = start };
+        },
         .err => |e| return .{ .tag = .err, .data = try ip.addExtra(local, &.{ idx(e.ty), @backingInt(e.name) }) },
         .error_union => |e| switch (e.val) {
             .err_name => |n| return .{ .tag = .error_union_err, .data = try ip.addExtra(local, &.{ idx(e.ty), @backingInt(n) }) },
@@ -1067,6 +1120,18 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
             .positive = extra[d + 1] != 0,
             .limbs = u.local.limbs.view()[extra[d + 2]],
         } } } },
+        .float_f16, .float_f32, .float_f64, .float_f80, .float_f128 => blk: {
+            const w = extra[d + 1 ..];
+            const ty = I.i(extra[d]);
+            break :blk .{ .float = .{ .ty = ty, .storage = switch (item.tag) {
+                .float_f16 => .{ .f16 = @bitCast(@as(u16, @truncate(w[0]))) },
+                .float_f32 => .{ .f32 = @bitCast(w[0]) },
+                .float_f64 => .{ .f64 = @bitCast(I.u64of(w[0], w[1])) },
+                .float_f80 => .{ .f80 = @bitCast(@as(u80, @truncate(@as(u96, w[2]) << 64 | I.u64of(w[0], w[1])))) },
+                .float_f128 => .{ .f128 = @bitCast(@as(u128, I.u64of(w[2], w[3])) << 64 | I.u64of(w[0], w[1])) },
+                else => unreachable,
+            } } };
+        },
         .err => .{ .err = .{ .ty = I.i(extra[d]), .name = I.s(extra[d + 1]) } },
         .error_union_err => .{ .error_union = .{ .ty = I.i(extra[d]), .val = .{ .err_name = I.s(extra[d + 1]) } } },
         .error_union_payload => .{ .error_union = .{ .ty = I.i(extra[d]), .val = .{ .payload = I.i(extra[d + 1]) } } },
@@ -1255,6 +1320,11 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
                 },
             }
         },
+        // The type fixes the storage, so the bits identify the value.
+        .float => |f| {
+            ip.hashIndex(&h, f.ty);
+            h.int(u128, f.bits());
+        },
         .err => |e| {
             ip.hashIndex(&h, e.ty);
             ip.hashString(&h, e.name);
@@ -1375,6 +1445,7 @@ fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
                 .big => |v| v.eql(y.storage.big),
             };
         },
+        .float => |x| x.ty == b.float.ty and std.meta.activeTag(x.storage) == std.meta.activeTag(b.float.storage) and x.bits() == b.float.bits(),
         .err => |x| x.ty == b.err.ty and x.name == b.err.name,
         .error_union => |x| {
             const y = b.error_union;
@@ -1452,6 +1523,7 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
             .simple_value => unreachable,
             .undef => |t| t,
             .int => |x| x.ty,
+            .float => |x| x.ty,
             .err => |x| x.ty,
             .error_union => |x| x.ty,
             .enum_literal => .enum_literal_type,
@@ -1484,6 +1556,19 @@ pub fn getInt(ip: *InternPool, tid: Tid, ty: Index, value: anytype) !Index {
     }
     if (value >= 0) return ip.get(tid, .{ .int = .{ .ty = ty, .storage = .{ .u64 = @intCast(value) } } });
     return ip.get(tid, .{ .int = .{ .ty = ty, .storage = .{ .i64 = @intCast(value) } } });
+}
+
+/// Interns `value` (any float type) as a value of float type `ty`, rounded
+/// to nearest-even into the type's storage.
+pub fn getFloat(ip: *InternPool, tid: Tid, ty: Index, value: anytype) !Index {
+    return ip.get(tid, .{ .float = .{ .ty = ty, .storage = switch (ip.indexToKey(ty).simple_type) {
+        .f16 => .{ .f16 = @floatCast(value) },
+        .f32 => .{ .f32 = @floatCast(value) },
+        .f64 => .{ .f64 = @floatCast(value) },
+        .f80, .c_longdouble => .{ .f80 = @floatCast(value) },
+        .f128, .comptime_float => .{ .f128 = @floatCast(value) },
+        else => unreachable,
+    } } });
 }
 
 /// The value of an integer as a big integer. `space` backs small values.
@@ -1674,6 +1759,28 @@ test "static items match their indices and deduplicate" {
     try std.testing.expectEqual(arr, try ip.get(.main, .{ .array_type = .{ .len = 3, .child = .u8_type } }));
     try std.testing.expect(arr != try ip.get(.main, .{ .array_type = .{ .len = 4, .child = .u8_type } }));
     try std.testing.expectEqual(Index.type_type, ip.typeOf(arr));
+}
+
+test "floats are interned by their exact bits" {
+    var ip: InternPool = try .init(std.testing.allocator, std.testing.io, 1);
+    defer ip.deinit();
+    const pz = try ip.getFloat(.main, .f64_type, @as(f64, 0.0));
+    const nz = try ip.getFloat(.main, .f64_type, @as(f64, -0.0));
+    try std.testing.expect(pz != nz);
+    try std.testing.expect(ip.stableHash(pz) != ip.stableHash(nz));
+    try std.testing.expectEqual(pz, try ip.getFloat(.main, .f64_type, @as(f32, 0.0)));
+    const nan = try ip.getFloat(.main, .f32_type, std.math.nan(f32));
+    try std.testing.expectEqual(nan, try ip.getFloat(.main, .f32_type, std.math.nan(f64)));
+    // The same number in another type is another value.
+    try std.testing.expect(pz != try ip.getFloat(.main, .comptime_float_type, @as(f64, 0.0)));
+    inline for (.{ .{ Index.f16_type, f16 }, .{ Index.f80_type, f80 }, .{ Index.f128_type, f128 } }) |p| {
+        const v = try ip.getFloat(.main, p[0], @as(p[1], -1.5));
+        try std.testing.expectEqual(@as(f128, -1.5), ip.indexToKey(v).float.toF128());
+        try std.testing.expectEqual(p[0], ip.typeOf(v));
+    }
+    const third: f80 = 1.0 / 3.0;
+    const v80 = try ip.getFloat(.main, .f80_type, third);
+    try std.testing.expectEqual(@as(u80, @bitCast(third)), @as(u80, @truncate(ip.indexToKey(v80).float.bits())));
 }
 
 test "stable hashes do not depend on interning order or thread" {

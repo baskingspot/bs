@@ -115,6 +115,11 @@ the callee's body first. Early cutoff on the set keeps such callers green.
 - Designed for concurrent use from the start: per-thread shards for appends
   and lock-free reads of published items. The skeleton can run one thread, but
   its API takes the per-thread handle so parallelism is not a retrofit.
+- Float values are stored as the IEEE bits of their type (c_longdouble as
+  f80, comptime_float as f128) and hashed and compared by those bits, as
+  upstream: -0.0 and 0.0 are distinct values, and so are NaNs with
+  different payloads. Comptime float arithmetic computes in the host type
+  of the same precision, as upstream does.
 - Error codes. `anyerror` integers are assigned per compilation and live only
   in memory; IR and Atoms refer to errors by name, and machine code gets the
   integers through link-time value relocations. A unit whose result depends on
@@ -161,12 +166,21 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   memory, which is also what debuggers expect in Debug builds. A small
   per-basic-block register cache may avoid redundant loads. No global
   register allocation.
-- Calling conventions: `.c` follows SysV for integer, bool, and pointer
-  parameters and results. Zap-to-zap calls (`.auto`) pass every argument in
+- Calling conventions: `.c` follows SysV for scalars: integers, bools, and
+  pointers in GPRs (16-byte integers in register pairs), f16, f32, f64, and
+  f128 in XMM registers, f80 in memory and returned in st0, and other values
+  in memory. Zap-to-zap calls (`.auto`) pass every argument in
   memory at 8-byte aligned offsets of the caller's outgoing area, return
   1-, 2-, 4-, and 8-byte results in rax, and return anything else through a
   result pointer in rdi. Nothing outside zap observes `.auto`, so this can
   change when a register allocator wants a different one.
+- Numerics: f32 and f64 use scalar SSE2 and f80 uses x87, as upstream
+  does. f16 and f128 arithmetic, operations SSE2 lacks (rounding, fmod,
+  transcendental functions, fma, fmin/fmax), and conversions SSE2 cannot do
+  call compiler_rt (see below). Integers wider than 64 bits live in memory
+  as 64-bit limbs, normalized like narrow integers (the bits above the width
+  are sign or zero copies); CodeGen operates on them limb by limb, inline
+  except for 128-bit division (`__udivti3` and friends).
 - Until milestone 3 routes safety panics to `std.builtin.panic`, a failed
   check writes `panic: <upstream message>` to stderr through small runtime
   helper Atoms and raises SIGABRT.
@@ -361,6 +375,22 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   `comptime` export blocks are not analyzed; zap maps helper symbol names to
   their declarations (upstream names the function after its symbol, e.g.
   `pub fn __udivti3` in `compiler_rt/udivmod.zig`).
+- Mechanism: the Frontend loads `lib/compiler_rt.zig` and its imports as the
+  `compiler_rt` module (ZIR from the global cache). CodeGen calls a helper
+  through `Zcu.requestCompilerRt(file, name)`, which returns the stable key
+  of the helper's function unit, `compiler_rt:compiler_rt/<file>:<name>`;
+  that key is also the call's symbol. `Zcu.analyzeAll` resolves each new
+  request (the file's root type, the declaration by name, its value) and
+  queues the function like any other. Helpers are named by declaration,
+  not by exported symbol (`__cmptf2` serves `__lttf2`, `fmodq` is exported
+  as `fmodf128`).
+- compiler_rt bodies are analyzed without runtime safety, ignoring
+  `@setRuntimeSafety`, because upstream builds compiler_rt in a release mode
+  and its code relies on that (for example wrapping `-=` in `fmodq`).
+  `builtin.is_test` is shared with the program, so under `zap test`
+  compiler_rt sees `is_test = true`; it reads it only in declarations zap
+  does not analyze (exports, its panic handler) and in `@setRuntimeSafety`
+  arguments, which zap ignores there.
 - `@memcpy`, `@memset`, and `@memmove` are inlined by CodeGen
   (`rep movsb`, `rep stosb`, and a direction check for overlap), not calls.
 - Consequence: zap binaries contain only the compiler_rt symbols they use.
