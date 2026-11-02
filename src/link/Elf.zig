@@ -846,6 +846,11 @@ fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const u64, di
             .x86_64_pc32, .value32 => 4,
             .value16 => 2,
             .value8 => 1,
+            // Another architecture's kind.
+            else => {
+                diag.* = .{ .atom = a.name };
+                return error.InvalidRelocation;
+            },
         };
         if (r.offset + @as(u64, width) > dst.len or r.info.target >= resolved.len) {
             diag.* = .{ .atom = a.name };
@@ -869,6 +874,7 @@ fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const u64, di
                     else => unreachable,
                 }
             },
+            else => unreachable,
         }
     }
 }

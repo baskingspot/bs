@@ -183,16 +183,29 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   declarations, or of the contents for anonymous constants. Atoms with equal
   keys are one symbol; the linker keeps one and rejects a key whose atoms
   differ.
-- Relocation kinds are either target-specific addresses (x86_64: absolute
-  64-bit, PC-relative 32-bit) or link-time values: an integer of 1, 2, 4, or
-  8 bytes that the whole compilation assigns to the target key, such as an
-  error code, passed to the linker rather than stored in any Atom.
+- Relocation kinds are either target-specific addresses or link-time
+  values: an integer of 1, 2, 4, or 8 bytes that the whole compilation
+  assigns to the target key, such as an error code, passed to the linker
+  rather than stored in any Atom. x86_64 addresses: absolute 64-bit,
+  PC-relative 32-bit. aarch64 addresses: absolute 64-bit (data only; Mach-O
+  turns it into a fixup), branch26 (b, bl), page21 (adrp) with pageoff12
+  (add, or a load or store whose access size the linker reads from the
+  instruction), and their GOT forms, which reach an import's GOT slot and
+  are relaxed to the symbol itself when it is defined in the image. aarch64
+  instructions have no 32-bit immediate field, so aarch64 CodeGen loads
+  link-time values from a constant Atom instead of patching code.
 - Atoms contain no InternPool indices. Constants a function needs (string
   literals, anonymous values) become their own Atoms with content-hash symbol
   keys, deduplicated by the linker.
-- The x86_64 encoder (`src/codegen/x86_64/Encoder.zig`) appends instructions
-  and produces an Atom's bytes and relocations; branches to local labels are
-  patched in place and never become relocations.
+- The encoders (`src/codegen/x86_64/Encoder.zig`,
+  `src/codegen/aarch64/Encoder.zig`) append instructions and produce an
+  Atom's bytes and relocations; branches to local labels are patched in
+  place and never become relocations. On aarch64, conditional branches and
+  cbz/tbz reach only labels (±1 MiB, tbz ±32 KiB; `finish` reports a
+  branch that does not fit), calls to other symbols are `bl`, and addresses
+  are adrp pairs. Both were checked against the system assembler (GNU as
+  for x86_64; clang's for aarch64, 32,771 instructions byte-identical,
+  including every encodable logical immediate).
 
 ### Linkers (`src/link/`)
 

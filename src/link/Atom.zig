@@ -117,6 +117,31 @@ pub const Reloc = extern struct {
         value16,
         value32,
         value64,
+        /// aarch64 kinds. P is the address of the instruction or field; the
+        /// instruction's other bits are kept. In Mach-O, a target that is
+        /// imported from a dylib is reached through its GOT slot or a stub.
+        ///
+        /// 64-bit absolute address: S + A. Mach-O emits a rebase (or, for an
+        /// import, a bind) fixup, so it is only valid in data and constants,
+        /// at 4-byte aligned addresses.
+        aarch64_abs64,
+        /// b, bl: (S + A - P) >> 2 into imm26 (±128 MiB). Branches to an
+        /// import go to its stub.
+        aarch64_branch26,
+        /// adrp: Page(S + A) - Page(P), 4 KiB pages, into immhi:immlo.
+        aarch64_page21,
+        /// add or load/store with an unsigned offset: (S + A) & 0xfff into
+        /// imm12, divided by the access size the instruction encodes (1 for
+        /// add, up to 16 for q registers), which the address must be
+        /// aligned to.
+        aarch64_pageoff12,
+        /// adrp: Page(GOT(S)) - Page(P), where GOT(S) is the address of S's
+        /// GOT slot. A must be 0.
+        aarch64_got_load_page21,
+        /// 64-bit ldr: GOT(S) & 0xfff, divided by 8, into imm12. A must be
+        /// 0. If S is defined in the image, the linker points the pair at S
+        /// itself and turns the ldr into an add.
+        aarch64_got_load_pageoff12,
     };
 };
 

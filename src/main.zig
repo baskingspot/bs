@@ -225,6 +225,7 @@ test {
     _ = @import("link/Atom.zig");
     _ = @import("link/Elf.zig");
     _ = @import("codegen/x86_64/Encoder.zig");
+    _ = @import("codegen/aarch64/Encoder.zig");
     _ = @import("InternPool.zig");
     _ = Zcu;
     _ = @import("Sema.zig");
