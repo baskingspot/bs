@@ -7005,7 +7005,9 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         const ref = try sema.resolveInlineBody(block, fn_info.ret_ty_body, inst);
         break :blk try sema.analyzeAsType(block, src, ref);
     } else try sema.resolveType(block, src, fn_info.ret_ty_ref);
-    if (fn_info.inferred_error_set) {
+    // A generic return type stays generic_poison: instantiation adds the
+    // inferred error set (see `calleeRetTy`).
+    if (fn_info.inferred_error_set and ret_ty != .generic_poison_type) {
         ret_ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = .adhoc_inferred_error_set_type, .payload_type = ret_ty } });
     }
 

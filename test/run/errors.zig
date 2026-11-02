@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -48,6 +48,16 @@ fn firstChar(s: ?[]const u8) u8 {
     return str[0];
 }
 
+fn halfUp(comptime T: type, x: T) !T {
+    if (x == 0) return error.Zero;
+    return (x + 1) / 2;
+}
+
+inline fn checked(x: u32) !u32 {
+    if (x > 100) return error.TooBig;
+    return x;
+}
+
 fn main() callconv(.c) noreturn {
     rt.printInt(parse("42") catch 0);
     rt.printInt(parse("") catch 1);
@@ -82,6 +92,19 @@ fn main() callconv(.c) noreturn {
     ptr = &target;
     ptr.?.* = 4;
     rt.printInt(target);
+
+    // A generic function returning `!T`, called with runtime arguments.
+    var seven: u32 = 7;
+    _ = &seven;
+    rt.printInt(halfUp(u32, seven) catch 0);
+    // An inline function with an inferred error set.
+    rt.printInt(checked(seven) catch 0);
+    rt.printInt(@intFromBool(checked(seven + 200) == error.TooBig));
+    // Optionals compared at runtime.
+    var none: ?u32 = null;
+    _ = &none;
+    rt.printInt(@intFromBool(none == seven));
+    rt.printInt(@intFromBool(@as(?u32, seven) == seven));
 
     const e: anyerror!u8 = error.Empty;
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
