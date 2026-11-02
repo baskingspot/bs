@@ -97,6 +97,8 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
     for (names.items) |file| {
         const name = file[0 .. file.len - ".zig".len];
         const src_path = b.fmt("test/run/{s}", .{file});
+        // The directory dependency covers only its entries' names.
+        b.dependOnFileContents(b.path(src_path));
         const source = dir.readFileAlloc(io, file, b.allocator, .limited(1 << 20)) catch |err|
             std.debug.panic("unable to read {s}: {t}", .{ src_path, err });
         var expect: struct {
