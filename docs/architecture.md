@@ -146,6 +146,21 @@ granularity.
   dependency still has the recorded result hash (red-green). That build pays
   per reached unit, which is acceptable because it would otherwise analyze
   them all.
+- **Storage.** Two layers, split by who reads them:
+  - The global store holds one file per entry, named by its key, written to a
+    temporary name and renamed into place, like Go's build cache. Concurrent
+    zap processes need no locks, and old entries are removed by age. Only a
+    project's first build and units re-analyzed after an edit touch it.
+  - The project's local cache holds the manifest and a pack: one file with
+    every Atom the last build linked. A rebuild maps the pack, appends the
+    Atoms it regenerated, and links from it, so the link reads one file. The
+    pack is compacted when its dead space grows past its live size.
+  - Measured on the orb (2026-11-02, warm page cache): reading 30k 2 KB files
+    took 70–84 ms; mapping and touching one 60 MB file took 2–3 ms. One file
+    per entry is fine for occasional lookups and too slow for every link.
+  - Not per-module packs: a build reads a slice of many modules, a std pack
+    would mix entries from every project on the machine, and concurrent
+    builds appending to it would need cross-process locking.
 - InternPool contents are rebuilt lazily on a warm build: only units that
   must be re-analyzed load the types and values they reference.
 
@@ -154,8 +169,7 @@ What the cache must get right, or edit-rebuilds will not be Go-class:
 - **Validation cost.** Go re-checks hundreds of packages per build; checking
   tens of thousands of declarations the same way would put a floor of tens of
   milliseconds under every rebuild, which is why edit-rebuilds walk from the
-  edit instead. Entries are stored packed (a few large files, read with
-  mmap), not one file per unit. Target: a no-edit rebuild of the libvaxis
+  edit instead. Target: a no-edit rebuild of the libvaxis
   example in under 10 ms beyond process start.
 - **Namespace-level dependencies.** Adding or removing a declaration must
   invalidate the units that looked that name up or reflected over the whole
