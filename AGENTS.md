@@ -36,7 +36,9 @@ builds. It does not track upstream: it compiles exactly one pinned Zig release
 
 ## Upstream reference
 
-- `.agents/setup` installs upstream `zig` 0.17.0 on `PATH`. It also symlinks
+- `.agents/setup` installs upstream `zig` 0.17.0 on `PATH` in orbs. On a Mac
+  satellite it leaves the owner's `zig` alone; use
+  `~/.cache/zap/zig-aarch64-macos-0.17.0/zig` there. It also symlinks
   that release's source tree at `upstream/` (gitignored), which contains
   `upstream/src/Sema.zig`, `upstream/test/behavior/` and more.
 - Upstream `zig` 0.17.0 is the oracle. When semantics are unclear, write a

@@ -60,7 +60,12 @@ time fetch "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_HOST-$ZIG_VERSION
 time fetch "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_VERSION.tar.xz" \
   "$ZIG_SRC_SHA" "$cache/zig-$ZIG_VERSION-src"
 
-ln -sfn "$bin_dir/zig" "$HOME/.local/bin/zig"
+# Orbs are disposable, so zig goes on PATH there. A Mac satellite is the
+# owner's own machine with its own zig; don't shadow it. Use
+# ~/.cache/zap/zig-aarch64-macos-0.17.0/zig explicitly there.
+if [ "$ZIG_HOST" = x86_64-linux ]; then
+  ln -sfn "$bin_dir/zig" "$HOME/.local/bin/zig"
+fi
 ln -sfn "$cache/zig-$ZIG_VERSION-src" "$repo_root/upstream"
 
-"$HOME/.local/bin/zig" version
+"$bin_dir/zig" version
