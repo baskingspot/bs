@@ -5,7 +5,8 @@
 //! File layout, with each segment starting on a page boundary and mapped at
 //! `base_address + file offset`:
 //!
-//!   R   ELF header, program headers, .rodata
+//!   R   ELF header, program headers, .rodata, .eh_frame, .eh_frame_hdr
+//!       (the last two present if `Options.debug` is not empty)
 //!   RX  .text
 //!   RW  .data, then .bss (memory only)
 //!       .debug_abbrev, .debug_info, .debug_line, .debug_str (not loaded;
@@ -17,6 +18,13 @@
 //! own fragment, per entry of `Options.debug`. The entries come separately
 //! from the atoms, so that linking without them never reads them, and with
 //! them the debug passes stream through them in chunks of their own.
+//!
+//! Call frame information is one .eh_frame CIE and a fixed-size FDE per
+//! entry with a frame-pointer frame, indexed by a sorted .eh_frame_hdr
+//! search table that PT_GNU_EH_FRAME points to, which is where std.debug's
+//! unwinder looks first. Both sections are sized for every entry before
+//! the debug entries are read, so entries that get no FDE leave unused
+//! zero bytes after each section.
 //!
 //! TLS is not implemented. `.tdata` and `.tbss` will go at the start of the
 //! RW segment, before `.data`, covered by a PT_TLS program header, with
@@ -149,8 +157,15 @@ const Place = packed struct(u64) {
 };
 /// Atoms per unit of work in placement and copying.
 const chunk_len = 2048;
-const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.debug_abbrev\x00.debug_info\x00.debug_line\x00.debug_str\x00";
-const shstrtab_no_debug = shstrtab[0..52];
+/// Section names. Outputs without debug info keep the prefix up to the
+/// names they use.
+const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_line\x00.debug_str\x00";
+const shstrtab_no_cfi = shstrtab[0..shName(".eh_frame")];
+const shstrtab_no_debug = shstrtab[0..shName(".debug_abbrev")];
+
+fn shName(comptime name: []const u8) u32 {
+    return comptime @intCast(std.mem.indexOf(u8, shstrtab, "\x00" ++ name ++ "\x00").? + 1);
+}
 
 /// Links `atoms` into the buffer `out.buffer(io, len)` returns.
 ///
@@ -249,11 +264,18 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     // Section placement, as file offsets (for .bss, address - base).
     const has_rx = sizes[text] > 0;
     const has_rw = sizes[data] > 0 or sizes[bss] > 0;
-    const phnum: u16 = 2 + @as(u16, @intFromBool(has_rx)) + @intFromBool(has_rw);
+    const has_cfi = debug.len > 0;
+    const phnum: u16 = 2 + @as(u16, @intFromBool(has_rx)) + @intFromBool(has_rw) + @intFromBool(has_cfi);
     const headers_end: u64 = @sizeOf(elf.Elf64.Ehdr) + phnum * @sizeOf(elf.Elf64.Phdr);
     var starts: [4]u64 = undefined;
     starts[rodata] = aligns[rodata].forward(headers_end);
-    const r_end = starts[rodata] + sizes[rodata];
+    const rodata_end = starts[rodata] + sizes[rodata];
+    // Room for an FDE per debug entry, and the terminator.
+    const eh_off = std.mem.alignForward(u64, rodata_end, 8);
+    const eh_room = if (has_cfi) Dwarf.cie.len + debug.len * Dwarf.fde_size + 4 else 0;
+    const hdr_off = eh_off + eh_room;
+    const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + debug.len * Dwarf.eh_frame_hdr_entry_size else 0;
+    const r_end = if (has_cfi) hdr_off + hdr_room else rodata_end;
     const rx_start = if (has_rx) std.mem.alignForward(u64, r_end, page_size) else r_end;
     starts[text] = aligns[text].forward(rx_start);
     const text_end = starts[text] + sizes[text];
@@ -262,6 +284,9 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const file_end = starts[data] + sizes[data];
     starts[bss] = aligns[bss].forward(file_end);
     const mem_end = starts[bss] + sizes[bss];
+    // Call frame information holds 32-bit offsets between any two parts of
+    // the image.
+    if (has_cfi and mem_end > std.math.maxInt(i32)) return error.OutOfMemory;
 
     const base = options.base_address;
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
@@ -274,11 +299,14 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     var info_len: u64 = 0;
     var line_len: u64 = 0;
     var n_chunk_files: usize = 0;
+    var n_fdes: u32 = 0;
     for (debug_chunks) |*c| {
         c.info_off = info_len;
         c.line_off = line_len;
+        c.fde_base = n_fdes;
         info_len += c.info_len;
         line_len += c.line_len;
+        n_fdes += c.n_fdes;
         n_chunk_files += c.files.count();
     }
     var files: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -311,9 +339,9 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
     const strtab_off = symtab_off + @as(u64, n_syms) * @sizeOf(elf.Elf64.Sym);
     const shstrtab_off = strtab_off + strtab_len;
-    const shstr = if (has_debug) shstrtab else shstrtab_no_debug;
+    const shstr = if (has_debug) shstrtab else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = if (has_debug) 12 else 8;
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_cfi)) + 4 * @as(u16, @intFromBool(has_debug));
     const buf = try out.buffer(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     l.buf = buf;
     adviseHugePages(buf);
@@ -322,6 +350,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     // Padding between sections; padding within a section is filled by the
     // atom or chunk after it.
     @memset(buf[headers_end..starts[rodata]], 0);
+    @memset(buf[rodata_end..eh_off], 0);
     @memset(buf[r_end..starts[text]], 0);
     @memset(buf[text_end..starts[data]], 0);
     @memset(buf[str_off + str_size .. symtab_off], 0);
@@ -329,6 +358,16 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     buf[strtab_off] = 0;
     @memcpy(buf[shstrtab_off..][0..shstr.len], shstr);
     @memset(buf[shstrtab_off + shstr.len .. shoff], 0);
+    const eh_size = Dwarf.cie.len + @as(u64, n_fdes) * Dwarf.fde_size + 4;
+    const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, n_fdes) * Dwarf.eh_frame_hdr_entry_size;
+    if (has_cfi) {
+        // The FDEs and the search table are written with the debug chunks.
+        @memcpy(buf[eh_off..][0..Dwarf.cie.len], &Dwarf.cie);
+        @memset(buf[eh_off + eh_size - 4 .. hdr_off], 0); // terminator, unused room
+        const eh_frame_rel: i32 = @intCast(@as(i64, @intCast(eh_off)) - @as(i64, @intCast(hdr_off + 4)));
+        buf[hdr_off..][0..Dwarf.eh_frame_hdr_size].* = Dwarf.ehFrameHdr(eh_frame_rel, n_fdes);
+        @memset(buf[hdr_off + hdr_size .. r_end], 0);
+    }
     if (has_debug) {
         // Debug info covers all of .text, so atoms without `debug` resolve to
         // the compile unit but to no function or line.
@@ -351,6 +390,8 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     l.max_targets = max_targets;
     l.info_off = info_off + dwarf.info_header.len;
     l.line_off = line_off + dwarf.line_header.len;
+    l.eh_off = eh_off;
+    l.hdr_off = hdr_off;
     try parallel(io, n_threads, n_chunks + n_debug_chunks, &l, Link.copyAll);
     try l.check(diag);
 
@@ -390,6 +431,19 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         });
         ph_off += @sizeOf(elf.Elf64.Phdr);
     };
+    if (has_cfi) {
+        writeStruct(buf[ph_off..], elf.Elf64.Phdr{
+            .type = .GNU_EH_FRAME,
+            .flags = .{ .R = true },
+            .offset = hdr_off,
+            .vaddr = base + hdr_off,
+            .paddr = base + hdr_off,
+            .filesz = hdr_size,
+            .memsz = hdr_size,
+            .@"align" = 4,
+        });
+        ph_off += @sizeOf(elf.Elf64.Phdr);
+    }
     writeStruct(buf[ph_off..], elf.Elf64.Phdr{
         .type = .GNU_STACK,
         .flags = .{ .R = true, .W = true },
@@ -401,27 +455,32 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         .@"align" = 16,
     });
 
+    const cfi_shdrs = [_]elf.Elf64.Shdr{
+        shdr(shName(".eh_frame"), .X86_64_UNWIND, .{ .ALLOC = true }, base, eh_off, eh_size, .@"8"),
+        shdr(shName(".eh_frame_hdr"), .PROGBITS, .{ .ALLOC = true }, base, hdr_off, hdr_size, .@"4"),
+    };
     const debug_shdrs = [_]elf.Elf64.Shdr{
-        nonAlloc(52, .PROGBITS, abbrev_off, Dwarf.abbrev.len),
-        nonAlloc(66, .PROGBITS, info_off, info_size),
-        nonAlloc(78, .PROGBITS, line_off, line_size),
-        nonAlloc(90, .PROGBITS, str_off, str_size),
+        nonAlloc(shName(".debug_abbrev"), .PROGBITS, abbrev_off, Dwarf.abbrev.len),
+        nonAlloc(shName(".debug_info"), .PROGBITS, info_off, info_size),
+        nonAlloc(shName(".debug_line"), .PROGBITS, line_off, line_size),
+        nonAlloc(shName(".debug_str"), .PROGBITS, str_off, str_size),
     };
     const strtab_ndx = shnum - 2;
     const shdrs = [_]elf.Elf64.Shdr{
         std.mem.zeroes(elf.Elf64.Shdr),
-        shdr(1, .PROGBITS, .{ .ALLOC = true }, base, starts[rodata], sizes[rodata], aligns[rodata]),
-        shdr(9, .PROGBITS, .{ .ALLOC = true, .EXECINSTR = true }, base, starts[text], sizes[text], aligns[text]),
-        shdr(15, .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
-        shdr(21, .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
-    } ++ debug_shdrs ++ [_]elf.Elf64.Shdr{
-        .{ .name = 26, .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = 1, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
-        nonAlloc(34, .STRTAB, strtab_off, strtab_len),
-        nonAlloc(42, .STRTAB, shstrtab_off, shstr.len),
+        shdr(shName(".rodata"), .PROGBITS, .{ .ALLOC = true }, base, starts[rodata], sizes[rodata], aligns[rodata]),
+        shdr(shName(".text"), .PROGBITS, .{ .ALLOC = true, .EXECINSTR = true }, base, starts[text], sizes[text], aligns[text]),
+        shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
+        shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
+    } ++ cfi_shdrs ++ debug_shdrs ++ [_]elf.Elf64.Shdr{
+        .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = 1, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
+        nonAlloc(shName(".strtab"), .STRTAB, strtab_off, strtab_len),
+        nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
     var sh_at = shoff;
     for (shdrs, 0..) |s, i| {
-        if (!has_debug and i >= 5 and i < 5 + debug_shdrs.len) continue;
+        if (!has_cfi and i >= 5 and i < 5 + cfi_shdrs.len) continue;
+        if (!has_debug and i >= 5 + cfi_shdrs.len and i < 5 + cfi_shdrs.len + debug_shdrs.len) continue;
         writeStruct(buf[sh_at..], s);
         sh_at += @sizeOf(elf.Elf64.Shdr);
     }
@@ -451,6 +510,7 @@ const DebugChunk = struct {
     /// Bytes of the chunk's subprogram entries and line sequences.
     info_len: u64,
     line_len: u64,
+    n_fdes: u32,
     /// Source files of the chunk's entries, in first-use order;
     /// `Link.file_of` indexes it.
     files: std.StringArrayHashMapUnmanaged(void),
@@ -458,6 +518,8 @@ const DebugChunk = struct {
     /// Where the chunk's entries and sequences start, after the headers.
     info_off: u64,
     line_off: u64,
+    /// The chunk's first FDE, counting from the first after the CIE.
+    fde_base: u32,
     /// Index in the output's file table of each of `files`.
     file_map: []u32,
 };
@@ -496,6 +558,9 @@ const Link = struct {
     /// Where the chunks' subprogram entries and line sequences start.
     info_off: u64 = undefined,
     line_off: u64 = undefined,
+    /// File offsets of .eh_frame and .eh_frame_hdr.
+    eh_off: u64 = undefined,
+    hdr_off: u64 = undefined,
 
     fn check(l: *Link, diag: *Diagnostic) Error!void {
         var first: ?Failure = null;
@@ -614,6 +679,7 @@ const Link = struct {
         const c = &l.debug_chunks[chunk];
         c.info_len = 0;
         c.line_len = 0;
+        c.n_fdes = 0;
         // Functions from one file usually share its path's bytes, so a
         // table by address saves hashing the path for most entries.
         var by_addr: FilesByAddr = .{};
@@ -635,6 +701,7 @@ const Link = struct {
             };
             c.info_len += Dwarf.subprogramSize(d);
             c.line_len += Dwarf.sequenceSize(d);
+            c.n_fdes += @intFromBool(d.frame == .frame_pointer);
         }
     }
 
@@ -672,13 +739,16 @@ const Link = struct {
         if (task < l.chunks.len) l.copy(task, thread) else l.copyDebug(task - l.chunks.len);
     }
 
-    /// Writes one chunk's subprogram entries and line sequences.
-    fn copyDebug(l: *Link, chunk: usize) void {
+    /// Writes one chunk's subprogram entries, line sequences, FDEs, and
+    /// search table entries.
+    noinline fn copyDebug(l: *Link, chunk: usize) void {
         const begin = chunk * chunk_len;
         const entries = l.debug[begin..@min(l.debug.len, begin + chunk_len)];
         const c = &l.debug_chunks[chunk];
         var info_off = l.info_off + c.info_off;
         var line_off = l.line_off + c.line_off;
+        var fde = c.fde_base;
+        const hdr_addr: i64 = @intCast(l.base + l.hdr_off);
         for (entries, l.file_of[begin..][0..entries.len], 0..) |*d, file_of, j| {
             // The entries stream; their fragments, names, and atoms do not.
             if (j + 12 < entries.len) {
@@ -694,6 +764,16 @@ const Link = struct {
             const file = c.file_map[file_of];
             info_off += Dwarf.writeSubprogram(l.buf[info_off..], d, addr, size, file);
             line_off += Dwarf.writeSequence(l.buf[line_off..], d, addr, size, file);
+            if (d.frame == .frame_pointer) {
+                const fde_off: u32 = @intCast(Dwarf.cie.len + @as(u64, fde) * Dwarf.fde_size);
+                const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
+                const fn_addr: i64 = @intCast(addr);
+                Dwarf.writeFde(l.buf[l.eh_off + fde_off ..][0..Dwarf.fde_size], fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
+                const entry = l.buf[l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, fde) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
+                std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
+                std.mem.writeInt(i32, entry[4..8], @intCast(fde_addr - hdr_addr), .little);
+                fde += 1;
+            }
         }
     }
 
@@ -1105,7 +1185,7 @@ test "links many chunks of atoms the same way on any number of threads" {
         const alignments = [_]std.mem.Alignment{ .@"1", .@"16", .@"64" };
         // Files change every 1000 functions, so chunks share some.
         const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
-        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = e.lines.bytes.items });
+        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = e.lines.bytes.items, .frame = .frame_pointer });
         try atoms.append(arena, .{ .key = fkey(i), .name = name, .section = .text, .alignment = alignments[i % 3], .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items });
         try atoms.append(arena, constants[i % 50]);
         if (i % 7 == 0) try atoms.append(arena, .{ .key = fkey(n + i), .name = "pad", .section = .bss, .alignment = .@"8", .zero_fill = i % 13 });
@@ -1198,10 +1278,10 @@ test "line programs decode with std.debug.Dwarf" {
         .{ .key = .fromName("g"), .name = "root:g", .section = .text, .bytes = &.{0xc3} },
     };
     const debug = [_]Atom.Debug{
-        .{ .atom = 1, .file = "src/f.zig", .name = "f", .base_line = 1000, .lines = lp.bytes.items },
-        .{ .atom = 2, .file = "g.zig", .name = "g", .base_line = 0, .lines = &.{} },
+        .{ .atom = 1, .file = "src/f.zig", .name = "f", .base_line = 1000, .lines = lp.bytes.items, .frame = .frame_pointer },
+        .{ .atom = 2, .file = "g.zig", .name = "g", .base_line = 0, .lines = &.{}, .frame = .none },
         // The duplicate's entry goes with it.
-        .{ .atom = 3, .file = "g.zig", .name = "g again", .base_line = 0, .lines = &.{} },
+        .{ .atom = 3, .file = "g.zig", .name = "g again", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
     };
     const out = try emit(gpa, io, &atoms, .{ .entry = key, .debug = &debug, .comp_dir = "/work" });
     defer gpa.free(out);
@@ -1235,6 +1315,94 @@ test "line programs decode with std.debug.Dwarf" {
     const stripped = try emit(gpa, io, &atoms, .{ .entry = key });
     defer gpa.free(stripped);
     try std.testing.expect(std.mem.indexOf(u8, stripped, ".debug_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, ".eh_frame") == null);
+}
+
+test "std.debug unwinds frame-pointer frames through .eh_frame_hdr" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const gpa = std.debug.getDebugInfoAllocator();
+    const io = std.testing.io;
+    const code: [64]u8 = @splat(0xcc);
+    const key: SymbolKey = .fromName("f");
+    const atoms = [_]Atom{
+        .{ .key = .fromName("no debug"), .name = "h", .section = .text, .bytes = &.{ 0xc3, 0xc3, 0xc3 } },
+        .{ .key = key, .name = "f", .section = .text, .alignment = .@"16", .bytes = &code },
+        .{ .key = .fromName("naked"), .name = "naked", .section = .text, .bytes = &.{ 0xcc, 0xcc } },
+        .{ .key = .fromName("f"), .name = "f", .section = .text, .alignment = .@"16", .bytes = &code },
+        .{ .key = .fromName("g"), .name = "g", .section = .text, .alignment = .@"16", .bytes = &code },
+    };
+    const debug = [_]Atom.Debug{
+        .{ .atom = 1, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
+        .{ .atom = 2, .file = "a.zig", .name = "naked", .base_line = 0, .lines = &.{}, .frame = .none },
+        .{ .atom = 3, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
+        .{ .atom = 4, .file = "a.zig", .name = "g", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
+    };
+    const out = try emit(gpa, io, &atoms, .{ .entry = key, .debug = &debug });
+    defer gpa.free(out);
+    const text = testSectionAddr(out, ".text");
+    const f = text + 16;
+    const naked = f + code.len;
+    const g = text + 96;
+    // Two FDEs; the duplicate and the naked function leave their room unused.
+    try std.testing.expectEqual(Dwarf.cie.len + 2 * Dwarf.fde_size + 4, testSection(out, ".eh_frame").?.size);
+    try std.testing.expectEqual(Dwarf.eh_frame_hdr_size + 2 * Dwarf.eh_frame_hdr_entry_size, testSection(out, ".eh_frame_hdr").?.size);
+
+    // Set up the way std.debug.SelfInfo does from PT_GNU_EH_FRAME.
+    const base = 0x200000;
+    const ehdr = std.mem.bytesToValue(elf.Elf64.Ehdr, out[0..@sizeOf(elf.Elf64.Ehdr)]);
+    const phdr = for (0..ehdr.phnum) |i| {
+        const ph = std.mem.bytesToValue(elf.Elf64.Phdr, out[ehdr.phoff + i * @sizeOf(elf.Elf64.Phdr) ..][0..@sizeOf(elf.Elf64.Phdr)]);
+        if (ph.type == elf.PT.GNU_EH_FRAME) break ph;
+    } else return error.TestUnexpectedResult;
+    const Unwind = std.debug.Dwarf.Unwind;
+    const header: Unwind.EhFrameHeader = try .parse(phdr.vaddr, out[phdr.offset..][0..phdr.filesz], 8, .little);
+    try std.testing.expectEqual(testSectionAddr(out, ".eh_frame"), header.eh_frame_vaddr);
+    try std.testing.expectEqual(2, header.search_table.?.fde_count);
+    // Through the search table, and through the FDEs sorted while parsing
+    // all of .eh_frame, which is what std.debug.SelfInfo asks for.
+    for ([_]bool{ false, true }) |sort_fdes| {
+        var unwind: Unwind = .initEhFrameHdr(header, phdr.vaddr, out[header.eh_frame_vaddr - base ..].ptr);
+        defer unwind.deinit(gpa);
+        try unwind.prepare(gpa, 8, .little, sort_fdes, false);
+
+        // A fake stack: saved rbp, then the return address.
+        var stack: [6]u64 = .{ 0, 0, 0x1111, 0x2222, 0, 0 };
+        const at = struct {
+            fn addr(s: *[6]u64, i: usize) u64 {
+                return @intFromPtr(&s[i]);
+            }
+        }.addr;
+        const cases = [_]struct { pc: u64, rsp: u64, rbp: u64, new_rbp: u64 }{
+            // Entry: only the return address is pushed.
+            .{ .pc = f, .rsp = at(&stack, 3), .rbp = 0x5555, .new_rbp = 0x5555 },
+            // After `push rbp`.
+            .{ .pc = f + 1, .rsp = at(&stack, 2), .rbp = 0x5555, .new_rbp = 0x1111 },
+            // In the body, with rsp anywhere below the frame.
+            .{ .pc = f + 4, .rsp = at(&stack, 0), .rbp = at(&stack, 2), .new_rbp = 0x1111 },
+            .{ .pc = f + code.len - 1, .rsp = at(&stack, 0), .rbp = at(&stack, 2), .new_rbp = 0x1111 },
+            .{ .pc = g + 20, .rsp = at(&stack, 1), .rbp = at(&stack, 2), .new_rbp = 0x1111 },
+        };
+        for (cases) |c| {
+            var ctx: std.debug.cpu_context.Native = .{ .gprs = .initFill(0) };
+            ctx.gprs.set(.rip, c.pc);
+            ctx.gprs.set(.rsp, c.rsp);
+            ctx.gprs.set(.rbp, c.rbp);
+            var unwinder: std.debug.Dwarf.SelfUnwinder = .init(&ctx);
+            defer unwinder.deinit();
+            const rules = try unwinder.computeRules(gpa, &unwind, 0, null);
+            try std.testing.expectEqual(0x2222, try unwinder.next(gpa, &rules));
+            try std.testing.expectEqual(at(&stack, 4), unwinder.cpu_state.gprs.get(.rsp));
+            try std.testing.expectEqual(c.new_rbp, unwinder.cpu_state.gprs.get(.rbp));
+        }
+        // No FDE covers a function without debug info or a naked one.
+        for ([_]u64{ text, naked, naked + 1 }) |pc| {
+            var ctx: std.debug.cpu_context.Native = .{ .gprs = .initFill(0) };
+            ctx.gprs.set(.rip, pc);
+            var unwinder: std.debug.Dwarf.SelfUnwinder = .init(&ctx);
+            defer unwinder.deinit();
+            try std.testing.expectError(error.MissingDebugInfo, unwinder.computeRules(gpa, &unwind, 0, null));
+        }
+    }
 }
 
 /// Loads `elf_bytes` the way std.debug does for stack traces.

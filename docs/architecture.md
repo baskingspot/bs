@@ -228,7 +228,8 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   and output buffers.
 - The ELF linker (`src/link/Elf.zig`) builds the whole file in one buffer
   (for `link`, a shared mapping of the new file, which replaces any old file
-  instead of truncating it). Segments: R (headers, .rodata), RX (.text), RW
+  instead of truncating it). Segments: R (headers, .rodata, and with debug info
+  .eh_frame and .eh_frame_hdr), RX (.text), RW
   (.data, .bss). TLS will add .tdata and .tbss at the start of RW with a
   PT_TLS header.
 - Phases, each split into tasks over a thread pool: insert every key into a
@@ -271,9 +272,33 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   written in place as extra tasks of the copy step. Entries whose atom lost
   to a duplicate are skipped. gdb (`break file.zig:N`, `break fn`, `bt`) and
   std.debug's ElfFile/Dwarf read it; std.debug requires a .debug_str, so
-  it holds the producer string. No CFI yet: debuggers unwind through the
-  rbp frame chain. Per-module compile units, types, variables, and rbrace
-  (epilogue) rows come later. Cost (bench-link with a line row every
+  it holds the producer string. Per-module compile units, types,
+  variables, and rbrace (epilogue) rows come later.
+- Call frame information: std.debug unwinds x86_64-linux stacks with DWARF
+  CFI (frame-pointer walking counts as unsafe there and is used only for
+  panics), looking first for PT_GNU_EH_FRAME. So each `Debug` entry whose
+  `frame` is `.frame_pointer` gets a fixed 32-byte FDE for CodeGen's
+  `push rbp; mov rbp, rsp` prologue (CFA rsp+8, then rsp+16 with rbp at
+  CFA-16, then rbp+16), all sharing one CIE in an allocated .eh_frame, and
+  an entry in .eh_frame_hdr's sorted search table; naked functions
+  (`.none`) get none. Both sections are sized for every entry before the
+  entries are read, so they need no pass before section placement, and
+  the FDEs are written by the same chunked debug tasks as the rest; the
+  room of skipped entries stays zero after each section. Not described:
+  the `ret` after each epilogue's `pop rbp` (CodeGen returns from several
+  places; gdb's epilogue sniffer covers it), functions without `Debug`
+  (runtime helpers), and naked functions, including `_start` (std's
+  `_start` marks rip undefined with `.cfi_undefined`; a frame kind for that
+  can come with std.start). Verified with gdb (its dwarf2 unwinder, at
+  entry, after the push, and in the body), `readelf
+  --debug-dump=frames-interp` (same rows as upstream's FDEs, minus
+  upstream's epilogue row), and std.debug's own unwinder
+  (`Dwarf.SelfUnwinder` through PT_GNU_EH_FRAME, both its search-table and
+  sorted-FDE lookups) walking a trapped zap process's stack from a ptrace
+  harness, and on a synthetic stack in a unit test. Cost on bench-link:
+  about 3M more instructions per debug emit (40 bytes per function; 406.4M
+  → 415.5M for three single-thread emits), within wall-clock noise; none
+  for stripped emits (312.1M). Cost (bench-link with a line row every
   8..40 bytes, 3.4 MiB of fragments, output 27.4 → 35.7 MiB): emit
   +10–11 ms on one thread and +3.5–4.5 ms on four in the session below
   (+6.5–8 and +2.3–3.3 ms on a quieter orb); about 2–5 µs of the 55–90 µs

@@ -201,6 +201,18 @@ pub const Debug = struct {
     /// special-opcode parameters of `LineProgram`; the linker wraps it in a
     /// sequence and copies it unchanged.
     lines: []const u8,
+    /// How the function's frame unwinds; the linker writes call frame
+    /// information (an FDE) from it.
+    frame: Frame,
+
+    pub const Frame = enum(u8) {
+        /// No unwind info, as for naked functions.
+        none,
+        /// The target's frame-pointer prologue at the start of the code
+        /// (x86_64: `push rbp; mov rbp, rsp`), after which the frame is
+        /// addressed from the frame pointer until the epilogue.
+        frame_pointer,
+    };
 };
 
 /// Builds `Debug.lines` from rows in increasing code offset.

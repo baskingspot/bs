@@ -131,6 +131,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .name = ip.stringSlice(nav.name),
         .base_line = file.zir.getDeclaration(nav.zir_inst).src_line,
         .lines = try arena.dupe(u8, cg.e.lines.bytes.items),
+        .frame = if (naked) .none else .frame_pointer,
     };
     try emit.addFunction(.{
         .key = try emit.funcKey(ir.func),
