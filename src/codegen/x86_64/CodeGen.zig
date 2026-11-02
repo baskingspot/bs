@@ -504,6 +504,17 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.load(.rax, data.ty_op.operand);
                 if (Type.isInt(ip, ty)) try cg.normalize(.rax, ty);
                 try cg.storeReg(dst, .rax, size);
+            } else if (Type.abiSize(ip, cg.typeOf(data.ty_op.operand)) != size) {
+                // A bitcast between a vector and an array or integer
+                // without its padding: the low bytes.
+                const n = @min(size, Type.abiSize(ip, cg.typeOf(data.ty_op.operand)));
+                try cg.fillMem(dst, size, 0);
+                try cg.copyMem(dst, try cg.memOf(data.ty_op.operand), n);
+                if (Type.isInt(ip, ty) and cg.passInRegs(ty)) {
+                    try cg.loadMem(.rax, dst, ty);
+                    try cg.normalize(.rax, ty);
+                    try cg.storeReg(dst, .rax, size);
+                }
             } else {
                 try cg.copyTo(dst, data.ty_op.operand);
             }
@@ -594,6 +605,17 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const src = try cg.memOf(data.bin_op.lhs);
             try cg.e.lea(.qword, .r10, src);
             try cg.load(.rcx, data.bin_op.rhs);
+            if (ip.indexToKey(cg.typeOf(data.bin_op.lhs)) == .vector_type and ty == .bool_type) {
+                // Bit-packed bool vector: bit rcx % 8 of byte rcx / 8.
+                try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
+                try cg.e.shift(.shr, .qword, .{ .reg = .rax }, 3);
+                try cg.e.alu(.add, .qword, .{ .reg = .r10 }, .{ .reg = .rax });
+                try cg.e.movzx(.dword, .rax, .byte, .{ .mem = Mem.at(.r10, 0) });
+                try cg.e.alu(.@"and", .dword, .{ .reg = .rcx }, .{ .imm = 7 });
+                try cg.e.shift(.shr, .dword, .{ .reg = .rax }, null);
+                try cg.e.alu(.@"and", .dword, .{ .reg = .rax }, .{ .imm = 1 });
+                return cg.storeReg(dst, .rax, 1);
+            }
             try cg.scaleAdd(.r10, .rcx, size);
             try cg.copyMem(dst, Mem.at(.r10, 0), size);
         },
@@ -692,9 +714,20 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const dst = try cg.resultMem(inst, ty) orelse return;
             const extra = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
             const elems = ir.refSlice(extra.end, extra.data.len);
+            if (ip.indexToKey(ty) == .vector_type and ip.indexToKey(ty).vector_type.child == .bool_type) {
+                // Bit-packed: element i is bit i % 8 of byte i / 8.
+                try cg.fillMem(dst, Type.abiSize(ip, ty), 0);
+                for (elems, 0..) |elem, i| {
+                    try cg.load(.rax, elem);
+                    if (i % 8 != 0) try cg.e.shift(.shl, .byte, .{ .reg = .rax }, @intCast(i % 8));
+                    try cg.e.alu(.@"or", .byte, .{ .mem = offsetMem(dst, i / 8) }, .{ .reg = .rax });
+                }
+                return;
+            }
             for (elems, 0..) |elem, i| {
                 const off = switch (ip.indexToKey(ty)) {
                     .array_type => |a| i * Type.abiSize(ip, a.child),
+                    .vector_type => |v| i * Type.abiSize(ip, v.child),
                     else => Type.fieldOffset(ip, ty, i),
                 };
                 try cg.copyTo(offsetMem(dst, off), elem);
@@ -1476,6 +1509,7 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
             const base_ty = Type.ptrInfo(ip, ip.typeOf(el.base));
             const elem_ty = switch (ip.indexToKey(base_ty.child)) {
                 .array_type => |a| if (base_ty.flags.size == .one) a.child else base_ty.child,
+                .vector_type => |v| if (base_ty.flags.size == .one) v.child else base_ty.child,
                 else => base_ty.child,
             };
             parent.off += @intCast(el.index * Type.abiSize(ip, elem_ty));
@@ -1587,6 +1621,20 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
                             try lowerValue(emit, elem, out[off..][0..esize], relocs, base_off + off);
                         },
                     }
+                },
+                .vector_type => |vt| for (0..vt.len) |i| {
+                    const el = switch (a.storage) {
+                        .elems => |elems| elems[i],
+                        .repeated_elem => |el| el,
+                        .bytes => |b| break @memcpy(out[0..vt.len], ip.stringSlice(b)[0..vt.len]),
+                    };
+                    if (vt.child == .bool_type) {
+                        if (el == .bool_true) out[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+                        continue;
+                    }
+                    const esize = Type.abiSize(ip, vt.child);
+                    const off: u32 = @intCast(i * esize);
+                    try lowerValue(emit, el, out[off..][0..esize], relocs, base_off + off);
                 },
                 .struct_type, .tuple_type => {
                     const n = Type.fieldCount(ip, ty);
@@ -2319,8 +2367,8 @@ fn normalizeWide(cg: *CodeGen, m: Mem, ty: Index) Error!void {
 /// extended.
 fn wideCast(cg: *CodeGen, dst: Mem, ty: Index, v: Val) Error!void {
     if (!Type.isInt(cg.ip, v.ty)) {
-        // A float's bits.
-        try cg.copyMem(dst, try cg.valMem(v), Type.abiSize(cg.ip, ty));
+        // A float's or a vector's bits.
+        try cg.copyMem(dst, try cg.valMem(v), @min(Type.abiSize(cg.ip, ty), Type.abiSize(cg.ip, v.ty)));
         return cg.normalizeWide(dst, ty);
     }
     if (cg.passInRegs(ty)) {

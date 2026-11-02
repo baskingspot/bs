@@ -271,8 +271,11 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
             break :blk a.lenIncludingSentinel() * abiSize(ip, a.child);
         },
         .vector => blk: {
+            // Upstream's stage2_x86_64 layout: bools are bits, other
+            // elements are laid out like an array.
             const v = ip.indexToKey(ty).vector_type;
-            break :blk std.mem.alignForward(u64, v.len * abiSize(ip, v.child), abiAlignment(ip, ty));
+            const bytes = if (v.child == .bool_type) (v.len + 7) / 8 else v.len * abiSize(ip, v.child);
+            break :blk std.mem.alignForward(u64, bytes, abiAlignment(ip, ty));
         },
         .optional => blk: {
             const child = childType(ip, ty);
@@ -301,7 +304,13 @@ pub fn abiAlignment(ip: *const InternPool, ty: Index) u64 {
         .float => @min(abiSize(ip, ty), 16),
         .pointer, .@"anyframe" => 8,
         .array => abiAlignment(ip, childType(ip, ty)),
-        .vector => @min(std.math.ceilPowerOfTwoAssert(u64, @max(1, ip.indexToKey(ty).vector_type.len * abiSize(ip, childType(ip, ty)))), 64),
+        .vector => blk: {
+            // Upstream's stage2_x86_64 rule for a CPU without AVX.
+            const v = ip.indexToKey(ty).vector_type;
+            if (v.len == 0) break :blk 1;
+            if (v.child == .bool_type) break :blk if (v.len > 64) 16 else std.math.ceilPowerOfTwoAssert(u64, (v.len + 7) / 8);
+            break :blk if (abiSize(ip, v.child) == 0) 1 else 16;
+        },
         .optional => blk: {
             const child = childType(ip, ty);
             if (optionalReprIsPtr(ip, child)) break :blk 8;

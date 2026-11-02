@@ -1,0 +1,108 @@
+//! signal: ABRT
+//! stdout: "15289149009567803999\n15289149009567803999\n1011000101 0100111010\n2\n16\n16\n2139095040\n4290772992\n1266679808\n01\n9223372036854775808\n31744\n1\n16777216\n1069547520\n"
+//! stderr: "panic: integer overflow\n"
+//! upstream-signal: SEGV
+const rt = @import("rt.zig");
+
+pub export fn _start() callconv(.naked) noreturn {
+    asm volatile ("call %[main:P]"
+        :
+        : [main] "X" (&main),
+    );
+}
+
+fn pi(x: i64) void {
+    rt.printInt(@bitCast(x));
+}
+
+fn pb(b: bool) void {
+    rt.print(if (b) "1" else "0");
+}
+
+fn bits32(x: f32) void {
+    rt.printInt(@as(u32, @bitCast(x)));
+}
+
+/// Element-wise arithmetic, comparisons, casts, and the vector builtins,
+/// at runtime and at comptime; bool vectors are bit-packed.
+fn ints() i64 {
+    var a: @Vector(4, i32) = .{ 1, -2, 3, 2147483647 };
+    var b: @Vector(4, i32) = .{ 5, 6, -7, 1 };
+    _ = &a;
+    _ = &b;
+    const s = a +% b;
+    const d = a - @as(@Vector(4, i32), @splat(1));
+    const lt = a < b;
+    const sel = @select(i32, lt, a, b);
+    const sh = @shuffle(i32, a, b, @Vector(5, i32){ 3, -1, 0, -4, 2 });
+    const w: @Vector(4, i64) = a;
+    const t: @Vector(4, i8) = @truncate(a);
+    const n = -%a;
+    const sl = b << @splat(3);
+    const pc = @popCount(a);
+    var acc: i64 = 0;
+    inline for (0..4) |i| {
+        acc = acc *% 31 +% s[i];
+        acc = acc *% 31 +% d[i];
+        acc = acc *% 31 +% @intFromBool(lt[i]);
+        acc = acc *% 31 +% sel[i];
+        acc = acc *% 31 +% w[i];
+        acc = acc *% 31 +% t[i];
+        acc = acc *% 31 +% n[i];
+        acc = acc *% 31 +% sl[i];
+        acc = acc *% 31 +% pc[i];
+    }
+    inline for (0..5) |i| acc = acc *% 31 +% sh[i];
+    return acc;
+}
+
+fn bools() void {
+    var x: @Vector(10, bool) = .{ true, false, true, true, false, false, false, true, false, true };
+    _ = &x;
+    const y = !x;
+    comptime var i: usize = 0;
+    inline while (i < 10) : (i += 1) pb(x[i]);
+    rt.print(" ");
+    i = 0;
+    inline while (i < 10) : (i += 1) pb(y[i]);
+    rt.print("\n");
+    rt.printInt(@sizeOf(@Vector(10, bool)));
+    rt.printInt(@sizeOf(@Vector(3, u8)));
+    rt.printInt(@alignOf(@Vector(3, u8)));
+}
+
+fn floats() void {
+    var f: @Vector(3, f32) = .{ 1.5, -0.0, 16777217.0 };
+    var g: @Vector(3, f32) = .{ 0.0, 0.0, 1.0 };
+    _ = &f;
+    _ = &g;
+    const q = f / g;
+    bits32(q[0]);
+    bits32(q[1]);
+    bits32(q[2]);
+    const ne = q != q;
+    pb(ne[0]);
+    pb(ne[1]);
+    rt.print("\n");
+    const h: @Vector(3, f64) = f;
+    rt.printInt(@as(u64, @bitCast(h[1])));
+    const r: @Vector(3, f16) = @floatCast(f);
+    rt.printInt(@as(u16, @bitCast(r[2])));
+    const k: @Vector(3, i32) = @intFromFloat(f);
+    pi(k[0]);
+    pi(k[2]);
+    const sq = @sqrt(f * f);
+    bits32(sq[0]);
+}
+
+fn main() callconv(.c) noreturn {
+    pi(ints());
+    pi(comptime ints());
+    bools();
+    floats();
+    var a: @Vector(2, i8) = .{ 100, 1 };
+    _ = &a;
+    const b = a + a; // overflow traps in element 0
+    pi(b[1]);
+    rt.exit(0);
+}

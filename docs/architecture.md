@@ -181,6 +181,15 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   as 64-bit limbs, normalized like narrow integers (the bits above the width
   are sign or zero copies); CodeGen operates on them limb by limb, inline
   except for 128-bit division (`__udivti3` and friends).
+- Vectors are scalarized in Sema: an element-wise operation extracts each
+  element (`array_elem_val`, or folded when comptime-known), applies the
+  scalar operation with its usual safety checks, and rebuilds the vector
+  with `aggregate_init`. CodeGen sees vectors only as values in memory,
+  laid out as upstream's x86_64 backend lays them out without AVX: bool
+  vectors bit-packed (element i is bit i % 8 of byte i / 8), other vectors
+  like arrays, aligned to 16. No IR instruction is vector-specific, so a
+  backend that wants SIMD can recognize the pattern or add instructions
+  later without changing Sema's results.
 - Until milestone 3 routes safety panics to `std.builtin.panic`, a failed
   check writes `panic: <upstream message>` to stderr through small runtime
   helper Atoms and raises SIGABRT.

@@ -521,12 +521,18 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .ptr_elem_val => blk: {
             const ptr = ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).ptr_type;
             break :blk switch (ptr.flags.size) {
-                .one => ip.indexToKey(ptr.child).array_type.child,
+                .one => switch (ip.indexToKey(ptr.child)) {
+                    .vector_type => |v| v.child,
+                    else => |k| k.array_type.child,
+                },
                 else => ptr.child,
             };
         },
         .slice_elem_val => ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).ptr_type.child,
-        .array_elem_val => ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).array_type.child,
+        .array_elem_val => switch (ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip))) {
+            .vector_type => |v| v.child,
+            else => |k| k.array_type.child,
+        },
     };
 }
 
