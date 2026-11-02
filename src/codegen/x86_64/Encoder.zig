@@ -1,0 +1,727 @@
+//! x86_64 machine code encoder for the Debug CodeGen. Appends one instruction
+//! per call to `code`; references to other symbols become `Atom.Reloc`s and
+//! branches to local labels are patched by `finish`. It always picks one
+//! encoding per form (rel32 branches, no short jumps) and does no
+//! instruction selection: invalid operand combinations are caller bugs and
+//! trip assertions.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const Atom = @import("../../link/Atom.zig");
+const SymbolKey = Atom.SymbolKey;
+
+const Encoder = @This();
+
+gpa: Allocator,
+code: std.ArrayList(u8) = .empty,
+relocs: std.ArrayList(Atom.Reloc) = .empty,
+/// Offset each label is bound to, or `unbound`.
+labels: std.ArrayList(u32) = .empty,
+/// rel32 fields that branch to a label not yet bound when they were emitted.
+fixups: std.ArrayList(struct { at: u32, label: Label }) = .empty,
+
+const unbound = std.math.maxInt(u32);
+
+pub const Reg = enum(u4) {
+    rax,
+    rcx,
+    rdx,
+    rbx,
+    rsp,
+    rbp,
+    rsi,
+    rdi,
+    r8,
+    r9,
+    r10,
+    r11,
+    r12,
+    r13,
+    r14,
+    r15,
+
+    fn low(r: Reg) u3 {
+        return @truncate(@backingInt(r));
+    }
+    /// spl, bpl, sil, and dil need a REX prefix to be addressed as bytes.
+    fn needsRexAsByte(r: Reg) bool {
+        return @backingInt(r) >= 4 and @backingInt(r) < 8;
+    }
+};
+
+pub const Xmm = enum(u4) {
+    xmm0,
+    xmm1,
+    xmm2,
+    xmm3,
+    xmm4,
+    xmm5,
+    xmm6,
+    xmm7,
+    xmm8,
+    xmm9,
+    xmm10,
+    xmm11,
+    xmm12,
+    xmm13,
+    xmm14,
+    xmm15,
+};
+
+/// Operand size of a GPR instruction.
+pub const Size = enum(u2) {
+    byte,
+    word,
+    dword,
+    qword,
+
+    pub fn bytes(s: Size) u8 {
+        return @as(u8, 1) << @backingInt(s);
+    }
+};
+
+pub const Float = enum { f32, f64 };
+
+/// Condition codes, numbered as in the opcode.
+pub const Cond = enum(u4) {
+    o,
+    no,
+    b,
+    ae,
+    e,
+    ne,
+    be,
+    a,
+    s,
+    ns,
+    p,
+    np,
+    l,
+    ge,
+    le,
+    g,
+
+    pub fn negate(c: Cond) Cond {
+        return @fromBackingInt(@intCast(@backingInt(c) ^ 1));
+    }
+};
+
+pub const Mem = struct {
+    base: Base = .none,
+    index: ?Index = null,
+    disp: i32 = 0,
+
+    pub const Base = union(enum) {
+        /// Absolute `[index*scale + disp]`.
+        none,
+        reg: Reg,
+        /// RIP-relative `[rip + sym + disp]`; becomes a PC32 relocation.
+        /// Cannot have an index.
+        sym: SymbolKey,
+    };
+    pub const Index = struct { reg: Reg, scale: Scale = .@"1" };
+    pub const Scale = enum(u2) { @"1", @"2", @"4", @"8" };
+
+    /// `[base + disp]`
+    pub fn at(base: Reg, disp: i32) Mem {
+        return .{ .base = .{ .reg = base }, .disp = disp };
+    }
+    /// `[rip + sym + disp]`
+    pub fn sym(key: SymbolKey, disp: i32) Mem {
+        return .{ .base = .{ .sym = key }, .disp = disp };
+    }
+};
+
+/// A GPR or memory operand.
+pub const Rm = union(enum) { reg: Reg, mem: Mem };
+/// An XMM or memory operand.
+pub const XmmRm = union(enum) { reg: Xmm, mem: Mem };
+/// Source operand of `mov`, ALU instructions, and `test`.
+pub const Operand = union(enum) { reg: Reg, mem: Mem, imm: i64 };
+
+pub const Label = enum(u32) { _ };
+pub const Target = union(enum) { label: Label, sym: SymbolKey };
+
+pub fn init(gpa: Allocator) Encoder {
+    return .{ .gpa = gpa };
+}
+
+pub fn deinit(e: *Encoder) void {
+    e.code.deinit(e.gpa);
+    e.relocs.deinit(e.gpa);
+    e.labels.deinit(e.gpa);
+    e.fixups.deinit(e.gpa);
+}
+
+/// Patches branches to labels. Every label must be bound.
+pub fn finish(e: *Encoder) void {
+    for (e.fixups.items) |f| e.patchRel32(f.at, e.labels.items[@backingInt(f.label)]);
+    e.fixups.clearRetainingCapacity();
+}
+
+pub fn newLabel(e: *Encoder) Allocator.Error!Label {
+    try e.labels.append(e.gpa, unbound);
+    return @fromBackingInt(@intCast(e.labels.items.len - 1));
+}
+
+/// Binds `label` to the current offset.
+pub fn bind(e: *Encoder, label: Label) void {
+    assert(e.labels.items[@backingInt(label)] == unbound);
+    e.labels.items[@backingInt(label)] = @intCast(e.code.items.len);
+}
+
+// ---------------------------------------------------------------- data movement
+
+pub fn mov(e: *Encoder, size: Size, dst: Rm, src: Operand) !void {
+    try e.reserve();
+    switch (src) {
+        .reg => |s| try e.gprRm(size, 0x88, 0x89, .{ .reg = s }, dst, 0),
+        .mem => |s| try e.gprRm(size, 0x8a, 0x8b, .{ .reg = dst.reg }, .{ .mem = s }, 0),
+        .imm => |imm| switch (dst) {
+            .reg => |d| if (size == .qword and imm < 0 and imm >= std.math.minInt(i32)) {
+                // Sign-extended imm32; shorter than movabs.
+                try e.gprRm(.qword, 0xc6, 0xc7, .{ .ext = 0 }, dst, 4);
+                e.immediate(.dword, imm);
+            } else if (size == .qword and imm >= 0 and imm <= std.math.maxInt(u32)) {
+                // `mov r32, imm32` zero-extends.
+                e.prefixes(.{ .b = ext(@backingInt(d)) }, .{});
+                e.byte(0xb8 | @as(u8, d.low()));
+                e.immediate(.dword, imm);
+            } else {
+                e.prefixes(.{ .w = size == .qword, .b = ext(@backingInt(d)) }, .{
+                    .op16 = size == .word,
+                    .force_rex = size == .byte and d.needsRexAsByte(),
+                });
+                e.byte((if (size == .byte) @as(u8, 0xb0) else 0xb8) | @as(u8, d.low()));
+                if (size == .qword) e.int(i64, imm) else e.immediate(size, imm);
+            },
+            .mem => {
+                try e.gprRm(size, 0xc6, 0xc7, .{ .ext = 0 }, dst, immLen(size));
+                e.immediate(size, imm);
+            },
+        },
+    }
+}
+
+/// `movabs dst, sym + addend`: loads a symbol's absolute address.
+pub fn movAbsSym(e: *Encoder, dst: Reg, sym: SymbolKey, addend: i64) !void {
+    try e.reserve();
+    e.prefixes(.{ .w = true, .b = ext(@backingInt(dst)) }, .{});
+    e.byte(0xb8 | @as(u8, dst.low()));
+    try e.reloc(.x86_64_abs64, sym, addend);
+    e.int(u64, 0);
+}
+
+pub fn lea(e: *Encoder, size: Size, dst: Reg, src: Mem) !void {
+    assert(size != .byte);
+    try e.reserve();
+    try e.gprRm(size, undefined, 0x8d, .{ .reg = dst }, .{ .mem = src }, 0);
+}
+
+/// Zero-extends `src` into `dst`. A dword source becomes `mov r32, r/m32`.
+pub fn movzx(e: *Encoder, dst_size: Size, dst: Reg, src_size: Size, src: Rm) !void {
+    try e.extend(dst_size, dst, src_size, src, 0xb6);
+}
+
+/// Sign-extends `src` into `dst`. A dword source becomes `movsxd`.
+pub fn movsx(e: *Encoder, dst_size: Size, dst: Reg, src_size: Size, src: Rm) !void {
+    try e.extend(dst_size, dst, src_size, src, 0xbe);
+}
+
+fn extend(e: *Encoder, dst_size: Size, dst: Reg, src_size: Size, src: Rm, op: u8) !void {
+    assert(@backingInt(src_size) < @backingInt(dst_size));
+    try e.reserve();
+    switch (src_size) {
+        .byte, .word => try e.modRm(.{
+            .w = dst_size == .qword,
+            .op16 = dst_size == .word,
+            .force_rex = src_size == .byte and src == .reg and src.reg.needsRexAsByte(),
+        }, &.{ 0x0f, op | @backingInt(src_size) }, @backingInt(dst), rmGpr(src), 0),
+        .dword => if (op == 0xb6)
+            try e.gprRm(.dword, undefined, 0x8b, .{ .reg = dst }, src, 0)
+        else
+            try e.gprRm(.qword, undefined, 0x63, .{ .reg = dst }, src, 0),
+        .qword => unreachable,
+    }
+}
+
+pub fn push(e: *Encoder, r: Reg) !void {
+    try e.reserve();
+    e.prefixes(.{ .b = ext(@backingInt(r)) }, .{});
+    e.byte(0x50 | @as(u8, r.low()));
+}
+
+pub fn pop(e: *Encoder, r: Reg) !void {
+    try e.reserve();
+    e.prefixes(.{ .b = ext(@backingInt(r)) }, .{});
+    e.byte(0x58 | @as(u8, r.low()));
+}
+
+pub fn cmov(e: *Encoder, cond: Cond, size: Size, dst: Reg, src: Rm) !void {
+    assert(size != .byte);
+    try e.reserve();
+    try e.modRm(.{ .w = size == .qword, .op16 = size == .word }, &.{ 0x0f, 0x40 | @as(u8, @backingInt(cond)) }, @backingInt(dst), rmGpr(src), 0);
+}
+
+/// Sets the byte `dst` to 1 if `cond` holds, else 0.
+pub fn setcc(e: *Encoder, cond: Cond, dst: Rm) !void {
+    try e.reserve();
+    try e.modRm(.{ .force_rex = dst == .reg and dst.reg.needsRexAsByte() }, &.{ 0x0f, 0x90 | @as(u8, @backingInt(cond)) }, 0, rmGpr(dst), 0);
+}
+
+// ---------------------------------------------------------------- arithmetic
+
+pub const AluOp = enum(u3) { add, @"or", adc, sbb, @"and", sub, xor, cmp };
+
+/// `op dst, src` for add, or, adc, sbb, and, sub, xor, cmp. A qword
+/// immediate must fit in i32.
+pub fn alu(e: *Encoder, op: AluOp, size: Size, dst: Rm, src: Operand) !void {
+    try e.reserve();
+    const base = @as(u8, @backingInt(op)) << 3;
+    switch (src) {
+        .reg => |s| try e.gprRm(size, base, base | 1, .{ .reg = s }, dst, 0),
+        .mem => |s| try e.gprRm(size, base | 2, base | 3, .{ .reg = dst.reg }, .{ .mem = s }, 0),
+        .imm => |imm| if (size != .byte and std.math.cast(i8, imm) != null) {
+            try e.gprRm(size, undefined, 0x83, .{ .ext = @backingInt(op) }, dst, 1);
+            e.immediate(.byte, imm);
+        } else if (dst == .reg and dst.reg == .rax) {
+            // Accumulator short form, as assemblers emit it.
+            e.prefixes(.{ .w = size == .qword }, .{ .op16 = size == .word });
+            e.byte(if (size == .byte) base | 4 else base | 5);
+            e.immediate(size, imm);
+        } else {
+            try e.gprRm(size, 0x80, 0x81, .{ .ext = @backingInt(op) }, dst, immLen(size));
+            e.immediate(size, imm);
+        },
+    }
+}
+
+/// `test dst, src`. A qword immediate must fit in i32.
+pub fn @"test"(e: *Encoder, size: Size, dst: Rm, src: Operand) !void {
+    try e.reserve();
+    switch (src) {
+        .reg => |s| try e.gprRm(size, 0x84, 0x85, .{ .reg = s }, dst, 0),
+        // `test` is symmetric; only the r/m, reg form exists.
+        .mem => |s| try e.gprRm(size, 0x84, 0x85, .{ .reg = dst.reg }, .{ .mem = s }, 0),
+        .imm => |imm| {
+            if (dst == .reg and dst.reg == .rax) {
+                e.prefixes(.{ .w = size == .qword }, .{ .op16 = size == .word });
+                e.byte(if (size == .byte) 0xa8 else 0xa9);
+            } else {
+                try e.gprRm(size, 0xf6, 0xf7, .{ .ext = 0 }, dst, immLen(size));
+            }
+            e.immediate(size, imm);
+        },
+    }
+}
+
+/// One-operand group 3 instructions. `mul`, `imul`, `div`, and `idiv`
+/// operate on rdx:rax (ax for bytes) as usual.
+pub const UnaryOp = enum(u3) { not = 2, neg = 3, mul = 4, imul = 5, div = 6, idiv = 7 };
+
+pub fn unary(e: *Encoder, op: UnaryOp, size: Size, dst: Rm) !void {
+    try e.reserve();
+    try e.gprRm(size, 0xf6, 0xf7, .{ .ext = @backingInt(op) }, dst, 0);
+}
+
+/// `imul dst, src` or, with `imm`, `imul dst, src, imm`.
+pub fn imul(e: *Encoder, size: Size, dst: Reg, src: Rm, imm: ?i32) !void {
+    assert(size != .byte);
+    try e.reserve();
+    const i = imm orelse return e.modRm(.{ .w = size == .qword, .op16 = size == .word }, &.{ 0x0f, 0xaf }, @backingInt(dst), rmGpr(src), 0);
+    if (std.math.cast(i8, i) != null) {
+        try e.gprRm(size, undefined, 0x6b, .{ .reg = dst }, src, 1);
+        e.immediate(.byte, i);
+    } else {
+        try e.gprRm(size, undefined, 0x69, .{ .reg = dst }, src, immLen(size));
+        e.immediate(size, i);
+    }
+}
+
+/// Sign-extends the accumulator into the high half of the dividend before
+/// `idiv`: cbw (al into ah), cwd, cdq, cqo.
+pub fn cqo(e: *Encoder, size: Size) !void {
+    try e.reserve();
+    switch (size) {
+        .byte => e.bytes(&.{ 0x66, 0x98 }),
+        .word => e.bytes(&.{ 0x66, 0x99 }),
+        .dword => e.byte(0x99),
+        .qword => e.bytes(&.{ 0x48, 0x99 }),
+    }
+}
+
+pub const ShiftOp = enum(u3) { rol = 0, ror = 1, shl = 4, shr = 5, sar = 7 };
+
+/// Shifts `dst` by `count`, or by cl when `count` is null.
+pub fn shift(e: *Encoder, op: ShiftOp, size: Size, dst: Rm, count: ?u8) !void {
+    try e.reserve();
+    if (count) |c| {
+        if (c == 1) return e.gprRm(size, 0xd0, 0xd1, .{ .ext = @backingInt(op) }, dst, 0);
+        try e.gprRm(size, 0xc0, 0xc1, .{ .ext = @backingInt(op) }, dst, 1);
+        e.byte(c);
+    } else {
+        try e.gprRm(size, 0xd2, 0xd3, .{ .ext = @backingInt(op) }, dst, 0);
+    }
+}
+
+// ---------------------------------------------------------------- control flow
+
+pub fn jmp(e: *Encoder, target: Target) !void {
+    try e.reserve();
+    e.byte(0xe9);
+    try e.rel32(target);
+}
+
+pub fn jcc(e: *Encoder, cond: Cond, target: Target) !void {
+    try e.reserve();
+    e.bytes(&.{ 0x0f, 0x80 | @as(u8, @backingInt(cond)) });
+    try e.rel32(target);
+}
+
+pub fn call(e: *Encoder, target: Target) !void {
+    try e.reserve();
+    e.byte(0xe8);
+    try e.rel32(target);
+}
+
+/// `jmp r/m64`
+pub fn jmpIndirect(e: *Encoder, target: Rm) !void {
+    try e.reserve();
+    try e.modRm(.{}, &.{0xff}, 4, rmGpr(target), 0);
+}
+
+/// `call r/m64`
+pub fn callIndirect(e: *Encoder, target: Rm) !void {
+    try e.reserve();
+    try e.modRm(.{}, &.{0xff}, 2, rmGpr(target), 0);
+}
+
+pub fn ret(e: *Encoder) !void {
+    try e.code.append(e.gpa, 0xc3);
+}
+
+pub fn syscall(e: *Encoder) !void {
+    try e.code.appendSlice(e.gpa, &.{ 0x0f, 0x05 });
+}
+
+pub fn ud2(e: *Encoder) !void {
+    try e.code.appendSlice(e.gpa, &.{ 0x0f, 0x0b });
+}
+
+pub fn int3(e: *Encoder) !void {
+    try e.code.append(e.gpa, 0xcc);
+}
+
+// ---------------------------------------------------------------- scalar SSE
+
+/// movss/movsd: register to register, load, or store.
+pub fn movs(e: *Encoder, ty: Float, dst: XmmRm, src: XmmRm) !void {
+    try e.reserve();
+    const p = scalarPrefix(ty);
+    switch (dst) {
+        .reg => |d| try e.modRm(.{ .prefix = p }, &.{ 0x0f, 0x10 }, @backingInt(d), rmXmm(src), 0),
+        .mem => try e.modRm(.{ .prefix = p }, &.{ 0x0f, 0x11 }, @backingInt(src.reg), rmXmm(dst), 0),
+    }
+}
+
+pub const SseOp = enum(u8) { sqrt = 0x51, add = 0x58, mul = 0x59, sub = 0x5c, min = 0x5d, div = 0x5e, max = 0x5f };
+
+/// addss/addsd and friends: `dst = dst op src` (sqrt: `dst = sqrt(src)`).
+pub fn sse(e: *Encoder, op: SseOp, ty: Float, dst: Xmm, src: XmmRm) !void {
+    try e.reserve();
+    try e.modRm(.{ .prefix = scalarPrefix(ty) }, &.{ 0x0f, @backingInt(op) }, @backingInt(dst), rmXmm(src), 0);
+}
+
+pub const SseLogicOp = enum(u8) { @"and" = 0x54, andn = 0x55, @"or" = 0x56, xor = 0x57 };
+
+/// andps/andpd, andnps/andnpd, orps/orpd, xorps/xorpd, for sign manipulation
+/// and zeroing. Memory operands must be 16-byte aligned.
+pub fn sseLogic(e: *Encoder, op: SseLogicOp, ty: Float, dst: Xmm, src: XmmRm) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = ty == .f64 }, &.{ 0x0f, @backingInt(op) }, @backingInt(dst), rmXmm(src), 0);
+}
+
+/// ucomiss/ucomisd: compares and sets ZF, PF, CF (unordered sets all three).
+pub fn ucomis(e: *Encoder, ty: Float, a: Xmm, b: XmmRm) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = ty == .f64 }, &.{ 0x0f, 0x2e }, @backingInt(a), rmXmm(b), 0);
+}
+
+/// cvtsi2ss/cvtsi2sd from a dword or qword integer.
+pub fn cvtsi2s(e: *Encoder, ty: Float, dst: Xmm, src_size: Size, src: Rm) !void {
+    assert(src_size == .dword or src_size == .qword);
+    try e.reserve();
+    try e.modRm(.{ .prefix = scalarPrefix(ty), .w = src_size == .qword }, &.{ 0x0f, 0x2a }, @backingInt(dst), rmGpr(src), 0);
+}
+
+/// cvttss2si/cvttsd2si (truncating) to a dword or qword integer.
+pub fn cvtts2si(e: *Encoder, ty: Float, dst_size: Size, dst: Reg, src: XmmRm) !void {
+    assert(dst_size == .dword or dst_size == .qword);
+    try e.reserve();
+    try e.modRm(.{ .prefix = scalarPrefix(ty), .w = dst_size == .qword }, &.{ 0x0f, 0x2c }, @backingInt(dst), rmXmm(src), 0);
+}
+
+/// cvtss2sd (to f64) or cvtsd2ss (to f32).
+pub fn cvts2s(e: *Encoder, to: Float, dst: Xmm, src: XmmRm) !void {
+    try e.reserve();
+    const from: Float = if (to == .f64) .f32 else .f64;
+    try e.modRm(.{ .prefix = scalarPrefix(from) }, &.{ 0x0f, 0x5a }, @backingInt(dst), rmXmm(src), 0);
+}
+
+/// movd/movq from a GPR or memory into the low lane of an XMM register.
+pub fn movToXmm(e: *Encoder, size: Size, dst: Xmm, src: Rm) !void {
+    assert(size == .dword or size == .qword);
+    try e.reserve();
+    try e.modRm(.{ .op16 = true, .w = size == .qword }, &.{ 0x0f, 0x6e }, @backingInt(dst), rmGpr(src), 0);
+}
+
+/// movd/movq from the low lane of an XMM register into a GPR or memory.
+pub fn movFromXmm(e: *Encoder, size: Size, dst: Rm, src: Xmm) !void {
+    assert(size == .dword or size == .qword);
+    try e.reserve();
+    try e.modRm(.{ .op16 = true, .w = size == .qword }, &.{ 0x0f, 0x7e }, @backingInt(src), rmGpr(dst), 0);
+}
+
+// ---------------------------------------------------------------- encoding core
+
+/// Longest instruction this encoder emits, rounded up.
+const max_insn_len = 16;
+
+/// Every instruction reserves capacity first, so the helpers below cannot
+/// fail. Only relocations allocate in the middle of an instruction.
+fn reserve(e: *Encoder) !void {
+    try e.code.ensureUnusedCapacity(e.gpa, max_insn_len);
+}
+
+fn byte(e: *Encoder, b: u8) void {
+    e.code.appendAssumeCapacity(b);
+}
+
+fn bytes(e: *Encoder, bs: []const u8) void {
+    e.code.appendSliceAssumeCapacity(bs);
+}
+
+fn int(e: *Encoder, comptime T: type, v: T) void {
+    std.mem.writeInt(T, e.code.addManyAsArrayAssumeCapacity(@sizeOf(T)), v, .little);
+}
+
+/// Immediate of an instruction with operand size `size`: qword operands take
+/// a sign-extended imm32.
+fn immediate(e: *Encoder, size: Size, v: i64) void {
+    switch (size) {
+        .byte => e.int(u8, @bitCast(@as(i8, @truncate(v)))),
+        .word => e.int(u16, @bitCast(@as(i16, @truncate(v)))),
+        .dword => e.int(u32, @bitCast(@as(i32, @truncate(v)))),
+        .qword => e.int(i32, @intCast(v)),
+    }
+}
+
+fn immLen(size: Size) u8 {
+    return @min(size.bytes(), 4);
+}
+
+fn ext(n: u4) u1 {
+    return @truncate(n >> 3);
+}
+
+fn scalarPrefix(ty: Float) u8 {
+    return switch (ty) {
+        .f32 => 0xf3,
+        .f64 => 0xf2,
+    };
+}
+
+fn reloc(e: *Encoder, kind: Atom.Reloc.Kind, target: SymbolKey, addend: i64) !void {
+    try e.relocs.append(e.gpa, .{ .offset = @intCast(e.code.items.len), .kind = kind, .target = target, .addend = addend });
+}
+
+fn rel32(e: *Encoder, target: Target) !void {
+    switch (target) {
+        .sym => |s| {
+            try e.reloc(.x86_64_pc32, s, -4);
+            e.int(u32, 0);
+        },
+        .label => |l| {
+            const at: u32 = @intCast(e.code.items.len);
+            const dest = e.labels.items[@backingInt(l)];
+            if (dest == unbound) try e.fixups.append(e.gpa, .{ .at = at, .label = l });
+            e.int(u32, 0);
+            if (dest != unbound) e.patchRel32(at, dest);
+        },
+    }
+}
+
+fn patchRel32(e: *Encoder, at: u32, dest: u32) void {
+    assert(dest != unbound);
+    const rel: i32 = @intCast(@as(i64, dest) - (@as(i64, at) + 4));
+    std.mem.writeInt(i32, e.code.items[at..][0..4], rel, .little);
+}
+
+const RmEnc = union(enum) { reg: u4, mem: Mem };
+
+fn rmGpr(rm: Rm) RmEnc {
+    return switch (rm) {
+        .reg => |r| .{ .reg = @backingInt(r) },
+        .mem => |m| .{ .mem = m },
+    };
+}
+
+fn rmXmm(rm: XmmRm) RmEnc {
+    return switch (rm) {
+        .reg => |r| .{ .reg = @backingInt(r) },
+        .mem => |m| .{ .mem = m },
+    };
+}
+
+const Rex = struct { w: bool = false, r: u1 = 0, x: u1 = 0, b: u1 = 0 };
+const Opts = struct {
+    /// Mandatory prefix (0xf2, 0xf3) or 0.
+    prefix: u8 = 0,
+    /// Operand-size override (0x66), for word operands and packed-double SSE.
+    op16: bool = false,
+    w: bool = false,
+    /// Emit REX even if empty, to reach spl/bpl/sil/dil.
+    force_rex: bool = false,
+};
+
+fn prefixes(e: *Encoder, rex: Rex, o: Opts) void {
+    if (o.op16) e.byte(0x66);
+    if (o.prefix != 0) e.byte(o.prefix);
+    const bits: u8 = (@as(u8, @intFromBool(rex.w)) << 3) | (@as(u8, rex.r) << 2) | (@as(u8, rex.x) << 1) | rex.b;
+    if (bits != 0 or o.force_rex) e.byte(0x40 | bits);
+}
+
+const RegField = union(enum) { reg: Reg, ext: u3 };
+
+/// A GPR instruction whose opcode is `op8` for byte operands and `op`
+/// otherwise, with ModRM.reg = `reg` and ModRM.rm = `rm`.
+fn gprRm(e: *Encoder, size: Size, op8: u8, op: u8, reg: RegField, rm: Rm, imm_len: u8) !void {
+    const is_byte = size == .byte;
+    const reg_num: u4, const reg_rex = switch (reg) {
+        .reg => |r| .{ @backingInt(r), is_byte and r.needsRexAsByte() },
+        .ext => |n| .{ n, false },
+    };
+    try e.modRm(.{
+        .op16 = size == .word,
+        .w = size == .qword,
+        .force_rex = reg_rex or (is_byte and rm == .reg and rm.reg.needsRexAsByte()),
+    }, &.{if (is_byte) op8 else op}, reg_num, rmGpr(rm), imm_len);
+}
+
+/// Prefixes, opcode, ModRM, SIB, and displacement. `imm_len` is the number
+/// of immediate bytes the caller appends afterwards, which a RIP-relative
+/// relocation must account for.
+fn modRm(e: *Encoder, o: Opts, opcode: []const u8, reg: u4, rm: RmEnc, imm_len: u8) !void {
+    var rex: Rex = .{ .w = o.w, .r = ext(reg) };
+    switch (rm) {
+        .reg => |r| rex.b = ext(r),
+        .mem => |m| {
+            if (m.base == .reg) rex.b = ext(@backingInt(m.base.reg));
+            if (m.index) |i| rex.x = ext(@backingInt(i.reg));
+        },
+    }
+    e.prefixes(rex, o);
+    e.bytes(opcode);
+    const reg3: u3 = @truncate(reg);
+    const m = switch (rm) {
+        .reg => |r| return e.byte(modrmByte(0b11, reg3, @truncate(r))),
+        .mem => |m| m,
+    };
+    switch (m.base) {
+        .sym => |s| {
+            assert(m.index == null);
+            e.byte(modrmByte(0b00, reg3, 0b101));
+            try e.reloc(.x86_64_pc32, s, @as(i64, m.disp) - 4 - imm_len);
+            e.int(u32, 0);
+        },
+        .none => {
+            e.byte(modrmByte(0b00, reg3, 0b100));
+            if (m.index) |i| {
+                assert(i.reg != .rsp);
+                e.byte(sibByte(@backingInt(i.scale), i.reg.low(), 0b101));
+            } else e.byte(sibByte(0, 0b100, 0b101));
+            e.int(i32, m.disp);
+        },
+        .reg => |base| {
+            // rbp and r13 as base have no disp-less form.
+            const mod: u2 = if (m.disp == 0 and base.low() != 0b101)
+                0b00
+            else if (std.math.cast(i8, m.disp) != null) 0b01 else 0b10;
+            if (m.index) |i| {
+                assert(i.reg != .rsp);
+                e.byte(modrmByte(mod, reg3, 0b100));
+                e.byte(sibByte(@backingInt(i.scale), i.reg.low(), base.low()));
+            } else if (base.low() == 0b100) {
+                // rsp and r12 as base need a SIB byte.
+                e.byte(modrmByte(mod, reg3, 0b100));
+                e.byte(sibByte(0, 0b100, 0b100));
+            } else {
+                e.byte(modrmByte(mod, reg3, base.low()));
+            }
+            switch (mod) {
+                0b00 => {},
+                0b01 => e.int(i8, @intCast(m.disp)),
+                0b10 => e.int(i32, m.disp),
+                0b11 => unreachable,
+            }
+        },
+    }
+}
+
+fn modrmByte(mod: u2, reg: u3, rm: u3) u8 {
+    return (@as(u8, mod) << 6) | (@as(u8, reg) << 3) | rm;
+}
+
+fn sibByte(scale: u2, index: u3, base: u3) u8 {
+    return (@as(u8, scale) << 6) | (@as(u8, index) << 3) | base;
+}
+
+test "encodings with special cases match GNU as" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    const foo: SymbolKey = .fromName("foo");
+    try e.mov(.qword, .{ .mem = .at(.rsp, 8) }, .{ .reg = .rax }); // 48 89 44 24 08
+    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = .at(.r12, 0) }); // 49 8b 04 24
+    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = .at(.rbp, 0) }); // 48 8b 45 00
+    try e.mov(.dword, .{ .reg = .r11 }, .{ .mem = .{ .base = .{ .reg = .r13 }, .index = .{ .reg = .r12, .scale = .@"8" }, .disp = -4096 } });
+    try e.mov(.byte, .{ .reg = .rsi }, .{ .reg = .rdi }); // 40 88 fe
+    try e.mov(.byte, .{ .reg = .r8 }, .{ .imm = 1 }); // 41 b0 01
+    try e.mov(.qword, .{ .reg = .rax }, .{ .imm = -1 }); // 48 c7 c0 ff ff ff ff
+    try e.mov(.qword, .{ .reg = .rax }, .{ .imm = 0xffffffff }); // b8 ff ff ff ff
+    try e.mov(.qword, .{ .reg = .rax }, .{ .imm = 0x100000000 }); // movabs
+    try e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1000 }); // 48 05 e8 03 00 00
+    try e.alu(.add, .dword, .{ .reg = .r9 }, .{ .imm = -128 }); // 41 83 c1 80
+    try e.movzx(.dword, .rax, .byte, .{ .reg = .rsi }); // 40 0f b6 c6
+    try e.movsx(.qword, .rax, .dword, .{ .reg = .rcx }); // 48 63 c1
+    try e.shift(.shl, .qword, .{ .reg = .rcx }, 1); // 48 d1 e1
+    try e.setcc(.ne, .{ .reg = .r10 }); // 41 0f 95 c2
+    try e.cvtsi2s(.f64, .xmm9, .qword, .{ .reg = .rax }); // f2 4c 0f 2a c8
+    try e.movFromXmm(.qword, .{ .reg = .rax }, .xmm8); // 66 4c 0f 7e c0
+    try e.mov(.dword, .{ .mem = .sym(foo, 8) }, .{ .imm = 5 }); // c7 05 <pc32 foo+0> 05 00 00 00
+    const expected = "48894424" ++ "08" ++ "498b0424" ++ "488b4500" ++ "478b9ce500f0ffff" ++ "4088fe" ++ "41b001" ++
+        "48c7c0ffffffff" ++ "b8ffffffff" ++ "48b80000000001000000" ++ "4805e8030000" ++ "4183c180" ++ "400fb6c6" ++
+        "4863c1" ++ "48d1e1" ++ "410f95c2" ++ "f24c0f2ac8" ++ "664c0f7ec0" ++ "c705000000000500" ++ "0000";
+    var buf: [expected.len / 2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
+    // The immediate after the field shifts the addend: 8 - 4 - 4.
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.{ .offset = 0x55, .kind = .x86_64_pc32, .target = foo, .addend = 0 }}, e.relocs.items);
+}
+
+test "branches to labels bound before and after them" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    const top = try e.newLabel();
+    const out = try e.newLabel();
+    e.bind(top);
+    try e.jcc(.e, .{ .label = out }); // 0: 0f 84 rel32 -> 12
+    try e.int3(); // 6
+    try e.jmp(.{ .label = top }); // 7: e9 rel32 -> 0
+    e.bind(out); // 12
+    try e.ret();
+    e.finish();
+    try std.testing.expectEqualSlices(u8, &.{ 0x0f, 0x84, 0x06, 0, 0, 0, 0xcc, 0xe9, 0xf4, 0xff, 0xff, 0xff, 0xc3 }, e.code.items);
+    try std.testing.expectEqual(0, e.relocs.items.len);
+}
