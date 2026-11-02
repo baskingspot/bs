@@ -32,6 +32,12 @@ pub const Options = struct {
     zig_lib_dir: ?[]const u8 = null,
     /// Arguments after `--` for `zap run`.
     run_args: []const []const u8 = &.{},
+    /// `zap test` only: the test runner's root source file (`--test-runner`).
+    test_runner: ?[]const u8 = null,
+    /// `zap test` only: include only tests whose names contain one of these.
+    test_filters: []const []const u8 = &.{},
+    /// `zap test` only: build the test binary without running it.
+    test_no_exec: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -55,11 +61,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     } else fatal("unknown command: {s}", .{cmd});
 
-    const opts = parseOptions(command, args[2..]);
+    const opts = try parseOptions(arena, command, args[2..]);
     const zig_lib_dir = opts.zig_lib_dir orelse init.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir;
     if (opts.target) |t| {
-        if (!std.mem.eql(u8, t, "native") and !std.mem.eql(u8, t, "x86_64-linux") and !std.mem.eql(u8, t, "aarch64-macos"))
-            fatal("unsupported target '{s}'; zap supports x86_64-linux and aarch64-macos", .{t});
+        const supported = [_][]const u8{ "native", "x86_64-linux", "x86_64-linux-none", "aarch64-macos", "aarch64-macos-none" };
+        for (supported) |s| {
+            if (std.mem.eql(u8, t, s)) break;
+        } else fatal("unsupported target '{s}'; zap supports x86_64-linux and aarch64-macos", .{t});
     }
 
     var fe: Frontend = try .init(init.gpa, init.io, zig_lib_dir, opts.root_src_path);
@@ -79,9 +87,10 @@ pub fn main(init: std.process.Init) !void {
     fatal("{s}: semantic analysis is not implemented yet ({d} files lowered to ZIR)", .{ @tagName(command), fe.files.items.len });
 }
 
-fn parseOptions(command: Command, args: []const []const u8) Options {
+fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []const u8) !Options {
     var root: ?[]const u8 = null;
     var opts: Options = .{ .command = command, .root_src_path = undefined };
+    var test_filters: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -99,6 +108,13 @@ fn parseOptions(command: Command, args: []const []const u8) Options {
             opts.target = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = nextArg(args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--test-runner")) {
+            opts.test_runner = nextTestArg(command, args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--test-filter")) {
+            try test_filters.append(arena, nextTestArg(command, args, &i, arg));
+        } else if (std.mem.eql(u8, arg, "--test-no-exec")) {
+            if (command != .@"test") fatal("{s} is only valid for 'zap test'", .{arg});
+            opts.test_no_exec = true;
         } else if (std.mem.eql(u8, arg, "-ODebug")) {
             // The only mode zap supports.
         } else if (std.mem.startsWith(u8, arg, "-O")) {
@@ -112,7 +128,13 @@ fn parseOptions(command: Command, args: []const []const u8) Options {
         }
     }
     opts.root_src_path = root orelse fatal("expected a root source file", .{});
+    opts.test_filters = test_filters.items;
     return opts;
+}
+
+fn nextTestArg(command: Command, args: []const []const u8, i: *usize, flag: []const u8) []const u8 {
+    if (command != .@"test") fatal("{s} is only valid for 'zap test'", .{flag});
+    return nextArg(args, i, flag);
 }
 
 fn nextArg(args: []const []const u8, i: *usize, flag: []const u8) []const u8 {
