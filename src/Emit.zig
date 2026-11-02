@@ -36,6 +36,24 @@ uses_panic: bool = false,
 /// Compile errors that codegen reports (unsupported constructs), rendered
 /// like Sema's.
 failed: bool = false,
+/// The entry symbol, once `finish` found it.
+entry: ?SymbolKey = null,
+/// What produced each atom, for the on-disk cache (`Incremental`).
+atom_owners: std.ArrayList(Owner) = .empty,
+/// Content-addressed atoms each unit referred to.
+content_uses: std.ArrayList(ContentUse) = .empty,
+/// The owner of atoms added now.
+owner: Owner = .link,
+
+pub const Owner = union(enum) {
+    unit: Zcu.AnalUnit,
+    /// A content-addressed constant, shared by the units that use it.
+    content,
+    /// Code the link needs regardless of units (panic helpers).
+    link,
+};
+
+pub const ContentUse = struct { unit: Zcu.AnalUnit, key: SymbolKey };
 
 pub fn init(gpa: Allocator, zcu: *Zcu) Emit {
     return .{ .gpa = gpa, .arena = .init(gpa), .zcu = zcu };
@@ -48,12 +66,16 @@ pub fn deinit(emit: *Emit) void {
     emit.content_keys.deinit(gpa);
     emit.navs.deinit(gpa);
     emit.errors.deinit(gpa);
+    emit.atom_owners.deinit(gpa);
+    emit.content_uses.deinit(gpa);
     emit.arena.deinit();
 }
 
 /// Sink callback from `Zcu.analyzeAll`.
 pub fn function(emit: *Emit, zcu: *Zcu, ir: *const Ir) !void {
     _ = zcu;
+    emit.owner = .{ .unit = .{ .func = ir.func } };
+    defer emit.owner = .link;
     CodeGen.generate(emit, ir) catch |err| switch (err) {
         error.CodegenFail => emit.failed = true,
         else => |e| return e,
@@ -81,6 +103,7 @@ pub fn finish(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !b
         }
     }
     if (emit.failed) return false;
+    emit.entry = entry;
     const entry_key = entry orelse {
         try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap requires the root file to export '_start' (std.start is not supported yet)", .{});
         return false;
@@ -108,7 +131,9 @@ pub fn allocator(emit: *Emit) Allocator {
 }
 
 pub fn addAtom(emit: *Emit, atom: Atom) !void {
+    try emit.atom_owners.ensureUnusedCapacity(emit.gpa, 1);
     try emit.atoms.append(emit.gpa, atom);
+    emit.atom_owners.appendAssumeCapacity(emit.owner);
 }
 
 /// Adds a function's atom and its debug info.
@@ -125,8 +150,12 @@ pub fn addFunction(emit: *Emit, atom: Atom, debug: Atom.Debug) !void {
 pub fn contentAtom(emit: *Emit, alignment: u64, bytes: []const u8, targets: []const SymbolKey, relocs: []const Atom.Reloc) !SymbolKey {
     const a: std.mem.Alignment = .fromByteUnits(@max(alignment, 1));
     const key: SymbolKey = .fromContents(.rodata, a, bytes, targets, relocs);
+    if (emit.owner == .unit) try emit.content_uses.append(emit.gpa, .{ .unit = emit.owner.unit, .key = key });
     const gop = try emit.content_keys.getOrPut(emit.gpa, key);
     if (gop.found_existing) return key;
+    const owner = emit.owner;
+    emit.owner = .content;
+    defer emit.owner = owner;
     const arena = emit.allocator();
     try emit.addAtom(.{
         .key = key,
@@ -157,8 +186,12 @@ pub fn navKey(emit: *Emit, nav: InternPool.NavIndex) !SymbolKey {
 }
 
 pub fn errorKey(ip: *const InternPool, name: InternPool.String) SymbolKey {
+    return errorKeyFromName(ip.stringSlice(name));
+}
+
+pub fn errorKeyFromName(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "error.{s}", .{ip.stringSlice(name)}) catch unreachable;
+    const s = std.fmt.bufPrint(&buf, "error.{s}", .{name}) catch unreachable;
     return .fromName(s);
 }
 
@@ -186,6 +219,8 @@ fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
     const nav = ip.getNav(nav_index);
     const ty = ip.typeOf(nav.val);
     if (!Type.hasRuntimeBits(ip, ty)) return;
+    emit.owner = .{ .unit = .{ .nav_val = nav_index } };
+    defer emit.owner = .link;
     const arena = emit.allocator();
     const bytes = try arena.alloc(u8, Type.abiSize(ip, ty));
     var refs: Atom.RelocList = .{};

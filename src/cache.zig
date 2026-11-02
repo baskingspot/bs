@@ -37,14 +37,53 @@ pub fn compilationDir(io: Io, local_cache: Io.Dir, key: Hash) !Io.Dir {
     const hex = std.fmt.hex(key);
     var buf: [64]u8 = undefined;
     const sub_path = std.fmt.bufPrint(&buf, "zap/c/{s}", .{&hex}) catch unreachable;
-    return local_cache.createDirPathOpen(io, sub_path, .{});
+    return local_cache.createDirPathOpen(io, sub_path, .{ .open_options = .{ .iterate = true } });
 }
 
 /// Takes the compilation's lock, held until the returned file is closed.
 /// Builds of one compilation take turns; the manifest and pack are only
 /// changed under it. The global store needs no lock.
 pub fn lock(io: Io, dir: Io.Dir) !Io.File {
-    return dir.createFile(io, "lock", .{ .truncate = false, .lock = .exclusive });
+    const f = try dir.createFile(io, "lock", .{ .truncate = false, .lock = .exclusive });
+    // Records use for `trimCompilations`.
+    f.setTimestampsNow(io) catch {};
+    return f;
+}
+
+/// Compilation directories unused this long are deleted by
+/// `trimCompilations`. They hold hard links to store packs, which keep
+/// those packs' disk space in use after the store trims them.
+pub const max_unused_compilation_ns = 5 * std.time.ns_per_day;
+
+/// Deletes the compilation directories under `local_cache` whose lock
+/// file was last touched more than `max_unused_compilation_ns` ago, at
+/// most once a day, skipping those a build holds. `lock` touches it.
+pub fn trimCompilations(io: Io, local_cache: Io.Dir) !void {
+    const now = Io.Clock.real.now(io);
+    var c = local_cache.openDir(io, "zap/c", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer c.close(io);
+    if (c.statFile(io, "trim", .{})) |stat| {
+        if (stat.mtime.durationTo(now).toNanoseconds() < std.time.ns_per_day) return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    }
+    try c.writeFile(io, .{ .sub_path = "trim", .data = "" });
+    var it = c.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .directory) continue;
+        var buf: [64]u8 = undefined;
+        const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{e.name}) catch continue;
+        const stat = c.statFile(io, lock_path, .{}) catch continue;
+        if (stat.mtime.durationTo(now).toNanoseconds() < max_unused_compilation_ns) continue;
+        const f = c.openFile(io, lock_path, .{ .mode = .read_write }) catch continue;
+        defer f.close(io);
+        if (!(f.tryLock(io, .exclusive) catch false)) continue;
+        c.deleteTree(io, e.name) catch {};
+    }
 }
 
 /// Maps `sub_path` read-only, or returns null if it does not exist.

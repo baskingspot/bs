@@ -5,6 +5,7 @@ const Frontend = @import("Frontend.zig");
 const Zcu = @import("Zcu.zig");
 const Ir = @import("Ir.zig");
 const Emit = @import("Emit.zig");
+const Incremental = @import("Incremental.zig");
 const Builtin = @import("Builtin.zig");
 
 pub const zig_version = "0.17.0";
@@ -90,6 +91,26 @@ pub fn main(init: std.process.Init) !void {
         .output_mode = if (command == .build_obj) .Obj else .Exe,
         .is_test = is_test,
     });
+    // The on-disk cache: a build whose inputs did not change relinks the
+    // last build's Atoms and skips everything else.
+    const run_test = is_test and !opts.test_no_exec;
+    const stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path);
+    const out_path: ?[]const u8 = switch (opts.emit_bin) {
+        .none => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else null,
+        .path => |p| p,
+        .default => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else stem,
+    };
+    if (run_test) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
+    const use_cache = out_path != null and !opts.dump_ir and (command == .build_exe or is_test) and
+        !std.mem.eql(u8, init.environ_map.get("ZAP_CACHE") orelse "", "off");
+    var inc: ?Incremental = if (use_cache) try Incremental.open(init.gpa, init.io, cache_dirs, args[1..], zig_lib_dir, "x86_64-linux", init.environ_map.get("ZAP_CACHE_TIMING") != null) else null;
+    defer if (inc) |*i| i.close();
+    if (inc) |*i| i.check = init.environ_map.get("ZAP_CACHE_CHECK") != null;
+    if (inc) |*i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
+        if (run_test) try runTest(init, out_path.?);
+        return;
+    };
+
     const test_runner = opts.test_runner orelse try std.fs.path.join(arena, &.{ zig_lib_dir, "compiler", "test_runner.zig" });
     var fe: Frontend = try .init(init.gpa, init.io, zig_lib_dir, .{
         .root_src_path = if (is_test) test_runner else opts.root_src_path,
@@ -114,6 +135,7 @@ pub fn main(init: std.process.Init) !void {
     defer zcu.deinit();
     zcu.is_test = is_test;
     zcu.test_filters = opts.test_filters;
+    if (inc) |*i| try i.seedErrors(&zcu);
     if (opts.dump_ir) {
         var stdout_buf: [4096]u8 = undefined;
         var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buf);
@@ -133,24 +155,19 @@ pub fn main(init: std.process.Init) !void {
         else => {},
     };
     exitOnErrors(init, &zcu);
-    const run_test = is_test and !opts.test_no_exec;
-    const stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path);
-    const out_path: []const u8 = switch (opts.emit_bin) {
-        .none => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else return,
-        .path => |p| p,
-        .default => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else stem,
-    };
-    if (run_test) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path).?);
-    const linked = try emit.finish(init.io, Io.Dir.cwd(), out_path);
+    const linked = try emit.finish(init.io, Io.Dir.cwd(), out_path orelse return);
     exitOnErrors(init, &zcu);
     if (!linked) std.process.exit(1);
-    if (run_test) {
-        var child = try std.process.spawn(init.io, .{ .argv = &.{out_path} });
-        const term = try child.wait(init.io);
-        switch (term) {
-            .exited => |code| if (code != 0) std.process.exit(code),
-            else => fatal("the test binary terminated unexpectedly: {any}", .{term}),
-        }
+    if (inc) |*i| try i.record(&fe, &zcu, &emit);
+    if (run_test) try runTest(init, out_path.?);
+}
+
+fn runTest(init: std.process.Init, path: []const u8) !void {
+    var child = try std.process.spawn(init.io, .{ .argv = &.{path} });
+    const term = try child.wait(init.io);
+    switch (term) {
+        .exited => |code| if (code != 0) std.process.exit(code),
+        else => fatal("the test binary terminated unexpectedly: {any}", .{term}),
     }
 }
 

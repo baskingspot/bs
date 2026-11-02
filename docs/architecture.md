@@ -498,16 +498,18 @@ granularity.
 
 ### Storage layer (`src/cache.zig`, `src/cache/`; built 2026-11-02)
 
-The storage layer exists; Sema does not use it yet. It knows keys, hashes,
-dependency edges, and Atoms, not Sema: nodes carry an opaque `tag`, and a
-store entry's result is an opaque payload until Sema serializes one.
+The storage layer knows keys, hashes, dependency edges, and Atoms, not
+Sema: nodes carry an opaque `tag`, and a store entry's result is an opaque
+payload until Sema serializes one. `src/Incremental.zig` connects it to a
+compilation (see "Integration" below).
 
 ```
 <global cache>/zap/store/<32 hex>.zsp       Store packs (shared by all projects)
 <global cache>/zap/store/lock               flock held by maintenance (merging, trimming)
 <global cache>/zap/store/trim               when packs were last trimmed
 <local cache>/zap/c/<32 hex>/               one compilation, keyed by root, target, options, output
-    lock          flock held by the build that owns the directory
+    lock          flock held by the build that owns the directory; its mtime is the last use
+    <32 hex>.zsp  base packs: hard links to the store packs holding the last build's Atoms
     manifest      base: mapped, pointer-free, replaced whole
     manifest.log  one checksummed record per build since the base
     pack          every Atom the last build linked, append-only
@@ -550,13 +552,20 @@ store entry's result is an opaque payload until Sema serializes one.
   Reverse edges are a superset while a log exists: a node's old reverse
   edges stay until the next base, so a walk may re-check a unit that no
   longer depends on the edit, never miss one.
-- **Pack** (`cache/Pack.zig`): `AtomRef` is 8 bytes (offset in 16-byte
-  units, so up to 64 GiB, and length). `append` writes the regenerated
+- **Pack** (`cache/Pack.zig`): the compilation's own append-only pack plus
+  base packs, store packs hard-linked into the compilation's directory. An
+  `AtomRef` is 12 bytes: pack (0 for the own pack, else a base), offset in
+  16-byte units (up to 64 GiB), and length; atom records inside store
+  entries are referenced in place. A first build therefore writes its Atoms
+  once, into the store pack it commits, and the hard link keeps the inode
+  alive when the store merges or trims that pack. On another file system
+  (`EXDEV`) the pack is copied instead. `append` writes the regenerated
   Atoms with one `pwrite` and remaps; old records stay put, so the manifest
   stays valid across appends. `decodeAll` decodes on every core. `compact`
-  rewrites the live records in link order under a new pack id when dead
-  bytes exceed live ones; the manifest records which pack id its references
-  are for.
+  moves the live records, from every pack, into a new own pack in link
+  order when dead bytes (unreferenced records, and the base packs' other
+  entries, headers, and dependencies) exceed live ones. The manifest names
+  its base packs and the own pack's id.
 - File contents are trusted once their lengths check out: indices inside
   them are not bounds-checked on each access. Records are host-endian (both
   targets are little-endian).
@@ -594,11 +603,59 @@ a file costs ~25–30 µs on this ext4 orb whichever way it is placed (O_TMPFILE
 and link, or create and rename), so a first build's 30k puts took 650–740 ms
 on one thread and 215–390 ms on four, four concurrent builds 1.4–1.9 s (the
 journal serializes them), a lookup 2.8–3.6 µs (open, read, close), and a trim
-scan of 60k entries 65–77 ms. Packs need one file per build. A first build
-writes its Atoms twice, once in the global store and once in the project's
-pack; that costs ~45 ms of the commit, and the project pack could refer to
-store packs instead, at the price of depending on files other builds merge
-and delete.
+scan of 60k entries 65–77 ms. Packs need one file per build.
+
+Also rejected: a first build writing its Atoms twice, to the store and to
+the project's pack (83 ms of pack append on top of the 42 ms store commit
+in `bench-cache`), and project packs naming store packs, which would depend
+on files other builds merge and delete. With hard-linked base packs the
+commit (written into the compilation's directory, then linked into the
+store) takes 42 ms, the relink decodes from it as fast as from an own pack
+(4.1 ms) with byte-identical output, and the cross-file-system fallback
+(store on tmpfs) takes 136 ms.
+
+### Integration (`src/Incremental.zig`; built 2026-11-02)
+
+- **Compilation key**: the zap binary's identity (inode, size, mtime), the
+  target, the working directory, the zig lib directory, and the command
+  line. The store seed, part of every store key, is the binary's identity
+  and the target only, so store entries are shared across projects.
+- **No-edit builds** (`relinkIfUnchanged`, before the frontend): lock the
+  compilation, map the manifest, stat its inputs (every file the frontend
+  loaded, with content hashes and the racy-mtime rule); if none changed,
+  decode the Atoms from the base packs and link with the manifest's entry
+  symbol and error codes. Frontend, Sema, and CodeGen do not run. A
+  conformance unit loading 562 files (std in test mode): 0.64–0.9 ms in
+  zap (0.4–0.6 of it the stats), 2 ms wall, against 14–19 ms for a full build.
+- **Recording** (`record`, after a successful link): Emit tags each atom
+  with its owner (a unit, a content-addressed constant, or the link's own
+  code) and each unit's uses of constants. The manifest gets one node per
+  unit and per dependee kind (`nav_ty`, `func_body`, `func_ies`,
+  `namespace_name`, `namespace`), with edges from `Zcu.deps`, each node's
+  `src_hash` (its declaration's, from ZIR) and result hash (InternPool
+  stable hashes; function and constant atoms' contents; inferred error set
+  names; which declaration a name finds; a namespace's names), the error
+  names in code order, the entry, and the inputs. Each node with Atoms is a
+  store entry keyed by (store seed, node key, `src_hash`); an entry already
+  in the store with the same result hash is referenced where it is,
+  otherwise it goes into the build's new store pack. Nodes are written in
+  the order of their first Atom, so a relink reproduces the build's output
+  byte for byte. 630 nodes take 1.3–1.9 ms to record.
+- **Error codes**: the last build's names are assigned first
+  (`seedErrors`), so codes stay stable across builds.
+- **Prediction check** (`ZAP_CACHE_CHECK=1`): compares a build's nodes with
+  the last manifest. The seeds are the nodes whose `src_hash` changed and
+  the source-computed nodes whose result changed; every node whose result
+  changed must be reachable from them over the last manifest's reverse
+  edges. This is the set an edit build will re-analyze.
+- `ZAP_CACHE_TIMING=1` prints the cache's time; `ZAP_CACHE=off` disables
+  it. Compilation directories unused for 5 days are deleted (they hold hard
+  links that keep trimmed store packs' space in use).
+- Not yet: re-analyzing only the predicted units after an edit, which needs
+  Sema to load the results of units it skips; a layout hash for
+  `type_layout` results (the type's identity stands in, so a layout change
+  is caught through its `src_hash`, not its result); recording comptime
+  side effects.
 
 What the cache must get right, or edit-rebuilds will not be Go-class:
 
