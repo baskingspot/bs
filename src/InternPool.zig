@@ -835,7 +835,10 @@ pub fn find(ip: *InternPool, key: Key) ?Index {
     return e.index;
 }
 
-pub fn get(ip: *InternPool, tid: Tid, key: Key) Allocator.Error!Index {
+pub fn get(ip: *InternPool, tid: Tid, key_in: Key) Allocator.Error!Index {
+    var bytes_buf: std.ArrayList(u8) = .empty;
+    defer bytes_buf.deinit(ip.gpa);
+    const key = if (key_in == .aggregate) try ip.canonicalAggregate(tid, key_in.aggregate, &bytes_buf) else key_in;
     const key_hash = ip.hashKey(key);
     const shard = ip.shardOf(key_hash);
     shard.mutex.lockUncancelable(ip.io);
@@ -852,6 +855,40 @@ pub fn get(ip: *InternPool, tid: Tid, key: Key) Allocator.Error!Index {
     const index: Index = @fromBackingInt(ip.wrap(tid, i));
     gop.key_ptr.* = .{ .hash = @truncate(key_hash), .index = index };
     return index;
+}
+
+/// Gives each array or vector value one storage form, as upstream does, so
+/// equal values intern to the same index: `repeated_elem` when every
+/// element (and the sentinel) is the same, else `bytes` for defined `u8`
+/// elements, else `elems`.
+fn canonicalAggregate(ip: *InternPool, tid: Tid, a: Aggregate, buf: *std.ArrayList(u8)) Allocator.Error!Key {
+    const child: Index, const len: u64 = switch (ip.indexToKey(a.ty)) {
+        .array_type => |t| .{ t.child, t.lenIncludingSentinel() },
+        .vector_type => |t| .{ t.child, t.len },
+        else => return .{ .aggregate = a },
+    };
+    if (len == 0) return .{ .aggregate = a };
+    switch (a.storage) {
+        .repeated_elem => return .{ .aggregate = a },
+        .bytes => |str| {
+            const bytes = ip.stringSlice(str)[0..@intCast(len)];
+            for (bytes[1..]) |b| if (b != bytes[0]) return .{ .aggregate = a };
+            const e = try ip.get(tid, .{ .int = .{ .ty = .u8_type, .storage = .{ .u64 = bytes[0] } } });
+            return .{ .aggregate = .{ .ty = a.ty, .storage = .{ .repeated_elem = e } } };
+        },
+        .elems => |elems| {
+            for (elems[1..]) |e| {
+                if (e != elems[0]) break;
+            } else return .{ .aggregate = .{ .ty = a.ty, .storage = .{ .repeated_elem = elems[0] } } };
+            if (child != .u8_type) return .{ .aggregate = a };
+            try buf.ensureTotalCapacity(ip.gpa, elems.len);
+            for (elems) |e| switch (ip.indexToKey(e)) {
+                .int => |i| buf.appendAssumeCapacity(@intCast(i.storage.u64)),
+                else => return .{ .aggregate = a },
+            };
+            return .{ .aggregate = .{ .ty = a.ty, .storage = .{ .bytes = try ip.getString(tid, buf.items) } } };
+        },
+    }
 }
 
 fn addExtra(ip: *InternPool, local: *Local, words: []const u32) !u32 {
