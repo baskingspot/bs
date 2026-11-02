@@ -352,16 +352,8 @@ fn copyMem(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
     if (size > 128) {
         try cg.e.lea(.qword, .rsi, src);
         try cg.e.lea(.qword, .rdi, dst);
-        try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(size / 8) });
-        const top = try cg.e.newLabel();
-        cg.e.bind(top);
-        try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rsi, 0) });
-        try cg.e.mov(.qword, .{ .mem = Mem.at(.rdi, 0) }, .{ .reg = .rax });
-        try cg.e.alu(.add, .qword, .{ .reg = .rsi }, .{ .imm = 8 });
-        try cg.e.alu(.add, .qword, .{ .reg = .rdi }, .{ .imm = 8 });
-        try cg.e.alu(.sub, .qword, .{ .reg = .rcx }, .{ .imm = 1 });
-        try cg.e.jcc(.ne, .{ .label = top });
-        return cg.copyTail(Mem.at(.rdi, 0), Mem.at(.rsi, 0), size % 8);
+        try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(size) });
+        return cg.e.repMovsb();
     }
     try cg.copyTail(dst, src, size);
 }
@@ -770,8 +762,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
     }
 }
 
-/// The bit operations into rax, with loops over the bits (the baseline
-/// x86_64 CPU has no lzcnt, tzcnt, or popcnt). Uses rcx, rdx, r11.
+/// The bit operations into rax. The baseline x86_64 CPU has no lzcnt,
+/// tzcnt, or popcnt, so clz and ctz use bsr and bsf, and popcount and
+/// bit_reverse loop over the bits. Uses rcx, rdx, r11.
 fn bitOp(cg: *CodeGen, tag: Inst.Tag, bits: u16, operand: Ref) Error!void {
     const e = &cg.e;
     try cg.load(.rdx, operand);
@@ -796,38 +789,36 @@ fn bitOp(cg: *CodeGen, tag: Inst.Tag, bits: u16, operand: Ref) Error!void {
             try e.jmp(.{ .label = top });
         },
         .ctz => {
-            // while (n < bits and x & 1 == 0) { x >>= 1; n += 1; }
-            e.bind(top);
-            try e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .imm = bits });
-            try e.jcc(.e, .{ .label = done });
-            try e.@"test"(.qword, .{ .reg = .rdx }, .{ .imm = 1 });
-            try e.jcc(.ne, .{ .label = done });
-            try e.shift(.shr, .qword, .{ .reg = .rdx }, 1);
-            try e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
-            try e.jmp(.{ .label = top });
+            // bsf leaves ZF set and its destination undefined for 0.
+            try e.mov(.dword, .{ .reg = .rax }, .{ .imm = bits });
+            try e.bitScan(false, .qword, .rcx, .{ .reg = .rdx });
+            try e.cmov(.ne, .qword, .rax, .{ .reg = .rcx });
         },
         .clz => {
-            // Align the operand's top bit with bit 63, then count.
-            if (bits != 64 and bits != 0) try e.shift(.shl, .qword, .{ .reg = .rdx }, @intCast(64 - bits));
-            e.bind(top);
-            try e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .imm = bits });
+            // bits - 1 - (index of the top set bit), or bits for 0.
+            try e.mov(.dword, .{ .reg = .rax }, .{ .imm = bits });
+            try e.bitScan(true, .qword, .rcx, .{ .reg = .rdx });
             try e.jcc(.e, .{ .label = done });
-            try e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
-            try e.jcc(.s, .{ .label = done });
-            try e.shift(.shl, .qword, .{ .reg = .rdx }, 1);
-            try e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = 1 });
-            try e.jmp(.{ .label = top });
+            try e.mov(.dword, .{ .reg = .rax }, .{ .imm = @as(i64, bits) - 1 });
+            try e.alu(.sub, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
         },
-        .byte_swap, .bit_reverse => {
+        .byte_swap => {
+            try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
+            if (bits > 8) {
+                try e.bswap(.qword, .rax);
+                if (bits < 64) try e.shift(.shr, .qword, .{ .reg = .rax }, @intCast(64 - bits));
+            }
+        },
+        .bit_reverse => {
             // Move the low unit of x to the bottom of n, `bits / unit` times.
-            const unit: u8 = if (tag == .byte_swap) 8 else 1;
+            const unit: u8 = 1;
             try e.mov(.dword, .{ .reg = .rcx }, .{ .imm = bits / unit });
             e.bind(top);
             try e.@"test"(.dword, .{ .reg = .rcx }, .{ .reg = .rcx });
             try e.jcc(.e, .{ .label = done });
             try e.shift(.shl, .qword, .{ .reg = .rax }, unit);
             try e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rdx });
-            try e.alu(.@"and", .qword, .{ .reg = .r11 }, .{ .imm = if (unit == 8) 0xff else 1 });
+            try e.alu(.@"and", .qword, .{ .reg = .r11 }, .{ .imm = 1 });
             try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .reg = .r11 });
             try e.shift(.shr, .qword, .{ .reg = .rdx }, unit);
             try e.alu(.sub, .dword, .{ .reg = .rcx }, .{ .imm = 1 });
