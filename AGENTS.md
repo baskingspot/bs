@@ -48,5 +48,10 @@ builds. It does not track upstream: it compiles exactly one pinned Zig release
 ## Development
 
 - zap is written in Zig 0.17.0. Build with `zig build`; test with `zig build test`.
+- `docs/architecture.md` fixes the boundaries between stages (analysis units,
+  InternPool stable hashes, typed IR, Atoms, cache model). Follow it, and
+  update it in the same change when a boundary moves.
+- Time zap built with `-Doptimize=ReleaseFast`; a Debug build of zap is about
+  10x slower and says nothing about zap's speed.
 - Linux work runs in orbs. Verify aarch64-macos output on a real Mac (a Mac
   satellite for this project), not by inspection alone.
