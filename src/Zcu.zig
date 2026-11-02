@@ -59,6 +59,9 @@ pub const ComptimeDecl = struct {
     file: u32,
     inst: Zir.Inst.Index,
     namespace: u32,
+    /// Position among the namespace's `comptime` declarations; with the
+    /// namespace's key, the unit's stable key.
+    ordinal: u32,
 };
 
 /// Sema's unit of work, caching, and parallelism.
@@ -66,7 +69,7 @@ pub const AnalUnit = union(enum) {
     nav_val: InternPool.NavIndex,
     type_layout: InternPool.Index,
     func: InternPool.Index,
-    comptime_decl: struct { file: u32, inst: Zir.Inst.Index },
+    comptime_decl: ComptimeDecl,
 };
 
 /// What a unit read from another unit. Recorded only through
@@ -94,8 +97,10 @@ pub const Namespace = struct {
     /// Lexically enclosing namespace, or `none`.
     parent: u32,
     owner_type: InternPool.Index,
-    /// Fully qualified name prefix of declarations in this namespace.
+    /// Display name prefix of declarations in this namespace.
     fqn: []const u8,
+    /// Stable key prefix of declarations in this namespace.
+    key: []const u8,
     decls: std.AutoArrayHashMapUnmanaged(InternPool.String, InternPool.NavIndex) = .empty,
 
     pub const none = std.math.maxInt(u32);
@@ -189,19 +194,21 @@ pub fn renderErrors(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip) !void {
 pub fn fileRootType(zcu: *Zcu, file_index: u32) !InternPool.Index {
     if (zcu.file_root_types.items[file_index] != .none) return zcu.file_root_types.items[file_index];
     const fqn = try zcu.fileFqn(file_index);
-    const ty = try zcu.createStructType(file_index, .main_struct_inst, &.{}, fqn, Namespace.none);
+    const ty = try zcu.createStructType(file_index, .main_struct_inst, &.{}, fqn, fqn, Namespace.none);
     zcu.file_root_types.items[file_index] = ty;
     return ty;
 }
 
-/// Interns a declared struct type. If it is new, creates its namespace and
-/// declarations and queues its `comptime` and exported declarations.
+/// Interns a declared struct type with display name `fqn` and stable key
+/// `key`. If it is new, creates its namespace and declarations and queues
+/// its `comptime` and exported declarations.
 pub fn createStructType(
     zcu: *Zcu,
     file_index: u32,
     inst: Zir.Inst.Index,
     captures: []const InternPool.Index,
     fqn: []const u8,
+    key: []const u8,
     parent_ns: u32,
 ) !InternPool.Index {
     const ip = &zcu.ip;
@@ -215,6 +222,7 @@ pub fn createStructType(
         .zir_inst = inst,
         .captures = captures,
         .name = name,
+        .key = try ip.getString(tid, key),
         .info = info,
     } });
     const si = ip.structInfo(ty);
@@ -227,23 +235,28 @@ pub fn createStructType(
         .parent = parent_ns,
         .owner_type = ty,
         .fqn = fqn,
+        .key = key,
     });
+    var comptime_ordinal: u32 = 0;
     for (decl.decls) |decl_inst| {
         const d = zir.getDeclaration(decl_inst);
         switch (d.kind) {
-            .@"comptime" => try zcu.comptime_decls.put(zcu.gpa, .{ .file = file_index, .inst = decl_inst, .namespace = ns_index }, .queued),
+            .@"comptime" => {
+                try zcu.comptime_decls.put(zcu.gpa, .{ .file = file_index, .inst = decl_inst, .namespace = ns_index, .ordinal = comptime_ordinal }, .queued);
+                comptime_ordinal += 1;
+            },
             .unnamed_test, .@"test", .decltest => {},
             .@"const", .@"var" => {
                 const simple = zir.nullTerminatedString(d.name);
-                const decl_fqn = try std.fmt.allocPrint(zcu.arena.allocator(), "{s}{s}{s}", .{
-                    fqn, if (parent_ns == Namespace.none) ":" else ".", simple,
-                });
-                const fqn_str = try ip.getString(tid, decl_fqn);
+                const sep = if (parent_ns == Namespace.none) ":" else ".";
+                const decl_fqn = try std.fmt.allocPrint(zcu.arena.allocator(), "{s}{s}{s}", .{ fqn, sep, simple });
+                const decl_key = try std.fmt.allocPrint(zcu.arena.allocator(), "{s}{s}{s}", .{ key, sep, simple });
                 var hasher: InternPool.Hasher = .init("nav");
-                hasher.bytes(decl_fqn);
+                hasher.bytes(decl_key);
                 const nav = try ip.createNav(tid, .{
                     .name = try ip.getString(tid, simple),
-                    .fqn = fqn_str,
+                    .fqn = try ip.getString(tid, decl_fqn),
+                    .key = try ip.getString(tid, decl_key),
                     .file = file_index,
                     .zir_inst = decl_inst,
                     .namespace = ns_index,
@@ -278,18 +291,16 @@ pub fn recordDeps(zcu: *Zcu, unit: AnalUnit, deps: []const Dependee) !void {
 pub fn unitKey(zcu: *Zcu, unit: AnalUnit, w: *std.Io.Writer) !void {
     const ip = &zcu.ip;
     switch (unit) {
-        .nav_val => |nav| try w.writeAll(ip.stringSlice(ip.getNav(nav).fqn)),
-        .type_layout => |ty| try w.print("{s}@layout", .{ip.stringSlice(ip.indexToKey(ty).struct_type.name)}),
+        .nav_val => |nav| try w.writeAll(ip.stringSlice(ip.getNav(nav).key)),
+        .type_layout => |ty| try w.print("{s}@layout", .{ip.stringSlice(ip.indexToKey(ty).struct_type.key)}),
         .func => |func| {
             const f = ip.indexToKey(func).func;
-            try w.writeAll(ip.stringSlice(ip.getNav(f.owner_nav).fqn));
-            if (f.generic_owner != .none) try w.print("__{x}", .{@as(u64, @truncate(ip.stableHash(func)))});
+            try w.writeAll(ip.stringSlice(ip.getNav(f.owner_nav).key));
+            if (f.generic_owner != .none) try w.print("__{x}", .{ip.stableHash(func)});
         },
         .comptime_decl => |c| {
-            // The ordinal among the namespace's comptime declarations.
-            const zir = &zcu.file(c.file).zir;
-            const d = zir.getDeclaration(c.inst);
-            try w.print("{s}:comptime@{d}", .{ try zcu.fileFqn(c.file), d.src_line });
+            const ns = &zcu.namespaces.items[c.namespace];
+            try w.print("{s}{s}comptime#{d}", .{ ns.key, if (ns.parent == Namespace.none) ":" else ".", c.ordinal });
         },
     }
 }

@@ -53,6 +53,8 @@ inferred_allocs: std.AutoHashMapUnmanaged(Ir.Inst.Index, InferredAlloc) = .empty
 branch_quota: u32 = 1000,
 branch_count: u32 = 0,
 last_dbg_stmt: ?Ir.Inst.Index = null,
+/// Anonymous types this unit has created so far, for their stable keys.
+anon_types: u32 = 0,
 
 pub const CompileError = error{
     /// A compile error was reported to the Zcu.
@@ -112,6 +114,8 @@ pub const Block = struct {
         result: Ref = .none,
         /// Comptime arguments, for naming types the call returns.
         args: []const Index,
+        /// Anonymous types created by this call so far.
+        anon_types: u32 = 0,
     };
 
     pub const Param = struct {
@@ -241,7 +245,7 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
 pub fn analyzeComptimeDecl(zcu: *Zcu, c: Zcu.ComptimeDecl) CompileError!void {
     var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
     defer arena_state.deinit();
-    var sema = create(zcu, arena_state.allocator(), c.file, .{ .comptime_decl = .{ .file = c.file, .inst = c.inst } });
+    var sema = create(zcu, arena_state.allocator(), c.file, .{ .comptime_decl = c });
     defer sema.destroy();
     const decl = sema.code.getDeclaration(c.inst);
     var block = sema.rootBlock(c.namespace, decl.src_node, true);
@@ -1803,36 +1807,70 @@ fn zirStructDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
             .decl_ref => |name| try sema.resolveConstValue(block, src, try sema.navRef(block, src, try sema.lookupName(block, src, sema.zirString(name))), "captured value must be comptime-known"),
         };
     }
-    const fqn = try sema.typeName(block, decl.name_strategy, inst);
-    const ty = try sema.zcu.createStructType(sema.file, inst, captures, fqn, block.namespace);
+    const name = try sema.typeName(block, decl.name_strategy, inst);
+    const ty = try sema.zcu.createStructType(sema.file, inst, captures, name.display, name.key, block.namespace);
     return .fromInterned(ty);
 }
 
-/// The fully qualified name of a new type, following `strategy`.
-fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Zir.Inst.Index) Allocator.Error![]const u8 {
+const TypeName = struct {
+    /// Upstream's `@typeName`.
+    display: []const u8,
+    /// Stable key (see "Analysis units" in docs/architecture.md).
+    key: []const u8,
+};
+
+/// The names of a new type, following `strategy`.
+fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Zir.Inst.Index) Allocator.Error!TypeName {
+    const ip = sema.ip;
     switch (strategy) {
         .parent => if (sema.owner_nav != .none and block.inlining == null) {
-            return sema.ip.stringSlice(sema.ip.getNav(sema.owner_nav).fqn);
+            const nav = ip.getNav(sema.owner_nav);
+            return .{ .display = ip.stringSlice(nav.fqn), .key = ip.stringSlice(nav.key) };
         },
         .func => if (block.inlining) |inlining| {
             var aw: std.Io.Writer.Allocating = .init(sema.arena);
-            const func = sema.ip.indexToKey(inlining.func).func;
+            const nav = ip.getNav(ip.indexToKey(inlining.func).func.owner_nav);
             const w = &aw.writer;
-            w.print("{s}(", .{sema.ip.stringSlice(sema.ip.getNav(func.owner_nav).fqn)}) catch return error.OutOfMemory;
+            w.print("{s}(", .{ip.stringSlice(nav.fqn)}) catch return error.OutOfMemory;
             var first = true;
             for (inlining.args) |arg| {
                 if (arg == .none) continue;
                 if (!first) w.writeAll(",") catch return error.OutOfMemory;
                 first = false;
-                (if (sema.ip.isType(arg)) print.printType(sema.ip, arg, w) else print.printValue(sema.ip, arg, w)) catch return error.OutOfMemory;
+                (if (ip.isType(arg)) print.printType(ip, arg, w) else print.printValue(ip, arg, w)) catch return error.OutOfMemory;
             }
             w.writeAll(")") catch return error.OutOfMemory;
-            return aw.written();
+            return .{ .display = aw.written(), .key = try sema.inliningKey(inlining) };
         },
         .anon, .dbg_var => {},
     }
     const parent = sema.zcu.namespacePtr(block.namespace).fqn;
-    return std.fmt.allocPrint(sema.arena, "{s}__struct_{d}", .{ parent, @backingInt(inst) });
+    const display = try std.fmt.allocPrint(sema.arena, "{s}__struct_{d}", .{ parent, @backingInt(inst) });
+    // Keyed by the creating unit (or comptime call) and an ordinal.
+    const prefix, const counter = if (block.inlining) |inlining|
+        .{ try sema.inliningKey(inlining), &inlining.anon_types }
+    else blk: {
+        var aw: std.Io.Writer.Allocating = .init(sema.arena);
+        sema.zcu.unitKey(sema.owner, &aw.writer) catch return error.OutOfMemory;
+        break :blk .{ aw.written(), &sema.anon_types };
+    };
+    defer counter.* += 1;
+    return .{ .display = display, .key = try std.fmt.allocPrint(sema.arena, "{s}#anon{d}", .{ prefix, counter.* }) };
+}
+
+/// Stable key of a comptime call: the callee's key and the stable hashes of
+/// its arguments.
+fn inliningKey(sema: *Sema, inlining: *const Block.Inlining) Allocator.Error![]const u8 {
+    const ip = sema.ip;
+    var aw: std.Io.Writer.Allocating = .init(sema.arena);
+    const w = &aw.writer;
+    w.print("{s}(", .{ip.stringSlice(ip.getNav(ip.indexToKey(inlining.func).func.owner_nav).key)}) catch return error.OutOfMemory;
+    for (inlining.args, 0..) |arg, i| {
+        if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
+        if (arg != .none) w.print("{x}", .{ip.stableHash(arg)}) catch return error.OutOfMemory;
+    }
+    w.writeAll(")") catch return error.OutOfMemory;
+    return aw.written();
 }
 
 fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -4898,4 +4936,50 @@ test "errors: comptime-known values out of range" {
         \\error(1:15): type 'u8' cannot represent integer value '300'
         \\
     );
+}
+
+/// Stable hashes of the elements of `const T = [_]type{ ... }` in `source`.
+fn testTypeHashes(source: []const u8, out: []InternPool.Hash) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data = source });
+    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/t.zig", .{tmp.sub_path});
+    defer gpa.free(root);
+    var fe: Frontend = try .init(gpa, io, "/nonexistent", root);
+    defer fe.deinit();
+    var fe_errors: std.zig.ErrorBundle.Wip = try .init(gpa);
+    defer fe_errors.deinit();
+    try std.testing.expect(try fe.loadAll(&fe_errors));
+    var zcu: Zcu = try .init(gpa, io, &fe);
+    defer zcu.deinit();
+    const NoSink = struct {
+        pub fn function(_: *@This(), _: *Zcu, _: *const Ir) !void {}
+    };
+    var sink: NoSink = .{};
+    try zcu.analyzeAll(&sink);
+    try std.testing.expectEqual(0, zcu.errors.items.len);
+    const ip = &zcu.ip;
+    const nav = zcu.namespaces.items[0].decls.get(try ip.getString(Zcu.tid, "T")).?;
+    const elems = ip.indexToKey(ip.getNav(nav).val).aggregate.storage.elems;
+    for (out, elems) |*h, e| h.* = ip.stableHash(e);
+}
+
+test "anonymous types are keyed by unit and ordinal, not ZIR index" {
+    var a: [2]InternPool.Hash = undefined;
+    try testTypeHashes(
+        \\const T = [_]type{ struct { x: u8 }, struct { x: u8 } };
+        \\comptime { _ = T; }
+    , &a);
+    // Identical text in one declaration still gives two distinct types.
+    try std.testing.expect(a[0] != a[1]);
+    var b: [2]InternPool.Hash = undefined;
+    try testTypeHashes(
+        \\const Unrelated = struct { y: u32, fn f() void {} };
+        \\const T = [_]type{ struct { x: u8 }, struct { x: u8 } };
+        \\comptime { _ = T; }
+    , &b);
+    // Code above shifts every ZIR index; the keys stay put.
+    try std.testing.expectEqualSlices(InternPool.Hash, &a, &b);
 }

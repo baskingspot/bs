@@ -222,9 +222,11 @@ pub const StructInfoIndex = enum(u32) { _ };
 pub const Nav = struct {
     /// Simple name of the declaration.
     name: String,
-    /// Fully qualified name: the declaration's stable unit key, for example
-    /// `root:main.zig:Point.init`. Also its linker symbol name.
+    /// Fully qualified display name, for example `root:main.zig:Point.init`.
     fqn: String,
+    /// Stable unit key. Equal to `fqn` except inside anonymous and generic
+    /// types, whose keys are not their display names.
+    key: String,
     file: u32,
     /// The `declaration` ZIR instruction.
     zir_inst: Zir.Inst.Index,
@@ -348,8 +350,12 @@ pub const StructType = struct {
     zir_inst: Zir.Inst.Index,
     /// Values captured from enclosing scopes; part of the type's identity.
     captures: []const Index,
-    /// Fully qualified name, used for the stable hash and diagnostics.
+    /// Display name, as upstream's `@typeName` renders it.
     name: String,
+    /// Stable key, used for the stable hash and the `type_layout` unit key.
+    /// The fully qualified name for declared types; for anonymous types the
+    /// enclosing unit's key plus an ordinal (see docs/architecture.md).
+    key: String,
     info: StructInfoIndex,
 };
 
@@ -806,7 +812,7 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
         },
         .inferred_error_set_type => |f| return .{ .tag = .type_inferred_error_set, .data = idx(f) },
         .struct_type => |t| {
-            const start = try ip.addExtra(local, &.{ t.file, @backingInt(t.zir_inst), @backingInt(t.name), @backingInt(t.info), @intCast(t.captures.len) });
+            const start = try ip.addExtra(local, &.{ t.file, @backingInt(t.zir_inst), @backingInt(t.name), @backingInt(t.info), @intCast(t.captures.len), @backingInt(t.key) });
             _ = try ip.addExtra(local, @ptrCast(t.captures));
             return .{ .tag = .type_struct, .data = start };
         },
@@ -911,7 +917,8 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
             .zir_inst = @fromBackingInt(extra[d + 1]),
             .name = I.s(extra[d + 2]),
             .info = @fromBackingInt(extra[d + 3]),
-            .captures = @ptrCast(extra[d + 5 ..][0..extra[d + 4]]),
+            .key = I.s(extra[d + 5]),
+            .captures = @ptrCast(extra[d + 6 ..][0..extra[d + 4]]),
         } },
         .type_tuple => blk: {
             const len = extra[d];
@@ -1051,9 +1058,9 @@ fn hashKey(ip: *const InternPool, key: Key) Hash {
             for (names) |n| ip.hashString(&h, n);
         },
         // A declared type's identity in-memory is its ZIR instruction, but
-        // its stable hash is its fully qualified name plus captures.
+        // its stable hash is its stable key plus captures.
         .struct_type => |t| {
-            ip.hashString(&h, t.name);
+            ip.hashString(&h, t.key);
             ip.hashIndices(&h, t.captures);
         },
         .tuple_type => |t| {
