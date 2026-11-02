@@ -399,8 +399,8 @@ granularity.
   per reached unit, which is acceptable because it would otherwise analyze
   them all.
 - **Storage.** Two layers, split by who reads them:
-  - The global store holds one file per entry, named by its key, written to a
-    temporary name and renamed into place, like Go's build cache. Concurrent
+  - The global store holds one file per entry, named by its key, written to
+    an unnamed temporary file and linked into place, like Go's build cache. Concurrent
     zap processes need no locks, and old entries are removed by age. Only a
     project's first build and units re-analyzed after an edit touch it.
   - The project's local cache holds the manifest and a pack: one file with
@@ -415,6 +415,88 @@ granularity.
     builds appending to it would need cross-process locking.
 - InternPool contents are rebuilt lazily on a warm build: only units that
   must be re-analyzed load the types and values they reference.
+
+### Storage layer (`src/cache.zig`, `src/cache/`; built 2026-11-02)
+
+The storage layer exists; Sema does not use it yet. It knows keys, hashes,
+dependency edges, and Atoms, not Sema: nodes carry an opaque `tag`, and a
+store entry's result is an opaque payload until Sema serializes one.
+
+```
+<global cache>/zap/units/<2 hex>/<32 hex>   Store entries (shared by all projects)
+<global cache>/zap/units/trim               when entries were last trimmed
+<local cache>/zap/c/<32 hex>/               one compilation, keyed by root, target, options, output
+    lock          flock held by the build that owns the directory
+    manifest      base: mapped, pointer-free, replaced whole
+    manifest.log  one checksummed record per build since the base
+    pack          every Atom the last build linked, append-only
+```
+
+- **Atom records** (`cache/atoms.zig`): 16-byte aligned, a 64-byte header,
+  then targets, relocations, an optional debug header, then bytes, name, and
+  debug strings. `decode` is zero-copy: the `Atom`'s slices point into the
+  record. Debug info is a self-contained tail so that only `encode` and
+  `decode` change when debug info moves to a parallel array
+  (`link-debug-soa`).
+- **Store** (`cache/Store.zig`): `put(key, {src_hash, result_hash, deps,
+  atoms, payload})` writes `Header`, `[]Dep{key, result_hash}`, atom
+  records, and the payload with one `writev`, then links the file into
+  place; losing a race to another writer of the same key is success. `get`
+  reads entries up to 64 KiB and maps larger ones; `Entry.isValid` is the
+  red-green check against a caller-supplied result-hash lookup. Entries
+  unused for 5 days are trimmed at most once a day; `get` refreshes an
+  entry's mtime at most once an hour.
+- **Manifest** (`cache/Manifest.zig`): nodes (80 bytes: key, result hash,
+  `src_hash`, ranges into the edge, reverse-edge, and atom-reference
+  arrays, `tag`), an open-addressing key table, edges, reverse edges, atom
+  references, input stat records (path, size, mtime, inode, content hash,
+  with a sentinel for racy mtimes), and error names in code order. Rewriting
+  the 8 MB base costs ~25–35 ms here, so an edit build appends a log record
+  instead (`Delta`): the changed and added nodes, inputs, and error names.
+  `open` applies the log into a small in-memory overlay; a torn record at
+  the end is dropped and overwritten. When the log passes a quarter of the
+  base, the next build writes a new base (`Builder.initFrom`, `write`).
+  Reverse edges are a superset while a log exists: a node's old reverse
+  edges stay until the next base, so a walk may re-check a unit that no
+  longer depends on the edit, never miss one.
+- **Pack** (`cache/Pack.zig`): `AtomRef` is 8 bytes (offset in 16-byte
+  units, so up to 64 GiB, and length). `append` writes the regenerated
+  Atoms with one `pwrite` and remaps; old records stay put, so the manifest
+  stays valid across appends. `decodeAll` decodes on every core. `compact`
+  rewrites the live records in link order under a new pack id when dead
+  bytes exceed live ones; the manifest records which pack id its references
+  are for.
+- File contents are trusted once their lengths check out: indices inside
+  them are not bounds-checked on each access. Records are host-endian (both
+  targets are little-endian).
+
+Measured with `zig build bench-cache` (ReleaseFast, 4-core orb, warm page
+cache; the orb varies ±40% run to run) on a synthetic compilation of 30k
+units plus 30k other nodes, 300k edges, 600 inputs, 2000 error names, and
+103,750 Atoms (22 MiB of code and data, 650k relocations): manifest 8.2 MiB,
+pack 55 MiB.
+
+| Step | Time |
+|---|---|
+| No-edit rebuild: lock, map manifest, stat 600 inputs | 0.29–0.56 ms |
+| Open manifest with 15 log records, gather atom refs | 0.24 ms |
+| Edit storage work: append one unit's Atoms, log record | 0.02 ms |
+| Dependents walk over 29,978 nodes (no early cutoff) | 1.9–2.5 ms |
+| Relink: map pack, decode 103,750 Atoms on 4 threads | 2.0–3.4 ms |
+| `Elf.emit` from the mapped pack (from memory) | 12–26 ms (11–22 ms) |
+| Cold save: pack append, manifest base | 100–120 ms, 30–44 ms |
+| Fold log into a new base | 22–58 ms |
+| Compaction, 166 → 55 MiB | 80–164 ms |
+| Store put of 30k entries, 1 thread / 4 threads | 760–950 ms / 320–540 ms |
+| Store get, validate, decode, per entry | 3–4 µs |
+
+The no-edit target (10 ms beyond process start) holds with room to spare.
+An edit rebuild's storage cost is the walk plus the relink, and the relink
+is `Elf.emit`, the linker's own cost, not the cache's. Creating a file costs
+~25–30 µs on this ext4 orb whichever way it is placed (O_TMPFILE and link or
+create and rename), so a project's first build with an empty global store
+pays ~1 s of file creation per 30k units on one thread; Sema should put
+entries from its worker threads.
 
 What the cache must get right, or edit-rebuilds will not be Go-class:
 

@@ -49,6 +49,12 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     }) });
     b.step("bench-intern", "Measure InternPool get() throughput on a Sema-like key mix").dependOn(&b.addRunArtifact(bench_intern).step);
+    const bench_cache = b.addExecutable(.{ .name = "bench-cache", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/bench_cache.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }) });
+    b.step("bench-cache", "Measure cache storage: manifest, pack, relink from the pack, global store").dependOn(&b.addRunArtifact(bench_cache).step);
     const bench_link_run = b.addRunArtifact(bench_link);
     bench_link_run.addPassthruArgs();
     b.step("bench-link", "Measure link throughput on ~100k synthetic atoms (args: elf (default) or macho)").dependOn(&bench_link_run.step);
