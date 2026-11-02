@@ -385,6 +385,39 @@ pub fn shift(e: *Encoder, op: ShiftOp, size: Size, dst: Rm, count: ?u8) !void {
     }
 }
 
+/// `bsf dst, src` (forward) or `bsr dst, src` (reverse): index of the lowest
+/// or highest set bit. Sets ZF and leaves `dst` undefined when `src` is 0.
+pub fn bitScan(e: *Encoder, reverse: bool, size: Size, dst: Reg, src: Rm) !void {
+    assert(size != .byte);
+    try e.reserve();
+    try e.modRm(.{ .w = size == .qword, .op16 = size == .word }, &.{ 0x0f, if (reverse) 0xbd else 0xbc }, @backingInt(dst), rmGpr(src), 0);
+}
+
+/// Reverses the bytes of a dword or qword register.
+pub fn bswap(e: *Encoder, size: Size, r: Reg) !void {
+    assert(size == .dword or size == .qword);
+    try e.reserve();
+    e.prefixes(.{ .w = size == .qword, .b = ext(@backingInt(r)) }, .{});
+    e.bytes(&.{ 0x0f, 0xc8 | @as(u8, r.low()) });
+}
+
+// ---------------------------------------------------------------- strings
+
+/// `rep movsb`: copies rcx bytes from [rsi] to [rdi], backwards if DF is set.
+pub fn repMovsb(e: *Encoder) !void {
+    try e.code.appendSlice(e.gpa, &.{ 0xf3, 0xa4 });
+}
+
+/// `rep stosb`: stores al to rcx bytes at [rdi].
+pub fn repStosb(e: *Encoder) !void {
+    try e.code.appendSlice(e.gpa, &.{ 0xf3, 0xaa });
+}
+
+/// `std` (true) or `cld` (false): sets or clears the direction flag.
+pub fn setDirection(e: *Encoder, backward: bool) !void {
+    try e.code.append(e.gpa, if (backward) 0xfd else 0xfc);
+}
+
 // ---------------------------------------------------------------- control flow
 
 pub fn jmp(e: *Encoder, target: Target) !void {
@@ -758,4 +791,23 @@ test "branches to labels bound before and after them" {
     e.finish();
     try std.testing.expectEqualSlices(u8, &.{ 0x0f, 0x84, 0x06, 0, 0, 0, 0xcc, 0xe9, 0xf4, 0xff, 0xff, 0xff, 0xc3 }, e.code.items);
     try std.testing.expectEqual(0, e.refs.relocs.items.len);
+}
+
+test "bit scans, byte swaps, and string ops match GNU as" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    try e.repMovsb(); // f3 a4
+    try e.repStosb(); // f3 aa
+    try e.setDirection(true); // fd
+    try e.setDirection(false); // fc
+    try e.bitScan(true, .qword, .rax, .{ .reg = .rcx }); // 48 0f bd c1
+    try e.bitScan(false, .dword, .r9, .{ .mem = .at(.r12, 0) }); // 45 0f bc 0c 24
+    try e.bitScan(true, .word, .rdx, .{ .reg = .r10 }); // 66 41 0f bd d2
+    try e.bswap(.dword, .rax); // 0f c8
+    try e.bswap(.qword, .r11); // 49 0f cb
+    try e.bswap(.qword, .rdi); // 48 0f cf
+    const expected = "f3a4" ++ "f3aa" ++ "fd" ++ "fc" ++ "480fbdc1" ++ "450fbc0c24" ++ "66410fbdd2" ++ "0fc8" ++ "490fcb" ++ "480fcf";
+    var buf: [expected.len / 2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
 }
