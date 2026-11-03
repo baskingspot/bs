@@ -1,7 +1,7 @@
 //! DWARF 5 debug info for the linkers: a compile unit per `Atom.Debug.unit`,
 //! with a subprogram entry (and an inlined subroutine entry per inline call)
-//! per `Atom.Debug` entry; one line-number program, which every unit
-//! shares, with a sequence per entry; and x86_64 call frame information for
+//! per `Atom.Debug` entry and a line-number program with the unit's files
+//! and a sequence per entry; and x86_64 call frame information for
 //! .eh_frame. Type and variable info come later.
 //!
 //! A unit's functions are not contiguous in .text, so its address ranges
@@ -22,13 +22,42 @@ const Atom = @import("Atom.zig");
 const ref = @import("Elf.zig").ref;
 const Dwarf = @This();
 
-/// Every unit's header and entry, one after another.
-unit_heads: []u8 = &.{},
-/// The line-number program header, with the file table.
-line_header: []u8 = &.{},
-/// .debug_rnglists' header, and each unit's aranges set header.
+/// The output's units, in first-use order, with what `place` built.
+units: std.StringArrayHashMapUnmanaged(Unit) = .empty,
+/// Sizes of .debug_info, .debug_rnglists, .debug_line, and .debug_aranges.
+info_size: u64 = 0,
+ranges_size: u64 = 0,
+line_size: u64 = 0,
+aranges_size: u64 = 0,
+/// FDEs, one per entry with a frame.
+n_frames: u32 = 0,
 rnglists_header: [rnglists_header_len]u8 = undefined,
-aranges_heads: []u8 = &.{},
+/// Owns the units, their files, and their headers.
+arena: std.heap.ArenaAllocator.State = .{},
+
+/// Where a unit goes, as offsets and lengths within the sections: its
+/// header, its entries, and the 0 ending them; its range list; its line
+/// program; and its aranges set.
+pub const Unit = struct {
+    /// DW_AT_name and DW_AT_comp_dir.
+    name: []const u8 = "",
+    dir: []const u8 = "",
+    /// The unit's line program's files.
+    files: std.StringArrayHashMapUnmanaged(void) = .empty,
+    info_off: u64 = 0,
+    info_len: u64 = 0,
+    ranges_off: u64 = 0,
+    ranges_len: u64 = 0,
+    line_off: u64 = 0,
+    line_len: u64 = 0,
+    aranges_off: u64 = 0,
+    aranges_len: u64 = 0,
+    /// The unit's header and entry, up to its children; its line program's
+    /// header; and its aranges set's header.
+    head: []u8 = &.{},
+    line_head: []u8 = &.{},
+    aranges_head: [aranges_head_len]u8 = undefined,
+};
 
 /// .debug_str. Names are inline strings, but readers such as std.debug
 /// require the section.
@@ -85,26 +114,113 @@ const aranges_head_len = 16;
 pub const range_len = 11;
 pub const aranges_tuple_len = 16;
 
-/// Builds the headers for the placed chunks: the units', whose ranges are
-/// relative to `text_addr`, and the line program's.
-pub fn init(gpa: Allocator, placed: *const Placed, comp_dir: []const u8, text_addr: u64) Allocator.Error!Dwarf {
+/// Places the chunks' parts, builds the units' file tables, and builds
+/// their headers, whose ranges are relative to `text_addr`. Within each
+/// section, units follow one another in first-use order, and a unit's
+/// parts from each chunk follow its header in chunk order.
+pub fn place(gpa: Allocator, chunks: []Chunk, comp_dir: []const u8, text_addr: u64) Allocator.Error!Dwarf {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
     var d: Dwarf = .{};
-    errdefer d.deinit(gpa);
-    var line: std.Io.Writer.Allocating = .init(gpa);
-    defer line.deinit();
-    buildLineHeader(gpa, &line.writer, placed.files.keys(), comp_dir) catch return error.OutOfMemory;
-    d.line_header = try line.toOwnedSlice();
-    std.mem.writeInt(u32, d.line_header[0..4], @intCast(d.line_header.len + placed.line_len - 4), .little);
+    const units = &d.units;
 
-    const units = placed.units.values();
-    var heads_len: usize = 0;
-    for (units) |u| heads_len += u.head_len;
-    d.unit_heads = try gpa.alloc(u8, heads_len);
-    d.aranges_heads = try gpa.alloc(u8, units.len * aranges_head_len);
+    // The units, their sizes, and each chunk's files' indices in its
+    // unit's file table.
+    var n_chunk_files: usize = 0;
+    for (chunks) |*c| {
+        c.frame_base = d.n_frames;
+        d.n_frames += c.n_frames;
+        n_chunk_files += c.files.count();
+    }
+    const file_map = try arena.alloc(u32, n_chunk_files);
+    var unit_map: std.ArrayList(u32) = .empty;
     var at: usize = 0;
-    for (placed.units.keys(), units, 0..) |unit, u, k| {
-        const name = if (unit.len > 0) unit else placed.files.keys()[0];
-        var w: std.Io.Writer = .fixed(d.unit_heads[at..][0..u.head_len]);
+    for (chunks) |*c| {
+        unit_map.clearRetainingCapacity();
+        for (c.units.keys(), c.units.values()) |name, part| {
+            const gop = try units.getOrPut(arena, name);
+            const u = gop.value_ptr;
+            if (!gop.found_existing) {
+                u.* = .{};
+                // File 0 is the unit's root file, as upstream writes it.
+                if (name.len > 0) try u.files.put(arena, name, {});
+            }
+            u.info_len += part.info_len;
+            u.line_len += part.line_len;
+            u.ranges_len += part.n_runs * range_len;
+            u.aranges_len += part.n_runs * aranges_tuple_len;
+            try unit_map.append(arena, @intCast(gop.index));
+        }
+        c.file_map = file_map[at..][0..c.files.count()];
+        at += c.files.count();
+        for (c.files.keys(), c.file_map) |key, *index| {
+            const u = &units.values()[unit_map.items[key.unit]];
+            index.* = @intCast((try u.files.getOrPut(arena, key.path)).index);
+        }
+    }
+
+    // Each unit's headers, and its place.
+    d.ranges_size = rnglists_header_len;
+    for (units.keys(), units.values()) |unit, *u| {
+        // The set_file operand is a fixed-width ULEB128, and `file_of`
+        // reserves the all-ones index for `skip`.
+        if (u.files.count() >= (1 << file_bits) - 1) return error.OutOfMemory;
+        if (unit.len > 0) {
+            u.name = std.fs.path.basenamePosix(unit);
+            u.dir = try std.fs.path.resolvePosix(arena, &.{ comp_dir, std.fs.path.dirnamePosix(unit) orelse "." });
+        } else {
+            u.name = u.files.keys()[0];
+            u.dir = comp_dir;
+        }
+        var line: std.Io.Writer.Allocating = .init(arena);
+        buildLineHeader(arena, &line.writer, u.files.keys(), u.dir, comp_dir) catch return error.OutOfMemory;
+        u.line_head = line.written();
+        u.head = try arena.alloc(u8, cuHeadLen(u.name, u.dir));
+
+        u.info_len += u.head.len + 1;
+        u.ranges_len += 1;
+        u.line_len += u.line_head.len;
+        u.aranges_len += aranges_head_len + aranges_tuple_len;
+        u.info_off = d.info_size;
+        u.ranges_off = d.ranges_size;
+        u.line_off = d.line_size;
+        u.aranges_off = d.aranges_size;
+        d.info_size += u.info_len;
+        d.ranges_size += u.ranges_len;
+        d.line_size += u.line_len;
+        d.aranges_size += u.aranges_len;
+    }
+    if (d.info_size > std.math.maxInt(u32) or d.ranges_size > std.math.maxInt(u32) or d.line_size > std.math.maxInt(u32)) return error.OutOfMemory;
+
+    // The chunks' parts, after each unit's header.
+    for (units.values()) |*u| {
+        u.info_off += u.head.len;
+        u.line_off += u.line_head.len;
+        u.aranges_off += aranges_head_len;
+    }
+    for (chunks) |*c| {
+        for (c.units.keys(), c.units.values()) |name, *part| {
+            const u = units.getPtr(name).?;
+            part.info_off = u.info_off;
+            part.ranges_off = u.ranges_off;
+            part.line_off = u.line_off;
+            part.aranges_off = u.aranges_off;
+            u.info_off += part.info_len;
+            u.ranges_off += part.n_runs * range_len;
+            u.line_off += part.line_len;
+            u.aranges_off += part.n_runs * aranges_tuple_len;
+        }
+    }
+    for (units.values()) |*u| {
+        u.info_off -= u.info_len - 1;
+        u.ranges_off -= u.ranges_len - 1;
+        u.line_off -= u.line_len;
+        u.aranges_off -= u.aranges_len - aranges_tuple_len;
+    }
+
+    for (units.values()) |*u| {
+        var w: std.Io.Writer = .fixed(u.head);
         w.writeInt(u32, @intCast(u.info_len - 4), .little) catch unreachable;
         w.writeInt(u16, 5, .little) catch unreachable;
         w.writeAll(&.{ DW.UT.compile, 8 }) catch unreachable;
@@ -112,17 +228,16 @@ pub fn init(gpa: Allocator, placed: *const Placed, comp_dir: []const u8, text_ad
         w.writeByte(abbrev_cu) catch unreachable;
         w.writeInt(u32, 0, .little) catch unreachable; // producer, at the start of `str`
         w.writeInt(u16, DW.LANG.Zig, .little) catch unreachable;
-        w.writeAll(name) catch unreachable;
+        w.writeAll(u.name) catch unreachable;
         w.writeByte(0) catch unreachable;
-        w.writeAll(comp_dir) catch unreachable;
+        w.writeAll(u.dir) catch unreachable;
         w.writeByte(0) catch unreachable;
-        w.writeInt(u32, 0, .little) catch unreachable; // stmt_list
+        w.writeInt(u32, @intCast(u.line_off), .little) catch unreachable;
         w.writeInt(u64, text_addr, .little) catch unreachable;
         w.writeInt(u32, @intCast(u.ranges_off), .little) catch unreachable;
-        std.debug.assert(w.end == u.head_len);
-        at += u.head_len;
-
-        const a = d.aranges_heads[k * aranges_head_len ..][0..aranges_head_len];
+        std.debug.assert(w.end == u.head.len);
+        std.mem.writeInt(u32, u.line_head[0..4], @intCast(u.line_len - 4), .little);
+        const a = &u.aranges_head;
         @memset(a, 0);
         std.mem.writeInt(u32, a[0..4], @intCast(u.aranges_len - 4), .little);
         std.mem.writeInt(u16, a[4..6], 2, .little);
@@ -130,27 +245,26 @@ pub fn init(gpa: Allocator, placed: *const Placed, comp_dir: []const u8, text_ad
         a[10] = 8; // address_size; segment_selector_size 0
     }
     d.rnglists_header = @splat(0);
-    std.mem.writeInt(u32, d.rnglists_header[0..4], @intCast(placed.ranges_size - 4), .little);
+    std.mem.writeInt(u32, d.rnglists_header[0..4], @intCast(d.ranges_size - 4), .little);
     std.mem.writeInt(u16, d.rnglists_header[4..6], 5, .little);
     d.rnglists_header[6] = 8; // address_size; segment_selector_size 0, offset_entry_count 0
+    d.arena = arena_state.state;
     return d;
 }
 
-fn buildLineHeader(gpa: Allocator, line: *std.Io.Writer, files: []const []const u8, comp_dir: []const u8) !void {
-    try line.writeInt(u32, 0, .little); // unit_length, set by `init`
+/// A line program's header for `files`. Directory 0 is the unit's
+/// directory; the others are the files' directories, resolved against
+/// `comp_dir`, since std.debug does not resolve them.
+fn buildLineHeader(arena: Allocator, line: *std.Io.Writer, files: []const []const u8, unit_dir: []const u8, comp_dir: []const u8) !void {
+    try line.writeInt(u32, 0, .little); // unit_length, set by `place`
     try line.writeInt(u16, 5, .little);
     try line.writeAll(&.{ 8, 0 }); // address_size, segment_selector_size
     try line.writeInt(u32, 0, .little); // header_length, set below
     try line.writeAll(&.{ 1, 1, 1 }); // minimum_instruction_length, maximum_operations_per_instruction, default_is_stmt
     try line.writeAll(&.{ @bitCast(@as(i8, Atom.LineProgram.line_base)), Atom.LineProgram.line_range, Atom.LineProgram.opcode_base });
     try line.writeAll(&.{ 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1 }); // standard_opcode_lengths
-    // Directory 0 is the compilation directory; the others are the files'
-    // directories resolved against it, since std.debug does not.
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
     var dirs: std.StringArrayHashMapUnmanaged(void) = .empty;
-    try dirs.put(arena, comp_dir, {});
+    try dirs.put(arena, unit_dir, {});
     const file_dirs = try arena.alloc(usize, files.len);
     for (files, file_dirs) |f, *dir| {
         const resolved = try std.fs.path.resolvePosix(arena, &.{ comp_dir, std.fs.path.dirnamePosix(f) orelse "." });
@@ -173,32 +287,35 @@ fn buildLineHeader(gpa: Allocator, line: *std.Io.Writer, files: []const []const 
 }
 
 pub fn deinit(d: *Dwarf, gpa: Allocator) void {
-    gpa.free(d.unit_heads);
-    gpa.free(d.line_header);
-    gpa.free(d.aranges_heads);
+    d.arena.promote(gpa).deinit();
+}
+
+/// Whether there is debug info: an entry whose atom was kept.
+pub fn present(d: *const Dwarf) bool {
+    return d.units.count() > 0;
 }
 
 /// The serially written parts of the sections, as (offset within the
 /// section, bytes): each unit's header and the 0 ending its children in
 /// .debug_info; .debug_rnglists' header and the end of each unit's list;
-/// and with `aranges`, each unit's set header and terminating tuple in
-/// .debug_aranges (dSYMs only: lldb maps addresses to a dSYM's units only
-/// through that section, which dsymutil always writes).
-pub fn heads(d: *const Dwarf, placed: *const Placed, ctx: anytype, comptime put: anytype) !void {
-    var at: usize = 0;
+/// each unit's line program header in .debug_line; and each unit's set
+/// header and terminating tuple in .debug_aranges (dSYMs only: lldb maps
+/// addresses to a dSYM's units only through that section, which dsymutil
+/// always writes).
+pub fn heads(d: *const Dwarf, ctx: anytype, comptime put: anytype) !void {
     const zeros: [aranges_tuple_len]u8 = @splat(0);
     try put(ctx, .ranges, 0, &d.rnglists_header);
-    for (placed.units.values(), 0..) |u, k| {
-        try put(ctx, .info, u.info_off, d.unit_heads[at..][0..u.head_len]);
-        at += u.head_len;
+    for (d.units.values()) |*u| {
+        try put(ctx, .info, u.info_off, u.head);
         try put(ctx, .info, u.info_off + u.info_len - 1, zeros[0..1]);
         try put(ctx, .ranges, u.ranges_off + u.ranges_len - 1, zeros[0..1]);
-        try put(ctx, .aranges, u.aranges_off, d.aranges_heads[k * aranges_head_len ..][0..aranges_head_len]);
+        try put(ctx, .line, u.line_off, u.line_head);
+        try put(ctx, .aranges, u.aranges_off, &u.aranges_head);
         try put(ctx, .aranges, u.aranges_off + u.aranges_len - aranges_tuple_len, &zeros);
     }
 }
 
-pub const Section = enum { info, ranges, aranges };
+pub const Section = enum { info, ranges, line, aranges };
 
 /// The subprogram entry's size, with its inlined subroutine entries.
 fn subprogramSize(debug: *const Atom.Debug) u64 {
@@ -217,16 +334,17 @@ fn hasChildren(inlines: []const Atom.Debug.Inline, k: usize) bool {
     return k + 1 < inlines.len and inlines[k + 1].parent == k;
 }
 
-/// Maps a local file index of `debug` (see `Atom.Debug.files`) to the
-/// output's.
+/// Maps a local file index of `debug` (see `Atom.Debug.files`) to its
+/// unit's file table, `unit` being its index in chunk `c`'s units.
 const FileMap = struct {
     c: *const Chunk,
     debug: *const Atom.Debug,
+    unit: u32,
     file: u32,
 
     fn get(m: FileMap, local: u32) u32 {
         if (local == 0) return m.file;
-        return m.c.file_map[m.c.files.getIndex(m.debug.files[local - 1]).?];
+        return m.c.file_map[m.c.files.getIndex(.{ .unit = m.unit, .path = m.debug.files[local - 1] }).?];
     }
 };
 
@@ -378,63 +496,78 @@ fn writeSleb(out: []u8, value: u32) usize {
 
 // The per-entry passes, shared by the linkers. Entries are split into
 // chunks of `chunk_len`; one parallel pass sizes each chunk's entries and
-// collects its files (`layOutChunk`), a serial step places the chunks and
-// builds the file table (`placeChunks`), and the linker writes each chunk's
-// parts in place.
+// collects their units and files (`layOutChunk`), a serial step places the
+// chunks' parts and builds the units' file tables and headers (`place`),
+// and the linker writes each chunk's parts in place (`ChunkWriter`).
 
 pub const chunk_len = 2048;
 
 /// One `chunk_len` run of consecutive debug entries.
 pub const Chunk = struct {
     // Filled in by `layOutChunk`.
-    /// Bytes of the chunk's line sequences.
-    line_len: u64,
     /// Entries with a `frame` other than `none`.
     n_frames: u32,
-    /// Source files of the chunk's entries, in first-use order; the
-    /// linker's `file_of` indexes it.
-    files: std.StringArrayHashMapUnmanaged(void),
+    /// Source files of the chunk's entries, each with its entry's unit, in
+    /// first-use order; `file_of` indexes it.
+    files: std.ArrayHashMapUnmanaged(FileKey, void, FileKey.Context, true),
     /// Units of the chunk's entries, in first-use order, and the chunk's
     /// part of each.
     units: std.StringArrayHashMapUnmanaged(UnitPart),
-    // Filled in by `placeChunks`.
-    /// Where the chunk's sequences start in .debug_line, after the header.
-    line_off: u64,
+    // Filled in by `place`.
     /// Entries with a frame in the chunks before this one.
     frame_base: u32,
-    /// Index in the output's file table of each of `files`.
+    /// Index of each of `files` in its unit's file table.
     file_map: []u32,
 
-    pub const empty: Chunk = .{ .line_len = 0, .n_frames = 0, .files = .empty, .units = .empty, .line_off = 0, .frame_base = 0, .file_map = &.{} };
+    pub const empty: Chunk = .{ .n_frames = 0, .files = .empty, .units = .empty, .frame_base = 0, .file_map = &.{} };
 
     pub fn deinit(c: *Chunk, gpa: Allocator) void {
         c.files.deinit(gpa);
         c.units.deinit(gpa);
     }
 
-    /// Bytes of the chunk's subprogram entries, range lists, and aranges
-    /// tuples, in all its units.
-    pub fn lens(c: *const Chunk) struct { info: u64, ranges: u64, aranges: u64 } {
+    /// Bytes of the chunk's subprogram entries, range lists, line
+    /// sequences, and aranges tuples, in all its units.
+    pub fn lens(c: *const Chunk) struct { info: u64, ranges: u64, line: u64, aranges: u64 } {
         var info: u64 = 0;
+        var line: u64 = 0;
         var runs: u64 = 0;
         for (c.units.values()) |u| {
             info += u.info_len;
+            line += u.line_len;
             runs += u.n_runs;
         }
-        return .{ .info = info, .ranges = runs * range_len, .aranges = runs * aranges_tuple_len };
+        return .{ .info = info, .ranges = runs * range_len, .line = line, .aranges = runs * aranges_tuple_len };
     }
+};
+
+pub const FileKey = struct {
+    /// Index in the chunk's units.
+    unit: u32,
+    path: []const u8,
+
+    pub const Context = struct {
+        pub fn hash(_: Context, k: FileKey) u32 {
+            return @truncate(std.hash.Wyhash.hash(k.unit, k.path));
+        }
+        pub fn eql(_: Context, a: FileKey, b: FileKey, _: usize) bool {
+            return a.unit == b.unit and std.mem.eql(u8, a.path, b.path);
+        }
+    };
 };
 
 /// A chunk's part of a unit.
 pub const UnitPart = struct {
     // Filled in by `layOutChunk`.
     info_len: u64 = 0,
+    line_len: u64 = 0,
     /// Runs of consecutive entries of the unit, each one range.
     n_runs: u32 = 0,
-    // Filled in by `placeChunks`: offsets within .debug_info,
-    // .debug_rnglists, and .debug_aranges.
+    // Filled in by `place`: offsets within .debug_info, .debug_rnglists,
+    // .debug_line, and .debug_aranges.
     info_off: u64 = 0,
     ranges_off: u64 = 0,
+    line_off: u64 = 0,
     aranges_off: u64 = 0,
 };
 
@@ -456,42 +589,40 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
     const begin = chunk * chunk_len;
     const end = @min(l.n_debug, begin + chunk_len);
     const c = &l.debug_chunks[chunk];
-    c.line_len = 0;
     c.n_frames = 0;
-    // Functions from one file usually share its path's bytes, so a table by
-    // address saves hashing the path for most entries.
-    var by_addr: FilesByAddr = .{};
+    // Functions from one file, or one unit, usually share its path's bytes,
+    // so tables by address save hashing the path for most entries.
+    var files_by_addr: ByAddr = .{};
+    var units_by_addr: ByAddr = .{};
     var units: UnitCursor = .{};
-    var units_by_addr: FilesByAddr = .{};
     for (l.file_of[begin..end], begin..) |*file_of, j| {
         file_of.* = skip;
         const atom = l.input.debugAtom(j);
         if (atom >= l.n_atoms or (j > 0 and l.input.debugAtom(j - 1) >= atom)) {
             return l.fail(task, @min(atom, l.n_atoms), error.InvalidDebugInfo, .{});
         }
-        const place = l.places[atom];
-        if (place.isDuplicate()) continue;
-        if (place.section != text) {
+        const atom_place = l.places[atom];
+        if (atom_place.isDuplicate()) continue;
+        if (atom_place.section != text) {
             return l.fail(task, atom, error.InvalidDebugInfo, .{ .atom = l.input.atom(atom).name });
         }
         const debug = l.input.debug(j);
         const d = ref(&debug);
-        const file: u32 = by_addr.get(d.file) orelse index: {
-            const gop = c.files.getOrPut(l.gpa, d.file) catch return l.fail(task, atom, error.OutOfMemory, .{});
-            by_addr.put(d.file, @intCast(gop.index));
-            break :index @intCast(gop.index);
+        const unit = units.next(l.gpa, c, &units_by_addr, d.unit) catch return l.fail(task, atom, error.OutOfMemory, .{});
+        const file = files_by_addr.get(d.file, unit) orelse index: {
+            const gop = c.files.getOrPut(l.gpa, .{ .unit = unit, .path = d.file }) catch return l.fail(task, atom, error.OutOfMemory, .{});
+            files_by_addr.put(d.file, unit, @intCast(gop.index));
+            break :index @as(u32, @intCast(gop.index));
         };
         if (d.inlines.len > 0 or d.patches.len > 0 or d.files.len > 0) {
             if (!valid(d, l.input.atom(atom).bytes.len)) return l.fail(task, atom, error.InvalidDebugInfo, .{ .atom = l.input.atom(atom).name });
-            for (d.files) |f| _ = c.files.getOrPut(l.gpa, f) catch return l.fail(task, atom, error.OutOfMemory, .{});
+            for (d.files) |f| _ = c.files.getOrPut(l.gpa, .{ .unit = unit, .path = f }) catch return l.fail(task, atom, error.OutOfMemory, .{});
         }
-        file_of.* = file;
-        const unit = units.next(l.gpa, c, &units_by_addr, d.unit) catch return l.fail(task, atom, error.OutOfMemory, .{});
-        file_of.* |= unit << file_bits;
+        file_of.* = file | unit << file_bits;
         const part = units.part;
         part.info_len += subprogramSize(d);
+        part.line_len += sequenceSize(d);
         part.n_runs += @intFromBool(units.new_run);
-        c.line_len += sequenceSize(d);
         c.n_frames += @intFromBool(d.frame != .none);
     }
 }
@@ -541,7 +672,7 @@ const UnitCursor = struct {
     part: *UnitPart = undefined,
     new_run: bool = false,
 
-    inline fn next(u: *UnitCursor, gpa: Allocator, c: *Chunk, by_addr: *FilesByAddr, unit: []const u8) Allocator.Error!u32 {
+    inline fn next(u: *UnitCursor, gpa: Allocator, c: *Chunk, by_addr: *ByAddr, unit: []const u8) Allocator.Error!u32 {
         // Consecutive entries' units are usually the same bytes.
         if (u.prev) |prev| if (prev.ptr == unit.ptr and prev.len == unit.len) {
             u.new_run = false;
@@ -550,11 +681,11 @@ const UnitCursor = struct {
         return u.find(gpa, c, by_addr, unit);
     }
 
-    noinline fn find(u: *UnitCursor, gpa: Allocator, c: *Chunk, by_addr: *FilesByAddr, unit: []const u8) Allocator.Error!u32 {
-        const index = by_addr.get(unit) orelse index: {
+    noinline fn find(u: *UnitCursor, gpa: Allocator, c: *Chunk, by_addr: *ByAddr, unit: []const u8) Allocator.Error!u32 {
+        const index = by_addr.get(unit, 0) orelse index: {
             const gop = try c.units.getOrPut(gpa, unit);
             if (!gop.found_existing) gop.value_ptr.* = .{};
-            by_addr.put(unit, @intCast(gop.index));
+            by_addr.put(unit, 0, @intCast(gop.index));
             break :index @as(u32, @intCast(gop.index));
         };
         u.new_run = u.prev == null or index != u.index;
@@ -565,161 +696,55 @@ const UnitCursor = struct {
     }
 };
 
-/// Open addressing from a path's address and length to its index in a
-/// chunk's `files`. Holds up to 3/4 of its slots; paths past that are looked
-/// up by contents every time.
-const FilesByAddr = struct {
-    slots: [1024]Slot = @splat(.{ .ptr = 0, .len = 0, .index = 0 }),
+/// Open addressing from a path's address and length, and a unit, to an
+/// index. Holds up to 3/4 of its slots; paths past that are looked up by
+/// contents every time.
+const ByAddr = struct {
+    slots: [1024]Slot = @splat(.{ .ptr = 0, .len = 0, .unit = 0, .index = 0 }),
     count: usize = 0,
 
-    const Slot = struct { ptr: usize, len: usize, index: u32 };
+    const Slot = struct { ptr: usize, len: usize, unit: u32, index: u32 };
 
-    fn home(file: []const u8) usize {
-        return @intCast((@intFromPtr(file.ptr) *% 0x9e3779b97f4a7c15) >> 54);
+    fn home(path: []const u8) usize {
+        return @intCast((@intFromPtr(path.ptr) *% 0x9e3779b97f4a7c15) >> 54);
     }
 
-    fn get(t: *const FilesByAddr, file: []const u8) ?u32 {
-        var i = home(file);
+    fn get(t: *const ByAddr, path: []const u8, unit: u32) ?u32 {
+        var i = home(path);
         while (t.slots[i].ptr != 0) : (i = (i + 1) % t.slots.len) {
-            if (t.slots[i].ptr == @intFromPtr(file.ptr) and t.slots[i].len == file.len) return t.slots[i].index;
+            const slot = t.slots[i];
+            if (slot.ptr == @intFromPtr(path.ptr) and slot.len == path.len and slot.unit == unit) return slot.index;
         }
         return null;
     }
 
-    fn put(t: *FilesByAddr, file: []const u8, index: u32) void {
+    fn put(t: *ByAddr, path: []const u8, unit: u32, index: u32) void {
         if (t.count >= t.slots.len / 4 * 3) return;
-        var i = home(file);
+        var i = home(path);
         while (t.slots[i].ptr != 0) i = (i + 1) % t.slots.len;
-        t.slots[i] = .{ .ptr = @intFromPtr(file.ptr), .len = file.len, .index = index };
+        t.slots[i] = .{ .ptr = @intFromPtr(path.ptr), .len = path.len, .unit = unit, .index = index };
         t.count += 1;
     }
 };
 
-/// The chunks' totals, and the output's file and unit tables.
-pub const Placed = struct {
-    line_len: u64 = 0,
-    n_frames: u32 = 0,
-    /// The whole .debug_info, .debug_rnglists, and .debug_aranges.
-    info_size: u64 = 0,
-    ranges_size: u64 = 0,
-    aranges_size: u64 = 0,
-    /// The output's file table, from the chunks' files in first-use order.
-    files: std.StringArrayHashMapUnmanaged(void) = .empty,
-    file_map: []u32 = &.{},
-    /// The output's units, in first-use order.
-    units: std.StringArrayHashMapUnmanaged(Unit) = .empty,
-
-    pub fn deinit(p: *Placed, gpa: Allocator) void {
-        p.files.deinit(gpa);
-        gpa.free(p.file_map);
-        p.units.deinit(gpa);
-    }
-};
-
-/// Where a unit goes: its entries, its range list, and its aranges set,
-/// as offsets and lengths within their sections.
-pub const Unit = struct {
-    info_off: u64 = 0,
-    info_len: u64 = 0,
-    /// Its header and entry, before its children.
-    head_len: u64 = 0,
-    ranges_off: u64 = 0,
-    ranges_len: u64 = 0,
-    aranges_off: u64 = 0,
-    aranges_len: u64 = 0,
-};
-
-/// Places the chunks' sequences after one another, builds the file table,
-/// and places each unit's header, the chunks' parts of it in chunk order,
-/// and the end of its children; likewise its range list and aranges set.
-pub fn placeChunks(gpa: Allocator, chunks: []Chunk, comp_dir: []const u8) error{OutOfMemory}!Placed {
-    var p: Placed = .{};
-    errdefer p.deinit(gpa);
-    var n_chunk_files: usize = 0;
-    for (chunks) |*c| {
-        c.line_off = p.line_len;
-        c.frame_base = p.n_frames;
-        p.line_len += c.line_len;
-        p.n_frames += c.n_frames;
-        n_chunk_files += c.files.count();
-    }
-    p.file_map = try gpa.alloc(u32, n_chunk_files);
-    var at: usize = 0;
-    for (chunks) |*c| {
-        c.file_map = p.file_map[at..][0..c.files.count()];
-        at += c.files.count();
-        for (c.files.keys(), c.file_map) |f, *global| {
-            global.* = @intCast((try p.files.getOrPut(gpa, f)).index);
-        }
-    }
-    // The set_file operand is a fixed-width ULEB128.
-    if (p.files.count() >= (1 << file_bits) - 1) return error.OutOfMemory;
-    if (p.files.count() == 0) return p;
-
-    // Each unit's size, then its place, then each chunk's part of it.
-    for (chunks) |*c| {
-        for (c.units.keys(), c.units.values()) |name, part| {
-            const gop = try p.units.getOrPut(gpa, name);
-            if (!gop.found_existing) gop.value_ptr.* = .{ .head_len = cuHeadLen(if (name.len > 0) name else p.files.keys()[0], comp_dir) };
-            const u = gop.value_ptr;
-            u.info_len += part.info_len;
-            u.ranges_len += part.n_runs * range_len;
-            u.aranges_len += part.n_runs * aranges_tuple_len;
-        }
-    }
-    p.ranges_size = rnglists_header_len;
-    for (p.units.values()) |*u| {
-        u.info_len += u.head_len + 1;
-        u.ranges_len += 1;
-        u.aranges_len += aranges_head_len + aranges_tuple_len;
-        u.info_off = p.info_size;
-        u.ranges_off = p.ranges_size;
-        u.aranges_off = p.aranges_size;
-        p.info_size += u.info_len;
-        p.ranges_size += u.ranges_len;
-        p.aranges_size += u.aranges_len;
-        // The parts' cursors.
-        u.info_off += u.head_len;
-        u.aranges_off += aranges_head_len;
-    }
-    if (p.info_size > std.math.maxInt(u32) or p.ranges_size > std.math.maxInt(u32)) return error.OutOfMemory;
-    for (chunks) |*c| {
-        for (c.units.keys(), c.units.values()) |name, *part| {
-            const u = p.units.getPtr(name).?;
-            part.info_off = u.info_off;
-            part.ranges_off = u.ranges_off;
-            part.aranges_off = u.aranges_off;
-            u.info_off += part.info_len;
-            u.ranges_off += part.n_runs * range_len;
-            u.aranges_off += part.n_runs * aranges_tuple_len;
-        }
-    }
-    // Back from the cursors to the units' starts.
-    for (p.units.values()) |*u| {
-        u.info_off -= u.info_len - 1;
-        u.ranges_off -= u.ranges_len - 1;
-        u.aranges_off -= u.aranges_len - aranges_tuple_len;
-    }
-    return p;
-}
-
 /// Writes one chunk's entries in order: each entry's subprogram entry to
-/// its unit's part of `info`, its sequence to `line`, and each run's range
-/// to its unit's part of `ranges` and, if not empty, `aranges`. A part is
-/// where the chunk's part of a unit goes, in the chunk's unit order; the
-/// writer advances them.
+/// its unit's part of `info` and its sequence to its unit's part of `line`,
+/// and each run's range to its unit's part of `ranges` and, if not empty,
+/// `aranges`. A part is where the chunk's part of a unit goes, in the
+/// chunk's unit order; the writer advances them.
 pub const ChunkWriter = struct {
     c: *const Chunk,
     info: [][]u8,
     ranges: [][]u8,
+    line: [][]u8,
     aranges: [][]u8,
-    line: []u8,
     /// Range offsets are from the units' low_pc.
     text_addr: u64,
     /// The current run's unit, as an index in the chunk's units or
-    /// `no_unit`, and the rest of its part of `info`.
+    /// `no_unit`, and the rest of its parts of `info` and `line`.
     k: u32 = no_unit,
     unit_info: []u8 = &.{},
+    unit_line: []u8 = &.{},
     run_start: u64 = 0,
     run_end: u64 = 0,
 
@@ -729,9 +754,9 @@ pub const ChunkWriter = struct {
         const k = file_of >> file_bits;
         if (k != w.k) w.switchUnit(k, addr);
         w.run_end = addr + size;
-        const files: FileMap = .{ .c = w.c, .debug = debug, .file = w.c.file_map[file_of & (1 << file_bits) - 1] };
+        const files: FileMap = .{ .c = w.c, .debug = debug, .unit = k, .file = w.c.file_map[file_of & (1 << file_bits) - 1] };
         w.unit_info = w.unit_info[writeSubprogram(w.unit_info, debug, addr, size, files)..];
-        w.line = w.line[writeSequence(w.line, debug, addr, size, files)..];
+        w.unit_line = w.unit_line[writeSequence(w.unit_line, debug, addr, size, files)..];
     }
 
     const no_unit = std.math.maxInt(u32);
@@ -740,6 +765,7 @@ pub const ChunkWriter = struct {
         if (w.k != no_unit) w.endRun();
         w.k = k;
         w.unit_info = w.info[k];
+        w.unit_line = w.line[k];
         w.run_start = addr;
     }
 
@@ -750,6 +776,7 @@ pub const ChunkWriter = struct {
     fn endRun(w: *ChunkWriter) void {
         const k = w.k;
         w.info[k] = w.unit_info;
+        w.line[k] = w.unit_line;
         w.ranges[k][0] = DW.RLE.offset_pair;
         w.ranges[k][1..6].* = paddedUleb5(w.run_start - w.text_addr);
         w.ranges[k][6..11].* = paddedUleb5(w.run_end - w.text_addr);

@@ -225,9 +225,12 @@ pub const Debug = struct {
     /// How the function's frame unwinds; the linker writes call frame
     /// information (an FDE) from it.
     frame: Frame,
-    /// The compile unit: the basename of the module's root source file, as
-    /// upstream names its units ("std.zig"). Each distinct unit is one
-    /// unit of the output; "" is the unit of the first file.
+    /// The compile unit: the path of the module's root source file, with
+    /// `file`'s path rules. Each distinct unit is one unit of the output,
+    /// named after the file's basename in the file's directory, as
+    /// upstream names its units ("std.zig" in .../lib/std), with a line
+    /// program of its own. "" is the unit of the first file, named after
+    /// its path in `comp_dir`.
     unit: []const u8 = "",
     /// Other source files `lines` switches to, with `file`'s path rules.
     /// A local file index is 0 for `file` and k + 1 for `files[k]`.
@@ -238,7 +241,7 @@ pub const Debug = struct {
     /// Offsets in `lines` of the opcodes whose operands the linker
     /// rewrites, in order (see `LineProgram.switchTo`):
     /// - `DW_LNS_set_file`, then a ULEB128 padded to 3 bytes holding a
-    ///   local file index, which becomes the output's file index;
+    ///   local file index, which becomes the unit's file index;
     /// - `DW_LNS_advance_line`, then an SLEB128 padded to 5 bytes holding a
     ///   base, 0 for the function's and k + 1 for `inlines[k]`'s, which
     ///   becomes the difference between that base line and the previous

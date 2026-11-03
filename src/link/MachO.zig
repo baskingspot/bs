@@ -567,19 +567,16 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // The dSYM's DWARF file: header, load commands (see `writeDsymHeader`),
     // then the __DWARF segment's sections from a 4 KiB boundary.
     const has_dsym = @TypeOf(dsym_out) != void;
-    var placed: Dwarf.Placed = .{};
-    defer placed.deinit(gpa);
     var dwarf: Dwarf = .{};
     defer dwarf.deinit(gpa);
     var dsym_layout: DsymLayout = undefined;
     if (has_dsym) {
-        placed = try Dwarf.placeChunks(gpa, debug_chunks, options.comp_dir);
-        if (placed.files.count() > 0) dwarf = try .init(gpa, &placed, options.comp_dir, base + starts[text]);
+        dwarf = try .place(gpa, debug_chunks, options.comp_dir, base + starts[text]);
         var segs_size: u32 = @sizeOf(macho.segment_command_64); // __PAGEZERO
         for (seg_present, seg_nsects) |p, n| if (p) {
             segs_size += @sizeOf(macho.segment_command_64) + n * @sizeOf(macho.section_64);
         };
-        dsym_layout = .init(n_segs - 1, segs_size, dwarf, placed);
+        dsym_layout = .init(n_segs - 1, segs_size, &dwarf);
         l.has_dsym = true;
         if (@TypeOf(dsym_out) == *Elf.MemoryOutput) {
             l.dsym = .{ .memory = try dsym_out.buffer(io, dsym_layout.len) };
@@ -588,14 +585,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             l.dsym = .{ .file = dsym_out.file.handle };
             for (debug_chunks) |*c| {
                 const lens = c.lens();
-                l.dsym_scratch_len = @max(l.dsym_scratch_len, lens.info + lens.ranges + lens.aranges + c.line_len);
+                l.dsym_scratch_len = @max(l.dsym_scratch_len, lens.info + lens.ranges + lens.aranges + lens.line);
             }
             l.dsym_scratch = try gpa.alloc(u8, n_threads * l.dsym_scratch_len);
         }
         l.dsym_info_off = dsym_layout.info_off;
         l.dsym_ranges_off = dsym_layout.ranges_off;
         l.dsym_aranges_off = dsym_layout.aranges_off;
-        l.dsym_line_off = dsym_layout.line_off + dwarf.line_header.len;
+        l.dsym_line_off = dsym_layout.line_off;
     }
     defer gpa.free(l.dsym_scratch);
 
@@ -782,16 +779,15 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     if (has_dsym) {
         // The dSYM's parts outside the debug chunks': its header and
-        // .debug_abbrev, the units' heads, the line program header, and
-        // .debug_str.
+        // .debug_abbrev, the units' heads (with their line program
+        // headers), and .debug_str.
         const dl = dsym_layout;
         const head = try gpa.alloc(u8, dl.info_off);
         defer gpa.free(head);
         writeDsymHeader(head, dl, buf[uuid_at..][0..16].*, buf[@sizeOf(macho.mach_header_64)..segs_end], base + linkedit_vm + std.mem.alignForward(u64, file_len - linkedit_off, page_size));
         if (dl.info_size > 0) {
             @memcpy(head[dl.abbrev_off..][0..Dwarf.abbrev.len], &Dwarf.abbrev);
-            try dwarf.heads(&placed, &l, Link.putDsymDebug);
-            try l.putDsym(dl.line_off, dwarf.line_header);
+            try dwarf.heads(&l, Link.putDsymDebug);
             try l.putDsym(dl.str_off, Dwarf.str);
         }
         try l.putDsym(0, head);
@@ -825,17 +821,17 @@ const DsymLayout = struct {
 
     const n_dwarf_sects = 6;
 
-    fn init(n_exe_segs: u32, exe_segs_size: u32, dwarf: Dwarf, placed: Dwarf.Placed) DsymLayout {
-        const has_debug = placed.files.count() > 0;
+    fn init(n_exe_segs: u32, exe_segs_size: u32, dwarf: *const Dwarf) DsymLayout {
+        const has_debug = dwarf.present();
         const sizeofcmds = @sizeOf(macho.uuid_command) + exe_segs_size + @sizeOf(macho.segment_command_64) +
             @as(u32, if (has_debug) n_dwarf_sects * @sizeOf(macho.section_64) else 0) + @sizeOf(macho.symtab_command);
         const dwarf_off = std.mem.alignForward(u64, @sizeOf(macho.mach_header_64) + sizeofcmds, 0x1000);
         const abbrev_size: u64 = if (has_debug) Dwarf.abbrev.len else 0;
-        const info_size = placed.info_size;
-        const ranges_size = if (has_debug) placed.ranges_size else 0;
-        const line_size = if (has_debug) dwarf.line_header.len + placed.line_len else 0;
+        const info_size = dwarf.info_size;
+        const ranges_size = if (has_debug) dwarf.ranges_size else 0;
+        const line_size = dwarf.line_size;
         const str_size: u64 = if (has_debug) Dwarf.str.len else 0;
-        const aranges_size: u64 = placed.aranges_size;
+        const aranges_size: u64 = dwarf.aranges_size;
         const info_off = dwarf_off + abbrev_size;
         const ranges_off = info_off + info_size;
         const line_off = ranges_off + ranges_size;
@@ -1097,8 +1093,8 @@ fn LinkOf(comptime Input: type) type {
         /// With numbered symbols, the atom numbered `Symbols.entry`, found by
         /// `resolveAddrsNumbered`.
         entry_atom: ?usize = null,
-        /// The dSYM's DWARF file, if one is written, and where the debug
-        /// chunks' subprogram entries and line sequences start in it.
+        /// The dSYM's DWARF file, if one is written, and the file offsets
+        /// of its debug sections.
         has_dsym: bool = false,
         dsym: Elf.Target = .{ .memory = &.{} },
         dsym_info_off: u64 = 0,
@@ -1413,6 +1409,7 @@ fn LinkOf(comptime Input: type) type {
             try l.putDsym(offset + switch (section) {
                 .info => l.dsym_info_off,
                 .ranges => l.dsym_ranges_off,
+                .line => l.dsym_line_off,
                 .aranges => l.dsym_aranges_off,
             }, bytes);
         }
@@ -1432,12 +1429,12 @@ fn LinkOf(comptime Input: type) type {
             const c = &l.debug_chunks[chunk];
             // A local copy: writes to the outputs could alias `l`.
             const input = l.input;
-            // The chunk's line sequences, and each unit's part of the
-            // subprogram entries, range lists, and aranges tuples: in the
-            // dSYM, or in the thread's scratch, written out at the end.
+            // Each unit's part of the subprogram entries, range lists, line
+            // sequences, and aranges tuples: in the dSYM, or in the thread's
+            // scratch, written out at the end.
             const units = c.units.values();
             const dsym = write and l.has_dsym;
-            const pieces: [][]u8 = if (dsym) l.gpa.alloc([]u8, 6 * units.len) catch {
+            const pieces: [][]u8 = if (dsym) l.gpa.alloc([]u8, 8 * units.len) catch {
                 l.fail(l.chunks.len + chunk, begin, error.OutOfMemory, .{});
                 return 0;
             } else &.{};
@@ -1445,30 +1442,27 @@ fn LinkOf(comptime Input: type) type {
             var w: Dwarf.ChunkWriter = undefined;
             if (dsym) {
                 const n_u = units.len;
-                var line: []u8 = undefined;
-                var at: usize = thread * l.dsym_scratch_len + c.line_len;
-                switch (l.dsym) {
-                    .memory => |m| line = m[l.dsym_line_off + c.line_off ..][0..c.line_len],
-                    .file => line = l.dsym_scratch[thread * l.dsym_scratch_len ..][0..c.line_len],
-                }
-                for (units, pieces[0..n_u], pieces[n_u..][0..n_u], pieces[2 * n_u ..][0..n_u]) |u, *i, *r, *a| {
-                    const lens = [3]u64{ u.info_len, u.n_runs * Dwarf.range_len, u.n_runs * Dwarf.aranges_tuple_len };
+                var at: usize = thread * l.dsym_scratch_len;
+                for (units, pieces[0..n_u], pieces[n_u..][0..n_u], pieces[2 * n_u ..][0..n_u], pieces[3 * n_u ..][0..n_u]) |u, *i, *r, *ln, *a| {
+                    const lens = [4]u64{ u.info_len, u.n_runs * Dwarf.range_len, u.line_len, u.n_runs * Dwarf.aranges_tuple_len };
                     switch (l.dsym) {
                         .memory => |m| {
                             i.* = m[l.dsym_info_off + u.info_off ..][0..lens[0]];
                             r.* = m[l.dsym_ranges_off + u.ranges_off ..][0..lens[1]];
-                            a.* = m[l.dsym_aranges_off + u.aranges_off ..][0..lens[2]];
+                            ln.* = m[l.dsym_line_off + u.line_off ..][0..lens[2]];
+                            a.* = m[l.dsym_aranges_off + u.aranges_off ..][0..lens[3]];
                         },
                         .file => {
                             i.* = l.dsym_scratch[at..][0..lens[0]];
                             r.* = l.dsym_scratch[at + lens[0] ..][0..lens[1]];
-                            a.* = l.dsym_scratch[at + lens[0] + lens[1] ..][0..lens[2]];
-                            at += lens[0] + lens[1] + lens[2];
+                            ln.* = l.dsym_scratch[at + lens[0] + lens[1] ..][0..lens[2]];
+                            a.* = l.dsym_scratch[at + lens[0] + lens[1] + lens[2] ..][0..lens[3]];
+                            at += lens[0] + lens[1] + lens[2] + lens[3];
                         },
                     }
                 }
-                @memcpy(pieces[3 * n_u ..], pieces[0 .. 3 * n_u]);
-                w = .{ .c = c, .info = pieces[3 * n_u ..][0..n_u], .ranges = pieces[4 * n_u ..][0..n_u], .aranges = pieces[5 * n_u ..][0..n_u], .line = line, .text_addr = l.section_addrs[text] };
+                @memcpy(pieces[4 * n_u ..], pieces[0 .. 4 * n_u]);
+                w = .{ .c = c, .info = pieces[4 * n_u ..][0..n_u], .ranges = pieces[5 * n_u ..][0..n_u], .line = pieces[6 * n_u ..][0..n_u], .aranges = pieces[7 * n_u ..][0..n_u], .text_addr = l.section_addrs[text] };
             }
             const page = if (write) l.buf[l.unwind_off + l.unwind_pages[chunk].off ..][0 .. unwind_page_header_size + l.unwind_pages[chunk].count * unwind_entry_size] else &.{};
             var n: u32 = 0;
@@ -1520,11 +1514,10 @@ fn LinkOf(comptime Input: type) type {
                 if (l.has_dsym and l.dsym == .file) {
                     const fd = l.dsym.file;
                     const n_u = units.len;
-                    const line = l.dsym_scratch[thread * l.dsym_scratch_len ..][0..c.line_len];
-                    Elf.pwriteAll(fd, line, l.dsym_line_off + c.line_off) catch l.fail(l.chunks.len + chunk, begin, error.WriteFailed, .{});
-                    for (units, pieces[0..n_u], pieces[n_u..][0..n_u], pieces[2 * n_u ..][0..n_u]) |u, i, r, a| {
+                    for (units, pieces[0..n_u], pieces[n_u..][0..n_u], pieces[2 * n_u ..][0..n_u], pieces[3 * n_u ..][0..n_u]) |u, i, r, ln, a| {
                         Elf.pwriteAll(fd, i, l.dsym_info_off + u.info_off) catch l.fail(l.chunks.len + chunk, begin, error.WriteFailed, .{});
                         Elf.pwriteAll(fd, r, l.dsym_ranges_off + u.ranges_off) catch l.fail(l.chunks.len + chunk, begin, error.WriteFailed, .{});
+                        Elf.pwriteAll(fd, ln, l.dsym_line_off + u.line_off) catch l.fail(l.chunks.len + chunk, begin, error.WriteFailed, .{});
                         Elf.pwriteAll(fd, a, l.dsym_aranges_off + u.aranges_off) catch l.fail(l.chunks.len + chunk, begin, error.WriteFailed, .{});
                     }
                 }
@@ -2290,7 +2283,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
         }
     }.f;
     const files = [_][]const u8{ "a.zig", "dir/b.zig", "/abs/c.zig" };
-    const units = [_][]const u8{ "root.zig", "std.zig" };
+    const units = [_][]const u8{ "src/root.zig", "/zig/lib/std/std.zig" };
     var atoms: std.ArrayList(Atom) = .empty;
     var debug: std.ArrayList(Atom.Debug) = .empty;
     var m: Encoder = .init(arena);
@@ -2407,7 +2400,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
         try dwarf.getSymbols(arena, arena, .little, vaddr, false, &symbols);
         const loc = symbols.items[0].source_location.?;
         try std.testing.expectEqualStrings(name, symbols.items[0].name.?);
-        try std.testing.expectEqualStrings(units[index / 300 % units.len], symbols.items[0].compile_unit_name.?);
+        try std.testing.expectEqualStrings(std.fs.path.basenamePosix(units[index / 300 % units.len]), symbols.items[0].compile_unit_name.?);
         try std.testing.expectEqual(index + 2, loc.line);
         try std.testing.expectEqual(5, loc.column);
         const file = files[index / 1000 % files.len];
@@ -2438,7 +2431,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
             // language.
             if (found) break std.mem.sliceTo(one.dsym[info.offset + std.mem.readInt(u32, set[6..10], .little) + 12 + 1 + 4 + 2 ..], 0);
         } else return error.TestExpectedEqual;
-        try std.testing.expectEqualStrings(units[index / 300 % units.len], unit_name);
+        try std.testing.expectEqualStrings(std.fs.path.basenamePosix(units[index / 300 % units.len]), unit_name);
     }
 
     // Each function's code has its frame's encoding, and code without

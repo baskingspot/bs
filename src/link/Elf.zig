@@ -608,19 +608,17 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     // Place the debug chunks, and build the file and unit tables from their
     // files and units in first-use order.
-    var placed = try Dwarf.placeChunks(gpa, debug_chunks, options.comp_dir);
-    defer placed.deinit(gpa);
-    const has_debug = placed.files.count() > 0;
-    var dwarf: Dwarf = if (has_debug) try .init(gpa, &placed, options.comp_dir, base + starts[text]) else .{};
+    var dwarf: Dwarf = try .place(gpa, debug_chunks, options.comp_dir, base + starts[text]);
     defer dwarf.deinit(gpa);
+    const has_debug = dwarf.present();
 
     const abbrev_off = file_end;
     const info_off = abbrev_off + if (has_debug) Dwarf.abbrev.len else 0;
-    const info_size = placed.info_size;
+    const info_size = dwarf.info_size;
     const ranges_off = info_off + info_size;
-    const ranges_size = if (has_debug) placed.ranges_size else 0;
+    const ranges_size = if (has_debug) dwarf.ranges_size else 0;
     const line_off = ranges_off + ranges_size;
-    const line_size = if (has_debug) dwarf.line_header.len + placed.line_len else 0;
+    const line_size = dwarf.line_size;
     const str_off = line_off + line_size;
     const str_size = if (has_debug) Dwarf.str.len else 0;
     const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
@@ -647,7 +645,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             for (debug_chunks) |*c| {
                 const fde_len = @as(u64, c.n_frames) * (Dwarf.fde_size + Dwarf.eh_frame_hdr_entry_size);
                 const lens = c.lens();
-                l.scratch_len = @max(l.scratch_len, lens.info + lens.ranges + c.line_len + fde_len);
+                l.scratch_len = @max(l.scratch_len, lens.info + lens.ranges + lens.line + fde_len);
             }
             l.scratch = try gpa.alloc(u8, n_threads * l.scratch_len);
         },
@@ -667,22 +665,22 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.fill(strtab_off, 1);
     try l.put(shstrtab_off, shstr);
     try l.fill(shstrtab_off + shstr.len, shoff - (shstrtab_off + shstr.len));
-    const eh_size = Dwarf.cie.len + @as(u64, placed.n_frames) * Dwarf.fde_size + 4;
-    const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, placed.n_frames) * Dwarf.eh_frame_hdr_entry_size;
+    const eh_size = Dwarf.cie.len + @as(u64, dwarf.n_frames) * Dwarf.fde_size + 4;
+    const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, dwarf.n_frames) * Dwarf.eh_frame_hdr_entry_size;
     if (has_cfi) {
         // The FDEs and the search table are written with the debug chunks.
         try l.put(eh_off, &Dwarf.cie);
         try l.fill(eh_off + eh_size - 4, hdr_off - (eh_off + eh_size - 4)); // terminator, unused room
         const eh_frame_rel: i32 = @intCast(@as(i64, @intCast(eh_off)) - @as(i64, @intCast(hdr_off + 4)));
-        try l.put(hdr_off, &Dwarf.ehFrameHdr(eh_frame_rel, placed.n_frames));
+        try l.put(hdr_off, &Dwarf.ehFrameHdr(eh_frame_rel, dwarf.n_frames));
         try l.fill(hdr_off + hdr_size, r_end - (hdr_off + hdr_size));
     }
     if (has_debug) {
         try l.put(abbrev_off, &Dwarf.abbrev);
         l.info_off = info_off;
         l.ranges_off = ranges_off;
-        try dwarf.heads(&placed, &l, Link.putDebug);
-        try l.put(line_off, dwarf.line_header);
+        l.line_off = line_off;
+        try dwarf.heads(&l, Link.putDebug);
         try l.put(str_off, Dwarf.str);
     }
 
@@ -693,7 +691,6 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     l.strtab_off = strtab_off;
     l.resolved = resolved;
     l.max_targets = max_targets;
-    l.line_off = line_off + dwarf.line_header.len;
     l.eh_off = eh_off;
     l.hdr_off = hdr_off;
     try parallel(io, n_threads, n_chunks + n_debug_chunks, &l, Link.copyAll);
@@ -882,8 +879,7 @@ fn LinkOf(comptime Input: type) type {
         /// `max_targets` addresses per thread.
         resolved: []u64 = undefined,
         max_targets: usize = undefined,
-        /// File offsets of .debug_info and .debug_rnglists, and of the line
-        /// sequences, after the line program's header.
+        /// File offsets of .debug_info, .debug_rnglists, and .debug_line.
         info_off: u64 = undefined,
         ranges_off: u64 = undefined,
         line_off: u64 = undefined,
@@ -1108,37 +1104,42 @@ fn LinkOf(comptime Input: type) type {
             const end = @min(l.n_debug, begin + chunk_len);
             const c = &l.debug_chunks[chunk];
             const task = l.chunks.len + chunk;
-            const offsets = [3]u64{
-                l.line_off + c.line_off,
+            const offsets = [2]u64{
                 l.eh_off + Dwarf.cie.len + @as(u64, c.frame_base) * Dwarf.fde_size,
                 l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, c.frame_base) * Dwarf.eh_frame_hdr_entry_size,
             };
-            const lens = [3]u64{ c.line_len, @as(u64, c.n_frames) * Dwarf.fde_size, @as(u64, c.n_frames) * Dwarf.eh_frame_hdr_entry_size };
-            const out = l.parts(thread, 3, offsets, lens);
-            // Each unit's part of the subprogram entries and range lists:
-            // in place, or in the scratch after `out`.
+            const lens = [2]u64{ @as(u64, c.n_frames) * Dwarf.fde_size, @as(u64, c.n_frames) * Dwarf.eh_frame_hdr_entry_size };
+            const out = l.parts(thread, 2, offsets, lens);
+            // Each unit's part of the subprogram entries, range lists, and
+            // line sequences: in place, or in the scratch after `out`.
             const units = c.units.values();
-            const pieces = l.gpa.alloc([]u8, 4 * units.len) catch return l.fail(task, begin, error.OutOfMemory, .{});
+            const n_u = units.len;
+            const pieces = l.gpa.alloc([]u8, 6 * n_u) catch return l.fail(task, begin, error.OutOfMemory, .{});
             defer l.gpa.free(pieces);
-            const info = pieces[0..units.len];
-            const ranges = pieces[units.len..][0..units.len];
+            const info = pieces[0..n_u];
+            const ranges = pieces[n_u..][0..n_u];
+            const line = pieces[2 * n_u ..][0..n_u];
             {
-                var at: usize = thread * l.scratch_len + lens[0] + lens[1] + lens[2];
-                for (units, info, ranges) |p, *i, *r| switch (l.target) {
-                    .memory => |buf| {
-                        i.* = buf[l.info_off + p.info_off ..][0..p.info_len];
-                        r.* = buf[l.ranges_off + p.ranges_off ..][0 .. p.n_runs * Dwarf.range_len];
-                    },
-                    .file => {
-                        i.* = l.scratch[at..][0..p.info_len];
-                        at += p.info_len;
-                        r.* = l.scratch[at..][0 .. p.n_runs * Dwarf.range_len];
-                        at += r.len;
-                    },
-                };
+                var at: usize = thread * l.scratch_len + lens[0] + lens[1];
+                for (units, info, ranges, line) |u, *i, *r, *ln| {
+                    const piece_lens = [3]u64{ u.info_len, u.n_runs * Dwarf.range_len, u.line_len };
+                    switch (l.target) {
+                        .memory => |buf| {
+                            i.* = buf[l.info_off + u.info_off ..][0..piece_lens[0]];
+                            r.* = buf[l.ranges_off + u.ranges_off ..][0..piece_lens[1]];
+                            ln.* = buf[l.line_off + u.line_off ..][0..piece_lens[2]];
+                        },
+                        .file => {
+                            i.* = l.scratch[at..][0..piece_lens[0]];
+                            r.* = l.scratch[at + piece_lens[0] ..][0..piece_lens[1]];
+                            ln.* = l.scratch[at + piece_lens[0] + piece_lens[1] ..][0..piece_lens[2]];
+                            at += piece_lens[0] + piece_lens[1] + piece_lens[2];
+                        },
+                    }
+                }
             }
-            @memcpy(pieces[2 * units.len ..], pieces[0 .. 2 * units.len]);
-            var w: Dwarf.ChunkWriter = .{ .c = c, .info = pieces[2 * units.len ..][0..units.len], .ranges = pieces[3 * units.len ..], .aranges = &.{}, .line = out[0], .text_addr = l.section_addrs[@backingInt(Atom.Section.text)] };
+            @memcpy(pieces[3 * n_u ..], pieces[0 .. 3 * n_u]);
+            var w: Dwarf.ChunkWriter = .{ .c = c, .info = pieces[3 * n_u ..][0..n_u], .ranges = pieces[4 * n_u ..][0..n_u], .line = pieces[5 * n_u ..][0..n_u], .aranges = &.{}, .text_addr = l.section_addrs[@backingInt(Atom.Section.text)] };
             // A local copy: writes to `out` could alias `l`.
             const input = l.input;
             var fde = c.frame_base;
@@ -1161,17 +1162,17 @@ fn LinkOf(comptime Input: type) type {
                     const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
                     const fn_addr: i64 = @intCast(addr);
                     const k = fde - c.frame_base;
-                    Dwarf.writeFde(out[1][@as(usize, k) * Dwarf.fde_size ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
-                    const entry = out[2][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
+                    Dwarf.writeFde(out[0][@as(usize, k) * Dwarf.fde_size ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
+                    const entry = out[1][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
                     std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
                     std.mem.writeInt(i32, entry[4..8], @intCast(fde_addr - hdr_addr), .little);
                     fde += 1;
                 }
             }
             w.finish();
-            l.writeParts(task, begin, 3, offsets, out);
-            if (l.target == .file) for (units, info, ranges) |p, i, r| {
-                l.writeParts(task, begin, 2, .{ l.info_off + p.info_off, l.ranges_off + p.ranges_off }, .{ i, r });
+            l.writeParts(task, begin, 2, offsets, out);
+            if (l.target == .file) for (units, info, ranges, line) |u, i, r, ln| {
+                l.writeParts(task, begin, 3, .{ l.info_off + u.info_off, l.ranges_off + u.ranges_off, l.line_off + u.line_off }, .{ i, r, ln });
             };
         }
 
@@ -1180,6 +1181,7 @@ fn LinkOf(comptime Input: type) type {
             switch (section) {
                 .info => try l.put(l.info_off + offset, bytes),
                 .ranges => try l.put(l.ranges_off + offset, bytes),
+                .line => try l.put(l.line_off + offset, bytes),
                 .aranges => {},
             }
         }
@@ -1930,8 +1932,9 @@ test "links many chunks of atoms the same way on any number of threads" {
     var debug: std.ArrayList(Atom.Debug) = .empty;
     var expected: u32 = 0;
     const files = [_][]const u8{ "a.zig", "dir/b.zig", "/abs/c.zig", "dir/d.zig" };
-    // "" is the unit of the first file.
-    const units = [_][]const u8{ "root.zig", "std.zig", "" };
+    // Units are named after their root files; "" is the unit of the
+    // first file.
+    const units = [_][]const u8{ "src/root.zig", "/zig/lib/std/std.zig", "" };
     for (0..n) |i| {
         var e: Encoder = .init(arena);
         try e.line(0, 0);
@@ -2006,7 +2009,7 @@ test "links many chunks of atoms the same way on any number of threads" {
         const loc = try testSymbolize(di, arena, addr + 7);
         try std.testing.expectEqualStrings(name, loc.name);
         const unit = units[index / 300 % units.len];
-        try std.testing.expectEqualStrings(if (unit.len > 0) unit else files[0], loc.unit);
+        try std.testing.expectEqualStrings(if (unit.len > 0) std.fs.path.basenamePosix(unit) else files[0], loc.unit);
         try std.testing.expectEqual(index + 2, loc.line);
         try std.testing.expectEqual(5, loc.column);
         const file = files[index / 1000 % files.len];
@@ -2099,11 +2102,12 @@ test "line programs decode with std.debug.Dwarf" {
 
     try std.testing.expectError(error.InvalidDebugInfo, emit(gpa, io, &atoms, .{ .entry = key, .debug = &.{ debug[1], debug[0] } }));
 
-    // Units and inline calls. `main` (unit main.zig) inlines `callMain`
-    // from start.zig at offsets 8..40, which inlines `inner` from mem.zig
-    // at 16..24; `g` is in unit std.zig, and `k` in main.zig again. As
-    // upstream's traces print them, an address takes the name of its
-    // innermost inline call and the line of the inlined code.
+    // Units and inline calls. `main` (unit src/main.zig) inlines
+    // `callMain` from start.zig at offsets 8..40, which inlines `inner`
+    // from mem.zig at 16..24; `g` is in unit /zig/std/std.zig, and `k` in
+    // src/main.zig again. As upstream's traces print them, an address
+    // takes the name of its innermost inline call and the line of the
+    // inlined code.
     var mp: Atom.LineProgram = .{};
     try mp.addRow(arena, 0, 0, 0); // main.zig:11:1
     try mp.addRow(arena, 4, 2, 4); // main.zig:13:5
@@ -2128,9 +2132,9 @@ test "line programs decode with std.debug.Dwarf" {
         .{ .key = .fromName("k"), .name = "k", .section = .text, .bytes = &.{0xc3} },
     };
     const debug2 = [_]Atom.Debug{
-        .{ .atom = 1, .file = "src/main.zig", .name = "main", .base_line = 10, .lines = mp.bytes.items, .frame = .frame_pointer, .unit = "main.zig", .files = &.{ "/zig/std/start.zig", "/zig/std/mem.zig" }, .inlines = &inlines, .patches = mp.patches.items },
-        .{ .atom = 2, .file = "/zig/std/start.zig", .name = "g", .base_line = 0, .lines = &.{}, .frame = .none, .unit = "std.zig" },
-        .{ .atom = 3, .file = "src/main.zig", .name = "k", .base_line = 30, .lines = &.{}, .frame = .none, .unit = "main.zig" },
+        .{ .atom = 1, .file = "src/main.zig", .name = "main", .base_line = 10, .lines = mp.bytes.items, .frame = .frame_pointer, .unit = "src/main.zig", .files = &.{ "/zig/std/start.zig", "/zig/std/mem.zig" }, .inlines = &inlines, .patches = mp.patches.items },
+        .{ .atom = 2, .file = "/zig/std/start.zig", .name = "g", .base_line = 0, .lines = &.{Atom.LineProgram.opcode_base - Atom.LineProgram.line_base}, .frame = .none, .unit = "/zig/std/std.zig" },
+        .{ .atom = 3, .file = "src/main.zig", .name = "k", .base_line = 30, .lines = &.{}, .frame = .none, .unit = "src/main.zig" },
     };
     const out2 = try emit(gpa, io, &atoms2, .{ .entry = main_key, .debug = &debug2, .comp_dir = "/work" });
     defer gpa.free(out2);
@@ -2153,8 +2157,20 @@ test "line programs decode with std.debug.Dwarf" {
         try std.testing.expectEqual(e.line, loc.line);
         try std.testing.expectEqual(e.column, loc.column);
     }
-    try std.testing.expectEqualStrings("std.zig", (try testSymbolize(di2, arena, testSymbolAddr(out2, "g").?)).unit);
+    // Each unit is named after its root file, in that file's directory,
+    // with a line program of its own files and functions.
+    const g2 = try testSymbolize(di2, arena, testSymbolAddr(out2, "g").?);
+    try std.testing.expectEqualStrings("std.zig", g2.unit);
+    try std.testing.expectEqualStrings("/zig/std/start.zig", g2.file);
+    try std.testing.expectEqual(1, g2.line);
     try std.testing.expectEqualStrings("main.zig", (try testSymbolize(di2, arena, testSymbolAddr(out2, "k").?)).unit);
+    const cus = try testUnits(arena, out2);
+    try std.testing.expectEqual(2, cus.len);
+    try std.testing.expectEqualStrings("main.zig", cus[0].name);
+    try std.testing.expectEqualStrings("/work/src", cus[0].dir);
+    try std.testing.expectEqualStrings("std.zig", cus[1].name);
+    try std.testing.expectEqualStrings("/zig/std", cus[1].dir);
+    try std.testing.expect(cus[0].stmt_list != cus[1].stmt_list);
     // Code before the first function with debug info is in no unit.
     var no_unit: std.ArrayList(std.debug.Symbol) = .empty;
     try std.testing.expectError(error.MissingDebugInfo, di2.getSymbols(arena, arena, .little, testSymbolAddr(out2, "h").?, false, &no_unit));
@@ -2313,6 +2329,26 @@ fn testSymbolAddr(elf_bytes: []const u8, name: []const u8) ?u64 {
         if (std.mem.eql(u8, std.mem.sliceTo(elf_bytes[strtab.offset + sym.name ..], 0), name)) return sym.value;
     }
     return null;
+}
+
+const TestUnit = struct { name: []const u8, dir: []const u8, stmt_list: u32 };
+
+/// The units' names, directories, and line program offsets, read from
+/// the layout `Dwarf` writes.
+fn testUnits(arena: Allocator, elf_bytes: []const u8) ![]const TestUnit {
+    const info_sh = testSection(elf_bytes, ".debug_info").?;
+    const info = elf_bytes[info_sh.offset..][0..info_sh.size];
+    var units: std.ArrayList(TestUnit) = .empty;
+    var off: usize = 0;
+    while (off < info.len) {
+        const len = std.mem.readInt(u32, info[off..][0..4], .little);
+        const name = std.mem.sliceTo(info[off + 19 ..], 0);
+        const dir = std.mem.sliceTo(info[off + 19 + name.len + 1 ..], 0);
+        const stmt_list = std.mem.readInt(u32, info[off + 19 + name.len + 1 + dir.len + 1 ..][0..4], .little);
+        try units.append(arena, .{ .name = name, .dir = dir, .stmt_list = stmt_list });
+        off += 4 + len;
+    }
+    return units.items;
 }
 
 fn testSymbolize(di: *std.debug.Dwarf, arena: Allocator, addr: u64) !struct { name: []const u8, unit: []const u8, file: []const u8, line: u64, column: u64 } {
