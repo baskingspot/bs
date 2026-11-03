@@ -324,7 +324,7 @@ fn subprogramSize(debug: *const Atom.Debug) u64 {
     // The entries with children each end with a 0.
     len += 1;
     for (debug.inlines, 0..) |inl, k| {
-        len += 1 + inl.name.len + 1 + 8 + 4 + 4 + 4 + 4;
+        len += 1 + inl.name_len + 1 + 8 + 4 + 4 + 4 + 4;
         len += @intFromBool(hasChildren(debug.inlines, k));
     }
     return len;
@@ -344,7 +344,7 @@ const FileMap = struct {
 
     fn get(m: FileMap, local: u32) u32 {
         if (local == 0) return m.file;
-        return m.c.file_map[m.c.files.getIndex(.{ .unit = m.unit, .path = m.debug.files[local - 1] }).?];
+        return m.c.file_map[m.c.files.getIndex(.{ .unit = m.unit, .path = m.debug.localFile(local) }).?];
     }
 };
 
@@ -386,9 +386,9 @@ noinline fn writeInlines(out: []u8, debug: *const Atom.Debug, addr: u64, files: 
         const parent_file, const parent_base = if (inl.parent == none) .{ 0, debug.base_line } else .{ inlines[inl.parent].file, inlines[inl.parent].base_line };
         out[at] = if (hasChildren(inlines, k)) abbrev_inline_parent else abbrev_inline;
         at += 1;
-        @memcpy(out[at..][0..inl.name.len], inl.name);
-        out[at + inl.name.len] = 0;
-        at += inl.name.len + 1;
+        @memcpy(out[at..][0..inl.name_len], debug.inlineName(inl));
+        out[at + inl.name_len] = 0;
+        at += inl.name_len + 1;
         std.mem.writeInt(u64, out[at..][0..8], addr + inl.low, .little);
         std.mem.writeInt(u32, out[at + 8 ..][0..4], inl.high - inl.low, .little);
         std.mem.writeInt(u32, out[at + 12 ..][0..4], files.get(parent_file), .little);
@@ -616,7 +616,12 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
         };
         if (d.inlines.len > 0 or d.patches.len > 0 or d.files.len > 0) {
             if (!valid(d, l.input.atom(atom).bytes.len)) return l.fail(task, atom, error.InvalidDebugInfo, .{ .atom = l.input.atom(atom).name });
-            for (d.files) |f| _ = c.files.getOrPut(l.gpa, .{ .unit = unit, .path = f }) catch return l.fail(task, atom, error.OutOfMemory, .{});
+            var start: usize = 0;
+            while (start < d.files.len) {
+                const path_end = std.mem.indexOfScalarPos(u8, d.files, start, 0).?;
+                _ = c.files.getOrPut(l.gpa, .{ .unit = unit, .path = d.files[start..path_end] }) catch return l.fail(task, atom, error.OutOfMemory, .{});
+                start = path_end + 1;
+            }
         }
         file_of.* = file | unit << file_bits;
         const part = units.part;
@@ -632,8 +637,17 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
 fn valid(d: *const Atom.Debug, size: u64) bool {
     const none = Atom.Debug.Inline.none;
     if (d.inlines.len >= none) return false;
+    // Each path is nonempty and ends with a 0 byte.
+    if (d.files.len > 0 and d.files[d.files.len - 1] != 0) return false;
+    var n_files: usize = 0;
+    for (d.files, 0..) |b, i| {
+        if (b != 0) continue;
+        if (i == 0 or d.files[i - 1] == 0) return false;
+        n_files += 1;
+    }
     for (d.inlines, 0..) |inl, k| {
-        if (inl.file > d.files.len or inl.low > inl.high or inl.high > size) return false;
+        if (inl.file > n_files or inl.low > inl.high or inl.high > size) return false;
+        if (inl.name_off > d.inline_names.len or inl.name_len > d.inline_names.len - inl.name_off) return false;
         // Preorder: the parent is the previous entry or one of its
         // ancestors.
         if (k == 0) {
@@ -651,7 +665,7 @@ fn valid(d: *const Atom.Debug, size: u64) bool {
         prev = p;
         switch (d.lines[p]) {
             DW.LNS.set_file => {
-                if (d.lines.len - p < set_file_len or readPaddedUleb(d.lines[p + 1 ..][0..3]) > d.files.len) return false;
+                if (d.lines.len - p < set_file_len or readPaddedUleb(d.lines[p + 1 ..][0..3]) > n_files) return false;
             },
             DW.LNS.advance_line => {
                 if (d.lines.len - p < 6) return false;

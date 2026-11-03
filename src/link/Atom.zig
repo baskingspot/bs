@@ -232,12 +232,17 @@ pub const Debug = struct {
     /// program of its own. "" is the unit of the first file, named after
     /// its path in `comp_dir`.
     unit: []const u8 = "",
-    /// Other source files `lines` switches to, with `file`'s path rules.
-    /// A local file index is 0 for `file` and k + 1 for `files[k]`.
-    files: []const []const u8 = &.{},
+    /// Other source files `lines` switches to, with `file`'s path rules,
+    /// each followed by a 0 byte. A local file index is 0 for `file` and
+    /// k + 1 for the k-th path (see `localFile`). Like every field here,
+    /// it holds no pointers, so cached records decode in place.
+    files: []const u8 = "",
     /// Calls inlined into the function, in preorder (a call's parent
     /// precedes it, and its first child, if any, follows it at once).
     inlines: []const Inline = &.{},
+    /// The inline calls' names, which `Inline.name_off` and
+    /// `Inline.name_len` slice (see `inlineName`).
+    inline_names: []const u8 = "",
     /// Offsets in `lines` of the opcodes whose operands the linker
     /// rewrites, in order (see `LineProgram.switchTo`):
     /// - `DW_LNS_set_file`, then a ULEB128 padded to 3 bytes holding a
@@ -249,9 +254,10 @@ pub const Debug = struct {
     /// A fragment without patches is copied unchanged.
     patches: []const u32 = &.{},
 
-    pub const Inline = struct {
-        /// The callee's simple name.
-        name: []const u8,
+    pub const Inline = extern struct {
+        /// The callee's simple name, in `inline_names`.
+        name_off: u32,
+        name_len: u32,
         /// The callee's source file, as a local file index.
         file: u32,
         /// Zero-based line of the callee declaration's first line.
@@ -270,6 +276,18 @@ pub const Debug = struct {
 
         pub const none = std.math.maxInt(u32);
     };
+
+    /// The path of local file index `local`, which must be in range.
+    pub fn localFile(d: *const Debug, local: u32) []const u8 {
+        if (local == 0) return d.file;
+        var start: usize = 0;
+        for (1..local) |_| start = std.mem.indexOfScalarPos(u8, d.files, start, 0).? + 1;
+        return d.files[start..std.mem.indexOfScalarPos(u8, d.files, start, 0).?];
+    }
+
+    pub fn inlineName(d: *const Debug, inl: Inline) []const u8 {
+        return d.inline_names[inl.name_off..][0..inl.name_len];
+    }
 
     pub const Frame = enum(u8) {
         /// No unwind info, as for naked functions.

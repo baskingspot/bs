@@ -2120,8 +2120,8 @@ test "line programs decode with std.debug.Dwarf" {
     try mp.switchTo(arena, 0, 0);
     try mp.addRow(arena, 40, 4, 4); // main.zig:15:5
     const inlines = [_]Atom.Debug.Inline{
-        .{ .name = "callMain", .file = 1, .base_line = 700, .call_line = 2, .call_column = 4, .low = 8, .high = 40, .parent = Atom.Debug.Inline.none },
-        .{ .name = "inner", .file = 2, .base_line = 50, .call_line = 88, .call_column = 62, .low = 16, .high = 24, .parent = 0 },
+        .{ .name_off = 0, .name_len = 8, .file = 1, .base_line = 700, .call_line = 2, .call_column = 4, .low = 8, .high = 40, .parent = Atom.Debug.Inline.none },
+        .{ .name_off = 8, .name_len = 5, .file = 2, .base_line = 50, .call_line = 88, .call_column = 62, .low = 16, .high = 24, .parent = 0 },
     };
     const code64: [64]u8 = @splat(0xcc);
     const main_key: SymbolKey = .fromName("main");
@@ -2132,7 +2132,7 @@ test "line programs decode with std.debug.Dwarf" {
         .{ .key = .fromName("k"), .name = "k", .section = .text, .bytes = &.{0xc3} },
     };
     const debug2 = [_]Atom.Debug{
-        .{ .atom = 1, .file = "src/main.zig", .name = "main", .base_line = 10, .lines = mp.bytes.items, .frame = .frame_pointer, .unit = "src/main.zig", .files = &.{ "/zig/std/start.zig", "/zig/std/mem.zig" }, .inlines = &inlines, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "src/main.zig", .name = "main", .base_line = 10, .lines = mp.bytes.items, .frame = .frame_pointer, .unit = "src/main.zig", .files = "/zig/std/start.zig\x00/zig/std/mem.zig\x00", .inlines = &inlines, .inline_names = "callMaininner", .patches = mp.patches.items },
         .{ .atom = 2, .file = "/zig/std/start.zig", .name = "g", .base_line = 0, .lines = &.{Atom.LineProgram.opcode_base - Atom.LineProgram.line_base}, .frame = .none, .unit = "/zig/std/std.zig" },
         .{ .atom = 3, .file = "src/main.zig", .name = "k", .base_line = 30, .lines = &.{}, .frame = .none, .unit = "src/main.zig" },
     };
@@ -2176,10 +2176,13 @@ test "line programs decode with std.debug.Dwarf" {
     try std.testing.expectError(error.MissingDebugInfo, di2.getSymbols(arena, arena, .little, testSymbolAddr(out2, "h").?, false, &no_unit));
     // Malformed inline calls and patches are rejected.
     for ([_]Atom.Debug{
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &.{ inlines[1], inlines[0] }, .patches = mp.patches.items },
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &inlines, .patches = &.{1} },
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files[0..1], .inlines = &inlines, .patches = mp.patches.items },
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = inlines[0..1], .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &.{ inlines[1], inlines[0] }, .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &inlines, .inline_names = debug2[0].inline_names, .patches = &.{1} },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = "/zig/std/start.zig\x00", .inlines = &inlines, .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = inlines[0..1], .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
+        // Paths must end with a 0 byte, and names must be in `inline_names`.
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files[0 .. debug2[0].files.len - 1], .inlines = &inlines, .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &inlines, .inline_names = "callMain", .patches = mp.patches.items },
     }) |bad| try std.testing.expectError(error.InvalidDebugInfo, emit(gpa, io, &atoms2, .{ .entry = main_key, .debug = &.{bad} }));
 
     const stripped = try emit(gpa, io, &atoms, .{ .entry = key });

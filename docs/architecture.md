@@ -228,6 +228,10 @@ the callee's body first. Early cutoff on the set keeps such callers green.
     index of their atom (`Debug.atom`, set by `Emit.addFunction`), so
     layout, which walks every Atom, never loads debug data, and the debug
     passes stream the slice in order without a pointer chase per atom.
+    Its fields are byte, `u32`, or extern-struct slices with no pointers
+    inside (extra file paths are 0-terminated in one byte slice; inline
+    calls name themselves by offset into another), so cached records
+    hand them out in place.
 - The symbol key is 128 bits: a hash of the rendered unit key for
   declarations, or of the contents for anonymous constants. Atoms with equal
   keys are one symbol; the linker keeps one and rejects a key whose atoms
