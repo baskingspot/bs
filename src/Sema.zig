@@ -1478,13 +1478,14 @@ fn resolveBlock(sema: *Sema, parent: *Block, src: Src, child: *Block, merges: *B
         try parent.instructions.appendSlice(gpa, child.instructions.items[0 .. child.instructions.items.len - 1]);
         return results[0];
     }
-    if (results.len == 1 and Type.isComptimeOnly(sema.ip, sema.typeOf(results[0])) and sema.resolveValue(results[0]) != null) {
-        // One exit with a comptime-only value (`if (c) return x else 0`):
-        // the block runs for its control flow, and the value is known.
+    if (results.len == 1 and sema.ir_insts.items(.tag)[@backingInt(merges.brs.items[0])] == .br) if (sema.resolveValue(results[0])) |v| {
+        // As upstream, a single comptime-known result is the block's value
+        // (it may be comptime-only, like `comptime_int`), and the block
+        // itself is void.
         sema.ir_insts.items(.data)[@backingInt(merges.brs.items[0])].br.operand = .void_value;
         try sema.addBlock(parent, merges.block_inst, .void_type, child.instructions.items);
-        return results[0];
-    }
+        return .fromInterned(v);
+    };
     const result_ty = try sema.resolvePeerTypes(parent, src, results);
     try sema.resolveLayout(parent, src, result_ty);
     for (merges.brs.items, results) |br, result| {
