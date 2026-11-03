@@ -267,6 +267,12 @@ pub const ContainerInfo = struct {
     /// Structs only: byte offsets, or bit offsets in the backing integer
     /// for packed structs.
     field_offsets: []const u64 = &.{},
+    /// Structs only: which fields are `comptime` (their value is the
+    /// default, and they take no space). Empty when none is.
+    field_is_comptime: []const bool = &.{},
+    /// Structs only: each field's explicit `align(n)` in bytes, 0 for
+    /// none. Empty when no field has one.
+    field_aligns: []const u64 = &.{},
     /// Enums: the integer tag type. Tagged unions: the enum tag type.
     /// Packed structs and unions: the backing integer type. Otherwise
     /// `.none`.
@@ -281,6 +287,10 @@ pub const ContainerInfo = struct {
     /// Cache for `Type.isComptimeOnly`, which recurses through pointers and
     /// so must stop at self-referential structs.
     comptime_only: enum { unknown, computing, yes, no } = .unknown,
+
+    pub fn fieldIsComptime(info: *const ContainerInfo, i: usize) bool {
+        return info.field_is_comptime.len != 0 and info.field_is_comptime[i];
+    }
 
     pub fn fieldIndex(info: *const ContainerInfo, ip: *const InternPool, name: []const u8) ?u32 {
         for (info.field_names, 0..) |n, i| {

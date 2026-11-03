@@ -1037,7 +1037,8 @@ the result's items:
 - Per unit kind: `nav_val` stores ty, val, `is_const`, `linkage`,
   `alignment` (the explicit `align(n)`, 0 if none);
   `type_layout` stores the `ContainerInfo` fields (names, field types and
-  defaults by reference, offsets, tag type, flags, size, alignment);
+  defaults by reference, offsets, which fields are `comptime`, explicit
+  field alignments, tag type, flags, size, alignment);
   `func` stores its references (its Atoms are in the pack, its IR is
   never stored); `func_ies` stores the error names; `comptime_decl` stores
   its exports.

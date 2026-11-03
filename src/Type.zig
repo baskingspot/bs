@@ -214,8 +214,8 @@ fn comptimeOnly(ip: *const InternPool, ty: Index, hit_cycle: *bool) bool {
             }
             info.comptime_only = .computing;
             var inner_cycle = false;
-            const result = for (info.field_types) |ft| {
-                if (comptimeOnly(ip, ft, &inner_cycle)) break true;
+            const result = for (info.field_types, 0..) |ft, i| {
+                if (!info.fieldIsComptime(i) and comptimeOnly(ip, ft, &inner_cycle)) break true;
             } else false;
             const complete = switch (info.status) {
                 .have_field_types, .layout_wip, .have_layout => true,
@@ -412,6 +412,16 @@ pub fn tupleLayout(ip: *const InternPool, ty: Index, field: ?usize) TupleLayout 
         alignment = @max(alignment, a);
     }
     return .{ .size = std.mem.alignForward(u64, offset, alignment), .alignment = alignment, .field_offset = field_offset };
+}
+
+/// The value of field `i` of struct or tuple `ty` if it is a `comptime`
+/// field, else `.none`.
+pub fn comptimeFieldValue(ip: *const InternPool, ty: Index, i: usize) Index {
+    return switch (ip.indexToKey(ty)) {
+        .tuple_type => |t| t.values[i],
+        .struct_type => if (ip.structInfo(ty).fieldIsComptime(i)) ip.structInfo(ty).field_defaults[i] else .none,
+        else => .none,
+    };
 }
 
 pub fn fieldCount(ip: *const InternPool, ty: Index) usize {

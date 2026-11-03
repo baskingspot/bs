@@ -836,7 +836,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 const off = switch (ip.indexToKey(ty)) {
                     .array_type => |a| i * Type.abiSize(ip, a.child),
                     .vector_type => |v| i * Type.abiSize(ip, v.child),
-                    else => Type.fieldOffset(ip, ty, i),
+                    else => if (Type.comptimeFieldValue(ip, ty, i) != .none) continue else Type.fieldOffset(ip, ty, i),
                 };
                 try cg.copyTo(offsetMem(dst, off), elem);
             }
@@ -1886,7 +1886,7 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
                     for (0..n) |i| {
                         const ft = Type.fieldType(ip, ty, i);
                         if (!Type.hasRuntimeBits(ip, ft)) continue;
-                        if (ip.indexToKey(ty) == .tuple_type and ip.indexToKey(ty).tuple_type.values[i] != .none) continue;
+                        if (Type.comptimeFieldValue(ip, ty, i) != .none) continue;
                         const el = switch (a.storage) {
                             .elems => |elems| elems[i],
                             .repeated_elem => |el| el,

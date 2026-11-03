@@ -61,6 +61,9 @@ const_allocs: std.AutoHashMapUnmanaged(Ir.Inst.Index, ConstAlloc) = .empty,
 /// Field indices of the bit pointers (`bitcast`s) into packed fields of
 /// `const_allocs`. Arena-allocated.
 packed_field_ptrs: std.AutoHashMapUnmanaged(Ir.Inst.Index, u32) = .empty,
+/// Mutable pointers to comptime fields' values, which stores may only
+/// check. Arena-allocated.
+comptime_field_ptrs: std.AutoHashMapUnmanaged(Index, void) = .empty,
 /// The errors `func` returns so far, for its inferred error set; published
 /// to `Zcu.inferred_errors` when its analysis ends. Arena-allocated.
 ies_names: std.ArrayList(InternPool.String) = .empty,
@@ -102,6 +105,8 @@ const ComptimeAlloc = struct {
     ty: Index,
     val: Index,
     is_const: bool,
+    /// An explicit `align(n)` of an inferred-type variable, or 0.
+    alignment: u64 = 0,
 };
 
 const InferredAlloc = struct {
@@ -381,11 +386,19 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     const offsets = try ip.arena(Zcu.tid).alloc(u64, n);
     const aligns = try sema.arena.alloc(u64, n);
     @memset(aligns, 0);
+    var is_comptime: []bool = &.{};
     var it = decl.iterateFields();
     while (it.next()) |field| {
         const i = field.idx;
         names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
-        if (field.is_comptime) return sema.fail(&block, block.nodeSrc(.zero), "zap does not support comptime fields yet", .{});
+        if (field.is_comptime) {
+            if (decl.layout != .auto) return sema.fail(&block, block.nodeSrc(.zero), "{t} struct fields cannot be marked comptime", .{decl.layout});
+            if (is_comptime.len == 0) {
+                is_comptime = try ip.arena(Zcu.tid).alloc(bool, n);
+                @memset(is_comptime, false);
+            }
+            is_comptime[i] = true;
+        }
         if (field.align_body) |body| {
             if (decl.layout == .@"packed") return sema.fail(&block, block.nodeSrc(.zero), "unable to override alignment of packed struct fields", .{});
             const a_ref = try sema.coerce(&block, .u32_type, try sema.resolveInlineBody(&block, body, key.zir_inst), block.nodeSrc(.zero));
@@ -399,6 +412,7 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     }
     info.field_names = names;
     info.field_types = types;
+    info.field_is_comptime = is_comptime;
     info.status = .have_field_types;
 
 
@@ -407,6 +421,10 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     else
         .none;
     try sema.structLayout(&block, info, decl.layout, explicit_backing, offsets, aligns);
+    for (aligns) |a| if (a != 0) {
+        info.field_aligns = try ip.arena(Zcu.tid).dupe(u64, aligns);
+        break;
+    };
 
     // Defaults may refer to the struct itself (for example its size), so
     // they are evaluated after the layout. Until then every field reads as
@@ -422,6 +440,8 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
         const coerced = try sema.coerce(&block, types[field.idx], ref, block.nodeSrc(.zero));
         defaults[field.idx] = try sema.resolveConstValue(&block, block.nodeSrc(.zero), coerced, "struct field default value must be comptime-known");
     }
+    if (is_comptime.len != 0) for (is_comptime, defaults) |c, d| if (c and d == .none)
+        return sema.fail(&block, block.nodeSrc(.zero), "comptime field without default initialization value", .{});
     info.field_defaults = defaults;
     try sema.finish();
 }
@@ -488,6 +508,10 @@ fn structLayout(sema: *Sema, block: *Block, info: *InternPool.ContainerInfo, lay
         var offset: u64 = 0;
         var alignment: u64 = 1;
         for (types, 0..) |ft, i| {
+            if (info.fieldIsComptime(i)) {
+                offsets[i] = 0;
+                continue;
+            }
             try sema.resolveLayout(block, block.nodeSrc(.zero), ft);
             if (!Type.hasRuntimeBits(ip, ft)) {
                 // A zero-bit field with an explicit alignment still aligns
@@ -2575,16 +2599,30 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             if (!small.has_type) {
                 const ref = try sema.allocInferred(block, small.is_const, small.is_comptime);
                 if (alignment != 0) {
-                    const ia = sema.inferred_allocs.getPtr(ref.toIndex() orelse return sema.failUnsupported(block, src, "aligned comptime variables")).?;
-                    ia.alignment = alignment;
+                    if (ref.toIndex()) |i| {
+                        sema.inferred_allocs.getPtr(i).?.alignment = alignment;
+                    } else {
+                        const id = sema.ip.indexToKey(sema.resolveValue(ref).?).ptr.base.comptime_alloc;
+                        sema.comptime_allocs.getPtr(id).?.alignment = alignment;
+                    }
                 }
                 break :blk ref;
             }
             const ty = try sema.resolveType(block, src, @fromBackingInt(sema.code.extra[extra.end]));
             const ptr = try sema.analyzeAlloc(block, src, ty, small.is_const, small.is_comptime);
             if (alignment != 0) {
-                const alloc_inst = ptr.toIndex() orelse return sema.failUnsupported(block, src, "aligned comptime variables");
-                sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = try sema.allocPtrType(ty, alignment) };
+                try sema.resolveLayout(block, src, ty);
+                const ptr_ty = try sema.allocPtrType(ty, alignment);
+                const alloc_inst = ptr.toIndex() orelse {
+                    // A comptime variable: the same allocation, through the
+                    // aligned pointer type.
+                    var k = sema.ip.indexToKey(sema.resolveValue(ptr).?).ptr;
+                    var info = Type.ptrInfo(sema.ip, ptr_ty);
+                    info.flags.is_const = Type.ptrInfo(sema.ip, k.ty).flags.is_const;
+                    k.ty = try sema.ptrType(info);
+                    break :blk .fromInterned(try sema.intern(.{ .ptr = k }));
+                };
+                sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = ptr_ty };
             }
             break :blk ptr;
         },
@@ -3052,6 +3090,7 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 } else {
                     names[i] = ip.structInfo(ty).field_names[i];
                     default = ip.structInfo(ty).field_defaults[i];
+                    is_comptime = ip.structInfo(ty).fieldIsComptime(i);
                 }
                 attrs[i] = try sema.structValue(block, src, attrs_ty, &[_]S{
                     .{ "comptime", boolValue(is_comptime) },
@@ -3578,6 +3617,7 @@ fn bitOffsetOf(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.Bin) Compil
     switch (ip.indexToKey(ty)) {
         .struct_type => {
             const i = try sema.structFieldIndex(block, src, ty, name);
+            if (ip.structInfo(ty).fieldIsComptime(i)) return sema.fail(block, src, "no offset available for comptime field", .{});
             if (Type.isPacked(ip, ty)) return Type.packedFieldBitOffset(ip, ty, i);
             return Type.fieldOffset(ip, ty, i) * 8;
         },
@@ -6556,7 +6596,10 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
         const id = sema.ip.indexToKey(pv).ptr.base.comptime_alloc;
         const alloc = sema.comptime_allocs.getPtr(id).?;
         if (alloc.ty == .none) return sema.fail(block, src, "unable to infer variable type", .{});
-        const ptr_ty = try sema.ptrType(.{ .child = alloc.ty, .flags = .{ .is_const = alloc.is_const } });
+        if (alloc.alignment != 0) try sema.resolveLayout(block, src, alloc.ty);
+        var info = Type.ptrInfo(sema.ip, try sema.allocPtrType(alloc.ty, alloc.alignment));
+        info.flags.is_const = alloc.is_const;
+        const ptr_ty = try sema.ptrType(info);
         return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .comptime_alloc = id } } }));
     }
     const alloc_inst = ptr.toIndex().?;
@@ -6608,6 +6651,12 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     if (info.flags.is_const) return sema.fail(block, src, "cannot assign to constant", .{});
     const operand = try sema.coerce(block, info.child, uncasted, src);
     if (sema.resolveValue(ptr)) |pv| {
+        if (sema.comptime_field_ptrs.contains(pv)) {
+            const uav = sema.ip.indexToKey(pv).ptr.base.uav;
+            if (sema.resolveValue(operand) != uav.val)
+                return sema.fail(block, src, "value stored in comptime field does not match the default value of the field", .{});
+            return;
+        }
         if (try sema.comptimePtrRoot(pv) == .comptime_alloc) {
             const val = try sema.resolveConstValue(block, src, operand, "value stored to a comptime variable must be comptime-known");
             return sema.comptimeStore(block, src, pv, val);
@@ -7260,6 +7309,8 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                 return .fromInterned(try sema.intValue(.comptime_int_type, ip.indexToKey(ty).tuple_type.types.len));
             const i = try sema.structFieldIndex(block, src, ty, name);
             if (ip.indexToKey(ty) == .tuple_type) return sema.tupleField(block, lhs, i);
+            try sema.resolveLayout(block, src, ty);
+            if (ip.structInfo(ty).fieldIsComptime(i)) return .fromInterned(ip.structInfo(ty).field_defaults[i]);
             if (sema.resolveValue(lhs)) |v| return .fromInterned(try sema.fieldValue(v, i));
             try sema.requireRuntime(block, src);
             if (Type.isPackedStruct(ip, ty)) {
@@ -7349,9 +7400,9 @@ fn fieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) Co
         .type => return sema.fieldPtr(block, src, try sema.analyzeLoad(block, src, ptr), name),
         .@"struct", .tuple => {
             const i = try sema.structFieldIndex(block, src, child, name);
-            if (ip.indexToKey(child) == .tuple_type and ip.indexToKey(child).tuple_type.values[i] != .none) {
-                return sema.analyzeRef(block, src, .fromInterned(ip.indexToKey(child).tuple_type.values[i]));
-            }
+            if (ip.indexToKey(child) == .struct_type) try sema.resolveLayout(block, src, child);
+            const cv = Type.comptimeFieldValue(ip, child, i);
+            if (cv != .none) return sema.comptimeFieldPtr(p.flags.is_const, cv);
             return sema.fieldPtrAt(block, src, ptr, Type.fieldType(ip, child, i), i);
         },
         .array => if (std.mem.eql(u8, name, "len")) {
@@ -7672,6 +7723,60 @@ fn bitSize(ip: *InternPool, ty: Index) u64 {
     return if (Type.hasRuntimeBits(ip, ty)) Type.abiSize(ip, ty) * 8 else 0;
 }
 
+/// The alignment flag of a pointer to field `i` of `aggregate_ty`
+/// through a pointer whose alignment flag is `ptr_align`, as upstream's
+/// `Type.fieldPtrAlign`: an underaligned aggregate passes its alignment
+/// on, an extern struct's fields are aligned by their offsets, and an
+/// explicit field alignment shows.
+fn fieldPtrAlignment(sema: *Sema, block: *Block, src: Src, ptr_align: u6, aggregate_ty: Index, i: u32) CompileError!u6 {
+    const ip = sema.ip;
+    const flag = struct {
+        fn f(bytes: u64) u6 {
+            return @intCast(std.math.log2_int(u64, bytes) + 1);
+        }
+    }.f;
+    switch (ip.indexToKey(aggregate_ty)) {
+        .struct_type, .union_type, .tuple_type => try sema.resolveLayout(block, src, aggregate_ty),
+        else => return 0,
+    }
+    const aggregate_align: u64 = if (ptr_align != 0) @as(u64, 1) << (ptr_align - 1) else Type.abiAlignment(ip, aggregate_ty);
+    const field_ty = Type.fieldType(ip, aggregate_ty, i);
+    try sema.resolveLayout(block, src, field_ty);
+    var explicit: u64 = 0;
+    switch (ip.indexToKey(aggregate_ty)) {
+        .struct_type => {
+            const info = ip.structInfo(aggregate_ty);
+            if (info.field_aligns.len != 0) explicit = info.field_aligns[i];
+            if (info.layout == .@"extern") {
+                const offset = info.field_offsets[i];
+                const field_align = if (offset == 0) aggregate_align else @min(aggregate_align, @as(u64, 1) << @intCast(@ctz(offset)));
+                if (ptr_align == 0 and explicit == 0 and field_align == Type.abiAlignment(ip, field_ty)) return 0;
+                return flag(field_align);
+            }
+            if (info.fieldIsComptime(i)) return if (explicit != 0) flag(explicit) else 0;
+        },
+        .union_type => if (ip.structInfo(aggregate_ty).layout != .auto) {
+            if (ptr_align != 0) return ptr_align;
+            return if (Type.abiAlignment(ip, field_ty) == aggregate_align) 0 else flag(aggregate_align);
+        },
+        else => {},
+    }
+    const field_align = if (explicit != 0) explicit else Type.abiAlignment(ip, field_ty);
+    if (aggregate_align < field_align) return flag(aggregate_align);
+    if (explicit == 0) return 0;
+    return if (field_align == Type.abiAlignment(ip, field_ty)) 0 else flag(field_align);
+}
+
+/// A pointer to a comptime field's value `val`, through a pointer to its
+/// aggregate that is const or not. Stores through a mutable one must store
+/// the same value (see `analyzeStore`).
+fn comptimeFieldPtr(sema: *Sema, is_const: bool, val: Index) CompileError!Ref {
+    const ptr_ty = try sema.ptrType(.{ .child = sema.ip.typeOf(val), .flags = .{ .is_const = is_const } });
+    const ptr = try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = val, .orig_ty = ptr_ty } } } });
+    if (!is_const) try sema.comptime_field_ptrs.put(sema.arena, ptr, {});
+    return .fromInterned(ptr);
+}
+
 fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i: u32) CompileError!Ref {
     const ip = sema.ip;
     const p = Type.ptrInfo(ip, sema.typeOf(ptr));
@@ -7715,7 +7820,11 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
         try sema.requireRuntime(block, src);
         return sema.packedFieldPtr(block, ptr, result_ty, i);
     }
-    const result_ty = try sema.ptrType(.{ .child = field_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
+    const result_ty = try sema.ptrType(.{ .child = field_ty, .flags = .{
+        .is_const = p.flags.is_const,
+        .is_volatile = p.flags.is_volatile,
+        .alignment = try sema.fieldPtrAlignment(block, src, p.flags.alignment, p.child, i),
+    } });
     if (sema.resolveValue(ptr)) |pv| {
         if (try sema.comptimePtrRoot(pv) != .int) {
             return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = i } } } }));
@@ -9136,6 +9245,11 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
     for (items) |item| {
         const idx = try sema.structFieldIndex(block, src, ty, item.name);
         elems[idx] = try sema.coerce(block, info.field_types[idx], item.init, src);
+        if (info.fieldIsComptime(idx)) {
+            try sema.resolveLayout(block, src, ty);
+            if (sema.resolveValue(elems[idx]) != info.field_defaults[idx])
+                return sema.fail(block, src, "value stored in comptime field does not match the default value of the field", .{});
+        }
     }
     for (elems, 0..) |*e, k| {
         if (e.* != .none) continue;
