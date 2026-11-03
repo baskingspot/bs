@@ -57,6 +57,10 @@ comptime_bodies: std.AutoHashMapUnmanaged(InternPool.Hash, ComptimeBody) = .empt
 /// Comptime loops the evaluator does not take over from the walker (see
 /// `Sema.bcOsr`), by file and the first instruction of the loop body.
 comptime_osr_off: std.AutoHashMapUnmanaged(OsrLoop, void) = .empty,
+/// Whether an aggregate value refers to a comptime allocation, cached for
+/// `Sema.refersToComptimeAlloc`: comptime calls check every argument, and
+/// large tables are passed again and again. A pure function of the value.
+comptime_alloc_refs: std.AutoHashMapUnmanaged(InternPool.Index, bool) = .empty,
 /// Walker runs of a function before it is lowered for the comptime
 /// evaluator; 0 turns the evaluator off (`ZAP_COMPTIME_EVAL`).
 comptime_eval_threshold: u32 = 4,
@@ -313,6 +317,7 @@ pub fn deinit(zcu: *Zcu) void {
         .cold => {},
     };
     zcu.comptime_bodies.deinit(gpa);
+    zcu.comptime_alloc_refs.deinit(gpa);
     zcu.comptime_osr_off.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
     zcu.anyerror_ies.deinit(gpa);

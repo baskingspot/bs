@@ -14255,9 +14255,15 @@ fn refersToComptimeAlloc(sema: *Sema, val: Index) bool {
         },
         .slice => sema.refersToComptimeAlloc(ip.keyPayload(.slice, val).ptr),
         .aggregate => switch (ip.keyPayload(.aggregate, val).storage) {
-            .elems => |elems| for (elems) |e| {
-                if (sema.refersToComptimeAlloc(e)) break true;
-            } else false,
+            .elems => |elems| {
+                if (sema.zcu.comptime_alloc_refs.get(val)) |r| return r;
+                const r = for (elems) |e| {
+                    if (sema.refersToComptimeAlloc(e)) break true;
+                } else false;
+                // Out of memory only costs the cache.
+                sema.zcu.comptime_alloc_refs.put(sema.gpa, val, r) catch {};
+                return r;
+            },
             .repeated_elem => |e| sema.refersToComptimeAlloc(e),
             .bytes => false,
         },
