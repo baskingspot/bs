@@ -70,71 +70,91 @@ manifest with the reason.
 
 ## Scoreboard
 
-2026-11-03, branch `corpus` on main 804a68a, both compilers on a 4-core
-orb. Every one of the 55 targets compiles with zap, and what it builds
-behaves the same as upstream's build: same exit status, same stdout, and
-the same test summary. ghostty-vt-test fails one test (tinyio's
-realPathFile) under both compilers. "not run" means a target that needs
-the network or a terminal. Times are one sample each: cold-local is an empty
-local cache with a warm global cache; edit is the rebuild after a one-line
-edit. Geometric-mean speedups: 2.0x cold-local over 55 targets (81.3 s vs 38.7 s
-in total) and 6.5x on edit over 28 (61.2 s vs 7.4 s). Single samples sometimes
-spike by 0.5–1.3 s: zls's 1.67 s edit build takes 0.36–0.42 s when rerun.
+2026-11-03, zap at branch `corpus2` on main b90d615 (main plus batch 2's
+fixes; std compiles in the same time as main's), upstream zig 0.17.0, on a
+4-core orb. All 72 targets of 29 projects compile with zap, and what they
+build behaves as upstream's build does: same exit status, same stdout,
+same test summary. Some tests fail under both compilers: ghostty-vt-test
+(tinyio's realPathFile), zbor (an ECDSA vector) and zig-hpke (an ML-KEM
+vector). "not run" marks a target that needs the network or a terminal.
+Times are one sample each: cold-local is an empty local cache with a warm
+global cache; edit is the rebuild after a one-line edit. Geometric-mean
+speedups: 2.0x cold-local over 72 targets (103.2 s vs 51.0 s in total)
+and 32.6x on edit builds over 39 (80.0 s vs 1.7 s). Single samples
+sometimes spike by 0.5–1.3 s: linuxwave's 1.57 s takes 0.23–0.25 s when
+rerun.
 
 | Project | Target | Verdict | upstream run | zap run | cold-local zig / zap | edit zig / zap |
 |---|---|---|---|---|---:|---:|
-| zls | zls | ok | exit 0 | exit 0 | 2.71 s / 1.31 s (2.1x) | 2.68 s / 1.67 s (1.6x) |
-| zls | lsp-codegen | ok | exit 0 | exit 0 | 826 ms / 396 ms (2.1x) | 839 ms / 124 ms (6.8x) |
-| zls | test | ok | exit 0, 487 passed; 11 skipped; 0 failed. | exit 0, 487 passed; 11 skipped; 0 failed. | 2.38 s / 1.30 s (1.8x) | 2.61 s / 342 ms (7.6x) |
-| zls | src test | ok | exit 0, All 94 tests passed. | exit 0, All 94 tests passed. | 1.20 s / 557 ms (2.2x) | 1.19 s / 163 ms (7.3x) |
-| ghostty | ghostty-vt-test | ok | exit 1, 3004 passed; 102 skipped; 1 failed. | exit 1, 3004 passed; 102 skipped; 1 failed. | 26.96 s / 10.87 s (2.5x) | 25.09 s / 907 ms (27.6x) |
-| ghostty | props-unigen | ok | exit 0 | exit 0 | 848 ms / 385 ms (2.2x) | 809 ms / 95 ms (8.5x) |
-| ghostty | symbols-unigen | ok | exit 0 | exit 0 | 928 ms / 385 ms (2.4x) | 745 ms / 104 ms (7.2x) |
-| ghostty | uucode_generate | ok | exit 0 | exit 0 | 899 ms / 449 ms (2.0x) | 843 ms / 155 ms (5.4x) |
-| superhtml | superhtml | ok | exit 1 | exit 1 | 2.89 s / 1.38 s (2.1x) | 3.01 s / 397 ms (7.6x) |
-| superhtml | test | ok | exit 0, All 85 tests passed. | exit 0, All 85 tests passed. | 2.68 s / 1.28 s (2.1x) | 2.85 s / 387 ms (7.4x) |
-| superhtml | language-tag-parser | ok | not run | not run | 585 ms / 251 ms (2.3x) | 519 ms / 95 ms (5.5x) |
-| ziggy | ziggy | ok | exit 1 | exit 1 | 1.37 s / 687 ms (2.0x) | 1.35 s / 276 ms (4.9x) |
-| ziggy | test | ok | exit 0, All 99 tests passed. | exit 0, All 99 tests passed. | 877 ms / 451 ms (1.9x) | 927 ms / 165 ms (5.6x) |
-| z2d | test | ok | exit 0, All 199 tests passed. | exit 0, All 199 tests passed. | 1.40 s / 679 ms (2.1x) | 1.55 s / 182 ms (8.5x) |
-| zf | zf | ok | exit 0 | exit 0 | 1.26 s / 529 ms (2.4x) | 1.16 s / 142 ms (8.2x) |
-| zf | test | ok | exit 0, All 10 tests passed. | exit 0, All 10 tests passed. | 517 ms / 243 ms (2.1x) | 527 ms / 101 ms (5.2x) |
-| zig-clap | test | ok | exit 0, All 27 tests passed. | exit 0, All 27 tests passed. | 612 ms / 370 ms (1.7x) | 611 ms / 110 ms (5.6x) |
-| zig-clap | simple | ok | exit 0 | exit 0 | 496 ms / 216 ms (2.3x) | 541 ms / 94 ms (5.8x) |
-| zig-clap | subcommands | ok | exit 1 | exit 1 | 492 ms / 219 ms (2.2x) | 501 ms / 87 ms (5.8x) |
-| zig-clap | usage | ok | exit 0 | exit 0 | 483 ms / 213 ms (2.3x) | 477 ms / 92 ms (5.2x) |
-| anyzig | zig | ok | not run | not run | 2.94 s / 1.57 s (1.9x) | 3.12 s / 398 ms (7.8x) |
-| anyzig | test | ok | not run | not run | 670 ms / 353 ms (1.9x) | – / – |
-| zine | translate-c | ok | exit 0 | exit 0 | 2.80 s / 1.50 s (1.9x) | 2.91 s / 491 ms (5.9x) |
-| zine | camera | ok | not run | not run | 440 ms / 255 ms (1.7x) | 446 ms / 113 ms (4.0x) |
-| zig-protobuf | protoc-gen-zig | ok | not run | not run | 1.01 s / 494 ms (2.0x) | – / – |
-| zig-protobuf | tests | ok | exit 0, All 5 tests passed. | exit 0, All 5 tests passed. | 746 ms / 371 ms (2.0x) | 717 ms / 141 ms (5.1x) |
-| zig-protobuf | protobuf | ok | exit 0, All 26 tests passed. | exit 0, All 26 tests passed. | 646 ms / 522 ms (1.2x) | – / – |
-| zig-protobuf | json | ok | exit 0, All 153 tests passed. | exit 0, All 153 tests passed. | 1.42 s / 829 ms (1.7x) | 1.23 s / 162 ms (7.6x) |
-| zig-protobuf | alltypes | ok | exit 0, All 10 tests passed. | exit 0, All 10 tests passed. | 1.33 s / 598 ms (2.2x) | – / – |
-| zig-protobuf | varints | ok | exit 0, All 36 tests passed. | exit 0, All 36 tests passed. | 639 ms / 308 ms (2.1x) | – / – |
-| vulkan-zig | vulkan-zig-generator | ok | exit 0 | exit 0 | 769 ms / 419 ms (1.8x) | 804 ms / 124 ms (6.5x) |
-| vulkan-zig | test | ok | exit 0, All 11 tests passed. | exit 0, All 11 tests passed. | 544 ms / 248 ms (2.2x) | – / – |
-| tls.zig | test | ok | exit 0, 88 passed; 1 skipped; 0 failed. | exit 0, 88 passed; 1 skipped; 0 failed. | 2.44 s / 1.21 s (2.0x) | 2.45 s / 154 ms (15.9x) |
-| tls.zig | http_get | ok | not run | not run | 1.68 s / 1.03 s (1.6x) | – / – |
-| tls.zig | server | ok | not run | not run | 1.71 s / 933 ms (1.8x) | – / – |
-| zlinter | no_unused_unit_test_coverage | ok | exit 0, All 6 tests passed. | exit 0, All 6 tests passed. | 745 ms / 418 ms (1.8x) | – / – |
-| zlinter | require_fmt_unit_test_coverage | ok | exit 0, All 7 tests passed. | exit 0, All 7 tests passed. | 798 ms / 394 ms (2.0x) | – / – |
-| zlinter | build_lint_builtin | ok | not run | not run | 511 ms / 212 ms (2.4x) | – / – |
-| zig-ecs | test | ok | exit 0, All 52 tests passed. | exit 0, All 52 tests passed. | 635 ms / 335 ms (1.9x) | 704 ms / 129 ms (5.5x) |
-| zig-minisign | minizign | ok | exit 1 | exit 1 | 631 ms / 347 ms (1.8x) | – / – |
-| zig-minisign | test | ok | exit 0, All 15 tests passed. | exit 0, All 15 tests passed. | 599 ms / 381 ms (1.6x) | – / – |
-| zalgebra | test | ok | exit 0, All 70 tests passed. | exit 0, All 70 tests passed. | 558 ms / 471 ms (1.2x) | – / – |
-| zig-args | test | ok | exit 0, All 15 tests passed. | exit 0, All 15 tests passed. | 589 ms / 307 ms (1.9x) | – / – |
-| zig-args | demo | ok | exit 0 | exit 0 | 506 ms / 262 ms (1.9x) | – / – |
-| zig-args | demo_verb | ok | exit 1 | exit 1 | 483 ms / 210 ms (2.3x) | – / – |
-| zBench | runner | ok | exit 0, All 3 tests passed. | exit 0, All 3 tests passed. | 479 ms / 218 ms (2.2x) | – / – |
-| zBench | statistics | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 483 ms / 212 ms (2.3x) | – / – |
-| zBench | platform | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 546 ms / 210 ms (2.6x) | – / – |
-| zBench | partial | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 472 ms / 233 ms (2.0x) | – / – |
-| linuxwave | linuxwave | ok | exit 0 | exit 0 | 518 ms / 247 ms (2.1x) | – / – |
-| linuxwave | wav-tests | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 507 ms / 423 ms (1.2x) | – / – |
-| linuxwave | gen-tests | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 483 ms / 240 ms (2.0x) | – / – |
-| linuxwave | file-tests | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 484 ms / 220 ms (2.2x) | – / – |
-| linuxwave | main-tests | ok | exit 0, All 4 tests passed. | exit 0, All 4 tests passed. | 540 ms / 315 ms (1.7x) | – / – |
-| zli | test | ok | exit 0, All 32 tests passed. | exit 0, All 32 tests passed. | 542 ms / 265 ms (2.0x) | – / – |
+| zls | zls | ok | exit 0 | exit 0 | 2.93 s / 1.39 s (2.1x) | 2.84 s / 68 ms (41.5x) |
+| zls | lsp-codegen | ok | exit 0 | exit 0 | 889 ms / 422 ms (2.1x) | 1.05 s / 37 ms (28.6x) |
+| zls | test | ok | exit 0, 487 passed; 11 skipped; 0 failed. | exit 0, 487 passed; 11 skipped; 0 failed. | 2.63 s / 1.39 s (1.9x) | 2.75 s / 60 ms (45.7x) |
+| zls | src test | ok | exit 0, All 94 tests passed. | exit 0, All 94 tests passed. | 1.29 s / 612 ms (2.1x) | 1.20 s / 24 ms (50.8x) |
+| ghostty | ghostty-vt-test | ok | exit 1, 3004 passed; 102 skipped; 1 failed. | exit 1, 3004 passed; 102 skipped; 1 failed. | 25.49 s / 10.93 s (2.3x) | 25.95 s / 238 ms (109.2x) |
+| ghostty | props-unigen | ok | exit 0 | exit 0 | 947 ms / 600 ms (1.6x) | 823 ms / 30 ms (27.6x) |
+| ghostty | symbols-unigen | ok | exit 0 | exit 0 | 808 ms / 403 ms (2.0x) | 879 ms / 49 ms (17.8x) |
+| ghostty | uucode_generate | ok | exit 0 | exit 0 | 826 ms / 478 ms (1.7x) | 835 ms / 69 ms (12.1x) |
+| superhtml | superhtml | ok | exit 1 | exit 1 | 2.91 s / 1.41 s (2.1x) | 2.97 s / 37 ms (80.2x) |
+| superhtml | test | ok | exit 0, All 85 tests passed. | exit 0, All 85 tests passed. | 2.67 s / 1.18 s (2.3x) | 2.85 s / 56 ms (50.6x) |
+| superhtml | language-tag-parser | ok | not run | not run | 562 ms / 229 ms (2.5x) | 541 ms / 29 ms (18.9x) |
+| ziggy | ziggy | ok | exit 1 | exit 1 | 1.26 s / 629 ms (2.0x) | 1.28 s / 30 ms (42.8x) |
+| ziggy | test | ok | exit 0, All 99 tests passed. | exit 0, All 99 tests passed. | 828 ms / 379 ms (2.2x) | 881 ms / 74 ms (12.0x) |
+| z2d | test | ok | exit 0, All 199 tests passed. | exit 0, All 199 tests passed. | 1.31 s / 948 ms (1.4x) | 1.36 s / 29 ms (47.4x) |
+| zf | zf | ok | exit 0 | exit 0 | 1.27 s / 482 ms (2.6x) | 1.16 s / 29 ms (39.9x) |
+| zf | test | ok | exit 0, All 10 tests passed. | exit 0, All 10 tests passed. | 519 ms / 235 ms (2.2x) | 493 ms / 29 ms (16.8x) |
+| zig-clap | test | ok | exit 0, All 27 tests passed. | exit 0, All 27 tests passed. | 587 ms / 275 ms (2.1x) | 663 ms / 20 ms (32.3x) |
+| zig-clap | simple | ok | exit 0 | exit 0 | 466 ms / 206 ms (2.3x) | 461 ms / 27 ms (16.9x) |
+| zig-clap | subcommands | ok | exit 1 | exit 1 | 464 ms / 209 ms (2.2x) | 459 ms / 32 ms (14.2x) |
+| zig-clap | usage | ok | exit 0 | exit 0 | 477 ms / 187 ms (2.5x) | 470 ms / 26 ms (17.8x) |
+| anyzig | zig | ok | not run | not run | 3.21 s / 1.50 s (2.1x) | 3.26 s / 49 ms (66.9x) |
+| anyzig | test | ok | not run | not run | 715 ms / 338 ms (2.1x) | – / – |
+| zine | translate-c | ok | exit 0 | exit 0 | 2.74 s / 1.64 s (1.7x) | 2.92 s / 55 ms (53.4x) |
+| zine | camera | ok | not run | not run | 522 ms / 212 ms (2.5x) | 481 ms / 22 ms (21.6x) |
+| zig-protobuf | protoc-gen-zig | ok | not run | not run | 999 ms / 454 ms (2.2x) | – / – |
+| zig-protobuf | tests | ok | exit 0, All 5 tests passed. | exit 0, All 5 tests passed. | 769 ms / 355 ms (2.2x) | 770 ms / 34 ms (22.5x) |
+| zig-protobuf | protobuf | ok | exit 0, All 26 tests passed. | exit 0, All 26 tests passed. | 752 ms / 352 ms (2.1x) | – / – |
+| zig-protobuf | json | ok | exit 0, All 153 tests passed. | exit 0, All 153 tests passed. | 1.20 s / 593 ms (2.0x) | 1.18 s / 26 ms (45.9x) |
+| zig-protobuf | alltypes | ok | exit 0, All 10 tests passed. | exit 0, All 10 tests passed. | 1.33 s / 656 ms (2.0x) | – / – |
+| zig-protobuf | varints | ok | exit 0, All 36 tests passed. | exit 0, All 36 tests passed. | 610 ms / 262 ms (2.3x) | – / – |
+| vulkan-zig | vulkan-zig-generator | ok | exit 0 | exit 0 | 771 ms / 358 ms (2.2x) | 760 ms / 32 ms (23.4x) |
+| vulkan-zig | test | ok | exit 0, All 11 tests passed. | exit 0, All 11 tests passed. | 553 ms / 506 ms (1.1x) | – / – |
+| tls.zig | test | ok | exit 0, 88 passed; 1 skipped; 0 failed. | exit 0, 88 passed; 1 skipped; 0 failed. | 2.34 s / 1.14 s (2.1x) | 2.48 s / 34 ms (72.1x) |
+| tls.zig | http_get | ok | not run | not run | 1.62 s / 822 ms (2.0x) | – / – |
+| tls.zig | server | ok | not run | not run | 1.59 s / 815 ms (1.9x) | – / – |
+| zlinter | no_unused_unit_test_coverage | ok | exit 0, All 6 tests passed. | exit 0, All 6 tests passed. | 756 ms / 356 ms (2.1x) | – / – |
+| zlinter | require_fmt_unit_test_coverage | ok | exit 0, All 7 tests passed. | exit 0, All 7 tests passed. | 773 ms / 347 ms (2.2x) | – / – |
+| zlinter | build_lint_builtin | ok | not run | not run | 449 ms / 186 ms (2.4x) | – / – |
+| zig-ecs | test | ok | exit 0, All 52 tests passed. | exit 0, All 52 tests passed. | 604 ms / 268 ms (2.3x) | 629 ms / 31 ms (20.3x) |
+| zig-minisign | minizign | ok | exit 1 | exit 1 | 608 ms / 271 ms (2.2x) | – / – |
+| zig-minisign | test | ok | exit 0, All 15 tests passed. | exit 0, All 15 tests passed. | 595 ms / 535 ms (1.1x) | – / – |
+| zalgebra | test | ok | exit 0, All 70 tests passed. | exit 0, All 70 tests passed. | 550 ms / 260 ms (2.1x) | – / – |
+| zig-args | test | ok | exit 0, All 15 tests passed. | exit 0, All 15 tests passed. | 592 ms / 265 ms (2.2x) | – / – |
+| zig-args | demo | ok | exit 0 | exit 0 | 483 ms / 204 ms (2.4x) | – / – |
+| zig-args | demo_verb | ok | exit 1 | exit 1 | 500 ms / 205 ms (2.4x) | – / – |
+| zBench | runner | ok | exit 0, All 3 tests passed. | exit 0, All 3 tests passed. | 490 ms / 264 ms (1.9x) | – / – |
+| zBench | statistics | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 515 ms / 256 ms (2.0x) | – / – |
+| zBench | platform | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 477 ms / 218 ms (2.2x) | – / – |
+| zBench | partial | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 487 ms / 202 ms (2.4x) | – / – |
+| linuxwave | linuxwave | ok | exit 0 | exit 0 | 578 ms / 1.57 s (0.4x) | – / – |
+| linuxwave | wav-tests | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 494 ms / 231 ms (2.1x) | – / – |
+| linuxwave | gen-tests | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 528 ms / 266 ms (2.0x) | – / – |
+| linuxwave | file-tests | ok | exit 0, All 1 tests passed. | exit 0, All 1 tests passed. | 528 ms / 211 ms (2.5x) | – / – |
+| linuxwave | main-tests | ok | exit 0, All 4 tests passed. | exit 0, All 4 tests passed. | 563 ms / 248 ms (2.3x) | – / – |
+| zli | test | ok | exit 0, All 32 tests passed. | exit 0, All 32 tests passed. | 605 ms / 271 ms (2.2x) | – / – |
+| zig-compiler | translate-c | ok | exit 0 | exit 0 | 2.71 s / 1.35 s (2.0x) | 2.67 s / 64 ms (41.9x) |
+| zig-compiler | resinator | ok | exit 0 | exit 0 | 2.43 s / 1.18 s (2.1x) | 2.59 s / 48 ms (54.1x) |
+| zig-compiler | resinator-test | ok | exit 0, 73 passed; 1 skipped; 0 failed. | exit 0, 73 passed; 1 skipped; 0 failed. | 1.28 s / 815 ms (1.6x) | – / – |
+| zig-compiler | aro-test | ok | exit 0, All 42 tests passed. | exit 0, All 42 tests passed. | 2.16 s / 1.35 s (1.6x) | 2.22 s / 90 ms (24.6x) |
+| zig-compiler | objcopy | ok | exit 0 | exit 0 | 527 ms / 239 ms (2.2x) | – / – |
+| zig-compiler | objdump | ok | exit 0 | exit 0 | 695 ms / 333 ms (2.1x) | – / – |
+| zig-compiler | reduce | ok | exit 0 | exit 0 | 1.07 s / 515 ms (2.1x) | – / – |
+| zig-compiler | std-docs | ok | exit 0 | exit 0 | 1.01 s / 464 ms (2.2x) | – / – |
+| zigimg | zigimgtest | ok | exit 0, 347 passed; 170 skipped; 0 failed. | exit 0, 347 passed; 170 skipped; 0 failed. | 1.53 s / 677 ms (2.3x) | 1.47 s / 39 ms (37.3x) |
+| zeit | test | ok | exit 0, All 33 tests passed. | exit 0, All 33 tests passed. | 667 ms / 302 ms (2.2x) | 740 ms / 28 ms (26.1x) |
+| zbor | test | ok | exit 1, 97 passed; 0 skipped; 1 failed. | exit 1, 97 passed; 0 skipped; 1 failed. | 1.10 s / 528 ms (2.1x) | 1.12 s / 28 ms (40.7x) |
+| libvaxis | test | ok | exit 0, 203 passed; 3 skipped; 0 failed. | exit 0, 203 passed; 3 skipped; 0 failed. | 1.78 s / 1.04 s (1.7x) | 1.58 s / 39 ms (40.7x) |
+| libvaxis | example-text_input | ok | not run | not run | 1.22 s / 671 ms (1.8x) | – / – |
+| cache.zig | test | ok | exit 0, 20 of 20 tests passed | exit 0, 20 of 20 tests passed | 579 ms / 262 ms (2.2x) | 582 ms / 37 ms (15.9x) |
+| zul | test | ok | exit 0, 86 of 86 tests passed | exit 0, 86 of 86 tests passed | 2.25 s / 1.02 s (2.2x) | 2.29 s / 33 ms (69.4x) |
+| metrics.zig | test | ok | exit 0, 41 of 41 tests passed | exit 0, 41 of 41 tests passed | 721 ms / 353 ms (2.0x) | 725 ms / 38 ms (19.2x) |
+| zig-hpke | test | ok | exit 1, 30 passed; 0 skipped; 1 failed. | exit 1, 30 passed; 0 skipped; 1 failed. | 1.48 s / 685 ms (2.2x) | 1.58 s / 25 ms (62.4x) |
