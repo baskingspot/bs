@@ -440,6 +440,8 @@ fn typeIn(cx: Ctx, ty: InternPool.Index, w: *Writer) Writer.Error!void {
         .struct_type, .enum_type, .union_type, .opaque_type => try typeNameIn(cx, ty, w),
         .tuple_type => |t| {
             if (t.names.len != 0) return typeNameIn(cx, ty, w);
+            // As upstream, the empty tuple is named by its one value.
+            if (t.types.len == 0) return w.writeAll("@TypeOf(.{})");
             try w.writeAll("struct {");
             for (t.types, t.values, 0..) |ft, fv, i| {
                 try w.writeAll(if (i == 0) " " else ", ");
@@ -450,7 +452,7 @@ fn typeIn(cx: Ctx, ty: InternPool.Index, w: *Writer) Writer.Error!void {
                     try valueIn(cx, fv, w, 3);
                 }
             }
-            try w.writeAll(if (t.types.len == 0) "}" else " }");
+            try w.writeAll(" }");
         },
         .func_type => |f| {
             try w.writeAll("fn (");
@@ -561,6 +563,16 @@ fn printAggregate(cx: Ctx, val: InternPool.Index, is_ref: bool, w: *Writer, leve
         return w.writeAll(".{ ... }");
     }
     const agg = cx.ip.keyPayload(.aggregate, val);
+    // Upstream interns an aggregate of only `undefined` elements as
+    // `undefined` (`PerThread.aggregateValue`).
+    const all_undef = switch (agg.storage) {
+        .elems => |elems| elems.len != 0 and for (elems) |e| {
+            if (cx.ip.keyTag(e) != .undef) break false;
+        } else true,
+        .repeated_elem => |e| cx.ip.keyTag(e) == .undef,
+        .bytes => false,
+    };
+    if (all_undef) return w.writeAll("undefined");
     const len: u64 = switch (cx.ip.indexToKey(agg.ty)) {
         .struct_type => {
             const names = cx.ip.structInfo(agg.ty).field_names;

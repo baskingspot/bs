@@ -31,6 +31,6 @@ pub fn main() void {}
 // enum_from_int.zig:14:22: error[lossy-conversion]: enum 'enum_from_int.Empty' has no tag with value '0'
 //   | const e: Empty = @enumFromInt(0);
 //   note enum_from_int.zig:2:15: enum declared here: const Empty = enum {};
-// enum_from_int.zig:19:8: error[no-field]: no field or member function named 'bar' in 'struct {}'
+// enum_from_int.zig:19:8: error[no-field]: no field or member function named 'bar' in '@TypeOf(.{})'
 //   | .{}.bar();
 // 4 errors
