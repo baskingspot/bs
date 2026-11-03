@@ -20,8 +20,11 @@ code: std.ArrayList(u8) = .empty,
 refs: Atom.RelocList = .{},
 /// Offset each label is bound to, or `unbound`.
 labels: std.ArrayList(u32) = .empty,
-/// Branches to a label not yet bound when they were emitted.
+/// Every reference to a label, in code order; `finish` patches them.
 fixups: std.ArrayList(Fixup) = .empty,
+/// After `finish`: the offsets, before relaxation, of the conditional
+/// branches it relaxed, in increasing order (see `finalOffset`).
+relaxed: std.ArrayList(u32) = .empty,
 
 const unbound = std.math.maxInt(u32);
 
@@ -278,30 +281,41 @@ pub const LogicOperand = union(enum) {
 pub const Label = enum(u32) { _ };
 pub const Target = union(enum) { label: Label, sym: SymbolKey };
 
-const Fixup = struct { at: u32, label: Label, field: BranchField };
+/// A reference to `label` from offset `at`. For `word32`, `anchor` is the
+/// label the word is relative to.
+const Fixup = struct { at: u32, label: Label, field: BranchField, anchor: Label = undefined };
 
-/// The offset field of a PC-relative branch: bit width and position, in
-/// instructions (4 bytes).
+/// The PC-relative field a fixup patches.
 const BranchField = enum {
-    /// b, bl: ±128 MiB.
+    /// b, bl: ±128 MiB, in instructions.
     imm26,
-    /// b.cond, cbz, cbnz: ±1 MiB.
+    /// b.cond, cbz, cbnz: ±1 MiB, in instructions. Relaxable.
     imm19,
-    /// tbz, tbnz: ±32 KiB.
+    /// tbz, tbnz: ±32 KiB, in instructions. Relaxable.
     imm14,
+    /// adr: ±1 MiB, in bytes (immhi:immlo).
+    adr21,
+    /// A 32-bit data word: label - anchor, in bytes.
+    word32,
 
     fn bits(f: BranchField) u5 {
         return switch (f) {
             .imm26 => 26,
             .imm19 => 19,
             .imm14 => 14,
+            .adr21 => 21,
+            .word32 => unreachable,
         };
     }
     fn lsb(f: BranchField) u5 {
         return switch (f) {
             .imm26 => 0,
             .imm19, .imm14 => 5,
+            .adr21, .word32 => unreachable,
         };
+    }
+    fn relaxable(f: BranchField) bool {
+        return f == .imm19 or f == .imm14;
     }
 };
 
@@ -314,15 +328,102 @@ pub fn deinit(e: *Encoder) void {
     e.refs.deinit(e.gpa);
     e.labels.deinit(e.gpa);
     e.fixups.deinit(e.gpa);
+    e.relaxed.deinit(e.gpa);
 }
 
-/// Patches branches to labels. Every label must be bound. Fails if a
-/// conditional branch is too far from its label (b.cond, cbz, and cbnz
-/// reach ±1 MiB, tbz and tbnz ±32 KiB); CodeGen then needs a longer
-/// sequence, such as an inverted short branch over a `b`.
-pub fn finish(e: *Encoder) error{BranchOutOfRange}!void {
-    for (e.fixups.items) |f| try e.patchBranch(f.at, e.labels.items[@backingInt(f.label)], f.field);
+/// Patches every reference to a label; every label must be bound. A
+/// conditional branch that cannot reach its label (b.cond, cbz, and cbnz
+/// reach ±1 MiB, tbz and tbnz ±32 KiB) is relaxed into the inverted branch
+/// over a `b`, which inserts 4 bytes after it, until every branch reaches
+/// (each round only relaxes, so this ends). Labels and relocations move
+/// with the code; offsets the caller recorded before `finish`, such as
+/// line rows, inline ranges, or the code size, map with `finalOffset`.
+/// Fails only if an `adr` or `b` cannot reach its label.
+pub fn finish(e: *Encoder) (Allocator.Error || error{BranchOutOfRange})!void {
+    const gpa = e.gpa;
+    e.relaxed.clearRetainingCapacity();
+    const relax = try gpa.alloc(bool, e.fixups.items.len);
+    defer gpa.free(relax);
+    @memset(relax, false);
+    while (true) {
+        var changed = false;
+        for (e.fixups.items, relax) |f, *r| {
+            if (r.* or !f.field.relaxable()) continue;
+            const dest = e.labels.items[@backingInt(f.label)];
+            assert(dest != unbound);
+            const delta = @as(i64, e.finalOffset(dest)) - e.finalOffset(f.at);
+            if (fits(delta >> 2, f.field.bits())) continue;
+            r.* = true;
+            changed = true;
+        }
+        if (!changed) break;
+        e.relaxed.clearRetainingCapacity();
+        for (e.fixups.items, relax) |f, r| if (r) try e.relaxed.append(gpa, f.at);
+    }
+    if (e.relaxed.items.len > 0) {
+        var code: std.ArrayList(u8) = try .initCapacity(gpa, e.code.items.len + 4 * e.relaxed.items.len);
+        var prev: u32 = 0;
+        for (e.relaxed.items) |at| {
+            code.appendSliceAssumeCapacity(e.code.items[prev..at]);
+            const insn = std.mem.readInt(u32, e.code.items[at..][0..4], .little);
+            // b.cond inverts its condition; cbz/cbnz and tbz/tbnz flip bit
+            // 24. The inverted branch skips the `b` that follows it.
+            const field: BranchField = if (insn & 0x7e000000 == 0x36000000) .imm14 else .imm19;
+            const inverted = if (insn & 0xff000010 == 0x54000000) inv: {
+                assert(insn & 0xe < 0xe);
+                break :inv insn ^ 1;
+            } else insn ^ (1 << 24);
+            const cleared = inverted & ~(((@as(u32, 1) << field.bits()) - 1) << field.lsb());
+            std.mem.writeInt(u32, code.addManyAsArrayAssumeCapacity(4), cleared | (@as(u32, 2) << field.lsb()), .little);
+            std.mem.writeInt(u32, code.addManyAsArrayAssumeCapacity(4), 0x14000000, .little);
+            prev = at + 4;
+        }
+        code.appendSliceAssumeCapacity(e.code.items[prev..]);
+        e.code.deinit(gpa);
+        e.code = code;
+        for (e.labels.items) |*l| if (l.* != unbound) {
+            l.* = e.finalOffset(l.*);
+        };
+        for (e.refs.relocs.items) |*r| r.offset = e.finalOffset(r.offset);
+    }
+    for (e.fixups.items, relax) |f, r| {
+        const at = e.finalOffset(f.at);
+        const dest = e.labels.items[@backingInt(f.label)];
+        if (r) {
+            try e.patchBranch(at + 4, dest, .imm26);
+        } else switch (f.field) {
+            .imm26, .imm19, .imm14 => try e.patchBranch(at, dest, f.field),
+            .adr21 => {
+                const delta = @as(i64, dest) - at;
+                if (!fits(delta, 21)) return error.BranchOutOfRange;
+                const d: u32 = @truncate(@as(u64, @bitCast(delta)));
+                const insn = e.code.items[at..][0..4];
+                std.mem.writeInt(u32, insn, std.mem.readInt(u32, insn, .little) | ((d & 3) << 29) | (((d >> 2) & 0x7ffff) << 5), .little);
+            },
+            .word32 => {
+                const delta: i32 = @intCast(@as(i64, dest) - e.labels.items[@backingInt(f.anchor)]);
+                std.mem.writeInt(i32, e.code.items[at..][0..4], delta, .little);
+            },
+        }
+    }
     e.fixups.clearRetainingCapacity();
+}
+
+/// Where code that was at `offset` before `finish` relaxed branches is
+/// after it: later by 4 bytes for each relaxed branch before `offset`.
+/// The offset of a relaxed branch itself does not change, and the code's
+/// old size maps to its new size.
+pub fn finalOffset(e: *const Encoder, offset: u32) u32 {
+    const before = std.sort.lowerBound(u32, e.relaxed.items, offset, struct {
+        fn order(o: u32, at: u32) std.math.Order {
+            return std.math.order(o, at);
+        }
+    }.order);
+    return offset + 4 * @as(u32, @intCast(before));
+}
+
+fn fits(v: i64, bits: u5) bool {
+    return v >= -(@as(i64, 1) << (bits - 1)) and v < (@as(i64, 1) << (bits - 1));
 }
 
 pub fn newLabel(e: *Encoder) Allocator.Error!Label {
@@ -388,15 +489,36 @@ pub fn stpFp(e: *Encoder, ty: Float, r1: VReg, r2: VReg, mem: Mem) !void {
     try e.pair(ty.size(), true, false, r1.enc(), r2.enc(), mem);
 }
 
+/// Loads a q register (128 bits).
+pub fn ldrQ(e: *Encoder, dst: VReg, mem: Mem) !void {
+    try e.loadStore(.byte, true, 0b11, dst.enc(), mem);
+}
+
+/// Stores a q register (128 bits).
+pub fn strQ(e: *Encoder, src: VReg, mem: Mem) !void {
+    try e.loadStore(.byte, true, 0b10, src.enc(), mem);
+}
+
+/// Loads two q registers from consecutive 16-byte slots.
+pub fn ldpQ(e: *Encoder, r1: VReg, r2: VReg, mem: Mem) !void {
+    try e.pairRaw(0b10, 4, true, true, r1.enc(), r2.enc(), mem);
+}
+
+/// Stores two q registers to consecutive 16-byte slots.
+pub fn stpQ(e: *Encoder, r1: VReg, r2: VReg, mem: Mem) !void {
+    try e.pairRaw(0b10, 4, true, false, r1.enc(), r2.enc(), mem);
+}
+
 /// Single-register load/store with any addressing form. `opc` selects
-/// store (00), load (01), or sign-extending load to x (10) or w (11).
+/// store (00), load (01), or sign-extending load to x (10) or w (11); for
+/// SIMD registers with size 00, opc 10 and 11 store and load a q register.
 fn loadStore(e: *Encoder, size: Size, simd: bool, opc: u2, rt: u32, mem: Mem) !void {
     try e.reserve();
     const sz: u5 = @backingInt(size);
     const common = (@as(u32, sz) << 30) | (@as(u32, @intFromBool(simd)) << 26) | (@as(u32, opc) << 22) | (mem.base.spEnc() << 5) | rt;
     switch (mem.offset) {
         .imm => |imm| {
-            const scale = @as(i32, 1) << sz;
+            const scale = @as(i32, 1) << (if (simd and opc >= 0b10) 4 else sz);
             if (imm >= 0 and @rem(imm, scale) == 0 and @divExact(imm, scale) < 4096) {
                 e.word(0x39000000 | common | (@as(u32, @intCast(@divExact(imm, scale))) << 10));
             } else {
@@ -422,22 +544,114 @@ fn loadStore(e: *Encoder, size: Size, simd: bool, opc: u2, rt: u32, mem: Mem) !v
 }
 
 fn pair(e: *Encoder, size: Size, simd: bool, load: bool, r1: u32, r2: u32, mem: Mem) !void {
-    try e.reserve();
     // opc: 32-bit 00, 64-bit 10 for integers; s 00, d 01 for SIMD.
-    const opc: u32 = switch (size) {
+    const opc: u2 = switch (size) {
         .word => 0b00,
         .dword => if (simd) 0b01 else 0b10,
         else => unreachable,
     };
-    const scale = @as(i32, 1) << @backingInt(size);
+    try e.pairRaw(opc, @backingInt(size), simd, load, r1, r2, mem);
+}
+
+/// A pair load or store with the opc field `opc` (q registers: 10 with
+/// SIMD) and slots of `1 << log2_size` bytes.
+fn pairRaw(e: *Encoder, opc: u2, log2_size: u3, simd: bool, load: bool, r1: u32, r2: u32, mem: Mem) !void {
+    try e.reserve();
+    const scale = @as(i32, 1) << log2_size;
     const mode: u32, const imm = switch (mem.offset) {
         .post => |i| .{ 0b001, i },
         .imm => |i| .{ 0b010, i },
         .pre => |i| .{ 0b011, i },
         else => unreachable,
     };
-    e.word(0x28000000 | (opc << 30) | (@as(u32, @intFromBool(simd)) << 26) | (mode << 23) | (@as(u32, @intFromBool(load)) << 22) |
+    e.word(0x28000000 | (@as(u32, opc) << 30) | (@as(u32, @intFromBool(simd)) << 26) | (mode << 23) | (@as(u32, @intFromBool(load)) << 22) |
         (simm(7, @divExact(imm, scale)) << 15) | (r2 << 10) | (mem.base.spEnc() << 5) | r1);
+}
+
+// ---------------------------------------------------------------- atomics
+
+/// Memory ordering of an atomic instruction: acquire sets A (or L), release
+/// sets R (or o0). `seq_cst` read-modify-writes use `acq_rel`.
+pub const Ordering = enum(u2) {
+    relaxed = 0b00,
+    release = 0b01,
+    acquire = 0b10,
+    acq_rel = 0b11,
+
+    fn aBit(o: Ordering) u32 {
+        return @backingInt(o) >> 1;
+    }
+    fn rBit(o: Ordering) u32 {
+        return @backingInt(o) & 1;
+    }
+};
+
+/// `ldar`: a load-acquire of `size` bytes from `[base]`, zero-extended.
+pub fn ldar(e: *Encoder, size: Size, dst: Reg, base: Reg) !void {
+    try e.reserve();
+    e.word(0x08dffc00 | (@as(u32, @backingInt(size)) << 30) | (base.spEnc() << 5) | dst.zrEnc());
+}
+
+/// `stlr`: a store-release of the low `size` bytes of `src` to `[base]`.
+pub fn stlr(e: *Encoder, size: Size, src: Reg, base: Reg) !void {
+    try e.reserve();
+    e.word(0x089ffc00 | (@as(u32, @backingInt(size)) << 30) | (base.spEnc() << 5) | src.zrEnc());
+}
+
+/// `cas{a}{l}{b,h}`: compares `size` bytes at `[base]` with `expected`
+/// and, if equal, stores `new`. `expected` receives the old value either
+/// way (LSE, ARMv8.1, which every Apple Silicon core has).
+pub fn cas(e: *Encoder, size: Size, order: Ordering, expected: Reg, new: Reg, base: Reg) !void {
+    try e.reserve();
+    e.word(0x08a07c00 | (@as(u32, @backingInt(size)) << 30) | (order.aBit() << 22) | (expected.zrEnc() << 16) |
+        (order.rBit() << 15) | (base.spEnc() << 5) | new.zrEnc());
+}
+
+/// `casp{a}{l}`: `cas` of a pair of w (`.word`) or x (`.dword`) registers.
+/// `expected` and `new` name the first of two consecutive registers, which
+/// must be even.
+pub fn casp(e: *Encoder, size: Size, order: Ordering, expected: Reg, new: Reg, base: Reg) !void {
+    assert(size == .word or size == .dword);
+    assert(expected.zrEnc() & 1 == 0 and new.zrEnc() & 1 == 0);
+    try e.reserve();
+    e.word(0x08207c00 | (@as(u32, @intFromBool(size == .dword)) << 30) | (order.aBit() << 22) | (expected.zrEnc() << 16) |
+        (order.rBit() << 15) | (base.spEnc() << 5) | new.zrEnc());
+}
+
+pub const AtomicOp = enum(u4) { add, clr, eor, set, smax, smin, umax, umin, swp };
+
+/// The LSE read-modify-writes `ld<op>{a}{l}{b,h}` and `swp`: `dst` gets
+/// the old `size` bytes at `[base]`, and memory gets `old op src` (`src`
+/// for swp; `clr` is and-not). With `dst` = zr and no acquire this is the
+/// `st<op>` alias.
+pub fn atomic(e: *Encoder, op: AtomicOp, size: Size, order: Ordering, src: Reg, dst: Reg, base: Reg) !void {
+    try e.reserve();
+    const o3: u32, const opc: u32 = if (op == .swp) .{ 1, 0 } else .{ 0, @backingInt(op) };
+    e.word(0x38200000 | (@as(u32, @backingInt(size)) << 30) | (order.aBit() << 23) | (order.rBit() << 22) |
+        (src.zrEnc() << 16) | (o3 << 15) | (opc << 12) | (base.spEnc() << 5) | dst.zrEnc());
+}
+
+/// Shareability domain and access types of a barrier, numbered as CRm.
+pub const Barrier = enum(u4) {
+    oshld = 0b0001,
+    oshst = 0b0010,
+    osh = 0b0011,
+    nshld = 0b0101,
+    nshst = 0b0110,
+    nsh = 0b0111,
+    ishld = 0b1001,
+    ishst = 0b1010,
+    /// Inner shareable, all accesses: what a `seq_cst` fence needs.
+    ish = 0b1011,
+    ld = 0b1101,
+    st = 0b1110,
+    sy = 0b1111,
+};
+
+/// `dmb option`
+pub fn dmb(e: *Encoder, option: Barrier) !void {
+    try e.reserve();
+    e.word(0xd50330bf | (@as(u32, @backingInt(option)) << 8));
 }
 
 // ---------------------------------------------------------------- addresses
@@ -449,6 +663,21 @@ pub fn adrp(e: *Encoder, dst: Reg, sym: SymbolKey, addend: i32) !void {
     try e.reserve();
     try e.reloc(.aarch64_page21, sym, addend);
     e.word(0x90000000 | dst.zrEnc());
+}
+
+/// `adr dst, label`: the address of a label in this function, ±1 MiB.
+pub fn adr(e: *Encoder, dst: Reg, label: Label) !void {
+    try e.reserve();
+    try e.branchTo(0x10000000 | dst.zrEnc(), label, .adr21);
+}
+
+/// A 32-bit data word holding `label - anchor` in bytes, as a jump table
+/// entry relative to the table's start: `adr x16, table; ldrsw x17, [x16,
+/// idx, lsl #2]; add x16, x16, x17; br x16`.
+pub fn labelDelta(e: *Encoder, label: Label, anchor: Label) !void {
+    try e.reserve();
+    try e.fixups.append(e.gpa, .{ .at = @intCast(e.code.items.len), .label = label, .field = .word32, .anchor = anchor });
+    e.word(0);
 }
 
 /// `adrp dst, sym@GOTPAGE`: the page of `sym`'s GOT slot (GOT page21
@@ -774,6 +1003,39 @@ pub fn csetm(e: *Encoder, width: Width, dst: Reg, cond: Cond) !void {
     try e.csel(.csinv, width, dst, .zr, .zr, cond.negate());
 }
 
+pub const CcmpOperand = union(enum) { reg: Reg, imm: u5 };
+
+/// ccmp/ccmn: if `cond` holds, sets the flags from `lhs - rhs` (or `lhs +
+/// rhs` for ccmn), else sets them to `nzcv`. Chains compares for `and`
+/// and `or` of conditions without branches.
+pub fn ccmp(e: *Encoder, negative: bool, width: Width, lhs: Reg, rhs: CcmpOperand, nzcv: u4, cond: Cond) !void {
+    try e.reserve();
+    const base: u32 = if (negative) 0x3a400000 else 0x7a400000;
+    const m: u32 = switch (rhs) {
+        .reg => |r| r.zrEnc() << 16,
+        .imm => |i| (@as(u32, i) << 16) | (1 << 11),
+    };
+    e.word(base | width.sf() | m | (@as(u32, @backingInt(cond)) << 12) | (lhs.zrEnc() << 5) | nzcv);
+}
+
+pub const BitOp = enum { rbit, rev16, rev32, rev, clz, cls };
+
+/// Data-processing (1 source): rbit, rev16 (bytes within halfwords), rev32
+/// (bytes within words, x only), rev (bytes of the register), clz, cls.
+pub fn bitOp(e: *Encoder, op: BitOp, width: Width, dst: Reg, src: Reg) !void {
+    assert(op != .rev32 or width == .x);
+    try e.reserve();
+    const opcode: u32 = switch (op) {
+        .rbit => 0,
+        .rev16 => 1,
+        .rev32 => 2,
+        .rev => if (width == .x) 3 else 2,
+        .clz => 4,
+        .cls => 5,
+    };
+    e.word(0x5ac00000 | width.sf() | (opcode << 10) | (src.zrEnc() << 5) | dst.zrEnc());
+}
+
 // ---------------------------------------------------------------- control flow
 
 /// `b`: to a label, or to a symbol (branch26 relocation; the linker sends
@@ -839,6 +1101,23 @@ pub fn brk(e: *Encoder, imm: u16) !void {
 pub fn nop(e: *Encoder) !void {
     try e.reserve();
     e.word(0xd503201f);
+}
+
+/// `udf #imm`: permanently undefined; raises SIGILL.
+pub fn udf(e: *Encoder, imm: u16) !void {
+    try e.reserve();
+    e.word(imm);
+}
+
+/// The stack probe before allocating a frame of `size` bytes, needed when
+/// `size` exceeds the 4 KiB guard page: `mov x9, #size; bl chkstk`, where
+/// `chkstk` is the libSystem import `__chkstk_darwin` (clang emits the
+/// same for frames over 4 KiB). It touches every page from sp down to sp -
+/// size, counting x9 down, and preserves every register but x9, x16, x17,
+/// lr, and the flags; the caller then subtracts `size` from sp.
+pub fn stackProbe(e: *Encoder, size: u32, chkstk: SymbolKey) !void {
+    try e.movImm(.x, .x9, size);
+    try e.bl(.{ .sym = chkstk });
 }
 
 // ---------------------------------------------------------------- scalar floating point
@@ -910,6 +1189,61 @@ pub fn fcmp(e: *Encoder, ty: Float, lhs: VReg, rhs: ?VReg) !void {
     e.word(0x1e202000 | ty.ftype() | (rm << 16) | (lhs.enc() << 5) | zero);
 }
 
+pub const FmaOp = enum(u2) {
+    /// `a + n*m`
+    madd = 0b00,
+    /// `a - n*m`
+    msub = 0b01,
+    /// `-a - n*m`
+    nmadd = 0b10,
+    /// `-a + n*m`
+    nmsub = 0b11,
+};
+
+/// Fused multiply-add (fmadd, fmsub, fnmadd, fnmsub), rounding once.
+pub fn fma(e: *Encoder, op: FmaOp, ty: Float, dst: VReg, n: VReg, m: VReg, a: VReg) !void {
+    try e.reserve();
+    const o: u32 = @backingInt(op);
+    e.word(0x1f000000 | ty.ftype() | ((o >> 1) << 21) | (m.enc() << 16) | ((o & 1) << 15) | (a.enc() << 10) | (n.enc() << 5) | dst.enc());
+}
+
+/// The 8-bit immediate of `fmov` that encodes `value`, if any: ±n/16 ×
+/// 2^e for n in 16..31 and e in -3..4 (0.0 is not one).
+pub fn fpImm(value: f64) ?u8 {
+    for (0..256) |i| {
+        const imm: u8 = @intCast(i);
+        if (expandFpImm(imm) == value) return imm;
+    }
+    return null;
+}
+
+fn expandFpImm(imm: u8) f64 {
+    const frac: f64 = @floatFromInt(16 + (imm & 15));
+    const b54: i32 = (imm >> 4) & 3;
+    const exp: i32 = if (imm & 0x40 != 0) b54 - 3 else b54 + 1;
+    const mag = std.math.ldexp(frac / 16, exp);
+    return if (imm & 0x80 != 0) -mag else mag;
+}
+
+/// `fmov dst, #imm`, with `imm` from `fpImm`.
+pub fn fmovImm(e: *Encoder, ty: Float, dst: VReg, imm: u8) !void {
+    try e.reserve();
+    e.word(0x1e201000 | ty.ftype() | (@as(u32, imm) << 13) | dst.enc());
+}
+
+/// `cnt vd.8b, vn.8b`: the number of set bits in each byte. `@popCount`
+/// is `fmov d, x; cnt; addv b; fmov w, s`.
+pub fn cnt(e: *Encoder, dst: VReg, src: VReg) !void {
+    try e.reserve();
+    e.word(0x0e205800 | (src.enc() << 5) | dst.enc());
+}
+
+/// `addv bd, vn.8b`: the sum of the 8 bytes, zeroing the rest of `dst`.
+pub fn addv(e: *Encoder, dst: VReg, src: VReg) !void {
+    try e.reserve();
+    e.word(0x0e31b800 | (src.enc() << 5) | dst.enc());
+}
+
 /// fcsel: `dst = cond ? src1 : src2`.
 pub fn fcsel(e: *Encoder, ty: Float, dst: VReg, src1: VReg, src2: VReg, cond: Cond) !void {
     try e.reserve();
@@ -963,23 +1297,18 @@ fn branch26(e: *Encoder, opcode: u32, target: Target) !void {
     }
 }
 
-/// Emits `opcode` with its offset field pointing at `label`, or zero and a
-/// fixup if the label is not bound yet.
+/// Emits `opcode` with a zero offset field and a fixup that `finish`
+/// points at `label`.
 fn branchTo(e: *Encoder, opcode: u32, label: Label, field: BranchField) !void {
-    const at: u32 = @intCast(e.code.items.len);
-    const dest = e.labels.items[@backingInt(label)];
-    if (dest == unbound) try e.fixups.append(e.gpa, .{ .at = at, .label = label, .field = field });
+    try e.fixups.append(e.gpa, .{ .at = @intCast(e.code.items.len), .label = label, .field = field });
     e.word(opcode);
-    // A backward branch is always in range of the field the function's
-    // size allows; a function too large for that is a caller bug.
-    if (dest != unbound) e.patchBranch(at, dest, field) catch unreachable;
 }
 
 fn patchBranch(e: *Encoder, at: u32, dest: u32, field: BranchField) error{BranchOutOfRange}!void {
     assert(dest != unbound);
     const delta = (@as(i64, dest) - at) >> 2;
     const bits = field.bits();
-    if (delta < -(@as(i64, 1) << (bits - 1)) or delta >= (@as(i64, 1) << (bits - 1))) return error.BranchOutOfRange;
+    if (!fits(delta, bits)) return error.BranchOutOfRange;
     const mask = (@as(u32, 1) << bits) - 1;
     const insn = e.code.items[at..][0..4];
     const v = std.mem.readInt(u32, insn, .little) | ((@as(u32, @truncate(@as(u64, @bitCast(delta)))) & mask) << field.lsb());
@@ -1046,15 +1375,85 @@ test "branches to labels bound before and after them" {
     try e.finish();
     try std.testing.expectEqualSlices(u8, &hex("80000054" ++ "630000b5" ++ "450008b6" ++ "fdffff17" ++ "c0035fd6"), e.code.items);
     try std.testing.expectEqual(0, e.refs.relocs.items.len);
+}
 
-    // A tbz past 32 KiB does not fit.
-    var f: Encoder = .init(gpa);
-    defer f.deinit();
-    const far = try f.newLabel();
-    try f.tbz(false, .x0, 0, far);
-    for (0..8192) |_| try f.nop();
-    f.bind(far);
-    try std.testing.expectError(error.BranchOutOfRange, f.finish());
+test "relaxes conditional branches that cannot reach their labels" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    const foo: SymbolKey = .fromName("foo");
+    const top = try e.newLabel();
+    const mid = try e.newLabel();
+    const far = try e.newLabel();
+    e.bind(top);
+    try e.tbz(false, .x0, 0, mid); // 0: reaches mid at 32764 until the tbnz below grows
+    try e.tbz(true, .x1, 3, far); // 4: too far
+    try e.bl(.{ .sym = foo }); // 8
+    try e.cbz(false, .x, .x2, mid); // 12: in range
+    while (e.code.items.len < 32764) try e.nop();
+    e.bind(mid);
+    try e.adr(.x3, top);
+    while (e.code.items.len < 40000) try e.nop();
+    e.bind(far);
+    try e.tbz(true, .x4, 63, top); // 40000: backward, too far
+    try e.ret();
+    try e.finish();
+
+    try std.testing.expectEqualSlices(u32, &.{ 0, 4, 40000 }, e.relaxed.items);
+    try std.testing.expectEqual(40020, e.code.items.len);
+    // Relaxed branches stay put; code after one moves by 4, so an inline
+    // range ending right after a relaxed branch covers its `b`, and the old
+    // size maps to the new one.
+    for ([_][2]u32{ .{ 0, 0 }, .{ 4, 8 }, .{ 8, 16 }, .{ 32764, 32772 }, .{ 40000, 40008 }, .{ 40004, 40016 }, .{ 40008, 40020 } }) |m|
+        try std.testing.expectEqual(m[1], e.finalOffset(m[0]));
+    // tbnz x0, #0, +8; b mid; tbz w1, #3, +8; b far; bl foo; cbz x2, mid
+    try std.testing.expectEqualSlices(u8, &hex("40000037" ++ "00200014" ++ "41001836" ++ "0f270014" ++ "00000094" ++ "82ff03b4"), e.code.items[0..24]);
+    try std.testing.expectEqualSlices(u8, &hex("e3fffb10"), e.code.items[32772..][0..4]); // adr x3, top
+    // far: tbz x4, #63, +8 (the inverted tbnz); b top; ret
+    try std.testing.expectEqualSlices(u8, &hex("4400f8b6" ++ "edd8ff17" ++ "c0035fd6"), e.code.items[40008..]);
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.init(16, .aarch64_branch26, 0, 0)}, e.refs.relocs.items);
+}
+
+test "atomics, bit ops, and other step-5 encodings match the system assembler" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    const chkstk: SymbolKey = .fromName("__chkstk_darwin");
+    const table = try e.newLabel();
+    const case = try e.newLabel();
+    try e.ccmp(false, .x, .x1, .{ .imm = 5 }, 0b0100, .ne); // ccmp x1, #5, #4, ne
+    try e.ccmp(true, .w, .x2, .{ .reg = .x3 }, 0, .lt); // ccmn w2, w3, #0, lt
+    try e.bitOp(.rev, .w, .x0, .x1); // rev w0, w1
+    try e.bitOp(.rev32, .x, .x0, .x1); // rev32 x0, x1
+    try e.bitOp(.cls, .x, .x5, .x6); // cls x5, x6
+    try e.cnt(.v0, .v0); // cnt v0.8b, v0.8b
+    try e.addv(.v0, .v0); // addv b0, v0.8b
+    try e.fma(.nmsub, .f64, .v0, .v1, .v2, .v3); // fnmsub d0, d1, d2, d3
+    try e.fmovImm(.f32, .v4, fpImm(-0.125).?); // fmov s4, #-0.125
+    try e.fmovImm(.f64, .v5, fpImm(31.0).?); // fmov d5, #31.0
+    try e.cas(.byte, .acq_rel, .x0, .x1, .sp); // casalb w0, w1, [sp]
+    try e.casp(.dword, .acquire, .x4, .x6, .x8); // caspa x4, x5, x6, x7, [x8]
+    try e.atomic(.swp, .dword, .relaxed, .x1, .x2, .x3); // swp x1, x2, [x3]
+    try e.atomic(.umin, .half, .release, .x1, .zr, .x3); // stuminlh w1, [x3]
+    try e.ldar(.byte, .x0, .x1); // ldarb w0, [x1]
+    try e.stlr(.dword, .zr, .sp); // stlr xzr, [sp]
+    try e.dmb(.ish); // dmb ish
+    try e.ldrQ(.v1, .at(.sp, 32)); // ldr q1, [sp, #32]
+    try e.strQ(.v2, .at(.x0, 8)); // stur q2, [x0, #8]
+    try e.stpQ(.v8, .v9, .{ .base = .sp, .offset = .{ .pre = -32 } }); // stp q8, q9, [sp, #-32]!
+    try e.udf(0x1234); // udf #0x1234
+    try e.stackProbe(0x186b0, chkstk); // mov x9, #0x86b0; movk x9, #1, lsl #16; bl ___chkstk_darwin
+    try e.adr(.x16, table); // adr x16, table
+    e.bind(case);
+    e.bind(table);
+    try e.labelDelta(case, table); // .long case - table
+    try e.finish();
+    const want = hex("241845fa" ++ "40b0433a" ++ "2008c05a" ++ "2008c0da" ++ "c514c0da" ++ "0058200e" ++ "00b8310e" ++
+        "208c621f" ++ "0410381e" ++ "05f0671e" ++ "e1ffe008" ++ "067d6448" ++ "628021f8" ++ "7f706178" ++ "20fcdf08" ++
+        "ffff9fc8" ++ "bf3b03d5" ++ "e10bc03d" ++ "0280803c" ++ "e827bfad" ++ "34120000" ++ "09d690d2" ++ "2900a0f2" ++
+        "00000094" ++ "30000010" ++ "00000000");
+    try std.testing.expectEqualSlices(u8, &want, e.code.items);
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.init(0x5c, .aarch64_branch26, 0, 0)}, e.refs.relocs.items);
 }
 
 test "bitmask immediates" {

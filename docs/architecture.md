@@ -620,11 +620,20 @@ comptime arguments are run-time values in the lowered code (uucode's
   `src/codegen/aarch64/Encoder.zig`) append instructions and produce an
   Atom's bytes and relocations; branches to local labels are patched in
   place and never become relocations. On aarch64, conditional branches and
-  cbz/tbz reach only labels (±1 MiB, tbz ±32 KiB; `finish` reports a
-  branch that does not fit), calls to other symbols are `bl`, and addresses
-  are adrp pairs. Both were checked against the system assembler (GNU as
-  for x86_64; clang's for aarch64, 32,771 instructions byte-identical,
-  including every encodable logical immediate).
+  cbz/tbz reach only labels (±1 MiB, tbz ±32 KiB), calls to other symbols
+  are `bl`, and addresses are adrp pairs. aarch64's `finish` patches every
+  label reference at once and relaxes a conditional branch that does not
+  reach into the inverted branch over a `b`, repeating until all reach;
+  labels and relocations move with the code, and CodeGen maps the offsets
+  it recorded (line rows, inline ranges, the code size) through
+  `Encoder.finalOffset` afterwards, so it builds its `LineProgram` after
+  `finish`. `adr` to a label and label-difference words (`labelDelta`)
+  serve jump tables. Both were checked against the system assembler (GNU
+  as for x86_64; clang's for aarch64, 32,771 instructions byte-identical,
+  including every encodable logical immediate, plus 2,748 for the
+  step-5 additions: LSE atomics, ldar/stlr, dmb, ccmp, clz/rbit/rev, cnt,
+  fused multiply-add, every fmov immediate, q-register loads and stores,
+  udf, adr, and a 1 MiB relaxation case).
 
 ### Optimizing backend (designed 2026-11-03, accepted by the owner; being built)
 
@@ -1002,8 +1011,8 @@ the Atom. Per architecture (`src/codegen/<arch>/`):
   (a binary search over sorted cases when there are many). Jump tables
   come later: they need data inside the text atom (x86_64 a RIP-relative
   table of offsets; aarch64 `adr` to a label and label-difference words,
-  `adr x, T; ldrsw x, [x, idx, lsl 2]; add; br`), which neither encoder
-  has yet.
+  `adr x, T; ldrsw x, [x, idx, lsl 2]; add; br`), which only the aarch64
+  encoder has yet.
 
 Flags are one implicit value on both architectures, never allocatable,
 never spilled (see pass 5). Link-time values (error codes): x86_64 patches
