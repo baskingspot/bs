@@ -65,6 +65,13 @@ out_args_size: u32 = 0,
 /// rbp offset of the slot holding the result pointer (for results returned
 /// in memory).
 ret_ptr_slot: ?i32 = null,
+/// The `alloc` whose memory is the result's (see `planCopies`).
+rvo_alloc: ?Inst.Index = null,
+/// From `planCopies`: `*const` allocs that may alias the memory of the
+/// value they are initialized with, and those values, whose slots are
+/// not shared.
+copy_of: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+copy_private: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// rbp offset of the slot holding the error return trace pointer: an
 /// `.auto` function's from r9, another's from `set_err_return_trace`.
 /// Null in a function that has none, whose `.auto` calls pass null.
@@ -144,6 +151,9 @@ const Home = union(enum) {
     slot: i32,
     /// The value is the address `rbp + off` (an `alloc`).
     frame_addr: i32,
+    /// A load read in place by its only user (see `planDeferred`): the
+    /// value is the memory its pointer points to.
+    deferred,
     /// Nothing reads the value and computing it has no effect: it is not
     /// emitted (pass 2).
     dead,
@@ -209,6 +219,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.arg_tys.deinit(gpa);
         cg.arg_locs.deinit(gpa);
         cg.pair_spills.deinit(gpa);
+        cg.copy_of.deinit(gpa);
+        cg.copy_private.deinit(gpa);
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
     }
@@ -406,7 +418,8 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
     const alignment = @min(Type.abiAlignment(cg.ip, ty), 16);
     // Values are emitted in layout order, so a slot whose value's interval
     // has ended can be shared (pass 7 of the design).
-    const class = if (cg.live and !cg.in_cold) Ssa.slotClass(size, alignment) else null;
+    const private = cg.copy_private.count() != 0 and cg.copy_private.contains(@backingInt(inst));
+    const class = if (cg.live and !cg.in_cold and !private) Ssa.slotClass(size, alignment) else null;
     const home: Home = .{ .slot = if (class) |c| blk: {
         const f = &cg.emit.ssa;
         const off = try f.takeSlot(cg.gpa, inst, c) orelse try cg.allocSlot(c.size, c.alignment);
@@ -670,6 +683,7 @@ fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
         .reg => |r| .{ .reg = r },
         .regs => |p| .{ .mem = try cg.spillPair(inst, p) },
         .xmm => |x| .{ .mem = try cg.spillXmm(inst, x) },
+        .deferred => .{ .mem = try cg.deferredMem(cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op.operand) },
         .fused, .pair => unreachable, // read only by their users
         .dead => unreachable,
         .slot => |off| .{ .mem = Mem.at(.rbp, off) },
@@ -893,6 +907,19 @@ fn spillXmm(cg: *CodeGen, inst: Inst.Index, x: Encoder.Xmm) Error!Mem {
     return m;
 }
 
+/// The memory pointer `ptr` points to, with r11 as the base if `ptr` is
+/// not in a register (`Home.deferred`).
+fn deferredMem(cg: *CodeGen, ptr: Ref) Error!Mem {
+    switch (try cg.locOf(ptr)) {
+        .addr => |m| return m,
+        .reg => |r| return Mem.at(r, 0),
+        else => {
+            try cg.load(.r11, ptr);
+            return Mem.at(.r11, 0);
+        },
+    }
+}
+
 /// The register holding `ref` if it is a value in one (`Home.xmm`).
 fn xmmOf(cg: *CodeGen, ref: Ref) ?Encoder.Xmm {
     const inst = ref.toIndex() orelse return null;
@@ -1018,6 +1045,8 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
             return false;
         },
         .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .loop, .breakpoint => return false,
+        // A frame address takes no register and emits nothing.
+        .struct_field_ptr, .ptr_elem_ptr, .ptr_add => if (cg.frameFoldable(inst.toRef())) return false,
         else => {},
     }
     const class: RegClass = if (cg.has_asm) .none else cg.wantsReg(inst);
@@ -1054,6 +1083,7 @@ pub fn termClobbers(cg: *CodeGen, block: Ssa.Block.Index) bool {
 
 fn planRegisters(cg: *CodeGen) Error!void {
     if (cg.fn_ty.cc == .naked) return;
+    try cg.planCopies();
     const f = &cg.emit.ssa;
     const ir = cg.ir;
     try f.live.resize(cg.gpa, ir.instructions.len);
@@ -1089,6 +1119,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
         }
         return;
     }
+    cg.planDeferred();
     cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved) & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
@@ -1104,6 +1135,165 @@ fn planRegisters(cg: *CodeGen) Error!void {
             .pair => cg.homes[i] = .pair,
         }
     }
+}
+
+/// Copy elision decided from the IR before liveness (step 2 of the
+/// optimizing backend's successors in docs/architecture.md):
+/// - Return value: in a function that returns through memory, an `alloc`
+///   of the result type whose load every `ret` returns (the load being
+///   the last value of the `ret`'s block, so nothing else reads it) is the
+///   result's memory: its home is the pointer the caller passed, and the
+///   load and the copy at the `ret` go (`rvo_alloc`). The caller's result
+///   memory is a slot of its own, which nothing else can reach.
+/// - Initializers: a `*const` alloc stored to once, with a value that
+///   always lives in memory, is that memory (`copy_of`) if the value is
+///   in place when the alloc is emitted; its slot is not shared
+///   (`copy_private`), and values do not change, so the memory holds the
+///   initializer for as long as the alloc's address is used. A value
+///   initializes at most one alloc, so allocs keep distinct addresses.
+fn planCopies(cg: *CodeGen) Error!void {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const f = cg.ssa;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const ret_ty = cg.fn_ty.return_type;
+    if (cg.fn_ty.cc == .auto and cg.autoClass(ret_ty) == .memory) rvo: {
+        var rvo: ?Inst.Index = null;
+        for (f.layout.items) |block| {
+            const b = f.blocks.items[@backingInt(block)];
+            if (b.term.tag != .ret) continue;
+            const l = datas[@backingInt(b.term.inst)].un_op.toIndex() orelse break :rvo;
+            const last = for (0..b.len) |k| {
+                const v = f.blockInsts(block)[b.len - 1 - k];
+                if (tags[@backingInt(v)] != .dbg_stmt) break v;
+            } else break :rvo;
+            if (last != l or tags[@backingInt(l)] != .load) break :rvo;
+            const a = datas[@backingInt(l)].ty_op.operand.toIndex() orelse break :rvo;
+            if (tags[@backingInt(a)] != .alloc or datas[@backingInt(a)].ty == .none) break :rvo;
+            const a_ty = datas[@backingInt(a)].ty;
+            // A `*const` one is forwarded instead (`Ssa.plan`).
+            const flags = Type.ptrInfo(ip, a_ty).flags;
+            if (Type.ptrInfo(ip, a_ty).child != ret_ty or flags.is_volatile or flags.is_const) break :rvo;
+            if (cg.allocAlignment(a_ty) > @min(Type.abiAlignment(ip, ret_ty), 16)) break :rvo;
+            if (rvo != null and rvo.? != a) break :rvo;
+            rvo = a;
+        }
+        const a = rvo orelse break :rvo;
+        cg.rvo_alloc = a;
+        for (f.layout.items) |block| {
+            const b = f.blocks.items[@backingInt(block)];
+            if (b.term.tag == .ret) cg.homes[@backingInt(datas[@backingInt(b.term.inst)].un_op.toIndex().?)] = .dead;
+        }
+    }
+    if (f.has_asm) return;
+    const gpa = cg.gpa;
+    for (f.values.items(.inst)) |inst| {
+        if (tags[@backingInt(inst)] != .store) continue;
+        const bin = datas[@backingInt(inst)].bin_op;
+        const a = bin.lhs.toIndex() orelse continue;
+        if (tags[@backingInt(a)] != .alloc) {
+            // A store into part of an alloc: it is not a copy.
+            if (cg.frameRoot(bin.lhs)) |root| try cg.copy_of.put(gpa, @backingInt(root), no_copy);
+            continue;
+        }
+        if (datas[@backingInt(a)].ty == .none) continue;
+        const info = Type.ptrInfo(ip, datas[@backingInt(a)].ty);
+        if (!info.flags.is_const or info.flags.is_volatile or a == cg.rvo_alloc) continue;
+        const gop = try cg.copy_of.getOrPut(gpa, @backingInt(a));
+        if (gop.found_existing) {
+            gop.value_ptr.* = no_copy;
+            continue;
+        }
+        gop.value_ptr.* = no_copy;
+        const v = bin.rhs.toIndex() orelse continue;
+        const ty = cg.typeOf(bin.rhs);
+        const size = Type.abiSize(ip, ty);
+        if (size == 0 or cg.passInRegs(ty) or cg.inPair(ty)) continue;
+        if ((try cg.copy_private.getOrPut(gpa, @backingInt(v))).found_existing) continue;
+        gop.value_ptr.* = @backingInt(v);
+    }
+}
+
+/// Before allocation: a load of a value that lives in memory whose only
+/// user is a later `.auto` call in the same block, with nothing between
+/// that may write memory, is not copied to a slot of its own: the call
+/// copies the argument from where the load points (`Home.deferred`). The
+/// pointer then lives until the call. The call copies its arguments one
+/// at a time, and the outgoing area does not overlap the memory read.
+fn planDeferred(cg: *CodeGen) void {
+    const ir = cg.ir;
+    const f = cg.ssa;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const live = f.live.slice();
+    const uses = live.items(.uses);
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const fate = live.items(.fate);
+    const share = live.items(.share);
+    const fwd = live.items(.fwd);
+    const cl = f.clobbers.items;
+    for (f.layout.items) |block| {
+        const values = f.blockInsts(block);
+        for (values, 0..) |u, k| {
+            if (tags[@backingInt(u)] != .call or fate[@backingInt(u)] != .normal) continue;
+            const data = datas[@backingInt(u)];
+            const callee_fn_ty = cg.typeOf(data.pl_op.operand);
+            const callee_ty = if (Type.class(cg.ip, callee_fn_ty) == .pointer) Type.ptrInfo(cg.ip, callee_fn_ty).child else callee_fn_ty;
+            if (cg.ip.keyPayload(.func_type, callee_ty).cc != .auto) continue;
+            const extra = ir.extraData(Ir.Call, data.pl_op.payload);
+            for (ir.refSlice(extra.end, extra.data.args_len)) |arg| {
+                const l = arg.toIndex() orelse continue;
+                const li = @backingInt(l);
+                if (tags[li] != .load or uses[li] != 1 or fate[li] != .normal or fwd[li] != Ssa.no_tie) continue;
+                const ty = datas[li].ty_op.ty;
+                if (Type.abiSize(cg.ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty)) continue;
+                if (!Ssa.removable(ir, cg.ip, l)) continue; // volatile
+                // `l` lies before the call in this block, with only values
+                // that write no memory between.
+                const found = for (0..@min(k, 32)) |j| {
+                    const v = values[k - 1 - j];
+                    if (v == l) break true;
+                    switch (tags[@backingInt(v)]) {
+                        .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+                        else => if (!Ssa.removable(ir, cg.ip, v)) break false,
+                    }
+                } else false;
+                if (!found) continue;
+                const ptr = datas[li].ty_op.operand;
+                if (ptr.toIndex()) |p0| {
+                    var p = @backingInt(p0);
+                    if (fwd[p] != Ssa.no_tie) p = fwd[p];
+                    if (share[p] != Ssa.no_tie or fate[p] != .normal) continue;
+                    const at = def[@backingInt(u)];
+                    end[p] = @max(end[p], at);
+                    crosses[p] = crosses[p] or cl[at][0] != cl[def[p]][0] or cl[at][1] != cl[def[p]][1];
+                }
+                cg.homes[li] = .deferred;
+            }
+        }
+    }
+}
+
+/// A `copy_of` entry for an alloc that is not a copy.
+const no_copy = std.math.maxInt(u32);
+
+/// The `alloc` that pointer `ref` is a field or element of, if any.
+fn frameRoot(cg: *CodeGen, ref: Ref) ?Inst.Index {
+    var cur = ref;
+    for (0..8) |_| {
+        const i = cur.toIndex() orelse return null;
+        const data = cg.ir.instructions.items(.data)[@backingInt(i)];
+        switch (cg.ir.instructions.items(.tag)[@backingInt(i)]) {
+            .alloc => return i,
+            .struct_field_ptr => cur = cg.ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand,
+            .ptr_elem_ptr, .ptr_add => cur = cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs,
+            else => return null,
+        }
+    }
+    return null;
 }
 
 /// How wide to write an error union's error code: through the padding
@@ -1135,6 +1325,63 @@ fn varXmm(cg: *CodeGen, ptr: Ref) ?Encoder.Xmm {
     const i = ptr.toIndex() orelse return null;
     if (cg.ir.instructions.items(.tag)[@backingInt(i)] != .alloc) return null;
     return cg.xmmOf(ptr);
+}
+
+/// The alignment of an `alloc` of pointer type `ty`'s memory.
+fn allocAlignment(cg: *CodeGen, ty: Index) u64 {
+    const info = Type.ptrInfo(cg.ip, ty);
+    return @max(Type.abiAlignment(cg.ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
+}
+
+/// The value of an integer constant operand that fits in 32 bits.
+fn constIndex(cg: *CodeGen, ref: Ref) ?u64 {
+    const v = ref.toInterned() orelse return null;
+    if (cg.ip.keyTag(v) != .int) return null;
+    const k = cg.ip.intValue(u64, v) orelse return null;
+    return if (k <= std.math.maxInt(i32)) k else null;
+}
+
+/// Whether pointer `ref` will be a frame address (`Home.frame_addr`): an
+/// `alloc` in the frame, or a field or constant-index element of one.
+/// Such a pointer needs no register and no code (`foldFrame`).
+fn frameFoldable(cg: *CodeGen, ref: Ref) bool {
+    const ip = cg.ip;
+    var cur = ref;
+    // Bounded: a chain of fields of fields is short.
+    for (0..8) |_| {
+        const i = cur.toIndex() orelse return false;
+        const data = cg.ir.instructions.items(.data)[@backingInt(i)];
+        switch (cg.ir.instructions.items(.tag)[@backingInt(i)]) {
+            .alloc => return data.ty != .none and cg.allocAlignment(data.ty) <= 16 and i != cg.rvo_alloc,
+            .struct_field_ptr => {
+                const sf = cg.ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+                const container = Type.ptrInfo(ip, cg.typeOf(sf.operand)).child;
+                if (Type.fieldOffset(ip, container, sf.index) > std.math.maxInt(i32)) return false;
+                cur = sf.operand;
+            },
+            .ptr_elem_ptr, .ptr_add => {
+                const bin = cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+                const k = cg.constIndex(bin.rhs) orelse return false;
+                if (k * Type.abiSize(ip, Type.ptrInfo(ip, data.ty_pl.ty).child) > std.math.maxInt(i32)) return false;
+                cur = bin.lhs;
+            },
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// Gives pointer `inst`, `base + off`, the frame address it is if `base`
+/// is one; returns whether it did.
+fn foldFrame(cg: *CodeGen, inst: Inst.Index, base: Ref, off: u64) bool {
+    const b = base.toIndex() orelse return false;
+    switch (cg.homes[@backingInt(b)]) {
+        .frame_addr => |o| {
+            cg.homes[@backingInt(inst)] = .{ .frame_addr = o + @as(i32, @intCast(off)) };
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// Whether `ty`'s values fit a general-purpose register.
@@ -1648,7 +1895,20 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
             const info = Type.ptrInfo(ip, data.ty);
             const size = @max(Type.abiSize(ip, info.child), 1);
-            const alignment = @max(Type.abiAlignment(ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
+            const alignment = cg.allocAlignment(data.ty);
+            if (inst == cg.rvo_alloc) {
+                // The result's memory, through the pointer the caller passed.
+                cg.homes[@backingInt(inst)] = .{ .slot = cg.ret_ptr_slot.? };
+                return;
+            }
+            if (cg.copy_of.count() != 0) if (cg.copy_of.get(@backingInt(inst))) |v| if (v != no_copy) switch (cg.homes[v]) {
+                // The memory of its initializer, already in place.
+                .slot => |off| if (@rem(off, @as(i32, @intCast(alignment))) == 0) {
+                    cg.homes[@backingInt(inst)] = .{ .frame_addr = off };
+                    return;
+                },
+                else => {},
+            };
             if (alignment <= 16) {
                 cg.homes[@backingInt(inst)] = .{ .frame_addr = try cg.allocSlot(size, alignment) };
                 return;
@@ -1664,6 +1924,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .load => {
             const ty = data.ty_op.ty;
+            if (cg.homes[@backingInt(inst)] == .deferred) return;
             if (cg.live) {
                 // A forwarded constant is the value stored (`Live.fwd`).
                 const w = cg.ssa.live.items(.fwd)[@backingInt(inst)];
@@ -1686,20 +1947,31 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
             if (cg.passInRegs(ty)) return cg.loadResult(inst, ty, try cg.ptrMem(data.ty_op.operand));
             const dst = try cg.resultMem(inst, ty) orelse return;
-            try cg.load(.r10, data.ty_op.operand);
-            try cg.copyMem(dst, Mem.at(.r10, 0), Type.abiSize(ip, data.ty_op.ty));
+            try cg.copyMem(dst, try cg.ptrMem(data.ty_op.operand), Type.abiSize(ip, data.ty_op.ty));
         },
         .store => {
             const val = data.bin_op.rhs;
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
+            // A `*const` alloc that is its initializer's memory (`planCopies`).
+            if (cg.copy_of.count() != 0) if (data.bin_op.lhs.toIndex()) |a| if (val.toIndex()) |v| switch (cg.homes[@backingInt(a)]) {
+                .frame_addr => |off| if (cg.homes[@backingInt(v)] == .slot and cg.homes[@backingInt(v)].slot == off) return,
+                else => {},
+            };
             if (cg.varReg(data.bin_op.lhs)) |r| return cg.load(r, val);
             if (cg.varXmm(data.bin_op.lhs)) |x| return cg.loadXmm(x, try cg.valOf(val));
             if (cg.pairOf(data.bin_op.lhs)) |p| return cg.loadRegs(p, val); // a variable
             if (cg.passInRegs(cg.typeOf(val))) return cg.storeVal(try cg.ptrMem(data.bin_op.lhs), val, size);
-            try cg.load(.r10, data.bin_op.lhs);
-            if (val.toInterned()) |v| if (ip.keyTag(v) == .undef) return cg.fillMem(Mem.at(.r10, 0), size, 0xaa);
-            try cg.copyTo(Mem.at(.r10, 0), val);
+            // Not based on a register `copyTo` uses.
+            const dst = switch (try cg.locOf(data.bin_op.lhs)) {
+                .addr => |m| m,
+                else => blk: {
+                    try cg.load(.r10, data.bin_op.lhs);
+                    break :blk Mem.at(.r10, 0);
+                },
+            };
+            if (val.toInterned()) |v| if (ip.keyTag(v) == .undef) return cg.fillMem(dst, size, 0xaa);
+            try cg.copyTo(dst, val);
         },
 
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
@@ -1887,6 +2159,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .struct_field_ptr => {
             const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
             const container = Type.ptrInfo(ip, cg.typeOf(sf.operand)).child;
+            if (cg.foldFrame(inst, sf.operand, Type.fieldOffset(ip, container, sf.index))) return;
             const d = cg.destReg(inst);
             try cg.addrPlus(d, sf.operand, Type.fieldOffset(ip, container, sf.index));
             try cg.setResult(inst, data.ty_pl.ty, d);
@@ -1904,6 +2177,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .ptr_elem_ptr, .slice_elem_ptr, .ptr_add => {
             const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
             const elem_ty = Type.ptrInfo(ip, data.ty_pl.ty).child;
+            if (tag != .slice_elem_ptr) if (cg.constIndex(bin.rhs)) |k| {
+                if (cg.foldFrame(inst, bin.lhs, k *% Type.abiSize(ip, elem_ty))) return;
+            };
             const d = cg.destReg(inst);
             try cg.elemAddrTo(d, tag == .slice_elem_ptr, bin.lhs, bin.rhs, Type.abiSize(ip, elem_ty));
             try cg.setResult(inst, data.ty_pl.ty, d);
@@ -2736,8 +3012,12 @@ fn ret(cg: *CodeGen, operand: Ref, next: Ssa.Block.Index) Error!void {
         .gpr_pair => try cg.loadPair(.rax, .rdx, operand),
         .sse => try cg.loadXmm(.xmm0, try cg.valOf(operand)),
         .memory => {
-            try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
-            try cg.copyTo(Mem.at(.r10, 0), operand);
+            // A load of the result's own alloc is not emitted (`planCopies`).
+            const rvo = if (operand.toIndex()) |l| cg.homes[@backingInt(l)] == .dead else false;
+            if (!rvo) {
+                try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
+                try cg.copyTo(Mem.at(.r10, 0), operand);
+            }
         },
     }
     if (next == .none) return cg.epilogue();
