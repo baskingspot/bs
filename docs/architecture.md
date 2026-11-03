@@ -3300,14 +3300,14 @@ user modules (non-generic functions only) was proposed and not adopted.
   as a no-edit rebuild and then after an edit above each error. Output
   must be byte-identical, with `ZAP_CACHE_CHECK=1`.
 - **Parity with upstream**: `run.py --compile-errors` runs upstream's
-  `test/cases/compile_errors` (1017 files; 990 apply to x86_64-linux) and
-  counts cases where zap reports the same primary locations and messages,
-  and those with the same locations. Today's baseline with a ReleaseSafe
-  zap at 6828550: 401 exact, 91 more at the same location with different
-  wording, 349 different, 107 accepted, and 42 crashes (27 are
-  `Elf.parallel` panicking on an empty `build-obj`, also accepted
-  programs). The location share is the number to raise. Crashes come
-  first: a crash is the worst diagnostic.
+  `test/cases/compile_errors` (1017 files; 994 apply to x86_64-linux) and
+  counts cases where zap reports the same error lines (location and
+  message), and those with the same locations. With a ReleaseSafe zap,
+  step 1 (c0f7c7d) gave 338 exact, 431 at the same locations (exact
+  included), 416 different, 132 accepted, and 15 crashes. After the crash
+  fixes (08d7c40): 365 exact, 466 at the same locations, 397 different,
+  131 accepted, and no crashes. The location share is the number to
+  raise. Crashes come first: a crash is the worst diagnostic.
 
 ### Steps
 
@@ -3326,5 +3326,6 @@ unchanged:
 6. The cache: failing builds commit the manifest for the units that
    succeeded.
 7. Alongside: `run.py --compile-errors`, and fixing zap's crashes and
-   wrong locations on upstream's compile-error cases.
+   wrong locations on upstream's compile-error cases. (Harness done; no
+   crashes left.)
 8. Later: `zap explain` and `zap fix` (applies exact fixes).
