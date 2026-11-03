@@ -3469,7 +3469,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     // point into comptime memory.
                     sema.elemVal(block, src, .fromInterned((try sema.comptimeLoadOrNull(block, src, sema.resolveValue(lhs).?)).?), index, true)
                 else
-                    sema.analyzeLoad(block, src, try sema.elemPtr(block, src, lhs, index, safety)),
+                    sema.loadElem(block, src, lhs, index),
                 .elem_val => sema.elemVal(block, src, lhs, index, false),
                 else => unreachable,
             };
@@ -9762,12 +9762,19 @@ const MutStep = struct { index: u64, base_ptr_ty: Index, is_elem: bool };
 /// The steps of comptime pointer `ptr` from the comptime variable it points
 /// into, root first, if every step is a plain field or element (no byte
 /// offsets) and there are at most `max` of them.
-fn mutPath(sema: *Sema, ptr: Index, buf: []MutStep) ?struct { id: u32, steps: []MutStep } {
+fn mutPath(sema: *Sema, ptr: Index, buf: []MutStep) ?MutPath {
+    return sema.mutPathKey(sema.ip.keyPayload(.ptr, ptr), buf);
+}
+
+const MutPath = struct { id: u32, steps: []MutStep };
+
+/// `mutPath` of pointer `key`, which need not be interned.
+fn mutPathKey(sema: *Sema, key: InternPool.Ptr, buf: []MutStep) ?MutPath {
     const ip = sema.ip;
     var n: usize = 0;
-    var p = ptr;
-    while (true) {
-        const k = ip.keyPayload(.ptr, p);
+    var k = key;
+    var p: Index = undefined;
+    while (true) : (k = ip.keyPayload(.ptr, p)) {
         if (k.byte_offset != 0) return null;
         switch (k.base) {
             .comptime_alloc => |id| {
@@ -9807,12 +9814,13 @@ fn mutStepOk(sema: *Sema, ty: Index, st: MutStep, store: bool) enum { no, leaf_o
     };
 }
 
-/// A load through `ptr` from a comptime variable that has a tree of
-/// in-place stores, without interning the tree; null if `ptr` takes a
-/// step the tree does not model, for the general path to handle.
-fn mutLoad(sema: *Sema, ptr: Index) !?Index {
+/// A load of a `load_ty` through pointer `key` (not necessarily interned)
+/// from a comptime variable that has a tree of in-place stores, without
+/// interning the tree; null if `key` takes a step the tree does not model,
+/// for the general path to handle.
+fn mutLoadKey(sema: *Sema, key: InternPool.Ptr, load_ty: Index) !?Index {
     var buf: [16]MutStep = undefined;
-    const path = sema.mutPath(ptr, &buf) orelse return null;
+    const path = sema.mutPathKey(key, &buf) orelse return null;
     const alloc = sema.comptime_allocs.getPtr(path.id) orelse return null;
     var node: ?*MutValue = alloc.mut orelse return null;
     var cur: Index = .none;
@@ -9825,7 +9833,7 @@ fn mutLoad(sema: *Sema, ptr: Index) !?Index {
         }
         // A subarray load (`arr[a..b]` with comptime-known bounds).
         if (st.is_elem and i + 1 == path.steps.len and sema.ip.keyTag(ty) == .array_type and
-            Type.ptrInfo(sema.ip, sema.ip.typeOf(ptr)).child != sema.ip.keyPayload(.array_type, ty).child) return null;
+            load_ty != sema.ip.keyPayload(.array_type, ty).child) return null;
         if (node) |n| switch (n.*) {
             // An array's sentinel, which the tree has no element for.
             .agg => |a| if (st.index >= a.elems.len) {
@@ -10056,11 +10064,34 @@ fn comptimeLoadOrNull(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileE
     const load_ty = Type.ptrInfo(ip, ip.typeOf(ptr)).child;
     // Even through an undefined pointer, a zero-bit type has its one value.
     if (sema.isUndef(ptr)) if (try sema.onePossibleValue(load_ty)) |v| return v;
-    const v = (try sema.comptimeLoadStructural(block, src, ptr)) orelse return null;
+    const key = switch (ip.indexToKey(ptr)) {
+        .ptr => |k| k,
+        .undef => return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{}),
+        else => return null,
+    };
+    return sema.comptimeLoadKey(block, src, key, load_ty, ptr);
+}
+
+/// `comptimeLoadOrNull` through pointer `key`, which loads a `load_ty`.
+/// `ptr` is the interned pointer, or `.none` while it is not (its `key.ty`
+/// may be `.none` too): a field or element read through a comptime-known
+/// pointer builds the key the general path would intern and loads from
+/// it, without interning it. A load that needs the interned pointer (to
+/// reinterpret memory) then returns null, and the caller takes the general
+/// path.
+fn comptimeLoadKey(sema: *Sema, block: *Block, src: Src, key: InternPool.Ptr, load_ty: Index, ptr: Index) CompileError!?Index {
+    const ip = sema.ip;
+    const v = (try sema.comptimeLoadStructuralKey(block, src, key, load_ty, ptr)) orelse return null;
     const v_ty = ip.typeOf(v);
     if (v_ty == load_ty or load_ty == .generic_poison_type or load_ty == .anyopaque_type) return v;
     if (sema.childCoercibleInMemory(v_ty, load_ty)) return try sema.retypeInMemory(v, load_ty);
     // The pointer views the memory as another type.
+    return sema.reinterpretLoadOrNull(block, src, ptr);
+}
+
+/// `reinterpretLoad`, or null for a pointer not interned (`.none`).
+fn reinterpretLoadOrNull(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!?Index {
+    if (ptr == .none) return null;
     return sema.reinterpretLoad(block, src, ptr);
 }
 
@@ -10074,27 +10105,34 @@ fn comptimeLoadStructural(sema: *Sema, block: *Block, src: Src, ptr: Index) Comp
         .undef => return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{}),
         else => return null,
     };
+    return sema.comptimeLoadStructuralKey(block, src, key, Type.ptrInfo(ip, key.ty).child, ptr);
+}
+
+/// `comptimeLoadStructural` through pointer `key`, which loads a
+/// `load_ty`; `ptr` as for `comptimeLoadKey`.
+fn comptimeLoadStructuralKey(sema: *Sema, block: *Block, src: Src, key: InternPool.Ptr, load_ty: Index, ptr: Index) CompileError!?Index {
+    const ip = sema.ip;
     return switch (key.base) {
         .comptime_alloc => |id| blk: {
             const alloc = sema.comptime_allocs.getPtr(id) orelse
                 return sema.fail(block, src, "comptime variable is not accessible here", .{});
-            break :blk try sema.loadAtOffset(try sema.allocValue(alloc), key);
+            break :blk try sema.loadAtOffset(try sema.allocValue(alloc), key, load_ty);
         },
-        .uav => |u| try sema.loadAtOffset(u.val, key),
+        .uav => |u| try sema.loadAtOffset(u.val, key, load_ty),
         .nav => |n| blk: {
             try sema.ensureNavVal(block, src, n);
             const nav = ip.getNav(n);
             if (!nav.is_const) break :blk null;
-            break :blk try sema.loadAtOffset(nav.val, key);
+            break :blk try sema.loadAtOffset(nav.val, key, load_ty);
         },
         .int => null,
         .field => |f| blk: {
-            if (try sema.mutLoad(ptr)) |v| break :blk v;
-            if (key.byte_offset != 0) return sema.reinterpretLoad(block, src, ptr);
+            if (try sema.mutLoadKey(key, load_ty)) |v| break :blk v;
+            if (key.byte_offset != 0) return sema.reinterpretLoadOrNull(block, src, ptr);
             const parent = (try sema.comptimeLoadStructural(block, src, f.base)) orelse break :blk null;
             const parent_ty = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
             if (ip.typeOf(parent) != parent_ty)
-                return sema.reinterpretLoad(block, src, ptr);
+                return sema.reinterpretLoadOrNull(block, src, ptr);
             // An extern union's inactive field reads its bytes.
             if (Type.class(ip, parent_ty) == .@"union" and ip.structInfo(parent_ty).layout == .@"extern" and ip.keyTag(parent) == .un and
                 ip.keyPayload(.un, parent).tag != try sema.unionFieldTagValue(parent_ty, @intCast(f.index)))
@@ -10106,30 +10144,29 @@ fn comptimeLoadStructural(sema: *Sema, block: *Block, src: Src, ptr: Index) Comp
             break :blk try sema.fieldValue(parent, @intCast(f.index));
         },
         .elem => |e| blk: {
-            if (try sema.mutLoad(ptr)) |v| break :blk v;
-            if (key.byte_offset != 0) return sema.reinterpretLoad(block, src, ptr);
+            if (try sema.mutLoadKey(key, load_ty)) |v| break :blk v;
+            if (key.byte_offset != 0) return sema.reinterpretLoadOrNull(block, src, ptr);
             const parent = (try sema.comptimeLoadStructural(block, src, e.base)) orelse break :blk null;
             const parent_ty = Type.ptrInfo(ip, ip.typeOf(e.base)).child;
             if (ip.keyTag(parent_ty) == .vector_type) {
                 if (ip.typeOf(parent) != parent_ty or e.index >= ip.keyPayload(.vector_type, parent_ty).len)
-                    return sema.reinterpretLoad(block, src, ptr);
+                    return sema.reinterpretLoadOrNull(block, src, ptr);
                 break :blk try sema.elemValue(parent, e.index);
             }
             if (ip.keyTag(parent_ty) != .array_type) break :blk null;
             if (ip.keyTag(ip.typeOf(parent)) != .array_type) {
                 // A single item viewed as a one-element array (`*T` to `*[1]T`).
                 if (e.index == 0 and ip.typeOf(parent) == ip.keyPayload(.array_type, parent_ty).child) break :blk parent;
-                return sema.reinterpretLoad(block, src, ptr);
+                return sema.reinterpretLoadOrNull(block, src, ptr);
             }
             if (ip.typeOf(parent) != parent_ty or e.index >= ip.keyPayload(.array_type, parent_ty).lenIncludingSentinel())
-                return sema.reinterpretLoad(block, src, ptr);
+                return sema.reinterpretLoadOrNull(block, src, ptr);
             const elem_ty = ip.keyPayload(.array_type, parent_ty).child;
-            const load_ty = Type.ptrInfo(ip, key.ty).child;
             if (load_ty != elem_ty and ip.keyTag(load_ty) == .array_type and ip.keyPayload(.array_type, load_ty).child == elem_ty) {
                 // A subarray (from slicing with comptime-known bounds).
                 const a = ip.keyPayload(.array_type, load_ty);
                 if (e.index + a.len > ip.keyPayload(.array_type, parent_ty).lenIncludingSentinel())
-                    return sema.reinterpretLoad(block, src, ptr);
+                    return sema.reinterpretLoadOrNull(block, src, ptr);
                 break :blk try sema.subArray(parent, e.index, load_ty);
             }
             break :blk try sema.elemValue(parent, e.index);
@@ -10160,11 +10197,9 @@ fn subArray(sema: *Sema, val: Index, start: u64, load_ty: Index) !Index {
 /// element of array `val` that a pointer with a byte offset (from a
 /// many-pointer or a cast to the element type) addresses. Null if the
 /// pointer reinterprets memory in a way zap does not model.
-fn loadAtOffset(sema: *Sema, val: Index, key: InternPool.Ptr) !?Index {
+fn loadAtOffset(sema: *Sema, val: Index, key: InternPool.Ptr, load_ty: Index) !?Index {
     const ip = sema.ip;
     if (val == .none) return val;
-    const p = Type.ptrInfo(ip, key.ty);
-    const load_ty = p.child;
     const val_ty = ip.typeOf(val);
     if (load_ty == val_ty or load_ty == .generic_poison_type or load_ty == .anyopaque_type) return if (key.byte_offset == 0) val else null;
     if (key.byte_offset == 0 and ip.keyTag(load_ty) == .array_type) {
@@ -10830,30 +10865,38 @@ fn elemPtrType(sema: *Sema, p: InternPool.PtrType, elem_ty: Index, index: ?u64) 
 }
 
 fn ptrElemPtrVal(sema: *Sema, ptr: Index, i: u64) !Index {
+    return sema.intern(.{ .ptr = (try sema.ptrElemPtrKey(ptr, i, true)).key });
+}
+
+/// The pointer `ptrElemPtrVal` interns, and the type of the element it
+/// points to. Without `want_ty`, its type is `.none`, for a load through
+/// it (`comptimeLoadKey`).
+fn ptrElemPtrKey(sema: *Sema, ptr: Index, i: u64, want_ty: bool) !struct { key: InternPool.Ptr, elem_ty: Index } {
     const ip = sema.ip;
     const key = ip.keyPayload(.ptr, ptr);
     const p = Type.ptrInfo(ip, key.ty);
     const elem_ty = if (p.flags.size == .one) Type.childType(ip, p.child) else p.child;
-    const elem_ptr_ty = try sema.elemPtrType(p, elem_ty, i);
-    if (p.flags.size == .one) {
-        return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = ptr, .index = i } } } });
-    }
-    // Steps over elements of the same size merge; a pointer cast to
-    // another element size (`[]const u8` over a `[3][4]u8`) steps by bytes.
-    if (key.base == .elem and key.byte_offset == 0 and Type.abiSize(ip, sema.memElemType(ip.typeOf(key.base.elem.base))) == Type.abiSize(ip, elem_ty)) {
-        const e = key.base.elem;
-        return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = e.base, .index = e.index + i } } } });
-    }
-    // Byte offsets cannot tell zero-size elements (such as types) apart:
-    // index the array the pointer starts.
-    if (Type.abiSize(ip, elem_ty) == 0 and key.byte_offset == 0 and key.base == .uav) {
-        const arr_ty = ip.typeOf(key.base.uav.val);
-        if (ip.keyTag(arr_ty) == .array_type and Type.childType(ip, arr_ty) == elem_ty) {
-            const arr_ptr = try sema.intern(.{ .ptr = .{ .ty = try sema.ptrType(.{ .child = arr_ty, .flags = .{ .is_const = p.flags.is_const } }), .base = key.base } });
-            return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = arr_ptr, .index = i } } } });
+    const elem_ptr_ty = if (want_ty) try sema.elemPtrType(p, elem_ty, i) else .none;
+    const base: InternPool.Ptr.BaseAddr, const byte_offset: u64 = blk: {
+        if (p.flags.size == .one) break :blk .{ .{ .elem = .{ .base = ptr, .index = i } }, 0 };
+        // Steps over elements of the same size merge; a pointer cast to
+        // another element size (`[]const u8` over a `[3][4]u8`) steps by bytes.
+        if (key.base == .elem and key.byte_offset == 0 and Type.abiSize(ip, sema.memElemType(ip.typeOf(key.base.elem.base))) == Type.abiSize(ip, elem_ty)) {
+            const e = key.base.elem;
+            break :blk .{ .{ .elem = .{ .base = e.base, .index = e.index + i } }, 0 };
         }
-    }
-    return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = key.base, .byte_offset = key.byte_offset + i * Type.abiSize(ip, elem_ty) } });
+        // Byte offsets cannot tell zero-size elements (such as types) apart:
+        // index the array the pointer starts.
+        if (Type.abiSize(ip, elem_ty) == 0 and key.byte_offset == 0 and key.base == .uav) {
+            const arr_ty = ip.typeOf(key.base.uav.val);
+            if (ip.keyTag(arr_ty) == .array_type and Type.childType(ip, arr_ty) == elem_ty) {
+                const arr_ptr = try sema.intern(.{ .ptr = .{ .ty = try sema.ptrType(.{ .child = arr_ty, .flags = .{ .is_const = p.flags.is_const } }), .base = key.base } });
+                break :blk .{ .{ .elem = .{ .base = arr_ptr, .index = i } }, 0 };
+            }
+        }
+        break :blk .{ key.base, key.byte_offset + i * Type.abiSize(ip, elem_ty) };
+    };
+    return .{ .key = .{ .ty = elem_ptr_ty, .base = base, .byte_offset = byte_offset }, .elem_ty = elem_ty };
 }
 
 // ---------------------------------------------------------------------------
@@ -11007,6 +11050,30 @@ fn fieldPtrLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8
 }
 
 /// `lhs.name` where `lhs` is a value, a pointer to the object, or a type.
+/// `analyzeLoad(fieldPtr(ptr, name))` for a pointer to a struct or tuple.
+/// Through a comptime-known pointer, the field is read without interning
+/// the field pointer (see `comptimeLoadKey`): the walker reads fields this
+/// way about a million times on large programs.
+fn loadField(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) CompileError!Ref {
+    const ip = sema.ip;
+    const p = Type.ptrInfo(ip, sema.typeOf(ptr));
+    const child = p.child;
+    comptime_known: {
+        if (sema.bc != null or Type.isPackedStruct(ip, child)) break :comptime_known;
+        const pv = sema.resolveValue(ptr) orelse break :comptime_known;
+        if (ip.keyTag(pv) != .ptr) break :comptime_known;
+        // What `fieldPtr` and `fieldPtrAt` check and resolve.
+        const i = try sema.structFieldIndex(block, src, child, name);
+        if (ip.keyTag(child) == .struct_type) try sema.resolveLayout(block, src, child);
+        if (Type.comptimeFieldValue(ip, child, i) != .none) break :comptime_known;
+        _ = try sema.fieldPtrAlignment(block, src, p.flags.alignment, child, i);
+        if (try sema.comptimePtrRoot(pv) == .int) break :comptime_known;
+        const key: InternPool.Ptr = .{ .ty = .none, .base = .{ .field = .{ .base = pv, .index = i } } };
+        if (try sema.comptimeLoadKey(block, src, key, Type.fieldType(ip, child, i), .none)) |v| return .fromInterned(v);
+    }
+    return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, ptr, name));
+}
+
 fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) CompileError!Ref {
     const ip = sema.ip;
     const ty = sema.typeOf(lhs);
@@ -11035,8 +11102,9 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                         .alignment = p.flags.alignment,
                     } }));
                 },
-                .tuple => if (std.mem.eql(u8, name, "len")) return .fromInterned(try sema.intValue(.usize_type, ip.keyPayload(.tuple_type, p.child).types.len)) else return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
-                .@"struct", .@"union" => return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
+                .tuple => if (std.mem.eql(u8, name, "len")) return .fromInterned(try sema.intValue(.usize_type, ip.keyPayload(.tuple_type, p.child).types.len)) else return sema.loadField(block, src, lhs, name),
+                .@"struct" => return sema.loadField(block, src, lhs, name),
+                .@"union" => return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
                 .pointer => {
                     // `ptr.len` of a pointer to an array needs only its type.
                     const cp = Type.ptrInfo(ip, p.child);
@@ -11864,6 +11932,49 @@ fn boundsCheck(sema: *Sema, block: *Block, src: Src, index: Ref, len: Ref, allow
 }
 
 /// `&lhs[index]` where `ptr` points to the indexable object.
+/// `analyzeLoad(elemPtr(ptr, index, true))`. Through a comptime-known
+/// pointer to an array or a slice, at a comptime-known index, the element
+/// is read without interning the element pointer (see `comptimeLoadKey`).
+fn loadElem(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    comptime_known: {
+        if (sema.bc != null) break :comptime_known;
+        const ptr_ty = sema.typeOf(ptr);
+        if (Type.class(ip, ptr_ty) != .pointer or sema.resolveValue(uncasted_index) == null) break :comptime_known;
+        const pv = sema.resolveValue(ptr) orelse break :comptime_known;
+        if (ip.keyTag(pv) != .ptr) break :comptime_known;
+        const p = Type.ptrInfo(ip, ptr_ty);
+        if (p.flags.size != .one) break :comptime_known;
+        // What `elemPtr` checks and resolves on its way to the pointer.
+        switch (ip.keyTag(p.child)) {
+            .array_type => {
+                const a = ip.keyPayload(.array_type, p.child);
+                const index = try sema.coerce(block, .usize_type, uncasted_index, src);
+                try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
+                // `elemPtrOfArrayPtr`.
+                if (p.flags.alignment != 0) try sema.resolveLayout(block, src, a.child);
+                if (try sema.comptimePtrRoot(pv) == .int) break :comptime_known;
+                const e = try sema.ptrElemPtrKey(pv, ip.intValue(u64, sema.resolveValue(index).?).?, false);
+                if (try sema.comptimeLoadKey(block, src, e.key, e.elem_ty, .none)) |v| return .fromInterned(v);
+            },
+            .ptr_type => if (ip.keyPayload(.ptr_type, p.child).flags.size == .slice) {
+                // The slice, as `analyzeLoad` reads it at comptime, then
+                // `elemPtrOfSlice`.
+                const sv = (try sema.comptimeLoadOrNull(block, src, pv)) orelse break :comptime_known;
+                if (sema.isUndef(sv)) break :comptime_known;
+                const cp = Type.ptrInfo(ip, ip.typeOf(sv));
+                const index = try sema.coerce(block, .usize_type, uncasted_index, src);
+                try sema.resolveLayout(block, src, cp.child);
+                try sema.boundsCheck(block, src, index, .fromInterned(ip.keyPayload(.slice, sv).len), cp.sentinel != .none);
+                const e = try sema.ptrElemPtrKey(ip.keyPayload(.slice, sv).ptr, ip.intValue(u64, sema.resolveValue(index).?).?, false);
+                if (try sema.comptimeLoadKey(block, src, e.key, e.elem_ty, .none)) |v| return .fromInterned(v);
+            },
+            else => {},
+        }
+    }
+    return sema.analyzeLoad(block, src, try sema.elemPtr(block, src, ptr, uncasted_index, true));
+}
+
 fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, safety: bool) CompileError!Ref {
     const ip = sema.ip;
     const ptr_ty = sema.typeOf(ptr);
@@ -11988,7 +12099,10 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
                 // The sentinel of a sentinel-terminated slice can be read.
                 if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, lhs), p.sentinel != .none);
                 if (sema.resolveValue(lhs)) |sv| if (sema.resolveValue(index)) |iv| {
-                    const ep = try sema.ptrElemPtrVal(ip.keyPayload(.slice, sv).ptr, ip.intValue(u64, iv).?);
+                    const slice_ptr = ip.keyPayload(.slice, sv).ptr;
+                    const e = try sema.ptrElemPtrKey(slice_ptr, ip.intValue(u64, iv).?, false);
+                    if (try sema.comptimeLoadKey(block, src, e.key, e.elem_ty, .none)) |v| return .fromInterned(v);
+                    const ep = try sema.ptrElemPtrVal(slice_ptr, ip.intValue(u64, iv).?);
                     if (try sema.comptimeLoadOrNull(block, src, ep)) |v| return .fromInterned(v);
                 };
                 if (block.is_comptime) if (try sema.indexedOnePossibleValue(ty)) |v| return .fromInterned(v);
