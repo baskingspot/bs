@@ -37,6 +37,14 @@ upstream/lib (the source tree, which has std's testdata), as
 `zig build test-std` builds its Debug entry for the target. Results are
 parsed as with --default-runner and compared with baseline/std-<target>.json.
 
+With --compile-errors, the measure is diagnostics instead: every case in
+upstream's test/cases/compile_errors that applies to the target, compiled
+by zap as upstream's case harness compiles it (build-obj, or build-exe or
+test when the case says so). A case is "exact" when zap reports the same
+error lines (location and message) as the case expects, "same location"
+when only the messages differ, and otherwise "different", "accepted" (no
+error), "crash" or "timeout". Notes are compared separately.
+
 Portable to Linux and macOS: Python 3 standard library only.
 """
 
@@ -860,6 +868,148 @@ def std_target(compiler, cfg, args, workdir):
     )
 
 
+# ---------------------------------------------------------------- compile-errors mode
+
+CASES_DIR = UPSTREAM_TEST / "cases" / "compile_errors"
+LOC_RE = re.compile(r"^(?P<path>[^\s:][^:]*)?:(?P<line>\d+):(?P<col>\d+): (?P<kind>error|note): (?P<msg>.*)$")
+
+
+def parse_case(path):
+    """The case's config and expected lines, or None if it is not an error case."""
+    src = path.read_text(errors="replace")
+    at = src.rfind("\n// error\n")
+    if at < 0:
+        return None
+    cfg, expected = {}, []
+    for ln in src[at + len("\n// error\n"):].splitlines():
+        text = ln[3:] if ln.startswith("// ") else ""
+        m = re.match(r"^(\w+)=(.*)$", text)
+        if m and not expected:
+            cfg[m.group(1)] = m.group(2)
+        elif text:
+            expected.append(text)
+    return cfg, expected
+
+
+def case_applies(cfg, target):
+    targets = cfg.get("target", "native").split(",")
+    arch_os = target.split("-")[:2]
+    if not any(t == "native" or t.split("-")[:2] == arch_os or t in ("x86_64-native", "native-linux") and arch_os == ["x86_64", "linux"] for t in targets):
+        return False
+    return all(b in ("auto", "selfhosted", "stage2") for b in cfg.get("backend", "auto").split(","))
+
+
+def zap_lines(stderr, case_name):
+    """zap's text diagnostics as upstream-style ':line:col: error: msg' lines,
+    with the case file's own path dropped and other paths reduced to their
+    base name, as upstream's harness shows them."""
+    errors, notes = [], []
+    def norm(path, rest):
+        base = os.path.basename(path)
+        return (":" if base == case_name else base + ":") + rest
+    for ln in stderr.splitlines():
+        m = re.match(r"^(\S+?):(\d+):(\d+): error(?:\[[^\]]*\])?: (.*)$", ln)
+        if m:
+            errors.append(norm(m.group(1), f"{m.group(2)}:{m.group(3)}: error: {m.group(4)}"))
+            continue
+        m = re.match(r"^  note (\S+?):(\d+):(\d+): (.*)$", ln)
+        if m:
+            notes.append(norm(m.group(1), f"{m.group(2)}:{m.group(3)}: note: {m.group(4)}"))
+    return errors, notes
+
+
+def crash_frame(stderr):
+    """The first frame of a crash's stack trace in zap's own source."""
+    for ln in stderr.splitlines():
+        m = re.search(r"/src/(\S+?\.zig:\d+):\d+: 0x[0-9a-f]+ in", ln)
+        if m:
+            return m.group(1)
+    return "?"
+
+
+def run_case(compiler, path, cfg, expected, args, workdir):
+    out_dir = workdir / "compile-errors" / path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.get("is_test") == "true":
+        argv = [str(compiler), "test", "--test-no-exec", str(path), f"-femit-bin={out_dir / 'case.test'}"]
+    elif cfg.get("output_mode", "Obj").lower() == "exe":
+        argv = [str(compiler), "build-exe", str(path), f"-femit-bin={out_dir / 'case'}"]
+    else:
+        argv = [str(compiler), "build-obj", str(path), f"-femit-bin={out_dir / 'case.o'}"]
+    code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    exp_errors = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "error"]
+    exp_notes = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "note"]
+    r = {"expected": exp_errors}
+    if timed_out:
+        r["status"] = "timeout"
+    elif code < 0 or "panic: " in err and not re.search(r"^\S+:\d+:\d+: error", err, re.M):
+        r["status"], r["crash"] = "crash", crash_frame(err)
+    elif code == 0:
+        r["status"] = "accepted"
+    else:
+        errors, notes = zap_lines(err, path.name)
+        r["got"] = errors
+        locs = lambda ls: sorted(l.split(": error:")[0] for l in ls)
+        if sorted(errors) == sorted(exp_errors):
+            r["status"] = "exact"
+            r["notes_match"] = sorted(notes) == sorted(exp_notes)
+        elif locs(errors) == locs(exp_errors):
+            r["status"] = "same_location"
+        else:
+            r["status"] = "different"
+    return path.name, r
+
+
+def compile_errors_target(compiler, cfg, args, workdir):
+    """--compile-errors: upstream's compile-error cases, compiled by zap."""
+    if args.upstream:
+        sys.exit("error: --compile-errors measures zap; the cases' expectations are upstream's")
+    # Failing builds record nothing worth reusing across cases.
+    os.environ["ZAP_CACHE"] = "off"
+    cases = []
+    for path in sorted(CASES_DIR.rglob("*.zig")):
+        parsed = parse_case(path)
+        if parsed and case_applies(parsed[0], cfg["zig_target"]):
+            cases.append((path, *parsed))
+    if args.files:
+        cases = [c for c in cases if c[0].name in args.files]
+    results = {}
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        futs = [ex.submit(run_case, compiler, p, c, e, args, workdir) for p, c, e in cases]
+        for f in as_completed(futs):
+            name, r = f.result()
+            results[name] = r
+            if args.verbose:
+                print(f"  {name}: {r['status']}{' ' + r.get('crash', '') if r['status'] == 'crash' else ''}", file=sys.stderr)
+    counts = {}
+    for r in results.values():
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    notes_ok = sum(1 for r in results.values() if r.get("notes_match"))
+    data = {
+        "format": FORMAT,
+        "target": cfg["name"],
+        "compiler": str(compiler),
+        "summary": {"cases": len(results), **counts, "exact_with_notes": notes_ok},
+        "cases": dict(sorted(results.items())),
+    }
+    out_path = args.out or workdir / f"compile-errors-{cfg['name']}.json"
+    write_json(out_path, data)
+    n = len(results)
+    loc = counts.get("exact", 0) + counts.get("same_location", 0)
+    print(
+        f"{cfg['name']} compile errors: {counts.get('exact', 0)}/{n} exact ({notes_ok} with notes), "
+        f"{loc}/{n} same location; {counts.get('different', 0)} different, {counts.get('accepted', 0)} accepted, "
+        f"{counts.get('crash', 0)} crashes, {counts.get('timeout', 0)} timeouts -> {rel(out_path)}"
+    )
+    crashes = {}
+    for name, r in results.items():
+        if r["status"] == "crash":
+            crashes.setdefault(r["crash"], []).append(name)
+    for frame, names in sorted(crashes.items(), key=lambda kv: -len(kv[1])):
+        print(f"  crash at {frame}: {len(names)} ({', '.join(sorted(names)[:3])}{', ...' if len(names) > 3 else ''})")
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -872,6 +1022,7 @@ def main():
     p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, zap_runner.zig for zap until zap compiles test_runner.zig)")
     p.add_argument("--default-runner", action="store_true", help="zap only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `zap test` without --test-runner does")
     p.add_argument("--std", action="store_true", help="measure upstream's std tests (lib/std/std.zig, default runner) instead of test/behavior")
+    p.add_argument("--compile-errors", action="store_true", help="zap only: measure diagnostics on upstream's test/cases/compile_errors instead of test/behavior")
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
     p.add_argument("--compile-timeout", type=float, default=300, help="seconds per file compile")
@@ -906,6 +1057,8 @@ def main():
             cfg = dict(TARGETS[name], name=name)
             if name not in runnable:
                 print(f"{name}: not run (needs an {name} host)")
+            elif args.compile_errors:
+                compile_errors_target(compiler, cfg, args, args.workdir)
             elif args.std:
                 std_target(compiler, cfg, args, args.workdir)
             elif args.upstream:
