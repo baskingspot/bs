@@ -94,12 +94,6 @@ uav_capturing: u32 = 0,
 /// `exportTarget` calls, whose results can change while analysis runs: a
 /// lowering that made one is not memoized.
 export_lookups: u32 = 0,
-/// Whether each owner's atoms are still adjacent in `atoms`; if not,
-/// `finish` regroups them (`groupByOwner`).
-grouped: bool = true,
-/// Units and the link's code that already have atoms, while `grouped`.
-units_seen: std.AutoHashMapUnmanaged(Zcu.AnalUnit, void) = .empty,
-link_seen: bool = false,
 /// The error codes `finish` assigned, for `link`.
 error_values: std.ArrayList(Elf.Value) = .empty,
 /// Time spent in `CodeGen.generate`, for `ZAP_TIMING`.
@@ -308,7 +302,6 @@ pub fn deinit(emit: *Emit) void {
     emit.uav_memo.deinit(gpa);
     emit.uav_refs.deinit(gpa);
     emit.uav_uses.deinit(gpa);
-    emit.units_seen.deinit(gpa);
     emit.error_values.deinit(gpa);
     emit.rt_pending.deinit(gpa);
     emit.side.deinit(gpa);
@@ -674,7 +667,7 @@ pub fn finish(emit: *Emit) !bool {
     if (emit.lazy) {
         try emit.lowerNavs();
         if (emit.failed) return false;
-        if (!emit.grouped) try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
+        try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
         return true;
     }
     // Before the declarations: a slot can request an exported one.
@@ -699,7 +692,7 @@ pub fn finish(emit: *Emit) !bool {
         return false;
     }
 
-    if (!emit.grouped) try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
+    try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
 
     // Error codes: the order names were first interned, starting at 1.
     for (emit.errors.keys()) |name| {
@@ -924,71 +917,100 @@ pub fn addAtom(emit: *Emit, atom: Atom) !void {
 
 fn appendAtom(emit: *Emit, atom: Atom) !void {
     try emit.atom_owners.ensureUnusedCapacity(emit.gpa, 1);
-    const owners = emit.atom_owners.items;
-    if (emit.grouped and (owners.len == 0 or !std.meta.eql(owners[owners.len - 1], emit.owner))) switch (emit.owner) {
-        .unit => |u| if ((try emit.units_seen.getOrPut(emit.gpa, u)).found_existing) {
-            emit.grouped = false;
-        },
-        .link => {
-            if (emit.link_seen) emit.grouped = false;
-            emit.link_seen = true;
-        },
-        // Each content-addressed atom is its own owner.
-        .content => {},
-    };
     try emit.atoms.append(emit.gpa, atom);
     emit.atom_owners.appendAssumeCapacity(emit.owner);
 }
 
-/// Reorders atoms so that each owner's are adjacent, owners in the order
-/// of their first atom, and drops atoms whose key an earlier one has, with
-/// their debug entries. That is the list the cache's manifest replays
-/// (nodes in the order of their first atom, `Incremental.record`), and the
-/// linker lays out atoms in chunks of input positions, so a fresh link of
-/// any other order or with duplicates could differ from a relink in
-/// padding.
+/// Reorders atoms so that each owner's are adjacent, owners sorted by the
+/// key of their first atom with the link's own atoms last, and drops atoms
+/// whose key an earlier one has, with their debug entries. The order is
+/// then a function of the atoms and their owners, not of the order units
+/// were analyzed or loaded in, so a build that loads units from the cache
+/// links the same bytes as one that analyzes them all. That is also the
+/// list the cache's manifest replays (nodes in the order of their first
+/// atom, `Incremental.record`), and the linker lays out atoms in chunks of
+/// input positions, so a fresh link of any other order or with duplicates
+/// could differ from a relink in padding.
 pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.ArrayList(Owner), debug: *std.ArrayList(Atom.Debug)) !void {
     const Group = union(enum) { unit: Zcu.AnalUnit, content: SymbolKey, link };
     const dropped = std.math.maxInt(u32);
     const n = atoms.items.len;
+    // Each atom's group.
     const group_of = try gpa.alloc(u32, n);
     defer gpa.free(group_of);
-    var groups: std.AutoHashMapUnmanaged(Group, u32) = .empty;
+    var groups: std.AutoArrayHashMapUnmanaged(Group, void) = .empty;
     defer groups.deinit(gpa);
-    var keys: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
-    defer keys.deinit(gpa);
     for (atoms.items, owners.items, group_of) |a, o, *g| {
-        if ((try keys.getOrPut(gpa, a.key)).found_existing) {
-            g.* = dropped;
-            continue;
-        }
         const gop = try groups.getOrPut(gpa, switch (o) {
             .unit => |u| .{ .unit = u },
             .content => .{ .content = a.key },
             .link => .link,
         });
-        if (!gop.found_existing) gop.value_ptr.* = groups.count() - 1;
-        g.* = gop.value_ptr.*;
+        g.* = @intCast(gop.index);
     }
-    // A stable counting sort by group.
+    // Atom indices by group, each group's in their order.
     const starts = try gpa.alloc(u32, groups.count() + 1);
     defer gpa.free(starts);
     @memset(starts, 0);
-    for (group_of) |g| if (g != dropped) {
-        starts[g + 1] += 1;
-    };
+    for (group_of) |g| starts[g + 1] += 1;
     for (1..starts.len) |i| starts[i] += starts[i - 1];
-    const kept = starts[starts.len - 1];
+    const by_group = try gpa.alloc(u32, n);
+    defer gpa.free(by_group);
+    {
+        const next = try gpa.dupe(u32, starts[0 .. starts.len - 1]);
+        defer gpa.free(next);
+        for (group_of, 0..) |g, i| {
+            by_group[next[g]] = @intCast(i);
+            next[g] += 1;
+        }
+    }
+    // The groups by their atoms' keys, the link's last. Two owners whose
+    // atoms all have the same keys are told apart by owner, which only
+    // the dropping of duplicates below can see.
+    const order = try gpa.alloc(u32, groups.count());
+    defer gpa.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    const Sort = struct {
+        atoms: []const Atom,
+        groups: []const Group,
+        starts: []const u32,
+        by_group: []const u32,
+
+        fn lessThan(c: @This(), x: u32, y: u32) bool {
+            const gx = c.groups[x];
+            const gy = c.groups[y];
+            if ((gx == .link) != (gy == .link)) return gy == .link;
+            const ax = c.by_group[c.starts[x]..c.starts[x + 1]];
+            const ay = c.by_group[c.starts[y]..c.starts[y + 1]];
+            for (ax[0..@min(ax.len, ay.len)], ay[0..@min(ax.len, ay.len)]) |i, j| {
+                const kx = @backingInt(c.atoms[i].key);
+                const ky = @backingInt(c.atoms[j].key);
+                if (kx != ky) return kx < ky;
+            }
+            if (ax.len != ay.len) return ax.len < ay.len;
+            var hx: std.hash.Wyhash = .init(0);
+            std.hash.autoHash(&hx, gx);
+            var hy: std.hash.Wyhash = .init(0);
+            std.hash.autoHash(&hy, gy);
+            return hx.final() < hy.final();
+        }
+    };
+    std.mem.sortUnstable(u32, order, Sort{ .atoms = atoms.items, .groups = groups.keys(), .starts = starts, .by_group = by_group }, Sort.lessThan);
+    // New positions, dropping repeated keys.
+    var keys: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
+    defer keys.deinit(gpa);
+    try keys.ensureTotalCapacity(gpa, @intCast(n));
     const new_index = try gpa.alloc(u32, n);
     defer gpa.free(new_index);
-    for (group_of, new_index) |g, *ni| {
-        if (g == dropped) {
-            ni.* = dropped;
+    var kept: u32 = 0;
+    for (order) |g| for (by_group[starts[g]..starts[g + 1]]) |i| {
+        if (keys.getOrPutAssumeCapacity(atoms.items[i].key).found_existing) {
+            new_index[i] = dropped;
             continue;
         }
-        ni.* = starts[g];
-        starts[g] += 1;
-    }
+        new_index[i] = kept;
+        kept += 1;
+    };
     const new_atoms = try gpa.alloc(Atom, kept);
     defer gpa.free(new_atoms);
     const new_owners = try gpa.alloc(Owner, kept);

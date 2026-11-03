@@ -2243,13 +2243,17 @@ it and can flush every CPU's TLB.
 - **Link order**: the linker lays out atoms in chunks of input positions,
   so its output depends on the input order and on duplicates, not just on
   the set of atoms. A fresh build therefore links exactly the list the
-  manifest replays: Emit tracks, as atoms are added, whether each owner's
-  atoms are still adjacent (one hash insert per unit), and if not,
-  `finish` regroups them, owners in the order of their first atom, and
-  drops later atoms with a key already seen (`Emit.groupByOwner`). A
-  relink then reproduces the fresh build byte for byte for any
-  alignments; the test in `src/Emit.zig` mixes alignments, duplicate
-  constants, and a unit whose atoms are split.
+  manifest replays: `finish` groups each owner's atoms, sorts the owners
+  by their atoms' symbol keys (the first atom's, then the next ones'; the
+  link's own atoms last), and drops later atoms with a key already seen
+  (`Emit.groupByOwner`). The order is a function of the atoms and their
+  owners, not of the order units were analyzed or loaded in, so a build
+  that loads units from the cache (a donor's first build, an eager edit
+  build) links the bytes a full build does, given the same error codes.
+  Sorting by symbol key rather than by the manifest's node key costs no
+  keying (2026-11-03). A relink then reproduces the fresh build byte for
+  byte for any alignments; the test in `src/Emit.zig` mixes alignments,
+  duplicate constants, and a unit whose atoms are split.
 - **Cost of recording**: on a generated std-free program of 20k functions
   and 5k globals (24.5k atoms, 68.6k nodes, 196k edges; 0.7 s to build),
   the build waits 65–80 ms for `record` after the link (wall 665–720 ms,
@@ -2785,8 +2789,8 @@ and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
   relink, no replay), whose `record` compares its nodes with the edit
   build's manifest: the same nodes with the same kinds, source hashes,
   results, dependencies (by key and kind), references, and atom records
-  byte for byte (so `base_line`s too). Not the output's bytes: the link
-  lays atoms out in analysis order, which loading changes. A difference
+  byte for byte (so `base_line`s too). Not the output's bytes: a lazy
+  build links in manifest order with its new nodes last. A difference
   fails the build. `zig build test` runs it in test/run's edit scripts
   (`rebuild-without`, `rebuild-replace`, `rebuild-lib-without` headers:
   each edit is built forward and back, verified, then relinked):
