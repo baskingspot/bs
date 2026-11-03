@@ -4624,7 +4624,22 @@ fn resolvePeerTypes(sema: *Sema, block: *Block, src: Src, refs: []const Ref) Com
     var chosen: Index = .noreturn_type;
     sema.peers_comptime_known = false;
     for (refs) |r| sema.peers_comptime_known = sema.peers_comptime_known or sema.resolveValue(r) != null;
+    // Upstream resolves all peers at once: array pointers next to a
+    // many-pointer become many-pointers, not slices, whatever their order.
+    // So many-pointer peers go first.
+    var many_first = refs;
     for (refs) |r| {
+        if (!sema.isManyPtr(sema.typeOf(r))) continue;
+        const sorted = try sema.arena.dupe(Ref, refs);
+        std.mem.sort(Ref, sorted, sema, struct {
+            fn lt(s: *Sema, x: Ref, y: Ref) bool {
+                return s.isManyPtr(s.typeOf(x)) and !s.isManyPtr(s.typeOf(y));
+            }
+        }.lt);
+        many_first = sorted;
+        break;
+    }
+    for (many_first) |r| {
         const ty = sema.typeOf(r);
         if (ty == .noreturn_type) continue;
         if (chosen == .noreturn_type) {
@@ -4634,6 +4649,11 @@ fn resolvePeerTypes(sema: *Sema, block: *Block, src: Src, refs: []const Ref) Com
         chosen = try sema.peerPair(block, src, chosen, ty);
     }
     return chosen;
+}
+
+fn isManyPtr(sema: *Sema, ty: Index) bool {
+    const t = if (Type.class(sema.ip, ty) == .optional) Type.childType(sema.ip, ty) else ty;
+    return Type.class(sema.ip, t) == .pointer and Type.ptrInfo(sema.ip, t).flags.size == .many;
 }
 
 fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileError!Index {
@@ -9009,6 +9029,25 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
         const init = try sema.coerce(block, ip.structInfo(ty).field_types[fi], items[0].init, src);
         return sema.unionInit(block, src, ty, fi, init);
     }
+    if (ip.indexToKey(ty) == .tuple_type) {
+        // `Tuple{ .@"0" = a, ... }`: fields by their names; a comptime
+        // field keeps its value.
+        const t = ip.indexToKey(ty).tuple_type;
+        const elems = try sema.arena.alloc(Ref, t.types.len);
+        @memset(elems, .none);
+        for (items) |item| {
+            const idx = try sema.structFieldIndex(block, src, ty, item.name);
+            elems[idx] = try sema.coerce(block, t.types[idx], item.init, src);
+        }
+        for (elems, t.values, 0..) |*e, v, k| {
+            if (v != .none) {
+                if (e.* != .none and sema.resolveValue(e.*) != v)
+                    return sema.fail(block, src, "value stored in comptime field does not match the default value of the field", .{});
+                e.* = .fromInterned(v);
+            } else if (e.* == .none) return sema.fail(block, src, "missing tuple field with index {d}", .{k});
+        }
+        return sema.aggregate(block, src, ty, elems);
+    }
     if (ip.indexToKey(ty) != .struct_type) return sema.fail(block, src, "type '{f}' does not support struct initialization syntax", .{sema.fmtType(ty)});
     try sema.resolveStructFields(block, src, ty);
     const info = ip.structInfo(ty);
@@ -9881,6 +9920,10 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     } else {
         body_len = sema.code.extraData(Zir.Inst.Func, data.payload_index).data.body_len;
     }
+    if (is_var_args) {
+        if (cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
+        if (body_len != 0) return sema.failUnsupported(block, src, "variadic function definitions");
+    }
 
     var ret_ty: Index = if (fn_info.ret_ty_body.len != 0) blk: {
         if (fn_info.ret_ty_is_generic) break :blk .generic_poison_type;
@@ -9891,10 +9934,6 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     // inferred error set (see `calleeRetTy`).
     if (fn_info.inferred_error_set and ret_ty != .generic_poison_type) {
         ret_ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = .adhoc_inferred_error_set_type, .payload_type = ret_ty } });
-    }
-    if (is_var_args) {
-        if (cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
-        if (body_len != 0) return sema.failUnsupported(block, src, "variadic function definitions");
     }
 
     var is_generic = ret_ty == .generic_poison_type;
@@ -9992,6 +10031,11 @@ fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     if (Type.class(ip, container) == .pointer and Type.ptrInfo(ip, container).flags.size == .one) {
         self_ptr = try sema.analyzeLoad(block, src, obj);
         container = Type.ptrInfo(ip, container).child;
+        // A pointer to a type: a call of one of its declarations.
+        if (container == .type_type) {
+            const callee = try sema.fieldVal(block, src, try sema.analyzeLoad(block, src, self_ptr), name);
+            return sema.analyzeCall(block, src, callee, .none, args, modifier);
+        }
     }
     if (ip.indexToKey(container) == .struct_type) {
         try sema.resolveStructFields(block, src, container);
