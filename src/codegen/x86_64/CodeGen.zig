@@ -62,6 +62,21 @@ outermost_frame: bool = false,
 /// In a variadic C function: where the prologue saved the argument
 /// registers, and what the named parameters used of them and of the stack.
 va: struct { save: i32 = 0, gp: u8 = 0, sse: u8 = 0, stack: u32 = 0 } = .{},
+/// Debug info: the last line row (relative to the innermost open inline
+/// call's declaration, or the function's), the inlined calls, the source
+/// files other than the function's that they come from, and the open
+/// calls, innermost last.
+dbg_line: u32 = 0,
+dbg_column: u32 = 0,
+dbg_inlines: std.ArrayList(Atom.Debug.Inline) = .empty,
+dbg_inline_names: std.ArrayList(u8) = .empty,
+dbg_inline_callees: std.ArrayList(SymbolKey) = .empty,
+dbg_files: std.ArrayList(u32) = .empty,
+dbg_open: std.ArrayList(OpenInline) = .empty,
+
+/// An inlined call whose end is not reached yet, and the caller's row to
+/// resume after it.
+const OpenInline = struct { index: u32, line: u32, column: u32 };
 
 pub const Error = Allocator.Error || error{CodegenFail};
 
@@ -104,6 +119,11 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.e.deinit();
         gpa.free(cg.homes);
         cg.blocks.deinit(gpa);
+        cg.dbg_inlines.deinit(gpa);
+        cg.dbg_inline_names.deinit(gpa);
+        cg.dbg_inline_callees.deinit(gpa);
+        cg.dbg_files.deinit(gpa);
+        cg.dbg_open.deinit(gpa);
     }
     @memset(cg.homes, .none);
 
@@ -134,12 +154,25 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         if (x.target == .nav and x.target.nav == func.owner_nav and func.generic_owner == .none) name = ip.stringSlice(x.name);
     }
     const file = emit.zcu.file(nav.file);
+    // A compile unit per module, named after its root file, as upstream.
+    const module = emit.zcu.fe.module(file.module);
+    var files: std.ArrayList(u8) = .empty;
+    for (cg.dbg_files.items) |f| {
+        try files.appendSlice(arena, emit.zcu.file(f).display_path);
+        try files.append(arena, 0);
+    }
     const debug: Atom.Debug = .{
         .file = file.display_path,
         .name = ip.stringSlice(nav.name),
         .base_line = file.zir.getDeclaration(nav.zir_inst).src_line,
         .lines = try arena.dupe(u8, cg.e.lines.bytes.items),
         .frame = if (cg.outermost_frame) .outermost else if (naked) .none else .frame_pointer,
+        .unit = try std.fs.path.join(arena, &.{ module.root_dir, module.root_file }),
+        .files = files.items,
+        .inlines = try arena.dupe(Atom.Debug.Inline, cg.dbg_inlines.items),
+        .inline_names = try arena.dupe(u8, cg.dbg_inline_names.items),
+        .inline_callees = try arena.dupe(SymbolKey, cg.dbg_inline_callees.items),
+        .patches = try arena.dupe(u32, cg.e.lines.patches.items),
     };
     try emit.addFunction(.{
         .key = try emit.funcKey(ir.func),
@@ -151,6 +184,62 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
     }, debug);
+}
+
+/// Starts the code of a call of `func` inlined at `site`, relative to the
+/// innermost open call (see `Atom.Debug.inlines`); its rows are relative
+/// to `func`'s declaration, in its file.
+fn beginInline(cg: *CodeGen, func: Index, site: Ir.DbgInline) Error!void {
+    const ip = cg.ip;
+    const zcu = cg.emit.zcu;
+    const nav = ip.getNav(ip.indexToKey(func).func.owner_nav);
+    const own_file = ip.getNav(ip.indexToKey(cg.ir.func).func.owner_nav).file;
+    const file: u32 = if (nav.file == own_file) 0 else for (cg.dbg_files.items, 1..) |f, i| {
+        if (f == nav.file) break @intCast(i);
+    } else blk: {
+        try cg.dbg_files.append(cg.gpa, nav.file);
+        break :blk @intCast(cg.dbg_files.items.len);
+    };
+    const index: u32 = @intCast(cg.dbg_inlines.items.len);
+    const name = ip.stringSlice(nav.name);
+    const callee: SymbolKey = .fromName(ip.stringSlice(nav.key));
+    // A callee inlined again in this function shares its name.
+    const name_off: u32 = for (cg.dbg_inline_callees.items, cg.dbg_inlines.items) |c, prev| {
+        if (c == callee) break prev.name_off;
+    } else off: {
+        const off: u32 = @intCast(cg.dbg_inline_names.items.len);
+        try cg.dbg_inline_names.appendSlice(cg.gpa, name);
+        break :off off;
+    };
+    try cg.dbg_inline_callees.append(cg.gpa, callee);
+    try cg.dbg_inlines.append(cg.gpa, .{
+        .name_off = name_off,
+        .name_len = @intCast(name.len),
+        .file = file,
+        .base_line = zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_line,
+        .call_line = site.line,
+        .call_column = site.column,
+        .low = @intCast(cg.e.code.items.len),
+        .high = @intCast(cg.e.code.items.len),
+        .parent = if (cg.dbg_open.getLastOrNull()) |o| o.index else Atom.Debug.Inline.none,
+    });
+    try cg.dbg_open.append(cg.gpa, .{ .index = index, .line = cg.dbg_line, .column = cg.dbg_column });
+    try cg.e.lines.switchTo(cg.gpa, file, index + 1);
+}
+
+/// Ends the innermost inlined call: the code after it is the caller's,
+/// from the caller's last statement on.
+fn endInline(cg: *CodeGen) Error!void {
+    const open = cg.dbg_open.pop().?;
+    cg.dbg_inlines.items[open.index].high = @intCast(cg.e.code.items.len);
+    if (cg.dbg_open.getLastOrNull()) |parent| {
+        try cg.e.lines.switchTo(cg.gpa, cg.dbg_inlines.items[parent.index].file, parent.index + 1);
+    } else {
+        try cg.e.lines.switchTo(cg.gpa, 0, 0);
+    }
+    cg.dbg_line = open.line;
+    cg.dbg_column = open.column;
+    try cg.e.line(open.line, open.column);
 }
 
 fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
@@ -434,12 +523,18 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
     const tag = ir.instructions.items(.tag)[@backingInt(inst)];
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     if (cg.fn_ty.cc == .naked) switch (tag) {
-        .assembly, .trap, .unreach, .dbg_stmt => {},
+        .assembly, .trap, .unreach, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
         else => return cg.fail("'{t}' in a naked function", .{tag}),
     };
     switch (tag) {
         .arg => {},
-        .dbg_stmt => try cg.e.line(data.dbg_stmt.line, data.dbg_stmt.column),
+        .dbg_stmt => {
+            cg.dbg_line = data.dbg_stmt.line;
+            cg.dbg_column = data.dbg_stmt.column;
+            try cg.e.line(data.dbg_stmt.line, data.dbg_stmt.column);
+        },
+        .dbg_inline_begin => try cg.beginInline(data.dbg_inline.func, ir.extraData(Ir.DbgInline, data.dbg_inline.payload).data),
+        .dbg_inline_end => try cg.endInline(),
         .alloc => {
             // An inferred alloc whose initializer never completes.
             if (data.ty == .none) return;

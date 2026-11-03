@@ -75,6 +75,12 @@ pub fn build(b: *std.Build) void {
 ///                               standard error contains this (repeatable;
 ///                               for output with addresses, such as stack
 ///                               traces)
+///   //! rebuild-without: "<zig string>"
+///                               zap first builds the program with the
+///                               first occurrence of this text removed,
+///                               then builds it as it is in the same place
+///                               twice, reusing its cache, and checks the
+///                               last build
 ///
 /// `test` builds each with zap and checks it; `test-upstream` does the same
 /// with upstream zig, so every program is checked against the oracle.
@@ -112,6 +118,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             stdout: ?[]const u8 = null,
             stderr: ?[]const u8 = null,
             stderr_contains: std.ArrayList([]const u8) = .empty,
+            rebuild_without: ?[]const u8 = null,
         } = .{};
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
@@ -126,6 +133,8 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             } else if (std.mem.eql(u8, key, "stderr-contains")) {
                 const bytes = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 expect.stderr_contains.append(b.allocator, bytes) catch @panic("OOM");
+            } else if (std.mem.eql(u8, key, "rebuild-without")) {
+                expect.rebuild_without = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
             } else if (std.mem.eql(u8, key, "stdout") or std.mem.eql(u8, key, "stderr")) {
                 const bytes = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 if (key[3] == 'o') expect.stdout = bytes else expect.stderr = bytes;
@@ -138,6 +147,25 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 const r = b.addSystemCommand(&.{ b.graph.zig_exe, "build-exe", "-fno-llvm", "-fno-lld" });
                 r.addFileArg(b.path(src_path));
                 break :blk r;
+            } else if (expect.rebuild_without) |text| blk: {
+                // Build the earlier version, then this one at the same path,
+                // then again with nothing changed (all from the cache).
+                const at = std.mem.indexOf(u8, source, text) orelse std.debug.panic("{s}: rebuild-without text not found", .{src_path});
+                const before = b.addWriteFiles().add(file, b.fmt("{s}{s}", .{ source[0..at], source[at + text.len ..] }));
+                const r = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
+                    \\set -e
+                    \\mkdir -p "$4.d"
+                    \\cp "$3" "$4.d/rt.zig"
+                    \\cp "$1" "$4.d/{0s}"
+                    \\"$5" build-exe "$4.d/{0s}" -femit-bin="$4"
+                    \\cp "$2" "$4.d/{0s}"
+                    \\"$5" build-exe "$4.d/{0s}" -femit-bin="$4"
+                    \\"$5" build-exe "$4.d/{0s}" -femit-bin="$4"
+                , .{file}), "sh" });
+                r.addFileArg(before);
+                r.addFileArg(b.path(src_path));
+                r.addFileArg(b.path("test/run/rt.zig"));
+                break :blk r;
             } else blk: {
                 const r = b.addRunArtifact(zap);
                 r.addArg("build-exe");
@@ -145,7 +173,11 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 break :blk r;
             };
             compile.addFileInput(b.path("test/run/rt.zig"));
-            const bin = compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            const bin = if (!upstream and expect.rebuild_without != null) bin: {
+                const out = compile.addOutputFileArg(name);
+                compile.addArtifactArg(zap);
+                break :bin out;
+            } else compile.addPrefixedOutputFileArg("-femit-bin=", name);
             if (!upstream and !host_runs_zap_output) {
                 // zap emits x86_64-linux executables; elsewhere only check
                 // that they compile.

@@ -77,7 +77,11 @@ bool_vector_inits: std.AutoHashMapUnmanaged(Ref, Ref) = .empty,
 peers_comptime_known: bool = false,
 branch_quota: u32 = 1000,
 branch_count: u32 = 0,
-last_dbg_stmt: ?Ir.Inst.Index = null,
+/// The statement position of the last `dbg_stmt` added, relative to the
+/// declaration of the function or inline call being analyzed: where an
+/// inline call made now is called from.
+dbg_line: u32 = 0,
+dbg_column: u32 = 0,
 /// Nesting of runtime inline calls, to fail on unbounded inline recursion.
 inline_depth: u32 = 0,
 
@@ -1538,8 +1542,9 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
 
             // Instructions with no result.
             .dbg_stmt => {
-                // Lines in an inlined body are relative to another declaration.
-                if (!block.is_comptime and block.inlining == null) try sema.addDbgStmt(block, data.dbg_stmt.line, data.dbg_stmt.column);
+                // Lines in an inlined body are relative to the callee's
+                // declaration (see `Ir.Inst.Tag.dbg_inline_begin`).
+                if (!block.is_comptime) try sema.addDbgStmt(block, data.dbg_stmt.line, data.dbg_stmt.column);
                 i += 1;
                 continue;
             },
@@ -1654,6 +1659,8 @@ fn isNoReturnInst(sema: *Sema, inst: Ir.Inst.Index) bool {
 }
 
 fn addDbgStmt(sema: *Sema, block: *Block, line: u32, column: u32) !void {
+    sema.dbg_line = line;
+    sema.dbg_column = column;
     // Consecutive statements without code between them collapse into one.
     if (block.instructions.items.len != 0) {
         const last = block.instructions.getLast();
@@ -11903,7 +11910,7 @@ fn analyzeCall(
     // As upstream, the call's statement position (AstGen's `dbg_stmt` just
     // before the call) applies again after its arguments' code, so that a
     // return address maps to the call.
-    if (call_args_in == .zir and !block.is_comptime and block.inlining == null) {
+    if (call_args_in == .zir and !block.is_comptime) {
         const dbg: Zir.Inst.Index = @fromBackingInt(@backingInt(call_args_in.zir.call_inst) - 1);
         if (sema.code.instructions.items(.tag)[@backingInt(dbg)] == .dbg_stmt) {
             const d = sema.code.instructions.items(.data)[@backingInt(dbg)].dbg_stmt;
@@ -12137,17 +12144,51 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) C
         .want_safety = caller.want_safety,
     };
     defer child.instructions.deinit(gpa);
+    // For debug info, the body is marked as an inlined call from the
+    // current statement; its statements are relative to the callee.
+    const call_line = sema.dbg_line;
+    const call_column = sema.dbg_column;
+    defer {
+        sema.dbg_line = call_line;
+        sema.dbg_column = call_column;
+    }
+    _ = try sema.addInst(&child, .{ .tag = .dbg_inline_begin, .data = .{ .dbg_inline = .{
+        .func = func,
+        .payload = try sema.addExtra(Ir.DbgInline{ .line = call_line, .column = call_column }),
+    } } });
     sema.analyzeBodyInner(&child, fn_info.body) catch |err| switch (err) {
         error.ComptimeReturn => {
             // Reached unconditionally (no earlier return), so the body's
             // runtime instructions run straight into the result.
             if (merges.results.items.len != 0) return sema.failUnsupported(caller, src, "a comptime return after a runtime return in an inline call");
+            try sema.endDbgInline(&child);
             try caller.instructions.appendSlice(gpa, child.instructions.items);
             return inlining.result;
         },
         else => return err,
     };
+    try sema.endDbgInline(&child);
     return sema.resolveBlock(caller, src, &child, &merges);
+}
+
+/// Closes the `dbg_inline_begin` that starts `child`, dropping both if the
+/// body has no instructions. The end goes before a final jump or trap, so
+/// that the body still ends in it (`resolveBlock` and `noreturn` checks
+/// look at the last instruction).
+fn endDbgInline(sema: *Sema, child: *Block) !void {
+    const insts = &child.instructions;
+    if (insts.items.len == 1) {
+        insts.items.len = 0;
+        return;
+    }
+    const end = try sema.reserveInst();
+    sema.ir_insts.set(@backingInt(end), .{ .tag = .dbg_inline_end, .data = .{ .no_op = {} } });
+    const last = insts.getLast();
+    const before_last = switch (sema.ir_insts.items(.tag)[@backingInt(last)]) {
+        .br, .repeat, .ret, .unreach, .trap => true,
+        else => false,
+    };
+    try insts.insert(sema.gpa, if (before_last) insts.items.len - 1 else insts.items.len, end);
 }
 
 /// The type of the parameter of generic `func` after `prior` arguments,

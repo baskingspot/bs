@@ -330,6 +330,14 @@ pub const Inst = struct {
         /// `dbg_stmt`: a statement starts at this line and column, relative
         /// to the function's declaration.
         dbg_stmt,
+        /// `dbg_inline` with `DbgInline`: the code up to the matching
+        /// `dbg_inline_end` is a call of `func` inlined at the statement
+        /// position `line:column`, relative to the enclosing function's (or
+        /// inline call's) declaration. `dbg_stmt`s up to there are relative
+        /// to `func`'s declaration. Debug info only.
+        dbg_inline_begin,
+        /// `no_op`: ends the innermost `dbg_inline_begin`.
+        dbg_inline_end,
     };
 
     pub const Data = union {
@@ -344,7 +352,13 @@ pub const Inst = struct {
         br: struct { block_inst: Index, operand: Ref },
         repeat: struct { loop_inst: Index },
         dbg_stmt: struct { line: u32, column: u32 },
+        dbg_inline: struct { func: InternPool.Index, payload: u32 },
     };
+};
+
+pub const DbgInline = struct {
+    line: u32,
+    column: u32,
 };
 
 pub const Block = struct {
@@ -508,7 +522,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .atomic_rmw,
         .cmpxchg,
         => data.ty_pl.ty,
-        .store, .atomic_store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt, .vector_store_elem, .breakpoint => .void_type,
+        .store, .atomic_store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .vector_store_elem, .breakpoint => .void_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),

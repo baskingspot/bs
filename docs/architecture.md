@@ -231,7 +231,13 @@ the callee's body first. Early cutoff on the set keeps such callers green.
     Its fields are byte, `u32`, or extern-struct slices with no pointers
     inside (extra file paths are 0-terminated in one byte slice; inline
     calls name themselves by offset into another), so cached records
-    hand them out in place.
+    hand them out in place. Inlined calls come from IR markers: Sema puts
+    `dbg_inline_begin` (callee, call position) and `dbg_inline_end` around
+    each runtime inline body, whose `dbg_stmt`s are relative to the
+    callee's declaration; CodeGen turns them into `Debug.inlines` records
+    and `LineProgram.switchTo` patches, and gives each the callee's stable
+    key (`Debug.inline_callees`, for the cache only). A function's unit is
+    its module's root file path.
 - The symbol key is 128 bits: a hash of the rendered unit key for
   declarations, or of the contents for anonymous constants. Atoms with equal
   keys are one symbol; the linker keeps one and rejects a key whose atoms
@@ -1258,11 +1264,14 @@ nothing.
 line, so lines added above a green function move its `base_line`
 without re-analysis. For green functions in changed files, the relink
 takes `base_line` from the new AST, the way it takes debug paths from the
-manifest's file table, and the manifest records the new value. The same
-holds for the functions a green function inlines: an edit that moves a
-callee's lines leaves the caller green but its inline records' base lines
-stale, so the relink refreshes each inline's base line from its callee
-(which `Atom.Debug.inlines` records by nav or locator), and the verify
+manifest's file table, and the manifest records the new value. Calls
+inlined into a function hold their callees' base lines too (in
+`Debug.inlines`), which move when only the callee's file changes: the
+exact hash includes them, so a store entry with old ones is not reused,
+and each carries the callee's key (`inline_callees`, the `SymbolKey` of
+its `Nav.key`) so a relink can refresh them the same way.
+test/run/panic_inline.zig rebuilds after such an edit and checks the
+trace. The verify
 edit scripts include moving an inlined callee's lines.
 
 Reviewed by the Sema thread (2026-11-03); its answers to the two open
