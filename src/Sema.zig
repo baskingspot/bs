@@ -501,6 +501,33 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
 /// `populateTestFunctions`, so every test is known.
 pub fn populateTestFunctions(zcu: *Zcu) CompileError!void {
     const ip = &zcu.ip;
+    // Tests are discovered as namespaces are created, an order that differs
+    // between a full build and an edit build (which loads cached units
+    // instead of analyzing them). List them by a rule instead: the main
+    // module's root file first, then files by module and path; within a
+    // file, a container's tests before those of the containers it holds,
+    // each in source order (upstream lists a file's top-level tests first,
+    // and a nested container's once its namespace is scanned).
+    std.mem.sort(InternPool.NavIndex, zcu.test_functions.items, zcu, struct {
+        fn lessThan(z: *Zcu, a: InternPool.NavIndex, b: InternPool.NavIndex) bool {
+            const na = z.ip.getNav(a);
+            const nb = z.ip.getNav(b);
+            if (na.file != nb.file) {
+                const root = z.moduleRootFile(z.fe.main_module);
+                if (na.file == root or nb.file == root) return na.file == root;
+                const fa = z.file(na.file);
+                const fb = z.file(nb.file);
+                if (fa.module != fb.module) return std.mem.lessThan(u8, z.fe.module(fa.module).name, z.fe.module(fb.module).name);
+                return std.mem.lessThan(u8, fa.sub_path, fb.sub_path);
+            }
+            if (na.namespace != nb.namespace) {
+                const ca = z.ip.containerType(z.namespacePtr(na.namespace).owner_type).?.zir_inst;
+                const cb = z.ip.containerType(z.namespacePtr(nb.namespace).owner_type).?.zir_inst;
+                return @backingInt(ca) < @backingInt(cb);
+            }
+            return @backingInt(na.zir_inst) < @backingInt(nb.zir_inst);
+        }
+    }.lessThan);
     const builtin_file = zcu.moduleRootFile(.builtin) orelse return;
     if (zcu.file_root_types.items[builtin_file] == .none) return;
     const ns = zcu.namespacePtr(ip.structInfo(zcu.file_root_types.items[builtin_file]).namespace);
@@ -10298,6 +10325,32 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     }
     const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, captures.items);
     const ty = try sema.createContainerType(kind, sema.file, inst, captures.items, name.display, name.key, block.namespace, layout);
+    try sema.fillReified(ty);
+    return .fromInterned(ty);
+}
+
+/// Fills in the fields of a type made by `@Struct`, `@Union`, or `@Enum`
+/// from its captures, unless they are filled already: what
+/// `zirReifyContainer` does after creating the type, for the on-disk
+/// cache's replay, which recreates the type from its stored locator. The
+/// captures were checked when the type was first made, so this reports no
+/// compile errors, declares no dependencies, and resolves nothing.
+pub fn fillReifiedInfo(zcu: *Zcu, ty: Index) Allocator.Error!void {
+    if (zcu.ip.structInfo(ty).status != .none) return;
+    var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
+    defer arena_state.deinit();
+    var sema = create(zcu, arena_state.allocator(), zcu.ip.containerType(ty).?.file, .{ .type_layout = ty });
+    defer sema.destroy();
+    try sema.fillReified(ty);
+}
+
+/// The one place that turns a reified type's captures into its fields; see
+/// `zirReifyContainer` for the captures: `[tag type, mode, names, values]`
+/// for an enum, and `[layout, backing or tag type, names, types,
+/// defaults..., aligns..., comptime flags...]` for a struct or union, where
+/// the aligns (`?usize`) and flags (`bool`) appear only if one is set.
+fn fillReified(sema: *Sema, ty: Index) Allocator.Error!void {
+    const ip = sema.ip;
     const info = ip.structInfo(ty);
     if (info.status != .none) return;
     const captures = ip.containerType(ty).?.captures;
@@ -10351,32 +10404,6 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
     const extra = sema.code.extraData(Zir.Inst.ReifyFn, ext.operand).data;
     const src = block.nodeSrc(extra.node);
     const reason = "function type attributes must be comptime-known";
-    try sema.fillReified(ty);
-    return .fromInterned(ty);
-}
-
-/// Fills in the fields of a type made by `@Struct`, `@Union`, or `@Enum`
-/// from its captures, unless they are filled already: what
-/// `zirReifyContainer` does after creating the type, for the on-disk
-/// cache's replay, which recreates the type from its stored locator. The
-/// captures were checked when the type was first made, so this reports no
-/// compile errors, declares no dependencies, and resolves nothing.
-pub fn fillReifiedInfo(zcu: *Zcu, ty: Index) Allocator.Error!void {
-    if (zcu.ip.structInfo(ty).status != .none) return;
-    var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
-    defer arena_state.deinit();
-    var sema = create(zcu, arena_state.allocator(), zcu.ip.containerType(ty).?.file, .{ .type_layout = ty });
-    defer sema.destroy();
-    try sema.fillReified(ty);
-}
-
-/// The one place that turns a reified type's captures into its fields; see
-/// `zirReifyContainer` for the captures: `[tag type, mode, names, values]`
-/// for an enum, and `[layout, backing or tag type, names, types,
-/// defaults..., aligns..., comptime flags...]` for a struct or union, where
-/// the aligns (`?usize`) and flags (`bool`) appear only if one is set.
-fn fillReified(sema: *Sema, ty: Index) Allocator.Error!void {
-    const ip = sema.ip;
     const params = try sema.constSliceElems(block, src, try sema.coerce(block, .slice_const_type_type, sema.resolveInst(extra.param_types), src), reason);
     const pattrs_ty = try sema.stdLangType(block, src, "Type.Fn.ParamAttributes");
     const pattrs_ptr_ty = try sema.ptrType(.{ .child = try sema.intern(.{ .array_type = .{ .len = params.len, .child = pattrs_ty } }), .flags = .{ .is_const = true } });

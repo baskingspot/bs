@@ -2258,24 +2258,20 @@ once, where store payloads would repeat `[]const u8` in every entry.
 - `builtin.test_functions` is filled outside unit analysis
   (`populateTestFunctions`, after all tests are known), so the test list is
   its own node, and adding or removing a test changes it.
-- Test order: a file's tests are listed in source order when its namespace
-  is created, which happens when something first resolves the file's root
-  type. `Zcu.analyzeAll` resolves the roots, then queued `comptime`
-  declarations, exports, the tests' declarations, and compiler_rt
-  requests, all before it analyzes function bodies in FIFO order. So the
-  main file's tests come first, then the tests of each file it reaches
-  in that order; a file first reached from a test body (`_ = Table;`,
-  `refAllDecls`) comes after every file reached without running test bodies.
-  Upstream also lists tests by when each file is scanned, but its scan
-  order comes from its work set, not a rule: `findOutdatedToAnalyze`
-  takes functions first and then the first ready unit, and
-  `clearOutdatedState` swap-removes it, so the most recently queued unit
-  moves to the front. zap does not reproduce that (it would mean
-  reproducing upstream's unit split and recursive analysis exactly), and
-  test order can differ between the two (libvaxis's `widgets.Table` tests
-  run right after `vxfw.vxfw`'s in zap and last in upstream). Once
-  analysis is parallel, the list is sorted by declaration key (see the
-  per-function table below), which is a different deterministic rule.
+- Test order: `populateTestFunctions` sorts the list, so it does not
+  depend on when each namespace was created (an edit build creates them in
+  load order, a full build in analysis order). The main module's root file
+  comes first, then the other files by module name and path; within a file,
+  a container's tests come before those of the containers it holds
+  (ordered by the container's ZIR instruction), each in source order.
+  Within a file this matches upstream, which lists a file's top-level tests
+  when it scans the file and a nested container's when it scans that
+  namespace. Across files upstream follows its scan order, which comes from
+  its work set, not a rule: `findOutdatedToAnalyze` takes functions first
+  and then the first ready unit, and `clearOutdatedState` swap-removes it,
+  so the most recently queued unit moves to the front. zap does not
+  reproduce that, so file order can differ (libvaxis's `widgets.Table`
+  tests run before `vxfw.vxfw`'s in zap and last in upstream).
 
 **Error codes and inferred error sets.** Codes stay append-only per
 compilation (`seedErrors` assigns the manifest's names first), so a name's
@@ -2603,7 +2599,7 @@ long; measure first.
 | `Zcu.deps` | map per unit | per-worker lists of (unit, dependees), merged and sorted by unit key at the end |
 | `Zcu.comptime_memo` | map | sharded map; two workers may compute the same call, the first insert wins, and both results are equal (memo keys and anonymous types inside are keyed by callee key and argument hashes) |
 | `Zcu.namespaces` | list, pointers into it | per-worker lists with the owner in the index, as InternPool does, so a namespace pointer stays valid; `decls` is fixed once the namespace is created |
-| `Zcu.errors`, `exports`, `test_functions`, `rt_helpers` | lists | locked appends; sorted at the end by unit key and source position (errors), declaration key (exports, tests), and key (compiler_rt requests), so their order does not depend on scheduling |
+| `Zcu.errors`, `exports`, `test_functions`, `rt_helpers` | lists | locked appends; sorted at the end by unit key and source position (errors), declaration key (exports) and file and source position (tests), and key (compiler_rt requests), so their order does not depend on scheduling |
 | `Zcu.arena` | one arena | one per worker |
 | `ip.next_comptime_alloc` | counter | stays atomic: comptime allocations never escape their unit (see InternPool) |
 | Frontend files | loaded before analysis, compiler_rt on demand | `loadFile` takes a lock |
