@@ -47,7 +47,7 @@ fn_ret_ty: Index = .none,
 panic_ns: Index = .none,
 ir_insts: std.MultiArrayList(Ir.Inst) = .empty,
 ir_extra: std.ArrayList(u32) = .empty,
-inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Ref) = .empty,
+inst_map: InstMap = .{},
 deps: std.ArrayList(Zcu.Dependee) = .empty,
 comptime_break_inst: Zir.Inst.Index = undefined,
 comptime_allocs: std.AutoHashMapUnmanaged(u32, ComptimeAlloc) = .empty,
@@ -103,6 +103,59 @@ pub const CompileError = error{
 const ConstAlloc = struct {
     block: *Block,
     stores: std.ArrayList(struct { ptr: Ref, val: Index }) = .empty,
+};
+
+/// The IR value of each analyzed ZIR instruction: a dense array over the
+/// range of instructions mapped so far, as upstream's. A unit maps most
+/// instructions of the bodies it analyzes, which lie close together, and a
+/// hash map spent much of the analysis of large array initializers
+/// hashing and growing.
+const InstMap = struct {
+    start: u32 = 0,
+    items: []Ref = &.{},
+
+    fn deinit(m: *InstMap, gpa: Allocator) void {
+        gpa.free(m.items);
+        m.* = .{};
+    }
+
+    fn get(m: *const InstMap, inst: Zir.Inst.Index) ?Ref {
+        const i = @backingInt(inst) -% m.start;
+        if (i >= m.items.len or m.items[i] == .none) return null;
+        return m.items[i];
+    }
+
+    fn put(m: *InstMap, gpa: Allocator, inst: Zir.Inst.Index, ref: Ref) !void {
+        const raw = @backingInt(inst);
+        if (raw -% m.start >= m.items.len) try m.grow(gpa, raw);
+        m.items[raw - m.start] = ref;
+    }
+
+    fn remove(m: *InstMap, inst: Zir.Inst.Index) void {
+        const i = @backingInt(inst) -% m.start;
+        if (i < m.items.len) m.items[i] = .none;
+    }
+
+    /// Covers `raw`, with room to grow in its direction.
+    fn grow(m: *InstMap, gpa: Allocator, raw: u32) !void {
+        const old_end: u64 = @as(u64, m.start) + m.items.len;
+        var start: u64 = m.start;
+        var end: u64 = old_end;
+        const slack: u64 = @max(64, m.items.len);
+        if (m.items.len == 0) {
+            start = raw -| 16;
+            end = @as(u64, raw) + slack;
+        } else if (raw < m.start) {
+            start = @min(raw, m.start -| slack);
+        } else {
+            end = @max(@as(u64, raw) + 1, old_end + slack);
+        }
+        const items = try gpa.alloc(Ref, @intCast(end - start));
+        @memset(items, .none);
+        if (m.items.len != 0) @memcpy(items[@intCast(m.start - start)..][0..m.items.len], m.items);
+        gpa.free(m.items);
+        m.* = .{ .start = @intCast(start), .items = items };
+    }
 };
 
 const ComptimeAlloc = struct {
@@ -10439,7 +10492,7 @@ fn switchItem(sema: *Sema, block: *Block, src: Src, switch_inst: Zir.Inst.Index,
             extra_index.* += len;
             // The result type of item bodies is `.{ .coerce_ty = switch_inst }`.
             try sema.inst_map.put(sema.gpa, switch_inst, .fromInterned(operand_ty));
-            defer _ = sema.inst_map.remove(switch_inst);
+            defer sema.inst_map.remove(switch_inst);
             break :blk try sema.resolveInlineBody(block, body, switch_inst);
         },
         // A declaration of the operand type, else an enum literal.
@@ -10544,7 +10597,7 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
     // `continue :sw x` coerces `x` to the switch instruction, which
     // stands for the operand type (captures use placeholders).
     try sema.inst_map.put(gpa, inst, .fromInterned(operand_ty));
-    defer _ = sema.inst_map.remove(inst);
+    defer sema.inst_map.remove(inst);
     // The prongs of one iteration, whose by-reference captures point to
     // that iteration's operand.
     const cases = try sema.arena.dupe(SwitchCase, cases_in);
@@ -12332,14 +12385,14 @@ fn coerceVarArg(sema: *Sema, block: *Block, src: Src, arg: Ref) CompileError!Ref
 const CalleeScope = struct {
     code: *const Zir,
     file: u32,
-    inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Ref),
+    inst_map: InstMap,
 
     fn enter(sema: *Sema, func: Index) CalleeScope {
         const nav = sema.ip.getNav(sema.ip.indexToKey(func).func.owner_nav);
         const saved: CalleeScope = .{ .code = sema.code, .file = sema.file, .inst_map = sema.inst_map };
         sema.code = &sema.zcu.file(nav.file).zir;
         sema.file = nav.file;
-        sema.inst_map = .empty;
+        sema.inst_map = .{};
         return saved;
     }
 
