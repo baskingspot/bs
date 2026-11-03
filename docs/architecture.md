@@ -1149,8 +1149,8 @@ scheduling; outputs stay correct, but byte-identical output across cold
 builds would need sorting new names before assigning them at the end of
 analysis.
 
-**`type_layout` result hash** (built 2026-11-03 in `record`, except the
-eager `comptime_only` and its recorded walk, which are Sema's). A layout
+**`type_layout` result hash** (built 2026-11-03 in `record`; the eager
+`comptime_only` and its recorded walk are Sema's). A layout
 node's result used to be the type's identity, which is wrong under early
 cutoff: when a field's type grows,
 the field type's layout result changes, ours is re-analyzed, and its
@@ -1163,15 +1163,29 @@ alignment, and `comptime_only`), computed once the status reaches
 pointer types hash by the child type's identity, so self-referential types
 need no recursion. `comptime_only` must be in the hash: if `F` gains a
 `type` field, its size and offsets can stay the same, and a struct `S` with
-a field of type `F` or `*F` would keep its hash while becoming
-comptime-only, leaving functions that take `S` at runtime green. So
-`comptime_only` is computed eagerly at `have_layout`, and the layouts that
-computation walks, through pointers too, are recorded as dependencies.
+a field of type `F` would keep its hash while becoming comptime-only,
+leaving functions that take `S` at runtime green. As in upstream 0.17
+(`Type.classify`), a pointer is a runtime type whatever it points to, so
+`*F` never makes `S` comptime-only; a struct with both runtime and
+comptime-only fields is "partially comptime": comptime-only, yet with
+runtime bits, its comptime-only fields taking no space, so a pointer to it
+can reach runtime code. Whether a type is comptime-only therefore depends
+only on the types it contains by value, which are exactly the layouts
+`resolveLayout` resolves and records as `type_layout` dependencies. Sema
+sets `comptime_only` when a struct's or union's layout reaches
+`have_layout` (`setComptimeOnly`), from its fields' answers, which are
+final by then; no walk through pointers, so no cycles. Every other Sema
+read goes through `isComptimeOnlyResolved`, which resolves (and records)
+those layouts first, and a function declaration resolves its parameter
+and return types' layouts, as upstream's `funcCommon` does, since whether
+a parameter is comptime-only decides how the function is called. So
+`nav_val(f)` depends on `type_layout(S)` for `fn f(s: S)`.
 `nav_val`'s result hash adds
 `is_const`, `is_threadlocal`, `linkage`, and `alignment` to the value's
-stable hash, since dependents read those too. Until Sema computes
-`comptime_only` at `have_layout`, `record` computes it, on one thread
-before hashing, since `isComptimeOnly` caches its answers in the types.
+stable hash, since dependents read those too. `record` reads
+`comptime_only` from the types; `isComptimeOnly` still caches answers
+for types that have field types but no layout yet, so record keeps
+reading it on one thread.
 
 **Debug info of green functions.** `src_hash` ignores a declaration's
 line, so lines added above a green function move its `base_line`

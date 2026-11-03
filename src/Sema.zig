@@ -552,6 +552,18 @@ fn structLayout(sema: *Sema, block: *Block, info: *InternPool.ContainerInfo, lay
         info.alignment = alignment;
     }
     info.status = .have_layout;
+    sema.setComptimeOnly(info);
+}
+
+/// Fixes whether a struct or union whose layout was just resolved is
+/// comptime-only. Its fields' by-value types had their layouts resolved,
+/// and recorded as dependencies, by the layout, which is all the answer
+/// reads: the `type_layout` result includes it, and is final.
+fn setComptimeOnly(sema: *Sema, info: *InternPool.ContainerInfo) void {
+    const yes = for (info.field_types, 0..) |ft, i| {
+        if (!info.fieldIsComptime(i) and Type.isComptimeOnly(sema.ip, ft)) break true;
+    } else false;
+    info.comptime_only = if (yes) .yes else .no;
 }
 
 fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPool.ContainerInfo) CompileError!void {
@@ -729,6 +741,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
             info.size = Type.abiSize(ip, backing);
             info.alignment = Type.abiAlignment(ip, backing);
             info.status = .have_layout;
+            sema.setComptimeOnly(info);
             return sema.finish();
         },
     }
@@ -753,6 +766,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     info.size = std.mem.alignForward(u64, size, alignment);
     info.alignment = alignment;
     info.status = .have_layout;
+    sema.setComptimeOnly(info);
     try sema.finish();
 }
 
@@ -966,14 +980,13 @@ fn resolveLayoutIfIdle(sema: *Sema, block: *Block, src: Src, ty: Index) CompileE
     }
 }
 
-/// Resolves the field types (not necessarily the layout) of a struct.
-/// `Type.isComptimeOnly` once a struct's or union's field types are known
-/// (before that, it answers no).
+/// `Type.isComptimeOnly`, after resolving the layouts it reads (those of
+/// the types `ty` contains by value), which records them as dependencies
+/// of this unit. Every Sema read of whether a type is comptime-only goes
+/// through here unless that layout was just resolved. A type whose layout
+/// is being resolved answers from the fields known so far.
 fn isComptimeOnlyResolved(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!bool {
-    switch (sema.ip.indexToKey(ty)) {
-        .struct_type, .union_type => try sema.resolveStructFields(block, src, ty),
-        else => {},
-    }
+    try sema.resolveLayoutIfIdle(block, src, ty);
     return Type.isComptimeOnly(sema.ip, ty);
 }
 
@@ -3192,12 +3205,12 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             var is_generic = f.is_generic;
             for (f.param_types, ptypes, pattrs, 0..) |pt, *t, *a, i| {
                 const generic = pt == .generic_poison_type;
-                if (generic or (i < 32 and (f.comptime_bits >> @intCast(i)) & 1 != 0) or (!generic and Type.isComptimeOnly(ip, pt))) is_generic = true;
+                if (generic or (i < 32 and (f.comptime_bits >> @intCast(i)) & 1 != 0) or (!generic and (try sema.isComptimeOnlyResolved(block, src, pt)))) is_generic = true;
                 t.* = try sema.intern(.{ .opt = .{ .ty = opt_type, .val = if (generic) .none else pt } });
                 a.* = try sema.structValue(block, src, pattrs_ty, &[_]S{.{ "noalias", boolValue(i < 32 and (f.noalias_bits >> @intCast(i)) & 1 != 0) }});
             }
             const ret_generic = f.return_type == .generic_poison_type;
-            if (ret_generic or Type.isComptimeOnly(ip, f.return_type)) is_generic = true;
+            if (ret_generic or (try sema.isComptimeOnlyResolved(block, src, f.return_type))) is_generic = true;
             const cc_ty = try sema.stdLangType(block, src, "CallingConvention");
             const cc = try sema.stdCallingConvention(block, src, cc_ty, f.cc);
             const attrs = try sema.structValue(block, src, try sema.stdLangType(block, src, "Type.Fn.Attributes"), &[_]S{
@@ -4839,7 +4852,7 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
         const bit = @as(u32, 1) << @intCast(@min(i, 31));
         if (i < 32 and (s.comptime_bits & bit) != (d.comptime_bits & bit)) {
             const comptime_side = if (s.comptime_bits & bit != 0) a else b;
-            if (comptime_side == .generic_poison_type or !Type.isComptimeOnly(ip, comptime_side)) return false;
+            if (comptime_side == .generic_poison_type or !(try sema.isComptimeOnlyResolved(block, src_loc, comptime_side))) return false;
         }
         if (a == b or a == .generic_poison_type or b == .generic_poison_type) continue;
         if (Type.class(ip, a) == .pointer and Type.class(ip, b) == .pointer and sema.ptrCoercibleInPlace(b, a)) continue;
@@ -6725,7 +6738,7 @@ fn allocPtrType(sema: *Sema, ty: Index, alignment: u64) !Index {
 fn analyzeAlloc(sema: *Sema, block: *Block, src: Src, ty: Index, is_const: bool, force_comptime: bool) CompileError!Ref {
     if (block.is_comptime or force_comptime) return .fromInterned(try sema.createComptimeAlloc(ty, is_const));
     try sema.resolveLayout(block, src, ty);
-    if (Type.isComptimeOnly(sema.ip, ty)) {
+    if ((try sema.isComptimeOnlyResolved(block, src, ty))) {
         // A constant of a comptime-only type is comptime.
         if (is_const) return .fromInterned(try sema.createComptimeAlloc(ty, false));
         return sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
@@ -6904,7 +6917,7 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
             try sema.resolveLayoutIfIdle(block, src, ty);
             const const_ty = try sema.ptrType(.{ .child = ty, .flags = .{ .is_const = true } });
             sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = try sema.ptrType(.{ .child = ty }) };
-            if (Type.isComptimeOnly(sema.ip, ty)) {
+            if ((try sema.isComptimeOnlyResolved(block, src, ty))) {
                 // The runtime alloc cannot hold it: drop the store.
                 const payload = try sema.addExtra(Ir.Block{ .body_len = 0 });
                 sema.ir_insts.set(@backingInt(ia.stores.items[0]), .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = payload } } });
@@ -6912,7 +6925,7 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
             return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = v, .orig_ty = const_ty } } } }));
         };
     }
-    if (Type.isComptimeOnly(sema.ip, ty)) return sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
+    if ((try sema.isComptimeOnlyResolved(block, src, ty))) return sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
     try sema.resolveLayout(block, src, ty);
     const ptr_ty = try sema.allocPtrType(ty, ia.alignment);
     sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = ptr_ty };
@@ -8064,7 +8077,7 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
     const is_var_args = try sema.structFieldValue(attrs, "varargs") == .bool_true;
     if (is_var_args and cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
     var is_generic = false;
-    for (params) |pt| if (Type.isComptimeOnly(ip, pt)) {
+    for (params) |pt| if ((try sema.isComptimeOnlyResolved(block, src, pt))) {
         is_generic = true;
     };
     return .fromInterned(try sema.intern(.{ .func_type = .{
@@ -8073,7 +8086,7 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
         .cc = cc,
         .is_var_args = is_var_args,
         .noalias_bits = noalias_bits,
-        .is_generic = is_generic or Type.isComptimeOnly(ip, ret_ty),
+        .is_generic = is_generic or (try sema.isComptimeOnlyResolved(block, src, ret_ty)),
     } }));
 }
 
@@ -8153,7 +8166,7 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag)
             }
         }
     }
-    if (!Type.hasRuntimeBits(ip, d.elem) and !Type.isComptimeOnly(ip, d.elem)) return .void_value;
+    if (!Type.hasRuntimeBits(ip, d.elem) and !(try sema.isComptimeOnlyResolved(block, src, d.elem))) return .void_value;
     const len_val = sema.resolveValue(len);
     if (len_val != null and ip.intValue(u64, len_val.?).? == 0) return .void_value;
 
@@ -8171,7 +8184,7 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag)
         }
     };
     try sema.requireRuntime(block, src);
-    if (Type.isComptimeOnly(ip, d.elem)) return sema.fail(block, src, "cannot copy comptime-only type '{f}' at runtime", .{sema.fmtType(d.elem)});
+    if ((try sema.isComptimeOnlyResolved(block, src, d.elem))) return sema.fail(block, src, "cannot copy comptime-only type '{f}' at runtime", .{sema.fmtType(d.elem)});
 
     // The IR form: `dest` gives the length, `source` is a pointer.
     if (d.len == .none) {
@@ -8206,7 +8219,7 @@ fn zirMemset(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     if (d.len == .none) return sema.fail(block, src, "unknown @memset length", .{});
     try sema.resolveLayout(block, src, d.elem);
     const elem = try sema.coerce(block, d.elem, sema.resolveInst(extra.rhs), src);
-    if (!Type.hasRuntimeBits(ip, d.elem) and !Type.isComptimeOnly(ip, d.elem)) return .void_value;
+    if (!Type.hasRuntimeBits(ip, d.elem) and !(try sema.isComptimeOnlyResolved(block, src, d.elem))) return .void_value;
     const len_val = sema.resolveValue(d.len);
     if (len_val != null and ip.intValue(u64, len_val.?).? == 0) return .void_value;
 
@@ -8218,7 +8231,7 @@ fn zirMemset(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         }
     };
     try sema.requireRuntime(block, src);
-    if (Type.isComptimeOnly(ip, d.elem)) return sema.fail(block, src, "cannot store comptime-only element '{f}' at runtime", .{sema.fmtType(d.elem)});
+    if ((try sema.isComptimeOnlyResolved(block, src, d.elem))) return sema.fail(block, src, "cannot store comptime-only element '{f}' at runtime", .{sema.fmtType(d.elem)});
     _ = try sema.addBinOp(block, .memset, dest, elem);
     return .void_value;
 }
@@ -9485,7 +9498,6 @@ fn switchProngsRuntime(
 /// does not continue. At runtime, the operand lives in a local and the
 /// prongs dispatch in a loop that `continue :label x` repeats.
 fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, operand: Ref, operand_ptr: Ref, cases_in: []const SwitchCase, else_case_in: ?SwitchCase, capture_inst: Zir.Inst.Index) CompileError!Ref {
-    const ip = sema.ip;
     const gpa = sema.gpa;
     const operand_ty = sema.typeOf(operand);
     // With captures by reference the loop carries a pointer to the
@@ -9533,7 +9545,7 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
         }
     }
     try sema.requireRuntime(parent, src);
-    if (Type.isComptimeOnly(ip, operand_ty)) return sema.failUnsupported(parent, src, "runtime labeled switches on comptime-only types");
+    if ((try sema.isComptimeOnlyResolved(parent, src, operand_ty))) return sema.failUnsupported(parent, src, "runtime labeled switches on comptime-only types");
     try sema.resolveLayout(parent, src, operand_ty);
     const block_inst = try sema.reserveInst();
     const loop_inst = try sema.reserveInst();
@@ -10768,7 +10780,7 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         var operand = sema.resolveInst(in.data.operand);
         const ty = sema.typeOf(operand);
         if (ty == .comptime_int_type) operand = try sema.coerce(block, .usize_type, operand, src);
-        if (Type.isComptimeOnly(sema.ip, sema.typeOf(operand))) return sema.fail(block, src, "inline assembly input of comptime-only type '{f}'", .{sema.fmtType(sema.typeOf(operand))});
+        if ((try sema.isComptimeOnlyResolved(block, src, sema.typeOf(operand)))) return sema.fail(block, src, "inline assembly input of comptime-only type '{f}'", .{sema.fmtType(sema.typeOf(operand))});
         try operands.append(gpa, .{
             .name = try sema.getString(sema.zirString(in.data.name)),
             .constraint = try sema.getString(sema.zirString(in.data.constraint)),
@@ -10877,6 +10889,15 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         ret_ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = .adhoc_inferred_error_set_type, .payload_type = ret_ty } });
     }
 
+    // As upstream, a function declaration's parameter and return types
+    // have their layouts resolved, which records them as dependencies of
+    // the declaration: whether a parameter is comptime-only decides how
+    // the function is called. A function type does not, so that it may
+    // name a type whose layout is being resolved.
+    if (body_len != 0) {
+        for (params) |p| try sema.resolveLayout(block, src, p.ty);
+        try sema.resolveLayout(block, src, ret_ty);
+    }
     var is_generic = ret_ty == .generic_poison_type;
     var comptime_bits: u32 = 0;
     const param_types = try sema.arena.alloc(Index, params.len);
@@ -11166,7 +11187,7 @@ fn analyzeCall(
     try sema.requireRuntime(block, src);
     const callee_fn_ty = ip.indexToKey(ip.typeOf(callee_func)).func_type;
     for (call_args, callee_fn_ty.param_types) |a, pt| {
-        if (Type.isComptimeOnly(ip, pt)) return sema.fail(block, src, "parameter of comptime-only type '{f}' must be declared comptime", .{sema.fmtType(pt)});
+        if ((try sema.isComptimeOnlyResolved(block, src, pt))) return sema.fail(block, src, "parameter of comptime-only type '{f}' must be declared comptime", .{sema.fmtType(pt)});
         _ = a;
     }
     if (callee_fn_ty.cc == .naked) return sema.fail(block, src, "unable to call function with naked calling convention", .{});
@@ -11284,7 +11305,7 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) C
             else => continue,
         }
         comptime_args[i] = sema.resolveValue(args[i]) orelse .none;
-        const is_comptime = tag == .param_comptime or tag == .param_anytype_comptime or Type.isComptimeOnly(ip, sema.typeOf(args[i]));
+        const is_comptime = tag == .param_comptime or tag == .param_anytype_comptime or (try sema.isComptimeOnlyResolved(caller, src, sema.typeOf(args[i])));
         if (is_comptime and comptime_args[i] == .none) return sema.fail(caller, src, "unable to resolve comptime value: argument to comptime parameter must be comptime-known", .{});
         try sema.inst_map.put(gpa, inst, args[i]);
         i += 1;
@@ -11437,7 +11458,7 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) 
     };
     for (args, comptime_args, 0..) |a, *ca, k| {
         // An `anytype` argument of a comptime-only type is comptime.
-        if ((k < 32 and (generic_ty.comptime_bits >> @intCast(k)) & 1 != 0) or Type.isComptimeOnly(ip, sema.typeOf(a))) {
+        if ((k < 32 and (generic_ty.comptime_bits >> @intCast(k)) & 1 != 0) or (try sema.isComptimeOnlyResolved(caller, src, sema.typeOf(a)))) {
             ca.* = try sema.resolveConstValue(caller, src, a, "argument to comptime parameter must be comptime-known");
         } else {
             ca.* = .none;

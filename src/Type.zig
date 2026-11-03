@@ -202,7 +202,11 @@ pub fn hasNoPossibleValue(ip: *const InternPool, ty: Index) bool {
     return ty == .noreturn_type or (class(ip, ty) == .@"enum" and ip.structInfo(ty).tag_type == .noreturn_type);
 }
 
-/// Whether values of this type exist only at compile time.
+/// Whether values of this type exist only at compile time. As upstream's
+/// Type.classify, a pointer is a runtime type whatever it points to, so
+/// the answer depends only on the types `ty` contains by value: exactly
+/// the layouts Sema's resolveLayout resolves and records as dependencies.
+/// A struct's or union's answer is fixed when its layout is.
 pub fn isComptimeOnly(ip: *const InternPool, ty: Index) bool {
     var hit_cycle = false;
     return comptimeOnly(ip, ty, &hit_cycle);
@@ -213,7 +217,6 @@ pub fn isComptimeOnly(ip: *const InternPool, ty: Index) bool {
 fn comptimeOnly(ip: *const InternPool, ty: Index, hit_cycle: *bool) bool {
     return switch (class(ip, ty)) {
         .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined, .@"fn", .special => true,
-        .pointer => class(ip, childType(ip, ty)) != .@"fn" and comptimeOnly(ip, childType(ip, ty), hit_cycle),
         .array, .vector, .optional => comptimeOnly(ip, childType(ip, ty), hit_cycle),
         .error_union => comptimeOnly(ip, ip.indexToKey(ty).error_union_type.payload_type, hit_cycle),
         .tuple => {
@@ -242,7 +245,9 @@ fn comptimeOnly(ip: *const InternPool, ty: Index, hit_cycle: *bool) bool {
                 else => false,
             };
             info.comptime_only = if (result) .yes else if (inner_cycle or !complete) .unknown else .no;
-            if (inner_cycle) hit_cycle.* = true;
+            // An answer that assumed a type without known fields is not
+            // final for the types containing it either.
+            if (inner_cycle or !complete) hit_cycle.* = true;
             return result;
         },
         else => false,
@@ -250,14 +255,16 @@ fn comptimeOnly(ip: *const InternPool, ty: Index, hit_cycle: *bool) bool {
 }
 
 /// Whether values of this type occupy memory at runtime.
+/// As upstream, a partially comptime aggregate (a struct with a `u32` and
+/// a `type` field) has runtime bits: its comptime-only fields take no
+/// space, and a pointer to it may reach runtime code.
 pub fn hasRuntimeBits(ip: *const InternPool, ty: Index) bool {
-    if (isComptimeOnly(ip, ty)) return false;
     return switch (class(ip, ty)) {
         .void, .noreturn, .@"opaque" => false,
         .int, .@"enum" => intInfo(ip, ty).bits != 0,
         .array => ip.indexToKey(ty).array_type.lenIncludingSentinel() != 0 and hasRuntimeBits(ip, childType(ip, ty)),
         .@"struct", .tuple, .@"union" => abiSize(ip, ty) != 0,
-        else => true,
+        else => !isComptimeOnly(ip, ty),
     };
 }
 

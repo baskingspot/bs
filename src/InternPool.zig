@@ -284,8 +284,9 @@ pub const ContainerInfo = struct {
     has_runtime_tag: bool = false,
     size: u64 = 0,
     alignment: u64 = 1,
-    /// Cache for `Type.isComptimeOnly`, which recurses through pointers and
-    /// so must stop at self-referential structs.
+    /// `Type.isComptimeOnly`, set when the layout is (Sema's
+    /// `setComptimeOnly`), or cached earlier once the field types are
+    /// known. Part of the `type_layout` result.
     comptime_only: enum { unknown, computing, yes, no } = .unknown,
 
     pub fn fieldIsComptime(info: *const ContainerInfo, i: usize) bool {
