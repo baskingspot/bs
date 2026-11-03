@@ -2346,7 +2346,9 @@ once, where store payloads would repeat `[]const u8` in every entry.
   nothing to do);
   `func` stores its references (its Atoms are in the pack, its IR is
   never stored); the `func_ies` node stores whether the set is `anyerror`
-  and the error names in the order they were found; `comptime_decl` has
+  and the error names in the order they were found, and every non-empty
+  set has one, read or not, so a loaded function without one has an empty
+  set (an edit build can add the first reader); `comptime_decl` has
   no result, only its dependencies and references. A unit that `@export`s (`Zcu.Export.unit`; null
   for `export` declarations, which the namespace scan recreates) has an
   `analyze` reference, so an edit build analyzes it rather than load it.

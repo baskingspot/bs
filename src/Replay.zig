@@ -307,7 +307,9 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
     const g = try r.greenNode(unit) orelse return false;
     errdefer r.deps.shrinkRetainingCapacity(g.deps_start);
     if (m.atoms(g.node).len == 0) return r.miss(g, "no atoms");
-    // The inferred error set, if the function has one: from its node.
+    // The inferred error set, if the function has one: from its node,
+    // which every non-empty set has (`Incremental.record`), so no node
+    // means an empty set.
     const f = ip.indexToKey(func).func;
     var ies: ?results.IesResult = null;
     const owner = ip.getNav(f.owner_nav);

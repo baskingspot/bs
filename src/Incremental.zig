@@ -975,6 +975,19 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             n_refs += 1;
         }
     }
+    // Every non-empty inferred error set, read or not: a loaded function
+    // takes its set from this node, and an edit build may add its first
+    // reader (`Replay.loadFunc` reads no node as an empty set).
+    var ies_items: std.ArrayList(Recorder.Ref) = .empty;
+    defer ies_items.deinit(gpa);
+    {
+        var it = zcu.inferred_errors.iterator();
+        while (it.next()) |e| if (e.value_ptr.len != 0) {
+            try ies_items.append(gpa, try r.addDependee(.{ .func_ies = e.key_ptr.* }));
+        };
+        var it_any = zcu.anyerror_ies.keyIterator();
+        while (it_any.next()) |f| try ies_items.append(gpa, try r.addDependee(.{ .func_ies = f.* }));
+    }
     const use_units = try gpa.alloc(u32, emit.content_uses.items.len);
     defer gpa.free(use_units);
     for (emit.content_uses.items, use_units) |use, *u| u.* = try r.addUnit(use.unit);
@@ -1073,6 +1086,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     for (analyze_items.items) |*it| it.* = try r.unitNode(it.*);
     for (quota_items.items) |*it| it[0] = try r.unitNode(it[0]);
     for (root_items.items) |*it| it.* = try r.unitNode(it.*);
+    for (ies_items.items) |ref| _ = try r.dependeeNode(ref);
     try r.group();
 
     // Each atom's debug info, and the atoms' hashes as their owners'
