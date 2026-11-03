@@ -1109,7 +1109,7 @@ fn analyzeTypeLayout(zcu: *Zcu, ty: Index, field_types_only: bool) CompileError!
         try sema.analyzeAsType(&block, block.nodeSrc(.zero), try sema.resolveInlineBody(&block, body, key.zir_inst))
     else
         .none;
-    try sema.structLayout(&block, info, decl.layout, explicit_backing, offsets, aligns);
+    try sema.structLayout(&block, cont_src, info, decl.layout, explicit_backing, offsets, aligns);
     if (decl.layout == .@"extern") for (types, 0..) |t, i|
         try sema.checkExtern(&block, cont_src.fieldSrc(i, .type), t, .struct_field, "extern structs cannot contain fields of type '{f}'", .{FmtType{ .ip = ip, .ty = t, .decl_note = false }});
     for (aligns) |a| if (a != 0) {
@@ -1244,13 +1244,14 @@ fn analyzeReifiedStructLayout(sema: *Sema, key: InternPool.ContainerType, info: 
     const layout = std.meta.stringToEnum(std.lang.Type.ContainerLayout, sema.enumTagName(key.captures[0]).?).?;
     const backing = ip.keyPayload(.opt, key.captures[1]).val;
     const offsets = try ip.arena(Zcu.tid).alloc(u64, info.field_types.len);
-    try sema.structLayout(&block, info, layout, backing, offsets, info.field_aligns);
+    try sema.structLayout(&block, block.nodeSrc(.zero), info, layout, backing, offsets, info.field_aligns);
     try sema.finish();
 }
 
 /// Computes the layout of a struct whose field types are known. `aligns`
 /// holds explicit field alignments (0 for none), or is empty.
-fn structLayout(sema: *Sema, block: *Block, info: *InternPool.ContainerInfo, layout: std.lang.Type.ContainerLayout, explicit_backing: Index, offsets: []u64, aligns: []const u64) CompileError!void {
+/// `cont_src` is the declaration, for errors about a field.
+fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.ContainerInfo, layout: std.lang.Type.ContainerLayout, explicit_backing: Index, offsets: []u64, aligns: []const u64) CompileError!void {
     const ip = sema.ip;
     const types = info.field_types;
     info.status = .layout_wip;
@@ -1260,10 +1261,8 @@ fn structLayout(sema: *Sema, block: *Block, info: *InternPool.ContainerInfo, lay
         var bits: u64 = 0;
         for (types, 0..) |ft, i| {
             try sema.resolveLayout(block, src, ft);
-            const fb = Type.packedBits(ip, ft) orelse {
-                if (Type.class(ip, ft) == .pointer) return sema.failUnsupported(block, src, "pointer fields in packed structs");
-                return sema.fail(block, src, "packed structs cannot contain fields of type '{f}'", .{sema.fmtType(ft)});
-            };
+            const fb = sema.packedFieldBits(ft) orelse
+                return sema.failUnpackable(block, cont_src.fieldSrc(@intCast(i), .type), "structs", ft);
             offsets[i] = bits;
             bits += fb;
         }
@@ -1556,10 +1555,8 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                 if (n == 0) return sema.fail(&block, src, "packed union has no fields", .{});
                 for (types) |ft| try sema.resolveLayout(&block, src, ft);
                 const field_bits = try sema.arena.alloc(u16, n);
-                for (types, field_bits) |ft, *b| b.* = Type.packedBits(ip, ft) orelse {
-                    if (Type.class(ip, ft) == .pointer) return sema.failUnsupported(&block, src, "pointer fields in packed unions");
-                    return sema.fail(&block, src, "packed unions cannot contain fields of type '{f}'", .{sema.fmtType(ft)});
-                };
+                for (types, field_bits, 0..) |ft, *b, i| b.* = sema.packedFieldBits(ft) orelse
+                    return sema.failUnpackable(&block, cont_src.fieldSrc(@intCast(i), .type), "unions", ft);
                 const backing = if (arg_ty != .none) blk: {
                     if (Type.class(ip, arg_ty) != .int) return sema.fail(&block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(arg_ty)});
                     for (field_bits) |b| if (b != Type.intInfo(ip, arg_ty).bits) return sema.fail(&block, src, "field bit width does not match backing integer", .{});
@@ -5465,7 +5462,7 @@ fn validateExtern(sema: *Sema, ty: Index, position: ExternPosition) bool {
 
 /// Whether enum `ty` has an explicit integer tag type, or packed struct
 /// or union `ty` an explicit backing integer (upstream's `.explicit`
-/// modes). A union's generated tag enum has neither.
+/// modes).
 fn explicitIntTag(sema: *Sema, ty: Index) bool {
     const key = sema.ip.containerType(ty) orelse return false;
     const code = &sema.zcu.file(key.file).zir;
@@ -5474,9 +5471,56 @@ fn explicitIntTag(sema: *Sema, ty: Index) bool {
     return switch (code.instructions.items(.data)[@backingInt(key.zir_inst)].extended.opcode) {
         .enum_decl => sema.ip.keyTag(ty) == .enum_type and code.getEnumDecl(key.zir_inst).tag_type_body != null,
         .struct_decl => code.getStructDecl(key.zir_inst).backing_int_type_body != null,
-        .union_decl => sema.ip.keyTag(ty) == .union_type and code.getUnionDecl(key.zir_inst).arg_type_body != null,
+        // The generated tag enum of `union(enum(T))` has an explicit tag
+        // type too; `union(E)` uses `E` itself.
+        .union_decl => code.getUnionDecl(key.zir_inst).arg_type_body != null,
         else => false,
     };
+}
+
+/// The bit width of `ty` as a field of a packed struct or union, or null
+/// if it has no bit-packed representation (upstream's `Type.unpackable`).
+fn packedFieldBits(sema: *Sema, ty: Index) ?u16 {
+    const ip = sema.ip;
+    if (Type.class(ip, ty) == .@"enum" and (!sema.explicitIntTag(ty) or ip.structInfo(ty).tag_type == .noreturn_type)) return null;
+    return Type.packedBits(ip, ty);
+}
+
+/// Fails at `src`, the type of a field of a packed struct or union (`what`
+/// is "structs" or "unions"), because `ty` has no bit-packed
+/// representation, with upstream's `explainWhyTypeIsUnpackable` notes
+/// (`fail` adds the declaration note).
+fn failUnpackable(sema: *Sema, block: *Block, src: Src, comptime what: []const u8, ty: Index) CompileError {
+    const ip = sema.ip;
+    const zcu = sema.zcu;
+    const err = if (comptime std.mem.eql(u8, what, "structs"))
+        sema.fail(block, src, "packed structs cannot contain fields of type '{f}'", .{sema.fmtType(ty)})
+    else
+        sema.fail(block, src, "packed unions cannot contain fields of type '{f}'", .{sema.fmtType(ty)});
+    const span = src.span(try zcu.fe.tree(@fromBackingInt(sema.file)));
+    switch (Type.class(ip, ty)) {
+        .type, .comptime_float, .comptime_int, .enum_literal, .undefined, .null => try zcu.addNote(sema.file, span, "comptime-only types have no bit-packed representation", .{}),
+        .pointer => if (Type.isSlice(ip, ty)) {
+            try zcu.addNote(sema.file, span, "slices do not have a bit-packed representation", .{});
+        } else {
+            try zcu.addNote(sema.file, span, "pointers cannot be directly bitpacked", .{});
+            try zcu.addNote(sema.file, span, "consider using 'usize' and '@intFromPtr'", .{});
+        },
+        .optional => if (Type.optionalReprIsPtr(ip, Type.childType(ip, ty))) {
+            try zcu.addNote(sema.file, span, "pointers cannot be directly bitpacked", .{});
+            try zcu.addNote(sema.file, span, "consider using 'usize' and '@intFromPtr'", .{});
+        } else try zcu.addNote(sema.file, span, "type does not have a bit-packed representation", .{}),
+        .@"enum" => if (!sema.explicitIntTag(ty)) {
+            const decl = sema.containerDecl(ty).?;
+            const decl_span = (try zcu.fe.tree(@fromBackingInt(decl.file))).nodeToSpan(decl.node);
+            try zcu.addNote(decl.file, decl_span, "integer tag type of enum is inferred", .{});
+            try zcu.addNote(decl.file, decl_span, "consider explicitly specifying the integer tag type", .{});
+        } else try zcu.addNote(sema.file, span, "type does not have a bit-packed representation", .{}),
+        .@"struct", .tuple => try zcu.addNote(sema.file, span, "non-packed structs do not have a bit-packed representation", .{}),
+        .@"union" => try zcu.addNote(sema.file, span, "non-packed unions do not have a bit-packed representation", .{}),
+        else => try zcu.addNote(sema.file, span, "type does not have a bit-packed representation", .{}),
+    }
+    return err;
 }
 
 /// Upstream's `explainWhyTypeIsNotExtern`: notes on why `ty` failed
