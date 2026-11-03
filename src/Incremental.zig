@@ -457,9 +457,9 @@ const Recorder = struct {
                 const index, const new = try r.node(try r.keyOf(.func_ies, &.{try r.unitKeyString(.{ .func = func })}), .func_ies);
                 if (new) {
                     var h: Hash = 0;
-                    if (r.zcu.inferred_errors.get(func)) |list| {
+                    if (r.zcu.inferred_errors.get(func)) |names| {
                         // Order-independent: the set, not the discovery order.
-                        for (list.items) |name| h +%= cache.hash(3, ip.stringSlice(name));
+                        for (names) |name| h +%= cache.hash(3, ip.stringSlice(name));
                     }
                     r.nodes.items[index].result_hash = h;
                     const producer = try r.unitNode(.{ .func = func });

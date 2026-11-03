@@ -56,6 +56,9 @@ inferred_allocs: std.AutoHashMapUnmanaged(Ir.Inst.Index, InferredAlloc) = .empty
 /// Runtime `const` locals initialized through a result pointer that may
 /// still be comptime-known (see `foldConstAlloc`), by `alloc` instruction.
 const_allocs: std.AutoHashMapUnmanaged(Ir.Inst.Index, ConstAlloc) = .empty,
+/// The errors `func` returns so far, for its inferred error set; published
+/// to `Zcu.inferred_errors` when its analysis ends. Arena-allocated.
+ies_names: std.ArrayList(InternPool.String) = .empty,
 /// For each runtime bool vector being initialized through a result pointer,
 /// the `[N]bool` local its elements are stored to first: bit-packed
 /// elements have no addresses. Arena-allocated.
@@ -742,6 +745,12 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     // `Func.SrcLocs` follows the body in `extra`.
     const body_end = (@intFromPtr(fn_info.body.ptr) - @intFromPtr(sema.code.extra.ptr)) / @sizeOf(u32) + fn_info.body.len;
     const src_locs = sema.code.extraData(Zir.Inst.Func.SrcLocs, body_end).data;
+
+    // One allocation per function, in the Zcu arena: a small gpa list per
+    // function instance pins allocator pages for the whole compilation.
+    if (sema.ies_names.items.len != 0) {
+        try zcu.inferred_errors.put(gpa, func_index, try zcu.arena.allocator().dupe(InternPool.String, sema.ies_names.items));
+    }
 
     const main_block: u32 = @intCast(sema.ir_extra.items.len);
     try sema.ir_extra.append(gpa, @intCast(block.instructions.items.len));
@@ -3703,11 +3712,9 @@ fn recordInferredErrors(sema: *Sema, block: *Block, src: Src, operand: Ref) Comp
 /// Adds the errors of `set` to the current function's inferred error set.
 fn addInferredErrors(sema: *Sema, block: *Block, src: Src, set: Index) CompileError!void {
     const names = (try sema.errorSetNames(block, src, set)) orelse return;
-    const gop = try sema.zcu.inferred_errors.getOrPut(sema.gpa, sema.func);
-    if (!gop.found_existing) gop.value_ptr.* = .empty;
     outer: for (names) |n| {
-        for (gop.value_ptr.items) |existing| if (existing == n) continue :outer;
-        try gop.value_ptr.append(sema.gpa, n);
+        for (sema.ies_names.items) |existing| if (existing == n) continue :outer;
+        try sema.ies_names.append(sema.arena, n);
     }
 }
 

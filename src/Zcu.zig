@@ -42,7 +42,8 @@ comptime_decls: std.AutoArrayHashMapUnmanaged(ComptimeDecl, enum { queued, done 
 /// Memoized comptime calls, keyed by `Sema.comptimeCallKey`.
 comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, InternPool.Index) = .empty,
 /// Errors each function instance returns, for inferred error sets.
-inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, std.ArrayList(InternPool.String)) = .empty,
+/// Arena-allocated.
+inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, []const InternPool.String) = .empty,
 exports: std.ArrayList(Export) = .empty,
 /// compiler_rt functions that CodeGen calls, by the stable key of their
 /// declaration; `analyzeAll` resolves each and queues its body.
@@ -146,7 +147,6 @@ pub fn deinit(zcu: *Zcu) void {
     const gpa = zcu.gpa;
     for (zcu.namespaces.items) |*ns| ns.decls.deinit(gpa);
     zcu.namespaces.deinit(gpa);
-    for (zcu.deps.values()) |d| gpa.free(d);
     zcu.deps.deinit(gpa);
     zcu.funcs.deinit(gpa);
     zcu.func_queue.deinit(gpa);
@@ -154,8 +154,6 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.ready_irs.deinit(gpa);
     zcu.comptime_decls.deinit(gpa);
     zcu.comptime_memo.deinit(gpa);
-    var it = zcu.inferred_errors.valueIterator();
-    while (it.next()) |list| list.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
     zcu.exports.deinit(gpa);
     zcu.rt_helpers.deinit(gpa);
@@ -394,9 +392,9 @@ pub fn namespacePtr(zcu: *Zcu, index: u32) *Namespace {
 // Units
 
 pub fn recordDeps(zcu: *Zcu, unit: AnalUnit, deps: []const Dependee) !void {
-    const gop = try zcu.deps.getOrPut(zcu.gpa, unit);
-    if (gop.found_existing) zcu.gpa.free(gop.value_ptr.*);
-    gop.value_ptr.* = try zcu.gpa.dupe(Dependee, deps);
+    // In the arena: a small gpa allocation per unit pins allocator pages
+    // for the whole compilation.
+    try zcu.deps.put(zcu.gpa, unit, try zcu.arena.allocator().dupe(Dependee, deps));
 }
 
 /// Renders a unit's stable key, which does not depend on analysis order or
@@ -471,7 +469,7 @@ pub fn ensureFuncIes(zcu: *Zcu, func: InternPool.Index) Sema.CompileError![]cons
             try zcu.ready_irs.append(zcu.gpa, ir);
         },
     }
-    return if (zcu.inferred_errors.get(func)) |list| list.items else &.{};
+    return zcu.inferred_errors.get(func) orelse &.{};
 }
 
 pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !void {
