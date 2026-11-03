@@ -4531,6 +4531,25 @@ fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
 // ---------------------------------------------------------------------------
 // Arithmetic and comparison
 
+/// `@addWithOverflow` and its relatives on vectors: the tuple of the
+/// wrapped results and a vector of their overflow bits, each mapped
+/// element by element.
+fn vectorOverflow(sema: *Sema, block: *Block, src: Src, op: Zir.Inst.Extended, len: u32, ty: Index, lhs: Ref, rhs: Ref) CompileError!Ref {
+    const Field = struct {
+        op: Zir.Inst.Extended,
+        index: u32,
+        fn call(o: @This(), s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
+            const t = if (o.op == .shl_with_overflow) try s.analyzeShlWithOverflow(b, sr, e[0], e[1]) else try s.analyzeOverflowBuiltin(b, sr, o.op, e[0], e[1]);
+            return s.tupleField(b, t, o.index);
+        }
+    };
+    const bits_ty = try sema.vectorType(len, .u1_type);
+    const result = try sema.vectorMap(block, src, len, ty, &.{ lhs, rhs }, Field{ .op = op, .index = 0 });
+    const bits = try sema.vectorMap(block, src, len, bits_ty, &.{ lhs, rhs }, Field{ .op = op, .index = 1 });
+    const tuple_ty = try sema.intern(.{ .tuple_type = .{ .types = &.{ ty, bits_ty }, .values = &.{ .none, .none } } });
+    return sema.aggregate(block, src, tuple_ty, &.{ result, bits });
+}
+
 fn overflowTupleType(sema: *Sema, ty: Index) !Index {
     return sema.intern(.{ .tuple_type = .{ .types = &.{ ty, .u1_type }, .values = &.{ .none, .none } } });
 }
@@ -5020,6 +5039,8 @@ fn analyzeBitNot(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileErro
 
 fn analyzeOverflowBuiltin(sema: *Sema, block: *Block, src: Src, op: Zir.Inst.Extended, uncasted_lhs: Ref, uncasted_rhs: Ref) CompileError!Ref {
     const ty = try sema.resolvePeerTypes(block, src, &.{ uncasted_lhs, uncasted_rhs });
+    if (sema.vectorLen(ty)) |len| if (Type.class(sema.ip, Type.childType(sema.ip, ty)) == .int)
+        return sema.vectorOverflow(block, src, op, len, ty, try sema.coerce(block, ty, uncasted_lhs, src), try sema.coerce(block, ty, uncasted_rhs, src));
     if (Type.class(sema.ip, ty) != .int) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(ty)});
     const lhs = try sema.coerce(block, ty, uncasted_lhs, src);
     const rhs = try sema.coerce(block, ty, uncasted_rhs, src);
@@ -5055,6 +5076,8 @@ fn analyzeOverflowBuiltin(sema: *Sema, block: *Block, src: Src, op: Zir.Inst.Ext
 fn analyzeShlWithOverflow(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_rhs: Ref) CompileError!Ref {
     const ip = sema.ip;
     const ty = sema.typeOf(lhs);
+    if (sema.vectorLen(ty)) |len| if (Type.class(ip, Type.childType(ip, ty)) == .int)
+        return sema.vectorOverflow(block, src, .shl_with_overflow, len, ty, lhs, uncasted_rhs);
     if (Type.class(ip, ty) != .int) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(ty)});
     const info = Type.intInfo(ip, ty);
     const shift_ty = try sema.intType(.unsigned, Type.log2IntBits(info.bits));

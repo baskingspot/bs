@@ -1,5 +1,5 @@
 //! signal: ABRT
-//! stdout: "15289149009567803999\n15289149009567803999\n1011000101 0100111010\n2\n16\n16\n2139095040\n4290772992\n1266679808\n01\n9223372036854775808\n31744\n1\n16777216\n1069547520\n13834917317793808384\n4611826755915743232\n9223372036854775808\n536870912\n1\n18446744073709551552\n18446744073709551615\n0\n18446744073709551588\n11\n"
+//! stdout: "15289149009567803999\n15289149009567803999\n1011000101 0100111010\n2\n16\n16\n2139095040\n4290772992\n1266679808\n01\n9223372036854775808\n31744\n1\n16777216\n1069547520\n13834917317793808384\n4611826755915743232\n9223372036854775808\n536870912\n1\n18446744073709551552\n18446744073709551615\n0\n18446744073709551588\n11\n16339675983031644798\n18446744073709551615\n1\n"
 //! stderr: "panic: integer overflow\n"
 //! upstream-signal: SEGV
 const rt = @import("rt.zig");
@@ -111,12 +111,41 @@ fn padded() void {
     rt.print("\n");
 }
 
+/// The overflow builtins on vectors give a vector of overflow bits.
+fn overflow() void {
+    var a: @Vector(5, i8) = .{ 127, -128, 5, -7, 64 };
+    var b: @Vector(5, i8) = .{ 1, -1, 3, -128, 2 };
+    var s: @Vector(5, u3) = .{ 0, 1, 7, 2, 1 };
+    var c: @Vector(1, i1) = .{-1};
+    _ = .{ &a, &b, &s, &c };
+    const add = @addWithOverflow(a, b);
+    const sub = @subWithOverflow(a, b);
+    const mul = @mulWithOverflow(a, b);
+    const shl = @shlWithOverflow(a, s);
+    var acc: i64 = 0;
+    inline for (0..5) |i| {
+        acc = acc *% 31 +% add[0][i];
+        acc = acc *% 31 +% add[1][i];
+        acc = acc *% 31 +% sub[0][i];
+        acc = acc *% 31 +% sub[1][i];
+        acc = acc *% 31 +% mul[0][i];
+        acc = acc *% 31 +% mul[1][i];
+        acc = acc *% 31 +% shl[0][i];
+        acc = acc *% 31 +% shl[1][i];
+    }
+    pi(acc);
+    const m = @mulWithOverflow(c, c);
+    pi(m[0][0]);
+    rt.printInt(m[1][0]);
+}
+
 fn main() callconv(.c) noreturn {
     pi(ints());
     pi(comptime ints());
     bools();
     floats();
     padded();
+    overflow();
     var a: @Vector(2, i8) = .{ 100, 1 };
     _ = &a;
     const b = a + a; // overflow traps in element 0
