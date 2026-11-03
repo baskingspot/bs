@@ -1791,7 +1791,10 @@ fn ptrToZeroBit(ip: *const InternPool, ptr: Index) bool {
                     else => !Type.hasRuntimeBits(ip, nav.ty),
                 };
             },
-            .uav => |u| return !Type.hasRuntimeBits(ip, ip.typeOf(u.val)),
+            .uav => |u| return switch (ip.indexToKey(u.val)) {
+                .func, .extern_func => false,
+                else => !Type.hasRuntimeBits(ip, ip.typeOf(u.val)),
+            },
             else => return false,
         }
     }
