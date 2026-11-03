@@ -1373,9 +1373,24 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                 if (ip.keyTag(arg_ty) != .enum_type) return sema.fail(&block, src, "expected enum tag type, found '{f}'", .{sema.fmtType(arg_ty)});
                 try sema.resolveLayout(&block, src, arg_ty);
                 const tag_info = ip.structInfo(arg_ty);
-                if (tag_info.field_names.len != n) return sema.fail(&block, src, "union fields do not match tag type '{f}'", .{sema.fmtType(arg_ty)});
-                for (names) |name| {
-                    if (tag_info.fieldIndex(ip, ip.stringSlice(name)) == null) return sema.fail(&block, src, "no field named '{s}' in enum '{f}'", .{ ip.stringSlice(name), sema.fmtType(arg_ty) });
+                // As upstream: a union field the enum lacks, an enum field the
+                // union lacks, then a field out of the enum's order.
+                for (names, 0..) |name, i| if (tag_info.fieldIndex(ip, ip.stringSlice(name)) == null) {
+                    return sema.fail(&block, cont_src.fieldSrc(@intCast(i), .name), "no field named '{s}' in enum '{f}'", .{ ip.stringSlice(name), sema.fmtType(arg_ty) });
+                };
+                for (tag_info.field_names, 0..) |name, k| {
+                    const ui = info.fieldIndex(ip, ip.stringSlice(name)) orelse {
+                        const err = sema.fail(&block, cont_src, "enum field '{s}' missing from union", .{ip.stringSlice(name)});
+                        try sema.noteEnumField(arg_ty, name, "enum field here", .{});
+                        return err;
+                    };
+                    if (ui != k) {
+                        const err = sema.fail(&block, cont_src, "union field order does not match tag enum field order", .{});
+                        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+                        try sema.zcu.addNote(sema.file, cont_src.fieldSrc(ui, .name).span(tree), "union field '{s}' is index {d}", .{ ip.stringSlice(name), ui });
+                        try sema.noteEnumField(arg_ty, name, "enum field '{s}' is index {d}", .{ ip.stringSlice(name), k });
+                        return err;
+                    }
                 }
                 info.tag_type = arg_ty;
             },
@@ -1742,6 +1757,14 @@ fn failSwitchEnum(sema: *Sema, block: *Block, src: Src, enum_ty: Index, union_ty
     if (decl) |d| try zcu.addDeclNote(d.file, decl_tree.?.nodeToSpan(d.node), "enum '{f}' declared here", .{sema.fmtType(enum_ty)});
     zcu.errors.items[zcu.errors.items.len - 1].fix = try @import("diag.zig").prongsFix(zcu.arena.allocator(), tree, span.main, prongs);
     return err;
+}
+
+/// A note at field `name` of enum `ty`'s declaration.
+fn noteEnumField(sema: *Sema, ty: Index, name: InternPool.String, comptime fmt: []const u8, args: anytype) CompileError!void {
+    const d = sema.containerDecl(ty) orelse return;
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(d.file));
+    const tok = fieldNameToken(tree, d.node, sema.ip.stringSlice(name)) orelse return;
+    try sema.zcu.addNote(d.file, tree.tokenToSpan(tok), fmt, args);
 }
 
 /// The name token of field `name` of the container declared at `node`.

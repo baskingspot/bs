@@ -1395,6 +1395,8 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "switch on non-exhaustive enum must include 'else' or '_' prong", .@"bad-switch" },
     .{ "switch on type '{f}'", .@"bad-switch" },
     .{ "switch on union with no attached enum", .@"bad-switch" },
+    .{ "enum field '{s}' missing from union", .@"bad-container" },
+    .{ "union field order does not match tag enum field order", .@"bad-container" },
     .{ "alignment value '{d}' is not a power of two", .@"bad-type" },
     .{ "cannot reify pointer to '@TypeOf(null)'", .@"bad-type" },
     .{ "function pointers must be single pointers", .@"bad-type" },
