@@ -19,8 +19,10 @@
 //!   neighboring functions (string literals), the rest uniformly random.
 //!
 //! Every function has debug info: one of 500 files, and a line row every
-//! 8..40 bytes. Each emit is also timed without it, to show its cost.
-//! Mach-O does not emit debug info yet.
+//! 8..40 bytes. Each emit is also timed without it, to show its cost. For
+//! Mach-O, an emit with debug info also builds the dSYM, as `link` writes
+//! it, and the output size is the executable's; numbered links are timed
+//! stripped.
 //!
 //! Both formats are also linked with numbered symbols (`Options.symbols`),
 //! as the cache's manifest would supply them: from the same scattered
@@ -106,13 +108,10 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
         }
         var parallel = single;
         parallel.threads = null;
-        // Mach-O has no debug info yet, so stripping changes nothing.
         const single_strip = single;
         const parallel_strip = parallel;
-        if (format == .elf) {
-            single.debug = debug;
-            parallel.debug = debug;
-        }
+        single.debug = debug;
+        parallel.debug = debug;
 
         // Threads must not change the output.
         const out1 = try L.emit(gpa, io, atoms, single);
@@ -174,7 +173,7 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
         if (format == .elf) try linkToFile(gpa, io, atoms, single, parallel, out_n, cpus);
         switch (format) {
             .elf => try benchNumbered(gpa, io, arena, atoms, debug, single, out_n, stripped, cpus),
-            .macho => try benchNumberedMachO(gpa, io, arena, atoms, single, cpus),
+            .macho => try benchNumberedMachO(gpa, io, arena, atoms, single_strip, cpus),
         }
     }
     std.debug.print("(best of {d} runs each)\n", .{runs});
@@ -406,8 +405,16 @@ fn put(comptime T: type, pack: []align(16) u8, at: *usize, items: []const T) []c
     return out;
 }
 
+/// Times `emit`, and for Mach-O with debug info, building the dSYM too.
 fn timeEmit(comptime L: type, gpa: std.mem.Allocator, io: std.Io, atoms: []const Atom, options: L.Options) !u64 {
     const t = std.Io.Timestamp.now(io, .awake);
+    if (L == MachO and options.debug.len > 0) {
+        const out = try MachO.emitWithDsym(gpa, io, atoms, options);
+        const ns = elapsed(io, t);
+        gpa.free(out.exe);
+        gpa.free(out.dsym);
+        return ns;
+    }
     const out = try L.emit(gpa, io, atoms, options);
     const ns = elapsed(io, t);
     gpa.free(out);
