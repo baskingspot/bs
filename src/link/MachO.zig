@@ -108,10 +108,18 @@ pub const Diagnostic = Elf.Diagnostic;
 /// atoms, which are not supported yet.
 pub const Error = Elf.Error;
 
-/// Links `atoms` and writes the executable to `sub_path` in `dir`, built
-/// directly in a shared mapping of a new file. The old file is replaced,
-/// not truncated: the kernel caches the code signature of a file it has
-/// run, and rewriting that file in place gets the next run killed.
+/// Links `atoms` and writes the executable to `sub_path` in `dir`: built in
+/// memory, signed there, and written into a new file with pwrite. The old
+/// file is replaced, not truncated: the kernel caches the code signature of
+/// a file it has run, and rewriting that file in place gets the next run
+/// killed.
+///
+/// Building in a shared mapping of the file instead costs about twice as
+/// much on macOS (12.5 ms against 6 ms for the 27 MiB bench-link output on
+/// an M4 Max): first-touch faults on the file's pages are slow, and the
+/// mapping must be invalidated with msync(MS_INVALIDATE) before exec, or
+/// the kernel kills every run of the file (golang/go#42684), which costs
+/// another 4 ms.
 pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, atoms: []const Atom, options: Options) !void {
     return linkInput(gpa, io, dir, sub_path, Elf.AtomSlice{ .atoms = atoms, .debug_entries = &.{} }, options);
 }
@@ -121,23 +129,16 @@ pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, a
 pub fn linkInput(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, input: anytype, options: Options) !void {
     var o = options;
     if (o.identifier == null) o.identifier = std.fs.path.basename(sub_path);
+    const bytes = try emitInput(gpa, io, input, o);
+    defer gpa.free(bytes);
     dir.deleteFile(io, sub_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => |e| return e,
     };
-    var out: Elf.FileOutput = .{ .file = try dir.createFile(io, sub_path, .{ .read = true, .permissions = .executable_file }) };
-    defer out.file.close(io);
+    const file = try dir.createFile(io, sub_path, .{ .permissions = .executable_file });
+    defer file.close(io);
     errdefer dir.deleteFile(io, sub_path) catch {};
-    defer if (out.map.len > 0) {
-        // The kernel caches code signing state when the file is mapped,
-        // before it has a signature, and without this every exec of the
-        // file is killed although `codesign -v` accepts it. Invalidating
-        // the mapping purges that state, as Go's linker does
-        // (golang/go#42684).
-        std.posix.msync(out.map, std.posix.MSF.INVALIDATE) catch {};
-        std.posix.munmap(out.map);
-    };
-    try build(gpa, io, input, o, &out);
+    try file.writePositionalAll(io, bytes, 0);
 }
 
 /// Links `atoms` into the bytes of an executable, owned by the caller.

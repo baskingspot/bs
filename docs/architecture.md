@@ -486,9 +486,14 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   serial pass; there are no dyld opcodes. The file ends in an ld64-style
   "linker-signed" ad-hoc signature: one CodeDirectory with a SHA-256 hash
   per 4 KiB page, hashed in parallel; the UUID comes from the same hashes,
-  so the file is read once for both. `link` must invalidate its mapping of
-  the output before unmapping it, or macOS kills every run of the file
-  despite a valid signature (golang/go#42684). It takes no `Atom.Debug`
+  so the file is read once for both. `link` builds and signs the output in
+  memory and pwrites it into a new file (never the old inode: the kernel
+  caches the signature of a file it has run). Building in a shared mapping
+  of the file took twice as long: first-touch faults on file pages cost
+  about 5 ms more than anonymous memory, and the mapping then needs
+  msync(MS_INVALIDATE) before exec (another 4 ms), or macOS kills every
+  run despite a valid signature (golang/go#42684). F_PREALLOCATE and
+  parallel pwrite gained nothing; close absorbs it. It takes no `Atom.Debug`
   yet; Mach-O debug info comes later. `MachO.linkInput`/`emitInput` read
   atoms through the same input as ELF's (its debug declarations unused),
   with the same `check`/`InvalidInput` contract, and `MachO.Symbols` has
@@ -501,10 +506,10 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   aarch64 relocations (970k: a constant reference is an adrp/add pair) and
   64 imports; output 26.9 MiB. Emit takes 22.5 ms on one thread (7.3x the
   1-thread floor of 3.1 ms; stripped ELF on the same machine: 11.0 ms) and
-  3.1 ms on 16 (ELF: 2.0 ms); linking to a file takes 12.4 ms (ELF, with
-  DWARF: 13.3 ms). SHA-256 of the 27 MiB output alone takes 8.8 ms on one
-  thread, most of the gap to stripped ELF; the rest is the extra
-  relocations.
+  3.1 ms on 16 (ELF: 2.0 ms); linking to a file takes 5.8 ms on 16
+  (2026-11-03; 12.4 ms with the shared mapping; ELF, with DWARF:
+  13.3 ms). SHA-256 of the 27 MiB output alone takes 8.8 ms on one thread,
+  most of the gap to stripped ELF; the rest is the extra relocations.
 
 ### compiler_rt (decided 2026-11-02)
 

@@ -370,17 +370,6 @@ pub const MemoryOutput = struct {
     }
 };
 
-pub const FileOutput = struct {
-    file: std.Io.File,
-    map: []align(std.heap.page_size_min) u8 = &.{},
-
-    pub fn buffer(o: *FileOutput, io: std.Io, len: usize) ![]u8 {
-        try o.file.setLength(io, len);
-        o.map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, o.file.handle, 0);
-        return o.map;
-    }
-};
-
 const page_size = 0x1000;
 
 /// Section header index of each `Atom.Section`. The allocated sections'
