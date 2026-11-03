@@ -7056,7 +7056,7 @@ fn zirMemset(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
 
 fn elemValueType(sema: *Sema, slice_ty: Index) !Index {
     const p = Type.ptrInfo(sema.ip, slice_ty);
-    return sema.ptrType(.{ .child = p.child, .sentinel = p.sentinel, .flags = .{ .size = .many, .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
+    return sema.ptrType(.{ .child = p.child, .sentinel = p.sentinel, .flags = .{ .size = .many, .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .is_allowzero = p.flags.is_allowzero, .alignment = p.flags.alignment } });
 }
 
 fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i: u32) CompileError!Ref {
@@ -7124,7 +7124,11 @@ fn slicePtr(sema: *Sema, block: *Block, slice: Ref) CompileError!Ref {
     const many_ty = try sema.elemValueType(sema.typeOf(slice));
     if (sema.resolveValue(slice)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(many_ty));
-        return .fromInterned(sema.ip.indexToKey(v).slice.ptr);
+        const ptr = sema.ip.indexToKey(v).slice.ptr;
+        // The slice may have been coerced (to a stricter alignment, say)
+        // without retyping its pointer.
+        if (sema.ip.typeOf(ptr) != many_ty) return sema.coercePtrTo(block, .fromInterned(ptr), many_ty);
+        return .fromInterned(ptr);
     }
     return sema.addTyOp(block, .slice_ptr, many_ty, slice);
 }

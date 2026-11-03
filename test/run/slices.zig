@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "3\n0\n1\n9\n6\n2\n98\n12\n4\n"
+//! stdout: "3\n0\n1\n9\n6\n2\n98\n12\n4\n7\n"
 const rt = @import("rt.zig");
 // For `std.lang.CallModifier`; std.start sees `_start` and stays out.
 const std = @import("std");
@@ -53,5 +53,11 @@ fn main() callconv(.c) noreturn {
     // `@call`.
     rt.printInt(@call(.auto, add, .{ 5, 7 }));
     rt.printInt(@call(.always_inline, add, .{ n, 1 }));
+    // A slice's .ptr keeps its alignment.
+    const aligned: []align(8) u8 = &words;
+    const aligned_ptr: [*]align(8) u8 = aligned.ptr;
+    rt.printInt(aligned_ptr[1]);
     rt.exit(0);
 }
+
+var words: [4]u8 align(8) = .{ 5, 7, 9, 11 };
