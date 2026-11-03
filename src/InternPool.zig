@@ -37,6 +37,11 @@ tid_width: u5,
 errors_mutex: Io.Mutex = .init,
 error_names: std.ArrayList(String) = .empty,
 error_map: std.AutoHashMapUnmanaged(String, u32) = .empty,
+/// Stable hash to non-static item, for `indexOfHash` only: built on its
+/// first call and extended with the items added since (`Local.by_hash_len`).
+/// The dedup maps are keyed by `lookupHash`, which no stable hash can probe.
+by_hash_mutex: Io.Mutex = .init,
+by_hash: std.AutoHashMapUnmanaged(Hash, Index) = .empty,
 /// Source of unique ids for comptime allocations.
 next_comptime_alloc: std.atomic.Value(u32) = .init(0),
 /// Stable hashes of the static items, derived from their index alone. Static
@@ -710,6 +715,8 @@ fn List(comptime T: type) type {
 const Local = struct {
     items: List(Item) = .{},
     hashes: List(Hash) = .{},
+    /// How many of `hashes` `InternPool.by_hash` holds.
+    by_hash_len: u32 = 0,
     extra: List(u32) = .{},
     strings: List([]const u8) = .{},
     limbs: List([]const Limb) = .{},
@@ -823,6 +830,7 @@ pub fn deinit(ip: *InternPool) void {
     gpa.free(ip.shards);
     ip.error_names.deinit(gpa);
     ip.error_map.deinit(gpa);
+    ip.by_hash.deinit(gpa);
     ip.* = undefined;
 }
 
@@ -962,25 +970,25 @@ pub fn find(ip: *InternPool, key: Key) ?Index {
 }
 
 /// The non-static item whose stable hash is `hash`, if one is interned.
-/// The dedup maps are keyed by stable hash already, so this costs one
-/// probe; the cache uses it to skip rebuilding items a run already has.
-pub fn indexOfHash(ip: *InternPool, hash: Hash) ?Index {
-    const shard = ip.shardOf(hash);
-    shard.mutex.lockUncancelable(ip.io);
-    defer shard.mutex.unlock(ip.io);
-    const e = shard.map.getKeyAdapted(hash, HashAdapter{ .ip = ip }) orelse return null;
-    return e.index;
+/// The cache uses it to skip rebuilding items a run already has. The first
+/// call indexes every item (one map insert each); later calls index only
+/// the items added since.
+pub fn indexOfHash(ip: *InternPool, hash: Hash) Allocator.Error!?Index {
+    ip.by_hash_mutex.lockUncancelable(ip.io);
+    defer ip.by_hash_mutex.unlock(ip.io);
+    for (ip.locals, 0..) |*local, tid| {
+        const len = local.hashes.len.load(.acquire);
+        if (local.by_hash_len == len) continue;
+        const hashes = local.hashes.view();
+        try ip.by_hash.ensureUnusedCapacity(ip.gpa, len - local.by_hash_len);
+        for (local.by_hash_len..len) |i| {
+            const gop = ip.by_hash.getOrPutAssumeCapacity(hashes[i]);
+            if (!gop.found_existing) gop.value_ptr.* = @fromBackingInt(ip.wrap(@fromBackingInt(@as(u8, @intCast(tid))), @intCast(i)));
+        }
+        local.by_hash_len = len;
+    }
+    return ip.by_hash.get(hash);
 }
-
-const HashAdapter = struct {
-    ip: *const InternPool,
-    pub fn hash(_: HashAdapter, h: Hash) u64 {
-        return @truncate(h);
-    }
-    pub fn eql(ha: HashAdapter, h: Hash, e: Entry) bool {
-        return e.hash == @as(u64, @truncate(h)) and ha.ip.stableHash(e.index) == h;
-    }
-};
 
 pub fn get(ip: *InternPool, tid: Tid, key_in: Key) Allocator.Error!Index {
     var bytes_buf: std.ArrayList(u8) = .empty;

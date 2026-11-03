@@ -446,7 +446,7 @@ pub fn Decoder(comptime Resolver: type) type {
             if (d.decoded[id] != 0) return @fromBackingInt(d.decoded[id] - 1);
             const at = d.starts[id];
             const h: Hash = @bitCast(d.words[at..][0..4].*);
-            if (!d.rebuild) if (d.ip.indexOfHash(h)) |i| {
+            if (!d.rebuild) if (try d.ip.indexOfHash(h)) |i| {
                 d.decoded[id] = @backingInt(i) + 1;
                 return i;
             };
@@ -456,7 +456,7 @@ pub fn Decoder(comptime Resolver: type) type {
                 if (d.miss.reason == .none) d.miss = .{ .id = id, .tag = tag, .reason = .unresolved };
                 return null;
             };
-            if (d.ip.stableHash(i) != h or (d.rebuild and d.ip.indexOfHash(h) != i)) {
+            if (d.ip.stableHash(i) != h or (d.rebuild and try d.ip.indexOfHash(h) != i)) {
                 d.miss = .{ .id = id, .tag = tag, .reason = .hash };
                 return null;
             }
