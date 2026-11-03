@@ -90,7 +90,8 @@ pub fn parseSize(text: []const u8) ?u64 {
 /// A file hard-linked into several directories counts once, against the
 /// most recently used. `zap run`'s program directories (`zap/o`) count
 /// and go the same way, by the program's mtime, which every run renews by
-/// relinking it; one is not locked, so a run that relinks the least
+/// relinking it or, when nothing changed, by touching it
+/// (`Incremental.renew_output`); one is not locked, so a run that relinks the least
 /// recently used program at the moment it goes fails, and the next run
 /// builds it again. Test binaries in `zap/tmp` that a killed build left
 /// go after a day. Runs at most once a minute, so that it costs a build
@@ -162,8 +163,8 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
                     if (e.kind != .file) continue;
                     const stat = d.statFile(io_, e.name, .{}) catch continue;
                     if (entry.run) {
-                        // A run that reuses the program relinks it, which
-                        // renews its mtime.
+                        // A run that reuses the program renews its
+                        // mtime.
                         if (entry.used == null or stat.mtime.compare(.gt, entry.used.?)) entry.used = stat.mtime;
                     } else if (std.mem.eql(u8, e.name, "lock")) entry.used = stat.mtime;
                     entry.files.append(gpa_, .{ .inode = @intCast(stat.inode), .size = stat.size }) catch return;

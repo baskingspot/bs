@@ -141,6 +141,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (inc) |*i| i.close();
     if (inc) |*i| i.check = init.environ_map.get("ZAP_CACHE_CHECK") != null;
     if (inc) |*i| i.stack_size = opts.stack_size;
+    if (inc) |*i| i.renew_output = command == .run;
     if (inc) |*i| if (init.environ_map.get("ZAP_CACHE_VERIFY")) |v| {
         i.verify = if (std.mem.eql(u8, v, "full")) .full else .replay;
         i.verify_argv = args;
@@ -236,6 +237,7 @@ pub fn main(init: std.process.Init) !void {
     const linked = try emit.link(init.io, Io.Dir.cwd(), bin_path);
     stages.mark("link");
     if (inc) |*i| i.finishRecord(linked);
+    if (linked) if (inc) |*i| i.noteOutput(Io.Dir.cwd(), bin_path);
     stages.mark("cache record (after the link)");
     stages.print();
     if (stages.on) emit.codegen_stats.print("zap: codegen");

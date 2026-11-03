@@ -2016,6 +2016,13 @@ it and can flush every CPU's TLB.
   zap (0.4–0.6 of it the stats), 2 ms wall, against 14–19 ms for a full build.
   The generated 24.5k-atom program below relinks in 5.2–7.6 ms (5.3 ms
   steady), against 7.4–9.5 (7.9 steady) when it decoded first.
+  If the output still has the inode, size, and mtime the last link left
+  it with (the compilation directory's `output` file, written after each
+  successful link and deleted before each link starts), the build does
+  not link at all and leaves the output untouched, so a `zig build`
+  runner neither copies nor rehashes it: hello takes 0.8 ms in the cache.
+  `zap run` (`renew_output`) still renews its program's mtime, which
+  trimming reads as its last use.
 - **Recording** (`startRecord` once Emit has its atoms, alongside the
   link; `finishRecord` places the manifest only if the link succeeded, so
   a failed link leaves the last successful build's; the store pack it

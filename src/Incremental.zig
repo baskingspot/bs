@@ -71,6 +71,9 @@ check_failed: std.atomic.Value(bool) = .init(false),
 /// `--stack`, for a relink; part of the command line that keys the
 /// compilation.
 stack_size: u64 = 16 * 1024 * 1024,
+/// Whether a build that does not relink renews the output's mtime, as a
+/// relink would: `zap run`'s programs are trimmed by it.
+renew_output: bool = false,
 /// `ZAP_CACHE_VERIFY`: `replay` checks an edit build that loaded units
 /// by building again in full (`full`, the build's own environment then),
 /// which compares its nodes with the edit build's (`verifyNodes`).
@@ -189,6 +192,14 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         try restat.?.setInput(i, path, stat, in.content_hash, inc.build_start);
     }
     const t1 = now(io);
+    // Past the fold size, the inputs are rehashed until the next full build
+    // writes a new base, so that the log stays bounded.
+    defer if (restat) |*d| if (!m.shouldFold()) d.append(io, inc.dir) catch {};
+    if (inc.outputUnchanged(out_dir, sub_path)) {
+        if (inc.timing) std.debug.print("cache: no input changed and the output is as the last link left it; not relinking ({d:.2} ms, {d} rehashed)\n", .{ ms(t0, now(io)), changed.items.len });
+        return true;
+    }
+    inc.forgetOutput();
 
     var pack: Pack = try .open(io, inc.dir);
     defer pack.close(gpa, io);
@@ -230,13 +241,51 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
             return err;
         },
     };
-    // Past the fold size, the inputs are rehashed until the next full build
-    // writes a new base, so that the log stays bounded.
-    if (restat) |*d| if (!m.shouldFold()) d.append(io, inc.dir) catch {};
+    inc.noteOutput(out_dir, sub_path);
     if (inc.timing) std.debug.print("cache: no input changed; relinked {d} atoms in {d:.2} ms (manifest and {d} stats {d:.2}, {d} rehashed; packs mapped and input gathered {d:.2}, link {d:.2})\n", .{
         in.refs.len, ms(t0, now(io)), m.inputCount(), ms(t0, t1), changed.items.len, ms(t1, t2), ms(t2, now(io)),
     });
     return true;
+}
+
+/// The file in the compilation's directory that holds the stat the last
+/// link left its output with (`OutputStat`, then the output's path), so
+/// that a build with nothing to do neither relinks nor touches the output:
+/// a `zig build` runner copies and rehashes an output whose mtime moved.
+const output_name = "output";
+
+const OutputStat = extern struct { inode: u64, size: u64, mtime: i64 };
+
+/// Whether `sub_path` still has the stat `noteOutput` recorded for it.
+/// With `renew_output`, also renews its mtime, recording the new stat.
+fn outputUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u8) bool {
+    const io = inc.io;
+    var buf: [@sizeOf(OutputStat) + 4096]u8 = undefined;
+    const bytes = inc.dir.readFile(io, output_name, &buf) catch return false;
+    if (bytes.len < @sizeOf(OutputStat) or !std.mem.eql(u8, bytes[@sizeOf(OutputStat)..], sub_path)) return false;
+    const want = std.mem.bytesToValue(OutputStat, bytes[0..@sizeOf(OutputStat)]);
+    const stat = out_dir.statFile(io, sub_path, .{}) catch return false;
+    if (stat.inode != want.inode or stat.size != want.size or stat.mtime.toNanoseconds() != want.mtime) return false;
+    if (inc.renew_output) {
+        out_dir.setTimestampsNow(io, sub_path, .{}) catch return false;
+        inc.noteOutput(out_dir, sub_path);
+    }
+    return true;
+}
+
+/// Records the stat of the output a link just wrote. Best effort.
+pub fn noteOutput(inc: *const Incremental, out_dir: Io.Dir, sub_path: []const u8) void {
+    const io = inc.io;
+    if (sub_path.len > 4096) return;
+    const stat = out_dir.statFile(io, sub_path, .{}) catch return;
+    const os: OutputStat = .{ .inode = @intCast(stat.inode), .size = stat.size, .mtime = @intCast(stat.mtime.toNanoseconds()) };
+    cache.writeReplace(io, inc.dir, output_name, &.{ std.mem.asBytes(&os), sub_path }) catch {};
+}
+
+/// Forgets the output's stat before a link replaces the output, so that
+/// a link that fails halfway does not leave it matching.
+fn forgetOutput(inc: *const Incremental) void {
+    inc.dir.deleteFile(inc.io, output_name) catch {};
 }
 
 /// Returns false for `relinkIfUnchanged`, saying why under
@@ -839,6 +888,7 @@ fn defaultsResultHash(ip: *const InternPool, ty: InternPool.Index) Hash {
 /// not change, so it runs alongside the link. `finishRecord` keeps or
 /// discards it. `fe`, `zcu`, and `emit` must not change until then.
 pub fn startRecord(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) void {
+    inc.forgetOutput();
     if (inc.timing) if (inc.replay) |r| r.printStats();
     std.debug.assert(inc.recording == null);
     inc.recording = inc.io.async(record, .{ inc, fe, zcu, emit });
