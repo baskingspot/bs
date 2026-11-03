@@ -3804,6 +3804,17 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                     };
                     return try sema.addTyOp(block, .bitcast, dest_ty, inst);
                 }
+                // `?u64` to `?usize`: integers of the same representation.
+                if (sema.sameIntRepr(s_child, child)) {
+                    if (val) |v| switch (ip.indexToKey(v)) {
+                        .opt => |o| {
+                            const payload: Index = if (o.val == .none) .none else (try sema.coerce(block, child, .fromInterned(o.val), src)).toInterned().?;
+                            return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = payload } }));
+                        },
+                        else => return .fromInterned(try sema.undefValue(dest_ty)),
+                    };
+                    return try sema.addTyOp(block, .bitcast, dest_ty, inst);
+                }
                 // `?error{A}` to `?error{A,B}`: the same representation.
                 if (Type.class(ip, s_child) == .error_set and Type.class(ip, child) == .error_set) {
                     if (val) |v| switch (ip.indexToKey(v)) {
@@ -3834,10 +3845,14 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             }
             if (sc == .error_union) {
                 const s_eu = ip.indexToKey(src_ty).error_union_type;
-                if (s_eu.payload_type != eu.payload_type) return null;
+                // As upstream, the payload must coerce in memory.
+                if (s_eu.payload_type != eu.payload_type and !sema.payloadCoercibleInMemory(s_eu.payload_type, eu.payload_type)) return null;
                 if (!try sema.errorSetCoercible(block, src, s_eu.error_set_type, eu.error_set_type, if (val) |v| v else .none)) return null;
                 if (val) |v| return .fromInterned(switch (ip.indexToKey(v)) {
-                    .error_union => |e| try sema.intern(.{ .error_union = .{ .ty = dest_ty, .val = e.val } }),
+                    .error_union => |e| try sema.intern(.{ .error_union = .{ .ty = dest_ty, .val = switch (e.val) {
+                        .err_name => e.val,
+                        .payload => |pv| .{ .payload = (try sema.coerce(block, eu.payload_type, .fromInterned(pv), src)).toInterned().? },
+                    } } }),
                     else => try sema.undefValue(dest_ty),
                 });
                 return try sema.addTyOp(block, .bitcast, dest_ty, inst);
@@ -4171,7 +4186,7 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
         return s.child == d.child or d.child == .anyopaque_type or (s.flags.size == .one and s_array != null and s_array.?.child == d.child);
     if (s.flags.size == d.flags.size) {
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;
-        if (s.child == d.child) return true;
+        if (s.child == d.child or sema.sameIntRepr(s.child, d.child)) return true;
         // Through a const pointer, a child may gain qualifiers itself
         // (`[]?[*:0]u8` to `[]const ?[*:0]const u8`).
         if (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child)) return true;
@@ -4194,10 +4209,32 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     return false;
 }
 
+/// Whether an error union payload of type `s` reads in place as a `d`.
+fn payloadCoercibleInMemory(sema: *Sema, s: Index, d: Index) bool {
+    const ip = sema.ip;
+    if (s == d or sema.sameIntRepr(s, d)) return true;
+    if (Type.class(ip, s) == .pointer and Type.class(ip, d) == .pointer) return sema.ptrCoercibleInPlace(s, d);
+    if (Type.class(ip, s) == .optional and Type.class(ip, d) == .optional) {
+        const sc = Type.childType(ip, s);
+        const dc = Type.childType(ip, d);
+        if (Type.class(ip, sc) == .pointer and Type.class(ip, dc) == .pointer) return sema.ptrCoercibleInPlace(sc, dc);
+        return sema.sameIntRepr(sc, dc);
+    }
+    return false;
+}
+
+/// Whether `a` and `b` are integer types of the same signedness and bits
+/// (`u64` and `usize`), which coerce in memory, as upstream.
+fn sameIntRepr(sema: *Sema, a: Index, b: Index) bool {
+    const ip = sema.ip;
+    if (Type.class(ip, a) != .int or Type.class(ip, b) != .int) return false;
+    return std.meta.eql(Type.intInfo(ip, a), Type.intInfo(ip, b));
+}
+
 /// Whether a value of type `src` can be read as a `dst` in place, where
 /// `dst` differs only by adding const or volatile to pointers inside it.
 fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
-    if (src == dst) return true;
+    if (src == dst or sema.sameIntRepr(src, dst)) return true;
     const ip = sema.ip;
     const sk = ip.indexToKey(src);
     const dk = ip.indexToKey(dst);
@@ -4241,7 +4278,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     // `*[N]T` to `[]T`.
     if (s.flags.size == .one and d.flags.size == .slice and ip.indexToKey(s.child) == .array_type) {
         const a = ip.indexToKey(s.child).array_type;
-        if (a.child != d.child and !(d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) return null;
+        if (a.child != d.child and !sema.sameIntRepr(a.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) return null;
         // A pointer to a zero-length array coerces to any slice, even a mutable one.
         if (s.flags.is_const and !d.flags.is_const and a.len != 0) return null;
         if (d.sentinel != .none and !sema.sentinelsMatch(a.sentinel, d.sentinel)) return null;
@@ -4252,7 +4289,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     }
     // `[]T` to `[*]T`, keeping a sentinel.
     if (s.flags.size == .slice and d.flags.size == .many) {
-        if (s.child != d.child and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
+        if (s.child != d.child and !sema.sameIntRepr(s.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
         if (s.flags.is_const and !d.flags.is_const) return null;
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return null;
         const raw = try sema.slicePtr(block, inst);

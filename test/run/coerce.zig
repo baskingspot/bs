@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "4\nabcd\n7\n9\n0\nB\n3\n10\n3\n6\n8\n44\n"
+//! stdout: "4\nabcd\n7\n9\n0\nB\n3\n10\n3\n6\n8\n14\n44\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -68,6 +68,17 @@ fn main() callconv(.c) noreturn {
         : [ret] "={eax}" (-> u32),
     );
     rt.printInt(r);
+    // Integers of the same representation (`u64`, `usize`) coerce in
+    // memory inside optionals, pointers, and error unions; so do
+    // sentinel slices inside error unions.
+    var none: ?usize = null;
+    _ = &none;
+    const some: ?usize = none orelse maybe(3);
+    var words: [2]u64 = .{ 1, 2 };
+    const ws: []usize = &words;
+    const eu: anyerror!?usize = @as(anyerror!?u64, maybe(5));
+    const nm: anyerror![]const u8 = nameOrFail(false);
+    rt.printInt(some.? + ws[1] + (eu catch unreachable).? + (nm catch unreachable).len);
     // Initializers whose result type is optional or an error union.
     var lo: u8 = 2;
     _ = &lo;
@@ -92,6 +103,12 @@ fn span(r: ?Range) u8 {
 fn pairOrFail(fail: bool) error{Bad}!Range {
     if (fail) return error.Bad;
     return .{ .lo = 3 };
+}
+fn maybe(x: u64) ?u64 {
+    return if (x == 0) null else x;
+}
+fn nameOrFail(fail: bool) error{Bad}![:0]const u8 {
+    return if (fail) error.Bad else "abcd";
 }
 fn widen(fail: bool) struct { ?error{ A, B }, u64 } {
     const narrow: struct { ?error{A}, usize } = .{ if (fail) error.A else null, 5 };
