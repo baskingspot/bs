@@ -4207,7 +4207,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     const nav_index = switch (ip.indexToKey(ptr_val).ptr.base) {
         .nav => |n| n,
         .uav => |v| {
-            try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .uav = v.val }, .name = try sema.getString(name) });
+            try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .uav = v.val }, .name = try sema.getString(name), .unit = sema.owner });
             return;
         },
         else => return sema.fail(block, src, "export target must be a global variable or a comptime-known constant", .{}),
@@ -4219,7 +4219,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
         else => nav_index,
     };
     if (ip.indexToKey(val) == .func) try sema.queueFuncRef(val);
-    try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name) });
+    try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name), .unit = sema.owner });
 }
 
 /// `@extern(T, .{ .name = ... })`: the address of a symbol defined

@@ -2252,7 +2252,9 @@ once, where store payloads would repeat `[]const u8` in every entry.
   `func` stores its references (its Atoms are in the pack, its IR is
   never stored); the `func_ies` node stores whether the set is `anyerror`
   and the error names in the order they were found; `comptime_decl` will
-  store its exports (step 4: exports do not record their unit yet).
+  store its exports (`Zcu.Export.unit` names the unit whose analysis
+  appended each one; it is null for `export` declarations, which the
+  namespace scan recreates).
 - `builtin.test_functions` is filled outside unit analysis
   (`populateTestFunctions`, after all tests are known), so the test list is
   its own node, and adding or removing a test changes it.

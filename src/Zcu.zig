@@ -95,6 +95,9 @@ pub const Export = struct {
         uav: InternPool.Index,
     },
     name: InternPool.String,
+    /// The unit whose analysis made the export (`@export`), or null for an
+    /// `export` declaration, which the namespace scan makes.
+    unit: ?AnalUnit,
 };
 
 pub const FuncState = enum { queued, in_progress, done, failed };
@@ -541,7 +544,7 @@ pub fn createContainerType(
         switch (d.kind) {
             .@"const", .@"var" => {
                 try zcu.namespaces.items[ns_index].decls.put(zcu.gpa, ip.getNav(nav).name, nav);
-                if (d.linkage == .@"export") try zcu.exports.append(zcu.gpa, .{ .target = .{ .nav = nav }, .name = ip.getNav(nav).name });
+                if (d.linkage == .@"export") try zcu.exports.append(zcu.gpa, .{ .target = .{ .nav = nav }, .name = ip.getNav(nav).name, .unit = null });
             },
             else => {
                 // Upstream's filter semantics: unnamed tests always run;
