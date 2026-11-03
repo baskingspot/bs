@@ -5846,13 +5846,11 @@ fn analyzeMinMax(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operan
                 if (val != null and !sema.isUndef(val.?) and vector_len == null) {
                     lo = try sema.bigValue(val.?);
                     hi = lo;
-                } else if (val != null and vector_len != null and !sema.isUndef(val.?)) {
+                } else if (val != null and vector_len != null and !sema.isUndef(val.?) and !try sema.anyElemUndef(val.?, vector_len.?)) {
                     lo = try sema.bigValue(try sema.elemValue(val.?, 0));
                     hi = lo;
                     for (1..vector_len.?) |i| {
-                        const e = try sema.elemValue(val.?, i);
-                        if (sema.isUndef(e)) break;
-                        const b = try sema.bigValue(e);
+                        const b = try sema.bigValue(try sema.elemValue(val.?, i));
                         if (b.order(lo) == .lt) lo = b;
                         if (b.order(hi) == .gt) hi = b;
                     }
@@ -5907,6 +5905,13 @@ fn analyzeMinMax(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operan
         (try sema.vectorCast(block, src, result_ty, cur, intCastUnchecked)).?
     else
         sema.intCastUnchecked(block, src, result_ty, cur);
+}
+
+/// Whether an element of comptime-known vector `val` is undefined; its
+/// other elements then do not narrow `@min`/`@max`'s bounds.
+fn anyElemUndef(sema: *Sema, val: Index, len: u32) !bool {
+    for (0..len) |i| if (sema.isUndef(try sema.elemValue(val, i))) return true;
+    return false;
 }
 
 /// The smallest integer type holding `min` through `max`, as upstream's
