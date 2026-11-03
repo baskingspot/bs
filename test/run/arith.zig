@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n7\n18446744073709551615\n3\n2\n4294967294\n3\n-3 -> 3\n200\n5\n"
+//! stdout: "42\n7\n18446744073709551615\n3\n2\n4294967294\n3\n-3 -> 3\n200\n5\n18446744073709551613\n7\n1\n0\n1\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -44,5 +44,23 @@ fn main() callconv(.c) noreturn {
     rt.printInt(c);
     const big: u64 = 1 << 40;
     rt.printInt(big >> 38 | @as(u64, @intFromBool(a < b)));
+    // Comptime-known signed `/` truncates; `%` is allowed when it is zero.
+    const sn: i32 = -7;
+    const sd: i32 = 2;
+    rt.printInt(@bitCast(@as(i64, sn / sd)));
+    rt.printInt(@as(u32, @bitCast(@as(i32, -8 % 4))) + @as(u32, 7 / -2 + 10));
+    // A comptime_int zero from a negative operand is the zero switch item.
+    rt.printInt(switch (@mod(-2, 2)) {
+        0 => 1,
+        else => 2,
+    });
+    // `u0` shifts by zero.
+    var z0: u0 = 0;
+    _ = &z0;
+    rt.printInt(@as(u8, z0 << 0) + @shlWithOverflow(z0, 0)[1]);
+    // `undefined == x` is an undefined bool.
+    var ub = undefined == 1;
+    ub = true;
+    rt.printInt(@intFromBool(ub));
     rt.exit(if (a ^ b == 1 and !(a > b) and (a != b or false)) 0 else 1);
 }

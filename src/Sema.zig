@@ -4980,13 +4980,24 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
     // Signed division and remainder need an explicit rounding mode.
     if (tag == .div or tag == .mod_rem) {
         if (signed) {
+            // As upstream: comptime-known operands divide by truncation,
+            // and a remainder is allowed when neither operand may be
+            // negative or the remainder is zero.
             const lv = sema.resolveValue(lhs);
             const rv = sema.resolveValue(rhs);
-            const nonneg = lv != null and rv != null and !sema.isUndef(lv.?) and !sema.isUndef(rv.?) and
-                sema.intSign(lv.?) >= 0 and sema.intSign(rv.?) > 0;
-            if (!nonneg) {
-                if (tag == .div) return sema.fail(block, src, "division with '{f}' and '{f}': signed integers must use @divTrunc, @divFloor, or @divExact", .{ sema.fmtType(ty), sema.fmtType(ty) });
-                return sema.fail(block, src, "remainder division with '{f}' and '{f}': signed integers and floats must use @rem or @mod", .{ sema.fmtType(ty), sema.fmtType(ty) });
+            const known = lv != null and rv != null and !sema.isUndef(lv.?) and !sema.isUndef(rv.?);
+            if (tag == .div and !known) return sema.fail(block, src, "division with '{f}' and '{f}': signed integers must use @divTrunc, @divFloor, or @divExact", .{ sema.fmtType(ty), sema.fmtType(ty) });
+            if (tag == .mod_rem) {
+                const maybe_negative = !known or sema.intSign(lv.?) < 0 or sema.intSign(rv.?) < 0;
+                if (maybe_negative) {
+                    const zero = known and sema.intSign(rv.?) != 0 and blk: {
+                        var q = try BigInt.init(sema.arena);
+                        var r = try BigInt.init(sema.arena);
+                        try q.divTrunc(&r, &try sema.bigValue(lv.?), &try sema.bigValue(rv.?));
+                        break :blk r.eqlZero();
+                    };
+                    if (!zero) return sema.fail(block, src, "remainder division with '{f}' and '{f}': signed integers and floats must use @rem or @mod", .{ sema.fmtType(ty), sema.fmtType(ty) });
+                }
             }
         }
     }
@@ -5255,7 +5266,8 @@ fn analyzeShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, lhs: Re
             return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
         }
         if (sema.intSign(v) < 0) return sema.fail(block, src, "shift by negative amount '{f}'", .{sema.fmtValue(v)});
-        if (!sat and class == .int and (sema.ip.intValue(u64, v) orelse std.math.maxInt(u64)) >= Type.intInfo(ip, ty).bits)
+        const amount = sema.ip.intValue(u64, v) orelse std.math.maxInt(u64);
+        if (!sat and class == .int and amount > 0 and amount >= Type.intInfo(ip, ty).bits)
             return sema.fail(block, src, "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
     }
     if (sema.resolveValue(lhs)) |lv| if (rv) |v| {
@@ -5290,6 +5302,7 @@ fn analyzeShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, lhs: Re
         return .fromInterned(try sema.bigToValue(ty, r.toConst()));
     };
     if (class == .comptime_int) return sema.fail(block, src, "LHS of shift must be a fixed-width integer type, or RHS must be comptime-known", .{});
+    if (rv) |v| if (sema.intSign(v) == 0) return lhs;
     try sema.requireRuntime(block, src);
     const bits = Type.intInfo(ip, ty).bits;
     const shift_ty = try sema.intType(.unsigned, Type.log2IntBits(bits));
@@ -5477,7 +5490,7 @@ fn analyzeShlWithOverflow(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncast
     const rhs = try sema.coerce(block, shift_ty, uncasted_rhs, src);
     const tuple_ty = try sema.overflowTupleType(ty);
     const rv = sema.resolveValue(rhs);
-    if (rv) |v| if (!sema.isUndef(v) and ip.intValue(u64, v).? >= info.bits)
+    if (rv) |v| if (!sema.isUndef(v) and ip.intValue(u64, v).? > 0 and ip.intValue(u64, v).? >= info.bits)
         return sema.fail(block, src, "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
     if (sema.resolveValue(lhs)) |lv| if (rv) |v| {
         if (sema.isUndef(lv) or sema.isUndef(v)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
@@ -6275,6 +6288,8 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         return sema.vectorMap(block, src, len, try sema.vectorType(len, .bool_type), &.{ l, r }, VectorCmp{ .op = op, .elem_ty = Type.childType(ip, ty) });
     }
     const is_eq = op == .eq or op == .neq;
+    // The `undefined` literal compares to anything as an undefined bool.
+    if (lc == .undefined or rc == .undefined) return .fromInterned(try sema.undefValue(.bool_type));
 
     // Comparison with `null`.
     if (lc == .null or rc == .null) {

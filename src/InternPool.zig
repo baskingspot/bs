@@ -1722,7 +1722,8 @@ pub fn isType(ip: *const InternPool, index: Index) bool {
 pub fn getInt(ip: *InternPool, tid: Tid, ty: Index, value: anytype) !Index {
     const T = @TypeOf(value);
     if (T == BigIntConst) {
-        if (value.positive) {
+        // A negative zero (from big-int arithmetic) is stored as zero.
+        if (value.positive or value.eqlZero()) {
             if (value.toInt(u64)) |v| return ip.get(tid, .{ .int = .{ .ty = ty, .storage = .{ .u64 = v } } }) else |_| {}
         } else if (value.toInt(i64)) |v| {
             return ip.get(tid, .{ .int = .{ .ty = ty, .storage = .{ .i64 = v } } });
