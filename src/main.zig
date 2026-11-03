@@ -49,6 +49,8 @@ pub const Options = struct {
     /// Print the typed IR of every analyzed function to stdout
     /// (`--debug-dump-ir`, for zap's own tests and debugging).
     dump_ir: bool = false,
+    root_deps: []const []const u8 = &.{},
+    modules: []const Frontend.ModuleArg = &.{},
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -128,6 +130,8 @@ pub fn main(init: std.process.Init) !void {
         .root_src_path = if (is_test) test_runner else opts.root_src_path,
         .builtin_dir = builtin_dir,
         .main_src_path = if (is_test) opts.root_src_path else null,
+        .root_deps = opts.root_deps,
+        .modules = opts.modules,
     });
     defer fe.deinit();
     try fe.enableCache(cache_dirs);
@@ -266,6 +270,8 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
     var root: ?[]const u8 = null;
     var opts: Options = .{ .command = command, .root_src_path = undefined };
     var test_filters: std.ArrayList([]const u8) = .empty;
+    var deps: std.ArrayList([]const u8) = .empty;
+    var modules: std.ArrayList(Frontend.ModuleArg) = .empty;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -294,6 +300,15 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
         } else if (std.mem.eql(u8, arg, "--test-no-exec")) {
             if (command != .@"test") fatal("{s} is only valid for 'zap test'", .{arg});
             opts.test_no_exec = true;
+        } else if (std.mem.eql(u8, arg, "--dep")) {
+            try deps.append(arena, nextArg(args, &i, arg));
+        } else if (std.mem.startsWith(u8, arg, "-M")) {
+            const spec = arg[2..];
+            const eq = std.mem.indexOfScalar(u8, spec, '=') orelse fatal("expected -Mname=path, found '{s}'", .{arg});
+            if (root == null) {
+                root = spec[eq + 1 ..];
+                opts.root_deps = try deps.toOwnedSlice(arena);
+            } else try modules.append(arena, .{ .name = spec[0..eq], .path = spec[eq + 1 ..], .deps = try deps.toOwnedSlice(arena) });
         } else if (std.mem.eql(u8, arg, "--debug-dump-ir")) {
             opts.dump_ir = true;
         } else if (std.mem.eql(u8, arg, "-ODebug")) {
@@ -304,12 +319,14 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
             fatal("unsupported option: {s}", .{arg});
         } else if (root == null) {
             root = arg;
+            opts.root_deps = try deps.toOwnedSlice(arena);
         } else {
             fatal("unexpected extra parameter: {s}", .{arg});
         }
     }
     opts.root_src_path = root orelse fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
+    opts.modules = modules.items;
     return opts;
 }
 

@@ -60,6 +60,8 @@ pub const Module = struct {
     root_file: []const u8,
     /// `root_dir` made absolute, for cache index keys. Set by `enableCache`.
     abs_root_dir: ?[:0]const u8 = null,
+    /// `@import` names this module resolves to other modules (`--dep`).
+    deps: []const Dep = &.{},
     /// Which of `caches` holds this module's ZIR: std's files are shared by
     /// every project through the global cache.
     cache: CacheKind,
@@ -74,6 +76,16 @@ pub const Module = struct {
 };
 
 pub const CacheKind = enum(u1) { local, global };
+
+pub const Dep = struct { name: []const u8, module: Module.Index };
+
+/// A module given on the command line (`--dep a --dep b=c -Mname=path`).
+pub const ModuleArg = struct {
+    name: []const u8,
+    path: []const u8,
+    /// `name` or `name=module`.
+    deps: []const []const u8,
+};
 
 pub const File = struct {
     module: Module.Index,
@@ -130,6 +142,9 @@ pub const Options = struct {
     /// Whether `loadAll` loads std, which upstream always analyzes. Off only
     /// in tests that have no lib directory.
     load_std: bool = true,
+    /// `--dep`s of the root module, and the other modules.
+    root_deps: []const []const u8 = &.{},
+    modules: []const ModuleArg = &.{},
 };
 
 pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
@@ -160,6 +175,25 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         fe.main_module = @fromBackingInt(@intCast(fe.modules.items.len));
         try fe.addModule("main", path, .local);
     }
+    const first_extra = fe.modules.items.len;
+    for (options.modules) |m| try fe.addModule(m.name, m.path, .local);
+    const resolve = struct {
+        fn f(f_fe: *Frontend, specs: []const []const u8) ![]const Dep {
+            const deps = try f_fe.gpa.alloc(Dep, specs.len);
+            for (deps, specs) |*d, spec| {
+                const eq = std.mem.indexOfScalar(u8, spec, '=');
+                const name = if (eq) |e| spec[0..e] else spec;
+                const target = if (eq) |e| spec[e + 1 ..] else spec;
+                const idx = for (f_fe.modules.items, 0..) |m, k| {
+                    if (std.mem.eql(u8, m.name, target)) break k;
+                } else std.process.fatal("no module named '{s}' for --dep '{s}'", .{ target, spec });
+                d.* = .{ .name = name, .module = @fromBackingInt(@intCast(idx)) };
+            }
+            return deps;
+        }
+    }.f;
+    fe.modules.items[@backingInt(fe.main_module)].deps = try resolve(&fe, options.root_deps);
+    for (options.modules, first_extra..) |m, k| fe.modules.items[k].deps = try resolve(&fe, m.deps);
     return fe;
 }
 
@@ -183,6 +217,7 @@ pub fn deinit(fe: *Frontend) void {
         gpa.free(m.root_dir);
         gpa.free(m.root_file);
         if (m.abs_root_dir) |p| gpa.free(p);
+        gpa.free(m.deps);
     }
     fe.modules.deinit(gpa);
     for (&fe.caches) |*c| if (c.*) |*cd| cd.deinit(gpa, fe.io);
@@ -206,6 +241,13 @@ pub fn file(fe: *const Frontend, index: File.Index) *const File {
 
 pub fn module(fe: *const Frontend, index: Module.Index) *const Module {
     return &fe.modules.items[@backingInt(index)];
+}
+
+/// The module that `@import(name)` in module `from` names through its
+/// `--dep`s, if any.
+pub fn depModule(fe: *const Frontend, from: Module.Index, name: []const u8) ?Module.Index {
+    for (fe.module(from).deps) |d| if (std.mem.eql(u8, d.name, name)) return d.module;
+    return null;
 }
 
 /// The syntax tree of a file, read and parsed again on first use. For error
@@ -1193,7 +1235,9 @@ fn collectImports(fe: *const Frontend, f: *const File, names: []const u8) ![]Imp
     var it = std.mem.tokenizeScalar(u8, names, 0);
     while (it.next()) |name| {
         try list.ensureUnusedCapacity(gpa, 1);
-        const imp: Import = if (std.mem.endsWith(u8, name, ".zig")) .{
+        const imp: Import = if (fe.depModule(f.module, name)) |m|
+            .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) }
+        else if (std.mem.endsWith(u8, name, ".zig")) .{
             .module = f.module,
             .sub_path = try std.fs.path.resolvePosix(gpa, &.{ std.fs.path.dirname(f.sub_path) orelse "", name }),
         } else if (std.mem.eql(u8, name, "std"))

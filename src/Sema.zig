@@ -3928,7 +3928,9 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     const path = sema.zirString(extra.path);
     const fe = sema.zcu.fe;
     const this_file = sema.zcu.file(sema.file);
-    const key = if (std.mem.endsWith(u8, path, ".zig")) blk: {
+    const key = if (fe.depModule(this_file.module, path)) |m|
+        sema.zcu.moduleRootFile(m).?
+    else if (std.mem.endsWith(u8, path, ".zig")) blk: {
         const dir = std.fs.path.dirname(this_file.sub_path) orelse "";
         const sub = try std.fs.path.resolvePosix(sema.arena, &.{ dir, path });
         const key = try std.fmt.allocPrint(sema.arena, "{d}:{s}", .{ @backingInt(this_file.module), sub });
