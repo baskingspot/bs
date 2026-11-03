@@ -3402,9 +3402,10 @@ Every record whose order today is discovery order becomes either sorted
 by a stable key at a serial point or a function of one unit's own
 analysis:
 
-1. *Output.* `finish` sorts owner groups by the node key the manifest
-   uses: a unit's key hash, or a content atom's key. The link's own atoms
-   go last. Duplicates are dropped as `groupByOwner` does now. Data for
+1. *Output.* `groupByOwner` sorts owner groups by their atoms' symbol
+   keys (the first atom's, then the next ones'), so `finish` needs no unit
+   keys; ties are broken by a hash of the owner. The link's own atoms go
+   last. Duplicates are then dropped by key, as now. Data for
    requested declarations is lowered in declaration-key order. Error
    codes are final by then (rule 5), so the error-name table follows from
    them. Callers no longer sit next to their callees; `bench/runtime.py`
@@ -3428,9 +3429,10 @@ analysis:
    verification matches by key. If lazy relinks must be byte-identical
    to full builds, `linkInput` can merge the base's key-ordered atom
    nodes with the log's new nodes by key, a cheap merge of two sorted
-   lists. Rule 1 can land on its own before the rest: the cache thread's
-   donor builds need it, because loading green units instead of
-   analyzing them changes atom order today.
+   lists. Rule 1 lands on its own before the rest, on the cache thread's
+   donor branch: loading green units instead of analyzing them changed
+   atom order, and with the sort an eager edit build of hello, and a
+   donor first build, are byte-identical to a full build.
 3. *Dependency records.* `deps`, `conditional_deps`, `func_refs` and
    `effect_uses` become per-worker logs, merged and sorted by unit key.
    A unit's own dependee list keeps the order that unit read them in. That
