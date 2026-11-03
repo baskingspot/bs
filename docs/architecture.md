@@ -114,11 +114,13 @@ results are observable and `test/behavior` checks them. Upstream's `n` counts
 anonymous types in analysis order; zap's is the type's instruction (an
 anonymous struct literal's too) relative to the declaration, like the key, so
 that an edit above a declaration renames none of its types: nothing that
-reads a type's name records a dependency on it. The exception is a `comptime`
-block's types: all the blocks of a namespace share the parent name
-`<namespace>.comptime`, so relative numbers would collide, and theirs are
-absolute instructions, which is safe because a comptime block is analyzed
-again in every edit build.
+reads a type's name records a dependency on it. A `comptime` block's types
+share the parent name `<namespace>.comptime` with the namespace's other
+blocks, so their `n` is `<ordinal>_<offset>`, the block's ordinal and the
+offset from it, as their key has both. (Absolute instructions renamed them
+on an edit above the block while their key stayed: the block is analyzed
+again in every edit build, but a function of the type is loaded with its
+old symbol name.)
 
 When a unit reads another unit's result (a declaration's value, a type's
 layout, a function's signature) it goes through one Sema function that records
@@ -2664,8 +2666,8 @@ and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
   marks where the walker would note one (`comptime_effect`,
   `Zcu.Bytecode.effects`) for the units whose runs reach it.
 - Anonymous types are named `Parent__struct_<n>` with `n` relative to
-  their declaration, except in `comptime` blocks (see "Analysis units"):
-  with absolute instructions,
+  their declaration (`<ordinal>_<offset>` in `comptime` blocks, see
+  "Analysis units"): with absolute instructions,
   a green unit's result kept the old name of a type in an edited file,
   and code reading `@typeName` went stale.
 - The error name table is written in code order, not use order, so that

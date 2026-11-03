@@ -5605,7 +5605,7 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
     const display = if (var_name) |n|
         try std.fmt.allocPrint(sema.arena, "{s}.{s}", .{ parent, n })
     else
-        try std.fmt.allocPrint(sema.arena, "{s}__{t}_{d}", .{ parent, kind, sema.anonTypeNumber(block, inst) });
+        try std.fmt.allocPrint(sema.arena, "{s}__{t}_{f}", .{ parent, kind, sema.anonTypeNumber(block, inst) });
     return .{ .display = display, .key = try sema.anonTypeKey(block, inst, captures) };
 }
 
@@ -5635,14 +5635,27 @@ fn anonTypeParent(sema: *Sema, block: *const Block) Allocator.Error![]const u8 {
 /// instruction `inst` in `block`. Upstream counts them in analysis order;
 /// zap numbers them from the declaration, as the key is, so that an edit
 /// above it does not rename the type, which nothing that reads its name
-/// would notice. The `comptime` blocks of a namespace share a parent name,
-/// so theirs are absolute instructions instead, which keep them apart: a
-/// comptime block is analyzed again in every edit build.
-fn anonTypeNumber(sema: *Sema, block: *const Block, inst: Zir.Inst.Index) u32 {
+/// would notice (a function of the type is loaded from the cache with its
+/// symbol name). The `comptime` blocks of a namespace share a parent name,
+/// so theirs are `<ordinal>_<offset>`, as their key has the block's
+/// ordinal (`Zcu.unitKey`).
+fn anonTypeNumber(sema: *Sema, block: *const Block, inst: Zir.Inst.Index) AnonTypeNumber {
     const nav, const base = sema.anonTypeBase(block);
-    if (nav == .none and sema.owner == .comptime_decl) return @backingInt(inst);
-    return @backingInt(inst) - @backingInt(base);
+    return .{
+        .ordinal = if (nav == .none and sema.owner == .comptime_decl) sema.owner.comptime_decl.ordinal else null,
+        .offset = @backingInt(inst) - @backingInt(base),
+    };
 }
+
+const AnonTypeNumber = struct {
+    ordinal: ?u32,
+    offset: u32,
+
+    pub fn format(n: AnonTypeNumber, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (n.ordinal) |o| try w.print("{d}_", .{o});
+        try w.print("{d}", .{n.offset});
+    }
+};
 
 /// The stable key of an anonymous container type made by ZIR instruction
 /// `inst` with `captures`: the key of the declaration whose code holds
@@ -13327,7 +13340,7 @@ fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: As
         sema.zcu.unitKey(sema.owner, &site.writer) catch return error.OutOfMemory;
     }
     site.writer.print("#lit{d}", .{@backingInt(src_node)}) catch return error.OutOfMemory;
-    const name = try std.fmt.allocPrint(sema.arena, "{s}__struct_{d}", .{ try sema.anonTypeParent(block), sema.anonTypeNumber(block, inst) });
+    const name = try std.fmt.allocPrint(sema.arena, "{s}__struct_{f}", .{ try sema.anonTypeParent(block), sema.anonTypeNumber(block, inst) });
 
     const ty = try sema.intern(.{ .tuple_type = .{
         .types = types,
