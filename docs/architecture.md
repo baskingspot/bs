@@ -1194,6 +1194,11 @@ the result's items:
   stable hashing; an escape is a compile error), and Zcu's per-run maps
   (`comptime_memo` starts empty; memoizing comptime calls across builds
   would be its own node kind later).
+- Accepted, unrecorded order dependence: a generic instance runs with
+  the largest `@setEvalBranchQuota` among its callers analyzed so far
+  (`Zcu.branch_quotas`), as upstream, so whether a deep comptime loop in
+  an instance passes can depend on which callers were analyzed first. It
+  is not a dependency, and replay does not reproduce it.
 - Per unit kind: `nav_val` stores ty, val, `is_const`, `linkage`,
   `alignment` (the explicit `align(n)`, 0 if none);
   `type_layout` stores the `ContainerInfo` fields (names, field types and
