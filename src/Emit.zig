@@ -228,7 +228,7 @@ fn lowerExternSlots(emit: *Emit) !bool {
             if (!std.mem.eql(u8, ip.stringSlice(x.name), name)) continue;
             const x_nav = switch (x.target) {
                 .nav => |n| n,
-                .uav => |v| break try emit.uavKey(v),
+                .uav => |v| break try emit.uavKey(v, 0),
             };
             const nav = ip.getNav(x_nav);
             if (nav.status != .resolved) continue;
@@ -455,8 +455,9 @@ pub fn useError(emit: *Emit, name: InternPool.String) !SymbolKey {
     return errorKey(&emit.zcu.ip, name);
 }
 
-/// Lowers an anonymous constant into its own content-addressed atom.
-pub fn uavKey(emit: *Emit, val: Index) !SymbolKey {
+/// Lowers an anonymous constant into its own content-addressed atom,
+/// aligned to at least `alignment` (0 for its type's).
+pub fn uavKey(emit: *Emit, val: Index, alignment: u64) !SymbolKey {
     const ip = &emit.zcu.ip;
     const ty = ip.typeOf(val);
     const size = Type.abiSize(ip, ty);
@@ -466,7 +467,7 @@ pub fn uavKey(emit: *Emit, val: Index) !SymbolKey {
     defer refs.deinit(emit.gpa);
     try CodeGen.lowerValue(emit, val, bytes, &refs, 0);
     refs.sort();
-    return emit.contentAtom(Type.abiAlignment(ip, ty), bytes, refs.targets.keys(), refs.relocs.items);
+    return emit.contentAtom(@max(alignment, Type.abiAlignment(ip, ty)), bytes, refs.targets.keys(), refs.relocs.items);
 }
 
 fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {

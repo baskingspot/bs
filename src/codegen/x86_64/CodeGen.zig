@@ -142,7 +142,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .key = try emit.funcKey(ir.func),
         .name = name,
         .section = .text,
-        .alignment = .@"16",
+        // `fn f() align(n)` raises the alignment.
+        .alignment = .fromByteUnits(@max(16, nav.alignment)),
         .bytes = try arena.dupe(u8, cg.e.code.items),
         .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
@@ -265,7 +266,7 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
         },
         else => {},
     }
-    return .{ .mem = Mem.sym(try cg.emit.uavKey(val), 0) };
+    return .{ .mem = Mem.sym(try cg.emit.uavKey(val, 0), 0) };
 }
 
 /// The 64-bit extended bits of an integer value.
@@ -1739,6 +1740,12 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
 
 const PtrTarget = struct { key: SymbolKey, off: i64 };
 
+/// The explicit alignment in bytes of pointer type `ptr_ty`, or 0.
+fn explicitAlignment(ip: *const InternPool, ptr_ty: Index) u64 {
+    const a = Type.ptrInfo(ip, ptr_ty).flags.alignment;
+    return if (a == 0) 0 else @as(u64, 1) << @intCast(a - 1);
+}
+
 /// The symbol and offset a comptime-known pointer refers to.
 pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
     const ip = &emit.zcu.ip;
@@ -1749,7 +1756,8 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
             if (ip.indexToKey(nav.val) == .func) break :blk .{ .key = try emit.funcKey(nav.val), .off = 0 };
             break :blk .{ .key = try emit.navKey(n), .off = 0 };
         },
-        .uav => |u| .{ .key = try emit.uavKey(u.val), .off = 0 },
+        // A local constant declared `align(n)` keeps its alignment.
+        .uav => |u| .{ .key = try emit.uavKey(u.val, if (u.orig_ty == .none) 0 else explicitAlignment(ip, u.orig_ty)), .off = 0 },
         .field => |f| blk: {
             var parent = try ptrTarget(emit, f.base);
             const container = Type.ptrInfo(ip, ip.typeOf(f.base)).child;

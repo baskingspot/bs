@@ -3414,8 +3414,12 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     const nav = sema.ip.getNav(nav_index);
     // A generic function has no body of its own until a call instantiates it.
     if (sema.ip.indexToKey(nav.val) == .func and !sema.ip.indexToKey(nav.ty).func_type.is_generic) try sema.zcu.queueFuncFrom(sema.owner, nav.val);
-    // An explicit alignment shows in the pointer type, as upstream.
-    const alignment: u6 = if (nav.alignment == 0 or sema.naturalAlignment(nav.ty) == nav.alignment) 0 else @intCast(std.math.log2_int(u64, nav.alignment) + 1);
+    // A referenced variable is emitted with its type's layout (`var global:
+    // @This()` inside the struct leaves it unresolved until now).
+    if (!nav.is_const) try sema.resolveLayoutIfIdle(block, src, nav.ty);
+    // An explicit alignment shows in the pointer type, as upstream, even
+    // when it is the natural one (`&f` for `fn f() align(1)`).
+    const alignment: u6 = if (nav.alignment == 0) 0 else @intCast(std.math.log2_int(u64, nav.alignment) + 1);
     const ptr_ty = try sema.ptrType(.{ .child = nav.ty, .flags = .{ .is_const = nav.is_const, .alignment = alignment } });
     // The address of an extern variable or function is known at link time.
     if (nav.linkage == .@"extern") {
@@ -4033,9 +4037,9 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         const a = try sema.resolveInt(block, src, @fromBackingInt(sema.code.extra[i]), .u32_type, "pointer alignment must be comptime-known");
         i += 1;
         if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
+        // As upstream, `*align(4) u32` is a type of its own, which coerces
+        // to and from `*u32` in memory.
         alignment = @intCast(std.math.log2_int(u64, a) + 1);
-        // `*align(4) u32` is `*u32`.
-        if (sema.naturalAlignment(elem) == a) alignment = 0;
     }
     if (data.flags.has_addrspace) return sema.failUnsupported(block, src, "address spaces");
     var packed_offset: InternPool.PtrType.PackedOffset = .{};
@@ -4760,7 +4764,12 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (s.flags.is_const and !d.flags.is_const) return false;
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
     if (s.flags.is_allowzero != d.flags.is_allowzero) return false;
-    if (s.flags.alignment != d.flags.alignment) return false;
+    if (s.flags.alignment != d.flags.alignment) {
+        // The alignment may only decrease.
+        const sa = sema.ptrAlignment(s) orelse return false;
+        const da = sema.ptrAlignment(d) orelse return false;
+        if (da > sa) return false;
+    }
     if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;
     if (s.child == d.child) return true;
     return d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child);
@@ -7989,12 +7998,32 @@ fn fieldValue(sema: *Sema, val: Index, index: u32) !Index {
 
 /// A pointer to element `i` of what array pointer or many-pointer value
 /// `ptr` points into.
+/// The type of a pointer to element `index` (null if runtime-known) of
+/// what a pointer of type `p` points to. As upstream, an explicit
+/// alignment carries over as far as the element's offset preserves it.
+fn elemPtrType(sema: *Sema, p: InternPool.PtrType, elem_ty: Index, index: ?u64) !Index {
+    var flag: u6 = 0;
+    if (p.flags.alignment != 0) {
+        const ip = sema.ip;
+        var a: u64 = @as(u64, 1) << @intCast(p.flags.alignment - 1);
+        if (Type.isComptimeOnly(ip, elem_ty)) {
+            a = @min(a, Type.abiAlignment(ip, elem_ty));
+        } else {
+            const size = Type.abiSize(ip, elem_ty);
+            const step = if (index) |i| i * size else size;
+            if (step != 0) a = @min(a, step & (~step +% 1));
+        }
+        flag = @intCast(std.math.log2_int(u64, a) + 1);
+    }
+    return sema.ptrType(.{ .child = elem_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .alignment = flag } });
+}
+
 fn ptrElemPtrVal(sema: *Sema, ptr: Index, i: u64) !Index {
     const ip = sema.ip;
     const key = ip.indexToKey(ptr).ptr;
     const p = Type.ptrInfo(ip, key.ty);
     const elem_ty = if (p.flags.size == .one) Type.childType(ip, p.child) else p.child;
-    const elem_ptr_ty = try sema.ptrType(.{ .child = elem_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
+    const elem_ptr_ty = try sema.elemPtrType(p, elem_ty, i);
     if (p.flags.size == .one) {
         return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = ptr, .index = i } } } });
     }
@@ -8549,7 +8578,7 @@ fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) 
     if (ip.indexToKey(align_val).opt.val != .none) {
         const a = ip.intValue(u64, ip.indexToKey(align_val).opt.val).?;
         if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
-        if (sema.naturalAlignment(elem_ty) != a) alignment = @intCast(std.math.log2_int(u64, a) + 1);
+        alignment = @intCast(std.math.log2_int(u64, a) + 1);
     }
     const addr_space = ip.indexToKey(try sema.structFieldValue(attrs, "addrspace")).opt.val;
     if (addr_space != .none) {
@@ -8928,20 +8957,25 @@ fn elemPtrOneLayer(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_inde
 fn elemPtrOfSlice(sema: *Sema, block: *Block, src: Src, slice: Ref, uncasted_index: Ref, safety: bool) CompileError!Ref {
     const cp = Type.ptrInfo(sema.ip, sema.typeOf(slice));
     const index = try sema.coerce(block, .usize_type, uncasted_index, src);
-    if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, slice), cp.sentinel != .none);
-    if (sema.resolveValue(slice)) |sv| if (sema.resolveValue(index)) |iv| {
-        return .fromInterned(try sema.ptrElemPtrVal(sema.ip.indexToKey(sv).slice.ptr, sema.ip.intValue(u64, iv).?));
-    };
-    try sema.requireRuntime(block, src);
     try sema.resolveLayout(block, src, cp.child);
-    const elem_ptr_ty = try sema.ptrType(.{ .child = cp.child, .flags = .{ .is_const = cp.flags.is_const, .is_volatile = cp.flags.is_volatile } });
+    const iv = sema.resolveValue(index);
+    const elem_ptr_ty = try sema.elemPtrType(cp, cp.child, if (iv) |v| sema.ip.intValue(u64, v) else null);
+    // As upstream, an undefined slice gives an undefined element pointer
+    // (`@TypeOf(&undefined_slice[0])`).
+    if (sema.resolveValue(slice)) |sv| if (sema.isUndef(sv)) return .fromInterned(try sema.undefValue(elem_ptr_ty));
+    if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, slice), cp.sentinel != .none);
+    if (sema.resolveValue(slice)) |sv| {
+        if (iv) |v| return .fromInterned(try sema.ptrElemPtrVal(sema.ip.indexToKey(sv).slice.ptr, sema.ip.intValue(u64, v).?));
+    }
+    try sema.requireRuntime(block, src);
     return sema.addTyPlBin(block, .slice_elem_ptr, elem_ptr_ty, slice, index);
 }
 
 fn elemPtrOfArrayPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) CompileError!Ref {
     const p = Type.ptrInfo(sema.ip, sema.typeOf(ptr));
     const elem_ty = Type.childType(sema.ip, p.child);
-    const result_ty = try sema.ptrType(.{ .child = elem_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
+    if (p.flags.alignment != 0) try sema.resolveLayout(block, src, elem_ty);
+    const result_ty = try sema.elemPtrType(p, elem_ty, if (sema.resolveValue(index)) |v| sema.ip.intValue(u64, v) else null);
     if (sema.resolveValue(ptr)) |pv| if (sema.resolveValue(index)) |iv| {
         if (try sema.comptimePtrRoot(pv) != .int)
             return .fromInterned(try sema.ptrElemPtrVal(pv, sema.ip.intValue(u64, iv).?));
@@ -8952,7 +8986,8 @@ fn elemPtrOfArrayPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref)
 
 fn elemPtrOfManyPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) CompileError!Ref {
     const p = Type.ptrInfo(sema.ip, sema.typeOf(ptr));
-    const result_ty = try sema.ptrType(.{ .child = p.child, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
+    if (p.flags.alignment != 0) try sema.resolveLayout(block, src, p.child);
+    const result_ty = try sema.elemPtrType(p, p.child, if (sema.resolveValue(index)) |v| sema.ip.intValue(u64, v) else null);
     if (sema.resolveValue(ptr)) |pv| if (sema.resolveValue(index)) |iv| {
         if (sema.ip.indexToKey(pv) == .ptr and try sema.comptimePtrRoot(pv) != .int)
             return .fromInterned(try sema.ptrElemPtrVal(pv, sema.ip.intValue(u64, iv).?));
@@ -9164,11 +9199,11 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
 
     // The result keeps an explicit alignment as far as the start allows.
     const result_align: u6 = if (ptr_align == 0) 0 else a: {
-        const sv = if (start_val) |v| ip.intValue(u64, v).? else break :a 0;
-        const off = sv * Type.abiSize(ip, elem_ty);
+        // A runtime-known start moves by whole elements.
+        const off = if (start_val) |v| ip.intValue(u64, v).? * Type.abiSize(ip, elem_ty) else Type.abiSize(ip, elem_ty);
         const bytes: u64 = @as(u64, 1) << @intCast(ptr_align - 1);
         const al = if (off == 0) bytes else @min(bytes, @as(u64, 1) << @intCast(@ctz(off)));
-        break :a if (sema.naturalAlignment(elem_ty) == al) 0 else @intCast(std.math.log2_int(u64, al) + 1);
+        break :a @intCast(std.math.log2_int(u64, al) + 1);
     };
     const many_ty = sema.typeOf(base);
     const base_val = sema.resolveValue(base);
@@ -10101,12 +10136,15 @@ fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: R
         const op_align = Type.ptrInfo(ip, sema.typeOf(c.operand_ptr)).flags.alignment;
         const natural = Type.abiAlignment(ip, ptr_info.child);
         var min: u64 = std.math.maxInt(u64);
+        var explicit = false;
         for (c.items) |item| {
             const fi = info.fieldIndex(ip, sema.enumTagName(item).?).?;
             const a = try sema.fieldPtrAlignment(block, src, op_align, ty, fi);
+            explicit = explicit or a != 0;
             min = @min(min, if (a == 0) Type.abiAlignment(ip, info.field_types[fi]) else @as(u64, 1) << (a - 1));
         }
-        ptr_info.flags.alignment = if (min == natural) 0 else @intCast(std.math.log2_int(u64, min) + 1);
+        // An explicit alignment stays explicit, even when natural.
+        ptr_info.flags.alignment = if (min == natural and !explicit) 0 else @intCast(std.math.log2_int(u64, min) + 1);
         return sema.coercePtrTo(block, ptr, try sema.ptrType(ptr_info));
     }
     if (Type.class(ip, ty) == .error_set and (c.items.len != 0 or c.else_errors != null)) {
