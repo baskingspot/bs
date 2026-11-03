@@ -5232,6 +5232,17 @@ fn stringLiteral(sema: *Sema, bytes: []const u8) !Index {
 
 /// The bytes of a comptime-known `[]const u8`, `*const [N]u8`, or similar.
 fn resolveConstString(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileError![]const u8 {
+    const ip = sema.ip;
+    // Hot (`@hasField(T, a ++ b)` in a loop): a pointer to a constant byte
+    // array, as `++` makes, reads its bytes without the coercion and load.
+    if (sema.resolveValue(ref)) |v| if (ip.keyAs(.ptr, v)) |p| if (p.base == .uav and p.byte_offset == 0) {
+        const pt = ip.keyPayload(.ptr_type, p.ty);
+        if (pt.flags.size == .one and ip.typeOf(p.base.uav.val) == pt.child and ip.keyTag(pt.child) == .array_type) {
+            if (ip.keyPayload(.array_type, pt.child).child == .u8_type) {
+                if (try sema.aggregateBytes(p.base.uav.val)) |b| return b;
+            }
+        }
+    };
     const coerced = try sema.coerce(block, .slice_const_u8_type, ref, src);
     const val = try sema.resolveConstValue(block, src, coerced, "string must be comptime-known");
     const slice = sema.ip.keyPayload(.slice, val);
@@ -5765,7 +5776,11 @@ fn enumTagValue(sema: *Sema, ty: Index, i: u32) !Index {
 fn enumTagIndex(sema: *Sema, val: Index) ?u32 {
     const ip = sema.ip;
     const e = ip.keyPayload(.enum_tag, val);
-    for (ip.structInfo(e.ty).field_defaults, 0..) |v, i| {
+    const values = ip.structInfo(e.ty).field_defaults;
+    // Most enums number their tags in order: try the value as the index
+    // before scanning (`@tagName` in a loop over a large enum).
+    if (ip.intValue(u32, e.int)) |n| if (n < values.len and values[n] == e.int) return n;
+    for (values, 0..) |v, i| {
         if (v == e.int) return @intCast(i);
     }
     return null;
