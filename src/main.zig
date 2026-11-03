@@ -159,6 +159,9 @@ pub fn main(init: std.process.Init) !void {
     defer zcu.deinit();
     zcu.is_test = is_test;
     zcu.test_filters = opts.test_filters;
+    // `ZAP_COMPTIME_EVAL=n`: lower a function for the comptime evaluator
+    // after n walker runs (0: never), for testing it.
+    if (init.environ_map.get("ZAP_COMPTIME_EVAL")) |v| zcu.comptime_eval_threshold = std.fmt.parseInt(u32, v, 10) catch 0;
     if (inc) |*i| try i.seedErrors(&zcu);
     if (opts.dump_ir) {
         var stdout_buf: [4096]u8 = undefined;

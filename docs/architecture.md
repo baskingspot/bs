@@ -157,9 +157,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
 - Debug semantics: Sema emits safety checks (overflow, bounds, unwrap,
   unreachable) as explicit IR, as upstream does. No optimization passes.
 - Target-independent, and precise enough to interpret. The bytecode comptime
-  evaluator (milestone 6) runs lowered function bodies; it may run this IR
-  directly or a denser encoding derived from it, but it does not get a second
-  semantic lowering.
+  evaluator (milestone 6) runs lowered function bodies; it runs this IR
+  directly (it may move to a denser encoding derived from it), and it does
+  not get a second semantic lowering (see "Comptime evaluator").
 
 ### Comptime
 
@@ -175,7 +175,169 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   declared, and a unit that reuses the result declares them too, as if it
   had made the call. Milestone 6 replaces the hot path behind this
   entry point with compiled bytecode for function instances whose types are
-  fully known, falling back to ZIR walking for type-constructing code.
+  fully known, falling back to ZIR walking for type-constructing code (see
+  "Comptime evaluator" below).
+
+### Comptime evaluator (designed and prototyped 2026-11-03, for review)
+
+The evaluator runs a function called at comptime from its lowered typed IR
+instead of walking its ZIR on every call. It changes speed only: every
+result, error, note, and branch-quota outcome is the walker's, because
+anything the evaluator does not reproduce exactly sends the call back to
+the walker.
+
+**What is compiled, and when.** Function bodies, one per function (not per
+call site), on the comptime call path only. `Sema.callComptime` checks the
+memo first, then asks the evaluator (`bcCall`), then walks
+(`walkComptimeCall`). Each function has a state in `Zcu.comptime_bodies`:
+`cold` (counting walker runs), `ready` (a lowered `Zcu.Bytecode`), or `off`.
+A function is lowered after `Zcu.comptime_eval_threshold` walker runs (4;
+`ZAP_COMPTIME_EVAL=n` sets it, 0 turns the evaluator off), so code that
+runs once at comptime (most of it) never pays for lowering. `comptime`
+blocks and declaration initializers run once each and stay with the
+walker; a `comptime` block inside a lowered function is evaluated by the
+lowering, as runtime analysis does, and its branches replay as ticks
+(below). Not lowered, for now: generic functions and instances (one body
+per comptime-argument tuple; next step), inferred error sets, `noreturn`,
+naked, and comptime-only signatures, and bodies whose lowering creates a
+container type, instantiates a generic, embeds a file, exports, takes a
+function's address, or makes a non-memoizable comptime call.
+
+**Lowering is runtime analysis with a few switches**, as the "Typed IR"
+section requires (no second semantic lowering): `bcLower` runs
+`analyzeFuncBody`'s steps on a fresh Sema with `sema.bc` set, which:
+
+- makes `@inComptime()` true and keeps safety checks on regardless of
+  `@setRuntimeSafety`; a failed check lowers to `unreach` (no panic
+  handler is resolved);
+- records each backward branch the walker would count in that body
+  (a `comptime` loop's iterations, an inline call's) as a
+  `comptime_tick` instruction, and `@setEvalBranchQuota` as
+  `comptime_quota`; both exist only in evaluator bodies;
+- keeps packed struct accesses as `struct_field_ptr`/`struct_field_val`
+  rather than bit arithmetic, which comptime memory addresses directly;
+- does not queue runtime analysis of callees.
+
+**The laziness rule.** Lowering analyzes every branch of the body; the
+walker analyzes only the branches it takes. Analysis has effects beyond
+the IR (resolving a declaration can fail, records dependencies, and
+assigns error codes), so lowering must not analyze anything the walker
+has not: it may read a declaration, layout, defaults, inferred error set,
+file root, or error code only once the walker has resolved it
+(`bcRequire`). Otherwise the lowering is `not_ready`, and is retried once
+the first unresolved declaration (`blocker`) resolves, or else after
+twice as many walker runs. uucode's `computeGraphemeBreak` reads
+`isIndicConjunctBreakExtend` on a rarely taken path, so it is lowered
+after about 380 of its 2205 calls. The fix is deoptimization stubs (an
+unresolved reference lowers to an instruction that aborts the run, below)
+wherever the reference's type does not feed type resolution of the code
+around it.
+
+**The bytecode is the lowered IR.** `Zcu.Bytecode` holds the function's
+`Ir` (main body as for CodeGen), the dependencies its lowering declared,
+and `in_frame`, a bitset of the instructions whose values live in the
+frame: an `alloc` used only by `load`/`store` (a local `var`, which then
+never enters comptime memory) and an `*_with_overflow` used only by
+`struct_field_val` (never interned as a tuple). The interpreter
+(`bcExec`) walks the IR's structured bodies: `block`/`loop` recurse,
+`br`/`repeat`/`ret` unwind as exits, and each instruction's value goes in
+a per-run frame array indexed by instruction. Values are InternPool
+indices, the walker's representation, so arguments, results, and memory
+pass between the two without conversion; a frame value may also be
+"garbage" (the payload of a null optional or the inactive error-union
+side), which runtime IR computes and masks (`opt == x` is
+`is_non_null(opt) and payload == x`) and which aborts the run if used
+otherwise. A denser encoding (unboxed integers in the frame instead of
+interned ones, a flat instruction stream with jump offsets) can replace
+this without touching Sema: the profile of the prototype shows interning
+integers and decoding keys as the evaluator's main cost.
+
+**Comptime memory.** Loads and stores go through Sema's comptime memory
+functions (`comptimeStore`, `comptimeLoadOrNull`, the `MutValue` trees),
+so a pointer argument into the caller's `comptime var` works, and a run's
+allocations are ordinary comptime allocations. Calls from bytecode go
+back through `callComptime` (memo, then evaluator, then walker), so
+lowered and walked functions call each other freely.
+
+**Falling back.** A run aborts (`error.BcAbort`) wherever the evaluator is
+not sure to match the walker: a failed safety check, `unreachable`, an
+exceeded branch quota, any error from a folding routine, a call through a
+function pointer or to a `noreturn` function, an undefined branch
+condition, a value shape it does not fold, or garbage used as a value.
+Before each run `bcCall` notes the undo log length, the branch counter and
+quota, and the error count; every first write to a comptime allocation
+created before the run, and every `MutValue` node it changes, is logged.
+An abort restores all of it, the walker runs the call again from the same
+state, and the function goes `off` if the walker succeeded (a run that
+needs the walker once likely will again). So an error is always reported
+by the walker, with its message, its "called at comptime here" notes, and
+the quota note, identical to an evaluator-free build; a failing call
+costs one extra partial run, and only on the way to a compile error.
+
+**Branch quota.** The evaluator counts exactly what the walker counts:
+each `loop` repeat, each call, and each `comptime_tick`; `comptime_quota`
+raises the quota as `@setEvalBranchQuota` does. Exceeding it aborts, and
+the walker re-runs the call and reports it.
+
+**Memoization.** The evaluator sits behind the memo: memoizable calls are
+memoized as before, whichever tier ran them. The lowering itself runs the
+memoizable comptime calls in the body (it refuses non-memoizable ones),
+including ones on branches the walker has not taken, under the laziness
+rule (they cannot resolve a declaration, number an error, or report an
+error either). A later walker call of the same arguments then hits the
+memo and counts no branches: an accepted order dependence of the branch
+count, which is already memo-order-dependent, as upstream's is. A memo
+entry's dependencies (see "Comptime") keep their conditional flags,
+below.
+
+**Dependencies.** A plain edge U → D means U resolves D itself, so replay
+may load D for a green U. Lowering reads what other units resolved
+(`bcRequire`), on every branch, so its reads are not plain edges of the
+units that run the body. They are *conditional* edges (`Sema.deps_conditional`,
+recorded in `Zcu.conditional_deps`): they count for invalidation (a changed
+D reaches U) but replay does not load them. Where the code the walker
+would run reads D, lowering places a `comptime_dep` instruction in the
+innermost runtime block, and a run that reaches it declares the plain edge,
+once per memoizable call in progress; a read outside any runtime block of
+the body (or in instructions lowering discards) is declared plain by every
+run (`Bytecode.entry_deps`). A plain declaration wins over a conditional
+one, and memo entries keep the flag. A unit's edges therefore cover what
+the walker would have read (plain) plus the lowering's other reads
+(conditional), whichever tier ran its calls; since call counts differ
+between an edit build and a full build, so can where lowering happens and
+the recorded edge sets, which is sound because both cover the walker's
+reads.
+
+**The cache.** Bytecode is in memory only, like all IR, and is not a cache
+artifact. A warm or edit build reuses the results of the units that made
+comptime calls, so it runs few of them, and a lowering is one analysis of
+the body, done after four walker runs. If edit builds ever show lowering cost,
+bytecode could become its own node kind keyed like `func_body` (the
+function's source hash) plus the results its lowering read (its recorded
+dependencies), which is the same check replay already does for a unit.
+
+**Parallel analysis.** A `Bytecode` is immutable once `ready` and shared
+read-only; `off` keeps it alive for runs in progress. With function bodies
+on a pool, `comptime_bodies` becomes a sharded map whose state changes by
+compare-and-swap, one worker lowers while others keep walking (no one
+waits on a lowering), and everything a run mutates (its frame, undo log,
+branch counter, comptime allocations) is per Sema, hence per worker.
+
+**Measured (prototype, ReleaseFast, Sema only, minimum of 7–10 runs on a
+noisy orb; the spread between batches was ±10%).** libvaxis text_input:
+286 → 260–277 ms. hello (94–100 ms) and binary.zig (4.5 s): unchanged
+within noise, as they repeat little comptime code. uucode's grapheme break
+table built 8 times (each table calls `computeGraphemeBreak` 2205 times,
+non-memoizable): 600 → 370–400 ms, of which 95 ms is that file's Sema
+outside the tables. What remains is the walker running
+`buildGraphemeBreakTable`'s own loop (a generic function called once:
+about 40 ms of libvaxis's Sema), the walker runs before lowering, and the
+evaluator's interning of integers.
+
+**Next steps**, in order of measured payoff: lower generic instances (keyed
+by the comptime arguments) and lower a called-once function on its first
+call when its body has a loop, which deoptimization stubs make safe under
+the laziness rule; unboxed integers in the frame; then a denser encoding.
 
 ### CodeGen (`src/codegen/<arch>/`)
 

@@ -338,6 +338,19 @@ pub const Inst = struct {
         dbg_inline_begin,
         /// `no_op`: ends the innermost `dbg_inline_begin`.
         dbg_inline_end,
+
+        /// Only in a body lowered for the comptime evaluator (see
+        /// docs/architecture.md, "Comptime"), never in CodeGen's IR.
+        /// `no_op`: one backward branch against the evaluation's branch
+        /// quota, where the ZIR walker counts one (an inline call, an
+        /// `inline` loop iteration, a comptime call made while lowering).
+        comptime_tick,
+        /// `quota`: `@setEvalBranchQuota(quota)`.
+        comptime_quota,
+        /// `dep`: the code the walker would run here reads dependee `dep`
+        /// (an index into the lowered body's dependencies), which the
+        /// running unit then declares.
+        comptime_dep,
     };
 
     pub const Data = union {
@@ -353,6 +366,8 @@ pub const Inst = struct {
         repeat: struct { loop_inst: Index },
         dbg_stmt: struct { line: u32, column: u32 },
         dbg_inline: struct { func: InternPool.Index, payload: u32 },
+        quota: u32,
+        dep: u32,
     };
 };
 
@@ -522,7 +537,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .atomic_rmw,
         .cmpxchg,
         => data.ty_pl.ty,
-        .store, .atomic_store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .vector_store_elem, .breakpoint => .void_type,
+        .store, .atomic_store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .vector_store_elem, .breakpoint, .comptime_tick, .comptime_quota, .comptime_dep => .void_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),

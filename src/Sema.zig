@@ -49,16 +49,24 @@ ir_insts: std.MultiArrayList(Ir.Inst) = .empty,
 ir_extra: std.ArrayList(u32) = .empty,
 inst_map: InstMap = .{},
 deps: std.ArrayList(Zcu.Dependee) = .empty,
-/// The entries of `deps`, once it is long enough to search this way.
-deps_set: std.HashMapUnmanaged(Zcu.Dependee, void, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
+/// Per entry of `deps`: whether only a lowering for the comptime
+/// evaluator read it (see `Zcu.conditional_deps`).
+deps_conditional: std.ArrayList(bool) = .empty,
+/// The entries of `deps` with their indices, once it is long enough to
+/// search this way.
+deps_set: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
 /// The dependencies declared by the memoizable comptime calls in progress,
 /// innermost last, for their memo entries (see `Zcu.Memo`): the entries
 /// from `memo_start` on are the innermost call's. Empty outside calls.
-memo_deps: std.ArrayList(Zcu.Dependee) = .empty,
-/// The last entry of `memo_deps` for each dependee.
+memo_deps: std.ArrayList(MemoCollected) = .empty,
+/// The last entry of `memo_deps` for each dependee and evaluator body.
 memo_pos: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
+memo_body_pos: std.AutoHashMapUnmanaged(*const Zcu.Bytecode, u32) = .empty,
 /// Null outside memoizable comptime calls.
 memo_start: ?u32 = null,
+/// Counts the memoizable calls started: a dependency declared at the
+/// current epoch is in this unit's `deps` and in the innermost call's.
+memo_epoch: u32 = 0,
 comptime_break_inst: Zir.Inst.Index = undefined,
 comptime_allocs: std.AutoHashMapUnmanaged(u32, ComptimeAlloc) = .empty,
 /// Parameters collected by `param` instructions for the next `func`
@@ -94,6 +102,23 @@ dbg_line: u32 = 0,
 dbg_column: u32 = 0,
 /// Nesting of runtime inline calls, to fail on unbounded inline recursion.
 inline_depth: u32 = 0,
+/// Set while this Sema lowers a function body for the comptime evaluator
+/// (see "Comptime evaluator").
+bc: ?*BcLowering = null,
+/// Stores to comptime allocations older than `bc_first_alloc`, to undo
+/// when an evaluator run aborts (see `BcUndo`). Empty outside runs.
+bc_undo: std.ArrayList(BcUndo) = .empty,
+/// The first comptime allocation of the innermost evaluator run that the
+/// ZIR walker started; 0 (log nothing) outside runs.
+bc_first_alloc: u32 = 0,
+/// The evaluator bodies whose dependencies this unit has declared, each
+/// with the `memo_epoch` at which each of its `comptime_dep`s was last
+/// declared (see `bcExec`). Arena-allocated arrays.
+bc_declared: std.AutoHashMapUnmanaged(*const Zcu.Bytecode, []u32) = .empty,
+/// The main body's `Ir.Block` payload in `ir_extra`, once lowering ends.
+bc_main_block: u32 = 0,
+/// While lowering, the block being analyzed, for `comptime_dep`.
+bc_block: ?*Block = null,
 
 pub const CompileError = error{
     /// A compile error was reported to the Zcu.
@@ -339,9 +364,13 @@ fn destroy(sema: *Sema) void {
     sema.ir_extra.deinit(gpa);
     sema.inst_map.deinit(gpa);
     sema.deps.deinit(gpa);
+    sema.deps_conditional.deinit(gpa);
     sema.deps_set.deinit(gpa);
     sema.memo_deps.deinit(gpa);
     sema.memo_pos.deinit(gpa);
+    sema.memo_body_pos.deinit(gpa);
+    sema.bc_undo.deinit(gpa);
+    sema.bc_declared.deinit(gpa);
     sema.comptime_allocs.deinit(gpa);
     var it = sema.inferred_allocs.valueIterator();
     while (it.next()) |ia| ia.stores.deinit(gpa);
@@ -350,7 +379,9 @@ fn destroy(sema: *Sema) void {
 }
 
 fn finish(sema: *Sema) !void {
-    try sema.zcu.recordDeps(sema.owner, sema.deps.items);
+    var conditional: std.ArrayList(u32) = .empty;
+    for (sema.deps_conditional.items, 0..) |c, i| if (c) try conditional.append(sema.arena, @intCast(i));
+    try sema.zcu.recordDeps(sema.owner, sema.deps.items, conditional.items);
 }
 
 fn rootBlock(sema: *Sema, namespace: u32, src_base: Ast.Node.Index, is_comptime: bool) Block {
@@ -1057,48 +1088,145 @@ fn depLoop(sema: *Sema, block: *Block, src: Src, err: CompileError) CompileError
     };
 }
 
+/// While lowering for the comptime evaluator, fails the lowering unless
+/// `ready`: lowering reads only what the ZIR walker has already resolved,
+/// so that it never analyzes a unit the walker would not have (see
+/// "Comptime evaluator"). It may succeed after more walker runs.
+fn bcRequire(sema: *Sema, ready: bool) CompileError!void {
+    const bc = sema.bc orelse return;
+    if (ready) return;
+    bc.not_ready = true;
+    return error.AnalysisFail;
+}
+
+/// While lowering for the comptime evaluator, fails the lowering for good:
+/// the body does something the evaluator does not reproduce yet.
+fn bcRefuse(sema: *Sema) CompileError!void {
+    const bc = sema.bc orelse return;
+    bc.refused = true;
+    return error.AnalysisFail;
+}
+
+fn fileRootType(sema: *Sema, file_index: u32) CompileError!Index {
+    try sema.bcRequire(sema.zcu.file_root_types.items[file_index] != .none);
+    return sema.zcu.fileRootType(file_index);
+}
+
+fn createContainerType(sema: *Sema, kind: Zcu.ContainerKind, file_index: u32, inst: Zir.Inst.Index, captures: []const Index, fqn: []const u8, key: []const u8, parent_ns: u32, reified_layout: ?std.lang.Type.ContainerLayout) CompileError!Index {
+    try sema.bcRefuse();
+    return sema.zcu.createContainerType(kind, file_index, inst, captures, fqn, key, parent_ns, reified_layout);
+}
+
+/// Queues `func`, which this unit refers to other than by calling it (its
+/// address, an export).
+fn queueFuncRef(sema: *Sema, func: Index) CompileError!void {
+    try sema.bcRefuse();
+    try sema.zcu.queueFuncFrom(sema.owner, func);
+}
+
 // ---------------------------------------------------------------------------
 // Dependencies
 
 /// The one place a unit records what it read from another unit.
 pub fn declareDependency(sema: *Sema, dependee: Zcu.Dependee) !void {
-    if (sema.memo_start) |start| try sema.memoCollect(dependee, start);
+    return sema.declareDep(dependee, false);
+}
+
+/// Declares `dependee`; `conditional` if only a lowering for the comptime
+/// evaluator read it (a plain declaration wins).
+fn declareDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !void {
+    const index = try sema.addDep(dependee, conditional);
+    // The code the walker runs reads it here; a plain read is declared
+    // where a run reaches it.
+    if (sema.bc != null and !conditional) try sema.bcDepEvent(index);
+    if (sema.memo_start) |start| try sema.memoCollect(.{ .dep = .{ .dependee = dependee, .conditional = conditional } }, start);
+}
+
+/// Adds `dependee` to this unit's `deps`, returning its index.
+fn addDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !u32 {
     // `deps` keeps the order replay follows; past a few entries, a set
     // answers whether one is already there (comptime loops declare the
     // same dependencies over and over).
-    if (sema.deps.items.len < 16) {
-        for (sema.deps.items) |d| {
-            if (std.meta.eql(d, dependee)) return;
-        }
-    } else {
-        if (sema.deps_set.count() == 0) for (sema.deps.items) |d| try sema.deps_set.put(sema.gpa, d, {});
-        if ((try sema.deps_set.getOrPut(sema.gpa, dependee)).found_existing) return;
+    const len: u32 = @intCast(sema.deps.items.len);
+    const found: ?u32 = if (len < 16) (for (sema.deps.items, 0..) |d, i| {
+        if (std.meta.eql(d, dependee)) break @intCast(i);
+    } else null) else blk: {
+        if (sema.deps_set.count() == 0) for (sema.deps.items, 0..) |d, i| try sema.deps_set.put(sema.gpa, d, @intCast(i));
+        const gop = try sema.deps_set.getOrPut(sema.gpa, dependee);
+        if (gop.found_existing) break :blk gop.value_ptr.*;
+        gop.value_ptr.* = len;
+        break :blk null;
+    };
+    if (found) |i| {
+        if (!conditional) sema.deps_conditional.items[i] = false;
+        return i;
     }
     try sema.deps.append(sema.gpa, dependee);
+    try sema.deps_conditional.append(sema.gpa, conditional);
+    return len;
 }
 
-fn memoCollect(sema: *Sema, dependee: Zcu.Dependee, start: u32) !void {
-    const gop = try sema.memo_pos.getOrPut(sema.gpa, dependee);
-    if (gop.found_existing and gop.value_ptr.* >= start) return;
-    gop.value_ptr.* = @intCast(sema.memo_deps.items.len);
-    try sema.memo_deps.append(sema.gpa, dependee);
+/// What a memoizable comptime call in progress declared: a dependency, or
+/// an evaluator body's (see `bcDeclareBody`).
+const MemoCollected = union(enum) {
+    dep: Zcu.MemoDep,
+    body: *const Zcu.Bytecode,
+};
+
+fn memoCollect(sema: *Sema, entry: MemoCollected, start: u32) !void {
+    const gpa = sema.gpa;
+    const len: u32 = @intCast(sema.memo_deps.items.len);
+    switch (entry) {
+        .dep => |d| {
+            const gop = try sema.memo_pos.getOrPut(gpa, d.dependee);
+            if (gop.found_existing and gop.value_ptr.* >= start) {
+                if (!d.conditional) sema.memo_deps.items[gop.value_ptr.*].dep.conditional = false;
+                return;
+            }
+            gop.value_ptr.* = len;
+        },
+        .body => |b| {
+            const gop = try sema.memo_body_pos.getOrPut(gpa, b);
+            if (gop.found_existing and gop.value_ptr.* >= start) return;
+            gop.value_ptr.* = len;
+        },
+    }
+    try sema.memo_deps.append(gpa, entry);
 }
 
 /// The dependencies the memoizable call whose entries start at `start`
 /// declared, for its memo entry.
-fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.Dependee {
-    var out: std.ArrayList(Zcu.Dependee) = .empty;
-    var seen: std.HashMapUnmanaged(Zcu.Dependee, void, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty;
-    defer seen.deinit(sema.gpa);
-    for (sema.memo_deps.items[start..]) |d| {
-        if ((try seen.getOrPut(sema.gpa, d)).found_existing) continue;
-        try out.append(sema.arena, d);
-    }
-    return sema.zcu.arena.allocator().dupe(Zcu.Dependee, out.items);
+fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.MemoDep {
+    var out: std.ArrayList(Zcu.MemoDep) = .empty;
+    var index: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty;
+    defer index.deinit(sema.gpa);
+    const S = struct {
+        fn add(o: *std.ArrayList(Zcu.MemoDep), ix: anytype, gpa: Allocator, arena: Allocator, d: Zcu.MemoDep) !void {
+            const gop = try ix.getOrPut(gpa, d.dependee);
+            if (gop.found_existing) {
+                if (!d.conditional) o.items[gop.value_ptr.*].conditional = false;
+                return;
+            }
+            gop.value_ptr.* = @intCast(o.items.len);
+            try o.append(arena, d);
+        }
+    };
+    for (sema.memo_deps.items[start..]) |e| switch (e) {
+        .dep => |d| try S.add(&out, &index, sema.gpa, sema.arena, d),
+        .body => |b| {
+            for (b.deps) |d| try S.add(&out, &index, sema.gpa, sema.arena, .{ .dependee = d, .conditional = true });
+            for (b.entry_deps) |i| try S.add(&out, &index, sema.gpa, sema.arena, .{ .dependee = b.deps[i], .conditional = false });
+        },
+    };
+    return sema.zcu.arena.allocator().dupe(Zcu.MemoDep, out.items);
 }
 
 fn ensureNavVal(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex) CompileError!void {
     try sema.declareDependency(.{ .nav_val = nav });
+    if (sema.bc) |bc| if (sema.ip.getNav(nav).status != .resolved and bc.blocker == .none) {
+        bc.blocker = nav;
+    };
+    try sema.bcRequire(sema.ip.getNav(nav).status == .resolved);
     sema.zcu.ensureNavVal(nav) catch |err| return sema.depLoop(block, src, err);
 }
 
@@ -1108,6 +1236,7 @@ fn resolveLayout(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!v
     switch (ip.indexToKey(ty)) {
         .struct_type, .enum_type, .union_type => {
             try sema.declareDependency(.{ .type_layout = ty });
+            try sema.bcRequire(ip.structInfo(ty).status == .have_layout);
             sema.zcu.ensureStructLayout(ty) catch |err| return sema.depLoop(block, src, err);
         },
         .array_type => |a| try sema.resolveLayout(block, src, a.child),
@@ -1168,6 +1297,7 @@ fn resolveStructDefaults(sema: *Sema, block: *Block, src: Src, ty: Index) Compil
     if (sema.ip.indexToKey(ty) != .struct_type) return;
     try sema.resolveLayout(block, src, ty);
     try sema.declareDependency(.{ .struct_defaults = ty });
+    try sema.bcRequire(sema.ip.structInfo(ty).defaults_status == .resolved);
     sema.zcu.ensureStructDefaults(ty) catch |err| return sema.depLoop(block, src, err);
 }
 
@@ -1263,6 +1393,12 @@ const PanicId = enum(u32) {
 
 fn addPanic(sema: *Sema, block: *Block, id: PanicId, lhs: Ref, rhs: Ref) CompileError!void {
     if (block.discards_runtime) return;
+    // The comptime evaluator gives a failed check to the walker, which
+    // reports it; comptime code never resolves the panic handlers.
+    if (sema.bc != null) {
+        _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+        return;
+    }
     // As upstream, call the handler in `std.lang.panic`.
     const ns = try sema.panicNamespace(block);
     const src = block.nodeSrc(.zero);
@@ -1293,7 +1429,7 @@ fn panicNamespace(sema: *Sema, block: *Block) CompileError!Index {
     // `std.lang.panic` is the root's namespace when it declares one; read
     // it directly, which needs no std (the root's deprecated panic
     // function does go through std).
-    const root_ty = try sema.zcu.fileRootType(sema.zcu.moduleRootFile(.root).?);
+    const root_ty = try sema.fileRootType(sema.zcu.moduleRootFile(.root).?);
     const root_panic: ?Index = if (try sema.lookupInType(root_ty, "panic")) |nav| blk: {
         const val = try sema.navVal(block, src, nav);
         break :blk if (sema.typeOf(val) == .type_type) try sema.analyzeAsType(block, src, val) else null;
@@ -1531,6 +1667,9 @@ fn analyzeInlineBody(sema: *Sema, block: *Block, body: []const Zir.Inst.Index, b
 }
 
 fn emitBackwardBranch(sema: *Sema, block: *Block, src: Src) CompileError!void {
+    // Each run of a body lowered for the comptime evaluator counts what
+    // the walker counts when it runs the body (see "Comptime evaluator").
+    if (sema.bc) |bc| if (bc.depth == 0) try sema.bcAddEvent(block, .{ .tag = .comptime_tick, .data = .{ .no_op = {} } });
     sema.branch_count += 1;
     if (sema.branch_count > sema.branch_quota) {
         const err = sema.fail(block, src, "evaluation exceeded {d} backwards branches", .{sema.branch_quota});
@@ -1541,6 +1680,9 @@ fn emitBackwardBranch(sema: *Sema, block: *Block, src: Src) CompileError!void {
 }
 
 fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Index) CompileError!void {
+    const saved_bc_block = sema.bc_block;
+    if (sema.bc != null) sema.bc_block = block;
+    defer sema.bc_block = saved_bc_block;
     const tags = sema.code.instructions.items(.tag);
     const datas = sema.code.instructions.items(.data);
     const gpa = sema.gpa;
@@ -1727,6 +1869,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                     const src = block.nodeSrc(data.un_node.src_node);
                     const quota = try sema.resolveInt(block, src, data.un_node.operand, .u32_type, "eval branch quota must be comptime-known");
                     sema.branch_quota = @max(sema.branch_quota, @as(u32, @intCast(quota)));
+                    if (sema.bc) |bc| if (bc.depth == 0) try sema.bcAddEvent(block, .{ .tag = .comptime_quota, .data = .{ .quota = @intCast(quota) } });
                 }
                 i += 1;
                 continue;
@@ -1776,7 +1919,9 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
             .set_runtime_safety => {
                 const src = block.nodeSrc(data.un_node.src_node);
                 const safety = try sema.resolveBool(block, src, sema.resolveInst(data.un_node.operand), "operand to @setRuntimeSafety must be comptime-known");
-                if (sema.zcu.file(sema.file).module != .compiler_rt) block.want_safety = safety;
+                // Comptime code is always checked, so a body lowered for the
+                // comptime evaluator keeps its checks.
+                if (sema.zcu.file(sema.file).module != .compiler_rt and sema.bc == null) block.want_safety = safety;
                 i += 1;
                 continue;
             },
@@ -2098,6 +2243,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .enum_literal => .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(data.str_tok.get(sema.code.*)) })),
         .error_value => blk: {
             const name = try sema.getString(data.str_tok.get(sema.code.*));
+            // Error values are numbered in the order the walker meets them.
+            try sema.bcRequire(sema.ip.hasErrorValue(name));
             _ = try sema.ip.errorValue(name);
             const ty = try sema.intern(.{ .error_set_type = &.{name} });
             break :blk .fromInterned(try sema.intern(.{ .err = .{ .ty = ty, .name = name } }));
@@ -2144,6 +2291,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             for (names, 0..) |*n, k| {
                 const s: Zir.NullTerminatedString = @fromBackingInt(sema.code.extra[extra.end + k]);
                 n.* = try sema.getString(sema.zirString(s));
+                try sema.bcRequire(sema.ip.hasErrorValue(n.*));
                 _ = try sema.ip.errorValue(n.*);
             }
             break :blk .fromInterned(try sema.errorSetType(names));
@@ -2954,7 +3102,8 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             }
             break :blk .fromInterned(ty);
         },
-        .in_comptime => .fromInterned(boolValue(block.is_comptime)),
+        // A body lowered for the comptime evaluator only runs at comptime.
+        .in_comptime => .fromInterned(boolValue(block.is_comptime or sema.bc != null)),
         // Instrumentation and intrinsics are not something zap emits.
         .disable_instrumentation, .disable_intrinsics => .void_value,
         .breakpoint => blk: {
@@ -3175,6 +3324,7 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
         return sema.fail(block, src, "embed of file outside package path: '{s}'", .{name});
     const sub_path = full[root.len + 1 ..];
+    try sema.bcRefuse();
     const index = sema.zcu.embedFile(file.module, sub_path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return sema.fail(block, src, "unable to open '{s}': {t}", .{ name, err }),
@@ -3603,7 +3753,7 @@ fn unwrapOptEu(sema: *Sema, ty: Index) Index {
 /// The value of `std.lang.<path>`, where `path` may be dotted.
 fn stdLangDecl(sema: *Sema, block: *Block, src: Src, path: []const u8) CompileError!Ref {
     const std_file = sema.zcu.moduleRootFile(.std) orelse return sema.fail(block, src, "std.lang.{s} requires the std module", .{path});
-    var cur: Ref = try sema.namespaceLookupVal(block, src, try sema.zcu.fileRootType(std_file), "lang");
+    var cur: Ref = try sema.namespaceLookupVal(block, src, try sema.fileRootType(std_file), "lang");
     var it = std.mem.splitScalar(u8, path, '.');
     while (it.next()) |part| {
         const container = try sema.resolveConstValue(block, src, cur, "std.lang declarations are comptime-known");
@@ -3667,7 +3817,7 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     try sema.ensureNavVal(block, src, nav_index);
     const nav = sema.ip.getNav(nav_index);
     // A generic function has no body of its own until a call instantiates it.
-    if (sema.ip.indexToKey(nav.val) == .func and !sema.ip.indexToKey(nav.ty).func_type.is_generic) try sema.zcu.queueFuncFrom(sema.owner, nav.val);
+    if (sema.ip.indexToKey(nav.val) == .func and !sema.ip.indexToKey(nav.ty).func_type.is_generic) try sema.queueFuncRef(nav.val);
     // A referenced variable is emitted with its type's layout (`var global:
     // @This()` inside the struct leaves it unresolved until now).
     if (!nav.is_const) try sema.resolveLayoutIfIdle(block, src, nav.ty);
@@ -3696,6 +3846,7 @@ fn isExternVar(ip: *const InternPool, nav: *const InternPool.Nav) bool {
 /// name. Only the name is honored; linkage, section, and visibility are
 /// those of a strong global symbol in a static executable.
 fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
+    try sema.bcRefuse();
     const ip = sema.ip;
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const extra = sema.code.extraData(Zir.Inst.Export, data.payload_index).data;
@@ -3723,7 +3874,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
         .func => |f| f.owner_nav,
         else => nav_index,
     };
-    if (ip.indexToKey(val) == .func) try sema.zcu.queueFuncFrom(sema.owner, val);
+    if (ip.indexToKey(val) == .func) try sema.queueFuncRef(val);
     try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name) });
 }
 
@@ -4062,7 +4213,7 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         sema.zcu.moduleRootFile(.builtin).?
     else
         return sema.fail(block, src, "no module named '{s}' available within module '{s}'", .{ path, fe.module(this_file.module).name });
-    return .fromInterned(try sema.zcu.fileRootType(key));
+    return .fromInterned(try sema.fileRootType(key));
 }
 
 fn zirDeclLiteral(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -4168,7 +4319,7 @@ fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.
         };
     }
     const name = try sema.typeName(block, name_strategy, inst, kind, captures);
-    const ty = try sema.zcu.createContainerType(kind, sema.file, inst, captures, name.display, name.key, block.namespace, null);
+    const ty = try sema.createContainerType(kind, sema.file, inst, captures, name.display, name.key, block.namespace, null);
     return .fromInterned(ty);
 }
 
@@ -4402,6 +4553,7 @@ fn errorSetNames(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!?
         .inferred_error_set_type => |func| {
             if (func == sema.func) return null;
             try sema.declareDependency(.{ .func_ies = func });
+            try sema.bcRequire(sema.zcu.funcs.get(func) == .done);
             return sema.zcu.ensureFuncIes(func) catch |err| switch (err) {
                 error.DependencyLoop => return sema.fail(block, src, "unable to resolve inferred error set", .{}),
                 else => |e| return e,
@@ -4656,7 +4808,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 if (d.child != src_ty and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
                 const f = ip.indexToKey(v).func;
                 if (f.generic_owner != .none) return null;
-                try sema.zcu.queueFuncFrom(sema.owner, v);
+                try sema.queueFuncRef(v);
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .nav = f.owner_nav } } }));
             },
             else => {},
@@ -7435,6 +7587,7 @@ fn zirStoreToInferredPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compi
         const id = sema.ip.indexToKey(pv).ptr.base.comptime_alloc;
         const alloc = sema.comptime_allocs.getPtr(id).?;
         const val = try sema.resolveConstValue(block, src, operand, "value stored to a comptime variable must be comptime-known");
+        try sema.bcLogAlloc(id, alloc);
         alloc.ty = sema.ip.typeOf(val);
         alloc.val = val;
         alloc.mut = null;
@@ -7525,7 +7678,8 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     try sema.requireRuntime(block, src);
     try sema.resolveLayout(block, src, info.child);
     if (!Type.hasRuntimeBits(ip, info.child)) return;
-    if (info.packed_offset.host_size != 0) {
+    // The comptime evaluator stores through bit pointers as the walker does.
+    if (info.packed_offset.host_size != 0 and sema.bc == null) {
         // Read, modify, and write the host integer.
         const host_ty = try sema.intType(.unsigned, info.packed_offset.host_size * 8);
         const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_volatile = info.flags.is_volatile } }), ptr);
@@ -7554,7 +7708,7 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
     if (zero_bit) if (try sema.onePossibleValue(info.child)) |v| return .fromInterned(v);
     try sema.requireRuntime(block, src);
     if (Type.isComptimeOnly(ip, info.child)) return sema.fail(block, src, "unable to load comptime-only type '{f}' at runtime", .{sema.fmtType(info.child)});
-    if (info.packed_offset.host_size != 0) {
+    if (info.packed_offset.host_size != 0 and sema.bc == null) {
         const host_ty = try sema.intType(.unsigned, info.packed_offset.host_size * 8);
         const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_const = true, .is_volatile = info.flags.is_volatile } }), ptr);
         return sema.packedExtract(block, try sema.addTyOp(block, .load, host_ty, host_ptr), info.packed_offset.bit_offset, info.child);
@@ -7903,12 +8057,14 @@ fn mutStore(sema: *Sema, ptr: Index, val: Index) !bool {
         if (last.is_elem and ip.typeOf(val) != ty) return false;
     }
     if (alloc.mut == null) {
+        try sema.bcLogAlloc(path.id, alloc);
         const m = try sema.arena.create(MutValue);
         m.* = .{ .val = alloc.val };
         alloc.mut = m;
     }
     var node = alloc.mut.?;
     for (path.steps, 0..) |st, i| {
+        try sema.bcLogNode(path.id, node);
         if (i + 1 == path.steps.len and sema.mutStepOk(sema.mutType(node), st, true) == .leaf_only) {
             // A field of an optional, error union, or slice: rebuild
             // that one small value.
@@ -7925,7 +8081,10 @@ fn mutStore(sema: *Sema, ptr: Index, val: Index) !bool {
         }
         node.agg.interned = .none;
         node = &node.agg.elems[@intCast(st.index)];
-        if (i + 1 == path.steps.len) node.* = .{ .val = val };
+        if (i + 1 == path.steps.len) {
+            try sema.bcLogNode(path.id, node);
+            node.* = .{ .val = val };
+        }
     }
     return true;
 }
@@ -8244,6 +8403,7 @@ fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) C
         .comptime_alloc => |id| {
             const alloc = sema.comptime_allocs.getPtr(id) orelse
                 return sema.fail(block, src, "comptime variable is not accessible here", .{});
+            try sema.bcLogAlloc(id, alloc);
             _ = try sema.allocValue(alloc);
             if (key.byte_offset == 0) {
                 // A store through a cast pointer writes the bytes it covers.
@@ -8548,8 +8708,10 @@ fn reinterpretStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index
     @memset(buf, 0);
     @memset(undef, true);
     if (!try sema.writeMemBytes(val, buf, undef)) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
-    alloc.val = (try sema.spliceMem(alloc.val, @intCast(root.offset), buf, undef)) orelse
+    const new = (try sema.spliceMem(alloc.val, @intCast(root.offset), buf, undef)) orelse
         return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+    try sema.bcLogAlloc(root.base.comptime_alloc, alloc);
+    alloc.val = new;
     alloc.mut = null;
 }
 
@@ -9046,7 +9208,7 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                 if (try sema.onePossibleValue(field_ty)) |v| return .fromInterned(v);
             if (sema.resolveValue(lhs)) |v| return .fromInterned(try sema.fieldValue(v, i));
             try sema.requireRuntime(block, src);
-            if (Type.isPackedStruct(ip, ty)) {
+            if (Type.isPackedStruct(ip, ty) and sema.bc == null) {
                 try sema.resolveLayout(block, src, ty);
                 const backing = ip.structInfo(ty).tag_type;
                 return sema.packedExtract(block, try sema.addTyOp(block, .bitcast, backing, lhs), Type.packedFieldBitOffset(ip, ty, i), Type.fieldType(ip, ty, i));
@@ -9252,7 +9414,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         }
         const captures = [_]Index{ tag_ty, mode, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = tag_ty } }), .storage = .{ .elems = values } } }) };
         const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, &captures);
-        const ty = try sema.zcu.createContainerType(kind, sema.file, inst, &captures, name.display, name.key, block.namespace, .auto);
+        const ty = try sema.createContainerType(kind, sema.file, inst, &captures, name.display, name.key, block.namespace, .auto);
         const info = ip.structInfo(ty);
         if (info.status == .none) {
             info.field_names = names;
@@ -9318,7 +9480,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
             return sema.fail(block, src, "comptime field without default initialization value", .{});
     }
     const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, captures.items);
-    const ty = try sema.zcu.createContainerType(kind, sema.file, inst, captures.items, name.display, name.key, block.namespace, layout);
+    const ty = try sema.createContainerType(kind, sema.file, inst, captures.items, name.display, name.key, block.namespace, layout);
     const info = ip.structInfo(ty);
     if (info.status == .none) {
         info.field_names = names;
@@ -9699,8 +9861,10 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
 
 /// A runtime bit pointer to field `i` of the packed struct or union `ptr`
 /// addresses: the same address, so a `bitcast`. A const local's field
-/// pointers remember `i`, for `constAllocPtr`.
+/// pointers remember `i`, for `constAllocPtr`. For the comptime evaluator,
+/// a field pointer, as the walker makes one.
 fn packedFieldPtr(sema: *Sema, block: *Block, ptr: Ref, result_ty: Index, i: u32) CompileError!Ref {
+    if (sema.bc != null) return sema.addStructField(block, .struct_field_ptr, result_ty, ptr, i);
     const field_ptr = try sema.addTyOp(block, .bitcast, result_ty, ptr);
     if (sema.const_allocs.count() != 0 and sema.constAllocRoot(ptr) != null)
         try sema.packed_field_ptrs.put(sema.arena, field_ptr.toIndex().?, i);
@@ -10308,6 +10472,7 @@ fn errSetIsEmpty(sema: *Sema, block: *Block, ty: Index) CompileError!bool {
             if (block.inlining) |inl| if (inl.ret_ty != .none and sema.ip.indexToKey(inl.ret_ty) == .error_union_type and
                 sema.ip.indexToKey(inl.ret_ty).error_union_type.error_set_type == ty) return false;
             try sema.declareDependency(.{ .func_ies = func });
+            try sema.bcRequire(sema.zcu.funcs.get(func) == .done);
             break :blk (sema.zcu.ensureFuncIes(func) catch |err| switch (err) {
                 error.DependencyLoop => return false,
                 else => |e| return e,
@@ -10707,9 +10872,11 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     if (sema.resolveValue(cond) == null) {
         // Each inline prong after the first counts as a backward branch,
         // as upstream.
+        // Counted when analyzing, not each time the code runs, so not in
+        // a body lowered for the comptime evaluator.
         var first = true;
         for (cases.items) |c| if (c.is_inline) {
-            if (!first) try sema.emitBackwardBranch(parent, src);
+            if (!first and sema.bc == null) try sema.emitBackwardBranch(parent, src);
             first = false;
         };
     }
@@ -11191,7 +11358,7 @@ fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref
     if (all_comptime) return .fromInterned(try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = vals } } }));
     try sema.requireRuntime(block, src);
     try sema.resolveLayout(block, src, ty);
-    if (Type.isPackedStruct(sema.ip, ty)) {
+    if (Type.isPackedStruct(sema.ip, ty) and sema.bc == null) {
         const backing = sema.ip.structInfo(ty).tag_type;
         var host: Ref = .fromInterned(try sema.intValue(backing, 0));
         for (elems, 0..) |e, i| host = try sema.packedInsert(block, host, Type.packedFieldBitOffset(sema.ip, ty, i), e);
@@ -12612,7 +12779,8 @@ fn analyzeCall(
     }
     if (callee_fn_ty.cc == .naked) return sema.fail(block, src, "unable to call function with naked calling convention", .{});
     try sema.declareDependency(.{ .nav_val = ip.indexToKey(callee_func).func.owner_nav });
-    try sema.zcu.queueFuncFrom(sema.owner, callee_func);
+    // The comptime evaluator calls it at comptime instead.
+    if (sema.bc == null) try sema.zcu.queueFuncFrom(sema.owner, callee_func);
     for (callee_fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
     try sema.resolveLayout(block, src, callee_fn_ty.return_type);
     var call_ret_ty = callee_fn_ty.return_type;
@@ -12886,20 +13054,58 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
     try sema.declareDependency(.{ .func_body = func });
     if (memoizable) if (sema.zcu.comptime_memo.get(key)) |memo| {
         // What the call read, this unit reads by reusing its result.
-        for (memo.deps) |d| try sema.declareDependency(d);
+        for (memo.deps) |d| try sema.declareDep(d.dependee, d.conditional);
         return memo.result;
     };
     const saved_memo_start = sema.memo_start;
     const memo_start: u32 = @intCast(sema.memo_deps.items.len);
-    if (memoizable) sema.memo_start = memo_start;
+    if (memoizable) {
+        sema.memo_start = memo_start;
+        sema.memo_epoch += 1;
+    }
     defer if (memoizable) {
         sema.memo_start = saved_memo_start;
         if (saved_memo_start == null) {
             sema.memo_deps.clearRetainingCapacity();
             sema.memo_pos.clearRetainingCapacity();
+            sema.memo_body_pos.clearRetainingCapacity();
         }
     };
+    // A lowered body runs once what each walker run of it would evaluate
+    // again, which only memoized calls make equal.
+    if (sema.bc) |bc| if (bc.depth == 0 and !memoizable) try sema.bcRefuse();
 
+    const result = switch (try sema.bcCall(caller, src, func, args)) {
+        .result => |r| r,
+        .none => try sema.walkComptimeCall(caller, src, func, args),
+        .aborted => blk: {
+            // The run hit something the evaluator does not reproduce
+            // (else the walker fails the same way below): leave this
+            // function to the walker.
+            const r = try sema.walkComptimeCall(caller, src, func, args);
+            const state = sema.zcu.comptime_bodies.getPtr(func).?;
+            if (state.* == .ready) {
+                const b = state.ready;
+                state.* = .{ .off = b };
+            }
+            break :blk r;
+        },
+    };
+    if (memoizable and !sema.refersToComptimeAlloc(result)) {
+        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(memo_start) });
+    } else if (sema.bc) |bc| if (bc.depth == 0) try sema.bcRefuse();
+    return result;
+}
+
+/// A comptime call evaluated by walking the callee's ZIR.
+fn walkComptimeCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []const Index) CompileError!Index {
+    const ip = sema.ip;
+    // While lowering for the evaluator, the callee's branches are counted
+    // against the lowering's quota, not recorded for each run.
+    if (sema.bc) |bc| bc.depth += 1;
+    defer if (sema.bc) |bc| {
+        bc.depth -= 1;
+    };
     const saved = CalleeScope.enter(sema, func);
     defer saved.leave(sema);
     var callee_block = sema.calleeBlock(caller, func);
@@ -12914,11 +13120,7 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
         error.ComptimeReturn => {},
         else => return err,
     };
-    const result = try sema.resolveConstValue(&callee_block, src, inlining.result, "comptime call must return a comptime-known value");
-    if (memoizable and !sema.refersToComptimeAlloc(result)) {
-        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(memo_start) });
-    }
-    return result;
+    return sema.resolveConstValue(&callee_block, src, inlining.result, "comptime call must return a comptime-known value");
 }
 
 fn refersToComptimeAlloc(sema: *Sema, val: Index) bool {
@@ -12943,10 +13145,1002 @@ fn refersToComptimeAlloc(sema: *Sema, val: Index) bool {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Comptime evaluator
+//
+// A function the ZIR walker has run often enough at comptime is lowered
+// once to typed IR, the way its runtime body would be (with the few
+// differences below), and later comptime calls of it run that IR on
+// interned values instead of walking ZIR again. See docs/architecture.md,
+// "Comptime evaluator", for the design and the rules that keep its
+// results and errors those of the walker:
+//
+// - Lowering only reads units the walker has already resolved
+//   (`bcRequire`), and refuses bodies with effects the evaluator does not
+//   reproduce (`bcRefuse`).
+// - A run aborts on anything it cannot evaluate exactly, including every
+//   compile error; its stores to older comptime memory are undone
+//   (`BcUndo`) and the walker runs the call instead, reporting the error.
+
+const BcLowering = struct {
+    /// Nesting of the comptime calls the walker evaluates while lowering.
+    /// They count as memoized calls of each run: only the call itself is
+    /// recorded as a backward branch.
+    depth: u32 = 0,
+    /// Lowering read something the walker has not resolved yet.
+    not_ready: bool = false,
+    /// The first unresolved declaration lowering read, if that was it.
+    blocker: InternPool.NavIndex = .none,
+    /// Lowering met something the evaluator does not reproduce.
+    refused: bool = false,
+};
+
+/// A store an evaluator run made to a comptime allocation that is older
+/// than the run, with what it overwrote.
+const BcUndo = union(enum) {
+    alloc: struct { id: u32, old: ComptimeAlloc },
+    node: struct { node: *MutValue, old: MutValue },
+};
+
+fn bcLogAlloc(sema: *Sema, id: u32, alloc: *const ComptimeAlloc) !void {
+    if (id < sema.bc_first_alloc) try sema.bc_undo.append(sema.gpa, .{ .alloc = .{ .id = id, .old = alloc.* } });
+}
+
+fn bcLogNode(sema: *Sema, id: u32, node: *MutValue) !void {
+    if (id < sema.bc_first_alloc) try sema.bc_undo.append(sema.gpa, .{ .node = .{ .node = node, .old = node.* } });
+}
+
+/// Adds `inst`, something each run of the body being lowered does (a
+/// backward branch, a branch quota), to the innermost runtime block: a
+/// comptime block's instructions are dropped, but the walker runs it again
+/// on every call.
+/// While lowering, marks where the code being analyzed reads dependency
+/// `index` (see `Zcu.Bytecode.deps`), in the innermost runtime block. A
+/// read outside one, or in instructions lowering discards, stays unmarked
+/// and every run declares it (`entry_deps`).
+fn bcDepEvent(sema: *Sema, index: u32) Allocator.Error!void {
+    var b = sema.bc_block orelse return;
+    while (b.is_comptime) b = b.parent orelse return;
+    if (b.instructions.items.len != 0 and sema.isNoReturnInst(b.instructions.getLast())) return;
+    try sema.ir_insts.append(sema.gpa, .{ .tag = .comptime_dep, .data = .{ .dep = index } });
+    try b.instructions.append(sema.gpa, @fromBackingInt(@intCast(sema.ir_insts.len - 1)));
+}
+
+fn bcAddEvent(sema: *Sema, block: *Block, inst: Ir.Inst) CompileError!void {
+    var b = block;
+    while (b.is_comptime) b = b.parent orelse return sema.bcRefuse();
+    _ = try sema.addInst(b, inst);
+}
+
+const BcLowered = union(enum) {
+    ready: *Zcu.Bytecode,
+    /// With the unresolved declaration that stopped it, if known.
+    not_ready: InternPool.NavIndex,
+    refused,
+};
+
+/// Lowers the body of `func_index` for the comptime evaluator.
+fn bcLower(zcu: *Zcu, func_index: Index) Allocator.Error!BcLowered {
+    const ip = &zcu.ip;
+    const func = ip.indexToKey(func_index).func;
+    const fn_ty = ip.indexToKey(func.ty).func_type;
+    // Generic functions instantiate per call; inferred error sets need
+    // the runtime body. Both stay with the walker for now.
+    if (fn_ty.is_generic or func.generic_owner != .none or fn_ty.cc == .naked) return .refused;
+    if (fn_ty.return_type == .noreturn_type) return .refused;
+    if (ip.indexToKey(fn_ty.return_type) == .error_union_type and
+        ip.indexToKey(fn_ty.return_type).error_union_type.error_set_type == .adhoc_inferred_error_set_type) return .refused;
+    var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
+    defer arena_state.deinit();
+    const nav = ip.getNav(func.owner_nav);
+    var sema = create(zcu, arena_state.allocator(), nav.file, .{ .func = func_index });
+    defer sema.destroy();
+    for (fn_ty.param_types) |pt| if (!sema.layoutResolved(pt)) return .{ .not_ready = .none };
+    if (!sema.layoutResolved(fn_ty.return_type)) return .{ .not_ready = .none };
+    // Comptime-only values do not fit the IR.
+    for (fn_ty.param_types) |pt| if (Type.isComptimeOnly(ip, pt)) return .refused;
+    if (Type.isComptimeOnly(ip, fn_ty.return_type)) return .refused;
+
+    var bc: BcLowering = .{};
+    sema.bc = &bc;
+    sema.func = func_index;
+    sema.fn_ret_ty = fn_ty.return_type;
+    const n_errors = zcu.errors.items.len;
+    const ok = if (sema.bcLowerBody(func_index)) true else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => false,
+    };
+    if (!ok or bc.not_ready or bc.refused or zcu.errors.items.len != n_errors) {
+        zcu.errors.shrinkRetainingCapacity(n_errors);
+        return if (bc.not_ready and !bc.refused) .{ .not_ready = bc.blocker } else .refused;
+    }
+    for (sema.ir_insts.items(.tag)) |tag| if (!bcSupported(tag)) return .refused;
+
+    const gpa = zcu.gpa;
+    const deps = try gpa.dupe(Zcu.Dependee, sema.deps.items);
+    errdefer gpa.free(deps);
+    const extra = try sema.ir_extra.toOwnedSlice(gpa);
+    errdefer gpa.free(extra);
+    var ir: Ir = .{
+        .instructions = sema.ir_insts.toOwnedSlice(),
+        .extra = extra,
+        .func = func_index,
+        .main_block = sema.bc_main_block,
+    };
+    errdefer ir.instructions.deinit(gpa);
+    var in_frame = try bcInFrame(gpa, &ir);
+    errdefer in_frame.deinit(gpa);
+    // Plain reads no reachable `comptime_dep` marks.
+    var marked = try std.DynamicBitSetUnmanaged.initEmpty(sema.arena, deps.len);
+    bcMarkDeps(&ir, ir.mainBody(), &marked);
+    var entry_deps: std.ArrayList(u32) = .empty;
+    defer entry_deps.deinit(gpa);
+    for (sema.deps_conditional.items, 0..) |c, i| if (!c and !marked.isSet(i)) try entry_deps.append(gpa, @intCast(i));
+    const entry = try entry_deps.toOwnedSlice(gpa);
+    errdefer gpa.free(entry);
+    const body = try gpa.create(Zcu.Bytecode);
+    body.* = .{ .ir = ir, .deps = deps, .entry_deps = entry, .in_frame = in_frame };
+    return .{ .ready = body };
+}
+
+/// Sets the dependencies the `comptime_dep` instructions reachable from
+/// `body` mark.
+fn bcMarkDeps(ir: *const Ir, body: []const Ir.Inst.Index, marked: *std.DynamicBitSetUnmanaged) void {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    for (body) |inst| {
+        const data = datas[@backingInt(inst)];
+        switch (tags[@backingInt(inst)]) {
+            .comptime_dep => marked.set(data.dep),
+            .block, .loop => {
+                const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
+                bcMarkDeps(ir, ir.bodySlice(extra.end, extra.data.body_len), marked);
+            },
+            .cond_br => {
+                const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
+                bcMarkDeps(ir, ir.bodySlice(extra.end, extra.data.then_body_len), marked);
+                bcMarkDeps(ir, ir.bodySlice(extra.end + extra.data.then_body_len, extra.data.else_body_len), marked);
+            },
+            .switch_br => {
+                const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
+                var at = extra.end;
+                for (0..extra.data.cases_len) |_| {
+                    const items_len = ir.extra[at];
+                    const body_len = ir.extra[at + 1];
+                    at += 2 + items_len;
+                    bcMarkDeps(ir, ir.bodySlice(at, body_len), marked);
+                    at += body_len;
+                }
+                bcMarkDeps(ir, ir.bodySlice(at, extra.data.else_body_len), marked);
+            },
+            else => {},
+        }
+    }
+}
+
+/// The instructions of `ir` whose values the evaluator can keep in its
+/// frame (see `Zcu.Bytecode.in_frame`).
+fn bcInFrame(gpa: Allocator, ir: *const Ir) Allocator.Error!std.DynamicBitSetUnmanaged {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    var set = try std.DynamicBitSetUnmanaged.initEmpty(gpa, tags.len);
+    for (tags, datas, 0..) |tag, data, i| switch (tag) {
+        .alloc => if (data.ty != .none) set.set(i),
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => set.set(i),
+        else => {},
+    };
+    const S = struct {
+        set: *std.DynamicBitSetUnmanaged,
+        tags: []const Ir.Inst.Tag,
+        /// A use other than the ones that keep a value in the frame.
+        fn escape(s: @This(), ref: Ref) void {
+            if (ref.toIndex()) |j| s.set.unset(@backingInt(j));
+        }
+        /// A use that keeps `ref` in the frame if it is a `want`.
+        fn use(s: @This(), ref: Ref, want: enum { alloc, overflow }) void {
+            const j = @backingInt(ref.toIndex() orelse return);
+            const is_alloc = s.tags[j] == .alloc;
+            if (is_alloc != (want == .alloc)) s.set.unset(j);
+        }
+    };
+    const s: S = .{ .set = &set, .tags = tags };
+    for (tags, datas) |tag, data| switch (tag) {
+        .load => s.use(data.ty_op.operand, .alloc),
+        .store => {
+            s.use(data.bin_op.lhs, .alloc);
+            s.escape(data.bin_op.rhs);
+        },
+        .struct_field_val => s.use(ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand, .overflow),
+        .struct_field_ptr => s.escape(ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand),
+        .bitcast,
+        .intcast,
+        .trunc,
+        .not,
+        .slice_ptr,
+        .slice_len,
+        .optional_payload,
+        .wrap_optional,
+        .unwrap_errunion_payload,
+        .unwrap_errunion_err,
+        .wrap_errunion_payload,
+        .wrap_errunion_err,
+        => s.escape(data.ty_op.operand),
+        .int_from_bool, .ret, .is_null, .is_non_null, .is_err, .is_non_err => s.escape(data.un_op),
+        .add_wrap,
+        .sub_wrap,
+        .mul_wrap,
+        .bit_and,
+        .bit_or,
+        .xor,
+        .shl,
+        .shr,
+        .div_trunc,
+        .div_floor,
+        .div_ceil,
+        .rem,
+        .mod,
+        .cmp_lt,
+        .cmp_lte,
+        .cmp_eq,
+        .cmp_gte,
+        .cmp_gt,
+        .cmp_neq,
+        .ptr_elem_val,
+        .slice_elem_val,
+        .array_elem_val,
+        => {
+            s.escape(data.bin_op.lhs);
+            s.escape(data.bin_op.rhs);
+        },
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow, .ptr_elem_ptr, .slice_elem_ptr => {
+            const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+            s.escape(bin.lhs);
+            s.escape(bin.rhs);
+        },
+        .aggregate_init => {
+            const extra = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
+            for (ir.refSlice(extra.end, extra.data.len)) |r| s.escape(r);
+        },
+        .call => {
+            const extra = ir.extraData(Ir.Call, data.pl_op.payload);
+            s.escape(data.pl_op.operand);
+            for (ir.refSlice(extra.end, extra.data.args_len)) |r| s.escape(r);
+        },
+        .br => s.escape(data.br.operand),
+        // Switch items are comptime-known.
+        .cond_br, .switch_br => s.escape(data.pl_op.operand),
+        .arg,
+        .alloc,
+        .block,
+        .loop,
+        .repeat,
+        .unreach,
+        .trap,
+        .dbg_stmt,
+        .dbg_inline_begin,
+        .dbg_inline_end,
+        .comptime_tick,
+        .comptime_quota,
+        .comptime_dep,
+        => {},
+        else => unreachable, // Not in `bcSupported`.
+    };
+    return set;
+}
+
+fn bcLowerBody(sema: *Sema, func_index: Index) CompileError!void {
+    const ip = sema.ip;
+    const gpa = sema.gpa;
+    const func = ip.indexToKey(func_index).func;
+    const fn_ty = ip.indexToKey(func.ty).func_type;
+    const nav = ip.getNav(func.owner_nav);
+    const decl = sema.code.getDeclaration(nav.zir_inst);
+    var block = sema.rootBlock(nav.namespace, decl.src_node, false);
+    defer block.instructions.deinit(gpa);
+    const fn_info = sema.code.getFnInfo(func.zir_inst);
+    var arg_i: u32 = 0;
+    for (fn_info.param_body) |inst| {
+        switch (sema.code.instructions.items(.tag)[@backingInt(inst)]) {
+            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {},
+            else => continue,
+        }
+        const pt = fn_ty.param_types[arg_i];
+        var ref = try sema.addInst(&block, .{ .tag = .arg, .data = .{ .arg = .{ .ty = pt, .index = arg_i } } });
+        arg_i += 1;
+        // As `analyzeFuncBody`: a parameter of a type with one possible
+        // value is that value.
+        if (!Type.hasRuntimeBits(ip, pt)) if (try sema.onePossibleValue(pt)) |v| {
+            ref = .fromInterned(v);
+        };
+        try sema.inst_map.put(gpa, inst, ref);
+    }
+    sema.analyzeBodyInner(&block, fn_info.body) catch |err| switch (err) {
+        error.ComptimeBreak, error.ComptimeReturn => return sema.bcRefuse(),
+        else => |e| return e,
+    };
+    sema.bc_main_block = @intCast(sema.ir_extra.items.len);
+    try sema.ir_extra.append(gpa, @intCast(block.instructions.items.len));
+    try sema.ir_extra.appendSlice(gpa, @ptrCast(block.instructions.items));
+}
+
+/// The instructions `bcExec` evaluates; a body with others stays with the
+/// walker.
+fn bcSupported(tag: Ir.Inst.Tag) bool {
+    return switch (tag) {
+        .arg,
+        .alloc,
+        .load,
+        .store,
+        .bitcast,
+        .intcast,
+        .trunc,
+        .not,
+        .int_from_bool,
+        .add_wrap,
+        .sub_wrap,
+        .mul_wrap,
+        .add_with_overflow,
+        .sub_with_overflow,
+        .mul_with_overflow,
+        .bit_and,
+        .bit_or,
+        .xor,
+        .shl,
+        .shr,
+        .div_trunc,
+        .div_floor,
+        .div_ceil,
+        .rem,
+        .mod,
+        .cmp_lt,
+        .cmp_lte,
+        .cmp_eq,
+        .cmp_gte,
+        .cmp_gt,
+        .cmp_neq,
+        .block,
+        .loop,
+        .repeat,
+        .br,
+        .cond_br,
+        .switch_br,
+        .ret,
+        .call,
+        .unreach,
+        .trap,
+        .struct_field_ptr,
+        .struct_field_val,
+        .ptr_elem_ptr,
+        .ptr_elem_val,
+        .array_elem_val,
+        .slice_ptr,
+        .slice_len,
+        .slice_elem_val,
+        .slice_elem_ptr,
+        .aggregate_init,
+        .is_null,
+        .is_non_null,
+        .optional_payload,
+        .wrap_optional,
+        .is_err,
+        .is_non_err,
+        .unwrap_errunion_payload,
+        .unwrap_errunion_err,
+        .wrap_errunion_payload,
+        .wrap_errunion_err,
+        .dbg_stmt,
+        .dbg_inline_begin,
+        .dbg_inline_end,
+        .comptime_tick,
+        .comptime_quota,
+        .comptime_dep,
+        => true,
+        else => false,
+    };
+}
+
+const BcCallResult = union(enum) {
+    /// The walker runs the call.
+    none,
+    result: Index,
+    /// The evaluator gave up on the call; the walker must run it.
+    aborted,
+};
+
+/// Runs comptime call `func(args)` in the evaluator if `func` is lowered,
+/// lowering it first once the walker has run it enough times.
+fn bcCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []const Index) CompileError!BcCallResult {
+    const zcu = sema.zcu;
+    if (sema.bc != null or zcu.comptime_eval_threshold == 0) return .none;
+    const gpa = sema.gpa;
+    const body: *const Zcu.Bytecode = blk: {
+        const gop = try zcu.comptime_bodies.getOrPut(gpa, func);
+        if (!gop.found_existing) gop.value_ptr.* = .{ .cold = .{ .runs = 0, .next_try = zcu.comptime_eval_threshold } };
+        switch (gop.value_ptr.*) {
+            .off => return .none,
+            .ready => |b| break :blk b,
+            .cold => |*c| {
+                // Lowering waits for the walker to resolve what it reads.
+                const ready = if (c.blocker != .none) sema.ip.getNav(c.blocker).status == .resolved else c.runs >= c.next_try;
+                if (!ready) {
+                    c.runs += 1;
+                    return .none;
+                }
+                const runs = c.runs;
+                const lowered = try bcLower(zcu, func);
+                // Lowering can add entries.
+                const state = zcu.comptime_bodies.getPtr(func).?;
+                switch (lowered) {
+                    .ready => |b| {
+                        state.* = .{ .ready = b };
+                        break :blk b;
+                    },
+                    // Retry once the walker resolves that declaration, else
+                    // after as many walker runs again.
+                    .not_ready => |blocker| {
+                        state.* = .{ .cold = .{ .runs = runs + 1, .next_try = runs * 2, .blocker = blocker } };
+                        return .none;
+                    },
+                    .refused => {
+                        state.* = .{ .off = null };
+                        return .none;
+                    },
+                }
+            },
+        }
+    };
+
+    const saved_undo = sema.bc_undo.items.len;
+    const saved_first = sema.bc_first_alloc;
+    const saved_count = sema.branch_count;
+    const saved_quota = sema.branch_quota;
+    const n_errors = zcu.errors.items.len;
+    sema.bc_first_alloc = sema.ip.next_comptime_alloc.load(.monotonic);
+    defer sema.bc_first_alloc = saved_first;
+    const result = sema.bcRun(caller, src, func, body, args) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BcAbort => {
+            // Put back what the run changed, for the walker to run the
+            // call from the same state.
+            var i = sema.bc_undo.items.len;
+            while (i > saved_undo) {
+                i -= 1;
+                switch (sema.bc_undo.items[i]) {
+                    .alloc => |a| sema.comptime_allocs.getPtr(a.id).?.* = a.old,
+                    .node => |n| n.node.* = n.old,
+                }
+            }
+            sema.bc_undo.shrinkRetainingCapacity(saved_undo);
+            sema.branch_count = saved_count;
+            sema.branch_quota = saved_quota;
+            zcu.errors.shrinkRetainingCapacity(n_errors);
+            return .aborted;
+        },
+    };
+    // The outermost run's log is no longer needed.
+    if (saved_first == 0) sema.bc_undo.clearRetainingCapacity();
+    return .{ .result = result };
+}
+
+const BcError = error{ BcAbort, OutOfMemory };
+
+fn bcErr(err: CompileError) BcError {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.BcAbort;
+}
+
+const BcFrame = struct {
+    ir: *const Ir,
+    /// Each instruction's value; for an `alloc` kept in the frame, the
+    /// value it holds.
+    vals: []Index,
+    /// For an `*_with_overflow` kept in the frame, the overflow bit (`vals`
+    /// holds the wrapped result).
+    overflow: []Index,
+    in_frame: *const std.DynamicBitSetUnmanaged,
+    deps: []const Zcu.Dependee,
+    /// See `Sema.bc_declared`.
+    declared: []u32,
+    args: []const Index,
+    /// A comptime block in the callee, for the Sema functions that fold.
+    block: *Block,
+    src: Src,
+
+    /// An operand, which may be `.none`: garbage, the payload of a null
+    /// optional or of an error union holding an error, which runtime IR
+    /// reads when it masks the result (`opt == x` is `is_non_null(opt)
+    /// and payload == x`).
+    fn val(f: *const BcFrame, ref: Ref) Index {
+        if (ref.toInterned()) |i| return i;
+        return f.vals[@backingInt(ref.toIndex().?)];
+    }
+
+    /// The instruction `ref` names if the frame keeps its value.
+    fn slot(f: *const BcFrame, ref: Ref) ?u32 {
+        const j = @backingInt(ref.toIndex() orelse return null);
+        return if (f.in_frame.isSet(j)) j else null;
+    }
+
+    /// An operand that must not be garbage.
+    fn get(f: *const BcFrame, ref: Ref) error{AnalysisFail}!Index {
+        const v = f.val(ref);
+        return if (v == .none) error.AnalysisFail else v;
+    }
+};
+
+const BcExit = union(enum) {
+    br: struct { block: Ir.Inst.Index, val: Index },
+    repeat: Ir.Inst.Index,
+    ret: Index,
+};
+
+fn bcRun(sema: *Sema, caller: *Block, src: Src, func: Index, body: *const Zcu.Bytecode, args: []const Index) BcError!Index {
+    const gpa = sema.gpa;
+    const declared = try sema.bcDeclareBody(body);
+    const saved = CalleeScope.enter(sema, func);
+    defer saved.leave(sema);
+    var block = sema.calleeBlock(caller, func);
+    defer block.instructions.deinit(gpa);
+    const n = body.ir.instructions.len;
+    const vals = try gpa.alloc(Index, 2 * n);
+    defer gpa.free(vals);
+    var f: BcFrame = .{
+        .ir = &body.ir,
+        .vals = vals[0..n],
+        .overflow = vals[n..],
+        .in_frame = &body.in_frame,
+        .deps = body.deps,
+        .declared = declared,
+        .args = args,
+        .block = &block,
+        .src = src,
+    };
+    return switch (try sema.bcExec(&f, body.ir.mainBody())) {
+        .ret => |v| v,
+        else => error.BcAbort,
+    };
+}
+
+/// Declares what running `body` may read: all of the lowering's reads as
+/// conditional dependencies, and the reads outside runtime blocks as plain
+/// ones; its `comptime_dep` instructions declare the others it reaches.
+/// Returns the body's `bc_declared` epochs.
+fn bcDeclareBody(sema: *Sema, body: *const Zcu.Bytecode) Allocator.Error![]u32 {
+    if (sema.memo_start) |start| try sema.memoCollect(.{ .body = body }, start);
+    const gop = try sema.bc_declared.getOrPut(sema.gpa, body);
+    if (gop.found_existing) return gop.value_ptr.*;
+    gop.value_ptr.* = try sema.arena.alloc(u32, body.deps.len);
+    @memset(gop.value_ptr.*, std.math.maxInt(u32));
+    for (body.deps) |d| _ = try sema.addDep(d, true);
+    for (body.entry_deps) |i| _ = try sema.addDep(body.deps[i], false);
+    return gop.value_ptr.*;
+}
+
+/// One backward branch, as the walker counts it.
+fn bcTick(sema: *Sema) BcError!void {
+    sema.branch_count += 1;
+    if (sema.branch_count > sema.branch_quota) return error.BcAbort;
+}
+
+fn bcExec(sema: *Sema, f: *BcFrame, body: []const Ir.Inst.Index) BcError!BcExit {
+    const ir = f.ir;
+    const ip = sema.ip;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    for (body) |inst| {
+        const i = @backingInt(inst);
+        const data = datas[i];
+        const tag = tags[i];
+        f.vals[i] = switch (tag) {
+            .arg => f.args[data.arg.index],
+            // Frame-kept allocs and overflow tuples.
+            .alloc => if (f.in_frame.isSet(i)) sema.undefValue(Type.ptrInfo(ip, data.ty).child) catch |e| return bcErr(e) else bcValue(sema, f, tag, data) catch |e| return bcErr(e),
+            .load => if (f.slot(data.ty_op.operand)) |j| f.vals[j] else bcValue(sema, f, tag, data) catch |e| return bcErr(e),
+            .store => if (f.slot(data.bin_op.lhs)) |j| blk: {
+                f.vals[j] = f.get(data.bin_op.rhs) catch return error.BcAbort;
+                break :blk .void_value;
+            } else bcValue(sema, f, tag, data) catch |e| return bcErr(e),
+            .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (f.in_frame.isSet(i)) blk: {
+                const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+                const lv = f.get(bin.lhs) catch return error.BcAbort;
+                const r = sema.bcArith(tag, ip.typeOf(lv), lv, f.get(bin.rhs) catch return error.BcAbort) catch |e| return bcErr(e);
+                f.overflow[i] = sema.intValue(.u1_type, @intFromBool(r.overflow)) catch |e| return bcErr(e);
+                break :blk r.val;
+            } else bcValue(sema, f, tag, data) catch |e| return bcErr(e),
+            .struct_field_val => blk: {
+                const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+                if (f.slot(sf.operand)) |j| break :blk if (sf.index == 0) f.vals[j] else f.overflow[j];
+                break :blk bcValue(sema, f, tag, data) catch |e| return bcErr(e);
+            },
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => continue,
+            .comptime_tick => {
+                try sema.bcTick();
+                continue;
+            },
+            .comptime_quota => {
+                sema.branch_quota = @max(sema.branch_quota, data.quota);
+                continue;
+            },
+            .comptime_dep => {
+                // Once per memoizable call, as a hot loop reaches it often.
+                if (f.declared[data.dep] != sema.memo_epoch) {
+                    try sema.declareDep(f.deps[data.dep], false);
+                    f.declared[data.dep] = sema.memo_epoch;
+                }
+                continue;
+            },
+            .block => blk: {
+                const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
+                const exit = try sema.bcExec(f, ir.bodySlice(extra.end, extra.data.body_len));
+                if (exit == .br and exit.br.block == inst) break :blk exit.br.val;
+                return exit;
+            },
+            .loop => {
+                const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
+                const loop_body = ir.bodySlice(extra.end, extra.data.body_len);
+                while (true) {
+                    const exit = try sema.bcExec(f, loop_body);
+                    if (exit == .repeat and exit.repeat == inst) {
+                        try sema.bcTick();
+                        continue;
+                    }
+                    return exit;
+                }
+            },
+            .repeat => return .{ .repeat = data.repeat.loop_inst },
+            .br => return .{ .br = .{ .block = data.br.block_inst, .val = f.val(data.br.operand) } },
+            .ret => return .{ .ret = f.get(data.un_op) catch return error.BcAbort },
+            // A failed safety check, or undefined behavior the walker
+            // reports.
+            .unreach, .trap => return error.BcAbort,
+            .cond_br => {
+                const cond = f.val(data.pl_op.operand);
+                if (cond != .bool_true and cond != .bool_false) return error.BcAbort;
+                const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
+                const then_body = ir.bodySlice(extra.end, extra.data.then_body_len);
+                const else_body = ir.bodySlice(extra.end + then_body.len, extra.data.else_body_len);
+                return sema.bcExec(f, if (cond == .bool_true) then_body else else_body);
+            },
+            .switch_br => {
+                const operand = f.get(data.pl_op.operand) catch return error.BcAbort;
+                if (sema.isUndef(operand)) return error.BcAbort;
+                const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
+                var at = extra.end;
+                for (0..extra.data.cases_len) |_| {
+                    const items_len = ir.extra[at];
+                    const body_len = ir.extra[at + 1];
+                    at += 2;
+                    const items = ir.refSlice(at, items_len);
+                    at += items_len;
+                    const case_body = ir.bodySlice(at, body_len);
+                    at += body_len;
+                    // Interned values of the same type are equal when
+                    // their indices are.
+                    for (items) |item| if (f.val(item) == operand) return sema.bcExec(f, case_body);
+                }
+                return sema.bcExec(f, ir.bodySlice(at, extra.data.else_body_len));
+            },
+            .call => blk: {
+                const extra = ir.extraData(Ir.Call, data.pl_op.payload);
+                const callee = f.get(data.pl_op.operand) catch return error.BcAbort;
+                // A panic handler: a failed safety check.
+                if (ip.indexToKey(callee) != .func or extra.data.ret_ty == .noreturn_type) return error.BcAbort;
+                const refs = ir.refSlice(extra.end, extra.data.args_len);
+                const args = try sema.arena.alloc(Index, refs.len);
+                for (refs, args) |r, *a| a.* = f.get(r) catch return error.BcAbort;
+                try sema.bcTick();
+                break :blk sema.callComptime(f.block, f.src, callee, args) catch |e| return bcErr(e);
+            },
+            else => sema.bcValue(f, tag, data) catch |e| return bcErr(e),
+        };
+    }
+    unreachable; // Every body ends in a `noreturn` instruction.
+}
+
+/// The value of a non-control-flow instruction, folded the way the walker
+/// folds it; `error.AnalysisFail` (without a reported error) where the
+/// evaluator does not reproduce the walker.
+fn bcValue(sema: *Sema, f: *BcFrame, tag: Ir.Inst.Tag, data: Ir.Inst.Data) CompileError!Index {
+    const ip = sema.ip;
+    const ir = f.ir;
+    const abort = error.AnalysisFail;
+    switch (tag) {
+        .alloc => {
+            if (data.ty == .none) return abort;
+            const child = Type.ptrInfo(ip, data.ty).child;
+            const id = ip.next_comptime_alloc.fetchAdd(1, .monotonic);
+            try sema.comptime_allocs.put(sema.gpa, id, .{ .ty = child, .val = try sema.undefValue(child), .is_const = false });
+            return sema.intern(.{ .ptr = .{ .ty = data.ty, .base = .{ .comptime_alloc = id } } });
+        },
+        .store => {
+            const ptr = try f.get(data.bin_op.lhs);
+            if (ip.indexToKey(ptr) != .ptr or sema.intoComptimeField(ptr)) return abort;
+            if (try sema.comptimePtrRoot(ptr) != .comptime_alloc) return abort;
+            try sema.comptimeStore(f.block, f.src, ptr, try f.get(data.bin_op.rhs));
+            return .void_value;
+        },
+        .load => {
+            const ptr = try f.get(data.ty_op.operand);
+            if (ip.indexToKey(ptr) != .ptr) return abort;
+            return (try sema.comptimeLoadOrNull(f.block, f.src, ptr)) orelse abort;
+        },
+        .bitcast => {
+            const ty = data.ty_op.ty;
+            const v = try f.get(data.ty_op.operand);
+            // An enum tag's integer, as `@intFromEnum` lowers.
+            if (ip.indexToKey(v) == .enum_tag and ip.typeOf(ip.indexToKey(v).enum_tag.int) == ty) return ip.indexToKey(v).enum_tag.int;
+            const operand: Ref = .fromInterned(v);
+            const r = if (Type.class(ip, ty) == .pointer) try sema.coercePtrTo(f.block, operand, ty) else try sema.bitCast(f.block, f.src, ty, operand);
+            return r.toInterned() orelse abort;
+        },
+        .intcast, .trunc => {
+            const v = try f.get(data.ty_op.operand);
+            if (ip.indexToKey(v) != .int) return abort;
+            const ty = data.ty_op.ty;
+            var big = try sema.bigValue(v);
+            if (tag == .trunc) {
+                const info = Type.intInfo(ip, ty);
+                try big.truncate(&big, info.signedness, info.bits);
+            } else if (!sema.intFits(v, ty)) return abort;
+            return sema.bigToValue(ty, big.toConst());
+        },
+        .int_from_bool => {
+            const v = try f.get(data.un_op);
+            if (v != .bool_true and v != .bool_false) return abort;
+            return sema.intValue(.u1_type, @intFromBool(v == .bool_true));
+        },
+        .not => {
+            const v = f.val(data.ty_op.operand);
+            if (v == .none) return .none;
+            if (v == .bool_true or v == .bool_false) return boolValue(v == .bool_false);
+            if (ip.indexToKey(v) != .int) return abort;
+            const info = Type.intInfo(ip, data.ty_op.ty);
+            var big = try sema.bigValue(v);
+            try big.bitNotWrap(&big, info.signedness, info.bits);
+            return sema.bigToValue(data.ty_op.ty, big.toConst());
+        },
+        .add_wrap, .sub_wrap, .mul_wrap => {
+            const lv = try f.get(data.bin_op.lhs);
+            return (try sema.bcArith(tag, ip.typeOf(lv), lv, try f.get(data.bin_op.rhs))).val;
+        },
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {
+            const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+            const lv = try f.get(bin.lhs);
+            const r = try sema.bcArith(tag, ip.typeOf(lv), lv, try f.get(bin.rhs));
+            const elems = [2]Index{ r.val, try sema.intValue(.u1_type, @intFromBool(r.overflow)) };
+            return sema.intern(.{ .aggregate = .{ .ty = data.ty_pl.ty, .storage = .{ .elems = &elems } } });
+        },
+        .bit_and, .bit_or, .xor => {
+            const lv = f.val(data.bin_op.lhs);
+            const rv = f.val(data.bin_op.rhs);
+            // Garbage masked by the other operand.
+            if (tag != .xor and (lv == .none or rv == .none)) {
+                const absorbing: Index = if (tag == .bit_and) .bool_false else .bool_true;
+                return if (lv == absorbing or rv == absorbing) absorbing else .none;
+            }
+            if (lv == .none or rv == .none) return .none;
+            if ((lv == .bool_true or lv == .bool_false) and (rv == .bool_true or rv == .bool_false)) {
+                const a = lv == .bool_true;
+                const b = rv == .bool_true;
+                return boolValue(switch (tag) {
+                    .bit_and => a and b,
+                    .bit_or => a or b,
+                    else => a != b,
+                });
+            }
+            if (ip.indexToKey(lv) != .int or ip.indexToKey(rv) != .int) return abort;
+            const ty = ip.typeOf(lv);
+            return sema.foldArithmetic(f.block, f.src, switch (tag) {
+                .bit_and => .bit_and,
+                .bit_or => .bit_or,
+                else => .xor,
+            }, ty, lv, rv);
+        },
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
+            const lv = try f.get(data.bin_op.lhs);
+            const rv = try f.get(data.bin_op.rhs);
+            if (ip.indexToKey(lv) != .int or ip.indexToKey(rv) != .int) return abort;
+            return sema.foldArithmetic(f.block, f.src, switch (tag) {
+                .div_trunc => .div_trunc,
+                .div_floor => .div_floor,
+                .div_ceil => .div_ceil,
+                .rem => .rem,
+                else => .mod,
+            }, ip.typeOf(lv), lv, rv);
+        },
+        .shl, .shr => {
+            const lv = try f.get(data.bin_op.lhs);
+            const rv = try f.get(data.bin_op.rhs);
+            if (ip.indexToKey(lv) != .int or ip.indexToKey(rv) != .int) return abort;
+            const ty = ip.typeOf(lv);
+            const info = Type.intInfo(ip, ty);
+            const amount = ip.intValue(u64, rv) orelse return abort;
+            if (amount >= info.bits) return abort;
+            const a = try sema.bigValue(lv);
+            var r = try BigInt.init(sema.arena);
+            if (tag == .shl) {
+                try r.shiftLeft(&a, @intCast(amount));
+                try r.truncate(&r, info.signedness, info.bits);
+            } else try r.shiftRight(&a, @intCast(amount));
+            return sema.bigToValue(ty, r.toConst());
+        },
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+            const lv = f.val(data.bin_op.lhs);
+            const rv = f.val(data.bin_op.rhs);
+            if (lv == .none or rv == .none) return .none;
+            const lk = ip.indexToKey(lv);
+            const rk = ip.indexToKey(rv);
+            if (lk == .int and rk == .int) {
+                var ls: [2]std.math.big.Limb = undefined;
+                var rs: [2]std.math.big.Limb = undefined;
+                const order = ip.intToBig(lv, &ls).order(ip.intToBig(rv, &rs));
+                return boolValue(switch (tag) {
+                    .cmp_lt => order == .lt,
+                    .cmp_lte => order != .gt,
+                    .cmp_eq => order == .eq,
+                    .cmp_gte => order != .lt,
+                    .cmp_gt => order == .gt,
+                    else => order != .eq,
+                });
+            }
+            // Bools and enum tags: interned values of one type are equal
+            // when their indices are.
+            const scalar = (lv == .bool_true or lv == .bool_false) and (rv == .bool_true or rv == .bool_false) or
+                (lk == .enum_tag and rk == .enum_tag);
+            if (!scalar or (tag != .cmp_eq and tag != .cmp_neq)) return abort;
+            return boolValue((lv == rv) == (tag == .cmp_eq));
+        },
+        .struct_field_val => {
+            const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+            const v = try f.get(sf.operand);
+            switch (ip.indexToKey(v)) {
+                .aggregate, .undef => return sema.fieldValue(v, sf.index),
+                .un => |u| {
+                    if (u.tag != try sema.unionFieldTagValue(u.ty, sf.index)) return abort;
+                    return u.val;
+                },
+                else => return abort,
+            }
+        },
+        .struct_field_ptr => {
+            const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+            const ptr = try f.get(sf.operand);
+            if (ip.indexToKey(ptr) != .ptr or try sema.comptimePtrRoot(ptr) == .int) return abort;
+            // As `fieldPtrAt` makes them; comptime fields and union
+            // payloads need more than that.
+            const child = Type.ptrInfo(ip, ip.typeOf(ptr)).child;
+            switch (ip.indexToKey(child)) {
+                .struct_type => if (ip.structInfo(child).fieldIsComptime(sf.index)) return abort,
+                .tuple_type => |t| if (t.values.len != 0 and t.values[sf.index] != .none) return abort,
+                else => return abort,
+            }
+            return sema.intern(.{ .ptr = .{ .ty = data.ty_pl.ty, .base = .{ .field = .{ .base = ptr, .index = sf.index } } } });
+        },
+        .ptr_elem_ptr, .ptr_elem_val => {
+            const ptr, const index = if (tag == .ptr_elem_ptr) blk: {
+                const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+                break :blk .{ try f.get(bin.lhs), try f.get(bin.rhs) };
+            } else .{ try f.get(data.bin_op.lhs), try f.get(data.bin_op.rhs) };
+            if (ip.indexToKey(ptr) != .ptr or try sema.comptimePtrRoot(ptr) == .int) return abort;
+            const elem_ptr = try sema.ptrElemPtrVal(ptr, ip.intValue(u64, index) orelse return abort);
+            if (tag == .ptr_elem_ptr) return elem_ptr;
+            return (try sema.comptimeLoadOrNull(f.block, f.src, elem_ptr)) orelse abort;
+        },
+        .slice_elem_ptr, .slice_elem_val => {
+            const slice, const index = if (tag == .slice_elem_ptr) blk: {
+                const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+                break :blk .{ try f.get(bin.lhs), try f.get(bin.rhs) };
+            } else .{ try f.get(data.bin_op.lhs), try f.get(data.bin_op.rhs) };
+            if (ip.indexToKey(slice) != .slice) return abort;
+            const ptr = ip.indexToKey(slice).slice.ptr;
+            if (ip.indexToKey(ptr) != .ptr or try sema.comptimePtrRoot(ptr) == .int) return abort;
+            const elem_ptr = try sema.ptrElemPtrVal(ptr, ip.intValue(u64, index) orelse return abort);
+            if (tag == .slice_elem_ptr) return elem_ptr;
+            return (try sema.comptimeLoadOrNull(f.block, f.src, elem_ptr)) orelse abort;
+        },
+        .slice_ptr, .slice_len => {
+            const v = try f.get(data.ty_op.operand);
+            if (ip.indexToKey(v) != .slice) return abort;
+            const s = ip.indexToKey(v).slice;
+            if (tag == .slice_len) return s.len;
+            if (ip.typeOf(s.ptr) != data.ty_op.ty) return abort;
+            return s.ptr;
+        },
+        .array_elem_val => {
+            const v = try f.get(data.bin_op.lhs);
+            const index = ip.intValue(u64, try f.get(data.bin_op.rhs)) orelse return abort;
+            switch (ip.indexToKey(v)) {
+                .aggregate, .undef => return sema.elemValue(v, index),
+                else => return abort,
+            }
+        },
+        .aggregate_init => {
+            const extra = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
+            const refs = ir.refSlice(extra.end, extra.data.len);
+            const elems = try sema.arena.alloc(Index, refs.len);
+            for (refs, elems) |r, *e| e.* = try f.get(r);
+            return sema.intern(.{ .aggregate = .{ .ty = data.ty_pl.ty, .storage = .{ .elems = elems } } });
+        },
+        .is_null, .is_non_null => {
+            const v = try f.get(data.un_op);
+            if (ip.indexToKey(v) != .opt) return abort;
+            return boolValue((ip.indexToKey(v).opt.val == .none) == (tag == .is_null));
+        },
+        .optional_payload => {
+            const v = try f.get(data.ty_op.operand);
+            if (ip.indexToKey(v) != .opt) return abort;
+            return ip.indexToKey(v).opt.val; // `.none` for null: garbage.
+        },
+        .wrap_optional => return sema.intern(.{ .opt = .{ .ty = data.ty_op.ty, .val = try f.get(data.ty_op.operand) } }),
+        .is_err, .is_non_err => {
+            const v = try f.get(data.un_op);
+            if (ip.indexToKey(v) != .error_union) return abort;
+            return boolValue((ip.indexToKey(v).error_union.val == .err_name) == (tag == .is_err));
+        },
+        .unwrap_errunion_payload, .unwrap_errunion_err => {
+            const v = try f.get(data.ty_op.operand);
+            if (ip.indexToKey(v) != .error_union) return abort;
+            // The other variant is garbage.
+            switch (ip.indexToKey(v).error_union.val) {
+                .payload => |p| return if (tag == .unwrap_errunion_payload) p else .none,
+                .err_name => |name| return if (tag == .unwrap_errunion_err) sema.intern(.{ .err = .{ .ty = data.ty_op.ty, .name = name } }) else .none,
+            }
+        },
+        .wrap_errunion_payload => return sema.intern(.{ .error_union = .{ .ty = data.ty_op.ty, .val = .{ .payload = try f.get(data.ty_op.operand) } } }),
+        .wrap_errunion_err => {
+            const e = try f.get(data.ty_op.operand);
+            if (ip.indexToKey(e) != .err) return abort;
+            return sema.intern(.{ .error_union = .{ .ty = data.ty_op.ty, .val = .{ .err_name = ip.indexToKey(e).err.name } } });
+        },
+        else => return abort,
+    }
+}
+
+/// Wrapping or overflow-checked integer arithmetic on comptime-known
+/// integers of type `ty`: the wrapped result, and whether it overflowed.
+fn bcArith(sema: *Sema, tag: Ir.Inst.Tag, ty: Index, lv: Index, rv: Index) CompileError!struct { val: Index, overflow: bool } {
+    const ip = sema.ip;
+    if (ip.indexToKey(lv) != .int or ip.indexToKey(rv) != .int or !Type.isInt(ip, ty)) return error.AnalysisFail;
+    const info = Type.intInfo(ip, ty);
+    // Up to 64 bits, without big integers.
+    if (info.bits <= 64) small: {
+        const x = ip.intValue(i128, lv) orelse break :small;
+        const y = ip.intValue(i128, rv) orelse break :small;
+        const r: i128 = switch (tag) {
+            .add_wrap, .add_with_overflow => x + y,
+            .sub_wrap, .sub_with_overflow => x - y,
+            else => blk: {
+                const p, const o = @mulWithOverflow(x, y);
+                if (o != 0) break :small;
+                break :blk p;
+            },
+        };
+        const bits: u7 = @intCast(info.bits);
+        const wrapped: i128 = if (bits == 0) 0 else blk: {
+            const low = @as(u128, @bitCast(r)) & ((@as(u128, 1) << bits) - 1);
+            const negative = info.signedness == .signed and (low >> (bits - 1)) & 1 != 0;
+            break :blk @as(i128, @intCast(low)) - if (negative) @as(i128, 1) << bits else 0;
+        };
+        return .{ .val = try sema.intValue(ty, wrapped), .overflow = wrapped != r };
+    }
+    const a = try sema.bigValue(lv);
+    const b = try sema.bigValue(rv);
+    var r = try BigInt.init(sema.arena);
+    switch (tag) {
+        .add_wrap, .add_with_overflow => try r.add(&a, &b),
+        .sub_wrap, .sub_with_overflow => try r.sub(&a, &b),
+        else => try r.mul(&a, &b),
+    }
+    const overflow = !r.fitsInTwosComp(info.signedness, info.bits);
+    if (overflow) try r.truncate(&r, info.signedness, info.bits);
+    return .{ .val = try sema.bigToValue(ty, r.toConst()), .overflow = overflow };
+}
+
 const Instance = struct { func: Index, runtime_args: []Ref };
 
 /// Instantiates generic function `func` for `args`.
 fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) CompileError!Instance {
+    // Instantiating (and the branch quota it records) is up to the walker.
+    try sema.bcRefuse();
     const ip = sema.ip;
     const generic = ip.indexToKey(func).func;
     const generic_ty = ip.indexToKey(generic.ty).func_type;

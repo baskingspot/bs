@@ -31,6 +31,11 @@ namespaces: std.ArrayList(Namespace) = .empty,
 /// Dependencies recorded per unit by `Sema.declareDependency`. Nothing
 /// persists them yet; the on-disk cache (milestone 6) will.
 deps: std.AutoArrayHashMapUnmanaged(AnalUnit, []const Dependee) = .empty,
+/// For units some of whose `deps` only the comptime evaluator's lowering
+/// read (see "Comptime evaluator" in docs/architecture.md): the indices of
+/// those, ascending. Such an edge counts for invalidation, but the unit
+/// does not resolve its dependee itself. Arena-allocated.
+conditional_deps: std.AutoHashMapUnmanaged(AnalUnit, []const u32) = .empty,
 /// Analysis state of runtime function bodies.
 funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, FuncState) = .empty,
 func_queue: std.ArrayList(InternPool.Index) = .empty,
@@ -45,6 +50,12 @@ ready_irs: std.ArrayList(Ir) = .empty,
 comptime_decls: std.AutoArrayHashMapUnmanaged(ComptimeDecl, enum { queued, done }) = .empty,
 /// Memoized comptime calls, keyed by `Sema.comptimeCallKey`.
 comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, Memo) = .empty,
+/// The comptime evaluator's state of each function called at comptime
+/// (see `Sema.callComptime`). In memory only, like function IR.
+comptime_bodies: std.AutoHashMapUnmanaged(InternPool.Index, ComptimeBody) = .empty,
+/// Walker runs of a function before it is lowered for the comptime
+/// evaluator; 0 turns the evaluator off (`ZAP_COMPTIME_EVAL`).
+comptime_eval_threshold: u32 = 4,
 /// Errors each function instance returns, for inferred error sets.
 /// Arena-allocated.
 inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, []const InternPool.String) = .empty,
@@ -84,12 +95,57 @@ pub const FuncState = enum { queued, in_progress, done, failed };
 
 pub const FuncRef = struct { from: AnalUnit, func: InternPool.Index };
 
+/// A function body lowered to IR for the comptime evaluator, with the
+/// dependencies its lowering declared, which every unit that runs it
+/// declares too.
 /// A memoized comptime call's result, with the dependencies the call
 /// declared, which a unit that reuses the result declares too.
 /// Arena-allocated.
 pub const Memo = struct {
     result: InternPool.Index,
+    deps: []const MemoDep,
+};
+
+pub const MemoDep = struct {
+    dependee: Dependee,
+    /// Read only by a lowering for the comptime evaluator.
+    conditional: bool,
+};
+
+pub const Bytecode = struct {
+    ir: Ir,
+    /// Every unit that runs the body declares these as conditional
+    /// dependencies; its `comptime_dep` instructions declare the ones the
+    /// run reaches as plain dependencies.
     deps: []const Dependee,
+    /// The indices of the `deps` no `comptime_dep` instruction marks (read
+    /// outside any runtime block of the body), which every run declares as
+    /// plain dependencies.
+    entry_deps: []const u32,
+    /// Instructions whose values the evaluator keeps in its frame: an
+    /// `alloc` used only by `load` and `store` to it, which stays out of
+    /// comptime memory, and an `*_with_overflow` read only by
+    /// `struct_field_val`, which is never interned as a tuple.
+    in_frame: std.DynamicBitSetUnmanaged,
+
+    pub fn destroy(b: *Bytecode, gpa: Allocator) void {
+        b.ir.deinit(gpa);
+        gpa.free(b.deps);
+        gpa.free(b.entry_deps);
+        b.in_frame.deinit(gpa);
+        gpa.destroy(b);
+    }
+};
+
+pub const ComptimeBody = union(enum) {
+    /// Not lowered yet: the walker ran the function `runs` times, and
+    /// lowering is (re)tried at `next_try` runs, or once declaration
+    /// `blocker` is resolved.
+    cold: struct { runs: u32, next_try: u32, blocker: InternPool.NavIndex = .none },
+    ready: *Bytecode,
+    /// The evaluator does not run this function (any more: a run aborted
+    /// where the walker succeeded; runs still in progress keep the body).
+    off: ?*Bytecode,
 };
 
 pub const ComptimeDecl = struct {
@@ -202,6 +258,14 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.ready_irs.deinit(gpa);
     zcu.comptime_decls.deinit(gpa);
     zcu.comptime_memo.deinit(gpa);
+    zcu.conditional_deps.deinit(gpa);
+    var bodies = zcu.comptime_bodies.valueIterator();
+    while (bodies.next()) |b| switch (b.*) {
+        .ready => |r| r.destroy(gpa),
+        .off => |o| if (o) |r| r.destroy(gpa),
+        .cold => {},
+    };
+    zcu.comptime_bodies.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
     zcu.anyerror_ies.deinit(gpa);
     zcu.branch_quotas.deinit(gpa);
@@ -456,10 +520,13 @@ pub fn namespacePtr(zcu: *Zcu, index: u32) *Namespace {
 // ---------------------------------------------------------------------------
 // Units
 
-pub fn recordDeps(zcu: *Zcu, unit: AnalUnit, deps: []const Dependee) !void {
+pub fn recordDeps(zcu: *Zcu, unit: AnalUnit, deps: []const Dependee, conditional: []const u32) !void {
     // In the arena: a small gpa allocation per unit pins allocator pages
     // for the whole compilation.
     try zcu.deps.put(zcu.gpa, unit, try zcu.arena.allocator().dupe(Dependee, deps));
+    if (conditional.len != 0) {
+        try zcu.conditional_deps.put(zcu.gpa, unit, try zcu.arena.allocator().dupe(u32, conditional));
+    } else _ = zcu.conditional_deps.remove(unit);
 }
 
 /// Renders a unit's stable key, which does not depend on analysis order or

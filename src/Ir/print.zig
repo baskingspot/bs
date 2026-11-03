@@ -86,7 +86,9 @@ const Printer = struct {
                 const d = ir.extraData(Ir.DbgInline, data.dbg_inline.payload).data;
                 try w.print("{s}, {d}:{d}", .{ p.ip.stringSlice(p.ip.getNav(p.ip.indexToKey(data.dbg_inline.func).func.owner_nav).name), d.line + 1, d.column + 1 });
             },
-            .dbg_inline_end => {},
+            .dbg_inline_end, .comptime_tick => {},
+            .comptime_quota => try w.print("{d}", .{data.quota}),
+            .comptime_dep => try w.print("{d}", .{data.dep}),
             .ret, .int_from_bool, .int_from_ptr, .error_name, .is_null, .is_non_null, .is_err, .is_non_err, .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => try p.ref(data.un_op),
             .store, .atomic_store, .set_union_tag, .memcpy, .memmove, .memset, .add_wrap, .sub_wrap, .mul_wrap, .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .ptr_elem_val, .slice_elem_val, .array_elem_val => {
                 try p.ref(data.bin_op.lhs);

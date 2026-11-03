@@ -919,6 +919,13 @@ pub fn errorValue(ip: *InternPool, name: String) !u32 {
     return gop.value_ptr.*;
 }
 
+/// Whether `name` has an error value yet.
+pub fn hasErrorValue(ip: *InternPool, name: String) bool {
+    ip.errors_mutex.lockUncancelable(ip.io);
+    defer ip.errors_mutex.unlock(ip.io);
+    return ip.error_map.contains(name);
+}
+
 // ---------------------------------------------------------------------------
 // Interning
 
