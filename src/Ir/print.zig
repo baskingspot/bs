@@ -267,8 +267,8 @@ pub fn printType(ip: *const InternPool, ty: InternPool.Index, w: *Writer) Writer
                 }
                 try w.writeAll("]");
             }
+            if (p.flags.is_allowzero and p.flags.size != .c) try w.writeAll("allowzero ");
             if (p.flags.alignment != 0) try w.print("align({d}) ", .{@as(u64, 1) << (p.flags.alignment - 1)});
-            if (p.flags.is_allowzero) try w.writeAll("allowzero ");
             if (p.flags.is_const) try w.writeAll("const ");
             if (p.flags.is_volatile) try w.writeAll("volatile ");
             try printType(ip, p.child, w);

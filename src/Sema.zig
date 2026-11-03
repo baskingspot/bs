@@ -4419,10 +4419,17 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                         },
                         else => return .fromInterned(try sema.undefValue(dest_ty)),
                     };
-                    return try sema.addTyOp(block, .bitcast, dest_ty, inst);
+                    if (Type.optionalReprIsPtr(ip, s_child) == Type.optionalReprIsPtr(ip, child)) return try sema.addTyOp(block, .bitcast, dest_ty, inst);
+                    // `?*T` to `?*allowzero T`: the null flag moves out of
+                    // the pointer.
+                    try sema.resolveLayout(block, src, dest_ty);
+                    const payload = try sema.coercePtrTo(block, try sema.addTyOp(block, .optional_payload, s_child, inst), child);
+                    const some = try sema.addTyOp(block, .wrap_optional, dest_ty, payload);
+                    const none: Ref = .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = .none } }));
+                    return try sema.select(block, dest_ty, try sema.addUnOp(block, .is_non_null, inst), some, none);
                 }
                 // `?u64` to `?usize`: integers of the same representation.
-                if (sema.sameIntRepr(s_child, child)) {
+                if (sema.sameScalarRepr(s_child, child)) {
                     if (val) |v| switch (ip.indexToKey(v)) {
                         .opt => |o| {
                             const payload: Index = if (o.val == .none) .none else (try sema.coerce(block, child, .fromInterned(o.val), src)).toInterned().?;
@@ -4624,6 +4631,16 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             const tag_ty = info.tag_type;
             if (tag_ty == .none or ip.indexToKey(tag_ty) != .enum_type) return null;
             const tag = (try sema.coerceInner(block, tag_ty, inst, src)) orelse return null;
+            if (sema.resolveValue(tag) == null) {
+                // As upstream: when every field is zero-bit, the union is
+                // its tag.
+                for (info.field_types) |ft| {
+                    if (Type.hasRuntimeBits(ip, ft) or Type.class(ip, ft) == .noreturn) break;
+                } else {
+                    try sema.requireRuntime(block, src);
+                    return try sema.addTyOp(block, .bitcast, dest_ty, tag);
+                }
+            }
             const tv = try sema.resolveConstValue(block, src, tag, "union tag must be comptime-known");
             const i = sema.enumTagIndex(tv).?;
             const field_ty = info.field_types[i];
@@ -4834,6 +4851,7 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     const d = Type.ptrInfo(ip, dest_ty);
     if (s.flags.is_const and !d.flags.is_const) return false;
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
+    if (s.flags.is_allowzero and !d.flags.is_allowzero and d.flags.size != .c) return false;
     if (d.flags.alignment != s.flags.alignment) {
         // The alignment may only decrease.
         const sa = sema.ptrAlignment(s) orelse return false;
@@ -4848,7 +4866,7 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
             (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
     if (s.flags.size == d.flags.size) {
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;
-        if (s.child == d.child or sema.sameIntRepr(s.child, d.child)) return true;
+        if (s.child == d.child or sema.sameScalarRepr(s.child, d.child)) return true;
         // Through a const pointer, a child may gain qualifiers itself
         // (`[]?[*:0]u8` to `[]const ?[*:0]const u8`).
         if (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child)) return true;
@@ -4867,7 +4885,8 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     if (s.flags.size == .many and d.flags.size == .one and d.child == .anyopaque_type) return true;
     // `*[N]T` to `[*]T`.
     if (s.flags.size == .one and d.flags.size == .many) {
-        if (s_array) |a| return a.child == d.child and (d.sentinel == .none or d.sentinel == a.sentinel);
+        if (s_array) |a| return (a.child == d.child or sema.sameScalarRepr(a.child, d.child) or (d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) and
+            (d.sentinel == .none or d.sentinel == a.sentinel);
     }
     return false;
 }
@@ -4875,29 +4894,42 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
 /// Whether an error union payload of type `s` reads in place as a `d`.
 fn payloadCoercibleInMemory(sema: *Sema, s: Index, d: Index) bool {
     const ip = sema.ip;
-    if (s == d or sema.sameIntRepr(s, d)) return true;
+    if (s == d or sema.sameScalarRepr(s, d)) return true;
     if (Type.class(ip, s) == .pointer and Type.class(ip, d) == .pointer) return sema.ptrCoercibleInPlace(s, d);
     if (Type.class(ip, s) == .optional and Type.class(ip, d) == .optional) {
         const sc = Type.childType(ip, s);
         const dc = Type.childType(ip, d);
         if (Type.class(ip, sc) == .pointer and Type.class(ip, dc) == .pointer) return sema.ptrCoercibleInPlace(sc, dc);
-        return sema.sameIntRepr(sc, dc);
+        return sema.sameScalarRepr(sc, dc);
+    }
+    // `*T` as `?*T`: a pointer-like optional is its pointer.
+    if (Type.class(ip, s) == .pointer and Type.class(ip, d) == .optional) {
+        const sp = Type.ptrInfo(ip, s);
+        const dc = Type.childType(ip, d);
+        return sp.flags.size != .slice and sp.flags.size != .c and !sp.flags.is_allowzero and
+            Type.class(ip, dc) == .pointer and Type.optionalReprIsPtr(ip, dc) and sema.ptrCoercibleInPlace(s, dc);
     }
     return false;
 }
 
 /// Whether `a` and `b` are integer types of the same signedness and bits
-/// (`u64` and `usize`), which coerce in memory, as upstream.
-fn sameIntRepr(sema: *Sema, a: Index, b: Index) bool {
+/// (`u64` and `usize`) or float types of the same bits (`f80` and
+/// `c_longdouble`), which coerce in memory, as upstream.
+fn sameScalarRepr(sema: *Sema, a: Index, b: Index) bool {
     const ip = sema.ip;
-    if (Type.class(ip, a) != .int or Type.class(ip, b) != .int) return false;
-    return std.meta.eql(Type.intInfo(ip, a), Type.intInfo(ip, b));
+    const ac = Type.class(ip, a);
+    if (ac != Type.class(ip, b)) return false;
+    return switch (ac) {
+        .int => std.meta.eql(Type.intInfo(ip, a), Type.intInfo(ip, b)),
+        .float => Type.floatBits(ip, a) == Type.floatBits(ip, b),
+        else => false,
+    };
 }
 
 /// Whether a value of type `src` can be read as a `dst` in place, where
 /// `dst` differs only by adding const or volatile to pointers inside it.
 fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
-    if (src == dst or sema.sameIntRepr(src, dst)) return true;
+    if (src == dst or sema.sameScalarRepr(src, dst)) return true;
     const ip = sema.ip;
     const sk = ip.indexToKey(src);
     const dk = ip.indexToKey(dst);
@@ -4973,7 +5005,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     // `*[N]T` to `[]T`.
     if (s.flags.size == .one and d.flags.size == .slice and ip.indexToKey(s.child) == .array_type) {
         const a = ip.indexToKey(s.child).array_type;
-        if (a.child != d.child and !sema.sameIntRepr(a.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) return null;
+        if (a.child != d.child and !sema.sameScalarRepr(a.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) return null;
         // A pointer to a zero-length array coerces to any slice, even a mutable one.
         if (s.flags.is_const and !d.flags.is_const and a.len != 0) return null;
         if (d.sentinel != .none and !sema.sentinelsMatch(a.sentinel, d.sentinel)) return null;
@@ -5008,7 +5040,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     }
     // `[]T` to `[*]T`, keeping a sentinel.
     if (s.flags.size == .slice and d.flags.size == .many) {
-        if (s.child != d.child and !sema.sameIntRepr(s.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
+        if (s.child != d.child and !sema.sameScalarRepr(s.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
         if (s.flags.is_const and !d.flags.is_const) return null;
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return null;
         const raw = try sema.slicePtr(block, inst);
@@ -5051,6 +5083,7 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
         }
         if (a == b or a == .generic_poison_type or b == .generic_poison_type) continue;
         if (Type.class(ip, a) == .pointer and Type.class(ip, b) == .pointer and sema.ptrCoercibleInPlace(b, a)) continue;
+        if (sema.cPtrOptCoercibleInMemory(b, a) or sema.cPtrOptCoercibleInMemory(a, b)) continue;
         return false;
     }
     if (s.return_type == d.return_type or s.return_type == .noreturn_type or s.return_type == .generic_poison_type) return true;
@@ -5095,6 +5128,20 @@ fn fnTypeCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
         return false;
     }
     return true;
+}
+
+/// Whether a C pointer and an optional pointer (`[*c]const u8` and
+/// `?[*:0]const u8`) have the same representation, as upstream's in-memory
+/// coercion allows between `from` and `to`.
+fn cPtrOptCoercibleInMemory(sema: *Sema, from: Index, to: Index) bool {
+    const ip = sema.ip;
+    if (Type.class(ip, from) != .pointer or Type.class(ip, to) != .optional) return false;
+    const c = Type.ptrInfo(ip, from);
+    const child = Type.childType(ip, to);
+    if (c.flags.size != .c or Type.class(ip, child) != .pointer) return false;
+    const o = Type.ptrInfo(ip, child);
+    if (o.flags.size == .slice or o.flags.size == .c or o.child != c.child) return false;
+    return (o.flags.is_const or !c.flags.is_const) and (o.flags.is_volatile or !c.flags.is_volatile);
 }
 
 /// `@TypeOf` a function with an inferred error set names that set, as
@@ -5207,10 +5254,8 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
     if (b == .undefined_type) return a;
     const ca = Type.class(ip, a);
     const cb = Type.class(ip, b);
-    if (ca == .null) return if (cb == .optional) b else sema.optType(b);
-    if (cb == .null) return if (ca == .optional) a else sema.optType(a);
-    if (ca == .optional and cb != .optional) return sema.optType(try sema.peerPair(block, src, Type.childType(ip, a), b));
-    if (cb == .optional and ca != .optional) return sema.optType(try sema.peerPair(block, src, a, Type.childType(ip, b)));
+    // As upstream, error sets come off first, so that an error set and an
+    // optional give `E!?T`.
     if (ca == .error_set and cb == .error_set) return sema.mergeErrorSets(block, src, a, b);
     if (ca == .error_union or cb == .error_union or ca == .error_set or cb == .error_set) {
         const Split = struct { set: Index, payload: Index };
@@ -5229,6 +5274,13 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
         const payload = if (sa.payload == .none) sb.payload else if (sb.payload == .none) sa.payload else try sema.peerPair(block, src, sa.payload, sb.payload);
         return sema.intern(.{ .error_union_type = .{ .error_set_type = set, .payload_type = payload } });
     }
+    // A C pointer absorbs null.
+    if (ca == .null and cb == .pointer and Type.ptrInfo(ip, b).flags.size == .c) return b;
+    if (cb == .null and ca == .pointer and Type.ptrInfo(ip, a).flags.size == .c) return a;
+    if (ca == .null) return if (cb == .optional) b else sema.optType(b);
+    if (cb == .null) return if (ca == .optional) a else sema.optType(a);
+    if (ca == .optional and cb != .optional) return sema.optType(try sema.peerPair(block, src, Type.childType(ip, a), b));
+    if (cb == .optional and ca != .optional) return sema.optType(try sema.peerPair(block, src, a, Type.childType(ip, b)));
     if (ca == .vector or cb == .vector) {
         const elems = struct {
             fn f(p: *InternPool, ty: Index) ?struct { u64, Index } {
@@ -5283,34 +5335,45 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
         try sema.resolveLayout(block, src, u);
         if (sema.ip.structInfo(u).tag_type == e) return u;
     }
-    if (ca == .pointer and cb == .pointer) {
-        // A C pointer peer makes a C pointer, gaining the other's
-        // qualifiers, as upstream's `c_ptr` strategy.
-        const pa = Type.ptrInfo(ip, a);
-        const pb = Type.ptrInfo(ip, b);
-        if ((pa.flags.size == .c or pb.flags.size == .c) and pa.flags.size != .slice and pb.flags.size != .slice) {
-            const child = if (pa.child == pb.child or sema.childCoercibleInMemory(pb.child, pa.child))
-                pa.child
-            else if (sema.childCoercibleInMemory(pa.child, pb.child))
-                pb.child
-            else
-                return sema.fail(block, src, "incompatible types: '{f}' and '{f}'", .{ sema.fmtType(a), sema.fmtType(b) });
-            const al_a = pa.flags.alignment;
-            const al_b = pb.flags.alignment;
-            return sema.ptrType(.{
-                .child = child,
-                .sentinel = if (pa.sentinel == pb.sentinel) pa.sentinel else .none,
-                .flags = .{
-                    .size = .c,
-                    .is_const = pa.flags.is_const or pb.flags.is_const,
-                    .is_volatile = pa.flags.is_volatile or pb.flags.is_volatile,
-                    .alignment = if (al_a == 0) al_b else if (al_b == 0) al_a else @min(al_a, al_b),
-                },
-            });
+    // Upstream's `array` and `tuple` strategies: arrays of one length with
+    // in-memory compatible elements, a tuple of an array's length, and
+    // tuples of one length field by field.
+    if (ca == .array and cb == .array) {
+        const xa = ip.indexToKey(a).array_type;
+        const xb = ip.indexToKey(b).array_type;
+        if (xa.len == xb.len) {
+            const child = if (sema.childCoercibleInMemory(xa.child, xb.child)) xb.child else if (sema.childCoercibleInMemory(xb.child, xa.child)) xa.child else .none;
+            if (child != .none) return sema.intern(.{ .array_type = .{ .len = xa.len, .child = child, .sentinel = if (xa.sentinel == xb.sentinel) xa.sentinel else .none } });
         }
+    }
+    if (ca == .array and cb == .tuple and ip.indexToKey(b).tuple_type.types.len == ip.indexToKey(a).array_type.len) return a;
+    if (cb == .array and ca == .tuple and ip.indexToKey(a).tuple_type.types.len == ip.indexToKey(b).array_type.len) return b;
+    if (ca == .tuple and cb == .tuple) {
+        const ta = ip.indexToKey(a).tuple_type;
+        const tb = ip.indexToKey(b).tuple_type;
+        if (ta.types.len == tb.types.len) {
+            const types = try sema.arena.alloc(Index, ta.types.len);
+            const values = try sema.arena.alloc(Index, ta.types.len);
+            for (types, values, ta.types, tb.types) |*t, *v, x, y| {
+                t.* = try sema.peerPair(block, src, x, y);
+                v.* = .none;
+            }
+            return sema.intern(.{ .tuple_type = .{ .types = types, .values = values } });
+        }
+    }
+    // A function body peered with a pointer acts as a pointer to it.
+    if (ca == .@"fn" and cb == .pointer) return sema.peerPair(block, src, try sema.ptrType(.{ .child = a, .flags = .{ .is_const = true } }), b);
+    if (cb == .@"fn" and ca == .pointer) return sema.peerPair(block, src, a, try sema.ptrType(.{ .child = b, .flags = .{ .is_const = true } }));
+    if (ca == .pointer and cb == .pointer) {
+        // A C pointer wins over other pointers to its element type.
+        if (try sema.peerCPtr(a, b)) |t| return t;
         if (sema.ptrCoercibleInPlace(a, b)) return b;
         if (sema.ptrCoercibleInPlace(b, a)) return a;
         if (try sema.peerPtrs(a, b)) |t| return t;
+        // A pointer to a tuple (`&.{ 'x', 'y' }`) is a pointer to an array
+        // of the other peer's elements.
+        if (try sema.tuplePtrAsArrayPtr(a, b)) |t| return sema.peerPair(block, src, t, b);
+        if (try sema.tuplePtrAsArrayPtr(b, a)) |t| return sema.peerPair(block, src, a, t);
     }
     return sema.fail(block, src, "incompatible types: '{f}' and '{f}'", .{ sema.fmtType(a), sema.fmtType(b) });
 }
@@ -5319,24 +5382,25 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
 /// same element type but different lengths or qualifiers, as upstream's
 /// pointer strategy: a slice (`*const [5:0]u8` and `*const [4:0]u8` give
 /// `[:0]const u8`), or a many-pointer when one peer is one. The sentinel
-/// survives only if both peers have it.
+/// survives only if both peers have it. Qualifiers (const, volatile,
+/// allowzero) combine, also for single pointers to one type.
 fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
     const ip = sema.ip;
-    const Seq = struct { elem: Index, sentinel: Index, size: InternPool.PtrType.Size, p: InternPool.PtrType };
+    const Seq = struct { elem: Index, sentinel: Index, size: InternPool.PtrType.Size, p: InternPool.PtrType, array: bool = false };
     const seq = struct {
         fn f(p_ip: *InternPool, ty: Index) ?Seq {
             const p = p_ip.indexToKey(ty).ptr_type;
-            if (p.packed_offset.host_size != 0 or p.flags.alignment != 0) return null;
+            if (p.packed_offset.host_size != 0) return null;
             return switch (p.flags.size) {
                 .one => if (p_ip.indexToKey(p.child) == .array_type) blk: {
                     const arr = p_ip.indexToKey(p.child).array_type;
-                    break :blk .{ .elem = arr.child, .sentinel = arr.sentinel, .size = .one, .p = p };
+                    break :blk .{ .elem = arr.child, .sentinel = arr.sentinel, .size = .one, .p = p, .array = true };
                 } else if (p_ip.indexToKey(p.child) == .tuple_type and p_ip.indexToKey(p.child).tuple_type.types.len == 0)
                     // `*const struct {}` (from `&.{}`) acts as a pointer
                     // to an empty array of any element type.
-                    .{ .elem = .noreturn_type, .sentinel = .none, .size = .one, .p = p }
+                    .{ .elem = .noreturn_type, .sentinel = .none, .size = .one, .p = p, .array = true }
                 else
-                    null,
+                    .{ .elem = p.child, .sentinel = .none, .size = .one, .p = p },
                 .slice, .many => .{ .elem = p.child, .sentinel = p.sentinel, .size = p.flags.size, .p = p },
                 .c => null,
             };
@@ -5347,8 +5411,10 @@ fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
     if (sa.elem == .noreturn_type) sa.elem = sb.elem;
     if (sb.elem == .noreturn_type) sb.elem = sa.elem;
     if (sa.elem != sb.elem or sa.elem == .noreturn_type) return null;
-    if (sa.p.flags.is_allowzero != sb.p.flags.is_allowzero) return null;
-    const size: InternPool.PtrType.Size = if (sa.size == .many or sb.size == .many) blk: {
+    // Single pointers to one non-array type merge only their qualifiers.
+    const single = sa.size == .one and !sa.array;
+    if (single != (sb.size == .one and !sb.array)) return null;
+    const size: InternPool.PtrType.Size = if (single) .one else if (sa.size == .many or sb.size == .many) blk: {
         if (sa.size == .slice or sb.size == .slice) return null;
         break :blk .many;
     } else .slice;
@@ -5359,9 +5425,62 @@ fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
             .size = size,
             .is_const = sa.p.flags.is_const or sb.p.flags.is_const,
             .is_volatile = sa.p.flags.is_volatile or sb.p.flags.is_volatile,
-            .is_allowzero = sa.p.flags.is_allowzero,
+            .is_allowzero = sa.p.flags.is_allowzero or sb.p.flags.is_allowzero,
+            .alignment = sema.peerAlignment(sa.p, sb.p) orelse return null,
         },
     });
+}
+
+/// The alignment flag of the peer of pointers `a` and `b`: the smaller
+/// alignment, explicit if either is; null if one is unknown.
+fn peerAlignment(sema: *Sema, a: InternPool.PtrType, b: InternPool.PtrType) ?u6 {
+    if (a.flags.alignment == 0 and b.flags.alignment == 0) return 0;
+    const x = sema.ptrAlignment(a) orelse return null;
+    const y = sema.ptrAlignment(b) orelse return null;
+    return @intCast(std.math.log2_int(u64, @min(x, y)) + 1);
+}
+
+/// The peer of a C pointer and another pointer to its element type (or
+/// to an array of it): the C pointer with both peers' qualifiers.
+fn peerCPtr(sema: *Sema, a: Index, b: Index) !?Index {
+    const ip = sema.ip;
+    const pa = Type.ptrInfo(ip, a);
+    const pb = Type.ptrInfo(ip, b);
+    if (pa.flags.size != .c and pb.flags.size != .c) return null;
+    if (pa.flags.size == .slice or pb.flags.size == .slice) return null;
+    const elem = struct {
+        fn f(p_ip: *InternPool, p: InternPool.PtrType) Index {
+            if (p.flags.size == .one and p_ip.indexToKey(p.child) == .array_type) return p_ip.indexToKey(p.child).array_type.child;
+            return p.child;
+        }
+    }.f;
+    const child = if (pa.flags.size == .c) pa.child else pb.child;
+    if (elem(ip, pa) != child or elem(ip, pb) != child) return null;
+    return try sema.ptrType(.{ .child = child, .flags = .{
+        .size = .c,
+        .is_const = pa.flags.is_const or pb.flags.is_const,
+        .is_volatile = pa.flags.is_volatile or pb.flags.is_volatile,
+        .is_allowzero = if (pa.flags.size == .c) pa.flags.is_allowzero else pb.flags.is_allowzero,
+        .alignment = sema.peerAlignment(pa, pb) orelse return null,
+    } });
+}
+
+/// Pointer-to-tuple `ptr_ty` as a pointer to an array of `other`'s element
+/// type, or null if either is not such a pointer.
+fn tuplePtrAsArrayPtr(sema: *Sema, ptr_ty: Index, other: Index) !?Index {
+    const ip = sema.ip;
+    const p = Type.ptrInfo(ip, ptr_ty);
+    if (p.flags.size != .one or ip.indexToKey(p.child) != .tuple_type) return null;
+    const o = Type.ptrInfo(ip, other);
+    const elem = switch (o.flags.size) {
+        .slice, .many => o.child,
+        .one => if (ip.indexToKey(o.child) == .array_type) ip.indexToKey(o.child).array_type.child else return null,
+        .c => return null,
+    };
+    const arr = try sema.intern(.{ .array_type = .{ .len = ip.indexToKey(p.child).tuple_type.types.len, .child = elem } });
+    var info = p;
+    info.child = arr;
+    return try sema.ptrType(info);
 }
 
 // ---------------------------------------------------------------------------
@@ -11524,6 +11643,25 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
                 Type.ptrInfo(p_ip, Type.childType(p_ip, ty)).flags.size != .slice;
         }
     }.f;
+    // An optional slice into a plain pointer gives the slice's pointer,
+    // whose address is zero for null.
+    const op_ty = sema.typeOf(operand);
+    if (Type.class(ip, op_ty) == .optional and Type.class(ip, Type.childType(ip, op_ty)) == .pointer and
+        Type.ptrInfo(ip, Type.childType(ip, op_ty)).flags.size == .slice and
+        Type.class(ip, dest_ty) == .pointer and Type.ptrInfo(ip, dest_ty).flags.size != .slice)
+    {
+        const az = Type.ptrInfo(ip, dest_ty).flags.is_allowzero;
+        if (sema.resolveValue(operand)) |v| {
+            if (!sema.isUndef(v) and ip.indexToKey(v).opt.val == .none) {
+                if (!az) return sema.fail(block, src, "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
+                return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .int, .byte_offset = 0 } }));
+            }
+        } else if (block.want_safety and !az) {
+            try sema.requireRuntime(block, src);
+            try sema.addSafetyCheck(block, try sema.addUnOp(block, .is_non_null, operand), .cast_to_null, .none, .none);
+        }
+        return sema.ptrCastInner(block, src, flags, dest_ty, try sema.optionalPayload(block, src, operand, false));
+    }
     // Optional pointers: null stays null in an optional result; otherwise
     // the pointer must not be null.
     if (optPtr(ip, sema.typeOf(operand))) {
