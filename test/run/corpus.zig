@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -54,6 +54,11 @@ fn lenField(args: anytype) usize {
     return args.len;
 }
 
+// ghostty (terminal/stream_terminal.zig): a struct literal stored into a
+// global optional (or error union) is set at run time.
+var global_opt: ?struct { x: u32, y: []const u8 } = null;
+var global_eu: error{Bad}!struct { x: u32 } = error.Bad;
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -74,5 +79,10 @@ fn main() callconv(.c) noreturn {
     var len: u7 = 9;
     _ = &len;
     rt.printInt(lenField(.{ .len = len }));
+
+    global_opt = .{ .x = 1, .y = "y" };
+    global_eu = .{ .x = 1 };
+    rt.printInt(global_opt.?.x);
+    rt.printInt((global_eu catch unreachable).x);
     rt.exit(0);
 }

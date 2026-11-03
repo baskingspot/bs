@@ -12546,13 +12546,18 @@ fn optionalPayloadPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, safe: bool
     info.child = child;
     if (info.flags.alignment != 0 and sema.naturalAlignment(child) == @as(u64, 1) << (info.flags.alignment - 1)) info.flags.alignment = 0;
     const result_ty = try sema.ptrType(info);
+    // Memory known only at run time (a global `var`) is set and checked
+    // at run time, through its comptime-known address, as upstream.
     if (sema.resolveValue(ptr)) |pv| if (try sema.comptimePtrRoot(pv) != .int) {
         if (set) {
-            try sema.comptimeStore(block, src, pv, try sema.intern(.{ .opt = .{ .ty = p.child, .val = try sema.undefValue(child) } }));
+            if (try sema.comptimePtrRoot(pv) == .comptime_alloc) {
+                try sema.comptimeStore(block, src, pv, try sema.intern(.{ .opt = .{ .ty = p.child, .val = try sema.undefValue(child) } }));
+                return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = 0 } } } }));
+            }
         } else if (try sema.comptimeLoadOrNull(block, src, pv)) |v| {
             if (safe and !sema.isUndef(v) and ip.keyPayload(.opt, v).val == .none) return sema.fail(block, src, "unable to unwrap null", .{});
+            return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = 0 } } } }));
         }
-        return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = 0 } } } }));
     };
     try sema.requireRuntime(block, src);
     if (safe and block.want_safety) {
@@ -12624,7 +12629,8 @@ fn errUnionPayloadPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, set: bool)
     if (Type.class(ip, p.child) != .error_union) return sema.fail(block, src, "expected error union type, found '{f}'", .{sema.fmtType(p.child)});
     const payload_ty = ip.keyPayload(.error_union_type, p.child).payload_type;
     const result_ty = try sema.ptrType(.{ .child = payload_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
-    if (sema.resolveValue(ptr)) |pv| if (try sema.comptimePtrRoot(pv) != .int) {
+    // Setting run-time memory (a global `var`) is a run-time store.
+    if (sema.resolveValue(ptr)) |pv| if (try sema.comptimePtrRoot(pv) != .int and (!set or try sema.comptimePtrRoot(pv) == .comptime_alloc)) {
         if (set) try sema.comptimeStore(block, src, pv, try sema.intern(.{ .error_union = .{ .ty = p.child, .val = .{ .payload = try sema.undefValue(payload_ty) } } }));
         return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = 0 } } } }));
     };
