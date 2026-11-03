@@ -13751,8 +13751,13 @@ noinline fn bcOsr(sema: *Sema, block: *Block, body: []const Zir.Inst.Index) Comp
     const n = b.ir.instructions.len;
     const vals = try gpa.alloc(Index, 2 * n);
     defer gpa.free(vals);
+    const ints = try gpa.alloc(u64, n);
+    defer gpa.free(ints);
     var f: BcFrame = .{
+        .sema = sema,
         .ir = &b.ir,
+        .int_types = b.ints,
+        .ints = ints,
         .vals = vals[0..n],
         .overflow = vals[n..],
         .in_frame = &b.in_frame,
@@ -13960,8 +13965,41 @@ fn bcFinish(sema: *Sema, ok: bool, n_errors: usize, params: []const Zcu.Bytecode
     const body_params = try gpa.dupe(Zcu.BytecodeParam, params);
     errdefer gpa.free(body_params);
     const body = try gpa.create(Zcu.Bytecode);
-    body.* = .{ .ir = ir, .deps = deps, .entry_deps = entry, .params = body_params, .in_frame = in_frame };
+    const ints = try bcInts(gpa, sema.ip, &ir, &in_frame);
+    body.* = .{ .ir = ir, .deps = deps, .entry_deps = entry, .params = body_params, .in_frame = in_frame, .ints = ints };
     return .{ .ready = body };
+}
+
+/// `Bytecode.ints`.
+fn bcInts(gpa: Allocator, ip: *InternPool, ir: *const Ir, in_frame: *const std.DynamicBitSetUnmanaged) Allocator.Error![]Zcu.BcInt {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const ints = try gpa.alloc(Zcu.BcInt, tags.len);
+    for (tags, datas, ints, 0..) |tag, data, *out, i| {
+        out.* = .{};
+        const ty: Index = switch (tag) {
+            .alloc => if (in_frame.isSet(i)) Type.ptrInfo(ip, data.ty).child else continue,
+            .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (in_frame.isSet(i)) ip.indexToKey(data.ty_pl.ty).tuple_type.types[0] else continue,
+            .block, .loop, .cond_br, .switch_br, .br, .repeat, .ret, .unreach, .trap, .comptime_exit => continue,
+            else => ir.typeOfIndex(@fromBackingInt(@intCast(i)), ip),
+        };
+        if (ty == .none or Type.class(ip, ty) != .int) continue;
+        const info = Type.intInfo(ip, ty);
+        if (info.bits == 0 or info.bits > 64) continue;
+        out.* = .{ .ty = ty, .bits = @intCast(info.bits), .signed = info.signedness == .signed };
+    }
+    return ints;
+}
+
+/// `x op y` for wrapping or overflow-checked integer `tag`, null if it
+/// overflows an `i128` (the general path handles it).
+fn bcIntOp(tag: Ir.Inst.Tag, x: i128, y: i128) ?i128 {
+    const r, const o = switch (tag) {
+        .add_wrap, .add_with_overflow => @addWithOverflow(x, y),
+        .sub_wrap, .sub_with_overflow => @subWithOverflow(x, y),
+        else => @mulWithOverflow(x, y),
+    };
+    return if (o == 0) r else null;
 }
 
 /// Sets the dependencies the `comptime_dep` instructions reachable from
@@ -14370,8 +14408,18 @@ fn bcErr(err: CompileError) BcError {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.BcAbort;
 }
 
+/// A frame value held unboxed in `BcFrame.ints` (see `Zcu.BcInt`).
+const bc_unboxed: Index = @fromBackingInt(std.math.maxInt(u32) - 1);
+
 const BcFrame = struct {
+    sema: *Sema,
     ir: *const Ir,
+    /// Per instruction, the integer type its value may be held unboxed
+    /// as (`Bytecode.ints`).
+    int_types: []const Zcu.BcInt,
+    /// For a value `vals` holds as `bc_unboxed`: the low 64 bits of its
+    /// two's complement.
+    ints: []u64,
     /// Each instruction's value; for an `alloc` kept in the frame, the
     /// value it holds.
     vals: []Index,
@@ -14391,9 +14439,44 @@ const BcFrame = struct {
     /// optional or of an error union holding an error, which runtime IR
     /// reads when it masks the result (`opt == x` is `is_non_null(opt)
     /// and payload == x`).
-    fn val(f: *const BcFrame, ref: Ref) Index {
+    fn val(f: *const BcFrame, ref: Ref) Allocator.Error!Index {
         if (ref.toInterned()) |i| return i;
-        return f.vals[@backingInt(ref.toIndex().?)];
+        const j = @backingInt(ref.toIndex().?);
+        const v = f.vals[j];
+        if (v != bc_unboxed) return v;
+        // Boxed where it escapes the frame's integer operations.
+        return f.sema.intValue(f.int_types[j].ty, f.int_types[j].value(f.ints[j]));
+    }
+
+    /// An integer operand's value, if it is one that fits an `i128`
+    /// (unboxed, or an interned integer).
+    fn int(f: *const BcFrame, ref: Ref) ?i128 {
+        const v = if (ref.toInterned()) |c| c else blk: {
+            const j = @backingInt(ref.toIndex().?);
+            const v = f.vals[j];
+            if (v == bc_unboxed) return f.int_types[j].value(f.ints[j]);
+            if (v == .none) return null;
+            break :blk v;
+        };
+        const key = f.sema.ip.indexToKey(v);
+        if (key != .int) return null;
+        return switch (key.int.storage) {
+            .u64 => |x| x,
+            .i64 => |x| x,
+            .big => null,
+        };
+    }
+
+    /// Sets instruction `i`'s value to integer `x`, which fits its type.
+    fn setInt(f: *BcFrame, i: u32, x: i128) void {
+        f.vals[i] = bc_unboxed;
+        f.ints[i] = @truncate(@as(u128, @bitCast(x)));
+    }
+
+    /// Copies the value of frame slot `from` to `to`, unboxed or not.
+    fn copy(f: *BcFrame, to: u32, from: u32) void {
+        f.vals[to] = f.vals[from];
+        f.ints[to] = f.ints[from];
     }
 
     /// The instruction `ref` names if the frame keeps its value.
@@ -14403,8 +14486,8 @@ const BcFrame = struct {
     }
 
     /// An operand that must not be garbage.
-    fn get(f: *const BcFrame, ref: Ref) error{AnalysisFail}!Index {
-        const v = f.val(ref);
+    fn get(f: *const BcFrame, ref: Ref) error{ AnalysisFail, OutOfMemory }!Index {
+        const v = try f.val(ref);
         return if (v == .none) error.AnalysisFail else v;
     }
 };
@@ -14437,8 +14520,13 @@ fn bcRun(sema: *Sema, caller: *Block, src: Src, func: Index, body: *const Zcu.By
     const n = body.ir.instructions.len;
     const vals = try gpa.alloc(Index, 2 * n);
     defer gpa.free(vals);
+    const ints = try gpa.alloc(u64, n);
+    defer gpa.free(ints);
     var f: BcFrame = .{
+        .sema = sema,
         .ir = &body.ir,
+        .int_types = body.ints,
+        .ints = ints,
         .vals = vals[0..n],
         .overflow = vals[n..],
         .in_frame = &body.in_frame,
@@ -14484,25 +14572,120 @@ fn bcExec(sema: *Sema, f: *BcFrame, body: []const Ir.Inst.Index) BcError!BcExit 
         const i = @backingInt(inst);
         const data = datas[i];
         const tag = tags[i];
+        // Integers up to 64 bits stay unboxed in the frame; an operand
+        // that is not such an integer takes the general path below.
+        fast: {
+            const it = f.int_types[i];
+            switch (tag) {
+                .add_wrap, .sub_wrap, .mul_wrap => {
+                    if (it.ty == .none) break :fast;
+                    const x = f.int(data.bin_op.lhs) orelse break :fast;
+                    const y = f.int(data.bin_op.rhs) orelse break :fast;
+                    const r = bcIntOp(tag, x, y) orelse break :fast;
+                    f.setInt(i, it.wrap(r));
+                },
+                .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {
+                    if (it.ty == .none or !f.in_frame.isSet(i)) break :fast;
+                    const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+                    const x = f.int(bin.lhs) orelse break :fast;
+                    const y = f.int(bin.rhs) orelse break :fast;
+                    const r = bcIntOp(tag, x, y) orelse break :fast;
+                    const w = it.wrap(r);
+                    f.setInt(i, w);
+                    f.overflow[i] = if (w != r) .one_u1 else .zero_u1;
+                },
+                .intcast, .trunc => {
+                    if (it.ty == .none) break :fast;
+                    const x = f.int(data.ty_op.operand) orelse break :fast;
+                    const w = it.wrap(x);
+                    // A value that does not fit fails a check the walker reports.
+                    if (tag == .intcast and w != x) return error.BcAbort;
+                    f.setInt(i, w);
+                },
+                .bit_and, .bit_or, .xor => {
+                    if (it.ty == .none) break :fast;
+                    const x = f.int(data.bin_op.lhs) orelse break :fast;
+                    const y = f.int(data.bin_op.rhs) orelse break :fast;
+                    f.setInt(i, switch (tag) {
+                        .bit_and => x & y,
+                        .bit_or => x | y,
+                        else => x ^ y,
+                    });
+                },
+                .not => {
+                    if (it.ty == .none) break :fast;
+                    const x = f.int(data.ty_op.operand) orelse break :fast;
+                    f.setInt(i, it.wrap(~x));
+                },
+                .shl, .shr => {
+                    if (it.ty == .none) break :fast;
+                    const x = f.int(data.bin_op.lhs) orelse break :fast;
+                    const amount = f.int(data.bin_op.rhs) orelse break :fast;
+                    if (amount < 0 or amount >= it.bits) break :fast;
+                    const a: u7 = @intCast(amount);
+                    f.setInt(i, if (tag == .shl) it.wrap(x << a) else x >> a);
+                },
+                .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
+                    if (it.ty == .none) break :fast;
+                    const x = f.int(data.bin_op.lhs) orelse break :fast;
+                    const y = f.int(data.bin_op.rhs) orelse break :fast;
+                    // Division by zero, the overflowing quotient, and
+                    // negative remainders: as the walker folds them.
+                    if (y <= 0 or x < 0) break :fast;
+                    f.setInt(i, switch (tag) {
+                        .div_trunc, .div_floor => @divTrunc(x, y),
+                        .div_ceil => @divTrunc(x + y - 1, y),
+                        else => @rem(x, y),
+                    });
+                },
+                .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+                    const x = f.int(data.bin_op.lhs) orelse break :fast;
+                    const y = f.int(data.bin_op.rhs) orelse break :fast;
+                    f.vals[i] = boolValue(switch (tag) {
+                        .cmp_lt => x < y,
+                        .cmp_lte => x <= y,
+                        .cmp_eq => x == y,
+                        .cmp_gte => x >= y,
+                        .cmp_gt => x > y,
+                        else => x != y,
+                    });
+                },
+                .load => f.copy(i, f.slot(data.ty_op.operand) orelse break :fast),
+                .store => {
+                    const j = f.slot(data.bin_op.lhs) orelse break :fast;
+                    const k = @backingInt(data.bin_op.rhs.toIndex() orelse break :fast);
+                    if (f.vals[k] != bc_unboxed) break :fast;
+                    f.copy(j, k);
+                    f.vals[i] = .void_value;
+                },
+                .struct_field_val => {
+                    const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+                    if (sf.index != 0) break :fast;
+                    f.copy(i, f.slot(sf.operand) orelse break :fast);
+                },
+                else => break :fast,
+            }
+            continue;
+        }
         f.vals[i] = switch (tag) {
             .arg => f.args[data.arg.index],
             // Frame-kept allocs and overflow tuples.
             .alloc => if (f.in_frame.isSet(i)) sema.undefValue(Type.ptrInfo(ip, data.ty).child) catch |e| return bcErr(e) else bcValue(sema, f, tag, data) catch |e| return bcErr(e),
-            .load => if (f.slot(data.ty_op.operand)) |j| f.vals[j] else bcValue(sema, f, tag, data) catch |e| return bcErr(e),
+            .load => bcValue(sema, f, tag, data) catch |e| return bcErr(e),
             .store => if (f.slot(data.bin_op.lhs)) |j| blk: {
-                f.vals[j] = f.get(data.bin_op.rhs) catch return error.BcAbort;
+                f.vals[j] = f.get(data.bin_op.rhs) catch |e| return bcErr(e);
                 break :blk .void_value;
             } else bcValue(sema, f, tag, data) catch |e| return bcErr(e),
             .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (f.in_frame.isSet(i)) blk: {
                 const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
-                const lv = f.get(bin.lhs) catch return error.BcAbort;
-                const r = sema.bcArith(tag, ip.typeOf(lv), lv, f.get(bin.rhs) catch return error.BcAbort) catch |e| return bcErr(e);
+                const lv = f.get(bin.lhs) catch |e| return bcErr(e);
+                const r = sema.bcArith(tag, ip.typeOf(lv), lv, f.get(bin.rhs) catch |e| return bcErr(e)) catch |e| return bcErr(e);
                 f.overflow[i] = sema.intValue(.u1_type, @intFromBool(r.overflow)) catch |e| return bcErr(e);
                 break :blk r.val;
             } else bcValue(sema, f, tag, data) catch |e| return bcErr(e),
             .struct_field_val => blk: {
                 const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
-                if (f.slot(sf.operand)) |j| break :blk if (sf.index == 0) f.vals[j] else f.overflow[j];
+                if (f.slot(sf.operand)) |j| break :blk if (sf.index == 0) try f.val(sf.operand) else f.overflow[j];
                 break :blk bcValue(sema, f, tag, data) catch |e| return bcErr(e);
             },
             .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => continue,
@@ -14541,14 +14724,14 @@ fn bcExec(sema: *Sema, f: *BcFrame, body: []const Ir.Inst.Index) BcError!BcExit 
                 }
             },
             .repeat => return .{ .repeat = data.repeat.loop_inst },
-            .comptime_exit => return .{ .exit = .{ .zir = data.pl_op.payload, .val = f.get(data.pl_op.operand) catch return error.BcAbort } },
-            .br => return .{ .br = .{ .block = data.br.block_inst, .val = f.val(data.br.operand) } },
-            .ret => return .{ .ret = f.get(data.un_op) catch return error.BcAbort },
+            .comptime_exit => return .{ .exit = .{ .zir = data.pl_op.payload, .val = f.get(data.pl_op.operand) catch |e| return bcErr(e) } },
+            .br => return .{ .br = .{ .block = data.br.block_inst, .val = try f.val(data.br.operand) } },
+            .ret => return .{ .ret = f.get(data.un_op) catch |e| return bcErr(e) },
             // A failed safety check, or undefined behavior the walker
             // reports.
             .unreach, .trap => return error.BcAbort,
             .cond_br => {
-                const cond = f.val(data.pl_op.operand);
+                const cond = try f.val(data.pl_op.operand);
                 if (cond != .bool_true and cond != .bool_false) return error.BcAbort;
                 const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
                 const then_body = ir.bodySlice(extra.end, extra.data.then_body_len);
@@ -14556,7 +14739,7 @@ fn bcExec(sema: *Sema, f: *BcFrame, body: []const Ir.Inst.Index) BcError!BcExit 
                 return sema.bcExec(f, if (cond == .bool_true) then_body else else_body);
             },
             .switch_br => {
-                const operand = f.get(data.pl_op.operand) catch return error.BcAbort;
+                const operand = f.get(data.pl_op.operand) catch |e| return bcErr(e);
                 if (sema.isUndef(operand)) return error.BcAbort;
                 const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
                 var at = extra.end;
@@ -14570,18 +14753,18 @@ fn bcExec(sema: *Sema, f: *BcFrame, body: []const Ir.Inst.Index) BcError!BcExit 
                     at += body_len;
                     // Interned values of the same type are equal when
                     // their indices are.
-                    for (items) |item| if (f.val(item) == operand) return sema.bcExec(f, case_body);
+                    for (items) |item| if (try f.val(item) == operand) return sema.bcExec(f, case_body);
                 }
                 return sema.bcExec(f, ir.bodySlice(at, extra.data.else_body_len));
             },
             .call => blk: {
                 const extra = ir.extraData(Ir.Call, data.pl_op.payload);
-                const callee = f.get(data.pl_op.operand) catch return error.BcAbort;
+                const callee = f.get(data.pl_op.operand) catch |e| return bcErr(e);
                 // A panic handler: a failed safety check.
                 if (ip.indexToKey(callee) != .func or extra.data.ret_ty == .noreturn_type) return error.BcAbort;
                 const refs = ir.refSlice(extra.end, extra.data.args_len);
                 const args = try sema.arena.alloc(Index, refs.len);
-                for (refs, args) |r, *a| a.* = f.get(r) catch return error.BcAbort;
+                for (refs, args) |r, *a| a.* = f.get(r) catch |e| return bcErr(e);
                 try sema.bcTick();
                 break :blk sema.callComptime(f.block, f.src, callee, args) catch |e| return bcErr(e);
             },
@@ -14641,10 +14824,10 @@ fn bcValue(sema: *Sema, f: *BcFrame, tag: Ir.Inst.Tag, data: Ir.Inst.Data) Compi
         .int_from_bool => {
             const v = try f.get(data.un_op);
             if (v != .bool_true and v != .bool_false) return abort;
-            return sema.intValue(.u1_type, @intFromBool(v == .bool_true));
+            return if (v == .bool_true) .one_u1 else .zero_u1;
         },
         .not => {
-            const v = f.val(data.ty_op.operand);
+            const v = try f.val(data.ty_op.operand);
             if (v == .none) return .none;
             if (v == .bool_true or v == .bool_false) return boolValue(v == .bool_false);
             if (ip.indexToKey(v) != .int) return abort;
@@ -14665,8 +14848,8 @@ fn bcValue(sema: *Sema, f: *BcFrame, tag: Ir.Inst.Tag, data: Ir.Inst.Data) Compi
             return sema.intern(.{ .aggregate = .{ .ty = data.ty_pl.ty, .storage = .{ .elems = &elems } } });
         },
         .bit_and, .bit_or, .xor => {
-            const lv = f.val(data.bin_op.lhs);
-            const rv = f.val(data.bin_op.rhs);
+            const lv = try f.val(data.bin_op.lhs);
+            const rv = try f.val(data.bin_op.rhs);
             // Garbage masked by the other operand.
             if (tag != .xor and (lv == .none or rv == .none)) {
                 const absorbing: Index = if (tag == .bit_and) .bool_false else .bool_true;
@@ -14719,8 +14902,8 @@ fn bcValue(sema: *Sema, f: *BcFrame, tag: Ir.Inst.Tag, data: Ir.Inst.Data) Compi
             return sema.bigToValue(ty, r.toConst());
         },
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
-            const lv = f.val(data.bin_op.lhs);
-            const rv = f.val(data.bin_op.rhs);
+            const lv = try f.val(data.bin_op.lhs);
+            const rv = try f.val(data.bin_op.rhs);
             if (lv == .none or rv == .none) return .none;
             const lk = ip.indexToKey(lv);
             const rk = ip.indexToKey(rv);

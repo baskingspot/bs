@@ -307,15 +307,29 @@ pass between the two without conversion; a frame value may also be
 "garbage" (the payload of a null optional or the inactive error-union
 side), which runtime IR computes and masks (`opt == x` is
 `is_non_null(opt) and payload == x`) and which aborts the run if used
-otherwise. Unboxed integers in the frame (instead of interned ones) and a
-denser encoding (a flat instruction stream with jump offsets and decoded
-operands) can replace this without touching Sema. They pay off in that
-order: in the prototype's profile, interning integers and decoding keys
-are most of the evaluator's time and the interpreter's own dispatch
-(`bcExec` itself) about a sixth of it, so the encoding is worth changing
-only once unboxing has removed the interning and dispatch is the largest
-remaining share, and only if it is a large share of Sema (the evaluator
-is about 5% of libvaxis's Sema instructions today).
+otherwise.
+
+**Unboxed integers.** `Bytecode.ints` records, per instruction, the
+integer type of 1 to 64 bits its value has (for a frame-kept `alloc`, the
+value it holds; for a frame-kept `*_with_overflow`, the wrapped result).
+Such a value lives in the frame as `bc_unboxed` plus the low 64 bits of
+its two's complement in `BcFrame.ints`: wrapping and overflow-checked
+arithmetic, casts, bitwise operations, shifts, non-negative division,
+and comparisons compute on `i128`s without interning, and frame-kept
+loads and stores copy the representation. A value is boxed (interned)
+only where it leaves those operations: into comptime memory, a call, an
+aggregate, a result, or an instruction without a fast path. Every fast
+path covers only the cases whose result the walker's folding routines
+also give without an error (no division by zero, no negative remainder,
+no shift past the width); anything else takes the general path, which
+folds as the walker does. A denser encoding (a flat instruction stream
+with jump offsets and decoded operands) can replace the IR walk without
+touching Sema. `bcExec` itself, dispatch together with the inlined fast
+paths, is now about a quarter of the evaluator's instructions in the
+grapheme tables, so the encoding becomes the next evaluator step once
+comptime memory and the per-call overhead are cheaper, and only while
+the evaluator is a large share of Sema (about 9% of libvaxis's build
+instructions).
 
 **Comptime memory.** Loads and stores go through Sema's comptime memory
 functions (`comptimeStore`, `comptimeLoadOrNull`, the `MutValue` trees),
@@ -413,11 +427,25 @@ there reaches the threshold, and the cost is code layout of
 the evaluator itself, mostly interning integers and the per-call
 overhead of `computeGraphemeBreak` (about 80 k instructions a call).
 
-**Next steps**, in order of measured payoff: unboxed integers in the
-frame; deoptimization stubs for references the walker has not resolved
-yet; generic calls whose comptime arguments are run-time values in the
-lowered code (uucode's `selectFieldIndexes` loop, refused today); then a
-denser encoding.
+**Measured (unboxed integers and the 64-bit `@bitCast` fast path,
+callgrind instructions for the whole build, against origin/main
+10e4219).** libvaxis text_input 2.636 G → 2.588 G (−1.8%); hello
+883 M → 869 M (−1.6%); the grapheme break table built 8 times
+2.790 G → 2.511 G (−10%). What remains in the tables' evaluator time is
+comptime memory (`comptimeLoadOrNull`, `comptimeStore`,
+`ptrElemPtrVal`, about a sixth), packed-struct `@bitCast`s (about an
+eighth), and per-call overhead (dependency declaration, argument
+checks). On libvaxis the evaluator is now about 9% of the build's
+instructions, while one unit, uucode's generated `table_0_stage2` (a
+47 k-row array of struct literals), takes about 40% of Sema: a literal
+costs about 21 k instructions a row, most of it repeated layout
+dependency declarations, field name lookups, and enum literal coercion.
+
+**Next steps**, in order of measured payoff: large aggregate literals
+(outside the evaluator); deoptimization stubs for references the walker
+has not resolved yet; generic calls whose comptime arguments are
+run-time values in the lowered code (uucode's `selectFieldIndexes` loop,
+refused today); then a denser encoding.
 
 ### CodeGen (`src/codegen/<arch>/`)
 

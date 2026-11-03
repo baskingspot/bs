@@ -134,9 +134,15 @@ pub const Bytecode = struct {
     /// comptime memory, and an `*_with_overflow` read only by
     /// `struct_field_val`, which is never interned as a tuple.
     in_frame: std.DynamicBitSetUnmanaged,
+    /// Per instruction: the integer type of up to 64 bits its value has
+    /// (for a frame-kept `alloc`, the value it holds; for a frame-kept
+    /// `*_with_overflow`, the wrapped result), which the evaluator holds
+    /// unboxed; `ty == .none` for other values.
+    ints: []const BcInt,
 
     pub fn destroy(b: *Bytecode, gpa: Allocator) void {
         b.ir.deinit(gpa);
+        gpa.free(b.ints);
         gpa.free(b.deps);
         gpa.free(b.entry_deps);
         gpa.free(b.params);
@@ -146,6 +152,25 @@ pub const Bytecode = struct {
 };
 
 pub const OsrLoop = struct { file: u32, inst: u32 };
+
+/// An integer type of 1 to 64 bits, for the evaluator's unboxed integers.
+pub const BcInt = struct {
+    ty: InternPool.Index = .none,
+    bits: u8 = 0,
+    signed: bool = false,
+
+    /// The value whose two's complement's low 64 bits are `raw`.
+    pub fn value(t: BcInt, raw: u64) i128 {
+        return if (t.signed) @as(i64, @bitCast(raw)) else raw;
+    }
+
+    /// `x` wrapped to the type.
+    pub fn wrap(t: BcInt, x: i128) i128 {
+        const shift: u7 = @intCast(128 - @as(u8, t.bits));
+        const low = @as(u128, @bitCast(x)) << shift;
+        return if (t.signed) @as(i128, @bitCast(low)) >> shift else @intCast(low >> shift);
+    }
+};
 
 pub const BytecodeParam = struct {
     ty: InternPool.Index,
