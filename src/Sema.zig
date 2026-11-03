@@ -3815,8 +3815,51 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
     if (ca == .pointer and cb == .pointer) {
         if (sema.ptrCoercibleInPlace(a, b)) return b;
         if (sema.ptrCoercibleInPlace(b, a)) return a;
+        if (try sema.peerPtrs(a, b)) |t| return t;
     }
     return sema.fail(block, src, "incompatible types: '{f}' and '{f}'", .{ sema.fmtType(a), sema.fmtType(b) });
+}
+
+/// The peer type of pointers to arrays, slices, and many-pointers with the
+/// same element type but different lengths or qualifiers, as upstream's
+/// pointer strategy: a slice (`*const [5:0]u8` and `*const [4:0]u8` give
+/// `[:0]const u8`), or a many-pointer when one peer is one. The sentinel
+/// survives only if both peers have it.
+fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
+    const ip = sema.ip;
+    const Seq = struct { elem: Index, sentinel: Index, size: InternPool.PtrType.Size, p: InternPool.PtrType };
+    const seq = struct {
+        fn f(p_ip: *InternPool, ty: Index) ?Seq {
+            const p = p_ip.indexToKey(ty).ptr_type;
+            if (p.packed_offset.host_size != 0 or p.flags.alignment != 0) return null;
+            return switch (p.flags.size) {
+                .one => if (p_ip.indexToKey(p.child) == .array_type) blk: {
+                    const arr = p_ip.indexToKey(p.child).array_type;
+                    break :blk .{ .elem = arr.child, .sentinel = arr.sentinel, .size = .one, .p = p };
+                } else null,
+                .slice, .many => .{ .elem = p.child, .sentinel = p.sentinel, .size = p.flags.size, .p = p },
+                .c => null,
+            };
+        }
+    }.f;
+    const sa = seq(ip, a) orelse return null;
+    const sb = seq(ip, b) orelse return null;
+    if (sa.elem != sb.elem) return null;
+    if (sa.p.flags.is_allowzero != sb.p.flags.is_allowzero) return null;
+    const size: InternPool.PtrType.Size = if (sa.size == .many or sb.size == .many) blk: {
+        if (sa.size == .slice or sb.size == .slice) return null;
+        break :blk .many;
+    } else .slice;
+    return try sema.ptrType(.{
+        .child = sa.elem,
+        .sentinel = if (sa.sentinel == sb.sentinel) sa.sentinel else .none,
+        .flags = .{
+            .size = size,
+            .is_const = sa.p.flags.is_const or sb.p.flags.is_const,
+            .is_volatile = sa.p.flags.is_volatile or sb.p.flags.is_volatile,
+            .is_allowzero = sa.p.flags.is_allowzero,
+        },
+    });
 }
 
 // ---------------------------------------------------------------------------
