@@ -454,6 +454,14 @@ pub fn isPackedStruct(ip: *const InternPool, ty: Index) bool {
     return ip.indexToKey(ty) == .struct_type and ip.structInfo(ty).layout == .@"packed";
 }
 
+/// A packed struct or packed union: a value of its backing integer type.
+pub fn isPacked(ip: *const InternPool, ty: Index) bool {
+    return switch (ip.indexToKey(ty)) {
+        .struct_type, .union_type => ip.structInfo(ty).layout == .@"packed",
+        else => false,
+    };
+}
+
 /// The bit offset of field `i` of packed struct `ty` in its backing
 /// integer.
 pub fn packedFieldBitOffset(ip: *const InternPool, ty: Index, i: usize) u16 {
@@ -468,7 +476,7 @@ pub fn packedBits(ip: *const InternPool, ty: Index) ?u16 {
         .void => 0,
         .int, .@"enum" => intInfo(ip, ty).bits,
         .float => floatBits(ip, ty),
-        .@"struct" => if (isPackedStruct(ip, ty)) intInfo(ip, ip.structInfo(ty).tag_type).bits else null,
+        .@"struct", .@"union" => if (isPacked(ip, ty)) intInfo(ip, ip.structInfo(ty).tag_type).bits else null,
         else => null,
     };
 }

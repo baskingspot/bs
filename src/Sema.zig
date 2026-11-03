@@ -522,7 +522,6 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
             .@"packed" => .@"packed",
         };
     } else kind = decl.kind;
-    if (kind == .@"packed" or kind == .packed_explicit) return sema.failUnsupported(&block, src, "packed unions");
     info.status = .field_types_wip;
     if (reify_node == null) {
         const n = decl.field_names.len;
@@ -598,7 +597,30 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
         },
         .auto => info.tag_type = try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n)),
         .@"extern" => {},
-        .@"packed", .packed_explicit => unreachable,
+        .@"packed", .packed_explicit => {
+            // Every field has the backing integer's bit width.
+            info.status = .layout_wip;
+            if (n == 0) return sema.fail(&block, src, "packed union has no fields", .{});
+            for (types) |ft| try sema.resolveLayout(&block, src, ft);
+            const field_bits = try sema.arena.alloc(u16, n);
+            for (types, field_bits) |ft, *b| b.* = Type.packedBits(ip, ft) orelse {
+                if (Type.class(ip, ft) == .pointer) return sema.failUnsupported(&block, src, "pointer fields in packed unions");
+                return sema.fail(&block, src, "packed unions cannot contain fields of type '{f}'", .{sema.fmtType(ft)});
+            };
+            const backing = if (arg_ty != .none) blk: {
+                if (Type.class(ip, arg_ty) != .int) return sema.fail(&block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(arg_ty)});
+                for (field_bits) |b| if (b != Type.intInfo(ip, arg_ty).bits) return sema.fail(&block, src, "field bit width does not match backing integer", .{});
+                break :blk arg_ty;
+            } else blk: {
+                for (field_bits[1..]) |b| if (b != field_bits[0]) return sema.fail(&block, src, "field bit width does not match earlier field", .{});
+                break :blk try sema.intType(.unsigned, field_bits[0]);
+            };
+            info.tag_type = backing;
+            info.size = Type.abiSize(ip, backing);
+            info.alignment = Type.abiAlignment(ip, backing);
+            info.status = .have_layout;
+            return sema.finish();
+        },
     }
     info.has_runtime_tag = info.tag_type != .none and Type.hasRuntimeBits(ip, info.tag_type);
     info.status = .have_field_types;
@@ -2643,7 +2665,7 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk try sema.structValue(block, src, try sema.stdLangType(block, src, "Type.Union"), &[_]S{
                 .{ "layout", try sema.enumValueByName(block, src, try sema.stdLangType(block, src, "Type.ContainerLayout"), @tagName(info.layout)) },
                 .{ "tag_type", try sema.optValue(.type_type, if (tagged) info.tag_type else .none) },
-                .{ "backing_integer", try sema.optValue(.type_type, .none) },
+                .{ "backing_integer", try sema.optValue(.type_type, if (info.layout == .@"packed") info.tag_type else .none) },
                 .{ "field_names", try sema.namesValue(info.field_names) },
                 .{ "field_types", try sema.sliceValue(.type_type, info.field_types) },
                 .{ "field_attrs", try sema.sliceValue(attrs_ty, attrs) },
@@ -5087,8 +5109,8 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
     }
     if (is_eq and (lc == .optional or rc == .optional)) return sema.cmpOptional(block, src, op, lhs, rhs);
     if (is_eq and lt == .void_type and rt == .void_type) return .fromInterned(boolValue(op == .eq));
-    if (is_eq and lt == rt and Type.isPackedStruct(ip, lt)) {
-        // Packed structs compare as their backing integers.
+    if (is_eq and lt == rt and Type.isPacked(ip, lt)) {
+        // Packed structs and unions compare as their backing integers.
         try sema.resolveLayout(block, src, lt);
         const backing = ip.structInfo(lt).tag_type;
         if (sema.resolveValue(lhs)) |a| if (sema.resolveValue(rhs)) |b| {
@@ -5424,7 +5446,7 @@ fn packedToBits(sema: *Sema, block: *Block, val: Ref) CompileError!Ref {
     if (ty == bits_ty) return val;
     var v = val;
     if (Type.class(ip, ty) == .@"enum") v = try sema.addTyOp(block, .bitcast, ip.structInfo(ty).tag_type, v);
-    if (Type.isPackedStruct(ip, ty)) v = try sema.addTyOp(block, .bitcast, ip.structInfo(ty).tag_type, v);
+    if (Type.isPacked(ip, ty)) v = try sema.addTyOp(block, .bitcast, ip.structInfo(ty).tag_type, v);
     if (sema.typeOf(v) == bits_ty) return v;
     return sema.addTyOp(block, .bitcast, bits_ty, v);
 }
@@ -5754,7 +5776,7 @@ fn withElem(sema: *Sema, val: Index, index: u64, elem: Index) !Index {
 
 /// Element `index` of an array, struct, or tuple value, or field 0 (the
 /// payload) of an optional or error union, or a slice's pointer/length.
-fn elemValue(sema: *Sema, val: Index, index: u64) !Index {
+fn elemValue(sema: *Sema, val: Index, index: u64) Allocator.Error!Index {
     const ip = sema.ip;
     const ty = ip.typeOf(val);
     const elem_ty: Index = switch (ip.indexToKey(ty)) {
@@ -5767,6 +5789,12 @@ fn elemValue(sema: *Sema, val: Index, index: u64) !Index {
         .union_type => blk: {
             const ft = ip.structInfo(ty).field_types[@intCast(index)];
             if (ip.indexToKey(val) == .un and ip.indexToKey(val).un.tag == try sema.unionFieldTagValue(ty, @intCast(index))) return ip.indexToKey(val).un.val;
+            if (ip.indexToKey(val) == .un and Type.isPacked(ip, ty)) {
+                // Another field of a packed union: the same bits.
+                var bits = try BigInt.init(sema.arena);
+                try sema.valueBits(ip.indexToKey(val).un.val, &bits, 0);
+                return sema.bitsValue(ft, bits.toConst(), 0);
+            }
             break :blk ft;
         },
         .ptr_type => if (index == 0) blk: {
@@ -5868,6 +5896,7 @@ fn unionRuntimeTag(sema: *Sema, ty: Index, i: u32) !Index {
 fn unionInit(sema: *Sema, block: *Block, src: Src, ty: Index, i: u32, init: Ref) CompileError!Ref {
     if (sema.resolveValue(init)) |v| return .fromInterned(try sema.intern(.{ .un = .{ .ty = ty, .tag = try sema.unionFieldTagValue(ty, i), .val = v } }));
     try sema.requireRuntime(block, src);
+    if (Type.isPacked(sema.ip, ty)) return sema.addTyOp(block, .bitcast, ty, try sema.packedToBits(block, init));
     return sema.addStructField(block, .union_init, ty, init, i);
 }
 
@@ -5879,7 +5908,7 @@ fn unionFieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, i: u32, initial
     const info = ip.structInfo(union_ty);
     const field_ty = info.field_types[i];
     if (sema.resolveValue(ptr)) |pv| if (try sema.comptimePtrRoot(pv) != .int) {
-        if (!initializing) if (try sema.comptimeLoadOrNull(block, src, pv)) |uv| if (ip.indexToKey(uv) == .un) {
+        if (!initializing and info.layout != .@"packed") if (try sema.comptimeLoadOrNull(block, src, pv)) |uv| if (ip.indexToKey(uv) == .un) {
             const active = ip.indexToKey(uv).un.tag;
             if (active != try sema.unionFieldTagValue(union_ty, i)) {
                 const active_i = for (0..info.field_names.len) |k| {
@@ -5982,9 +6011,16 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
             if (sema.resolveValue(lhs)) |v| {
                 const field_ty = ip.structInfo(ty).field_types[i];
                 if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(field_ty));
+                if (Type.isPacked(ip, ty)) return .fromInterned(try sema.fieldValue(v, i));
                 const u = ip.indexToKey(v).un;
                 if (u.tag != try sema.unionFieldTagValue(ty, i)) return sema.fail(block, src, "access of inactive union field '{s}'", .{name});
                 return .fromInterned(u.val);
+            }
+            if (Type.isPacked(ip, ty)) {
+                // Any field: the backing integer's bits.
+                try sema.requireRuntime(block, src);
+                const field_ty = ip.structInfo(ty).field_types[i];
+                return sema.packedFromBits(block, try sema.packedToBits(block, lhs), field_ty);
             }
             return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, try sema.analyzeRef(block, src, lhs), name));
         },
@@ -6378,6 +6414,22 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
                 .bit_offset = bit_offset,
             },
         });
+        if (sema.resolveValue(ptr)) |pv| {
+            if (!sema.isUndef(pv) and try sema.comptimePtrRoot(pv) != .int) {
+                return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = i } } } }));
+            }
+        }
+        try sema.requireRuntime(block, src);
+        return sema.addTyOp(block, .bitcast, result_ty, ptr);
+    }
+    if (ip.indexToKey(p.child) == .union_type and Type.isPacked(ip, p.child)) {
+        // The union's address, alignment, and bit offset, as upstream.
+        try sema.resolveLayout(block, src, p.child);
+        var info = p;
+        info.child = field_ty;
+        const align_bytes: u64 = if (p.flags.alignment != 0) @as(u64, 1) << (p.flags.alignment - 1) else Type.abiAlignment(ip, p.child);
+        info.flags.alignment = if (sema.naturalAlignment(field_ty) == align_bytes) 0 else @intCast(std.math.log2_int(u64, align_bytes) + 1);
+        const result_ty = try sema.ptrType(info);
         if (sema.resolveValue(ptr)) |pv| {
             if (!sema.isUndef(pv) and try sema.comptimePtrRoot(pv) != .int) {
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = i } } } }));
@@ -7953,13 +8005,13 @@ fn bitCastBits(sema: *Sema, ty: Index) ?u64 {
             if (eb != Type.abiSize(ip, v.child) * 8) break :blk null;
             break :blk eb * v.len;
         },
-        .struct_type => if (Type.isPackedStruct(ip, ty)) Type.intInfo(ip, ip.structInfo(ty).tag_type).bits else null,
+        .struct_type, .union_type => if (Type.isPacked(ip, ty)) Type.intInfo(ip, ip.structInfo(ty).tag_type).bits else null,
         else => if (Type.class(ip, ty) == .float) Type.floatBits(ip, ty) else if (ty == .bool_type) 1 else null,
     };
 }
 
 /// ORs the bits of value `v` (see `bitCastBits`) into `out` at bit `offset`.
-fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) !void {
+fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) Allocator.Error!void {
     const ip = sema.ip;
     const ty = ip.typeOf(v);
     var part = try BigInt.init(sema.arena);
@@ -7989,6 +8041,11 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) !void {
             if (sema.isUndef(v)) return;
             return sema.valueBits(ip.indexToKey(v).enum_tag.int, out, offset);
         },
+        // A packed union by its active field.
+        .@"union" => {
+            if (sema.isUndef(v)) return;
+            return sema.valueBits(ip.indexToKey(v).un.val, out, offset);
+        },
         .void => return,
         else => {
             if (sema.isUndef(v)) return; // An undefined element: zeros.
@@ -8002,7 +8059,7 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) !void {
 
 /// The value of type `ty` (see `bitCastBits`) whose bits are those of `bits`
 /// from bit `offset`.
-fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) !Index {
+fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) Allocator.Error!Index {
     const ip = sema.ip;
     var part = try BigInt.init(sema.arena);
     try part.shiftRight(&try bits.toManaged(sema.arena), @intCast(offset));
@@ -8032,6 +8089,7 @@ fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) 
             return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
         },
         .@"enum" => return sema.intern(.{ .enum_tag = .{ .ty = ty, .int = try sema.bitsValue(ip.structInfo(ty).tag_type, bits, offset) } }),
+        .@"union" => return sema.intern(.{ .un = .{ .ty = ty, .tag = try sema.unionFieldTagValue(ty, 0), .val = try sema.bitsValue(ip.structInfo(ty).field_types[0], bits, offset) } }),
         .void => return .void_value,
         else => {
             const info = Type.intInfo(ip, ty);

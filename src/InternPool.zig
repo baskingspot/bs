@@ -265,7 +265,8 @@ pub const ContainerInfo = struct {
     /// for packed structs.
     field_offsets: []const u64 = &.{},
     /// Enums: the integer tag type. Tagged unions: the enum tag type.
-    /// Packed structs: the backing integer type. Otherwise `.none`.
+    /// Packed structs and unions: the backing integer type. Otherwise
+    /// `.none`.
     tag_type: Index = .none,
     /// Enums only: whether the enum is non-exhaustive (`_`).
     nonexhaustive: bool = false,
