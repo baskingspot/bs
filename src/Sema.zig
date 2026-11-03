@@ -4243,11 +4243,17 @@ fn resolveConstString(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileErr
     return bytes;
 }
 
+/// An error set type's names are in the order of their error codes, as
+/// upstream's are in the order its strings were interned (`error{ One,
+/// Two } || error{Three}` lists One, Two, Three). Codes are assigned on
+/// first use and kept by the manifest, so the order is stable across edit
+/// builds of a compilation.
 fn errorSetType(sema: *Sema, names: []InternPool.String) !Index {
     const ip = sema.ip;
+    for (names) |n| _ = try ip.errorValue(n);
     std.mem.sort(InternPool.String, names, ip, struct {
         fn lt(p: *InternPool, a: InternPool.String, b: InternPool.String) bool {
-            return std.mem.order(u8, p.stringSlice(a), p.stringSlice(b)) == .lt;
+            return (p.errorValue(a) catch unreachable) < (p.errorValue(b) catch unreachable);
         }
     }.lt);
     var n: usize = 0;

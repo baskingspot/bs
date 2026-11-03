@@ -1222,7 +1222,11 @@ compilation (`seedErrors` assigns the manifest's names first), so a name's
 code never changes while the compilation directory lives, including names
 only a skipped unit uses. That makes an `error_code(name)` dependency
 unnecessary: a comptime `@intFromError` result cannot go stale, and the
-dependency kind proposed earlier is dropped. New names from re-analyzed
+dependency kind proposed earlier is dropped. An error set type lists its names in
+code order (upstream's is string intern order; both put
+`error{ One, Two } || error{Three}` as One, Two, Three, which
+`@typeInfo` and `@typeName` show), so seeded codes also keep that order
+stable across edit builds. New names from re-analyzed
 units take the next codes and go to the Delta. A function's inferred error
 set is the `func_ies` node: a green function's names come from its payload,
 so `ensureFuncIes` on a skipped function does not analyze its body; a

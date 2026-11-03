@@ -188,8 +188,18 @@ fn main() callconv(.c) noreturn {
     var only_a: error{A} = error.A;
     _ = &only_a;
     oneCode(only_a, @intFromError(error.A));
+    // A merged error set lists its names in the order they were first
+    // used, and @hasDecl sees only `pub` declarations.
+    const merged = @typeInfo(error{ MergeOne, MergeTwo } || error{MergeThree}).error_set.error_names.?;
+    comptime if (merged.len != 3 or merged[1][6] != 'w' or merged[2][6] != 'h') unreachable;
+    comptime if (@hasDecl(Hidden, "secret") or !@hasDecl(Hidden, "open")) unreachable;
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
 }
+
+const Hidden = struct {
+    const secret = 1;
+    pub const open = 2;
+};
 
 fn oneCode(x: error{A}, comptime code: u16) void {
     if (@intFromError(x) != code) @compileError("not comptime-known");
