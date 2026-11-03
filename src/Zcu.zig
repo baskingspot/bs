@@ -93,8 +93,9 @@ exports: std.ArrayList(Export) = .empty,
 /// Files read by `@embedFile`, each once; `Dependee.embed_file` indexes it.
 embed_files: std.StringArrayHashMapUnmanaged(EmbedFile) = .empty,
 /// compiler_rt functions that CodeGen calls, by the stable key of their
-/// declaration; `analyzeAll` resolves each and queues its body.
-rt_helpers: std.StringArrayHashMapUnmanaged(void) = .empty,
+/// declaration; `analyzeAll` resolves each to its declaration (`.none`
+/// until then) and queues its body.
+rt_helpers: std.StringArrayHashMapUnmanaged(InternPool.NavIndex) = .empty,
 /// `zap test`: collect the main module's tests into `builtin.test_functions`.
 is_test: bool = false,
 /// `-fsingle-threaded`: `threadlocal` variables are ordinary globals, as
@@ -880,7 +881,10 @@ pub fn compilerRtKey(buf: *[128]u8, file_name: []const u8, name: []const u8) []c
 /// are analyzed, never compiler_rt's `comptime` export blocks.
 pub fn requestCompilerRtKey(zcu: *Zcu, key: []const u8) ![]const u8 {
     const gop = try zcu.rt_helpers.getOrPut(zcu.gpa, key);
-    if (!gop.found_existing) gop.key_ptr.* = try zcu.arena.allocator().dupe(u8, key);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try zcu.arena.allocator().dupe(u8, key);
+        gop.value_ptr.* = .none;
+    }
     return gop.key_ptr.*;
 }
 
@@ -909,6 +913,12 @@ pub fn compilerRtExport(name: []const u8) ?RtExport {
     return map.get(name);
 }
 
+/// The files analysis starts from: builtin, std (whose start code imports
+/// the root module) and, under `zap test`, the module under test.
+pub fn rootFiles(zcu: *Zcu) [3]?u32 {
+    return .{ 0, zcu.moduleRootFile(.std), zcu.moduleRootFile(zcu.fe.main_module) };
+}
+
 fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
     const no_span: Ast.Span = .{ .start = 0, .end = 0, .main = 0 };
     const rest = key["compiler_rt:".len..];
@@ -924,6 +934,7 @@ fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
     const ns = zcu.ip.structInfo(ty).namespace;
     const nav = zcu.namespaces.items[ns].decls.get(try zcu.ip.getString(tid, name)) orelse
         return zcu.addError(@backingInt(file_index), no_span, "compiler_rt has no function '{s}'", .{name});
+    zcu.rt_helpers.getPtr(key).?.* = nav;
     zcu.ensureNavVal(nav) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return,
@@ -949,14 +960,21 @@ fn sinkFunction(zcu: *Zcu, sink: anytype, ir: Ir) !void {
 pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
     // Upstream's analysis roots: std (whose start code imports the root
     // module) and, under `zap test`, the module under test.
-    _ = try zcu.fileRootType(0);
-    if (zcu.moduleRootFile(.std)) |f| _ = try zcu.fileRootType(f);
-    if (zcu.moduleRootFile(zcu.fe.main_module)) |f| _ = try zcu.fileRootType(f);
+    for (zcu.rootFiles()) |root| if (root) |f| {
+        _ = try zcu.fileRootType(f);
+    };
+    // A lazy edit build also walks the last build's graph from them.
+    const lazy = if (zcu.replay) |r| r.lazy else false;
+    if (lazy) try zcu.replay.?.startWalk();
     var done_exports: usize = 0;
     var done_comptime: usize = 0;
     var done_tests: usize = 0;
     var done_rt: usize = 0;
     while (true) {
+        if (lazy and zcu.replay.?.walking()) {
+            try zcu.replay.?.walk();
+            continue;
+        }
         if (done_comptime < zcu.comptime_decls.count()) {
             const c = zcu.comptime_decls.keys()[done_comptime];
             done_comptime += 1;
@@ -1002,8 +1020,9 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
         }
         if (zcu.next_func == zcu.func_queue.items.len) {
             if (@hasDecl(@TypeOf(sink.*), "sync")) try sink.sync(zcu);
-            if (done_rt == zcu.rt_helpers.count()) break;
-            continue;
+            if (done_rt != zcu.rt_helpers.count()) continue;
+            if (lazy and try zcu.replay.?.settle()) continue;
+            break;
         }
         const func = zcu.func_queue.items[zcu.next_func];
         zcu.next_func += 1;

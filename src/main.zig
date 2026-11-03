@@ -264,6 +264,19 @@ pub const Outcome = union(enum) {
 /// cache. `inputs`, if given, gets every source file the build read, as
 /// absolute paths separated by zero bytes.
 pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8)) !Outcome {
+    const n_inputs = if (inputs) |list| list.items.len else 0;
+    // A lazy edit build whose changes the cache cannot record builds again
+    // eagerly (`Incremental.finishLazy`).
+    return compileReplaying(init, job, inc_opt, out_path, prog, inputs, init.environ_map.get("ZAP_CACHE_REPLAY") orelse "") catch |err| switch (err) {
+        error.LazyFallback => {
+            if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
+            return compileReplaying(init, job, inc_opt, out_path, prog, inputs, "eager");
+        },
+        else => |e| return e,
+    };
+}
+
+fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8) !Outcome {
     const arena = init.arena.allocator();
     const opts = job.opts;
     const env = init.environ_map;
@@ -350,13 +363,14 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     const threads: usize = if (env.get("ZAP_THREADS")) |v| std.fmt.parseInt(usize, v, 10) catch 1 else std.Thread.getCpuCount() catch 1;
     try emit.startPool(@max(threads, 1) - 1);
     const sema_node = prog.start("Analyze and Generate Code", 0);
-    if (inc_opt) |i| try i.beginReplay(&fe, &zcu, &emit, std.mem.eql(u8, env.get("ZAP_CACHE_REPLAY") orelse "", "off"));
+    if (inc_opt) |i| try i.beginReplay(&fe, &zcu, &emit, replay_mode);
     try zcu.analyzeAll(&emit);
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
     stages.markSplit("sema", "codegen", emit.codegen_ns);
     sema_node.end();
     zcu.printUnitTiming();
-    if (is_test) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
+    // A lazy edit build leaves the test list as the last build linked it.
+    if (is_test and !(if (zcu.replay) |r| r.lazy else false)) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {},
     };
@@ -370,11 +384,15 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     if (!ready) return .failed;
     // The cache records the build while it links, and keeps the record
     // only if the link succeeds.
-    if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
-    const linked = try emit.link(init.io, Io.Dir.cwd(), bin_path);
+    // A lazy edit build links from the manifest it appends to.
+    const lazy_linked = if (inc_opt) |i| try i.finishLazy(&fe, &zcu, &emit, Io.Dir.cwd(), bin_path) else null;
+    if (lazy_linked == null) if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
+    const linked = lazy_linked orelse try emit.link(init.io, Io.Dir.cwd(), bin_path);
     stages.mark("link");
-    if (inc_opt) |i| i.finishRecord(linked);
-    if (linked) if (inc_opt) |i| i.noteOutput(Io.Dir.cwd(), bin_path);
+    if (lazy_linked == null) if (inc_opt) |i| {
+        i.finishRecord(linked);
+        if (linked) i.noteOutput(Io.Dir.cwd(), bin_path);
+    };
     stages.mark("cache record (after the link)");
     stages.print();
     if (stages.on) emit.codegen_stats.print("zap: codegen");

@@ -38,6 +38,11 @@ debug: std.ArrayList(Atom.Debug) = .empty,
 content_keys: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty,
 /// Declarations whose data the code refers to; lowered by `finish`.
 navs: std.AutoArrayHashMapUnmanaged(InternPool.NavIndex, void) = .empty,
+/// How many of `navs` were lowered (`lowerNavs`).
+navs_done: usize = 0,
+/// A lazy edit build (`Replay.lazy`): `finish` lowers only this build's
+/// data, and the link's own atoms come from the cache.
+lazy: bool = false,
 /// Error names referenced by `value*` relocations.
 errors: std.AutoArrayHashMapUnmanaged(InternPool.String, void) = .empty,
 /// External symbols the code reads the address of (`@extern`), by name,
@@ -70,6 +75,11 @@ content_uses: std.ArrayList(ContentUse) = .empty,
 /// table), possibly repeated, for the on-disk cache: a unit loaded from it
 /// requests them again.
 unit_refs: std.ArrayList(UnitRef) = .empty,
+/// What the link's own atoms requested (`unit_refs` without a unit).
+link_refs: std.ArrayList(@FieldType(UnitRef, "ref")) = .empty,
+/// The content atoms the link's own atoms used (`content_uses` without a
+/// unit).
+link_content_uses: std.ArrayList(SymbolKey) = .empty,
 /// The owner of atoms added now.
 owner: Owner = .link,
 /// `uavKey`'s results, by value and alignment. Each one's lowering
@@ -277,6 +287,8 @@ pub fn deinit(emit: *Emit) void {
     emit.atom_owners.deinit(gpa);
     emit.content_uses.deinit(gpa);
     emit.unit_refs.deinit(gpa);
+    emit.link_refs.deinit(gpa);
+    emit.link_content_uses.deinit(gpa);
     emit.ssa.deinit(gpa);
     if (emit.bench_irs) |*irs| {
         for (irs.items) |*ir| ir.deinit(gpa);
@@ -632,14 +644,16 @@ pub fn finish(emit: *Emit) !bool {
     // The threads go back to the Io for the cache's recording and the
     // link, which run concurrently.
     if (emit.pool) |pool| stopWorkers(pool);
+    if (emit.lazy) {
+        try emit.lowerNavs();
+        if (emit.failed) return false;
+        if (!emit.grouped) try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
+        return true;
+    }
     // Before the declarations: a slot can request an exported one.
     if (!try emit.lowerExternSlots()) return false;
     if (emit.obj) try emit.findExports();
-    // Lowering a declaration can request more declarations.
-    var i: usize = 0;
-    while (i < emit.navs.count()) : (i += 1) {
-        try emit.lowerNav(emit.navs.keys()[i]);
-    }
+    try emit.lowerNavs();
     if (emit.uses_error_names) try emit.emitErrorNameTable();
 
     var entry: ?SymbolKey = null;
@@ -703,13 +717,21 @@ pub fn useExtern(emit: *Emit, name: []const u8, weak: bool) !SymbolKey {
 
 /// Records that the current unit's code requested `ref`.
 fn addRef(emit: *Emit, ref: @FieldType(UnitRef, "ref")) !void {
-    if (emit.owner == .unit) try emit.unit_refs.append(emit.gpa, .{ .unit = emit.owner.unit, .ref = ref });
+    switch (emit.owner) {
+        .unit => |u| try emit.unit_refs.append(emit.gpa, .{ .unit = u, .ref = ref }),
+        .link => try emit.link_refs.append(emit.gpa, ref),
+        .content => {},
+    }
     if (emit.uav_capturing != 0) try emit.uav_refs.append(emit.gpa, ref);
 }
 
 /// Records that the current unit's code used content atom `key`.
 fn addContentUse(emit: *Emit, key: SymbolKey) !void {
-    if (emit.owner == .unit) try emit.content_uses.append(emit.gpa, .{ .unit = emit.owner.unit, .key = key });
+    switch (emit.owner) {
+        .unit => |u| try emit.content_uses.append(emit.gpa, .{ .unit = u, .key = key }),
+        .link => try emit.link_content_uses.append(emit.gpa, key),
+        .content => {},
+    }
     if (emit.uav_capturing != 0) try emit.uav_uses.append(emit.gpa, key);
 }
 
@@ -1120,6 +1142,19 @@ pub fn uavKey(emit: *Emit, val: Index, alignment: u64) !SymbolKey {
         .uses_len = @intCast(emit.uav_uses.items.len - uses_start - @intFromBool(emit.uav_capturing != 0)),
     });
     return key;
+}
+
+/// Lowers the data of the declarations requested since the last call.
+/// Lowering a declaration can request more declarations. A lazy edit
+/// build leaves out those whose data the cache has
+/// (`Replay.keepsNavData`).
+pub fn lowerNavs(emit: *Emit) !void {
+    while (emit.navs_done < emit.navs.count()) {
+        const nav = emit.navs.keys()[emit.navs_done];
+        emit.navs_done += 1;
+        if (emit.zcu.replay) |r| if (try r.keepsNavData(nav)) continue;
+        try emit.lowerNav(nav);
+    }
 }
 
 fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {

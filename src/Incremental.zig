@@ -215,51 +215,10 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         if (inc.timing) std.debug.print("cache: no input changed and the output is as the last link left it; not relinking ({d:.2} ms, {d} rehashed)\n", .{ ms(t0, now(io)), changed.items.len });
         return true;
     }
-    inc.forgetOutput();
 
-    var pack: Pack = try .open(io, inc.dir);
-    defer pack.close(gpa, io);
-    if (pack.id != m.pack_id) return inc.noRelink("the pack is not the manifest's", .{});
-    for (0..m.bases.len) |i| _ = pack.addBase(gpa, io, inc.dir, m.basePack(i)) catch |err|
-        return inc.noRelink("base pack {s}: {t}", .{ m.basePack(i), err });
-    const in = try m.linkInput(gpa);
-    const files = try gpa.alloc([]const u8, m.fileCount());
-    defer gpa.free(files);
-    for (files, 0..) |*f, i| f.* = m.file(@intCast(i));
-    const input = try pack.linkAtoms(gpa, inc.arch, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
-    defer input.deinit(gpa);
-    const values = try gpa.alloc(Elf.NumberedValue, m.errorCount());
-    defer gpa.free(values);
-    for (values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    const t2 = now(io);
-
-    var diag: Elf.Diagnostic = .{};
-    Elf.linkInput(gpa, io, out_dir, sub_path, input, .{
-        .entry = @fromBackingInt(m.entry),
-        .symbols = .{
-            .atoms = in.numbered,
-            .targets = in.targets,
-            .targets_tail = in.targets_tail,
-            .values = values,
-            .entry = m.entry_symbol,
-            .len = m.symbolLen(),
-        },
-        .diag = &diag,
-        .comp_dir = cwd,
-        .stack_size = inc.stack_size,
-    }) catch |err| switch (err) {
-        // A damaged pack or manifest: build from scratch instead.
-        error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo => return inc.noRelink("{t} (atom '{s}')", .{ err, diag.atom }),
-        else => {
-            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
-            return err;
-        },
-    };
-    inc.noteOutput(out_dir, sub_path);
+    const linked = (try inc.linkFrom(m, out_dir, sub_path)) orelse return false;
     if (inc.timing) std.debug.print("cache: no input changed; relinked {d} atoms in {d:.2} ms (manifest and {d} stats {d:.2}, {d} rehashed; packs mapped and input gathered {d:.2}, link {d:.2})\n", .{
-        in.refs.len, ms(t0, now(io)), m.inputCount(), ms(t0, t1), changed.items.len, ms(t1, t2), ms(t2, now(io)),
+        linked.atoms, ms(t0, now(io)), m.inputCount(), ms(t0, t1), changed.items.len, ms(t1, linked.gathered), ms(linked.gathered, now(io)),
     });
     return true;
 }
@@ -304,6 +263,64 @@ fn forgetOutput(inc: *const Incremental) void {
     inc.dir.deleteFile(inc.io, output_name) catch {};
 }
 
+/// Links manifest `m`'s live atoms from the packs into `sub_path`, and
+/// records the output's stat (`noteOutput`). Returns null, saying why
+/// under `ZAP_CACHE_TIMING`, if the packs or the manifest are damaged.
+fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const u8) !?Linked {
+    const gpa = inc.gpa;
+    const io = inc.io;
+    inc.forgetOutput();
+    var pack: Pack = try .open(io, inc.dir);
+    defer pack.close(gpa, io);
+    if (pack.id != m.pack_id) return inc.noLink("the pack is not the manifest's", .{});
+    for (0..m.bases.len) |i| _ = pack.addBase(gpa, io, inc.dir, m.basePack(i)) catch |err|
+        return inc.noLink("base pack {s}: {t}", .{ m.basePack(i), err });
+    const in = try m.linkInput(gpa);
+    const files = try gpa.alloc([]const u8, m.fileCount());
+    defer gpa.free(files);
+    for (files, 0..) |*f, i| f.* = m.file(@intCast(i));
+    const input = try pack.linkAtoms(gpa, inc.arch, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
+    defer input.deinit(gpa);
+    const values = try gpa.alloc(Elf.NumberedValue, m.errorCount());
+    defer gpa.free(values);
+    for (values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const gathered = now(io);
+
+    var diag: Elf.Diagnostic = .{};
+    Elf.linkInput(gpa, io, out_dir, sub_path, input, .{
+        .entry = @fromBackingInt(m.entry),
+        .symbols = .{
+            .atoms = in.numbered,
+            .targets = in.targets,
+            .targets_tail = in.targets_tail,
+            .values = values,
+            .entry = m.entry_symbol,
+            .len = m.symbolLen(),
+        },
+        .diag = &diag,
+        .comp_dir = cwd,
+        .stack_size = inc.stack_size,
+    }) catch |err| switch (err) {
+        // A damaged pack or manifest: build from scratch instead.
+        error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo => return inc.noLink("{t} (atom '{s}')", .{ err, diag.atom }),
+        else => {
+            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+            return err;
+        },
+    };
+    inc.noteOutput(out_dir, sub_path);
+    return .{ .atoms = in.refs.len, .gathered = gathered };
+}
+
+const Linked = struct { atoms: usize, gathered: Io.Timestamp };
+
+fn noLink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) ?Linked {
+    _ = inc.noRelink(fmt, args);
+    return null;
+}
+
 /// Returns false for `relinkIfUnchanged`, saying why under
 /// `ZAP_CACHE_TIMING`.
 fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bool {
@@ -314,11 +331,14 @@ fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bo
 /// Makes this an edit build: analysis loads the units the edits since the
 /// last build left green from it (see "Edit builds: replaying cached
 /// results" in docs/architecture.md). Call after `seedErrors`, before
-/// analysis. `ZAP_CACHE_REPLAY=off` turns it off.
-pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emit, off: bool) !void {
+/// analysis. `mode` is `ZAP_CACHE_REPLAY`: `off` turns it off, `eager`
+/// loads every green node it can before analysis instead of only those
+/// the build reaches.
+pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emit, mode: []const u8) !void {
     const m = if (inc.prev) |*m| m else return;
-    if (off or inc.verify == .full) return;
-    const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit) catch |err| switch (err) {
+    if (std.mem.eql(u8, mode, "off") or inc.verify == .full) return;
+    const lazy = !std.mem.eql(u8, mode, "eager");
+    const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (inc.timing) std.debug.print("cache: not replaying: {t}\n", .{err});
@@ -328,6 +348,7 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     r.check = inc.check;
     inc.replay = r;
     zcu.replay = r;
+    emit.lazy = lazy;
 }
 
 /// Assigns the last build's error codes first, so that they keep their
@@ -984,6 +1005,591 @@ fn verifyReplay(inc: *Incremental) !void {
     std.process.exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// A lazy edit build's end (step 4b)
+
+/// Ends a lazy edit build (`Replay.lazy`), in place of `startRecord`, the
+/// link, and `finishRecord`: appends what the build changed to the
+/// manifest's log (`recordDelta`), and links from the manifest. Returns
+/// null if this is not a lazy build, else whether it linked, or
+/// `error.LazyFallback` if the log cannot express the build's changes
+/// (the log is then as it was): the caller builds again eagerly.
+pub fn finishLazy(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit, out_dir: Io.Dir, sub_path: []const u8) !?bool {
+    const r = inc.replay orelse return null;
+    if (!r.lazy) return null;
+    const gpa = inc.gpa;
+    const io = inc.io;
+    if (inc.timing) r.printStats();
+    const t0 = now(io);
+    const m = &inc.prev.?;
+    const old_log = m.overlay.len;
+    inc.recordDelta(fe, zcu, emit, r) catch |err| switch (err) {
+        error.Fallback => return inc.fallBack(),
+        else => return err,
+    };
+    const t1 = now(io);
+    // The manifest with the record applied.
+    var now_m = (try Manifest.open(gpa, io, inc.dir)) orelse return error.ManifestGone;
+    defer now_m.close(gpa, io);
+    const linked = try inc.linkFrom(&now_m, out_dir, sub_path) orelse {
+        inc.dropLog(old_log);
+        return inc.fallBack();
+    };
+    const t2 = now(io);
+    var folded = false;
+    if (now_m.shouldFold()) {
+        var b: Manifest.Builder = try .initFrom(gpa, &now_m);
+        defer b.deinit();
+        try b.write(io, inc.dir, now_m.pack_id);
+        folded = true;
+    }
+    if (inc.timing) std.debug.print("cache: recorded the edits in {d:.2} ms; linked {d} atoms from the manifest in {d:.2} ms (gathered {d:.2}){s}\n", .{
+        ms(t0, t1), linked.atoms, ms(t1, now(io)), ms(t1, linked.gathered), if (folded) "; folded the log into a new base" else "",
+    });
+    _ = t2;
+    if (inc.verify == .replay) try inc.verifyReplay();
+    return true;
+}
+
+/// Truncates the manifest's log to `len` bytes, dropping the records
+/// appended since (0: no log).
+fn dropLog(inc: *Incremental, len: u64) void {
+    if (len == 0) return inc.dir.deleteFile(inc.io, "manifest.log") catch {};
+    const f = inc.dir.openFile(inc.io, "manifest.log", .{ .mode = .write_only }) catch return;
+    defer f.close(inc.io);
+    f.setLength(inc.io, len) catch {};
+}
+
+/// Ends the lazy replay, for the caller to build again eagerly.
+fn fallBack(inc: *Incremental) error{LazyFallback} {
+    if (inc.replay) |r| r.destroy();
+    inc.replay = null;
+    return error.LazyFallback;
+}
+
+/// Why `recordDelta` falls back to an eager build, under
+/// `ZAP_CACHE_TIMING`.
+fn lazyFallback(inc: *const Incremental, comptime fmt: []const u8, args: anytype) error{Fallback} {
+    if (inc.timing) std.debug.print("cache: building again eagerly: " ++ fmt ++ "\n", args);
+    return error.Fallback;
+}
+
+/// Appends a lazy edit build's changes to the manifest's log: the nodes of
+/// the units it analyzed and of the dependees whose results changed, the
+/// new atoms (appended to the pack), the changed and new inputs with the
+/// sources and result items that name their instructions mapped to the
+/// new ZIR, new error names, and which nodes are live (`unlinked`) and
+/// which an edit reached without the build deciding them (`stale`).
+fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit, rp: *Replay) !void {
+    const gpa = inc.gpa;
+    const io = inc.io;
+    const ip = &zcu.ip;
+    const m = rp.m;
+    const n_prev = m.nodeCount();
+
+    // What the log cannot express yet: exports that ran again (their
+    // symbols are the link's), and declarations whose data this build
+    // lowered without analyzing them (green, but never lowered before).
+    for (zcu.exports.items) |e| if (e.unit != null) return inc.lazyFallback("an @export ran again", .{});
+    for (emit.atom_owners.items) |owner| switch (owner) {
+        .unit => |u| if (!zcu.deps.contains(u)) return inc.lazyFallback("a declaration's data is new", .{}),
+        .content, .link => {},
+    };
+
+    var g: Graph = .{ .r = .{ .gpa = gpa, .zcu = zcu } };
+    defer g.deinit();
+    const r = &g.r;
+    try g.collect(io, zcu, emit);
+    try g.makeNodes(io, zcu, emit);
+    const nodes = r.nodes.items;
+
+    // Each node's index in the manifest: its own, or a new one.
+    const final = try gpa.alloc(u32, nodes.len);
+    defer gpa.free(final);
+    var n_new: u32 = 0;
+    for (nodes, final) |n, *f| f.* = m.find(n.key) orelse blk: {
+        n_new += 1;
+        break :blk n_prev + n_new - 1;
+    };
+    const new_tags = try gpa.alloc(Tag, n_new);
+    defer gpa.free(new_tags);
+    for (nodes, final) |n, f| if (f >= n_prev) {
+        new_tags[f - n_prev] = n.tag;
+    };
+    // Which nodes to write: the units analyzed, every new node, and
+    // dependees whose results changed (their references too, for
+    // namespaces' roots).
+    var d: Manifest.Delta = .init(gpa, m);
+    defer d.deinit();
+    var node_refs = try g.nodeRefs(emit, &d);
+    defer node_refs.deinit(gpa);
+    const ref_starts = try gpa.alloc(u32, nodes.len + 1);
+    defer gpa.free(ref_starts);
+    {
+        var j: usize = 0;
+        for (0..nodes.len + 1) |ni| {
+            while (j < node_refs.items.len and node_refs.items[j].node < ni) j += 1;
+            ref_starts[ni] = @intCast(j);
+        }
+    }
+    var refs_buf: std.ArrayList(Manifest.Ref) = .empty;
+    defer refs_buf.deinit(gpa);
+    const write = try gpa.alloc(bool, nodes.len);
+    defer gpa.free(write);
+    @memset(write, false);
+    for (r.unit_list.items, r.unit_info) |u, info| {
+        if (zcu.deps.contains(u)) write[info.node] = true;
+    }
+    for (nodes, final, write, 0..) |n, f, *w, ni| {
+        if (n.tag == .link) {
+            w.* = false;
+            continue;
+        }
+        if (f >= n_prev) {
+            w.* = true;
+            continue;
+        }
+        if (w.* or n.tag == .content) continue;
+        switch (n.tag) {
+            .nav_val, .type_layout, .struct_defaults, .func, .comptime_decl => continue,
+            else => {},
+        }
+        // A dependee: its result, and its references.
+        try mappedRefs(gpa, node_refs.items[ref_starts[ni]..ref_starts[ni + 1]], final, &refs_buf);
+        const refs_eql = refsEql(m, m.nodeRefs(f), refs_buf.items, &d);
+        // Namespaces' roots: comptime declarations come and go, but the
+        // link's own atoms list the exports and tests.
+        if (!refs_eql and n.tag == .namespace and !onlyComptimeRootsDiffer(m, m.nodeRefs(f), refs_buf.items, n_prev, new_tags))
+            return inc.lazyFallback("exports or tests changed", .{});
+        if (!refs_eql or m.node(f).result_hash != n.result_hash) w.* = true;
+    }
+    // Tests or exports in a new namespace: as above.
+    for (nodes, final, 0..) |n, f, ni| if (f >= n_prev and n.tag == .namespace) {
+        for (node_refs.items[ref_starts[ni]..ref_starts[ni + 1]]) |nr| {
+            if (nr.ref.kind == .root and nodes[nr.ref.value].tag != .comptime_decl) return inc.lazyFallback("exports or tests changed", .{});
+        }
+    };
+
+    // The atoms of the nodes written, appended to the pack.
+    var new_atoms: std.ArrayList(Atom) = .empty;
+    defer new_atoms.deinit(gpa);
+    var new_debug: std.ArrayList(Atom.Debug) = .empty;
+    defer new_debug.deinit(gpa);
+    const atom_at = try gpa.alloc(u32, emit.atoms.items.len);
+    defer gpa.free(atom_at);
+    for (nodes, write) |n, w| if (w) for (n.atoms) |ai| {
+        atom_at[ai] = @intCast(new_atoms.items.len);
+        if (g.debug_of[ai]) |dbg| {
+            var copy = dbg.*;
+            copy.atom = @intCast(new_atoms.items.len);
+            try new_debug.append(gpa, copy);
+        }
+        try new_atoms.append(gpa, emit.atoms.items[ai]);
+    };
+    const new_refs = try gpa.alloc(Pack.AtomRef, new_atoms.items.len);
+    defer gpa.free(new_refs);
+    if (new_atoms.items.len != 0) try rp.pack.append(gpa, io, new_atoms.items, new_debug.items, new_refs);
+
+    // Inputs: each file's, the changed ones' new stats, and new ones.
+    var path_buf: std.ArrayList(u8) = .empty;
+    defer path_buf.deinit(gpa);
+    const file_inputs = try gpa.alloc(u32, fe.files.items.len);
+    defer gpa.free(file_inputs);
+    var n_inputs = m.inputCount();
+    var changed_input = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_inputs);
+    defer changed_input.deinit(gpa);
+    for (rp.changed.items) |c| changed_input.set(c.input);
+    for (fe.files.items, file_inputs, 0..) |*f, *fi, i| {
+        if (rp.file_inputs.get(@intCast(i))) |in| {
+            fi.* = in;
+            if (!changed_input.isSet(in)) continue;
+        } else {
+            fi.* = n_inputs;
+            n_inputs += 1;
+        }
+        try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+        const known = fi.* < m.inputCount();
+        if (Io.Dir.cwd().statFile(io, path_buf.items, .{})) |stat|
+            try d.setInput(if (known) fi.* else null, path_buf.items, stat, @bitCast(f.content_hash), inc.build_start)
+        else |_|
+            return inc.lazyFallback("{s} is gone", .{path_buf.items});
+    }
+    // Embedded files: by path.
+    const embed_inputs = try gpa.alloc(u32, zcu.embed_files.count());
+    defer gpa.free(embed_inputs);
+    for (zcu.embed_files.values(), embed_inputs) |f, *ei| {
+        try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+        const content_hash: Hash = @bitCast(Frontend.hashSource(f.bytes));
+        const known = rp.by_path.get(path_buf.items);
+        ei.* = known orelse n_inputs;
+        if (known) |in| {
+            if (m.input(in)[0].content_hash == content_hash) continue;
+        } else n_inputs += 1;
+        const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch return inc.lazyFallback("{s} is gone", .{path_buf.items});
+        try d.setInput(known, path_buf.items, stat, content_hash, inc.build_start);
+    }
+
+    // Results, with this build's items after the manifest's: those it
+    // decoded keep their ids.
+    var enc: results.Encoder = .{ .gpa = gpa, .zcu = zcu, .id_base = m.itemCount(), .file_inputs = file_inputs };
+    defer enc.deinit();
+    for (rp.decoder.decoded, 0..) |v, id| if (v != 0) try enc.ids.put(gpa, @fromBackingInt(v - 1), @intCast(id));
+    var result_words: std.ArrayList(u32) = .empty;
+    defer result_words.deinit(gpa);
+    const item_results = try gpa.alloc(Encoded.Ranges, r.unit_list.items.len + r.dependee_list.items.len);
+    defer gpa.free(item_results);
+    _ = try encodeResults(io, r, &enc, &result_words, item_results);
+    const result_of = try gpa.alloc(Encoded.Ranges, nodes.len);
+    defer gpa.free(result_of);
+    @memset(result_of, .{});
+    for (r.unit_info, item_results[0..r.unit_info.len]) |info, res| result_of[info.node] = res;
+    for (r.dependee_info, item_results[r.unit_info.len..]) |info, res| result_of[info.node] = res;
+    try d.addItems(enc.words.items, enc.starts.items);
+
+    // Which nodes are live now: those the walk reached, and those written
+    // with what they depend on.
+    var live = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev + n_new);
+    defer live.deinit(gpa);
+    {
+        var it = rp.visited.iterator(.{});
+        while (it.next()) |i| live.set(i);
+    }
+    for (nodes, final, write) |n, f, w| if (w) {
+        live.set(f);
+        for (n.deps) |e| live.set(final[Manifest.Edge.nodeOf(e)]);
+    };
+    // The link's inputs must not change: the symbols it resolves outside
+    // the atoms, and the error name table.
+    try inc.checkLinkInputs(rp, &live, nodes, final, write, node_refs.items, ref_starts, &d);
+
+    // The nodes.
+    var deps_buf: std.ArrayList(u32) = .empty;
+    defer deps_buf.deinit(gpa);
+    var atom_refs: std.ArrayList(Pack.AtomRef) = .empty;
+    defer atom_refs.deinit(gpa);
+    var symbols: std.ArrayList(Manifest.AtomSymbols) = .empty;
+    defer symbols.deinit(gpa);
+    var n_written: usize = 0;
+    // New nodes go in order, after the manifest's.
+    var order: std.ArrayList(u32) = .empty;
+    defer order.deinit(gpa);
+    for (write, 0..) |w, ni| if (w) try order.append(gpa, @intCast(ni));
+    std.mem.sortUnstable(u32, order.items, final, struct {
+        fn lessThan(f: []const u32, a: u32, b: u32) bool {
+            return f[a] < f[b];
+        }
+    }.lessThan);
+    for (order.items) |ni| {
+        const n = &nodes[ni];
+        const f = final[ni];
+        deps_buf.clearRetainingCapacity();
+        for (n.deps) |e| {
+            const edge: Manifest.Edge = @bitCast(e);
+            try deps_buf.append(gpa, Manifest.Edge.init(final[edge.node], edge.kind));
+        }
+        try mappedRefs(gpa, node_refs.items[ref_starts[ni]..ref_starts[ni + 1]], final, &refs_buf);
+        atom_refs.clearRetainingCapacity();
+        symbols.clearRetainingCapacity();
+        for (n.atoms) |ai| {
+            const a = &emit.atoms.items[ai];
+            try atom_refs.append(gpa, new_refs[atom_at[ai]]);
+            try symbols.append(gpa, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (g.debug_of[ai]) |dbg| dbg.file else null });
+        }
+        var source = n.source;
+        if (source.input != Manifest.Source.no_input) {
+            source.input = if (source.input < file_inputs.len) file_inputs[source.input] else embed_inputs[source.input - file_inputs.len];
+        }
+        const res = result_of[ni];
+        const init: Manifest.NodeInit = .{
+            .key = n.key,
+            .result_hash = n.result_hash,
+            .src_hash = n.src_hash,
+            .tag = @backingInt(n.tag),
+            .deps = deps_buf.items,
+            .atoms = atom_refs.items,
+            .symbols = symbols.items,
+            .refs = refs_buf.items,
+            .source = source,
+            .source_name = n.source_name,
+            .result = result_words.items[res.result[0]..][0..res.result[1]],
+            .subject = result_words.items[res.subject[0]..][0..res.subject[1]],
+            .flags = .{ .unlinked = n.atoms.len != 0 and !live.isSet(f) },
+        };
+        if (f < n_prev) try d.update(f, init) else _ = try d.addNode(init);
+        n_written += 1;
+    }
+    var written = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    defer written.deinit(gpa);
+    for (final, write) |f, w| if (w and f < n_prev) written.set(f);
+    // The nodes this build's graph has: decided, written or not.
+    var in_graph = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    defer in_graph.deinit(gpa);
+    for (final) |f| if (f < n_prev) in_graph.set(f);
+
+    // The others' flags, and the sources and lines in changed inputs.
+    for (0..n_prev) |i_usize| {
+        const i: u32 = @intCast(i_usize);
+        if (written.isSet(i)) continue;
+        const old = m.flags(i);
+        var flags = old;
+        flags.unlinked = m.atoms(i).len != 0 and !live.isSet(i);
+        if (rp.state[i] != .unknown or in_graph.isSet(i)) {
+            flags.stale = false;
+        } else if (rp.outdated.isSet(i) and !rp.dead.isSet(i)) flags.stale = true;
+        if (@as(u8, @bitCast(flags)) != @as(u8, @bitCast(old))) try d.setFlags(i, flags);
+        const src = m.source(i);
+        if (src.input == Manifest.Source.no_input or src.inst == Manifest.Source.no_inst or src.input >= changed_input.bit_length or !changed_input.isSet(src.input)) continue;
+        const inst = rp.mapInst(src.input, @fromBackingInt(src.inst));
+        const new_inst: u32 = if (inst) |x| @backingInt(x) else Manifest.Source.no_inst;
+        if (new_inst != src.inst) try d.setSource(i, .{ .input = src.input, .inst = new_inst });
+    }
+    {
+        var it = rp.refresh.iterator(.{});
+        while (it.next()) |i| if (!written.isSet(i) and live.isSet(i) and m.atoms(@intCast(i)).len != 0) try inc.refreshDebug(rp, &d, @intCast(i));
+    }
+    try inc.remapItems(rp, &d, &changed_input);
+    for (m.errorCount() + 1..ip.error_names.items.len) |code| {
+        const name = ip.error_names.items[code];
+        _ = try d.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
+    }
+    try d.append(io, inc.dir);
+    if (inc.timing) std.debug.print("cache: wrote {d} nodes ({d} new), {d} atoms, {d} items, {d} flags, {d} sources to the log\n", .{
+        n_written, n_new, new_atoms.items.len, enc.starts.items.len, d.flags.items.len, d.sources.items.len,
+    });
+}
+
+/// `refs` (`Recorder` nodes) as manifest references, in `out`, sorted and
+/// deduplicated as a base's are.
+fn mappedRefs(gpa: Allocator, refs: []const NodeRef, final: []const u32, out: *std.ArrayList(Manifest.Ref)) !void {
+    out.clearRetainingCapacity();
+    for (refs) |nr| {
+        var ref = nr.ref;
+        switch (ref.kind) {
+            .func, .nav, .effects, .root => ref.value = final[ref.value],
+            else => {},
+        }
+        try out.append(gpa, ref);
+    }
+    std.mem.sortUnstable(Manifest.Ref, out.items, {}, struct {
+        fn lessThan(_: void, x: Manifest.Ref, y: Manifest.Ref) bool {
+            if (x.kind != y.kind) return @backingInt(x.kind) < @backingInt(y.kind);
+            return x.value < y.value;
+        }
+    }.lessThan);
+    var n: usize = 0;
+    for (out.items) |ref| {
+        if (n != 0 and std.meta.eql(out.items[n - 1], ref)) continue;
+        out.items[n] = ref;
+        n += 1;
+    }
+    out.shrinkRetainingCapacity(n);
+}
+
+/// Whether two nodes' references are the same, names compared by name.
+fn refsEql(m: *const Manifest, old: []const Manifest.Ref, new: []const Manifest.Ref, d: *const Manifest.Delta) bool {
+    _ = d;
+    if (old.len != new.len) return false;
+    for (old, new) |a, b| {
+        if (a.kind != b.kind) return false;
+        switch (a.kind) {
+            .ext, .ext_weak, .rt => if (b.value >= m.refNameCount() or a.value != b.value) return false,
+            .quota, .effects => {},
+            else => if (a.value != b.value) return false,
+        }
+    }
+    return true;
+}
+
+/// Whether a namespace's old and new roots differ only in `comptime`
+/// declarations.
+fn onlyComptimeRootsDiffer(m: *const Manifest, old: []const Manifest.Ref, new: []const Manifest.Ref, n_prev: u32, new_tags: []const Tag) bool {
+    const Ctx = struct {
+        fn other(mm: *const Manifest, refs: []const Manifest.Ref, i: *usize, np: u32, nt: []const Tag) ?u32 {
+            while (i.* < refs.len) : (i.* += 1) {
+                const ref = refs[i.*];
+                if (ref.kind != .root) continue;
+                const tag: Tag = if (ref.value < np) @fromBackingInt(mm.node(ref.value).tag) else nt[ref.value - np];
+                if (tag == .comptime_decl) continue;
+                i.* += 1;
+                return ref.value;
+            }
+            return null;
+        }
+    };
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        const a = Ctx.other(m, old, &i, n_prev, new_tags);
+        const b = Ctx.other(m, new, &j, n_prev, new_tags);
+        if (a == null and b == null) return true;
+        if (a == null or b == null or a.? != b.?) return false;
+    }
+}
+
+/// Falls back if the link's inputs outside the atoms change with the live set:
+/// the symbols it resolves outside the build (`ext`, `ext_weak`), whether
+/// it writes the error name table, and if so, the error names.
+fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSetUnmanaged, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, d: *Manifest.Delta) !void {
+    const gpa = inc.gpa;
+    const m = rp.m;
+    const n_prev = m.nodeCount();
+    const Set = struct {
+        names: std.StringArrayHashMapUnmanaged(void) = .empty,
+        error_names: bool = false,
+
+        fn add(s: *@This(), a: Allocator, kind: Manifest.Ref.Kind, name: []const u8) !void {
+            switch (kind) {
+                .ext => try s.names.put(a, name, {}),
+                // Weak and strong references to one name resolve alike
+                // unless every one is weak.
+                .ext_weak => try s.names.put(a, try std.fmt.allocPrint(a, "{s}\x00weak", .{name}), {}),
+                .error_names => s.error_names = true,
+                else => {},
+            }
+        }
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var old: Set = .{};
+    var new: Set = .{};
+    var written = try std.DynamicBitSetUnmanaged.initEmpty(arena, n_prev);
+    for (final, write) |f, w| if (w and f < n_prev) written.set(f);
+    for (0..n_prev) |i_usize| {
+        const i: u32 = @intCast(i_usize);
+        const is_link = m.node(i).tag == @backingInt(Tag.link);
+        const has_atoms = m.atoms(i).len != 0;
+        const refs = m.nodeRefs(i);
+        if (is_link or (has_atoms and !m.flags(i).unlinked)) for (refs) |ref| try old.add(arena, ref.kind, if (ref.kind == .ext or ref.kind == .ext_weak) m.refName(ref.value) else "");
+        if (written.isSet(i)) continue;
+        if (is_link or (has_atoms and live.isSet(i))) for (refs) |ref| try new.add(arena, ref.kind, if (ref.kind == .ext or ref.kind == .ext_weak) m.refName(ref.value) else "");
+    }
+    for (nodes, write, 0..) |n, w, ni| if (w and n.atoms.len != 0) for (node_refs[ref_starts[ni]..ref_starts[ni + 1]]) |nr| {
+        const name = switch (nr.ref.kind) {
+            .ext, .ext_weak => if (nr.ref.value < m.refNameCount()) m.refName(nr.ref.value) else d.strings.items[d.ref_names.items[nr.ref.value - m.refNameCount()].off..][0..d.ref_names.items[nr.ref.value - m.refNameCount()].len],
+            else => "",
+        };
+        try new.add(arena, nr.ref.kind, name);
+    };
+    // A name both weak and strong in a set counts as strong.
+    for ([_]*Set{ &old, &new }) |s| {
+        var i: usize = 0;
+        while (i < s.names.count()) {
+            const k = s.names.keys()[i];
+            if (std.mem.endsWith(u8, k, "\x00weak") and s.names.contains(k[0 .. k.len - 5])) {
+                s.names.swapRemoveAt(i);
+            } else i += 1;
+        }
+    }
+    if (old.error_names != new.error_names) {
+        return inc.lazyFallback("the error name table comes or goes", .{});
+    }
+    if (new.error_names and rp.zcu.ip.error_names.items.len - 1 != m.errorCount()) {
+        return inc.lazyFallback("the error name table changed", .{});
+    }
+    if (old.names.count() != new.names.count()) {
+        return inc.lazyFallback("external symbols changed", .{});
+    }
+    for (old.names.keys()) |k| if (!new.names.contains(k)) {
+        return inc.lazyFallback("external symbols changed", .{});
+    };
+}
+
+/// Gives the atoms of green function node `i` the lines CodeGen would now
+/// write: its declaration's, and its inlined callees', if they are in
+/// changed inputs (as `Replay.loadFunc` does for an eager build).
+fn refreshDebug(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32) !void {
+    const gpa = inc.gpa;
+    const m = rp.m;
+    var src = m.source(i);
+    var line: ?u32 = null;
+    if (src.input != Manifest.Source.no_input and rp.maps.maps.contains(src.input)) {
+        const inst = rp.mapInst(src.input, @fromBackingInt(src.inst)) orelse return;
+        const file = rp.fileOf(src.input) orelse return;
+        const zir = &rp.zcu.file(file).zir;
+        if (zir.instructions.items(.tag)[@backingInt(inst)] != .declaration) return;
+        line = zir.getDeclaration(inst).src_line;
+        src.inst = @backingInt(inst);
+    }
+    var atoms: std.ArrayList(Atom) = .empty;
+    defer atoms.deinit(gpa);
+    var debug: std.ArrayList(Atom.Debug) = .empty;
+    defer debug.deinit(gpa);
+    var moved = false;
+    for (m.atoms(i)) |ref| {
+        const dec = rp.pack.decode(ref, rp.arch) catch return error.Fallback;
+        if (dec.debug) |dbg| {
+            var copy = dbg;
+            copy.atom = @intCast(atoms.items.len);
+            if (line) |l| if (copy.base_line != l) {
+                moved = true;
+                copy.base_line = l;
+            };
+            if (copy.inlines.len != 0) {
+                copy.inlines = try rp.refreshInlines(&copy);
+                if (copy.inlines.ptr != dbg.inlines.ptr) moved = true;
+            }
+            try debug.append(gpa, copy);
+        }
+        try atoms.append(gpa, dec.atom);
+    }
+    if (!moved) return;
+    const refs = try gpa.alloc(Pack.AtomRef, atoms.items.len);
+    defer gpa.free(refs);
+    try rp.pack.append(gpa, inc.io, atoms.items, debug.items, refs);
+    const symbols = try gpa.alloc(Manifest.AtomSymbols, atoms.items.len);
+    defer gpa.free(symbols);
+    for (symbols, atoms.items) |*s, a| s.* = .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets) };
+    for (debug.items) |dbg| symbols[dbg.atom].file = dbg.file;
+    const n = m.node(i);
+    try d.update(i, .{
+        .key = n.key,
+        .result_hash = n.result_hash,
+        .src_hash = n.src_hash,
+        .tag = n.tag,
+        .deps = m.deps(i),
+        .atoms = refs,
+        .symbols = symbols,
+        .refs = m.nodeRefs(i),
+        .source = src,
+        .source_name = m.sourceName(i),
+        .result = m.result(i),
+        .subject = m.subject(i),
+        .flags = .{},
+    });
+}
+
+/// Rewrites the manifest's result items that name instructions of changed
+/// inputs to name them in the new ZIR (or none, if they are gone), so that
+/// the inputs' new contents describe them.
+fn remapItems(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, changed: *const std.DynamicBitSetUnmanaged) !void {
+    if (changed.count() == 0) return;
+    const gpa = inc.gpa;
+    const m = rp.m;
+    const items = m.resultItems();
+    const n = items.count();
+    const file_of = try gpa.alloc(u32, n);
+    defer gpa.free(file_of);
+    @memset(file_of, std.math.maxInt(u32));
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(gpa);
+    const Ctx = struct {
+        rp: *Replay,
+        changed: *const std.DynamicBitSetUnmanaged,
+        pub fn map(c: @This(), input: u32, inst: u32) ?u32 {
+            if (input >= c.changed.bit_length or !c.changed.isSet(input)) return null;
+            const x = c.rp.mapInst(input, @fromBackingInt(inst)) orelse return Manifest.Source.no_inst;
+            return @backingInt(x);
+        }
+    };
+    for (0..n) |id_usize| {
+        const id: u32 = @intCast(id_usize);
+        const words, const at = items.at(id);
+        out.clearRetainingCapacity();
+        if (try results.remapSource(words, at, id, file_of, &out, gpa, Ctx{ .rp = rp, .changed = changed })) try d.overrideItem(id, out.items);
+    }
+}
+
 /// A recorded build, its manifest written but not placed.
 const Recorded = struct {
     manifest: Io.File.Atomic,
@@ -1002,6 +1608,317 @@ const Recorded = struct {
 
 /// Records a successful build into an unplaced manifest; see
 /// `startRecord`.
+/// A reference `record` adds for `reach`, from a unit, a dependee, or the
+/// link's own atoms.
+const ReachItem = struct {
+    from: union(enum) { ref: Recorder.Ref, link },
+    kind: Manifest.Ref.Kind,
+    to: Recorder.Ref,
+};
+
+/// `from` requested compiler_rt helper `key`: it reaches the helper's
+/// function and its file's roots.
+fn addRtReach(r: *Recorder, items: *std.ArrayList(ReachItem), from: @FieldType(ReachItem, "from"), key: []const u8) !void {
+    const zcu = r.zcu;
+    const ip = &zcu.ip;
+    const nav_index = zcu.rt_helpers.get(key) orelse return;
+    if (nav_index == .none) return;
+    const nav = ip.getNav(nav_index);
+    const root = zcu.file_root_types.items[nav.file];
+    if (root != .none) try items.append(r.gpa, .{ .from = from, .kind = .effects, .to = try r.addDependee(.{ .namespace = ip.structInfo(root).namespace }) });
+    if (nav.status == .resolved and ip.keyTag(nav.val) == .func) try items.append(r.gpa, .{ .from = from, .kind = .func, .to = .{ .unit = try r.addUnit(.{ .func = nav.val }) } });
+}
+
+/// The graph of a build's units, dependees, and atoms that `record`
+/// makes from its Zcu and Emit: `collect` adds and keys every item,
+/// `makeNodes` makes the nodes, their edges, and their atoms' hashes.
+const Graph = struct {
+    r: Recorder,
+    atom_units: []u32 = &.{},
+    dep_units: []u32 = &.{},
+    dep_refs: []Recorder.Ref = &.{},
+    use_units: []u32 = &.{},
+    func_ref_items: [][2]u32 = &.{},
+    unit_ref_items: [][2]u32 = &.{},
+    ies_items: std.ArrayList(Recorder.Ref) = .empty,
+    analyze_items: std.ArrayList(u32) = .empty,
+    reach_items: std.ArrayList(ReachItem) = .empty,
+    quota_items: std.ArrayList([2]u32) = .empty,
+    root_ns_items: std.ArrayList(Recorder.Ref) = .empty,
+    root_nodes: []u32 = &.{},
+    reach_nodes: [][2]u32 = &.{},
+    debug_of: []?*const Atom.Debug = &.{},
+
+    fn deinit(g: *Graph) void {
+        const gpa = g.r.gpa;
+        g.r.deinit();
+        gpa.free(g.atom_units);
+        gpa.free(g.dep_units);
+        gpa.free(g.dep_refs);
+        gpa.free(g.use_units);
+        gpa.free(g.func_ref_items);
+        gpa.free(g.unit_ref_items);
+        g.ies_items.deinit(gpa);
+        g.analyze_items.deinit(gpa);
+        g.reach_items.deinit(gpa);
+        g.quota_items.deinit(gpa);
+        g.root_ns_items.deinit(gpa);
+        gpa.free(g.root_nodes);
+        gpa.free(g.reach_nodes);
+        gpa.free(g.debug_of);
+    }
+
+    fn collect(g: *Graph, io: Io, zcu: *Zcu, emit: *const Emit) !void {
+        const gpa = g.r.gpa;
+        const ip = &zcu.ip;
+        const r = &g.r;
+        // About one node per atom, unit, and dependee.
+        const expected_nodes: u32 = @intCast(emit.atoms.items.len + 2 * zcu.deps.count());
+        try r.nodes.ensureTotalCapacity(gpa, expected_nodes);
+        try r.map.ensureTotalCapacity(gpa, expected_nodes);
+        try r.units.ensureTotalCapacity(gpa, @intCast(zcu.deps.count()));
+        try r.dependees.ensureTotalCapacity(gpa, @intCast(zcu.deps.count()));
+        try r.atom_pairs.ensureTotalCapacity(gpa, emit.atoms.items.len);
+        var n_edges: usize = emit.content_uses.items.len;
+        for (zcu.deps.values()) |dependees| n_edges += dependees.len;
+        try r.edges.ensureTotalCapacity(gpa, n_edges + n_edges / 4);
+
+        // Every distinct unit and dependee, as `Recorder` items, keyed on
+        // every core.
+        g.atom_units = try gpa.alloc(u32, emit.atoms.items.len);
+        for (emit.atom_owners.items, g.atom_units) |owner, *u| u.* = switch (owner) {
+            .unit => |unit| try r.addUnit(unit),
+            .content, .link => Recorder.no_node,
+        };
+        g.dep_units = try gpa.alloc(u32, zcu.deps.count());
+        g.dep_refs = try gpa.alloc(Recorder.Ref, n_edges);
+        var n_refs: usize = 0;
+        for (zcu.deps.keys(), zcu.deps.values(), g.dep_units) |unit, dependees, *u| {
+            u.* = try r.addUnit(unit);
+            for (dependees) |d| {
+                g.dep_refs[n_refs] = try r.addDependee(d);
+                n_refs += 1;
+            }
+        }
+        // Every non-empty inferred error set, read or not: a loaded function
+        // takes its set from this node, and an edit build may add its first
+        // reader (`Replay.loadFunc` reads no node as an empty set).
+        {
+            var it = zcu.inferred_errors.iterator();
+            while (it.next()) |e| if (e.value_ptr.len != 0) {
+                try g.ies_items.append(gpa, try r.addDependee(.{ .func_ies = e.key_ptr.* }));
+            };
+            var it_any = zcu.anyerror_ies.keyIterator();
+            while (it_any.next()) |f| try g.ies_items.append(gpa, try r.addDependee(.{ .func_ies = f.* }));
+        }
+        g.use_units = try gpa.alloc(u32, emit.content_uses.items.len);
+        for (emit.content_uses.items, g.use_units) |use, *u| u.* = try r.addUnit(use.unit);
+        // References: Sema's queued functions and Emit's requests, as unit
+        // items for now.
+        g.func_ref_items = try gpa.alloc([2]u32, zcu.func_refs.count());
+        for (zcu.func_refs.keys(), g.func_ref_items) |fr, *it| it.* = .{ try r.addUnit(fr.from), try r.addUnit(.{ .func = fr.func }) };
+        // Units an edit build must analyze, and generic instances' branch
+        // quotas (see `Manifest.Ref.Kind`).
+        for (zcu.effect_uses.keys()) |use| {
+            const ns = ip.structInfo(use.ty).namespace;
+            if (zcu.namespaces.items[ns].effects and !loadMakes(zcu, use)) try g.analyze_items.append(gpa, try r.addUnit(use.unit));
+        }
+        // What makes the atoms live (`reach`): the roots of each namespace,
+        // the units that make namespaces, and the functions analysis queued
+        // itself (exports, tests, compiler_rt helpers).
+        for (zcu.effect_uses.keys()) |use| try g.reach_items.append(gpa, .{
+            .from = .{ .ref = .{ .unit = try r.addUnit(use.unit) } },
+            .kind = .effects,
+            .to = try r.addDependee(.{ .namespace = ip.structInfo(use.ty).namespace }),
+        });
+        for (zcu.comptime_decls.keys()) |c| try g.reach_items.append(gpa, .{
+            .from = .{ .ref = try r.addDependee(.{ .namespace = c.namespace }) },
+            .kind = .root,
+            .to = .{ .unit = try r.addUnit(.{ .comptime_decl = c }) },
+        });
+        for (zcu.exports.items) |e| {
+            if (e.target != .nav) continue;
+            const nav = ip.getNav(e.target.nav);
+            if (nav.status != .resolved) continue;
+            const target: Recorder.Ref = .{ .unit = try r.addUnit(.{ .nav_val = e.target.nav }) };
+            const from: Recorder.Ref = if (e.unit) |u| .{ .unit = try r.addUnit(u) } else from: {
+                try g.reach_items.append(gpa, .{ .from = .{ .ref = try r.addDependee(.{ .namespace = nav.namespace }) }, .kind = .root, .to = target });
+                break :from target;
+            };
+            if (ip.keyTag(nav.val) == .func) try g.reach_items.append(gpa, .{ .from = .{ .ref = from }, .kind = .func, .to = .{ .unit = try r.addUnit(.{ .func = nav.val }) } });
+        }
+        for (zcu.test_functions.items) |nav_index| {
+            const nav = ip.getNav(nav_index);
+            const target: Recorder.Ref = .{ .unit = try r.addUnit(.{ .nav_val = nav_index }) };
+            try g.reach_items.append(gpa, .{ .from = .{ .ref = try r.addDependee(.{ .namespace = nav.namespace }) }, .kind = .root, .to = target });
+            if (nav.status == .resolved and ip.keyTag(nav.val) == .func) try g.reach_items.append(gpa, .{ .from = .{ .ref = target }, .kind = .func, .to = .{ .unit = try r.addUnit(.{ .func = nav.val }) } });
+        }
+        // A compiler_rt helper's requester reaches its function and the roots
+        // of its file, which `resolveCompilerRt` makes.
+        for (emit.unit_refs.items) |ur| if (ur.ref == .rt) try addRtReach(r, &g.reach_items, .{ .ref = .{ .unit = try r.addUnit(ur.unit) } }, ur.ref.rt);
+        for (emit.link_refs.items) |lr| switch (lr) {
+            .rt => |key| try addRtReach(r, &g.reach_items, .link, key),
+            .nav => |nav| try g.reach_items.append(gpa, .{ .from = .link, .kind = .nav, .to = .{ .unit = try r.addUnit(.{ .nav_val = nav }) } }),
+            else => {},
+        };
+        for (zcu.exports.items) |e| if (e.unit) |unit| try g.analyze_items.append(gpa, try r.addUnit(unit));
+        var it_quota = zcu.branch_quotas.iterator();
+        while (it_quota.next()) |q| if (zcu.deps.contains(.{ .func = q.key_ptr.* }))
+            try g.quota_items.append(gpa, .{ try r.addUnit(.{ .func = q.key_ptr.* }), q.value_ptr.* });
+        g.unit_ref_items = try gpa.alloc([2]u32, emit.unit_refs.items.len);
+        for (emit.unit_refs.items, g.unit_ref_items) |ur, *it| it.* = .{
+            try r.addUnit(ur.unit),
+            if (ur.ref == .nav) try r.addUnit(.{ .nav_val = ur.ref.nav }) else Recorder.no_node,
+        };
+        // The namespaces of the files analysis starts from (`Zcu.analyzeAll`),
+        // which with the link's own atoms are where `reach` starts.
+        for (zcu.rootFiles()) |f| if (f) |file| {
+            const ty = zcu.file_root_types.items[file];
+            if (ty != .none) try g.root_ns_items.append(gpa, try r.addDependee(.{ .namespace = ip.structInfo(ty).namespace }));
+        };
+        try r.prepare(io);
+    }
+
+    fn makeNodes(g: *Graph, io: Io, zcu: *Zcu, emit: *const Emit) !void {
+        const gpa = g.r.gpa;
+        const r = &g.r;
+
+        // Nodes in the order of their first atom, so that a relink lays out
+        // the output as this build did.
+        const link_key = cache.hash(2, &.{@backingInt(Tag.link)});
+        for (emit.atom_owners.items, emit.atoms.items, g.atom_units, 0..) |owner, atom, u, i| {
+            const index = switch (owner) {
+                .unit => try r.unitNode(u),
+                .content => (try r.node(@backingInt(atom.key), .content))[0],
+                .link => (try r.node(link_key, .link))[0],
+            };
+            r.atom_pairs.appendAssumeCapacity(.{ index, @intCast(i) });
+        }
+        var n_refs: usize = 0;
+        for (zcu.deps.keys(), zcu.deps.values(), g.dep_units) |unit, dependees, u| {
+            const index = try r.unitNode(u);
+            // Ascending indices into `dependees`.
+            const conditional = zcu.conditional_deps.get(unit) orelse &.{};
+            var next_conditional: usize = 0;
+            for (g.dep_refs[n_refs..][0..dependees.len], 0..) |ref, j| {
+                const is_conditional = next_conditional < conditional.len and conditional[next_conditional] == j;
+                next_conditional += @intFromBool(is_conditional);
+                try r.edges.append(gpa, .{ index, Recorder.edge(try r.dependeeNode(ref), is_conditional) });
+            }
+            n_refs += dependees.len;
+        }
+        for (emit.content_uses.items, g.use_units) |use, u| {
+            const index = try r.unitNode(u);
+            try r.edges.append(gpa, .{ index, Recorder.edge(r.map.get(@backingInt(use.key)).?, false) });
+        }
+        // Nodes for the references' units, so that every node exists before
+        // the store and manifest passes.
+        for (g.func_ref_items) |it| {
+            _ = try r.unitNode(it[0]);
+            _ = try r.unitNode(it[1]);
+        }
+        for (g.unit_ref_items) |it| {
+            _ = try r.unitNode(it[0]);
+            if (it[1] != Recorder.no_node) _ = try r.unitNode(it[1]);
+        }
+        for (g.analyze_items.items) |*it| it.* = try r.unitNode(it.*);
+        for (g.quota_items.items) |*it| it[0] = try r.unitNode(it[0]);
+        g.root_nodes = try gpa.alloc(u32, g.root_ns_items.items.len);
+        for (g.root_ns_items.items, g.root_nodes) |ref, *n| n.* = try r.dependeeNode(ref);
+        for (g.ies_items.items) |ref| _ = try r.dependeeNode(ref);
+        g.reach_nodes = try gpa.alloc([2]u32, g.reach_items.items.len);
+        for (g.reach_items.items, g.reach_nodes) |it, *rn| rn.* = .{ switch (it.from) {
+            .ref => |f| try r.dependeeNode(f),
+            .link => (try r.node(link_key, .link))[0],
+        }, try r.dependeeNode(it.to) };
+        if (emit.link_content_uses.items.len != 0) {
+            const index = (try r.node(link_key, .link))[0];
+            for (emit.link_content_uses.items) |key| try r.edges.append(gpa, .{ index, Recorder.edge(r.map.get(@backingInt(key)).?, false) });
+        }
+        try r.group();
+
+        // Each atom's debug info, and the atoms' hashes as their owners'
+        // results where nothing else is.
+        g.debug_of = try gpa.alloc(?*const Atom.Debug, emit.atoms.items.len);
+        @memset(g.debug_of, null);
+        for (emit.debug.items) |*d| g.debug_of[d.atom] = d;
+        try forChunks(io, r.nodes.items.len, struct {
+            nodes: []Node,
+            atoms: []const Atom,
+            debug_of: []const ?*const Atom.Debug,
+
+            fn run(c: @This(), lo: usize, hi: usize, _: usize) !void {
+                for (c.nodes[lo..hi]) |*n| switch (n.tag) {
+                    .func, .link, .content => {
+                        var h: Hash = 0;
+                        // What the atoms' records hold besides their contents:
+                        // a store entry is reused only if its records are
+                        // these, byte for byte.
+                        var rest: Hash = 0;
+                        for (n.atoms) |ai| {
+                            const a = &c.atoms[ai];
+                            h = h *% 31 +% contentsHash(a);
+                            rest = rest *% 31 +% cache.hash(@truncate(@backingInt(a.key)), a.name);
+                            if (c.debug_of[ai]) |d| {
+                                h +%= cache.hash(@truncate(h), d.lines);
+                                rest = rest *% 31 +% d.base_line +% cache.hash(6, d.file) +% cache.hash(7, d.name);
+                                rest = rest *% 31 +% cache.hash(8, d.unit);
+                                // Inline calls carry their callees' base lines,
+                                // which move without the caller changing.
+                                if (d.inlines.len | d.patches.len | d.files.len != 0) {
+                                    rest = rest *% 31 +% cache.hash(9, d.files) +% cache.hash(10, d.inline_names) +%
+                                        cache.hash(11, @ptrCast(d.inlines)) +% cache.hash(12, @ptrCast(d.inline_callees)) +% cache.hash(13, @ptrCast(d.patches));
+                                }
+                            }
+                        }
+                        n.result_hash = h;
+                        n.exact_hash = h ^ cache.hash(5, std.mem.asBytes(&rest));
+                    },
+                    else => n.exact_hash = n.result_hash,
+                };
+            }
+        }{ .nodes = r.nodes.items, .atoms = emit.atoms.items, .debug_of = g.debug_of });
+    }
+
+    /// Each node's references, sorted by node and then reference; names
+    /// come from `namer` (a `Manifest.Builder` or `Manifest.Delta`).
+    fn nodeRefs(g: *Graph, emit: *const Emit, namer: anytype) !std.ArrayList(NodeRef) {
+        const gpa = g.r.gpa;
+        const r = &g.r;
+        const ip = &r.zcu.ip;
+        var node_refs: std.ArrayList(NodeRef) = try .initCapacity(gpa, g.func_ref_items.len + g.unit_ref_items.len + g.analyze_items.items.len + g.quota_items.items.len);
+        errdefer node_refs.deinit(gpa);
+        for (g.analyze_items.items) |n| node_refs.appendAssumeCapacity(.{ .node = n, .ref = .{ .kind = .analyze, .value = 0 } });
+        for (g.quota_items.items) |q| node_refs.appendAssumeCapacity(.{ .node = q[0], .ref = .{ .kind = .quota, .value = q[1] } });
+        for (g.func_ref_items) |it| {
+            const from = try r.unitNode(it[0]);
+            const to = try r.unitNode(it[1]);
+            if (from != to) node_refs.appendAssumeCapacity(.{ .node = from, .ref = .{ .kind = .func, .value = to } });
+        }
+        for (emit.unit_refs.items, g.unit_ref_items) |ur, it| node_refs.appendAssumeCapacity(.{ .node = try r.unitNode(it[0]), .ref = switch (ur.ref) {
+            .nav => .{ .kind = .nav, .value = try r.unitNode(it[1]) },
+            .err => |name| .{ .kind = .err, .value = try ip.errorValue(name) },
+            .ext => |e| .{ .kind = if (e.weak) .ext_weak else .ext, .value = try namer.addRefName(e.name) },
+            .rt => |key| .{ .kind = .rt, .value = try namer.addRefName(key) },
+            .error_names => .{ .kind = .error_names, .value = 0 },
+        } });
+        for (g.reach_items.items, g.reach_nodes) |it, rn| if (rn[0] != rn[1]) try node_refs.append(gpa, .{ .node = rn[0], .ref = .{ .kind = it.kind, .value = rn[1] } });
+        std.mem.sortUnstable(NodeRef, node_refs.items, {}, NodeRef.lessThan);
+        return node_refs;
+    }
+};
+
+/// A reference of node `node` (a `Recorder` node).
+const NodeRef = struct {
+    node: u32,
+    ref: Manifest.Ref,
+    fn lessThan(_: void, x: @This(), y: @This()) bool {
+        if (x.node != y.node) return x.node < y.node;
+        if (x.ref.kind != y.ref.kind) return @backingInt(x.ref.kind) < @backingInt(y.ref.kind);
+        return x.ref.value < y.ref.value;
+    }
+};
+
 fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) anyerror!Recorded {
     const gpa = inc.gpa;
     const io = inc.io;
@@ -1011,97 +1928,12 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     var trimming = io.async(Frontend.trimCaches, .{fe});
     defer trimming.await(io);
     const ip = &zcu.ip;
-    var r: Recorder = .{ .gpa = gpa, .zcu = zcu };
-    defer r.deinit();
-    // About one node per atom, unit, and dependee.
-    const expected_nodes: u32 = @intCast(emit.atoms.items.len + 2 * zcu.deps.count());
-    try r.nodes.ensureTotalCapacity(gpa, expected_nodes);
-    try r.map.ensureTotalCapacity(gpa, expected_nodes);
-    try r.units.ensureTotalCapacity(gpa, @intCast(zcu.deps.count()));
-    try r.dependees.ensureTotalCapacity(gpa, @intCast(zcu.deps.count()));
-    try r.atom_pairs.ensureTotalCapacity(gpa, emit.atoms.items.len);
-    var n_edges: usize = emit.content_uses.items.len;
-    for (zcu.deps.values()) |dependees| n_edges += dependees.len;
-    try r.edges.ensureTotalCapacity(gpa, n_edges + n_edges / 4);
-
-    // Every distinct unit and dependee, as `Recorder` items, keyed on
-    // every core.
-    const atom_units = try gpa.alloc(u32, emit.atoms.items.len);
-    defer gpa.free(atom_units);
-    for (emit.atom_owners.items, atom_units) |owner, *u| u.* = switch (owner) {
-        .unit => |unit| try r.addUnit(unit),
-        .content, .link => Recorder.no_node,
-    };
-    const dep_units = try gpa.alloc(u32, zcu.deps.count());
-    defer gpa.free(dep_units);
-    const dep_refs = try gpa.alloc(Recorder.Ref, n_edges);
-    defer gpa.free(dep_refs);
-    var n_refs: usize = 0;
-    for (zcu.deps.keys(), zcu.deps.values(), dep_units) |unit, dependees, *u| {
-        u.* = try r.addUnit(unit);
-        for (dependees) |d| {
-            dep_refs[n_refs] = try r.addDependee(d);
-            n_refs += 1;
-        }
-    }
-    // Every non-empty inferred error set, read or not: a loaded function
-    // takes its set from this node, and an edit build may add its first
-    // reader (`Replay.loadFunc` reads no node as an empty set).
-    var ies_items: std.ArrayList(Recorder.Ref) = .empty;
-    defer ies_items.deinit(gpa);
-    {
-        var it = zcu.inferred_errors.iterator();
-        while (it.next()) |e| if (e.value_ptr.len != 0) {
-            try ies_items.append(gpa, try r.addDependee(.{ .func_ies = e.key_ptr.* }));
-        };
-        var it_any = zcu.anyerror_ies.keyIterator();
-        while (it_any.next()) |f| try ies_items.append(gpa, try r.addDependee(.{ .func_ies = f.* }));
-    }
-    const use_units = try gpa.alloc(u32, emit.content_uses.items.len);
-    defer gpa.free(use_units);
-    for (emit.content_uses.items, use_units) |use, *u| u.* = try r.addUnit(use.unit);
-    // References: Sema's queued functions and Emit's requests, as unit
-    // items for now.
-    const func_ref_items = try gpa.alloc([2]u32, zcu.func_refs.count());
-    defer gpa.free(func_ref_items);
-    for (zcu.func_refs.keys(), func_ref_items) |fr, *it| it.* = .{ try r.addUnit(fr.from), try r.addUnit(.{ .func = fr.func }) };
-    // Units an edit build must analyze, and generic instances' branch
-    // quotas (see `Manifest.Ref.Kind`).
-    var analyze_items: std.ArrayList(u32) = .empty;
-    defer analyze_items.deinit(gpa);
-    for (zcu.effect_uses.keys()) |use| if (!loadMakes(zcu, use)) try analyze_items.append(gpa, try r.addUnit(use.unit));
-    for (zcu.exports.items) |e| if (e.unit) |unit| try analyze_items.append(gpa, try r.addUnit(unit));
-    var quota_items: std.ArrayList([2]u32) = .empty;
-    defer quota_items.deinit(gpa);
-    var it_quota = zcu.branch_quotas.iterator();
-    while (it_quota.next()) |q| if (zcu.deps.contains(.{ .func = q.key_ptr.* }))
-        try quota_items.append(gpa, .{ try r.addUnit(.{ .func = q.key_ptr.* }), q.value_ptr.* });
-    const unit_ref_items = try gpa.alloc([2]u32, emit.unit_refs.items.len);
-    defer gpa.free(unit_ref_items);
-    for (emit.unit_refs.items, unit_ref_items) |ur, *it| it.* = .{
-        try r.addUnit(ur.unit),
-        if (ur.ref == .nav) try r.addUnit(.{ .nav_val = ur.ref.nav }) else Recorder.no_node,
-    };
-    // `ZAP_CACHE_CHECK`: the units analysis starts from, for
-    // `checkReferences`.
-    var root_items: std.ArrayList(u32) = .empty;
-    defer root_items.deinit(gpa);
-    if (inc.check) {
-        for (zcu.comptime_decls.keys()) |c| try root_items.append(gpa, try r.addUnit(.{ .comptime_decl = c }));
-        for (zcu.exports.items) |e| if (e.target == .nav) {
-            try root_items.append(gpa, try r.addUnit(.{ .nav_val = e.target.nav }));
-            const val = ip.getNav(e.target.nav).val;
-            if (ip.keyTag(val) == .func) try root_items.append(gpa, try r.addUnit(.{ .func = val }));
-        };
-        for (zcu.test_functions.items) |nav| {
-            try root_items.append(gpa, try r.addUnit(.{ .nav_val = nav }));
-            const val = ip.getNav(nav).val;
-            if (val != .none and ip.keyTag(val) == .func) try root_items.append(gpa, try r.addUnit(.{ .func = val }));
-        }
-    }
+    var g: Graph = .{ .r = .{ .gpa = gpa, .zcu = zcu } };
+    defer g.deinit();
+    const r = &g.r;
+    try g.collect(io, zcu, emit);
     const t_collect = now(io);
-    try r.prepare(io);
-    const t_keys = now(io);
+    const t_keys = t_collect;
 
     // The units' results, for an edit build to load, encoded on another
     // thread while this one makes the graph and looks up the store.
@@ -1111,98 +1943,15 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     defer result_words.deinit(gpa);
     const item_results = try gpa.alloc(Encoded.Ranges, r.unit_list.items.len + r.dependee_list.items.len);
     defer gpa.free(item_results);
-    var encoding = io.async(encodeResults, .{ io, &r, &enc, &result_words, item_results });
+    var encoding = io.async(encodeResults, .{ io, r, &enc, &result_words, item_results });
     defer if (encoding.cancel(io)) |_| {} else |_| {};
 
-    // Nodes in the order of their first atom, so that a relink lays out
-    // the output as this build did.
-    const link_key = cache.hash(2, &.{@backingInt(Tag.link)});
-    for (emit.atom_owners.items, emit.atoms.items, atom_units, 0..) |owner, atom, u, i| {
-        const index = switch (owner) {
-            .unit => try r.unitNode(u),
-            .content => (try r.node(@backingInt(atom.key), .content))[0],
-            .link => (try r.node(link_key, .link))[0],
-        };
-        r.atom_pairs.appendAssumeCapacity(.{ index, @intCast(i) });
-    }
-    n_refs = 0;
-    for (zcu.deps.keys(), zcu.deps.values(), dep_units) |unit, dependees, u| {
-        const index = try r.unitNode(u);
-        // Ascending indices into `dependees`.
-        const conditional = zcu.conditional_deps.get(unit) orelse &.{};
-        var next_conditional: usize = 0;
-        for (dep_refs[n_refs..][0..dependees.len], 0..) |ref, j| {
-            const is_conditional = next_conditional < conditional.len and conditional[next_conditional] == j;
-            next_conditional += @intFromBool(is_conditional);
-            try r.edges.append(gpa, .{ index, Recorder.edge(try r.dependeeNode(ref), is_conditional) });
-        }
-        n_refs += dependees.len;
-    }
-    for (emit.content_uses.items, use_units) |use, u| {
-        const index = try r.unitNode(u);
-        try r.edges.append(gpa, .{ index, Recorder.edge(r.map.get(@backingInt(use.key)).?, false) });
-    }
-    // Nodes for the references' units, so that every node exists before
-    // the store and manifest passes.
-    for (func_ref_items) |it| {
-        _ = try r.unitNode(it[0]);
-        _ = try r.unitNode(it[1]);
-    }
-    for (unit_ref_items) |it| {
-        _ = try r.unitNode(it[0]);
-        if (it[1] != Recorder.no_node) _ = try r.unitNode(it[1]);
-    }
-    for (analyze_items.items) |*it| it.* = try r.unitNode(it.*);
-    for (quota_items.items) |*it| it[0] = try r.unitNode(it[0]);
-    for (root_items.items) |*it| it.* = try r.unitNode(it.*);
-    for (ies_items.items) |ref| _ = try r.dependeeNode(ref);
-    try r.group();
-
-    // Each atom's debug info, and the atoms' hashes as their owners'
-    // results where nothing else is.
-    const debug_of = try gpa.alloc(?*const Atom.Debug, emit.atoms.items.len);
-    defer gpa.free(debug_of);
-    @memset(debug_of, null);
-    for (emit.debug.items) |*d| debug_of[d.atom] = d;
-    try forChunks(io, r.nodes.items.len, struct {
-        nodes: []Node,
-        atoms: []const Atom,
-        debug_of: []const ?*const Atom.Debug,
-
-        fn run(c: @This(), lo: usize, hi: usize, _: usize) !void {
-            for (c.nodes[lo..hi]) |*n| switch (n.tag) {
-                .func, .link, .content => {
-                    var h: Hash = 0;
-                    // What the atoms' records hold besides their contents:
-                    // a store entry is reused only if its records are
-                    // these, byte for byte.
-                    var rest: Hash = 0;
-                    for (n.atoms) |ai| {
-                        const a = &c.atoms[ai];
-                        h = h *% 31 +% contentsHash(a);
-                        rest = rest *% 31 +% cache.hash(@truncate(@backingInt(a.key)), a.name);
-                        if (c.debug_of[ai]) |d| {
-                            h +%= cache.hash(@truncate(h), d.lines);
-                            rest = rest *% 31 +% d.base_line +% cache.hash(6, d.file) +% cache.hash(7, d.name);
-                            rest = rest *% 31 +% cache.hash(8, d.unit);
-                            // Inline calls carry their callees' base lines,
-                            // which move without the caller changing.
-                            if (d.inlines.len | d.patches.len | d.files.len != 0) {
-                                rest = rest *% 31 +% cache.hash(9, d.files) +% cache.hash(10, d.inline_names) +%
-                                    cache.hash(11, @ptrCast(d.inlines)) +% cache.hash(12, @ptrCast(d.inline_callees)) +% cache.hash(13, @ptrCast(d.patches));
-                            }
-                        }
-                    }
-                    n.result_hash = h;
-                    n.exact_hash = h ^ cache.hash(5, std.mem.asBytes(&rest));
-                },
-                else => n.exact_hash = n.result_hash,
-            };
-        }
-    }{ .nodes = r.nodes.items, .atoms = emit.atoms.items, .debug_of = debug_of });
+    try g.makeNodes(io, zcu, emit);
+    const root_nodes = g.root_nodes;
+    const debug_of = g.debug_of;
     const t1 = now(io);
 
-    if (inc.check) inc.checkPrediction(&r, fe);
+    if (inc.check) inc.checkPrediction(r, fe);
 
     // Store: find equal entries on every core; the others go into one new
     // pack, encoded straight into the file on other threads while this one
@@ -1289,7 +2038,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     @memset(result_of, .{});
     for (r.unit_info, item_results[0..r.unit_info.len]) |info, res| result_of[info.node] = res;
     for (r.dependee_info, item_results[r.unit_info.len..]) |info, res| result_of[info.node] = res;
-    if (inc.check and !checkResults(gpa, zcu, &r, &enc, result_words.items, result_of, encoded.unencodable)) inc.check_failed.store(true, .monotonic);
+    if (inc.check and !checkResults(gpa, zcu, r, &enc, result_words.items, result_of, encoded.unencodable)) inc.check_failed.store(true, .monotonic);
     const t2 = now(io);
     var committing = io.async(Putter.writePack, .{ putter, io, entries.items, end, new_name != null });
     defer if (committing.cancel(io)) |_| {} else |_| {};
@@ -1304,33 +2053,8 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     var n_targets: usize = 0;
     for (emit.atoms.items) |*a| n_targets += a.targets.len;
     try b.ensureUnusedCapacity(emit.atoms.items.len, n_targets);
-    // Each node's references, sorted by node and deduplicated.
-    const NodeRef = struct {
-        node: u32,
-        ref: Manifest.Ref,
-        fn lessThan(_: void, x: @This(), y: @This()) bool {
-            if (x.node != y.node) return x.node < y.node;
-            if (x.ref.kind != y.ref.kind) return @backingInt(x.ref.kind) < @backingInt(y.ref.kind);
-            return x.ref.value < y.ref.value;
-        }
-    };
-    var node_refs: std.ArrayList(NodeRef) = try .initCapacity(gpa, func_ref_items.len + unit_ref_items.len + analyze_items.items.len + quota_items.items.len);
+    var node_refs = try g.nodeRefs(emit, &b);
     defer node_refs.deinit(gpa);
-    for (analyze_items.items) |n| node_refs.appendAssumeCapacity(.{ .node = n, .ref = .{ .kind = .analyze, .value = 0 } });
-    for (quota_items.items) |q| node_refs.appendAssumeCapacity(.{ .node = q[0], .ref = .{ .kind = .quota, .value = q[1] } });
-    for (func_ref_items) |it| {
-        const from = try r.unitNode(it[0]);
-        const to = try r.unitNode(it[1]);
-        if (from != to) node_refs.appendAssumeCapacity(.{ .node = from, .ref = .{ .kind = .func, .value = to } });
-    }
-    for (emit.unit_refs.items, unit_ref_items) |ur, it| node_refs.appendAssumeCapacity(.{ .node = try r.unitNode(it[0]), .ref = switch (ur.ref) {
-        .nav => .{ .kind = .nav, .value = try r.unitNode(it[1]) },
-        .err => |name| .{ .kind = .err, .value = try ip.errorValue(name) },
-        .ext => |e| .{ .kind = if (e.weak) .ext_weak else .ext, .value = try b.addRefName(e.name) },
-        .rt => |key| .{ .kind = .rt, .value = try b.addRefName(key) },
-        .error_names => .{ .kind = .error_names, .value = 0 },
-    } });
-    std.mem.sortUnstable(NodeRef, node_refs.items, {}, NodeRef.lessThan);
     var refs_of: std.ArrayList(Manifest.Ref) = .empty;
     defer refs_of.deinit(gpa);
     var next_ref: usize = 0;
@@ -1373,8 +2097,8 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             .subject = result_words.items[res.subject[0]..][0..res.subject[1]],
         });
     }
-    if (inc.check and !checkReferences(gpa, &r, root_items.items, &b)) inc.check_failed.store(true, .monotonic);
-    if (inc.verify == .full and !try inc.verifyNodes(&r, &b, emit, debug_of)) inc.check_failed.store(true, .monotonic);
+    if (inc.check and !checkReach(gpa, r, root_nodes, &b)) inc.check_failed.store(true, .monotonic);
+    if (inc.verify == .full and !try inc.verifyNodes(r, &b, emit, debug_of)) inc.check_failed.store(true, .monotonic);
     for (base_names.items) |name| _ = try b.addBasePack(name);
     b.items = enc.words.items;
     b.item_starts = enc.starts.items;
@@ -1788,62 +2512,67 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
 /// dependencies and references. A build that loads units from the cache
 /// queues functions only along references, so a function this misses
 /// would drop out of an edit build.
-fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *const Manifest.Builder) bool {
+/// Appends the nodes `reach` follows from a node with dependencies `deps`
+/// (`Manifest.Edge` words) and references `refs`: what analyzing the node
+/// analyzed in turn (its plain dependencies, which for an inferred error
+/// set or a declaration's type is the unit that produces them), the
+/// functions it queued, the declarations whose data its code refers to,
+/// the namespaces it made, and a namespace's roots. A build analyzes the
+/// units reach finds from the root files' namespaces, and links the atoms
+/// of those it finds.
+pub fn reachNext(deps: []const u32, refs: []const Manifest.Ref, next: *std.ArrayList(u32), gpa: Allocator) !void {
+    for (deps) |e| {
+        const edge: Manifest.Edge = @bitCast(e);
+        if (edge.kind == .plain) try next.append(gpa, edge.node);
+    }
+    for (refs) |ref| switch (ref.kind) {
+        .func, .nav, .effects, .root => try next.append(gpa, ref.value),
+        else => {},
+    };
+}
+
+/// `ZAP_CACHE_CHECK`: that `reach` from the root files' namespaces and the
+/// link's own atoms reaches exactly the nodes with atoms, which is what an
+/// edit build links without loading the units that did not change.
+fn checkReach(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *const Manifest.Builder) bool {
     const nodes = r.nodes.items;
     var seen = std.DynamicBitSetUnmanaged.initEmpty(gpa, nodes.len) catch return true;
     defer seen.deinit(gpa);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
-    var k: Keyer = .{ .zcu = r.zcu, .key_buf = .init(gpa), .unit_buf = .init(gpa) };
-    defer k.key_buf.deinit();
-    defer k.unit_buf.deinit();
-    for (roots) |n| if (!seen.isSet(n)) {
-        seen.set(n);
-        stack.append(gpa, n) catch return true;
-    };
+    var next: std.ArrayList(u32) = .empty;
+    defer next.deinit(gpa);
+    const link = r.map.get(cache.hash(2, &.{@backingInt(Tag.link)}));
+    for (roots) |n| stack.append(gpa, n) catch return true;
+    if (link) |n| stack.append(gpa, n) catch return true;
+    for (stack.items) |n| seen.set(n);
     while (stack.pop()) |n| {
+        next.clearRetainingCapacity();
         const range = b.ref_ranges.items[n];
-        var next: std.ArrayList(u32) = .empty;
-        defer next.deinit(gpa);
-        // A function is reached only by a reference, or by resolving its
-        // inferred error set, which analyzes and emits its body: the
-        // `func_ies` dependee's edge to it. A green unit loaded from the
-        // cache reaches it the same way, through `ensureFuncIes`.
-        for (nodes[n].deps) |e| {
-            const d = Manifest.Edge.nodeOf(e);
-            if (nodes[d].tag != .func or nodes[n].tag == .func_ies) next.append(gpa, d) catch return true;
-        }
-        for (b.refs.items[range[0]..][0..range[1]]) |ref| switch (ref.kind) {
-            .func, .nav => next.append(gpa, ref.value) catch return true,
-            .rt => {
-                const name = b.strings.items[b.ref_names.items[ref.value].off..][0..b.ref_names.items[ref.value].len];
-                const key = k.keyOf(.func, &.{name}) catch return true;
-                if (r.map.get(key)) |f| next.append(gpa, f) catch return true;
-            },
-            else => {},
-        };
+        reachNext(nodes[n].deps, b.refs.items[range[0]..][0..range[1]], &next, gpa) catch return true;
         for (next.items) |d| if (!seen.isSet(d)) {
             seen.set(d);
             stack.append(gpa, d) catch return true;
         };
     }
-    var funcs: usize = 0;
+    var with_atoms: usize = 0;
     var missed: usize = 0;
+    var extra: usize = 0;
     for (nodes, 0..) |n, i| {
-        if (n.tag != .func) continue;
-        funcs += 1;
-        if (seen.isSet(i)) continue;
-        missed += 1;
-        if (missed > 10) continue;
+        const reached = seen.isSet(i);
+        if (n.atoms.len != 0) with_atoms += 1;
+        const what: []const u8 = if (n.atoms.len != 0 and !reached) "is not reached" else if (n.atoms.len == 0 and reached and n.tag == .func) "is reached but has no atoms" else continue;
+        if (n.atoms.len != 0) missed += 1 else extra += 1;
+        if (missed + extra > 10) continue;
         var name: std.Io.Writer.Allocating = .init(gpa);
         defer name.deinit();
         for (r.unit_list.items, r.unit_info) |u, info| if (info.key == n.key) {
             r.zcu.unitKey(u, &name.writer) catch {};
             break;
         };
-        std.debug.print("cache check: function {s} is not reached by references\n", .{name.written()});
+        std.debug.print("cache check: {t} node {s} {s}\n", .{ n.tag, name.written(), what });
     }
-    std.debug.print("cache check: references reach {d} of {d} functions\n", .{ funcs - missed, funcs });
+    std.debug.print("cache check: reach finds {d} of {d} nodes with atoms, and {d} functions without\n", .{ with_atoms - missed, with_atoms, extra });
     return missed == 0;
 }
 
@@ -1855,7 +2584,7 @@ fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *c
 /// declarations here (`results.Lookup`); creating them is replay's.
 fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const results.Encoder, words: []const u32, result_of: []const Encoded.Ranges, unencodable: usize) bool {
     const ip = &zcu.ip;
-    var d = results.Decoder(results.Lookup).init(gpa, ip, enc.words.items, enc.starts.items, .{ .zcu = zcu }) catch return false;
+    var d = results.Decoder(results.Lookup).init(gpa, ip, .{ .base_words = enc.words.items, .base_starts = enc.starts.items }, .{ .zcu = zcu }) catch return false;
     defer d.deinit();
     d.rebuild = true;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -2062,14 +2791,14 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         }
         fn refKey(bb: *const Manifest.Builder, rec: *const Recorder, ref: Manifest.Ref) [2]Hash {
             return .{ @backingInt(ref.kind), switch (ref.kind) {
-                .func, .nav => rec.nodes.items[ref.value].key,
+                .func, .nav, .effects, .root => rec.nodes.items[ref.value].key,
                 .ext, .ext_weak, .rt => cache.hash(0, bb.strings.items[bb.ref_names.items[ref.value].off..][0..bb.ref_names.items[ref.value].len]),
                 .err, .error_names, .analyze, .quota => ref.value,
             } };
         }
         fn prevRefKey(mm: *const Manifest, ref: Manifest.Ref) [2]Hash {
             return .{ @backingInt(ref.kind), switch (ref.kind) {
-                .func, .nav => mm.node(ref.value).key,
+                .func, .nav, .effects, .root => mm.node(ref.value).key,
                 .ext, .ext_weak, .rt => cache.hash(0, mm.refName(ref.value)),
                 .err, .error_names, .analyze, .quota => ref.value,
             } };
@@ -2117,6 +2846,8 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         seen.set(pi);
         const pn = m.node(pi);
         if (pn.tag != @backingInt(n.tag)) V.report(r, ni, n, "different kind", &differ);
+        if (m.flags(pi).stale) V.report(r, ni, n, "left undecided", &differ);
+        if (n.atoms.len != 0 and m.flags(pi).unlinked) V.report(r, ni, n, "not linked", &differ);
         if (pn.src_hash != n.src_hash) V.report(r, ni, n, "different source hash", &differ);
         if (pn.result_hash != n.result_hash) V.report(r, ni, n, "different result", &differ);
         mine.clearRetainingCapacity();
@@ -2144,9 +2875,13 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         theirs.clearRetainingCapacity();
         const range = b.ref_ranges.items[ni];
         // Not `quota`: which caller instantiates a generic function first,
-        // and so its quota, depends on analysis order, as upstream's.
-        for (b.refs.items[range[0]..][0..range[1]]) |ref| if (ref.kind != .quota) try mine.append(gpa, V.refKey(b, r, ref));
-        for (m.nodeRefs(pi)) |ref| if (ref.kind != .quota) try theirs.append(gpa, V.prevRefKey(m, ref));
+        // and so its quota, depends on analysis order, as upstream's. Not
+        // `effects` either: a memoized comptime call notes the containers
+        // it evaluated only for its first caller, so which units have
+        // them depends on order too (`checkReach` checks that each build's
+        // reach links its atoms).
+        for (b.refs.items[range[0]..][0..range[1]]) |ref| if (ref.kind != .quota and ref.kind != .effects) try mine.append(gpa, V.refKey(b, r, ref));
+        for (m.nodeRefs(pi)) |ref| if (ref.kind != .quota and ref.kind != .effects) try theirs.append(gpa, V.prevRefKey(m, ref));
         std.mem.sortUnstable([2]Hash, mine.items, {}, V.lessThan);
         std.mem.sortUnstable([2]Hash, theirs.items, {}, V.lessThan);
         if (!std.mem.eql([2]Hash, mine.items, theirs.items)) {
@@ -2176,6 +2911,9 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
     while (it.next()) |pi| {
         const pn = m.node(@intCast(pi));
         if (V.isDependee(pn.tag)) continue;
+        // A lazy edit build keeps the nodes it no longer reaches; only
+        // linking them would differ.
+        if (m.atoms(@intCast(pi)).len == 0 or m.flags(@intCast(pi)).unlinked) continue;
         differ += 1;
         if (differ <= 20) std.debug.print("cache verify: node {x} (kind {d}): only in the edit build\n", .{ pn.key, pn.tag });
     }

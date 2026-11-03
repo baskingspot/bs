@@ -47,6 +47,7 @@ outdated: std.DynamicBitSetUnmanaged,
 state: []State,
 /// Inputs whose contents changed, with their instruction maps.
 maps: seeds.InstMaps = .{},
+changed: std.ArrayList(seeds.Changed) = .empty,
 /// Each input's file in this build, once looked up: its index + 1, or 0
 /// if not looked up yet, or `no_file`.
 input_files: []u32,
@@ -65,13 +66,32 @@ keyer: Incremental.Keyer,
 navs_by_key: std.AutoHashMapUnmanaged(Atom.SymbolKey, InternPool.NavIndex) = .empty,
 navs_indexed: usize = 0,
 deps: std.ArrayList(Zcu.Dependee) = .empty,
+/// A lazy edit build (step 4b): green units are not loaded unless an
+/// analysis reads them, and their functions' atoms stay in the pack; the
+/// build records only what changed (`Incremental.recordLazy`). Otherwise
+/// every unit the build reaches is loaded or analyzed (step 4a).
+lazy: bool = false,
+/// The nodes `walk` reached: the units a full build would analyze, whose
+/// atoms the build links.
+visited: std.DynamicBitSetUnmanaged = .{},
+walk_stack: std.ArrayList(u32) = .empty,
+/// Green units whose results are in the Zcu.
+loaded: std.DynamicBitSetUnmanaged = .{},
+/// Declarations whose data a live node refers to (`walk`), which a red
+/// one's must be lowered again for.
+data_refs: std.DynamicBitSetUnmanaged = .{},
+/// Nodes whose subject is gone: what they were about no longer exists.
+dead: std.DynamicBitSetUnmanaged = .{},
+/// Green functions whose line information may have moved: they or a
+/// function they inline are in a changed input (`Incremental.refreshDebug`).
+refresh: std.DynamicBitSetUnmanaged = .{},
 stats: Stats = .{},
 /// `ZAP_CACHE_CHECK`: print each green unit that could not be loaded.
 check: bool = false,
 
 const no_file = std.math.maxInt(u32);
 
-const State = enum(u8) { unknown, green, red };
+pub const State = enum(u8) { unknown, green, red };
 
 pub const Stats = struct {
     seeds: u32 = 0,
@@ -88,7 +108,7 @@ pub const Stats = struct {
 
 /// Starts an edit build from manifest `m`: finds the inputs that changed
 /// since, the seeds, and what they reach. `fe` has loaded the files.
-pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Atom.Unwind.Arch, fe: *const Frontend, zcu: *Zcu, emit: *Emit) !*Replay {
+pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Atom.Unwind.Arch, fe: *const Frontend, zcu: *Zcu, emit: *Emit, lazy: bool) !*Replay {
     const t0 = Io.Timestamp.now(io, .awake);
     var pack: Pack = try .open(io, dir);
     errdefer pack.close(gpa, io);
@@ -109,8 +129,14 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
         .state = try gpa.alloc(State, n),
         .dependees = try gpa.alloc(?Zcu.Dependee, n),
         .input_files = try gpa.alloc(u32, m.inputCount()),
-        .decoder = try .init(gpa, &zcu.ip, m.items, m.item_starts, .{ .r = undefined }),
+        .decoder = try .init(gpa, &zcu.ip, m.resultItems(), .{ .r = undefined }),
         .keyer = .init(zcu, gpa),
+        .lazy = lazy,
+        .visited = try .initEmpty(gpa, n),
+        .loaded = try .initEmpty(gpa, n),
+        .data_refs = try .initEmpty(gpa, n),
+        .dead = try .initEmpty(gpa, n),
+        .refresh = try .initEmpty(gpa, n),
     };
     r.decoder.resolver = .{ .r = r };
     @memset(r.state, .unknown);
@@ -121,8 +147,7 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     for (0..m.inputCount()) |i| _ = try r.by_path.getOrPutValue(gpa, m.input(@intCast(i))[1], @intCast(i));
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
-    var changed: std.ArrayList(seeds.Changed) = .empty;
-    defer changed.deinit(gpa);
+    const changed = &r.changed;
     var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.inputCount());
     defer seen.deinit(gpa);
     for (fe.files.items, 0..) |*f, fi| {
@@ -158,6 +183,8 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     var stack = seed_list;
     seed_list = .empty;
     defer stack.deinit(gpa);
+    // Nodes an earlier lazy build left unchecked, as if edited again.
+    if (lazy) for (0..n) |i| if (m.flags(@intCast(i)).stale) try stack.append(gpa, @intCast(i));
     for (stack.items) |i| r.outdated.set(i);
     while (stack.pop()) |i| for (m.rdeps(i)) |part| for (part) |d| if (!r.outdated.isSet(d)) {
         r.outdated.set(d);
@@ -172,9 +199,16 @@ pub fn destroy(r: *Replay) void {
     const gpa = r.gpa;
     r.pack.close(gpa, r.io);
     r.outdated.deinit(gpa);
+    r.visited.deinit(gpa);
+    r.walk_stack.deinit(gpa);
+    r.loaded.deinit(gpa);
+    r.data_refs.deinit(gpa);
+    r.dead.deinit(gpa);
+    r.refresh.deinit(gpa);
     gpa.free(r.state);
     gpa.free(r.dependees);
     r.maps.deinit(gpa);
+    r.changed.deinit(gpa);
     gpa.free(r.input_files);
     r.file_inputs.deinit(gpa);
     r.by_path.deinit(gpa);
@@ -191,6 +225,7 @@ pub fn printStats(r: *const Replay) void {
     std.debug.print("cache: replayed {d} units ({d} functions) from the last build; analyzed {d} again ({d} changed, {d} not decodable) and {d} new; {d} inputs changed, {d} seeds reach {d} of {d} nodes; setup {d:.2} ms\n", .{
         s.loaded, s.loaded_funcs, s.red, s.red_changed, s.misses, s.new, s.changed_inputs, s.seeds, s.outdated, r.m.nodeCount(), @as(f64, @floatFromInt(s.setup_ns)) / 1e6,
     });
+    if (r.lazy) std.debug.print("cache: the walk reached {d} nodes; {d} are gone\n", .{ r.visited.count(), r.dead.count() });
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +242,7 @@ fn loadNavFallible(r: *Replay, nav_index: InternPool.NavIndex) !bool {
     const g = try r.greenNode(unit) orelse return false;
     errdefer r.deps.shrinkRetainingCapacity(g.deps_start);
     const got = try results.decodeNav(&r.decoder, r.m.result(g.node)) orelse return r.miss(g, "result");
-    const refs = try r.resolveRefs(g, false) orelse return r.miss(g, "references");
+    const refs: []const Ref = if (r.lazy) &.{} else try r.resolveRefs(g, false) orelse return r.miss(g, "references");
     defer r.gpa.free(refs);
     const nav = r.zcu.ip.getNav(nav_index);
     nav.ty = got.ty;
@@ -233,7 +268,7 @@ fn loadLayoutFallible(r: *Replay, ty: Index) !bool {
     const info = r.zcu.ip.structInfo(ty);
     const got = try results.decodeLayout(&r.decoder, r.zcu.ip.arena(Zcu.tid), r.m.result(g.node)) orelse return r.miss(g, "result");
     if (got.status != .have_layout) return r.miss(g, "no layout");
-    const refs = try r.resolveRefs(g, false) orelse return r.miss(g, "references");
+    const refs: []const Ref = if (r.lazy) &.{} else try r.resolveRefs(g, false) orelse return r.miss(g, "references");
     defer r.gpa.free(refs);
     // A struct's non-`comptime` defaults are the `struct_defaults` unit's
     // (a reified struct has them already).
@@ -265,7 +300,7 @@ fn loadDefaultsFallible(r: *Replay, ty: Index) !bool {
     defer r.gpa.free(got.defaults);
     const info = r.zcu.ip.structInfo(ty);
     if (!got.resolved or got.defaults.len != info.field_defaults.len) return r.miss(g, "defaults");
-    const refs = try r.resolveRefs(g, false) orelse return r.miss(g, "references");
+    const refs: []const Ref = if (r.lazy) &.{} else try r.resolveRefs(g, false) orelse return r.miss(g, "references");
     defer r.gpa.free(refs);
     const defaults = try r.zcu.ip.arena(Zcu.tid).dupe(Index, info.field_defaults);
     for (defaults, got.defaults, 0..) |*d, v, i| {
@@ -286,6 +321,10 @@ fn loadComptimeFallible(r: *Replay, c: Zcu.ComptimeDecl) !bool {
     const unit: Zcu.AnalUnit = .{ .comptime_decl = c };
     const g = try r.greenNode(unit) orelse return false;
     errdefer r.deps.shrinkRetainingCapacity(g.deps_start);
+    if (r.lazy) {
+        try r.commitLazy(g, false);
+        return true;
+    }
     const refs = try r.resolveRefs(g, false) orelse return r.miss(g, "references");
     defer r.gpa.free(refs);
     try r.commit(unit, g, refs);
@@ -306,7 +345,7 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
     const unit: Zcu.AnalUnit = .{ .func = func };
     const g = try r.greenNode(unit) orelse return false;
     errdefer r.deps.shrinkRetainingCapacity(g.deps_start);
-    if (m.atoms(g.node).len == 0) return r.miss(g, "no atoms");
+    if (m.atoms(g.node).len == 0 or m.flags(g.node).unlinked) return r.miss(g, "no atoms");
     // The inferred error set, if the function has one: from its node,
     // which every non-empty set has (`Incremental.record`), so no node
     // means an empty set.
@@ -325,6 +364,15 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
             if (words.len == 0) return r.miss(g, "inferred errors");
             ies = try results.decodeIes(ip, zcu.arena.allocator(), words);
         }
+    }
+    if (r.lazy) {
+        if (ies) |got| {
+            if (got.is_anyerror) try zcu.anyerror_ies.put(zcu.gpa, func, {});
+            if (!got.is_anyerror or got.names.len != 0) try zcu.inferred_errors.put(zcu.gpa, func, got.names);
+        }
+        try r.commitLazy(g, false);
+        r.stats.loaded_funcs += 1;
+        return true;
     }
     // The atoms, decoded before anything is committed.
     var atoms: std.ArrayList(struct { atom: Atom, debug: ?Atom.Debug }) = .empty;
@@ -376,7 +424,7 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
 
 /// Inlined callees' base lines, for those in changed files, as CodeGen
 /// would now write them.
-fn refreshInlines(r: *Replay, d: *const Atom.Debug) ![]const Atom.Debug.Inline {
+pub fn refreshInlines(r: *Replay, d: *const Atom.Debug) ![]const Atom.Debug.Inline {
     const zcu = r.zcu;
     var out: ?[]Atom.Debug.Inline = null;
     for (d.inlines, 0..) |in, i| {
@@ -449,6 +497,19 @@ fn greenNode(r: *Replay, unit: Zcu.AnalUnit) !?Green {
         },
         else => {},
     };
+    const g: Green = .{ .unit = unit, .node = node, .deps_start = r.deps.items.len };
+    const is_outdated = r.outdated.isSet(node);
+    // A lazy build leaves a unit alone unless an edit reached it: its
+    // recorded result and dependencies are current, and its effects (an
+    // `analyze` reference) are in the manifest. A result written into the
+    // Zcu, though, brings its dependencies up to date first, as analysis
+    // would have: what it names (a declaration's address, say) is read by
+    // what reads it.
+    const materialize = switch (unit) {
+        .func, .comptime_decl => false,
+        else => true,
+    };
+    if (r.lazy and !is_outdated and !r.dead.isSet(node) and !materialize) return g;
     if (analyze) return r.red(node);
     const n = m.node(node);
     const has_result = switch (unit) {
@@ -456,9 +517,7 @@ fn greenNode(r: *Replay, unit: Zcu.AnalUnit) !?Green {
         else => m.result(node).len != 0,
     };
     if (n.src_hash != r.keyer.unitSrcHash(unit) or !has_result) return r.red(node);
-    const g: Green = .{ .unit = unit, .node = node, .deps_start = r.deps.items.len };
     errdefer r.deps.shrinkRetainingCapacity(g.deps_start);
-    const is_outdated = r.outdated.isSet(node);
     for (m.deps(node)) |e| {
         const edge: Manifest.Edge = @bitCast(e);
         // Conditional edges: the unit does not resolve those itself.
@@ -472,6 +531,7 @@ fn greenNode(r: *Replay, unit: Zcu.AnalUnit) !?Green {
             .func, .link, .comptime_decl => return r.redAt(g),
             else => {},
         }
+        if (r.lazy and !materialize and !r.outdated.isSet(d)) continue;
         const dep = try r.dependee(d, dtag) orelse {
             r.noteMiss(unit, @tagName(dtag));
             return r.redAt(g);
@@ -499,6 +559,8 @@ fn greenNode(r: *Replay, unit: Zcu.AnalUnit) !?Green {
                 r.stats.red_changed += 1;
                 return r.redAt(g);
             }
+            // Decided: an edit reached it, but its result is as recorded.
+            if (r.state[d] == .unknown) r.state[d] = .green;
         }
         try r.deps.append(r.gpa, dep);
     }
@@ -508,6 +570,8 @@ fn greenNode(r: *Replay, unit: Zcu.AnalUnit) !?Green {
 const Ref = union(enum) {
     func: Index,
     nav: InternPool.NavIndex,
+    /// A container type the unit evaluated, which loading it makes again.
+    effects: Index,
     other: Manifest.Ref,
 };
 
@@ -527,14 +591,29 @@ fn resolveRefs(r: *Replay, g: Green, is_func: bool) !?[]Ref {
             r.zcu.ensureNavVal(dep.nav_val) catch return null;
             try out.append(r.gpa, .{ .nav = dep.nav_val });
         },
-        .analyze, .quota => {},
+        .effects => {
+            const dep = try r.dependee(ref.value, .namespace) orelse return null;
+            try out.append(r.gpa, .{ .effects = r.zcu.namespaces.items[dep.namespace].owner_type });
+        },
+        .analyze, .quota, .root => {},
         else => if (is_func) try out.append(r.gpa, .{ .other = ref }),
     };
     return try out.toOwnedSlice(r.gpa);
 }
 
+/// A green unit in a lazy build: it is live, and its result is in the
+/// Zcu if `loaded`.
+fn commitLazy(r: *Replay, g: Green, loaded: bool) !void {
+    r.deps.shrinkRetainingCapacity(g.deps_start);
+    r.state[g.node] = .green;
+    if (loaded) r.loaded.set(g.node);
+    r.stats.loaded += 1;
+    try r.visit(g.node);
+}
+
 /// Records a loaded unit's dependencies and replays its references.
 fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
+    if (r.lazy) return r.commitLazy(g, true);
     const zcu = r.zcu;
     const m = r.m;
     try zcu.recordDeps(unit, r.deps.items[g.deps_start..], &.{});
@@ -548,6 +627,7 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
     for (refs) |ref| switch (ref) {
         .func => |func| _ = try zcu.queueFuncFrom(unit, func),
         .nav => |nav| _ = try emit.navKey(nav),
+        .effects => |ty| try zcu.effect_uses.put(zcu.gpa, .{ .unit = unit, .ty = ty }, {}),
         .other => |o| switch (o.kind) {
             .err => _ = try emit.useError(try zcu.ip.getString(Zcu.tid, m.errorName(o.value))),
             .ext, .ext_weak => _ = try emit.useExtern(m.refName(o.value), o.kind == .ext_weak),
@@ -558,7 +638,7 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
                 _ = try emit.requestCompilerRt(rest[0..colon], rest[colon + 1 ..]);
             },
             .error_names => try emit.useErrorNames(),
-            .func, .nav, .analyze, .quota => unreachable,
+            .func, .nav, .analyze, .quota, .effects, .root => unreachable,
         },
     };
 }
@@ -664,10 +744,161 @@ fn ensure(r: *Replay, dep: Zcu.Dependee) bool {
 }
 
 // ---------------------------------------------------------------------------
+// A lazy build's walk
+
+const link_key = cache.hash(2, &.{@backingInt(Tag.link)});
+
+/// Marks node `n` live and queues it for `walk`.
+fn visit(r: *Replay, n: u32) !void {
+    if (r.visited.isSet(n)) return;
+    r.visited.set(n);
+    try r.walk_stack.append(r.gpa, n);
+}
+
+/// Starts the walk from the root files' namespaces and the link's own
+/// atoms, as `Incremental.reachNext` describes. Call once the root files'
+/// types exist.
+pub fn startWalk(r: *Replay) !void {
+    const zcu = r.zcu;
+    for (zcu.rootFiles()) |root| if (root) |f| {
+        if (f >= zcu.file_root_types.items.len) continue;
+        const ty = zcu.file_root_types.items[f];
+        if (ty == .none) continue;
+        const info = try r.keyer.dependeeInfo(.{ .namespace = zcu.ip.structInfo(ty).namespace });
+        if (r.m.find(info.key)) |n| try r.visit(n);
+    };
+    if (r.m.find(link_key)) |n| try r.visit(n);
+}
+
+pub fn walking(r: *const Replay) bool {
+    return r.walk_stack.items.len != 0;
+}
+
+/// Follows the walk's edges from the nodes it reached: a green node's
+/// from the manifest, without loading it. A node an edit reached goes to
+/// analysis instead, which walks on from it if it is green, and whose
+/// queues reach what a red one refers to now.
+pub fn walk(r: *Replay) !void {
+    var next: std.ArrayList(u32) = .empty;
+    defer next.deinit(r.gpa);
+    while (r.walk_stack.pop()) |n| {
+        next.clearRetainingCapacity();
+        try r.walkNode(n, &next);
+        for (next.items) |d| try r.visit(d);
+    }
+}
+
+fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
+    const m = r.m;
+    const tag = std.enums.fromInt(Tag, m.node(n).tag) orelse return;
+    if (r.outdated.isSet(n) and r.state[n] == .unknown) switch (tag) {
+        // Analysis decides it; a green one is visited again as it loads,
+        // and walked on from then.
+        .nav_val, .type_layout, .struct_defaults => {
+            r.visited.unset(n);
+            const dep = try r.dependee(n, tag) orelse return r.die(n);
+            _ = r.ensure(dep);
+            return;
+        },
+        .func => {
+            r.visited.unset(n);
+            const dep = try r.dependee(n, tag) orelse return r.die(n);
+            _ = try r.zcu.queueFunc(dep.func_body);
+            return;
+        },
+        // Its namespace's scan makes it (below), and analysis decides.
+        .comptime_decl => {
+            r.visited.unset(n);
+            return;
+        },
+        else => {},
+    };
+    if (r.dead.isSet(n) or r.state[n] == .red) return;
+    // A namespace whose container an edit reached, or one of whose roots
+    // it did, is made again: its scan queues the roots as they are now,
+    // and analysis decides each.
+    if (tag == .namespace and r.namespaceOutdated(n)) {
+        _ = try r.dependee(n, .namespace) orelse return r.die(n);
+    }
+    try Incremental.reachNext(m.deps(n), m.nodeRefs(n), next, r.gpa);
+    for (m.nodeRefs(n)) |ref| if (ref.kind == .nav) r.data_refs.set(ref.value);
+    // A function's lines: its own declaration's, and those of the
+    // functions it inlines, which it depends on. Those are made now, so
+    // that their namespaces exist as in a full build.
+    if (tag == .func and r.maps.maps.count() != 0) {
+        var moved = r.inChangedInput(n);
+        for (m.deps(n)) |e| {
+            const d = Manifest.Edge.nodeOf(e);
+            const dtag = std.enums.fromInt(Tag, m.node(d).tag) orelse continue;
+            if (dtag != .func_body or !r.inChangedInput(d)) continue;
+            moved = true;
+            _ = try r.dependee(d, dtag);
+        }
+        if (moved) r.refresh.set(n);
+    }
+}
+
+fn inChangedInput(r: *Replay, n: u32) bool {
+    const src = r.m.source(n);
+    return src.input != Manifest.Source.no_input and r.maps.maps.contains(src.input);
+}
+
+fn namespaceOutdated(r: *Replay, n: u32) bool {
+    if (r.outdated.isSet(n)) return true;
+    const src = r.m.source(n);
+    if (src.input != Manifest.Source.no_input and r.maps.maps.contains(src.input)) return true;
+    for (r.m.nodeRefs(n)) |ref| if (ref.kind == .root and r.outdated.isSet(ref.value)) return true;
+    return false;
+}
+
+fn die(r: *Replay, n: u32) void {
+    r.dead.set(n);
+    r.state[n] = .red;
+}
+
+/// `Zcu.analyzeAll` with nothing else to do in a lazy build: requests the
+/// data of red declarations that live nodes refer to, and lowers the data
+/// requested so far, which can reach more units. Returns whether that
+/// gave analysis more to do.
+pub fn settle(r: *Replay) !bool {
+    const emit = r.emit;
+    const before = emit.navs_done;
+    var it = r.data_refs.iterator(.{});
+    while (it.next()) |n| {
+        if (r.state[n] != .red or r.dead.isSet(n) or r.m.node(@intCast(n)).tag != @backingInt(Tag.nav_val)) continue;
+        const dep = try r.dependee(@intCast(n), .nav_val) orelse continue;
+        const saved = emit.owner;
+        defer emit.owner = saved;
+        // Not a reference of any unit's: the node that refers to it keeps
+        // its own.
+        emit.owner = .content;
+        _ = try emit.navKey(dep.nav_val);
+    }
+    try emit.lowerNavs();
+    return emit.navs_done != before or r.walking();
+}
+
+/// For `Emit.lowerNavs`: whether declaration `nav`'s data is in the pack
+/// already, in a lazy build (it is then live). Otherwise makes sure it is
+/// resolved, to be lowered.
+pub fn keepsNavData(r: *Replay, nav: InternPool.NavIndex) !bool {
+    if (!r.lazy) return false;
+    const unit: Zcu.AnalUnit = .{ .nav_val = nav };
+    const node = r.unit_nodes.get(unit) orelse r.m.find(try r.keyer.keyOf(.nav_val, &.{try r.keyer.unitKeyString(unit)}));
+    if (node) |n| if ((r.state[n] == .green or (r.state[n] == .unknown and !r.outdated.isSet(n))) and r.m.atoms(n).len != 0 and !r.m.flags(n).unlinked) {
+        r.data_refs.set(n);
+        try r.visit(n);
+        return true;
+    };
+    r.zcu.ensureNavVal(nav) catch return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Resolving items that name source
 
 /// The file input `input` is in this build, if it is loaded.
-fn fileOf(r: *Replay, input: u32) ?u32 {
+pub fn fileOf(r: *Replay, input: u32) ?u32 {
     if (input >= r.input_files.len) return null;
     if (r.input_files[input] == 0) {
         // Loaded since `create` (compiler_rt), or not at all.
@@ -689,7 +920,7 @@ fn fileOf(r: *Replay, input: u32) ?u32 {
 }
 
 /// Instruction `inst` of input `input`'s recorded ZIR, in its ZIR now.
-fn mapInst(r: *Replay, input: u32, inst: Zir.Inst.Index) ?Zir.Inst.Index {
+pub fn mapInst(r: *Replay, input: u32, inst: Zir.Inst.Index) ?Zir.Inst.Index {
     const entry = r.maps.maps.get(input) orelse return inst;
     const map = entry orelse return null;
     return map.get(inst);
@@ -745,6 +976,12 @@ const Resolver = struct {
         };
         if ((c.reified_layout != null) != (opcode == .reify_struct or opcode == .reify_enum or opcode == .reify_union)) return null;
         const parent_ns = if (zcu.ip.containerType(c.parent) != null) zcu.ip.structInfo(c.parent).namespace else return null;
+        // A reified enum's mode is read by its tag name, which the mode
+        // type's layout holds: a lazy build may not have loaded it yet.
+        if (c.reified_layout != null and kind == .enum_type) {
+            if (c.captures.len < 2) return null;
+            zcu.ensureStructLayout(zcu.ip.typeOf(c.captures[1])) catch return null;
+        }
         const ty = try zcu.createContainerType(ck, file, inst, c.captures, c.name, c.key, parent_ns, c.reified_layout);
         // A reified type's fields come from its captures, as `@Struct` and
         // the like make them.

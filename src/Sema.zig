@@ -1662,27 +1662,28 @@ fn bcRefuse(sema: *Sema) CompileError!void {
 fn fileRootType(sema: *Sema, file_index: u32) CompileError!Index {
     try sema.bcRequire(sema.zcu.file_root_types.items[file_index] != .none);
     const ty = try sema.zcu.fileRootType(file_index);
-    try sema.noteEffects(ty);
+    try sema.noteEffects(ty, true);
     return ty;
 }
 
 fn createContainerType(sema: *Sema, kind: Zcu.ContainerKind, file_index: u32, inst: Zir.Inst.Index, captures: []const Index, fqn: []const u8, key: []const u8, parent_ns: u32, reified_layout: ?std.lang.Type.ContainerLayout) CompileError!Index {
     try sema.bcRefuse();
     const ty = try sema.zcu.createContainerType(kind, file_index, inst, captures, fqn, key, parent_ns, reified_layout);
-    try sema.noteEffects(ty);
+    try sema.noteEffects(ty, false);
     return ty;
 }
 
 /// Records in `Zcu.effect_uses` that this unit evaluated container type
-/// `ty`, if creating its namespace had effects. As a dependency is
+/// `ty`, if creating its namespace had effects or it is a file's root
+/// (whose edits can add them). As a dependency is
 /// declared: a memoizable call in progress records it for its memo entry,
 /// whose hits note it again, and a lowering for the comptime evaluator
 /// (not its owner's analysis) marks where the code reads it, for the units
 /// whose runs reach that (`Zcu.Bytecode.effects`).
-fn noteEffects(sema: *Sema, ty: Index) Allocator.Error!void {
+fn noteEffects(sema: *Sema, ty: Index, file_root: bool) Allocator.Error!void {
     const zcu = sema.zcu;
     const ns = zcu.ip.structInfo(ty).namespace;
-    if (ns == Zcu.Namespace.none or !zcu.namespaces.items[ns].effects) return;
+    if (ns == Zcu.Namespace.none or !(file_root or zcu.namespaces.items[ns].effects)) return;
     if (sema.memo_start) |start| _ = try sema.memoCollect(.{ .effect = ty }, start);
     if (sema.bc) |bc| {
         const index = std.mem.indexOfScalar(Index, bc.effects.items, ty) orelse blk: {
@@ -1874,7 +1875,7 @@ fn memoEffects(sema: *Sema, start: u32) ![]const Index {
 /// containers with effects it evaluated.
 fn memoHit(sema: *Sema, memo: Zcu.Memo) !Index {
     for (memo.deps) |d| try sema.declareDep(d.dependee, d.conditional);
-    for (memo.effects) |ty| try sema.noteEffects(ty);
+    for (memo.effects) |ty| try sema.noteEffects(ty, true);
     return memo.result;
 }
 
@@ -15608,7 +15609,7 @@ noinline fn bcOsr(sema: *Sema, block: *Block, body: []const Zir.Inst.Index) Comp
     defer sema.bc_first_alloc = saved_first;
     for (b.deps) |d| try sema.declareDep(d, true);
     for (b.entry_deps) |i| try sema.declareDep(b.deps[i], false);
-    for (b.entry_effects) |i| try sema.noteEffects(b.effects[i]);
+    for (b.entry_effects) |i| try sema.noteEffects(b.effects[i], true);
     const declared = try sema.arena.alloc(u32, b.deps.len);
     @memset(declared, std.math.maxInt(u32));
     const n = b.ir.instructions.len;
@@ -16433,7 +16434,7 @@ fn bcDeclareBody(sema: *Sema, body: *const Zcu.Bytecode) Allocator.Error![]u32 {
     @memset(gop.value_ptr.*, std.math.maxInt(u32));
     for (body.deps) |d| _ = try sema.addDep(d, true);
     for (body.entry_deps) |i| _ = try sema.addDep(body.deps[i], false);
-    for (body.entry_effects) |i| try sema.noteEffects(body.effects[i]);
+    for (body.entry_effects) |i| try sema.noteEffects(body.effects[i], true);
     return gop.value_ptr.*;
 }
 
@@ -16586,7 +16587,7 @@ fn bcExec(sema: *Sema, f: *BcFrame, body: []const Ir.Inst.Index) BcError!BcExit 
                 continue;
             },
             .comptime_effect => {
-                try sema.noteEffects(f.effects[data.dep]);
+                try sema.noteEffects(f.effects[data.dep], true);
                 continue;
             },
             .block => blk: {

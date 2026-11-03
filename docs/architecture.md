@@ -2255,7 +2255,8 @@ it and can flush every CPU's TLB.
 Being built in steps (each mergeable, full builds unchanged): result
 hashes (done), references (2a, done), seeds from ZIR (2b, done), result
 closures (3, done), the hook and the verify mode (4a, done; see "Step 4a
-as built" below), and Delta with a numbered relink (4b). What an edit
+as built" below), and lazy edit builds with a Delta and a relink from the
+manifest (4b, done; see "Step 4b as built"). What an edit
 build does, and what it needs from Sema, Zcu, and the InternPool:
 
 **Flow.** The no-edit check finds changed inputs. The frontend loads every
@@ -2697,6 +2698,70 @@ and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
   statement to its first test, and appends a declaration, builds,
   restores the file and builds again, both verified with
   `ZAP_CACHE_CHECK` on.
+
+**Step 4b as built** (2026-11-03). An edit build is lazy by default
+(`ZAP_CACHE_REPLAY=eager` selects 4a): it loads only what analysis reads,
+records only what changed, and links from the manifest.
+
+- *The walk.* `Zcu.analyzeAll` starts `Replay.startWalk` from the root
+  files' namespace nodes and the link node, and follows what a full
+  build's analysis would reach (`Incremental.reachNext`: plain
+  dependencies, and the `func`, `nav`, `effects` and `root` references).
+  Record adds the edges reach needs: `effects` (a unit to the namespace
+  it evaluated), `root` (a namespace to its `comptime`, exported and test
+  declarations), `func` from exported, test and compiler_rt declarations
+  to their functions, and the link's own requests on the link node.
+  `ZAP_CACHE_CHECK` checks that reach finds every node with atoms. A node
+  the walk reaches that no edit reached is live and is not loaded. An
+  outdated one goes to analysis (`ensure*`, `queueFunc`, a namespace's
+  scan), which decides it, and the walk goes on from it if it is green.
+  A namespace whose container or roots an edit reached is made again, so
+  that its scan queues the roots as they are now.
+- *Loading on demand.* A green unit's result is decoded only when
+  analysis reads it (`ensureNavVal` and the rest). Writing a result into
+  the Zcu first brings the unit's plain dependencies up to date, as
+  analysis would have: CodeGen reads the declarations a value points to.
+  A green function is never decoded: its atoms stay in the pack, and only
+  its inferred error set is set. Emit lowers only the data of this
+  build's declarations (`Replay.keepsNavData`).
+- *Recording* (`Incremental.finishLazy`, in place of `startRecord`, the
+  link, and `finishRecord`): `recordDelta` builds the same graph as
+  `record` (`Graph`), from this build's analysis only, and appends one log
+  record. It holds the nodes of the units analyzed, every new node, and
+  the dependees whose results or references changed. Their atoms are
+  appended to the local pack. It also holds the changed and new inputs,
+  this build's result items after the manifest's (items it decoded keep
+  their ids), and new error names. For the changed inputs, it rewrites
+  every node source and result item that names an instruction to the new
+  ZIR (`SourceDelta`, `ItemOverride`, `results.remapSource`), or to none
+  if the instruction is gone. Items carry their length beside their tag
+  for this. It refreshes the lines of green functions that are, or that
+  inline a function, in a changed input (`refreshDebug`; the walk makes
+  the inlined callees' declarations). Node flags record what is linked:
+  `unlinked` for nodes with atoms that the walk and this build's nodes do
+  not reach. `stale` marks nodes an edit reached that the build left
+  undecided, which the next lazy build seeds again. The link then reads
+  the manifest with the record applied (`linkFrom`, shared with the
+  no-edit relink), and a log past a quarter of the base is folded into a
+  new base.
+- *Falling back.* A build whose changes the log cannot express builds
+  again in the same process as an eager edit build, with the log
+  untouched (`error.LazyFallback`, which `main.compile` catches, so that
+  the `--listen=-` server falls back too):
+  an `@export` that ran again, exported or test declarations added or
+  removed, a declaration's data lowered for the first time without its
+  unit being analyzed, or a change in the link's inputs outside the atoms
+  (external symbols, whether the error name table is written, and new
+  error names while it is). `ZAP_CACHE_TIMING` says why.
+- `ZAP_CACHE_VERIFY` compares a full build with the edit build's manifest
+  as before, and also requires the full build's nodes to be neither
+  `stale` nor, with atoms, `unlinked` there. Nodes only in the edit
+  build's manifest count only if they are linked.
+- Known gaps: `zap test` skips `populateTestFunctions` in a lazy build,
+  since the test list is as linked (adding or removing a test falls
+  back). Inputs touched without a change are rehashed until the next
+  build that records them. The pack grows with each record until a full
+  or eager build rewrites it (no compaction on fold yet).
 
 **Debug info of green functions.** `src_hash` ignores a declaration's
 line, so lines added above a green function move its `base_line`

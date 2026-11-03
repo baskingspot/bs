@@ -32,6 +32,7 @@ const InternPool = @import("../InternPool.zig");
 const Zcu = @import("../Zcu.zig");
 const Index = InternPool.Index;
 const Hash = InternPool.Hash;
+pub const Items = @import("Manifest.zig").Items;
 
 /// An operand: a static index (below `InternPool.static_len`), `none_ref`,
 /// or `InternPool.static_len` + an item id.
@@ -59,6 +60,12 @@ pub const Encoder = struct {
     /// pointers into comptime memory, items that refer to themselves, and
     /// items nested too deeply.
     fallbacks: struct { comptime_alloc: u32 = 0, cycle: u32 = 0, too_deep: u32 = 0 } = .{},
+    /// The id of the table's first item: a manifest's log appends its
+    /// items after the manifest's (`ids` may then hold the manifest's
+    /// items' ids, below it).
+    id_base: u32 = 0,
+    /// Each file's input in the manifest, if not the file's index.
+    file_inputs: []const u32 = &.{},
 
     const failed = std.math.maxInt(u32);
     const in_progress = std.math.maxInt(u32) - 1;
@@ -87,7 +94,7 @@ pub const Encoder = struct {
         };
         gop.value_ptr.* = in_progress;
         const ok = try e.item(index);
-        const id: u32 = if (ok) @intCast(e.starts.items.len - 1) else failed;
+        const id: u32 = if (ok) e.id_base + @as(u32, @intCast(e.starts.items.len - 1)) else failed;
         e.ids.getPtr(index).?.* = id;
         return if (ok) InternPool.static_len + id else null;
     }
@@ -307,6 +314,9 @@ pub const Encoder = struct {
             },
         };
         if (!ok) return false;
+        // The item's length in words, beside its tag, when it fits.
+        const len = e.scratch.items.len - base;
+        if (len < 1 << 24) e.scratch.items[base + 4] |= @as(u32, @intCast(len)) << 8;
         try e.starts.append(e.gpa, @intCast(e.words.items.len));
         try e.words.appendSlice(e.gpa, e.scratch.items[base..]);
         return true;
@@ -328,7 +338,7 @@ pub const Encoder = struct {
         const generated_tag = ip.indexToKey(index) == .enum_type and !reified and
             zir.instructions.items(.tag)[@backingInt(c.zir_inst)] == .extended and
             zir.instructions.items(.data)[@backingInt(c.zir_inst)].extended.opcode == .union_decl;
-        try e.push(c.file);
+        try e.push(if (e.file_inputs.len != 0) e.file_inputs[c.file] else c.file);
         try e.push(@backingInt(c.zir_inst));
         try e.push(@as(u32, @intFromBool(reified)) | @as(u32, @backingInt(info.layout)) << 1 | @as(u32, @intFromBool(generated_tag)) << 31);
         const parent = e.zcu.namespacePtr(info.namespace).parent;
@@ -397,6 +407,39 @@ pub const Lookup = struct {
     }
 };
 
+/// Item `at` of `words` with the source instruction it names (a
+/// container type's, or a function's) replaced by `map(file, inst)`, into
+/// `out`, or null if it names none or `map` leaves it as it is. A
+/// function's file is its owner type's, from `file_of` (by item id; set
+/// here for container types, which come before the items that use them).
+pub fn remapSource(words: []const u32, at: u32, id: u32, file_of: []u32, out: *std.ArrayList(u32), gpa: Allocator, ctx: anytype) !bool {
+    const tag_word = words[at + 4];
+    const tag: KeyTag = @fromBackingInt(@as(u6, @intCast(tag_word & 0xff)));
+    const len = tag_word >> 8;
+    const inst_at: u32 = switch (tag) {
+        .struct_type, .enum_type, .union_type, .opaque_type => blk: {
+            file_of[id] = words[at + 5];
+            break :blk at + 6;
+        },
+        .func => blk: {
+            const owner = words[at + 5];
+            if (owner < InternPool.static_len or owner == none_ref) return false;
+            file_of[id] = file_of[owner - InternPool.static_len];
+            // The owner's name, then the type.
+            break :blk at + 6 + 1 + (words[at + 6] + 3) / 4 + 1;
+        },
+        else => return false,
+    };
+    const file = file_of[id];
+    if (file == std.math.maxInt(u32) or len == 0) return false;
+    const inst = ctx.map(file, words[inst_at]) orelse return false;
+    if (inst == words[inst_at]) return false;
+    const start = out.items.len;
+    try out.appendSlice(gpa, words[at..][0..len]);
+    out.items[start + (inst_at - at)] = inst;
+    return true;
+}
+
 /// A container type's locator, as decoded.
 pub const Container = struct {
     file: u32,
@@ -439,8 +482,7 @@ pub fn Decoder(comptime Resolver: type) type {
 
         gpa: Allocator,
         ip: *InternPool,
-        words: []const u32,
-        starts: []const u32,
+        items: Items,
         resolver: Resolver,
         rebuild: bool = false,
         /// Per item: its index + 1, or 0 if not decoded yet.
@@ -450,10 +492,10 @@ pub fn Decoder(comptime Resolver: type) type {
         limbs: std.ArrayList(std.math.big.Limb) = .empty,
         miss: Miss = .{},
 
-        pub fn init(gpa: Allocator, ip: *InternPool, words: []const u32, starts: []const u32, resolver: Resolver) !D {
-            const decoded = try gpa.alloc(u32, starts.len);
+        pub fn init(gpa: Allocator, ip: *InternPool, items: Items, resolver: Resolver) !D {
+            const decoded = try gpa.alloc(u32, items.count());
             @memset(decoded, 0);
-            return .{ .gpa = gpa, .ip = ip, .words = words, .starts = starts, .resolver = resolver, .decoded = decoded };
+            return .{ .gpa = gpa, .ip = ip, .items = items, .resolver = resolver, .decoded = decoded };
         }
 
         pub fn deinit(d: *D) void {
@@ -469,14 +511,14 @@ pub fn Decoder(comptime Resolver: type) type {
             if (r < InternPool.static_len) return @fromBackingInt(r);
             const id = r - InternPool.static_len;
             if (d.decoded[id] != 0) return @fromBackingInt(d.decoded[id] - 1);
-            const at = d.starts[id];
-            const h: Hash = @bitCast(d.words[at..][0..4].*);
+            const words, const at = d.items.at(id);
+            const h: Hash = @bitCast(words[at..][0..4].*);
             if (!d.rebuild) if (try d.ip.indexOfHash(h)) |i| {
                 d.decoded[id] = @backingInt(i) + 1;
                 return i;
             };
-            var c: Cursor = .{ .words = d.words, .at = at + 5 };
-            const tag: KeyTag = @fromBackingInt(@intCast(d.words[at + 4]));
+            var c: Cursor = .{ .words = words, .at = at + 5 };
+            const tag: KeyTag = @fromBackingInt(@as(u6, @intCast(words[at + 4] & 0xff)));
             const i = try d.item(tag, &c) orelse {
                 if (d.miss.reason == .none) d.miss = .{ .id = id, .tag = tag, .reason = .unresolved };
                 return null;
