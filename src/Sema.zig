@@ -55,6 +55,8 @@ deps_conditional: std.ArrayList(bool) = .empty,
 /// The entries of `deps` with their indices, once it is long enough to
 /// search this way.
 deps_set: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
+/// When this unit's analysis started, for `Zcu.unit_timing`.
+timer: [2]u64,
 /// The dependencies declared by the memoizable comptime calls in progress,
 /// innermost last, for their memo entries (see `Zcu.Memo`): the entries
 /// from `memo_start` on are the innermost call's. Empty outside calls.
@@ -393,11 +395,13 @@ fn create(zcu: *Zcu, arena: Allocator, file: u32, owner: Zcu.AnalUnit) Sema {
         .file = file,
         .code = &zcu.file(file).zir,
         .owner = owner,
+        .timer = if (zcu.unit_timing) |*t| t.start(zcu.io) else undefined,
     };
 }
 
 fn destroy(sema: *Sema) void {
     const gpa = sema.gpa;
+    if (sema.zcu.unit_timing) |*t| t.stop(gpa, sema.zcu.io, sema.owner, sema.timer);
     sema.ir_insts.deinit(gpa);
     sema.ir_extra.deinit(gpa);
     sema.inst_map.deinit(gpa);

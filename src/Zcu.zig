@@ -60,6 +60,8 @@ comptime_osr_off: std.AutoHashMapUnmanaged(OsrLoop, void) = .empty,
 /// Walker runs of a function before it is lowered for the comptime
 /// evaluator; 0 turns the evaluator off (`ZAP_COMPTIME_EVAL`).
 comptime_eval_threshold: u32 = 4,
+/// `ZAP_UNIT_TIMING=n`: analysis time per unit, for `printUnitTiming`.
+unit_timing: ?UnitTiming = null,
 /// Errors each function instance returns, for inferred error sets.
 /// Arena-allocated.
 inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, []const InternPool.String) = .empty,
@@ -292,6 +294,7 @@ pub fn deinit(zcu: *Zcu) void {
     for (zcu.namespaces.items) |*ns| ns.decls.deinit(gpa);
     zcu.namespaces.deinit(gpa);
     zcu.deps.deinit(gpa);
+    if (zcu.unit_timing) |*t| t.ns.deinit(gpa);
     zcu.func_refs.deinit(gpa);
     zcu.funcs.deinit(gpa);
     zcu.func_queue.deinit(gpa);
@@ -588,6 +591,49 @@ pub fn unitKey(zcu: *Zcu, unit: AnalUnit, w: *std.Io.Writer) !void {
             const ns = &zcu.namespaces.items[c.namespace];
             try w.print("{s}{s}comptime#{d}", .{ ns.key, if (ns.parent == Namespace.none) ":" else ".", c.ordinal });
         },
+    }
+}
+
+pub const UnitTiming = struct {
+    /// How many units `printUnitTiming` prints.
+    top: u32,
+    /// Time spent in the units the innermost unit in progress analyzed in
+    /// turn, which `ns` does not count against it.
+    nested_ns: u64 = 0,
+    ns: std.AutoArrayHashMapUnmanaged(AnalUnit, u64) = .empty,
+
+    /// Starts timing a unit (`Sema.create`); pass the result to `stop`.
+    pub fn start(t: *UnitTiming, io: Io) [2]u64 {
+        defer t.nested_ns = 0;
+        return .{ @intCast(Io.Timestamp.now(io, .awake).nanoseconds), t.nested_ns };
+    }
+
+    pub fn stop(t: *UnitTiming, gpa: Allocator, io: Io, unit: AnalUnit, started: [2]u64) void {
+        const ns = @as(u64, @intCast(Io.Timestamp.now(io, .awake).nanoseconds)) - started[0];
+        const gop = t.ns.getOrPutValue(gpa, unit, 0) catch return;
+        gop.value_ptr.* += ns -| t.nested_ns;
+        t.nested_ns = started[1] + ns;
+    }
+};
+
+/// Prints the `ZAP_UNIT_TIMING` slowest units to stderr.
+pub fn printUnitTiming(zcu: *Zcu) void {
+    const t = if (zcu.unit_timing) |*t| t else return;
+    const C = struct {
+        v: []const u64,
+        pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+            return c.v[a] > c.v[b];
+        }
+    };
+    t.ns.sort(C{ .v = t.ns.values() });
+    var total: u64 = 0;
+    for (t.ns.values()) |v| total += v;
+    std.debug.print("unit timing: {d} units, {d:.1} ms\n", .{ t.ns.count(), @as(f64, @floatFromInt(total)) / 1e6 });
+    for (t.ns.keys()[0..@min(t.top, t.ns.count())], t.ns.values()[0..@min(t.top, t.ns.count())]) |unit, ns| {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        zcu.unitKey(unit, &w) catch {};
+        std.debug.print("{d:>9.2} ms  {s} {s}\n", .{ @as(f64, @floatFromInt(ns)) / 1e6, @tagName(unit), w.buffered() });
     }
 }
 

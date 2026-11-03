@@ -2366,7 +2366,9 @@ shares nothing across projects and ties the file format to in-memory layout.
 
 ### Where a cold build's time goes (measured 2026-11-03)
 
-`ZAP_TIMING=1` prints wall time per stage. CodeGen runs inside
+`ZAP_TIMING=1` prints wall time per stage. `ZAP_UNIT_TIMING=n` prints the
+n analysis units that took longest, each without the units it analyzed in
+turn (timed from `Sema.create` to `Sema.destroy`). CodeGen runs inside
 `Zcu.analyzeAll` (Emit times `CodeGen.generate`); "Sema" is the rest of
 `analyzeAll`. "Record" is the wait for the cache after the link. ReleaseFast
 zap, 4-core orb, page cache warm; "ZIR warm" means std's ZIR was in the

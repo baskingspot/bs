@@ -183,6 +183,9 @@ pub fn main(init: std.process.Init) !void {
     // `ZAP_COMPTIME_EVAL=n`: lower a function for the comptime evaluator
     // after n walker runs (0: never), for testing it.
     if (init.environ_map.get("ZAP_COMPTIME_EVAL")) |v| zcu.comptime_eval_threshold = std.fmt.parseInt(u32, v, 10) catch 0;
+    // `ZAP_UNIT_TIMING=n`: print the n units whose analysis took longest,
+    // not counting the units each analyzed in turn.
+    if (init.environ_map.get("ZAP_UNIT_TIMING")) |v| zcu.unit_timing = .{ .top = std.fmt.parseInt(u32, v, 10) catch 20 };
     if (inc) |*i| try i.seedErrors(&zcu);
     if (opts.dump_ir) {
         var stdout_buf: [4096]u8 = undefined;
@@ -204,6 +207,7 @@ pub fn main(init: std.process.Init) !void {
     try zcu.analyzeAll(&emit);
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
     stages.markSplit("sema", "codegen", emit.codegen_ns);
+    zcu.printUnitTiming();
     if (is_test) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {},
