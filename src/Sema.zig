@@ -11131,7 +11131,9 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                         .alignment = p.flags.alignment,
                     } }));
                 },
-                .tuple => if (std.mem.eql(u8, name, "len")) return .fromInterned(try sema.intValue(.usize_type, ip.keyPayload(.tuple_type, p.child).types.len)) else return sema.loadField(block, src, lhs, name),
+                // An anonymous struct type is a tuple type with names; its
+                // `len` is a field.
+                .tuple => if (std.mem.eql(u8, name, "len") and ip.keyPayload(.tuple_type, p.child).names.len == 0) return .fromInterned(try sema.intValue(.usize_type, ip.keyPayload(.tuple_type, p.child).types.len)) else return sema.loadField(block, src, lhs, name),
                 .@"struct" => return sema.loadField(block, src, lhs, name),
                 .@"union" => return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
                 .pointer => {

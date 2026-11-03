@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -48,6 +48,12 @@ fn Pair(n: []const u8) type {
     return [n.len]u8;
 }
 
+// zls (features/hover.zig): `len` is an ordinary field of an anonymous
+// struct, also through the pointer a parameter is reached by.
+fn lenField(args: anytype) usize {
+    return args.len;
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -64,5 +70,9 @@ fn main() callconv(.c) noreturn {
 
     rt.printInt(runCases([_]Case{ .{ .expected = 40 }, .{ .expected = 2 } }, expected));
     _ = &Pair;
+
+    var len: u7 = 9;
+    _ = &len;
+    rt.printInt(lenField(.{ .len = len }));
     rt.exit(0);
 }
