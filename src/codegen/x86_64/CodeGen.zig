@@ -2649,7 +2649,15 @@ fn floatFromInt(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         }
         return cg.storeXmm(dst, .xmm0, Type.abiSize(ip, ty));
     };
-    const abbrev = rtIntAbbrev(info.bits) orelse return cg.fail("converting {d}-bit integers to floats", .{info.bits});
+    const abbrev = rtIntAbbrev(info.bits) orelse {
+        // `__floateisf(a, bits)` and friends read the integer from memory.
+        const name = try std.fmt.allocPrint(cg.emit.allocator(), "__float{s}ei{s}", .{ if (info.signedness == .unsigned) "un" else "", rtFloatAbbrev(Type.floatBits(ip, ty)) });
+        const key: SymbolKey = .fromName(try cg.emit.zcu.requestCompilerRt("float_from_int.zig", name));
+        try cg.e.lea(.qword, .rdi, try cg.valMem(operand));
+        try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .imm = info.bits });
+        try cg.e.call(.{ .sym = key });
+        return cg.cCallResult(ty, dst);
+    };
     const name = try std.fmt.allocPrint(cg.emit.allocator(), "__float{s}{s}{s}", .{ if (info.signedness == .unsigned) "un" else "", abbrev, rtFloatAbbrev(Type.floatBits(ip, ty)) });
     // Loading the operand extends it to the helper's width.
     try cg.rtCall("float_from_int.zig", name, &.{operand}, ty, dst);
@@ -2688,7 +2696,15 @@ fn intFromFloat(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         }
         return cg.storeReg(dst, .rax, size);
     };
-    const abbrev = rtIntAbbrev(info.bits) orelse return cg.fail("converting floats to {d}-bit integers", .{info.bits});
+    const abbrev = rtIntAbbrev(info.bits) orelse {
+        // `__fixsfei(r, bits, a)` and friends write the integer, of its
+        // ABI size, to memory.
+        const name = try std.fmt.allocPrint(cg.emit.allocator(), "__fix{s}{s}ei", .{ if (info.signedness == .unsigned) "uns" else "", rtFloatAbbrev(Type.floatBits(ip, float_ty)) });
+        const key: SymbolKey = .fromName(try cg.emit.zcu.requestCompilerRt("int_from_float.zig", name));
+        try cg.cCallArgs(&.{ .{ .ty = .usize_type, .loc = .{ .addr = dst } }, .{ .ty = .usize_type, .loc = .{ .imm = info.bits } }, operand }, .void_type, null);
+        try cg.e.call(.{ .sym = key });
+        return;
+    };
     const name = try std.fmt.allocPrint(cg.emit.allocator(), "__fix{s}{s}{s}", .{ if (info.signedness == .unsigned) "uns" else "", rtFloatAbbrev(Type.floatBits(ip, float_ty)), abbrev });
     const rt_ty = rtIntType(info.bits, info.signedness);
     if (Type.abiSize(ip, rt_ty) == size) return cg.rtCall("int_from_float.zig", name, &.{operand}, rt_ty, dst);
