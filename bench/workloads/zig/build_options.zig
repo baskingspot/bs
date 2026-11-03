@@ -1,0 +1,49 @@
+pub const mem_leak_frames: u32 = 4;
+pub const have_llvm: bool = false;
+pub const llvm_has_m68k: bool = false;
+pub const llvm_has_csky: bool = false;
+pub const llvm_has_arc: bool = false;
+pub const llvm_has_xtensa: bool = false;
+pub const debug_gpa: bool = false;
+pub const @"src.dev.Env" = enum (u4) {
+    bootstrap = 0,
+    core = 1,
+    full = 2,
+    c_source = 3,
+    ast_gen = 4,
+    sema = 5,
+    @"aarch64-linux" = 6,
+    cbe = 7,
+    @"powerpc-linux" = 8,
+    @"riscv64-linux" = 9,
+    spirv = 10,
+    wasm = 11,
+    @"x86_64-linux" = 12,
+    @"x86_64-windows" = 13,
+    @"loongarch-linux" = 14,
+    spork8 = 15,
+};
+pub const dev: @"src.dev.Env" = .full;
+pub const @"build.IoMode" = enum (u1) {
+    threaded = 0,
+    evented = 1,
+};
+pub const io_mode: @"build.IoMode" = .threaded;
+pub const @"build.ValueInterpretMode" = enum (u1) {
+    direct = 0,
+    by_name = 1,
+};
+pub const value_interpret_mode: @"build.ValueInterpretMode" = .direct;
+pub const version: [:0]const u8 = "0.17.0";
+pub const semver: @import("std").SemanticVersion = .{
+    .major = 0,
+    .minor = 17,
+    .patch = 0,
+};
+pub const enable_debug_extensions: bool = true;
+pub const enable_logging: bool = true;
+pub const enable_tracy: bool = false;
+pub const enable_tracy_callstack: bool = false;
+pub const enable_tracy_allocation: bool = false;
+pub const tracy_callstack_depth: u32 = 6;
+pub const value_tracing: bool = false;

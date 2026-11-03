@@ -369,7 +369,48 @@ class Vaxis(Workload):
         }
 
 
-WORKLOADS = {"hello": Hello, "vaxis": Vaxis}
+class ZigCompiler(Workload):
+    name = "zig"
+    description = "upstream zig 0.17.0's compiler, src/main.zig without LLVM"
+
+    def setup(self):
+        # The build-exe command `zig build -Denable-llvm=false
+        # -Dversion-string=0.17.0 --verbose` runs for the compiler, with its
+        # generated build_options module copied to workloads/zig.
+        upstream_src = os.path.join(REPO_DIR, "upstream", "src")
+        if not os.path.isdir(upstream_src):
+            sys.exit(f"{upstream_src} is missing; run .agents/setup")
+        os.makedirs(self.dir, exist_ok=True)
+        src = os.path.join(self.dir, "src")
+        rmtree(src)
+        shutil.copytree(upstream_src, src)
+        shutil.copy(os.path.join(BENCH_DIR, "workloads", "zig", "build_options.zig"), self.dir)
+        self.commands = {
+            "build-exe": {
+                "cwd": self.dir,
+                "argv": [self.compiler, "build-exe", "--stack", "48234496", "-fno-sanitize-thread", "-Odebug",
+                         "--dep", "build_options", "-Mroot=src/main.zig", "-Mbuild_options=build_options.zig",
+                         "--name", "zig", "--cache-dir", "cache/local", "--global-cache-dir", "cache/global"],
+                "local_cache": os.path.join(self.dir, "cache/local"),
+                "global_cache": os.path.join(self.dir, "cache/global"),
+                "output": os.path.join(self.dir, "zig"),
+                "name": "zig",
+            },
+        }
+        self.edits = {
+            "root": (os.path.join(src, "main.zig"), "    if (args.len > 0) crash_report.zig_argv0 = args[0];"),
+            # Another file of the root module: the compiler has no library
+            # module of its own besides std.
+            "lib": (os.path.join(src, "Sema.zig"), "    const file_scope = block.getFileScope(zcu);"),
+        }
+
+    def check_output(self, path):
+        p = subprocess.run([path, "version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if p.returncode != 0 or p.stdout.strip() != "0.17.0":
+            sys.exit(f"{path} version did not print 0.17.0: rc={p.returncode} stdout={p.stdout!r}")
+
+
+WORKLOADS = {"hello": Hello, "vaxis": Vaxis, "zig": ZigCompiler}
 
 
 def zig_env(zig):

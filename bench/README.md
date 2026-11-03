@@ -73,7 +73,7 @@ zig build -Doptimize=ReleaseFast
 python3 bench/bench.py --compiler zig-out/bin/zap --machine-note "Amp orb, 4 vCPU"
 ```
 
-Useful options: `--workloads hello,vaxis`, `--modes build-exe,zig-build`,
+Useful options: `--workloads hello,vaxis,zig`, `--modes build-exe,zig-build`,
 `--scenarios core` or a comma-separated list, `--runs`, `--cold-runs`,
 `--build-cold-runs`, `--out PATH` (without extension). With a compiler other
 than upstream zig the defaults are the `build-exe` mode and the core
@@ -97,6 +97,14 @@ files live in `bench/.work/` (gitignored); delete it to start over.
   libvaxis's `build.zig` produces. uucode generates `tables.zig` (7 MB) at
   build time; setup runs libvaxis's build once and keeps the generated
   modules in `.work/vaxis/gen/`, so the command needs no build system.
+- **zig**: upstream zig 0.17.0's own compiler (`upstream/src/main.zig`, a
+  copy of `.agents/setup`'s source tree) without LLVM: the build-exe
+  command `zig build -Denable-llvm=false -Dversion-string=0.17.0 --verbose`
+  runs, with its generated build options module checked in as
+  [`workloads/zig/build_options.zig`](workloads/zig/build_options.zig).
+  The output check runs `zig version`. Both edits are in the root module
+  (`src/main.zig`, `src/Sema.zig`), which is the compiler's only module
+  besides std.
 
 The `zig-build` mode builds the same example through
 [`workloads/vaxis-build/`](workloads/vaxis-build/), a wrapper project that
@@ -114,7 +122,7 @@ The exact commands are recorded in each report.
 | `cold-local` | build with an empty local cache and a warm global cache |
 | `warm` | rebuild with no change |
 | `edit-root` | rebuild after a one-line edit to a function body in the root file |
-| `edit-lib` | the same in a library file (`std/debug.zig` for hello, `src/Vaxis.zig` for vaxis) |
+| `edit-lib` | the same in a library file (`std/debug.zig` for hello, `src/Vaxis.zig` for vaxis, `src/Sema.zig` for zig) |
 | `incr-cli-edit-*` | the edits with `-fincremental` added, one compiler process per build |
 | `incr-edit-*` | the edits as in-process incremental updates: `-fincremental --listen=-`, compiler kept alive |
 
