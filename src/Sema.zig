@@ -9089,6 +9089,11 @@ fn zirBitCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
             operand = try sema.analyzeLoad(block, src, try sema.coercePtrTo(block, ref, try sema.ptrType(.{ .child = full, .flags = .{ .is_const = true } })));
         }
     }
+    return sema.bitCast(block, src, dest_ty, operand);
+}
+
+fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) CompileError!Ref {
+    const ip = sema.ip;
     const src_ty = sema.typeOf(operand);
     if (Type.isInt(ip, dest_ty) and Type.isInt(ip, src_ty)) {
         const d = Type.intInfo(ip, dest_ty);
@@ -9116,6 +9121,16 @@ fn zirBitCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         }
         try sema.requireRuntime(block, src);
         return sema.addTyOp(block, .bitcast, dest_ty, operand);
+    };
+    // Vectors of elements with padding bits (`@Vector(4, f80)`,
+    // `@Vector(3, u7)`): each element is stored in its own bytes, and
+    // the vector's bits are its elements' bits in order, so equal
+    // element widths reinterpret element by element.
+    if (sema.vectorLen(dest_ty)) |len| if (sema.vectorLen(src_ty) == len) {
+        const d_elem = Type.childType(ip, dest_ty);
+        const s_elem = Type.childType(ip, src_ty);
+        if (sema.bitCastBits(d_elem)) |d_bits| if (sema.bitCastBits(s_elem) == d_bits and sema.vectorLen(d_elem) == null and sema.vectorLen(s_elem) == null)
+            return (try sema.vectorCast(block, src, dest_ty, operand, bitCast)).?;
     };
     return sema.failUnsupported(block, src, "@bitCast between these types");
 }
