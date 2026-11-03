@@ -2127,9 +2127,17 @@ move.
 
 **Cache.** `-fPIC` and `-dynamic` exist only on `build-obj` and
 `build-lib`, which skip the cache today, so no pic atom reaches the
-store. When objects are cached ("Roots and output kinds"), the
-compilation key holds the arguments and builtin.zig differs, so pic and
-non-pic atoms never mix; the manifest's output kind gains `shared`.
+store. When objects are cached ("Roots and output kinds"), pic and
+non-pic atoms are kept apart by both keys: the compilation key holds the
+arguments, and the donor key gains the options that change code
+(`-fPIC`, `-dynamic`, the output kind; the cache thread adds them). The
+donor key matters because a first build replays another compilation's
+manifest, and a differing builtin.zig turns most units red but not those
+that do not read it, whose function atoms would otherwise load from a
+non-pic donor. The manifest's output kind gains `shared`. The new
+relocation kinds need no format bump: the store seed and the compilation
+key include the zap binary's identity, and `atoms.check` rejects unknown
+kinds.
 
 **Checks.**
 - A zap `-fPIC` object: exported functions and data, a table of data
