@@ -1,0 +1,397 @@
+{
+ "schema": 1,
+ "generated": "2026-11-03T02:06:16+00:00",
+ "harness_commit": "7bc7283",
+ "machine": {
+  "note": "",
+  "logical_cpus": 4,
+  "kernel": "6.1.158+",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python": "3.11.6",
+  "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "mem_total_gib": 7.8
+ },
+ "compiler": {
+  "path": "/home/user/workspace/repo/zig-out/bin/zap",
+  "realpath": "/home/user/workspace/repo/zig-out/bin/zap",
+  "version": "0.17.0",
+  "default_backend": "stage2_x86_64",
+  "default_mode": "debug",
+  "object_format": "elf"
+ },
+ "runs": 10,
+ "cold_runs": 5,
+ "build_cold_runs": 3,
+ "scenario_descriptions": {
+  "cold": "empty local and global caches",
+  "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+  "warm": "rebuild, no change",
+  "edit-root": "rebuild after a one-line edit to a function body in the root file",
+  "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+  "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+  "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+  "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+  "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+ },
+ "calibration_s": {
+  "start": 0.11965277000035712,
+  "end": 0.12071569300042029
+ },
+ "workloads": {
+  "hello": {
+   "description": "hello world through std.debug.print",
+   "commands": {
+    "build-exe": {
+     "cwd": "hello",
+     "argv": [
+      "zap",
+      "build-exe",
+      "hello.zig",
+      "--zig-lib-dir",
+      "zig-lib",
+      "--cache-dir",
+      "cache/local",
+      "--global-cache-dir",
+      "cache/global"
+     ]
+    }
+   },
+   "edits": {
+    "root": {
+     "file": "hello/hello.zig",
+     "anchor": "    std.debug.print(\"Hello, world!\\n\", .{});",
+     "line": 4
+    },
+    "lib": {
+     "file": "hello/zig-lib/std/debug.zig",
+     "anchor": "    stderr.file_writer.interface.print(fmt, args) catch return;",
+     "line": 330
+    }
+   }
+  }
+ },
+ "results": [
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "cold",
+   "runs": [
+    {
+     "wall_s": 0.421600849999777,
+     "cpu_s": 0.923812,
+     "maxrss_kb": 49024
+    },
+    {
+     "wall_s": 0.42817775900039123,
+     "cpu_s": 0.931442,
+     "maxrss_kb": 48700
+    },
+    {
+     "wall_s": 0.4110182980002719,
+     "cpu_s": 0.913004,
+     "maxrss_kb": 48700
+    },
+    {
+     "wall_s": 0.39710301699960837,
+     "cpu_s": 0.883946,
+     "maxrss_kb": 48796
+    },
+    {
+     "wall_s": 0.4252824529994541,
+     "cpu_s": 0.942988,
+     "maxrss_kb": 48524
+    }
+   ],
+   "stats": {
+    "n": 5,
+    "median_s": 0.421600849999777,
+    "min_s": 0.39710301699960837,
+    "max_s": 0.42817775900039123,
+    "mean_s": 0.4166364753999005,
+    "stdev_s": 0.01270550161678474,
+    "cpu_median_s": 0.923812,
+    "maxrss_median_kb": 48700,
+    "maxrss_max_kb": 49024
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "cold-local",
+   "runs": [
+    {
+     "wall_s": 0.21106046899967623,
+     "cpu_s": 0.21203099999999997,
+     "maxrss_kb": 47880
+    },
+    {
+     "wall_s": 0.19834543999968446,
+     "cpu_s": 0.198986,
+     "maxrss_kb": 47876
+    },
+    {
+     "wall_s": 0.21194273899982363,
+     "cpu_s": 0.21301699999999998,
+     "maxrss_kb": 47880
+    },
+    {
+     "wall_s": 0.22137421800016455,
+     "cpu_s": 0.22267499999999998,
+     "maxrss_kb": 47864
+    },
+    {
+     "wall_s": 0.20919122499981313,
+     "cpu_s": 0.209423,
+     "maxrss_kb": 47340
+    },
+    {
+     "wall_s": 0.21042586300063704,
+     "cpu_s": 0.21088999999999997,
+     "maxrss_kb": 47888
+    },
+    {
+     "wall_s": 0.289689332999842,
+     "cpu_s": 0.290371,
+     "maxrss_kb": 47884
+    },
+    {
+     "wall_s": 0.23819416199967236,
+     "cpu_s": 0.239509,
+     "maxrss_kb": 47444
+    },
+    {
+     "wall_s": 0.23380449500018585,
+     "cpu_s": 0.234196,
+     "maxrss_kb": 47624
+    },
+    {
+     "wall_s": 0.2062741449999521,
+     "cpu_s": 0.20675899999999997,
+     "maxrss_kb": 47616
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.21150160399974993,
+    "min_s": 0.19834543999968446,
+    "max_s": 0.289689332999842,
+    "mean_s": 0.22303020889994513,
+    "stdev_s": 0.026455222152598004,
+    "cpu_median_s": 0.212524,
+    "maxrss_median_kb": 47870.0,
+    "maxrss_max_kb": 47888
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "warm",
+   "runs": [
+    {
+     "wall_s": 0.004131566000069142,
+     "cpu_s": 0.005546,
+     "maxrss_kb": 18952
+    },
+    {
+     "wall_s": 0.0034237350000694278,
+     "cpu_s": 0.004582,
+     "maxrss_kb": 18952
+    },
+    {
+     "wall_s": 0.0031762720000187983,
+     "cpu_s": 0.0042,
+     "maxrss_kb": 18952
+    },
+    {
+     "wall_s": 0.0031253930001184926,
+     "cpu_s": 0.004118,
+     "maxrss_kb": 18952
+    },
+    {
+     "wall_s": 0.0029063439997116802,
+     "cpu_s": 0.003909,
+     "maxrss_kb": 18952
+    },
+    {
+     "wall_s": 0.003245934999540623,
+     "cpu_s": 0.003966,
+     "maxrss_kb": 18952
+    },
+    {
+     "wall_s": 0.002907093999965582,
+     "cpu_s": 0.003901,
+     "maxrss_kb": 18952
+    },
+    {
+     "wall_s": 0.0029923450001660967,
+     "cpu_s": 0.003944,
+     "maxrss_kb": 18952
+    },
+    {
+     "wall_s": 0.0030036069993002457,
+     "cpu_s": 0.004089,
+     "maxrss_kb": 18952
+    },
+    {
+     "wall_s": 0.0029650709993802593,
+     "cpu_s": 0.003929,
+     "maxrss_kb": 18952
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.003064499999709369,
+    "min_s": 0.0029063439997116802,
+    "max_s": 0.004131566000069142,
+    "mean_s": 0.0031877361998340348,
+    "stdev_s": 0.00037021285435492125,
+    "cpu_median_s": 0.0040275,
+    "maxrss_median_kb": 18952.0,
+    "maxrss_max_kb": 18952
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "edit-root",
+   "runs": [
+    {
+     "wall_s": 0.22557314100049553,
+     "cpu_s": 0.225203,
+     "maxrss_kb": 48084
+    },
+    {
+     "wall_s": 0.22181336899939197,
+     "cpu_s": 0.221075,
+     "maxrss_kb": 48136
+    },
+    {
+     "wall_s": 0.23479426799985958,
+     "cpu_s": 0.234808,
+     "maxrss_kb": 48156
+    },
+    {
+     "wall_s": 0.2215760400004001,
+     "cpu_s": 0.22143200000000002,
+     "maxrss_kb": 47608
+    },
+    {
+     "wall_s": 0.22700867099956668,
+     "cpu_s": 0.225507,
+     "maxrss_kb": 47952
+    },
+    {
+     "wall_s": 0.22237959599988244,
+     "cpu_s": 0.22193599999999997,
+     "maxrss_kb": 47656
+    },
+    {
+     "wall_s": 0.22499356099979195,
+     "cpu_s": 0.225536,
+     "maxrss_kb": 47804
+    },
+    {
+     "wall_s": 0.21750617999987298,
+     "cpu_s": 0.21737299999999998,
+     "maxrss_kb": 47984
+    },
+    {
+     "wall_s": 0.2310630170004515,
+     "cpu_s": 0.229418,
+     "maxrss_kb": 48176
+    },
+    {
+     "wall_s": 0.23145695600032923,
+     "cpu_s": 0.230719,
+     "maxrss_kb": 47880
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.22528335100014374,
+    "min_s": 0.21750617999987298,
+    "max_s": 0.23479426799985958,
+    "mean_s": 0.2258164799000042,
+    "stdev_s": 0.005343521655057556,
+    "cpu_median_s": 0.225355,
+    "maxrss_median_kb": 47968.0,
+    "maxrss_max_kb": 48176
+   },
+   "extra": {}
+  },
+  {
+   "workload": "hello",
+   "mode": "build-exe",
+   "scenario": "edit-lib",
+   "runs": [
+    {
+     "wall_s": 0.23104456500004744,
+     "cpu_s": 0.23480399999999998,
+     "maxrss_kb": 48308
+    },
+    {
+     "wall_s": 0.253206661999684,
+     "cpu_s": 0.25516099999999997,
+     "maxrss_kb": 48124
+    },
+    {
+     "wall_s": 0.23068125499958114,
+     "cpu_s": 0.23373,
+     "maxrss_kb": 47804
+    },
+    {
+     "wall_s": 0.22851528399951349,
+     "cpu_s": 0.232616,
+     "maxrss_kb": 48208
+    },
+    {
+     "wall_s": 0.22393872500015277,
+     "cpu_s": 0.227037,
+     "maxrss_kb": 47700
+    },
+    {
+     "wall_s": 0.21340692299963848,
+     "cpu_s": 0.216477,
+     "maxrss_kb": 47800
+    },
+    {
+     "wall_s": 0.21088395300012053,
+     "cpu_s": 0.21318099999999998,
+     "maxrss_kb": 47860
+    },
+    {
+     "wall_s": 0.22878694500013808,
+     "cpu_s": 0.232018,
+     "maxrss_kb": 47648
+    },
+    {
+     "wall_s": 0.23248998800045229,
+     "cpu_s": 0.235738,
+     "maxrss_kb": 47680
+    },
+    {
+     "wall_s": 0.22734562499954336,
+     "cpu_s": 0.23071599999999998,
+     "maxrss_kb": 48036
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.22865111449982578,
+    "min_s": 0.21088395300012053,
+    "max_s": 0.253206661999684,
+    "mean_s": 0.22802999249988715,
+    "stdev_s": 0.011526342933866675,
+    "cpu_median_s": 0.232317,
+    "maxrss_median_kb": 47832.0,
+    "maxrss_max_kb": 48308
+   },
+   "extra": {}
+  }
+ ],
+ "skipped": []
+}
