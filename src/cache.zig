@@ -83,11 +83,15 @@ pub fn parseSize(text: []const u8) ?u64 {
 /// `max_unused_compilation_ns`, then the least recently used while the
 /// directories total more than `max_bytes`, down to three quarters of it.
 /// A file hard-linked into several directories counts once, against the
-/// most recently used. Runs at most once a minute, so that it costs a build
+/// most recently used. `zap run`'s program directories (`zap/o`) count
+/// and go the same way, by the program's mtime, which every run renews by
+/// relinking it; one is not locked, so a run that relinks the least
+/// recently used program at the moment it goes fails, and the next run
+/// builds it again. Test binaries in `zap/tmp` that a killed build left
+/// go after a day. Runs at most once a minute, so that it costs a build
 /// a few stats, and with `force`, which `Incremental` passes for a build
 /// that started a directory. `Incremental` runs it once the build's new
-/// pack is written, so that it counts. Returns null if it
-/// did not run.
+/// pack is written, so that it counts. Returns null if it did not run.
 pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir, max_bytes: u64, force: bool) !?MaintainResult {
     const now = Io.Clock.real.now(io);
     var c = local_cache.openDir(io, "zap/c", .{ .iterate = true }) catch |err| switch (err) {
@@ -102,97 +106,137 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
         else => |e| return e,
     }
     try c.writeFile(io, .{ .sub_path = "trim", .data = "" });
+    // `zap run`'s programs, one directory per compilation.
+    var o: ?Io.Dir = local_cache.openDir(io, "zap/o", .{ .iterate = true }) catch null;
+    defer if (o) |*d| d.close(io);
+    trimTemporary(io, local_cache, now);
 
     const File = struct { inode: u64, size: u64 };
-    const Compilation = struct {
-        name: [32]u8,
-        /// The lock file's mtime; null without one.
+    const Entry = struct {
+        /// `zap/c/<name>` or `zap/o/<name>`.
+        name_buf: [32]u8,
+        name_len: u8,
+        run: bool,
+        /// A compilation's lock file's mtime (null without one: it is
+        /// being created), or a program's mtime (null without one).
         used: ?Io.Timestamp = null,
         files: std.ArrayList(File) = .empty,
         bytes: u64 = 0,
+
+        fn name(e: *const @This()) []const u8 {
+            return e.name_buf[0..e.name_len];
+        }
     };
-    var comps: std.ArrayList(Compilation) = .empty;
+    var entries: std.ArrayList(Entry) = .empty;
     defer {
-        for (comps.items) |*comp| comp.files.deinit(gpa);
-        comps.deinit(gpa);
+        for (entries.items) |*e| e.files.deinit(gpa);
+        entries.deinit(gpa);
     }
-    var it = c.iterate();
-    while (try it.next(io)) |e| {
-        if (e.kind != .directory or e.name.len != 32) continue;
-        try comps.append(gpa, .{ .name = e.name[0..32].* });
+    for ([_]?Io.Dir{ c, o }, [_]bool{ false, true }) |maybe_dir, run| {
+        const dir = maybe_dir orelse continue;
+        var it = dir.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind != .directory or e.name.len > 32 or (!run and e.name.len != 32)) continue;
+            var entry: Entry = .{ .name_buf = undefined, .name_len = @intCast(e.name.len), .run = run };
+            @memcpy(entry.name_buf[0..e.name.len], e.name);
+            try entries.append(gpa, entry);
+        }
     }
     // Each directory's files, stat'ed on several threads: hundreds of
     // directories take milliseconds on one.
     const Worker = struct {
-        fn run(gpa_: std.mem.Allocator, io_: Io, c_: Io.Dir, comps_: []Compilation, first: usize, stride: usize) void {
+        fn run(gpa_: std.mem.Allocator, io_: Io, c_: Io.Dir, o_: ?Io.Dir, entries_: []Entry, first: usize, stride: usize) void {
             var i = first;
-            while (i < comps_.len) : (i += stride) {
-                const comp = &comps_[i];
-                var d = c_.openDir(io_, &comp.name, .{ .iterate = true }) catch continue;
+            while (i < entries_.len) : (i += stride) {
+                const entry = &entries_[i];
+                const parent = if (entry.run) o_.? else c_;
+                var d = parent.openDir(io_, entry.name(), .{ .iterate = true }) catch continue;
                 defer d.close(io_);
                 var files = d.iterate();
                 while (files.next(io_) catch null) |e| {
                     if (e.kind != .file) continue;
                     const stat = d.statFile(io_, e.name, .{}) catch continue;
-                    if (std.mem.eql(u8, e.name, "lock")) comp.used = stat.mtime;
-                    comp.files.append(gpa_, .{ .inode = @intCast(stat.inode), .size = stat.size }) catch return;
+                    if (entry.run) {
+                        // A run that reuses the program relinks it, which
+                        // renews its mtime.
+                        if (entry.used == null or stat.mtime.compare(.gt, entry.used.?)) entry.used = stat.mtime;
+                    } else if (std.mem.eql(u8, e.name, "lock")) entry.used = stat.mtime;
+                    entry.files.append(gpa_, .{ .inode = @intCast(stat.inode), .size = stat.size }) catch return;
                 }
             }
         }
     };
-    const n_threads = @max(1, @min(16, std.Thread.getCpuCount() catch 1, comps.items.len / 32));
+    const n_threads = @max(1, @min(16, std.Thread.getCpuCount() catch 1, entries.items.len / 32));
     var group: Io.Group = .init;
-    for (1..n_threads) |t| group.async(io, Worker.run, .{ gpa, io, c, comps.items, t, n_threads });
-    Worker.run(gpa, io, c, comps.items, 0, n_threads);
+    for (1..n_threads) |t| group.async(io, Worker.run, .{ gpa, io, c, o, entries.items, t, n_threads });
+    Worker.run(gpa, io, c, o, entries.items, 0, n_threads);
     try group.await(io);
-    // A directory without a lock file is being created.
-    var n_comps: usize = 0;
-    for (comps.items) |*comp| {
-        if (comp.used == null) {
-            comp.files.deinit(gpa);
+    var n_entries: usize = 0;
+    for (entries.items) |*e| {
+        if (e.used == null) {
+            e.files.deinit(gpa);
             continue;
         }
-        comps.items[n_comps] = comp.*;
-        n_comps += 1;
+        entries.items[n_entries] = e.*;
+        n_entries += 1;
     }
-    comps.shrinkRetainingCapacity(n_comps);
+    entries.shrinkRetainingCapacity(n_entries);
     // Most recently used first.
-    std.mem.sortUnstable(Compilation, comps.items, {}, struct {
-        fn newer(_: void, a: Compilation, b: Compilation) bool {
+    std.mem.sortUnstable(Entry, entries.items, {}, struct {
+        fn newer(_: void, a: Entry, b: Entry) bool {
             return a.used.?.compare(.gt, b.used.?);
         }
     }.newer);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(gpa);
     var total: u64 = 0;
-    for (comps.items) |*comp| {
-        for (comp.files.items) |f| {
+    for (entries.items) |*e| {
+        for (e.files.items) |f| {
             if ((try seen.getOrPut(gpa, f.inode)).found_existing) continue;
-            comp.bytes += f.size;
+            e.bytes += f.size;
         }
-        total += comp.bytes;
+        total += e.bytes;
     }
-    var result: MaintainResult = .{ .scanned = @intCast(comps.items.len), .bytes = total };
+    var result: MaintainResult = .{ .scanned = @intCast(entries.items.len), .bytes = total };
     const over = total > max_bytes;
     const target = max_bytes - max_bytes / 4;
     // Least recently used first.
-    var i = comps.items.len;
+    var i = entries.items.len;
     while (i > 0) {
         i -= 1;
-        const comp = &comps.items[i];
-        const old = comp.used.?.durationTo(now).toNanoseconds() > max_unused_compilation_ns;
+        const e = &entries.items[i];
+        const old = e.used.?.durationTo(now).toNanoseconds() > max_unused_compilation_ns;
         if (!old and (!over or total <= target)) break;
-        var buf: [64]u8 = undefined;
-        const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{&comp.name}) catch unreachable;
-        const f = c.openFile(io, lock_path, .{ .mode = .read_write }) catch continue;
-        defer f.close(io);
-        if (!(f.tryLock(io, .exclusive) catch false)) continue;
-        c.deleteTree(io, &comp.name) catch continue;
-        total -= comp.bytes;
+        if (e.run) {
+            o.?.deleteTree(io, e.name()) catch continue;
+        } else {
+            var buf: [64]u8 = undefined;
+            const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{e.name()}) catch unreachable;
+            const f = c.openFile(io, lock_path, .{ .mode = .read_write }) catch continue;
+            defer f.close(io);
+            if (!(f.tryLock(io, .exclusive) catch false)) continue;
+            c.deleteTree(io, e.name()) catch continue;
+        }
+        total -= e.bytes;
         result.deleted += 1;
     }
     result.bytes_after = total;
     return result;
+}
+
+/// Temporary files in `zap/tmp` (test binaries, deleted once they ran)
+/// older than this were left by a build that was killed.
+const max_temporary_ns = std.time.ns_per_day;
+
+fn trimTemporary(io: Io, local_cache: Io.Dir, now: Io.Timestamp) void {
+    var tmp = local_cache.openDir(io, "zap/tmp", .{ .iterate = true }) catch return;
+    defer tmp.close(io);
+    var it = tmp.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file) continue;
+        const stat = tmp.statFile(io, e.name, .{}) catch continue;
+        if (stat.mtime.durationTo(now).toNanoseconds() > max_temporary_ns) tmp.deleteFile(io, e.name) catch {};
+    }
 }
 
 pub const MaintainResult = struct { scanned: u32, deleted: u32 = 0, bytes: u64, bytes_after: u64 = 0 };

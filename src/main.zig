@@ -139,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
     };
     stages.on = init.environ_map.get("ZAP_TIMING") != null;
     if (inc) |*i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
-        if (run_test) try runTest(init, out_path.?);
+        if (run_test) try runTest(init, out_path.?, opts.emit_bin != .path);
         if (command == .run) {
             i.close();
             inc = null;
@@ -213,7 +213,7 @@ pub fn main(init: std.process.Init) !void {
     stages.mark("cache record (after the link)");
     stages.print();
     if (!linked) std.process.exit(1);
-    if (run_test) try runTest(init, out_path.?);
+    if (run_test) try runTest(init, out_path.?, opts.emit_bin != .path);
     if (command == .run) {
         // Releases the cache's lock: the program inherits nothing of zap.
         if (inc) |*i| i.close();
@@ -253,9 +253,12 @@ fn runBinPath(arena: std.mem.Allocator, io: Io, cache_dir: []const u8, compile_a
     return std.fmt.allocPrint(arena, "{s}/o/{x:0>16}/{s}", .{ cache_dir, h.final(), stem });
 }
 
-fn runTest(init: std.process.Init, path: []const u8) !void {
+/// Runs a test binary, then deletes it if it is `temporary`: named by
+/// `testBinPath` for this build alone.
+fn runTest(init: std.process.Init, path: []const u8, temporary: bool) !void {
     var child = try std.process.spawn(init.io, .{ .argv = &.{path} });
     const term = try child.wait(init.io);
+    if (temporary) Io.Dir.cwd().deleteFile(init.io, path) catch {};
     switch (term) {
         .exited => |code| if (code != 0) std.process.exit(code),
         else => fatal("the test binary terminated unexpectedly: {any}", .{term}),

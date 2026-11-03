@@ -1262,7 +1262,11 @@ it and can flush every CPU's TLB.
   skipping those a build holds. Store packs that this zap cannot read
   (another zap's pack format, or damaged) count and go by mtime like the
   rest, but are not deleted for being unreadable: two zap versions can
-  share a store. A store pack that a compilation directory
+  share a store. `zap run`'s program directories (`zap/o/<hash>`) count
+  and go with the compilation directories, by the program's mtime, which
+  every run renews by relinking it, so a program run daily stays. `zap
+  test` deletes its binary (`zap/tmp`) once it ran; ones a killed build
+  left go after a day. A store pack that a compilation directory
   links keeps its space until the directory goes, which is why the local
   limit counts the links. The local scan runs after a build that started
   a directory (that is how the local cache grows) and otherwise at most
