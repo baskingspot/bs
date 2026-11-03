@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -116,6 +116,19 @@ fn main() callconv(.c) noreturn {
     const name = @errorName(errs[1]);
     rt.printInt(name[name.len]);
 
+    // `(try x).field` goes through a pointer to the error union.
+    rt.printInt(tryField(false) catch 99);
+    rt.printInt(tryField(true) catch 99);
+
     const e: anyerror!u8 = error.Empty;
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
+}
+
+const Pair = struct { a: u32, b: [3]u8 };
+fn getPair(fail: bool) error{Bad}!Pair {
+    if (fail) return error.Bad;
+    return .{ .a = 4, .b = .{ 1, 2, 3 } };
+}
+fn tryField(fail: bool) error{Bad}!u32 {
+    return (try getPair(fail)).a + (try getPair(fail)).b[2];
 }

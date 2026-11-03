@@ -1954,8 +1954,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const loaded = try sema.analyzeLoad(block, src, sema.resolveInst(data.un_node.operand));
             break :blk sema.errUnionCode(block, src, loaded);
         },
-        .@"try" => sema.zirTry(block, inst),
-        .try_ptr => sema.failUnsupported(block, block.nodeSrc(data.pl_node.src_node), "try through a pointer"),
+        .@"try" => sema.zirTry(block, inst, false),
+        .try_ptr => sema.zirTry(block, inst, true),
         .switch_block => sema.zirSwitchBlock(block, inst),
         .switch_block_err_union => sema.zirSwitchBlockErrUnion(block, inst),
         .memcpy => sema.zirMemcpy(block, inst, .memcpy),
@@ -7555,17 +7555,20 @@ fn errUnionCode(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError
     return sema.addTyOp(block, .unwrap_errunion_err, set_ty, operand);
 }
 
-fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+/// `try eu`, or with `is_ptr`, `(try eu).field` and the like: the operand
+/// is a pointer to the error union, and the result points to its payload.
+fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_ptr: bool) CompileError!Ref {
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const extra = sema.code.extraData(Zir.Inst.Try, data.payload_index);
     const body = sema.code.bodySlice(extra.end, extra.data.body_len);
     const src = parent.nodeSrc(data.src_node);
     const operand = sema.resolveInst(extra.data.operand);
-    const ty = sema.typeOf(operand);
+    const eu = if (is_ptr) try sema.analyzeLoad(parent, src, operand) else operand;
+    const ty = sema.typeOf(eu);
     if (Type.class(sema.ip, ty) != .error_union) return sema.fail(parent, src, "expected error union type, found '{f}'", .{sema.fmtType(ty)});
-    const is_non_err = try sema.analyzeIsNonErr(parent, src, operand);
+    const is_non_err = try sema.analyzeIsNonErr(parent, src, eu);
     if (sema.resolveValue(is_non_err)) |v| {
-        if (v == .bool_true) return sema.errUnionPayload(parent, src, operand);
+        if (v == .bool_true) return if (is_ptr) sema.errUnionPayloadPtr(parent, src, operand, false) else sema.errUnionPayload(parent, src, operand);
         try sema.analyzeBodyInner(parent, body);
         return .unreachable_value;
     }
@@ -7580,6 +7583,7 @@ fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     defer inner.instructions.deinit(sema.gpa);
     try sema.addCondBr(&inner, is_non_err, ok_block.instructions.items, err_block.instructions.items);
     try sema.addBlock(parent, block_inst, .void_type, inner.instructions.items);
+    if (is_ptr) return sema.errUnionPayloadPtr(parent, src, operand, false);
     return sema.errUnionPayload(parent, src, operand);
 }
 
