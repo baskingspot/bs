@@ -56,6 +56,9 @@ blocks: std.AutoHashMapUnmanaged(Inst.Index, Encoder.Label) = .empty,
 /// rbp offset of the slot holding the result pointer (for results returned
 /// in memory).
 ret_ptr_slot: ?i32 = null,
+/// Inline assembly marked the return address undefined (`.cfi_undefined
+/// %rip`): this is the outermost frame.
+outermost_frame: bool = false,
 
 pub const Error = Allocator.Error || error{CodegenFail};
 
@@ -1319,17 +1322,29 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             try names.put(cg.gpa, ip.stringSlice(in.name), arg);
         } else return cg.fail("asm input constraint '{s}'", .{constraint});
     }
-    for (outputs) |out| {
+    // `=r` outputs get registers that no other operand uses.
+    const out_regs = try cg.gpa.alloc(Reg, outputs.len);
+    defer cg.gpa.free(out_regs);
+    for (outputs, out_regs) |out, *out_reg| {
         const constraint = ip.stringSlice(out.constraint);
+        if (std.mem.eql(u8, constraint, "=r")) {
+            const ty = if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child;
+            const reg = for ([_]Reg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9, .r10, .r11 }) |r| {
+                if (used & (@as(u16, 1) << @backingInt(r)) == 0) break r;
+            } else return cg.fail("asm with too many register operands", .{});
+            used |= @as(u16, 1) << @backingInt(reg);
+            out_reg.* = reg;
+            try names.put(cg.gpa, ip.stringSlice(out.name), .{ .reg = .{ .reg = reg, .size = sizeOf(Type.abiSize(ip, ty)) } });
+            continue;
+        }
         if (!std.mem.startsWith(u8, constraint, "=") or regConstraint(constraint[1..]) == null)
             return cg.fail("asm output constraint '{s}'", .{constraint});
+        out_reg.* = (parseReg(regConstraint(constraint[1..]).?) orelse return cg.fail("unknown register in asm constraint '{s}'", .{constraint})).reg;
     }
 
     try cg.assemble(ip.stringSlice(extra.data.source), &names);
 
-    for (outputs) |out| {
-        const constraint = ip.stringSlice(out.constraint);
-        const reg = (parseReg(regConstraint(constraint[1..]).?) orelse return cg.fail("unknown register in asm constraint '{s}'", .{constraint})).reg;
+    for (outputs, out_regs) |out, reg| {
         if (out.operand == .none) {
             const ty = data.ty_pl.ty;
             const dst = try cg.resultMem(inst, ty) orelse continue;
@@ -1364,13 +1379,28 @@ fn parseReg(name: []const u8) ?ParsedReg {
     return null;
 }
 
-const AsmOperand = union(enum) { reg: ParsedReg, imm: i64, sym: struct { key: SymbolKey, off: i32 } };
+const AsmOperand = union(enum) {
+    reg: ParsedReg,
+    imm: i64,
+    sym: struct { key: SymbolKey, off: i32 },
+    /// A memory operand, optionally relative to the fs segment.
+    mem: struct { mem: Mem, fs: bool = false },
+};
 
 fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg)) Error!void {
     var lines = std.mem.tokenizeAny(u8, source, "\n;");
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '.') {
+            // The only directive: std.start's `_start` marks the return
+            // address undefined so unwinders stop at the outermost frame.
+            if (std.mem.eql(u8, line, ".cfi_undefined %rip") or std.mem.eql(u8, line, ".cfi_undefined %%rip")) {
+                cg.outermost_frame = true;
+                continue;
+            }
+            return cg.fail("zap does not support the assembler directive '{s}' yet", .{line});
+        }
         const sp = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
         const mnemonic = line[0..sp];
         var operands: [2]AsmOperand = undefined;
@@ -1397,6 +1427,7 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
             .reg => |r| .{ .reg = r },
         };
     }
+    if (std.mem.indexOfScalar(u8, tok, '(') != null or std.mem.indexOfScalar(u8, tok, ':') != null) return cg.asmMemOperand(tok, names, line);
     if (std.mem.startsWith(u8, tok, "%%") or std.mem.startsWith(u8, tok, "%")) {
         const name = std.mem.trimStart(u8, tok, "%");
         const reg = parseReg(name) orelse return cg.fail("unknown register '{s}' in '{s}'", .{ name, line });
@@ -1409,9 +1440,73 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
     return cg.fail("zap does not support asm operand '{s}' yet", .{tok});
 }
 
+/// An AT&T memory operand: `%fs:disp`, `disp(%base)`, or
+/// `disp(%base,%index,scale)`, where registers may be `%[name]` inputs.
+fn asmMemOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), line: []const u8) Error!AsmOperand {
+    var rest = tok;
+    var fs = false;
+    if (std.mem.startsWith(u8, rest, "%%fs:") or std.mem.startsWith(u8, rest, "%fs:")) {
+        fs = true;
+        rest = rest[std.mem.indexOfScalar(u8, rest, ':').? + 1 ..];
+    }
+    const open = std.mem.indexOfScalar(u8, rest, '(') orelse rest.len;
+    const disp_text = rest[0..open];
+    const disp: i32 = if (disp_text.len == 0) 0 else std.fmt.parseInt(i32, disp_text, 0) catch return cg.fail("bad asm memory operand '{s}' in '{s}'", .{ tok, line });
+    var mem: Mem = .{ .disp = disp };
+    if (open < rest.len) {
+        if (rest[rest.len - 1] != ')') return cg.fail("bad asm memory operand '{s}' in '{s}'", .{ tok, line });
+        var parts = std.mem.splitScalar(u8, rest[open + 1 .. rest.len - 1], ',');
+        var k: usize = 0;
+        while (parts.next()) |raw_part| : (k += 1) {
+            const part = std.mem.trim(u8, raw_part, " \t");
+            if (k == 2) {
+                const scale = std.fmt.parseInt(u8, part, 10) catch return cg.fail("bad asm scale in '{s}'", .{line});
+                mem.index.?.scale = switch (scale) {
+                    1 => .@"1",
+                    2 => .@"2",
+                    4 => .@"4",
+                    8 => .@"8",
+                    else => return cg.fail("bad asm scale in '{s}'", .{line}),
+                };
+                continue;
+            }
+            if (part.len == 0) continue;
+            const reg = switch (try cg.asmOperand(part, names, line)) {
+                .reg => |r| r.reg,
+                else => return cg.fail("bad asm memory operand '{s}' in '{s}'", .{ tok, line }),
+            };
+            if (k == 0) mem.base = .{ .reg = reg } else mem.index = .{ .reg = reg };
+        }
+    }
+    return .{ .mem = .{ .mem = mem, .fs = fs } };
+}
+
 fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []const u8) Error!void {
     const e = &cg.e;
     const eql = std.mem.eql;
+    // Memory operands of `mov`.
+    if (ops.len == 2 and (ops[0] == .mem or ops[1] == .mem) and std.mem.startsWith(u8, mnemonic, "mov")) {
+        const m = if (ops[0] == .mem) ops[0].mem else ops[1].mem;
+        const other = if (ops[0] == .mem) ops[1] else ops[0];
+        const suffix_size: ?Size = if (mnemonic.len == 4) switch (mnemonic[3]) {
+            'b' => .byte,
+            'w' => .word,
+            'l' => .dword,
+            'q' => .qword,
+            else => null,
+        } else null;
+        if (m.fs) try e.raw(&.{0x64});
+        switch (other) {
+            .reg => |r| {
+                const size = suffix_size orelse r.size;
+                if (ops[0] == .mem) return e.mov(size, .{ .reg = r.reg }, .{ .mem = m.mem });
+                return e.mov(size, .{ .mem = m.mem }, .{ .reg = r.reg });
+            },
+            .imm => |v| if (ops[1] == .mem) return e.mov(suffix_size orelse return cg.fail("asm 'mov' needs a size suffix: '{s}'", .{line}), .{ .mem = m.mem }, .{ .imm = v }),
+            else => {},
+        }
+        return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line});
+    }
     if (ops.len == 0) {
         if (eql(u8, mnemonic, "syscall")) return e.syscall();
         if (eql(u8, mnemonic, "ud2")) return e.ud2();
@@ -1424,7 +1519,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
                 return if (mnemonic[0] == 'c') e.call(.{ .sym = s.key }) else e.jmp(.{ .sym = s.key });
             },
             .reg => |r| return if (mnemonic[0] == 'c') e.callIndirect(.{ .reg = r.reg }) else e.jmpIndirect(.{ .reg = r.reg }),
-            .imm => {},
+            .imm, .mem => {},
         };
         if ((eql(u8, mnemonic, "push") or eql(u8, mnemonic, "pushq")) and ops[0] == .reg) return e.push(ops[0].reg.reg);
         if (ops[0] == .reg) {
@@ -1457,7 +1552,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         const src: Encoder.Operand = switch (ops[0]) {
             .reg => |r| .{ .reg = r.reg },
             .imm => |v| .{ .imm = v },
-            .sym => return cg.fail("symbol operand in '{s}'", .{line}),
+            .sym, .mem => return cg.fail("symbol or memory operand in '{s}'", .{line}),
         };
         if (eql(u8, base, "mov") or eql(u8, mnemonic, "movabs")) return e.mov(size, .{ .reg = dst.reg }, src);
         const alu_ops = [_]struct { []const u8, Encoder.AluOp }{
@@ -1470,7 +1565,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         for (shift_ops) |op| if (eql(u8, base, op[0])) switch (ops[0]) {
             .imm => |v| return e.shift(op[1], size, .{ .reg = dst.reg }, @truncate(@as(u64, @bitCast(v)))),
             .reg => |r| if (r.reg == .rcx) return e.shift(op[1], size, .{ .reg = dst.reg }, null),
-            .sym => {},
+            .sym, .mem => {},
         };
         if (eql(u8, base, "xchg") and ops[0] == .reg) return e.xchg(size, .{ .reg = dst.reg }, ops[0].reg.reg);
     }

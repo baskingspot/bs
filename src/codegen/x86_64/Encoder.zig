@@ -613,6 +613,13 @@ const max_insn_len = 16;
 
 /// Every instruction reserves capacity first, so the helpers below cannot
 /// fail. Only relocations allocate in the middle of an instruction.
+/// Appends raw bytes: prefixes (such as the fs segment override, 0x64) and
+/// instructions without operands that have no method of their own.
+pub fn raw(e: *Encoder, bs: []const u8) !void {
+    try e.reserve();
+    e.bytes(bs);
+}
+
 fn reserve(e: *Encoder) !void {
     try e.code.ensureUnusedCapacity(e.gpa, max_insn_len);
 }
