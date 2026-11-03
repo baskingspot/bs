@@ -49,6 +49,12 @@ atom_owners: std.ArrayList(Owner) = .empty,
 content_uses: std.ArrayList(ContentUse) = .empty,
 /// The owner of atoms added now.
 owner: Owner = .link,
+/// Whether each owner's atoms are still adjacent in `atoms`; if not,
+/// `finish` regroups them (`groupByOwner`).
+grouped: bool = true,
+/// Units and the link's code that already have atoms, while `grouped`.
+units_seen: std.AutoHashMapUnmanaged(Zcu.AnalUnit, void) = .empty,
+link_seen: bool = false,
 
 pub const Owner = union(enum) {
     unit: Zcu.AnalUnit,
@@ -74,6 +80,7 @@ pub fn deinit(emit: *Emit) void {
     emit.externs.deinit(gpa);
     emit.atom_owners.deinit(gpa);
     emit.content_uses.deinit(gpa);
+    emit.units_seen.deinit(gpa);
     emit.arena.deinit();
 }
 
@@ -117,6 +124,8 @@ pub fn finish(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !b
         try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap requires the root file to export '_start' (std.start is not supported yet)", .{});
         return false;
     };
+
+    if (!emit.grouped) try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
 
     // Error codes: the order names were first interned, starting at 1.
     var values: std.ArrayList(Elf.Value) = .empty;
@@ -194,8 +203,95 @@ pub fn allocator(emit: *Emit) Allocator {
 
 pub fn addAtom(emit: *Emit, atom: Atom) !void {
     try emit.atom_owners.ensureUnusedCapacity(emit.gpa, 1);
+    const owners = emit.atom_owners.items;
+    if (emit.grouped and (owners.len == 0 or !std.meta.eql(owners[owners.len - 1], emit.owner))) switch (emit.owner) {
+        .unit => |u| if ((try emit.units_seen.getOrPut(emit.gpa, u)).found_existing) {
+            emit.grouped = false;
+        },
+        .link => {
+            if (emit.link_seen) emit.grouped = false;
+            emit.link_seen = true;
+        },
+        // Each content-addressed atom is its own owner.
+        .content => {},
+    };
     try emit.atoms.append(emit.gpa, atom);
     emit.atom_owners.appendAssumeCapacity(emit.owner);
+}
+
+/// Reorders atoms so that each owner's are adjacent, owners in the order
+/// of their first atom, and drops atoms whose key an earlier one has, with
+/// their debug entries. That is the list the cache's manifest replays
+/// (nodes in the order of their first atom, `Incremental.record`), and the
+/// linker lays out atoms in chunks of input positions, so a fresh link of
+/// any other order or with duplicates could differ from a relink in
+/// padding.
+pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.ArrayList(Owner), debug: *std.ArrayList(Atom.Debug)) !void {
+    const Group = union(enum) { unit: Zcu.AnalUnit, content: SymbolKey, link };
+    const dropped = std.math.maxInt(u32);
+    const n = atoms.items.len;
+    const group_of = try gpa.alloc(u32, n);
+    defer gpa.free(group_of);
+    var groups: std.AutoHashMapUnmanaged(Group, u32) = .empty;
+    defer groups.deinit(gpa);
+    var keys: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
+    defer keys.deinit(gpa);
+    for (atoms.items, owners.items, group_of) |a, o, *g| {
+        if ((try keys.getOrPut(gpa, a.key)).found_existing) {
+            g.* = dropped;
+            continue;
+        }
+        const gop = try groups.getOrPut(gpa, switch (o) {
+            .unit => |u| .{ .unit = u },
+            .content => .{ .content = a.key },
+            .link => .link,
+        });
+        if (!gop.found_existing) gop.value_ptr.* = groups.count() - 1;
+        g.* = gop.value_ptr.*;
+    }
+    // A stable counting sort by group.
+    const starts = try gpa.alloc(u32, groups.count() + 1);
+    defer gpa.free(starts);
+    @memset(starts, 0);
+    for (group_of) |g| if (g != dropped) {
+        starts[g + 1] += 1;
+    };
+    for (1..starts.len) |i| starts[i] += starts[i - 1];
+    const kept = starts[starts.len - 1];
+    const new_index = try gpa.alloc(u32, n);
+    defer gpa.free(new_index);
+    for (group_of, new_index) |g, *ni| {
+        if (g == dropped) {
+            ni.* = dropped;
+            continue;
+        }
+        ni.* = starts[g];
+        starts[g] += 1;
+    }
+    const new_atoms = try gpa.alloc(Atom, kept);
+    defer gpa.free(new_atoms);
+    const new_owners = try gpa.alloc(Owner, kept);
+    defer gpa.free(new_owners);
+    for (atoms.items, owners.items, new_index) |a, o, ni| if (ni != dropped) {
+        new_atoms[ni] = a;
+        new_owners[ni] = o;
+    };
+    @memcpy(atoms.items[0..kept], new_atoms);
+    atoms.shrinkRetainingCapacity(kept);
+    @memcpy(owners.items[0..kept], new_owners);
+    owners.shrinkRetainingCapacity(kept);
+    var d_kept: usize = 0;
+    for (debug.items) |d| if (new_index[d.atom] != dropped) {
+        debug.items[d_kept] = d;
+        debug.items[d_kept].atom = new_index[d.atom];
+        d_kept += 1;
+    };
+    debug.shrinkRetainingCapacity(d_kept);
+    std.mem.sortUnstable(Atom.Debug, debug.items, {}, struct {
+        fn lt(_: void, a: Atom.Debug, b: Atom.Debug) bool {
+            return a.atom < b.atom;
+        }
+    }.lt);
 }
 
 /// Adds a function's atom and its debug info.
@@ -334,4 +430,126 @@ fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
         .targets = try arena.dupe(SymbolKey, refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, refs.relocs.items),
     });
+}
+
+test "a relink in the manifest's order reproduces the fresh link, with mixed alignments and duplicates" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cache = @import("cache.zig");
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var atoms: std.ArrayList(Atom) = .empty;
+    defer atoms.deinit(gpa);
+    var owners: std.ArrayList(Owner) = .empty;
+    defer owners.deinit(gpa);
+    var debug: std.ArrayList(Atom.Debug) = .empty;
+    defer debug.deinit(gpa);
+    const alignments = [_]std.mem.Alignment{ .@"1", .@"16", .@"64", .@"8" };
+
+    // Constants, content-addressed: 50, each emitted again later.
+    var constants: [50]Atom = undefined;
+    for (&constants, 0..) |*c, j| {
+        const bytes = try arena.alloc(u8, 1 + j % 13);
+        @memset(bytes, @intCast(j));
+        const a = alignments[j % 4];
+        c.* = .{ .key = .fromContents(.rodata, a, bytes, &.{}, &.{}), .name = "", .section = .rodata, .alignment = a, .bytes = bytes };
+    }
+    const start: SymbolKey = .fromName("_start");
+    try atoms.append(gpa, .{ .key = start, .name = "_start", .section = .text, .bytes = &.{ 0xe8, 0, 0, 0, 0, 0xcc }, .targets = &.{.fromName("f0")}, .relocs = &.{.init(1, .x86_64_pc32, 0, -4)} });
+    try owners.append(gpa, .link);
+    for (constants) |c| {
+        try atoms.append(gpa, c);
+        try owners.append(gpa, .content);
+    }
+    const n = 3000;
+    for (0..n) |i| {
+        const unit: Zcu.AnalUnit = .{ .func = @fromBackingInt(@intCast(100_000 + i)) };
+        const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
+        const bytes = try arena.alloc(u8, 5 + i % 37);
+        @memset(bytes, 0x90);
+        const target = constants[i % constants.len].key;
+        try debug.append(gpa, .{ .atom = @intCast(atoms.items.len), .file = "t.zig", .name = name, .base_line = @intCast(i), .lines = &.{}, .frame = .frame_pointer });
+        try atoms.append(gpa, .{ .key = .fromName(name), .name = name, .section = .text, .alignment = alignments[i % 3], .bytes = bytes, .targets = try arena.dupe(SymbolKey, &.{target}), .relocs = &.{.init(1, .x86_64_pc32, 0, -4)} });
+        try owners.append(gpa, .{ .unit = unit });
+        if (i % 7 == 0) {
+            try atoms.append(gpa, constants[i % constants.len]);
+            try owners.append(gpa, .content);
+        }
+        // A unit's second atom, after other units' atoms.
+        if (i % 11 == 10) {
+            const extra = try std.fmt.allocPrint(arena, "data{d}", .{i});
+            try atoms.append(gpa, .{ .key = .fromName(extra), .name = extra, .section = .data, .alignment = alignments[i % 4], .bytes = try arena.dupe(u8, "abcdefgh") });
+            try owners.append(gpa, .{ .unit = .{ .func = @fromBackingInt(@intCast(100_000 + i - 5)) } });
+        }
+    }
+    try atoms.append(gpa, .{ .key = .fromName("tail"), .name = "tail", .section = .bss, .alignment = .@"64", .zero_fill = 100 });
+    try owners.append(gpa, .link);
+
+    const ungrouped = try Elf.emit(gpa, io, atoms.items, .{ .entry = start, .debug = debug.items });
+    defer gpa.free(ungrouped);
+    try groupByOwner(gpa, &atoms, &owners, &debug);
+    const fresh = try Elf.emit(gpa, io, atoms.items, .{ .entry = start, .debug = debug.items });
+    defer gpa.free(fresh);
+    // The input order matters to the layout, which is why both builds
+    // link one order.
+    try std.testing.expect(!std.mem.eql(u8, ungrouped, fresh));
+
+    // Grouped and deduplicated: no key twice, each owner's atoms adjacent.
+    var keys: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
+    defer keys.deinit(gpa);
+    var closed: std.AutoHashMapUnmanaged(Zcu.AnalUnit, void) = .empty;
+    defer closed.deinit(gpa);
+    for (atoms.items, owners.items, 0..) |a, o, i| {
+        try std.testing.expect(!(try keys.getOrPut(gpa, a.key)).found_existing);
+        if (i > 0 and std.meta.eql(owners.items[i - 1], o)) continue;
+        if (i > 0) if (owners.items[i - 1] == .unit) try closed.put(gpa, owners.items[i - 1].unit, {});
+        if (o == .unit) try std.testing.expect(!closed.contains(o.unit));
+    }
+
+    // Record as `Incremental.record` does, one node per owner, and relink
+    // from the pack with the manifest's numbered symbols.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pack: cache.Pack = try .create(io, tmp.dir);
+    defer pack.close(gpa, io);
+    const refs = try gpa.alloc(cache.Pack.AtomRef, atoms.items.len);
+    defer gpa.free(refs);
+    try pack.append(gpa, io, atoms.items, debug.items, refs);
+    {
+        var b: cache.Manifest.Builder = .{ .gpa = gpa };
+        defer b.deinit();
+        var symbols: std.ArrayList(cache.Manifest.AtomSymbols) = .empty;
+        defer symbols.deinit(gpa);
+        var next_debug: usize = 0;
+        var first: usize = 0;
+        for (atoms.items, 0..) |a, i| {
+            const file: ?[]const u8 = if (next_debug < debug.items.len and debug.items[next_debug].atom == i) f: {
+                next_debug += 1;
+                break :f "t.zig";
+            } else null;
+            try symbols.append(gpa, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = file });
+            if (i + 1 < atoms.items.len and std.meta.eql(owners.items[i + 1], owners.items[i]) and owners.items[i] != .content) continue;
+            _ = try b.addNode(.{ .key = i, .result_hash = 0, .atoms = refs[first .. i + 1], .symbols = symbols.items });
+            symbols.clearRetainingCapacity();
+            first = i + 1;
+        }
+        b.entry = @backingInt(start);
+        try b.write(io, tmp.dir, pack.id);
+    }
+    var m = (try cache.Manifest.open(gpa, io, tmp.dir)).?;
+    defer m.close(gpa, io);
+    const in = try m.linkInput(gpa);
+    const decoded = try gpa.alloc(Atom, in.refs.len);
+    defer gpa.free(decoded);
+    var decoded_debug: std.ArrayList(Atom.Debug) = .empty;
+    defer decoded_debug.deinit(gpa);
+    try pack.decodeAll(gpa, io, in.refs, decoded, &decoded_debug, .{ .of = in.debug_files, .names = &.{m.file(0)} });
+    const relinked = try Elf.emit(gpa, io, decoded, .{
+        .entry = start,
+        .debug = decoded_debug.items,
+        .symbols = .{ .atoms = in.numbered, .targets = in.targets, .entry = m.entry_symbol, .len = m.symbolLen() },
+    });
+    defer gpa.free(relinked);
+    try std.testing.expectEqualSlices(u8, fresh, relinked);
 }
