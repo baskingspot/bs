@@ -34,6 +34,8 @@ const Zcu = @import("Zcu.zig");
 const Emit = @import("Emit.zig");
 const Atom = @import("link/Atom.zig");
 const Elf = @import("link/Elf.zig");
+const ElfObject = @import("link/ElfObject.zig");
+const Archive = @import("link/Archive.zig");
 const Replay = @import("Replay.zig");
 
 const Incremental = @This();
@@ -79,6 +81,11 @@ check_failed: std.atomic.Value(bool) = .init(false),
 /// `--stack`, for a relink; part of the command line that keys the
 /// compilation.
 stack_size: u64 = 16 * 1024 * 1024,
+/// What the build links, from the command (part of the compilation's key),
+/// and the stem of a library's object's name in its archive (its root
+/// source file's).
+output: Manifest.Output = .exe,
+archive_stem: []const u8 = "",
 /// Whether a build that does not relink renews the output's mtime, as a
 /// relink would: `zap run`'s programs are trimmed by it.
 renew_output: bool = false,
@@ -193,7 +200,8 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     const t0 = now(io);
     const m = if (inc.prev) |*m| m else return inc.noRelink("no manifest", .{});
     if (inc.verify == .full) return inc.noRelink("verifying an edit build", .{});
-    if (m.entry == 0) return inc.noRelink("no entry point", .{});
+    if (m.output != inc.output) return inc.noRelink("the manifest links another kind of output", .{});
+    if (m.entry == 0 and inc.output == .exe) return inc.noRelink("no entry point", .{});
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(gpa);
     try m.changedInputs(gpa, io, &changed);
@@ -291,9 +299,27 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     for (files, 0..) |*f, i| f.* = m.file(@intCast(i));
     const input = try pack.linkAtoms(gpa, inc.arch, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
     defer input.deinit(gpa);
-    const values = try gpa.alloc(Elf.NumberedValue, m.errorCount());
-    defer gpa.free(values);
-    for (values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };
+    // An object's exports and imports; its imports are 0 in the image
+    // (`ElfObject.linkInput`).
+    var exports: std.ArrayList(ElfObject.Export) = .empty;
+    defer exports.deinit(gpa);
+    var imports: std.ArrayList(ElfObject.Import) = .empty;
+    defer imports.deinit(gpa);
+    var values: std.ArrayList(Elf.NumberedValue) = try .initCapacity(gpa, m.errorCount() + m.link_symbols.len);
+    defer values.deinit(gpa);
+    for (1..m.errorCount() + 1) |code| values.appendAssumeCapacity(.{ .symbol = m.errorSymbol(@intCast(code)), .value = code });
+    for (m.link_symbols) |ls| {
+        const name = m.string(ls.name);
+        switch (ls.kind) {
+            .@"export" => try exports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name }),
+            .import => {
+                const f: Emit.ImportFlags = .fromBits(@truncate(ls.flags));
+                try imports.append(gpa, .{ .key = @fromBackingInt(ls.key), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls });
+                if (m.symbol(ls.key)) |n| values.appendAssumeCapacity(.{ .symbol = n, .value = 0 });
+            },
+            _ => return inc.noLink("unknown link symbol kind", .{}),
+        }
+    }
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
     const gathered = now(io);
@@ -303,13 +329,13 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     for (&bounds, Elf.boundKeys()) |*b, key| b.* = m.symbol(@backingInt(key)) orelse Elf.no_bound;
 
     var diag: Elf.Diagnostic = .{};
-    Elf.linkInput(gpa, io, out_dir, sub_path, input, .{
-        .entry = @fromBackingInt(m.entry),
+    const options: Elf.Options = .{
+        .entry = if (inc.output == .exe) @fromBackingInt(m.entry) else null,
         .symbols = .{
             .atoms = in.numbered,
             .targets = in.targets,
             .targets_tail = in.targets_tail,
-            .values = values,
+            .values = values.items,
             .bounds = bounds,
             .entry = m.entry_symbol,
             .len = m.symbolLen(),
@@ -317,7 +343,21 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
         .diag = &diag,
         .comp_dir = cwd,
         .stack_size = inc.stack_size,
-    }) catch |err| switch (err) {
+    };
+    const symbols: ElfObject.Symbols = .{ .exports = exports.items, .imports = imports.items };
+    const result = switch (inc.output) {
+        .exe => Elf.linkInput(gpa, io, out_dir, sub_path, input, options),
+        .obj => ElfObject.linkInput(gpa, io, out_dir, sub_path, input, options, symbols),
+        .lib => lib: {
+            const obj = ElfObject.emitInput(gpa, io, input, options, symbols) catch |err| break :lib err;
+            defer gpa.free(obj);
+            const member = try std.fmt.allocPrint(gpa, "{s}.o", .{inc.archive_stem});
+            defer gpa.free(member);
+            break :lib Archive.write(gpa, io, out_dir, sub_path, member, obj);
+        },
+        _ => unreachable,
+    };
+    result catch |err| switch (err) {
         // A damaged pack or manifest: build from scratch instead.
         error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo => return inc.noLink("{t} (atom '{s}')", .{ err, diag.atom }),
         else => {
@@ -387,11 +427,13 @@ const donor_renew_ns = std.time.ns_per_hour;
 /// replayed here, beyond what the graph checks itself (inputs and
 /// red-green): zap and the target (`store_seed`), the std, and options
 /// Zcu reads without recording a dependency: `-fsingle-threaded` (whether
-/// declarations are threadlocal), test filters (which tests exist), and
-/// the root module's `-M` name (`Frontend.displayName`: `@src()` and
-/// messages show it; the root module's own name, which keys its files,
-/// is the same in every compilation so that `@import("root")` carries
-/// over).
+/// declarations are threadlocal), test filters (which tests exist), the
+/// root module's `-M` name (`Frontend.displayName`: `@src()` and messages
+/// show it; the root module's own name, which keys its files, is the same
+/// in every compilation so that `@import("root")` carries over), and
+/// whether the build links an object (`build-obj`, `build-lib`), whose
+/// code CodeGen generates differently: a symbol the build does not export
+/// is an import, not compiler_rt's.
 /// The builtin module is an input, so a donor whose builtin differs is
 /// valid, but loses most of std; `useDonor` ranks those last.
 fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, root_name: []const u8, args: []const []const u8) !Hash {
@@ -409,7 +451,9 @@ fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, r
         else => h.update(zig_lib_dir),
     }
     var single_threaded = false;
+    var object = false;
     for (args, 0..) |a, i| {
+        if (i == 0 and (std.mem.eql(u8, a, "build-obj") or std.mem.eql(u8, a, "build-lib"))) object = true;
         if (std.mem.eql(u8, a, "-fsingle-threaded")) single_threaded = true;
         if (std.mem.eql(u8, a, "-fno-single-threaded")) single_threaded = false;
         if (std.mem.eql(u8, a, "--test-filter") and i + 1 < args.len) {
@@ -418,6 +462,7 @@ fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, r
         }
     }
     h.update(if (single_threaded) "\x00st" else "\x00mt");
+    h.update(if (object) "\x00obj" else "\x00exe");
     return cache.hash(3, std.mem.asBytes(&h.final()));
 }
 
@@ -1626,7 +1671,7 @@ fn refsEql(m: *const Manifest, old: []const Manifest.Ref, new: []const Manifest.
     for (old, new) |a, b| {
         if (a.kind != b.kind) return false;
         switch (a.kind) {
-            .ext, .ext_weak, .rt => if (b.value >= m.refNameCount() or a.value != b.value) return false,
+            .ext, .ext_weak, .rt, .import => if (b.value >= m.refNameCount() or a.value != b.value) return false,
             .quota, .effects => {},
             else => if (a.value != b.value) return false,
         }
@@ -1660,9 +1705,35 @@ fn onlyComptimeRootsDiffer(m: *const Manifest, old: []const Manifest.Ref, new: [
     }
 }
 
+/// Whether a reference names a symbol outside the build.
+fn externalRef(kind: Manifest.Ref.Kind) bool {
+    return switch (kind) {
+        .ext, .ext_weak, .import => true,
+        else => false,
+    };
+}
+
+/// The `refName` of an import: its name, NUL, and its flags as a digit
+/// (`Manifest.Ref.value`), so that a change in flags alone is a changed
+/// reference.
+fn addImportRefName(gpa: Allocator, namer: anytype, name: []const u8, flags: Emit.ImportFlags) !u32 {
+    const ref_name = try std.fmt.allocPrint(gpa, "{s}\x00{d}", .{ name, flags.bits() });
+    defer gpa.free(ref_name);
+    return namer.addRefName(ref_name);
+}
+
+/// The name and flags of an import `refName` (`addImportRefName`).
+pub fn parseImportRef(ref_name: []const u8) ?struct { []const u8, Emit.ImportFlags } {
+    if (ref_name.len < 2 or ref_name[ref_name.len - 2] != 0) return null;
+    const digit = ref_name[ref_name.len - 1];
+    if (digit < '0' or digit > '7') return null;
+    return .{ ref_name[0 .. ref_name.len - 2], .fromBits(@intCast(digit - '0')) };
+}
+
 /// Falls back if the link's inputs outside the atoms change with the live set:
-/// the symbols it resolves outside the build (`ext`, `ext_weak`), whether
-/// it writes the error name table, and if so, the error names.
+/// the symbols it resolves outside the build (`ext`, `ext_weak`), an
+/// object's imports (`import`, with their flags; the manifest lists them),
+/// whether it writes the error name table, and if so, the error names.
 fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSetUnmanaged, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, d: *Manifest.Delta) !void {
     const gpa = inc.gpa;
     const m = rp.m;
@@ -1677,6 +1748,9 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSe
                 // Weak and strong references to one name resolve alike
                 // unless every one is weak.
                 .ext_weak => try s.names.put(a, try std.fmt.allocPrint(a, "{s}\x00weak", .{name}), {}),
+                // Any change of an import's flags falls back, even one
+                // that merges to the same flags.
+                .import => try s.names.put(a, try std.fmt.allocPrint(a, "\x00import\x00{s}", .{name}), {}),
                 .error_names => s.error_names = true,
                 else => {},
             }
@@ -1694,13 +1768,13 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSe
         const is_link = m.node(i).tag == @backingInt(Tag.link);
         const has_atoms = m.atoms(i).len != 0;
         const refs = m.nodeRefs(i);
-        if (is_link or (has_atoms and !m.flags(i).unlinked)) for (refs) |ref| try old.add(arena, ref.kind, if (ref.kind == .ext or ref.kind == .ext_weak) m.refName(ref.value) else "");
+        if (is_link or (has_atoms and !m.flags(i).unlinked)) for (refs) |ref| try old.add(arena, ref.kind, if (externalRef(ref.kind)) m.refName(ref.value) else "");
         if (written.isSet(i)) continue;
-        if (is_link or (has_atoms and live.isSet(i))) for (refs) |ref| try new.add(arena, ref.kind, if (ref.kind == .ext or ref.kind == .ext_weak) m.refName(ref.value) else "");
+        if (is_link or (has_atoms and live.isSet(i))) for (refs) |ref| try new.add(arena, ref.kind, if (externalRef(ref.kind)) m.refName(ref.value) else "");
     }
     for (nodes, write, 0..) |n, w, ni| if (w and n.atoms.len != 0) for (node_refs[ref_starts[ni]..ref_starts[ni + 1]]) |nr| {
         const name = switch (nr.ref.kind) {
-            .ext, .ext_weak => if (nr.ref.value < m.refNameCount()) m.refName(nr.ref.value) else d.strings.items[d.ref_names.items[nr.ref.value - m.refNameCount()].off..][0..d.ref_names.items[nr.ref.value - m.refNameCount()].len],
+            .ext, .ext_weak, .import => if (nr.ref.value < m.refNameCount()) m.refName(nr.ref.value) else d.strings.items[d.ref_names.items[nr.ref.value - m.refNameCount()].off..][0..d.ref_names.items[nr.ref.value - m.refNameCount()].len],
             else => "",
         };
         try new.add(arena, nr.ref.kind, name);
@@ -2138,6 +2212,7 @@ const Graph = struct {
             .nav => .{ .kind = .nav, .value = try r.unitNode(it[1]) },
             .err => |name| .{ .kind = .err, .value = try ip.errorValue(name) },
             .ext => |e| .{ .kind = if (e.weak) .ext_weak else .ext, .value = try namer.addRefName(e.name) },
+            .import => |e| .{ .kind = .import, .value = try addImportRefName(gpa, namer, e.name, e.flags) },
             .rt => |key| .{ .kind = .rt, .value = try namer.addRefName(key) },
             .error_names => .{ .kind = .error_names, .value = 0 },
         } });
@@ -2341,7 +2416,10 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     for (base_names.items) |name| _ = try b.addBasePack(name);
     b.items = enc.words.items;
     b.item_starts = enc.starts.items;
-    b.entry = @backingInt(emit.entry.?);
+    b.entry = if (emit.entry) |e| @backingInt(e) else 0;
+    b.output = inc.output;
+    for (emit.exports.items) |x| try b.addLinkSymbol(.@"export", @backingInt(x.key), x.name, 0);
+    for (emit.imports.keys(), emit.imports.values()) |name, flags| try b.addLinkSymbol(.import, @backingInt(Emit.importKey(name)), name, flags.bits());
     for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
     const t3 = now(io);
     var path_buf: std.ArrayList(u8) = .empty;
@@ -3080,14 +3158,14 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         fn refKey(bb: *const Manifest.Builder, rec: *const Recorder, ref: Manifest.Ref) [2]Hash {
             return .{ @backingInt(ref.kind), switch (ref.kind) {
                 .func, .nav, .effects, .root => rec.nodes.items[ref.value].key,
-                .ext, .ext_weak, .rt => cache.hash(0, bb.strings.items[bb.ref_names.items[ref.value].off..][0..bb.ref_names.items[ref.value].len]),
+                .ext, .ext_weak, .rt, .import => cache.hash(0, bb.strings.items[bb.ref_names.items[ref.value].off..][0..bb.ref_names.items[ref.value].len]),
                 .err, .error_names, .analyze, .quota => ref.value,
             } };
         }
         fn prevRefKey(mm: *const Manifest, ref: Manifest.Ref) [2]Hash {
             return .{ @backingInt(ref.kind), switch (ref.kind) {
                 .func, .nav, .effects, .root => mm.node(ref.value).key,
-                .ext, .ext_weak, .rt => cache.hash(0, mm.refName(ref.value)),
+                .ext, .ext_weak, .rt, .import => cache.hash(0, mm.refName(ref.value)),
                 .err, .error_names, .analyze, .quota => ref.value,
             } };
         }

@@ -670,6 +670,10 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
         .other => |o| switch (o.kind) {
             .err => _ = try emit.useError(try zcu.ip.getString(Zcu.tid, m.errorName(o.value))),
             .ext, .ext_weak => _ = try emit.useExtern(m.refName(o.value), o.kind == .ext_weak),
+            .import => {
+                const name, const flags = Incremental.parseImportRef(m.refName(o.value)) orelse return error.InvalidImportRef;
+                _ = try emit.useImport(name, flags);
+            },
             .rt => {
                 const key = m.refName(o.value);
                 const rest = key["compiler_rt:compiler_rt/".len..];

@@ -77,6 +77,8 @@ id: Hash,
 pack_id: Hash,
 /// The link's entry symbol (an `Atom.SymbolKey`), or 0.
 entry: Hash,
+/// What the build linked.
+output: Output,
 /// The entry's number, and how many numbers the base uses.
 entry_symbol: u32,
 /// How many base nodes are `unlinked`.
@@ -101,8 +103,12 @@ files: []const StrRef,
 /// Each node's references are `refs[ref_starts[i]..ref_starts[i + 1]]`.
 ref_starts: []const u32,
 refs: []const Ref,
-/// Names that `ext`, `ext_weak`, and `rt` references index.
+/// Names that `ext`, `ext_weak`, `import`, and `rt`
+/// references index.
 ref_names: []const StrRef,
+/// An object's or a library's exports, then its imports, each sorted by
+/// name (empty for an executable).
+link_symbols: []const LinkSymbol,
 nodes: []const Node,
 /// Where each base node's source is, parallel to `nodes` (see `Source`).
 sources: []const Source,
@@ -208,13 +214,31 @@ pub const Source = extern struct {
 
 pub const SourceName = extern struct { node: u32, name: StrRef };
 
+/// The kind of file a build links: an executable, a relocatable object
+/// (`build-obj`), or a static library holding one (`build-lib`).
+pub const Output = enum(u32) { exe, obj, lib, _ };
+
+/// A symbol an object defines for other objects, or one it leaves to them,
+/// by name (`ElfObject.Export`, `ElfObject.Import`). An export's `key` is
+/// the atom's; an import's is the key relocations name it by.
+pub const LinkSymbol = extern struct {
+    key: Hash,
+    name: StrRef,
+    kind: Kind,
+    /// An import's `Emit.ImportFlags.bits`; 0 for an export.
+    flags: u32 = 0,
+
+    pub const Kind = enum(u32) { @"export", import, _ };
+};
+
 /// Something a unit requested that is not a dependency: what loading the
 /// unit from the cache must request again so that the build reaches the
 /// same units and emits the same data.
 pub const Ref = extern struct {
     kind: Kind,
     /// A node index (`func`, `nav`), an error code (`err`), an index for
-    /// `refName` (`ext`, `ext_weak`, `rt`), or 0.
+    /// `refName` (`ext`, `ext_weak`, `rt`, `import`), or 0. An `import`'s
+    /// name ends in NUL and its `Emit.ImportFlags.bits` as an ASCII digit.
     value: u32,
 
     pub const Kind = enum(u32) {
@@ -247,6 +271,9 @@ pub const Ref = extern struct {
         /// declaration's unit (`value`), which a build that makes the
         /// container analyzes.
         root,
+        /// In an object, a symbol another object defines, which the unit's
+        /// code refers to (`Emit.useImport`).
+        import,
     };
 };
 
@@ -378,10 +405,10 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN11".*;
+const magic = "ZAPMAN12".*;
 const log_magic = "ZAPMLG05".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
@@ -392,7 +419,7 @@ const Header = extern struct {
     entry_symbol: u32,
     /// How many nodes are `unlinked`.
     unlinked: u32 = 0,
-    unused: u32 = 0,
+    output: Output = .exe,
     id: Hash,
     pack_id: Hash,
     entry: Hash,
@@ -483,6 +510,7 @@ comptime {
     std.debug.assert(@sizeOf(NodeDelta) == 96);
     std.debug.assert(@sizeOf(Symbol) == 24);
     std.debug.assert(@sizeOf(InputDelta) == 80);
+    std.debug.assert(@sizeOf(LinkSymbol) == 32);
 }
 
 /// The log, applied. Slices point into `buf`.
@@ -575,6 +603,7 @@ fn SectionType(comptime s: Section) type {
         .symbols => Symbol,
         .numbered => NumberedAtom,
         .targets, .error_symbols, .debug_files, .debug_atoms => u32,
+        .link_symbols => LinkSymbol,
         .strings => u8,
     };
 }
@@ -593,6 +622,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
     m.id = h.id;
     m.pack_id = h.pack_id;
     m.entry = h.entry;
+    m.output = h.output;
     m.entry_symbol = h.entry_symbol;
     m.base_unlinked = h.unlinked;
     m.symbol_len = h.symbol_len;
@@ -613,6 +643,9 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
         m.result_starts.len != m.nodes.len + 1 or m.result_starts[m.nodes.len] != m.results.len or
         m.subject_starts.len != m.nodes.len + 1 or m.subject_starts[m.nodes.len] != m.subjects.len or
         (m.item_starts.len != 0 and m.item_starts[m.item_starts.len - 1] >= m.items.len)) return corrupt(io, &map);
+    for (m.link_symbols) |ls| {
+        if (ls.name.off > m.strings.len or ls.name.len > m.strings.len - ls.name.off or ls.flags > 7) return corrupt(io, &map);
+    }
     errdefer m.overlay.deinit(gpa);
     try m.readLog(gpa, io, dir);
     return m;
@@ -1432,6 +1465,8 @@ pub const Builder = struct {
     owned_item_starts: std.ArrayList(u32) = .empty,
     strings: std.ArrayList(u8) = .empty,
     entry: Hash = 0,
+    output: Output = .exe,
+    link_symbols: std.ArrayList(LinkSymbol) = .empty,
     /// Each number's key.
     symbol_keys: std.ArrayList(Hash) = .empty,
     /// Keys numbered since `base`, or all of them without one.
@@ -1468,6 +1503,7 @@ pub const Builder = struct {
         b.owned_items.deinit(gpa);
         b.owned_item_starts.deinit(gpa);
         b.strings.deinit(gpa);
+        b.link_symbols.deinit(gpa);
         b.symbol_keys.deinit(gpa);
         b.symbol_map.deinit(gpa);
         b.added.deinit(gpa);
@@ -1476,7 +1512,7 @@ pub const Builder = struct {
     /// Starts from `base` with its log applied. `base` must stay open while
     /// the builder is used.
     pub fn initFrom(gpa: Allocator, base: *const Manifest) !Builder {
-        var b: Builder = .{ .gpa = gpa, .base = base, .entry = base.entry };
+        var b: Builder = .{ .gpa = gpa, .base = base, .entry = base.entry, .output = base.output };
         errdefer b.deinit();
         try b.nodes.appendSlice(gpa, base.nodes);
         try b.edges.appendSlice(gpa, base.edges);
@@ -1488,6 +1524,7 @@ pub const Builder = struct {
         try b.bases.appendSlice(gpa, base.bases);
         try b.files.appendSlice(gpa, base.files);
         try b.ref_names.appendSlice(gpa, base.ref_names);
+        try b.link_symbols.appendSlice(gpa, base.link_symbols);
         try b.refs.appendSlice(gpa, base.refs);
         try b.ref_ranges.ensureTotalCapacity(gpa, base.nodeCount());
         for (0..base.nodes.len) |i| b.ref_ranges.appendAssumeCapacity(.{ base.ref_starts[i], base.ref_starts[i + 1] - base.ref_starts[i] });
@@ -1772,6 +1809,11 @@ pub const Builder = struct {
         return @intCast(b.error_names.items.len);
     }
 
+    /// Adds an object's export or import (see `Manifest.link_symbols`).
+    pub fn addLinkSymbol(b: *Builder, kind: LinkSymbol.Kind, key: Hash, name: []const u8, link_flags: u32) !void {
+        try b.link_symbols.append(b.gpa, .{ .key = key, .name = try b.addString(name), .kind = kind, .flags = link_flags });
+    }
+
     /// Adds a base pack by file name; returns its pack index.
     pub fn addBasePack(b: *Builder, name: []const u8) !u32 {
         try b.bases.append(b.gpa, try b.addString(name));
@@ -1827,7 +1869,7 @@ pub const Builder = struct {
             for (b.refs.items[range[0]..][0..range[1]]) |r| {
                 switch (r.kind) {
                     .func, .nav, .effects, .root => if (r.value >= nodes.len) return error.InvalidNodeIndex,
-                    .ext, .ext_weak, .rt => if (r.value >= b.ref_names.items.len) return error.InvalidRefName,
+                    .ext, .ext_weak, .rt, .import => if (r.value >= b.ref_names.items.len) return error.InvalidRefName,
                     .err, .error_names, .analyze, .quota => {},
                 }
                 node_refs.appendAssumeCapacity(r);
@@ -1969,6 +2011,7 @@ pub const Builder = struct {
             .id = undefined,
             .pack_id = pack_id,
             .entry = b.entry,
+            .output = b.output,
             .symbol_len = next,
             .entry_symbol = entry_symbol,
             .unlinked = n_unlinked: {
@@ -2006,6 +2049,7 @@ pub const Builder = struct {
             @ptrCast(result_starts),
             @ptrCast(node_subjects),
             @ptrCast(subject_starts),
+            @ptrCast(b.link_symbols.items),
             b.strings.items,
         };
         const zeros: [16]u8 = @splat(0);
@@ -2103,6 +2147,9 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         try t.expectEqual(1, try b.addErrorName("OutOfMemory", 0xe1));
         try t.expectEqual(2, try b.addErrorName("Overflow", 0xe2));
         b.entry = 0xa1;
+        b.output = .lib;
+        try b.addLinkSymbol(.@"export", 0xa1, "zap_add", 0);
+        try b.addLinkSymbol(.import, 0xb0, "c_twice", 1);
         try b.write(io, tmp.dir, 0xabc);
     }
     var m = (try Manifest.open(gpa, io, tmp.dir)).?;
@@ -2191,6 +2238,12 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     const expectLogged = struct {
         fn check(m3: *Manifest) !void {
             try t.expectEqual(5, m3.nodeCount());
+            try t.expectEqual(Output.lib, m3.output);
+            try t.expectEqual(2, m3.link_symbols.len);
+            try t.expectEqual(LinkSymbol.Kind.import, m3.link_symbols[1].kind);
+            try t.expectEqual(1, m3.link_symbols[1].flags);
+            try t.expectEqual(0xb0, m3.link_symbols[1].key);
+            try t.expectEqualStrings("c_twice", m3.string(m3.link_symbols[1].name));
             try t.expectEqual(33, m3.node(2).result_hash);
             try t.expectEqual(6, m3.node(4).result_hash);
             try t.expectEqual(4, m3.find(104));

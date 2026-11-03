@@ -1970,9 +1970,10 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
     code an export reaches): hello, link stage 6.5–8.3 ms for the object
     against 3.1–4.3 ms for the executable, in a 230 ms build; libvaxis
     text_input, 8.7–10.1 ms against 4.6–6.0 ms, in a 560 ms build.
-  - build-obj does not use the on-disk cache yet: a relink would need the
-    exports, the imports, and the output kind in the manifest, and
-    `ElfObject` to take the cache's input with numbered symbols.
+  - build-obj and build-lib use the on-disk cache as build-exe does
+    ("Roots and output kinds" below). An object's exports and imports are
+    sorted by name, so that the object is a function of its atoms, as the
+    link order is.
 - `zap run` builds the executable into `<cache>/zap/o/<hash>/<name>`, the
   hash of the working directory, std's directory, and the command line
   before `--`, so a rerun relinks in place through the cache, then
@@ -2208,9 +2209,11 @@ of six runs of 15 each, moves −8% to +8% by measurement (random targets
 the static path gained one branch per chunk and one per atom.
 
 **Cache.** `-fPIC` and `-dynamic` exist only on `build-obj` and
-`build-lib`, which skip the cache today, so no pic atom reaches the
-store. When objects are cached ("Roots and output kinds"), pic and
-non-pic atoms are kept apart by both keys: the compilation key holds the
+`build-lib`. Those commands use the cache ("Roots and output kinds"),
+but pic builds still skip it (main's `openCache`) because `Elf`'s
+numbered link has no position-independent layout yet, so no pic atom
+reaches the store. When they are cached, pic and non-pic atoms are kept
+apart by both keys: the compilation key holds the
 arguments, and the donor key gains the options that change code
 (`-fPIC`, `-dynamic`, the output kind; the cache thread adds them). The
 donor key matters because a first build replays another compilation's
@@ -3258,17 +3261,42 @@ ample). `record` takes it from `Zcu.conditional_deps`, and a plain edge
 to the same node wins. Reverse edges are plain node indices: both kinds
 invalidate.
 
-**Roots and output kinds** (for `zap build-obj`, which skips the cache
-for now). Replay seeds its reference closure from a root list the
-manifest stores (comptime declarations, exports, the entry, tests), as
-`record` already gathers them, not from the entry; an object's roots are
-its exports. The manifest's entry is optional and its header records the
-output kind, so the relink picks `Elf` or `ElfObject` (the compilation
-key holds the arguments, so the kind cannot change within a compilation
-directory). An object's imports come from the recorded `useExtern`
-references of the units linked; exports already come from Emit.
-`ElfObject` takes the same numbered input as `Elf`, so the pack serves
-both. A format version bump and the linker side; no Sema hook.
+**Roots and output kinds** (`zap build-obj` and `build-lib`, built
+2026-11-03). Reach already starts from what `record` gathers (namespace
+roots, exports, tests, `comptime` declarations), not from the entry, so
+an object's exports are its roots with no change there. What the relink
+needs besides the atoms is in the manifest (ZAPMAN12):
+
+- The header's output kind (`Manifest.Output`: exe, obj, lib). The
+  compilation key holds the arguments, so the kind cannot change within a
+  compilation directory; a mismatch only declines the relink. The entry is
+  0 for an object.
+- `link_symbols`: the exports (atom key and name) and then the imports
+  (key, name and `Emit.ImportFlags`: weak, hidden, tls), each sorted by
+  name, as `Emit.finish` orders them for `ElfObject`.
+- Imports are references, like externs: `Emit.useImport` records an
+  `import` reference for the current unit, which a worker's merge carries
+  over and which a loaded unit requests again (`Replay`), so an eager
+  build's import list is a full build's. The reference's name is the
+  symbol's, a NUL and the flags as a digit, so a change in flags alone is
+  a changed reference. A lazy build falls back when the imports of the
+  live nodes change, flags included (`checkLinkInputs`, as for externs),
+  or exports change (as before), so the manifest's lists stay right
+  without a log record for them.
+- `ElfObject.linkInput` takes the numbered input `Elf.linkInput` takes;
+  an import's number gets the value 0. With no entry, `Elf` ignores
+  `Symbols.entry`. A library relinks by building the object in memory and
+  writing the archive (`Archive.write`) with the member named after the
+  root source file.
+- Donor keys include whether the build links an object: CodeGen makes an
+  object's unresolved symbols imports instead of compiler_rt calls, so an
+  executable's atoms are not an object's.
+- `-fPIC`, `-fPIE` and `-dynamic` builds skip the cache for now (see
+  "Position-independent code and shared libraries").
+- Checked by test/obj/cache.sh: cold, relink, lazy edit, an import that
+  goes (eager fallback), an export that comes back, and an import that
+  becomes weak (fallback, then a relink), for build-obj and build-lib, each byte-identical to a build without the cache and checked
+  with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`.
 
 **Step 4a as built** (2026-11-03). An edit build is a full build in which
 green units are loaded instead of analyzed; `record` then writes a whole
@@ -3458,8 +3486,12 @@ analyzing everything.
   (`-fsingle-threaded`, which decides whether declarations are
   threadlocal, test filters, and the root module's `-M` name, which
   `@src()` and messages show while its files are keyed `=root:` or
-  `=main:` in every compilation). Everything else (the builtin module,
-  root and modules, every file) is an input the replay checks.
+  `=main:` in every compilation), and whether the build links an object,
+  which CodeGen reads (an object imports what it does not define).
+  Everything else (the builtin module, root and modules, every file) is
+  an input the replay checks. Options that change code without changing
+  builtin.zig (`-fPIC`, `-ffuzz`) must join the key, or the store seed as
+  `-ffuzz` does, when they land.
 - *Choosing.* `useDonor` runs after the frontend: among the donors of
   this compilation's key, it takes the one whose builtin module is this
   build's, then the one sharing the most input files (same path, same

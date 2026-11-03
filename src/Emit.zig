@@ -211,11 +211,10 @@ const Out = struct { start: Marks, end: Marks, failed: bool };
 
 const Side = union(enum) {
     rt: []const u8,
-    import: struct { name: []const u8, flags: ImportFlags },
 };
 
 /// How an object refers to an imported symbol.
-const ImportFlags = struct {
+pub const ImportFlags = struct {
     /// Every reference is weak.
     weak: bool = false,
     /// Some reference is PC-relative (`pcrelTarget`), so the final link
@@ -223,6 +222,20 @@ const ImportFlags = struct {
     hidden: bool = false,
     /// A thread-local (`tlsTarget`).
     tls: bool = false,
+
+    /// The flags of a symbol referred to both ways.
+    pub fn merge(a: ImportFlags, b: ImportFlags) ImportFlags {
+        return .{ .weak = a.weak and b.weak, .hidden = a.hidden or b.hidden, .tls = a.tls or b.tls };
+    }
+
+    /// As the cache stores them (`Manifest.LinkSymbol.flags`).
+    pub fn bits(f: ImportFlags) u3 {
+        return @as(u3, @intFromBool(f.weak)) | @as(u3, @intFromBool(f.hidden)) << 1 | @as(u3, @intFromBool(f.tls)) << 2;
+    }
+
+    pub fn fromBits(b: u3) ImportFlags {
+        return .{ .weak = b & 1 != 0, .hidden = b & 2 != 0, .tls = b & 4 != 0 };
+    }
 };
 
 /// `Zcu.exports` as CodeGen may read them: a worker's snapshot, taken when
@@ -295,6 +308,8 @@ pub const UnitRef = struct {
         err: InternPool.String,
         /// `useExtern`; the name is owned by `externs`.
         ext: struct { name: []const u8, weak: bool },
+        /// `useImport`; the name is owned by `imports`.
+        import: struct { name: []const u8, flags: ImportFlags },
         /// `requestCompilerRt`'s key, owned by the Emit that requested it.
         rt: []const u8,
         error_names,
@@ -577,7 +592,6 @@ fn mergeOut(emit: *Emit, w: *const Emit, out: Out) Allocator.Error!void {
     defer emit.owner = saved;
     for (w.side.items[out.start.side..out.end.side]) |s| switch (s) {
         .rt => |key| _ = try emit.requestRtKey(key),
-        .import => |i| _ = try emit.useImport(i.name, i.flags),
     };
     var d = out.start.debug;
     for (out.start.atoms..out.end.atoms) |i| {
@@ -604,6 +618,10 @@ fn mergeOut(emit: *Emit, w: *const Emit, out: Out) Allocator.Error!void {
             if (!gop.found_existing) {
                 gop.value_ptr.* = x.weak;
             } else if (!x.weak) gop.value_ptr.* = false;
+        },
+        .import => |x| {
+            const gop = try emit.imports.getOrPut(gpa, x.name);
+            gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.merge(x.flags) else x.flags;
         },
         // In `side`.
         .rt => {},
@@ -723,6 +741,23 @@ pub fn finish(emit: *Emit) !bool {
     }
 
     try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
+    // An object's symbols by name, not in the order analysis or the
+    // cache's loading found them, so that the object is a function of its
+    // atoms as the link order is (`groupByOwner`).
+    if (emit.obj) {
+        std.mem.sortUnstable(ElfObject.Export, emit.exports.items, {}, struct {
+            fn lessThan(_: void, a: ElfObject.Export, b: ElfObject.Export) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lessThan);
+        const Names = struct {
+            keys: []const []const u8,
+            pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+                return std.mem.lessThan(u8, c.keys[a], c.keys[b]);
+            }
+        };
+        emit.imports.sort(Names{ .keys = emit.imports.keys() });
+    }
 
     // Error codes: the order names were first interned, starting at 1.
     for (emit.errors.keys()) |name| {
@@ -837,7 +872,7 @@ fn externSlotKey(name: []const u8) SymbolKey {
 }
 
 /// The key relocations name an imported symbol by (see `useImport`).
-fn importKey(name: []const u8) SymbolKey {
+pub fn importKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
     return .fromName(std.fmt.bufPrint(&buf, "import.{s}", .{name}) catch name);
 }
@@ -848,18 +883,16 @@ pub fn tlsGetAddr(emit: *Emit) !SymbolKey {
     return emit.useImport("__tls_get_addr", .{});
 }
 
-/// In an object, the key of `name`, which another object defines.
-fn useImport(emit: *Emit, name: []const u8, flags: ImportFlags) !SymbolKey {
+/// In an object, the key of `name`, which another object defines, on
+/// behalf of the current unit (a worker's merge moves its imports with its
+/// references).
+pub fn useImport(emit: *Emit, name: []const u8, flags: ImportFlags) !SymbolKey {
     const gop = try emit.imports.getOrPut(emit.gpa, name);
     if (!gop.found_existing) {
         gop.key_ptr.* = try emit.allocator().dupe(u8, name);
         gop.value_ptr.* = flags;
-    } else {
-        gop.value_ptr.weak = gop.value_ptr.weak and flags.weak;
-        gop.value_ptr.hidden = gop.value_ptr.hidden or flags.hidden;
-        gop.value_ptr.tls = gop.value_ptr.tls or flags.tls;
-    }
-    if (emit.is_worker) try emit.side.append(emit.gpa, .{ .import = .{ .name = gop.key_ptr.*, .flags = flags } });
+    } else gop.value_ptr.* = gop.value_ptr.merge(flags);
+    try emit.addRef(.{ .import = .{ .name = gop.key_ptr.*, .flags = flags } });
     return importKey(name);
 }
 

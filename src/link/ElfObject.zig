@@ -58,7 +58,15 @@ pub const Symbols = struct {
 /// Writes the object of `atoms` to `sub_path` in `dir`, overwriting the
 /// old one in place when that is safe, as `Elf.link` does.
 pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, atoms: []const Atom, options: Elf.Options, symbols: Symbols) !void {
-    const obj = try build(gpa, io, atoms, options, symbols);
+    return linkInput(gpa, io, dir, sub_path, Elf.AtomSlice{ .atoms = atoms, .debug_entries = options.debug }, options, symbols);
+}
+
+/// `link` with the atoms and their debug info read from `input`, as
+/// `Elf.linkInput` reads them, such as the cache's mapped packs. With
+/// `options.symbols` (numbered, as the cache's manifest numbers them), its
+/// `values` must give each import's number the value 0.
+pub fn linkInput(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, input: anytype, options: Elf.Options, symbols: Symbols) !void {
+    const obj = try build(gpa, io, input, options, symbols);
     defer obj.deinit(gpa);
     var out: Elf.ReusedOutput = .{ .dir = dir, .sub_path = sub_path, .writes = .pwrite, .executable = false };
     defer out.close(io);
@@ -72,7 +80,12 @@ pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, a
 /// `Elf.emit`'s, without `entry` or `symbols`; an undefined export fails
 /// with `error.UndefinedSymbol`.
 pub fn emit(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, symbols: Symbols) Elf.Error![]u8 {
-    const obj = try build(gpa, io, atoms, options, symbols);
+    return emitInput(gpa, io, Elf.AtomSlice{ .atoms = atoms, .debug_entries = options.debug }, options, symbols);
+}
+
+/// `emit` with the atoms read from `input` (see `linkInput`).
+pub fn emitInput(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbols: Symbols) Elf.Error![]u8 {
+    const obj = try build(gpa, io, input, options, symbols);
     defer gpa.free(obj.tail);
     const out = try gpa.realloc(obj.image, obj.prefix.len + obj.tail.len);
     @memcpy(out[obj.prefix.len..], obj.tail);
@@ -91,12 +104,12 @@ const Object = struct {
     }
 };
 
-fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, symbols: Symbols) Elf.Error!Object {
-    std.debug.assert(options.symbols == null);
+fn build(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbols: Symbols) Elf.Error!Object {
     var unused_diag: Elf.Diagnostic = .{};
     const diag = options.diag orelse &unused_diag;
 
-    // The image, with imports resolved to 0 for now.
+    // The image, with imports resolved to 0 for now (numbered symbols
+    // carry those values already).
     const values = try gpa.alloc(Elf.Value, options.values.len + symbols.imports.len);
     defer gpa.free(values);
     @memcpy(values[0..options.values.len], options.values);
@@ -106,8 +119,9 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
     image_options.values = values;
     image_options.diag = diag;
     image_options.object = true;
-    const image = try Elf.emit(gpa, io, atoms, image_options);
+    const image = try Elf.emitInput(gpa, io, input, image_options);
     errdefer gpa.free(image);
+    const n_atoms = input.len();
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -117,11 +131,12 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
     // The image's symbols are the kept atoms, in input order.
     const n_syms = c.image_symtab.len;
     var sym_of: std.HashMapUnmanaged(SymbolKey, u32, KeyContext, 80) = .empty;
-    try sym_of.ensureTotalCapacity(arena, @intCast(atoms.len));
+    try sym_of.ensureTotalCapacity(arena, @intCast(n_atoms));
     const atom_of = try arena.alloc(u32, n_syms);
     var next: u32 = 1;
-    for (atoms, 0..) |*a, i| {
-        const gop = sym_of.getOrPutAssumeCapacity(a.key);
+    for (0..n_atoms) |i| {
+        const av = input.atom(i);
+        const gop = sym_of.getOrPutAssumeCapacity(Elf.ref(&av).key);
         if (gop.found_existing) continue;
         gop.value_ptr.* = next;
         atom_of[next] = @intCast(i);
@@ -144,7 +159,8 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
         // could be preempted, so a shared object's link would refuse it
         // PC-relative, and the object's code binds to its own definitions
         // (as upstream's does).
-        if (!options.pic and std.mem.eql(u8, atoms[atom_of[s.*]].name, x.name)) index[s.*] = std.math.maxInt(u32);
+        const av = input.atom(atom_of[s.*]);
+        if (!options.pic and std.mem.eql(u8, Elf.ref(&av).name, x.name)) index[s.*] = std.math.maxInt(u32);
     }
     next = @intCast(1 + c.sections.items.len);
     for (index[1..]) |*x| {
@@ -207,7 +223,8 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
 
     // The atoms' relocations.
     for (c.image_symtab[1..], atom_of[1..]) |s, i| {
-        const a = &atoms[i];
+        const av = input.atom(i);
+        const a = Elf.ref(&av);
         if (a.relocs.len == 0) continue;
         const k = c.section_of[s.shndx];
         const relas = &c.sections.items[k - 1].relas;

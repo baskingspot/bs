@@ -309,9 +309,9 @@ pub const Job = struct {
     /// everything else.
     pub fn openCache(job: *const Job, out_path: ?[]const u8) ?Incremental {
         const env = job.environ_map;
-        // build-obj does not use the cache yet: a relink would also need the
-        // object's exports and imports in the manifest.
-        const use_cache = out_path != null and !job.opts.dump_ir and job.opts.command != .build_obj and job.opts.command != .build_lib and
+        // The numbered link has no position-independent layout yet (`Elf`);
+        // -fPIE and -dynamic imply -fPIC.
+        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -322,6 +322,12 @@ pub const Job = struct {
         i.check = env.get("ZAP_CACHE_CHECK") != null;
         i.donors = !std.mem.eql(u8, env.get("ZAP_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
+        i.output = switch (job.opts.command) {
+            .build_obj => .obj,
+            .build_lib => .lib,
+            else => .exe,
+        };
+        i.archive_stem = std.fs.path.stem(job.opts.root_src_path);
         // `zap run`'s program counts as used when it runs (`renew_output`);
         // other outputs keep the stat the last link left, so that the next
         // build can skip the link.
@@ -488,12 +494,12 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // A lazy edit build links from the manifest it appends to.
     const lazy_linked = if (inc_opt) |i| try i.finishLazy(&fe, &zcu, &emit, Io.Dir.cwd(), bin_path) else null;
     if (lazy_linked == null) if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
-    // A static library is its object in an archive (link/Archive.zig); it
-    // does not use the cache, so it never links lazily.
+    // A static library is its object in an archive (link/Archive.zig); a
+    // lazy edit build writes the archive itself.
     const archive = opts.command == .build_lib and !opts.dynamic;
     const link_path = if (archive) try std.fmt.allocPrint(arena, "{s}.o.tmp", .{bin_path}) else bin_path;
     var linked = lazy_linked orelse try emit.link(init.io, Io.Dir.cwd(), link_path);
-    if (linked and archive) {
+    if (linked and lazy_linked == null and archive) {
         defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
         const obj = try Io.Dir.cwd().readFileAlloc(init.io, link_path, arena, .unlimited);
         const member = try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(opts.root_src_path)});

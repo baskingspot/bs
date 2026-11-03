@@ -412,7 +412,8 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
 
 /// `zap build-obj`: test/obj/lib.zig, linked into test/obj/main.zig by
 /// upstream zig, run normally and into a panic in the object's code, whose
-/// stack trace needs the object's debug info. `zap run`: test/obj/args.zig,
+/// stack trace needs the object's debug info, and edited through the cache
+/// as an object and a library (test/obj/cache.sh). `zap run`: test/obj/args.zig,
 /// whose arguments and exit status must pass through.
 fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const host = b.graph.host.result;
@@ -553,6 +554,16 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         tls_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&tls_run.step);
     }
+
+    // build-obj and build-lib through the cache: test/obj/cache.sh.
+    const cache = b.addSystemCommand(&.{"sh"});
+    cache.setName("zap build-obj and build-lib cache");
+    cache.addFileArg(b.path("test/obj/cache.sh"));
+    cache.addArtifactArg(zap);
+    cache.addFileArg(b.path("test/obj/lib.zig"));
+    _ = cache.addOutputDirectoryArg("work");
+    cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&cache.step);
 
     const zap_run = b.addRunArtifact(zap);
     zap_run.setName("zap run args");
