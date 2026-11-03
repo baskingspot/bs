@@ -4797,6 +4797,7 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
         // (`[]?[*:0]u8` to `[]const ?[*:0]const u8`).
         if (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child)) return true;
         if (d.child == .anyopaque_type and s.flags.size != .slice) return true;
+        if (Type.class(ip, s.child) == .@"fn" and Type.class(ip, d.child) == .@"fn") return sema.fnTypeCoercibleInMemory(s.child, d.child);
         if (s.flags.size == .one and ip.indexToKey(d.child) == .array_type) {
             const b = ip.indexToKey(d.child).array_type;
             // `*[N:s]T` to `*[N]T`.
@@ -5005,6 +5006,39 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
     var set = sr.error_union_type.error_set_type;
     if (set == .adhoc_inferred_error_set_type) set = try sema.intern(.{ .inferred_error_set_type = func });
     return sema.errorSetCoercible(block, src_loc, set, dr.error_union_type.error_set_type, .none);
+}
+
+/// Whether a function of type `src` can be called as a `dst` (through a
+/// pointer cast `*const fn () error{}!void` to `*const fn () anyerror!void`):
+/// the same parameters, and a return value that coerces in memory. An
+/// inferred error set only matches itself or `anyerror` here.
+fn fnTypeCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
+    const ip = sema.ip;
+    const s = ip.indexToKey(src).func_type;
+    const d = ip.indexToKey(dst).func_type;
+    if (s.cc != d.cc or s.is_var_args != d.is_var_args or s.is_generic != d.is_generic or s.comptime_bits != d.comptime_bits or
+        s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits) return false;
+    for (s.param_types, d.param_types) |a, b| {
+        if (a == b) continue;
+        if (Type.class(ip, a) == .pointer and Type.class(ip, b) == .pointer and sema.ptrCoercibleInPlace(b, a)) continue;
+        return false;
+    }
+    if (s.return_type == d.return_type or s.return_type == .noreturn_type) return true;
+    const sr = ip.indexToKey(s.return_type);
+    const dr = ip.indexToKey(d.return_type);
+    if (sr != .error_union_type or dr != .error_union_type) return false;
+    if (!sema.payloadCoercibleInMemory(sr.error_union_type.payload_type, dr.error_union_type.payload_type)) return false;
+    const ss = sr.error_union_type.error_set_type;
+    const ds = dr.error_union_type.error_set_type;
+    if (ss == ds or ds == .anyerror_type) return true;
+    const sn = ip.indexToKey(ss);
+    const dn = ip.indexToKey(ds);
+    if (sn != .error_set_type or dn != .error_set_type) return false;
+    outer: for (sn.error_set_type) |n| {
+        for (dn.error_set_type) |m| if (n == m) continue :outer;
+        return false;
+    }
+    return true;
 }
 
 /// `@TypeOf` a function with an inferred error set names that set, as
@@ -7340,7 +7374,8 @@ fn cPtrToSingle(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref
     const single_ty = try sema.ptrType(info);
     if (sema.resolveValue(ptr)) |v| {
         const k = sema.ip.indexToKey(v);
-        if (k == .ptr and k.ptr.base == .int and k.ptr.byte_offset == 0) return sema.fail(block, src, "unable to unwrap null", .{});
+        // Under `@TypeOf`, only the type matters, as upstream.
+        if (k == .ptr and k.ptr.base == .int and k.ptr.byte_offset == 0 and !block.is_typeof) return sema.fail(block, src, "unable to unwrap null", .{});
     } else if (block.want_safety and !block.is_comptime) {
         const ok = try sema.addBinOp(block, .cmp_neq, try sema.addUnOp(block, .int_from_ptr, ptr), .fromInterned(.zero_usize));
         try sema.addSafetyCheck(block, ok, .unwrap_null, .none, .none);
@@ -8497,6 +8532,12 @@ fn namespaceLookupVal(sema: *Sema, block: *Block, src: Src, container: Index, na
     const ip = sema.ip;
     if (Type.class(ip, container) == .error_set) {
         const n = try sema.getString(name);
+        // `anyerror.Name` is `error.Name`, as upstream.
+        if (container == .anyerror_type) {
+            _ = try ip.errorValue(n);
+            const ty = try sema.intern(.{ .error_set_type = &.{n} });
+            return .fromInterned(try sema.intern(.{ .err = .{ .ty = ty, .name = n } }));
+        }
         if (try sema.errorSetNames(block, src, container)) |names| {
             for (names) |x| if (x == n) return .fromInterned(try sema.intern(.{ .err = .{ .ty = container, .name = n } }));
             return sema.fail(block, src, "no error named '{s}' in '{f}'", .{ name, sema.fmtType(container) });
@@ -9051,9 +9092,8 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
         // address as the struct.
         try sema.resolveLayout(block, src, p.child);
         const bit_offset = p.packed_offset.bit_offset + Type.packedFieldBitOffset(ip, p.child, i);
-        // The struct pointer's alignment, as upstream.
-        const align_bytes: u64 = if (p.flags.alignment != 0) @as(u64, 1) << (p.flags.alignment - 1) else Type.abiAlignment(ip, p.child);
-        const alignment: u6 = if (sema.naturalAlignment(field_ty) == align_bytes) 0 else @intCast(std.math.log2_int(u64, align_bytes) + 1);
+        // The struct pointer's alignment, always explicit, as upstream.
+        const alignment: u6 = if (p.flags.alignment != 0) p.flags.alignment else @intCast(std.math.log2_int(u64, Type.abiAlignment(ip, p.child)) + 1);
         const result_ty = try sema.ptrType(.{
             .child = field_ty,
             .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .alignment = alignment },
@@ -9075,8 +9115,10 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
         try sema.resolveLayout(block, src, p.child);
         var info = p;
         info.child = field_ty;
-        const align_bytes: u64 = if (p.flags.alignment != 0) @as(u64, 1) << (p.flags.alignment - 1) else Type.abiAlignment(ip, p.child);
-        info.flags.alignment = if (sema.naturalAlignment(field_ty) == align_bytes) 0 else @intCast(std.math.log2_int(u64, align_bytes) + 1);
+        if (p.flags.alignment == 0) {
+            const align_bytes = Type.abiAlignment(ip, p.child);
+            info.flags.alignment = if (sema.naturalAlignment(field_ty) == align_bytes) 0 else @intCast(std.math.log2_int(u64, align_bytes) + 1);
+        }
         const result_ty = try sema.ptrType(info);
         if (sema.resolveValue(ptr)) |pv| {
             if (!sema.isUndef(pv) and try sema.comptimePtrRoot(pv) != .int) {
@@ -9687,6 +9729,11 @@ fn analyzeIsNonErr(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileEr
         .error_union => {},
         else => return .fromInterned(.bool_true),
     }
+    // A payload with no possible value (`!noreturn`) is never there.
+    const payload = sema.ip.indexToKey(ty).error_union_type.payload_type;
+    if (Type.class(sema.ip, payload) == .@"enum") try sema.resolveLayout(block, src, payload);
+    if (payload == .noreturn_type or (Type.class(sema.ip, payload) == .@"enum" and Type.hasNoPossibleValue(sema.ip, payload)))
+        return .fromInterned(.bool_false);
     if (try sema.errSetIsEmpty(block, sema.ip.indexToKey(ty).error_union_type.error_set_type)) return .fromInterned(.bool_true);
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(.undef_bool);
@@ -11832,6 +11879,12 @@ fn analyzeCall(
                     // A pointer cast to another function type calls
                     // indirectly.
                     if (ip.indexToKey(nv) == .func and ip.typeOf(nv) == p.child) func = nv;
+                    // At comptime, it calls the function and coerces the
+                    // result, as upstream.
+                    if (ip.indexToKey(nv) == .func and func == .none and (block.is_comptime or modifier == .compile_time)) {
+                        const r = try sema.analyzeCall(block, src, .fromInterned(nv), first_arg, call_args_in, modifier);
+                        return sema.coerce(block, ip.indexToKey(p.child).func_type.return_type, r, src);
+                    }
                     if (ip.indexToKey(nv) == .extern_func) extern_func = nv;
                 }
             };

@@ -72,6 +72,9 @@ fn main() callconv(.c) noreturn {
     const lo: *[100]u16 = @ptrFromInt(50);
     rt.printInt(hi - lo);
     rt.printInt(comptime wholeArrays());
+    // Under @TypeOf, dereferencing a null C pointer only names a type.
+    comptime if (@TypeOf(@as([*c]u8, null).*) != u8) unreachable;
+    comptime if (@TypeOf(&@as([*c]u8, null).*) != *u8) unreachable;
     rt.exit(0);
 }
 

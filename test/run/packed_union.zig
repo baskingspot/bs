@@ -86,5 +86,19 @@ fn main() callconv(.c) noreturn {
     comptime if (@as(Small, .{ .u = 5 }).i != -3) unreachable;
     comptime if (@as(Small, .{ .u = 5 }) != @as(Small, .{ .i = -3 })) unreachable;
     comptime if (@sizeOf(Flags) != 4) unreachable;
+    // Field pointers into packed containers keep the container pointer's
+    // alignment explicit.
+    const PU = packed union { x: u20 };
+    const PS = packed struct(u24) { a: u2, u: PU, b: u2 };
+    var ps: PS = undefined;
+    var ps1: PS align(1) = undefined;
+    _ = .{ &ps, &ps1 };
+    comptime if (@TypeOf(&ps.a) != *align(4:0:4) u2) unreachable;
+    comptime if (@TypeOf(&ps.u) != *align(4:2:4) PU) unreachable;
+    comptime if (@TypeOf(&ps.u.x) != *align(4:2:4) u20) unreachable;
+    comptime if (@TypeOf(&ps1.u.x) != *align(1:2:4) u20) unreachable;
+    var pu: PU = undefined;
+    _ = &pu;
+    comptime if (@TypeOf(&pu.x) != *u20) unreachable;
     rt.exit(0);
 }

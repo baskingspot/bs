@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n41\nNope\nBad\nother\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n41\nNope\nBad\nother\nA\n7\nGenericFailure\nWeird name!\n1\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -165,7 +165,48 @@ fn main() callconv(.c) noreturn {
         error.Other => rt.print("other\n"),
         else => rt.print("else\n"),
     }
+
+    // A pointer to a function returning a smaller error set calls as one
+    // returning `anyerror`, at runtime and at comptime.
+    const p: *const fn () anyerror!void = &failA;
+    p() catch |err| rt.print(@errorName(err));
+    rt.print("\n");
+    rt.printInt(comptime callAny(&sevenNoErr));
+
+    // A `!noreturn` is never its payload.
+    NoReturn.a = 64;
+    if (NoReturn.loop()) {
+        @compileError("unreachable");
+    } else |err| rt.print(@errorName(err));
+    rt.print("\n");
+
+    // `anyerror.Name` is `error.Name`.
+    if (weird()) |_| {} else |err| rt.print(@errorName(err));
+    rt.print("\n");
+    rt.printInt(@intFromBool(@TypeOf(@field(anyerror, "NotFound")) == error{NotFound}));
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
+}
+
+fn failA() error{A}!void {
+    return error.A;
+}
+fn sevenNoErr() error{}!u32 {
+    return 7;
+}
+fn callAny(f: *const fn () anyerror!u32) u32 {
+    return f() catch 0;
+}
+const NoReturn = struct {
+    var a: u32 = undefined;
+    fn loop() !noreturn {
+        while (true) {
+            a -= 1;
+            if (a == 0) return error.GenericFailure;
+        }
+    }
+};
+fn weird() !void {
+    return @field(anyerror, "Weird name!");
 }
 
 fn anyUnwrap(x: anyerror!u32) !u32 {
