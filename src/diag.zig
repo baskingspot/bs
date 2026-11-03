@@ -1351,6 +1351,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "type '{f}' cannot be destructured", .@"bad-destructure" },
     .{ "export target cannot be slice", .@"bad-export" },
     .{ "exported symbol name cannot be empty", .@"bad-export" },
+    .{ "unable to export type '{f}'", .@"bad-export" },
     .{ "extern variable cannot have type '{f}'", .@"bad-export" },
     .{ "export target must be a global variable or a comptime-known constant", .@"bad-export" },
     .{ "compiler_rt file '{s}' not found", .@"bad-import" },

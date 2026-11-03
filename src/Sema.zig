@@ -5909,6 +5909,11 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     };
     try sema.ensureNavVal(block, src, nav_index);
     const val = ip.getNav(nav_index).val;
+    // As upstream, an exported variable has a defined memory layout.
+    if (Type.class(ip, ip.typeOf(val)) != .@"fn") {
+        try sema.resolveLayout(block, src, ip.typeOf(val));
+        try sema.checkExtern(block, src, ip.typeOf(val), .other, "unable to export type '{f}'", .{FmtType{ .ip = ip, .ty = ip.typeOf(val), .decl_note = false }});
+    }
     const export_nav = switch (ip.indexToKey(val)) {
         .func => |f| f.owner_nav,
         else => nav_index,
@@ -15896,7 +15901,13 @@ fn zirBitCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
             operand = try sema.analyzeLoad(block, src, try sema.coercePtrTo(block, ref, try sema.ptrType(.{ .child = full, .flags = .{ .is_const = true } })));
         }
     }
-    return sema.bitCast(block, src, dest_ty, operand);
+    const result = try sema.bitCast(block, src, dest_ty, operand);
+    // As upstream, a comptime-known exhaustive enum must be one of its tags.
+    if (Type.class(ip, dest_ty) == .@"enum" and !ip.structInfo(dest_ty).nonexhaustive) if (sema.resolveValue(result)) |v| {
+        if (sema.isUndef(v)) return sema.fail(block, sema.callArgSrc(src, false, 0), "use of undefined value here causes illegal behavior", .{});
+        if (sema.enumTagIndex(v) == null) return sema.fail(block, src, "enum '{f}' has no tag with value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(ip.keyPayload(.enum_tag, v).int) });
+    };
+    return result;
 }
 
 fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) CompileError!Ref {
