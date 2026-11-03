@@ -3658,8 +3658,6 @@ fn zirErrorCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     return sema.addTyOp(block, .bitcast, dest_ty, operand);
 }
 
-/// `@fieldParentPtr("field", field_ptr)`: the pointer to the struct or
-/// union containing the field `field_ptr` points to.
 /// The bit offset of a struct field, for `@offsetOf` and `@bitOffsetOf`.
 fn bitOffsetOf(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.Bin) CompileError!u64 {
     const ip = sema.ip;
@@ -3674,8 +3672,7 @@ fn bitOffsetOf(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.Bin) Compil
             return Type.fieldOffset(ip, ty, i) * 8;
         },
         .tuple_type => |t| {
-            const i = std.fmt.parseInt(u32, name, 10) catch t.types.len;
-            if (i >= t.types.len) return sema.fail(block, src, "no field named '{s}' in tuple '{f}'", .{ name, sema.fmtType(ty) });
+            const i = try sema.structFieldIndex(block, src, ty, name);
             if (t.values[i] != .none) return sema.fail(block, src, "no offset available for comptime field", .{});
             return Type.fieldOffset(ip, ty, i) * 8;
         },
@@ -3683,6 +3680,8 @@ fn bitOffsetOf(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.Bin) Compil
     }
 }
 
+/// `@fieldParentPtr("field", field_ptr)`: the pointer to the struct or
+/// union containing the field `field_ptr` points to.
 fn zirFieldParentPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const ip = sema.ip;
     const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
@@ -3700,6 +3699,7 @@ fn zirFieldParentPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileEr
         else
             try sema.structFieldIndex(block, src, parent_ty, name),
         .union_type => try sema.unionFieldIndex(block, src, parent_ty, name),
+        .tuple_type => try sema.structFieldIndex(block, src, parent_ty, name),
         else => return sema.fail(block, src, "expected struct or union type, found '{f}'", .{sema.fmtType(parent_ty)}),
     };
     const field_ptr = sema.resolveInst(extra.field_ptr);
@@ -9615,6 +9615,9 @@ fn zirArrayInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
             e.* = sema.resolveInst(a);
             t.* = sema.typeOf(e.*);
             v.* = sema.resolveValue(e.*) orelse .none;
+            // As for anonymous struct literals: a field referring to
+            // comptime-mutable memory is not a comptime field.
+            if (v.* != .none and sema.ip.indexToKey(v.*) == .ptr and try sema.comptimePtrRoot(v.*) == .comptime_alloc) v.* = .none;
         }
         const ty = try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } });
         return sema.aggregate(block, src, ty, elems);
