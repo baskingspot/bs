@@ -1364,6 +1364,44 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
 6. DWARF variable locations; then leaf inlining with the cache edge.
+   *DWARF types and variables: paused by the owner, 2026-11-03.* zap
+   keeps line tables, CFI, function names and inlined frames, the
+   debuggability the scope asks for; types and variables mostly serve
+   interactive debugger sessions, which agents rarely use, and would
+   cost compile time. The design, approved before the pause, for
+   whoever picks it up:
+   - Types: content-addressed type atoms in a `debug_type` section, not
+     loaded, built on the CodeGen workers from the InternPool alone
+     (like `contentAtom`, owner `.content` plus a content use). The
+     linkers place them all in one types CU (gdb handles cross-CU
+     references; lldb in a dSYM was not yet checked) and resolve a
+     4-byte DIE-reference relocation: `DW_FORM_ref4` inside the types
+     unit, `DW_FORM_ref_addr` from subprograms. Base and composite
+     types as upstream emits; a pointer to a container references a
+     name-only stub, so recursive types need no cycle. No
+     `decl_file`/`decl_line` in type DIE bytes (a file index is per-CU
+     and a line would go stale in green functions); if wanted, a
+     relocation or linker side table. Two types with the same display
+     name share a stub; a vendor attribute with the stable hash would
+     separate them.
+   - Variables: Sema emits `dbg_var_ptr`/`dbg_var_val` markers. CodeGen
+     reports, per marker after emission, ranges `{start, end, loc}` in
+     final atom pcs, cut per emitted block (cold blocks move), with
+     `loc` one of `reg`, `regs[2]` (pieces), `frame` (fbreg, frame base
+     rbp), `frame_addr`, `ptr_in` (then deref), or a comptime constant
+     (`implicit_value`). Markers do not count as uses for promotion or
+     the dead-value sweep; a value used only by markers stays alive
+     without extending intervals (gdb shows "optimized out" after its
+     last use; upstream's scope-long extent would be a flag). The
+     ranges become loclists. `Atom.Debug` gains runs for type keys,
+     variables, names and locations; variable decl lines are relative
+     to `base_line` (or the enclosing inline's base line) so
+     `refreshDebug` moves them, columns absolute, `exact_hash`
+     unchanged; ZAPPACK and ZAPSTP bump.
+   - Before landing: measure CodeGen ns per IR instruction, debug emit,
+     the number of type atoms (manifest nodes) and the change in
+     `record` time and manifest size on the zig workload; if type atoms
+     run to tens of thousands, share one node per owning unit.
 
 ### Linkers (`src/link/`)
 
