@@ -1,0 +1,14 @@
+.{
+    .name = "zap",
+    .version = .{ 0, 17, 0 },
+    .tags = .{ .fast, .debug },
+    .ratio = 1.5,
+    .count = 'A',
+    .opt = null,
+    .nested = .{ .a = -3, .b = true },
+    .kind = .{ .int = 42 },
+    .mode = .slow,
+    .bytes = .{ 1, 2, 3 },
+    .big = 0x1_0000_0000_0000_0000,
+    .neg = -1e3,
+}

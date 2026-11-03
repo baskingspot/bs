@@ -67,6 +67,13 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
   edit build the edited file's own lowering (about 5 ms for `debug.zig`) is
   the critical path. std's
   cached ZIR takes 41 MB.
+- ZON imports (`@import("x.zon")`) are not frontend files. Sema reads the
+  file through the `@embedFile` path, so the importing unit depends on its
+  bytes (`embed_file`), parses it with `Ast.parse(.zon)` and std's
+  `ZonGen`, and lowers the `Zoir` to a value of the import's result type,
+  or to anonymous structs and tuples of comptime fields without one (as
+  upstream's `Sema/LowerZon.zig`). Errors in the ZON file are reported at
+  the import, prefixed with the ZON file's line and column.
 
 ### Analysis units
 

@@ -4482,10 +4482,361 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         sema.zcu.moduleRootFile(.root).?
     else if (std.mem.eql(u8, path, "builtin"))
         sema.zcu.moduleRootFile(.builtin).?
+    else if (std.mem.endsWith(u8, path, ".zon"))
+        return .fromInterned(try sema.importZon(block, src, path, extra.res_ty))
     else
         return sema.fail(block, src, "no module named '{s}' available within module '{s}'", .{ path, fe.module(this_file.module).name });
     return .fromInterned(try sema.fileRootType(key));
 }
+
+// ---------------------------------------------------------------------------
+// ZON imports
+//
+// Ported from upstream's src/Sema/LowerZon.zig.
+// Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
+
+/// `@import("x.zon")`: the file's value, of type `res_ty_ref` if it has one.
+/// The file is read like an `@embedFile`, so the importing unit depends on
+/// its bytes, and lowered from std's ZonGen output.
+fn importZon(sema: *Sema, block: *Block, src: Src, path: []const u8, res_ty_ref: Zir.Inst.Ref) CompileError!Index {
+    const gpa = sema.gpa;
+    const res_ty: Index = if (res_ty_ref == .none) .none else blk: {
+        const ty = try sema.resolveType(block, src, res_ty_ref);
+        break :blk if (ty == .generic_poison_type) .none else ty;
+    };
+    const file = sema.zcu.file(sema.file);
+    const module = sema.zcu.fe.module(file.module);
+    const root: []const u8 = module.abs_root_dir orelse
+        std.Io.Dir.cwd().realPathFileAlloc(sema.zcu.fe.io, module.root_dir, sema.arena) catch |err|
+            return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
+    const dir = std.fs.path.dirname(file.sub_path) orelse "";
+    const full = try std.fs.path.resolveAllocPosix(sema.arena, &.{ root, dir, path });
+    if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
+        return sema.fail(block, src, "import of file outside module path: '{s}'", .{path});
+    const sub_path = full[root.len + 1 ..];
+    try sema.bcRefuse();
+    const index = sema.zcu.embedFile(file.module, sub_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return sema.fail(block, src, "unable to open '{s}': {t}", .{ path, err }),
+    };
+    try sema.declareDependency(.{ .embed_file = index });
+    const source = try sema.arena.dupeSentinel(u8, sema.zcu.embed_files.values()[index].bytes, 0);
+    var tree = try Ast.parse(gpa, source, .{ .mode = .zon });
+    defer tree.deinit(gpa);
+    if (tree.errors.len != 0) {
+        var msg: std.Io.Writer.Allocating = .init(sema.arena);
+        tree.renderError(tree.errors[0], &msg.writer) catch return error.OutOfMemory;
+        const loc = tree.tokenLocation(0, tree.errors[0].token);
+        return sema.fail(block, src, "{s}:{d}:{d}: {s}", .{ path, loc.line + 1, loc.column + 1, msg.written() });
+    }
+    const zoir = try std.zig.ZonGen.generate(gpa, tree, .{});
+    defer zoir.deinit(gpa);
+    if (zoir.hasCompileErrors()) {
+        const e = zoir.compile_errors[0];
+        const msg = e.msg.get(&zoir);
+        if (e.token.unwrap()) |tok| {
+            const loc = tree.tokenLocation(0, tok);
+            return sema.fail(block, src, "{s}:{d}:{d}: {s}", .{ path, loc.line + 1, loc.column + 1 + e.node_or_offset, msg });
+        }
+        return sema.fail(block, src, "{s}: {s}", .{ path, msg });
+    }
+    var z: Zon = .{ .sema = sema, .block = block, .src = src, .zoir = &zoir, .tree = &tree, .path = path, .key = sema.zcu.embed_files.values()[index].key };
+    if (res_ty == .none) return z.lowerAnon(.root);
+    return z.lower(.root, res_ty);
+}
+
+const Zon = struct {
+    sema: *Sema,
+    block: *Block,
+    /// The import.
+    src: Src,
+    zoir: *const std.zig.Zoir,
+    tree: *const Ast,
+    path: []const u8,
+    /// The file's stable key, `module:sub_path`.
+    key: []const u8,
+
+    const Node = std.zig.Zoir.Node.Index;
+    const Error = CompileError || error{WrongType};
+
+    /// Reports an error at `node`, at the import with the ZON location.
+    fn fail(z: *const Zon, node: Node, comptime fmt: []const u8, args: anytype) CompileError {
+        const msg = std.fmt.allocPrint(z.sema.arena, fmt, args) catch return error.OutOfMemory;
+        const loc = z.tree.tokenLocation(0, z.tree.firstToken(node.getAstNode(z.zoir)));
+        return z.sema.fail(z.block, z.src, "{s}:{d}:{d}: {s}", .{ z.path, loc.line + 1, loc.column + 1, msg });
+    }
+
+    fn lower(z: *const Zon, node: Node, ty: Index) CompileError!Index {
+        return z.lowerInner(node, ty) catch |err| switch (err) {
+            error.WrongType => return z.fail(node, "expected type '{f}'", .{z.sema.fmtType(ty)}),
+            else => |e| return e,
+        };
+    }
+
+    fn lowerAnon(z: *const Zon, node: Node) CompileError!Index {
+        const sema = z.sema;
+        switch (node.get(z.zoir)) {
+            .true => return .bool_true,
+            .false => return .bool_false,
+            .null => return .null_value,
+            .pos_inf => return z.fail(node, "infinity requires a known result type", .{}),
+            .neg_inf => return z.fail(node, "negative infinity requires a known result type", .{}),
+            .nan => return z.fail(node, "NaN requires a known result type", .{}),
+            .int_literal => |int| return switch (int) {
+                .small => |v| sema.intValue(.comptime_int_type, v),
+                .big => |v| sema.bigToValue(.comptime_int_type, v),
+            },
+            .float_literal => |v| return sema.floatValue(.comptime_float_type, v),
+            .char_literal => |v| return sema.intValue(.comptime_int_type, v),
+            .enum_literal => |v| return sema.intern(.{ .enum_literal = try sema.getString(v.get(z.zoir)) }),
+            .string_literal => |v| return sema.stringLiteral(v),
+            .empty_literal => return .empty_tuple,
+            .array_literal => |nodes| {
+                const types = try sema.arena.alloc(Index, nodes.len);
+                const values = try sema.arena.alloc(Index, nodes.len);
+                for (types, values, 0..) |*t, *v, i| {
+                    v.* = try z.lowerAnon(nodes.at(@intCast(i)));
+                    t.* = sema.ip.typeOf(v.*);
+                }
+                const ty = try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } });
+                return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = values } } });
+            },
+            .struct_literal => |init| {
+                // An anonymous struct of comptime fields, as upstream's
+                // reified ZON struct types.
+                const names = try sema.arena.alloc(InternPool.String, init.names.len);
+                const types = try sema.arena.alloc(Index, init.names.len);
+                const values = try sema.arena.alloc(Index, init.names.len);
+                for (names, types, values, 0..) |*n, *t, *v, i| {
+                    n.* = try sema.getString(init.names[i].get(z.zoir));
+                    v.* = try z.lowerAnon(init.vals.at(@intCast(i)));
+                    t.* = sema.ip.typeOf(v.*);
+                }
+                const ast_node = @backingInt(node.getAstNode(z.zoir));
+                const stem = z.path[if (std.mem.lastIndexOfScalar(u8, z.path, '/')) |k| k + 1 else 0..];
+                const ty = try sema.intern(.{ .tuple_type = .{
+                    .types = types,
+                    .values = values,
+                    .names = names,
+                    .site = try sema.getString(try std.fmt.allocPrint(sema.arena, "{s}#zon{d}", .{ z.key, ast_node })),
+                    .name = try sema.getString(try std.fmt.allocPrint(sema.arena, "{s}__struct_{d}", .{ stem, ast_node })),
+                } });
+                return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = values } } });
+            },
+        }
+    }
+
+    fn lowerInner(z: *const Zon, node: Node, ty: Index) Error!Index {
+        const sema = z.sema;
+        const ip = sema.ip;
+        switch (Type.class(ip, ty)) {
+            .optional => {
+                const child = Type.childType(ip, ty);
+                if (Type.class(ip, child) == .optional) return z.fail(node, "type '{f}' is not available in ZON", .{sema.fmtType(ty)});
+                if (node.get(z.zoir) == .null) return sema.intern(.{ .opt = .{ .ty = ty, .val = .none } });
+                return sema.intern(.{ .opt = .{ .ty = ty, .val = try z.lowerInner(node, child) } });
+            },
+            .pointer => {
+                const p = Type.ptrInfo(ip, ty);
+                if (!p.flags.is_const) return z.fail(node, "type '{f}' is not available in ZON: ZON does not allow mutable pointers", .{sema.fmtType(ty)});
+                switch (p.flags.size) {
+                    .one => {
+                        const val = try z.lowerInner(node, p.child);
+                        return sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .uav = .{ .val = val, .orig_ty = ty } } } });
+                    },
+                    .slice => return z.lowerSlice(node, ty, p),
+                    else => return z.fail(node, "type '{f}' is not available in ZON", .{sema.fmtType(ty)}),
+                }
+            },
+            .bool => return switch (node.get(z.zoir)) {
+                .true => .bool_true,
+                .false => .bool_false,
+                else => error.WrongType,
+            },
+            .int, .comptime_int => return z.lowerInt(node, ty),
+            .float, .comptime_float => return z.lowerFloat(node, ty),
+            .null => return switch (node.get(z.zoir)) {
+                .null => .null_value,
+                else => error.WrongType,
+            },
+            .@"enum" => switch (node.get(z.zoir)) {
+                .enum_literal => |name| {
+                    const n = name.get(z.zoir);
+                    const i = (try sema.enumFieldIndex(z.block, z.src, ty, n)) orelse
+                        return z.fail(node, "enum {f} has no member named '{f}'", .{ sema.fmtType(ty), std.zig.fmtId(n) });
+                    return sema.enumTagValue(ty, i);
+                },
+                else => return error.WrongType,
+            },
+            .enum_literal => return switch (node.get(z.zoir)) {
+                .enum_literal => |name| sema.intern(.{ .enum_literal = try sema.getString(name.get(z.zoir)) }),
+                else => error.WrongType,
+            },
+            .array => {
+                const a = ip.indexToKey(ty).array_type;
+                const nodes = z.elemNodes(node) orelse return error.WrongType;
+                if (nodes.len != a.len) return error.WrongType;
+                const elems = try sema.arena.alloc(Index, @intCast(a.lenIncludingSentinel()));
+                for (elems[0..nodes.len], 0..) |*e, i| e.* = try z.lower(nodes.at(@intCast(i)), a.child);
+                if (a.sentinel != .none) elems[nodes.len] = a.sentinel;
+                return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+            },
+            .vector => {
+                const v = ip.indexToKey(ty).vector_type;
+                const nodes = z.elemNodes(node) orelse return error.WrongType;
+                if (nodes.len != v.len) return z.fail(node, "expected {d} vector elements; found {d}", .{ v.len, nodes.len });
+                const elems = try sema.arena.alloc(Index, v.len);
+                for (elems, 0..) |*e, i| e.* = try z.lower(nodes.at(@intCast(i)), v.child);
+                return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+            },
+            .tuple => {
+                const t = ip.indexToKey(ty).tuple_type;
+                if (t.names.len != 0) return z.fail(node, "type '{f}' is not available in ZON", .{sema.fmtType(ty)});
+                const nodes = z.elemNodes(node) orelse return error.WrongType;
+                const elems = try sema.arena.dupe(Index, t.values);
+                for (0..nodes.len) |i| {
+                    const n = nodes.at(@intCast(i));
+                    if (i >= elems.len) return z.fail(n, "index {d} outside tuple of length {d}", .{ i, elems.len });
+                    const val = try z.lower(n, t.types[i]);
+                    if (elems[i] != .none and val != elems[i]) return z.fail(n, "value stored in comptime field does not match the default value of the field", .{});
+                    elems[i] = val;
+                }
+                for (elems, 0..) |v, i| if (v == .none) return z.fail(node, "missing tuple field with index {d}", .{i});
+                return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+            },
+            .@"struct" => {
+                try sema.resolveStructFields(z.block, z.src, ty);
+                const has_fields = ip.structInfo(ty).field_types.len != 0;
+                if (has_fields) try sema.resolveStructDefaults(z.block, z.src, ty);
+                const info = ip.structInfo(ty);
+                const names: []const std.zig.Zoir.NullTerminatedString, const vals: ?std.zig.Zoir.Node.Index.Range = switch (node.get(z.zoir)) {
+                    .struct_literal => |f| .{ f.names, f.vals },
+                    .empty_literal => .{ &.{}, null },
+                    else => return error.WrongType,
+                };
+                const elems = try sema.arena.alloc(Index, info.field_types.len);
+                for (elems, 0..) |*e, i| e.* = if (info.field_defaults.len != 0) info.field_defaults[i] else .none;
+                for (names, 0..) |name, i| {
+                    const n = vals.?.at(@intCast(i));
+                    const field_name = name.get(z.zoir);
+                    const k = info.fieldIndex(ip, field_name) orelse return z.fail(n, "unexpected field '{f}'", .{std.zig.fmtId(field_name)});
+                    const val = try z.lower(n, info.field_types[k]);
+                    if (info.field_is_comptime.len != 0 and info.field_is_comptime[k] and val != info.field_defaults[k])
+                        return z.fail(n, "value stored in comptime field does not match the default value of the field", .{});
+                    elems[k] = val;
+                }
+                for (elems, info.field_names) |v, name| if (v == .none) return z.fail(node, "missing field '{s}'", .{ip.stringSlice(name)});
+                return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+            },
+            .@"union" => {
+                try sema.resolveLayout(z.block, z.src, ty);
+                const info = ip.structInfo(ty);
+                if (info.layout == .@"packed") return z.fail(node, "zap does not support packed unions in ZON yet", .{});
+                const name, const field_node: ?Node = switch (node.get(z.zoir)) {
+                    .enum_literal => |n| .{ n.get(z.zoir), null },
+                    .struct_literal => |f| blk: {
+                        if (f.names.len != 1) return error.WrongType;
+                        break :blk .{ f.names[0].get(z.zoir), f.vals.at(0) };
+                    },
+                    else => return error.WrongType,
+                };
+                const i = info.fieldIndex(ip, name) orelse return error.WrongType;
+                const field_ty = info.field_types[i];
+                const val = if (field_node) |n| blk: {
+                    if (field_ty == .void_type) return z.fail(n, "expected type 'void'", .{});
+                    break :blk try z.lower(n, field_ty);
+                } else blk: {
+                    if (field_ty != .void_type) return error.WrongType;
+                    break :blk Index.void_value;
+                };
+                return sema.intern(.{ .un = .{ .ty = ty, .tag = try sema.unionFieldTagValue(ty, i), .val = val } });
+            },
+            else => return z.fail(node, "type '{f}' not available in ZON", .{sema.fmtType(ty)}),
+        }
+    }
+
+    /// The elements of an array literal or `.{}`.
+    fn elemNodes(z: *const Zon, node: Node) ?std.zig.Zoir.Node.Index.Range {
+        return switch (node.get(z.zoir)) {
+            .array_literal => |nodes| nodes,
+            .empty_literal => .{ .start = node, .len = 0 },
+            else => null,
+        };
+    }
+
+    fn lowerSlice(z: *const Zon, node: Node, ty: Index, p: InternPool.PtrType) Error!Index {
+        const sema = z.sema;
+        // A string literal, for `[]const u8` and `[:0]const u8`.
+        if (p.child == .u8_type and (p.sentinel == .none or p.sentinel == .zero_u8) and p.flags.alignment <= 1) switch (node.get(z.zoir)) {
+            .string_literal => |v| return (try sema.coerce(z.block, ty, .fromInterned(try sema.stringLiteral(v)), z.src)).toInterned().?,
+            else => {},
+        };
+        const nodes = z.elemNodes(node) orelse return error.WrongType;
+        const elems = try sema.arena.alloc(Index, nodes.len + @intFromBool(p.sentinel != .none));
+        for (elems[0..nodes.len], 0..) |*e, i| e.* = try z.lower(nodes.at(@intCast(i)), p.child);
+        if (p.sentinel != .none) elems[nodes.len] = p.sentinel;
+        const array_ty = try sema.intern(.{ .array_type = .{ .len = nodes.len, .child = p.child, .sentinel = p.sentinel } });
+        const array = try sema.intern(.{ .aggregate = .{ .ty = array_ty, .storage = .{ .elems = elems } } });
+        var many = p;
+        many.flags.size = .many;
+        const many_ty = try sema.ptrType(many);
+        const orig_ty = try sema.ptrType(.{ .child = array_ty, .flags = .{ .is_const = true } });
+        const ptr = try sema.intern(.{ .ptr = .{ .ty = many_ty, .base = .{ .uav = .{ .val = array, .orig_ty = orig_ty } } } });
+        return sema.intern(.{ .slice = .{ .ty = ty, .ptr = ptr, .len = try sema.intValue(.usize_type, nodes.len) } });
+    }
+
+    fn lowerInt(z: *const Zon, node: Node, ty: Index) Error!Index {
+        const sema = z.sema;
+        const ip = sema.ip;
+        var space: [2]std.math.big.Limb = undefined;
+        const big: BigIntConst = switch (node.get(z.zoir)) {
+            .int_literal => |int| switch (int) {
+                .small => |v| std.math.big.int.Mutable.init(&space, v).toConst(),
+                .big => |v| v,
+            },
+            .char_literal => |v| std.math.big.int.Mutable.init(&space, v).toConst(),
+            .float_literal => |v| blk: {
+                var m: std.math.big.int.Mutable = .{
+                    .limbs = try sema.arena.alloc(std.math.big.Limb, std.math.big.int.calcLimbLen(v)),
+                    .len = undefined,
+                    .positive = undefined,
+                };
+                if (m.setFloat(v, .trunc) == .inexact)
+                    return z.fail(node, "fractional component prevents float value '{d}' from coercion to type '{f}'", .{ v, sema.fmtType(ty) });
+                break :blk m.toConst();
+            },
+            else => return error.WrongType,
+        };
+        if (Type.class(ip, ty) == .int) {
+            const info = Type.intInfo(ip, ty);
+            if (!big.fitsInTwosComp(info.signedness, info.bits))
+                return z.fail(node, "type '{f}' cannot represent integer value '{d}'", .{ sema.fmtType(ty), big });
+        }
+        return sema.bigToValue(ty, big);
+    }
+
+    fn lowerFloat(z: *const Zon, node: Node, ty: Index) Error!Index {
+        const sema = z.sema;
+        const v: f128 = switch (node.get(z.zoir)) {
+            .int_literal => |int| switch (int) {
+                .small => |i| @floatFromInt(i),
+                .big => |b| b.toFloat(f128, .nearest_even)[0],
+            },
+            .float_literal => |f| f,
+            .char_literal => |c| @floatFromInt(c),
+            .pos_inf, .neg_inf, .nan => |_, tag| blk: {
+                if (ty == .comptime_float_type) return z.fail(node, "expected type '{f}'", .{sema.fmtType(ty)});
+                break :blk switch (tag) {
+                    .pos_inf => std.math.inf(f128),
+                    .neg_inf => -std.math.inf(f128),
+                    else => std.math.nan(f128),
+                };
+            },
+            else => return error.WrongType,
+        };
+        return sema.floatValue(ty, v);
+    }
+};
 
 fn zirDeclLiteral(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const tag = sema.code.instructions.items(.tag)[@backingInt(inst)];
