@@ -1794,6 +1794,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         if (eql(u8, mnemonic, "syscall")) return e.syscall();
         if (eql(u8, mnemonic, "ud2")) return e.ud2();
         if (eql(u8, mnemonic, "int3")) return e.int3();
+        if (eql(u8, mnemonic, "pause")) return e.raw(&.{ 0xf3, 0x90 });
         if (eql(u8, mnemonic, "ret") or eql(u8, mnemonic, "retq")) return e.ret();
     } else if (ops.len == 1) {
         if (eql(u8, mnemonic, "call") or eql(u8, mnemonic, "callq") or eql(u8, mnemonic, "jmp")) switch (ops[0]) {
