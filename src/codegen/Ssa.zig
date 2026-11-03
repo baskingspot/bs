@@ -65,6 +65,9 @@ clobbers: std.ArrayList([2]u32) = .empty,
 /// Overflow operations whose results only their `struct_field_val`s read
 /// (`Fate.pair`), and those two values (or `no_tie`), from `plan`.
 pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
+/// Scratch for `plan`: the allocs it considers promoting, and their loads.
+candidates: std.ArrayList(u32) = .empty,
+var_loads: std.ArrayList(u32) = .empty,
 
 pub const no_loop = std.math.maxInt(u32);
 
@@ -94,6 +97,11 @@ pub const Live = struct {
     crosses: bool,
     /// How the value is computed, from `plan`.
     fate: Fate,
+    /// From `plan`, for a load of a promoted variable: the variable (an IR
+    /// instruction index, or `no_tie`), whose register the load may share
+    /// for its whole interval: the variable's interval contains it, and no
+    /// store to the variable lies in it.
+    share: u32,
 };
 
 /// What `plan` decided for a value, beside its register.
@@ -183,6 +191,8 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.slots.active.deinit(gpa);
     f.clobbers.deinit(gpa);
     f.pairs.deinit(gpa);
+    f.candidates.deinit(gpa);
+    f.var_loads.deinit(gpa);
 }
 
 pub fn blockInsts(f: *const Func, block: Block.Index) []const Inst.Index {
@@ -366,7 +376,14 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
 ///   `ctx.fusable(inst)`.
 /// - Arguments are all moved at the entry, so an unused one, whose interval
 ///   ends there, takes no register.
-/// Without inline assembly only pass 2 runs. `ctx.inGpr(ty)` says whether
+/// - Promotion: a non-volatile alloc whose type is in a general-purpose
+///   register (`ctx.inGpr`) and whose address is only loaded from and
+///   stored to, so it is never taken, gets `want_reg`, and its loads and
+///   stores are moves. This is mem2reg without renaming: the variable
+///   keeps one register for its interval, which `liveness` extends over
+///   the loops that use it, so it needs no phis. A load may share the
+///   variable's register (`Live.share`).
+/// With inline assembly only pass 2 runs. `ctx.inGpr(ty)` says whether
 /// an overflow operation on `ty` runs in general-purpose registers.
 pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: anytype) Allocator.Error!void {
     const tags = ir.instructions.items(.tag);
@@ -377,7 +394,9 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     const reg = live.items(.reg);
     const def = live.items(.def);
     const fate = live.items(.fate);
+    const share = live.items(.share);
     @memset(fate, .normal);
+    @memset(share, no_tie);
     f.pairs.clearRetainingCapacity();
     {
         const Uses = struct {
@@ -397,6 +416,12 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
         }
     }
     if (f.has_asm) return;
+    // Promotion counts each candidate's loads and stores in `share`, free
+    // until the loads' entries are set.
+    const count = share;
+    const candidate = no_tie - 1;
+    f.candidates.clearRetainingCapacity();
+    f.var_loads.clearRetainingCapacity();
     for (f.layout.items) |block| {
         const b = f.blocks.items[@backingInt(block)];
         const cond: ?Inst.Index = if (b.term.tag == .branch) datas[@backingInt(b.term.inst)].pl_op.operand.toIndex() else null;
@@ -440,6 +465,25 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                 .arg => if (uses[i] == 0) {
                     reg[i] = no_reg;
                 },
+                .alloc => {
+                    const ty = datas[i].ty;
+                    if (ty == .none) continue;
+                    const info = Type.ptrInfo(ip, ty);
+                    if (info.flags.is_volatile or !ctx.inGpr(info.child)) continue;
+                    count[i] = candidate;
+                    try f.candidates.append(gpa, i);
+                },
+                .load => if (fate[i] != .dead) {
+                    const v = @backingInt(datas[i].ty_op.operand.toIndex() orelse continue);
+                    if (count[v] == no_tie) continue;
+                    count[v] -%= 1;
+                    try f.var_loads.append(gpa, i);
+                },
+                .store => {
+                    const bin = datas[i].bin_op;
+                    const v = @backingInt(bin.lhs.toIndex() orelse continue);
+                    if (count[v] != no_tie and bin.rhs != bin.lhs) count[v] -%= 1;
+                },
                 else => if (cond != null and cond.? == inst and uses[i] == 1 and ctx.fusable(inst)) {
                     fate[i] = .fused;
                     reg[i] = no_reg;
@@ -447,6 +491,45 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
             }
         }
     }
+    // A candidate whose every use is a load or a store's address is
+    // promoted (see `plan`).
+    const tie = live.items(.tie);
+    for (f.candidates.items) |v| {
+        if (candidate - count[v] == uses[v]) {
+            reg[v] = want_reg;
+            tie[v] = no_tie;
+        }
+        count[v] = no_tie;
+    }
+    for (f.var_loads.items) |l| {
+        const v = datas[l].ty_op.operand.toIndex().?;
+        if (reg[@backingInt(v)] == want_reg and reg[l] == want_reg) share[l] = f.shareable(ir, @fromBackingInt(l), v);
+    }
+}
+
+/// `v` if load `load` of promoted variable `v` may share its register
+/// (`Live.share`), else `no_tie`. A store of the load itself writes back
+/// what the register holds.
+fn shareable(f: *const Func, ir: *const Ir, load: Inst.Index, v: Inst.Index) u32 {
+    const live = f.live.slice();
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const l = @backingInt(load);
+    if (end[l] > end[@backingInt(v)]) return no_tie;
+    // Value `i` is at position `2 * i + 2`: scan the values after the load
+    // up to its interval's end, which is usually close.
+    const first = (def[l] - 2) / 2 + 1;
+    const stop = @min(end[l] / 2, f.values.len);
+    if (stop > first + 64) return no_tie;
+    const insts = f.values.items(.inst);
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    for (insts[@min(first, stop)..stop]) |inst| {
+        if (tags[@backingInt(inst)] != .store) continue;
+        const bin = datas[@backingInt(inst)].bin_op;
+        if (bin.lhs == v.toRef() and bin.rhs != load.toRef()) return no_tie;
+    }
+    return @backingInt(v);
 }
 
 /// Whether value `inst` may go unemitted when nothing reads it: it reads
@@ -614,7 +697,12 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
     const end = s.items(.end);
     const tie = s.items(.tie);
     const crosses = s.items(.crosses);
+    const share = s.items(.share);
     var active: [max_regs]u32 = undefined;
+    // Per register: the last end of the loads sharing it with its current
+    // holder (`Live.share`), which may not be evicted before then. Loads
+    // that share are not in `active`; their holder outlives them.
+    var held: [max_regs]u32 = @splat(0);
     var active_len: u8 = 0;
     var free: u32 = (@as(u32, 1) << @intCast(n)) - 1;
     var used: u32 = 0;
@@ -631,8 +719,17 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
             } else j += 1;
         }
         const usable: u32 = if (crosses[inst]) survives else ~@as(u32, 0);
+        const v = share[inst];
+        if (v != no_tie and reg[v] < n) {
+            reg[inst] = reg[v];
+            held[reg[v]] = @max(held[reg[v]], end[inst]);
+            continue;
+        }
         const t = tie[inst];
-        if (t != no_tie and end[t] == def[inst] and reg[t] < n and usable >> @intCast(reg[t]) & 1 != 0) {
+        // Not a register a load shares, which its variable still holds.
+        if (t != no_tie and end[t] == def[inst] and reg[t] < n and usable >> @intCast(reg[t]) & 1 != 0 and
+            (share[t] == no_tie or reg[share[t]] != reg[t]))
+        {
             // Take over the tied operand's register, which dies here.
             const k = std.mem.indexOfScalar(u32, active[0..active_len], t).?;
             reg[inst] = reg[t];
@@ -651,7 +748,7 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
         }
         var last: ?u8 = null;
         for (active[0..active_len], 0..) |a, k| {
-            if (usable >> @intCast(reg[a]) & 1 == 0) continue;
+            if (usable >> @intCast(reg[a]) & 1 == 0 or held[reg[a]] >= def[inst]) continue;
             if (last == null or end[a] > end[active[last.?]]) last = @intCast(k);
         }
         const victim = if (last) |l| active[l] else {

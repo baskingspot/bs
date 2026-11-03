@@ -861,7 +861,17 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     const tag = ir.instructions.items(.tag)[@backingInt(inst)];
     switch (tag) {
-        .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .block, .loop, .breakpoint => return false,
+        // A block's result may get a register; the `br`s that write it are
+        // moves. (`Ssa.plan` promotes variables.)
+        .block => {
+            if (!cg.has_asm and cg.inGpr(data.ty_pl.ty)) {
+                const live = cg.emit.ssa.live.slice();
+                live.items(.reg)[@backingInt(inst)] = Ssa.want_reg;
+                live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+            }
+            return false;
+        },
+        .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .loop, .breakpoint => return false,
         else => {},
     }
     const want = !cg.has_asm and cg.wantsReg(inst);
@@ -954,6 +964,17 @@ fn errFieldSize(layout: Type.ErrorUnionLayout) Size {
         4 => .dword,
         8 => .qword,
         else => unreachable,
+    };
+}
+
+/// The register holding `ptr`'s pointee if `ptr` is a promoted variable
+/// that got one.
+fn varReg(cg: *CodeGen, ptr: Ref) ?Reg {
+    const i = ptr.toIndex() orelse return null;
+    if (cg.ir.instructions.items(.tag)[@backingInt(i)] != .alloc) return null;
+    return switch (cg.homes[@backingInt(i)]) {
+        .reg => |r| r,
+        else => null,
     };
 }
 
@@ -1294,6 +1315,7 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
             try cg.checkNaked(tag);
             if (tag == .br) switch (cg.homes[@backingInt(data.br.block_inst)]) {
                 .slot => |off| try cg.copyTo(Mem.at(.rbp, off), data.br.operand),
+                .reg => |r| try cg.load(r, data.br.operand),
                 else => {},
             };
             try cg.jumpTo(term.succ[0], next);
@@ -1357,6 +1379,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .alloc => {
             // An inferred alloc whose initializer never completes.
             if (data.ty == .none) return;
+            // A variable in a register.
+            if (cg.homes[@backingInt(inst)] == .reg) return;
             const info = Type.ptrInfo(ip, data.ty);
             const size = @max(Type.abiSize(ip, info.child), 1);
             const alignment = @max(Type.abiAlignment(ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
@@ -1375,6 +1399,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .load => {
             const ty = data.ty_op.ty;
+            if (cg.varReg(data.ty_op.operand)) |r| return cg.setResult(inst, ty, r);
             if (cg.passInRegs(ty)) {
                 const m = try cg.ptrMem(data.ty_op.operand);
                 const d = cg.destReg(inst);
@@ -1389,6 +1414,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const val = data.bin_op.rhs;
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
+            if (cg.varReg(data.bin_op.lhs)) |r| return cg.load(r, val);
             if (cg.passInRegs(cg.typeOf(val))) return cg.storeVal(try cg.ptrMem(data.bin_op.lhs), val, size);
             try cg.load(.r10, data.bin_op.lhs);
             if (val.toInterned()) |v| if (ip.keyTag(v) == .undef) return cg.fillMem(Mem.at(.r10, 0), size, 0xaa);
@@ -1568,7 +1594,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
 
         // The block's result, which each `br` writes (see `genTerm`).
-        .block => _ = try cg.slotFor(inst, data.ty_pl.ty),
+        .block => if (cg.homes[@backingInt(inst)] != .reg) {
+            _ = try cg.slotFor(inst, data.ty_pl.ty);
+        },
         .loop => {},
         // Terminators (`genTerm`).
         .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap => unreachable,
