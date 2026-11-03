@@ -184,7 +184,15 @@ fn main() callconv(.c) noreturn {
     if (weird()) |_| {} else |err| rt.print(@errorName(err));
     rt.print("\n");
     rt.printInt(@intFromBool(@TypeOf(@field(anyerror, "NotFound")) == error{NotFound}));
+    // The code of an error set with one name is comptime-known.
+    var only_a: error{A} = error.A;
+    _ = &only_a;
+    oneCode(only_a, @intFromError(error.A));
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
+}
+
+fn oneCode(x: error{A}, comptime code: u16) void {
+    if (@intFromError(x) != code) @compileError("not comptime-known");
 }
 
 fn failA() error{A}!void {

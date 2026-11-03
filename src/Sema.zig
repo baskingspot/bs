@@ -2966,6 +2966,17 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 } orelse break :blk sema.fail(block, src, "integer value '{d}' represents no error", .{code});
                 break :blk .fromInterned(try sema.intern(.{ .err = .{ .ty = .anyerror_type, .name = name } }));
             };
+            // An error set of zero or one names has one code, as upstream.
+            if (to_int) {
+                const op_ty = sema.typeOf(sema.resolveInst(extra.operand));
+                if (op_ty != .anyerror_type and Type.class(sema.ip, op_ty) == .error_set) {
+                    if (try sema.errorSetNames(block, src, op_ty)) |names| switch (names.len) {
+                        0 => break :blk .fromInterned(try sema.intValue(.u16_type, 0)),
+                        1 => break :blk .fromInterned(try sema.intValue(.u16_type, try sema.ip.errorValue(names[0]))),
+                        else => {},
+                    };
+                }
+            }
             if (block.is_comptime) break :blk sema.fail(block, src, "unable to evaluate comptime expression", .{});
             break :blk sema.addTyOp(block, .bitcast, if (to_int) .u16_type else .anyerror_type, operand);
         },
