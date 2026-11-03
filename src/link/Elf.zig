@@ -1380,7 +1380,10 @@ pub const SymbolTable = struct {
         // practically impossible for large ones.
         const slots = std.math.ceilPowerOfTwoAssert(usize, 64 + max_count * 2 / n_partitions);
         const len = slots * n_partitions;
-        const entries = try std.heap.page_allocator.alignedAlloc(Entry, huge_page, len);
+        // `rawAlloc`: `Allocator.alloc` fills the memory with undefined
+        // bytes in safe builds, and `used` must start false.
+        const bytes = std.heap.page_allocator.rawAlloc(len * @sizeOf(Entry), huge_page, @returnAddress()) orelse return error.OutOfMemory;
+        const entries: []Entry = @as([*]Entry, @ptrCast(@alignCast(bytes)))[0..len];
         adviseHugePages(std.mem.sliceAsBytes(entries));
         return .{
             .entries = entries,
@@ -1390,7 +1393,7 @@ pub const SymbolTable = struct {
     }
 
     pub fn deinit(t: *SymbolTable) void {
-        std.heap.page_allocator.free(t.entries);
+        if (t.entries.len != 0) std.heap.page_allocator.rawFree(std.mem.sliceAsBytes(t.entries), huge_page, @returnAddress());
     }
 
     /// Faults in a partition's pages, writable, before it is used. Otherwise
