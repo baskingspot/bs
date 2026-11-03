@@ -1695,6 +1695,10 @@ fn asmMemOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapU
                 continue;
             }
             if (part.len == 0) continue;
+            if (k == 0 and (std.mem.eql(u8, part, "%rip") or std.mem.eql(u8, part, "%%rip"))) {
+                mem.base = .rip;
+                continue;
+            }
             const reg = switch (try cg.asmOperand(part, names, line)) {
                 .reg => |r| r.reg,
                 else => return cg.fail("bad asm memory operand '{s}' in '{s}'", .{ tok, line }),
@@ -1757,6 +1761,8 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             }
         }
         if ((eql(u8, mnemonic, "pop") or eql(u8, mnemonic, "popq")) and ops[0] == .reg) return e.pop(ops[0].reg.reg);
+    } else if (ops[1] == .reg and ops[0] == .mem and !ops[0].mem.fs and (eql(u8, mnemonic, "lea") or eql(u8, mnemonic, "leaq"))) {
+        return e.lea(ops[1].reg.size, ops[1].reg.reg, ops[0].mem.mem);
     } else if (ops[1] == .reg) {
         // AT&T order: source, destination.
         const dst = ops[1].reg;

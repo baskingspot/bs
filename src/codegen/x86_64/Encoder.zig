@@ -122,6 +122,9 @@ pub const Mem = struct {
         /// RIP-relative `[rip + sym + disp]`; becomes a PC32 relocation.
         /// Cannot have an index.
         sym: SymbolKey,
+        /// `[rip + disp]`, relative to the end of the instruction.
+        /// Cannot have an index.
+        rip,
     };
     pub const Index = struct { reg: Reg, scale: Scale = .@"1" };
     pub const Scale = enum(u2) { @"1", @"2", @"4", @"8" };
@@ -808,6 +811,11 @@ fn modRm(e: *Encoder, o: Opts, opcode: []const u8, reg: u4, rm: RmEnc, imm_len: 
             e.byte(modrmByte(0b00, reg3, 0b101));
             try e.reloc(.x86_64_pc32, s, @as(i64, m.disp) - 4 - imm_len);
             e.int(u32, 0);
+        },
+        .rip => {
+            assert(m.index == null);
+            e.byte(modrmByte(0b00, reg3, 0b101));
+            e.int(i32, m.disp);
         },
         .none => {
             e.byte(modrmByte(0b00, reg3, 0b100));

@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n7\n1\n6\n8\n8\n"
+//! stdout: "42\n7\n1\n6\n8\n8\n12\n"
 const rt = @import("rt.zig");
 // For `std.lang.ExportOptions`; std.start sees `_start` and stays out.
 const std = @import("std");
@@ -47,6 +47,7 @@ fn main() callconv(.c) noreturn {
     rt.printInt(pick(1));
     rt.printInt(pick(0));
     rt.printInt(countdown(4));
+    rt.printInt(ripDistance());
     rt.exit(0);
 }
 
@@ -76,4 +77,15 @@ fn countdown(n: u64) u64 {
         : [ret] "={rax}" (-> u64),
         : [n] "{rdi}" (n),
     );
+}
+/// RIP-relative operands are relative to the next instruction (a
+/// `leaq (%rip)` is 7 bytes), as std.debug's cpu_context reads %rip.
+fn ripDistance() u64 {
+    return asm volatile (
+        \\ leaq (%%rip), %%rax
+        \\ leaq 5(%%rip), %%rcx
+        \\ subq %%rax, %%rcx
+        : [ret] "={rcx}" (-> u64),
+        :
+        : .{ .rax = true });
 }
