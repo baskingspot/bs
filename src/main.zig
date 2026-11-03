@@ -412,6 +412,7 @@ fn dupeDiagnostics(arena: std.mem.Allocator, diags: []const diag.Diagnostic) ![]
         const candidates = try arena.dupe([]const u8, d.candidates);
         for (candidates) |*c| c.* = try arena.dupe(u8, c.*);
         d.candidates = candidates;
+        if (d.hint) |h| d.hint = try arena.dupe(u8, h);
     }
     return out;
 }

@@ -540,8 +540,11 @@ pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_li
         const src_loc: std.zig.ErrorBundle.SourceLocationIndex = if (d.loc) |l| try bundleSrcLoc(wip, l, @intCast(refs.items.len)) else .none;
         // The trace trails the message's source location.
         if (d.loc != null) for (refs.items) |r| try wip.addReferenceTrace(r);
-        try wip.addRootErrorMessage(.{ .msg = msg, .count = d.count, .src_loc = src_loc, .notes_len = @intCast(d.notes.len) });
-        const notes_start = try wip.reserveNotes(@intCast(d.notes.len));
+        // Candidates and the hint trail the notes as notes without a location.
+        const extra_notes = @as(u32, @intFromBool(d.candidates.len != 0)) + @intFromBool(d.hint != null);
+        const notes_len: u32 = @intCast(d.notes.len + extra_notes);
+        try wip.addRootErrorMessage(.{ .msg = msg, .count = d.count, .src_loc = src_loc, .notes_len = notes_len });
+        const notes_start = try wip.reserveNotes(notes_len);
         for (d.notes, notes_start..) |n, i| {
             const note_msg = if (n.call) |kind| try wip.addString(switch (kind) {
                 .@"inline" => "called inline here",
@@ -549,6 +552,21 @@ pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_li
             }) else try wip.addString(n.msg);
             const note_loc: std.zig.ErrorBundle.SourceLocationIndex = if (n.loc) |l| try bundleSrcLoc(wip, l, 0) else .none;
             const index = try wip.addErrorMessage(.{ .msg = note_msg, .count = n.count, .src_loc = note_loc });
+            wip.extra.items[i] = @backingInt(index);
+        }
+        var i = notes_start + d.notes.len;
+        if (d.candidates.len != 0) {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(wip.gpa);
+            try text.appendSlice(wip.gpa, "candidates:");
+            for (d.candidates, 0..) |c, j| try text.print(wip.gpa, "{s} {s}", .{ if (j == 0) "" else ",", c });
+            const index = try wip.addErrorMessage(.{ .msg = try wip.addString(text.items), .src_loc = .none });
+            wip.extra.items[i] = @backingInt(index);
+            i += 1;
+        }
+        if (d.hint) |h| {
+            // Not one statement: adding the message can move `extra`.
+            const index = try wip.addErrorMessage(.{ .msg = try wip.printString("hint: {s}", .{h}), .src_loc = .none });
             wip.extra.items[i] = @backingInt(index);
         }
     }

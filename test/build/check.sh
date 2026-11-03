@@ -43,6 +43,14 @@ expect "src/main.zig:6:"
 expect "error: [type-mismatch]"
 sed -i 's/args.len - "x"/args.len - 1/' src/main.zig
 
+# Candidates and the migration hint travel as notes without a location.
+sed -i 's/std.debug.print/std.io.print/' src/main.zig
+if "$zap" build >"$work/log" 2>&1; then fail "zap build succeeded with std.io"; fi
+expect "error: [no-member] root source file struct 'std' has no member named 'io'"
+expect "note: candidates: Io"
+expect "note: hint: std.io is now std.Io"
+sed -i 's/std.io.print/std.debug.print/' src/main.zig
+
 # A step zap does not build fails with a diagnostic, not a crash.
 if "$zap" build -Doptimize=ReleaseFast >"$work/log" 2>&1; then fail "zap build succeeded in ReleaseFast"; fi
 expect "error: [unsupported] zap builds only Debug ('-Ofast')"
