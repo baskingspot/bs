@@ -3498,7 +3498,10 @@ pub const Diagnostic = struct {
     msg: []const u8,
     count: u32 = 1,
     notes: []const Note = &.{},
-    // Later steps: candidates, hint, fixes, instances.
+    refs: []const Ref = &.{}, // the reference trace
+    candidates: []const []const u8 = &.{},
+    hint: ?[]const u8 = null,
+    // Later steps: fixes, instances.
 };
 pub const Loc = struct {
     path: []const u8, // displayed: relative to the cwd, or to the zig lib directory
@@ -3592,6 +3595,19 @@ code.
   diffing the `pub` declaration sets of std between upstream releases 0.11
   and 0.17 (a script in `tools/diag/`), with the replacement text written
   by hand and checked against 0.17's std. Expect a few hundred entries.
+  `tools/diag/std_removed.py` takes the lib/std directories of older
+  releases and 0.17's and lists what 0.17 lacks, collapsed to the
+  outermost missing container and ranked by how often the old std used
+  it. Over 0.11, 0.13, 0.14.1 and 0.15.2 it lists about 5300 entries,
+  most of them internal (std.os.windows, Build internals); `std.io`
+  leads by far (1305 uses), then `posix.close`, `crypto.random`,
+  `fs.cwd`, `mem.page_size`. The table (`diag.migrations`) starts with
+  the most used public ones: 43 API entries, a `*` entry per container
+  whose misses share one answer (`os`, `posix`, `lang.Type`), and 14
+  builtins. Every replacement was compiled with upstream 0.17 and zap.
+  Not yet covered: `usingnamespace` and `async`, which are parse errors,
+  and arity-change patterns such as `list.append(x)` on an unmanaged
+  list.
 
 **Fixes zap knows**, first set:
 
@@ -3814,11 +3830,12 @@ unchanged:
    format strings. (Done.)
 3. Facts: candidates, declaration sites, user frame first, the reference
    trace from `referenced_by`, and inferred error sets printed by name.
-   (Started: upstream's type-mismatch notes, declared-here notes with
-   their source lines, the reference trace, and candidates for failed
-   member and field lookups. Not yet: candidates for undeclared
-   identifiers, which come from AstGen.)
-4. The migration and pattern table.
+   (Done: upstream's type-mismatch notes, declared-here notes with their
+   source lines, the reference trace, and candidates for failed member
+   and field lookups and for undeclared identifiers, the latter by
+   parsing the failing file again. Not yet: the value's origin on type
+   mismatches, and inferred error sets by name.)
+4. The migration and pattern table. (Started: the first set above.)
 5. Fixes, first set.
 6. The cache: failing builds commit the manifest for the units that
    succeeded.

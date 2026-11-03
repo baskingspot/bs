@@ -1323,7 +1323,8 @@ const CandidateNames = enum {
 };
 
 /// Returns `err` after giving the most recent error, a failed lookup of
-/// `name` in `ty`, the names of `ty` close to it (`diag.closeNames`).
+/// `name` in `ty`, the names of `ty` close to it (`diag.closeNames`) and
+/// what replaced the name if 0.17 removed it (`diag.migrationHint`).
 /// Declarations of another file count only if `pub`.
 fn withCandidates(sema: *Sema, err: CompileError, ty: Index, name: []const u8, which: CandidateNames) CompileError {
     sema.addCandidates(ty, name, which) catch |e| return e;
@@ -1351,8 +1352,11 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
             }
         }
     };
+    const diag = @import("diag.zig");
+    const last = &zcu.errors.items[zcu.errors.items.len - 1];
+    last.hint = diag.migrationHint(try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)}), name);
     var close: std.ArrayList([]const u8) = .empty;
-    try @import("diag.zig").closeNames(sema.arena, name, names.items, which == .fields, &close);
+    try diag.closeNames(sema.arena, name, names.items, which == .fields, &close);
     if (close.items.len == 0) return;
     const arena = zcu.arena.allocator();
     const owned = try arena.alloc([]const u8, close.items.len);

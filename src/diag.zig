@@ -138,6 +138,9 @@ pub const Diagnostic = struct {
     refs: []const Ref = &.{},
     /// Names close to the one a failed lookup asked for, closest first.
     candidates: []const []const u8 = &.{},
+    /// One line on what replaced an API or builtin that 0.17 lacks
+    /// (`migrationHint`, `builtinHint`).
+    hint: ?[]const u8 = null,
 };
 
 /// A frame of the reference trace: unit `name` referred onward at `loc`.
@@ -294,7 +297,8 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
             }
         else
             &.{};
-        try out.append(arena, .{ .code = code, .loc = try bundleLoc(arena, paths, bundle, m.src_loc), .msg = msg, .count = m.count, .notes = notes, .candidates = candidates });
+        const hint: ?[]const u8 = if (code == .@"unknown-builtin") if (quoted(msg)) |name| builtinHint(name) else null else null;
+        try out.append(arena, .{ .code = code, .loc = try bundleLoc(arena, paths, bundle, m.src_loc), .msg = msg, .count = m.count, .notes = notes, .candidates = candidates, .hint = hint });
     }
 }
 
@@ -302,10 +306,7 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
 /// identifier 'x'" at `sli`) could have meant, from the file parsed again
 /// (`scopeNames`), filtered by `closeNames`.
 fn undeclaredCandidates(arena: std.mem.Allocator, io: std.Io, bundle: std.zig.ErrorBundle, sli: std.zig.ErrorBundle.SourceLocationIndex, msg: []const u8) ![]const []const u8 {
-    const open = std.mem.indexOfScalar(u8, msg, '\'') orelse return &.{};
-    const close = std.mem.lastIndexOfScalar(u8, msg, '\'') orelse return &.{};
-    if (close <= open + 1) return &.{};
-    const name = msg[open + 1 .. close];
+    const name = quoted(msg) orelse return &.{};
     const sl = bundle.getSourceLocation(sli);
     const path = bundle.nullTerminatedString(sl.src_path);
     const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, arena, .unlimited, .of(u8), 0);
@@ -315,6 +316,119 @@ fn undeclaredCandidates(arena: std.mem.Allocator, io: std.Io, bundle: std.zig.Er
     var out: std.ArrayList([]const u8) = .empty;
     try closeNames(arena, name, names.items, false, &out);
     return out.items;
+}
+
+/// The text between the first and last `'` of `msg`, if any.
+fn quoted(msg: []const u8) ?[]const u8 {
+    const open = std.mem.indexOfScalar(u8, msg, '\'') orelse return null;
+    const close = std.mem.lastIndexOfScalar(u8, msg, '\'') orelse return null;
+    if (close <= open + 1) return null;
+    return msg[open + 1 .. close];
+}
+
+// ---------------------------------------------------------------------------
+// Migration and pattern hints (step 4)
+
+/// What replaced std APIs that models still write from older releases, by
+/// (container, missing name). The container is named as zap prints it,
+/// without generic arguments (`array_list.Aligned`); a name of `*` covers
+/// every missing name of the container. Seeded from
+/// `tools/diag/std_removed.py` (0.11 to 0.15 against 0.17, most used
+/// first); every replacement is checked against 0.17's std.
+const migrations = [_]struct { []const u8, []const u8, []const u8 }{
+    .{ "std", "io", "std.io is now std.Io: take `init: std.process.Init` in main, then `var w = std.Io.File.stdout().writer(init.io, &buffer);`, print with `w.interface.print(...)` and `w.interface.flush()`; std.debug.print writes to stderr without io" },
+    .{ "std", "rand", "std.rand is now std.Random" },
+    .{ "std", "net", "std.net is now std.Io.net" },
+    .{ "std", "ChildProcess", "std.ChildProcess is now std.process.Child" },
+    .{ "std", "StringArrayHashMap", "managed array hash maps were removed: use std.StringArrayHashMapUnmanaged (`= .empty`) and pass the allocator to each call" },
+    .{ "std", "BoundedArray", "std.BoundedArray was removed: use `std.ArrayList(T).initBuffer(&buffer)` with appendBounded and appendSliceBounded" },
+    .{ "std", "fifo", "std.fifo was removed: use std.Deque, or std.Io.Reader and std.Io.Writer for byte streams" },
+    .{ "std", "event", "std.event was removed: concurrency goes through std.Io" },
+    .{ "fs", "cwd", "std.fs.cwd() is now std.Io.Dir.cwd(), and its methods take io: `std.Io.Dir.cwd().openFile(io, path, .{})`" },
+    .{ "fs", "Dir", "std.fs.Dir is now std.Io.Dir; its methods take io" },
+    .{ "fs", "File", "std.fs.File is now std.Io.File; its methods take io (`file.close(io)`)" },
+    .{ "fs", "realpathAlloc", "use `std.Io.Dir.cwd().realPathFileAlloc(io, path, gpa)`" },
+    .{ "fs", "openFileAbsolute", "use `std.Io.Dir.openFileAbsolute(io, path, .{})`" },
+    .{ "fs", "createFileAbsolute", "use `std.Io.Dir.createFileAbsolute(io, path, .{})`" },
+    .{ "fs", "openDirAbsolute", "use `std.Io.Dir.openDirAbsolute(io, path, .{})`" },
+    .{ "fs", "renameAbsolute", "use `std.Io.Dir.renameAbsolute(old_path, new_path, io)`" },
+    .{ "fs", "MAX_PATH_BYTES", "std.fs.MAX_PATH_BYTES is now std.fs.max_path_bytes" },
+    .{ "mem", "page_size", "use std.heap.pageSize() at run time, or std.heap.page_size_min / page_size_max at comptime" },
+    .{ "mem", "readIntLittle", "use `std.mem.readInt(T, bytes, .little)`" },
+    .{ "mem", "readIntBig", "use `std.mem.readInt(T, bytes, .big)`" },
+    .{ "mem", "readIntNative", "use `std.mem.readInt(T, bytes, builtin.cpu.arch.endian())`" },
+    .{ "mem", "writeIntLittle", "use `std.mem.writeInt(T, buffer, value, .little)`" },
+    .{ "mem", "writeIntBig", "use `std.mem.writeInt(T, buffer, value, .big)`" },
+    .{ "mem", "trimRight", "std.mem.trimRight is now std.mem.trimEnd" },
+    .{ "mem", "trimLeft", "std.mem.trimLeft is now std.mem.trimStart" },
+    .{ "mem", "copy", "use @memcpy for non-overlapping slices, or std.mem.copyForwards" },
+    .{ "mem", "set", "use `@memset(slice, value)`" },
+    .{ "meta", "Int", "use the builtin `@Int(.unsigned, bits)`" },
+    .{ "crypto", "random", "std.crypto.random was replaced by std.Io: `io.random(&buffer)`" },
+    .{ "heap", "GeneralPurposeAllocator", "std.heap.GeneralPurposeAllocator is now std.heap.DebugAllocator(.{}); in main, init.gpa from std.process.Init is one already" },
+    .{ "time", "sleep", "use `io.sleep(.fromMilliseconds(ms), .awake)` (std.Io.sleep)" },
+    .{ "process", "argsAlloc", "arguments come from main: take `init: std.process.Init`, then `var it = init.minimal.args.iterate();`" },
+    .{ "process", "args", "arguments come from main: take `init: std.process.Init`, then `var it = init.minimal.args.iterate();`" },
+    .{ "fmt", "format", "print through a writer (`w.print(fmt, args)`, std.Io.Writer), or use std.fmt.bufPrint or std.fmt.allocPrint" },
+    .{ "json", "stringify", "use `std.json.Stringify.value(value, .{}, writer)`" },
+    .{ "json", "stringifyAlloc", "use `std.json.Stringify.valueAlloc(gpa, value, .{})`" },
+    .{ "debug", "warn", "std.debug.warn is now std.debug.print" },
+    .{ "os", "exit", "use std.process.exit" },
+    .{ "os", "*", "std.os keeps only OS-specific APIs (std.os.linux, std.os.windows): POSIX wrappers moved to std.posix, files and sockets to std.Io" },
+    .{ "posix", "close", "close files with `file.close(io)` (std.Io.File) and directories with `dir.close(io)`" },
+    .{ "posix", "*", "std.posix lost its file and socket functions to std.Io: files are std.Io.File and std.Io.Dir, sockets std.Io.net; raw Linux syscalls are in std.os.linux" },
+    .{ "array_list.Aligned", "init", "std.ArrayList is unmanaged: `var list: std.ArrayList(T) = .empty;`, then pass the allocator to each call (`list.append(gpa, x)`, `list.deinit(gpa)`); std.array_list.Managed keeps the old API" },
+    .{ "lang.Type", "*", "@typeInfo's fields are lowercase: .int, .pointer, .@\"struct\", .@\"enum\", .@\"union\", .@\"fn\"" },
+};
+
+const migration_map = std.StaticStringMap([]const u8).initComptime(kvs: {
+    @setEvalBranchQuota(100_000);
+    var kvs: [migrations.len]struct { []const u8, []const u8 } = undefined;
+    for (migrations, &kvs) |m, *kv| kv.* = .{ m[0] ++ "\x00" ++ m[1], m[2] };
+    break :kvs kvs;
+});
+
+/// The migration hint for a failed lookup of `name` in the container
+/// zap prints as `container` (generic arguments are ignored).
+pub fn migrationHint(container: []const u8, name: []const u8) ?[]const u8 {
+    const base = container[0 .. std.mem.indexOfScalar(u8, container, '(') orelse container.len];
+    var buf: [256]u8 = undefined;
+    const exact = std.fmt.bufPrint(&buf, "{s}\x00{s}", .{ base, name }) catch return null;
+    if (migration_map.get(exact)) |h| return h;
+    const any = std.fmt.bufPrint(&buf, "{s}\x00*", .{base}) catch return null;
+    return migration_map.get(any);
+}
+
+/// What replaced builtins of older releases (`@intToEnum`), by name with
+/// its `@`; checked against 0.17's builtin list.
+const builtin_hints = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "@intToEnum", "renamed to @enumFromInt, which takes its type from the result: `@as(E, @enumFromInt(x))`" },
+    .{ "@enumToInt", "renamed to @intFromEnum: `@intFromEnum(e)`" },
+    .{ "@intToFloat", "renamed to @floatFromInt, which takes its type from the result: `@as(f64, @floatFromInt(x))`" },
+    .{ "@floatToInt", "renamed to @intFromFloat, which takes its type from the result: `@as(i32, @intFromFloat(x))`" },
+    .{ "@ptrToInt", "renamed to @intFromPtr: `@intFromPtr(p)`" },
+    .{ "@intToPtr", "renamed to @ptrFromInt, which takes its type from the result: `@as(*T, @ptrFromInt(x))`" },
+    .{ "@boolToInt", "renamed to @intFromBool: `@intFromBool(b)`" },
+    .{ "@errorToInt", "renamed to @intFromError: `@intFromError(err)`" },
+    .{ "@intToError", "renamed to @errorFromInt: `@errorFromInt(x)`" },
+    .{ "@errSetCast", "renamed to @errorCast, which takes its type from the result: `@as(E, @errorCast(err))`" },
+    .{ "@Type", "@Type was split into @Int, @Struct, @Union, @Enum, @Pointer, @Fn, @Tuple and @EnumLiteral" },
+    .{ "@setCold", "use `@branchHint(.cold);` as the first statement of the function" },
+    .{ "@fence", "@fence was removed: give the atomic operations themselves the ordering" },
+    .{ "@cImport", "@cImport was removed: translate the C headers in build.zig (b.addTranslateC) and import the result as a module" },
+});
+
+pub fn builtinHint(name: []const u8) ?[]const u8 {
+    return builtin_hints.get(name);
+}
+
+test migrationHint {
+    try std.testing.expect(migrationHint("std", "io") != null);
+    // Generic arguments are ignored, and `*` covers a container.
+    try std.testing.expect(std.mem.startsWith(u8, migrationHint("array_list.Aligned(u8,null)", "init").?, "std.ArrayList is unmanaged"));
+    try std.testing.expect(std.mem.startsWith(u8, migrationHint("os", "fd_t").?, "std.os keeps"));
+    try std.testing.expectEqual(null, migrationHint("mem", "eql"));
+    try std.testing.expectEqual(null, migrationHint("array_list.Alignedd", "init"));
 }
 
 /// Primitive names an identifier can mean without a declaration.
@@ -496,6 +610,7 @@ fn renderText(w: *Writer, d: Diagnostic) Writer.Error!void {
         for (d.candidates, 0..) |c, i| try w.print("{s} {s}", .{ if (i == 0) "" else ",", c });
         try w.writeByte('\n');
     }
+    if (d.hint) |h| try w.print("  hint: {s}\n", .{h});
     // Frames in the zig lib directory carry nothing an agent can change;
     // they print only as a count next to the user's frames.
     if (user_frames != 0) {
@@ -595,6 +710,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
         src: ?[]const u8 = null,
         notes: ?[]const JsonNote,
         candidates: ?[]const []const u8,
+        hint: ?[]const u8,
         calls: ?[]const JsonCall,
         ref: ?[]const JsonRef,
     } = .{
@@ -608,6 +724,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
         .src = if (d.loc) |l| sourceExcerpt(l) else null,
         .notes = if (n_notes != 0) notes_buf[0..n_notes] else null,
         .candidates = if (d.candidates.len != 0) d.candidates else null,
+        .hint = d.hint,
         .calls = if (n_calls != 0) calls_buf[0..n_calls] else null,
         .ref = if (n_refs != 0) refs_buf[0..n_refs] else null,
     };
