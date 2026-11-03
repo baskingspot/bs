@@ -9252,6 +9252,8 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         const len = sema.vectorLen(ty).?;
         const l = try sema.vectorOperand(block, src, ty, lhs);
         const r = try sema.vectorOperand(block, src, ty, rhs);
+        if ((op == .eq or op == .neq) and !block.is_comptime and sema.bc == null)
+            if (try sema.cmpBytes(block, src, op == .eq, ty, len, l, r)) |res| return res;
         return sema.vectorMap(block, src, len, try sema.vectorType(len, .bool_type), &.{ l, r }, VectorCmp{ .op = op, .elem_ty = Type.childType(ip, ty) });
     }
     const is_eq = op == .eq or op == .neq;
@@ -17658,6 +17660,60 @@ fn vectorMapLoop(sema: *Sema, block: *Block, src: Src, len: u32, result_ty: Inde
     try block.instructions.append(gpa, res_inst);
     try sema.addBlock(block, block_inst, .void_type, &.{loop_inst});
     return sema.analyzeLoad(block, src, res_inst.toRef());
+}
+
+/// `a == b` (`eq`) or `a != b` on vectors of type `ty` of bytes, 8 to 64
+/// long in steps of 8, at least one runtime: eight elements at a time in
+/// u64 words instead of `vectorMapLoop`'s loop over the elements, about
+/// ten instructions per word where the loop takes about 25 per element.
+/// The fuzzer's `PcBitsetIterator.next` spends nearly all its time on
+/// one (`@as(@Vector(64, u8), @splat(0)) != counters`). Other vectors
+/// return null.
+fn cmpBytes(sema: *Sema, block: *Block, src: Src, eq: bool, ty: Index, len: u32, a: Ref, b: Ref) CompileError!?Ref {
+    const ip = sema.ip;
+    const elem = Type.childType(ip, ty);
+    if (!Type.isInt(ip, elem) or Type.intInfo(ip, elem).bits != 8) return null;
+    if (len == 0 or len % 8 != 0 or len > 64) return null;
+    if (sema.typeOf(a) != ty or sema.typeOf(b) != ty) return null;
+    var runtime = false;
+    // Undefined elements compare to undefined bools, element by element.
+    for ([_]Ref{ a, b }) |o| if (sema.resolveValue(o)) |v| {
+        if (sema.isUndef(v)) return null;
+        for (0..len) |i| if (sema.isUndef(try sema.elemValue(v, @intCast(i)))) return null;
+    } else {
+        runtime = true;
+    };
+    if (!runtime) return null;
+    const word_ty = try sema.vectorType(len / 8, .u64_type);
+    const wa = try sema.bitCast(block, src, word_ty, a);
+    const wb = try sema.bitCast(block, src, word_ty, b);
+    const zero = try sema.intValue(.u64_type, 0);
+    const lo7: Ref = .fromInterned(try sema.intValue(.u64_type, 0x7f7f_7f7f_7f7f_7f7f));
+    const hi1: Ref = .fromInterned(try sema.intValue(.u64_type, 0x8080_8080_8080_8080));
+    // Moves bit 8i to bit 56 + i, with no carries between them.
+    const gather: Ref = .fromInterned(try sema.intValue(.u64_type, 0x0102_0408_1020_4080));
+    const shift_ty = try sema.intType(.unsigned, 6);
+    var bits: Ref = .none;
+    for (0..len / 8) |j| {
+        const xa = try sema.vectorElem(block, wa, @intCast(j));
+        const xb = try sema.vectorElem(block, wb, @intCast(j));
+        // A byte of `x` is nonzero where the elements differ.
+        const x = if (sema.resolveValue(xa) == zero) xb else if (sema.resolveValue(xb) == zero) xa else try sema.addBinOp(block, .xor, xa, xb);
+        // The top bit of each byte: set if any of its bits is.
+        const low = try sema.addBinOp(block, .add_wrap, try sema.addBinOp(block, .bit_and, x, lo7), lo7);
+        const top = try sema.addBinOp(block, .bit_and, try sema.addBinOp(block, .bit_or, low, x), hi1);
+        const ones = try sema.addBinOp(block, .shr, top, .fromInterned(try sema.intValue(shift_ty, 7)));
+        const byte = try sema.addBinOp(block, .shr, try sema.addBinOp(block, .mul_wrap, ones, gather), .fromInterned(try sema.intValue(shift_ty, 56)));
+        if (j == 0) {
+            bits = byte;
+            continue;
+        }
+        const placed = try sema.addBinOp(block, .shl, byte, .fromInterned(try sema.intValue(shift_ty, 8 * j)));
+        bits = try sema.addBinOp(block, .bit_or, bits, placed);
+    }
+    if (eq) bits = try sema.addBinOp(block, .xor, bits, .fromInterned(try sema.intValue(.u64_type, @as(u64, std.math.maxInt(u64)) >> @intCast(64 - len))));
+    if (len < 64) bits = try sema.addTyOp(block, .trunc, try sema.intType(.unsigned, @intCast(len)), bits);
+    return try sema.bitCast(block, src, try sema.vectorType(len, .bool_type), bits);
 }
 
 /// Whether every value of `src` coerces to `dest`, both integers or both
