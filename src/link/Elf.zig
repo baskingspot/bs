@@ -560,7 +560,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
     const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls;
     const has_cfi = n_debug > 0;
-    const phnum: u16 = 3 + @as(u16, @intFromBool(has_rx)) + @intFromBool(has_rw) + @intFromBool(has_cfi) + @intFromBool(has_tls);
+    // Which program headers are written, of all the linker writes, in
+    // order: PHDR; the R, RX, and RW LOADs; TLS; GNU_EH_FRAME; GNU_STACK.
+    const ph_present = [_]bool{ true, true, has_rx, has_rw, has_tls, has_cfi, true };
+    var phnum: u16 = 0;
+    for (ph_present) |p| phnum += @intFromBool(p);
     const headers_end: u64 = @sizeOf(elf.Elf64.Ehdr) + phnum * @sizeOf(elf.Elf64.Phdr);
     var starts: [n_sections]u64 = undefined;
     starts[rodata] = aligns[rodata].forward(headers_end);
@@ -700,7 +704,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.check(diag);
 
     // Headers.
-    var head: [@sizeOf(elf.Elf64.Ehdr) + 7 * @sizeOf(elf.Elf64.Phdr)]u8 = undefined;
+    var head: [@sizeOf(elf.Elf64.Ehdr) + ph_present.len * @sizeOf(elf.Elf64.Phdr)]u8 = undefined;
     writeStruct(&head, elf.Elf64.Ehdr{
         .ident = .{ .class = .@"64", .data = .@"2LSB", .version = 1, .osabi = .NONE, .abiversion = 0 },
         .type = .EXEC,
@@ -718,50 +722,31 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .shstrndx = shnum - 1,
     });
     var ph_off: usize = @sizeOf(elf.Elf64.Ehdr);
-    const phdrs = [_]struct { bool, elf.PT, elf.PF, u64, u64, u64, u64 }{
-        .{ true, .PHDR, .{ .R = true }, @sizeOf(elf.Elf64.Ehdr), phnum * @sizeOf(elf.Elf64.Phdr), phnum * @sizeOf(elf.Elf64.Phdr), 8 },
-        .{ true, .LOAD, .{ .R = true }, 0, r_end, r_end, page_size },
-        .{ has_rx, .LOAD, .{ .R = true, .X = true }, rx_start, text_end - rx_start, text_end - rx_start, page_size },
-        .{ has_rw, .LOAD, .{ .R = true, .W = true }, rw_start, file_end - rw_start, mem_end - rw_start, page_size },
-        .{ has_tls, .TLS, .{ .R = true }, tls_start, sizes[tdata], tls_end - tls_start, tls_align.toByteUnits() },
+    // In `ph_present`'s order: type, flags, offset, address, file and
+    // memory sizes, alignment.
+    const ph_size = phnum * @sizeOf(elf.Elf64.Phdr);
+    const phdrs = [ph_present.len]struct { elf.PT, elf.PF, u64, u64, u64, u64, u64 }{
+        .{ .PHDR, .{ .R = true }, @sizeOf(elf.Elf64.Ehdr), base + @sizeOf(elf.Elf64.Ehdr), ph_size, ph_size, 8 },
+        .{ .LOAD, .{ .R = true }, 0, base, r_end, r_end, page_size },
+        .{ .LOAD, .{ .R = true, .X = true }, rx_start, base + rx_start, text_end - rx_start, text_end - rx_start, page_size },
+        .{ .LOAD, .{ .R = true, .W = true }, rw_start, base + rw_start, file_end - rw_start, mem_end - rw_start, page_size },
+        .{ .TLS, .{ .R = true }, tls_start, base + tls_start, sizes[tdata], tls_end - tls_start, tls_align.toByteUnits() },
+        .{ .GNU_EH_FRAME, .{ .R = true }, hdr_off, base + hdr_off, hdr_size, hdr_size, 4 },
+        .{ .GNU_STACK, .{ .R = true, .W = true }, 0, 0, 0, 0, 16 },
     };
-    for (phdrs) |p| if (p[0]) {
+    for (ph_present, phdrs) |present, p| if (present) {
         writeStruct(head[ph_off..], elf.Elf64.Phdr{
-            .type = p[1],
-            .flags = p[2],
-            .offset = p[3],
-            .vaddr = base + p[3],
-            .paddr = base + p[3],
+            .type = p[0],
+            .flags = p[1],
+            .offset = p[2],
+            .vaddr = p[3],
+            .paddr = p[3],
             .filesz = p[4],
             .memsz = p[5],
             .@"align" = p[6],
         });
         ph_off += @sizeOf(elf.Elf64.Phdr);
     };
-    if (has_cfi) {
-        writeStruct(head[ph_off..], elf.Elf64.Phdr{
-            .type = .GNU_EH_FRAME,
-            .flags = .{ .R = true },
-            .offset = hdr_off,
-            .vaddr = base + hdr_off,
-            .paddr = base + hdr_off,
-            .filesz = hdr_size,
-            .memsz = hdr_size,
-            .@"align" = 4,
-        });
-        ph_off += @sizeOf(elf.Elf64.Phdr);
-    }
-    writeStruct(head[ph_off..], elf.Elf64.Phdr{
-        .type = .GNU_STACK,
-        .flags = .{ .R = true, .W = true },
-        .offset = 0,
-        .vaddr = 0,
-        .paddr = 0,
-        .filesz = 0,
-        .memsz = 0,
-        .@"align" = 16,
-    });
-    ph_off += @sizeOf(elf.Elf64.Phdr);
     std.debug.assert(ph_off == headers_end);
     try l.put(0, head[0..headers_end]);
 
