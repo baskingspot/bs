@@ -9142,7 +9142,8 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
             try sema.addSafetyCheck(block, ok, .cast_to_null, .none, .none);
         }
         operand = try sema.optionalPayload(block, src, operand, false);
-    } else if (optPtr(ip, dest_ty) and Type.class(ip, sema.typeOf(operand)) == .pointer) {
+    } else if (Type.class(ip, dest_ty) == .optional and Type.class(ip, Type.childType(ip, dest_ty)) == .pointer and Type.class(ip, sema.typeOf(operand)) == .pointer) {
+        // Into an optional pointer or slice: cast to the payload and wrap.
         const child = try sema.ptrCastInner(block, src, flags, Type.childType(ip, dest_ty), operand);
         return sema.coerce(block, dest_ty, child, src);
     }

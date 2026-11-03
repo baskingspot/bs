@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "1\n7\n3\n1\n0\n1\n1\n1\n9\n1\n42\n4\n4\n44\n7\n4294967295\n42\n13\n"
+//! stdout: "1\n7\n3\n1\n0\n1\n1\n1\n9\n1\n42\n4\n4\n44\n7\n4294967295\n42\n13\n4\n"
 const rt = @import("rt.zig");
 // For `std.lang.ExternOptions`; std.start sees `_start` and stays out.
 const std = @import("std");
@@ -92,6 +92,9 @@ fn main() callconv(.c) noreturn {
     // Extern function declarations resolve to exports of their name.
     rt.printInt(api_add(4, 2));
     rt.printInt(zap_add(1, 3));
+    // @ptrCast into an optional slice.
+    const ws = wordsOf(&word_buf).?;
+    rt.printInt(ws.len + ws[1]);
     rt.exit(0);
 }
 
@@ -121,3 +124,8 @@ fn addImpl(a: u32, b: u32) callconv(.c) u32 {
     return a * 10 + b;
 }
 extern fn zap_add(a: u32, b: u32) u32;
+
+var word_buf: [8]u8 align(4) = .{ 1, 0, 0, 0, 2, 0, 0, 0 };
+fn wordsOf(b: []u8) ?[]u32 {
+    return @ptrCast(@alignCast(b));
+}
