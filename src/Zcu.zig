@@ -50,9 +50,10 @@ ready_irs: std.ArrayList(Ir) = .empty,
 comptime_decls: std.AutoArrayHashMapUnmanaged(ComptimeDecl, enum { queued, done }) = .empty,
 /// Memoized comptime calls, keyed by `Sema.comptimeCallKey`.
 comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, Memo) = .empty,
-/// The comptime evaluator's state of each function called at comptime
-/// (see `Sema.callComptime`). In memory only, like function IR.
-comptime_bodies: std.AutoHashMapUnmanaged(InternPool.Index, ComptimeBody) = .empty,
+/// The comptime evaluator's state of each function called at comptime,
+/// and of each generic function per specialization (see `Sema.bcCall`).
+/// In memory only, like function IR.
+comptime_bodies: std.AutoHashMapUnmanaged(InternPool.Hash, ComptimeBody) = .empty,
 /// Walker runs of a function before it is lowered for the comptime
 /// evaluator; 0 turns the evaluator off (`ZAP_COMPTIME_EVAL`).
 comptime_eval_threshold: u32 = 4,
@@ -122,6 +123,9 @@ pub const Bytecode = struct {
     /// outside any runtime block of the body), which every run declares as
     /// plain dependencies.
     entry_deps: []const u32,
+    /// For a generic function's specialization, per parameter: its type,
+    /// and its value if the body has it comptime-known. Empty otherwise.
+    params: []const BytecodeParam,
     /// Instructions whose values the evaluator keeps in its frame: an
     /// `alloc` used only by `load` and `store` to it, which stays out of
     /// comptime memory, and an `*_with_overflow` read only by
@@ -132,9 +136,16 @@ pub const Bytecode = struct {
         b.ir.deinit(gpa);
         gpa.free(b.deps);
         gpa.free(b.entry_deps);
+        gpa.free(b.params);
         b.in_frame.deinit(gpa);
         gpa.destroy(b);
     }
+};
+
+pub const BytecodeParam = struct {
+    ty: InternPool.Index,
+    /// `.none` for a parameter the body takes as an `arg`.
+    val: InternPool.Index,
 };
 
 pub const ComptimeBody = union(enum) {

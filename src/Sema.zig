@@ -13329,12 +13329,12 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
     const result = switch (try sema.bcCall(caller, src, func, args)) {
         .result => |r| r,
         .none => try sema.walkComptimeCall(caller, src, func, args),
-        .aborted => blk: {
+        .aborted => |body_key| blk: {
             // The run hit something the evaluator does not reproduce
             // (else the walker fails the same way below): leave this
             // function to the walker.
             const r = try sema.walkComptimeCall(caller, src, func, args);
-            const state = sema.zcu.comptime_bodies.getPtr(func).?;
+            const state = sema.zcu.comptime_bodies.getPtr(body_key).?;
             if (state.* == .ready) {
                 const b = state.ready;
                 state.* = .{ .off = b };
@@ -13471,33 +13471,23 @@ const BcLowered = union(enum) {
 };
 
 /// Lowers the body of `func_index` for the comptime evaluator.
-fn bcLower(zcu: *Zcu, func_index: Index) Allocator.Error!BcLowered {
+fn bcLower(zcu: *Zcu, func_index: Index, args: []const Index) Allocator.Error!BcLowered {
     const ip = &zcu.ip;
     const func = ip.indexToKey(func_index).func;
     const fn_ty = ip.indexToKey(func.ty).func_type;
-    // Generic functions instantiate per call; inferred error sets need
-    // the runtime body. Both stay with the walker for now.
-    if (fn_ty.is_generic or func.generic_owner != .none or fn_ty.cc == .naked) return .refused;
-    if (fn_ty.return_type == .noreturn_type) return .refused;
-    if (ip.indexToKey(fn_ty.return_type) == .error_union_type and
-        ip.indexToKey(fn_ty.return_type).error_union_type.error_set_type == .adhoc_inferred_error_set_type) return .refused;
+    // An instance called by value stays with the walker.
+    if (func.generic_owner != .none or fn_ty.cc == .naked) return .refused;
     var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
     defer arena_state.deinit();
     const nav = ip.getNav(func.owner_nav);
     var sema = create(zcu, arena_state.allocator(), nav.file, .{ .func = func_index });
     defer sema.destroy();
-    for (fn_ty.param_types) |pt| if (!sema.layoutResolved(pt)) return .{ .not_ready = .none };
-    if (!sema.layoutResolved(fn_ty.return_type)) return .{ .not_ready = .none };
-    // Comptime-only values do not fit the IR.
-    for (fn_ty.param_types) |pt| if (Type.isComptimeOnly(ip, pt)) return .refused;
-    if (Type.isComptimeOnly(ip, fn_ty.return_type)) return .refused;
 
     var bc: BcLowering = .{};
     sema.bc = &bc;
-    sema.func = func_index;
-    sema.fn_ret_ty = fn_ty.return_type;
+    var params: std.ArrayList(Zcu.BytecodeParam) = .empty;
     const n_errors = zcu.errors.items.len;
-    const ok = if (sema.bcLowerBody(func_index)) true else |err| switch (err) {
+    const ok = if (sema.bcLowerBody(func_index, args, &params)) true else |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => false,
     };
@@ -13515,7 +13505,7 @@ fn bcLower(zcu: *Zcu, func_index: Index) Allocator.Error!BcLowered {
     var ir: Ir = .{
         .instructions = sema.ir_insts.toOwnedSlice(),
         .extra = extra,
-        .func = func_index,
+        .func = sema.func,
         .main_block = sema.bc_main_block,
     };
     errdefer ir.instructions.deinit(gpa);
@@ -13529,8 +13519,10 @@ fn bcLower(zcu: *Zcu, func_index: Index) Allocator.Error!BcLowered {
     for (sema.deps_conditional.items, 0..) |c, i| if (!c and !marked.isSet(i)) try entry_deps.append(gpa, @intCast(i));
     const entry = try entry_deps.toOwnedSlice(gpa);
     errdefer gpa.free(entry);
+    const body_params = try gpa.dupe(Zcu.BytecodeParam, params.items);
+    errdefer gpa.free(body_params);
     const body = try gpa.create(Zcu.Bytecode);
-    body.* = .{ .ir = ir, .deps = deps, .entry_deps = entry, .in_frame = in_frame };
+    body.* = .{ .ir = ir, .deps = deps, .entry_deps = entry, .params = body_params, .in_frame = in_frame };
     return .{ .ready = body };
 }
 
@@ -13679,7 +13671,10 @@ fn bcInFrame(gpa: Allocator, ir: *const Ir) Allocator.Error!std.DynamicBitSetUnm
     return set;
 }
 
-fn bcLowerBody(sema: *Sema, func_index: Index) CompileError!void {
+/// Lowers `func_index`'s body; for a generic function, its specialization
+/// for `args` (see `bcCall`), whose parameters go to `params`, as
+/// `instantiate` would make it, with `sema.func` its instance.
+fn bcLowerBody(sema: *Sema, func_index: Index, args: []const Index, params: *std.ArrayList(Zcu.BytecodeParam)) CompileError!void {
     const ip = sema.ip;
     const gpa = sema.gpa;
     const func = ip.indexToKey(func_index).func;
@@ -13688,16 +13683,51 @@ fn bcLowerBody(sema: *Sema, func_index: Index) CompileError!void {
     const decl = sema.code.getDeclaration(nav.zir_inst);
     var block = sema.rootBlock(nav.namespace, decl.src_node, false);
     defer block.instructions.deinit(gpa);
+    // Generic parameter and return types evaluate at comptime.
+    var ct = sema.rootBlock(nav.namespace, decl.src_node, true);
+    defer ct.instructions.deinit(gpa);
+    const src = block.nodeSrc(.zero);
     const fn_info = sema.code.getFnInfo(func.zir_inst);
-    var arg_i: u32 = 0;
+    const comptime_args = try sema.arena.alloc(Index, if (fn_ty.is_generic) args.len else 0);
+    var runtime_types: std.ArrayList(Index) = .empty;
+    var zir_param_i: u32 = 0;
     for (fn_info.param_body) |inst| {
-        switch (sema.code.instructions.items(.tag)[@backingInt(inst)]) {
+        const tag = sema.code.instructions.items(.tag)[@backingInt(inst)];
+        switch (tag) {
             .param, .param_comptime, .param_anytype, .param_anytype_comptime => {},
             else => continue,
         }
-        const pt = fn_ty.param_types[arg_i];
+        defer zir_param_i += 1;
+        const k = zir_param_i;
+        const pt = if (!fn_ty.is_generic) fn_ty.param_types[k] else switch (tag) {
+            .param_anytype, .param_anytype_comptime => ip.typeOf(args[k]),
+            else => if (fn_ty.param_types[k] != .generic_poison_type) fn_ty.param_types[k] else blk: {
+                const data = sema.code.instructions.items(.data)[@backingInt(inst)];
+                const extra = sema.code.extraData(Zir.Inst.Param, data.pl_tok.payload_index);
+                const body = sema.code.bodySlice(extra.end, extra.data.type.body_len);
+                break :blk try sema.analyzeAsType(&ct, src, try sema.resolveInlineBody(&ct, body, inst));
+            },
+        };
+        try sema.bcRequire(sema.layoutResolved(pt));
+        // As `instantiate`: comptime parameters, and arguments of
+        // comptime-only types, are comptime-known in the body.
+        if (fn_ty.is_generic and ((fn_ty.comptime_bits >> @intCast(k)) & 1 != 0 or Type.isComptimeOnly(ip, pt))) {
+            const coerced = try sema.coerce(&ct, pt, .fromInterned(args[k]), src);
+            const val = coerced.toInterned() orelse return sema.bcRefuse();
+            comptime_args[k] = val;
+            try params.append(sema.arena, .{ .ty = pt, .val = val });
+            try sema.inst_map.put(gpa, inst, coerced);
+            continue;
+        }
+        // Comptime-only values do not fit the IR.
+        if (Type.isComptimeOnly(ip, pt)) return sema.bcRefuse();
+        const arg_i: u32 = @intCast(runtime_types.items.len);
+        if (fn_ty.is_generic) {
+            comptime_args[k] = .none;
+            try params.append(sema.arena, .{ .ty = pt, .val = .none });
+        }
+        try runtime_types.append(sema.arena, pt);
         var ref = try sema.addInst(&block, .{ .tag = .arg, .data = .{ .arg = .{ .ty = pt, .index = arg_i } } });
-        arg_i += 1;
         // As `analyzeFuncBody`: a parameter of a type with one possible
         // value is that value.
         if (!Type.hasRuntimeBits(ip, pt)) if (try sema.onePossibleValue(pt)) |v| {
@@ -13705,6 +13735,22 @@ fn bcLowerBody(sema: *Sema, func_index: Index) CompileError!void {
         };
         try sema.inst_map.put(gpa, inst, ref);
     }
+    const ret_ty = if (!fn_ty.is_generic) fn_ty.return_type else try sema.calleeRetTy(&ct, src, func_index);
+    // Inferred error sets need the runtime body; `noreturn` functions
+    // cannot return a value to the walker.
+    if (ret_ty == .noreturn_type) return sema.bcRefuse();
+    if (ip.indexToKey(ret_ty) == .error_union_type and
+        ip.indexToKey(ret_ty).error_union_type.error_set_type == .adhoc_inferred_error_set_type) return sema.bcRefuse();
+    try sema.bcRequire(sema.layoutResolved(ret_ty));
+    if (Type.isComptimeOnly(ip, ret_ty)) return sema.bcRefuse();
+    sema.fn_ret_ty = ret_ty;
+    sema.func = if (!fn_ty.is_generic) func_index else try sema.intern(.{ .func = .{
+        .owner_nav = func.owner_nav,
+        .ty = try sema.intern(.{ .func_type = .{ .param_types = runtime_types.items, .return_type = ret_ty, .cc = fn_ty.cc } }),
+        .zir_inst = func.zir_inst,
+        .generic_owner = func_index,
+        .comptime_args = comptime_args,
+    } });
     sema.analyzeBodyInner(&block, fn_info.body) catch |err| switch (err) {
         error.ComptimeBreak, error.ComptimeReturn => return sema.bcRefuse(),
         else => |e| return e,
@@ -13794,8 +13840,9 @@ const BcCallResult = union(enum) {
     /// The walker runs the call.
     none,
     result: Index,
-    /// The evaluator gave up on the call; the walker must run it.
-    aborted,
+    /// The evaluator gave up on the call; the walker must run it. With
+    /// the body's key in `Zcu.comptime_bodies`.
+    aborted: InternPool.Hash,
 };
 
 /// Runs comptime call `func(args)` in the evaluator if `func` is lowered,
@@ -13804,8 +13851,24 @@ fn bcCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []const Inde
     const zcu = sema.zcu;
     if (sema.bc != null or zcu.comptime_eval_threshold == 0) return .none;
     const gpa = sema.gpa;
+    const ip = sema.ip;
+    // A generic function has a body per specialization: the values of its
+    // comptime arguments and the types of the others.
+    const fn_ty = ip.indexToKey(ip.indexToKey(func).func.ty).func_type;
+    const body_key: InternPool.Hash = if (!fn_ty.is_generic) ip.stableHash(func) else blk: {
+        if (args.len > 32) return .none;
+        var hasher: InternPool.Hasher = .init("comptime specialization");
+        hasher.int(InternPool.Hash, ip.stableHash(func));
+        for (args, 0..) |a, k| {
+            const ty = ip.typeOf(a);
+            if (!sema.layoutResolved(ty)) return .none;
+            const is_comptime = (fn_ty.comptime_bits >> @intCast(k)) & 1 != 0 or Type.isComptimeOnly(ip, ty);
+            hasher.int(InternPool.Hash, ip.stableHash(if (is_comptime) a else ty));
+        }
+        break :blk hasher.final();
+    };
     const body: *const Zcu.Bytecode = blk: {
-        const gop = try zcu.comptime_bodies.getOrPut(gpa, func);
+        const gop = try zcu.comptime_bodies.getOrPut(gpa, body_key);
         if (!gop.found_existing) gop.value_ptr.* = .{ .cold = .{ .runs = 0, .next_try = zcu.comptime_eval_threshold } };
         switch (gop.value_ptr.*) {
             .off => return .none,
@@ -13818,9 +13881,9 @@ fn bcCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []const Inde
                     return .none;
                 }
                 const runs = c.runs;
-                const lowered = try bcLower(zcu, func);
+                const lowered = try bcLower(zcu, func, args);
                 // Lowering can add entries.
-                const state = zcu.comptime_bodies.getPtr(func).?;
+                const state = zcu.comptime_bodies.getPtr(body_key).?;
                 switch (lowered) {
                     .ready => |b| {
                         state.* = .{ .ready = b };
@@ -13865,7 +13928,7 @@ fn bcCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []const Inde
             sema.branch_count = saved_count;
             sema.branch_quota = saved_quota;
             zcu.errors.shrinkRetainingCapacity(n_errors);
-            return .aborted;
+            return .{ .aborted = body_key };
         },
     };
     // The outermost run's log is no longer needed.
@@ -13931,6 +13994,16 @@ fn bcRun(sema: *Sema, caller: *Block, src: Src, func: Index, body: *const Zcu.By
     defer saved.leave(sema);
     var block = sema.calleeBlock(caller, func);
     defer block.instructions.deinit(gpa);
+    // A specialization's arguments, coerced as the walker coerces them;
+    // the comptime ones are the specialization's.
+    const run_args = if (body.params.len == 0) args else blk: {
+        var list: std.ArrayList(Index) = .empty;
+        for (body.params, args) |p, a| {
+            const v = if (sema.ip.typeOf(a) == p.ty) a else (sema.coerce(&block, p.ty, .fromInterned(a), src) catch |e| return bcErr(e)).toInterned() orelse return error.BcAbort;
+            if (p.val == .none) try list.append(sema.arena, v) else if (v != p.val) return error.BcAbort;
+        }
+        break :blk list.items;
+    };
     const n = body.ir.instructions.len;
     const vals = try gpa.alloc(Index, 2 * n);
     defer gpa.free(vals);
@@ -13941,7 +14014,7 @@ fn bcRun(sema: *Sema, caller: *Block, src: Src, func: Index, body: *const Zcu.By
         .in_frame = &body.in_frame,
         .deps = body.deps,
         .declared = declared,
-        .args = args,
+        .args = run_args,
         .block = &block,
         .src = src,
     };

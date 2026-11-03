@@ -188,7 +188,7 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   fully known, falling back to ZIR walking for type-constructing code (see
   "Comptime evaluator" below).
 
-### Comptime evaluator (designed and prototyped 2026-11-03, for review)
+### Comptime evaluator (designed 2026-11-03, accepted; being built)
 
 The evaluator runs a function called at comptime from its lowered typed IR
 instead of walking its ZIR on every call. It changes speed only: every
@@ -197,19 +197,25 @@ anything the evaluator does not reproduce exactly sends the call back to
 the walker.
 
 **What is compiled, and when.** Function bodies, one per function (not per
-call site), on the comptime call path only. `Sema.callComptime` checks the
+call site), and one per specialization of a generic function: the values
+of its comptime arguments (and of arguments of comptime-only types) and
+the types of the others, the parts of a call `instantiate` would key an
+instance by. A specialization's body is that instance's, with the
+parameter types `Bytecode.params` records; a run coerces the arguments to
+them as the walker does. Bodies are lowered on the comptime call path only. `Sema.callComptime` checks the
 memo first, then asks the evaluator (`bcCall`), then walks
 (`walkComptimeCall`). Each function has a state in `Zcu.comptime_bodies`:
-`cold` (counting walker runs), `ready` (a lowered `Zcu.Bytecode`), or `off`.
+`cold` (counting walker runs), `ready` (a lowered `Zcu.Bytecode`), or `off`,
+keyed by the function's stable hash or the specialization's.
 A function is lowered after `Zcu.comptime_eval_threshold` walker runs (4;
 `ZAP_COMPTIME_EVAL=n` sets it, 0 turns the evaluator off), so code that
 runs once at comptime (most of it) never pays for lowering. `comptime`
 blocks and declaration initializers run once each and stay with the
 walker; a `comptime` block inside a lowered function is evaluated by the
 lowering, as runtime analysis does, and its branches replay as ticks
-(below). Not lowered, for now: generic functions and instances (one body
-per comptime-argument tuple; next step), inferred error sets, `noreturn`,
-naked, and comptime-only signatures, and bodies whose lowering creates a
+(below). Not lowered, for now: instances called by value, inferred error
+sets, `noreturn`, naked, and comptime-only parameters (other than a
+specialization's comptime ones) and results, and bodies whose lowering creates a
 container type, instantiates a generic, embeds a file, exports, takes a
 function's address, or makes a non-memoizable comptime call.
 
@@ -226,7 +232,11 @@ section requires (no second semantic lowering): `bcLower` runs
   `comptime_quota`; both exist only in evaluator bodies;
 - keeps packed struct accesses as `struct_field_ptr`/`struct_field_val`
   rather than bit arithmetic, which comptime memory addresses directly;
-- does not queue runtime analysis of callees.
+- does not queue runtime analysis of callees;
+- refuses a runtime block that merges results of different types: the
+  walker keeps the type of the branch it takes, where runtime analysis
+  would resolve the peer type (`if (c) @as(u8, 1) else @as(u16, 2)` is a
+  `u8` or a `u16` at comptime, never a `u16` for both).
 
 **The laziness rule.** Lowering analyzes every branch of the body; the
 walker analyzes only the branches it takes. Analysis has effects beyond
@@ -257,10 +267,15 @@ pass between the two without conversion; a frame value may also be
 "garbage" (the payload of a null optional or the inactive error-union
 side), which runtime IR computes and masks (`opt == x` is
 `is_non_null(opt) and payload == x`) and which aborts the run if used
-otherwise. A denser encoding (unboxed integers in the frame instead of
-interned ones, a flat instruction stream with jump offsets) can replace
-this without touching Sema: the profile of the prototype shows interning
-integers and decoding keys as the evaluator's main cost.
+otherwise. Unboxed integers in the frame (instead of interned ones) and a
+denser encoding (a flat instruction stream with jump offsets and decoded
+operands) can replace this without touching Sema. They pay off in that
+order: in the prototype's profile, interning integers and decoding keys
+are most of the evaluator's time and the interpreter's own dispatch
+(`bcExec` itself) about a sixth of it, so the encoding is worth changing
+only once unboxing has removed the interning and dispatch is the largest
+remaining share, and only if it is a large share of Sema (the evaluator
+is about 5% of libvaxis's Sema instructions today).
 
 **Comptime memory.** Loads and stores go through Sema's comptime memory
 functions (`comptimeStore`, `comptimeLoadOrNull`, the `MutValue` trees),

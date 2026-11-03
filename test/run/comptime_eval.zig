@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "476\n6\n6765\n55\n258\n55\n18\n1228\n"
+//! stdout: "476\n6\n6765\n55\n258\n55\n18\n28739\n1228\n"
 // Comptime calls repeated often enough for zap's comptime evaluator to run
 // them from lowered IR instead of the ZIR walker; the results must be the
 // walker's (and upstream's).
@@ -97,6 +97,49 @@ const bumped = blk: {
     break :blk count;
 };
 
+fn sumOf(comptime T: type, xs: []const T) T {
+    var s: T = 0;
+    for (xs) |x| s +%= x;
+    return s;
+}
+
+fn eqlOf(comptime T: type, a: []const T, b: []const T) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x != y) return false;
+    return true;
+}
+
+fn addOf(comptime T: type, a: T, b: T) T {
+    return a +% b;
+}
+
+fn twice(x: anytype) @TypeOf(x) {
+    return x *% 2;
+}
+
+fn bitsOf(T: type, n: u16) u16 {
+    return @bitSizeOf(T) * n;
+}
+
+/// Generic functions run per specialization: the comptime arguments'
+/// values and the other arguments' types.
+const generic = blk: {
+    @setEvalBranchQuota(10000);
+    var t: u64 = 0;
+    const words = [_][]const u8{ "alpha", "beta", "gamma", "beta", "delta", "epsilon", "zeta", "eta", "theta", "beta", "iota", "kappa" };
+    for (words, 0..) |w, i| {
+        t += sumOf(u8, w);
+        if (eqlOf(u8, w, "beta")) t += 1000;
+        t += addOf(u16, 7, @intCast(w.len * i));
+        t += addOf(u8, 250, @intCast(i));
+        t += twice(@as(u32, @intCast(w.len + i)));
+        t += twice(@as(u8, 120 + @as(u8, @intCast(i))));
+        t += bitsOf(u32, @intCast(i)) + bitsOf([3]u8, 1);
+    }
+    for (0..6) |k| t += sumOf(u16, &.{ @intCast(k), 1000, 2000 });
+    break :blk t;
+};
+
 /// The walker types an `if` by the branch it takes; runtime analysis
 /// would give it the peer type of both.
 fn branchSize(c: bool, k: u32) u32 {
@@ -124,6 +167,7 @@ fn main() callconv(.c) noreturn {
     rt.printInt(comptime sumQuotients(8));
     rt.printInt(counted.sum);
     rt.printInt(bumped);
+    rt.printInt(generic);
     rt.printInt(peer);
     rt.exit(0);
 }
