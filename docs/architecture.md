@@ -3476,14 +3476,20 @@ analysis:
    fails depending on which calls another worker memoized first. A unit
    that succeeds under a lower quota gives the same result under a
    higher one, so failures are the problem: every "evaluation exceeded"
-   failure in a parallel build triggers a serial rerun. That leaves one
-   gap, the reverse case: a unit that stays under its quota only because
-   of a memo hit, which a one-thread build would not have had, so the
-   parallel build succeeds where one thread fails. To close it, a memo
-   entry records the branches its computation counted, and a hit charges
-   them. Upstream charges nothing for a hit, so zap would then reject a
-   program that stays under its quota only through memo hits. (Open
-   question 6: charge, or accept the gap.)
+   failure in a parallel build triggers a serial rerun. The reverse case
+   remains: a unit that stays under its quota only because of a memo hit
+   that a one-thread build would not have had, so a parallel build would
+   succeed where one thread fails. So a memo entry records the branches
+   its computation counted, and in a parallel build each hit adds them
+   to a shadow counter beside the real one. The real counter and quota
+   work as today, so a hit still charges nothing, as upstream. If real
+   plus shadow branches would pass the quota, the build reruns serially,
+   and the serial result is the answer. If a parallel build stays under
+   real plus shadow, a one-thread build stays under too: each of its
+   extra misses executes and counts what the hit recorded. So parallel
+   and serial builds agree, and zap never rejects what one thread would
+   accept. One thread needs no shadow counter (decided by the lead,
+   2026-11-03).
 8. *Exports, tests and compiler_rt requests.* They become locked
    appends, sorted at the end: exports by declaration key, tests by file
    and source position (`populateTestFunctions` already does this), and
@@ -3677,11 +3683,8 @@ Answered in review (2026-11-03):
    results, so every hit on the logical stack reruns serially. The
    "resolved yet?" reads are classified above.
 
-Still open:
-
-6. Branch quotas: charge a memo hit the branches its computation
-   counted, which makes quota outcomes independent of memo timing but
-   rejects programs upstream accepts at the edge, or accept that gap.
+6. Branch quotas and memo hits: a shadow counter of the hits' recorded
+   branches, with a serial rerun when it would pass the quota (rule 7).
 
 **The completion hook, and recording as units complete.** When a unit's
 result is final (a declaration resolved, a layout resolved, a `comptime`
