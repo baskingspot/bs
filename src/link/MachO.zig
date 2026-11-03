@@ -195,7 +195,7 @@ const Place = packed struct(u64) {
 
     const duplicate: Place = @bitCast(@as(u64, std.math.maxInt(u64)));
 
-    fn isDuplicate(p: Place) bool {
+    pub fn isDuplicate(p: Place) bool {
         return @as(u64, @bitCast(p)) == std.math.maxInt(u64);
     }
 };
@@ -700,7 +700,7 @@ fn LinkOf(comptime Input: type) type {
             return failure.err;
         }
 
-        fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
+        pub fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
             if (l.failures[task] == null) l.failures[task] = .{ .atom = atom, .err = err, .diag = diag };
         }
 

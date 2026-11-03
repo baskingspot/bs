@@ -402,7 +402,7 @@ const Place = packed struct(u64) {
 
     const duplicate: Place = @bitCast(@as(u64, std.math.maxInt(u64)));
 
-    fn isDuplicate(p: Place) bool {
+    pub fn isDuplicate(p: Place) bool {
         return @as(u64, @bitCast(p)) == std.math.maxInt(u64);
     }
 };
@@ -472,7 +472,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer gpa.free(chunks);
     const n_debug = input.debugLen();
     const n_debug_chunks = std.math.divCeil(usize, n_debug, chunk_len) catch unreachable;
-    const debug_chunks = try gpa.alloc(DebugChunk, n_debug_chunks);
+    const debug_chunks = try gpa.alloc(Dwarf.Chunk, n_debug_chunks);
     defer gpa.free(debug_chunks);
     for (debug_chunks) |*c| c.files = .empty;
     defer for (debug_chunks) |*c| c.files.deinit(gpa);
@@ -606,35 +606,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     // Place the debug chunks, and build the file table from their files in
     // first-use order.
-    var info_len: u64 = 0;
-    var line_len: u64 = 0;
-    var n_chunk_files: usize = 0;
-    var n_fdes: u32 = 0;
-    for (debug_chunks) |*c| {
-        c.info_off = info_len;
-        c.line_off = line_len;
-        c.fde_base = n_fdes;
-        info_len += c.info_len;
-        line_len += c.line_len;
-        n_fdes += c.n_fdes;
-        n_chunk_files += c.files.count();
-    }
-    var files: std.StringArrayHashMapUnmanaged(void) = .empty;
-    defer files.deinit(gpa);
-    const file_map = try gpa.alloc(u32, n_chunk_files);
-    defer gpa.free(file_map);
-    {
-        var at: usize = 0;
-        for (debug_chunks) |*c| {
-            c.file_map = file_map[at..][0..c.files.count()];
-            at += c.files.count();
-            for (c.files.keys(), c.file_map) |f, *global| {
-                global.* = @intCast((try files.getOrPut(gpa, f)).index);
-            }
-        }
-    }
-    // The set_file operand is a fixed-width ULEB128.
-    if (files.count() >= 1 << 21) return error.OutOfMemory;
+    var placed = try Dwarf.placeChunks(gpa, debug_chunks);
+    defer placed.deinit(gpa);
+    const files = placed.files;
+    const info_len = placed.info_len;
+    const line_len = placed.line_len;
     var dwarf: Dwarf = if (files.count() > 0) try .init(gpa, files.keys(), options.comp_dir) else .{};
     defer dwarf.deinit(gpa);
 
@@ -668,7 +644,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
                 l.scratch_len = @max(l.scratch_len, len);
             }
             for (debug_chunks) |*c| {
-                const fde_len = @as(u64, c.n_fdes) * (Dwarf.fde_size + Dwarf.eh_frame_hdr_entry_size);
+                const fde_len = @as(u64, c.n_frames) * (Dwarf.fde_size + Dwarf.eh_frame_hdr_entry_size);
                 l.scratch_len = @max(l.scratch_len, c.info_len + c.line_len + fde_len);
             }
             l.scratch = try gpa.alloc(u8, n_threads * l.scratch_len);
@@ -689,14 +665,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.fill(strtab_off, 1);
     try l.put(shstrtab_off, shstr);
     try l.fill(shstrtab_off + shstr.len, shoff - (shstrtab_off + shstr.len));
-    const eh_size = Dwarf.cie.len + @as(u64, n_fdes) * Dwarf.fde_size + 4;
-    const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, n_fdes) * Dwarf.eh_frame_hdr_entry_size;
+    const eh_size = Dwarf.cie.len + @as(u64, placed.n_frames) * Dwarf.fde_size + 4;
+    const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, placed.n_frames) * Dwarf.eh_frame_hdr_entry_size;
     if (has_cfi) {
         // The FDEs and the search table are written with the debug chunks.
         try l.put(eh_off, &Dwarf.cie);
         try l.fill(eh_off + eh_size - 4, hdr_off - (eh_off + eh_size - 4)); // terminator, unused room
         const eh_frame_rel: i32 = @intCast(@as(i64, @intCast(eh_off)) - @as(i64, @intCast(hdr_off + 4)));
-        try l.put(hdr_off, &Dwarf.ehFrameHdr(eh_frame_rel, n_fdes));
+        try l.put(hdr_off, &Dwarf.ehFrameHdr(eh_frame_rel, placed.n_frames));
         try l.fill(hdr_off + hdr_size, r_end - (hdr_off + hdr_size));
     }
     if (has_debug) {
@@ -854,26 +830,6 @@ const Chunk = struct {
     str: u32,
 };
 
-/// One `chunk_len` run of consecutive debug entries.
-const DebugChunk = struct {
-    // Filled in by `Link.layOutDebug`.
-    /// Bytes of the chunk's subprogram entries and line sequences.
-    info_len: u64,
-    line_len: u64,
-    n_fdes: u32,
-    /// Source files of the chunk's entries, in first-use order;
-    /// `Link.file_of` indexes it.
-    files: std.StringArrayHashMapUnmanaged(void),
-    // Filled in serially after `Link.layOutDebug`.
-    /// Where the chunk's entries and sequences start, after the headers.
-    info_off: u64,
-    line_off: u64,
-    /// The chunk's first FDE, counting from the first after the CIE.
-    fde_base: u32,
-    /// Index in the output's file table of each of `files`.
-    file_map: []u32,
-};
-
 const Failure = struct { atom: usize, err: Error, diag: Diagnostic };
 
 /// State shared by the threads of `build`, reading atoms from an `Input`
@@ -886,7 +842,7 @@ fn LinkOf(comptime Input: type) type {
         input: Input,
         n_atoms: usize,
         n_debug: usize,
-        debug_chunks: []DebugChunk,
+        debug_chunks: []Dwarf.Chunk,
         /// Index into its chunk's `files` of each debug entry, or `skip`.
         file_of: []u32,
         n_partitions: usize,
@@ -946,7 +902,7 @@ fn LinkOf(comptime Input: type) type {
             return failure.err;
         }
 
-        fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
+        pub fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
             if (l.failures[task] == null) l.failures[task] = .{ .atom = atom, .err = err, .diag = diag };
         }
 
@@ -1130,79 +1086,14 @@ fn LinkOf(comptime Input: type) type {
             }
         }
 
-        const skip = std.math.maxInt(u32);
-
         fn resolveAddrsAndLayOutDebug(l: *Link, task: usize, thread: usize) void {
             if (task < l.n_resolve_tasks) l.resolveAddrs(task, thread) else l.layOutDebug(task - l.n_resolve_tasks);
         }
 
-        /// Sizes one chunk's debug entries and collects their files. Entries
-        /// for atoms that were deduplicated away are skipped.
+        /// Sizes one chunk's debug entries and collects their files.
         fn layOutDebug(l: *Link, chunk: usize) void {
-            const begin = chunk * chunk_len;
-            const end = @min(l.n_debug, begin + chunk_len);
-            const c = &l.debug_chunks[chunk];
-            c.info_len = 0;
-            c.line_len = 0;
-            c.n_fdes = 0;
-            // Functions from one file usually share its path's bytes, so a
-            // table by address saves hashing the path for most entries.
-            var by_addr: FilesByAddr = .{};
-            const task = l.chunks.len + chunk;
-            for (l.file_of[begin..end], begin..) |*file_of, j| {
-                file_of.* = skip;
-                // Checked before `debug(j)` reads anything of the atom's.
-                const atom = l.input.debugAtom(j);
-                if (atom >= l.n_atoms or (j > 0 and l.input.debugAtom(j - 1) >= atom)) {
-                    return l.fail(task, @min(atom, l.n_atoms), error.InvalidDebugInfo, .{});
-                }
-                const place = l.places[atom];
-                if (place.isDuplicate()) continue;
-                if (place.section != @backingInt(Atom.Section.text)) {
-                    return l.fail(task, atom, error.InvalidDebugInfo, .{ .atom = l.input.atom(atom).name });
-                }
-                const debug = l.input.debug(j);
-                const d = ref(&debug);
-                file_of.* = by_addr.get(d.file) orelse index: {
-                    const gop = c.files.getOrPut(l.gpa, d.file) catch return l.fail(task, atom, error.OutOfMemory, .{});
-                    by_addr.put(d.file, @intCast(gop.index));
-                    break :index @intCast(gop.index);
-                };
-                c.info_len += Dwarf.subprogramSize(d);
-                c.line_len += Dwarf.sequenceSize(d);
-                c.n_fdes += @intFromBool(d.frame != .none);
-            }
+            Dwarf.layOutChunk(l, chunk, l.chunks.len + chunk, @backingInt(Atom.Section.text));
         }
-
-        /// Open addressing from a path's address and length to its index in a
-        /// chunk's `files`. Holds up to 3/4 of its slots; paths past that are
-        /// looked up by contents every time.
-        const FilesByAddr = struct {
-            slots: [1024]Slot = @splat(.{ .ptr = 0, .len = 0, .index = 0 }),
-            count: usize = 0,
-
-            const Slot = struct { ptr: usize, len: usize, index: u32 };
-
-            fn home(file: []const u8) usize {
-                return @intCast((@intFromPtr(file.ptr) *% 0x9e3779b97f4a7c15) >> 54);
-            }
-
-            fn get(t: *const FilesByAddr, file: []const u8) ?u32 {
-                var i = home(file);
-                while (t.slots[i].ptr != 0) : (i = (i + 1) % t.slots.len) {
-                    if (t.slots[i].ptr == @intFromPtr(file.ptr) and t.slots[i].len == file.len) return t.slots[i].index;
-                }
-                return null;
-            }
-
-            fn put(t: *FilesByAddr, file: []const u8, index: u32) void {
-                if (t.count >= t.slots.len / 4 * 3) return;
-                var i = home(file);
-                while (t.slots[i].ptr != 0) i = (i + 1) % t.slots.len;
-                t.slots[i] = .{ .ptr = @intFromPtr(file.ptr), .len = file.len, .index = index };
-                t.count += 1;
-            }
-        };
 
         fn copyAll(l: *Link, task: usize, thread: usize) void {
             if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len, thread);
@@ -1218,16 +1109,16 @@ fn LinkOf(comptime Input: type) type {
             const offsets = [4]u64{
                 l.info_off + c.info_off,
                 l.line_off + c.line_off,
-                l.eh_off + Dwarf.cie.len + @as(u64, c.fde_base) * Dwarf.fde_size,
-                l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, c.fde_base) * Dwarf.eh_frame_hdr_entry_size,
+                l.eh_off + Dwarf.cie.len + @as(u64, c.frame_base) * Dwarf.fde_size,
+                l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, c.frame_base) * Dwarf.eh_frame_hdr_entry_size,
             };
-            const out = l.parts(thread, 4, offsets, .{ c.info_len, c.line_len, @as(u64, c.n_fdes) * Dwarf.fde_size, @as(u64, c.n_fdes) * Dwarf.eh_frame_hdr_entry_size });
+            const out = l.parts(thread, 4, offsets, .{ c.info_len, c.line_len, @as(u64, c.n_frames) * Dwarf.fde_size, @as(u64, c.n_frames) * Dwarf.eh_frame_hdr_entry_size });
             defer l.writeParts(l.chunks.len + chunk, begin, 4, offsets, out);
             // A local copy: writes to `out` could alias `l`.
             const input = l.input;
             var info_off: usize = 0;
             var line_off: usize = 0;
-            var fde = c.fde_base;
+            var fde = c.frame_base;
             const hdr_addr: i64 = @intCast(l.base + l.hdr_off);
             for (l.file_of[begin..end], begin..) |file_of, j| {
                 // The entries stream; their fragments, names, and atoms do not.
@@ -1235,7 +1126,7 @@ fn LinkOf(comptime Input: type) type {
                     input.prefetchDebug(j + 12);
                     @prefetch(&l.places[input.debugAtom(j + 12)], .{});
                 }
-                if (file_of == skip) continue;
+                if (file_of == Dwarf.skip) continue;
                 const debug = input.debug(j);
                 const d = ref(&debug);
                 const atom = input.debugAtom(j);
@@ -1248,7 +1139,7 @@ fn LinkOf(comptime Input: type) type {
                     const fde_off: u32 = @intCast(Dwarf.cie.len + @as(u64, fde) * Dwarf.fde_size);
                     const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
                     const fn_addr: i64 = @intCast(addr);
-                    const k = fde - c.fde_base;
+                    const k = fde - c.frame_base;
                     Dwarf.writeFde(out[2][@as(usize, k) * Dwarf.fde_size ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
                     const entry = out[3][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
                     std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
