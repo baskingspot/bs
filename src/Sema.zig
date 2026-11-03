@@ -5881,16 +5881,25 @@ const AnonTypeNumber = struct {
 /// that made it, nor of how many types its unit made before. It must
 /// still tell distinct types apart, since their declarations' keys
 /// extend it.
+///
+/// So the declaration's key enters without the captures of the generic
+/// instances on its path: a type that captures none of an instance's
+/// arguments is one type for all instances (`fn F(comptime T: type) type
+/// { return struct {}; }`), and its key must not name whichever instance
+/// made it first. That would depend on analysis order, which differs
+/// between a full build and a replay that loads some instances green.
 fn anonTypeKey(sema: *Sema, block: *Block, inst: Zir.Inst.Index, captures: []const Index) Allocator.Error![]const u8 {
     const ip = sema.ip;
-    var aw: std.Io.Writer.Allocating = .init(sema.arena);
-    const w = &aw.writer;
+    var base_key: std.Io.Writer.Allocating = .init(sema.arena);
     const nav, const base = sema.anonTypeBase(block);
     // A `comptime` block, or a container's field types and defaults, if
     // not a declaration.
     if (nav != .none) {
-        w.writeAll(ip.stringSlice(ip.getNav(nav).key)) catch return error.OutOfMemory;
-    } else sema.zcu.unitKey(sema.owner, w) catch return error.OutOfMemory;
+        base_key.writer.writeAll(ip.stringSlice(ip.getNav(nav).key)) catch return error.OutOfMemory;
+    } else sema.zcu.unitKey(sema.owner, &base_key.writer) catch return error.OutOfMemory;
+    var aw: std.Io.Writer.Allocating = .init(sema.arena);
+    const w = &aw.writer;
+    writeWithoutCaptures(w, base_key.written()) catch return error.OutOfMemory;
     w.print("#{d}(", .{@as(i64, @backingInt(inst)) - @backingInt(base)}) catch return error.OutOfMemory;
     for (captures, 0..) |c, i| {
         if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
@@ -5898,6 +5907,27 @@ fn anonTypeKey(sema: *Sema, block: *Block, inst: Zir.Inst.Index, captures: []con
     }
     w.writeAll(")") catch return error.OutOfMemory;
     return aw.written();
+}
+
+/// Writes `key` with the capture lists this function writes, `#<n>(<hex>,
+/// ...)`, emptied.
+fn writeWithoutCaptures(w: *std.Io.Writer, key: []const u8) std.Io.Writer.Error!void {
+    var i: usize = 0;
+    while (i < key.len) {
+        try w.writeByte(key[i]);
+        i += 1;
+        if (key[i - 1] != '#') continue;
+        var j = i;
+        if (j < key.len and key[j] == '-') j += 1;
+        const digits = j;
+        while (j < key.len and std.ascii.isDigit(key[j])) j += 1;
+        if (j == digits or j == key.len or key[j] != '(') continue;
+        var end = j + 1;
+        while (end < key.len and (std.ascii.isHex(key[end]) or key[end] == ',')) end += 1;
+        if (end == key.len or key[end] != ')') continue;
+        try w.writeAll(key[i .. j + 1]);
+        i = end;
+    }
 }
 
 /// The declaration whose code holds the instructions `block` analyzes, if

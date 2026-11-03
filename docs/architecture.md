@@ -107,8 +107,12 @@ the same instruction with equal captures is the same type (two comptime calls
 one type, as behavior/struct.zig checks), and two identical `struct {}` texts
 are distinct instructions. So the key does not include a comptime call's
 arguments or an ordinal among the types a unit creates: either would give one
-type two keys, or two types one. (It must still tell distinct types apart:
-their declarations' keys extend it.) The *display name* is separate from the
+type two keys, or two types one. Nor the captures of the generic instances on
+the declaration's key: `MultiArrayList(T).sizes` holds one struct for every
+`T`, since it captures no `T`, and keyed under the instance that made it first
+it was named by analysis order, which a replay that loads some instances
+green does not repeat (`anonTypeKey` empties those capture lists). (It must
+still tell distinct types apart: their declarations' keys extend it.) The *display name* is separate from the
 key and follows upstream's form (`Parent__struct_<n>`), because `@typeName`
 results are observable and `test/behavior` checks them. Upstream's `n` counts
 anonymous types in analysis order; zap's is the type's instruction (an
