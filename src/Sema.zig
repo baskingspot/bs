@@ -8691,7 +8691,7 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                         .alignment = p.flags.alignment,
                     } }));
                 },
-                .tuple => if (std.mem.eql(u8, name, "len")) return .fromInterned(try sema.intValue(.comptime_int_type, ip.indexToKey(p.child).tuple_type.types.len)) else return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
+                .tuple => if (std.mem.eql(u8, name, "len")) return .fromInterned(try sema.intValue(.usize_type, ip.indexToKey(p.child).tuple_type.types.len)) else return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
                 .@"struct", .@"union" => return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
                 .pointer => {
                     // `ptr.len` of a pointer to an array needs only its type.
@@ -8707,7 +8707,7 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
         },
         .@"struct", .tuple => {
             if (ip.indexToKey(ty) == .tuple_type and ip.indexToKey(ty).tuple_type.names.len == 0 and std.mem.eql(u8, name, "len"))
-                return .fromInterned(try sema.intValue(.comptime_int_type, ip.indexToKey(ty).tuple_type.types.len));
+                return .fromInterned(try sema.intValue(.usize_type, ip.indexToKey(ty).tuple_type.types.len));
             const i = try sema.structFieldIndex(block, src, ty, name);
             if (ip.indexToKey(ty) == .tuple_type) return sema.tupleField(block, lhs, i);
             try sema.resolveLayout(block, src, ty);
