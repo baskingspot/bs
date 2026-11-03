@@ -2814,9 +2814,46 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const trace_ptr = try sema.ptrType(.{ .child = try sema.stdLangType(block, src, "StackTrace") });
             break :blk .fromInterned(try sema.intern(.{ .opt = .{ .ty = try sema.optType(trace_ptr), .val = .none } }));
         },
-        .builtin_src => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
+        .builtin_src => sema.zirBuiltinSrc(block, ext),
         else => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
     };
+}
+
+/// `@src()`: a `std.builtin.SourceLocation` of the enclosing function, as
+/// upstream: its simple name, its file's path in its module, and the
+/// 1-based line and column.
+fn zirBuiltinSrc(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) CompileError!Ref {
+    const ip = sema.ip;
+    const extra = sema.code.extraData(Zir.Inst.Src, ext.operand).data;
+    const src = block.nodeSrc(extra.node);
+    const func = if (block.inlining) |inlining| inlining.func else sema.func;
+    if (func == .none) return sema.fail(block, src, "@src outside function", .{});
+    const fn_name = ip.stringSlice(ip.getNav(ip.indexToKey(func).func.owner_nav).name);
+    const file = sema.zcu.file(sema.file);
+    // Upstream's module names: `test` for the module under test, the root
+    // file's stem for a build-exe root.
+    const fe = sema.zcu.fe;
+    const module = fe.module(file.module);
+    const module_name = if (fe.main_module != .root and file.module == fe.main_module)
+        "test"
+    else if (file.module == .root and fe.main_module == .root)
+        std.fs.path.stem(module.root_file)
+    else
+        module.name;
+    const strings = [_][]const u8{ module_name, file.sub_path, fn_name };
+    var vals: [3]Index = undefined;
+    for (strings, &vals) |bytes, *v| {
+        const lit: Ref = .fromInterned(try sema.stringLiteral(bytes));
+        v.* = sema.resolveValue(try sema.coerce(block, .slice_const_u8_sentinel_0_type, lit, src)).?;
+    }
+    const ty = try sema.stdLangType(block, src, "SourceLocation");
+    return .fromInterned(try sema.structValue(block, src, ty, &.{
+        .{ "module", vals[0] },
+        .{ "file", vals[1] },
+        .{ "fn_name", vals[2] },
+        .{ "line", try sema.intValue(.u32_type, extra.line + 1) },
+        .{ "column", try sema.intValue(.u32_type, extra.column + 1) },
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -3711,8 +3748,30 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
         },
         .anon, .dbg_var => {},
     }
-    const parent = sema.zcu.namespacePtr(block.namespace).fqn;
-    const display = try std.fmt.allocPrint(sema.arena, "{s}__{t}_{d}", .{ parent, kind, @backingInt(inst) });
+    // Upstream's `type_fqn_ctx`: the function being analyzed or called
+    // inline, else the declaration, else `<namespace>.comptime`.
+    const parent = if (block.inlining) |inlining|
+        ip.stringSlice(ip.getNav(ip.indexToKey(inlining.func).func.owner_nav).fqn)
+    else if (sema.func != .none)
+        ip.stringSlice(ip.getNav(ip.indexToKey(sema.func).func.owner_nav).fqn)
+    else if (sema.owner_nav != .none)
+        ip.stringSlice(ip.getNav(sema.owner_nav).fqn)
+    else
+        try std.fmt.allocPrint(sema.arena, "{s}.comptime", .{sema.zcu.namespacePtr(block.namespace).fqn});
+    // `const T = struct {...};` in a function body: named after the local.
+    const var_name: ?[]const u8 = if (strategy == .dbg_var) blk: {
+        const tags = sema.code.instructions.items(.tag);
+        const datas = sema.code.instructions.items(.data);
+        for (@backingInt(inst)..tags.len) |k| switch (tags[k]) {
+            .dbg_var_ptr, .dbg_var_val => if (datas[k].str_op.operand == inst.toRef()) break :blk datas[k].str_op.getStr(sema.code.*),
+            else => {},
+        };
+        break :blk null;
+    } else null;
+    const display = if (var_name) |n|
+        try std.fmt.allocPrint(sema.arena, "{s}.{s}", .{ parent, n })
+    else
+        try std.fmt.allocPrint(sema.arena, "{s}__{t}_{d}", .{ parent, kind, @backingInt(inst) });
     // Keyed by the creating unit (or comptime call) and an ordinal.
     const prefix, const counter = if (block.inlining) |inlining|
         .{ try sema.inliningKey(inlining), &inlining.anon_types }
@@ -9793,10 +9852,18 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
 
     var cc: InternPool.CallingConvention = if (sema.owner_nav != .none and ip.getNav(sema.owner_nav).linkage == .@"export") .c else .auto;
     var body_len: u32 = 0;
+    var is_var_args = false;
+    var noalias_bits: u32 = 0;
     if (tag == .func_fancy) {
         const extra = sema.code.extraData(Zir.Inst.FuncFancy, data.payload_index);
         body_len = extra.data.body_len;
-        if (extra.data.bits.is_var_args) return sema.failUnsupported(block, src, "variadic functions");
+        is_var_args = extra.data.bits.is_var_args;
+        if (extra.data.bits.has_any_noalias) {
+            var k = extra.end;
+            if (extra.data.bits.has_cc_body) k += 1 + sema.code.extra[k] else if (extra.data.bits.has_cc_ref) k += 1;
+            if (extra.data.bits.has_ret_ty_body) k += 1 + sema.code.extra[k] else if (extra.data.bits.has_ret_ty_ref) k += 1;
+            noalias_bits = sema.code.extra[k];
+        }
         var cc_ref: Ref = .none;
         if (extra.data.bits.has_cc_body) {
             const len = sema.code.extra[extra.end];
@@ -9825,6 +9892,10 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     if (fn_info.inferred_error_set and ret_ty != .generic_poison_type) {
         ret_ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = .adhoc_inferred_error_set_type, .payload_type = ret_ty } });
     }
+    if (is_var_args) {
+        if (cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
+        if (body_len != 0) return sema.failUnsupported(block, src, "variadic function definitions");
+    }
 
     var is_generic = ret_ty == .generic_poison_type;
     var comptime_bits: u32 = 0;
@@ -9844,7 +9915,9 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         .param_types = param_types,
         .return_type = ret_ty,
         .cc = cc,
+        .is_var_args = is_var_args,
         .comptime_bits = comptime_bits,
+        .noalias_bits = noalias_bits,
         .is_generic = is_generic,
     } });
     if (body_len == 0) return .fromInterned(fn_ty);
@@ -9986,6 +10059,7 @@ fn analyzeCall(
     };
     const fn_ty = ip.indexToKey(fn_ty_index).func_type;
     const total_args = call_args_in.len() + @intFromBool(first_arg != .none);
+    if (fn_ty.is_var_args) return sema.failUnsupported(block, src, "calling variadic functions");
     if (total_args != fn_ty.param_types.len) {
         return sema.fail(block, src, "expected {d} argument(s), found {d}", .{ fn_ty.param_types.len, total_args });
     }

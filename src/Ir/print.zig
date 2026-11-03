@@ -327,8 +327,10 @@ pub fn printType(ip: *const InternPool, ty: InternPool.Index, w: *Writer) Writer
             for (f.param_types, 0..) |pt, i| {
                 if (i != 0) try w.writeAll(", ");
                 if ((f.comptime_bits >> @intCast(i)) & 1 != 0) try w.writeAll("comptime ");
+                if (i < 32 and (f.noalias_bits >> @intCast(i)) & 1 != 0) try w.writeAll("noalias ");
                 try printType(ip, pt, w);
             }
+            if (f.is_var_args) try w.writeAll(if (f.param_types.len == 0) "..." else ", ...");
             try w.writeAll(") ");
             if (f.cc != .auto) try w.print("callconv(.{s}) ", .{@tagName(f.cc)});
             try printType(ip, f.return_type, w);
