@@ -7176,7 +7176,14 @@ fn ptrRootOffset(sema: *Sema, ptr: InternPool.Ptr) ?u64 {
         },
         .elem => |e| {
             const parent = ip.indexToKey(e.base).ptr;
-            const elem_ty = Type.ptrInfo(ip, ptr.ty).child;
+            // The element type is the base's: a pointer cast keeps the base
+            // (`@as(*u32, @ptrCast(&bytes[4]))` is 4 bytes in, not 16).
+            const base_ty = Type.ptrInfo(ip, parent.ty);
+            const elem_ty = switch (ip.indexToKey(base_ty.child)) {
+                .array_type => |a| if (base_ty.flags.size == .one) a.child else base_ty.child,
+                .vector_type => |v| if (base_ty.flags.size == .one) v.child else base_ty.child,
+                else => base_ty.child,
+            };
             const size = if (e.index == 0) 0 else if (known(ip, elem_ty)) Type.abiSize(ip, elem_ty) else return null;
             return (sema.ptrRootOffset(parent) orelse return null) + e.index * size + ptr.byte_offset;
         },
