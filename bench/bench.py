@@ -48,7 +48,7 @@ CORE_SCENARIOS = ["cold", "cold-local", "warm", "edit-root", "edit-lib"]
 
 MODES = {
     "build-exe": "plain `zig build-exe` command with -M/--dep module flags",
-    "zig-build": "`zig build` of the same executable (reference; needs upstream zig's build system)",
+    "zig-build": "`zig build` (`zap build`) of the same executable through upstream's build runner",
 }
 
 # Appended to the anchor line for each edit. It keeps the line count, so only
@@ -662,7 +662,7 @@ def main():
                     help="upstream zig 0.17.0 used to prepare workloads (fetch, generate); never timed")
     ap.add_argument("--workloads", default=",".join(WORKLOADS), help="comma-separated: " + ",".join(WORKLOADS))
     ap.add_argument("--modes", default=None,
-                    help="comma-separated: build-exe,zig-build (default: both for zig, build-exe otherwise)")
+                    help="comma-separated: build-exe,zig-build (default: both)")
     ap.add_argument("--scenarios", default=None,
                     help="comma-separated, or 'core' (default: all for zig, core otherwise): " + ",".join(SCENARIOS))
     ap.add_argument("--runs", type=int, default=10, help="runs per warm/edit scenario (default 10)")
@@ -676,11 +676,11 @@ def main():
 
     work = os.path.abspath(args.work_dir)
     os.makedirs(work, exist_ok=True)
-    compiler = shutil.which(args.compiler) or os.path.abspath(args.compiler)
-    setup_zig = shutil.which(args.setup_zig) or os.path.abspath(args.setup_zig)
+    compiler = os.path.abspath(shutil.which(args.compiler) or args.compiler)
+    setup_zig = os.path.abspath(shutil.which(args.setup_zig) or args.setup_zig)
     cinfo = compiler_info(compiler, work)
     is_upstream = os.path.realpath(compiler) == os.path.realpath(setup_zig)
-    modes = (args.modes.split(",") if args.modes else (list(MODES) if is_upstream else ["build-exe"]))
+    modes = args.modes.split(",") if args.modes else list(MODES)
     if args.scenarios in (None, ""):
         scenarios = DEFAULT_SCENARIOS if is_upstream else CORE_SCENARIOS
     elif args.scenarios == "core":

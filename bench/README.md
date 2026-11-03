@@ -62,6 +62,47 @@ What the numbers say about upstream:
   88 ms after for the baseline) shows such drift. Compare zap and zig from
   runs in the same session, not against an old report.
 
+## `zap build` against `zig build` (2026-11-03)
+
+Reports: [`results/2026-11-03-zap-build-zap.md`](results/2026-11-03-zap-build-zap.md)
+and [`results/2026-11-03-zap-build-zig-0.17.0.md`](results/2026-11-03-zap-build-zig-0.17.0.md),
+run back to back on the same orb (calibration 126–129 ms, so about 1.3x
+slower than the baseline's orb: upstream's cold build took 104 s here
+against 87 s there). vaxis `zig-build` mode, the wrapper project, zap
+ReleaseFast. Median wall time, peak RSS in parentheses.
+
+| | cold | cold-local | warm (no edit) | edit root | edit lib |
+|---|---:|---:|---:|---:|---:|
+| `zig build` | 103.7 s (908 MiB) | 6.51 s (304 MiB) | 24 ms (39 MiB) | 1.19 s | 1.20 s |
+| `zap build` | 5.14 s (314 MiB) | 2.37 s (138 MiB) | 38 ms (18 MiB) | 144 ms | 139 ms |
+
+- **cold** includes compiling the build runner (`lib/compiler/Maker.zig`),
+  a one-time cost per global cache (upstream, ReleaseSafe with LLVM, about
+  75 s at the baseline's speed) or per zap binary (zap, Debug, about 3 s).
+  It is not a per-build cost. **cold-local** is the per-project first
+  build: runner cached, empty local cache.
+- **warm is slower with zap: 38 ms against 24 ms.** zap's own check
+  that the runner is current costs about 3 ms; the rest is the runner
+  itself, which zap builds in Debug (safety checks, little optimization)
+  where upstream builds it in ReleaseSafe with LLVM. Its configure phase
+  and step graph walk take about twice as long. The compile steps
+  themselves are cache hits in about 2–3 ms.
+- **The build.zig compile** (the configurer step, `build-exe ... --name
+  configurer -fsingle-threaded --dep @build --dep @dependencies
+  -Mroot=<lib>/compiler/configurer.zig`), served over `--listen=-` by each
+  compiler from the runner's exact command line, one process per run,
+  global cache warm, 10 runs:
+
+  | project | compiler | first compile | no change | one-line edit to build.zig |
+  |---|---|---:|---:|---:|
+  | libvaxis | zig | 1198 ms | 6.7 ms | 1226 ms |
+  | libvaxis | zap | 691 ms | 1.7 ms | 213 ms |
+  | zap repo | zig | 1202 ms | 5.4 ms | 1185 ms |
+  | zap repo | zap | 682 ms | 1.5 ms | 186 ms |
+
+  The edit appends a statement to the `pub fn build` line. This is the
+  compile every `zig build` pays when its build script changed.
+
 ## Running
 
 ```sh
@@ -75,9 +116,11 @@ python3 bench/bench.py --compiler zig-out/bin/zap --machine-note "Amp orb, 4 vCP
 
 Useful options: `--workloads hello,vaxis,zig`, `--modes build-exe,zig-build`,
 `--scenarios core` or a comma-separated list, `--runs`, `--cold-runs`,
-`--build-cold-runs`, `--out PATH` (without extension). With a compiler other
-than upstream zig the defaults are the `build-exe` mode and the core
-scenarios (cold, cold-local, warm, edit-root, edit-lib).
+`--build-cold-runs`, `--out PATH` (without extension). Both modes run by
+default; with zap, `zig-build` times `zap build`, which compiles and runs
+upstream's build runner with zap as the compiler. With a compiler other
+than upstream zig the default scenarios are the core ones (cold,
+cold-local, warm, edit-root, edit-lib).
 
 ### Profiling with valgrind
 

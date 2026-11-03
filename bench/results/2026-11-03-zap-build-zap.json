@@ -1,0 +1,390 @@
+{
+ "schema": 1,
+ "generated": "2026-11-03T18:22:22+00:00",
+ "harness_commit": "3795f8a",
+ "machine": {
+  "note": "Amp orb, 4 vCPU",
+  "logical_cpus": 4,
+  "kernel": "6.1.158+",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python": "3.11.6",
+  "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "mem_total_gib": 7.8
+ },
+ "compiler": {
+  "path": "/home/user/workspace/repo/zig-out/bin/zap",
+  "realpath": "/home/user/workspace/repo/zig-out/bin/zap",
+  "version": "0.17.0",
+  "default_backend": "stage2_x86_64",
+  "default_mode": "debug",
+  "object_format": "elf"
+ },
+ "runs": 10,
+ "cold_runs": 5,
+ "build_cold_runs": 3,
+ "scenario_descriptions": {
+  "cold": "empty local and global caches",
+  "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+  "warm": "rebuild, no change",
+  "edit-root": "rebuild after a one-line edit to a function body in the root file",
+  "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+  "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+  "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+  "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+  "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+ },
+ "calibration_s": {
+  "start": 0.12927869799932523,
+  "end": 0.12563756800045667
+ },
+ "workloads": {
+  "vaxis": {
+   "description": "libvaxis 0620b34e091d examples/text_input.zig",
+   "commands": {
+    "zig-build": {
+     "cwd": "vaxis/wrapper",
+     "argv": [
+      "zap",
+      "build",
+      "--cache-dir",
+      "../build-cache/local"
+     ],
+     "env": {
+      "ZIG_GLOBAL_CACHE_DIR": "../build-cache/global"
+     }
+    }
+   },
+   "edits": {
+    "root": {
+     "file": "vaxis/libvaxis/examples/text_input.zig",
+     "anchor": "    const alloc = init.gpa;",
+     "line": 23
+    },
+    "lib": {
+     "file": "vaxis/libvaxis/src/Vaxis.zig",
+     "anchor": "    var started: bool = false;",
+     "line": 407
+    }
+   },
+   "libvaxis": {
+    "url": "https://github.com/rockorager/libvaxis",
+    "commit": "0620b34e091deaa6f64608922be3814147128dfb",
+    "patched": false
+   }
+  }
+ },
+ "results": [
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "cold",
+   "runs": [
+    {
+     "wall_s": 5.142340954999781,
+     "cpu_s": 6.13931,
+     "maxrss_kb": 321980
+    },
+    {
+     "wall_s": 5.136526424000294,
+     "cpu_s": 6.177456,
+     "maxrss_kb": 323844
+    },
+    {
+     "wall_s": 5.053530510999735,
+     "cpu_s": 6.0643460000000005,
+     "maxrss_kb": 321292
+    }
+   ],
+   "stats": {
+    "n": 3,
+    "median_s": 5.136526424000294,
+    "min_s": 5.053530510999735,
+    "max_s": 5.142340954999781,
+    "mean_s": 5.110799296666603,
+    "stdev_s": 0.049681360201833065,
+    "cpu_median_s": 6.13931,
+    "maxrss_median_kb": 321980,
+    "maxrss_max_kb": 323844
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "cold-local",
+   "runs": [
+    {
+     "wall_s": 2.3815716360004444,
+     "cpu_s": 2.59345,
+     "maxrss_kb": 141084
+    },
+    {
+     "wall_s": 2.3825346249996073,
+     "cpu_s": 2.571148,
+     "maxrss_kb": 141808
+    },
+    {
+     "wall_s": 2.353186569999707,
+     "cpu_s": 2.566379,
+     "maxrss_kb": 143296
+    },
+    {
+     "wall_s": 2.3595795470000667,
+     "cpu_s": 2.5731010000000003,
+     "maxrss_kb": 141364
+    },
+    {
+     "wall_s": 2.315424726999481,
+     "cpu_s": 2.53829,
+     "maxrss_kb": 142948
+    },
+    {
+     "wall_s": 2.4247029839998504,
+     "cpu_s": 2.659161,
+     "maxrss_kb": 140972
+    },
+    {
+     "wall_s": 2.455134720999922,
+     "cpu_s": 2.6795039999999997,
+     "maxrss_kb": 141032
+    },
+    {
+     "wall_s": 2.359324936000121,
+     "cpu_s": 2.5968489999999997,
+     "maxrss_kb": 141896
+    },
+    {
+     "wall_s": 2.3076326860000336,
+     "cpu_s": 2.514368,
+     "maxrss_kb": 140940
+    },
+    {
+     "wall_s": 2.3776283269999112,
+     "cpu_s": 2.601132,
+     "maxrss_kb": 142780
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 2.368603936999989,
+    "min_s": 2.3076326860000336,
+    "max_s": 2.455134720999922,
+    "mean_s": 2.3716720758999146,
+    "stdev_s": 0.04464049767699543,
+    "cpu_median_s": 2.5832755,
+    "maxrss_median_kb": 141586.0,
+    "maxrss_max_kb": 143296
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "warm",
+   "runs": [
+    {
+     "wall_s": 0.03734078599973145,
+     "cpu_s": 0.038640999999999995,
+     "maxrss_kb": 18828
+    },
+    {
+     "wall_s": 0.037404022000373516,
+     "cpu_s": 0.038407,
+     "maxrss_kb": 18828
+    },
+    {
+     "wall_s": 0.038201295000362734,
+     "cpu_s": 0.039778999999999995,
+     "maxrss_kb": 18828
+    },
+    {
+     "wall_s": 0.03819480099991779,
+     "cpu_s": 0.039509,
+     "maxrss_kb": 18828
+    },
+    {
+     "wall_s": 0.03803748099926452,
+     "cpu_s": 0.039041,
+     "maxrss_kb": 18828
+    },
+    {
+     "wall_s": 0.03772528700028488,
+     "cpu_s": 0.038895,
+     "maxrss_kb": 18828
+    },
+    {
+     "wall_s": 0.038776330000473536,
+     "cpu_s": 0.040038,
+     "maxrss_kb": 18828
+    },
+    {
+     "wall_s": 0.03805626699977438,
+     "cpu_s": 0.039167,
+     "maxrss_kb": 18828
+    },
+    {
+     "wall_s": 0.03915906200018071,
+     "cpu_s": 0.040325,
+     "maxrss_kb": 18828
+    },
+    {
+     "wall_s": 0.03825195799981884,
+     "cpu_s": 0.039497,
+     "maxrss_kb": 18828
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.038125533999846084,
+    "min_s": 0.03734078599973145,
+    "max_s": 0.03915906200018071,
+    "mean_s": 0.038114728900018234,
+    "stdev_s": 0.0005603794976311168,
+    "cpu_median_s": 0.039332,
+    "maxrss_median_kb": 18828.0,
+    "maxrss_max_kb": 18828
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "edit-root",
+   "runs": [
+    {
+     "wall_s": 0.17781227999967086,
+     "cpu_s": 0.20043899999999998,
+     "maxrss_kb": 70732
+    },
+    {
+     "wall_s": 0.16358666399992217,
+     "cpu_s": 0.17911699999999997,
+     "maxrss_kb": 68368
+    },
+    {
+     "wall_s": 0.1540112559996487,
+     "cpu_s": 0.169957,
+     "maxrss_kb": 71248
+    },
+    {
+     "wall_s": 0.14303739099977975,
+     "cpu_s": 0.158621,
+     "maxrss_kb": 71460
+    },
+    {
+     "wall_s": 0.15589348299999983,
+     "cpu_s": 0.172686,
+     "maxrss_kb": 68264
+    },
+    {
+     "wall_s": 0.14184690300044167,
+     "cpu_s": 0.159292,
+     "maxrss_kb": 70504
+    },
+    {
+     "wall_s": 0.14485907399921416,
+     "cpu_s": 0.165325,
+     "maxrss_kb": 69712
+    },
+    {
+     "wall_s": 0.13466303600034735,
+     "cpu_s": 0.151268,
+     "maxrss_kb": 70748
+    },
+    {
+     "wall_s": 0.13101773000016692,
+     "cpu_s": 0.148676,
+     "maxrss_kb": 67600
+    },
+    {
+     "wall_s": 0.14213520199973573,
+     "cpu_s": 0.163128,
+     "maxrss_kb": 71804
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.14394823249949695,
+    "min_s": 0.13101773000016692,
+    "max_s": 0.17781227999967086,
+    "mean_s": 0.14888630189989271,
+    "stdev_s": 0.014123756822338298,
+    "cpu_median_s": 0.1642265,
+    "maxrss_median_kb": 70618.0,
+    "maxrss_max_kb": 71804
+   },
+   "extra": {}
+  },
+  {
+   "workload": "vaxis",
+   "mode": "zig-build",
+   "scenario": "edit-lib",
+   "runs": [
+    {
+     "wall_s": 0.14484722899942426,
+     "cpu_s": 0.164732,
+     "maxrss_kb": 70904
+    },
+    {
+     "wall_s": 0.13855525400049373,
+     "cpu_s": 0.16000799999999998,
+     "maxrss_kb": 72184
+    },
+    {
+     "wall_s": 0.14057586299986724,
+     "cpu_s": 0.16330499999999998,
+     "maxrss_kb": 69632
+    },
+    {
+     "wall_s": 0.14010947899987514,
+     "cpu_s": 0.1583,
+     "maxrss_kb": 70584
+    },
+    {
+     "wall_s": 0.1381110729998909,
+     "cpu_s": 0.157192,
+     "maxrss_kb": 72452
+    },
+    {
+     "wall_s": 0.1393971010002133,
+     "cpu_s": 0.158965,
+     "maxrss_kb": 69832
+    },
+    {
+     "wall_s": 0.13888506300008885,
+     "cpu_s": 0.158943,
+     "maxrss_kb": 72660
+    },
+    {
+     "wall_s": 0.1361092720007946,
+     "cpu_s": 0.155887,
+     "maxrss_kb": 72992
+    },
+    {
+     "wall_s": 0.1410122940005749,
+     "cpu_s": 0.16225699999999998,
+     "maxrss_kb": 73256
+    },
+    {
+     "wall_s": 0.13823342500018043,
+     "cpu_s": 0.15772599999999998,
+     "maxrss_kb": 70248
+    }
+   ],
+   "stats": {
+    "n": 10,
+    "median_s": 0.13914108200015107,
+    "min_s": 0.1361092720007946,
+    "max_s": 0.14484722899942426,
+    "mean_s": 0.13958360530014033,
+    "stdev_s": 0.002324999068771873,
+    "cpu_median_s": 0.15895399999999998,
+    "maxrss_median_kb": 71544.0,
+    "maxrss_max_kb": 73256
+   },
+   "extra": {}
+  }
+ ],
+ "skipped": []
+}
