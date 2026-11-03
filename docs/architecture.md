@@ -411,7 +411,7 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   reproduced on demand), the mapping's worst case outweighs its best, so
   `auto` is pwrite everywhere. A
   small program links on 1 thread (fewer than 2048 atoms is one chunk).
-- Debug info (`src/link/Dwarf.zig`, shared with the Mach-O linker later) is
+- Debug info (`src/link/Dwarf.zig`, shared with the Mach-O linker) is
   DWARF 5 with one compile unit for the whole output: .debug_abbrev, a
   .debug_info subprogram entry per function with `debug` (name, low_pc,
   high_pc, decl_file, decl_line), and one .debug_line sequence per such
@@ -493,14 +493,38 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   about 5 ms more than anonymous memory, and the mapping then needs
   msync(MS_INVALIDATE) before exec (another 4 ms), or macOS kills every
   run despite a valid signature (golang/go#42684). F_PREALLOCATE and
-  parallel pwrite gained nothing; close absorbs it. It takes no `Atom.Debug`
-  yet; Mach-O debug info comes later. `MachO.linkInput`/`emitInput` read
+  parallel pwrite gained nothing; close absorbs it. `MachO.linkInput`/`emitInput` read
   atoms through the same input as ELF's (its debug declarations unused),
   with the same `check`/`InvalidInput` contract, and `MachO.Symbols` has
   `targets_tail`. Cost to the slice path on the orb (callgrind, three
   single-thread emits, excluding the 3594M instructions of software
   SHA-256 that are the same in both): 463.1M → 464.5M (+0.31%), from code
   layout; wall clock within noise.
+- Mach-O debug info (`Options.debug`) goes where macOS's tools look. The
+  DWARF is ELF's (one compile unit, a subprogram and a line sequence per
+  entry, from the same `Dwarf.zig` passes) in a dSYM bundle,
+  `<exe>.dSYM/Contents/Resources/DWARF/<exe>`: an MH_DSYM file with the
+  executable's UUID, its segment and section commands without contents
+  (as dsymutil and upstream Zig write them), and a __DWARF segment.
+  std.debug (MachOFile looks for exactly this path and checks the UUID)
+  and lldb read it; neither reads DWARF inside the executable, and a debug
+  map of N_OSO stabs would need object files. The dSYM is a new file each
+  link, written with pwrite from per-thread buffers: a debugger may have
+  the old one mapped. Unwinding uses `__TEXT,__unwind_info`, which
+  std.debug's Mach-O unwinder requires (it reads __eh_frame only for
+  entries whose compact encoding defers to DWARF), as do libunwind and
+  lldb. `.frame_pointer` is UNWIND_ARM64_MODE_FRAME (`stp x29, x30, [sp,
+  #-16]!; mov x29, sp`), as LLVM encodes such functions; `.none` and
+  `.outermost` get no encoding (dyld calls `main`, so no zap frame is
+  outermost). Entries are regular second-level pages, one per chunk of
+  2048 debug entries: an entry where a function starts unless it
+  continues the previous encoding, and an encoding-0 entry where a run of
+  functions ends, a run continuing while the next function is the next
+  kept code in __text (padding takes the encoding before it, as with
+  ld64). The entries depend only on where atoms went within their chunks,
+  so a pass right after layout counts them exactly before sections are
+  placed, and the copy step writes them; a serial step writes the index.
+  Without debug info there is no __unwind_info and the output is unchanged.
 - Measured Mach-O link throughput (2026-11-02, Apple M4 Max, 12+4 cores,
   `zig build bench-link -- macho`, best of 15): the same 100k atoms with
   aarch64 relocations (970k: a constant reference is an adrp/add pair) and

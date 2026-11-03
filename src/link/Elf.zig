@@ -161,7 +161,7 @@ pub const Error = Allocator.Error || std.Io.Cancelable || error{
 /// Where `build` puts the output: a buffer holding all of it (in memory, or
 /// a mapping of the file), or a file it writes with pwrite, one contiguous
 /// range at a time.
-const Target = union(enum) {
+pub const Target = union(enum) {
     memory: []u8,
     file: std.posix.fd_t,
 };
@@ -1412,7 +1412,7 @@ fn nonAlloc(name: u32, ty: elf.SHT, offset: u64, size: u64) elf.Elf64.Shdr {
     return .{ .name = name, .type = ty, .flags = .{ .shf = .{} }, .addr = 0, .offset = offset, .size = size, .link = 0, .info = 0, .addralign = 1, .entsize = 0 };
 }
 
-fn pwriteAll(fd: std.posix.fd_t, bytes: []const u8, offset: u64) Error!void {
+pub fn pwriteAll(fd: std.posix.fd_t, bytes: []const u8, offset: u64) Error!void {
     var at: usize = 0;
     while (at < bytes.len) {
         const sys = std.posix.system;

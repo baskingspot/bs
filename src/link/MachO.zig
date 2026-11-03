@@ -8,7 +8,8 @@
 //! loaded segments mapped at `base_address + file offset`:
 //!
 //!   __PAGEZERO    4 GiB, no access, not in the file
-//!   __TEXT        r-x  header and load commands, __text, __stubs, __const
+//!   __TEXT        r-x  header and load commands, __text, __stubs, __const,
+//!                      __unwind_info (with debug info)
 //!   __DATA_CONST  rw-, read-only after fixups  __got, __const
 //!   __DATA        rw-  __data, __bss (memory only)
 //!   __LINKEDIT    r--  chained fixups, exports trie, symbol table, indirect
@@ -27,10 +28,16 @@
 //! before it, flagged ad hoc, which is all Apple Silicon needs to run the
 //! file. The UUID is derived from the same page hashes.
 //!
+//! Debug info (`Options.debug`) goes where macOS's tools look for it. The
+//! DWARF, the same compile unit, subprograms, and line sequences as ELF's
+//! (`Dwarf.zig`), goes in a dSYM bundle next to the executable, matched to
+//! it by UUID, which lldb and std.debug read; `__TEXT,__unwind_info` holds
+//! compact unwind entries from each entry's `frame`, which libunwind, lldb,
+//! and std.debug's unwinder read. There is no __eh_frame: the frames zap
+//! describes all have compact encodings, as LLVM and ld64 emit them.
+//!
 //! Not implemented yet: TLS (`__thread_vars`, `__thread_data`,
-//! `__thread_bss`), and debug info: it takes no `Atom.Debug` entries, and
-//! there is no DWARF (in macOS's scheme, a debug map of N_OSO stabs or a
-//! dSYM).
+//! `__thread_bss`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,6 +45,7 @@ const macho = std.macho;
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Atom = @import("Atom.zig");
+const Dwarf = @import("Dwarf.zig");
 const Elf = @import("Elf.zig");
 const SymbolKey = Atom.SymbolKey;
 const SymbolTable = Elf.SymbolTable;
@@ -73,6 +81,13 @@ pub const Options = struct {
     /// in diagnostics and `values` not at all; `imports` still gives the
     /// imports' names, in the order of `Symbols.imports`.
     symbols: ?Symbols = null,
+    /// Debug info for functions, ordered by `Atom.Debug.atom`, as for
+    /// `Elf.Options.debug`: DWARF in a dSYM bundle next to the executable
+    /// (see `link`), and `__unwind_info` from each entry's `frame`.
+    debug: []const Atom.Debug = &.{},
+    /// The compilation directory that relative `Atom.Debug.file` paths are
+    /// relative to (DW_AT_comp_dir).
+    comp_dir: []const u8 = ".",
 };
 
 /// `Elf.Symbols` with the imports numbered too.
@@ -112,7 +127,9 @@ pub const Error = Elf.Error;
 /// memory, signed there, and written into a new file with pwrite. The old
 /// file is replaced, not truncated: the kernel caches the code signature of
 /// a file it has run, and rewriting that file in place gets the next run
-/// killed.
+/// killed. With `options.debug`, the DWARF goes to `<sub_path>.dSYM/
+/// Contents/Resources/DWARF/<file name>`, where lldb and std.debug look for
+/// it, with the executable's UUID.
 ///
 /// Building in a shared mapping of the file instead costs about twice as
 /// much on macOS (12.5 ms against 6 ms for the 27 MiB bench-link output on
@@ -121,16 +138,35 @@ pub const Error = Elf.Error;
 /// the kernel kills every run of the file (golang/go#42684), which costs
 /// another 4 ms.
 pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, atoms: []const Atom, options: Options) !void {
-    return linkInput(gpa, io, dir, sub_path, Elf.AtomSlice{ .atoms = atoms, .debug_entries = &.{} }, options);
+    return linkInput(gpa, io, dir, sub_path, Elf.AtomSlice{ .atoms = atoms, .debug_entries = options.debug }, options);
 }
 
-/// `link` with the atoms read from `input`, which has `Elf.AtomSlice`'s
-/// declarations other than the debug ones.
+/// `link` with the atoms and their debug info read from `input`, which has
+/// `Elf.AtomSlice`'s declarations; `options.debug` is not used.
 pub fn linkInput(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, input: anytype, options: Options) !void {
     var o = options;
     if (o.identifier == null) o.identifier = std.fs.path.basename(sub_path);
-    const bytes = try emitInput(gpa, io, input, o);
-    defer gpa.free(bytes);
+    var out: Elf.MemoryOutput = .{ .gpa = gpa };
+    defer gpa.free(out.buf);
+    if (input.debugLen() == 0) {
+        try build(gpa, io, input, o, &out, {});
+    } else {
+        const dsym_dir = try std.fmt.allocPrint(gpa, "{s}.dSYM/Contents/Resources/DWARF", .{sub_path});
+        defer gpa.free(dsym_dir);
+        var dsym_parent = try dir.createDirPathOpen(io, dsym_dir, .{});
+        defer dsym_parent.close(io);
+        // A debugger may have the old file mapped, so it is replaced, not
+        // overwritten.
+        const dsym_name = std.fs.path.basename(sub_path);
+        dsym_parent.deleteFile(io, dsym_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        var dsym: DsymFile = .{ .file = try dsym_parent.createFile(io, dsym_name, .{}) };
+        defer dsym.file.close(io);
+        errdefer dsym_parent.deleteFile(io, dsym_name) catch {};
+        try build(gpa, io, input, o, &out, &dsym);
+    }
     dir.deleteFile(io, sub_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => |e| return e,
@@ -138,20 +174,45 @@ pub fn linkInput(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const 
     const file = try dir.createFile(io, sub_path, .{ .permissions = .executable_file });
     defer file.close(io);
     errdefer dir.deleteFile(io, sub_path) catch {};
-    try file.writePositionalAll(io, bytes, 0);
+    try file.writePositionalAll(io, out.buf, 0);
 }
 
-/// Links `atoms` into the bytes of an executable, owned by the caller.
+/// Links `atoms` into the bytes of an executable, owned by the caller,
+/// the same as `link` writes; the dSYM is not built.
 pub fn emit(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options) Error![]u8 {
-    return emitInput(gpa, io, Elf.AtomSlice{ .atoms = atoms, .debug_entries = &.{} }, options);
+    return emitInput(gpa, io, Elf.AtomSlice{ .atoms = atoms, .debug_entries = options.debug }, options);
 }
 
 /// `emit` with the atoms read from `input` (see `linkInput`).
 pub fn emitInput(gpa: Allocator, io: std.Io, input: anytype, options: Options) Error![]u8 {
     var out: Elf.MemoryOutput = .{ .gpa = gpa };
     errdefer gpa.free(out.buf);
-    try build(gpa, io, input, options, &out);
+    try build(gpa, io, input, options, &out, {});
     return out.buf;
+}
+
+/// The dSYM's DWARF file, written with pwrite from a buffer per thread, one
+/// contiguous range at a time, as `Elf.link` writes, rather than through a
+/// mapping, which would fault in and zero every page of the new file.
+const DsymFile = struct { file: std.Io.File };
+
+/// An executable and its dSYM's DWARF file, owned by the caller.
+pub const Emitted = struct { exe: []u8, dsym: []u8 };
+
+/// `emit`, and the DWARF file that `link` writes into the dSYM bundle
+/// (empty without debug info).
+pub fn emitWithDsym(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options) Error!Emitted {
+    const input: Elf.AtomSlice = .{ .atoms = atoms, .debug_entries = options.debug };
+    var out: Elf.MemoryOutput = .{ .gpa = gpa };
+    errdefer gpa.free(out.buf);
+    var dsym: Elf.MemoryOutput = .{ .gpa = gpa };
+    errdefer gpa.free(dsym.buf);
+    if (options.debug.len == 0) {
+        try build(gpa, io, input, options, &out, {});
+    } else {
+        try build(gpa, io, input, options, &out, &dsym);
+    }
+    return .{ .exe = out.buf, .dsym = dsym.buf };
 }
 
 pub const base_address = 0x1_0000_0000;
@@ -162,13 +223,14 @@ const sig_page_size = 0x1000;
 const stub_size = 12;
 
 /// Output sections, in layout order.
-const Sect = enum(u3) { text, stubs, text_const, got, data_const, data, bss };
-const n_sects = 7;
+const Sect = enum(u3) { text, stubs, text_const, unwind_info, got, data_const, data, bss };
+const n_sects = 8;
 const Seg = enum(u2) { text, data_const, data };
 const sect_info = [n_sects]struct { seg: Seg, name: []const u8, flags: u32 }{
     .{ .seg = .text, .name = "__text", .flags = macho.S_REGULAR | macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS },
     .{ .seg = .text, .name = "__stubs", .flags = macho.S_SYMBOL_STUBS | macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS },
     .{ .seg = .text, .name = "__const", .flags = macho.S_REGULAR },
+    .{ .seg = .text, .name = "__unwind_info", .flags = macho.S_REGULAR },
     .{ .seg = .data_const, .name = "__got", .flags = macho.S_NON_LAZY_SYMBOL_POINTERS },
     .{ .seg = .data_const, .name = "__const", .flags = macho.S_REGULAR },
     .{ .seg = .data, .name = "__data", .flags = macho.S_REGULAR },
@@ -179,6 +241,7 @@ const seg_names = [3][]const u8{ "__TEXT", "__DATA_CONST", "__DATA" };
 const text = @backingInt(Sect.text);
 const stubs = @backingInt(Sect.stubs);
 const text_const = @backingInt(Sect.text_const);
+const unwind_info = @backingInt(Sect.unwind_info);
 const got = @backingInt(Sect.got);
 const data_const = @backingInt(Sect.data_const);
 const data = @backingInt(Sect.data);
@@ -217,7 +280,7 @@ const mh_execute_header = "__mh_execute_header";
 /// threads. Mach-O adds a serial pass that writes the GOT and stubs and
 /// links fixups into per-page chains, and a parallel pass that hashes
 /// pages for the code signature.
-fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anytype) !void {
+fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anytype, dsym_out: anytype) !void {
     const Link = LinkOf(@TypeOf(input));
     var unused_diag: Diagnostic = .{};
     const diag = options.diag orelse &unused_diag;
@@ -240,11 +303,27 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer gpa.free(keys);
     const chunks = try gpa.alloc(Chunk, n_chunks);
     defer gpa.free(chunks);
-    const failures = try gpa.alloc(?Failure, @max(n_chunks, n_partitions));
+    const n_debug = input.debugLen();
+    const n_debug_chunks = std.math.divCeil(usize, n_debug, Dwarf.chunk_len) catch unreachable;
+    const debug_chunks = try gpa.alloc(Dwarf.Chunk, n_debug_chunks);
+    defer gpa.free(debug_chunks);
+    for (debug_chunks) |*c| c.files = .empty;
+    defer for (debug_chunks) |*c| c.files.deinit(gpa);
+    const file_of = try gpa.alloc(u32, n_debug);
+    defer gpa.free(file_of);
+    const unwind_pages = try gpa.alloc(UnwindPage, n_debug_chunks);
+    defer gpa.free(unwind_pages);
+    // Atom chunks, then debug chunks.
+    const failures = try gpa.alloc(?Failure, @max(n_chunks + n_debug_chunks, n_partitions));
     defer gpa.free(failures);
     var l: Link = .{
+        .gpa = gpa,
         .input = input,
         .n_atoms = n_atoms,
+        .n_debug = n_debug,
+        .debug_chunks = debug_chunks,
+        .file_of = file_of,
+        .unwind_pages = unwind_pages,
         .places = places,
         .keys = keys,
         .chunks = chunks,
@@ -263,6 +342,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         try parallel(io, n_threads, n_chunks, &l, Link.layOutNumbered);
     }
     try l.check(diag);
+    // Size the debug chunks, which needs only where atoms went.
+    if (n_debug > 0) {
+        try parallel(io, n_threads, n_debug_chunks, &l, Link.layOutDebug);
+        try l.check(diag);
+    }
 
     // Place chunks within sections, and their symbols, names, and fixups.
     var sizes: [n_sects]u64 = @splat(0);
@@ -344,6 +428,15 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     aligns[stubs] = .@"4";
     sizes[got] = @as(u64, n_imports) * 8;
     aligns[got] = .@"8";
+    if (n_debug > 0) {
+        var at = unwindPagesOff(n_debug_chunks) + unwind_lead_page_size;
+        for (unwind_pages) |*p| {
+            p.off = at;
+            if (p.count > 0) at += unwind_page_header_size + @as(u64, p.count) * unwind_entry_size;
+        }
+        sizes[unwind_info] = at;
+    }
+    aligns[unwind_info] = .@"4";
 
     // Which sections and segments exist. __text always does: it holds the
     // entry point.
@@ -438,15 +531,47 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
     if (numbered != null) {
         try parallel(io, n_threads, n_chunks, &l, Link.resolveAddrsNumbered);
-        try l.check(diag);
+    } else {
+        try parallel(io, n_threads, n_partitions, &l, Link.resolveAddrsKeyed);
+    }
+    try l.check(diag);
+    if (numbered != null) {
         entry_index = l.entry_atom orelse {
             diag.* = .{ .target = options.entry };
             return error.UndefinedSymbol;
         };
         try checkEntry(&l, entry_index, options.entry, diag);
-    } else {
-        try parallel(io, n_threads, n_partitions, &l, Link.resolveAddrsKeyed);
     }
+
+    // The dSYM's DWARF file: header, load commands (see `writeDsymHeader`),
+    // then the __DWARF segment's sections from a 4 KiB boundary.
+    const has_dsym = @TypeOf(dsym_out) != void;
+    var placed: Dwarf.Placed = .{};
+    defer placed.deinit(gpa);
+    var dwarf: Dwarf = .{};
+    defer dwarf.deinit(gpa);
+    var dsym_layout: DsymLayout = undefined;
+    if (has_dsym) {
+        placed = try Dwarf.placeChunks(gpa, debug_chunks);
+        if (placed.files.count() > 0) dwarf = try .init(gpa, placed.files.keys(), options.comp_dir);
+        var segs_size: u32 = @sizeOf(macho.segment_command_64); // __PAGEZERO
+        for (seg_present, seg_nsects) |p, n| if (p) {
+            segs_size += @sizeOf(macho.segment_command_64) + n * @sizeOf(macho.section_64);
+        };
+        dsym_layout = .init(n_segs - 1, segs_size, dwarf, placed);
+        l.has_dsym = true;
+        if (@TypeOf(dsym_out) == *Elf.MemoryOutput) {
+            l.dsym = .{ .memory = try dsym_out.buffer(io, dsym_layout.len) };
+        } else {
+            try dsym_out.file.setLength(io, dsym_layout.len);
+            l.dsym = .{ .file = dsym_out.file.handle };
+            for (debug_chunks) |*c| l.dsym_scratch_len = @max(l.dsym_scratch_len, c.info_len + c.line_len);
+            l.dsym_scratch = try gpa.alloc(u8, n_threads * l.dsym_scratch_len);
+        }
+        l.dsym_info_off = dsym_layout.info_off + dwarf.info_header.len;
+        l.dsym_line_off = dsym_layout.line_off + dwarf.line_header.len;
+    }
+    defer gpa.free(l.dsym_scratch);
 
     const buf = try out.buffer(io, file_len);
     l.buf = buf;
@@ -461,6 +586,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             .{ starts[text], starts[text] + sizes[text] },
             .{ starts[stubs], starts[stubs] + sizes[stubs] },
             .{ starts[text_const], starts[text_const] + sizes[text_const] },
+            .{ starts[unwind_info], starts[unwind_info] + sizes[unwind_info] },
             .{ starts[got], starts[got] + sizes[got] },
             .{ starts[data_const], starts[data_const] + sizes[data_const] },
             .{ starts[data], starts[data] + sizes[data] },
@@ -489,12 +615,16 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     l.sect_index = sect_index;
     l.stubs_addr = base + starts[stubs];
     l.got_addr = base + starts[got];
-    if (numbered == null) {
+    l.unwind_off = starts[unwind_info];
+    if (n_debug > 0) {
+        try parallel(io, n_threads, n_chunks + n_debug_chunks, &l, Link.copyAll);
+    } else if (numbered == null) {
         try parallel(io, n_threads, n_chunks, &l, Link.copyKeyed);
     } else {
         try parallel(io, n_threads, n_chunks, &l, Link.copyNumbered);
     }
     try l.check(diag);
+    if (n_debug > 0) writeUnwindIndex(buf[starts[unwind_info]..][0..sizes[unwind_info]], unwind_pages, @intCast(starts[text]), @intCast(starts[text] + sizes[text]));
 
     // GOT slots: one bind per import. Stubs: load the slot and jump.
     for (0..n_imports) |i| {
@@ -581,6 +711,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             });
         };
     };
+    const segs_end = w.at;
     w.put(macho.segment_command_64{
         .cmdsize = @sizeOf(macho.segment_command_64),
         .segname = name16("__LINKEDIT"),
@@ -620,6 +751,232 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     std.debug.assert(w.at == cmds_end);
 
     try sign(io, n_threads, buf, @intCast(sig_off), uuid_at, identifier, seg_file_end[0]);
+
+    if (has_dsym) {
+        // The dSYM's parts outside the debug chunks', in three contiguous
+        // ranges: from its header to the unit's header, the end of the
+        // unit and the line program header, and .debug_str.
+        const dl = dsym_layout;
+        const head = try gpa.alloc(u8, dl.info_off + dwarf.info_header.len);
+        defer gpa.free(head);
+        writeDsymHeader(head, dl, buf[uuid_at..][0..16].*, buf[@sizeOf(macho.mach_header_64)..segs_end], base + linkedit_vm + std.mem.alignForward(u64, file_len - linkedit_off, page_size));
+        if (dl.info_size > 0) {
+            // Debug info covers all of __text, so atoms without `debug`
+            // resolve to the compile unit but to no function or line.
+            @memcpy(head[dl.abbrev_off..][0..Dwarf.abbrev.len], &Dwarf.abbrev);
+            dwarf.finishInfoHeader(dl.info_size, base + starts[text], sizes[text]);
+            @memcpy(head[dl.info_off..][0..dwarf.info_header.len], dwarf.info_header);
+            dwarf.finishLineHeader(dl.line_size);
+            const mid = try gpa.alloc(u8, 1 + dwarf.line_header.len);
+            defer gpa.free(mid);
+            mid[0] = 0; // end of the unit's children
+            @memcpy(mid[1..], dwarf.line_header);
+            try l.putDsym(dl.info_off + dl.info_size - 1, mid);
+            try l.putDsym(dl.str_off, Dwarf.str);
+        }
+        try l.putDsym(0, head);
+    }
+}
+
+/// Where the parts of the dSYM's DWARF file go. It holds the executable's
+/// UUID and segment and section commands (with no file contents), as
+/// dsymutil's and upstream Zig's dSYMs do, so debuggers match its
+/// addresses to the executable's sections; a __DWARF segment with the
+/// debug sections, after the executable's address space; and an empty
+/// symbol table.
+const DsymLayout = struct {
+    n_exe_segs: u32,
+    exe_segs_size: u32,
+    sizeofcmds: u32,
+    /// File offsets and sizes of the debug sections, all 0 without debug
+    /// info (every entry's atom lost to a duplicate).
+    abbrev_off: u64,
+    info_off: u64,
+    info_size: u64,
+    line_off: u64,
+    line_size: u64,
+    str_off: u64,
+    dwarf_off: u64,
+    len: u64,
+
+    const n_dwarf_sects = 4;
+
+    fn init(n_exe_segs: u32, exe_segs_size: u32, dwarf: Dwarf, placed: Dwarf.Placed) DsymLayout {
+        const has_debug = placed.files.count() > 0;
+        const sizeofcmds = @sizeOf(macho.uuid_command) + exe_segs_size + @sizeOf(macho.segment_command_64) +
+            @as(u32, if (has_debug) n_dwarf_sects * @sizeOf(macho.section_64) else 0) + @sizeOf(macho.symtab_command);
+        const dwarf_off = std.mem.alignForward(u64, @sizeOf(macho.mach_header_64) + sizeofcmds, 0x1000);
+        const abbrev_size: u64 = if (has_debug) Dwarf.abbrev.len else 0;
+        const info_size = if (has_debug) dwarf.info_header.len + placed.info_len + 1 else 0;
+        const line_size = if (has_debug) dwarf.line_header.len + placed.line_len else 0;
+        const str_size: u64 = if (has_debug) Dwarf.str.len else 0;
+        const info_off = dwarf_off + abbrev_size;
+        const line_off = info_off + info_size;
+        const str_off = line_off + line_size;
+        return .{
+            .n_exe_segs = n_exe_segs,
+            .exe_segs_size = exe_segs_size,
+            .sizeofcmds = sizeofcmds,
+            .abbrev_off = dwarf_off,
+            .info_off = info_off,
+            .info_size = info_size,
+            .line_off = line_off,
+            .line_size = line_size,
+            .str_off = str_off,
+            .dwarf_off = dwarf_off,
+            .len = str_off + str_size,
+        };
+    }
+};
+
+/// Writes the dSYM's header and load commands, and zeros the padding
+/// before its __DWARF segment. `exe_segs` are the executable's segment and
+/// section commands before __LINKEDIT; `dwarf_vmaddr` is where the
+/// executable's address space ends.
+fn writeDsymHeader(dsym: []u8, dl: DsymLayout, uuid: [16]u8, exe_segs: []const u8, dwarf_vmaddr: u64) void {
+    const has_debug = dl.info_size > 0;
+    writeStruct(dsym, macho.mach_header_64{
+        .cputype = macho.CPU_TYPE_ARM64,
+        .cpusubtype = macho.CPU_SUBTYPE_ARM_ALL,
+        .filetype = macho.MH_DSYM,
+        .ncmds = dl.n_exe_segs + 3,
+        .sizeofcmds = dl.sizeofcmds,
+        .flags = 0,
+    });
+    var w: CmdWriter = .{ .buf = dsym, .at = @sizeOf(macho.mach_header_64) };
+    w.put(macho.uuid_command{ .uuid = uuid });
+    // The executable's segments, without file contents.
+    std.debug.assert(exe_segs.len == dl.exe_segs_size);
+    @memcpy(dsym[w.at..][0..exe_segs.len], exe_segs);
+    var at = w.at;
+    w.at += exe_segs.len;
+    while (at < w.at) {
+        var seg = std.mem.bytesToValue(macho.segment_command_64, dsym[at..][0..@sizeOf(macho.segment_command_64)]);
+        seg.fileoff = 0;
+        seg.filesize = 0;
+        writeStruct(dsym[at..], seg);
+        at += @sizeOf(macho.segment_command_64);
+        for (0..seg.nsects) |_| {
+            var sect = std.mem.bytesToValue(macho.section_64, dsym[at..][0..@sizeOf(macho.section_64)]);
+            sect.offset = 0;
+            writeStruct(dsym[at..], sect);
+            at += @sizeOf(macho.section_64);
+        }
+    }
+    const dwarf_size = dl.len - dl.dwarf_off;
+    w.put(macho.segment_command_64{
+        .cmdsize = @sizeOf(macho.segment_command_64) + @as(u32, if (has_debug) DsymLayout.n_dwarf_sects * @sizeOf(macho.section_64) else 0),
+        .segname = name16("__DWARF"),
+        .vmaddr = dwarf_vmaddr,
+        .vmsize = std.mem.alignForward(u64, dwarf_size, page_size),
+        .fileoff = dl.dwarf_off,
+        .filesize = dwarf_size,
+        .maxprot = .{ .READ = true, .WRITE = true, .EXEC = true },
+        .initprot = .{ .READ = true, .WRITE = true },
+        .nsects = @as(u32, if (has_debug) DsymLayout.n_dwarf_sects else 0),
+    });
+    if (has_debug) {
+        const sects = [DsymLayout.n_dwarf_sects]struct { []const u8, u64, u64 }{
+            .{ "__debug_abbrev", dl.abbrev_off, Dwarf.abbrev.len },
+            .{ "__debug_info", dl.info_off, dl.info_size },
+            .{ "__debug_line", dl.line_off, dl.line_size },
+            .{ "__debug_str", dl.str_off, Dwarf.str.len },
+        };
+        for (sects) |sect| w.put(macho.section_64{
+            .sectname = name16(sect[0]),
+            .segname = name16("__DWARF"),
+            .addr = dwarf_vmaddr + sect[1] - dl.dwarf_off,
+            .size = sect[2],
+            .offset = @intCast(sect[1]),
+            .@"align" = 0,
+            .flags = macho.S_ATTR_DEBUG,
+        });
+    }
+    w.put(macho.symtab_command{ .symoff = 0, .nsyms = 0, .stroff = 0, .strsize = 0 });
+    std.debug.assert(w.at == @sizeOf(macho.mach_header_64) + dl.sizeofcmds);
+    @memset(dsym[w.at..dl.dwarf_off], 0);
+}
+
+// __unwind_info, from the `frame` of each debug entry: the header; a
+// first-level index with room for a leading page, a page per debug chunk,
+// and the end; an empty LSDA array; the leading page, which marks code
+// before the first function as having no unwind info; then each debug
+// chunk's regular second-level page, with room for 2 entries per debug
+// entry and 1 more. A chunk writes its page in place: an entry where each
+// function starts unless it continues the previous entry's encoding, and
+// an entry with no encoding where each run of functions ends, so that code
+// without debug info between functions is not taken for theirs.
+// `writeUnwindIndex` then lists the pages that have entries. Debuggers and
+// unwinders find the page from the index and the entry by binary search.
+
+const unwind_header_size = @sizeOf(macho.unwind_info_section_header);
+const unwind_index_entry_size = @sizeOf(macho.unwind_info_section_header_index_entry);
+const unwind_page_header_size = @sizeOf(macho.unwind_info_regular_second_level_page_header);
+const unwind_entry_size = @sizeOf(macho.unwind_info_regular_second_level_entry);
+const unwind_lead_page_size = unwind_page_header_size + unwind_entry_size;
+
+/// Offset of the LSDA array and the pages, for `n_chunks` debug chunks.
+fn unwindPagesOff(n_chunks: usize) u64 {
+    return unwind_header_size + (n_chunks + 2) * unwind_index_entry_size;
+}
+
+/// A debug chunk's page: its number of entries (from `Link.layOutDebug`),
+/// its offset in the section, and its first function offset (from
+/// `Link.copyDebug`).
+const UnwindPage = struct { count: u32, off: u64, first: u32 };
+
+/// The compact unwind encoding of a frame. `frame_pointer` is the
+/// prologue `stp x29, x30, [sp, #-16]!; mov x29, sp`, which leaves x29
+/// pointing at the saved x29 and x30: UNWIND_ARM64_MODE_FRAME with no other
+/// saved registers. The others have none (0), so unwinders fall back to
+/// the frame chain; dyld calls `main`, so no frame of the executable's is
+/// the outermost one.
+fn unwindEncoding(frame: Atom.Debug.Frame) u32 {
+    return switch (frame) {
+        .frame_pointer => 0x0400_0000,
+        .none, .outermost => 0,
+    };
+}
+
+/// Writes the header, the first-level index, and the leading page of
+/// `out`, the __unwind_info section, after the debug chunks wrote their
+/// pages. Offsets are from the start of __TEXT; __text spans `text_start`
+/// to `text_end`.
+fn writeUnwindIndex(out: []u8, pages: []const UnwindPage, text_start: u32, text_end: u32) void {
+    const pages_off: u32 = @intCast(unwindPagesOff(pages.len));
+    var n: u32 = 0;
+    var index_at: usize = unwind_header_size;
+    const putIndex = struct {
+        fn f(o: []u8, at: *usize, count: *u32, function: u32, page: u32, lsda: u32) void {
+            writeStruct(o[at.*..], macho.unwind_info_section_header_index_entry{ .functionOffset = function, .secondLevelPagesSectionOffset = page, .lsdaIndexArraySectionOffset = lsda });
+            at.* += unwind_index_entry_size;
+            count.* += 1;
+        }
+    }.f;
+    const first: ?u32 = for (pages) |p| {
+        if (p.count > 0) break p.first;
+    } else null;
+    const lead = out[pages_off..][0..unwind_lead_page_size];
+    if (first != null and first.? > text_start) {
+        putIndex(out, &index_at, &n, text_start, pages_off, pages_off);
+        writeStruct(lead, macho.unwind_info_regular_second_level_page_header{ .entryPageOffset = unwind_page_header_size, .entryCount = 1 });
+        writeStruct(lead[unwind_page_header_size..], macho.unwind_info_regular_second_level_entry{ .functionOffset = text_start, .encoding = 0 });
+    } else @memset(lead, 0);
+    for (pages) |p| if (p.count > 0) {
+        putIndex(out, &index_at, &n, p.first, @intCast(p.off), pages_off);
+    };
+    // The end: past it, no unwind info.
+    putIndex(out, &index_at, &n, text_end, 0, pages_off);
+    @memset(out[index_at..pages_off], 0);
+    writeStruct(out, macho.unwind_info_section_header{
+        .version = macho.UNWIND_SECTION_VERSION,
+        .commonEncodingsArraySectionOffset = unwind_header_size,
+        .commonEncodingsArrayCount = 0,
+        .personalityArraySectionOffset = unwind_header_size,
+        .personalityArrayCount = 0,
+        .indexSectionOffset = unwind_header_size,
+        .indexCount = n,
+    });
 }
 
 /// One `chunk_len` run of consecutive atoms.
@@ -656,8 +1013,15 @@ fn LinkOf(comptime Input: type) type {
     return struct {
         const Link = @This();
 
+        gpa: Allocator,
         input: Input,
         n_atoms: usize,
+        n_debug: usize,
+        debug_chunks: []Dwarf.Chunk,
+        /// Index into its chunk's `files` of each debug entry, or
+        /// `Dwarf.skip`.
+        file_of: []u32,
+        unwind_pages: []UnwindPage,
         places: []Place,
         keys: []SymbolKey,
         chunks: []Chunk,
@@ -687,6 +1051,17 @@ fn LinkOf(comptime Input: type) type {
         /// With numbered symbols, the atom numbered `Symbols.entry`, found by
         /// `resolveAddrsNumbered`.
         entry_atom: ?usize = null,
+        /// The dSYM's DWARF file, if one is written, and where the debug
+        /// chunks' subprogram entries and line sequences start in it.
+        has_dsym: bool = false,
+        dsym: Elf.Target = .{ .memory = &.{} },
+        dsym_info_off: u64 = 0,
+        dsym_line_off: u64 = 0,
+        /// With a `.file` dSYM, room per thread for a debug chunk's parts.
+        dsym_scratch: []u8 = &.{},
+        dsym_scratch_len: usize = 0,
+        /// File offset of __unwind_info.
+        unwind_off: u64 = 0,
 
         fn check(l: *Link, diag: *Diagnostic) Error!void {
             var first: ?Failure = null;
@@ -933,6 +1308,140 @@ fn LinkOf(comptime Input: type) type {
                     str_off += @intCast(a.name.len + 1);
                 }
             }
+        }
+
+        /// Sizes one debug chunk's entries, collects their files, and
+        /// counts its __unwind_info entries.
+        fn layOutDebug(l: *Link, chunk: usize, _: usize) void {
+            const task = l.chunks.len + chunk;
+            Dwarf.layOutChunk(l, chunk, task, text);
+            if (l.failures[task] != null) return;
+            l.unwind_pages[chunk].count = l.walkDebug(chunk, undefined, false);
+        }
+
+        fn copyAll(l: *Link, task: usize, thread: usize) void {
+            if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len, thread);
+            if (l.numbered == null) l.copyKeyed(task, thread) else l.copyNumbered(task, thread);
+        }
+
+        /// Writes one debug chunk's subprogram entries and line sequences
+        /// into the dSYM, if there is one, and its __unwind_info page.
+        noinline fn copyDebug(l: *Link, chunk: usize, thread: usize) void {
+            _ = l.walkDebug(chunk, thread, true);
+        }
+
+        /// Writes `bytes` at `offset` of the dSYM.
+        fn putDsym(l: *Link, offset: u64, bytes: []const u8) Error!void {
+            switch (l.dsym) {
+                .memory => |m| @memcpy(m[offset..][0..bytes.len], bytes),
+                .file => |fd| try Elf.pwriteAll(fd, bytes, offset),
+            }
+        }
+
+        /// Counts (`write` false) or writes one debug chunk's __unwind_info
+        /// entries, and when writing, its parts of the dSYM. Both passes walk
+        /// the entries the same way, so the count is exact: an entry where
+        /// each function starts unless it continues the previous entry's
+        /// encoding, and an entry with no encoding where each run of
+        /// functions ends. A run continues while the next function is the
+        /// next code in __text, so padding between functions takes the
+        /// encoding before it, as with ld64; code without debug info ends
+        /// it.
+        fn walkDebug(l: *Link, chunk: usize, thread: usize, comptime write: bool) u32 {
+            const begin = chunk * Dwarf.chunk_len;
+            const end = @min(l.n_debug, begin + Dwarf.chunk_len);
+            const c = &l.debug_chunks[chunk];
+            // A local copy: writes to the outputs could alias `l`.
+            const input = l.input;
+            // The chunk's subprogram entries and line sequences: in the
+            // dSYM, or in the thread's scratch, written out at the end.
+            var info: []u8 = &.{};
+            var line: []u8 = &.{};
+            if (write and l.has_dsym) switch (l.dsym) {
+                .memory => |m| {
+                    info = m[l.dsym_info_off + c.info_off ..][0..c.info_len];
+                    line = m[l.dsym_line_off + c.line_off ..][0..c.line_len];
+                },
+                .file => {
+                    const scratch = l.dsym_scratch[thread * l.dsym_scratch_len ..];
+                    info = scratch[0..c.info_len];
+                    line = scratch[c.info_len..][0..c.line_len];
+                },
+            };
+            var info_off: usize = 0;
+            var line_off: usize = 0;
+            const page = if (write) l.buf[l.unwind_off + l.unwind_pages[chunk].off ..][0 .. unwind_page_header_size + l.unwind_pages[chunk].count * unwind_entry_size] else &.{};
+            var n: u32 = 0;
+            var first: u32 = 0;
+            var encoding: u32 = 0;
+            var run_end: u32 = 0;
+            var prev_atom: u32 = 0;
+            for (l.file_of[begin..end], begin..) |file_of, j| {
+                // The entries stream; their fragments, names, and atoms do not.
+                if (write and j + 12 < end) {
+                    input.prefetchDebug(j + 12);
+                    @prefetch(&l.places[input.debugAtom(j + 12)], .{});
+                }
+                if (file_of == Dwarf.skip) continue;
+                const debug = input.debug(j);
+                const d = Elf.ref(&debug);
+                const atom = input.debugAtom(j);
+                const e = unwindEncoding(d.frame);
+                const continues = n > 0 and !l.textBetween(prev_atom, atom);
+                prev_atom = atom;
+                var start: u32 = 0;
+                if (write) {
+                    const addr = l.atomAddr(atom);
+                    const size = input.atom(atom).bytes.len;
+                    if (l.has_dsym) {
+                        const file = c.file_map[file_of];
+                        info_off += Dwarf.writeSubprogram(info[info_off..], d, addr, size, file);
+                        line_off += Dwarf.writeSequence(line[line_off..], d, addr, size, file);
+                    }
+                    start = @intCast(addr - base_address);
+                }
+                if (n > 0 and !continues and encoding != 0) {
+                    if (write) putUnwindEntry(page, n, run_end, 0);
+                    n += 1;
+                    encoding = 0;
+                }
+                if (n == 0 or e != encoding) {
+                    if (write) {
+                        if (n == 0) first = start;
+                        putUnwindEntry(page, n, start, e);
+                    }
+                    n += 1;
+                    encoding = e;
+                }
+                if (write) run_end = start + @as(u32, @intCast(input.atom(atom).bytes.len));
+            }
+            if (n > 0 and encoding != 0) {
+                if (write) putUnwindEntry(page, n, run_end, 0);
+                n += 1;
+            }
+            if (write) {
+                if (l.has_dsym and l.dsym == .file) {
+                    const fd = l.dsym.file;
+                    Elf.pwriteAll(fd, info, l.dsym_info_off + c.info_off) catch l.fail(l.chunks.len + chunk, begin, error.WriteFailed, .{});
+                    Elf.pwriteAll(fd, line, l.dsym_line_off + c.line_off) catch l.fail(l.chunks.len + chunk, begin, error.WriteFailed, .{});
+                }
+                std.debug.assert(n == l.unwind_pages[chunk].count);
+                if (n > 0) writeStruct(page, macho.unwind_info_regular_second_level_page_header{ .entryPageOffset = unwind_page_header_size, .entryCount = @intCast(n) });
+                l.unwind_pages[chunk].first = first;
+            }
+            return n;
+        }
+
+        /// Whether code that is kept lies between atoms `a` and `b`.
+        fn textBetween(l: *const Link, a: u32, b: u32) bool {
+            for (l.places[a + 1 .. b]) |p| {
+                if (p.section == text and !p.isDuplicate()) return true;
+            }
+            return false;
+        }
+
+        fn putUnwindEntry(page: []u8, i: u32, function: u32, encoding: u32) void {
+            writeStruct(page[unwind_page_header_size + i * unwind_entry_size ..], macho.unwind_info_regular_second_level_entry{ .functionOffset = function, .encoding = encoding });
         }
 
         /// Applies `a`'s relocations to its copy `dst` at address `p_base` in
@@ -1607,4 +2116,242 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
     defer gpa.free(result.stderr);
     try std.testing.expectEqualStrings(msg_text, result.stdout);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = @truncate(expected) }, result.term);
+}
+
+test "writes a dSYM that std.debug symbolizes and __unwind_info for each function" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Encoder = @import("../codegen/aarch64/Encoder.zig");
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // _main, which has no debug info, calls f_0. f_i adds 1 to w19 on line
+    // i + 2, column 5, of its file, and calls f_(i+1) inside a frame-pointer
+    // frame; every tenth is naked and tail-calls instead. Every seventh is
+    // followed by a function without debug info, and one function appears
+    // twice, the copy's entry losing with it. _main exits with w19.
+    const n = 2 * Dwarf.chunk_len + 300;
+    const main: SymbolKey = .fromName("_main");
+    const fkey = struct {
+        fn f(prefix: []const u8, i: usize) SymbolKey {
+            var buf: [32]u8 = undefined;
+            return .fromName(std.fmt.bufPrint(&buf, "{s}{d}", .{ prefix, i }) catch unreachable);
+        }
+    }.f;
+    const files = [_][]const u8{ "a.zig", "dir/b.zig", "/abs/c.zig" };
+    var atoms: std.ArrayList(Atom) = .empty;
+    var debug: std.ArrayList(Atom.Debug) = .empty;
+    var m: Encoder = .init(arena);
+    try m.stp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .pre = -16 } });
+    try m.mov(.x, .fp, .sp);
+    try m.movz(.x, .x19, 0, 0);
+    try m.bl(.{ .sym = fkey("f", 0) });
+    try m.uxt(.byte, .x0, .x19);
+    try m.ldp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .post = 16 } });
+    try m.ret();
+    try m.finish();
+    try atoms.append(arena, .{ .key = main, .name = "_main", .section = .text, .alignment = .@"4", .bytes = m.code.items, .targets = m.refs.targets.keys(), .relocs = m.refs.relocs.items });
+    const naked = struct {
+        fn f(i: usize) bool {
+            return i % 10 == 9;
+        }
+    }.f;
+    const dup = n - 5;
+    for (0..n) |i| {
+        var e: Encoder = .init(arena);
+        var lines: Atom.LineProgram = .{};
+        if (!naked(i)) {
+            try e.stp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .pre = -16 } });
+            try e.mov(.x, .fp, .sp);
+        }
+        try lines.addRow(arena, @intCast(e.code.items.len), 1, 4);
+        try e.addSub(.add, .w, .x19, .x19, .{ .imm = 1 });
+        if (naked(i)) {
+            if (i + 1 < n) try e.b(.{ .sym = fkey("f", i + 1) }) else try e.ret();
+        } else {
+            if (i + 1 < n) try e.bl(.{ .sym = fkey("f", i + 1) });
+            try e.ldp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .post = 16 } });
+            try e.ret();
+        }
+        try e.finish();
+        const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
+        const atom: Atom = .{ .key = fkey("f", i), .name = name, .section = .text, .alignment = if (i % 3 == 0) .@"16" else .@"4", .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items };
+        const entry: Atom.Debug = .{ .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = lines.bytes.items, .frame = if (naked(i)) .none else .frame_pointer };
+        try debug.append(arena, d: {
+            var d = entry;
+            d.atom = @intCast(atoms.items.len);
+            break :d d;
+        });
+        try atoms.append(arena, atom);
+        if (i == dup) {
+            var d = entry;
+            d.atom = @intCast(atoms.items.len);
+            try debug.append(arena, d);
+            try atoms.append(arena, atom);
+        }
+        if (i % 7 == 0) try atoms.append(arena, .{ .key = fkey("helper", i), .name = "helper", .section = .text, .alignment = .@"4", .bytes = &.{ 0xc0, 0x03, 0x5f, 0xd6 } });
+    }
+
+    const options: Options = .{ .entry = main, .identifier = "prog", .debug = debug.items, .comp_dir = "/w" };
+    const one = try emitWithDsym(gpa, io, atoms.items, o: {
+        var o = options;
+        o.threads = 1;
+        break :o o;
+    });
+    defer gpa.free(one.exe);
+    defer gpa.free(one.dsym);
+    const four = try emitWithDsym(gpa, io, atoms.items, o: {
+        var o = options;
+        o.threads = 4;
+        break :o o;
+    });
+    defer gpa.free(four.exe);
+    defer gpa.free(four.dsym);
+    try std.testing.expectEqualSlices(u8, one.exe, four.exe);
+    try std.testing.expectEqualSlices(u8, one.dsym, four.dsym);
+    const plain = try emit(gpa, io, atoms.items, options);
+    defer gpa.free(plain);
+    try std.testing.expectEqualSlices(u8, one.exe, plain);
+    const stripped = try emit(gpa, io, atoms.items, o: {
+        var o = options;
+        o.debug = &.{};
+        break :o o;
+    });
+    defer gpa.free(stripped);
+    try std.testing.expect(testMachOSection(stripped, "__unwind_info") == null);
+
+    // `link` writes the same files, the DWARF one where std.debug and lldb
+    // look for it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try link(gpa, io, tmp.dir, "prog", atoms.items, options);
+    const written = try tmp.dir.readFileAlloc(io, "prog", gpa, .unlimited);
+    defer gpa.free(written);
+    try std.testing.expectEqualSlices(u8, one.exe, written);
+    const written_dsym = try tmp.dir.readFileAlloc(io, "prog.dSYM/Contents/Resources/DWARF/prog", gpa, .unlimited);
+    defer gpa.free(written_dsym);
+    try std.testing.expectEqualSlices(u8, one.dsym, written_dsym);
+    const path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/prog", .{tmp.sub_path});
+    if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
+        const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
+        defer gpa.free(result.stdout);
+        defer gpa.free(result.stderr);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = @truncate(n) }, result.term);
+    }
+
+    // std.debug finds the dSYM by the executable's UUID and resolves
+    // functions in every debug chunk to their names and rows; the second
+    // instruction of each is on line i + 2, column 5.
+    const di_gpa = std.debug.getDebugInfoAllocator();
+    var mf = try std.debug.MachOFile.load(di_gpa, io, path, .aarch64);
+    defer mf.deinit(di_gpa);
+    for ([_]usize{ 0, 9, 997, 2047, 2048, 3001, dup, n - 1 }) |index| {
+        const name = try std.fmt.allocPrint(arena, "f{d}", .{index});
+        const addr = testMachOSymbol(one.exe, name).?;
+        const body = addr + if (naked(index)) 0 else @as(u64, 8);
+        const dwarf, const vaddr = try mf.getDwarfForAddress(di_gpa, io, body);
+        try std.testing.expectEqual(body, vaddr);
+        var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+        try dwarf.getSymbols(arena, arena, .little, vaddr, false, &symbols);
+        const loc = symbols.items[0].source_location.?;
+        try std.testing.expectEqualStrings(name, symbols.items[0].name.?);
+        try std.testing.expectEqual(index + 2, loc.line);
+        try std.testing.expectEqual(5, loc.column);
+        const file = files[index / 1000 % files.len];
+        try std.testing.expectEqualStrings(if (file[0] == '/') file else try std.fmt.allocPrint(arena, "/w/{s}", .{file}), loc.file_name);
+    }
+
+    // Each function's code has its frame's encoding, and code without
+    // debug info none, looked up as std.debug's unwinder does.
+    const frame: u32 = 0x0400_0000;
+    const main_addr = testMachOSymbol(one.exe, "_main").?;
+    try std.testing.expectEqual(0, testUnwindEncoding(one.exe, main_addr + 4).?);
+    for (0..n) |index| {
+        const name = try std.fmt.allocPrint(arena, "f{d}", .{index});
+        const addr = testMachOSymbol(one.exe, name).?;
+        const expected: u32 = if (naked(index)) 0 else frame;
+        try std.testing.expectEqual(expected, testUnwindEncoding(one.exe, addr).?);
+        try std.testing.expectEqual(expected, testUnwindEncoding(one.exe, addr + if (naked(index)) 4 else @as(u64, 8)).?);
+        if (index % 7 == 0) {
+            // The helper after it, which starts at the next 4-byte boundary.
+            const helper = addr + atoms.items[debug.items[index + @intFromBool(index > dup)].atom].bytes.len;
+            try std.testing.expectEqual(0, testUnwindEncoding(one.exe, helper).?);
+        }
+    }
+    const text_sect = testMachOSection(one.exe, "__text").?;
+    try std.testing.expectEqual(null, testUnwindEncoding(one.exe, text_sect.addr + text_sect.size));
+}
+
+fn testMachOSection(bytes: []const u8, name: []const u8) ?macho.section_64 {
+    const hdr = std.mem.bytesToValue(macho.mach_header_64, bytes[0..@sizeOf(macho.mach_header_64)]);
+    var at: usize = @sizeOf(macho.mach_header_64);
+    for (0..hdr.ncmds) |_| {
+        const lc = std.mem.bytesToValue(macho.load_command, bytes[at..][0..@sizeOf(macho.load_command)]);
+        if (lc.cmd == .SEGMENT_64) {
+            const seg = std.mem.bytesToValue(macho.segment_command_64, bytes[at..][0..@sizeOf(macho.segment_command_64)]);
+            for (0..seg.nsects) |i| {
+                const sect = std.mem.bytesToValue(macho.section_64, bytes[at + @sizeOf(macho.segment_command_64) + i * @sizeOf(macho.section_64) ..][0..@sizeOf(macho.section_64)]);
+                if (std.mem.eql(u8, sect.sectName(), name)) return sect;
+            }
+        }
+        at += lc.cmdsize;
+    }
+    return null;
+}
+
+fn testMachOSymbol(bytes: []const u8, name: []const u8) ?u64 {
+    const hdr = std.mem.bytesToValue(macho.mach_header_64, bytes[0..@sizeOf(macho.mach_header_64)]);
+    var at: usize = @sizeOf(macho.mach_header_64);
+    for (0..hdr.ncmds) |_| {
+        const lc = std.mem.bytesToValue(macho.load_command, bytes[at..][0..@sizeOf(macho.load_command)]);
+        if (lc.cmd == .SYMTAB) {
+            const st = std.mem.bytesToValue(macho.symtab_command, bytes[at..][0..@sizeOf(macho.symtab_command)]);
+            for (0..st.nsyms) |i| {
+                const sym = std.mem.bytesToValue(macho.nlist_64, bytes[st.symoff + i * @sizeOf(macho.nlist_64) ..][0..@sizeOf(macho.nlist_64)]);
+                if (std.mem.eql(u8, std.mem.sliceTo(bytes[st.stroff + sym.n_strx ..], 0), name)) return sym.n_value;
+            }
+        }
+        at += lc.cmdsize;
+    }
+    return null;
+}
+
+/// The compact unwind encoding of the code at `addr`, found the way
+/// std.debug.SelfInfo's Mach-O unwinder finds it (0: no unwind info), or
+/// null if the index says there is none.
+fn testUnwindEncoding(bytes: []const u8, addr: u64) ?u32 {
+    const sect = testMachOSection(bytes, "__unwind_info").?;
+    const info = bytes[sect.offset..][0..sect.size];
+    const header = std.mem.bytesToValue(macho.unwind_info_section_header, info[0..@sizeOf(macho.unwind_info_section_header)]);
+    const indices = std.mem.bytesAsSlice(macho.unwind_info_section_header_index_entry, info[header.indexSectionOffset..][0 .. header.indexCount * @sizeOf(macho.unwind_info_section_header_index_entry)]);
+    const pc = addr - base_address;
+    var left: usize = 0;
+    var len: usize = indices.len;
+    while (len > 1) {
+        const mid = left + len / 2;
+        if (pc < indices[mid].functionOffset) {
+            len /= 2;
+        } else {
+            left = mid;
+            len -= len / 2;
+        }
+    }
+    const start = indices[left].secondLevelPagesSectionOffset;
+    if (start == 0) return null;
+    const page = std.mem.bytesToValue(macho.unwind_info_regular_second_level_page_header, info[start..][0..@sizeOf(macho.unwind_info_regular_second_level_page_header)]);
+    std.debug.assert(page.kind == .REGULAR and page.entryCount > 0);
+    const entries = std.mem.bytesAsSlice(macho.unwind_info_regular_second_level_entry, info[start + page.entryPageOffset ..][0 .. page.entryCount * @sizeOf(macho.unwind_info_regular_second_level_entry)]);
+    left = 0;
+    len = entries.len;
+    while (len > 1) {
+        const mid = left + len / 2;
+        if (pc < entries[mid].functionOffset) {
+            len /= 2;
+        } else {
+            left = mid;
+            len -= len / 2;
+        }
+    }
+    return entries[left].encoding;
 }
