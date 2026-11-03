@@ -117,7 +117,8 @@ pub fn finish(emit: *Emit) !bool {
 
     var entry: ?SymbolKey = null;
     for (zcu.exports.items) |e| {
-        const nav = ip.getNav(e.nav);
+        if (e.target != .nav) continue;
+        const nav = ip.getNav(e.target.nav);
         if (nav.status != .resolved) continue;
         if (std.mem.eql(u8, ip.stringSlice(e.name), "_start") and ip.indexToKey(nav.val) == .func) {
             entry = try emit.funcKey(nav.val);
@@ -180,9 +181,13 @@ fn lowerExternSlots(emit: *Emit) !bool {
     for (emit.externs.keys(), emit.externs.values()) |name, weak| {
         const target: ?SymbolKey = for (zcu.exports.items) |x| {
             if (!std.mem.eql(u8, ip.stringSlice(x.name), name)) continue;
-            const nav = ip.getNav(x.nav);
+            const x_nav = switch (x.target) {
+                .nav => |n| n,
+                .uav => |v| break try emit.uavKey(v),
+            };
+            const nav = ip.getNav(x_nav);
             if (nav.status != .resolved) continue;
-            break if (ip.indexToKey(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x.nav);
+            break if (ip.indexToKey(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x_nav);
         } else if (try zcu.requestCompilerRtExport(name)) |key| .fromName(key) else null;
         if (target == null and !weak) {
             try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});

@@ -59,7 +59,11 @@ errors: std.ArrayList(ErrorMsg) = .empty,
 arena: std.heap.ArenaAllocator,
 
 pub const Export = struct {
-    nav: InternPool.NavIndex,
+    target: union(enum) {
+        nav: InternPool.NavIndex,
+        /// An anonymous constant, as in `@export(&comptime_value, ...)`.
+        uav: InternPool.Index,
+    },
     name: InternPool.String,
 };
 
@@ -367,7 +371,7 @@ pub fn createContainerType(
         switch (d.kind) {
             .@"const", .@"var" => {
                 try zcu.namespaces.items[ns_index].decls.put(zcu.gpa, ip.getNav(nav).name, nav);
-                if (d.linkage == .@"export") try zcu.exports.append(zcu.gpa, .{ .nav = nav, .name = ip.getNav(nav).name });
+                if (d.linkage == .@"export") try zcu.exports.append(zcu.gpa, .{ .target = .{ .nav = nav }, .name = ip.getNav(nav).name });
             },
             else => {
                 // Upstream's filter semantics: unnamed tests always run;
@@ -565,10 +569,14 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
         if (done_exports < zcu.exports.items.len) {
             const e = zcu.exports.items[done_exports];
             done_exports += 1;
-            zcu.ensureNavVal(e.nav) catch |err| switch (err) {
+            if (e.target != .nav) continue;
+            zcu.ensureNavVal(e.target.nav) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => {},
+                else => continue,
             };
+            // An exported function is emitted whether or not it is called.
+            const val = zcu.ip.getNav(e.target.nav).val;
+            if (zcu.ip.indexToKey(val) == .func) try zcu.queueFunc(val);
             continue;
         }
         if (done_tests < zcu.test_functions.items.len) {

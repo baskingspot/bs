@@ -128,7 +128,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const nav = ip.getNav(func.owner_nav);
     var name = try emit.unitName(.{ .func = ir.func });
     for (emit.zcu.exports.items) |x| {
-        if (x.nav == func.owner_nav and func.generic_owner == .none) name = ip.stringSlice(x.name);
+        if (x.target == .nav and x.target.nav == func.owner_nav and func.generic_owner == .none) name = ip.stringSlice(x.name);
     }
     const file = emit.zcu.file(nav.file);
     const debug: Atom.Debug = .{

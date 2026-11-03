@@ -287,8 +287,11 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     if (decl.linkage == .@"extern") {
         // `extern fn name(...) T;`: defined by an export of `name`, which
         // calls reach through a slot the linker fills (see `extern_ptr`).
-        if (Type.class(sema.ip, decl_ty) != .@"fn") return sema.failUnsupported(&block, src, "extern variables");
-        nav.val = try sema.intern(.{ .extern_func = .{ .name = nav.name, .ty = decl_ty, .is_weak = false } });
+        // An extern variable has no value; `navRef` reaches it the same way.
+        nav.val = if (Type.class(sema.ip, decl_ty) == .@"fn")
+            try sema.intern(.{ .extern_func = .{ .name = nav.name, .ty = decl_ty, .is_weak = false } })
+        else
+            try sema.undefValue(decl_ty);
         nav.ty = decl_ty;
         return sema.finish();
     }
@@ -3262,7 +3265,7 @@ fn zirDeclVal(sema: *Sema, block: *Block, inst: Zir.Inst.Index, is_ref: bool) Co
 fn navVal(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) CompileError!Ref {
     try sema.ensureNavVal(block, src, nav_index);
     const nav = sema.ip.getNav(nav_index);
-    if (nav.is_const) return .fromInterned(nav.val);
+    if (nav.is_const and !isExternVar(sema.ip, nav)) return .fromInterned(nav.val);
     return sema.analyzeLoad(block, src, try sema.navRef(block, src, nav_index));
 }
 
@@ -3273,7 +3276,16 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     // An explicit alignment shows in the pointer type, as upstream.
     const alignment: u6 = if (nav.alignment == 0 or sema.naturalAlignment(nav.ty) == nav.alignment) 0 else @intCast(std.math.log2_int(u64, nav.alignment) + 1);
     const ptr_ty = try sema.ptrType(.{ .child = nav.ty, .flags = .{ .is_const = nav.is_const, .alignment = alignment } });
+    // The address of an extern variable or function is known at link time.
+    if (nav.linkage == .@"extern") {
+        if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
+        return sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(nav.name) } } });
+    }
     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .nav = nav_index } } }));
+}
+
+fn isExternVar(ip: *const InternPool, nav: *const InternPool.Nav) bool {
+    return nav.linkage == .@"extern" and ip.indexToKey(nav.val) != .extern_func;
 }
 
 /// `@export(&decl, .{ .name = ... })`: exports a declaration under a symbol
@@ -3295,7 +3307,10 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     const name = try sema.resolveConstString(block, src, .fromInterned(name_val));
     const nav_index = switch (ip.indexToKey(ptr_val).ptr.base) {
         .nav => |n| n,
-        .uav => return sema.failUnsupported(block, src, "exporting anonymous values"),
+        .uav => |v| {
+            try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .uav = v.val }, .name = try sema.getString(name) });
+            return;
+        },
         else => return sema.fail(block, src, "export target must be a global variable or a comptime-known constant", .{}),
     };
     try sema.ensureNavVal(block, src, nav_index);
@@ -3305,7 +3320,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
         else => nav_index,
     };
     if (ip.indexToKey(val) == .func) try sema.zcu.queueFunc(val);
-    try sema.zcu.exports.append(sema.gpa, .{ .nav = export_nav, .name = try sema.getString(name) });
+    try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name) });
 }
 
 /// `@extern(T, .{ .name = ... })`: the address of a symbol defined
