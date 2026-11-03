@@ -129,3 +129,30 @@ min–max and standard deviation; CPU is user+sys of the process tree; peak RSS
 is the largest single process in the tree, from `wait4`. In-process
 incremental rows time each update from the protocol message to the end of the
 compiler's reply, and their RSS and CPU cover the whole session.
+
+## Run-time benchmarks
+
+`bench/runtime.py` times the code zap generates. It builds each program in
+[`runtime/`](runtime/) with zap and with upstream zig 0.17.0 in Debug
+(self-hosted x86_64 backend) and ReleaseSafe (LLVM), checks that the three
+binaries print the same output, and reports the median wall time of each.
+Every program reads its problem size from an exported variable, so no
+compiler folds the work away.
+
+| Program | What it exercises |
+|---|---|
+| fib | recursive calls: argument passing, call overhead |
+| sieve | tight loops over a byte array with bounds checks |
+| sort | `std.mem.sort` and `std.mem.sortUnstable` on u32s: generic std code, comparator calls |
+| hash | `std.AutoHashMap(u64, u64)`: hashing, probing, growth, lookups |
+| nbody | f64 arithmetic on small structs passed by value |
+| fmt | `std.Io.Writer.print` into a buffer: formatting, interface calls |
+
+```sh
+zig build -Doptimize=ReleaseFast
+python3 bench/runtime.py --compiler zig-out/bin/zap --machine-note "Amp orb, 4 vCPU"
+```
+
+Options: `--programs fib,sort`, `--runs`, `--no-upstream` (zap only),
+`--zig PATH`, `--out PATH` (without extension). Baseline before the
+optimizing backend: [`results/2026-11-03-runtime-zap-8fe40fe.md`](results/2026-11-03-runtime-zap-8fe40fe.md).
