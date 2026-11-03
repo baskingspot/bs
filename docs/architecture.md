@@ -558,9 +558,11 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   (as dsymutil and upstream Zig write them), and a __DWARF segment, which
   also holds a .debug_aranges set per unit with its ranges: lldb trusts a dSYM's
   aranges to be complete (dsymutil always writes them) and maps no address
-  to a unit without them. lldb shows no Function for DW_LANG_Zig units (it
-  has no Zig type system); upstream's self-hosted backend has the same
-  limit, and its LLVM backend writes DW_LANG_C99. zap keeps DW_LANG_Zig.
+  to a unit without them. lldb shows no Function, inlined frames, or
+  breakpoint file:line for DW_LANG_Zig units (it has no Zig type system),
+  so dSYM units are DW_LANG_C99, as upstream's macOS Debug default (the
+  LLVM backend) writes them; ELF units stay DW_LANG_Zig, as upstream's
+  Linux default (the self-hosted backend) writes them, and gdb reads.
   std.debug (MachOFile looks for exactly this path and checks the UUID)
   and lldb read it; neither reads DWARF inside the executable, and a debug
   map of N_OSO stabs would need object files. The dSYM is a new file each

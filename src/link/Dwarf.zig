@@ -115,10 +115,11 @@ pub const range_len = 11;
 pub const aranges_tuple_len = 16;
 
 /// Places the chunks' parts, builds the units' file tables, and builds
-/// their headers, whose ranges are relative to `text_addr`. Within each
+/// their headers, whose ranges are relative to `text_addr` and whose
+/// units have DW_AT_language `language`. Within each
 /// section, units follow one another in first-use order, and a unit's
 /// parts from each chunk follow its header in chunk order.
-pub fn place(gpa: Allocator, chunks: []Chunk, comp_dir: []const u8, text_addr: u64) Allocator.Error!Dwarf {
+pub fn place(gpa: Allocator, chunks: []Chunk, comp_dir: []const u8, text_addr: u64, language: u16) Allocator.Error!Dwarf {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -227,7 +228,7 @@ pub fn place(gpa: Allocator, chunks: []Chunk, comp_dir: []const u8, text_addr: u
         w.writeInt(u32, 0, .little) catch unreachable; // debug_abbrev_offset
         w.writeByte(abbrev_cu) catch unreachable;
         w.writeInt(u32, 0, .little) catch unreachable; // producer, at the start of `str`
-        w.writeInt(u16, DW.LANG.Zig, .little) catch unreachable;
+        w.writeInt(u16, language, .little) catch unreachable;
         w.writeAll(u.name) catch unreachable;
         w.writeByte(0) catch unreachable;
         w.writeAll(u.dir) catch unreachable;

@@ -47,6 +47,10 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Atom = @import("Atom.zig");
 const Dwarf = @import("Dwarf.zig");
+/// DW_AT_language of the compile units: C99, as upstream's LLVM backend
+/// (its macOS Debug default) writes it, since lldb has no Zig type system
+/// and shows no functions or inlined frames for DW_LANG_Zig units.
+const dwarf_language = std.dwarf.LANG.C99;
 const Elf = @import("Elf.zig");
 const SymbolKey = Atom.SymbolKey;
 const SymbolTable = Elf.SymbolTable;
@@ -571,7 +575,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer dwarf.deinit(gpa);
     var dsym_layout: DsymLayout = undefined;
     if (has_dsym) {
-        dwarf = try .place(gpa, debug_chunks, options.comp_dir, base + starts[text]);
+        dwarf = try .place(gpa, debug_chunks, options.comp_dir, base + starts[text], dwarf_language);
         var segs_size: u32 = @sizeOf(macho.segment_command_64); // __PAGEZERO
         for (seg_present, seg_nsects) |p, n| if (p) {
             segs_size += @sizeOf(macho.segment_command_64) + n * @sizeOf(macho.section_64);

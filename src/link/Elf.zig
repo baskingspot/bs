@@ -44,6 +44,9 @@ const elf = std.elf;
 const Allocator = std.mem.Allocator;
 const Atom = @import("Atom.zig");
 const Dwarf = @import("Dwarf.zig");
+/// DW_AT_language of the compile units: Zig, as upstream's self-hosted
+/// backend (its Linux Debug default) writes it, which gdb reads.
+const dwarf_language = std.dwarf.LANG.Zig;
 const SymbolKey = Atom.SymbolKey;
 const Elf = @This();
 
@@ -608,7 +611,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     // Place the debug chunks, and build the file and unit tables from their
     // files and units in first-use order.
-    var dwarf: Dwarf = try .place(gpa, debug_chunks, options.comp_dir, base + starts[text]);
+    var dwarf: Dwarf = try .place(gpa, debug_chunks, options.comp_dir, base + starts[text], dwarf_language);
     defer dwarf.deinit(gpa);
     const has_debug = dwarf.present();
 
