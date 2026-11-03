@@ -9160,11 +9160,11 @@ fn bitCastBits(sema: *Sema, ty: Index) ?u64 {
     // Covers `usize` and the other named integer types too.
     if (Type.isInt(ip, ty)) return Type.intInfo(ip, ty).bits;
     return switch (ip.indexToKey(ty)) {
+        // A sentinel is part of the array's bits.
         .array_type => |a| blk: {
-            if (a.sentinel != .none) break :blk null;
             const eb = sema.bitCastBits(a.child) orelse break :blk null;
             if (eb != Type.abiSize(ip, a.child) * 8) break :blk null;
-            break :blk eb * a.len;
+            break :blk eb * (a.len + @intFromBool(a.sentinel != .none));
         },
         // Bool vectors are bit-packed in memory too; other elements must
         // fill their bytes.
@@ -9188,7 +9188,9 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) Allocator.Error!v
         .array => {
             const child = Type.childType(ip, ty);
             const eb = sema.bitCastBits(child).?;
-            for (0..ip.indexToKey(ty).array_type.len) |i| try sema.valueBits(try sema.elemValue(v, i), out, offset + i * eb);
+            const a = ip.indexToKey(ty).array_type;
+            // `elemValue` at `len` is the sentinel.
+            for (0..a.len + @intFromBool(a.sentinel != .none)) |i| try sema.valueBits(try sema.elemValue(v, i), out, offset + i * eb);
             return;
         },
         .vector => {
@@ -9236,8 +9238,11 @@ fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) 
         .array => {
             const child = Type.childType(ip, ty);
             const eb = sema.bitCastBits(child).?;
-            const elems = try sema.arena.alloc(Index, @intCast(ip.indexToKey(ty).array_type.len));
-            for (elems, 0..) |*e, i| e.* = try sema.bitsValue(child, bits, offset + i * eb);
+            const a = ip.indexToKey(ty).array_type;
+            // The sentinel's bits are ignored; the aggregate stores it last.
+            const elems = try sema.arena.alloc(Index, @intCast(a.lenIncludingSentinel()));
+            for (elems[0..@intCast(a.len)], 0..) |*e, i| e.* = try sema.bitsValue(child, bits, offset + i * eb);
+            if (a.sentinel != .none) elems[@intCast(a.len)] = a.sentinel;
             return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
         },
         .vector => {
