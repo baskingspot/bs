@@ -162,10 +162,32 @@ const InstMap = struct {
 
 const ComptimeAlloc = struct {
     ty: Index,
+    /// The variable's value; out of date while `mut` has newer stores (read
+    /// it through `allocValue`).
     val: Index,
     is_const: bool,
     /// An explicit `align(n)` of an inferred-type variable, or 0.
     alignment: u64 = 0,
+    /// The value as a tree that stores to fields and elements write in
+    /// place, once one has (see `MutValue`); null until then and after the
+    /// whole variable is stored to.
+    mut: ?*MutValue = null,
+};
+
+/// A comptime variable's value while code stores to its fields and
+/// elements: aggregates whose elements are interned values or nested
+/// trees. A store replaces one leaf instead of re-interning every
+/// aggregate on its path, which made filling an n-element array O(n²);
+/// the tree is interned when the variable is read as a whole, and each
+/// aggregate caches its interned value until a store below it.
+const MutValue = union(enum) {
+    val: Index,
+    agg: struct {
+        ty: Index,
+        elems: []MutValue,
+        /// The interned value, or `.none` after a store below.
+        interned: Index,
+    },
 };
 
 const InferredAlloc = struct {
@@ -2197,12 +2219,13 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             // address.
             if (sema.resolveValue(ptr)) |pv| if (sema.ip.indexToKey(pv) == .ptr) {
                 const k = sema.ip.indexToKey(pv).ptr;
-                if (k.base == .comptime_alloc and k.byte_offset == 0) if (sema.comptime_allocs.get(k.base.comptime_alloc)) |alloc| {
-                    if (!sema.refersToComptimeAlloc(alloc.val)) {
+                if (k.base == .comptime_alloc and k.byte_offset == 0) if (sema.comptime_allocs.getPtr(k.base.comptime_alloc)) |alloc| {
+                    const alloc_val = try sema.allocValue(alloc);
+                    if (!sema.refersToComptimeAlloc(alloc_val)) {
                         var info = Type.ptrInfo(sema.ip, k.ty);
                         info.flags.is_const = true;
                         const const_ty = try sema.ptrType(info);
-                        break :blk .fromInterned(try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = alloc.val, .orig_ty = const_ty } } } }));
+                        break :blk .fromInterned(try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = alloc_val, .orig_ty = const_ty } } } }));
                     }
                 };
             };
@@ -7318,7 +7341,7 @@ fn foldConstAlloc(sema: *Sema, block: *Block, src: Src, alloc: Ir.Inst.Index) Co
             else => return err,
         };
     }
-    const val = sema.comptime_allocs.get(id).?.val;
+    const val = try sema.allocValue(sema.comptime_allocs.getPtr(id).?);
     var info = Type.ptrInfo(ip, ptr_ty);
     info.flags.is_const = true;
     const const_ty = try sema.ptrType(info);
@@ -7376,6 +7399,7 @@ fn zirStoreToInferredPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compi
         const val = try sema.resolveConstValue(block, src, operand, "value stored to a comptime variable must be comptime-known");
         alloc.ty = sema.ip.typeOf(val);
         alloc.val = val;
+        alloc.mut = null;
         return;
     }
     const ia = sema.inferred_allocs.getPtr(ptr.toIndex().?).?;
@@ -7677,10 +7701,12 @@ fn sliceToArrayPtr(sema: *Sema, block: *Block, src: Src, slice: Index) CompileEr
 // ---------------------------------------------------------------------------
 // Comptime memory
 //
-// Comptime-mutable memory is a set of allocations, each holding one interned
-// value. Pointers into them are interned `ptr` values whose base is
+// Comptime-mutable memory is a set of allocations, each holding one value.
+// Pointers into them are interned `ptr` values whose base is
 // `comptime_alloc` (possibly through `field`/`elem` derivations). A store
-// rebuilds the aggregate along the pointer's path.
+// through a plain field/element path writes in place into the allocation's
+// `MutValue` tree, which is interned when the value is read as a whole;
+// other stores (byte offsets, reinterpretation) rebuild the interned value.
 
 fn createComptimeAlloc(sema: *Sema, ty: Index, is_const: bool) !Index {
     const id = sema.ip.next_comptime_alloc.fetchAdd(1, .monotonic);
@@ -7691,6 +7717,195 @@ fn createComptimeAlloc(sema: *Sema, ty: Index, is_const: bool) !Index {
     });
     const ptr_ty = try sema.ptrType(.{ .child = if (ty == .none) .generic_poison_type else ty });
     return sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .comptime_alloc = id } } });
+}
+
+/// The current value of a comptime variable, interning its tree of
+/// in-place stores if it has newer ones.
+fn allocValue(sema: *Sema, alloc: *ComptimeAlloc) !Index {
+    if (alloc.mut) |m| alloc.val = try sema.mutIntern(m);
+    return alloc.val;
+}
+
+fn mutIntern(sema: *Sema, m: *MutValue) !Index {
+    switch (m.*) {
+        .val => |v| return v,
+        .agg => |*a| {
+            if (a.interned != .none) return a.interned;
+            const elems = try sema.arena.alloc(Index, a.elems.len);
+            for (elems, a.elems) |*e, *me| e.* = try sema.mutIntern(me);
+            a.interned = try sema.intern(.{ .aggregate = .{ .ty = a.ty, .storage = .{ .elems = elems } } });
+            return a.interned;
+        },
+    }
+}
+
+fn mutType(sema: *Sema, m: *const MutValue) Index {
+    return switch (m.*) {
+        .val => |v| sema.ip.typeOf(v),
+        .agg => |a| a.ty,
+    };
+}
+
+/// One step of a pointer from a comptime variable to a part of it.
+const MutStep = struct { index: u64, base_ptr_ty: Index, is_elem: bool };
+
+/// The steps of comptime pointer `ptr` from the comptime variable it points
+/// into, root first, if every step is a plain field or element (no byte
+/// offsets) and there are at most `max` of them.
+fn mutPath(sema: *Sema, ptr: Index, buf: []MutStep) ?struct { id: u32, steps: []MutStep } {
+    const ip = sema.ip;
+    var n: usize = 0;
+    var p = ptr;
+    while (true) {
+        const k = ip.indexToKey(p).ptr;
+        if (k.byte_offset != 0) return null;
+        switch (k.base) {
+            .comptime_alloc => |id| {
+                std.mem.reverse(MutStep, buf[0..n]);
+                return .{ .id = id, .steps = buf[0..n] };
+            },
+            .field => |f| {
+                if (n == buf.len) return null;
+                buf[n] = .{ .index = f.index, .base_ptr_ty = ip.typeOf(f.base), .is_elem = false };
+                p = f.base;
+            },
+            .elem => |e| {
+                if (n == buf.len) return null;
+                buf[n] = .{ .index = e.index, .base_ptr_ty = ip.typeOf(e.base), .is_elem = true };
+                p = e.base;
+            },
+            else => return null,
+        }
+        n += 1;
+    }
+}
+
+/// Whether a step into a value of type `ty` stays within it the way
+/// `comptimeLoadStructural` and `comptimeStore` read and write it without
+/// reinterpreting, and whether the tree can hold `ty` as an aggregate.
+fn mutStepOk(sema: *Sema, ty: Index, st: MutStep, store: bool) enum { no, leaf_only, agg } {
+    const ip = sema.ip;
+    if (ty != Type.ptrInfo(ip, st.base_ptr_ty).child) return .no;
+    return switch (ip.indexToKey(ty)) {
+        .array_type => |a| if (!st.is_elem) .no else if (st.index < a.len) .agg else if (!store and st.index < a.lenIncludingSentinel()) .leaf_only else .no,
+        .vector_type => |v| if (st.is_elem and st.index < v.len) .agg else .no,
+        .struct_type, .tuple_type => if (st.is_elem) .no else .agg,
+        // The general path checks the active field (an extern union's
+        // other fields read its bytes).
+        .union_type => .no,
+        else => if (st.is_elem) .no else .leaf_only,
+    };
+}
+
+/// A load through `ptr` from a comptime variable that has a tree of
+/// in-place stores, without interning the tree; null if `ptr` takes a
+/// step the tree does not model, for the general path to handle.
+fn mutLoad(sema: *Sema, ptr: Index) !?Index {
+    var buf: [16]MutStep = undefined;
+    const path = sema.mutPath(ptr, &buf) orelse return null;
+    const alloc = sema.comptime_allocs.getPtr(path.id) orelse return null;
+    var node: ?*MutValue = alloc.mut orelse return null;
+    var cur: Index = .none;
+    for (path.steps, 0..) |st, i| {
+        const ty = if (node) |n| sema.mutType(n) else sema.ip.typeOf(cur);
+        switch (sema.mutStepOk(ty, st, false)) {
+            .no => return null,
+            .leaf_only => if (i + 1 != path.steps.len) return null,
+            .agg => {},
+        }
+        // A subarray load (`arr[a..b]` with comptime-known bounds).
+        if (st.is_elem and i + 1 == path.steps.len and sema.ip.indexToKey(ty) == .array_type and
+            Type.ptrInfo(sema.ip, sema.ip.typeOf(ptr)).child != sema.ip.indexToKey(ty).array_type.child) return null;
+        if (node) |n| switch (n.*) {
+            // An array's sentinel, which the tree has no element for.
+            .agg => |a| if (st.index >= a.elems.len) {
+                node = null;
+                cur = try sema.elemValue(try sema.mutIntern(n), st.index);
+            } else {
+                const child = &a.elems[@intCast(st.index)];
+                switch (child.*) {
+                    .agg => node = child,
+                    .val => |v| {
+                        node = null;
+                        cur = v;
+                    },
+                }
+            },
+            .val => |v| {
+                node = null;
+                cur = try sema.elemValue(v, st.index);
+            },
+        } else cur = try sema.elemValue(cur, st.index);
+    }
+    return if (node) |n| try sema.mutIntern(n) else cur;
+}
+
+/// A store of `val` through `ptr` into a comptime variable, in place in
+/// the variable's tree (made on the first such store); false if `ptr`
+/// takes a step the tree does not model, for the general path to handle.
+fn mutStore(sema: *Sema, ptr: Index, val: Index) !bool {
+    const ip = sema.ip;
+    var buf: [16]MutStep = undefined;
+    const path = sema.mutPath(ptr, &buf) orelse return false;
+    if (path.steps.len == 0) return false;
+    const alloc = sema.comptime_allocs.getPtr(path.id) orelse return false;
+    if (alloc.val == .none and alloc.mut == null) return false;
+    // Check the whole path before changing anything.
+    {
+        var ty = if (alloc.mut) |m| sema.mutType(m) else ip.typeOf(alloc.val);
+        for (path.steps, 0..) |st, i| {
+            switch (sema.mutStepOk(ty, st, true)) {
+                .no => return false,
+                .leaf_only => if (i + 1 != path.steps.len) return false,
+                .agg => {},
+            }
+            ty = sema.elemTypeOf(ty, st.index);
+        }
+        const last = path.steps[path.steps.len - 1];
+        if (last.is_elem and ip.typeOf(val) != ty) return false;
+    }
+    if (alloc.mut == null) {
+        const m = try sema.arena.create(MutValue);
+        m.* = .{ .val = alloc.val };
+        alloc.mut = m;
+    }
+    var node = alloc.mut.?;
+    for (path.steps, 0..) |st, i| {
+        if (i + 1 == path.steps.len and sema.mutStepOk(sema.mutType(node), st, true) == .leaf_only) {
+            // A field of an optional, error union, or slice: rebuild
+            // that one small value.
+            const v = try sema.mutIntern(node);
+            node.* = .{ .val = try sema.withElem(v, st.index, val) };
+            break;
+        }
+        if (node.* == .val) {
+            const v = node.val;
+            const elems = try sema.aggregateElems(v);
+            const mut_elems = try sema.arena.alloc(MutValue, elems.len);
+            for (mut_elems, elems) |*me, e| me.* = .{ .val = e };
+            node.* = .{ .agg = .{ .ty = ip.typeOf(v), .elems = mut_elems, .interned = .none } };
+        }
+        node.agg.interned = .none;
+        node = &node.agg.elems[@intCast(st.index)];
+        if (i + 1 == path.steps.len) node.* = .{ .val = val };
+    }
+    return true;
+}
+
+/// The type of element or field `index` of a value of type `ty`, as
+/// `elemValue` steps.
+fn elemTypeOf(sema: *Sema, ty: Index, index: u64) Index {
+    const ip = sema.ip;
+    return switch (ip.indexToKey(ty)) {
+        .array_type => |a| if (index == a.len and a.sentinel != .none) a.child else a.child,
+        .vector_type => |v| v.child,
+        .struct_type => ip.structInfo(ty).field_types[@intCast(index)],
+        .tuple_type => |t| t.types[@intCast(index)],
+        .opt_type => |c| c,
+        .error_union_type => |e| e.payload_type,
+        .union_type => ip.structInfo(ty).field_types[@intCast(index)],
+        else => .none,
+    };
 }
 
 const PtrRoot = enum { comptime_alloc, uav, nav, int };
@@ -7846,9 +8061,9 @@ fn comptimeLoadStructural(sema: *Sema, block: *Block, src: Src, ptr: Index) Comp
     };
     return switch (key.base) {
         .comptime_alloc => |id| blk: {
-            const alloc = sema.comptime_allocs.get(id) orelse
+            const alloc = sema.comptime_allocs.getPtr(id) orelse
                 return sema.fail(block, src, "comptime variable is not accessible here", .{});
-            break :blk try sema.loadAtOffset(alloc.val, key);
+            break :blk try sema.loadAtOffset(try sema.allocValue(alloc), key);
         },
         .uav => |u| try sema.loadAtOffset(u.val, key),
         .nav => |n| blk: {
@@ -7859,6 +8074,7 @@ fn comptimeLoadStructural(sema: *Sema, block: *Block, src: Src, ptr: Index) Comp
         },
         .int => null,
         .field => |f| blk: {
+            if (try sema.mutLoad(ptr)) |v| break :blk v;
             if (key.byte_offset != 0) return sema.reinterpretLoad(block, src, ptr);
             const parent = (try sema.comptimeLoadStructural(block, src, f.base)) orelse break :blk null;
             const parent_ty = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
@@ -7875,6 +8091,7 @@ fn comptimeLoadStructural(sema: *Sema, block: *Block, src: Src, ptr: Index) Comp
             break :blk try sema.fieldValue(parent, @intCast(f.index));
         },
         .elem => |e| blk: {
+            if (try sema.mutLoad(ptr)) |v| break :blk v;
             if (key.byte_offset != 0) return sema.reinterpretLoad(block, src, ptr);
             const parent = (try sema.comptimeLoadStructural(block, src, e.base)) orelse break :blk null;
             const parent_ty = Type.ptrInfo(ip, ip.typeOf(e.base)).child;
@@ -7982,14 +8199,20 @@ fn comptimeLoad(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!I
 fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) CompileError!void {
     const key = sema.ip.indexToKey(ptr).ptr;
     switch (key.base) {
+        .field, .elem => if (try sema.mutStore(ptr, val)) return,
+        else => {},
+    }
+    switch (key.base) {
         .comptime_alloc => |id| {
             const alloc = sema.comptime_allocs.getPtr(id) orelse
                 return sema.fail(block, src, "comptime variable is not accessible here", .{});
+            _ = try sema.allocValue(alloc);
             if (key.byte_offset == 0) {
                 // A store through a cast pointer writes the bytes it covers.
                 if (alloc.val != .none and !sema.childCoercibleInMemory(sema.ip.typeOf(val), sema.ip.typeOf(alloc.val)))
                     return sema.reinterpretStore(block, src, ptr, val);
                 alloc.val = val;
+                alloc.mut = null;
             } else {
                 // An element addressed by offset (through a many-pointer).
                 const ip = sema.ip;
@@ -8000,6 +8223,7 @@ fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) C
                 if (size == 0 or key.byte_offset % size != 0) return sema.reinterpretStore(block, src, ptr, val);
                 if (key.byte_offset / size >= a.len or ip.typeOf(val) != a.child) return sema.reinterpretStore(block, src, ptr, val);
                 alloc.val = try sema.withElem(alloc.val, key.byte_offset / size, val);
+                alloc.mut = null;
             }
         },
         .field => |f| {
@@ -8158,8 +8382,8 @@ fn reinterpretLoad(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileErro
 /// runtime.
 fn memRootValue(sema: *Sema, block: *Block, src: Src, base: InternPool.Ptr.BaseAddr) CompileError!?Index {
     return switch (base) {
-        .comptime_alloc => |id| (sema.comptime_allocs.get(id) orelse
-            return sema.fail(block, src, "comptime variable is not accessible here", .{})).val,
+        .comptime_alloc => |id| try sema.allocValue(sema.comptime_allocs.getPtr(id) orelse
+            return sema.fail(block, src, "comptime variable is not accessible here", .{})),
         .uav => |u| u.val,
         .nav => |n| blk: {
             try sema.ensureNavVal(block, src, n);
@@ -8274,7 +8498,7 @@ fn reinterpretStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index
         return sema.fail(block, src, "comptime variable is not accessible here", .{});
     const ip = sema.ip;
     const val_ty = ip.typeOf(val);
-    const dest_ty = ip.typeOf(alloc.val);
+    const dest_ty = ip.typeOf(try sema.allocValue(alloc));
     try sema.resolveLayout(block, src, val_ty);
     try sema.resolveLayout(block, src, dest_ty);
     const size = Type.abiSize(ip, val_ty);
@@ -8288,6 +8512,7 @@ fn reinterpretStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index
     if (!try sema.writeMemBytes(val, buf, undef)) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
     alloc.val = (try sema.spliceMem(alloc.val, @intCast(root.offset), buf, undef)) orelse
         return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+    alloc.mut = null;
 }
 
 /// `val` with the bytes from `offset` (which may start before `val`)

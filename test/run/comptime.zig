@@ -1,5 +1,5 @@
 //! exit: 7
-//! stdout: "55\n144\n25\n42\n9\n1099511627776\n2\n700\n20\n6\n5\n4\npow2\n13\n"
+//! stdout: "55\n144\n25\n42\n9\n1099511627776\n2\n700\n20\n6\n5\n4\npow2\n13\n99\n48\n3\n7\n31\n1234\n7\n500\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -39,6 +39,37 @@ fn table(comptime n: usize) [n]u32 {
 }
 
 const fib10 = fib(10);
+
+// Element and field stores into comptime memory, mixed with whole reads: a
+// value read out must not see later stores, and stores through a slice or a
+// many-pointer must land in the same memory as stores through the array.
+const Cell = struct { tag: u8, v: [3]u16, o: ?u8 = null };
+const cells = blk: {
+    var a: [4]Cell = undefined;
+    for (&a, 0..) |*c, i| {
+        c.* = .{ .tag = @intCast(i), .v = .{ 0, 0, 0 } };
+        c.v[1] = @intCast(i * 10);
+        c.v[2] = c.v[1] + 1;
+    }
+    a[2].o = 7;
+    const snap = a;
+    a[0].tag = 99;
+    a[1] = snap[3];
+    a[1].v[0] = snap[0].tag + snap[2].o.?;
+    const sl = a[3].v[1..];
+    sl[1] = 500;
+    const many: [*]u16 = &a[2].v;
+    many[0] = 1234;
+    var grid: [3][3]u8 = @splat(@splat(0));
+    for (0..3) |i| for (0..3) |j| {
+        grid[i][j] = @intCast(i * 3 + j);
+    };
+    const row = grid[1];
+    grid[2] = row;
+    grid[1][1] = 40;
+    a[0].v[0] = grid[2][1] + grid[1][1] + row[1];
+    break :blk a;
+};
 
 // A local type may name a runtime parameter's type (std.sort.upperBound).
 fn addVia(context: anytype, x: u32) u32 {
@@ -87,5 +118,13 @@ fn main() callconv(.c) noreturn {
     var ten: u32 = 10;
     _ = &ten;
     rt.printInt(addVia(ten, 3));
+    rt.printInt(cells[0].tag);
+    rt.printInt(cells[0].v[0]);
+    rt.printInt(cells[1].tag);
+    rt.printInt(cells[1].v[0]);
+    rt.printInt(cells[1].v[2]);
+    rt.printInt(cells[2].v[0]);
+    rt.printInt(cells[2].o.?);
+    rt.printInt(cells[3].v[2]);
     rt.exit(@intCast(@bitSizeOf(u7)));
 }

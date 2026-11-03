@@ -166,6 +166,10 @@ the callee's body first. Early cutoff on the set keeps such callers green.
 - Skeleton and milestone 3: Sema evaluates comptime code by walking ZIR, as
   upstream does, with a comptime memory model (comptime allocations, mutable
   comptime values, comptime pointers) owned by Sema, not smeared across it.
+  Like upstream's `MutableValue`, a comptime allocation that code stores into
+  field by field or element by element holds a mutable tree that those
+  stores write in place; it is interned only when read as a whole, so
+  filling an n-element array costs O(n), not O(n²) interned aggregates.
 - All comptime calls go through one entry point that memoizes by (function,
   stable hashes of arguments). Milestone 6 replaces the hot path behind this
   entry point with compiled bytecode for function instances whose types are
