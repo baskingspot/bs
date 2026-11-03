@@ -16,10 +16,19 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "zig_lib_dir", zig_lib_dir);
 
+    // `-Dsanitize-thread`: a ThreadSanitizer build of zap, for checking the
+    // state CodeGen workers share with the Sema thread (see "Parallel
+    // function bodies" in docs/architecture.md). Build it with
+    // -Doptimize=ReleaseFast, where libc's malloc is the allocator, which
+    // ThreadSanitizer intercepts; std's SafeAllocator hands memory between
+    // threads in ways it cannot see, and every reuse then looks like a race.
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Build zap with ThreadSanitizer (use with -Doptimize=ReleaseFast)") orelse false;
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .link_libc = if (sanitize_thread) true else null,
     });
     exe_mod.addOptions("build_options", options);
 

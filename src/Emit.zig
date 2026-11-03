@@ -171,6 +171,17 @@ pub const Pool = struct {
     workers: []Emit,
     threads: usize = 0,
     group: std.Io.Group = .init,
+    /// `ZAP_SCHED_FUZZ=<seed>`: random delays and yields where workers take
+    /// jobs and the Sema thread hands them over, random batch lengths, and
+    /// merges that sometimes wait for workers instead of generating the
+    /// jobs not handed over yet. The output must not change; a difference
+    /// from `ZAP_THREADS=1` is a dependence on timing. Which worker takes
+    /// which job varies, but each worker's jobs stay ascending, which the
+    /// merge relies on (`mergeOut`).
+    fuzz: ?u64 = null,
+    /// The Sema thread's random state and batch length under `fuzz`.
+    fuzz_rng: std.Random.DefaultPrng = .init(0),
+    batch_target: usize = batch_len,
 };
 
 const Job = struct {
@@ -328,7 +339,7 @@ fn stopWorkers(pool: *Pool) void {
 
 /// Starts CodeGen workers on `threads` threads besides the Sema thread; 0
 /// generates each function on the Sema thread, with the same output.
-pub fn startPool(emit: *Emit, threads: usize) !void {
+pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
     const gpa = emit.gpa;
     const io = emit.zcu.io;
     // One per thread, and the Sema thread's.
@@ -340,7 +351,8 @@ pub fn startPool(emit: *Emit, threads: usize) !void {
         w.obj = emit.obj;
     }
     const pool = try gpa.create(Pool);
-    pool.* = .{ .io = io, .workers = workers };
+    pool.* = .{ .io = io, .workers = workers, .fuzz = fuzz };
+    if (fuzz) |seed| pool.fuzz_rng = .init(seed);
     emit.pool = pool;
     emit.analyzing = true;
     for (0..threads) |i| {
@@ -353,6 +365,7 @@ fn workerMain(pool: *Pool, index: usize) void {
     Type.codegen_worker = true;
     const io = pool.io;
     const w = &pool.workers[index];
+    var rng: std.Random.DefaultPrng = .init((pool.fuzz orelse 0) +% (index + 1) *% 0x9e3779b97f4a7c15);
     pool.mutex.lockUncancelable(io);
     defer pool.mutex.unlock(io);
     while (true) {
@@ -366,6 +379,7 @@ fn workerMain(pool: *Pool, index: usize) void {
         pool.taken += 1;
         const job = pool.jobs.items[i];
         pool.mutex.unlock(io);
+        if (pool.fuzz != null) fuzzDelay(io, rng.random());
         const out = runJob(w, job.ir, job.exports);
         pool.mutex.lockUncancelable(io);
         if (out) |o| {
@@ -430,7 +444,18 @@ pub fn functionOwned(emit: *Emit, zcu: *Zcu, ir: Ir) !void {
         return;
     }
     try pool.batch.append(emit.gpa, .{ .ir = ir, .exports = exports });
-    if (pool.batch.items.len == batch_len) try publish(pool, emit.gpa);
+    if (pool.batch.items.len >= pool.batch_target) try publish(pool, emit.gpa);
+    if (pool.fuzz != null) fuzzDelay(pool.io, pool.fuzz_rng.random());
+}
+
+/// Under `ZAP_SCHED_FUZZ`: sometimes sleeps up to half a millisecond,
+/// sometimes yields.
+fn fuzzDelay(io: std.Io, random: std.Random) void {
+    switch (random.uintLessThan(u8, 8)) {
+        0, 1 => io.sleep(.{ .nanoseconds = random.uintLessThan(u32, 500_000) }, .awake) catch {},
+        2, 3 => std.Thread.yield() catch {},
+        else => {},
+    }
 }
 
 /// How many jobs the Sema thread hands over at once.
@@ -441,6 +466,7 @@ fn publish(pool: *Pool, gpa: Allocator) !void {
     defer pool.mutex.unlock(pool.io);
     try pool.jobs.appendSlice(gpa, pool.batch.items);
     pool.batch.clearRetainingCapacity();
+    if (pool.fuzz != null) pool.batch_target = 1 + pool.fuzz_rng.random().uintLessThan(usize, 32);
     if (pool.sleeping != 0) pool.work.broadcast(pool.io);
 }
 
@@ -480,6 +506,7 @@ fn mergeJobs(emit: *Emit) Allocator.Error!void {
     // rather than wake a worker and wait: an edit build, which loads most
     // units from the cache, merges after nearly every function it
     // generates.
+    if (pool.fuzz != null and pool.threads != 0 and pool.fuzz_rng.random().boolean()) try publish(pool, emit.gpa);
     const own: u32 = @intCast(pool.threads);
     for (pool.batch.items) |*job| if (!job.done) {
         job.out = try runJob(&pool.workers[own], job.ir, job.exports);

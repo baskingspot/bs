@@ -3086,6 +3086,34 @@ on demand, as today, unless another worker holds it. With bodies at
 CodeGen, the generated program to ~140 ms (its single-file frontend then
 dominates), and binary.zig to ~2.7 s.
 
+Measured after step 1 (2026-11-03, ReleaseFast zap, cold, `ZAP_THREADS=4`
+on the 4-vCPU orb, with temporary timers around each `analyzeAll`
+category). "Bodies" is `Sema.analyzeFuncBody` together with the
+declarations and types resolved from inside it, which is the work step 2
+spreads over workers. "Serial" is everything else on the critical path:
+the frontend, comptime declarations and roots, compiler_rt resolution,
+hand-over, emit, link, and the cache record. "CodeGen" is the workers'
+summed CPU time.
+
+| workload | wall | bodies | serial | CodeGen (workers) |
+|---|---|---|---|---|
+| hello | 166 ms | 143 ms (86%) | 23 ms | 86 ms |
+| libvaxis text_input (cold-local) | 458 ms | 268 ms (59%) | 190 ms (frontend 135, record 30) | 102 ms |
+| zig workload | 8.85 s | 8.28 s (94%) | 0.57 s | 3.9 s |
+| std tests (`--test-no-exec`) | 7.46 s | 7.19 s (96%) | 0.27 s | 1.5 s |
+
+The Sema thread is busy for the whole wall time apart from the frontend,
+emit, link and the record, so with step 1 the pool keeps CodeGen off
+the critical path, and bodies are the critical path. If step 2 spreads
+bodies plus CodeGen perfectly over the effective capacity of this orb
+(2 physical cores with SMT, roughly 2.5 workers' worth; CodeGen runs
+15–30% slower per IR instruction at 4 threads than at 1), the bound is
+serial + (bodies + CodeGen) / 2.5: hello 166 → ~115 ms, libvaxis 458 →
+~340 ms, the zig workload 8.85 → ~5.4 s, std 7.46 → ~3.7 s. On 8 real
+cores the bound is hello ~50 ms, the zig workload ~2.1 s and std ~1.4 s.
+These are upper bounds: waits on units another worker holds, and
+contention on the InternPool, lower them.
+
 **Step 3: record each unit as it completes**, on the worker that finished
 it (below), so that `record`'s graph and store work overlap analysis and
 only numbering and the manifest write remain after the link.
@@ -3209,7 +3237,32 @@ binary and the manifest's atom order must be byte-identical across thread
 counts and runs, and conformance must not change. A debug option that
 shuffles the work queue and adds random yields at claim points exposes
 order dependence, and ThreadSanitizer builds of zap check the shared
-state.
+state. Built for step 1:
+
+- `ZAP_SCHED_FUZZ=<seed>` (`Emit.Pool.fuzz`): random sleeps (up to 0.5
+  ms) and yields where workers take jobs and after the Sema thread hands
+  one over, a random batch length (1–32), and merges that randomly wait
+  for workers instead of generating the jobs not handed over yet. Which
+  worker generates which job varies; each worker's jobs stay ascending,
+  which `mergeOut`'s deduplication relies on, so step 1 does not shuffle
+  the queue itself.
+- `zig build -Dsanitize-thread -Doptimize=ReleaseFast`: a
+  ThreadSanitizer build of zap, linked with libc so that the allocator is
+  malloc, which ThreadSanitizer intercepts. (std's SafeAllocator, the
+  ReleaseSafe default, hands freed memory to other threads in ways it
+  cannot see: a ReleaseSafe build reported about 460 false races on
+  libvaxis, every one a new allocation reusing memory another thread
+  freed.)
+- Results (2026-11-03, origin/main 40b29a8 plus these options): the
+  ThreadSanitizer build with `ZAP_THREADS=4` and `ZAP_SCHED_FUZZ`
+  reported no race on hello, libvaxis text_input, the zig workload, std's
+  tests (3351/3351), and behavior with `--edit-verify` and
+  `ZAP_CACHE_CHECK=1` (2067/2067 in 112 files; the x86_64 file, whose
+  edit-verify run exceeds the orb's 7.8 GB under ThreadSanitizer, was
+  checked without `--edit-verify`, 103/103). With a ReleaseFast zap, all
+  113 behavior test binaries and the four workloads' outputs are
+  byte-identical between `ZAP_THREADS=1` and `ZAP_THREADS=4` with
+  `ZAP_SCHED_FUZZ` (several seeds).
 
 ## The command line and `zap build` (built 2026-11-03)
 
