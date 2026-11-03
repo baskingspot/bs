@@ -59,6 +59,9 @@ ret_ptr_slot: ?i32 = null,
 /// Inline assembly marked the return address undefined (`.cfi_undefined
 /// %rip`): this is the outermost frame.
 outermost_frame: bool = false,
+/// In a variadic C function: where the prologue saved the argument
+/// registers, and what the named parameters used of them and of the stack.
+va: struct { save: i32 = 0, gp: u8 = 0, sse: u8 = 0, stack: u32 = 0 } = .{},
 
 pub const Error = Allocator.Error || error{CodegenFail};
 
@@ -569,6 +572,13 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
             try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.sym(slot, 0) });
             try cg.storeReg(dst, .rax, 8);
+        },
+        .c_va_start => try cg.cVaStart(inst, data.ty),
+        .c_va_arg => try cg.cVaArg(inst, data.ty_op.ty, data.ty_op.operand),
+        .c_va_copy => {
+            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
+            try cg.load(.rdx, data.ty_op.operand);
+            try cg.copyMem(dst, Mem.at(.rdx, 0), 24);
         },
         .tls_ptr => {
             const key = try cg.emit.navKey(@fromBackingInt(data.ty_pl.payload));
@@ -1257,11 +1267,19 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         cg.out_args_size = @max(cg.out_args_size, off);
         if (dst) |m| if (!cg.passInRegs(ret_ty)) try cg.e.lea(.qword, .rdi, m);
     }
+    // A variadic callee learns from al how many vector registers hold
+    // arguments.
+    var va_sse: u8 = 0;
+    if (callee_ty.is_var_args) for (args) |arg| {
+        if (cg.cClass(cg.typeOf(arg)) == .sse and va_sse < 8) va_sse += 1;
+    };
     if (callee_val) |f| {
+        if (callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
         try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
     } else {
         // r11 is not an argument register in either convention.
         try cg.load(.r11, callee_ref);
+        if (callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
         try cg.e.callIndirect(.{ .reg = .r11 });
     }
     if (callee_ty.cc == .c) return cg.cCallResult(ret_ty, dst);
@@ -2180,6 +2198,70 @@ fn setupCParams(cg: *CodeGen) Error!void {
             else => unreachable,
         }
     }
+    if (cg.fn_ty.is_var_args) {
+        // The SysV register save area: the six argument GPRs, then the
+        // eight argument XMM registers at 16-byte strides (only their low
+        // halves, which is all a `double` needs).
+        const save = try cg.allocSlot(176, 16);
+        for (c_arg_regs, 0..) |r, i| try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, save + @as(i32, @intCast(i * 8))) }, .{ .reg = r });
+        for (xmm_args, 0..) |x, i| try cg.storeXmm(Mem.at(.rbp, save + 48 + @as(i32, @intCast(i * 16))), x, 8);
+        cg.va = .{ .save = save, .gp = gp, .sse = sse, .stack = stack };
+    }
+}
+
+/// `@cVaStart()`: a SysV `va_list` past the named parameters.
+fn cVaStart(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!void {
+    const dst = try cg.resultMem(inst, ty) orelse return;
+    try cg.e.mov(.dword, .{ .mem = dst }, .{ .imm = @as(i32, cg.va.gp) * 8 });
+    try cg.e.mov(.dword, .{ .mem = offsetMem(dst, 4) }, .{ .imm = 48 + @as(i32, cg.va.sse) * 16 });
+    try cg.e.lea(.qword, .rax, Mem.at(.rbp, @intCast(16 + cg.va.stack)));
+    try cg.e.mov(.qword, .{ .mem = offsetMem(dst, 8) }, .{ .reg = .rax });
+    try cg.e.lea(.qword, .rax, Mem.at(.rbp, cg.va.save));
+    try cg.e.mov(.qword, .{ .mem = offsetMem(dst, 16) }, .{ .reg = .rax });
+}
+
+/// `@cVaArg(list, T)`, as the SysV ABI's `va_arg`: from the register save
+/// area while registers of `T`'s class remain, else from the overflow area.
+fn cVaArg(cg: *CodeGen, inst: Inst.Index, ty: Index, list: Ref) Error!void {
+    const ip = cg.ip;
+    const size = Type.abiSize(ip, ty);
+    try cg.load(.rcx, list);
+    const class = cg.cClass(ty);
+    const on_stack = try cg.e.newLabel();
+    const done = try cg.e.newLabel();
+    // The register class's offset field, its limit, and its stride.
+    const reg: ?struct { field: u32, limit: i32, step: i32 } = switch (class) {
+        .int => .{ .field = 0, .limit = 48, .step = 8 },
+        .int_pair => .{ .field = 0, .limit = 40, .step = 16 },
+        .sse => .{ .field = 4, .limit = 176, .step = 16 },
+        else => null,
+    };
+    if (reg) |r| {
+        try cg.e.mov(.dword, .{ .reg = .rax }, .{ .mem = Mem.at(.rcx, @intCast(r.field)) });
+        try cg.e.alu(.cmp, .dword, .{ .reg = .rax }, .{ .imm = r.limit });
+        try cg.e.jcc(.ae, .{ .label = on_stack });
+        try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .mem = Mem.at(.rcx, 16) });
+        try cg.e.alu(.add, .qword, .{ .reg = .rdx }, .{ .reg = .rax });
+        try cg.e.alu(.add, .dword, .{ .reg = .rax }, .{ .imm = r.step });
+        try cg.e.mov(.dword, .{ .mem = Mem.at(.rcx, @intCast(r.field)) }, .{ .reg = .rax });
+        try cg.e.jmp(.{ .label = done });
+    }
+    cg.e.bind(on_stack);
+    try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .mem = Mem.at(.rcx, 8) });
+    if (Type.abiAlignment(ip, ty) >= 16) {
+        try cg.e.alu(.add, .qword, .{ .reg = .rdx }, .{ .imm = 15 });
+        try cg.e.alu(.@"and", .qword, .{ .reg = .rdx }, .{ .imm = -16 });
+    }
+    try cg.e.lea(.qword, .rax, Mem.at(.rdx, @intCast(std.mem.alignForward(u64, size, 8))));
+    try cg.e.mov(.qword, .{ .mem = Mem.at(.rcx, 8) }, .{ .reg = .rax });
+    cg.e.bind(done);
+    const dst = try cg.resultMem(inst, ty) orelse return;
+    // Callers promote a variadic f32 to f64, as C does.
+    if (ty == .f32_type) {
+        try cg.e.cvts2s(.f32, .xmm0, .{ .mem = Mem.at(.rdx, 0) });
+        return cg.storeXmm(dst, .xmm0, 4);
+    }
+    try cg.copyMem(dst, Mem.at(.rdx, 0), size);
 }
 
 /// Returns `operand` from a C-convention function.

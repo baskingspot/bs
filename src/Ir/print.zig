@@ -73,7 +73,7 @@ const Printer = struct {
                 try p.ty(data.arg.ty);
                 try w.print(", {d}", .{data.arg.index});
             },
-            .alloc => try p.ty(data.ty),
+            .alloc, .c_va_start => try p.ty(data.ty),
             .unreach, .trap, .breakpoint, .ret_addr, .frame_addr => {},
             .dbg_stmt => try w.print("{d}:{d}", .{ data.dbg_stmt.line + 1, data.dbg_stmt.column + 1 }),
             .ret, .int_from_bool, .int_from_ptr, .error_name, .is_null, .is_non_null, .is_err, .is_non_err, .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => try p.ref(data.un_op),
@@ -82,7 +82,7 @@ const Printer = struct {
                 try w.writeAll(", ");
                 try p.ref(data.bin_op.rhs);
             },
-            .load, .atomic_load, .not, .intcast, .trunc, .float_cast, .float_from_int, .int_from_float, .bitcast, .ptr_from_int, .slice_ptr, .slice_len, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set, .wrap_optional, .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set, .wrap_errunion_payload, .wrap_errunion_err, .get_union_tag, .tag_name, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => {
+            .c_va_arg, .c_va_copy, .load, .atomic_load, .not, .intcast, .trunc, .float_cast, .float_from_int, .int_from_float, .bitcast, .ptr_from_int, .slice_ptr, .slice_len, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set, .wrap_optional, .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set, .wrap_errunion_payload, .wrap_errunion_err, .get_union_tag, .tag_name, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => {
                 try p.ty(data.ty_op.ty);
                 try w.writeAll(", ");
                 try p.ref(data.ty_op.operand);

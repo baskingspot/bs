@@ -2890,6 +2890,35 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .builtin_extern => sema.zirBuiltinExtern(block, inst),
         .field_parent_ptr => sema.zirFieldParentPtr(block, inst),
         .cmpxchg => sema.zirCmpxchg(block, inst),
+        .c_va_start => blk: {
+            const src = block.nodeSrc(@fromBackingInt(@as(i32, @bitCast(ext.operand))));
+            if (sema.func == .none or !sema.ip.indexToKey(sema.ip.typeOf(sema.func)).func_type.is_var_args or block.inlining != null)
+                break :blk sema.fail(block, src, "'@cVaStart' only allowed in variadic functions", .{});
+            try sema.requireRuntime(block, src);
+            break :blk sema.addInst(block, .{ .tag = .c_va_start, .data = .{ .ty = try sema.stdLangType(block, src, "VaList") } });
+        },
+        .c_va_arg => blk: {
+            const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
+            const src = block.nodeSrc(extra.node);
+            const list = try sema.vaListPtr(block, src, extra.lhs);
+            const ty = try sema.resolveType(block, src, extra.rhs);
+            try sema.resolveLayout(block, src, ty);
+            try sema.requireRuntime(block, src);
+            break :blk sema.addTyOp(block, .c_va_arg, ty, list);
+        },
+        .c_va_copy => blk: {
+            const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
+            const src = block.nodeSrc(extra.node);
+            const list = try sema.vaListPtr(block, src, extra.operand);
+            try sema.requireRuntime(block, src);
+            break :blk sema.addTyOp(block, .c_va_copy, try sema.stdLangType(block, src, "VaList"), list);
+        },
+        // Ending a `VaList` does nothing on x86_64.
+        .c_va_end => blk: {
+            const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
+            _ = try sema.vaListPtr(block, block.nodeSrc(extra.node), extra.operand);
+            break :blk .void_value;
+        },
         .error_cast => sema.zirErrorCast(block, inst),
         // Error values are numbered at link time, so these are runtime
         // operations even on comptime-known operands.
@@ -11423,7 +11452,6 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     }
     if (is_var_args) {
         if (cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
-        if (body_len != 0) return sema.failUnsupported(block, src, "variadic function definitions");
     }
 
     var ret_ty: Index = if (fn_info.ret_ty_body.len != 0) blk: {
@@ -11619,8 +11647,10 @@ fn analyzeCall(
     };
     const fn_ty = ip.indexToKey(fn_ty_index).func_type;
     const total_args = call_args_in.len() + @intFromBool(first_arg != .none);
-    if (fn_ty.is_var_args) return sema.failUnsupported(block, src, "calling variadic functions");
-    if (total_args != fn_ty.param_types.len) {
+    if (fn_ty.is_var_args) {
+        if (total_args < fn_ty.param_types.len) return sema.fail(block, src, "expected at least {d} argument(s), found {d}", .{ fn_ty.param_types.len, total_args });
+        if (block.is_comptime or modifier == .compile_time) return sema.fail(block, src, "unable to call variadic function at comptime", .{});
+    } else if (total_args != fn_ty.param_types.len) {
         return sema.fail(block, src, "expected {d} argument(s), found {d}", .{ fn_ty.param_types.len, total_args });
     }
     switch (modifier) {
@@ -11644,6 +11674,13 @@ fn analyzeCall(
                 const arg_end = sema.code.extra[zir_args.extra_end + k];
                 const body = sema.code.bodySlice(zir_args.extra_end + arg_start, arg_end - arg_start);
                 arg_start = arg_end;
+                // A variadic argument has no result type.
+                if (arg_i >= fn_ty.param_types.len) {
+                    try sema.inst_map.put(sema.gpa, zir_args.call_inst, .fromInterned(.generic_poison_type));
+                    args[arg_i] = try sema.coerceVarArg(block, src, try sema.resolveInlineBody(block, body, zir_args.call_inst));
+                    arg_i += 1;
+                    continue;
+                }
                 // A generic parameter's type can depend on the arguments before it;
                 // it is the argument's result type, as upstream.
                 const param_ty = if (fn_ty.param_types[arg_i] == .generic_poison_type and func != .none)
@@ -11662,6 +11699,11 @@ fn analyzeCall(
             }
         },
         .resolved => |resolved| for (resolved) |arg| {
+            if (arg_i >= fn_ty.param_types.len) {
+                args[arg_i] = try sema.coerceVarArg(block, src, arg);
+                arg_i += 1;
+                continue;
+            }
             const param_ty = if (fn_ty.param_types[arg_i] == .generic_poison_type and func != .none)
                 try sema.genericParamType(block, src, func, args[0..arg_i])
             else
@@ -11735,9 +11777,8 @@ fn analyzeCall(
     }
     try sema.requireRuntime(block, src);
     const callee_fn_ty = ip.indexToKey(ip.typeOf(callee_func)).func_type;
-    for (call_args, callee_fn_ty.param_types) |a, pt| {
-        if ((try sema.isComptimeOnlyResolved(block, src, pt))) return sema.fail(block, src, "parameter of comptime-only type '{f}' must be declared comptime", .{sema.fmtType(pt)});
-        _ = a;
+    for (callee_fn_ty.param_types) |pt| {
+        if (try sema.isComptimeOnlyResolved(block, src, pt)) return sema.fail(block, src, "parameter of comptime-only type '{f}' must be declared comptime", .{sema.fmtType(pt)});
     }
     if (callee_fn_ty.cc == .naked) return sema.fail(block, src, "unable to call function with naked calling convention", .{});
     try sema.declareDependency(.{ .nav_val = ip.indexToKey(callee_func).func.owner_nav });
@@ -11755,6 +11796,35 @@ fn analyzeCall(
     const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len) });
     try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(call_args));
     return sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = .fromInterned(callee_func), .payload = payload } } });
+}
+
+fn vaListPtr(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref) CompileError!Ref {
+    const ty = try sema.ptrType(.{ .child = try sema.stdLangType(block, src, "VaList") });
+    return sema.coerce(block, ty, sema.resolveInst(ref), src);
+}
+
+/// An argument passed for a C function's `...`, promoted as upstream's
+/// `coerceVarArgParam`: small integers to c_int or c_uint, f32 to f64, and
+/// a function to a pointer to it.
+fn coerceVarArg(sema: *Sema, block: *Block, src: Src, arg: Ref) CompileError!Ref {
+    if (block.is_typeof) return arg;
+    const ip = sema.ip;
+    const ty = sema.typeOf(arg);
+    const coerced = switch (Type.class(ip, ty)) {
+        .comptime_int, .comptime_float => return sema.fail(block, src, "integer and float literals passed to variadic function must be casted to a fixed-size number type", .{}),
+        .array => return sema.fail(block, src, "arrays must be passed by reference to variadic function", .{}),
+        .@"fn" => try sema.analyzeRef(block, src, arg),
+        .float => if (Type.floatBits(ip, ty) < 64) try sema.coerce(block, .f64_type, arg, src) else arg,
+        .int => int: {
+            const info = Type.intInfo(ip, ty);
+            if (info.bits <= 32) break :int try sema.coerce(block, if (info.signedness == .signed) .c_int_type else .c_uint_type, arg, src);
+            if (info.bits <= 64) break :int try sema.coerce(block, if (info.signedness == .signed) .c_long_type else .c_ulong_type, arg, src);
+            break :int arg;
+        },
+        else => arg,
+    };
+    try sema.resolveLayout(block, src, sema.typeOf(coerced));
+    return coerced;
 }
 
 /// State saved while analyzing another function's ZIR in this Sema.

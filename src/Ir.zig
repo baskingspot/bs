@@ -233,6 +233,14 @@ pub const Inst = struct {
         trap,
         /// `no_op`: `@breakpoint()`, which returns.
         breakpoint,
+        /// `ty`: `@cVaStart()` in a variadic C function, a `VaList` of type
+        /// `ty` for the arguments after the named ones.
+        c_va_start,
+        /// `ty_op`: `@cVaArg`, the next variadic argument, of type `ty`, from
+        /// the `VaList` that `operand` points to.
+        c_va_arg,
+        /// `ty_op`: `@cVaCopy`, a copy of the `VaList` `operand` points to.
+        c_va_copy,
 
         /// `pl_op` with `Call`: `operand` is the callee function value, or a
         /// function pointer for an indirect call.
@@ -448,7 +456,8 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
         .arg => data.arg.ty,
-        .alloc => data.ty,
+        .alloc, .c_va_start => data.ty,
+        .c_va_arg, .c_va_copy,
         .load,
         .not,
         .intcast,
