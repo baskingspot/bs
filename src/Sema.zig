@@ -6208,6 +6208,9 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         const ptr_ty = if (lc == .pointer) lt else rt;
         return sema.analyzeCmp(block, src, op, try sema.coerce(block, ptr_ty, lhs, src), try sema.coerce(block, ptr_ty, rhs, src));
     }
+    // A function body compares as a pointer to it.
+    if (is_eq and lc == .@"fn" and rc == .pointer) return sema.analyzeCmp(block, src, op, try sema.coerce(block, rt, lhs, src), rhs);
+    if (is_eq and rc == .@"fn" and lc == .pointer) return sema.analyzeCmp(block, src, op, lhs, try sema.coerce(block, lt, rhs, src));
     if (lt == .type_type and rt == .type_type and is_eq) {
         const a = try sema.resolveConstValue(block, src, lhs, "types must be comptime-known");
         const b = try sema.resolveConstValue(block, src, rhs, "types must be comptime-known");
