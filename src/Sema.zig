@@ -8364,6 +8364,19 @@ fn bindSwitchCaptures(sema: *Sema, block: *Block, src: Src, c: SwitchCase, opera
 }
 
 fn analyzeProng(sema: *Sema, block: *Block, c: SwitchCase, operand: Ref, capture_inst: Zir.Inst.Index, switch_inst: Zir.Inst.Index) CompileError!void {
+    const ip = sema.ip;
+    const op_ty = sema.typeOf(operand);
+    if (Type.class(ip, op_ty) == .@"union" and c.items.len != 0) {
+        // A prong whose union fields are all `noreturn` cannot be taken,
+        // so upstream does not analyze its body.
+        const info = ip.structInfo(op_ty);
+        for (c.items) |item| {
+            if (info.field_types[info.fieldIndex(ip, sema.enumTagName(item).?).?] != .noreturn_type) break;
+        } else {
+            _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+            return;
+        }
+    }
     try sema.bindSwitchCaptures(block, block.nodeSrc(.zero), c, operand, capture_inst);
     if (c.capture == .by_val and sema.typeOf(sema.inst_map.get(capture_inst).?) == .noreturn_type) {
         // A union payload of type noreturn: the prong cannot be reached.
