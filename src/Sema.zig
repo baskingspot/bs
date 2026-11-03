@@ -1729,6 +1729,7 @@ fn intFits(sema: *Sema, val: Index, ty: Index) bool {
 fn minIntValue(sema: *Sema, ty: Index) !Index {
     const info = Type.intInfo(sema.ip, ty);
     if (info.signedness == .unsigned or info.bits == 0) return sema.intValue(ty, 0);
+    if (info.bits <= 64) return sema.intValue(ty, @as(i64, std.math.minInt(i64)) >> @intCast(64 - info.bits));
     var big = try BigInt.initSet(sema.arena, 1);
     try big.shiftLeft(&big, info.bits - 1);
     big.negate();
@@ -1738,8 +1739,11 @@ fn minIntValue(sema: *Sema, ty: Index) !Index {
 fn maxIntValue(sema: *Sema, ty: Index) !Index {
     const info = Type.intInfo(sema.ip, ty);
     if (info.bits == 0) return sema.intValue(ty, 0);
+    const value_bits = info.bits - @intFromBool(info.signedness == .signed);
+    if (value_bits == 0) return sema.intValue(ty, 0);
+    if (value_bits <= 64) return sema.intValue(ty, @as(u64, std.math.maxInt(u64)) >> @intCast(64 - value_bits));
     var big = try BigInt.initSet(sema.arena, 1);
-    try big.shiftLeft(&big, info.bits - @intFromBool(info.signedness == .signed));
+    try big.shiftLeft(&big, value_bits);
     var one = try BigInt.initSet(sema.arena, 1);
     try big.sub(&big, &one);
     return sema.bigToValue(ty, big.toConst());
@@ -6816,6 +6820,28 @@ fn intSign(sema: *Sema, val: Index) i2 {
 }
 
 fn foldArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, ty: Index, lv: Index, rv: Index) CompileError!Index {
+    // Most comptime arithmetic (indices, lengths, offsets) fits in 64 bits.
+    if (tag == .add or tag == .sub or tag == .mul) small: {
+        const x = sema.ip.intValue(i64, lv) orelse break :small;
+        const y = sema.ip.intValue(i64, rv) orelse break :small;
+        const r: i128 = switch (tag) {
+            .add => @as(i128, x) + y,
+            .sub => @as(i128, x) - y,
+            .mul => @as(i128, x) * y,
+            else => unreachable,
+        };
+        if (r < std.math.minInt(i64) or r > std.math.maxInt(u64)) break :small;
+        if (ty != .comptime_int_type) {
+            const info = Type.intInfo(sema.ip, ty);
+            const fits = switch (info.signedness) {
+                .unsigned => r >= 0 and (info.bits >= 64 or r < @as(i128, 1) << @intCast(info.bits)),
+                .signed => info.bits >= 65 or (info.bits != 0 and r >= -(@as(i128, 1) << @intCast(info.bits - 1)) and r < @as(i128, 1) << @intCast(info.bits - 1)) or (info.bits == 0 and r == 0),
+            };
+            // Overflow is reported below.
+            if (!fits) break :small;
+        }
+        return sema.intValue(ty, r);
+    }
     const a = try sema.bigValue(lv);
     const b = try sema.bigValue(rv);
     var r = try BigInt.init(sema.arena);
