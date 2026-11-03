@@ -1,13 +1,14 @@
 //! exit: 1
 //! stdout: "start 0\ncatch 0\nkept 2\nif-else 2\narg 0\nlabeled 0\ninline 2\ncfn 2\nafter-cfn 2\n"
 //! stderr-contains: "error: TooBig\n"
-//! stderr-contains: "error_trace.zig:19:16: 0x"
+//! stderr-contains: "error_trace.zig:20:16: 0x"
 //! stderr-contains: " in fail (error_trace.zig)\n    if (x > 3) return error.TooBig;\n               ^\n"
 //! stderr-contains: " in twice (error_trace.zig)\n    return try fail(x) * 2;\n           ^\n"
-//! stderr-contains: "error_trace.zig:26:5: 0x"
+//! stderr-contains: "error_trace.zig:27:5: 0x"
 //! stderr-contains: " in inl (error_trace.zig)\n"
-//! stderr-contains: "error_trace.zig:75:9: 0x"
+//! stderr-contains: "error_trace.zig:76:9: 0x"
 //! stderr-contains: " in main (error_trace.zig)\n    _ = try inl(10);\n        ^\n"
+//! targets: x86_64-linux aarch64-macos
 
 // Error return traces, as upstream: each `.auto` function shares its
 // caller's trace, returning an error pushes the return address, and handling

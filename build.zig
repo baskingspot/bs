@@ -110,6 +110,11 @@ pub fn build(b: *std.Build) void {
 ///   //! rebuild-lib-without: "<lib path>" "<zig string>"
 ///                               the same edit in a file of zap's lib
 ///                               directory, of which the builds use a copy
+///   //! targets: <target> ...   the targets the program is for (default
+///                               x86_64-linux); with aarch64-macos, an
+///                               aarch64-macos host also builds it for
+///                               that target and checks it (not the
+///                               rebuild headers)
 ///
 /// `test` builds each with zap and checks it; `test-upstream` does the same
 /// with upstream zig, so every program is checked against the oracle.
@@ -117,6 +122,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
     const io = b.graph.io;
     const host = b.graph.host.result;
     const host_runs_zap_output = host.cpu.arch == .x86_64 and host.os.tag == .linux;
+    const host_runs_macos_output = host.cpu.arch == .aarch64 and host.os.tag == .macos;
     // The headers are read here, while configuring.
     b.dependOnDirectoryContents(b.path("test/run"));
     var dir = b.root.openDir(io, "test/run", .{ .iterate = true }) catch |err|
@@ -150,6 +156,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             /// Each text, and what the earlier version has instead.
             rebuild_without: std.ArrayList([2][]const u8) = .empty,
             lib_edit: ?struct { path: []const u8, text: []const u8 } = null,
+            aarch64_macos: bool = false,
         } = .{};
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
@@ -175,6 +182,11 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 if (key[8] == 'r') {
                     expect.rebuild_without.append(b.allocator, .{ first, second }) catch @panic("OOM");
                 } else expect.lib_edit = .{ .path = first, .text = second };
+            } else if (std.mem.eql(u8, key, "targets")) {
+                var targets = std.mem.tokenizeScalar(u8, value, ' ');
+                while (targets.next()) |t| {
+                    if (std.mem.eql(u8, t, "aarch64-macos")) expect.aarch64_macos = true else if (!std.mem.eql(u8, t, "x86_64-linux")) std.debug.panic("{s}: unknown target '{s}'", .{ src_path, t });
+                }
             } else if (std.mem.eql(u8, key, "stdout") or std.mem.eql(u8, key, "stderr")) {
                 const bytes = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 if (key[3] == 'o') expect.stdout = bytes else expect.stderr = bytes;
@@ -263,6 +275,19 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             for (expect.stderr_contains.items) |part| run.addCheck(.{ .expect_stderr_match = part });
             run.addCheck(.{ .expect_term = if (expect.signal) |sig| .{ .signal = sig } else .{ .exited = expect.exit.? } });
             (if (upstream) upstream_step else test_step).dependOn(&run.step);
+        }
+        if (expect.aarch64_macos and host_runs_macos_output) {
+            const compile = b.addRunArtifact(zap);
+            compile.addArgs(&.{ "build-exe", "-target", "aarch64-macos" });
+            compile.addFileArg(b.path(src_path));
+            const bin = compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            const run = std.Build.Step.Run.create(b, b.fmt("run {s} (aarch64-macos)", .{name}));
+            run.addFileArg(bin);
+            if (expect.stdout) |out| run.addCheck(.{ .expect_stdout_exact = out });
+            if (expect.stderr) |err| run.addCheck(.{ .expect_stderr_exact = err });
+            for (expect.stderr_contains.items) |part| run.addCheck(.{ .expect_stderr_match = part });
+            run.addCheck(.{ .expect_term = if (expect.signal) |sig| .{ .signal = sig } else .{ .exited = expect.exit.? } });
+            test_step.dependOn(&run.step);
         }
     }
 }
