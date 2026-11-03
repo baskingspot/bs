@@ -14,8 +14,12 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   within a budget). Output stays debuggable: line tables, frame pointers,
   inlined frames. LLVM-class optimization (vectorization, heavy loop work)
   stays upstream's job; users run upstream `zig` for ReleaseFast and friends.
+- C interop is in scope: `-lc`, `@cImport`, and C source files. translate-c
+  (upstream's Aro-based Zig program in `lib/compiler/translate-c`) is built
+  by zap itself, so `@cImport` needs no LLVM. C source files are compiled by
+  the user's upstream `zig cc` (Clang); zap never compiles C itself.
 - Out of scope unless the user asks: other targets, release modes, LLVM,
-  `@cImport`/translate-c, the C backend, compiling C sources.
+  the C backend, a C compiler inside zap.
 - CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`
   (zap compiles and runs the build runner and serves its compile steps over the
   `--listen=-` compiler protocol).
