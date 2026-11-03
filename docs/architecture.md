@@ -2650,6 +2650,33 @@ noisy), libvaxis 1.781 G → 1.515 G (−14.9%), hello 809 M → 713 M
   name without coercing and loading it. What remains is the walker's
   per-operation interning (`InternPool.get` is 40% of the loop).
 
+Interning round (against origin/main 9a99323, same measures): zig
+workload 51.61 G → 48.67 G instructions (−5.7%), libvaxis 1.508 G →
+1.443 G (−4.3%), hello 707 M → 683 M (−3.4%), binary.zig 64.67 G →
+63.22 G (−2.2%), the `mnemonic_table` repro 364 M → 323 M (−11%).
+`InternPool.get` fell from 12.4% to below 10% of the zig workload,
+inclusive:
+
+- The lookup hash mixes each key field as a word (see "InternPool"); it
+  cost about 108 instructions per lookup, mostly in buffering for wyhash.
+- Integer keys hit a per-thread direct-mapped cache in `get`.
+- Comparisons of a runtime integer with a comptime-known one (`i < n`)
+  interned the type's minimum and maximum to rule out the trivial cases;
+  64-bit types compare in `i128` now. Coercing a comptime-known integer
+  to another integer type, and `intFits`, skip big integers when the
+  value fits 64 bits.
+- `Sema.stringLiteral` keeps each literal's value (`Zcu.string_literals`);
+  the walker evaluated the same literals about a million times, four
+  interns each.
+- Inside a memoizable comptime call, a repeated dependency declaration
+  now stops at a direct-mapped cache, as outside one.
+
+What remains of interning is mostly new pointer values (`ptrElemPtrVal`,
+`fieldPtrAt`, `analyzeRef`, `elemPtrType`, `navRef`): about 1 M each on
+the zig workload, each a real new or reused value. Beyond that the
+walker's cost is spread thin; the next structural step is fewer
+intermediate values per operation, not cheaper ones.
+
 ### Parallel function bodies (designed 2026-11-03, for review)
 
 Not built yet; two threads change Sema daily. Three steps, each useful
