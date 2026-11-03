@@ -772,7 +772,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             mid[0] = 0; // end of the unit's children
             @memcpy(mid[1..], dwarf.line_header);
             try l.putDsym(dl.info_off + dl.info_size - 1, mid);
-            try l.putDsym(dl.str_off, Dwarf.str);
+            var tail: [Dwarf.str.len + Dwarf.aranges_size]u8 = undefined;
+            tail[0..Dwarf.str.len].* = Dwarf.str.*;
+            tail[Dwarf.str.len..].* = Dwarf.aranges(base + starts[text], sizes[text]);
+            try l.putDsym(dl.str_off, &tail);
         }
         try l.putDsym(0, head);
     }
@@ -796,10 +799,11 @@ const DsymLayout = struct {
     line_off: u64,
     line_size: u64,
     str_off: u64,
+    aranges_off: u64,
     dwarf_off: u64,
     len: u64,
 
-    const n_dwarf_sects = 4;
+    const n_dwarf_sects = 5;
 
     fn init(n_exe_segs: u32, exe_segs_size: u32, dwarf: Dwarf, placed: Dwarf.Placed) DsymLayout {
         const has_debug = placed.files.count() > 0;
@@ -810,9 +814,11 @@ const DsymLayout = struct {
         const info_size = if (has_debug) dwarf.info_header.len + placed.info_len + 1 else 0;
         const line_size = if (has_debug) dwarf.line_header.len + placed.line_len else 0;
         const str_size: u64 = if (has_debug) Dwarf.str.len else 0;
+        const aranges_size: u64 = if (has_debug) Dwarf.aranges_size else 0;
         const info_off = dwarf_off + abbrev_size;
         const line_off = info_off + info_size;
         const str_off = line_off + line_size;
+        const aranges_off = str_off + str_size;
         return .{
             .n_exe_segs = n_exe_segs,
             .exe_segs_size = exe_segs_size,
@@ -823,8 +829,9 @@ const DsymLayout = struct {
             .line_off = line_off,
             .line_size = line_size,
             .str_off = str_off,
+            .aranges_off = aranges_off,
             .dwarf_off = dwarf_off,
-            .len = str_off + str_size,
+            .len = aranges_off + aranges_size,
         };
     }
 };
@@ -881,6 +888,7 @@ fn writeDsymHeader(dsym: []u8, dl: DsymLayout, uuid: [16]u8, exe_segs: []const u
             .{ "__debug_info", dl.info_off, dl.info_size },
             .{ "__debug_line", dl.line_off, dl.line_size },
             .{ "__debug_str", dl.str_off, Dwarf.str.len },
+            .{ "__debug_aranges", dl.aranges_off, Dwarf.aranges_size },
         };
         for (sects) |sect| w.put(macho.section_64{
             .sectname = name16(sect[0]),
@@ -2262,6 +2270,13 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
         try std.testing.expectEqualStrings(if (file[0] == '/') file else try std.fmt.allocPrint(arena, "/w/{s}", .{file}), loc.file_name);
     }
 
+    // lldb finds a dSYM's units only through .debug_aranges.
+    const text_sect = testMachOSection(one.exe, "__text").?;
+    const aranges = testMachOSection(one.dsym, "__debug_aranges").?;
+    const set = one.dsym[aranges.offset..][0..aranges.size];
+    try std.testing.expectEqual(text_sect.addr, std.mem.readInt(u64, set[16..24], .little));
+    try std.testing.expectEqual(text_sect.size, std.mem.readInt(u64, set[24..32], .little));
+
     // Each function's code has its frame's encoding, and code without
     // debug info none, looked up as std.debug's unwinder does.
     const frame: u32 = 0x0400_0000;
@@ -2279,7 +2294,6 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
             try std.testing.expectEqual(0, testUnwindEncoding(one.exe, helper).?);
         }
     }
-    const text_sect = testMachOSection(one.exe, "__text").?;
     try std.testing.expectEqual(null, testUnwindEncoding(one.exe, text_sect.addr + text_sect.size));
 }
 
