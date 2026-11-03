@@ -1742,7 +1742,32 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
                     const off: u32 = @intCast(i * esize);
                     try lowerValue(emit, el, out[off..][0..esize], relocs, base_off + off);
                 },
-                .struct_type, .tuple_type => {
+                .struct_type, .tuple_type => if (Type.isPackedStruct(ip, ty)) {
+                    // Each field's low bits at its bit offset in the backing
+                    // integer.
+                    for (0..Type.fieldCount(ip, ty)) |i| {
+                        const ft = Type.fieldType(ip, ty, i);
+                        const bits = Type.packedBits(ip, ft).?;
+                        if (bits == 0) continue;
+                        const el = switch (a.storage) {
+                            .elems => |elems| elems[i],
+                            .repeated_elem => |el| el,
+                            .bytes => unreachable,
+                        };
+                        const tmp = try gpa.alloc(u8, @intCast(Type.abiSize(ip, ft)));
+                        defer gpa.free(tmp);
+                        @memset(tmp, 0);
+                        const relocs_len = relocs.relocs.items.len;
+                        try lowerValue(emit, el, tmp, relocs, 0);
+                        assert(relocs.relocs.items.len == relocs_len); // no pointers in packed structs
+                        const off = Type.packedFieldBitOffset(ip, ty, i);
+                        for (0..bits) |b| {
+                            const bit = (tmp[b / 8] >> @intCast(b % 8)) & 1;
+                            const ob = off + b;
+                            out[ob / 8] |= @as(u8, bit) << @intCast(ob % 8);
+                        }
+                    }
+                } else {
                     const n = Type.fieldCount(ip, ty);
                     for (0..n) |i| {
                         const ft = Type.fieldType(ip, ty, i);

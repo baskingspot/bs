@@ -318,7 +318,6 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     var block = sema.rootBlock(info.namespace, decl.fields_baseline_src_node, true);
     defer block.instructions.deinit(zcu.gpa);
 
-    if (decl.layout == .@"packed") return sema.fail(&block, block.nodeSrc(.zero), "zap does not support packed structs yet", .{});
     info.status = .field_types_wip;
     const n = decl.field_names.len;
     const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
@@ -341,23 +340,51 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
 
 
     info.status = .layout_wip;
-    var offset: u64 = 0;
-    var alignment: u64 = 1;
-    for (types, 0..) |ft, i| {
-        try sema.resolveLayout(&block, block.nodeSrc(.zero), ft);
-        if (!Type.hasRuntimeBits(ip, ft)) {
-            offsets[i] = offset;
-            continue;
+    if (decl.layout == .@"packed") {
+        // Fields are packed into the backing integer from bit 0.
+        const src = block.nodeSrc(.zero);
+        var bits: u64 = 0;
+        for (types, 0..) |ft, i| {
+            try sema.resolveLayout(&block, src, ft);
+            const fb = Type.packedBits(ip, ft) orelse {
+                if (Type.class(ip, ft) == .pointer) return sema.failUnsupported(&block, src, "pointer fields in packed structs");
+                return sema.fail(&block, src, "packed structs cannot contain fields of type '{f}'", .{sema.fmtType(ft)});
+            };
+            offsets[i] = bits;
+            bits += fb;
         }
-        const a = Type.abiAlignment(ip, ft);
-        offset = std.mem.alignForward(u64, offset, a);
-        offsets[i] = offset;
-        offset += Type.abiSize(ip, ft);
-        alignment = @max(alignment, a);
+        const backing: Index = if (decl.backing_int_type_body) |body| blk: {
+            const t = try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
+            if (Type.class(ip, t) != .int) return sema.fail(&block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(t)});
+            if (Type.intInfo(ip, t).bits != bits) return sema.fail(&block, src, "backing integer type '{f}' has bit size {d} but the struct fields have a total bit size of {d}", .{ sema.fmtType(t), Type.intInfo(ip, t).bits, bits });
+            break :blk t;
+        } else blk: {
+            if (bits > std.math.maxInt(u16)) return sema.fail(&block, src, "size of packed struct '{d}' exceeds maximum bit width of 65535", .{bits});
+            break :blk try sema.intType(.unsigned, @intCast(bits));
+        };
+        info.field_offsets = offsets;
+        info.tag_type = backing;
+        info.size = Type.abiSize(ip, backing);
+        info.alignment = Type.abiAlignment(ip, backing);
+    } else {
+        var offset: u64 = 0;
+        var alignment: u64 = 1;
+        for (types, 0..) |ft, i| {
+            try sema.resolveLayout(&block, block.nodeSrc(.zero), ft);
+            if (!Type.hasRuntimeBits(ip, ft)) {
+                offsets[i] = offset;
+                continue;
+            }
+            const a = Type.abiAlignment(ip, ft);
+            offset = std.mem.alignForward(u64, offset, a);
+            offsets[i] = offset;
+            offset += Type.abiSize(ip, ft);
+            alignment = @max(alignment, a);
+        }
+        info.field_offsets = offsets;
+        info.size = std.mem.alignForward(u64, offset, alignment);
+        info.alignment = alignment;
     }
-    info.field_offsets = offsets;
-    info.size = std.mem.alignForward(u64, offset, alignment);
-    info.alignment = alignment;
     info.status = .have_layout;
 
     // Defaults may refer to the struct itself (for example its size), so
@@ -2480,10 +2507,14 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 });
             }
             const layout_ty = try sema.stdLangType(block, src, "Type.ContainerLayout");
+            const backing: Index = if (class != .tuple and Type.isPackedStruct(ip, ty)) b: {
+                try sema.resolveLayout(block, src, ty);
+                break :b ip.structInfo(ty).tag_type;
+            } else .none;
             break :blk try sema.structValue(block, src, try sema.stdLangType(block, src, "Type.Struct"), &[_]S{
                 .{ "is_tuple", boolValue(is_tuple) },
                 .{ "layout", try sema.enumValueByName(block, src, layout_ty, if (class == .tuple) "auto" else @tagName(ip.structInfo(ty).layout)) },
-                .{ "backing_integer", try sema.optValue(.type_type, .none) },
+                .{ "backing_integer", try sema.optValue(.type_type, backing) },
                 .{ "field_names", try sema.namesValue(names) },
                 .{ "field_types", try sema.sliceValue(.type_type, types) },
                 .{ "field_attrs", try sema.sliceValue(attrs_ty, attrs) },
@@ -2913,8 +2944,21 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         if (sema.naturalAlignment(elem) == a) alignment = 0;
     }
     if (data.flags.has_addrspace) return sema.failUnsupported(block, src, "address spaces");
-    if (data.flags.has_bit_range) return sema.failUnsupported(block, src, "bit-pointers");
+    var packed_offset: InternPool.PtrType.PackedOffset = .{};
+    if (data.flags.has_bit_range) {
+        const bit_offset = try sema.resolveInt(block, src, @fromBackingInt(sema.code.extra[i]), .u16_type, "bit offset must be comptime-known");
+        const host_size = try sema.resolveInt(block, src, @fromBackingInt(sema.code.extra[i + 1]), .u16_type, "host size must be comptime-known");
+        i += 2;
+        if (host_size != 0) {
+            try sema.resolveLayout(block, src, elem);
+            const bits = Type.packedBits(sema.ip, elem) orelse return sema.fail(block, src, "bit-pointer cannot refer to value of type '{f}'", .{sema.fmtType(elem)});
+            if (bit_offset >= host_size * 8) return sema.fail(block, src, "packed type '{f}' at bit offset {d} starts {d} bits after the end of a {d} byte host integer", .{ sema.fmtType(elem), bit_offset, bit_offset - host_size * 8, host_size });
+            if (bits > host_size * 8 - bit_offset) return sema.fail(block, src, "packed type '{f}' at bit offset {d} ends {d} bits after the end of a {d} byte host integer", .{ sema.fmtType(elem), bit_offset, bits - (host_size * 8 - bit_offset), host_size });
+        }
+        packed_offset = .{ .bit_offset = @intCast(bit_offset), .host_size = @intCast(host_size) };
+    }
     return .fromInterned(try sema.ptrType(.{
+        .packed_offset = packed_offset,
         .child = elem,
         .sentinel = sentinel,
         .flags = .{
@@ -4929,6 +4973,21 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
     }
     if (is_eq and (lc == .optional or rc == .optional)) return sema.cmpOptional(block, src, op, lhs, rhs);
     if (is_eq and lt == .void_type and rt == .void_type) return .fromInterned(boolValue(op == .eq));
+    if (is_eq and lt == rt and Type.isPackedStruct(ip, lt)) {
+        // Packed structs compare as their backing integers.
+        try sema.resolveLayout(block, src, lt);
+        const backing = ip.structInfo(lt).tag_type;
+        if (sema.resolveValue(lhs)) |a| if (sema.resolveValue(rhs)) |b| {
+            if (sema.isUndef(a) or sema.isUndef(b)) return .fromInterned(try sema.undefValue(.bool_type));
+            var ab = try BigInt.init(sema.arena);
+            var bb = try BigInt.init(sema.arena);
+            try sema.valueBits(a, &ab, 0);
+            try sema.valueBits(b, &bb, 0);
+            return .fromInterned(boolValue(ab.eql(bb) == (op == .eq)));
+        };
+        try sema.requireRuntime(block, src);
+        return sema.addBinOp(block, if (op == .eq) .cmp_eq else .cmp_neq, try sema.addTyOp(block, .bitcast, backing, lhs), try sema.addTyOp(block, .bitcast, backing, rhs));
+    }
     if (is_eq and ((lc == .error_union and rc == .error_set) or (lc == .error_set and rc == .error_union))) {
         // `eu == error.X`: the error union holds that error.
         const eu = if (lc == .error_union) lhs else rhs;
@@ -5202,6 +5261,15 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     try sema.requireRuntime(block, src);
     try sema.resolveLayout(block, src, info.child);
     if (!Type.hasRuntimeBits(ip, info.child)) return;
+    if (info.packed_offset.host_size != 0) {
+        // Read, modify, and write the host integer.
+        const host_ty = try sema.intType(.unsigned, info.packed_offset.host_size * 8);
+        const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_volatile = info.flags.is_volatile } }), ptr);
+        const old = try sema.addTyOp(block, .load, host_ty, host_ptr);
+        const new = try sema.packedInsert(block, old, info.packed_offset.bit_offset, operand);
+        _ = try sema.addBinOp(block, .store, host_ptr, new);
+        return;
+    }
     _ = try sema.addBinOp(block, .store, ptr, operand);
 }
 
@@ -5219,7 +5287,80 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
         if (info.child == .void_type) return .void_value;
         if (Type.isComptimeOnly(ip, info.child)) return sema.fail(block, src, "unable to load comptime-only type '{f}' at runtime", .{sema.fmtType(info.child)});
     }
+    if (info.packed_offset.host_size != 0) {
+        const host_ty = try sema.intType(.unsigned, info.packed_offset.host_size * 8);
+        const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_const = true, .is_volatile = info.flags.is_volatile } }), ptr);
+        return sema.packedExtract(block, try sema.addTyOp(block, .load, host_ty, host_ptr), info.packed_offset.bit_offset, info.child);
+    }
     return sema.addTyOp(block, .load, info.child, ptr);
+}
+
+// ---------------------------------------------------------------------------
+// Packed structs
+//
+// A packed struct is its backing integer at runtime. Sema lowers field
+// reads, field writes through bit pointers, and initialization to integer
+// operations on it, so CodeGen never sees a packed field.
+
+/// Runtime value `val` as an unsigned integer of its packed bit width.
+fn packedToBits(sema: *Sema, block: *Block, val: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const ty = sema.typeOf(val);
+    const bits_ty = try sema.intType(.unsigned, Type.packedBits(ip, ty).?);
+    if (ty == bits_ty) return val;
+    var v = val;
+    if (Type.class(ip, ty) == .@"enum") v = try sema.addTyOp(block, .bitcast, ip.structInfo(ty).tag_type, v);
+    if (Type.isPackedStruct(ip, ty)) v = try sema.addTyOp(block, .bitcast, ip.structInfo(ty).tag_type, v);
+    if (sema.typeOf(v) == bits_ty) return v;
+    return sema.addTyOp(block, .bitcast, bits_ty, v);
+}
+
+/// The value of type `ty` whose packed bits are unsigned integer `bits`.
+fn packedFromBits(sema: *Sema, block: *Block, bits: Ref, ty: Index) CompileError!Ref {
+    const ip = sema.ip;
+    if (sema.typeOf(bits) == ty) return bits;
+    if (Type.class(ip, ty) == .@"enum") {
+        const tag_ty = ip.structInfo(ty).tag_type;
+        const tag = if (tag_ty == sema.typeOf(bits)) bits else try sema.addTyOp(block, .bitcast, tag_ty, bits);
+        return sema.addTyOp(block, .bitcast, ty, tag);
+    }
+    return sema.addTyOp(block, .bitcast, ty, bits);
+}
+
+/// The field of type `ty` at `bit_offset` in runtime integer `host`.
+fn packedExtract(sema: *Sema, block: *Block, host: Ref, bit_offset: u16, ty: Index) CompileError!Ref {
+    const ip = sema.ip;
+    const host_ty = sema.typeOf(host);
+    const host_bits = Type.intInfo(ip, host_ty).bits;
+    const bits = Type.packedBits(ip, ty).?;
+    if (bits == 0) return .fromInterned(try sema.undefValue(ty));
+    var v = host;
+    if (bit_offset != 0) v = try sema.addBinOp(block, .shr, v, .fromInterned(try sema.intValue(try sema.intType(.unsigned, Type.log2IntBits(host_bits)), bit_offset)));
+    if (bits != host_bits) v = try sema.addTyOp(block, .trunc, try sema.intType(.unsigned, bits), v);
+    return sema.packedFromBits(block, v, ty);
+}
+
+/// Runtime integer `host` with the field at `bit_offset` replaced by `val`.
+fn packedInsert(sema: *Sema, block: *Block, host: Ref, bit_offset: u16, val: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const host_ty = sema.typeOf(host);
+    const host_bits = Type.intInfo(ip, host_ty).bits;
+    const bits = Type.packedBits(ip, sema.typeOf(val)).?;
+    if (bits == 0) return host;
+    // host & ~(mask << bit_offset) | (val << bit_offset)
+    var mask = try std.math.big.int.Managed.initSet(sema.arena, 1);
+    try mask.shiftLeft(&mask, bits);
+    try mask.addScalar(&mask, -1);
+    try mask.shiftLeft(&mask, bit_offset);
+    var all = try std.math.big.int.Managed.initSet(sema.arena, 1);
+    try all.shiftLeft(&all, host_bits);
+    try all.addScalar(&all, -1);
+    try mask.bitXor(&mask, &all);
+    const cleared = try sema.addBinOp(block, .bit_and, host, .fromInterned(try sema.bigToValue(host_ty, mask.toConst())));
+    var v = try sema.packedToBits(block, val);
+    if (bits != host_bits) v = try sema.addTyOp(block, .intcast, host_ty, v);
+    if (bit_offset != 0) v = try sema.addBinOp(block, .shl, v, .fromInterned(try sema.intValue(try sema.intType(.unsigned, Type.log2IntBits(host_bits)), bit_offset)));
+    return sema.addBinOp(block, .bit_or, cleared, v);
 }
 
 fn analyzeRef(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
@@ -5714,6 +5855,11 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
             if (ip.indexToKey(ty) == .tuple_type) return sema.tupleField(block, lhs, i);
             if (sema.resolveValue(lhs)) |v| return .fromInterned(try sema.fieldValue(v, i));
             try sema.requireRuntime(block, src);
+            if (Type.isPackedStruct(ip, ty)) {
+                try sema.resolveLayout(block, src, ty);
+                const backing = ip.structInfo(ty).tag_type;
+                return sema.packedExtract(block, try sema.addTyOp(block, .bitcast, backing, lhs), Type.packedFieldBitOffset(ip, ty, i), Type.fieldType(ip, ty, i));
+            }
             return sema.addStructField(block, .struct_field_val, Type.fieldType(ip, ty, i), lhs, i);
         },
         .array => if (std.mem.eql(u8, name, "len")) return .fromInterned(try sema.intValue(.usize_type, ip.indexToKey(ty).array_type.len)),
@@ -5998,7 +6144,32 @@ fn elemValueType(sema: *Sema, slice_ty: Index) !Index {
 }
 
 fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i: u32) CompileError!Ref {
-    const p = Type.ptrInfo(sema.ip, sema.typeOf(ptr));
+    const ip = sema.ip;
+    const p = Type.ptrInfo(ip, sema.typeOf(ptr));
+    if (Type.isPackedStruct(ip, p.child)) {
+        // A bit pointer into the struct's backing integer, at the same
+        // address as the struct.
+        try sema.resolveLayout(block, src, p.child);
+        const bit_offset = p.packed_offset.bit_offset + Type.packedFieldBitOffset(ip, p.child, i);
+        // The struct pointer's alignment, as upstream.
+        const align_bytes: u64 = if (p.flags.alignment != 0) @as(u64, 1) << (p.flags.alignment - 1) else Type.abiAlignment(ip, p.child);
+        const alignment: u6 = if (sema.naturalAlignment(field_ty) == align_bytes) 0 else @intCast(std.math.log2_int(u64, align_bytes) + 1);
+        const result_ty = try sema.ptrType(.{
+            .child = field_ty,
+            .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .alignment = alignment },
+            .packed_offset = .{
+                .host_size = if (p.packed_offset.host_size != 0) p.packed_offset.host_size else @intCast(Type.abiSize(ip, p.child)),
+                .bit_offset = bit_offset,
+            },
+        });
+        if (sema.resolveValue(ptr)) |pv| {
+            if (!sema.isUndef(pv) and try sema.comptimePtrRoot(pv) != .int) {
+                return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = i } } } }));
+            }
+        }
+        try sema.requireRuntime(block, src);
+        return sema.addTyOp(block, .bitcast, result_ty, ptr);
+    }
     const result_ty = try sema.ptrType(.{ .child = field_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
     if (sema.resolveValue(ptr)) |pv| {
         if (try sema.comptimePtrRoot(pv) != .int) {
@@ -7024,6 +7195,12 @@ fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref
     if (all_comptime) return .fromInterned(try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = vals } } }));
     try sema.requireRuntime(block, src);
     try sema.resolveLayout(block, src, ty);
+    if (Type.isPackedStruct(sema.ip, ty)) {
+        const backing = sema.ip.structInfo(ty).tag_type;
+        var host: Ref = .fromInterned(try sema.intValue(backing, 0));
+        for (elems, 0..) |e, i| host = try sema.packedInsert(block, host, Type.packedFieldBitOffset(sema.ip, ty, i), e);
+        return sema.addTyOp(block, .bitcast, ty, host);
+    }
     const payload = try sema.addExtra(Ir.Aggregate{ .len = @intCast(elems.len) });
     try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(elems));
     return sema.addInst(block, .{ .tag = .aggregate_init, .data = .{ .ty_pl = .{ .ty = ty, .payload = payload } } });
@@ -7436,6 +7613,7 @@ fn bitCastBits(sema: *Sema, ty: Index) ?u64 {
             if (eb != Type.abiSize(ip, v.child) * 8) break :blk null;
             break :blk eb * v.len;
         },
+        .struct_type => if (Type.isPackedStruct(ip, ty)) Type.intInfo(ip, ip.structInfo(ty).tag_type).bits else null,
         else => if (Type.class(ip, ty) == .float) Type.floatBits(ip, ty) else if (ty == .bool_type) 1 else null,
     };
 }
@@ -7460,6 +7638,18 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) !void {
         },
         .float => try part.set(ip.indexToKey(v).float.bits()),
         .bool => try part.set(@intFromBool(v == .bool_true)),
+        // A packed struct's fields, and an enum (a packed struct field) by
+        // its tag.
+        .@"struct" => {
+            if (sema.isUndef(v)) return;
+            for (0..Type.fieldCount(ip, ty)) |i| try sema.valueBits(try sema.fieldValue(v, @intCast(i)), out, offset + Type.packedFieldBitOffset(ip, ty, i));
+            return;
+        },
+        .@"enum" => {
+            if (sema.isUndef(v)) return;
+            return sema.valueBits(ip.indexToKey(v).enum_tag.int, out, offset);
+        },
+        .void => return,
         else => {
             if (sema.isUndef(v)) return; // An undefined element: zeros.
             part = try sema.bigValue(v);
@@ -7496,6 +7686,13 @@ fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) 
             return sema.floatFromBits(ty, part.toConst().toInt(u128) catch unreachable);
         },
         .bool => return boolValue(part.toConst().limbs[0] & 1 != 0),
+        .@"struct" => {
+            const elems = try sema.arena.alloc(Index, Type.fieldCount(ip, ty));
+            for (elems, 0..) |*e, i| e.* = try sema.bitsValue(Type.fieldType(ip, ty, i), bits, offset + Type.packedFieldBitOffset(ip, ty, i));
+            return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+        },
+        .@"enum" => return sema.intern(.{ .enum_tag = .{ .ty = ty, .int = try sema.bitsValue(ip.structInfo(ty).tag_type, bits, offset) } }),
+        .void => return .void_value,
         else => {
             const info = Type.intInfo(ip, ty);
             try part.truncate(&part, info.signedness, info.bits);

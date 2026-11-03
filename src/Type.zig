@@ -430,9 +430,11 @@ pub fn fieldType(ip: *const InternPool, ty: Index, i: usize) Index {
     };
 }
 
+/// The byte offset of field `i`. A packed struct's fields live in its
+/// backing integer at offset 0 (see `packedFieldBitOffset`).
 pub fn fieldOffset(ip: *const InternPool, ty: Index, i: usize) u64 {
     return switch (ip.indexToKey(ty)) {
-        .struct_type => ip.structInfo(ty).field_offsets[i],
+        .struct_type => if (isPackedStruct(ip, ty)) 0 else ip.structInfo(ty).field_offsets[i],
         .union_type => unionLayout(ip, ty).payload_offset,
         .tuple_type => tupleLayout(ip, ty, i).field_offset,
         .array_type => |a| i * abiSize(ip, a.child),
@@ -446,4 +448,27 @@ pub fn fieldOffset(ip: *const InternPool, ty: Index, i: usize) u64 {
 pub fn log2IntBits(bits: u16) u16 {
     if (bits <= 1) return 0;
     return std.math.log2_int_ceil(u16, bits);
+}
+
+pub fn isPackedStruct(ip: *const InternPool, ty: Index) bool {
+    return ip.indexToKey(ty) == .struct_type and ip.structInfo(ty).layout == .@"packed";
+}
+
+/// The bit offset of field `i` of packed struct `ty` in its backing
+/// integer.
+pub fn packedFieldBitOffset(ip: *const InternPool, ty: Index, i: usize) u16 {
+    return @intCast(ip.structInfo(ty).field_offsets[i]);
+}
+
+/// The number of bits `ty` occupies in a packed struct, or null if it
+/// cannot be a packed struct field (zap does not support pointers there).
+pub fn packedBits(ip: *const InternPool, ty: Index) ?u16 {
+    if (ty == .bool_type) return 1;
+    return switch (class(ip, ty)) {
+        .void => 0,
+        .int, .@"enum" => intInfo(ip, ty).bits,
+        .float => floatBits(ip, ty),
+        .@"struct" => if (isPackedStruct(ip, ty)) intInfo(ip, ip.structInfo(ty).tag_type).bits else null,
+        else => null,
+    };
 }

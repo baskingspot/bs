@@ -261,10 +261,11 @@ pub const ContainerInfo = struct {
     /// Structs: the default value, `.none` for fields without one.
     /// Enums: the tag value of each field, of type `tag_type`.
     field_defaults: []const Index = &.{},
-    /// Structs only.
+    /// Structs only: byte offsets, or bit offsets in the backing integer
+    /// for packed structs.
     field_offsets: []const u64 = &.{},
     /// Enums: the integer tag type. Tagged unions: the enum tag type.
-    /// Otherwise `.none`.
+    /// Packed structs: the backing integer type. Otherwise `.none`.
     tag_type: Index = .none,
     /// Enums only: whether the enum is non-exhaustive (`_`).
     nonexhaustive: bool = false,
@@ -343,6 +344,10 @@ pub const PtrType = struct {
     child: Index,
     sentinel: Index = .none,
     flags: Flags = .{},
+    /// A bit pointer, to a field of a packed struct: the pointer addresses
+    /// a `host_size`-byte integer and the value is at `bit_offset` in it.
+    /// `host_size` 0 is an ordinary pointer.
+    packed_offset: PackedOffset = .{},
 
     pub const Size = std.lang.Type.Pointer.Size;
     pub const Flags = packed struct(u32) {
@@ -353,6 +358,11 @@ pub const PtrType = struct {
         /// 0 means the child's natural alignment, otherwise log2(align) + 1.
         alignment: u6 = 0,
         _: u21 = 0,
+    };
+
+    pub const PackedOffset = packed struct(u32) {
+        host_size: u16 = 0,
+        bit_offset: u16 = 0,
     };
 };
 
@@ -952,7 +962,7 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
     switch (key) {
         .int_type => |t| return .{ .tag = if (t.signedness == .signed) .type_int_signed else .type_int_unsigned, .data = t.bits },
         .simple_type => |t| return .{ .tag = .type_simple, .data = @backingInt(t) },
-        .ptr_type => |t| return .{ .tag = .type_ptr, .data = try ip.addExtra(local, &.{ idx(t.child), idx(t.sentinel), @bitCast(t.flags) }) },
+        .ptr_type => |t| return .{ .tag = .type_ptr, .data = try ip.addExtra(local, &.{ idx(t.child), idx(t.sentinel), @bitCast(t.flags), @bitCast(t.packed_offset) }) },
         .array_type => |t| return .{ .tag = .type_array, .data = try ip.addExtra(local, &.{ @truncate(t.len), @truncate(t.len >> 32), idx(t.child), idx(t.sentinel) }) },
         .vector_type => |t| return .{ .tag = .type_vector, .data = try ip.addExtra(local, &.{ t.len, idx(t.child) }) },
         .opt_type => |c| return .{ .tag = .type_opt, .data = idx(c) },
@@ -1083,7 +1093,7 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         .type_int_signed => .{ .int_type = .{ .signedness = .signed, .bits = @intCast(d) } },
         .type_int_unsigned => .{ .int_type = .{ .signedness = .unsigned, .bits = @intCast(d) } },
         .type_simple => .{ .simple_type = @fromBackingInt(d) },
-        .type_ptr => .{ .ptr_type = .{ .child = I.i(extra[d]), .sentinel = I.i(extra[d + 1]), .flags = @bitCast(extra[d + 2]) } },
+        .type_ptr => .{ .ptr_type = .{ .child = I.i(extra[d]), .sentinel = I.i(extra[d + 1]), .flags = @bitCast(extra[d + 2]), .packed_offset = @bitCast(extra[d + 3]) } },
         .type_array => .{ .array_type = .{ .len = I.u64of(extra[d], extra[d + 1]), .child = I.i(extra[d + 2]), .sentinel = I.i(extra[d + 3]) } },
         .type_vector => .{ .vector_type = .{ .len = extra[d], .child = I.i(extra[d + 1]) } },
         .type_opt => .{ .opt_type = I.i(d) },
@@ -1283,6 +1293,7 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
             ip.hashIndex(&h, t.child);
             ip.hashIndex(&h, t.sentinel);
             h.int(u32, @bitCast(t.flags));
+            h.int(u32, @bitCast(t.packed_offset));
         },
         .array_type => |t| {
             h.int(u64, t.len);
@@ -1434,7 +1445,8 @@ fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
         .int_type => |x| x.signedness == b.int_type.signedness and x.bits == b.int_type.bits,
         .simple_type => |x| x == b.simple_type,
         .ptr_type => |x| x.child == b.ptr_type.child and x.sentinel == b.ptr_type.sentinel and
-            @as(u32, @bitCast(x.flags)) == @as(u32, @bitCast(b.ptr_type.flags)),
+            @as(u32, @bitCast(x.flags)) == @as(u32, @bitCast(b.ptr_type.flags)) and
+            @as(u32, @bitCast(x.packed_offset)) == @as(u32, @bitCast(b.ptr_type.packed_offset)),
         .array_type => |x| x.len == b.array_type.len and x.child == b.array_type.child and x.sentinel == b.array_type.sentinel,
         .vector_type => |x| x.len == b.vector_type.len and x.child == b.vector_type.child,
         .opt_type => |x| x == b.opt_type,
