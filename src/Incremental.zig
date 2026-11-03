@@ -626,8 +626,10 @@ const Keyer = struct {
                 const ns = k.zcu.namespacePtr(nn.namespace);
                 return .{
                     .key = try k.keyOf(.namespace_name, &.{ ns.key, ip.stringSlice(nn.name) }),
-                    // Which declaration the name finds, if any.
-                    .result_hash = if (ns.decls.get(nn.name)) |nav| cache.hash(3, ip.stringSlice(ip.getNav(nav).key)) else 0,
+                    // Which declaration the name finds, if any, and
+                    // whether it is `pub` (`@hasDecl`, and access from
+                    // other files, read that).
+                    .result_hash = if (ns.decls.get(nn.name)) |nav| cache.hash(3, ip.stringSlice(ip.getNav(nav).key)) ^ @intFromBool(ip.getNav(nav).is_pub) else 0,
                 };
             },
             .namespace => |ns_index| {

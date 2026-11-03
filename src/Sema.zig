@@ -4007,8 +4007,8 @@ fn zirHasDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.rhs));
     // Records exactly what was observed: whether this name exists.
     const nav = (try sema.lookupInType(ty, name)) orelse return .fromInterned(.bool_false);
-    const is_visible = sema.ip.getNav(nav).is_pub or sema.ip.getNav(nav).file == sema.file;
-    return .fromInterned(boolValue(is_visible));
+    // Only a `pub` declaration counts, even in the same file, as upstream.
+    return .fromInterned(boolValue(sema.ip.getNav(nav).is_pub));
 }
 
 fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.ContainerKind) CompileError!Ref {
