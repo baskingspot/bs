@@ -927,12 +927,17 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
             const enum_ty = cg.typeOf(data.ty_op.operand);
             const info = ip.structInfo(enum_ty);
-            try cg.load(.rax, data.ty_op.operand);
+            const wide = cg.isWideInt(enum_ty);
+            if (!wide) try cg.load(.rax, data.ty_op.operand);
             const done = try cg.e.newLabel();
             for (info.field_names, info.field_defaults) |name, v| {
                 const next = try cg.e.newLabel();
-                try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @bitCast(intBits(ip, v)) });
-                try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
+                if (wide) {
+                    try cg.wideEqFlags(data.ty_op.operand, .fromInterned(v));
+                } else {
+                    try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @bitCast(intBits(ip, v)) });
+                    try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
+                }
                 try cg.e.jcc(.ne, .{ .label = next });
                 const bytes = ip.stringSlice(name);
                 const z = try cg.emit.allocator().alloc(u8, bytes.len + 1);
@@ -1163,7 +1168,8 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
 fn switchBr(cg: *CodeGen, data: Inst.Data) Error!void {
     const ir = cg.ir;
     const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
-    try cg.load(.rax, data.pl_op.operand);
+    const wide = cg.isWideInt(cg.typeOf(data.pl_op.operand));
+    if (!wide) try cg.load(.rax, data.pl_op.operand);
     const Case = struct { label: Encoder.Label, body: []const Inst.Index };
     var cases: std.ArrayList(Case) = .empty;
     defer cases.deinit(cg.gpa);
@@ -1176,6 +1182,11 @@ fn switchBr(cg: *CodeGen, data: Inst.Data) Error!void {
         i += 2 + items_len + body_len;
         const label = try cg.e.newLabel();
         for (items) |item| {
+            if (wide) {
+                try cg.wideEqFlags(data.pl_op.operand, item);
+                try cg.e.jcc(.e, .{ .label = label });
+                continue;
+            }
             try cg.load(.rcx, item);
             try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
             try cg.e.jcc(.e, .{ .label = label });
@@ -2619,7 +2630,9 @@ fn intFromFloat(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 // run limb by limb in rax, rcx, and rdx.
 
 fn isWideInt(cg: *CodeGen, ty: Index) bool {
-    return Type.isInt(cg.ip, ty) and Type.abiSize(cg.ip, ty) > 8;
+    // An enum is its integer tag.
+    const c = Type.class(cg.ip, ty);
+    return (c == .int or c == .@"enum") and Type.abiSize(cg.ip, ty) > 8;
 }
 
 fn limbCount(cg: *CodeGen, ty: Index) u32 {
@@ -2642,6 +2655,20 @@ fn loadLimb(cg: *CodeGen, reg: Reg, v: Val, i: u32) Error!void {
     if (!cg.signed(v.ty)) return cg.e.mov(.dword, .{ .reg = reg }, .{ .imm = 0 });
     try cg.loadLimb(reg, v, n - 1);
     try cg.e.shift(.sar, .qword, .{ .reg = reg }, 63);
+}
+
+/// Sets ZF when wide integers `a` and `b` of the same type are equal: when
+/// every limb XORs to zero. Uses rax and rcx.
+fn wideEqFlags(cg: *CodeGen, a_ref: Ref, b_ref: Ref) Error!void {
+    const a = (try cg.wideVal(a_ref)).loc.mem;
+    const b = (try cg.wideVal(b_ref)).loc.mem;
+    try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = a });
+    try cg.e.alu(.xor, .qword, .{ .reg = .rax }, .{ .mem = b });
+    for (1..cg.limbCount(cg.typeOf(a_ref))) |i| {
+        try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .mem = limb(a, @intCast(i)) });
+        try cg.e.alu(.xor, .qword, .{ .reg = .rcx }, .{ .mem = limb(b, @intCast(i)) });
+        try cg.e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .reg = .rcx });
+    }
 }
 
 /// `v` with a wide integer in memory (materializing an undefined constant).
@@ -2852,18 +2879,12 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
             const dst = try cg.resultMem(inst, .bool_type) orelse return;
             const ty = cg.typeOf(data.bin_op.lhs);
             const n = cg.limbCount(ty);
-            var a = (try cg.wideVal(data.bin_op.lhs)).loc.mem;
-            var b = (try cg.wideVal(data.bin_op.rhs)).loc.mem;
             if (tag == .cmp_eq or tag == .cmp_neq) {
-                try e.mov(.qword, .{ .reg = .rax }, .{ .mem = a });
-                try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .mem = b });
-                for (1..n) |i| {
-                    try e.mov(.qword, .{ .reg = .rcx }, .{ .mem = limb(a, @intCast(i)) });
-                    try e.alu(.xor, .qword, .{ .reg = .rcx }, .{ .mem = limb(b, @intCast(i)) });
-                    try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .reg = .rcx });
-                }
+                try cg.wideEqFlags(data.bin_op.lhs, data.bin_op.rhs);
                 return e.setcc(if (tag == .cmp_eq) .e else .ne, .{ .mem = dst });
             }
+            var a = (try cg.wideVal(data.bin_op.lhs)).loc.mem;
+            var b = (try cg.wideVal(data.bin_op.rhs)).loc.mem;
             // The flags of `a - b` over all limbs: `>` and `<=` swap.
             if (tag == .cmp_gt or tag == .cmp_lte) std.mem.swap(Mem, &a, &b);
             for (0..n) |i| {
