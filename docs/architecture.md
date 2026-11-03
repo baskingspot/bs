@@ -4193,6 +4193,120 @@ state. Built for step 1:
   skipped) as `zig build test`; its oracle steps find upstream zig on
   PATH when the build's compiler is not a zig release.
 
+## Fuzzing (designed 2026-11-03; being built)
+
+Goal: upstream 0.17.0's built-in fuzzer works with zap on x86_64-linux:
+`-ffuzz`, `std.testing.fuzz`, and `zig build test --fuzz` under `zap
+build`. Agents fuzz to find a crash, then minimize and fix it.
+
+**How upstream does it.** `zig build test --fuzz[=n]` runs the tests
+once, learns which call `std.testing.fuzz`, rebuilds those test binaries
+with `-ffuzz`, and runs them with `--listen=-`; the test runner hands
+each fuzz test to the fuzzer (`std.Build.abi.fuzz`), which mutates
+inputs and keeps the ones that reach new code. Only the LLVM backend
+instruments (`codegen/llvm/FuncGen.zig`, `.poi`): per function, an array
+of 8-bit counters in section `__sancov_cntrs`, bumped at the function's
+entry and at both arms of most branches, and a parallel array of the
+points' addresses in `__sancov_pcs1`. The fuzzer finds both arrays
+through the linker's `__start_`/`__stop_` symbols, resets the counters
+before each run, and reads them as hit or not hit. `lib/fuzzer.zig` is a
+separate compilation (a static library, ReleaseFast, uninstrumented, with
+its own root, `std_options`, and copy of std), so its own work never
+shows as coverage. Upstream's self-hosted x86_64 backend, its Linux Debug
+default, does not instrument: `--fuzz` there fails with "pcs_len was
+zero". Measured (orb, `zig build test --fuzz=30M -Dllvm`, fresh cache):
+upstream's LLVM build finds a planted out-of-bounds write behind a
+`key=zap!` prefix after 6.7 M runs, about 20 s.
+
+**zap's design.**
+
+- **Command line.** `-ffuzz` sets one flag for the compilation:
+  `builtin.fuzz = true`, every function of the program's module family
+  (below) except compiler_rt is instrumented, and an executable links the
+  fuzzer. Upstream's flag is per module; zap instruments every module,
+  which upstream's `zig build --fuzz` asks for anyway (it passes
+  `-ffuzz` ahead of the root module, and modules inherit it). `-fno-fuzz`
+  stays accepted and ignored (a module that opts out is instrumented
+  too; instrumentation is not semantics). `-ffuzz` on `build-obj` and
+  `build-lib`, and for aarch64-macos, is `[unsupported]` for now.
+- **The fuzzer is a module family, not a second compilation.** zap
+  compiles `<zig lib>/fuzzer.zig` in the same compilation as the program,
+  but as its own *module family*: the root `fuzzer` (fuzzer.zig), its own
+  `std@fuzzer` (std's files again) and `builtin@fuzzer` (output mode
+  `Lib`, `is_test` and `fuzz` false). Every module names the modules that
+  `@import("std")`, `@import("root")` and `@import("builtin")` resolve to
+  (`Frontend.Module.std_mod`, `root_mod`, `builtin_mod`; the main ones
+  for every module but the fuzzer's). So fuzzer.zig gets what upstream's
+  separate compilation gives it: its `std_options` (its log goes to its
+  own file), its panic handler, `std.lang` types of its own std, and std
+  code that is not instrumented. Sema reads the family wherever it names
+  std, root or builtin itself: imports, `@embedFile` of a module name,
+  `std.lang` lookups (`stdLangDecl`), the panic handler's namespace, and
+  the `@typeInfo` memo key (each family's `std.lang.Type` differs).
+  Exports and externs still meet by name across families, as with
+  compiler_rt: the test runner's `extern fn fuzzer_init` resolves to
+  fuzzer.zig's `export fn`, and fuzzer.zig's `extern fn runner_test_run`
+  to the test runner's. Unit keys stay unique because module names do.
+  Why not a separate compilation linked in: zap's linker does not read
+  objects, and a second Zcu would need its own cache manifest, relink
+  path, error numbering and symbol-key salt. As a family, the fuzzer gets
+  the per-declaration cache, parallel CodeGen, edit builds and debug info
+  for free; the cost is analyzing the std code fuzzer.zig reaches a
+  second time, once per project (it is cached like any other unit).
+- **Coverage points**, decided per function in the shared SSA layer
+  (`Ssa.place` with `cover`), so aarch64 reuses them: the function's
+  entry, and each successor block of a `branch` or `switch_br` whose
+  arms are all hot. A branch with a cold arm (a safety check, `@panic`,
+  `unreachable`) gets none: its failing side ends the run, and its other
+  side tells the fuzzer nothing its predecessor does not. This matches
+  upstream's choice, which marks Sema's safety checks `.none`; zap also
+  instruments switch cases, which upstream leaves out, because a case
+  is often the only branch a byte-dispatch loop has. A covered block is
+  never bypassed by pass 3 (an empty arm keeps a block of its own). Not
+  instrumented: compiler_rt, the fuzzer's family, naked functions, and
+  functions that call `@disableInstrumentation()` (the test runner's,
+  `std.testing.Smith`'s helpers), which Sema records on the IR
+  (`Ir.disable_instrumentation`, never persisted, like the IR).
+- **Counters.** Each point is `mov byte [rip + counters + i], 1` (7
+  bytes) at the start of its block: it sets the counter rather than
+  adding to it, which is all the fuzzer reads (zero or not), cannot wrap
+  to zero after 256 hits as an 8-bit add does, needs no load, and touches
+  no register and no flag, so it goes anywhere without the allocator's
+  knowledge. On aarch64 it will be `adrp`/`strb` with a scratch register.
+- **Atoms.** An instrumented function's unit gets two more atoms, keyed
+  from its function key: the counters (section `sancov_cntrs`, zero-fill,
+  alignment 1, one byte per point) and the PC table (section
+  `sancov_pcs`, alignment 8, one `x86_64_abs64` relocation per point to
+  the function at the point's offset; the entry's is offset 0, the
+  function's address, as upstream's, which the build runner matches to a
+  test's entry). Offsets are taken after branch shortening. Both have
+  empty names. Because the linker keeps atoms in input order within a
+  section and the two atoms are added together, the two arrays line up
+  index for index, as the fuzzer requires; their sizes (n and 8n bytes)
+  need no padding between atoms.
+- **Format changes** (append-only): `Atom.Section` gains `sancov_cntrs`
+  and `sancov_pcs` (the cache stores the section as a byte and checks it
+  with `std.enums.fromInt`; `Elf.Place.section` has 3 bits, which now
+  are all used). The ELF linker places `__sancov_pcs1` after `.rodata`
+  in the R segment and `__sancov_cntrs` (NOBITS) after `.bss`, and
+  writes their section headers only when they are not empty, so a build
+  without `-ffuzz` links exactly as before. It defines the four
+  boundary symbols as link-time addresses (`Atom.SymbolKey.sectionBound`),
+  which the extern slots of `@extern("__start___sancov_cntrs")` and the
+  others name; the cached relink passes their symbol numbers
+  (`Elf.Symbols.bounds`). Objects do not get the sections yet.
+- **Cache.** Instrumented atoms differ from plain ones, so the store
+  seed and the compilation key include the flag (the target string gets
+  `+fuzz`), and so must the donor key.
+- **Cost when off**: one flag test per function in CodeGen and per
+  `place`, and the linker's per-section arrays grow from 6 to 8 entries;
+  no extra atoms, sections, analysis or format bytes.
+- **`zap build`.** Nothing zap-specific: the runner's fuzz rebuild passes
+  `-ffuzz` and zap builds it; the test binary runs as upstream's does.
+  `--fuzz` without a limit also serves upstream's web UI, whose wasm
+  client the runner compiles with the build's compiler for wasm32, which
+  zap does not target; fuzzing and crash reports work without it.
+
 ## `builtin` and conformance
 
 - zap generates the `builtin` module itself. It reports
