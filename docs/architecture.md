@@ -1326,6 +1326,39 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    fusion, unused arguments) are `Ssa.plan`, run after `liveness` and
    recorded per value as a `Live.fate` beside its register; the
    architecture answers `inGpr`, `fusable`, and `ovfFlagsOnly`.
+   Promotion, the next piece, is built in an interim form without
+   renaming: `Ssa.plan` promotes a non-volatile alloc whose type is in a
+   register (`inGpr`) or two (`inPair`) and whose address is only loaded
+   from and stored to (one count per candidate in the pass `plan` already
+   makes), and the variable keeps one register, or pair, for its whole
+   interval, which liveness already extends over the loops that use it,
+   so no phis are needed; a block's result is likewise one register that
+   each `br` writes. A load shares its variable's register when the
+   variable's interval contains the load's and no store to the variable
+   lies inside it (`Live.share`); `allocate` keeps such a variable from
+   being evicted while loads share it. A pair class (`want_pair`,
+   `Live.reg2`) holds 16-byte values as their two eightbytes: on x86_64,
+   slices, optional slices, and error unions with an 8-byte payload
+   (error code low, payload high), which loads, `slice`, element reads,
+   `.auto` arguments and results, and the error-union and optional
+   operations produce and read in registers; other code reads a pair
+   from a spill slot written at the read. A pair gets two free registers
+   or none, and is neither evicted nor tied. Error unions of up to 8
+   bytes are in one register (error code in the low 16 bits). Against
+   main 40b29a8, libvaxis text_input (`ZAP_BENCH_CODEGEN=10`, three
+   runs, idle): 5.58 → 5.15 code bytes per IR instruction, 698 → 687
+   frame bytes per function, 210–211 → 212–224 ns per IR instruction
+   (allocation 54.5 → 64–68, emission 139–140 → 132–139); the encoder
+   now counts the branches before each label when binding it instead of
+   searching for them, which pays back part of shortening. std's tests
+   (`ZAP_CACHE=off`, `ZAP_TIMING=1`): 292 → 285 ns per IR instruction
+   (allocation 63 → 71, emission 211 → 197), 6.03 → 5.63 code bytes per
+   IR instruction, wall time 6.53–6.58 → 6.55–6.60 s. `bench/runtime.py`,
+   same session: fib 123 → 118 ms, sieve 268 → 137, sort 370 → 291,
+   hash 239 → 239, nbody 405–410 → 407–449 (noise), fmt 134 → 114.
+   Still to come: renaming (a variable in different registers on
+   different paths), floats in registers, and copy elision for larger
+   aggregates.
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
 6. DWARF variable locations; then leaf inlining with the cache edge.
