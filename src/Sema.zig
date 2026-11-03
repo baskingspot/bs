@@ -5316,16 +5316,16 @@ fn analyzePtrArithmetic(sema: *Sema, block: *Block, src: Src, is_add: bool, ptr:
             const k = ip.indexToKey(pv).ptr;
             const count = ip.intValue(u64, nv).?;
             const delta = count *% elem_size;
+            // Step the element index when the pointer still has the
+            // element size of the array it indexes (it may have been cast).
+            const step_index = k.base == .elem and Type.abiSize(ip, sema.memElemType(ip.typeOf(k.base.elem.base))) == elem_size;
             return .fromInterned(try sema.intern(.{ .ptr = .{
                 .ty = ptr_ty,
-                .base = switch (k.base) {
-                    .elem => |e| .{ .elem = .{ .base = e.base, .index = if (is_add) e.index + count else e.index -% count } },
-                    else => k.base,
-                },
-                .byte_offset = switch (k.base) {
-                    .elem => k.byte_offset,
-                    else => if (is_add) k.byte_offset +% delta else k.byte_offset -% delta,
-                },
+                .base = if (step_index)
+                    .{ .elem = .{ .base = k.base.elem.base, .index = if (is_add) k.base.elem.index + count else k.base.elem.index -% count } }
+                else
+                    k.base,
+                .byte_offset = if (step_index) k.byte_offset else if (is_add) k.byte_offset +% delta else k.byte_offset -% delta,
             } }));
         }
     };
@@ -7294,6 +7294,22 @@ fn ptrRootBase(sema: *Sema, ptr: InternPool.Ptr) InternPool.Ptr.BaseAddr {
 /// only known at runtime (a global `var`, an address from an integer).
 fn comptimeLoadOrNull(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!?Index {
     const ip = sema.ip;
+    const load_ty = Type.ptrInfo(ip, ip.typeOf(ptr)).child;
+    // Even through an undefined pointer, a zero-bit type has its one value.
+    if (sema.isUndef(ptr)) if (try sema.onePossibleValue(load_ty)) |v| return v;
+    const v = (try sema.comptimeLoadStructural(block, src, ptr)) orelse return null;
+    const v_ty = ip.typeOf(v);
+    if (v_ty == load_ty or load_ty == .generic_poison_type or load_ty == .anyopaque_type) return v;
+    if (sema.childCoercibleInMemory(v_ty, load_ty)) return try sema.retypeInMemory(v, load_ty);
+    // The pointer views the memory as another type.
+    return sema.reinterpretLoad(block, src, ptr);
+}
+
+/// The value a comptime-known pointer addresses, found by following the
+/// pointer's steps through the values; its type may differ from the
+/// pointer's child type when the pointer was cast.
+fn comptimeLoadStructural(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!?Index {
+    const ip = sema.ip;
     const key = switch (ip.indexToKey(ptr)) {
         .ptr => |k| k,
         .undef => return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{}),
@@ -7314,34 +7330,36 @@ fn comptimeLoadOrNull(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileE
         },
         .int => null,
         .field => |f| blk: {
-            const parent = (try sema.comptimeLoadOrNull(block, src, f.base)) orelse break :blk null;
+            if (key.byte_offset != 0) return sema.reinterpretLoad(block, src, ptr);
+            const parent = (try sema.comptimeLoadStructural(block, src, f.base)) orelse break :blk null;
             if (ip.typeOf(parent) != Type.ptrInfo(ip, ip.typeOf(f.base)).child)
-                return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+                return sema.reinterpretLoad(block, src, ptr);
             break :blk try sema.fieldValue(parent, @intCast(f.index));
         },
         .elem => |e| blk: {
-            const parent = (try sema.comptimeLoadOrNull(block, src, e.base)) orelse break :blk null;
+            if (key.byte_offset != 0) return sema.reinterpretLoad(block, src, ptr);
+            const parent = (try sema.comptimeLoadStructural(block, src, e.base)) orelse break :blk null;
             const parent_ty = Type.ptrInfo(ip, ip.typeOf(e.base)).child;
             if (ip.indexToKey(parent_ty) == .vector_type) {
                 if (ip.typeOf(parent) != parent_ty or e.index >= ip.indexToKey(parent_ty).vector_type.len)
-                    return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+                    return sema.reinterpretLoad(block, src, ptr);
                 break :blk try sema.elemValue(parent, e.index);
             }
             if (ip.indexToKey(parent_ty) != .array_type) break :blk null;
             if (ip.indexToKey(ip.typeOf(parent)) != .array_type) {
                 // A single item viewed as a one-element array (`*T` to `*[1]T`).
                 if (e.index == 0 and ip.typeOf(parent) == ip.indexToKey(parent_ty).array_type.child) break :blk parent;
-                return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+                return sema.reinterpretLoad(block, src, ptr);
             }
             if (ip.typeOf(parent) != parent_ty or e.index >= ip.indexToKey(parent_ty).array_type.lenIncludingSentinel())
-                return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+                return sema.reinterpretLoad(block, src, ptr);
             const elem_ty = ip.indexToKey(parent_ty).array_type.child;
             const load_ty = Type.ptrInfo(ip, key.ty).child;
             if (load_ty != elem_ty and ip.indexToKey(load_ty) == .array_type and ip.indexToKey(load_ty).array_type.child == elem_ty) {
                 // A subarray (from slicing with comptime-known bounds).
                 const a = ip.indexToKey(load_ty).array_type;
                 if (e.index + a.len > ip.indexToKey(parent_ty).array_type.lenIncludingSentinel())
-                    return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+                    return sema.reinterpretLoad(block, src, ptr);
                 const elems = try sema.arena.alloc(Index, @intCast(a.lenIncludingSentinel()));
                 for (elems, 0..) |*x, i| x.* = if (i == a.len) a.sentinel else try sema.elemValue(parent, e.index + i);
                 break :blk try sema.intern(.{ .aggregate = .{ .ty = load_ty, .storage = .{ .elems = elems } } });
@@ -7391,6 +7409,22 @@ fn loadAtOffset(sema: *Sema, val: Index, key: InternPool.Ptr) !?Index {
     return if (retype) try sema.retypePtrValue(elem, load_ty) else elem;
 }
 
+/// Value `val` as in-memory coercible type `ty` (see
+/// `childCoercibleInMemory`).
+fn retypeInMemory(sema: *Sema, val: Index, ty: Index) !Index {
+    const ip = sema.ip;
+    if (sema.isUndef(val)) return sema.undefValue(ty);
+    if (Type.class(ip, ty) == .int) return sema.bigToValue(ty, (try sema.bigValue(val)).toConst());
+    switch (ip.indexToKey(val)) {
+        .ptr, .slice, .opt => {},
+        else => return val,
+    }
+    // `*T` read as `?*T`.
+    if (Type.class(ip, ty) == .optional and Type.class(ip, ip.typeOf(val)) != .optional)
+        return sema.intern(.{ .opt = .{ .ty = ty, .val = try sema.retypePtrValue(val, Type.childType(ip, ty)) } });
+    return sema.retypePtrValue(val, ty);
+}
+
 /// Pointer or slice value `val` as in-memory coercible pointer type `ty`.
 fn retypePtrValue(sema: *Sema, val: Index, ty: Index) !Index {
     const ip = sema.ip;
@@ -7414,37 +7448,42 @@ fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) C
             const alloc = sema.comptime_allocs.getPtr(id) orelse
                 return sema.fail(block, src, "comptime variable is not accessible here", .{});
             if (key.byte_offset == 0) {
+                // A store through a cast pointer writes the bytes it covers.
+                if (alloc.val != .none and !sema.childCoercibleInMemory(sema.ip.typeOf(val), sema.ip.typeOf(alloc.val)))
+                    return sema.reinterpretStore(block, src, ptr, val);
                 alloc.val = val;
             } else {
                 // An element addressed by offset (through a many-pointer).
                 const ip = sema.ip;
                 const arr_ty = ip.typeOf(alloc.val);
-                if (ip.indexToKey(arr_ty) != .array_type) return sema.fail(block, src, "unable to store to this memory at comptime", .{});
+                if (ip.indexToKey(arr_ty) != .array_type) return sema.reinterpretStore(block, src, ptr, val);
                 const a = ip.indexToKey(arr_ty).array_type;
                 const size = Type.abiSize(ip, a.child);
-                if (size == 0 or key.byte_offset % size != 0) return sema.fail(block, src, "unable to store to this memory at comptime", .{});
-                if (key.byte_offset / size >= a.len or ip.typeOf(val) != a.child) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+                if (size == 0 or key.byte_offset % size != 0) return sema.reinterpretStore(block, src, ptr, val);
+                if (key.byte_offset / size >= a.len or ip.typeOf(val) != a.child) return sema.reinterpretStore(block, src, ptr, val);
                 alloc.val = try sema.withElem(alloc.val, key.byte_offset / size, val);
             }
         },
         .field => |f| {
-            const parent = try sema.comptimeLoad(block, src, f.base);
+            if (key.byte_offset != 0) return sema.reinterpretStore(block, src, ptr, val);
+            const parent = (try sema.comptimeLoadStructural(block, src, f.base)) orelse return sema.fail(block, src, "unable to evaluate comptime expression: memory is runtime-known", .{});
             if (sema.ip.typeOf(parent) != Type.ptrInfo(sema.ip, sema.ip.typeOf(f.base)).child)
-                return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+                return sema.reinterpretStore(block, src, ptr, val);
             try sema.comptimeStore(block, src, f.base, try sema.withElem(parent, f.index, val));
         },
         .elem => |e| {
-            const parent = try sema.comptimeLoad(block, src, e.base);
+            if (key.byte_offset != 0) return sema.reinterpretStore(block, src, ptr, val);
+            const parent = (try sema.comptimeLoadStructural(block, src, e.base)) orelse return sema.fail(block, src, "unable to evaluate comptime expression: memory is runtime-known", .{});
             const parent_ty = sema.ip.typeOf(parent);
             if (sema.ip.indexToKey(parent_ty) == .vector_type) {
                 const v = sema.ip.indexToKey(parent_ty).vector_type;
-                if (e.index >= v.len or sema.ip.typeOf(val) != v.child) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+                if (e.index >= v.len or sema.ip.typeOf(val) != v.child) return sema.reinterpretStore(block, src, ptr, val);
                 return sema.comptimeStore(block, src, e.base, try sema.withElem(parent, e.index, val));
             }
             if (sema.ip.indexToKey(parent_ty) != .array_type) {
                 // A single item viewed as a one-element array.
                 if (e.index == 0 and parent_ty == sema.ip.typeOf(val)) return sema.comptimeStore(block, src, e.base, val);
-                return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+                return sema.reinterpretStore(block, src, ptr, val);
             }
             const a = sema.ip.indexToKey(parent_ty).array_type;
             const val_ty = sema.ip.typeOf(val);
@@ -7457,11 +7496,407 @@ fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) C
                     return sema.comptimeStore(block, src, e.base, try sema.intern(.{ .aggregate = .{ .ty = parent_ty, .storage = .{ .elems = elems } } }));
                 }
             }
-            if (e.index >= a.lenIncludingSentinel() or val_ty != a.child) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+            if (e.index >= a.lenIncludingSentinel() or val_ty != a.child) return sema.reinterpretStore(block, src, ptr, val);
             try sema.comptimeStore(block, src, e.base, try sema.withElem(parent, e.index, val));
         },
         else => return sema.fail(block, src, "unable to store to this memory at comptime", .{}),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Comptime memory reinterpretation
+//
+// A load or store through a pointer whose type does not match the value it
+// addresses (`@as(*i32, @ptrCast(&x))`, an extern struct viewed as bytes)
+// works on the memory of the variable or constant it points into, as laid
+// out on the target (little-endian). It descends to the smallest field or
+// element holding the accessed bytes and turns only that into bytes, so
+// pointers to memory elsewhere in the value, which have no bytes at
+// comptime, survive.
+
+/// The value at the root of pointer `ptr` (a comptime variable, an
+/// anonymous constant, or a declaration) and `ptr`'s byte offset in it, or
+/// null if a step of the pointer has no byte offset zap models.
+fn ptrMemRoot(sema: *Sema, ptr: Index) ?struct { base: InternPool.Ptr.BaseAddr, offset: u64 } {
+    const ip = sema.ip;
+    var k = ip.indexToKey(ptr).ptr;
+    var offset: u64 = 0;
+    while (true) {
+        offset +%= k.byte_offset;
+        switch (k.base) {
+            .field => |f| {
+                const parent_ty = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
+                switch (ip.indexToKey(parent_ty)) {
+                    .struct_type => if (Type.isPacked(ip, parent_ty)) return null,
+                    .tuple_type => {},
+                    else => return null,
+                }
+                offset +%= Type.fieldOffset(ip, parent_ty, @intCast(f.index));
+                k = ip.indexToKey(f.base).ptr;
+            },
+            .elem => |e| {
+                const elem_ty = sema.memElemType(ip.typeOf(e.base));
+                if (Type.class(ip, Type.ptrInfo(ip, ip.typeOf(e.base)).child) == .vector and !sema.memWholeBytes(elem_ty)) return null;
+                offset +%= e.index *% Type.abiSize(ip, elem_ty);
+                k = ip.indexToKey(e.base).ptr;
+            },
+            else => return .{ .base = k.base, .offset = offset },
+        }
+    }
+}
+
+/// The type of the elements an element pointer with base pointer type
+/// `base_ptr_ty` steps over.
+fn memElemType(sema: *Sema, base_ptr_ty: Index) Index {
+    const ip = sema.ip;
+    const parent_ty = Type.ptrInfo(ip, base_ptr_ty).child;
+    return switch (ip.indexToKey(parent_ty)) {
+        .array_type => |a| a.child,
+        .vector_type => |v| v.child,
+        // A single item viewed as an array.
+        else => parent_ty,
+    };
+}
+
+/// Whether `ty`'s values fill their bytes, so that a vector of them is laid
+/// out element after element.
+fn memWholeBytes(sema: *Sema, ty: Index) bool {
+    const bits = sema.bitCastBits(ty) orelse return false;
+    return bits == Type.abiSize(sema.ip, ty) * 8;
+}
+
+/// The number of fields or elements of `ty` that reinterpretation treats
+/// separately: those of arrays (with the sentinel), vectors of whole-byte
+/// elements, and structs and tuples that are not packed.
+fn memChildCount(sema: *Sema, ty: Index) ?usize {
+    const ip = sema.ip;
+    return switch (ip.indexToKey(ty)) {
+        .array_type => |a| @intCast(a.lenIncludingSentinel()),
+        .vector_type => |v| if (sema.memWholeBytes(v.child)) v.len else null,
+        .struct_type => if (Type.isPacked(ip, ty)) null else Type.fieldCount(ip, ty),
+        .tuple_type => |t| t.types.len,
+        else => null,
+    };
+}
+
+fn memChildOffset(sema: *Sema, ty: Index, i: usize) u64 {
+    const ip = sema.ip;
+    return switch (ip.indexToKey(ty)) {
+        .vector_type => |v| i * Type.abiSize(ip, v.child),
+        else => Type.fieldOffset(ip, ty, i),
+    };
+}
+
+fn memChildType(sema: *Sema, ty: Index, i: usize) Index {
+    return switch (sema.ip.indexToKey(ty)) {
+        .vector_type => |v| v.child,
+        else => Type.fieldType(sema.ip, ty, i),
+    };
+}
+
+/// Loads a value of `ptr`'s child type from the memory `ptr` points into.
+/// Null if that memory is only known at runtime.
+fn reinterpretLoad(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!?Index {
+    const ty = Type.ptrInfo(sema.ip, sema.ip.typeOf(ptr)).child;
+    const base = sema.arrayBase(ty);
+    if (Type.isComptimeOnly(sema.ip, base.ty)) return sema.restructureLoad(block, src, ptr, ty);
+    const root = sema.ptrMemRoot(ptr) orelse {
+        // A step without a byte offset (a packed struct field): the parent
+        // reinterpreted as a whole, then the field.
+        const k = sema.ip.indexToKey(ptr).ptr;
+        if (k.byte_offset == 0 and k.base == .field) {
+            const parent = (try sema.comptimeLoadOrNull(block, src, k.base.field.base)) orelse return null;
+            return try sema.fieldValue(parent, @intCast(k.base.field.index));
+        }
+        return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+    };
+    const root_val = (try sema.memRootValue(block, src, root.base)) orelse return null;
+    try sema.resolveLayout(block, src, ty);
+    try sema.resolveLayout(block, src, sema.ip.typeOf(root_val));
+    return try sema.readMem(block, src, root_val, root.offset, ty);
+}
+
+/// The value at the root of a pointer, or null if it is only known at
+/// runtime.
+fn memRootValue(sema: *Sema, block: *Block, src: Src, base: InternPool.Ptr.BaseAddr) CompileError!?Index {
+    return switch (base) {
+        .comptime_alloc => |id| (sema.comptime_allocs.get(id) orelse
+            return sema.fail(block, src, "comptime variable is not accessible here", .{})).val,
+        .uav => |u| u.val,
+        .nav => |n| blk: {
+            try sema.ensureNavVal(block, src, n);
+            const nav = sema.ip.getNav(n);
+            if (!nav.is_const) return null;
+            break :blk nav.val;
+        },
+        else => null,
+    };
+}
+
+/// `ty` seen as nested arrays: the innermost element type and how many of
+/// them `ty` holds (sentinels aside).
+fn arrayBase(sema: *Sema, ty: Index) struct { ty: Index, len: u64 } {
+    var t = ty;
+    var len: u64 = 1;
+    while (sema.ip.indexToKey(t) == .array_type) {
+        const a = sema.ip.indexToKey(t).array_type;
+        len *= a.len;
+        t = a.child;
+    }
+    return .{ .ty = t, .len = len };
+}
+
+/// Loads a `ty` through `ptr` when its innermost element type is
+/// comptime-only, which has no bytes: as upstream, nested arrays of it
+/// are restructured element by element (`*const [3][2]comptime_int` read
+/// as `*const [2][3]comptime_int`).
+fn restructureLoad(sema: *Sema, block: *Block, src: Src, ptr: Index, ty: Index) CompileError!?Index {
+    const ip = sema.ip;
+    const base = sema.arrayBase(ty);
+    var k = ip.indexToKey(ptr).ptr;
+    var pos: u64 = 0;
+    const root_val = while (true) {
+        if (k.byte_offset != 0) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+        switch (k.base) {
+            .elem => |e| {
+                const parent_ty = Type.ptrInfo(ip, ip.typeOf(e.base)).child;
+                const elem_ty = if (ip.indexToKey(parent_ty) == .array_type) ip.indexToKey(parent_ty).array_type.child else parent_ty;
+                pos += e.index * sema.arrayBase(elem_ty).len;
+                k = ip.indexToKey(e.base).ptr;
+            },
+            .field, .int => return sema.failUnsupported(block, src, "reinterpreting memory at comptime"),
+            else => break (try sema.memRootValue(block, src, k.base)) orelse return null,
+        }
+    };
+    const root_base = sema.arrayBase(ip.typeOf(root_val));
+    if (root_base.ty != base.ty) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+    if (pos + base.len > root_base.len)
+        return sema.fail(block, src, "dereference of '{f}' exceeds bounds of containing decl of type '{f}'", .{ sema.fmtType(ip.typeOf(ptr)), sema.fmtType(ip.typeOf(root_val)) });
+    const flat = try sema.arena.alloc(Index, @intCast(root_base.len));
+    var n: usize = 0;
+    try sema.flattenArray(root_val, flat, &n);
+    var i: usize = @intCast(pos);
+    return try sema.buildArray(ty, flat, &i);
+}
+
+fn flattenArray(sema: *Sema, val: Index, out: []Index, n: *usize) CompileError!void {
+    const ty = sema.ip.typeOf(val);
+    if (sema.ip.indexToKey(ty) != .array_type) {
+        out[n.*] = val;
+        n.* += 1;
+        return;
+    }
+    for (0..@intCast(sema.ip.indexToKey(ty).array_type.len)) |i| try sema.flattenArray(try sema.elemValue(val, i), out, n);
+}
+
+fn buildArray(sema: *Sema, ty: Index, flat: []const Index, i: *usize) CompileError!Index {
+    if (sema.ip.indexToKey(ty) != .array_type) {
+        defer i.* += 1;
+        return flat[i.*];
+    }
+    const a = sema.ip.indexToKey(ty).array_type;
+    const elems = try sema.arena.alloc(Index, @intCast(a.lenIncludingSentinel()));
+    for (elems[0..@intCast(a.len)]) |*e| e.* = try sema.buildArray(a.child, flat, i);
+    if (a.sentinel != .none) elems[@intCast(a.len)] = a.sentinel;
+    return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+}
+
+/// The value of type `ty` at byte `offset` of value `val`.
+fn readMem(sema: *Sema, block: *Block, src: Src, val: Index, offset: u64, ty: Index) CompileError!Index {
+    const ip = sema.ip;
+    const val_ty = ip.typeOf(val);
+    if (val_ty == ty and offset == 0) return val;
+    const size = Type.abiSize(ip, ty);
+    if (size == 0) if (try sema.onePossibleValue(ty)) |v| return v;
+    if (offset > Type.abiSize(ip, val_ty) or size > Type.abiSize(ip, val_ty) - offset)
+        return sema.fail(block, src, "dereference of '{f}' exceeds bounds of containing decl of type '{f}'", .{ sema.fmtType(try sema.ptrType(.{ .child = ty })), sema.fmtType(val_ty) });
+    // Descend into the field or element holding all of the bytes.
+    if (!sema.isUndef(val)) if (sema.memChildCount(val_ty)) |n| for (0..n) |i| {
+        const co = sema.memChildOffset(val_ty, i);
+        const cs = Type.abiSize(ip, sema.memChildType(val_ty, i));
+        if (offset >= co and offset + size <= co + cs and (cs != 0 or size == 0))
+            return sema.readMem(block, src, try sema.elemValue(val, i), offset - co, ty);
+    };
+    const n: usize = @intCast(Type.abiSize(ip, val_ty));
+    const buf = try sema.arena.alloc(u8, n);
+    const undef = try sema.arena.alloc(bool, n);
+    @memset(buf, 0);
+    @memset(undef, true);
+    if (!try sema.writeMemBytes(val, buf, undef)) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+    const o: usize = @intCast(offset);
+    return (try sema.readMemBytes(ty, buf[o..][0..@intCast(size)], undef[o..][0..@intCast(size)])) orelse
+        sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+}
+
+/// Stores `val` to the comptime variable memory `ptr` points into.
+fn reinterpretStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) CompileError!void {
+    const root = sema.ptrMemRoot(ptr) orelse return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+    if (root.base != .comptime_alloc) return sema.fail(block, src, "unable to store to this memory at comptime", .{});
+    const alloc = sema.comptime_allocs.getPtr(root.base.comptime_alloc) orelse
+        return sema.fail(block, src, "comptime variable is not accessible here", .{});
+    const ip = sema.ip;
+    const val_ty = ip.typeOf(val);
+    const dest_ty = ip.typeOf(alloc.val);
+    try sema.resolveLayout(block, src, val_ty);
+    try sema.resolveLayout(block, src, dest_ty);
+    const size = Type.abiSize(ip, val_ty);
+    if (size == 0) return; // No bytes to write.
+    if (root.offset > Type.abiSize(ip, dest_ty) or size > Type.abiSize(ip, dest_ty) - root.offset)
+        return sema.fail(block, src, "dereference of '{f}' exceeds bounds of containing decl of type '{f}'", .{ sema.fmtType(ip.typeOf(ptr)), sema.fmtType(dest_ty) });
+    const buf = try sema.arena.alloc(u8, @intCast(size));
+    const undef = try sema.arena.alloc(bool, @intCast(size));
+    @memset(buf, 0);
+    @memset(undef, true);
+    if (!try sema.writeMemBytes(val, buf, undef)) return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+    alloc.val = (try sema.spliceMem(alloc.val, @intCast(root.offset), buf, undef)) orelse
+        return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
+}
+
+/// `val` with the bytes from `offset` (which may start before `val`)
+/// replaced by `bytes`, or null if the bytes land in a value that has no
+/// byte representation at comptime.
+fn spliceMem(sema: *Sema, val: Index, offset: i64, bytes: []const u8, undef: []const bool) CompileError!?Index {
+    const ip = sema.ip;
+    const ty = ip.typeOf(val);
+    const size: i64 = @intCast(Type.abiSize(ip, ty));
+    const len: i64 = @intCast(bytes.len);
+    if (offset >= size or offset + len <= 0) return val;
+    if (sema.memChildCount(ty)) |n| {
+        const elems = try sema.aggregateElems(val);
+        for (elems[0..n], 0..) |*e, i| {
+            e.* = (try sema.spliceMem(e.*, offset - @as(i64, @intCast(sema.memChildOffset(ty, i))), bytes, undef)) orelse return null;
+        }
+        return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+    }
+    const n: usize = @intCast(size);
+    const buf = try sema.arena.alloc(u8, n);
+    const buf_undef = try sema.arena.alloc(bool, n);
+    @memset(buf, 0);
+    @memset(buf_undef, true);
+    // A value written over completely needs no bytes of its own.
+    if (offset > 0 or offset + len < size) if (!try sema.writeMemBytes(val, buf, buf_undef)) return null;
+    const lo: usize = @intCast(@max(offset, 0));
+    const hi: usize = @intCast(@min(offset + len, size));
+    const from: usize = @intCast(@as(i64, @intCast(lo)) - offset);
+    @memcpy(buf[lo..hi], bytes[from..][0 .. hi - lo]);
+    @memcpy(buf_undef[lo..hi], undef[from..][0 .. hi - lo]);
+    return sema.readMemBytes(ty, buf, buf_undef);
+}
+
+/// Writes the memory of comptime value `v` to `buf` (its `abiSize` bytes),
+/// clearing `undef` for the bytes it defines; padding stays undefined.
+/// False if `v` has no byte representation at comptime (a pointer to
+/// memory, an error).
+fn writeMemBytes(sema: *Sema, v: Index, buf: []u8, undef: []bool) CompileError!bool {
+    const ip = sema.ip;
+    const ty = ip.typeOf(v);
+    const size: usize = @intCast(Type.abiSize(ip, ty));
+    if (sema.isUndef(v)) return true;
+    if (sema.memChildCount(ty)) |n| {
+        for (0..n) |i| {
+            const o: usize = @intCast(sema.memChildOffset(ty, i));
+            if (!try sema.writeMemBytes(try sema.elemValue(v, i), buf[o..], undef[o..])) return false;
+        }
+        return true;
+    }
+    var used = size;
+    switch (Type.class(ip, ty)) {
+        .void => return true,
+        .bool => buf[0] = @intFromBool(v == .bool_true),
+        .int => (try sema.bigValue(v)).toConst().writeTwosComplement(buf[0..size], .little),
+        .float => {
+            used = Type.floatBits(ip, ty) / 8;
+            var all: [16]u8 = undefined;
+            std.mem.writeInt(u128, &all, ip.indexToKey(v).float.bits(), .little);
+            @memcpy(buf[0..used], all[0..used]);
+        },
+        .@"enum" => return sema.writeMemBytes(ip.indexToKey(v).enum_tag.int, buf, undef),
+        .pointer => {
+            const k = ip.indexToKey(v);
+            if (k != .ptr or k.ptr.base != .int) return false;
+            std.mem.writeInt(u64, buf[0..8], k.ptr.byte_offset, .little);
+        },
+        .optional => {
+            if (!Type.optionalReprIsPtr(ip, Type.childType(ip, ty))) return false;
+            const payload = ip.indexToKey(v).opt.val;
+            if (payload != .none) return sema.writeMemBytes(payload, buf, undef);
+            @memset(buf[0..size], 0);
+        },
+        .@"struct", .@"union" => {
+            if (Type.isPacked(ip, ty)) {
+                var bits = try BigInt.init(sema.arena);
+                try sema.valueBits(v, &bits, 0);
+                bits.toConst().writeTwosComplement(buf[0..size], .little);
+            } else if (ip.structInfo(ty).layout == .@"extern" and Type.class(ip, ty) == .@"union") {
+                return sema.writeMemBytes(ip.indexToKey(v).un.val, buf, undef);
+            } else return false;
+        },
+        else => return false,
+    }
+    @memset(undef[0..used], false);
+    return true;
+}
+
+/// The value of type `ty` whose memory is `buf`, or null if `ty` has no
+/// byte representation at comptime. A scalar with an undefined byte is
+/// undefined.
+fn readMemBytes(sema: *Sema, ty: Index, buf: []const u8, undef: []const bool) CompileError!?Index {
+    const ip = sema.ip;
+    if (sema.memChildCount(ty)) |n| {
+        const elems = try sema.arena.alloc(Index, n);
+        for (elems, 0..) |*e, i| {
+            const o: usize = @intCast(sema.memChildOffset(ty, i));
+            const ct = sema.memChildType(ty, i);
+            const cs: usize = @intCast(Type.abiSize(ip, ct));
+            e.* = (try sema.readMemBytes(ct, buf[o..][0..cs], undef[o..][0..cs])) orelse return null;
+        }
+        // The type's sentinel, whatever the bytes say.
+        if (ip.indexToKey(ty) == .array_type and ip.indexToKey(ty).array_type.sentinel != .none)
+            elems[n - 1] = ip.indexToKey(ty).array_type.sentinel;
+        return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+    }
+    const class = Type.class(ip, ty);
+    const used: usize = if (class == .float) Type.floatBits(ip, ty) / 8 else buf.len;
+    if (class == .void) return .void_value;
+    if (std.mem.indexOfScalar(bool, undef[0..used], true) != null) return try sema.undefValue(ty);
+    switch (class) {
+        .bool => return boolValue(buf[0] & 1 != 0),
+        .int => return try sema.intFromMemBytes(ty, buf),
+        .float => {
+            var all: [16]u8 = @splat(0);
+            @memcpy(all[0..used], buf[0..used]);
+            return try sema.floatFromBits(ty, std.mem.readInt(u128, &all, .little));
+        },
+        .@"enum" => return try sema.intern(.{ .enum_tag = .{ .ty = ty, .int = try sema.intFromMemBytes(ip.structInfo(ty).tag_type, buf) } }),
+        .pointer => {
+            if (Type.isSlice(ip, ty)) return null;
+            return try sema.intern(.{ .ptr = .{ .ty = ty, .base = .int, .byte_offset = std.mem.readInt(u64, buf[0..8], .little) } });
+        },
+        .optional => {
+            const child = Type.childType(ip, ty);
+            if (!Type.optionalReprIsPtr(ip, child)) return null;
+            const addr = std.mem.readInt(u64, buf[0..8], .little);
+            const payload: Index = if (addr == 0) .none else try sema.intern(.{ .ptr = .{ .ty = child, .base = .int, .byte_offset = addr } });
+            return try sema.intern(.{ .opt = .{ .ty = ty, .val = payload } });
+        },
+        .@"struct", .@"union" => {
+            if (!Type.isPacked(ip, ty)) return null;
+            const backing = ip.structInfo(ty).tag_type;
+            const bits = try sema.bigValue(try sema.intFromMemBytes(backing, buf));
+            return try sema.bitsValue(ty, bits.toConst(), 0);
+        },
+        else => return null,
+    }
+}
+
+/// The integer of type `ty` stored little-endian in `buf`.
+fn intFromMemBytes(sema: *Sema, ty: Index, buf: []const u8) !Index {
+    const info = Type.intInfo(sema.ip, ty);
+    if (info.bits == 0) return sema.intValue(ty, 0);
+    const limbs = try sema.arena.alloc(std.math.big.Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
+    var m: std.math.big.int.Mutable = .{ .limbs = limbs, .len = 1, .positive = true };
+    m.readTwosComplement(buf[0..@intCast((info.bits + 7) / 8)], info.bits, .little, info.signedness);
+    return sema.bigToValue(ty, m.toConst());
 }
 
 /// The elements of an aggregate value (including an array's sentinel).
@@ -8226,7 +8661,15 @@ fn zirMemset(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     if (sema.resolveValue(dest)) |dv| if (len_val) |lv| if (sema.resolveValue(elem)) |ev| {
         const raw_dest = (try sema.memRawPtr(block, .fromInterned(dv))).toInterned().?;
         if (!sema.isUndef(raw_dest) and try sema.comptimePtrRoot(raw_dest) == .comptime_alloc) {
-            for (0..@intCast(ip.intValue(u64, lv).?)) |i| try sema.comptimeStore(block, src, try sema.ptrElemPtrVal(raw_dest, i), ev);
+            // One store of the whole array, so that bytes of memory viewed
+            // as another type are all defined at once.
+            const len = ip.intValue(u64, lv).?;
+            const arr_ty = try sema.intern(.{ .array_type = .{ .len = len, .child = d.elem } });
+            const elems = try sema.arena.alloc(Index, @intCast(len));
+            @memset(elems, ev);
+            const k = ip.indexToKey(raw_dest).ptr;
+            const arr_ptr = try sema.intern(.{ .ptr = .{ .ty = try sema.ptrType(.{ .child = arr_ty }), .base = k.base, .byte_offset = k.byte_offset } });
+            try sema.comptimeStore(block, src, arr_ptr, try sema.intern(.{ .aggregate = .{ .ty = arr_ty, .storage = .{ .elems = elems } } }));
             return .void_value;
         }
     };
@@ -10695,13 +11138,16 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
         if (s.flags.size != .one) return sema.fail(block, src, "cannot infer length of slice from '{f}'", .{sema.fmtType(src_ty)});
         try sema.resolveLayout(block, src, d.child);
         try sema.resolveLayout(block, src, s.child);
-        const bytes = switch (ip.indexToKey(s.child)) {
-            .array_type => |a| a.len * Type.abiSize(ip, a.child), // not the sentinel
-            else => Type.abiSize(ip, s.child),
+        const src_elem: Index, const src_len: u64 = switch (ip.indexToKey(s.child)) {
+            .array_type => |a| .{ a.child, a.len }, // not the sentinel
+            else => .{ s.child, 1 },
         };
+        const many = try sema.coercePtrTo(block, operand, try sema.elemValueType(dest_ty));
+        // The same elements, of any size, keep their count.
+        if (src_elem == d.child) return sema.makeSlice(block, dest_ty, many, .fromInterned(try sema.intValue(.usize_type, src_len)));
+        const bytes = src_len * Type.abiSize(ip, src_elem);
         const dsize = Type.abiSize(ip, d.child);
         if (dsize == 0 or bytes % dsize != 0) return sema.fail(block, src, "type '{f}' does not divide exactly into destination elements", .{sema.fmtType(s.child)});
-        const many = try sema.coercePtrTo(block, operand, try sema.elemValueType(dest_ty));
         return sema.makeSlice(block, dest_ty, many, .fromInterned(try sema.intValue(.usize_type, bytes / dsize)));
     }
     if (d.flags.size == .slice) {
@@ -11424,7 +11870,13 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
 
 fn refersToComptimeAlloc(sema: *Sema, val: Index) bool {
     return switch (sema.ip.indexToKey(val)) {
-        .ptr => (sema.comptimePtrRoot(val) catch return true) == .comptime_alloc,
+        // Also through a constant holding such a pointer (`&ptr` where
+        // `const ptr = &comptime_var`).
+        .ptr => |k| switch (sema.ptrRootBase(k)) {
+            .comptime_alloc => true,
+            .uav => |u| sema.refersToComptimeAlloc(u.val),
+            else => false,
+        },
         .slice => |s| sema.refersToComptimeAlloc(s.ptr),
         .aggregate => |a| switch (a.storage) {
             .elems => |elems| for (elems) |e| {
