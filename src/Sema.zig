@@ -5015,7 +5015,9 @@ fn coercePtrTo(sema: *Sema, block: *Block, ptr: Ref, ty: Index) CompileError!Ref
             .ptr => |p| {
                 const s = Type.ptrInfo(ip, src_ty);
                 const d = Type.ptrInfo(ip, ty);
-                if (s.flags.size == .one and d.flags.size != .one and ip.indexToKey(s.child) == .array_type and p.base != .int) {
+                // (`*[2]i32` cast to `[*][2]i32` instead points at whole
+                // arrays, from this one.)
+                if (s.flags.size == .one and d.flags.size != .one and ip.indexToKey(s.child) == .array_type and p.base != .int and d.child != s.child) {
                     // A subarray of `buf` (from `buf[a..b]`) starts at an
                     // element of `buf`, so later indices stay within `buf`.
                     if (p.base == .elem and p.byte_offset == 0) {
@@ -5154,6 +5156,30 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
     if (ca == .enum_literal and (cb == .@"enum" or cb == .@"union")) return b;
     if (cb == .enum_literal and (ca == .@"enum" or ca == .@"union")) return a;
     if (ca == .pointer and cb == .pointer) {
+        // A C pointer peer makes a C pointer, gaining the other's
+        // qualifiers, as upstream's `c_ptr` strategy.
+        const pa = Type.ptrInfo(ip, a);
+        const pb = Type.ptrInfo(ip, b);
+        if ((pa.flags.size == .c or pb.flags.size == .c) and pa.flags.size != .slice and pb.flags.size != .slice) {
+            const child = if (pa.child == pb.child or sema.childCoercibleInMemory(pb.child, pa.child))
+                pa.child
+            else if (sema.childCoercibleInMemory(pa.child, pb.child))
+                pb.child
+            else
+                return sema.fail(block, src, "incompatible types: '{f}' and '{f}'", .{ sema.fmtType(a), sema.fmtType(b) });
+            const al_a = pa.flags.alignment;
+            const al_b = pb.flags.alignment;
+            return sema.ptrType(.{
+                .child = child,
+                .sentinel = if (pa.sentinel == pb.sentinel) pa.sentinel else .none,
+                .flags = .{
+                    .size = .c,
+                    .is_const = pa.flags.is_const or pb.flags.is_const,
+                    .is_volatile = pa.flags.is_volatile or pb.flags.is_volatile,
+                    .alignment = if (al_a == 0) al_b else if (al_b == 0) al_a else @min(al_a, al_b),
+                },
+            });
+        }
         if (sema.ptrCoercibleInPlace(a, b)) return b;
         if (sema.ptrCoercibleInPlace(b, a)) return a;
         if (try sema.peerPtrs(a, b)) |t| return t;
@@ -5405,10 +5431,17 @@ fn analyzePtrDiff(sema: *Sema, block: *Block, src: Src, lhs: Ref, rhs: Ref) Comp
     const ip = sema.ip;
     const lp = Type.ptrInfo(ip, sema.typeOf(lhs));
     const rp = Type.ptrInfo(ip, sema.typeOf(rhs));
-    if (lp.flags.size == .slice or rp.flags.size == .slice or lp.child != rp.child)
+    // As upstream, a pointer to an array steps by its element.
+    const elem = struct {
+        fn f(p_ip: *InternPool, p: InternPool.PtrType) Index {
+            return if (p.flags.size == .one and p_ip.indexToKey(p.child) == .array_type) p_ip.indexToKey(p.child).array_type.child else p.child;
+        }
+    }.f;
+    const elem_ty = elem(ip, lp);
+    if (lp.flags.size == .slice or rp.flags.size == .slice or elem_ty != elem(ip, rp))
         return sema.fail(block, src, "incompatible pointer arithmetic operands '{f}' and '{f}'", .{ sema.fmtType(sema.typeOf(lhs)), sema.fmtType(sema.typeOf(rhs)) });
-    try sema.resolveLayout(block, src, lp.child);
-    const elem_size = @max(Type.abiSize(ip, lp.child), 1);
+    try sema.resolveLayout(block, src, elem_ty);
+    const elem_size = @max(Type.abiSize(ip, elem_ty), 1);
     if (sema.resolveValue(lhs)) |lv| if (sema.resolveValue(rhs)) |rv| {
         const lk = ip.indexToKey(lv).ptr;
         const rk = ip.indexToKey(rv).ptr;
@@ -5431,12 +5464,20 @@ fn analyzePtrDiff(sema: *Sema, block: *Block, src: Src, lhs: Ref, rhs: Ref) Comp
 
 fn analyzePtrArithmetic(sema: *Sema, block: *Block, src: Src, is_add: bool, ptr: Ref, uncasted_n: Ref) CompileError!Ref {
     const ip = sema.ip;
-    const ptr_ty = sema.typeOf(ptr);
-    const p = Type.ptrInfo(ip, ptr_ty);
-    if (p.flags.size != .many and p.flags.size != .c) return sema.fail(block, src, "invalid pointer arithmetic operand: '{f}'", .{sema.fmtType(ptr_ty)});
+    const ptr_ty_in = sema.typeOf(ptr);
+    const p = Type.ptrInfo(ip, ptr_ty_in);
+    if (p.flags.size != .many and p.flags.size != .c) return sema.fail(block, src, "invalid pointer arithmetic operand: '{f}'", .{sema.fmtType(ptr_ty_in)});
     const n = try sema.coerce(block, .usize_type, uncasted_n, src);
     try sema.resolveLayout(block, src, p.child);
     const elem_size = Type.abiSize(ip, p.child);
+    // An explicit alignment drops to what the offset keeps, as upstream.
+    const ptr_ty = if (p.flags.alignment == 0) ptr_ty_in else ty: {
+        const offset: u64 = if (sema.resolveValue(n)) |nv| (if (sema.isUndef(nv)) elem_size else ip.intValue(u64, nv).? *% elem_size) else elem_size;
+        if (offset == 0) break :ty ptr_ty_in;
+        var info = p;
+        info.flags.alignment = @intCast(@min(p.flags.alignment, @as(u32, @ctz(offset)) + 1));
+        break :ty try sema.ptrType(info);
+    };
     if (sema.resolveValue(ptr)) |pv| if (sema.resolveValue(n)) |nv| {
         if (ip.indexToKey(pv) == .ptr and !sema.isUndef(nv)) {
             const k = ip.indexToKey(pv).ptr;
