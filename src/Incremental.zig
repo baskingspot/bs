@@ -253,7 +253,7 @@ fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bo
 pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emit, off: bool) !void {
     const m = if (inc.prev) |*m| m else return;
     if (off or inc.verify == .full) return;
-    const r = Replay.create(inc.gpa, inc.io, m, inc.dir, fe, zcu, emit) catch |err| switch (err) {
+    const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (inc.timing) std.debug.print("cache: not replaying: {t}\n", .{err});

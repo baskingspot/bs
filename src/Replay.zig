@@ -40,6 +40,8 @@ emit: *Emit,
 m: *const Manifest,
 /// The last build's packs, mapped while the build's atoms point into them.
 pack: Pack,
+/// The target's unwind record format, to decode the packs' atoms.
+arch: Atom.Unwind.Arch,
 /// Nodes an edit reaches over reverse edges.
 outdated: std.DynamicBitSetUnmanaged,
 state: []State,
@@ -86,7 +88,7 @@ pub const Stats = struct {
 
 /// Starts an edit build from manifest `m`: finds the inputs that changed
 /// since, the seeds, and what they reach. `fe` has loaded the files.
-pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, fe: *const Frontend, zcu: *Zcu, emit: *Emit) !*Replay {
+pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Atom.Unwind.Arch, fe: *const Frontend, zcu: *Zcu, emit: *Emit) !*Replay {
     const t0 = Io.Timestamp.now(io, .awake);
     var pack: Pack = try .open(io, dir);
     errdefer pack.close(gpa, io);
@@ -102,6 +104,7 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, fe: *cons
         .emit = emit,
         .m = m,
         .pack = pack,
+        .arch = arch,
         .outdated = try .initEmpty(gpa, n),
         .state = try gpa.alloc(State, n),
         .dependees = try gpa.alloc(?Zcu.Dependee, n),
@@ -326,7 +329,7 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
     defer atoms.deinit(r.gpa);
     const changed_file = r.isChangedFile(owner.file);
     for (m.atoms(g.node)) |ref| {
-        const d = r.pack.decode(ref) catch return r.miss(g, "atom");
+        const d = r.pack.decode(ref, r.arch) catch return r.miss(g, "atom");
         var debug = d.debug;
         if (debug) |*dbg| {
             if (changed_file) dbg.base_line = zcu.file(owner.file).zir.getDeclaration(owner.zir_inst).src_line;
@@ -339,7 +342,7 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
     for (m.deps(g.node)) |e| {
         const d = Manifest.Edge.nodeOf(e);
         if (m.node(d).tag != @backingInt(Tag.content)) continue;
-        for (m.atoms(d)) |ref| try content.append(r.gpa, (r.pack.decode(ref) catch return r.miss(g, "content atom")).atom);
+        for (m.atoms(d)) |ref| try content.append(r.gpa, (r.pack.decode(ref, r.arch) catch return r.miss(g, "content atom")).atom);
     }
     const refs = try r.resolveRefs(g, true) orelse return r.miss(g, "references");
     defer r.gpa.free(refs);
