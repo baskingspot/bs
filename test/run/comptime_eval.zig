@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "476\n6\n6765\n55\n258\n55\n18\n"
+//! stdout: "476\n6\n6765\n55\n258\n55\n18\n1228\n"
 // Comptime calls repeated often enough for zap's comptime evaluator to run
 // them from lowered IR instead of the ZIR walker; the results must be the
 // walker's (and upstream's).
@@ -97,6 +97,19 @@ const bumped = blk: {
     break :blk count;
 };
 
+/// The walker types an `if` by the branch it takes; runtime analysis
+/// would give it the peer type of both.
+fn branchSize(c: bool, k: u32) u32 {
+    const x = if (c) @as(u8, 255) else @as(u16, 300);
+    return @sizeOf(@TypeOf(x)) * 100 + k;
+}
+
+const peer = blk: {
+    var t: u32 = 0;
+    for (0..8) |k| t += branchSize(k % 2 == 0, @intCast(k));
+    break :blk t;
+};
+
 fn main() callconv(.c) noreturn {
     var s: u32 = 0;
     for (table) |w| s += w;
@@ -111,5 +124,6 @@ fn main() callconv(.c) noreturn {
     rt.printInt(comptime sumQuotients(8));
     rt.printInt(counted.sum);
     rt.printInt(bumped);
+    rt.printInt(peer);
     rt.exit(0);
 }

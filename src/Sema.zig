@@ -2108,6 +2108,11 @@ fn resolveBlock(sema: *Sema, parent: *Block, src: Src, child: *Block, merges: *B
         try sema.addBlock(parent, merges.block_inst, .void_type, child.instructions.items);
         return .fromInterned(v);
     };
+    // The walker takes one branch and keeps its result's type; peer type
+    // resolution would type the result differently.
+    if (sema.bc != null) for (results[1..]) |r| {
+        if (sema.typeOf(r) != sema.typeOf(results[0])) try sema.bcRefuse();
+    };
     const result_ty = try sema.resolvePeerTypes(parent, src, results);
     try sema.resolveLayout(parent, src, result_ty);
     for (merges.brs.items, results) |br, result| {
