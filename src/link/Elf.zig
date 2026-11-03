@@ -93,8 +93,9 @@ pub const Value = struct { key: SymbolKey, value: u64 };
 /// every relocation target is an index into one address table.
 ///
 /// The atoms must have distinct keys: deduplicating is the numbering's job.
-/// Given the atoms the key-based path keeps, in the same order, the output
-/// is byte-identical to that path's.
+/// The output is byte-identical to the key-based link of the same atoms.
+/// (Not necessarily to that of a longer list with duplicates: layout works
+/// in chunks of input atoms, and dropping some moves chunk boundaries.)
 pub const Symbols = struct {
     /// One per atom.
     atoms: []const NumberedAtom,

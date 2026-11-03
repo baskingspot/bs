@@ -319,9 +319,18 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   nothing: no key gathering, dedup, or probes; a chunked pass writes each
   atom's address into a table indexed by number (u32 offsets from the base,
   so 4 bytes per symbol: relocations index it at random), and the copy
-  pass reads targets from it. The atoms must have distinct keys; given the
-  atoms the key-based path keeps, in its order, the output is the same
-  bytes, which bench-link checks. Values (error codes) are numbers too.
+  pass reads targets from it. The atoms must have distinct keys; the output
+  is the same bytes as the key-based link of the same atoms, which
+  bench-link and the Mach-O unit test check. It need not match the
+  key-based link of a list that still has duplicates: layout works in
+  chunks of 2048 input atoms, each aligned to its largest alignment, so
+  dropping duplicates moves chunk boundaries and can change padding.
+  Values (error codes) are numbers too. Mach-O (`MachO.Symbols`) numbers
+  its imports as well; the address table marks values and imports apart
+  from addresses, atoms take precedence over imports and imports over
+  values, as with keys. On the orb (Mach-O emitted, not run), 4 threads:
+  keys 25–26 ms, numbered scattered 21.7 ms, packed 19.1 ms; the rest is
+  Mach-O's serial fixup chains and code-signature hashing.
   Runs of target numbers can sit anywhere in the array, so a cache can
   append the runs of an edit's new atoms and keep the rest. Measured
   (2026-11-03, same session, best of 15; "packed" lays each atom's

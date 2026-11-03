@@ -68,6 +68,28 @@ pub const Options = struct {
     threads: ?usize = null,
     /// Filled in when linking fails with a symbol-related error.
     diag: ?*Diagnostic = null,
+    /// The symbols, already numbered by the caller, so that the link
+    /// looks up no keys (see `Elf.Symbols`). When set, `entry` is used only
+    /// in diagnostics and `values` not at all; `imports` still gives the
+    /// imports' names, in the order of `Symbols.imports`.
+    symbols: ?Symbols = null,
+};
+
+/// `Elf.Symbols` with the imports numbered too.
+pub const Symbols = struct {
+    /// One per atom.
+    atoms: []const Elf.NumberedAtom,
+    /// The numbers of the atoms' targets, as for `Elf.Symbols.targets`.
+    targets: []const u32,
+    values: []const Elf.NumberedValue = &.{},
+    /// The number of each of `Options.imports`. An atom with the same
+    /// number takes precedence over an import, as a key does, and an import
+    /// over a value; of imports with the same number the first wins.
+    imports: []const u32 = &.{},
+    entry: u32,
+    /// Numbers are below this; numbers with no atom, import, or value are
+    /// undefined, which is an error only if a relocation uses one.
+    len: u32,
 };
 
 pub const Import = struct {
@@ -165,6 +187,12 @@ const Place = packed struct(u64) {
 };
 /// Atoms per unit of work in placement and copying.
 const chunk_len = 2048;
+/// Address-table entries, with numbered symbols: an atom's address minus
+/// `base_address`, `value_tag` plus the index of a value in
+/// `Symbols.values`, `value_tag` plus the number of values plus the index
+/// of an import, or `unset`.
+const unset = std.math.maxInt(u32);
+const value_tag = 1 << 31;
 const dylinker_path = "/usr/lib/dyld";
 const libsystem_path = "/usr/lib/libSystem.B.dylib";
 const mh_execute_header = "__mh_execute_header";
@@ -183,11 +211,16 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const n_threads = @max(1, @min(n_chunks, options.threads orelse std.Thread.getCpuCount() catch 1));
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
-    var symbols: SymbolTable = try .init(atoms.len, n_partitions);
+    const numbered = options.symbols;
+    if (numbered) |s| if (s.atoms.len != atoms.len or s.entry >= s.len or s.imports.len != options.imports.len) return error.InvalidSymbols;
+    var symbols: SymbolTable = if (numbered == null) try .init(atoms.len, n_partitions) else .empty;
     defer symbols.deinit();
+    // With numbered symbols, each number's address, import, or value.
+    const addrs = try gpa.alloc(u32, if (numbered) |s| s.len else 0);
+    defer gpa.free(addrs);
     const places = try gpa.alloc(Place, atoms.len);
     defer gpa.free(places);
-    const keys = try gpa.alloc(SymbolKey, atoms.len);
+    const keys = try gpa.alloc(SymbolKey, if (numbered == null) atoms.len else 0);
     defer gpa.free(keys);
     const chunks = try gpa.alloc(Chunk, n_chunks);
     defer gpa.free(chunks);
@@ -200,12 +233,18 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         .chunks = chunks,
         .symbols = &symbols,
         .failures = failures,
+        .numbered = numbered,
+        .addrs = addrs,
     };
 
     @memset(failures, null);
-    try parallel(io, n_threads, n_chunks, &l, Link.gatherKeys);
-    try parallel(io, n_threads, n_partitions, &l, Link.dedup);
-    try parallel(io, n_threads, n_chunks, &l, Link.layOut);
+    if (numbered == null) {
+        try parallel(io, n_threads, n_chunks, &l, Link.gatherKeys);
+        try parallel(io, n_threads, n_partitions, &l, Link.dedup);
+        try parallel(io, n_threads, n_chunks, &l, Link.layOutKeyed);
+    } else {
+        try parallel(io, n_threads, n_chunks, &l, Link.layOutNumbered);
+    }
     try l.check(diag);
 
     // Place chunks within sections, and their symbols, names, and fixups.
@@ -243,24 +282,45 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     }
     const total_fixups = n_fixups[got] + n_fixups[data_const] + n_fixups[data];
 
-    const entry_index = symbols.get(options.entry) orelse {
-        diag.* = .{ .target = options.entry };
-        return error.UndefinedSymbol;
-    };
-    if (places[entry_index].section != text) {
-        diag.* = .{ .atom = atoms[entry_index].name, .target = options.entry };
-        return error.InvalidRelocation;
+    // With numbered symbols, the entry's atom is found while resolving
+    // addresses.
+    var entry_index: usize = undefined;
+    if (numbered == null) {
+        entry_index = symbols.get(options.entry) orelse {
+            diag.* = .{ .target = options.entry };
+            return error.UndefinedSymbol;
+        };
+        try checkEntry(&l, entry_index, options.entry, diag);
     }
 
-    var values: SymbolTable = try .init(options.values.len, 1);
+    var values: SymbolTable = .empty;
     defer values.deinit();
-    for (options.values) |v| values.getOrPut(v.key).* = .{ .key = v.key, .value = v.value, .used = true };
-    var imports: SymbolTable = try .init(options.imports.len, 1);
+    var imports: SymbolTable = .empty;
     defer imports.deinit();
-    for (options.imports, 0..) |imp, i| {
-        const e = imports.getOrPut(imp.key);
-        if (!e.used) e.* = .{ .key = imp.key, .value = i, .used = true };
-        strtab_len += imp.name.len + 1;
+    for (options.imports) |imp| strtab_len += imp.name.len + 1;
+    if (numbered) |s| {
+        // Atoms, numbered in `resolveAddrs`, take precedence over imports,
+        // and imports over values.
+        @memset(addrs, unset);
+        if (s.values.len + s.imports.len >= unset - value_tag) return error.InvalidSymbols;
+        for (s.values, 0..) |v, i| {
+            if (v.symbol >= addrs.len) return error.InvalidSymbols;
+            addrs[v.symbol] = @intCast(value_tag + i);
+        }
+        var i = s.imports.len;
+        while (i > 0) {
+            i -= 1;
+            if (s.imports[i] >= addrs.len) return error.InvalidSymbols;
+            addrs[s.imports[i]] = @intCast(value_tag + s.values.len + i);
+        }
+    } else {
+        values = try .init(options.values.len, 1);
+        for (options.values) |v| values.getOrPut(v.key).* = .{ .key = v.key, .value = v.value, .used = true };
+        imports = try .init(options.imports.len, 1);
+        for (options.imports, 0..) |imp, i| {
+            const e = imports.getOrPut(imp.key);
+            if (!e.used) e.* = .{ .key = imp.key, .value = i, .used = true };
+        }
     }
     strtab_len += mh_execute_header.len + 1;
     sizes[stubs] = @as(u64, n_imports) * stub_size;
@@ -356,8 +416,20 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     if (sig_off > std.math.maxInt(u32)) return error.OutOfMemory;
 
     const base = base_address;
+    // Numbered symbols keep addresses as 31-bit offsets from the base.
+    if (numbered != null and linkedit_vm >= value_tag) return error.OutOfMemory;
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
-    try parallel(io, n_threads, n_partitions, &l, Link.resolveAddrs);
+    if (numbered != null) {
+        try parallel(io, n_threads, n_chunks, &l, Link.resolveAddrsNumbered);
+        try l.check(diag);
+        entry_index = l.entry_atom orelse {
+            diag.* = .{ .target = options.entry };
+            return error.UndefinedSymbol;
+        };
+        try checkEntry(&l, entry_index, options.entry, diag);
+    } else {
+        try parallel(io, n_threads, n_partitions, &l, Link.resolveAddrsKeyed);
+    }
 
     const buf = try out.buffer(io, file_len);
     l.buf = buf;
@@ -400,7 +472,11 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     l.sect_index = sect_index;
     l.stubs_addr = base + starts[stubs];
     l.got_addr = base + starts[got];
-    try parallel(io, n_threads, n_chunks, &l, Link.copy);
+    if (numbered == null) {
+        try parallel(io, n_threads, n_chunks, &l, Link.copyKeyed);
+    } else {
+        try parallel(io, n_threads, n_chunks, &l, Link.copyNumbered);
+    }
     try l.check(diag);
 
     // GOT slots: one bind per import. Stubs: load the slot and jump.
@@ -516,7 +592,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     w.put(macho.uuid_command{ .uuid = @splat(0) });
     const version = (@as(u32, @intCast(options.min_os.major)) << 16) | (@as(u32, @intCast(options.min_os.minor)) << 8) | @as(u32, @intCast(options.min_os.patch));
     w.put(macho.build_version_command{ .cmdsize = @sizeOf(macho.build_version_command), .platform = .MACOS, .minos = version, .sdk = version, .ntools = 0 });
-    w.put(macho.entry_point_command{ .entryoff = symbols.get(options.entry).? - base });
+    w.put(macho.entry_point_command{ .entryoff = l.atomAddr(entry_index) - base });
     w.putWithString(macho.dylib_command{ .cmd = .LOAD_DYLIB, .cmdsize = dylib_cmd_size, .dylib = .{
         .name = @sizeOf(macho.dylib_command),
         .timestamp = 2,
@@ -583,6 +659,12 @@ const Link = struct {
     sect_index: [n_sects]u8 = undefined,
     stubs_addr: u64 = undefined,
     got_addr: u64 = undefined,
+    numbered: ?Symbols,
+    /// With numbered symbols, the address table (see `unset`).
+    addrs: []u32,
+    /// With numbered symbols, the atom numbered `Symbols.entry`, found by
+    /// `resolveAddrsNumbered`.
+    entry_atom: ?usize = null,
 
     fn check(l: *Link, diag: *Diagnostic) Error!void {
         var first: ?Failure = null;
@@ -604,10 +686,52 @@ const Link = struct {
         return l.section_addrs[p.section] + l.chunks[index / chunk_len].bases[p.section] + p.offset;
     }
 
-    fn resolveAddrs(l: *Link, partition: usize, _: usize) void {
+    fn resolveAddrsKeyed(l: *Link, partition: usize, _: usize) void {
         for (l.symbols.partitionEntries(partition)) |*e| {
             if (e.used) e.value = l.atomAddr(e.value);
         }
+    }
+
+    /// Sets the addresses of one chunk's atoms' numbers.
+    fn resolveAddrsNumbered(l: *Link, chunk: usize, _: usize) void {
+        const s = l.numbered.?;
+        const begin = chunk * chunk_len;
+        const end = @min(l.atoms.len, begin + chunk_len);
+        for (s.atoms[begin..end], begin..) |n, i| {
+            if (n.symbol >= l.addrs.len) return l.fail(chunk, i, error.InvalidSymbols, .{ .atom = l.atoms[i].name });
+            l.addrs[n.symbol] = @intCast(l.atomAddr(i) - base_address);
+            // Numbers are distinct, so one chunk at most writes this.
+            if (n.symbol == s.entry) l.entry_atom = i;
+        }
+    }
+
+    /// Sets `res` to what the targets of `a`, atom `i`, resolve to, from
+    /// `addrs`.
+    fn resolveNumbered(l: *Link, a: *const Atom, i: usize, chunk: usize, res: []Resolved) bool {
+        const s = l.numbered.?;
+        const first = s.atoms[i].targets;
+        if (first > s.targets.len or s.targets.len - first < a.targets.len) {
+            l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name });
+            return false;
+        }
+        for (s.targets[first..][0..a.targets.len], res, a.targets) |n, *r, t| {
+            if (n >= l.addrs.len) {
+                l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name, .target = t });
+                return false;
+            }
+            const e = l.addrs[n];
+            if (e < value_tag) {
+                r.* = .{ .v = base_address + @as(u64, e), .kind = .addr };
+            } else if (e == unset) {
+                l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
+                return false;
+            } else if (e - value_tag < s.values.len) {
+                r.* = .{ .v = s.values[e - value_tag].value, .kind = .value };
+            } else {
+                r.* = .{ .v = e - value_tag - s.values.len, .kind = .import };
+            }
+        }
+        return true;
     }
 
     fn gatherKeys(l: *Link, chunk: usize, _: usize) void {
@@ -630,7 +754,17 @@ const Link = struct {
     /// Lays out one chunk's atoms within each section, as if the chunk's
     /// part of every section started at 0, and counts the fixups its
     /// absolute addresses need.
-    fn layOut(l: *Link, chunk: usize, _: usize) void {
+    fn layOutKeyed(l: *Link, chunk: usize, _: usize) void {
+        l.layOut(chunk, false);
+    }
+
+    fn layOutNumbered(l: *Link, chunk: usize, _: usize) void {
+        l.layOut(chunk, true);
+    }
+
+    /// The key-based and numbered paths are compiled apart, so that each
+    /// is as tight as if it were the only one.
+    fn layOut(l: *Link, chunk: usize, comptime numbered: bool) void {
         const begin = chunk * chunk_len;
         const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
         var c: Chunk = .{
@@ -647,12 +781,14 @@ const Link = struct {
             .str = undefined,
         };
         for (atoms, l.places[begin..][0..atoms.len], begin..) |*a, *p, i| {
-            if (i + 16 < l.keys.len) l.symbols.prefetch(l.keys[i + 16]);
-            const kept = l.symbols.get(l.keys[i]).?;
-            if (kept != i) {
-                if (!Elf.identical(&l.atoms[kept], a)) l.fail(chunk, i, error.DuplicateSymbol, .{ .atom = a.name, .target = a.key });
-                p.* = .duplicate;
-                continue;
+            if (!numbered) {
+                if (i + 16 < l.keys.len) l.symbols.prefetch(l.keys[i + 16]);
+                const kept = l.symbols.get(l.keys[i]).?;
+                if (kept != i) {
+                    if (!Elf.identical(&l.atoms[kept], a)) l.fail(chunk, i, error.DuplicateSymbol, .{ .atom = a.name, .target = a.key });
+                    p.* = .duplicate;
+                    continue;
+                }
             }
             if (a.section == .bss and (a.bytes.len != 0 or a.relocs.len != 0)) {
                 l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
@@ -699,7 +835,16 @@ const Link = struct {
 
     /// Copies one chunk's atoms, applies their relocations, records their
     /// fixups, and writes their symbols.
-    fn copy(l: *Link, chunk: usize, thread: usize) void {
+    fn copyKeyed(l: *Link, chunk: usize, thread: usize) void {
+        l.copy(chunk, thread, false);
+    }
+
+    /// Out of line, so that the key-based `copy` compiles as if alone.
+    noinline fn copyNumbered(l: *Link, chunk: usize, thread: usize) void {
+        l.copy(chunk, thread, true);
+    }
+
+    fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
         const c = &l.chunks[chunk];
         const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
         for (c.lead_gaps, c.bases, l.section_addrs, 0..) |gap, chunk_base, sa, s| {
@@ -716,11 +861,11 @@ const Link = struct {
             if (i + 4 < l.atoms.len) {
                 const n = &l.atoms[i + 4];
                 Elf.prefetchSlice(u8, n.bytes[0..@min(n.bytes.len, 64)]);
-                Elf.prefetchSlice(SymbolKey, n.targets);
+                if (!numbered) Elf.prefetchSlice(SymbolKey, n.targets);
                 Elf.prefetchSlice(Atom.Reloc, n.relocs);
                 Elf.prefetchSlice(u8, n.name);
             }
-            if (i + 2 < l.atoms.len) for (l.atoms[i + 2].targets) |t| l.symbols.prefetch(t);
+            if (!numbered and i + 2 < l.atoms.len) for (l.atoms[i + 2].targets) |t| l.symbols.prefetch(t);
             if (place.isDuplicate()) continue;
             const addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
             if (place.section != bss) {
@@ -729,7 +874,9 @@ const Link = struct {
                 const dst = l.buf[start..][0..a.bytes.len];
                 @memcpy(dst, a.bytes);
                 const res = resolved[0..a.targets.len];
-                for (a.targets, res) |t, *r| {
+                if (numbered) {
+                    if (!l.resolveNumbered(a, i, chunk, res)) return;
+                } else for (a.targets, res) |t, *r| {
                     r.* = if (l.symbols.get(t)) |v|
                         .{ .v = v, .kind = .addr }
                     else if (l.imports.get(t)) |v|
@@ -1042,6 +1189,13 @@ const ChainedFixupsLayout = struct {
 /// there, after setting the UUID (at `uuid_at`) from the hashes of the
 /// other pages, so the file is hashed once. `text_end` is the end of
 /// __TEXT in the file, the executable segment.
+/// Checks that the entry point, atom `index`, is code.
+fn checkEntry(l: *const Link, index: usize, key: SymbolKey, diag: *Diagnostic) Error!void {
+    if (l.places[index].section == text) return;
+    diag.* = .{ .atom = l.atoms[index].name, .target = key };
+    return error.InvalidRelocation;
+}
+
 fn sign(io: std.Io, n_threads: usize, buf: []u8, sig_off: u32, uuid_at: usize, identifier: []const u8, text_end: u64) !void {
     const n_slots = std.math.divCeil(u32, sig_off, sig_page_size) catch unreachable;
     const cd_off = sig_off + @sizeOf(macho.SuperBlob) + @sizeOf(macho.BlobIndex);
@@ -1244,7 +1398,6 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
 }
 
 test "links many chunks of atoms and pages of fixups the same way on any number of threads" {
-    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const Encoder = @import("../codegen/aarch64/Encoder.zig");
@@ -1334,6 +1487,51 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
     defer gpa.free(four);
     try std.testing.expectEqualSlices(u8, one, four);
 
+    // Numbered symbols, as the cache's manifest supplies them: the atoms
+    // the key-based link keeps, in its order, then the imports, numbered
+    // densely, give the same bytes as the key-based link of those atoms.
+    // (Not of all atoms: chunks of other atoms align differently.)
+    var numbers: std.AutoHashMapUnmanaged(SymbolKey, u32) = .empty;
+    var kept: std.ArrayList(Atom) = .empty;
+    for (atoms.items) |a| {
+        const gop = try numbers.getOrPut(arena, a.key);
+        if (gop.found_existing) continue;
+        gop.value_ptr.* = @intCast(kept.items.len);
+        try kept.append(arena, a);
+    }
+    const import_numbers = try arena.alloc(u32, imports.len);
+    for (imports, import_numbers, 0..) |imp, *num, i| {
+        num.* = @intCast(kept.items.len + i);
+        try numbers.put(arena, imp.key, num.*);
+    }
+    const numbered_atoms = try arena.alloc(Elf.NumberedAtom, kept.items.len);
+    var targets: std.ArrayList(u32) = .empty;
+    for (numbered_atoms, kept.items, 0..) |*num, a, i| {
+        num.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
+        for (a.targets) |t| try targets.append(arena, numbers.get(t).?);
+    }
+    var symbols: Symbols = .{ .atoms = numbered_atoms, .targets = targets.items, .imports = import_numbers, .entry = numbers.get(main).?, .len = @intCast(numbers.count()) };
+    const keyed = try emit(gpa, io, kept.items, .{ .entry = main, .imports = imports, .identifier = "chunks" });
+    defer gpa.free(keyed);
+    for ([_]usize{ 1, 4 }) |threads| {
+        const numbered = try emit(gpa, io, kept.items, .{ .entry = main, .imports = imports, .threads = threads, .identifier = "chunks", .symbols = symbols });
+        defer gpa.free(numbered);
+        try std.testing.expectEqualSlices(u8, keyed, numbered);
+    }
+    // An import's number left undefined, and an entry that is not code.
+    var diag: Diagnostic = .{};
+    symbols.imports = &.{ import_numbers[0], symbols.len };
+    try std.testing.expectError(error.InvalidSymbols, emit(gpa, io, kept.items, .{ .entry = main, .imports = imports, .symbols = symbols }));
+    symbols.imports = &.{ import_numbers[0], import_numbers[0] };
+    try std.testing.expectError(error.UndefinedSymbol, emit(gpa, io, kept.items, .{ .entry = main, .imports = imports, .symbols = symbols, .diag = &diag }));
+    try std.testing.expectEqual(exit, diag.target.?);
+    symbols.imports = import_numbers;
+    symbols.entry = numbers.get(msg).?;
+    try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, kept.items, .{ .entry = main, .imports = imports, .symbols = symbols, .diag = &diag }));
+    try std.testing.expectEqualStrings("msg", diag.atom);
+
+    // Running the output needs a Mac.
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .macos) return;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try link(gpa, io, tmp.dir, "chunks", atoms.items, .{ .entry = main, .imports = imports, .threads = 3 });

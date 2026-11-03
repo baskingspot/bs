@@ -22,11 +22,11 @@
 //! 8..40 bytes. Each emit is also timed without it, to show its cost.
 //! Mach-O does not emit debug info yet.
 //!
-//! ELF is also linked with numbered symbols (`Elf.Options.symbols`), as the
-//! cache's manifest would supply them: from the same scattered atoms, and
-//! from "packed" atoms whose records lie one after another in link order,
-//! as in a compacted pack (targets, relocations, bytes, name). Both must
-//! produce the same bytes as the key-based link.
+//! Both formats are also linked with numbered symbols (`Options.symbols`),
+//! as the cache's manifest would supply them: from the same scattered
+//! atoms, and from "packed" atoms whose records lie one after another in
+//! link order, as in a compacted pack (targets, relocations, bytes, name).
+//! Both must produce the same bytes as the key-based link.
 //!
 //! ELF links to a file are timed with each `Elf.FileWrites`, overwriting
 //! the previous output in place and into a new file, on 1 and all threads.
@@ -172,7 +172,10 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
             cpus,                                ms(with_write),
         });
         if (format == .elf) try linkToFile(gpa, io, atoms, single, parallel, out_n, cpus);
-        if (format == .elf) try benchNumbered(gpa, io, arena, atoms, debug, single, out_n, stripped, cpus);
+        switch (format) {
+            .elf => try benchNumbered(gpa, io, arena, atoms, debug, single, out_n, stripped, cpus),
+            .macho => try benchNumberedMachO(gpa, io, arena, atoms, single, cpus),
+        }
     }
     std.debug.print("(best of {d} runs each)\n", .{runs});
 }
@@ -324,6 +327,73 @@ fn linkToFile(gpa: std.mem.Allocator, io: std.Io, atoms: []const Atom, single: E
             \\    link to a file, {s}: auto {d:.2} ms on 1 thread, {d:.2} ms on {d}; map {d:.2}, {d:.2}; pwrite {d:.2}, {d:.2}
             \\
         , .{ case, ms(best[0][0]), ms(best[0][1]), cpus, ms(best[1][0]), ms(best[1][1]), ms(best[2][0]), ms(best[2][1]) });
+    }
+}
+
+/// `benchNumbered` for Mach-O, which numbers its imports too and has no
+/// debug info. Compares against the key-based link of the kept atoms.
+fn benchNumberedMachO(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, all: []const Atom, options: MachO.Options, cpus: usize) !void {
+    var numbers: std.AutoHashMapUnmanaged(Atom.SymbolKey, u32) = .empty;
+    var kept: std.ArrayList(Atom) = .empty;
+    for (all) |a| {
+        const gop = try numbers.getOrPut(arena, a.key);
+        if (gop.found_existing) continue;
+        gop.value_ptr.* = @intCast(kept.items.len);
+        try kept.append(arena, a);
+    }
+    const import_numbers = try arena.alloc(u32, options.imports.len);
+    for (options.imports, import_numbers) |imp, *n| {
+        const gop = try numbers.getOrPut(arena, imp.key);
+        if (!gop.found_existing) gop.value_ptr.* = @intCast(numbers.count() - 1);
+        n.* = gop.value_ptr.*;
+    }
+    const atom_numbers = try arena.alloc(Elf.NumberedAtom, kept.items.len);
+    var targets: std.ArrayList(u32) = .empty;
+    for (atom_numbers, kept.items, 0..) |*n, a, i| {
+        n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
+        for (a.targets) |t| try targets.append(arena, numbers.get(t).?);
+    }
+    const expected = try MachO.emit(gpa, io, kept.items, options);
+    defer gpa.free(expected);
+    var single = options;
+    single.symbols = .{ .atoms = atom_numbers, .targets = targets.items, .imports = import_numbers, .entry = numbers.get(options.entry).?, .len = numbers.count() };
+
+    const packed_atoms = try arena.dupe(Atom, kept.items);
+    var total: usize = 0;
+    for (packed_atoms) |a| total += 16 + 16 * a.targets.len + 12 * a.relocs.len + a.bytes.len + a.name.len;
+    const pack = try arena.alignedAlloc(u8, .@"16", total);
+    var at: usize = 0;
+    for (packed_atoms) |*a| {
+        const record = at;
+        a.targets = put(Atom.SymbolKey, pack, &at, a.targets);
+        a.relocs = put(Atom.Reloc, pack, &at, a.relocs);
+        a.bytes = put(u8, pack, &at, a.bytes);
+        a.name = put(u8, pack, &at, a.name);
+        at = record + std.mem.alignForward(usize, at - record, 16);
+    }
+
+    const keyed_parallel = blk: {
+        var o = options;
+        o.threads = null;
+        var best: u64 = std.math.maxInt(u64);
+        for (0..runs) |_| best = @min(best, try timeEmit(MachO, gpa, io, kept.items, o));
+        break :blk best;
+    };
+    std.debug.print("  keys, deduplicated atoms: emit {d:.2} ms on {d}\n", .{ ms(keyed_parallel), cpus });
+    for ([_]struct { []const u8, []const Atom }{ .{ "scattered", kept.items }, .{ "packed", packed_atoms } }) |v| {
+        const name, const atoms = v;
+        var parallel = single;
+        parallel.threads = null;
+        for ([_]MachO.Options{ single, parallel }) |o| {
+            const out = try MachO.emit(gpa, io, atoms, o);
+            defer gpa.free(out);
+            if (!std.mem.eql(u8, out, expected)) @panic("numbered symbols changed the output");
+        }
+        var best: [2]u64 = @splat(std.math.maxInt(u64));
+        for (0..runs) |_| {
+            for (&best, [_]MachO.Options{ single, parallel }) |*b, o| b.* = @min(b.*, try timeEmit(MachO, gpa, io, atoms, o));
+        }
+        std.debug.print("  numbered, {s}: emit {d:.2} ms on 1 thread, {d:.2} ms on {d}\n", .{ name, ms(best[0]), ms(best[1]), cpus });
     }
 }
 
