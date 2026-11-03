@@ -480,7 +480,13 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   so the file is read once for both. `link` must invalidate its mapping of
   the output before unmapping it, or macOS kills every run of the file
   despite a valid signature (golang/go#42684). It takes no `Atom.Debug`
-  yet; Mach-O debug info comes later.
+  yet; Mach-O debug info comes later. `MachO.linkInput`/`emitInput` read
+  atoms through the same input as ELF's (its debug declarations unused),
+  with the same `check`/`InvalidInput` contract, and `MachO.Symbols` has
+  `targets_tail`. Cost to the slice path on the orb (callgrind, three
+  single-thread emits, excluding the 3594M instructions of software
+  SHA-256 that are the same in both): 463.1M → 464.5M (+0.31%), from code
+  layout; wall clock within noise.
 - Measured Mach-O link throughput (2026-11-02, Apple M4 Max, 12+4 cores,
   `zig build bench-link -- macho`, best of 15): the same 100k atoms with
   aarch64 relocations (970k: a constant reference is an adrp/add pair) and

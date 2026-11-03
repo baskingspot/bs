@@ -251,7 +251,7 @@ pub const AtomSlice = struct {
 
 /// A pointer to what an input returned, given a pointer to it, whether it
 /// returned a value or a pointer.
-inline fn ref(p: anytype) switch (@typeInfo(@TypeOf(p.*))) {
+pub inline fn ref(p: anytype) switch (@typeInfo(@TypeOf(p.*))) {
     .pointer => @TypeOf(p.*),
     else => @TypeOf(p),
 } {
@@ -1623,9 +1623,9 @@ fn overflow(a: *const Atom, r: Atom.Reloc, diag: *Diagnostic) Error {
     return error.RelocationOverflow;
 }
 
-/// An input that returns records by value, as a cache's pack does, and
-/// asserts that the linker checks each atom before it reads it.
-const TestInput = struct {
+/// For tests: an input that returns records by value, as a cache's pack
+/// does, and asserts that the linker checks each atom before it reads it.
+pub const TestInput = struct {
     slice: AtomSlice,
     checked: []std.atomic.Value(bool),
     /// Atoms whose check fails.

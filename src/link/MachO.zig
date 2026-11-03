@@ -81,6 +81,8 @@ pub const Symbols = struct {
     atoms: []const Elf.NumberedAtom,
     /// The numbers of the atoms' targets, as for `Elf.Symbols.targets`.
     targets: []const u32,
+    /// As for `Elf.Symbols.targets_tail`.
+    targets_tail: []const u32 = &.{},
     values: []const Elf.NumberedValue = &.{},
     /// The number of each of `Options.imports`. An atom with the same
     /// number takes precedence over an import, as a key does, and an import
@@ -111,6 +113,12 @@ pub const Error = Elf.Error;
 /// not truncated: the kernel caches the code signature of a file it has
 /// run, and rewriting that file in place gets the next run killed.
 pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, atoms: []const Atom, options: Options) !void {
+    return linkInput(gpa, io, dir, sub_path, Elf.AtomSlice{ .atoms = atoms, .debug_entries = &.{} }, options);
+}
+
+/// `link` with the atoms read from `input`, which has `Elf.AtomSlice`'s
+/// declarations other than the debug ones.
+pub fn linkInput(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, input: anytype, options: Options) !void {
     var o = options;
     if (o.identifier == null) o.identifier = std.fs.path.basename(sub_path);
     dir.deleteFile(io, sub_path) catch |err| switch (err) {
@@ -129,14 +137,19 @@ pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, a
         std.posix.msync(out.map, std.posix.MSF.INVALIDATE) catch {};
         std.posix.munmap(out.map);
     };
-    try build(gpa, io, atoms, o, &out);
+    try build(gpa, io, input, o, &out);
 }
 
 /// Links `atoms` into the bytes of an executable, owned by the caller.
 pub fn emit(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options) Error![]u8 {
+    return emitInput(gpa, io, Elf.AtomSlice{ .atoms = atoms, .debug_entries = &.{} }, options);
+}
+
+/// `emit` with the atoms read from `input` (see `linkInput`).
+pub fn emitInput(gpa: Allocator, io: std.Io, input: anytype, options: Options) Error![]u8 {
     var out: Elf.MemoryOutput = .{ .gpa = gpa };
     errdefer gpa.free(out.buf);
-    try build(gpa, io, atoms, options, &out);
+    try build(gpa, io, input, options, &out);
     return out.buf;
 }
 
@@ -203,31 +216,34 @@ const mh_execute_header = "__mh_execute_header";
 /// threads. Mach-O adds a serial pass that writes the GOT and stubs and
 /// links fixups into per-page chains, and a parallel pass that hashes
 /// pages for the code signature.
-fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out: anytype) !void {
+fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anytype) !void {
+    const Link = LinkOf(@TypeOf(input));
     var unused_diag: Diagnostic = .{};
     const diag = options.diag orelse &unused_diag;
 
-    const n_chunks = std.math.divCeil(usize, atoms.len, chunk_len) catch unreachable;
+    const n_atoms = input.len();
+    const n_chunks = std.math.divCeil(usize, n_atoms, chunk_len) catch unreachable;
     const n_threads = @max(1, @min(n_chunks, options.threads orelse std.Thread.getCpuCount() catch 1));
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
     const numbered = options.symbols;
-    if (numbered) |s| if (s.atoms.len != atoms.len or s.entry >= s.len or s.imports.len != options.imports.len) return error.InvalidSymbols;
-    var symbols: SymbolTable = if (numbered == null) try .init(atoms.len, n_partitions) else .empty;
+    if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len or s.imports.len != options.imports.len) return error.InvalidSymbols;
+    var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
     defer symbols.deinit();
     // With numbered symbols, each number's address, import, or value.
     const addrs = try gpa.alloc(u32, if (numbered) |s| s.len else 0);
     defer gpa.free(addrs);
-    const places = try gpa.alloc(Place, atoms.len);
+    const places = try gpa.alloc(Place, n_atoms);
     defer gpa.free(places);
-    const keys = try gpa.alloc(SymbolKey, if (numbered == null) atoms.len else 0);
+    const keys = try gpa.alloc(SymbolKey, if (numbered == null) n_atoms else 0);
     defer gpa.free(keys);
     const chunks = try gpa.alloc(Chunk, n_chunks);
     defer gpa.free(chunks);
     const failures = try gpa.alloc(?Failure, @max(n_chunks, n_partitions));
     defer gpa.free(failures);
     var l: Link = .{
-        .atoms = atoms,
+        .input = input,
+        .n_atoms = n_atoms,
         .places = places,
         .keys = keys,
         .chunks = chunks,
@@ -633,372 +649,390 @@ const Failure = struct { atom: usize, err: Error, diag: Diagnostic };
 /// value.
 const Resolved = struct { v: u64, kind: enum(u8) { addr, import, value } };
 
-/// State shared by the threads of `build`.
-const Link = struct {
-    atoms: []const Atom,
-    places: []Place,
-    keys: []SymbolKey,
-    chunks: []Chunk,
-    /// Maps a key to the index of the atom kept for it, and from
-    /// `resolveAddrs` on to its address.
-    symbols: *SymbolTable,
-    failures: []?Failure,
-    section_addrs: [n_sects]u64 = undefined,
-    // Set before `copy`.
-    values: *const SymbolTable = undefined,
-    /// Import key to its index in `Options.imports`.
-    imports: *const SymbolTable = undefined,
-    buf: []u8 = undefined,
-    symtab_off: u64 = undefined,
-    strtab_off: u64 = undefined,
-    resolved: []Resolved = undefined,
-    max_targets: usize = undefined,
-    /// File offset of every chained fixup, in address order.
-    fixups: []u64 = undefined,
-    /// 1-based section number of each section, for symbols.
-    sect_index: [n_sects]u8 = undefined,
-    stubs_addr: u64 = undefined,
-    got_addr: u64 = undefined,
-    numbered: ?Symbols,
-    /// With numbered symbols, the address table (see `unset`).
-    addrs: []u32,
-    /// With numbered symbols, the atom numbered `Symbols.entry`, found by
-    /// `resolveAddrsNumbered`.
-    entry_atom: ?usize = null,
+/// State shared by the threads of `build`, reading atoms from an `Input`
+/// (see `Elf.AtomSlice`; the debug declarations are not used).
+fn LinkOf(comptime Input: type) type {
+    return struct {
+        const Link = @This();
 
-    fn check(l: *Link, diag: *Diagnostic) Error!void {
-        var first: ?Failure = null;
-        for (l.failures) |f| if (f) |failure| {
-            if (first == null or failure.atom < first.?.atom) first = failure;
-        };
-        @memset(l.failures, null);
-        const failure = first orelse return;
-        diag.* = failure.diag;
-        return failure.err;
-    }
+        input: Input,
+        n_atoms: usize,
+        places: []Place,
+        keys: []SymbolKey,
+        chunks: []Chunk,
+        /// Maps a key to the index of the atom kept for it, and from
+        /// `resolveAddrs` on to its address.
+        symbols: *SymbolTable,
+        failures: []?Failure,
+        section_addrs: [n_sects]u64 = undefined,
+        // Set before `copy`.
+        values: *const SymbolTable = undefined,
+        /// Import key to its index in `Options.imports`.
+        imports: *const SymbolTable = undefined,
+        buf: []u8 = undefined,
+        symtab_off: u64 = undefined,
+        strtab_off: u64 = undefined,
+        resolved: []Resolved = undefined,
+        max_targets: usize = undefined,
+        /// File offset of every chained fixup, in address order.
+        fixups: []u64 = undefined,
+        /// 1-based section number of each section, for symbols.
+        sect_index: [n_sects]u8 = undefined,
+        stubs_addr: u64 = undefined,
+        got_addr: u64 = undefined,
+        numbered: ?Symbols,
+        /// With numbered symbols, the address table (see `unset`).
+        addrs: []u32,
+        /// With numbered symbols, the atom numbered `Symbols.entry`, found by
+        /// `resolveAddrsNumbered`.
+        entry_atom: ?usize = null,
 
-    fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
-        if (l.failures[task] == null) l.failures[task] = .{ .atom = atom, .err = err, .diag = diag };
-    }
-
-    fn atomAddr(l: *const Link, index: u64) u64 {
-        const p = l.places[index];
-        return l.section_addrs[p.section] + l.chunks[index / chunk_len].bases[p.section] + p.offset;
-    }
-
-    fn resolveAddrsKeyed(l: *Link, partition: usize, _: usize) void {
-        for (l.symbols.partitionEntries(partition)) |*e| {
-            if (e.used) e.value = l.atomAddr(e.value);
+        fn check(l: *Link, diag: *Diagnostic) Error!void {
+            var first: ?Failure = null;
+            for (l.failures) |f| if (f) |failure| {
+                if (first == null or failure.atom < first.?.atom) first = failure;
+            };
+            @memset(l.failures, null);
+            const failure = first orelse return;
+            diag.* = failure.diag;
+            if (failure.atom < l.n_atoms) diag.index = failure.atom;
+            return failure.err;
         }
-    }
 
-    /// Sets the addresses of one chunk's atoms' numbers.
-    fn resolveAddrsNumbered(l: *Link, chunk: usize, _: usize) void {
-        const s = l.numbered.?;
-        const begin = chunk * chunk_len;
-        const end = @min(l.atoms.len, begin + chunk_len);
-        for (s.atoms[begin..end], begin..) |n, i| {
-            if (n.symbol >= l.addrs.len) return l.fail(chunk, i, error.InvalidSymbols, .{ .atom = l.atoms[i].name });
-            l.addrs[n.symbol] = @intCast(l.atomAddr(i) - base_address);
-            // Numbers are distinct, so one chunk at most writes this.
-            if (n.symbol == s.entry) l.entry_atom = i;
+        fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
+            if (l.failures[task] == null) l.failures[task] = .{ .atom = atom, .err = err, .diag = diag };
         }
-    }
 
-    /// Sets `res` to what the targets of `a`, atom `i`, resolve to, from
-    /// `addrs`.
-    fn resolveNumbered(l: *Link, a: *const Atom, i: usize, chunk: usize, res: []Resolved) bool {
-        const s = l.numbered.?;
-        const first = s.atoms[i].targets;
-        if (first > s.targets.len or s.targets.len - first < a.targets.len) {
-            l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name });
-            return false;
+        fn atomAddr(l: *const Link, index: u64) u64 {
+            const p = l.places[index];
+            return l.section_addrs[p.section] + l.chunks[index / chunk_len].bases[p.section] + p.offset;
         }
-        for (s.targets[first..][0..a.targets.len], res, a.targets) |n, *r, t| {
-            if (n >= l.addrs.len) {
-                l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name, .target = t });
-                return false;
-            }
-            const e = l.addrs[n];
-            if (e < value_tag) {
-                r.* = .{ .v = base_address + @as(u64, e), .kind = .addr };
-            } else if (e == unset) {
-                l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
-                return false;
-            } else if (e - value_tag < s.values.len) {
-                r.* = .{ .v = s.values[e - value_tag].value, .kind = .value };
-            } else {
-                r.* = .{ .v = e - value_tag - s.values.len, .kind = .import };
+
+        fn resolveAddrsKeyed(l: *Link, partition: usize, _: usize) void {
+            for (l.symbols.partitionEntries(partition)) |*e| {
+                if (e.used) e.value = l.atomAddr(e.value);
             }
         }
-        return true;
-    }
 
-    fn gatherKeys(l: *Link, chunk: usize, _: usize) void {
-        const begin = chunk * chunk_len;
-        const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
-        for (atoms, l.keys[begin..][0..atoms.len]) |*a, *k| k.* = a.key;
-    }
-
-    fn dedup(l: *Link, partition: usize, _: usize) void {
-        l.symbols.populate(partition);
-        const keys = l.keys;
-        for (keys, 0..) |key, i| {
-            if (i + 16 < keys.len and l.symbols.partition(keys[i + 16]) == partition) l.symbols.prefetch(keys[i + 16]);
-            if (l.symbols.partition(key) != partition) continue;
-            const e = l.symbols.getOrPut(key);
-            if (!e.used) e.* = .{ .key = key, .value = i, .used = true };
+        /// Sets the addresses of one chunk's atoms' numbers.
+        fn resolveAddrsNumbered(l: *Link, chunk: usize, _: usize) void {
+            const s = l.numbered.?;
+            const begin = chunk * chunk_len;
+            const end = @min(l.n_atoms, begin + chunk_len);
+            for (s.atoms[begin..end], begin..) |n, i| {
+                if (n.symbol >= l.addrs.len) return l.fail(chunk, i, error.InvalidSymbols, .{ .atom = l.input.atom(i).name });
+                l.addrs[n.symbol] = @intCast(l.atomAddr(i) - base_address);
+                // Numbers are distinct, so one chunk at most writes this.
+                if (n.symbol == s.entry) l.entry_atom = i;
+            }
         }
-    }
 
-    /// Lays out one chunk's atoms within each section, as if the chunk's
-    /// part of every section started at 0, and counts the fixups its
-    /// absolute addresses need.
-    fn layOutKeyed(l: *Link, chunk: usize, _: usize) void {
-        l.layOut(chunk, false);
-    }
-
-    fn layOutNumbered(l: *Link, chunk: usize, _: usize) void {
-        l.layOut(chunk, true);
-    }
-
-    /// The key-based and numbered paths are compiled apart, so that each
-    /// is as tight as if it were the only one.
-    fn layOut(l: *Link, chunk: usize, comptime numbered: bool) void {
-        const begin = chunk * chunk_len;
-        const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
-        var c: Chunk = .{
-            .sizes = @splat(0),
-            .aligns = @splat(.@"1"),
-            .n_fixups = @splat(0),
-            .n_syms = 0,
-            .str_len = 0,
-            .max_targets = 0,
-            .bases = undefined,
-            .lead_gaps = undefined,
-            .fixups = undefined,
-            .sym = undefined,
-            .str = undefined,
-        };
-        for (atoms, l.places[begin..][0..atoms.len], begin..) |*a, *p, i| {
-            if (!numbered) {
-                if (i + 16 < l.keys.len) l.symbols.prefetch(l.keys[i + 16]);
-                const kept = l.symbols.get(l.keys[i]).?;
-                if (kept != i) {
-                    if (!Elf.identical(&l.atoms[kept], a)) l.fail(chunk, i, error.DuplicateSymbol, .{ .atom = a.name, .target = a.key });
-                    p.* = .duplicate;
-                    continue;
+        /// Sets `res` to what the targets of `a`, atom `i`, resolve to, from
+        /// `addrs`.
+        fn resolveNumbered(l: *Link, a: *const Atom, i: usize, chunk: usize, res: []Resolved) bool {
+            const s = l.numbered.?;
+            const first = s.atoms[i].targets;
+            // A run lies wholly in `targets` or wholly in `targets_tail`.
+            const runs, const at = if (first < s.targets.len) .{ s.targets, first } else .{ s.targets_tail, first - s.targets.len };
+            if (at > runs.len or runs.len - at < a.targets.len) {
+                l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name });
+                return false;
+            }
+            for (runs[at..][0..a.targets.len], res, a.targets) |n, *r, t| {
+                if (n >= l.addrs.len) {
+                    l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name, .target = t });
+                    return false;
+                }
+                const e = l.addrs[n];
+                if (e < value_tag) {
+                    r.* = .{ .v = base_address + @as(u64, e), .kind = .addr };
+                } else if (e == unset) {
+                    l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
+                    return false;
+                } else if (e - value_tag < s.values.len) {
+                    r.* = .{ .v = s.values[e - value_tag].value, .kind = .value };
+                } else {
+                    r.* = .{ .v = e - value_tag - s.values.len, .kind = .import };
                 }
             }
-            if (a.section == .bss and (a.bytes.len != 0 or a.relocs.len != 0)) {
-                l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
-                continue;
+            return true;
+        }
+
+        fn gatherKeys(l: *Link, chunk: usize, _: usize) void {
+            const begin = chunk * chunk_len;
+            const end = @min(l.n_atoms, begin + chunk_len);
+            for (l.keys[begin..end], begin..) |*k, i| {
+                // The key path's first read of each atom.
+                if (!l.input.check(i)) return l.fail(chunk, i, error.InvalidInput, .{});
+                k.* = l.input.atom(i).key;
             }
-            var n_abs: u32 = 0;
-            if (a.section == .rodata or a.section == .data) {
-                for (a.relocs) |r| n_abs += @intFromBool(r.info.kind == .aarch64_abs64);
+        }
+
+        fn dedup(l: *Link, partition: usize, _: usize) void {
+            l.symbols.populate(partition);
+            const keys = l.keys;
+            for (keys, 0..) |key, i| {
+                if (i + 16 < keys.len and l.symbols.partition(keys[i + 16]) == partition) l.symbols.prefetch(keys[i + 16]);
+                if (l.symbols.partition(key) != partition) continue;
+                const e = l.symbols.getOrPut(key);
+                if (!e.used) e.* = .{ .key = key, .value = i, .used = true };
             }
-            const s: u3 = switch (a.section) {
-                .text => text,
-                .rodata => if (n_abs > 0) data_const else text_const,
-                .data => data,
-                .bss => bss,
-                // Not implemented yet (see the file's doc comment).
-                .tdata, .tbss => {
+        }
+
+        /// Lays out one chunk's atoms within each section, as if the chunk's
+        /// part of every section started at 0, and counts the fixups its
+        /// absolute addresses need.
+        fn layOutKeyed(l: *Link, chunk: usize, _: usize) void {
+            l.layOut(chunk, false);
+        }
+
+        fn layOutNumbered(l: *Link, chunk: usize, _: usize) void {
+            l.layOut(chunk, true);
+        }
+
+        /// The key-based and numbered paths are compiled apart, so that each
+        /// is as tight as if it were the only one.
+        fn layOut(l: *Link, chunk: usize, comptime numbered: bool) void {
+            const begin = chunk * chunk_len;
+            const end = @min(l.n_atoms, begin + chunk_len);
+            var c: Chunk = .{
+                .sizes = @splat(0),
+                .aligns = @splat(.@"1"),
+                .n_fixups = @splat(0),
+                .n_syms = 0,
+                .str_len = 0,
+                .max_targets = 0,
+                .bases = undefined,
+                .lead_gaps = undefined,
+                .fixups = undefined,
+                .sym = undefined,
+                .str = undefined,
+            };
+            for (l.places[begin..end], begin..) |*p, i| {
+                // The numbered path's first read of each atom; the key
+                // path checked them in `gatherKeys`.
+                if (numbered and !l.input.check(i)) {
+                    l.fail(chunk, i, error.InvalidInput, .{});
+                    continue;
+                }
+                const atom = l.input.atom(i);
+                const a = Elf.ref(&atom);
+                if (!numbered) {
+                    if (i + 16 < l.keys.len) l.symbols.prefetch(l.keys[i + 16]);
+                    const kept = l.symbols.get(l.keys[i]).?;
+                    if (kept != i) {
+                        const kept_atom = l.input.atom(kept);
+                        if (!Elf.identical(Elf.ref(&kept_atom), a)) l.fail(chunk, i, error.DuplicateSymbol, .{ .atom = a.name, .target = a.key });
+                        p.* = .duplicate;
+                        continue;
+                    }
+                }
+                if (a.section == .bss and (a.bytes.len != 0 or a.relocs.len != 0)) {
                     l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
                     continue;
-                },
-            };
-            c.n_fixups[s] += n_abs;
-            const off = a.alignment.forward(c.sizes[s]);
-            p.* = .{
-                .offset = std.math.cast(u40, off) orelse {
-                    l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
-                    continue;
-                },
-                .gap = std.math.cast(u21, off - c.sizes[s]) orelse {
-                    l.fail(chunk, i, error.AlignmentTooLarge, .{ .atom = a.name });
-                    continue;
-                },
-                .section = s,
-            };
-            c.sizes[s] = off + a.size();
-            c.aligns[s] = c.aligns[s].max(a.alignment);
-            if (a.name.len > 0) {
-                c.n_syms += 1;
-                c.str_len += @intCast(a.name.len + 1);
-            }
-            c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
-        }
-        l.chunks[chunk] = c;
-    }
-
-    /// Copies one chunk's atoms, applies their relocations, records their
-    /// fixups, and writes their symbols.
-    fn copyKeyed(l: *Link, chunk: usize, thread: usize) void {
-        l.copy(chunk, thread, false);
-    }
-
-    /// Out of line, so that the key-based `copy` compiles as if alone.
-    noinline fn copyNumbered(l: *Link, chunk: usize, thread: usize) void {
-        l.copy(chunk, thread, true);
-    }
-
-    fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
-        const c = &l.chunks[chunk];
-        const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
-        for (c.lead_gaps, c.bases, l.section_addrs, 0..) |gap, chunk_base, sa, s| {
-            if (s == bss or gap == 0) continue;
-            const start = sa - base_address + chunk_base;
-            @memset(l.buf[start - gap .. start], 0);
-        }
-        var fixup = c.fixups;
-        const begin = chunk * chunk_len;
-        const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
-        var sym_off = l.symtab_off + @as(u64, c.sym) * @sizeOf(macho.nlist_64);
-        var str_off = c.str;
-        for (atoms, l.places[begin..][0..atoms.len], begin..) |*a, place, i| {
-            if (i + 4 < l.atoms.len) {
-                const n = &l.atoms[i + 4];
-                Elf.prefetchSlice(u8, n.bytes[0..@min(n.bytes.len, 64)]);
-                if (!numbered) Elf.prefetchSlice(SymbolKey, n.targets);
-                Elf.prefetchSlice(Atom.Reloc, n.relocs);
-                Elf.prefetchSlice(u8, n.name);
-            }
-            if (!numbered and i + 2 < l.atoms.len) for (l.atoms[i + 2].targets) |t| l.symbols.prefetch(t);
-            if (place.isDuplicate()) continue;
-            const addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
-            if (place.section != bss) {
-                const start = addr - base_address;
-                @memset(l.buf[start - place.gap .. start], 0);
-                const dst = l.buf[start..][0..a.bytes.len];
-                @memcpy(dst, a.bytes);
-                const res = resolved[0..a.targets.len];
-                if (numbered) {
-                    if (!l.resolveNumbered(a, i, chunk, res)) return;
-                } else for (a.targets, res) |t, *r| {
-                    r.* = if (l.symbols.get(t)) |v|
-                        .{ .v = v, .kind = .addr }
-                    else if (l.imports.get(t)) |v|
-                        .{ .v = v, .kind = .import }
-                    else if (l.values.get(t)) |v|
-                        .{ .v = v, .kind = .value }
-                    else {
-                        l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
-                        return;
-                    };
                 }
-                var diag: Diagnostic = .{};
-                l.applyRelocs(a, dst, addr, place.section, res, &fixup[place.section], &diag) catch |err| return l.fail(chunk, i, err, diag);
+                var n_abs: u32 = 0;
+                if (a.section == .rodata or a.section == .data) {
+                    for (a.relocs) |r| n_abs += @intFromBool(r.info.kind == .aarch64_abs64);
+                }
+                const s: u3 = switch (a.section) {
+                    .text => text,
+                    .rodata => if (n_abs > 0) data_const else text_const,
+                    .data => data,
+                    .bss => bss,
+                    // Not implemented yet (see the file's doc comment).
+                    .tdata, .tbss => {
+                        l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
+                        continue;
+                    },
+                };
+                c.n_fixups[s] += n_abs;
+                const off = a.alignment.forward(c.sizes[s]);
+                p.* = .{
+                    .offset = std.math.cast(u40, off) orelse {
+                        l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
+                        continue;
+                    },
+                    .gap = std.math.cast(u21, off - c.sizes[s]) orelse {
+                        l.fail(chunk, i, error.AlignmentTooLarge, .{ .atom = a.name });
+                        continue;
+                    },
+                    .section = s,
+                };
+                c.sizes[s] = off + a.size();
+                c.aligns[s] = c.aligns[s].max(a.alignment);
+                if (a.name.len > 0) {
+                    c.n_syms += 1;
+                    c.str_len += @intCast(a.name.len + 1);
+                }
+                c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
             }
-            if (a.name.len > 0) {
-                @memcpy(l.buf[l.strtab_off + str_off ..][0..a.name.len], a.name);
-                l.buf[l.strtab_off + str_off + a.name.len] = 0;
-                writeStruct(l.buf[sym_off..], nlist(str_off, macho.N_SECT, l.sect_index[place.section], 0, addr));
-                sym_off += @sizeOf(macho.nlist_64);
-                str_off += @intCast(a.name.len + 1);
-            }
+            l.chunks[chunk] = c;
         }
-    }
 
-    /// Applies `a`'s relocations to its copy `dst` at address `p_base` in
-    /// section `sect`, recording fixups from `fixups.*` on.
-    fn applyRelocs(l: *const Link, a: *const Atom, dst: []u8, p_base: u64, sect: u3, resolved: []const Resolved, fixups: *u64, diag: *Diagnostic) Error!void {
-        for (a.relocs) |r| {
-            const width: u4 = switch (r.info.kind) {
-                .aarch64_abs64, .value64 => 8,
-                .value16 => 2,
-                .value8 => 1,
-                else => 4,
-            };
-            if (r.offset + @as(u64, width) > dst.len or r.info.target >= resolved.len) {
-                diag.* = .{ .atom = a.name };
-                return error.InvalidRelocation;
+        /// Copies one chunk's atoms, applies their relocations, records their
+        /// fixups, and writes their symbols.
+        fn copyKeyed(l: *Link, chunk: usize, thread: usize) void {
+            l.copy(chunk, thread, false);
+        }
+
+        /// Out of line, so that the key-based `copy` compiles as if alone.
+        noinline fn copyNumbered(l: *Link, chunk: usize, thread: usize) void {
+            l.copy(chunk, thread, true);
+        }
+
+        fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
+            const c = &l.chunks[chunk];
+            const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
+            for (c.lead_gaps, c.bases, l.section_addrs, 0..) |gap, chunk_base, sa, s| {
+                if (s == bss or gap == 0) continue;
+                const start = sa - base_address + chunk_base;
+                @memset(l.buf[start - gap .. start], 0);
             }
-            const field = dst[r.offset..];
-            const t = resolved[r.info.target];
-            const p = p_base + r.offset;
-            const addend: i64 = r.addend;
-            const insn = std.mem.readInt(u32, field[0..4], .little);
-            const invalid = error.InvalidRelocation;
-            errdefer diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
-            switch (r.info.kind) {
-                .aarch64_branch26 => {
-                    const s = switch (t.kind) {
-                        .addr => t.v,
-                        .import => l.stubs_addr + stub_size * t.v,
-                        .value => return invalid,
-                    };
-                    const delta: i64 = @bitCast((s +% @as(u64, @bitCast(addend))) -% p);
-                    if (delta & 3 != 0 or delta < -(1 << 27) or delta >= 1 << 27) return error.RelocationOverflow;
-                    const imm: u32 = @truncate(@as(u64, @bitCast(delta >> 2)) & 0x3ffffff);
-                    std.mem.writeInt(u32, field[0..4], (insn & 0xfc000000) | imm, .little);
-                },
-                .aarch64_page21, .aarch64_got_load_page21 => {
-                    const s = switch (t.kind) {
-                        .addr => t.v,
-                        .import => if (r.info.kind == .aarch64_got_load_page21) l.got_addr + 8 * t.v else return invalid,
-                        .value => return invalid,
-                    };
-                    if (r.info.kind == .aarch64_got_load_page21 and addend != 0) return invalid;
-                    const pages = pageDelta(s +% @as(u64, @bitCast(addend)), p);
-                    if (pages < -(1 << 20) or pages >= 1 << 20) return error.RelocationOverflow;
-                    std.mem.writeInt(u32, field[0..4], patchAdrp(insn, pages), .little);
-                },
-                .aarch64_pageoff12 => {
-                    if (t.kind != .addr) return invalid;
-                    const off: u32 = @truncate((t.v +% @as(u64, @bitCast(addend))) & 0xfff);
-                    const scale = pageOffScale(insn) orelse return invalid;
-                    if (off & ((@as(u32, 1) << scale) - 1) != 0) return error.RelocationOverflow;
-                    std.mem.writeInt(u32, field[0..4], (insn & ~@as(u32, 0xfff << 10)) | ((off >> scale) << 10), .little);
-                },
-                .aarch64_got_load_pageoff12 => {
-                    // ldr xt, [xn, #imm12 * 8]
-                    if (insn & 0xffc00000 != 0xf9400000 or addend != 0) return invalid;
-                    const v: u32 = switch (t.kind) {
-                        .import => ((insn & 0xffc003ff) | @as(u32, @intCast(((l.got_addr + 8 * t.v) & 0xfff) >> 3)) << 10),
-                        // Defined here: add xt, xn, #lo12(S).
-                        .addr => 0x91000000 | (insn & 0x3ff) | @as(u32, @intCast(t.v & 0xfff)) << 10,
-                        .value => return invalid,
-                    };
-                    std.mem.writeInt(u32, field[0..4], v, .little);
-                },
-                .aarch64_abs64 => {
-                    if ((sect != data_const and sect != data) or p & 3 != 0) return invalid;
-                    const v = switch (t.kind) {
-                        .addr => rebase: {
-                            const target = @as(i128, t.v) + addend - base_address;
-                            if (target < 0 or target >= 1 << 36) return error.RelocationOverflow;
-                            break :rebase @as(u64, @intCast(target));
-                        },
-                        .import => bind: {
-                            if (addend < 0 or addend > 255) return error.RelocationOverflow;
-                            break :bind bindPointer(@intCast(t.v), @intCast(addend));
-                        },
-                        .value => return invalid,
-                    };
-                    std.mem.writeInt(u64, field[0..8], v, .little);
-                    l.fixups[fixups.*] = p - base_address;
-                    fixups.* += 1;
-                },
-                .value8, .value16, .value32, .value64 => {
-                    // Addresses are not known before the loader slides
-                    // the image; only link-time values qualify.
-                    if (t.kind != .value) return invalid;
-                    const v = @as(i128, t.v) + addend;
-                    switch (r.info.kind) {
-                        .value8 => field[0] = std.math.cast(u8, v) orelse return error.RelocationOverflow,
-                        .value16 => std.mem.writeInt(u16, field[0..2], std.math.cast(u16, v) orelse return error.RelocationOverflow, .little),
-                        .value32 => std.mem.writeInt(u32, field[0..4], std.math.cast(u32, v) orelse return error.RelocationOverflow, .little),
-                        .value64 => std.mem.writeInt(u64, field[0..8], std.math.cast(u64, v) orelse return error.RelocationOverflow, .little),
-                        else => unreachable,
+            var fixup = c.fixups;
+            const begin = chunk * chunk_len;
+            const end = @min(l.n_atoms, begin + chunk_len);
+            var sym_off = l.symtab_off + @as(u64, c.sym) * @sizeOf(macho.nlist_64);
+            var str_off = c.str;
+            for (l.places[begin..end], begin..) |place, i| {
+                if (i + 4 < l.n_atoms) l.input.prefetch(i + 4, !numbered);
+                if (!numbered and i + 2 < l.n_atoms) for (l.input.atom(i + 2).targets) |t| l.symbols.prefetch(t);
+                if (place.isDuplicate()) continue;
+                const atom = l.input.atom(i);
+                const a = Elf.ref(&atom);
+                const addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
+                if (place.section != bss) {
+                    const start = addr - base_address;
+                    @memset(l.buf[start - place.gap .. start], 0);
+                    const dst = l.buf[start..][0..a.bytes.len];
+                    @memcpy(dst, a.bytes);
+                    const res = resolved[0..a.targets.len];
+                    if (numbered) {
+                        if (!l.resolveNumbered(a, i, chunk, res)) return;
+                    } else for (a.targets, res) |t, *r| {
+                        r.* = if (l.symbols.get(t)) |v|
+                            .{ .v = v, .kind = .addr }
+                        else if (l.imports.get(t)) |v|
+                            .{ .v = v, .kind = .import }
+                        else if (l.values.get(t)) |v|
+                            .{ .v = v, .kind = .value }
+                        else {
+                            l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
+                            return;
+                        };
                     }
-                },
-                .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32 => return invalid,
+                    var diag: Diagnostic = .{};
+                    l.applyRelocs(a, dst, addr, place.section, res, &fixup[place.section], &diag) catch |err| return l.fail(chunk, i, err, diag);
+                }
+                if (a.name.len > 0) {
+                    @memcpy(l.buf[l.strtab_off + str_off ..][0..a.name.len], a.name);
+                    l.buf[l.strtab_off + str_off + a.name.len] = 0;
+                    writeStruct(l.buf[sym_off..], nlist(str_off, macho.N_SECT, l.sect_index[place.section], 0, addr));
+                    sym_off += @sizeOf(macho.nlist_64);
+                    str_off += @intCast(a.name.len + 1);
+                }
             }
         }
-    }
-};
+
+        /// Applies `a`'s relocations to its copy `dst` at address `p_base` in
+        /// section `sect`, recording fixups from `fixups.*` on.
+        fn applyRelocs(l: *const Link, a: *const Atom, dst: []u8, p_base: u64, sect: u3, resolved: []const Resolved, fixups: *u64, diag: *Diagnostic) Error!void {
+            for (a.relocs) |r| {
+                const width: u4 = switch (r.info.kind) {
+                    .aarch64_abs64, .value64 => 8,
+                    .value16 => 2,
+                    .value8 => 1,
+                    else => 4,
+                };
+                if (r.offset + @as(u64, width) > dst.len or r.info.target >= resolved.len) {
+                    diag.* = .{ .atom = a.name };
+                    return error.InvalidRelocation;
+                }
+                const field = dst[r.offset..];
+                const t = resolved[r.info.target];
+                const p = p_base + r.offset;
+                const addend: i64 = r.addend;
+                const insn = std.mem.readInt(u32, field[0..4], .little);
+                const invalid = error.InvalidRelocation;
+                errdefer diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
+                switch (r.info.kind) {
+                    .aarch64_branch26 => {
+                        const s = switch (t.kind) {
+                            .addr => t.v,
+                            .import => l.stubs_addr + stub_size * t.v,
+                            .value => return invalid,
+                        };
+                        const delta: i64 = @bitCast((s +% @as(u64, @bitCast(addend))) -% p);
+                        if (delta & 3 != 0 or delta < -(1 << 27) or delta >= 1 << 27) return error.RelocationOverflow;
+                        const imm: u32 = @truncate(@as(u64, @bitCast(delta >> 2)) & 0x3ffffff);
+                        std.mem.writeInt(u32, field[0..4], (insn & 0xfc000000) | imm, .little);
+                    },
+                    .aarch64_page21, .aarch64_got_load_page21 => {
+                        const s = switch (t.kind) {
+                            .addr => t.v,
+                            .import => if (r.info.kind == .aarch64_got_load_page21) l.got_addr + 8 * t.v else return invalid,
+                            .value => return invalid,
+                        };
+                        if (r.info.kind == .aarch64_got_load_page21 and addend != 0) return invalid;
+                        const pages = pageDelta(s +% @as(u64, @bitCast(addend)), p);
+                        if (pages < -(1 << 20) or pages >= 1 << 20) return error.RelocationOverflow;
+                        std.mem.writeInt(u32, field[0..4], patchAdrp(insn, pages), .little);
+                    },
+                    .aarch64_pageoff12 => {
+                        if (t.kind != .addr) return invalid;
+                        const off: u32 = @truncate((t.v +% @as(u64, @bitCast(addend))) & 0xfff);
+                        const scale = pageOffScale(insn) orelse return invalid;
+                        if (off & ((@as(u32, 1) << scale) - 1) != 0) return error.RelocationOverflow;
+                        std.mem.writeInt(u32, field[0..4], (insn & ~@as(u32, 0xfff << 10)) | ((off >> scale) << 10), .little);
+                    },
+                    .aarch64_got_load_pageoff12 => {
+                        // ldr xt, [xn, #imm12 * 8]
+                        if (insn & 0xffc00000 != 0xf9400000 or addend != 0) return invalid;
+                        const v: u32 = switch (t.kind) {
+                            .import => ((insn & 0xffc003ff) | @as(u32, @intCast(((l.got_addr + 8 * t.v) & 0xfff) >> 3)) << 10),
+                            // Defined here: add xt, xn, #lo12(S).
+                            .addr => 0x91000000 | (insn & 0x3ff) | @as(u32, @intCast(t.v & 0xfff)) << 10,
+                            .value => return invalid,
+                        };
+                        std.mem.writeInt(u32, field[0..4], v, .little);
+                    },
+                    .aarch64_abs64 => {
+                        if ((sect != data_const and sect != data) or p & 3 != 0) return invalid;
+                        const v = switch (t.kind) {
+                            .addr => rebase: {
+                                const target = @as(i128, t.v) + addend - base_address;
+                                if (target < 0 or target >= 1 << 36) return error.RelocationOverflow;
+                                break :rebase @as(u64, @intCast(target));
+                            },
+                            .import => bind: {
+                                if (addend < 0 or addend > 255) return error.RelocationOverflow;
+                                break :bind bindPointer(@intCast(t.v), @intCast(addend));
+                            },
+                            .value => return invalid,
+                        };
+                        std.mem.writeInt(u64, field[0..8], v, .little);
+                        l.fixups[fixups.*] = p - base_address;
+                        fixups.* += 1;
+                    },
+                    .value8, .value16, .value32, .value64 => {
+                        // Addresses are not known before the loader slides
+                        // the image; only link-time values qualify.
+                        if (t.kind != .value) return invalid;
+                        const v = @as(i128, t.v) + addend;
+                        switch (r.info.kind) {
+                            .value8 => field[0] = std.math.cast(u8, v) orelse return error.RelocationOverflow,
+                            .value16 => std.mem.writeInt(u16, field[0..2], std.math.cast(u16, v) orelse return error.RelocationOverflow, .little),
+                            .value32 => std.mem.writeInt(u32, field[0..4], std.math.cast(u32, v) orelse return error.RelocationOverflow, .little),
+                            .value64 => std.mem.writeInt(u64, field[0..8], std.math.cast(u64, v) orelse return error.RelocationOverflow, .little),
+                            else => unreachable,
+                        }
+                    },
+                    .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32 => return invalid,
+                }
+            }
+        }
+    };
+}
 
 /// Page(target) - Page(p), in 4 KiB pages, as adrp computes it.
 fn pageDelta(target: u64, p: u64) i64 {
@@ -1190,9 +1224,9 @@ const ChainedFixupsLayout = struct {
 /// other pages, so the file is hashed once. `text_end` is the end of
 /// __TEXT in the file, the executable segment.
 /// Checks that the entry point, atom `index`, is code.
-fn checkEntry(l: *const Link, index: usize, key: SymbolKey, diag: *Diagnostic) Error!void {
+fn checkEntry(l: anytype, index: usize, key: SymbolKey, diag: *Diagnostic) Error!void {
     if (l.places[index].section == text) return;
-    diag.* = .{ .atom = l.atoms[index].name, .target = key };
+    diag.* = .{ .atom = l.input.atom(index).name, .target = key };
     return error.InvalidRelocation;
 }
 
@@ -1518,6 +1552,33 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
         defer gpa.free(numbered);
         try std.testing.expectEqualSlices(u8, keyed, numbered);
     }
+    // So does an input returning records by value, which the linker checks
+    // before reading, with the runs split between `targets` and
+    // `targets_tail`. Of several invalid records, the lowest is reported.
+    const checked = try arena.alloc(std.atomic.Value(bool), kept.items.len);
+    @memset(checked, .init(false));
+    const input: Elf.TestInput = .{ .slice = .{ .atoms = kept.items, .debug_entries = &.{} }, .checked = checked };
+    var split = symbols;
+    const half = numbered_atoms[kept.items.len / 2].targets;
+    split.targets = targets.items[0..half];
+    split.targets_tail = targets.items[half..];
+    for ([_]?Symbols{ null, split }) |input_symbols| {
+        const from_input = try emitInput(gpa, io, input, .{ .entry = main, .imports = imports, .threads = 4, .identifier = "chunks", .symbols = input_symbols });
+        defer gpa.free(from_input);
+        try std.testing.expectEqualSlices(u8, keyed, from_input);
+        var bad = input;
+        bad.bad = &.{ kept.items.len - 1, 2500 };
+        var input_diag: Diagnostic = .{};
+        try std.testing.expectError(error.InvalidInput, emitInput(gpa, io, bad, .{ .entry = main, .imports = imports, .threads = 4, .symbols = input_symbols, .diag = &input_diag }));
+        try std.testing.expectEqual(2500, input_diag.index.?);
+    }
+    // A run may not straddle the two.
+    const two = for (kept.items, 0..) |a, i| {
+        if (a.targets.len >= 2) break i;
+    } else unreachable;
+    split.targets = targets.items[0 .. numbered_atoms[two].targets + 1];
+    split.targets_tail = targets.items[numbered_atoms[two].targets + 1 ..];
+    try std.testing.expectError(error.InvalidSymbols, emitInput(gpa, io, input, .{ .entry = main, .imports = imports, .symbols = split }));
     // An import's number left undefined, and an entry that is not code.
     var diag: Diagnostic = .{};
     symbols.imports = &.{ import_numbers[0], symbols.len };
