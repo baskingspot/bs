@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "reflect.S\n*const reflect.S\n[]const u8\n?*anyopaque\nreflect.G.Box(u8)\nreflect.E\nIo.Writer\nstruct { u8, bool }\nerror{A,B}!u32\nfn (u8) callconv(.c) void\n[3:0]u16\n@Vector(4, f32)\nfn () callconv(.c) noreturn\nanyerror\n9084\n16\nFoo\n4\n99\n117637633\n"
+//! stdout: "reflect.S\n*const reflect.S\n[]const u8\n?*anyopaque\nreflect.G.Box(u8)\nreflect.E\nIo.Writer\nstruct { u8, bool }\nerror{A,B}!u32\nfn (u8) callconv(.c) void\n[3:0]u16\n@Vector(4, f32)\nfn () callconv(.c) noreturn\nanyerror\n9084\n16\nFoo\n4\n99\n117637633\n2\n"
 //! @typeName, @offsetOf, @bitOffsetOf, @FieldType, @intFromError, and @errorFromInt.
 const std = @import("std");
 const rt = @import("rt.zig");
@@ -48,5 +48,13 @@ fn main() callconv(.c) noreturn {
     rt.printInt(name4[2] + name4[3]);
     const sc: [3:7]u8 = .{ 1, 2, 3 };
     rt.printInt(@as(u32, @bitCast(sc)));
+    // @typeInfo field names ([:0]const u8 elements) read as []const u8,
+    // as @Struct's arguments are.
+    rt.printInt(@sizeOf(@FieldType(FieldsOf(E, u16), "y")));
     rt.exit(0);
+}
+
+fn FieldsOf(comptime T: type, comptime Data: type) type {
+    const field_names = @typeInfo(T).@"enum".field_names;
+    return @Struct(.auto, null, field_names, &@splat(Data), &@splat(.{}));
 }

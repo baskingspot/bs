@@ -6396,11 +6396,27 @@ fn loadAtOffset(sema: *Sema, val: Index, key: InternPool.Ptr) !?Index {
     }
     if (ip.indexToKey(val_ty) != .array_type) return if (key.byte_offset == 0) val else null;
     const a = ip.indexToKey(val_ty).array_type;
-    if (load_ty != a.child) return if (key.byte_offset == 0) val else null;
+    // Elements may be read through a pointer to an in-memory coercible
+    // type (`[:0]const u8` elements as `[]const u8`).
+    const retype = load_ty != a.child and sema.childCoercibleInMemory(a.child, load_ty);
+    if (load_ty != a.child and !retype) return if (key.byte_offset == 0) val else null;
     const size = Type.abiSize(ip, a.child);
-    if (size == 0) return try sema.elemValue(val, 0);
-    if (key.byte_offset % size != 0 or key.byte_offset / size > a.len) return null;
-    return try sema.elemValue(val, key.byte_offset / size);
+    const elem = if (size == 0) try sema.elemValue(val, 0) else blk: {
+        if (key.byte_offset % size != 0 or key.byte_offset / size > a.len) return null;
+        break :blk try sema.elemValue(val, key.byte_offset / size);
+    };
+    return if (retype) try sema.retypePtrValue(elem, load_ty) else elem;
+}
+
+/// Pointer or slice value `val` as in-memory coercible pointer type `ty`.
+fn retypePtrValue(sema: *Sema, val: Index, ty: Index) !Index {
+    const ip = sema.ip;
+    return switch (ip.indexToKey(val)) {
+        .slice => |sl| sema.intern(.{ .slice = .{ .ty = ty, .ptr = try sema.retypePtrValue(sl.ptr, try sema.elemValueType(ty)), .len = sl.len } }),
+        .ptr => |pk| sema.intern(.{ .ptr = .{ .ty = ty, .base = pk.base, .byte_offset = pk.byte_offset } }),
+        .opt => |o| sema.intern(.{ .opt = .{ .ty = ty, .val = if (o.val == .none) .none else try sema.retypePtrValue(o.val, Type.childType(ip, ty)) } }),
+        else => sema.undefValue(ty),
+    };
 }
 
 fn comptimeLoad(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!Index {
