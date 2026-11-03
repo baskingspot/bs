@@ -2537,6 +2537,13 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .in_comptime => .fromInterned(boolValue(block.is_comptime)),
         // Instrumentation and intrinsics are not something zap emits.
         .disable_instrumentation, .disable_intrinsics => .void_value,
+        // Optimized float mode only licenses an optimizer; without one, as
+        // in upstream's Debug backends, float operations are the same.
+        .set_float_mode => blk: {
+            const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
+            _ = try sema.resolveConstValue(block, block.nodeSrc(extra.node), sema.resolveInst(extra.operand), "operand to @setFloatMode must be comptime-known");
+            break :blk .void_value;
+        },
         .reify_pointer_sentinel_ty => blk: {
             const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
             const elem_ty = try sema.resolveType(block, block.nodeSrc(extra.node), extra.operand);
