@@ -243,6 +243,11 @@ pub const Inst = struct {
         /// `ty_pl` with `Bin`: pointer to element `rhs` of what pointer `lhs`
         /// points to (`*[N]T` or `[*]T`).
         ptr_elem_ptr,
+        /// `pl_op` with `Bin`: store `rhs` as element `lhs` (a `usize`) of
+        /// the vector `operand` points to. Elements of bool vectors are
+        /// bits and have no pointers; Sema's vector loops use this for all
+        /// vectors (as upstream's `legalize_vec_store_elem`).
+        vector_store_elem,
         /// `bin_op`: load element `rhs` through `*[N]T` or `[*]T` `lhs`.
         ptr_elem_val,
         /// `ty_pl` with `Bin`: pointer to element `rhs` of slice `lhs`.
@@ -558,7 +563,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .atomic_rmw,
         .cmpxchg,
         => data.ty_pl.ty,
-        .store, .atomic_store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt => .void_type,
+        .store, .atomic_store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt, .vector_store_elem => .void_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),

@@ -668,6 +668,29 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.elemAddr(.rax, tag == .slice_elem_ptr, bin.lhs, bin.rhs, Type.abiSize(ip, elem_ty));
             try cg.storeReg(dst, .rax, 8);
         },
+        .vector_store_elem => {
+            const bin = ir.extraData(Ir.Bin, data.pl_op.payload).data;
+            const elem_ty = Type.childType(ip, Type.ptrInfo(ip, cg.typeOf(data.pl_op.operand)).child);
+            try cg.load(.r10, data.pl_op.operand);
+            try cg.load(.rcx, bin.lhs);
+            if (elem_ty == .bool_type) {
+                // Bit rcx % 8 of byte rcx / 8: clear it, then or in the value.
+                try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
+                try cg.e.shift(.shr, .qword, .{ .reg = .rax }, 3);
+                try cg.e.alu(.add, .qword, .{ .reg = .r10 }, .{ .reg = .rax });
+                try cg.e.alu(.@"and", .dword, .{ .reg = .rcx }, .{ .imm = 7 });
+                try cg.e.mov(.dword, .{ .reg = .rdx }, .{ .imm = 1 });
+                try cg.e.shift(.shl, .dword, .{ .reg = .rdx }, null);
+                try cg.e.unary(.not, .dword, .{ .reg = .rdx });
+                try cg.e.alu(.@"and", .byte, .{ .mem = Mem.at(.r10, 0) }, .{ .reg = .rdx });
+                try cg.load(.rax, bin.rhs);
+                try cg.e.shift(.shl, .dword, .{ .reg = .rax }, null);
+                try cg.e.alu(.@"or", .byte, .{ .mem = Mem.at(.r10, 0) }, .{ .reg = .rax });
+                return;
+            }
+            try cg.scaleAdd(.r10, .rcx, Type.abiSize(ip, elem_ty));
+            try cg.copyTo(Mem.at(.r10, 0), bin.rhs);
+        },
         .ptr_elem_val, .slice_elem_val => {
             const ty = ir.typeOfIndex(inst, ip);
             const dst = try cg.resultMem(inst, ty) orelse return;

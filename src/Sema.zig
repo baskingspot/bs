@@ -3919,7 +3919,16 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             if (len != s_len) return null;
             if (dc == .array and ip.indexToKey(dest_ty).array_type.sentinel != .none) return null;
             const dest_elem = Type.childType(ip, dest_ty);
-            const same = dest_elem == Type.childType(ip, src_ty);
+            const src_elem = Type.childType(ip, src_ty);
+            const same = dest_elem == src_elem;
+            if (val == null and !block.is_comptime) {
+                // Arrays and vectors of non-bool elements share a layout
+                // (vectors only add padding at the end).
+                if (same and dest_elem != .bool_type) return try sema.addTyOp(block, .bitcast, dest_ty, inst);
+                if (sema.elemCoercionWidens(dest_elem, src_elem) and dc == .vector and sc == .vector) {
+                    return try sema.vectorMap(block, src, @intCast(len), dest_ty, &.{inst}, VectorCast{ .f = coerceElem, .elem_ty = dest_elem });
+                }
+            }
             const elems = try sema.arena.alloc(Ref, @intCast(len));
             for (elems, 0..) |*e, i| {
                 const elem = try sema.vectorElem(block, inst, @intCast(i));
@@ -4526,9 +4535,9 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
         return sema.analyzePtrArithmetic(block, src, tag == .add or tag == .addwrap, uncasted_lhs, uncasted_rhs);
     const ty = try sema.resolvePeerTypes(block, src, &.{ uncasted_lhs, uncasted_rhs });
     if (sema.vectorLen(ty)) |len| {
-        const lhs = try sema.coerce(block, ty, uncasted_lhs, src);
-        const rhs = try sema.coerce(block, ty, uncasted_rhs, src);
-        return sema.vectorMap(block, src, len, ty, &.{ lhs, rhs }, VectorArith{ .tag = tag });
+        const lhs = try sema.vectorOperand(block, src, ty, uncasted_lhs);
+        const rhs = try sema.vectorOperand(block, src, ty, uncasted_rhs);
+        return sema.vectorMap(block, src, len, ty, &.{ lhs, rhs }, VectorArith{ .tag = tag, .elem_ty = Type.childType(ip, ty) });
     }
     const is_bool = ty == .bool_type;
     const class = Type.class(ip, ty);
@@ -5818,9 +5827,9 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
     if (lc == .vector or rc == .vector) {
         const ty = try sema.resolvePeerTypes(block, src, &.{ lhs, rhs });
         const len = sema.vectorLen(ty).?;
-        const l = try sema.coerce(block, ty, lhs, src);
-        const r = try sema.coerce(block, ty, rhs, src);
-        return sema.vectorMap(block, src, len, try sema.vectorType(len, .bool_type), &.{ l, r }, VectorCmp{ .op = op });
+        const l = try sema.vectorOperand(block, src, ty, lhs);
+        const r = try sema.vectorOperand(block, src, ty, rhs);
+        return sema.vectorMap(block, src, len, try sema.vectorType(len, .bool_type), &.{ l, r }, VectorCmp{ .op = op, .elem_ty = Type.childType(ip, ty) });
     }
     const is_eq = op == .eq or op == .neq;
 
@@ -10105,6 +10114,8 @@ fn vectorElem(sema: *Sema, block: *Block, v: Ref, i: u32) CompileError!Ref {
 /// vector `operands` (non-vector operands are passed unchanged) and builds
 /// a vector of type `result_ty`, or of the results' type if `.none`.
 fn vectorMap(sema: *Sema, block: *Block, src: Src, len: u32, result_ty: Index, operands: []const Ref, op: anytype) CompileError!Ref {
+    if (len >= vector_loop_min_len and !block.is_comptime and sema.vectorLoopable(operands))
+        return sema.vectorMapLoop(block, src, len, result_ty, operands, op);
     const results = try sema.arena.alloc(Ref, len);
     const scalars = try sema.arena.alloc(Ref, operands.len);
     for (results, 0..) |*r, i| {
@@ -10118,17 +10129,112 @@ fn vectorMap(sema: *Sema, block: *Block, src: Src, len: u32, result_ty: Index, o
     return sema.aggregate(block, src, ty, results);
 }
 
+/// Runtime vectors at least this long are mapped with a loop instead of
+/// one copy of the scalar operation per element. Below it, the loop's
+/// bookkeeping costs more than unrolling.
+const vector_loop_min_len = 4;
+
+/// Whether a vector operation on `operands` runs at runtime on elements
+/// with runtime bits (zero-bit elements fold to their only value).
+fn vectorLoopable(sema: *Sema, operands: []const Ref) bool {
+    var runtime = false;
+    for (operands) |o| {
+        const ty = sema.typeOf(o);
+        if (sema.vectorLen(ty) == null) continue;
+        if (!Type.hasRuntimeBits(sema.ip, Type.childType(sema.ip, ty))) return false;
+        if (sema.resolveValue(o) == null) runtime = true;
+    }
+    return runtime;
+}
+
+/// `vectorMap` as a runtime loop:
+///
+///     res: @Vector(len, R) = undefined; i: usize = 0;
+///     while (i < len) : (i += 1) res[i] = op(a[i], b[i]);
+///
+/// The scalar operation is analyzed once, on elements at a runtime index,
+/// so its safety checks are emitted once instead of per element.
+fn vectorMapLoop(sema: *Sema, block: *Block, src: Src, len: u32, result_ty: Index, operands: []const Ref, op: anytype) CompileError!Ref {
+    const gpa = sema.gpa;
+    const idx_ptr = try sema.analyzeAlloc(block, src, .usize_type, false, false);
+    try sema.analyzeStore(block, src, idx_ptr, .fromInterned(.zero_usize));
+    // The result's element type is known once the operation is analyzed.
+    const res_inst = try sema.reserveInst();
+    const block_inst = try sema.reserveInst();
+    const loop_inst = try sema.reserveInst();
+
+    var loop_block = block.child();
+    defer loop_block.instructions.deinit(gpa);
+    const i = try sema.analyzeLoad(&loop_block, src, idx_ptr);
+    const in_range = try sema.addBinOp(&loop_block, .cmp_lt, i, .fromInterned(try sema.intValue(.usize_type, len)));
+
+    var then_block = block.child();
+    defer then_block.instructions.deinit(gpa);
+    const scalars = try sema.arena.alloc(Ref, operands.len);
+    for (operands, scalars) |o, *sc| sc.* = if (sema.vectorLen(sema.typeOf(o)) != null) try sema.addBinOp(&then_block, .array_elem_val, o, i) else o;
+    const r = try op.call(sema, &then_block, src, scalars);
+    const ty = if (result_ty != .none) result_ty else try sema.vectorType(len, sema.typeOf(r));
+    try sema.resolveLayout(block, src, ty);
+    const payload = try sema.addExtra(Ir.Bin{ .lhs = i, .rhs = r });
+    _ = try sema.addInst(&then_block, .{ .tag = .vector_store_elem, .data = .{ .pl_op = .{ .operand = res_inst.toRef(), .payload = payload } } });
+    const next = try sema.addBinOp(&then_block, .add_wrap, i, .fromInterned(try sema.intValue(.usize_type, 1)));
+    try sema.analyzeStore(&then_block, src, idx_ptr, next);
+    _ = try sema.addInst(&then_block, .{ .tag = .repeat, .data = .{ .repeat = .{ .loop_inst = loop_inst } } });
+
+    var else_block = block.child();
+    defer else_block.instructions.deinit(gpa);
+    _ = try sema.addInst(&else_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
+    try sema.addCondBr(&loop_block, in_range, then_block.instructions.items, else_block.instructions.items);
+
+    const loop_payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(loop_block.instructions.items.len) });
+    try sema.appendBody(loop_block.instructions.items);
+    sema.ir_insts.set(@backingInt(loop_inst), .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = loop_payload } } });
+    sema.ir_insts.set(@backingInt(res_inst), .{ .tag = .alloc, .data = .{ .ty = try sema.ptrType(.{ .child = ty }) } });
+    try block.instructions.append(gpa, res_inst);
+    try sema.addBlock(block, block_inst, .void_type, &.{loop_inst});
+    return sema.analyzeLoad(block, src, res_inst.toRef());
+}
+
+/// Whether every value of `src` coerces to `dest`, both integers or both
+/// floats (as upstream's vector coercion fast path).
+fn elemCoercionWidens(sema: *Sema, dest: Index, src: Index) bool {
+    const ip = sema.ip;
+    if (Type.isInt(ip, dest) and Type.isInt(ip, src)) {
+        const d = Type.intInfo(ip, dest);
+        const s = Type.intInfo(ip, src);
+        return (d.signedness == s.signedness and d.bits >= s.bits) or (d.signedness == .signed and d.bits > s.bits);
+    }
+    return Type.class(ip, dest) == .float and Type.class(ip, src) == .float and Type.floatBits(ip, dest) >= Type.floatBits(ip, src);
+}
+
+fn coerceElem(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) CompileError!Ref {
+    return sema.coerce(block, dest_ty, operand, src);
+}
+
+/// An operand of a vector operation of type `vec_ty`. A vector of another
+/// element type stays as is: its elements coerce one at a time inside the
+/// operation, instead of in a separate pass over the vector.
+fn vectorOperand(sema: *Sema, block: *Block, src: Src, vec_ty: Index, operand: Ref) CompileError!Ref {
+    if (sema.vectorLen(sema.typeOf(operand)) != null) return operand;
+    return sema.coerce(block, vec_ty, operand, src);
+}
+
+/// A binary operation, with the scalars first coerced to `elem_ty` unless
+/// it is `.none`.
 const VectorArith = struct {
     tag: Zir.Inst.Tag,
+    elem_ty: Index = .none,
     fn call(op: VectorArith, sema: *Sema, block: *Block, src: Src, s: []const Ref) CompileError!Ref {
-        return sema.analyzeArithmetic(block, src, op.tag, s[0], s[1]);
+        if (op.elem_ty == .none) return sema.analyzeArithmetic(block, src, op.tag, s[0], s[1]);
+        return sema.analyzeArithmetic(block, src, op.tag, try sema.coerce(block, op.elem_ty, s[0], src), try sema.coerce(block, op.elem_ty, s[1], src));
     }
 };
 
 const VectorCmp = struct {
     op: std.math.CompareOperator,
+    elem_ty: Index,
     fn call(op: VectorCmp, sema: *Sema, block: *Block, src: Src, s: []const Ref) CompileError!Ref {
-        return sema.analyzeCmp(block, src, op.op, s[0], s[1]);
+        return sema.analyzeCmp(block, src, op.op, try sema.coerce(block, op.elem_ty, s[0], src), try sema.coerce(block, op.elem_ty, s[1], src));
     }
 };
 
@@ -10195,10 +10301,50 @@ fn zirReduce(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         unreachable;
     if (is_float and (tag == .bit_and or tag == .bit_or or tag == .xor))
         return sema.fail(block, src, "@reduce operation '{s}' requires integer or boolean operand; found '{f}'", .{ op, sema.fmtType(ty) });
+    if (len >= vector_loop_min_len and !block.is_comptime and sema.vectorLoopable(&.{operand}))
+        return sema.reduceLoop(block, src, tag, operand, len);
     // A left fold, in element order.
     var acc = try sema.vectorElem(block, operand, 0);
     for (1..len) |i| acc = try sema.analyzeArithmetic(block, src, tag, acc, try sema.vectorElem(block, operand, @intCast(i)));
     return acc;
+}
+
+/// `@reduce` of a runtime vector as a loop:
+///
+///     acc = v[0]; i = 1; while (i < len) : (i += 1) acc = op(acc, v[i]);
+fn reduceLoop(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand: Ref, len: u32) CompileError!Ref {
+    const gpa = sema.gpa;
+    const elem_ty = Type.childType(sema.ip, sema.typeOf(operand));
+    const acc_ptr = try sema.analyzeAlloc(block, src, elem_ty, false, false);
+    try sema.analyzeStore(block, src, acc_ptr, try sema.vectorElem(block, operand, 0));
+    const idx_ptr = try sema.analyzeAlloc(block, src, .usize_type, false, false);
+    try sema.analyzeStore(block, src, idx_ptr, .fromInterned(try sema.intValue(.usize_type, 1)));
+    const block_inst = try sema.reserveInst();
+    const loop_inst = try sema.reserveInst();
+
+    var loop_block = block.child();
+    defer loop_block.instructions.deinit(gpa);
+    const i = try sema.analyzeLoad(&loop_block, src, idx_ptr);
+    const in_range = try sema.addBinOp(&loop_block, .cmp_lt, i, .fromInterned(try sema.intValue(.usize_type, len)));
+
+    var then_block = block.child();
+    defer then_block.instructions.deinit(gpa);
+    const acc = try sema.analyzeLoad(&then_block, src, acc_ptr);
+    const elem = try sema.addBinOp(&then_block, .array_elem_val, operand, i);
+    try sema.analyzeStore(&then_block, src, acc_ptr, try sema.analyzeArithmetic(&then_block, src, tag, acc, elem));
+    try sema.analyzeStore(&then_block, src, idx_ptr, try sema.addBinOp(&then_block, .add_wrap, i, .fromInterned(try sema.intValue(.usize_type, 1))));
+    _ = try sema.addInst(&then_block, .{ .tag = .repeat, .data = .{ .repeat = .{ .loop_inst = loop_inst } } });
+
+    var else_block = block.child();
+    defer else_block.instructions.deinit(gpa);
+    _ = try sema.addInst(&else_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
+    try sema.addCondBr(&loop_block, in_range, then_block.instructions.items, else_block.instructions.items);
+
+    const loop_payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(loop_block.instructions.items.len) });
+    try sema.appendBody(loop_block.instructions.items);
+    sema.ir_insts.set(@backingInt(loop_inst), .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = loop_payload } } });
+    try sema.addBlock(block, block_inst, .void_type, &.{loop_inst});
+    return sema.analyzeLoad(block, src, acc_ptr);
 }
 
 fn zirSelect(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstData) CompileError!Ref {
