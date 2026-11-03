@@ -3904,7 +3904,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const elem_src: Src = .{ .base = src.base, .loc = .{ .array_elem = data.pl_node.src_node } };
             const elem = try sema.resolveType(block, elem_src, extra.elem_type);
             try sema.validateArrayElemType(block, elem_src, elem);
-            const sentinel = try sema.resolveConstValue(block, src, try sema.coerce(block, elem, sema.resolveInst(extra.sentinel), src), "array sentinel value must be comptime-known");
+            const sentinel_src: Src = .{ .base = src.base, .loc = .{ .sentinel = data.pl_node.src_node } };
+            const sentinel = try sema.resolveConstValue(block, sentinel_src, try sema.coerce(block, elem, sema.resolveInst(extra.sentinel), sentinel_src), "array sentinel value must be comptime-known");
+            try sema.checkSentinelType(block, sentinel_src, elem);
             break :blk .fromInterned(try sema.intern(.{ .array_type = .{ .len = len, .child = elem, .sentinel = sentinel } }));
         },
         .optional_type => blk: {
@@ -5644,9 +5646,32 @@ fn intFromPtr(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!R
 
 /// `@ptrFromInt` of an address to pointer type `ty`.
 fn ptrFromInt(sema: *Sema, block: *Block, src: Src, ty: Index, uncasted: Ref) CompileError!Ref {
-    const operand = try sema.coerce(block, .usize_type, uncasted, src);
-    if (try sema.resolveDefinedValue(block, src, operand)) |v| {
+    const ip = sema.ip;
+    const operand_src = sema.callArgSrc(src, false, 0);
+    // As upstream's checkPtrType, then: a slice's length is unknown.
+    const ptr_ty = switch (Type.class(ip, ty)) {
+        .pointer => ty,
+        .optional => if (Type.class(ip, Type.childType(ip, ty)) == .pointer) Type.childType(ip, ty) else .none,
+        else => .none,
+    };
+    if (ptr_ty == .none) {
+        const err = sema.fail(block, src, "expected pointer type, found '{f}'", .{sema.fmtType(ty)});
+        if (Type.class(ip, ty) == .@"fn") try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "use '*const ' to make a function pointer type", .{});
+        return err;
+    }
+    if (Type.isSlice(ip, ptr_ty)) {
+        const err = sema.fail(block, src, "integer cannot be converted to slice type '{f}'", .{sema.fmtType(ty)});
+        try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "slice length cannot be inferred from address", .{});
+        return err;
+    }
+    const operand = try sema.coerce(block, .usize_type, uncasted, operand_src);
+    if (try sema.resolveDefinedValue(block, operand_src, operand)) |v| {
         const addr = sema.ip.intValue(u64, v).?;
+        if (addr != 0) {
+            try sema.resolveLayout(block, src, Type.ptrInfo(ip, ptr_ty).child);
+            if (sema.ptrAlignment(Type.ptrInfo(ip, ptr_ty))) |a| if (addr % a != 0)
+                return sema.fail(block, operand_src, "pointer type '{f}' requires aligned address", .{sema.fmtType(ty)});
+        }
         // A non-null optional pointer is an `opt` around its pointer.
         if (Type.class(sema.ip, ty) == .optional) {
             if (addr == 0) return .fromInterned(try sema.intern(.{ .opt = .{ .ty = ty, .val = .none } }));
@@ -5654,7 +5679,7 @@ fn ptrFromInt(sema: *Sema, block: *Block, src: Src, ty: Index, uncasted: Ref) Co
             return .fromInterned(try sema.intern(.{ .opt = .{ .ty = ty, .val = ptr } }));
         }
         if (addr == 0 and !Type.ptrInfo(sema.ip, ty).flags.is_allowzero and Type.ptrInfo(sema.ip, ty).flags.size != .c)
-            return sema.fail(block, src, "pointer type '{f}' does not allow address zero", .{sema.fmtType(ty)});
+            return sema.fail(block, operand_src, "pointer type '{f}' does not allow address zero", .{sema.fmtType(ty)});
         return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .int, .byte_offset = addr } }));
     }
     return sema.addTyOp(block, .ptr_from_int, ty, operand);
@@ -6965,7 +6990,9 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     if (data.flags.has_sentinel) {
         const ref = sema.resolveInst(@fromBackingInt(sema.code.extra[i]));
         i += 1;
-        sentinel = try sema.resolveConstValue(block, src, try sema.coerce(block, elem, ref, src), "pointer sentinel value must be comptime-known");
+        const sentinel_src: Src = .{ .base = src.base, .loc = .{ .sentinel = extra.data.src_node } };
+        sentinel = try sema.resolveConstValue(block, sentinel_src, try sema.coerce(block, elem, ref, sentinel_src), "pointer sentinel value must be comptime-known");
+        try sema.checkSentinelType(block, sentinel_src, elem);
     }
     var alignment: u6 = 0;
     if (data.flags.has_align) {
@@ -7659,7 +7686,13 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                     try sema.resolveLayoutIfIdle(block, src, s.child);
                     try sema.resolveLayoutIfIdle(block, src, d.child);
                 }
-                return sema.coercePtr(block, dest_ty, inst);
+                const r = (try sema.coercePtr(block, dest_ty, inst)) orelse return null;
+                // A null C pointer, as upstream's coerceCompatiblePtrs.
+                if (s.flags.size == .c and d.flags.size != .c and !d.flags.is_allowzero) if (val) |v| if (ip.keyTag(v) == .ptr) {
+                    const p = ip.keyPayload(.ptr, v);
+                    if (p.base == .int and p.byte_offset == 0) return sema.fail(block, src, "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
+                };
+                return r;
             },
             .null => if (Type.ptrInfo(ip, dest_ty).flags.size == .c)
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .int, .byte_offset = 0 } })),
@@ -10728,8 +10761,10 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
     sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = ptr_ty };
     for (ia.stores.items, operands) |store, op| try sema.coerceBrOperand(block, store, ty, op, src);
     if (ia.is_const) {
-        const const_ty = try sema.ptrType(.{ .child = ty, .flags = .{ .is_const = true } });
-        return sema.addTyOp(block, .bitcast, const_ty, ptr);
+        // Keeping an explicit alignment, as upstream.
+        var info = Type.ptrInfo(sema.ip, ptr_ty);
+        info.flags.is_const = true;
+        return sema.addTyOp(block, .bitcast, try sema.ptrType(info), ptr);
     }
     return ptr;
 }
@@ -12933,6 +12968,7 @@ fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) 
     if (sema.isUndef(sentinel_opt)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
     const sentinel = ip.keyPayload(.opt, sentinel_opt).val;
     if (sentinel != .none and (size == .one or size == .c)) return sema.fail(block, src, "sentinels are only allowed on slices and unknown-length pointers", .{});
+    if (sentinel != .none) try sema.checkSentinelType(block, sema.callArgSrc(src, false, 3), elem_ty);
     return .fromInterned(try sema.ptrType(.{
         .child = elem_ty,
         .sentinel = sentinel,
@@ -13290,6 +13326,7 @@ fn loadElem(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref)
         switch (ip.keyTag(p.child)) {
             .array_type => {
                 const a = ip.keyPayload(.array_type, p.child);
+                if (a.len == 0 and a.sentinel == .none) break :comptime_known;
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src);
                 try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
                 // `elemPtrOfArrayPtr`.
@@ -13324,6 +13361,7 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
     const child = p.child;
     switch (ip.indexToKey(child)) {
         .array_type => |a| {
+            if (a.len == 0 and a.sentinel == .none) return sema.fail(block, src, "cannot index into empty array", .{});
             const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
             const len: Ref = .fromInterned(try sema.intValue(.usize_type, a.len));
             if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, len, a.sentinel != .none);
@@ -13419,6 +13457,9 @@ fn elemPtrOfArrayPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref)
 fn elemPtrOfManyPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) CompileError!Ref {
     const p = Type.ptrInfo(sema.ip, sema.typeOf(ptr));
     if (p.flags.alignment != 0) try sema.resolveLayout(block, src, p.child);
+    // As upstream, neither may be undefined.
+    _ = try sema.resolveDefinedValue(block, src, ptr);
+    _ = try sema.resolveDefinedValue(block, src, index);
     const result_ty = try sema.elemPtrType(p, p.child, if (sema.resolveValue(index)) |v| sema.ip.intValue(u64, v) else null);
     if (sema.resolveValue(ptr)) |pv| if (sema.resolveValue(index)) |iv| {
         if (sema.ip.keyTag(pv) == .ptr and try sema.comptimePtrRoot(pv) != .int)
@@ -13459,6 +13500,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
                 const ep = if (p.flags.size == .one) blk: {
                     const a = ip.keyPayload(.array_type, p.child);
+                    if (a.len == 0 and a.sentinel == .none) return sema.fail(block, src, "cannot index into empty array", .{});
                     if (safety) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
                     break :blk try sema.elemPtrOfArrayPtr(block, src, lhs, index);
                 } else try sema.elemPtrOfManyPtr(block, src, lhs, index);
@@ -13466,6 +13508,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
             },
         },
         .array_type => |a| {
+            if (a.len == 0 and a.sentinel == .none) return sema.fail(block, src, "cannot index into empty array", .{});
             const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
             if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
             if (sema.resolveValue(lhs)) |v| if (sema.resolveValue(index)) |iv| return .fromInterned(try sema.elemValue(v, ip.intValue(u64, iv).?));
@@ -13588,6 +13631,10 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                     if (cp.sentinel != .none) base = try sema.coercePtrTo(block, base, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .many, .is_const = is_const } }));
                 },
                 .many, .c => {
+                    if (cp.flags.size == .c) if (try sema.resolveDefinedValue(block, src, obj)) |v| {
+                        const k = ip.keyPayload(.ptr, v);
+                        if (k.base == .int and k.byte_offset == 0) return sema.fail(block, src, "slice of null pointer", .{});
+                    };
                     elem_ty = cp.child;
                     ptr_sentinel = cp.sentinel;
                     many_obj = obj;
@@ -13691,6 +13738,10 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         ip.intValue(u64, end_val.?).? - ip.intValue(u64, start_val.?).?
     else
         null;
+    // As upstream, `@as([*]T, undefined)[x..x]` is the only slice of an
+    // undefined pointer.
+    if (base_val != null and sema.isUndef(base_val.?)) if (known_len) |n| if (n != 0)
+        return sema.fail(block, src, "non-zero length slice of undefined pointer", .{});
     if (slice_sentinel != .none) try sema.checkSliceSentinel(block, src, new_ptr, start_val, end_val, start, end, elem_ty, slice_sentinel);
     if (known_len) |n| {
         const array_ty = try sema.intern(.{ .array_type = .{ .len = n, .child = elem_ty, .sentinel = result_sentinel } });
@@ -16050,6 +16101,12 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
     const dest_ty = try sema.castDestType(block, src, dest_ref, false);
     var operand = sema.resolveInst(operand_ref);
     const ip = sema.ip;
+    // An undefined pointer may be cast only where null is allowed, as
+    // upstream.
+    if (sema.resolveValue(operand)) |v| if (sema.isUndef(v) and Type.class(ip, sema.typeOf(operand)) == .pointer and Type.class(ip, dest_ty) == .pointer) {
+        const d = Type.ptrInfo(ip, dest_ty);
+        if (!d.flags.is_allowzero and d.flags.size != .c) return sema.fail(block, sema.callArgSrc(src, false, 0), "use of undefined value here causes illegal behavior", .{});
+    };
     const optPtr = struct {
         fn f(p_ip: *InternPool, ty: Index) bool {
             return Type.class(p_ip, ty) == .optional and Type.class(p_ip, Type.childType(p_ip, ty)) == .pointer and
@@ -16112,6 +16169,30 @@ fn addTyOpOrFold(sema: *Sema, block: *Block, ty: Index, operand: Ref) CompileErr
     return sema.addTyOp(block, .optional_payload, ty, operand);
 }
 
+/// As upstream: a sentinel's type compares with `==` (`Type.isSelfComparable`).
+fn checkSentinelType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
+    if (!selfComparable(sema.ip, ty)) return sema.fail(block, src, "non-scalar sentinel type '{f}'", .{sema.fmtType(ty)});
+}
+
+fn selfComparable(ip: *InternPool, ty: Index) bool {
+    return switch (Type.class(ip, ty)) {
+        .noreturn, .array, .undefined, .null, .error_union, .tuple => false,
+        .vector, .optional => selfComparable(ip, Type.childType(ip, ty)),
+        .@"struct", .@"union" => Type.isPacked(ip, ty),
+        .pointer => !Type.isSlice(ip, ty),
+        else => true,
+    };
+}
+
+fn pointerSizeString(size: std.lang.Type.Pointer.Size) []const u8 {
+    return switch (size) {
+        .one => "single pointer",
+        .many => "many pointer",
+        .c => "C pointer",
+        .slice => "slice",
+    };
+}
+
 fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCastFlags, dest_ty: Index, operand: Ref) CompileError!Ref {
     const ip = sema.ip;
     const src_ty = sema.typeOf(operand);
@@ -16120,6 +16201,32 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
     const d = Type.ptrInfo(sema.ip, dest_ty);
     const s = Type.ptrInfo(sema.ip, src_ty);
     if (s.flags.is_const and !d.flags.is_const and !flags.const_cast) return sema.fail(block, src, "@ptrCast discards const qualifier", .{});
+    // As upstream's ptrCastFull: only @ptrCast changes a pointer's size,
+    // other than `*[N]T` to `[]T` and to or from a C pointer.
+    if (!flags.ptr_cast and s.flags.size != d.flags.size and s.flags.size != .c and d.flags.size != .c and
+        !(d.flags.size == .slice and s.flags.size == .one and Type.class(ip, s.child) == .array and Type.childType(ip, s.child) == d.child))
+    {
+        const err = sema.fail(block, src, "cannot implicitly convert {s} to {s}", .{ pointerSizeString(s.flags.size), pointerSizeString(d.flags.size) });
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        const to_many = d.flags.size == .many and (s.flags.size == .slice or (s.flags.size == .one and Type.class(ip, s.child) == .array));
+        try sema.zcu.addNote(sema.file, src.span(tree), "{s}", .{if (to_many) "use 'ptr' field to convert slice to many pointer" else "use @ptrCast to change pointer size"});
+        return err;
+    }
+    // Only @alignCast raises the alignment, as upstream.
+    if (!flags.align_cast) {
+        try sema.resolveLayout(block, src, s.child);
+        try sema.resolveLayout(block, src, d.child);
+        const sa = sema.ptrAlignment(s) orelse 1;
+        const da = sema.ptrAlignment(d) orelse 1;
+        if (da > sa) {
+            const err = sema.fail(block, src, "{s} increases pointer alignment", .{flags.needResultTypeBuiltinName()});
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            try sema.zcu.addNote(sema.file, sema.callArgSrc(src, false, 0).span(tree), "'{f}' has alignment '{d}'", .{ sema.fmtType(src_ty), sa });
+            try sema.zcu.addNote(sema.file, src.span(tree), "'{f}' has alignment '{d}'", .{ sema.fmtType(dest_ty), da });
+            try sema.zcu.addNote(sema.file, src.span(tree), "use @alignCast to assert pointer alignment", .{});
+            return err;
+        }
+    }
     if (s.flags.size == .slice and d.flags.size != .slice) {
         // The slice's pointer.
         const raw = try sema.slicePtr(block, operand);
@@ -16169,6 +16276,15 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
         }
         return sema.makeSlice(block, dest_ty, many, new_len);
     }
+    // `@alignCast` to a stricter alignment of a comptime-known address is
+    // checked now, as upstream.
+    if (flags.align_cast) if (sema.resolveValue(operand)) |v| if (ip.keyTag(v) == .ptr and ip.keyPayload(.ptr, v).base == .int) {
+        try sema.resolveLayout(block, src, d.child);
+        const da = sema.ptrAlignment(d) orelse 1;
+        const addr = ip.keyPayload(.ptr, v).byte_offset;
+        if (da > (sema.ptrAlignment(s) orelse 1) and addr % da != 0)
+            return sema.fail(block, sema.callArgSrc(src, false, 0), "pointer address 0x{X} is not aligned to {d} bytes", .{ addr, da });
+    };
     // `@alignCast` to a stricter alignment is checked at runtime.
     if (flags.align_cast and block.want_safety and !block.is_comptime and sema.resolveValue(operand) == null) {
         try sema.resolveLayout(block, src, d.child);
