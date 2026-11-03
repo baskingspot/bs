@@ -42,7 +42,8 @@ pub const Class = enum {
 };
 
 pub fn class(ip: *const InternPool, ty: Index) Class {
-    return switch (ip.indexToKey(ty)) {
+    // Hot: reads the item tag, not the whole key.
+    return switch (ip.keyTag(ty)) {
         .int_type => .int,
         .ptr_type => .pointer,
         .array_type => .array,
@@ -57,7 +58,7 @@ pub fn class(ip: *const InternPool, ty: Index) Class {
         .opaque_type => .@"opaque",
         .tuple_type => .tuple,
         .func_type => .@"fn",
-        .simple_type => |s| switch (s) {
+        .simple_type => switch (ip.simpleType(ty)) {
             .f16, .f32, .f64, .f80, .f128, .c_longdouble => .float,
             .usize, .isize, .c_char, .c_short, .c_ushort, .c_int, .c_uint, .c_long, .c_ulong, .c_longlong, .c_ulonglong => .int,
             .anyopaque => .@"opaque",
@@ -84,6 +85,7 @@ pub fn isInt(ip: *const InternPool, ty: Index) bool {
 pub const IntInfo = std.lang.Type.Int;
 
 pub fn intInfo(ip: *const InternPool, ty: Index) IntInfo {
+    if (ip.intType(ty)) |t| return t;
     return switch (ip.indexToKey(ty)) {
         .int_type => |t| t,
         .simple_type => |s| switch (s) {
@@ -108,7 +110,7 @@ pub fn intInfo(ip: *const InternPool, ty: Index) IntInfo {
 }
 
 pub fn floatBits(ip: *const InternPool, ty: Index) u16 {
-    return switch (ip.indexToKey(ty).simple_type) {
+    return switch (ip.simpleType(ty)) {
         .f16 => 16,
         .f32 => 32,
         .f64 => 64,

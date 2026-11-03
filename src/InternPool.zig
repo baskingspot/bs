@@ -1233,6 +1233,72 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
     };
 }
 
+/// The item of `index` and its local's `extra`, for the narrow readers
+/// below that decode one field instead of a whole `Key`.
+fn itemOf(ip: *const InternPool, index: Index) struct { tag: Tag, data: u32, extra: [*]const u32 } {
+    assert(index != .none);
+    const u = ip.unwrapIndex(@backingInt(index));
+    const item = u.local.items.view()[u.index];
+    return .{ .tag = item.tag, .data = item.data, .extra = u.local.extra.view() };
+}
+
+/// The `Key` tag of `index`, from its item tag alone.
+pub fn keyTag(ip: *const InternPool, index: Index) std.meta.Tag(Key) {
+    return switch (ip.itemOf(index).tag) {
+        .type_int_signed, .type_int_unsigned => .int_type,
+        .type_simple => .simple_type,
+        .type_ptr => .ptr_type,
+        .type_array => .array_type,
+        .type_vector => .vector_type,
+        .type_opt => .opt_type,
+        .type_anyframe => .anyframe_type,
+        .type_error_union => .error_union_type,
+        .type_error_set => .error_set_type,
+        .type_inferred_error_set => .inferred_error_set_type,
+        .type_struct => .struct_type,
+        .type_enum => .enum_type,
+        .type_union => .union_type,
+        .type_opaque => .opaque_type,
+        .type_tuple => .tuple_type,
+        .type_func => .func_type,
+        .simple_value => .simple_value,
+        .undef => .undef,
+        .int_u64, .int_i64, .int_big => .int,
+        .float_f16, .float_f32, .float_f64, .float_f80, .float_f128 => .float,
+        .err => .err,
+        .error_union_err, .error_union_payload => .error_union,
+        .enum_literal => .enum_literal,
+        .enum_tag => .enum_tag,
+        .un => .un,
+        .ptr => .ptr,
+        .slice => .slice,
+        .opt_null, .opt_payload => .opt,
+        .aggregate_elems, .aggregate_bytes, .aggregate_repeated => .aggregate,
+        .func => .func,
+        .extern_func => .extern_func,
+        .calling_convention => .calling_convention,
+        .nav_capture_val, .nav_capture_ref => .nav_capture,
+        .runtime_capture => .runtime_capture,
+    };
+}
+
+/// `indexToKey(index).simple_type`, without decoding the whole key.
+pub fn simpleType(ip: *const InternPool, index: Index) SimpleType {
+    const item = ip.itemOf(index);
+    assert(item.tag == .type_simple);
+    return @fromBackingInt(item.data);
+}
+
+/// `indexToKey(index).int_type`, without decoding the whole key.
+pub fn intType(ip: *const InternPool, index: Index) ?std.lang.Type.Int {
+    const item = ip.itemOf(index);
+    return switch (item.tag) {
+        .type_int_signed => .{ .signedness = .signed, .bits = @intCast(item.data) },
+        .type_int_unsigned => .{ .signedness = .unsigned, .bits = @intCast(item.data) },
+        else => null,
+    };
+}
+
 pub fn stableHash(ip: *const InternPool, index: Index) Hash {
     if (@backingInt(index) < static_len) return ip.static_hashes[@backingInt(index)];
     const u = ip.unwrapIndex(@backingInt(index));
@@ -1582,41 +1648,56 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
         .null_value => .null_type,
         .bool_true, .bool_false => .bool_type,
         .empty_tuple => .empty_tuple_type,
-        else => switch (ip.indexToKey(index)) {
-            .int_type,
-            .ptr_type,
-            .array_type,
-            .vector_type,
-            .opt_type,
-            .anyframe_type,
-            .error_union_type,
-            .simple_type,
-            .struct_type,
-            .enum_type,
-            .union_type,
-            .opaque_type,
-            .tuple_type,
-            .error_set_type,
-            .inferred_error_set_type,
-            .func_type,
-            => .type_type,
-            .simple_value => unreachable,
-            .undef => |t| t,
-            .int => |x| x.ty,
-            .float => |x| x.ty,
-            .err => |x| x.ty,
-            .error_union => |x| x.ty,
-            .enum_literal => .enum_literal_type,
-            .enum_tag => |x| x.ty,
-            .un => |x| x.ty,
-            .ptr => |x| x.ty,
-            .slice => |x| x.ty,
-            .opt => |x| x.ty,
-            .aggregate => |x| x.ty,
-            .func => |x| x.ty,
-            .extern_func => |x| x.ty,
-            .calling_convention => .calling_convention_type,
-            .nav_capture, .runtime_capture => .generic_poison_type,
+        // Reads only the type field of the item (see `indexToKey`).
+        else => blk: {
+            const item = ip.itemOf(index);
+            const d = item.data;
+            break :blk switch (item.tag) {
+                .type_int_signed,
+                .type_int_unsigned,
+                .type_simple,
+                .type_ptr,
+                .type_array,
+                .type_vector,
+                .type_opt,
+                .type_anyframe,
+                .type_error_union,
+                .type_error_set,
+                .type_inferred_error_set,
+                .type_struct,
+                .type_enum,
+                .type_union,
+                .type_opaque,
+                .type_tuple,
+                .type_func,
+                => .type_type,
+                .simple_value => unreachable,
+                .undef, .opt_null => @fromBackingInt(d),
+                .int_u64,
+                .int_i64,
+                .int_big,
+                .float_f16,
+                .float_f32,
+                .float_f64,
+                .float_f80,
+                .float_f128,
+                .err,
+                .error_union_err,
+                .error_union_payload,
+                .enum_tag,
+                .un,
+                .ptr,
+                .slice,
+                .opt_payload,
+                .aggregate_elems,
+                .aggregate_bytes,
+                .aggregate_repeated,
+                => @fromBackingInt(item.extra[d]),
+                .func, .extern_func => @fromBackingInt(item.extra[d + 1]),
+                .enum_literal => .enum_literal_type,
+                .calling_convention => .calling_convention_type,
+                .nav_capture_val, .nav_capture_ref, .runtime_capture => .generic_poison_type,
+            };
         },
     };
 }
