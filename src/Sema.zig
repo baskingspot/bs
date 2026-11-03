@@ -2505,11 +2505,20 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const raw_ty = try sema.resolveType(block, src, extra.lhs);
             if (raw_ty == .generic_poison_type) break :blk sema.analyzeFloatUnary(block, src, op, operand);
             const dest_ty = sema.unwrapOptEu(raw_ty);
-            const oc = Type.class(sema.ip, sema.typeOf(operand));
+            const oc = Type.class(sema.ip, Type.scalarType(sema.ip, sema.typeOf(operand)));
             if (oc != .float and oc != .comptime_float) return sema.fail(block, src, "expected float or vector type, found '{f}'", .{sema.fmtType(sema.typeOf(operand))});
-            break :blk switch (Type.class(sema.ip, dest_ty)) {
+            break :blk switch (Type.class(sema.ip, Type.scalarType(sema.ip, dest_ty))) {
                 .float, .comptime_float => sema.analyzeFloatUnary(block, src, op, try sema.coerce(block, dest_ty, operand, src)),
-                .int, .comptime_int => sema.analyzeFloatToInt(block, src, dest_ty, operand, mode),
+                .int, .comptime_int => if (sema.vectorLen(dest_ty)) |len|
+                    sema.vectorMap(block, src, len, dest_ty, &.{operand}, struct {
+                        elem_ty: Index,
+                        mode: IntFromFloatMode,
+                        fn call(o: @This(), s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
+                            return s.analyzeFloatToInt(b, sr, o.elem_ty, e[0], o.mode);
+                        }
+                    }{ .elem_ty = Type.childType(sema.ip, dest_ty), .mode = mode })
+                else
+                    sema.analyzeFloatToInt(block, src, dest_ty, operand, mode),
                 else => sema.fail(block, src, "expected integer, float, or vector of either integers or floats, found '{f}'", .{sema.fmtType(dest_ty)}),
             };
         },
