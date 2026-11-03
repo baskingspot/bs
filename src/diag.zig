@@ -1317,6 +1317,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "generic return type not allowed in function with calling convention '{s}'", .@"bad-fn-type" },
     .{ "extern structs cannot contain fields of type '{f}'", .@"bad-type" },
     .{ "extern unions cannot contain fields of type '{f}'", .@"bad-type" },
+    .{ "comptime control flow inside runtime block", .@"bad-break" },
     .{ "array of 'noreturn' not allowed", .@"bad-type" },
     .{ "cannot initialize union field with uninstantiable type '{f}'", .@"bad-type" },
     .{ "unable to override alignment of packed struct fields", .@"bad-container" },
