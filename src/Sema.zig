@@ -6808,7 +6808,22 @@ fn enumFromInt(sema: *Sema, block: *Block, src: Src, ty: Index, uncasted: Ref) C
     try sema.resolveLayout(block, src, ty);
     const info = ip.structInfo(ty);
     const int_ty = info.tag_type;
-    const operand = try sema.coerce(block, int_ty, uncasted, src);
+    // Any integer converts, as upstream: a value out of the tag type's
+    // range is an invalid enum value, like one that names no tag.
+    const uncasted_ty = sema.typeOf(uncasted);
+    const operand = if (Type.isInt(ip, uncasted_ty) and uncasted_ty != int_ty) operand: {
+        if (sema.resolveValue(uncasted)) |v| {
+            if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(ty));
+            if (!sema.intFits(v, int_ty)) return if (info.nonexhaustive)
+                sema.failCode(block, src, .@"lossy-conversion", "int value '{f}' out of range of non-exhaustive enum '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) })
+            else
+                sema.fail(block, src, "enum '{f}' has no tag with value '{f}'", .{ sema.fmtType(ty), sema.fmtValue(v) });
+            break :operand Ref.fromInterned(try sema.retypeInt(v, int_ty));
+        }
+        try sema.requireRuntime(block, src);
+        if (block.want_safety) try sema.intRangeCheck(block, uncasted, int_ty, .invalid_enum_value);
+        break :operand try sema.addTyOp(block, .intcast, int_ty, uncasted);
+    } else try sema.coerce(block, int_ty, uncasted, src);
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(ty));
         const val = try sema.intern(.{ .enum_tag = .{ .ty = ty, .int = v } });
@@ -14147,11 +14162,18 @@ fn analyzeIntCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand:
     if (dest_ty == src_ty) return operand;
     // Lowering (`runtimeElemAccess`): the evaluator checks the value fits.
     if (src_ty == .comptime_int_type) return sema.addTyOp(block, .intcast, dest_ty, operand);
+    if (block.want_safety) try sema.intRangeCheck(block, operand, dest_ty, .integer_out_of_bounds);
+    return sema.addTyOp(block, .intcast, dest_ty, operand);
+}
+
+/// Checks at run time that integer `operand` is within integer type
+/// `dest_ty`'s range, comparing in the operand's type, else panics with `id`.
+fn intRangeCheck(sema: *Sema, block: *Block, operand: Ref, dest_ty: Index, id: PanicId) CompileError!void {
+    const ip = sema.ip;
+    const src_ty = sema.typeOf(operand);
     const s = Type.intInfo(ip, src_ty);
     const d = Type.intInfo(ip, dest_ty);
-    if (block.want_safety) {
-        // Check the value is within the destination's range, comparing in
-        // the source type.
+    {
         var ok: Ref = .fromInterned(.bool_true);
         const min = try sema.minIntValue(dest_ty);
         const max = try sema.maxIntValue(dest_ty);
@@ -14171,9 +14193,8 @@ fn analyzeIntCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand:
                 ok = if (ok.toInterned() == .bool_true) hi else try sema.addBinOp(block, .bit_and, ok, hi);
             }
         }
-        try sema.addSafetyCheck(block, ok, .integer_out_of_bounds, .none, .none);
+        try sema.addSafetyCheck(block, ok, id, .none, .none);
     }
-    return sema.addTyOp(block, .intcast, dest_ty, operand);
 }
 
 fn zirTruncate(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {

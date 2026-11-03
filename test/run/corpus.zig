@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -104,6 +104,16 @@ fn pick(x: u32) u32 {
     return r;
 }
 
+// zig-minisign (wasm.zig): @enumFromInt takes an integer of any type.
+const Result = enum(isize) { overflow = -12, _ };
+const Small = enum(u8) { a, b, c };
+fn resultFromLen(len: usize) Result {
+    return @enumFromInt(len);
+}
+fn small(i: u32) Small {
+    return @enumFromInt(i);
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -144,5 +154,10 @@ fn main() callconv(.c) noreturn {
     var two: u32 = 2;
     _ = &two;
     rt.printInt(pick(two));
+
+    var three: u32 = 3;
+    _ = &three;
+    rt.printInt(@intCast(@intFromEnum(resultFromLen(three))));
+    rt.printInt(@intFromEnum(small(three - 1)));
     rt.exit(0);
 }
