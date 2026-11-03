@@ -721,8 +721,8 @@ const Local = struct {
 
 const Shard = struct {
     mutex: Io.Mutex = .init,
-    /// Entries carry the low 64 bits of the item's stable hash, so a probe
-    /// rejects non-matching entries without loading the item.
+    /// Entries carry the item's `lookupHash`, so a probe rejects
+    /// non-matching entries without loading the item.
     map: std.HashMapUnmanaged(Entry, void, EntryContext, 80) = .empty,
     string_map: std.HashMapUnmanaged(String, void, StringContext, 80) = .empty,
 };
@@ -740,12 +740,12 @@ const EntryContext = struct {
 
 const KeyAdapter = struct {
     ip: *const InternPool,
-    key_hash: Hash,
+    key_hash: u64,
     pub fn hash(ka: KeyAdapter, _: Key) u64 {
-        return @truncate(ka.key_hash);
+        return ka.key_hash;
     }
     pub fn eql(ka: KeyAdapter, key: Key, e: Entry) bool {
-        return e.hash == @as(u64, @truncate(ka.key_hash)) and keyEql(ka.ip, key, ka.ip.indexToKey(e.index));
+        return e.hash == ka.key_hash and keyEql(ka.ip, key, ka.ip.indexToKey(e.index));
     }
 };
 
@@ -947,13 +947,13 @@ pub fn hasErrorValue(ip: *InternPool, name: String) bool {
 
 /// The dedup shard of a key. Chosen by the hash's high bits; the shard's
 /// map uses the low bits, which would otherwise be equal within a shard.
-fn shardOf(ip: *InternPool, key_hash: Hash) *Shard {
-    return &ip.shards[@as(usize, @truncate(key_hash >> 64)) & (ip.shards.len - 1)];
+fn shardOf(ip: *InternPool, key_hash: u64) *Shard {
+    return &ip.shards[@as(usize, @truncate(key_hash >> 48)) & (ip.shards.len - 1)];
 }
 
 /// The index of `key` if it is interned.
 pub fn find(ip: *InternPool, key: Key) ?Index {
-    const key_hash = ip.hashKey(key);
+    const key_hash = ip.lookupHash(key);
     const shard = ip.shardOf(key_hash);
     shard.mutex.lockUncancelable(ip.io);
     defer shard.mutex.unlock(ip.io);
@@ -986,7 +986,7 @@ pub fn get(ip: *InternPool, tid: Tid, key_in: Key) Allocator.Error!Index {
     var bytes_buf: std.ArrayList(u8) = .empty;
     defer bytes_buf.deinit(ip.gpa);
     const key = if (key_in == .aggregate) try ip.canonicalAggregate(tid, key_in.aggregate, &bytes_buf) else key_in;
-    const key_hash = ip.hashKey(key);
+    const key_hash = ip.lookupHash(key);
     const shard = ip.shardOf(key_hash);
     shard.mutex.lockUncancelable(ip.io);
     defer shard.mutex.unlock(ip.io);
@@ -997,10 +997,10 @@ pub fn get(ip: *InternPool, tid: Tid, key_in: Key) Allocator.Error!Index {
     const item = try ip.encode(local, key);
     try local.hashes.ensureUnused(ip.gpa, 1);
     const i = try local.items.append(ip.gpa, item);
-    _ = try local.hashes.append(ip.gpa, key_hash);
+    _ = try local.hashes.append(ip.gpa, ip.hashKey(key));
     assert(local.hashes.len.raw == local.items.len.raw);
     const index: Index = @fromBackingInt(ip.wrap(tid, i));
-    gop.key_ptr.* = .{ .hash = @truncate(key_hash), .index = index };
+    gop.key_ptr.* = .{ .hash = key_hash, .index = index };
     return index;
 }
 
@@ -1605,6 +1605,174 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
         .calling_convention => |cc| h.int(u8, @backingInt(cc)),
     }
     return h.final();
+}
+
+/// The hash of `key` that dedup lookups use: over the indices and string
+/// indices `keyEql` compares, which is cheaper than `hashKey`. Only an item
+/// that is new gets its stable hash. In memory only.
+fn lookupHash(ip: *const InternPool, key: Key) u64 {
+    var h: Hasher = .{};
+    h.int(u8, @backingInt(std.meta.activeTag(key)));
+    const u = struct {
+        fn i(x: anytype) u32 {
+            return @backingInt(x);
+        }
+        fn list(hasher: *Hasher, l: anytype) void {
+            hasher.bytes(std.mem.sliceAsBytes(l));
+        }
+    };
+    switch (key) {
+        .int_type => |t| {
+            h.int(u8, @backingInt(t.signedness));
+            h.int(u16, t.bits);
+        },
+        .simple_type => |t| h.int(u32, @backingInt(t)),
+        .ptr_type => |t| {
+            h.int(u32, u.i(t.child));
+            h.int(u32, u.i(t.sentinel));
+            h.int(u32, @bitCast(t.flags));
+            h.int(u32, @bitCast(t.packed_offset));
+        },
+        .array_type => |t| {
+            h.int(u64, t.len);
+            h.int(u32, u.i(t.child));
+            h.int(u32, u.i(t.sentinel));
+        },
+        .vector_type => |t| {
+            h.int(u32, t.len);
+            h.int(u32, u.i(t.child));
+        },
+        .opt_type, .anyframe_type, .inferred_error_set_type, .undef, .runtime_capture => |x| h.int(u32, u.i(x)),
+        .nav_capture => |c| {
+            h.int(u32, u.i(c.nav));
+            h.int(u8, @intFromBool(c.by_ref));
+        },
+        .error_union_type => |t| {
+            h.int(u32, u.i(t.error_set_type));
+            h.int(u32, u.i(t.payload_type));
+        },
+        .error_set_type => |names| u.list(&h, names),
+        .struct_type, .enum_type, .union_type, .opaque_type => |t| {
+            h.int(u32, t.file);
+            h.int(u32, u.i(t.zir_inst));
+            u.list(&h, t.captures);
+        },
+        .tuple_type => |t| {
+            u.list(&h, t.types);
+            u.list(&h, t.values);
+            u.list(&h, t.names);
+            h.int(u32, u.i(t.site));
+        },
+        .func_type => |t| {
+            u.list(&h, t.param_types);
+            h.int(u32, u.i(t.return_type));
+            h.int(u8, @backingInt(t.cc));
+            h.int(u8, @intFromBool(t.is_var_args));
+            h.int(u8, @intFromBool(t.is_generic));
+            h.int(u32, t.comptime_bits);
+            h.int(u32, t.noalias_bits);
+        },
+        .simple_value => |v| h.int(u32, @backingInt(v)),
+        .int => |int| {
+            h.int(u32, u.i(int.ty));
+            h.int(u8, @backingInt(std.meta.activeTag(int.storage)));
+            switch (int.storage) {
+                .u64 => |v| h.int(u64, v),
+                .i64 => |v| h.int(i64, v),
+                .big => |big| {
+                    h.int(u8, @intFromBool(big.positive));
+                    u.list(&h, big.limbs);
+                },
+            }
+        },
+        .float => |f| {
+            h.int(u32, u.i(f.ty));
+            h.int(u8, @backingInt(std.meta.activeTag(f.storage)));
+            h.int(u128, f.bits());
+        },
+        .err => |e| {
+            h.int(u32, u.i(e.ty));
+            h.int(u32, u.i(e.name));
+        },
+        .error_union => |e| {
+            h.int(u32, u.i(e.ty));
+            switch (e.val) {
+                .err_name => |n| {
+                    h.int(u8, 0);
+                    h.int(u32, u.i(n));
+                },
+                .payload => |pl| {
+                    h.int(u8, 1);
+                    h.int(u32, u.i(pl));
+                },
+            }
+        },
+        .enum_literal => |x| h.int(u32, u.i(x)),
+        .enum_tag => |e| {
+            h.int(u32, u.i(e.ty));
+            h.int(u32, u.i(e.int));
+        },
+        .un => |x| {
+            h.int(u32, u.i(x.ty));
+            h.int(u32, u.i(x.tag));
+            h.int(u32, u.i(x.val));
+        },
+        .ptr => |x| {
+            h.int(u32, u.i(x.ty));
+            h.int(u64, x.byte_offset);
+            h.int(u8, @backingInt(std.meta.activeTag(x.base)));
+            switch (x.base) {
+                .nav => |n| h.int(u32, u.i(n)),
+                .uav => |a| {
+                    h.int(u32, u.i(a.val));
+                    h.int(u32, u.i(a.orig_ty));
+                },
+                .comptime_alloc => |c| h.int(u32, c),
+                .int => {},
+                .field => |f| {
+                    h.int(u32, u.i(f.base));
+                    h.int(u64, f.index);
+                },
+                .elem => |e| {
+                    h.int(u32, u.i(e.base));
+                    h.int(u64, e.index);
+                },
+            }
+        },
+        .slice => |x| {
+            h.int(u32, u.i(x.ty));
+            h.int(u32, u.i(x.ptr));
+            h.int(u32, u.i(x.len));
+        },
+        .opt => |x| {
+            h.int(u32, u.i(x.ty));
+            h.int(u32, u.i(x.val));
+        },
+        .aggregate => |a| {
+            h.int(u32, u.i(a.ty));
+            h.int(u8, @backingInt(std.meta.activeTag(a.storage)));
+            switch (a.storage) {
+                .elems => |e| u.list(&h, e),
+                .bytes => |str| h.int(u32, u.i(str)),
+                .repeated_elem => |e| h.int(u32, u.i(e)),
+            }
+        },
+        .func => |f| {
+            h.int(u32, u.i(f.owner_nav));
+            h.int(u32, u.i(f.ty));
+            h.int(u32, u.i(f.zir_inst));
+            h.int(u32, u.i(f.generic_owner));
+            u.list(&h, f.comptime_args);
+        },
+        .extern_func => |f| {
+            h.int(u32, u.i(f.name));
+            h.int(u32, u.i(f.ty));
+            h.int(u8, @intFromBool(f.is_weak));
+        },
+        .calling_convention => |cc| h.int(u8, @backingInt(cc)),
+    }
+    _ = ip;
+    return std.hash.Wyhash.hash(@truncate(h.chain), h.buf[0..h.len]);
 }
 
 fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {

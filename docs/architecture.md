@@ -145,7 +145,10 @@ the callee's body first. Early cutoff on the set keeps such callers green.
 - Every item carries a 128-bit **stable hash** computed from its contents and
   the stable hashes of the items it references (never from indices). Indices
   are an in-memory detail; anything persisted or shared between threads
-  across runs uses stable hashes or unit keys. Field names are interned
+  across runs uses stable hashes or unit keys. Deduplication does not need
+  it: a lookup hashes the key's indices and string indices (what equality
+  compares) in one 64-bit pass, and only an item that is new computes its
+  stable hash. Most lookups find an existing item. Field names are interned
   too, so a lookup by name in a container of more than a few fields
   compares string indices, not bytes.
 - Designed for concurrent use from the start: per-thread shards for appends
