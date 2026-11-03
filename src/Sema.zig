@@ -7067,7 +7067,16 @@ const CoerceCtx = union(enum) {
 
 fn coerceCtx(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src, ctx: CoerceCtx) CompileError!Ref {
     if (try sema.coerceInner(block, dest_ty, inst, src)) |r| return r;
-    return sema.failTypeMismatch(block, src, dest_ty, sema.typeOf(inst), ctx);
+    const ip = sema.ip;
+    var actual = sema.typeOf(inst);
+    // A function coerces to a pointer as `&f`, so upstream names `&f`'s
+    // type (see `navRef`).
+    if (Type.class(ip, actual) == .@"fn" and Type.class(ip, dest_ty) == .pointer) if (sema.resolveValue(inst)) |v| if (ip.keyAs(.func, v)) |f| {
+        const nav = ip.getNav(f.owner_nav);
+        const alignment: u6 = if (nav.alignment == 0) 0 else @intCast(std.math.log2_int(u64, nav.alignment) + 1);
+        actual = try sema.ptrType(.{ .child = actual, .flags = .{ .is_const = true, .alignment = alignment } });
+    };
+    return sema.failTypeMismatch(block, src, dest_ty, actual, ctx);
 }
 
 /// "expected type" with upstream's notes: why the types differ, and the
@@ -7138,6 +7147,12 @@ fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: 
     var actual = actual_ty;
     while (wanted != actual) {
         const class = Type.class(ip, wanted);
+        // `*T` to `?*anyopaque`, where `T` is a pointer, as upstream.
+        if (class == .optional and Type.class(ip, actual) == .pointer) {
+            const child = ip.keyPayload(.opt_type, wanted);
+            if (Type.optionalReprIsPtr(ip, child) and Type.childType(ip, child) == .anyopaque_type and sema.isDoublePtr(Type.childType(ip, actual)))
+                return zcu.addNote(file, span, "cannot implicitly cast double pointer '{f}' to anyopaque pointer '{f}'", .{ sema.fmtType(actual), sema.fmtType(wanted) });
+        }
         if (class != Type.class(ip, actual)) return sema.noteDeclaredPair(wanted, actual);
         switch (class) {
             .int => {
@@ -7256,9 +7271,18 @@ fn notePtrDifference(sema: *Sema, span: Ast.Span, wanted: Index, actual: Index, 
     const a_zero = a.flags.is_allowzero or a.flags.size == .c;
     const w_zero = w.flags.is_allowzero or w.flags.size == .c;
     if (a_zero and !w_zero) return zcu.addNote(file, span, "'{f}' could have null values which are illegal in type '{f}'", .{ sema.fmtType(actual), sema.fmtType(wanted) });
+    if (w.child == .anyopaque_type and sema.isDoublePtr(a.child))
+        return zcu.addNote(file, span, "cannot implicitly cast double pointer '{f}' to anyopaque pointer '{f}'", .{ sema.fmtType(actual), sema.fmtType(wanted) });
     if (a.child != w.child) {
         try zcu.addNote(file, span, "pointer type child '{f}' cannot cast into pointer type child '{f}'", .{ sema.fmtType(a.child), sema.fmtType(w.child) });
         return sema.noteTypeDifference(span, w.child, a.child);
+    }
+    if (a.packed_offset.host_size != w.packed_offset.host_size or a.packed_offset.bit_offset != w.packed_offset.bit_offset) {
+        if (a.packed_offset.host_size != w.packed_offset.host_size)
+            try zcu.addNote(file, span, "pointer host size '{d}' cannot cast into pointer host size '{d}'", .{ a.packed_offset.host_size, w.packed_offset.host_size });
+        if (a.packed_offset.bit_offset != w.packed_offset.bit_offset)
+            try zcu.addNote(file, span, "pointer bit offset '{d}' cannot cast into pointer bit offset '{d}'", .{ a.packed_offset.bit_offset, w.packed_offset.bit_offset });
+        return;
     }
     if (w.sentinel != .none and w.sentinel != a.sentinel and a.flags.size != .c) {
         if (a.sentinel != .none) return zcu.addNote(file, span, "pointer sentinel '{f}' cannot cast into pointer sentinel '{f}'", .{ sema.fmtValue(a.sentinel), sema.fmtValue(w.sentinel) });
@@ -7549,6 +7573,9 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 if (d.child != src_ty and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
                 const f = ip.keyPayload(.func, v);
                 if (f.generic_owner != .none) return null;
+                // The function's alignment may only decrease, as for `&f`.
+                const fn_align = ip.getNav(f.owner_nav).alignment;
+                if ((sema.ptrAlignment(d) orelse 1) > @max(fn_align, sema.naturalAlignment(src_ty) orelse 1)) return null;
                 if (sema.fnHasRuntimeBits(src_ty)) try sema.queueFuncRef(src, v);
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .nav = f.owner_nav } } }));
             },
@@ -7917,6 +7944,7 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     if (s.flags.is_const and !d.flags.is_const) return false;
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
     if (s.flags.is_allowzero and !d.flags.is_allowzero and d.flags.size != .c) return false;
+    if (@as(u32, @bitCast(s.packed_offset)) != @as(u32, @bitCast(d.packed_offset))) return false;
     if (d.flags.alignment != s.flags.alignment) {
         // The alignment may only decrease.
         const sa = sema.ptrAlignment(s) orelse return false;
@@ -7935,7 +7963,7 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
         // Through a const pointer, a child may gain qualifiers itself
         // (`[]?[*:0]u8` to `[]const ?[*:0]const u8`).
         if (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child)) return true;
-        if (d.child == .anyopaque_type and s.flags.size != .slice) return true;
+        if (d.child == .anyopaque_type and s.flags.size != .slice) return !sema.isDoublePtr(s.child);
         if (Type.class(ip, s.child) == .@"fn" and Type.class(ip, d.child) == .@"fn") return sema.fnTypeCoercibleInMemory(s.child, d.child);
         if (s.flags.size == .one and ip.keyTag(d.child) == .array_type) {
             const b = ip.keyPayload(.array_type, d.child);
@@ -7947,13 +7975,24 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
         return false;
     }
     // `[*]T` to `*anyopaque`.
-    if (s.flags.size == .many and d.flags.size == .one and d.child == .anyopaque_type) return true;
+    if (s.flags.size == .many and d.flags.size == .one and d.child == .anyopaque_type) return !sema.isDoublePtr(s.child);
     // `*[N]T` to `[*]T`.
     if (s.flags.size == .one and d.flags.size == .many) {
         if (s_array) |a| return (a.child == d.child or sema.sameScalarRepr(a.child, d.child) or (d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) and
             (d.sentinel == .none or d.sentinel == a.sentinel);
     }
     return false;
+}
+
+/// Whether a pointer to `child` is a double pointer, which does not coerce
+/// to `*anyopaque`, as upstream: `child` is a pointer or an optional one.
+fn isDoublePtr(sema: *Sema, child: Index) bool {
+    const ip = sema.ip;
+    return switch (Type.class(ip, child)) {
+        .pointer => true,
+        .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, child)),
+        else => false,
+    };
 }
 
 /// Whether an error union payload of type `s` reads in place as a `d`.
@@ -8023,6 +8062,7 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (s.flags.is_const and !d.flags.is_const) return false;
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
     if (s.flags.is_allowzero != d.flags.is_allowzero) return false;
+    if (@as(u32, @bitCast(s.packed_offset)) != @as(u32, @bitCast(d.packed_offset))) return false;
     if (s.flags.alignment != d.flags.alignment) {
         // The alignment may only decrease.
         const sa = sema.ptrAlignment(s) orelse return false;
@@ -8040,12 +8080,22 @@ fn isOptionalNonC(ip: *const InternPool, child: Index) bool {
     return (p.flags.size == .one or p.flags.size == .many) and !p.flags.is_allowzero;
 }
 
+/// Whether a pointer `s` is aligned enough to be a `d`: the alignment may
+/// only decrease.
+fn ptrAlignOk(sema: *Sema, s: InternPool.PtrType, d: InternPool.PtrType) bool {
+    if (s.flags.alignment == d.flags.alignment and s.child == d.child) return true;
+    const sa = sema.ptrAlignment(s) orelse return false;
+    const da = sema.ptrAlignment(d) orelse return false;
+    return da <= sa;
+}
+
 /// Whether pointers `s` and `d`, one of them a C pointer, read each
 /// other's memory: the same child and alignment, gaining only qualifiers.
 fn cPtrMatches(sema: *Sema, s: InternPool.PtrType, d: InternPool.PtrType) bool {
     if (s.flags.is_const and !d.flags.is_const) return false;
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
     if (s.flags.alignment != d.flags.alignment) return false;
+    if (@as(u32, @bitCast(s.packed_offset)) != @as(u32, @bitCast(d.packed_offset))) return false;
     return s.child == d.child or (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
 }
 
@@ -8073,6 +8123,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         if (a.child != d.child and !sema.sameScalarRepr(a.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) return null;
         // A pointer to a zero-length array coerces to any slice, even a mutable one.
         if (s.flags.is_const and !d.flags.is_const and a.len != 0) return null;
+        if (a.len != 0 and !sema.ptrAlignOk(s, d)) return null;
         if (d.sentinel != .none and !sema.sentinelsMatch(a.sentinel, d.sentinel)) return null;
         const many_ty = try sema.ptrType(.{ .child = d.child, .sentinel = d.sentinel, .flags = .{ .size = .many, .is_const = d.flags.is_const, .is_volatile = d.flags.is_volatile } });
         const ptr = try sema.coercePtrTo(block, inst, many_ty);
@@ -8108,6 +8159,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         if (s.child != d.child and !sema.sameScalarRepr(s.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
         if (s.flags.is_const and !d.flags.is_const) return null;
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return null;
+        if (!sema.ptrAlignOk(s, d)) return null;
         const raw = try sema.slicePtr(block, inst);
         return try sema.coercePtrTo(block, raw, dest_ty);
     }
@@ -8127,6 +8179,7 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         if (k != .ptr or k.ptr.base != .nav or k.ptr.byte_offset != 0) return null;
         const func = ip.getNav(k.ptr.base.nav).val;
         if (ip.keyTag(func) != .func or ip.typeOf(func) != s.child) return null;
+        if (!sema.ptrAlignOk(s, d)) return null;
         if (!try sema.fnTypeCoercible(block, block.nodeSrc(.zero), func, d.child)) return null;
         return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = k.ptr.base } }));
     }
