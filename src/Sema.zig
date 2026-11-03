@@ -1340,7 +1340,11 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 i += 1;
                 continue;
             },
-            .validate_destructure => return sema.failUnsupported(block, block.nodeSrc(.zero), "destructuring"),
+            .validate_destructure => {
+                try sema.zirValidateDestructure(block, inst);
+                i += 1;
+                continue;
+            },
             .set_runtime_safety => {
                 const src = block.nodeSrc(data.un_node.src_node);
                 const safety = try sema.resolveBool(block, src, sema.resolveInst(data.un_node.operand), "operand to @setRuntimeSafety must be comptime-known");
@@ -3017,6 +3021,23 @@ fn atomicPtr(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref, is_const: 
     if (!is_const and info.flags.is_const) return sema.fail(block, src, "cannot assign to constant", .{});
     try sema.atomicElemType(block, src, info.child);
     return .{ ptr, info.child };
+}
+
+/// `const a, const b = operand;`: the operand must be an array, vector, or
+/// tuple of the destructured length. The elements are read by `elem_val_imm`.
+fn zirValidateDestructure(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
+    const ip = sema.ip;
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const extra = sema.code.extraData(Zir.Inst.ValidateDestructure, data.payload_index).data;
+    const src = block.nodeSrc(data.src_node);
+    const ty = sema.typeOf(sema.resolveInst(extra.operand));
+    const len: u64 = switch (ip.indexToKey(ty)) {
+        .array_type => |a| a.len,
+        .vector_type => |v| v.len,
+        .tuple_type => |t| t.types.len,
+        else => return sema.fail(block, src, "type '{f}' cannot be destructured", .{sema.fmtType(ty)}),
+    };
+    if (len != extra.expect_len) return sema.fail(block, src, "expected {d} elements for destructure, found {d}", .{ extra.expect_len, len });
 }
 
 fn zirAtomicLoad(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {

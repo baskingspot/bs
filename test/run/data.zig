@@ -1,5 +1,5 @@
 //! exit: 5
-//! stdout: "65\n118\n17\n42\n32\n105\n5\n21\nzzzzzzz\nbc\n75\n9\n"
+//! stdout: "65\n118\n17\n42\n32\n105\n5\n21\nzzzzzzz\nbc\n75\n9\n10\n1\n16\n56\n10\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -87,5 +87,28 @@ fn main() callconv(.c) noreturn {
     const p: *const [5]u32 = &arr;
     const mp: [*]const u32 = p;
     rt.printInt(mp[3] + p.len);
+
+    // Destructuring tuples, arrays, and vectors, into new and existing
+    // variables.
+    var n: u32 = 5;
+    _ = &n;
+    const a, const b = pair(n);
+    var arr3 = [3]u8{ 1, 2, 3 };
+    _ = &arr3;
+    const x, var y, const z = arr3;
+    y += 10;
+    const vec: @Vector(2, u16) = .{ 7, 8 };
+    const pv, const qv = vec;
+    var m: u32 = 0;
+    m, const k = .{ n + 1, @as(u8, 4) };
+    rt.printInt(a);
+    rt.printInt(@intFromBool(b));
+    rt.printInt(x + y + z);
+    rt.printInt(pv * qv);
+    rt.printInt(m + k);
     rt.exit(@intCast(arr.len));
+}
+
+fn pair(x: u32) struct { u32, bool } {
+    return .{ x * 2, x > 3 };
 }
