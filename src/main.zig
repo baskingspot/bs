@@ -82,6 +82,11 @@ pub const Options = struct {
     /// both are accepted and ignored.
     pic: bool = false,
     pie: bool = false,
+    /// `-dynamic` on `build-lib`: a shared object, position-independent.
+    dynamic: bool = false,
+    /// `-fsoname=<name>` and `-fno-soname`; by default the shared object's
+    /// file name, as upstream's.
+    soname: union(enum) { default, name: []const u8, none } = .default,
     /// `--listen=-`: serve std's compiler protocol on stdin and stdout
     /// (`zig build`'s compile steps) instead of compiling once.
     listen: bool = false,
@@ -183,7 +188,7 @@ pub fn main(init_std: std.process.Init) !void {
         else if (command == .run)
             try runBinPath(arena, init.io, job.zapLocal(arena), job.compile_args, job.zig_lib_dir, job.stem)
         else
-            try outputName(arena, command, job.stem),
+            try outputName(arena, command, opts.dynamic, job.stem),
     };
     if (run_test or (command == .run and opts.emit_bin == .default)) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
     var inc = job.openCache(out_path);
@@ -251,6 +256,7 @@ pub const Job = struct {
             .fuzz = opts.fuzz,
             .pic = opts.pic,
             .pie = opts.pie,
+            .dynamic = opts.dynamic,
         });
         // An executable that fuzzes links the fuzzer, whose module family
         // has a builtin of its own, as upstream's separate compilation of
@@ -438,6 +444,12 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     defer emit.deinit();
     emit.obj = opts.command == .build_obj or opts.command == .build_lib;
     emit.pic = if (opts.pie) .pie else if (opts.pic) .pic else .none;
+    emit.shared = opts.dynamic;
+    if (opts.dynamic) emit.soname = switch (opts.soname) {
+        .default => try outputName(arena, .build_lib, true, job.stem),
+        .name => |n| n,
+        .none => null,
+    };
     emit.stack_size = opts.stack_size;
     emit.fuzz = opts.fuzz;
     // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
@@ -478,9 +490,10 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     if (lazy_linked == null) if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
     // A static library is its object in an archive (link/Archive.zig); it
     // does not use the cache, so it never links lazily.
-    const link_path = if (opts.command == .build_lib) try std.fmt.allocPrint(arena, "{s}.o.tmp", .{bin_path}) else bin_path;
+    const archive = opts.command == .build_lib and !opts.dynamic;
+    const link_path = if (archive) try std.fmt.allocPrint(arena, "{s}.o.tmp", .{bin_path}) else bin_path;
     var linked = lazy_linked orelse try emit.link(init.io, Io.Dir.cwd(), link_path);
-    if (linked and opts.command == .build_lib) {
+    if (linked and archive) {
         defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
         const obj = try Io.Dir.cwd().readFileAlloc(init.io, link_path, arena, .unlimited);
         const member = try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(opts.root_src_path)});
@@ -545,10 +558,10 @@ fn printEnv(init: std.process.Init) !void {
 }
 
 /// The output's file name in its directory, as upstream names it.
-fn outputName(arena: std.mem.Allocator, command: Command, stem: []const u8) ![]const u8 {
+fn outputName(arena: std.mem.Allocator, command: Command, dynamic: bool, stem: []const u8) ![]const u8 {
     return switch (command) {
         .build_obj => std.fmt.allocPrint(arena, "{s}.o", .{stem}),
-        .build_lib => std.fmt.allocPrint(arena, "lib{s}.a", .{stem}),
+        .build_lib => std.fmt.allocPrint(arena, "lib{s}.{s}", .{ stem, if (dynamic) "so" else "a" }),
         else => stem,
     };
 }
@@ -642,7 +655,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     if (job) |*j| {
         _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.cacheTarget());
         digest = Incremental.outputDigest(key);
-        const name = try outputName(arena, opts.command, j.stem);
+        const name = try outputName(arena, opts.command, opts.dynamic, j.stem);
         out_path = switch (opts.emit_bin) {
             .none => null,
             .path => |p| p,
@@ -948,7 +961,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fno-error-tracing", "zap always has error return traces ('-fno-error-tracing'); remove '.error_tracing = false'" },
     .{ "-fsanitize-thread", "zap has no ThreadSanitizer ('-fsanitize-thread'); build this step with upstream zig" },
     .{ "-fno-valgrind", "zap always emits Valgrind client requests ('-fno-valgrind'); remove '.valgrind = false'" },
-    .{ "-dynamic", "zap links executables statically ('-dynamic'); build this step with upstream zig" },
     .{ "-femit-asm", "zap does not emit assembly ('-femit-asm')" },
     .{ "-femit-implib", "zap does not emit import libraries ('-femit-implib')" },
     .{ "-femit-llvm-bc", "zap has no LLVM backend ('-femit-llvm-bc')" },
@@ -1012,6 +1024,19 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
                 opts.pic = true;
                 if (std.mem.eql(u8, arg, "-fPIE") and command == .build_obj) opts.pie = true;
             }
+        } else if (std.mem.eql(u8, arg, "-dynamic")) {
+            // Shared objects, which are position-independent; executables
+            // stay static.
+            if (command == .build_lib) {
+                opts.dynamic = true;
+                opts.pic = true;
+            } else setUnsupported(&opts, arena, "zap links executables statically ('-dynamic'); build this step with upstream zig", .{});
+        } else if (std.mem.startsWith(u8, arg, "-fsoname=")) {
+            opts.soname = .{ .name = arg["-fsoname=".len..] };
+        } else if (std.mem.eql(u8, arg, "-fsoname")) {
+            opts.soname = .default;
+        } else if (std.mem.eql(u8, arg, "-fno-soname")) {
+            opts.soname = .none;
         } else if (std.mem.eql(u8, arg, "-fno-PIC") or std.mem.eql(u8, arg, "-fno-PIE")) {
             // As upstream: -fno-PIE leaves -fPIC alone.
             if (std.mem.eql(u8, arg, "-fno-PIC")) opts.pic = false;

@@ -22,6 +22,7 @@ const Atom = @import("link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Elf = @import("link/Elf.zig");
 const ElfObject = @import("link/ElfObject.zig");
+const ElfDynamic = @import("link/ElfDynamic.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const Ssa = @import("codegen/Ssa.zig");
 
@@ -64,6 +65,13 @@ obj: bool = false,
 /// local-dynamic model; `.pie` and `.none` use local-exec. `.pic` and
 /// `.pie` images put .rodata with absolute addresses in .data.rel.ro.
 pic: enum { none, pic, pie } = .none,
+/// Whether the output is a shared object (`zap build-lib -dynamic`), with
+/// `obj` set too: it needs no entry, its exports are its dynamic symbols,
+/// and symbols that neither it nor compiler_rt defines are imported from
+/// the modules that load it.
+shared: bool = false,
+/// The shared object's DT_SONAME.
+soname: ?[]const u8 = null,
 /// `--stack`: the executable's main thread stack size.
 stack_size: u64 = 16 * 1024 * 1024,
 /// `-ffuzz`: CodeGen instruments the main module family's functions with
@@ -352,6 +360,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
         w.obj = emit.obj;
         w.fuzz = emit.fuzz;
         w.pic = emit.pic;
+        w.shared = emit.shared;
     }
     const pool = try gpa.create(Pool);
     pool.* = .{ .io = io, .workers = workers, .fuzz = fuzz };
@@ -720,12 +729,19 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
     const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none };
-    const result = if (emit.obj) obj: {
-        const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
-        defer emit.gpa.free(imports);
-        for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, weak| imp.* = .{ .key = importKey(name), .name = name, .weak = weak };
-        break :obj ElfObject.link(emit.gpa, io, dir, sub_path, emit.atoms.items, options, .{ .exports = emit.exports.items, .imports = imports });
-    } else Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, options);
+    const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
+    defer emit.gpa.free(imports);
+    for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, weak| imp.* = .{ .key = importKey(name), .name = name, .weak = weak };
+    const result = if (emit.shared) shared: {
+        const dynamic: ElfDynamic.Options = .{ .exports = emit.exports.items, .imports = imports, .soname = emit.soname };
+        var shared_options = options;
+        shared_options.base_address = 0;
+        shared_options.dynamic = &dynamic;
+        break :shared Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, shared_options);
+    } else if (emit.obj)
+        ElfObject.link(emit.gpa, io, dir, sub_path, emit.atoms.items, options, .{ .exports = emit.exports.items, .imports = imports })
+    else
+        Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, options);
     result catch |err| {
         std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
         return false;
@@ -865,7 +881,13 @@ fn lowerExternSlots(emit: *Emit) !bool {
     const arena = emit.allocator();
     var ok = true;
     for (emit.externs.keys(), emit.externs.values()) |name, weak| {
-        const target = if (emit.obj) try emit.userExport(name) orelse try emit.useImport(name, weak) else sectionBound(name) orelse try emit.exportTarget(name);
+        const target = if (emit.shared)
+            try emit.userExport(name) orelse try emit.rtExport(name) orelse
+                if (std.mem.eql(u8, name, "_DYNAMIC")) ElfDynamic.dynamic_key else try emit.useImport(name, weak)
+        else if (emit.obj)
+            try emit.userExport(name) orelse try emit.useImport(name, weak)
+        else
+            sectionBound(name) orelse try emit.exportTarget(name);
         if (target == null and !weak) {
             try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
             ok = false;
@@ -905,7 +927,15 @@ fn sectionBound(name: []const u8) ?SymbolKey {
 pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
     emit.export_lookups += 1;
     if (try emit.userExport(name)) |key| return key;
-    if (emit.obj) return try emit.useImport(name, false);
+    // A shared object links compiler_rt in, as upstream's do.
+    if (emit.obj and !emit.shared) return try emit.useImport(name, false);
+    if (try emit.rtExport(name)) |key| return key;
+    if (emit.shared) return try emit.useImport(name, false);
+    return null;
+}
+
+/// The compiler_rt function exported as `name`, requested, or null.
+fn rtExport(emit: *Emit, name: []const u8) !?SymbolKey {
     const e = Zcu.compilerRtExport(name) orelse return null;
     var buf: [128]u8 = undefined;
     return .fromName(try emit.requestRtKey(Zcu.compilerRtKey(&buf, e.file, e.decl)));

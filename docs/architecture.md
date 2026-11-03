@@ -1980,7 +1980,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   arguments after `--` and `ZIG_EXE` set: exit status and signals are the
   program's own.
 
-### Position-independent code and shared libraries (milestone 8; designed 2026-11-03)
+### Position-independent code and shared libraries (milestone 8; designed and built 2026-11-03)
 
 Scope: x86_64-linux. `build-obj -fPIC`/`-fPIE` and `build-lib -fPIC`
 (archives) produce objects that link into PIEs and shared objects with
@@ -2084,52 +2084,88 @@ and protected ones; a shared object leaves hidden exports out of
 `.dynsym` (0.17's `GlobalLinkage` has only strong and weak). This is a small change to
 Sema (written here, reviewed by the Sema thread).
 
-**Shared objects** (`build-lib -dynamic`): `Elf.emit` with
-`Options.dynamic` (exports, imports, soname). ET_DYN at base 0, written
-once like the executable; `src/link/ElfDynamic.zig` builds the dynamic
-sections, and Elf calls it at layout and in the copy tasks.
-- Layout. R: ELF header, program headers, .dynsym, .gnu.hash, .hash,
-  .dynstr, .rela.dyn, .rodata, .eh_frame, .eh_frame_hdr. RX: .plt, .text.
-  RW: .tdata, .tbss (room only, as now), .data.rel.ro, .dynamic, .got,
-  the end of PT_GNU_RELRO (page-aligned), .data, .bss. Program headers:
-  PT_PHDR, three PT_LOADs, PT_DYNAMIC, PT_TLS, PT_GNU_RELRO,
-  PT_GNU_EH_FRAME, PT_GNU_STACK.
-- `.dynsym`: the imports, undefined, GLOBAL or WEAK; then the exports
-  with default or protected visibility (FUNC or OBJECT, with the atom's
-  size), ordered by GNU hash bucket. Both `.gnu.hash` and `.hash`, as
-  upstream writes them; glibc and musl read either.
-- `.rela.dyn`: R_X86_64_RELATIVE for each `x86_64_abs64` to a defined
-  symbol, first, counted in DT_RELACOUNT; R_X86_64_64 for one to an
-  import (extern slots); R_X86_64_DTPMOD64 for the module's TLS GOT pair
-  (one, if any `x86_64_tlsld`); R_X86_64_GLOB_DAT for each PLT slot.
-- `.plt`: an 8-byte stub, `jmp [rip + slot]` and padding, for each import
-  that an `x86_64_pc32` reaches (`__tls_get_addr`). Binding is eager
-  (DF_BIND_NOW, DF_1_NOW, no DT_JMPREL), as upstream's libraries are, so
-  there is no lazy-binding header.
+**Shared objects** (`build-lib -dynamic`, built 2026-11-03): `Elf.emit`
+with `Options.dynamic` (`ElfDynamic.Options`: exports, imports, soname).
+ET_DYN at base 0, written once like the executable;
+`src/link/ElfDynamic.zig` builds the dynamic tables, which depend only on
+names, before layout, and Elf fills in the exports' values after it.
+- Layout. R: ELF header, program headers, .dynsym, .dynstr, .hash,
+  .gnu.hash, .rela.dyn, .rodata, .eh_frame, .eh_frame_hdr. RX: .plt,
+  .text. RW: .tdata, .tbss (room only, as now), .data.rel.ro, .dynamic,
+  .got, the end of PT_GNU_RELRO (page-aligned, so the loader protects all
+  of it), .data, .bss. Program headers: PT_PHDR, three PT_LOADs,
+  PT_DYNAMIC, PT_TLS, PT_GNU_RELRO, PT_GNU_EH_FRAME, PT_GNU_STACK. The
+  dynamic sections' headers come after the other allocated sections',
+  so `shndxOf` is unchanged.
+- `.dynsym`: the imports, undefined, GLOBAL or WEAK, in input order; then
+  the exports with default or protected visibility (the atom's symbol
+  type and size), ordered by GNU hash bucket. Both `.gnu.hash` and
+  `.hash`, as upstream writes them; glibc reads either (checked by hiding
+  DT_GNU_HASH: dlsym still finds every export through DT_HASH).
+- Imports: each has a GOT slot (R_X86_64_GLOB_DAT) and an 8-byte PLT stub
+  (`jmp [rip + slot]`, nop) that relocations to it resolve to, so an
+  `x86_64_pc32` to an import (the call to `__tls_get_addr`) calls the
+  stub, and an `x86_64_abs64` to one, recognized by its stub address,
+  becomes an R_X86_64_64 against the symbol. Libraries import few
+  symbols, so every import gets both rather than only the ones each use
+  needs. Binding is eager (DF_BIND_NOW, DF_1_NOW, no DT_JMPREL), as
+  upstream's libraries are.
+- `.rela.dyn`: one record per `x86_64_abs64` in atom order, RELATIVE or
+  R_X86_64_64 as above; then R_X86_64_DTPMOD64 for the module's TLS GOT
+  pair (if the image has thread-locals); then the GLOB_DATs. RELATIVE
+  records are not first, so there is no DT_RELACOUNT (upstream writes
+  none either). An `x86_64_abs64` in .text fails the link: code must not
+  need the loader to write it.
 - `.dynamic`: DT_SONAME (`lib<name>.so` by default, `-fsoname=`,
   `-fno-soname`), HASH, GNU_HASH, SYMTAB, SYMENT, STRTAB, STRSZ, RELA,
-  RELASZ, RELAENT, RELACOUNT, FLAGS, FLAGS_1. There is no DT_NEEDED:
-  imports resolve against what the loader has already loaded (the host
-  program, its libc, and the dynamic linker's `__tls_get_addr`), as for
-  upstream's libraries that do not link libc.
+  RELASZ, RELAENT, FLAGS, FLAGS_1. There is no DT_NEEDED: imports resolve
+  against what the loader has already loaded (the host program, its
+  libc, and the dynamic linker's `__tls_get_addr`), as for upstream's
+  libraries that do not link libc. `_DYNAMIC`, which std.dynamic_library
+  reads through a weak hidden extern, is linker-defined
+  (`ElfDynamic.dynamic_key`).
 - TLS: `x86_64_tlsld` is PC-relative to the GOT pair (DTPMOD64, 0);
   `x86_64_dtpoff32` is the offset in the PT_TLS block.
-- Undefined externs are imports, as in an object; an extern the
-  compilation exports resolves inside.
-- Written once: the dynamic sections' sizes are known before layout:
-  the symbol and string counts come from the exports and imports, and
-  one pass over the atoms, pic only, counts the relocations that need
-  records, per chunk. Each copy task then writes its RELATIVE records
-  at prefix-summed indexes, in offset order, while it resolves its
-  chunk.
+- Externs resolve to the compilation's exports, then to compiler_rt (a
+  shared object links compiler_rt in, as upstream's), and are imported
+  otherwise (std's `getauxval`, as upstream's library imports it).
+- Written once: layout counts each chunk's absolute relocations, a prefix
+  sum gives each chunk its first .rela.dyn record, and each copy task
+  writes its records while it resolves its chunk (`Link.copyDynamic`,
+  the copy loop instantiated with a comptime flag); the rest of the
+  dynamic sections are written serially.
 - `.symtab`, debug info and unwind tables are as in the executable.
+- Checked (2026-11-03): test/obj/lib.zig as zap's shared object, loaded
+  by test/obj/main.zig linked against it by upstream (`-lc -rdynamic`)
+  and by a C program with dlopen/dlsym (test/obj/dl.c), both in `zig
+  build test`; by hand, a library with thread-locals written from two
+  threads, data pointers, exported data, and an import from the host,
+  loaded by a C program linked against it, by dlopen, and by
+  `std.DynLib`. A panic in the library prints the same partial trace as
+  upstream's library (neither finds the library's unwind info).
+
+**Objects, checked** (2026-11-03): a zap `-fPIC` object links into
+shared objects with `cc -shared`, `ld -shared` and upstream `zig
+build-lib -dynamic`, and into PIEs with `cc -pie` (which relaxes the
+local-dynamic sequences to `mov rax, fs:0`) and upstream `zig build-exe
+-fPIE`, with and without `-fllvm -flld`; the same `-fPIC` archive with
+`cc -shared -Wl,--whole-archive`. Thread-locals, data pointers, exported
+data, imports and panic traces work in each. A `-fPIE` object links into
+PIEs and is refused by `cc -shared` (TPOFF32), as `gcc -fPIE` objects
+are. `zig build test` keeps the upstream PIE (with a panic trace) and
+the upstream shared object.
 
 **Executables do not slow down.** zap's own executable link never sees
 the new kinds, since `build-exe` is not pic. The `.data.rel.ro` decision
 and the dynamic records run only for pic and pie images. The relocation
 loop takes a comptime flag for them, so the static loop compiles as
 before. `zig build bench-link` and std's tests (compile time) must not
-move.
+move. Measured (2026-11-03, 4-core orb, ReleaseFast, against main
+b90d615): hello's and std's test binaries are byte-identical; std's test
+compile takes 7.22–7.59 s before and 7.08–7.15 s after; bench-link, best
+of six runs of 15 each, moves −8% to +8% by measurement (random targets
++4–8%, mixed targets −8% to 0%), which is this orb's run-to-run noise:
+the static path gained one branch per chunk and one per atom.
 
 **Cache.** `-fPIC` and `-dynamic` exist only on `build-obj` and
 `build-lib`, which skip the cache today, so no pic atom reaches the
@@ -2160,8 +2196,10 @@ kinds.
 - `zig build test` keeps them (test/pic, next to test/obj).
 
 **Steps.** 1: pic objects and archives (thread-locals, `.data.rel.ro`,
-PLT32, export linkage). 2: shared objects. 3: `-fPIE` objects whose root
-has `main` (inline assembly symbols). Ownership: this thread owns the
+PLT32, export linkage; built 2026-11-03). 2: shared objects (built
+2026-11-03). 3: `-fPIE` objects whose root has `main` (inline assembly
+symbols; not built yet: such an object fails to compile on std.pie's
+`lea _DYNAMIC(%rip)`). Ownership: this thread owns the
 encoder, the atom kinds, `Emit`'s output kinds and the linkers. The two
 CodeGen edits (`tls_ptr`'s lowering and `clobbers`) are written here and
 reviewed by the hello thread, which owns CodeGen; the Sema thread
@@ -4353,7 +4391,8 @@ state. Built for step 1:
 - **Libraries and docs.** `build-lib` (static, upstream's default) writes
   a GNU ar archive of the library's object with a `/SYM64/` index of its
   defined globals, as upstream does (`src/link/Archive.zig`); `-dynamic`
-  is `[unsupported]`. `-femit-docs` writes upstream's autodocs directory
+  writes a shared object (see "Position-independent code and shared
+  libraries"). `-femit-docs` writes upstream's autodocs directory
   (`src/Docs.zig`; `<name>-docs` next to the output under `--listen=-`,
   `docs/` otherwise): `index.html` and `main.js` from the zig lib
   directory, `sources.tar` with the .zig files of the module graph (byte

@@ -478,6 +478,33 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&so_run.step);
 
+    // The same library as zap's own shared object, loaded by a program
+    // upstream links against it and by a C program with dlopen.
+    const zso = b.addRunArtifact(zap);
+    zso.addArgs(&.{ "build-lib", "-dynamic", "--name", "zapso" });
+    zso.addFileArg(b.path("test/obj/lib.zig"));
+    const zso_file = zso.addPrefixedOutputFileArg("-femit-bin=", "libzapso.so");
+    const zso_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
+    zso_host.addFileArg(b.path("test/obj/main.zig"));
+    zso_host.addFileArg(zso_file);
+    const zso_host_bin = zso_host.addPrefixedOutputFileArg("-femit-bin=", "main");
+    const zso_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
+    zso_run.setName("run obj main (zap shared object)");
+    zso_run.addFileArg(zso_file);
+    zso_run.addFileArg(zso_host_bin);
+    zso_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+    zso_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&zso_run.step);
+    const dl_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
+    dl_host.addFileArg(b.path("test/obj/dl.c"));
+    const dl_bin = dl_host.addPrefixedOutputFileArg("-femit-bin=", "dl");
+    const dl_run = std.Build.Step.Run.create(b, "run dl.c (dlopen of zap shared object)");
+    dl_run.addFileArg(dl_bin);
+    dl_run.addFileArg(zso_file);
+    dl_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+    dl_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&dl_run.step);
+
     const zap_run = b.addRunArtifact(zap);
     zap_run.setName("zap run args");
     zap_run.addArg("run");

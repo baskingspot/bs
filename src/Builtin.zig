@@ -24,6 +24,8 @@ pub const Options = struct {
     /// "Position-independent code" in docs/architecture.md).
     pic: bool = false,
     pie: bool = false,
+    /// `-dynamic` on a library.
+    dynamic: bool = false,
 };
 
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
@@ -34,7 +36,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const zig_backend = std.lang.CompilerBackend.stage2_x86_64;
     \\
     \\pub const output_mode: std.lang.OutputMode = .{s};
-    \\pub const link_mode: std.lang.LinkMode = .static;
+    \\pub const link_mode: std.lang.LinkMode = .{s};
     \\pub const unwind_tables: std.lang.UnwindTables = .{s};
     \\pub const is_test = {s};
     \\pub const single_threaded = {s};
@@ -110,7 +112,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const omit_frame_pointer = false;
     \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
     \\
-    , .{ @tagName(opts.output_mode), @tagName(opts.unwind_tables), if (opts.is_test) "true" else "false", if (opts.single_threaded) "true" else "false", if (opts.fuzz) "true" else "false", if (opts.pic) "true" else "false", if (opts.pie) "true" else "false" });
+    , .{ @tagName(opts.output_mode), if (opts.dynamic) "dynamic" else "static", @tagName(opts.unwind_tables), if (opts.is_test) "true" else "false", if (opts.single_threaded) "true" else "false", if (opts.fuzz) "true" else "false", if (opts.pic) "true" else "false", if (opts.pie) "true" else "false" });
 }
 
 /// Writes the generated source to `<cache_dir>/builtin/<content hash>/builtin.zig`
