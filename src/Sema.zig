@@ -12285,6 +12285,9 @@ fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) C
         if (d_bits != s_bits) return sema.fail(block, src, "@bitCast size mismatch: destination type '{f}' has {d} bits but source type '{f}' has {d} bits", .{ sema.fmtType(dest_ty), d_bits, sema.fmtType(src_ty), s_bits });
         if (sema.resolveValue(operand)) |v| {
             if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
+            // Up to 64 bits of scalars and packed structs, without big
+            // integers (`BreakState` and its `u3` in uucode's tables).
+            if (d_bits <= 64) if (sema.valueBits64(v, 0)) |bits| if (try sema.bitsValue64(dest_ty, bits, 0)) |r| return .fromInterned(r);
             var bits = try BigInt.init(sema.arena);
             try sema.valueBits(v, &bits, 0);
             return .fromInterned(try sema.bitsValue(dest_ty, bits.toConst(), 0));
@@ -12458,6 +12461,68 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) Allocator.Error!v
     }
     try part.shiftLeft(&part, @intCast(offset));
     try out.bitOr(out, &part);
+}
+
+/// `valueBits` for a value of at most 64 bits made of integers, bools,
+/// enums, and packed structs of them; null for other values.
+fn valueBits64(sema: *Sema, v: Index, offset: u16) ?u64 {
+    const ip = sema.ip;
+    const ty = ip.typeOf(v);
+    const key = ip.indexToKey(v);
+    if (key == .undef) return 0;
+    const part: u64 = switch (Type.class(ip, ty)) {
+        .bool => @intFromBool(v == .bool_true),
+        .int => blk: {
+            const bits = Type.intInfo(ip, ty).bits;
+            const x: u64 = switch (key.int.storage) {
+                .u64 => |x| x,
+                .i64 => |x| @bitCast(x),
+                .big => return null,
+            };
+            break :blk if (bits >= 64) x else x & ((@as(u64, 1) << @intCast(bits)) - 1);
+        },
+        .@"enum" => return sema.valueBits64(key.enum_tag.int, offset),
+        .@"struct" => {
+            if (key != .aggregate) return null;
+            var out: u64 = 0;
+            for (0..Type.fieldCount(ip, ty)) |i| {
+                const field = sema.fieldValue(v, @intCast(i)) catch return null;
+                out |= sema.valueBits64(field, offset + Type.packedFieldBitOffset(ip, ty, i)) orelse return null;
+            }
+            return out;
+        },
+        else => return null,
+    };
+    return part << @intCast(offset);
+}
+
+/// `bitsValue` for the types `valueBits64` reads; null for others.
+fn bitsValue64(sema: *Sema, ty: Index, bits: u64, offset: u16) Allocator.Error!?Index {
+    const ip = sema.ip;
+    const part = bits >> @intCast(offset);
+    switch (Type.class(ip, ty)) {
+        .bool => return boolValue(part & 1 != 0),
+        .int => {
+            const info = Type.intInfo(ip, ty);
+            if (info.bits > 64 or info.bits == 0) return null;
+            const shift: u7 = @intCast(64 - info.bits);
+            const value: i128 = if (info.signedness == .signed)
+                @as(i64, @bitCast(part << @intCast(shift))) >> @intCast(shift)
+            else
+                (part << @intCast(shift)) >> @intCast(shift);
+            return try sema.intValue(ty, value);
+        },
+        .@"enum" => {
+            const int = try sema.bitsValue64(ip.structInfo(ty).tag_type, bits, offset) orelse return null;
+            return try sema.intern(.{ .enum_tag = .{ .ty = ty, .int = int } });
+        },
+        .@"struct" => {
+            const elems = try sema.arena.alloc(Index, Type.fieldCount(ip, ty));
+            for (elems, 0..) |*e, i| e.* = try sema.bitsValue64(Type.fieldType(ip, ty, i), bits, offset + Type.packedFieldBitOffset(ip, ty, i)) orelse return null;
+            return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+        },
+        else => return null,
+    }
 }
 
 /// The value of type `ty` (see `bitCastBits`) whose bits are those of `bits`
