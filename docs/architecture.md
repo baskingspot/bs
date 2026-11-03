@@ -171,7 +171,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   stores write in place; it is interned only when read as a whole, so
   filling an n-element array costs O(n), not O(n²) interned aggregates.
 - All comptime calls go through one entry point that memoizes by (function,
-  stable hashes of arguments). Milestone 6 replaces the hot path behind this
+  stable hashes of arguments). A memo entry keeps the dependencies its call
+  declared, and a unit that reuses the result declares them too, as if it
+  had made the call. Milestone 6 replaces the hot path behind this
   entry point with compiled bytecode for function instances whose types are
   fully known, falling back to ZIR walking for type-constructing code.
 

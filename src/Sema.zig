@@ -51,6 +51,14 @@ inst_map: InstMap = .{},
 deps: std.ArrayList(Zcu.Dependee) = .empty,
 /// The entries of `deps`, once it is long enough to search this way.
 deps_set: std.HashMapUnmanaged(Zcu.Dependee, void, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
+/// The dependencies declared by the memoizable comptime calls in progress,
+/// innermost last, for their memo entries (see `Zcu.Memo`): the entries
+/// from `memo_start` on are the innermost call's. Empty outside calls.
+memo_deps: std.ArrayList(Zcu.Dependee) = .empty,
+/// The last entry of `memo_deps` for each dependee.
+memo_pos: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
+/// Null outside memoizable comptime calls.
+memo_start: ?u32 = null,
 comptime_break_inst: Zir.Inst.Index = undefined,
 comptime_allocs: std.AutoHashMapUnmanaged(u32, ComptimeAlloc) = .empty,
 /// Parameters collected by `param` instructions for the next `func`
@@ -332,6 +340,8 @@ fn destroy(sema: *Sema) void {
     sema.inst_map.deinit(gpa);
     sema.deps.deinit(gpa);
     sema.deps_set.deinit(gpa);
+    sema.memo_deps.deinit(gpa);
+    sema.memo_pos.deinit(gpa);
     sema.comptime_allocs.deinit(gpa);
     var it = sema.inferred_allocs.valueIterator();
     while (it.next()) |ia| ia.stores.deinit(gpa);
@@ -1052,6 +1062,7 @@ fn depLoop(sema: *Sema, block: *Block, src: Src, err: CompileError) CompileError
 
 /// The one place a unit records what it read from another unit.
 pub fn declareDependency(sema: *Sema, dependee: Zcu.Dependee) !void {
+    if (sema.memo_start) |start| try sema.memoCollect(dependee, start);
     // `deps` keeps the order replay follows; past a few entries, a set
     // answers whether one is already there (comptime loops declare the
     // same dependencies over and over).
@@ -1064,6 +1075,26 @@ pub fn declareDependency(sema: *Sema, dependee: Zcu.Dependee) !void {
         if ((try sema.deps_set.getOrPut(sema.gpa, dependee)).found_existing) return;
     }
     try sema.deps.append(sema.gpa, dependee);
+}
+
+fn memoCollect(sema: *Sema, dependee: Zcu.Dependee, start: u32) !void {
+    const gop = try sema.memo_pos.getOrPut(sema.gpa, dependee);
+    if (gop.found_existing and gop.value_ptr.* >= start) return;
+    gop.value_ptr.* = @intCast(sema.memo_deps.items.len);
+    try sema.memo_deps.append(sema.gpa, dependee);
+}
+
+/// The dependencies the memoizable call whose entries start at `start`
+/// declared, for its memo entry.
+fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.Dependee {
+    var out: std.ArrayList(Zcu.Dependee) = .empty;
+    var seen: std.HashMapUnmanaged(Zcu.Dependee, void, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty;
+    defer seen.deinit(sema.gpa);
+    for (sema.memo_deps.items[start..]) |d| {
+        if ((try seen.getOrPut(sema.gpa, d)).found_existing) continue;
+        try out.append(sema.arena, d);
+    }
+    return sema.zcu.arena.allocator().dupe(Zcu.Dependee, out.items);
 }
 
 fn ensureNavVal(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex) CompileError!void {
@@ -12853,7 +12884,21 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
     }
     const key = hasher.final();
     try sema.declareDependency(.{ .func_body = func });
-    if (memoizable) if (sema.zcu.comptime_memo.get(key)) |result| return result;
+    if (memoizable) if (sema.zcu.comptime_memo.get(key)) |memo| {
+        // What the call read, this unit reads by reusing its result.
+        for (memo.deps) |d| try sema.declareDependency(d);
+        return memo.result;
+    };
+    const saved_memo_start = sema.memo_start;
+    const memo_start: u32 = @intCast(sema.memo_deps.items.len);
+    if (memoizable) sema.memo_start = memo_start;
+    defer if (memoizable) {
+        sema.memo_start = saved_memo_start;
+        if (saved_memo_start == null) {
+            sema.memo_deps.clearRetainingCapacity();
+            sema.memo_pos.clearRetainingCapacity();
+        }
+    };
 
     const saved = CalleeScope.enter(sema, func);
     defer saved.leave(sema);
@@ -12870,7 +12915,9 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
         else => return err,
     };
     const result = try sema.resolveConstValue(&callee_block, src, inlining.result, "comptime call must return a comptime-known value");
-    if (memoizable and !sema.refersToComptimeAlloc(result)) try sema.zcu.comptime_memo.put(sema.gpa, key, result);
+    if (memoizable and !sema.refersToComptimeAlloc(result)) {
+        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(memo_start) });
+    }
     return result;
 }
 

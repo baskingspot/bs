@@ -44,7 +44,7 @@ ready_irs: std.ArrayList(Ir) = .empty,
 /// `comptime` declarations, analyzed once each.
 comptime_decls: std.AutoArrayHashMapUnmanaged(ComptimeDecl, enum { queued, done }) = .empty,
 /// Memoized comptime calls, keyed by `Sema.comptimeCallKey`.
-comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, InternPool.Index) = .empty,
+comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, Memo) = .empty,
 /// Errors each function instance returns, for inferred error sets.
 /// Arena-allocated.
 inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, []const InternPool.String) = .empty,
@@ -83,6 +83,14 @@ pub const Export = struct {
 pub const FuncState = enum { queued, in_progress, done, failed };
 
 pub const FuncRef = struct { from: AnalUnit, func: InternPool.Index };
+
+/// A memoized comptime call's result, with the dependencies the call
+/// declared, which a unit that reuses the result declares too.
+/// Arena-allocated.
+pub const Memo = struct {
+    result: InternPool.Index,
+    deps: []const Dependee,
+};
 
 pub const ComptimeDecl = struct {
     file: u32,
