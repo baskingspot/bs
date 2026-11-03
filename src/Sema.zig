@@ -1369,25 +1369,17 @@ fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPo
     const n = decl.field_names.len;
     const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
     const values = try ip.arena(Zcu.tid).alloc(Index, n);
-    var next: ?Index = try sema.intValue(tag_ty, 0);
     var it = decl.iterateFields();
     while (it.next()) |field| {
-        const i = field.idx;
-        names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
-        const val = if (field.value_body) |body| blk: {
-            if (decl.tag_type_body == null) return sema.fail(&block, src, "explicitly valued enum requires an integer tag type", .{});
-            try sema.inst_map.put(sema.gpa, key.zir_inst, .fromInterned(tag_ty));
-            const ref = try sema.coerce(&block, tag_ty, try sema.resolveInlineBody(&block, body, key.zir_inst), src);
-            break :blk try sema.resolveConstValue(&block, src, ref, "enum tag value must be comptime-known");
-        } else next orelse return sema.fail(&block, src, "enumeration value '{f}' too large for type '{f}'", .{ sema.fmtValue(values[i - 1]), sema.fmtType(tag_ty) });
-        for (values[0..i], 0..) |v, j| {
-            if (v == val) return sema.fail(&block, src, "enum tag value {f} already taken by field '{s}'", .{ sema.fmtValue(val), ip.stringSlice(names[j]) });
-        }
-        values[i] = val;
-        const one = try sema.intValue(tag_ty, 1);
-        var big = try sema.bigValue(val);
-        try big.add(&big, &(try sema.bigValue(one)));
-        next = if (big.toConst().fitsInTwosComp(Type.intInfo(ip, tag_ty).signedness, Type.intInfo(ip, tag_ty).bits)) try sema.bigToValue(tag_ty, big.toConst()) else null;
+        names[field.idx] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
+        if (field.value_body != null and decl.tag_type_body == null) return sema.fail(&block, src, "explicitly valued enum requires an integer tag type", .{});
+    }
+    const cont_src: Src = .{ .base = decl.src_node, .loc = .{ .node = .zero } };
+    if (n != 0) try sema.enumTagValues(&block, cont_src, key.zir_inst, decl.iterateFields(), tag_ty, names, values);
+    // As upstream: a `_` must leave a value unnamed.
+    if (decl.nonexhaustive and Type.class(ip, tag_ty) == .int) {
+        const bits = Type.intInfo(ip, tag_ty).bits;
+        if (bits < 64 and n == @as(u64, 1) << @intCast(bits)) return sema.fail(&block, cont_src, "non-exhaustive enum specifies every value", .{});
     }
     info.field_names = names;
     info.field_defaults = values;
@@ -1397,6 +1389,42 @@ fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPo
     info.alignment = Type.abiAlignment(ip, tag_ty);
     info.status = .have_layout;
     try sema.finish();
+}
+
+/// The tag values of enum fields `fields` (of an enum or a `union(enum)`)
+/// into `values`, as upstream: a field's explicit value, else one more
+/// than the previous field's (0 for the first), each fitting `tag_ty`
+/// and unique.
+fn enumTagValues(sema: *Sema, block: *Block, cont_src: Src, zir_inst: Zir.Inst.Index, fields: anytype, tag_ty: Index, names: []const InternPool.String, values: []Index) CompileError!void {
+    const ip = sema.ip;
+    const info = Type.intInfo(ip, tag_ty);
+    const explicit = try sema.arena.alloc(bool, values.len);
+    var seen: std.AutoHashMapUnmanaged(Index, u32) = .empty;
+    var next = try sema.bigValue(try sema.intValue(tag_ty, 0));
+    var it = fields;
+    while (it.next()) |field| {
+        const i = field.idx;
+        explicit[i] = field.value_body != null;
+        const val_src = cont_src.fieldSrc(i, if (explicit[i]) .value else .name);
+        values[i] = if (field.value_body) |body| blk: {
+            try sema.inst_map.put(sema.gpa, zir_inst, .fromInterned(tag_ty));
+            const ref = try sema.coerce(block, tag_ty, try sema.resolveInlineBody(block, body, zir_inst), val_src);
+            break :blk try sema.resolveConstValue(block, val_src, ref, "enum tag value must be comptime-known");
+        } else blk: {
+            if (!next.toConst().fitsInTwosComp(info.signedness, info.bits))
+                return sema.fail(block, val_src, "enum tag value '{f}' too large for type '{f}'", .{ next.toConst(), sema.fmtType(tag_ty) });
+            break :blk try sema.bigToValue(tag_ty, next.toConst());
+        };
+        if (try seen.fetchPut(sema.arena, values[i], i)) |prev| {
+            const err = sema.fail(block, val_src, "enum tag value '{f}' for field '{s}' already taken", .{ sema.fmtValue(values[i]), ip.stringSlice(names[i]) });
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            const prev_src = cont_src.fieldSrc(prev.value, if (explicit[prev.value]) .value else .name);
+            try sema.zcu.addNote(sema.file, prev_src.span(tree), "previous occurrence in field '{s}'", .{ip.stringSlice(names[prev.value])});
+            return err;
+        }
+        next = try sema.bigValue(values[i]);
+        try next.addScalar(&next, 1);
+    }
 }
 
 fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPool.ContainerInfo) CompileError!void {
@@ -1488,21 +1516,11 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                 info.tag_type = arg_ty;
             },
             .tagged_enum, .tagged_enum_explicit => {
+                if (arg_ty != .none and Type.class(ip, arg_ty) != .int and !(arg_ty == .noreturn_type and n == 0))
+                    return sema.fail(&block, .{ .base = decl.src_node, .loc = .{ .container_arg = .zero } }, "expected integer tag type, found '{f}'", .{sema.fmtType(arg_ty)});
                 const int_ty = if (arg_ty != .none) arg_ty else try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n));
                 const values = try ip.arena(Zcu.tid).alloc(Index, n);
-                var next: u64 = 0;
-                var it = decl.iterateFields();
-                while (it.next()) |field| {
-                    if (field.value_body) |body| {
-                        try sema.inst_map.put(sema.gpa, key.zir_inst, .fromInterned(int_ty));
-                        const ref = try sema.coerce(&block, int_ty, try sema.resolveInlineBody(&block, body, key.zir_inst), src);
-                        values[field.idx] = try sema.resolveConstValue(&block, src, ref, "enum tag value must be comptime-known");
-                        next = (ip.intValue(u64, values[field.idx]) orelse 0) + 1;
-                    } else {
-                        values[field.idx] = try sema.intValue(int_ty, next);
-                        next += 1;
-                    }
-                }
+                if (n != 0) try sema.enumTagValues(&block, cont_src, key.zir_inst, decl.iterateFields(), int_ty, names, values);
                 // Named after the union, whose layout alone makes it.
                 const tag_name: Zcu.NameCandidate = .{ .creator = 0, .template = .{
                     .bytes = try sema.arena.dupe(u8, "@typeInfo().@\"union\".tag_type.?"),
