@@ -402,6 +402,10 @@ pub const Src = struct {
         store_operand: Ast.Node.Offset,
         /// The operand of a `return`.
         return_operand: Ast.Node.Offset,
+        /// The element type of an array type.
+        array_elem: Ast.Node.Offset,
+        /// The argument of a container declaration (`enum(u8)`).
+        container_arg: Ast.Node.Offset,
     },
 
     pub fn span(src: Src, tree: *const Ast) Ast.Span {
@@ -428,6 +432,16 @@ pub const Src = struct {
                 const node = off.toAbsolute(src.base);
                 const operand = if (tree.nodeTag(node) == .@"return") tree.nodeData(node).opt_node.unwrap() else null;
                 return tree.nodeToSpan(operand orelse node);
+            },
+            .array_elem => |off| {
+                const node = off.toAbsolute(src.base);
+                return tree.nodeToSpan(if (tree.fullArrayType(node)) |a| a.ast.elem_type else node);
+            },
+            .container_arg => |off| {
+                const node = off.toAbsolute(src.base);
+                var buf: [2]Ast.Node.Index = undefined;
+                const arg = if (tree.fullContainerDecl(&buf, node)) |c| c.ast.arg.unwrap() else null;
+                return tree.nodeToSpan(arg orelse node);
             },
         };
     }
@@ -845,7 +859,12 @@ fn structLayout(sema: *Sema, block: *Block, info: *InternPool.ContainerInfo, lay
             offset += Type.abiSize(ip, types[i]);
         }
         info.field_offsets = offsets;
-        info.size = std.mem.alignForward(u64, offset, alignment);
+        // As upstream, a struct with a runtime field of a type with no
+        // possible value has none either, and takes no space.
+        const npv = for (types, 0..) |ft, i| {
+            if (!info.fieldIsComptime(i) and Type.hasNoPossibleValue(ip, ft)) break true;
+        } else false;
+        info.size = if (npv) 0 else std.mem.alignForward(u64, offset, alignment);
         info.alignment = alignment;
     }
     info.status = .have_layout;
@@ -872,7 +891,15 @@ fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPo
     info.status = .field_types_wip;
     const tag_ty: Index = if (decl.tag_type_body) |body| blk: {
         const t = try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
-        if (Type.class(ip, t) != .int) return sema.fail(&block, src, "expected integer tag type, found '{f}'", .{sema.fmtType(t)});
+        // As upstream, an exhaustive enum without fields is backed by
+        // `noreturn`, and only such an enum.
+        const empty_exhaustive = decl.field_names.len == 0 and !decl.nonexhaustive;
+        const arg_src: Src = .{ .base = decl.src_node, .loc = .{ .container_arg = .zero } };
+        switch (Type.class(ip, t)) {
+            .int => if (empty_exhaustive) return sema.fail(&block, arg_src, "empty exhaustive enums must be backed by 'noreturn'", .{}),
+            .noreturn => if (!empty_exhaustive) return sema.fail(&block, arg_src, "non-empty enums cannot be backed by 'noreturn'", .{}),
+            else => return sema.fail(&block, arg_src, "expected integer tag type, found '{f}'", .{sema.fmtType(t)}),
+        }
         break :blk t;
     } else blk: {
         if (decl.nonexhaustive) return sema.fail(&block, src, "non-exhaustive enum missing integer tag type", .{});
@@ -1245,6 +1272,30 @@ const FmtValue = struct {
 
 fn fmtValue(sema: *Sema, val: Index) FmtValue {
     return .{ .ip = sema.ip, .val = val };
+}
+
+/// Whether `ty` has no possible value (`Type.hasNoPossibleValue`), after
+/// resolving its layout, which records it as a dependency. A type whose
+/// layout is being resolved (one referring to itself) is taken to have
+/// values.
+fn noPossibleValue(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!bool {
+    switch (Type.class(sema.ip, ty)) {
+        .noreturn, .@"opaque" => return true,
+        .array, .vector, .tuple, .@"struct", .@"union", .@"enum" => {},
+        else => return false,
+    }
+    try sema.resolveLayoutIfIdle(block, src, ty);
+    return sema.layoutResolved(ty) and Type.hasNoPossibleValue(sema.ip, ty);
+}
+
+/// As upstream's validateArrayElemType: arrays of opaque types and of
+/// `noreturn` do not exist.
+fn validateArrayElemType(sema: *Sema, block: *Block, elem_src: Src, elem: Index) CompileError!void {
+    switch (Type.class(sema.ip, elem)) {
+        .@"opaque" => return sema.fail(block, elem_src, "array of opaque type '{f}' not allowed", .{sema.fmtType(elem)}),
+        .noreturn => return sema.fail(block, elem_src, "array of 'noreturn' not allowed", .{}),
+        else => {},
+    }
 }
 
 fn failUnsupported(sema: *Sema, block: *Block, src: Src, what: []const u8) CompileError {
@@ -2899,6 +2950,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.pl_node.src_node);
             const len = try sema.resolveInt(block, src, extra.lhs, .usize_type, "array length must be comptime-known");
             const elem = try sema.resolveType(block, src, extra.rhs);
+            try sema.validateArrayElemType(block, .{ .base = src.base, .loc = .{ .array_elem = data.pl_node.src_node } }, elem);
             break :blk .fromInterned(try sema.intern(.{ .array_type = .{ .len = len, .child = elem } }));
         },
         .array_type_sentinel => blk: {
@@ -2906,6 +2958,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.pl_node.src_node);
             const len = try sema.resolveInt(block, src, extra.len, .usize_type, "array length must be comptime-known");
             const elem = try sema.resolveType(block, src, extra.elem_type);
+            try sema.validateArrayElemType(block, .{ .base = src.base, .loc = .{ .array_elem = data.pl_node.src_node } }, elem);
             const sentinel = try sema.resolveConstValue(block, src, try sema.coerce(block, elem, sema.resolveInst(extra.sentinel), src), "array sentinel must be comptime-known");
             break :blk .fromInterned(try sema.intern(.{ .array_type = .{ .len = len, .child = elem, .sentinel = sentinel } }));
         },
@@ -3542,6 +3595,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             const ty = try sema.resolveType(block, src, data.un_node.operand);
             try sema.resolveLayout(block, src, ty);
+            if (tag == .size_of and Type.hasNoPossibleValue(sema.ip, ty))
+                return sema.fail(block, sema.callArgSrc(src, false, 0), "no size available for uninstantiable type '{f}'", .{sema.fmtType(ty)});
             const size = if (Type.hasRuntimeBits(sema.ip, ty)) Type.abiSize(sema.ip, ty) else 0;
             const bits = if (tag == .size_of) size else bitSize(sema.ip, ty);
             break :blk .fromInterned(try sema.intValue(.comptime_int_type, bits));
@@ -3550,6 +3605,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             const ty = try sema.resolveType(block, src, data.un_node.operand);
             try sema.resolveLayout(block, src, ty);
+            if (Type.hasNoPossibleValue(sema.ip, ty))
+                return sema.fail(block, sema.callArgSrc(src, false, 0), "no align available for uninstantiable type '{f}'", .{sema.fmtType(ty)});
             break :blk .fromInterned(try sema.intValue(.comptime_int_type, Type.abiAlignment(sema.ip, ty)));
         },
         .has_decl => sema.zirHasDecl(block, inst),
@@ -5755,12 +5812,15 @@ fn coerceCtx(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src, ct
 }
 
 /// "expected type" with upstream's notes: why the types differ, and the
-/// declaration that fixed the expected type.
-fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index, actual: Index, ctx: CoerceCtx) CompileError {
+/// declaration that fixed the expected type. Out of line: `coerce` runs on
+/// every coercion.
+noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index, actual: Index, ctx: CoerceCtx) CompileError {
     const ip = sema.ip;
+    const npv = sema.layoutResolved(wanted) and Type.hasNoPossibleValue(ip, wanted);
     const err = sema.fail(block, src, "expected type '{f}', found '{f}'", .{ sema.fmtType(wanted), sema.fmtType(actual) });
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     const span = src.span(tree);
+    if (npv) try sema.zcu.addNote(sema.file, span, "cannot coerce to uninstantiable type '{f}'", .{sema.fmtType(wanted)});
     // E!T and ?T to T.
     if (ip.keyTag(actual) == .error_union_type and ip.keyPayload(.error_union_type, actual).payload_type == wanted) {
         try sema.zcu.addNote(sema.file, span, "cannot convert error union to payload type", .{});
@@ -5954,7 +6014,12 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
     const src_ty = sema.typeOf(inst);
     if (src_ty == dest_ty or dest_ty == .generic_poison_type) return inst;
     if (src_ty == .noreturn_type) return inst;
-    if (src_ty == .undefined_type) return .fromInterned(try sema.undefValue(dest_ty));
+    if (src_ty == .undefined_type) {
+        // As upstream, no value of a type with no possible value exists,
+        // not even an undefined one.
+        if (try sema.noPossibleValue(block, src, dest_ty)) return null;
+        return .fromInterned(try sema.undefValue(dest_ty));
+    }
     const val = sema.resolveValue(inst);
     const dc = Type.class(ip, dest_ty);
     const sc = Type.class(ip, src_ty);
@@ -10520,10 +10585,18 @@ fn unionRuntimeTag(sema: *Sema, ty: Index, i: u32) !Index {
 
 /// A union value with field `i` holding `init`.
 fn unionInit(sema: *Sema, block: *Block, src: Src, ty: Index, i: u32, init: Ref) CompileError!Ref {
+    try sema.checkUnionFieldInstantiable(block, src, sema.ip.structInfo(ty).field_types[i]);
     if (sema.resolveValue(init)) |v| return .fromInterned(try sema.intern(.{ .un = .{ .ty = ty, .tag = try sema.unionFieldTagValue(ty, i), .val = v } }));
     try sema.requireRuntime(block, src);
     if (Type.isPacked(sema.ip, ty)) return sema.addTyOp(block, .bitcast, ty, try sema.packedToBits(block, init));
     return sema.addStructField(block, .union_init, ty, init, i);
+}
+
+/// As upstream, a union field whose type has no possible value cannot be
+/// made active.
+fn checkUnionFieldInstantiable(sema: *Sema, block: *Block, src: Src, field_ty: Index) CompileError!void {
+    if (try sema.noPossibleValue(block, src, field_ty))
+        return sema.fail(block, src, "cannot initialize union field with uninstantiable type '{f}'", .{sema.fmtType(field_ty)});
 }
 
 /// `&u.field` where `ptr` points to a union. `initializing` makes the field
@@ -10533,6 +10606,7 @@ fn unionFieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, i: u32, initial
     const union_ty = Type.ptrInfo(ip, sema.typeOf(ptr)).child;
     const info = ip.structInfo(union_ty);
     const field_ty = info.field_types[i];
+    if (initializing) try sema.checkUnionFieldInstantiable(block, src, field_ty);
     // A runtime variable's union gets its tag set and checked at runtime.
     const runtime_var = if (sema.resolveValue(ptr)) |pv| ip.keyTag(pv) == .ptr and !block.is_comptime and switch (sema.ptrRootBase(ip.keyPayload(.ptr, pv))) {
         .nav => |n| !ip.getNav(n).is_const,
@@ -11931,7 +12005,7 @@ fn analyzeIsNonNull(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileE
     }
     // `?noreturn` and `?error{}` hold only null, as upstream.
     const child = Type.childType(sema.ip, ty);
-    if (child == .noreturn_type or (Type.class(sema.ip, child) == .error_set and try sema.errSetIsEmpty(block, child))) return .fromInterned(.bool_false);
+    if (try sema.noPossibleValue(block, src, child) or (Type.class(sema.ip, child) == .error_set and try sema.errSetIsEmpty(block, child))) return .fromInterned(.bool_false);
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(.undef_bool);
         return .fromInterned(boolValue(sema.ip.keyPayload(.opt, v).val != .none));
@@ -12004,9 +12078,7 @@ fn analyzeIsNonErr(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileEr
     }
     // A payload with no possible value (`!noreturn`) is never there.
     const payload = sema.ip.keyPayload(.error_union_type, ty).payload_type;
-    if (Type.class(sema.ip, payload) == .@"enum") try sema.resolveLayout(block, src, payload);
-    if (payload == .noreturn_type or (Type.class(sema.ip, payload) == .@"enum" and Type.hasNoPossibleValue(sema.ip, payload)))
-        return .fromInterned(.bool_false);
+    if (try sema.noPossibleValue(block, src, payload)) return .fromInterned(.bool_false);
     if (try sema.errSetIsEmpty(block, sema.ip.keyPayload(.error_union_type, ty).error_set_type)) return .fromInterned(.bool_true);
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(.undef_bool);
@@ -14492,7 +14564,7 @@ fn analyzeCall(
         if (fn_ty.cc == .auto) sema.has_error_trace = true;
         const payload = try sema.addExtra(Ir.Call{ .ret_ty = ret_ty, .args_len = @intCast(args.len) });
         try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(args));
-        return sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = callee_ptr, .payload = payload } } });
+        return sema.endIfNoReturn(block, try sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = callee_ptr, .payload = payload } } }));
     }
     if (comptime_call) {
         const vals = try sema.arena.alloc(Index, args.len);
@@ -14557,7 +14629,17 @@ fn analyzeCall(
     if (callee_fn_ty.cc == .auto) sema.has_error_trace = true;
     const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len) });
     try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(call_args));
-    return sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = .fromInterned(callee_func), .payload = payload } } });
+    return sema.endIfNoReturn(block, try sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = .fromInterned(callee_func), .payload = payload } } }));
+}
+
+/// A call whose return type has no possible value other than `noreturn`
+/// (`struct { n: noreturn }`) does not return either, as upstream: the
+/// block ends after it. Its return type's layout is resolved.
+fn endIfNoReturn(sema: *Sema, block: *Block, call: Ref) CompileError!Ref {
+    const ret_ty = sema.typeOf(call);
+    if (ret_ty == .noreturn_type or !Type.hasNoPossibleValue(sema.ip, ret_ty)) return call;
+    _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+    return .unreachable_value;
 }
 
 fn vaListPtr(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref) CompileError!Ref {

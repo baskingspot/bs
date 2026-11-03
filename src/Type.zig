@@ -192,10 +192,44 @@ pub fn optionalReprIsPayload(ip: *const InternPool, child: Index) bool {
     };
 }
 
-/// Whether no value of `ty` can exist: `noreturn`, or an exhaustive enum
-/// without fields (its tag type is `noreturn`). Asserts a resolved layout.
+/// Whether no value of `ty` can exist, as upstream's `classify` returns
+/// `no_possible_value`: `noreturn` and opaque types; an array or vector
+/// with elements (or a sentinel) of such a type; a struct or tuple with a
+/// runtime field of such a type; an auto or extern union whose fields all
+/// are (one without fields too); an enum whose tag type is (`noreturn`,
+/// which an exhaustive enum without fields has). Asserts that the layouts
+/// of `ty` and the types it holds by value are resolved.
 pub fn hasNoPossibleValue(ip: *const InternPool, ty: Index) bool {
-    return ty == .noreturn_type or (class(ip, ty) == .@"enum" and ip.structInfo(ty).tag_type == .noreturn_type);
+    return switch (class(ip, ty)) {
+        .noreturn, .@"opaque" => true,
+        .array => {
+            const a = ip.keyPayload(.array_type, ty);
+            return (a.len != 0 or a.sentinel != .none) and hasNoPossibleValue(ip, a.child);
+        },
+        .vector => {
+            const v = ip.keyPayload(.vector_type, ty);
+            return v.len != 0 and hasNoPossibleValue(ip, v.child);
+        },
+        .tuple => {
+            const t = ip.keyPayload(.tuple_type, ty);
+            for (t.types, t.values) |ft, fv| if (fv == .none and hasNoPossibleValue(ip, ft)) return true;
+            return false;
+        },
+        .@"struct" => {
+            const info = ip.structInfo(ty);
+            if (info.layout == .@"packed") return false;
+            for (info.field_types, 0..) |ft, i| if (!info.fieldIsComptime(i) and hasNoPossibleValue(ip, ft)) return true;
+            return false;
+        },
+        .@"union" => {
+            const info = ip.structInfo(ty);
+            if (info.layout == .@"packed") return false;
+            for (info.field_types) |ft| if (!hasNoPossibleValue(ip, ft)) return false;
+            return true;
+        },
+        .@"enum" => hasNoPossibleValue(ip, ip.structInfo(ty).tag_type),
+        else => false,
+    };
 }
 
 /// Whether values of this type exist only at compile time. As upstream's
@@ -260,6 +294,7 @@ pub fn hasRuntimeBits(ip: *const InternPool, ty: Index) bool {
         .int, .@"enum" => intInfo(ip, ty).bits != 0,
         .array => ip.keyPayload(.array_type, ty).lenIncludingSentinel() != 0 and hasRuntimeBits(ip, childType(ip, ty)),
         .@"struct", .tuple, .@"union" => abiSize(ip, ty) != 0,
+        .optional => !isComptimeOnly(ip, ty) and abiSize(ip, ty) != 0,
         else => !isComptimeOnly(ip, ty),
     };
 }
@@ -305,6 +340,9 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
         .optional => blk: {
             const child = childType(ip, ty);
             if (optionalReprIsPayload(ip, child)) break :blk abiSize(ip, child);
+            // As upstream, `?T` of a `T` with no possible value is always
+            // null: it has one possible value.
+            if (hasNoPossibleValue(ip, child)) break :blk 0;
             if (!hasRuntimeBits(ip, child)) break :blk 1;
             break :blk std.mem.alignForward(u64, abiSize(ip, child) + 1, abiAlignment(ip, child));
         },
@@ -362,7 +400,12 @@ pub const ErrorUnionLayout = struct {
 /// The error code (`u16`) comes first, then the payload.
 pub fn errorUnionLayout(ip: *const InternPool, ty: Index) ErrorUnionLayout {
     const payload = ip.keyPayload(.error_union_type, ty).payload_type;
-    if (!hasRuntimeBits(ip, payload)) return .{ .err_offset = 0, .payload_offset = 0, .size = 2, .alignment = 2 };
+    // As upstream, a payload without bits still aligns the error union
+    // (`E!S` of a `struct { x: u64, n: noreturn }` is 8 bytes).
+    if (!hasRuntimeBits(ip, payload)) {
+        const alignment = @max(2, abiAlignment(ip, payload));
+        return .{ .err_offset = 0, .payload_offset = 0, .size = alignment, .alignment = alignment };
+    }
     const pa = abiAlignment(ip, payload);
     const alignment = @max(pa, 2);
     const payload_offset = std.mem.alignForward(u64, 2, pa);
