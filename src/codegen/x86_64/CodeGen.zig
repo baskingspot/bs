@@ -4111,16 +4111,17 @@ fn genFloat(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Erro
             const lhs = try cg.valOf(data.bin_op.lhs);
             const rhs = try cg.valOf(data.bin_op.rhs);
             if (cg.sseType(ty)) |ft| {
-                // minss/maxss return the second operand if either is NaN.
-                const d = cg.destXmm(inst);
-                try cg.loadXmm(d, lhs);
-                const r = try cg.xmmReg(rhs, .xmm1);
+                // As upstream: rhs if lhs is NaN, else minss/maxss with
+                // rhs first, which return their second operand, lhs, on
+                // ties (+0 and -0) and when rhs is NaN.
+                const l = try cg.xmmReg(lhs, .xmm0);
+                try cg.loadXmm(.xmm1, rhs);
                 const done = try cg.e.newLabel();
-                try cg.e.ucomis(ft, r, .{ .reg = r });
+                try cg.e.ucomis(ft, l, .{ .reg = l });
                 try cg.e.jcc(.p, .{ .label = done });
-                try cg.e.sse(if (tag == .min_float) .min else .max, ft, d, .{ .reg = r });
+                try cg.e.sse(if (tag == .min_float) .min else .max, ft, .xmm1, .{ .reg = l });
                 cg.e.bind(done);
-                return cg.setXmm(inst, ty, d);
+                return cg.setXmm(inst, ty, .xmm1);
             }
             const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.libmCall(if (tag == .min_float) "fmin" else "fmax", null, ty, &.{ lhs, rhs }, dst);
