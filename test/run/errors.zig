@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -120,6 +120,15 @@ fn main() callconv(.c) noreturn {
     rt.printInt(tryField(false) catch 99);
     rt.printInt(tryField(true) catch 99);
 
+    // The prongs of a catch's error switch are peers of the payload; a
+    // branch that returns leaves a comptime-known value; a noreturn union
+    // payload's prong is unreachable.
+    rt.printInt(sum(3, 2) catch 99);
+    rt.printInt(sum(3, 0) catch 99);
+    rt.printInt(sum(0, 0) catch 98);
+    rt.printInt(sum(3, 1) catch 97);
+    rt.printInt(mode(.{ .plain = 4 }));
+
     const e: anyerror!u8 = error.Empty;
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
 }
@@ -131,4 +140,25 @@ fn getPair(fail: bool) error{Bad}!Pair {
 }
 fn tryField(fail: bool) error{Bad}!u32 {
     return (try getPair(fail)).a + (try getPair(fail)).b[2];
+}
+
+fn read(k: u32) error{ End, Fail }!usize {
+    return switch (k) {
+        0 => error.End,
+        1 => error.Fail,
+        else => k * 10,
+    };
+}
+fn sum(n: usize, k: u32) error{ End, Fail }!usize {
+    return n + (read(k) catch |err| switch (err) {
+        error.End => if (n == 0) return error.End else 0,
+        error.Fail => |e| return e,
+    });
+}
+const Mode = union(enum) { plain: u8, never: noreturn };
+fn mode(m: Mode) u8 {
+    return switch (m) {
+        .plain => |p| p,
+        .never => |w| w.missing,
+    };
 }

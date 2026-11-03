@@ -1461,6 +1461,13 @@ fn resolveBlock(sema: *Sema, parent: *Block, src: Src, child: *Block, merges: *B
         try parent.instructions.appendSlice(gpa, child.instructions.items[0 .. child.instructions.items.len - 1]);
         return results[0];
     }
+    if (results.len == 1 and Type.isComptimeOnly(sema.ip, sema.typeOf(results[0])) and sema.resolveValue(results[0]) != null) {
+        // One exit with a comptime-only value (`if (c) return x else 0`):
+        // the block runs for its control flow, and the value is known.
+        sema.ir_insts.items(.data)[@backingInt(merges.brs.items[0])].br.operand = .void_value;
+        try sema.addBlock(parent, merges.block_inst, .void_type, child.instructions.items);
+        return results[0];
+    }
     const result_ty = try sema.resolvePeerTypes(parent, src, results);
     try sema.resolveLayout(parent, src, result_ty);
     for (merges.brs.items, results) |br, result| {
@@ -8046,14 +8053,17 @@ fn switchProngsRuntime(
     capture_inst: Zir.Inst.Index,
 ) CompileError!Ref {
     const gpa = sema.gpa;
-    const block_inst = try sema.reserveInst();
+    // The error switch of `eu catch |err| switch (err) {...}` breaks to the
+    // block of the whole expression, so its prongs are peers of the payload.
+    const enclosing = labelOf(parent, inst);
+    const block_inst = if (enclosing == null) try sema.reserveInst() else undefined;
     var label: Block.Label = .{ .zir_block = inst, .merges = .{ .block_inst = block_inst } };
     defer {
         label.merges.results.deinit(gpa);
         label.merges.brs.deinit(gpa);
     }
     var outer = parent.child();
-    outer.label = &label;
+    if (enclosing == null) outer.label = &label;
     defer outer.instructions.deinit(gpa);
 
     if (cases.len == 1 and else_case == null and sema.resolveValue(cond) != null) {
@@ -8092,7 +8102,21 @@ fn switchProngsRuntime(
             _ = try sema.addInst(&outer, .{ .tag = .switch_br, .data = .{ .pl_op = .{ .operand = cond, .payload = payload } } });
         }
     }
+    if (enclosing != null) {
+        try parent.instructions.appendSlice(gpa, outer.instructions.items);
+        return .unreachable_value;
+    }
     return sema.resolveBlock(parent, src, &outer, &label.merges);
+}
+
+/// The label of the runtime block of ZIR block `inst` enclosing `block`.
+fn labelOf(block: *Block, inst: Zir.Inst.Index) ?*Block.Label {
+    var it: ?*Block = block;
+    while (it) |cur| : (it = cur.parent) {
+        const label = cur.label orelse continue;
+        if (label.zir_block == inst) return label;
+    }
+    return null;
 }
 
 /// What a prong captures: the operand, or a union's payload.
@@ -8139,9 +8163,14 @@ fn bindSwitchCaptures(sema: *Sema, block: *Block, src: Src, c: SwitchCase, opera
 
 fn analyzeProng(sema: *Sema, block: *Block, c: SwitchCase, operand: Ref, capture_inst: Zir.Inst.Index, switch_inst: Zir.Inst.Index) CompileError!void {
     try sema.bindSwitchCaptures(block, block.nodeSrc(.zero), c, operand, capture_inst);
+    if (c.capture == .by_val and sema.typeOf(sema.inst_map.get(capture_inst).?) == .noreturn_type) {
+        // A union payload of type noreturn: the prong cannot be reached.
+        _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+        return;
+    }
     if (try sema.analyzeInlineBody(block, c.body, switch_inst)) |result| {
         // A prong ended with a comptime break to the switch.
-        try sema.addBr(block, block.label.?, result);
+        try sema.addBr(block, labelOf(block, switch_inst).?, result);
     }
 }
 
@@ -10075,23 +10104,20 @@ test "dump: inferred error sets resolve through the callee's body" {
         \\  %3 = dbg_stmt(2:12)
         \\  %4 = is_non_err(%2)
         \\  %5 = block(u8, {
-        \\    %14 = cond_br(%4, {
+        \\    %12 = cond_br(%4, {
         \\      %6 = unwrap_errunion_payload(u8, %2)
         \\      %7 = br(%5, %6)
         \\    }, {
         \\      %8 = unwrap_errunion_err(@typeInfo(@typeInfo(@TypeOf(t.g)).@"fn".return_type.?).error_union.error_set, %2)
-        \\      %9 = block(u8, {
-        \\        %12 = switch_br(%8, [<@typeInfo(@typeInfo(@TypeOf(t.g)).@"fn".return_type.?).error_union.error_set, error.Zero>] => {
-        \\          %10 = br(%9, <u8, 1>)
-        \\        }, else => {
-        \\          %11 = panic(corrupt_switch)
-        \\        })
+        \\      %11 = switch_br(%8, [<@typeInfo(@typeInfo(@TypeOf(t.g)).@"fn".return_type.?).error_union.error_set, error.Zero>] => {
+        \\        %9 = br(%5, <u8, 1>)
+        \\      }, else => {
+        \\        %10 = panic(corrupt_switch)
         \\      })
-        \\      %13 = br(%5, %9)
         \\    })
         \\  })
-        \\  %15 = dbg_stmt(2:5)
-        \\  %16 = ret(%5)
+        \\  %13 = dbg_stmt(2:5)
+        \\  %14 = ret(%5)
         \\}
         \\fn t.g(u8) (inferred error set)!u8 {
         \\  %0 = arg(u8, 0)
