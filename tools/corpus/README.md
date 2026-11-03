@@ -24,7 +24,18 @@ a full build with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`; not timed).
   0.17.0 or which CI builds with 0.17.0), the `zig build` steps that build
   its targets (`build`), and the targets: compile steps named by their
   `--name`, how to run each (`run`: arguments for an executable; tests run
-  without arguments), and an `edit` line for the edit build.
+  without arguments), and an `edit` line for the edit build. Run arguments
+  and `cwd` may name `{src}` (the checkout), `{zig_lib}` (upstream's lib
+  directory), `{gen}` (the generation cache, where code generators write)
+  or a `fetch`ed package, and a glob there names its first match. A run's
+  `output` file counts as part of its stdout.
+- A project with `copy` instead of `url` is a directory of this checkout,
+  copied to `.work/src/`: `zig-compiler` is upstream 0.17.0's own tools in
+  `upstream/lib/compiler` (translate-c and resinator on Aro, Aro's tests,
+  objcopy, objdump, reduce, std-docs). It has no build.zig, so the
+  manifest gives its `commands` and the root `files` its modules need
+  (upstream builds these tools with the module root at lib/compiler,
+  which `-M` cannot express).
 - Setup clones each project into `.work/src/` (gitignored) and runs upstream
   `zig build <step> --verbose` once with a fresh cache under `.work/gen/`.
   That fetches dependencies, runs code generators (uucode's tables, lsp-kit's

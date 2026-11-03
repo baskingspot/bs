@@ -11,6 +11,7 @@ tools/corpus/README.md.
 """
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -53,6 +54,21 @@ def sh(argv, cwd, env=None, timeout=None, check=True):
 def setup(proj, zig, refresh):
     """Clone, fetch, generate; return the recorded commands by target name."""
     src = os.path.join(WORK, "src", proj["name"])
+    proj["fetched"] = {"src": src, "zig_lib": os.path.join(REPO_DIR, "upstream", "lib"),
+                       "gen": os.path.join(WORK, "gen", proj["name"])}
+    if "copy" in proj:
+        # A directory of this checkout, such as upstream's own tools in
+        # upstream/lib/compiler: copied so that edits leave it alone, plus
+        # the manifest's `files` (root files for modules whose code
+        # imports outside its own directory). There is no build.zig: the
+        # manifest gives the commands.
+        if not os.path.isdir(src):
+            shutil.copytree(os.path.join(REPO_DIR, proj["copy"]), src)
+        for name, text in proj.get("files", {}).items():
+            os.makedirs(os.path.dirname(os.path.join(src, name)), exist_ok=True)
+            with open(os.path.join(src, name), "w") as f:
+                f.write(text)
+        return src, proj["commands"]
     if not os.path.isdir(os.path.join(src, ".git")):
         os.makedirs(os.path.dirname(src), exist_ok=True)
         sh(["git", "clone", "--quiet", "--filter=blob:none", proj["url"], src], WORK)
@@ -60,7 +76,6 @@ def setup(proj, zig, refresh):
         sh(["git", "fetch", "--quiet", "origin", proj["commit"]], src, check=False)
         sh(["git", "checkout", "--quiet", "--force", "--detach", proj["commit"]], src)
     # Data packages a target's run needs (`fetch`), unpacked under .work/fetch/.
-    proj["fetched"] = {}
     for name, url in proj.get("fetch", {}).items():
         h = sh([zig, "fetch", url], WORK).stdout.strip()
         dest = os.path.join(WORK, "fetch", h)
@@ -166,7 +181,7 @@ def first_error(output):
     return (lines[0] if lines else output.strip().splitlines()[-1] if output.strip() else "")[:300]
 
 
-TEST_SUMMARY = re.compile(r"^(All \d+ tests passed\.|\d+ passed; \d+ skipped; \d+ failed\.)", re.M)
+TEST_SUMMARY = re.compile(r"^(?:\x1b\[[0-9;]*m)*(All \d+ tests passed\.|\d+ passed; \d+ skipped; \d+ failed\.|\d+ of \d+ tests passed)", re.M)
 
 
 def run_binary(path, args, cwd, timeout):
@@ -196,6 +211,20 @@ def apply_edit(path, line, n):
     with open(path, "w") as f:
         f.write(text[:at + len(line)] + EDIT_SUFFIX.format(n=n) + text[at + len(line):])
     return text
+
+
+def expand(arg, proj):
+    """A run argument or directory with `{src}`, `{zig_lib}`, `{gen}` (the
+    generation cache: code generators' outputs) or a fetched package
+    substituted; a glob names its first match, as a generated file's path
+    holds a hash."""
+    arg = arg.format(**proj["fetched"])
+    if "*" in arg:
+        matches = sorted(glob.glob(arg, recursive=True))
+        if not matches:
+            sys.exit(f"{proj['name']}: nothing matches {arg}")
+        arg = matches[0]
+    return arg
 
 
 def build_target(proj, src, words, tgt, compilers, args):
@@ -229,7 +258,7 @@ def build_target(proj, src, words, tgt, compilers, args):
         # manifest's "run" arguments.
         run_args = tgt.get("run", [] if is_test else None)
         if run_args is not None:
-            run_args = [a.format(**proj["fetched"]) for a in run_args]
+            run_args = [expand(a, proj) for a in run_args]
         if args.no_run and run_args is not None:
             r["run"] = "skipped"
             run = {"exit": None, "stdout": "", "stderr": ""}
@@ -241,10 +270,21 @@ def build_target(proj, src, words, tgt, compilers, args):
             run_path = os.path.join(out_dir, "run", name)
             os.makedirs(os.path.dirname(run_path), exist_ok=True)
             shutil.copy(out, run_path)
-            run = run_binary(run_path, run_args, os.path.join(src, tgt.get("cwd", ".")), tgt.get("timeout", 600))
+            cwd = os.path.join(src, expand(tgt.get("cwd", "."), proj))
+            if os.path.isfile(cwd):
+                # A generated file names the directory it is in.
+                cwd = os.path.dirname(cwd)
+            run = run_binary(run_path, run_args, cwd, tgt.get("timeout", 600))
             r["run"] = summarize_run(run, is_test)
         r["run_exit"] = run["exit"]
         r["stdout_sha"] = hashlib.sha256(run["stdout"].encode()).hexdigest()
+        # A file the run writes (`output`) counts as part of its stdout.
+        if tgt.get("output") and run_args is not None and r["run"] != "skipped":
+            out_file = expand(tgt["output"], proj)
+            if os.path.exists(out_file):
+                with open(out_file, "rb") as f:
+                    r["stdout_sha"] = hashlib.sha256(run["stdout"].encode() + f.read()).hexdigest()
+                os.remove(out_file)
         r["stdout"] = run["stdout"][-2000:]
         r["stderr"] = run["stderr"][-4000:]
         if edit and not args.no_edit:

@@ -644,6 +644,327 @@
      "name": "test"
     }
    ]
+  },
+  {
+   "name": "zig-compiler",
+   "url": "upstream/lib/compiler (Zig 0.17.0's own tools)",
+   "commit": "0.17.0",
+   "copy": "upstream/lib/compiler",
+   "files": {
+    "translate_c_root.zig": "pub const main = @import(\"translate-c/main.zig\").main;\n",
+    "resinator_root.zig": "pub const main = @import(\"resinator/main.zig\").main;\n\ntest {\n    _ = @import(\"resinator/ani.zig\");\n    _ = @import(\"resinator/ast.zig\");\n    _ = @import(\"resinator/bmp.zig\");\n    _ = @import(\"resinator/cli.zig\");\n    _ = @import(\"resinator/code_pages.zig\");\n    _ = @import(\"resinator/comments.zig\");\n    _ = @import(\"resinator/compile.zig\");\n    _ = @import(\"resinator/cvtres.zig\");\n    _ = @import(\"resinator/disjoint_code_page.zig\");\n    _ = @import(\"resinator/errors.zig\");\n    _ = @import(\"resinator/ico.zig\");\n    _ = @import(\"resinator/lang.zig\");\n    _ = @import(\"resinator/lex.zig\");\n    _ = @import(\"resinator/literals.zig\");\n    _ = @import(\"resinator/main.zig\");\n    _ = @import(\"resinator/parse.zig\");\n    _ = @import(\"resinator/preprocess.zig\");\n    _ = @import(\"resinator/rc.zig\");\n    _ = @import(\"resinator/res.zig\");\n    _ = @import(\"resinator/source_mapping.zig\");\n    _ = @import(\"resinator/utils.zig\");\n    _ = @import(\"resinator/windows1252.zig\");\n}\n",
+    "rc/generated.h": "#define GENERATED_DEFINE \"foo\"\n"
+   },
+   "commands": {
+    "translate-c": [
+     "zig",
+     "build-exe",
+     "--dep",
+     "aro",
+     "-Mroot=translate_c_root.zig",
+     "-Maro=aro/aro.zig",
+     "--name",
+     "translate-c"
+    ],
+    "resinator": [
+     "zig",
+     "build-exe",
+     "--dep",
+     "aro",
+     "-Mroot=resinator_root.zig",
+     "-Maro=aro/aro.zig",
+     "--name",
+     "resinator"
+    ],
+    "resinator-test": [
+     "zig",
+     "test",
+     "--dep",
+     "aro",
+     "-Mroot=resinator_root.zig",
+     "-Maro=aro/aro.zig",
+     "--name",
+     "resinator-test"
+    ],
+    "aro-test": [
+     "zig",
+     "test",
+     "-Mroot=aro/aro.zig",
+     "--name",
+     "aro-test"
+    ],
+    "objcopy": [
+     "zig",
+     "build-exe",
+     "-Mroot=objcopy.zig",
+     "--name",
+     "objcopy"
+    ],
+    "objdump": [
+     "zig",
+     "build-exe",
+     "-Mroot=objdump.zig",
+     "--name",
+     "objdump"
+    ],
+    "reduce": [
+     "zig",
+     "build-exe",
+     "-Mroot=reduce.zig",
+     "--name",
+     "reduce"
+    ],
+    "std-docs": [
+     "zig",
+     "build-exe",
+     "-Mroot=std-docs.zig",
+     "--name",
+     "std-docs"
+    ]
+   },
+   "targets": [
+    {
+     "name": "translate-c",
+     "run": [
+      "--zig-lib={zig_lib}",
+      "--",
+      "-resource-dir",
+      "{src}/aro",
+      "-I",
+      "{zig_lib}/include",
+      "{zig_lib}/include/x86intrin.h"
+     ],
+     "edit": [
+      "translate-c/Translator.zig",
+      "    const gpa = options.gpa;"
+     ]
+    },
+    {
+     "name": "resinator",
+     "run": [
+      "--zig-lib={zig_lib}",
+      "/c65001",
+      "/i",
+      "{src}/rc",
+      "/i",
+      "{zig_lib}/../test/standalone/windows_resources/res",
+      "/fo",
+      "/dev/stdout",
+      "{zig_lib}/../test/standalone/windows_resources/res/zig.rc"
+     ],
+     "edit": [
+      "resinator/compile.zig",
+      "    const arena = arena_allocator.allocator();"
+     ]
+    },
+    {
+     "name": "resinator-test"
+    },
+    {
+     "name": "aro-test",
+     "edit": [
+      "aro/aro/Parser.zig",
+      "    const decl_spec_start = p.tok_i;"
+     ]
+    },
+    {
+     "name": "objcopy",
+     "run": [
+      "-O",
+      "hex",
+      "/bin/true",
+      "{src}/true.hex"
+     ],
+     "output": "{src}/true.hex"
+    },
+    {
+     "name": "objdump",
+     "run": [
+      "--help"
+     ]
+    },
+    {
+     "name": "reduce",
+     "run": [
+      "-h"
+     ]
+    },
+    {
+     "name": "std-docs",
+     "run": [
+      "--zig-lib={zig_lib}",
+      "--zig=zig",
+      "--global-cache=/tmp",
+      "-h"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zigimg",
+   "url": "https://github.com/zigimg/zigimg",
+   "commit": "083d0304840a3f5fd547c2e2005148a18886c401",
+   "ref": "master",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zigimgtest",
+     "edit": [
+      "src/formats/png/reader.zig",
+      "    const id = chunk_process_data.chunk_id;"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zeit",
+   "url": "https://github.com/rockorager/zeit",
+   "commit": "06bb7b462b4218770fb5438ebe6b0c0c5ef18888",
+   "ref": "main",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/zeit.zig",
+      "    const f = try dir.openFile(io, loc.asText(), .{});"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zbor",
+   "url": "https://github.com/r4gus/zbor",
+   "commit": "11115509222fc12852a25f945cce152aaeba8be2",
+   "ref": "master",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/parse.zig",
+      "    const t = try DataItem.new(\"\\xf5\");"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "libvaxis",
+   "url": "https://github.com/rockorager/libvaxis",
+   "commit": "0620b34e091deaa6f64608922be3814147128dfb",
+   "ref": "main",
+   "build": [
+    [
+     "test"
+    ],
+    [
+     "install"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/Vaxis.zig",
+      "    const cursor_vis_changed = self.screen.cursor_vis != self.screen_last.cursor_vis;"
+     ]
+    },
+    {
+     "name": "example-text_input"
+    }
+   ]
+  },
+  {
+   "name": "cache.zig",
+   "url": "https://github.com/karlseguin/cache.zig",
+   "commit": "b0bc7913a4b428e1b09d26bef0684ac77dc7af3a",
+   "ref": "master",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/cache.zig",
+      "    const name = @typeName(Ctx);"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zul",
+   "url": "https://github.com/karlseguin/zul",
+   "commit": "23f1ecb429ff29aae8aee6e01e634cbc4e3f8f89",
+   "ref": "master",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/string_builder.zig",
+      "        const static = try allocator.alloc(u8, static_size);"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "metrics.zig",
+   "url": "https://github.com/karlseguin/metrics.zig",
+   "commit": "3676413b54c8b36c3aca2c22500aaf065ff2b45d",
+   "ref": "master",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/histogram.zig",
+      "                const total_count = @atomicLoad(usize, &self.count, .monotonic);"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zig-hpke",
+   "url": "https://github.com/jedisct1/zig-hpke",
+   "commit": "73a97960bdce650e2f09b0bbb00da736b3079288",
+   "ref": "master",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/main.zig",
+      "        const components = suite_id.getComponents();"
+     ]
+    }
+   ]
   }
  ],
  "excluded": [
@@ -683,6 +1004,51 @@
   {
    "name": "tokamak",
    "reason": "its tests link libc (-lc)"
+  },
+  {
+   "name": "zware",
+   "url": "https://github.com/malcolmstill/zware",
+   "reason": "its interpreter requires the LLVM backend (`.always_tail` calls); upstream's self-hosted backend rejects it, and its spec tests need wabt (C++)"
+  },
+  {
+   "name": "zig-yaml",
+   "url": "https://github.com/kubkon/zig-yaml",
+   "reason": "master (e5cf8ac) declares 0.16.0 and its build.zig does not build with 0.17.0"
+  },
+  {
+   "name": "supermd",
+   "url": "https://github.com/kristoff-it/supermd",
+   "reason": "links cmark-gfm (C)"
+  },
+  {
+   "name": "buzz",
+   "url": "https://github.com/buzz-language/buzz",
+   "reason": "links libc and C sources (mimalloc, linenoise)"
+  },
+  {
+   "name": "zig-json (nektro)",
+   "url": "https://github.com/nektro/zig-json",
+   "reason": "its test links libc"
+  },
+  {
+   "name": "arocc",
+   "url": "https://github.com/Vexu/arocc",
+   "reason": "master targets 0.18.0-dev; its last 0.17 commits require a 0.17.0-dev build. Upstream's own copy of Aro is in the corpus (zig-compiler: aro-test, translate-c)"
+  },
+  {
+   "name": "poop",
+   "url": "https://github.com/andrewrk/poop",
+   "reason": "main (e1a802d) does not compile with 0.17.0 (`@typeInfo(...).@\"struct\".fields`)"
+  },
+  {
+   "name": "websocket.zig, pg.zig",
+   "url": "https://github.com/karlseguin",
+   "reason": "tests need network services; websocket.zig's tests hang without them and pg.zig's need PostgreSQL"
+  },
+  {
+   "name": "ZCS",
+   "url": "https://github.com/Games-by-Mason/ZCS",
+   "reason": "targets 0.16.0-dev; its tracy dependency's build.zig fails on 0.17.0"
   }
  ]
 }
