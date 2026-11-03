@@ -22,12 +22,13 @@
 //! from the atoms, so that linking without them never reads them, and with
 //! them the debug passes stream through them in chunks of their own.
 //!
-//! Call frame information is one .eh_frame CIE and a fixed-size FDE per
-//! entry with a frame (frame-pointer or outermost), indexed by a sorted .eh_frame_hdr
-//! search table that PT_GNU_EH_FRAME points to, which is where std.debug's
-//! unwinder looks first. Both sections are sized for every entry before
-//! the debug entries are read, so entries that get no FDE leave unused
-//! zero bytes after each section.
+//! Call frame information is one .eh_frame CIE and an FDE per entry whose
+//! atom has a frame (`Atom.unwind`: frame-pointer, with the registers it
+//! saves, or outermost), indexed by a sorted .eh_frame_hdr search table
+//! that PT_GNU_EH_FRAME points to, which is where std.debug's unwinder
+//! looks first. Both sections are sized for every entry, at the largest
+//! FDE, before the debug entries are read, so the room FDEs do not use
+//! is zero bytes after each section.
 //!
 //! Thread-local storage: .tdata and .tbss start the RW segment, covered by
 //! a PT_TLS program header (filesz the .tdata bytes, memsz through the end
@@ -580,7 +581,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const rodata_end = starts[rodata] + sizes[rodata];
     // Room for an FDE per debug entry, and the terminator.
     const eh_off = std.mem.alignForward(u64, rodata_end, 8);
-    const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.fde_size + 4 else 0;
+    const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.max_fde_size + 4 else 0;
     const hdr_off = eh_off + eh_room;
     const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + n_debug * Dwarf.eh_frame_hdr_entry_size else 0;
     const r_end = if (has_cfi) hdr_off + hdr_room else rodata_end;
@@ -659,7 +660,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
                 l.scratch_len = @max(l.scratch_len, len);
             }
             for (debug_chunks) |*c| {
-                const fde_len = @as(u64, c.n_frames) * (Dwarf.fde_size + Dwarf.eh_frame_hdr_entry_size);
+                const fde_len = c.frame_bytes + @as(u64, c.n_frames) * Dwarf.eh_frame_hdr_entry_size;
                 const lens = c.lens();
                 l.scratch_len = @max(l.scratch_len, lens.info + lens.ranges + lens.line + fde_len);
             }
@@ -681,7 +682,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.fill(strtab_off, 1);
     try l.put(shstrtab_off, shstr);
     try l.fill(shstrtab_off + shstr.len, shoff - (shstrtab_off + shstr.len));
-    const eh_size = Dwarf.cie.len + @as(u64, dwarf.n_frames) * Dwarf.fde_size + 4;
+    const eh_size = Dwarf.cie.len + dwarf.frame_bytes + 4;
     const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, dwarf.n_frames) * Dwarf.eh_frame_hdr_entry_size;
     if (has_cfi) {
         // The FDEs and the search table are written with the debug chunks.
@@ -1102,10 +1103,10 @@ fn LinkOf(comptime Input: type) type {
             const c = &l.debug_chunks[chunk];
             const task = l.chunks.len + chunk;
             const offsets = [2]u64{
-                l.eh_off + Dwarf.cie.len + @as(u64, c.frame_base) * Dwarf.fde_size,
+                l.eh_off + Dwarf.cie.len + c.frame_off,
                 l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, c.frame_base) * Dwarf.eh_frame_hdr_entry_size,
             };
-            const lens = [2]u64{ @as(u64, c.n_frames) * Dwarf.fde_size, @as(u64, c.n_frames) * Dwarf.eh_frame_hdr_entry_size };
+            const lens = [2]u64{ c.frame_bytes, @as(u64, c.n_frames) * Dwarf.eh_frame_hdr_entry_size };
             const out = l.parts(thread, 2, offsets, lens);
             // Each unit's part of the subprogram entries, range lists, and
             // line sequences: in place, or in the scratch after `out`.
@@ -1140,6 +1141,7 @@ fn LinkOf(comptime Input: type) type {
             // A local copy: writes to `out` could alias `l`.
             const input = l.input;
             var fde = c.frame_base;
+            var fde_at: u32 = 0;
             const hdr_addr: i64 = @intCast(l.base + l.hdr_off);
             for (l.file_of[begin..end], begin..) |file_of, j| {
                 // The entries stream; their fragments, names, and atoms do not.
@@ -1155,12 +1157,15 @@ fn LinkOf(comptime Input: type) type {
                 const a = input.atom(atom);
                 const size = a.bytes.len;
                 w.entry(d, a.name, addr, size, file_of);
-                if (d.frame != .none) {
-                    const fde_off: u32 = @intCast(Dwarf.cie.len + @as(u64, fde) * Dwarf.fde_size);
+                const unwind = ref(&a).unwind;
+                if (unwind.kind != .none) {
+                    const fde_off: u32 = @intCast(Dwarf.cie.len + c.frame_off + fde_at);
                     const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
                     const fn_addr: i64 = @intCast(addr);
                     const k = fde - c.frame_base;
-                    Dwarf.writeFde(out[0][@as(usize, k) * Dwarf.fde_size ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
+                    const fde_len = Dwarf.fdeSize(unwind);
+                    Dwarf.writeFde(out[0][fde_at..][0..fde_len], unwind, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
+                    fde_at += fde_len;
                     const entry = out[1][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
                     std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
                     std.mem.writeInt(i32, entry[4..8], @intCast(fde_addr - hdr_addr), .little);
@@ -1470,7 +1475,8 @@ pub fn writeStruct(dst: []u8, s: anytype) void {
 
 pub fn identical(a: *const Atom, b: *const Atom) bool {
     if (a.section != b.section or a.alignment != b.alignment or a.size() != b.size() or
-        a.targets.len != b.targets.len or a.relocs.len != b.relocs.len) return false;
+        a.targets.len != b.targets.len or a.relocs.len != b.relocs.len or
+        !std.meta.eql(a.unwind, b.unwind)) return false;
     if (!std.mem.eql(u8, a.bytes, b.bytes)) return false;
     if (!std.mem.eql(SymbolKey, a.targets, b.targets)) return false;
     return std.mem.eql(u8, std.mem.sliceAsBytes(a.relocs), std.mem.sliceAsBytes(b.relocs));
@@ -1955,8 +1961,8 @@ test "links many chunks of atoms the same way on any number of threads" {
         // units every 300, so units have several ranges in a chunk and
         // span chunks.
         const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
-        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = e.lines.bytes.items, .frame = .frame_pointer, .unit = units[i / 300 % units.len] });
-        try atoms.append(arena, .{ .key = fkey(i), .name = name, .section = .text, .alignment = alignments[i % 3], .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items });
+        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = e.lines.bytes.items, .unit = units[i / 300 % units.len] });
+        try atoms.append(arena, .{ .key = fkey(i), .name = name, .section = .text, .alignment = alignments[i % 3], .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items, .unwind = .frame_pointer });
         try atoms.append(arena, constants[i % 50]);
         if (i % 7 == 0) try atoms.append(arena, .{ .key = fkey(n + i), .name = "pad", .section = .bss, .alignment = .@"8", .zero_fill = i % 13 });
     }
@@ -2064,15 +2070,15 @@ test "line programs decode with std.debug.Dwarf" {
     const key: SymbolKey = .fromName("f");
     const atoms = [_]Atom{
         .{ .key = .fromName("no debug"), .name = "h", .section = .text, .bytes = &.{ 0xc3, 0xc3, 0xc3 } },
-        .{ .key = key, .name = "root:f", .section = .text, .alignment = .@"16", .bytes = &code },
+        .{ .key = key, .name = "root:f", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .frame_pointer },
         .{ .key = .fromName("g"), .name = "root:g", .section = .text, .bytes = &.{0xc3} },
         .{ .key = .fromName("g"), .name = "root:g", .section = .text, .bytes = &.{0xc3} },
     };
     const debug = [_]Atom.Debug{
-        .{ .atom = 1, .file = "src/f.zig", .name = "f", .base_line = 1000, .lines = lp.bytes.items, .frame = .frame_pointer },
-        .{ .atom = 2, .file = "g.zig", .name = "g", .base_line = 0, .lines = &.{}, .frame = .none },
+        .{ .atom = 1, .file = "src/f.zig", .name = "f", .base_line = 1000, .lines = lp.bytes.items },
+        .{ .atom = 2, .file = "g.zig", .name = "g", .base_line = 0, .lines = &.{} },
         // The duplicate's entry goes with it.
-        .{ .atom = 3, .file = "g.zig", .name = "g again", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
+        .{ .atom = 3, .file = "g.zig", .name = "g again", .base_line = 0, .lines = &.{} },
     };
     const out = try emit(gpa, io, &atoms, .{ .entry = key, .debug = &debug, .comp_dir = "/work" });
     defer gpa.free(out);
@@ -2137,14 +2143,14 @@ test "line programs decode with std.debug.Dwarf" {
     const main_key: SymbolKey = .fromName("main");
     const atoms2 = [_]Atom{
         .{ .key = .fromName("no debug"), .name = "h", .section = .text, .bytes = &.{ 0xc3, 0xc3, 0xc3 } },
-        .{ .key = main_key, .name = "main", .section = .text, .alignment = .@"16", .bytes = &code64 },
+        .{ .key = main_key, .name = "main", .section = .text, .alignment = .@"16", .bytes = &code64, .unwind = .frame_pointer },
         .{ .key = .fromName("g"), .name = "g", .section = .text, .bytes = &.{0xc3} },
         .{ .key = .fromName("k"), .name = "k", .section = .text, .bytes = &.{0xc3} },
     };
     const debug2 = [_]Atom.Debug{
-        .{ .atom = 1, .file = "src/main.zig", .name = "main", .base_line = 10, .lines = mp.bytes.items, .frame = .frame_pointer, .unit = "src/main.zig", .files = "/zig/std/start.zig\x00/zig/std/mem.zig\x00", .inlines = &inlines, .inline_names = "callMaininner", .patches = mp.patches.items },
-        .{ .atom = 2, .file = "/zig/std/start.zig", .name = "g", .base_line = 0, .lines = &.{Atom.LineProgram.opcode_base - Atom.LineProgram.line_base}, .frame = .none, .unit = "/zig/std/std.zig" },
-        .{ .atom = 3, .file = "src/main.zig", .name = "k", .base_line = 30, .lines = &.{}, .frame = .none, .unit = "src/main.zig" },
+        .{ .atom = 1, .file = "src/main.zig", .name = "main", .base_line = 10, .lines = mp.bytes.items, .unit = "src/main.zig", .files = "/zig/std/start.zig\x00/zig/std/mem.zig\x00", .inlines = &inlines, .inline_names = "callMaininner", .patches = mp.patches.items },
+        .{ .atom = 2, .file = "/zig/std/start.zig", .name = "g", .base_line = 0, .lines = &.{Atom.LineProgram.opcode_base - Atom.LineProgram.line_base}, .unit = "/zig/std/std.zig" },
+        .{ .atom = 3, .file = "src/main.zig", .name = "k", .base_line = 30, .lines = &.{}, .unit = "src/main.zig" },
     };
     const out2 = try emit(gpa, io, &atoms2, .{ .entry = main_key, .debug = &debug2, .comp_dir = "/work" });
     defer gpa.free(out2);
@@ -2186,13 +2192,13 @@ test "line programs decode with std.debug.Dwarf" {
     try std.testing.expectError(error.MissingDebugInfo, di2.getSymbols(arena, arena, .little, testSymbolAddr(out2, "h").?, false, &no_unit));
     // Malformed inline calls and patches are rejected.
     for ([_]Atom.Debug{
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &.{ inlines[1], inlines[0] }, .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &inlines, .inline_names = debug2[0].inline_names, .patches = &.{1} },
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = "/zig/std/start.zig\x00", .inlines = &inlines, .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = inlines[0..1], .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .files = debug2[0].files, .inlines = &.{ inlines[1], inlines[0] }, .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .files = debug2[0].files, .inlines = &inlines, .inline_names = debug2[0].inline_names, .patches = &.{1} },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .files = "/zig/std/start.zig\x00", .inlines = &inlines, .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .files = debug2[0].files, .inlines = inlines[0..1], .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
         // Paths must end with a 0 byte, and names must be in `inline_names`.
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files[0 .. debug2[0].files.len - 1], .inlines = &inlines, .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
-        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &inlines, .inline_names = "callMain", .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .files = debug2[0].files[0 .. debug2[0].files.len - 1], .inlines = &inlines, .inline_names = debug2[0].inline_names, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .files = debug2[0].files, .inlines = &inlines, .inline_names = "callMain", .patches = mp.patches.items },
     }) |bad| try std.testing.expectError(error.InvalidDebugInfo, emit(gpa, io, &atoms2, .{ .entry = main_key, .debug = &.{bad} }));
 
     const stripped = try emit(gpa, io, &atoms, .{ .entry = key });
@@ -2209,18 +2215,20 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
     const key: SymbolKey = .fromName("f");
     const atoms = [_]Atom{
         .{ .key = .fromName("no debug"), .name = "h", .section = .text, .bytes = &.{ 0xc3, 0xc3, 0xc3 } },
-        .{ .key = key, .name = "f", .section = .text, .alignment = .@"16", .bytes = &code },
+        .{ .key = key, .name = "f", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .frame_pointer },
         .{ .key = .fromName("naked"), .name = "naked", .section = .text, .bytes = &.{ 0xcc, 0xcc } },
-        .{ .key = .fromName("f"), .name = "f", .section = .text, .alignment = .@"16", .bytes = &code },
-        .{ .key = .fromName("g"), .name = "g", .section = .text, .alignment = .@"16", .bytes = &code },
-        .{ .key = .fromName("_start"), .name = "_start", .section = .text, .alignment = .@"16", .bytes = &code },
+        .{ .key = .fromName("f"), .name = "f", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .frame_pointer },
+        // Saves rbx, r13, and r15: `push rbx` at 4, `push r13` at 5, and
+        // `push r15` at 7, after `push rbp; mov rbp, rsp`.
+        .{ .key = .fromName("g"), .name = "g", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .{ .kind = .frame_pointer, .saved = 0x15 } },
+        .{ .key = .fromName("_start"), .name = "_start", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .outermost },
     };
     const debug = [_]Atom.Debug{
-        .{ .atom = 1, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
-        .{ .atom = 2, .file = "a.zig", .name = "naked", .base_line = 0, .lines = &.{}, .frame = .none },
-        .{ .atom = 3, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
-        .{ .atom = 4, .file = "a.zig", .name = "g", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
-        .{ .atom = 5, .file = "a.zig", .name = "_start", .base_line = 0, .lines = &.{}, .frame = .outermost },
+        .{ .atom = 1, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{} },
+        .{ .atom = 2, .file = "a.zig", .name = "naked", .base_line = 0, .lines = &.{} },
+        .{ .atom = 3, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{} },
+        .{ .atom = 4, .file = "a.zig", .name = "g", .base_line = 0, .lines = &.{} },
+        .{ .atom = 5, .file = "a.zig", .name = "_start", .base_line = 0, .lines = &.{} },
     };
     const out = try emit(gpa, io, &atoms, .{ .entry = key, .debug = &debug });
     defer gpa.free(out);
@@ -2229,9 +2237,9 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
     const naked = f + code.len;
     const g = text + 96;
     const start = g + code.len;
-    // Three FDEs; the duplicate and the naked function leave their room
-    // unused.
-    try std.testing.expectEqual(Dwarf.cie.len + 3 * Dwarf.fde_size + 4, testSection(out, ".eh_frame").?.size);
+    // Three FDEs, g's with its three saved registers; the duplicate and
+    // the naked function leave their room unused.
+    try std.testing.expectEqual(Dwarf.cie.len + 2 * Dwarf.fde_size + Dwarf.max_fde_size + 4, testSection(out, ".eh_frame").?.size);
     try std.testing.expectEqual(Dwarf.eh_frame_hdr_size + 3 * Dwarf.eh_frame_hdr_entry_size, testSection(out, ".eh_frame_hdr").?.size);
 
     // Set up the way std.debug.SelfInfo does from PT_GNU_EH_FRAME.
@@ -2280,6 +2288,35 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
             try std.testing.expectEqual(0x2222, try unwinder.next(gpa, &rules));
             try std.testing.expectEqual(at(&stack, 4), unwinder.cpu_state.gprs.get(.rsp));
             try std.testing.expectEqual(c.new_rbp, unwinder.cpu_state.gprs.get(.rbp));
+        }
+        // g's saved registers, each from the end of its push: below the
+        // saved rbp, rbx, r13, then r15.
+        var g_stack: [6]u64 = .{ 0xf15, 0xf13, 0xfb, 0x1111, 0x2222, 0 };
+        const g_cases = [_]struct { pc: u64, rbx: u64, r13: u64, r15: u64 }{
+            .{ .pc = g + 4, .rbx = 0xb, .r13 = 0x13, .r15 = 0x15 },
+            .{ .pc = g + 5, .rbx = 0xfb, .r13 = 0x13, .r15 = 0x15 },
+            .{ .pc = g + 6, .rbx = 0xfb, .r13 = 0x13, .r15 = 0x15 },
+            .{ .pc = g + 7, .rbx = 0xfb, .r13 = 0xf13, .r15 = 0x15 },
+            .{ .pc = g + 9, .rbx = 0xfb, .r13 = 0xf13, .r15 = 0xf15 },
+            .{ .pc = g + code.len - 1, .rbx = 0xfb, .r13 = 0xf13, .r15 = 0xf15 },
+        };
+        for (g_cases) |c| {
+            var ctx: std.debug.cpu_context.Native = .{ .gprs = .initFill(0) };
+            ctx.gprs.set(.rip, c.pc);
+            ctx.gprs.set(.rsp, at(&g_stack, 0));
+            ctx.gprs.set(.rbp, at(&g_stack, 3));
+            ctx.gprs.set(.rbx, 0xb);
+            ctx.gprs.set(.r13, 0x13);
+            ctx.gprs.set(.r15, 0x15);
+            var unwinder: std.debug.Dwarf.SelfUnwinder = .init(&ctx);
+            defer unwinder.deinit();
+            const rules = try unwinder.computeRules(gpa, &unwind, 0, null);
+            try std.testing.expectEqual(0x2222, try unwinder.next(gpa, &rules));
+            try std.testing.expectEqual(at(&g_stack, 5), unwinder.cpu_state.gprs.get(.rsp));
+            try std.testing.expectEqual(0x1111, unwinder.cpu_state.gprs.get(.rbp));
+            try std.testing.expectEqual(c.rbx, unwinder.cpu_state.gprs.get(.rbx));
+            try std.testing.expectEqual(c.r13, unwinder.cpu_state.gprs.get(.r13));
+            try std.testing.expectEqual(c.r15, unwinder.cpu_state.gprs.get(.r15));
         }
         // The outermost frame ends the stack: no return address.
         for ([_]u64{ start, start + 1, start + code.len - 1 }) |pc| {

@@ -29,8 +29,9 @@ info_size: u64 = 0,
 ranges_size: u64 = 0,
 line_size: u64 = 0,
 aranges_size: u64 = 0,
-/// FDEs, one per entry with a frame.
+/// FDEs, one per entry with a frame, and their bytes.
 n_frames: u32 = 0,
+frame_bytes: u64 = 0,
 rnglists_header: [rnglists_header_len]u8 = undefined,
 /// Owns the units, their files, and their headers.
 arena: std.heap.ArenaAllocator.State = .{},
@@ -132,7 +133,9 @@ pub fn place(gpa: Allocator, chunks: []Chunk, comp_dir: []const u8, text_addr: u
     var n_chunk_files: usize = 0;
     for (chunks) |*c| {
         c.frame_base = d.n_frames;
+        c.frame_off = d.frame_bytes;
         d.n_frames += c.n_frames;
+        d.frame_bytes += c.frame_bytes;
         n_chunk_files += c.files.count();
     }
     const file_map = try arena.alloc(u32, n_chunk_files);
@@ -600,8 +603,9 @@ pub const chunk_len = 2048;
 /// One `chunk_len` run of consecutive debug entries.
 pub const Chunk = struct {
     // Filled in by `layOutChunk`.
-    /// Entries with a `frame` other than `none`.
+    /// Entries whose atom's `unwind` is not `none`, and their FDEs' bytes.
     n_frames: u32,
+    frame_bytes: u32,
     /// Source files of the chunk's entries, each with its entry's unit, in
     /// first-use order; `file_of` indexes it.
     files: std.ArrayHashMapUnmanaged(FileKey, void, FileKey.Context, true),
@@ -609,12 +613,13 @@ pub const Chunk = struct {
     /// part of each.
     units: std.StringArrayHashMapUnmanaged(UnitPart),
     // Filled in by `place`.
-    /// Entries with a frame in the chunks before this one.
+    /// FDEs in the chunks before this one, and their bytes.
     frame_base: u32,
+    frame_off: u64,
     /// Index of each of `files` in its unit's file table.
     file_map: []u32,
 
-    pub const empty: Chunk = .{ .n_frames = 0, .files = .empty, .units = .empty, .frame_base = 0, .file_map = &.{} };
+    pub const empty: Chunk = .{ .n_frames = 0, .frame_bytes = 0, .files = .empty, .units = .empty, .frame_base = 0, .frame_off = 0, .file_map = &.{} };
 
     pub fn deinit(c: *Chunk, gpa: Allocator) void {
         c.files.deinit(gpa);
@@ -685,6 +690,7 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
     const end = @min(l.n_debug, begin + chunk_len);
     const c = &l.debug_chunks[chunk];
     c.n_frames = 0;
+    c.frame_bytes = 0;
     // Functions from one file, or one unit, usually share its path's bytes,
     // so tables by address save hashing the path for most entries.
     var files_by_addr: ByAddr = .{};
@@ -720,10 +726,14 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
         }
         file_of.* = file | unit << file_bits;
         const part = units.part;
-        part.info_len += subprogramSize(d, l.input.atom(atom).name);
+        const a = l.input.atom(atom);
+        part.info_len += subprogramSize(d, a.name);
         part.line_len += sequenceSize(d);
         part.n_runs += @intFromBool(units.new_run);
-        c.n_frames += @intFromBool(d.frame != .none);
+        if (a.unwind.kind != .none) {
+            c.n_frames += 1;
+            c.frame_bytes += fdeSize(a.unwind);
+        }
     }
 }
 
@@ -900,10 +910,10 @@ pub const ChunkWriter = struct {
 };
 
 // Call frame information (.eh_frame and .eh_frame_hdr, x86_64). Every
-// function with a frame (`Atom.Debug.Frame` other than `none`) gets one FDE
-// of `fde_size` bytes,
-// all sharing the CIE at the start of .eh_frame, so the linker places
-// them by count alone.
+// function with a frame (`Atom.unwind` other than `none`) gets one FDE,
+// all sharing the CIE at the start of .eh_frame. An FDE's size depends on
+// its unwind record alone (`fdeSize`), so the layout pass sizes each
+// chunk's FDEs and the linker places them before writing any.
 
 /// The CIE at offset 0 of .eh_frame: augmentation "zR" with pc-relative
 /// sdata4 FDE pointers, code alignment 1, data alignment -8, and return
@@ -926,17 +936,31 @@ pub const cie = [_]u8{
 };
 // zig fmt: on
 
+/// The size of an FDE with up to two saved registers, and the largest.
 pub const fde_size = 32;
+pub const max_fde_size = 40;
 
-/// An FDE for the frame-pointer prologue `push rbp; mov rbp, rsp`: after
-/// the 1-byte push, the CFA is rsp + 16 with rbp saved at CFA - 16; after
-/// the 3-byte mov, the CFA is rbp + 16 for the rest of the function. The
-/// one instruction between an epilogue's `pop rbp` and its `ret` is not
-/// described: CodeGen may return from several places, and the FDE has a
-/// fixed size.
+/// The size of the FDE of a function whose `unwind` is not `none`: the
+/// frame-pointer program and 3 bytes per saved register, padded to 8.
+pub fn fdeSize(u: Atom.Unwind) u32 {
+    const n: u32 = if (u.kind == .frame_pointer) @popCount(u.saved & Atom.Unwind.savedBits(.x86_64)) else 0;
+    return std.mem.alignForward(u32, @as(u32, frame_pointer_program.len) + 3 * n, 8);
+}
+
+/// The x86_64 callee-saved registers of `Atom.Unwind.saved`, in push
+/// order: DWARF register number and push length.
+const saved_regs = [_]struct { dwarf: u8, push_len: u8 }{ .{ .dwarf = 3, .push_len = 1 }, .{ .dwarf = 12, .push_len = 2 }, .{ .dwarf = 13, .push_len = 2 }, .{ .dwarf = 14, .push_len = 2 }, .{ .dwarf = 15, .push_len = 2 } };
+
+/// An FDE for the frame-pointer prologue `push rbp; mov rbp, rsp`, up to
+/// its saved registers: after the 1-byte push, the CFA is rsp + 16 with
+/// rbp saved at CFA - 16; after the 3-byte mov, the CFA is rbp + 16 for
+/// the rest of the function. `writeFde` adds the saved registers, each
+/// from the end of its push. The one instruction between an epilogue's
+/// `pop rbp` and its `ret` is not described: CodeGen may return from
+/// several places.
 // zig fmt: off
-const fde_template = [_]u8{
-    28, 0, 0, 0, // length
+const frame_pointer_program = [_]u8{
+    0, 0, 0, 0, // length
     0, 0, 0, 0, // CIE pointer
     0, 0, 0, 0, // pc_begin
     0, 0, 0, 0, // pc_range
@@ -946,32 +970,61 @@ const fde_template = [_]u8{
     DW.CFA.offset + 6, 2, // rbp at CFA - 16
     DW.CFA.advance_loc + 3,
     DW.CFA.def_cfa_register, 6, // CFA = rbp + 16
-} ++ @as([7]u8, @splat(DW.CFA.nop));
+};
 
 /// An FDE for the outermost frame, such as `_start`'s: the CIE's CFA of
 /// rsp + 8, and no return address (rip undefined), which tells unwinders
 /// that the stack ends here.
-const outermost_fde_template = fde_template[0..17].* ++ [_]u8{
+const outermost_program = frame_pointer_program[0..17].* ++ [_]u8{
     DW.CFA.undefined, 16, // rip undefined
-} ++ @as([13]u8, @splat(DW.CFA.nop));
+};
 // zig fmt: on
 
-comptime {
-    std.debug.assert(cie.len % 8 == 0 and fde_template.len == fde_size and outermost_fde_template.len == fde_size);
+/// Whole FDEs, up to their pointers and range, for the common cases.
+const frame_pointer_fde = fdeTemplate(&frame_pointer_program);
+const outermost_fde = fdeTemplate(&outermost_program);
+
+fn fdeTemplate(comptime program: []const u8) [fde_size]u8 {
+    var out: [fde_size]u8 = @splat(DW.CFA.nop);
+    out[0..program.len].* = program[0..program.len].*;
+    std.mem.writeInt(u32, out[0..4], fde_size - 4, .little);
+    return out;
 }
 
-/// Writes the FDE at offset `fde_off` of .eh_frame, for the `size`-byte
-/// function `pc_rel` bytes after the FDE's pc_begin field, with a
-/// `frame` other than `none`.
-pub fn writeFde(out: *[fde_size]u8, frame: Atom.Debug.Frame, fde_off: u32, pc_rel: i32, size: u32) void {
-    out.* = switch (frame) {
+comptime {
+    std.debug.assert(cie.len % 8 == 0 and fdeSize(.frame_pointer) == fde_size and outermost_program.len <= fde_size);
+    std.debug.assert(fdeSize(.{ .kind = .frame_pointer, .saved = 0x1f }) == max_fde_size);
+}
+
+/// Writes the FDE at offset `fde_off` of .eh_frame, `fdeSize(u)` bytes of
+/// `out`, for the `size`-byte function `pc_rel` bytes after the FDE's
+/// pc_begin field, whose `unwind` is `u`, not `none`.
+pub fn writeFde(out: []u8, u: Atom.Unwind, fde_off: u32, pc_rel: i32, size: u32) void {
+    switch (u.kind) {
         .none => unreachable,
-        .frame_pointer => fde_template,
-        .outermost => outermost_fde_template,
-    };
+        .outermost => out[0..fde_size].* = outermost_fde,
+        .frame_pointer => if (u.saved == 0) {
+            out[0..fde_size].* = frame_pointer_fde;
+        } else writeSaved(out, u.saved),
+    }
     std.mem.writeInt(u32, out[4..8], fde_off + 4, .little);
     std.mem.writeInt(i32, out[8..12], pc_rel, .little);
     std.mem.writeInt(u32, out[12..16], size, .little);
+}
+
+/// The frame-pointer FDE's program with the `saved` registers, each at
+/// CFA - 24 - 8k for the k-th pushed, from the end of its push.
+noinline fn writeSaved(out: []u8, saved: u16) void {
+    out[0..frame_pointer_program.len].* = frame_pointer_program;
+    var at: usize = frame_pointer_program.len;
+    var k: u8 = 0;
+    for (saved_regs, 0..) |r, bit| if (saved >> @intCast(bit) & 1 != 0) {
+        out[at..][0..3].* = .{ DW.CFA.advance_loc + r.push_len, DW.CFA.offset + r.dwarf, 3 + k };
+        at += 3;
+        k += 1;
+    };
+    @memset(out[at..], DW.CFA.nop);
+    std.mem.writeInt(u32, out[0..4], @intCast(out.len - 4), .little);
 }
 
 /// .eh_frame_hdr up to its search table: pointers are pc-relative or, in

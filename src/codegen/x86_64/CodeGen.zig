@@ -238,7 +238,6 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .name = ip.stringSlice(nav.name),
         .base_line = file.zir.getDeclaration(nav.zir_inst).src_line,
         .lines = try arena.dupe(u8, cg.e.lines.bytes.items),
-        .frame = if (cg.outermost_frame) .outermost else if (naked) .none else .frame_pointer,
         .unit = try std.fs.path.join(arena, &.{ module.root_dir, module.root_file }),
         .files = files.items,
         .inlines = try arena.dupe(Atom.Debug.Inline, cg.dbg_inlines.items),
@@ -255,6 +254,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .bytes = try arena.dupe(u8, cg.e.code.items),
         .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
+        // `cg.saved` has `Atom.Unwind.saved`'s x86_64 bits: the prologue
+        // pushes `alloc_regs`' callee-saved ones in that order.
+        .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else .{ .kind = .frame_pointer, .saved = @intCast(cg.saved) },
     }, debug);
 }
 

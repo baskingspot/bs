@@ -153,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
         const in = try m.linkInput(gpa);
         var files: [512][]const u8 = undefined;
         for (files[0..m.fileCount()], 0..) |*f, j| f.* = m.file(@intCast(j));
-        const input = try p.linkAtoms(gpa, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files[0..m.fileCount()] });
+        const input = try p.linkAtoms(gpa, .x86_64, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files[0..m.fileCount()] });
         defer input.deinit(gpa);
         const t1 = now(io);
         const out = try Elf.emitInput(gpa, io, input, parallel);
@@ -184,7 +184,7 @@ pub fn main(init: std.process.Init) !void {
         var new_debug: std.ArrayList(Atom.Debug) = .empty;
         defer new_debug.deinit(gpa);
         for (old_refs, new_atoms, 0..) |r, *a, k| {
-            const d = try p.decode(r);
+            const d = try p.decode(r, .x86_64);
             a.* = d.atom;
             if (d.debug) |dbg| {
                 var e = dbg;
@@ -335,7 +335,7 @@ fn relinkOnce(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, entry: Atom.SymbolKey
     const in = try m.linkInput(gpa);
     var names: [512][]const u8 = undefined;
     for (names[0..m.fileCount()], 0..) |*f, i| f.* = m.file(@intCast(i));
-    const input = try p.linkAtoms(gpa, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = names[0..m.fileCount()] });
+    const input = try p.linkAtoms(gpa, .x86_64, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = names[0..m.fileCount()] });
     defer input.deinit(gpa);
     var values: [n_errors]Elf.NumberedValue = undefined;
     for (&values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };
@@ -538,7 +538,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                 var relink: Stats = .{};
                 for (0..5) |_| {
                     const t0 = now(io);
-                    const input = try p.linkAtoms(gpa, refs, debug_atoms.items, null);
+                    const input = try p.linkAtoms(gpa, .x86_64, refs, debug_atoms.items, null);
                     defer input.deinit(gpa);
                     const t1 = now(io);
                     const out = try Elf.emitInput(gpa, io, input, options);
@@ -579,7 +579,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                 for (keys[0]) |key| {
                     const e = (try st.get(gpa, io, key)).?;
                     if (!e.isValid(1, AllValid{ .deps = dep_list })) @panic("invalid entry");
-                    _ = try e.decodeAtoms(entry_atoms[0..e.atomCount()], &entry_debug);
+                    _ = try e.decodeAtoms(.x86_64, entry_atoms[0..e.atomCount()], &entry_debug);
                 }
                 const t2 = now(io);
                 for (keys[2]) |key| if (try st.get(gpa, io, key) != null) @panic("unexpected hit");
@@ -704,8 +704,8 @@ fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.Symbo
             line += rand.intRangeAtMost(u32, 1, 3);
         }
         const name = names[i];
-        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i % files.len], .name = name[std.mem.lastIndexOfScalar(u8, name, ':').? + 1 ..], .base_line = rand.uintLessThan(u32, 5000), .lines = lines.bytes.items, .frame = .frame_pointer });
-        try atoms.append(arena, .{ .key = keys[i], .name = name, .section = .text, .alignment = .@"16", .bytes = bytes, .targets = try arena.dupe(Atom.SymbolKey, targets.keys()), .relocs = relocs.items });
+        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i % files.len], .name = name[std.mem.lastIndexOfScalar(u8, name, ':').? + 1 ..], .base_line = rand.uintLessThan(u32, 5000), .lines = lines.bytes.items });
+        try atoms.append(arena, .{ .key = keys[i], .name = name, .section = .text, .alignment = .@"16", .bytes = bytes, .targets = try arena.dupe(Atom.SymbolKey, targets.keys()), .relocs = relocs.items, .unwind = .frame_pointer });
     }
     for (0..n_rodata) |i| {
         const bytes = try arena.alloc(u8, rand.intRangeAtMost(u32, 8, 128));

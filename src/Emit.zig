@@ -751,8 +751,8 @@ test "a relink in the manifest's order reproduces the fresh link, with mixed ali
         const bytes = try arena.alloc(u8, 5 + i % 37);
         @memset(bytes, 0x90);
         const target = constants[i % constants.len].key;
-        try debug.append(gpa, .{ .atom = @intCast(atoms.items.len), .file = "t.zig", .name = name, .base_line = @intCast(i), .lines = &.{}, .frame = .frame_pointer });
-        try atoms.append(gpa, .{ .key = .fromName(name), .name = name, .section = .text, .alignment = alignments[i % 3], .bytes = bytes, .targets = try arena.dupe(SymbolKey, &.{target}), .relocs = &.{.init(1, .x86_64_pc32, 0, -4)} });
+        try debug.append(gpa, .{ .atom = @intCast(atoms.items.len), .file = "t.zig", .name = name, .base_line = @intCast(i), .lines = &.{} });
+        try atoms.append(gpa, .{ .key = .fromName(name), .name = name, .section = .text, .alignment = alignments[i % 3], .bytes = bytes, .targets = try arena.dupe(SymbolKey, &.{target}), .relocs = &.{.init(1, .x86_64_pc32, 0, -4)}, .unwind = .frame_pointer });
         try owners.append(gpa, .{ .unit = unit });
         if (i % 7 == 0) {
             try atoms.append(gpa, constants[i % constants.len]);
@@ -822,7 +822,7 @@ test "a relink in the manifest's order reproduces the fresh link, with mixed ali
     var m = (try cache.Manifest.open(gpa, io, tmp.dir)).?;
     defer m.close(gpa, io);
     const in = try m.linkInput(gpa);
-    const input = try pack.linkAtoms(gpa, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = &.{m.file(0)} });
+    const input = try pack.linkAtoms(gpa, .x86_64, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = &.{m.file(0)} });
     defer input.deinit(gpa);
     const relinked = try Elf.emitInput(gpa, io, input, .{
         .entry = start,

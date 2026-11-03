@@ -31,6 +31,10 @@ zero_fill: u64 = 0,
 targets: []const SymbolKey = &.{},
 /// Sorted by offset. Must be empty for `.bss` and `.tbss`.
 relocs: []const Reloc = &.{},
+/// How the function's frame unwinds, from which the linkers write call
+/// frame information. It describes the code, not its debug info, so it is
+/// the atom's. Data atoms and naked functions keep `.none`.
+unwind: Unwind = .none,
 /// 128-bit stable identity of a symbol. Derived from the unit key for
 /// declarations (`fromName`) and from the contents for anonymous constants
 /// (`fromContents`), never from in-memory indices. Two atoms with the same key
@@ -226,9 +230,6 @@ pub const Debug = struct {
     /// special-opcode parameters of `LineProgram`; the linker wraps it in a
     /// sequence and copies it, rewriting only the operands at `patches`.
     lines: []const u8,
-    /// How the function's frame unwinds; the linker writes call frame
-    /// information (an FDE) from it.
-    frame: Frame,
     /// The compile unit: the path of the module's root source file, with
     /// `file`'s path rules. Each distinct unit is one unit of the output,
     /// named after the file's basename in the file's directory, as
@@ -297,19 +298,57 @@ pub const Debug = struct {
     pub fn inlineName(d: *const Debug, inl: Inline) []const u8 {
         return d.inline_names[inl.name_off..][0..inl.name_len];
     }
+};
 
-    pub const Frame = enum(u8) {
-        /// No unwind info, as for naked functions.
+/// A function's unwind information (see `Atom.unwind`).
+pub const Unwind = extern struct {
+    kind: Kind,
+    /// The callee-saved registers the prologue saves, with `frame_pointer`
+    /// only; the bits and the prologue are each architecture's (see
+    /// `savedBits`):
+    /// - x86_64: rbx 0x1, r12 0x2, r13 0x4, r14 0x8, r15 0x10, pushed in
+    ///   that order right after `push rbp; mov rbp, rsp`, the k-th pushed
+    ///   at CFA - 24 - 8k (rbx's push is 1 byte, the others' 2);
+    /// - aarch64: compact unwind's register pairs, x19/x20 0x1 through
+    ///   x27/x28 0x10 and d8/d9 0x100 through d14/d15 0x800.
+    saved: u16 = 0,
+    /// Reserved for aarch64's frameless leaves, in 16-byte units; 0.
+    stack_size: u16 = 0,
+
+    pub const none: Unwind = .{ .kind = .none };
+    pub const frame_pointer: Unwind = .{ .kind = .frame_pointer };
+    pub const outermost: Unwind = .{ .kind = .outermost };
+
+    pub const Kind = enum(u8) {
+        /// No unwind info, as for naked functions and data.
         none,
         /// The target's frame-pointer prologue at the start of the code
-        /// (x86_64: `push rbp; mov rbp, rsp`), after which the frame is
-        /// addressed from the frame pointer until the epilogue.
+        /// (x86_64: `push rbp; mov rbp, rsp`), then the `saved` registers'
+        /// saves, after which the frame is addressed from the frame
+        /// pointer until the epilogue.
         frame_pointer,
         /// The outermost frame, such as std.start's `_start`: unwinding
         /// stops here (x86_64: return address undefined, as for
         /// `.cfi_undefined rip`).
         outermost,
     };
+
+    pub const Arch = enum { x86_64, aarch64 };
+
+    /// The `saved` bits `arch` defines.
+    pub fn savedBits(arch: Arch) u16 {
+        return switch (arch) {
+            .x86_64 => 0x1f,
+            .aarch64 => 0x0f1f,
+        };
+    }
+
+    /// Whether `u` is one `arch` can describe: saved registers only with
+    /// a frame pointer, and only `arch`'s.
+    pub fn valid(u: Unwind, arch: Arch) bool {
+        if (u.saved & ~savedBits(arch) != 0) return false;
+        return u.saved == 0 or u.kind == .frame_pointer;
+    }
 };
 
 /// Builds `Debug.lines` from rows in increasing code offset.

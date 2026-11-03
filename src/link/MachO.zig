@@ -968,13 +968,14 @@ const UnwindPage = struct { count: u32, off: u64, first: u32 };
 
 /// The compact unwind encoding of a frame. `frame_pointer` is the
 /// prologue `stp x29, x30, [sp, #-16]!; mov x29, sp`, which leaves x29
-/// pointing at the saved x29 and x30: UNWIND_ARM64_MODE_FRAME with no other
-/// saved registers. The others have none (0), so unwinders fall back to
-/// the frame chain; dyld calls `main`, so no frame of the executable's is
-/// the outermost one.
-fn unwindEncoding(frame: Atom.Debug.Frame) u32 {
-    return switch (frame) {
-        .frame_pointer => 0x0400_0000,
+/// pointing at the saved x29 and x30: UNWIND_ARM64_MODE_FRAME, with the
+/// saved register pairs' bits, which `Atom.Unwind.saved` holds as compact
+/// unwind defines them. The others have none (0), so unwinders fall back
+/// to the frame chain; dyld calls `main`, so no frame of the executable's
+/// is the outermost one.
+fn unwindEncoding(u: Atom.Unwind) u32 {
+    return switch (u.kind) {
+        .frame_pointer => 0x0400_0000 | @as(u32, u.saved & Atom.Unwind.savedBits(.aarch64)),
         .none, .outermost => 0,
     };
 }
@@ -1494,13 +1495,13 @@ fn LinkOf(comptime Input: type) type {
                 const debug = input.debug(j);
                 const d = Elf.ref(&debug);
                 const atom = input.debugAtom(j);
-                const e = unwindEncoding(d.frame);
+                const a = input.atom(atom);
+                const e = unwindEncoding(Elf.ref(&a).unwind);
                 const continues = n > 0 and !l.textBetween(prev_atom, atom);
                 prev_atom = atom;
                 var start: u32 = 0;
                 if (write) {
                     const addr = l.atomAddr(atom);
-                    const a = input.atom(atom);
                     const size = a.bytes.len;
                     if (l.has_dsym) w.entry(d, a.name, addr, size, file_of);
                     start = @intCast(addr - base_address);
@@ -2336,8 +2337,8 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
         }
         try e.finish();
         const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
-        const atom: Atom = .{ .key = fkey("f", i), .name = name, .section = .text, .alignment = if (i % 3 == 0) .@"16" else .@"4", .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items };
-        const entry: Atom.Debug = .{ .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = lines.bytes.items, .frame = if (naked(i)) .none else .frame_pointer, .unit = units[i / 300 % units.len] };
+        const atom: Atom = .{ .key = fkey("f", i), .name = name, .section = .text, .alignment = if (i % 3 == 0) .@"16" else .@"4", .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items, .unwind = if (naked(i)) .none else .frame_pointer };
+        const entry: Atom.Debug = .{ .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = lines.bytes.items, .unit = units[i / 300 % units.len] };
         try debug.append(arena, d: {
             var d = entry;
             d.atom = @intCast(atoms.items.len);

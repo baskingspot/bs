@@ -1017,8 +1017,10 @@ link-time value is ever needed in code. The link thread adds the kind.
 - **CFI and unwinding.** Frame pointers stay in every function that is
   not naked, so std.debug's frame-pointer walk and every debugger keep
   working. Saved callee-saved registers need more than today's
-  `Atom.Debug.Frame` can say, so the function's unwind information
-  becomes a small record: frame kind (none, frame pointer, outermost), a
+  `Atom.Debug.Frame` could say, so the function's unwind information
+  became a small record (built 2026-11-03: `Atom.unwind`, an
+  `Atom.Unwind` of `kind`, `saved`, and `stack_size`; Mach-O ORs `saved`
+  into UNWIND_ARM64_MODE_FRAME): frame kind (none, frame pointer, outermost), a
   stack size (u16, in 16-byte units, reserved now for aarch64's
   FRAMELESS leaves, `0x02000000 | size / 16 << 12`, which may come
   later), and a saved-register mask whose bits and layout each architecture fixes
@@ -1478,17 +1480,23 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
 - Call frame information: std.debug unwinds x86_64-linux stacks with DWARF
   CFI (frame-pointer walking counts as unsafe there and is used only for
   panics), looking first for PT_GNU_EH_FRAME. So each `Debug` entry whose
-  `frame` is `.frame_pointer` or `.outermost` gets a fixed 32-byte FDE.
+  atom's `unwind` (`Atom.Unwind`) is `.frame_pointer` or `.outermost`
+  gets an FDE: 32 bytes, or 40 for a function that saves more than two
+  registers.
   `.outermost` (std.start's `_start`, `.cfi_undefined rip`) keeps the
   CIE's CFA of rsp+8 and marks rip undefined, which ends std.debug's
   unwind (SelfUnwinder returns 0). `.frame_pointer` describes CodeGen's
   `push rbp; mov rbp, rsp` prologue (CFA rsp+8, then rsp+16 with rbp at
-  CFA-16, then rbp+16), all sharing one CIE in an allocated .eh_frame, and
-  an entry in .eh_frame_hdr's sorted search table; naked functions
-  (`.none`) get none. Both sections are sized for every entry before the
-  entries are read, so they need no pass before section placement, and
-  the FDEs are written by the same chunked debug tasks as the rest; the
-  room of skipped entries stays zero after each section. Not described:
+  CFA-16, then rbp+16), then the callee-saved registers it pushes
+  (`Unwind.saved`: rbx, r12–r15, in that order), each with a
+  `DW_CFA_offset` at CFA − 24 − 8k from the end of its push, so every
+  instruction of the prologue unwinds right; all share one CIE in an
+  allocated .eh_frame, with an entry each in .eh_frame_hdr's sorted
+  search table; naked functions (`.none`) get none. Both sections are
+  sized for every entry, at the largest FDE, before the entries are read,
+  so they need no pass before section placement; the debug layout pass
+  sizes each chunk's FDEs, and the same chunked debug tasks as the rest
+  write them; the room FDEs do not use stays zero after each section. Not described:
   the `ret` after each epilogue's `pop rbp` (CodeGen returns from several
   places; gdb's epilogue sniffer covers it), functions without `Debug`
   (runtime helpers), and naked functions other than an outermost one.
@@ -1595,7 +1603,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   the dSYM costs about 1.1 ms. Under callgrind on the orb, stripped emits
   cost 0.05% more instructions outside SHA-256 (464.5M → 464.8M), from
   code layout. A leaf function that keeps lr in its register and needs no
-  frame should get a frameless `Atom.Debug.Frame` kind, encoded
+  frame should get a frameless `Atom.Unwind` kind, encoded
   UNWIND_ARM64_MODE_FRAMELESS (0x02000000 with no stack), as clang does,
   so that unwinders step through a fault in a leaf. It comes with the
   aarch64 CodeGen, which knows which functions those are; until then

@@ -47,9 +47,12 @@ const Header = extern struct {
     /// `std.mem.Alignment` as log2 bytes.
     alignment: u8,
     has_debug: bool,
-    /// `Atom.Debug.Frame`, if `has_debug`.
-    debug_frame: u8,
-    unused: [16]u8 = @splat(0),
+    /// `Atom.unwind`, for every atom: its kind (`Atom.Unwind.Kind`, checked
+    /// when decoding), saved registers, and stack size.
+    unwind_kind: u8,
+    unwind_saved: u16,
+    unwind_stack_size: u16,
+    unused: [12]u8 = @splat(0),
 };
 
 const DebugHeader = extern struct {
@@ -151,7 +154,9 @@ pub fn encode(atom: *const Atom, debug: ?*const Atom.Debug, out: []u8) void {
         .section = @backingInt(atom.section),
         .alignment = @backingInt(atom.alignment),
         .has_debug = debug != null,
-        .debug_frame = if (debug) |d| @backingInt(d.frame) else 0,
+        .unwind_kind = @backingInt(atom.unwind.kind),
+        .unwind_saved = atom.unwind.saved,
+        .unwind_stack_size = atom.unwind.stack_size,
     };
     var w: std.Io.Writer = .fixed(out);
     w.writeAll(std.mem.asBytes(&header)) catch unreachable;
@@ -184,18 +189,20 @@ pub const Decoded = struct {
 
 /// Checks the record at the start of `bytes`, which must be
 /// `alignment`-aligned, and returns its length, or null if it is
-/// malformed: its lengths overrun it or `bytes`, or an enum field is out of
-/// range. A record that passes can be read with `view`.
-pub fn check(bytes: []align(alignment) const u8) ?usize {
+/// malformed: its lengths overrun it or `bytes`, an enum field is out of
+/// range, or its unwind record is not one `arch` can describe. A record
+/// that passes can be read with `view`.
+pub fn check(bytes: []align(alignment) const u8, arch: Atom.Unwind.Arch) ?usize {
     if (bytes.len < @sizeOf(Header)) return null;
     const h: *const Header = @ptrCast(bytes.ptr);
     if (h.len > bytes.len or h.len % alignment != 0) return null;
     if (std.enums.fromInt(Atom.Section, h.section) == null) return null;
     if (h.alignment > std.math.maxInt(std.math.Log2Int(usize))) return null;
+    const kind = std.enums.fromInt(Atom.Unwind.Kind, h.unwind_kind) orelse return null;
+    if (!Atom.Unwind.valid(.{ .kind = kind, .saved = h.unwind_saved, .stack_size = h.unwind_stack_size }, arch)) return null;
     var end: usize = @sizeOf(Header) + 16 * @as(usize, h.targets_len) + @sizeOf(Atom.Reloc) * @as(usize, h.relocs_len);
     end += @as(usize, h.bytes_len) + h.name_len;
     if (h.has_debug) {
-        if (std.enums.fromInt(Atom.Debug.Frame, h.debug_frame) == null) return null;
         const dh_off = end - h.bytes_len - h.name_len;
         if (dh_off + @sizeOf(DebugHeader) > h.len) return null;
         const dh = std.mem.bytesToValue(DebugHeader, bytes[dh_off..][0..@sizeOf(DebugHeader)]);
@@ -278,7 +285,6 @@ pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug
             .name = debug_name,
             .base_line = dh.base_line,
             .lines = lines,
-            .frame = @fromBackingInt(@intCast(h.debug_frame)),
             .unit = unit,
             .files = files,
             .inlines = inlines[0..dh.inlines_len],
@@ -296,13 +302,15 @@ pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug
         .zero_fill = @as(u64, h.zero_fill_hi) << 32 | h.zero_fill_lo,
         .targets = targets[0..h.targets_len],
         .relocs = relocs[0..h.relocs_len],
+        .unwind = .{ .kind = @fromBackingInt(h.unwind_kind), .saved = h.unwind_saved, .stack_size = h.unwind_stack_size },
     }, .debug = debug };
 }
 
 /// Decodes the record at the start of `bytes`, which must be
-/// `alignment`-aligned. The slices point into `bytes`.
-pub fn decode(bytes: []align(alignment) const u8) DecodeError!Decoded {
-    const len = check(bytes) orelse return error.CorruptAtom;
+/// `alignment`-aligned, with `arch`'s unwind records. The slices point
+/// into `bytes`.
+pub fn decode(bytes: []align(alignment) const u8, arch: Atom.Unwind.Arch) DecodeError!Decoded {
+    const len = check(bytes, arch) orelse return error.CorruptAtom;
     const v = view(bytes.ptr);
     return .{ .atom = v.atom, .debug = v.debug, .len = len };
 }
@@ -317,6 +325,7 @@ pub fn expectEqualAtoms(expected: Atom, actual: Atom) !void {
     try t.expectEqual(expected.zero_fill, actual.zero_fill);
     try t.expectEqualSlices(Atom.SymbolKey, expected.targets, actual.targets);
     try t.expectEqualSlices(u8, @ptrCast(expected.relocs), @ptrCast(actual.relocs));
+    try t.expectEqual(expected.unwind, actual.unwind);
 }
 
 /// Compares debug info, ignoring `atom`.
@@ -329,7 +338,6 @@ pub fn expectEqualDebug(expected: ?*const Atom.Debug, actual: ?*const Atom.Debug
         try t.expectEqualStrings(e.name, a.name);
         try t.expectEqual(e.base_line, a.base_line);
         try t.expectEqualSlices(u8, e.lines, a.lines);
-        try t.expectEqual(e.frame, a.frame);
         try t.expectEqualStrings(e.unit, a.unit);
         try t.expectEqualSlices(u8, e.files, a.files);
         try t.expectEqualSlices(u8, @ptrCast(e.inlines), @ptrCast(a.inlines));
@@ -351,6 +359,7 @@ test "atoms round-trip through records" {
             .bytes = &.{ 0xe8, 0, 0, 0, 0, 0xc3 },
             .targets = &.{callee},
             .relocs = &.{.init(1, .x86_64_pc32, 0, -4)},
+            .unwind = .{ .kind = .frame_pointer, .saved = 0x13 },
         },
         // More than 4 GiB of zero fill: the high half must survive.
         .{ .key = .fromName("big"), .name = "test:big", .section = .bss, .alignment = .@"8", .zero_fill = (5 << 32) + 3 },
@@ -364,7 +373,6 @@ test "atoms round-trip through records" {
             .name = "f",
             .base_line = 41,
             .lines = &.{ 5, 0x13, 0x04, 0x81, 0x80, 0x00, 0x03, 0x81, 0x80, 0x80, 0x80, 0x00 },
-            .frame = .frame_pointer,
             .unit = "src/main.zig",
             .files = "lib/std/start.zig\x00",
             .inlines = &.{.{ .name_off = 0, .name_len = 8, .file = 1, .base_line = 600, .call_line = 2, .call_column = 4, .low = 1, .high = 5, .parent = Atom.Debug.Inline.none }},
@@ -372,7 +380,7 @@ test "atoms round-trip through records" {
             .inline_callees = &.{.fromName("std.start.callMain")},
             .patches = &.{ 2, 6 },
         },
-        .{ .atom = 2, .file = "src/u.zig", .name = "g", .base_line = 7, .lines = &.{0x14}, .frame = .none },
+        .{ .atom = 2, .file = "src/u.zig", .name = "g", .base_line = 7, .lines = &.{0x14} },
     };
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
@@ -389,24 +397,29 @@ test "atoms round-trip through records" {
     var off: usize = 0;
     cursor = .{ .debug = &debug };
     for (atoms, 0..) |expected, i| {
-        const actual = try decode(@alignCast(copy[off..]));
+        const actual = try decode(@alignCast(copy[off..]), .x86_64);
         try expectEqualAtoms(expected, actual.atom);
         try expectEqualDebug(cursor.of(i), if (actual.debug) |*d| d else null);
         off += actual.len;
     }
     try std.testing.expectEqual(copy.len, off);
     // A truncated record is an error, not an out-of-bounds read.
-    try std.testing.expectError(error.CorruptAtom, decode(copy[0 .. encodedLen(&atoms[0], &debug[0]) - 16]));
-    // So is a bad section, alignment, or frame kind, or debug lengths that
-    // overrun the record (atom 0's debug header is at 64 + 16 + 12).
+    try std.testing.expectError(error.CorruptAtom, decode(copy[0 .. encodedLen(&atoms[0], &debug[0]) - 16], .x86_64));
+    // So is a bad section, alignment, or unwind kind, saved registers the
+    // architecture does not have or with no frame pointer, or debug
+    // lengths that overrun the record (atom 0's debug header is at 64 +
+    // 16 + 12).
     const len0 = encodedLen(&atoms[0], &debug[0]);
-    try std.testing.expectEqual(len0, check(copy));
-    for ([_]struct { usize, u8 }{ .{ 44, 0xff }, .{ 45, 64 }, .{ 47, 0xff }, .{ 92 + 12, 0xff } }) |m| {
+    try std.testing.expectEqual(len0, check(copy, .x86_64));
+    for ([_]struct { usize, u8 }{ .{ 44, 0xff }, .{ 45, 64 }, .{ 47, 3 }, .{ 47, 0 }, .{ 48, 0x33 }, .{ 49, 0x01 }, .{ 92 + 12, 0xff } }) |m| {
         const saved = copy[m[0]];
         copy[m[0]] = m[1];
-        try std.testing.expectEqual(null, check(copy));
+        try std.testing.expectEqual(null, check(copy, .x86_64));
         copy[m[0]] = saved;
     }
+    // d8/d9 is aarch64's.
+    copy[49] = 0x01;
+    try std.testing.expectEqual(len0, check(copy, .aarch64));
 }
 
 test "check rejects inconsistent debug runs" {
@@ -415,7 +428,6 @@ test "check rejects inconsistent debug runs" {
         .name = "f",
         .base_line = 1,
         .lines = &.{ 0x04, 0x81, 0x80, 0x00, 0x03, 0x81, 0x80, 0x80, 0x80, 0x00, 0x13 },
-        .frame = .frame_pointer,
         .files = "u.zig\x00",
         .inlines = &.{
             .{ .name_off = 0, .name_len = 1, .file = 1, .base_line = 3, .call_line = 0, .call_column = 0, .low = 0, .high = 4, .parent = Atom.Debug.Inline.none },

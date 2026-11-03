@@ -53,6 +53,8 @@ lock: Io.File,
 /// entries are shared by every project built by the same zap for the same
 /// target.
 store_seed: Hash,
+/// The target's architecture, whose unwind records cached atoms must have.
+arch: Atom.Unwind.Arch,
 /// Taken before the inputs are read; inputs modified after it are
 /// recorded as needing a rehash.
 build_start: Io.Timestamp,
@@ -110,6 +112,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .dir = dir,
         .lock = lock,
         .store_seed = store_seed,
+        .arch = if (std.mem.startsWith(u8, target, "aarch64")) .aarch64 else .x86_64,
         .build_start = build_start,
         .timing = timing,
     };
@@ -183,7 +186,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     const files = try gpa.alloc([]const u8, m.fileCount());
     defer gpa.free(files);
     for (files, 0..) |*f, i| f.* = m.file(@intCast(i));
-    const input = try pack.linkAtoms(gpa, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
+    const input = try pack.linkAtoms(gpa, inc.arch, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
     defer input.deinit(gpa);
     const values = try gpa.alloc(Elf.NumberedValue, m.errorCount());
     defer gpa.free(values);
@@ -993,7 +996,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
                         h = h *% 31 +% contentsHash(a);
                         rest = rest *% 31 +% cache.hash(@truncate(@backingInt(a.key)), a.name);
                         if (c.debug_of[ai]) |d| {
-                            h +%= cache.hash(@truncate(h), d.lines) +% @backingInt(d.frame);
+                            h +%= cache.hash(@truncate(h), d.lines);
                             rest = rest *% 31 +% d.base_line +% cache.hash(6, d.file) +% cache.hash(7, d.name);
                             rest = rest *% 31 +% cache.hash(8, d.unit);
                             // Inline calls carry their callees' base lines,
@@ -1711,7 +1714,8 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
 /// `Atom.SymbolKey.fromContents`, with a faster hash: results need not be
 /// symbol keys.
 fn contentsHash(a: *const Atom) Hash {
-    var h = cache.hash(@as(u64, @backingInt(a.section)) << 8 | @backingInt(a.alignment), a.bytes);
+    const unwind = @as(u64, @backingInt(a.unwind.kind)) << 32 | @as(u64, a.unwind.saved) << 16 | a.unwind.stack_size;
+    var h = cache.hash(unwind << 16 | @as(u64, @backingInt(a.section)) << 8 | @backingInt(a.alignment), a.bytes);
     h = h *% 31 +% cache.hash(a.zero_fill, @ptrCast(a.relocs));
     return h *% 31 +% cache.hash(a.relocs.len, @ptrCast(a.targets));
 }

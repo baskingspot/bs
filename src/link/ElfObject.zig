@@ -220,8 +220,9 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
         const text_addr = c.image_addr.items[text - 1];
         const bytes = c.contents(eh_k);
         const relas = &c.sections.items[eh_k - 1].relas;
+        // FDEs follow the CIE up to the 0 terminator.
         var off: u64 = Dwarf.cie.len;
-        while (off + Dwarf.fde_size <= eh.size) : (off += Dwarf.fde_size) {
+        while (off + 4 < eh.size) : (off += 4 + std.mem.readInt(u32, bytes[off..][0..4], .little)) {
             const field = off + 8;
             const target = c.image_addr.items[eh_k - 1] + field +% @as(u64, @bitCast(@as(i64, std.mem.readInt(i32, bytes[field..][0..4], .little))));
             try relas.append(arena, .{ .offset = field, .info = .{ .type = @backingInt(elf.R_X86_64.PC32), .sym = @intCast(text) }, .addend = @intCast(target - text_addr) });

@@ -83,7 +83,7 @@ const Header = extern struct {
     result_hash: Hash,
 };
 
-const pack_magic = "ZAPSTP02".*;
+const pack_magic = "ZAPSTP03".*;
 const pack_ext = ".zsp";
 
 const PackHeader = extern struct {
@@ -346,12 +346,13 @@ pub const Entry = struct {
     /// Decodes the entry's atoms into `out`, which has `atomCount()` items,
     /// and their debug info into the start of `debug`, which has as many;
     /// `Debug.atom` is the index in `out`. Returns how many have debug info.
-    pub fn decodeAtoms(e: Entry, out: []Atom, debug: []Atom.Debug) atoms_codec.DecodeError!usize {
+    /// `arch` is the architecture whose unwind records are valid.
+    pub fn decodeAtoms(e: Entry, arch: Atom.Unwind.Arch, out: []Atom, debug: []Atom.Debug) atoms_codec.DecodeError!usize {
         const bytes = e.atomBytes();
         var off: usize = 0;
         var n_debug: usize = 0;
         for (out, 0..) |*a, i| {
-            const d = try atoms_codec.decode(@alignCast(bytes[off..]));
+            const d = try atoms_codec.decode(@alignCast(bytes[off..]), arch);
             a.* = d.atom;
             if (d.debug) |dbg| {
                 debug[n_debug] = dbg;
@@ -896,9 +897,9 @@ test "entries round-trip through packs, are checked, copied forward, merged, and
 
     const atoms = [_]Atom{
         .{ .key = .fromName("c"), .name = "t:c", .section = .rodata, .alignment = .@"8", .bytes = "abcdefgh" },
-        .{ .key = .fromName("f"), .name = "t:f", .section = .text, .bytes = &.{0xc3} },
+        .{ .key = .fromName("f"), .name = "t:f", .section = .text, .bytes = &.{0xc3}, .unwind = .frame_pointer },
     };
-    const debug = [_]Atom.Debug{.{ .atom = 1, .file = "t.zig", .name = "f", .base_line = 3, .lines = &.{1}, .frame = .frame_pointer }};
+    const debug = [_]Atom.Debug{.{ .atom = 1, .file = "t.zig", .name = "f", .base_line = 3, .lines = &.{1} }};
     const deps = [_]Dep{ .{ .key = 1, .result_hash = 10 }, .{ .key = 2, .result_hash = 20 } };
     // Keys 7 and 7 + 2^127 share no fan-out bucket; 8 shares 7's.
     const k2: Key = 7 + (1 << 127);
@@ -924,7 +925,7 @@ test "entries round-trip through packs, are checked, copied forward, merged, and
         var decoded: [2]Atom = undefined;
         var decoded_debug: [2]Atom.Debug = undefined;
         try t.expectEqual(2, entry.atomCount());
-        try t.expectEqual(1, try entry.decodeAtoms(&decoded, &decoded_debug));
+        try t.expectEqual(1, try entry.decodeAtoms(.x86_64, &decoded, &decoded_debug));
         for (atoms, decoded) |e, a| try atoms_codec.expectEqualAtoms(e, a);
         try t.expectEqual(1, decoded_debug[0].atom);
         try atoms_codec.expectEqualDebug(&debug[0], &decoded_debug[0]);
@@ -1127,7 +1128,7 @@ test "a pack written in place reads back like a committed batch" {
     try t.expectEqual(2, e0.resultHash());
     var decoded: [1]Atom = undefined;
     var decoded_debug: [1]Atom.Debug = undefined;
-    _ = try e0.decodeAtoms(&decoded, &decoded_debug);
+    _ = try e0.decodeAtoms(.x86_64, &decoded, &decoded_debug);
     try atoms_codec.expectEqualAtoms(atoms[0], decoded[0]);
     const e1 = (try store.get(gpa, io, 10)).?;
     try t.expectEqual(4, e1.resultHash());

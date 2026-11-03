@@ -65,7 +65,7 @@ pub const AtomRef = extern struct {
     }
 };
 
-const magic = "ZAPPACK2".*;
+const magic = "ZAPPACK3".*;
 
 const Header = extern struct {
     magic: [8]u8 = magic,
@@ -179,9 +179,10 @@ fn record(p: *const Pack, ref: AtomRef) DecodeError![]align(16) const u8 {
     return @alignCast(mem[off..][0..ref.len]);
 }
 
-/// Decodes the record at `ref`. Its slices point into the mapping.
-pub fn decode(p: *const Pack, ref: AtomRef) DecodeError!atoms_codec.Decoded {
-    const d = try atoms_codec.decode(try p.record(ref));
+/// Decodes the record at `ref`, with `arch`'s unwind records. Its slices
+/// point into the mapping.
+pub fn decode(p: *const Pack, ref: AtomRef, arch: Atom.Unwind.Arch) DecodeError!atoms_codec.Decoded {
+    const d = try atoms_codec.decode(try p.record(ref), arch);
     if (d.len != ref.len) return error.CorruptAtom;
     return d;
 }
@@ -196,13 +197,14 @@ pub const DebugFiles = struct {
 /// The atoms at `refs` as the linker's input (`Elf.linkInput`), read in
 /// place from the mapped records: nothing is decoded up front. Valid until
 /// `close`, as mappings replaced by `append` or `compact` stay mapped until
-/// then. Free with `LinkAtoms.deinit`.
-pub fn linkAtoms(p: *const Pack, gpa: Allocator, refs: []const AtomRef, debug_atoms: []const u32, files: ?DebugFiles) !LinkAtoms {
+/// then. `arch` is the architecture whose unwind records `check` accepts.
+/// Free with `LinkAtoms.deinit`.
+pub fn linkAtoms(p: *const Pack, gpa: Allocator, arch: Atom.Unwind.Arch, refs: []const AtomRef, debug_atoms: []const u32, files: ?DebugFiles) !LinkAtoms {
     if (files) |f| std.debug.assert(f.of.len == refs.len);
     const mems = try gpa.alloc([]align(16) const u8, 1 + p.bases.items.len);
     mems[0] = p.map.memory[0..p.len];
     for (mems[1..], p.bases.items) |*m, b| m.* = b.memory;
-    return .{ .mems = mems, .refs = refs, .debug_atoms = debug_atoms, .files = files };
+    return .{ .mems = mems, .arch = arch, .refs = refs, .debug_atoms = debug_atoms, .files = files };
 }
 
 /// The linker's input read from mapped packs (see `linkAtoms`), with the
@@ -211,6 +213,7 @@ pub fn linkAtoms(p: *const Pack, gpa: Allocator, refs: []const AtomRef, debug_at
 pub const LinkAtoms = struct {
     /// Each pack's mapped bytes, by pack index.
     mems: []const []align(16) const u8,
+    arch: Atom.Unwind.Arch,
     refs: []const AtomRef,
     /// The atoms with debug info, ascending (`Manifest.LinkInput`).
     debug_atoms: []const u32,
@@ -238,7 +241,7 @@ pub const LinkAtoms = struct {
         const mem = in.mems[r.pack];
         const off = r.offset();
         if ((r.pack == 0 and off < @sizeOf(Header)) or off > mem.len or r.len > mem.len - off) return false;
-        return atoms_codec.check(@alignCast(mem[off..][0..r.len])) == r.len;
+        return atoms_codec.check(@alignCast(mem[off..][0..r.len]), in.arch) == r.len;
     }
 
     pub inline fn atom(in: LinkAtoms, i: usize) Atom {
@@ -259,7 +262,7 @@ pub const LinkAtoms = struct {
     pub inline fn debug(in: LinkAtoms, j: usize) Atom.Debug {
         const i = in.debug_atoms[j];
         var d = atoms_codec.view(in.rec(i)).debug orelse
-            return .{ .file = "", .name = "", .base_line = 0, .lines = &.{}, .frame = .none };
+            return .{ .file = "", .name = "", .base_line = 0, .lines = &.{} };
         if (in.files) |fs| {
             const f = fs.of[i];
             d.file = if (f < fs.names.len) fs.names[f] else "";
@@ -329,11 +332,11 @@ test "append, reopen, decode, and compact" {
     defer tmp.cleanup();
 
     const atoms = [_]Atom{
-        .{ .key = .fromName("a"), .name = "t:a", .section = .text, .bytes = &.{ 0x90, 0xc3 } },
+        .{ .key = .fromName("a"), .name = "t:a", .section = .text, .bytes = &.{ 0x90, 0xc3 }, .unwind = .{ .kind = .frame_pointer, .saved = 0x5 } },
         .{ .key = .fromName("b"), .name = "t:b", .section = .data, .alignment = .@"8", .bytes = "12345678" },
         .{ .key = .fromName("c"), .name = "t:c", .section = .bss, .zero_fill = 64 },
     };
-    const debug = [_]Atom.Debug{.{ .atom = 0, .file = "t.zig", .name = "a", .base_line = 9, .lines = &.{0x13}, .frame = .frame_pointer }};
+    const debug = [_]Atom.Debug{.{ .atom = 0, .file = "t.zig", .name = "a", .base_line = 9, .lines = &.{0x13} }};
     var refs: [3]AtomRef = undefined;
     var id: Hash = undefined;
     {
@@ -341,7 +344,7 @@ test "append, reopen, decode, and compact" {
         defer p.close(gpa, io);
         id = p.id;
         try p.append(gpa, io, atoms[0..2], &debug, refs[0..2]);
-        const a = (try p.decode(refs[0])).atom;
+        const a = (try p.decode(refs[0], .x86_64)).atom;
         try p.append(gpa, io, atoms[2..], &.{}, refs[2..]);
         // Decoded before the second append, still valid.
         try atoms_codec.expectEqualAtoms(atoms[0], a);
@@ -355,7 +358,7 @@ test "append, reopen, decode, and compact" {
     const names: []const []const u8 = &.{ "x.zig", "t.zig" };
     const order = [_]AtomRef{ refs[1], refs[0], refs[2], .init(p.len, 64), .initIn(1, 0, 64), refs[0] };
     const of = [_]u32{ no_file, 1, no_file, no_file, no_file, no_file };
-    const input = try p.linkAtoms(gpa, &order, &.{1}, .{ .of = &of, .names = names });
+    const input = try p.linkAtoms(gpa, .x86_64, &order, &.{1}, .{ .of = &of, .names = names });
     defer input.deinit(gpa);
     for ([_]usize{ 1, 0, 2 }, 0..) |e, i| {
         try std.testing.expect(input.check(i));
@@ -372,10 +375,10 @@ test "append, reopen, decode, and compact" {
     // A reference whose length is not its record's.
     var short = order;
     short[5].len -= 16;
-    const input_short = try p.linkAtoms(gpa, &short, &.{}, .{ .of = &of, .names = names });
+    const input_short = try p.linkAtoms(gpa, .x86_64, &short, &.{}, .{ .of = &of, .names = names });
     defer input_short.deinit(gpa);
     try std.testing.expect(!input_short.check(5));
-    try std.testing.expectError(error.CorruptAtom, p.decode(.init(p.len, 64)));
+    try std.testing.expectError(error.CorruptAtom, p.decode(.init(p.len, 64), .x86_64));
 
     // Only b and a are live, in that order.
     var live = [_]AtomRef{ refs[1], refs[0] };
@@ -384,8 +387,8 @@ test "append, reopen, decode, and compact" {
     try p.compact(gpa, io, tmp.dir, &live);
     try std.testing.expect(p.id != id);
     try std.testing.expectEqual(32 + liveBytes(&live), p.len);
-    try atoms_codec.expectEqualAtoms(atoms[1], (try p.decode(live[0])).atom);
-    const a = try p.decode(live[1]);
+    try atoms_codec.expectEqualAtoms(atoms[1], (try p.decode(live[0], .x86_64)).atom);
+    const a = try p.decode(live[1], .x86_64);
     try atoms_codec.expectEqualAtoms(atoms[0], a.atom);
     try atoms_codec.expectEqualDebug(&debug[0], &a.debug.?);
     // Read before compaction, still valid.
@@ -404,7 +407,7 @@ test "base packs are linked, decoded, and compacted away" {
 
     // A store pack: 48 bytes of something else, then a record.
     const atom: Atom = .{ .key = .fromName("f"), .name = "t:f", .section = .text, .bytes = &.{0xc3} };
-    const debug: Atom.Debug = .{ .file = "t.zig", .name = "f", .base_line = 1, .lines = &.{1}, .frame = .frame_pointer };
+    const debug: Atom.Debug = .{ .file = "t.zig", .name = "f", .base_line = 1, .lines = &.{1} };
     const len = atoms_codec.encodedLen(&atom, &debug);
     const bytes = try gpa.alloc(u8, 48 + len);
     defer gpa.free(bytes);
@@ -418,15 +421,15 @@ test "base packs are linked, decoded, and compacted away" {
     // The link outlives the store's name.
     try store_dir.deleteFile(io, "p1.zsp");
     var refs = [_]AtomRef{.initIn(1, 48, @intCast(len))};
-    const d = try p.decode(refs[0]);
+    const d = try p.decode(refs[0], .x86_64);
     try atoms_codec.expectEqualAtoms(atom, d.atom);
     try atoms_codec.expectEqualDebug(&debug, &d.debug.?);
-    try std.testing.expectError(error.CorruptAtom, p.decode(.initIn(2, 0, 64)));
+    try std.testing.expectError(error.CorruptAtom, p.decode(.initIn(2, 0, 64), .x86_64));
 
     // 48 foreign bytes against `len` live ones: not yet worth compacting.
     try std.testing.expect(!p.shouldCompact(liveBytes(&refs)));
     try p.compact(gpa, io, dir, &refs);
     try std.testing.expectEqual(0, refs[0].pack);
     try std.testing.expectEqual(0, p.bases.items.len);
-    try atoms_codec.expectEqualAtoms(atom, (try p.decode(refs[0])).atom);
+    try atoms_codec.expectEqualAtoms(atom, (try p.decode(refs[0], .x86_64)).atom);
 }
