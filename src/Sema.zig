@@ -2187,7 +2187,11 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             var operand = sema.resolveInst(data.un_node.operand);
             var ty = sema.typeOf(operand);
-            if (tag == .backing_int and Type.class(sema.ip, ty) != .@"enum") return sema.failUnsupported(block, src, "@backingInt of non-enum types");
+            if (tag == .backing_int and Type.isPacked(sema.ip, ty)) {
+                // A packed struct's or union's backing integer: its bits.
+                try sema.resolveLayout(block, src, ty);
+                break :blk sema.reinterpretBits(block, src, sema.ip.structInfo(ty).tag_type, operand);
+            }
             if (Type.class(sema.ip, ty) == .@"union") {
                 try sema.resolveLayout(block, src, ty);
                 if (sema.ip.indexToKey(sema.ip.structInfo(ty).tag_type) != .enum_type) return sema.fail(block, src, "untagged union '{f}' cannot be converted to integer", .{sema.fmtType(ty)});
@@ -2212,7 +2216,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 else => break,
             };
             if (ty == .generic_poison_type) break :blk .fromInterned(ty);
-            if (Type.class(sema.ip, ty) != .@"enum") return sema.failUnsupported(block, src, "@fromBackingInt to non-enum types");
+            if (Type.class(sema.ip, ty) != .@"enum" and !Type.isPacked(sema.ip, ty)) return sema.fail(block, src, "expected enum or packed type, found '{f}'", .{sema.fmtType(ty)});
             try sema.resolveLayout(block, src, ty);
             break :blk .fromInterned(sema.ip.structInfo(ty).tag_type);
         },
@@ -2220,6 +2224,11 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
             const ty = try sema.castDestType(block, src, extra.lhs, true);
+            if (tag == .from_backing_int and Type.isPacked(sema.ip, ty)) {
+                try sema.resolveLayout(block, src, ty);
+                const int = try sema.coerce(block, sema.ip.structInfo(ty).tag_type, sema.resolveInst(extra.rhs), src);
+                break :blk sema.reinterpretBits(block, src, ty, int);
+            }
             if (Type.class(sema.ip, ty) != .@"enum") return sema.fail(block, src, "expected enum, found '{f}'", .{sema.fmtType(ty)});
             break :blk sema.enumFromInt(block, src, ty, sema.resolveInst(extra.rhs));
         },
@@ -2233,6 +2242,16 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.pl_node.src_node);
             const bits = try sema.bitOffsetOf(block, src, sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data);
             break :blk .fromInterned(try sema.intValue(.comptime_int_type, if (tag == .offset_of) bits / 8 else bits));
+        },
+        .union_init => blk: {
+            const extra = sema.code.extraData(Zir.Inst.UnionInit, data.pl_node.payload_index).data;
+            const src = block.nodeSrc(data.pl_node.src_node);
+            const ty = try sema.resolveType(block, src, extra.union_type);
+            if (Type.class(sema.ip, ty) != .@"union") return sema.fail(block, src, "expected union type, found '{f}'", .{sema.fmtType(ty)});
+            const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.field_name));
+            const i = try sema.unionFieldIndex(block, src, ty, name);
+            const init = try sema.coerce(block, sema.ip.structInfo(ty).field_types[i], sema.resolveInst(extra.init), src);
+            break :blk sema.unionInit(block, src, ty, i, init);
         },
         .field_type_ref => blk: {
             const extra = sema.code.extraData(Zir.Inst.FieldTypeRef, data.pl_node.payload_index).data;
@@ -9196,6 +9215,19 @@ fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) C
     return sema.failUnsupported(block, src, "@bitCast between these types");
 }
 
+/// `operand` as a value of `dest_ty` with the same bits, for a packed type
+/// and its backing integer (whose layouts are resolved).
+fn reinterpretBits(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) CompileError!Ref {
+    if (sema.resolveValue(operand)) |v| {
+        if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
+        var bits = try BigInt.init(sema.arena);
+        try sema.valueBits(v, &bits, 0);
+        return .fromInterned(try sema.bitsValue(dest_ty, bits.toConst(), 0));
+    }
+    try sema.requireRuntime(block, src);
+    return sema.addTyOp(block, .bitcast, dest_ty, operand);
+}
+
 /// The bits of `ty` if `@bitCast` reinterprets it as plain bits: an
 /// integer, a float, or an array of them without padding bits.
 fn bitCastBits(sema: *Sema, ty: Index) ?u64 {
@@ -9218,6 +9250,8 @@ fn bitCastBits(sema: *Sema, ty: Index) ?u64 {
             break :blk eb * v.len;
         },
         .struct_type, .union_type => if (Type.isPacked(ip, ty)) Type.intInfo(ip, ip.structInfo(ty).tag_type).bits else null,
+        // An enum by its tag, as upstream.
+        .enum_type => Type.intInfo(ip, ip.structInfo(ty).tag_type).bits,
         else => if (Type.class(ip, ty) == .float) Type.floatBits(ip, ty) else if (ty == .bool_type) 1 else null,
     };
 }
