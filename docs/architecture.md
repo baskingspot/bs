@@ -450,7 +450,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   `Debug.unit` (the path of the module's root file; as upstream does, the
   unit is named after its basename, which std.debug prints as "in main
   (hello.zig)", with its directory as comp_dir), holding a
-  subprogram entry per function with `debug` (name, low_pc, high_pc,
+  subprogram entry per function with `debug` (name; linkage_name, the
+  atom's name, which is upstream's qualified name and what gdb's `break
+  widgets.TextInput.update` and backtraces use; low_pc, high_pc,
   decl_file, decl_line) and an inlined_subroutine entry per
   `Debug.inlines` call (name, low_pc, high_pc, call_file, call_line,
   call_column; nested by `parent`); a .debug_line program per unit

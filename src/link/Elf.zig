@@ -774,7 +774,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
     } ++ cfi_shdrs ++ debug_shdrs ++ [_]elf.Elf64.Shdr{
-        .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = 1, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
+        .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = n_syms, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
         nonAlloc(shName(".strtab"), .STRTAB, strtab_off, strtab_len),
         nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
@@ -1143,8 +1143,9 @@ fn LinkOf(comptime Input: type) type {
                 const d = ref(&debug);
                 const atom = input.debugAtom(j);
                 const addr = l.atomAddr(atom);
-                const size = input.atom(atom).bytes.len;
-                w.entry(d, addr, size, file_of);
+                const a = input.atom(atom);
+                const size = a.bytes.len;
+                w.entry(d, a.name, addr, size, file_of);
                 if (d.frame != .none) {
                     const fde_off: u32 = @intCast(Dwarf.cie.len + @as(u64, fde) * Dwarf.fde_size);
                     const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
@@ -1272,7 +1273,10 @@ fn LinkOf(comptime Input: type) type {
                 }
                 writeStruct(out[symtab][sym_off..], elf.Elf64.Sym{
                     .name = name,
-                    .info = .{ .type = sym_types[place.section], .bind = .GLOBAL },
+                    // Local, as upstream writes them: names can repeat
+                    // (generic instances), and nothing links against an
+                    // executable's symbols.
+                    .info = .{ .type = sym_types[place.section], .bind = .LOCAL },
                     .other = .{ .visibility = .DEFAULT },
                     .shndx = l.shndx[place.section],
                     .value = addr - l.sym_bias[place.section],
@@ -2087,6 +2091,14 @@ test "line programs decode with std.debug.Dwarf" {
     // A function with no rows still names its address range.
     const g = try testSymbolize(di, arena, f_addr + code.len);
     try std.testing.expectEqualStrings("g", g.name);
+    // Subprogram entries carry the atom's name as DW_AT_linkage_name,
+    // after DW_AT_name.
+    const info_sh = testSection(out, ".debug_info").?;
+    try std.testing.expect(std.mem.indexOf(u8, out[info_sh.offset..][0..info_sh.size], "f\x00root:f\x00") != null);
+    // Every symbol is local, as upstream writes them: names can repeat.
+    const symtab = testSection(out, ".symtab").?;
+    try std.testing.expectEqual(symtab.size / @sizeOf(elf.Elf64.Sym), symtab.info);
+    for (std.mem.bytesAsSlice(elf.Elf64.Sym, out[symtab.offset..][0..symtab.size])) |sym| try std.testing.expectEqual(elf.STB.LOCAL, sym.info.bind);
 
     try std.testing.expectError(error.InvalidDebugInfo, emit(gpa, io, &atoms, .{ .entry = key, .debug = &.{ debug[1], debug[0] } }));
 

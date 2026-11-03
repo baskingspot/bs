@@ -1490,8 +1490,9 @@ fn LinkOf(comptime Input: type) type {
                 var start: u32 = 0;
                 if (write) {
                     const addr = l.atomAddr(atom);
-                    const size = input.atom(atom).bytes.len;
-                    if (l.has_dsym) w.entry(d, addr, size, file_of);
+                    const a = input.atom(atom);
+                    const size = a.bytes.len;
+                    if (l.has_dsym) w.entry(d, a.name, addr, size, file_of);
                     start = @intCast(addr - base_address);
                 }
                 if (n > 0 and !continues and encoding != 0) {

@@ -71,6 +71,7 @@ const abbrev_inline = 4;
 const abbrev_inline_parent = 5;
 
 const subprogram_attrs = [_]u8{ DW.AT.name, DW.FORM.string } ++
+    [_]u8{ DW.AT.linkage_name, DW.FORM.string } ++
     [_]u8{ DW.AT.low_pc, DW.FORM.addr } ++
     [_]u8{ DW.AT.high_pc, DW.FORM.data4 } ++
     [_]u8{ DW.AT.decl_file, DW.FORM.data4 } ++
@@ -326,8 +327,8 @@ pub fn heads(d: *const Dwarf, ctx: anytype, comptime put: anytype) !void {
 pub const Section = enum { info, ranges, line, aranges };
 
 /// The subprogram entry's size, with its inlined subroutine entries.
-fn subprogramSize(debug: *const Atom.Debug) u64 {
-    var len: u64 = 1 + debug.name.len + 1 + 8 + 4 + 4 + 4;
+fn subprogramSize(debug: *const Atom.Debug, linkage_name: []const u8) u64 {
+    var len: u64 = 1 + debug.name.len + 1 + linkage_name.len + 1 + 8 + 4 + 4 + 4;
     if (debug.inlines.len == 0) return len;
     // The entries with children each end with a 0.
     len += 1;
@@ -359,13 +360,16 @@ const FileMap = struct {
 /// Writes the subprogram entry of the `size`-byte function at `addr`, and
 /// its inlined subroutine entries, at the start of `out`, and returns
 /// their size.
-inline fn writeSubprogram(out: []u8, debug: *const Atom.Debug, addr: u64, size: u64, files: FileMap) usize {
+inline fn writeSubprogram(out: []u8, debug: *const Atom.Debug, linkage_name: []const u8, addr: u64, size: u64, files: FileMap) usize {
     var at: usize = 0;
     out[at] = if (debug.inlines.len == 0) abbrev_subprogram else abbrev_subprogram_parent;
     at += 1;
     @memcpy(out[at..][0..debug.name.len], debug.name);
     out[at + debug.name.len] = 0;
     at += debug.name.len + 1;
+    @memcpy(out[at..][0..linkage_name.len], linkage_name);
+    out[at + linkage_name.len] = 0;
+    at += linkage_name.len + 1;
     std.mem.writeInt(u64, out[at..][0..8], addr, .little);
     std.mem.writeInt(u32, out[at + 8 ..][0..4], @intCast(size), .little);
     std.mem.writeInt(u32, out[at + 12 ..][0..4], files.file, .little);
@@ -633,7 +637,7 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
         }
         file_of.* = file | unit << file_bits;
         const part = units.part;
-        part.info_len += subprogramSize(d);
+        part.info_len += subprogramSize(d, l.input.atom(atom).name);
         part.line_len += sequenceSize(d);
         part.n_runs += @intFromBool(units.new_run);
         c.n_frames += @intFromBool(d.frame != .none);
@@ -771,13 +775,14 @@ pub const ChunkWriter = struct {
     run_end: u64 = 0,
 
     /// Writes the entry `debug` of the `size`-byte function at `addr`,
-    /// whose file is `file_of` (see `layOutChunk`).
-    pub inline fn entry(w: *ChunkWriter, debug: *const Atom.Debug, addr: u64, size: u64, file_of: u32) void {
+    /// whose file is `file_of` (see `layOutChunk`) and whose symbol is
+    /// `linkage_name`.
+    pub inline fn entry(w: *ChunkWriter, debug: *const Atom.Debug, linkage_name: []const u8, addr: u64, size: u64, file_of: u32) void {
         const k = file_of >> file_bits;
         if (k != w.k) w.switchUnit(k, addr);
         w.run_end = addr + size;
         const files: FileMap = .{ .c = w.c, .debug = debug, .unit = k, .file = w.c.file_map[file_of & (1 << file_bits) - 1] };
-        w.unit_info = w.unit_info[writeSubprogram(w.unit_info, debug, addr, size, files)..];
+        w.unit_info = w.unit_info[writeSubprogram(w.unit_info, debug, linkage_name, addr, size, files)..];
         w.unit_line = w.unit_line[writeSequence(w.unit_line, debug, addr, size, files)..];
     }
 
