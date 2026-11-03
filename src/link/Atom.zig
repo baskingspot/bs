@@ -13,7 +13,11 @@ const Atom = @This();
 /// Identifies the atom's symbol; other atoms reference it by key.
 key: SymbolKey,
 /// Symbol name written to the output's symbol table. For declarations this is
-/// the rendered unit key; content-addressed atoms may use any name.
+/// upstream's name, the declaration's qualified name ("widgets.TextInput.update",
+/// "array_list.Aligned(u8,null).append", with `__func_` and a hash for a
+/// generic function's instance); names may repeat, as upstream's do. The
+/// key, not the name, is the atom's identity. Content-addressed atoms may
+/// use any name.
 name: []const u8,
 section: Section,
 alignment: std.mem.Alignment = .@"1",

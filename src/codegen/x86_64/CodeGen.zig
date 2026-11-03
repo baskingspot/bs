@@ -163,7 +163,12 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
 
     const arena = emit.allocator();
     const nav = ip.getNav(func.owner_nav);
-    var name = try emit.unitName(.{ .func = ir.func });
+    // The symbol name is upstream's: the declaration's qualified name, with
+    // `__func_` and a stable hash for an instance of a generic function
+    // (upstream numbers them by InternPool index). Names may repeat, like
+    // upstream's local symbols; the atom's key is its identity.
+    var name: []const u8 = ip.stringSlice(nav.fqn);
+    if (func.generic_owner != .none) name = try std.fmt.allocPrint(arena, "{s}__func_{x:0>8}", .{ name, @as(u32, @truncate(ip.stableHash(ir.func))) });
     for (emit.zcu.exports.items) |x| {
         if (x.target == .nav and x.target.nav == func.owner_nav and func.generic_owner == .none) name = ip.stringSlice(x.name);
     }

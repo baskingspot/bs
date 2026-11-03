@@ -213,7 +213,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   directory. std-free test programs declare a minimal root `panic`
   (`test/run/rt.zig`, `tools/conformance/zap_runner.zig`).
 - Output is an **Atom**, defined in `src/link/Atom.zig`:
-  - stable symbol key and name, section kind, alignment;
+  - stable symbol key and name, section kind, alignment. The key is the
+    identity; the name is for the symbol table, upstream's qualified
+    name (`widgets.TextInput.update`), and may repeat;
   - code or data bytes (or a size for zero-fill sections);
   - a target table listing each symbol key the atom references once, and
     relocations of 12 bytes each: offset (u32), addend (i32), and a u32
