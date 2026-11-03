@@ -702,6 +702,22 @@ pub fn loadGotAddr(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
     try e.ldr(.dword, dst, .{ .base = dst, .offset = .{ .got_page_off = sym } });
 }
 
+/// x0 = the address of thread-local `sym` for the calling thread: its
+/// descriptor's address (tlvp relocations), then a call to the
+/// descriptor's thunk, `adrp x0; add x0, x0; ldr x16, [x0]; blr x16`. The
+/// thunk (dyld's tlv_get_addr) clobbers only x0, x16, x17, lr, and the
+/// flags.
+pub fn threadLocalAddr(e: *Encoder, sym: SymbolKey) !void {
+    try e.reserve();
+    try e.reloc(.aarch64_tlvp_page21, sym, 0);
+    e.word(0x90000000); // adrp x0
+    try e.reserve();
+    try e.reloc(.aarch64_tlvp_pageoff12, sym, 0);
+    e.word(0x91000000); // add x0, x0, #0
+    try e.ldr(.dword, .x16, .at(.x0, 0));
+    try e.blr(.x16);
+}
+
 // ---------------------------------------------------------------- moves
 
 /// `mov dst, src`: orr with zr, or `add dst, src, #0` when either is sp.

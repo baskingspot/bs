@@ -610,7 +610,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   turns it into a fixup), branch26 (b, bl), page21 (adrp) with pageoff12
   (add, or a load or store whose access size the linker reads from the
   instruction), and their GOT forms, which reach an import's GOT slot and
-  are relaxed to the symbol itself when it is defined in the image. aarch64
+  are relaxed to the symbol itself when it is defined in the image, and
+  tlvp page21/pageoff12, which reach a thread-local's descriptor (Mach-O
+  TLV, whose thunk returns the variable's address). aarch64
   link-time values that fit 16 bits, such as error codes, go into a `movz`
   or `movk` imm16 field (`aarch64_movw_value16`, Mach-O only, since zap
   links its own output); wider ones are loaded from a constant Atom.
@@ -1573,8 +1575,19 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   instead of two, which the aarch64 kinds had made slower.)
 - Mach-O output is a PIE: __PAGEZERO, __TEXT (header, __text, __stubs,
   __const), __DATA_CONST (__got, and __const for `.rodata` atoms holding
-  absolute addresses), __DATA (__data, __bss), __LINKEDIT, all on 16 KiB
-  pages. Imports (`Options.imports`, all from libSystem) each get a GOT
+  absolute addresses), __DATA (__data, __thread_vars, __thread_data,
+  __thread_bss, __bss, ld64's order), __LINKEDIT, all on 16 KiB pages.
+  Thread-locals follow ld64: `.tdata` and `.tbss` atoms make up the
+  template dyld copies per thread (__thread_data, then the zero-fill
+  __thread_bss, its start aligned for both), and each gets a 24-byte
+  descriptor in __thread_vars whose thunk is a chained bind to
+  libSystem's `__tlv_bootstrap` (an import the linker adds, with no GOT
+  slot or stub) and whose offset is the atom's in the template;
+  MH_HAS_TLV_DESCRIPTORS is set. A thread-local's symbol is its
+  descriptor, so placement gives the atom the descriptor's place and the
+  copy pass places its bytes in the template again in the same order.
+  Code reaches it with the tlvp kinds (`Encoder.threadLocalAddr`: `adrp
+  x0; add x0, x0; ldr x16, [x0]; blr x16`, x0 = the address). Imports (`Options.imports`, all from libSystem) each get a GOT
   slot and a stub; branch26 to an import goes to the stub, the GOT forms
   load the slot, and absolute addresses of imports in data are binds.
   Rebases and binds are chained fixups (`DYLD_CHAINED_PTR_64_OFFSET`, as

@@ -11,7 +11,8 @@
 //!   __TEXT        r-x  header and load commands, __text, __stubs, __const,
 //!                      __unwind_info (with debug info)
 //!   __DATA_CONST  rw-, read-only after fixups  __got, __const
-//!   __DATA        rw-  __data, __bss (memory only)
+//!   __DATA        rw-  __data, __thread_vars, __thread_data, then memory
+//!                      only: __thread_bss, __bss
 //!   __LINKEDIT    r--  chained fixups, exports trie, function starts,
 //!                      symbol table, indirect symbol table, string table,
 //!                      code signature
@@ -42,8 +43,14 @@
 //! and std.debug's unwinder read. There is no __eh_frame: the frames zap
 //! describes all have compact encodings, as LLVM and ld64 emit them.
 //!
-//! Not implemented yet: TLS (`__thread_vars`, `__thread_data`,
-//! `__thread_bss`).
+//! Thread-locals work as with ld64: `.tdata` and `.tbss` atoms make up the
+//! template dyld copies for each thread (`__thread_data`, then the zero
+//! fill `__thread_bss`), and each gets a descriptor in `__thread_vars`,
+//! a thunk bound to libSystem's `__tlv_bootstrap`, a key, and the atom's
+//! offset in the template. A thread-local's symbol is its descriptor, so
+//! code reaches it with `adrp x0, desc; add x0, x0, desc@pageoff` (the
+//! tlvp relocations), then calls the thunk, which returns the variable's
+//! address for the calling thread in x0.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -234,8 +241,8 @@ const sig_page_size = 0x1000;
 const stub_size = 12;
 
 /// Output sections, in layout order.
-const Sect = enum(u3) { text, stubs, text_const, unwind_info, got, data_const, data, bss };
-const n_sects = 8;
+const Sect = enum(u4) { text, stubs, text_const, unwind_info, got, data_const, data, thread_vars, thread_data, thread_bss, bss };
+const n_sects = 11;
 const Seg = enum(u2) { text, data_const, data };
 const sect_info = [n_sects]struct { seg: Seg, name: []const u8, flags: u32 }{
     .{ .seg = .text, .name = "__text", .flags = macho.S_REGULAR | macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS },
@@ -245,6 +252,9 @@ const sect_info = [n_sects]struct { seg: Seg, name: []const u8, flags: u32 }{
     .{ .seg = .data_const, .name = "__got", .flags = macho.S_NON_LAZY_SYMBOL_POINTERS },
     .{ .seg = .data_const, .name = "__const", .flags = macho.S_REGULAR },
     .{ .seg = .data, .name = "__data", .flags = macho.S_REGULAR },
+    .{ .seg = .data, .name = "__thread_vars", .flags = macho.S_THREAD_LOCAL_VARIABLES },
+    .{ .seg = .data, .name = "__thread_data", .flags = macho.S_THREAD_LOCAL_REGULAR },
+    .{ .seg = .data, .name = "__thread_bss", .flags = macho.S_THREAD_LOCAL_ZEROFILL },
     .{ .seg = .data, .name = "__bss", .flags = macho.S_ZEROFILL },
 };
 const seg_names = [3][]const u8{ "__TEXT", "__DATA_CONST", "__DATA" };
@@ -256,16 +266,30 @@ const unwind_info = @backingInt(Sect.unwind_info);
 const got = @backingInt(Sect.got);
 const data_const = @backingInt(Sect.data_const);
 const data = @backingInt(Sect.data);
+const thread_vars = @backingInt(Sect.thread_vars);
+const thread_data = @backingInt(Sect.thread_data);
+const thread_bss = @backingInt(Sect.thread_bss);
 const bss = @backingInt(Sect.bss);
 
-/// Where pass 1 placed an atom.
+/// A thread-local variable's descriptor (`struct tlv_descriptor`): the
+/// thunk, bound to `__tlv_bootstrap`, a key dyld fills in, and the
+/// variable's offset in the template.
+const tlv_descriptor_size = 24;
+
+fn zeroFill(s: usize) bool {
+    return s == bss or s == thread_bss;
+}
+
+/// Where pass 1 placed an atom. A thread-local atom's place is its
+/// descriptor's, in `__thread_vars`; `copy` places its bytes in the
+/// template again, in the same order as `layOut`.
 const Place = packed struct(u64) {
     /// Offset within the chunk's part of the section.
-    offset: u40,
+    offset: u39,
     /// Alignment padding between the previous atom of the section and this
     /// one, which the copy pass fills.
     gap: u21,
-    section: u3,
+    section: u4,
 
     const duplicate: Place = @bitCast(@as(u64, std.math.maxInt(u64)));
 
@@ -367,7 +391,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var max_targets: usize = 0;
     const n_imports: u32 = std.math.cast(u32, options.imports.len) orelse return error.OutOfMemory;
     // Fixups in address order: GOT slots, then __DATA_CONST,__const, then
-    // __data, each section's in chunk order.
+    // __data, the descriptors' binds, and __thread_data, each section's in
+    // chunk order.
     var n_fixups: [n_sects]u64 = @splat(0);
     n_fixups[got] = n_imports;
     for (chunks) |*c| {
@@ -388,11 +413,26 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         max_targets = @max(max_targets, c.max_targets);
     }
     // Make the per-chunk fixup indices global.
-    for (chunks) |*c| {
-        c.fixups[data_const] += n_fixups[got];
-        c.fixups[data] += n_fixups[got] + n_fixups[data_const];
+    var sect_fixups: [n_sects]u64 = undefined;
+    var total_fixups: u64 = 0;
+    for (&sect_fixups, n_fixups) |*first, n| {
+        first.* = total_fixups;
+        total_fixups += n;
     }
-    const total_fixups = n_fixups[got] + n_fixups[data_const] + n_fixups[data];
+    for (chunks) |*c| {
+        for (&c.fixups, sect_fixups) |*first, sect_first| first.* += sect_first;
+    }
+    // Thread-locals' thunks bind to `__tlv_bootstrap`, an import after the
+    // caller's with no GOT slot or stub.
+    const has_tlv = sizes[thread_vars] > 0;
+    const bind_imports = try gpa.alloc(Import, n_imports + @intFromBool(has_tlv));
+    defer gpa.free(bind_imports);
+    @memcpy(bind_imports[0..n_imports], options.imports);
+    if (has_tlv) bind_imports[n_imports] = .{ .key = .fromName("_tlv_bootstrap"), .name = "_tlv_bootstrap" };
+    const n_bind_imports: u32 = @intCast(bind_imports.len);
+    // Offsets in the template keep their alignment only if the template's
+    // start has the largest.
+    aligns[thread_data] = aligns[thread_data].max(aligns[thread_bss]);
 
     // With numbered symbols, the entry's atom is found while resolving
     // addresses.
@@ -409,7 +449,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer values.deinit();
     var imports: SymbolTable = .empty;
     defer imports.deinit();
-    for (options.imports) |imp| strtab_len += 1 + imp.name.len + 1;
+    for (bind_imports) |imp| strtab_len += 1 + imp.name.len + 1;
     if (numbered) |s| {
         // Atoms, numbered in `resolveAddrs`, take precedence over imports,
         // and imports over values.
@@ -502,16 +542,22 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             }
             starts[s] = aligns[s].forward(at);
             at = starts[s] + sizes[s];
-            if (s != bss) seg_file_end[seg] = at;
+            if (!zeroFill(s)) seg_file_end[seg] = at;
             seg_mem_end[seg] = at;
         }
     }
     for (&seg_file_end, seg_start, seg_present) |*end, start, p| {
         end.* = if (p) std.mem.alignForward(u64, end.*, page_size) else start;
     }
-    // __DATA's file part ends where its data ends, rounded to a page; __bss
-    // and any other memory-only tail follow in memory.
-    seg_file_end[@backingInt(Seg.data)] = if (sizes[data] > 0) std.mem.alignForward(u64, starts[data] + sizes[data], page_size) else seg_start[@backingInt(Seg.data)];
+    // __DATA's file part ends where its last section with contents ends,
+    // rounded to a page; the zero-fill sections follow in memory.
+    {
+        var end = seg_start[@backingInt(Seg.data)];
+        for ([_]usize{ data, thread_vars, thread_data }) |s| {
+            if (sizes[s] > 0) end = starts[s] + sizes[s];
+        }
+        seg_file_end[@backingInt(Seg.data)] = std.mem.alignForward(u64, end, page_size);
+    }
     for (&seg_mem_end, seg_start, seg_present) |*end, start, p| {
         end.* = if (p) std.mem.alignForward(u64, end.*, page_size) else start;
     }
@@ -520,8 +566,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const linkedit_vm = seg_mem_end[last_seg];
 
     // __LINKEDIT contents.
-    const fixups_seg = [3]bool{ false, n_fixups[got] + n_fixups[data_const] > 0, n_fixups[data] > 0 };
-    const cf = ChainedFixupsLayout.init(n_segs, seg_present, fixups_seg, seg_start, seg_mem_end, options.imports);
+    const fixups_seg = [3]bool{ false, n_fixups[got] + n_fixups[data_const] > 0, n_fixups[data] + n_fixups[thread_vars] + n_fixups[thread_data] > 0 };
+    const cf = ChainedFixupsLayout.init(n_segs, seg_present, fixups_seg, seg_start, seg_mem_end, bind_imports);
     const fixups_off = linkedit_off;
     const trie_off = fixups_off + cf.size;
     // Function starts: ULEB128 deltas between the file offsets of
@@ -543,7 +589,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     }
     const func_starts_size = std.mem.alignForward(u64, func_starts_len + 1, 8);
     const symtab_off = func_starts_off + func_starts_size;
-    const n_syms: u32 = n_atom_syms + 1 + n_imports;
+    const n_syms: u32 = n_atom_syms + 1 + n_bind_imports;
     const indirect_off = symtab_off + @as(u64, n_syms) * @sizeOf(macho.nlist_64);
     const n_indirect = 2 * n_imports;
     const strtab_off = indirect_off + @as(u64, n_indirect) * 4;
@@ -623,6 +669,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             .{ starts[got], starts[got] + sizes[got] },
             .{ starts[data_const], starts[data_const] + sizes[data_const] },
             .{ starts[data], starts[data] + sizes[data] },
+            .{ starts[thread_vars], starts[thread_vars] + sizes[thread_vars] },
+            .{ starts[thread_data], starts[thread_data] + sizes[thread_data] },
             .{ fixups_off, func_starts_off + func_starts_len },
             .{ symtab_off, strtab_end },
             .{ sig_off, file_len },
@@ -649,6 +697,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     l.sect_index = sect_index;
     l.stubs_addr = base + starts[stubs];
     l.got_addr = base + starts[got];
+    l.tlv_template = base + if (sizes[thread_data] > 0) starts[thread_data] else starts[thread_bss];
+    l.tlv_bootstrap = @intCast(n_imports);
     l.unwind_off = starts[unwind_info];
     if (n_debug > 0) {
         try parallel(io, n_threads, n_chunks + n_debug_chunks, &l, Link.copyAll);
@@ -675,7 +725,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     // Chained fixups: header, per-segment page starts with each page's
     // fixups linked into a chain, imports, and their names.
-    cf.write(buf, fixups_off, fixups, options.imports);
+    cf.write(buf, fixups_off, fixups, bind_imports);
     @memcpy(buf[trie_off..][0..exports_trie.len], exports_trie);
 
     // Symbols after the atoms': __mh_execute_header (exported), then the
@@ -683,14 +733,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     {
         var sym_off = symtab_off + @as(u64, n_atom_syms) * @sizeOf(macho.nlist_64);
         var str_off = strtab_len - (mh_execute_header.len + 1);
-        for (options.imports) |imp| str_off -= 1 + imp.name.len + 1;
+        for (bind_imports) |imp| str_off -= 1 + imp.name.len + 1;
         buf[strtab_off] = 0;
         writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_SECT | macho.N_EXT, 1, macho.REFERENCED_DYNAMICALLY, base));
         sym_off += @sizeOf(macho.nlist_64);
         @memcpy(buf[strtab_off + str_off ..][0..mh_execute_header.len], mh_execute_header);
         buf[strtab_off + str_off + mh_execute_header.len] = 0;
         str_off += mh_execute_header.len + 1;
-        for (options.imports, 0..) |imp, i| {
+        for (bind_imports, 0..) |imp, i| {
             // Two-level namespace: library ordinal 1, libSystem.
             writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_UNDF | macho.N_EXT, 0, 1 << 8, 0));
             sym_off += @sizeOf(macho.nlist_64);
@@ -699,6 +749,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             buf[strtab_off + str_off + 1 + imp.name.len] = 0;
             str_off += 1 + imp.name.len + 1;
             // Indirect symbols: the stubs' entries, then the GOT's.
+            if (i == n_imports) break;
             const sym_index = n_atom_syms + 1 + @as(u32, @intCast(i));
             std.mem.writeInt(u32, buf[indirect_off + 4 * i ..][0..4], sym_index, .little);
             std.mem.writeInt(u32, buf[indirect_off + 4 * (n_imports + i) ..][0..4], sym_index, .little);
@@ -713,7 +764,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .filetype = macho.MH_EXECUTE,
         .ncmds = ncmds,
         .sizeofcmds = sizeofcmds,
-        .flags = macho.MH_NOUNDEFS | macho.MH_DYLDLINK | macho.MH_TWOLEVEL | macho.MH_PIE,
+        .flags = macho.MH_NOUNDEFS | macho.MH_DYLDLINK | macho.MH_TWOLEVEL | macho.MH_PIE | @as(u32, if (has_tlv) macho.MH_HAS_TLV_DESCRIPTORS else 0),
     });
     w.put(macho.segment_command_64{ .cmdsize = @sizeOf(macho.segment_command_64), .segname = name16("__PAGEZERO"), .vmsize = base });
     for (seg_present, 0..) |p, seg| if (p) {
@@ -737,7 +788,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
                 .segname = name16(seg_names[seg]),
                 .addr = base + starts[s],
                 .size = sizes[s],
-                .offset = if (s == bss) 0 else @intCast(starts[s]),
+                .offset = if (zeroFill(s)) 0 else @intCast(starts[s]),
                 .@"align" = @backingInt(aligns[s]),
                 .flags = info.flags,
                 // Indirect symbol table index, and the stub size.
@@ -766,7 +817,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .iextdefsym = n_atom_syms,
         .nextdefsym = 1,
         .iundefsym = n_atom_syms + 1,
-        .nundefsym = n_imports,
+        .nundefsym = n_bind_imports,
         .indirectsymoff = if (n_indirect > 0) @intCast(indirect_off) else 0,
         .nindirectsyms = n_indirect,
     });
@@ -1099,6 +1150,10 @@ fn LinkOf(comptime Input: type) type {
         sect_index: [n_sects]u8 = undefined,
         stubs_addr: u64 = undefined,
         got_addr: u64 = undefined,
+        /// The address of the thread-local template (`__thread_data`, then
+        /// `__thread_bss`), and the import number of `__tlv_bootstrap`.
+        tlv_template: u64 = undefined,
+        tlv_bootstrap: u24 = undefined,
         numbered: ?Symbols,
         /// With numbered symbols, the address table (see `unset`).
         addrs: []u32,
@@ -1267,29 +1322,47 @@ fn LinkOf(comptime Input: type) type {
                         continue;
                     }
                 }
-                if (a.section == .bss and (a.bytes.len != 0 or a.relocs.len != 0)) {
+                if ((a.section == .bss or a.section == .tbss) and (a.bytes.len != 0 or a.relocs.len != 0)) {
                     l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
                     continue;
                 }
                 var n_abs: u32 = 0;
-                if (a.section == .rodata or a.section == .data) {
+                if (a.section == .rodata or a.section == .data or a.section == .tdata) {
                     for (a.relocs) |r| n_abs += @intFromBool(r.info.kind == .aarch64_abs64);
                 }
-                const s: u3 = switch (a.section) {
+                var s: u4 = switch (a.section) {
                     .text => text,
                     .rodata => if (n_abs > 0) data_const else text_const,
                     .data => data,
                     .bss => bss,
-                    // Not implemented yet (see the file's doc comment).
-                    .tdata, .tbss => {
-                        l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
-                        continue;
-                    },
+                    .tdata => thread_data,
+                    .tbss => thread_bss,
                 };
                 c.n_fixups[s] += n_abs;
-                const off = a.alignment.forward(c.sizes[s]);
+                var off = a.alignment.forward(c.sizes[s]);
+                if (s == thread_data or s == thread_bss) {
+                    // The bytes go in the template (`copy` places them
+                    // again); the atom's place is its descriptor's.
+                    c.sizes[s] = off + a.size();
+                    c.aligns[s] = c.aligns[s].max(a.alignment);
+                    s = thread_vars;
+                    off = c.sizes[s];
+                    c.sizes[s] += tlv_descriptor_size;
+                    c.aligns[s] = .@"8";
+                    c.n_fixups[s] += 1;
+                    p.* = .{ .offset = std.math.cast(u39, off) orelse {
+                        l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
+                        continue;
+                    }, .gap = 0, .section = s };
+                    if (a.name.len > 0) {
+                        c.n_syms += 1;
+                        c.str_len += @intCast(1 + a.name.len + 1);
+                    }
+                    c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
+                    continue;
+                }
                 p.* = .{
-                    .offset = std.math.cast(u40, off) orelse {
+                    .offset = std.math.cast(u39, off) orelse {
                         l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
                         continue;
                     },
@@ -1333,7 +1406,7 @@ fn LinkOf(comptime Input: type) type {
             const c = &l.chunks[chunk];
             const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
             for (c.lead_gaps, c.bases, l.section_addrs, 0..) |gap, chunk_base, sa, s| {
-                if (s == bss or gap == 0) continue;
+                if (zeroFill(s) or gap == 0) continue;
                 const start = sa - base_address + chunk_base;
                 @memset(l.buf[start - gap .. start], 0);
             }
@@ -1344,19 +1417,40 @@ fn LinkOf(comptime Input: type) type {
             var str_off = c.str;
             var starts_off = c.starts_off;
             var prev_func = c.prev_func;
+            // The chunk's parts of `__thread_data` and `__thread_bss` so far.
+            var tlv_sizes: [2]u64 = @splat(0);
             for (l.places[begin..end], begin..) |place, i| {
                 if (i + 4 < l.n_atoms) l.input.prefetch(i + 4, !numbered);
                 if (!numbered and i + 2 < l.n_atoms) for (l.input.atom(i + 2).targets) |t| l.symbols.prefetch(t);
                 if (place.isDuplicate()) continue;
                 const atom = l.input.atom(i);
                 const a = Elf.ref(&atom);
-                const addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
-                if (place.section != bss) {
+                const place_addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
+                var addr = place_addr;
+                var sect = place.section;
+                var gap: u64 = place.gap;
+                if (sect == thread_vars) {
+                    // Place the bytes in the template as `layOut` did, and
+                    // write the descriptor.
+                    sect = if (a.section == .tdata) thread_data else thread_bss;
+                    const size = &tlv_sizes[sect - thread_data];
+                    const off = a.alignment.forward(size.*);
+                    gap = off - size.*;
+                    size.* = off + a.size();
+                    addr = l.section_addrs[sect] + c.bases[sect] + off;
+                    const desc = l.buf[place_addr - base_address ..][0..tlv_descriptor_size];
+                    std.mem.writeInt(u64, desc[0..8], bindPointer(l.tlv_bootstrap, 0), .little);
+                    std.mem.writeInt(u64, desc[8..16], 0, .little);
+                    std.mem.writeInt(u64, desc[16..24], addr - l.tlv_template, .little);
+                    l.fixups[fixup[thread_vars]] = place_addr - base_address;
+                    fixup[thread_vars] += 1;
+                }
+                if (!zeroFill(sect)) {
                     const start = addr - base_address;
-                    @memset(l.buf[start - place.gap .. start], 0);
+                    @memset(l.buf[start - gap .. start], 0);
                     const dst = l.buf[start..][0..a.bytes.len];
                     @memcpy(dst, a.bytes);
-                    if (place.section == text and a.bytes.len > 0) {
+                    if (sect == text and a.bytes.len > 0) {
                         starts_off += writeUleb(l.buf[starts_off..], start - prev_func);
                         prev_func = start;
                     }
@@ -1376,7 +1470,7 @@ fn LinkOf(comptime Input: type) type {
                         };
                     }
                     var diag: Diagnostic = .{};
-                    l.applyRelocs(a, dst, addr, place.section, res, &fixup[place.section], &diag) catch |err| return l.fail(chunk, i, err, diag);
+                    l.applyRelocs(a, dst, addr, sect, res, &fixup[sect], &diag) catch |err| return l.fail(chunk, i, err, diag);
                 }
                 if (a.name.len > 0) {
                     // Darwin's names have a leading underscore, which
@@ -1384,7 +1478,7 @@ fn LinkOf(comptime Input: type) type {
                     l.buf[l.strtab_off + str_off] = '_';
                     @memcpy(l.buf[l.strtab_off + str_off + 1 ..][0..a.name.len], a.name);
                     l.buf[l.strtab_off + str_off + 1 + a.name.len] = 0;
-                    writeStruct(l.buf[sym_off..], nlist(str_off, macho.N_SECT, l.sect_index[place.section], 0, addr));
+                    writeStruct(l.buf[sym_off..], nlist(str_off, macho.N_SECT, l.sect_index[place.section], 0, place_addr));
                     sym_off += @sizeOf(macho.nlist_64);
                     str_off += @intCast(1 + a.name.len + 1);
                 }
@@ -1558,7 +1652,7 @@ fn LinkOf(comptime Input: type) type {
 
         /// Applies `a`'s relocations to its copy `dst` at address `p_base` in
         /// section `sect`, recording fixups from `fixups.*` on.
-        fn applyRelocs(l: *const Link, a: *const Atom, dst: []u8, p_base: u64, sect: u3, resolved: []const Resolved, fixups: *u64, diag: *Diagnostic) Error!void {
+        fn applyRelocs(l: *const Link, a: *const Atom, dst: []u8, p_base: u64, sect: u4, resolved: []const Resolved, fixups: *u64, diag: *Diagnostic) Error!void {
             for (a.relocs) |r| {
                 const width: u4 = switch (r.info.kind) {
                     .aarch64_abs64, .value64 => 8,
@@ -1619,7 +1713,7 @@ fn LinkOf(comptime Input: type) type {
                         std.mem.writeInt(u32, field[0..4], v, .little);
                     },
                     .aarch64_abs64 => {
-                        if ((sect != data_const and sect != data) or p & 3 != 0) return invalid;
+                        if ((sect != data_const and sect != data and sect != thread_data) or p & 3 != 0) return invalid;
                         const v = switch (t.kind) {
                             .addr => rebase: {
                                 const target = @as(i128, t.v) + addend - base_address;
@@ -1654,6 +1748,17 @@ fn LinkOf(comptime Input: type) type {
                         if (t.kind != .value or insn & 0x5f800000 != 0x52800000) return invalid;
                         const v = std.math.cast(u16, @as(i128, t.v) + addend) orelse return error.RelocationOverflow;
                         std.mem.writeInt(u32, field[0..4], (insn & ~@as(u32, 0xffff << 5)) | (@as(u32, v) << 5), .little);
+                    },
+                    .aarch64_tlvp_page21, .aarch64_tlvp_pageoff12 => {
+                        // A thread-local's address is its descriptor's.
+                        if (t.kind != .addr or t.v < l.section_addrs[thread_vars] or t.v >= l.tlv_template or addend != 0) return invalid;
+                        if (r.info.kind == .aarch64_tlvp_page21) {
+                            std.mem.writeInt(u32, field[0..4], patchAdrp(insn, pageDelta(t.v, p)), .little);
+                        } else {
+                            // add xd, xn, #lo12
+                            if (insn & 0xffc00000 != 0x91000000) return invalid;
+                            std.mem.writeInt(u32, field[0..4], insn | @as(u32, @intCast(t.v & 0xfff)) << 10, .little);
+                        }
                     },
                     .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32 => return invalid,
                 }
@@ -2087,6 +2192,122 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
     try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &movz_of_addr, .{ .entry = main }));
 }
 
+test "gives each thread its own thread-locals from __thread_data and __thread_bss" {
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Encoder = @import("../codegen/aarch64/Encoder.zig");
+
+    const main: SymbolKey = .fromName("main");
+    const run: SymbolKey = .fromName("run");
+    const counter: SymbolKey = .fromName("counter");
+    const ptr: SymbolKey = .fromName("ptr");
+    const zero: SymbolKey = .fromName("zero");
+    const big: SymbolKey = .fromName("big");
+    const target: SymbolKey = .fromName("target");
+    const pthread_create: SymbolKey = .fromName("pthread_create");
+    const pthread_join: SymbolKey = .fromName("pthread_join");
+    const exit: SymbolKey = .fromName("exit");
+
+    // run(arg): counter += arg; zero += 1; big[3] = 1; return counter.
+    var r: Encoder = .init(gpa);
+    defer r.deinit();
+    try r.stp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .pre = -32 } });
+    try r.mov(.x, .fp, .sp);
+    try r.str(.dword, .x0, .at(.sp, 16));
+    try r.threadLocalAddr(counter);
+    try r.ldr(.dword, .x9, .at(.x0, 0));
+    try r.ldr(.dword, .x10, .at(.sp, 16));
+    try r.addSub(.add, .x, .x9, .x9, .r(.x10));
+    try r.str(.dword, .x9, .at(.x0, 0));
+    try r.str(.dword, .x9, .at(.sp, 24));
+    try r.threadLocalAddr(zero);
+    try r.ldr(.word, .x9, .at(.x0, 0));
+    try r.addSub(.add, .w, .x9, .x9, .{ .imm = 1 });
+    try r.str(.word, .x9, .at(.x0, 0));
+    try r.threadLocalAddr(big);
+    try r.movz(.w, .x9, 1, 0);
+    try r.str(.byte, .x9, .at(.x0, 3));
+    try r.ldr(.dword, .x0, .at(.sp, 24));
+    try r.ldp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .post = 32 } });
+    try r.ret();
+    try r.finish();
+
+    // Run `run(10)` on a thread, which must return 15, then check that
+    // this thread's copies are the initial ones: counter 5, zero and big
+    // zero, big 16-byte aligned, and ptr the rebased address of `target`.
+    var m: Encoder = .init(gpa);
+    defer m.deinit();
+    const trap = try m.newLabel();
+    try m.stp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .pre = -48 } });
+    try m.mov(.x, .fp, .sp);
+    try m.addSub(.add, .x, .x0, .sp, .{ .imm = 32 });
+    try m.movz(.x, .x1, 0, 0);
+    try m.loadAddr(.x2, run, 0);
+    try m.movz(.x, .x3, 10, 0);
+    try m.bl(.{ .sym = pthread_create });
+    try m.cbz(true, .w, .x0, trap);
+    try m.ldr(.dword, .x0, .at(.sp, 32));
+    try m.addSub(.add, .x, .x1, .sp, .{ .imm = 40 });
+    try m.bl(.{ .sym = pthread_join });
+    try m.cbz(true, .w, .x0, trap);
+    try m.ldr(.dword, .x9, .at(.sp, 40));
+    try m.cmp(.x, .x9, .{ .imm = 15 });
+    try m.bcond(.ne, trap);
+    try m.threadLocalAddr(counter);
+    try m.ldr(.dword, .x9, .at(.x0, 0));
+    try m.cmp(.x, .x9, .{ .imm = 5 });
+    try m.bcond(.ne, trap);
+    try m.threadLocalAddr(zero);
+    try m.ldr(.word, .x9, .at(.x0, 0));
+    try m.cbz(true, .w, .x9, trap);
+    try m.threadLocalAddr(big);
+    try m.ldr(.byte, .x9, .at(.x0, 3));
+    try m.cbz(true, .w, .x9, trap);
+    try m.tst(.x, .x0, .{ .imm = 15 });
+    try m.bcond(.ne, trap);
+    try m.threadLocalAddr(ptr);
+    try m.ldr(.dword, .x9, .at(.x0, 0));
+    try m.loadAddr(.x10, target, 0);
+    try m.cmp(.x, .x9, .r(.x10));
+    try m.bcond(.ne, trap);
+    try m.movz(.w, .x0, 42, 0);
+    try m.bl(.{ .sym = exit });
+    m.bind(trap);
+    try m.brk(1);
+    try m.finish();
+
+    const atoms = [_]Atom{
+        .{ .key = main, .name = "main", .section = .text, .alignment = .@"4", .bytes = m.code.items, .targets = m.refs.targets.keys(), .relocs = m.refs.relocs.items },
+        .{ .key = zero, .name = "zero", .section = .tbss, .alignment = .@"4", .zero_fill = 4 },
+        .{ .key = counter, .name = "counter", .section = .tdata, .alignment = .@"8", .bytes = &.{ 5, 0, 0, 0, 0, 0, 0, 0 } },
+        .{ .key = run, .name = "run", .section = .text, .alignment = .@"4", .bytes = r.code.items, .targets = r.refs.targets.keys(), .relocs = r.refs.relocs.items },
+        .{ .key = big, .name = "big", .section = .tbss, .alignment = .@"16", .zero_fill = 100 },
+        .{ .key = ptr, .name = "ptr", .section = .tdata, .alignment = .@"8", .bytes = &@as([8]u8, @splat(0)), .targets = &.{target}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} },
+        .{ .key = target, .name = "target", .section = .data, .alignment = .@"8", .bytes = &@as([8]u8, @splat(0)) },
+    };
+    const options: Options = .{
+        .entry = main,
+        .imports = &.{ .{ .key = pthread_create, .name = "pthread_create" }, .{ .key = pthread_join, .name = "pthread_join" }, .{ .key = exit, .name = "exit" } },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try link(gpa, io, tmp.dir, "tlv", &atoms, options);
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/tlv", .{tmp.sub_path});
+    defer gpa.free(path);
+    const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, result.term);
+
+    // A tlvp relocation takes only a thread-local.
+    var diag: Diagnostic = .{};
+    var bad = atoms;
+    bad[0].targets = &.{target};
+    bad[0].relocs = &.{.init(0, .aarch64_tlvp_page21, 0, 0)};
+    try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &bad, .{ .entry = main, .imports = options.imports, .diag = &diag }));
+}
+
 test "links many chunks of atoms and pages of fixups the same way on any number of threads" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -2101,7 +2322,8 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
     // `finish` walks a list of nodes { next, value pointer } that alternate
     // between __data and __DATA_CONST, so both segments have several pages
     // of chained rebases, adds each value to w19, writes a message, and
-    // exits with w19.
+    // exits with w19. Some f_i also add a thread-local from .tdata (whose
+    // value is i % 50 + 1) or .tbss (0), spread over the chunks.
     const n = 2 * chunk_len + 300;
     const n_nodes = 3000;
     const msg_text = "chunks ok\n";
@@ -2130,6 +2352,21 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
         try e.adrp(.x9, c, 0);
         try e.ldr(.word, .x9, .{ .base = .x9, .offset = .{ .page_off = .{ .sym = c } } });
         try e.addSub(.add, .w, .x19, .x19, .r(.x9));
+        if (i % 97 == 0 or i % 89 == 0) {
+            const tdata = i % 97 == 0;
+            const tl = key(if (tdata) "td" else "tb", i);
+            try e.threadLocalAddr(tl);
+            try e.ldr(.word, .x9, .at(.x0, 0));
+            try e.addSub(.add, .w, .x19, .x19, .r(.x9));
+            const alignment: std.mem.Alignment = if (i % 2 == 0) .@"4" else .@"16";
+            if (tdata) {
+                expected +%= @intCast(i % 50 + 1);
+                const bytes = try arena.dupe(u8, std.mem.asBytes(&@as(u32, @intCast(i % 50 + 1))));
+                try atoms.append(arena, .{ .key = tl, .name = "td", .section = .tdata, .alignment = alignment, .bytes = bytes });
+            } else {
+                try atoms.append(arena, .{ .key = tl, .name = "tb", .section = .tbss, .alignment = alignment, .zero_fill = 4 + i % 5 });
+            }
+        }
         try e.b(.{ .sym = if (i + 1 < n) key("f", i + 1) else finish });
         try e.finish();
         expected +%= @intCast(i % 50 + 1);

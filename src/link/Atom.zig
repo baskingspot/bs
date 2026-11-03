@@ -172,6 +172,14 @@ pub const Reloc = extern struct {
         /// an error compare is `movz w16, #code; cmp wN, w16` instead of a
         /// load from a constant.
         aarch64_movw_value16,
+        /// adrp: Page(TLV(S)) - Page(P), where TLV(S) is the address of
+        /// thread-local S's descriptor (Mach-O `__thread_vars`), whose
+        /// thunk returns S's address for the calling thread. S must be in
+        /// `.tdata` or `.tbss`; A must be 0.
+        aarch64_tlvp_page21,
+        /// 64-bit add: TLV(S) & 0xfff into imm12, completing the address of
+        /// S's descriptor after `aarch64_tlvp_page21`. A must be 0.
+        aarch64_tlvp_pageoff12,
     };
 };
 
