@@ -861,7 +861,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     }{ .nodes = r.nodes.items, .atoms = emit.atoms.items, .debug_of = debug_of });
     const t1 = now(io);
 
-    if (inc.check) inc.checkPrediction(r.nodes.items);
+    if (inc.check) inc.checkPrediction(&r);
 
     // Store: find equal entries on every core; the others go into one new
     // pack, encoded straight into the file on other threads while this one
@@ -1186,8 +1186,9 @@ const Putter = struct {
 /// straight from source (namespaces, names, function bodies) whose result
 /// changed. Every node whose result changed must be among them. Prints
 /// the counts, and the nodes it missed.
-fn checkPrediction(inc: *Incremental, nodes: []const Node) void {
+fn checkPrediction(inc: *Incremental, r: *const Recorder) void {
     const gpa = inc.gpa;
+    const nodes = r.nodes.items;
     const m = if (inc.prev) |*m| m else return;
     const n_prev = m.nodeCount();
     const reached = std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev) catch return;
@@ -1227,7 +1228,24 @@ fn checkPrediction(inc: *Incremental, nodes: []const Node) void {
         changed += 1;
         if (seen.isSet(i)) continue;
         missed += 1;
-        if (missed <= 10) std.debug.print("cache check: {t} node {x} changed its result but no changed source reaches it\n", .{ n.tag, n.key });
+        if (missed > 10) continue;
+        // Name it by its unit, if it is one.
+        var name: std.Io.Writer.Allocating = .init(gpa);
+        defer name.deinit();
+        for (r.unit_list.items, r.unit_info) |u, info| if (info.key == n.key) {
+            r.zcu.unitKey(u, &name.writer) catch {};
+            break;
+        };
+        std.debug.print("cache check: {t} node {x} ({s}) changed its result but no changed source reaches it; it depended on:\n", .{ n.tag, n.key, name.written() });
+        for (m.deps(i)) |d| {
+            const dn = m.node(d);
+            name.clearRetainingCapacity();
+            for (r.unit_list.items, r.unit_info) |u, info| if (info.key == dn.key) {
+                r.zcu.unitKey(u, &name.writer) catch {};
+                break;
+            };
+            std.debug.print("cache check:   {t} {x} {s}\n", .{ @as(Tag, @fromBackingInt(@intCast(dn.tag))), dn.key, name.written() });
+        }
     }
     std.debug.print("cache check: {d} nodes ({d} new); {d} seeds reach {d}; {d} results changed, {d} missed\n", .{
         nodes.len, added, seeds, seen.count(), changed, missed,
