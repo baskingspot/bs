@@ -100,6 +100,8 @@ pub fn intInfo(ip: *const InternPool, ty: Index) IntInfo {
             .c_ulong, .c_ulonglong => .{ .signedness = .unsigned, .bits = 64 },
             // Error codes are `u16`, like upstream's default.
             .anyerror, .adhoc_inferred_error_set => .{ .signedness = .unsigned, .bits = 16 },
+            // The tag of an enum without fields may be `noreturn`.
+            .noreturn => .{ .signedness = .unsigned, .bits = 0 },
             else => unreachable,
         },
         .error_set_type, .inferred_error_set_type => .{ .signedness = .unsigned, .bits = 16 },

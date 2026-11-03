@@ -469,7 +469,7 @@ fn analyzeReifiedStructLayout(sema: *Sema, key: InternPool.ContainerType, info: 
     const layout = std.meta.stringToEnum(std.lang.Type.ContainerLayout, sema.enumTagName(key.captures[0]).?).?;
     const backing = ip.indexToKey(key.captures[1]).opt.val;
     const offsets = try ip.arena(Zcu.tid).alloc(u64, info.field_types.len);
-    try sema.structLayout(&block, info, layout, backing, offsets, &.{});
+    try sema.structLayout(&block, info, layout, backing, offsets, info.field_aligns);
     try sema.finish();
 }
 
@@ -553,7 +553,8 @@ fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPo
     } else blk: {
         if (decl.nonexhaustive) return sema.fail(&block, src, "non-exhaustive enum missing integer tag type", .{});
         const n = decl.field_names.len;
-        break :blk try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n));
+        // As upstream, an enum without fields has tag type `noreturn`.
+        break :blk if (n == 0) .noreturn_type else try sema.intType(.unsigned, std.math.log2_int_ceil(usize, n));
     };
     const n = decl.field_names.len;
     const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
@@ -2760,6 +2761,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             });
         },
         .reify_pointer => sema.zirReifyPointer(block, ext),
+        .reify_fn => sema.zirReifyFn(block, ext),
         .reify_struct => sema.zirReifyContainer(block, inst, ext, .@"struct"),
         .reify_union => sema.zirReifyContainer(block, inst, ext, .@"union"),
         .reify_enum => sema.zirReifyContainer(block, inst, ext, .@"enum"),
@@ -3789,7 +3791,9 @@ fn analyzeDeclLiteral(sema: *Sema, block: *Block, src: Src, name: []const u8, or
             return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{name});
         return .fromInterned(try sema.intern(.{ .calling_convention = cc }));
     }
-    if (ty == .generic_poison_type) return sema.fail(block, src, "decl literal requires a result type", .{});
+    // No result type (an `anytype` parameter): an enum literal, as upstream.
+    if (ty == .generic_poison_type or ty == .enum_literal_type or Type.class(sema.ip, ty) == .error_set)
+        return .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(name) }));
     const nav = (try sema.lookupInType(ty, name)) orelse {
         // Not a declaration: an enum literal.
         const lit: Ref = .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(name) }));
@@ -4776,9 +4780,16 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
     const s = ip.indexToKey(src).func_type;
     const d = ip.indexToKey(dst).func_type;
     if (s.cc != d.cc or s.is_var_args != d.is_var_args or s.is_generic != d.is_generic or
-        s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits or s.comptime_bits != d.comptime_bits) return false;
+        s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits) return false;
     // Parameters coerce the other way, in memory; a generic one matches any.
-    for (s.param_types, d.param_types) |a, b| {
+    for (s.param_types, d.param_types, 0..) |a, b, i| {
+        // `comptime` must match, except where zap made a parameter of a
+        // comptime-only type implicitly comptime and upstream does not.
+        const bit = @as(u32, 1) << @intCast(@min(i, 31));
+        if (i < 32 and (s.comptime_bits & bit) != (d.comptime_bits & bit)) {
+            const comptime_side = if (s.comptime_bits & bit != 0) a else b;
+            if (comptime_side == .generic_poison_type or !Type.isComptimeOnly(ip, comptime_side)) return false;
+        }
         if (a == b or a == .generic_poison_type or b == .generic_poison_type) continue;
         if (Type.class(ip, a) == .pointer and Type.class(ip, b) == .pointer and sema.ptrCoercibleInPlace(b, a)) continue;
         return false;
@@ -4955,6 +4966,10 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
         // unsigned type or else the first; the coercion checks the values.
         if (sema.peers_comptime_known) return if (ia.signedness == .unsigned and ia.bits > ib.bits) a else if (ib.signedness == .unsigned and ib.bits > ia.bits) b else a;
     }
+    // Upstream's `enum_or_union` strategy: an enum literal takes the enum's
+    // or tagged union's type.
+    if (ca == .enum_literal and (cb == .@"enum" or cb == .@"union")) return b;
+    if (cb == .enum_literal and (ca == .@"enum" or ca == .@"union")) return a;
     if (ca == .pointer and cb == .pointer) {
         if (sema.ptrCoercibleInPlace(a, b)) return b;
         if (sema.ptrCoercibleInPlace(b, a)) return a;
@@ -7786,7 +7801,8 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
 
     if (kind == .@"enum") {
         const tag_ty = try sema.resolveType(block, src, args[0]);
-        if (Type.class(ip, tag_ty) != .int) return sema.fail(block, src, "tag type must be an integer type", .{});
+        // As upstream, an enum without fields may have tag type `noreturn`.
+        if (Type.class(ip, tag_ty) != .int and !(tag_ty == .noreturn_type and n == 0)) return sema.fail(block, src, "tag type must be an integer type", .{});
         const mode_ty = try sema.stdLangType(block, src, "Type.Enum.Mode");
         const mode = try sema.resolveConstValue(block, src, try sema.coerce(block, mode_ty, sema.resolveInst(args[1]), src), reason);
         const value_slice_ty = try sema.ptrType(.{ .child = tag_ty, .flags = .{ .size = .slice, .is_const = true } });
@@ -7823,12 +7839,26 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     const attrs = try sema.constSliceElems(block, src, try sema.coerce(block, try sema.ptrType(.{ .child = attrs_ty, .flags = .{ .size = .slice, .is_const = true } }), sema.resolveInst(args[3]), src), reason);
     if (attrs.len != n) return sema.fail(block, src, "{d} field names but {d} field attributes", .{ n, attrs.len });
     const defaults = try ip.arena(Zcu.tid).alloc(Index, n);
-    for (attrs, types, defaults) |a, ft, *d| {
+    // Struct fields' explicit alignments and `comptime` flags, as values
+    // (they are part of the type's identity).
+    const align_vals = try sema.arena.alloc(Index, n);
+    const comptime_vals = try sema.arena.alloc(Index, n);
+    var any_align = false;
+    var any_comptime = false;
+    for (attrs, types, defaults, align_vals, comptime_vals) |a, ft, *d, *av, *cv| {
         if (sema.isUndef(a) or sema.isUndef(ft)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
-        if (ip.indexToKey(try sema.structFieldValue(a, "align")).opt.val != .none) return sema.failUnsupported(block, src, "field alignment");
+        av.* = try sema.structFieldValue(a, "align");
+        cv.* = .bool_false;
+        if (ip.indexToKey(av.*).opt.val != .none) {
+            if (kind != .@"struct") return sema.failUnsupported(block, src, "union field alignment");
+            const bytes = ip.intValue(u64, ip.indexToKey(av.*).opt.val).?;
+            if (bytes == 0 or !std.math.isPowerOfTwo(bytes)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{bytes});
+            any_align = true;
+        }
         d.* = .none;
         if (kind != .@"struct") continue;
-        if (try sema.structFieldValue(a, "comptime") == .bool_true) return sema.failUnsupported(block, src, "comptime fields");
+        cv.* = try sema.structFieldValue(a, "comptime");
+        if (cv.* == .bool_true) any_comptime = true;
         const dp = ip.indexToKey(try sema.structFieldValue(a, "default_value_ptr")).opt.val;
         if (dp != .none) {
             // The default value is behind a type-erased pointer.
@@ -7843,6 +7873,13 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     var captures: std.ArrayList(Index) = .empty;
     try captures.appendSlice(sema.arena, &.{ layout_val, arg_ty, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = .type_type } }), .storage = .{ .elems = types } } }) });
     try captures.appendSlice(sema.arena, defaults);
+    if (any_align) try captures.appendSlice(sema.arena, align_vals);
+    if (any_comptime) try captures.appendSlice(sema.arena, comptime_vals);
+    if (any_comptime) {
+        if (layout != .auto) return sema.fail(block, src, "{t} struct fields cannot be marked comptime", .{layout});
+        for (comptime_vals, defaults) |c, d| if (c == .bool_true and d == .none)
+            return sema.fail(block, src, "comptime field without default initialization value", .{});
+    }
     const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, captures.items);
     const ty = try sema.zcu.createContainerType(kind, sema.file, inst, captures.items, name.display, name.key, block.namespace, layout);
     const info = ip.structInfo(ty);
@@ -7850,9 +7887,69 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         info.field_names = names;
         info.field_types = try ip.arena(Zcu.tid).dupe(Index, types);
         info.field_defaults = defaults;
+        if (any_align) {
+            const aligns = try ip.arena(Zcu.tid).alloc(u64, n);
+            for (aligns, align_vals) |*al, av| al.* = if (ip.indexToKey(av).opt.val == .none) 0 else ip.intValue(u64, ip.indexToKey(av).opt.val).?;
+            info.field_aligns = aligns;
+        }
+        if (any_comptime) {
+            const flags = try ip.arena(Zcu.tid).alloc(bool, n);
+            for (flags, comptime_vals) |*f, cv| f.* = cv == .bool_true;
+            info.field_is_comptime = flags;
+        }
         info.status = .have_field_types;
     }
     return .fromInterned(ty);
+}
+
+/// `@Fn(param_types, param_attrs, return_type, attrs)`.
+fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) CompileError!Ref {
+    const ip = sema.ip;
+    const extra = sema.code.extraData(Zir.Inst.ReifyFn, ext.operand).data;
+    const src = block.nodeSrc(extra.node);
+    const reason = "function type attributes must be comptime-known";
+    const params = try sema.constSliceElems(block, src, try sema.coerce(block, .slice_const_type_type, sema.resolveInst(extra.param_types), src), reason);
+    const pattrs_ty = try sema.stdLangType(block, src, "Type.Fn.ParamAttributes");
+    const pattrs_ptr_ty = try sema.ptrType(.{ .child = try sema.intern(.{ .array_type = .{ .len = params.len, .child = pattrs_ty } }), .flags = .{ .is_const = true } });
+    const pattrs_slice_ty = try sema.ptrType(.{ .child = pattrs_ty, .flags = .{ .size = .slice, .is_const = true } });
+    const pattrs_arr = try sema.coerce(block, pattrs_ptr_ty, sema.resolveInst(extra.param_attrs), src);
+    const pattrs = try sema.constSliceElems(block, src, try sema.coerce(block, pattrs_slice_ty, pattrs_arr, src), reason);
+    const ret_ty = try sema.resolveType(block, src, extra.ret_ty);
+    const attrs = try sema.resolveConstValue(block, src, try sema.coerce(block, try sema.stdLangType(block, src, "Type.Fn.Attributes"), sema.resolveInst(extra.fn_attrs), src), reason);
+    if (sema.isUndef(attrs)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+    var noalias_bits: u32 = 0;
+    for (params, pattrs, 0..) |pt, pa, i| {
+        if (sema.isUndef(pt) or sema.isUndef(pa)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        if (try sema.structFieldValue(pa, "noalias") == .bool_true) {
+            if (i > 31) return sema.fail(block, src, "this compiler implementation only supports 'noalias' on the first 32 parameters", .{});
+            noalias_bits |= @as(u32, 1) << @intCast(i);
+        }
+    }
+    // `std.builtin.CallingConvention` by its tag, as zap's `fn` types know
+    // them (`.c` is `.x86_64_sysv`).
+    const cc_val = try sema.structFieldValue(attrs, "callconv");
+    const cc: InternPool.CallingConvention = switch (ip.indexToKey(cc_val)) {
+        .calling_convention => |c| c,
+        .un => |u| blk: {
+            const tag = sema.enumTagName(u.tag).?;
+            break :blk if (std.mem.eql(u8, tag, "auto")) .auto else if (std.mem.eql(u8, tag, "x86_64_sysv")) .c else if (std.mem.eql(u8, tag, "naked")) .naked else if (std.mem.eql(u8, tag, "inline")) .@"inline" else return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{tag});
+        },
+        else => unreachable,
+    };
+    const is_var_args = try sema.structFieldValue(attrs, "varargs") == .bool_true;
+    if (is_var_args and cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
+    var is_generic = false;
+    for (params) |pt| if (Type.isComptimeOnly(ip, pt)) {
+        is_generic = true;
+    };
+    return .fromInterned(try sema.intern(.{ .func_type = .{
+        .param_types = try sema.arena.dupe(Index, params),
+        .return_type = ret_ty,
+        .cc = cc,
+        .is_var_args = is_var_args,
+        .noalias_bits = noalias_bits,
+        .is_generic = is_generic or Type.isComptimeOnly(ip, ret_ty),
+    } }));
 }
 
 fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) CompileError!Ref {
