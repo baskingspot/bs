@@ -49,6 +49,8 @@ ir_insts: std.MultiArrayList(Ir.Inst) = .empty,
 ir_extra: std.ArrayList(u32) = .empty,
 inst_map: InstMap = .{},
 deps: std.ArrayList(Zcu.Dependee) = .empty,
+/// The entries of `deps`, once it is long enough to search this way.
+deps_set: std.HashMapUnmanaged(Zcu.Dependee, void, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
 comptime_break_inst: Zir.Inst.Index = undefined,
 comptime_allocs: std.AutoHashMapUnmanaged(u32, ComptimeAlloc) = .empty,
 /// Parameters collected by `param` instructions for the next `func`
@@ -307,6 +309,7 @@ fn destroy(sema: *Sema) void {
     sema.ir_extra.deinit(gpa);
     sema.inst_map.deinit(gpa);
     sema.deps.deinit(gpa);
+    sema.deps_set.deinit(gpa);
     sema.comptime_allocs.deinit(gpa);
     var it = sema.inferred_allocs.valueIterator();
     while (it.next()) |ia| ia.stores.deinit(gpa);
@@ -1027,8 +1030,16 @@ fn depLoop(sema: *Sema, block: *Block, src: Src, err: CompileError) CompileError
 
 /// The one place a unit records what it read from another unit.
 pub fn declareDependency(sema: *Sema, dependee: Zcu.Dependee) !void {
-    for (sema.deps.items) |d| {
-        if (std.meta.eql(d, dependee)) return;
+    // `deps` keeps the order replay follows; past a few entries, a set
+    // answers whether one is already there (comptime loops declare the
+    // same dependencies over and over).
+    if (sema.deps.items.len < 16) {
+        for (sema.deps.items) |d| {
+            if (std.meta.eql(d, dependee)) return;
+        }
+    } else {
+        if (sema.deps_set.count() == 0) for (sema.deps.items) |d| try sema.deps_set.put(sema.gpa, d, {});
+        if ((try sema.deps_set.getOrPut(sema.gpa, dependee)).found_existing) return;
     }
     try sema.deps.append(sema.gpa, dependee);
 }
@@ -4674,9 +4685,11 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
         },
         .@"enum" => switch (sc) {
             .enum_literal => {
-                const name = ip.stringSlice(ip.indexToKey(val.?).enum_literal);
-                const i = (try sema.enumFieldIndex(block, src, dest_ty, name)) orelse
-                    return sema.fail(block, src, "enum '{f}' has no field named '{s}'", .{ sema.fmtType(dest_ty), name });
+                // Interned names compare by index.
+                const name = ip.indexToKey(val.?).enum_literal;
+                try sema.resolveLayout(block, src, dest_ty);
+                const i: u32 = @intCast(std.mem.indexOfScalar(InternPool.String, ip.structInfo(dest_ty).field_names, name) orelse
+                    return sema.fail(block, src, "enum '{f}' has no field named '{s}'", .{ sema.fmtType(dest_ty), ip.stringSlice(name) }));
                 return .fromInterned(try sema.enumTagValue(dest_ty, i));
             },
             .@"union" => {

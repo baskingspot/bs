@@ -297,7 +297,8 @@ const UnitContext = struct {
     }
 };
 
-const DependeeContext = struct {
+/// Also Sema's, for the set of dependencies a unit declared.
+pub const DependeeContext = struct {
     pub fn hash(_: DependeeContext, d: Zcu.Dependee) u64 {
         return switch (d) {
             .nav_val => |n| mix(0, @backingInt(n)),
