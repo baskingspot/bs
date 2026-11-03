@@ -1361,6 +1361,22 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    Still to come: renaming (a variable in different registers on
    different paths), floats in registers, and copy elision for larger
    aggregates.
+   Division, after it: unsigned division by a constant divides without
+   `div` (a shift and mask for a power of two; else a multiply by a magic
+   number, Granlund and Montgomery 1994, with the add-and-halve fixup when
+   the multiplier needs 65 bits; a quotient of 0 or 1 by compare for
+   divisors above half the range), and unsigned division by a variable
+   uses the 32-bit `div`, always up to 32 bits and, as LLVM's slow-divide
+   bypass, when both 64-bit operands fit (2.0 against 3.4 ns per divide on
+   the bench machine). Signed division keeps the 64-bit `idiv`: Sema
+   guards only `minInt / -1`, and a 32-bit `idiv` traps on `minInt % -1`.
+   A `/` and `%` of the same operands still divide twice; Sema's
+   divide-by-zero checks put them in different blocks, so merging them
+   needs value numbering across blocks. Against main 31f715c: fmt 107–112
+   → 97–108 ms (its hex digits divide by a runtime base), the other
+   benchmarks within noise; libvaxis 5.02 → 5.03 code bytes per IR
+   instruction and CodeGen ns per IR instruction within noise; std's
+   tests the same wall time, binary +8 KB.
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
 6. DWARF variable locations; then leaf inlining with the cache edge.
