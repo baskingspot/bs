@@ -45,6 +45,9 @@ const n_bss = 1_000;
 const n_hot = 512;
 const runs = 15;
 const out_path = "/tmp/zap-bench-link.out";
+/// Held for the whole run: two runs at once would write `out_path` under
+/// each other, and skew each other's timings.
+const lock_path = "/tmp/zap-bench-link.lock";
 
 const n_imports = 64;
 
@@ -60,6 +63,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("usage: bench-link [elf|macho]\n", .{});
         std.process.exit(1);
     } else .elf;
+    const lock = std.Io.Dir.cwd().createFile(io, lock_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
+        error.WouldBlock => {
+            std.debug.print("another bench-link is running\n", .{});
+            std.process.exit(1);
+        },
+        else => |e| return e,
+    };
+    defer lock.close(io);
     switch (format) {
         inline else => |f| try bench(f, gpa, io, arena),
     }
@@ -143,9 +154,7 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
             try L.link(gpa, io, std.Io.Dir.cwd(), out_path, atoms, parallel);
             with_write = @min(with_write, elapsed(io, t));
         }
-        const file = try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .unlimited);
-        defer gpa.free(file);
-        if (!std.mem.eql(u8, file, out_n)) @panic("link wrote different bytes than emit returned");
+        try checkFile(gpa, io, out_n);
 
         std.debug.print(
             \\{t} {t} targets: {d} atoms ({d} after dedup), {d} relocations to {d} per-atom targets, atom bytes {d:.1} MiB, line programs {d:.1} MiB, output {d:.1} MiB ({d:.1} MiB stripped)
@@ -317,9 +326,7 @@ fn linkToFile(gpa: std.mem.Allocator, io: std.Io, atoms: []const Atom, single: E
                     try Elf.link(gpa, io, cwd, out_path, atoms, o);
                     t_best.* = @min(t_best.*, elapsed(io, t));
                 }
-                const file = try cwd.readFileAlloc(io, out_path, gpa, .unlimited);
-                defer gpa.free(file);
-                if (!std.mem.eql(u8, file, expected)) @panic("link wrote different bytes than emit returned");
+                try checkFile(gpa, io, expected);
             }
         }
         std.debug.print(
@@ -403,6 +410,14 @@ fn put(comptime T: type, pack: []align(16) u8, at: *usize, items: []const T) []c
     const out: []const T = @ptrCast(@alignCast(pack[at.*..][0..bytes.len]));
     at.* += bytes.len;
     return out;
+}
+
+/// Panics, saying where, unless `out_path` holds `expected`.
+fn checkFile(gpa: std.mem.Allocator, io: std.Io, expected: []const u8) !void {
+    const file = try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .unlimited);
+    defer gpa.free(file);
+    const first = std.mem.indexOfDiff(u8, file, expected) orelse return;
+    std.debug.panic("link wrote different bytes than emit returned: {d} bytes, expected {d}, first difference at 0x{x}", .{ file.len, expected.len, first });
 }
 
 /// Times `emit`, and for Mach-O with debug info, building the dSYM too.
