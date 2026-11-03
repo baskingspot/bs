@@ -90,7 +90,7 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
 
     var imports: [n_imports]MachO.Import = undefined;
     for (&imports, 0..) |*imp, i| {
-        imp.name = try std.fmt.allocPrint(arena, "_imp{d}", .{i});
+        imp.name = try std.fmt.allocPrint(arena, "imp{d}", .{i});
         imp.key = .fromName(imp.name);
     }
 

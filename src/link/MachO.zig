@@ -24,6 +24,11 @@
 //! rebases and binds, the format ld64 emits for arm64 since macOS 12), so
 //! there are no rebase or bind opcodes and dyld walks each page's chain.
 //!
+//! Atom and import names are platform-neutral (`main`, `write`,
+//! `widgets.TextInput.update`); the symbol table and the imports' names
+//! get Darwin's leading underscore, and DW_AT_linkage_name leaves it out,
+//! as LLVM and ld64 write them. Atom symbols are local.
+//!
 //! The code signature is the one ld64 emits by default ("linker-signed"):
 //! one CodeDirectory with a SHA-256 hash per 4 KiB page of everything
 //! before it, flagged ad hoc, which is all Apple Silicon needs to run the
@@ -116,7 +121,8 @@ pub const Symbols = struct {
 
 pub const Import = struct {
     key: SymbolKey,
-    /// The Mach-O symbol name, with its leading underscore: `_write`.
+    /// The symbol's name without Darwin's leading underscore, which the
+    /// linker adds, as it does to atoms' names: `write`.
     name: []const u8,
 };
 
@@ -403,7 +409,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     defer values.deinit();
     var imports: SymbolTable = .empty;
     defer imports.deinit();
-    for (options.imports) |imp| strtab_len += imp.name.len + 1;
+    for (options.imports) |imp| strtab_len += 1 + imp.name.len + 1;
     if (numbered) |s| {
         // Atoms, numbered in `resolveAddrs`, take precedence over imports,
         // and imports over values.
@@ -677,7 +683,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     {
         var sym_off = symtab_off + @as(u64, n_atom_syms) * @sizeOf(macho.nlist_64);
         var str_off = strtab_len - (mh_execute_header.len + 1);
-        for (options.imports) |imp| str_off -= imp.name.len + 1;
+        for (options.imports) |imp| str_off -= 1 + imp.name.len + 1;
         buf[strtab_off] = 0;
         writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_SECT | macho.N_EXT, 1, macho.REFERENCED_DYNAMICALLY, base));
         sym_off += @sizeOf(macho.nlist_64);
@@ -688,9 +694,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             // Two-level namespace: library ordinal 1, libSystem.
             writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_UNDF | macho.N_EXT, 0, 1 << 8, 0));
             sym_off += @sizeOf(macho.nlist_64);
-            @memcpy(buf[strtab_off + str_off ..][0..imp.name.len], imp.name);
-            buf[strtab_off + str_off + imp.name.len] = 0;
-            str_off += imp.name.len + 1;
+            buf[strtab_off + str_off] = '_';
+            @memcpy(buf[strtab_off + str_off + 1 ..][0..imp.name.len], imp.name);
+            buf[strtab_off + str_off + 1 + imp.name.len] = 0;
+            str_off += 1 + imp.name.len + 1;
             // Indirect symbols: the stubs' entries, then the GOT's.
             const sym_index = n_atom_syms + 1 + @as(u32, @intCast(i));
             std.mem.writeInt(u32, buf[indirect_off + 4 * i ..][0..4], sym_index, .little);
@@ -1300,7 +1307,7 @@ fn LinkOf(comptime Input: type) type {
                 }
                 if (a.name.len > 0) {
                     c.n_syms += 1;
-                    c.str_len += @intCast(a.name.len + 1);
+                    c.str_len += @intCast(1 + a.name.len + 1);
                 }
                 c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
             }
@@ -1371,11 +1378,14 @@ fn LinkOf(comptime Input: type) type {
                     l.applyRelocs(a, dst, addr, place.section, res, &fixup[place.section], &diag) catch |err| return l.fail(chunk, i, err, diag);
                 }
                 if (a.name.len > 0) {
-                    @memcpy(l.buf[l.strtab_off + str_off ..][0..a.name.len], a.name);
-                    l.buf[l.strtab_off + str_off + a.name.len] = 0;
+                    // Darwin's names have a leading underscore, which
+                    // DW_AT_linkage_name and the atom's name leave out.
+                    l.buf[l.strtab_off + str_off] = '_';
+                    @memcpy(l.buf[l.strtab_off + str_off + 1 ..][0..a.name.len], a.name);
+                    l.buf[l.strtab_off + str_off + 1 + a.name.len] = 0;
                     writeStruct(l.buf[sym_off..], nlist(str_off, macho.N_SECT, l.sect_index[place.section], 0, addr));
                     sym_off += @sizeOf(macho.nlist_64);
-                    str_off += @intCast(a.name.len + 1);
+                    str_off += @intCast(1 + a.name.len + 1);
                 }
             }
         }
@@ -1782,7 +1792,7 @@ const ChainedFixupsLayout = struct {
         cf.imports_off = std.mem.alignForward(u32, starts_off + at, 4);
         cf.symbols_off = cf.imports_off + 4 * @as(u32, @intCast(imports.len));
         var symbols_len: u32 = 1;
-        for (imports) |imp| symbols_len += @intCast(imp.name.len + 1);
+        for (imports) |imp| symbols_len += @intCast(1 + imp.name.len + 1);
         cf.size = std.mem.alignForward(u32, cf.symbols_off + symbols_len, 8);
         return cf;
     }
@@ -1838,8 +1848,9 @@ const ChainedFixupsLayout = struct {
         var name_off: u32 = 1;
         for (imports, 0..) |imp, i| {
             put32(out, cf.imports_off + 4 * i, 1 | (name_off << 9));
-            @memcpy(out[cf.symbols_off + name_off ..][0..imp.name.len], imp.name);
-            name_off += @intCast(imp.name.len + 1);
+            out[cf.symbols_off + name_off] = '_';
+            @memcpy(out[cf.symbols_off + name_off + 1 ..][0..imp.name.len], imp.name);
+            name_off += @intCast(1 + imp.name.len + 1);
         }
     }
 
@@ -1995,7 +2006,7 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
 
     const msg_atom: Atom = .{ .key = msg, .name = "__anon_msg", .section = .rodata, .bytes = msg_text };
     const atoms = [_]Atom{
-        .{ .key = main, .name = "_main", .section = .text, .alignment = .@"4", .bytes = s.code.items, .targets = s.refs.targets.keys(), .relocs = s.refs.relocs.items },
+        .{ .key = main, .name = "main", .section = .text, .alignment = .@"4", .bytes = s.code.items, .targets = s.refs.targets.keys(), .relocs = s.refs.relocs.items },
         msg_atom,
         .{ .key = write_msg, .name = "write_msg", .section = .text, .alignment = .@"4", .bytes = w.code.items, .targets = w.refs.targets.keys(), .relocs = w.refs.relocs.items },
         .{ .key = status, .name = "status", .section = .bss, .alignment = .@"4", .zero_fill = 4 },
@@ -2013,7 +2024,7 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
     };
     const options: Options = .{
         .entry = main,
-        .imports = &.{ .{ .key = write, .name = "_write" }, .{ .key = exit, .name = "_exit" } },
+        .imports = &.{ .{ .key = write, .name = "write" }, .{ .key = exit, .name = "exit" } },
         .values = &.{.{ .key = exit_code, .value = 42 }},
         .identifier = "hello",
     };
@@ -2056,7 +2067,7 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
     const conflicting = [_]Atom{ atoms[0], .{ .key = main, .name = "other", .section = .text, .bytes = "\xc0\x03\x5f\xd6" } };
     try std.testing.expectError(error.DuplicateSymbol, emit(gpa, io, &conflicting, .{ .entry = main, .diag = &diag }));
     try std.testing.expectEqualStrings("other", diag.atom);
-    const abs_in_text = [_]Atom{.{ .key = main, .name = "_main", .section = .text, .bytes = &@as([8]u8, @splat(0)), .targets = &.{main}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} }};
+    const abs_in_text = [_]Atom{.{ .key = main, .name = "main", .section = .text, .bytes = &@as([8]u8, @splat(0)), .targets = &.{main}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} }};
     try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &abs_in_text, .{ .entry = main }));
 }
 
@@ -2141,9 +2152,9 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
     try s.movz(.x, .x19, 0, 0);
     try s.b(.{ .sym = key("f", 0) });
     try s.finish();
-    try atoms.append(arena, .{ .key = main, .name = "_main", .section = .text, .alignment = .@"4", .bytes = s.code.items, .targets = s.refs.targets.keys(), .relocs = s.refs.relocs.items });
+    try atoms.append(arena, .{ .key = main, .name = "main", .section = .text, .alignment = .@"4", .bytes = s.code.items, .targets = s.refs.targets.keys(), .relocs = s.refs.relocs.items });
 
-    const imports: []const Import = &.{ .{ .key = write, .name = "_write" }, .{ .key = exit, .name = "_exit" } };
+    const imports: []const Import = &.{ .{ .key = write, .name = "write" }, .{ .key = exit, .name = "exit" } };
     const one = try emit(gpa, io, atoms.items, .{ .entry = main, .imports = imports, .threads = 1, .identifier = "chunks" });
     defer gpa.free(one);
     const four = try emit(gpa, io, atoms.items, .{ .entry = main, .imports = imports, .threads = 4, .identifier = "chunks" });
@@ -2300,7 +2311,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     try m.ldp(.dword, .fp, .lr, .{ .base = .sp, .offset = .{ .post = 16 } });
     try m.ret();
     try m.finish();
-    try atoms.append(arena, .{ .key = main, .name = "_main", .section = .text, .alignment = .@"4", .bytes = m.code.items, .targets = m.refs.targets.keys(), .relocs = m.refs.relocs.items });
+    try atoms.append(arena, .{ .key = main, .name = "main", .section = .text, .alignment = .@"4", .bytes = m.code.items, .targets = m.refs.targets.keys(), .relocs = m.refs.relocs.items });
     const naked = struct {
         fn f(i: usize) bool {
             return i % 10 == 9;
@@ -2442,7 +2453,7 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
     // Each function's code has its frame's encoding, and code without
     // debug info none, looked up as std.debug's unwinder does.
     const frame: u32 = 0x0400_0000;
-    const main_addr = testMachOSymbol(one.exe, "_main").?;
+    const main_addr = testMachOSymbol(one.exe, "main").?;
     try std.testing.expectEqual(0, testUnwindEncoding(one.exe, main_addr + 4).?);
     for (0..n) |index| {
         const name = try std.fmt.allocPrint(arena, "f{d}", .{index});
@@ -2496,7 +2507,8 @@ fn testMachOSymbol(bytes: []const u8, name: []const u8) ?u64 {
             const st = std.mem.bytesToValue(macho.symtab_command, bytes[at..][0..@sizeOf(macho.symtab_command)]);
             for (0..st.nsyms) |i| {
                 const sym = std.mem.bytesToValue(macho.nlist_64, bytes[st.symoff + i * @sizeOf(macho.nlist_64) ..][0..@sizeOf(macho.nlist_64)]);
-                if (std.mem.eql(u8, std.mem.sliceTo(bytes[st.stroff + sym.n_strx ..], 0), name)) return sym.n_value;
+                const sym_name = std.mem.sliceTo(bytes[st.stroff + sym.n_strx ..], 0);
+                if (sym_name.len == name.len + 1 and sym_name[0] == '_' and std.mem.eql(u8, sym_name[1..], name)) return sym.n_value;
             }
         }
         at += lc.cmdsize;

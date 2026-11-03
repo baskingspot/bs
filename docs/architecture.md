@@ -287,7 +287,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
 - x86_64-linux: static ELF first. aarch64-macos: Mach-O against libSystem,
   ad-hoc code signature. The Mach-O linker (`src/link/MachO.zig`) has the
   same phases as the ELF linker and shares its thread pool, symbol table,
-  and output buffers.
+  and output buffers. Atom names are platform-neutral; the Mach-O linker
+  adds Darwin's leading underscore to the names it writes in the symbol
+  table and chained fixups, and not to DW_AT_linkage_name, as LLVM does.
 - The ELF linker (`src/link/Elf.zig`) writes every byte of the output once:
   into one buffer (for `emit`, memory; for `link`, a shared mapping of the
   output file), or for `link`, with pwrite: each copy task builds its
