@@ -404,6 +404,9 @@ fn dupeDiagnostics(arena: std.mem.Allocator, diags: []const diag.Diagnostic) ![]
             r.loc = try S.loc(arena, r.loc);
         }
         d.refs = refs;
+        const candidates = try arena.dupe([]const u8, d.candidates);
+        for (candidates) |*c| c.* = try arena.dupe(u8, c.*);
+        d.candidates = candidates;
     }
     return out;
 }
