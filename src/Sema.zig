@@ -406,6 +406,12 @@ pub const Src = struct {
         array_elem: Ast.Node.Offset,
         /// The argument of a container declaration (`enum(u8)`).
         container_arg: Ast.Node.Offset,
+        /// The field name of a field access, or the function name of a
+        /// call (upstream's `node_offset_field_name`).
+        field_name: Ast.Node.Offset,
+        /// The function expression of a call (upstream's
+        /// `node_offset_call_func`).
+        call_func: Ast.Node.Offset,
     },
 
     pub fn span(src: Src, tree: *const Ast) Ast.Span {
@@ -443,7 +449,38 @@ pub const Src = struct {
                 const arg = if (tree.fullContainerDecl(&buf, node)) |c| c.ast.arg.unwrap() else null;
                 return tree.nodeToSpan(arg orelse node);
             },
+            .field_name => |off| {
+                const node = off.toAbsolute(src.base);
+                var buf: [1]Ast.Node.Index = undefined;
+                const tok = switch (tree.nodeTag(node)) {
+                    .field_access => tree.nodeData(node).node_and_token[1],
+                    .call_one, .call_one_comma, .call, .call_comma => tree.lastToken(tree.fullCall(&buf, node).?.ast.fn_expr),
+                    else => return tree.nodeToSpan(node),
+                };
+                return tree.tokenToSpan(tok);
+            },
+            .call_func => |off| {
+                const node = off.toAbsolute(src.base);
+                var buf: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buf, node) orelse return tree.nodeToSpan(node);
+                return tree.nodeToSpan(call.ast.fn_expr);
+            },
         };
+    }
+
+    /// The field name of the field access (or method call) at `src`, where
+    /// errors about the name point, as upstream. Resolved only when
+    /// rendered.
+    fn fieldName(src: Src) Src {
+        const off = src.nodeOffset() orelse return src;
+        return .{ .base = src.base, .loc = .{ .field_name = off } };
+    }
+
+    /// The function expression of the call at `src`. Resolved only when
+    /// rendered.
+    fn callFunc(src: Src) Src {
+        const off = src.nodeOffset() orelse return src;
+        return .{ .base = src.base, .loc = .{ .call_func = off } };
     }
 
     /// `src` as an offset from its base, if it is a node.
@@ -1224,6 +1261,54 @@ fn failCode(sema: *Sema, block: *const Block, src: Src, code: @import("diag.zig"
     return error.AnalysisFail;
 }
 
+/// Which names of a type a failed lookup could have meant.
+const CandidateNames = enum {
+    /// Its fields, all of them when there are at most 8.
+    fields,
+    /// Its declarations, and an enum's or a tagged union's tags.
+    members,
+    /// Both, for a method call.
+    fields_and_members,
+};
+
+/// Returns `err` after giving the most recent error, a failed lookup of
+/// `name` in `ty`, the names of `ty` close to it (`diag.closeNames`).
+/// Declarations of another file count only if `pub`.
+fn withCandidates(sema: *Sema, err: CompileError, ty: Index, name: []const u8, which: CandidateNames) CompileError {
+    sema.addCandidates(ty, name, which) catch |e| return e;
+    return err;
+}
+
+fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames) !void {
+    const ip = sema.ip;
+    const zcu = sema.zcu;
+    var names: std.ArrayList([]const u8) = .empty;
+    const fields = which != .members or ip.keyTag(ty) == .enum_type or ip.keyTag(ty) == .union_type;
+    if (fields) switch (ip.keyTag(ty)) {
+        .struct_type, .union_type, .enum_type => for (ip.structInfo(ty).field_names) |n| try names.append(sema.arena, ip.stringSlice(n)),
+        .tuple_type => for (ip.keyPayload(.tuple_type, ty).names) |n| try names.append(sema.arena, ip.stringSlice(n)),
+        else => {},
+    };
+    if (which != .fields) if (ip.containerType(ty) != null) {
+        const ns_index = ip.structInfo(ty).namespace;
+        if (ns_index != Zcu.Namespace.none) {
+            try sema.declareDependency(.{ .namespace = ns_index });
+            const ns = zcu.namespacePtr(ns_index);
+            for (ns.decls.keys(), ns.decls.values()) |n, nav| {
+                const decl = ip.getNav(nav);
+                if (decl.is_pub or decl.file == sema.file) try names.append(sema.arena, ip.stringSlice(n));
+            }
+        }
+    };
+    var close: std.ArrayList([]const u8) = .empty;
+    try @import("diag.zig").closeNames(sema.arena, name, names.items, which == .fields, &close);
+    if (close.items.len == 0) return;
+    const arena = zcu.arena.allocator();
+    const owned = try arena.alloc([]const u8, close.items.len);
+    for (owned, close.items) |*o, n| o.* = try arena.dupe(u8, n);
+    zcu.errors.items[zcu.errors.items.len - 1].candidates = owned;
+}
+
 /// Notes where struct, union, enum or opaque type `ty` is declared, on the
 /// most recent error (upstream's `addDeclaredHereNote`).
 fn addDeclaredHereNote(sema: *Sema, ty: Index) CompileError!void {
@@ -1842,7 +1927,7 @@ fn addPanic(sema: *Sema, block: *Block, id: PanicId, lhs: Ref, rhs: Ref) Compile
         .unwrap_error => .{ "unwrapError", &.{lhs} },
         inline else => |tag| .{ comptime panicFnName(tag), &.{} },
     };
-    const callee = try sema.namespaceLookupVal(block, src, ns, name);
+    const callee = try sema.namespaceLookupVal(block, src, ns, name, src);
     _ = try sema.analyzeCall(block, src, callee, .none, .{ .resolved = try sema.arena.dupe(Ref, args) }, .auto);
     _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
 }
@@ -4512,11 +4597,11 @@ fn unwrapOptEu(sema: *Sema, ty: Index) Index {
 /// The value of `std.lang.<path>`, where `path` may be dotted.
 fn stdLangDecl(sema: *Sema, block: *Block, src: Src, path: []const u8) CompileError!Ref {
     const std_file = sema.zcu.moduleRootFile(.std) orelse return sema.fail(block, src, "std.lang.{s} requires the std module", .{path});
-    var cur: Ref = try sema.namespaceLookupVal(block, src, try sema.fileRootType(std_file), "lang");
+    var cur: Ref = try sema.namespaceLookupVal(block, src, try sema.fileRootType(std_file), "lang", src);
     var it = std.mem.splitScalar(u8, path, '.');
     while (it.next()) |part| {
         const container = try sema.resolveConstValue(block, src, cur, "std.lang declarations are comptime-known");
-        cur = try sema.namespaceLookupVal(block, src, container, part);
+        cur = try sema.namespaceLookupVal(block, src, container, part, src);
     }
     return cur;
 }
@@ -5367,6 +5452,22 @@ fn analyzeDeclLiteral(sema: *Sema, block: *Block, src: Src, name: []const u8, or
     if (ty == .generic_poison_type or ty == .enum_literal_type or Type.class(sema.ip, ty) == .error_set)
         return .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(name) }));
     const nav = (try sema.lookupInType(ty, name)) orelse {
+        // Upstream looks the name up as a member of the type: a container
+        // with neither such a declaration nor such a tag has no member.
+        switch (Type.class(sema.ip, ty)) {
+            // The tag itself, so that coercing it does not search again.
+            .@"enum" => if (do_coerce) {
+                try sema.resolveLayout(block, src, ty);
+                const i = sema.ip.structInfo(ty).fieldIndex(sema.ip, name) orelse return sema.failNoMember(block, src, ty, name);
+                return sema.coerce(block, orig_ty, .fromInterned(try sema.enumTagValue(ty, i)), src);
+            },
+            .@"union" => {
+                try sema.resolveLayout(block, src, ty);
+                if (sema.ip.structInfo(ty).fieldIndex(sema.ip, name) == null) return sema.failNoMember(block, src, ty, name);
+            },
+            .@"struct", .tuple, .@"opaque" => return sema.failNoMember(block, src, ty, name),
+            else => {},
+        }
         // Not a declaration: an enum literal.
         const lit: Ref = .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(name) }));
         if (!do_coerce) return lit;
@@ -6331,7 +6432,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 const name = ip.keyPayload(.enum_literal, val.?);
                 try sema.resolveLayout(block, src, dest_ty);
                 const i: u32 = @intCast(std.mem.indexOfScalar(InternPool.String, ip.structInfo(dest_ty).field_names, name) orelse
-                    return sema.fail(block, src, "enum '{f}' has no field named '{s}'", .{ sema.fmtType(dest_ty), ip.stringSlice(name) }));
+                    return sema.withCandidates(sema.fail(block, src, "no field named '{s}' in enum '{f}'", .{ ip.stringSlice(name), sema.fmtType(dest_ty) }), dest_ty, ip.stringSlice(name), .fields));
                 return .fromInterned(try sema.enumTagValue(dest_ty, i));
             },
             .@"union" => {
@@ -10544,7 +10645,7 @@ fn fieldTypeByName(sema: *Sema, block: *Block, src: Src, ty: Index, name: []cons
         .struct_type => {
             try sema.resolveStructFields(block, src, ty);
             const info = ip.structInfo(ty);
-            const i = info.fieldIndex(ip, name) orelse return sema.fail(block, src, "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) });
+            const i = info.fieldIndex(ip, name) orelse return sema.withCandidates(sema.fail(block, src, "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) }), ty, name, .fields);
             return info.field_types[i];
         },
         .union_type => return ip.structInfo(ty).field_types[try sema.unionFieldIndex(block, src, ty, name)],
@@ -10561,7 +10662,7 @@ fn fieldTypeByName(sema: *Sema, block: *Block, src: Src, ty: Index, name: []cons
 fn unionFieldIndex(sema: *Sema, block: *Block, src: Src, ty: Index, name: []const u8) CompileError!u32 {
     try sema.resolveLayout(block, src, ty);
     return sema.ip.structInfo(ty).fieldIndex(sema.ip, name) orelse
-        sema.fail(block, src, "no field named '{s}' in union '{f}'", .{ name, sema.fmtType(ty) });
+        sema.withCandidates(sema.fail(block, src.fieldName(), "no field named '{s}' in union '{f}'", .{ name, sema.fmtType(ty) }), ty, name, .fields);
 }
 
 /// The tag of union `ty` when field `i` is active: an `enum_tag`, or the
@@ -10645,14 +10746,14 @@ fn structFieldIndex(sema: *Sema, block: *Block, src: Src, ty: Index, name: []con
         .struct_type => {
             try sema.resolveStructFields(block, src, ty);
             return ip.structInfo(ty).fieldIndex(ip, name) orelse
-                sema.fail(block, src, "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) });
+                sema.withCandidates(sema.fail(block, src.fieldName(), "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) }), ty, name, .fields);
         },
         .tuple_type => |t| {
             if (t.names.len != 0) {
                 for (t.names, 0..) |n, i| if (std.mem.eql(u8, ip.stringSlice(n), name)) return @intCast(i);
-                return sema.fail(block, src, "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) });
+                return sema.withCandidates(sema.fail(block, src.fieldName(), "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) }), ty, name, .fields);
             }
-            const i = std.fmt.parseInt(u32, name, 10) catch return sema.fail(block, src, "no field named '{s}' in tuple '{f}'", .{ name, sema.fmtType(ty) });
+            const i = std.fmt.parseInt(u32, name, 10) catch return sema.fail(block, src.fieldName(), "no field named '{s}' in tuple '{f}'", .{ name, sema.fmtType(ty) });
             if (i >= t.types.len) return sema.fail(block, src, "index '{d}' out of bounds of tuple '{f}'", .{ i, sema.fmtType(ty) });
             return i;
         },
@@ -10690,7 +10791,7 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
     switch (Type.class(ip, ty)) {
         .type => {
             const container = try sema.resolveConstValue(block, src, lhs, "types must be comptime-known");
-            return sema.namespaceLookupVal(block, src, container, name);
+            return sema.namespaceLookupVal(block, src, container, name, src);
         },
         .pointer => {
             const p = Type.ptrInfo(ip, ty);
@@ -10774,7 +10875,11 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
     return sema.fail(block, src, "type '{f}' does not support field access", .{sema.fmtType(ty)});
 }
 
-fn namespaceLookupVal(sema: *Sema, block: *Block, src: Src, container: Index, name: []const u8) CompileError!Ref {
+/// A struct's or opaque type's missing member is reported at
+/// `struct_miss_src`: upstream reports it at the field access in a value
+/// lookup and at the field name in a pointer lookup. An enum's or union's
+/// is always at the field name.
+fn namespaceLookupVal(sema: *Sema, block: *Block, src: Src, container: Index, name: []const u8, struct_miss_src: Src) CompileError!Ref {
     const ip = sema.ip;
     if (Type.class(ip, container) == .error_set) {
         const n = try sema.getString(name);
@@ -10803,11 +10908,30 @@ fn namespaceLookupVal(sema: *Sema, block: *Block, src: Src, container: Index, na
         if (tag_ty != .none) {
             if (try sema.enumFieldIndex(block, src, tag_ty, name)) |i| return .fromInterned(try sema.enumTagValue(tag_ty, i));
         }
-        return sema.fail(block, src, "'{f}' has no member named '{s}'", .{ sema.fmtType(container), name });
+        const miss_src = switch (Type.class(ip, container)) {
+            .@"enum", .@"union" => src.fieldName(),
+            else => struct_miss_src,
+        };
+        return sema.failNoMember(block, miss_src, container, name);
     };
     const n = ip.getNav(nav);
     if (!n.is_pub and n.file != sema.file) return sema.fail(block, src, "'{s}' is not marked 'pub'", .{name});
     return sema.navVal(block, src, nav);
+}
+
+/// "has no member named", worded by the kind of `container` as upstream.
+fn failNoMember(sema: *Sema, block: *Block, src: Src, container: Index, name: []const u8) CompileError {
+    const ip = sema.ip;
+    const kind = switch (Type.class(ip, container)) {
+        .@"struct", .tuple => "struct",
+        .@"union" => "union",
+        .@"enum" => "enum",
+        .@"opaque" => "opaque",
+        else => return sema.fail(block, src, "'{f}' has no member named '{s}'", .{ sema.fmtType(container), name }),
+    };
+    if (ip.containerType(container)) |c| if (c.zir_inst == .main_struct_inst)
+        return sema.withCandidates(sema.fail(block, src, "root source file struct '{f}' has no member named '{s}'", .{ sema.fmtType(container), name }), container, name, .members);
+    return sema.withCandidates(sema.fail(block, src, "{s} '{f}' has no member named '{s}'", .{ kind, sema.fmtType(container), name }), container, name, .members);
 }
 
 /// `&lhs.name` where `ptr` points to the object.
@@ -10819,7 +10943,7 @@ fn fieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) Co
             const container = try sema.resolveConstValue(block, src, ptr, "types must be comptime-known");
             // An enum tag or error is a value, referenced like a constant.
             const nav = (try sema.lookupInType(container, name)) orelse
-                return sema.analyzeRef(block, src, try sema.namespaceLookupVal(block, src, container, name));
+                return sema.analyzeRef(block, src, try sema.namespaceLookupVal(block, src, container, name, src.fieldName()));
             return sema.navRef(block, src, nav);
         }
         return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ptr_ty)});
@@ -14368,15 +14492,16 @@ fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const args: CallArgs = .{ .zir = .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len } };
     const obj_ty = sema.typeOf(obj);
     if (obj_ty == .type_type) {
-        const callee = try sema.fieldVal(block, src, obj, name);
+        // Errors about the lookup point at the callee, as upstream.
+        const callee = try sema.fieldVal(block, src.callFunc(), obj, name);
         return sema.analyzeCall(block, src, callee, .none, args, modifier);
     }
     // `obj` points to the object; find the container of the method.
-    if (Type.class(ip, obj_ty) != .pointer) return sema.fail(block, src, "type '{f}' has no member named '{s}'", .{ sema.fmtType(obj_ty), name });
+    if (Type.class(ip, obj_ty) != .pointer) return sema.fail(block, src.callFunc(), "type '{f}' has no member named '{s}'", .{ sema.fmtType(obj_ty), name });
     var self_ptr = obj;
     var container = Type.ptrInfo(ip, obj_ty).child;
     if (container == .type_type) {
-        const callee = try sema.fieldVal(block, src, try sema.analyzeLoad(block, src, obj), name);
+        const callee = try sema.fieldVal(block, src.callFunc(), try sema.analyzeLoad(block, src, obj), name);
         return sema.analyzeCall(block, src, callee, .none, args, modifier);
     }
     if (Type.class(ip, container) == .pointer and Type.ptrInfo(ip, container).flags.size == .one) {
@@ -14384,7 +14509,7 @@ fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
         container = Type.ptrInfo(ip, container).child;
         // A pointer to a type: a call of one of its declarations.
         if (container == .type_type) {
-            const callee = try sema.fieldVal(block, src, try sema.analyzeLoad(block, src, self_ptr), name);
+            const callee = try sema.fieldVal(block, src.callFunc(), try sema.analyzeLoad(block, src, self_ptr), name);
             return sema.analyzeCall(block, src, callee, .none, args, modifier);
         }
     }
@@ -14397,10 +14522,10 @@ fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
         }
     }
     const nav = (try sema.lookupInType(container, name)) orelse
-        return sema.fail(block, src, "no field or member function named '{s}' in '{f}'", .{ name, sema.fmtType(container) });
+        return sema.withCandidates(sema.fail(block, src.callFunc(), "no field or member function named '{s}' in '{f}'", .{ name, sema.fmtType(container) }), container, name, .fields_and_members);
     const callee = try sema.navVal(block, src, nav);
     const callee_ty = sema.typeOf(callee);
-    if (Type.class(ip, callee_ty) != .@"fn") return sema.fail(block, src, "no field or member function named '{s}' in '{f}'", .{ name, sema.fmtType(container) });
+    if (Type.class(ip, callee_ty) != .@"fn") return sema.withCandidates(sema.fail(block, src.callFunc(), "no field or member function named '{s}' in '{f}'", .{ name, sema.fmtType(container) }), container, name, .fields_and_members);
     const fn_ty = ip.keyPayload(.func_type, callee_ty);
     if (fn_ty.param_types.len == 0) return sema.fail(block, src, "member function '{s}' has no parameters", .{name});
     const first_ty = fn_ty.param_types[0];

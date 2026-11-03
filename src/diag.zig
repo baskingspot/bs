@@ -136,6 +136,8 @@ pub const Diagnostic = struct {
     notes: []const Note = &.{},
     /// The reference trace: who referred to the failed unit, nearest first.
     refs: []const Ref = &.{},
+    /// Names close to the one a failed lookup asked for, closest first.
+    candidates: []const []const u8 = &.{},
 };
 
 /// A frame of the reference trace: unit `name` referred onward at `loc`.
@@ -182,6 +184,92 @@ pub const Paths = struct {
         };
     }
 };
+
+/// The most candidates a failed lookup lists.
+pub const max_candidates = 5;
+
+/// Appends to `out` the names of `names` close to `name`, a name a lookup
+/// did not find, closest first and at most `max_candidates`: a
+/// case-insensitive match (`io` → `Io`), or a Damerau-Levenshtein
+/// distance of at most 2, and at most a third of the name's length so
+/// that short names do not match everything (rustc's rule). With
+/// `all_if_few`, a list of at most 8 names is returned whole, in order.
+pub fn closeNames(arena: std.mem.Allocator, name: []const u8, names: []const []const u8, all_if_few: bool, out: *std.ArrayList([]const u8)) !void {
+    if (all_if_few and names.len <= 8) {
+        for (names) |n| if (!std.mem.eql(u8, n, name)) try out.append(arena, n);
+        return;
+    }
+    const limit: usize = @min(2, @max(1, name.len / 3));
+    const Scored = struct { name: []const u8, dist: usize };
+    var found: std.ArrayList(Scored) = .empty;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, name)) continue;
+        const dist: usize = if (std.ascii.eqlIgnoreCase(n, name)) 0 else editDistance(name, n, limit) orelse continue;
+        try found.append(arena, .{ .name = n, .dist = dist });
+    }
+    std.mem.sort(Scored, found.items, {}, struct {
+        fn lessThan(_: void, a: Scored, b: Scored) bool {
+            return a.dist < b.dist or (a.dist == b.dist and std.mem.order(u8, a.name, b.name) == .lt);
+        }
+    }.lessThan);
+    for (found.items[0..@min(found.items.len, max_candidates)]) |f| try out.append(arena, f.name);
+}
+
+/// The optimal-string-alignment distance between `a` and `b` (edits are
+/// insertions, deletions, substitutions and swaps of adjacent bytes), or
+/// null when it is more than `limit`.
+fn editDistance(a: []const u8, b: []const u8, limit: usize) ?usize {
+    if (@max(a.len, b.len) - @min(a.len, b.len) > limit) return null;
+    const max_len = 64;
+    if (b.len >= max_len) return null;
+    var rows: [3][max_len]usize = undefined;
+    var prev2 = &rows[0];
+    var prev = &rows[1];
+    var cur = &rows[2];
+    for (0..b.len + 1) |j| prev[j] = j;
+    for (a, 1..) |ca, i| {
+        cur[0] = i;
+        var row_min = cur[0];
+        for (b, 1..) |cb, j| {
+            var d = @min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + @intFromBool(ca != cb));
+            if (i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb) d = @min(d, prev2[j - 2] + 1);
+            cur[j] = d;
+            row_min = @min(row_min, d);
+        }
+        if (row_min > limit) return null;
+        const t = prev2;
+        prev2 = prev;
+        prev = cur;
+        cur = t;
+    }
+    return if (prev[b.len] <= limit) prev[b.len] else null;
+}
+
+test closeNames {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayList([]const u8) = .empty;
+    // Case, then a swap, and short names do not match far ones.
+    try closeNames(arena, "io", &.{ "os", "Io", "fs", "c", "mem" }, false, &out);
+    try std.testing.expectEqualSlices(u8, "Io", out.items[0]);
+    try std.testing.expectEqual(1, out.items.len);
+    out.clearRetainingCapacity();
+    try closeNames(arena, "tow", &.{ "one", "two", "three" }, false, &out);
+    try std.testing.expectEqual(1, out.items.len);
+    try std.testing.expectEqualSlices(u8, "two", out.items[0]);
+    out.clearRetainingCapacity();
+    // Length 5 allows one edit: "prepend" is three away, "appendSlice" more.
+    try closeNames(arena, "apend", &.{ "prepend", "pend", "appendSlice", "append" }, false, &out);
+    try std.testing.expectEqual(2, out.items.len);
+    try std.testing.expectEqualSlices(u8, "append", out.items[0]);
+    try std.testing.expectEqualSlices(u8, "pend", out.items[1]);
+    out.clearRetainingCapacity();
+    // A few fields are listed whole, in order, without the asked name.
+    try closeNames(arena, "z", &.{ "x", "y" }, true, &out);
+    try std.testing.expectEqual(2, out.items.len);
+    try std.testing.expectEqualSlices(u8, "x", out.items[0]);
+}
 
 /// Appends the messages of an ErrorBundle (AstGen and parse errors) as
 /// diagnostics, classifying each message's code.
@@ -250,6 +338,11 @@ fn renderText(w: *Writer, d: Diagnostic) Writer.Error!void {
         try w.print(": {s}", .{n.msg});
         if (n.count > 1) try w.print(" ({d} times)", .{n.count});
         if (n.decl) if (n.loc) |l| if (sourceExcerpt(l)) |src| try w.print(": {s}", .{src});
+        try w.writeByte('\n');
+    }
+    if (d.candidates.len != 0) {
+        try w.writeAll("  candidates:");
+        for (d.candidates, 0..) |c, i| try w.print("{s} {s}", .{ if (i == 0) "" else ",", c });
         try w.writeByte('\n');
     }
     // Frames in the zig lib directory carry nothing an agent can change;
@@ -350,6 +443,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
         count: ?u32,
         src: ?[]const u8 = null,
         notes: ?[]const JsonNote,
+        candidates: ?[]const []const u8,
         calls: ?[]const JsonCall,
         ref: ?[]const JsonRef,
     } = .{
@@ -362,6 +456,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
         .count = if (d.count > 1) d.count else null,
         .src = if (d.loc) |l| sourceExcerpt(l) else null,
         .notes = if (n_notes != 0) notes_buf[0..n_notes] else null,
+        .candidates = if (d.candidates.len != 0) d.candidates else null,
         .calls = if (n_calls != 0) calls_buf[0..n_calls] else null,
         .ref = if (n_refs != 0) refs_buf[0..n_refs] else null,
     };
@@ -590,7 +685,6 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "type '{f}' cannot represent integer value '{d}'", .@"lossy-conversion" },
     .{ "type '{f}' cannot represent integer value '{f}'", .@"lossy-conversion" },
     .{ "union '{f}' has no tag with value '{f}'", .@"lossy-conversion" },
-    .{ "enum '{f}' has no field named '{s}'", .@"no-field" },
     .{ "no field named '{s}' in enum '{f}'", .@"no-field" },
     .{ "no field named '{s}' in struct '{f}'", .@"no-field" },
     .{ "no field named '{s}' in tuple '{f}'", .@"no-field" },
@@ -598,6 +692,8 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "no field or member function named '{s}' in '{f}'", .@"no-field" },
     .{ "'error.{s}' not a member of error set '{f}'", .@"no-member" },
     .{ "'{f}' has no member named '{s}'", .@"no-member" },
+    .{ "{s} '{f}' has no member named '{s}'", .@"no-member" },
+    .{ "root source file struct '{f}' has no member named '{s}'", .@"no-member" },
     .{ "enum {f} has no member named '{f}'", .@"no-member" },
     .{ "no error named '{s}' in '{f}'", .@"no-member" },
     .{ "no member named '{s}' in '{f}'", .@"no-member" },

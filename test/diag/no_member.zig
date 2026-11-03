@@ -6,7 +6,8 @@ pub fn main() void {
 }
 
 // error
-// no_member.zig:4:20: error[no-member]: 'std' has no member named 'io'
+// no_member.zig:4:21: error[no-member]: root source file struct 'std' has no member named 'io'
 //   | const out = std.io.getStdOut();
 //   note std/std.zig:1:1: struct declared here
+//   candidates: Io
 // 1 error

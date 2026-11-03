@@ -3342,9 +3342,15 @@ code.
 **Facts**, computed only on the error path from data Sema already has:
 
 - *Failed lookups* (`no-member`, `undeclared`, `no-field`): candidates
-  with Damerau-Levenshtein distance at most 2 or a case-insensitive match
-  (`io` → `Io`), restricted to `pub` names across files; all field names
-  when a type has at most 8; and the migration hint below.
+  with Damerau-Levenshtein distance at most 2, and at most a third of the
+  name's length so that short names do not match everything (rustc's
+  rule), or a case-insensitive match (`io` → `Io`); restricted to `pub`
+  names across files, closest first, at most 5; all field names when a
+  type has at most 8; and the migration hint below. A member lookup
+  considers declarations and an enum's or tagged union's tags, a field
+  lookup the fields, a method call both (`diag.closeNames`,
+  `Sema.addCandidates`). They read the whole namespace, so the failing
+  unit declares a `namespace` dependency.
 - *Type mismatches*: both types in full, the declaration that fixed the
   expected type (return type, parameter, variable type) and the
   declaration of the value's origin (a local or parameter, with its source
@@ -3578,7 +3584,9 @@ unchanged:
 3. Facts: candidates, declaration sites, user frame first, the reference
    trace from `referenced_by`, and inferred error sets printed by name.
    (Started: upstream's type-mismatch notes, declared-here notes with
-   their source lines, and the reference trace.)
+   their source lines, the reference trace, and candidates for failed
+   member and field lookups. Not yet: candidates for undeclared
+   identifiers, which come from AstGen.)
 4. The migration and pattern table.
 5. Fixes, first set.
 6. The cache: failing builds commit the manifest for the units that
