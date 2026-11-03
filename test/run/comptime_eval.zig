@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "476\n6\n6765\n55\n258\n55\n18\n28739\n1228\n"
+//! stdout: "476\n6\n6765\n55\n258\n55\n18\n28739\n1228\n606\n179668\n88\n582\n708\n710\n"
 // Comptime calls repeated often enough for zap's comptime evaluator to run
 // them from lowered IR instead of the ZIR walker; the results must be the
 // walker's (and upstream's).
@@ -153,6 +153,54 @@ const peer = blk: {
     break :blk t;
 };
 
+/// Loops long enough for the evaluator to take them over from the walker
+/// midway (on-stack replacement): reading the walker's variables, the
+/// elements of a comptime_int slice, a narrowing that only a known value
+/// allows, and leaving the loop by a break with a value.
+const osr_table = blk: {
+    @setEvalBranchQuota(100000);
+    const vals: []const comptime_int = &.{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9 };
+    var t: [600]u16 = undefined;
+    var acc: Acc = .{ .sum = 0, .count = 0 };
+    for (&t, 0..) |*e, i| {
+        var x: u16 = i;
+        const v: u8 = @intCast(vals[i % vals.len]);
+        x ^= v;
+        accumulate(&acc, x);
+        e.* = x;
+    }
+    var k: usize = 0;
+    const found = while (k < t.len) : (k += 1) {
+        if (t[k] > 590) break k;
+    } else 0;
+    break :blk .{ t[599], acc.sum, acc.count, found };
+};
+
+/// A return from inside a long loop of a function called once.
+fn firstAbove(limit: u32) u32 {
+    var i: u32 = 0;
+    while (true) : (i += 1) {
+        if (i *% i > limit) return i;
+    }
+}
+
+/// The evaluator gives up on comparing floats after the loop has written
+/// the walker's memory many times; the walker must run the loop on from
+/// where the evaluator took it over.
+const osr_abort = blk: {
+    @setEvalBranchQuota(100000);
+    var count: u32 = 0;
+    var f: f32 = 0.5;
+    for (0..700) |k| {
+        count += 1;
+        if (k == 500 and f < 1.0) {
+            count += 10;
+            f = 2.0;
+        }
+    }
+    break :blk count;
+};
+
 fn main() callconv(.c) noreturn {
     var s: u32 = 0;
     for (table) |w| s += w;
@@ -169,5 +217,11 @@ fn main() callconv(.c) noreturn {
     rt.printInt(bumped);
     rt.printInt(generic);
     rt.printInt(peer);
+    rt.printInt(osr_table[0]);
+    rt.printInt(osr_table[1]);
+    rt.printInt(osr_table[2]);
+    rt.printInt(osr_table[3]);
+    rt.printInt(comptime firstAbove(500000));
+    rt.printInt(osr_abort);
     rt.exit(0);
 }

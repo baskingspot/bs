@@ -363,6 +363,10 @@ pub const Inst = struct {
         /// (an index into the lowered body's dependencies), which the
         /// running unit then declares.
         comptime_dep,
+        /// `pl_op`: leave the lowered loop of an on-stack replacement with
+        /// `operand` through the ZIR `break` (or `break_inline`)
+        /// instruction `payload`, whose target the walker runs.
+        comptime_exit,
     };
 
     pub const Data = union {
@@ -550,6 +554,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .cmpxchg,
         => data.ty_pl.ty,
         .store, .atomic_store, .set_union_tag, .set_err_return_trace, .memcpy, .memmove, .memset, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .vector_store_elem, .breakpoint, .comptime_tick, .comptime_quota, .comptime_dep => .void_type,
+        .comptime_exit => .noreturn_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),

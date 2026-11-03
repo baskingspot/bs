@@ -54,6 +54,9 @@ comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, Memo) = .empty,
 /// and of each generic function per specialization (see `Sema.bcCall`).
 /// In memory only, like function IR.
 comptime_bodies: std.AutoHashMapUnmanaged(InternPool.Hash, ComptimeBody) = .empty,
+/// Comptime loops the evaluator does not take over from the walker (see
+/// `Sema.bcOsr`), by file and the first instruction of the loop body.
+comptime_osr_off: std.AutoHashMapUnmanaged(OsrLoop, void) = .empty,
 /// Walker runs of a function before it is lowered for the comptime
 /// evaluator; 0 turns the evaluator off (`ZAP_COMPTIME_EVAL`).
 comptime_eval_threshold: u32 = 4,
@@ -141,6 +144,8 @@ pub const Bytecode = struct {
         gpa.destroy(b);
     }
 };
+
+pub const OsrLoop = struct { file: u32, inst: u32 };
 
 pub const BytecodeParam = struct {
     ty: InternPool.Index,
@@ -277,6 +282,7 @@ pub fn deinit(zcu: *Zcu) void {
         .cold => {},
     };
     zcu.comptime_bodies.deinit(gpa);
+    zcu.comptime_osr_off.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
     zcu.anyerror_ies.deinit(gpa);
     zcu.branch_quotas.deinit(gpa);

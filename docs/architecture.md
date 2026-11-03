@@ -210,14 +210,16 @@ keyed by the function's stable hash or the specialization's.
 A function is lowered after `Zcu.comptime_eval_threshold` walker runs (4;
 `ZAP_COMPTIME_EVAL=n` sets it, 0 turns the evaluator off), so code that
 runs once at comptime (most of it) never pays for lowering. `comptime`
-blocks and declaration initializers run once each and stay with the
-walker; a `comptime` block inside a lowered function is evaluated by the
-lowering, as runtime analysis does, and its branches replay as ticks
-(below). Not lowered, for now: instances called by value, inferred error
-sets, `noreturn`, naked, and comptime-only parameters (other than a
-specialization's comptime ones) and results, and bodies whose lowering creates a
-container type, instantiates a generic, embeds a file, exports, takes a
-function's address, or makes a non-memoizable comptime call.
+blocks, declaration initializers, and functions called once run once
+each and stay with the walker, except for their long loops, which the
+evaluator takes over midway (on-stack replacement, below); a `comptime`
+block inside a lowered function is evaluated by the lowering, as runtime
+analysis does, and its branches replay as ticks (below). Not lowered,
+for now: instances called by value, inferred error sets, `noreturn`,
+naked, and comptime-only parameters (other than a specialization's
+comptime ones) and results, and bodies whose lowering creates a container
+type, instantiates a generic, embeds a file, exports, takes a function's
+address, or makes a non-memoizable comptime call.
 
 **Lowering is runtime analysis with a few switches**, as the "Typed IR"
 section requires (no second semantic lowering): `bcLower` runs
@@ -237,6 +239,44 @@ section requires (no second semantic lowering): `bcLower` runs
   walker keeps the type of the branch it takes, where runtime analysis
   would resolve the peer type (`if (c) @as(u8, 1) else @as(u16, 2)` is a
   `u8` or a `u16` at comptime, never a `u16` for both).
+
+**On-stack replacement (OSR).** When a comptime loop has taken
+`bc_osr_branches` (256) backward branches, counting nested loops and
+calls, the walker hands it to the evaluator at the loop head
+(`Sema.bcOsr`, from the `repeat` in `analyzeBodyInner`). `bcLowerLoop`
+lowers the loop body as a runtime `loop` on a fresh Sema, as `bcLower`
+lowers a function body, except:
+
+- the walker's current values (its `inst_map`) are constants, which the
+  next iteration's code may use;
+- the walker's comptime variables are *foreign*: a pointer into a comptime
+  allocation the lowering Sema does not own lowers to run-time `load` and
+  `store` (`bcForeign`), which the evaluator executes against the walker's
+  memory, logged for undo as a call's are;
+- a comptime `var` declared in the body becomes a run-time one
+  (`bcOsrVar`), since the whole body is comptime code; a use that needs its
+  value comptime-known fails the lowering;
+- a `break` to a block outside the body (one lowering has not entered)
+  lowers to `comptime_exit`, which ends the run with the ZIR break and its
+  value; the walker continues from that break as if it had run it, and a
+  `return` lowers to `ret`, which ends the call the loop is in.
+
+Every value the evaluator sees is one the walker would know at comptime,
+so lowering also accepts two things runtime analysis rejects, both
+checked by the run: an integer coercion that only a known value allows
+(`var crc: u32 = i` with `i: usize`) lowers to `intcast`, which aborts if
+the value does not fit, and a comptime_int element read at a run-time
+index or address (`for (field_values) |v|`) is allowed when only
+`@intCast` takes it (`resolveInst` refuses any other use). A run that
+aborts restores memory, the branch counter, and the quota to their
+state at the loop head, and the walker runs the loop on from there; a loop
+whose lowering is refused or whose run aborted is not tried again
+(`Zcu.comptime_osr_off`, by file and loop instruction), and a
+`not_ready` lowering is retried after 1024 more branches. Dependencies
+follow the same rules as a function's bytecode: the lowering's reads are
+conditional, the reached `comptime_dep`s and `entry_deps` plain. A
+lowered loop is used for one run only (the constants are the walker's
+state at that point), so it is not cached.
 
 **The laziness rule.** Lowering analyzes every branch of the body; the
 walker analyzes only the branches it takes. Analysis has effects beyond
@@ -346,7 +386,10 @@ read-only; `off` keeps it alive for runs in progress. With function bodies
 on a pool, `comptime_bodies` becomes a sharded map whose state changes by
 compare-and-swap, one worker lowers while others keep walking (no one
 waits on a lowering), and everything a run mutates (its frame, undo log,
-branch counter, comptime allocations) is per Sema, hence per worker.
+branch counter, comptime allocations) is per Sema, hence per worker. An
+OSR lowering and its run are per Sema too; `Zcu.comptime_osr_off` is a hint
+(a loop missing from it is only tried again), so it can be a sharded set
+that workers add to without ordering.
 
 **Measured (prototype, ReleaseFast, Sema only, minimum of 7–10 runs on a
 noisy orb; the spread between batches was ±10%).** libvaxis text_input:
@@ -359,10 +402,22 @@ outside the tables. What remains is the walker running
 about 40 ms of libvaxis's Sema), the walker runs before lowering, and the
 evaluator's interning of integers.
 
-**Next steps**, in order of measured payoff: lower generic instances (keyed
-by the comptime arguments) and lower a called-once function on its first
-call when its body has a loop, which deoptimization stubs make safe under
-the laziness rule; unboxed integers in the frame; then a denser encoding.
+**Measured (OSR, callgrind instructions for the whole build, ReleaseFast
+`-Dcpu=x86_64_v3`, against generic specializations).** libvaxis
+text_input 3.113 G → 3.024 G (−2.9%; it takes over uucode's
+`buildGraphemeBreakTable` loops and std's CRC table loop); hello
+925 M → 891 M (−3.7%); uucode's grapheme break table built 8 times
+3.369 G → 2.890 G (−14%); binary.zig 45.15 G → 45.37 G (+0.5%): no loop
+there reaches the threshold, and the cost is code layout of
+`analyzeBodyInner` around the new checks. What remains in the tables is
+the evaluator itself, mostly interning integers and the per-call
+overhead of `computeGraphemeBreak` (about 80 k instructions a call).
+
+**Next steps**, in order of measured payoff: unboxed integers in the
+frame; deoptimization stubs for references the walker has not resolved
+yet; generic calls whose comptime arguments are run-time values in the
+lowered code (uucode's `selectFieldIndexes` loop, refused today); then a
+denser encoding.
 
 ### CodeGen (`src/codegen/<arch>/`)
 
