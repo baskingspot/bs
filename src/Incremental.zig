@@ -102,7 +102,10 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .build_start = build_start,
         .timing = timing,
     };
-    inc.prev = Manifest.open(gpa, io, dir) catch null;
+    inc.prev = Manifest.open(gpa, io, dir) catch |err| prev: {
+        if (timing) std.debug.print("cache: unable to open the manifest: {t}\n", .{err});
+        break :prev null;
+    };
     return inc;
 }
 
@@ -133,8 +136,8 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     const gpa = inc.gpa;
     const io = inc.io;
     const t0 = now(io);
-    const m = if (inc.prev) |*m| m else return false;
-    if (m.entry == 0) return false;
+    const m = if (inc.prev) |*m| m else return inc.noRelink("no manifest", .{});
+    if (m.entry == 0) return inc.noRelink("no entry point", .{});
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(gpa);
     try m.changedInputs(gpa, io, &changed);
@@ -154,7 +157,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
             if (inc.timing) std.debug.print("cache: {d} inputs changed, first {s}\n", .{ changed.items.len, path });
             return false;
         }
-        const stat = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+        const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |err| return inc.noRelink("{s}: {t}", .{ path, err });
         if (restat == null) restat = .init(gpa, m);
         try restat.?.setInput(i, path, stat, in.content_hash, inc.build_start);
     }
@@ -162,8 +165,9 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
 
     var pack: Pack = try .open(io, inc.dir);
     defer pack.close(gpa, io);
-    if (pack.id != m.pack_id) return false;
-    for (0..m.bases.len) |i| _ = pack.addBase(gpa, io, inc.dir, m.basePack(i)) catch return false;
+    if (pack.id != m.pack_id) return inc.noRelink("the pack is not the manifest's", .{});
+    for (0..m.bases.len) |i| _ = pack.addBase(gpa, io, inc.dir, m.basePack(i)) catch |err|
+        return inc.noRelink("base pack {s}: {t}", .{ m.basePack(i), err });
     const in = try m.linkInput(gpa);
     const files = try gpa.alloc([]const u8, m.fileCount());
     defer gpa.free(files);
@@ -192,7 +196,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         .comp_dir = cwd,
     }) catch |err| switch (err) {
         // A damaged pack or manifest: build from scratch instead.
-        error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo => return false,
+        error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo => return inc.noRelink("{t} (atom '{s}')", .{ err, diag.atom }),
         else => {
             std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
             return err;
@@ -205,6 +209,13 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         in.refs.len, ms(t0, now(io)), m.inputCount(), ms(t0, t1), changed.items.len, ms(t1, t2), ms(t2, now(io)),
     });
     return true;
+}
+
+/// Returns false for `relinkIfUnchanged`, saying why under
+/// `ZAP_CACHE_TIMING`.
+fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bool {
+    if (inc.timing) std.debug.print("cache: not relinking: " ++ fmt ++ "\n", args);
+    return false;
 }
 
 /// Assigns the last build's error codes first, so that they keep their
@@ -766,16 +777,21 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             for (c.nodes[lo..hi]) |*n| switch (n.tag) {
                 .func, .link, .content => {
                     var h: Hash = 0;
-                    var lines: Hash = 0;
+                    // What the atoms' records hold besides their contents:
+                    // a store entry is reused only if its records are
+                    // these, byte for byte.
+                    var rest: Hash = 0;
                     for (n.atoms) |ai| {
-                        h = h *% 31 +% contentsHash(&c.atoms[ai]);
+                        const a = &c.atoms[ai];
+                        h = h *% 31 +% contentsHash(a);
+                        rest = rest *% 31 +% cache.hash(@truncate(@backingInt(a.key)), a.name);
                         if (c.debug_of[ai]) |d| {
                             h +%= cache.hash(@truncate(h), d.lines) +% @backingInt(d.frame);
-                            lines = lines *% 31 +% d.base_line;
+                            rest = rest *% 31 +% d.base_line +% cache.hash(6, d.file) +% cache.hash(7, d.name);
                         }
                     }
                     n.result_hash = h;
-                    n.exact_hash = h ^ cache.hash(5, std.mem.asBytes(&lines));
+                    n.exact_hash = h ^ cache.hash(5, std.mem.asBytes(&rest));
                 },
                 else => n.exact_hash = n.result_hash,
             };
@@ -996,13 +1012,16 @@ const Putter = struct {
             const p = l.p;
             for (p.nodes[lo..hi], p.where[lo..hi]) |*n, *w| {
                 if (n.atoms.len == 0) continue;
+                const len = p.entryLen(n);
                 if (try p.store.get(p.inc.gpa, p.inc.io, storeKey(p.inc.store_seed, n.key, n.src_hash))) |e| {
-                    if (e.resultHash() == n.exact_hash and e.atomCount() == n.atoms.len and e.deps().len == n.deps.len) {
+                    if (e.resultHash() == n.exact_hash and e.atomCount() == n.atoms.len and e.deps().len == n.deps.len and
+                        e.atomsBytes() == len - Store.atomsOffset(n.deps.len))
+                    {
                         w.* = .{ .hit = .{ .pack = e.pack, .offset = e.offset } };
                         continue;
                     }
                 }
-                w.* = .{ .put = .{ .len = p.entryLen(n) } };
+                w.* = .{ .put = .{ .len = len } };
             }
         }
     };

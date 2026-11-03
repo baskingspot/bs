@@ -974,6 +974,16 @@ it and can flush every CPU's TLB.
   fails is discarded with a warning, as a damaged pack falls back; a ZIR
   cache write failure is reported once. The generated `builtin.zig` is the
   exception: it must exist on disk to be compiled, as upstream's must.
+- **Reuse means identical records**: `record` reuses a store entry when
+  its result hash, counts, and atom-record length match, and the hash it
+  compares covers everything a record holds (symbol key, name, debug
+  file, name, and base line), not only the contents. Until 2026-11-03 it
+  covered contents and line numbers only, so an entry written by another
+  compilation whose atoms had other names was reused, the manifest's atom
+  references took this build's lengths, and the next relink failed its
+  record check and rebuilt from scratch: the conformance x86_64 unit (204k
+  atoms) took 15 s on every warm run instead of 0.5 s. `ZAP_CACHE_TIMING`
+  now says why a build does not relink.
 - **Touched but unchanged inputs**: when inputs' stats changed but their
   contents' hashes did not (a touch, a checkout, or an input too new to
   trust when recorded), the build still relinks, and their new stats go

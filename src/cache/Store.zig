@@ -313,6 +313,11 @@ pub const Entry = struct {
         return e.header().atoms_len;
     }
 
+    /// The length of the atom records.
+    pub fn atomsBytes(e: Entry) u64 {
+        return e.header().atoms_bytes;
+    }
+
     /// Decodes the entry's atoms into `out`, which has `atomCount()` items,
     /// and their debug info into the start of `debug`, which has as many;
     /// `Debug.atom` is the index in `out`. Returns how many have debug info.
