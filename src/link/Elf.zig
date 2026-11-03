@@ -1,6 +1,9 @@
-//! Static, non-PIE x86_64 ELF linker. Takes the whole set of Atoms, lays out
-//! sections, resolves relocations, and writes the executable in one pass
-//! into one buffer. Nothing is patched afterwards.
+//! x86_64 ELF linker for static, non-PIE executables and, with
+//! `Options.dynamic`, shared objects (whose dynamic sections `ElfDynamic`
+//! builds; see "Position-independent code and shared libraries" in
+//! docs/architecture.md). Takes the whole set of Atoms, lays out sections,
+//! resolves relocations, and writes the output in one pass into one
+//! buffer. Nothing is patched afterwards.
 //!
 //! File layout, with each segment starting on a page boundary and mapped at
 //! `base_address + file offset`:
@@ -49,6 +52,7 @@ const elf = std.elf;
 const Allocator = std.mem.Allocator;
 const Atom = @import("Atom.zig");
 const Dwarf = @import("Dwarf.zig");
+const ElfDynamic = @import("ElfDynamic.zig");
 /// DW_AT_language of the compile units: Zig, as upstream's self-hosted
 /// backend (its Linux Debug default) writes it, which gdb reads.
 const dwarf_language = std.dwarf.LANG.Zig;
@@ -93,6 +97,11 @@ pub const Options = struct {
     /// absolute addresses go to .data.rel.ro, which a loader may write, and
     /// local-dynamic TLS relocations are allowed. Executables are not.
     pic: bool = false,
+    /// A shared object (ET_DYN, `zap build-lib -dynamic`): its exports,
+    /// imports, and soname, from which `ElfDynamic` builds the dynamic
+    /// sections. Implies `pic`; `base_address` should be 0, `entry` null,
+    /// and `symbols` null.
+    dynamic: ?*const ElfDynamic.Options = null,
 };
 
 pub const FileWrites = enum {
@@ -474,7 +483,8 @@ const unset = std.math.maxInt(u32);
 const value_tag = 1 << 31;
 /// Section names. Outputs without debug info keep the prefix up to the
 /// names they use.
-const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00.data.rel.ro\x00";
+const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00.data.rel.ro\x00.dynsym\x00.dynstr\x00.hash\x00.gnu.hash\x00.rela.dyn\x00.plt\x00.dynamic\x00.got\x00";
+const shstrtab_no_dyn = shstrtab[0..shName(".dynsym")];
 const shstrtab_no_relro = shstrtab[0..shName(".data.rel.ro")];
 const shstrtab_no_sancov = shstrtab[0..shName("__sancov_pcs1")];
 const shstrtab_no_tls = shstrtab[0..shName(".tdata")];
@@ -519,6 +529,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
 
     const numbered = options.symbols;
     if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len) return error.InvalidSymbols;
+    // The cache, which numbers symbols, holds no pic compilations.
+    if (numbered != null and (options.pic or options.dynamic != null)) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
     defer symbols.deinit();
     // With numbered symbols, each number's address or value.
@@ -553,7 +565,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .n_partitions = n_partitions,
         .n_resolve_tasks = if (numbered == null) n_partitions else n_chunks,
         .numbered = numbered,
-        .pic = options.pic,
+        .pic = options.pic or options.dynamic != null,
+        .dynamic = options.dynamic != null,
         .addrs = addrs,
         .places = places,
         .keys = keys,
@@ -594,6 +607,29 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         strtab_len += c.str_len;
         max_targets = @max(max_targets, c.max_targets);
     }
+    // A shared object's dynamic tables, and the atoms of its exports.
+    var dyn_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer dyn_arena.deinit();
+    const dyn_opts = options.dynamic;
+    const dyn: ?ElfDynamic.Tables = if (dyn_opts) |d| try ElfDynamic.tables(dyn_arena.allocator(), d.*) else null;
+    const has_dyn = dyn != null;
+    const n_imports: u64 = if (dyn_opts) |d| d.imports.len else 0;
+    var dyn_exports: []u64 = &.{};
+    var n_rela: u64 = 0;
+    if (dyn) |*t| {
+        dyn_exports = try dyn_arena.allocator().alloc(u64, t.exports.len);
+        for (dyn_exports, t.exports) |*atom, i| {
+            const x = dyn_opts.?.exports[i];
+            atom.* = symbols.get(x.key) orelse {
+                diag.* = .{ .atom = x.name, .target = x.key };
+                return error.UndefinedSymbol;
+            };
+        }
+        for (chunks) |*c| {
+            c.rela = std.math.cast(u32, n_rela) orelse return error.OutOfMemory;
+            n_rela += c.n_rela;
+        }
+    }
     var values: SymbolTable = .empty;
     defer values.deinit();
     if (numbered) |s| {
@@ -609,25 +645,45 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             diag.* = .{ .target = e };
             return error.UndefinedSymbol;
         };
-        values = try .init(options.values.len + 2 * bound_sections.len, 1);
+        values = try .init(options.values.len + 2 * bound_sections.len + n_imports + 1, 1);
         for (options.values) |v| values.getOrPut(v.key).* = .{ .key = v.key, .value = v.value, .used = true };
     }
 
     // Section placement, as file offsets (for .bss, address - base).
-    const has_rx = sizes[text] > 0;
+    const plt_size = n_imports * ElfDynamic.plt_entry_size;
+    const has_rx = sizes[text] > 0 or plt_size > 0;
     const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
     const has_sancov = sizes[cntrs] > 0 or sizes[pcs] > 0;
     const has_relro = sizes[data_rel_ro] > 0;
-    const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls or sizes[cntrs] > 0 or has_relro;
+    const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls or sizes[cntrs] > 0 or has_relro or has_dyn;
     const has_cfi = n_debug > 0;
     // Which program headers are written, of all the linker writes, in
-    // order: PHDR; the R, RX, and RW LOADs; TLS; GNU_EH_FRAME; GNU_STACK.
-    const ph_present = [_]bool{ true, true, has_rx, has_rw, has_tls, has_cfi, true };
+    // order: PHDR; the R, RX, and RW LOADs; DYNAMIC; TLS; GNU_RELRO;
+    // GNU_EH_FRAME; GNU_STACK.
+    const ph_present = [_]bool{ true, true, has_rx, has_rw, has_dyn, has_tls, has_dyn, has_cfi, true };
     var phnum: u16 = 0;
     for (ph_present) |p| phnum += @intFromBool(p);
     const headers_end: u64 = @sizeOf(elf.Elf64.Ehdr) + phnum * @sizeOf(elf.Elf64.Phdr);
+    // A shared object's read-only dynamic tables follow the headers; the
+    // .rela.dyn records are the atoms' absolute relocations, in atom
+    // order, then the TLS GOT pair's module, then the imports' GOT slots.
+    var dynsym_off: u64 = 0;
+    var dynstr_off: u64 = 0;
+    var hash_off: u64 = 0;
+    var gnu_hash_off: u64 = 0;
+    var rela_off: u64 = 0;
+    var r_tables_end = headers_end;
+    if (dyn) |*t| {
+        n_rela += @intFromBool(has_tls) + n_imports;
+        dynsym_off = std.mem.alignForward(u64, headers_end, 8);
+        dynstr_off = dynsym_off + t.dynsymSize();
+        hash_off = std.mem.alignForward(u64, dynstr_off + t.dynstr.len, 8);
+        gnu_hash_off = std.mem.alignForward(u64, hash_off + t.hash.len, 8);
+        rela_off = std.mem.alignForward(u64, gnu_hash_off + t.gnu_hash.len, 8);
+        r_tables_end = rela_off + n_rela * @sizeOf(elf.Elf64.Rela);
+    }
     var starts: [n_sections]u64 = undefined;
-    starts[rodata] = aligns[rodata].forward(headers_end);
+    starts[rodata] = aligns[rodata].forward(r_tables_end);
     const rodata_end = starts[rodata] + sizes[rodata];
     // The coverage PC table, if any, follows .rodata in the R segment.
     starts[pcs] = aligns[pcs].forward(rodata_end);
@@ -639,7 +695,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + n_debug * Dwarf.eh_frame_hdr_entry_size else 0;
     const r_end = if (has_cfi) hdr_off + hdr_room else pcs_end;
     const rx_start = if (has_rx) std.mem.alignForward(u64, r_end, page_size) else r_end;
-    starts[text] = aligns[text].forward(rx_start);
+    const plt_off = if (has_dyn) std.mem.alignForward(u64, rx_start, 16) else rx_start;
+    starts[text] = aligns[text].forward(plt_off + plt_size);
     const text_end = starts[text] + sizes[text];
     const rw_start = if (has_rw) std.mem.alignForward(u64, text_end, page_size) else text_end;
     // The TLS segment: its start and every thread's copy are aligned to
@@ -652,7 +709,19 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const tls_end = starts[tbss] + sizes[tbss];
     starts[data_rel_ro] = aligns[data_rel_ro].forward(tls_end);
     const relro_end = starts[data_rel_ro] + sizes[data_rel_ro];
-    starts[data] = aligns[data].forward(relro_end);
+    // A shared object's .dynamic and .got end PT_GNU_RELRO, which ends
+    // on a page boundary so that the loader protects all of it.
+    var dynamic_off: u64 = 0;
+    var got_off: u64 = 0;
+    var got_size: u64 = 0;
+    var data_floor = relro_end;
+    if (dyn) |*t| {
+        dynamic_off = std.mem.alignForward(u64, relro_end, 8);
+        got_off = dynamic_off + ElfDynamic.dynamicCount(t) * @sizeOf(elf.Elf64_Dyn);
+        got_size = 16 * @as(u64, @intFromBool(has_tls)) + 8 * n_imports;
+        data_floor = std.mem.alignForward(u64, got_off + got_size, page_size);
+    }
+    starts[data] = aligns[data].forward(data_floor);
     const file_end = starts[data] + sizes[data];
     starts[bss] = aligns[bss].forward(file_end);
     // The coverage counters, if any, are memory only after .bss.
@@ -689,8 +758,17 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .start = base + tls_start,
         .end = base + tls_end,
         .tp = base + tls_start + tls_align.forward(tls_end - tls_start),
-        .ld_got = if (options.pic) base + tls_start else null,
+        .ld_got = if (has_dyn) base + got_off else if (options.pic) base + tls_start else null,
     };
+    if (dyn_opts) |d| {
+        l.plt_start = base + plt_off;
+        l.plt_end = l.plt_start + plt_size;
+        l.rela_off = rela_off;
+        // Imports resolve to their PLT stubs; absolute relocations to
+        // them become symbol relocations.
+        for (d.imports, 0..) |imp, i| values.getOrPut(imp.key).* = .{ .key = imp.key, .value = l.plt_start + i * ElfDynamic.plt_entry_size, .used = true };
+        values.getOrPut(ElfDynamic.dynamic_key).* = .{ .key = ElfDynamic.dynamic_key, .value = base + dynamic_off, .used = true };
+    }
     try parallel(io, n_threads, l.n_resolve_tasks + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
     try l.check(diag);
     const entry_addr = if (numbered) |s| l.numberedAddr(addrs[s.entry]) else if (options.entry) |e| symbols.get(e).? else 0;
@@ -717,9 +795,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
     const strtab_off = symtab_off + @as(u64, n_syms) * @sizeOf(elf.Elf64.Sym);
     const shstrtab_off = strtab_off + strtab_len;
-    const shstr = if (has_relro) shstrtab else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
+    const shstr = if (has_dyn) shstrtab else if (has_relro) shstrtab_no_dyn else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug));
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + 8 * @as(u16, @intFromBool(has_dyn));
     l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     switch (l.target) {
         .memory => |buf| {
@@ -729,7 +807,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .file => {
             // Room for the largest task's parts of the output.
             for (chunks) |*c| {
-                var len: u64 = @as(u64, c.n_syms) * @sizeOf(elf.Elf64.Sym) + c.str_len;
+                var len: u64 = @as(u64, c.n_syms) * @sizeOf(elf.Elf64.Sym) + c.str_len + @as(u64, c.n_rela) * @sizeOf(elf.Elf64.Rela);
                 for (c.lead_gaps, c.sizes, zero_fill) |gap, size, no_bytes| {
                     if (!no_bytes) len += gap + size;
                 }
@@ -770,6 +848,55 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         try l.put(hdr_off, &Dwarf.ehFrameHdr(eh_frame_rel, dwarf.n_frames));
         try l.fill(hdr_off + hdr_size, r_end - (hdr_off + hdr_size));
     }
+    if (dyn) |*t| {
+        // The tables the copy tasks do not write, over the padding filled
+        // above: the chunks write their atoms' .rela.dyn records.
+        const d = dyn_opts.?;
+        const a = dyn_arena.allocator();
+        const defined = try a.alloc(ElfDynamic.Defined, dyn_exports.len);
+        for (defined, dyn_exports) |*def, atom| {
+            const p = places[atom];
+            def.* = .{
+                .value = l.atomAddr(atom) - l.sym_bias[p.section],
+                .size = input.atom(atom).size(),
+                .shndx = l.shndx[p.section],
+                .type = sym_types[p.section],
+            };
+        }
+        const dynsym = try a.alloc(u8, t.dynsymSize());
+        ElfDynamic.writeSymbols(dynsym, t, d.*, defined);
+        try l.put(dynsym_off, dynsym);
+        try l.put(dynstr_off, t.dynstr);
+        try l.put(hash_off, t.hash);
+        try l.put(gnu_hash_off, t.gnu_hash);
+        const tail = try a.alloc(elf.Elf64.Rela, @intFromBool(has_tls) + n_imports);
+        var k: usize = 0;
+        if (has_tls) {
+            tail[0] = .{ .offset = base + got_off, .info = .{ .type = @backingInt(elf.R_X86_64.DTPMOD64), .sym = 0 }, .addend = 0 };
+            k = 1;
+        }
+        const slots = got_off + 16 * @as(u64, @intFromBool(has_tls));
+        const plt = try a.alloc(u8, plt_size);
+        for (0..n_imports) |i| {
+            const slot = base + slots + 8 * i;
+            tail[k + i] = .{ .offset = slot, .info = .{ .type = @backingInt(elf.R_X86_64.GLOB_DAT), .sym = @intCast(1 + i) }, .addend = 0 };
+            const stub = l.plt_start + i * ElfDynamic.plt_entry_size;
+            plt[i * ElfDynamic.plt_entry_size ..][0..ElfDynamic.plt_entry_size].* = ElfDynamic.pltEntry(stub, slot);
+        }
+        try l.put(rela_off + (n_rela - tail.len) * @sizeOf(elf.Elf64.Rela), std.mem.sliceAsBytes(tail));
+        try l.put(plt_off, plt);
+        const dynamic = try a.alloc(u8, ElfDynamic.dynamicCount(t) * @sizeOf(elf.Elf64_Dyn));
+        ElfDynamic.writeDynamic(dynamic, t, .{
+            .dynsym = base + dynsym_off,
+            .dynstr = base + dynstr_off,
+            .hash = base + hash_off,
+            .gnu_hash = base + gnu_hash_off,
+            .rela = base + rela_off,
+            .rela_size = n_rela * @sizeOf(elf.Elf64.Rela),
+        });
+        try l.put(dynamic_off, dynamic);
+        // The GOT is zeros until the loader fills it.
+    }
     if (has_debug) {
         try l.put(abbrev_off, &Dwarf.abbrev);
         l.info_off = info_off;
@@ -795,7 +922,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var head: [@sizeOf(elf.Elf64.Ehdr) + ph_present.len * @sizeOf(elf.Elf64.Phdr)]u8 = undefined;
     writeStruct(&head, elf.Elf64.Ehdr{
         .ident = .{ .class = .@"64", .data = .@"2LSB", .version = 1, .osabi = .NONE, .abiversion = 0 },
-        .type = .EXEC,
+        .type = if (has_dyn) .DYN else .EXEC,
         .machine = .X86_64,
         .version = 1,
         .entry = entry_addr.?,
@@ -818,7 +945,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .{ .LOAD, .{ .R = true }, 0, base, r_end, r_end, page_size },
         .{ .LOAD, .{ .R = true, .X = true }, rx_start, base + rx_start, text_end - rx_start, text_end - rx_start, page_size },
         .{ .LOAD, .{ .R = true, .W = true }, rw_start, base + rw_start, file_end - rw_start, mem_end - rw_start, page_size },
+        // (Absent ones may wrap.)
+        .{ .DYNAMIC, .{ .R = true, .W = true }, dynamic_off, base + dynamic_off, got_off -% dynamic_off, got_off -% dynamic_off, 8 },
         .{ .TLS, .{ .R = true }, tls_start, base + tls_start, sizes[tdata], tls_end - tls_start, tls_align.toByteUnits() },
+        .{ .GNU_RELRO, .{ .R = true }, rw_start, base + rw_start, got_off + got_size -% rw_start, got_off + got_size -% rw_start, 1 },
         .{ .GNU_EH_FRAME, .{ .R = true }, hdr_off, base + hdr_off, hdr_size, hdr_size, 4 },
         .{ .GNU_STACK, .{ .R = true, .W = true }, 0, 0, 0, std.mem.alignForward(u64, options.stack_size, page_size), 1 },
     };
@@ -858,6 +988,33 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName("__sancov_cntrs"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[cntrs], sizes[cntrs], aligns[cntrs]),
     };
     const strtab_ndx = shnum - 2;
+    // A shared object's sections go last among the allocated ones, so the
+    // others keep their indices (`shndxOf`).
+    const dynsym_ndx: u32 = if (has_dyn) shnum - 3 - 8 else 0;
+    const dyn_shdrs = blk: {
+        const t = if (dyn) |*t| t else &ElfDynamic.Tables{ .exports = &.{}, .n_imports = 0, .dynstr = "", .names = &.{}, .soname = null, .hash = "", .gnu_hash = "" };
+        var h = [_]elf.Elf64.Shdr{
+            shdr(shName(".dynsym"), .DYNSYM, .{ .ALLOC = true }, base, dynsym_off, t.dynsymSize(), .@"8"),
+            shdr(shName(".dynstr"), .STRTAB, .{ .ALLOC = true }, base, dynstr_off, t.dynstr.len, .@"1"),
+            shdr(shName(".hash"), .HASH, .{ .ALLOC = true }, base, hash_off, t.hash.len, .@"8"),
+            shdr(shName(".gnu.hash"), .GNU_HASH, .{ .ALLOC = true }, base, gnu_hash_off, t.gnu_hash.len, .@"8"),
+            shdr(shName(".rela.dyn"), .RELA, .{ .ALLOC = true }, base, rela_off, n_rela * @sizeOf(elf.Elf64.Rela), .@"8"),
+            shdr(shName(".plt"), .PROGBITS, .{ .ALLOC = true, .EXECINSTR = true }, base, plt_off, plt_size, .@"16"),
+            shdr(shName(".dynamic"), .DYNAMIC, .{ .ALLOC = true, .WRITE = true }, base, dynamic_off, got_off -% dynamic_off, .@"8"),
+            shdr(shName(".got"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, got_off, got_size, .@"8"),
+        };
+        h[0].link = dynsym_ndx + 1;
+        h[0].info = 1;
+        h[0].entsize = @sizeOf(elf.Elf64.Sym);
+        h[2].link = dynsym_ndx;
+        h[2].entsize = 4;
+        h[3].link = dynsym_ndx;
+        h[4].link = dynsym_ndx;
+        h[4].entsize = @sizeOf(elf.Elf64.Rela);
+        h[6].link = dynsym_ndx + 1;
+        h[6].entsize = @sizeOf(elf.Elf64_Dyn);
+        break :blk h;
+    };
     const shdrs = [_]elf.Elf64.Shdr{
         std.mem.zeroes(elf.Elf64.Shdr),
         shdr(shName(".rodata"), .PROGBITS, .{ .ALLOC = true }, base, starts[rodata], sizes[rodata], aligns[rodata]),
@@ -866,14 +1023,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName(".data.rel.ro"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data_rel_ro], sizes[data_rel_ro], aligns[data_rel_ro]),
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
-    } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ [_]elf.Elf64.Shdr{
+    } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ dyn_shdrs ++ [_]elf.Elf64.Shdr{
         .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = n_syms, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
         nonAlloc(shName(".strtab"), .STRTAB, strtab_off, strtab_len),
         nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
     var sh_buf: [shdrs.len * @sizeOf(elf.Elf64.Shdr)]u8 = undefined;
     var sh_at: usize = 0;
-    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ true, 3 } };
+    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ has_dyn, dyn_shdrs.len }, .{ true, 3 } };
     var group: usize = 0;
     var group_end: usize = present[0][1];
     for (shdrs, 0..) |s, i| {
@@ -897,6 +1054,9 @@ const Chunk = struct {
     n_syms: u32,
     str_len: u32,
     max_targets: u32,
+    /// In a shared object, the atoms' absolute relocations, each of which
+    /// is a dynamic relocation.
+    n_rela: u32,
     // Filled in serially after `Link.layOut`.
     /// Where the chunk's atoms of each section start, within the section.
     bases: [n_sections]u64,
@@ -905,6 +1065,8 @@ const Chunk = struct {
     /// The chunk's first symbol in .symtab and first byte in .strtab.
     sym: u32,
     str: u32,
+    /// The chunk's first record in .rela.dyn.
+    rela: u32,
 };
 
 const Failure = struct { atom: usize, err: Error, diag: Diagnostic };
@@ -929,6 +1091,14 @@ fn LinkOf(comptime Input: type) type {
         numbered: ?Symbols,
         /// `Options.pic`.
         pic: bool,
+        /// Whether `Options.dynamic` is set.
+        dynamic: bool,
+        /// In a shared object: the PLT stubs' addresses, one per import in
+        /// .dynsym order after the null symbol, which imports resolve to;
+        /// and .rela.dyn's file offset.
+        plt_start: u64 = 0,
+        plt_end: u64 = 0,
+        rela_off: u64 = 0,
         /// With numbered symbols, where each is (see `unset`).
         addrs: []u32,
         places: []Place,
@@ -1116,12 +1286,19 @@ fn LinkOf(comptime Input: type) type {
                 .n_syms = 0,
                 .str_len = 0,
                 .max_targets = 0,
+                .n_rela = 0,
                 .bases = undefined,
                 .lead_gaps = undefined,
                 .sym = undefined,
                 .str = undefined,
+                .rela = undefined,
             };
             defer l.chunks[chunk] = c;
+            // Locals: the loop writes through pointers that could alias `l`.
+            // Numbered input comes from the cache, which holds no pic
+            // compilations, so that path compiles without them.
+            const pic = !numbered and l.pic;
+            const dynamic = !numbered and l.dynamic;
             for (l.places[begin..end], begin..) |*p, i| {
                 // The numbered path's first read of each atom; the key
                 // path checked them in `gatherKeys`.
@@ -1145,7 +1322,7 @@ fn LinkOf(comptime Input: type) type {
                     l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
                     continue;
                 }
-                const s = if (l.pic and a.section == .rodata and hasAbs(a)) data_rel_ro else @backingInt(a.section);
+                const s = if (pic and a.section == .rodata and hasAbs(a)) data_rel_ro else @backingInt(a.section);
                 const off = a.alignment.forward(c.sizes[s]);
                 p.* = .{
                     .offset = std.math.cast(u38, off) orelse {
@@ -1163,6 +1340,9 @@ fn LinkOf(comptime Input: type) type {
                 c.n_syms += 1;
                 if (a.name.len > 0) c.str_len += @intCast(a.name.len + 1);
                 c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
+                if (dynamic) {
+                    for (a.relocs) |r| c.n_rela += @intFromBool(r.info.kind == .x86_64_abs64);
+                }
             }
         }
 
@@ -1177,7 +1357,8 @@ fn LinkOf(comptime Input: type) type {
 
         fn copyAll(l: *Link, task: usize, thread: usize) void {
             if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len, thread);
-            if (l.numbered == null) l.copy(task, thread, false) else l.copyNumbered(task, thread);
+            if (l.dynamic) return l.copyDynamic(task, thread);
+            if (l.numbered == null) l.copy(task, thread, false, false) else l.copyNumbered(task, thread);
         }
 
         /// Writes one chunk's subprogram entries, line sequences, FDEs, and
@@ -1303,17 +1484,25 @@ fn LinkOf(comptime Input: type) type {
         /// their symbols.
         /// Out of line, so that the key-based `copy` compiles as if alone.
         noinline fn copyNumbered(l: *Link, chunk: usize, thread: usize) void {
-            l.copy(chunk, thread, true);
+            l.copy(chunk, thread, true, false);
         }
 
-        fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
+        /// A shared object's, which also writes a .rela.dyn record per
+        /// absolute relocation; out of line, as `copyNumbered`.
+        noinline fn copyDynamic(l: *Link, chunk: usize, thread: usize) void {
+            l.copy(chunk, thread, false, true);
+        }
+
+        fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool, comptime dynamic: bool) void {
             const c = &l.chunks[chunk];
             const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
             // The chunk's part of each section with file contents, from the
-            // padding before it, then its symbols and their names. Sections
-            // without file contents get empty parts.
-            var offsets: [n_sections + 2]u64 = @splat(0);
-            var lens: [n_sections + 2]u64 = @splat(0);
+            // padding before it, then its symbols and their names, and in a
+            // shared object its .rela.dyn records. Sections without file
+            // contents get empty parts.
+            const n_parts = n_sections + 2 + @intFromBool(dynamic);
+            var offsets: [n_parts]u64 = @splat(0);
+            var lens: [n_parts]u64 = @splat(0);
             for (offsets[0..n_sections], lens[0..n_sections], c.lead_gaps, c.bases, c.sizes, l.section_addrs, zero_fill) |*off, *len, gap, chunk_base, size, sa, no_bytes| {
                 if (no_bytes) continue;
                 off.* = sa - l.base + chunk_base - gap;
@@ -1325,7 +1514,13 @@ fn LinkOf(comptime Input: type) type {
             lens[symtab] = @as(u64, c.n_syms) * @sizeOf(elf.Elf64.Sym);
             offsets[strtab] = l.strtab_off + c.str;
             lens[strtab] = c.str_len;
-            const out = l.parts(thread, n_sections + 2, offsets, lens);
+            const rela = n_sections + 2;
+            if (dynamic) {
+                offsets[rela] = l.rela_off + @as(u64, c.rela) * @sizeOf(elf.Elf64.Rela);
+                lens[rela] = @as(u64, c.n_rela) * @sizeOf(elf.Elf64.Rela);
+            }
+            var rela_at: usize = 0;
+            const out = l.parts(thread, n_parts, offsets, lens);
             for (out[0..n_sections], c.lead_gaps, fills, zero_fill) |o, gap, byte, no_bytes| {
                 if (!no_bytes) @memset(o[0..gap], byte);
             }
@@ -1362,6 +1557,19 @@ fn LinkOf(comptime Input: type) type {
                     }
                     var diag: Diagnostic = .{};
                     applyRelocs(a, dst, addr, res, &l.tls, &diag) catch |err| return l.fail(chunk, i, err, diag);
+                    if (dynamic) for (a.relocs) |r| {
+                        if (r.info.kind != .x86_64_abs64) continue;
+                        // Code must not need the loader to write it.
+                        if (place.section == @backingInt(Atom.Section.text)) return l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name, .target = a.targets[r.info.target] });
+                        const t = res[r.info.target];
+                        const v = t +% @as(u64, @bitCast(@as(i64, r.addend)));
+                        const rec: elf.Elf64.Rela = if (t >= l.plt_start and t < l.plt_end)
+                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.@"64"), .sym = @intCast(1 + (t - l.plt_start) / ElfDynamic.plt_entry_size) }, .addend = r.addend }
+                        else
+                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.RELATIVE), .sym = 0 }, .addend = @bitCast(v) };
+                        writeStruct(out[rela][rela_at..], rec);
+                        rela_at += @sizeOf(elf.Elf64.Rela);
+                    };
                 }
                 var name: u32 = 0;
                 if (a.name.len > 0) {
@@ -1383,7 +1591,7 @@ fn LinkOf(comptime Input: type) type {
                 });
                 sym_off += @sizeOf(elf.Elf64.Sym);
             }
-            l.writeParts(chunk, begin, n_sections + 2, offsets, out);
+            l.writeParts(chunk, begin, n_parts, offsets, out);
         }
     };
 }

@@ -39,19 +39,15 @@ const Allocator = std.mem.Allocator;
 const Atom = @import("Atom.zig");
 const Dwarf = @import("Dwarf.zig");
 const Elf = @import("Elf.zig");
+const ElfDynamic = @import("ElfDynamic.zig");
 const SymbolKey = Atom.SymbolKey;
 
 /// A symbol the object defines for other objects: the atom `key`, as
 /// `name`.
-pub const Export = struct {
-    key: SymbolKey,
-    name: []const u8,
-    weak: bool = false,
-    visibility: std.lang.SymbolVisibility = .default,
-};
+pub const Export = ElfDynamic.Export;
 /// A symbol the object references and another object defines. Relocations
 /// name it by `key`, which no atom may have.
-pub const Import = struct { key: SymbolKey, name: []const u8, weak: bool = false };
+pub const Import = ElfDynamic.Import;
 
 pub const Symbols = struct {
     exports: []const Export = &.{},
