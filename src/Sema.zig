@@ -13410,10 +13410,17 @@ fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: R
     const info = ip.structInfo(ty);
     const name = sema.enumTagName(c.items[0]).?;
     const i = info.fieldIndex(ip, name).?;
-    if (sema.resolveValue(operand)) |v| return .fromInterned(try sema.fieldValue(v, i));
     const differing = for (c.items[1..]) |item| {
         if (info.field_types[info.fieldIndex(ip, sema.enumTagName(item).?).?] != info.field_types[i]) break true;
     } else false;
+    if (sema.resolveValue(operand)) |v| {
+        // The active field, which need not be the prong's first item.
+        if (c.items.len == 1 or ip.keyTag(v) != .un) return .fromInterned(try sema.fieldValue(v, i));
+        const active = info.fieldIndex(ip, sema.enumTagName(ip.keyPayload(.un, v).tag).?).?;
+        const val: Ref = .fromInterned(try sema.fieldValue(v, active));
+        if (!differing) return val;
+        return sema.coerce(block, try sema.unionCapturePeer(block, src, ty, c.items), val, src);
+    }
     if (differing) return sema.peerUnionCapture(block, src, c.items, operand);
     if (!Type.hasRuntimeBits(ip, info.field_types[i]) and !Type.isComptimeOnly(ip, info.field_types[i]))
         if (try sema.onePossibleValue(info.field_types[i])) |v| return .fromInterned(v);
@@ -13428,12 +13435,8 @@ fn peerUnionCapture(sema: *Sema, block: *Block, src: Src, items: []const Index, 
     const ty = sema.typeOf(operand);
     const info = ip.structInfo(ty);
     const fields = try sema.arena.alloc(u32, items.len);
-    const samples = try sema.arena.alloc(Ref, items.len);
-    for (items, fields, samples) |item, *f, *r| {
-        f.* = info.fieldIndex(ip, sema.enumTagName(item).?).?;
-        r.* = .fromInterned(try sema.undefValue(info.field_types[f.*]));
-    }
-    const peer = try sema.resolvePeerTypes(block, src, samples);
+    for (items, fields) |item, *f| f.* = info.fieldIndex(ip, sema.enumTagName(item).?).?;
+    const peer = try sema.unionCapturePeer(block, src, ty, items);
     try sema.requireRuntime(block, src);
     const tag = try sema.unionTag(block, src, operand);
     const block_inst = try sema.reserveInst();
@@ -13460,6 +13463,15 @@ fn peerUnionCapture(sema: *Sema, block: *Block, src: Src, items: []const Index, 
     }
     try sema.addBlock(block, block_inst, peer, chain);
     return block_inst.toRef();
+}
+
+/// The peer type of union `ty`'s fields named by a prong's `items`.
+fn unionCapturePeer(sema: *Sema, block: *Block, src: Src, ty: Index, items: []const Index) CompileError!Index {
+    const ip = sema.ip;
+    const info = ip.structInfo(ty);
+    const samples = try sema.arena.alloc(Ref, items.len);
+    for (items, samples) |item, *r| r.* = .fromInterned(try sema.undefValue(info.field_types[info.fieldIndex(ip, sema.enumTagName(item).?).?]));
+    return sema.resolvePeerTypes(block, src, samples);
 }
 
 fn bindSwitchCaptures(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: Ref, capture_inst: Zir.Inst.Index) CompileError!void {

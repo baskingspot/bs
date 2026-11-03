@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -76,6 +76,23 @@ fn twice(x: u32) u32 {
 }
 const rules = .{.{ .name = "a", .func = twice }};
 
+// zig-protobuf (protobuf.zig): a prong over several union fields captures
+// the active one at comptime, coerced to their peer type if they differ.
+const Repeated = union(enum) { scalar: u8, submessage: void };
+const FieldType = union(enum) { repeated: Repeated, packed_repeated: Repeated, small: u8, wide: u16 };
+fn isSubmessage(comptime t: FieldType) bool {
+    return switch (t) {
+        .repeated, .packed_repeated => |r| r == .submessage,
+        else => false,
+    };
+}
+fn width(comptime t: FieldType) u32 {
+    return switch (t) {
+        .small, .wide => |w| w,
+        else => 0,
+    };
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -109,5 +126,8 @@ fn main() callconv(.c) noreturn {
     };
     rt.printInt(@intFromBool(@TypeOf(arr) == [1]u8 and arr[0] == 'a'));
     rt.printInt(@intFromBool(rules[0].func(21) == 42));
+
+    rt.printInt(@intFromBool(comptime isSubmessage(.{ .packed_repeated = .submessage })));
+    rt.printInt(comptime width(.{ .wide = 300 }));
     rt.exit(0);
 }
