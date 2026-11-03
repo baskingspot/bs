@@ -3191,42 +3191,92 @@ fixed first:
 - The union analyzer stores `.have_layout` in two places; both must come
   after its last result field.
 - `analyzeNavVal` writes `nav.ty` and `nav.alignment` before the value
-  resolves, for `navRef`. In step 2, a release store of a "type known" bit
-  publishes them, and only a reader on the unit's logical stack (below)
-  reads them early.
+  resolves, for `navRef`. Prerequisite 1 below removes that partial read.
+
+Two Sema changes come before step 2. Both fix bugs today, and the Sema
+thread can land them on their own:
+1. *A `nav_ty` unit*, as upstream has. A declaration with a type
+   annotation resolves its type without its value, and `navRef` claims
+   only that unit. This removes the partial read of a resolving
+   declaration (and with it any "type known" bit), and makes legal
+   address-of cycles acyclic. A repro that fails today:
+   `const S = struct { p: *const anyopaque }; var x: S = .{ .p =
+   @ptrCast(&y) }; var y = &x;` with `export fn f() usize { return
+   @intFromPtr(&x); }` and `export fn g() usize { return @intFromPtr(&y);
+   }`. zap accepts it when f's export comes first and reports
+   "dependency loop detected" when g's comes first. Upstream accepts both.
+   It also removes a result difference: the partial path drops an
+   explicit alignment equal to the natural one, while the full path keeps
+   it, so `&x` got a different pointer type inside a cycle.
+2. *Function types resolve the field types of by-value parameter types*,
+   under a claim, as upstream's `comptimeOnlySema` does. They skip only a
+   type that is truly on the logical stack. Today `zirFunc`'s
+   function-type path calls `Type.isComptimeOnly` on unresolved parameter
+   types, and `Type.comptimeOnly` then reads `info.field_types` at status
+   `none` or `field_types_wip`. In parallel that is a data race. It is
+   also a bug now: with `const S = struct { t: type }; const F = fn (S)
+   void;`, `F == fn (S) void` is false in zap if F was interned before S's
+   fields resolved, and true upstream. All of the `comptimeOnly` cycles
+   measured below come from this site.
+
+`Type` queries then read only published phases. Stage A adds a checked
+build that asserts a ContainerInfo or Nav field is read only after its
+phase is published, or while the unit is held on the reader's logical
+stack.
 
 A thread that finds a unit in progress on another worker waits on the
 word (a futex wait on its value), after registering the wait (below).
 
 **Step 2, inferred error sets.** A caller that needs a callee's resolved
 set calls `ensureFuncIes`, which is a unit claim like the others: done,
-read the set; queued and unclaimed, claim it and analyze the body on this worker
-(today's nested analysis); in progress elsewhere, wait, with the cycle
-check. A body that needs its own set while analyzing itself is the
-recursion case that is a dependency loop today, and stays one (reported
-by the serial rerun below). `ready_irs` goes away. On
+read the set; queued and unclaimed, claim it and analyze the body on
+this worker (today's nested analysis); in progress elsewhere, wait, with
+the cycle check. A body that needs its own set while analyzing itself is
+the recursion case that is a dependency loop today, and stays one
+(reported by the serial rerun below). `ready_irs` goes away. On
 binary.zig most bodies are reached this way, so work stealing must not
 assume bodies come from the queue: a nested body's CodeGen runs right
 after its Sema on the worker that claimed it.
 
 **Step 2, the logical stack and dependency loops.** Today "in progress"
-means "on my native stack", and code relies on that in six places:
+means "on my native stack", and code relies on that in these places:
 - `ensure*` returns `error.DependencyLoop`, which `Sema.depLoop` reports
   at the innermost requester.
-- `navRef` reads `nav.ty` of a resolving declaration.
-- `resolveLayoutIfIdle` and `resolveStructFields` skip a layout in progress.
+- `errorSetNames` turns a `DependencyLoop` from `ensureFuncIes` into its
+  own error, "unable to resolve inferred error set" (a failing reader).
+- `navRef` reads `nav.ty` of a resolving declaration (gone with
+  prerequisite 1).
+- `resolveLayoutIfIdle` and `resolveStructFields` skip a layout in
+  progress. After such a skip, `noPossibleValue` and
+  `isComptimeOnlyResolved` answer from partial state ("taken to have
+  values", "the fields known so far").
+- `errSetIsEmpty` answers "not empty" on an inferred-error-set loop.
 - `Type.comptimeOnly` reads `.computing` as a cycle (`hit_cycle`).
 - Replay's `greenNode` accepts a resolving `nav_val` dependency.
 - `ensureStructLayout` sets `layout_wip` around `loadLayout`.
+
+Measured on main (ced55dc, ReleaseFast, a counter on every path), on the
+zig workload, the std tests, libvaxis and all of behavior: `navRef`
+partial reads 0, 0, 0 and 4; `IfIdle` skips, `resolveStructFields`
+skips, inferred-error-set loop answers and loop reports 0 everywhere;
+`comptimeOnly` cycles 143, 64 and 23 on the first three, every one the
+incomplete case at status `none`, from the `zirFunc` site that
+prerequisite 2 fixes.
 
 In parallel, a unit in progress may belong to another worker. The rule:
 a unit held by worker W is *on my logical stack* if W is me, or if W is
 waiting, directly or through other waiting workers, on a unit I hold.
 That is exactly when the serial build would have analyzed my current
-unit nested inside it. On my logical stack, today's behavior applies
-unchanged: a partial read, a skip, or a dependency loop. Otherwise, I
-wait until the unit is done or failed. That gives me the state the
-serial build would have found after analyzing the unit itself.
+unit nested inside it. Otherwise, I wait until the unit is done or
+failed, which gives me the state the serial build would have found
+after analyzing the unit itself. On my logical stack, the outcome
+depends on which member of the cycle the schedule entered first, and
+skipping changes results: an answer-returning reader answers
+differently, an `IfIdle` skip records no `type_layout` edge where a
+resolve does, and a partial read can decide success versus a loop. So
+every hit on the logical stack (a loop, a failing reader, or a
+tolerating one) triggers a serial rerun (below). With the prerequisites
+in, the measurements above say that almost never happens.
 
 - *The wait graph.* Each worker has one `waiting_on` slot. Registering a
   wait and walking the chain both happen under one global mutex,
@@ -3251,23 +3301,32 @@ serial build would have found after analyzing the unit itself.
   schedule, it reruns the whole compilation in process, as `main.compile`
   already reruns `compileReplaying` on `LazyFallback`. There are two
   kinds:
-  - *Serial reruns.* A dependency loop, or a body that fails its branch
-    quota while a later caller could still raise it (rule 7). Which unit
-    finds a loop, and where, depends on where the cycle was entered. So a
-    parallel build stops at the first such event and reruns with one Sema
-    thread. With one worker the native stack is the logical stack and the
-    queue order is fixed, so that run reports exactly what a
-    `ZAP_SEMA_THREADS=1` build reports. A one-thread build never needs
-    this rerun. Both cases are compile errors, so their cost does not
-    matter.
+  - *Serial reruns.* Any hit on the logical stack (above), or an
+    "evaluation exceeded" failure (rule 7). Which unit finds a loop, and
+    where, depends on where the cycle was entered, and a tolerating
+    reader's answer depends on the same thing. So a parallel build stops
+    at the first such event and reruns with one Sema thread. With one
+    worker the native stack is the logical stack and the queue order is
+    fixed, so that run gives exactly what a `ZAP_SEMA_THREADS=1` build
+    gives, including whether a cycle that a partial read could resolve
+    succeeds. A one-thread build never needs this rerun. Discarding the
+    parallel run also discards what a unit did before it failed:
+    functions it queued, `func_refs` and `referenced_by` entries, which a
+    rollback inside the build would otherwise have to undo.
   - *Code reruns.* A unit read a provisional error code at comptime
     (rule 5). The build reruns with the final codes seeded first, at
     every thread count, one thread included.
-- *Readers that tolerate work in progress.* `resolveLayoutIfIdle`,
-  `resolveStructFields` and `greenNode`'s shortcut follow the same rule.
-  Whether they skip must not change the unit's result: the serial build
-  already chose differently depending on discovery order. To confirm
-  per call site in review.
+- *"Resolved yet?" reads.* A separate class: no cycle, just a check of
+  whether another unit is done.
+  - Some only choose a tier and may stay timing-dependent: the comptime
+    body key's `layoutResolved`, `bcRequire`, and the status of
+    `c.blocker`.
+  - Others change the result and must claim first or be made canonical:
+    `ptrCoercibleInPlace` and `peerAlignment` (through `ptrAlignment` and
+    `naturalAlignment`, so coercion legality and peer types),
+    `optionalPayloadPtr`, the `try_ptr` and packed-union field pointer
+    types, `comptimePtrsEqual` and `ptrRootOffset` (which can return
+    null, "can't tell"), and `failTypeMismatch`'s uninstantiable note.
 - *`Type.comptimeOnly`.* The `.computing` marker moves into a per-worker
   set. Only final answers are written to `ContainerInfo.comptime_only`,
   by a CAS from `.unknown`, and any thread that wins writes the same
@@ -3315,30 +3374,46 @@ analysis:
    A unit's own dependee list keeps the order that unit read them in. That
    order is a function of its analysis, as long as its inputs are. Two
    inputs are not today:
-   - *Comptime memo entries.* An entry's `deps` and conditional flags
-     depend on whether the walker or the evaluator computed the call, and
-     shared run counts in `comptime_bodies` decide that. In parallel,
-     two workers may also compute one call concurrently, and the first
-     insert wins. The rule: a call's recorded dependencies must not depend
-     on the path. The evaluator would declare what the walker declares, or
-     both would declare the body's whole dependency set conditionally (as
-     `bcDeclareBody` does now). The lowering trigger itself may stay
-     timing-dependent. (Open question 1.)
+   - *Comptime memo entries.* An entry's conditional flags depend on
+     whether the walker or the evaluator computed the call, and shared run
+     counts in `comptime_bodies` decide that. In parallel, two workers may
+     also compute one call concurrently, and the first insert wins. Plain
+     edges already don't depend on the tier, by construction:
+     `comptime_dep` covers the reads on the executed path and
+     `entry_deps` everything else, and `--edit-verify` checks it, since
+     tiers differ between edit and full builds. Conditional edges cannot
+     match without lowering every memoizable body, which costs as much as
+     analyzing it. They are a safety net only: the evaluator computes
+     exactly what the walker would, and every read on the executed path is
+     plain, so no result depends on a dependee reached only through a
+     conditional edge. The rule: stop persisting conditional edges.
+     Stage A drops them, runs `--edit-verify`, and asserts under
+     `ZAP_CACHE_VERIFY` that an executed read is never only conditional.
+     Memo entries where the first insert wins then differ only in
+     conditional flags, which nothing reads. The lowering trigger may stay
+     timing-dependent.
    - *`branch_quotas`* (rule 7).
 4. *Anonymous type names.* Names come from ZIR offsets and comptime
    ordinals (`typeName`, `anonTypeNumber`), not counters. One order
    dependence remains: a container's key is file, ZIR instruction and
-   captures, so when two creators would name the same type differently
-   (the `.func` naming strategy, which prints inline call arguments, or a
-   generic instance's parent versus an inline call's), the first creator
-   names it. The rule: a type's name is a function of its key, computed
-   from the key alone wherever creators can differ. (Open question 2:
-   whether any real case has two creators with different names.)
+   captures, so when two creators would name the same type differently,
+   the first creator names it. It happens, in upstream too: with `fn
+   F(comptime x: u32) type { _ = x; return struct {}; }`, `F(1) == F(2)`,
+   and both print `a.F(2)` if `F(2)` was created first (an inline
+   function behaves the same). No name can come from the key alone, since
+   the key lacks the uncaptured arguments, and adding them would break
+   upstream's type identity. The rule: the name is a CAS-min by the
+   creator's key. Comptime `@typeName` reads and error-message renderings
+   of the name are recorded, and if the final name differs from one that
+   was read, the build reruns, as for provisional codes. Symbol names are
+   computed at `finish` and are fine already. Stage A first counts how
+   often two creators give different names.
 5. *Error codes and error sets.*
    - *Codes.* The last build's codes are seeded first (`seedErrors`,
      unchanged). A name with no seeded code gets a provisional code when
      first used. When analysis ends, the final assignment keeps the seeded
-     codes and numbers the new names in name order.
+     codes and numbers the new names in the global error-name order
+     (below).
    - *Comptime reads of codes.* A unit that reads a provisional code at
      comptime (`@intFromError` or `@errorFromInt` folding, `error_value`
      in the evaluator, `anyerror` name reads) marks the build. If any
@@ -3353,16 +3428,27 @@ analysis:
      error set types stop reading codes.
    - *Error-set order.* `errorSetType` sorts a set's names by code, so an
      error set type's key, stable hash, layout and `@typeInfo` order all
-     follow code order. Step 2 sorts by name bytes instead, so error set
-     types never read codes. This also removes today's `--edit-verify`
-     sensitivity of error set types to code order. Upstream's order is an
-     interning artifact. For `const E = error{ Zeta, Alpha, Mid }; const
-     F = error{ Mid, Beta };`, upstream's `@typeInfo(…).error_set` gives
-     Alpha Mid Zeta for E and Mid Beta for F, which is neither name order
-     nor code order, and zap today gives Mid Zeta Alpha (code order).
-     Conformance does not depend on it. The lead accepted name order, the
-     location-sorted errors of rule 6, and the one-time change in codes
-     and link order (2026-11-03, pending the owner's approval of stage A).
+     follow code order. Upstream's order is an interning artifact: for
+     `const E = error{ Zeta, Alpha, Mid }; const F = error{ Mid, Beta };`,
+     upstream's `@typeInfo(…).error_set` gives Alpha Mid Zeta for E and Mid
+     Beta for F, and zap today gives Mid Zeta Alpha (code order).
+     Conformance does depend on it, though: sorting by name bytes breaks
+     behavior's type_info.zig (`error{ One, Two } || error{Three}` must
+     list One, Two, Three) and cast.zig's peer-type sets with Three.
+   - *The global error-name order.* Before Sema, the frontend scans the
+     ZIR of all loaded files in its fixed file order and orders names by
+     first textual occurrence, which tracks upstream's interning order.
+     Files loaded later (compiler_rt, at serial points) append in key
+     order; reified names, which are rare, go last in name order. Error
+     set types sort by this order and never read codes, so codes can stay
+     seeded or provisional. A change to the order is a real input change:
+     it is one input node, the order's hash. This also removes today's
+     `--edit-verify` sensitivity of error set types to code order.
+   - The lead accepted location-sorted errors (rule 6) and the one-time
+     change in codes and link order (2026-11-03, pending the owner's
+     approval of stage A). The lead had also accepted name-sorted error
+     sets, on the belief that conformance did not depend on the order;
+     the global order above replaces that.
    - One worker uses the same rules, so the codes of new names change
      once from today's first-use numbering.
 6. *Compile errors.*
@@ -3373,20 +3459,31 @@ analysis:
      `zcu.errors`) becomes a rollback of the Sema's own list.
    - At the end, errors are sorted by source location: file path, byte
      offset, then message, as upstream's `ErrorMsg.order` sorts
-     `failed_analysis`. The first error is the first in that order, and
-     it gets the reference-trace frames.
+     `failed_analysis`, then unit key (the same failing comptime call
+     reached from two callers gives equal location and message with
+     different notes, since failed calls are not memoized). The first
+     error is the first in that order, and it gets the reference-trace
+     frames.
    - Which errors exist does not depend on order: analysis does not stop
      at an error, every referenced unit is analyzed, and loops go through
      the serial rerun.
    - `referenced_by` keeps the smallest referrer by unit key (a CAS-min)
      instead of the first one, so reference traces change once.
-7. *`branch_quotas`.* A generic instance's quota is the largest any
-   instantiating caller set, which is known only when all of them have
-   run. Upstream has the same order dependence (ziglang/zig#22410). A
-   body that succeeds under a lower quota gives the same result under a
-   higher one. So only a generic instance that fails with "evaluation
-   exceeded" in a parallel build triggers a serial rerun (above), which
-   reproduces the one-thread outcome.
+7. *Branch quotas.* A generic instance's quota is the largest any
+   instantiating caller set, known only when all of them have run
+   (upstream has the same order dependence, ziglang/zig#22410). And a
+   memo hit counts no branches, so any unit near its quota passes or
+   fails depending on which calls another worker memoized first. A unit
+   that succeeds under a lower quota gives the same result under a
+   higher one, so failures are the problem: every "evaluation exceeded"
+   failure in a parallel build triggers a serial rerun. That leaves one
+   gap, the reverse case: a unit that stays under its quota only because
+   of a memo hit, which a one-thread build would not have had, so the
+   parallel build succeeds where one thread fails. To close it, a memo
+   entry records the branches its computation counted, and a hit charges
+   them. Upstream charges nothing for a hit, so zap would then reject a
+   program that stays under its quota only through memo hits. (Open
+   question 6: charge, or accept the gap.)
 8. *Exports, tests and compiler_rt requests.* They become locked
    appends, sorted at the end: exports by declaration key, tests by file
    and source position (`populateTestFunctions` already does this), and
@@ -3422,9 +3519,9 @@ Zcu.zig, InternPool.zig or Type.zig apart from `Type.codegen_worker`.
 | `ready_irs` | queue | removed |
 | `comptime_decls` | roots | coordinator only |
 | `comptime_memo` | cache | sharded; first insert wins; entries in the inserting worker's arena; path-independent deps (rule 3) |
-| `comptime_bodies` | cache with order-dependent run counts | sharded; atomic run counter; lowering claimed by CAS while other threads keep walking (no wait) |
+| `comptime_bodies` | cache with order-dependent run counts | sharded; atomic run counter; lowering claimed by CAS while other threads keep walking (no wait). `Bytecode` is immutable once `.ready` |
 | `comptime_osr_off` | cache, insert-only | sharded set |
-| `comptime_alloc_refs`, `string_literals` | pure caches | per worker |
+| `comptime_alloc_refs`, `string_literals`, `string_cache`, `nav_ptrs` | pure caches (`string_cache` and `nav_ptrs` came with m6-ptr; `nav_ptrs` is written only after the nav's done load) | per worker |
 | `inferred_errors`, `anyerror_ies` | unit results | written before the body's done store |
 | `namespaces` | list; indices stored in Navs, ContainerInfos, dependees | per-worker chunked lists with the owner in the index, as InternPool does, so `namespacePtr` stays valid. Indices are not persisted (`ns.key` is) |
 | `file_root_types` | create-once | CAS on the slot (above) |
@@ -3437,6 +3534,7 @@ Zcu.zig, InternPool.zig or Type.zig apart from `Type.codegen_worker`.
 | `fe` | read-only during analysis | `loadFile` only at serial points; `tree`/`source` are already behind `syntax_mutex` |
 | `replay` | edit builds | below |
 | `Type.codegen_worker` | threadlocal "may not write" | removed: every worker writes final answers only |
+| Worker stacks | step 1's pool uses default thread stacks | Sema-sized stacks: nested `ensure` chains (binary.zig's inferred-error-set nesting) plus CodeGen right after a nested body run deep |
 
 **Step 2, replay and lazy edit builds.** Lazy replay (step 4b, the
 default) already loads units inside the `ensure*` hooks, which become
@@ -3513,15 +3611,23 @@ checks:
 - the ThreadSanitizer build reports nothing with fuzzing on;
 - bench.py cold, cold-local and edit numbers before and after.
 
-A. *Determinism, serially.* Rules 1–8 and code reruns, on one thread.
-   Rule 1 may land first, alone. Count the units that read provisional
-   codes on std and the zig workload before relying on code reruns.
-   `ZAP_SCHED_FUZZ` gains a Sema mode that shuffles the function queue
-   and the order in which roots are queued. A shuffled serial build
-   exposes every order dependence that parallel analysis would, except
-   interleaving inside a unit, and must produce identical bytes. Serial
-   output changes once: link order, codes of new names, error order and
-   reference traces.
+0. *Prerequisites (Sema).* The `nav_ty` unit and function types that
+   resolve by-value parameter types (above). Both fix bugs today.
+A. *Determinism, serially.* Rules 1–8 and the reruns they need, on one
+   thread. Rule 1 may land first, alone. Before relying on reruns, count
+   on std and the zig workload: units that read provisional codes, and
+   types that two creators name differently. Drop conditional edges
+   (rule 3).
+   - `ZAP_SCHED_FUZZ` gains two Sema modes. One shuffles the function
+     queue and the order in which roots are queued. The other eagerly
+     resolves random idle units at random points, as another worker
+     would. A fuzzed serial build exposes the order dependences that
+     parallel analysis would, except interleaving inside a unit, and
+     must produce identical bytes. The queue shuffle alone does not
+     expose the "resolved yet?" reads; the eager mode does.
+   - The checked build asserts published-only reads (above).
+   - Serial output changes once: link order, codes of new names, error
+     order and reference traces.
 B. *Thread identity, still one analysis thread.* `Zcu.tid` becomes a
    per-worker field passed through Sema, Replay and Incremental.
    InternPool gets one local per worker. Caches, arenas, `dep_maps`,
@@ -3554,23 +3660,28 @@ E. *Default on and tuning.* Shard-lock contention and per-worker lookup
   RSS. Step 1 added 4–5%, and step 2 should add about as much again.
 
 **Open questions for review.**
-1. (Sema) Can the walker and the evaluator record the same dependencies
-   for a call, or should both declare the body's set conditionally?
-2. (Sema) Can two creators give one container key different names? If
-   so, which name should the key alone produce?
-3. (Sema) Do conformance tests depend on `@typeInfo` error-set order, so
-   that name order needs a mapping to upstream's interning order?
-4. (Cache) Are the key-sorted node numbering and delta numbering
-   acceptable for the manifest format, and does the claim hook fit
-   first-build reuse's lookups?
-5. (Sema) Are there more places that read "in progress" as "on my stack"
-   than the six listed under "the logical stack"?
+Answered in review (2026-11-03):
+1. Walker and evaluator dependencies: plain edges already match;
+   conditional edges stop being persisted (rule 3).
+2. Two creators, one key: yes, as upstream; CAS-min name with recorded
+   reads (rule 4).
+3. Error-set order: conformance depends on it; the global error-name
+   order (rule 5).
+4. (Cache) Key-ordered numbering is acceptable, and donor reuse goes
+   through `greenNode`. The cache review also replaced in-build
+   re-analysis with whole reruns, added Replay's `dependees`, `visited`
+   clears and a shared decoder memo, and set the lazy fallback for
+   stage C.
+5. More "on my stack" readers: `errorSetNames`, `errSetIsEmpty`, and the
+   partial answers after an `IfIdle` skip; and skipping does change
+   results, so every hit on the logical stack reruns serially. The
+   "resolved yet?" reads are classified above.
 
-Cache review (2026-11-03) answered question 4: key-ordered numbering is
-acceptable, and donor reuse goes through `greenNode` (above). It also
-replaced in-build re-analysis with whole reruns, added Replay's
-`dependees`, `visited` clears and a shared decoder memo, and set the
-lazy fallback for stage C.
+Still open:
+
+6. Branch quotas: charge a memo hit the branches its computation
+   counted, which makes quota outcomes independent of memo timing but
+   rejects programs upstream accepts at the edge, or accept that gap.
 
 **The completion hook, and recording as units complete.** When a unit's
 result is final (a declaration resolved, a layout resolved, a `comptime`
