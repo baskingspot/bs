@@ -100,9 +100,11 @@ pub const Loc = struct {
     /// 1-based line and byte column, as upstream.
     line: u32,
     col: u32,
-    /// Byte offsets of the span in the file, end exclusive.
+    /// Byte offsets of the span in the file, end exclusive, and of its
+    /// main token (where `line` and `col` point; ErrorBundle's span_main).
     start: u32,
     end: u32,
+    main: u32,
     /// The whole source line of `line`, without its newline.
     source_line: []const u8,
     /// In std, `builtin`, compiler_rt or another file under the zig lib
@@ -174,6 +176,7 @@ pub const Paths = struct {
             .col = @intCast(lc.column + 1),
             .start = start,
             .end = end,
+            .main = main,
             .source_line = lc.source_line,
             .in_lib = in_lib or force_lib,
         };
@@ -205,6 +208,7 @@ fn bundleLoc(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorBundle
         .col = sl.column + 1,
         .start = sl.span_start,
         .end = sl.span_end,
+        .main = sl.span_main,
         .source_line = if (sl.source_line != 0) bundle.nullTerminatedString(sl.source_line) else "",
         .in_lib = in_lib,
     };
