@@ -556,6 +556,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .extern_ptr => {
             const name = ip.stringSlice(@fromBackingInt(data.ty_pl.payload));
             const weak = Type.class(ip, data.ty_pl.ty) == .optional;
+            // Analyzes the compiler_rt function the slot will point to.
+            _ = try cg.emit.zcu.requestCompilerRtExport(name);
             const slot = try cg.emit.useExtern(name, weak);
             const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
             try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.sym(slot, 0) });

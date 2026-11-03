@@ -174,7 +174,7 @@ fn lowerExternSlots(emit: *Emit) !bool {
             const nav = ip.getNav(x.nav);
             if (nav.status != .resolved) continue;
             break if (ip.indexToKey(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x.nav);
-        } else null;
+        } else if (try zcu.requestCompilerRtExport(name)) |key| .fromName(key) else null;
         if (target == null and !weak) {
             try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
             ok = false;

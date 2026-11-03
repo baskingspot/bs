@@ -491,6 +491,32 @@ pub fn requestCompilerRt(zcu: *Zcu, file_name: []const u8, name: []const u8) ![]
     return gop.key_ptr.*;
 }
 
+/// The stable key of the compiler_rt function exporting libm symbol `name`
+/// (`sinf`, `__floorh`, `sqrtf128`, ...), requesting it like
+/// `requestCompilerRt`, or null if compiler_rt does not export `name`.
+/// For `@extern` references, which upstream resolves against the
+/// compiler_rt it links.
+pub fn requestCompilerRtExport(zcu: *Zcu, name: []const u8) !?[]const u8 {
+    const RtExport = struct { file: []const u8, decl: []const u8 };
+    const map = comptime blk: {
+        const ops = .{ "sqrt", "sin", "cos", "tan", "exp", "exp2", "log", "log2", "log10", "fabs", "floor", "ceil", "round", "trunc", "fma", "fmin", "fmax", "fmod" };
+        var kvs: [ops.len * 5]struct { []const u8, RtExport } = undefined;
+        for (ops, 0..) |op, i| {
+            const f = if (std.mem.eql(u8, op, "floor") or std.mem.eql(u8, op, "ceil")) "floor_ceil.zig" else op ++ ".zig";
+            kvs[i * 5 ..][0..5].* = .{
+                .{ "__" ++ op ++ "h", .{ .file = f, .decl = "__" ++ op ++ "h" } },
+                .{ op ++ "f", .{ .file = f, .decl = op ++ "f" } },
+                .{ op, .{ .file = f, .decl = op } },
+                .{ "__" ++ op ++ "x", .{ .file = f, .decl = "__" ++ op ++ "x" } },
+                .{ op ++ "f128", .{ .file = f, .decl = op ++ "q" } },
+            };
+        }
+        break :blk std.StaticStringMap(RtExport).initComptime(kvs);
+    };
+    const e = map.get(name) orelse return null;
+    return try zcu.requestCompilerRt(e.file, e.decl);
+}
+
 fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
     const no_span: Ast.Span = .{ .start = 0, .end = 0, .main = 0 };
     const rest = key["compiler_rt:".len..];
