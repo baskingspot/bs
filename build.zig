@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     const upstream_step = b.step("test-upstream", "Run the run tests with upstream zig, the oracle");
     addRunTests(b, exe, test_step, upstream_step);
-    addObjTests(b, exe, test_step);
+    addObjAndRunTests(b, exe, test_step);
 
     // Always ReleaseFast: a Debug build of zap says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
@@ -198,8 +198,9 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
 
 /// `zap build-obj`: test/obj/lib.zig, linked into test/obj/main.zig by
 /// upstream zig, run normally and into a panic in the object's code, whose
-/// stack trace needs the object's debug info.
-fn addObjTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+/// stack trace needs the object's debug info. `zap run`: test/obj/args.zig,
+/// whose arguments and exit status must pass through.
+fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const host = b.graph.host.result;
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
     const obj = b.addRunArtifact(zap);
@@ -225,6 +226,17 @@ fn addObjTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
     panic.addCheck(.{ .expect_stderr_match = "main.zig:14:39: 0x" });
     panic.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
     test_step.dependOn(&panic.step);
+
+    const zap_run = b.addRunArtifact(zap);
+    zap_run.setName("zap run args");
+    zap_run.addArg("run");
+    zap_run.addFileArg(b.path("test/obj/args.zig"));
+    zap_run.addArg("--global-cache-dir");
+    _ = zap_run.addOutputDirectoryArg("run-cache");
+    zap_run.addArgs(&.{ "--", "a", "b c", "" });
+    zap_run.addCheck(.{ .expect_stdout_exact = "[a][b c][]\n" });
+    zap_run.addCheck(.{ .expect_term = .{ .exited = 43 } });
+    test_step.dependOn(&zap_run.step);
 }
 
 fn defaultZigLibDir(b: *std.Build) []const u8 {

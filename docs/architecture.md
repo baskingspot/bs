@@ -895,6 +895,12 @@ the laziness rule; unboxed integers in the frame; then a denser encoding.
   - build-obj does not use the on-disk cache yet: a relink would need the
     exports, the imports, and the output kind in the manifest, and
     `ElfObject` to take the cache's input with numbered symbols.
+- `zap run` builds the executable into `<cache>/zap/o/<hash>/<name>`, the
+  hash of the working directory, std's directory, and the command line
+  before `--`, so a rerun relinks in place through the cache, then
+  replaces itself with the program (execve, as upstream does) with the
+  arguments after `--` and `ZIG_EXE` set: exit status and signals are the
+  program's own.
 
 ### compiler_rt (decided 2026-11-02)
 

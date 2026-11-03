@@ -104,21 +104,28 @@ pub fn main(init: std.process.Init) !void {
     // last build's Atoms and skips everything else.
     const run_test = is_test and !opts.test_no_exec;
     const stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path);
+    // The command line that describes the compilation: `zap run`'s
+    // arguments after `--` are the program's.
+    const compile_args = args[1 .. args.len - opts.run_args.len];
     const out_path: ?[]const u8 = switch (opts.emit_bin) {
-        .none => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else null,
+        .none => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else if (command == .run) fatal("'zap run' needs a binary to run; remove -fno-emit-bin", .{}) else null,
         .path => |p| p,
         .default => if (run_test)
             try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem)
+        else if (command == .run)
+            try runBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), compile_args, zig_lib_dir, stem)
         else if (command == .build_obj)
             try std.fmt.allocPrint(arena, "{s}.o", .{stem})
         else
             stem,
     };
-    if (run_test) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
-    const use_cache = out_path != null and !opts.dump_ir and (command == .build_exe or is_test) and
+    if (run_test or (command == .run and opts.emit_bin == .default)) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
+    // build-obj does not use the cache yet: a relink would also need the
+    // object's exports and imports in the manifest.
+    const use_cache = out_path != null and !opts.dump_ir and command != .build_obj and
         !std.mem.eql(u8, init.environ_map.get("ZAP_CACHE") orelse "", "off");
     // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
-    var inc: ?Incremental = if (use_cache) Incremental.open(init.gpa, init.io, cache_dirs, args[1..], zig_lib_dir, "x86_64-linux", init.environ_map.get("ZAP_CACHE_TIMING") != null) catch |err| switch (err) {
+    var inc: ?Incremental = if (use_cache) Incremental.open(init.gpa, init.io, cache_dirs, compile_args, zig_lib_dir, "x86_64-linux", init.environ_map.get("ZAP_CACHE_TIMING") != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => no_cache: {
             std.log.warn("unable to use the cache: {t}", .{err});
@@ -133,6 +140,11 @@ pub fn main(init: std.process.Init) !void {
     stages.on = init.environ_map.get("ZAP_TIMING") != null;
     if (inc) |*i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
         if (run_test) try runTest(init, out_path.?);
+        if (command == .run) {
+            i.close();
+            inc = null;
+            runExe(init, out_path.?, opts.run_args);
+        }
         return;
     };
 
@@ -177,8 +189,6 @@ pub fn main(init: std.process.Init) !void {
         exitOnErrors(init, &zcu);
         return;
     }
-    if (command == .run) fatal("run: not implemented yet", .{});
-
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
     emit.obj = command == .build_obj;
@@ -204,6 +214,43 @@ pub fn main(init: std.process.Init) !void {
     stages.print();
     if (!linked) std.process.exit(1);
     if (run_test) try runTest(init, out_path.?);
+    if (command == .run) {
+        // Releases the cache's lock: the program inherits nothing of zap.
+        if (inc) |*i| i.close();
+        inc = null;
+        runExe(init, out_path.?, opts.run_args);
+    }
+}
+
+/// Replaces zap with the program at `path`, as upstream's `zig run` does,
+/// so that its exit status and signals are the program's own.
+fn runExe(init: std.process.Init, path: []const u8, run_args: []const []const u8) noreturn {
+    const arena = init.arena.allocator();
+    const argv = arena.alloc([]const u8, 1 + run_args.len) catch fatal("out of memory", .{});
+    // A path without a slash would be looked up in PATH.
+    argv[0] = if (std.mem.indexOfScalar(u8, path, '/') == null) std.fs.path.join(arena, &.{ ".", path }) catch fatal("out of memory", .{}) else path;
+    @memcpy(argv[1..], run_args);
+    // Upstream sets ZIG_EXE for the program.
+    if (std.process.executablePathAlloc(init.io, arena)) |self| {
+        init.environ_map.put("ZIG_EXE", self) catch {};
+    } else |_| {}
+    const err = std.process.replace(init.io, .{ .argv = argv, .environ_map = init.environ_map });
+    fatal("the following command failed to execve with '{t}':\n{s}", .{ err, std.mem.join(arena, " ", argv) catch path });
+}
+
+/// Where `zap run` puts the program: a directory of the cache per
+/// compilation, so that running it again relinks in place.
+fn runBinPath(arena: std.mem.Allocator, io: Io, cache_dir: []const u8, compile_args: []const []const u8, zig_lib_dir: []const u8, stem: []const u8) ![]const u8 {
+    var h: std.hash.Wyhash = .init(0);
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    h.update(cwd);
+    h.update(&.{0});
+    h.update(zig_lib_dir);
+    for (compile_args) |a| {
+        h.update(&.{0});
+        h.update(a);
+    }
+    return std.fmt.allocPrint(arena, "{s}/o/{x:0>16}/{s}", .{ cache_dir, h.final(), stem });
 }
 
 fn runTest(init: std.process.Init, path: []const u8) !void {
