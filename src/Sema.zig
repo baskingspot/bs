@@ -8770,7 +8770,24 @@ fn zirBitCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     const extra = sema.code.extraData(Zir.Inst.Bin, data.payload_index).data;
     const src = block.nodeSrc(data.src_node);
     const dest_ty = try sema.castDestType(block, src, extra.lhs, true);
-    const operand = sema.resolveInst(extra.rhs);
+    var operand = sema.resolveInst(extra.rhs);
+    if (ip.indexToKey(sema.typeOf(operand)) == .array_type and ip.indexToKey(sema.typeOf(operand)).array_type.sentinel != .none) {
+        // A source array's sentinel is part of its bits, as upstream:
+        // cast the `[N:s]T` as the `[N+1]T` ending in `s`.
+        const a = ip.indexToKey(sema.typeOf(operand)).array_type;
+        const full = try sema.intern(.{ .array_type = .{ .len = a.len + 1, .child = a.child } });
+        if (sema.resolveValue(operand)) |v| {
+            if (!sema.isUndef(v)) {
+                const elems = try sema.arena.alloc(Index, a.len + 1);
+                for (elems[0..a.len], 0..) |*e, i| e.* = try sema.elemValue(v, i);
+                elems[a.len] = a.sentinel;
+                operand = .fromInterned(try sema.intern(.{ .aggregate = .{ .ty = full, .storage = .{ .elems = elems } } }));
+            } else operand = .fromInterned(try sema.undefValue(full));
+        } else {
+            const ref = try sema.analyzeRef(block, src, operand);
+            operand = try sema.analyzeLoad(block, src, try sema.coercePtrTo(block, ref, try sema.ptrType(.{ .child = full, .flags = .{ .is_const = true } })));
+        }
+    }
     const src_ty = sema.typeOf(operand);
     if (Type.isInt(ip, dest_ty) and Type.isInt(ip, src_ty)) {
         const d = Type.intInfo(ip, dest_ty);
