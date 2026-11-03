@@ -260,7 +260,9 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
         const run = b.addRunArtifact(zap);
         run.setName(b.fmt("diag {s}", .{file}));
         run.setCwd(b.path("test/diag"));
-        run.addArgs(&.{ "build-exe", "-fno-emit-bin", file });
+        // An explicit target, so the expected diagnostics print on a Mac
+        // too, where native aarch64-macos is refused until its CodeGen exists.
+        run.addArgs(&.{ "build-exe", "-target", "x86_64-linux", "-fno-emit-bin", file });
         var arg_it = std.mem.tokenizeScalar(u8, args, ' ');
         while (arg_it.next()) |a| run.addArg(a);
         run.addFileInput(b.path(src_path));
