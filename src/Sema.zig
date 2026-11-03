@@ -2077,6 +2077,16 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk sema.enumFromInt(block, src, ty, sema.resolveInst(extra.rhs));
         },
         .tag_name => sema.zirTagName(block, inst),
+        .error_name => blk: {
+            const src = block.nodeSrc(data.un_node.src_node);
+            const operand = try sema.coerce(block, .anyerror_type, sema.resolveInst(data.un_node.operand), src);
+            if (sema.resolveValue(operand)) |v| {
+                if (sema.isUndef(v)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+                break :blk .fromInterned(try sema.nameSliceValue(sema.ip.stringSlice(sema.ip.indexToKey(v).err.name)));
+            }
+            try sema.requireRuntime(block, src);
+            break :blk sema.addUnOp(block, .error_name, operand);
+        },
         .type_info => sema.zirTypeInfo(block, inst),
         .clz, .ctz, .pop_count, .byte_swap, .bit_reverse => sema.zirBitOp(block, inst, tag),
         .reduce => sema.zirReduce(block, inst),
@@ -6415,7 +6425,7 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
         .array_type => |a| {
             const index = try sema.coerce(block, .usize_type, uncasted_index, src);
             const len: Ref = .fromInterned(try sema.intValue(.usize_type, a.len));
-            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, len, a.sentinel != .none and sema.resolveValue(index) != null);
+            if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, len, a.sentinel != .none);
             return sema.elemPtrOfArrayPtr(block, src, ptr, index);
         },
         .vector_type => |v| {
@@ -6517,7 +6527,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src);
                 const ep = if (p.flags.size == .one) blk: {
                     const a = ip.indexToKey(p.child).array_type;
-                    if (safety) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), false);
+                    if (safety) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
                     break :blk try sema.elemPtrOfArrayPtr(block, src, lhs, index);
                 } else try sema.elemPtrOfManyPtr(block, src, lhs, index);
                 return sema.analyzeLoad(block, src, ep);

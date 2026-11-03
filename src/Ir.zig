@@ -182,6 +182,9 @@ pub const Inst = struct {
         int_from_bool,
         /// `un_op`: pointer to `usize`.
         int_from_ptr,
+        /// `un_op`: an error's name, a `[:0]const u8`, from the table the
+        /// linker gets once every error code is assigned.
+        error_name,
         /// `ty_op`: `usize` to pointer.
         ptr_from_int,
 
@@ -519,6 +522,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => .bool_type,
         .int_from_bool => .u1_type,
         .int_from_ptr => .usize_type,
+        .error_name => .slice_const_u8_sentinel_0_type,
         .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap, .panic => .noreturn_type,
         .call => ir.extraData(Call, data.pl_op.payload).data.ret_ty,
         .ptr_elem_val => blk: {

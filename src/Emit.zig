@@ -33,6 +33,8 @@ navs: std.AutoArrayHashMapUnmanaged(InternPool.NavIndex, void) = .empty,
 errors: std.AutoArrayHashMapUnmanaged(InternPool.String, void) = .empty,
 /// Whether any function calls the panic helpers.
 uses_panic: bool = false,
+/// Whether code reads `error_name_table`.
+uses_error_names: bool = false,
 /// Compile errors that codegen reports (unsupported constructs), rendered
 /// like Sema's.
 failed: bool = false,
@@ -93,6 +95,7 @@ pub fn finish(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !b
         try emit.lowerNav(emit.navs.keys()[i]);
     }
     if (emit.uses_panic) try CodeGen.emitPanicHelpers(emit);
+    if (emit.uses_error_names) try emit.emitErrorNameTable();
 
     var entry: ?SymbolKey = null;
     for (zcu.exports.items) |e| {
@@ -193,6 +196,42 @@ pub fn errorKeyFromName(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "error.{s}", .{name}) catch unreachable;
     return .fromName(s);
+}
+
+/// A `[:0]const u8` per error code, for `@errorName` at runtime. It is
+/// built after every function is lowered, when the set of errors the
+/// program uses is known; codes stay symbolic everywhere else.
+pub const error_name_table: SymbolKey = .fromName("__zap_error_names");
+
+fn emitErrorNameTable(emit: *Emit) !void {
+    const ip = &emit.zcu.ip;
+    const gpa = emit.gpa;
+    var max: u32 = 0;
+    for (emit.errors.keys()) |name| max = @max(max, try ip.errorValue(name));
+    const bytes = try emit.allocator().alloc(u8, (@as(usize, max) + 1) * 16);
+    @memset(bytes, 0);
+    var refs: Atom.RelocList = .{};
+    defer refs.deinit(gpa);
+    for (emit.errors.keys()) |name| {
+        const s = ip.stringSlice(name);
+        const z = try gpa.alloc(u8, s.len + 1);
+        defer gpa.free(z);
+        @memcpy(z[0..s.len], s);
+        z[s.len] = 0;
+        const off: u32 = try ip.errorValue(name) * 16;
+        try refs.append(gpa, off, .x86_64_abs64, try emit.contentAtom(1, z, &.{}, &.{}), 0);
+        std.mem.writeInt(u64, bytes[off + 8 ..][0..8], s.len, .little);
+    }
+    refs.sort();
+    try emit.addAtom(.{
+        .key = error_name_table,
+        .name = "__zap_error_names",
+        .section = .rodata,
+        .alignment = .@"8",
+        .bytes = bytes,
+        .targets = try emit.allocator().dupe(SymbolKey, refs.targets.keys()),
+        .relocs = try emit.allocator().dupe(Atom.Reloc, refs.relocs.items),
+    });
 }
 
 pub fn useError(emit: *Emit, name: InternPool.String) !SymbolKey {

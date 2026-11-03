@@ -522,6 +522,17 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.copyTo(dst, data.ty_op.operand);
             }
         },
+        .error_name => {
+            // The table holds a slice per error code.
+            cg.emit.uses_error_names = true;
+            const dst = try cg.resultMem(inst, .slice_const_u8_sentinel_0_type) orelse return;
+            try cg.load(.rax, data.un_op);
+            try cg.e.movzx(.dword, .rax, .word, .{ .reg = .rax });
+            try cg.e.shift(.shl, .qword, .{ .reg = .rax }, 4);
+            try cg.e.lea(.qword, .rcx, Mem.sym(Emit.error_name_table, 0));
+            try cg.e.alu(.add, .qword, .{ .reg = .rcx }, .{ .reg = .rax });
+            try cg.copyMem(dst, Mem.at(.rcx, 0), 16);
+        },
         .int_from_bool, .int_from_ptr => {
             const ty = ir.typeOfIndex(inst, ip);
             const dst = try cg.resultMem(inst, ty) orelse return;

@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -105,6 +105,16 @@ fn main() callconv(.c) noreturn {
     _ = &none;
     rt.printInt(@intFromBool(none == seven));
     rt.printInt(@intFromBool(@as(?u32, seven) == seven));
+
+    // Error names at runtime come from a table built at link time.
+    var errs = [_]anyerror{ error.BadDigit, error.Empty };
+    _ = &errs;
+    for (errs) |err| {
+        rt.print(@errorName(err));
+        rt.print("\n");
+    }
+    const name = @errorName(errs[1]);
+    rt.printInt(name[name.len]);
 
     const e: anyerror!u8 = error.Empty;
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
