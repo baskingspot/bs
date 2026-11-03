@@ -1,0 +1,688 @@
+{
+ "projects": [
+  {
+   "name": "zls",
+   "url": "https://github.com/zigtools/zls",
+   "commit": "542462c4ddf045493fa9ca028ee6bc3f38b2754a",
+   "ref": "0.17.0",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zls",
+     "run": [
+      "--version"
+     ],
+     "edit": [
+      "src/features/hover.zig",
+      "    const is_negative = tree.tokenTag(token_index -| 1) == .minus;"
+     ]
+    },
+    {
+     "name": "lsp-codegen",
+     "run": [
+      "/dev/stdout"
+     ],
+     "edit": [
+      "zig-pkg/lsp_kit-0.1.0-bi_PL9o2DADHS1PDra3MGz1MXnsboN_ewNvrc419z7Fb/src/codegen/codegen.zig",
+      "    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;"
+     ]
+    },
+    {
+     "name": "test",
+     "edit": [
+      "src/features/hover.zig",
+      "    const is_negative = tree.tokenTag(token_index -| 1) == .minus;"
+     ]
+    },
+    {
+     "name": "src test",
+     "edit": [
+      "src/features/hover.zig",
+      "    const is_negative = tree.tokenTag(token_index -| 1) == .minus;"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "ghostty",
+   "url": "https://github.com/ghostty-org/ghostty",
+   "commit": "6fba0873efb7765e9d0f79de449063f3214b3d75",
+   "ref": "main",
+   "build": [
+    [
+     "test-lib-vt-build",
+     "-Demit-lib-vt=true",
+     "-Dsimd=false",
+     "-Dvt-features=-kitty_graphics"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "ghostty-vt-test",
+     "edit": [
+      "src/terminal/Terminal.zig",
+      "        const state = &self.screens.active.charset;"
+     ],
+     "timeout": 3600
+    },
+    {
+     "name": "props-unigen",
+     "run": [],
+     "edit": [
+      "src/unicode/props_uucode.zig",
+      "    const alloc = init.arena.allocator();"
+     ]
+    },
+    {
+     "name": "symbols-unigen",
+     "run": [],
+     "edit": [
+      "src/unicode/symbols_uucode.zig",
+      "    const alloc = init.arena.allocator();"
+     ]
+    },
+    {
+     "name": "uucode_generate",
+     "cwd": "zig-pkg/uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg",
+     "run": [
+      "/dev/stdout"
+     ],
+     "edit": [
+      "zig-pkg/uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg/src/generate.zig",
+      "    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "superhtml",
+   "url": "https://github.com/kristoff-it/superhtml",
+   "commit": "b00f3d25e7e8103d18c08961ca39be7c282923ed",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "superhtml",
+     "run": [
+      "--help"
+     ],
+     "edit": [
+      "src/main.zig",
+      "    const io = init.io;"
+     ]
+    },
+    {
+     "name": "test",
+     "edit": [
+      "src/html/Ast.zig",
+      "    log.debug(\"INIT ---- syntax only: {}\", .{syntax_only});"
+     ]
+    },
+    {
+     "name": "language-tag-parser",
+     "edit": [
+      "src/html/language_tag/parse.zig",
+      "    const io = init.io;"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "ziggy",
+   "url": "https://github.com/kristoff-it/ziggy",
+   "commit": "7fc62a537ba3e3a84287025b5b794e0cfaadef2f",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "ziggy",
+     "run": [
+      "--help"
+     ],
+     "edit": [
+      "src/main.zig",
+      "    const io = init.io;"
+     ]
+    },
+    {
+     "name": "test",
+     "edit": [
+      "src/Tokenizer.zig",
+      "                    tok.tag = .eof;"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "z2d",
+   "url": "https://github.com/vancluever/z2d",
+   "commit": "f7a74c779f88d0fcc47ebc737365ad8c60dcb0b6",
+   "ref": "main",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/Context.zig",
+      "pub fn stroke(self: *Context) painter.StrokeError!void {"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zf",
+   "url": "https://github.com/natecraddock/zf",
+   "commit": "e00f9e978b6a7126d1b35fa8ffd49b62042ad6f3",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zf",
+     "run": [
+      "--version"
+     ],
+     "edit": [
+      "src/tui/main.zig",
+      "    const io = init.io;"
+     ]
+    },
+    {
+     "name": "test",
+     "edit": [
+      "src/zf/zf.zig",
+      "    var sum: f64 = 0;"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zig-clap",
+   "url": "https://github.com/Hejsil/zig-clap",
+   "commit": "05faf3905e8548f5cc269a8836e154065e70128d",
+   "ref": "master",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "clap.zig",
+      "    var arena = std.heap.ArenaAllocator.init(opt.allocator);"
+     ]
+    },
+    {
+     "name": "simple",
+     "run": [
+      "--help"
+     ],
+     "edit": [
+      "example/simple.zig",
+      "    var diag = clap.Diagnostic{};"
+     ]
+    },
+    {
+     "name": "subcommands",
+     "run": [
+      "--help"
+     ],
+     "edit": [
+      "example/subcommands.zig",
+      "    var iter = try init.minimal.args.iterateAllocator(init.gpa);"
+     ]
+    },
+    {
+     "name": "usage",
+     "run": [
+      "--help"
+     ],
+     "edit": [
+      "example/usage.zig",
+      "    var res = try clap.parse(clap.Help, &params, clap.parsers.default, init.minimal.args, .{ .allocator = init.gpa });"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "anyzig",
+   "url": "https://github.com/marler8997/anyzig",
+   "commit": "c8d9cc52fad013cfa5ab79cccccd627416ff9314",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zig",
+     "edit": [
+      "src/main.zig",
+      "    const gpa = global.gpa;"
+     ]
+    },
+    {
+     "name": "test",
+     "run": null
+    }
+   ]
+  },
+  {
+   "name": "zine",
+   "url": "https://github.com/kristoff-it/zine",
+   "commit": "6cacc90b1dfdc414859683e85e05c93602a4afd1",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "translate-c",
+     "run": [
+      "--help"
+     ],
+     "edit": [
+      "zig-pkg/translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx/src/main.zig",
+      "        _ = safe_allocator.deinit();"
+     ]
+    },
+    {
+     "name": "camera",
+     "edit": [
+      "build/camera.zig",
+      "    const io = init.io;"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zig-protobuf",
+   "url": "https://github.com/Arwalk/zig-protobuf",
+   "commit": "b407c70b3a9820858ed5bdc099ecb050239beb7f",
+   "ref": "master",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "protoc-gen-zig"
+    },
+    {
+     "name": "tests",
+     "edit": [
+      "src/wire.zig",
+      "    const desc_table = Result._desc_table;"
+     ]
+    },
+    {
+     "name": "protobuf"
+    },
+    {
+     "name": "json",
+     "edit": [
+      "src/wire.zig",
+      "    const desc_table = Result._desc_table;"
+     ]
+    },
+    {
+     "name": "alltypes"
+    },
+    {
+     "name": "varints"
+    }
+   ]
+  },
+  {
+   "name": "vulkan-zig",
+   "url": "https://github.com/Snektron/vulkan-zig",
+   "commit": "e82bb8a4c5fbec18db891d04efa6208fe3d625d0",
+   "ref": "master",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "vulkan-zig-generator",
+     "run": [
+      "{vulkan_headers}/registry/vk.xml",
+      "/dev/stdout"
+     ],
+     "edit": [
+      "src/main.zig",
+      "    const prog_name = args.next() orelse \"vulkan-zig-generator\";"
+     ]
+    },
+    {
+     "name": "test"
+    }
+   ],
+   "fetch": {
+    "vulkan_headers": "git+https://github.com/KhronosGroup/Vulkan-Headers#f6a6f7ab165cedbfa2a7d0c93fe27a2d01ce09c8"
+   }
+  },
+  {
+   "name": "tls.zig",
+   "url": "https://github.com/ianic/tls.zig",
+   "commit": "bd22bcb73f423389441a1de80bf031ef1b623cce",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/handshake_client.zig",
+      "        h.max_client_record_len = h.output.end;"
+     ]
+    },
+    {
+     "name": "http_get"
+    },
+    {
+     "name": "server"
+    }
+   ]
+  },
+  {
+   "name": "zlinter",
+   "url": "https://github.com/KurtWagner/zlinter",
+   "commit": "1b79bec911fda0b4333bd012fbe21dc571c8f924",
+   "ref": "master",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "no_unused_unit_test_coverage"
+    },
+    {
+     "name": "require_fmt_unit_test_coverage"
+    },
+    {
+     "name": "build_lint_builtin"
+    }
+   ]
+  },
+  {
+   "name": "zig-ecs",
+   "url": "https://github.com/prime31/zig-ecs",
+   "commit": "b8defed8f4837fad1426b9421ea67a12c6d03407",
+   "ref": "master",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/ecs/registry.zig",
+      "        const comp_set = Storage(T).create(self.allocator);"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zig-minisign",
+   "url": "https://github.com/jedisct1/zig-minisign",
+   "commit": "4bdf1637d966cdd401535c297c6860ea933536ea",
+   "ref": "master",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "minizign",
+     "run": [
+      "-h"
+     ]
+    },
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "zalgebra",
+   "url": "https://github.com/kooparse/zalgebra",
+   "commit": "b5ebfef29a76fffdf1bc5424ac4c9f49fe323df2",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "zig-args",
+   "url": "https://github.com/ikskuh/zig-args",
+   "commit": "ad3c89ecdb2979b8b5d52b43b78e79bf51293235",
+   "ref": "master",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "demo",
+     "run": [
+      "--help"
+     ]
+    },
+    {
+     "name": "demo_verb",
+     "run": [
+      "--help"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zBench",
+   "url": "https://github.com/hendriknielaender/zBench",
+   "commit": "f12a2262bcd9d300207890555c577da5e29de453",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "runner"
+    },
+    {
+     "name": "statistics"
+    },
+    {
+     "name": "platform"
+    },
+    {
+     "name": "partial"
+    }
+   ]
+  },
+  {
+   "name": "linuxwave",
+   "url": "https://github.com/orhun/linuxwave",
+   "commit": "ba0b91cf48741f9aa1baef621137d5c426168cef",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "linuxwave",
+     "run": [
+      "-i",
+      "build.zig",
+      "-o",
+      "/dev/stdout"
+     ]
+    },
+    {
+     "name": "wav-tests"
+    },
+    {
+     "name": "gen-tests"
+    },
+    {
+     "name": "file-tests"
+    },
+    {
+     "name": "main-tests"
+    }
+   ]
+  },
+  {
+   "name": "zli",
+   "url": "https://github.com/xcaeser/zli",
+   "commit": "52a3773e7b825e755c878b022cb4f9c589c3712f",
+   "ref": "main",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  }
+ ],
+ "excluded": [
+  {
+   "name": "tigerbeetle",
+   "url": "https://github.com/tigerbeetle/tigerbeetle",
+   "reason": "main (0450c32b, 2026-10-14) pins Zig 0.16.0 and build.zig rejects any other version; no 0.17 branch"
+  },
+  {
+   "name": "zzz",
+   "reason": "links libc and BearSSL (C) in every artifact"
+  },
+  {
+   "name": "http.zig",
+   "reason": "every artifact links libc (-lc)"
+  },
+  {
+   "name": "libxev",
+   "reason": "every artifact links libc (-lc)"
+  },
+  {
+   "name": "zigmod",
+   "reason": "links libyaml (C) and libc"
+  },
+  {
+   "name": "zio",
+   "reason": "links libc on Linux"
+  },
+  {
+   "name": "Avalanche",
+   "reason": "links libc"
+  },
+  {
+   "name": "zedis",
+   "reason": "links libc (-lc)"
+  },
+  {
+   "name": "tokamak",
+   "reason": "its tests link libc (-lc)"
+  }
+ ]
+}

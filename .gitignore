@@ -4,3 +4,4 @@ zig-out/
 .amp/portals/*
 /bench/.work/
 __pycache__/
+/tools/corpus/.work/
