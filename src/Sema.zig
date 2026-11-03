@@ -9895,6 +9895,17 @@ fn analyzeCall(
         },
     }
 
+    // As upstream, the call's statement position (AstGen's `dbg_stmt` just
+    // before the call) applies again after its arguments' code, so that a
+    // return address maps to the call.
+    if (call_args_in == .zir and !block.is_comptime and block.inlining == null) {
+        const dbg: Zir.Inst.Index = @fromBackingInt(@backingInt(call_args_in.zir.call_inst) - 1);
+        if (sema.code.instructions.items(.tag)[@backingInt(dbg)] == .dbg_stmt) {
+            const d = sema.code.instructions.items(.data)[@backingInt(dbg)].dbg_stmt;
+            try sema.addDbgStmt(block, d.line, d.column);
+        }
+    }
+
     const ret_ty = fn_ty.return_type;
     const comptime_call = block.is_comptime or modifier == .compile_time or
         (ret_ty != .generic_poison_type and Type.isComptimeOnly(ip, ret_ty));
@@ -10804,10 +10815,11 @@ test "dump: a function type in a parameter's type has its own parameters" {
         \\  %1 = arg(*const fn (u8) u8, 1)
         \\  %2 = dbg_stmt(2:14)
         \\  %3 = trunc(u8, %0)
-        \\  %4 = call(%1, [%3])
-        \\  %5 = dbg_stmt(2:5)
-        \\  %6 = intcast(u16, %4)
-        \\  %7 = ret(%6)
+        \\  %4 = dbg_stmt(2:13)
+        \\  %5 = call(%1, [%3])
+        \\  %6 = dbg_stmt(2:5)
+        \\  %7 = intcast(u16, %5)
+        \\  %8 = ret(%7)
         \\}
         \\
     );
