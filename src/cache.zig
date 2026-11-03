@@ -8,6 +8,9 @@
 //!   input stats, and error codes; one mapped, pointer-free file.
 //! - `Pack`: the Atoms that compilation last linked, in one append-only file.
 //!
+//! Two parts know more than storage: `seeds` reads ZIR, and `results`
+//! encodes units' results as InternPool items, both for edit builds.
+//!
 //! Layout:
 //!
 //!   <global cache>/zap/store/<32 hex>.zsp       Store packs
@@ -27,6 +30,7 @@ pub const Manifest = @import("cache/Manifest.zig");
 pub const Pack = @import("cache/Pack.zig");
 pub const atoms = @import("cache/atoms.zig");
 pub const seeds = @import("cache/seeds.zig");
+pub const results = @import("cache/results.zig");
 
 /// A 128-bit content or identity hash.
 pub const Hash = u128;

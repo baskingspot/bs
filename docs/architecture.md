@@ -2034,7 +2034,7 @@ it and can flush every CPU's TLB.
 
 Being built in steps (each mergeable, full builds unchanged): result
 hashes (done), references (2a, done), seeds from ZIR (2b, done), result
-closures (3), and the hook with Delta and the verify mode (4). What an
+closures (3, done), and the hook with Delta and the verify mode (4). What an
 edit build does, and what it needs from Sema, Zcu, and the InternPool:
 
 **Flow.** The no-edit check finds changed inputs. The frontend loads every
@@ -2126,45 +2126,73 @@ Two things Sema must add, both narrow:
   result with the manifest's before its dependents decide, so the hashing
   `record` does today moves to one function both use.
 
-**Serialized results.** A result is the closure of InternPool items it
-references, encoded canonically in a store entry's payload (the opaque
-`payload` field `Store.Batch.put` already has), plus a small header naming
-the result's items:
+**Serialized results** (`src/cache/results.zig`, recorded since
+2026-11-03). A result is the closure of InternPool items it references
+plus a few scalars. The manifest stores them, not the store: replay
+loads the previous build's results of the same compilation, which the
+manifest already maps, and one item table per manifest stores each item
+once, where store payloads would repeat `[]const u8` in every entry.
 
-- Items in post-order (children first), each its stable hash and its `Key`
-  with every `Index` operand replaced by a reference: a static index (below
-  `static_len`), or the stable hash of an item earlier in the closure.
-  Identical results encode to identical bytes, so the entry's result hash
-  and the payload agree.
-- Loading walks the closure: an item whose stable hash the InternPool
-  already has (a new `ip.indexOfHash`, which needs a stable-hash index
-  next to the deduplication maps) is skipped; otherwise its `Key` is built
-  with resolved operands and interned with `ip.get`. After interning,
-  `ip.stableHash(index)` must equal the recorded hash; a mismatch is a bug,
-  reported as a cache miss that re-analyzes the unit.
+- The item table (`items`, `item_starts` sections): every item some
+  result references, children first, each its stable hash, its `Key` tag,
+  and the key's operands as `u32` words, with every `Index` replaced by a
+  reference: a static index (below `static_len`), `none`, or
+  `static_len` + the id of an earlier item. Strings are inline (a length
+  word, then the bytes, padded); big ints' limbs, floats' bits, and
+  `aggregate` bytes are inline too.
+- Each node's result (`results`, `result_starts`): a short list of words
+  per unit kind, its `Index` fields references into the table. Empty for
+  a node without one: a log record's nodes (until step 4's Delta stores
+  them), unresolved declarations, and results that cannot be encoded.
+- Loading walks a result's references, memoized per item: an item whose
+  stable hash the run already has (`ip.indexOfHash`, one probe, since the
+  dedup maps are keyed by stable hash) is taken as it is; otherwise its
+  `Key` is rebuilt from the decoded operands and interned with `ip.get`,
+  and `ip.stableHash` of the result must equal the recorded hash. A
+  mismatch is a bug, treated as a cache miss that re-analyzes the unit.
 - Key kinds, all by contents: `int_type`, `ptr_type`, `array_type`,
   `vector_type`, `opt_type`, `anyframe_type`, `error_union_type`,
-  `simple_type`, `tuple_type`, `error_set_type` (names inline),
-  `func_type`, `simple_value`, `undef`, `int` (big limbs inline), `float`
-  (exact bits), `err`, `error_union`, `enum_literal`, `enum_tag`, `un`,
-  `slice`, `opt`, `aggregate` (`bytes` inline), `calling_convention`.
-  Strings are inline.
-- Key kinds that name source, by locator instead of ZIR index (indices
-  shift when unrelated code above changes): `struct_type`, `enum_type`,
-  `union_type`, `opaque_type` as (owning declaration's key, ZIR offset of
-  the container instruction relative to that declaration, captures, display
-  name, stable key); the owning declaration's `src_hash` is unchanged
-  whenever the type is green, so the relative offset still finds the same
-  instruction. Interning one goes through a Zcu function that creates the
-  type and scans its namespace as analysis does (Sema thread). `func` as
-  (owner declaration's key, relative ZIR offset, generic owner, comptime
-  arguments); `inferred_error_set_type` as its function; `ptr` with a
-  `nav` base as the declaration's key, resolved to a `NavIndex` by
-  namespace lookup alone; `nav_capture` (a container type's capture of a
-  declaration from an enclosing generic namespace, ZIR's
-  `decl_val`/`decl_ref` captures, by value or by reference) the same way.
-  Such a capture stays unresolved until the type's body reads it, as
-  upstream, because the type may be that declaration's own value.
+  `simple_type`, `tuple_type`, `error_set_type`, `func_type`,
+  `simple_value`, `undef`, `int`, `float` (exact bits), `err`,
+  `error_union`, `enum_literal`, `enum_tag`, `un`, `slice`, `opt`,
+  `aggregate`, `extern_func`, `calling_convention`, `runtime_capture`.
+- Key kinds that name source, by ZIR instruction: the absolute
+  instruction in the ZIR of the recorded input, which an edit build maps
+  to the new ZIR with the same `mapOldZirToNew` map that computes the
+  seeds (it tracks declarations, containers including `@Struct`-style
+  reifications, and function declarations); an instruction that no
+  longer maps is a miss. `struct_type`, `enum_type`, `union_type`,
+  `opaque_type` as (file, instruction, reified layout or none, the type
+  that owns the parent namespace, captures, display name, stable key),
+  everything `Zcu.createContainerType` takes. Interning one goes through
+  a Zcu function that creates the type and scans its namespace as
+  analysis does (Sema thread); a reified type's fields come from its
+  captures, which hold all of `@Struct`'s arguments. `func` as (owner
+  declaration, instruction, generic owner, comptime arguments);
+  `inferred_error_set_type` as its function. A declaration, in `ptr`'s
+  `nav` base, `func`'s owner, and `nav_capture`, is (the type that owns
+  its namespace, its name), resolved by namespace lookup alone (tests,
+  which are not in `decls`, by a scan of the test list). A capture stays
+  unresolved until the type's body reads it, as upstream, because the
+  type may be that declaration's own value.
+- Not encodable: `comptime_alloc` pointers (an escape is a compile error,
+  but a type's capture can name comptime memory), anything that refers
+  to one, cycles, and items nested deeper than 1000. Such a result is not
+  stored and its unit is re-analyzed in every edit build that reaches it.
+  None occur in conformance or the std tests.
+- `ZAP_CACHE_CHECK` decodes every recorded result from its words alone,
+  rebuilding each item from its key (`ip.find` instead of the hash
+  shortcut, container types, functions, and declarations found by their
+  locators), and checks that it yields this build's exact indices and
+  scalars, and that `ip.indexOfHash` finds each item. All 113 conformance
+  units (714k results, 849k items) and the std tests (38k results, 130k
+  items) round-trip with none unencodable.
+- Cost: encoding runs on its own thread while `record` builds the graph
+  and looks up the store, so a full build does not wait for it. The
+  `zig` workload (upstream's compiler) has 70k results over 188k items,
+  15 MB of words, encoded in 60 to 80 ms; its manifest grows from 75 to
+  93 MB and its peak RSS by about 45 MB (1.355 to 1.40 GB). Hello: 4.6k
+  results, 7.1k items, 610 KB, 2 ms.
 - Interning a closure never calls `Zcu.ensure*`: container types come
   from `createContainerType` and a namespace scan, which need no
   declaration's value, and a `nav` pointer needs only the `NavIndex`.
@@ -2193,17 +2221,20 @@ the result's items:
   (`Zcu.branch_quotas`), as upstream, so whether a deep comptime loop in
   an instance passes can depend on which callers were analyzed first. It
   is not a dependency, and replay does not reproduce it.
-- Per unit kind: `nav_val` stores ty, val, `is_const`, `linkage`,
-  `alignment` (the explicit `align(n)`, 0 if none);
-  `type_layout` stores the `ContainerInfo` fields (names, field types and
-  `comptime` field values by reference, offsets, which fields are
-  `comptime`, explicit field alignments, tag type, flags, size,
-  alignment); `struct_defaults` stores the other fields' default values
-  by reference (reified structs get theirs with the type, so the unit has
+- Per unit kind: `nav_val` stores ty, val, `is_const`,
+  `is_threadlocal`, `linkage`, `alignment` (the explicit `align(n)`, 0
+  if none);
+  `type_layout` stores the `ContainerInfo` fields (status, names, field
+  types and `comptime` field values by reference, offsets, which fields
+  are `comptime`, explicit field alignments, tag type, flags, size,
+  alignment, `comptime_only`); `struct_defaults` stores whether the
+  defaults were resolved and the other fields' default values by
+  reference (reified structs get theirs with the type, so the unit has
   nothing to do);
   `func` stores its references (its Atoms are in the pack, its IR is
-  never stored); `func_ies` stores the error names; `comptime_decl` stores
-  its exports.
+  never stored); the `func_ies` node stores whether the set is `anyerror`
+  and the error names in the order they were found; `comptime_decl` will
+  store its exports (step 4: exports do not record their unit yet).
 - `builtin.test_functions` is filled outside unit analysis
   (`populateTestFunctions`, after all tests are known), so the test list is
   its own node, and adding or removing a test changes it.
@@ -2333,10 +2364,11 @@ through them still re-runs Sema, since IR is not cached; a green `f`
 whose body a red caller needs is re-analyzed without being emitted, its
 manifest data kept (option (a) there).
 
-The manifest will store the kind in the top 2 bits of each edge's node
-index (two values spare; 2^30 nodes is ample), with the replay format
-bump; until conditional edges have a reader, every edge is plain, which
-over-predicts but is sound.
+The manifest stores the kind in the top 2 bits of each edge's word
+(`Manifest.Edge`: a 30-bit node index, two values spare; 2^30 nodes is
+ample). `record` takes it from `Zcu.conditional_deps`, and a plain edge
+to the same node wins. Reverse edges are plain node indices: both kinds
+invalidate.
 
 **Roots and output kinds** (for `zap build-obj`, which skips the cache
 for now). Replay seeds its reference closure from a root list the

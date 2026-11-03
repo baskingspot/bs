@@ -7,8 +7,9 @@
 //! - Every successful build is recorded (`record`): each unit's atoms go
 //!   to the global store as an entry, unless an equal entry is already
 //!   there, and the compilation's manifest lists the units, their
-//!   dependencies, source and result hashes, atoms (in the store packs it
-//!   hard-links as base packs), input stats, error codes, and entry.
+//!   dependencies, source and result hashes, results (`results.zig`),
+//!   atoms (in the store packs it hard-links as base packs), input stats,
+//!   error codes, and entry.
 //! - The error codes of the last build are assigned first, so they stay
 //!   stable across builds (`seedErrors`).
 //!
@@ -25,6 +26,7 @@ const Pack = cache.Pack;
 const Store = cache.Store;
 const atoms_codec = cache.atoms;
 const seeds = cache.seeds;
+const results = cache.results;
 const Hash = cache.Hash;
 const Frontend = @import("Frontend.zig");
 const InternPool = @import("InternPool.zig");
@@ -251,7 +253,8 @@ const Node = struct {
     tag: Tag,
     source: Manifest.Source = .none,
     source_name: ?[]const u8 = null,
-    /// Node indices, ascending and distinct; set by `Recorder.group`.
+    /// `Manifest.Edge` words, by node index ascending and distinct; set by
+    /// `Recorder.group`.
     deps: []const u32 = &.{},
     /// Indices into `Emit.atoms`, ascending; set by `Recorder.group`.
     atoms: []const u32 = &.{},
@@ -347,7 +350,8 @@ const Recorder = struct {
     dependee_info: []Info = &.{},
     /// (node, dependency) and (node, atom index) pairs, grouped into the
     /// nodes' `deps` and `atoms` by `group`: one array each instead of two
-    /// small lists per node.
+    /// small lists per node. A dependency is its node index times two,
+    /// plus one if it is conditional (`edge`).
     edges: std.ArrayList([2]u32) = .empty,
     atom_pairs: std.ArrayList([2]u32) = .empty,
     storage: []u32 = &.{},
@@ -355,6 +359,11 @@ const Recorder = struct {
     const no_node = std.math.maxInt(u32);
 
     const Ref = union(enum) { unit: u32, dependee: u32 };
+
+    /// The second word of an `edges` pair.
+    fn edge(dep: u32, conditional: bool) u32 {
+        return dep << 1 | @intFromBool(conditional);
+    }
 
     /// What a unit's or dependee's node gets, and the node once made.
     const Info = struct {
@@ -486,7 +495,7 @@ const Recorder = struct {
             r.nodes.items[index].source = info.source;
             r.nodes.items[index].source_name = info.source_name;
             const producer = r.dependee_producer.items[i];
-            if (producer != no_node) try r.edges.append(r.gpa, .{ index, try r.unitNode(producer) });
+            if (producer != no_node) try r.edges.append(r.gpa, .{ index, edge(try r.unitNode(producer), false) });
         }
         return index;
     }
@@ -501,14 +510,15 @@ const Recorder = struct {
         };
     }
 
-    /// Sets each node's `deps` (sorted, without repeats) and `atoms` (in
-    /// order) from the pairs, with stable counting sorts: O(pairs + nodes).
+    /// Sets each node's `deps` (sorted, without repeats, plain over
+    /// conditional) and `atoms` (in order) from the pairs, with stable
+    /// counting sorts: O(pairs + nodes).
     fn group(r: *Recorder) !void {
         const gpa = r.gpa;
         const n = r.nodes.items.len;
         const tmp = try gpa.alloc([2]u32, @max(r.edges.items.len, r.atom_pairs.items.len));
         defer gpa.free(tmp);
-        const counts = try gpa.alloc(u32, n + 1);
+        const counts = try gpa.alloc(u32, 2 * n + 1);
         defer gpa.free(counts);
         // By dependency, then stably by node: sorted pairs.
         countingSort(r.edges.items, 1, counts, tmp);
@@ -522,8 +532,11 @@ const Recorder = struct {
             const node_index = edges[i][0];
             const start = at;
             while (i < edges.len and edges[i][0] == node_index) : (i += 1) {
-                if (at > start and r.storage[at - 1] == edges[i][1]) continue;
-                r.storage[at] = edges[i][1];
+                // A plain edge sorts before a conditional one to the same
+                // node, and wins.
+                const dep = edges[i][1] >> 1;
+                if (at > start and Manifest.Edge.nodeOf(r.storage[at - 1]) == dep) continue;
+                r.storage[at] = Manifest.Edge.init(dep, if (edges[i][1] & 1 != 0) .conditional else .plain);
                 at += 1;
             }
             r.nodes.items[node_index].deps = r.storage[start..at];
@@ -900,6 +913,17 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     try r.prepare(io);
     const t_keys = now(io);
 
+    // The units' results, for an edit build to load, encoded on another
+    // thread while this one makes the graph and looks up the store.
+    var enc: results.Encoder = .{ .gpa = gpa, .zcu = zcu };
+    defer enc.deinit();
+    var result_words: std.ArrayList(u32) = .empty;
+    defer result_words.deinit(gpa);
+    const item_results = try gpa.alloc([2]u32, r.unit_list.items.len + r.dependee_list.items.len);
+    defer gpa.free(item_results);
+    var encoding = io.async(encodeResults, .{ io, &r, &enc, &result_words, item_results });
+    defer if (encoding.cancel(io)) |_| {} else |_| {};
+
     // Nodes in the order of their first atom, so that a relink lays out
     // the output as this build did.
     const link_key = cache.hash(2, &.{@backingInt(Tag.link)});
@@ -912,14 +936,21 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         r.atom_pairs.appendAssumeCapacity(.{ index, @intCast(i) });
     }
     n_refs = 0;
-    for (zcu.deps.values(), dep_units) |dependees, u| {
+    for (zcu.deps.keys(), zcu.deps.values(), dep_units) |unit, dependees, u| {
         const index = try r.unitNode(u);
-        for (dep_refs[n_refs..][0..dependees.len]) |ref| try r.edges.append(gpa, .{ index, try r.dependeeNode(ref) });
+        // Ascending indices into `dependees`.
+        const conditional = zcu.conditional_deps.get(unit) orelse &.{};
+        var next_conditional: usize = 0;
+        for (dep_refs[n_refs..][0..dependees.len], 0..) |ref, j| {
+            const is_conditional = next_conditional < conditional.len and conditional[next_conditional] == j;
+            next_conditional += @intFromBool(is_conditional);
+            try r.edges.append(gpa, .{ index, Recorder.edge(try r.dependeeNode(ref), is_conditional) });
+        }
         n_refs += dependees.len;
     }
     for (emit.content_uses.items, use_units) |use, u| {
         const index = try r.unitNode(u);
-        try r.edges.append(gpa, .{ index, r.map.get(@backingInt(use.key)).? });
+        try r.edges.append(gpa, .{ index, Recorder.edge(r.map.get(@backingInt(use.key)).?, false) });
     }
     // Nodes for the references' units, so that every node exists before
     // the store and manifest passes.
@@ -1059,6 +1090,17 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         try base_names.append(gpa, &new_name.?);
     }
     const new_base: u32 = @intCast(base_names.items.len);
+    const encoded = try encoding.await(io);
+    const result_of = try gpa.alloc([2]u32, r.nodes.items.len);
+    defer gpa.free(result_of);
+    @memset(result_of, .{ 0, 0 });
+    for (r.unit_info, item_results[0..r.unit_info.len]) |info, res| if (res[1] != 0) {
+        result_of[info.node] = res;
+    };
+    for (r.dependee_info, item_results[r.unit_info.len..]) |info, res| if (res[1] != 0) {
+        result_of[info.node] = res;
+    };
+    if (inc.check and !checkResults(gpa, zcu, &r, &enc, result_words.items, result_of, encoded.unencodable)) inc.check_failed.store(true, .monotonic);
     const t2 = now(io);
     var committing = io.async(Putter.writePack, .{ putter, io, entries.items, end, new_name != null });
     defer if (committing.cancel(io)) |_| {} else |_| {};
@@ -1124,10 +1166,13 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
                 off += len;
             }
         }
-        _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps, .atoms = refs.items, .symbols = symbols.items, .refs = refs_of.items, .source = n.source, .source_name = n.source_name });
+        const res = result_of[ni];
+        _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps, .atoms = refs.items, .symbols = symbols.items, .refs = refs_of.items, .source = n.source, .source_name = n.source_name, .result = result_words.items[res[0]..][0..res[1]] });
     }
     if (inc.check and !checkReferences(gpa, &r, root_items.items, &b)) inc.check_failed.store(true, .monotonic);
     for (base_names.items) |name| _ = try b.addBasePack(name);
+    b.items = enc.words.items;
+    b.item_starts = enc.starts.items;
     b.entry = @backingInt(emit.entry.?);
     for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
     const t3 = now(io);
@@ -1171,13 +1216,59 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         out.* = try gpa.dupe(u8, name);
         n_names += 1;
     }
-    const report = try std.fmt.allocPrint(gpa, "cache: recorded {d} nodes, {d} atoms, {d} references, {d} inputs in {d:.2} ms alongside the link (graph {d:.2}: items {d:.2}, keys {d:.2}; store lookups {d:.2}: {d} reused, {d} put; manifest {d:.2} while the store writes: nodes and symbols {d:.2}, inputs {d:.2}, write {d:.2}; store's remainder {d:.2})", .{
-        r.nodes.items.len, emit.atoms.items.len, b.refs.items.len,      fe.files.items.len, ms(t0, t6),
-        ms(t0, t1),        ms(t0, t_collect),    ms(t_collect, t_keys), ms(t1, t2),         reused,
-        n_put,             ms(t2, t5),           ms(t2, t3),            ms(t3, t4),         ms(t4, t5),
+    const report = try std.fmt.allocPrint(gpa, "cache: recorded {d} nodes, {d} atoms, {d} references, {d} inputs in {d:.2} ms alongside the link (graph {d:.2}: items {d:.2}, keys {d:.2}; store lookups {d:.2}: {d} reused, {d} put, beside results {d:.2}: {d} units, {d} not encodable, {d} items, {d} KB; manifest {d:.2} while the store writes: nodes and symbols {d:.2}, inputs {d:.2}, write {d:.2}; store's remainder {d:.2})", .{
+        r.nodes.items.len,                                         emit.atoms.items.len, b.refs.items.len,      fe.files.items.len,  ms(t0, t6),
+        ms(t0, t1),                                                ms(t0, t_collect),    ms(t_collect, t_keys), ms(t1, t2),          reused,
+        n_put,                                                     encoded.ms,           encoded.units,         encoded.unencodable, enc.starts.items.len,
+        (enc.words.items.len + result_words.items.len) * 4 / 1024, ms(t2, t5),           ms(t2, t3),            ms(t3, t4),          ms(t4, t5),
         ms(t5, t6),
     });
     return .{ .manifest = manifest, .base_names = names, .report = report };
+}
+
+const Encoded = struct { units: usize = 0, unencodable: usize = 0, ms: f64 = 0 };
+
+/// Encodes the results of `r`'s units and dependees (`results.zig`) into
+/// `words`, the range of each in `ranges` (units first, as in `unit_list`
+/// and `dependee_list`; empty for none). Reads only the lists, which do not
+/// change once `prepare` ran.
+fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.ArrayList(u32), ranges: [][2]u32) !Encoded {
+    const t0 = now(io);
+    const gpa = r.gpa;
+    const ip = &r.zcu.ip;
+    @memset(ranges, .{ 0, 0 });
+    var e: Encoded = .{};
+    try enc.ids.ensureTotalCapacity(gpa, @intCast(4 * r.unit_list.items.len));
+    for (r.unit_list.items, ranges[0..r.unit_list.items.len]) |unit, *range| {
+        const start = words.items.len;
+        const ok = switch (unit) {
+            .nav_val => |nav_index| blk: {
+                const nav = ip.getNav(nav_index);
+                if (nav.status != .resolved) continue;
+                break :blk try results.encodeNav(enc, words, nav);
+            },
+            .type_layout => |ty| try results.encodeLayout(enc, words, ty),
+            .struct_defaults => |ty| try results.encodeDefaults(enc, words, ty),
+            .func, .comptime_decl => continue,
+        };
+        if (!ok) {
+            e.unencodable += 1;
+            continue;
+        }
+        range.* = .{ @intCast(start), @intCast(words.items.len - start) };
+        e.units += 1;
+    }
+    for (r.dependee_list.items, ranges[r.unit_list.items.len..]) |d, *range| switch (d) {
+        .func_ies => |func| {
+            const start = words.items.len;
+            try results.encodeIes(gpa, r.zcu, words, func);
+            range.* = .{ @intCast(start), @intCast(words.items.len - start) };
+            e.units += 1;
+        },
+        else => {},
+    };
+    e.ms = ms(t0, now(io));
+    return e;
 }
 
 /// The local cache's size limit and trimming (`Store.commit` maintains the
@@ -1310,7 +1401,10 @@ const Putter = struct {
                 if (buf.items.len == 0) buf_off = put.offset;
                 std.debug.assert(buf_off + buf.items.len == put.offset);
                 deps.clearRetainingCapacity();
-                for (n.deps) |d| try deps.append(gpa, .{ .key = p.nodes[d].key, .result_hash = p.nodes[d].result_hash });
+                for (n.deps) |e| {
+                    const d = Manifest.Edge.nodeOf(e);
+                    try deps.append(gpa, .{ .key = p.nodes[d].key, .result_hash = p.nodes[d].result_hash });
+                }
                 atoms.clearRetainingCapacity();
                 debug.clearRetainingCapacity();
                 for (n.atoms, 0..) |ai, j| {
@@ -1435,8 +1529,8 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
             break;
         };
         std.debug.print("cache check: {t} node {x} ({s}) changed its result but no changed source reaches it; it depended on:\n", .{ n.tag, n.key, name.written() });
-        for (m.deps(i)) |d| {
-            const dn = m.node(d);
+        for (m.deps(i)) |e| {
+            const dn = m.node(Manifest.Edge.nodeOf(e));
             name.clearRetainingCapacity();
             for (r.unit_list.items, r.unit_info) |u, info| if (info.key == dn.key) {
                 r.zcu.unitKey(u, &name.writer) catch {};
@@ -1477,7 +1571,10 @@ fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *c
         // inferred error set, which analyzes and emits its body: the
         // `func_ies` dependee's edge to it. A green unit loaded from the
         // cache reaches it the same way, through `ensureFuncIes`.
-        for (nodes[n].deps) |d| if (nodes[d].tag != .func or nodes[n].tag == .func_ies) next.append(gpa, d) catch return true;
+        for (nodes[n].deps) |e| {
+            const d = Manifest.Edge.nodeOf(e);
+            if (nodes[d].tag != .func or nodes[n].tag == .func_ies) next.append(gpa, d) catch return true;
+        }
         for (b.refs.items[range[0]..][0..range[1]]) |ref| switch (ref.kind) {
             .func, .nav => next.append(gpa, ref.value) catch return true,
             .rt => {
@@ -1510,6 +1607,100 @@ fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *c
     }
     std.debug.print("cache check: references reach {d} of {d} functions\n", .{ funcs - missed, funcs });
     return missed == 0;
+}
+
+/// `ZAP_CACHE_CHECK`: decodes every encoded result from its words alone,
+/// rebuilding each item from its key rather than finding it by hash, and
+/// checks that it is this build's result: the same InternPool indices, and
+/// the same scalars. That is what an edit build relies on when it loads a
+/// green unit. The decoder only finds container types, functions, and
+/// declarations here (`results.Lookup`); creating them is replay's.
+fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const results.Encoder, words: []const u32, result_of: []const [2]u32, unencodable: usize) bool {
+    const ip = &zcu.ip;
+    var d = results.Decoder(results.Lookup).init(gpa, ip, enc.words.items, enc.starts.items, .{ .zcu = zcu }) catch return false;
+    defer d.deinit();
+    d.rebuild = true;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var checked: usize = 0;
+    var mismatched: usize = 0;
+    const Check = struct {
+        fn report(z: *Zcu, dec: anytype, unit: anytype, what: []const u8) void {
+            var name: std.Io.Writer.Allocating = .init(z.gpa);
+            defer name.deinit();
+            z.unitKey(unit, &name.writer) catch {};
+            std.debug.print("cache check: the result of {t} {s} does not round-trip: {s}", .{ unit, name.written(), what });
+            if (dec.miss.reason != .none) std.debug.print(" (item {d}, {t}: {t})", .{ dec.miss.id, dec.miss.tag, dec.miss.reason });
+            std.debug.print("\n", .{});
+        }
+    };
+    for (r.unit_list.items, r.unit_info) |unit, info| {
+        const res = result_of[info.node];
+        if (res[1] == 0) continue;
+        _ = arena_state.reset(.retain_capacity);
+        const arena = arena_state.allocator();
+        const w = words[res[0]..][0..res[1]];
+        checked += 1;
+        d.miss = .{};
+        const ok, const what: []const u8 = switch (unit) {
+            .nav_val => |nav_index| blk: {
+                const nav = ip.getNav(nav_index);
+                const got = (results.decodeNav(&d, w) catch null) orelse break :blk .{ false, "unresolved" };
+                break :blk .{ got.ty == nav.ty and got.val == nav.val and got.is_const == nav.is_const and
+                    got.is_threadlocal == nav.is_threadlocal and got.linkage == nav.linkage and got.alignment == nav.alignment, "different" };
+            },
+            .type_layout => |ty| blk: {
+                const info_live = ip.structInfo(ty);
+                const got = (results.decodeLayout(&d, arena, w) catch null) orelse break :blk .{ false, "unresolved" };
+                const is_struct = ip.indexToKey(ty) == .struct_type;
+                var same = got.status == info_live.status and got.layout == info_live.layout and
+                    got.nonexhaustive == info_live.nonexhaustive and got.has_runtime_tag == info_live.has_runtime_tag and
+                    got.comptime_only == info_live.comptime_only and got.size == info_live.size and
+                    got.alignment == info_live.alignment and got.tag_type == info_live.tag_type and
+                    std.mem.eql(InternPool.String, got.field_names, info_live.field_names) and
+                    std.mem.eql(InternPool.Index, got.field_types, info_live.field_types) and
+                    std.mem.eql(u64, got.field_offsets, info_live.field_offsets) and
+                    std.mem.eql(bool, got.field_is_comptime, info_live.field_is_comptime) and
+                    std.mem.eql(u64, got.field_aligns, info_live.field_aligns) and
+                    got.field_defaults.len == info_live.field_defaults.len;
+                if (same) for (got.field_defaults, info_live.field_defaults, 0..) |g, l, i| {
+                    if (g != (if (!is_struct or info_live.fieldIsComptime(i)) l else .none)) same = false;
+                };
+                break :blk .{ same, "different" };
+            },
+            .struct_defaults => |ty| blk: {
+                const info_live = ip.structInfo(ty);
+                const got = (results.decodeDefaults(&d, arena, w) catch null) orelse break :blk .{ false, "unresolved" };
+                var same = got.resolved == (info_live.defaults_status == .resolved) and got.defaults.len == info_live.field_defaults.len;
+                if (same) for (got.defaults, info_live.field_defaults, 0..) |g, l, i| {
+                    if (g != (if (info_live.fieldIsComptime(i)) .none else l)) same = false;
+                };
+                break :blk .{ same, "different" };
+            },
+            .func, .comptime_decl => unreachable,
+        };
+        if (ok) continue;
+        mismatched += 1;
+        if (mismatched <= 10) Check.report(zcu, &d, unit, what);
+    }
+    for (r.dependee_list.items, r.dependee_info) |dep, info| switch (dep) {
+        .func_ies => |func| {
+            _ = arena_state.reset(.retain_capacity);
+            const res = result_of[info.node];
+            const got = results.decodeIes(ip, arena_state.allocator(), words[res[0]..][0..res[1]]) catch return false;
+            checked += 1;
+            const names = zcu.inferred_errors.get(func) orelse &.{};
+            if (got.is_anyerror == zcu.anyerror_ies.contains(func) and std.mem.eql(InternPool.String, got.names, names)) continue;
+            mismatched += 1;
+            if (mismatched <= 10) Check.report(zcu, &d, Zcu.AnalUnit{ .func = func }, "different inferred errors");
+        },
+        else => {},
+    };
+    const f = enc.fallbacks;
+    std.debug.print("cache check: {d} results round-trip through {d} items, {d} did not; {d} not encodable ({d} comptime pointers, {d} cycles, {d} too deep)\n", .{
+        checked - mismatched, enc.starts.items.len, mismatched, unencodable, f.comptime_alloc, f.cycle, f.too_deep,
+    });
+    return mismatched == 0;
 }
 
 /// Everything the linker emits for an atom but its name and key, like

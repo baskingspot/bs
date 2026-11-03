@@ -945,6 +945,27 @@ pub fn find(ip: *InternPool, key: Key) ?Index {
     return e.index;
 }
 
+/// The non-static item whose stable hash is `hash`, if one is interned.
+/// The dedup maps are keyed by stable hash already, so this costs one
+/// probe; the cache uses it to skip rebuilding items a run already has.
+pub fn indexOfHash(ip: *InternPool, hash: Hash) ?Index {
+    const shard = ip.shardOf(hash);
+    shard.mutex.lockUncancelable(ip.io);
+    defer shard.mutex.unlock(ip.io);
+    const e = shard.map.getKeyAdapted(hash, HashAdapter{ .ip = ip }) orelse return null;
+    return e.index;
+}
+
+const HashAdapter = struct {
+    ip: *const InternPool,
+    pub fn hash(_: HashAdapter, h: Hash) u64 {
+        return @truncate(h);
+    }
+    pub fn eql(ha: HashAdapter, h: Hash, e: Entry) bool {
+        return e.hash == @as(u64, @truncate(h)) and ha.ip.stableHash(e.index) == h;
+    }
+};
+
 pub fn get(ip: *InternPool, tid: Tid, key_in: Key) Allocator.Error!Index {
     var bytes_buf: std.ArrayList(u8) = .empty;
     defer bytes_buf.deinit(ip.gpa);

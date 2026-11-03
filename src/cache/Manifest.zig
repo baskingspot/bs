@@ -48,6 +48,11 @@
 //! that a relink reads the records in place (`Pack.LinkAtoms`) and decodes
 //! nothing.
 //!
+//! A node also keeps its unit's result (`result`), so that an edit build
+//! can load a green unit's result instead of analyzing it: words in the
+//! format of `results.zig`, whose InternPool items are in one table for the
+//! whole manifest (`items`, `item_starts`). Only a base stores results.
+//!
 //! Base file: `Header`, then each section at a 16-byte aligned offset.
 //! Log file: `LogHeader`, then records (`RecordHeader` and its body), each
 //! checksummed; a torn record at the end is ignored and overwritten.
@@ -101,8 +106,8 @@ source_names: []const SourceName,
 /// Open-addressing table from `Node.key` to node index + 1 (0: empty),
 /// a power of two long, at most half full.
 table: []const u32,
-/// Node indices: each node's dependencies at `deps_start`, its dependents
-/// in `redges` at `rdeps_start`.
+/// Each node's dependencies at `deps_start` (edge words: see `Edge`), its
+/// dependents in `redges` at `rdeps_start` (node indices).
 edges: []const u32,
 redges: []const u32,
 atom_refs: []const Pack.AtomRef,
@@ -112,6 +117,14 @@ error_names: []const StrRef,
 /// The file names of the pack's base packs (see `Pack`), in pack index
 /// order from 1.
 bases: []const StrRef,
+/// The item table of the results (see `results.zig`): item `i` is at
+/// `items[item_starts[i]..]`.
+items: []const u32,
+item_starts: []const u32,
+/// Each base node's result is `results[result_starts[i]..result_starts[i + 1]]`,
+/// empty if it has none.
+results: []const u32,
+result_starts: []const u32,
 strings: []const u8,
 overlay: Overlay,
 
@@ -134,6 +147,28 @@ pub const Node = extern struct {
 };
 
 pub const StrRef = extern struct { off: u32, len: u32 };
+
+/// A dependency edge as stored in `edges` and passed in `NodeInit.deps`:
+/// the node depended on, and how. Replay brings only plain dependencies up
+/// to date before deciding whether a unit is green; a conditional one is
+/// a read that only the comptime evaluator's lowering made (Sema's
+/// `deps_conditional`), which the unit's result does not depend on. Both
+/// propagate when an edit build walks reverse edges, which may visit more
+/// than it must.
+pub const Edge = packed struct(u32) {
+    node: u30,
+    kind: Kind = .plain,
+
+    pub const Kind = enum(u2) { plain, conditional, _ };
+
+    pub fn init(node_index: u32, kind: Kind) u32 {
+        return @bitCast(Edge{ .node = @intCast(node_index), .kind = kind });
+    }
+
+    pub fn nodeOf(word: u32) u32 {
+        return @as(Edge, @bitCast(word)).node;
+    }
+};
 
 /// Where a node's result comes from in the sources, so that an edit build
 /// finds the nodes an edited file can change without analyzing anything
@@ -301,10 +336,10 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN07".*;
+const magic = "ZAPMAN08".*;
 const log_magic = "ZAPMLG03".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
@@ -444,7 +479,7 @@ fn SectionType(comptime s: Section) type {
         .atom_refs => Pack.AtomRef,
         .inputs => Input,
         .error_names, .bases, .files, .ref_names => StrRef,
-        .ref_starts => u32,
+        .ref_starts, .items, .item_starts, .results, .result_starts => u32,
         .refs => Ref,
         .sources => Source,
         .source_names => SourceName,
@@ -484,7 +519,9 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
         m.numbered.len != m.atom_refs.len or m.debug_files.len != m.atom_refs.len or
         m.error_symbols.len != m.error_names.len or
         m.ref_starts.len != m.nodes.len + 1 or m.ref_starts[m.nodes.len] != m.refs.len or
-        m.sources.len != m.nodes.len) return corrupt(io, &map);
+        m.sources.len != m.nodes.len or
+        m.result_starts.len != m.nodes.len + 1 or m.result_starts[m.nodes.len] != m.results.len or
+        (m.item_starts.len != 0 and m.item_starts[m.item_starts.len - 1] >= m.items.len)) return corrupt(io, &map);
     errdefer m.overlay.deinit(gpa);
     try m.readLog(gpa, io, dir);
     return m;
@@ -546,7 +583,7 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
         }
         try o.nodes.put(gpa, index, .{ .delta = &d[0], .deps = node_deps, .atoms = node_atoms, .numbered = node_numbered, .debug_files = node_files, .refs = node_refs });
         for (node_deps) |dep| {
-            const gop = try o.rdeps.getOrPut(gpa, dep);
+            const gop = try o.rdeps.getOrPut(gpa, Edge.nodeOf(dep));
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(gpa, index);
         }
@@ -648,10 +685,19 @@ pub fn refNameCount(m: *const Manifest) u32 {
     return @intCast(m.ref_names.len + m.overlay.ref_names.items.len);
 }
 
+/// Node `index`'s dependencies, as `Edge` words.
 pub fn deps(m: *const Manifest, index: u32) []const u32 {
     if (m.overlay.nodes.get(index)) |s| return s.deps;
     const n = m.nodes[index];
     return m.edges[n.deps_start..][0..n.deps_len];
+}
+
+/// Node `index`'s result in the format of `results.zig`, or empty if it has
+/// none. A node a log record changed or added has none: only a base stores
+/// results.
+pub fn result(m: *const Manifest, index: u32) []const u32 {
+    if (index >= m.nodes.len or m.overlay.nodes.contains(index)) return &.{};
+    return m.results[m.result_starts[index]..m.result_starts[index + 1]];
 }
 
 /// The nodes that depend on `index`, possibly with extras (see the file's
@@ -858,7 +904,7 @@ pub const NodeInit = struct {
     result_hash: Hash,
     src_hash: Hash = 0,
     tag: u8 = 0,
-    /// Indices of nodes, which may be added later.
+    /// `Edge` words; their nodes may be added later.
     deps: []const u32 = &.{},
     atoms: []const Pack.AtomRef = &.{},
     /// One per atom.
@@ -869,6 +915,8 @@ pub const NodeInit = struct {
     source: Source = .none,
     /// For a `namespace_name` node, the name it looks up.
     source_name: ?[]const u8 = null,
+    /// The unit's result, referring to the builder's `items` (bases only).
+    result: []const u32 = &.{},
 };
 
 /// Interns debug source paths; owns its keys.
@@ -1116,6 +1164,12 @@ pub const Builder = struct {
     /// Parallel to `nodes`.
     sources: std.ArrayList(Source) = .empty,
     source_names: std.ArrayList(SourceName) = .empty,
+    /// Each node's range of `results`, parallel to `nodes`.
+    result_ranges: std.ArrayList([2]u32) = .empty,
+    results: std.ArrayList(u32) = .empty,
+    /// The results' item table, owned by the caller (or the base).
+    items: []const u32 = &.{},
+    item_starts: []const u32 = &.{},
     strings: std.ArrayList(u8) = .empty,
     entry: Hash = 0,
     /// Each number's key.
@@ -1147,6 +1201,8 @@ pub const Builder = struct {
         b.ref_name_table.deinit(gpa);
         b.sources.deinit(gpa);
         b.source_names.deinit(gpa);
+        b.result_ranges.deinit(gpa);
+        b.results.deinit(gpa);
         b.strings.deinit(gpa);
         b.symbol_keys.deinit(gpa);
         b.symbol_map.deinit(gpa);
@@ -1176,6 +1232,15 @@ pub const Builder = struct {
         try b.sources.appendSlice(gpa, base.sources);
         try b.sources.appendNTimes(gpa, .none, base.nodeCount() - base.nodes.len);
         try b.source_names.appendSlice(gpa, base.source_names);
+        try b.results.appendSlice(gpa, base.results);
+        try b.result_ranges.ensureTotalCapacity(gpa, base.nodeCount());
+        for (0..base.nodes.len) |i| {
+            const r = base.result_starts[i];
+            b.result_ranges.appendAssumeCapacity(.{ r, if (base.overlay.nodes.contains(@intCast(i))) 0 else base.result_starts[i + 1] - r });
+        }
+        b.result_ranges.appendNTimesAssumeCapacity(.{ 0, 0 }, base.nodeCount() - base.nodes.len);
+        b.items = base.items;
+        b.item_starts = base.item_starts;
         const o = &base.overlay;
         // Number space: the base's and the log's, as they are.
         try b.targets.appendSlice(gpa, base.targets);
@@ -1255,6 +1320,8 @@ pub const Builder = struct {
         try b.refs.appendSlice(gpa, n.refs);
         try b.sources.append(gpa, n.source);
         if (n.source_name) |name| try b.source_names.append(gpa, .{ .node = index, .name = try b.addString(name) });
+        try b.result_ranges.append(gpa, .{ @intCast(b.results.items.len), @intCast(n.result.len) });
+        try b.results.appendSlice(gpa, n.result);
         return index;
     }
 
@@ -1289,6 +1356,8 @@ pub const Builder = struct {
         // A node keeps its key, so its source and name: only the
         // instruction can move.
         b.sources.items[index] = n.source;
+        b.result_ranges.items[index] = .{ @intCast(b.results.items.len), @intCast(n.result.len) };
+        try b.results.appendSlice(b.gpa, n.result);
     }
 
     /// Reserves room for `n_atoms` more atom references with `n_targets` more
@@ -1408,7 +1477,7 @@ pub const Builder = struct {
             target_count += n.targets_len;
         }
         for (b.edges.items) |d| {
-            if (d >= nodes.len) return error.InvalidNodeIndex;
+            if (Edge.nodeOf(d) >= nodes.len) return error.InvalidNodeIndex;
         }
         // References, in node order.
         const ref_starts = try gpa.alloc(u32, nodes.len + 1);
@@ -1427,6 +1496,28 @@ pub const Builder = struct {
             }
         }
         ref_starts[nodes.len] = @intCast(node_refs.items.len);
+        // Results, in node order: as they are, if every node was added in
+        // order to an empty builder.
+        const result_starts = try gpa.alloc(u32, nodes.len + 1);
+        defer gpa.free(result_starts);
+        var compacted_results: std.ArrayList(u32) = .empty;
+        defer compacted_results.deinit(gpa);
+        var node_results: []const u32 = b.results.items;
+        var results_len: u32 = 0;
+        const results_in_order = for (b.result_ranges.items, 0..) |range, i| {
+            if (range[0] != results_len and range[1] != 0) break false;
+            result_starts[i] = results_len;
+            results_len += range[1];
+        } else results_len == node_results.len;
+        if (!results_in_order) {
+            try compacted_results.ensureTotalCapacity(gpa, b.results.items.len);
+            for (b.result_ranges.items, 0..) |range, i| {
+                result_starts[i] = @intCast(compacted_results.items.len);
+                compacted_results.appendSliceAssumeCapacity(b.results.items[range[0]..][0..range[1]]);
+            }
+            node_results = compacted_results.items;
+        }
+        result_starts[nodes.len] = @intCast(node_results.len);
         const numbered = try gpa.alloc(NumberedAtom, ref_count);
         defer gpa.free(numbered);
         const targets = try gpa.alloc(u32, target_count);
@@ -1515,7 +1606,7 @@ pub const Builder = struct {
 
         // Reverse edges: count, prefix sums, fill.
         for (nodes) |*n| n.rdeps_len = 0;
-        for (edges) |d| nodes[d].rdeps_len += 1;
+        for (edges) |d| nodes[Edge.nodeOf(d)].rdeps_len += 1;
         var start: u32 = 0;
         for (nodes) |*n| {
             n.rdeps_start = start;
@@ -1526,7 +1617,7 @@ pub const Builder = struct {
         defer gpa.free(redges);
         for (nodes, 0..) |n, i| {
             for (edges[n.deps_start..][0..n.deps_len]) |d| {
-                const t = &nodes[d];
+                const t = &nodes[Edge.nodeOf(d)];
                 redges[t.rdeps_start + t.rdeps_len] = @intCast(i);
                 t.rdeps_len += 1;
             }
@@ -1577,6 +1668,10 @@ pub const Builder = struct {
             @ptrCast(b.ref_names.items),
             @ptrCast(b.sources.items),
             @ptrCast(b.source_names.items),
+            @ptrCast(b.items),
+            @ptrCast(b.item_starts),
+            @ptrCast(node_results),
+            @ptrCast(result_starts),
             b.strings.items,
         };
         const zeros: [16]u8 = @splat(0);
@@ -1638,8 +1733,11 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         const memcpy = try b.addRefName("memcpy");
         _ = try b.addNode(.{ .key = 101, .result_hash = 2, .src_hash = 7, .deps = &.{0}, .atoms = &.{.init(32, 64)}, .symbols = &.{
             .{ .key = 0xa1, .targets = &.{ 0xa3, 0xe1 }, .file = "a.zig" },
-        }, .refs = &.{ .{ .kind = .func, .value = 3 }, .{ .kind = .ext, .value = memcpy }, .{ .kind = .err, .value = 2 }, .{ .kind = .error_names, .value = 0 } }, .source = .{ .input = 0, .inst = 12 } });
-        _ = try b.addNode(.{ .key = 102, .result_hash = 3, .deps = &.{ 1, 0, 3 }, .source = .{ .input = 0, .inst = 0 }, .source_name = "x" });
+        }, .refs = &.{ .{ .kind = .func, .value = 3 }, .{ .kind = .ext, .value = memcpy }, .{ .kind = .err, .value = 2 }, .{ .kind = .error_names, .value = 0 } }, .source = .{ .input = 0, .inst = 12 }, .result = &.{ 7, 8, 9 } });
+        // Node 2's dependency on node 0 is conditional.
+        _ = try b.addNode(.{ .key = 102, .result_hash = 3, .deps = &.{ 1, Edge.init(0, .conditional), 3 }, .source = .{ .input = 0, .inst = 0 }, .source_name = "x", .result = &.{5} });
+        b.items = &.{ 1, 2, 3, 4, 5, 6 };
+        b.item_starts = &.{ 0, 5 };
         _ = try b.addNode(.{ .key = 103, .result_hash = 4, .atoms = &.{.init(160, 16)}, .symbols = &.{
             .{ .key = 0xa3, .targets = &.{ 0xa1, 0xb0 } },
         } });
@@ -1654,8 +1752,13 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     try t.expectEqual(0xabc, m.pack_id);
     try t.expectEqual(2, m.find(102));
     try t.expectEqual(null, m.find(999));
-    try t.expectEqualSlices(u32, &.{ 1, 0, 3 }, m.deps(2));
+    try t.expectEqualSlices(u32, &.{ 1, Edge.init(0, .conditional), 3 }, m.deps(2));
+    try t.expectEqual(0, Edge.nodeOf(m.deps(2)[1]));
     try t.expectEqualSlices(u32, &.{ 1, 2 }, m.rdeps(0)[0]);
+    try t.expectEqualSlices(u32, &.{}, m.result(0));
+    try t.expectEqualSlices(u32, &.{ 7, 8, 9 }, m.result(1));
+    try t.expectEqualSlices(u32, &.{5}, m.result(2));
+    try t.expectEqualSlices(u32, &.{ 0, 5 }, m.item_starts);
     try t.expectEqualSlices(u32, &.{2}, m.rdeps(1)[0]);
     try t.expectEqual(64, m.atoms(1)[0].len);
     try t.expectEqualStrings("Overflow", m.errorName(2));
@@ -1727,6 +1830,11 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             try t.expectEqual(6, m3.node(4).result_hash);
             try t.expectEqual(4, m3.find(104));
             try t.expectEqualSlices(u32, &.{3}, m3.deps(2));
+            // A node the log changed has no result; the others keep theirs.
+            try t.expectEqualSlices(u32, &.{ 7, 8, 9 }, m3.result(1));
+            try t.expectEqualSlices(u32, &.{}, m3.result(2));
+            try t.expectEqualSlices(u32, &.{}, m3.result(4));
+            try t.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, m3.items);
             try t.expectEqual(96, m3.atoms(2)[0].offset());
             try t.expectEqualStrings("OutOfMemory", m3.errorName(1));
             try t.expectEqualStrings("Unexpected", m3.errorName(3));
