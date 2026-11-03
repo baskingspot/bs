@@ -1,5 +1,5 @@
 //! exit: 3
-//! stdout: "84\n14\n10\n137\n28\n30\n8\n3\n11\n9\n6\n1\n"
+//! stdout: "84\n14\n10\n137\n28\n30\n8\n3\n11\n9\n6\n1\n213\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -13,6 +13,15 @@ var counter: u32 = 0;
 
 fn bump(n: u32) void {
     counter += n;
+}
+
+/// A 32-bit switch whose ranges cover every value needs no else.
+fn unitKind(x: u32) u8 {
+    return switch (x) {
+        0...0xfffffff0 - 1 => 1,
+        0xfffffff0...0xffffffff - 1 => 2,
+        0xffffffff => 3,
+    };
 }
 
 fn classify(x: u8) u8 {
@@ -98,6 +107,9 @@ fn main() callconv(.c) noreturn {
     // A const destructured from a comptime-selected prong stays
     // comptime-known.
     rt.printInt(leb(false, 9));
+    var unit_len: u32 = 0xffffffff;
+    _ = &unit_len;
+    rt.printInt(unitKind(unit_len) + unitKind(5) * 10 + unitKind(0xfffffff5) * 100);
     rt.exit(if (b) 3 else 4);
 }
 

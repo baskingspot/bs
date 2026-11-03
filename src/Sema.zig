@@ -8270,15 +8270,32 @@ fn switchCaseMatches(sema: *Sema, c: SwitchCase, v: Index) !bool {
 fn switchCoversAllInts(sema: *Sema, cases: []const SwitchCase, ty: Index) !bool {
     if (ty == .comptime_int_type) return false;
     const info = Type.intInfo(sema.ip, ty);
-    if (info.bits > 16) return false;
-    const min = sema.ip.intValue(i64, try sema.minIntValue(ty)).?;
-    const max = sema.ip.intValue(i64, try sema.maxIntValue(ty)).?;
-    var covered: i64 = 0;
+    if (info.bits > 64) return false;
+    const ip = sema.ip;
+    const Interval = struct {
+        lo: i128,
+        hi: i128,
+        fn lessThan(_: void, x: @This(), y: @This()) bool {
+            return x.lo < y.lo;
+        }
+    };
+    var intervals: std.ArrayList(Interval) = .empty;
     for (cases) |c| {
-        covered += @intCast(c.items.len);
-        for (c.ranges) |r| covered += sema.ip.intValue(i64, r[1]).? - sema.ip.intValue(i64, r[0]).? + 1;
+        for (c.items) |item| {
+            const v = ip.intValue(i128, item) orelse return false;
+            try intervals.append(sema.arena, .{ .lo = v, .hi = v });
+        }
+        for (c.ranges) |r| try intervals.append(sema.arena, .{ .lo = ip.intValue(i128, r[0]).?, .hi = ip.intValue(i128, r[1]).? });
     }
-    return covered >= max - min + 1;
+    std.mem.sort(Interval, intervals.items, {}, Interval.lessThan);
+    // Sweep: every value from min to max must be in some interval.
+    var next: i128 = ip.intValue(i128, try sema.minIntValue(ty)).?;
+    const max = ip.intValue(i128, try sema.maxIntValue(ty)).?;
+    for (intervals.items) |iv| {
+        if (iv.lo > next) return false;
+        next = @max(next, iv.hi + 1);
+    }
+    return next > max;
 }
 
 fn switchProngsRuntime(
