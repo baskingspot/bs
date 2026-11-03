@@ -129,6 +129,25 @@ pub fn finishLineHeader(d: *Dwarf, line_size: u64) void {
     std.mem.writeInt(u32, d.line_header[0..4], @intCast(line_size - 4), .little);
 }
 
+/// .debug_aranges for the compile unit at offset 0 of .debug_info, covering
+/// the `size` bytes at `low_pc`: a version 2 set with one range. lldb maps
+/// addresses to the units of a dSYM only through this section, which
+/// dsymutil always writes.
+pub fn aranges(low_pc: u64, size: u64) [aranges_size]u8 {
+    var a: [aranges_size]u8 = @splat(0);
+    std.mem.writeInt(u32, a[0..4], aranges_size - 4, .little);
+    std.mem.writeInt(u16, a[4..6], 2, .little);
+    // debug_info_offset 0, then address_size and segment_selector_size,
+    // then padding to a multiple of the tuple size.
+    a[10] = 8;
+    std.mem.writeInt(u64, a[16..24], low_pc, .little);
+    std.mem.writeInt(u64, a[24..32], size, .little);
+    // A (0, 0) tuple ends the set.
+    return a;
+}
+
+pub const aranges_size = 48;
+
 pub fn subprogramSize(debug: *const Atom.Debug) u64 {
     return 1 + debug.name.len + 1 + 8 + 4 + 4 + 4;
 }

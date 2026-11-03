@@ -505,7 +505,12 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   entry, from the same `Dwarf.zig` passes) in a dSYM bundle,
   `<exe>.dSYM/Contents/Resources/DWARF/<exe>`: an MH_DSYM file with the
   executable's UUID, its segment and section commands without contents
-  (as dsymutil and upstream Zig write them), and a __DWARF segment.
+  (as dsymutil and upstream Zig write them), and a __DWARF segment, which
+  also holds a .debug_aranges set covering __text: lldb trusts a dSYM's
+  aranges to be complete (dsymutil always writes them) and maps no address
+  to a unit without them. lldb shows no Function for DW_LANG_Zig units (it
+  has no Zig type system); upstream's self-hosted backend has the same
+  limit, and its LLVM backend writes DW_LANG_C99. zap keeps DW_LANG_Zig.
   std.debug (MachOFile looks for exactly this path and checks the UUID)
   and lldb read it; neither reads DWARF inside the executable, and a debug
   map of N_OSO stabs would need object files. The dSYM is a new file each
