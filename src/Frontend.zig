@@ -172,8 +172,18 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         .cache = .global,
     });
     if (options.main_src_path) |path| {
-        fe.main_module = @fromBackingInt(@intCast(fe.modules.items.len));
-        try fe.addModule("main", path, .local);
+        // As upstream, testing `<lib>/std/std.zig` tests the std module
+        // itself rather than a second copy of it.
+        const resolved = try std.fs.path.resolve(gpa, &.{path});
+        defer gpa.free(resolved);
+        const std_root = try std.fs.path.resolve(gpa, &.{ zig_lib_dir, "std", "std.zig" });
+        defer gpa.free(std_root);
+        if (std.mem.eql(u8, resolved, std_root)) {
+            fe.main_module = .std;
+        } else {
+            fe.main_module = @fromBackingInt(@intCast(fe.modules.items.len));
+            try fe.addModule("main", path, .local);
+        }
     }
     const first_extra = fe.modules.items.len;
     for (options.modules) |m| try fe.addModule(m.name, m.path, .local);
