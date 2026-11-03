@@ -133,6 +133,9 @@ const Home = union(enum) {
     slot: i32,
     /// The value is the address `rbp + off` (an `alloc`).
     frame_addr: i32,
+    /// Nothing reads the value and computing it has no effect: it is not
+    /// emitted (pass 2).
+    dead,
 };
 
 /// Where an operand's value can be read.
@@ -627,6 +630,7 @@ fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
         .none => .none,
         .reg => |r| .{ .reg = r },
         .fused, .pair => unreachable, // read only by their users
+        .dead => unreachable,
         .slot => |off| .{ .mem = Mem.at(.rbp, off) },
         .frame_addr => |off| .{ .addr = Mem.at(.rbp, off) },
     };
@@ -912,6 +916,27 @@ fn planRegisters(cg: *CodeGen) Error!void {
     // `clobbers` marks the values that want a register.
     try f.liveness(cg.gpa, ir, cg);
     cg.live = true;
+    // Pass 2: values that nothing reads and whose computation has no
+    // effect are not emitted. Their operands lose a use, so chains of them
+    // go in the same backward sweep (operands come first in the layout).
+    // Intervals stay as `liveness` computed them, which is only longer.
+    {
+        const Uses = struct {
+            uses: []u32,
+            pub fn use(c: @This(), ref: Ref) void {
+                if (ref.toIndex()) |i| c.uses[@backingInt(i)] -= 1;
+            }
+        };
+        var i = insts.len;
+        while (i > 0) {
+            i -= 1;
+            const inst = insts[i];
+            if (uses[@backingInt(inst)] != 0 or !cg.removable(inst)) continue;
+            cg.homes[@backingInt(inst)] = .dead;
+            reg[@backingInt(inst)] = Ssa.no_reg;
+            Ssa.forEachOperand(ir, inst, Uses{ .uses = uses });
+        }
+    }
     if (cg.has_asm) return;
     const datas = ir.instructions.items(.data);
     const def = live.items(.def);
@@ -930,7 +955,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
                     var n: u32 = 0;
                     for (values[k + 1 ..]) |next| {
                         const j = @backingInt(next);
-                        if (tags[j] == .dbg_stmt) continue;
+                        if (tags[j] == .dbg_stmt or cg.homes[j] == .dead) continue;
                         if (tags[j] != .struct_field_val) break;
                         const sf = ir.extraData(Ir.StructField, datas[j].ty_pl.payload).data;
                         if (sf.operand != inst.toRef() or fields[sf.index] != Ssa.no_tie) break;
@@ -975,6 +1000,27 @@ fn planRegisters(cg: *CodeGen) Error!void {
         const r = reg[@backingInt(inst)];
         if (r != Ssa.no_reg) cg.homes[@backingInt(inst)] = .{ .reg = alloc_regs[r] };
     }
+}
+
+/// Whether value `inst` may go unemitted when nothing reads it: it reads
+/// no volatile memory, writes nothing but its own result, cannot trap, and
+/// requests nothing from the linker that its users would not.
+fn removable(cg: *CodeGen, inst: Inst.Index) bool {
+    const ir = cg.ir;
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .not => true,
+        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float => true,
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => true,
+        .intcast, .trunc, .float_cast, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => true,
+        .int_from_bool, .int_from_ptr, .ptr_from_int, .ret_addr, .frame_addr, .save_err_return_trace_index => true,
+        .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_add, .slice_ptr, .slice_len, .slice => true,
+        .is_null, .is_non_null, .is_err, .is_non_err, .optional_payload, .wrap_optional => true,
+        .unwrap_errunion_payload, .unwrap_errunion_err, .wrap_errunion_payload, .wrap_errunion_err => true,
+        .aggregate_init, .union_init, .get_union_tag, .array_elem_val => true,
+        .load => !Type.ptrInfo(cg.ip, cg.typeOf(data.ty_op.operand)).flags.is_volatile,
+        else => false,
+    };
 }
 
 /// Whether `ty`'s values fit a general-purpose register.
@@ -1289,7 +1335,9 @@ fn emitBlocks(cg: *CodeGen) Error!void {
 
 fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!void {
     cg.e.bind(cg.labels[@backingInt(block)]);
-    for (cg.ssa.blockInsts(block)) |inst| try cg.genInst(inst);
+    for (cg.ssa.blockInsts(block)) |inst| {
+        if (cg.homes[@backingInt(inst)] != .dead) try cg.genInst(inst);
+    }
     try cg.genTerm(cg.ssa.blocks.items[@backingInt(block)].term, next);
 }
 
