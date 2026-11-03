@@ -1469,6 +1469,8 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "assembly input contains reference to comptime var", .@"comptime-var-escape" },
     .{ "assembly output contains reference to comptime var", .@"comptime-var-escape" },
     .{ "comptime variable is not accessible here", .@"comptime-var-escape" },
+    .{ "store to comptime variable depends on runtime condition", .@"comptime-var-escape" },
+    .{ "cannot store to comptime variable in non-inline loop", .@"comptime-var-escape" },
     .{ "global variable contains reference to comptime var", .@"comptime-var-escape" },
     .{ "runtime value contains reference to comptime var", .@"comptime-var-escape" },
     .{ "dependency loop detected", .@"dependency-loop" },

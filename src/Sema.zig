@@ -263,6 +263,9 @@ const ComptimeAlloc = struct {
     /// place, once one has (see `MutValue`); null until then and after the
     /// whole variable is stored to.
     mut: ?*MutValue = null,
+    /// The `runtime_depth` of the block declaring a comptime variable:
+    /// stores from deeper in runtime control flow are an error.
+    runtime_depth: u32 = std.math.maxInt(u32),
 };
 
 /// A comptime variable's value while code stores to its fields and
@@ -314,6 +317,8 @@ pub const Block = struct {
     /// loop (its `runtime_cond`/`runtime_loop`).
     runtime_depth: u32 = 0,
     runtime_src: ?Src = null,
+    /// Whether the innermost runtime construct is a loop, not a branch.
+    runtime_loop: bool = false,
     /// The condition or loop of the last runtime branch analyzed directly
     /// in this block (upstream's `runtime_cond`), for the note on a
     /// comptime-only result that depends on it.
@@ -384,6 +389,7 @@ pub const Block = struct {
         var c = b.child();
         c.runtime_cond = true;
         c.runtime_depth = b.runtime_depth + 1;
+        c.runtime_loop = false;
         if (src) |s| c.runtime_src = s;
         return c;
     }
@@ -407,6 +413,7 @@ pub const Block = struct {
             .comptime_reason = b.comptime_reason,
             .runtime_depth = b.runtime_depth,
             .runtime_src = b.runtime_src,
+            .runtime_loop = b.runtime_loop,
         };
     }
 
@@ -3634,6 +3641,7 @@ fn zirLoop(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const loop_inst = try sema.reserveInst();
     var label: Block.Label = .{ .zir_block = inst, .merges = .{ .block_inst = block_inst } };
     var loop_block = parent.condChild(parent.nodeSrc(data.src_node));
+    loop_block.runtime_loop = true;
     loop_block.label = &label;
     loop_block.loop = loop_inst;
     defer {
@@ -10614,7 +10622,7 @@ fn allocPtrType(sema: *Sema, ty: Index, alignment: u64) !Index {
 
 fn analyzeAlloc(sema: *Sema, block: *Block, src: Src, ty: Index, is_const: bool, force_comptime: bool) CompileError!Ref {
     if (block.is_comptime or (force_comptime and !(sema.bcOsrVar(block) and !try sema.isComptimeOnlyResolved(block, src, ty))))
-        return .fromInterned(try sema.createComptimeAlloc(ty, is_const));
+        return .fromInterned(try sema.createComptimeVar(block, ty, is_const));
     try sema.resolveLayout(block, src, ty);
     if ((try sema.isComptimeOnlyResolved(block, src, ty))) {
         // A constant of a comptime-only type is comptime.
@@ -10741,7 +10749,7 @@ fn constAllocPtr(sema: *Sema, ptr: Ref, alloc: Ir.Inst.Index, id: u32) !?Index {
 }
 
 fn allocInferred(sema: *Sema, block: *Block, is_const: bool, force_comptime: bool) CompileError!Ref {
-    if (block.is_comptime or (force_comptime and (is_const or !sema.bcOsrVar(block)))) return .fromInterned(try sema.createComptimeAlloc(.none, is_const));
+    if (block.is_comptime or (force_comptime and (is_const or !sema.bcOsrVar(block)))) return .fromInterned(try sema.createComptimeVar(block, .none, is_const));
     const ref = try sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = .none } });
     try sema.inferred_allocs.put(sema.gpa, ref.toIndex().?, .{ .is_const = is_const, .block = block });
     return ref;
@@ -10757,6 +10765,7 @@ fn zirStoreToInferredPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compi
         const id = sema.ip.keyPayload(.ptr, pv).base.comptime_alloc;
         const alloc = sema.comptime_allocs.getPtr(id).?;
         const val = try sema.resolveConstValue(block, src, operand, "value stored to a comptime variable must be comptime-known");
+        try sema.checkComptimeVarStore(block, src, pv);
         try sema.bcLogAlloc(id, alloc);
         alloc.ty = sema.ip.typeOf(val);
         alloc.val = val;
@@ -10868,6 +10877,7 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
         }
         if (try sema.comptimePtrRoot(pv) == .comptime_alloc) {
             const val = try sema.resolveConstValue(block, src, operand, "value stored to a comptime variable must be comptime-known");
+            try sema.checkComptimeVarStore(block, src, pv);
             return sema.comptimeStore(block, src, pv, val);
         }
     };
@@ -11123,6 +11133,34 @@ fn sliceToArrayPtr(sema: *Sema, block: *Block, src: Src, slice: Index) CompileEr
 // through a plain field/element path writes in place into the allocation's
 // `MutValue` tree, which is interned when the value is read as a whole;
 // other stores (byte offsets, reinterpretation) rebuild the interned value.
+
+/// A comptime alloc for a variable declared in `block`.
+fn createComptimeVar(sema: *Sema, block: *Block, ty: Index, is_const: bool) !Index {
+    const ptr = try sema.createComptimeAlloc(ty, is_const);
+    sema.comptime_allocs.getPtr(sema.ip.keyPayload(.ptr, ptr).base.comptime_alloc).?.runtime_depth = block.runtime_depth;
+    return ptr;
+}
+
+/// As upstream: a comptime variable is not stored to from inside runtime
+/// control flow that its declaration is outside of.
+fn checkComptimeVarStore(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!void {
+    const ip = sema.ip;
+    var p = ptr;
+    const id = while (true) switch (ip.keyPayload(.ptr, p).base) {
+        .comptime_alloc => |id| break id,
+        .field => |f| p = f.base,
+        .elem => |e| p = e.base,
+        else => return,
+    };
+    const alloc = sema.comptime_allocs.getPtr(id) orelse return;
+    if (block.runtime_depth <= alloc.runtime_depth) return;
+    const err = if (block.runtime_loop)
+        sema.fail(block, src, "cannot store to comptime variable in non-inline loop", .{})
+    else
+        sema.fail(block, src, "store to comptime variable depends on runtime condition", .{});
+    if (block.runtime_src) |rs| try sema.zcu.addNote(sema.file, rs.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "{s}", .{if (block.runtime_loop) "non-inline loop here" else "runtime condition here"});
+    return err;
+}
 
 fn createComptimeAlloc(sema: *Sema, ty: Index, is_const: bool) !Index {
     const id = sema.ip.next_comptime_alloc.fetchAdd(1, .monotonic);
@@ -17119,6 +17157,10 @@ fn calleeBlock(sema: *Sema, parent: *Block, func: Index) Block {
         .signature = func,
         .src_base = decl.src_node,
         .want_safety = parent.want_safety,
+        // As upstream, a call runs under the caller's runtime conditions.
+        .runtime_depth = parent.runtime_depth,
+        .runtime_src = parent.runtime_src,
+        .runtime_loop = parent.runtime_loop,
     };
 }
 
