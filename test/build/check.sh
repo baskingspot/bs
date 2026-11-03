@@ -33,6 +33,11 @@ expect "hello 2"
 "$zap" build test --summary all >"$work/log" 2>&1 || fail "zap build test"
 expect "run test 3 pass (3 total)"
 
+# Docs: upstream's viewer, its page, and the modules' sources.
+"$zap" build docs >"$work/log" 2>&1 || fail "zap build docs"
+for f in index.html main.js main.wasm sources.tar; do [ -s "zig-out/docs/$f" ] || fail "zig-out/docs/$f"; done
+tar tf zig-out/docs/sources.tar | grep -qx test/main.zig || fail "sources.tar holds test/main.zig"
+
 # An edit: the output changes in place.
 sed -i 's/"hello"/"howdy"/' src/greet.zig
 "$zap" build >"$work/log" 2>&1 || fail "zap build (edit)"

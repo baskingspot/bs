@@ -10,6 +10,7 @@ const Emit = @import("Emit.zig");
 const Incremental = @import("Incremental.zig");
 const Builtin = @import("Builtin.zig");
 const Archive = @import("link/Archive.zig");
+const Docs = @import("Docs.zig");
 
 pub const zig_version = "0.17.0";
 
@@ -38,6 +39,8 @@ pub const Options = struct {
     root_src_path: []const u8,
     name: ?[]const u8 = null,
     emit_bin: union(enum) { default, path: []const u8, none } = .default,
+    /// `-femit-docs[=path]`: the autodocs directory (Docs.zig).
+    emit_docs: union(enum) { default, path: []const u8, none } = .none,
     target: ?[]const u8 = null,
     zig_lib_dir: ?[]const u8 = null,
     /// `--cache-dir` and `--global-cache-dir`.
@@ -157,6 +160,12 @@ pub fn main(init: std.process.Init) !void {
         },
         .failed => std.process.exit(1),
     }
+    const docs_path: ?[]const u8 = switch (opts.emit_docs) {
+        .none => null,
+        .default => "docs",
+        .path => |p| p,
+    };
+    if (docs_path) |p| try emitDocs(init, &job, p, false);
     if (run_test) try runTest(init, out_path.?, opts.emit_bin != .path);
     if (command == .run) {
         // Releases the cache's lock: the program inherits nothing of zap.
@@ -423,6 +432,18 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     return .{ .ok = .{ .cache_hit = false } };
 }
 
+/// Writes the docs directory (`-femit-docs`) at `path`; after a build that
+/// compiled nothing, only if it is missing.
+fn emitDocs(init: std.process.Init, job: *const Job, path: []const u8, cache_hit: bool) !void {
+    const io = init.io;
+    if (cache_hit) {
+        const tar = try std.fs.path.join(init.arena.allocator(), &.{ path, "sources.tar" });
+        if (Io.Dir.cwd().access(io, tar, .{})) |_| return else |_| {}
+    }
+    Docs.emit(init.gpa, io, job.zig_lib_dir, path, job.stem, &job.opts) catch |err|
+        fatal("unable to emit docs to '{s}': {t}", .{ path, err });
+}
+
 /// The output's file name in its directory, as upstream names it.
 fn outputName(arena: std.mem.Allocator, command: Command, stem: []const u8) ![]const u8 {
     return switch (command) {
@@ -517,6 +538,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     // `<local cache>/o/<hex digest>/<binary name>`.
     var digest: [16]u8 = undefined;
     var out_path: ?[]const u8 = null;
+    var docs_path: ?[]const u8 = null;
     if (job) |*j| {
         _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, "x86_64-linux");
         digest = Incremental.outputDigest(key);
@@ -527,6 +549,11 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
             .default => try std.fs.path.join(arena, &.{ j.cache_dirs.local, "o", &std.fmt.bytesToHex(digest, .lower), name }),
         };
         if (opts.emit_bin == .default) try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(out_path.?).?);
+        docs_path = switch (opts.emit_docs) {
+            .none => null,
+            .path => |p| p,
+            .default => try std.fmt.allocPrint(arena, "{s}/o/{s}/{s}-docs", .{ j.cache_dirs.local, &std.fmt.bytesToHex(digest, .lower), j.stem }),
+        };
         // Upstream's compiler creates the local cache's `tmp`, where the
         // build runner then writes the configuration without creating it.
         try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ j.cache_dirs.local, "tmp" }));
@@ -557,7 +584,8 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
                 }
                 switch (outcome) {
                     .ok => |r| {
-                        if (out_path != null) try server.serveEmitDigest(&digest, .{ .flags = .{ .cache_hit = r.cache_hit } });
+                        if (docs_path) |p| try emitDocs(init, j, p, r.cache_hit);
+                        if (out_path != null or docs_path != null) try server.serveEmitDigest(&digest, .{ .flags = .{ .cache_hit = r.cache_hit } });
                         try server.serveErrorBundle(.error_bundle, .empty);
                     },
                     .errors => |diags| try serveErrors(&server, init.gpa, diags, opts.reference_trace),
@@ -823,7 +851,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fno-valgrind", "zap always emits Valgrind client requests ('-fno-valgrind'); remove '.valgrind = false'" },
     .{ "-dynamic", "zap links executables statically ('-dynamic'); build this step with upstream zig" },
     .{ "-femit-asm", "zap does not emit assembly ('-femit-asm')" },
-    .{ "-femit-docs", "zap does not emit documentation ('-femit-docs'); build docs with upstream zig" },
     .{ "-femit-implib", "zap does not emit import libraries ('-femit-implib')" },
     .{ "-femit-llvm-bc", "zap has no LLVM backend ('-femit-llvm-bc')" },
     .{ "-femit-llvm-ir", "zap has no LLVM backend ('-femit-llvm-ir')" },
@@ -871,6 +898,12 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             opts.emit_bin = .{ .path = arg["-femit-bin=".len..] };
         } else if (std.mem.eql(u8, arg, "-fno-emit-bin")) {
             opts.emit_bin = .none;
+        } else if (std.mem.eql(u8, arg, "-femit-docs")) {
+            opts.emit_docs = .default;
+        } else if (std.mem.startsWith(u8, arg, "-femit-docs=")) {
+            opts.emit_docs = .{ .path = arg["-femit-docs=".len..] };
+        } else if (std.mem.eql(u8, arg, "-fno-emit-docs")) {
+            opts.emit_docs = .none;
         } else if (std.mem.eql(u8, arg, "-fPIC") or std.mem.eql(u8, arg, "-fPIE")) {
             // On an executable, a preference that changes nothing a program
             // means, as with -fllvm: zap links it static and non-PIE, and

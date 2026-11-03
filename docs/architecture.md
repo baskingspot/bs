@@ -3833,11 +3833,28 @@ state. Built for step 1:
   zap does not implement (`translate-c`, `cc`, `test-obj`, ...) are
   served the same way. Without `--listen=-`, zap renders with its own
   renderer (`--error-format`).
-- **Not yet:** `--watch` and long-lived sessions. Each `update` compiles as
-  a CLI build does, through the on-disk cache; the serve loop already
-  handles repeated updates, so `--watch` needs only the updates to reuse
-  the in-memory state. `zig build --watch` panics on Linux older than 6.5
-  (bench/README.md) before that matters here.
+- **Libraries and docs.** `build-lib` (static, upstream's default) writes
+  a GNU ar archive of the library's object with a `/SYM64/` index of its
+  defined globals, as upstream does (`src/link/Archive.zig`); `-dynamic`
+  is `[unsupported]`. `-femit-docs` writes upstream's autodocs directory
+  (`src/Docs.zig`; `<name>-docs` next to the output under `--listen=-`,
+  `docs/` otherwise): `index.html` and `main.js` from the zig lib
+  directory, `sources.tar` with the .zig files of the module graph (byte
+  for byte upstream's), and the viewer `main.wasm`. The viewer is
+  lib/docs/wasm compiled for wasm32 in ReleaseSmall, the same for every
+  project, and zap has no wasm backend: zap's `build.zig` compiles it once
+  with the upstream zig that builds zap, from the zig lib directory baked
+  into zap, and zap embeds it (identical to upstream's). A build with
+  another `--zig-lib-dir` takes the html and js from that directory and
+  keeps the embedded viewer. zig-clap needs it: its test compile emits
+  docs (`getEmittedDocs`) for every step.
+- **`--watch`** is upstream's runner keeping each compile step's zap alive
+  and sending an `update` per rebuild; each update compiles as a CLI build
+  does, through the on-disk cache. There is no in-memory session (owner's
+  decision, 2026-11-03): replay's lazy edit builds are as fast one-shot as
+  upstream's in-process session. `zig build --watch` panics on Linux older
+  than 6.5 (bench/README.md), for the runner zap builds too, so it is not
+  tested on the orbs.
 - Measured (2026-11-03, orb, zap ReleaseFast, bench.py vaxis `zig-build`,
   details in bench/README.md): first build of a project with the runner
   cached 2.37 s (upstream 6.51 s), edit 139–144 ms (1.19–1.20 s), no edit

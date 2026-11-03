@@ -28,4 +28,7 @@ pub fn build(b: *std.Build) void {
     }) }));
     const tests = b.addTest(.{ .root_module = mod });
     b.step("test", "Run hello's tests").dependOn(&b.addRunArtifact(tests).step);
+    // As zig-clap's: the test compile also emits docs, for every step.
+    const docs = b.addInstallDirectory(.{ .source_dir = tests.getEmittedDocs(), .install_dir = .prefix, .install_subdir = "docs" });
+    b.step("docs", "Install hello's docs").dependOn(&docs.step);
 }

@@ -31,6 +31,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = if (sanitize_thread) true else null,
     });
     exe_mod.addOptions("build_options", options);
+    // The autodocs viewer `-femit-docs` writes (src/Docs.zig).
+    const docs_wasm = docsWasm(b, zig_lib_dir);
+    exe_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
 
     const exe = b.addExecutable(.{ .name = "zap", .root_module = exe_mod });
     // Comptime evaluation recurses on the native stack: a 1000-deep
@@ -83,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_zap_mod.addOptions("build_options", options);
+    bench_zap_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
     const bench_zap = b.addExecutable(.{ .name = "zap", .root_module = bench_zap_mod });
     bench_zap.stack_size = exe.stack_size;
     const bench_codegen_run = b.addRunArtifact(bench_zap);
@@ -448,6 +452,24 @@ fn defaultZigLibDir(b: *std.Build) []const u8 {
     const zig_exe = std.Io.Dir.cwd().realPathFileAlloc(io, zig, b.allocator) catch |err|
         std.debug.panic("unable to resolve zig executable path '{s}': {t}", .{ zig, err });
     return b.pathJoin(&.{ std.fs.path.dirname(zig_exe).?, "lib" });
+}
+
+/// lib/docs/wasm of `zig_lib_dir` compiled as upstream's compiler compiles
+/// it for `-femit-docs` (`workerDocsWasm`): wasm32, ReleaseSmall, the same
+/// CPU features. zap has no wasm backend, so upstream zig builds it, once.
+fn docsWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{
+        upstreamZig(b),  "build-exe",
+        "-target",       "wasm32-freestanding",
+        "-mcpu",         "baseline+atomics+reference_types",
+        "-OReleaseSmall", "-fno-entry",
+        "-rdynamic",     "--name",
+        "main",          "--dep",
+        "Walk",
+    });
+    cmd.addPrefixedFileArg("-Mroot=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "main.zig" }) });
+    cmd.addPrefixedFileArg("-MWalk=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "Walk.zig" }) });
+    return cmd.addPrefixedOutputFileArg("-femit-bin=", "main.wasm");
 }
 
 /// Upstream zig, the oracle the tests compare zap with: the zig running
