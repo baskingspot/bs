@@ -152,7 +152,10 @@ pub const Options = struct {
     /// Whether `loadAll` loads std, which upstream always analyzes. Off only
     /// in tests that have no lib directory.
     load_std: bool = true,
-    /// `--dep`s of the root module, and the other modules.
+    /// The `-M` name of the root module, or under `zap test` of the module
+    /// under test, which `--dep`s name it by; its `--dep`s; and the other
+    /// modules.
+    root_name: []const u8 = "root",
     root_deps: []const []const u8 = &.{},
     modules: []const ModuleArg = &.{},
     /// With `-ffuzz` on an executable: the directory of the fuzzer's
@@ -165,6 +168,11 @@ pub const Options = struct {
 pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
     var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir, .load_std = options.load_std };
     errdefer fe.deinit();
+    // The root module and the module under test are named by their roles,
+    // not their `-M` name (`root_name`): cache keys name modules
+    // (`Zcu.fileKey`), and the root file of a `zap test` must not stand
+    // for the root module of a `zap build-exe`, which `@import("root")`
+    // finds.
     try fe.addModule("root", options.root_src_path, .local);
     try fe.modules.append(gpa, .{
         .name = "std",
@@ -203,13 +211,17 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     const first_extra = fe.modules.items.len;
     for (options.modules) |m| try fe.addModule(m.name, m.path, .local);
     const resolve = struct {
-        fn f(f_fe: *Frontend, specs: []const []const u8) ![]const Dep {
+        fn f(f_fe: *Frontend, root_name: []const u8, specs: []const []const u8) ![]const Dep {
             const deps = try f_fe.gpa.alloc(Dep, specs.len);
             for (deps, specs) |*d, spec| {
                 const eq = std.mem.indexOfScalar(u8, spec, '=');
                 const name = if (eq) |e| spec[0..e] else spec;
                 const target = if (eq) |e| spec[e + 1 ..] else spec;
-                const idx = for (f_fe.modules.items, 0..) |m, k| {
+                // By `-M` name: under `zap test` no `--dep` names the test
+                // runner.
+                const main: usize = @backingInt(f_fe.main_module);
+                const idx = if (std.mem.eql(u8, target, root_name)) main else for (f_fe.modules.items, 0..) |m, k| {
+                    if (k == 0 or (k == main and f_fe.main_module != .std)) continue;
                     if (std.mem.eql(u8, m.name, target)) break k;
                 } else std.process.fatal("no module named '{s}' for --dep '{s}'", .{ target, spec });
                 d.* = .{ .name = name, .module = @fromBackingInt(@intCast(idx)) };
@@ -217,8 +229,8 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
             return deps;
         }
     }.f;
-    fe.modules.items[@backingInt(fe.main_module)].deps = try resolve(&fe, options.root_deps);
-    for (options.modules, first_extra..) |m, k| fe.modules.items[k].deps = try resolve(&fe, m.deps);
+    fe.modules.items[@backingInt(fe.main_module)].deps = try resolve(&fe, options.root_name, options.root_deps);
+    for (options.modules, first_extra..) |m, k| fe.modules.items[k].deps = try resolve(&fe, options.root_name, m.deps);
     if (options.fuzzer_builtin_dir) |dir| {
         const root: Module.Index = @fromBackingInt(@intCast(fe.modules.items.len));
         const family: [3]Module.Index = .{ @fromBackingInt(@backingInt(root) + 1), root, @fromBackingInt(@backingInt(root) + 2) };

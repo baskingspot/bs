@@ -454,16 +454,32 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
 
     // Modules rooted at a ZON file and at a plain file.
     const mods = b.addRunArtifact(zap);
-    mods.addArgs(&.{ "build-exe", "--dep", "config", "--dep", "version" });
-    mods.addPrefixedFileArg("-Mroot=", b.path("test/obj/modules.zig"));
+    mods.addArgs(&.{ "build-exe", "--dep", "config", "--dep", "version", "--dep", "back" });
+    mods.addPrefixedFileArg("-Mapp=", b.path("test/obj/modules.zig"));
     mods.addPrefixedFileArg("-Mconfig=", b.path("test/obj/mod/config.zon"));
     mods.addPrefixedFileArg("-Mversion=", b.path("test/obj/mod/version"));
+    mods.addArgs(&.{ "--dep", "app" });
+    mods.addPrefixedFileArg("-Mback=", b.path("test/obj/mod/back.zig"));
     const mods_bin = mods.addPrefixedOutputFileArg("-femit-bin=", "modules");
     const mods_run = std.Build.Step.Run.create(b, "run modules");
     mods_run.addFileArg(mods_bin);
-    mods_run.addCheck(.{ .expect_stdout_exact = "zap 3 0.17.0-dev 31\n" });
+    mods_run.addCheck(.{ .expect_stdout_exact = "zap 3 0.17.0-dev 31 31\n" });
     mods_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&mods_run.step);
+
+    // A module under test that imports itself by its `-M` name. Named
+    // "root" like upstream's test runner; the cache check fails if the two
+    // modules share a cache key.
+    const self_test = b.addRunArtifact(zap);
+    self_test.setName("zap test self import");
+    self_test.setEnvironmentVariable("ZAP_CACHE_CHECK", "1");
+    self_test.addArgs(&.{ "test", "--dep", "self=root" });
+    self_test.addPrefixedFileArg("-Mroot=", b.path("test/obj/mod/self.zig"));
+    self_test.addArg("--global-cache-dir");
+    _ = self_test.addOutputDirectoryArg("self-test-cache");
+    self_test.addCheck(.{ .expect_stderr_match = "All 1 tests passed." });
+    self_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&self_test.step);
 }
 
 /// `zap build` end to end: test/build/check.sh builds test/build/hello

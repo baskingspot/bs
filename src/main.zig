@@ -85,6 +85,9 @@ pub const Options = struct {
     /// Why zap cannot build what the options ask for (a release mode, C
     /// sources, LLVM), as a diagnostic's message: the first such option.
     unsupported: ?[]const u8 = null,
+    /// The name of the first `-M` module (the root module, or under `zap
+    /// test` the module under test), which other modules' `--dep`s name.
+    root_name: []const u8 = "root",
     root_deps: []const []const u8 = &.{},
     modules: []const Frontend.ModuleArg = &.{},
 };
@@ -367,6 +370,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .root_src_path = if (is_test) test_runner else opts.root_src_path,
         .builtin_dir = job.builtin_dir,
         .main_src_path = if (is_test) opts.root_src_path else null,
+        .root_name = opts.root_name,
         .root_deps = opts.root_deps,
         .modules = opts.modules,
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
@@ -1059,6 +1063,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             };
             if (root == null) {
                 root = spec[eq + 1 ..];
+                opts.root_name = spec[0..eq];
                 opts.root_deps = try deps.toOwnedSlice(arena);
             } else try modules.append(arena, .{ .name = spec[0..eq], .path = spec[eq + 1 ..], .deps = try deps.toOwnedSlice(arena) });
         } else if (std.mem.startsWith(u8, arg, "--error-format=")) {
@@ -1115,6 +1120,13 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     opts.root_src_path = root orelse if (opts.unsupported != null) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
     opts.modules = modules.items;
+    // As upstream: a `--dep` names one module.
+    for (modules.items, 0..) |m, k| {
+        const prev = if (std.mem.eql(u8, m.name, opts.root_name)) opts.root_src_path else for (modules.items[0..k]) |p| {
+            if (std.mem.eql(u8, p.name, m.name)) break p.path;
+        } else continue;
+        fatal("unable to add module \"{s}\": already exists as '{s}'", .{ m.name, prev });
+    }
     return opts;
 }
 
