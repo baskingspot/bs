@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n7\n1\n"
+//! stdout: "42\n7\n1\n6\n8\n8\n"
 const rt = @import("rt.zig");
 // For `std.lang.ExportOptions`; std.start sees `_start` and stays out.
 const std = @import("std");
@@ -43,5 +43,37 @@ fn main() callconv(.c) noreturn {
     );
     rt.printInt(out);
     rt.printInt(@intFromBool(stackPointer() % 8 == 0));
+    // Local labels, conditional jumps, test, and indirect calls.
+    rt.printInt(pick(1));
+    rt.printInt(pick(0));
+    rt.printInt(countdown(4));
     rt.exit(0);
+}
+
+fn seven() callconv(.c) u64 {
+    return 7;
+}
+fn pick(x: u64) u64 {
+    return asm volatile (
+        \\ testq %%rdi, %%rdi
+        \\ jz 1f
+        \\ movq $5, %%rax
+        \\ jmp 2f
+        \\1:
+        \\ callq *%%rsi
+        \\2: addq $1, %%rax
+        : [ret] "={rax}" (-> u64),
+        : [x] "{rdi}" (x),
+          [f] "{rsi}" (&seven),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+}
+fn countdown(n: u64) u64 {
+    return asm volatile (
+        \\ xorl %%eax, %%eax
+        \\1: addq $2, %%rax
+        \\ subq $1, %%rdi
+        \\ jnz 1b
+        : [ret] "={rax}" (-> u64),
+        : [n] "{rdi}" (n),
+    );
 }

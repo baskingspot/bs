@@ -1546,6 +1546,7 @@ const AsmOperand = union(enum) {
 };
 
 fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg)) Error!void {
+    var locals: LocalLabels = .{};
     var source_lines = std.mem.tokenizeScalar(u8, source, '\n');
     while (source_lines.next()) |source_line| {
         // `#` and `//` start comments.
@@ -1553,11 +1554,28 @@ fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnm
         if (std.mem.indexOfScalar(u8, code, '#')) |i| code = code[0..i];
         if (std.mem.indexOf(u8, code, "//")) |i| code = code[0..i];
         var statements = std.mem.tokenizeScalar(u8, code, ';');
-        while (statements.next()) |raw| try cg.assembleStatement(std.mem.trim(u8, raw, " \t\r"), names);
+        while (statements.next()) |raw| try cg.assembleStatement(std.mem.trim(u8, raw, " \t\r"), names, &locals);
     }
+    for (locals.fwd) |l| if (l != null) return cg.fail("asm refers to an undefined local label", .{});
 }
 
-fn assembleStatement(cg: *CodeGen, line: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg)) Error!void {
+/// GNU as local labels `0:` to `9:`, referenced as `1f` (the next) and
+/// `1b` (the previous).
+const LocalLabels = struct {
+    fwd: [10]?Encoder.Label = @splat(null),
+    back: [10]?Encoder.Label = @splat(null),
+};
+
+fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), locals: *LocalLabels) Error!void {
+    var line = line_in;
+    if (line.len >= 2 and std.ascii.isDigit(line[0]) and line[1] == ':') {
+        const n = line[0] - '0';
+        const label = locals.fwd[n] orelse try cg.e.newLabel();
+        cg.e.bind(label);
+        locals.fwd[n] = null;
+        locals.back[n] = label;
+        line = std.mem.trim(u8, line[2..], " \t");
+    }
     if (line.len == 0) return;
     if (line[0] == '.') {
         // The only directive: std.start's `_start` marks the return
@@ -1570,6 +1588,22 @@ fn assembleStatement(cg: *CodeGen, line: []const u8, names: *const std.StringHas
     }
     const sp = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
     const mnemonic = line[0..sp];
+    const arg = std.mem.trim(u8, line[sp..], " \t");
+    if (mnemonic[0] == 'j' and arg.len == 2 and std.ascii.isDigit(arg[0]) and (arg[1] == 'f' or arg[1] == 'b')) {
+        // A jump to a local label.
+        const n = arg[0] - '0';
+        const label = if (arg[1] == 'b')
+            locals.back[n] orelse return cg.fail("asm refers to an undefined local label: '{s}'", .{line})
+        else
+            locals.fwd[n] orelse blk: {
+                const l = try cg.e.newLabel();
+                locals.fwd[n] = l;
+                break :blk l;
+            };
+        if (std.mem.eql(u8, mnemonic, "jmp")) return cg.e.jmp(.{ .label = label });
+        const cond = asmCond(mnemonic[1..]) orelse return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line});
+        return cg.e.jcc(cond, .{ .label = label });
+    }
     var operands: [2]AsmOperand = undefined;
     var n: usize = 0;
     var it = std.mem.tokenizeScalar(u8, line[sp..], ',');
@@ -1581,7 +1615,19 @@ fn assembleStatement(cg: *CodeGen, line: []const u8, names: *const std.StringHas
     try cg.asmInst(mnemonic, operands[0..n], line);
 }
 
-fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), line: []const u8) Error!AsmOperand {
+fn asmCond(name: []const u8) ?Encoder.Cond {
+    const conds = [_]struct { []const u8, Encoder.Cond }{
+        .{ "z", .e },  .{ "e", .e },  .{ "nz", .ne }, .{ "ne", .ne }, .{ "b", .b },   .{ "c", .b },
+        .{ "ae", .ae }, .{ "nc", .ae }, .{ "be", .be }, .{ "a", .a },   .{ "l", .l },   .{ "ge", .ge },
+        .{ "le", .le }, .{ "g", .g },  .{ "s", .s },   .{ "ns", .ns }, .{ "o", .o },   .{ "no", .no },
+    };
+    for (conds) |c| if (std.mem.eql(u8, name, c[0])) return c[1];
+    return null;
+}
+
+fn asmOperand(cg: *CodeGen, tok_in: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), line: []const u8) Error!AsmOperand {
+    // `*` marks an indirect call or jump target.
+    const tok = if (tok_in.len > 1 and tok_in[0] == '*') tok_in[1..] else tok_in;
     if (std.mem.startsWith(u8, tok, "%[")) {
         const close = std.mem.indexOfScalar(u8, tok, ']') orelse return cg.fail("bad asm operand '{s}'", .{tok});
         var name = tok[2..close];
@@ -1677,7 +1723,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         if (eql(u8, mnemonic, "syscall")) return e.syscall();
         if (eql(u8, mnemonic, "ud2")) return e.ud2();
         if (eql(u8, mnemonic, "int3")) return e.int3();
-        if (eql(u8, mnemonic, "ret")) return e.ret();
+        if (eql(u8, mnemonic, "ret") or eql(u8, mnemonic, "retq")) return e.ret();
     } else if (ops.len == 1) {
         if (eql(u8, mnemonic, "call") or eql(u8, mnemonic, "callq") or eql(u8, mnemonic, "jmp")) switch (ops[0]) {
             .sym => |s| {
@@ -1703,7 +1749,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         // AT&T order: source, destination.
         const dst = ops[1].reg;
         // A size suffix, unless it is part of the name (`shl`, `sub`).
-        const known = [_][]const u8{ "mov", "add", "or", "and", "sub", "xor", "cmp", "rol", "ror", "shl", "sal", "shr", "sar", "xchg" };
+        const known = [_][]const u8{ "mov", "add", "or", "and", "sub", "xor", "cmp", "test", "rol", "ror", "shl", "sal", "shr", "sar", "xchg" };
         const base = for (known) |k| {
             if (mnemonic.len == k.len + 1 and std.mem.startsWith(u8, mnemonic, k) and std.mem.indexOfScalar(u8, "bwlq", mnemonic[k.len]) != null) break k;
         } else mnemonic;
@@ -1725,6 +1771,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .{ "add", .add }, .{ "or", .@"or" }, .{ "and", .@"and" }, .{ "sub", .sub }, .{ "xor", .xor }, .{ "cmp", .cmp },
         };
         for (alu_ops) |op| if (eql(u8, base, op[0])) return e.alu(op[1], size, .{ .reg = dst.reg }, src);
+        if (eql(u8, base, "test")) return e.@"test"(size, .{ .reg = dst.reg }, src);
         const shift_ops = [_]struct { []const u8, Encoder.ShiftOp }{
             .{ "rol", .rol }, .{ "ror", .ror }, .{ "shl", .shl }, .{ "sal", .shl }, .{ "shr", .shr }, .{ "sar", .sar },
         };
