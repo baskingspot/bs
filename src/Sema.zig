@@ -2418,7 +2418,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const operand = try sema.coerce(block, .anyerror_type, sema.resolveInst(data.un_node.operand), src);
             if (sema.resolveValue(operand)) |v| {
                 if (sema.isUndef(v)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
-                break :blk .fromInterned(try sema.nameSliceValue(sema.ip.stringSlice(sema.ip.indexToKey(v).err.name)));
+                // A string literal, as upstream.
+                break :blk .fromInterned(try sema.stringLiteral(sema.ip.stringSlice(sema.ip.indexToKey(v).err.name)));
             }
             try sema.requireRuntime(block, src);
             break :blk sema.addUnOp(block, .error_name, operand);
