@@ -53,6 +53,9 @@ comptime_allocs: std.AutoHashMapUnmanaged(u32, ComptimeAlloc) = .empty,
 /// instruction (a function prototype or function type). Arena-allocated.
 params: std.ArrayList(Block.Param) = .empty,
 inferred_allocs: std.AutoHashMapUnmanaged(Ir.Inst.Index, InferredAlloc) = .empty,
+/// Runtime `const` locals initialized through a result pointer that may
+/// still be comptime-known (see `foldConstAlloc`), by `alloc` instruction.
+const_allocs: std.AutoHashMapUnmanaged(Ir.Inst.Index, ConstAlloc) = .empty,
 /// For each runtime bool vector being initialized through a result pointer,
 /// the `[N]bool` local its elements are stored to first: bit-packed
 /// elements have no addresses. Arena-allocated.
@@ -80,6 +83,13 @@ pub const CompileError = error{
     ComptimeReturn,
 };
 
+/// The stores into a runtime `const` local so far: all of comptime-known
+/// values, from the local's own block. Arena-allocated.
+const ConstAlloc = struct {
+    block: *Block,
+    stores: std.ArrayList(struct { ptr: Ref, val: Index }) = .empty,
+};
+
 const ComptimeAlloc = struct {
     ty: Index,
     val: Index,
@@ -89,6 +99,9 @@ const ComptimeAlloc = struct {
 const InferredAlloc = struct {
     stores: std.ArrayList(Ir.Inst.Index) = .empty,
     is_const: bool,
+    /// The block of the `alloc`, and whether every store so far was in it.
+    block: *Block,
+    same_block: bool = true,
     /// Requested alignment, or 0.
     alignment: u64 = 0,
 };
@@ -208,6 +221,7 @@ fn destroy(sema: *Sema) void {
     var it = sema.inferred_allocs.valueIterator();
     while (it.next()) |ia| ia.stores.deinit(gpa);
     sema.inferred_allocs.deinit(gpa);
+    sema.const_allocs.deinit(gpa);
 }
 
 fn finish(sema: *Sema) !void {
@@ -1758,6 +1772,21 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .resolve_inferred_alloc => sema.zirResolveInferredAlloc(block, inst),
         .make_ptr_const => blk: {
             const ptr = sema.resolveInst(data.un_node.operand);
+            if (ptr.toIndex()) |i| if (try sema.foldConstAlloc(block, block.nodeSrc(data.un_node.src_node), i)) |folded| break :blk .fromInterned(folded);
+            // A constant held in comptime memory (one of a comptime-only
+            // type) becomes an immutable value that runtime code can
+            // address.
+            if (sema.resolveValue(ptr)) |pv| if (sema.ip.indexToKey(pv) == .ptr) {
+                const k = sema.ip.indexToKey(pv).ptr;
+                if (k.base == .comptime_alloc and k.byte_offset == 0) if (sema.comptime_allocs.get(k.base.comptime_alloc)) |alloc| {
+                    if (!sema.refersToComptimeAlloc(alloc.val)) {
+                        var info = Type.ptrInfo(sema.ip, k.ty);
+                        info.flags.is_const = true;
+                        const const_ty = try sema.ptrType(info);
+                        break :blk .fromInterned(try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = alloc.val, .orig_ty = const_ty } } } }));
+                    }
+                };
+            };
             var info = Type.ptrInfo(sema.ip, sema.typeOf(ptr));
             info.flags.is_const = true;
             break :blk sema.coercePtrTo(block, ptr, try sema.ptrType(info));
@@ -5376,16 +5405,121 @@ fn analyzeAlloc(sema: *Sema, block: *Block, src: Src, ty: Index, is_const: bool,
     if (block.is_comptime or force_comptime) return .fromInterned(try sema.createComptimeAlloc(ty, is_const));
     try sema.resolveLayout(block, src, ty);
     if (Type.isComptimeOnly(sema.ip, ty)) {
+        // A constant of a comptime-only type is comptime.
+        if (is_const) return .fromInterned(try sema.createComptimeAlloc(ty, false));
         return sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
     }
     const ptr_ty = try sema.ptrType(.{ .child = ty });
-    return sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = ptr_ty } });
+    const ref = try sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = ptr_ty } });
+    if (is_const) try sema.const_allocs.put(sema.gpa, ref.toIndex().?, .{ .block = block });
+    return ref;
+}
+
+/// The runtime `const` local that pointer `ptr` (a field or element
+/// pointer into it, or the local itself) addresses, if it may still be
+/// comptime-known.
+/// `replayable` is whether `constAllocPtr` can follow the derivation.
+fn constAllocRoot(sema: *Sema, ptr: Ref) ?struct { alloc: Ir.Inst.Index, replayable: bool } {
+    var r = ptr;
+    var replayable = true;
+    while (r.toIndex()) |i| {
+        const data = sema.ir_insts.items(.data)[@backingInt(i)];
+        switch (sema.ir_insts.items(.tag)[@backingInt(i)]) {
+            .alloc => return if (sema.const_allocs.contains(i)) .{ .alloc = i, .replayable = replayable } else null,
+            .struct_field_ptr, .ptr_elem_ptr => r = @fromBackingInt(sema.ir_extra.items[data.ty_pl.payload]),
+            .optional_payload_ptr_set, .errunion_payload_ptr_set => r = data.ty_op.operand,
+            .ptr_add => {
+                r = @fromBackingInt(sema.ir_extra.items[data.ty_pl.payload]);
+                replayable = false;
+            },
+            .bitcast, .optional_payload_ptr, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr => {
+                r = data.ty_op.operand;
+                replayable = false;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// Records a store of `val` through `ptr` for the `const` local it
+/// addresses: one that stays comptime-known must get only comptime-known
+/// values, from its own block.
+fn trackConstStore(sema: *Sema, block: *Block, ptr: Ref, val: Ref) !void {
+    if (sema.const_allocs.count() == 0) return;
+    const r = sema.constAllocRoot(ptr) orelse return;
+    const root = r.alloc;
+    const ca = sema.const_allocs.getPtr(root).?;
+    const v = sema.resolveValue(val) orelse return sema.forgetConstAlloc(root);
+    if (!r.replayable or ca.block != block or sema.refersToComptimeAlloc(v)) return sema.forgetConstAlloc(root);
+    try ca.stores.append(sema.arena, .{ .ptr = ptr, .val = v });
+}
+
+fn forgetConstAlloc(sema: *Sema, root: Ir.Inst.Index) void {
+    _ = sema.const_allocs.remove(root);
+}
+
+/// Stops tracking the `const` local `ptr` addresses, which something other
+/// than a store writes.
+fn forgetConstAllocOf(sema: *Sema, ptr: Ref) void {
+    if (sema.const_allocs.count() == 0) return;
+    if (sema.constAllocRoot(ptr)) |r| sema.forgetConstAlloc(r.alloc);
+}
+
+/// `const` local `alloc`, done being initialized, as a pointer to a
+/// comptime-known value if every store into it was comptime-known, as
+/// upstream does; else null. The runtime stores stay but go unread.
+fn foldConstAlloc(sema: *Sema, block: *Block, src: Src, alloc: Ir.Inst.Index) CompileError!?Index {
+    const ca = (sema.const_allocs.fetchRemove(alloc) orelse return null).value;
+    const ip = sema.ip;
+    const ptr_ty = sema.ir_insts.items(.data)[@backingInt(alloc)].ty;
+    const child = Type.ptrInfo(ip, ptr_ty).child;
+    const id = ip.indexToKey(try sema.createComptimeAlloc(child, false)).ptr.base.comptime_alloc;
+    for (ca.stores.items) |st| {
+        const p = try sema.constAllocPtr(st.ptr, alloc, id) orelse return null;
+        sema.comptimeStore(block, src, p, st.val) catch |err| switch (err) {
+            error.AnalysisFail => return null,
+            else => return err,
+        };
+    }
+    const val = sema.comptime_allocs.get(id).?.val;
+    var info = Type.ptrInfo(ip, ptr_ty);
+    info.flags.is_const = true;
+    const const_ty = try sema.ptrType(info);
+    return try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = val, .orig_ty = const_ty } } } });
+}
+
+/// Runtime pointer `ptr` into `alloc`, as a pointer into comptime alloc
+/// `id`; null for derivations zap does not replay.
+fn constAllocPtr(sema: *Sema, ptr: Ref, alloc: Ir.Inst.Index, id: u32) !?Index {
+    const i = ptr.toIndex().?;
+    const ty = sema.typeOf(ptr);
+    const data = sema.ir_insts.items(.data)[@backingInt(i)];
+    switch (sema.ir_insts.items(.tag)[@backingInt(i)]) {
+        .alloc => return try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .comptime_alloc = id } } }),
+        .struct_field_ptr => {
+            const sf = sema.ir_extra.items[data.ty_pl.payload..][0..2];
+            const base = try sema.constAllocPtr(@fromBackingInt(sf[0]), alloc, id) orelse return null;
+            return try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .field = .{ .base = base, .index = sf[1] } } } });
+        },
+        .ptr_elem_ptr => {
+            const bin = sema.ir_extra.items[data.ty_pl.payload..][0..2];
+            const base = try sema.constAllocPtr(@fromBackingInt(bin[0]), alloc, id) orelse return null;
+            const index = sema.resolveValue(@fromBackingInt(bin[1])) orelse return null;
+            return try sema.ptrElemPtrVal(base, sema.ip.intValue(u64, index).?);
+        },
+        .optional_payload_ptr_set, .errunion_payload_ptr_set => {
+            const base = try sema.constAllocPtr(data.ty_op.operand, alloc, id) orelse return null;
+            return try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .field = .{ .base = base, .index = 0 } } } });
+        },
+        else => return null,
+    }
 }
 
 fn allocInferred(sema: *Sema, block: *Block, is_const: bool, force_comptime: bool) CompileError!Ref {
     if (block.is_comptime or force_comptime) return .fromInterned(try sema.createComptimeAlloc(.none, is_const));
     const ref = try sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = .none } });
-    try sema.inferred_allocs.put(sema.gpa, ref.toIndex().?, .{ .is_const = is_const });
+    try sema.inferred_allocs.put(sema.gpa, ref.toIndex().?, .{ .is_const = is_const, .block = block });
     return ref;
 }
 
@@ -5404,6 +5538,7 @@ fn zirStoreToInferredPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compi
         return;
     }
     const ia = sema.inferred_allocs.getPtr(ptr.toIndex().?).?;
+    if (ia.block != block) ia.same_block = false;
     const store = try sema.addBinOp(block, .store, ptr, operand);
     try ia.stores.append(sema.gpa, store.toIndex().?);
 }
@@ -5425,6 +5560,22 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
     for (ia.stores.items, operands) |store, *op| op.* = sema.ir_insts.items(.data)[@backingInt(store)].bin_op.rhs;
     const ty = try sema.resolvePeerTypes(block, src, operands);
     if (ty == .noreturn_type) return sema.fail(block, src, "unable to infer variable type", .{});
+    if (ia.is_const and ia.same_block and operands.len == 1 and ia.alignment == 0) {
+        // A constant initialized once with a comptime-known value is
+        // comptime-known, as upstream; the runtime store goes unread.
+        const coerced = try sema.coerce(block, ty, operands[0], src);
+        if (sema.resolveValue(coerced)) |v| if (!sema.refersToComptimeAlloc(v)) {
+            try sema.resolveLayoutIfIdle(block, src, ty);
+            const const_ty = try sema.ptrType(.{ .child = ty, .flags = .{ .is_const = true } });
+            sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = try sema.ptrType(.{ .child = ty }) };
+            if (Type.isComptimeOnly(sema.ip, ty)) {
+                // The runtime alloc cannot hold it: drop the store.
+                const payload = try sema.addExtra(Ir.Block{ .body_len = 0 });
+                sema.ir_insts.set(@backingInt(ia.stores.items[0]), .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = payload } } });
+            } else try sema.coerceBrOperand(block, ia.stores.items[0], ty, operands[0], src);
+            return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = v, .orig_ty = const_ty } } } }));
+        };
+    }
     if (Type.isComptimeOnly(sema.ip, ty)) return sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
     try sema.resolveLayout(block, src, ty);
     if (ia.alignment != 0 and ia.alignment != Type.abiAlignment(sema.ip, ty)) return sema.failUnsupported(block, src, "local variables aligned differently from their type");
@@ -5458,6 +5609,7 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
             return sema.comptimeStore(block, src, pv, val);
         }
     }
+    try sema.trackConstStore(block, ptr, operand);
     try sema.requireRuntime(block, src);
     try sema.resolveLayout(block, src, info.child);
     if (!Type.hasRuntimeBits(ip, info.child)) return;
