@@ -1677,17 +1677,54 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
     return h.final();
 }
 
+/// Builds `lookupHash`: each field is mixed in as a 64-bit word with one
+/// multiply-fold, a few instructions per field, where buffering the fields
+/// for wyhash cost about 100 instructions per key. In memory only.
+const LookupHasher = struct {
+    h: u64 = 0x2d358dccaa6c78a5,
+
+    inline fn word(hasher: *LookupHasher, w: u64) void {
+        hasher.h = mum(hasher.h ^ w, 0x8bb84b93962eacc9);
+    }
+    inline fn int(hasher: *LookupHasher, comptime T: type, v: T) void {
+        if (@bitSizeOf(T) > 64) {
+            const x: u128 = @bitCast(v);
+            hasher.word(@truncate(x));
+            hasher.word(@truncate(x >> 64));
+        } else {
+            hasher.word(@as(@Int(.unsigned, @bitSizeOf(T)), @bitCast(v)));
+        }
+    }
+    fn bytes(hasher: *LookupHasher, b: []const u8) void {
+        hasher.word(b.len);
+        var i: usize = 0;
+        while (i + 8 <= b.len) : (i += 8) hasher.word(std.mem.readInt(u64, b[i..][0..8], .little));
+        if (i < b.len) {
+            var tail: u64 = 0;
+            for (b[i..], 0..) |c, k| tail |= @as(u64, c) << @intCast(8 * k);
+            hasher.word(tail);
+        }
+    }
+    fn final(hasher: LookupHasher) u64 {
+        return mum(hasher.h, 0x4b33a62ed433d4a3);
+    }
+    inline fn mum(a: u64, b: u64) u64 {
+        const r = @as(u128, a) * b;
+        return @as(u64, @truncate(r)) ^ @as(u64, @truncate(r >> 64));
+    }
+};
+
 /// The hash of `key` that dedup lookups use: over the indices and string
 /// indices `keyEql` compares, which is cheaper than `hashKey`. Only an item
 /// that is new gets its stable hash. In memory only.
 fn lookupHash(ip: *const InternPool, key: Key) u64 {
-    var h: Hasher = .{};
+    var h: LookupHasher = .{};
     h.int(u8, @backingInt(std.meta.activeTag(key)));
     const u = struct {
         fn i(x: anytype) u32 {
             return @backingInt(x);
         }
-        fn list(hasher: *Hasher, l: anytype) void {
+        fn list(hasher: *LookupHasher, l: anytype) void {
             hasher.bytes(std.mem.sliceAsBytes(l));
         }
     };
@@ -1842,7 +1879,7 @@ fn lookupHash(ip: *const InternPool, key: Key) u64 {
         .calling_convention => |cc| h.int(u8, @backingInt(cc)),
     }
     _ = ip;
-    return std.hash.Wyhash.hash(@truncate(h.chain), h.buf[0..h.len]);
+    return h.final();
 }
 
 inline fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
