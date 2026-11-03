@@ -287,6 +287,9 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
         if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(&block, src, "alignment value '{d}' is not a power of two", .{a});
         nav.alignment = a;
     }
+    // A declared type is known before the value, so the value may take its
+    // own address (`const foo: S = .{ .self = &foo }`), as upstream.
+    if (decl_ty != .none) nav.ty = decl_ty;
     if (decl.linkage == .@"extern") {
         // `extern fn name(...) T;`: defined by an export of `name`, which
         // calls reach through a slot the linker fills (see `extern_ptr`).
@@ -3410,6 +3413,15 @@ fn navVal(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
 }
 
 fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) CompileError!Ref {
+    const pending = sema.ip.getNav(nav_index);
+    if (pending.status == .resolving and pending.ty != .none and pending.linkage == .normal and !pending.is_threadlocal) {
+        // Its own initializer (or one it depends on): the address needs
+        // only the declared type.
+        if (nav_index != sema.owner_nav) try sema.declareDependency(.{ .nav_val = nav_index });
+        const alignment: u6 = if (pending.alignment == 0 or sema.naturalAlignment(pending.ty) == pending.alignment) 0 else @intCast(std.math.log2_int(u64, pending.alignment) + 1);
+        const ptr_ty = try sema.ptrType(.{ .child = pending.ty, .flags = .{ .is_const = pending.is_const, .alignment = alignment } });
+        return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .nav = nav_index } } }));
+    }
     try sema.ensureNavVal(block, src, nav_index);
     const nav = sema.ip.getNav(nav_index);
     // A generic function has no body of its own until a call instantiates it.
