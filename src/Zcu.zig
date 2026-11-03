@@ -50,6 +50,11 @@ comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, InternPool.Index) = .em
 inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, []const InternPool.String) = .empty,
 /// Function instances whose inferred error set is `anyerror`.
 anyerror_ies: std.AutoHashMapUnmanaged(InternPool.Index, void) = .empty,
+/// The largest `@setEvalBranchQuota` of the callers that instantiated each
+/// generic function instance, which its body runs with, as upstream.
+/// Not a recorded dependency: an edit that lowers a caller's quota leaves
+/// a cached instance green (upstream's order dependence, ziglang/zig#22410).
+branch_quotas: std.AutoHashMapUnmanaged(InternPool.Index, u32) = .empty,
 exports: std.ArrayList(Export) = .empty,
 /// Files read by `@embedFile`, each once; `Dependee.embed_file` indexes it.
 embed_files: std.StringArrayHashMapUnmanaged(EmbedFile) = .empty,
@@ -186,6 +191,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.comptime_memo.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
     zcu.anyerror_ies.deinit(gpa);
+    zcu.branch_quotas.deinit(gpa);
     zcu.exports.deinit(gpa);
     zcu.embed_files.deinit(gpa);
     zcu.rt_helpers.deinit(gpa);

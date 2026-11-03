@@ -134,6 +134,11 @@ pub const Block = struct {
     runtime_cond: bool = false,
     /// Inside `@TypeOf`'s operand: only the type of values matters.
     is_typeof: bool = false,
+    /// A `comptime` block in a runtime function body: as upstream, it may
+    /// compute runtime-known values, whose instructions are dropped, as
+    /// long as nothing comptime (a branch, a constant, its result) needs
+    /// them.
+    discards_runtime: bool = false,
     /// The innermost runtime `loop` this block is inside of.
     loop: ?Ir.Inst.Index = null,
 
@@ -190,6 +195,7 @@ pub const Block = struct {
             .want_safety = b.want_safety,
             .loop = b.loop,
             .is_typeof = b.is_typeof,
+            .discards_runtime = b.discards_runtime,
         };
     }
 
@@ -748,18 +754,24 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
             return sema.finish();
         },
     }
-    info.has_runtime_tag = info.tag_type != .none and Type.hasRuntimeBits(ip, info.tag_type);
     info.status = .have_field_types;
 
     info.status = .layout_wip;
     var payload_size: u64 = 0;
     var payload_align: u64 = 1;
+    // As upstream, the tag is stored only if more than one field can be
+    // active and the union is not comptime-only.
+    var possible_tags: u32 = 0;
+    var comptime_state = false;
     for (types, 0..) |ft, i| {
         try sema.resolveLayout(&block, src, ft);
-        if (Type.class(ip, ft) == .noreturn) continue;
+        if (Type.hasNoPossibleValue(ip, ft)) continue;
+        possible_tags += 1;
+        if (Type.isComptimeOnly(ip, ft)) comptime_state = true;
         if (Type.hasRuntimeBits(ip, ft)) payload_size = @max(payload_size, Type.abiSize(ip, ft));
         payload_align = @max(payload_align, Type.unionFieldAlign(ip, info, @intCast(i)));
     }
+    info.has_runtime_tag = info.tag_type != .none and possible_tags > 1 and !comptime_state and Type.hasRuntimeBits(ip, info.tag_type);
     var size = payload_size;
     var alignment = payload_align;
     if (info.has_runtime_tag) {
@@ -783,6 +795,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     var sema = create(zcu, arena_state.allocator(), nav.file, .{ .func = func_index });
     defer sema.destroy();
     sema.func = func_index;
+    sema.branch_quota = @max(sema.branch_quota, sema.zcu.branch_quotas.get(func_index) orelse 0);
     sema.fn_ret_ty = fn_ty.return_type;
     if (ip.indexToKey(fn_ty.return_type) == .error_union_type) {
         const eu = ip.indexToKey(fn_ty.return_type).error_union_type;
@@ -1005,7 +1018,7 @@ fn resolveStructFields(sema: *Sema, block: *Block, src: Src, ty: Index) CompileE
 fn addInst(sema: *Sema, block: *Block, inst: Ir.Inst) !Ref {
     // Callers should have checked with `requireRuntime` and a precise source
     // location; this is the backstop for paths that do not yet.
-    if (block.is_comptime) return sema.fail(block, .{ .base = block.src_base, .loc = .{ .node = .zero } }, "unable to evaluate comptime expression", .{});
+    if (block.is_comptime and !block.discards_runtime) return sema.fail(block, .{ .base = block.src_base, .loc = .{ .node = .zero } }, "unable to evaluate comptime expression", .{});
     const index: Ir.Inst.Index = @fromBackingInt(@intCast(sema.ir_insts.len));
     try sema.ir_insts.append(sema.gpa, inst);
     try block.instructions.append(sema.gpa, index);
@@ -1084,6 +1097,7 @@ const PanicId = enum(u32) {
 };
 
 fn addPanic(sema: *Sema, block: *Block, id: PanicId, lhs: Ref, rhs: Ref) CompileError!void {
+    if (block.discards_runtime) return;
     // As upstream, call the handler in `std.lang.panic`.
     const ns = try sema.panicNamespace(block);
     const src = block.nodeSrc(.zero);
@@ -1150,6 +1164,8 @@ fn appendBody(sema: *Sema, body: []const Ir.Inst.Index) !void {
 
 /// Emits `if (!ok) panic(id)`.
 fn addSafetyCheck(sema: *Sema, block: *Block, ok: Ref, id: PanicId, lhs: Ref, rhs: Ref) !void {
+    // Dropped instructions need no checks.
+    if (block.discards_runtime) return;
     if (ok.toInterned()) |v| {
         if (v == .bool_true) return;
     }
@@ -1423,6 +1439,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 var child = block.child();
                 defer child.instructions.deinit(gpa);
                 child.is_comptime = true;
+                if (!block.is_comptime and sema.func != .none) child.discards_runtime = true;
                 const result = try sema.resolveInlineBody(&child, block_body, inst);
                 if (sema.resolveValue(result) == null) {
                     return sema.fail(block, block.nodeSrc(data.pl_node.src_node), "unable to resolve comptime value", .{});
@@ -4675,10 +4692,17 @@ fn nameSliceValue(sema: *Sema, name: []const u8) !Index {
 /// The tag of union value `operand`.
 fn unionTag(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
     const union_ty = sema.typeOf(operand);
-    const tag_ty = sema.ip.structInfo(union_ty).tag_type;
+    const info = sema.ip.structInfo(union_ty);
+    const tag_ty = info.tag_type;
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(tag_ty));
         return .fromInterned(sema.ip.indexToKey(v).un.tag);
+    }
+    if (!info.has_runtime_tag) {
+        // Only one field can be active, as upstream's unionToTag.
+        for (info.field_types, 0..) |ft, i| {
+            if (!Type.hasNoPossibleValue(sema.ip, ft)) return .fromInterned(try sema.unionFieldTagValue(union_ty, @intCast(i)));
+        }
     }
     try sema.requireRuntime(block, src);
     return sema.addTyOp(block, .get_union_tag, tag_ty, operand);
@@ -5039,7 +5063,7 @@ fn coercePtrTo(sema: *Sema, block: *Block, ptr: Ref, ty: Index) CompileError!Ref
             else => {},
         }
     }
-    if (block.is_comptime) return sema.fail(block, .{ .base = block.src_base, .loc = .{ .node = .zero } }, "unable to evaluate comptime expression", .{});
+    if (block.is_comptime and !block.discards_runtime) return sema.fail(block, .{ .base = block.src_base, .loc = .{ .node = .zero } }, "unable to evaluate comptime expression", .{});
     return sema.addTyOp(block, .bitcast, ty, ptr);
 }
 
@@ -5155,6 +5179,13 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
     // or tagged union's type.
     if (ca == .enum_literal and (cb == .@"enum" or cb == .@"union")) return b;
     if (cb == .enum_literal and (ca == .@"enum" or ca == .@"union")) return a;
+    // A tagged union and its tag type resolve to the union, as upstream.
+    if ((ca == .@"enum" and cb == .@"union") or (ca == .@"union" and cb == .@"enum")) {
+        const u = if (ca == .@"union") a else b;
+        const e = if (ca == .@"union") b else a;
+        try sema.resolveLayout(block, src, u);
+        if (sema.ip.structInfo(u).tag_type == e) return u;
+    }
     if (ca == .pointer and cb == .pointer) {
         // A C pointer peer makes a C pointer, gaining the other's
         // qualifiers, as upstream's `c_ptr` strategy.
@@ -5263,7 +5294,7 @@ fn overflowTupleType(sema: *Sema, ty: Index) !Index {
 }
 
 fn requireRuntime(sema: *Sema, block: *Block, src: Src) CompileError!void {
-    if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression", .{});
+    if (block.is_comptime and !block.discards_runtime) return sema.fail(block, src, "unable to evaluate comptime expression", .{});
 }
 
 fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, uncasted_lhs: Ref, uncasted_rhs: Ref) CompileError!Ref {
@@ -6889,6 +6920,9 @@ fn zirBoolBr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_or: bool) Com
         try sema.addCondBr(&inner, lhs, rhs_block.instructions.items, short_block.instructions.items);
     }
     try sema.addBlock(parent, block_inst, .bool_type, inner.instructions.items);
+    // `x and false` is false and `x or true` is true whatever `x`, as
+    // upstream; both operands still run.
+    if (sema.resolveValue(rhs) == boolValue(is_or)) return .fromInterned(boolValue(is_or));
     return block_inst.toRef();
 }
 
@@ -9934,7 +9968,8 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         if (!seen_true or !seen_false) return sema.fail(parent, src, "switch must handle all possibilities", .{});
     } else if (else_case == null and Type.class(ip, operand_ty) == .@"enum") {
         const info = ip.structInfo(operand_ty);
-        if (info.nonexhaustive and !sb.has_under) return sema.fail(parent, src, "switch on non-exhaustive enum must include 'else' or '_' prong", .{});
+        // A union switches over its fields, whatever its tag type.
+        if (info.nonexhaustive and !sb.has_under and !is_union) return sema.fail(parent, src, "switch on non-exhaustive enum must include 'else' or '_' prong", .{});
         for (info.field_defaults) |fv| {
             const tv = try sema.intern(.{ .enum_tag = .{ .ty = operand_ty, .int = fv } });
             for (cases.items) |c| {
@@ -11708,7 +11743,8 @@ fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
             return sema.analyzeCall(block, src, callee, .none, args, modifier);
         }
     }
-    if (ip.indexToKey(container) == .struct_type) {
+    if (ip.indexToKey(container) == .struct_type or ip.indexToKey(container) == .union_type) {
+        // A field holding a function (pointer) is called.
         try sema.resolveStructFields(block, src, container);
         if (ip.structInfo(container).fieldIndex(ip, name) != null) {
             const callee = try sema.fieldVal(block, src, obj, name);
@@ -12236,6 +12272,11 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) 
         .generic_owner = func,
         .comptime_args = comptime_args,
     } });
+    // As upstream, an instance's body runs with the largest branch quota
+    // of its callers at instantiation (an order dependence upstream also
+    // has; see Zcu.branch_quotas).
+    const gop = try sema.zcu.branch_quotas.getOrPut(sema.gpa, instance);
+    gop.value_ptr.* = if (gop.found_existing) @max(gop.value_ptr.*, sema.branch_quota) else sema.branch_quota;
     return .{ .func = instance, .runtime_args = runtime_args.items };
 }
 
