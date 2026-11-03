@@ -59,6 +59,10 @@ deps_set: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").Dep
 /// index into `deps` (0 for none). Analysis declares the same few over and
 /// over (each element of a large literal resolves the same layouts).
 dep_cache: [64]u32 = @splat(0),
+/// The same inside a memoizable comptime call: one more index into
+/// `memo_deps` (0 for none). An entry at or after `memo_start` is in the
+/// call's dependencies, and so in `deps`, at least as plain as it is there.
+memo_dep_cache: [64]u32 = @splat(0),
 /// When this unit's analysis started, for `Zcu.unit_timing`.
 timer: [2]u64,
 /// What a name in the current file's ZIR resolved to in a type: each row
@@ -1361,18 +1365,26 @@ fn declareDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !void {
     // Declaring a dependency again changes nothing, unless it turns a
     // conditional one plain, or lowering or a memoizable call in progress
     // records it too.
-    const cacheable = sema.bc == null and sema.memo_start == null;
-    const slot = &sema.dep_cache[@as(u6, @truncate(@import("Incremental.zig").DependeeContext.hash(.{}, dependee)))];
-    if (cacheable and slot.* != 0) {
-        const i = slot.* - 1;
-        if (std.meta.eql(sema.deps.items[i], dependee) and (conditional or !sema.deps_conditional.items[i])) return;
+    const h: u6 = @truncate(@import("Incremental.zig").DependeeContext.hash(.{}, dependee));
+    const slot = &sema.dep_cache[h];
+    if (sema.bc == null) {
+        if (sema.memo_start) |start| {
+            const m = sema.memo_dep_cache[h];
+            if (m != 0 and m - 1 >= start and m - 1 < sema.memo_deps.items.len) switch (sema.memo_deps.items[m - 1]) {
+                .dep => |d| if (std.meta.eql(d.dependee, dependee) and (conditional or !d.conditional)) return,
+                .body => {},
+            };
+        } else if (slot.* != 0) {
+            const i = slot.* - 1;
+            if (std.meta.eql(sema.deps.items[i], dependee) and (conditional or !sema.deps_conditional.items[i])) return;
+        }
     }
     const index = try sema.addDep(dependee, conditional);
     slot.* = index + 1;
     // The code the walker runs reads it here; a plain read is declared
     // where a run reaches it.
     if (sema.bc != null and !conditional) try sema.bcDepEvent(index);
-    if (sema.memo_start) |start| try sema.memoCollect(.{ .dep = .{ .dependee = dependee, .conditional = conditional } }, start);
+    if (sema.memo_start) |start| sema.memo_dep_cache[h] = 1 + try sema.memoCollect(.{ .dep = .{ .dependee = dependee, .conditional = conditional } }, start);
 }
 
 /// Adds `dependee` to this unit's `deps`, returning its index.
@@ -1406,7 +1418,8 @@ const MemoCollected = union(enum) {
     body: *const Zcu.Bytecode,
 };
 
-fn memoCollect(sema: *Sema, entry: MemoCollected, start: u32) !void {
+/// Returns the entry's position in `memo_deps`.
+fn memoCollect(sema: *Sema, entry: MemoCollected, start: u32) !u32 {
     const gpa = sema.gpa;
     const len: u32 = @intCast(sema.memo_deps.items.len);
     switch (entry) {
@@ -1414,17 +1427,18 @@ fn memoCollect(sema: *Sema, entry: MemoCollected, start: u32) !void {
             const gop = try sema.memo_pos.getOrPut(gpa, d.dependee);
             if (gop.found_existing and gop.value_ptr.* >= start) {
                 if (!d.conditional) sema.memo_deps.items[gop.value_ptr.*].dep.conditional = false;
-                return;
+                return gop.value_ptr.*;
             }
             gop.value_ptr.* = len;
         },
         .body => |b| {
             const gop = try sema.memo_body_pos.getOrPut(gpa, b);
-            if (gop.found_existing and gop.value_ptr.* >= start) return;
+            if (gop.found_existing and gop.value_ptr.* >= start) return gop.value_ptr.*;
             gop.value_ptr.* = len;
         },
     }
     try sema.memo_deps.append(gpa, entry);
+    return len;
 }
 
 /// The dependencies the memoizable call whose entries start at `start`
@@ -15516,7 +15530,7 @@ fn bcRun(sema: *Sema, caller: *Block, src: Src, func: Index, body: *const Zcu.By
 /// ones; its `comptime_dep` instructions declare the others it reaches.
 /// Returns the body's `bc_declared` epochs.
 fn bcDeclareBody(sema: *Sema, body: *const Zcu.Bytecode) Allocator.Error![]u32 {
-    if (sema.memo_start) |start| try sema.memoCollect(.{ .body = body }, start);
+    if (sema.memo_start) |start| _ = try sema.memoCollect(.{ .body = body }, start);
     const gop = try sema.bc_declared.getOrPut(sema.gpa, body);
     if (gop.found_existing) return gop.value_ptr.*;
     gop.value_ptr.* = try sema.arena.alloc(u32, body.deps.len);
