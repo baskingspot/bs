@@ -11,11 +11,14 @@
 //! (positive offsets from rsp).
 //!
 //! Calling conventions:
-//! - `.auto` (zap to zap): every argument is passed in memory, at 8-byte
-//!   aligned offsets of the outgoing area, read by the callee at rbp+16.
-//!   A result whose size is 1, 2, 4, or 8 bytes returns in rax; any other
-//!   result is written through a pointer the caller passes in rdi.
-//!   The caller's error return trace pointer goes in r9, as upstream.
+//! - `.auto` (zap to zap; see `autoClass`): arguments of up to 8 bytes in
+//!   rdi, rsi, rdx, rcx, r8, r9, of 9 to 16 bytes in two consecutive ones
+//!   (never split with the stack), f16/f32/f64 in xmm0-xmm7; the rest, and
+//!   what does not fit, at 8-byte aligned offsets of the outgoing area,
+//!   read by the callee at rbp+16. Results likewise in rax (and rdx) or
+//!   xmm0; larger ones through a pointer the caller passes in rdi, which
+//!   then takes the first argument register. The caller's error return
+//!   trace pointer goes in rax.
 //! - `.c`: SysV for scalars: integers, bools, and pointers in GPRs (16-byte
 //!   integers in pairs), f16/f32/f64/f128 in XMM registers, f80 in memory
 //!   and returned in st0; other values in memory.
@@ -372,29 +375,200 @@ fn passInRegs(cg: *CodeGen, ty: Index) bool {
 
 const c_arg_regs = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
 
+/// How `.auto` passes a value of a type: in one or two general-purpose
+/// registers (the bytes of the value, as eightbytes; one register holds a
+/// 1-, 2-, 4-, or 8-byte value extended like a load), in an SSE register,
+/// or in memory (arguments in the outgoing area, results through a
+/// pointer in rdi).
+const AutoClass = enum { none, gpr, gpr_pair, sse, memory };
+
+fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
+    const ip = cg.ip;
+    if (!Type.hasRuntimeBits(ip, ty)) return .none;
+    if (Type.class(ip, ty) == .float) return switch (Type.floatBits(ip, ty)) {
+        16, 32, 64 => .sse,
+        else => .memory,
+    };
+    const size = Type.abiSize(ip, ty);
+    return if (size <= 8) .gpr else if (size <= 16) .gpr_pair else .memory;
+}
+
+/// Where the `.auto` convention puts each argument, in order, given the
+/// result type; the stack offsets are from the start of the outgoing area.
+const AutoArg = union(enum) { none, gpr: u8, gpr_pair: u8, sse: u8, stack: u32 };
+
+fn autoArgs(cg: *CodeGen, ret_ty: Index, tys: []const Index, locs: []AutoArg) u32 {
+    var gp: u8 = @intFromBool(cg.autoClass(ret_ty) == .memory);
+    var sse: u8 = 0;
+    var stack: u32 = 0;
+    for (tys, locs) |ty, *l| {
+        l.* = switch (cg.autoClass(ty)) {
+            .none => .none,
+            .gpr => if (gp < 6) blk: {
+                gp += 1;
+                break :blk .{ .gpr = gp - 1 };
+            } else .{ .stack = 0 },
+            // A pair never splits between registers and the stack.
+            .gpr_pair => if (gp < 5) blk: {
+                gp += 2;
+                break :blk .{ .gpr_pair = gp - 2 };
+            } else .{ .stack = 0 },
+            .sse => if (sse < 8) blk: {
+                sse += 1;
+                break :blk .{ .sse = sse - 1 };
+            } else .{ .stack = 0 },
+            .memory => .{ .stack = 0 },
+        };
+        if (l.* == .stack) {
+            l.* = .{ .stack = stack };
+            stack += @intCast(std.mem.alignForward(u64, Type.abiSize(cg.ip, ty), 8));
+        }
+    }
+    return stack;
+}
+
+/// Loads the `n` bytes (1 to 8) at `m` into `reg`, zero-extended. Uses r11
+/// for sizes that take more than one load.
+fn loadBytes(cg: *CodeGen, reg: Reg, m: Mem, n: u64) Error!void {
+    const e = &cg.e;
+    switch (n) {
+        8 => return e.mov(.qword, .{ .reg = reg }, .{ .mem = m }),
+        4 => return e.movzx(.qword, reg, .dword, .{ .mem = m }),
+        2 => return e.movzx(.qword, reg, .word, .{ .mem = m }),
+        1 => return e.movzx(.qword, reg, .byte, .{ .mem = m }),
+        3 => try e.movzx(.qword, reg, .word, .{ .mem = m }),
+        else => try e.movzx(.qword, reg, .dword, .{ .mem = m }),
+    }
+    var off: u64 = if (n == 3) 2 else 4;
+    while (off < n) {
+        const chunk: u64 = if (n - off >= 2) 2 else 1;
+        try e.movzx(.qword, .r11, if (chunk == 2) .word else .byte, .{ .mem = offsetMem(m, off) });
+        try e.shift(.shl, .qword, .{ .reg = .r11 }, @intCast(off * 8));
+        try e.alu(.@"or", .qword, .{ .reg = reg }, .{ .reg = .r11 });
+        off += chunk;
+    }
+}
+
+/// Stores the low `n` bytes (1 to 8) of `reg` to `m`. Uses r11.
+fn storeBytes(cg: *CodeGen, m: Mem, reg: Reg, n: u64) Error!void {
+    switch (n) {
+        1, 2, 4, 8 => return cg.storeReg(m, reg, n),
+        else => {},
+    }
+    const e = &cg.e;
+    try e.mov(.qword, .{ .reg = .r11 }, .{ .reg = reg });
+    var off: u64 = 0;
+    while (off < n) {
+        const chunk: u64 = if (n - off >= 4) 4 else if (n - off >= 2) 2 else 1;
+        try e.mov(sizeOf(chunk), .{ .mem = offsetMem(m, off) }, .{ .reg = .r11 });
+        off += chunk;
+        if (off < n) try e.shift(.shr, .qword, .{ .reg = .r11 }, @intCast(chunk * 8));
+    }
+}
+
+/// Loads `.auto` value `ref` of class `gpr` into `reg`.
+fn loadGpr(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
+    const size = Type.abiSize(cg.ip, cg.typeOf(ref));
+    if (cg.passInRegs(cg.typeOf(ref))) return cg.load(reg, ref);
+    try cg.loadBytes(reg, try cg.memOf(ref), size);
+}
+
+/// Loads `.auto` value `ref` of class `gpr_pair` into `lo` and `hi`.
+fn loadPair(cg: *CodeGen, lo: Reg, hi: Reg, ref: Ref) Error!void {
+    const size = Type.abiSize(cg.ip, cg.typeOf(ref));
+    const m = try cg.memOf(ref);
+    try cg.e.mov(.qword, .{ .reg = lo }, .{ .mem = m });
+    try cg.loadBytes(hi, offsetMem(m, 8), size - 8);
+}
+
 fn setupParams(cg: *CodeGen) Error!void {
     const ip = cg.ip;
     if (cg.fn_ty.cc == .c) return cg.setupCParams();
-    if (cg.fn_ty.cc == .auto) {
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    // The error return trace pointer arrives in rax; a function that
+    // neither reads it nor calls passes it on drops it.
+    const needs_trace = for (cg.ssa.values.items(.inst)) |inst| switch (tags[@backingInt(inst)]) {
+        .call, .err_return_trace, .save_err_return_trace_index => break true,
+        else => {},
+    } else false;
+    if (needs_trace) {
         cg.trace_slot = try cg.allocSlot(8, 8);
-        try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, cg.trace_slot.?) }, .{ .reg = .r9 });
+        try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, cg.trace_slot.?) }, .{ .reg = .rax });
     }
     const ret_ty = cg.fn_ty.return_type;
-    if (Type.hasRuntimeBits(ip, ret_ty) and !cg.passInRegs(ret_ty)) {
+    if (cg.autoClass(ret_ty) == .memory) {
         const off = try cg.allocSlot(8, 8);
         try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, off) }, .{ .reg = .rdi });
         cg.ret_ptr_slot = off;
     }
     // `arg` instructions are at the start of the main body.
-    var stack_off: i32 = 16;
-    for (cg.ir.mainBody()) |inst| {
-        if (cg.ir.instructions.items(.tag)[@backingInt(inst)] != .arg) break;
-        const ty = cg.ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
-        if (!Type.hasRuntimeBits(ip, ty)) continue;
-        const size = Type.abiSize(ip, ty);
-        cg.homes[@backingInt(inst)] = .{ .slot = stack_off };
-        stack_off += @intCast(std.mem.alignForward(u64, size, 8));
+    var n: usize = 0;
+    for (ir.mainBody()) |inst| {
+        if (tags[@backingInt(inst)] != .arg) break;
+        n += 1;
     }
+    const args = ir.mainBody()[0..n];
+    const tys = try cg.gpa.alloc(Index, n);
+    defer cg.gpa.free(tys);
+    const locs = try cg.gpa.alloc(AutoArg, n);
+    defer cg.gpa.free(locs);
+    for (args, tys) |inst, *ty| ty.* = ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
+    _ = cg.autoArgs(ret_ty, tys, locs);
+    // Arguments that live in memory first, then the moves into registers,
+    // which may overwrite argument registers.
+    var moves: [6]struct { dst: Reg, src: Reg } = undefined;
+    var n_moves: usize = 0;
+    for (args, tys, locs) |inst, ty, l| {
+        const size = Type.abiSize(ip, ty);
+        const home = cg.homes[@backingInt(inst)];
+        if (cg.live and cg.ssa.live.items(.uses)[@backingInt(inst)] == 0) continue;
+        switch (l) {
+            .none => {},
+            .gpr => |r| if (home == .reg) {
+                moves[n_moves] = .{ .dst = home.reg, .src = c_arg_regs[r] };
+                n_moves += 1;
+            } else try cg.storeBytes((try cg.resultMem(inst, ty)).?, c_arg_regs[r], size),
+            .gpr_pair => |r| {
+                const m = (try cg.resultMem(inst, ty)).?;
+                try cg.e.mov(.qword, .{ .mem = m }, .{ .reg = c_arg_regs[r] });
+                try cg.storeBytes(offsetMem(m, 8), c_arg_regs[r + 1], size - 8);
+            },
+            .sse => |x| try cg.storeXmm((try cg.resultMem(inst, ty)).?, xmm_args[x], size),
+            // Loaded into a register after the moves (below).
+            .stack => |off| if (home != .reg) {
+                cg.homes[@backingInt(inst)] = .{ .slot = 16 + @as(i32, @intCast(off)) };
+            },
+        }
+    }
+    // A parallel move: each destination is written once its old value has
+    // been read, and a cycle goes through r11.
+    while (n_moves != 0) {
+        const i = for (moves[0..n_moves], 0..) |mv, i| {
+            const read = for (moves[0..n_moves]) |other| {
+                if (other.src == mv.dst and other.dst != mv.dst) break true;
+            } else false;
+            if (!read) break i;
+        } else blk: {
+            const d = moves[0].dst;
+            try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .reg = d });
+            for (moves[0..n_moves]) |*other| if (other.src == d) {
+                other.src = .r11;
+            };
+            break :blk 0;
+        };
+        const mv = moves[i];
+        if (mv.dst != mv.src) try cg.e.mov(.qword, .{ .reg = mv.dst }, .{ .reg = mv.src });
+        n_moves -= 1;
+        moves[i] = moves[n_moves];
+    }
+    for (args, tys, locs) |inst, ty, l| switch (l) {
+        .stack => |off| switch (cg.homes[@backingInt(inst)]) {
+            .reg => |r| try cg.loadMem(r, Mem.at(.rbp, 16 + @as(i32, @intCast(off))), ty),
+            else => {},
+        },
+        else => {},
+    };
 }
 
 fn sizeOf(bytes: u64) Size {
@@ -653,7 +827,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     const tag = ir.instructions.items(.tag)[@backingInt(inst)];
     switch (tag) {
-        .arg, .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .block, .loop, .breakpoint => return false,
+        .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .block, .loop, .breakpoint => return false,
         else => {},
     }
     const want = !cg.has_asm and cg.wantsReg(inst);
@@ -663,7 +837,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         live.items(.tie)[@backingInt(inst)] = cg.tiedOperand(inst);
     }
     return switch (tag) {
-        .ret_addr, .frame_addr, .extern_ptr, .tls_ptr, .err_return_trace, .save_err_return_trace_index, .set_err_return_trace => false,
+        .arg, .ret_addr, .frame_addr, .extern_ptr, .tls_ptr, .err_return_trace, .save_err_return_trace_index, .set_err_return_trace => false,
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => !cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)),
         .store => !cg.passInRegs(cg.typeOf(data.bin_op.rhs)),
         .call, .atomic_rmw => true,
@@ -743,6 +917,9 @@ fn planRegisters(cg: *CodeGen) Error!void {
                 cg.homes[i] = .fused;
                 reg[i] = Ssa.no_reg;
             }
+            // Arguments are all moved at the entry, so an unused one, whose
+            // interval ends there, must not take a register (or anything).
+            if (tags[i] == .arg and uses[i] == 0) reg[i] = Ssa.no_reg;
         }
     }
     cg.saved = f.allocate(alloc_regs.len, callee_saved) & callee_saved;
@@ -795,6 +972,8 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) bool {
         .not, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => !cg.isWideInt(cg.typeOf(data.ty_op.operand)),
         .intcast, .trunc, .bitcast, .ptr_from_int => cg.passInRegs(cg.typeOf(data.ty_op.operand)) and !cg.isWideInt(cg.typeOf(data.ty_op.operand)),
         .load, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err => true,
+        // `setupParams` moves it from where `.auto` passes it.
+        .arg => cg.fn_ty.cc == .auto,
         .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_add, .ptr_elem_val, .slice_elem_val => true,
         .slice_ptr, .slice_len, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set => true,
         .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => true,
@@ -1929,13 +2108,15 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
     const ty = cg.fn_ty.return_type;
     if (cg.fn_ty.cc == .c) {
         try cg.cRet(operand);
-    } else if (Type.hasRuntimeBits(cg.ip, ty)) {
-        if (cg.ret_ptr_slot) |off| {
-            try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, off) });
+    } else switch (cg.autoClass(ty)) {
+        .none => {},
+        .gpr => try cg.loadGpr(.rax, operand),
+        .gpr_pair => try cg.loadPair(.rax, .rdx, operand),
+        .sse => try cg.loadXmm(.xmm0, try cg.valOf(operand)),
+        .memory => {
+            try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .mem = Mem.at(.rbp, cg.ret_ptr_slot.?) });
             try cg.copyTo(Mem.at(.r10, 0), operand);
-        } else {
-            try cg.load(.rax, operand);
-        }
+        },
     }
     try cg.epilogue();
 }
@@ -1963,24 +2144,34 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const callee_fn_ty = cg.typeOf(callee_ref);
     const callee_ty = ip.keyPayload(.func_type, if (Type.class(ip, callee_fn_ty) == .pointer) Type.ptrInfo(ip, callee_fn_ty).child else callee_fn_ty);
     const ret_ty = extra.data.ret_ty;
+    const is_c = callee_ty.cc == .c;
+    const ret_class = cg.autoClass(ret_ty);
     // A result in rax goes to its home after the call.
-    const in_rax = cg.passInRegs(ret_ty) and (callee_ty.cc != .c or cg.cClass(ret_ty) == .int);
+    const in_rax = cg.passInRegs(ret_ty) and if (is_c) cg.cClass(ret_ty) == .int else ret_class == .gpr;
     const dst = if (in_rax) null else try cg.resultMem(inst, ret_ty);
-    if (callee_ty.cc == .c) {
+    if (is_c) {
         const vals = try cg.gpa.alloc(Val, args.len);
         defer cg.gpa.free(vals);
         for (args, vals) |arg, *v| v.* = try cg.valOf(arg);
         try cg.cCallArgs(vals, ret_ty, dst);
     } else {
-        var off: u32 = 0;
-        for (args) |arg| {
-            const ty = cg.typeOf(arg);
-            if (!Type.hasRuntimeBits(ip, ty)) continue;
-            try cg.copyTo(Mem.at(.rsp, @intCast(off)), arg);
-            off += @intCast(std.mem.alignForward(u64, Type.abiSize(ip, ty), 8));
-        }
-        cg.out_args_size = @max(cg.out_args_size, off);
-        if (dst) |m| if (!cg.passInRegs(ret_ty)) try cg.e.lea(.qword, .rdi, m);
+        const tys = try cg.gpa.alloc(Index, args.len);
+        defer cg.gpa.free(tys);
+        const locs = try cg.gpa.alloc(AutoArg, args.len);
+        defer cg.gpa.free(locs);
+        for (args, tys) |arg, *ty| ty.* = cg.typeOf(arg);
+        cg.out_args_size = @max(cg.out_args_size, cg.autoArgs(ret_ty, tys, locs));
+        // The outgoing area first (copies use rax, rsi, rdi, and rcx), then
+        // SSE registers (rax), then general registers. The arguments are
+        // not in caller-saved registers: a call is a clobber point.
+        for (args, locs) |arg, l| if (l == .stack) try cg.copyTo(Mem.at(.rsp, @intCast(l.stack)), arg);
+        for (args, locs) |arg, l| if (l == .sse) try cg.loadXmm(xmm_args[l.sse], try cg.valOf(arg));
+        for (args, locs) |arg, l| switch (l) {
+            .gpr => |r| try cg.loadGpr(c_arg_regs[r], arg),
+            .gpr_pair => |r| try cg.loadPair(c_arg_regs[r], c_arg_regs[r + 1], arg),
+            else => {},
+        };
+        if (ret_class == .memory) if (dst) |m| try cg.e.lea(.qword, .rdi, m);
     }
     // A variadic callee learns from al how many vector registers hold
     // arguments.
@@ -1988,7 +2179,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     if (callee_ty.is_var_args) for (args) |arg| {
         if (cg.cClass(cg.typeOf(arg)) == .sse and va_sse < 8) va_sse += 1;
     };
-    if (callee_ty.cc == .auto) try cg.loadTrace(.r9);
+    if (!is_c) try cg.loadTrace(.rax);
     if (callee_val) |f| {
         if (callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
         try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
@@ -2001,12 +2192,23 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     if (in_rax) {
         // C callees leave the bits above a narrow result unspecified.
         const size = Type.abiSize(ip, ret_ty);
-        if (callee_ty.cc == .c and size < 8) {
+        if (is_c and size < 8) {
             if (cg.signed(ret_ty)) try cg.e.movsx(.qword, .rax, sizeOf(size), .{ .reg = .rax }) else try cg.e.movzx(.qword, .rax, sizeOf(size), .{ .reg = .rax });
         }
         return cg.setResult(inst, ret_ty, .rax);
     }
-    if (callee_ty.cc == .c) return cg.cCallResult(ret_ty, dst);
+    if (is_c) return cg.cCallResult(ret_ty, dst);
+    const m = dst orelse return;
+    const size = Type.abiSize(ip, ret_ty);
+    switch (ret_class) {
+        .gpr => try cg.storeBytes(m, .rax, size),
+        .gpr_pair => {
+            try cg.e.mov(.qword, .{ .mem = m }, .{ .reg = .rax });
+            try cg.storeBytes(offsetMem(m, 8), .rdx, size - 8);
+        },
+        .sse => try cg.storeXmm(m, .xmm0, size),
+        .none, .memory => {},
+    }
 }
 
 /// `@atomicRmw`: xchg and lock xadd where x86 has them, else a lock
