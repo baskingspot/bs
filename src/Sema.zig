@@ -6727,8 +6727,10 @@ fn analyzeDeclLiteral(sema: *Sema, block: *Block, src: Src, name: []const u8, or
     };
     if (ty == .calling_convention_type) return sema.callingConventionValue(block, src, name);
     // No result type (an `anytype` parameter): an enum literal, as upstream.
-    if (ty == .generic_poison_type or ty == .enum_literal_type or Type.class(sema.ip, ty) == .error_set)
-        return .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(name) }));
+    if (ty == .generic_poison_type or ty == .enum_literal_type or Type.class(sema.ip, ty) == .error_set) {
+        const lit: Ref = .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(name) }));
+        return if (do_coerce and orig_ty != .generic_poison_type) sema.coerce(block, orig_ty, lit, src) else lit;
+    }
     const nav = (try sema.lookupInType(ty, name)) orelse {
         // Upstream looks the name up as a member of the type: a container
         // with neither such a declaration nor such a tag has no member.
@@ -8581,6 +8583,26 @@ fn resolvePeerTypes(sema: *Sema, block: *Block, src: Src, refs: []const Ref) Com
         }
         chosen = try sema.peerPair(block, src, chosen, ty);
     }
+    // Upstream's `fixed_float` strategy: a runtime-known integer peer of a
+    // float must fit its significand.
+    if (Type.class(sema.ip, chosen) == .float) for (refs, 0..) |r, i| {
+        if (Type.class(sema.ip, sema.typeOf(r)) != .int or sema.resolveValue(r) != null) continue;
+        const info = Type.intInfo(sema.ip, sema.typeOf(r));
+        const significand_bits: u16 = switch (Type.floatBits(sema.ip, chosen)) {
+            16 => 11,
+            32 => 24,
+            64 => 53,
+            80 => 64,
+            else => 113,
+        };
+        if (info.bits - @intFromBool(info.signedness == .signed) <= significand_bits) continue;
+        // The peers in source order, as upstream.
+        const f = for (refs, 0..) |fr, fi| {
+            if (Type.class(sema.ip, sema.typeOf(fr)) == .float) break fi;
+        } else continue;
+        const a, const b = if (i < f) .{ r, refs[f] } else .{ refs[f], r };
+        return sema.fail(block, src, "incompatible types: '{f}' and '{f}'", .{ sema.fmtType(sema.typeOf(a)), sema.fmtType(sema.typeOf(b)) });
+    };
     return chosen;
 }
 
