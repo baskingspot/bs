@@ -494,7 +494,16 @@ fn copyTail(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
     }
 }
 
+/// Above 128 bytes, `rep stosb`, as `copyMem` uses `rep movsb` (upstream
+/// always fills undefined memory with it); so its callers already allow
+/// rdi and rcx to be clobbered there.
 fn fillMem(cg: *CodeGen, dst: Mem, size: u64, byte: u8) Error!void {
+    if (size > 128) {
+        try cg.e.lea(.qword, .rdi, dst);
+        try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(size) });
+        try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = byte });
+        return cg.e.repStosb();
+    }
     var pattern: u64 = byte;
     pattern *%= 0x0101_0101_0101_0101;
     try cg.e.mov(.qword, .{ .reg = .rax }, .{ .imm = @bitCast(pattern) });
