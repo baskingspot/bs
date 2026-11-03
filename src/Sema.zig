@@ -1159,11 +1159,11 @@ fn failUnsupported(sema: *Sema, block: *Block, src: Src, what: []const u8) Compi
 
 /// Notes call site `src` on the error a failed call reported (if it reported
 /// one since there were `n_errors`), and returns `err`.
-fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: CompileError, comptime note: []const u8) CompileError {
+fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: CompileError, kind: @import("diag.zig").CallKind) CompileError {
     _ = block;
     if (err == error.AnalysisFail and sema.zcu.errors.items.len > n_errors) {
         const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
-        try sema.zcu.addNote(sema.file, src.span(tree), note, .{});
+        try sema.zcu.addCallFrame(sema.file, src.span(tree), kind);
     }
     return err;
 }
@@ -13845,13 +13845,13 @@ fn analyzeCall(
         // upstream.
         try sema.emitBackwardBranch(block, src);
         const n = sema.zcu.errors.items.len;
-        return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, "called at comptime here"));
+        return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, .@"comptime"));
     }
 
     if (fn_ty.cc == .@"inline" or modifier == .always_inline) {
         try sema.emitBackwardBranch(block, src);
         const n = sema.zcu.errors.items.len;
-        return sema.inlineCall(block, src, func, args) catch |err| return sema.noteCallSite(block, src, n, err, "called inline here");
+        return sema.inlineCall(block, src, func, args) catch |err| return sema.noteCallSite(block, src, n, err, .@"inline");
     }
 
     var callee_func = func;
@@ -13865,7 +13865,7 @@ fn analyzeCall(
             for (args, vals) |a, *v| v.* = try sema.resolveConstValue(block, src, a, "argument to function being called at comptime must be comptime-known");
             try sema.emitBackwardBranch(block, src);
             const n = sema.zcu.errors.items.len;
-            return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, "called at comptime here"));
+            return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, .@"comptime"));
         }
     }
     try sema.requireRuntime(block, src);

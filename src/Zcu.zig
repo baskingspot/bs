@@ -18,6 +18,7 @@ const cache = @import("cache.zig");
 const InternPool = @import("InternPool.zig");
 const Ir = @import("Ir.zig");
 const Sema = @import("Sema.zig");
+const diag = @import("diag.zig");
 
 const Zcu = @This();
 
@@ -276,11 +277,13 @@ pub const ErrorMsg = struct {
     file: u32,
     span: Ast.Span,
     msg: []const u8,
+    code: diag.Code = .unclassified,
     notes: []const Note = &.{},
 
     /// `count` repeats of the same note in a row (a recursive call's
-    /// frames) render once, as upstream.
-    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1 };
+    /// frames) render once, as upstream. `call` marks a call-site frame of
+    /// the comptime or inline call chain.
+    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1, call: ?diag.CallKind = null };
 };
 
 pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
@@ -386,50 +389,50 @@ pub fn addError(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []cons
 
 /// Adds a note to the most recent error.
 pub fn addNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
+    try zcu.appendNote(.{ .file = file_index, .span = span, .msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args) });
+}
+
+/// Adds a call-site frame of the comptime or inline call chain to the most
+/// recent error.
+pub fn addCallFrame(zcu: *Zcu, file_index: u32, span: Ast.Span, kind: diag.CallKind) !void {
+    try zcu.appendNote(.{ .file = file_index, .span = span, .msg = switch (kind) {
+        .@"inline" => "called inline here",
+        .@"comptime" => "called at comptime here",
+    }, .call = kind });
+}
+
+fn appendNote(zcu: *Zcu, note: ErrorMsg.Note) !void {
     const arena = zcu.arena.allocator();
     const e = &zcu.errors.items[zcu.errors.items.len - 1];
-    const msg = try std.fmt.allocPrint(arena, fmt, args);
     if (e.notes.len != 0) {
         const last = e.notes[e.notes.len - 1];
-        if (last.file == file_index and last.span.main == span.main and std.mem.eql(u8, last.msg, msg)) {
+        if (last.file == note.file and last.span.main == note.span.main and std.mem.eql(u8, last.msg, note.msg)) {
             @constCast(&e.notes[e.notes.len - 1]).count += 1;
             return;
         }
     }
     const notes = try arena.alloc(ErrorMsg.Note, e.notes.len + 1);
     @memcpy(notes[0..e.notes.len], e.notes);
-    notes[e.notes.len] = .{ .file = file_index, .span = span, .msg = msg };
+    notes[e.notes.len] = note;
     e.notes = notes;
 }
 
-fn srcLoc(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip, file_index: u32, span: Ast.Span) !std.zig.ErrorBundle.SourceLocationIndex {
-    const loc = std.zig.findLineColumn(try zcu.fe.source(@fromBackingInt(file_index)), span.main);
-    return wip.addSourceLocation(.{
-        .src_path = try wip.addString(zcu.file(file_index).display_path),
-        .span_start = span.start,
-        .span_main = span.main,
-        .span_end = span.end,
-        .line = @intCast(loc.line),
-        .column = @intCast(loc.column),
-        .source_line = try wip.addString(loc.source_line),
-    });
+fn diagLoc(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, file_index: u32, span: Ast.Span) !diag.Loc {
+    const f = zcu.file(file_index);
+    return paths.loc(arena, f.display_path, try zcu.fe.source(@fromBackingInt(file_index)), span.start, span.main, span.end, f.module == .builtin);
 }
 
-pub fn renderErrors(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip) !void {
-    for (zcu.fe.late_errors.items) |b| try wip.addBundleAsRoots(b);
+/// This compilation's errors as diagnostics: AstGen errors of files loaded
+/// during analysis first, then Sema's.
+pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag.Diagnostic {
+    var out: std.ArrayList(diag.Diagnostic) = .empty;
+    for (zcu.fe.late_errors.items) |b| try diag.fromBundle(arena, paths, b, &out);
     for (zcu.errors.items) |e| {
-        try wip.addRootErrorMessage(.{
-            .msg = try wip.addString(e.msg),
-            .src_loc = try zcu.srcLoc(wip, e.file, e.span),
-            .notes_len = @intCast(e.notes.len),
-        });
-        const start = try wip.reserveNotes(@intCast(e.notes.len));
-        for (e.notes, start..) |n, i| {
-            const msg = if (n.count == 1) try wip.addString(n.msg) else try wip.printString("{s} ({d} times)", .{ n.msg, n.count });
-            const note = try wip.addErrorMessage(.{ .msg = msg, .src_loc = try zcu.srcLoc(wip, n.file, n.span) });
-            wip.extra.items[i] = @backingInt(note);
-        }
+        const notes = try arena.alloc(diag.Note, e.notes.len);
+        for (notes, e.notes) |*n, en| n.* = .{ .loc = try zcu.diagLoc(arena, paths, en.file, en.span), .msg = en.msg, .count = en.count, .call = en.call };
+        try out.append(arena, .{ .code = e.code, .loc = try zcu.diagLoc(arena, paths, e.file, e.span), .msg = e.msg, .notes = notes });
     }
+    return out.items;
 }
 
 // ---------------------------------------------------------------------------

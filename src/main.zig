@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const build_options = @import("build_options");
+const diag = @import("diag.zig");
 const Frontend = @import("Frontend.zig");
 const Zcu = @import("Zcu.zig");
 const Ir = @import("Ir.zig");
@@ -47,6 +48,8 @@ pub const Options = struct {
     test_filters: []const []const u8 = &.{},
     /// `zap test` only: build the test binary without running it.
     test_no_exec: bool = false,
+    /// `--error-format`: how compile errors print to stderr.
+    error_format: diag.Format = .text,
     /// Print the typed IR of every analyzed function to stdout
     /// (`--debug-dump-ir`, for zap's own tests and debugging).
     dump_ir: bool = false,
@@ -171,7 +174,10 @@ pub fn main(init: std.process.Init) !void {
     var bundle = try errors.toOwnedBundle("");
     defer bundle.deinit(init.gpa);
     if (bundle.errorMessageCount() > 0) {
-        try bundle.renderToStderr(init.io, .{}, .auto);
+        var diags: std.ArrayList(diag.Diagnostic) = .empty;
+        const paths: diag.Paths = try .init(arena, init.io, zig_lib_dir);
+        try diag.fromBundle(arena, paths, bundle, &diags);
+        try printDiagnostics(init.io, diags.items, opts.error_format);
         std.process.exit(1);
     }
     std.debug.assert(ok);
@@ -193,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
         var sink: DumpSink = .{ .w = &stdout.interface };
         try zcu.analyzeAll(&sink);
         try stdout.interface.flush();
-        exitOnErrors(init, &zcu);
+        exitOnErrors(init, &zcu, opts.error_format);
         return;
     }
     var emit: Emit = .init(init.gpa, &zcu);
@@ -212,11 +218,11 @@ pub fn main(init: std.process.Init) !void {
         error.OutOfMemory => return error.OutOfMemory,
         else => {},
     };
-    exitOnErrors(init, &zcu);
+    exitOnErrors(init, &zcu, opts.error_format);
     const bin_path = out_path orelse return;
     const ready = try emit.finish();
     stages.mark("emit");
-    exitOnErrors(init, &zcu);
+    exitOnErrors(init, &zcu, opts.error_format);
     if (!ready) std.process.exit(1);
     // The cache records the build while it links, and keeps the record
     // only if the link succeeds.
@@ -323,19 +329,23 @@ const Stages = struct {
     }
 };
 
-fn exitOnErrors(init: std.process.Init, zcu: *Zcu) void {
+fn exitOnErrors(init: std.process.Init, zcu: *Zcu, format: diag.Format) void {
     if (zcu.errors.items.len == 0) return;
-    renderErrors(init, zcu) catch {};
+    renderErrors(init, zcu, format) catch {};
     std.process.exit(1);
 }
 
-fn renderErrors(init: std.process.Init, zcu: *Zcu) !void {
-    var wip: std.zig.ErrorBundle.Wip = try .init(init.gpa);
-    defer wip.deinit();
-    try zcu.renderErrors(&wip);
-    var bundle = try wip.toOwnedBundle("");
-    defer bundle.deinit(init.gpa);
-    try bundle.renderToStderr(init.io, .{}, .auto);
+fn renderErrors(init: std.process.Init, zcu: *Zcu, format: diag.Format) !void {
+    const arena = init.arena.allocator();
+    const paths: diag.Paths = try .init(arena, init.io, zcu.fe.zig_lib_dir);
+    try printDiagnostics(init.io, try zcu.diagnostics(arena, paths), format);
+}
+
+fn printDiagnostics(io: Io, diags: []const diag.Diagnostic, format: diag.Format) !void {
+    var buf: [4096]u8 = undefined;
+    var w = Io.File.stderr().writerStreaming(io, &buf);
+    try diag.render(&w.interface, diags, format);
+    try w.interface.flush();
 }
 
 const DumpSink = struct {
@@ -389,6 +399,9 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
                 root = spec[eq + 1 ..];
                 opts.root_deps = try deps.toOwnedSlice(arena);
             } else try modules.append(arena, .{ .name = spec[0..eq], .path = spec[eq + 1 ..], .deps = try deps.toOwnedSlice(arena) });
+        } else if (std.mem.startsWith(u8, arg, "--error-format=")) {
+            const v = arg["--error-format=".len..];
+            opts.error_format = std.meta.stringToEnum(diag.Format, v) orelse fatal("invalid --error-format '{s}': expected 'text' or 'json'", .{v});
         } else if (std.mem.eql(u8, arg, "--debug-dump-ir")) {
             opts.dump_ir = true;
         } else if (std.mem.eql(u8, arg, "--stack")) {
@@ -449,6 +462,7 @@ test {
     _ = @import("InternPool.zig");
     _ = Zcu;
     _ = @import("Sema.zig");
+    _ = @import("diag.zig");
     _ = Ir;
     _ = Emit;
 }

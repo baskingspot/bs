@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
     const upstream_step = b.step("test-upstream", "Run the run tests with upstream zig, the oracle");
     addRunTests(b, exe, test_step, upstream_step);
     addObjAndRunTests(b, exe, test_step);
+    addDiagTests(b, exe, test_step, upstream_step);
 
     // Always ReleaseFast: a Debug build of zap says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
@@ -211,6 +212,69 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             run.addCheck(.{ .expect_term = if (expect.signal) |sig| .{ .signal = sig } else .{ .exited = expect.exit.? } });
             (if (upstream) upstream_step else test_step).dependOn(&run.step);
         }
+    }
+}
+
+/// Each `test/diag/*.zig` program is a compile error. It ends with a block
+/// of `//` comment lines giving zap's exact standard error:
+///
+///   // error
+///   // args: --error-format=json      (optional: more arguments)
+///   // <expected stderr line>
+///   // ...
+///
+/// `test` runs `zap build-exe -fno-emit-bin <file>` from test/diag and
+/// checks stderr and exit status 1; `test-upstream` checks that upstream
+/// zig rejects the program too.
+fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step) void {
+    const io = b.graph.io;
+    b.dependOnDirectoryContents(b.path("test/diag"));
+    var dir = b.root.openDir(io, "test/diag", .{ .iterate = true }) catch |err|
+        std.debug.panic("unable to open test/diag: {t}", .{err});
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch |err| std.debug.panic("unable to list test/diag: {t}", .{err})) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        const file = b.dupe(entry.name);
+        const src_path = b.fmt("test/diag/{s}", .{file});
+        b.dependOnFileContents(b.path(src_path));
+        const source = dir.readFileAlloc(io, file, b.allocator, .limited(1 << 20)) catch |err|
+            std.debug.panic("unable to read {s}: {t}", .{ src_path, err });
+        const block = std.mem.lastIndexOf(u8, source, "\n// error\n") orelse
+            std.debug.panic("{s}: missing '// error' block", .{src_path});
+        var args: []const u8 = "";
+        var expected: std.ArrayList(u8) = .empty;
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, source[block + "\n// error\n".len ..], "\n"), '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (!std.mem.startsWith(u8, line, "//")) std.debug.panic("{s}: non-comment line after '// error'", .{src_path});
+            const text = if (line.len > 2) line[3..] else "";
+            if (expected.items.len == 0 and std.mem.startsWith(u8, text, "args: ")) {
+                args = text["args: ".len..];
+                continue;
+            }
+            expected.appendSlice(b.allocator, text) catch @panic("OOM");
+            expected.append(b.allocator, '\n') catch @panic("OOM");
+        }
+
+        const run = b.addRunArtifact(zap);
+        run.setName(b.fmt("diag {s}", .{file}));
+        run.setCwd(b.path("test/diag"));
+        run.addArgs(&.{ "build-exe", "-fno-emit-bin", file });
+        var arg_it = std.mem.tokenizeScalar(u8, args, ' ');
+        while (arg_it.next()) |a| run.addArg(a);
+        run.addFileInput(b.path(src_path));
+        run.setEnvironmentVariable("ZAP_CACHE", "off");
+        run.addCheck(.{ .expect_stderr_exact = expected.items });
+        run.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        test_step.dependOn(&run.step);
+
+        const up = b.addSystemCommand(&.{ b.graph.zig_exe, "build-exe", "-fno-emit-bin" });
+        up.setName(b.fmt("diag {s} (upstream rejects)", .{file}));
+        up.addFileArg(b.path(src_path));
+        up.addCheck(.{ .expect_stderr_match = "error: " });
+        up.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        upstream_step.dependOn(&up.step);
     }
 }
 

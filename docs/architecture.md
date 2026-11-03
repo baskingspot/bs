@@ -2976,6 +2976,7 @@ lines, each starting with a keyword:
   candidates: <name>, <name>, ...
   hint: <one line>
   fix[?] <path>:<line>:<col>-<line>:<col>: <replacement text>
+  call: <path>:<line>:<col> inline|comptime, ..., +<n> std
   ref: <fn> <path>:<line>:<col> <- <fn> <path>:<line>:<col> (+<n> std frames)
   in <n> instances: <comptime args of the first ones>
 ```
@@ -2988,8 +2989,9 @@ that may not be what the author meant.
 `{"code", "file", "line", "col", "span": [start, end], "msg", "src",
 "notes": [{"file", "line", "col", "span", "msg", "src"}], "candidates",
 "hint", "fixes": [{"applicability": "exact"|"maybe"|"placeholder",
-"edits": [{"file", "span", "text"}]}], "ref": [{"fn", "file", "line",
-"col"}], "instances"}`. Spans are 0-based byte offsets, end exclusive.
+"edits": [{"file", "span", "text"}]}], "calls": [{"file", "line", "col",
+"kind"}], "ref": [{"fn", "file", "line", "col"}], "instances"}`. `calls`
+lists every frame, the lib directory's included. Spans are 0-based byte offsets, end exclusive.
 Absent fields are omitted, not null. The last line is
 `{"summary": {"errors": n}}`. As with rustc, consumers must
 ignore unknown keys.
@@ -3025,32 +3027,43 @@ ignore unknown keys.
 
 ### The diagnostic record
 
-`Zcu.ErrorMsg` (file, absolute `Ast.Span`, message, notes) becomes a
-richer record. Text, JSON and ErrorBundle are three renderings of it.
+`src/diag.zig` holds the record, the codes, and the text and JSON
+renderers. Sema keeps recording `Zcu.ErrorMsg` (file, absolute
+`Ast.Span`, message, notes), which gains a `code`, and notes gain `call`,
+which marks a call-site frame (`Zcu.addCallFrame`, from `noteCallSite`).
+At the end, `Zcu.diagnostics` resolves every error, AstGen's included
+(`diag.fromBundle`), into the record that is rendered:
 
 ```zig
 pub const Diagnostic = struct {
-    code: Code, // enum(u16); names and `zap explain` texts in src/diag/codes.zig
-    loc: Loc,
+    code: Code = .unclassified, // enum(u16) with kebab-case tag names
+    loc: ?Loc,
     msg: []const u8,
+    count: u32 = 1,
     notes: []const Note = &.{},
-    candidates: []const InternPool.String = &.{},
-    hint: Hint = .none, // index into the migration and pattern table
-    fixes: []const Fix = &.{},
-    instances: u32 = 1,
+    // Later steps: candidates, hint, fixes, instances.
 };
-/// A location relative to its declaration, resolved to line, column and
-/// byte span only when rendered: the declaration's tracked ZIR instruction
-/// and Sema's `Src` offset (a node or token offset from the declaration's
-/// base node), as upstream's LazySrcLoc does. A cached diagnostic stays
-/// correct when an edit above it moves the declaration.
-pub const Loc = struct { file: u32, decl: Zir.Inst.Index, off: Src.Offset };
-pub const Note = struct { loc: ?Loc, msg: []const u8, show_source: bool = false, count: u32 = 1 };
-pub const Fix = struct { applicability: enum { exact, maybe, placeholder }, edits: []const Edit };
-pub const Edit = struct { loc: Loc, text: []const u8 };
+pub const Loc = struct {
+    path: []const u8, // displayed: relative to the cwd, or to the zig lib directory
+    line: u32,
+    col: u32, // 1-based, bytes
+    start: u32,
+    end: u32, // byte span, end exclusive
+    source_line: []const u8,
+    in_lib: bool, // std, builtin, compiler_rt: frames here collapse to a count
+};
+pub const Note = struct { loc: ?Loc, msg: []const u8, count: u32 = 1, call: ?CallKind = null };
+pub const Fix = struct { applicability: enum { exact, maybe, placeholder }, edits: []const Edit }; // step 5
 ```
 
-The reference trace (`ref:`) is not stored in the record. It is computed
+Locations stay absolute spans until rendered. Declaration-relative
+locations would matter only for diagnostics loaded from the cache, and the
+accepted design caches none: a failed unit is always re-analyzed.
+
+The call line (`call:`) collects the comptime and inline call-site frames.
+Frames in the zig lib directory print only as a count, and the line is
+omitted when every frame is in the lib directory. The reference trace
+(`ref:`, step 3) is not stored in the record. It is computed
 when rendering from `Zcu.referenced_by`, which keeps for each unit the
 (unit, `Src`) that referenced it with the smallest unit key, so the
 trace doesn't depend on scheduling. It's written where `queueFuncFrom` and
@@ -3124,11 +3137,11 @@ maps to a code.
   them.
 - **ErrorBundle is not enough** as the record: it has no code, no fixes,
   and only strings for facts, and it bakes absolute line and column in at
-  creation, which cached diagnostics can't use. It stays as the input
-  format for AstGen's errors and as the output for `--listen`
-  (`std.zig.Server`, which `zig build` and the test runner's IPC use). In
-  that output the code becomes a message prefix (`[no-member] ...`), and
-  facts and fixes become notes.
+  creation. It stays as the input format for AstGen's errors, and it
+  becomes the output for `--listen` (`std.zig.Server`, which `zig build`
+  uses) when zap gets that mode with `zig build` integration. In that
+  output the code becomes a message prefix (`[no-member] ...`), and facts
+  and fixes become notes.
 - **No recovery.** A failed function fails its dependents silently, as
   upstream (owner decision). A proposed poison error set for failed
   callees, which would have shown independent errors in one build, is not
@@ -3274,13 +3287,13 @@ user modules (non-generic functions only) was proposed and not adopted.
 
 ### Testing
 
-- **Corpus**: `test/diag/<code>/<case>.zig`, one mistake per file, with
-  the expected text output in a trailing comment block, as upstream's
-  `test/cases` do (`// error` then `// :4:21: error[no-member]: ...` and
-  its detail lines). `zig build test-diag` compiles each case with zap
-  and compares the output exactly. Each case also renders as JSON, which
-  must parse and convert back to the same text. Upstream must reject
-  every case too (the harness checks it when `zig` is on `PATH`).
+- **Corpus**: `test/diag/<case>.zig`, one mistake per file, with zap's
+  exact stderr in a trailing comment block (`// error`, an optional
+  `// args: --error-format=json`, then the expected lines; see
+  `addDiagTests` in build.zig). `zig build test` runs
+  `zap build-exe -fno-emit-bin <case>` from `test/diag` and compares
+  stderr exactly. `zig build test-upstream` checks that upstream rejects
+  every case too.
 - **Fixes round-trip**: applying every `exact` fix must give a program
   that compiles, or that fails with the case's next expected error.
 - **Cache**: the corpus runs twice in one cache directory, the second time
@@ -3301,9 +3314,9 @@ user modules (non-generic functions only) was proposed and not adopted.
 Each step is mergeable on its own and keeps today's errors otherwise
 unchanged:
 
-1. The record and the renderers (text, JSON lines, and ErrorBundle for
-   `--listen`), AstGen code classification, and the token-efficiency
-   rules (paths, collapsed std frames, no carets).
+1. The record and the text and JSON renderers, AstGen code
+   classification, the token-efficiency rules (paths, collapsed std
+   frames, no carets), and the `test/diag` corpus. (Done.)
 2. Codes on Sema's call sites, in batches, coordinated with the Sema
    thread, which owns most of them.
 3. Facts: candidates, declaration sites, user frame first, the reference
