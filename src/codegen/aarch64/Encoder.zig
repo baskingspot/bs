@@ -732,6 +732,15 @@ pub fn movn(e: *Encoder, width: Width, dst: Reg, imm: u16, shift: u6) !void {
     try e.movWide(.movn, width, dst, imm, shift);
 }
 
+/// movz or movk of the link-time value assigned to `sym`, such as an error
+/// code, which must fit 16 bits (movw_value16 relocation).
+pub fn movWideValue(e: *Encoder, op: MovWideOp, width: Width, dst: Reg, sym: SymbolKey, shift: u6) !void {
+    assert(op != .movn);
+    try e.reserve();
+    try e.reloc(.aarch64_movw_value16, sym, 0);
+    try e.movWide(op, width, dst, 0, shift);
+}
+
 /// Loads any constant into `dst` in as few instructions as this encoder
 /// knows: one movz or movn, else one orr of a bitmask immediate, else movz
 /// or movn (whichever leaves fewer halfwords to fix) followed by movks.

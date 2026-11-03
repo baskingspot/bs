@@ -611,8 +611,9 @@ comptime arguments are run-time values in the lowered code (uucode's
   (add, or a load or store whose access size the linker reads from the
   instruction), and their GOT forms, which reach an import's GOT slot and
   are relaxed to the symbol itself when it is defined in the image. aarch64
-  instructions have no 32-bit immediate field, so aarch64 CodeGen loads
-  link-time values from a constant Atom instead of patching code.
+  link-time values that fit 16 bits, such as error codes, go into a `movz`
+  or `movk` imm16 field (`aarch64_movw_value16`, Mach-O only, since zap
+  links its own output); wider ones are loaded from a constant Atom.
 - Atoms contain no InternPool indices. Constants a function needs (string
   literals, anonymous values) become their own Atoms with content-hash symbol
   keys, deduplicated by the linker.
@@ -1021,13 +1022,13 @@ them, and the cheapest is a new relocation kind that writes a link-time
 value into a `movz` imm16 field (zap links its own output, so no external
 linker must understand it), which makes an error compare `movz` + `cmp`
 instead of `adrp` + `ldr` + `cmp`. Decide before aarch64 lowering depends
-on either (relocation kinds are append-only). The Mac thread agrees;
-the kind writes a link-time value into imm16 (bits 5–20) of a `movz`
+on either (relocation kinds are append-only). Decided and built as
+`aarch64_movw_value16` (`Encoder.movWideValue`): the kind writes a link-time value into imm16 (bits 5–20) of a `movz`
 (or a `movk`, with the shift taken from its `hw` field), and the linker
 checks the opcode and that the value fits 16 bits. Error codes are u16,
 so an error compare is `movz w16, #code; cmp wN, w16`, with x16 as the
 in-instruction scratch; a `movk lsl 16` kind can follow if a 32-bit
-link-time value is ever needed in code. The link thread adds the kind.
+link-time value is ever needed in code.
 
 #### Debug info
 

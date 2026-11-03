@@ -167,6 +167,11 @@ pub const Reloc = extern struct {
         /// up to its alignment (ELF R_X86_64_TPOFF32, x86_64 TLS variant
         /// 2). S must be in `.tdata` or `.tbss`.
         x86_64_tpoff32,
+        /// movz or movk: V + A into imm16, checked to fit 16 bits; the
+        /// instruction's hw field shifts it. Only for link-time values, so
+        /// an error compare is `movz w16, #code; cmp wN, w16` instead of a
+        /// load from a constant.
+        aarch64_movw_value16,
     };
 };
 

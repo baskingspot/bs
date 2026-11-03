@@ -1649,6 +1649,12 @@ fn LinkOf(comptime Input: type) type {
                             else => unreachable,
                         }
                     },
+                    .aarch64_movw_value16 => {
+                        // movz or movk, w or x.
+                        if (t.kind != .value or insn & 0x5f800000 != 0x52800000) return invalid;
+                        const v = std.math.cast(u16, @as(i128, t.v) + addend) orelse return error.RelocationOverflow;
+                        std.mem.writeInt(u32, field[0..4], (insn & ~@as(u32, 0xffff << 5)) | (@as(u32, v) << 5), .little);
+                    },
                     .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32 => return invalid,
                 }
             }
@@ -1997,7 +2003,8 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
     try s.cmp(.x, .x11, .r(.x12));
     try s.bcond(.ne, trap);
     try s.ldr(.word, .x0, .at(.x10, 0));
-    try s.cmp(.w, .x0, .{ .imm = 42 });
+    try s.movWideValue(.movz, .w, .x16, exit_code, 0);
+    try s.cmp(.w, .x0, .r(.x16));
     try s.bcond(.ne, trap);
     try s.loadGotAddr(.x16, exit);
     try s.blr(.x16);
@@ -2070,6 +2077,14 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
     try std.testing.expectEqualStrings("other", diag.atom);
     const abs_in_text = [_]Atom{.{ .key = main, .name = "main", .section = .text, .bytes = &@as([8]u8, @splat(0)), .targets = &.{main}, .relocs = &.{.init(0, .aarch64_abs64, 0, 0)} }};
     try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &abs_in_text, .{ .entry = main }));
+    // A movz takes only a link-time value, and only one that fits 16 bits.
+    try std.testing.expectError(error.RelocationOverflow, emit(gpa, io, &atoms, o: {
+        var o = options;
+        o.values = &.{.{ .key = exit_code, .value = 0x10000 }};
+        break :o o;
+    }));
+    const movz_of_addr = [_]Atom{.{ .key = main, .name = "main", .section = .text, .bytes = "\x00\x00\x80\x52", .targets = &.{main}, .relocs = &.{.init(0, .aarch64_movw_value16, 0, 0)} }};
+    try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &movz_of_addr, .{ .entry = main }));
 }
 
 test "links many chunks of atoms and pages of fixups the same way on any number of threads" {
