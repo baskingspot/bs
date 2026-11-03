@@ -78,8 +78,6 @@ branch_count: u32 = 0,
 last_dbg_stmt: ?Ir.Inst.Index = null,
 /// Nesting of runtime inline calls, to fail on unbounded inline recursion.
 inline_depth: u32 = 0,
-/// Anonymous types this unit has created so far, for their stable keys.
-anon_types: u32 = 0,
 
 pub const CompileError = error{
     /// A compile error was reported to the Zcu.
@@ -159,9 +157,7 @@ pub const Block = struct {
         /// Comptime arguments (`none` for runtime ones), for naming types
         /// the call returns.
         args: []const Index,
-        /// Anonymous types created by this call so far.
-        anon_types: u32 = 0,
-        /// A runtime call of an inline function: returns break to this
+                /// A runtime call of an inline function: returns break to this
         /// block. Null for comptime calls.
         merges: ?*Merges = null,
     };
@@ -3816,7 +3812,7 @@ fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.
             .decl_ref => |name| try sema.intern(.{ .nav_capture = .{ .nav = try sema.lookupName(block, src, sema.zirString(name)), .by_ref = true } }),
         };
     }
-    const name = try sema.typeName(block, name_strategy, inst, kind);
+    const name = try sema.typeName(block, name_strategy, inst, kind, captures);
     const ty = try sema.zcu.createContainerType(kind, sema.file, inst, captures, name.display, name.key, block.namespace, null);
     return .fromInterned(ty);
 }
@@ -3829,7 +3825,7 @@ const TypeName = struct {
 };
 
 /// The names of a new type, following `strategy`.
-fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Zir.Inst.Index, kind: Zcu.ContainerKind) Allocator.Error!TypeName {
+fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Zir.Inst.Index, kind: Zcu.ContainerKind, captures: []const Index) Allocator.Error!TypeName {
     const ip = sema.ip;
     switch (strategy) {
         .parent => if (sema.owner_nav != .none and block.inlining == null) {
@@ -3849,7 +3845,7 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
                 (if (ip.isType(arg)) print.printType(ip, arg, w) else print.printValue(ip, arg, w)) catch return error.OutOfMemory;
             }
             w.writeAll(")") catch return error.OutOfMemory;
-            return .{ .display = aw.written(), .key = try sema.inliningKey(inlining) };
+            return .{ .display = aw.written(), .key = try sema.anonTypeKey(block, inst, captures) };
         },
         .anon, .dbg_var => {},
     }
@@ -3877,16 +3873,48 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
         try std.fmt.allocPrint(sema.arena, "{s}.{s}", .{ parent, n })
     else
         try std.fmt.allocPrint(sema.arena, "{s}__{t}_{d}", .{ parent, kind, @backingInt(inst) });
-    // Keyed by the creating unit (or comptime call) and an ordinal.
-    const prefix, const counter = if (block.inlining) |inlining|
-        .{ try sema.inliningKey(inlining), &inlining.anon_types }
-    else blk: {
-        var aw: std.Io.Writer.Allocating = .init(sema.arena);
-        sema.zcu.unitKey(sema.owner, &aw.writer) catch return error.OutOfMemory;
-        break :blk .{ aw.written(), &sema.anon_types };
+    return .{ .display = display, .key = try sema.anonTypeKey(block, inst, captures) };
+}
+
+/// The stable key of an anonymous container type made by ZIR instruction
+/// `inst` with `captures`: the key of the declaration whose code holds
+/// `inst`, the offset of `inst` from that declaration, and the stable
+/// hashes of the captures. A type's identity is its ZIR instruction and
+/// captures, as upstream (`InternPool` compares them), so its key is a
+/// function of exactly those: not of the arguments of the comptime call
+/// that made it, nor of how many types its unit made before. It must
+/// still tell distinct types apart, since their declarations' keys
+/// extend it.
+fn anonTypeKey(sema: *Sema, block: *Block, inst: Zir.Inst.Index, captures: []const Index) Allocator.Error![]const u8 {
+    const ip = sema.ip;
+    var aw: std.Io.Writer.Allocating = .init(sema.arena);
+    const w = &aw.writer;
+    const nav: InternPool.NavIndex = if (block.inlining) |inlining|
+        ip.indexToKey(inlining.func).func.owner_nav
+    else if (sema.func != .none)
+        ip.indexToKey(sema.func).func.owner_nav
+    else
+        sema.owner_nav;
+    const base: Zir.Inst.Index = if (nav != .none) blk: {
+        const n = ip.getNav(nav);
+        w.writeAll(ip.stringSlice(n.key)) catch return error.OutOfMemory;
+        break :blk n.zir_inst;
+    } else blk: {
+        // A `comptime` block, or a container's field types and defaults.
+        sema.zcu.unitKey(sema.owner, w) catch return error.OutOfMemory;
+        break :blk switch (sema.owner) {
+            .comptime_decl => |c| c.inst,
+            .type_layout => |ty| ip.containerType(ty).?.zir_inst,
+            else => unreachable,
+        };
     };
-    defer counter.* += 1;
-    return .{ .display = display, .key = try std.fmt.allocPrint(sema.arena, "{s}#anon{d}", .{ prefix, counter.* }) };
+    w.print("#{d}(", .{@as(i64, @backingInt(inst)) - @backingInt(base)}) catch return error.OutOfMemory;
+    for (captures, 0..) |c, i| {
+        if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
+        if (c != .none) w.print("{x}", .{ip.stableHash(c)}) catch return error.OutOfMemory;
+    }
+    w.writeAll(")") catch return error.OutOfMemory;
+    return aw.written();
 }
 
 /// Stable key of a comptime call: the callee's key and the stable hashes of
@@ -7528,7 +7556,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
             for (values[0..i]) |prev| if (prev == v) return sema.fail(block, src, "enum tag value {f} already taken", .{sema.fmtValue(v)});
         }
         const captures = [_]Index{ tag_ty, mode, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = tag_ty } }), .storage = .{ .elems = values } } }) };
-        const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind);
+        const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, &captures);
         const ty = try sema.zcu.createContainerType(kind, sema.file, inst, &captures, name.display, name.key, block.namespace, .auto);
         const info = ip.structInfo(ty);
         if (info.status == .none) {
@@ -7574,7 +7602,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     var captures: std.ArrayList(Index) = .empty;
     try captures.appendSlice(sema.arena, &.{ layout_val, arg_ty, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = .type_type } }), .storage = .{ .elems = types } } }) });
     try captures.appendSlice(sema.arena, defaults);
-    const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind);
+    const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, captures.items);
     const ty = try sema.zcu.createContainerType(kind, sema.file, inst, captures.items, name.display, name.key, block.namespace, layout);
     const info = ip.structInfo(ty);
     if (info.status == .none) {

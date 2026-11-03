@@ -400,7 +400,8 @@ pub const ContainerType = struct {
     name: String,
     /// Stable key, used for the stable hash and the `type_layout` unit key.
     /// The fully qualified name for declared types; for anonymous types the
-    /// enclosing unit's key plus an ordinal (see docs/architecture.md).
+    /// enclosing declaration's key, the relative ZIR offset, and the
+    /// captures' stable hashes (see docs/architecture.md).
     key: String,
     info: ContainerInfoIndex,
 };
