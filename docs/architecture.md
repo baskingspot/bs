@@ -985,7 +985,10 @@ it and can flush every CPU's TLB.
   once per inode. Past it, the least recently used go, down to three
   quarters: store packs by mtime in `commit`'s maintenance, compilation
   directories by their lock's mtime in `cache.maintainCompilations`,
-  skipping those a build holds. A store pack that a compilation directory
+  skipping those a build holds. Store packs that this zap cannot read
+  (another zap's pack format, or damaged) count and go by mtime like the
+  rest, but are not deleted for being unreadable: two zap versions can
+  share a store. A store pack that a compilation directory
   links keeps its space until the directory goes, which is why the local
   limit counts the links. The local scan runs after a build that started
   a directory (that is how the local cache grows) and otherwise at most

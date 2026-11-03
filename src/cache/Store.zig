@@ -56,6 +56,9 @@ opened: Io.Timestamp,
 forward: std.ArrayList(Forward) = .empty,
 /// `commit` evicts the least recently used packs while they total more.
 max_bytes: u64 = cache.default_max_bytes,
+/// The size of the packs `open` found but could not read: another zap's
+/// format, or damaged. They count toward `max_bytes` too.
+other_bytes: u64 = 0,
 forward_mutex: Io.Mutex = .init,
 /// The id of the pack the next `commit` writes, if `reserveName` chose it.
 next_id: ?Hash = null,
@@ -192,11 +195,24 @@ fn nameOf(id: Hash) PackName {
 pub fn open(gpa: Allocator, io: Io, global_cache: Io.Dir) !Store {
     const dir = try global_cache.createDirPathOpen(io, "zap/store", .{ .open_options = .{ .iterate = true } });
     errdefer dir.close(io);
-    return .{ .dir = dir, .packs = try loadPacks(gpa, io, dir), .opened = Io.Clock.real.now(io) };
+    var others: std.ArrayList(OtherPack) = .empty;
+    defer others.deinit(gpa);
+    const packs = try loadPacks(gpa, io, dir, &others);
+    var other_bytes: u64 = 0;
+    for (others.items) |o| other_bytes += o.size;
+    return .{ .dir = dir, .packs = packs, .opened = Io.Clock.real.now(io), .other_bytes = other_bytes };
 }
 
-/// Maps the packs in `dir`, newest first.
-fn loadPacks(gpa: Allocator, io: Io, dir: Io.Dir) ![]PackFile {
+/// A pack that `openPack` cannot read: written by a zap whose pack format
+/// differs (which may still use it), or damaged. Maintenance counts it
+/// toward the size limit and deletes it by its mtime, as any other pack,
+/// but never because it is unreadable, so that two zap versions sharing
+/// a store do not delete each other's packs.
+const OtherPack = struct { name: [32 + pack_ext.len]u8, size: u64, mtime: Io.Timestamp };
+
+/// Maps the packs in `dir`, newest first, and appends those it cannot
+/// read to `others`.
+fn loadPacks(gpa: Allocator, io: Io, dir: Io.Dir, others: *std.ArrayList(OtherPack)) ![]PackFile {
     var packs: std.ArrayList(PackFile) = .empty;
     errdefer {
         for (packs.items) |*p| p.map.destroy(io);
@@ -206,7 +222,11 @@ fn loadPacks(gpa: Allocator, io: Io, dir: Io.Dir) ![]PackFile {
     while (try it.next(io)) |e| {
         if (e.kind != .file or e.name.len != 32 + pack_ext.len or !std.mem.endsWith(u8, e.name, pack_ext)) continue;
         try packs.ensureUnusedCapacity(gpa, 1);
-        if (try openPack(io, dir, e.name)) |p| packs.appendAssumeCapacity(p);
+        if (try openPack(io, dir, e.name)) |p| {
+            packs.appendAssumeCapacity(p);
+        } else if (dir.statFile(io, e.name, .{})) |stat| {
+            try others.append(gpa, .{ .name = e.name[0 .. 32 + pack_ext.len].*, .size = stat.size, .mtime = stat.mtime });
+        } else |_| {}
     }
     std.mem.sortUnstable(PackFile, packs.items, {}, struct {
         fn newer(_: void, a: PackFile, b: PackFile) bool {
@@ -716,7 +736,7 @@ fn maintainIfDue(store: *const Store, gpa: Allocator, io: Io, new_bytes: u64) vo
         stat.mtime.durationTo(now).toNanoseconds() >= trim_interval_ns
     else |_|
         true;
-    var bytes = new_bytes;
+    var bytes = new_bytes + store.other_bytes;
     for (store.packs) |*p| bytes += p.size;
     const n_packs = store.packs.len + @intFromBool(new_bytes != 0);
     if (!trim_due and n_packs <= max_packs and bytes <= store.max_bytes) return;
@@ -742,45 +762,61 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
     if (!try lock_file.tryLock(io, .exclusive)) return .{};
     var result: MaintainResult = .{};
     // Packs written since this build opened the store count too.
-    const packs = try loadPacks(gpa, io, dir);
+    var others: std.ArrayList(OtherPack) = .empty;
+    defer others.deinit(gpa);
+    const packs = try loadPacks(gpa, io, dir, &others);
     defer {
         for (packs) |*p| p.map.destroy(io);
         gpa.free(packs);
     }
+    // Every pack, readable (`live`) or not (`OtherPack`), as candidates
+    // for deletion.
+    const Candidate = struct { name: []const u8, size: u64, mtime: Io.Timestamp, order: i64, live: ?*const PackFile };
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer candidates.deinit(gpa);
     var live: std.ArrayList(*const PackFile) = .empty;
     defer live.deinit(gpa);
-    for (packs) |*p| {
-        if (options.trim and p.mtime.durationTo(options.now).toNanoseconds() > max_unused_ns) {
-            dir.deleteFile(io, &p.name) catch {};
+    for (packs) |*p| try candidates.append(gpa, .{ .name = &p.name, .size = p.size, .mtime = p.mtime, .order = p.order, .live = p });
+    for (others.items) |*o| try candidates.append(gpa, .{ .name = &o.name, .size = o.size, .mtime = o.mtime, .order = std.math.minInt(i64), .live = null });
+    var total: u64 = 0;
+    var n_kept: usize = 0;
+    for (candidates.items) |c| {
+        if (options.trim and c.mtime.durationTo(options.now).toNanoseconds() > max_unused_ns) {
+            dir.deleteFile(io, c.name) catch {};
             result.deleted += 1;
-        } else try live.append(gpa, p);
+            continue;
+        }
+        candidates.items[n_kept] = c;
+        n_kept += 1;
+        total += c.size;
     }
+    candidates.shrinkRetainingCapacity(n_kept);
     if (options.trim) try dir.writeFile(io, .{ .sub_path = "trim", .data = "" });
 
-    var total: u64 = 0;
-    for (live.items) |p| total += p.size;
     if (total > options.max_bytes) {
         // Least recently used first. The space of a pack that a
         // compilation directory links stays in use until that directory
         // drops it (`cache.maintainCompilations`).
-        const by_use = try gpa.dupe(*const PackFile, live.items);
-        defer gpa.free(by_use);
-        std.mem.sortUnstable(*const PackFile, by_use, {}, struct {
-            fn older(_: void, a: *const PackFile, b: *const PackFile) bool {
+        std.mem.sortUnstable(Candidate, candidates.items, {}, struct {
+            fn older(_: void, a: Candidate, b: Candidate) bool {
                 return a.mtime.compare(.lt, b.mtime) or (a.mtime.compare(.eq, b.mtime) and a.order < b.order);
             }
         }.older);
         const target = options.max_bytes - options.max_bytes / 4;
-        for (by_use) |p| {
+        for (candidates.items) |*c| {
             if (total <= target) break;
-            dir.deleteFile(io, &p.name) catch continue;
-            total -= p.size;
+            dir.deleteFile(io, c.name) catch continue;
+            total -= c.size;
             result.evicted += 1;
-            for (live.items, 0..) |q, i| if (q == p) {
-                _ = live.orderedRemove(i);
-                break;
-            };
+            c.live = null;
         }
+    }
+    // Newest first, as `packs` is.
+    for (packs) |*p| {
+        for (candidates.items) |c| if (c.live == p) {
+            try live.append(gpa, p);
+            break;
+        };
     }
     if (live.items.len <= max_packs) return result;
 
@@ -1013,9 +1049,30 @@ test "merges leave large packs alone, and the size limit evicts the least recent
     const r = try maintain(gpa, io, store_dir, .{ .trim = false, .now = now, .max_bytes = 64 << 10 });
     try t.expectEqual(1, r.evicted);
     try t.expectError(error.FileNotFound, store_dir.statFile(io, &big_name, .{}));
+    {
+        var store: Store = try .open(gpa, io, tmp.dir);
+        defer store.close(gpa, io);
+        try t.expectEqual(null, try store.get(gpa, io, 5));
+        try t.expectEqual(0, (try store.get(gpa, io, 100)).?.resultHash());
+    }
+    // A pack in another format stays while it fits, and counts toward the
+    // limit like any other.
+    const other_name = "ffffffffffffffffffffffffffffffff" ++ pack_ext;
+    const other_bytes = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(other_bytes);
+    @memset(other_bytes, 'Z');
+    try store_dir.writeFile(io, .{ .sub_path = other_name, .data = other_bytes });
+    try store_dir.setTimestamps(io, other_name, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-std.time.ns_per_hour)) } });
+    {
+        var store: Store = try .open(gpa, io, tmp.dir);
+        defer store.close(gpa, io);
+        try t.expectEqual(1 << 20, store.other_bytes);
+    }
+    try t.expectEqual(0, (try maintain(gpa, io, store_dir, .{ .trim = false, .now = now, .max_bytes = 2 << 20 })).evicted);
+    try t.expectEqual(1, (try maintain(gpa, io, store_dir, .{ .trim = false, .now = now, .max_bytes = 1 << 20 })).evicted);
+    try t.expectError(error.FileNotFound, store_dir.statFile(io, other_name, .{}));
     var store: Store = try .open(gpa, io, tmp.dir);
     defer store.close(gpa, io);
-    try t.expectEqual(null, try store.get(gpa, io, 5));
     try t.expectEqual(0, (try store.get(gpa, io, 100)).?.resultHash());
 }
 
