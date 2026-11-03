@@ -254,8 +254,13 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   ad-hoc code signature. The Mach-O linker (`src/link/MachO.zig`) has the
   same phases as the ELF linker and shares its thread pool, symbol table,
   and output buffers.
-- The ELF linker (`src/link/Elf.zig`) builds the whole file in one buffer:
-  for `link`, a shared mapping of the output file. The old output is
+- The ELF linker (`src/link/Elf.zig`) writes every byte of the output once:
+  into one buffer (for `emit`, memory; for `link`, a shared mapping of the
+  output file), or for `link`, with pwrite: each copy task builds its
+  file-contiguous parts (its chunk's run of each section with the padding
+  before it, its symbols, their names; a debug chunk's .debug_info,
+  .debug_line, FDE, and search-table runs) in a buffer of its thread's and
+  writes each with one pwrite. The old output is
   overwritten in place when it is a regular executable with one link, not
   running (Linux refuses to open a running executable for writing), and at
   least 7/8 in the page cache (mincore), resizing with ftruncate but never
@@ -264,7 +269,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   inode. Reuse skips allocating and zeroing every page cache page again:
   on the orb, writing 38 MiB into a new file takes 31 ms, in place 11–15
   ms, into fresh anonymous memory 10 ms. Mach-O keeps replacing, since
-  macOS kills signed binaries modified in place. Segments: R (headers,
+  macOS kills signed binaries modified in place. `link` writes through
+  the mapping when overwriting in place, and with pwrite into a new file on
+  fewer than 4 threads (see the numbers below). Segments: R (headers,
   .rodata, and with debug info .eh_frame and .eh_frame_hdr), RX (.text),
   RW (.tdata, .tbss, .data, .bss). Thread-locals start RW, covered by
   PT_TLS (filesz the .tdata bytes, memsz through .tbss, align the larger
@@ -339,6 +346,29 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   key-based path, the numbered code costs that path 0.5% more instructions
   under callgrind (312.1M → 313.7M for three stripped emits), from code
   layout; wall-clock time does not show it.
+- Writing the file through the mapping or with pwrite (2026-11-03, same
+  session, best of 15, ms; `Options.file_writes` forces either). Through
+  the mapping, each page costs a fault and page_mkwrite, a new file's
+  pages are zeroed first, and munmap tears the mapping down. pwrite skips
+  the faults and the zeroing (whole pages are written) but copies every
+  byte once more, from the thread's buffer, and ext4 holds the inode lock
+  for each write, so threads' writes do not overlap (on 4 threads, perf
+  shows a fifth of the CPU spinning on it). Both mark every page dirty,
+  which neither avoids.
+
+  | map / pwrite, random targets | in place, 1 thread | in place, 4 threads | new file, 1 thread | 2 threads | 4 threads |
+  |---|---|---|---|---|---|
+  | keys, debug | 54.7 / 52.5 | 26.6 / 26.2 | 71.3 / 62.3 | 54.7 / 43.4 | 38.2 / 38.2 |
+  | numbered, scattered, debug | 43.7 / 42.2 | 21.8 / 22.6 | 62.4 / 49.9 | 45.3 / 38.3 | 34.8 / 34.4 |
+  | numbered, packed, debug | 32.2 / 31.6 | 18.2 / 19.6 | 47.9 / 39.4 | | 27.8 / 29.3 |
+
+  (The 2-thread column is a separate run with the process limited to 2
+  CPUs.) Mixed targets give the same picture. So in place, the common
+  case of an edit-rebuild, the two tie on 1 thread and the mapping wins
+  on 4; into a new file (first build, a running or uncached old output),
+  pwrite wins by 15–20% on 1 and 2 threads and they tie on 4, where the
+  inode lock caps pwrite as threads grow. `auto` picks accordingly. A
+  small program links on 1 thread (fewer than 2048 atoms is one chunk).
 - Debug info (`src/link/Dwarf.zig`, shared with the Mach-O linker later) is
   DWARF 5 with one compile unit for the whole output: .debug_abbrev, a
   .debug_info subprogram entry per function with `debug` (name, low_pc,

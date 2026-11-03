@@ -71,6 +71,18 @@ pub const Options = struct {
     /// looks up no keys. When set, `entry` is used only in diagnostics and
     /// `values` not at all.
     symbols: ?Symbols = null,
+    /// How `link` writes the file; for tests and benchmarks.
+    file_writes: FileWrites = .auto,
+};
+
+pub const FileWrites = enum {
+    /// Whichever is faster in the case at hand.
+    auto,
+    /// Through a shared mapping of the file.
+    map,
+    /// With pwrite: each task builds its contiguous parts of the file in a
+    /// buffer of its thread's and writes them.
+    pwrite,
 };
 
 pub const Value = struct { key: SymbolKey, value: u64 };
@@ -131,15 +143,28 @@ pub const Error = Allocator.Error || std.Io.Cancelable || error{
     /// `Options.symbols` does not fit the atoms: wrong lengths, or a
     /// number out of range.
     InvalidSymbols,
+    /// Writing the output file failed, for example because the disk is
+    /// full.
+    WriteFailed,
 };
 
-/// Links `atoms` and writes the executable to `sub_path` in `dir`. The
-/// output is built directly in a shared mapping of the file, so its bytes
-/// are written once, into the page cache. The previous output is
-/// overwritten in place when that is safe (see `ReusedOutput`), which
-/// saves the kernel allocating and zeroing every page again.
+/// Where `build` puts the output: a buffer holding all of it (in memory, or
+/// a mapping of the file), or a file it writes with pwrite, one contiguous
+/// range at a time.
+const Target = union(enum) {
+    memory: []u8,
+    file: std.posix.fd_t,
+};
+
+/// Links `atoms` and writes the executable to `sub_path` in `dir`, each
+/// byte once, into the page cache: built directly in a shared mapping of
+/// the file, or built in a buffer per thread, one contiguous range of the
+/// file at a time, and written with pwrite (see `ReusedOutput.target`). The
+/// previous output is overwritten in place when that is safe (see
+/// `ReusedOutput`), which saves the kernel allocating and zeroing every
+/// page again.
 pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, atoms: []const Atom, options: Options) !void {
-    var out: ReusedOutput = .{ .dir = dir, .sub_path = sub_path };
+    var out: ReusedOutput = .{ .dir = dir, .sub_path = sub_path, .writes = options.file_writes };
     defer out.close(io);
     errdefer dir.deleteFile(io, sub_path) catch {};
     try build(gpa, io, atoms, options, &out);
@@ -155,41 +180,54 @@ pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, a
 const ReusedOutput = struct {
     dir: std.Io.Dir,
     sub_path: []const u8,
+    writes: FileWrites,
     file: ?std.Io.File = null,
     map: []align(std.heap.page_size_min) u8 = &.{},
 
-    pub fn buffer(o: *ReusedOutput, io: std.Io, len: usize) ![]u8 {
-        if (builtin.os.tag == .linux) if (o.reuse(io, len)) |map| {
-            o.map = map;
-            return map;
+    fn target(o: *ReusedOutput, io: std.Io, len: usize, threads: usize) !Target {
+        const in_place = builtin.os.tag == .linux and o.reuse(io, len);
+        if (!in_place) {
+            o.dir.deleteFile(io, o.sub_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => |e| return e,
+            };
+            o.file = try o.dir.createFile(io, o.sub_path, .{ .read = true, .permissions = .executable_file });
+            try o.file.?.setLength(io, len);
+        }
+        // Writing through the mapping pays a fault and page_mkwrite per
+        // page, and zeroing each new page of a new file first. pwrite pays
+        // one more copy, from the thread's buffer, and ext4 takes the inode
+        // lock for each write, so threads' writes do not overlap. Both mark
+        // every page dirty. Measured (docs/architecture.md): in place they
+        // tie on 1 thread and the mapping wins on 4; into a new file pwrite
+        // wins on 1 and 2 threads and they tie on 4.
+        const writes: FileWrites = switch (o.writes) {
+            .auto => if (!in_place and threads < 4) .pwrite else .map,
+            else => |w| w,
         };
-        o.dir.deleteFile(io, o.sub_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => |e| return e,
-        };
-        o.file = try o.dir.createFile(io, o.sub_path, .{ .read = true, .permissions = .executable_file });
-        try o.file.?.setLength(io, len);
+        if (writes == .pwrite) return .{ .file = o.file.?.handle };
         o.map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, o.file.?.handle, 0);
-        return o.map;
+        return .{ .memory = o.map };
     }
 
-    fn reuse(o: *ReusedOutput, io: std.Io, len: usize) ?[]align(std.heap.page_size_min) u8 {
-        const file = o.dir.openFile(io, o.sub_path, .{ .mode = .read_write, .follow_symlinks = false }) catch return null;
+    fn reuse(o: *ReusedOutput, io: std.Io, len: usize) bool {
+        const file = o.dir.openFile(io, o.sub_path, .{ .mode = .read_write, .follow_symlinks = false }) catch return false;
         const st = file.stat(io) catch return closed(io, file);
         if (st.kind != .file or st.nlink != 1 or @backingInt(st.permissions) & 0o111 == 0) return closed(io, file);
         file.setLength(io, len) catch return closed(io, file);
-        const map = std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, file.handle, 0) catch return closed(io, file);
-        if (!mostlyCached(map[0..std.mem.alignBackward(usize, @min(len, st.size), std.heap.page_size_min)])) {
-            std.posix.munmap(map);
-            return closed(io, file);
+        const old_len = std.mem.alignBackward(usize, @min(len, st.size), std.heap.page_size_min);
+        if (old_len > 0) {
+            const map = std.posix.mmap(null, old_len, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0) catch return closed(io, file);
+            defer std.posix.munmap(map);
+            if (!mostlyCached(map)) return closed(io, file);
         }
         o.file = file;
-        return map;
+        return true;
     }
 
-    fn closed(io: std.Io, file: std.Io.File) ?[]align(std.heap.page_size_min) u8 {
+    fn closed(io: std.Io, file: std.Io.File) bool {
         file.close(io);
-        return null;
+        return false;
     }
 
     /// Whether at least 7/8 of the pages of `map` are in the page cache.
@@ -227,6 +265,10 @@ pub const MemoryOutput = struct {
     pub fn buffer(o: *MemoryOutput, _: std.Io, len: usize) Error![]u8 {
         o.buf = try o.gpa.alloc(u8, len);
         return o.buf;
+    }
+
+    fn target(o: *MemoryOutput, io: std.Io, len: usize, _: usize) Error!Target {
+        return .{ .memory = try o.buffer(io, len) };
     }
 };
 
@@ -296,7 +338,7 @@ fn shName(comptime name: []const u8) u32 {
     return comptime @intCast(std.mem.indexOf(u8, shstrtab, "\x00" ++ name ++ "\x00").? + 1);
 }
 
-/// Links `atoms` into the buffer `out.buffer(io, len)` returns.
+/// Links `atoms` into `out.target(io, len, threads)`.
 ///
 /// Work is split three ways, each spread over threads; the output does not
 /// depend on the thread count:
@@ -519,45 +561,64 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const shstr = if (has_tls) shstrtab else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
     const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + 2 * @as(u16, @intFromBool(has_cfi)) + 4 * @as(u16, @intFromBool(has_debug));
-    const buf = try out.buffer(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
-    l.buf = buf;
-    adviseHugePages(buf);
-    try parallel(io, n_threads, std.math.divCeil(usize, buf.len, populate_len) catch unreachable, &l, Link.populateOutput);
+    l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr), n_threads);
+    switch (l.target) {
+        .memory => |buf| {
+            adviseHugePages(buf);
+            try parallel(io, n_threads, std.math.divCeil(usize, buf.len, populate_len) catch unreachable, &l, Link.populateOutput);
+        },
+        .file => {
+            // Room for the largest task's parts of the output.
+            for (chunks) |*c| {
+                var len: u64 = @as(u64, c.n_syms) * @sizeOf(elf.Elf64.Sym) + c.str_len;
+                for (c.lead_gaps, c.sizes, zero_fill) |gap, size, no_bytes| {
+                    if (!no_bytes) len += gap + size;
+                }
+                l.scratch_len = @max(l.scratch_len, len);
+            }
+            for (debug_chunks) |*c| {
+                const fde_len = @as(u64, c.n_fdes) * (Dwarf.fde_size + Dwarf.eh_frame_hdr_entry_size);
+                l.scratch_len = @max(l.scratch_len, c.info_len + c.line_len + fde_len);
+            }
+            l.scratch = try gpa.alloc(u8, n_threads * l.scratch_len);
+        },
+    }
+    defer gpa.free(l.scratch);
 
     // Padding between sections; padding within a section is filled by the
     // atom or chunk after it.
-    @memset(buf[headers_end..starts[rodata]], 0);
-    @memset(buf[rodata_end..eh_off], 0);
-    @memset(buf[r_end..starts[text]], 0);
-    @memset(buf[text_end..tls_start], 0);
+    try l.fill(headers_end, starts[rodata] - headers_end);
+    try l.fill(rodata_end, eh_off - rodata_end);
+    try l.fill(r_end, starts[text] - r_end);
+    try l.fill(text_end, tls_start - text_end);
     // .tbss's room in the file is zeros.
-    @memset(buf[tdata_end..starts[data]], 0);
-    @memset(buf[str_off + str_size .. symtab_off], 0);
-    @memset(buf[symtab_off..][0..@sizeOf(elf.Elf64.Sym)], 0);
-    buf[strtab_off] = 0;
-    @memcpy(buf[shstrtab_off..][0..shstr.len], shstr);
-    @memset(buf[shstrtab_off + shstr.len .. shoff], 0);
+    try l.fill(tdata_end, starts[data] - tdata_end);
+    try l.fill(str_off + str_size, symtab_off - (str_off + str_size));
+    try l.fill(symtab_off, @sizeOf(elf.Elf64.Sym));
+    try l.fill(strtab_off, 1);
+    try l.put(shstrtab_off, shstr);
+    try l.fill(shstrtab_off + shstr.len, shoff - (shstrtab_off + shstr.len));
     const eh_size = Dwarf.cie.len + @as(u64, n_fdes) * Dwarf.fde_size + 4;
     const hdr_size = Dwarf.eh_frame_hdr_size + @as(u64, n_fdes) * Dwarf.eh_frame_hdr_entry_size;
     if (has_cfi) {
         // The FDEs and the search table are written with the debug chunks.
-        @memcpy(buf[eh_off..][0..Dwarf.cie.len], &Dwarf.cie);
-        @memset(buf[eh_off + eh_size - 4 .. hdr_off], 0); // terminator, unused room
+        try l.put(eh_off, &Dwarf.cie);
+        try l.fill(eh_off + eh_size - 4, hdr_off - (eh_off + eh_size - 4)); // terminator, unused room
         const eh_frame_rel: i32 = @intCast(@as(i64, @intCast(eh_off)) - @as(i64, @intCast(hdr_off + 4)));
-        buf[hdr_off..][0..Dwarf.eh_frame_hdr_size].* = Dwarf.ehFrameHdr(eh_frame_rel, n_fdes);
-        @memset(buf[hdr_off + hdr_size .. r_end], 0);
+        try l.put(hdr_off, &Dwarf.ehFrameHdr(eh_frame_rel, n_fdes));
+        try l.fill(hdr_off + hdr_size, r_end - (hdr_off + hdr_size));
     }
     if (has_debug) {
         // Debug info covers all of .text, so atoms without `debug` resolve to
         // the compile unit but to no function or line.
         const text_addr = base + starts[text];
-        @memcpy(buf[abbrev_off..][0..Dwarf.abbrev.len], &Dwarf.abbrev);
+        try l.put(abbrev_off, &Dwarf.abbrev);
         dwarf.finishInfoHeader(info_size, text_addr, sizes[text]);
-        @memcpy(buf[info_off..][0..dwarf.info_header.len], dwarf.info_header);
-        buf[info_off + info_size - 1] = 0; // end of the unit's children
+        try l.put(info_off, dwarf.info_header);
+        try l.fill(info_off + info_size - 1, 1); // end of the unit's children
         dwarf.finishLineHeader(line_size);
-        @memcpy(buf[line_off..][0..dwarf.line_header.len], dwarf.line_header);
-        @memcpy(buf[str_off..][0..str_size], Dwarf.str);
+        try l.put(line_off, dwarf.line_header);
+        try l.put(str_off, Dwarf.str);
     }
 
     const resolved = try gpa.alloc(u64, n_threads * max_targets);
@@ -575,7 +636,8 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     try l.check(diag);
 
     // Headers.
-    writeStruct(buf, elf.Elf64.Ehdr{
+    var head: [@sizeOf(elf.Elf64.Ehdr) + 6 * @sizeOf(elf.Elf64.Phdr)]u8 = undefined;
+    writeStruct(&head, elf.Elf64.Ehdr{
         .ident = .{ .class = .@"64", .data = .@"2LSB", .version = 1, .osabi = .NONE, .abiversion = 0 },
         .type = .EXEC,
         .machine = .X86_64,
@@ -599,7 +661,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         .{ has_tls, .TLS, .{ .R = true }, tls_start, sizes[tdata], tls_end - tls_start, tls_align.toByteUnits() },
     };
     for (phdrs) |p| if (p[0]) {
-        writeStruct(buf[ph_off..], elf.Elf64.Phdr{
+        writeStruct(head[ph_off..], elf.Elf64.Phdr{
             .type = p[1],
             .flags = p[2],
             .offset = p[3],
@@ -612,7 +674,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         ph_off += @sizeOf(elf.Elf64.Phdr);
     };
     if (has_cfi) {
-        writeStruct(buf[ph_off..], elf.Elf64.Phdr{
+        writeStruct(head[ph_off..], elf.Elf64.Phdr{
             .type = .GNU_EH_FRAME,
             .flags = .{ .R = true },
             .offset = hdr_off,
@@ -624,7 +686,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         });
         ph_off += @sizeOf(elf.Elf64.Phdr);
     }
-    writeStruct(buf[ph_off..], elf.Elf64.Phdr{
+    writeStruct(head[ph_off..], elf.Elf64.Phdr{
         .type = .GNU_STACK,
         .flags = .{ .R = true, .W = true },
         .offset = 0,
@@ -634,6 +696,9 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         .memsz = 0,
         .@"align" = 16,
     });
+    ph_off += @sizeOf(elf.Elf64.Phdr);
+    std.debug.assert(ph_off == headers_end);
+    try l.put(0, head[0..headers_end]);
 
     const cfi_shdrs = [_]elf.Elf64.Shdr{
         shdr(shName(".eh_frame"), .X86_64_UNWIND, .{ .ALLOC = true }, base, eh_off, eh_size, .@"8"),
@@ -662,7 +727,8 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         nonAlloc(shName(".strtab"), .STRTAB, strtab_off, strtab_len),
         nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
-    var sh_at = shoff;
+    var sh_buf: [shdrs.len * @sizeOf(elf.Elf64.Shdr)]u8 = undefined;
+    var sh_at: usize = 0;
     const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ true, 2 }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ true, 3 } };
     var group: usize = 0;
     var group_end: usize = present[0][1];
@@ -672,9 +738,11 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
             group_end += present[group][1];
         }
         if (!present[group][0]) continue;
-        writeStruct(buf[sh_at..], s);
+        writeStruct(sh_buf[sh_at..], s);
         sh_at += @sizeOf(elf.Elf64.Shdr);
     }
+    std.debug.assert(sh_at == shnum * @sizeOf(elf.Elf64.Shdr));
+    try l.put(shoff, sh_buf[0..sh_at]);
 }
 
 /// One `chunk_len` run of consecutive atoms.
@@ -744,7 +812,11 @@ const Link = struct {
     failures: []?Failure,
     // Set before `copy`.
     values: *const SymbolTable = undefined,
-    buf: []u8 = undefined,
+    target: Target = undefined,
+    /// With a `.file` target, `scratch_len` bytes per thread for the parts
+    /// of the output a task writes.
+    scratch: []u8 = &.{},
+    scratch_len: usize = 0,
     base: u64 = undefined,
     section_addrs: [n_sections]u64 = undefined,
     /// The TLS segment's addresses, and the thread pointer's place
@@ -812,8 +884,58 @@ const Link = struct {
     }
 
     fn populateOutput(l: *Link, part: usize, _: usize) void {
+        const buf = l.target.memory;
         const begin = part * populate_len;
-        populate(l.buf[begin..@min(l.buf.len, begin + populate_len)]);
+        populate(buf[begin..@min(buf.len, begin + populate_len)]);
+    }
+
+    /// Writes `bytes` at `offset` of the output.
+    fn put(l: *Link, offset: u64, bytes: []const u8) Error!void {
+        switch (l.target) {
+            .memory => |buf| @memcpy(buf[offset..][0..bytes.len], bytes),
+            .file => |fd| try pwriteAll(fd, bytes, offset),
+        }
+    }
+
+    /// Writes `len` zero bytes at `offset` of the output.
+    fn fill(l: *Link, offset: u64, len: u64) Error!void {
+        switch (l.target) {
+            .memory => |buf| @memset(buf[offset..][0..len], 0),
+            .file => |fd| {
+                const zeroes: [4096]u8 = @splat(0);
+                var at: u64 = 0;
+                while (at < len) : (at += zeroes.len) try pwriteAll(fd, zeroes[0..@min(zeroes.len, len - at)], offset + at);
+            },
+        }
+    }
+
+    /// Buffers for a task's parts of the output, each the contiguous
+    /// range of `lens[k]` bytes at `offsets[k]`: the output itself, or
+    /// with a `.file` target, the thread's scratch, which `writeParts`
+    /// writes out.
+    fn parts(l: *Link, thread: usize, comptime n: usize, offsets: [n]u64, lens: [n]u64) [n][]u8 {
+        var out: [n][]u8 = undefined;
+        switch (l.target) {
+            .memory => |buf| for (&out, offsets, lens) |*o, off, len| {
+                o.* = buf[off..][0..len];
+            },
+            .file => {
+                var at: usize = thread * l.scratch_len;
+                for (&out, lens) |*o, len| {
+                    o.* = l.scratch[at..][0..len];
+                    at += len;
+                }
+            },
+        }
+        return out;
+    }
+
+    fn writeParts(l: *Link, task: usize, atom: usize, comptime n: usize, offsets: [n]u64, bufs: [n][]u8) void {
+        const fd = switch (l.target) {
+            .memory => return,
+            .file => |fd| fd,
+        };
+        for (offsets, bufs) |off, b| pwriteAll(fd, b, off) catch return l.fail(task, atom, error.WriteFailed, .{});
     }
 
     fn gatherKeys(l: *Link, chunk: usize, _: usize) void {
@@ -969,18 +1091,26 @@ const Link = struct {
     };
 
     fn copyAll(l: *Link, task: usize, thread: usize) void {
-        if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len);
+        if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len, thread);
         if (l.numbered == null) l.copy(task, thread, false) else l.copyNumbered(task, thread);
     }
 
     /// Writes one chunk's subprogram entries, line sequences, FDEs, and
     /// search table entries.
-    noinline fn copyDebug(l: *Link, chunk: usize) void {
+    noinline fn copyDebug(l: *Link, chunk: usize, thread: usize) void {
         const begin = chunk * chunk_len;
         const entries = l.debug[begin..@min(l.debug.len, begin + chunk_len)];
         const c = &l.debug_chunks[chunk];
-        var info_off = l.info_off + c.info_off;
-        var line_off = l.line_off + c.line_off;
+        const offsets = [4]u64{
+            l.info_off + c.info_off,
+            l.line_off + c.line_off,
+            l.eh_off + Dwarf.cie.len + @as(u64, c.fde_base) * Dwarf.fde_size,
+            l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, c.fde_base) * Dwarf.eh_frame_hdr_entry_size,
+        };
+        const out = l.parts(thread, 4, offsets, .{ c.info_len, c.line_len, @as(u64, c.n_fdes) * Dwarf.fde_size, @as(u64, c.n_fdes) * Dwarf.eh_frame_hdr_entry_size });
+        defer l.writeParts(l.chunks.len + chunk, begin, 4, offsets, out);
+        var info_off: usize = 0;
+        var line_off: usize = 0;
         var fde = c.fde_base;
         const hdr_addr: i64 = @intCast(l.base + l.hdr_off);
         for (entries, l.file_of[begin..][0..entries.len], 0..) |*d, file_of, j| {
@@ -996,14 +1126,15 @@ const Link = struct {
             const addr = l.atomAddr(d.atom);
             const size = l.atoms[d.atom].bytes.len;
             const file = c.file_map[file_of];
-            info_off += Dwarf.writeSubprogram(l.buf[info_off..], d, addr, size, file);
-            line_off += Dwarf.writeSequence(l.buf[line_off..], d, addr, size, file);
+            info_off += Dwarf.writeSubprogram(out[0][info_off..], d, addr, size, file);
+            line_off += Dwarf.writeSequence(out[1][line_off..], d, addr, size, file);
             if (d.frame != .none) {
                 const fde_off: u32 = @intCast(Dwarf.cie.len + @as(u64, fde) * Dwarf.fde_size);
                 const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
                 const fn_addr: i64 = @intCast(addr);
-                Dwarf.writeFde(l.buf[l.eh_off + fde_off ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
-                const entry = l.buf[l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, fde) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
+                const k = fde - c.fde_base;
+                Dwarf.writeFde(out[2][@as(usize, k) * Dwarf.fde_size ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
+                const entry = out[3][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
                 std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
                 std.mem.writeInt(i32, entry[4..8], @intCast(fde_addr - hdr_addr), .little);
                 fde += 1;
@@ -1044,15 +1175,30 @@ const Link = struct {
     fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
         const c = &l.chunks[chunk];
         const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
-        for (c.lead_gaps, c.bases, l.section_addrs, fills, 0..) |gap, chunk_base, sa, fill, s| {
-            if (zero_fill[s]) continue;
-            const start = sa - l.base + chunk_base;
-            @memset(l.buf[start - gap .. start], fill);
+        // The chunk's part of each section with file contents, from the
+        // padding before it, then its symbols and their names. Sections
+        // without file contents get empty parts.
+        var offsets: [n_sections + 2]u64 = @splat(0);
+        var lens: [n_sections + 2]u64 = @splat(0);
+        for (offsets[0..n_sections], lens[0..n_sections], c.lead_gaps, c.bases, c.sizes, l.section_addrs, zero_fill) |*off, *len, gap, chunk_base, size, sa, no_bytes| {
+            if (no_bytes) continue;
+            off.* = sa - l.base + chunk_base - gap;
+            len.* = gap + size;
+        }
+        const symtab = n_sections;
+        const strtab = n_sections + 1;
+        offsets[symtab] = l.symtab_off + @as(u64, c.sym) * @sizeOf(elf.Elf64.Sym);
+        lens[symtab] = @as(u64, c.n_syms) * @sizeOf(elf.Elf64.Sym);
+        offsets[strtab] = l.strtab_off + c.str;
+        lens[strtab] = c.str_len;
+        const out = l.parts(thread, n_sections + 2, offsets, lens);
+        for (out[0..n_sections], c.lead_gaps, fills, zero_fill) |o, gap, byte, no_bytes| {
+            if (!no_bytes) @memset(o[0..gap], byte);
         }
         const begin = chunk * chunk_len;
         const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
-        var sym_off = l.symtab_off + @as(u64, c.sym) * @sizeOf(elf.Elf64.Sym);
-        var str_off = c.str;
+        var sym_off: usize = 0;
+        var str_off: usize = 0;
         for (atoms, l.places[begin..][0..atoms.len], begin..) |*a, place, i| {
             // An atom's bytes, targets, relocations, and name, and its
             // targets' `symbols` entries, are scattered in memory; start
@@ -1070,9 +1216,10 @@ const Link = struct {
             if (place.isDuplicate()) continue;
             const addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
             if (!zero_fill[place.section]) {
-                const start = addr - l.base;
-                @memset(l.buf[start - place.gap .. start], fills[place.section]);
-                const dst = l.buf[start..][0..a.bytes.len];
+                const section_out = out[place.section];
+                const start = addr - l.base - offsets[place.section];
+                @memset(section_out[start - place.gap .. start], fills[place.section]);
+                const dst = section_out[start..][0..a.bytes.len];
                 @memcpy(dst, a.bytes);
                 const res = resolved[0..a.targets.len];
                 if (numbered) {
@@ -1088,12 +1235,12 @@ const Link = struct {
             }
             var name: u32 = 0;
             if (a.name.len > 0) {
-                name = str_off;
-                @memcpy(l.buf[l.strtab_off + str_off ..][0..a.name.len], a.name);
-                l.buf[l.strtab_off + str_off + a.name.len] = 0;
-                str_off += @intCast(a.name.len + 1);
+                name = c.str + @as(u32, @intCast(str_off));
+                @memcpy(out[strtab][str_off..][0..a.name.len], a.name);
+                out[strtab][str_off + a.name.len] = 0;
+                str_off += a.name.len + 1;
             }
-            writeStruct(l.buf[sym_off..], elf.Elf64.Sym{
+            writeStruct(out[symtab][sym_off..], elf.Elf64.Sym{
                 .name = name,
                 .info = .{ .type = sym_types[place.section], .bind = .GLOBAL },
                 .other = .{ .visibility = .DEFAULT },
@@ -1103,6 +1250,7 @@ const Link = struct {
             });
             sym_off += @sizeOf(elf.Elf64.Sym);
         }
+        l.writeParts(chunk, begin, n_sections + 2, offsets, out);
     }
 };
 
@@ -1256,6 +1404,19 @@ fn shdr(name: u32, ty: elf.SHT, flags: elf.SHF, base: u64, offset: u64, size: u6
 
 fn nonAlloc(name: u32, ty: elf.SHT, offset: u64, size: u64) elf.Elf64.Shdr {
     return .{ .name = name, .type = ty, .flags = .{ .shf = .{} }, .addr = 0, .offset = offset, .size = size, .link = 0, .info = 0, .addralign = 1, .entsize = 0 };
+}
+
+fn pwriteAll(fd: std.posix.fd_t, bytes: []const u8, offset: u64) Error!void {
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const sys = std.posix.system;
+        const rc = sys.pwrite(fd, bytes[at..].ptr, bytes.len - at, @intCast(offset + at));
+        switch (sys.errno(rc)) {
+            .SUCCESS => at += @intCast(rc),
+            .INTR => {},
+            else => return error.WriteFailed,
+        }
+    }
 }
 
 pub fn writeStruct(dst: []u8, s: anytype) void {
@@ -1418,19 +1579,29 @@ test "links and runs a program that writes from rodata and exits with 42" {
     symbols.len = 5;
     try std.testing.expectError(error.InvalidSymbols, emit(gpa, io, kept, .{ .entry = start, .symbols = symbols }));
 
-    // An old output is overwritten in place, every byte of it.
+    // An old output is overwritten in place, every byte of it, and a new
+    // file gets the same bytes, through a mapping or with pwrite.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const garbage = try gpa.alloc(u8, bytes.len + 3 * 4096 + 5);
     defer gpa.free(garbage);
     @memset(garbage, 0xa5);
-    try tmp.dir.writeFile(io, .{ .sub_path = "hello", .data = garbage, .flags = .{ .permissions = .executable_file } });
-    const old_inode = (try tmp.dir.statFile(io, "hello", .{})).inode;
-    try link(gpa, io, tmp.dir, "hello", &atoms, options);
-    try std.testing.expectEqual(old_inode, (try tmp.dir.statFile(io, "hello", .{})).inode);
-    const written = try tmp.dir.readFileAlloc(io, "hello", gpa, .unlimited);
-    defer gpa.free(written);
-    try std.testing.expectEqualSlices(u8, bytes, written);
+    for ([_]FileWrites{ .map, .pwrite }) |writes| {
+        var file_options = options;
+        file_options.file_writes = writes;
+        try tmp.dir.writeFile(io, .{ .sub_path = "hello", .data = garbage, .flags = .{ .permissions = .executable_file } });
+        const old_inode = (try tmp.dir.statFile(io, "hello", .{})).inode;
+        try link(gpa, io, tmp.dir, "hello", &atoms, file_options);
+        try std.testing.expectEqual(old_inode, (try tmp.dir.statFile(io, "hello", .{})).inode);
+        const written = try tmp.dir.readFileAlloc(io, "hello", gpa, .unlimited);
+        defer gpa.free(written);
+        try std.testing.expectEqualSlices(u8, bytes, written);
+        try tmp.dir.deleteFile(io, "hello");
+        try link(gpa, io, tmp.dir, "hello", &atoms, file_options);
+        const created = try tmp.dir.readFileAlloc(io, "hello", gpa, .unlimited);
+        defer gpa.free(created);
+        try std.testing.expectEqualSlices(u8, bytes, created);
+    }
     const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/hello", .{tmp.sub_path});
     defer gpa.free(path);
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
@@ -1712,7 +1883,12 @@ test "links many chunks of atoms the same way on any number of threads" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try link(gpa, io, tmp.dir, "chunks", atoms.items, .{ .entry = start, .threads = 3 });
+    for ([_]FileWrites{ .map, .pwrite }) |writes| {
+        try link(gpa, io, tmp.dir, "chunks", atoms.items, .{ .entry = start, .threads = 3, .debug = debug.items, .comp_dir = "/w", .file_writes = writes });
+        const written = try tmp.dir.readFileAlloc(io, "chunks", gpa, .unlimited);
+        defer gpa.free(written);
+        try std.testing.expectEqualSlices(u8, one, written);
+    }
     const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/chunks", .{tmp.sub_path});
     defer gpa.free(path);
     const result = try std.process.run(gpa, io, .{ .argv = &.{path} });

@@ -27,6 +27,9 @@
 //! from "packed" atoms whose records lie one after another in link order,
 //! as in a compacted pack (targets, relocations, bytes, name). Both must
 //! produce the same bytes as the key-based link.
+//!
+//! ELF links to a file are timed with each `Elf.FileWrites`, overwriting
+//! the previous output in place and into a new file, on 1 and all threads.
 
 const std = @import("std");
 const Atom = @import("link/Atom.zig");
@@ -168,6 +171,7 @@ fn bench(comptime format: Format, gpa: std.mem.Allocator, io: std.Io, arena: std
             rate(atoms.len, best_parallel),      ms(best_parallel_strip),
             cpus,                                ms(with_write),
         });
+        if (format == .elf) try linkToFile(gpa, io, atoms, single, parallel, out_n, cpus);
         if (format == .elf) try benchNumbered(gpa, io, arena, atoms, debug, single, out_n, stripped, cpus);
     }
     std.debug.print("(best of {d} runs each)\n", .{runs});
@@ -284,16 +288,42 @@ fn benchNumbered(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, a
         for (0..runs) |_| {
             for (&best, [_]Elf.Options{ single, parallel, single_strip, parallel_strip }) |*b, o| b.* = @min(b.*, try timeEmit(Elf, gpa, io, atoms, o));
         }
-        var with_write: u64 = std.math.maxInt(u64);
+        std.debug.print(
+            \\  numbered, {s}: emit {d:.2} ms on 1 thread, {d:.2} ms on {d}; stripped {d:.2} ms, {d:.2} ms
+            \\
+        , .{ name, ms(best[0]), ms(best[1]), cpus, ms(best[2]), ms(best[3]) });
+        try linkToFile(gpa, io, atoms, single, parallel, expected, cpus);
+    }
+}
+
+/// Times `Elf.link` on 1 and all threads with each way of writing the
+/// file: over the previous output, which it overwrites in place, and into
+/// a new file (the old one deleted beforehand, untimed). Checks that each
+/// writes `expected`.
+fn linkToFile(gpa: std.mem.Allocator, io: std.Io, atoms: []const Atom, single: Elf.Options, parallel: Elf.Options, expected: []const u8, cpus: usize) !void {
+    const cwd = std.Io.Dir.cwd();
+    for ([_][]const u8{ "in place", "new file" }) |case| {
+        const fresh = case[0] == 'n';
+        var best: [3][2]u64 = @splat(@splat(std.math.maxInt(u64)));
         for (0..runs) |_| {
-            const t = std.Io.Timestamp.now(io, .awake);
-            try Elf.link(gpa, io, std.Io.Dir.cwd(), out_path, atoms, parallel);
-            with_write = @min(with_write, elapsed(io, t));
+            for (&best, [_]Elf.FileWrites{ .auto, .map, .pwrite }) |*b, writes| {
+                for (b, [_]Elf.Options{ single, parallel }) |*t_best, options| {
+                    var o = options;
+                    o.file_writes = writes;
+                    if (fresh) cwd.deleteFile(io, out_path) catch {};
+                    const t = std.Io.Timestamp.now(io, .awake);
+                    try Elf.link(gpa, io, cwd, out_path, atoms, o);
+                    t_best.* = @min(t_best.*, elapsed(io, t));
+                }
+                const file = try cwd.readFileAlloc(io, out_path, gpa, .unlimited);
+                defer gpa.free(file);
+                if (!std.mem.eql(u8, file, expected)) @panic("link wrote different bytes than emit returned");
+            }
         }
         std.debug.print(
-            \\  numbered, {s}: emit {d:.2} ms on 1 thread, {d:.2} ms on {d}; stripped {d:.2} ms, {d:.2} ms; link to a file {d:.2} ms
+            \\    link to a file, {s}: auto {d:.2} ms on 1 thread, {d:.2} ms on {d}; map {d:.2}, {d:.2}; pwrite {d:.2}, {d:.2}
             \\
-        , .{ name, ms(best[0]), ms(best[1]), cpus, ms(best[2]), ms(best[3]), ms(with_write) });
+        , .{ case, ms(best[0][0]), ms(best[0][1]), cpus, ms(best[1][0]), ms(best[1][1]), ms(best[2][0]), ms(best[2][1]) });
     }
 }
 
