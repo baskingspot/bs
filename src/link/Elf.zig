@@ -63,6 +63,10 @@ pub const Options = struct {
     /// that are not symbols (see the `value*` relocation kinds).
     values: []const Value = &.{},
     base_address: u64 = 0x200000,
+    /// The main thread's stack size, as PT_GNU_STACK's memory size, which
+    /// std's start code raises the stack limit to (`--stack`; upstream's
+    /// default is 16 MiB).
+    stack_size: u64 = 16 * 1024 * 1024,
     /// Threads to link with, the calling thread included; null means one
     /// per CPU. The output is the same for any number.
     threads: ?usize = null,
@@ -737,7 +741,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .{ .LOAD, .{ .R = true, .W = true }, rw_start, base + rw_start, file_end - rw_start, mem_end - rw_start, page_size },
         .{ .TLS, .{ .R = true }, tls_start, base + tls_start, sizes[tdata], tls_end - tls_start, tls_align.toByteUnits() },
         .{ .GNU_EH_FRAME, .{ .R = true }, hdr_off, base + hdr_off, hdr_size, hdr_size, 4 },
-        .{ .GNU_STACK, .{ .R = true, .W = true }, 0, 0, 0, 0, 16 },
+        .{ .GNU_STACK, .{ .R = true, .W = true }, 0, 0, 0, std.mem.alignForward(u64, options.stack_size, page_size), 1 },
     };
     for (ph_present, phdrs) |present, p| if (present) {
         writeStruct(head[ph_off..], elf.Elf64.Phdr{

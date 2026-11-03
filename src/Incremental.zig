@@ -62,6 +62,9 @@ timing: bool,
 /// reach every function. A gap fails the build (`finishRecord`).
 check: bool = false,
 check_failed: std.atomic.Value(bool) = .init(false),
+/// `--stack`, for a relink; part of the command line that keys the
+/// compilation.
+stack_size: u64 = 16 * 1024 * 1024,
 /// The recording `startRecord` runs while the build links.
 recording: ?Io.Future(anyerror!Recorded) = null,
 
@@ -199,6 +202,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         },
         .diag = &diag,
         .comp_dir = cwd,
+        .stack_size = inc.stack_size,
     }) catch |err| switch (err) {
         // A damaged pack or manifest: build from scratch instead.
         error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo => return inc.noRelink("{t} (atom '{s}')", .{ err, diag.atom }),

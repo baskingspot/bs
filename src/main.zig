@@ -50,6 +50,9 @@ pub const Options = struct {
     /// Print the typed IR of every analyzed function to stdout
     /// (`--debug-dump-ir`, for zap's own tests and debugging).
     dump_ir: bool = false,
+    /// `--stack`: the main thread's stack size in bytes, which std's start
+    /// code sets from PT_GNU_STACK; upstream's default is 16 MiB.
+    stack_size: u64 = 16 * 1024 * 1024,
     root_deps: []const []const u8 = &.{},
     modules: []const Frontend.ModuleArg = &.{},
 };
@@ -134,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
     } else null;
     defer if (inc) |*i| i.close();
     if (inc) |*i| i.check = init.environ_map.get("ZAP_CACHE_CHECK") != null;
+    if (inc) |*i| i.stack_size = opts.stack_size;
     if (inc) |*i| if (init.environ_map.get("ZAP_CACHE_MAX_SIZE")) |v| {
         i.max_bytes = @import("cache.zig").parseSize(v) orelse fatal("invalid ZAP_CACHE_MAX_SIZE '{s}': expected bytes, or a number and K, M, G, or T", .{v});
     };
@@ -192,6 +196,7 @@ pub fn main(init: std.process.Init) !void {
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
     emit.obj = command == .build_obj;
+    emit.stack_size = opts.stack_size;
     // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
     // n more times (`zig build bench-codegen`).
     const bench_runs: u32 = if (init.environ_map.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
@@ -382,7 +387,12 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
             } else try modules.append(arena, .{ .name = spec[0..eq], .path = spec[eq + 1 ..], .deps = try deps.toOwnedSlice(arena) });
         } else if (std.mem.eql(u8, arg, "--debug-dump-ir")) {
             opts.dump_ir = true;
-        } else if (std.mem.eql(u8, arg, "-ODebug")) {
+        } else if (std.mem.eql(u8, arg, "--stack")) {
+            const v = nextArg(args, &i, arg);
+            opts.stack_size = std.fmt.parseUnsigned(u64, v, 0) catch fatal("invalid stack size: '{s}'", .{v});
+        } else if (std.mem.eql(u8, arg, "-fno-sanitize-thread")) {
+            // zap never builds with ThreadSanitizer.
+        } else if (std.mem.eql(u8, arg, "-ODebug") or std.mem.eql(u8, arg, "-Odebug")) {
             // The only mode zap supports.
         } else if (std.mem.startsWith(u8, arg, "-O")) {
             fatal("zap only supports Debug builds; use upstream zig for '{s}'", .{arg});

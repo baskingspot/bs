@@ -47,6 +47,8 @@ entry: ?SymbolKey = null,
 /// no entry, its exports are symbols for other objects, and symbols it
 /// does not define are imported from them.
 obj: bool = false,
+/// `--stack`: the executable's main thread stack size.
+stack_size: u64 = 16 * 1024 * 1024,
 /// In an object, the symbols other objects define, by name, and whether
 /// every reference is weak.
 imports: std.StringArrayHashMapUnmanaged(bool) = .empty,
@@ -275,7 +277,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
-    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd };
+    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size };
     const result = if (emit.obj) obj: {
         const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
         defer emit.gpa.free(imports);
