@@ -40,6 +40,9 @@ block_loop: std.ArrayList(u32) = .empty,
 /// and the terminator of a block whose values end before value `i` at
 /// `2 * i + 1`.
 live: std.MultiArrayList(Live) = .empty,
+/// Frame-slot sharing, filled as the architecture emits values in layout
+/// order (see `takeSlot`).
+slots: Slots = .{},
 
 pub const no_loop = std.math.maxInt(u32);
 
@@ -131,6 +134,8 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.loops.deinit(gpa);
     f.block_loop.deinit(gpa);
     f.live.deinit(gpa);
+    for (&f.slots.free) |*l| l.deinit(gpa);
+    f.slots.active.deinit(gpa);
 }
 
 pub fn blockInsts(f: *const Func, block: Block.Index) []const Inst.Index {
@@ -167,6 +172,8 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     const s = f.live.slice();
     @memset(s.items(.uses), 0);
     @memset(s.items(.reg), no_reg);
+    for (&f.slots.free) |*l| l.clearRetainingCapacity();
+    f.slots.active.clearRetainingCapacity();
     var w: LiveWalk = .{ .uses = s.items(.uses), .def = s.items(.def), .end = s.items(.end), .loops = f.loops.items, .loop = no_loop, .pos = 0 };
     const insts = f.values.items(.inst);
     const datas = ir.instructions.items(.data);
@@ -187,7 +194,12 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
         }
         w.pos = term_pos;
         switch (b.term.tag) {
-            .jump => if (tags[@backingInt(b.term.inst)] == .br) w.use(term_data.br.operand),
+            .jump => if (tags[@backingInt(b.term.inst)] == .br) {
+                w.use(term_data.br.operand);
+                // The `br` writes the block's result.
+                const blk = @backingInt(term_data.br.block_inst);
+                w.end[blk] = @max(w.end[blk], term_pos);
+            },
             .branch, .switch_br => w.use(term_data.pl_op.operand),
             .ret => w.use(term_data.un_op),
             .fallthrough, .noreturn, .unreach => {},
@@ -351,6 +363,74 @@ pub fn allocate(f: *Func, n: u8) u32 {
 }
 
 pub const max_regs = 16;
+
+/// Frame slots shared by lifetime (pass 7): a value's slot is free for
+/// another value once the position passes the end of its interval. Slots
+/// are classed by size, rounded up to 8 bytes (16 for 16-byte aligned
+/// values), up to `max_slot` bytes; larger values get their own.
+pub const Slots = struct {
+    free: [2 * max_slot / 8]std.ArrayList(i32) = @splat(.empty),
+    /// Slots in use, a min-heap by `end`.
+    active: std.ArrayList(Active) = .empty,
+
+    const Active = struct { end: u32, off: i32, class: u16 };
+};
+
+pub const max_slot = 512;
+
+/// A slot's class and its size and alignment, or null if it is not shared.
+pub const SlotClass = struct { index: u16, size: u32, alignment: u32 };
+
+pub fn slotClass(size: u64, alignment: u64) ?SlotClass {
+    const a: u32 = if (alignment > 8) 16 else 8;
+    const rounded = std.mem.alignForward(u64, @max(size, 1), a);
+    if (rounded > max_slot) return null;
+    return .{ .index = @intCast((rounded / 8 - 1) * 2 + @intFromBool(a == 16)), .size = @intCast(rounded), .alignment = a };
+}
+
+/// A free slot of `class` for value `inst`, reusing one whose value's
+/// interval ended before `inst`'s definition, or null if there is none
+/// (the caller then allocates one and records it with `holdSlot`).
+pub fn takeSlot(f: *Func, gpa: Allocator, inst: Inst.Index, class: SlotClass) Allocator.Error!?i32 {
+    const pos = f.live.items(.def)[@backingInt(inst)];
+    const s = &f.slots;
+    while (s.active.items.len != 0 and s.active.items[0].end < pos) {
+        const top = s.active.items[0];
+        try s.free[top.class].append(gpa, top.off);
+        const last = s.active.pop().?;
+        if (s.active.items.len == 0) break;
+        // Sift `last` down from the root.
+        const h = s.active.items;
+        var i: usize = 0;
+        while (true) {
+            var c = 2 * i + 1;
+            if (c >= h.len) break;
+            if (c + 1 < h.len and h[c + 1].end < h[c].end) c += 1;
+            if (h[c].end >= last.end) break;
+            h[i] = h[c];
+            i = c;
+        }
+        h[i] = last;
+    }
+    return s.free[class.index].pop();
+}
+
+/// Records that value `inst` holds the slot at `off` until its interval
+/// ends.
+pub fn holdSlot(f: *Func, gpa: Allocator, inst: Inst.Index, off: i32, class: SlotClass) Allocator.Error!void {
+    const s = &f.slots;
+    const end = f.live.items(.end)[@backingInt(inst)];
+    try s.active.append(gpa, undefined);
+    const h = s.active.items;
+    var i = h.len - 1;
+    while (i > 0) {
+        const parent = (i - 1) / 2;
+        if (h[parent].end <= end) break;
+        h[i] = h[parent];
+        i = parent;
+    }
+    h[i] = .{ .end = end, .off = off, .class = class.index };
+}
 
 const Builder = struct {
     f: *Func,

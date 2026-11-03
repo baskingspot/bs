@@ -70,6 +70,8 @@ trace_slot: ?i32 = null,
 /// The callee-saved registers the function's values use (`alloc_regs`
 /// bits), which the prologue saves below rbp and every return restores.
 saved: u32 = 0,
+/// `Ssa.liveness` ran, so value slots are shared by lifetime.
+live: bool = false,
 /// Inline assembly marked the return address undefined (`.cfi_undefined
 /// %rip`): this is the outermost frame.
 outermost_frame: bool = false,
@@ -330,7 +332,17 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
     // A value's home is only copied from and to, never addressed as a `*T`
     // (Sema takes addresses of `alloc`s, which realign themselves), so 16
     // bytes suffice for any type, as for arguments, which have 8.
-    const home: Home = .{ .slot = try cg.allocSlot(Type.abiSize(cg.ip, ty), @min(Type.abiAlignment(cg.ip, ty), 16)) };
+    const size = Type.abiSize(cg.ip, ty);
+    const alignment = @min(Type.abiAlignment(cg.ip, ty), 16);
+    // Values are emitted in layout order, so a slot whose value's interval
+    // has ended can be shared (pass 7 of the design).
+    const class = if (cg.live) Ssa.slotClass(size, alignment) else null;
+    const home: Home = .{ .slot = if (class) |c| blk: {
+        const f = &cg.emit.ssa;
+        const off = try f.takeSlot(cg.gpa, inst, c) orelse try cg.allocSlot(c.size, c.alignment);
+        try f.holdSlot(cg.gpa, inst, off, c);
+        break :blk off;
+    } else try cg.allocSlot(size, alignment) };
     cg.homes[@backingInt(inst)] = home;
     return home;
 }
@@ -624,8 +636,9 @@ fn planRegisters(cg: *CodeGen) Error!void {
     const ir = cg.ir;
     const tags = ir.instructions.items(.tag);
     const insts = f.values.items(.inst);
-    for (insts) |inst| if (tags[@backingInt(inst)] == .assembly) return;
     try f.liveness(cg.gpa, ir);
+    cg.live = true;
+    for (insts) |inst| if (tags[@backingInt(inst)] == .assembly) return;
     const live = f.live.slice();
     const uses = live.items(.uses);
     const reg = live.items(.reg);
