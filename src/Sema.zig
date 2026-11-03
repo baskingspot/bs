@@ -6474,6 +6474,9 @@ fn analyzeFloatToInt(sema: *Sema, block: *Block, src: Src, dest_ty: Index, opera
     const ty = sema.typeOf(operand);
     if (Type.class(ip, dest_ty) != .int and dest_ty != .comptime_int_type) return sema.fail(block, src, "expected integer result type, found '{f}'", .{sema.fmtType(dest_ty)});
     const class = Type.class(ip, ty);
+    // A comptime_int operand is already integral: every rounding mode
+    // leaves it unchanged.
+    if (ty == .comptime_int_type) return sema.coerce(block, dest_ty, operand, src);
     if (class != .float and class != .comptime_float) return sema.fail(block, src, "expected float type, found '{f}'", .{sema.fmtType(ty)});
     if (sema.resolveValue(operand)) |v| return .fromInterned(try sema.intFromFloat(block, src, v, dest_ty, mode));
     if (dest_ty == .comptime_int_type) return sema.fail(block, src, "unable to resolve comptime value", .{});
@@ -6520,6 +6523,7 @@ fn analyzeFloatCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operan
     const dc = Type.class(ip, dest_ty);
     const sc = Type.class(ip, ty);
     if (dc != .float and dc != .comptime_float) return sema.fail(block, src, "expected float or vector type, found '{f}'", .{sema.fmtType(dest_ty)});
+    if (ty == .comptime_int_type) return sema.analyzeFloatFromInt(block, src, dest_ty, operand);
     if (sc != .float and sc != .comptime_float) return sema.fail(block, src, "expected float or vector type, found '{f}'", .{sema.fmtType(ty)});
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
