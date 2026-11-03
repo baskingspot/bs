@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "7\n1\n255\n255\n1\n0\n0\n4096\n9\n"
+//! stdout: "7\n1\n255\n255\n1\n0\n0\n4096\n9\n11\n"
 //! Patterns std relies on: a generic namespace's declarations captured by
 //! nested types (resolved lazily, so a type can capture itself), a runtime
 //! block with one comptime-known result, @intFromPtr of optional pointers,
@@ -65,6 +65,17 @@ fn val(m: Mode) u32 {
     };
 }
 var g: u32 = 5;
+const page = 4096;
+fn take(m: []align(page) const u8) usize {
+    return m.len;
+}
+fn take2(p: ?[*]align(page) u8) usize {
+    return @intFromBool(p != null);
+}
+fn unmap(memory: []align(page) u8) usize {
+    return take(memory.ptr[0..memory.len]) + take2(memory.ptr);
+}
+var page_buf: [8192]u8 align(page) = undefined;
 fn main() callconv(.c) noreturn {
     var s: SM(u32) = .{};
     s.push(.{ .reg = .{ .a = 7, .b = 1 } });
@@ -88,5 +99,7 @@ fn main() callconv(.c) noreturn {
     var m: Mode = .{ .b = 9 };
     _ = &m;
     rt.printInt(val(m));
+    const pm: []u8 = page_buf[0..10];
+    rt.printInt(unmap(@alignCast(pm)));
     rt.exit(0);
 }
