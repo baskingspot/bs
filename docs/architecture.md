@@ -1288,6 +1288,40 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    register there with a parallel move. Pairs (slices, error unions) still
    live in memory inside a function until the SSA has a pair class.
 4. Layout, fusion, overflow from flags, dead code, and branch shortening.
+   Built. `Ssa.place` (passes 3 and 4) bypasses blocks without values
+   that only jump (a `repeat`, a `br` without a result, a fallthrough)
+   and orders the rest for emission (`Ssa.order`): a block ending in a
+   call of a noreturn function is cold and goes to the end, and a branch
+   falls through to whichever side follows. Positions for liveness,
+   allocation, and slot sharing stay in the structured IR's order rather
+   than the emission order: a cold block ends the function and defines
+   nothing others read, so it runs the same at the end with the registers
+   it has in place, and its values get slots of their own (slot sharing
+   assumes emission in position order). Each cold block starts with the
+   row and the inlined calls open where it was (new `Debug.Inline`
+   entries with the same call information). An overflow operation whose
+   bit only its block's branch tests leaves it in the flags: at 8, 16,
+   32, and 64 bits the operation runs at that width and the branch reads
+   its carry or overflow flag (8-bit multiplication excepted), other
+   widths compare against the truncation. Pass 2 leaves out values
+   without uses whose computation has no effect, in one backward sweep
+   after liveness. The encoder shortens `jmp`/`jcc` to rel8 when in reach
+   (not in functions with inline assembly), re-encoding once and moving
+   relocations, labels, line rows, inline ranges, and the frame patch.
+   Error unions get their error code written through the padding before
+   the payload (up to 8 bytes), so whole-word reads forward from the
+   store. Against step 3 (main 4a5232b), libvaxis text_input
+   (`ZAP_BENCH_CODEGEN=10`, two runs): 6.26 → 5.58 code bytes per IR
+   instruction, 210–218 → 234–238 ns per IR instruction (build +4 for
+   `place`, liveness and allocation +4 for the dead-code sweep, emission
+   +12, of which shortening is about half); std's tests (`zap test
+   upstream/lib/std/std.zig --test-no-exec`, `ZAP_CACHE=off`): 7.8–8.3 →
+   8.0–8.4 s, 6.70 → 6.03 code bytes per IR instruction.
+   `bench/runtime.py`, same session: fib 135 → 128 ms, sieve 316 → 303,
+   sort 448 → 421, hash 300 → 297, nbody 457 → 456, fmt 155 → 149. What
+   remains is mostly memory traffic: block results and loop variables
+   through slots, slices and floats through memory (promotion, step 4's
+   successor).
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
 6. DWARF variable locations; then leaf inlining with the cache edge.
