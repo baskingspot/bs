@@ -1,5 +1,5 @@
 //! exit: 3
-//! stdout: "84\n14\n10\n137\n28\n30\n8\n3\n"
+//! stdout: "84\n14\n10\n137\n28\n30\n8\n3\n11\n9\n6\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -83,5 +83,26 @@ fn main() callconv(.c) noreturn {
 
     var b = false;
     if (!b and total > 3) b = true;
+
+    // Switch prongs capturing by reference.
+    var us = [_]RefU{ .{ .a = 1 }, .{ .b = .{ 1, 2 } }, .c };
+    for (&us) |*u| bumpRef(u);
+    rt.printInt(us[0].a);
+    rt.printInt(us[1].b[1]);
+    var sn: u8 = 3;
+    switch (sn) {
+        0...5 => |*p| p.* *= 2,
+        else => |*p| p.* = 0,
+    }
+    rt.printInt(sn);
     rt.exit(if (b) 3 else 4);
+}
+
+const RefU = union(enum) { a: u32, b: [2]u8, c: void };
+fn bumpRef(u: *RefU) void {
+    switch (u.*) {
+        .a => |*x| x.* += 10,
+        .b => |*arr| arr[1] = 9,
+        .c => {},
+    }
 }

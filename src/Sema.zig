@@ -1956,12 +1956,12 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         },
         .@"try" => sema.zirTry(block, inst, false),
         .try_ptr => sema.zirTry(block, inst, true),
-        .switch_block => sema.zirSwitchBlock(block, inst),
+        .switch_block => sema.zirSwitchBlock(block, inst, false),
         .switch_block_err_union => sema.zirSwitchBlockErrUnion(block, inst),
         .memcpy => sema.zirMemcpy(block, inst, .memcpy),
         .memmove => sema.zirMemcpy(block, inst, .memmove),
         .memset => sema.zirMemset(block, inst),
-        .switch_block_ref => sema.failUnsupported(block, block.nodeSrc(data.pl_node.src_node), @tagName(tag)),
+        .switch_block_ref => sema.zirSwitchBlock(block, inst, true),
 
         // Initialization.
         .struct_init_empty, .struct_init_empty_result, .struct_init_empty_ref_result => blk: {
@@ -7600,13 +7600,19 @@ const SwitchCase = struct {
     /// The else prong of a switch on a known error set: the errors no
     /// other prong handles, which are the capture's type.
     else_errors: ?[]const InternPool.String = null,
+    /// A pointer to the operand, for captures by reference, or `none`.
+    operand_ptr: Ref = .none,
 };
 
-fn zirSwitchBlock(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+/// With `is_ref`, the operand is a pointer, and prongs may capture by
+/// reference (`|*payload|`).
+fn zirSwitchBlock(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_ref: bool) CompileError!Ref {
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const src = parent.nodeSrc(data.src_node);
     const sb = sema.code.getSwitchBlock(inst);
-    return sema.analyzeSwitch(parent, src, inst, sema.resolveInst(sb.main_operand));
+    const operand = sema.resolveInst(sb.main_operand);
+    if (!is_ref) return sema.analyzeSwitch(parent, src, inst, operand, .none);
+    return sema.analyzeSwitch(parent, src, inst, try sema.analyzeLoad(parent, src, operand), operand);
 }
 
 /// `if (eu) |payload| ... else |err| switch (err) { ... }` and
@@ -7626,7 +7632,7 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     const cond = try sema.analyzeIsNonErr(parent, src, eu);
     if (parent.is_comptime) {
         const v = sema.resolveValue(cond) orelse return sema.fail(parent, src, "unable to evaluate comptime expression", .{});
-        if (v == .bool_false) return sema.analyzeSwitch(parent, src, inst, try sema.errUnionCode(parent, src, eu));
+        if (v == .bool_false) return sema.analyzeSwitch(parent, src, inst, try sema.errUnionCode(parent, src, eu), .none);
         if (non_err.capture != .none) try sema.inst_map.put(gpa, inst, try sema.errUnionPayload(parent, src, eu));
         return (try sema.analyzeInlineBody(parent, non_err.body, inst)) orelse .unreachable_value;
     }
@@ -7652,7 +7658,7 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     defer else_block.instructions.deinit(gpa);
     if (cond_val != .bool_true) {
         const code = try sema.errUnionCode(&else_block, src, eu);
-        const result = try sema.analyzeSwitch(&else_block, src, inst, code);
+        const result = try sema.analyzeSwitch(&else_block, src, inst, code, .none);
         if (sema.typeOf(result) != .noreturn_type) try sema.addBr(&else_block, &label, result);
     }
     if (cond_val) |v| {
@@ -7664,7 +7670,9 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     return sema.resolveBlock(parent, src, &outer, &label.merges);
 }
 
-fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, operand: Ref) CompileError!Ref {
+/// `operand_ptr` points to `operand` in a switch whose prongs may capture
+/// by reference, else is `none`.
+fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, operand: Ref, operand_ptr: Ref) CompileError!Ref {
     const ip = sema.ip;
     const gpa = sema.gpa;
     const sb = sema.code.getSwitchBlock(inst);
@@ -7718,6 +7726,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
             .capture = case.prong_info.capture,
             .is_inline = case.prong_info.is_inline,
             .tag_inst = if (case.prong_info.has_tag_capture) tag_inst.toOptional() else .none,
+            .operand_ptr = operand_ptr,
         });
     }
     var else_case: ?SwitchCase = if (sb.else_case) |e| .{
@@ -7727,6 +7736,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         .capture = e.capture,
         .is_inline = e.is_inline,
         .tag_inst = if (e.has_tag_capture) tag_inst.toOptional() else .none,
+        .operand_ptr = operand_ptr,
     } else null;
     if (else_case) |e| if (e.tag_inst != .none and !is_union) return sema.fail(parent, src, "cannot capture tag of non-union type '{f}'", .{sema.fmtType(sema.typeOf(operand))});
     if (sb.has_under and (Type.class(ip, operand_ty) != .@"enum" or !ip.structInfo(operand_ty).nonexhaustive))
@@ -7985,6 +7995,14 @@ fn switchProngsRuntime(
 fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: Ref) CompileError!Ref {
     const ip = sema.ip;
     const ty = sema.typeOf(operand);
+    if (c.capture == .by_ref) {
+        // A pointer to the union's payload, else to the operand.
+        if (c.operand_ptr == .none) return sema.failUnsupported(block, src, "this switch capture by reference");
+        if (Type.class(ip, ty) != .@"union" or c.items.len == 0) return c.operand_ptr;
+        const info = ip.structInfo(ty);
+        const i = info.fieldIndex(ip, sema.enumTagName(c.items[0]).?).?;
+        return sema.fieldPtrAt(block, src, c.operand_ptr, info.field_types[i], i);
+    }
     if (Type.class(ip, ty) == .error_set and (c.items.len != 0 or c.else_errors != null) and !c.is_inline) {
         // The capture's type is the set of the prong's errors.
         const names = if (c.else_errors) |ee| try sema.arena.dupe(InternPool.String, ee) else try sema.arena.alloc(InternPool.String, c.items.len);
@@ -8016,7 +8034,6 @@ fn bindSwitchCaptures(sema: *Sema, block: *Block, src: Src, c: SwitchCase, opera
 }
 
 fn analyzeProng(sema: *Sema, block: *Block, c: SwitchCase, operand: Ref, capture_inst: Zir.Inst.Index, switch_inst: Zir.Inst.Index) CompileError!void {
-    if (c.capture == .by_ref) return sema.failUnsupported(block, block.nodeSrc(.zero), "switch captures by reference");
     try sema.bindSwitchCaptures(block, block.nodeSrc(.zero), c, operand, capture_inst);
     if (try sema.analyzeInlineBody(block, c.body, switch_inst)) |result| {
         // A prong ended with a comptime break to the switch.
