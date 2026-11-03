@@ -876,7 +876,7 @@ const Link = struct {
             };
             c.info_len += Dwarf.subprogramSize(d);
             c.line_len += Dwarf.sequenceSize(d);
-            c.n_fdes += @intFromBool(d.frame == .frame_pointer);
+            c.n_fdes += @intFromBool(d.frame != .none);
         }
     }
 
@@ -940,11 +940,11 @@ const Link = struct {
             const file = c.file_map[file_of];
             info_off += Dwarf.writeSubprogram(l.buf[info_off..], d, addr, size, file);
             line_off += Dwarf.writeSequence(l.buf[line_off..], d, addr, size, file);
-            if (d.frame == .frame_pointer) {
+            if (d.frame != .none) {
                 const fde_off: u32 = @intCast(Dwarf.cie.len + @as(u64, fde) * Dwarf.fde_size);
                 const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
                 const fn_addr: i64 = @intCast(addr);
-                Dwarf.writeFde(l.buf[l.eh_off + fde_off ..][0..Dwarf.fde_size], fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
+                Dwarf.writeFde(l.buf[l.eh_off + fde_off ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
                 const entry = l.buf[l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, fde) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
                 std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
                 std.mem.writeInt(i32, entry[4..8], @intCast(fde_addr - hdr_addr), .little);
@@ -1559,7 +1559,7 @@ test "line programs decode with std.debug.Dwarf" {
     try std.testing.expect(std.mem.indexOf(u8, stripped, ".eh_frame") == null);
 }
 
-test "std.debug unwinds frame-pointer frames through .eh_frame_hdr" {
+test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at the outermost frame" {
     if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     const gpa = std.debug.getDebugInfoAllocator();
     const io = std.testing.io;
@@ -1571,12 +1571,14 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr" {
         .{ .key = .fromName("naked"), .name = "naked", .section = .text, .bytes = &.{ 0xcc, 0xcc } },
         .{ .key = .fromName("f"), .name = "f", .section = .text, .alignment = .@"16", .bytes = &code },
         .{ .key = .fromName("g"), .name = "g", .section = .text, .alignment = .@"16", .bytes = &code },
+        .{ .key = .fromName("_start"), .name = "_start", .section = .text, .alignment = .@"16", .bytes = &code },
     };
     const debug = [_]Atom.Debug{
         .{ .atom = 1, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
         .{ .atom = 2, .file = "a.zig", .name = "naked", .base_line = 0, .lines = &.{}, .frame = .none },
         .{ .atom = 3, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
         .{ .atom = 4, .file = "a.zig", .name = "g", .base_line = 0, .lines = &.{}, .frame = .frame_pointer },
+        .{ .atom = 5, .file = "a.zig", .name = "_start", .base_line = 0, .lines = &.{}, .frame = .outermost },
     };
     const out = try emit(gpa, io, &atoms, .{ .entry = key, .debug = &debug });
     defer gpa.free(out);
@@ -1584,9 +1586,11 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr" {
     const f = text + 16;
     const naked = f + code.len;
     const g = text + 96;
-    // Two FDEs; the duplicate and the naked function leave their room unused.
-    try std.testing.expectEqual(Dwarf.cie.len + 2 * Dwarf.fde_size + 4, testSection(out, ".eh_frame").?.size);
-    try std.testing.expectEqual(Dwarf.eh_frame_hdr_size + 2 * Dwarf.eh_frame_hdr_entry_size, testSection(out, ".eh_frame_hdr").?.size);
+    const start = g + code.len;
+    // Three FDEs; the duplicate and the naked function leave their room
+    // unused.
+    try std.testing.expectEqual(Dwarf.cie.len + 3 * Dwarf.fde_size + 4, testSection(out, ".eh_frame").?.size);
+    try std.testing.expectEqual(Dwarf.eh_frame_hdr_size + 3 * Dwarf.eh_frame_hdr_entry_size, testSection(out, ".eh_frame_hdr").?.size);
 
     // Set up the way std.debug.SelfInfo does from PT_GNU_EH_FRAME.
     const base = 0x200000;
@@ -1598,7 +1602,7 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr" {
     const Unwind = std.debug.Dwarf.Unwind;
     const header: Unwind.EhFrameHeader = try .parse(phdr.vaddr, out[phdr.offset..][0..phdr.filesz], 8, .little);
     try std.testing.expectEqual(testSectionAddr(out, ".eh_frame"), header.eh_frame_vaddr);
-    try std.testing.expectEqual(2, header.search_table.?.fde_count);
+    try std.testing.expectEqual(3, header.search_table.?.fde_count);
     // Through the search table, and through the FDEs sorted while parsing
     // all of .eh_frame, which is what std.debug.SelfInfo asks for.
     for ([_]bool{ false, true }) |sort_fdes| {
@@ -1634,6 +1638,17 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr" {
             try std.testing.expectEqual(0x2222, try unwinder.next(gpa, &rules));
             try std.testing.expectEqual(at(&stack, 4), unwinder.cpu_state.gprs.get(.rsp));
             try std.testing.expectEqual(c.new_rbp, unwinder.cpu_state.gprs.get(.rbp));
+        }
+        // The outermost frame ends the stack: no return address.
+        for ([_]u64{ start, start + 1, start + code.len - 1 }) |pc| {
+            var start_stack: [2]u64 = .{ 0x3333, 0 };
+            var ctx: std.debug.cpu_context.Native = .{ .gprs = .initFill(0) };
+            ctx.gprs.set(.rip, pc);
+            ctx.gprs.set(.rsp, @intFromPtr(&start_stack));
+            var unwinder: std.debug.Dwarf.SelfUnwinder = .init(&ctx);
+            defer unwinder.deinit();
+            const rules = try unwinder.computeRules(gpa, &unwind, 0, null);
+            try std.testing.expectEqual(0, try unwinder.next(gpa, &rules));
         }
         // No FDE covers a function without debug info or a naked one.
         for ([_]u64{ text, naked, naked + 1 }) |pc| {

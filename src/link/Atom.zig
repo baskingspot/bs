@@ -212,6 +212,10 @@ pub const Debug = struct {
         /// (x86_64: `push rbp; mov rbp, rsp`), after which the frame is
         /// addressed from the frame pointer until the epilogue.
         frame_pointer,
+        /// The outermost frame, such as std.start's `_start`: unwinding
+        /// stops here (x86_64: return address undefined, as for
+        /// `.cfi_undefined rip`).
+        outermost,
     };
 };
 

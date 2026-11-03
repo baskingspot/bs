@@ -199,7 +199,8 @@ fn writeSleb(out: []u8, value: u32) usize {
 }
 
 // Call frame information (.eh_frame and .eh_frame_hdr, x86_64). Every
-// function with a frame-pointer frame gets one FDE of `fde_size` bytes,
+// function with a frame (`Atom.Debug.Frame` other than `none`) gets one FDE
+// of `fde_size` bytes,
 // all sharing the CIE at the start of .eh_frame, so the linker places
 // them by count alone.
 
@@ -245,16 +246,28 @@ const fde_template = [_]u8{
     DW.CFA.advance_loc + 3,
     DW.CFA.def_cfa_register, 6, // CFA = rbp + 16
 } ++ @as([7]u8, @splat(DW.CFA.nop));
+
+/// An FDE for the outermost frame, such as `_start`'s: the CIE's CFA of
+/// rsp + 8, and no return address (rip undefined), which tells unwinders
+/// that the stack ends here.
+const outermost_fde_template = fde_template[0..17].* ++ [_]u8{
+    DW.CFA.undefined, 16, // rip undefined
+} ++ @as([13]u8, @splat(DW.CFA.nop));
 // zig fmt: on
 
 comptime {
-    std.debug.assert(cie.len % 8 == 0 and fde_template.len == fde_size);
+    std.debug.assert(cie.len % 8 == 0 and fde_template.len == fde_size and outermost_fde_template.len == fde_size);
 }
 
 /// Writes the FDE at offset `fde_off` of .eh_frame, for the `size`-byte
-/// function `pc_rel` bytes after the FDE's pc_begin field.
-pub fn writeFde(out: *[fde_size]u8, fde_off: u32, pc_rel: i32, size: u32) void {
-    out.* = fde_template;
+/// function `pc_rel` bytes after the FDE's pc_begin field, with a
+/// `frame` other than `none`.
+pub fn writeFde(out: *[fde_size]u8, frame: Atom.Debug.Frame, fde_off: u32, pc_rel: i32, size: u32) void {
+    out.* = switch (frame) {
+        .none => unreachable,
+        .frame_pointer => fde_template,
+        .outermost => outermost_fde_template,
+    };
     std.mem.writeInt(u32, out[4..8], fde_off + 4, .little);
     std.mem.writeInt(i32, out[8..12], pc_rel, .little);
     std.mem.writeInt(u32, out[12..16], size, .little);

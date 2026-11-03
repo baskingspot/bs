@@ -341,7 +341,10 @@ the callee's body first. Early cutoff on the set keeps such callers green.
 - Call frame information: std.debug unwinds x86_64-linux stacks with DWARF
   CFI (frame-pointer walking counts as unsafe there and is used only for
   panics), looking first for PT_GNU_EH_FRAME. So each `Debug` entry whose
-  `frame` is `.frame_pointer` gets a fixed 32-byte FDE for CodeGen's
+  `frame` is `.frame_pointer` or `.outermost` gets a fixed 32-byte FDE.
+  `.outermost` (std.start's `_start`, `.cfi_undefined rip`) keeps the
+  CIE's CFA of rsp+8 and marks rip undefined, which ends std.debug's
+  unwind (SelfUnwinder returns 0). `.frame_pointer` describes CodeGen's
   `push rbp; mov rbp, rsp` prologue (CFA rsp+8, then rsp+16 with rbp at
   CFA-16, then rbp+16), all sharing one CIE in an allocated .eh_frame, and
   an entry in .eh_frame_hdr's sorted search table; naked functions
@@ -351,9 +354,8 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   room of skipped entries stays zero after each section. Not described:
   the `ret` after each epilogue's `pop rbp` (CodeGen returns from several
   places; gdb's epilogue sniffer covers it), functions without `Debug`
-  (runtime helpers), and naked functions, including `_start` (std's
-  `_start` marks rip undefined with `.cfi_undefined`; a frame kind for that
-  can come with std.start). Verified with gdb (its dwarf2 unwinder, at
+  (runtime helpers), and naked functions other than an outermost one.
+  Verified with gdb (its dwarf2 unwinder, at
   entry, after the push, and in the body), `readelf
   --debug-dump=frames-interp` (same rows as upstream's FDEs, minus
   upstream's epilogue row), and std.debug's own unwinder
