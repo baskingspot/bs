@@ -2648,3 +2648,503 @@ state.
   matters: upstream built for the host CPU runs two fewer tests (the
   bitsliced AES cross-checks) and runs `math.lerp`, which it skips without
   FMA.
+
+## Diagnostics (designed 2026-11-03, for review)
+
+Two owner decisions (AGENTS.md) shape this section: zap's main users are
+coding agents, so compile errors are shaped for them; and zap may reject
+more than upstream, as long as everything else upstream accepts keeps its
+meaning and upstream's std and `test/behavior` still compile. Nothing here
+is built yet. `zig build` integration comes after it.
+
+### What agents get today (measured)
+
+A three-function program with three independent mistakes an agent makes in
+0.17 (`std.io`, `std.ArrayList(u8).init(gpa)`, returning a `usize` as
+`u32`) shows the problems. Both upstream and zap:
+
+- **report one error per build.** `main` calls `try greet()`, so `main`
+  depends on `greet`'s inferred error set. `greet` fails, so `main` fails,
+  and `collect` and `count` are never analyzed. The agent needs three
+  compile cycles for three independent errors. Likewise, any AstGen error,
+  even "unused function parameter", stops the build before Sema, so no
+  semantic error is shown with it.
+- **spend tokens on noise.** Upstream adds a reference trace through
+  `std/start.zig` (four frames plus "2 reference(s) hidden"), a caret line
+  per location, and a note "struct declared here" pointing at
+  `std.zig:1:1`, whose source line is `pub const AutoHashMap = ...`. zap
+  prints three "called inline here" notes through `start.zig` instead.
+  Upstream's output for the three errors (one build each) is 642 tokens
+  (o200k tokenizer).
+- **omit the facts the agent goes looking for.** "has no member named
+  'io'" gives no candidate (`Io`). The rename of `std.ascii.indexOfIgnoreCase`
+  to `findIgnoreCase` gives none either, and neither says what replaced a
+  removed API. A type mismatch prints an inferred error set as
+  `@typeInfo(@typeInfo(@TypeOf(a2.leak)).@"fn".return_type.?).error_union.error_set!u32`.
+
+API drift is likely the largest class of agent mistakes in Zig, since
+models are trained on several std versions. That's not measured across
+agents; the corpus below should track it. Writing this section's scratch
+tools hit three drift errors (`Ast.parse` options,
+`std.ascii.indexOfIgnoreCase`, `std.fs.cwd`), and none of the messages
+named the replacement.
+
+The form proposed below carries more facts (candidates, a migration hint,
+the declaration of `n`, a fix, a user-code reference) in 304 tokens for
+all three errors, reported in one build:
+
+```
+e.zig:4:21: error[no-member]: 'std' has no member named 'io'
+  | const out = std.io.getStdOut().writer();
+  candidates: Io
+  hint: std.io was replaced by std.Io; stdout is std.Io.File.stdout().writer(io, &buffer)
+  ref: main e.zig:20:14
+e.zig:9:33: error[no-member]: 'std.ArrayList(u8)' has no member named 'init'
+  | var list = std.ArrayList(u8).init(gpa);
+  candidates: initCapacity, initBuffer, empty
+  hint: std.ArrayList is unmanaged: `var list: std.ArrayList(u8) = .empty;`, then pass the allocator to each call (`list.append(gpa, x)`, `list.deinit(gpa)`)
+  ref: main e.zig:21:16
+e.zig:16:12: error[type-mismatch]: expected 'u32', found 'usize'
+  | return n;
+  note: u32 cannot represent all usize values
+  note e.zig:13:29: return type declared here
+  note e.zig:14:9: 'n' declared here: var n: usize = 0;
+  fix? e.zig:16:12-16:13: @intCast(n)
+  ref: main e.zig:22:14
+3 errors
+```
+
+The same three records as JSON lines are 428 tokens (cl100k: 633, 301 and
+414 for upstream, text and JSON).
+
+### Lessons from other compilers
+
+- **rustc**: a stable code per error (`E0308`, lint names such as
+  `unused_variables`), a primary span plus labeled secondary spans,
+  `help`/`note` children, `rustc --explain` for long explanations, and
+  `--error-format=json` with byte and line/column spans and suggestions
+  graded by applicability (`MachineApplicable`, `MaybeIncorrect`,
+  `HasPlaceholders`, `Unspecified`); `cargo fix` applies only the first
+  kind. zap takes all of this. The human rendering (ASCII art,
+  multi-line labels) costs tokens without adding facts.
+- **Go**: compiler errors are one `file:line:col: message` line each, and
+  the compiler rejects some things other languages only warn about
+  (unused imports and variables), which is the precedent for zap's extra
+  errors. `go vet` analyzers report `Diagnostic{Pos, End, Category,
+  Message, SuggestedFixes []{Message, TextEdits}, Related}`, and `go
+  test` runs only a high-confidence subset of vet automatically. Checks
+  that fail a build must be nearly free of false positives.
+- **Elm**: every error says what it found, what it expected, and what to
+  try ("These names seem close though:" with candidates, plus "Hint:" lines
+  that teach the language), and `--report=json` exposes the same content.
+  zap takes the candidates and hints, not the conversational prose.
+- **TypeScript**: numeric codes (`TS2322`), a compact non-pretty mode
+  (`file(3,5): error TS2322: ...`), an elaboration chain for nested type
+  mismatches ("Type 'X' is not assignable to type 'Y'. Property 'z' is
+  missing..."), `relatedInformation` locations, and code fixes served
+  by the language service. zap takes the chain for nested mismatches
+  (a field of a struct literal, a parameter of a function type) and the
+  related locations.
+
+Codes are mnemonic names (`no-member`, `type-mismatch`), as rustc's lint
+names and Go's analyzer names are, rather than numbers. An agent can read a
+name without looking it up, and the name costs one to three tokens.
+
+### Output form
+
+**Recommendation: text by default, JSON lines with
+`--error-format=json`.** Both render from the same record, so neither form
+has a fact the other lacks; JSON adds byte offsets. Text is the default
+because:
+
+- an agent reads the compiler's stderr directly in a shell tool, and
+  measured on the example above, text costs 29% fewer tokens than the
+  same JSON;
+- models read compiler text well, trained on rustc, gcc and upstream zig
+  output;
+- the first line of each error keeps the universal
+  `path:line:col: error...:` shape, so editors' problem matchers, `grep`,
+  and agent harnesses that parse upstream's output keep working.
+
+JSON is for programs: harnesses that apply fixes, editors, and a later
+`zap fix`.
+
+**Text grammar.** One error is a header line followed by indented detail
+lines, each starting with a keyword:
+
+```
+<path>:<line>:<col>: error[<code>]: <message>
+  | <primary source line, indentation trimmed>
+  note[ <path>:<line>:<col>]: <message>[: <declaration source line>]
+  candidates: <name>, <name>, ...
+  hint: <one line>
+  fix[?] <path>:<line>:<col>-<line>:<col>: <replacement text>
+  ref: <fn> <path>:<line>:<col> <- <fn> <path>:<line>:<col> (+<n> std frames)
+  in <n> instances: <comptime args of the first ones>
+```
+
+The output ends with `<n> errors`, or `<shown> of <n> errors (<code> <count>, ...)`
+when it hits the limit. Lines and columns are 1-based, and columns count
+bytes, as upstream. `fix:` is exact (apply as is); `fix?` is valid code
+that may not be what the author meant.
+
+**JSON lines.** One object per error, with short keys:
+`{"code", "file", "line", "col", "span": [start, end], "msg", "src",
+"notes": [{"file", "line", "col", "span", "msg", "src"}], "candidates",
+"hint", "fixes": [{"applicability": "exact"|"maybe"|"placeholder",
+"edits": [{"file", "span", "text"}]}], "ref": [{"fn", "file", "line",
+"col"}], "instances"}`. Spans are 0-based byte offsets, end exclusive.
+Absent fields are omitted, not null. The last line is
+`{"summary": {"errors": n, "shown": m}}`. As with rustc, consumers must
+ignore unknown keys.
+
+**Token efficiency rules**, each checked by the corpus tests below:
+
+1. The primary location's source line is printed once, without a caret
+   line. The column is in the header, and models misread caret alignment.
+   Notes print their source line only when it is a declaration (one line,
+   trimmed).
+2. Paths are relative to the working directory. Files under the zig lib
+   directory print as `std/...` (or `compiler_rt/...`, `lib/...`), not as
+   an absolute cache path (about 15 tokens each).
+3. Frames in std, `builtin` and compiler_rt collapse into a count. The
+   nearest frame in a checked module (see "Extra errors": the user's
+   modules) is always shown. When an error's own location is inside std
+   (a `std.fmt` format-string error, a comptime `assert`) and the call
+   chain reaches user code, the innermost user frame becomes the header
+   location, and the std location becomes a note `raised at std/...`.
+   That changes only the rendering.
+4. Identical errors from several generic instances of one source location
+   render once, with `in <n> instances:`.
+5. Cascades are suppressed: an error whose operands involve a failed value
+   is not reported (see "Recovery").
+6. At most 20 errors print by default (`-ferror-limit=<n>`, 0 for no
+   limit), with a summary by code. An agent fixes a few errors at a time.
+7. Types print in full, as fully qualified names with generic arguments,
+   but an inferred error set prints as its names when it has at most six
+   (`error{A,B}!u32`), else as `<fn>'s error set (<n> names)`. A type
+   printed in full once may be referred to by name in the same error.
+8. No color unless stderr is a terminal (upstream's `.auto` already does
+   this).
+9. Long explanations live behind `zap explain <code>` (a paragraph, an
+   example, the usual fix), not in the output.
+
+### The diagnostic record
+
+`Zcu.ErrorMsg` (file, absolute `Ast.Span`, message, notes) becomes a
+richer record. Text, JSON and ErrorBundle are three renderings of it.
+
+```zig
+pub const Diagnostic = struct {
+    code: Code, // enum(u16); names and `zap explain` texts in src/diag/codes.zig
+    loc: Loc,
+    msg: []const u8,
+    notes: []const Note = &.{},
+    candidates: []const InternPool.String = &.{},
+    hint: Hint = .none, // index into the migration and pattern table
+    fixes: []const Fix = &.{},
+    instances: u32 = 1,
+};
+/// A location relative to its declaration, resolved to line, column and
+/// byte span only when rendered: the declaration's tracked ZIR instruction
+/// and Sema's `Src` offset (a node or token offset from the declaration's
+/// base node), as upstream's LazySrcLoc does. A cached diagnostic stays
+/// correct when an edit above it moves the declaration.
+pub const Loc = struct { file: u32, decl: Zir.Inst.Index, off: Src.Offset };
+pub const Note = struct { loc: ?Loc, msg: []const u8, show_source: bool = false, count: u32 = 1 };
+pub const Fix = struct { applicability: enum { exact, maybe, placeholder }, edits: []const Edit };
+pub const Edit = struct { loc: Loc, text: []const u8 };
+```
+
+The reference trace (`ref:`) is not stored in the record. It is computed
+when rendering from `Zcu.referenced_by`, which keeps for each unit the
+(unit, `Src`) that referenced it with the smallest unit key, so the
+trace doesn't depend on scheduling. It's written where `queueFuncFrom` and
+the namespace lookups already record references: one entry per unit, on
+the first reference only.
+
+**Codes.** Each code is a kebab-case name, never renamed or reused once
+released; a retired code stays reserved. A code names a kind of error, not
+a call site. Sema has about 464 `fail` calls with about 273 distinct
+formats, which group into roughly 60 to 80 codes. AstGen has 186 error
+sites with 118 distinct formats. A Sema code is passed at the call site
+(`sema.failCode(block, src, .no_member, fmt, args)`). The migration is
+mechanical and staged: `sema.fail` keeps working with code `unclassified`
+until every call site names one, and a unit test lists the remaining
+`unclassified` sites. An AstGen code comes from a table of upstream's
+message formats (pinned at 0.17.0, so the table is complete). A test
+extracts every format string from `AstGen.zig` and checks that each one
+maps to a code.
+
+**Facts**, computed only on the error path from data Sema already has:
+
+- *Failed lookups* (`no-member`, `undeclared`, `no-field`): candidates
+  with Damerau-Levenshtein distance at most 2 or a case-insensitive match
+  (`io` → `Io`), restricted to `pub` names across files; all field names
+  when a type has at most 8; and the migration hint below.
+- *Type mismatches*: both types in full, the declaration that fixed the
+  expected type (return type, parameter, variable type) and the
+  declaration of the value's origin (a local or parameter, with its source
+  line). Nested mismatches (a field of a struct literal, a parameter of a
+  function type) are an elaboration chain of notes, as in TypeScript.
+- *Calls*: the callee's signature line and location on argument-count and
+  argument-type errors.
+- *Switches*: the missing tags (and a placeholder fix adding their prongs).
+- *Comptime*: the comptime call chain, compressed as in the token
+  efficiency rules.
+- *Migration and pattern hints*: a curated table keyed by (container,
+  missing name) or by builtin name, holding the 0.17 replacement for APIs
+  and syntax models still emit (`std.io`, `ArrayList.init`,
+  `std.fs.cwd`, `std.mem.indexOf*` to `find*`, `@intToEnum` and the other
+  pre-0.11 builtin names, `usingnamespace`, `async`). It's seeded by
+  diffing the `pub` declaration sets of std between upstream releases 0.11
+  and 0.17 (a script in `tools/diag/`), with the replacement text written
+  by hand and checked against 0.17's std. Expect a few hundred entries.
+
+**Fixes zap knows**, first set:
+
+| error | fix | applicability |
+|---|---|---|
+| unused local, parameter or capture (AstGen) | insert `_ = name;` after the declaration, or at the start of the body for a parameter | exact |
+| local variable is never mutated (AstGen) | `var` → `const` | exact |
+| pointless discard (AstGen) | delete the `_ = name;` statement | exact |
+| invalid builtin `@intToEnum(T, x)` and the other renamed builtins | `@as(T, @enumFromInt(x))` | exact |
+| error union is discarded | insert `try ` when the function returns an error union | maybe |
+| integer or float narrowing mismatch | wrap in `@intCast`, `@floatCast`, `@floatFromInt`, ... | maybe |
+| failed lookup with one candidate at distance 1 | rename | maybe |
+| switch must handle all possibilities | add `.tag => @panic("TODO"),` prongs | placeholder |
+| zap-only checks | see "Extra errors" | per check |
+
+### Where errors come from, and what changes
+
+- **AstGen** errors are upstream's AstGen unchanged. Frontend collects them
+  as ErrorBundles (`loadAll`'s bundle and `late_errors`). zap converts each
+  message into a Diagnostic: its code from the format table, its fix from
+  the table above. Only the rendering changes. One behavior changes: when
+  every AstGen error in the build comes from `checkUsed` (unused locals,
+  parameters and captures, pointless discards, never-mutated variables),
+  Sema still runs and its errors are reported too. Those errors are
+  appended, not raised (`appendErrorTok`), so the ZIR is complete. The
+  build still fails, so no program's meaning changes.
+- **Sema** errors go through `sema.fail`/`addNote` into `zcu.errors`,
+  which are sorted by unit key and position at the end (see "Parallel
+  function bodies"). `Zcu.renderErrors` and `main.renderErrors` turn them
+  into an ErrorBundle. They become `Diagnostic`s, and
+  `src/diag/render.zig` renders text or JSON. `noteCallSite`'s "called
+  inline here" notes become `ref` frames, so the collapsing rules apply to
+  them.
+- **ErrorBundle is not enough** as the record: it has no code, no fixes,
+  and only strings for facts, and it bakes absolute line and column in at
+  creation, which cached diagnostics can't use. It stays as the input
+  format for AstGen's errors and as the output for `--listen`
+  (`std.zig.Server`, which `zig build` and the test runner's IPC use). In
+  that output the code becomes a message prefix (`[no-member] ...`), and
+  facts and fixes become notes.
+- **Recovery** (more independent errors per build). A call that needs a
+  failed callee's inferred error set resolves it to a *poison* error set
+  instead of failing the caller. The caller keeps analyzing, so the
+  functions it references are queued and analyzed, and errors whose
+  operands involve poison are not reported (as rustc's error type and
+  TypeScript's error type do). The caller is still marked failed at the
+  end and never reaches CodeGen. In the example above this turns three
+  builds into one. Statement-level recovery inside a failed body is not
+  proposed: later statements depend on earlier ones, so it would mostly
+  produce cascades.
+
+### Errors and the cache
+
+Today a failing build records nothing: `exitOnErrors` exits before
+`Incremental` records the manifest, so the build after a compile error is
+cold. An agent's loop is edit, compile, read errors, so this is the build
+an agent waits for most. The change:
+
+- **A failing build commits its manifest** for every unit that succeeded,
+  and records failed units as failed nodes with no result. A failed node
+  is always red: an edit build re-analyzes it, which regenerates its full
+  diagnostics by construction. Its dependents that failed with it are red
+  too. Failed units are few, so this costs little and needs no serialized
+  form for failures.
+- **Diagnostics of units that succeeded** (zap-only checks: a check never
+  fails the unit, the build fails at the end) are part of the unit's
+  result entry. They're stored in a section of the payload with
+  declaration-relative `Loc`s and replayed when the unit loads green. They
+  are not part of the result hash used for early cutoff: dependents don't
+  read them.
+- **A no-edit rebuild of a failing build** is an edit build with no seeds.
+  It loads every green unit, re-analyzes only the failed ones, and prints
+  the same diagnostics. There is no relink.
+- **AstGen errors** are already in the ZIR cache entry, keyed by content.
+- `ZAP_CACHE_CHECK` also compares replayed diagnostics with a fresh
+  build's, as rendered text, byte for byte.
+
+### Extra errors: zap-only checks
+
+**Framework.** A check is a pass over a function's typed IR, plus its
+file's AST and the InternPool, and runs right after Sema produces that IR,
+in the same worker, before CodeGen. Each check lives in its own file in
+`src/check/` and reports `Diagnostic`s with its own code. The header
+names it as zap-only (`error[leak-on-error, zap-only]`) so that an agent
+or a person knows why upstream accepts the program. Checks:
+
+- run only on **checked modules**: modules given on the command line (the
+  root and `-M` modules) whose files are not under the zig lib directory.
+  Never std, `builtin` or compiler_rt, even when std is the root module
+  (`run.py --std`). With `zig build` integration, only the root package's
+  modules count, not dependencies from the package cache. `test/behavior`
+  files are root modules in conformance runs, so they are in scope, and
+  conformance with checks on is the first precision gate.
+- run on inlined code only when the inline callee's file is checked, and
+  report generic instances once per source location. A check whose answer
+  depends on comptime arguments runs only on non-generic functions.
+- are part of the unit's cached result (above). Check results depend only
+  on the unit's IR and its file, so they need no dependency of their own.
+- have a source-level way out that is valid upstream Zig and states the
+  intent (listed per check), plus `-fno-check=<code>` for a whole build.
+  There are no suppression comments: ZIR doesn't see comments, and
+  suppressions rot.
+- must cost under 2% of Sema time on the libvaxis workload (a linear
+  pass over IR), measured with `ZAP_TIMING`.
+
+The bar for making a check an error: zero findings on `test/behavior`, on
+libvaxis, and on upstream's compiler source (the bench workloads), except
+real bugs, and few on std (out of scope, but measured with
+`ZAP_CHECK_ALL=1` as a precision report). Go makes the same choice for
+the vet checks `go test` runs.
+
+**Candidates, measured** on std (563 files, 483 k lines), the compiler
+source (`upstream/src`, 182 files, 545 k lines), libvaxis `src/` (53
+files, 22 k lines) and `test/behavior`. The semantic counts come from a
+temporary probe in Sema while building std's tests, the compiler, and
+libvaxis's tests. The syntactic ones come from a scratch scanner using
+`std.zig.Ast`.
+
+| check | std | compiler | libvaxis | behavior | verdict |
+|---|---|---|---|---|---|
+| `catch unreachable` on a non-empty error set | 258 sites | 315 | 1 | 44 (30 on `anyerror`) | no: almost all deliberate (writes into fixed buffers, known-valid parses) |
+| … narrowed: the operand is a direct call into `std.Io`, `std.fs`, `std.posix`, `std.process` or `std.net`, and its error set names an OS error (`FileNotFound`, `AccessDenied`, ...; not `Canceled`, not `anyerror`) | 0 | 0 | 0 | 0 | **yes** |
+| `!T` whose inferred error set is empty | 35 functions | 63 | 3 | — | no: configuration-pruned (`builtin.is_test`, OS switches) or kept for interface symmetry |
+| allocation not freed on a later error path | 14 (syntactic) | 1 (syntactic) | 0 | 0 | **yes**, semantic form |
+| `@intCast` that can truncate | 2170 lines | 4205 | 157 | — | no: narrowing is what `@intCast` is for; Debug checks it at run time |
+| unused `pub` declarations | — | 2641 of 8058 `pub` declarations unreferenced | — | — | no: API surface, debug helpers, other build configurations |
+| returning a slice or pointer of a local array | 0 | 0 | 0 | 0 | **yes** |
+| `defer` frees or deinits what the function returns | 0 | 0 | 0 | 0 | **yes** |
+
+Notes on the evidence:
+
+- *`catch unreachable`, narrowed*: the probe listed every site with its
+  error set. Only seven name an OS error: three `Canceled` sets in std's
+  Io and test runner, two compiler-internal sets that include `Canceled`,
+  `Compilation.zig:4849` (a `resolveTargetQuery` for a non-native target,
+  which never touches the OS), and `link/Dwarf.zig:1044` (a debug check on
+  a large inferred set). Excluding `Canceled` and requiring a direct call
+  into the OS-facing namespaces removes all seven. That's by inspection;
+  the check itself must re-measure. In ReleaseFast, which users run
+  upstream for, `openFile(...) catch unreachable` on a missing file is
+  undefined behavior, so this is a real bug, and it's the shortcut
+  agents take. The way out is `catch |err| std.debug.panic("...: {t}",
+  .{err})` or handling the error. Fix: `fix?` replacing `unreachable`
+  with `|err| std.debug.panic("<callee> failed: {t}", .{err})`.
+- *Empty inferred error sets*: in libvaxis all three are
+  configuration-pruned (`Loop.installResizeHandler` on non-Windows,
+  `_ttyRun` under `builtin.is_test`, `nextEvent` through a queue whose
+  `pop` can't fail). In the compiler they're backend hooks such as
+  `Select.prepareReturn`, kept as `!void` for symmetry with siblings that
+  fail. Rejecting them would make code depend on the target it's built
+  for.
+- *Leaks*: the syntactic scan flags `const x = try a.alloc(...)` followed
+  by a `try` or `return error` before any `defer`/`errdefer` naming `x`,
+  ignoring arenas and stopping at any other use of `x` (a possible
+  ownership move). All 14 std hits are allocator self-tests or pool
+  allocations freed with the pool, and the compiler's one hit is
+  `cg.alloc`, a SPIR-V instruction, not an Allocator. The semantic check
+  requires the receiver's type to be `std.mem.Allocator`, skips `test`
+  blocks (a failing test leaks harmlessly, and the testing allocator
+  reports it), and treats passing `x` anywhere as a move. That removes
+  every hit above. Exact fix: insert `errdefer a.free(x);` (or
+  `a.destroy(x)` for `create`) after the declaration.
+- *Dangling returns*: upstream rejects `return &x` for a runtime local, but
+  accepts `return buf[0..n]` and `return s` where `s` came from
+  `bufPrint(&buf, ...)` on a local `buf`. Both return dangling stack
+  memory, and both compile without complaint (checked with upstream 0.17).
+  The check follows the IR from a slice or pointer of a runtime local
+  array to `ret`. Comptime functions are excluded (returning a comptime
+  local is fine). No exact fix: the way out is a caller-provided buffer or
+  an allocation.
+- *`defer` frees the returned value*: `defer a.free(b); return b;` compiles
+  upstream and returns freed memory. Fix (`fix?`): `defer` → `errdefer`,
+  which hands ownership to the caller.
+
+**Not a check, but measured: unreferenced code is never analyzed.**
+Forcing analysis of every declaration in libvaxis (`_ = &@field(T,
+name)` recursively, with upstream zig) gives 27 errors. Four are real
+latent bugs that compile today only because nothing references them:
+`std.posix.getenv` (Vaxis.zig:1659), `std.debug.FormattedPanic`
+(main.zig:52), `std.io` (widgets/TextView.zig:14), and `readCell` doing
+`return;` in a function returning `?Cell` (widgets/ScrollView.zig:125).
+The rest are Windows-only code and deliberate `@compileError` guards in
+zigimg. Agents write a helper, never call it, and see a clean build, so
+this matters. But analyzing everything rejects target-specific code, so
+it shouldn't be the default. Proposed later as an opt-in
+`-fanalyze-unreferenced` for checked modules (non-generic functions
+only), for the owner to decide.
+
+### Testing
+
+- **Corpus**: `test/diag/<code>/<case>.zig`, one mistake per file, with
+  the expected text output in a trailing comment block, as upstream's
+  `test/cases` do (`// error` then `// :4:21: error[no-member]: ...` and
+  its detail lines). `zig build test-diag` compiles each case with zap
+  and compares the output exactly. Each case also renders as JSON, which
+  must parse and convert back to the same text. Each case records whether
+  upstream rejects it, and a zap-only case must be accepted by upstream
+  (the harness checks it when `zig` is on `PATH`).
+- **Fixes round-trip**: applying every `exact` fix must give a program
+  that compiles, or that fails with the case's next expected error.
+- **Cache**: the corpus runs twice in one cache directory, the second time
+  as a no-edit rebuild and then after an edit above each error. Output
+  must be byte-identical, with `ZAP_CACHE_CHECK=1`.
+- **Parity with upstream**: `run.py --compile-errors` runs upstream's
+  `test/cases/compile_errors` (1017 files; 990 apply to x86_64-linux) and
+  counts cases where zap reports the same primary locations and messages,
+  and those with the same locations. Today's baseline with a ReleaseSafe
+  zap at 6828550: 401 exact, 91 more at the same location with different
+  wording, 349 different, 107 accepted, and 42 crashes (27 are
+  `Elf.parallel` panicking on an empty `build-obj`, also accepted
+  programs). The location share is the number to raise; the wording may
+  differ once codes and facts land.
+- **Precision gates for zap-only checks**: behavior 2170/2170 and std
+  3351/3351 with checks on, and zero findings on the bench workloads
+  (libvaxis text_input, the compiler), reported by `bench.py`.
+
+### Steps
+
+Each step is mergeable on its own and keeps today's errors otherwise
+unchanged:
+
+1. The record and the three renderers, AstGen code classification, and
+   the token-efficiency rules (paths, collapsed std frames, no carets,
+   error limit).
+2. Codes on Sema's call sites, in batches, coordinated with the Sema
+   thread, which owns most of them.
+3. Facts: candidates, declaration sites, user frame first, the reference
+   trace from `referenced_by`, and inferred error sets printed by name.
+4. The migration and pattern table.
+5. Fixes, first set.
+6. Recovery: `checkUsed` errors don't stop Sema, and failed callees'
+   error sets become poison.
+7. The cache: failing builds commit manifests, and check diagnostics are
+   stored in results.
+8. The check framework and the four checks, each gated as above.
+9. Later: `zap explain`, `zap fix` (applies exact fixes), and
+   `-fanalyze-unreferenced`.
+
+### Decisions for the owner
+
+- Text by default with `--error-format=json`, or JSON by default.
+  Recommended: text.
+- Keep upstream's message wording where it's already clear, and add the
+  code and facts around it. Recommended: yes; models know upstream's
+  messages from training.
+- The default error limit. Recommended: 20.
+- The four zap-only checks above as errors, and `-fanalyze-unreferenced`
+  as opt-in.
