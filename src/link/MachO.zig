@@ -1668,7 +1668,9 @@ fn LinkOf(comptime Input: type) type {
                 const t = resolved[r.info.target];
                 const p = p_base + r.offset;
                 const addend: i64 = r.addend;
-                const insn = std.mem.readInt(u32, field[0..4], .little);
+                // Only instruction fields are 4 bytes; a narrower field may
+                // end the atom.
+                const insn = if (width == 4) std.mem.readInt(u32, field[0..4], .little) else 0;
                 const invalid = error.InvalidRelocation;
                 errdefer diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
                 switch (r.info.kind) {
