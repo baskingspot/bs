@@ -1978,6 +1978,182 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   arguments after `--` and `ZIG_EXE` set: exit status and signals are the
   program's own.
 
+### Position-independent code and shared libraries (milestone 8; designed 2026-11-03)
+
+Scope: x86_64-linux. `build-obj -fPIC`/`-fPIE` and `build-lib -fPIC`
+(archives) produce objects that link into PIEs and shared objects with
+upstream zig, `cc` and `ld`; `build-lib -dynamic` produces a shared
+object that a C program and an upstream-built program load. `build-exe`
+stays static and non-PIE whatever `-fPIE` says (decided 2026-11-03,
+above), so zap's own executable link sees none of this.
+
+**What is position-dependent today** (surveyed 2026-11-03):
+- Code reaches every symbol RIP-relative (`x86_64_pc32`). No code atom
+  has an absolute relocation: `Encoder.movAbsSym` is used only by linker
+  tests, and inline assembly has no symbol operands.
+- An `extern` is read from an 8-byte slot (`Emit.lowerExternSlots`: a
+  .rodata atom holding an `x86_64_abs64` to the definition, or in an
+  object to an import). The slots are zap's GOT already: code loads a
+  slot RIP-relative and calls through it, so no PLT is needed for them.
+- Imports are the only symbols another module can preempt. Every
+  reference from Zig code to Zig code, exported functions and variables
+  included, binds inside the image, as upstream's: an upstream `-dynamic`
+  library calls its own `export fn foo` with a direct `call foo` and
+  reads its exported variable with `lea exported_data(%rip)`, and
+  reaches only `extern` functions through the PLT. zap does the same, so
+  exports need no GOT entries and cannot be interposed from inside.
+- Data pointers are `x86_64_abs64` in .rodata and .data atoms.
+- Thread-locals use local-exec (`x86_64_tpoff32`) only.
+
+So making code position-independent is a matter of thread-locals and of
+where data with absolute relocations goes. Everything else is the
+linkers'.
+
+**Modes.** As upstream (checked with `--show-builtin`): `-fPIC` on
+`build-obj`/`build-lib` sets `position_independent_code`; `-fPIE` on
+`build-obj` sets both it and `position_independent_executable`;
+`build-lib -dynamic` forces PIC and sets `link_mode = .dynamic`. Below,
+*pic* means position-independent code that may end up in a shared
+object (`-fPIC`, `-dynamic`), *pie* code that ends up in an executable.
+
+**Thread-locals in code** (CodeGen and Encoder; the only change in code):
+- Not pic, or pie: local-exec, as today. An executable's thread-locals
+  are in its static TLS block, so `-fPIE` keeps `TPOFF32`, as `gcc
+  -fPIE` does for variables the object defines.
+- pic: local-dynamic, upstream's sequence for pic code,
+  `lea rdi, [rip + x@tlsld]; call __tls_get_addr@plt; lea dst, [rax +
+  x@dtpoff]`. It is the canonical form linkers relax to local-exec
+  (`mov rax, fs:0`, padded) when the object lands in an executable.
+  Zig's thread-locals are always defined in the image (Sema rejects
+  thread-local externs, which stay `[unsupported]`), so local-dynamic
+  covers them, and general-dynamic is not needed.
+- The sequence is a call: in pic mode `CodeGen.clobbers` returns true for
+  `tls_ptr`, so the allocator keeps nothing in rsi, rdi, r8 or r9 across
+  it, as for calls; rax, rcx, rdx, r10 and r11 are scratch already, and no
+  value lives in an xmm register across instructions yet (when floats get
+  registers, `tls_ptr` counts as a call there too). The stack is 16-byte
+  aligned at every instruction of a body (fixed frames), as calls need.
+- Rejected: TLS descriptors, which preserve every register but rax:
+  upstream's new linker (`Elf2`) rejects `GOTPC32_TLSDESC`, while it
+  links TLSLD (without relaxing; std exports `__tls_get_addr` in a
+  static executable for such links). A helper that
+  saves the caller-saved registers around `__tls_get_addr`: 30 or more
+  saves per access, for no gain over treating the access as a call.
+- Inline assembly gets `sym(%rip)` operands and the `.weak`/`.hidden`
+  directives, for std.pie's `lea _DYNAMIC(%rip)`, which std.start runs
+  in a `-fPIE` object whose root has `main` (static PIE start code). Only
+  that case needs it, so it comes last.
+- Non-pic code is byte-identical to today's.
+
+**Atoms.** Two relocation kinds, appended so stored numbers stay put:
+`x86_64_tlsld` (the variable's module, R_X86_64_TLSLD: PC-relative to
+the module's TLS GOT pair, A = -4) and `x86_64_dtpoff32` (S + A minus the
+start of the TLS segment, R_X86_64_DTPOFF32). The call names the import
+`__tls_get_addr`. Nothing else changes: whether an atom needs dynamic
+relocations follows from its relocations, so neither `Atom.Section` nor
+the atom gains a field.
+
+**Data with absolute addresses.** In a pic or pie image, a .rodata atom
+with an `x86_64_abs64` (or a `value64` naming a symbol) goes to
+`.data.rel.ro` instead; extern slots are such atoms. A loader must write
+those words, and `lld` refuses dynamic relocations in a read-only
+segment (`ld` writes DT_TEXTREL, which hardened loaders refuse). Elf's
+layout decides it per atom, only for pic and pie images. In a shared
+object `.data.rel.ro` is under PT_GNU_RELRO, so it is read-only once
+relocated.
+
+**Objects** (`ElfObject`): `x86_64_pc32` to an import becomes
+R_X86_64_PLT32 (the only one is the call to `__tls_get_addr`; other
+imports are reached through slots), any other `x86_64_pc32` PC32,
+`x86_64_abs64` R_X86_64_64 (the final link turns it into RELATIVE or a
+symbol relocation), `x86_64_tlsld` TLSLD against the variable's symbol,
+`x86_64_dtpoff32` DTPOFF32. A pic object has no TPOFF32 and no absolute
+relocation outside .data, .data.rel.ro and the debug sections. Archives
+wrap the same object, as now.
+
+**Exports.** `Zcu.Export` gains linkage and visibility from `@export`'s
+options (an `export` declaration is strong and default). Today only the
+name is honored. Objects then bind weak exports STB_WEAK and mark hidden
+and protected ones; a shared object leaves hidden exports out of
+`.dynsym`; `.internal` linkage exports nothing. This is a small change to
+Sema (written here, reviewed by the Sema thread).
+
+**Shared objects** (`build-lib -dynamic`): `Elf.emit` with
+`Options.dynamic` (exports, imports, soname). ET_DYN at base 0, written
+once like the executable; `src/link/ElfDynamic.zig` builds the dynamic
+sections, and Elf calls it at layout and in the copy tasks.
+- Layout. R: ELF header, program headers, .dynsym, .gnu.hash, .hash,
+  .dynstr, .rela.dyn, .rodata, .eh_frame, .eh_frame_hdr. RX: .plt, .text.
+  RW: .tdata, .tbss (room only, as now), .data.rel.ro, .dynamic, .got,
+  the end of PT_GNU_RELRO (page-aligned), .data, .bss. Program headers:
+  PT_PHDR, three PT_LOADs, PT_DYNAMIC, PT_TLS, PT_GNU_RELRO,
+  PT_GNU_EH_FRAME, PT_GNU_STACK.
+- `.dynsym`: the imports, undefined, GLOBAL or WEAK; then the exports
+  with default or protected visibility (FUNC or OBJECT, with the atom's
+  size), ordered by GNU hash bucket. Both `.gnu.hash` and `.hash`, as
+  upstream writes them; glibc and musl read either.
+- `.rela.dyn`: R_X86_64_RELATIVE for each `x86_64_abs64` to a defined
+  symbol, first, counted in DT_RELACOUNT; R_X86_64_64 for one to an
+  import (extern slots); R_X86_64_DTPMOD64 for the module's TLS GOT pair
+  (one, if any `x86_64_tlsld`); R_X86_64_GLOB_DAT for each PLT slot.
+- `.plt`: an 8-byte stub, `jmp [rip + slot]` and padding, for each import
+  that an `x86_64_pc32` reaches (`__tls_get_addr`). Binding is eager
+  (DF_BIND_NOW, DF_1_NOW, no DT_JMPREL), as upstream's libraries are, so
+  there is no lazy-binding header.
+- `.dynamic`: DT_SONAME (`lib<name>.so` by default, `-fsoname=`,
+  `-fno-soname`), HASH, GNU_HASH, SYMTAB, SYMENT, STRTAB, STRSZ, RELA,
+  RELASZ, RELAENT, RELACOUNT, FLAGS, FLAGS_1. There is no DT_NEEDED:
+  imports resolve against what the loader has already loaded (the host
+  program, its libc, and the dynamic linker's `__tls_get_addr`), as for
+  upstream's libraries that do not link libc.
+- TLS: `x86_64_tlsld` is PC-relative to the GOT pair (DTPMOD64, 0);
+  `x86_64_dtpoff32` is the offset in the PT_TLS block.
+- Undefined externs are imports, as in an object; an extern the
+  compilation exports resolves inside.
+- Written once: the dynamic sections' sizes are known before layout:
+  the symbol and string counts come from the exports and imports, and
+  one pass over the atoms, pic only, counts the relocations that need
+  records, per chunk. Each copy task then writes its RELATIVE records
+  at prefix-summed indexes, in offset order, while it resolves its
+  chunk.
+- `.symtab`, debug info and unwind tables are as in the executable.
+
+**Executables do not slow down.** zap's own executable link never sees
+the new kinds, since `build-exe` is not pic. The `.data.rel.ro` decision
+and the dynamic records run only for pic and pie images. The relocation
+loop takes a comptime flag for them, so the static loop compiles as
+before. `zig build bench-link` and std's tests (compile time) must not
+move.
+
+**Cache.** `-fPIC` and `-dynamic` exist only on `build-obj` and
+`build-lib`, which skip the cache today, so no pic atom reaches the
+store. When objects are cached ("Roots and output kinds"), the
+compilation key holds the arguments and builtin.zig differs, so pic and
+non-pic atoms never mix; the manifest's output kind gains `shared`.
+
+**Checks.**
+- A zap `-fPIC` object: exported functions and data, a table of data
+  pointers, a thread-local written from two threads, an extern the host
+  defines, and a panic trace through its frames. It is linked into
+  shared objects with `cc -shared`, `ld -shared` and upstream `zig
+  build-lib -dynamic`, and into PIEs with `cc -pie` and upstream `zig
+  build-exe -fPIE`, then loaded and run. The same `-fPIC` archive is
+  linked with `cc -shared -Wl,--whole-archive`.
+- A zap shared object, loaded by a C program (`-l` at link time, and
+  `dlopen`/`dlsym`) and by an upstream-built Zig program. readelf finds
+  no TEXTREL, no relocation kinds other than the four above, and RELRO
+  covering `.data.rel.ro`, `.dynamic` and `.got`.
+- `zig build test` keeps them (test/pic, next to test/obj).
+
+**Steps.** 1: pic objects and archives (thread-locals, `.data.rel.ro`,
+PLT32, export linkage). 2: shared objects. 3: `-fPIE` objects whose root
+has `main` (inline assembly symbols). Ownership: this thread owns the
+encoder, the atom kinds, `Emit`'s output kinds and the linkers. The two
+CodeGen edits (`tls_ptr`'s lowering and `clobbers`) are written here and
+reviewed by the hello thread, which owns CodeGen; the Sema thread
+reviews export linkage; the cache thread is consulted on the relocation
+kinds.
+
 ### compiler_rt (decided 2026-11-02)
 
 - Upstream compiles all of `lib/compiler_rt.zig` as a separate compilation
