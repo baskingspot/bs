@@ -251,6 +251,26 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 compile.addArtifactArg(zap);
                 break :bin out;
             } else compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            // CodeGen on worker threads gives the same output as on the
+            // Sema thread (`ZAP_THREADS`); checked on programs that use
+            // compiler_rt helpers, constants, error names and generics.
+            if (!upstream and isThreadChecked(file)) {
+                compile.setEnvironmentVariable("ZAP_THREADS", "4");
+                compile.setEnvironmentVariable("ZAP_CACHE", "off");
+                const serial = b.addRunArtifact(zap);
+                serial.setName(b.fmt("compile {s} (ZAP_THREADS=1)", .{name}));
+                serial.addArgs(&.{ "build-exe", "-target", "x86_64-linux" });
+                serial.addFileArg(b.path(src_path));
+                serial.addFileInput(b.path("test/run/rt.zig"));
+                serial.setEnvironmentVariable("ZAP_THREADS", "1");
+                serial.setEnvironmentVariable("ZAP_CACHE", "off");
+                const serial_bin = serial.addPrefixedOutputFileArg("-femit-bin=", name);
+                const same = b.addSystemCommand(&.{"cmp"});
+                same.setName(b.fmt("{s}: ZAP_THREADS=4 and 1 build the same", .{name}));
+                same.addFileArg(bin);
+                same.addFileArg(serial_bin);
+                test_step.dependOn(&same.step);
+            }
             if (!upstream and !host_runs_zap_output) {
                 // zap emits x86_64-linux executables; elsewhere only check
                 // that they compile.
@@ -266,6 +286,13 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             (if (upstream) upstream_step else test_step).dependOn(&run.step);
         }
     }
+}
+
+fn isThreadChecked(file: []const u8) bool {
+    for ([_][]const u8{ "errors.zig", "float.zig", "int128.zig", "std_patterns.zig" }) |f| {
+        if (std.mem.eql(u8, file, f)) return true;
+    }
+    return false;
 }
 
 /// Each `test/diag/*.zig` program is a compile error. It ends with a block

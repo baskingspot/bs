@@ -344,6 +344,11 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // n more times (`zig build bench-codegen`).
     const bench_runs: u32 = if (env.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
     if (bench_runs != 0) emit.bench_irs = .empty;
+    // `ZAP_THREADS=n`: analysis and CodeGen on n threads, Sema on one and
+    // CodeGen on the others; 1 generates on the Sema thread. The output
+    // is the same for every n.
+    const threads: usize = if (env.get("ZAP_THREADS")) |v| std.fmt.parseInt(usize, v, 10) catch 1 else std.Thread.getCpuCount() catch 1;
+    try emit.startPool(@max(threads, 1) - 1);
     const sema_node = prog.start("Analyze and Generate Code", 0);
     if (inc_opt) |i| try i.beginReplay(&fe, &zcu, &emit, std.mem.eql(u8, env.get("ZAP_CACHE_REPLAY") orelse "", "off"));
     try zcu.analyzeAll(&emit);

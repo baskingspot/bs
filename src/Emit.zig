@@ -3,6 +3,12 @@
 //! until the link, lowers the data the code refers to (declarations,
 //! anonymous constants), and assigns error codes, which
 //! reach machine code only through `value*` relocations.
+//!
+//! CodeGen runs on a pool of workers behind the Sema thread (`Pool`), each
+//! generating into its own worker Emit. Their output is merged into the
+//! main Emit in the order Sema handed the functions over, which makes the
+//! result that of generating each function right after its analysis
+//! (see "Parallel function bodies" in docs/architecture.md).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -11,6 +17,7 @@ const Index = InternPool.Index;
 const Ir = @import("Ir.zig");
 const Type = @import("Type.zig");
 const Zcu = @import("Zcu.zig");
+const Diag = @import("diag.zig");
 const Atom = @import("link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Elf = @import("link/Elf.zig");
@@ -94,6 +101,97 @@ bench_irs: ?std.ArrayList(Ir) = null,
 ssa: Ssa = .{},
 /// Per-stage backend time and size, for `ZAP_TIMING` and bench-codegen.
 codegen_stats: CodeGenStats = .{},
+/// The CodeGen workers, on the main Emit (`startPool`).
+pool: ?*Pool = null,
+/// Whether analysis still runs: the main Emit collects compiler_rt
+/// requests in `rt_pending` until then.
+analyzing: bool = false,
+/// Compiler_rt functions requested while analysis runs, which `sync`
+/// hands to the Zcu once its function queue is empty, in request order.
+/// So the point where Sema learns of them does not depend on when CodeGen
+/// ran.
+rt_pending: std.StringArrayHashMapUnmanaged(void) = .empty,
+/// The exports snapshot last handed to a worker (`exportsSnapshot`), and
+/// how many of its declarations were not resolved yet.
+export_snap: ExportsView = .{ .list = &.{}, .resolved = &.{} },
+export_snap_unresolved: u32 = 0,
+/// Whether this is a worker's Emit, whose output `mergeOut` moves into the
+/// main Emit. A worker changes nothing shared: what would (compiler_rt
+/// requests, imports, compile errors) is logged for the merge.
+is_worker: bool = false,
+/// On a worker: requests that change state shared beyond this Emit, in
+/// order.
+side: std.ArrayList(Side) = .empty,
+/// On a worker: the compiler_rt keys requested, owned.
+rt_keys: std.StringHashMapUnmanaged(void) = .empty,
+/// On a worker: compile errors CodeGen reported (`addError`).
+codegen_errors: std.ArrayList(Zcu.ErrorMsg) = .empty,
+/// On a worker: the exports as they were when Sema handed over the
+/// function being generated.
+exports_view: ExportsView = .{ .list = &.{}, .resolved = &.{} },
+
+/// The CodeGen workers. Sema hands each analyzed function over as a job
+/// (`functionOwned`); workers take jobs in order, and `mergeJobs` waits
+/// for all jobs handed over and merges their output in job order. Jobs not
+/// handed over yet when a merge comes, and with no threads every job, are
+/// generated on the Sema thread into its own Emit, `workers[threads]`; the
+/// merge is the same.
+pub const Pool = struct {
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    /// Signaled when a job is added or the pool stops.
+    work: std.Io.Condition = .init,
+    /// Signaled when the last job handed over has finished.
+    idle: std.Io.Condition = .init,
+    /// Jobs handed over since the last merge, in analysis order. Only the
+    /// Sema thread adds or removes jobs; workers take and fill them under
+    /// `mutex`.
+    jobs: std.ArrayList(Job) = .empty,
+    /// Jobs not handed over yet, after `jobs`: the Sema thread hands them
+    /// over in batches (`batch_len`), since waking a worker costs about as
+    /// much as a small function's CodeGen.
+    batch: std.ArrayList(Job) = .empty,
+    taken: usize = 0,
+    /// Workers waiting for `work`.
+    sleeping: usize = 0,
+    finished: usize = 0,
+    stop: bool = false,
+    /// A worker's error (out of memory), returned by the next merge.
+    err: ?Allocator.Error = null,
+    workers: []Emit,
+    threads: usize = 0,
+    group: std.Io.Group = .init,
+};
+
+const Job = struct {
+    ir: Ir,
+    exports: ExportsView,
+    /// Set when the job finished: the worker that generated it, and what
+    /// it added to that worker's lists.
+    worker: u32 = 0,
+    out: Out = undefined,
+    /// A job in `batch` the Sema thread generated already (no threads).
+    done: bool = false,
+};
+
+/// The lengths of a worker's output lists.
+const Marks = struct { atoms: u32, debug: u32, content_uses: u32, unit_refs: u32, side: u32, errors: u32 };
+
+const Out = struct { start: Marks, end: Marks, failed: bool };
+
+const Side = union(enum) {
+    rt: []const u8,
+    import: struct { name: []const u8, weak: bool },
+};
+
+/// `Zcu.exports` as CodeGen may read them: a worker's snapshot, taken when
+/// Sema handed over its function, or the live list on the main Emit.
+pub const ExportsView = struct {
+    list: []const Zcu.Export,
+    /// Whether each export's declaration was resolved when the snapshot
+    /// was taken; null: read its status now.
+    resolved: ?[]const bool = null,
+};
 
 pub const CodeGenStats = struct {
     /// Building the SSA form from the IR.
@@ -156,7 +254,7 @@ pub const UnitRef = struct {
         err: InternPool.String,
         /// `useExtern`; the name is owned by `externs`.
         ext: struct { name: []const u8, weak: bool },
-        /// `requestCompilerRt`'s key, owned by `Zcu.rt_helpers`.
+        /// `requestCompilerRt`'s key, owned by the Emit that requested it.
         rt: []const u8,
         error_names,
     },
@@ -189,11 +287,112 @@ pub fn deinit(emit: *Emit) void {
     emit.uav_uses.deinit(gpa);
     emit.units_seen.deinit(gpa);
     emit.error_values.deinit(gpa);
+    emit.rt_pending.deinit(gpa);
+    emit.side.deinit(gpa);
+    emit.rt_keys.deinit(gpa);
+    emit.codegen_errors.deinit(gpa);
+    if (emit.pool) |pool| {
+        stopWorkers(pool);
+        for (pool.workers) |*w| w.deinit();
+        gpa.free(pool.workers);
+        for (pool.batch.items) |*job| if (!job.done) job.ir.deinit(gpa);
+        pool.batch.deinit(gpa);
+        pool.jobs.deinit(gpa);
+        gpa.destroy(pool);
+    }
     emit.arena.deinit();
 }
 
-/// Sink callback from `Zcu.analyzeAll`.
-pub fn function(emit: *Emit, zcu: *Zcu, ir: *const Ir) !void {
+/// Ends the worker threads once they finished the jobs left, which frees
+/// their IR. Their Emits stay: the main Emit's atoms point into them.
+fn stopWorkers(pool: *Pool) void {
+    const io = pool.io;
+    pool.mutex.lockUncancelable(io);
+    pool.stop = true;
+    pool.work.broadcast(io);
+    pool.mutex.unlock(io);
+    pool.group.await(io) catch {};
+}
+
+/// Starts CodeGen workers on `threads` threads besides the Sema thread; 0
+/// generates each function on the Sema thread, with the same output.
+pub fn startPool(emit: *Emit, threads: usize) !void {
+    const gpa = emit.gpa;
+    const io = emit.zcu.io;
+    // One per thread, and the Sema thread's.
+    const workers = try gpa.alloc(Emit, threads + 1);
+    errdefer gpa.free(workers);
+    for (workers) |*w| {
+        w.* = .init(gpa, emit.zcu);
+        w.is_worker = true;
+        w.obj = emit.obj;
+    }
+    const pool = try gpa.create(Pool);
+    pool.* = .{ .io = io, .workers = workers };
+    emit.pool = pool;
+    emit.analyzing = true;
+    for (0..threads) |i| {
+        pool.group.concurrent(io, workerMain, .{ pool, i }) catch break;
+        pool.threads += 1;
+    }
+}
+
+fn workerMain(pool: *Pool, index: usize) void {
+    Type.codegen_worker = true;
+    const io = pool.io;
+    const w = &pool.workers[index];
+    pool.mutex.lockUncancelable(io);
+    defer pool.mutex.unlock(io);
+    while (true) {
+        while (pool.taken == pool.jobs.items.len and !pool.stop) {
+            pool.sleeping += 1;
+            pool.work.waitUncancelable(io, &pool.mutex);
+            pool.sleeping -= 1;
+        }
+        if (pool.taken == pool.jobs.items.len) return;
+        const i = pool.taken;
+        pool.taken += 1;
+        const job = pool.jobs.items[i];
+        pool.mutex.unlock(io);
+        const out = runJob(w, job.ir, job.exports);
+        pool.mutex.lockUncancelable(io);
+        if (out) |o| {
+            pool.jobs.items[i].out = o;
+        } else |err| {
+            if (pool.err == null) pool.err = err;
+            pool.jobs.items[i].out = .{ .start = w.marks(), .end = w.marks(), .failed = false };
+        }
+        pool.jobs.items[i].worker = @intCast(index);
+        pool.finished += 1;
+        if (pool.finished == pool.jobs.items.len) pool.idle.signal(io);
+    }
+}
+
+fn marks(w: *const Emit) Marks {
+    return .{
+        .atoms = @intCast(w.atoms.items.len),
+        .debug = @intCast(w.debug.items.len),
+        .content_uses = @intCast(w.content_uses.items.len),
+        .unit_refs = @intCast(w.unit_refs.items.len),
+        .side = @intCast(w.side.items.len),
+        .errors = @intCast(w.codegen_errors.items.len),
+    };
+}
+
+/// Generates a job's function into worker Emit `w`, and frees its IR.
+fn runJob(w: *Emit, ir: Ir, exports: ExportsView) Allocator.Error!Out {
+    var owned = ir;
+    defer owned.deinit(w.gpa);
+    w.exports_view = exports;
+    w.failed = false;
+    const start = w.marks();
+    try w.generateFunction(&owned);
+    return .{ .start = start, .end = w.marks(), .failed = w.failed };
+}
+
+/// Sink callback from `Zcu.analyzeAll`, which hands over the IR: generates
+/// the function, on a worker if there is a pool.
+pub fn functionOwned(emit: *Emit, zcu: *Zcu, ir: Ir) !void {
     if (emit.bench_irs) |*irs| {
         var list = ir.instructions.toMultiArrayList();
         try irs.append(emit.gpa, .{
@@ -205,14 +404,203 @@ pub fn function(emit: *Emit, zcu: *Zcu, ir: *const Ir) !void {
             .rbrace_column = ir.rbrace_column,
         });
     }
+    const pool = emit.pool orelse {
+        var owned = ir;
+        defer owned.deinit(emit.gpa);
+        return emit.generateFunction(&owned);
+    };
+    const exports = try emit.exportsSnapshot();
+    if (pool.threads == 0) {
+        const t0 = std.Io.Timestamp.now(zcu.io, .awake);
+        defer emit.codegen_ns += @intCast(t0.durationTo(.now(zcu.io, .awake)).nanoseconds);
+        const out = try runJob(&pool.workers[0], ir, exports);
+        try pool.batch.append(emit.gpa, .{ .ir = undefined, .exports = exports, .out = out, .done = true });
+        return;
+    }
+    try pool.batch.append(emit.gpa, .{ .ir = ir, .exports = exports });
+    if (pool.batch.items.len == batch_len) try publish(pool, emit.gpa);
+}
+
+/// How many jobs the Sema thread hands over at once.
+const batch_len = 16;
+
+fn publish(pool: *Pool, gpa: Allocator) !void {
+    pool.mutex.lockUncancelable(pool.io);
+    defer pool.mutex.unlock(pool.io);
+    try pool.jobs.appendSlice(gpa, pool.batch.items);
+    pool.batch.clearRetainingCapacity();
+    if (pool.sleeping != 0) pool.work.broadcast(pool.io);
+}
+
+/// Sink callback from `Zcu.analyzeAll` when its function queue is empty:
+/// waits for CodeGen, merges its output, and hands the compiler_rt
+/// functions requested so far to the Zcu.
+pub fn sync(emit: *Emit, zcu: *Zcu) !void {
+    try emit.mergeJobs();
+    for (emit.rt_pending.keys()) |key| _ = try zcu.requestCompilerRtKey(key);
+    emit.rt_pending.clearRetainingCapacity();
+}
+
+/// Generates a function into this Emit.
+fn generateFunction(emit: *Emit, ir: *const Ir) Allocator.Error!void {
     emit.owner = .{ .unit = .{ .func = ir.func } };
     defer emit.owner = .link;
-    const t0 = std.Io.Timestamp.now(zcu.io, .awake);
-    defer emit.codegen_ns += @intCast(t0.durationTo(.now(zcu.io, .awake)).nanoseconds);
+    const io = emit.zcu.io;
+    const t0 = std.Io.Timestamp.now(io, .awake);
+    defer emit.codegen_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
     CodeGen.generate(emit, ir) catch |err| switch (err) {
         error.CodegenFail => emit.failed = true,
         else => |e| return e,
     };
+}
+
+/// Merges the output of the jobs handed over so far, in job order, once
+/// they have finished. On the Sema thread, before anything else writes to
+/// the main Emit (`syncPending`), so the result does not depend on when
+/// the workers ran.
+fn mergeJobs(emit: *Emit) Allocator.Error!void {
+    const pool = emit.pool orelse return;
+    if (pool.jobs.items.len + pool.batch.items.len == 0) return;
+    const io = pool.io;
+    const t0 = std.Io.Timestamp.now(io, .awake);
+    defer emit.codegen_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
+    // Jobs not handed over yet run here, while the workers finish theirs,
+    // rather than wake a worker and wait: an edit build, which loads most
+    // units from the cache, merges after nearly every function it
+    // generates.
+    const own: u32 = @intCast(pool.threads);
+    for (pool.batch.items) |*job| if (!job.done) {
+        job.out = try runJob(&pool.workers[own], job.ir, job.exports);
+        job.worker = own;
+        job.done = true;
+    };
+    if (pool.jobs.items.len != 0) {
+        pool.mutex.lockUncancelable(io);
+        while (pool.finished < pool.jobs.items.len) pool.idle.waitUncancelable(io, &pool.mutex);
+        pool.mutex.unlock(io);
+    }
+    if (pool.err) |err| return err;
+    for (pool.jobs.items) |*job| try emit.mergeOut(&pool.workers[job.worker], job.out);
+    for (pool.batch.items) |*job| try emit.mergeOut(&pool.workers[job.worker], job.out);
+    pool.batch.clearRetainingCapacity();
+    pool.mutex.lockUncancelable(io);
+    pool.jobs.clearRetainingCapacity();
+    pool.taken = 0;
+    pool.finished = 0;
+    pool.mutex.unlock(io);
+    // The workers are idle until the Sema thread hands over more.
+    for (pool.workers) |*w| {
+        w.atoms.clearRetainingCapacity();
+        w.atom_owners.clearRetainingCapacity();
+        w.debug.clearRetainingCapacity();
+        w.content_uses.clearRetainingCapacity();
+        w.unit_refs.clearRetainingCapacity();
+        w.side.clearRetainingCapacity();
+        w.codegen_errors.clearRetainingCapacity();
+        inline for (@typeInfo(CodeGenStats).@"struct".field_names) |name| @field(emit.codegen_stats, name) += @field(w.codegen_stats, name);
+        w.codegen_stats = .{};
+    }
+}
+
+/// Merges what one job added to worker Emit `w`, as if it had been
+/// generated into this Emit. A worker deduplicates content-addressed atoms
+/// and memoizes constants itself; since a worker's jobs are in job order,
+/// the first job to use a constant has its atom, which this keeps unless
+/// an earlier job's or a loaded unit's is here already, and a request that
+/// a worker repeats from its memo was made by an earlier job.
+fn mergeOut(emit: *Emit, w: *const Emit, out: Out) Allocator.Error!void {
+    const gpa = emit.gpa;
+    const zcu = emit.zcu;
+    // A loaded unit's atoms can be next (`syncPending`).
+    const saved = emit.owner;
+    defer emit.owner = saved;
+    for (w.side.items[out.start.side..out.end.side]) |s| switch (s) {
+        .rt => |key| _ = try emit.requestRtKey(key),
+        .import => |i| _ = try emit.useImport(i.name, i.weak),
+    };
+    var d = out.start.debug;
+    for (out.start.atoms..out.end.atoms) |i| {
+        const atom = w.atoms.items[i];
+        const owner = w.atom_owners.items[i];
+        if (owner == .content and (try emit.content_keys.getOrPut(gpa, atom.key)).found_existing) continue;
+        if (d < out.end.debug and w.debug.items[d].atom == i) {
+            var dbg = w.debug.items[d];
+            dbg.atom = @intCast(emit.atoms.items.len);
+            try emit.debug.append(gpa, dbg);
+            d += 1;
+        }
+        emit.owner = owner;
+        try emit.appendAtom(atom);
+    }
+    try emit.content_uses.appendSlice(gpa, w.content_uses.items[out.start.content_uses..out.end.content_uses]);
+    const refs = w.unit_refs.items[out.start.unit_refs..out.end.unit_refs];
+    try emit.unit_refs.appendSlice(gpa, refs);
+    for (refs) |ur| switch (ur.ref) {
+        .nav => |n| try emit.navs.put(gpa, n, {}),
+        .err => |e| try emit.errors.put(gpa, e, {}),
+        .ext => |x| {
+            const gop = try emit.externs.getOrPut(gpa, x.name);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = x.weak;
+            } else if (!x.weak) gop.value_ptr.* = false;
+        },
+        // In `side`.
+        .rt => {},
+        .error_names => emit.uses_error_names = true,
+    };
+    for (w.codegen_errors.items[out.start.errors..out.end.errors]) |e| {
+        var copy = e;
+        copy.msg = try zcu.arena.allocator().dupe(u8, e.msg);
+        try zcu.errors.append(zcu.gpa, copy);
+    }
+    if (out.failed) emit.failed = true;
+}
+
+/// Merges CodeGen's pending output before the main Emit changes in
+/// another way (a unit the cache loads), as the serial order has it.
+fn syncPending(emit: *Emit) Allocator.Error!void {
+    if (emit.pool) |pool| if (pool.jobs.items.len + pool.batch.items.len != 0) try emit.mergeJobs();
+}
+
+/// The exports for a job handed over now: copied when they changed, so
+/// that a worker reads them as they were, whenever it runs.
+fn exportsSnapshot(emit: *Emit) !ExportsView {
+    const ip = &emit.zcu.ip;
+    const xs = emit.zcu.exports.items;
+    const snap = emit.export_snap;
+    if (snap.list.len == xs.len) {
+        if (emit.export_snap_unresolved == 0) return snap;
+        for (snap.list, snap.resolved.?) |x, r| {
+            if (!r and ip.getNav(x.target.nav).status == .resolved) break;
+        } else return snap;
+    }
+    const arena = emit.allocator();
+    const list = try arena.dupe(Zcu.Export, xs);
+    const resolved = try arena.alloc(bool, xs.len);
+    var unresolved: u32 = 0;
+    for (list, resolved) |x, *r| {
+        r.* = x.target != .nav or ip.getNav(x.target.nav).status == .resolved;
+        unresolved += @intFromBool(!r.*);
+    }
+    emit.export_snap = .{ .list = list, .resolved = resolved };
+    emit.export_snap_unresolved = unresolved;
+    return emit.export_snap;
+}
+
+/// The exports CodeGen sees (`ExportsView`).
+pub fn exportsView(emit: *const Emit) ExportsView {
+    return if (emit.is_worker) emit.exports_view else .{ .list = emit.zcu.exports.items };
+}
+
+/// `Zcu.addError`, from CodeGen: a worker keeps the error for the merge.
+pub fn addError(emit: *Emit, file_index: u32, span: std.zig.Ast.Span, comptime fmt: []const u8, args: anytype) !void {
+    if (!emit.is_worker) return emit.zcu.addError(file_index, span, fmt, args);
+    try emit.codegen_errors.append(emit.gpa, .{
+        .file = file_index,
+        .span = span,
+        .msg = try std.fmt.allocPrint(emit.allocator(), fmt, args),
+        .code = comptime Diag.formatCode(fmt),
+    });
 }
 
 /// `ZAP_BENCH_CODEGEN=n`: generates every function captured during
@@ -225,7 +613,7 @@ pub fn benchCodegen(emit: *Emit, runs: u32) !void {
     for (0..runs) |_| {
         var e: Emit = .init(emit.gpa, emit.zcu);
         defer e.deinit();
-        for (irs.items) |*ir| try e.function(emit.zcu, ir);
+        for (irs.items) |*ir| try e.generateFunction(ir);
         const s = e.codegen_stats;
         if (best == null or s.build_ns + s.alloc_ns + s.emit_ns < best.?.build_ns + best.?.alloc_ns + best.?.emit_ns) best = s;
     }
@@ -239,6 +627,11 @@ pub fn benchCodegen(emit: *Emit, runs: u32) !void {
 pub fn finish(emit: *Emit) !bool {
     const zcu = emit.zcu;
     const ip = &zcu.ip;
+    try emit.mergeJobs();
+    emit.analyzing = false;
+    // The threads go back to the Io for the cache's recording and the
+    // link, which run concurrently.
+    if (emit.pool) |pool| stopWorkers(pool);
     // Before the declarations: a slot can request an exported one.
     if (!try emit.lowerExternSlots()) return false;
     if (emit.obj) try emit.findExports();
@@ -298,6 +691,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
 /// The key of the 8-byte slot holding the address of external symbol
 /// `name`, requesting that `finish` write it.
 pub fn useExtern(emit: *Emit, name: []const u8, weak: bool) !SymbolKey {
+    try emit.syncPending();
     const gop = try emit.externs.getOrPut(emit.gpa, name);
     if (!gop.found_existing) {
         gop.key_ptr.* = try emit.allocator().dupe(u8, name);
@@ -321,20 +715,39 @@ fn addContentUse(emit: *Emit, key: SymbolKey) !void {
 
 /// `Zcu.requestCompilerRt` on behalf of the current unit.
 pub fn requestCompilerRt(emit: *Emit, file_name: []const u8, name: []const u8) ![]const u8 {
-    const key = try emit.zcu.requestCompilerRt(file_name, name);
+    try emit.syncPending();
+    var buf: [128]u8 = undefined;
+    const key = try emit.requestRtKey(Zcu.compilerRtKey(&buf, file_name, name));
     try emit.addRef(.{ .rt = key });
     return key;
 }
 
 /// `Zcu.requestCompilerRtExport` on behalf of the current unit.
 pub fn requestCompilerRtExport(emit: *Emit, name: []const u8) !?[]const u8 {
-    const key = try emit.zcu.requestCompilerRtExport(name) orelse return null;
-    try emit.addRef(.{ .rt = key });
-    return key;
+    const e = Zcu.compilerRtExport(name) orelse return null;
+    return try emit.requestCompilerRt(e.file, e.decl);
+}
+
+/// Requests compiler_rt function `key` and returns the key, owned: from a
+/// worker, for the merge; while analysis runs, for `sync`; after it, from
+/// the Zcu.
+fn requestRtKey(emit: *Emit, key: []const u8) ![]const u8 {
+    if (emit.is_worker) {
+        const gop = try emit.rt_keys.getOrPut(emit.gpa, key);
+        if (gop.found_existing) return gop.key_ptr.*;
+        gop.key_ptr.* = try emit.allocator().dupe(u8, key);
+        try emit.side.append(emit.gpa, .{ .rt = gop.key_ptr.* });
+        return gop.key_ptr.*;
+    }
+    if (!emit.analyzing) return emit.zcu.requestCompilerRtKey(key);
+    const gop = try emit.rt_pending.getOrPut(emit.gpa, key);
+    if (!gop.found_existing) gop.key_ptr.* = try emit.allocator().dupe(u8, key);
+    return gop.key_ptr.*;
 }
 
 /// Requests the error name table, which `@errorName` reads.
 pub fn useErrorNames(emit: *Emit) !void {
+    try emit.syncPending();
     emit.uses_error_names = true;
     try emit.addRef(.error_names);
 }
@@ -357,6 +770,7 @@ fn useImport(emit: *Emit, name: []const u8, weak: bool) !SymbolKey {
         gop.key_ptr.* = try emit.allocator().dupe(u8, name);
         gop.value_ptr.* = weak;
     } else if (!weak) gop.value_ptr.* = false;
+    if (emit.is_worker) try emit.side.append(emit.gpa, .{ .import = .{ .name = gop.key_ptr.*, .weak = weak } });
     return importKey(name);
 }
 
@@ -423,21 +837,23 @@ pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
     emit.export_lookups += 1;
     if (try emit.userExport(name)) |key| return key;
     if (emit.obj) return try emit.useImport(name, false);
-    return if (try emit.zcu.requestCompilerRtExport(name)) |key| .fromName(key) else null;
+    const e = Zcu.compilerRtExport(name) orelse return null;
+    var buf: [128]u8 = undefined;
+    return .fromName(try emit.requestRtKey(Zcu.compilerRtKey(&buf, e.file, e.decl)));
 }
 
 /// The symbol the compilation exports as `name`, or null.
 fn userExport(emit: *Emit, name: []const u8) !?SymbolKey {
-    const zcu = emit.zcu;
-    const ip = &zcu.ip;
-    for (zcu.exports.items) |x| {
+    const ip = &emit.zcu.ip;
+    const view = emit.exportsView();
+    for (view.list, 0..) |x, i| {
         if (!std.mem.eql(u8, ip.stringSlice(x.name), name)) continue;
         const x_nav = switch (x.target) {
             .nav => |n| n,
             .uav => |v| return try emit.uavKey(v, 0),
         };
         const nav = ip.getNav(x_nav);
-        if (nav.status != .resolved) continue;
+        if (!(if (view.resolved) |r| r[i] else nav.status == .resolved)) continue;
         return if (ip.keyTag(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x_nav);
     }
     return null;
@@ -448,6 +864,16 @@ pub fn allocator(emit: *Emit) Allocator {
 }
 
 pub fn addAtom(emit: *Emit, atom: Atom) !void {
+    if (emit.is_worker) {
+        // `mergeOut` tracks grouping in the main Emit.
+        try emit.atom_owners.append(emit.gpa, emit.owner);
+        return emit.atoms.append(emit.gpa, atom);
+    }
+    try emit.syncPending();
+    try emit.appendAtom(atom);
+}
+
+fn appendAtom(emit: *Emit, atom: Atom) !void {
     try emit.atom_owners.ensureUnusedCapacity(emit.gpa, 1);
     const owners = emit.atom_owners.items;
     if (emit.grouped and (owners.len == 0 or !std.meta.eql(owners[owners.len - 1], emit.owner))) switch (emit.owner) {
@@ -542,6 +968,7 @@ pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.Ar
 
 /// Adds a function's atom and its debug info.
 pub fn addFunction(emit: *Emit, atom: Atom, debug: Atom.Debug) !void {
+    try emit.syncPending();
     try emit.debug.ensureUnusedCapacity(emit.gpa, 1);
     var d = debug;
     d.atom = @intCast(emit.atoms.items.len);
@@ -585,6 +1012,7 @@ pub fn funcKey(emit: *Emit, func: Index) !SymbolKey {
 
 /// The key of a declaration's data atom, requesting that it be emitted.
 pub fn navKey(emit: *Emit, nav: InternPool.NavIndex) !SymbolKey {
+    try emit.syncPending();
     try emit.navs.put(emit.gpa, nav, {});
     try emit.addRef(.{ .nav = nav });
     return .fromName(try emit.unitName(.{ .nav_val = nav }));
@@ -640,6 +1068,7 @@ fn emitErrorNameTable(emit: *Emit) !void {
 }
 
 pub fn useError(emit: *Emit, name: InternPool.String) !SymbolKey {
+    try emit.syncPending();
     try emit.errors.put(emit.gpa, name, {});
     try emit.addRef(.{ .err = name });
     return errorKey(&emit.zcu.ip, name);

@@ -252,7 +252,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     // upstream's local symbols; the atom's key is its identity.
     var name: []const u8 = ip.stringSlice(nav.fqn);
     if (func.generic_owner != .none) name = try std.fmt.allocPrint(arena, "{s}__func_{x:0>8}", .{ name, @as(u32, @truncate(ip.stableHash(ir.func))) });
-    for (emit.zcu.exports.items) |x| {
+    for (emit.exportsView().list) |x| {
         if (x.target == .nav and x.target.nav == func.owner_nav and func.generic_owner == .none) name = ip.stringSlice(x.name);
     }
     const file = emit.zcu.file(nav.file);
@@ -351,7 +351,7 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
     const tree = try cg.emit.zcu.fe.tree(@fromBackingInt(nav.file));
     const decl = cg.emit.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst);
-    try cg.emit.zcu.addError(nav.file, tree.nodeToSpan(decl.src_node), "zap codegen: " ++ fmt, args);
+    try cg.emit.addError(nav.file, tree.nodeToSpan(decl.src_node), "zap codegen: " ++ fmt, args);
     return error.CodegenFail;
 }
 
@@ -660,7 +660,7 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
             // The address of an extern function is in its link slot.
             if (p.base == .uav and ip.keyTag(p.base.uav.val) == .extern_func and p.byte_offset == 0) {
                 const name = ip.stringSlice(ip.keyPayload(.extern_func, p.base.uav.val).name);
-                _ = try cg.emit.zcu.requestCompilerRtExport(name);
+                _ = try cg.emit.requestCompilerRtExport(name);
                 return .{ .mem = Mem.sym(try cg.emit.useExtern(name, false), 0) };
             }
             if (ptrToZeroBit(ip, val)) return .{ .imm = 0xaaaaaaaaaaaaaaaa };
@@ -2883,7 +2883,7 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
             // An extern function's address in data: the export's symbol.
             const name = ip.stringSlice(ip.keyPayload(.extern_func, u.val).name);
             const key = try emit.exportTarget(name) orelse {
-                try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
+                try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
                 return error.CodegenFail;
             };
             break :blk .{ .key = key, .off = 0 };

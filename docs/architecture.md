@@ -1802,11 +1802,16 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   always loaded: a std-free hello took 2 files instead of 701; 0.6 ms
   cold instead of 180–190 ms, 0.3–0.5 ms warm instead of 5.6–5.8 ms). AstGen errors in files loaded this way are
   reported with Sema's (`Frontend.late_errors`). CodeGen calls a helper
-  through `Zcu.requestCompilerRt(file, name)`, which returns the stable key
+  through `Emit.requestCompilerRt(file, name)`, which returns the stable key
   of the helper's function unit, `compiler_rt:compiler_rt/<file>:<name>`;
-  that key is also the call's symbol. `Zcu.analyzeAll` resolves each new
-  request (the file's root type, the declaration by name, its value) and
-  queues the function like any other. Helpers are named by declaration,
+  that key is also the call's symbol. Emit hands the requests to the Zcu
+  (`Zcu.requestCompilerRtKey`) when `analyzeAll`'s function queue is empty
+  (`sink.sync`), in the order they were made, so when Sema learns of a
+  helper does not depend on when CodeGen ran (see "Parallel function
+  bodies"); it also keeps file loads away from running CodeGen workers,
+  which read `Frontend.files`. `Zcu.analyzeAll` resolves each new request
+  (the file's root type, the declaration by name, its value) and queues
+  the function like any other. Helpers are named by declaration,
   not by exported symbol (`__cmptf2` serves `__lttf2`, `fmodq` is exported
   as `fmodf128`).
 - compiler_rt bodies are analyzed without runtime safety, ignoring
@@ -2723,7 +2728,9 @@ shares nothing across projects and ties the file format to in-memory layout.
 n analysis units that took longest, each without the units it analyzed in
 turn (timed from `Sema.create` to `Sema.destroy`). CodeGen runs inside
 `Zcu.analyzeAll` (Emit times `CodeGen.generate`); "Sema" is the rest of
-`analyzeAll`. "Record" is the wait for the cache after the link. ReleaseFast
+`analyzeAll`. (The table predates parallel CodeGen: since then "CodeGen"
+is the Sema thread's time waiting for and merging the workers' output,
+and with `ZAP_THREADS=1` the same as before.) "Record" is the wait for the cache after the link. ReleaseFast
 zap, 4-core orb, page cache warm; "ZIR warm" means std's ZIR was in the
 global cache but the compilation's directory was empty.
 
@@ -2862,18 +2869,89 @@ the zig workload, each a real new or reused value. Beyond that the
 walker's cost is spread thin; the next structural step is fewer
 intermediate values per operation, not cheaper ones.
 
-### Parallel function bodies (designed 2026-11-03, for review)
+### Parallel function bodies (designed 2026-11-03; step 1 built 2026-11-03)
 
-Not built yet; two threads change Sema daily. Three steps, each useful
-alone, sharing one hook.
+Three steps, each useful alone, sharing one hook. Step 1 is built (below);
+steps 2 and 3 are designs.
 
-**Step 1: CodeGen on a pool, behind one Sema thread.** CodeGen reads the
-InternPool and Zcu without interning (it requests compiler_rt functions
-and declarations' data, which become locked appends). Sema stays serial;
-`sink.function` hands each IR, owned, to a pool of CodeGen workers, each
-with its own Emit output (below). Expected: Sema plus CodeGen goes from
-the sum to about Sema alone: 155 → ~120 ms on hello, 470 → ~310 ms on the
-generated program, 10 → ~6.3 s on binary.zig.
+**Step 1: CodeGen on a pool, behind one Sema thread (built).** Sema stays
+serial and unchanged. `Zcu.analyzeAll` hands each function's IR, owned, to
+`Emit.functionOwned`, which queues it as a job for a pool of CodeGen
+workers (`Emit.Pool`), each generating into its own worker Emit: its own
+arena, atoms, debug entries, owners, content-atom uses, unit references,
+SSA scratch, constant memo, and content-atom set. `ZAP_THREADS=n` runs
+Sema plus n−1 workers (default: one per CPU); `ZAP_THREADS=1` generates
+each function on the Sema thread into the same worker Emit, with the
+same merge, which is the serial path for A/B runs. The output is
+byte-identical for every n.
+
+- *Order.* Workers take jobs in hand-over order, so each worker's jobs are
+  ascending. `Emit.mergeJobs` waits for every job handed over and moves
+  each job's output into the main Emit in job order (`mergeOut`), as if
+  the function had been generated right after its analysis: atoms with
+  their owners (which keeps `grouped`/`groupByOwner` and the manifest's
+  node order as they were), debug entries renumbered, content uses, and
+  unit references, whose effects (declarations to lower, error names,
+  extern slots, the error name table) are applied as `navKey` and friends
+  would have. A content-addressed atom is kept unless the main Emit has
+  its key already; since the first job to use a constant is the first
+  job of its worker to use it, its atom is in that job's output. A
+  constant a worker finds in its memo was lowered by an earlier job of the
+  same worker, which already made the requests the memo repeats.
+- *When it merges.* Before anything else writes to the main Emit: when a
+  unit the cache loads adds atoms or requests (`Replay` calls Emit's
+  methods, which merge first), at `analyzeAll`'s `sink.sync` when the
+  function queue is empty, and at `finish`. Whether jobs are pending is a
+  count, not timing, so merges happen at the same points for every n.
+- *What a worker must not change.* A worker reads the InternPool (items
+  are published before the job is queued, and arrays retire rather than
+  free), resolved declarations and layouts, ZIR and file paths. What would
+  change shared state is logged in its Emit and applied at the merge:
+  compiler_rt requests and object imports (`Emit.side`), compile errors
+  (`Emit.addError`). compiler_rt requests reach the Zcu only at
+  `sink.sync`, so the Sema thread learns of them at the same point
+  whatever the timing, and loading a helper's files (which grows
+  `Frontend.files`) happens with every worker idle. Exports, which
+  CodeGen reads for symbol names and `@extern` targets and which analysis
+  keeps adding to, come from a snapshot taken when the job was queued
+  (`Emit.exportsSnapshot`: the list and which declarations were resolved,
+  copied only when either changed). `Type.isComptimeOnly` caches its
+  answer in the type's info; on a worker (`Type.codegen_worker`) it reads
+  only final answers and writes nothing.
+- *Handing over.* The Sema thread queues jobs in batches of 16
+  (`batch_len`) under one lock: waking a worker per function cost about
+  as much as the CodeGen it moved (7 ms of hello's 150). A merge runs the
+  jobs not handed over yet on the Sema thread, into its own Emit, while
+  the workers finish theirs: an edit build merges after nearly every
+  function it generates (the next loaded unit), and waking a worker for
+  each one made vaxis's edit-lib build 118 → 174 ms.
+- *Measured* (ReleaseFast zap, this orb: 4 vCPUs on 2 cores, default 3
+  workers, against origin/main b30a515 in the same session; bench.py
+  medians):
+
+  | Build | before | after |
+  |---|---:|---:|
+  | hello, cold-local | 234 ms | 186 ms |
+  | hello, cold | 483 ms | 429 ms |
+  | vaxis, cold-local | 549–561 ms | 485–493 ms |
+  | vaxis, cold | 716 ms | 677 ms |
+  | zig workload, cold | 13.73 s | 10.89 s |
+  | std tests (`zap test lib/std/std.zig --test-no-exec`, cache off) | 8.31 s | 7.22 s |
+  | vaxis, edit-root / edit-lib | 111 / 109–112 ms | 104 / 107–114 ms |
+
+  `ZAP_TIMING`: on hello the Sema thread spends 1.4 ms in CodeGen
+  instead of 74 ms; on the zig workload, Sema plus CodeGen goes from
+  11.5 s (8.65 + 2.89) to 8.7 s (CodeGen 45 ms). What is left is Sema
+  itself, which runs a few percent slower next to busy workers (std:
+  7.42 → 7.65 s), since two of the four vCPUs share its core. Peak RSS
+  grows by 4–5% (std 601 → 624 MB, zig workload 1232 → 1296 MB): each
+  worker keeps its own SSA scratch and constant memo, and IR waits in
+  the queue.
+
+Step 1 orders output by hand-over, not by the node key sort below: with
+one Sema thread, hand-over order is deterministic and keeps the serial
+order byte for byte. Step 2, where hand-over order depends on timing,
+needs the sort.
 
 **Step 2: function bodies on a pool.** Workers take queued function
 bodies; each worker runs Sema and then CodeGen on the same body while the
@@ -3001,7 +3079,8 @@ are queued, which is cheap); `finish`'s data lowering (5 ms on the
 generated program); and the re-analysis of dependency loops and of units
 that read provisional error codes.
 
-**Checking it.** `ZAP_THREADS=1` runs everything inline. The output
+**Checking it.** `ZAP_THREADS=1` runs everything inline (built for step
+1, where it means CodeGen on the Sema thread). The output
 binary and the manifest's atom order must be byte-identical across thread
 counts and runs, and conformance must not change. A debug option that
 shuffles the work queue and adds random yields at claim points exposes

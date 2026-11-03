@@ -242,6 +242,11 @@ pub fn isComptimeOnly(ip: *const InternPool, ty: Index) bool {
     return comptimeOnly(ip, ty, &hit_cycle);
 }
 
+/// Set on CodeGen worker threads (see `Emit.Pool`), which read types while
+/// the Sema thread analyzes: `comptimeOnly` there neither writes the
+/// per-type cache nor trusts its in-progress mark.
+pub threadlocal var codegen_worker: bool = false;
+
 /// Sets `hit_cycle` when the answer assumed that a struct already being
 /// examined is not comptime-only; such answers are not cached.
 fn comptimeOnly(ip: *const InternPool, ty: Index, hit_cycle: *bool) bool {
@@ -259,12 +264,19 @@ fn comptimeOnly(ip: *const InternPool, ty: Index, hit_cycle: *bool) bool {
             switch (info.comptime_only) {
                 .yes => return true,
                 .no => return false,
-                .computing => {
+                // Another thread's mark on a CodeGen worker: answered below.
+                .computing => if (!codegen_worker) {
                     hit_cycle.* = true;
                     return false;
                 },
                 .unknown => {},
             }
+            // A CodeGen worker reads only types whose layout is resolved,
+            // which contain no cycle, and leaves the cache to the Sema
+            // thread, whose in-progress marks it must not see or make.
+            if (codegen_worker) return for (info.field_types, 0..) |ft, i| {
+                if (!info.fieldIsComptime(i) and comptimeOnly(ip, ft, hit_cycle)) break true;
+            } else false;
             info.comptime_only = .computing;
             var inner_cycle = false;
             const result = for (info.field_types, 0..) |ft, i| {

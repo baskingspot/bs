@@ -855,25 +855,28 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
     return true;
 }
 
-/// Requests compiler_rt function `name`, declared in `lib/compiler_rt/<file>`,
-/// and returns the stable key of its function unit (its symbol). Only that
-/// declaration and what it reaches are analyzed, never compiler_rt's
-/// `comptime` export blocks.
-pub fn requestCompilerRt(zcu: *Zcu, file_name: []const u8, name: []const u8) ![]const u8 {
-    var buf: [128]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "compiler_rt:compiler_rt/{s}:{s}", .{ file_name, name }) catch unreachable;
+/// The stable key of compiler_rt function `name`, declared in
+/// `lib/compiler_rt/<file>`: the key of its function unit (its symbol).
+pub fn compilerRtKey(buf: *[128]u8, file_name: []const u8, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "compiler_rt:compiler_rt/{s}:{s}", .{ file_name, name }) catch unreachable;
+}
+
+/// Requests compiler_rt function `key` (`compilerRtKey`) and returns the
+/// key, owned by `rt_helpers`. Only that declaration and what it reaches
+/// are analyzed, never compiler_rt's `comptime` export blocks.
+pub fn requestCompilerRtKey(zcu: *Zcu, key: []const u8) ![]const u8 {
     const gop = try zcu.rt_helpers.getOrPut(zcu.gpa, key);
     if (!gop.found_existing) gop.key_ptr.* = try zcu.arena.allocator().dupe(u8, key);
     return gop.key_ptr.*;
 }
 
-/// The stable key of the compiler_rt function exporting libm symbol `name`
-/// (`sinf`, `__floorh`, `sqrtf128`, ...), requesting it like
-/// `requestCompilerRt`, or null if compiler_rt does not export `name`.
-/// For `@extern` references, which upstream resolves against the
+pub const RtExport = struct { file: []const u8, decl: []const u8 };
+
+/// The compiler_rt function exporting libm symbol `name` (`sinf`,
+/// `__floorh`, `sqrtf128`, ...), or null if compiler_rt does not export
+/// `name`. For `@extern` references, which upstream resolves against the
 /// compiler_rt it links.
-pub fn requestCompilerRtExport(zcu: *Zcu, name: []const u8) !?[]const u8 {
-    const RtExport = struct { file: []const u8, decl: []const u8 };
+pub fn compilerRtExport(name: []const u8) ?RtExport {
     const map = comptime blk: {
         const ops = .{ "sqrt", "sin", "cos", "tan", "exp", "exp2", "log", "log2", "log10", "fabs", "floor", "ceil", "round", "trunc", "fma", "fmin", "fmax", "fmod" };
         var kvs: [ops.len * 5]struct { []const u8, RtExport } = undefined;
@@ -889,8 +892,7 @@ pub fn requestCompilerRtExport(zcu: *Zcu, name: []const u8) !?[]const u8 {
         }
         break :blk std.StaticStringMap(RtExport).initComptime(kvs);
     };
-    const e = map.get(name) orelse return null;
-    return try zcu.requestCompilerRt(e.file, e.decl);
+    return map.get(name);
 }
 
 fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
@@ -915,9 +917,21 @@ fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
     _ = try zcu.queueFunc(zcu.ip.getNav(nav).val);
 }
 
+/// Hands a function's IR to the sink: a sink with `functionOwned` keeps it
+/// (Emit gives it to a CodeGen worker); `function` borrows it.
+fn sinkFunction(zcu: *Zcu, sink: anytype, ir: Ir) !void {
+    if (@hasDecl(@TypeOf(sink.*), "functionOwned")) return sink.functionOwned(zcu, ir);
+    var owned = ir;
+    defer owned.deinit(zcu.gpa);
+    try sink.function(zcu, &owned);
+}
+
 /// Analyzes the root file's `comptime` and exported declarations and
 /// everything they reach. Each runtime function body is passed to
-/// `sink.function(ir)` as soon as it is analyzed, then freed.
+/// `sink.function(ir)` (or `sink.functionOwned`) as soon as it is analyzed.
+/// A sink with `sync` is called when the function queue is empty; it may
+/// request compiler_rt functions then (Emit: CodeGen runs behind Sema and
+/// hands its requests over there), which are analyzed in turn.
 pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
     // Upstream's analysis roots: std (whose start code imports the root
     // module) and, under `zap test`, the module under test.
@@ -969,12 +983,14 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
             continue;
         }
         if (zcu.ready_irs.items.len != 0) {
-            var ir = zcu.ready_irs.orderedRemove(0);
-            defer ir.deinit(zcu.gpa);
-            try sink.function(zcu, &ir);
+            try zcu.sinkFunction(sink, zcu.ready_irs.orderedRemove(0));
             continue;
         }
-        if (zcu.next_func == zcu.func_queue.items.len) break;
+        if (zcu.next_func == zcu.func_queue.items.len) {
+            if (@hasDecl(@TypeOf(sink.*), "sync")) try sink.sync(zcu);
+            if (done_rt == zcu.rt_helpers.count()) break;
+            continue;
+        }
         const func = zcu.func_queue.items[zcu.next_func];
         zcu.next_func += 1;
         const state = zcu.funcs.getPtr(func).?;
@@ -985,15 +1001,14 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
             continue;
         };
         // Analysis can grow `funcs`, so the state is looked up again after.
-        var ir = Sema.analyzeFuncBody(zcu, func) catch |err| switch (err) {
+        const ir = Sema.analyzeFuncBody(zcu, func) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 zcu.funcs.getPtr(func).?.* = .failed;
                 continue;
             },
         };
-        defer ir.deinit(zcu.gpa);
         zcu.funcs.getPtr(func).?.* = .done;
-        try sink.function(zcu, &ir);
+        try zcu.sinkFunction(sink, ir);
     }
 }
