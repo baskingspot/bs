@@ -8,4 +8,5 @@ pub fn main() void {
 // error
 // no_member.zig:4:20: error[no-member]: 'std' has no member named 'io'
 //   | const out = std.io.getStdOut();
+//   note std/std.zig:1:1: struct declared here
 // 1 error

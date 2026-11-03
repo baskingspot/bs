@@ -402,7 +402,7 @@ pub const Src = struct {
         return_operand: Ast.Node.Offset,
     },
 
-    fn span(src: Src, tree: *const Ast) Ast.Span {
+    pub fn span(src: Src, tree: *const Ast) Ast.Span {
         return switch (src.loc) {
             .node => |off| tree.nodeToSpan(off.toAbsolute(src.base)),
             .node_abs => |n| tree.nodeToSpan(n),
@@ -1183,12 +1183,41 @@ pub fn fail(sema: *Sema, block: *const Block, src: Src, comptime fmt: []const u8
     return sema.failCode(block, src, comptime @import("diag.zig").formatCode(fmt), fmt, args);
 }
 
-/// `fail` with a code other than its format's.
+/// `fail` with a code other than its format's. As upstream, each
+/// declared type the message names gets a note at its declaration.
 fn failCode(sema: *Sema, block: *const Block, src: Src, code: @import("diag.zig").Code, comptime fmt: []const u8, args: anytype) CompileError {
     _ = block;
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     try sema.zcu.addErrorCode(sema.file, src.span(tree), code, fmt, args);
+    sema.zcu.errors.items[sema.zcu.errors.items.len - 1].unit = sema.owner;
+    inline for (args) |arg| if (@TypeOf(arg) == FmtType) try sema.addDeclaredHereNote(arg.ty);
     return error.AnalysisFail;
+}
+
+/// Notes where struct, union, enum or opaque type `ty` is declared, on the
+/// most recent error (upstream's `addDeclaredHereNote`).
+fn addDeclaredHereNote(sema: *Sema, ty: Index) CompileError!void {
+    const ip = sema.ip;
+    const category = switch (Type.class(ip, ty)) {
+        .@"struct" => "struct",
+        .@"union" => "union",
+        .@"enum" => "enum",
+        .@"opaque" => "opaque",
+        else => return,
+    };
+    const c = ip.containerType(ty) orelse return;
+    const code = &sema.zcu.file(c.file).zir;
+    const node: Ast.Node.Index = reifyNode(code, c.zir_inst) orelse switch (code.instructions.items(.data)[@backingInt(c.zir_inst)].extended.opcode) {
+        .struct_decl => code.getStructDecl(c.zir_inst).src_node,
+        .union_decl => code.getUnionDecl(c.zir_inst).src_node,
+        .enum_decl => code.getEnumDecl(c.zir_inst).src_node,
+        .opaque_decl => code.getOpaqueDecl(c.zir_inst).src_node,
+        else => return,
+    };
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(c.file));
+    // A file's root struct has no declaration line to show.
+    if (node == .root) return sema.zcu.addNote(c.file, tree.nodeToSpan(node), "{s} declared here", .{category});
+    try sema.zcu.addDeclNote(c.file, tree.nodeToSpan(node), "{s} declared here", .{category});
 }
 
 const FmtType = struct {
@@ -1391,9 +1420,17 @@ fn noteEffects(sema: *Sema, ty: Index) Allocator.Error!void {
 
 /// Queues `func`, which this unit refers to other than by calling it (its
 /// address, an export).
-fn queueFuncRef(sema: *Sema, func: Index) CompileError!void {
+fn queueFuncRef(sema: *Sema, src: Src, func: Index) CompileError!void {
     try sema.bcRefuse();
-    try sema.zcu.queueFuncFrom(sema.owner, func);
+    if (try sema.zcu.queueFuncFrom(sema.owner, func)) try sema.noteReference(.{ .func = func }, src);
+}
+
+/// Records that this unit refers to `unit` at `src`, if nothing referred to
+/// it before: the reference trace of `unit`'s errors (`Zcu.referenced_by`).
+fn noteReference(sema: *Sema, unit: Zcu.AnalUnit, src: Src) !void {
+    if (sema.bc != null or std.meta.eql(unit, sema.owner)) return;
+    const gop = try sema.zcu.referenced_by.getOrPut(sema.gpa, unit);
+    if (!gop.found_existing) gop.value_ptr.* = .{ .from = sema.owner, .file = sema.file, .src = src };
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,10 +1552,12 @@ fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.MemoDep {
 
 fn ensureNavVal(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex) CompileError!void {
     try sema.declareDependency(.{ .nav_val = nav });
-    if (sema.bc) |bc| if (sema.ip.getNav(nav).status != .resolved and bc.blocker == .none) {
+    const status = sema.ip.getNav(nav).status;
+    if (sema.bc) |bc| if (status != .resolved and bc.blocker == .none) {
         bc.blocker = nav;
     };
-    try sema.bcRequire(sema.ip.getNav(nav).status == .resolved);
+    try sema.bcRequire(status == .resolved);
+    if (status == .unresolved) try sema.noteReference(.{ .nav_val = nav }, src);
     sema.zcu.ensureNavVal(nav) catch |err| return sema.depLoop(block, src, err);
 }
 
@@ -1528,7 +1567,9 @@ fn resolveLayout(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!v
     switch (ip.keyTag(ty)) {
         .struct_type, .enum_type, .union_type => {
             try sema.declareDependency(.{ .type_layout = ty });
-            try sema.bcRequire(ip.structInfo(ty).status == .have_layout);
+            const status = ip.structInfo(ty).status;
+            try sema.bcRequire(status == .have_layout);
+            if (status == .none) try sema.noteReference(.{ .type_layout = ty }, src);
             sema.zcu.ensureStructLayout(ty) catch |err| return sema.depLoop(block, src, err);
         },
         .array_type => try sema.resolveLayout(block, src, ip.keyPayload(.array_type, ty).child),
@@ -2607,7 +2648,7 @@ fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src, operand_src: Src) 
             };
             ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = set, .payload_type = sema.ip.keyPayload(.error_union_type, ty).payload_type } });
         }
-        const coerced = try sema.coerce(b, ty, operand, operand_src);
+        const coerced = try sema.coerceCtx(b, ty, operand, operand_src, .{ .ret = inlining.func });
         if (inlining.merges) |merges| if (!b.is_comptime) {
             if (!b.is_typeof and sema.isErrorType(ty)) try sema.maybePushErrorTrace(b, src, coerced);
             const br = try sema.addInst(b, .{ .tag = .br, .data = .{ .br = .{ .block_inst = merges.block_inst, .operand = coerced } } });
@@ -2626,7 +2667,7 @@ fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src, operand_src: Src) 
     if (sema.fn_ret_ty == .none) try sema.bcRefuse();
     if (b.is_comptime) return sema.fail(b, src, "function called at runtime cannot return value at comptime", .{});
     try sema.recordInferredErrors(b, src, operand);
-    const coerced = try sema.coerce(b, sema.fn_ret_ty, operand, operand_src);
+    const coerced = try sema.coerceCtx(b, sema.fn_ret_ty, operand, operand_src, .{ .ret = sema.func });
     try sema.validateRuntimeValue(b, operand_src, coerced);
     if (sema.isErrorType(sema.fn_ret_ty)) try sema.maybePushErrorTrace(b, src, coerced);
     _ = try sema.addUnOp(b, .ret, coerced);
@@ -4439,7 +4480,7 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     try sema.ensureNavVal(block, src, nav_index);
     const nav = sema.ip.getNav(nav_index);
     // A generic function has no body of its own until a call instantiates it.
-    if (sema.ip.keyTag(nav.val) == .func and !sema.ip.keyPayload(.func_type, nav.ty).is_generic) try sema.queueFuncRef(nav.val);
+    if (sema.ip.keyTag(nav.val) == .func and !sema.ip.keyPayload(.func_type, nav.ty).is_generic) try sema.queueFuncRef(src, nav.val);
     // A referenced variable is emitted with its type's layout (`var global:
     // @This()` inside the struct leaves it unresolved until now).
     if (!nav.is_const) try sema.resolveLayoutIfIdle(block, src, nav.ty);
@@ -4496,7 +4537,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
         .func => |f| f.owner_nav,
         else => nav_index,
     };
-    if (ip.keyTag(val) == .func) try sema.queueFuncRef(val);
+    if (ip.keyTag(val) == .func) try sema.queueFuncRef(src, val);
     try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name), .unit = sema.owner });
 }
 
@@ -5644,8 +5685,216 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
 }
 
 fn coerce(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) CompileError!Ref {
+    return sema.coerceCtx(block, dest_ty, inst, src, .none);
+}
+
+/// What fixed a coercion's destination type, for the error's notes.
+const CoerceCtx = union(enum) {
+    none,
+    /// The return type of function `func`.
+    ret: Index,
+    /// Parameter `index` of function `func` (`.none` for a call through a
+    /// pointer).
+    param: struct { func: Index, index: usize },
+};
+
+fn coerceCtx(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src, ctx: CoerceCtx) CompileError!Ref {
     if (try sema.coerceInner(block, dest_ty, inst, src)) |r| return r;
-    return sema.fail(block, src, "expected type '{f}', found '{f}'", .{ sema.fmtType(dest_ty), sema.fmtType(sema.typeOf(inst)) });
+    return sema.failTypeMismatch(block, src, dest_ty, sema.typeOf(inst), ctx);
+}
+
+/// "expected type" with upstream's notes: why the types differ, and the
+/// declaration that fixed the expected type.
+fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index, actual: Index, ctx: CoerceCtx) CompileError {
+    const ip = sema.ip;
+    const err = sema.fail(block, src, "expected type '{f}', found '{f}'", .{ sema.fmtType(wanted), sema.fmtType(actual) });
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    const span = src.span(tree);
+    // E!T and ?T to T.
+    if (ip.keyTag(actual) == .error_union_type and ip.keyPayload(.error_union_type, actual).payload_type == wanted) {
+        try sema.zcu.addNote(sema.file, span, "cannot convert error union to payload type", .{});
+        try sema.zcu.addNote(sema.file, span, "consider using 'try', 'catch', or 'if'", .{});
+    }
+    if (ip.keyTag(actual) == .opt_type and ip.keyPayload(.opt_type, actual) == wanted) {
+        try sema.zcu.addNote(sema.file, span, "cannot convert optional to payload type", .{});
+        try sema.zcu.addNote(sema.file, span, "consider using '.?', 'orelse', or 'if'", .{});
+    }
+    try sema.noteTypeDifference(span, wanted, actual);
+    switch (ctx) {
+        .none => {},
+        .ret => |func| if (!sema.isTestFunc(func)) if (try sema.fnTypeExprSrc(func, null)) |loc| {
+            if (sema.isErrorType(actual) and !sema.isErrorType(wanted))
+                try sema.zcu.addDeclNote(loc.file, loc.span, "function cannot return an error", .{})
+            else
+                try sema.zcu.addDeclNote(loc.file, loc.span, "function return type declared here", .{});
+        },
+        .param => |p| if (p.func != .none) if (try sema.fnTypeExprSrc(p.func, p.index)) |loc|
+            try sema.zcu.addDeclNote(loc.file, loc.span, "parameter type declared here", .{}),
+    }
+    return err;
+}
+
+/// Notes the first difference that keeps `actual` from coercing to
+/// `wanted`, descending into child types, as upstream's
+/// `InMemoryCoercionResult.report`. Types of different kinds get no note
+/// here (`fail` notes where declared types are declared).
+fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: Index) CompileError!void {
+    const ip = sema.ip;
+    const zcu = sema.zcu;
+    const file = sema.file;
+    var wanted = wanted_ty;
+    var actual = actual_ty;
+    while (wanted != actual) {
+        const class = Type.class(ip, wanted);
+        if (class != Type.class(ip, actual)) return;
+        switch (class) {
+            .int => {
+                const w = Type.intInfo(ip, wanted);
+                const a = Type.intInfo(ip, actual);
+                const fits = if (w.signedness == a.signedness) w.bits >= a.bits else w.signedness == .signed and w.bits > a.bits;
+                if (fits) return;
+                return zcu.addNote(file, span, "{t} {d}-bit int cannot represent all possible {t} {d}-bit values", .{ w.signedness, w.bits, a.signedness, a.bits });
+            },
+            .error_union => {
+                const w = ip.keyPayload(.error_union_type, wanted);
+                const a = ip.keyPayload(.error_union_type, actual);
+                if (w.payload_type != a.payload_type) {
+                    try zcu.addNote(file, span, "error union payload '{f}' cannot cast into error union payload '{f}'", .{ sema.fmtType(a.payload_type), sema.fmtType(w.payload_type) });
+                    wanted = w.payload_type;
+                    actual = a.payload_type;
+                } else {
+                    wanted = w.error_set_type;
+                    actual = a.error_set_type;
+                }
+            },
+            .error_set => {
+                if (actual == .anyerror_type) return zcu.addNote(file, span, "global error set cannot cast into a smaller set", .{});
+                // Inferred sets may be unresolved here: no note.
+                const w = ip.keyAs(.error_set_type, wanted) orelse return;
+                const a = ip.keyAs(.error_set_type, actual) orelse return;
+                for (a) |name| if (std.mem.indexOfScalar(InternPool.String, w, name) == null)
+                    try zcu.addNote(file, span, "'error.{s}' not a member of destination error set", .{ip.stringSlice(name)});
+                return;
+            },
+            .array, .vector => {
+                const kind = if (class == .array) "array" else "vector";
+                const w_len = if (class == .array) ip.keyPayload(.array_type, wanted).len else ip.keyPayload(.vector_type, wanted).len;
+                const a_len = if (class == .array) ip.keyPayload(.array_type, actual).len else ip.keyPayload(.vector_type, actual).len;
+                if (w_len != a_len) {
+                    // Arrays as upstream's coercion reports them, vectors
+                    // as its in-memory check does.
+                    if (class == .array) {
+                        try zcu.addNote(file, span, "destination has length {d}", .{w_len});
+                        return zcu.addNote(file, span, "source has length {d}", .{a_len});
+                    }
+                    return zcu.addNote(file, span, "vector of length {d} cannot cast into a vector of length {d}", .{ a_len, w_len });
+                }
+                const w_child = Type.childType(ip, wanted);
+                const a_child = Type.childType(ip, actual);
+                if (w_child == a_child) return;
+                try zcu.addNote(file, span, "{s} element type '{f}' cannot cast into {s} element type '{f}'", .{ kind, sema.fmtType(a_child), kind, sema.fmtType(w_child) });
+                wanted = w_child;
+                actual = a_child;
+            },
+            .optional => {
+                const w_child = ip.keyPayload(.opt_type, wanted);
+                const a_child = ip.keyPayload(.opt_type, actual);
+                if (Type.optionalReprIsPtr(ip, w_child) and Type.optionalReprIsPtr(ip, a_child)) {
+                    // Upstream compares optional pointers as pointers but
+                    // reads their qualifiers from the optional types.
+                    return sema.notePtrDifference(span, wanted, actual, Type.ptrInfo(ip, w_child), Type.ptrInfo(ip, a_child), true);
+                }
+                try zcu.addNote(file, span, "optional type child '{f}' cannot cast into optional type child '{f}'", .{ sema.fmtType(a_child), sema.fmtType(w_child) });
+                wanted = w_child;
+                actual = a_child;
+            },
+            .pointer => {
+                var a = Type.ptrInfo(ip, actual);
+                const w = Type.ptrInfo(ip, wanted);
+                // As upstream's coercion: `*[N]T` and `[]T` compare as
+                // pointers of the wanted size to `T`.
+                if (a.flags.size == .one and w.flags.size != .one and ip.keyTag(a.child) == .array_type) {
+                    const arr = ip.keyPayload(.array_type, a.child);
+                    a.child = arr.child;
+                    a.sentinel = arr.sentinel;
+                    a.flags.size = w.flags.size;
+                } else if (a.flags.size == .slice and (w.flags.size == .many or w.flags.size == .c)) {
+                    a.flags.size = w.flags.size;
+                }
+                return sema.notePtrDifference(span, wanted, actual, w, a, false);
+            },
+            else => return,
+        }
+    }
+}
+
+/// The pointer part of `noteTypeDifference`, in the order of upstream's
+/// `coerceInMemoryAllowedPtrs`. `wanted` and `actual` are the types named
+/// in notes; `is_opt` when they are optional pointers.
+fn notePtrDifference(sema: *Sema, span: Ast.Span, wanted: Index, actual: Index, w: InternPool.PtrType, a: InternPool.PtrType, is_opt: bool) CompileError!void {
+    const zcu = sema.zcu;
+    const file = sema.file;
+    const sizeName = struct {
+        fn f(size: InternPool.PtrType.Size) []const u8 {
+            return switch (size) {
+                .one => "single pointer",
+                .many => "many pointer",
+                .c => "C pointer",
+                .slice => "slice",
+            };
+        }
+    }.f;
+    if (a.flags.size != w.flags.size and a.flags.size != .c and w.flags.size != .c)
+        return zcu.addNote(file, span, "a {s} cannot cast into a {s}", .{ sizeName(a.flags.size), sizeName(w.flags.size) });
+    if (a.flags.is_const and !w.flags.is_const) {
+        if (!is_opt) return zcu.addNote(file, span, "cast discards const qualifier", .{});
+        return zcu.addNote(file, span, "mutable '{f}' would allow illegal const pointers stored to type '{f}'", .{ sema.fmtType(wanted), sema.fmtType(actual) });
+    }
+    if (a.flags.is_volatile and !w.flags.is_volatile) {
+        if (!is_opt) return zcu.addNote(file, span, "cast discards volatile qualifier", .{});
+        return zcu.addNote(file, span, "mutable '{f}' would allow illegal volatile pointers stored to type '{f}'", .{ sema.fmtType(wanted), sema.fmtType(actual) });
+    }
+    const a_zero = a.flags.is_allowzero or a.flags.size == .c;
+    const w_zero = w.flags.is_allowzero or w.flags.size == .c;
+    if (a_zero and !w_zero) return zcu.addNote(file, span, "'{f}' could have null values which are illegal in type '{f}'", .{ sema.fmtType(actual), sema.fmtType(wanted) });
+    if (a.child != w.child) {
+        try zcu.addNote(file, span, "pointer type child '{f}' cannot cast into pointer type child '{f}'", .{ sema.fmtType(a.child), sema.fmtType(w.child) });
+        return sema.noteTypeDifference(span, w.child, a.child);
+    }
+    if (w.sentinel != .none and w.sentinel != a.sentinel and a.flags.size != .c) {
+        if (a.sentinel != .none) return zcu.addNote(file, span, "pointer sentinel '{f}' cannot cast into pointer sentinel '{f}'", .{ sema.fmtValue(a.sentinel), sema.fmtValue(w.sentinel) });
+        return zcu.addNote(file, span, "destination pointer requires '{f}' sentinel", .{sema.fmtValue(w.sentinel)});
+    }
+    const a_align = sema.ptrAlignment(a) orelse return;
+    const w_align = sema.ptrAlignment(w) orelse return;
+    if (a_align < w_align) return zcu.addNote(file, span, "pointer alignment '{d}' cannot cast into pointer alignment '{d}'", .{ a_align, w_align });
+}
+
+fn isTestFunc(sema: *Sema, func: Index) bool {
+    const f = sema.ip.keyAs(.func, func) orelse return false;
+    const nav = f.owner_nav;
+    return std.mem.indexOfScalar(InternPool.NavIndex, sema.zcu.test_functions.items, nav) != null;
+}
+
+/// Where function `func` declares the type of parameter `param`, or its
+/// return type when `param` is null.
+fn fnTypeExprSrc(sema: *Sema, func: Index, param: ?usize) !?struct { file: u32, span: Ast.Span } {
+    const ip = sema.ip;
+    const f = ip.keyAs(.func, func) orelse return null;
+    const nav = ip.getNav(f.owner_nav);
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(nav.file));
+    const decl = sema.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst);
+    var buf: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buf, decl.src_node) orelse return null;
+    const node = if (param) |i| node: {
+        var it = proto.iterate(tree);
+        var k: usize = 0;
+        while (it.next()) |p| : (k += 1) {
+            if (k == i) break :node p.type_expr orelse return null;
+        }
+        return null;
+    } else proto.ast.return_type.unwrap() orelse return null;
+    return .{ .file = nav.file, .span = tree.nodeToSpan(node) };
 }
 
 /// Returns null if `inst` does not coerce to `dest_ty`.
@@ -5872,7 +6121,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 if (d.child != src_ty and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
                 const f = ip.keyPayload(.func, v);
                 if (f.generic_owner != .none) return null;
-                try sema.queueFuncRef(v);
+                try sema.queueFuncRef(src, v);
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .nav = f.owner_nav } } }));
             },
             else => {},
@@ -14148,7 +14397,7 @@ fn analyzeCall(
                 if (arg_i < 32 and (fn_ty.comptime_bits >> @intCast(arg_i)) & 1 != 0) ct_block.is_comptime = true;
                 const arg = try sema.resolveInlineBody(if (ct_block.is_comptime) &ct_block else block, body, zir_args.call_inst);
                 if (sema.isErrorType(sema.typeOf(arg))) sema.any_arg_is_error = true;
-                args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerce(block, param_ty, arg, src);
+                args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerceCtx(block, param_ty, arg, sema.callArgSrc(src, first_arg != .none, arg_i), .{ .param = .{ .func = func, .index = arg_i } });
                 arg_i += 1;
             }
         },
@@ -14162,7 +14411,7 @@ fn analyzeCall(
                 try sema.genericParamType(block, src, func, args[0..arg_i])
             else
                 fn_ty.param_types[arg_i];
-            args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerce(block, param_ty, arg, src);
+            args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerceCtx(block, param_ty, arg, sema.callArgSrc(src, first_arg != .none, arg_i), .{ .param = .{ .func = func, .index = arg_i } });
             arg_i += 1;
         },
     }
@@ -14246,7 +14495,9 @@ fn analyzeCall(
     // read its declaration.
     try sema.declareDep(.{ .nav_val = ip.keyPayload(.func, callee_func).owner_nav }, sema.bc != null);
     // The comptime evaluator calls it at comptime instead.
-    if (sema.bc == null) try sema.zcu.queueFuncFrom(sema.owner, callee_func);
+    if (sema.bc == null) {
+        if (try sema.zcu.queueFuncFrom(sema.owner, callee_func)) try sema.noteReference(.{ .func = callee_func }, src);
+    }
     for (callee_fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
     try sema.resolveLayout(block, src, callee_fn_ty.return_type);
     var call_ret_ty = callee_fn_ty.return_type;

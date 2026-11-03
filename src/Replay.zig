@@ -546,7 +546,7 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
     defer emit.owner = saved;
     emit.owner = .{ .unit = unit };
     for (refs) |ref| switch (ref) {
-        .func => |func| try zcu.queueFuncFrom(unit, func),
+        .func => |func| _ = try zcu.queueFuncFrom(unit, func),
         .nav => |nav| _ = try emit.navKey(nav),
         .other => |o| switch (o.kind) {
             .err => _ = try emit.useError(try zcu.ip.getString(Zcu.tid, m.errorName(o.value))),

@@ -44,6 +44,9 @@ func_queue: std.ArrayList(InternPool.Index) = .empty,
 /// Which unit queued which function (`queueFuncFrom`), for the on-disk
 /// cache: a unit loaded from it queues them again.
 func_refs: std.AutoArrayHashMapUnmanaged(FuncRef, void) = .empty,
+/// For each analyzed unit, the first unit that referred to it and where:
+/// the reference trace of its errors.
+referenced_by: std.AutoHashMapUnmanaged(AnalUnit, Reference) = .empty,
 next_func: usize = 0,
 /// Function bodies analyzed out of queue order (to resolve an inferred
 /// error set), waiting to be passed to the sink.
@@ -123,6 +126,7 @@ pub const FuncState = enum { queued, in_progress, done, failed };
 pub const EffectUse = struct { unit: AnalUnit, ty: InternPool.Index };
 
 pub const FuncRef = struct { from: AnalUnit, func: InternPool.Index };
+pub const Reference = struct { from: AnalUnit, file: u32, src: Sema.Src };
 
 /// A function body lowered to IR for the comptime evaluator, with the
 /// dependencies its lowering declared, which every unit that runs it
@@ -297,11 +301,14 @@ pub const ErrorMsg = struct {
     msg: []const u8,
     code: diag.Code = .unclassified,
     notes: []const Note = &.{},
+    /// The unit whose analysis failed, whose references `diagnostics`
+    /// follows for the reference trace.
+    unit: ?AnalUnit = null,
 
     /// `count` repeats of the same note in a row (a recursive call's
     /// frames) render once, as upstream. `call` marks a call-site frame of
     /// the comptime or inline call chain.
-    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1, call: ?diag.CallKind = null };
+    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1, call: ?diag.CallKind = null, decl: bool = false };
 };
 
 pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
@@ -324,6 +331,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.deps.deinit(gpa);
     if (zcu.unit_timing) |*t| t.ns.deinit(gpa);
     zcu.func_refs.deinit(gpa);
+    zcu.referenced_by.deinit(gpa);
     zcu.funcs.deinit(gpa);
     zcu.func_queue.deinit(gpa);
     for (zcu.ready_irs.items) |*ir| ir.deinit(gpa);
@@ -417,6 +425,12 @@ pub fn addNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []const
     try zcu.appendNote(.{ .file = file_index, .span = span, .msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args) });
 }
 
+/// Adds a note pointing at a declaration to the most recent error; it shows
+/// the declaration's source line.
+pub fn addDeclNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
+    try zcu.appendNote(.{ .file = file_index, .span = span, .msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args), .decl = true });
+}
+
 /// Adds a call-site frame of the comptime or inline call chain to the most
 /// recent error.
 pub fn addCallFrame(zcu: *Zcu, file_index: u32, span: Ast.Span, kind: diag.CallKind) !void {
@@ -454,10 +468,39 @@ pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag
     for (zcu.fe.late_errors.items) |b| try diag.fromBundle(arena, paths, b, &out);
     for (zcu.errors.items) |e| {
         const notes = try arena.alloc(diag.Note, e.notes.len);
-        for (notes, e.notes) |*n, en| n.* = .{ .loc = try zcu.diagLoc(arena, paths, en.file, en.span), .msg = en.msg, .count = en.count, .call = en.call };
-        try out.append(arena, .{ .code = e.code, .loc = try zcu.diagLoc(arena, paths, e.file, e.span), .msg = e.msg, .notes = notes });
+        for (notes, e.notes) |*n, en| n.* = .{ .loc = try zcu.diagLoc(arena, paths, en.file, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl };
+        try out.append(arena, .{ .code = e.code, .loc = try zcu.diagLoc(arena, paths, e.file, e.span), .msg = e.msg, .notes = notes, .refs = try zcu.referenceTrace(arena, paths, e.unit) });
     }
     return out.items;
+}
+
+/// The chain of first references that led analysis to `unit`, nearest
+/// first, until a unit nothing referred to (a root: `main`'s caller in
+/// std, an export, a test, a `comptime` block).
+fn referenceTrace(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, start: ?AnalUnit) ![]const diag.Ref {
+    var frames: std.ArrayList(diag.Ref) = .empty;
+    var unit = start orelse return &.{};
+    while (zcu.referenced_by.get(unit)) |r| {
+        // A unit refers to another only before that one's analysis
+        // ends, but bound the walk anyway.
+        if (frames.items.len == 256) break;
+        const tree = try zcu.fe.tree(@fromBackingInt(r.file));
+        try frames.append(arena, .{ .name = try zcu.unitName(arena, r.from), .loc = try zcu.diagLoc(arena, paths, r.file, r.src.span(tree)) });
+        unit = r.from;
+    }
+    return frames.items;
+}
+
+/// A unit's name as the reference trace shows it: a declaration's or a
+/// type's name, or `comptime`.
+fn unitName(zcu: *const Zcu, arena: Allocator, unit: AnalUnit) ![]const u8 {
+    const ip = &zcu.ip;
+    return switch (unit) {
+        .nav_val => |nav| ip.stringSlice(ip.getNav(nav).name),
+        .func => |func| ip.stringSlice(ip.getNav(ip.keyPayload(.func, func).owner_nav).name),
+        .type_layout, .struct_defaults => |ty| try arena.dupe(u8, ip.stringSlice((ip.containerType(ty) orelse return "type").name)),
+        .comptime_decl => "comptime",
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +739,7 @@ pub fn ensureNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) Sema.CompileError
     nav.status = .resolving;
     if (zcu.replay) |r| if (r.loadNav(nav_index)) {
         nav.status = .resolved;
-        if (nav.linkage == .@"export" and zcu.ip.indexToKey(nav.val) == .func) try zcu.queueFunc(nav.val);
+        if (nav.linkage == .@"export" and zcu.ip.indexToKey(nav.val) == .func) _ = try zcu.queueFunc(nav.val);
         return;
     };
     Sema.analyzeNavVal(zcu, nav_index) catch |err| {
@@ -704,7 +747,7 @@ pub fn ensureNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) Sema.CompileError
         return err;
     };
     nav.status = .resolved;
-    if (nav.linkage == .@"export" and zcu.ip.keyTag(nav.val) == .func) try zcu.queueFunc(nav.val);
+    if (nav.linkage == .@"export" and zcu.ip.keyTag(nav.val) == .func) _ = try zcu.queueFunc(nav.val);
 }
 
 /// Resolves the fields and layout of a struct type (its `type_layout` unit).
@@ -781,16 +824,19 @@ pub fn ensureFuncIes(zcu: *Zcu, func: InternPool.Index) Sema.CompileError!?[]con
 /// Queues `func` on behalf of unit `from`, which refers to it (a call, a
 /// reference to its declaration, a coercion to a function pointer, an
 /// export), and records the reference.
-pub fn queueFuncFrom(zcu: *Zcu, from: AnalUnit, func: InternPool.Index) !void {
+/// Returns whether `func` was queued now, for the first time.
+pub fn queueFuncFrom(zcu: *Zcu, from: AnalUnit, func: InternPool.Index) !bool {
     try zcu.func_refs.put(zcu.gpa, .{ .from = from, .func = func }, {});
-    try zcu.queueFunc(func);
+    return zcu.queueFunc(func);
 }
 
-pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !void {
+/// Returns whether `func` was queued now, for the first time.
+pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
     const gop = try zcu.funcs.getOrPut(zcu.gpa, func);
-    if (gop.found_existing) return;
+    if (gop.found_existing) return false;
     gop.value_ptr.* = .queued;
     try zcu.func_queue.append(zcu.gpa, func);
+    return true;
 }
 
 /// Requests compiler_rt function `name`, declared in `lib/compiler_rt/<file>`,
@@ -850,7 +896,7 @@ fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
         error.OutOfMemory => return error.OutOfMemory,
         else => return,
     };
-    try zcu.queueFunc(zcu.ip.getNav(nav).val);
+    _ = try zcu.queueFunc(zcu.ip.getNav(nav).val);
 }
 
 /// Analyzes the root file's `comptime` and exported declarations and
@@ -887,7 +933,7 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
             };
             // An exported function is emitted whether or not it is called.
             const val = zcu.ip.getNav(e.target.nav).val;
-            if (zcu.ip.keyTag(val) == .func) try zcu.queueFunc(val);
+            if (zcu.ip.keyTag(val) == .func) _ = try zcu.queueFunc(val);
             continue;
         }
         if (done_tests < zcu.test_functions.items.len) {
@@ -897,7 +943,7 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => continue,
             };
-            try zcu.queueFunc(zcu.ip.getNav(nav).val);
+            _ = try zcu.queueFunc(zcu.ip.getNav(nav).val);
             continue;
         }
         if (done_rt < zcu.rt_helpers.count()) {

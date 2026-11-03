@@ -118,6 +118,9 @@ pub const Note = struct {
     /// A call-site frame of the comptime or inline call chain rather than
     /// a note; frames render together on one `call:` line.
     call: ?CallKind = null,
+    /// Points at a declaration, whose source line the note shows (token
+    /// efficiency rule 1).
+    decl: bool = false,
 };
 
 pub const CallKind = enum { @"inline", @"comptime" };
@@ -129,7 +132,12 @@ pub const Diagnostic = struct {
     /// Identical messages counted together (ErrorBundle's `count`).
     count: u32 = 1,
     notes: []const Note = &.{},
+    /// The reference trace: who referred to the failed unit, nearest first.
+    refs: []const Ref = &.{},
 };
+
+/// A frame of the reference trace: unit `name` referred onward at `loc`.
+pub const Ref = struct { name: []const u8, loc: ?Loc };
 
 pub const Format = enum { text, json };
 
@@ -237,6 +245,7 @@ fn renderText(w: *Writer, d: Diagnostic) Writer.Error!void {
         if (n.loc) |l| try w.print(" {s}:{d}:{d}", .{ l.path, l.line, l.col });
         try w.print(": {s}", .{n.msg});
         if (n.count > 1) try w.print(" ({d} times)", .{n.count});
+        if (n.decl) if (n.loc) |l| if (sourceExcerpt(l)) |src| try w.print(": {s}", .{src});
         try w.writeByte('\n');
     }
     // Frames in the zig lib directory carry nothing an agent can change;
@@ -253,6 +262,23 @@ fn renderText(w: *Writer, d: Diagnostic) Writer.Error!void {
             first = false;
         }
         if (lib_frames != 0) try w.print(", +{d} std", .{lib_frames});
+        try w.writeByte('\n');
+    }
+    // The reference trace, by the same rule: user frames, then a count.
+    var user_refs: usize = 0;
+    for (d.refs) |r| {
+        if (r.loc != null and !r.loc.?.in_lib) user_refs += 1;
+    }
+    if (user_refs != 0) {
+        try w.writeAll("  ref:");
+        var first = true;
+        for (d.refs) |r| {
+            const l = r.loc orelse continue;
+            if (l.in_lib) continue;
+            try w.print("{s} {s} {s}:{d}:{d}", .{ if (first) "" else " <-", r.name, l.path, l.line, l.col });
+            first = false;
+        }
+        if (d.refs.len != user_refs) try w.print(" (+{d} std frames)", .{d.refs.len - user_refs});
         try w.writeByte('\n');
     }
 }
@@ -273,8 +299,21 @@ fn sourceExcerpt(l: Loc) ?[]const u8 {
 const JsonLoc = struct { file: []const u8, line: u32, col: u32, span: [2]u32 };
 
 fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
-    const JsonNote = struct { file: ?[]const u8 = null, line: ?u32 = null, col: ?u32 = null, span: ?[2]u32 = null, msg: []const u8, count: ?u32 = null };
+    const JsonNote = struct { file: ?[]const u8 = null, line: ?u32 = null, col: ?u32 = null, span: ?[2]u32 = null, msg: []const u8, count: ?u32 = null, src: ?[]const u8 = null };
     const JsonCall = struct { file: []const u8, line: u32, col: u32, kind: CallKind, count: ?u32 = null };
+    const JsonRef = struct { @"fn": []const u8, file: ?[]const u8 = null, line: ?u32 = null, col: ?u32 = null };
+    var refs_buf: [64]JsonRef = undefined;
+    var n_refs: usize = 0;
+    for (d.refs) |r| {
+        if (n_refs == refs_buf.len) break;
+        refs_buf[n_refs] = .{ .@"fn" = r.name };
+        if (r.loc) |l| {
+            refs_buf[n_refs].file = l.path;
+            refs_buf[n_refs].line = l.line;
+            refs_buf[n_refs].col = l.col;
+        }
+        n_refs += 1;
+    }
     var notes_buf: [64]JsonNote = undefined;
     var calls_buf: [64]JsonCall = undefined;
     var n_notes: usize = 0;
@@ -292,6 +331,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
                 notes_buf[n_notes].line = l.line;
                 notes_buf[n_notes].col = l.col;
                 notes_buf[n_notes].span = .{ l.start, l.end };
+                if (n.decl) notes_buf[n_notes].src = sourceExcerpt(l);
             }
             n_notes += 1;
         }
@@ -307,6 +347,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
         src: ?[]const u8 = null,
         notes: ?[]const JsonNote,
         calls: ?[]const JsonCall,
+        ref: ?[]const JsonRef,
     } = .{
         .code = if (d.code == .unclassified) null else d.code,
         .file = if (d.loc) |l| l.path else null,
@@ -318,6 +359,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
         .src = if (d.loc) |l| sourceExcerpt(l) else null,
         .notes = if (n_notes != 0) notes_buf[0..n_notes] else null,
         .calls = if (n_calls != 0) calls_buf[0..n_calls] else null,
+        .ref = if (n_refs != 0) refs_buf[0..n_refs] else null,
     };
     try std.json.Stringify.value(obj, .{ .emit_null_optional_fields = false }, w);
     try w.writeByte('\n');

@@ -3217,13 +3217,29 @@ accepted design caches none: a failed unit is always re-analyzed.
 
 The call line (`call:`) collects the comptime and inline call-site frames.
 Frames in the zig lib directory print only as a count, and the line is
-omitted when every frame is in the lib directory. The reference trace
-(`ref:`, step 3) is not stored in the record. It is computed
-when rendering from `Zcu.referenced_by`, which keeps for each unit the
-(unit, `Src`) that referenced it with the smallest unit key, so the
-trace doesn't depend on scheduling. It's written where `queueFuncFrom` and
-the namespace lookups already record references: one entry per unit, on
-the first reference only.
+omitted when every frame is in the lib directory.
+
+The reference trace (`ref:`) is computed when rendering from
+`Zcu.referenced_by`: for each analyzed unit, the first unit that referred
+to it and where (a call, a function's address or export, a declaration's
+value, a type's layout). Sema records it in `noteReference` only for a
+unit not yet analyzed or queued (a function's first queueing, which
+`Zcu.queueFunc` reports from its existing lookup), so the hot path pays
+nothing new; the map costs about 8 MB on the std test build. The site
+is a lazy `Src` resolved only when an error is rendered. Each error records its failed unit, and the trace follows
+first references from it until a unit nothing referred to. It prints by
+the call line's rule (`ref: main ret.zig:6:12 (+3 std frames)`); JSON
+lists every frame. First references are deterministic because analysis
+order is; parallel function bodies will need the smallest unit key
+instead. Gap: in an edit build, a referrer loaded green from the cache
+records nothing, so its frame is missing. Closing it needs the manifest
+to keep each unit's first reference site, alongside step 6.
+
+Notes that point at declarations (`decl` in the record) show the
+declaration's source line after the message: `function return type
+declared here: fn len(n: usize) u32 {`. As upstream's `fail`, every
+declared type an error's message names gets a "struct declared here"
+note.
 
 **Codes.** Each code is a kebab-case name, never renamed or reused once
 released; a retired code stays reserved. A code names a kind of error, not
@@ -3482,6 +3498,8 @@ unchanged:
    format strings. (Done.)
 3. Facts: candidates, declaration sites, user frame first, the reference
    trace from `referenced_by`, and inferred error sets printed by name.
+   (Started: upstream's type-mismatch notes, declared-here notes with
+   their source lines, and the reference trace.)
 4. The migration and pattern table.
 5. Fixes, first set.
 6. The cache: failing builds commit the manifest for the units that
