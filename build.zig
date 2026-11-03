@@ -410,6 +410,19 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     zap_run.addCheck(.{ .expect_stdout_exact = "[a][b c][]\n" });
     zap_run.addCheck(.{ .expect_term = .{ .exited = 43 } });
     test_step.dependOn(&zap_run.step);
+
+    // Modules rooted at a ZON file and at a plain file.
+    const mods = b.addRunArtifact(zap);
+    mods.addArgs(&.{ "build-exe", "--dep", "config", "--dep", "version" });
+    mods.addPrefixedFileArg("-Mroot=", b.path("test/obj/modules.zig"));
+    mods.addPrefixedFileArg("-Mconfig=", b.path("test/obj/mod/config.zon"));
+    mods.addPrefixedFileArg("-Mversion=", b.path("test/obj/mod/version"));
+    const mods_bin = mods.addPrefixedOutputFileArg("-femit-bin=", "modules");
+    const mods_run = std.Build.Step.Run.create(b, "run modules");
+    mods_run.addFileArg(mods_bin);
+    mods_run.addCheck(.{ .expect_stdout_exact = "zap 3 0.17.0-dev 31\n" });
+    mods_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&mods_run.step);
 }
 
 /// `zap build` end to end: test/build/check.sh builds test/build/hello

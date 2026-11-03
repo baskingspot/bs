@@ -4329,7 +4329,26 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const name = try sema.resolveConstString(block, src, sema.resolveInst(data.operand));
     if (name.len == 0) return sema.fail(block, src, "file path name cannot be empty", .{});
     const file = sema.zcu.file(sema.file);
-    const module = sema.zcu.fe.module(file.module);
+    const fe = sema.zcu.fe;
+    // A module name embeds that module's root file, as upstream.
+    const named: ?Frontend.Module.Index = if (std.mem.eql(u8, name, "std"))
+        .std
+    else if (std.mem.eql(u8, name, "root"))
+        .root
+    else if (std.mem.eql(u8, name, "builtin"))
+        .builtin
+    else
+        fe.depModule(file.module, name);
+    if (named) |m| {
+        try sema.bcRefuse();
+        const index = sema.zcu.embedFile(m, fe.module(m).root_file) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return sema.fail(block, src, "unable to open '{s}': {t}", .{ name, err }),
+        };
+        try sema.declareDependency(.{ .embed_file = index });
+        return .fromInterned(try sema.stringLiteral(sema.zcu.embed_files.values()[index].bytes));
+    }
+    const module = fe.module(file.module);
     const root: []const u8 = module.abs_root_dir orelse
         std.Io.Dir.cwd().realPathFileAlloc(sema.zcu.fe.io, module.root_dir, sema.arena) catch |err|
             return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
@@ -5252,7 +5271,10 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     const fe = sema.zcu.fe;
     const this_file = sema.zcu.file(sema.file);
     const key = if (fe.depModule(this_file.module, path)) |m|
-        sema.zcu.moduleRootFile(m).?
+        if (std.mem.endsWith(u8, fe.module(m).root_file, ".zon"))
+            return .fromInterned(try sema.importZon(block, src, path, m, extra.res_ty))
+        else
+            sema.zcu.moduleRootFile(m).?
     else if (std.mem.endsWith(u8, path, ".zig")) blk: {
         const dir = std.fs.path.dirname(this_file.sub_path) orelse "";
         const sub = try std.fs.path.resolvePosix(sema.arena, &.{ dir, path });
@@ -5266,7 +5288,7 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     else if (std.mem.eql(u8, path, "builtin"))
         sema.zcu.moduleRootFile(.builtin).?
     else if (std.mem.endsWith(u8, path, ".zon"))
-        return .fromInterned(try sema.importZon(block, src, path, extra.res_ty))
+        return .fromInterned(try sema.importZon(block, src, path, null, extra.res_ty))
     else
         return sema.fail(block, src, "no module named '{s}' available within module '{s}'", .{ path, fe.module(this_file.module).name });
     return .fromInterned(try sema.fileRootType(key));
@@ -5281,24 +5303,29 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
 /// `@import("x.zon")`: the file's value, of type `res_ty_ref` if it has one.
 /// The file is read like an `@embedFile`, so the importing unit depends on
 /// its bytes, and lowered from std's ZonGen output.
-fn importZon(sema: *Sema, block: *Block, src: Src, path: []const u8, res_ty_ref: Zir.Inst.Ref) CompileError!Index {
+/// `@import` of a ZON file: `path` relative to the current file, or the
+/// root file of module `dep` (`-Mname=file.zon`).
+fn importZon(sema: *Sema, block: *Block, src: Src, path: []const u8, dep: ?Frontend.Module.Index, res_ty_ref: Zir.Inst.Ref) CompileError!Index {
     const gpa = sema.gpa;
     const res_ty: Index = if (res_ty_ref == .none) .none else blk: {
         const ty = try sema.resolveType(block, src, res_ty_ref);
         break :blk if (ty == .generic_poison_type) .none else ty;
     };
     const file = sema.zcu.file(sema.file);
-    const module = sema.zcu.fe.module(file.module);
-    const root: []const u8 = module.abs_root_dir orelse
-        std.Io.Dir.cwd().realPathFileAlloc(sema.zcu.fe.io, module.root_dir, sema.arena) catch |err|
-            return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
-    const dir = std.fs.path.dirname(file.sub_path) orelse "";
-    const full = try std.fs.path.resolveAllocPosix(sema.arena, &.{ root, dir, path });
-    if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
-        return sema.fail(block, src, "import of file outside module path: '{s}'", .{path});
-    const sub_path = full[root.len + 1 ..];
+    const zon_module = dep orelse file.module;
+    const sub_path = if (dep) |m| sema.zcu.fe.module(m).root_file else blk: {
+        const module = sema.zcu.fe.module(file.module);
+        const root: []const u8 = module.abs_root_dir orelse
+            std.Io.Dir.cwd().realPathFileAlloc(sema.zcu.fe.io, module.root_dir, sema.arena) catch |err|
+                return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
+        const dir = std.fs.path.dirname(file.sub_path) orelse "";
+        const full = try std.fs.path.resolveAllocPosix(sema.arena, &.{ root, dir, path });
+        if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
+            return sema.fail(block, src, "import of file outside module path: '{s}'", .{path});
+        break :blk full[root.len + 1 ..];
+    };
     try sema.bcRefuse();
-    const index = sema.zcu.embedFile(file.module, sub_path) catch |err| switch (err) {
+    const index = sema.zcu.embedFile(zon_module, sub_path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return sema.fail(block, src, "unable to open '{s}': {t}", .{ path, err }),
     };

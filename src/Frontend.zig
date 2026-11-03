@@ -1272,7 +1272,11 @@ fn collectImports(fe: *const Frontend, f: *const File, names: []const u8) ![]Imp
     while (it.next()) |name| {
         try list.ensureUnusedCapacity(gpa, 1);
         const imp: Import = if (fe.depModule(f.module, name)) |m|
-            .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) }
+            // A ZON module is Sema's to read, like a ZON file.
+            if (std.mem.endsWith(u8, fe.module(m).root_file, ".zon"))
+                continue
+            else
+                .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) }
         else if (std.mem.endsWith(u8, name, ".zig")) .{
             .module = f.module,
             .sub_path = try std.fs.path.resolvePosix(gpa, &.{ std.fs.path.dirname(f.sub_path) orelse "", name }),
