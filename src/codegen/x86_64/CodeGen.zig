@@ -1546,31 +1546,39 @@ const AsmOperand = union(enum) {
 };
 
 fn assemble(cg: *CodeGen, source: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg)) Error!void {
-    var lines = std.mem.tokenizeAny(u8, source, "\n;");
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        if (line[0] == '.') {
-            // The only directive: std.start's `_start` marks the return
-            // address undefined so unwinders stop at the outermost frame.
-            if (std.mem.eql(u8, line, ".cfi_undefined %rip") or std.mem.eql(u8, line, ".cfi_undefined %%rip")) {
-                cg.outermost_frame = true;
-                continue;
-            }
-            return cg.fail("zap does not support the assembler directive '{s}' yet", .{line});
-        }
-        const sp = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
-        const mnemonic = line[0..sp];
-        var operands: [2]AsmOperand = undefined;
-        var n: usize = 0;
-        var it = std.mem.tokenizeScalar(u8, line[sp..], ',');
-        while (it.next()) |tok| {
-            if (n == 2) return cg.fail("asm instruction with more than two operands: '{s}'", .{line});
-            operands[n] = try cg.asmOperand(std.mem.trim(u8, tok, " \t"), names, line);
-            n += 1;
-        }
-        try cg.asmInst(mnemonic, operands[0..n], line);
+    var source_lines = std.mem.tokenizeScalar(u8, source, '\n');
+    while (source_lines.next()) |source_line| {
+        // `#` and `//` start comments.
+        var code = source_line;
+        if (std.mem.indexOfScalar(u8, code, '#')) |i| code = code[0..i];
+        if (std.mem.indexOf(u8, code, "//")) |i| code = code[0..i];
+        var statements = std.mem.tokenizeScalar(u8, code, ';');
+        while (statements.next()) |raw| try cg.assembleStatement(std.mem.trim(u8, raw, " \t\r"), names);
     }
+}
+
+fn assembleStatement(cg: *CodeGen, line: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg)) Error!void {
+    if (line.len == 0) return;
+    if (line[0] == '.') {
+        // The only directive: std.start's `_start` marks the return
+        // address undefined so unwinders stop at the outermost frame.
+        if (std.mem.eql(u8, line, ".cfi_undefined %rip") or std.mem.eql(u8, line, ".cfi_undefined %%rip")) {
+            cg.outermost_frame = true;
+            return;
+        }
+        return cg.fail("zap does not support the assembler directive '{s}' yet", .{line});
+    }
+    const sp = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+    const mnemonic = line[0..sp];
+    var operands: [2]AsmOperand = undefined;
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, line[sp..], ',');
+    while (it.next()) |tok| {
+        if (n == 2) return cg.fail("asm instruction with more than two operands: '{s}'", .{line});
+        operands[n] = try cg.asmOperand(std.mem.trim(u8, tok, " \t"), names, line);
+        n += 1;
+    }
+    try cg.asmInst(mnemonic, operands[0..n], line);
 }
 
 fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), line: []const u8) Error!AsmOperand {

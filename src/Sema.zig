@@ -1598,13 +1598,15 @@ fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src) CompileError!void 
             ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = set, .payload_type = sema.ip.indexToKey(ty).error_union_type.payload_type } });
         }
         const coerced = try sema.coerce(b, ty, operand, src);
-        if (inlining.merges) |merges| {
-            if (b.is_comptime) return sema.fail(b, src, "function called at runtime cannot return value at comptime", .{});
+        if (inlining.merges) |merges| if (!b.is_comptime) {
             const br = try sema.addInst(b, .{ .tag = .br, .data = .{ .br = .{ .block_inst = merges.block_inst, .operand = coerced } } });
             try merges.results.append(sema.gpa, coerced);
             try merges.brs.append(sema.gpa, br.toIndex().?);
             return;
-        }
+        };
+        // A return from a comptime block of a runtime inline call ends
+        // the call with a comptime-known result (see `inlineCall`).
+        if (b.is_comptime) _ = try sema.resolveConstValue(b, src, coerced, "value returned at comptime must be comptime-known");
         inlining.result = coerced;
         return error.ComptimeReturn;
     }
@@ -3658,6 +3660,18 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                     };
                     return try sema.addTyOp(block, .bitcast, dest_ty, inst);
                 }
+                // `?error{A}` to `?error{A,B}`: the same representation.
+                if (Type.class(ip, s_child) == .error_set and Type.class(ip, child) == .error_set) {
+                    if (val) |v| switch (ip.indexToKey(v)) {
+                        .opt => |o| {
+                            const payload: Index = if (o.val == .none) .none else ((try sema.coerceInner(block, child, .fromInterned(o.val), src)) orelse return null).toInterned().?;
+                            return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = payload } }));
+                        },
+                        else => return .fromInterned(try sema.undefValue(dest_ty)),
+                    };
+                    if (!try sema.errorSetCoercible(block, src, s_child, child, .none)) return null;
+                    return try sema.addTyOp(block, .bitcast, dest_ty, inst);
+                }
                 // `?T` to `??T`: wrapped like any payload.
                 if (Type.class(ip, child) != .optional) return null;
             }
@@ -3746,14 +3760,19 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             for (elems, 0..) |*e, k| e.* = (try sema.coerceInner(block, v.child, try sema.tupleField(block, inst, @intCast(k)), src)) orelse return null;
             return try sema.aggregate(block, src, dest_ty, elems);
         } else if (dc == .array and sc == .array) {
-            // `[N:s]T` to `[N]T`.
+            // `[N:s]T` to `[N]T`, and between element types with the same
+            // representation (`[N][:0]const u8` to `[N][]const u8`).
             const a = ip.indexToKey(dest_ty).array_type;
             const s = ip.indexToKey(src_ty).array_type;
-            if (a.len != s.len or a.child != s.child or a.sentinel != .none) return null;
+            if (a.len != s.len or a.sentinel != .none) return null;
+            if (a.child != s.child and !sema.childCoercibleInMemory(s.child, a.child)) return null;
             if (val) |v| {
                 if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
                 const elems = try sema.arena.alloc(Index, a.len);
-                for (elems, 0..) |*e, i| e.* = try sema.elemValue(v, i);
+                for (elems, 0..) |*e, i| {
+                    e.* = try sema.elemValue(v, i);
+                    if (a.child != s.child) e.* = (try sema.coerce(block, a.child, .fromInterned(e.*), src)).toInterned().?;
+                }
                 return .fromInterned(try sema.intern(.{ .aggregate = .{ .ty = dest_ty, .storage = .{ .elems = elems } } }));
             }
             const ref = try sema.analyzeRef(block, src, inst);
@@ -3800,6 +3819,19 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
         },
         .special => if (dest_ty == .calling_convention_type and sc == .enum_literal) {
             return null;
+        },
+        // Field by field, as upstream's `coerceTupleToTuple`.
+        .tuple => if (sc == .tuple) {
+            const d = ip.indexToKey(dest_ty).tuple_type;
+            const s = ip.indexToKey(src_ty).tuple_type;
+            if (d.types.len != s.types.len or d.names.len != 0 or s.names.len != 0) return null;
+            const elems = try sema.arena.alloc(Ref, d.types.len);
+            for (elems, d.types, d.values, 0..) |*e, ft, fv, k| {
+                const field = try sema.tupleField(block, inst, @intCast(k));
+                e.* = (try sema.coerceInner(block, ft, field, src)) orelse return null;
+                if (fv != .none and sema.resolveValue(e.*) != fv) return null;
+            }
+            return try sema.aggregate(block, src, dest_ty, elems);
         },
         else => {},
     }
@@ -9438,7 +9470,16 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) C
         .want_safety = caller.want_safety,
     };
     defer child.instructions.deinit(gpa);
-    try sema.analyzeBodyInner(&child, fn_info.body);
+    sema.analyzeBodyInner(&child, fn_info.body) catch |err| switch (err) {
+        error.ComptimeReturn => {
+            // Reached unconditionally (no earlier return), so the body's
+            // runtime instructions run straight into the result.
+            if (merges.results.items.len != 0) return sema.failUnsupported(caller, src, "a comptime return after a runtime return in an inline call");
+            try caller.instructions.appendSlice(gpa, child.instructions.items);
+            return inlining.result;
+        },
+        else => return err,
+    };
     return sema.resolveBlock(caller, src, &child, &merges);
 }
 

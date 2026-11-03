@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "4\nabcd\n7\n9\n0\nB\n3\n"
+//! stdout: "4\nabcd\n7\n9\n0\nB\n3\n10\n3\n6\n8\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -48,5 +48,37 @@ fn main() callconv(.c) noreturn {
     var c: [*c]const u8 = null;
     c = "abc";
     rt.printInt(@as(u64, @intFromBool(c != null)) + 2);
+    // A comptime block's return ends a runtime inline call; arrays coerce
+    // between element types of the same representation; tuples coerce
+    // field by field, widening optional error sets.
+    var unit: u8 = 1;
+    _ = &unit;
+    const t = table(4);
+    rt.printInt(t[3] + unit);
+    const names: [2][:0]const u8 = .{ "ab", "cde" };
+    var plain: [2][]const u8 = names;
+    _ = &plain;
+    rt.printInt(plain[1].len);
+    const p = widen(true);
+    rt.printInt(@intFromBool(p[0] != null) + p[1]);
+    // Assembler comments.
+    const r = asm volatile (
+        \\ movl $7, %%eax # a comment
+        \\ addl $1, %%eax // another
+        : [ret] "={eax}" (-> u32),
+    );
+    rt.printInt(r);
     rt.exit(0);
+}
+
+inline fn table(comptime n: usize) [n]u8 {
+    comptime {
+        var out: [n]u8 = undefined;
+        for (&out, 0..) |*o, i| o.* = @intCast(i * 3);
+        return out;
+    }
+}
+fn widen(fail: bool) struct { ?error{ A, B }, u64 } {
+    const narrow: struct { ?error{A}, usize } = .{ if (fail) error.A else null, 5 };
+    return narrow;
 }
