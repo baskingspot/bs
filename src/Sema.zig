@@ -15299,8 +15299,14 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     // A tuple or anonymous struct has no declarations: only a field (`.{ .f
     // = func }`) can be called.
     if (ip.keyTag(container) == .tuple_type) {
-        const callee = try sema.fieldVal(block, src, obj, name);
-        return sema.analyzeCall(block, src, callee, .none, args, modifier);
+        const t = ip.keyPayload(.tuple_type, container);
+        const has_field = for (t.names) |n| {
+            if (std.mem.eql(u8, ip.stringSlice(n), name)) break true;
+        } else if (std.fmt.parseInt(u32, name, 10)) |i| t.names.len == 0 and i < t.types.len else |_| false;
+        if (has_field) {
+            const callee = try sema.fieldVal(block, src, obj, name);
+            return sema.analyzeCall(block, src, callee, .none, args, modifier);
+        }
     }
     if (ip.keyTag(container) == .struct_type or ip.keyTag(container) == .union_type) {
         // A field holding a function (pointer) is called.
