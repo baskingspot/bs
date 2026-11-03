@@ -117,6 +117,8 @@ pub const Block = struct {
     /// Absolute AST node that ZIR source offsets in this body are relative to.
     src_base: Ast.Node.Index,
     want_safety: bool = true,
+    /// See `condChild`.
+    runtime_cond: bool = false,
     /// The innermost runtime `loop` this block is inside of.
     loop: ?Ir.Inst.Index = null,
 
@@ -154,6 +156,14 @@ pub const Block = struct {
         is_comptime: bool,
         name: Zir.NullTerminatedString,
     };
+
+    /// A child whose instructions run only on some paths (a branch,
+    /// switch prong, or loop body), unlike a labeled block's.
+    fn condChild(b: *Block) Block {
+        var c = b.child();
+        c.runtime_cond = true;
+        return c;
+    }
 
     fn child(b: *Block) Block {
         return .{
@@ -1579,7 +1589,7 @@ fn zirLoop(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const block_inst = try sema.reserveInst();
     const loop_inst = try sema.reserveInst();
     var label: Block.Label = .{ .zir_block = inst, .merges = .{ .block_inst = block_inst } };
-    var loop_block = parent.child();
+    var loop_block = parent.condChild();
     loop_block.label = &label;
     loop_block.loop = loop_inst;
     defer {
@@ -1617,10 +1627,10 @@ fn zirCondbr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!?[]
     if (try sema.resolveDefinedValue(parent, src, cond)) |v| return if (v == .bool_true) then_body else else_body;
 
     const gpa = sema.gpa;
-    var then_block = parent.child();
+    var then_block = parent.condChild();
     defer then_block.instructions.deinit(gpa);
     try sema.analyzeBodyInner(&then_block, then_body);
-    var else_block = parent.child();
+    var else_block = parent.condChild();
     defer else_block.instructions.deinit(gpa);
     try sema.analyzeBodyInner(&else_block, else_body);
     try sema.addCondBr(parent, cond, then_block.instructions.items, else_block.instructions.items);
@@ -4631,10 +4641,10 @@ fn analyzePtrArithmetic(sema: *Sema, block: *Block, src: Src, is_add: bool, ptr:
 /// `block { cond_br(cond, { br a }, { br b }) }`
 fn select(sema: *Sema, block: *Block, ty: Index, cond: Ref, a: Ref, b: Ref) CompileError!Ref {
     const block_inst = try sema.reserveInst();
-    var then_block = block.child();
+    var then_block = block.condChild();
     defer then_block.instructions.deinit(sema.gpa);
     _ = try sema.addInst(&then_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = a } } });
-    var else_block = block.child();
+    var else_block = block.condChild();
     defer else_block.instructions.deinit(sema.gpa);
     _ = try sema.addInst(&else_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = b } } });
     var inner = block.child();
@@ -5938,11 +5948,11 @@ fn zirBoolBr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_or: bool) Com
     }
     try sema.requireRuntime(parent, src);
     const block_inst = try sema.reserveInst();
-    var rhs_block = parent.child();
+    var rhs_block = parent.condChild();
     defer rhs_block.instructions.deinit(sema.gpa);
     const rhs = try sema.coerce(&rhs_block, .bool_type, try sema.resolveInlineBody(&rhs_block, body, inst), src);
     _ = try sema.addInst(&rhs_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = rhs } } });
-    var short_block = parent.child();
+    var short_block = parent.condChild();
     defer short_block.instructions.deinit(sema.gpa);
     _ = try sema.addInst(&short_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .fromInterned(boolValue(is_or)) } } });
     var inner = parent.child();
@@ -6009,7 +6019,14 @@ fn trackConstStore(sema: *Sema, block: *Block, ptr: Ref, val: Ref) !void {
     const root = r.alloc;
     const ca = sema.const_allocs.getPtr(root).?;
     const v = sema.resolveValue(val) orelse return sema.forgetConstAlloc(root);
-    if (!r.replayable or ca.block != block or sema.refersToComptimeAlloc(v)) return sema.forgetConstAlloc(root);
+    if (!r.replayable or sema.refersToComptimeAlloc(v)) return sema.forgetConstAlloc(root);
+    // The store must run whenever the local is initialized: from its own
+    // block or a labeled block in it, not a branch.
+    var b = block;
+    while (b != ca.block) {
+        if (b.runtime_cond) return sema.forgetConstAlloc(root);
+        b = b.parent orelse return sema.forgetConstAlloc(root);
+    }
     try ca.stores.append(sema.arena, .{ .ptr = ptr, .val = v });
 }
 
@@ -7824,10 +7841,10 @@ fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_ptr: bool) Compi
         return .unreachable_value;
     }
     const block_inst = try sema.reserveInst();
-    var ok_block = parent.child();
+    var ok_block = parent.condChild();
     defer ok_block.instructions.deinit(sema.gpa);
     _ = try sema.addInst(&ok_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
-    var err_block = parent.child();
+    var err_block = parent.condChild();
     defer err_block.instructions.deinit(sema.gpa);
     try sema.analyzeBodyInner(&err_block, body);
     var inner = parent.child();
@@ -7904,13 +7921,13 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     defer outer.instructions.deinit(gpa);
 
     const cond_val = sema.resolveValue(cond);
-    var then_block = outer.child();
+    var then_block = outer.condChild();
     defer then_block.instructions.deinit(gpa);
     if (cond_val != .bool_false) {
         if (non_err.capture != .none) try sema.inst_map.put(gpa, inst, try sema.errUnionPayload(&then_block, src, eu));
         if (try sema.analyzeInlineBody(&then_block, non_err.body, inst)) |result| try sema.addBr(&then_block, &label, result);
     }
-    var else_block = outer.child();
+    var else_block = outer.condChild();
     defer else_block.instructions.deinit(gpa);
     if (cond_val != .bool_true) {
         const code = try sema.errUnionCode(&else_block, src, eu);
@@ -8272,7 +8289,7 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
     const ptr = try sema.addInst(&outer, .{ .tag = .alloc, .data = .{ .ty = try sema.ptrType(.{ .child = operand_ty }) } });
     _ = try sema.addBinOp(&outer, .store, ptr, operand);
     label.switch_continue = .{ .loop_inst = loop_inst, .operand_ptr = ptr, .operand_ty = operand_ty };
-    var loop_block = outer.child();
+    var loop_block = outer.condChild();
     defer loop_block.instructions.deinit(gpa);
     const cur = try sema.analyzeLoad(&loop_block, src, ptr);
     const cond = if (is_union) try sema.unionTag(&loop_block, src, cur) else cur;
@@ -8301,7 +8318,7 @@ fn emitSwitchProngs(sema: *Sema, outer: *Block, src: Src, inst: Zir.Inst.Index, 
             var bodies: std.ArrayList(u32) = .empty;
             defer bodies.deinit(gpa);
             for (cases) |c| {
-                var prong = outer.child();
+                var prong = outer.condChild();
                 defer prong.instructions.deinit(gpa);
                 try sema.analyzeProng(&prong, c, operand, capture_inst, inst);
                 try bodies.append(gpa, @intCast(c.items.len));
@@ -8309,7 +8326,7 @@ fn emitSwitchProngs(sema: *Sema, outer: *Block, src: Src, inst: Zir.Inst.Index, 
                 for (c.items) |item| try bodies.append(gpa, @backingInt(item));
                 try bodies.appendSlice(gpa, @ptrCast(prong.instructions.items));
             }
-            var else_block = outer.child();
+            var else_block = outer.condChild();
             defer else_block.instructions.deinit(gpa);
             if (else_case) |e| {
                 try sema.analyzeProng(&else_block, e, operand, capture_inst, inst);
@@ -8425,10 +8442,10 @@ fn switchAsCondBrs(sema: *Sema, block: *Block, src: Src, cases: []const SwitchCa
         const in = try sema.addBinOp(block, .bit_and, ge, le);
         cond = if (cond.toInterned() == .bool_false) in else try sema.addBinOp(block, .bit_or, cond, in);
     }
-    var then_block = block.child();
+    var then_block = block.condChild();
     defer then_block.instructions.deinit(sema.gpa);
     try sema.analyzeProng(&then_block, c, operand, capture_inst, switch_inst);
-    var else_block = block.child();
+    var else_block = block.condChild();
     defer else_block.instructions.deinit(sema.gpa);
     try sema.switchAsCondBrs(&else_block, src, cases[1..], else_case, cond_operand, operand, capture_inst, switch_inst);
     try sema.addCondBr(block, cond, then_block.instructions.items, else_block.instructions.items);

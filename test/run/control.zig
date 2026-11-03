@@ -1,5 +1,5 @@
 //! exit: 3
-//! stdout: "84\n14\n10\n137\n28\n30\n8\n3\n11\n9\n6\n"
+//! stdout: "84\n14\n10\n137\n28\n30\n8\n3\n11\n9\n6\n1\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -95,6 +95,9 @@ fn main() callconv(.c) noreturn {
         else => |*p| p.* = 0,
     }
     rt.printInt(sn);
+    // A const destructured from a comptime-selected prong stays
+    // comptime-known.
+    rt.printInt(leb(false, 9));
     rt.exit(if (b) 3 else 4);
 }
 
@@ -105,4 +108,19 @@ fn bumpRef(u: *RefU) void {
         .b => |*arr| arr[1] = 9,
         .c => {},
     }
+}
+
+fn leb(comptime signed: bool, b: u8) u32 {
+    const allowed: u7, var fits: bool = switch (signed) {
+        false => blk: {
+            const ok = b >> 3 == 0;
+            break :blk .{ 0, ok };
+        },
+        true => .{ 5, b == 1 },
+    };
+    if (!signed) comptime {
+        if (allowed != 0) unreachable;
+    };
+    fits = !fits;
+    return @intFromBool(fits) + allowed;
 }
