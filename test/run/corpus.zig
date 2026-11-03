@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -114,6 +114,14 @@ fn small(i: u32) Small {
     return @enumFromInt(i);
 }
 
+// ziggy (known-folders): a struct literal that leaves a comptime field to
+// its default stores nothing for it, not the default over a runtime field.
+const Config = struct { a: u32 = 7, b: bool = true };
+const WithConfig = struct {
+    comptime config: Config = .{},
+    p: *const u64,
+};
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -159,5 +167,11 @@ fn main() callconv(.c) noreturn {
     _ = &three;
     rt.printInt(@intCast(@intFromEnum(resultFromLen(three))));
     rt.printInt(@intFromEnum(small(three - 1)));
+
+    const x: u64 = 42;
+    var wc: WithConfig = .{ .p = &x };
+    _ = &wc;
+    rt.printInt(wc.p.*);
+    rt.printInt(wc.config.a);
     rt.exit(0);
 }

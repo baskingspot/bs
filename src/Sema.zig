@@ -13787,6 +13787,8 @@ fn zirValidatePtrStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Co
         if (s) continue;
         const d = info.field_defaults[k];
         if (d == .none) return sema.fail(block, src, "missing struct field: {s}", .{ip.stringSlice(info.field_names[k])});
+        // A comptime field has no storage: its value is the default.
+        if (info.fieldIsComptime(k)) continue;
         const field_ptr = try sema.fieldPtrAt(block, src, obj_ptr, info.field_types[k], @intCast(k));
         try sema.analyzeStore(block, src, field_ptr, .fromInterned(d));
     }
