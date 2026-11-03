@@ -48,6 +48,9 @@ panic_ns: Index = .none,
 ir_insts: std.MultiArrayList(Ir.Inst) = .empty,
 ir_extra: std.ArrayList(u32) = .empty,
 inst_map: InstMap = .{},
+/// Emptied instruction lists of finished blocks, which `Block.child`
+/// reuses: analysis makes millions of short-lived child blocks.
+insts_pool: std.ArrayList(std.ArrayList(Ir.Inst.Index)) = .empty,
 deps: std.ArrayList(Zcu.Dependee) = .empty,
 /// Per entry of `deps`: whether only a lowering for the comptime
 /// evaluator read it (see `Zcu.conditional_deps`).
@@ -362,6 +365,7 @@ pub const Block = struct {
             .parent = b,
             .sema = b.sema,
             .namespace = b.namespace,
+            .instructions = b.sema.insts_pool.pop() orelse .empty,
             .is_comptime = b.is_comptime,
             .label = null,
             .inlining = b.inlining,
@@ -373,6 +377,15 @@ pub const Block = struct {
             .discards_runtime = b.discards_runtime,
             .error_return_trace_index = b.error_return_trace_index,
         };
+    }
+
+    /// Frees `instructions`, emptied, to `Sema.insts_pool`.
+    fn deinitInsts(b: *Block) void {
+        const sema = b.sema;
+        if (b.instructions.capacity == 0) return;
+        b.instructions.clearRetainingCapacity();
+        sema.insts_pool.append(sema.gpa, b.instructions) catch b.instructions.deinit(sema.gpa);
+        b.instructions = .empty;
     }
 
     pub fn nodeSrc(b: *const Block, offset: Ast.Node.Offset) Src {
@@ -566,6 +579,8 @@ fn destroy(sema: *Sema) void {
     sema.ir_insts.deinit(gpa);
     sema.ir_extra.deinit(gpa);
     sema.inst_map.deinit(gpa);
+    for (sema.insts_pool.items) |*l| l.deinit(gpa);
+    sema.insts_pool.deinit(gpa);
     sema.deps.deinit(gpa);
     sema.deps_conditional.deinit(gpa);
     giveDepMap(sema.zcu, &sema.deps_set);
@@ -608,7 +623,7 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     sema.owner_nav = nav_index;
     const decl = sema.code.getDeclaration(nav.zir_inst);
     var block = sema.rootBlock(nav.namespace, decl.src_node, true);
-    defer block.instructions.deinit(zcu.gpa);
+    defer block.deinitInsts();
     const src = block.nodeSrc(.zero);
 
     const decl_ty: Index = if (decl.type_body) |body| blk: {
@@ -720,7 +735,7 @@ pub fn analyzeComptimeDecl(zcu: *Zcu, c: Zcu.ComptimeDecl) CompileError!void {
     defer sema.destroy();
     const decl = sema.code.getDeclaration(c.inst);
     var block = sema.rootBlock(c.namespace, decl.src_node, true);
-    defer block.instructions.deinit(zcu.gpa);
+    defer block.deinitInsts();
     _ = try sema.resolveInlineBody(&block, decl.value_body.?, c.inst);
     try sema.finish();
 }
@@ -742,7 +757,7 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     if (reifyNode(sema.code, key.zir_inst)) |node| return sema.analyzeReifiedStructLayout(key, info, node);
     const decl = sema.code.getStructDecl(key.zir_inst);
     var block = sema.rootBlock(info.namespace, decl.fields_baseline_src_node, true);
-    defer block.instructions.deinit(zcu.gpa);
+    defer block.deinitInsts();
 
     info.status = .field_types_wip;
     const n = decl.field_names.len;
@@ -822,7 +837,7 @@ pub fn analyzeStructDefaults(zcu: *Zcu, ty: Index) CompileError!void {
     try sema.declareDependency(.{ .type_layout = ty });
     const decl = sema.code.getStructDecl(key.zir_inst);
     var block = sema.rootBlock(info.namespace, decl.fields_baseline_src_node, true);
-    defer block.instructions.deinit(zcu.gpa);
+    defer block.deinitInsts();
     const defaults: []Index = @constCast(info.field_defaults);
     var it = decl.iterateFields();
     while (it.next()) |field| {
@@ -869,7 +884,7 @@ fn reifyNode(code: *const Zir, inst: Zir.Inst.Index) ?Ast.Node.Index {
 fn analyzeReifiedStructLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPool.ContainerInfo, node: Ast.Node.Index) CompileError!void {
     const ip = sema.ip;
     var block = sema.rootBlock(info.namespace, node, true);
-    defer block.instructions.deinit(sema.gpa);
+    defer block.deinitInsts();
     const layout = std.meta.stringToEnum(std.lang.Type.ContainerLayout, sema.enumTagName(key.captures[0]).?).?;
     const backing = ip.keyPayload(.opt, key.captures[1]).val;
     const offsets = try ip.arena(Zcu.tid).alloc(u64, info.field_types.len);
@@ -974,7 +989,7 @@ fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPo
     const ip = sema.ip;
     const decl = sema.code.getEnumDecl(key.zir_inst);
     var block = sema.rootBlock(info.namespace, decl.fields_baseline_src_node, true);
-    defer block.instructions.deinit(sema.gpa);
+    defer block.deinitInsts();
     const src = block.nodeSrc(.zero);
     info.status = .field_types_wip;
     const tag_ty: Index = if (decl.tag_type_body) |body| blk: {
@@ -1035,7 +1050,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     const reify_node = reifyNode(sema.code, key.zir_inst);
     const decl = if (reify_node == null) sema.code.getUnionDecl(key.zir_inst) else undefined;
     var block = sema.rootBlock(info.namespace, reify_node orelse decl.fields_baseline_src_node, true);
-    defer block.instructions.deinit(sema.gpa);
+    defer block.deinitInsts();
     const src = block.nodeSrc(.zero);
     var kind: Zir.Inst.UnionDecl.Kind = undefined;
     var arg_ty: Index = .none;
@@ -1214,7 +1229,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     }
     const decl = sema.code.getDeclaration(nav.zir_inst);
     var block = sema.rootBlock(nav.namespace, decl.src_node, false);
-    defer block.instructions.deinit(zcu.gpa);
+    defer block.deinitInsts();
     const gpa = zcu.gpa;
     // Upstream builds compiler_rt in a release mode: no safety checks.
     if (zcu.file(nav.file).module == .compiler_rt) block.want_safety = false;
@@ -2133,16 +2148,16 @@ fn addSafetyCheck(sema: *Sema, block: *Block, ok: Ref, id: PanicId, lhs: Ref, rh
         if (v == .bool_true) return;
     }
     var fail_block = block.child();
-    defer fail_block.instructions.deinit(sema.gpa);
+    defer fail_block.deinitInsts();
     try sema.addPanic(&fail_block, id, lhs, rhs);
     // `block { cond_br(ok, { br }, { panic }) }`
     const block_inst: Ir.Inst.Index = @fromBackingInt(@intCast(sema.ir_insts.len));
     try sema.ir_insts.append(sema.gpa, .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = undefined } } });
     var ok_block = block.child();
-    defer ok_block.instructions.deinit(sema.gpa);
+    defer ok_block.deinitInsts();
     _ = try sema.addInst(&ok_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
     var inner = block.child();
-    defer inner.instructions.deinit(sema.gpa);
+    defer inner.deinitInsts();
     try sema.addCondBr(&inner, ok, ok_block.instructions.items, fail_block.instructions.items);
     const payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(inner.instructions.items.len) });
     try sema.appendBody(inner.instructions.items);
@@ -2480,7 +2495,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 const extra = sema.code.extraData(Zir.Inst.BlockComptime, data.pl_node.payload_index);
                 const block_body = sema.code.bodySlice(extra.end, extra.data.body_len);
                 var child = block.child();
-                defer child.instructions.deinit(gpa);
+                defer child.deinitInsts();
                 child.is_comptime = true;
                 if (!block.is_comptime and sema.func != .none) child.discards_runtime = true;
                 const result = try sema.resolveInlineBody(&child, block_body, inst);
@@ -2774,7 +2789,7 @@ fn zirBlock(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     var child = parent.child();
     child.label = &label;
     defer {
-        child.instructions.deinit(sema.gpa);
+        child.deinitInsts();
         label.merges.deinit(sema.gpa);
     }
     // A comptime break to this block (from a nested inline body) delivers
@@ -2835,7 +2850,7 @@ fn resolveBlock(sema: *Sema, parent: *Block, src: Src, child: *Block, merges: *B
 fn coerceBrOperand(sema: *Sema, b: *Block, inst: Ir.Inst.Index, ty: Index, operand: Ref, src: Src) CompileError!void {
     if (sema.typeOf(operand) == ty) return;
     var coerce_block = b.child();
-    defer coerce_block.instructions.deinit(sema.gpa);
+    defer coerce_block.deinitInsts();
     const coerced = try sema.coerce(&coerce_block, ty, operand, src);
     var data = sema.ir_insts.items(.data)[@backingInt(inst)];
     const tag = sema.ir_insts.items(.tag)[@backingInt(inst)];
@@ -2925,7 +2940,7 @@ fn zirLoop(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     loop_block.label = &label;
     loop_block.loop = loop_inst;
     defer {
-        loop_block.instructions.deinit(gpa);
+        loop_block.deinitInsts();
         label.merges.deinit(gpa);
     }
     try sema.analyzeBodyInner(&loop_block, body);
@@ -2934,7 +2949,7 @@ fn zirLoop(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     sema.ir_insts.set(@backingInt(loop_inst), .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = loop_payload } } });
 
     var outer = parent.child();
-    defer outer.instructions.deinit(gpa);
+    defer outer.deinitInsts();
     try outer.instructions.append(gpa, loop_inst);
     if (label.merges.results.items.len == 0) {
         try parent.instructions.append(gpa, loop_inst);
@@ -2958,12 +2973,11 @@ fn zirCondbr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!?[]
     const cond = try sema.coerce(parent, .bool_type, sema.resolveInst(extra.data.condition), src);
     if (try sema.resolveDefinedValue(parent, src, cond)) |v| return if (v == .bool_true) then_body else else_body;
 
-    const gpa = sema.gpa;
     var then_block = parent.condChild();
-    defer then_block.instructions.deinit(gpa);
+    defer then_block.deinitInsts();
     try sema.analyzeBodyInner(&then_block, then_body);
     var else_block = parent.condChild();
-    defer else_block.instructions.deinit(gpa);
+    defer else_block.deinitInsts();
     try sema.analyzeBodyInner(&else_block, else_body);
     try sema.addCondBr(parent, cond, then_block.instructions.items, else_block.instructions.items);
     return null;
@@ -3026,7 +3040,7 @@ fn isErrorType(sema: *Sema, ty: Index) bool {
 /// entry after its arguments.
 fn setupErrorReturnTrace(sema: *Sema, block: *Block, last_arg_index: usize) CompileError!void {
     var b = block.child();
-    defer b.instructions.deinit(sema.gpa);
+    defer b.deinitInsts();
     const src = block.nodeSrc(.zero);
     const addrs_ty = try sema.intern(.{ .array_type = .{ .len = 32, .child = .usize_type } });
     const addrs = try sema.addInst(&b, .{ .tag = .alloc, .data = .{ .ty = try sema.ptrType(.{ .child = addrs_ty }) } });
@@ -3069,9 +3083,9 @@ fn maybePushErrorTrace(sema: *Sema, block: *Block, src: Src, operand: Ref) Compi
     if (is_non_err.toInterned() != null) return sema.callReturnError(block, src);
     const block_inst = try sema.reserveInst();
     var ok = block.child();
-    defer ok.instructions.deinit(sema.gpa);
+    defer ok.deinitInsts();
     var err = block.child();
-    defer err.instructions.deinit(sema.gpa);
+    defer err.deinitInsts();
     try sema.callReturnError(&err, src);
     try sema.addIfElse(block, block_inst, is_non_err, &ok, &err);
 }
@@ -3092,7 +3106,7 @@ fn callReturnError(sema: *Sema, block: *Block, src: Src) CompileError!void {
 fn addIfElse(sema: *Sema, block: *Block, block_inst: Ir.Inst.Index, cond: Ref, then: *Block, else_: *Block) CompileError!void {
     for ([_]*Block{ then, else_ }) |b| _ = try sema.addInst(b, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
     var inner = block.child();
-    defer inner.instructions.deinit(sema.gpa);
+    defer inner.deinitInsts();
     try sema.addCondBr(&inner, cond, then.instructions.items, else_.instructions.items);
     try sema.addBlock(block, block_inst, .void_type, inner.instructions.items);
 }
@@ -3113,10 +3127,10 @@ fn popErrorReturnTrace(sema: *Sema, block: *Block, src: Src, operand: Ref, saved
     }
     const block_inst = try sema.reserveInst();
     var then = block.child();
-    defer then.instructions.deinit(sema.gpa);
+    defer then.deinitInsts();
     try sema.storeErrRetIndex(&then, info, saved);
     var else_ = block.child();
-    defer else_.instructions.deinit(sema.gpa);
+    defer else_.deinitInsts();
     try sema.addIfElse(block, block_inst, is_non_err, &then, &else_);
 }
 
@@ -3286,7 +3300,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const extra = sema.code.extraData(Zir.Inst.Block, data.pl_node.payload_index);
             const body = sema.code.bodySlice(extra.end, extra.data.body_len);
             var child = block.child();
-            defer child.instructions.deinit(sema.gpa);
+            defer child.deinitInsts();
             // The operand is analyzed for its type only, as runtime code even
             // in a comptime scope (like upstream); any IR it emits is never
             // referenced by a body.
@@ -4185,7 +4199,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(extra.data.src_node);
             const body = sema.code.bodySlice(extra.data.body_index, extra.data.body_len);
             var child = block.child();
-            defer child.instructions.deinit(sema.gpa);
+            defer child.deinitInsts();
             // As upstream, the operands are analyzed for their types only,
             // as runtime code even in a comptime scope.
             child.is_comptime = false;
@@ -7786,13 +7800,13 @@ fn analyzePtrArithmetic(sema: *Sema, block: *Block, src: Src, is_add: bool, ptr:
 fn select(sema: *Sema, block: *Block, ty: Index, cond: Ref, a: Ref, b: Ref) CompileError!Ref {
     const block_inst = try sema.reserveInst();
     var then_block = block.condChild();
-    defer then_block.instructions.deinit(sema.gpa);
+    defer then_block.deinitInsts();
     _ = try sema.addInst(&then_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = a } } });
     var else_block = block.condChild();
-    defer else_block.instructions.deinit(sema.gpa);
+    defer else_block.deinitInsts();
     _ = try sema.addInst(&else_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = b } } });
     var inner = block.child();
-    defer inner.instructions.deinit(sema.gpa);
+    defer inner.deinitInsts();
     try sema.addCondBr(&inner, cond, then_block.instructions.items, else_block.instructions.items);
     try sema.addBlock(block, block_inst, ty, inner.instructions.items);
     return block_inst.toRef();
@@ -9195,14 +9209,14 @@ fn zirBoolBr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_or: bool) Com
     try sema.requireRuntime(parent, src);
     const block_inst = try sema.reserveInst();
     var rhs_block = parent.condChild();
-    defer rhs_block.instructions.deinit(sema.gpa);
+    defer rhs_block.deinitInsts();
     const rhs = try sema.coerce(&rhs_block, .bool_type, try sema.resolveInlineBody(&rhs_block, body, inst), src);
     _ = try sema.addInst(&rhs_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = rhs } } });
     var short_block = parent.condChild();
-    defer short_block.instructions.deinit(sema.gpa);
+    defer short_block.deinitInsts();
     _ = try sema.addInst(&short_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .fromInterned(boolValue(is_or)) } } });
     var inner = parent.child();
-    defer inner.instructions.deinit(sema.gpa);
+    defer inner.deinitInsts();
     if (is_or) {
         try sema.addCondBr(&inner, lhs, short_block.instructions.items, rhs_block.instructions.items);
     } else {
@@ -12507,13 +12521,13 @@ fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_ptr: bool) Compi
     }
     const block_inst = try sema.reserveInst();
     var ok_block = parent.condChild();
-    defer ok_block.instructions.deinit(sema.gpa);
+    defer ok_block.deinitInsts();
     _ = try sema.addInst(&ok_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
     var err_block = parent.condChild();
-    defer err_block.instructions.deinit(sema.gpa);
+    defer err_block.deinitInsts();
     try sema.analyzeBodyInner(&err_block, body);
     var inner = parent.child();
-    defer inner.instructions.deinit(sema.gpa);
+    defer inner.deinitInsts();
     try sema.addCondBr(&inner, is_non_err, ok_block.instructions.items, err_block.instructions.items);
     try sema.addBlock(parent, block_inst, .void_type, inner.instructions.items);
     if (is_ptr) {
@@ -12593,17 +12607,17 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     }
     var outer = parent.child();
     outer.label = &label;
-    defer outer.instructions.deinit(gpa);
+    defer outer.deinitInsts();
 
     const cond_val = sema.resolveValue(cond);
     var then_block = outer.condChild();
-    defer then_block.instructions.deinit(gpa);
+    defer then_block.deinitInsts();
     if (cond_val != .bool_false) {
         if (non_err.capture != .none) try sema.inst_map.put(gpa, inst, try sema.errUnionCapture(&then_block, src, eu, eu_ptr, non_err.capture));
         if (try sema.analyzeInlineBody(&then_block, non_err.body, inst)) |result| try sema.addBr(&then_block, &label, result, src);
     }
     var else_block = outer.condChild();
-    defer else_block.instructions.deinit(gpa);
+    defer else_block.deinitInsts();
     if (cond_val != .bool_true) {
         const code = try sema.errUnionCode(&else_block, src, eu);
         // Prong bodies refer to the error (the switch operand) as `inst`.
@@ -12629,7 +12643,6 @@ fn errUnionCapture(sema: *Sema, block: *Block, src: Src, eu: Ref, eu_ptr: Ref, c
 /// by reference, else is `none`.
 fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, operand: Ref, operand_ptr: Ref) CompileError!Ref {
     const ip = sema.ip;
-    const gpa = sema.gpa;
     const sb = sema.code.getSwitchBlock(inst);
     // A tagged union switches on its tag; prongs capture the payload. A
     // packed struct or union switches on its bits, as upstream.
@@ -12649,7 +12662,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     // Evaluate the case items at comptime.
     var cases: std.ArrayList(SwitchCase) = .empty;
     var item_block = parent.child();
-    defer item_block.instructions.deinit(gpa);
+    defer item_block.deinitInsts();
     item_block.is_comptime = true;
     var extra_index = sb.end;
     var under_index: ?usize = null;
@@ -13009,7 +13022,7 @@ fn switchProngsRuntime(
     }
     var outer = parent.child();
     if (enclosing == null) outer.label = &label;
-    defer outer.instructions.deinit(gpa);
+    defer outer.deinitInsts();
     try sema.emitSwitchProngs(&outer, src, inst, cond, operand, cases, else_case, capture_inst);
     if (enclosing != null) {
         try parent.instructions.appendSlice(gpa, outer.instructions.items);
@@ -13079,12 +13092,12 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
     }
     var outer = parent.child();
     outer.label = &label;
-    defer outer.instructions.deinit(gpa);
+    defer outer.deinitInsts();
     const ptr = try sema.addInst(&outer, .{ .tag = .alloc, .data = .{ .ty = try sema.ptrType(.{ .child = slot_ty }) } });
     _ = try sema.addBinOp(&outer, .store, ptr, if (is_ref) operand_ptr else operand);
     label.switch_continue = .{ .loop_inst = loop_inst, .operand_ptr = ptr, .operand_ty = slot_ty };
     var loop_block = outer.condChild();
-    defer loop_block.instructions.deinit(gpa);
+    defer loop_block.deinitInsts();
     const slot = try sema.analyzeLoad(&loop_block, src, ptr);
     if (is_ref) setPtr(cases, &else_case, slot);
     const cur = if (is_ref) try sema.analyzeLoad(&loop_block, src, slot) else slot;
@@ -13130,7 +13143,7 @@ fn emitSwitchProngs(sema: *Sema, outer: *Block, src: Src, inst: Zir.Inst.Index, 
             defer bodies.deinit(gpa);
             for (cases) |c| {
                 var prong = outer.condChild();
-                defer prong.instructions.deinit(gpa);
+                defer prong.deinitInsts();
                 try sema.analyzeProng(&prong, c, operand, capture_inst, inst);
                 try bodies.append(gpa, @intCast(c.items.len));
                 try bodies.append(gpa, @intCast(prong.instructions.items.len));
@@ -13138,7 +13151,7 @@ fn emitSwitchProngs(sema: *Sema, outer: *Block, src: Src, inst: Zir.Inst.Index, 
                 try bodies.appendSlice(gpa, @ptrCast(prong.instructions.items));
             }
             var else_block = outer.condChild();
-            defer else_block.instructions.deinit(gpa);
+            defer else_block.deinitInsts();
             if (else_case) |e| {
                 try sema.analyzeProng(&else_block, e, operand, capture_inst, inst);
             } else if (outer.want_safety) {
@@ -13244,7 +13257,7 @@ fn peerUnionCapture(sema: *Sema, block: *Block, src: Src, items: []const Index, 
     var chain: []const Ir.Inst.Index = &.{};
     {
         var last = block.condChild();
-        defer last.instructions.deinit(sema.gpa);
+        defer last.deinitInsts();
         _ = try sema.addInst(&last, .{ .tag = .unreach, .data = .{ .no_op = {} } });
         chain = try sema.arena.dupe(Ir.Inst.Index, last.instructions.items);
     }
@@ -13252,10 +13265,10 @@ fn peerUnionCapture(sema: *Sema, block: *Block, src: Src, items: []const Index, 
     while (k > 0) {
         k -= 1;
         var b = block.condChild();
-        defer b.instructions.deinit(sema.gpa);
+        defer b.deinitInsts();
         const eq = try sema.addBinOp(&b, .cmp_eq, tag, .fromInterned(items[k]));
         var then = b.condChild();
-        defer then.instructions.deinit(sema.gpa);
+        defer then.deinitInsts();
         const val = try sema.addStructField(&then, .struct_field_val, info.field_types[fields[k]], operand, fields[k]);
         const coerced = try sema.coerce(&then, peer, val, src);
         _ = try sema.addInst(&then, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = coerced } } });
@@ -13323,10 +13336,10 @@ fn switchAsCondBrs(sema: *Sema, block: *Block, src: Src, cases: []const SwitchCa
         cond = if (cond.toInterned() == .bool_false) in else try sema.addBinOp(block, .bit_or, cond, in);
     }
     var then_block = block.condChild();
-    defer then_block.instructions.deinit(sema.gpa);
+    defer then_block.deinitInsts();
     try sema.analyzeProng(&then_block, c, operand, capture_inst, switch_inst);
     var else_block = block.condChild();
-    defer else_block.instructions.deinit(sema.gpa);
+    defer else_block.deinitInsts();
     try sema.switchAsCondBrs(&else_block, src, cases[1..], else_case, cond_operand, operand, capture_inst, switch_inst);
     try sema.addCondBr(block, cond, then_block.instructions.items, else_block.instructions.items);
 }
@@ -14939,7 +14952,7 @@ fn analyzeCall(
                 // As upstream, an argument to a comptime parameter is
                 // evaluated at comptime.
                 var ct_block = block.child();
-                defer ct_block.instructions.deinit(sema.gpa);
+                defer ct_block.deinitInsts();
                 if (arg_i < 32 and (fn_ty.comptime_bits >> @intCast(arg_i)) & 1 != 0) ct_block.is_comptime = true;
                 const arg = try sema.resolveInlineBody(if (ct_block.is_comptime) &ct_block else block, body, zir_args.call_inst);
                 if (sema.isErrorType(sema.typeOf(arg))) sema.any_arg_is_error = true;
@@ -15180,7 +15193,7 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) C
     defer saved.leave(sema);
     // Parameter and return types evaluate at comptime, the body at runtime.
     var ct_block = sema.calleeBlock(caller, func);
-    defer ct_block.instructions.deinit(gpa);
+    defer ct_block.deinitInsts();
     const fn_info = sema.code.getFnInfo(f.zir_inst);
     const comptime_args = try sema.arena.alloc(Index, args.len);
     var i: usize = 0;
@@ -15243,7 +15256,7 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) C
         .src_base = ct_block.src_base,
         .want_safety = caller.want_safety,
     };
-    defer child.instructions.deinit(gpa);
+    defer child.deinitInsts();
     // For debug info, the body is marked as an inlined call from the
     // current statement; its statements are relative to the callee.
     const call_line = sema.dbg_line;
@@ -15303,7 +15316,7 @@ fn genericParamType(sema: *Sema, caller: *Block, src: Src, func: Index, prior: [
     const saved = CalleeScope.enter(sema, func);
     defer saved.leave(sema);
     var callee_block = sema.calleeBlock(caller, func);
-    defer callee_block.instructions.deinit(sema.gpa);
+    defer callee_block.deinitInsts();
     const fn_info = sema.code.getFnInfo(sema.ip.keyPayload(.func, func).zir_inst);
     var i: usize = 0;
     for (fn_info.param_body) |inst| {
@@ -15417,7 +15430,7 @@ fn walkComptimeCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []
     const saved = CalleeScope.enter(sema, func);
     defer saved.leave(sema);
     var callee_block = sema.calleeBlock(caller, func);
-    defer callee_block.instructions.deinit(sema.gpa);
+    defer callee_block.deinitInsts();
     const arg_refs = try sema.arena.alloc(Ref, args.len);
     for (args, arg_refs) |a, *r| r.* = .fromInterned(a);
     try sema.mapCalleeParams(&callee_block, caller, src, func, arg_refs);
@@ -15688,7 +15701,7 @@ fn bcLowerLoop(sema: *Sema, block: *Block, body: []const Zir.Inst.Index) Allocat
     };
     const loop_inst = try l.reserveInst();
     var root = l.rootBlock(block.namespace, block.src_base, false);
-    defer root.instructions.deinit(gpa);
+    defer root.deinitInsts();
     root.want_safety = true;
     root.loop = loop_inst;
     const n_errors = zcu.errors.items.len;
@@ -16035,10 +16048,10 @@ fn bcLowerBody(sema: *Sema, func_index: Index, args: []const Index, params: *std
     const nav = ip.getNav(func.owner_nav);
     const decl = sema.code.getDeclaration(nav.zir_inst);
     var block = sema.rootBlock(nav.namespace, decl.src_node, false);
-    defer block.instructions.deinit(gpa);
+    defer block.deinitInsts();
     // Generic parameter and return types evaluate at comptime.
     var ct = sema.rootBlock(nav.namespace, decl.src_node, true);
-    defer ct.instructions.deinit(gpa);
+    defer ct.deinitInsts();
     const src = block.nodeSrc(.zero);
     const fn_info = sema.code.getFnInfo(func.zir_inst);
     const comptime_args = try sema.arena.alloc(Index, if (fn_ty.is_generic) args.len else 0);
@@ -16385,7 +16398,7 @@ fn bcRun(sema: *Sema, caller: *Block, src: Src, func: Index, body: *const Zcu.By
     const saved = CalleeScope.enter(sema, func);
     defer saved.leave(sema);
     var block = sema.calleeBlock(caller, func);
-    defer block.instructions.deinit(gpa);
+    defer block.deinitInsts();
     // A specialization's arguments, coerced as the walker coerces them;
     // the comptime ones are the specialization's.
     const run_args = if (body.params.len == 0) args else blk: {
@@ -16974,7 +16987,7 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) 
         const saved = CalleeScope.enter(sema, func);
         defer saved.leave(sema);
         var callee_block = sema.calleeBlock(caller, func);
-        defer callee_block.instructions.deinit(sema.gpa);
+        defer callee_block.deinitInsts();
         try sema.mapCalleeParams(&callee_block, caller, src, func, args);
         break :blk try sema.calleeRetTy(&callee_block, src, func);
     };
@@ -17134,12 +17147,12 @@ fn vectorMapLoop(sema: *Sema, block: *Block, src: Src, len: u32, result_ty: Inde
     const loop_inst = try sema.reserveInst();
 
     var loop_block = block.child();
-    defer loop_block.instructions.deinit(gpa);
+    defer loop_block.deinitInsts();
     const i = try sema.analyzeLoad(&loop_block, src, idx_ptr);
     const in_range = try sema.addBinOp(&loop_block, .cmp_lt, i, .fromInterned(try sema.intValue(.usize_type, len)));
 
     var then_block = block.child();
-    defer then_block.instructions.deinit(gpa);
+    defer then_block.deinitInsts();
     const scalars = try sema.arena.alloc(Ref, operands.len);
     for (operands, scalars) |o, *sc| sc.* = if (sema.vectorLen(sema.typeOf(o)) != null) try sema.addBinOp(&then_block, .array_elem_val, o, i) else o;
     const r = try op.call(sema, &then_block, src, scalars);
@@ -17152,7 +17165,7 @@ fn vectorMapLoop(sema: *Sema, block: *Block, src: Src, len: u32, result_ty: Inde
     _ = try sema.addInst(&then_block, .{ .tag = .repeat, .data = .{ .repeat = .{ .loop_inst = loop_inst } } });
 
     var else_block = block.child();
-    defer else_block.instructions.deinit(gpa);
+    defer else_block.deinitInsts();
     _ = try sema.addInst(&else_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
     try sema.addCondBr(&loop_block, in_range, then_block.instructions.items, else_block.instructions.items);
 
@@ -17287,7 +17300,6 @@ fn zirReduce(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
 ///
 ///     acc = v[0]; i = 1; while (i < len) : (i += 1) acc = op(acc, v[i]);
 fn reduceLoop(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand: Ref, len: u32) CompileError!Ref {
-    const gpa = sema.gpa;
     const elem_ty = Type.childType(sema.ip, sema.typeOf(operand));
     const acc_ptr = try sema.analyzeAlloc(block, src, elem_ty, false, false);
     try sema.analyzeStore(block, src, acc_ptr, try sema.vectorElem(block, operand, 0));
@@ -17297,12 +17309,12 @@ fn reduceLoop(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand: 
     const loop_inst = try sema.reserveInst();
 
     var loop_block = block.child();
-    defer loop_block.instructions.deinit(gpa);
+    defer loop_block.deinitInsts();
     const i = try sema.analyzeLoad(&loop_block, src, idx_ptr);
     const in_range = try sema.addBinOp(&loop_block, .cmp_lt, i, .fromInterned(try sema.intValue(.usize_type, len)));
 
     var then_block = block.child();
-    defer then_block.instructions.deinit(gpa);
+    defer then_block.deinitInsts();
     const acc = try sema.analyzeLoad(&then_block, src, acc_ptr);
     const elem = try sema.addBinOp(&then_block, .array_elem_val, operand, i);
     try sema.analyzeStore(&then_block, src, acc_ptr, try sema.analyzeArithmetic(&then_block, src, tag, acc, elem));
@@ -17310,7 +17322,7 @@ fn reduceLoop(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand: 
     _ = try sema.addInst(&then_block, .{ .tag = .repeat, .data = .{ .repeat = .{ .loop_inst = loop_inst } } });
 
     var else_block = block.child();
-    defer else_block.instructions.deinit(gpa);
+    defer else_block.deinitInsts();
     _ = try sema.addInst(&else_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
     try sema.addCondBr(&loop_block, in_range, then_block.instructions.items, else_block.instructions.items);
 
