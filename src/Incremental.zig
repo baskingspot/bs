@@ -622,7 +622,7 @@ const Keyer = struct {
                 info.result_hash = layoutResultHash(ip, ty);
             },
             .func => |func| {
-                const owner = ip.getNav(ip.indexToKey(func).func.owner_nav);
+                const owner = ip.getNav(ip.keyPayload(.func, func).owner_nav);
                 info.src_hash = k.srcHash(owner.file, owner.zir_inst);
                 info.source = source(owner.file, owner.zir_inst);
                 // The result is the function's atom, hashed in `record`.
@@ -653,7 +653,7 @@ const Keyer = struct {
                 };
             },
             .func_body => |func| {
-                const owner = ip.getNav(ip.indexToKey(func).func.owner_nav);
+                const owner = ip.getNav(ip.keyPayload(.func, func).owner_nav);
                 return .{
                     .key = try k.keyOf(.func_body, &.{try k.unitKeyString(.{ .func = func })}),
                     .result_hash = k.srcHash(owner.file, owner.zir_inst),
@@ -905,12 +905,12 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         for (zcu.exports.items) |e| if (e.target == .nav) {
             try root_items.append(gpa, try r.addUnit(.{ .nav_val = e.target.nav }));
             const val = ip.getNav(e.target.nav).val;
-            if (ip.indexToKey(val) == .func) try root_items.append(gpa, try r.addUnit(.{ .func = val }));
+            if (ip.keyTag(val) == .func) try root_items.append(gpa, try r.addUnit(.{ .func = val }));
         };
         for (zcu.test_functions.items) |nav| {
             try root_items.append(gpa, try r.addUnit(.{ .nav_val = nav }));
             const val = ip.getNav(nav).val;
-            if (val != .none and ip.indexToKey(val) == .func) try root_items.append(gpa, try r.addUnit(.{ .func = val }));
+            if (val != .none and ip.keyTag(val) == .func) try root_items.append(gpa, try r.addUnit(.{ .func = val }));
         }
     }
     const t_collect = now(io);
@@ -1656,7 +1656,7 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
             .type_layout => |ty| blk: {
                 const info_live = ip.structInfo(ty);
                 const got = (results.decodeLayout(&d, arena, w) catch null) orelse break :blk .{ false, "unresolved" };
-                const is_struct = ip.indexToKey(ty) == .struct_type;
+                const is_struct = ip.keyTag(ty) == .struct_type;
                 var same = got.status == info_live.status and got.layout == info_live.layout and
                     got.nonexhaustive == info_live.nonexhaustive and got.has_runtime_tag == info_live.has_runtime_tag and
                     got.comptime_only == info_live.comptime_only and got.size == info_live.size and

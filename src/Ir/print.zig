@@ -15,8 +15,8 @@ const Ir = @import("../Ir.zig");
 const Inst = Ir.Inst;
 
 pub fn dump(ir: *const Ir, ip: *const InternPool, w: *Writer) Writer.Error!void {
-    const func = ip.indexToKey(ir.func).func;
-    const fn_ty = ip.indexToKey(func.ty).func_type;
+    const func = ip.keyPayload(.func, ir.func);
+    const fn_ty = ip.keyPayload(.func_type, func.ty);
     try w.writeAll("fn ");
     try printFuncName(ip, ir.func, w);
     try w.writeAll("(");
@@ -85,7 +85,7 @@ const Printer = struct {
             .dbg_stmt => try w.print("{d}:{d}", .{ data.dbg_stmt.line + 1, data.dbg_stmt.column + 1 }),
             .dbg_inline_begin => {
                 const d = ir.extraData(Ir.DbgInline, data.dbg_inline.payload).data;
-                try w.print("{s}, {d}:{d}", .{ p.ip.stringSlice(p.ip.getNav(p.ip.indexToKey(data.dbg_inline.func).func.owner_nav).name), d.line + 1, d.column + 1 });
+                try w.print("{s}, {d}:{d}", .{ p.ip.stringSlice(p.ip.getNav(p.ip.keyPayload(.func, data.dbg_inline.func).owner_nav).name), d.line + 1, d.column + 1 });
             },
             .dbg_inline_end, .comptime_tick => {},
             .comptime_quota => try w.print("{d}", .{data.quota}),
@@ -326,7 +326,7 @@ pub fn printType(ip: *const InternPool, ty: InternPool.Index, w: *Writer) Writer
         },
         .inferred_error_set_type => |f| {
             try w.print("@typeInfo(@typeInfo(@TypeOf({s})).@\"fn\".return_type.?).error_union.error_set", .{
-                ip.stringSlice(ip.getNav(ip.indexToKey(f).func.owner_nav).fqn),
+                ip.stringSlice(ip.getNav(ip.keyPayload(.func, f).owner_nav).fqn),
             });
         },
         .struct_type, .enum_type, .union_type, .opaque_type => |s| try w.writeAll(ip.stringSlice(s.name)),
@@ -408,7 +408,7 @@ pub fn printValueDepth(ip: *const InternPool, val: InternPool.Index, w: *Writer,
                 else => u.tag,
             };
             const index = intValue(ip, tag_int);
-            if (index != null and ip.indexToKey(u.tag) != .enum_tag and index.? < names.len) {
+            if (index != null and ip.keyTag(u.tag) != .enum_tag and index.? < names.len) {
                 try w.print(".{s}", .{ip.stringSlice(names[@intCast(index.?)])});
             } else {
                 try printValueDepth(ip, u.tag, w, level - 1);
@@ -420,7 +420,7 @@ pub fn printValueDepth(ip: *const InternPool, val: InternPool.Index, w: *Writer,
         .calling_convention => |cc| try w.print(".{s}", .{@tagName(cc)}),
         .ptr => try printPtr(ip, val, .rvalue, w, level),
         .slice => |s| {
-            if (ip.indexToKey(s.ptr) == .undef and intValue(ip, s.len) == 0) return w.writeAll("&.{}");
+            if (ip.keyTag(s.ptr) == .undef and intValue(ip, s.len) == 0) return w.writeAll("&.{}");
             try printPtr(ip, s.ptr, null, w, level);
             try w.writeAll("[0..");
             if (level == 0) try w.writeAll("(...)") else try printValueDepth(ip, s.len, w, level - 1);
@@ -452,7 +452,7 @@ fn printAggregate(ip: *const InternPool, val: InternPool.Index, is_ref: bool, w:
         if (is_ref) try w.writeByte('&');
         return w.writeAll(".{ ... }");
     }
-    const agg = ip.indexToKey(val).aggregate;
+    const agg = ip.keyPayload(.aggregate, val);
     const len: u64 = switch (ip.indexToKey(agg.ty)) {
         .struct_type => {
             const names = ip.structInfo(agg.ty).field_names;
@@ -536,17 +536,17 @@ const PtrKind = enum { lvalue, rvalue };
 /// prints as a reference to the aggregate (`"hi"[0..2]`, `&.{ 1, 2 }`),
 /// anything else as its derivation from a declaration or address.
 fn printPtr(ip: *const InternPool, ptr_val: InternPool.Index, want_kind: ?PtrKind, w: *Writer, level: u8) Writer.Error!void {
-    if (ip.indexToKey(ptr_val) == .undef) return w.writeAll("undefined");
+    if (ip.keyTag(ptr_val) == .undef) return w.writeAll("undefined");
     // zap derives a many-pointer to a constant's first element through
     // `elem` 0; upstream points at the constant itself.
-    var base = ip.indexToKey(ptr_val).ptr;
+    var base = ip.keyPayload(.ptr, ptr_val);
     while (base.byte_offset == 0) switch (base.base) {
         .elem => |e| if (e.index == 0) {
-            base = ip.indexToKey(e.base).ptr;
+            base = ip.keyPayload(.ptr, e.base);
         } else break,
         else => break,
     };
-    if (base.base == .uav and ip.indexToKey(base.base.uav.val) == .aggregate) {
+    if (base.base == .uav and ip.keyTag(base.base.uav.val) == .aggregate) {
         return printAggregate(ip, base.base.uav.val, true, w, level);
     }
     try printPtrDerivation(ip, ptr_val, want_kind, w, level, 20);
@@ -554,7 +554,7 @@ fn printPtr(ip: *const InternPool, ptr_val: InternPool.Index, want_kind: ?PtrKin
 
 fn printPtrDerivation(ip: *const InternPool, ptr_val: InternPool.Index, want_kind: ?PtrKind, w: *Writer, level: u8, depth: u8) Writer.Error!void {
     if (depth == 0) return w.writeAll("...");
-    const p = ip.indexToKey(ptr_val).ptr;
+    const p = ip.keyPayload(.ptr, ptr_val);
     const cast = p.byte_offset == 0 and castElemPtr(ip, p);
     const result_kind: PtrKind = if (p.byte_offset != 0 or p.base == .int or cast) .rvalue else .lvalue;
     const need_kind = want_kind orelse result_kind;
@@ -592,8 +592,8 @@ fn castElemPtr(ip: *const InternPool, p: InternPool.Ptr) bool {
         .elem => |e| e,
         else => return false,
     };
-    const ptr_ty = ip.indexToKey(p.ty).ptr_type;
-    const base_ty = ip.indexToKey(ip.indexToKey(e.base).ptr.ty).ptr_type;
+    const ptr_ty = ip.keyPayload(.ptr_type, p.ty);
+    const base_ty = ip.keyPayload(.ptr_type, ip.indexToKey(e.base).ptr.ty);
     const elem_ty = if (base_ty.flags.size == .one) switch (ip.indexToKey(base_ty.child)) {
         .array_type => |a| a.child,
         .vector_type => |v| v.child,
@@ -619,7 +619,7 @@ fn printPtrBase(ip: *const InternPool, p: InternPool.Ptr, kind: PtrKind, w: *Wri
         .int => unreachable,
         .field => |f| {
             try printPtrDerivation(ip, f.base, null, w, level, depth - 1);
-            const agg_ty = ip.indexToKey(ip.indexToKey(f.base).ptr.ty).ptr_type.child;
+            const agg_ty = ip.keyPayload(.ptr_type, ip.indexToKey(f.base).ptr.ty).child;
             const names: []const InternPool.String = switch (ip.indexToKey(agg_ty)) {
                 .struct_type, .union_type => ip.structInfo(agg_ty).field_names,
                 .tuple_type => |t| t.names,
@@ -642,7 +642,7 @@ fn printPtrBase(ip: *const InternPool, p: InternPool.Ptr, kind: PtrKind, w: *Wri
 /// A function's declaration name, followed by the comptime arguments of a
 /// generic instance in brackets.
 fn printFuncName(ip: *const InternPool, func_index: InternPool.Index, w: *Writer) Writer.Error!void {
-    const func = ip.indexToKey(func_index).func;
+    const func = ip.keyPayload(.func, func_index);
     try w.writeAll(ip.stringSlice(ip.getNav(func.owner_nav).fqn));
     if (func.comptime_args.len == 0) return;
     try w.writeAll("[");

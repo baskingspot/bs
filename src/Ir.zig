@@ -566,7 +566,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap => .noreturn_type,
         .call => ir.extraData(Call, data.pl_op.payload).data.ret_ty,
         .ptr_elem_val => blk: {
-            const ptr = ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).ptr_type;
+            const ptr = ip.keyPayload(.ptr_type, ir.typeOf(data.bin_op.lhs, ip));
             break :blk switch (ptr.flags.size) {
                 .one => switch (ip.indexToKey(ptr.child)) {
                     .vector_type => |v| v.child,
@@ -575,7 +575,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
                 else => ptr.child,
             };
         },
-        .slice_elem_val => ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).ptr_type.child,
+        .slice_elem_val => ip.keyPayload(.ptr_type, ir.typeOf(data.bin_op.lhs, ip)).child,
         .array_elem_val => switch (ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip))) {
             .vector_type => |v| v.child,
             else => |k| k.array_type.child,

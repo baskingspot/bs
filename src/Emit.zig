@@ -254,7 +254,7 @@ pub fn finish(emit: *Emit) !bool {
         if (e.target != .nav) continue;
         const nav = ip.getNav(e.target.nav);
         if (nav.status != .resolved) continue;
-        if (std.mem.eql(u8, ip.stringSlice(e.name), "_start") and ip.indexToKey(nav.val) == .func) {
+        if (std.mem.eql(u8, ip.stringSlice(e.name), "_start") and ip.keyTag(nav.val) == .func) {
             entry = try emit.funcKey(nav.val);
         }
     }
@@ -372,7 +372,7 @@ fn findExports(emit: *Emit) !void {
             .nav => |n| key: {
                 const nav = ip.getNav(n);
                 if (nav.status != .resolved) continue;
-                if (ip.indexToKey(nav.val) == .func) break :key try emit.funcKey(nav.val);
+                if (ip.keyTag(nav.val) == .func) break :key try emit.funcKey(nav.val);
                 if (!Type.hasRuntimeBits(ip, ip.typeOf(nav.val))) continue;
                 break :key try emit.navKey(n);
             },
@@ -438,7 +438,7 @@ fn userExport(emit: *Emit, name: []const u8) !?SymbolKey {
         };
         const nav = ip.getNav(x_nav);
         if (nav.status != .resolved) continue;
-        return if (ip.indexToKey(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x_nav);
+        return if (ip.keyTag(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x_nav);
     }
     return null;
 }

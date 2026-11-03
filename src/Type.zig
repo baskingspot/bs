@@ -86,9 +86,8 @@ pub const IntInfo = std.lang.Type.Int;
 
 pub fn intInfo(ip: *const InternPool, ty: Index) IntInfo {
     if (ip.intType(ty)) |t| return t;
-    return switch (ip.indexToKey(ty)) {
-        .int_type => |t| t,
-        .simple_type => |s| switch (s) {
+    return switch (ip.keyTag(ty)) {
+        .simple_type => switch (ip.simpleType(ty)) {
             .usize => .{ .signedness = .unsigned, .bits = ptr_bits },
             .isize => .{ .signedness = .signed, .bits = ptr_bits },
             .c_char => .{ .signedness = .signed, .bits = 8 },
@@ -147,51 +146,48 @@ pub fn floatOfBits(bits: u16) Index {
 }
 
 pub fn ptrInfo(ip: *const InternPool, ty: Index) InternPool.PtrType {
-    return ip.indexToKey(ty).ptr_type;
+    return ip.keyPayload(.ptr_type, ty);
 }
 
 pub fn isSlice(ip: *const InternPool, ty: Index) bool {
-    return switch (ip.indexToKey(ty)) {
-        .ptr_type => |p| p.flags.size == .slice,
-        else => false,
-    };
+    const p = ip.keyAs(.ptr_type, ty) orelse return false;
+    return p.flags.size == .slice;
 }
 
 /// The child of a pointer, optional, or array type.
 pub fn childType(ip: *const InternPool, ty: Index) Index {
-    return switch (ip.indexToKey(ty)) {
-        .ptr_type => |p| p.child,
-        .opt_type => |c| c,
-        .array_type => |a| a.child,
-        .vector_type => |v| v.child,
+    return switch (ip.keyTag(ty)) {
+        .ptr_type => ip.keyPayload(.ptr_type, ty).child,
+        .opt_type => ip.keyPayload(.opt_type, ty),
+        .array_type => ip.keyPayload(.array_type, ty).child,
+        .vector_type => ip.keyPayload(.vector_type, ty).child,
         else => unreachable,
     };
 }
 
 /// The element type of a vector type; any other type itself.
 pub fn scalarType(ip: *const InternPool, ty: Index) Index {
-    return switch (ip.indexToKey(ty)) {
-        .vector_type => |v| v.child,
-        else => ty,
-    };
+    const v = ip.keyAs(.vector_type, ty) orelse return ty;
+    return v.child;
 }
 
 /// Whether `?ty` is represented as `ty` with 0 meaning null.
 pub fn optionalReprIsPtr(ip: *const InternPool, child: Index) bool {
-    return switch (ip.indexToKey(child)) {
-        .ptr_type => |p| p.flags.size != .c and p.flags.size != .slice and !p.flags.is_allowzero,
-        else => false,
-    };
+    const p = ip.keyAs(.ptr_type, child) orelse return false;
+    return p.flags.size != .c and p.flags.size != .slice and !p.flags.is_allowzero;
 }
 
 /// Whether `?ty` is represented as `ty` with a zero first word meaning
 /// null, as upstream's optionalReprIsPayload: single and many pointers,
 /// slices (null `ptr`), and error sets (error code 0).
 pub fn optionalReprIsPayload(ip: *const InternPool, child: Index) bool {
-    return switch (ip.indexToKey(child)) {
-        .ptr_type => |p| p.flags.size != .c and !p.flags.is_allowzero,
+    return switch (ip.keyTag(child)) {
+        .ptr_type => {
+            const p = ip.keyPayload(.ptr_type, child);
+            return p.flags.size != .c and !p.flags.is_allowzero;
+        },
         .error_set_type, .inferred_error_set_type => true,
-        .simple_type => |s| s == .anyerror,
+        .simple_type => ip.simpleType(child) == .anyerror,
         else => false,
     };
 }
@@ -218,9 +214,9 @@ fn comptimeOnly(ip: *const InternPool, ty: Index, hit_cycle: *bool) bool {
     return switch (class(ip, ty)) {
         .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined, .@"fn", .special => true,
         .array, .vector, .optional => comptimeOnly(ip, childType(ip, ty), hit_cycle),
-        .error_union => comptimeOnly(ip, ip.indexToKey(ty).error_union_type.payload_type, hit_cycle),
+        .error_union => comptimeOnly(ip, ip.keyPayload(.error_union_type, ty).payload_type, hit_cycle),
         .tuple => {
-            const t = ip.indexToKey(ty).tuple_type;
+            const t = ip.keyPayload(.tuple_type, ty);
             for (t.types, t.values) |ft, fv| if (fv == .none and comptimeOnly(ip, ft, hit_cycle)) return true;
             return false;
         },
@@ -262,7 +258,7 @@ pub fn hasRuntimeBits(ip: *const InternPool, ty: Index) bool {
     return switch (class(ip, ty)) {
         .void, .noreturn, .@"opaque" => false,
         .int, .@"enum" => intInfo(ip, ty).bits != 0,
-        .array => ip.indexToKey(ty).array_type.lenIncludingSentinel() != 0 and hasRuntimeBits(ip, childType(ip, ty)),
+        .array => ip.keyPayload(.array_type, ty).lenIncludingSentinel() != 0 and hasRuntimeBits(ip, childType(ip, ty)),
         .@"struct", .tuple, .@"union" => abiSize(ip, ty) != 0,
         else => !isComptimeOnly(ip, ty),
     };
@@ -285,7 +281,7 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
         .void, .noreturn, .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined, .@"fn", .special, .@"opaque" => 0,
         .bool => 1,
         .int, .error_set, .@"enum" => intAbiSize(intInfo(ip, ty).bits),
-        .float => switch (ip.indexToKey(ty).simple_type) {
+        .float => switch (ip.keyPayload(.simple_type, ty)) {
             .f16 => 2,
             .f32 => 4,
             .f64 => 8,
@@ -296,13 +292,13 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
         .pointer => if (isSlice(ip, ty)) 16 else 8,
         .@"anyframe" => 8,
         .array => blk: {
-            const a = ip.indexToKey(ty).array_type;
+            const a = ip.keyPayload(.array_type, ty);
             break :blk a.lenIncludingSentinel() * abiSize(ip, a.child);
         },
         .vector => blk: {
             // Upstream's stage2_x86_64 layout: bools are bits, other
             // elements are laid out like an array.
-            const v = ip.indexToKey(ty).vector_type;
+            const v = ip.keyPayload(.vector_type, ty);
             const bytes = if (v.child == .bool_type) (v.len + 7) / 8 else v.len * abiSize(ip, v.child);
             break :blk std.mem.alignForward(u64, bytes, abiAlignment(ip, ty));
         },
@@ -335,7 +331,7 @@ pub fn abiAlignment(ip: *const InternPool, ty: Index) u64 {
         .array => abiAlignment(ip, childType(ip, ty)),
         .vector => blk: {
             // Upstream's stage2_x86_64 rule for a CPU without AVX.
-            const v = ip.indexToKey(ty).vector_type;
+            const v = ip.keyPayload(.vector_type, ty);
             if (v.len == 0) break :blk 1;
             if (v.child == .bool_type) break :blk if (v.len > 64) 16 else std.math.ceilPowerOfTwoAssert(u64, (v.len + 7) / 8);
             break :blk if (abiSize(ip, v.child) == 0) 1 else 16;
@@ -365,7 +361,7 @@ pub const ErrorUnionLayout = struct {
 
 /// The error code (`u16`) comes first, then the payload.
 pub fn errorUnionLayout(ip: *const InternPool, ty: Index) ErrorUnionLayout {
-    const payload = ip.indexToKey(ty).error_union_type.payload_type;
+    const payload = ip.keyPayload(.error_union_type, ty).payload_type;
     if (!hasRuntimeBits(ip, payload)) return .{ .err_offset = 0, .payload_offset = 0, .size = 2, .alignment = 2 };
     const pa = abiAlignment(ip, payload);
     const alignment = @max(pa, 2);
@@ -415,7 +411,7 @@ pub fn unionFieldAlign(ip: *const InternPool, info: *const InternPool.ContainerI
 /// hidden safety tag the field index.
 pub fn unionFieldTag(ip: *const InternPool, ty: Index, field: u32) u64 {
     const info = ip.structInfo(ty);
-    if (ip.indexToKey(info.tag_type) != .enum_type) return field;
+    if (ip.keyTag(info.tag_type) != .enum_type) return field;
     const tag_info = ip.structInfo(info.tag_type);
     const i = tag_info.fieldIndex(ip, ip.stringSlice(info.field_names[field])).?;
     const v = tag_info.field_defaults[i];
@@ -426,7 +422,7 @@ pub const TupleLayout = struct { size: u64, alignment: u64, field_offset: u64 };
 
 /// Layout of a tuple; also returns the offset of field `field` if given.
 pub fn tupleLayout(ip: *const InternPool, ty: Index, field: ?usize) TupleLayout {
-    const t = ip.indexToKey(ty).tuple_type;
+    const t = ip.keyPayload(.tuple_type, ty);
     var offset: u64 = 0;
     var alignment: u64 = 1;
     var field_offset: u64 = 0;
@@ -447,27 +443,27 @@ pub fn tupleLayout(ip: *const InternPool, ty: Index, field: ?usize) TupleLayout 
 /// The value of field `i` of struct or tuple `ty` if it is a `comptime`
 /// field, else `.none`.
 pub fn comptimeFieldValue(ip: *const InternPool, ty: Index, i: usize) Index {
-    return switch (ip.indexToKey(ty)) {
-        .tuple_type => |t| t.values[i],
+    return switch (ip.keyTag(ty)) {
+        .tuple_type => ip.keyPayload(.tuple_type, ty).values[i],
         .struct_type => if (ip.structInfo(ty).fieldIsComptime(i)) ip.structInfo(ty).field_defaults[i] else .none,
         else => .none,
     };
 }
 
 pub fn fieldCount(ip: *const InternPool, ty: Index) usize {
-    return switch (ip.indexToKey(ty)) {
+    return switch (ip.keyTag(ty)) {
         .struct_type, .union_type => ip.structInfo(ty).field_types.len,
-        .tuple_type => |t| t.types.len,
-        .array_type => |a| a.len,
+        .tuple_type => ip.keyPayload(.tuple_type, ty).types.len,
+        .array_type => ip.keyPayload(.array_type, ty).len,
         else => unreachable,
     };
 }
 
 pub fn fieldType(ip: *const InternPool, ty: Index, i: usize) Index {
-    return switch (ip.indexToKey(ty)) {
+    return switch (ip.keyTag(ty)) {
         .struct_type, .union_type => ip.structInfo(ty).field_types[i],
-        .tuple_type => |t| t.types[i],
-        .array_type => |a| a.child,
+        .tuple_type => ip.keyPayload(.tuple_type, ty).types[i],
+        .array_type => ip.keyPayload(.array_type, ty).child,
         else => unreachable,
     };
 }
@@ -475,11 +471,11 @@ pub fn fieldType(ip: *const InternPool, ty: Index, i: usize) Index {
 /// The byte offset of field `i`. A packed struct's fields live in its
 /// backing integer at offset 0 (see `packedFieldBitOffset`).
 pub fn fieldOffset(ip: *const InternPool, ty: Index, i: usize) u64 {
-    return switch (ip.indexToKey(ty)) {
+    return switch (ip.keyTag(ty)) {
         .struct_type => if (isPackedStruct(ip, ty)) 0 else ip.structInfo(ty).field_offsets[i],
         .union_type => unionLayout(ip, ty).payload_offset,
         .tuple_type => tupleLayout(ip, ty, i).field_offset,
-        .array_type => |a| i * abiSize(ip, a.child),
+        .array_type => i * abiSize(ip, ip.keyPayload(.array_type, ty).child),
         // A slice's `ptr` and `len`.
         .ptr_type => i * 8,
         else => unreachable,
@@ -493,12 +489,12 @@ pub fn log2IntBits(bits: u16) u16 {
 }
 
 pub fn isPackedStruct(ip: *const InternPool, ty: Index) bool {
-    return ip.indexToKey(ty) == .struct_type and ip.structInfo(ty).layout == .@"packed";
+    return ip.keyTag(ty) == .struct_type and ip.structInfo(ty).layout == .@"packed";
 }
 
 /// A packed struct or packed union: a value of its backing integer type.
 pub fn isPacked(ip: *const InternPool, ty: Index) bool {
-    return switch (ip.indexToKey(ty)) {
+    return switch (ip.keyTag(ty)) {
         .struct_type, .union_type => ip.structInfo(ty).layout == .@"packed",
         else => false,
     };

@@ -151,6 +151,13 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   stable hash. Most lookups find an existing item. Field names are interned
   too, so a lookup by name in a container of more than a few fields
   compares string indices, not bytes.
+- Reads decode only what the caller uses. `indexToKey` builds a whole
+  `Key`; hot code asks for the key's tag (`keyTag`, from the item tag
+  alone) and then one payload (`keyPayload(.ptr, i)`, or `keyAs` for an
+  optional one), which share `indexToKey`'s decoder instantiated per item
+  tag. Equality in `get` compares against the payload of the entry's own
+  tag the same way. An index's top bits select the owning thread's list;
+  with one thread the shift gives 0 without a branch.
 - Designed for concurrent use from the start: per-thread shards for appends
   and lock-free reads of published items. The skeleton can run one thread, but
   its API takes the per-thread handle so parallelism is not a retrofit.

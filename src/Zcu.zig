@@ -586,7 +586,7 @@ pub fn unitKey(zcu: *Zcu, unit: AnalUnit, w: *std.Io.Writer) !void {
         .type_layout => |ty| try w.print("{s}@layout", .{ip.stringSlice(ip.containerType(ty).?.key)}),
         .struct_defaults => |ty| try w.print("{s}@defaults", .{ip.stringSlice(ip.containerType(ty).?.key)}),
         .func => |func| {
-            const f = ip.indexToKey(func).func;
+            const f = ip.keyPayload(.func, func);
             try w.writeAll(ip.stringSlice(ip.getNav(f.owner_nav).key));
             if (f.generic_owner != .none) try w.print("__{x}", .{ip.stableHash(func)});
         },
@@ -664,7 +664,7 @@ pub fn ensureNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) Sema.CompileError
         return err;
     };
     nav.status = .resolved;
-    if (nav.linkage == .@"export" and zcu.ip.indexToKey(nav.val) == .func) try zcu.queueFunc(nav.val);
+    if (nav.linkage == .@"export" and zcu.ip.keyTag(nav.val) == .func) try zcu.queueFunc(nav.val);
 }
 
 /// Resolves the fields and layout of a struct type (its `type_layout` unit).
@@ -832,7 +832,7 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
             };
             // An exported function is emitted whether or not it is called.
             const val = zcu.ip.getNav(e.target.nav).val;
-            if (zcu.ip.indexToKey(val) == .func) try zcu.queueFunc(val);
+            if (zcu.ip.keyTag(val) == .func) try zcu.queueFunc(val);
             continue;
         }
         if (done_tests < zcu.test_functions.items.len) {

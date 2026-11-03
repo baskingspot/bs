@@ -32,6 +32,10 @@ locals: []Local,
 shards: []Shard,
 /// Number of bits of an index that select the owning thread.
 tid_width: u5,
+/// `31 - tid_width`, and the mask of the local part of an index below it,
+/// precomputed for `unwrapIndex`, which every item read goes through.
+tid_shift: u5,
+local_mask: u32,
 /// Global error set: error name to error value. Error values are an
 /// in-memory detail; Atoms refer to errors by name (see docs/architecture.md).
 errors_mutex: Io.Mutex = .init,
@@ -752,7 +756,13 @@ const KeyAdapter = struct {
         return ka.key_hash;
     }
     pub fn eql(ka: KeyAdapter, key: Key, e: Entry) bool {
-        return e.hash == ka.key_hash and keyEql(ka.ip, key, ka.ip.indexToKey(e.index));
+        if (e.hash != ka.key_hash) return false;
+        // Hot (every hit of `get`): compares against the payload of the
+        // entry's own item tag, decoding nothing else.
+        const item = ka.ip.itemOf(e.index);
+        return switch (item.tag) {
+            inline else => |t| key == (comptime keyTagOf(t)) and keyEql(ka.ip, key, ka.ip.decodeItem(t, e.index, item)),
+        };
     }
 };
 
@@ -788,6 +798,8 @@ pub fn init(gpa: Allocator, io: Io, thread_count: u32) !InternPool {
         .locals = try gpa.alloc(Local, n),
         .shards = try gpa.alloc(Shard, n),
         .tid_width = tid_width,
+        .tid_shift = 31 - tid_width,
+        .local_mask = (@as(u32, 1) << (31 - tid_width)) - 1,
     };
     for (ip.locals) |*l| l.* = .{ .arena = .init(gpa) };
     for (ip.shards) |*s| s.* = .{};
@@ -838,7 +850,7 @@ pub fn deinit(ip: *InternPool) void {
 // leaving the top bit free for `Ir.Inst.Ref`.
 
 fn tidShift(ip: *const InternPool) u5 {
-    return 31 - ip.tid_width;
+    return ip.tid_shift;
 }
 
 fn wrap(ip: *const InternPool, tid: Tid, local: u32) u32 {
@@ -846,10 +858,11 @@ fn wrap(ip: *const InternPool, tid: Tid, local: u32) u32 {
     return (@as(u32, @backingInt(tid)) << ip.tidShift()) | local;
 }
 
-fn unwrapIndex(ip: *const InternPool, raw: u32) struct { local: *Local, index: u32 } {
-    const shift = ip.tidShift();
-    const tid = if (ip.tid_width == 0) 0 else raw >> shift;
-    return .{ .local = &ip.locals[tid], .index = raw & ((@as(u32, 1) << shift) - 1) };
+inline fn unwrapIndex(ip: *const InternPool, raw: u32) struct { local: *Local, index: u32 } {
+    // Indexes use 31 bits, so with one thread (`tid_shift == 31`) the shift
+    // gives 0 without a branch.
+    assert(raw >> 31 == 0);
+    return .{ .local = &ip.locals[raw >> ip.tid_shift], .index = raw & ip.local_mask };
 }
 
 // ---------------------------------------------------------------------------
@@ -910,14 +923,24 @@ pub fn createContainerInfo(ip: *InternPool, tid: Tid, info: ContainerInfo) !Cont
 
 /// The info of a declared container type of any kind.
 pub fn structInfo(ip: *const InternPool, ty: Index) *ContainerInfo {
-    const u = ip.unwrapIndex(@backingInt(ip.containerType(ty).?.info));
+    // Hot: reads the info word alone (see `decodeItem`).
+    const item = ip.itemOf(ty);
+    assert(switch (item.tag) {
+        .type_struct, .type_enum, .type_union, .type_opaque => true,
+        else => false,
+    });
+    const u = ip.unwrapIndex(item.extra[item.data + 3]);
     return u.local.structs.view()[u.index];
 }
 
 /// The container key of a declared struct, enum, union, or opaque type.
 pub fn containerType(ip: *const InternPool, ty: Index) ?ContainerType {
-    return switch (ip.indexToKey(ty)) {
-        .struct_type, .enum_type, .union_type, .opaque_type => |c| c,
+    const item = ip.itemOf(ty);
+    return switch (item.tag) {
+        inline .type_struct, .type_enum, .type_union, .type_opaque => |t| switch (ip.decodeItem(t, ty, item)) {
+            inline .struct_type, .enum_type, .union_type, .opaque_type => |c| c,
+            else => unreachable,
+        },
         else => null,
     };
 }
@@ -1173,10 +1196,40 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
 }
 
 pub fn indexToKey(ip: *const InternPool, index: Index) Key {
-    assert(index != .none);
-    const u = ip.unwrapIndex(@backingInt(index));
-    const item = u.local.items.view()[u.index];
-    const extra = u.local.extra.view();
+    const item = ip.itemOf(index);
+    return switch (item.tag) {
+        inline else => |t| ip.decodeItem(t, index, item),
+    };
+}
+
+/// The payload of `index`'s key, which must have tag `kt`, decoding only
+/// that payload: `ip.keyPayload(.ptr, i)` is `ip.keyPayload(.ptr, i)`.
+pub fn keyPayload(ip: *const InternPool, comptime kt: KeyTag, index: Index) @FieldType(Key, @tagName(kt)) {
+    const item = ip.itemOf(index);
+    switch (item.tag) {
+        inline else => |t| if (comptime keyTagOf(t) == kt) return @field(ip.decodeItem(t, index, item), @tagName(kt)),
+    }
+    unreachable;
+}
+
+/// The payload of `index`'s key if its tag is `kt`, decoding only that
+/// payload.
+pub fn keyAs(ip: *const InternPool, comptime kt: KeyTag, index: Index) ?@FieldType(Key, @tagName(kt)) {
+    const item = ip.itemOf(index);
+    switch (item.tag) {
+        inline else => |t| if (comptime keyTagOf(t) == kt) return @field(ip.decodeItem(t, index, item), @tagName(kt)),
+    }
+    return null;
+}
+
+pub const KeyTag = std.meta.Tag(Key);
+
+/// The key of the item `item` (of `index`), whose tag is `tag`. Shared by
+/// `indexToKey` and the typed readers (`keyPayload`, `keyAs`), which
+/// instantiate it per tag so that only the payload a caller reads is
+/// decoded.
+inline fn decodeItem(ip: *const InternPool, comptime tag: Tag, index: Index, item: ItemRef) Key {
+    const extra = item.extra;
     const d = item.data;
     const I = struct {
         fn i(x: u32) Index {
@@ -1189,7 +1242,7 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
             return @as(u64, lo) | (@as(u64, hi) << 32);
         }
     };
-    return switch (item.tag) {
+    return switch (tag) {
         .type_int_signed => .{ .int_type = .{ .signedness = .signed, .bits = @intCast(d) } },
         .type_int_unsigned => .{ .int_type = .{ .signedness = .unsigned, .bits = @intCast(d) } },
         .type_simple => .{ .simple_type = @fromBackingInt(d) },
@@ -1201,7 +1254,7 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         .type_error_union => .{ .error_union_type = .{ .error_set_type = I.i(extra[d]), .payload_type = I.i(extra[d + 1]) } },
         .type_error_set => .{ .error_set_type = @ptrCast(extra[d + 1 ..][0..extra[d]]) },
         .type_inferred_error_set => .{ .inferred_error_set_type = I.i(d) },
-        .nav_capture_val, .nav_capture_ref => .{ .nav_capture = .{ .nav = @fromBackingInt(d), .by_ref = item.tag == .nav_capture_ref } },
+        .nav_capture_val, .nav_capture_ref => .{ .nav_capture = .{ .nav = @fromBackingInt(d), .by_ref = tag == .nav_capture_ref } },
         .runtime_capture => .{ .runtime_capture = I.i(d) },
         .type_struct, .type_enum, .type_union, .type_opaque => blk: {
             const c: ContainerType = .{
@@ -1212,7 +1265,7 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
                 .key = I.s(extra[d + 5]),
                 .captures = @ptrCast(extra[d + 6 ..][0..extra[d + 4]]),
             };
-            break :blk switch (item.tag) {
+            break :blk switch (tag) {
                 .type_struct => .{ .struct_type = c },
                 .type_enum => .{ .enum_type = c },
                 .type_union => .{ .union_type = c },
@@ -1249,12 +1302,12 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         .int_i64 => .{ .int = .{ .ty = I.i(extra[d]), .storage = .{ .i64 = @bitCast(I.u64of(extra[d + 1], extra[d + 2])) } } },
         .int_big => .{ .int = .{ .ty = I.i(extra[d]), .storage = .{ .big = .{
             .positive = extra[d + 1] != 0,
-            .limbs = u.local.limbs.view()[extra[d + 2]],
+            .limbs = ip.unwrapIndex(@backingInt(index)).local.limbs.view()[extra[d + 2]],
         } } } },
         .float_f16, .float_f32, .float_f64, .float_f80, .float_f128 => blk: {
             const w = extra[d + 1 ..];
             const ty = I.i(extra[d]);
-            break :blk .{ .float = .{ .ty = ty, .storage = switch (item.tag) {
+            break :blk .{ .float = .{ .ty = ty, .storage = switch (tag) {
                 .float_f16 => .{ .f16 = @bitCast(@as(u16, @truncate(w[0]))) },
                 .float_f32 => .{ .f32 = @bitCast(w[0]) },
                 .float_f64 => .{ .f64 = @bitCast(I.u64of(w[0], w[1])) },
@@ -1306,7 +1359,9 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
 
 /// The item of `index` and its local's `extra`, for the narrow readers
 /// below that decode one field instead of a whole `Key`.
-fn itemOf(ip: *const InternPool, index: Index) struct { tag: Tag, data: u32, extra: [*]const u32 } {
+const ItemRef = struct { tag: Tag, data: u32, extra: [*]const u32 };
+
+inline fn itemOf(ip: *const InternPool, index: Index) ItemRef {
     assert(index != .none);
     const u = ip.unwrapIndex(@backingInt(index));
     const item = u.local.items.view()[u.index];
@@ -1314,8 +1369,12 @@ fn itemOf(ip: *const InternPool, index: Index) struct { tag: Tag, data: u32, ext
 }
 
 /// The `Key` tag of `index`, from its item tag alone.
-pub fn keyTag(ip: *const InternPool, index: Index) std.meta.Tag(Key) {
-    return switch (ip.itemOf(index).tag) {
+pub inline fn keyTag(ip: *const InternPool, index: Index) KeyTag {
+    return keyTagOf(ip.itemOf(index).tag);
+}
+
+fn keyTagOf(tag: Tag) KeyTag {
+    return switch (tag) {
         .type_int_signed, .type_int_unsigned => .int_type,
         .type_simple => .simple_type,
         .type_ptr => .ptr_type,
@@ -1353,14 +1412,14 @@ pub fn keyTag(ip: *const InternPool, index: Index) std.meta.Tag(Key) {
     };
 }
 
-/// `indexToKey(index).simple_type`, without decoding the whole key.
+/// `keyPayload(.simple_type, index)`, without decoding the whole key.
 pub fn simpleType(ip: *const InternPool, index: Index) SimpleType {
     const item = ip.itemOf(index);
     assert(item.tag == .type_simple);
     return @fromBackingInt(item.data);
 }
 
-/// `indexToKey(index).int_type`, without decoding the whole key.
+/// `keyPayload(.int_type, index)`, without decoding the whole key.
 pub fn intType(ip: *const InternPool, index: Index) ?std.lang.Type.Int {
     const item = ip.itemOf(index);
     return switch (item.tag) {
@@ -1783,7 +1842,7 @@ fn lookupHash(ip: *const InternPool, key: Key) u64 {
     return std.hash.Wyhash.hash(@truncate(h.chain), h.buf[0..h.len]);
 }
 
-fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
+inline fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
     _ = ip;
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     const eqlIdx = std.mem.eql;
@@ -1964,7 +2023,7 @@ pub fn getInt(ip: *InternPool, tid: Tid, ty: Index, value: anytype) !Index {
 /// Interns `value` (any float type) as a value of float type `ty`, rounded
 /// to nearest-even into the type's storage.
 pub fn getFloat(ip: *InternPool, tid: Tid, ty: Index, value: anytype) !Index {
-    return ip.get(tid, .{ .float = .{ .ty = ty, .storage = switch (ip.indexToKey(ty).simple_type) {
+    return ip.get(tid, .{ .float = .{ .ty = ty, .storage = switch (ip.keyPayload(.simple_type, ty)) {
         .f16 => .{ .f16 = @floatCast(value) },
         .f32 => .{ .f32 = @floatCast(value) },
         .f64 => .{ .f64 = @floatCast(value) },
@@ -1976,7 +2035,7 @@ pub fn getFloat(ip: *InternPool, tid: Tid, ty: Index, value: anytype) !Index {
 
 /// The value of an integer as a big integer. `space` backs small values.
 pub fn intToBig(ip: *const InternPool, index: Index, space: *[2]Limb) BigIntConst {
-    const int = ip.indexToKey(index).int;
+    const int = ip.keyPayload(.int, index);
     return switch (int.storage) {
         .u64 => |v| std.math.big.int.Mutable.init(space, v).toConst(),
         .i64 => |v| std.math.big.int.Mutable.init(space, v).toConst(),
@@ -1986,7 +2045,7 @@ pub fn intToBig(ip: *const InternPool, index: Index, space: *[2]Limb) BigIntCons
 
 /// The value of an integer that fits in `T`, or null.
 pub fn intValue(ip: *const InternPool, comptime T: type, index: Index) ?T {
-    const int = ip.indexToKey(index).int;
+    const int = ip.keyPayload(.int, index);
     return switch (int.storage) {
         .u64 => |v| std.math.cast(T, v),
         .i64 => |v| std.math.cast(T, v),
@@ -2178,12 +2237,12 @@ test "floats are interned by their exact bits" {
     try std.testing.expect(pz != try ip.getFloat(.main, .comptime_float_type, @as(f64, 0.0)));
     inline for (.{ .{ Index.f16_type, f16 }, .{ Index.f80_type, f80 }, .{ Index.f128_type, f128 } }) |p| {
         const v = try ip.getFloat(.main, p[0], @as(p[1], -1.5));
-        try std.testing.expectEqual(@as(f128, -1.5), ip.indexToKey(v).float.toF128());
+        try std.testing.expectEqual(@as(f128, -1.5), ip.keyPayload(.float, v).toF128());
         try std.testing.expectEqual(p[0], ip.typeOf(v));
     }
     const third: f80 = 1.0 / 3.0;
     const v80 = try ip.getFloat(.main, .f80_type, third);
-    try std.testing.expectEqual(@as(u80, @bitCast(third)), @as(u80, @truncate(ip.indexToKey(v80).float.bits())));
+    try std.testing.expectEqual(@as(u80, @bitCast(third)), @as(u80, @truncate(ip.keyPayload(.float, v80).bits())));
 }
 
 test "stable hashes do not depend on interning order or thread" {
@@ -2203,6 +2262,6 @@ test "stable hashes do not depend on interning order or thread" {
     try std.testing.expect(@backingInt(xa) != @backingInt(xb));
     try std.testing.expectEqual(a.stableHash(xa), b.stableHash(xb));
     // Readers on any thread see the item interned by another.
-    try std.testing.expectEqual(pb, b.indexToKey(xb).array_type.child);
+    try std.testing.expectEqual(pb, b.keyPayload(.array_type, xb).child);
     try std.testing.expectEqual(xb, try b.get(.main, .{ .array_type = .{ .len = 2, .child = pb } }));
 }

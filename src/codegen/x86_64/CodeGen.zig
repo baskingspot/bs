@@ -133,7 +133,7 @@ const Loc = union(enum) {
 
 pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const ip = &emit.zcu.ip;
-    const func = ip.indexToKey(ir.func).func;
+    const func = ip.keyPayload(.func, ir.func);
     const gpa = emit.gpa;
     const t0 = std.Io.Timestamp.now(emit.zcu.io, .awake);
     try emit.ssa.build(gpa, ir);
@@ -153,7 +153,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .ip = ip,
         .ir = ir,
         .e = .init(gpa),
-        .fn_ty = ip.indexToKey(func.ty).func_type,
+        .fn_ty = ip.keyPayload(.func_type, func.ty),
         .homes = try gpa.alloc(Home, ir.instructions.len),
         .ssa = &emit.ssa,
         .labels = try gpa.alloc(Encoder.Label, emit.ssa.blocks.items.len),
@@ -264,8 +264,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
 fn beginInline(cg: *CodeGen, func: Index, site: Ir.DbgInline) Error!void {
     const ip = cg.ip;
     const zcu = cg.emit.zcu;
-    const nav = ip.getNav(ip.indexToKey(func).func.owner_nav);
-    const own_file = ip.getNav(ip.indexToKey(cg.ir.func).func.owner_nav).file;
+    const nav = ip.getNav(ip.keyPayload(.func, func).owner_nav);
+    const own_file = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav).file;
     const file: u32 = if (nav.file == own_file) 0 else for (cg.dbg_files.items, 1..) |f, i| {
         if (f == nav.file) break @intCast(i);
     } else blk: {
@@ -316,7 +316,7 @@ fn endInline(cg: *CodeGen) Error!void {
 
 fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     const ip = cg.ip;
-    const nav = ip.getNav(ip.indexToKey(cg.ir.func).func.owner_nav);
+    const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
     const tree = try cg.emit.zcu.fe.tree(@fromBackingInt(nav.file));
     const decl = cg.emit.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst);
     try cg.emit.zcu.addError(nav.file, tree.nodeToSpan(decl.src_node), "zap codegen: " ++ fmt, args);
@@ -448,8 +448,8 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
         .ptr => |p| if (!Type.isSlice(ip, ty)) {
             if (p.base == .int) return .{ .imm = p.byte_offset };
             // The address of an extern function is in its link slot.
-            if (p.base == .uav and ip.indexToKey(p.base.uav.val) == .extern_func and p.byte_offset == 0) {
-                const name = ip.stringSlice(ip.indexToKey(p.base.uav.val).extern_func.name);
+            if (p.base == .uav and ip.keyTag(p.base.uav.val) == .extern_func and p.byte_offset == 0) {
+                const name = ip.stringSlice(ip.keyPayload(.extern_func, p.base.uav.val).name);
                 _ = try cg.emit.zcu.requestCompilerRtExport(name);
                 return .{ .mem = Mem.sym(try cg.emit.useExtern(name, false), 0) };
             }
@@ -1120,7 +1120,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (size == 0) return;
             if (cg.passInRegs(cg.typeOf(val))) return cg.storeVal(try cg.ptrMem(data.bin_op.lhs), val, size);
             try cg.load(.r10, data.bin_op.lhs);
-            if (val.toInterned()) |v| if (ip.indexToKey(v) == .undef) return cg.fillMem(Mem.at(.r10, 0), size, 0xaa);
+            if (val.toInterned()) |v| if (ip.keyTag(v) == .undef) return cg.fillMem(Mem.at(.r10, 0), size, 0xaa);
             try cg.copyTo(Mem.at(.r10, 0), val);
         },
 
@@ -1376,7 +1376,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const src = try cg.memOf(data.bin_op.lhs);
             try cg.e.lea(.qword, .r10, src);
             try cg.load(.rcx, data.bin_op.rhs);
-            if (ip.indexToKey(cg.typeOf(data.bin_op.lhs)) == .vector_type and ty == .bool_type) {
+            if (ip.keyTag(cg.typeOf(data.bin_op.lhs)) == .vector_type and ty == .bool_type) {
                 // Bit-packed bool vector: bit rcx % 8 of byte rcx / 8.
                 try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
                 try cg.e.shift(.shr, .qword, .{ .reg = .rax }, 3);
@@ -1484,7 +1484,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const dst = try cg.resultMem(inst, ty) orelse return;
             const extra = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
             const elems = ir.refSlice(extra.end, extra.data.len);
-            if (ip.indexToKey(ty) == .vector_type and ip.indexToKey(ty).vector_type.child == .bool_type) {
+            if (ip.keyTag(ty) == .vector_type and ip.keyPayload(.vector_type, ty).child == .bool_type) {
                 // Bit-packed: element i is bit i % 8 of byte i / 8.
                 try cg.fillMem(dst, Type.abiSize(ip, ty), 0);
                 for (elems, 0..) |elem, i| {
@@ -1560,7 +1560,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const done = try cg.e.newLabel();
             try cg.e.@"test"(.qword, .{ .reg = .r9 }, .{ .reg = .r9 });
             try cg.e.jcc(.e, .{ .label = done });
-            if (elem.toInterned()) |v| if (ip.indexToKey(v) == .undef) {
+            if (elem.toInterned()) |v| if (ip.keyTag(v) == .undef) {
                 try cg.fillMem(Mem.at(.r8, 0), elem_size, 0xaa);
             } else try cg.copyTo(Mem.at(.r8, 0), elem) else try cg.copyTo(Mem.at(.r8, 0), elem);
             try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .reg = .r8 });
@@ -1631,7 +1631,7 @@ fn memDest(cg: *CodeGen, ptr: Reg, len: Reg, dest: Ref) Error!u64 {
         try cg.e.mov(.qword, .{ .reg = len }, .{ .mem = offsetMem(m, 8) });
         return Type.abiSize(ip, p.child);
     }
-    const a = ip.indexToKey(p.child).array_type;
+    const a = ip.keyPayload(.array_type, p.child);
     try cg.load(ptr, dest);
     try cg.e.mov(.qword, .{ .reg = len }, .{ .imm = @intCast(a.len) });
     return Type.abiSize(ip, a.child);
@@ -1959,7 +1959,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         else => null,
     } else null;
     const callee_fn_ty = cg.typeOf(callee_ref);
-    const callee_ty = ip.indexToKey(if (Type.class(ip, callee_fn_ty) == .pointer) Type.ptrInfo(ip, callee_fn_ty).child else callee_fn_ty).func_type;
+    const callee_ty = ip.keyPayload(.func_type, if (Type.class(ip, callee_fn_ty) == .pointer) Type.ptrInfo(ip, callee_fn_ty).child else callee_fn_ty);
     const ret_ty = extra.data.ret_ty;
     // A result in rax goes to its home after the call.
     const in_rax = cg.passInRegs(ret_ty) and (callee_ty.cc != .c or cg.cClass(ret_ty) == .int);
@@ -2504,19 +2504,19 @@ fn explicitAlignment(ip: *const InternPool, ptr_ty: Index) u64 {
 fn ptrToZeroBit(ip: *const InternPool, ptr: Index) bool {
     var v = ptr;
     while (true) {
-        const p = ip.indexToKey(v).ptr;
+        const p = ip.keyPayload(.ptr, v);
         switch (p.base) {
             .field => |f| v = f.base,
             .elem => |e| v = e.base,
             .nav => |n| {
                 const nav = ip.getNav(n);
                 if (nav.linkage == .@"extern") return false;
-                return switch (ip.indexToKey(nav.val)) {
+                return switch (ip.keyTag(nav.val)) {
                     .func, .extern_func => false,
                     else => !Type.hasRuntimeBits(ip, nav.ty),
                 };
             },
-            .uav => |u| return switch (ip.indexToKey(u.val)) {
+            .uav => |u| return switch (ip.keyTag(u.val)) {
                 .func, .extern_func => false,
                 else => !Type.hasRuntimeBits(ip, ip.typeOf(u.val)),
             },
@@ -2527,16 +2527,16 @@ fn ptrToZeroBit(ip: *const InternPool, ptr: Index) bool {
 
 pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
     const ip = &emit.zcu.ip;
-    const p = ip.indexToKey(ptr).ptr;
+    const p = ip.keyPayload(.ptr, ptr);
     var t: PtrTarget = switch (p.base) {
         .nav => |n| blk: {
             const nav = ip.getNav(n);
-            if (ip.indexToKey(nav.val) == .func) break :blk .{ .key = try emit.funcKey(nav.val), .off = 0 };
+            if (ip.keyTag(nav.val) == .func) break :blk .{ .key = try emit.funcKey(nav.val), .off = 0 };
             break :blk .{ .key = try emit.navKey(n), .off = 0 };
         },
-        .uav => |u| if (ip.indexToKey(u.val) == .extern_func) blk: {
+        .uav => |u| if (ip.keyTag(u.val) == .extern_func) blk: {
             // An extern function's address in data: the export's symbol.
-            const name = ip.stringSlice(ip.indexToKey(u.val).extern_func.name);
+            const name = ip.stringSlice(ip.keyPayload(.extern_func, u.val).name);
             const key = try emit.exportTarget(name) orelse {
                 try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
                 return error.CodegenFail;
@@ -2548,7 +2548,7 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
         .field => |f| blk: {
             var parent = try ptrTarget(emit, f.base);
             const container = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
-            parent.off += @intCast(switch (ip.indexToKey(container)) {
+            parent.off += @intCast(switch (ip.keyTag(container)) {
                 .opt_type => 0,
                 .error_union_type => Type.errorUnionLayout(ip, container).payload_offset,
                 .ptr_type => f.index * 8,
@@ -2619,7 +2619,7 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
             @memset(out, 0);
             const layout = Type.unionLayout(ip, ty);
             if (layout.tag_size != 0) {
-                const tag_int = if (ip.indexToKey(u.tag) == .enum_tag) ip.indexToKey(u.tag).enum_tag.int else u.tag;
+                const tag_int = if (ip.keyTag(u.tag) == .enum_tag) ip.keyPayload(.enum_tag, u.tag).int else u.tag;
                 try lowerValue(emit, tag_int, out[@intCast(layout.tag_offset)..][0..@intCast(layout.tag_size)], relocs, base_off + @as(u32, @intCast(layout.tag_offset)));
             }
             const pt = ip.typeOf(u.val);
