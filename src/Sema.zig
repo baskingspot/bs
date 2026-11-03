@@ -2403,6 +2403,23 @@ fn maxIntValue(sema: *Sema, ty: Index) !Index {
 // ---------------------------------------------------------------------------
 // Body analysis
 
+/// Break `inst` (`break` or `break_inline`) from runtime `block` to an
+/// enclosing runtime block (see `zirBlockInline`), if its target is one.
+fn runtimeBreak(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!bool {
+    const brk = sema.code.instructions.items(.data)[@backingInt(inst)].@"break";
+    const brk_extra = sema.code.extraData(Zir.Inst.Break, brk.payload_index).data;
+    const target = brk_extra.block_inst;
+    var it: ?*Block = block;
+    while (it) |cur| : (it = cur.parent) {
+        const label = cur.label orelse continue;
+        if (label.zir_block == target) {
+            try sema.addBr(block, label, sema.resolveInst(brk.operand), breakOperandSrc(block, brk_extra, block.nodeSrc(.zero)));
+            return true;
+        }
+    }
+    return sema.bc != null and try sema.bcOsrExit(block, inst, target);
+}
+
 /// Analyzes a body whose result is delivered by a `break_inline` (or comptime
 /// `break`) to `break_target`, and returns that result.
 fn resolveInlineBody(sema: *Sema, block: *Block, body: []const Zir.Inst.Index, break_target: Zir.Inst.Index) CompileError!Ref {
@@ -2468,21 +2485,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 return;
             },
             .break_inline => {
-                if (!block.is_comptime) {
-                    // To an enclosing runtime block (see `zirBlockInline`).
-                    const brk = data.@"break";
-                    const brk_extra = sema.code.extraData(Zir.Inst.Break, brk.payload_index).data;
-                    const target = brk_extra.block_inst;
-                    var it: ?*Block = block;
-                    while (it) |cur| : (it = cur.parent) {
-                        const label = cur.label orelse continue;
-                        if (label.zir_block == target) {
-                            try sema.addBr(block, label, sema.resolveInst(brk.operand), breakOperandSrc(block, brk_extra, block.nodeSrc(.zero)));
-                            return;
-                        }
-                    }
-                    if (sema.bc != null and try sema.bcOsrExit(block, inst, target)) return;
-                }
+                if (!block.is_comptime and try sema.runtimeBreak(block, inst)) return;
                 sema.comptime_break_inst = inst;
                 return error.ComptimeBreak;
             },
@@ -2523,7 +2526,14 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 defer child.deinitInsts();
                 child.is_comptime = true;
                 if (!block.is_comptime and sema.func != .none) child.discards_runtime = true;
-                const result = try sema.resolveInlineBody(&child, block_body, inst);
+                // A break out of the comptime block (`if (x) comptime
+                // continue;`) is a runtime break from where the block is,
+                // as upstream's analyzeBodyRuntimeBreak.
+                const result = sema.resolveInlineBody(&child, block_body, inst) catch |err| switch (err) {
+                    error.ComptimeBreak => if (!block.is_comptime and sema.code.instructions.items(.tag)[@backingInt(sema.comptime_break_inst)] != .switch_continue and
+                        try sema.runtimeBreak(block, sema.comptime_break_inst)) return else return err,
+                    else => return err,
+                };
                 if (sema.resolveValue(result) == null) {
                     return sema.fail(block, block.nodeSrc(data.pl_node.src_node), "unable to resolve comptime value", .{});
                 }

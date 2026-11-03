@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -93,6 +93,17 @@ fn width(comptime t: FieldType) u32 {
     };
 }
 
+// zig-protobuf (wire.zig): `if (runtime) comptime continue;` in an inline
+// loop continues only when the condition holds.
+fn pick(x: u32) u32 {
+    var r: u32 = 0;
+    inline for (.{ 1, 2, 3 }) |n| {
+        if (n != x) comptime continue;
+        r += n * 10;
+    }
+    return r;
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -129,5 +140,9 @@ fn main() callconv(.c) noreturn {
 
     rt.printInt(@intFromBool(comptime isSubmessage(.{ .packed_repeated = .submessage })));
     rt.printInt(comptime width(.{ .wide = 300 }));
+
+    var two: u32 = 2;
+    _ = &two;
+    rt.printInt(pick(two));
     rt.exit(0);
 }
