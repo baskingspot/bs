@@ -11210,7 +11210,7 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag)
         try sema.zcu.addNote(sema.file, source_src.span(tree), "source type '{f}' provides no length", .{sema.fmtType(sema.typeOf(source))});
         return err;
     }
-    if (d.elem != s.elem) return sema.fail(block, src, "pointer element type '{f}' cannot coerce into element type '{f}'", .{ sema.fmtType(s.elem), sema.fmtType(d.elem) });
+    if (d.elem != s.elem and !sema.childCoercibleInMemory(s.elem, d.elem)) return sema.fail(block, src, "pointer element type '{f}' cannot coerce into element type '{f}'", .{ sema.fmtType(s.elem), sema.fmtType(d.elem) });
     try sema.resolveLayout(block, src, d.elem);
 
     var len = if (d.len != .none) d.len else s.len;
@@ -11244,7 +11244,10 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag)
             const raw_src = (try sema.memRawPtr(block, .fromInterned(sv))).toInterned().?;
             if (sema.isUndef(raw_src)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
             const elems = try sema.arena.alloc(Index, @intCast(n));
-            for (elems, 0..) |*e, i| e.* = try sema.comptimeLoad(block, src, try sema.ptrElemPtrVal(raw_src, i));
+            for (elems, 0..) |*e, i| {
+                e.* = try sema.comptimeLoad(block, src, try sema.ptrElemPtrVal(raw_src, i));
+                if (d.elem != s.elem) e.* = try sema.retypeInMemory(e.*, d.elem);
+            }
             for (elems, 0..) |e, i| try sema.comptimeStore(block, src, try sema.ptrElemPtrVal(raw_dest, i), e);
             return .void_value;
         }

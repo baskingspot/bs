@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n7\n1\n6\n8\n8\n12\n"
+//! stdout: "42\n7\n1\n6\n8\n8\n12\n32\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 // For `std.lang.ExportOptions`; std.start sees `_start` and stays out.
@@ -49,6 +49,7 @@ fn main() callconv(.c) noreturn {
     rt.printInt(pick(0));
     rt.printInt(countdown(4));
     rt.printInt(ripDistance());
+    rt.printInt(keepAcross(5));
     rt.exit(0);
 }
 
@@ -89,4 +90,18 @@ fn ripDistance() u64 {
         : [ret] "={rcx}" (-> u64),
         :
         : .{ .rax = true });
+}
+/// A `{reg}` output naming a callee-saved register (cpuid's `={ebx}`)
+/// writes it, so the function saves it for its caller.
+fn ebxNine() u32 {
+    return asm volatile ("movl $9, %%ebx"
+        : [ret] "={ebx}" (-> u32),
+    );
+}
+/// Keeps `acc` in a callee-saved register across the calls.
+fn keepAcross(n: u64) u64 {
+    var acc: u64 = n;
+    var i: u64 = 0;
+    while (i < 3) : (i += 1) acc += ebxNine();
+    return acc;
 }

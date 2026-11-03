@@ -937,7 +937,26 @@ fn planRegisters(cg: *CodeGen) Error!void {
             Ssa.forEachOperand(ir, inst, Uses{ .uses = uses });
         }
     }
-    if (cg.has_asm) return;
+    if (cg.has_asm) {
+        // No value gets a register, but a `{reg}` operand that names a
+        // callee-saved register (cpuid's `={ebx}`) writes it, so the
+        // prologue saves it.
+        for (insts) |inst| {
+            if (tags[@backingInt(inst)] != .assembly) continue;
+            const extra = ir.extraData(Ir.Asm, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload);
+            var i = extra.end;
+            for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
+                const op = ir.extraData(Ir.Asm.Operand, i).data;
+                i += 3;
+                const c = asmAlternative(std.mem.trimStart(u8, cg.ip.stringSlice(op.constraint), "=+"));
+                const r = parseReg(regConstraint(c) orelse continue) orelse continue;
+                for (alloc_regs[0..@popCount(callee_saved)], 0..) |saved, bit| {
+                    if (saved == r.reg) cg.saved |= @as(u32, 1) << @intCast(bit);
+                }
+            }
+        }
+        return;
+    }
     const datas = ir.instructions.items(.data);
     const def = live.items(.def);
     for (f.layout.items) |block| {

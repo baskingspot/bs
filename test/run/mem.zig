@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "hello\n3\nxxxxxhello\n4\n9\n0\nabcabcdefg\nbcdefgg\n10\n0\n"
+//! stdout: "hello\n3\nxxxxxhello\n4\n9\n0\nabcabcdefg\nbcdefgg\n10\n0\n12\n12\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -77,5 +77,19 @@ fn main() callconv(.c) noreturn {
     big2 = big;
     rt.printInt(big2[299] + big2[0] - 4);
     rt.printInt(overAligned(5));
+
+    // Element types that coerce in memory: `usize` and `u64`.
+    const words: [3]usize = .{ 3, 4, 5 };
+    var dwords: [3]u64 = undefined;
+    @memcpy(&dwords, &words);
+    rt.printInt(dwords[0] + dwords[1] + dwords[2]);
+    rt.printInt(comptime usizeSum());
     rt.exit(0);
+}
+
+fn usizeSum() u64 {
+    const words: [3]usize = .{ 3, 4, 5 };
+    var dwords: [3]u64 = undefined;
+    @memcpy(&dwords, &words);
+    return dwords[0] + dwords[1] + dwords[2];
 }
