@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "1\n7\n3\n1\n0\n1\n1\n1\n9\n1\n42\n4\n4\n44\n7\n4294967295\n"
+//! stdout: "1\n7\n3\n1\n0\n1\n1\n1\n9\n1\n42\n4\n4\n44\n7\n4294967295\n42\n13\n"
 const rt = @import("rt.zig");
 // For `std.lang.ExternOptions`; std.start sees `_start` and stays out.
 const std = @import("std");
@@ -89,6 +89,9 @@ fn main() callconv(.c) noreturn {
     var w: u32 = 7;
     rt.printInt(optCast(&w).?.*);
     rt.printInt(bitsOf(-1) catch 0);
+    // Extern function declarations resolve to exports of their name.
+    rt.printInt(api_add(4, 2));
+    rt.printInt(zap_add(1, 3));
     rt.exit(0);
 }
 
@@ -105,3 +108,16 @@ fn optCast(p: *u32) ?*u8 {
 fn bitsOf(x: i32) error{X}!u32 {
     return @bitCast(x);
 }
+
+// As std.os.linux.getauxval: an extern declaration that an export in the
+// same program defines.
+const api_add = struct {
+    comptime {
+        @export(&addImpl, .{ .name = "zap_add", .linkage = .weak });
+    }
+    extern fn zap_add(a: u32, b: u32) u32;
+}.zap_add;
+fn addImpl(a: u32, b: u32) callconv(.c) u32 {
+    return a * 10 + b;
+}
+extern fn zap_add(a: u32, b: u32) u32;

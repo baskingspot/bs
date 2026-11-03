@@ -250,11 +250,18 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     defer block.instructions.deinit(zcu.gpa);
     const src = block.nodeSrc(.zero);
 
-    if (decl.linkage == .@"extern") return sema.fail(&block, src, "zap does not support extern declarations yet", .{});
     const decl_ty: Index = if (decl.type_body) |body| blk: {
         const ref = try sema.resolveInlineBody(&block, body, nav.zir_inst);
         break :blk try sema.analyzeAsType(&block, src, ref);
     } else .none;
+    if (decl.linkage == .@"extern") {
+        // `extern fn name(...) T;`: defined by an export of `name`, which
+        // calls reach through a slot the linker fills (see `extern_ptr`).
+        if (Type.class(sema.ip, decl_ty) != .@"fn") return sema.failUnsupported(&block, src, "extern variables");
+        nav.val = try sema.intern(.{ .extern_func = .{ .name = nav.name, .ty = decl_ty, .is_weak = false } });
+        nav.ty = decl_ty;
+        return sema.finish();
+    }
     // Within the value body, the `declaration` instruction refers to the type.
     if (decl_ty != .none) try sema.inst_map.put(sema.gpa, nav.zir_inst, .fromInterned(decl_ty));
     var val_ref = try sema.resolveInlineBody(&block, decl.value_body.?, nav.zir_inst);
@@ -9242,9 +9249,15 @@ fn analyzeCall(
     // declared function (a direct call) or not (an indirect call).
     const callee_ty = sema.typeOf(callee);
     var func: Index = .none;
+    // An extern function is called through a pointer loaded at runtime.
+    var extern_func: Index = .none;
     const fn_ty_index: Index = switch (Type.class(ip, callee_ty)) {
         .@"fn" => blk: {
             const v = try sema.resolveConstValue(block, src, callee, "function value must be comptime-known");
+            if (ip.indexToKey(v) == .extern_func) {
+                extern_func = v;
+                break :blk callee_ty;
+            }
             if (ip.indexToKey(v) != .func) return sema.fail(block, src, "type '{f}' not a function", .{sema.fmtType(callee_ty)});
             func = v;
             break :blk callee_ty;
@@ -9260,6 +9273,7 @@ fn analyzeCall(
                     // A pointer cast to another function type calls
                     // indirectly.
                     if (ip.indexToKey(nv) == .func and ip.typeOf(nv) == p.child) func = nv;
+                    if (ip.indexToKey(nv) == .extern_func) extern_func = nv;
                 }
             };
             break :blk p.child;
@@ -9318,13 +9332,18 @@ fn analyzeCall(
         (ret_ty != .generic_poison_type and Type.isComptimeOnly(ip, ret_ty));
     if (func == .none) {
         if (comptime_call) return sema.fail(block, src, "unable to resolve comptime value: function pointer is not comptime-known", .{});
+        const callee_ptr = if (extern_func == .none) callee else blk: {
+            const ptr_ty = try sema.ptrType(.{ .child = ip.typeOf(extern_func), .flags = .{ .is_const = true } });
+            const name = ip.indexToKey(extern_func).extern_func.name;
+            break :blk try sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(name) } } });
+        };
         if (fn_ty.is_generic) return sema.fail(block, src, "cannot call a generic function through a pointer", .{});
         try sema.requireRuntime(block, src);
         for (fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
         try sema.resolveLayout(block, src, ret_ty);
         const payload = try sema.addExtra(Ir.Call{ .ret_ty = ret_ty, .args_len = @intCast(args.len) });
         try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(args));
-        return sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = callee, .payload = payload } } });
+        return sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = callee_ptr, .payload = payload } } });
     }
     if (comptime_call) {
         const vals = try sema.arena.alloc(Index, args.len);

@@ -547,7 +547,16 @@ pub const Key = union(enum) {
     opt: struct { ty: Index, val: Index },
     aggregate: Aggregate,
     func: Func,
+    /// A function declared `extern`, defined by the export of `name`
+    /// (zap links statically, so another part of the program).
+    extern_func: ExternFunc,
     calling_convention: CallingConvention,
+};
+
+pub const ExternFunc = struct {
+    name: String,
+    ty: Index,
+    is_weak: bool,
 };
 
 // ---------------------------------------------------------------------------
@@ -597,6 +606,7 @@ const Tag = enum(u8) {
     aggregate_bytes,
     aggregate_repeated,
     func,
+    extern_func,
     calling_convention,
 };
 
@@ -1069,6 +1079,7 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
             _ = try ip.addExtra(local, @ptrCast(f.comptime_args));
             return .{ .tag = .func, .data = start };
         },
+        .extern_func => |f| return .{ .tag = .extern_func, .data = try ip.addExtra(local, &.{ @backingInt(f.name), idx(f.ty), @intFromBool(f.is_weak) }) },
         .calling_convention => |cc| return .{ .tag = .calling_convention, .data = @backingInt(cc) },
     }
 }
@@ -1198,6 +1209,7 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
             .generic_owner = I.i(extra[d + 3]),
             .comptime_args = @ptrCast(extra[d + 5 ..][0..extra[d + 4]]),
         } },
+        .extern_func => .{ .extern_func = .{ .name = I.s(extra[d]), .ty = I.i(extra[d + 1]), .is_weak = extra[d + 2] != 0 } },
         .calling_convention => .{ .calling_convention = @fromBackingInt(@as(u8, @truncate(d))) },
     };
 }
@@ -1433,6 +1445,11 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
             ip.hashIndex(&h, f.generic_owner);
             ip.hashIndices(&h, f.comptime_args);
         },
+        .extern_func => |f| {
+            ip.hashString(&h, f.name);
+            ip.hashIndex(&h, f.ty);
+            h.int(u8, @intFromBool(f.is_weak));
+        },
         .calling_convention => |cc| h.int(u8, @backingInt(cc)),
     }
     return h.final();
@@ -1524,6 +1541,7 @@ fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
             return x.owner_nav == y.owner_nav and x.ty == y.ty and x.zir_inst == y.zir_inst and
                 x.generic_owner == y.generic_owner and eqlIdx(Index, x.comptime_args, y.comptime_args);
         },
+        .extern_func => |x| x.name == b.extern_func.name and x.ty == b.extern_func.ty and x.is_weak == b.extern_func.is_weak,
         .calling_convention => |x| x == b.calling_convention,
     };
 }
@@ -1571,6 +1589,7 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
             .opt => |x| x.ty,
             .aggregate => |x| x.ty,
             .func => |x| x.ty,
+            .extern_func => |x| x.ty,
             .calling_convention => .calling_convention_type,
         },
     };
