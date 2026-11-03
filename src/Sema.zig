@@ -391,6 +391,15 @@ pub const Src = struct {
         node_abs: Ast.Node.Index,
         /// The initializer of the variable declaration `base`, or `base` if it has none.
         var_init,
+        // Operands of the node at an offset, found only when an error is
+        // rendered (as upstream's LazySrcLoc), so that analysis never reads
+        // the tree for them. Each falls back to the node itself.
+        /// Argument `index` of a call or builtin call.
+        call_arg: struct { node: Ast.Node.Offset, index: u32 },
+        /// The stored operand of an assignment or variable declaration.
+        store_operand: Ast.Node.Offset,
+        /// The operand of a `return`.
+        return_operand: Ast.Node.Offset,
     },
 
     fn span(src: Src, tree: *const Ast) Ast.Span {
@@ -399,6 +408,34 @@ pub const Src = struct {
             .node_abs => |n| tree.nodeToSpan(n),
             .token => |off| tree.tokenToSpan(off.toAbsolute(tree.firstToken(src.base))),
             .var_init => tree.nodeToSpan(if (tree.fullVarDecl(src.base)) |vd| vd.ast.init_node.unwrap() orelse src.base else src.base),
+            .call_arg => |a| {
+                const node = a.node.toAbsolute(src.base);
+                var buf: [2]Ast.Node.Index = undefined;
+                const params = if (tree.fullCall(buf[0..1], node)) |call| call.ast.params else tree.builtinCallParams(&buf, node) orelse &.{};
+                return tree.nodeToSpan(if (a.index < params.len) params[a.index] else node);
+            },
+            .store_operand => |off| {
+                const node = off.toAbsolute(src.base);
+                const operand: ?Ast.Node.Index = switch (tree.nodeTag(node)) {
+                    .assign => tree.nodeData(node).node_and_node[1],
+                    else => if (tree.fullVarDecl(node)) |vd| vd.ast.init_node.unwrap() else null,
+                };
+                return tree.nodeToSpan(operand orelse node);
+            },
+            .return_operand => |off| {
+                const node = off.toAbsolute(src.base);
+                const operand = if (tree.nodeTag(node) == .@"return") tree.nodeData(node).opt_node.unwrap() else null;
+                return tree.nodeToSpan(operand orelse node);
+            },
+        };
+    }
+
+    /// `src` as an offset from its base, if it is a node.
+    fn nodeOffset(src: Src) ?Ast.Node.Offset {
+        return switch (src.loc) {
+            .node => |off| off,
+            .node_abs => |n| @fromBackingInt(@as(i32, @intCast(@as(i64, @backingInt(n)) - @backingInt(src.base)))),
+            else => null,
         };
     }
 };
@@ -1193,10 +1230,22 @@ fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: Comp
     return err;
 }
 
+/// Whether `val` is comptime-known and refers to a comptime variable, so
+/// that `validateRuntimeValue` fails: lets callers find the error's source
+/// only then.
+fn escapesComptimeVar(sema: *Sema, val: Ref) bool {
+    const v = sema.resolveValue(val) orelse return false;
+    return sema.refersToComptimeAlloc(v);
+}
+
 /// Fails if comptime-known `val` refers to a comptime variable: such a
 /// pointer cannot reach runtime code, which would see memory that only
 /// exists during analysis (upstream's `validateRuntimeValue`).
 fn validateRuntimeValue(sema: *Sema, block: *Block, src: Src, val: Ref) CompileError!void {
+    // A body lowered for the comptime evaluator runs at comptime, where
+    // comptime var pointers are fine; failing here would refuse the
+    // lowering and send every call back to the walker.
+    if (sema.bc != null) return;
     const v = sema.resolveValue(val) orelse return;
     if (!sema.refersToComptimeAlloc(v)) return;
     const err = sema.fail(block, src, "runtime value contains reference to comptime var", .{});
@@ -1207,23 +1256,12 @@ fn validateRuntimeValue(sema: *Sema, block: *Block, src: Src, val: Ref) CompileE
 
 /// The source of argument `i` of the call at `src` (a method call's
 /// receiver is argument 0), or `src` itself when the call has no such
-/// argument node.
+/// argument node. Resolved only when rendered.
 fn callArgSrc(sema: *Sema, src: Src, has_receiver: bool, i: usize) Src {
-    const tree = sema.zcu.fe.tree(@fromBackingInt(sema.file)) catch return src;
-    const node = switch (src.loc) {
-        .node => |off| off.toAbsolute(src.base),
-        .node_abs => |n| n,
-        else => return src,
-    };
-    var buf: [2]Ast.Node.Index = undefined;
-    const params = if (tree.fullCall(buf[0..1], node)) |call| call.ast.params else tree.builtinCallParams(&buf, node) orelse return src;
-    var param = i;
-    if (has_receiver) {
-        if (i == 0) return src;
-        param -= 1;
-    }
-    if (param >= params.len) return src;
-    return .{ .base = src.base, .loc = .{ .node_abs = params[param] } };
+    _ = sema;
+    if (has_receiver and i == 0) return src;
+    const off = src.nodeOffset() orelse return src;
+    return .{ .base = src.base, .loc = .{ .call_arg = .{ .node = off, .index = @intCast(i - @intFromBool(has_receiver)) } } };
 }
 
 /// The initializer of element `i` of aggregate type `ty` in the struct
@@ -1284,32 +1322,20 @@ fn indexableSrc(sema: *Sema, src: Src) Src {
 }
 
 /// The stored operand of the assignment or variable declaration at `src`
-/// (upstream's `node_offset_store_operand`), or `src` itself.
+/// (upstream's `node_offset_store_operand`), or `src` itself. Resolved
+/// only when rendered.
 fn storeOperandSrc(sema: *Sema, src: Src) Src {
-    const tree = sema.zcu.fe.tree(@fromBackingInt(sema.file)) catch return src;
-    const node = switch (src.loc) {
-        .node => |off| off.toAbsolute(src.base),
-        .node_abs => |n| n,
-        else => return src,
-    };
-    const operand: Ast.Node.Index = switch (tree.nodeTag(node)) {
-        .assign => tree.nodeData(node).node_and_node[1],
-        else => if (tree.fullVarDecl(node)) |vd| vd.ast.init_node.unwrap() orelse return src else return src,
-    };
-    return .{ .base = src.base, .loc = .{ .node_abs = operand } };
+    _ = sema;
+    const off = src.nodeOffset() orelse return src;
+    return .{ .base = src.base, .loc = .{ .store_operand = off } };
 }
 
 /// The operand of the `return` at `src`, or `src` for a bare `return`.
+/// Resolved only when rendered.
 fn returnOperandSrc(sema: *Sema, src: Src) Src {
-    const tree = sema.zcu.fe.tree(@fromBackingInt(sema.file)) catch return src;
-    const node = switch (src.loc) {
-        .node => |off| off.toAbsolute(src.base),
-        .node_abs => |n| n,
-        else => return src,
-    };
-    if (tree.nodeTag(node) != .@"return") return src;
-    const operand = tree.nodeData(node).opt_node.unwrap() orelse return src;
-    return .{ .base = src.base, .loc = .{ .node_abs = operand } };
+    _ = sema;
+    const off = src.nodeOffset() orelse return src;
+    return .{ .base = src.base, .loc = .{ .return_operand = off } };
 }
 
 /// Converts a dependency loop reported by the Zcu into a compile error here.
@@ -10801,11 +10827,11 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag)
     const d = try sema.memOperand(block, sema.callArgSrc(src, false, 0), dest);
     const s = try sema.memOperand(block, sema.callArgSrc(src, false, 1), source);
     if (Type.ptrInfo(ip, sema.typeOf(dest)).flags.is_const) return sema.fail(block, sema.callArgSrc(src, false, 0), "cannot copy to constant pointer", .{});
-    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     const dest_src = sema.callArgSrc(src, false, 0);
     const source_src = sema.callArgSrc(src, false, 1);
     if (d.len == .none and s.len == .none) {
         const err = sema.fail(block, src, "unknown copy length", .{});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
         try sema.zcu.addNote(sema.file, dest_src.span(tree), "destination type '{f}' provides no length", .{sema.fmtType(sema.typeOf(dest))});
         try sema.zcu.addNote(sema.file, source_src.span(tree), "source type '{f}' provides no length", .{sema.fmtType(sema.typeOf(source))});
         return err;
@@ -10818,6 +10844,7 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag)
         if (sema.resolveValue(d.len)) |dl| if (sema.resolveValue(s.len)) |sl| {
             if (dl != sl) {
                 const err = sema.fail(block, src, "non-matching copy lengths", .{});
+                const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
                 try sema.zcu.addNote(sema.file, dest_src.span(tree), "length {f} here", .{sema.fmtValue(dl)});
                 try sema.zcu.addNote(sema.file, source_src.span(tree), "length {f} here", .{sema.fmtValue(sl)});
                 return err;
@@ -11195,7 +11222,7 @@ fn elemPtrOfSlice(sema: *Sema, block: *Block, src: Src, slice: Ref, uncasted_ind
         if (iv) |v| return .fromInterned(try sema.ptrElemPtrVal(sema.ip.keyPayload(.slice, sv).ptr, sema.ip.intValue(u64, v).?));
     }
     try sema.requireRuntime(block, src);
-    try sema.validateRuntimeValue(block, sema.indexableSrc(src), slice);
+    if (sema.escapesComptimeVar(slice)) try sema.validateRuntimeValue(block, sema.indexableSrc(src), slice);
     return sema.addTyPlBin(block, .slice_elem_ptr, elem_ptr_ty, slice, index);
 }
 
@@ -11210,7 +11237,7 @@ fn elemPtrOfArrayPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref)
     };
     try sema.requireRuntime(block, src);
     try sema.runtimeElemAccess(block, src, elem_ty);
-    try sema.validateRuntimeValue(block, sema.indexableSrc(src), ptr);
+    if (sema.escapesComptimeVar(ptr)) try sema.validateRuntimeValue(block, sema.indexableSrc(src), ptr);
     return sema.addTyPlBin(block, .ptr_elem_ptr, result_ty, ptr, index);
 }
 
@@ -11223,7 +11250,7 @@ fn elemPtrOfManyPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) 
             return .fromInterned(try sema.ptrElemPtrVal(pv, sema.ip.intValue(u64, iv).?));
     };
     try sema.requireRuntime(block, src);
-    try sema.validateRuntimeValue(block, sema.indexableSrc(src), ptr);
+    if (sema.escapesComptimeVar(ptr)) try sema.validateRuntimeValue(block, sema.indexableSrc(src), ptr);
     return sema.addTyPlBin(block, .ptr_elem_ptr, result_ty, ptr, index);
 }
 
@@ -12587,7 +12614,7 @@ fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref
     }
     if (all_comptime) return .fromInterned(try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = vals } } }));
     try sema.requireRuntime(block, src);
-    for (elems, vals, 0..) |e, v, i| if (v != .none) try sema.validateRuntimeValue(block, sema.initElemSrc(src, ty, i), e);
+    for (elems, vals, 0..) |e, v, i| if (v != .none and sema.refersToComptimeAlloc(v)) try sema.validateRuntimeValue(block, sema.initElemSrc(src, ty, i), e);
     try sema.resolveLayout(block, src, ty);
     if (Type.isPackedStruct(sema.ip, ty) and sema.bc == null) {
         const backing = sema.ip.structInfo(ty).tag_type;
@@ -13696,12 +13723,12 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         if (is_type) {
             if (result_ty != .void_type) return sema.failUnsupported(block, src, "inline assembly with more than one result output");
             result_ty = try sema.resolveType(block, src, o.data.operand);
-            try sema.validateAsmOutputType(block, sema.asmOperandSrc(src, true, k), result_ty);
+            try sema.validateAsmOutputType(block, src, k, result_ty);
         } else {
             operand = sema.resolveInst(o.data.operand);
-            if (sema.resolveValue(operand)) |v| if (sema.refersToComptimeAlloc(v))
+            if (sema.escapesComptimeVar(operand))
                 return sema.fail(block, sema.asmOperandSrc(src, true, k), "assembly output contains reference to comptime var", .{});
-            try sema.validateAsmOutputType(block, sema.asmOperandSrc(src, true, k), Type.childType(sema.ip, sema.typeOf(operand)));
+            try sema.validateAsmOutputType(block, src, k, Type.childType(sema.ip, sema.typeOf(operand)));
         }
         try operands.append(gpa, .{
             .name = try sema.getString(sema.zirString(o.data.name)),
@@ -13713,7 +13740,7 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         const in = sema.code.extraData(Zir.Inst.Asm.Input, i);
         i = in.end;
         var operand = sema.resolveInst(in.data.operand);
-        if (sema.resolveValue(operand)) |v| if (sema.refersToComptimeAlloc(v))
+        if (sema.escapesComptimeVar(operand))
             return sema.fail(block, sema.asmOperandSrc(src, false, k), "assembly input contains reference to comptime var", .{});
         const ty = sema.typeOf(operand);
         if (ty == .comptime_int_type) operand = try sema.coerce(block, .usize_type, operand, src);
@@ -13739,9 +13766,9 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     return sema.addInst(block, .{ .tag = .assembly, .data = .{ .ty_pl = .{ .ty = result_ty, .payload = payload } } });
 }
 
-/// Fails unless an `asm` output of type `ty` has a register-sized
-/// representation, as upstream checks.
-fn validateAsmOutputType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
+/// Fails unless output `k` of the `asm` at `asm_src`, of type `ty`, has a
+/// register-sized representation, as upstream checks.
+fn validateAsmOutputType(sema: *Sema, block: *Block, asm_src: Src, k: usize, ty: Index) CompileError!void {
     const ip = sema.ip;
     const note: ?[]const u8 = switch (Type.class(ip, ty)) {
         .int, .float, .bool, .vector, .@"enum" => return,
@@ -13752,6 +13779,7 @@ fn validateAsmOutputType(sema: *Sema, block: *Block, src: Src, ty: Index) Compil
         .array => "array types cannot be passed to inline assembly",
         else => null,
     };
+    const src = sema.asmOperandSrc(asm_src, true, k);
     const err = sema.fail(block, src, "invalid inline assembly output type '{f}'", .{sema.fmtType(ty)});
     if (note) |n| {
         const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
