@@ -1231,6 +1231,24 @@ the result's items:
 - `builtin.test_functions` is filled outside unit analysis
   (`populateTestFunctions`, after all tests are known), so the test list is
   its own node, and adding or removing a test changes it.
+- Test order: a file's tests are listed in source order when its namespace
+  is created, which happens when something first resolves the file's root
+  type. `Zcu.analyzeAll` resolves the roots, then queued `comptime`
+  declarations, exports, the tests' declarations, and compiler_rt
+  requests, all before it analyzes function bodies in FIFO order. So the
+  main file's tests come first, then the tests of each file it reaches
+  in that order; a file first reached from a test body (`_ = Table;`,
+  `refAllDecls`) comes after every file reached without running test bodies.
+  Upstream also lists tests by when each file is scanned, but its scan
+  order comes from its work set, not a rule: `findOutdatedToAnalyze`
+  takes functions first and then the first ready unit, and
+  `clearOutdatedState` swap-removes it, so the most recently queued unit
+  moves to the front. zap does not reproduce that (it would mean
+  reproducing upstream's unit split and recursive analysis exactly), and
+  test order can differ between the two (libvaxis's `widgets.Table` tests
+  run right after `vxfw.vxfw`'s in zap and last in upstream). Once
+  analysis is parallel, the list is sorted by declaration key (see the
+  per-function table below), which is a different deterministic rule.
 
 **Error codes and inferred error sets.** Codes stay append-only per
 compilation (`seedErrors` assigns the manifest's names first), so a name's
