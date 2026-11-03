@@ -344,6 +344,32 @@ pub fn enableCache(fe: *Frontend, dirs: CacheDirs) !void {
     }
 }
 
+/// ZIR an earlier build lowered from file `index`'s source when it had
+/// `content_hash`, from the file's module's cache, for comparing with the
+/// file's ZIR now (`seeds.zig`); null if the cache no longer has it.
+pub fn loadOldZir(fe: *const Frontend, index: File.Index, content_hash: Hash) Allocator.Error!?OldZir {
+    const mod = fe.module(fe.file(index).module);
+    const cd: *const CacheDir = if (fe.caches[@backingInt(mod.cache)]) |*cd|
+        cd
+    else if (fe.caches[@backingInt(CacheKind.local)]) |*cd| cd else return null;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(fe.gpa);
+    const zir, const mapping, _ = cd.loadZir(fe.gpa, fe.io, content_hash, &buf) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return .{ .zir = zir, .mapping = mapping };
+}
+
+pub const OldZir = struct {
+    zir: Zir,
+    mapping: ?Io.File.MemoryMap,
+
+    pub fn deinit(o: *OldZir, fe: *const Frontend) void {
+        if (o.mapping) |*m| m.destroy(fe.io) else o.zir.deinit(fe.gpa);
+    }
+};
+
 fn cacheFor(fe: *Frontend, mod: *const Module) ?*CacheDir {
     if (fe.caches[@backingInt(mod.cache)]) |*cd| return cd;
     if (fe.caches[@backingInt(CacheKind.local)]) |*cd| return cd;

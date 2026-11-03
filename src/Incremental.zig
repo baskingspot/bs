@@ -24,6 +24,7 @@ const Manifest = cache.Manifest;
 const Pack = cache.Pack;
 const Store = cache.Store;
 const atoms_codec = cache.atoms;
+const seeds = cache.seeds;
 const Hash = cache.Hash;
 const Frontend = @import("Frontend.zig");
 const InternPool = @import("InternPool.zig");
@@ -248,6 +249,8 @@ const Node = struct {
     exact_hash: Hash = 0,
     src_hash: Hash = 0,
     tag: Tag,
+    source: Manifest.Source = .none,
+    source_name: ?[]const u8 = null,
     /// Node indices, ascending and distinct; set by `Recorder.group`.
     deps: []const u32 = &.{},
     /// Indices into `Emit.atoms`, ascending; set by `Recorder.group`.
@@ -358,6 +361,8 @@ const Recorder = struct {
         key: Hash = 0,
         src_hash: Hash = 0,
         result_hash: Hash = 0,
+        source: Manifest.Source = .none,
+        source_name: ?[]const u8 = null,
         node: u32 = no_node,
     };
 
@@ -450,6 +455,7 @@ const Recorder = struct {
         if (new) {
             r.nodes.items[index].src_hash = info.src_hash;
             r.nodes.items[index].result_hash = info.result_hash;
+            r.nodes.items[index].source = info.source;
         }
         info.node = index;
         return index;
@@ -477,6 +483,8 @@ const Recorder = struct {
         info.node = index;
         if (new) {
             r.nodes.items[index].result_hash = info.result_hash;
+            r.nodes.items[index].source = info.source;
+            r.nodes.items[index].source_name = info.source_name;
             const producer = r.dependee_producer.items[i];
             if (producer != no_node) try r.edges.append(r.gpa, .{ index, try r.unitNode(producer) });
         }
@@ -570,6 +578,15 @@ const Keyer = struct {
         return k.unit_buf.written();
     }
 
+    fn source(file: u32, inst: std.zig.Zir.Inst.Index) Manifest.Source {
+        return .{ .input = file, .inst = @backingInt(inst) };
+    }
+
+    /// A namespace's container: where its declarations' names are.
+    fn namespaceSource(k: *Keyer, ns: *const Zcu.Namespace) Manifest.Source {
+        return source(ns.file, k.zcu.ip.containerType(ns.owner_type).?.zir_inst);
+    }
+
     fn srcHash(k: *Keyer, file: u32, inst: std.zig.Zir.Inst.Index) Hash {
         const h = k.zcu.file(file).zir.getAssociatedSrcHash(inst) orelse return 0;
         return @bitCast(h);
@@ -582,22 +599,29 @@ const Keyer = struct {
             .nav_val => |nav_index| {
                 const nav = ip.getNav(nav_index);
                 info.src_hash = k.srcHash(nav.file, nav.zir_inst);
+                info.source = source(nav.file, nav.zir_inst);
                 if (nav.status == .resolved) info.result_hash = navResultHash(ip, nav);
             },
             .type_layout => |ty| {
                 const c = ip.containerType(ty).?;
                 info.src_hash = k.srcHash(c.file, c.zir_inst);
+                info.source = source(c.file, c.zir_inst);
                 info.result_hash = layoutResultHash(ip, ty);
             },
             .func => |func| {
                 const owner = ip.getNav(ip.indexToKey(func).func.owner_nav);
                 info.src_hash = k.srcHash(owner.file, owner.zir_inst);
+                info.source = source(owner.file, owner.zir_inst);
                 // The result is the function's atom, hashed in `record`.
             },
-            .comptime_decl => |c| info.src_hash = k.srcHash(c.file, c.inst),
+            .comptime_decl => |c| {
+                info.src_hash = k.srcHash(c.file, c.inst);
+                info.source = source(c.file, c.inst);
+            },
             .struct_defaults => |ty| {
                 const c = ip.containerType(ty).?;
                 info.src_hash = k.srcHash(c.file, c.zir_inst);
+                info.source = source(c.file, c.zir_inst);
                 info.result_hash = defaultsResultHash(ip, ty);
             },
         }
@@ -620,6 +644,7 @@ const Keyer = struct {
                 return .{
                     .key = try k.keyOf(.func_body, &.{try k.unitKeyString(.{ .func = func })}),
                     .result_hash = k.srcHash(owner.file, owner.zir_inst),
+                    .source = source(owner.file, owner.zir_inst),
                 };
             },
             .func_ies => |func| {
@@ -638,18 +663,25 @@ const Keyer = struct {
                     // whether it is `pub` (`@hasDecl`, and access from
                     // other files, read that).
                     .result_hash = if (ns.decls.get(nn.name)) |nav| cache.hash(3, ip.stringSlice(ip.getNav(nav).key)) ^ @intFromBool(ip.getNav(nav).is_pub) else 0,
+                    .source = k.namespaceSource(ns),
+                    .source_name = ip.stringSlice(nn.name),
                 };
             },
             .namespace => |ns_index| {
                 const ns = k.zcu.namespacePtr(ns_index);
                 var h: Hash = 0;
                 for (ns.decls.keys()) |name| h = cache.hash(@truncate(h), ip.stringSlice(name)) ^ h;
-                return .{ .key = try k.keyOf(.namespace, &.{ns.key}), .result_hash = h };
+                return .{ .key = try k.keyOf(.namespace, &.{ns.key}), .result_hash = h, .source = k.namespaceSource(ns) };
             },
             // The file's contents, by its path in its module.
             .embed_file => |i| {
                 const f = k.zcu.embed_files.values()[i];
-                return .{ .key = try k.keyOf(.embed_file, &.{f.key}), .result_hash = f.hash };
+                // Embedded files' inputs follow the source files'.
+                return .{
+                    .key = try k.keyOf(.embed_file, &.{f.key}),
+                    .result_hash = f.hash,
+                    .source = .{ .input = @intCast(k.zcu.fe.files.items.len + i), .inst = Manifest.Source.no_inst },
+                };
             },
         }
     }
@@ -946,7 +978,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     }{ .nodes = r.nodes.items, .atoms = emit.atoms.items, .debug_of = debug_of });
     const t1 = now(io);
 
-    if (inc.check) inc.checkPrediction(&r);
+    if (inc.check) inc.checkPrediction(&r, fe);
 
     // Store: find equal entries on every core; the others go into one new
     // pack, encoded straight into the file on other threads while this one
@@ -1092,7 +1124,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
                 off += len;
             }
         }
-        _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps, .atoms = refs.items, .symbols = symbols.items, .refs = refs_of.items });
+        _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps, .atoms = refs.items, .symbols = symbols.items, .refs = refs_of.items, .source = n.source, .source_name = n.source_name });
     }
     if (inc.check and !checkReferences(gpa, &r, root_items.items, &b)) inc.check_failed.store(true, .monotonic);
     for (base_names.items) |name| _ = try b.addBasePack(name);
@@ -1101,22 +1133,25 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     const t3 = now(io);
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
+    // Input `i` is file `i` (`Manifest.Source.input`), then the embedded
+    // files.
     for (fe.files.items) |*f| {
-        const mod = fe.module(f.module);
-        path_buf.clearRetainingCapacity();
-        try path_buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, f.sub_path });
-        const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch continue;
-        try b.addInput(path_buf.items, stat, @bitCast(f.content_hash), inc.build_start);
+        try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+        if (Io.Dir.cwd().statFile(io, path_buf.items, .{})) |stat|
+            try b.addInput(path_buf.items, stat, @bitCast(f.content_hash), inc.build_start)
+        else |_|
+            try b.addUnstattedInput(path_buf.items, @bitCast(f.content_hash));
     }
     // `@embedFile`d files are inputs too. Every input's content hash is
     // `Frontend.hashSource`'s, which `relinkIfUnchanged` checks a touched
     // input against.
     for (zcu.embed_files.values()) |f| {
-        const mod = fe.module(f.module);
-        path_buf.clearRetainingCapacity();
-        try path_buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, f.sub_path });
-        const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch continue;
-        try b.addInput(path_buf.items, stat, @bitCast(Frontend.hashSource(f.bytes)), inc.build_start);
+        try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+        const content_hash: Hash = @bitCast(Frontend.hashSource(f.bytes));
+        if (Io.Dir.cwd().statFile(io, path_buf.items, .{})) |stat|
+            try b.addInput(path_buf.items, stat, content_hash, inc.build_start)
+        else |_|
+            try b.addUnstattedInput(path_buf.items, content_hash);
     }
     const t4 = now(io);
     var manifest = try b.writeUnplaced(io, inc.dir, pack.id);
@@ -1307,46 +1342,88 @@ const Putter = struct {
 /// straight from source (namespaces, names, function bodies) whose result
 /// changed. Every node whose result changed must be among them. Prints
 /// the counts, and the nodes it missed.
-fn checkPrediction(inc: *Incremental, r: *const Recorder) void {
+/// The path an input is recorded under: absolute, if the module's root is.
+fn inputPath(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, module: Frontend.Module.Index, sub_path: []const u8) !void {
+    const mod = fe.module(module);
+    buf.clearRetainingCapacity();
+    try buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, sub_path });
+}
+
+fn checkPrediction(inc: *Incremental, r: *const Recorder, fe: *const Frontend) void {
+    inc.checkPredictionFallible(r, fe) catch |err| {
+        std.debug.print("cache check: could not check the prediction: {t}\n", .{err});
+        inc.check_failed.store(true, .monotonic);
+    };
+}
+
+/// `ZAP_CACHE_CHECK`: computes the seeds from the changed inputs' ZIR, as
+/// an edit build will (`seeds.zig`), and checks that every node whose
+/// result this build changed is reachable from them over the last
+/// manifest's reverse edges.
+fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Frontend) !void {
     const gpa = inc.gpa;
+    const io = inc.io;
     const nodes = r.nodes.items;
     const m = if (inc.prev) |*m| m else return;
     const n_prev = m.nodeCount();
-    const reached = std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev) catch return;
-    var seen = reached;
+
+    // The inputs whose contents changed, by path.
+    var now_inputs: std.StringHashMapUnmanaged(struct { file: ?Frontend.File.Index, hash: Hash }) = .empty;
+    defer {
+        var it = now_inputs.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        now_inputs.deinit(gpa);
+    }
+    var path_buf: std.ArrayList(u8) = .empty;
+    defer path_buf.deinit(gpa);
+    for (fe.files.items, 0..) |*f, i| {
+        try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+        const gop = try now_inputs.getOrPut(gpa, path_buf.items);
+        if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, path_buf.items);
+        gop.value_ptr.* = .{ .file = @fromBackingInt(@as(u32, @intCast(i))), .hash = @bitCast(f.content_hash) };
+    }
+    for (r.zcu.embed_files.values()) |f| {
+        try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+        const gop = try now_inputs.getOrPut(gpa, path_buf.items);
+        if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, path_buf.items);
+        gop.value_ptr.* = .{ .file = null, .hash = @bitCast(Frontend.hashSource(f.bytes)) };
+    }
+    var changed: std.ArrayList(seeds.Changed) = .empty;
+    defer changed.deinit(gpa);
+    for (0..m.inputCount()) |j| {
+        const in, const path = m.input(@intCast(j));
+        // An input no longer read has no nodes in this build.
+        const now_in = now_inputs.get(path) orelse continue;
+        if (now_in.hash != in.content_hash) try changed.append(gpa, .{ .input = @intCast(j), .file = now_in.file });
+    }
+    var seed_list: std.ArrayList(u32) = .empty;
+    defer seed_list.deinit(gpa);
+    const t0 = now(io);
+    const stats = try seeds.compute(gpa, m, fe, changed.items, &seed_list);
+    const seeds_ms = ms(t0, now(io));
+
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
     defer seen.deinit(gpa);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
-    var seeds: usize = 0;
+    for (seed_list.items) |i| {
+        seen.set(i);
+        try stack.append(gpa, i);
+    }
     var added: usize = 0;
     for (nodes) |n| {
-        const i = m.find(n.key) orelse {
-            added += 1;
-            continue;
-        };
-        const old = m.node(i);
-        const from_source = switch (n.tag) {
-            .func_body, .namespace_name, .namespace => true,
-            else => false,
-        };
-        if (old.src_hash != n.src_hash or (from_source and old.result_hash != n.result_hash)) {
-            seeds += 1;
-            if (!seen.isSet(i)) {
-                seen.set(i);
-                stack.append(gpa, i) catch return;
-            }
-        }
+        if (m.find(n.key) == null) added += 1;
     }
     while (stack.pop()) |i| for (m.rdeps(i)) |part| for (part) |d| if (!seen.isSet(d)) {
         seen.set(d);
-        stack.append(gpa, d) catch return;
+        try stack.append(gpa, d);
     };
-    var changed: usize = 0;
+    var n_changed: usize = 0;
     var missed: usize = 0;
     for (nodes) |n| {
         const i = m.find(n.key) orelse continue;
         if (m.node(i).result_hash == n.result_hash) continue;
-        changed += 1;
+        n_changed += 1;
         if (seen.isSet(i)) continue;
         missed += 1;
         if (missed > 10) continue;
@@ -1369,8 +1446,8 @@ fn checkPrediction(inc: *Incremental, r: *const Recorder) void {
         }
     }
     if (missed != 0) inc.check_failed.store(true, .monotonic);
-    std.debug.print("cache check: {d} nodes ({d} new); {d} seeds reach {d}; {d} results changed, {d} missed\n", .{
-        nodes.len, added, seeds, seen.count(), changed, missed,
+    std.debug.print("cache check: {d} nodes ({d} new); {d} inputs changed ({d} without their old ZIR); {d} seeds from ZIR in {d:.2} ms reach {d}; {d} results changed, {d} missed\n", .{
+        nodes.len, added, changed.items.len, stats.without_old_zir, seed_list.items.len, seeds_ms, seen.count(), n_changed, missed,
     });
 }
 

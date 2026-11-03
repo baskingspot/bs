@@ -26,6 +26,7 @@ pub const Store = @import("cache/Store.zig");
 pub const Manifest = @import("cache/Manifest.zig");
 pub const Pack = @import("cache/Pack.zig");
 pub const atoms = @import("cache/atoms.zig");
+pub const seeds = @import("cache/seeds.zig");
 
 /// A 128-bit content or identity hash.
 pub const Hash = u128;

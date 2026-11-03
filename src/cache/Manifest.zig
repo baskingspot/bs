@@ -14,9 +14,9 @@
 //!
 //! A rebuild maps the manifest and stats the inputs (`changedInputs`); with
 //! no change that is the whole cost, because nothing in the base is touched
-//! but its header and the input records. After an edit it compares changed
-//! declarations' `src_hash`es with their nodes and walks reverse edges from
-//! those alone (`rdeps`). Reverse edges are a superset: when a log record
+//! but its header and the input records. After an edit, the nodes' sources
+//! (`Source`) find the nodes the edited files change directly
+//! (`seeds.zig`), and it walks reverse edges from those alone (`rdeps`). Reverse edges are a superset: when a log record
 //! replaces a node's dependencies, the base's reverse edges from its old
 //! dependencies stay until the next base, so a walk may visit a unit that no
 //! longer depends on the changed node. Visiting it only re-checks it.
@@ -94,6 +94,10 @@ refs: []const Ref,
 /// Names that `ext`, `ext_weak`, and `rt` references index.
 ref_names: []const StrRef,
 nodes: []const Node,
+/// Where each base node's source is, parallel to `nodes` (see `Source`).
+sources: []const Source,
+/// The names of `namespace_name` nodes' sources, by node, ascending.
+source_names: []const SourceName,
 /// Open-addressing table from `Node.key` to node index + 1 (0: empty),
 /// a power of two long, at most half full.
 table: []const u32,
@@ -130,6 +134,24 @@ pub const Node = extern struct {
 };
 
 pub const StrRef = extern struct { off: u32, len: u32 };
+
+/// Where a node's result comes from in the sources, so that an edit build
+/// finds the nodes an edited file can change without analyzing anything
+/// (`seeds.zig`): an input (an index into `inputs`; for a Zig source file,
+/// its `Frontend` file index in the build that wrote the manifest) and a
+/// ZIR instruction in the ZIR of that input's recorded content (a
+/// declaration, a container type, a `comptime` block), or none for an
+/// embedded file. Opaque to the store, like `Node.tag`.
+pub const Source = extern struct {
+    input: u32,
+    inst: u32,
+
+    pub const none: Source = .{ .input = no_input, .inst = no_inst };
+    pub const no_input = std.math.maxInt(u32);
+    pub const no_inst = std.math.maxInt(u32);
+};
+
+pub const SourceName = extern struct { node: u32, name: StrRef };
 
 /// Something a unit requested that is not a dependency: what loading the
 /// unit from the cache must request again so that the build reaches the
@@ -279,10 +301,10 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN06".*;
+const magic = "ZAPMAN07".*;
 const log_magic = "ZAPMLG03".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
@@ -424,6 +446,8 @@ fn SectionType(comptime s: Section) type {
         .error_names, .bases, .files, .ref_names => StrRef,
         .ref_starts => u32,
         .refs => Ref,
+        .sources => Source,
+        .source_names => SourceName,
         .symbols => Symbol,
         .numbered => NumberedAtom,
         .targets, .error_symbols, .debug_files, .debug_atoms => u32,
@@ -459,7 +483,8 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
         m.symbols.len <= m.symbol_len or
         m.numbered.len != m.atom_refs.len or m.debug_files.len != m.atom_refs.len or
         m.error_symbols.len != m.error_names.len or
-        m.ref_starts.len != m.nodes.len + 1 or m.ref_starts[m.nodes.len] != m.refs.len) return corrupt(io, &map);
+        m.ref_starts.len != m.nodes.len + 1 or m.ref_starts[m.nodes.len] != m.refs.len or
+        m.sources.len != m.nodes.len) return corrupt(io, &map);
     errdefer m.overlay.deinit(gpa);
     try m.readLog(gpa, io, dir);
     return m;
@@ -592,6 +617,28 @@ pub fn nodeRefs(m: *const Manifest, index: u32) []const Ref {
 }
 
 /// The name an `ext`, `ext_weak`, or `rt` reference's value indexes.
+/// Node `index`'s source. Nodes a log record added have none: only a base
+/// records sources.
+pub fn source(m: *const Manifest, index: u32) Source {
+    return if (index < m.sources.len) m.sources[index] else .none;
+}
+
+/// The declaration name a `namespace_name` node looks up, if `index` is
+/// one.
+pub fn sourceName(m: *const Manifest, index: u32) ?[]const u8 {
+    var lo: usize = 0;
+    var hi: usize = m.source_names.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const n = m.source_names[mid];
+        if (n.node < index) lo = mid + 1 else if (n.node > index) hi = mid else {
+            if (n.name.off > m.strings.len or n.name.len > m.strings.len - n.name.off) return null;
+            return m.string(n.name);
+        }
+    }
+    return null;
+}
+
 pub fn refName(m: *const Manifest, value: u32) []const u8 {
     if (value < m.ref_names.len) return m.string(m.ref_names[value]);
     return m.overlay.ref_names.items[value - m.ref_names.len];
@@ -819,6 +866,9 @@ pub const NodeInit = struct {
     /// Node indices in `func` and `nav` references may be added later;
     /// names come from `addRefName`.
     refs: []const Ref = &.{},
+    source: Source = .none,
+    /// For a `namespace_name` node, the name it looks up.
+    source_name: ?[]const u8 = null,
 };
 
 /// Interns debug source paths; owns its keys.
@@ -1063,6 +1113,9 @@ pub const Builder = struct {
     refs: std.ArrayList(Ref) = .empty,
     ref_names: std.ArrayList(StrRef) = .empty,
     ref_name_table: FileTable = .{},
+    /// Parallel to `nodes`.
+    sources: std.ArrayList(Source) = .empty,
+    source_names: std.ArrayList(SourceName) = .empty,
     strings: std.ArrayList(u8) = .empty,
     entry: Hash = 0,
     /// Each number's key.
@@ -1092,6 +1145,8 @@ pub const Builder = struct {
         b.refs.deinit(gpa);
         b.ref_names.deinit(gpa);
         b.ref_name_table.deinit(gpa);
+        b.sources.deinit(gpa);
+        b.source_names.deinit(gpa);
         b.strings.deinit(gpa);
         b.symbol_keys.deinit(gpa);
         b.symbol_map.deinit(gpa);
@@ -1118,6 +1173,9 @@ pub const Builder = struct {
         for (0..base.nodes.len) |i| b.ref_ranges.appendAssumeCapacity(.{ base.ref_starts[i], base.ref_starts[i + 1] - base.ref_starts[i] });
         b.ref_ranges.appendNTimesAssumeCapacity(.{ 0, 0 }, base.nodeCount() - base.nodes.len);
         try b.strings.appendSlice(gpa, base.strings);
+        try b.sources.appendSlice(gpa, base.sources);
+        try b.sources.appendNTimes(gpa, .none, base.nodeCount() - base.nodes.len);
+        try b.source_names.appendSlice(gpa, base.source_names);
         const o = &base.overlay;
         // Number space: the base's and the log's, as they are.
         try b.targets.appendSlice(gpa, base.targets);
@@ -1195,6 +1253,8 @@ pub const Builder = struct {
         b.nodes.items[index].targets_len = try b.appendAtoms(n);
         try b.ref_ranges.append(gpa, .{ @intCast(b.refs.items.len), @intCast(n.refs.len) });
         try b.refs.appendSlice(gpa, n.refs);
+        try b.sources.append(gpa, n.source);
+        if (n.source_name) |name| try b.source_names.append(gpa, .{ .node = index, .name = try b.addString(name) });
         return index;
     }
 
@@ -1226,6 +1286,9 @@ pub const Builder = struct {
         b.nodes.items[index].targets_len = try b.appendAtoms(n);
         b.ref_ranges.items[index] = .{ @intCast(b.refs.items.len), @intCast(n.refs.len) };
         try b.refs.appendSlice(b.gpa, n.refs);
+        // A node keeps its key, so its source and name: only the
+        // instruction can move.
+        b.sources.items[index] = n.source;
     }
 
     /// Reserves room for `n_atoms` more atom references with `n_targets` more
@@ -1285,6 +1348,13 @@ pub const Builder = struct {
     /// Records an input file and its stat as of `build_start`.
     pub fn addInput(b: *Builder, path: []const u8, stat: Io.File.Stat, content_hash: Hash, build_start: Io.Timestamp) !void {
         try b.inputs.append(b.gpa, .init(stat, content_hash, build_start, try b.addString(path)));
+    }
+
+    /// An input whose stat failed: it never matches, so the next build
+    /// hashes it again. Keeps input indices equal to the build's file
+    /// indices, which `Source.input` relies on.
+    pub fn addUnstattedInput(b: *Builder, path: []const u8, content_hash: Hash) !void {
+        try b.inputs.append(b.gpa, .{ .content_hash = content_hash, .inode = 0, .size = 0, .mtime = Input.racy_mtime, .path = try b.addString(path) });
     }
 
     /// Assigns the next error code to `name`, whose symbol key is `key`.
@@ -1505,6 +1575,8 @@ pub const Builder = struct {
             @ptrCast(ref_starts),
             @ptrCast(node_refs.items),
             @ptrCast(b.ref_names.items),
+            @ptrCast(b.sources.items),
+            @ptrCast(b.source_names.items),
             b.strings.items,
         };
         const zeros: [16]u8 = @splat(0);
@@ -1566,8 +1638,8 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         const memcpy = try b.addRefName("memcpy");
         _ = try b.addNode(.{ .key = 101, .result_hash = 2, .src_hash = 7, .deps = &.{0}, .atoms = &.{.init(32, 64)}, .symbols = &.{
             .{ .key = 0xa1, .targets = &.{ 0xa3, 0xe1 }, .file = "a.zig" },
-        }, .refs = &.{ .{ .kind = .func, .value = 3 }, .{ .kind = .ext, .value = memcpy }, .{ .kind = .err, .value = 2 }, .{ .kind = .error_names, .value = 0 } } });
-        _ = try b.addNode(.{ .key = 102, .result_hash = 3, .deps = &.{ 1, 0, 3 } });
+        }, .refs = &.{ .{ .kind = .func, .value = 3 }, .{ .kind = .ext, .value = memcpy }, .{ .kind = .err, .value = 2 }, .{ .kind = .error_names, .value = 0 } }, .source = .{ .input = 0, .inst = 12 } });
+        _ = try b.addNode(.{ .key = 102, .result_hash = 3, .deps = &.{ 1, 0, 3 }, .source = .{ .input = 0, .inst = 0 }, .source_name = "x" });
         _ = try b.addNode(.{ .key = 103, .result_hash = 4, .atoms = &.{.init(160, 16)}, .symbols = &.{
             .{ .key = 0xa3, .targets = &.{ 0xa1, 0xb0 } },
         } });
@@ -1700,6 +1772,13 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             try t.expectEqual(m3.symbol(0xe3).?, m3.errorSymbol(3));
             try t.expectEqual(m3.symbol(0xe2).?, m3.errorSymbol(2));
             try t.expectEqual(m3.symbol(0xa1).?, m3.entry_symbol);
+            // Sources, which only a base records.
+            try t.expectEqual(Source.none, m3.source(0));
+            try t.expectEqual(Source{ .input = 0, .inst = 12 }, m3.source(1));
+            try t.expectEqual(Source{ .input = 0, .inst = 0 }, m3.source(2));
+            try t.expectEqualStrings("x", m3.sourceName(2).?);
+            try t.expectEqual(null, m3.sourceName(1));
+            try t.expectEqual(Source.none, m3.source(4));
         }
     }.check;
     var m3 = (try Manifest.open(gpa, io, tmp.dir)).?;

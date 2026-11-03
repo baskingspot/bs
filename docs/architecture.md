@@ -2032,22 +2032,40 @@ it and can flush every CPU's TLB.
 
 ### Edit builds: replaying cached results (designed 2026-11-03, for review)
 
-Not built yet: Sema's set of types and values is still growing, and this
-waits until hello world through `std.debug.print` compiles. What an edit
-build does, and what it needs from Sema, Zcu, and the InternPool:
+Being built in steps (each mergeable, full builds unchanged): result
+hashes (done), references (2a, done), seeds from ZIR (2b, done), result
+closures (3), and the hook with Delta and the verify mode (4). What an
+edit build does, and what it needs from Sema, Zcu, and the InternPool:
 
 **Flow.** The no-edit check finds changed inputs. The frontend loads every
 file as today (unchanged files are ZIR cache hits). Before Sema runs,
-`Incremental` computes the *seeds* from the changed files alone: for each
-node the manifest lists for a changed file (a new `sources` section: per
-input, its nodes and a locator for each: declaration name path, plus the
-ZIR offset relative to the declaration for container types and the ordinal
-for `comptime` blocks), it resolves the locator in the new ZIR and compares
-`src_hash`; `namespace_name`, `namespace`, and `func_body` nodes are
-recomputed from ZIR, as `record` computes them, and a changed embedded
-file's `embed_file` node is a seed. A missing locator is a
-seed. The *possibly outdated* set is everything reachable from the seeds
-over reverse edges (`Manifest.rdeps`, already fast: 2 ms for 30k nodes).
+`Incremental` computes the *seeds* from the changed files alone
+(`src/cache/seeds.zig`). Each node records its source
+(`Manifest.Source`, a `sources` section parallel to the nodes): an input
+(for a Zig file, its file index in the recording build, which equals its
+input index) and a ZIR instruction in the ZIR of that input's recorded
+content: the declaration of a `nav_val`, `func`, or `func_body` node, the
+container of a `type_layout`, `struct_defaults`, `namespace`, or
+`namespace_name` node (with the name it looks up, in `source_names`),
+the block of a `comptime_decl`; an `embed_file` node names its input
+only. The old ZIR is still in the frontend's cache, named by the
+recorded content hash (trimming keeps a day of edits), so upstream's
+`mapOldZirToNew` (declarations by name, `comptime` blocks and unnamed
+tests by order, the containers inside a declaration by order) maps each
+recorded instruction to the new ZIR. A node is a seed if its instruction
+no longer maps, if its `src_hash` changed (for `func_body`, its result,
+which is that hash), if its container's declaration names changed, in
+order (`namespace`), or if the name it looks up appeared, disappeared,
+or changed `pub` (`namespace_name`); a changed embedded file's node is a
+seed, and without the old ZIR every node of the input is. Recording the
+sources costs nothing measurable and 8 bytes a node plus the looked-up
+names (libvaxis: manifest 2.94 to 3.22 MB). `ZAP_CACHE_CHECK` computes
+the seeds this way and checks that they reach every changed result:
+conformance after edits to three std files (a body in `mem.zig`, a
+comment in `debug.zig`, a new declaration and a default in `fmt.zig`)
+reports 0 missed in all 113 units; mapping `mem.zig` takes 1.2 ms.
+The *possibly outdated* set is everything reachable from the seeds over
+reverse edges (`Manifest.rdeps`, already fast: 2 ms for 30k nodes).
 Sema then runs from the usual roots, and every unit it reaches is either
 re-analyzed or loaded:
 
