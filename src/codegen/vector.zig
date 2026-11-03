@@ -115,8 +115,8 @@ pub const max_bools = 64;
 pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Index) bool {
     switch (cpu.arch) {
         .x86_64 => {},
-        // TODO(aarch64-rebased): NEON answers, with the aarch64
-        // backend's lowering (docs/slop/architecture.md, "Vectors").
+        // aarch64: none until the backend lowers NEON
+        // (docs/slop/architecture.md, "Vectors").
         else => return false,
     }
     // SSE4.2 orders 64-bit integers (pcmpgtq); SSE2 only in many

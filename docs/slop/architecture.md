@@ -1288,9 +1288,9 @@ backend does, not scalarized. The split has three parts:
   comptime-known), the scalar operation is analyzed with its usual
   safety checks, and the results are reassembled with `aggregate_init`.
   So an answer may change only together with the backend. Sema asks
-  for `Zcu.cpu`, which main.zig sets from `-mcpu` (x86_64 only until the
-  aarch64 backend's target plumbing replaces it: `TODO(aarch64-rebased)`
-  there); aarch64 answers false until NEON lowering lands.
+  for `Zcu.cpu`: the `-mcpu` CPU on x86_64-linux, `apple_m1` on
+  aarch64-macos (main.zig), where it answers false until NEON lowering
+  lands, so its vectors stay scalarized.
 - **The IR**: the existing element-wise tags (`add_wrap`, `sub_wrap`,
   `mul_wrap`, `bit_and`, `bit_or`, `xor`, `not`, `add_float` ...
   `max_float`, `neg_float`, `abs_float`, `sqrt`) carry vector operands,

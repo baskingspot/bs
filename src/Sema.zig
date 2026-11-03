@@ -5914,10 +5914,9 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         },
         .builtin_src => sema.zirBuiltinSrc(block, ext),
         .compile_log => sema.zirCompileLog(block, ext),
-        // As upstream on targets other than WebAssembly (bs's Sema only
-        // analyzes for x86_64 so far).
-        .wasm_memory_size => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.UnNode, ext.operand).data.node), "builtin @wasmMemorySize is available when targeting WebAssembly; targeted CPU architecture is {s}", .{"x86_64"}),
-        .wasm_memory_grow => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.BinNode, ext.operand).data.node), "builtin @wasmMemoryGrow is available when targeting WebAssembly; targeted CPU architecture is {s}", .{"x86_64"}),
+        // As upstream on targets other than WebAssembly.
+        .wasm_memory_size => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.UnNode, ext.operand).data.node), "builtin @wasmMemorySize is available when targeting WebAssembly; targeted CPU architecture is {s}", .{@tagName(sema.ip.target.arch())}),
+        .wasm_memory_grow => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.BinNode, ext.operand).data.node), "builtin @wasmMemoryGrow is available when targeting WebAssembly; targeted CPU architecture is {s}", .{@tagName(sema.ip.target.arch())}),
         // A declaration whose ZIR AstGen could not generate: AstGen
         // reported it, so it fails, as do the units that read it, with no
         // error of their own (upstream's `failTransitive`).
@@ -6338,7 +6337,7 @@ fn analyzeBitOp(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand
 /// value.
 fn stdCallingConvention(sema: *Sema, block: *Block, src: Src, cc_ty: Index, f: InternPool.FuncType) CompileError!Index {
     const ip = sema.ip;
-    const name = ccName(f.cc);
+    const name = ccName(ip.target, f.cc);
     const i = try sema.unionFieldIndex(block, src, cc_ty, name);
     const field_ty = ip.structInfo(cc_ty).field_types[i];
     const payload = if (field_ty == .void_type) .void_value else if (f.stack_align == 0) try sema.structValue(block, src, field_ty, &.{}) else payload: {
@@ -6349,11 +6348,14 @@ fn stdCallingConvention(sema: *Sema, block: *Block, src: Src, cc_ty: Index, f: I
     return sema.intern(.{ .un = .{ .ty = cc_ty, .tag = try sema.unionFieldTagValue(cc_ty, i), .val = payload } });
 }
 
-/// The `std.lang.CallingConvention` tag of `cc`.
-fn ccName(cc: InternPool.CallingConvention) []const u8 {
+/// The `std.lang.CallingConvention` tag of `cc` on `target`.
+fn ccName(target: InternPool.Target, cc: InternPool.CallingConvention) []const u8 {
     return switch (cc) {
         .auto => "auto",
-        .c => "x86_64_sysv",
+        .c => switch (target) {
+            .x86_64_linux => "x86_64_sysv",
+            .aarch64_macos => "aarch64_aapcs_darwin",
+        },
         .naked => "naked",
         .@"inline" => "inline",
         .x86_64_win => "x86_64_win",
@@ -6523,7 +6525,7 @@ fn explainWhyNotExtern(sema: *Sema, file: u32, span: Ast.Span, ty: Index, positi
             try zcu.addNote(file, span, "use '*const ' to make a function pointer type", .{});
         } else switch (ip.keyPayload(.func_type, ty).cc) {
             .auto => try zcu.addNote(file, span, "extern function must specify calling convention", .{}),
-            else => |cc| try zcu.addNote(file, span, "{s} function cannot be extern", .{ccName(cc)}),
+            else => |cc| try zcu.addNote(file, span, "{s} function cannot be extern", .{ccName(ip.target, cc)}),
         },
         .@"enum" => {
             // Located at the enum's declaration, as upstream.
@@ -8132,10 +8134,11 @@ fn resolveAddressSpace(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileEr
     if (sema.isUndef(val)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
     const name = sema.enumTagName(val).?;
     const as = std.meta.stringToEnum(std.lang.AddressSpace, name).?;
-    // As `std.Target.supportsAddressSpace` for x86_64, bs's one Sema target.
+    // As `std.Target.supportsAddressSpace`: segments only on x86_64.
     switch (as) {
-        .generic, .gs, .fs, .ss => {},
-        else => return sema.fail(block, src, "pointers with address space '{s}' are not supported on x86", .{name}),
+        .generic => {},
+        .gs, .fs, .ss => if (sema.ip.target.arch() != .x86_64) return sema.fail(block, src, "pointers with address space '{s}' are not supported on {s}", .{ name, @tagName(sema.ip.target.arch().family()) }),
+        else => return sema.fail(block, src, "pointers with address space '{s}' are not supported on {s}", .{ name, @tagName(sema.ip.target.arch().family()) }),
     }
     return as;
 }
@@ -8298,9 +8301,9 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
         .auto
     else if (std.mem.eql(u8, name, "inline"))
         .@"inline"
-    else if (std.mem.eql(u8, name, "x86_64_sysv"))
+    else if (std.mem.eql(u8, name, ccName(sema.ip.target, .c)))
         .c
-    else if (std.mem.eql(u8, name, "x86_64_win"))
+    else if (sema.ip.target == .x86_64_linux and std.mem.eql(u8, name, "x86_64_win"))
         .x86_64_win
     else {
         if (std.meta.stringToEnum(std.lang.CallingConvention.Tag, name) == null) {
@@ -8333,7 +8336,7 @@ const Callconv = struct {
 /// than `incoming_stack_alignment` are not supported.
 fn callconvOf(sema: *Sema, block: *Block, src: Src, val: Index) CompileError!Callconv {
     const ip = sema.ip;
-    if (ip.indexToKey(val) == .calling_convention) return .{ .tag = std.meta.stringToEnum(std.lang.CallingConvention.Tag, ccName(ip.keyPayload(.calling_convention, val))).? };
+    if (ip.indexToKey(val) == .calling_convention) return .{ .tag = std.meta.stringToEnum(std.lang.CallingConvention.Tag, ccName(ip.target, ip.keyPayload(.calling_convention, val))).? };
     const u = ip.keyPayload(.un, val);
     const name = sema.enumTagName(u.tag).?;
     var cc: Callconv = .{ .tag = std.meta.stringToEnum(std.lang.CallingConvention.Tag, name).? };
@@ -8357,25 +8360,32 @@ fn internCallconv(sema: *Sema, block: *Block, src: Src, cc: Callconv) CompileErr
     const a = cc.stack_align orelse 0;
     if (cc.stack_align != null and !std.math.isPowerOfTwo(a))
         return sema.fail(block, src, "calling convention incoming stack alignment '{d}' is not a power of two", .{a});
+    const target = sema.ip.target;
     const bs_cc: InternPool.CallingConvention = switch (cc.tag) {
         .auto => .auto,
         .naked => .naked,
         .@"inline" => .@"inline",
-        .x86_64_sysv => .c,
-        .x86_64_win => .x86_64_win,
-        else => {
+        else => if (std.mem.eql(u8, @tagName(cc.tag), ccName(target, .c)))
+            .c
+        else if (cc.tag == .x86_64_win and target == .x86_64_linux)
+            .x86_64_win
+        else {
             // As upstream, a convention of another architecture is an
             // error, and so is one that upstream's own x86_64 backend does
             // not support: bs supports the same ones.
             if (cc.tag != .async) {
                 const archs = std.Target.Cpu.Arch.fromCallingConvention(cc.tag);
-                if (std.mem.indexOfScalar(std.Target.Cpu.Arch, archs, .x86_64) == null) {
+                if (std.mem.indexOfScalar(std.Target.Cpu.Arch, archs, target.arch()) == null) {
                     var list: std.Io.Writer.Allocating = .init(sema.arena);
                     for (archs, 0..) |arch, i| list.writer.print("{s}'{t}'", .{ if (i == 0) "" else ", ", arch }) catch return error.OutOfMemory;
                     return sema.fail(block, src, "calling convention '{s}' only available on architectures {s}", .{ @tagName(cc.tag), list.written() });
                 }
             }
-            return sema.fail(block, src, "calling convention '{s}' not supported by compiler backend 'stage2_x86_64'", .{@tagName(cc.tag)});
+            return switch (target) {
+                .x86_64_linux => sema.fail(block, src, "calling convention '{s}' not supported by compiler backend 'stage2_x86_64'", .{@tagName(cc.tag)}),
+                // Upstream's LLVM backend has the other aarch64 conventions.
+                .aarch64_macos => sema.fail(block, src, "bs does not support calling convention '{s}' on aarch64-macos yet", .{@tagName(cc.tag)}),
+            };
         },
     };
     return .{ bs_cc, if (cc.stack_align != null) @intCast(std.math.log2_int(u64, a) + 1) else 0 };
@@ -8603,7 +8613,7 @@ fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: 
                 const a = ip.keyPayload(.func_type, actual);
                 if (w.is_var_args != a.is_var_args)
                     return zcu.addNote(file, span, "{s}variadic function cannot cast into a {s}variadic function", .{ if (a.is_var_args) "" else "non-", if (w.is_var_args) "" else "non-" });
-                if (w.cc != a.cc or w.stack_align != a.stack_align) return zcu.addNote(file, span, "calling convention '{s}' cannot cast into calling convention '{s}'", .{ ccName(a.cc), ccName(w.cc) });
+                if (w.cc != a.cc or w.stack_align != a.stack_align) return zcu.addNote(file, span, "calling convention '{s}' cannot cast into calling convention '{s}'", .{ ccName(ip.target, a.cc), ccName(ip.target, w.cc) });
                 const w_generic = !sema.fnHasRuntimeBits(wanted);
                 const a_generic = !sema.fnHasRuntimeBits(actual);
                 if (w_generic != a_generic)
@@ -9372,8 +9382,7 @@ fn naturalAlignment(sema: *Sema, ty: Index) ?u64 {
         // As upstream's abiAlignment, so that an over-aligned pointer
         // coerces to `*anyopaque`.
         .@"opaque" => 1,
-        // x86_64's minimum function alignment, as upstream.
-        .@"fn" => 1,
+        // Functions too: the target's minimum function alignment.
         // Zero-bit types too, as upstream: `*u0` and `*align(1) u0` match.
         else => Type.abiAlignment(ip, ty),
     };
@@ -14608,22 +14617,26 @@ fn fillReified(sema: *Sema, ty: Index) Allocator.Error!void {
     info.status = .have_field_types;
 }
 
-/// Whether a variadic function may have convention `tag`: x86_64's, as
-/// upstream's `callConvSupportsVarArgs`. Another architecture's is left to
-/// `internCallconv`.
-fn ccSupportsVarArgs(tag: std.lang.CallingConvention.Tag) bool {
+/// Whether a variadic function may have convention `tag`, as upstream's
+/// `callConvSupportsVarArgs`: the C conventions of the target's
+/// architecture. Another architecture's is left to `internCallconv`.
+fn ccSupportsVarArgs(target: InternPool.Target, tag: std.lang.CallingConvention.Tag) bool {
     return switch (tag) {
         .x86_64_sysv, .x86_64_x32, .x86_64_win => true,
+        .aarch64_aapcs, .aarch64_aapcs_darwin, .aarch64_aapcs_win, .aarch64_vfabi, .aarch64_vfabi_sve => true,
         .auto, .async, .naked, .@"inline" => false,
-        else => std.mem.indexOfScalar(std.Target.Cpu.Arch, std.Target.Cpu.Arch.fromCallingConvention(tag), .x86_64) == null,
+        else => std.mem.indexOfScalar(std.Target.Cpu.Arch, std.Target.Cpu.Arch.fromCallingConvention(tag), target.arch()) == null,
     };
 }
 
-/// As upstream's `checkCallConvSupportsVarArgs`; the note lists x86_64's
-/// conventions, the only target bs generates code for so far.
+/// As upstream's `checkCallConvSupportsVarArgs`; the note lists the
+/// target architecture's conventions.
 fn failVarArgsCc(sema: *Sema, block: *Block, src: Src, tag: std.lang.CallingConvention.Tag) CompileError {
     const err = sema.fail(block, src, "variadic function does not support '{s}' calling convention", .{@tagName(tag)});
-    try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "supported calling conventions: 'x86_64_sysv', 'x86_64_x32', 'x86_64_win'", .{});
+    try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "supported calling conventions: {s}", .{switch (sema.ip.target) {
+        .x86_64_linux => "'x86_64_sysv', 'x86_64_x32', 'x86_64_win'",
+        .aarch64_macos => "'aarch64_aapcs', 'aarch64_aapcs_darwin', 'aarch64_aapcs_win', 'aarch64_vfabi', 'aarch64_vfabi_sve'",
+    }});
     return err;
 }
 
@@ -14650,10 +14663,10 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
         }
     }
     // `std.builtin.CallingConvention` by its tag, as bs's `fn` types know
-    // them (`.c` is `.x86_64_sysv`).
+    // them (`.c` is the target's C convention, `ccName`).
     const parsed_cc = try sema.callconvOf(block, src, try sema.structFieldValue(attrs, "callconv"));
     const is_var_args = try sema.structFieldValue(attrs, "varargs") == .bool_true;
-    if (is_var_args and !ccSupportsVarArgs(parsed_cc.tag)) return sema.failVarArgsCc(block, sema.callArgSrc(src, false, 3), parsed_cc.tag);
+    if (is_var_args and !ccSupportsVarArgs(sema.ip.target, parsed_cc.tag)) return sema.failVarArgsCc(block, sema.callArgSrc(src, false, 3), parsed_cc.tag);
     const cc, const stack_align = try sema.internCallconv(block, src, parsed_cc);
     return .fromInterned(try sema.intern(.{ .func_type = .{
         .param_types = try sema.arena.dupe(Index, params),
@@ -14970,7 +14983,12 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
             .child = field_ty,
             .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .address_space = p.flags.address_space, .alignment = alignment },
             .packed_offset = .{
-                .host_size = if (p.packed_offset.host_size != 0) p.packed_offset.host_size else @intCast(Type.abiSize(ip, p.child)),
+                // As upstream's `fieldPtrType`, by backend: LLVM (aarch64-macos)
+                // hosts the bytes the bits need, the x86_64 backend the struct.
+                .host_size = if (p.packed_offset.host_size != 0) p.packed_offset.host_size else switch (ip.target) {
+                    .x86_64_linux => @intCast(Type.abiSize(ip, p.child)),
+                    .aarch64_macos => @intCast((@as(u32, Type.packedBits(ip, p.child).?) + 7) / 8),
+                },
                 .bit_offset = bit_offset,
             },
         });
@@ -18693,7 +18711,7 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const params = sema.params.items;
     sema.params = .empty;
 
-    var parsed_cc: Callconv = .{ .tag = if (sema.owner_nav != .none and ip.getNav(sema.owner_nav).linkage == .@"export") .x86_64_sysv else .auto };
+    var parsed_cc: Callconv = .{ .tag = if (sema.owner_nav != .none and ip.getNav(sema.owner_nav).linkage == .@"export") std.meta.stringToEnum(std.lang.CallingConvention.Tag, ccName(ip.target, .c)).? else .auto };
     var body_len: u32 = 0;
     var is_var_args = false;
     var noalias_bits: u32 = 0;
@@ -18737,7 +18755,7 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     if (is_noinline and parsed_cc.tag == .@"inline") return sema.fail(block, cc_src, "'noinline' function cannot have calling convention 'inline'", .{});
     if (is_var_args) {
         const var_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(params.len) } } };
-        if (!ccSupportsVarArgs(parsed_cc.tag)) return sema.failVarArgsCc(block, var_src, parsed_cc.tag);
+        if (!ccSupportsVarArgs(sema.ip.target, parsed_cc.tag)) return sema.failVarArgsCc(block, var_src, parsed_cc.tag);
     }
 
     // Errors about a parameter or the return type point at it, as upstream.
@@ -18805,7 +18823,7 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     // A calling convention other than Zig's takes only extern-compatible
     // types (upstream's `checkParamType` and `validateResolvedFuncType`).
     if (!ccAllowsZigTypes(cc)) {
-        const cc_name = ccName(cc);
+        const cc_name = ccName(ip.target, cc);
         for (params, 0..) |p, k| {
             const param_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(k) } } };
             if (p.is_comptime) return sema.fail(block, param_src, "comptime parameters not allowed in function with calling convention '{s}'", .{cc_name});

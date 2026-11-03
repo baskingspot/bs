@@ -28,6 +28,8 @@ const InternPool = @This();
 
 gpa: Allocator,
 io: Io,
+/// The compilation's target, for the layout queries that differ (`Type`).
+target: Target = .x86_64_linux,
 locals: []Local,
 shards: []Shard,
 /// Number of bits of an index that select the owning thread.
@@ -56,6 +58,26 @@ next_comptime_alloc: std.atomic.Value(u32) = .init(0),
 static_hashes: [static_len]Hash = undefined,
 
 pub const Hash = u128;
+
+/// The targets bs compiles for (AGENTS.md, "Scope").
+pub const Target = enum {
+    x86_64_linux,
+    aarch64_macos,
+
+    pub fn name(t: Target) []const u8 {
+        return switch (t) {
+            .x86_64_linux => "x86_64-linux",
+            .aarch64_macos => "aarch64-macos",
+        };
+    }
+
+    pub fn arch(t: Target) std.Target.Cpu.Arch {
+        return switch (t) {
+            .x86_64_linux => .x86_64,
+            .aarch64_macos => .aarch64,
+        };
+    }
+};
 
 /// A per-thread handle. Every call that may append to the pool takes one.
 pub const Tid = enum(u8) {
@@ -2275,14 +2297,21 @@ pub fn getInt(ip: *InternPool, tid: Tid, ty: Index, value: anytype) !Index {
 /// Interns `value` (any float type) as a value of float type `ty`, rounded
 /// to nearest-even into the type's storage.
 pub fn getFloat(ip: *InternPool, tid: Tid, ty: Index, value: anytype) !Index {
-    return ip.get(tid, .{ .float = .{ .ty = ty, .storage = switch (ip.keyPayload(.simple_type, ty)) {
-        .f16 => .{ .f16 = @floatCast(value) },
-        .f32 => .{ .f32 = @floatCast(value) },
-        .f64 => .{ .f64 = @floatCast(value) },
-        .f80, .c_longdouble => .{ .f80 = @floatCast(value) },
-        .f128, .comptime_float => .{ .f128 = @floatCast(value) },
-        else => unreachable,
-    } } });
+    return ip.get(tid, .{
+        .float = .{
+            .ty = ty,
+            .storage = switch (ip.keyPayload(.simple_type, ty)) {
+                .f16 => .{ .f16 = @floatCast(value) },
+                .f32 => .{ .f32 = @floatCast(value) },
+                .f64 => .{ .f64 = @floatCast(value) },
+                .f80 => .{ .f80 = @floatCast(value) },
+                // `long double` is `double` on aarch64-macos.
+                .c_longdouble => if (ip.target == .aarch64_macos) .{ .f64 = @floatCast(value) } else .{ .f80 = @floatCast(value) },
+                .f128, .comptime_float => .{ .f128 = @floatCast(value) },
+                else => unreachable,
+            },
+        },
+    });
 }
 
 /// The value of an integer as a big integer. `space` backs small values.

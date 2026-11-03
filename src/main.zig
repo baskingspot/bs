@@ -20,6 +20,7 @@ const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
 const CSource = @import("CSource.zig");
 const cpu_mod = @import("cpu.zig");
+const InternPool = @import("InternPool.zig");
 
 pub const zig_version = "0.17.1";
 
@@ -61,6 +62,8 @@ pub const Options = struct {
     /// `-mcpu`, resolved (`cpu.resolve`): the baseline unless it names a
     /// CPU up to x86-64-v2.
     cpu: std.Target.Cpu = cpu_mod.baseline,
+    /// The target `target` names (`checkTarget`).
+    bs_target: InternPool.Target = .x86_64_linux,
     zig_lib_dir: ?[]const u8 = null,
     /// `--cache-dir` and `--global-cache-dir`.
     cache_dir: ?[]const u8 = null,
@@ -336,9 +339,9 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
     const unsafe = opts.optimize == .fast or opts.optimize == .small;
     const prove_on = proving(env);
     const cpu_name = try cpu_mod.cacheName(arena, opts.cpu);
-    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and cpu_name.len == 0) return "x86_64-linux";
+    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and cpu_name.len == 0) return opts.bs_target.name();
     var s: std.ArrayList(u8) = .empty;
-    try s.appendSlice(arena, "x86_64-linux");
+    try s.appendSlice(arena, opts.bs_target.name());
     try s.appendSlice(arena, cpu_name);
     if (opts.fuzz) {
         try s.appendSlice(arena, "+fuzz");
@@ -428,6 +431,7 @@ pub const Job = struct {
             .glibc = if (opts.link_libc) opts.glibc_version else null,
             .link_libcpp = opts.link_libcpp,
             .cpu = opts.cpu,
+            .target = opts.bs_target,
         };
         const builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "bs" }), builtin_opts);
         // A module whose `-O`, `-ferror-tracing` or `-fvalgrind` differs
@@ -459,6 +463,7 @@ pub const Job = struct {
                 .error_tracing = false,
                 .valgrind = false,
                 .cpu = opts.cpu,
+                .target = opts.bs_target,
             })
         else
             null;
@@ -514,7 +519,9 @@ pub const Job = struct {
         // -fPIE and -dynamic imply -fPIC (and -lc on objects and
         // libraries). A library of C only has no Zig to cache; its
         // objects have their records.
-        return !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and
+        // aarch64-macos does not use the cache yet: its relink would need
+        // the Mach-O linker's inputs in the manifest.
+        return !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and job.opts.bs_target == .x86_64_linux and
             !std.mem.eql(u8, job.environ_map.get("BS_CACHE") orelse "", "off");
     }
 
@@ -1022,6 +1029,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
 
     var zcu: Zcu = try .init(init.gpa, init.io, &fe);
     defer zcu.deinit();
+    zcu.ip.target = opts.bs_target;
     defer if (inputs) |list| for (zcu.embed_files.values()) |f| {
         Incremental.inputPath(arena, &path_buf, &fe, f.module, f.sub_path) catch {};
         appendInput(arena, list, path_buf.items) catch {};
@@ -1029,10 +1037,9 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     zcu.is_test = is_test;
     zcu.name_pins = pins.*;
     zcu.single_threaded = opts.single_threaded;
-    // TODO(aarch64-rebased): the CPU of `opts.bs_target` (apple_m1 for
-    // aarch64-macos), which `vector.native` answers for.
     zcu.cpu = opts.cpu;
-    zcu.link_libc = opts.link_libc;
+    // libSystem, macOS's libc, is linked into every executable.
+    zcu.link_libc = opts.link_libc or opts.bs_target == .aarch64_macos;
     zcu.link_libcpp = opts.link_libcpp;
     zcu.test_filters = opts.test_filters;
     // `BS_COMPTIME_EVAL=n`: lower a function for the comptime evaluator
@@ -1111,7 +1118,9 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const bench_runs: u32 = if (env.get("BS_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
     if (bench_runs != 0) emit.bench_irs = .empty;
     const inl = inlining(job.environ_map);
-    if (inl.budget != 0) emit.enableInlining(inl.budget, inl.safe);
+    // The aarch64 backend has no synthetic panic frames yet, so it inlines
+    // only callees that cannot panic, which keeps panic traces complete.
+    if (inl.budget != 0) emit.enableInlining(inl.budget, inl.safe or opts.bs_target == .aarch64_macos);
     // `BS_THREADS=n`: analysis and CodeGen on n threads, Sema on one and
     // CodeGen on the others; 1 generates on the Sema thread. The output
     // is the same for every n.
@@ -1803,6 +1812,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     var lib_dirs: std.ArrayList([]const u8) = .empty;
     // `-static` and `-dynamic`, the last one given (upstream's `link_mode`).
     var link_mode: ?std.lang.LinkMode = null;
+    // `-mcpu`, resolved for the target (`cpu.resolve` on x86_64).
+    var mcpu: ?[]const u8 = null;
     var lib_search: LibQuery.Search = .{};
     var rpaths: std.ArrayList([]const u8) = .empty;
     var sysroot = false;
@@ -1891,10 +1902,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             // for `-Dcpu=x86_64_v2`).
             opts.target = if (std.mem.eql(u8, t, "native-native") or std.mem.eql(u8, t, @tagName(builtin.cpu.arch) ++ "-native")) "native" else t;
         } else if (std.mem.eql(u8, arg, "-mcpu") or std.mem.startsWith(u8, arg, "-mcpu=")) {
-            const text = if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else nextArg(args, &i, arg);
-            const r = cpu_mod.resolve(arena, io, text);
-            opts.cpu = r.cpu;
-            if (r.refused) |msg| setUnsupported(&opts, arena, "{s}", .{msg});
+            // Resolved once the target is known.
+            mcpu = if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
@@ -2103,8 +2112,29 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             fatal("unexpected extra parameter: {s}", .{arg});
         }
     }
-    if (opts.target) |target| checkTarget(&opts, arena, target) else if (!(builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux))
-        setUnsupported(&opts, arena, "bs does not implement aarch64-macos code generation yet ('native'); pass -target x86_64-linux", .{});
+    checkTarget(&opts, arena, opts.target orelse "native");
+    // The aarch64-macos backend builds executables and tests of Zig
+    // only, linked against libSystem, which is macOS's libc: `-lc` asks
+    // for nothing more.
+    if (opts.bs_target == .aarch64_macos) {
+        if (command == .build_obj or command == .build_lib)
+            setUnsupported(&opts, arena, "bs builds only executables and tests for aarch64-macos so far; build this step with upstream zig", .{})
+        else if (c_files.items.len != 0 or link_inputs.items.len != 0 or opts.link_libcpp)
+            setUnsupported(&opts, arena, "bs does not link C sources, objects, or libraries other than libSystem for aarch64-macos yet; build this step with upstream zig", .{})
+        else if (opts.fuzz)
+            setUnsupported(&opts, arena, "bs does not instrument code for fuzzing on aarch64-macos yet ('-ffuzz'); build this step with upstream zig", .{});
+        // Code is generated for Apple's M1 (`-target aarch64-macos`), the
+        // target's baseline. `zig build` passes `-mcpu baseline` with an
+        // explicit target and `-mcpu native` for `-Dcpu=native`.
+        if (mcpu) |text| if (!std.mem.eql(u8, text, "baseline") and !std.mem.eql(u8, text, "native") and !std.mem.eql(u8, text, "apple_m1"))
+            setUnsupported(&opts, arena, "bs generates code only for apple_m1 on aarch64-macos ('-mcpu {s}'); drop -mcpu or build this step with upstream zig", .{text});
+        opts.cpu = std.Target.aarch64.cpu.apple_m1.toCpu(.aarch64);
+        opts.link_libc = false;
+    } else if (mcpu) |text| {
+        const r = cpu_mod.resolve(arena, io, text);
+        opts.cpu = r.cpu;
+        if (r.refused) |msg| setUnsupported(&opts, arena, "{s}", .{msg});
+    }
     // The last of `-static` and `-dynamic` (upstream's `link_mode`). Shared
     // objects are position-independent; executables stay static unless
     // they link libc.
@@ -2303,13 +2333,18 @@ fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []con
     }
 }
 
-/// Only the x86_64-linux backend exists so far; refuses aarch64-macos
-/// rather than silently writing an x86_64 ELF.
+/// Resolves `-target` (`opts.bs_target`), or refuses a target bs does
+/// not support.
 pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8) void {
-    const native_ok = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
-    if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none") or
-        (std.mem.eql(u8, target, "native") and native_ok))
-    {} else if (std.mem.startsWith(u8, target, "x86_64-linux-gnu")) {
+    if (std.mem.eql(u8, target, "native")) {
+        if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux) {
+            opts.bs_target = .x86_64_linux;
+        } else if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
+            opts.bs_target = .aarch64_macos;
+        } else setUnsupported(opts, arena, "bs does not support the native target; pass -target x86_64-linux or -target aarch64-macos", .{});
+    } else if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none")) {
+        opts.bs_target = .x86_64_linux;
+    } else if (std.mem.startsWith(u8, target, "x86_64-linux-gnu")) {
         // `x86_64-linux-gnu[.version]`: glibc, of that version or upstream's
         // default for the target.
         const rest = target["x86_64-linux-gnu".len..];
@@ -2326,10 +2361,8 @@ pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8)
         } else setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux and aarch64-macos", .{target});
         if (opts.glibc_version != null and !opts.link_libc)
             setUnsupported(opts, arena, "bs supports '{s}' only with -lc; drop the ABI or add -lc", .{target});
-    } else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none") or
-        std.mem.eql(u8, target, "native"))
-    {
-        setUnsupported(opts, arena, "bs does not implement aarch64-macos code generation yet ('{s}'); pass -target x86_64-linux", .{target});
+    } else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none")) {
+        opts.bs_target = .aarch64_macos;
     } else setUnsupported(opts, arena, "bs does not support the target '{s}'; it supports x86_64-linux and aarch64-macos", .{target});
 }
 

@@ -5870,8 +5870,8 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
                 @memset(out[0..8], 0);
                 if (t.ext) |name| {
                     const b = try emit.externDataTarget(ip.stringSlice(name));
-                    try relocs.append(gpa, base_off, .x86_64_abs64, b.key, t.off + b.addend);
-                } else try relocs.append(gpa, base_off, .x86_64_abs64, t.key, t.off);
+                    try relocs.append(gpa, base_off, emit.abs64Kind(), b.key, t.off + b.addend);
+                } else try relocs.append(gpa, base_off, emit.abs64Kind(), t.key, t.off);
             }
         },
         .slice => |s| {

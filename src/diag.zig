@@ -1795,7 +1795,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "@ptrCast discards const qualifier", .@"bad-cast" },
     .{ "{s} changes pointer address space", .@"bad-cast" },
     .{ "invalid address space cast", .@"bad-cast" },
-    .{ "pointers with address space '{s}' are not supported on x86", .@"bad-type" },
+    .{ "pointers with address space '{s}' are not supported on {s}", .@"bad-type" },
     .{ "cannot @bitCast to '{f}'", .@"bad-cast" },
     .{ "cannot @bitCast from '{f}'", .@"bad-cast" },
     .{ "bit-pointer cannot refer to value of type '{f}'", .@"bad-cast" },

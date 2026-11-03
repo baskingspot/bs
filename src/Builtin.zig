@@ -1,13 +1,18 @@
 //! The generated `builtin` module: `@import("builtin")`.
 //!
-//! The text follows upstream Zig 0.17.1's `src/Builtin.zig` output for bs's
-//! one Linux configuration: x86_64-linux-none, Debug or ReleaseSafe, the
-//! self-hosted x86_64 backend, static linking.
+//! The text follows upstream Zig 0.17.1's `src/Builtin.zig` output for
+//! bs's two targets, Debug or ReleaseSafe: x86_64-linux-none with the
+//! self-hosted x86_64 backend, linked statically unless it links glibc,
+//! and aarch64-macos (CPU `apple_m1`, macOS 15.0 to 27.0, as
+//! `-target aarch64-macos` gives) with LLVM, linked against libSystem.
+//! `zig_backend` is upstream's Debug default for the target, so std takes
+//! the code paths it takes with upstream.
 //! Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const InternPool = @import("InternPool.zig");
 
 pub const OutputMode = enum { Exe, Obj, Lib };
 
@@ -40,6 +45,7 @@ pub const Options = struct {
     link_libcpp: bool = false,
     /// `-mcpu` (`cpu.resolve`).
     cpu: std.Target.Cpu = @import("cpu.zig").baseline,
+    target: InternPool.Target = .x86_64_linux,
 };
 
 /// bs's start code for executables that link glibc, in place of glibc's
@@ -125,6 +131,145 @@ pub fn writeCMain(gpa: Allocator, io: Io, cache_dir: []const u8) ![]u8 {
 }
 
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
+    if (opts.target == .aarch64_macos) return std.fmt.allocPrint(gpa,
+        \\const std = @import("std");
+        \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
+        \\pub const zig_version_string = "0.17.1";
+        \\pub const zig_backend = std.lang.CompilerBackend.stage2_llvm;
+        \\
+        \\pub const output_mode: std.lang.OutputMode = .{s};
+        \\pub const link_mode: std.lang.LinkMode = .dynamic;
+        \\pub const unwind_tables: std.lang.UnwindTables = .{s};
+        \\pub const is_test = {s};
+        \\pub const single_threaded = {s};
+        \\/// Deprecated; to be removed in 0.18.0. Use `target.abi` instead.
+        \\pub const abi: std.Target.Abi = .none;
+        \\/// Deprecated; to be removed in 0.18.0. Use `target.cpu` instead.
+        \\pub const cpu: std.Target.Cpu = .{{
+        \\    .arch = .aarch64,
+        \\    .model = &std.Target.aarch64.cpu.apple_m1,
+        \\    .features = std.Target.aarch64.featureSet(&.{{
+        \\        .aes,
+        \\        .aggressive_fma,
+        \\        .alternate_sextload_cvt_f32_pattern,
+        \\        .altnzcv,
+        \\        .am,
+        \\        .arith_bcc_fusion,
+        \\        .arith_cbz_fusion,
+        \\        .ccdp,
+        \\        .ccidx,
+        \\        .ccpp,
+        \\        .complxnum,
+        \\        .contextidr_el2,
+        \\        .crc,
+        \\        .disable_latency_sched_heuristic,
+        \\        .dit,
+        \\        .dotprod,
+        \\        .el2vmsa,
+        \\        .el3,
+        \\        .flagm,
+        \\        .fp16fml,
+        \\        .fp_armv8,
+        \\        .fptoint,
+        \\        .fullfp16,
+        \\        .fuse_address,
+        \\        .fuse_aes,
+        \\        .fuse_arith_logic,
+        \\        .fuse_crypto_eor,
+        \\        .fuse_csel,
+        \\        .fuse_literals,
+        \\        .jsconv,
+        \\        .lor,
+        \\        .lse,
+        \\        .lse2,
+        \\        .max_interleave_factor_4,
+        \\        .mpam,
+        \\        .neon,
+        \\        .no_zcz_fpr64,
+        \\        .nv,
+        \\        .pan,
+        \\        .pan_rwv,
+        \\        .pauth,
+        \\        .perfmon,
+        \\        .predres,
+        \\        .ras,
+        \\        .rcpc,
+        \\        .rcpc_immo,
+        \\        .rdm,
+        \\        .sb,
+        \\        .sel2,
+        \\        .sha2,
+        \\        .sha3,
+        \\        .specrestrict,
+        \\        .ssbs,
+        \\        .store_pair_suppress,
+        \\        .tlb_rmi,
+        \\        .tracev8_4,
+        \\        .uaops,
+        \\        .v8_1a,
+        \\        .v8_2a,
+        \\        .v8_3a,
+        \\        .v8_4a,
+        \\        .v8a,
+        \\        .vh,
+        \\        .zcm_fpr128,
+        \\        .zcm_gpr64,
+        \\        .zcz_fpr128,
+        \\        .zcz_gpr32,
+        \\        .zcz_gpr64,
+        \\    }}),
+        \\}};
+        \\/// Deprecated; to be removed in 0.18.0. Use `target.os` instead.
+        \\pub const os: std.Target.Os = .{{
+        \\    .tag = .macos,
+        \\    .version_range = .{{ .semver = .{{
+        \\        .min = .{{
+        \\            .major = 15,
+        \\            .minor = 0,
+        \\            .patch = 0,
+        \\        }},
+        \\        .max = .{{
+        \\            .major = 27,
+        \\            .minor = 0,
+        \\            .patch = 0,
+        \\        }},
+        \\    }}}},
+        \\}};
+        \\pub const target: std.Target = .{{
+        \\    .cpu = cpu,
+        \\    .os = os,
+        \\    .abi = abi,
+        \\    .ofmt = object_format,
+        \\    .dynamic_linker = .init("/usr/lib/dyld"),
+        \\}};
+        \\/// Deprecated; to be removed in 0.18.0. Use `target.ofmt` instead.
+        \\pub const object_format: std.Target.ObjectFormat = .macho;
+        \\/// Deprecated, to be removed after 0.18.0
+        \\pub const mode = optimize;
+        \\pub const optimize: std.lang.Optimize = .{s};
+        \\pub const link_libc = true;
+        \\pub const link_libcpp = {s};
+        \\pub const have_error_return_tracing = {s};
+        \\pub const valgrind_support = false;
+        \\pub const sanitize_thread = false;
+        \\pub const fuzz = {s};
+        \\pub const position_independent_code = true;
+        \\pub const position_independent_executable = true;
+        \\pub const strip_debug_info = false;
+        \\pub const code_model: std.lang.CodeModel = .default;
+        \\pub const omit_frame_pointer = false;
+        \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
+        \\
+    , .{
+        @tagName(opts.output_mode),
+        @tagName(opts.unwind_tables),
+        if (opts.is_test) "true" else "false",
+        if (opts.single_threaded) "true" else "false",
+        @tagName(opts.optimize),
+        if (opts.link_libcpp) "true" else "false",
+        if (opts.error_tracing) "true" else "false",
+        if (opts.fuzz) "true" else "false",
+    });
     const libc = opts.glibc != null;
     // Objects and static libraries with -lc stay static and take no start
     // code, as upstream's (`--show-builtin`).

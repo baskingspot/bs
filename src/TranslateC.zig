@@ -145,6 +145,8 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         const libc = opts.link_libc;
         opts.link_libc = true;
         main.checkTarget(&opts, arena, target);
+        if (opts.bs_target != .x86_64_linux)
+            main.setUnsupported(&opts, arena, "bs translates C only for x86_64-linux so far ('{s}'); pass -target x86_64-linux", .{target});
         opts.link_libc = libc;
         if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena, io);
     }
