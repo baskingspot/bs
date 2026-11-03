@@ -155,10 +155,16 @@ pub fn main(init: std.process.Init) !void {
         else => {},
     };
     exitOnErrors(init, &zcu);
-    const linked = try emit.finish(init.io, Io.Dir.cwd(), out_path orelse return);
+    const bin_path = out_path orelse return;
+    const ready = try emit.finish();
     exitOnErrors(init, &zcu);
+    if (!ready) std.process.exit(1);
+    // The cache records the build while it links, and keeps the record
+    // only if the link succeeds.
+    if (inc) |*i| i.startRecord(&fe, &zcu, &emit);
+    const linked = try emit.link(init.io, Io.Dir.cwd(), bin_path);
+    if (inc) |*i| try i.finishRecord(linked);
     if (!linked) std.process.exit(1);
-    if (inc) |*i| try i.record(&fe, &zcu, &emit);
     if (run_test) try runTest(init, out_path.?);
 }
 

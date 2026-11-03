@@ -54,6 +54,8 @@ opened: Io.Timestamp,
 /// Hits in old packs, written again by the next `commit`.
 forward: std.ArrayList(Forward) = .empty,
 forward_mutex: Io.Mutex = .init,
+/// The id of the pack the next `commit` writes, if `reserveName` chose it.
+next_id: ?Hash = null,
 
 pub const Key = Hash;
 
@@ -161,6 +163,21 @@ pub const PackName = [32 + pack_ext.len]u8;
 /// The file name of pack `i` in `dir`.
 pub fn packName(store: *const Store, i: u32) []const u8 {
     return &store.packs[i].name;
+}
+
+/// Chooses the name of the pack the next `commit` writes, if it writes one,
+/// so that a manifest can name it before the commit finishes.
+pub fn reserveName(store: *Store, io: Io) PackName {
+    var id: Hash = undefined;
+    io.random(std.mem.asBytes(&id));
+    store.next_id = id;
+    return nameOf(id);
+}
+
+fn nameOf(id: Hash) PackName {
+    var name: PackName = undefined;
+    _ = std.fmt.bufPrint(&name, "{x:0>32}" ++ pack_ext, .{id}) catch unreachable;
+    return name;
 }
 
 /// Maps every pack in `<global_cache>/zap/store`.
@@ -372,8 +389,6 @@ pub const Batch = struct {
     /// Offsets are relative to `bytes`.
     index: std.ArrayList(IndexEntry) = .empty,
 
-    const IndexEntry = struct { key: Key, loc: Loc };
-
     pub fn deinit(b: *Batch, gpa: Allocator) void {
         b.bytes.deinit(gpa);
         b.index.deinit(gpa);
@@ -384,32 +399,8 @@ pub const Batch = struct {
     /// the bytes of the batches before it; the entry's atom records start
     /// `atomsOffset(deps.len)` into it, one after another.
     pub fn put(b: *Batch, gpa: Allocator, key: Key, contents: Contents) Allocator.Error!usize {
-        var atoms_len: usize = 0;
-        var cursor: atoms_codec.DebugCursor = .{ .debug = contents.debug };
-        for (contents.atoms, 0..) |*a, i| atoms_len += atoms_codec.encodedLen(a, cursor.of(i));
-        const header: Header = .{
-            .deps_len = @intCast(contents.deps.len),
-            .atoms_len = @intCast(contents.atoms.len),
-            .atoms_bytes = atoms_len,
-            .payload_len = contents.payload.len,
-            .src_hash = contents.src_hash,
-            .result_hash = contents.result_hash,
-        };
-        const len = @sizeOf(Header) + @sizeOf(Dep) * contents.deps.len + atoms_len + contents.payload.len;
         const start = b.bytes.items.len;
-        const out = try b.reserve(gpa, key, len);
-        @memcpy(out[0..@sizeOf(Header)], std.mem.asBytes(&header));
-        var off: usize = @sizeOf(Header);
-        @memcpy(out[off..][0 .. @sizeOf(Dep) * contents.deps.len], @as([]const u8, @ptrCast(contents.deps)));
-        off += @sizeOf(Dep) * contents.deps.len;
-        cursor = .{ .debug = contents.debug };
-        for (contents.atoms, 0..) |*a, i| {
-            const d = cursor.of(i);
-            const n = atoms_codec.encodedLen(a, d);
-            atoms_codec.encode(a, d, out[off..][0..n]);
-            off += n;
-        }
-        @memcpy(out[off..], contents.payload);
+        encodeEntry(contents, try b.reserve(gpa, key, entryLen(contents)));
         return start;
     }
 
@@ -418,6 +409,13 @@ pub const Batch = struct {
     }
 
     /// Appends room for an entry of `len` bytes and indexes it.
+    /// Makes room for `n` entries of `bytes` bytes in all, padding
+    /// included, so that `put` neither grows nor copies the batch.
+    pub fn ensureUnusedCapacity(b: *Batch, gpa: Allocator, n: usize, bytes: usize) Allocator.Error!void {
+        try b.index.ensureUnusedCapacity(gpa, n);
+        try b.bytes.ensureUnusedCapacity(gpa, bytes);
+    }
+
     fn reserve(b: *Batch, gpa: Allocator, key: Key, len: usize) Allocator.Error![]u8 {
         const start = b.bytes.items.len;
         const padded = std.mem.alignForward(usize, len, 16);
@@ -433,6 +431,112 @@ pub const Batch = struct {
         b.index.clearRetainingCapacity();
     }
 };
+
+/// The length of the entry of `contents`, before padding to 16 bytes.
+pub fn entryLen(contents: Contents) usize {
+    var len = @sizeOf(Header) + @sizeOf(Dep) * contents.deps.len + contents.payload.len;
+    var cursor: atoms_codec.DebugCursor = .{ .debug = contents.debug };
+    for (contents.atoms, 0..) |*a, i| len += atoms_codec.encodedLen(a, cursor.of(i));
+    return len;
+}
+
+/// Writes the entry of `contents` to `out`, which is `entryLen(contents)`
+/// bytes. Its atom records start `atomsOffset(deps.len)` into it, one after
+/// another.
+pub fn encodeEntry(contents: Contents, out: []u8) void {
+    const atoms_len = out.len - @sizeOf(Header) - @sizeOf(Dep) * contents.deps.len - contents.payload.len;
+    const header: Header = .{
+        .deps_len = @intCast(contents.deps.len),
+        .atoms_len = @intCast(contents.atoms.len),
+        .atoms_bytes = atoms_len,
+        .payload_len = contents.payload.len,
+        .src_hash = contents.src_hash,
+        .result_hash = contents.result_hash,
+    };
+    @memcpy(out[0..@sizeOf(Header)], std.mem.asBytes(&header));
+    var off: usize = @sizeOf(Header);
+    @memcpy(out[off..][0 .. @sizeOf(Dep) * contents.deps.len], @as([]const u8, @ptrCast(contents.deps)));
+    off += @sizeOf(Dep) * contents.deps.len;
+    var cursor: atoms_codec.DebugCursor = .{ .debug = contents.debug };
+    for (contents.atoms, 0..) |*a, i| {
+        const d = cursor.of(i);
+        const n = atoms_codec.encodedLen(a, d);
+        atoms_codec.encode(a, d, out[off..][0..n]);
+        off += n;
+    }
+    @memcpy(out[off..], contents.payload);
+}
+
+/// Where an entry is in a pack: its key, and offset and length.
+pub const IndexEntry = struct {
+    key: Key,
+    loc: Loc,
+
+    pub fn init(key: Key, offset: u64, len: usize) IndexEntry {
+        std.debug.assert(offset % 16 == 0);
+        return .{ .key = key, .loc = .{ .offset16 = @intCast(offset / 16), .len = @intCast(len) } };
+    }
+};
+
+/// A pack whose entries the caller writes in place, from several threads
+/// if it likes (`beginPack`, `writeAt`, `commitPack`), so that a build's
+/// entries are never all in memory: the caller lays them out from
+/// `pack_header_len`, each 16-byte aligned, with `entryLen` and
+/// `encodeEntry`.
+pub const PackWriter = struct {
+    af: Io.File.Atomic,
+    id: Hash,
+    /// `af` refers to it, so a `PackWriter` must not move.
+    name: PackName,
+
+    pub fn writeAt(w: *PackWriter, io: Io, bytes: []const u8, offset: u64) !void {
+        try w.af.file.writePositionalAll(io, bytes, offset);
+    }
+
+    /// Discards the pack, unless `commitPack` placed it.
+    pub fn deinit(w: *PackWriter, io: Io) void {
+        w.af.deinit(io);
+    }
+};
+
+/// Starts a pack in `w`, in `keep` if given (see `commit`), named as
+/// `reserveName` chose if it did.
+pub fn beginPack(store: *Store, io: Io, keep: ?Io.Dir, w: *PackWriter) !void {
+    if (store.next_id) |i| w.id = i else io.random(std.mem.asBytes(&w.id));
+    store.next_id = null;
+    w.name = nameOf(w.id);
+    w.af = try (keep orelse store.dir).createFileAtomic(io, &w.name, .{});
+}
+
+/// Finishes a pack from `beginPack`, whose entries are at `entries` and end
+/// at `end`: adds the entries `get` found in old packs, writes the index
+/// and header, places the pack as `commit` does, and merges or trims packs
+/// if due. Returns the pack's file name.
+pub fn commitPack(store: *Store, gpa: Allocator, io: Io, w: *PackWriter, entries: []const IndexEntry, end: u64, keep: ?Io.Dir) !PackName {
+    var all: std.ArrayList(IndexEntry) = try .initCapacity(gpa, entries.len + store.forward.items.len);
+    defer all.deinit(gpa);
+    all.appendSliceAssumeCapacity(entries);
+    var off = end;
+    for (store.forward.items) |f| {
+        try w.writeAt(io, f.bytes, off);
+        all.appendAssumeCapacity(.init(f.key, off, f.bytes.len));
+        off += std.mem.alignForward(u64, f.bytes.len, 16);
+    }
+    store.forward.clearRetainingCapacity();
+    const now: i64 = @intCast(store.opened.toNanoseconds());
+    const name = try finishPack(gpa, io, w, all.items, off, now, now);
+    if (keep) |k| try placeInStore(io, k, store.dir, &name);
+    store.refreshUsed(io);
+    try maintainIfDue(gpa, io, store.dir, store.packs.len + 1);
+    return name;
+}
+
+fn placeInStore(io: Io, keep: Io.Dir, store_dir: Io.Dir, name: []const u8) !void {
+    keep.hardLink(name, store_dir, name, io, .{}) catch |err| switch (err) {
+        error.CrossDevice, error.OperationUnsupported => try keep.copyFile(name, store_dir, name, io, .{}),
+        else => |e| return e,
+    };
+}
 
 /// Writes the entries of `batches`, and the entries `get` found in old
 /// packs, as one new pack, then merges or trims packs if due. Empties the
@@ -469,39 +573,48 @@ pub fn write(store: *Store, gpa: Allocator, io: Io, batches: []Batch, keep: ?Io.
     }
     if (n_parts == 0) return null;
     const now: i64 = @intCast(store.opened.toNanoseconds());
-    const k = keep orelse return try writePack(gpa, io, store.dir, parts[0..n_parts], now, now);
-    const name = try writePack(gpa, io, k, parts[0..n_parts], now, now);
-    k.hardLink(&name, store.dir, &name, io, .{}) catch |err| switch (err) {
-        error.CrossDevice, error.OperationUnsupported => try k.copyFile(&name, store.dir, &name, io, .{}),
-        else => |e| return e,
-    };
+    const id = store.next_id;
+    store.next_id = null;
+    const k = keep orelse return try writePack(gpa, io, store.dir, parts[0..n_parts], now, now, id);
+    const name = try writePack(gpa, io, k, parts[0..n_parts], now, now, id);
+    try placeInStore(io, k, store.dir, &name);
     return name;
 }
 
-/// Writes the entries of `parts` as a pack, with the index sorted by key
-/// and, of repeated keys, only the first. Returns its name.
-fn writePack(gpa: Allocator, io: Io, dir: Io.Dir, parts: []const *const Batch, created: i64, order: i64) !PackName {
+/// Writes the entries of `parts` as a pack with id `id`, or a random one,
+/// with the index sorted by key and, of repeated keys, only the first.
+/// Returns its name.
+fn writePack(gpa: Allocator, io: Io, dir: Io.Dir, parts: []const *const Batch, created: i64, order: i64, id: ?Hash) !PackName {
     var count: usize = 0;
-    var entries_len: usize = 0;
-    for (parts) |p| {
-        count += p.index.items.len;
-        entries_len += p.bytes.items.len;
-    }
-    const index = try gpa.alloc(Batch.IndexEntry, count);
+    for (parts) |p| count += p.index.items.len;
+    const index = try gpa.alloc(IndexEntry, count);
     defer gpa.free(index);
+    var end: u64 = @sizeOf(PackHeader);
     {
         var i: usize = 0;
-        var base: usize = @sizeOf(PackHeader);
         for (parts) |p| {
             for (p.index.items) |e| {
-                index[i] = .{ .key = e.key, .loc = .{ .offset16 = @intCast(base / 16 + e.loc.offset16), .len = e.loc.len } };
+                index[i] = .{ .key = e.key, .loc = .{ .offset16 = @intCast(end / 16 + e.loc.offset16), .len = e.loc.len } };
                 i += 1;
             }
-            base += p.bytes.items.len;
+            end += p.bytes.items.len;
         }
     }
-    std.sort.pdq(Batch.IndexEntry, index, {}, struct {
-        fn lt(_: void, a: Batch.IndexEntry, b: Batch.IndexEntry) bool {
+    var w: PackWriter = undefined;
+    if (id) |i| w.id = i else io.random(std.mem.asBytes(&w.id));
+    w.name = nameOf(w.id);
+    w.af = try dir.createFileAtomic(io, &w.name, .{});
+    defer w.deinit(io);
+    try writeSegments(gpa, io, w.af.file, parts);
+    return finishPack(gpa, io, &w, index, end, created, order);
+}
+
+/// Sorts `index` (absolute offsets; of repeated keys, the earliest entry
+/// stays), writes it at `end` and the header at 0, and links the pack under
+/// its name.
+fn finishPack(gpa: Allocator, io: Io, w: *PackWriter, index: []IndexEntry, end: u64, created: i64, order: i64) !PackName {
+    std.sort.pdq(IndexEntry, index, {}, struct {
+        fn lt(_: void, a: IndexEntry, b: IndexEntry) bool {
             return a.key < b.key or (a.key == b.key and a.loc.offset16 < b.loc.offset16);
         }
     }.lt);
@@ -526,46 +639,28 @@ fn writePack(gpa: Allocator, io: Io, dir: Io.Dir, parts: []const *const Batch, c
         while (b <= top) : (b += 1) fanout[b] = @intCast(i);
     }
     while (b < fanout_len) : (b += 1) fanout[b] = @intCast(n);
-    var header: PackHeader = .{
+    const header: PackHeader = .{
         .count = @intCast(n),
-        .index_off = @sizeOf(PackHeader) + entries_len,
+        .index_off = end,
         .created = created,
         .order = order,
-        .id = undefined,
+        .id = w.id,
     };
-    io.random(std.mem.asBytes(&header.id));
-    var name: [32 + pack_ext.len]u8 = undefined;
-    _ = std.fmt.bufPrint(&name, "{x:0>32}" ++ pack_ext, .{header.id}) catch unreachable;
-    var af = try dir.createFileAtomic(io, &name, .{});
-    defer af.deinit(io);
-    try writeSegments(gpa, io, af.file, std.mem.asBytes(&header), parts, index_bytes);
-    try af.link(io);
-    return name;
+    try w.writeAt(io, index_bytes, end);
+    try w.writeAt(io, std.mem.asBytes(&header), 0);
+    try w.af.link(io);
+    return w.name;
 }
 
-/// Writes `header`, the parts' entries, and `index` to `f`. Large packs are
-/// written from several threads: copying into the page cache is most of
-/// the cost of a first build's commit.
-fn writeSegments(gpa: Allocator, io: Io, f: Io.File, header: []const u8, parts: []const *const Batch, index: []const u8) !void {
-    var total: usize = header.len + index.len;
-    for (parts) |p| total += p.bytes.items.len;
-    const n_threads = @min(16, std.Thread.getCpuCount() catch 1, total / (4 << 20));
-    if (n_threads <= 1) {
-        var vecs: std.ArrayList([]const u8) = try .initCapacity(gpa, parts.len + 2);
-        defer vecs.deinit(gpa);
-        vecs.appendAssumeCapacity(header);
-        for (parts) |p| vecs.appendAssumeCapacity(p.bytes.items);
-        vecs.appendAssumeCapacity(index);
-        var w = f.writerStreaming(io, &.{});
-        w.interface.writeVecAll(vecs.items) catch return w.err.?;
-        return;
-    }
+/// Writes the parts' entries to `f`, from `pack_header_len` on. Large packs
+/// are written from several threads: copying into the page cache is most
+/// of the cost of a first build's commit.
+fn writeSegments(gpa: Allocator, io: Io, f: Io.File, parts: []const *const Batch) !void {
     // Segments of at most 4 MiB, dealt out to the threads in turn.
     const Segment = struct { bytes: []const u8, off: u64 };
     var segments: std.ArrayList(Segment) = .empty;
     defer segments.deinit(gpa);
-    try segments.append(gpa, .{ .bytes = header, .off = 0 });
-    var off: u64 = header.len;
+    var off: u64 = @sizeOf(PackHeader);
     for (parts) |p| {
         var rest: []const u8 = p.bytes.items;
         while (rest.len > 0) {
@@ -575,7 +670,6 @@ fn writeSegments(gpa: Allocator, io: Io, f: Io.File, header: []const u8, parts: 
             rest = rest[len..];
         }
     }
-    try segments.append(gpa, .{ .bytes = index, .off = off });
     const Worker = struct {
         fn run(file: Io.File, io_: Io, segs: []const Segment, first: usize, stride: usize, err: *?Io.File.WritePositionalError) void {
             var i = first;
@@ -587,6 +681,7 @@ fn writeSegments(gpa: Allocator, io: Io, f: Io.File, header: []const u8, parts: 
             }
         }
     };
+    const n_threads = @max(1, @min(16, std.Thread.getCpuCount() catch 1, segments.items.len));
     var errs: [16]?Io.File.WritePositionalError = @splat(null);
     var group: Io.Group = .init;
     for (1..n_threads) |i| group.async(io, Worker.run, .{ f, io, segments.items, i, n_threads, &errs[i] });
@@ -676,7 +771,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
         for (p.keys, 0..) |k, i| try merged.putRaw(gpa, k, p.entryBytes(i));
     }
     // `writePack` keeps the first copy of a key: the newest pack's.
-    const name = try writePack(gpa, io, dir, &.{&merged}, created, merge[0].order);
+    const name = try writePack(gpa, io, dir, &.{&merged}, created, merge[0].order, null);
     // The merged pack was last used when the most recently used of its
     // parts was.
     try dir.setTimestamps(io, &name, .{ .modify_timestamp = .{ .new = mtime } });
@@ -799,4 +894,63 @@ test "entries round-trip through packs, are checked, copied forward, merged, and
     const r = try maintain(gpa, io, store_dir, .{ .trim = true, .now = later });
     try t.expectEqual(max_packs / 2, r.deleted);
     try t.expectEqual(0, try countPacks(io, store_dir));
+}
+
+test "a pack written in place reads back like a committed batch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const t = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const keep = try tmp.dir.createDirPathOpen(io, "c", .{});
+    defer keep.close(io);
+
+    const atoms = [_]Atom{.{ .key = .fromName("f"), .name = "t:f", .section = .text, .bytes = &.{0xc3} }};
+    const contents = [_]Contents{
+        .{ .src_hash = 1, .result_hash = 2, .atoms = &atoms },
+        .{ .src_hash = 3, .result_hash = 4, .deps = &.{.{ .key = 5, .result_hash = 6 }}, .payload = "xyz" },
+    };
+    const keys = [_]Key{ 11, 10 };
+    var name: PackName = undefined;
+    {
+        var store: Store = try .open(gpa, io, tmp.dir);
+        defer store.close(gpa, io);
+        const reserved = store.reserveName(io);
+        var w: PackWriter = undefined;
+        try store.beginPack(io, keep, &w);
+        defer w.deinit(io);
+        var entries: [2]IndexEntry = undefined;
+        var off: u64 = pack_header_len;
+        // Written in reverse order, as threads may.
+        var offsets: [2]u64 = undefined;
+        for (contents, keys, &entries, &offsets) |c, k, *e, *o| {
+            o.* = off;
+            e.* = .init(k, off, entryLen(c));
+            off += std.mem.alignForward(u64, entryLen(c), 16);
+        }
+        var i: usize = contents.len;
+        while (i > 0) {
+            i -= 1;
+            const buf = try gpa.alloc(u8, entryLen(contents[i]));
+            defer gpa.free(buf);
+            encodeEntry(contents[i], buf);
+            try w.writeAt(io, buf, offsets[i]);
+        }
+        name = try store.commitPack(gpa, io, &w, &entries, off, keep);
+        try t.expectEqualSlices(u8, &reserved, &name);
+    }
+    // In the store, and kept in `keep`.
+    _ = try keep.statFile(io, &name, .{});
+    var store: Store = try .open(gpa, io, tmp.dir);
+    defer store.close(gpa, io);
+    const e0 = (try store.get(gpa, io, 11)).?;
+    try t.expectEqual(2, e0.resultHash());
+    var decoded: [1]Atom = undefined;
+    var decoded_debug: [1]Atom.Debug = undefined;
+    _ = try e0.decodeAtoms(&decoded, &decoded_debug);
+    try atoms_codec.expectEqualAtoms(atoms[0], decoded[0]);
+    const e1 = (try store.get(gpa, io, 10)).?;
+    try t.expectEqual(4, e1.resultHash());
+    try t.expectEqualStrings("xyz", e1.payload());
+    try t.expectEqual(6, e1.deps()[0].result_hash);
 }

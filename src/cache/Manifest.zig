@@ -1194,6 +1194,14 @@ pub const Builder = struct {
     /// Writes a new base to `dir`, atomically replacing the old one and
     /// leaving its log behind.
     pub fn write(b: *Builder, io: Io, dir: Io.Dir, pack_id: Hash) !void {
+        var af = try b.writeUnplaced(io, dir, pack_id);
+        defer af.deinit(io);
+        try place(&af, io, dir);
+    }
+
+    /// `write` without placing the file: `place` makes it the manifest,
+    /// `deinit` discards it.
+    pub fn writeUnplaced(b: *Builder, io: Io, dir: Io.Dir, pack_id: Hash) !Io.File.Atomic {
         const gpa = b.gpa;
         const nodes = try gpa.dupe(Node, b.nodes.items);
         defer gpa.free(nodes);
@@ -1379,10 +1387,15 @@ pub const Builder = struct {
             header.sections[i].len = parts[i].len / @sizeOf(SectionType(s));
         }
         var af = try dir.createFileAtomic(io, "manifest", .{ .replace = true });
-        defer af.deinit(io);
+        errdefer af.deinit(io);
         var w = af.file.writerStreaming(io, &.{});
         w.interface.writeVecAll(&vecs) catch return w.err.?;
         w.interface.flush() catch return w.err.?;
+        return af;
+    }
+
+    /// Makes a file from `writeUnplaced` the manifest in `dir`.
+    pub fn place(af: *Io.File.Atomic, io: Io, dir: Io.Dir) !void {
         try af.replace(io);
         // The new base's id makes the old log inapplicable; this only tidies.
         dir.deleteFile(io, log_name) catch {};

@@ -55,6 +55,8 @@ grouped: bool = true,
 /// Units and the link's code that already have atoms, while `grouped`.
 units_seen: std.AutoHashMapUnmanaged(Zcu.AnalUnit, void) = .empty,
 link_seen: bool = false,
+/// The error codes `finish` assigned, for `link`.
+error_values: std.ArrayList(Elf.Value) = .empty,
 
 pub const Owner = union(enum) {
     unit: Zcu.AnalUnit,
@@ -81,6 +83,7 @@ pub fn deinit(emit: *Emit) void {
     emit.atom_owners.deinit(gpa);
     emit.content_uses.deinit(gpa);
     emit.units_seen.deinit(gpa);
+    emit.error_values.deinit(gpa);
     emit.arena.deinit();
 }
 
@@ -95,9 +98,11 @@ pub fn function(emit: *Emit, zcu: *Zcu, ir: *const Ir) !void {
     };
 }
 
-/// Lowers the remaining data, then links everything into `sub_path`.
-/// Returns false (after reporting errors to the Zcu) if it could not.
-pub fn finish(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !bool {
+/// Lowers the remaining data and orders the atoms for `link`. Returns
+/// false (after reporting errors to the Zcu) if it could not. Afterwards
+/// the atoms and the Zcu are only read, so the cache can record the build
+/// while it links.
+pub fn finish(emit: *Emit) !bool {
     const zcu = emit.zcu;
     const ip = &zcu.ip;
     // Before the declarations: a slot can request an exported one.
@@ -120,24 +125,28 @@ pub fn finish(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !b
     }
     if (emit.failed) return false;
     emit.entry = entry;
-    const entry_key = entry orelse {
+    if (entry == null) {
         try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap requires the root file to export '_start' (std.start is not supported yet)", .{});
         return false;
-    };
+    }
 
     if (!emit.grouped) try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
 
     // Error codes: the order names were first interned, starting at 1.
-    var values: std.ArrayList(Elf.Value) = .empty;
-    defer values.deinit(emit.gpa);
     for (emit.errors.keys()) |name| {
-        try values.append(emit.gpa, .{ .key = errorKey(ip, name), .value = try ip.errorValue(name) });
+        try emit.error_values.append(emit.gpa, .{ .key = errorKey(ip, name), .value = try ip.errorValue(name) });
     }
+    return true;
+}
+
+/// Links the atoms `finish` prepared into `sub_path`. Returns false, after
+/// printing the error, if the link failed.
+pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !bool {
     var diag: Elf.Diagnostic = .{};
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
-    Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = entry_key, .values = values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd }) catch |err| {
+    Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry.?, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd }) catch |err| {
         std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
         return false;
     };

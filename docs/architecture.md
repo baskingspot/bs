@@ -681,7 +681,12 @@ compilation (see "Integration" below).
   `commit` writes all of a build's batches as one pack: a 64-byte header,
   the entries (`Header`, `[]Dep{key, result_hash}`, atom records, payload),
   then the keys sorted, their locations, and a 257-entry fan-out table on
-  the keys' top byte. Large packs are written from several threads; the
+  the keys' top byte. Large packs are written from several threads. A
+  caller that lays out its entries itself writes them in place instead
+  (`beginPack`, `PackWriter.writeAt`, `commitPack`, with `entryLen` and
+  `encodeEntry`), so that a build's entries are never in memory at once:
+  `record` does, since a batch holding every Atom again cost 350–400 MB at
+  peak on a 282 MB binary. The
   file is placed with O_TMPFILE and link under a random name, so concurrent
   writers never collide. `open` maps every pack; `get` searches them in
   decreasing `order` (when their newest entry was written) without a
@@ -828,7 +833,10 @@ it and can flush every CPU's TLB.
   zap (0.4–0.6 of it the stats), 2 ms wall, against 14–19 ms for a full build.
   The generated 24.5k-atom program below relinks in 5.2–7.6 ms (5.3 ms
   steady), against 7.4–9.5 (7.9 steady) when it decoded first.
-- **Recording** (`record`, after a successful link): Emit tags each atom
+- **Recording** (`startRecord` once Emit has its atoms, alongside the
+  link; `finishRecord` places the manifest only if the link succeeded, so
+  a failed link leaves the last successful build's; the store pack it
+  wrote stays, its entries being valid results either way): Emit tags each atom
   with its owner (a unit, a content-addressed constant, or the link's own
   code) and each unit's uses of constants. The manifest gets one node per
   unit and per dependee kind (`nav_ty`, `func_body`, `func_ies`,
@@ -841,6 +849,12 @@ it and can flush every CPU's TLB.
   in the store with the same result hash is referenced where it is,
   otherwise it goes into the build's new store pack. Nodes are written in
   the order of their first Atom, each with its Atoms grouped.
+  Keys and hashes of the distinct units and dependees are computed on
+  every core first (they only read the Zcu), then nodes are made in order;
+  store lookups run on every core, the misses are laid out in node order,
+  and their entries are encoded straight into the new pack on other
+  threads while this one fills and writes the manifest, which names the
+  pack before it exists (`Store.reserveName`).
 - **Link order**: the linker lays out atoms in chunks of input positions,
   so its output depends on the input order and on duplicates, not just on
   the set of atoms. A fresh build therefore links exactly the list the
@@ -852,8 +866,16 @@ it and can flush every CPU's TLB.
   alignments; the test in `src/Emit.zig` mixes alignments, duplicate
   constants, and a unit whose atoms are split.
 - **Cost of recording**: on a generated std-free program of 20k functions
-  and 5k globals (24.5k atoms, 68.6k nodes, 196k edges; 0.9 s to build),
-  `record` takes 118–122 ms: the graph 45–49, store puts 20–21, commit
+  and 5k globals (24.5k atoms, 68.6k nodes, 196k edges; 0.7 s to build),
+  the build waits 65–80 ms for `record` after the link (wall 665–720 ms,
+  against 725–777 ms and 109–129 ms of `record` when it ran after the link
+  on one thread). The link is only ~10 ms of that overlap; the rest is
+  `record` using the other cores: the graph 39–47 (collecting items
+  11–15, keys and hashes on every core 9–13), lookups 2, then the manifest
+  30–37 while the store writes. On x86_64/binary.zig (128.7k atoms, 256k
+  nodes, a 282 MB binary) the wait after the link is 230–420 ms against
+  1.09–1.26 s, and peak RSS 975–980 MB against 1.33 GB (837 MB without the
+  cache). Before, on one thread: the graph 45–49, store puts 20–21, commit
   20–22, manifest 30–33 (nodes and symbols 16–17, write 14–17). Numbering
   the symbols is 4–6 ms of the manifest's share (the nodes loop takes
   13 ms without it). The graph took 116–125 ms before each unit's and

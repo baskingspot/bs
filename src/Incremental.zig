@@ -55,6 +55,8 @@ timing: bool,
 /// `ZAP_CACHE_CHECK`: check that the last manifest's reverse edges predict
 /// every result this build changed.
 check: bool = false,
+/// The recording `startRecord` runs while the build links.
+recording: ?Io.Future(anyerror!Recorded) = null,
 
 /// Opens and locks the directory of the compilation that `args` (the
 /// command line after `zap`) describes, run from the current directory.
@@ -100,6 +102,10 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
 }
 
 pub fn close(inc: *Incremental) void {
+    if (inc.recording) |*f| {
+        var r = f.cancel(inc.io) catch null;
+        if (r) |*rec| rec.discard(inc);
+    }
     if (inc.prev) |*m| m.close(inc.gpa, inc.io);
     inc.global.close(inc.io);
     inc.lock.close(inc.io);
@@ -272,12 +278,19 @@ const Recorder = struct {
     zcu: *Zcu,
     nodes: std.ArrayList(Node) = .empty,
     map: std.HashMapUnmanaged(Hash, u32, HashContext, std.hash_map.default_max_load_percentage) = .empty,
-    /// Each unit's and dependee's node, so that rendering and hashing its
-    /// key happens once, not once per edge.
+    /// Each distinct unit and dependee, by index into `unit_list` and
+    /// `dependee_list`, whose `Info` (key and hashes) `prepare` computes
+    /// on every core before `unitNode` and `dependeeNode` make nodes of
+    /// them. Dependees that are units (`nav_val`, `type_layout`) are only
+    /// in `units`.
     units: std.HashMapUnmanaged(Zcu.AnalUnit, u32, UnitContext, std.hash_map.default_max_load_percentage) = .empty,
     dependees: std.HashMapUnmanaged(Zcu.Dependee, u32, DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
-    key_buf: std.Io.Writer.Allocating,
-    unit_buf: std.Io.Writer.Allocating,
+    unit_list: std.ArrayList(Zcu.AnalUnit) = .empty,
+    dependee_list: std.ArrayList(Zcu.Dependee) = .empty,
+    /// The unit item that produces each dependee, or `no_node`.
+    dependee_producer: std.ArrayList(u32) = .empty,
+    unit_info: []Info = &.{},
+    dependee_info: []Info = &.{},
     /// (node, dependency) and (node, atom index) pairs, grouped into the
     /// nodes' `deps` and `atoms` by `group`: one array each instead of two
     /// small lists per node.
@@ -285,16 +298,32 @@ const Recorder = struct {
     atom_pairs: std.ArrayList([2]u32) = .empty,
     storage: []u32 = &.{},
 
+    const no_node = std.math.maxInt(u32);
+
+    const Ref = union(enum) { unit: u32, dependee: u32 };
+
+    /// What a unit's or dependee's node gets, and the node once made.
+    const Info = struct {
+        key: Hash = 0,
+        src_hash: Hash = 0,
+        result_hash: Hash = 0,
+        node: u32 = no_node,
+    };
+
     fn deinit(r: *Recorder) void {
-        r.edges.deinit(r.gpa);
-        r.atom_pairs.deinit(r.gpa);
-        r.gpa.free(r.storage);
-        r.nodes.deinit(r.gpa);
-        r.map.deinit(r.gpa);
-        r.units.deinit(r.gpa);
-        r.dependees.deinit(r.gpa);
-        r.key_buf.deinit();
-        r.unit_buf.deinit();
+        const gpa = r.gpa;
+        r.edges.deinit(gpa);
+        r.atom_pairs.deinit(gpa);
+        gpa.free(r.storage);
+        r.nodes.deinit(gpa);
+        r.map.deinit(gpa);
+        r.units.deinit(gpa);
+        r.dependees.deinit(gpa);
+        r.unit_list.deinit(gpa);
+        r.dependee_list.deinit(gpa);
+        r.dependee_producer.deinit(gpa);
+        gpa.free(r.unit_info);
+        gpa.free(r.dependee_info);
     }
 
     fn node(r: *Recorder, key: Hash, tag: Tag) !struct { u32, bool } {
@@ -305,23 +334,109 @@ const Recorder = struct {
         return .{ gop.value_ptr.*, true };
     }
 
-    /// A key for `parts`, distinct per `tag`.
-    fn keyOf(r: *Recorder, tag: Tag, parts: []const []const u8) !Hash {
-        r.key_buf.clearRetainingCapacity();
-        const w = &r.key_buf.writer;
-        try w.writeByte(@backingInt(tag));
-        for (parts) |p| {
-            try w.writeAll(p);
-            try w.writeByte(0);
+    /// The unit's index in `unit_list`.
+    fn addUnit(r: *Recorder, unit: Zcu.AnalUnit) !u32 {
+        const gop = try r.units.getOrPut(r.gpa, unit);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(r.unit_list.items.len);
+            try r.unit_list.append(r.gpa, unit);
         }
-        return cache.hash(2, r.key_buf.written());
+        return gop.value_ptr.*;
     }
 
-    /// Valid until the next call.
-    fn unitKeyString(r: *Recorder, unit: Zcu.AnalUnit) ![]const u8 {
-        r.unit_buf.clearRetainingCapacity();
-        try r.zcu.unitKey(unit, &r.unit_buf.writer);
-        return r.unit_buf.written();
+    /// A `Ref` to the dependee: a unit, or its index in `dependee_list`.
+    fn addDependee(r: *Recorder, d: Zcu.Dependee) !Ref {
+        const producer: u32 = switch (d) {
+            .nav_val => |nav| return .{ .unit = try r.addUnit(.{ .nav_val = nav }) },
+            .type_layout => |ty| return .{ .unit = try r.addUnit(.{ .type_layout = ty }) },
+            // With an edge to the unit that produces them.
+            .nav_ty => |nav| try r.addUnit(.{ .nav_val = nav }),
+            .func_ies => |func| try r.addUnit(.{ .func = func }),
+            .func_body, .namespace_name, .namespace => no_node,
+        };
+        const gop = try r.dependees.getOrPut(r.gpa, d);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(r.dependee_list.items.len);
+            try r.dependee_list.append(r.gpa, d);
+            try r.dependee_producer.append(r.gpa, producer);
+        }
+        return .{ .dependee = gop.value_ptr.* };
+    }
+
+    /// Computes every listed unit's and dependee's `Info`, on every core:
+    /// rendering and hashing keys and reading source and result hashes is
+    /// most of recording the graph, and only reads the Zcu.
+    fn prepare(r: *Recorder, io: Io) !void {
+        const gpa = r.gpa;
+        r.unit_info = try gpa.alloc(Info, r.unit_list.items.len);
+        @memset(r.unit_info, .{});
+        r.dependee_info = try gpa.alloc(Info, r.dependee_list.items.len);
+        @memset(r.dependee_info, .{});
+        try forChunks(io, r.unit_list.items.len + r.dependee_list.items.len, struct {
+            r: *const Recorder,
+
+            fn run(c: @This(), lo: usize, hi: usize, _: usize) !void {
+                var k: Keyer = .{ .zcu = c.r.zcu, .key_buf = .init(c.r.gpa), .unit_buf = .init(c.r.gpa) };
+                defer k.key_buf.deinit();
+                defer k.unit_buf.deinit();
+                const n_units = c.r.unit_list.items.len;
+                for (lo..hi) |i| {
+                    if (i < n_units)
+                        c.r.unit_info[i] = try k.unitInfo(c.r.unit_list.items[i])
+                    else
+                        c.r.dependee_info[i - n_units] = try k.dependeeInfo(c.r.dependee_list.items[i - n_units]);
+                }
+            }
+        }{ .r = r });
+    }
+
+    /// The node of unit `i` (an index in `unit_list`).
+    fn unitNode(r: *Recorder, i: u32) !u32 {
+        const info = &r.unit_info[i];
+        if (info.node != no_node) return info.node;
+        const index, const new = try r.node(info.key, unitTag(r.unit_list.items[i]));
+        if (new) {
+            r.nodes.items[index].src_hash = info.src_hash;
+            r.nodes.items[index].result_hash = info.result_hash;
+        }
+        info.node = index;
+        return index;
+    }
+
+    /// The node of what a unit read, with an edge to the unit that
+    /// produces it, if any.
+    fn dependeeNode(r: *Recorder, ref: Ref) !u32 {
+        const i = switch (ref) {
+            .unit => |u| return r.unitNode(u),
+            .dependee => |i| i,
+        };
+        const info = &r.dependee_info[i];
+        if (info.node != no_node) return info.node;
+        const tag: Tag = switch (r.dependee_list.items[i]) {
+            .nav_val, .type_layout => unreachable,
+            .nav_ty => .nav_ty,
+            .func_ies => .func_ies,
+            .func_body => .func_body,
+            .namespace_name => .namespace_name,
+            .namespace => .namespace,
+        };
+        const index, const new = try r.node(info.key, tag);
+        info.node = index;
+        if (new) {
+            r.nodes.items[index].result_hash = info.result_hash;
+            const producer = r.dependee_producer.items[i];
+            if (producer != no_node) try r.edges.append(r.gpa, .{ index, try r.unitNode(producer) });
+        }
+        return index;
+    }
+
+    fn unitTag(unit: Zcu.AnalUnit) Tag {
+        return switch (unit) {
+            .nav_val => .nav_val,
+            .type_layout => .type_layout,
+            .func => .func,
+            .comptime_decl => .comptime_decl,
+        };
     }
 
     /// Sets each node's `deps` (sorted, without repeats) and `atoms` (in
@@ -373,161 +488,222 @@ const Recorder = struct {
             counts[p[field]] += 1;
         }
     }
+};
 
-    fn srcHash(r: *Recorder, file: u32, inst: std.zig.Zir.Inst.Index) Hash {
-        const h = r.zcu.file(file).zir.getAssociatedSrcHash(inst) orelse return 0;
+/// Renders and hashes keys, and reads source and result hashes, for one
+/// thread of `Recorder.prepare`.
+const Keyer = struct {
+    zcu: *Zcu,
+    key_buf: std.Io.Writer.Allocating,
+    unit_buf: std.Io.Writer.Allocating,
+
+    /// A key for `parts`, distinct per `tag`.
+    fn keyOf(k: *Keyer, tag: Tag, parts: []const []const u8) !Hash {
+        k.key_buf.clearRetainingCapacity();
+        const w = &k.key_buf.writer;
+        try w.writeByte(@backingInt(tag));
+        for (parts) |p| {
+            try w.writeAll(p);
+            try w.writeByte(0);
+        }
+        return cache.hash(2, k.key_buf.written());
+    }
+
+    /// Valid until the next call.
+    fn unitKeyString(k: *Keyer, unit: Zcu.AnalUnit) ![]const u8 {
+        k.unit_buf.clearRetainingCapacity();
+        try k.zcu.unitKey(unit, &k.unit_buf.writer);
+        return k.unit_buf.written();
+    }
+
+    fn srcHash(k: *Keyer, file: u32, inst: std.zig.Zir.Inst.Index) Hash {
+        const h = k.zcu.file(file).zir.getAssociatedSrcHash(inst) orelse return 0;
         return @bitCast(h);
     }
 
-    fn unitNode(r: *Recorder, unit: Zcu.AnalUnit) !u32 {
-        const gop = try r.units.getOrPut(r.gpa, unit);
-        if (!gop.found_existing) {
-            errdefer _ = r.units.remove(unit);
-            gop.value_ptr.* = try r.newUnitNode(unit);
-        }
-        return gop.value_ptr.*;
-    }
-
-    fn newUnitNode(r: *Recorder, unit: Zcu.AnalUnit) !u32 {
-        const ip = &r.zcu.ip;
-        const tag: Tag = switch (unit) {
-            .nav_val => .nav_val,
-            .type_layout => .type_layout,
-            .func => .func,
-            .comptime_decl => .comptime_decl,
-        };
-        const index, const new = try r.node(try r.keyOf(tag, &.{try r.unitKeyString(unit)}), tag);
-        if (!new) return index;
-        const n = &r.nodes.items[index];
+    fn unitInfo(k: *Keyer, unit: Zcu.AnalUnit) !Recorder.Info {
+        const ip = &k.zcu.ip;
+        var info: Recorder.Info = .{ .key = try k.keyOf(Recorder.unitTag(unit), &.{try k.unitKeyString(unit)}) };
         switch (unit) {
             .nav_val => |nav_index| {
                 const nav = ip.getNav(nav_index);
-                n.src_hash = r.srcHash(nav.file, nav.zir_inst);
-                if (nav.status == .resolved) n.result_hash = ip.stableHash(nav.val);
+                info.src_hash = k.srcHash(nav.file, nav.zir_inst);
+                if (nav.status == .resolved) info.result_hash = ip.stableHash(nav.val);
             },
             .type_layout => |ty| {
                 const c = ip.containerType(ty).?;
-                n.src_hash = r.srcHash(c.file, c.zir_inst);
+                info.src_hash = k.srcHash(c.file, c.zir_inst);
                 // The type's identity; its layout is not hashed yet.
-                n.result_hash = ip.stableHash(ty);
+                info.result_hash = ip.stableHash(ty);
             },
             .func => |func| {
                 const owner = ip.getNav(ip.indexToKey(func).func.owner_nav);
-                n.src_hash = r.srcHash(owner.file, owner.zir_inst);
+                info.src_hash = k.srcHash(owner.file, owner.zir_inst);
                 // The result is the function's atom, hashed in `record`.
             },
-            .comptime_decl => |c| n.src_hash = r.srcHash(c.file, c.inst),
+            .comptime_decl => |c| info.src_hash = k.srcHash(c.file, c.inst),
         }
-        return index;
+        return info;
     }
 
-    /// The node of what a unit read, with an edge to the unit that
-    /// produces it, if any.
-    fn dependeeNode(r: *Recorder, d: Zcu.Dependee) !u32 {
-        if (r.dependees.get(d)) |index| return index;
-        const index = try r.newDependeeNode(d);
-        try r.dependees.put(r.gpa, d, index);
-        return index;
-    }
-
-    fn newDependeeNode(r: *Recorder, d: Zcu.Dependee) !u32 {
-        const ip = &r.zcu.ip;
+    fn dependeeInfo(k: *Keyer, d: Zcu.Dependee) !Recorder.Info {
+        const ip = &k.zcu.ip;
         switch (d) {
-            .nav_val => |nav| return r.unitNode(.{ .nav_val = nav }),
-            .type_layout => |ty| return r.unitNode(.{ .type_layout = ty }),
+            .nav_val, .type_layout => unreachable, // Units.
             .nav_ty => |nav_index| {
                 const nav = ip.getNav(nav_index);
-                const index, const new = try r.node(try r.keyOf(.nav_ty, &.{ip.stringSlice(nav.key)}), .nav_ty);
-                if (new) {
-                    if (nav.status == .resolved) r.nodes.items[index].result_hash = ip.stableHash(ip.typeOf(nav.val));
-                    const producer = try r.unitNode(.{ .nav_val = nav_index });
-                    try r.edges.append(r.gpa, .{ index, producer });
-                }
-                return index;
+                return .{
+                    .key = try k.keyOf(.nav_ty, &.{ip.stringSlice(nav.key)}),
+                    .result_hash = if (nav.status == .resolved) ip.stableHash(ip.typeOf(nav.val)) else 0,
+                };
             },
             .func_body => |func| {
-                const index, const new = try r.node(try r.keyOf(.func_body, &.{try r.unitKeyString(.{ .func = func })}), .func_body);
-                if (new) {
-                    const owner = ip.getNav(ip.indexToKey(func).func.owner_nav);
-                    r.nodes.items[index].result_hash = r.srcHash(owner.file, owner.zir_inst);
-                }
-                return index;
+                const owner = ip.getNav(ip.indexToKey(func).func.owner_nav);
+                return .{
+                    .key = try k.keyOf(.func_body, &.{try k.unitKeyString(.{ .func = func })}),
+                    .result_hash = k.srcHash(owner.file, owner.zir_inst),
+                };
             },
             .func_ies => |func| {
-                const index, const new = try r.node(try r.keyOf(.func_ies, &.{try r.unitKeyString(.{ .func = func })}), .func_ies);
-                if (new) {
-                    var h: Hash = 0;
-                    if (r.zcu.inferred_errors.get(func)) |names| {
-                        // Order-independent: the set, not the discovery order.
-                        for (names) |name| h +%= cache.hash(3, ip.stringSlice(name));
-                    }
-                    r.nodes.items[index].result_hash = h;
-                    const producer = try r.unitNode(.{ .func = func });
-                    try r.edges.append(r.gpa, .{ index, producer });
+                var h: Hash = 0;
+                if (k.zcu.inferred_errors.get(func)) |names| {
+                    // Order-independent: the set, not the discovery order.
+                    for (names) |name| h +%= cache.hash(3, ip.stringSlice(name));
                 }
-                return index;
+                return .{ .key = try k.keyOf(.func_ies, &.{try k.unitKeyString(.{ .func = func })}), .result_hash = h };
             },
             .namespace_name => |nn| {
-                const ns = r.zcu.namespacePtr(nn.namespace);
-                const name = ip.stringSlice(nn.name);
-                const index, const new = try r.node(try r.keyOf(.namespace_name, &.{ ns.key, name }), .namespace_name);
-                if (new) {
+                const ns = k.zcu.namespacePtr(nn.namespace);
+                return .{
+                    .key = try k.keyOf(.namespace_name, &.{ ns.key, ip.stringSlice(nn.name) }),
                     // Which declaration the name finds, if any.
-                    r.nodes.items[index].result_hash = if (ns.decls.get(nn.name)) |nav| cache.hash(3, ip.stringSlice(ip.getNav(nav).key)) else 0;
-                }
-                return index;
+                    .result_hash = if (ns.decls.get(nn.name)) |nav| cache.hash(3, ip.stringSlice(ip.getNav(nav).key)) else 0,
+                };
             },
             .namespace => |ns_index| {
-                const ns = r.zcu.namespacePtr(ns_index);
-                const index, const new = try r.node(try r.keyOf(.namespace, &.{ns.key}), .namespace);
-                if (new) {
-                    var h: Hash = 0;
-                    for (ns.decls.keys()) |name| h = cache.hash(@truncate(h), ip.stringSlice(name)) ^ h;
-                    r.nodes.items[index].result_hash = h;
-                }
-                return index;
+                const ns = k.zcu.namespacePtr(ns_index);
+                var h: Hash = 0;
+                for (ns.decls.keys()) |name| h = cache.hash(@truncate(h), ip.stringSlice(name)) ^ h;
+                return .{ .key = try k.keyOf(.namespace, &.{ns.key}), .result_hash = h };
             },
         }
     }
 };
 
-/// Records a successful build. `emit` has linked its atoms.
-pub fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) !void {
+/// Starts recording the build that `emit` is about to link, on another
+/// thread: `record` needs only the atoms and the Zcu, which the link does
+/// not change, so it runs alongside the link. `finishRecord` keeps or
+/// discards it. `fe`, `zcu`, and `emit` must not change until then.
+pub fn startRecord(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) void {
+    std.debug.assert(inc.recording == null);
+    inc.recording = inc.io.async(record, .{ inc, fe, zcu, emit });
+}
+
+/// Waits for the recording `startRecord` started, and if the link
+/// succeeded, makes it the compilation's manifest. A failed link discards
+/// it, so the next build starts from the last successful one. (Its store
+/// entries stay: they are valid results whichever way the link went.)
+pub fn finishRecord(inc: *Incremental, linked: bool) !void {
+    const t0 = now(inc.io);
+    var r = try inc.recording.?.await(inc.io);
+    inc.recording = null;
+    const waited = ms(t0, now(inc.io));
+    if (!linked) return r.discard(inc);
+    defer r.discard(inc);
+    try Manifest.Builder.place(&r.manifest, inc.io, inc.dir);
+    // Base packs the new manifest does not name.
+    var it = inc.dir.iterate();
+    while (try it.next(inc.io)) |e| {
+        if (!std.mem.endsWith(u8, e.name, ".zsp")) continue;
+        for (r.base_names) |name| {
+            if (std.mem.eql(u8, name, e.name)) break;
+        } else inc.dir.deleteFile(inc.io, e.name) catch {};
+    }
+    if (inc.timing) std.debug.print("{s}; after the link, waited {d:.2} ms and placed in {d:.2} ms\n", .{ r.report, waited, ms(t0, now(inc.io)) - waited });
+}
+
+/// A recorded build, its manifest written but not placed.
+const Recorded = struct {
+    manifest: Io.File.Atomic,
+    /// The base packs the manifest names.
+    base_names: []const []const u8,
+    /// For `ZAP_CACHE_TIMING`.
+    report: []const u8,
+
+    fn discard(r: *Recorded, inc: *Incremental) void {
+        r.manifest.deinit(inc.io);
+        for (r.base_names) |n| inc.gpa.free(n);
+        inc.gpa.free(r.base_names);
+        inc.gpa.free(r.report);
+    }
+};
+
+/// Records a successful build into an unplaced manifest; see
+/// `startRecord`.
+fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) anyerror!Recorded {
     const gpa = inc.gpa;
     const io = inc.io;
     const t0 = now(io);
     const ip = &zcu.ip;
-    var r: Recorder = .{ .gpa = gpa, .zcu = zcu, .key_buf = .init(gpa), .unit_buf = .init(gpa) };
+    var r: Recorder = .{ .gpa = gpa, .zcu = zcu };
     defer r.deinit();
     // About one node per atom, unit, and dependee.
     const expected_nodes: u32 = @intCast(emit.atoms.items.len + 2 * zcu.deps.count());
     try r.nodes.ensureTotalCapacity(gpa, expected_nodes);
     try r.map.ensureTotalCapacity(gpa, expected_nodes);
     try r.units.ensureTotalCapacity(gpa, @intCast(zcu.deps.count()));
+    try r.dependees.ensureTotalCapacity(gpa, @intCast(zcu.deps.count()));
     try r.atom_pairs.ensureTotalCapacity(gpa, emit.atoms.items.len);
     var n_edges: usize = emit.content_uses.items.len;
     for (zcu.deps.values()) |dependees| n_edges += dependees.len;
     try r.edges.ensureTotalCapacity(gpa, n_edges + n_edges / 4);
 
+    // Every distinct unit and dependee, as `Recorder` items, keyed on
+    // every core.
+    const atom_units = try gpa.alloc(u32, emit.atoms.items.len);
+    defer gpa.free(atom_units);
+    for (emit.atom_owners.items, atom_units) |owner, *u| u.* = switch (owner) {
+        .unit => |unit| try r.addUnit(unit),
+        .content, .link => Recorder.no_node,
+    };
+    const dep_units = try gpa.alloc(u32, zcu.deps.count());
+    defer gpa.free(dep_units);
+    const dep_refs = try gpa.alloc(Recorder.Ref, n_edges);
+    defer gpa.free(dep_refs);
+    var n_refs: usize = 0;
+    for (zcu.deps.keys(), zcu.deps.values(), dep_units) |unit, dependees, *u| {
+        u.* = try r.addUnit(unit);
+        for (dependees) |d| {
+            dep_refs[n_refs] = try r.addDependee(d);
+            n_refs += 1;
+        }
+    }
+    const use_units = try gpa.alloc(u32, emit.content_uses.items.len);
+    defer gpa.free(use_units);
+    for (emit.content_uses.items, use_units) |use, *u| u.* = try r.addUnit(use.unit);
+    const t_collect = now(io);
+    try r.prepare(io);
+    const t_keys = now(io);
+
     // Nodes in the order of their first atom, so that a relink lays out
     // the output as this build did.
-    const link_key = try r.keyOf(.link, &.{});
-    for (emit.atom_owners.items, emit.atoms.items, 0..) |owner, atom, i| {
+    const link_key = cache.hash(2, &.{@backingInt(Tag.link)});
+    for (emit.atom_owners.items, emit.atoms.items, atom_units, 0..) |owner, atom, u, i| {
         const index = switch (owner) {
-            .unit => |u| try r.unitNode(u),
+            .unit => try r.unitNode(u),
             .content => (try r.node(@backingInt(atom.key), .content))[0],
             .link => (try r.node(link_key, .link))[0],
         };
-        try r.atom_pairs.append(gpa, .{ index, @intCast(i) });
+        r.atom_pairs.appendAssumeCapacity(.{ index, @intCast(i) });
     }
-    for (zcu.deps.keys(), zcu.deps.values()) |unit, dependees| {
-        const index = try r.unitNode(unit);
-        for (dependees) |d| {
-            try r.edges.append(gpa, .{ index, try r.dependeeNode(d) });
-        }
+    n_refs = 0;
+    for (zcu.deps.values(), dep_units) |dependees, u| {
+        const index = try r.unitNode(u);
+        for (dep_refs[n_refs..][0..dependees.len]) |ref| try r.edges.append(gpa, .{ index, try r.dependeeNode(ref) });
+        n_refs += dependees.len;
     }
-    for (emit.content_uses.items) |use| {
-        const index = try r.unitNode(use.unit);
+    for (emit.content_uses.items, use_units) |use, u| {
+        const index = try r.unitNode(u);
         try r.edges.append(gpa, .{ index, r.map.get(@backingInt(use.key)).? });
     }
     try r.group();
@@ -538,98 +714,97 @@ pub fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Em
     defer gpa.free(debug_of);
     @memset(debug_of, null);
     for (emit.debug.items) |*d| debug_of[d.atom] = d;
-    for (r.nodes.items) |*n| {
-        switch (n.tag) {
-            .func, .link, .content => {
-                var h: Hash = 0;
-                var lines: Hash = 0;
-                for (n.atoms) |ai| {
-                    const a = &emit.atoms.items[ai];
-                    h = h *% 31 +% contentsHash(a);
-                    if (debug_of[ai]) |d| {
-                        h +%= cache.hash(@truncate(h), d.lines) +% @backingInt(d.frame);
-                        lines = lines *% 31 +% d.base_line;
+    try forChunks(io, r.nodes.items.len, struct {
+        nodes: []Node,
+        atoms: []const Atom,
+        debug_of: []const ?*const Atom.Debug,
+
+        fn run(c: @This(), lo: usize, hi: usize, _: usize) !void {
+            for (c.nodes[lo..hi]) |*n| switch (n.tag) {
+                .func, .link, .content => {
+                    var h: Hash = 0;
+                    var lines: Hash = 0;
+                    for (n.atoms) |ai| {
+                        h = h *% 31 +% contentsHash(&c.atoms[ai]);
+                        if (c.debug_of[ai]) |d| {
+                            h +%= cache.hash(@truncate(h), d.lines) +% @backingInt(d.frame);
+                            lines = lines *% 31 +% d.base_line;
+                        }
                     }
-                }
-                n.result_hash = h;
-                n.exact_hash = h ^ cache.hash(5, std.mem.asBytes(&lines));
-            },
-            else => n.exact_hash = n.result_hash,
+                    n.result_hash = h;
+                    n.exact_hash = h ^ cache.hash(5, std.mem.asBytes(&lines));
+                },
+                else => n.exact_hash = n.result_hash,
+            };
         }
-    }
+    }{ .nodes = r.nodes.items, .atoms = emit.atoms.items, .debug_of = debug_of });
     const t1 = now(io);
 
     if (inc.check) inc.checkPrediction(r.nodes.items);
 
-    // Store: reuse equal entries, put the rest in one new pack.
+    // Store: find equal entries on every core; the others go into one new
+    // pack, encoded straight into the file on other threads while this one
+    // builds the manifest, so that they are never all in memory.
     var store: Store = try .open(gpa, io, inc.global);
     defer store.close(gpa, io);
-    const Where = struct { pack: u32, entry_offset: u64 };
-    const where = try gpa.alloc(?Where, r.nodes.items.len);
+    var pack: Pack = try .open(io, inc.dir);
+    defer pack.close(gpa, io);
+    const where = try gpa.alloc(Where, r.nodes.items.len);
     defer gpa.free(where);
-    @memset(where, null);
-    // Store pack index -> base pack index + 1.
+    @memset(where, .none);
+    const putter: Putter = .{ .inc = inc, .store = &store, .nodes = r.nodes.items, .emit = emit, .debug_of = debug_of, .where = where };
+    try forChunks(io, r.nodes.items.len, Putter.Lookup{ .p = putter });
+    // Link the store packs of the hits into the compilation's directory;
+    // an entry whose pack cannot be linked is put again. Then lay out the
+    // new pack.
+    var base_names: std.ArrayList([]const u8) = .empty;
+    defer base_names.deinit(gpa);
     const store_bases = try gpa.alloc(u32, store.packs.len);
     defer gpa.free(store_bases);
     @memset(store_bases, 0);
-    var pack: Pack = try .open(io, inc.dir);
-    defer pack.close(gpa, io);
-    var base_names: std.ArrayList([]const u8) = .empty;
-    defer base_names.deinit(gpa);
-    var batch: Store.Batch = .{};
-    defer batch.deinit(gpa);
-    const in_batch: u32 = std.math.maxInt(u32);
-    var store_deps: std.ArrayList(Store.Dep) = .empty;
-    defer store_deps.deinit(gpa);
-    var entry_atoms: std.ArrayList(Atom) = .empty;
-    defer entry_atoms.deinit(gpa);
-    var entry_debug: std.ArrayList(Atom.Debug) = .empty;
-    defer entry_debug.deinit(gpa);
     var reused: usize = 0;
-    for (r.nodes.items, where) |n, *w| {
-        if (n.atoms.len == 0) continue;
-        const store_key = storeKey(inc.store_seed, n.key, n.src_hash);
-        if (try store.get(gpa, io, store_key)) |e| hit: {
-            if (e.resultHash() != n.exact_hash or e.atomCount() != n.atoms.len or e.deps().len != n.deps.len) break :hit;
-            if (store_bases[e.pack] == 0) {
-                const name = store.packName(e.pack);
-                store_bases[e.pack] = pack.linkBase(gpa, io, store.dir, name, inc.dir) catch break :hit;
-                try base_names.append(gpa, name);
+    var entries: std.ArrayList(Store.IndexEntry) = .empty;
+    defer entries.deinit(gpa);
+    var end: u64 = Store.pack_header_len;
+    for (where, r.nodes.items) |*w, *n| switch (w.*) {
+        .none => {},
+        .hit => |h| {
+            if (store_bases[h.pack] == 0) {
+                const name = store.packName(h.pack);
+                if (pack.linkBase(gpa, io, store.dir, name, inc.dir)) |base| {
+                    store_bases[h.pack] = base;
+                    try base_names.append(gpa, name);
+                } else |_| {
+                    w.* = .{ .put = .{ .len = putter.entryLen(n) } };
+                }
             }
-            w.* = .{ .pack = store_bases[e.pack], .entry_offset = e.offset };
-            reused += 1;
-            continue;
-        }
-        store_deps.clearRetainingCapacity();
-        for (n.deps) |d| try store_deps.append(gpa, .{ .key = r.nodes.items[d].key, .result_hash = r.nodes.items[d].result_hash });
-        entry_atoms.clearRetainingCapacity();
-        entry_debug.clearRetainingCapacity();
-        for (n.atoms, 0..) |ai, j| {
-            try entry_atoms.append(gpa, emit.atoms.items[ai]);
-            if (debug_of[ai]) |d| {
-                var copy = d.*;
-                copy.atom = @intCast(j);
-                try entry_debug.append(gpa, copy);
+            if (w.* == .hit) {
+                w.* = .{ .hit = .{ .pack = store_bases[h.pack], .offset = h.offset } };
+                reused += 1;
             }
-        }
-        const off = try batch.put(gpa, store_key, .{
-            .src_hash = n.src_hash,
-            .result_hash = n.exact_hash,
-            .deps = store_deps.items,
-            .atoms = entry_atoms.items,
-            .debug = entry_debug.items,
-        });
-        w.* = .{ .pack = in_batch, .entry_offset = Store.pack_header_len + off };
+        },
+        .put => {},
+    };
+    for (where, r.nodes.items) |*w, *n| switch (w.*) {
+        .put => |*p| {
+            p.offset = end;
+            try entries.append(gpa, .init(storeKey(inc.store_seed, n.key, n.src_hash), end, p.len));
+            end += std.mem.alignForward(u64, p.len, 16);
+        },
+        .none, .hit => {},
+    };
+    const n_put = entries.items.len;
+    // The new pack is named now, so that the manifest is written while
+    // the store writes it.
+    var new_name: ?Store.PackName = null;
+    if (n_put != 0 or store.forward.items.len != 0) {
+        new_name = store.reserveName(io);
+        try base_names.append(gpa, &new_name.?);
     }
-    const n_put = batch.index.items.len;
+    const new_base: u32 = @intCast(base_names.items.len);
     const t2 = now(io);
-    const new_pack = try store.commit(gpa, io, (&batch)[0..1], inc.dir);
-    var new_base: u32 = 0;
-    if (new_pack) |*name| {
-        new_base = try pack.addBase(gpa, io, inc.dir, name);
-        try base_names.append(gpa, name);
-    }
-    const t3 = now(io);
+    var committing = io.async(Putter.writePack, .{ putter, io, entries.items, end, new_name != null });
+    defer if (committing.cancel(io)) |_| {} else |_| {};
 
     // The manifest.
     var b: Manifest.Builder = .{ .gpa = gpa };
@@ -644,13 +819,17 @@ pub fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Em
     for (r.nodes.items, where) |n, w| {
         refs.clearRetainingCapacity();
         symbols.clearRetainingCapacity();
-        if (w) |loc| {
-            const base_pack = if (loc.pack == in_batch) new_base else loc.pack;
-            var off = loc.entry_offset + Store.atomsOffset(n.deps.len);
+        const loc: ?struct { u32, u64 } = switch (w) {
+            .none => null,
+            .hit => |h| .{ h.pack, h.offset },
+            .put => |p| .{ new_base, p.offset },
+        };
+        if (loc) |l| {
+            var off = l[1] + Store.atomsOffset(n.deps.len);
             for (n.atoms) |ai| {
                 const a = &emit.atoms.items[ai];
                 const len = atoms_codec.encodedLen(a, debug_of[ai]);
-                try refs.append(gpa, .initIn(base_pack, off, @intCast(len)));
+                try refs.append(gpa, .initIn(l[0], off, @intCast(len)));
                 try symbols.append(gpa, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (debug_of[ai]) |d| d.file else null });
                 off += len;
             }
@@ -660,7 +839,7 @@ pub fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Em
     for (base_names.items) |name| _ = try b.addBasePack(name);
     b.entry = @backingInt(emit.entry.?);
     for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
-    const t4 = now(io);
+    const t3 = now(io);
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
     for (fe.files.items) |*f| {
@@ -670,23 +849,168 @@ pub fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Em
         const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch continue;
         try b.addInput(path_buf.items, stat, @bitCast(f.content_hash), inc.build_start);
     }
+    const t4 = now(io);
+    var manifest = try b.writeUnplaced(io, inc.dir, pack.id);
+    errdefer manifest.deinit(io);
     const t5 = now(io);
-    try b.write(io, inc.dir, pack.id);
+    const committed = try committing.await(io);
+    if (new_name) |name| if (!std.mem.eql(u8, &committed.?, &name)) return error.StoreCommitFailed;
     const t6 = now(io);
-    // Base packs the new manifest does not name.
-    var it = inc.dir.iterate();
-    while (try it.next(io)) |e| {
-        if (!std.mem.endsWith(u8, e.name, ".zsp")) continue;
-        for (base_names.items) |name| {
-            if (std.mem.eql(u8, name, e.name)) break;
-        } else inc.dir.deleteFile(io, e.name) catch {};
+
+    const names = try gpa.alloc([]const u8, base_names.items.len);
+    var n_names: usize = 0;
+    errdefer {
+        for (names[0..n_names]) |n| gpa.free(n);
+        gpa.free(names);
     }
-    if (inc.timing) std.debug.print("cache: recorded {d} nodes, {d} atoms, {d} inputs in {d:.2} ms (graph {d:.2}, store: {d} reused, {d} put {d:.2}, commit {d:.2}; manifest {d:.2}: nodes and symbols {d:.2}, inputs {d:.2}, write {d:.2})\n", .{
-        r.nodes.items.len, emit.atoms.items.len, fe.files.items.len, ms(t0, now(io)), ms(t0, t1), reused,
-        n_put,             ms(t1, t2),           ms(t2, t3),         ms(t3, now(io)), ms(t3, t4), ms(t4, t5),
-        ms(t5, t6),
+    for (names, base_names.items) |*out, name| {
+        out.* = try gpa.dupe(u8, name);
+        n_names += 1;
+    }
+    const report = try std.fmt.allocPrint(gpa, "cache: recorded {d} nodes, {d} atoms, {d} inputs in {d:.2} ms alongside the link (graph {d:.2}: items {d:.2}, keys {d:.2}; store lookups {d:.2}: {d} reused, {d} put; manifest {d:.2} while the store writes: nodes and symbols {d:.2}, inputs {d:.2}, write {d:.2}; store's remainder {d:.2})", .{
+        r.nodes.items.len, emit.atoms.items.len, fe.files.items.len,    ms(t0, t6),
+        ms(t0, t1),        ms(t0, t_collect),    ms(t_collect, t_keys), ms(t1, t2),
+        reused,            n_put,                ms(t2, t5),            ms(t2, t3),
+        ms(t3, t4),        ms(t4, t5),           ms(t5, t6),
     });
+    return .{ .manifest = manifest, .base_names = names, .report = report };
 }
+
+/// Where a node's store entry is.
+const Where = union(enum) {
+    none,
+    /// In a store pack, by store pack index until `record` hard-links it,
+    /// then by base pack index.
+    hit: struct { pack: u32, offset: u64 },
+    /// To be written to the new pack, `len` bytes at `offset`.
+    put: struct { len: usize, offset: u64 = 0 },
+};
+
+const max_chunks = 64;
+
+/// Runs `ctx.run(lo, hi, chunk)` over chunks of `0..len` on every core.
+fn forChunks(io: Io, len: usize, ctx: anytype) !void {
+    const n = @min(max_chunks, @max(1, len / 1024), 4 * (std.Thread.getCpuCount() catch 1));
+    const Chunk = struct {
+        err: ?anyerror = null,
+        fn run(c: *@This(), x: @TypeOf(ctx), lo: usize, hi: usize, i: usize) void {
+            x.run(lo, hi, i) catch |e| {
+                c.err = e;
+            };
+        }
+    };
+    var chunks: [max_chunks]Chunk = @splat(.{});
+    var group: Io.Group = .init;
+    for (1..n) |i| group.async(io, Chunk.run, .{ &chunks[i], ctx, i * len / n, (i + 1) * len / n, i });
+    chunks[0].run(ctx, 0, len / n, 0);
+    try group.await(io);
+    for (chunks[0..n]) |c| if (c.err) |e| return e;
+}
+
+/// Looks nodes up in the store (`Lookup`), and writes those it misses as
+/// a new pack (`writePack`).
+const Putter = struct {
+    inc: *const Incremental,
+    store: *Store,
+    nodes: []const Node,
+    emit: *const Emit,
+    debug_of: []const ?*const Atom.Debug,
+    where: []Where,
+
+    /// The length of node `n`'s entry, as `Store.entryLen`.
+    fn entryLen(p: Putter, n: *const Node) usize {
+        var len = Store.atomsOffset(n.deps.len);
+        for (n.atoms) |ai| len += atoms_codec.encodedLen(&p.emit.atoms.items[ai], p.debug_of[ai]);
+        return len;
+    }
+
+    const Lookup = struct {
+        p: Putter,
+
+        fn run(l: Lookup, lo: usize, hi: usize, _: usize) !void {
+            const p = l.p;
+            for (p.nodes[lo..hi], p.where[lo..hi]) |*n, *w| {
+                if (n.atoms.len == 0) continue;
+                if (try p.store.get(p.inc.gpa, p.inc.io, storeKey(p.inc.store_seed, n.key, n.src_hash))) |e| {
+                    if (e.resultHash() == n.exact_hash and e.atomCount() == n.atoms.len and e.deps().len == n.deps.len) {
+                        w.* = .{ .hit = .{ .pack = e.pack, .offset = e.offset } };
+                        continue;
+                    }
+                }
+                w.* = .{ .put = .{ .len = p.entryLen(n) } };
+            }
+        }
+    };
+
+    /// Writes the entries `where` puts, laid out as `entries` up to `end`,
+    /// into the pack `Store.reserveName` named, if `any`, and commits it.
+    fn writePack(p: Putter, io: Io, entries: []const Store.IndexEntry, end: u64, any: bool) !?Store.PackName {
+        if (!any) return null;
+        var w: Store.PackWriter = undefined;
+        try p.store.beginPack(io, p.inc.dir, &w);
+        defer w.deinit(io);
+        try forChunks(io, p.nodes.len, Writer{ .p = p, .w = &w });
+        return try p.store.commitPack(p.inc.gpa, io, &w, entries, end, p.inc.dir);
+    }
+
+    /// Encodes a chunk's entries, which are contiguous in the pack, into a
+    /// buffer of at most `buf_len` bytes at a time.
+    const Writer = struct {
+        p: Putter,
+        w: *Store.PackWriter,
+
+        const buf_len = 1 << 20;
+
+        fn run(x: Writer, lo: usize, hi: usize, _: usize) !void {
+            const p = x.p;
+            const gpa = p.inc.gpa;
+            var buf: std.array_list.Aligned(u8, .@"16") = .empty;
+            defer buf.deinit(gpa);
+            var buf_off: u64 = 0;
+            var deps: std.ArrayList(Store.Dep) = .empty;
+            defer deps.deinit(gpa);
+            var atoms: std.ArrayList(Atom) = .empty;
+            defer atoms.deinit(gpa);
+            var debug: std.ArrayList(Atom.Debug) = .empty;
+            defer debug.deinit(gpa);
+            for (p.nodes[lo..hi], p.where[lo..hi]) |*n, w| {
+                const put = switch (w) {
+                    .put => |put| put,
+                    .none, .hit => continue,
+                };
+                const padded = std.mem.alignForward(usize, put.len, 16);
+                if (buf.items.len != 0 and buf.items.len + padded > buf_len) {
+                    try x.w.writeAt(p.inc.io, buf.items, buf_off);
+                    buf.clearRetainingCapacity();
+                }
+                if (buf.items.len == 0) buf_off = put.offset;
+                std.debug.assert(buf_off + buf.items.len == put.offset);
+                deps.clearRetainingCapacity();
+                for (n.deps) |d| try deps.append(gpa, .{ .key = p.nodes[d].key, .result_hash = p.nodes[d].result_hash });
+                atoms.clearRetainingCapacity();
+                debug.clearRetainingCapacity();
+                for (n.atoms, 0..) |ai, j| {
+                    try atoms.append(gpa, p.emit.atoms.items[ai]);
+                    if (p.debug_of[ai]) |d| {
+                        var copy = d.*;
+                        copy.atom = @intCast(j);
+                        try debug.append(gpa, copy);
+                    }
+                }
+                const start = buf.items.len;
+                try buf.appendNTimes(gpa, 0, padded);
+                Store.encodeEntry(.{
+                    .src_hash = n.src_hash,
+                    .result_hash = n.exact_hash,
+                    .deps = deps.items,
+                    .atoms = atoms.items,
+                    .debug = debug.items,
+                }, buf.items[start..][0..put.len]);
+            }
+            if (buf.items.len != 0) try x.w.writeAt(p.inc.io, buf.items, buf_off);
+        }
+    };
+};
 
 /// Compares this build's nodes with the last build's manifest: the units
 /// an edit-rebuild would re-analyze are those reachable over reverse edges
