@@ -5427,13 +5427,18 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
 }
 
 fn stringLiteral(sema: *Sema, bytes: []const u8) !Index {
+    const cache = &sema.zcu.string_literals;
+    if (cache.get(bytes)) |v| return v;
     const with_sentinel = try sema.arena.alloc(u8, bytes.len + 1);
     @memcpy(with_sentinel[0..bytes.len], bytes);
     with_sentinel[bytes.len] = 0;
+    const str = try sema.getString(with_sentinel);
     const array_ty = try sema.intern(.{ .array_type = .{ .len = bytes.len, .child = .u8_type, .sentinel = .zero_u8 } });
-    const val = try sema.intern(.{ .aggregate = .{ .ty = array_ty, .storage = .{ .bytes = try sema.getString(with_sentinel) } } });
+    const val = try sema.intern(.{ .aggregate = .{ .ty = array_ty, .storage = .{ .bytes = str } } });
     const ptr_ty = try sema.ptrType(.{ .child = array_ty, .flags = .{ .is_const = true } });
-    return sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = val, .orig_ty = ptr_ty } } } });
+    const ptr = try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = val, .orig_ty = ptr_ty } } } });
+    try cache.put(sema.gpa, sema.ip.stringSlice(str)[0..bytes.len], ptr);
+    return ptr;
 }
 
 /// The bytes of a comptime-known `[]const u8`, `*const [N]u8`, or similar.

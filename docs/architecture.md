@@ -2704,7 +2704,7 @@ long; measure first.
 | `Zcu.inferred_errors` | map | written by the body's worker before marking done; read after done |
 | `Zcu.deps` | map per unit | per-worker lists of (unit, dependees), merged and sorted by unit key at the end |
 | `Zcu.comptime_memo` | map | sharded map; two workers may compute the same call, the first insert wins, and both results are equal (memo keys and anonymous types inside are keyed by callee key and argument hashes) |
-| `Zcu.comptime_alloc_refs` | map | per-worker; a pure function of the value, so a cache per worker gives the same answers |
+| `Zcu.comptime_alloc_refs`, `string_literals` | maps | per-worker; pure caches (of a value's property, and of a literal's value), so a cache per worker gives the same answers |
 | `Zcu.namespaces` | list, pointers into it | per-worker lists with the owner in the index, as InternPool does, so a namespace pointer stays valid; `decls` is fixed once the namespace is created |
 | `Zcu.errors`, `exports`, `test_functions`, `rt_helpers` | lists | locked appends; sorted at the end by unit key and source position (errors), declaration key (exports) and file and source position (tests), and key (compiler_rt requests), so their order does not depend on scheduling |
 | `Zcu.arena` | one arena | one per worker |

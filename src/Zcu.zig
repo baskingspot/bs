@@ -62,6 +62,10 @@ comptime_osr_off: std.AutoHashMapUnmanaged(OsrLoop, void) = .empty,
 /// `Sema.refersToComptimeAlloc`: comptime calls check every argument, and
 /// large tables are passed again and again. A pure function of the value.
 comptime_alloc_refs: std.AutoHashMapUnmanaged(InternPool.Index, bool) = .empty,
+/// The value of each string literal (`Sema.stringLiteral`), by its bytes,
+/// which point into the interned string with the sentinel. A pure cache:
+/// the walker evaluates the same literals again and again.
+string_literals: std.StringHashMapUnmanaged(InternPool.Index) = .empty,
 /// Walker runs of a function before it is lowered for the comptime
 /// evaluator; 0 turns the evaluator off (`ZAP_COMPTIME_EVAL`).
 comptime_eval_threshold: u32 = 4,
@@ -321,6 +325,7 @@ pub fn deinit(zcu: *Zcu) void {
     };
     zcu.comptime_bodies.deinit(gpa);
     zcu.comptime_alloc_refs.deinit(gpa);
+    zcu.string_literals.deinit(gpa);
     zcu.comptime_osr_off.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
     zcu.anyerror_ies.deinit(gpa);
