@@ -323,14 +323,27 @@ pub const Encoder = struct {
                 .reify_struct, .reify_union, .reify_enum => true,
                 else => false,
             };
+        // A union's generated tag enum, which its layout makes: no unit
+        // has it as a result, so it carries its fields.
+        const generated_tag = ip.indexToKey(index) == .enum_type and !reified and
+            zir.instructions.items(.tag)[@backingInt(c.zir_inst)] == .extended and
+            zir.instructions.items(.data)[@backingInt(c.zir_inst)].extended.opcode == .union_decl;
         try e.push(c.file);
         try e.push(@backingInt(c.zir_inst));
-        try e.push(@as(u32, @intFromBool(reified)) | @as(u32, @backingInt(info.layout)) << 1);
+        try e.push(@as(u32, @intFromBool(reified)) | @as(u32, @backingInt(info.layout)) << 1 | @as(u32, @intFromBool(generated_tag)) << 31);
         const parent = e.zcu.namespacePtr(info.namespace).parent;
         if (!try e.pushRef(if (parent == Zcu.Namespace.none) .none else e.zcu.namespacePtr(parent).owner_type)) return false;
         if (!try e.pushRefs(c.captures)) return false;
         try e.pushString(c.name);
         try e.pushString(c.key);
+        if (generated_tag) {
+            if (!try e.pushRef(e.zcu.namespacePtr(info.namespace).owner_type) or !try e.pushRef(info.tag_type)) return false;
+            try e.push64(info.size);
+            try e.push64(info.alignment);
+            try e.push(@intCast(info.field_names.len));
+            for (info.field_names) |n| try e.pushString(n);
+            if (!try e.pushRefs(info.field_defaults)) return false;
+        }
         return true;
     }
 };
@@ -394,6 +407,18 @@ pub const Container = struct {
     captures: []const Index,
     name: []const u8,
     key: []const u8,
+    generated_tag: ?GeneratedTag = null,
+};
+
+/// A union's generated tag enum's fields (`ContainerInfo`), allocated in
+/// the InternPool's arena.
+pub const GeneratedTag = struct {
+    union_type: Index,
+    tag_type: Index,
+    size: u64,
+    alignment: u64,
+    names: []const InternPool.String,
+    values: []const Index,
 };
 
 /// Why a decode failed, for `ZAP_CACHE_CHECK`.
@@ -523,16 +548,36 @@ pub fn Decoder(comptime Resolver: type) type {
                     const flags = c.next();
                     const parent = try d.ref(c) orelse return null;
                     const start = try d.refs(c) orelse return null;
+                    const end = d.scratch.items.len;
                     const name = c.bytes();
                     const key = c.bytes();
+                    const generated_tag: ?GeneratedTag = if (flags & 1 << 31 == 0) null else gen: {
+                        const union_ty = try d.ref(c) orelse return null;
+                        const int_ty = try d.ref(c) orelse return null;
+                        const size = c.next64();
+                        const alignment = c.next64();
+                        const arena = d.ip.arena(Zcu.tid);
+                        const names = try arena.alloc(InternPool.String, c.next());
+                        for (names) |*n| n.* = try d.string(c);
+                        const values = try d.refs(c) orelse return null;
+                        break :gen .{
+                            .union_type = union_ty,
+                            .tag_type = int_ty,
+                            .size = size,
+                            .alignment = alignment,
+                            .names = names,
+                            .values = try arena.dupe(Index, d.scratch.items[values..]),
+                        };
+                    };
                     return d.resolver.container(tag, .{
                         .file = file,
                         .zir_inst = zir_inst,
-                        .reified_layout = if (flags & 1 != 0) @fromBackingInt(@intCast(flags >> 1)) else null,
+                        .reified_layout = if (flags & 1 != 0) @fromBackingInt(@intCast((flags >> 1) & 3)) else null,
                         .parent = parent,
-                        .captures = d.scratch.items[start..],
+                        .captures = d.scratch.items[start..end],
                         .name = name,
                         .key = key,
+                        .generated_tag = generated_tag,
                     });
                 },
                 .tuple_type => {
@@ -876,4 +921,69 @@ pub fn decodeIes(ip: *InternPool, arena: Allocator, words: []const u32) !IesResu
     const names = try arena.alloc(InternPool.String, c.next());
     for (names) |*n| n.* = try ip.getString(Zcu.tid, c.bytes());
     return .{ .is_anyerror = is_anyerror, .names = names };
+}
+
+/// What a node is about: the live unit or dependee behind it, so that an
+/// edit build can bring a green unit's dependencies up to date and record
+/// them as this build's (`encodeSubject`).
+pub const Subject = union(enum) {
+    /// `nav_val`, `nav_ty`.
+    nav: InternPool.NavIndex,
+    /// `type_layout`, `struct_defaults`.
+    ty: Index,
+    /// `func`, `func_body`, `func_ies`.
+    func: Index,
+    /// The namespace's owner type and the name looked up.
+    namespace_name: struct { owner: Index, name: []const u8 },
+    /// The namespace's owner type.
+    namespace: Index,
+    /// The file's stable key, `module:sub/path`.
+    embed_file: []const u8,
+};
+
+/// Words: the subject's tag, then a ref, a declaration (its namespace's
+/// type and name), or a string.
+pub fn encodeSubject(e: *Encoder, out: *std.ArrayList(u32), s: Subject) !bool {
+    const start = out.items.len;
+    try out.append(e.gpa, @backingInt(std.meta.activeTag(s)));
+    const ok = switch (s) {
+        .nav => |n| blk: {
+            const nav = e.zcu.ip.getNav(n);
+            if (!try appendRef(e, out, e.zcu.namespacePtr(nav.namespace).owner_type)) break :blk false;
+            try appendBytes(e.gpa, out, e.zcu.ip.stringSlice(nav.name));
+            break :blk true;
+        },
+        .ty, .func, .namespace => |i| try appendRef(e, out, i),
+        .namespace_name => |nn| blk: {
+            if (!try appendRef(e, out, nn.owner)) break :blk false;
+            try appendBytes(e.gpa, out, nn.name);
+            break :blk true;
+        },
+        .embed_file => |key| blk: {
+            try appendBytes(e.gpa, out, key);
+            break :blk true;
+        },
+    };
+    return finish(out, start, ok);
+}
+
+/// The subject in `words`, its items resolved by `d`; null if one cannot
+/// be. A `nav` is found by name in its namespace.
+pub fn decodeSubject(d: anytype, words: []const u32) !?Subject {
+    var c: Cursor = .{ .words = words, .at = 0 };
+    const tag: std.meta.Tag(Subject) = @fromBackingInt(@intCast(c.next()));
+    return switch (tag) {
+        .nav => blk: {
+            const owner = try d.index(c.next()) orelse return null;
+            break :blk .{ .nav = try d.resolver.nav(owner, c.bytes()) orelse return null };
+        },
+        .ty => .{ .ty = try d.index(c.next()) orelse return null },
+        .func => .{ .func = try d.index(c.next()) orelse return null },
+        .namespace => .{ .namespace = try d.index(c.next()) orelse return null },
+        .namespace_name => blk: {
+            const owner = try d.index(c.next()) orelse return null;
+            break :blk .{ .namespace_name = .{ .owner = owner, .name = c.bytes() } };
+        },
+        .embed_file => .{ .embed_file = c.bytes() },
+    };
 }

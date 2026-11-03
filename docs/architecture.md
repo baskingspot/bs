@@ -109,8 +109,12 @@ are distinct instructions. So the key does not include a comptime call's
 arguments or an ordinal among the types a unit creates: either would give one
 type two keys, or two types one. (It must still tell distinct types apart:
 their declarations' keys extend it.) The *display name* is separate from the
-key and follows upstream exactly (`Parent__struct_<n>`), because `@typeName`
-results are observable and `test/behavior` checks them.
+key and follows upstream's form (`Parent__struct_<n>`), because `@typeName`
+results are observable and `test/behavior` checks them. Upstream's `n` counts
+anonymous types in analysis order; zap's is the type's instruction (for an
+anonymous struct literal, its source node) relative to the declaration, like
+the key, so that an edit above a declaration renames none of its types:
+nothing that reads a type's name records a dependency on it.
 
 When a unit reads another unit's result (a declaration's value, a type's
 layout, a function's signature) it goes through one Sema function that records
@@ -2132,8 +2136,9 @@ it and can flush every CPU's TLB.
 
 Being built in steps (each mergeable, full builds unchanged): result
 hashes (done), references (2a, done), seeds from ZIR (2b, done), result
-closures (3, done), and the hook with Delta and the verify mode (4). What an
-edit build does, and what it needs from Sema, Zcu, and the InternPool:
+closures (3, done), the hook and the verify mode (4a, done; see "Step 4a
+as built" below), and Delta with a numbered relink (4b). What an edit
+build does, and what it needs from Sema, Zcu, and the InternPool:
 
 **Flow.** The no-edit check finds changed inputs. The frontend loads every
 file as today (unchanged files are ZIR cache hits). Before Sema runs,
@@ -2243,8 +2248,8 @@ once, where store payloads would repeat `[]const u8` in every entry.
   a node without one: a log record's nodes (until step 4's Delta stores
   them), unresolved declarations, and results that cannot be encoded.
 - Loading walks a result's references, memoized per item: an item whose
-  stable hash the run already has (`ip.indexOfHash`, one probe, since the
-  dedup maps are keyed by stable hash) is taken as it is; otherwise its
+  stable hash the run already has (`ip.indexOfHash`, a map built on first
+  use) is taken as it is; otherwise its
   `Key` is rebuilt from the decoded operands and interned with `ip.get`,
   and `ip.stableHash` of the result must equal the recorded hash. A
   mismatch is a bug, treated as a cache miss that re-analyzes the unit.
@@ -2320,7 +2325,9 @@ once, where store payloads would repeat `[]const u8` in every entry.
   the largest `@setEvalBranchQuota` among its callers analyzed so far
   (`Zcu.branch_quotas`), as upstream, so whether a deep comptime loop in
   an instance passes can depend on which callers were analyzed first. It
-  is not a dependency, and replay does not reproduce it.
+  is not a dependency. Its node records the quota (a `quota` reference),
+  which an edit build restores before it analyzes or loads the instance,
+  so loaded callers still count.
 - Per unit kind: `nav_val` stores ty, val, `is_const`,
   `is_threadlocal`, `linkage`, `alignment` (the explicit `align(n)`, 0
   if none);
@@ -2333,10 +2340,10 @@ once, where store payloads would repeat `[]const u8` in every entry.
   nothing to do);
   `func` stores its references (its Atoms are in the pack, its IR is
   never stored); the `func_ies` node stores whether the set is `anyerror`
-  and the error names in the order they were found; `comptime_decl` will
-  store its exports (`Zcu.Export.unit` names the unit whose analysis
-  appended each one; it is null for `export` declarations, which the
-  namespace scan recreates).
+  and the error names in the order they were found; `comptime_decl` has
+  no result, only its dependencies and references. A unit that `@export`s (`Zcu.Export.unit`; null
+  for `export` declarations, which the namespace scan recreates) has an
+  `analyze` reference, so an edit build analyzes it rather than load it.
 - `builtin.test_functions` is filled outside unit analysis
   (`populateTestFunctions`, after all tests are known), so the test list is
   its own node, and adding or removing a test changes it.
@@ -2479,6 +2486,90 @@ directory). An object's imports come from the recorded `useExtern`
 references of the units linked; exports already come from Emit.
 `ElfObject` takes the same numbered input as `Elf`, so the pack serves
 both. A format version bump and the linker side; no Sema hook.
+
+**Step 4a as built** (2026-11-03). An edit build is a full build in which
+green units are loaded instead of analyzed; `record` then writes a whole
+new manifest and pack from the Zcu and Emit, as a full build does. That
+leaves the Delta, instruction maps across log records, and the numbered
+relink to step 4b, which makes the edit build lazy as well; 4a's output
+and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
+
+- `src/Replay.zig` owns it. `Incremental.beginReplay` creates it after
+  `seedErrors` if the compilation has a manifest (`ZAP_CACHE_REPLAY=off`
+  turns it off): changed inputs, the seeds and their instruction maps
+  (`seeds.compute`), and the outdated set. The Zcu hook is as above:
+  `ensureNavVal`, `ensureStructLayout`, `ensureStructDefaults`,
+  `ensureFuncIes`, and `analyzeAll`'s function queue and `comptime`
+  declarations ask `Replay.load*` with the unit marked in progress.
+- A unit is green if its node exists with a result (a function or
+  `comptime` declaration needs none), its source hash is
+  unchanged, it has no `analyze` reference, and every plain dependency
+  can be made (its node's *subject*, below) and brought up to date with
+  `Zcu.ensure*`; if the unit is outdated, each dependency's result hash
+  must also equal the recorded one. Then the dependencies are recorded
+  as the unit's (`Zcu.recordDeps`), its result is decoded into the Zcu,
+  and its references are replayed through the APIs analysis and CodeGen
+  use (`queueFuncFrom`, `Emit.navKey`, `useError`, `useExtern`,
+  `requestCompilerRt`, `useErrorNames`). A function's atoms come from the
+  pack and go to Emit with the unit as owner, with its constants'
+  content atoms (once each, with their `content_uses`); its inferred
+  error set comes from its `func_ies` node. Conditional edges are not
+  entered and not recorded again. A dependency on a declaration in
+  progress (`Sema.navRef` takes its address while it resolves) is
+  accepted without resolving it, unless the unit is outdated.
+- *Subjects* (a `subjects` section beside the results): each node's live
+  unit or dependee, so that a green unit's dependencies are made from the
+  manifest alone: a declaration, a type, a function, a namespace with the
+  name looked up, an embedded file's key. Decoding one makes the types
+  it names as analysis would (`results.zig`'s resolver:
+  `createContainerType`, `fileRootType`, `Sema.fillReifiedInfo`, and a
+  union's generated tag enum, whose item carries its fields since no
+  unit has it as a result). A function is interned with its instruction
+  mapped to the new ZIR.
+- Debug info: a green function in a changed file gets `base_line` from the
+  new ZIR, and each inlined call's base line is refreshed through its
+  callee's key (`inline_callees`) if the callee's file changed.
+- Effects outside a unit's result: a namespace whose creation queued
+  `comptime`, exported or test declarations has `Namespace.effects`. A
+  unit whose analysis evaluated such a type's declaration or `@import`
+  (`Zcu.effect_uses`, noted by `Sema.createContainerType` and
+  `Sema.fileRootType`, not during a lowering) gets an `analyze` reference
+  unless loading it makes the type anyway: the type is its value, or the
+  subject of one of its plain dependencies. Otherwise a green unit that
+  made such a type would skip its `comptime` blocks and exports. Noted on
+  every evaluation, not only the one that created the namespace, so that
+  the references do not depend on analysis order.
+- Anonymous types are named `Parent__struct_<n>` with `n` relative to
+  their declaration (see "Analysis units"): with absolute instructions,
+  a green unit's result kept the old name of a type in an edited file,
+  and code reading `@typeName` went stale.
+- The error name table is written in code order, not use order, so that
+  its atom does not depend on which units were loaded.
+- `zap test` replays too: the test list is sorted (above).
+- Known limits: a unit is red, not loaded, if a result or dependency
+  cannot be made (`ZAP_CACHE_CHECK` prints each one; none in hello or
+  conformance). Two declarations that take each other's addresses, one
+  of them outdated and red while the other loads, can report a false
+  dependency loop, since the loading one has no type yet.
+- `ZAP_CACHE_VERIFY=1`: after an edit build that replayed, zap builds the
+  same command again in full in a child (`ZAP_CACHE_VERIFY=full`: no
+  relink, no replay), whose `record` compares its nodes with the edit
+  build's manifest: the same nodes with the same kinds, source hashes,
+  results, dependencies (by key and kind), references, and atom records
+  byte for byte (so `base_line`s too). Not the output's bytes: the link
+  lays atoms out in analysis order, which loading changes. A difference
+  fails the build. `zig build test` runs it in test/run's edit scripts
+  (`rebuild-without`, `rebuild-replace`, `rebuild-lib-without` headers:
+  each edit is built forward and back, verified, then relinked):
+  test/run/edit.zig (a body, a signature, a field type, a defaulted and a
+  comptime-only field, a new declaration, an `@embedFile` of itself),
+  test/run/edit_std.zig (lines moved in a copy of std's debug.zig), and
+  test/run/panic_inline.zig (an inlined callee moves).
+  `tools/conformance/run.py --edit-verify` does it for every behavior
+  unit: after the unit's build it prepends a line to its file, adds a
+  statement to its first test, and appends a declaration, builds,
+  restores the file and builds again, both verified with
+  `ZAP_CACHE_CHECK` on.
 
 **Debug info of green functions.** `src_hash` ignores a declaration's
 line, so lines added above a green function move its `base_line`

@@ -89,6 +89,7 @@ STATUS_LABELS = {
     "compile_crash": "compiler crashes",
     "compile_timeout": "compile timeouts",
     "incomplete": "incomplete runs",
+    "edit_verify_failed": "edit-verify failures",
 }
 
 
@@ -107,14 +108,27 @@ STATUS_LABELS = {
 # itself, filtered to its own tests: one of them only reproduces in the root.
 
 
-def unit_root(unit, workdir):
-    """The unit's root source file, generated if needed."""
+def unit_root(unit, workdir, editable=False):
+    """The unit's root source file, generated if needed. If `editable`, the
+    unit's own file is a copy (`behavior/<unit>`), the others links."""
     if unit == ROOT_UNIT:
         return UPSTREAM_TEST / "behavior.zig"
     unit_dir = workdir / "units" / unit[: -len(".zig")]
     unit_dir.mkdir(parents=True, exist_ok=True)
     link = unit_dir / "behavior"
-    if not link.is_symlink() or os.readlink(link) != str(UPSTREAM_TEST / "behavior"):
+    if editable:
+        if link.is_symlink():
+            link.unlink()
+        shutil.rmtree(link, ignore_errors=True)
+        link.mkdir()
+        for entry in (UPSTREAM_TEST / "behavior").iterdir():
+            if entry.name == unit:
+                shutil.copyfile(entry, link / entry.name)
+            else:
+                (link / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+    elif not link.is_symlink() or os.readlink(link) != str(UPSTREAM_TEST / "behavior"):
+        if link.is_dir() and not link.is_symlink():
+            shutil.rmtree(link)
         link.unlink(missing_ok=True)
         link.symlink_to(UPSTREAM_TEST / "behavior", target_is_directory=True)
     root = unit_dir / "behavior.zig"
@@ -150,12 +164,13 @@ _live = set()
 _live_lock = threading.Lock()
 
 
-def run_process(argv, cwd, timeout):
+def run_process(argv, cwd, timeout, env=None):
     """Runs argv in its own process group. Returns (returncode, stdout, stderr,
     timed_out); returncode is negative for a signal, as in subprocess."""
     proc = subprocess.Popen(
         argv,
         cwd=cwd,
+        env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -220,20 +235,23 @@ def tail(text, limit=LOG_LIMIT):
 # ---------------------------------------------------------------- one unit
 
 
-def compile_unit(compiler, unit, cfg, args, workdir):
+def compile_unit(compiler, unit, cfg, args, workdir, env=None):
     bin_path = workdir / "bin" / cfg["name"] / (unit[: -len(".zig")] + ".test")
     bin_path.parent.mkdir(parents=True, exist_ok=True)
     if bin_path.exists():
         bin_path.unlink()
-    argv = [str(compiler), "test", str(unit_root(unit, workdir))]
+    editable = args.edit_verify and unit != ROOT_UNIT
+    argv = [str(compiler), "test", str(unit_root(unit, workdir, editable) if env is None else workdir / "units" / unit[: -len(".zig")] / "behavior.zig")]
     if not args.default_runner:
         argv += ["--test-runner", str(args.test_runner)]
     argv += ["-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}"]
     for f in unit_filters(unit):
         argv += ["--test-filter", f]
-    code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
+    code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout, env)
     if code == 0 and not timed_out and bin_path.exists():
         return bin_path, None
+    if env is not None:
+        return None, {"status": "edit_verify_failed", "log": describe_exit(code, timed_out, args.compile_timeout) + "\n" + tail(err + out), "tests": {}}
     if timed_out:
         status = "compile_timeout"
     elif code < 0:
@@ -531,10 +549,40 @@ def run_unit_default(bin_path, owns, args, workdir):
     return result
 
 
+def edit_verify(compiler, unit, cfg, args, workdir):
+    """--edit-verify: after the unit's first build, edits its file and builds
+    it again, then restores it and builds once more, each an edit build
+    that zap checks against a full build (ZAP_CACHE_VERIFY) with its
+    dependency checks on (ZAP_CACHE_CHECK). The edits move every line,
+    change a test's body, and add a declaration. Returns the last build's
+    binary and a failure, if any."""
+    path = workdir / "units" / unit[: -len(".zig")] / "behavior" / unit
+    original = path.read_text()
+    lines = original.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if re.match(r"^test\b.*\{\s*$", line):
+            lines.insert(i + 1, "    _ = 0;\n")
+            break
+    edited = "// zap edit-verify\n" + "".join(lines) + "\npub const zap_edit_probe: u32 = 1;\n"
+    env = dict(os.environ, ZAP_CACHE_VERIFY="1", ZAP_CACHE_CHECK="1")
+    result = None, None
+    for text in (edited, original):
+        path.write_text(text)
+        result = compile_unit(compiler, unit, cfg, args, workdir, env)
+        if result[1]:
+            break
+    path.write_text(original)
+    return result
+
+
 def run_one(compiler, unit, cfg, args, workdir):
     bin_path, failure = compile_unit(compiler, unit, cfg, args, workdir)
     if failure:
         return failure
+    if args.edit_verify and unit != ROOT_UNIT:
+        bin_path, failure = edit_verify(compiler, unit, cfg, args, workdir)
+        if failure:
+            return failure
     try:
         run = run_unit_default if args.default_runner else run_unit
         return run(bin_path, lambda name: unit_owns(unit, name), args, workdir)
@@ -1030,6 +1078,7 @@ def main():
     p.add_argument("--workdir", type=Path, default=REPO / ".zig-cache" / "conformance", help="scratch directory")
     p.add_argument("--out", type=Path, help="JSON output path (only with one --target)")
     p.add_argument("--keep-binaries", action="store_true", help="keep test binaries in the workdir")
+    p.add_argument("--edit-verify", action="store_true", help="zap only: after each file's build, edit it and build again, then restore it and build once more, checking each edit build against a full build (ZAP_CACHE_VERIFY, ZAP_CACHE_CHECK); a difference fails the file as edit_verify_failed")
     p.add_argument("-v", "--verbose", action="store_true", help="print each file's result to stderr")
     args = p.parse_args()
 

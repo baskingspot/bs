@@ -43,19 +43,38 @@ pub const Stats = struct {
     without_old_zir: u32 = 0,
 };
 
-/// Appends the seeds of `changed` to `seeds`, in node order.
-pub fn compute(gpa: Allocator, m: *const Manifest, fe: *const Frontend, changed: []const Changed, seeds: *std.ArrayList(u32)) !Stats {
+pub const InstMap = std.AutoHashMapUnmanaged(Zir.Inst.Index, Zir.Inst.Index);
+
+/// For each changed input, by input index: the map from the instructions
+/// of its recorded ZIR to the new ZIR's (`mapOldZirToNew`), or null if
+/// there is none (no old ZIR, or the file is no longer loaded). An edit
+/// build resolves the instructions that cached results name with it.
+pub const InstMaps = struct {
+    maps: std.AutoHashMapUnmanaged(u32, ?InstMap) = .empty,
+
+    pub fn deinit(im: *InstMaps, gpa: Allocator) void {
+        var it = im.maps.valueIterator();
+        while (it.next()) |m| if (m.*) |*map| map.deinit(gpa);
+        im.maps.deinit(gpa);
+    }
+};
+
+/// Appends the seeds of `changed` to `seeds`, in node order, and if `maps`
+/// is not null, puts each changed input's map there.
+pub fn compute(gpa: Allocator, m: *const Manifest, fe: *const Frontend, changed: []const Changed, seeds: *std.ArrayList(u32), maps: ?*InstMaps) !Stats {
     var stats: Stats = .{};
     const Ctx = struct {
         old: ?Frontend.OldZir = null,
         new: ?*const Zir = null,
         map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Zir.Inst.Index) = .empty,
+        names: NameIndex = .{},
     };
     const ctxs = try gpa.alloc(Ctx, changed.len);
     defer {
         for (ctxs) |*c| {
             if (c.old) |*o| o.deinit(fe);
             c.map.deinit(gpa);
+            c.names.deinit(gpa);
         }
         gpa.free(ctxs);
     }
@@ -81,18 +100,24 @@ pub fn compute(gpa: Allocator, m: *const Manifest, fe: *const Frontend, changed:
         const src = m.source(i);
         if (src.input == Manifest.Source.no_input) continue;
         const ctx = &ctxs[by_input.get(src.input) orelse continue];
-        if (try isSeed(m, i, src, ctx.old, ctx.new, &ctx.map)) try seeds.append(gpa, i);
+        if (try isSeed(gpa, m, i, src, ctx.old, ctx.new, &ctx.map, &ctx.names)) try seeds.append(gpa, i);
     }
+    if (maps) |out| for (changed, ctxs) |c, *ctx| {
+        try out.maps.put(gpa, c.input, if (ctx.old != null and ctx.new != null) ctx.map else null);
+        if (ctx.old != null and ctx.new != null) ctx.map = .empty;
+    };
     return stats;
 }
 
 fn isSeed(
+    gpa: Allocator,
     m: *const Manifest,
     i: u32,
     src: Manifest.Source,
     old_zir: ?Frontend.OldZir,
     new_zir: ?*const Zir,
     map: *const std.AutoHashMapUnmanaged(Zir.Inst.Index, Zir.Inst.Index),
+    names: *NameIndex,
 ) !bool {
     const old = &(old_zir orelse return true).zir;
     const new = new_zir orelse return true;
@@ -120,10 +145,10 @@ fn isSeed(
         .namespace_name => {
             if (!isContainer(old, old_inst) or !isContainer(new, new_inst)) return true;
             const name = m.sourceName(i) orelse return true;
-            const o = findNamed(old, old_inst, name);
-            const w = findNamed(new, new_inst, name);
+            const o = (try names.get(gpa, old, old_inst)).get(name);
+            const w = (try names.get(gpa, new, new_inst)).get(name);
             if (o == null or w == null) return (o == null) != (w == null);
-            return o.?.is_pub != w.?.is_pub;
+            return o.? != w.?;
         },
         .nav_ty, .func_ies, .content, .link, .embed_file => return true,
     }
@@ -157,12 +182,36 @@ fn nextNamed(zir: *const Zir, decls: []const Zir.Inst.Index, index: *usize) ?Nam
     return null;
 }
 
-fn findNamed(zir: *const Zir, container: Zir.Inst.Index, name: []const u8) ?Named {
-    const decls = zir.typeDecls(container);
-    var i: usize = 0;
-    while (nextNamed(zir, decls, &i)) |d| if (std.mem.eql(u8, d.name, name)) return d;
-    return null;
-}
+/// Each container's `const` and `var` names, built on first use, so that
+/// looking up the many `namespace_name` nodes of a container with many
+/// declarations stays linear.
+const NameIndex = struct {
+    /// By ZIR (old or new) and container instruction: name to `is_pub`.
+    by: std.AutoHashMapUnmanaged(struct { *const Zir, Zir.Inst.Index }, std.StringHashMapUnmanaged(bool)) = .empty,
+
+    fn deinit(ni: *NameIndex, gpa: Allocator) void {
+        var it = ni.by.valueIterator();
+        while (it.next()) |v| v.deinit(gpa);
+        ni.by.deinit(gpa);
+    }
+
+    fn get(ni: *NameIndex, gpa: Allocator, zir: *const Zir, container: Zir.Inst.Index) !*const std.StringHashMapUnmanaged(bool) {
+        const gop = try ni.by.getOrPut(gpa, .{ zir, container });
+        if (gop.found_existing) return gop.value_ptr;
+        gop.value_ptr.* = .empty;
+        errdefer {
+            gop.value_ptr.deinit(gpa);
+            _ = ni.by.remove(.{ zir, container });
+        }
+        const decls = zir.typeDecls(container);
+        var i: usize = 0;
+        while (nextNamed(zir, decls, &i)) |d| {
+            const e = try gop.value_ptr.getOrPut(gpa, d.name);
+            if (!e.found_existing) e.value_ptr.* = d.is_pub;
+        }
+        return gop.value_ptr;
+    }
+};
 
 // Copied from upstream `src/Zcu.zig` (Copyright (c) Zig contributors, MIT;
 // see upstream/LICENSE), unchanged but for this file's names.

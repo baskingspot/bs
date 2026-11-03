@@ -141,6 +141,11 @@ pub fn main(init: std.process.Init) !void {
     defer if (inc) |*i| i.close();
     if (inc) |*i| i.check = init.environ_map.get("ZAP_CACHE_CHECK") != null;
     if (inc) |*i| i.stack_size = opts.stack_size;
+    if (inc) |*i| if (init.environ_map.get("ZAP_CACHE_VERIFY")) |v| {
+        i.verify = if (std.mem.eql(u8, v, "full")) .full else .replay;
+        i.verify_argv = args;
+        i.verify_environ = init.environ_map;
+    };
     if (inc) |*i| if (init.environ_map.get("ZAP_CACHE_MAX_SIZE")) |v| {
         i.max_bytes = @import("cache.zig").parseSize(v) orelse fatal("invalid ZAP_CACHE_MAX_SIZE '{s}': expected bytes, or a number and K, M, G, or T", .{v});
     };
@@ -210,6 +215,7 @@ pub fn main(init: std.process.Init) !void {
     // n more times (`zig build bench-codegen`).
     const bench_runs: u32 = if (init.environ_map.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
     if (bench_runs != 0) emit.bench_irs = .empty;
+    if (inc) |*i| try i.beginReplay(&fe, &zcu, &emit, std.mem.eql(u8, init.environ_map.get("ZAP_CACHE_REPLAY") orelse "", "off"));
     try zcu.analyzeAll(&emit);
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
     stages.markSplit("sema", "codegen", emit.codegen_ns);

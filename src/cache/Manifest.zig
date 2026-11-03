@@ -49,9 +49,12 @@
 //! nothing.
 //!
 //! A node also keeps its unit's result (`result`), so that an edit build
-//! can load a green unit's result instead of analyzing it: words in the
-//! format of `results.zig`, whose InternPool items are in one table for the
-//! whole manifest (`items`, `item_starts`). Only a base stores results.
+//! can load a green unit's result instead of analyzing it, and its subject
+//! (`subject`: the declaration, type, function, or namespace it is about),
+//! so that an edit build can find the live dependee behind a dependency:
+//! words in the format of `results.zig`, whose InternPool items are in one
+//! table for the whole manifest (`items`, `item_starts`). Only a base
+//! stores them.
 //!
 //! Base file: `Header`, then each section at a 16-byte aligned offset.
 //! Log file: `LogHeader`, then records (`RecordHeader` and its body), each
@@ -125,6 +128,9 @@ item_starts: []const u32,
 /// empty if it has none.
 results: []const u32,
 result_starts: []const u32,
+/// Each base node's subject, the same way.
+subjects: []const u32,
+subject_starts: []const u32,
 strings: []const u8,
 overlay: Overlay,
 
@@ -211,6 +217,13 @@ pub const Ref = extern struct {
         rt,
         /// The error name table.
         error_names,
+        /// An edit build must analyze the unit rather than load it: its
+        /// analysis had effects outside its result (an `@export`, or a new
+        /// namespace with `comptime`, exported or test declarations).
+        analyze,
+        /// The branch quota (`value`) a generic instance's callers gave it
+        /// (`Zcu.branch_quotas`), which it keeps when they are loaded.
+        quota,
     };
 };
 
@@ -336,10 +349,10 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN08".*;
+const magic = "ZAPMAN09".*;
 const log_magic = "ZAPMLG03".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
@@ -479,7 +492,7 @@ fn SectionType(comptime s: Section) type {
         .atom_refs => Pack.AtomRef,
         .inputs => Input,
         .error_names, .bases, .files, .ref_names => StrRef,
-        .ref_starts, .items, .item_starts, .results, .result_starts => u32,
+        .ref_starts, .items, .item_starts, .results, .result_starts, .subjects, .subject_starts => u32,
         .refs => Ref,
         .sources => Source,
         .source_names => SourceName,
@@ -521,6 +534,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
         m.ref_starts.len != m.nodes.len + 1 or m.ref_starts[m.nodes.len] != m.refs.len or
         m.sources.len != m.nodes.len or
         m.result_starts.len != m.nodes.len + 1 or m.result_starts[m.nodes.len] != m.results.len or
+        m.subject_starts.len != m.nodes.len + 1 or m.subject_starts[m.nodes.len] != m.subjects.len or
         (m.item_starts.len != 0 and m.item_starts[m.item_starts.len - 1] >= m.items.len)) return corrupt(io, &map);
     errdefer m.overlay.deinit(gpa);
     try m.readLog(gpa, io, dir);
@@ -698,6 +712,13 @@ pub fn deps(m: *const Manifest, index: u32) []const u32 {
 pub fn result(m: *const Manifest, index: u32) []const u32 {
     if (index >= m.nodes.len or m.overlay.nodes.contains(index)) return &.{};
     return m.results[m.result_starts[index]..m.result_starts[index + 1]];
+}
+
+/// Node `index`'s subject in the format of `results.zig`, or empty, as
+/// `result`.
+pub fn subject(m: *const Manifest, index: u32) []const u32 {
+    if (index >= m.nodes.len or m.overlay.nodes.contains(index)) return &.{};
+    return m.subjects[m.subject_starts[index]..m.subject_starts[index + 1]];
 }
 
 /// The nodes that depend on `index`, possibly with extras (see the file's
@@ -915,8 +936,10 @@ pub const NodeInit = struct {
     source: Source = .none,
     /// For a `namespace_name` node, the name it looks up.
     source_name: ?[]const u8 = null,
-    /// The unit's result, referring to the builder's `items` (bases only).
+    /// The unit's result and the node's subject, referring to the
+    /// builder's `items` (bases only).
     result: []const u32 = &.{},
+    subject: []const u32 = &.{},
 };
 
 /// Interns debug source paths; owns its keys.
@@ -1167,6 +1190,8 @@ pub const Builder = struct {
     /// Each node's range of `results`, parallel to `nodes`.
     result_ranges: std.ArrayList([2]u32) = .empty,
     results: std.ArrayList(u32) = .empty,
+    subject_ranges: std.ArrayList([2]u32) = .empty,
+    subjects: std.ArrayList(u32) = .empty,
     /// The results' item table, owned by the caller (or the base).
     items: []const u32 = &.{},
     item_starts: []const u32 = &.{},
@@ -1203,6 +1228,8 @@ pub const Builder = struct {
         b.source_names.deinit(gpa);
         b.result_ranges.deinit(gpa);
         b.results.deinit(gpa);
+        b.subject_ranges.deinit(gpa);
+        b.subjects.deinit(gpa);
         b.strings.deinit(gpa);
         b.symbol_keys.deinit(gpa);
         b.symbol_map.deinit(gpa);
@@ -1233,12 +1260,18 @@ pub const Builder = struct {
         try b.sources.appendNTimes(gpa, .none, base.nodeCount() - base.nodes.len);
         try b.source_names.appendSlice(gpa, base.source_names);
         try b.results.appendSlice(gpa, base.results);
+        try b.subjects.appendSlice(gpa, base.subjects);
         try b.result_ranges.ensureTotalCapacity(gpa, base.nodeCount());
+        try b.subject_ranges.ensureTotalCapacity(gpa, base.nodeCount());
         for (0..base.nodes.len) |i| {
+            const changed = base.overlay.nodes.contains(@intCast(i));
             const r = base.result_starts[i];
-            b.result_ranges.appendAssumeCapacity(.{ r, if (base.overlay.nodes.contains(@intCast(i))) 0 else base.result_starts[i + 1] - r });
+            b.result_ranges.appendAssumeCapacity(.{ r, if (changed) 0 else base.result_starts[i + 1] - r });
+            const sj = base.subject_starts[i];
+            b.subject_ranges.appendAssumeCapacity(.{ sj, if (changed) 0 else base.subject_starts[i + 1] - sj });
         }
         b.result_ranges.appendNTimesAssumeCapacity(.{ 0, 0 }, base.nodeCount() - base.nodes.len);
+        b.subject_ranges.appendNTimesAssumeCapacity(.{ 0, 0 }, base.nodeCount() - base.nodes.len);
         b.items = base.items;
         b.item_starts = base.item_starts;
         const o = &base.overlay;
@@ -1322,6 +1355,8 @@ pub const Builder = struct {
         if (n.source_name) |name| try b.source_names.append(gpa, .{ .node = index, .name = try b.addString(name) });
         try b.result_ranges.append(gpa, .{ @intCast(b.results.items.len), @intCast(n.result.len) });
         try b.results.appendSlice(gpa, n.result);
+        try b.subject_ranges.append(gpa, .{ @intCast(b.subjects.items.len), @intCast(n.subject.len) });
+        try b.subjects.appendSlice(gpa, n.subject);
         return index;
     }
 
@@ -1358,6 +1393,8 @@ pub const Builder = struct {
         b.sources.items[index] = n.source;
         b.result_ranges.items[index] = .{ @intCast(b.results.items.len), @intCast(n.result.len) };
         try b.results.appendSlice(b.gpa, n.result);
+        b.subject_ranges.items[index] = .{ @intCast(b.subjects.items.len), @intCast(n.subject.len) };
+        try b.subjects.appendSlice(b.gpa, n.subject);
     }
 
     /// Reserves room for `n_atoms` more atom references with `n_targets` more
@@ -1490,34 +1527,23 @@ pub const Builder = struct {
                 switch (r.kind) {
                     .func, .nav => if (r.value >= nodes.len) return error.InvalidNodeIndex,
                     .ext, .ext_weak, .rt => if (r.value >= b.ref_names.items.len) return error.InvalidRefName,
-                    .err, .error_names => {},
+                    .err, .error_names, .analyze, .quota => {},
                 }
                 node_refs.appendAssumeCapacity(r);
             }
         }
         ref_starts[nodes.len] = @intCast(node_refs.items.len);
-        // Results, in node order: as they are, if every node was added in
-        // order to an empty builder.
+        // Results and subjects, in node order.
         const result_starts = try gpa.alloc(u32, nodes.len + 1);
         defer gpa.free(result_starts);
         var compacted_results: std.ArrayList(u32) = .empty;
         defer compacted_results.deinit(gpa);
-        var node_results: []const u32 = b.results.items;
-        var results_len: u32 = 0;
-        const results_in_order = for (b.result_ranges.items, 0..) |range, i| {
-            if (range[0] != results_len and range[1] != 0) break false;
-            result_starts[i] = results_len;
-            results_len += range[1];
-        } else results_len == node_results.len;
-        if (!results_in_order) {
-            try compacted_results.ensureTotalCapacity(gpa, b.results.items.len);
-            for (b.result_ranges.items, 0..) |range, i| {
-                result_starts[i] = @intCast(compacted_results.items.len);
-                compacted_results.appendSliceAssumeCapacity(b.results.items[range[0]..][0..range[1]]);
-            }
-            node_results = compacted_results.items;
-        }
-        result_starts[nodes.len] = @intCast(node_results.len);
+        const node_results = try inNodeOrder(gpa, b.result_ranges.items, b.results.items, result_starts, &compacted_results);
+        const subject_starts = try gpa.alloc(u32, nodes.len + 1);
+        defer gpa.free(subject_starts);
+        var compacted_subjects: std.ArrayList(u32) = .empty;
+        defer compacted_subjects.deinit(gpa);
+        const node_subjects = try inNodeOrder(gpa, b.subject_ranges.items, b.subjects.items, subject_starts, &compacted_subjects);
         const numbered = try gpa.alloc(NumberedAtom, ref_count);
         defer gpa.free(numbered);
         const targets = try gpa.alloc(u32, target_count);
@@ -1672,6 +1698,8 @@ pub const Builder = struct {
             @ptrCast(b.item_starts),
             @ptrCast(node_results),
             @ptrCast(result_starts),
+            @ptrCast(node_subjects),
+            @ptrCast(subject_starts),
             b.strings.items,
         };
         const zeros: [16]u8 = @splat(0);
@@ -1695,6 +1723,30 @@ pub const Builder = struct {
         w.interface.writeVecAll(&vecs) catch return w.err.?;
         w.interface.flush() catch return w.err.?;
         return af;
+    }
+
+    /// The words of each node's range of `data`, in node order, with each
+    /// node's start in `starts` (one more than the nodes): `data` as it is
+    /// if every node was added in order to an empty builder, else a copy in
+    /// `compacted`.
+    fn inNodeOrder(gpa: Allocator, ranges: []const [2]u32, data: []const u32, starts: []u32, compacted: *std.ArrayList(u32)) ![]const u32 {
+        var len: u32 = 0;
+        const in_order = for (ranges, 0..) |range, i| {
+            if (range[0] != len and range[1] != 0) break false;
+            starts[i] = len;
+            len += range[1];
+        } else len == data.len;
+        if (in_order) {
+            starts[ranges.len] = len;
+            return data;
+        }
+        try compacted.ensureTotalCapacity(gpa, data.len);
+        for (ranges, 0..) |range, i| {
+            starts[i] = @intCast(compacted.items.len);
+            compacted.appendSliceAssumeCapacity(data[range[0]..][0..range[1]]);
+        }
+        starts[ranges.len] = @intCast(compacted.items.len);
+        return compacted.items;
     }
 
     /// Makes a file from `writeUnplaced` the manifest in `dir`.

@@ -97,10 +97,19 @@ pub fn build(b: *std.Build) void {
 ///                               traces)
 ///   //! rebuild-without: "<zig string>"
 ///                               zap first builds the program with the
-///                               first occurrence of this text removed,
-///                               then builds it as it is in the same place
-///                               twice, reusing its cache, and checks the
-///                               last build
+///                               first occurrence of this text after the
+///                               headers removed (repeatable: each text;
+///                               `rebuild-replace: "<this>" "<earlier>"`
+///                               replaces it instead), then as it is,
+///                               then without again, then as it is, then
+///                               once more with nothing changed, all in the
+///                               same place reusing its cache, and checks
+///                               the last build. The edit builds compare
+///                               themselves with full builds
+///                               (`ZAP_CACHE_VERIFY`, `ZAP_CACHE_CHECK`).
+///   //! rebuild-lib-without: "<lib path>" "<zig string>"
+///                               the same edit in a file of zap's lib
+///                               directory, of which the builds use a copy
 ///
 /// `test` builds each with zap and checks it; `test-upstream` does the same
 /// with upstream zig, so every program is checked against the oracle.
@@ -138,7 +147,9 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             stdout: ?[]const u8 = null,
             stderr: ?[]const u8 = null,
             stderr_contains: std.ArrayList([]const u8) = .empty,
-            rebuild_without: ?[]const u8 = null,
+            /// Each text, and what the earlier version has instead.
+            rebuild_without: std.ArrayList([2][]const u8) = .empty,
+            lib_edit: ?struct { path: []const u8, text: []const u8 } = null,
         } = .{};
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
@@ -154,7 +165,16 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 const bytes = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 expect.stderr_contains.append(b.allocator, bytes) catch @panic("OOM");
             } else if (std.mem.eql(u8, key, "rebuild-without")) {
-                expect.rebuild_without = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
+                const text = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
+                expect.rebuild_without.append(b.allocator, .{ text, "" }) catch @panic("OOM");
+            } else if (std.mem.eql(u8, key, "rebuild-replace") or std.mem.eql(u8, key, "rebuild-lib-without")) {
+                // Two strings.
+                const end = 1 + (std.mem.indexOfPos(u8, value, 1, "\" \"") orelse std.debug.panic("{s}: bad {s}", .{ src_path, key }));
+                const first = std.zig.string_literal.parseAlloc(b.allocator, value[0..end]) catch std.debug.panic("{s}: bad string", .{src_path});
+                const second = std.zig.string_literal.parseAlloc(b.allocator, std.mem.trim(u8, value[end..], " ")) catch std.debug.panic("{s}: bad string", .{src_path});
+                if (key[8] == 'r') {
+                    expect.rebuild_without.append(b.allocator, .{ first, second }) catch @panic("OOM");
+                } else expect.lib_edit = .{ .path = first, .text = second };
             } else if (std.mem.eql(u8, key, "stdout") or std.mem.eql(u8, key, "stderr")) {
                 const bytes = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 if (key[3] == 'o') expect.stdout = bytes else expect.stderr = bytes;
@@ -167,21 +187,53 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 const r = b.addSystemCommand(&.{ b.graph.zig_exe, "build-exe", "-fno-llvm", "-fno-lld" });
                 r.addFileArg(b.path(src_path));
                 break :blk r;
-            } else if (expect.rebuild_without) |text| blk: {
+            } else if (expect.rebuild_without.items.len != 0 or expect.lib_edit != null) blk: {
                 // Build the earlier version, then this one at the same path,
-                // then again with nothing changed (all from the cache).
-                const at = std.mem.indexOf(u8, source, text) orelse std.debug.panic("{s}: rebuild-without text not found", .{src_path});
-                const before = b.addWriteFiles().add(file, b.fmt("{s}{s}", .{ source[0..at], source[at + text.len ..] }));
+                // then the earlier and this one again, each an edit build
+                // checked against a full build, then this one with nothing
+                // changed (a relink), all from the cache.
+                var earlier = source;
+                var body_start: usize = 0;
+                while (std.mem.startsWith(u8, earlier[body_start..], "//! ")) body_start = std.mem.indexOfScalarPos(u8, earlier, body_start, '\n').? + 1;
+                for (expect.rebuild_without.items) |edit| {
+                    const at = std.mem.indexOfPos(u8, earlier, body_start, edit[0]) orelse std.debug.panic("{s}: rebuild-without text not found", .{src_path});
+                    earlier = b.fmt("{s}{s}{s}", .{ earlier[0..at], edit[1], earlier[at + edit[0].len ..] });
+                }
+                const files = b.addWriteFiles();
+                const before = files.add(file, earlier);
+                // A lib edit: a copy of the lib directory of links, and the
+                // edited file's two versions.
+                var lib_setup: []const u8 = "";
+                var lib_flag: []const u8 = "";
+                var lib_before: []const u8 = "";
+                var lib_after: []const u8 = "";
+                if (expect.lib_edit) |e| {
+                    const lib_dir = defaultZigLibDir(b);
+                    const lib_src = std.Io.Dir.cwd().readFileAlloc(io, b.pathJoin(&.{ lib_dir, e.path }), b.allocator, .limited(16 << 20)) catch |err|
+                        std.debug.panic("{s}: unable to read {s}: {t}", .{ src_path, e.path, err });
+                    const at = std.mem.indexOf(u8, lib_src, e.text) orelse std.debug.panic("{s}: rebuild-lib-without text not found", .{src_path});
+                    _ = files.add("lib_before", b.fmt("{s}{s}", .{ lib_src[0..at], lib_src[at + e.text.len ..] }));
+                    lib_setup = b.fmt("rm -rf \"$4.d/lib\"; cp -rs {s} \"$4.d/lib\"; rm \"$4.d/lib/{s}\"\n", .{ lib_dir, e.path });
+                    lib_flag = b.fmt(" --zig-lib-dir \"$4.d/lib\"", .{});
+                    lib_before = b.fmt("cp \"$(dirname \"$1\")/lib_before\" \"$4.d/lib/{s}\"\n", .{e.path});
+                    lib_after = b.fmt("cp {s}/{s} \"$4.d/lib/{s}\"\n", .{ lib_dir, e.path, e.path });
+                }
+                // Quiet unless a build fails: the checks print to stderr.
+                const zap_cmd = b.fmt("\"$5\" build-exe -target x86_64-linux \"$4.d/{s}\" -femit-bin=\"$4\"{s} 2>\"$4.d/log\" || {{ cat \"$4.d/log\" >&2; exit 1; }}", .{ file, lib_flag });
                 const r = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
                     \\set -e
                     \\mkdir -p "$4.d"
                     \\cp "$3" "$4.d/rt.zig"
-                    \\cp "$1" "$4.d/{0s}"
-                    \\"$5" build-exe -target x86_64-linux "$4.d/{0s}" -femit-bin="$4"
-                    \\cp "$2" "$4.d/{0s}"
-                    \\"$5" build-exe -target x86_64-linux "$4.d/{0s}" -femit-bin="$4"
-                    \\"$5" build-exe -target x86_64-linux "$4.d/{0s}" -femit-bin="$4"
-                , .{file}), "sh" });
+                    \\{[setup]s}cp "$1" "$4.d/{[file]s}"
+                    \\{[lib_before]s}{[zap]s}
+                    \\cp "$2" "$4.d/{[file]s}"
+                    \\{[lib_after]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
+                    \\cp "$1" "$4.d/{[file]s}"
+                    \\{[lib_before]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
+                    \\cp "$2" "$4.d/{[file]s}"
+                    \\{[lib_after]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
+                    \\{[zap]s}
+                , .{ .setup = lib_setup, .file = file, .lib_before = lib_before, .lib_after = lib_after, .zap = zap_cmd }), "sh" });
                 r.addFileArg(before);
                 r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path("test/run/rt.zig"));
@@ -193,7 +245,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 break :blk r;
             };
             compile.addFileInput(b.path("test/run/rt.zig"));
-            const bin = if (!upstream and expect.rebuild_without != null) bin: {
+            const bin = if (!upstream and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null)) bin: {
                 const out = compile.addOutputFileArg(name);
                 compile.addArtifactArg(zap);
                 break :bin out;

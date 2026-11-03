@@ -34,6 +34,7 @@ const Zcu = @import("Zcu.zig");
 const Emit = @import("Emit.zig");
 const Atom = @import("link/Atom.zig");
 const Elf = @import("link/Elf.zig");
+const Replay = @import("Replay.zig");
 
 const Incremental = @This();
 
@@ -70,8 +71,18 @@ check_failed: std.atomic.Value(bool) = .init(false),
 /// `--stack`, for a relink; part of the command line that keys the
 /// compilation.
 stack_size: u64 = 16 * 1024 * 1024,
+/// `ZAP_CACHE_VERIFY`: `replay` checks an edit build that loaded units
+/// by building again in full (`full`, the build's own environment then),
+/// which compares its nodes with the edit build's (`verifyNodes`).
+verify: enum { off, replay, full } = .off,
+/// For `verify`: the command line and environment to build again with.
+verify_argv: []const []const u8 = &.{},
+verify_environ: ?*std.process.Environ.Map = null,
 /// The recording `startRecord` runs while the build links.
 recording: ?Io.Future(anyerror!Recorded) = null,
+/// An edit build's replay of `prev` (`beginReplay`); the atoms it loaded
+/// point into its packs until `close`.
+replay: ?*Replay = null,
 
 /// Opens and locks the directory of the compilation that `args` (the
 /// command line after `zap`) describes, run from the current directory.
@@ -128,6 +139,7 @@ pub fn close(inc: *Incremental) void {
         var r = f.cancel(inc.io) catch null;
         if (r) |*rec| rec.discard(inc);
     }
+    if (inc.replay) |r| r.destroy();
     if (inc.prev) |*m| m.close(inc.gpa, inc.io);
     inc.global.close(inc.io);
     inc.local.close(inc.io);
@@ -151,6 +163,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     const io = inc.io;
     const t0 = now(io);
     const m = if (inc.prev) |*m| m else return inc.noRelink("no manifest", .{});
+    if (inc.verify == .full) return inc.noRelink("verifying an edit build", .{});
     if (m.entry == 0) return inc.noRelink("no entry point", .{});
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(gpa);
@@ -231,6 +244,25 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
 fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bool {
     if (inc.timing) std.debug.print("cache: not relinking: " ++ fmt ++ "\n", args);
     return false;
+}
+
+/// Makes this an edit build: analysis loads the units the edits since the
+/// last build left green from it (see "Edit builds: replaying cached
+/// results" in docs/architecture.md). Call after `seedErrors`, before
+/// analysis. `ZAP_CACHE_REPLAY=off` turns it off.
+pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emit, off: bool) !void {
+    const m = if (inc.prev) |*m| m else return;
+    if (off or inc.verify == .full) return;
+    const r = Replay.create(inc.gpa, inc.io, m, inc.dir, fe, zcu, emit) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (inc.timing) std.debug.print("cache: not replaying: {t}\n", .{err});
+            return;
+        },
+    };
+    r.check = inc.check;
+    inc.replay = r;
+    zcu.replay = r;
 }
 
 /// Assigns the last build's error codes first, so that they keep their
@@ -333,7 +365,7 @@ pub const DependeeContext = struct {
     }
 };
 
-const Recorder = struct {
+pub const Recorder = struct {
     gpa: Allocator,
     zcu: *Zcu,
     nodes: std.ArrayList(Node) = .empty,
@@ -369,7 +401,7 @@ const Recorder = struct {
     }
 
     /// What a unit's or dependee's node gets, and the node once made.
-    const Info = struct {
+    pub const Info = struct {
         key: Hash = 0,
         src_hash: Hash = 0,
         result_hash: Hash = 0,
@@ -503,7 +535,7 @@ const Recorder = struct {
         return index;
     }
 
-    fn unitTag(unit: Zcu.AnalUnit) Tag {
+    pub fn unitTag(unit: Zcu.AnalUnit) Tag {
         return switch (unit) {
             .nav_val => .nav_val,
             .type_layout => .type_layout,
@@ -570,13 +602,22 @@ const Recorder = struct {
 
 /// Renders and hashes keys, and reads source and result hashes, for one
 /// thread of `Recorder.prepare`.
-const Keyer = struct {
+pub const Keyer = struct {
     zcu: *Zcu,
     key_buf: std.Io.Writer.Allocating,
     unit_buf: std.Io.Writer.Allocating,
 
     /// A key for `parts`, distinct per `tag`.
-    fn keyOf(k: *Keyer, tag: Tag, parts: []const []const u8) !Hash {
+    pub fn init(zcu: *Zcu, gpa: Allocator) Keyer {
+        return .{ .zcu = zcu, .key_buf = .init(gpa), .unit_buf = .init(gpa) };
+    }
+
+    pub fn deinit(k: *Keyer) void {
+        k.key_buf.deinit();
+        k.unit_buf.deinit();
+    }
+
+    pub fn keyOf(k: *Keyer, tag: Tag, parts: []const []const u8) !Hash {
         k.key_buf.clearRetainingCapacity();
         const w = &k.key_buf.writer;
         try w.writeByte(@backingInt(tag));
@@ -588,7 +629,7 @@ const Keyer = struct {
     }
 
     /// Valid until the next call.
-    fn unitKeyString(k: *Keyer, unit: Zcu.AnalUnit) ![]const u8 {
+    pub fn unitKeyString(k: *Keyer, unit: Zcu.AnalUnit) ![]const u8 {
         k.unit_buf.clearRetainingCapacity();
         try k.zcu.unitKey(unit, &k.unit_buf.writer);
         return k.unit_buf.written();
@@ -608,7 +649,21 @@ const Keyer = struct {
         return @bitCast(h);
     }
 
-    fn unitInfo(k: *Keyer, unit: Zcu.AnalUnit) !Recorder.Info {
+    /// `unitInfo(unit).src_hash`, without the rest.
+    pub fn unitSrcHash(k: *Keyer, unit: Zcu.AnalUnit) Hash {
+        const ip = &k.zcu.ip;
+        return switch (unit) {
+            .nav_val => |nav_index| k.srcHash(ip.getNav(nav_index).file, ip.getNav(nav_index).zir_inst),
+            .type_layout, .struct_defaults => |ty| k.srcHash(ip.containerType(ty).?.file, ip.containerType(ty).?.zir_inst),
+            .func => |func| blk: {
+                const owner = ip.getNav(ip.indexToKey(func).func.owner_nav);
+                break :blk k.srcHash(owner.file, owner.zir_inst);
+            },
+            .comptime_decl => |c| k.srcHash(c.file, c.inst),
+        };
+    }
+
+    pub fn unitInfo(k: *Keyer, unit: Zcu.AnalUnit) !Recorder.Info {
         const ip = &k.zcu.ip;
         var info: Recorder.Info = .{ .key = try k.keyOf(Recorder.unitTag(unit), &.{try k.unitKeyString(unit)}) };
         switch (unit) {
@@ -644,7 +699,7 @@ const Keyer = struct {
         return info;
     }
 
-    fn dependeeInfo(k: *Keyer, d: Zcu.Dependee) !Recorder.Info {
+    pub fn dependeeInfo(k: *Keyer, d: Zcu.Dependee) !Recorder.Info {
         const ip = &k.zcu.ip;
         switch (d) {
             .nav_val, .type_layout, .struct_defaults => unreachable, // Units.
@@ -784,6 +839,7 @@ fn defaultsResultHash(ip: *const InternPool, ty: InternPool.Index) Hash {
 /// not change, so it runs alongside the link. `finishRecord` keeps or
 /// discards it. `fe`, `zcu`, and `emit` must not change until then.
 pub fn startRecord(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) void {
+    if (inc.timing) if (inc.replay) |r| r.printStats();
     std.debug.assert(inc.recording == null);
     inc.recording = inc.io.async(record, .{ inc, fe, zcu, emit });
 }
@@ -807,7 +863,9 @@ fn finishRecordFallible(inc: *Incremental, linked: bool) !void {
         // Loudly, so that a conformance run with the check on cannot hide
         // a gap; the gaps are printed above.
         r.discard(inc);
-        std.debug.print("error: ZAP_CACHE_CHECK found gaps in the recorded dependencies or references\n", .{});
+        if (inc.verify == .full) {
+            std.debug.print("error: ZAP_CACHE_VERIFY: the edit build's nodes differ from a full build's\n", .{});
+        } else std.debug.print("error: ZAP_CACHE_CHECK found gaps in the recorded dependencies or references\n", .{});
         std.process.exit(1);
     }
     const waited = ms(t0, now(inc.io));
@@ -823,6 +881,38 @@ fn finishRecordFallible(inc: *Incremental, linked: bool) !void {
         } else inc.dir.deleteFile(inc.io, e.name) catch {};
     }
     if (inc.timing) std.debug.print("{s}; after the link, waited {d:.2} ms and placed in {d:.2} ms\n", .{ r.report, waited, ms(t0, now(inc.io)) - waited });
+    switch (inc.verify) {
+        .off => {},
+        .replay => if (inc.replay != null) try inc.verifyReplay(),
+        // Verified; the edit build that started this one runs the result.
+        .full => std.process.exit(0),
+    }
+}
+
+/// `ZAP_CACHE_VERIFY`: builds again in full in a child zap, which compares
+/// its nodes with this edit build's manifest, and exits if they differ.
+fn verifyReplay(inc: *Incremental) !void {
+    const io = inc.io;
+    const env = inc.verify_environ.?;
+    const old = env.get("ZAP_CACHE_VERIFY") orelse "1";
+    try env.put("ZAP_CACHE_VERIFY", "full");
+    defer env.put("ZAP_CACHE_VERIFY", old) catch {};
+    const argv = try inc.gpa.dupe([]const u8, inc.verify_argv);
+    defer inc.gpa.free(argv);
+    const self = try std.process.executablePathAlloc(io, inc.gpa);
+    defer inc.gpa.free(self);
+    argv[0] = self;
+    // The child takes the compilation's lock.
+    inc.lock.close(io);
+    var child = try std.process.spawn(io, .{ .argv = argv, .environ_map = env });
+    const term = child.wait(io);
+    inc.lock = try cache.lock(io, inc.dir);
+    switch (try term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    std.debug.print("error: ZAP_CACHE_VERIFY: the full build of this edit build failed or differed\n", .{});
+    std.process.exit(1);
 }
 
 /// A recorded build, its manifest written but not placed.
@@ -893,6 +983,17 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     const func_ref_items = try gpa.alloc([2]u32, zcu.func_refs.count());
     defer gpa.free(func_ref_items);
     for (zcu.func_refs.keys(), func_ref_items) |fr, *it| it.* = .{ try r.addUnit(fr.from), try r.addUnit(.{ .func = fr.func }) };
+    // Units an edit build must analyze, and generic instances' branch
+    // quotas (see `Manifest.Ref.Kind`).
+    var analyze_items: std.ArrayList(u32) = .empty;
+    defer analyze_items.deinit(gpa);
+    for (zcu.effect_uses.keys()) |use| if (!loadMakes(zcu, use)) try analyze_items.append(gpa, try r.addUnit(use.unit));
+    for (zcu.exports.items) |e| if (e.unit) |unit| try analyze_items.append(gpa, try r.addUnit(unit));
+    var quota_items: std.ArrayList([2]u32) = .empty;
+    defer quota_items.deinit(gpa);
+    var it_quota = zcu.branch_quotas.iterator();
+    while (it_quota.next()) |q| if (zcu.deps.contains(.{ .func = q.key_ptr.* }))
+        try quota_items.append(gpa, .{ try r.addUnit(.{ .func = q.key_ptr.* }), q.value_ptr.* });
     const unit_ref_items = try gpa.alloc([2]u32, emit.unit_refs.items.len);
     defer gpa.free(unit_ref_items);
     for (emit.unit_refs.items, unit_ref_items) |ur, *it| it.* = .{
@@ -926,7 +1027,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     defer enc.deinit();
     var result_words: std.ArrayList(u32) = .empty;
     defer result_words.deinit(gpa);
-    const item_results = try gpa.alloc([2]u32, r.unit_list.items.len + r.dependee_list.items.len);
+    const item_results = try gpa.alloc(Encoded.Ranges, r.unit_list.items.len + r.dependee_list.items.len);
     defer gpa.free(item_results);
     var encoding = io.async(encodeResults, .{ io, &r, &enc, &result_words, item_results });
     defer if (encoding.cancel(io)) |_| {} else |_| {};
@@ -969,6 +1070,8 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         _ = try r.unitNode(it[0]);
         if (it[1] != Recorder.no_node) _ = try r.unitNode(it[1]);
     }
+    for (analyze_items.items) |*it| it.* = try r.unitNode(it.*);
+    for (quota_items.items) |*it| it[0] = try r.unitNode(it[0]);
     for (root_items.items) |*it| it.* = try r.unitNode(it.*);
     try r.group();
 
@@ -1098,15 +1201,11 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     }
     const new_base: u32 = @intCast(base_names.items.len);
     const encoded = try encoding.await(io);
-    const result_of = try gpa.alloc([2]u32, r.nodes.items.len);
+    const result_of = try gpa.alloc(Encoded.Ranges, r.nodes.items.len);
     defer gpa.free(result_of);
-    @memset(result_of, .{ 0, 0 });
-    for (r.unit_info, item_results[0..r.unit_info.len]) |info, res| if (res[1] != 0) {
-        result_of[info.node] = res;
-    };
-    for (r.dependee_info, item_results[r.unit_info.len..]) |info, res| if (res[1] != 0) {
-        result_of[info.node] = res;
-    };
+    @memset(result_of, .{});
+    for (r.unit_info, item_results[0..r.unit_info.len]) |info, res| result_of[info.node] = res;
+    for (r.dependee_info, item_results[r.unit_info.len..]) |info, res| result_of[info.node] = res;
     if (inc.check and !checkResults(gpa, zcu, &r, &enc, result_words.items, result_of, encoded.unencodable)) inc.check_failed.store(true, .monotonic);
     const t2 = now(io);
     var committing = io.async(Putter.writePack, .{ putter, io, entries.items, end, new_name != null });
@@ -1132,8 +1231,10 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             return x.ref.value < y.ref.value;
         }
     };
-    var node_refs: std.ArrayList(NodeRef) = try .initCapacity(gpa, func_ref_items.len + unit_ref_items.len);
+    var node_refs: std.ArrayList(NodeRef) = try .initCapacity(gpa, func_ref_items.len + unit_ref_items.len + analyze_items.items.len + quota_items.items.len);
     defer node_refs.deinit(gpa);
+    for (analyze_items.items) |n| node_refs.appendAssumeCapacity(.{ .node = n, .ref = .{ .kind = .analyze, .value = 0 } });
+    for (quota_items.items) |q| node_refs.appendAssumeCapacity(.{ .node = q[0], .ref = .{ .kind = .quota, .value = q[1] } });
     for (func_ref_items) |it| {
         const from = try r.unitNode(it[0]);
         const to = try r.unitNode(it[1]);
@@ -1174,9 +1275,23 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             }
         }
         const res = result_of[ni];
-        _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps, .atoms = refs.items, .symbols = symbols.items, .refs = refs_of.items, .source = n.source, .source_name = n.source_name, .result = result_words.items[res[0]..][0..res[1]] });
+        _ = try b.addNode(.{
+            .key = n.key,
+            .result_hash = n.result_hash,
+            .src_hash = n.src_hash,
+            .tag = @backingInt(n.tag),
+            .deps = n.deps,
+            .atoms = refs.items,
+            .symbols = symbols.items,
+            .refs = refs_of.items,
+            .source = n.source,
+            .source_name = n.source_name,
+            .result = result_words.items[res.result[0]..][0..res.result[1]],
+            .subject = result_words.items[res.subject[0]..][0..res.subject[1]],
+        });
     }
     if (inc.check and !checkReferences(gpa, &r, root_items.items, &b)) inc.check_failed.store(true, .monotonic);
+    if (inc.verify == .full and !try inc.verifyNodes(&r, &b, emit, debug_of)) inc.check_failed.store(true, .monotonic);
     for (base_names.items) |name| _ = try b.addBasePack(name);
     b.items = enc.words.items;
     b.item_starts = enc.starts.items;
@@ -1233,20 +1348,42 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     return .{ .manifest = manifest, .base_names = names, .report = report };
 }
 
-const Encoded = struct { units: usize = 0, unencodable: usize = 0, ms: f64 = 0 };
+const Encoded = struct {
+    units: usize = 0,
+    unencodable: usize = 0,
+    /// Nodes whose subject could not be encoded.
+    no_subject: usize = 0,
+    ms: f64 = 0,
 
-/// Encodes the results of `r`'s units and dependees (`results.zig`) into
-/// `words`, the range of each in `ranges` (units first, as in `unit_list`
-/// and `dependee_list`; empty for none). Reads only the lists, which do not
-/// change once `prepare` ran.
-fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.ArrayList(u32), ranges: [][2]u32) !Encoded {
+    /// Where a unit's or dependee's result and subject are in the words.
+    const Ranges = struct { result: [2]u32 = .{ 0, 0 }, subject: [2]u32 = .{ 0, 0 } };
+};
+
+/// Encodes the results and subjects of `r`'s units and dependees
+/// (`results.zig`) into `words`, the ranges of each in `ranges` (units
+/// first, as in `unit_list` and `dependee_list`; empty for none). Reads
+/// only the lists, which do not change once `prepare` ran.
+fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.ArrayList(u32), ranges: []Encoded.Ranges) !Encoded {
     const t0 = now(io);
     const gpa = r.gpa;
-    const ip = &r.zcu.ip;
-    @memset(ranges, .{ 0, 0 });
+    const zcu = r.zcu;
+    const ip = &zcu.ip;
+    @memset(ranges, .{});
     var e: Encoded = .{};
     try enc.ids.ensureTotalCapacity(gpa, @intCast(4 * r.unit_list.items.len));
     for (r.unit_list.items, ranges[0..r.unit_list.items.len]) |unit, *range| {
+        const subject: ?results.Subject = switch (unit) {
+            .nav_val => |nav| .{ .nav = nav },
+            .type_layout, .struct_defaults => |ty| .{ .ty = ty },
+            .func => |func| .{ .func = func },
+            .comptime_decl => null,
+        };
+        if (subject) |sj| {
+            const start = words.items.len;
+            if (try results.encodeSubject(enc, words, sj)) {
+                range.subject = .{ @intCast(start), @intCast(words.items.len - start) };
+            } else e.no_subject += 1;
+        }
         const start = words.items.len;
         const ok = switch (unit) {
             .nav_val => |nav_index| blk: {
@@ -1262,18 +1399,29 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
             e.unencodable += 1;
             continue;
         }
-        range.* = .{ @intCast(start), @intCast(words.items.len - start) };
+        range.result = .{ @intCast(start), @intCast(words.items.len - start) };
         e.units += 1;
     }
-    for (r.dependee_list.items, ranges[r.unit_list.items.len..]) |d, *range| switch (d) {
-        .func_ies => |func| {
+    for (r.dependee_list.items, ranges[r.unit_list.items.len..]) |d, *range| {
+        const subject: results.Subject = switch (d) {
+            .nav_val, .type_layout, .struct_defaults => unreachable, // Units.
+            .nav_ty => |nav| .{ .nav = nav },
+            .func_body, .func_ies => |func| .{ .func = func },
+            .namespace_name => |nn| .{ .namespace_name = .{ .owner = zcu.namespacePtr(nn.namespace).owner_type, .name = ip.stringSlice(nn.name) } },
+            .namespace => |ns| .{ .namespace = zcu.namespacePtr(ns).owner_type },
+            .embed_file => |i| .{ .embed_file = zcu.embed_files.values()[i].key },
+        };
+        const sj_start = words.items.len;
+        if (try results.encodeSubject(enc, words, subject)) {
+            range.subject = .{ @intCast(sj_start), @intCast(words.items.len - sj_start) };
+        } else e.no_subject += 1;
+        if (d == .func_ies) {
             const start = words.items.len;
-            try results.encodeIes(gpa, r.zcu, words, func);
-            range.* = .{ @intCast(start), @intCast(words.items.len - start) };
+            try results.encodeIes(gpa, zcu, words, d.func_ies);
+            range.result = .{ @intCast(start), @intCast(words.items.len - start) };
             e.units += 1;
-        },
-        else => {},
-    };
+        }
+    }
     e.ms = ms(t0, now(io));
     return e;
 }
@@ -1444,7 +1592,7 @@ const Putter = struct {
 /// changed. Every node whose result changed must be among them. Prints
 /// the counts, and the nodes it missed.
 /// The path an input is recorded under: absolute, if the module's root is.
-fn inputPath(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, module: Frontend.Module.Index, sub_path: []const u8) !void {
+pub fn inputPath(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, module: Frontend.Module.Index, sub_path: []const u8) !void {
     const mod = fe.module(module);
     buf.clearRetainingCapacity();
     try buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, sub_path });
@@ -1500,7 +1648,7 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
     var seed_list: std.ArrayList(u32) = .empty;
     defer seed_list.deinit(gpa);
     const t0 = now(io);
-    const stats = try seeds.compute(gpa, m, fe, changed.items, &seed_list);
+    const stats = try seeds.compute(gpa, m, fe, changed.items, &seed_list, null);
     const seeds_ms = ms(t0, now(io));
 
     var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
@@ -1622,7 +1770,7 @@ fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *c
 /// the same scalars. That is what an edit build relies on when it loads a
 /// green unit. The decoder only finds container types, functions, and
 /// declarations here (`results.Lookup`); creating them is replay's.
-fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const results.Encoder, words: []const u32, result_of: []const [2]u32, unencodable: usize) bool {
+fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const results.Encoder, words: []const u32, result_of: []const Encoded.Ranges, unencodable: usize) bool {
     const ip = &zcu.ip;
     var d = results.Decoder(results.Lookup).init(gpa, ip, enc.words.items, enc.starts.items, .{ .zcu = zcu }) catch return false;
     defer d.deinit();
@@ -1641,8 +1789,25 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
             std.debug.print("\n", .{});
         }
     };
+    var subjects: usize = 0;
     for (r.unit_list.items, r.unit_info) |unit, info| {
-        const res = result_of[info.node];
+        const res = result_of[info.node].result;
+        const sj = result_of[info.node].subject;
+        if (sj[1] != 0) {
+            subjects += 1;
+            d.miss = .{};
+            const want: ?results.Subject = switch (unit) {
+                .nav_val => |nav| .{ .nav = nav },
+                .type_layout, .struct_defaults => |ty| .{ .ty = ty },
+                .func => |func| .{ .func = func },
+                .comptime_decl => null,
+            };
+            const got = results.decodeSubject(&d, words[sj[0]..][0..sj[1]]) catch null;
+            if (got == null or !subjectEql(got.?, want.?)) {
+                mismatched += 1;
+                if (mismatched <= 10) Check.report(zcu, &d, unit, "its subject differs");
+            }
+        }
         if (res[1] == 0) continue;
         _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();
@@ -1690,10 +1855,28 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
         mismatched += 1;
         if (mismatched <= 10) Check.report(zcu, &d, unit, what);
     }
+    for (r.dependee_list.items, r.dependee_info) |dep, info| {
+        const sj = result_of[info.node].subject;
+        if (sj[1] == 0) continue;
+        subjects += 1;
+        d.miss = .{};
+        const want: results.Subject = switch (dep) {
+            .nav_val, .type_layout, .struct_defaults => unreachable,
+            .nav_ty => |nav| .{ .nav = nav },
+            .func_body, .func_ies => |func| .{ .func = func },
+            .namespace_name => |nn| .{ .namespace_name = .{ .owner = zcu.namespacePtr(nn.namespace).owner_type, .name = ip.stringSlice(nn.name) } },
+            .namespace => |ns| .{ .namespace = zcu.namespacePtr(ns).owner_type },
+            .embed_file => |i| .{ .embed_file = zcu.embed_files.values()[i].key },
+        };
+        const got = results.decodeSubject(&d, words[sj[0]..][0..sj[1]]) catch null;
+        if (got != null and subjectEql(got.?, want)) continue;
+        mismatched += 1;
+        if (mismatched <= 10) std.debug.print("cache check: the subject of a {t} dependee does not round-trip\n", .{dep});
+    }
     for (r.dependee_list.items, r.dependee_info) |dep, info| switch (dep) {
         .func_ies => |func| {
             _ = arena_state.reset(.retain_capacity);
-            const res = result_of[info.node];
+            const res = result_of[info.node].result;
             const got = results.decodeIes(ip, arena_state.allocator(), words[res[0]..][0..res[1]]) catch return false;
             checked += 1;
             const names = zcu.inferred_errors.get(func) orelse &.{};
@@ -1704,15 +1887,219 @@ fn checkResults(gpa: Allocator, zcu: *Zcu, r: *const Recorder, enc: *const resul
         else => {},
     };
     const f = enc.fallbacks;
-    std.debug.print("cache check: {d} results round-trip through {d} items, {d} did not; {d} not encodable ({d} comptime pointers, {d} cycles, {d} too deep)\n", .{
-        checked - mismatched, enc.starts.items.len, mismatched, unencodable, f.comptime_alloc, f.cycle, f.too_deep,
+    std.debug.print("cache check: {d} results and {d} subjects round-trip through {d} items, {d} did not; {d} not encodable ({d} comptime pointers, {d} cycles, {d} too deep)\n", .{
+        checked, subjects, enc.starts.items.len, mismatched, unencodable, f.comptime_alloc, f.cycle, f.too_deep,
     });
     return mismatched == 0;
+}
+
+fn subjectEql(a: results.Subject, b: results.Subject) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .nav => |n| n == b.nav,
+        .ty => |t| t == b.ty,
+        .func => |f| f == b.func,
+        .namespace => |t| t == b.namespace,
+        .namespace_name => |nn| nn.owner == b.namespace_name.owner and std.mem.eql(u8, nn.name, b.namespace_name.name),
+        .embed_file => |k| std.mem.eql(u8, k, b.embed_file),
+    };
 }
 
 /// Everything the linker emits for an atom but its name and key, like
 /// `Atom.SymbolKey.fromContents`, with a faster hash: results need not be
 /// symbol keys.
+/// Whether loading `use.unit` in an edit build makes `use.ty`, and with it
+/// its namespace's effects: if `ty` is its value, or the subject of one of
+/// its plain dependencies, which an edit build brings up to date.
+fn loadMakes(zcu: *Zcu, use: Zcu.EffectUse) bool {
+    const ip = &zcu.ip;
+    if (use.unit == .nav_val and ip.getNav(use.unit.nav_val).val == use.ty) return true;
+    const deps = zcu.deps.get(use.unit) orelse return false;
+    const conditional = zcu.conditional_deps.get(use.unit) orelse &.{};
+    const ns = ip.structInfo(use.ty).namespace;
+    for (deps, 0..) |d, i| {
+        if (std.mem.indexOfScalar(u32, conditional, @intCast(i)) != null) continue;
+        switch (d) {
+            .type_layout, .struct_defaults => |ty| if (ty == use.ty) return true,
+            .namespace => |n| if (n == ns) return true,
+            .namespace_name => |nn| if (nn.namespace == ns) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// `ZAP_CACHE_VERIFY=full`: whether this full build's nodes are those of
+/// the edit build that wrote `prev`: the same nodes with the same results,
+/// source hashes, dependencies, references and atom records. (Not the
+/// output's bytes: the link lays atoms out in analysis order, which an
+/// edit build changes.) Prints the differences.
+fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder, emit: *const Emit, debug_of: []const ?*const Atom.Debug) !bool {
+    const gpa = inc.gpa;
+    const m = if (inc.prev) |*m| m else return true;
+    var pack: Pack = try .open(inc.io, inc.dir);
+    defer pack.close(gpa, inc.io);
+    for (0..m.bases.len) |i| _ = try pack.addBase(gpa, inc.io, inc.dir, m.basePack(i));
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.nodeCount());
+    defer seen.deinit(gpa);
+    var differ: usize = 0;
+    var mine: std.ArrayList([2]Hash) = .empty;
+    defer mine.deinit(gpa);
+    var theirs: std.ArrayList([2]Hash) = .empty;
+    defer theirs.deinit(gpa);
+    var buf: std.array_list.Aligned(u8, .@"16") = .empty;
+    defer buf.deinit(gpa);
+    const V = struct {
+        fn report(rec: *const Recorder, ni: usize, n: *const Node, what: []const u8, count: *usize) void {
+            count.* += 1;
+            if (count.* > 20) return;
+            var name: std.Io.Writer.Allocating = .init(rec.gpa);
+            defer name.deinit();
+            nodeName(rec, ni, &name.writer);
+            std.debug.print("cache verify: {t} node {x} {s}: {s}\n", .{ n.tag, n.key, name.written(), what });
+        }
+        /// The unit or dependee behind node `ni`, for messages.
+        fn nodeName(rec: *const Recorder, ni: usize, w: *std.Io.Writer) void {
+            const z = rec.zcu;
+            for (rec.unit_list.items, rec.unit_info) |unit, info| if (info.node == ni) {
+                z.unitKey(unit, w) catch {};
+                return;
+            };
+            for (rec.dependee_list.items, rec.dependee_info) |d, info| if (info.node == ni) {
+                switch (d) {
+                    .nav_ty => |nav| w.writeAll(z.ip.stringSlice(z.ip.getNav(nav).key)) catch {},
+                    .func_body, .func_ies => |f| z.unitKey(.{ .func = f }, w) catch {},
+                    .namespace_name => |nn| w.print("{s} {s}", .{ z.namespacePtr(nn.namespace).key, z.ip.stringSlice(nn.name) }) catch {},
+                    .namespace => |ns| w.writeAll(z.namespacePtr(ns).key) catch {},
+                    .embed_file => |i| w.writeAll(z.embed_files.values()[i].key) catch {},
+                    .nav_val, .type_layout, .struct_defaults => {},
+                }
+                return;
+            };
+        }
+        fn refKey(bb: *const Manifest.Builder, rec: *const Recorder, ref: Manifest.Ref) [2]Hash {
+            return .{ @backingInt(ref.kind), switch (ref.kind) {
+                .func, .nav => rec.nodes.items[ref.value].key,
+                .ext, .ext_weak, .rt => cache.hash(0, bb.strings.items[bb.ref_names.items[ref.value].off..][0..bb.ref_names.items[ref.value].len]),
+                .err, .error_names, .analyze, .quota => ref.value,
+            } };
+        }
+        fn prevRefKey(mm: *const Manifest, ref: Manifest.Ref) [2]Hash {
+            return .{ @backingInt(ref.kind), switch (ref.kind) {
+                .func, .nav => mm.node(ref.value).key,
+                .ext, .ext_weak, .rt => cache.hash(0, mm.refName(ref.value)),
+                .err, .error_names, .analyze, .quota => ref.value,
+            } };
+        }
+        fn lessThan(_: void, x: [2]Hash, y: [2]Hash) bool {
+            return if (x[0] != y[0]) x[0] < y[0] else x[1] < y[1];
+        }
+        /// Whether every key of `x` is in `y`, both key-sorted lists of
+        /// (key, node).
+        fn subset(x: []const [2]Hash, y: []const [2]Hash) bool {
+            var j: usize = 0;
+            for (x) |p| {
+                while (j < y.len and y[j][0] < p[0]) j += 1;
+                if (j == y.len or y[j][0] != p[0]) return false;
+            }
+            return true;
+        }
+        /// Whether a node of kind `tag` exists only for its dependents'
+        /// edges, which the edge check covers.
+        fn isDependee(tag: u8) bool {
+            const t = std.enums.fromInt(Tag, tag) orelse return false;
+            return switch (t) {
+                .nav_ty, .func_body, .func_ies, .namespace_name, .namespace, .embed_file => true,
+                else => false,
+            };
+        }
+        /// The full build's dependencies the edit build lacks.
+        fn printDiff(rec: *const Recorder, x: []const [2]Hash, y: []const [2]Hash) void {
+            var j: usize = 0;
+            for (x) |p| {
+                while (j < y.len and y[j][0] < p[0]) j += 1;
+                if (j < y.len and y[j][0] == p[0]) continue;
+                var name: std.Io.Writer.Allocating = .init(rec.gpa);
+                defer name.deinit();
+                nodeName(rec, @intCast(p[1]), &name.writer);
+                std.debug.print("cache verify:   the edit build lacks its dependency on {t} {s}\n", .{ rec.nodes.items[@intCast(p[1])].tag, name.written() });
+            }
+        }
+    };
+    for (r.nodes.items, 0..) |*n, ni| {
+        const pi = m.find(n.key) orelse {
+            if (!V.isDependee(@backingInt(n.tag))) V.report(r, ni, n, "only in the full build", &differ);
+            continue;
+        };
+        seen.set(pi);
+        const pn = m.node(pi);
+        if (pn.tag != @backingInt(n.tag)) V.report(r, ni, n, "different kind", &differ);
+        if (pn.src_hash != n.src_hash) V.report(r, ni, n, "different source hash", &differ);
+        if (pn.result_hash != n.result_hash) V.report(r, ni, n, "different result", &differ);
+        mine.clearRetainingCapacity();
+        theirs.clearRetainingCapacity();
+        // Every edge the full build resolved itself, of either kind in the
+        // edit build: which reads are conditional, and which conditional
+        // edges exist, depends on when lowering for the comptime evaluator
+        // happened, which call counts decide, and green units make no calls
+        // (see "Edge kinds"). An extra edge only invalidates more.
+        for (n.deps) |e| {
+            const edge: Manifest.Edge = @bitCast(e);
+            if (edge.kind == .plain) try mine.append(gpa, .{ r.nodes.items[edge.node].key, edge.node });
+        }
+        for (m.deps(pi)) |e| {
+            const edge: Manifest.Edge = @bitCast(e);
+            try theirs.append(gpa, .{ m.node(edge.node).key, edge.node });
+        }
+        std.mem.sortUnstable([2]Hash, mine.items, {}, V.lessThan);
+        std.mem.sortUnstable([2]Hash, theirs.items, {}, V.lessThan);
+        if (!V.subset(mine.items, theirs.items)) {
+            V.report(r, ni, n, "missing dependencies", &differ);
+            if (differ <= 20) V.printDiff(r, mine.items, theirs.items);
+        }
+        mine.clearRetainingCapacity();
+        theirs.clearRetainingCapacity();
+        const range = b.ref_ranges.items[ni];
+        // Not `quota`: which caller instantiates a generic function first,
+        // and so its quota, depends on analysis order, as upstream's.
+        for (b.refs.items[range[0]..][0..range[1]]) |ref| if (ref.kind != .quota) try mine.append(gpa, V.refKey(b, r, ref));
+        for (m.nodeRefs(pi)) |ref| if (ref.kind != .quota) try theirs.append(gpa, V.prevRefKey(m, ref));
+        std.mem.sortUnstable([2]Hash, mine.items, {}, V.lessThan);
+        std.mem.sortUnstable([2]Hash, theirs.items, {}, V.lessThan);
+        if (!std.mem.eql([2]Hash, mine.items, theirs.items)) {
+            V.report(r, ni, n, "different references", &differ);
+            if (differ <= 20) std.debug.print("cache verify:   full build {any}\ncache verify:   edit build {any}\n", .{ mine.items, theirs.items });
+        }
+        const prev_atoms = m.atoms(pi);
+        if (prev_atoms.len != n.atoms.len) {
+            V.report(r, ni, n, "different atoms", &differ);
+            continue;
+        }
+        for (n.atoms, prev_atoms) |ai, ref| {
+            const a = &emit.atoms.items[ai];
+            try buf.resize(gpa, atoms_codec.encodedLen(a, debug_of[ai]));
+            atoms_codec.encode(a, debug_of[ai], buf.items);
+            const old = pack.record(ref) catch {
+                V.report(r, ni, n, "unreadable atom", &differ);
+                break;
+            };
+            if (!std.mem.eql(u8, old, buf.items)) {
+                V.report(r, ni, n, "different atom record", &differ);
+                break;
+            }
+        }
+    }
+    var it = seen.iterator(.{ .kind = .unset });
+    while (it.next()) |pi| {
+        const pn = m.node(@intCast(pi));
+        if (V.isDependee(pn.tag)) continue;
+        differ += 1;
+        if (differ <= 20) std.debug.print("cache verify: node {x} (kind {d}): only in the edit build\n", .{ pn.key, pn.tag });
+    }
+    std.debug.print("cache verify: {d} nodes compared with the edit build's, {d} differ\n", .{ r.nodes.items.len, differ });
+    return differ == 0;
+}
+
 fn contentsHash(a: *const Atom) Hash {
     const unwind = @as(u64, @backingInt(a.unwind.kind)) << 32 | @as(u64, a.unwind.saved) << 16 | a.unwind.stack_size;
     var h = cache.hash(unwind << 16 | @as(u64, @backingInt(a.section)) << 8 | @backingInt(a.alignment), a.bytes);

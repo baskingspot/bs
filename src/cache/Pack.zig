@@ -167,7 +167,7 @@ pub fn totalBytes(p: *const Pack) u64 {
     return n;
 }
 
-fn record(p: *const Pack, ref: AtomRef) DecodeError![]align(16) const u8 {
+pub fn record(p: *const Pack, ref: AtomRef) DecodeError![]align(16) const u8 {
     const off = ref.offset();
     const mem: []align(16) const u8, const start: u64 = if (ref.pack == 0)
         .{ p.map.memory[0..p.len], @sizeOf(Header) }

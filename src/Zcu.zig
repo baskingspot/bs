@@ -17,6 +17,7 @@ const Frontend = @import("Frontend.zig");
 const cache = @import("cache.zig");
 const InternPool = @import("InternPool.zig");
 const Ir = @import("Ir.zig");
+const Replay = @import("Replay.zig");
 const Sema = @import("Sema.zig");
 const diag = @import("diag.zig");
 
@@ -94,6 +95,14 @@ test_filters: []const []const u8 = &.{},
 /// Test declarations to run, in discovery order.
 test_functions: std.ArrayList(InternPool.NavIndex) = .empty,
 errors: std.ArrayList(ErrorMsg) = .empty,
+/// Which units' analysis evaluated a container declaration or `@import`
+/// whose namespace has `effects` (`Sema.createContainerType`). The cache
+/// makes an edit build analyze such a unit again rather than load it,
+/// unless loading it makes the type anyway (see `Incremental.record`).
+effect_uses: std.AutoArrayHashMapUnmanaged(EffectUse, void) = .empty,
+/// In an edit build, the last build's results: each `ensure*` and the
+/// function queue load a unit from it, if it is green, before analyzing it.
+replay: ?*Replay = null,
 /// Owns diagnostic text and namespace tables.
 arena: std.heap.ArenaAllocator,
 
@@ -110,6 +119,8 @@ pub const Export = struct {
 };
 
 pub const FuncState = enum { queued, in_progress, done, failed };
+
+pub const EffectUse = struct { unit: AnalUnit, ty: InternPool.Index };
 
 pub const FuncRef = struct { from: AnalUnit, func: InternPool.Index };
 
@@ -273,6 +284,9 @@ pub const Namespace = struct {
     /// Stable key prefix of declarations in this namespace.
     key: []const u8,
     decls: std.AutoArrayHashMapUnmanaged(InternPool.String, InternPool.NavIndex) = .empty,
+    /// Whether creating it queued `comptime`, exported or test
+    /// declarations: effects beyond the type itself.
+    effects: bool = false,
 
     pub const none = std.math.maxInt(u32);
 };
@@ -317,6 +331,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.comptime_decls.deinit(gpa);
     zcu.comptime_memo.deinit(gpa);
     zcu.conditional_deps.deinit(gpa);
+    zcu.effect_uses.deinit(gpa);
     var bodies = zcu.comptime_bodies.valueIterator();
     while (bodies.next()) |b| switch (b.*) {
         .ready => |r| r.destroy(gpa),
@@ -521,6 +536,7 @@ pub fn createContainerType(
     const arena = zcu.arena.allocator();
     const key_sep = if (parent_ns == Namespace.none) ":" else ".";
     const collect_tests = zcu.is_test and zcu.file(file_index).module == zcu.fe.main_module;
+    const effects = zcu.comptime_decls.count() + zcu.exports.items.len + zcu.test_functions.items.len;
     var comptime_ordinal: u32 = 0;
     var unnamed_tests: u32 = 0;
     for (decls) |decl_inst| {
@@ -576,6 +592,7 @@ pub fn createContainerType(
             },
         }
     }
+    zcu.namespaces.items[ns_index].effects = zcu.comptime_decls.count() + zcu.exports.items.len + zcu.test_functions.items.len != effects;
     return ty;
 }
 
@@ -677,6 +694,11 @@ pub fn ensureNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) Sema.CompileError
         .unresolved => {},
     }
     nav.status = .resolving;
+    if (zcu.replay) |r| if (r.loadNav(nav_index)) {
+        nav.status = .resolved;
+        if (nav.linkage == .@"export" and zcu.ip.indexToKey(nav.val) == .func) try zcu.queueFunc(nav.val);
+        return;
+    };
     Sema.analyzeNavVal(zcu, nav_index) catch |err| {
         nav.status = .failed;
         return err;
@@ -693,6 +715,12 @@ pub fn ensureStructLayout(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!voi
         .failed => return error.AnalysisFail,
         .field_types_wip, .layout_wip => return error.DependencyLoop,
         .none, .have_field_types => {},
+    }
+    if (zcu.replay) |r| {
+        const status = info.status;
+        info.status = .layout_wip;
+        if (r.loadLayout(ty)) return;
+        info.status = status;
     }
     Sema.analyzeStructLayout(zcu, ty) catch |err| {
         info.status = .failed;
@@ -711,6 +739,10 @@ pub fn ensureStructDefaults(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!v
         .none => {},
     }
     info.defaults_status = .wip;
+    if (zcu.replay) |r| if (r.loadDefaults(ty)) {
+        info.defaults_status = .resolved;
+        return;
+    };
     Sema.analyzeStructDefaults(zcu, ty) catch |err| {
         info.defaults_status = .failed;
         return err;
@@ -729,6 +761,10 @@ pub fn ensureFuncIes(zcu: *Zcu, func: InternPool.Index) Sema.CompileError!?[]con
         .in_progress => return error.DependencyLoop,
         .queued => {
             gop.value_ptr.* = .in_progress;
+            if (zcu.replay) |r| if (r.loadFunc(func)) {
+                zcu.funcs.getPtr(func).?.* = .done;
+                return if (zcu.anyerror_ies.contains(func)) null else zcu.inferred_errors.get(func) orelse &.{};
+            };
             var ir = Sema.analyzeFuncBody(zcu, func) catch |err| {
                 zcu.funcs.getPtr(func).?.* = .failed;
                 return err;
@@ -834,6 +870,7 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
         if (done_comptime < zcu.comptime_decls.count()) {
             const c = zcu.comptime_decls.keys()[done_comptime];
             done_comptime += 1;
+            if (zcu.replay) |r| if (r.loadComptime(c)) continue;
             Sema.analyzeComptimeDecl(zcu, c) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {},
@@ -881,6 +918,10 @@ pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
         const state = zcu.funcs.getPtr(func).?;
         if (state.* != .queued) continue;
         state.* = .in_progress;
+        if (zcu.replay) |r| if (r.loadFunc(func)) {
+            zcu.funcs.getPtr(func).?.* = .done;
+            continue;
+        };
         // Analysis can grow `funcs`, so the state is looked up again after.
         var ir = Sema.analyzeFuncBody(zcu, func) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,

@@ -1339,12 +1339,26 @@ fn bcRefuse(sema: *Sema) CompileError!void {
 
 fn fileRootType(sema: *Sema, file_index: u32) CompileError!Index {
     try sema.bcRequire(sema.zcu.file_root_types.items[file_index] != .none);
-    return sema.zcu.fileRootType(file_index);
+    const ty = try sema.zcu.fileRootType(file_index);
+    try sema.noteEffects(ty);
+    return ty;
 }
 
 fn createContainerType(sema: *Sema, kind: Zcu.ContainerKind, file_index: u32, inst: Zir.Inst.Index, captures: []const Index, fqn: []const u8, key: []const u8, parent_ns: u32, reified_layout: ?std.lang.Type.ContainerLayout) CompileError!Index {
     try sema.bcRefuse();
-    return sema.zcu.createContainerType(kind, file_index, inst, captures, fqn, key, parent_ns, reified_layout);
+    const ty = try sema.zcu.createContainerType(kind, file_index, inst, captures, fqn, key, parent_ns, reified_layout);
+    try sema.noteEffects(ty);
+    return ty;
+}
+
+/// Records in `Zcu.effect_uses` that this unit evaluated container type
+/// `ty`, if creating its namespace had effects.
+fn noteEffects(sema: *Sema, ty: Index) Allocator.Error!void {
+    // A lowering for the comptime evaluator is not its owner's analysis.
+    if (sema.bc != null) return;
+    const zcu = sema.zcu;
+    const ns = zcu.ip.structInfo(ty).namespace;
+    if (ns != Zcu.Namespace.none and zcu.namespaces.items[ns].effects) try zcu.effect_uses.put(zcu.gpa, .{ .unit = sema.owner, .ty = ty }, {});
 }
 
 /// Queues `func`, which this unit refers to other than by calling it (its
