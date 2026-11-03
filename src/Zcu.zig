@@ -406,6 +406,8 @@ pub const Namespace = struct {
 pub const ErrorMsg = struct {
     file: u32,
     span: Ast.Span,
+    /// `file` is an `embed_files` index (an imported ZON file).
+    embed: bool = false,
     msg: []const u8,
     code: diag.Code = .unclassified,
     notes: []const Note = &.{},
@@ -422,7 +424,7 @@ pub const ErrorMsg = struct {
     /// `count` repeats of the same note in a row (a recursive call's
     /// frames) render once, as upstream. `call` marks a call-site frame of
     /// the comptime or inline call chain.
-    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1, call: ?diag.CallKind = null, decl: bool = false };
+    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1, call: ?diag.CallKind = null, decl: bool = false, embed: bool = false };
 };
 
 pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
@@ -560,6 +562,17 @@ pub fn addErrorCode(zcu: *Zcu, file_index: u32, span: Ast.Span, code: diag.Code,
     try zcu.errors.append(zcu.gpa, .{ .file = file_index, .span = span, .msg = msg, .code = code });
 }
 
+/// Adds an error in embedded file `embed_index` (an imported ZON file).
+pub fn addEmbedError(zcu: *Zcu, embed_index: u32, span: Ast.Span, code: diag.Code, comptime fmt: []const u8, args: anytype) !void {
+    const msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args);
+    try zcu.errors.append(zcu.gpa, .{ .file = embed_index, .embed = true, .span = span, .msg = msg, .code = code });
+}
+
+/// Adds a note in embedded file `embed_index` to the most recent error.
+pub fn addEmbedNote(zcu: *Zcu, embed_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
+    try zcu.appendNote(.{ .file = embed_index, .embed = true, .span = span, .msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args) });
+}
+
 /// Adds a note to the most recent error.
 pub fn addNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
     try zcu.appendNote(.{ .file = file_index, .span = span, .msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args) });
@@ -585,7 +598,7 @@ fn appendNote(zcu: *Zcu, note: ErrorMsg.Note) !void {
     const e = &zcu.errors.items[zcu.errors.items.len - 1];
     if (e.notes.len != 0) {
         const last = e.notes[e.notes.len - 1];
-        if (last.file == note.file and last.span.main == note.span.main and std.mem.eql(u8, last.msg, note.msg)) {
+        if (last.file == note.file and last.embed == note.embed and last.span.main == note.span.main and std.mem.eql(u8, last.msg, note.msg)) {
             @constCast(&e.notes[e.notes.len - 1]).count += 1;
             return;
         }
@@ -599,6 +612,22 @@ fn appendNote(zcu: *Zcu, note: ErrorMsg.Note) !void {
 fn diagLoc(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, file_index: u32, span: Ast.Span) !diag.Loc {
     const f = zcu.file(file_index);
     return paths.loc(arena, f.display_path, try zcu.fe.source(@fromBackingInt(file_index)), span.start, span.main, span.end, f.module == zcu.fe.module(f.module).builtin_mod);
+}
+
+/// `diagLoc` in a Zcu file, or in an embedded file when `embed`.
+fn diagLocIn(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, file_index: u32, embed: bool, span: Ast.Span) !diag.Loc {
+    if (!embed) return zcu.diagLoc(arena, paths, file_index, span);
+    const e = zcu.embed_files.values()[file_index];
+    const path = try std.fs.path.join(arena, &.{ zcu.fe.module(e.module).root_dir, e.sub_path });
+    return paths.loc(arena, path, e.bytes, span.start, span.main, span.end, false);
+}
+
+/// One `@compileLog` call's output line, made by `unit` at `span` of `file`.
+pub const CompileLog = struct { unit: AnalUnit, file: u32, span: Ast.Span, text: []const u8 };
+
+/// Whether the build failed: an error, or a `@compileLog` call.
+pub fn failed(zcu: *const Zcu) bool {
+    return zcu.errors.items.len != 0 or zcu.compile_logs.items.len != 0;
 }
 
 /// This compilation's errors as diagnostics: AstGen errors of files loaded
@@ -618,12 +647,12 @@ pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag
     }.lessThan);
     for (errors) |e| {
         const notes = try arena.alloc(diag.Note, e.notes.len);
-        for (notes, e.notes) |*n, en| n.* = .{ .loc = try zcu.diagLoc(arena, paths, en.file, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl };
+        for (notes, e.notes) |*n, en| n.* = .{ .loc = try zcu.diagLocIn(arena, paths, en.file, en.embed, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl };
         const fixes: []const diag.Fix = if (e.fix) |f|
             try arena.dupe(diag.Fix, &.{try paths.fix(arena, zcu.file(e.file).display_path, try zcu.fe.source(@fromBackingInt(e.file)), f)})
         else
             &.{};
-        try out.append(arena, .{ .code = e.code, .loc = try zcu.diagLoc(arena, paths, e.file, e.span), .msg = e.msg, .notes = notes, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint, .fixes = fixes });
+        try out.append(arena, .{ .code = e.code, .loc = try zcu.diagLocIn(arena, paths, e.file, e.embed, e.span), .msg = e.msg, .notes = notes, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint, .fixes = fixes });
     }
     return out.items;
 }

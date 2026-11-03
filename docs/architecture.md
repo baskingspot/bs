@@ -72,8 +72,12 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
   bytes (`embed_file`), parses it with `Ast.parse(.zon)` and std's
   `ZonGen`, and lowers the `Zoir` to a value of the import's result type,
   or to anonymous structs and tuples of comptime fields without one (as
-  upstream's `Sema/LowerZon.zig`). Errors in the ZON file are reported at
-  the import, prefixed with the ZON file's line and column.
+  upstream's `Sema/LowerZon.zig`). As upstream, errors point into the ZON
+  file (`Zcu.ErrorMsg.embed`: `file` is then an `embed_files` index):
+  syntax and ZonGen errors with ZonGen's notes, lowering errors with an
+  "imported here" note at the import. A result type ZON cannot express is
+  an error at the import, checked before any value is lowered (upstream's
+  `checkType`).
 
 ### Analysis units
 

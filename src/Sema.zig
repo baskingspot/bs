@@ -5834,26 +5834,45 @@ fn importZon(sema: *Sema, block: *Block, src: Src, path: []const u8, dep: ?Front
     const source = try sema.arena.dupeSentinel(u8, sema.zcu.embed_files.values()[index].bytes, 0);
     var tree = try Ast.parse(gpa, source, .{ .mode = .zon });
     defer tree.deinit(gpa);
+    // Syntax errors point into the ZON file, as upstream, which reports
+    // them as the file's own.
     if (tree.errors.len != 0) {
+        const e = tree.errors[0];
         var msg: std.Io.Writer.Allocating = .init(sema.arena);
-        tree.renderError(tree.errors[0], &msg.writer) catch return error.OutOfMemory;
-        const loc = tree.tokenLocation(0, tree.errors[0].token);
-        return sema.fail(block, src, "{s}:{d}:{d}: {s}", .{ path, loc.line + 1, loc.column + 1, msg.written() });
+        tree.renderError(e, &msg.writer) catch return error.OutOfMemory;
+        const start = tree.tokenStart(e.token) + if (e.token_is_prev) @as(u32, @intCast(tree.tokenSlice(e.token).len)) else 0;
+        try sema.zcu.addEmbedError(@intCast(index), .{ .start = start, .main = start, .end = start }, .syntax, "{s}", .{msg.written()});
+        return sema.failedHere();
     }
     const zoir = try std.zig.ZonGen.generate(gpa, tree, .{});
     defer zoir.deinit(gpa);
     if (zoir.hasCompileErrors()) {
         const e = zoir.compile_errors[0];
         const msg = e.msg.get(&zoir);
-        if (e.token.unwrap()) |tok| {
-            const loc = tree.tokenLocation(0, tok);
-            return sema.fail(block, src, "{s}:{d}:{d}: {s}", .{ path, loc.line + 1, loc.column + 1 + e.node_or_offset, msg });
-        }
-        return sema.fail(block, src, "{s}: {s}", .{ path, msg });
+        try sema.zcu.addEmbedError(@intCast(index), zoirSpan(&tree, e.token, e.node_or_offset), @import("diag.zig").classifyAstGen(msg), "{s}", .{msg});
+        for (e.getNotes(&zoir)) |note|
+            try sema.zcu.addEmbedNote(@intCast(index), zoirSpan(&tree, note.token, note.node_or_offset), "{s}", .{note.msg.get(&zoir)});
+        return sema.failedHere();
     }
-    var z: Zon = .{ .sema = sema, .block = block, .src = src, .zoir = &zoir, .tree = &tree, .path = path, .key = sema.zcu.embed_files.values()[index].key };
+    var z: Zon = .{ .sema = sema, .block = block, .src = src, .zoir = &zoir, .tree = &tree, .embed = @intCast(index), .key = sema.zcu.embed_files.values()[index].key };
     if (res_ty == .none) return z.lowerAnon(.root);
+    try z.checkType(res_ty);
     return z.lower(.root, res_ty);
+}
+
+/// A ZonGen error's location: a byte offset into a token, or a node.
+fn zoirSpan(tree: *const Ast, token: Ast.OptionalTokenIndex, node_or_offset: u32) Ast.Span {
+    if (token.unwrap()) |tok| {
+        const start = tree.tokenStart(tok) + node_or_offset;
+        return .{ .start = start, .main = start, .end = start };
+    }
+    return tree.nodeToSpan(@fromBackingInt(node_or_offset));
+}
+
+/// Marks the error just added as this unit's and fails, as `fail` does.
+fn failedHere(sema: *Sema) CompileError {
+    sema.zcu.errors.items[sema.zcu.errors.items.len - 1].unit = sema.owner;
+    return error.AnalysisFail;
 }
 
 const Zon = struct {
@@ -5863,18 +5882,66 @@ const Zon = struct {
     src: Src,
     zoir: *const std.zig.Zoir,
     tree: *const Ast,
-    path: []const u8,
+    /// The file's `Zcu.embed_files` index.
+    embed: u32,
     /// The file's stable key, `module:sub_path`.
     key: []const u8,
 
     const Node = std.zig.Zoir.Node.Index;
     const Error = CompileError || error{WrongType};
 
-    /// Reports an error at `node`, at the import with the ZON location.
+    /// Reports an error at `node` in the ZON file, with a note at the
+    /// import, as upstream.
     fn fail(z: *const Zon, node: Node, comptime fmt: []const u8, args: anytype) CompileError {
-        const msg = std.fmt.allocPrint(z.sema.arena, fmt, args) catch return error.OutOfMemory;
-        const loc = z.tree.tokenLocation(0, z.tree.firstToken(node.getAstNode(z.zoir)));
-        return z.sema.failCode(z.block, z.src, comptime @import("diag.zig").formatCode(fmt), "{s}:{d}:{d}: {s}", .{ z.path, loc.line + 1, loc.column + 1, msg });
+        const sema = z.sema;
+        try sema.zcu.addEmbedError(z.embed, z.tree.nodeToSpan(node.getAstNode(z.zoir)), comptime @import("diag.zig").formatCode(fmt), fmt, args);
+        try sema.zcu.addNote(sema.file, z.src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "imported here", .{});
+        return sema.failedHere();
+    }
+
+    /// As upstream's LowerZon.checkType: a result type ZON cannot express
+    /// is an error at the import, before any value is lowered.
+    fn checkType(z: *const Zon, ty: Index) CompileError!void {
+        var visited: std.AutoHashMapUnmanaged(Index, void) = .empty;
+        try z.checkTypeInner(ty, .none, &visited);
+    }
+
+    fn checkTypeInner(z: *const Zon, ty: Index, parent_opt: Index, visited: *std.AutoHashMapUnmanaged(Index, void)) CompileError!void {
+        const sema = z.sema;
+        const ip = sema.ip;
+        switch (Type.class(ip, ty)) {
+            .bool, .int, .float, .null, .@"enum", .comptime_float, .comptime_int, .enum_literal => {},
+            .pointer => {
+                const p = Type.ptrInfo(ip, ty);
+                if (!p.flags.is_const) return z.failType(ty, "ZON does not allow mutable pointers");
+                switch (p.flags.size) {
+                    .one => try z.checkTypeInner(p.child, parent_opt, visited),
+                    .slice => try z.checkTypeInner(p.child, .none, visited),
+                    .many => return z.failType(ty, "ZON does not allow many-pointers"),
+                    .c => return z.failType(ty, "ZON does not allow C pointers"),
+                }
+            },
+            .optional => {
+                if (parent_opt != .none) return z.failType(parent_opt, "ZON does not allow nested optionals");
+                try z.checkTypeInner(Type.childType(ip, ty), ty, visited);
+            },
+            .array, .vector => try z.checkTypeInner(Type.childType(ip, ty), .none, visited),
+            .tuple => for (ip.keyPayload(.tuple_type, ty).types) |t| try z.checkTypeInner(t, .none, visited),
+            .@"struct", .@"union" => {
+                const gop = try visited.getOrPut(sema.arena, ty);
+                if (gop.found_existing) return;
+                try sema.resolveLayout(z.block, z.src, ty);
+                for (ip.structInfo(ty).field_types) |t| if (t != .void_type or Type.class(ip, ty) == .@"struct") try z.checkTypeInner(t, .none, visited);
+            },
+            else => return z.failType(ty, null),
+        }
+    }
+
+    fn failType(z: *const Zon, ty: Index, note: ?[]const u8) CompileError {
+        const sema = z.sema;
+        const err = sema.fail(z.block, z.src, "type '{f}' is not available in ZON", .{sema.fmtType(ty)});
+        if (note) |n| try sema.zcu.addNote(sema.file, z.src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "{s}", .{n});
+        return err;
     }
 
     fn lower(z: *const Zon, node: Node, ty: Index) CompileError!Index {
@@ -5924,7 +5991,7 @@ const Zon = struct {
                     t.* = sema.ip.typeOf(v.*);
                 }
                 const ast_node = @backingInt(node.getAstNode(z.zoir));
-                const stem = z.path[if (std.mem.lastIndexOfScalar(u8, z.path, '/')) |k| k + 1 else 0..];
+                const stem = std.fs.path.basenamePosix(sema.zcu.embed_files.values()[z.embed].sub_path);
                 const ty = try sema.internNamed(.{ .tuple_type = .{
                     .types = types,
                     .values = values,
@@ -5942,20 +6009,18 @@ const Zon = struct {
         switch (Type.class(ip, ty)) {
             .optional => {
                 const child = Type.childType(ip, ty);
-                if (Type.class(ip, child) == .optional) return z.fail(node, "type '{f}' is not available in ZON", .{sema.fmtType(ty)});
                 if (node.get(z.zoir) == .null) return sema.intern(.{ .opt = .{ .ty = ty, .val = .none } });
                 return sema.intern(.{ .opt = .{ .ty = ty, .val = try z.lowerInner(node, child) } });
             },
             .pointer => {
                 const p = Type.ptrInfo(ip, ty);
-                if (!p.flags.is_const) return z.fail(node, "type '{f}' is not available in ZON: ZON does not allow mutable pointers", .{sema.fmtType(ty)});
                 switch (p.flags.size) {
                     .one => {
                         const val = try z.lowerInner(node, p.child);
                         return sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .uav = .{ .val = val, .orig_ty = ty } } } });
                     },
                     .slice => return z.lowerSlice(node, ty, p),
-                    else => return z.fail(node, "type '{f}' is not available in ZON", .{sema.fmtType(ty)}),
+                    .many, .c => unreachable, // `checkType`
                 }
             },
             .bool => return switch (node.get(z.zoir)) {

@@ -1379,7 +1379,6 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "pointer to noreturn not allowed", .@"bad-type" },
     .{ "sentinels are only allowed on slices and unknown-length pointers", .@"bad-type" },
     .{ "type '{f}' is not available in ZON", .@"bad-type" },
-    .{ "type '{f}' is not available in ZON: ZON does not allow mutable pointers", .@"bad-type" },
     .{ "type '{f}' not available in ZON", .@"bad-type" },
     .{ "{d} exceeds maximum integer bit count", .@"bad-type" },
     .{ "caught unexpected error 'error.{s}'", .@"caught-error" },
