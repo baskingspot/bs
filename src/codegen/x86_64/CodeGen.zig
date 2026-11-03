@@ -74,6 +74,14 @@ trace_slot: ?i32 = null,
 saved: u32 = 0,
 /// `Ssa.liveness` ran, so value slots are shared by lifetime.
 live: bool = false,
+/// Emitting the cold blocks, after the others: their values get slots of
+/// their own (see `Ssa.place`).
+in_cold: bool = false,
+/// Per cold block, in `Ssa.order`, the debug state where it would have
+/// been emitted in place: its row and the inlined calls open there
+/// (`cold_open[open_start..][0..open_len]`).
+cold_starts: std.ArrayList(ColdStart) = .empty,
+cold_open: std.ArrayList(OpenInline) = .empty,
 /// The function contains inline assembly, so no value gets a register.
 has_asm: bool = false,
 /// Overflow operations whose results only their `struct_field_val`s read
@@ -103,6 +111,8 @@ dbg_open: std.ArrayList(OpenInline) = .empty,
 /// An inlined call whose end is not reached yet, and the caller's row to
 /// resume after it.
 const OpenInline = struct { index: u32, line: u32, column: u32 };
+
+const ColdStart = struct { line: u32, column: u32, open_start: u32, open_len: u32 };
 
 pub const Error = Allocator.Error || error{CodegenFail};
 
@@ -143,6 +153,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const gpa = emit.gpa;
     const t0 = std.Io.Timestamp.now(emit.zcu.io, .awake);
     try emit.ssa.build(gpa, ir);
+    try emit.ssa.place(gpa, ir);
     const t1 = std.Io.Timestamp.now(emit.zcu.io, .awake);
     var t2 = t1;
     defer {
@@ -176,6 +187,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.pairs.deinit(gpa);
         cg.arg_tys.deinit(gpa);
         cg.arg_locs.deinit(gpa);
+        cg.cold_starts.deinit(gpa);
+        cg.cold_open.deinit(gpa);
     }
     @memset(cg.homes, .none);
     try cg.planRegisters();
@@ -354,7 +367,7 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
     const alignment = @min(Type.abiAlignment(cg.ip, ty), 16);
     // Values are emitted in layout order, so a slot whose value's interval
     // has ended can be shared (pass 7 of the design).
-    const class = if (cg.live) Ssa.slotClass(size, alignment) else null;
+    const class = if (cg.live and !cg.in_cold) Ssa.slotClass(size, alignment) else null;
     const home: Home = .{ .slot = if (class) |c| blk: {
         const f = &cg.emit.ssa;
         const off = try f.takeSlot(cg.gpa, inst, c) orelse try cg.allocSlot(c.size, c.alignment);
@@ -1197,16 +1210,59 @@ fn epilogue(cg: *CodeGen) Error!void {
 // ---------------------------------------------------------------------------
 // Instructions
 
-/// Emits the SSA blocks in layout order.
+/// Emits the SSA blocks in `Ssa.order`: the others in layout order, then
+/// the cold ones, each with the debug state it has in place.
 fn emitBlocks(cg: *CodeGen) Error!void {
     const f = cg.ssa;
+    const order = f.order.items;
     for (cg.labels) |*l| l.* = try cg.e.newLabel();
+    var k: usize = 0; // the next block in `order`
     for (f.layout.items, 0..) |block, i| {
-        cg.e.bind(cg.labels[@backingInt(block)]);
-        for (f.blockInsts(block)) |inst| try cg.genInst(inst);
-        const next: Ssa.Block.Index = if (i + 1 < f.layout.items.len) f.layout.items[i + 1] else .none;
-        try cg.genTerm(f.blocks.items[@backingInt(block)].term, next);
+        if (i != 0 and f.fwd.items[@backingInt(block)] != block) continue;
+        if (f.cold.items[@backingInt(block)]) {
+            try cg.cold_starts.append(cg.gpa, .{ .line = cg.dbg_line, .column = cg.dbg_column, .open_start = @intCast(cg.cold_open.items.len), .open_len = @intCast(cg.dbg_open.items.len) });
+            try cg.cold_open.appendSlice(cg.gpa, cg.dbg_open.items);
+            continue;
+        }
+        k += 1;
+        try cg.genBlock(block, if (k < order.len) order[k] else .none);
     }
+    if (k == order.len) return;
+    // Inlined calls left open by the code above stay as they are.
+    cg.in_cold = true;
+    cg.dbg_open.clearRetainingCapacity();
+    for (order[k..], cg.cold_starts.items, k..) |block, s, i| {
+        // The inlined calls open at the block get entries for its code,
+        // with the same call information.
+        const pc: u32 = @intCast(cg.e.code.items.len);
+        for (cg.cold_open.items[s.open_start..][0..s.open_len]) |o| {
+            var copy = cg.dbg_inlines.items[o.index];
+            copy.low = pc;
+            copy.high = pc;
+            copy.parent = if (cg.dbg_open.getLastOrNull()) |p| p.index else Atom.Debug.Inline.none;
+            try cg.dbg_inline_callees.append(cg.gpa, cg.dbg_inline_callees.items[o.index]);
+            try cg.dbg_open.append(cg.gpa, .{ .index = @intCast(cg.dbg_inlines.items.len), .line = o.line, .column = o.column });
+            try cg.dbg_inlines.append(cg.gpa, copy);
+        }
+        if (cg.dbg_open.getLastOrNull()) |o| {
+            try cg.e.lines.switchTo(cg.gpa, cg.dbg_inlines.items[o.index].file, o.index + 1);
+        } else {
+            try cg.e.lines.switchTo(cg.gpa, 0, 0);
+        }
+        cg.dbg_line = s.line;
+        cg.dbg_column = s.column;
+        try cg.e.line(s.line, s.column);
+        try cg.genBlock(block, if (i + 1 < order.len) order[i + 1] else .none);
+        const end: u32 = @intCast(cg.e.code.items.len);
+        for (cg.dbg_open.items) |o| cg.dbg_inlines.items[o.index].high = end;
+        cg.dbg_open.clearRetainingCapacity();
+    }
+}
+
+fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!void {
+    cg.e.bind(cg.labels[@backingInt(block)]);
+    for (cg.ssa.blockInsts(block)) |inst| try cg.genInst(inst);
+    try cg.genTerm(cg.ssa.blocks.items[@backingInt(block)].term, next);
 }
 
 fn checkNaked(cg: *CodeGen, tag: Inst.Tag) Error!void {
@@ -1223,31 +1279,33 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
     const data = ir.instructions.items(.data)[@backingInt(term.inst)];
     switch (term.tag) {
         .noreturn => {},
-        .fallthrough => assert(@backingInt(next) == term.succ[0]),
+        .fallthrough => try cg.jumpTo(term.succ[0], next),
         .jump => {
             try cg.checkNaked(tag);
             if (tag == .br) switch (cg.homes[@backingInt(data.br.block_inst)]) {
                 .slot => |off| try cg.copyTo(Mem.at(.rbp, off), data.br.operand),
                 else => {},
             };
-            try cg.e.jmp(.{ .label = cg.labels[term.succ[0]] });
+            try cg.jumpTo(term.succ[0], next);
         },
         .branch => {
             try cg.checkNaked(tag);
-            assert(@backingInt(next) == term.succ[0]);
             const cond = data.pl_op.operand;
-            if (cond.toIndex()) |c| if (cg.homes[@backingInt(c)] == .fused) {
-                const cc = try cg.condFlags(c);
-                return cg.e.jcc(cc.negate(), .{ .label = cg.labels[term.succ[1]] });
+            const fused = if (cond.toIndex()) |c| cg.homes[@backingInt(c)] == .fused else false;
+            const cc: Encoder.Cond = if (fused) try cg.condFlags(cond.toIndex().?) else cc: {
+                const r = try cg.regOf(cond, .rax);
+                try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
+                break :cc .ne;
             };
-            const r = try cg.regOf(cond, .rax);
-            try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
-            try cg.e.jcc(.e, .{ .label = cg.labels[term.succ[1]] });
+            // Fall through to whichever side follows.
+            if (cg.ssa.fwd.items[term.succ[1]] == next) return cg.e.jcc(cc, .{ .label = cg.blockLabel(term.succ[0]) });
+            try cg.e.jcc(cc.negate(), .{ .label = cg.blockLabel(term.succ[1]) });
+            try cg.jumpTo(term.succ[0], next);
         },
         .switch_br => {
             try cg.checkNaked(tag);
-            assert(@backingInt(next) == term.succ[1]);
             try cg.switchBr(data, term);
+            try cg.jumpTo(term.succ[1], next);
         },
         .ret => {
             try cg.checkNaked(tag);
@@ -1255,6 +1313,17 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         },
         .unreach => try cg.e.ud2(),
     }
+}
+
+/// Jumps to block `target` unless it goes to `next`, the block emitted
+/// next.
+fn jumpTo(cg: *CodeGen, target: u32, next: Ssa.Block.Index) Error!void {
+    if (cg.ssa.fwd.items[target] != next) try cg.e.jmp(.{ .label = cg.blockLabel(target) });
+}
+
+/// The label of the code a branch to block `target` goes to.
+fn blockLabel(cg: *CodeGen, target: u32) Encoder.Label {
+    return cg.labels[@backingInt(cg.ssa.fwd.items[target])];
 }
 
 /// Emits a value, from its IR instruction.
@@ -2101,7 +2170,7 @@ fn switchBr(cg: *CodeGen, data: Inst.Data, term: Ssa.Term) Error!void {
         const items_len = ir.extra[i];
         const items = ir.refSlice(i + 2, items_len);
         i += 2 + items_len + ir.extra[i + 1];
-        const label = cg.labels[@backingInt(case_block)];
+        const label = cg.blockLabel(@backingInt(case_block));
         for (items) |item| {
             if (wide) {
                 try cg.wideEqFlags(data.pl_op.operand, item);

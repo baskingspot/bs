@@ -22,8 +22,18 @@ const Func = @This();
 
 values: std.MultiArrayList(Value) = .empty,
 blocks: std.ArrayList(Block) = .empty,
-/// Blocks in the order their code is laid out.
+/// Blocks in the structured IR's order, which numbers positions for
+/// liveness, allocation, and slot sharing.
 layout: std.ArrayList(Block.Index) = .empty,
+/// Blocks in the order their code is emitted (`place`, passes 3 and 4):
+/// `layout` without the bypassed blocks and with the cold blocks moved to
+/// the end, `order[cold_start..]`.
+order: std.ArrayList(Block.Index) = .empty,
+cold_start: u32 = 0,
+/// Per block: whether it is cold, and the block a branch to it goes to:
+/// itself, or where it jumps if it is bypassed (`place`).
+cold: std.ArrayList(bool) = .empty,
+fwd: std.ArrayList(Block.Index) = .empty,
 /// Switch successors: per switch, its case blocks in IR order.
 extra: std.ArrayList(Block.Index) = .empty,
 /// For each IR instruction that a `br` or `repeat` targets (`block`,
@@ -136,6 +146,9 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.values.deinit(gpa);
     f.blocks.deinit(gpa);
     f.layout.deinit(gpa);
+    f.order.deinit(gpa);
+    f.cold.deinit(gpa);
+    f.fwd.deinit(gpa);
     f.extra.deinit(gpa);
     f.targets.deinit(gpa);
     f.loops.deinit(gpa);
@@ -169,6 +182,65 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     try f.values.ensureTotalCapacity(gpa, ir.instructions.len);
     var b: Builder = .{ .f = f, .gpa = gpa, .ir = ir };
     try b.body(ir.mainBody());
+}
+
+/// Passes 3 and 4: bypasses blocks that only jump (`fwd`) and orders the
+/// rest for emission (`order`). A block without values whose terminator
+/// only jumps (a `repeat`, a `br` without a result, a fallthrough) is
+/// bypassed: branches to it go where it goes. A block that ends with a
+/// call of a noreturn function (a failing check's panic, `@panic`) is
+/// cold and moves to the end, so the hot path falls through its checks
+/// and their branches jump out of line. The entry block stays first.
+///
+/// Positions stay in `layout` order. A cold block ends the function's
+/// execution and defines nothing another block reads, so running it at
+/// the end, with the registers `allocate` gave it in place, is the same
+/// as running it in place: no value defined after it in `layout` order
+/// exists on its path. Slot sharing (`takeSlot`) assumes emission in
+/// position order, so the architecture gives the values of cold blocks
+/// slots of their own.
+pub fn place(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
+    const n = f.blocks.items.len;
+    f.order.clearRetainingCapacity();
+    try f.order.ensureTotalCapacity(gpa, f.layout.items.len);
+    try f.cold.resize(gpa, n);
+    @memset(f.cold.items, false);
+    try f.fwd.resize(gpa, n);
+    for (f.fwd.items, 0..) |*t, i| t.* = @fromBackingInt(@intCast(i));
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const insts = f.values.items(.inst);
+    // Each bypassable block points at its successor; then chains are
+    // followed, and a block on a cycle of them (an empty endless loop)
+    // keeps its code.
+    for (f.layout.items[1..]) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        if (b.len != 0) continue;
+        const only_jumps = switch (b.term.tag) {
+            .fallthrough => true,
+            .jump => tags[@backingInt(b.term.inst)] == .repeat or datas[@backingInt(b.term.inst)].br.operand == Inst.Ref.void_value,
+            else => false,
+        };
+        if (only_jumps) f.fwd.items[@backingInt(block)] = @fromBackingInt(b.term.succ[0]);
+    }
+    for (f.layout.items) |block| {
+        var t = block;
+        var steps: usize = 0;
+        while (f.fwd.items[@backingInt(t)] != t and steps <= n) : (steps += 1) t = f.fwd.items[@backingInt(t)];
+        f.fwd.items[@backingInt(block)] = if (steps > n) block else t;
+    }
+    for (f.layout.items, 0..) |block, i| {
+        if (i != 0 and f.fwd.items[@backingInt(block)] != block) continue;
+        const b = f.blocks.items[@backingInt(block)];
+        const cold = i != 0 and b.len != 0 and (b.term.tag == .noreturn or b.term.tag == .unreach) and
+            tags[@backingInt(insts[b.start + b.len - 1])] == .call;
+        f.cold.items[@backingInt(block)] = cold;
+        if (!cold) f.order.appendAssumeCapacity(block);
+    }
+    f.cold_start = @intCast(f.order.items.len);
+    for (f.layout.items) |block| {
+        if (f.cold.items[@backingInt(block)]) f.order.appendAssumeCapacity(block);
+    }
 }
 
 /// Computes each value's uses and live interval (`live`). A value that is
