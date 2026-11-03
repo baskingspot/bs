@@ -132,55 +132,78 @@ pub const Decoded = struct {
     len: usize,
 };
 
-/// Decodes the record at the start of `bytes`, which must be
-/// `alignment`-aligned. The slices point into `bytes`.
-pub fn decode(bytes: []align(alignment) const u8) DecodeError!Decoded {
-    if (bytes.len < @sizeOf(Header)) return error.CorruptAtom;
+/// Checks the record at the start of `bytes`, which must be
+/// `alignment`-aligned, and returns its length, or null if it is
+/// malformed: its lengths overrun it or `bytes`, or an enum field is out of
+/// range. A record that passes can be read with `view`.
+pub fn check(bytes: []align(alignment) const u8) ?usize {
+    if (bytes.len < @sizeOf(Header)) return null;
     const h: *const Header = @ptrCast(bytes.ptr);
-    if (h.len > bytes.len or h.len % alignment != 0) return error.CorruptAtom;
-    const rec = bytes[0..h.len];
-    const section = std.enums.fromInt(Atom.Section, h.section) orelse return error.CorruptAtom;
-    if (h.alignment > std.math.maxInt(std.math.Log2Int(usize))) return error.CorruptAtom;
+    if (h.len > bytes.len or h.len % alignment != 0) return null;
+    if (std.enums.fromInt(Atom.Section, h.section) == null) return null;
+    if (h.alignment > std.math.maxInt(std.math.Log2Int(usize))) return null;
+    var end: usize = @sizeOf(Header) + 16 * @as(usize, h.targets_len) + @sizeOf(Atom.Reloc) * @as(usize, h.relocs_len);
+    end += @as(usize, h.bytes_len) + h.name_len;
+    if (h.has_debug) {
+        if (std.enums.fromInt(Atom.Debug.Frame, h.debug_frame) == null) return null;
+        const dh_off = end - h.bytes_len - h.name_len;
+        if (dh_off + @sizeOf(DebugHeader) > h.len) return null;
+        const dh = std.mem.bytesToValue(DebugHeader, bytes[dh_off..][0..@sizeOf(DebugHeader)]);
+        end += @sizeOf(DebugHeader) + @as(usize, dh.file_len) + dh.name_len + dh.lines_len;
+    }
+    if (end > h.len) return null;
+    return h.len;
+}
+
+/// The atom and debug info of a record that passed `check`, without
+/// checking it again. The slices point into the record.
+pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug: ?Atom.Debug } {
+    const h: *const Header = @ptrCast(rec);
     var off: usize = @sizeOf(Header);
-    const targets_end = off + 16 * @as(usize, h.targets_len);
-    const relocs_end = targets_end + @sizeOf(Atom.Reloc) * @as(usize, h.relocs_len);
-    if (relocs_end > rec.len) return error.CorruptAtom;
-    const targets: []const Atom.SymbolKey = @ptrCast(@alignCast(rec[off..targets_end]));
-    const relocs: []const Atom.Reloc = @ptrCast(@alignCast(rec[targets_end..relocs_end]));
-    off = relocs_end;
+    const targets: [*]const Atom.SymbolKey = @ptrCast(@alignCast(rec + off));
+    off += 16 * @as(usize, h.targets_len);
+    const relocs: [*]const Atom.Reloc = @ptrCast(@alignCast(rec + off));
+    off += @sizeOf(Atom.Reloc) * @as(usize, h.relocs_len);
     var dh: DebugHeader = undefined;
     if (h.has_debug) {
-        if (off + @sizeOf(DebugHeader) > rec.len) return error.CorruptAtom;
         dh = std.mem.bytesToValue(DebugHeader, rec[off..][0..@sizeOf(DebugHeader)]);
         off += @sizeOf(DebugHeader);
     }
-    var tail_len = @as(usize, h.bytes_len) + h.name_len;
-    if (h.has_debug) tail_len += @as(usize, dh.file_len) + dh.name_len + dh.lines_len;
-    if (off + tail_len > rec.len) return error.CorruptAtom;
-    const atom_bytes = take(rec, &off, h.bytes_len);
-    const name = take(rec, &off, h.name_len);
-    const debug: ?Atom.Debug = if (h.has_debug) .{
-        .file = take(rec, &off, dh.file_len),
-        .name = take(rec, &off, dh.name_len),
-        .base_line = dh.base_line,
-        .lines = take(rec, &off, dh.lines_len),
-        .frame = std.enums.fromInt(Atom.Debug.Frame, h.debug_frame) orelse return error.CorruptAtom,
+    const bytes = rec[off..][0..h.bytes_len];
+    off += h.bytes_len;
+    const name = rec[off..][0..h.name_len];
+    off += h.name_len;
+    const debug: ?Atom.Debug = if (h.has_debug) d: {
+        const file = rec[off..][0..dh.file_len];
+        off += dh.file_len;
+        const debug_name = rec[off..][0..dh.name_len];
+        off += dh.name_len;
+        break :d .{
+            .file = file,
+            .name = debug_name,
+            .base_line = dh.base_line,
+            .lines = rec[off..][0..dh.lines_len],
+            .frame = @fromBackingInt(@intCast(h.debug_frame)),
+        };
     } else null;
     return .{ .atom = .{
         .key = h.key,
         .name = name,
-        .section = section,
+        .section = @fromBackingInt(@intCast(h.section)),
         .alignment = @fromBackingInt(@intCast(h.alignment)),
-        .bytes = atom_bytes,
+        .bytes = bytes,
         .zero_fill = @as(u64, h.zero_fill_hi) << 32 | h.zero_fill_lo,
-        .targets = targets,
-        .relocs = relocs,
-    }, .debug = debug, .len = h.len };
+        .targets = targets[0..h.targets_len],
+        .relocs = relocs[0..h.relocs_len],
+    }, .debug = debug };
 }
 
-fn take(rec: []const u8, off: *usize, len: usize) []const u8 {
-    defer off.* += len;
-    return rec[off.*..][0..len];
+/// Decodes the record at the start of `bytes`, which must be
+/// `alignment`-aligned. The slices point into `bytes`.
+pub fn decode(bytes: []align(alignment) const u8) DecodeError!Decoded {
+    const len = check(bytes) orelse return error.CorruptAtom;
+    const v = view(bytes.ptr);
+    return .{ .atom = v.atom, .debug = v.debug, .len = len };
 }
 
 pub fn expectEqualAtoms(expected: Atom, actual: Atom) !void {
@@ -254,4 +277,14 @@ test "atoms round-trip through records" {
     try std.testing.expectEqual(copy.len, off);
     // A truncated record is an error, not an out-of-bounds read.
     try std.testing.expectError(error.CorruptAtom, decode(copy[0 .. encodedLen(&atoms[0], &debug[0]) - 16]));
+    // So is a bad section, alignment, or frame kind, or debug lengths that
+    // overrun the record (atom 0's debug header is at 64 + 16 + 12).
+    const len0 = encodedLen(&atoms[0], &debug[0]);
+    try std.testing.expectEqual(len0, check(copy));
+    for ([_]struct { usize, u8 }{ .{ 44, 0xff }, .{ 45, 64 }, .{ 47, 0xff }, .{ 92 + 12, 0xff } }) |m| {
+        const saved = copy[m[0]];
+        copy[m[0]] = m[1];
+        try std.testing.expectEqual(null, check(copy));
+        copy[m[0]] = saved;
+    }
 }

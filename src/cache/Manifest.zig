@@ -39,7 +39,9 @@
 //! linked, then the targets nothing defines, then error codes) and drops
 //! the keys nothing uses. It also interns the atoms' debug source paths,
 //! so that every function of a file shares one path and the linker
-//! matches them by address.
+//! matches them by address, and lists the atoms that have debug info, so
+//! that a relink reads the records in place (`Pack.LinkAtoms`) and decodes
+//! nothing.
 //!
 //! Base file: `Header`, then each section at a 16-byte aligned offset.
 //! Log file: `LogHeader`, then records (`RecordHeader` and its body), each
@@ -77,6 +79,9 @@ error_symbols: []const u32,
 /// Each atom reference's debug source path, an index into `files`, or
 /// `no_file`.
 debug_files: []const u32,
+/// The atom references whose `debug_files` entry is not `no_file`,
+/// ascending.
+debug_atoms: []const u32,
 files: []const StrRef,
 nodes: []const Node,
 /// Open-addressing table from `Node.key` to node index + 1 (0: empty),
@@ -238,10 +243,10 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, files, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN04".*;
+const magic = "ZAPMAN05".*;
 const log_magic = "ZAPMLG02".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
@@ -363,7 +368,7 @@ const Overlay = struct {
             gpa.free(g.refs);
             gpa.free(g.numbered);
             gpa.free(g.debug_files);
-            gpa.free(g.targets);
+            gpa.free(g.debug_atoms);
         }
     }
 };
@@ -377,7 +382,7 @@ fn SectionType(comptime s: Section) type {
         .error_names, .bases, .files => StrRef,
         .symbols => Symbol,
         .numbered => NumberedAtom,
-        .targets, .error_symbols, .debug_files => u32,
+        .targets, .error_symbols, .debug_files, .debug_atoms => u32,
         .strings => u8,
     };
 }
@@ -555,19 +560,30 @@ pub fn atoms(m: *const Manifest, index: u32) []const Pack.AtomRef {
 }
 
 /// What to link: every live atom reference in node order, with its
-/// numbered atom and debug file, and the target runs they index.
+/// numbered atom and debug file, the atoms that have debug info, and the
+/// target runs they index: the base's, then the log's (as
+/// `Elf.Symbols.targets` and `targets_tail`).
 pub const LinkInput = struct {
     refs: []const Pack.AtomRef,
     numbered: []const NumberedAtom,
     debug_files: []const u32,
+    debug_atoms: []const u32,
     targets: []const u32,
+    targets_tail: []const u32,
 };
 
 /// Slices of the mapping when the log changed no node; otherwise gathered
 /// once and kept until `close`.
 pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
     const o = &m.overlay;
-    if (o.nodes.count() == 0) return .{ .refs = m.atom_refs, .numbered = m.numbered, .debug_files = m.debug_files, .targets = m.targets };
+    if (o.nodes.count() == 0) return .{
+        .refs = m.atom_refs,
+        .numbered = m.numbered,
+        .debug_files = m.debug_files,
+        .debug_atoms = m.debug_atoms,
+        .targets = m.targets,
+        .targets_tail = o.targets.items,
+    };
     if (o.gathered) |g| return g;
     // The base's references are in node order: copy the runs between
     // changed nodes whole instead of visiting every node.
@@ -600,16 +616,31 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
     try refs.appendSlice(gpa, m.atom_refs[base_done..]);
     try numbered.appendSlice(gpa, m.numbered[base_done..]);
     try debug_files.appendSlice(gpa, m.debug_files[base_done..]);
-    const targets = try std.mem.concat(gpa, u32, &.{ m.targets, o.targets.items });
-    errdefer gpa.free(targets);
+    const debug_atoms = try debugAtoms(gpa, debug_files.items);
+    errdefer gpa.free(debug_atoms);
     const g: LinkInput = .{
         .refs = try refs.toOwnedSlice(gpa),
         .numbered = try numbered.toOwnedSlice(gpa),
         .debug_files = try debug_files.toOwnedSlice(gpa),
-        .targets = targets,
+        .debug_atoms = debug_atoms,
+        .targets = m.targets,
+        .targets_tail = o.targets.items,
     };
     o.gathered = g;
     return g;
+}
+
+/// The indices of `debug_files` that are not `no_file`.
+fn debugAtoms(gpa: Allocator, debug_files: []const u32) ![]u32 {
+    var n: usize = 0;
+    for (debug_files) |f| n += @intFromBool(f != no_file);
+    const out = try gpa.alloc(u32, n);
+    n = 0;
+    for (debug_files, 0..) |f, i| if (f != no_file) {
+        out[n] = @intCast(i);
+        n += 1;
+    };
+    return out;
 }
 
 /// Every live atom reference, in node order.
@@ -1290,6 +1321,9 @@ pub const Builder = struct {
             }
         }
 
+        const debug_atoms = try debugAtoms(gpa, debug_files);
+        defer gpa.free(debug_atoms);
+
         const table = try gpa.alloc(u32, try std.math.ceilPowerOfTwo(usize, @max(16, 2 * nodes.len)));
         defer gpa.free(table);
         @memset(table, 0);
@@ -1325,6 +1359,7 @@ pub const Builder = struct {
             @ptrCast(targets),
             @ptrCast(error_symbols),
             @ptrCast(debug_files),
+            @ptrCast(debug_atoms),
             @ptrCast(b.files.items),
             b.strings.items,
         };
@@ -1413,6 +1448,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         try t.expectEqualSlices(u32, &.{ 1, 2, 0, 3 }, in.targets);
         try t.expectEqual(4, m.errorSymbol(2));
         try t.expectEqualSlices(u32, &.{ 0, no_file }, in.debug_files);
+        try t.expectEqualSlices(u32, &.{0}, in.debug_atoms);
         try t.expectEqualStrings("a.zig", m.file(0));
     }
     var changed: std.ArrayList(u32) = .empty;
@@ -1489,9 +1525,11 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             try t.expectEqual(expected.len, in.numbered.len);
             for (expected, in.numbered, in.debug_files) |e, na, f| {
                 try t.expectEqual(m3.symbol(e[0]).?, na.symbol);
-                for (e[1], in.targets[na.targets..][0..e[1].len]) |key, number| try t.expectEqual(m3.symbol(key).?, number);
+                const runs = if (na.targets < in.targets.len) in.targets[na.targets..] else in.targets_tail[na.targets - in.targets.len ..];
+                for (e[1], runs[0..e[1].len]) |key, number| try t.expectEqual(m3.symbol(key).?, number);
                 if (e[2]) |name| try t.expectEqualStrings(name, m3.file(f)) else try t.expectEqual(no_file, f);
             }
+            try t.expectEqualSlices(u32, &.{ 0, 1, 3 }, in.debug_atoms);
             try t.expectEqual(m3.symbol(0xe3).?, m3.errorSymbol(3));
             try t.expectEqual(m3.symbol(0xe2).?, m3.errorSymbol(2));
             try t.expectEqual(m3.symbol(0xa1).?, m3.entry_symbol);

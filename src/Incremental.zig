@@ -137,37 +137,41 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     if (pack.id != m.pack_id) return false;
     for (0..m.bases.len) |i| _ = pack.addBase(gpa, io, inc.dir, m.basePack(i)) catch return false;
     const in = try m.linkInput(gpa);
-    const atoms = try gpa.alloc(Atom, in.refs.len);
-    defer gpa.free(atoms);
-    var debug: std.ArrayList(Atom.Debug) = .empty;
-    defer debug.deinit(gpa);
     const files = try gpa.alloc([]const u8, m.fileCount());
     defer gpa.free(files);
     for (files, 0..) |*f, i| f.* = m.file(@intCast(i));
-    pack.decodeAll(gpa, io, in.refs, atoms, &debug, .{ .of = in.debug_files, .names = files }) catch |err| switch (err) {
-        error.CorruptAtom => return false,
-        else => |e| return e,
-    };
-    const t2 = now(io);
-
+    const input = try pack.linkAtoms(gpa, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
+    defer input.deinit(gpa);
     const values = try gpa.alloc(Elf.NumberedValue, m.errorCount());
     defer gpa.free(values);
     for (values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
+    const t2 = now(io);
+
     var diag: Elf.Diagnostic = .{};
-    Elf.link(gpa, io, out_dir, sub_path, atoms, .{
+    Elf.linkInput(gpa, io, out_dir, sub_path, input, .{
         .entry = @fromBackingInt(m.entry),
-        .symbols = .{ .atoms = in.numbered, .targets = in.targets, .values = values, .entry = m.entry_symbol, .len = m.symbolLen() },
+        .symbols = .{
+            .atoms = in.numbered,
+            .targets = in.targets,
+            .targets_tail = in.targets_tail,
+            .values = values,
+            .entry = m.entry_symbol,
+            .len = m.symbolLen(),
+        },
         .diag = &diag,
-        .debug = debug.items,
         .comp_dir = cwd,
-    }) catch |err| {
-        std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
-        return err;
+    }) catch |err| switch (err) {
+        // A damaged pack or manifest: build from scratch instead.
+        error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo => return false,
+        else => {
+            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+            return err;
+        },
     };
-    if (inc.timing) std.debug.print("cache: no input changed; relinked {d} atoms in {d:.2} ms (manifest and {d} stats {d:.2}, decode {d:.2}, link {d:.2})\n", .{
-        atoms.len, ms(t0, now(io)), m.inputCount(), ms(t0, t1), ms(t1, t2), ms(t2, now(io)),
+    if (inc.timing) std.debug.print("cache: no input changed; relinked {d} atoms in {d:.2} ms (manifest and {d} stats {d:.2}, packs mapped and input gathered {d:.2}, link {d:.2})\n", .{
+        in.refs.len, ms(t0, now(io)), m.inputCount(), ms(t0, t1), ms(t1, t2), ms(t2, now(io)),
     });
     return true;
 }

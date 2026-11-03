@@ -621,11 +621,13 @@ compilation (see "Integration" below).
 
 - **Atom records** (`cache/atoms.zig`): 16-byte aligned, a 64-byte header,
   then targets, relocations, an optional debug header, then bytes, name, and
-  debug strings. `decode` is zero-copy: the `Atom`'s slices point into the
-  record. A function's debug info is the record's tail, so an Atom and its
-  debug info are cached and replaced together; `decode` returns them
-  apart, and `Pack.decodeAll` builds the linker's `[]Atom.Debug`, sorted by
-  atom index, alongside the Atoms.
+  debug strings. `check` validates a record once (lengths within it,
+  section, alignment, frame kind, debug header lengths); `view` then builds
+  the `Atom` and its `Atom.Debug` from the header without checks, their
+  slices pointing into the record. A function's debug info is the record's
+  tail, so an Atom and its debug info are cached and replaced together.
+  Nothing decodes records into `Atom` arrays for a link: the linker reads
+  them in place through `Pack.LinkAtoms` (below).
 - **Store** (`cache/Store.zig`): each worker fills a `Batch`
   (`put(key, {src_hash, result_hash, deps, atoms, debug, payload})`), and
   `commit` writes all of a build's batches as one pack: a 64-byte header,
@@ -665,17 +667,19 @@ compilation (see "Integration" below).
   contiguous in its atoms' order), each error's number, and the entry's.
   A relink passes these slices straight from the mapping, and the linker
   hashes no keys. A log record numbers only its new keys, after the
-  existing ones, and appends its runs; while a log exists, `linkInput`
-  gathers the atom arrays and concatenates the runs once (~1.2 ms more at
-  100k atoms). Writing a base renumbers in link order (the atoms as they
+  existing ones, and appends its runs, which the linker reads as
+  `Symbols.targets_tail` after the base's runs; while a log exists,
+  `linkInput` gathers the atom arrays once (~1 ms at 100k atoms and 15
+  records). Writing a base renumbers in link order (the atoms as they
   are linked, then targets no atom defines, then error codes and the
   entry) with array lookups, not key hashing, and drops keys nothing uses;
   a manifest written after pack compaction (`Builder.setAtomRefs`)
   therefore numbers the packed atoms 0..n. The link needs each key defined
   once, so `write` rejects a duplicate. The manifest also interns debug
   source paths (`files`, and a file index per atom reference), and
-  `Pack.decodeAll` hands every debug entry its file's one copy, so the
-  linker matches files by address.
+  `LinkAtoms.debug` hands every debug entry its file's one copy, so the
+  linker matches files by address. It lists the atom references that
+  have debug info (`debug_atoms`, ascending), the linker's `debugAtom`.
 - **Pack** (`cache/Pack.zig`): the compilation's own append-only pack plus
   base packs, store packs hard-linked into the compilation's directory. An
   `AtomRef` is 12 bytes: pack (0 for the own pack, else a base), offset in
@@ -685,7 +689,12 @@ compilation (see "Integration" below).
   alive when the store merges or trims that pack. On another file system
   (`EXDEV`) the pack is copied instead. `append` writes the regenerated
   Atoms with one `pwrite` and remaps; old records stay put, so the manifest
-  stays valid across appends. `decodeAll` decodes on every core. `compact`
+  stays valid across appends. `LinkAtoms` is the linker's input
+  (`Elf.linkInput`) read straight from the mappings: `check(i)` bounds the
+  record in its pack and runs `atoms.check`, once per atom in the linker's
+  first pass over it (a failure is `error.InvalidInput`, and the build
+  starts over without the cache), and `atom(i)` and `debug(j)` return
+  values built by `atoms.view`. `compact`
   moves the live records, from every pack, into a new own pack in link
   order when dead bytes (unreferenced records, and the base packs' other
   entries, headers, and dependencies) exceed live ones. The manifest names
@@ -703,12 +712,13 @@ relocations): manifest 14.9 MiB, pack 55 MiB.
 | Step | Time |
 |---|---|
 | No-edit rebuild: lock, map manifest, stat 600 inputs | 0.29–0.57 ms |
-| Open manifest with 15 log records, gather link input | 1.3–1.8 ms |
+| Open manifest with 15 log records, gather link input | 0.96–1.05 ms |
 | Edit storage work: append one unit's Atoms, log record | 0.1 ms |
 | Dependents walk over 29,978 nodes (no early cutoff) | 1.9–2.5 ms |
-| Relink, numbered: map, decode 100,000 Atoms on 4 threads, `Elf.emit` | 15.0–15.2 ms (decode 6.3–6.8, emit 8.4–8.6) |
-| Relink by keys, as before numbering | 20.8–21.9 ms (decode 5.8–6.3, emit 15.1–15.4) |
-| Relink, numbered, after compaction (packed in link order) | 12.4–15.4 ms (emit 7.2–8.7) |
+| Relink, numbered: map, `Elf.emitInput` reading 100,000 records in place | 8.0–10.5 ms (gather 0.01; 10.2–11.7 decoding first) |
+| Relink with 15 log records (gather 1.0–1.2, log runs as `targets_tail`) | 8.5–9.5 ms (11.0–12.9 decoding first) |
+| Relink by keys, as before numbering | 11.2–14.2 ms (15.5–17.2 decoding first) |
+| Relink, numbered, after compaction (packed in link order) | 8.0–8.7 ms (10.4–11.8 decoding first) |
 | Cold save: pack append, manifest base | 80–120 ms, 70–107 ms (numbering the keys 47–74 of it) |
 | Fold log into a new base (renumbers) | 41–71 ms |
 | Compaction, 164 → 55 MiB; manifest renumbered after it | 156–230 ms; 41–54 ms |
@@ -735,9 +745,25 @@ the project's pack (83 ms of pack append on top of the 42 ms store commit
 in `bench-cache`), and project packs naming store packs, which would depend
 on files other builds merge and delete. With hard-linked base packs the
 commit (written into the compilation's directory, then linked into the
-store) takes 42 ms, the relink decodes from it as fast as from an own pack
-(4.1 ms) with byte-identical output, and the cross-file-system fallback
-(store on tmpfs) takes 136 ms.
+store) takes 42 ms, the relink reads it as fast as an own pack with
+byte-identical output, and the cross-file-system fallback (store on tmpfs)
+takes 136 ms.
+
+Decoding before the link (replaced 2026-11-03; the "decoding first"
+numbers above are from the same session): `Pack.decodeAll` built `[]Atom`
+and `[]Atom.Debug` on 4 threads, 4.2–4.7 ms at 100k atoms, and a log's
+target runs were joined into one array. Reading records in place moves
+their page faults and header reads into the linker's passes (emit +1.5–2
+ms) and removes the decode.
+
+Also rejected: faulting the packs in before the link with
+`MADV_POPULATE_READ` in 4 MiB chunks on every core, as the linker
+populates its output. The relink got 0.6–0.8 ms slower (8.6–9.8 against
+8.0–8.9 ms in one session): populating a 68 MiB page-cached file takes 0.9–1.2 ms on 4
+threads, the same as touching each page, and file read faults are already
+cheap (fault-around maps 16 pages each) and spread over the linker's
+threads. The output's case differs: a fresh page's first write fault zeroes
+it and can flush every CPU's TLB.
 
 ### Integration (`src/Incremental.zig`; built 2026-11-02)
 
@@ -748,10 +774,12 @@ store) takes 42 ms, the relink decodes from it as fast as from an own pack
 - **No-edit builds** (`relinkIfUnchanged`, before the frontend): lock the
   compilation, map the manifest, stat its inputs (every file the frontend
   loaded, with content hashes and the racy-mtime rule); if none changed,
-  decode the Atoms from the base packs and link with the manifest's
+  link the records in place from the packs (`Pack.LinkAtoms`) with the manifest's
   numbered symbols, entry, and error codes. Frontend, Sema, and CodeGen do not run. A
   conformance unit loading 562 files (std in test mode): 0.64–0.9 ms in
   zap (0.4–0.6 of it the stats), 2 ms wall, against 14–19 ms for a full build.
+  The generated 24.5k-atom program below relinks in 5.2–7.6 ms (5.3 ms
+  steady), against 7.4–9.5 (7.9 steady) when it decoded first.
 - **Recording** (`record`, after a successful link): Emit tags each atom
   with its owner (a unit, a content-addressed constant, or the link's own
   code) and each unit's uses of constants. The manifest gets one node per

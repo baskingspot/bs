@@ -540,15 +540,11 @@ test "a relink in the manifest's order reproduces the fresh link, with mixed ali
     var m = (try cache.Manifest.open(gpa, io, tmp.dir)).?;
     defer m.close(gpa, io);
     const in = try m.linkInput(gpa);
-    const decoded = try gpa.alloc(Atom, in.refs.len);
-    defer gpa.free(decoded);
-    var decoded_debug: std.ArrayList(Atom.Debug) = .empty;
-    defer decoded_debug.deinit(gpa);
-    try pack.decodeAll(gpa, io, in.refs, decoded, &decoded_debug, .{ .of = in.debug_files, .names = &.{m.file(0)} });
-    const relinked = try Elf.emit(gpa, io, decoded, .{
+    const input = try pack.linkAtoms(gpa, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = &.{m.file(0)} });
+    defer input.deinit(gpa);
+    const relinked = try Elf.emitInput(gpa, io, input, .{
         .entry = start,
-        .debug = decoded_debug.items,
-        .symbols = .{ .atoms = in.numbered, .targets = in.targets, .entry = m.entry_symbol, .len = m.symbolLen() },
+        .symbols = .{ .atoms = in.numbered, .targets = in.targets, .targets_tail = in.targets_tail, .entry = m.entry_symbol, .len = m.symbolLen() },
     });
     defer gpa.free(relinked);
     try std.testing.expectEqualSlices(u8, fresh, relinked);

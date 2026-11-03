@@ -5,9 +5,10 @@
 //! manifest and pack, and times what rebuilds would do with them:
 //!
 //! - no-edit rebuild: lock, map the manifest, stat every input;
-//! - relink: map the pack, decode every Atom, `Elf.emit` straight from the
-//!   mapping with the manifest's numbered symbols (checked against an emit
-//!   of the original Atoms), and by keys for comparison;
+//! - relink: map the manifest and pack, `Elf.emitInput` reading the records
+//!   in place (`Pack.LinkAtoms`) with the manifest's numbered symbols
+//!   (checked against an emit of the original Atoms), and by keys for
+//!   comparison;
 //! - edit rebuild storage work: append a unit's new Atoms, find its
 //!   dependents, write the next manifest;
 //! - compaction, and the global store (a first build's puts and commit,
@@ -143,22 +144,19 @@ pub fn main(init: std.process.Init) !void {
     var relink: Stats = .{};
     var relink_keys: Stats = .{};
     var emit_memory: Stats = .{};
-    const decoded = try gpa.alloc(Atom, atoms.len);
-    defer gpa.free(decoded);
-    var decoded_debug: std.ArrayList(Atom.Debug) = .empty;
-    defer decoded_debug.deinit(gpa);
     for (0..runs) |i| {
-        relink.add(try relinkOnce(gpa, io, dir, decoded, &decoded_debug, keys[0], if (i == 0) expected else null));
+        relink.add(try relinkOnce(gpa, io, dir, keys[0], if (i == 0) expected else null));
 
         const t0 = now(io);
         var m = (try Manifest.open(gpa, io, dir)).?;
         var p: Pack = try .open(io, dir);
-        decoded_debug.clearRetainingCapacity();
-        try p.decodeAll(gpa, io, try m.allAtomRefs(gpa), decoded, &decoded_debug, null);
+        const in = try m.linkInput(gpa);
+        var files: [512][]const u8 = undefined;
+        for (files[0..m.fileCount()], 0..) |*f, j| f.* = m.file(@intCast(j));
+        const input = try p.linkAtoms(gpa, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files[0..m.fileCount()] });
+        defer input.deinit(gpa);
         const t1 = now(io);
-        var from_pack = parallel;
-        from_pack.debug = decoded_debug.items;
-        const out = try Elf.emit(gpa, io, decoded, from_pack);
+        const out = try Elf.emitInput(gpa, io, input, parallel);
         const t2 = now(io);
         if (i == 0 and !std.mem.eql(u8, out, expected)) @panic("relink by keys differs");
         gpa.free(out);
@@ -185,7 +183,15 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(new_atoms);
         var new_debug: std.ArrayList(Atom.Debug) = .empty;
         defer new_debug.deinit(gpa);
-        try p.decodeAll(gpa, io, old_refs, new_atoms, &new_debug, null);
+        for (old_refs, new_atoms, 0..) |r, *a, k| {
+            const d = try p.decode(r);
+            a.* = d.atom;
+            if (d.debug) |dbg| {
+                var e = dbg;
+                e.atom = @intCast(k);
+                try new_debug.append(gpa, e);
+            }
+        }
         const new_refs = try gpa.alloc(Pack.AtomRef, old_refs.len);
         defer gpa.free(new_refs);
         const t0 = now(io);
@@ -229,7 +235,7 @@ pub fn main(init: std.process.Init) !void {
         m.close(gpa, io);
     }
     var relink_logged: Stats = .{};
-    for (0..runs) |i| relink_logged.add(try relinkOnce(gpa, io, dir, decoded, &decoded_debug, keys[0], if (i == 0) expected else null));
+    for (0..runs) |i| relink_logged.add(try relinkOnce(gpa, io, dir, keys[0], if (i == 0) expected else null));
     const log_size: u64 = (try dir.statFile(io, "manifest.log", .{})).size;
     var fold_ns: u64 = 0;
     {
@@ -272,7 +278,7 @@ pub fn main(init: std.process.Init) !void {
         renumber_ns = since(io, t1);
     }
     var relink_packed: Stats = .{};
-    for (0..runs) |i| relink_packed.add(try relinkOnce(gpa, io, dir, decoded, &decoded_debug, keys[0], if (i == 0) expected else null));
+    for (0..runs) |i| relink_packed.add(try relinkOnce(gpa, io, dir, keys[0], if (i == 0) expected else null));
 
     var n_relocs: usize = 0;
     var n_edges: usize = 0;
@@ -291,10 +297,10 @@ pub fn main(init: std.process.Init) !void {
     print("no-edit rebuild (median / best of {d}): {d:.3} / {d:.3} ms\n", .{ runs, ms(noedit.median(3)), ms(noedit.best(3)) });
     print("  lock {d:.3}, map manifest {d:.3}, stat {d} inputs {d:.3}\n", .{ ms(noedit.median(0)), ms(noedit.median(1)), n_inputs, ms(noedit.median(2)) });
     print("relink, numbered by the manifest (median / best): {d:.2} / {d:.2} ms\n", .{ ms(relink.median(3)), ms(relink.best(3)) });
-    print("  map manifest and pack {d:.3}, decode {d} atoms {d:.2}, Elf.emit from the mapping {d:.2}\n", .{
+    print("  map manifest and pack {d:.3}, gather the input of {d} atoms {d:.3}, Elf.emitInput from the mapping {d:.2}\n", .{
         ms(relink.median(0)), atoms.len, ms(relink.median(1)), ms(relink.median(2)),
     });
-    print("  by keys instead: {d:.2} / {d:.2} ms (decode {d:.2}, Elf.emit {d:.2}; from memory {d:.2})\n", .{
+    print("  by keys instead: {d:.2} / {d:.2} ms (gather {d:.2}, Elf.emitInput {d:.2}; Elf.emit from memory {d:.2})\n", .{
         ms(relink_keys.median(3)), ms(relink_keys.best(3)), ms(relink_keys.median(1)), ms(relink_keys.median(2)), ms(emit_memory.median(0)),
     });
     print("edit rebuild storage work (median / best): {d:.2} / {d:.2} ms\n", .{ ms(edit.median(3)), ms(edit.best(3)) });
@@ -304,20 +310,21 @@ pub fn main(init: std.process.Init) !void {
     print("open with {d} log records ({d:.1} KiB) and gather atom refs (median): {d:.3} ms; fold into a new base: {d:.2} ms\n", .{
         runs, @as(f64, @floatFromInt(log_size)) / 1024, ms(open_logged.median(0)), ms(fold_ns),
     });
-    print("relink with the log's records: {d:.2} / {d:.2} ms (decode {d:.2}, Elf.emit {d:.2})\n", .{
+    print("relink with the log's records: {d:.2} / {d:.2} ms (gather {d:.2}, Elf.emitInput {d:.2})\n", .{
         ms(relink_logged.median(3)), ms(relink_logged.best(3)), ms(relink_logged.median(1)), ms(relink_logged.median(2)),
     });
     print("compaction: {d:.1} -> {d:.1} MiB in {d:.2} ms, manifest renumbered in link order {d:.2} ms\n", .{ mib(uncompacted_size), mib(compacted_size), ms(compaction_ns), ms(renumber_ns) });
-    print("relink after compaction, numbered and packed: {d:.2} / {d:.2} ms (map {d:.3}, decode {d:.2}, Elf.emit {d:.2})\n", .{
+    print("relink after compaction, numbered and packed: {d:.2} / {d:.2} ms (map {d:.3}, gather {d:.2}, Elf.emitInput {d:.2})\n", .{
         ms(relink_packed.median(3)), ms(relink_packed.best(3)), ms(relink_packed.median(0)), ms(relink_packed.median(1)), ms(relink_packed.median(2)),
     });
     try benchStores(gpa, io, arena, rand, work, atoms, debug, keys[0]);
 }
 
-/// A relink as `Incremental` does it: map the manifest and pack, decode
-/// the atoms with interned debug paths, and `Elf.emit` with the manifest's
-/// numbered symbols. Checks the output against `expected`, if given.
-fn relinkOnce(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, decoded: []Atom, decoded_debug: *std.ArrayList(Atom.Debug), entry: Atom.SymbolKey, expected: ?[]const u8) ![4]u64 {
+/// A relink as `Incremental` does it: map the manifest and pack, and
+/// `Elf.emitInput` from the mapped records with the manifest's numbered
+/// symbols. Checks the output against `expected`, if given. Returns open,
+/// input gathering, emit, and total times.
+fn relinkOnce(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, entry: Atom.SymbolKey, expected: ?[]const u8) ![4]u64 {
     const t0 = now(io);
     var m = (try Manifest.open(gpa, io, dir)).?;
     defer m.close(gpa, io);
@@ -328,16 +335,22 @@ fn relinkOnce(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, decoded: []Atom, deco
     const in = try m.linkInput(gpa);
     var names: [512][]const u8 = undefined;
     for (names[0..m.fileCount()], 0..) |*f, i| f.* = m.file(@intCast(i));
-    decoded_debug.clearRetainingCapacity();
-    try p.decodeAll(gpa, io, in.refs, decoded, decoded_debug, .{ .of = in.debug_files, .names = names[0..m.fileCount()] });
-    const t2 = now(io);
+    const input = try p.linkAtoms(gpa, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = names[0..m.fileCount()] });
+    defer input.deinit(gpa);
     var values: [n_errors]Elf.NumberedValue = undefined;
     for (&values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };
-    const out = try Elf.emit(gpa, io, decoded, .{
+    const t2 = now(io);
+    const out = try Elf.emitInput(gpa, io, input, .{
         .entry = entry,
         .comp_dir = "/bench",
-        .debug = decoded_debug.items,
-        .symbols = .{ .atoms = in.numbered, .targets = in.targets, .values = &values, .entry = m.entry_symbol, .len = m.symbolLen() },
+        .symbols = .{
+            .atoms = in.numbered,
+            .targets = in.targets,
+            .targets_tail = in.targets_tail,
+            .values = &values,
+            .entry = m.entry_symbol,
+            .len = m.symbolLen(),
+        },
     });
     defer gpa.free(out);
     const t3 = now(io);
@@ -473,10 +486,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
             defer gpa.free(expected);
             const offs = try arena.alloc(usize, n_units);
             const refs = try arena.alloc(Pack.AtomRef, atoms.len);
-            const decoded = try gpa.alloc(Atom, atoms.len);
-            defer gpa.free(decoded);
-            var decoded_debug: std.ArrayList(Atom.Debug) = .empty;
-            defer decoded_debug.deinit(gpa);
+            var debug_atoms: std.ArrayList(u32) = .empty;
             const shm_ok = if (Io.Dir.cwd().access(io, "/dev/shm", .{})) true else |_| false;
             for ([_]bool{ false, true }) |cross| {
                 if (cross and !shm_ok) continue;
@@ -507,6 +517,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                 var p: Pack = try .open(io, cdir);
                 defer p.close(gpa, io);
                 const base = try p.addBase(gpa, io, cdir, &name);
+                debug_atoms.clearRetainingCapacity();
                 for (0..n_threads) |i| {
                     const lo = i * n_units / n_threads;
                     const hi = (i + 1) * n_units / n_threads;
@@ -516,7 +527,9 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                         var cursor: cache.atoms.DebugCursor = .{ .debug = c.debug };
                         const first_atom = u * atoms.len / n_units;
                         for (c.atoms, 0..) |*a, j| {
-                            const len = cache.atoms.encodedLen(a, cursor.of(j));
+                            const d = cursor.of(j);
+                            if (d != null) try debug_atoms.append(arena, @intCast(first_atom + j));
+                            const len = cache.atoms.encodedLen(a, d);
                             refs[first_atom + j] = .initIn(base, off, @intCast(len));
                             off += len;
                         }
@@ -525,19 +538,17 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                 var relink: Stats = .{};
                 for (0..5) |_| {
                     const t0 = now(io);
-                    decoded_debug.clearRetainingCapacity();
-                    try p.decodeAll(gpa, io, refs, decoded, &decoded_debug, null);
+                    const input = try p.linkAtoms(gpa, refs, debug_atoms.items, null);
+                    defer input.deinit(gpa);
                     const t1 = now(io);
-                    var o = options;
-                    o.debug = decoded_debug.items;
-                    const out = try Elf.emit(gpa, io, decoded, o);
+                    const out = try Elf.emitInput(gpa, io, input, options);
                     const t2 = now(io);
                     if (!std.mem.eql(u8, out, expected)) @panic("relink from the store pack differs");
                     gpa.free(out);
                     relink.add(.{ ns(t0, t1), ns(t1, t2), 0, 0 });
                 }
                 if (cross) Io.Dir.cwd().deleteTree(io, "/dev/shm/zap-bench-cache") catch {};
-                print("  first build writing Atoms once ({s}): commit into the compilation dir and {s} {d:.0} ms; relink from it: decode {d:.2} ms, Elf.emit {d:.2} ms (same output)\n", .{
+                print("  first build writing Atoms once ({s}): commit into the compilation dir and {s} {d:.0} ms; relink from it: gather {d:.2} ms, Elf.emitInput {d:.2} ms (same output)\n", .{
                     if (cross) "store on tmpfs" else "same file system", if (cross) "copy to the store" else "hard-link into the store", ms(t_keep), ms(relink.median(0)), ms(relink.median(1)),
                 });
             }

@@ -1,7 +1,7 @@
 //! Every Atom one compilation last linked, in one append-only file, so a
 //! relink reads one mapped file instead of an entry per unit. A build
-//! appends the Atoms it regenerated (`append`) and links from the mapping
-//! (`decodeAll`); which records are live is recorded in the manifest as
+//! appends the Atoms it regenerated (`append`) and links from the mapping,
+//! reading the records in place (`LinkAtoms`); which records are live is recorded in the manifest as
 //! `AtomRef`s. Old records stay where they are, so a manifest written
 //! before an append still describes the pack; when dead records outgrow
 //! live ones, `compact` rewrites the pack with only the live records, in
@@ -37,7 +37,7 @@ id: Hash,
 len: u64,
 /// Maps `[0, len)`.
 map: Io.File.MemoryMap,
-/// Mappings replaced by appends, kept until `close` so atoms decoded from
+/// Mappings replaced by appends, kept until `close` so atoms read from
 /// them stay valid.
 retired: std.ArrayList(Io.File.MemoryMap) = .empty,
 /// Base packs, mapped: pack index `i` is `bases.items[i - 1]`.
@@ -193,72 +193,91 @@ pub const DebugFiles = struct {
     names: []const []const u8,
 };
 
-/// Decodes the atoms at `refs` into `out`, ready to link, and appends
-/// their debug info to `debug`, sorted by `atom`, an index into `out`.
-/// With `files`, every debug path is replaced by its interned copy, so
-/// that the linker matches paths by address. Runs on one thread per CPU:
-/// writing the `Atom`s is most of the cost. `gpa` must be thread-safe.
-pub fn decodeAll(
-    p: *const Pack,
-    gpa: Allocator,
-    io: Io,
-    refs: []const AtomRef,
-    out: []Atom,
-    debug: *std.ArrayList(Atom.Debug),
-    files: ?DebugFiles,
-) (DecodeError || Allocator.Error || Io.Cancelable)!void {
+/// The atoms at `refs` as the linker's input (`Elf.linkInput`), read in
+/// place from the mapped records: nothing is decoded up front. Valid until
+/// `close`, as mappings replaced by `append` or `compact` stay mapped until
+/// then. Free with `LinkAtoms.deinit`.
+pub fn linkAtoms(p: *const Pack, gpa: Allocator, refs: []const AtomRef, debug_atoms: []const u32, files: ?DebugFiles) !LinkAtoms {
     if (files) |f| std.debug.assert(f.of.len == refs.len);
-    const Chunk = struct {
-        first: u32,
-        refs: []const AtomRef,
-        out: []Atom,
-        debug: std.ArrayList(Atom.Debug) = .empty,
-        err: ?(DecodeError || Allocator.Error) = null,
-
-        fn decode(c: *@This(), pack: *const Pack, a: Allocator, fs: ?DebugFiles) void {
-            c.decodeOrFail(pack, a, fs) catch |e| {
-                c.err = e;
-            };
-        }
-
-        fn decodeOrFail(c: *@This(), pack: *const Pack, a: Allocator, fs: ?DebugFiles) !void {
-            for (c.refs, c.out, c.first..) |r, *atom, i| {
-                const d = try pack.decode(r);
-                atom.* = d.atom;
-                if (d.debug) |dbg| {
-                    var e = dbg;
-                    e.atom = @intCast(i);
-                    if (fs) |f| {
-                        const index = f.of[i];
-                        if (index >= f.names.len) return error.CorruptAtom;
-                        e.file = f.names[index];
-                    }
-                    try c.debug.append(a, e);
-                }
-            }
-        }
-    };
-    const max_threads = 16;
-    const n = @min(max_threads, std.Thread.getCpuCount() catch 1, @max(1, refs.len / 4096));
-    var chunks: [max_threads]Chunk = undefined;
-    for (chunks[0..n], 0..) |*c, i| {
-        const lo = i * refs.len / n;
-        const hi = (i + 1) * refs.len / n;
-        c.* = .{ .first = @intCast(lo), .refs = refs[lo..hi], .out = out[lo..hi] };
-    }
-    defer for (chunks[0..n]) |*c| c.debug.deinit(gpa);
-    var group: Io.Group = .init;
-    for (chunks[1..n]) |*c| group.async(io, Chunk.decode, .{ c, p, gpa, files });
-    chunks[0].decode(p, gpa, files);
-    try group.await(io);
-    var n_debug: usize = 0;
-    for (chunks[0..n]) |*c| {
-        if (c.err) |e| return e;
-        n_debug += c.debug.items.len;
-    }
-    try debug.ensureUnusedCapacity(gpa, n_debug);
-    for (chunks[0..n]) |*c| debug.appendSliceAssumeCapacity(c.debug.items);
+    const mems = try gpa.alloc([]align(16) const u8, 1 + p.bases.items.len);
+    mems[0] = p.map.memory[0..p.len];
+    for (mems[1..], p.bases.items) |*m, b| m.* = b.memory;
+    return .{ .mems = mems, .refs = refs, .debug_atoms = debug_atoms, .files = files };
 }
+
+/// The linker's input read from mapped packs (see `linkAtoms`), with the
+/// declarations of `Elf.AtomSlice`. `check` validates a record once; then
+/// `atom` and `debug` build their values from its header without checks.
+pub const LinkAtoms = struct {
+    /// Each pack's mapped bytes, by pack index.
+    mems: []const []align(16) const u8,
+    refs: []const AtomRef,
+    /// The atoms with debug info, ascending (`Manifest.LinkInput`).
+    debug_atoms: []const u32,
+    /// Without them, debug paths are the records' own copies.
+    files: ?DebugFiles,
+
+    pub fn deinit(in: LinkAtoms, gpa: Allocator) void {
+        gpa.free(in.mems);
+    }
+
+    pub inline fn len(in: LinkAtoms) usize {
+        return in.refs.len;
+    }
+
+    inline fn rec(in: LinkAtoms, i: usize) [*]align(16) const u8 {
+        const r = in.refs[i];
+        return @alignCast(in.mems[r.pack].ptr + r.offset());
+    }
+
+    /// Whether atom `i`'s record lies in its pack and is well-formed,
+    /// debug info included (`atoms_codec.check`).
+    pub inline fn check(in: LinkAtoms, i: usize) bool {
+        const r = in.refs[i];
+        if (r.pack >= in.mems.len) return false;
+        const mem = in.mems[r.pack];
+        const off = r.offset();
+        if ((r.pack == 0 and off < @sizeOf(Header)) or off > mem.len or r.len > mem.len - off) return false;
+        return atoms_codec.check(@alignCast(mem[off..][0..r.len])) == r.len;
+    }
+
+    pub inline fn atom(in: LinkAtoms, i: usize) Atom {
+        return atoms_codec.view(in.rec(i)).atom;
+    }
+
+    pub inline fn debugLen(in: LinkAtoms) usize {
+        return in.debug_atoms.len;
+    }
+
+    pub inline fn debugAtom(in: LinkAtoms, j: usize) u32 {
+        return in.debug_atoms[j];
+    }
+
+    /// Debug entry `j`, with its interned path. A listed atom whose record
+    /// has no debug info, or whose path index is out of range (a damaged
+    /// manifest), gets empty debug info rather than a read out of bounds.
+    pub inline fn debug(in: LinkAtoms, j: usize) Atom.Debug {
+        const i = in.debug_atoms[j];
+        var d = atoms_codec.view(in.rec(i)).debug orelse
+            return .{ .file = "", .name = "", .base_line = 0, .lines = &.{}, .frame = .none };
+        if (in.files) |fs| {
+            const f = fs.of[i];
+            d.file = if (f < fs.names.len) fs.names[f] else "";
+        }
+        return d;
+    }
+
+    pub inline fn prefetch(in: LinkAtoms, i: usize, comptime keys: bool) void {
+        _ = keys;
+        const p = in.rec(i);
+        @prefetch(p, .{});
+        @prefetch(p + 64, .{});
+    }
+
+    pub inline fn prefetchDebug(in: LinkAtoms, j: usize) void {
+        @prefetch(in.rec(in.debug_atoms[j]), .{});
+    }
+};
 
 /// Whether dead bytes (records no longer referenced, and the base packs'
 /// other contents) outweigh live ones, given the bytes of the records
@@ -330,22 +349,32 @@ test "append, reopen, decode, and compact" {
     var p: Pack = try .open(io, tmp.dir);
     defer p.close(gpa, io);
     try std.testing.expectEqual(id, p.id);
-    var decoded: [3]Atom = undefined;
-    var decoded_debug: std.ArrayList(Atom.Debug) = .empty;
-    defer decoded_debug.deinit(gpa);
-    // Atom a comes second here, so its debug entry must name index 1.
-    const order = [_]AtomRef{ refs[1], refs[0], refs[2] };
-    try p.decodeAll(gpa, io, &order, &decoded, &decoded_debug, null);
-    for ([_]usize{ 1, 0, 2 }, decoded) |e, a| try atoms_codec.expectEqualAtoms(atoms[e], a);
-    try std.testing.expectEqual(1, decoded_debug.items.len);
-    try std.testing.expectEqual(1, decoded_debug.items[0].atom);
-    try atoms_codec.expectEqualDebug(&debug[0], &decoded_debug.items[0]);
-    // With interned files, each debug entry takes its file's one copy.
-    const names: []const []const u8 = &.{ "x.zig", "y.zig" };
+    // Read in place as the linker's input. Atom a comes second here, and
+    // its debug entry takes its file's one interned copy.
     const no_file = std.math.maxInt(u32);
-    decoded_debug.clearRetainingCapacity();
-    try p.decodeAll(gpa, io, &order, &decoded, &decoded_debug, .{ .of = &.{ no_file, 1, no_file }, .names = names });
-    try std.testing.expectEqual(names[1].ptr, decoded_debug.items[0].file.ptr);
+    const names: []const []const u8 = &.{ "x.zig", "t.zig" };
+    const order = [_]AtomRef{ refs[1], refs[0], refs[2], .init(p.len, 64), .initIn(1, 0, 64), refs[0] };
+    const of = [_]u32{ no_file, 1, no_file, no_file, no_file, no_file };
+    const input = try p.linkAtoms(gpa, &order, &.{1}, .{ .of = &of, .names = names });
+    defer input.deinit(gpa);
+    for ([_]usize{ 1, 0, 2 }, 0..) |e, i| {
+        try std.testing.expect(input.check(i));
+        try atoms_codec.expectEqualAtoms(atoms[e], input.atom(i));
+    }
+    try std.testing.expectEqual(1, input.debugLen());
+    try std.testing.expectEqual(1, input.debugAtom(0));
+    const d = input.debug(0);
+    try atoms_codec.expectEqualDebug(&debug[0], &d);
+    try std.testing.expectEqual(names[1].ptr, d.file.ptr);
+    // Past the end of the pack, in a pack that is not there.
+    try std.testing.expect(!input.check(3));
+    try std.testing.expect(!input.check(4));
+    // A reference whose length is not its record's.
+    var short = order;
+    short[5].len -= 16;
+    const input_short = try p.linkAtoms(gpa, &short, &.{}, .{ .of = &of, .names = names });
+    defer input_short.deinit(gpa);
+    try std.testing.expect(!input_short.check(5));
     try std.testing.expectError(error.CorruptAtom, p.decode(.init(p.len, 64)));
 
     // Only b and a are live, in that order.
@@ -359,8 +388,8 @@ test "append, reopen, decode, and compact" {
     const a = try p.decode(live[1]);
     try atoms_codec.expectEqualAtoms(atoms[0], a.atom);
     try atoms_codec.expectEqualDebug(&debug[0], &a.debug.?);
-    // Decoded before compaction, still valid.
-    try atoms_codec.expectEqualAtoms(atoms[2], decoded[2]);
+    // Read before compaction, still valid.
+    try atoms_codec.expectEqualAtoms(atoms[2], input.atom(2));
 }
 
 test "base packs are linked, decoded, and compacted away" {
