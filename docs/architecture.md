@@ -558,7 +558,12 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   +0.6 ms on 16; linking to a file 6.8–7.1 ms against 5.7–5.9, so writing
   the dSYM costs about 1.1 ms. Under callgrind on the orb, stripped emits
   cost 0.05% more instructions outside SHA-256 (464.5M → 464.8M), from
-  code layout.
+  code layout. A leaf function that keeps lr in its register and needs no
+  frame should get a frameless `Atom.Debug.Frame` kind, encoded
+  UNWIND_ARM64_MODE_FRAMELESS (0x02000000 with no stack), as clang does,
+  so that unwinders step through a fault in a leaf. It comes with the
+  aarch64 CodeGen, which knows which functions those are; until then
+  such functions get `.none`.
 - Measured Mach-O link throughput (2026-11-02, Apple M4 Max, 12+4 cores,
   `zig build bench-link -- macho`, best of 15): the same 100k atoms with
   aarch64 relocations (970k: a constant reference is an adrp/add pair) and
