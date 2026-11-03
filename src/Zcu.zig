@@ -42,6 +42,9 @@ conditional_deps: std.AutoHashMapUnmanaged(AnalUnit, []const u32) = .empty,
 /// (`Sema.takeDepMap`), so that each of the many units does not grow a
 /// fresh one. Per analysis thread once Sema runs in parallel.
 dep_maps: std.ArrayList(@import("Incremental.zig").DependeeMap) = .empty,
+/// Recently interned strings by the address of their bytes, for
+/// `Sema.getString` (allocated on first use). Sema-only.
+string_cache: []StringCacheEntry = &.{},
 /// Analysis state of runtime function bodies.
 funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, FuncState) = .empty,
 func_queue: std.ArrayList(InternPool.Index) = .empty,
@@ -366,6 +369,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.conditional_deps.deinit(gpa);
     for (zcu.dep_maps.items) |*m| m.deinit(gpa);
     zcu.dep_maps.deinit(gpa);
+    gpa.free(zcu.string_cache);
     zcu.effect_uses.deinit(gpa);
     var bodies = zcu.comptime_bodies.valueIterator();
     while (bodies.next()) |b| switch (b.*) {
@@ -391,6 +395,8 @@ pub fn deinit(zcu: *Zcu) void {
 }
 
 pub const tid: InternPool.Tid = .main;
+
+pub const StringCacheEntry = struct { ptr: usize, string: InternPool.String };
 
 /// Reads file `sub_path` of module `module` for `@embedFile`, once per
 /// compilation; returns its `embed_files` index.

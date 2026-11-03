@@ -2269,8 +2269,21 @@ fn intType(sema: *Sema, signedness: std.lang.Signedness, bits: u16) !Index {
     return sema.intern(.{ .int_type = .{ .signedness = signedness, .bits = bits } });
 }
 
+/// Interns `bytes`. Most come from ZIR (declaration and field names), and
+/// a unit interns the same few again and again: `Zcu.string_cache` answers
+/// those by the address of the bytes, checked against the string.
 fn getString(sema: *Sema, bytes: []const u8) !InternPool.String {
-    return sema.ip.getString(Zcu.tid, bytes);
+    const zcu = sema.zcu;
+    if (zcu.string_cache.len == 0) {
+        zcu.string_cache = try zcu.gpa.alloc(Zcu.StringCacheEntry, 4096);
+        @memset(zcu.string_cache, .{ .ptr = 0, .string = .empty });
+    }
+    const addr = @intFromPtr(bytes.ptr);
+    const e = &zcu.string_cache[@intCast((addr *% 0x9e3779b97f4a7c15) >> 52)];
+    if (e.ptr == addr and std.mem.eql(u8, sema.ip.stringSlice(e.string), bytes)) return e.string;
+    const string = try sema.ip.getString(Zcu.tid, bytes);
+    e.* = .{ .ptr = addr, .string = string };
+    return string;
 }
 
 const NameKey = struct {
