@@ -8561,11 +8561,27 @@ fn loadAtOffset(sema: *Sema, val: Index, key: InternPool.Ptr) !?Index {
     }
     if (ip.indexToKey(val_ty) != .array_type) return if (key.byte_offset == 0) val else null;
     const a = ip.indexToKey(val_ty).array_type;
+    // A subarray (from slicing a comptime-known array at an offset); other
+    // views, such as one reaching into the sentinel, are read below.
+    const size = Type.abiSize(ip, a.child);
+    if (ip.indexToKey(load_ty) == .array_type and ip.indexToKey(load_ty).array_type.child == a.child and size != 0 and key.byte_offset % size == 0 and
+        key.byte_offset / size + ip.indexToKey(load_ty).array_type.len <= a.len)
+    {
+        const b = ip.indexToKey(load_ty).array_type;
+        const start = key.byte_offset / size;
+        if (b.sentinel != .none and start + b.len == a.len and a.sentinel != b.sentinel) return null;
+        const elems = try sema.arena.alloc(Index, @intCast(b.lenIncludingSentinel()));
+        for (elems[0..@intCast(b.len)], 0..) |*e, i| e.* = try sema.elemValue(val, start + i);
+        if (b.sentinel != .none) {
+            if (try sema.elemValue(val, start + b.len) != b.sentinel) return null;
+            elems[@intCast(b.len)] = b.sentinel;
+        }
+        return try sema.intern(.{ .aggregate = .{ .ty = load_ty, .storage = .{ .elems = elems } } });
+    }
     // Elements may be read through a pointer to an in-memory coercible
     // type (`[:0]const u8` elements as `[]const u8`).
     const retype = load_ty != a.child and sema.childCoercibleInMemory(a.child, load_ty);
     if (load_ty != a.child and !retype) return if (key.byte_offset == 0) val else null;
-    const size = Type.abiSize(ip, a.child);
     const elem = if (size == 0) try sema.elemValue(val, 0) else blk: {
         if (key.byte_offset % size != 0 or key.byte_offset / size > a.len) return null;
         break :blk try sema.elemValue(val, key.byte_offset / size);
@@ -9208,7 +9224,9 @@ fn ptrElemPtrVal(sema: *Sema, ptr: Index, i: u64) !Index {
     if (p.flags.size == .one) {
         return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = ptr, .index = i } } } });
     }
-    if (key.base == .elem) {
+    // Steps over elements of the same size merge; a pointer cast to
+    // another element size (`[]const u8` over a `[3][4]u8`) steps by bytes.
+    if (key.base == .elem and key.byte_offset == 0 and Type.abiSize(ip, sema.memElemType(ip.typeOf(key.base.elem.base))) == Type.abiSize(ip, elem_ty)) {
         const e = key.base.elem;
         return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = e.base, .index = e.index + i } } } });
     }
@@ -10246,7 +10264,11 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
                 try sema.requireRuntime(block, src);
                 return sema.addBinOp(block, .slice_elem_val, lhs, index);
             },
-            .one, .many, .c => {
+            // As upstream, a pointer to a vector or tuple indexes through
+            // `elemPtr`.
+            .one, .many, .c => if (p.flags.size == .one and ip.indexToKey(p.child) != .array_type)
+                return sema.analyzeLoad(block, src, try sema.elemPtr(block, src, lhs, uncasted_index, safety))
+            else {
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src);
                 const ep = if (p.flags.size == .one) blk: {
                     const a = ip.indexToKey(p.child).array_type;
@@ -10473,9 +10495,9 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             const k = ip.indexToKey(pv).ptr;
             switch (k.base) {
                 .elem => |e| {
-                    if (try sema.isArrayPtrOfLen(e.base, elem_ty, n) and e.index == 0 and result_sentinel == .none) return .fromInterned(e.base);
+                    if (try sema.isArrayPtrOfLen(e.base, elem_ty, n) and e.index == 0 and k.byte_offset == 0 and result_sentinel == .none) return .fromInterned(e.base);
                     // A pointer to the subarray starting at element `e.index`.
-                    return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = k.base } }));
+                    return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = k.base, .byte_offset = k.byte_offset } }));
                 },
                 // The same address viewed as an array pointer.
                 else => return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = k.base, .byte_offset = k.byte_offset } })),
@@ -11968,7 +11990,15 @@ fn catElems(sema: *Sema, block: *Block, src: Src, operand: Ref, elem_ty: Index, 
     const ty = sema.typeOf(operand);
     // A comptime-known array (directly or behind a pointer) is read once.
     var val: ?Index = if (sema.resolveValue(operand)) |v| switch (ip.indexToKey(ty)) {
-        .ptr_type => |p| if (p.flags.size == .one) try sema.comptimeLoadOrNull(block, src, v) else null,
+        .ptr_type => |p| switch (p.flags.size) {
+            .one => try sema.comptimeLoadOrNull(block, src, v),
+            // A comptime slice reads as one array, not element by element.
+            .slice => if (sema.isUndef(v)) null else try sema.comptimeLoadOrNull(block, src, try sema.retypePtrValue(
+                ip.indexToKey(v).slice.ptr,
+                try sema.ptrType(.{ .child = try sema.intern(.{ .array_type = .{ .len = out.len, .child = p.child } }), .flags = .{ .is_const = true } }),
+            )),
+            else => null,
+        },
         else => v,
     } else null;
     if (val == .none) val = null;
