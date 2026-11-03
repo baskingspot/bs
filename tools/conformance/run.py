@@ -39,8 +39,9 @@ parsed as with --default-runner and compared with baseline/std-<target>.json.
 
 With --compile-errors, the measure is diagnostics instead: every case in
 upstream's test/cases/compile_errors that applies to the target, compiled
-by zap as upstream's case harness compiles it (build-obj, or build-exe or
-test when the case says so). A case is "exact" when zap reports the same
+by zap as upstream's case harness compiles it: as a root file named
+tmp.zig, so that its types are named `tmp.T`, with build-obj, or build-exe
+or test when the case says so. A case is "exact" when zap reports the same
 error lines (location and message) as the case expects, "same location"
 when only the messages differ, and otherwise "different", "accepted" (no
 error), "crash" or "timeout". Notes are compared separately.
@@ -948,22 +949,35 @@ def case_applies(cfg, target):
 
 
 def zap_lines(stderr, case_name):
-    """zap's text diagnostics as upstream-style ':line:col: error: msg' lines,
-    with the case file's own path dropped and other paths reduced to their
-    base name, as upstream's harness shows them."""
+    """zap's diagnostics (--error-format=json) as upstream-style
+    ':line:col: error: msg' lines. Notes in the case file keep their
+    location; notes elsewhere become '?: note: msg', as other_note() turns
+    upstream's ':?:?: note:' and bare 'note:' lines. Call-site frames are
+    notes, worded as upstream's."""
     errors, notes = [], []
-    def norm(path, rest):
-        base = os.path.basename(path)
-        return (":" if base == case_name else base + ":") + rest
     for ln in stderr.splitlines():
-        m = re.match(r"^(\S+?):(\d+):(\d+): error(?:\[[^\]]*\])?: (.*)$", ln)
-        if m:
-            errors.append(norm(m.group(1), f"{m.group(2)}:{m.group(3)}: error: {m.group(4)}"))
+        try:
+            d = json.loads(ln)
+        except ValueError:
             continue
-        m = re.match(r"^  note (\S+?):(\d+):(\d+): (.*)$", ln)
-        if m:
-            notes.append(norm(m.group(1), f"{m.group(2)}:{m.group(3)}: note: {m.group(4)}"))
+        if "msg" not in d:
+            continue
+        here = lambda o: os.path.basename(o.get("file", "")) == case_name
+        prefix = ":" if here(d) else os.path.basename(d.get("file", "")) + ":"
+        errors.append(f"{prefix}{d.get('line', 0)}:{d.get('col', 0)}: error: {d['msg']}")
+        for n in d.get("notes", []):
+            notes.append(f":{n['line']}:{n['col']}: note: {n['msg']}" if "line" in n and here(n) else f"?: note: {n['msg']}")
+        for c in d.get("calls", []):
+            msg = "called inline here" if c["kind"] == "inline" else "called at comptime here"
+            notes.append(f":{c['line']}:{c['col']}: note: {msg}" if here(c) else f"?: note: {msg}")
     return errors, notes
+
+
+def other_note(line):
+    """Upstream's note outside the case file (':?:?: note:' or a bare
+    'note:'), as zap_lines() writes one; None for other lines."""
+    m = re.match(r"^(?::\?:\?: )?note: (.*)$", line)
+    return f"?: note: {m.group(1)}" if m else None
 
 
 def crash_frame(stderr):
@@ -978,16 +992,20 @@ def crash_frame(stderr):
 def run_case(compiler, path, cfg, expected, args, workdir):
     out_dir = workdir / "compile-errors" / path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Upstream's harness compiles each case as tmp.zig.
+    root = out_dir / "tmp.zig"
+    shutil.copyfile(path, root)
     if cfg.get("is_test") == "true":
-        argv = [str(compiler), "test", "--test-no-exec", str(path), f"-femit-bin={out_dir / 'case.test'}"]
+        argv = [str(compiler), "test", "--test-no-exec", str(root), f"-femit-bin={out_dir / 'case.test'}"]
     elif cfg.get("output_mode", "Obj").lower() == "exe":
-        argv = [str(compiler), "build-exe", str(path), f"-femit-bin={out_dir / 'case'}"]
+        argv = [str(compiler), "build-exe", str(root), f"-femit-bin={out_dir / 'case'}"]
     else:
-        argv = [str(compiler), "build-obj", str(path), f"-femit-bin={out_dir / 'case.o'}"]
+        argv = [str(compiler), "build-obj", str(root), f"-femit-bin={out_dir / 'case.o'}"]
+    argv.append("--error-format=json")
     code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
     shutil.rmtree(out_dir, ignore_errors=True)
     exp_errors = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "error"]
-    exp_notes = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "note"]
+    exp_notes = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "note"] + [o for o in map(other_note, expected) if o]
     r = {"expected": exp_errors}
     if timed_out:
         r["status"] = "timeout"
@@ -996,7 +1014,7 @@ def run_case(compiler, path, cfg, expected, args, workdir):
     elif code == 0:
         r["status"] = "accepted"
     else:
-        errors, notes = zap_lines(err, path.name)
+        errors, notes = zap_lines(err, root.name)
         r["got"] = errors
         locs = lambda ls: sorted(l.split(": error:")[0] for l in ls)
         if sorted(errors) == sorted(exp_errors):

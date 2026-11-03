@@ -3570,6 +3570,14 @@ user modules (non-generic functions only) was proposed and not adopted.
   fixes (08d7c40): 365 exact, 466 at the same locations, 397 different,
   131 accepted, and no crashes. The location share is the number to
   raise. Crashes come first: a crash is the worst diagnostic.
+  Like upstream's case harness, run.py compiles each case as `tmp.zig`
+  (its types are `tmp.T`) and reads zap's JSON lines. Call frames count
+  as upstream's "called inline/at comptime here" notes, and notes outside
+  the case file compare by message only, as upstream's `:?:?: note:`
+  lines do. Measured that way, with the lookup facts of step 3: 404
+  exact (336 with notes), 489 at the same locations, 374 different, 131
+  accepted, no crashes. Before the harness change, the same zap measured
+  373 exact (294 with notes) and 486 at the same locations.
 
 ### Steps
 
