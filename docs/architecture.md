@@ -2828,8 +2828,8 @@ shares nothing across projects and ties the file format to in-memory layout.
 - The cache records a build alongside the link, on every core (see
   "Integration").
 - Linking is parallel within the linker.
-- Sema and CodeGen run on one thread today; the design below makes them
-  parallel.
+- CodeGen runs on a pool behind one Sema thread (step 1 below); step 2
+  below, designed, makes Sema parallel too.
 
 ### Where a cold build's time goes (measured 2026-11-03)
 
@@ -3118,18 +3118,24 @@ one Sema thread, hand-over order is deterministic and keeps the serial
 order byte for byte. Step 2, where hand-over order depends on timing,
 needs the sort.
 
-**Step 2: function bodies on a pool.** Workers take queued function
-bodies; each worker runs Sema and then CodeGen on the same body while the
-IR is hot in cache, and anything a body needs (a declaration's value, a
-type's layout, a callee's inferred error set) is resolved by that worker
-on demand, as today, unless another worker holds it. With bodies at
-93–97% of Sema, 4 cores would take hello to roughly 50 ms of Sema plus
-CodeGen, the generated program to ~140 ms (its single-file frontend then
-dominates), and binary.zig to ~2.7 s.
+**Step 2: Sema of function bodies on a pool (designed 2026-11-03, for
+review; no code yet).** Workers analyze function bodies in parallel. Each
+body's CodeGen runs right after its Sema, on the same worker, while the
+IR is hot in cache. Whatever a body needs (a declaration's value, a
+type's field types, layout or defaults, a callee's inferred error set, a
+comptime call) is resolved on demand, as today, by the worker that needs
+it, through a claim on the unit (below). The coordinating thread keeps
+`analyzeAll`'s roots and the serial points. The output, the cache's
+records and every diagnostic must be the same for every thread count and
+every schedule. The design is in the paragraphs after step 3: units and
+claims, the logical stack and dependency loops, determinism, shared
+state, replay, the stages, and what stays serial. The expected gains
+follow here.
 
-Measured after step 1 (2026-11-03, ReleaseFast zap, cold, `ZAP_THREADS=4`
-on the 4-vCPU orb, with temporary timers around each `analyzeAll`
-category). "Bodies" is `Sema.analyzeFuncBody` together with the
+**Step 2, expected gains.** Measured after step 1 (2026-11-03,
+ReleaseFast zap, cold, `ZAP_THREADS=4` on the 4-vCPU orb, with temporary
+timers around each `analyzeAll` category). "Bodies" is
+`Sema.analyzeFuncBody` together with the
 declarations and types resolved from inside it, which is the work step 2
 spreads over workers. "Serial" is everything else on the critical path:
 the frontend, comptime declarations and roots, compiler_rt resolution,
@@ -3159,91 +3165,355 @@ contention on the InternPool, lower them.
 it (below), so that `record`'s graph and store work overlap analysis and
 only numbering and the manifest write remain after the link.
 
-**Claiming units.** A unit's state is where workers synchronize, as the
-current `ensure*` functions already are (Nav `status`, `ContainerInfo.status`,
-`Zcu.funcs`, `comptime_decls`, the root types of files). Each state becomes
-an atomic word holding unresolved, in progress by worker N, done, or
-failed. `ensure*` claims an unresolved unit with a compare-and-swap and
-analyzes it on the calling worker; a done unit is read after an acquire
-load (its result fields are written before the release store that marks
-it done); a unit in progress on another worker is waited for. Before
-waiting, a worker records which unit it waits on and follows the chain
-owner → the unit that owner waits on → ...; reaching itself is a
-dependency loop. The chain is the same cycle a serial stack would find,
-but which unit reports it depends on timing, so the units on the cycle
-are marked and re-analyzed on one thread at the end, in the serial order,
-to report upstream's diagnostic. Waiting blocks the worker (a futex per
-state word), so a pool needs more workers than cores only if waits get
-long; measure first.
+**Step 2, units and claims.** A unit is analyzed once, by whichever
+thread claims it first. Its state word is where threads synchronize. The
+words already exist as plain enums, and `ensure*` checks them and then
+sets them:
 
-**What is per function, and what is shared.**
-
-| State | Today | In parallel |
+| Unit | State today | Claim word in step 2 |
 |---|---|---|
-| `Sema` instance: arena, `ir_insts`, `inst_map`, `deps`, comptime allocations, `ies_names`, inline and branch counters, anonymous-type ordinals | per unit | per unit, unchanged |
-| InternPool items and strings | one thread (`Zcu.tid = .main`) | per-worker `Tid`, already sharded (below) |
-| Nav and `ContainerInfo` result fields | written by their unit | written by the claiming worker before marking done |
-| `Zcu.funcs`, `func_queue` | map and list | sharded state map; a work queue (per-worker deques with stealing) |
-| `Zcu.inferred_errors` | map | written by the body's worker before marking done; read after done |
-| `Zcu.deps` | map per unit | per-worker lists of (unit, dependees), merged and sorted by unit key at the end |
-| `Zcu.comptime_memo` | map | sharded map; two workers may compute the same call, the first insert wins, and both results are equal (memo keys and anonymous types inside are keyed by callee key and argument hashes) |
-| `Zcu.comptime_alloc_refs`, `string_literals` | maps | per-worker; pure caches (of a value's property, and of a literal's value), so a cache per worker gives the same answers |
-| `Zcu.namespaces` | list, pointers into it | per-worker lists with the owner in the index, as InternPool does, so a namespace pointer stays valid; `decls` is fixed once the namespace is created |
-| `Zcu.errors`, `exports`, `test_functions`, `rt_helpers` | lists | locked appends; sorted at the end by unit key and source position (errors), declaration key (exports) and file and source position (tests), and key (compiler_rt requests), so their order does not depend on scheduling |
-| `Zcu.arena` | one arena | one per worker |
-| `ip.next_comptime_alloc` | counter | stays atomic: comptime allocations never escape their unit (see InternPool) |
-| Frontend files | loaded before analysis, compiler_rt on demand | `loadFile` takes a lock |
+| Declaration value | `Nav.status`: unresolved, resolving, resolved, failed | the same field, atomic, in the Nav (per-tid arena, stable address) |
+| Field types and layout | `ContainerInfo.status`: none, field_types_wip, have_field_types, layout_wip, have_layout, failed | the same field, atomic, in the ContainerInfo |
+| Struct defaults | `ContainerInfo.defaults_status` | the same field, atomic |
+| Function body and its inferred error set | `Zcu.funcs`: queued, in_progress, done, failed | a sharded map from function to a state word in per-worker chunked storage, so map growth never moves a word |
+| A container's namespace | `createContainerType` checks `si.namespace` and then creates it | a namespace phase in the ContainerInfo, claimed the same way. The ContainerInfo a losing creator made before its lookup is dropped |
+| A file's root type | `file_root_types` slot, create-once | CAS on the slot. The array grows only at serial points (compiler_rt file loads) |
+| `comptime` declarations | `comptime_decls` (only `.queued` is written) and `analyzeAll`'s cursor | unchanged: only the coordinator analyzes them, still through claims for what they reach |
 
-**InternPool writes.** The pool is already built for this: each worker
-appends to its own `Local` shard (its `Tid` is in every new index), the
-deduplication maps are sharded by hash with a mutex per shard, and
-published items are immutable and read without locks. Two workers
-interning the same key race on the shard lock; the loser gets the
-winner's index. Indices therefore differ from run to run, which is fine
-because nothing persisted or ordered uses them (stable hashes and unit
-keys do). Work needed: `Zcu.tid` becomes a per-worker field passed through
-Sema; error values (below); and measuring shard-lock contention on the
-hottest keys (pointer and integer types), which may want per-worker
-lookup caches in front of the shards.
+A word holds the phase (today's enum values) and, in a work-in-progress
+phase, the claiming worker. To claim, a thread CASes an idle phase to
+the matching work-in-progress phase with itself as owner, and analyzes
+the unit. It writes the result fields with plain stores, then stores the
+final phase with release semantics. A reader acquire-loads the word, so
+a done or failed unit costs one load, as now. Three orderings must be
+fixed first:
+- `setComptimeOnly` writes `comptime_only` after `status = .have_layout`.
+- The union analyzer stores `.have_layout` in two places; both must come
+  after its last result field.
+- `analyzeNavVal` writes `nav.ty` and `nav.alignment` before the value
+  resolves, for `navRef`. In step 2, a release store of a "type known" bit
+  publishes them, and only a reader on the unit's logical stack (below)
+  reads them early.
 
-**Inferred error sets.** A caller that needs a callee's resolved set calls
-`ensureFuncIes`, which is a unit claim like the others: done, read the
+A thread that finds a unit in progress on another worker waits on the
+word (a futex wait on its value), after registering the wait (below).
+
+**Step 2, inferred error sets.** A caller that needs a callee's resolved
+set calls `ensureFuncIes`, which is a unit claim like the others: done, read the
 set; queued and unclaimed, claim it and analyze the body on this worker
 (today's nested analysis); in progress elsewhere, wait, with the cycle
 check. A body that needs its own set while analyzing itself is the
-recursion case that is a dependency loop today, and stays one. On
+recursion case that is a dependency loop today, and stays one (reported
+through the deferred pass below). `ready_irs` goes away. On
 binary.zig most bodies are reached this way, so work stealing must not
 assume bodies come from the queue: a nested body's CodeGen runs right
 after its Sema on the worker that claimed it.
 
-**Emit and output order.** Each worker has an Emit output: its atoms,
-debug entries, owners, content-atom uses, and the declarations, error
-names, externs, and compiler_rt functions its code requested.
-Content-addressed atoms are deduplicated per worker and again at `finish`.
-The link order must not depend on scheduling, and today it is the order
-of discovery on one thread. In parallel, `finish` sorts owner groups by
-the node key the manifest uses (a unit's stable key hash; a content atom's
-key), with the link's own atoms last, then deduplicates as
-`groupByOwner` does now. Sorting 100k groups costs a few ms. It also keeps
-an edited unit's atoms in place, which a future in-place relink wants.
-Callers no longer sit next to their callees, which costs nothing
-measurable in a Debug build. Error codes for value relocations are
-assigned in that same order (below), and data for requested declarations
-is lowered at `finish` in declaration key order.
+**Step 2, the logical stack and dependency loops.** Today "in progress"
+means "on my native stack", and code relies on that in six places:
+- `ensure*` returns `error.DependencyLoop`, which `Sema.depLoop` reports
+  at the innermost requester.
+- `navRef` reads `nav.ty` of a resolving declaration.
+- `resolveLayoutIfIdle` and `resolveStructFields` skip a layout in progress.
+- `Type.comptimeOnly` reads `.computing` as a cycle (`hit_cycle`).
+- Replay's `greenNode` accepts a resolving `nav_val` dependency.
+- `ensureStructLayout` sets `layout_wip` around `loadLayout`.
 
-**Error codes.** Codes are the one order-dependent value Sema computes:
-`ip.errorValue` numbers names in the order they are first interned. Runtime
-code only names errors (value relocations), so only comptime uses
-(`@intFromError`, an error integer folded into a constant) need a code
-during analysis. Codes come first from the last build's manifest
-(`seedErrors`). A name without one gets a provisional code when a unit
-first needs it, and the unit records that it read the code (the error
-node the manifest already has). At the end, the final assignment
-numbers the remaining names in the deterministic order above. Units whose
-provisional codes differ from the final ones, which happens only for new
-names read at comptime, are re-analyzed on one thread before Emit
-finishes. Their dependents follow over the recorded edges, which is
-the edit-build machinery.
+In parallel, a unit in progress may belong to another worker. The rule:
+a unit held by worker W is *on my logical stack* if W is me, or if W is
+waiting, directly or through other waiting workers, on a unit I hold.
+That is exactly when the serial build would have analyzed my current
+unit nested inside it. On my logical stack, today's behavior applies
+unchanged: a partial read, a skip, or a dependency loop. Otherwise, I
+wait until the unit is done or failed. That gives me the state the
+serial build would have found after analyzing the unit itself.
+
+- *The wait graph.* Each worker has one `waiting_on` slot. Registering a
+  wait and walking the chain both happen under one global mutex,
+  `wait_lock`. That mutex is only taken when a claim fails because
+  another worker holds the unit, so claims and done reads never touch it.
+  Under the lock, the waiter reads the unit's owner and follows owner →
+  its `waiting_on` → that unit's owner, and so on.
+  - Reaching itself: the unit is on its logical stack.
+  - Reaching a running worker or a finished unit: it sets `waiting_on`,
+    drops the lock, waits, and clears the slot under the lock when it
+    wakes.
+- *Why the walk is exact.* Every edge of a chain that ends at me is a
+  blocked worker waiting on a unit whose holder is blocked in turn, ending
+  at a unit I hold. None of them can finish while I hold the lock, so the
+  chain cannot dissolve under the walk. Walks are serialized, so of two
+  workers closing a cycle exactly one sees it, and the other blocks. A
+  deadlock is impossible: a wait that would close a cycle never blocks.
+- *Dependency loops.* Which unit finds a loop, and where, depends on
+  where the cycle was entered, so a loop is never reported where it is
+  found.
+  - The finder fails its requesting unit with `error.DependencyLoopDeferred`
+    instead of a diagnostic. Every unit that fails because of a deferred
+    unit is marked *deferred* too (a failed phase with no errors), and its
+    partial records are dropped: errors, dependencies, atoms, and memo
+    entries made after it.
+  - When the pool drains, the coordinator resets the deferred units to
+    unresolved and re-analyzes them on one thread, entering them in
+    unit-key order. That pass reports the loop as today.
+  - One worker takes the same path, so the diagnostic is the same for
+    every thread count. It may differ from today's serial build, which
+    entered the cycle in discovery order. Loops are compile errors, so
+    the extra pass costs nothing that matters.
+- *Readers that tolerate work in progress.* `resolveLayoutIfIdle`,
+  `resolveStructFields` and `greenNode`'s shortcut follow the same rule.
+  Whether they skip must not change the unit's result: the serial build
+  already chose differently depending on discovery order. To confirm
+  per call site in review.
+- *`Type.comptimeOnly`.* The `.computing` marker moves into a per-worker
+  set. Only final answers are written to `ContainerInfo.comptime_only`,
+  by a CAS from `.unknown`, and any thread that wins writes the same
+  answer. Answers that hit a cycle stay uncached, as today.
+
+**Step 2, determinism.** Raw InternPool indices, namespace indices,
+embed-file indices and comptime allocation ids come to depend on timing.
+That is allowed only where they reach nothing persisted, ordered or
+printed. Stable hashes and unit keys already are what reaches those.
+Every record whose order today is discovery order becomes either sorted
+by a stable key at a serial point or a function of one unit's own
+analysis:
+
+1. *Output.* `finish` sorts owner groups by the node key the manifest
+   uses: a unit's key hash, or a content atom's key. The link's own atoms
+   go last. Duplicates are dropped as `groupByOwner` does now. Data for
+   requested declarations is lowered in declaration-key order. Error
+   codes are final by then (rule 5), so the error-name table follows from
+   them. Callers no longer sit next to their callees; `bench/runtime.py`
+   should show nothing in a Debug build, and stage A checks that.
+2. *The cache's records.* Node numbering follows the sorted link order
+   for atom nodes. After that come the units of `zcu.deps`, then content
+   uses, references, roots and inferred-error-set nodes, each sorted by
+   key. These follow from the sorted order:
+   - per-node edges, which are sorted by node index;
+   - references, whose values are node indices;
+   - the result item table (`unit_list` and `dependee_list`);
+   - pack offsets;
+   - symbol numbering;
+   - a lazy delta's new nodes, numbered in key order instead of Recorder
+     order.
+
+   The manifest and the pack are then byte-identical for every schedule.
+   Step 3 later lets pack placement vary, but never references.
+3. *Dependency records.* `deps`, `conditional_deps`, `func_refs` and
+   `effect_uses` become per-worker logs, merged and sorted by unit key.
+   A unit's own dependee list keeps the order that unit read them in. That
+   order is a function of its analysis, as long as its inputs are. Two
+   inputs are not today:
+   - *Comptime memo entries.* An entry's `deps` and conditional flags
+     depend on whether the walker or the evaluator computed the call, and
+     shared run counts in `comptime_bodies` decide that. In parallel,
+     two workers may also compute one call concurrently, and the first
+     insert wins. The rule: a call's recorded dependencies must not depend
+     on the path. The evaluator would declare what the walker declares, or
+     both would declare the body's whole dependency set conditionally (as
+     `bcDeclareBody` does now). The lowering trigger itself may stay
+     timing-dependent. (Open question 1.)
+   - *`branch_quotas`* (rule 7).
+4. *Anonymous type names.* Names come from ZIR offsets and comptime
+   ordinals (`typeName`, `anonTypeNumber`), not counters. One order
+   dependence remains: a container's key is file, ZIR instruction and
+   captures, so when two creators would name the same type differently
+   (the `.func` naming strategy, which prints inline call arguments, or a
+   generic instance's parent versus an inline call's), the first creator
+   names it. The rule: a type's name is a function of its key, computed
+   from the key alone wherever creators can differ. (Open question 2:
+   whether any real case has two creators with different names.)
+5. *Error codes and error sets.*
+   - *Codes.* The last build's codes are seeded first (`seedErrors`,
+     unchanged). A name with no seeded code gets a provisional code when
+     first used. At the serial end, the final assignment keeps the seeded
+     codes and numbers the new names in name order.
+   - *Comptime reads of codes.* A unit that read a provisional code at
+     comptime (`@intFromError` or `@errorFromInt` folding, `error_value`
+     in the evaluator, `anyerror` name reads) records it. If its final
+     code differs, the unit is re-analyzed at the serial point with codes
+     fixed, using the edit-build machinery.
+   - *Error-set order.* `errorSetType` sorts a set's names by code, so an
+     error set type's key, stable hash, layout and `@typeInfo` order all
+     follow code order. Step 2 sorts by name bytes instead, so error set
+     types never read codes. Upstream sorts by string index, which is
+     interning order and just as arbitrary. This also removes today's
+     `--edit-verify` sensitivity of error set types to code order.
+     (Open question 3: conformance tests that depend on `@typeInfo`
+     error-set order.)
+   - One worker uses the same rules, so the codes of new names change
+     once from today's first-use numbering.
+6. *Compile errors.*
+   - Each unit appends to its worker's list, tagged with the unit. Notes,
+     fixes and candidates attach to a handle the error call returns,
+     instead of `errors.items[len - 1]`.
+   - The evaluator's rollback (`bcRollback` and `bcFinish` shrinking
+     `zcu.errors`) becomes a rollback of the Sema's own list.
+   - At the end, errors are sorted by source location: file path, byte
+     offset, then message, as upstream's `ErrorMsg.order` sorts
+     `failed_analysis`. The first error is the first in that order, and
+     it gets the reference-trace frames.
+   - Which errors exist does not depend on order: analysis does not stop
+     at an error, every referenced unit is analyzed, and loops go through
+     the deferred pass.
+   - `referenced_by` keeps the smallest referrer by unit key (a CAS-min)
+     instead of the first one, so reference traces change once.
+7. *`branch_quotas`.* A generic instance's quota is the largest any
+   instantiating caller set, which is known only when all of them have
+   run. Upstream has the same order dependence (ziglang/zig#22410). A
+   body that succeeds under a lower quota gives the same result under a
+   higher one. So only a body that fails with "evaluation exceeded"
+   while its quota can still rise is deferred, to be re-run at the serial
+   point under the final quota.
+8. *Exports, tests and compiler_rt requests.* They become locked
+   appends, sorted at the end: exports by declaration key, tests by file
+   and source position (`populateTestFunctions` already does this), and
+   compiler_rt keys at the `sync` point, as today. `isTestFunc` scans
+   `test_functions` while it grows. It becomes a flag set when the
+   namespace is created, which is before any reference to the function.
+
+**Step 2, shared state.** Survey of origin/main 9c65ff1. Sema has no
+globals: no `threadlocal` and no container-level `var` in Sema.zig,
+Zcu.zig, InternPool.zig or Type.zig apart from `Type.codegen_worker`.
+
+*InternPool.*
+
+| State | Today | Step 2 |
+|---|---|---|
+| Item and string storage (`Local` lists) | One writer per tid, lock-free readers (release/acquire `ptr`/`len`); old buffers retired, not freed. Only `.main` writes (`Zcu.tid`, `init(…, 1)`), and two OS threads have never written | Ready. `init` with workers + 1 locals, `Tid` per worker. Add `assert(tid < locals.len)` |
+| Dedup maps (`Shard`) | A mutex per shard, taken on every lookup, hits included; inserts encode the item under the lock | Correct now. Contention on hot keys (pointer and integer types) is measured in stage E. Per-worker lookup caches in front if needed |
+| `Local.int_cache` (the direct-mapped intern cache) | One 512-entry array per tid, plain reads and writes | Ready: per worker |
+| `Local.arena` | Per tid | Ready |
+| Stable hashes | Computed when an item is interned; never written after | Ready |
+| `errorValue`, `error_names` | `errors_mutex`; numbered by first use | Provisional codes (determinism rule 5) |
+| `next_comptime_alloc` | Atomic `fetchAdd` | Ids depend on timing but never leave their unit. `bc_first_alloc`'s "older than this run" test stays exact, because no other unit's id reaches this Sema. Per-worker id blocks avoid sharing the cache line |
+| `Nav` and `ContainerInfo` fields | Written in place through the pointers `getNav` and `structInfo` return, by Sema and Replay | Only under the unit's claim, published by the release store of its phase (above). `comptime_only` as above |
+
+*Zcu.*
+
+| State | Kind | Step 2 |
+|---|---|---|
+| `deps`, `conditional_deps`, `func_refs`, `effect_uses` | order-dependent records | per-worker logs; sorted by key (rule 3) |
+| `dep_maps` | scratch pool | per worker |
+| `funcs` | unit state | claim words (above) |
+| `func_queue`, `next_func` | queue | per-worker deques with stealing; `queueFunc` pushes onto the caller's deque |
+| `ready_irs` | queue | removed |
+| `comptime_decls` | roots | coordinator only |
+| `comptime_memo` | cache | sharded; first insert wins; entries in the inserting worker's arena; path-independent deps (rule 3) |
+| `comptime_bodies` | cache with order-dependent run counts | sharded; atomic run counter; lowering claimed by CAS while other threads keep walking (no wait) |
+| `comptime_osr_off` | cache, insert-only | sharded set |
+| `comptime_alloc_refs`, `string_literals` | pure caches | per worker |
+| `inferred_errors`, `anyerror_ies` | unit results | written before the body's done store |
+| `namespaces` | list; indices stored in Navs, ContainerInfos, dependees | per-worker chunked lists with the owner in the index, as InternPool does, so `namespacePtr` stays valid. Indices are not persisted (`ns.key` is) |
+| `file_root_types` | create-once | CAS on the slot (above) |
+| `embed_files` | list; index in `Dependee.embed_file` | locked; the index is valid within one build and persisted by key |
+| `exports`, `test_functions`, `rt_helpers`, `errors` | order-dependent records | rules 6 and 8 |
+| `referenced_by` | first referrer | CAS-min by key (rule 6) |
+| `branch_quotas` | read-max-write | locked; rule 7 |
+| `arena` | allocator | per worker |
+| `unit_timing` | debug; one nested stack | per worker; summed when printed |
+| `fe` | read-only during analysis | `loadFile` only at serial points; `tree`/`source` are already behind `syntax_mutex` |
+| `replay` | edit builds | below |
+| `Type.codegen_worker` | threadlocal "may not write" | removed: every worker writes final answers only |
+
+**Step 2, replay and lazy edit builds.** Lazy replay (step 4b, the
+default) already loads units inside the `ensure*` hooks, which become
+claims. A unit is loaded or checked green on the worker that claims it,
+and `greenNode`'s recursive `ensure` of each plain edge becomes ordinary
+claims. Green checks of independent units then run in parallel.
+
+- *Single-thread state in `Replay`.* Each piece needs its own change:
+  - The `deps` stack, with each `Green`'s `deps_start`, becomes per worker.
+  - Per-node `state[]` is written under the unit's claim, so it gets a
+    release store.
+  - The `visited`, `loaded`, `dead`, `data_refs` and `refresh` bitsets get
+    atomic ORs.
+  - `unit_nodes`, `input_files`/`file_inputs` and `navs_by_key` are filled
+    lazily today. They become concurrent maps, or are filled when
+    `Replay.create` runs.
+  - `decoder`, with its memo and single `miss` slot, `keyer`'s buffers and
+    `stats` become per worker.
+  - Resolver loads and type creation take the worker's tid and arena.
+  - `greenNode`'s `quota` refs raise `branch_quotas` under its lock.
+- *The walk.* `startWalk`, `walk` and `settle` stay on the coordinator.
+  The walk hands outdated nodes to the pool: `ensure` for declarations
+  and layouts, `queueFunc` for bodies. `settle` runs when the pool drains.
+- *Eager replay (4a).* `loadFunc` and `commit` write through
+  `emit.owner` into the main Emit after `syncPending`. In step 2 they
+  write into the worker's Emit output with its own owner. The key sort
+  at `finish` makes their position irrelevant.
+- *Record and verification.* `record` reads frozen Zcu and Emit state
+  after the serial end, and its inputs are sorted (rule 2), so a
+  schedule cannot change the manifest. `--edit-verify` (which matches
+  nodes by key) and `ZAP_CACHE_CHECK` work unchanged. Their known
+  sensitivity to code order (`.err` refs and error set types) goes away
+  with rule 5.
+- *Global first-build reuse* (the cache thread's next step). It looks up
+  a unit in the store when the unit is reached. In step 2 that is the
+  claim, so the lookup runs on the claiming worker. Store reads are
+  read-only, and each worker has its own lookup scratch.
+- *Failed builds committing their manifest* (diagnostics step 6). Errors
+  are sorted (rule 6), and failed units are always red, so nothing
+  changes for step 2.
+
+**Step 2, stages.** Each stage lands on its own and must meet these
+checks:
+- the output and the cache's records are byte-identical across
+  `ZAP_THREADS` values and `ZAP_SCHED_FUZZ` seeds;
+- conformance is unchanged with `ZAP_CACHE_CHECK=1`: behavior with
+  `--edit-verify` and with `--default-runner`, and `--std`;
+- the ThreadSanitizer build reports nothing with fuzzing on;
+- bench.py cold, cold-local and edit numbers before and after.
+
+A. *Determinism, serially.* Rules 1–8, poison-and-rerun loops, and the
+   serial end (fixpoint over compiler_rt `sync`, deferred loops,
+   provisional codes and quota deferrals), all on one thread.
+   `ZAP_SCHED_FUZZ` gains a Sema mode that shuffles the function queue
+   and the order in which roots are queued. A shuffled serial build
+   exposes every order dependence that parallel analysis would, except
+   interleaving inside a unit, and must produce identical bytes. Serial
+   output changes once: link order, codes of new names, error order and
+   reference traces.
+B. *Thread identity, still one analysis thread.* `Zcu.tid` becomes a
+   per-worker field passed through Sema, Replay and Incremental.
+   InternPool gets one local per worker. Caches, arenas, `dep_maps`,
+   namespace lists and record logs become per worker. Measure the cost
+   of passing the tid (expected: none).
+C. *Bodies on the pool, cold builds.* Claim words, the wait graph and
+   the logical stack, deques with stealing, and Sema followed by CodeGen
+   on one worker. Enabled by `ZAP_SEMA_THREADS` (default 1). A build with
+   a manifest still analyzes on one thread. The fuzzer adds yields and
+   sleeps at claims, waits and steals. TSan runs over conformance.
+D. *Replay.* Replay's state as above. Edit builds and lazy loads use the
+   pool.
+E. *Default on and tuning.* Shard-lock contention and per-worker lookup
+   caches, stealing granularity, memory (per-worker arenas and duplicated
+   cache entries). Then step 3.
+
+**Step 2, costs to watch.** On the zig workload:
+- *Claims.* A done unit costs one acquire load, as now. A claim is one
+  CAS per analyzed unit, about 144 k in total.
+- *Waits.* They happen only on contention, and two workers may
+  duplicate a comptime call, which costs time, not correctness.
+- *Shard locks.* Every intern takes one. With one shard today it is
+  uncontended; the stage E measurements show whether hot keys need
+  per-worker caches.
+- *Sorting.* Owner groups, dependency logs and errors take a few
+  milliseconds at the end.
+- *Memory.* Per-worker arenas, caches and namespace chunks grow peak
+  RSS. Step 1 added 4–5%, and step 2 should add about as much again.
+
+**Open questions for review.**
+1. (Sema) Can the walker and the evaluator record the same dependencies
+   for a call, or should both declare the body's set conditionally?
+2. (Sema) Can two creators give one container key different names? If
+   so, which name should the key alone produce?
+3. (Sema) Do conformance tests depend on `@typeInfo` error-set order, so
+   that name order needs a mapping to upstream's interning order?
+4. (Cache) Are the key-sorted node numbering and delta numbering
+   acceptable for the manifest format, and does the claim hook fit
+   first-build reuse's lookups?
+5. (Both) Are there more places that read "in progress" as "on my stack"
+   than the six listed under "the logical stack"?
 
 **The completion hook, and recording as units complete.** When a unit's
 result is final (a declaration resolved, a layout resolved, a `comptime`
@@ -3266,11 +3536,14 @@ depends on timing, so pack bytes differ between runs while every
 reference stays correct. The same hook is where an edit build loads a
 skipped unit's cached result (see "Edit builds").
 
-**What stays serial.** AstGen of a single file; the roots
-(`analyzeAll`'s comptime declarations, exports, and tests until bodies
-are queued, which is cheap); `finish`'s data lowering (5 ms on the
-generated program); and the re-analysis of dependency loops and of units
-that read provisional error codes.
+**What stays serial.** AstGen of a single file. The roots
+(`analyzeAll`'s comptime declarations, exports and tests) are walked on
+the coordinator, cheaply, though what they reach is claimed like
+anything else. compiler_rt resolution and the file loads it causes
+happen when the pool drains. Also serial: the serial end (the deferred
+dependency loops, units that read provisional error codes, bodies
+deferred for their branch quota), `finish`'s data lowering (5 ms on the
+generated program), emit, the link, and today's `record`.
 
 **Checking it.** `ZAP_THREADS=1` runs everything inline (built for step
 1, where it means CodeGen on the Sema thread). The output
@@ -3298,12 +3571,18 @@ state. Built for step 1:
   ThreadSanitizer build with `ZAP_THREADS=4` and `ZAP_SCHED_FUZZ`
   reported no race on hello, libvaxis text_input, the zig workload, std's
   tests (3351/3351), and behavior with `--edit-verify` and
-  `ZAP_CACHE_CHECK=1` (2067/2067 in 112 files; the x86_64 file, whose
-  edit-verify run exceeds the orb's 7.8 GB under ThreadSanitizer, was
-  checked without `--edit-verify`, 103/103). With a ReleaseFast zap, all
+  `ZAP_CACHE_CHECK=1` (2067/2067 in 112 files). The x86_64 file's
+  edit-verify run needs about 8.1 GB under ThreadSanitizer (the edit
+  build and its `ZAP_CACHE_VERIFY=full` child together; 7.65 GB for the
+  larger), so it ran on a 31 GB orb against origin/main 9c65ff1: 103/103,
+  no race, no edit-verify difference. With a ReleaseFast zap, all
   113 behavior test binaries and the four workloads' outputs are
   byte-identical between `ZAP_THREADS=1` and `ZAP_THREADS=4` with
   `ZAP_SCHED_FUZZ` (several seeds).
+- For step 2 (see its stages): `ZAP_SCHED_FUZZ` also shuffles Sema's
+  function queue and root order (stage A, serially), then yields and
+  sleeps at claims, waits and steals (stage C). Every stage compares the
+  output and the cache's records across thread counts and seeds.
 
 ## The command line and `zap build` (built 2026-11-03)
 
