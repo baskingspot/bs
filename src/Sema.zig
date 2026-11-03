@@ -3335,6 +3335,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 if (d.flags.size != .one or d.child != src_ty or ip.indexToKey(v) != .func) return null;
                 const f = ip.indexToKey(v).func;
                 if (f.generic_owner != .none) return null;
+                try sema.zcu.queueFunc(v);
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .nav = f.owner_nav } } }));
             },
             else => {},
