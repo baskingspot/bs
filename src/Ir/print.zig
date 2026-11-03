@@ -314,7 +314,7 @@ pub fn printType(ip: *const InternPool, ty: InternPool.Index, w: *Writer) Writer
                 ip.stringSlice(ip.getNav(ip.indexToKey(f).func.owner_nav).fqn),
             });
         },
-        .struct_type => |s| try w.writeAll(ip.stringSlice(s.name)),
+        .struct_type, .enum_type, .union_type, .opaque_type => |s| try w.writeAll(ip.stringSlice(s.name)),
         .tuple_type => |t| {
             if (t.names.len != 0) return w.writeAll(ip.stringSlice(t.name));
             try w.writeAll("struct {");

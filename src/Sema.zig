@@ -2152,6 +2152,23 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk sema.enumFromInt(block, src, ty, sema.resolveInst(extra.rhs));
         },
         .tag_name => sema.zirTagName(block, inst),
+        .type_name => blk: {
+            const src = block.nodeSrc(data.un_node.src_node);
+            const ty = try sema.resolveType(block, src, data.un_node.operand);
+            break :blk .fromInterned(try sema.stringLiteral(try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)})));
+        },
+        .offset_of, .bit_offset_of => blk: {
+            const src = block.nodeSrc(data.pl_node.src_node);
+            const bits = try sema.bitOffsetOf(block, src, sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data);
+            break :blk .fromInterned(try sema.intValue(.comptime_int_type, if (tag == .offset_of) bits / 8 else bits));
+        },
+        .field_type_ref => blk: {
+            const extra = sema.code.extraData(Zir.Inst.FieldTypeRef, data.pl_node.payload_index).data;
+            const src = block.nodeSrc(data.pl_node.src_node);
+            const ty = try sema.resolveType(block, src, extra.container_type);
+            const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.field_name));
+            break :blk .fromInterned(try sema.fieldTypeByName(block, src, ty, name));
+        },
         .error_name => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             const operand = try sema.coerce(block, .anyerror_type, sema.resolveInst(data.un_node.operand), src);
@@ -2528,6 +2545,16 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .builtin_extern => sema.zirBuiltinExtern(block, inst),
         .field_parent_ptr => sema.zirFieldParentPtr(block, inst),
         .cmpxchg => sema.zirCmpxchg(block, inst),
+        // Error values are numbered at link time, so these are runtime
+        // operations even on comptime-known operands.
+        .int_from_error, .error_from_int => blk: {
+            const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
+            const src = block.nodeSrc(extra.node);
+            if (block.is_comptime) break :blk sema.failUnsupported(block, src, "comptime error codes");
+            const to_int = ext.opcode == .int_from_error;
+            const operand = try sema.coerce(block, if (to_int) .anyerror_type else .u16_type, sema.resolveInst(extra.operand), src);
+            break :blk sema.addTyOp(block, .bitcast, if (to_int) .u16_type else .anyerror_type, operand);
+        },
         .ret_addr, .frame_address => blk: {
             // Zero at comptime, as upstream.
             if (block.is_comptime) break :blk .fromInterned(.zero_usize);
@@ -3140,6 +3167,28 @@ fn zirCmpxchg(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
 
 /// `@fieldParentPtr("field", field_ptr)`: the pointer to the struct or
 /// union containing the field `field_ptr` points to.
+/// The bit offset of a struct field, for `@offsetOf` and `@bitOffsetOf`.
+fn bitOffsetOf(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.Bin) CompileError!u64 {
+    const ip = sema.ip;
+    const ty = try sema.resolveType(block, src, extra.lhs);
+    const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.rhs));
+    try sema.resolveLayout(block, src, ty);
+    switch (ip.indexToKey(ty)) {
+        .struct_type => {
+            const i = try sema.structFieldIndex(block, src, ty, name);
+            if (Type.isPacked(ip, ty)) return Type.packedFieldBitOffset(ip, ty, i);
+            return Type.fieldOffset(ip, ty, i) * 8;
+        },
+        .tuple_type => |t| {
+            const i = std.fmt.parseInt(u32, name, 10) catch t.types.len;
+            if (i >= t.types.len) return sema.fail(block, src, "no field named '{s}' in tuple '{f}'", .{ name, sema.fmtType(ty) });
+            if (t.values[i] != .none) return sema.fail(block, src, "no offset available for comptime field", .{});
+            return Type.fieldOffset(ip, ty, i) * 8;
+        },
+        else => return sema.fail(block, src, "expected struct type, found '{f}'", .{sema.fmtType(ty)}),
+    }
+}
+
 fn zirFieldParentPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const ip = sema.ip;
     const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
