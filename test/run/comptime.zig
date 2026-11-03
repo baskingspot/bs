@@ -1,5 +1,5 @@
 //! exit: 7
-//! stdout: "55\n144\n25\n42\n9\n1099511627776\n2\n700\n20\n6\n5\n4\npow2\n"
+//! stdout: "55\n144\n25\n42\n9\n1099511627776\n2\n700\n20\n6\n5\n4\npow2\n13\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -38,6 +38,16 @@ fn table(comptime n: usize) [n]u32 {
 }
 
 const fib10 = fib(10);
+
+// A local type may name a runtime parameter's type (std.sort.upperBound).
+fn addVia(context: anytype, x: u32) u32 {
+    const S = struct {
+        fn add(ctx: @TypeOf(context), y: u32) u32 {
+            return ctx + y;
+        }
+    };
+    return S.add(context, x);
+}
 const squares = table(6);
 const answer: u8 = blk: {
     var x: u8 = 0;
@@ -73,5 +83,8 @@ fn main() callconv(.c) noreturn {
     const t = .{ @as(u8, 4), true };
     rt.printInt(if (t[1]) t[0] else 0);
     if (comptime isPow2(64)) rt.print("pow2\n");
+    var ten: u32 = 10;
+    _ = &ten;
+    rt.printInt(addVia(ten, 3));
     rt.exit(@intCast(@bitSizeOf(u7)));
 }

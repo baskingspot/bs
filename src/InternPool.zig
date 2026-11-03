@@ -557,6 +557,10 @@ pub const Key = union(enum) {
     /// as upstream, so a type may capture the declaration that it is the
     /// value of. Appears only in `ContainerType.captures`.
     nav_capture: struct { nav: NavIndex, by_ref: bool },
+    /// A container type's capture of a runtime value of this type. Only
+    /// `@TypeOf` may read it, as upstream. Appears only in
+    /// `ContainerType.captures`.
+    runtime_capture: Index,
 };
 
 pub const ExternFunc = struct {
@@ -616,6 +620,7 @@ const Tag = enum(u8) {
     calling_convention,
     nav_capture_val,
     nav_capture_ref,
+    runtime_capture,
 };
 
 const Item = struct {
@@ -994,6 +999,7 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
         },
         .inferred_error_set_type => |f| return .{ .tag = .type_inferred_error_set, .data = idx(f) },
         .nav_capture => |c| return .{ .tag = if (c.by_ref) .nav_capture_ref else .nav_capture_val, .data = @backingInt(c.nav) },
+        .runtime_capture => |t| return .{ .tag = .runtime_capture, .data = idx(t) },
         .struct_type, .enum_type, .union_type, .opaque_type => |t| {
             const start = try ip.addExtra(local, &.{ t.file, @backingInt(t.zir_inst), @backingInt(t.name), @backingInt(t.info), @intCast(t.captures.len), @backingInt(t.key) });
             _ = try ip.addExtra(local, @ptrCast(t.captures));
@@ -1123,6 +1129,7 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         .type_error_set => .{ .error_set_type = @ptrCast(extra[d + 1 ..][0..extra[d]]) },
         .type_inferred_error_set => .{ .inferred_error_set_type = I.i(d) },
         .nav_capture_val, .nav_capture_ref => .{ .nav_capture = .{ .nav = @fromBackingInt(d), .by_ref = item.tag == .nav_capture_ref } },
+        .runtime_capture => .{ .runtime_capture = I.i(d) },
         .type_struct, .type_enum, .type_union, .type_opaque => blk: {
             const c: ContainerType = .{
                 .file = extra[d],
@@ -1327,7 +1334,7 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
             h.int(u32, t.len);
             ip.hashIndex(&h, t.child);
         },
-        .opt_type, .anyframe_type, .inferred_error_set_type, .undef => |i| ip.hashIndex(&h, i),
+        .opt_type, .anyframe_type, .inferred_error_set_type, .undef, .runtime_capture => |i| ip.hashIndex(&h, i),
         .nav_capture => |c| {
             h.int(Hash, ip.getNav(c.nav).hash);
             h.int(u8, @intFromBool(c.by_ref));
@@ -1486,6 +1493,7 @@ fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
         .inferred_error_set_type => |x| x == b.inferred_error_set_type,
         .nav_capture => |x| x.nav == b.nav_capture.nav and x.by_ref == b.nav_capture.by_ref,
         .undef => |x| x == b.undef,
+        .runtime_capture => |x| x == b.runtime_capture,
         .error_union_type => |x| x.error_set_type == b.error_union_type.error_set_type and x.payload_type == b.error_union_type.payload_type,
         .error_set_type => |x| eqlIdx(String, x, b.error_set_type),
         .struct_type, .enum_type, .union_type, .opaque_type => |x| {
@@ -1606,7 +1614,7 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
             .func => |x| x.ty,
             .extern_func => |x| x.ty,
             .calling_convention => .calling_convention_type,
-            .nav_capture => .generic_poison_type,
+            .nav_capture, .runtime_capture => .generic_poison_type,
         },
     };
 }

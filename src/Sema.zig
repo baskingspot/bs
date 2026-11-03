@@ -119,6 +119,8 @@ pub const Block = struct {
     want_safety: bool = true,
     /// See `condChild`.
     runtime_cond: bool = false,
+    /// Inside `@TypeOf`'s operand: only the type of values matters.
+    is_typeof: bool = false,
     /// The innermost runtime `loop` this block is inside of.
     loop: ?Ir.Inst.Index = null,
 
@@ -176,6 +178,7 @@ pub const Block = struct {
             .src_base = b.src_base,
             .want_safety = b.want_safety,
             .loop = b.loop,
+            .is_typeof = b.is_typeof,
         };
     }
 
@@ -1798,6 +1801,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             // in a comptime scope (like upstream); any IR it emits is never
             // referenced by a body.
             child.is_comptime = false;
+            child.is_typeof = true;
             const operand = try sema.resolveInlineBody(&child, body, inst);
             break :blk .fromInterned(sema.typeOf(operand));
         },
@@ -2372,6 +2376,12 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 const src = block.nodeSrc(@enumFromInt(@as(i32, @bitCast(ext.operand))));
                 break :blk if (c.by_ref) sema.navRef(block, src, c.nav) else sema.navVal(block, src, c.nav);
             }
+            if (sema.ip.indexToKey(cap) == .runtime_capture) {
+                // Only its type is known; as upstream, only `@TypeOf` reads it.
+                const src = block.nodeSrc(@enumFromInt(@as(i32, @bitCast(ext.operand))));
+                if (!block.is_typeof) return sema.fail(block, src, "variable not accessible from inner function", .{});
+                break :blk sema.addTyOp(block, .bitcast, sema.ip.indexToKey(cap).runtime_capture, .fromInterned(try sema.undefValue(sema.ip.indexToKey(cap).runtime_capture)));
+            }
             break :blk .fromInterned(cap);
         },
         .@"asm", .asm_expr => sema.zirAsm(block, inst),
@@ -2599,6 +2609,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             var child = block.child();
             defer child.instructions.deinit(sema.gpa);
             child.is_comptime = block.is_comptime;
+            child.is_typeof = true;
             _ = try sema.analyzeInlineBody(&child, body, inst);
             const refs = try sema.arena.alloc(Ref, ext.small);
             for (refs, 0..) |*r, k| r.* = sema.resolveInst(@fromBackingInt(sema.code.extra[extra.end + k]));
@@ -3470,10 +3481,12 @@ fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.
     for (decl_captures, captures) |cap, *out| {
         out.* = switch (cap.unwrap()) {
             .nested => |i| sema.ip.containerType(sema.zcu.namespacePtr(block.namespace).owner_type).?.captures[i],
-            .instruction => |i| try sema.resolveConstValue(block, src, sema.resolveInst(i.toRef()), "captured value must be comptime-known"),
+            // A runtime value is captured by its type (see `runtime_capture`).
+            .instruction => |i| sema.resolveValue(sema.resolveInst(i.toRef())) orelse
+                try sema.intern(.{ .runtime_capture = sema.typeOf(sema.resolveInst(i.toRef())) }),
             .instruction_load => |i| blk: {
                 const loaded = try sema.analyzeLoad(block, src, sema.resolveInst(i.toRef()));
-                break :blk try sema.resolveConstValue(block, src, loaded, "captured value must be comptime-known");
+                break :blk sema.resolveValue(loaded) orelse try sema.intern(.{ .runtime_capture = sema.typeOf(loaded) });
             },
             // As upstream, a captured declaration is resolved only when the
             // type's body reads it: the type may be that declaration's value.
