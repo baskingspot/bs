@@ -130,6 +130,13 @@ pub const want_reg: u8 = 0xfe;
 /// Like `want_reg`, for a value that needs two registers: a 9- to 16-byte
 /// value as its two eightbytes (`reg` the low, `reg2` the high one).
 pub const want_pair: u8 = 0xfd;
+/// Like `want_reg`, for a value in a floating-point register.
+pub const want_float: u8 = 0xfc;
+
+/// Whether `r` is one of the `want` markers.
+pub fn wants(r: u8) bool {
+    return r >= want_float and r != no_reg;
+}
 
 pub const Value = struct {
     op: Op,
@@ -384,8 +391,9 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
 /// - Arguments are all moved at the entry, so an unused one, whose interval
 ///   ends there, takes no register.
 /// - Promotion: a non-volatile alloc whose type is in a general-purpose
-///   register (`ctx.inGpr`) or two (`ctx.inPair`) and whose address is only loaded from and
-///   stored to, so it is never taken, gets `want_reg` (`want_pair`), and its loads and
+///   register (`ctx.inGpr`), two (`ctx.inPair`), or a floating-point one
+///   (`ctx.inFloat`) and whose address is only loaded from and stored to,
+///   so it is never taken, gets `want_reg` (`want_pair`, `want_float`), and its loads and
 ///   stores are moves. This is mem2reg without renaming: the variable
 ///   keeps one register for its interval, which `liveness` extends over
 ///   the loops that use it, so it needs no phis. A load may share the
@@ -478,10 +486,9 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     if (ty == .none) continue;
                     const info = Type.ptrInfo(ip, ty);
                     if (info.flags.is_volatile) continue;
-                    const pair = !ctx.inGpr(info.child);
-                    if (pair and !ctx.inPair(info.child)) continue;
+                    const class: u32 = if (ctx.inGpr(info.child)) 0 else if (ctx.inPair(info.child)) 1 else if (ctx.inFloat(info.child)) 2 else continue;
                     count[i] = candidate;
-                    try f.candidates.append(gpa, i | @as(u32, @intFromBool(pair)) << 31);
+                    try f.candidates.append(gpa, i | class << 30);
                 },
                 .load => if (fate[i] != .dead) {
                     const v = @backingInt(datas[i].ty_op.operand.toIndex() orelse continue);
@@ -505,16 +512,20 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     // promoted (see `plan`).
     const tie = live.items(.tie);
     for (f.candidates.items) |c| {
-        const v = c & ~(@as(u32, 1) << 31);
+        const v = c & ~(@as(u32, 3) << 30);
         if (candidate - count[v] == uses[v]) {
-            reg[v] = if (c >> 31 != 0) want_pair else want_reg;
+            reg[v] = switch (c >> 30) {
+                0 => want_reg,
+                1 => want_pair,
+                else => want_float,
+            };
             tie[v] = no_tie;
         }
         count[v] = no_tie;
     }
     for (f.var_loads.items) |l| {
         const v = datas[l].ty_op.operand.toIndex().?;
-        if (reg[@backingInt(v)] == reg[l] and (reg[l] == want_reg or reg[l] == want_pair)) share[l] = f.shareable(ir, @fromBackingInt(l), v);
+        if (reg[@backingInt(v)] == reg[l] and wants(reg[l])) share[l] = f.shareable(ir, @fromBackingInt(l), v);
     }
 }
 
@@ -693,7 +704,9 @@ pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 
 /// Linear-scan register allocation (Poletto and Sarkar) over the values
 /// `liveness` gave intervals and the architecture marked `want_reg` or
-/// `want_pair`, with `n` registers, in order of definition. Only the
+/// `want_pair`, with `n` general-purpose registers (indices 0 to n - 1),
+/// and `want_float`, with `n_float` floating-point ones (the next
+/// indices), in order of definition. Only the
 /// registers in `survives` may hold a value that crosses a clobber point;
 /// a value that crosses none prefers the others. When none is free, the
 /// value whose interval ends last among those holding a register it could
@@ -702,8 +715,11 @@ pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// their registers through their last use, so a result shares a register
 /// only with its tied operand or, for a load of a promoted variable, with
 /// the variable (`Live.share`). Returns the mask of registers used.
-pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
-    assert(n <= max_regs);
+pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32) u32 {
+    const total = n + n_float;
+    assert(total <= max_regs);
+    const gprs: u32 = (@as(u32, 1) << @intCast(n)) - 1;
+    const floats: u32 = ((@as(u32, 1) << @intCast(n_float)) - 1) << @intCast(n);
     const s = f.live.slice();
     const reg = s.items(.reg);
     const reg2 = s.items(.reg2);
@@ -718,11 +734,11 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
     // that share are not in `active`; their holder outlives them.
     var held: [max_regs]u32 = @splat(0);
     var active_len: u8 = 0;
-    var free: u32 = (@as(u32, 1) << @intCast(n)) - 1;
+    var free: u32 = gprs | floats;
     var used: u32 = 0;
     for (f.values.items(.inst)) |inst_index| {
         const inst = @backingInt(inst_index);
-        if (reg[inst] != want_reg and reg[inst] != want_pair) continue;
+        if (!wants(reg[inst])) continue;
         var j: u8 = 0;
         while (j < active_len) {
             const a = active[j];
@@ -733,9 +749,9 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
                 active[j] = active[active_len];
             } else j += 1;
         }
-        const usable: u32 = if (crosses[inst]) survives else ~@as(u32, 0);
+        const usable: u32 = (if (reg[inst] == want_float) floats else gprs) & if (crosses[inst]) survives else ~@as(u32, 0);
         const v = share[inst];
-        if (v != no_tie and reg[v] < n) {
+        if (v != no_tie and reg[v] < total) {
             reg[inst] = reg[v];
             held[reg[v]] = @max(held[reg[v]], end[inst]);
             if (reg2[v] != no_reg) reg2[inst] = reg2[v];
@@ -762,7 +778,7 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
         }
         const t = tie[inst];
         // Not a register a load shares, which its variable still holds.
-        if (t != no_tie and end[t] == def[inst] and reg[t] < n and usable >> @intCast(reg[t]) & 1 != 0 and
+        if (t != no_tie and end[t] == def[inst] and reg[t] < total and usable >> @intCast(reg[t]) & 1 != 0 and
             reg2[t] == no_reg and (share[t] == no_tie or reg[share[t]] != reg[t]))
         {
             // Take over the tied operand's register, which dies here.
@@ -772,7 +788,7 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
             continue;
         }
         if (free & usable != 0) {
-            const pick = if (free & ~survives != 0 and !crosses[inst]) free & ~survives else free & usable;
+            const pick = if (free & usable & ~survives != 0 and !crosses[inst]) free & usable & ~survives else free & usable;
             const r: u8 = @intCast(@ctz(pick));
             free &= ~(@as(u32, 1) << @intCast(r));
             used |= @as(u32, 1) << @intCast(r);
@@ -799,7 +815,7 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
     return used;
 }
 
-pub const max_regs = 16;
+pub const max_regs = 32;
 
 /// Frame slots shared by lifetime (pass 7): a value's slot is free for
 /// another value once the position passes the end of its interval. Slots
