@@ -2313,6 +2313,13 @@ fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Err
 fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void {
     const s = cg.signed(ty);
     try cg.load(.rax, lhs);
+    if (!s) if (rhs.toInterned()) |v| switch (tag) {
+        .div_trunc, .div_floor, .div_ceil, .rem, .mod => if (intBits(cg.ip, v) != 0) {
+            try cg.divConst(tag, intBits(cg.ip, v), Type.intInfo(cg.ip, ty).bits);
+            return cg.normalize(.rax, ty);
+        },
+        else => {},
+    };
     try cg.load(.rcx, rhs);
     switch (tag) {
         .add_wrap => try cg.e.alu(.add, .qword, .{ .reg = .rax }, .{ .reg = .rcx }),
@@ -2328,8 +2335,26 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void 
                 try cg.e.cqo(.qword);
                 try cg.e.unary(.idiv, .qword, .{ .reg = .rcx });
             } else {
+                // A 32-bit divide is faster where the operands fit (it
+                // zero-extends its results): always for types of up to 32
+                // bits, else when both values do, as LLVM bypasses slow
+                // divides.
                 try cg.e.alu(.xor, .dword, .{ .reg = .rdx }, .{ .reg = .rdx });
-                try cg.e.unary(.div, .qword, .{ .reg = .rcx });
+                if (Type.intInfo(cg.ip, ty).bits <= 32) {
+                    try cg.e.unary(.div, .dword, .{ .reg = .rcx });
+                } else {
+                    const wide = try cg.e.newLabel();
+                    const done = try cg.e.newLabel();
+                    try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rax });
+                    try cg.e.alu(.@"or", .qword, .{ .reg = .r11 }, .{ .reg = .rcx });
+                    try cg.e.shift(.shr, .qword, .{ .reg = .r11 }, 32);
+                    try cg.e.jcc(.ne, .{ .label = wide });
+                    try cg.e.unary(.div, .dword, .{ .reg = .rcx });
+                    try cg.e.jmp(.{ .label = done });
+                    cg.e.bind(wide);
+                    try cg.e.unary(.div, .qword, .{ .reg = .rcx });
+                    cg.e.bind(done);
+                }
             }
             // rax = quotient, rdx = remainder.
             if (s and (tag == .div_floor or tag == .mod)) {
@@ -2367,6 +2392,87 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void 
         else => unreachable,
     }
     try cg.normalize(.rax, ty);
+}
+
+/// Unsigned division of the `bits`-bit value in rax by constant `d` (not
+/// zero) without a divide: a shift for a power of two, else a multiply by
+/// a magic number (Granlund and Montgomery, 1994): the smallest `p` from
+/// 64 with `m = ceil(2^p / d)` and `m * d - 2^p <= 2^(p - bits)` gives
+/// `x / d = (x * m) >> p` for every `bits`-bit `x`; an `m` of 65 bits
+/// takes the add-and-halve fixup. The result, by `tag`, ends in rax. Uses
+/// rcx, rdx, and r11.
+fn divConst(cg: *CodeGen, tag: Inst.Tag, d: u64, bits: u16) Error!void {
+    const e = &cg.e;
+    const want_rem = tag == .rem or tag == .mod or tag == .div_ceil;
+    if (std.math.isPowerOfTwo(d)) {
+        const k: u6 = @intCast(@ctz(d));
+        if (want_rem) try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rax });
+        if (k != 0) try e.shift(.shr, .qword, .{ .reg = .rax }, k);
+        if (want_rem) try cg.andImm(.rdx, d - 1);
+    } else if (d > @as(u64, 1) << @intCast(bits - 1)) {
+        // The quotient is 0 or 1.
+        try e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(d) });
+        try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rax });
+        try e.alu(.xor, .dword, .{ .reg = .rcx }, .{ .reg = .rcx });
+        try e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .r11 });
+        try e.setcc(.ae, .{ .reg = .rcx });
+        const done = try e.newLabel();
+        try e.jcc(.b, .{ .label = done });
+        try e.alu(.sub, .qword, .{ .reg = .rdx }, .{ .reg = .r11 });
+        e.bind(done);
+        try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
+    } else {
+        var p: u8 = 64;
+        const m: u128 = while (true) : (p += 1) {
+            const two_p = @as(u128, 1) << @intCast(p);
+            const mm = (two_p + d - 1) / d;
+            if (mm * d - two_p <= @as(u128, 1) << @intCast(p - bits)) break mm;
+        };
+        try e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rax });
+        try e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(@as(u64, @truncate(m))) });
+        try e.unary(.mul, .qword, .{ .reg = .r11 });
+        if (m >> 64 == 0) {
+            try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
+            if (p > 64) try e.shift(.shr, .qword, .{ .reg = .rax }, @intCast(p - 64));
+        } else {
+            // q = (t + ((x - t) >> 1)) >> (p - 65), t = (x * (m - 2^64)) >> 64.
+            try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
+            try e.alu(.sub, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
+            try e.shift(.shr, .qword, .{ .reg = .rax }, 1);
+            try e.alu(.add, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
+            if (p > 65) try e.shift(.shr, .qword, .{ .reg = .rax }, @intCast(p - 65));
+        }
+        if (want_rem) {
+            // r = x - q * d.
+            if (std.math.cast(i32, d)) |imm| {
+                try e.imul(.qword, .rdx, .{ .reg = .rax }, imm);
+            } else {
+                try e.mov(.qword, .{ .reg = .rdx }, .{ .imm = @bitCast(d) });
+                try e.imul(.qword, .rdx, .{ .reg = .rax }, null);
+            }
+            try e.alu(.sub, .qword, .{ .reg = .rcx }, .{ .reg = .rdx });
+            try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rcx });
+        }
+    }
+    switch (tag) {
+        .div_trunc, .div_floor => {},
+        .rem, .mod => try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx }),
+        .div_ceil => {
+            // Up by one when the remainder is not zero.
+            try e.@"test"(.qword, .{ .reg = .rdx }, .{ .reg = .rdx });
+            try e.setcc(.ne, .{ .reg = .rdx });
+            try e.movzx(.qword, .rdx, .byte, .{ .reg = .rdx });
+            try e.alu(.add, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
+        },
+        else => unreachable,
+    }
+}
+
+/// `reg &= mask`.
+fn andImm(cg: *CodeGen, reg: Reg, mask: u64) Error!void {
+    if (std.math.cast(i32, mask)) |imm| return cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .imm = imm });
+    try cg.e.mov(.qword, .{ .reg = .r11 }, .{ .imm = @bitCast(mask) });
+    try cg.e.alu(.@"and", .qword, .{ .reg = reg }, .{ .reg = .r11 });
 }
 
 /// `{ T, u1 }` results: the wrapped value and whether it overflowed `T`.
