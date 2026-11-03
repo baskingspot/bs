@@ -3525,6 +3525,15 @@ analyzing everything.
   without donors ("not linked"). And `builtin.test_functions` is set
   after analysis from the build's tests, so `checkPrediction` exempts it
   like the link node.
+- *Follow-up: lazy donor builds.* A donor build replays eagerly, so that
+  it records a full manifest of its own: on a fresh zls worktree its
+  first build spends 207 ms loading and analyzing in Sema and 121 ms
+  recording, against 34 ms in the frontend. A lazy one would hard-link
+  the donor's manifest as its base and log the differences (inputs with
+  new paths and keys, the units it analyzed) as an edit build does,
+  loading only what the build reaches. It needs Delta records for input
+  path and key changes, and the debug-path check per loaded function;
+  not built.
 
 Reviewed by the Sema thread (2026-11-03); its answers to the two open
 questions (calling back into `Zcu.ensure*`, anonymous types' ordinals) and
