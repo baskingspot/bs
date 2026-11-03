@@ -2869,6 +2869,30 @@ the zig workload, each a real new or reused value. Beyond that the
 walker's cost is spread thin; the next structural step is fewer
 intermediate values per operation, not cheaper ones.
 
+Dependency-set round (against origin/main 8990f04, same measures): zig
+workload 47.79 G → 46.30 G instructions (−3.1%), libvaxis 1.511 G →
+1.473 G (−2.5%); output identical. Declaring dependencies cost 2.9 G
+inclusive (about 9% of Sema): 15.6 M declarations, of which 8.5 M stopped
+at `dep_cache`, 2.7 M found the dependee already in `deps`, and 3.3 M were
+new. What changed:
+
+- Each unit grew its `deps_set` (and each memoizable call its `memo_pos`,
+  and `memoDeps` a scratch map) from empty: 366 k rehashing grows, 0.8 G.
+  Emptied maps now go back to a pool in the Zcu (`Zcu.dep_maps`, per
+  analysis thread once Sema is parallel) and keep their capacity; a map
+  grown past 4096 entries is freed instead, since clearing costs its
+  capacity.
+- `dep_cache` and `memo_dep_cache` have 256 entries instead of 64, which
+  halves the declarations that reach `deps` only to find their dependee.
+- `InternPool.getString` hashed its bytes twice (once for the shard), and
+  its map rehashed every string's bytes on growth. String map entries now
+  carry a 32-bit hash, as item entries carry `lookupHash`.
+
+Measuring note: valgrind runs x87 arithmetic at 64-bit precision, so
+binaries a callgrind run emits can differ from native ones in `f80`
+constants that comptime computed (compiler_rt's `rem_pio2l`); compare
+outputs from native runs.
+
 ### Parallel function bodies (designed 2026-11-03; step 1 built 2026-11-03)
 
 Three steps, each useful alone, sharing one hook. Step 1 is built (below);

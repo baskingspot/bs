@@ -54,15 +54,15 @@ deps: std.ArrayList(Zcu.Dependee) = .empty,
 deps_conditional: std.ArrayList(bool) = .empty,
 /// The entries of `deps` with their indices, once it is long enough to
 /// search this way.
-deps_set: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
+deps_set: DependeeMap = .empty,
 /// Recently declared dependencies, by a hash of the dependee: one more
 /// index into `deps` (0 for none). Analysis declares the same few over and
 /// over (each element of a large literal resolves the same layouts).
-dep_cache: [64]u32 = @splat(0),
+dep_cache: [256]u32 = @splat(0),
 /// The same inside a memoizable comptime call: one more index into
 /// `memo_deps` (0 for none). An entry at or after `memo_start` is in the
 /// call's dependencies, and so in `deps`, at least as plain as it is there.
-memo_dep_cache: [64]u32 = @splat(0),
+memo_dep_cache: [256]u32 = @splat(0),
 /// When this unit's analysis started, for `Zcu.unit_timing`.
 timer: [2]u64,
 /// What a name in the current file's ZIR resolved to in a type: each row
@@ -75,7 +75,7 @@ name_cache: std.AutoHashMapUnmanaged(NameKey, u32) = .empty,
 memo_deps: std.ArrayList(MemoCollected) = .empty,
 /// The last entry of `memo_deps` for each dependee, evaluator body and
 /// container type with effects.
-memo_pos: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
+memo_pos: DependeeMap = .empty,
 memo_body_pos: std.AutoHashMapUnmanaged(*const Zcu.Bytecode, u32) = .empty,
 memo_effect_pos: std.AutoHashMapUnmanaged(Index, u32) = .empty,
 /// Null outside memoizable comptime calls.
@@ -517,10 +517,10 @@ fn destroy(sema: *Sema) void {
     sema.inst_map.deinit(gpa);
     sema.deps.deinit(gpa);
     sema.deps_conditional.deinit(gpa);
-    sema.deps_set.deinit(gpa);
+    giveDepMap(sema.zcu, &sema.deps_set);
     sema.name_cache.deinit(gpa);
     sema.memo_deps.deinit(gpa);
-    sema.memo_pos.deinit(gpa);
+    giveDepMap(sema.zcu, &sema.memo_pos);
     sema.memo_body_pos.deinit(gpa);
     sema.memo_effect_pos.deinit(gpa);
     sema.bc_undo.deinit(gpa);
@@ -1599,7 +1599,7 @@ fn declareDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !void {
     // Declaring a dependency again changes nothing, unless it turns a
     // conditional one plain, or lowering or a memoizable call in progress
     // records it too.
-    const h: u6 = @truncate(@import("Incremental.zig").DependeeContext.hash(.{}, dependee));
+    const h: u8 = @truncate(@import("Incremental.zig").DependeeContext.hash(.{}, dependee));
     const slot = &sema.dep_cache[h];
     if (sema.bc == null) {
         if (sema.memo_start) |start| {
@@ -1630,7 +1630,10 @@ fn addDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !u32 {
     const found: ?u32 = if (len < 16) (for (sema.deps.items, 0..) |d, i| {
         if (std.meta.eql(d, dependee)) break @intCast(i);
     } else null) else blk: {
-        if (sema.deps_set.count() == 0) for (sema.deps.items, 0..) |d, i| try sema.deps_set.put(sema.gpa, d, @intCast(i));
+        if (sema.deps_set.count() == 0) {
+            if (sema.deps_set.capacity() == 0) sema.deps_set = takeDepMap(sema.zcu);
+            for (sema.deps.items, 0..) |d, i| try sema.deps_set.put(sema.gpa, d, @intCast(i));
+        }
         const gop = try sema.deps_set.getOrPut(sema.gpa, dependee);
         if (gop.found_existing) break :blk gop.value_ptr.*;
         gop.value_ptr.* = len;
@@ -1643,6 +1646,26 @@ fn addDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !u32 {
     try sema.deps.append(sema.gpa, dependee);
     try sema.deps_conditional.append(sema.gpa, conditional);
     return len;
+}
+
+const DependeeMap = @import("Incremental.zig").DependeeMap;
+
+/// An empty dependee map, with capacity from an earlier unit if one is
+/// pooled.
+fn takeDepMap(zcu: *Zcu) DependeeMap {
+    return zcu.dep_maps.pop() orelse .empty;
+}
+
+/// Returns `map` to the pool, emptied. Clearing costs its capacity, so a
+/// map grown far beyond what most units need is freed instead.
+fn giveDepMap(zcu: *Zcu, map: *DependeeMap) void {
+    defer map.* = .empty;
+    if (map.capacity() == 0) return;
+    if (map.capacity() <= 4096) {
+        map.clearRetainingCapacity();
+        if (zcu.dep_maps.append(zcu.gpa, map.*)) return else |_| {}
+    }
+    map.deinit(zcu.gpa);
 }
 
 /// What a memoizable comptime call in progress declared: a dependency, an
@@ -1660,6 +1683,7 @@ fn memoCollect(sema: *Sema, entry: MemoCollected, start: u32) !u32 {
     const len: u32 = @intCast(sema.memo_deps.items.len);
     switch (entry) {
         .dep => |d| {
+            if (sema.memo_pos.capacity() == 0) sema.memo_pos = takeDepMap(sema.zcu);
             const gop = try sema.memo_pos.getOrPut(gpa, d.dependee);
             if (gop.found_existing and gop.value_ptr.* >= start) {
                 if (!d.conditional) sema.memo_deps.items[gop.value_ptr.*].dep.conditional = false;
@@ -1686,8 +1710,8 @@ fn memoCollect(sema: *Sema, entry: MemoCollected, start: u32) !u32 {
 /// declared, for its memo entry.
 fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.MemoDep {
     var out: std.ArrayList(Zcu.MemoDep) = .empty;
-    var index: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty;
-    defer index.deinit(sema.gpa);
+    var index = takeDepMap(sema.zcu);
+    defer giveDepMap(sema.zcu, &index);
     const S = struct {
         fn add(o: *std.ArrayList(Zcu.MemoDep), ix: anytype, gpa: Allocator, arena: Allocator, d: Zcu.MemoDep) !void {
             const gop = try ix.getOrPut(gpa, d.dependee);

@@ -38,6 +38,10 @@ deps: std.AutoArrayHashMapUnmanaged(AnalUnit, []const Dependee) = .empty,
 /// those, ascending. Such an edge counts for invalidation, but the unit
 /// does not resolve its dependee itself. Arena-allocated.
 conditional_deps: std.AutoHashMapUnmanaged(AnalUnit, []const u32) = .empty,
+/// Empty dependee maps with their capacity kept, for Sema's per-unit sets
+/// (`Sema.takeDepMap`), so that each of the many units does not grow a
+/// fresh one. Per analysis thread once Sema runs in parallel.
+dep_maps: std.ArrayList(@import("Incremental.zig").DependeeMap) = .empty,
 /// Analysis state of runtime function bodies.
 funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, FuncState) = .empty,
 func_queue: std.ArrayList(InternPool.Index) = .empty,
@@ -355,6 +359,8 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.comptime_decls.deinit(gpa);
     zcu.comptime_memo.deinit(gpa);
     zcu.conditional_deps.deinit(gpa);
+    for (zcu.dep_maps.items) |*m| m.deinit(gpa);
+    zcu.dep_maps.deinit(gpa);
     zcu.effect_uses.deinit(gpa);
     var bodies = zcu.comptime_bodies.valueIterator();
     while (bodies.next()) |b| switch (b.*) {

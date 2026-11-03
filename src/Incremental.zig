@@ -411,6 +411,9 @@ const UnitContext = struct {
 };
 
 /// Also Sema's, for the set of dependencies a unit declared.
+/// A dependee to position map, as Sema keeps per unit (see `Zcu.dep_maps`).
+pub const DependeeMap = std.HashMapUnmanaged(Zcu.Dependee, u32, DependeeContext, std.hash_map.default_max_load_percentage);
+
 pub const DependeeContext = struct {
     pub fn hash(_: DependeeContext, d: Zcu.Dependee) u64 {
         return switch (d) {
