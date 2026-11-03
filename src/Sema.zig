@@ -2577,7 +2577,13 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             if (block.is_comptime) break :blk .fromInterned(.zero_usize);
             break :blk sema.addInst(block, .{ .tag = if (ext.opcode == .ret_addr) .ret_addr else .frame_addr, .data = .{ .no_op = {} } });
         },
-        .builtin_src, .error_return_trace => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
+        // zap keeps no error return traces yet: there is never one to show.
+        .error_return_trace => blk: {
+            const src = block.nodeSrc(.zero);
+            const trace_ptr = try sema.ptrType(.{ .child = try sema.stdLangType(block, src, "StackTrace") });
+            break :blk .fromInterned(try sema.intern(.{ .opt = .{ .ty = try sema.optType(trace_ptr), .val = .none } }));
+        },
+        .builtin_src => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
         else => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
     };
 }
