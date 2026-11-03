@@ -938,6 +938,16 @@ fn resolveLayoutIfIdle(sema: *Sema, block: *Block, src: Src, ty: Index) CompileE
 }
 
 /// Resolves the field types (not necessarily the layout) of a struct.
+/// `Type.isComptimeOnly` once a struct's or union's field types are known
+/// (before that, it answers no).
+fn isComptimeOnlyResolved(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!bool {
+    switch (sema.ip.indexToKey(ty)) {
+        .struct_type, .union_type => try sema.resolveStructFields(block, src, ty),
+        else => {},
+    }
+    return Type.isComptimeOnly(sema.ip, ty);
+}
+
 fn resolveStructFields(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
     const info = sema.ip.structInfo(ty);
     if (info.status == .layout_wip or info.status == .have_field_types) return;
@@ -4765,10 +4775,15 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
     if (Type.class(ip, dst) != .@"fn") return false;
     const s = ip.indexToKey(src).func_type;
     const d = ip.indexToKey(dst).func_type;
-    if (s.cc != d.cc or s.is_generic != d.is_generic or s.comptime_bits != d.comptime_bits or s.param_types.len != d.param_types.len) return false;
-    // A generic parameter on either side matches, as upstream.
-    for (s.param_types, d.param_types) |a, b| if (a != b and a != .generic_poison_type and b != .generic_poison_type) return false;
-    if (s.return_type == d.return_type or s.return_type == .noreturn_type) return true;
+    if (s.cc != d.cc or s.is_var_args != d.is_var_args or s.is_generic != d.is_generic or
+        s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits or s.comptime_bits != d.comptime_bits) return false;
+    // Parameters coerce the other way, in memory; a generic one matches any.
+    for (s.param_types, d.param_types) |a, b| {
+        if (a == b or a == .generic_poison_type or b == .generic_poison_type) continue;
+        if (Type.class(ip, a) == .pointer and Type.class(ip, b) == .pointer and sema.ptrCoercibleInPlace(b, a)) continue;
+        return false;
+    }
+    if (s.return_type == d.return_type or s.return_type == .noreturn_type or s.return_type == .generic_poison_type) return true;
     const sr = ip.indexToKey(s.return_type);
     const dr = ip.indexToKey(d.return_type);
     if (sr != .error_union_type or dr != .error_union_type) return false;
@@ -5187,6 +5202,7 @@ fn analyzePtrDiff(sema: *Sema, block: *Block, src: Src, lhs: Ref, rhs: Ref) Comp
     const rp = Type.ptrInfo(ip, sema.typeOf(rhs));
     if (lp.flags.size == .slice or rp.flags.size == .slice or lp.child != rp.child)
         return sema.fail(block, src, "incompatible pointer arithmetic operands '{f}' and '{f}'", .{ sema.fmtType(sema.typeOf(lhs)), sema.fmtType(sema.typeOf(rhs)) });
+    try sema.resolveLayout(block, src, lp.child);
     const elem_size = @max(Type.abiSize(ip, lp.child), 1);
     if (sema.resolveValue(lhs)) |lv| if (sema.resolveValue(rhs)) |rv| {
         const lk = ip.indexToKey(lv).ptr;
@@ -5214,6 +5230,7 @@ fn analyzePtrArithmetic(sema: *Sema, block: *Block, src: Src, is_add: bool, ptr:
     const p = Type.ptrInfo(ip, ptr_ty);
     if (p.flags.size != .many and p.flags.size != .c) return sema.fail(block, src, "invalid pointer arithmetic operand: '{f}'", .{sema.fmtType(ptr_ty)});
     const n = try sema.coerce(block, .usize_type, uncasted_n, src);
+    try sema.resolveLayout(block, src, p.child);
     const elem_size = Type.abiSize(ip, p.child);
     if (sema.resolveValue(ptr)) |pv| if (sema.resolveValue(n)) |nv| {
         if (ip.indexToKey(pv) == .ptr and !sema.isUndef(nv)) {
@@ -7053,7 +7070,51 @@ fn comptimePtrsEqual(sema: *Sema, a: InternPool.Ptr, b: InternPool.Ptr) ?bool {
     const ra = sema.ptrRootBase(a);
     const rb = sema.ptrRootBase(b);
     if (!std.meta.eql(ra, rb)) return false;
-    return null;
+    // The same allocation: compare byte offsets into it, when known.
+    const oa = sema.ptrRootOffset(a) orelse return null;
+    const ob = sema.ptrRootOffset(b) orelse return null;
+    return oa == ob;
+}
+
+/// The byte offset of comptime pointer `ptr` into its allocation, or null
+/// if a layout on the way is not known (a packed field, or a type whose
+/// layout is unresolved).
+fn ptrRootOffset(sema: *Sema, ptr: InternPool.Ptr) ?u64 {
+    const ip = sema.ip;
+    const known = struct {
+        fn f(p: *InternPool, ty: Index) bool {
+            return switch (p.indexToKey(ty)) {
+                .struct_type, .union_type, .enum_type => p.structInfo(ty).status == .have_layout,
+                .array_type => |a| f(p, a.child),
+                .vector_type => |v| f(p, v.child),
+                .opt_type => |c| f(p, c),
+                .error_union_type => |e| f(p, e.payload_type),
+                .tuple_type => |t| for (t.types) |ft| {
+                    if (!f(p, ft)) break false;
+                } else true,
+                else => true,
+            };
+        }
+    }.f;
+    switch (ptr.base) {
+        .field => |f| {
+            const parent = ip.indexToKey(f.base).ptr;
+            const agg = Type.ptrInfo(ip, parent.ty).child;
+            if (!known(ip, agg) or Type.isPacked(ip, agg) or Type.isSlice(ip, agg)) return null;
+            if (ip.indexToKey(agg) == .struct_type or ip.indexToKey(agg) == .tuple_type) {
+                if (Type.comptimeFieldValue(ip, agg, f.index) != .none) return null;
+            }
+            return (sema.ptrRootOffset(parent) orelse return null) + Type.fieldOffset(ip, agg, f.index) + ptr.byte_offset;
+        },
+        .elem => |e| {
+            const parent = ip.indexToKey(e.base).ptr;
+            const elem_ty = Type.ptrInfo(ip, ptr.ty).child;
+            const size = if (e.index == 0) 0 else if (known(ip, elem_ty)) Type.abiSize(ip, elem_ty) else return null;
+            return (sema.ptrRootOffset(parent) orelse return null) + e.index * size + ptr.byte_offset;
+        },
+        .int => return null,
+        else => return ptr.byte_offset,
+    }
 }
 
 /// The byte offset of comptime pointer `ptr` within its allocation, as
@@ -10677,7 +10738,7 @@ fn analyzeCall(
     // at runtime, as upstream; its result must be comptime-known.
     const is_inline = fn_ty.cc == .@"inline" or modifier == .always_inline;
     const comptime_call = block.is_comptime or modifier == .compile_time or
-        (ret_ty != .generic_poison_type and Type.isComptimeOnly(ip, ret_ty) and !is_inline);
+        (ret_ty != .generic_poison_type and try sema.isComptimeOnlyResolved(block, src, ret_ty) and !is_inline);
     if (func == .none) {
         if (comptime_call) return sema.fail(block, src, "unable to resolve comptime value: function pointer is not comptime-known", .{});
         const callee_ptr = if (extern_func == .none) callee else blk: {
@@ -10715,7 +10776,7 @@ fn analyzeCall(
         const inst = try sema.instantiate(block, src, func, args);
         callee_func = inst.func;
         call_args = inst.runtime_args;
-        if (Type.isComptimeOnly(ip, ip.indexToKey(ip.typeOf(callee_func)).func_type.return_type)) {
+        if (try sema.isComptimeOnlyResolved(block, src, ip.indexToKey(ip.typeOf(callee_func)).func_type.return_type)) {
             const vals = try sema.arena.alloc(Index, args.len);
             for (args, vals) |a, *v| v.* = try sema.resolveConstValue(block, src, a, "argument to function being called at comptime must be comptime-known");
             try sema.emitBackwardBranch(block, src);
