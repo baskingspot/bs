@@ -4635,9 +4635,10 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     }
     const s_array: ?InternPool.ArrayType = if (ip.indexToKey(s.child) == .array_type) ip.indexToKey(s.child).array_type else null;
     // C pointers coerce to and from single and many pointers of the same child.
-    if (s.flags.size == .c and d.flags.size != .slice) return s.child == d.child or d.child == .anyopaque_type;
+    if (s.flags.size == .c and d.flags.size != .slice) return s.child == d.child or d.child == .anyopaque_type or (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
     if (d.flags.size == .c and s.flags.size != .slice)
-        return s.child == d.child or d.child == .anyopaque_type or (s.flags.size == .one and s_array != null and s_array.?.child == d.child);
+        return s.child == d.child or d.child == .anyopaque_type or (s.flags.size == .one and s_array != null and s_array.?.child == d.child) or
+            (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
     if (s.flags.size == d.flags.size) {
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;
         if (s.child == d.child or sema.sameIntRepr(s.child, d.child)) return true;
@@ -4698,6 +4699,12 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
         if (Type.class(ip, sc) != .pointer or Type.class(ip, dc) != .pointer) return false;
         return sema.childCoercibleInMemory(sc, dc);
     }
+    // A C pointer and an optional single or many pointer share a
+    // representation (`?[*]const u8` and `[*c]const u8`), as upstream.
+    if (sk == .ptr_type and sk.ptr_type.flags.size == .c and dk == .opt_type and isOptionalNonC(ip, dk.opt_type))
+        return sema.cPtrMatches(sk.ptr_type, ip.indexToKey(dk.opt_type).ptr_type);
+    if (dk == .ptr_type and dk.ptr_type.flags.size == .c and sk == .opt_type and isOptionalNonC(ip, sk.opt_type))
+        return sema.cPtrMatches(ip.indexToKey(sk.opt_type).ptr_type, dk.ptr_type);
     // `*T` read as `?*T`: a pointer-like optional is its pointer, as
     // upstream (`*const *anyopaque` to `*const ?*anyopaque`).
     if (sk == .ptr_type and dk == .opt_type and sk.ptr_type.flags.size != .slice and !sk.ptr_type.flags.is_allowzero) {
@@ -4715,6 +4722,21 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;
     if (s.child == d.child) return true;
     return d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child);
+}
+
+fn isOptionalNonC(ip: *const InternPool, child: Index) bool {
+    if (ip.indexToKey(child) != .ptr_type) return false;
+    const p = ip.indexToKey(child).ptr_type;
+    return (p.flags.size == .one or p.flags.size == .many) and !p.flags.is_allowzero;
+}
+
+/// Whether pointers `s` and `d`, one of them a C pointer, read each
+/// other's memory: the same child and alignment, gaining only qualifiers.
+fn cPtrMatches(sema: *Sema, s: InternPool.PtrType, d: InternPool.PtrType) bool {
+    if (s.flags.is_const and !d.flags.is_const) return false;
+    if (s.flags.is_volatile and !d.flags.is_volatile) return false;
+    if (s.flags.alignment != d.flags.alignment) return false;
+    return s.child == d.child or (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
 }
 
 /// Whether sentinel `s` satisfies sentinel `d`, which may be of a
@@ -6499,8 +6521,38 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         try sema.requireRuntime(block, src);
         return sema.addBinOp(block, if (op == .eq) .cmp_eq else .cmp_neq, lhs, rhs);
     }
+    // A C pointer compares with an integer as with a pointer from it.
+    if (lc == .pointer and Type.ptrInfo(ip, lt).flags.size == .c and (rc == .int or rc == .comptime_int))
+        return sema.analyzeCmp(block, src, op, lhs, try sema.coerce(block, lt, rhs, src));
+    if (rc == .pointer and Type.ptrInfo(ip, rt).flags.size == .c and (lc == .int or lc == .comptime_int))
+        return sema.analyzeCmp(block, src, op, try sema.coerce(block, rt, lhs, src), rhs);
+    if (lc == .pointer and rc == .pointer and !is_eq) {
+        // Only C pointers are ordered, as upstream.
+        for ([_]Index{ lt, rt }) |t| if (Type.ptrInfo(ip, t).flags.size != .c)
+            return sema.fail(block, src, "operator {s} not allowed for type '{f}'", .{ @tagName(op), sema.fmtType(t) });
+        // Ordered comparison compares addresses: comptime-known for
+        // addresses from integers or within the same comptime memory.
+        if (sema.resolveValue(lhs)) |a| if (sema.resolveValue(rhs)) |b| {
+            const ka = ip.indexToKey(a);
+            const kb = ip.indexToKey(b);
+            if (ka == .ptr and kb == .ptr) {
+                if (ka.ptr.base == .int and kb.ptr.base == .int)
+                    return .fromInterned(boolValue(std.math.compare(ka.ptr.byte_offset, op, kb.ptr.byte_offset)));
+                if (ka.ptr.base != .int and kb.ptr.base != .int and std.meta.eql(sema.ptrRootBase(ka.ptr), sema.ptrRootBase(kb.ptr)))
+                    return .fromInterned(boolValue(std.math.compare(try sema.comptimePtrOffset(block, src, a), op, try sema.comptimePtrOffset(block, src, b))));
+            }
+        };
+        try sema.requireRuntime(block, src);
+        const tag: Ir.Inst.Tag = switch (op) {
+            .lt => .cmp_lt,
+            .lte => .cmp_lte,
+            .gt => .cmp_gt,
+            .gte => .cmp_gte,
+            else => unreachable,
+        };
+        return sema.addBinOp(block, tag, try sema.addUnOp(block, .int_from_ptr, lhs), try sema.addUnOp(block, .int_from_ptr, rhs));
+    }
     if (lc == .pointer and rc == .pointer) {
-        if (!is_eq) return sema.failUnsupported(block, src, "ordered pointer comparison");
         if (sema.resolveValue(lhs)) |a| if (sema.resolveValue(rhs)) |b| {
             if (sema.isUndef(a) or sema.isUndef(b)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
             const ka = ip.indexToKey(a);
@@ -6517,7 +6569,8 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
                 else if ((a_int and ka.ptr.byte_offset == 0) or (b_int and kb.ptr.byte_offset == 0))
                     false
                 else if (!a_int and !b_int)
-                    sema.comptimePtrsEqual(ka.ptr, kb.ptr)
+                    sema.comptimePtrsEqual(ka.ptr, kb.ptr) orelse
+                        (try sema.comptimePtrOffset(block, src, a) == try sema.comptimePtrOffset(block, src, b))
                 else
                     null;
                 if (known) |eq| return .fromInterned(boolValue(eq == (op == .eq)));
@@ -8476,6 +8529,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     var len: Ref = .none;
     var is_const = Type.ptrInfo(ip, ptr_ty).flags.is_const;
     var ptr_align = Type.ptrInfo(ip, ptr_ty).flags.alignment;
+    var is_allowzero = false;
     var elem_ty: Index = undefined;
     // The sentinel of the sliced object, which the result keeps when it
     // ends where the object does.
@@ -8492,6 +8546,8 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             var obj = try sema.analyzeLoad(block, src, ptr);
             is_const = cp.flags.is_const;
             ptr_align = cp.flags.alignment;
+            // The result is allowzero if the sliced pointer is, as upstream.
+            is_allowzero = cp.flags.is_allowzero and cp.flags.size != .c;
             switch (cp.flags.size) {
                 .one => {
                     // `*T` slices like `*[1]T`, as upstream.
@@ -8604,7 +8660,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     if (slice_sentinel != .none) try sema.checkSliceSentinel(block, src, new_ptr, start_val, end_val, start, end, elem_ty, slice_sentinel);
     if (known_len) |n| {
         const array_ty = try sema.intern(.{ .array_type = .{ .len = n, .child = elem_ty, .sentinel = result_sentinel } });
-        const result_ty = try sema.ptrType(.{ .child = array_ty, .flags = .{ .is_const = is_const, .alignment = result_align } });
+        const result_ty = try sema.ptrType(.{ .child = array_ty, .flags = .{ .is_const = is_const, .is_allowzero = is_allowzero, .alignment = result_align } });
         if (sema.resolveValue(new_ptr)) |pv| {
             if (sema.isUndef(pv)) return .fromInterned(try sema.undefValue(result_ty));
             const k = ip.indexToKey(pv).ptr;
@@ -8620,7 +8676,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         }
         return sema.addTyOp(block, .bitcast, result_ty, new_ptr);
     }
-    const slice_ty = try sema.ptrType(.{ .child = elem_ty, .sentinel = result_sentinel, .flags = .{ .size = .slice, .is_const = is_const, .alignment = result_align } });
+    const slice_ty = try sema.ptrType(.{ .child = elem_ty, .sentinel = result_sentinel, .flags = .{ .size = .slice, .is_const = is_const, .is_allowzero = is_allowzero, .alignment = result_align } });
     const new_len = try sema.analyzeArithmetic(block, src, .subwrap, end, start);
     return sema.makeSlice(block, slice_ty, new_ptr, new_len);
 }
@@ -8718,6 +8774,10 @@ fn analyzeIsNonNull(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileE
     switch (Type.class(sema.ip, ty)) {
         .null => return .fromInterned(.bool_false),
         .optional => {},
+        // A C pointer is optional too.
+        .pointer => if (Type.ptrInfo(sema.ip, ty).flags.size == .c) {
+            return sema.analyzeCmp(block, src, .neq, operand, .fromInterned(.null_value));
+        } else return sema.fail(block, src, "expected optional type, found '{f}'", .{sema.fmtType(ty)}),
         else => return sema.fail(block, src, "expected optional type, found '{f}'", .{sema.fmtType(ty)}),
     }
     if (sema.resolveValue(operand)) |v| {
@@ -8730,6 +8790,16 @@ fn analyzeIsNonNull(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileE
 
 fn optionalPayload(sema: *Sema, block: *Block, src: Src, operand: Ref, safe: bool) CompileError!Ref {
     const ty = sema.typeOf(operand);
+    // A C pointer's payload is itself, checked for null.
+    if (Type.class(sema.ip, ty) == .pointer and Type.ptrInfo(sema.ip, ty).flags.size == .c) {
+        if (safe and block.want_safety and !block.is_comptime) {
+            const ok = try sema.analyzeIsNonNull(block, src, operand);
+            if (sema.resolveValue(ok)) |v| {
+                if (v == .bool_false) return sema.fail(block, src, "unable to unwrap null", .{});
+            } else try sema.addSafetyCheck(block, ok, .unwrap_null, .none, .none);
+        }
+        return operand;
+    }
     if (Type.class(sema.ip, ty) != .optional) return sema.fail(block, src, "expected optional type, found '{f}'", .{sema.fmtType(ty)});
     const child = Type.childType(sema.ip, ty);
     if (sema.resolveValue(operand)) |v| {
