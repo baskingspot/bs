@@ -254,7 +254,8 @@ const MutValue = union(enum) {
 const InferredAlloc = struct {
     stores: std.ArrayList(Ir.Inst.Index) = .empty,
     is_const: bool,
-    /// The block of the `alloc`, and whether every store so far was in it.
+    /// The block of the `alloc`, and whether every store so far ran
+    /// whenever it does (from it or a labeled block in it).
     block: *Block,
     same_block: bool = true,
     /// Requested alignment, or 0.
@@ -2752,6 +2753,13 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 else if (sema.isBoolVectorPtr(sema.typeOf(lhs)) and sema.resolveValue(index) != null)
                     // Bool vectors are bit-packed: load the vector, then the bit.
                     sema.elemVal(block, src, try sema.analyzeLoad(block, src, lhs), index, true)
+                else if (sema.resolveValue(index) == null and sema.resolveValue(lhs) != null and !sema.isUndef(sema.resolveValue(lhs).?) and
+                    try sema.comptimePtrRoot(sema.resolveValue(lhs).?) == .comptime_alloc and
+                    try sema.comptimeLoadOrNull(block, src, sema.resolveValue(lhs).?) != null)
+                    // As upstream: a runtime index into a `comptime var`
+                    // indexes its current value, since runtime code cannot
+                    // point into comptime memory.
+                    sema.elemVal(block, src, .fromInterned((try sema.comptimeLoadOrNull(block, src, sema.resolveValue(lhs).?)).?), index, true)
                 else
                     sema.analyzeLoad(block, src, try sema.elemPtr(block, src, lhs, index, safety)),
                 .elem_val => sema.elemVal(block, src, lhs, index, false),
@@ -4410,7 +4418,15 @@ fn zirFieldParentPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileEr
     const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
     const extra = sema.code.extraData(Zir.Inst.FieldParentPtr, ext.operand).data;
     const src = block.nodeSrc(extra.src_node);
-    const dest_ty = try sema.castDestType(block, src, extra.parent_ptr_type, false);
+    // As upstream, the result type may be an optional pointer.
+    const result_ty = try sema.castDestType(block, src, extra.parent_ptr_type, false);
+    const dest_ty = if (Type.class(ip, result_ty) == .optional and Type.class(ip, Type.childType(ip, result_ty)) == .pointer) Type.childType(ip, result_ty) else result_ty;
+    if (dest_ty != result_ty) return sema.coerce(block, result_ty, try sema.fieldParentPtr(block, src, extra, dest_ty), src);
+    return sema.fieldParentPtr(block, src, extra, dest_ty);
+}
+
+fn fieldParentPtr(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.FieldParentPtr, dest_ty: Index) CompileError!Ref {
+    const ip = sema.ip;
     if (Type.class(ip, dest_ty) != .pointer or Type.ptrInfo(ip, dest_ty).flags.size != .one)
         return sema.fail(block, src, "expected single pointer type, found '{f}'", .{sema.fmtType(dest_ty)});
     const parent_ty = Type.ptrInfo(ip, dest_ty).child;
@@ -7895,7 +7911,20 @@ fn zirStoreToInferredPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compi
         return;
     }
     const ia = sema.inferred_allocs.getPtr(ptr.toIndex().?).?;
-    if (ia.block != block) ia.same_block = false;
+    // A store from a labeled block inside the alloc's block, such as the
+    // prong a comptime-known `switch` operand selects, runs whenever the
+    // alloc's block does; one from a branch does not.
+    var b = block;
+    while (b != ia.block) {
+        if (b.runtime_cond) {
+            ia.same_block = false;
+            break;
+        }
+        b = b.parent orelse {
+            ia.same_block = false;
+            break;
+        };
+    }
     const store = try sema.addBinOp(block, .store, ptr, operand);
     try ia.stores.append(sema.gpa, store.toIndex().?);
 }
@@ -11165,7 +11194,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     if (else_case) |e| if (e.is_inline) {
         // `inline else` becomes one inline prong per value no other prong
         // handles.
-        const all = try sema.switchAllValues(parent, src, operand_ty, under_prong != null);
+        const all = try sema.switchAllValues(parent, src, operand_ty, under_prong != null or is_union);
         for (all) |v| {
             for (cases.items) |c| {
                 if (try sema.switchCaseMatches(c, v)) break;
@@ -13385,9 +13414,30 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) C
         try sema.inst_map.put(gpa, inst, args[i]);
         i += 1;
     }
+    // The return type, evaluated at comptime, sees a runtime argument as an
+    // undefined value of its type, as a generic call's does: it may only
+    // use the type (`[refs.len]T` takes a `ref` of the argument).
+    i = 0;
+    for (fn_info.param_body) |inst| {
+        switch (sema.code.instructions.items(.tag)[@backingInt(inst)]) {
+            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {},
+            else => continue,
+        }
+        if (comptime_args[i] == .none) try sema.inst_map.put(gpa, inst, .fromInterned(try sema.undefValue(sema.typeOf(args[i]))));
+        i += 1;
+    }
     // With an inferred error set, the result's error set is what the
     // returns produce (see `analyzeRet`).
     const ret_ty = try sema.calleeRetTy(&ct_block, src, func);
+    i = 0;
+    for (fn_info.param_body) |inst| {
+        switch (sema.code.instructions.items(.tag)[@backingInt(inst)]) {
+            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {},
+            else => continue,
+        }
+        if (comptime_args[i] == .none) try sema.inst_map.put(gpa, inst, args[i]);
+        i += 1;
+    }
     try sema.declareDependency(.{ .func_body = func });
 
     var merges: Block.Merges = .{ .block_inst = try sema.reserveInst() };
