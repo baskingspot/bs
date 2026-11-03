@@ -2183,7 +2183,9 @@ once, where store payloads would repeat `[]const u8` in every entry.
   everything `Zcu.createContainerType` takes. Interning one goes through
   a Zcu function that creates the type and scans its namespace as
   analysis does (Sema thread); a reified type's fields come from its
-  captures, which hold all of `@Struct`'s arguments. `func` as (owner
+  captures, which hold all of `@Struct`'s arguments, through
+  `Sema.fillReifiedInfo`, the function `zirReify` also uses, so the two
+  cannot drift. `func` as (owner
   declaration, instruction, generic owner, comptime arguments);
   `inferred_error_set_type` as its function. A declaration, in `ptr`'s
   `nav` base, `func`'s owner, and `nav_capture`, is (the type that owns

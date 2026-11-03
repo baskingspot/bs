@@ -10219,7 +10219,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     const reason = "reified type arguments must be comptime-known";
     const name_vals = try sema.constSliceElems(block, src, try sema.coerce(block, .slice_const_slice_const_u8_type, sema.resolveInst(names_ref), src), reason);
     const n = name_vals.len;
-    const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
+    const names = try sema.arena.alloc(InternPool.String, n);
     for (name_vals, names, 0..) |v, *name, i| {
         name.* = try sema.getString(try sema.resolveConstString(block, src, .fromInterned(v)));
         for (names[0..i]) |prev| if (prev == name.*) return sema.fail(block, src, "duplicate {t} field name '{s}'", .{ kind, ip.stringSlice(prev) });
@@ -10241,16 +10241,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         const captures = [_]Index{ tag_ty, mode, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = tag_ty } }), .storage = .{ .elems = values } } }) };
         const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, &captures);
         const ty = try sema.createContainerType(kind, sema.file, inst, &captures, name.display, name.key, block.namespace, .auto);
-        const info = ip.structInfo(ty);
-        if (info.status == .none) {
-            info.field_names = names;
-            info.field_defaults = try ip.arena(Zcu.tid).dupe(Index, values);
-            info.tag_type = tag_ty;
-            info.nonexhaustive = std.mem.eql(u8, sema.enumTagName(mode).?, "nonexhaustive");
-            info.size = Type.abiSize(ip, tag_ty);
-            info.alignment = Type.abiAlignment(ip, tag_ty);
-            info.status = .have_layout;
-        }
+        try sema.fillReified(ty);
         return .fromInterned(ty);
     }
 
@@ -10264,7 +10255,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     const attrs_ty = try sema.stdLangType(block, src, if (kind == .@"struct") "Type.Struct.FieldAttributes" else "Type.Union.FieldAttributes");
     const attrs = try sema.constSliceElems(block, src, try sema.coerce(block, try sema.ptrType(.{ .child = attrs_ty, .flags = .{ .size = .slice, .is_const = true } }), sema.resolveInst(args[3]), src), reason);
     if (attrs.len != n) return sema.fail(block, src, "{d} field names but {d} field attributes", .{ n, attrs.len });
-    const defaults = try ip.arena(Zcu.tid).alloc(Index, n);
+    const defaults = try sema.arena.alloc(Index, n);
     // Struct fields' explicit alignments and `comptime` flags, as values
     // (they are part of the type's identity).
     const align_vals = try sema.arena.alloc(Index, n);
@@ -10308,24 +10299,50 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, captures.items);
     const ty = try sema.createContainerType(kind, sema.file, inst, captures.items, name.display, name.key, block.namespace, layout);
     const info = ip.structInfo(ty);
-    if (info.status == .none) {
-        info.field_names = names;
-        info.field_types = try ip.arena(Zcu.tid).dupe(Index, types);
-        info.field_defaults = defaults;
-        info.defaults_status = .resolved;
-        if (any_align) {
-            const aligns = try ip.arena(Zcu.tid).alloc(u64, n);
-            for (aligns, align_vals) |*al, av| al.* = if (ip.indexToKey(av).opt.val == .none) 0 else ip.intValue(u64, ip.indexToKey(av).opt.val).?;
-            info.field_aligns = aligns;
-        }
-        if (any_comptime) {
-            const flags = try ip.arena(Zcu.tid).alloc(bool, n);
-            for (flags, comptime_vals) |*f, cv| f.* = cv == .bool_true;
-            info.field_is_comptime = flags;
-        }
-        info.status = .have_field_types;
+    if (info.status != .none) return;
+    const captures = ip.containerType(ty).?.captures;
+    const arena = ip.arena(Zcu.tid);
+    // The names, from the `[]const [:0]const u8` value `namesValue` made.
+    const names_slice = ip.indexToKey(captures[2]).slice;
+    const n: usize = @intCast(ip.intValue(u64, names_slice.len).?);
+    const names_array = ip.indexToKey(names_slice.ptr).ptr.base.uav.val;
+    const names = try arena.alloc(InternPool.String, n);
+    for (names, 0..) |*name, i| {
+        const s = ip.indexToKey(try sema.elemValue(names_array, i)).slice;
+        const bytes = ip.indexToKey(ip.indexToKey(s.ptr).ptr.base.elem.base).ptr.base.uav.val;
+        const buf = try sema.arena.alloc(u8, @intCast(ip.intValue(u64, s.len).?));
+        for (buf, 0..) |*b, k| b.* = ip.intValue(u8, try sema.elemValue(bytes, k)).?;
+        name.* = try sema.getString(buf);
     }
-    return .fromInterned(ty);
+    const elems = try arena.alloc(Index, n);
+    for (elems, 0..) |*e, i| e.* = try sema.elemValue(captures[3], i);
+    info.field_names = names;
+    if (ip.indexToKey(ty) == .enum_type) {
+        const tag_ty = captures[0];
+        info.field_defaults = elems;
+        info.tag_type = tag_ty;
+        info.nonexhaustive = std.mem.eql(u8, sema.enumTagName(captures[1]).?, "nonexhaustive");
+        info.size = Type.abiSize(ip, tag_ty);
+        info.alignment = Type.abiAlignment(ip, tag_ty);
+        info.status = .have_layout;
+        return;
+    }
+    info.field_types = elems;
+    info.field_defaults = try arena.dupe(Index, captures[4..][0..n]);
+    info.defaults_status = .resolved;
+    var rest = captures[4 + n ..];
+    if (rest.len != 0 and ip.typeOf(rest[0]) != .bool_type) {
+        const aligns = try arena.alloc(u64, n);
+        for (aligns, rest[0..n]) |*al, av| al.* = if (ip.indexToKey(av).opt.val == .none) 0 else ip.intValue(u64, ip.indexToKey(av).opt.val).?;
+        info.field_aligns = aligns;
+        rest = rest[n..];
+    }
+    if (rest.len != 0) {
+        const flags = try arena.alloc(bool, n);
+        for (flags, rest) |*f, cv| f.* = cv == .bool_true;
+        info.field_is_comptime = flags;
+    }
+    info.status = .have_field_types;
 }
 
 /// `@Fn(param_types, param_attrs, return_type, attrs)`.
@@ -10334,6 +10351,32 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
     const extra = sema.code.extraData(Zir.Inst.ReifyFn, ext.operand).data;
     const src = block.nodeSrc(extra.node);
     const reason = "function type attributes must be comptime-known";
+    try sema.fillReified(ty);
+    return .fromInterned(ty);
+}
+
+/// Fills in the fields of a type made by `@Struct`, `@Union`, or `@Enum`
+/// from its captures, unless they are filled already: what
+/// `zirReifyContainer` does after creating the type, for the on-disk
+/// cache's replay, which recreates the type from its stored locator. The
+/// captures were checked when the type was first made, so this reports no
+/// compile errors, declares no dependencies, and resolves nothing.
+pub fn fillReifiedInfo(zcu: *Zcu, ty: Index) Allocator.Error!void {
+    if (zcu.ip.structInfo(ty).status != .none) return;
+    var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
+    defer arena_state.deinit();
+    var sema = create(zcu, arena_state.allocator(), zcu.ip.containerType(ty).?.file, .{ .type_layout = ty });
+    defer sema.destroy();
+    try sema.fillReified(ty);
+}
+
+/// The one place that turns a reified type's captures into its fields; see
+/// `zirReifyContainer` for the captures: `[tag type, mode, names, values]`
+/// for an enum, and `[layout, backing or tag type, names, types,
+/// defaults..., aligns..., comptime flags...]` for a struct or union, where
+/// the aligns (`?usize`) and flags (`bool`) appear only if one is set.
+fn fillReified(sema: *Sema, ty: Index) Allocator.Error!void {
+    const ip = sema.ip;
     const params = try sema.constSliceElems(block, src, try sema.coerce(block, .slice_const_type_type, sema.resolveInst(extra.param_types), src), reason);
     const pattrs_ty = try sema.stdLangType(block, src, "Type.Fn.ParamAttributes");
     const pattrs_ptr_ty = try sema.ptrType(.{ .child = try sema.intern(.{ .array_type = .{ .len = params.len, .child = pattrs_ty } }), .flags = .{ .is_const = true } });
