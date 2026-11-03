@@ -55,8 +55,16 @@ deps_conditional: std.ArrayList(bool) = .empty,
 /// The entries of `deps` with their indices, once it is long enough to
 /// search this way.
 deps_set: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
+/// Recently declared dependencies, by a hash of the dependee: one more
+/// index into `deps` (0 for none). Analysis declares the same few over and
+/// over (each element of a large literal resolves the same layouts).
+dep_cache: [64]u32 = @splat(0),
 /// When this unit's analysis started, for `Zcu.unit_timing`.
 timer: [2]u64,
+/// What a name in the current file's ZIR resolved to in a type: each row
+/// of a large literal looks up the same field names and enum literals.
+/// Only while `nameCacheable`.
+name_cache: std.AutoHashMapUnmanaged(NameKey, u32) = .empty,
 /// The dependencies declared by the memoizable comptime calls in progress,
 /// innermost last, for their memo entries (see `Zcu.Memo`): the entries
 /// from `memo_start` on are the innermost call's. Empty outside calls.
@@ -408,6 +416,7 @@ fn destroy(sema: *Sema) void {
     sema.deps.deinit(gpa);
     sema.deps_conditional.deinit(gpa);
     sema.deps_set.deinit(gpa);
+    sema.name_cache.deinit(gpa);
     sema.memo_deps.deinit(gpa);
     sema.memo_pos.deinit(gpa);
     sema.memo_body_pos.deinit(gpa);
@@ -1187,7 +1196,17 @@ pub fn declareDependency(sema: *Sema, dependee: Zcu.Dependee) !void {
 /// Declares `dependee`; `conditional` if only a lowering for the comptime
 /// evaluator read it (a plain declaration wins).
 fn declareDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !void {
+    // Declaring a dependency again changes nothing, unless it turns a
+    // conditional one plain, or lowering or a memoizable call in progress
+    // records it too.
+    const cacheable = sema.bc == null and sema.memo_start == null;
+    const slot = &sema.dep_cache[@as(u6, @truncate(@import("Incremental.zig").DependeeContext.hash(.{}, dependee)))];
+    if (cacheable and slot.* != 0) {
+        const i = slot.* - 1;
+        if (std.meta.eql(sema.deps.items[i], dependee) and (conditional or !sema.deps_conditional.items[i])) return;
+    }
     const index = try sema.addDep(dependee, conditional);
+    slot.* = index + 1;
     // The code the walker runs reads it here; a plain read is declared
     // where a run reaches it.
     if (sema.bc != null and !conditional) try sema.bcDepEvent(index);
@@ -1644,6 +1663,36 @@ fn intType(sema: *Sema, signedness: std.lang.Signedness, bits: u16) !Index {
 
 fn getString(sema: *Sema, bytes: []const u8) !InternPool.String {
     return sema.ip.getString(Zcu.tid, bytes);
+}
+
+const NameKey = struct {
+    file: u32,
+    name: Zir.NullTerminatedString,
+    ty: Index,
+    kind: enum(u32) {
+        /// `.name` with result type `ty`, coerced: the value.
+        decl_literal,
+        /// The type of field `name` of struct `ty`.
+        field_type,
+        /// The index of field `name` of struct `ty`.
+        field_index,
+    },
+};
+
+/// Whether `name_cache` may answer: a cached answer skips the dependencies
+/// and errors its first analysis declared, which this unit already has,
+/// unless lowering or a memoizable call in progress records them too.
+fn nameCacheable(sema: *Sema) bool {
+    return sema.bc == null and sema.memo_start == null;
+}
+
+fn nameCacheGet(sema: *Sema, key: NameKey) ?u32 {
+    if (!sema.nameCacheable()) return null;
+    return sema.name_cache.get(key);
+}
+
+fn nameCachePut(sema: *Sema, key: NameKey, value: u32) !void {
+    if (sema.nameCacheable()) try sema.name_cache.put(sema.gpa, key, value);
 }
 
 fn zirString(sema: *Sema, s: Zir.NullTerminatedString) []const u8 {
@@ -2872,7 +2921,11 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const extra = sema.code.extraData(Zir.Inst.FieldType, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
             const ty = sema.unwrapOptEu(try sema.resolveType(block, src, extra.container_type));
-            break :blk .fromInterned(try sema.fieldTypeByName(block, src, ty, sema.zirString(extra.name_start)));
+            const key: NameKey = .{ .file = sema.file, .name = extra.name_start, .ty = ty, .kind = .field_type };
+            if (sema.nameCacheGet(key)) |v| break :blk .fromInterned(@fromBackingInt(v));
+            const ft = try sema.fieldTypeByName(block, src, ty, sema.zirString(extra.name_start));
+            try sema.nameCachePut(key, @backingInt(ft));
+            break :blk .fromInterned(ft);
         },
         .struct_init_field_ptr => blk: {
             const extra = sema.code.extraData(Zir.Inst.Field, data.pl_node.payload_index).data;
@@ -4849,7 +4902,12 @@ fn zirDeclLiteral(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
     const src = block.nodeSrc(data.src_node);
     const name = sema.zirString(extra.field_name_start);
     const orig_ty = try sema.resolveType(block, src, extra.lhs);
-    return sema.analyzeDeclLiteral(block, src, name, orig_ty, tag == .decl_literal);
+    if (tag != .decl_literal) return sema.analyzeDeclLiteral(block, src, name, orig_ty, false);
+    const key: NameKey = .{ .file = sema.file, .name = extra.field_name_start, .ty = orig_ty, .kind = .decl_literal };
+    if (sema.nameCacheGet(key)) |v| return .fromInterned(@fromBackingInt(v));
+    const r = try sema.analyzeDeclLiteral(block, src, name, orig_ty, true);
+    if (r.toInterned()) |v| try sema.nameCachePut(key, @backingInt(v));
+    return r;
 }
 
 /// `.name` with result type `orig_ty`: a declaration of `orig_ty` (or of
@@ -12138,7 +12196,7 @@ fn zirStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
         const ft_data = sema.code.instructions.items(.data)[@backingInt(e.data.field_type)].pl_node;
         const ft = sema.code.extraData(Zir.Inst.FieldType, ft_data.payload_index).data;
         if (ty == .none) ty = try sema.resolveType(block, src, ft.container_type);
-        item.* = .{ .name = sema.zirString(ft.name_start), .init = sema.resolveInst(e.data.init) };
+        item.* = .{ .name = sema.zirString(ft.name_start), .name_start = ft.name_start, .init = sema.resolveInst(e.data.init) };
     }
     if (ty == .clobbers_type) return .fromInterned(try sema.undefValue(.clobbers_type));
     if (ty == .generic_poison_type) {
@@ -12157,7 +12215,7 @@ fn zirStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
     return sema.structInitTyped(block, src, ty, items);
 }
 
-const StructInitItem = struct { name: []const u8, init: Ref };
+const StructInitItem = struct { name: []const u8, name_start: Zir.NullTerminatedString, init: Ref };
 
 fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []const StructInitItem) CompileError!Ref {
     const ip = sema.ip;
@@ -12192,7 +12250,12 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
     const elems = try sema.arena.alloc(Ref, info.field_types.len);
     @memset(elems, .none);
     for (items) |item| {
-        const idx = try sema.structFieldIndex(block, src, ty, item.name);
+        const key: NameKey = .{ .file = sema.file, .name = item.name_start, .ty = ty, .kind = .field_index };
+        const idx = sema.nameCacheGet(key) orelse idx: {
+            const idx = try sema.structFieldIndex(block, src, ty, item.name);
+            try sema.nameCachePut(key, idx);
+            break :idx idx;
+        };
         elems[idx] = try sema.coerce(block, info.field_types[idx], item.init, src);
         if (info.fieldIsComptime(idx)) {
             try sema.resolveLayout(block, src, ty);

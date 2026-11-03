@@ -117,6 +117,21 @@ layout, a function's signature) it goes through one Sema function that records
 the dependency. Sema records dependencies from the first skeleton onward, even
 before anything persists them.
 
+Within one unit, a repeated read may skip the lookup: a unit's dependencies
+are a set, so the dependencies the first read declared are already the
+unit's. Sema keeps two such caches, both per unit (per `Sema`) and in
+memory only. `dep_cache` returns early from declaring a dependency the unit
+declared recently (a direct-mapped table over `deps`), unless the new
+declaration makes a conditional edge plain. `name_cache` remembers what a
+ZIR string (by file and string index) resolved to in a type, after a lookup
+that succeeded: a decl literal's coerced value (`.default`, an enum
+literal), and a struct field's type and index in a struct literal. A large
+literal (uucode's 47 k-row tables) looks up the same few names in every
+row. Both are off while a memoizable comptime call
+or a lowering for the comptime evaluator is in progress, because those
+record their own dependency lists (the memo entry's, the lowered body's),
+which must not miss a read.
+
 Function bodies depend on the *signatures* of the functions they call, not on
 their bodies. Editing a function body therefore re-analyzes and re-generates
 only that function. The one exception is an inferred error set: a caller
@@ -448,11 +463,22 @@ instructions, while one unit, uucode's generated `table_0_stage2` (a
 costs about 21 k instructions a row, most of it repeated layout
 dependency declarations, field name lookups, and enum literal coercion.
 
-**Next steps**, in order of measured payoff: large aggregate literals
-(outside the evaluator); deoptimization stubs for references the walker
-has not resolved yet; generic calls whose comptime arguments are
-run-time values in the lowered code (uucode's `selectFieldIndexes` loop,
-refused today); then a denser encoding.
+**Measured (large aggregate literals: `dep_cache` and `name_cache`, see
+"Analysis units"; callgrind instructions for the whole build, against
+origin/main 9d936c3).** libvaxis text_input 2.606 G → 1.901 G (−27%);
+`table_0_stage2` alone 102–110 → 41–51 ms (`ZAP_UNIT_TIMING`, 5 runs),
+and libvaxis's Sema 319–450 → 216–267 ms; a synthetic 47 k-row table of
+the same shape 21.8 k → 7.4 k instructions a row; hello 883 M → 871 M
+(−1.4%); binary.zig unchanged within noise (Sema 5.49–5.81 s before,
+5.34–5.87 s after; callgrind runs out of memory on it, before and after).
+A row's remaining cost is the walker's generic per-instruction work (about
+16 ZIR instructions a row: four field types, four decl literals, four
+coercions, the struct init) and interning the row's aggregate.
+
+**Next steps** (later), in order of measured payoff: deoptimization stubs
+for references the walker has not resolved yet; generic calls whose
+comptime arguments are run-time values in the lowered code (uucode's
+`selectFieldIndexes` loop, refused today); then a denser encoding.
 
 ### CodeGen (`src/codegen/<arch>/`)
 
