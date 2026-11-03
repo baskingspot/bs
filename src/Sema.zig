@@ -5315,10 +5315,14 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
         };
         break :blk null;
     } else null;
+    // Numbered from the declaration, as the key is, not by the absolute
+    // instruction: an edit above it must not rename the type, which
+    // nothing that reads its name would notice. (Upstream numbers them in
+    // analysis order.)
     const display = if (var_name) |n|
         try std.fmt.allocPrint(sema.arena, "{s}.{s}", .{ parent, n })
     else
-        try std.fmt.allocPrint(sema.arena, "{s}__{t}_{d}", .{ parent, kind, @backingInt(inst) });
+        try std.fmt.allocPrint(sema.arena, "{s}__{t}_{d}", .{ parent, kind, @as(i64, @backingInt(inst)) - @backingInt(sema.anonTypeBase(block)[1]) });
     return .{ .display = display, .key = try sema.anonTypeKey(block, inst, captures) };
 }
 
@@ -5335,6 +5339,26 @@ fn anonTypeKey(sema: *Sema, block: *Block, inst: Zir.Inst.Index, captures: []con
     const ip = sema.ip;
     var aw: std.Io.Writer.Allocating = .init(sema.arena);
     const w = &aw.writer;
+    const nav, const base = sema.anonTypeBase(block);
+    // A `comptime` block, or a container's field types and defaults, if
+    // not a declaration.
+    if (nav != .none) {
+        w.writeAll(ip.stringSlice(ip.getNav(nav).key)) catch return error.OutOfMemory;
+    } else sema.zcu.unitKey(sema.owner, w) catch return error.OutOfMemory;
+    w.print("#{d}(", .{@as(i64, @backingInt(inst)) - @backingInt(base)}) catch return error.OutOfMemory;
+    for (captures, 0..) |c, i| {
+        if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
+        if (c != .none) w.print("{x}", .{ip.stableHash(c)}) catch return error.OutOfMemory;
+    }
+    w.writeAll(")") catch return error.OutOfMemory;
+    return aw.written();
+}
+
+/// The declaration whose code holds the instructions `block` analyzes, if
+/// any, and the instruction the anonymous types made there are numbered
+/// from (`anonTypeKey`, `typeName`).
+fn anonTypeBase(sema: *Sema, block: *const Block) struct { InternPool.NavIndex, Zir.Inst.Index } {
+    const ip = sema.ip;
     const nav: InternPool.NavIndex = if (block.inlining) |inlining|
         ip.keyPayload(.func, inlining.func).owner_nav
     else if (block.signature != .none)
@@ -5343,26 +5367,12 @@ fn anonTypeKey(sema: *Sema, block: *Block, inst: Zir.Inst.Index, captures: []con
         ip.keyPayload(.func, sema.func).owner_nav
     else
         sema.owner_nav;
-    const base: Zir.Inst.Index = if (nav != .none) blk: {
-        const n = ip.getNav(nav);
-        w.writeAll(ip.stringSlice(n.key)) catch return error.OutOfMemory;
-        break :blk n.zir_inst;
-    } else blk: {
-        // A `comptime` block, or a container's field types and defaults.
-        sema.zcu.unitKey(sema.owner, w) catch return error.OutOfMemory;
-        break :blk switch (sema.owner) {
-            .comptime_decl => |c| c.inst,
-            .type_layout, .struct_defaults => |ty| ip.containerType(ty).?.zir_inst,
-            else => unreachable,
-        };
-    };
-    w.print("#{d}(", .{@as(i64, @backingInt(inst)) - @backingInt(base)}) catch return error.OutOfMemory;
-    for (captures, 0..) |c, i| {
-        if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
-        if (c != .none) w.print("{x}", .{ip.stableHash(c)}) catch return error.OutOfMemory;
-    }
-    w.writeAll(")") catch return error.OutOfMemory;
-    return aw.written();
+    if (nav != .none) return .{ nav, ip.getNav(nav).zir_inst };
+    return .{ nav, switch (sema.owner) {
+        .comptime_decl => |c| c.inst,
+        .type_layout, .struct_defaults => |ty| ip.containerType(ty).?.zir_inst,
+        else => unreachable,
+    } };
 }
 
 /// Stable key of a comptime call: the callee's key and the stable hashes of
@@ -12703,7 +12713,7 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
 
 /// `.{ .a = x, .b = y }` without a result type. Like upstream, its type is
 /// a struct equal by its literal and fields, with comptime-known fields
-/// as comptime fields, named `Parent__struct_<inst>`.
+/// as comptime fields, named `Parent__struct_<node offset>`.
 fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: Ast.Node.Offset, names: []const InternPool.String, inits: []const Ref) CompileError!Ref {
     const ip = sema.ip;
     const src = block.nodeSrc(src_node);
@@ -12734,7 +12744,10 @@ fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: As
         parent.writer.writeAll(sema.zcu.namespacePtr(block.namespace).fqn) catch return error.OutOfMemory;
     }
     site.writer.print("#lit{d}", .{@backingInt(src_node)}) catch return error.OutOfMemory;
-    parent.writer.print("__struct_{d}", .{@backingInt(inst)}) catch return error.OutOfMemory;
+    // By its source node, relative to the declaration like `site`, so that
+    // an edit above it does not rename it (see `typeName`).
+    _ = inst;
+    parent.writer.print("__struct_{d}", .{@backingInt(src_node)}) catch return error.OutOfMemory;
 
     const ty = try sema.intern(.{ .tuple_type = .{
         .types = types,
