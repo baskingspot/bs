@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -129,6 +129,17 @@ fn main() callconv(.c) noreturn {
     rt.printInt(sum(3, 1) catch 97);
     rt.printInt(mode(.{ .plain = 4 }));
 
+    // @errorCast of error sets and error unions.
+    var any_err: anyerror = error.B;
+    _ = &any_err;
+    rt.print(@errorName(narrowSet(any_err)));
+    rt.print("\n");
+    var any_eu: anyerror!u8 = 5;
+    _ = &any_eu;
+    rt.printInt(narrowEu(any_eu) catch 0);
+    any_eu = error.B;
+    rt.printInt(narrowEu(any_eu) catch 9);
+
     const e: anyerror!u8 = error.Empty;
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
 }
@@ -161,4 +172,11 @@ fn mode(m: Mode) u8 {
         .plain => |p| p,
         .never => |w| w.missing,
     };
+}
+
+fn narrowSet(e: anyerror) error{ A, B } {
+    return @errorCast(e);
+}
+fn narrowEu(x: anyerror!u8) error{B}!u8 {
+    return @errorCast(x);
 }

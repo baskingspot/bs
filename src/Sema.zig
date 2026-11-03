@@ -2561,6 +2561,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .builtin_extern => sema.zirBuiltinExtern(block, inst),
         .field_parent_ptr => sema.zirFieldParentPtr(block, inst),
         .cmpxchg => sema.zirCmpxchg(block, inst),
+        .error_cast => sema.zirErrorCast(block, inst),
         // Error values are numbered at link time, so these are runtime
         // operations even on comptime-known operands.
         .int_from_error, .error_from_int => blk: {
@@ -3190,6 +3191,66 @@ fn zirCmpxchg(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     }
     const payload = try sema.addExtra(Ir.Cmpxchg{ .ptr = ptr, .expected = expected, .new = new });
     return sema.addInst(block, .{ .tag = .cmpxchg, .data = .{ .ty_pl = .{ .ty = result_ty, .payload = payload } } });
+}
+
+/// `@errorCast(x)`: an error set or error union as another error set
+/// (or error union with the same payload), checking at runtime that the
+/// error is in the destination set.
+fn zirErrorCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const ip = sema.ip;
+    const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
+    const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
+    const src = block.nodeSrc(extra.node);
+    var dest_ty = try sema.resolveType(block, src, extra.lhs);
+    if (ip.indexToKey(dest_ty) == .opt_type) dest_ty = ip.indexToKey(dest_ty).opt_type;
+    const operand = sema.resolveInst(extra.rhs);
+    const operand_ty = sema.typeOf(operand);
+    const dest_class = Type.class(ip, dest_ty);
+    const operand_class = Type.class(ip, operand_ty);
+    if ((dest_class != .error_set and dest_class != .error_union) or (operand_class != .error_set and operand_class != .error_union))
+        return sema.fail(block, src, "expected error set or error union type, found '{f}'", .{sema.fmtType(if (dest_class != .error_set and dest_class != .error_union) dest_ty else operand_ty)});
+    if (dest_class == .error_set and operand_class == .error_union) return sema.fail(block, src, "cannot cast an error union type to error set", .{});
+    if (dest_class == .error_union and operand_class == .error_union and
+        ip.indexToKey(dest_ty).error_union_type.payload_type != ip.indexToKey(operand_ty).error_union_type.payload_type)
+        return sema.fail(block, src, "payload types of error unions must match", .{});
+    const dest_set = if (dest_class == .error_union) ip.indexToKey(dest_ty).error_union_type.error_set_type else dest_ty;
+    const operand_set = if (operand_class == .error_union) ip.indexToKey(operand_ty).error_union_type.error_set_type else operand_ty;
+    const superset = try sema.errorSetCoercible(block, src, operand_set, dest_set, .none);
+    const dest_names = try sema.errorSetNames(block, src, dest_set);
+
+    if (sema.resolveValue(operand)) |v| if (!sema.isUndef(v)) {
+        const name = switch (ip.indexToKey(v)) {
+            .err => |e| e.name,
+            .error_union => |eu| switch (eu.val) {
+                .err_name => |n| n,
+                .payload => |pv| return .fromInterned(try sema.intern(.{ .error_union = .{ .ty = dest_ty, .val = .{ .payload = pv } } })),
+            },
+            else => unreachable,
+        };
+        if (!superset) if (dest_names) |names| {
+            for (names) |n| {
+                if (n == name) break;
+            } else return sema.fail(block, src, "'error.{s}' not a member of error set '{f}'", .{ ip.stringSlice(name), sema.fmtType(dest_set) });
+        };
+        return .fromInterned(try sema.intern(if (dest_class == .error_set)
+            .{ .err = .{ .ty = dest_ty, .name = name } }
+        else
+            .{ .error_union = .{ .ty = dest_ty, .val = .{ .err_name = name } } }));
+    };
+    try sema.requireRuntime(block, src);
+    if (block.want_safety and !superset) if (dest_names) |names| {
+        // The error, if there is one, must be one of the destination's.
+        const code = if (operand_class == .error_union) try sema.addTyOp(block, .unwrap_errunion_err, operand_set, operand) else operand;
+        var ok: Ref = if (operand_class == .error_union) try sema.analyzeIsNonErr(block, src, operand) else .fromInterned(.bool_false);
+        for (names) |n| {
+            const err: Ref = .fromInterned(try sema.intern(.{ .err = .{ .ty = operand_set, .name = n } }));
+            const eq = try sema.addBinOp(block, .cmp_eq, code, err);
+            ok = if (ok.toInterned() == .bool_false) eq else try sema.addBinOp(block, .bit_or, ok, eq);
+        }
+        try sema.addSafetyCheck(block, ok, .invalid_error_code, .none, .none);
+    };
+    try sema.resolveLayout(block, src, dest_ty);
+    return sema.addTyOp(block, .bitcast, dest_ty, operand);
 }
 
 /// `@fieldParentPtr("field", field_ptr)`: the pointer to the struct or
