@@ -2654,7 +2654,9 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const body = sema.code.bodySlice(extra.data.body_index, extra.data.body_len);
             var child = block.child();
             defer child.instructions.deinit(sema.gpa);
-            child.is_comptime = block.is_comptime;
+            // As upstream, the operands are analyzed for their types only,
+            // as runtime code even in a comptime scope.
+            child.is_comptime = false;
             child.is_typeof = true;
             _ = try sema.analyzeInlineBody(&child, body, inst);
             const refs = try sema.arena.alloc(Ref, ext.small);
@@ -3781,6 +3783,9 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             }
             if (dc == .comptime_int or sc == .comptime_int) return sema.fail(block, src, "unable to resolve comptime value", .{});
             const s = Type.intInfo(ip, src_ty);
+            // A zero-bit integer has one possible value, so it is
+            // comptime-known even at runtime, as upstream.
+            if (s.bits == 0) return .fromInterned(try sema.intValue(dest_ty, 0));
             const d = Type.intInfo(ip, dest_ty);
             const fits = if (s.signedness == d.signedness) d.bits >= s.bits else s.signedness == .unsigned and d.bits > s.bits;
             if (fits) return try sema.addTyOp(block, .intcast, dest_ty, inst);
