@@ -1428,6 +1428,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "parameter of comptime-only type '{f}' must be declared comptime", .@"comptime-only" },
     .{ "unable to load comptime-only type '{f}' at runtime", .@"comptime-only" },
     .{ "variable of type '{f}' must be const or comptime", .@"comptime-only" },
+    .{ "value with comptime-only type '{f}' depends on runtime control flow", .@"comptime-only" },
     .{ "LHS of shift must be a fixed-width integer type, or RHS must be comptime-known", .@"comptime-required" },
     .{ "function called at runtime cannot return value at comptime", .@"comptime-required" },
     .{ "no offset available for comptime field", .@"comptime-required" },

@@ -10671,7 +10671,12 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
             return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = v, .orig_ty = const_ty } } } }));
         };
     }
-    if ((try sema.isComptimeOnlyResolved(block, src, ty))) return sema.fail(block, src.varTy(), "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
+    if ((try sema.isComptimeOnlyResolved(block, src, ty))) {
+        // A constant that was not comptime-known above was stored under a
+        // runtime condition, as upstream.
+        if (ia.is_const) return sema.fail(block, src, "value with comptime-only type '{f}' depends on runtime control flow", .{sema.fmtType(ty)});
+        return sema.fail(block, src.varTy(), "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
+    }
     if (ia.is_const) for (operands) |op| try sema.validateRuntimeValue(block, src, op);
     try sema.resolveLayout(block, src, ty);
     const ptr_ty = try sema.allocPtrType(ty, ia.alignment);
