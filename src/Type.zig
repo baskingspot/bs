@@ -391,12 +391,13 @@ pub fn unionLayout(ip: *const InternPool, ty: Index) UnionLayout {
 
 /// The tag's and the payload's offsets in a union with a runtime tag, for
 /// its layout to record: as upstream's `getUnionLayout`, the tag goes
-/// first unless the payload is more aligned than it.
+/// first unless the fields that can be active are more aligned than it.
+/// (The union's own size and alignment count every field.)
 pub fn unionTagPayloadOffsets(ip: *const InternPool, info: *const InternPool.ContainerInfo) [2]u64 {
     var payload_size: u64 = 0;
     var payload_align: u64 = 1;
     for (info.field_types, 0..) |ft, i| {
-        if (class(ip, ft) == .noreturn) continue;
+        if (hasNoPossibleValue(ip, ft)) continue;
         if (hasRuntimeBits(ip, ft)) payload_size = @max(payload_size, abiSize(ip, ft));
         payload_align = @max(payload_align, unionFieldAlign(ip, info, @intCast(i)));
     }

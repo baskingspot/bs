@@ -1013,11 +1013,13 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     var comptime_state = false;
     for (types, 0..) |ft, i| {
         try sema.resolveLayout(&block, src, ft);
+        // As upstream, every field counts toward the size and alignment,
+        // even one that cannot be active (`noreturn align(8)`).
+        if (Type.hasRuntimeBits(ip, ft)) payload_size = @max(payload_size, Type.abiSize(ip, ft));
+        payload_align = @max(payload_align, Type.unionFieldAlign(ip, info, @intCast(i)));
         if (Type.hasNoPossibleValue(ip, ft)) continue;
         possible_tags += 1;
         if (Type.isComptimeOnly(ip, ft)) comptime_state = true;
-        if (Type.hasRuntimeBits(ip, ft)) payload_size = @max(payload_size, Type.abiSize(ip, ft));
-        payload_align = @max(payload_align, Type.unionFieldAlign(ip, info, @intCast(i)));
     }
     info.has_runtime_tag = info.tag_type != .none and possible_tags > 1 and !comptime_state and Type.hasRuntimeBits(ip, info.tag_type);
     var size = payload_size;

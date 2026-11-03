@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n"
+//! stdout: "1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn { asm volatile ("call %[main:P]" : : [main] "X" (&main)); }
@@ -57,6 +57,7 @@ fn main() callconv(.c) noreturn {
     const cb = comptime asBytes(@constCast(&U{ .y = 3 }))[0];
     ok(cb == 3);
     globalUnion();
+    noreturnAlign();
     rt.exit(0);
 }
 
@@ -74,4 +75,26 @@ fn globalUnion() void {
     ok(TU.global != .a);
     ok(TU.global == .b);
     ok(TU.global.b == 123456);
+}
+
+// A field that cannot be active still counts toward the union's size and
+// alignment, but not toward where the tag goes (upstream: tag first here).
+const NA = union(enum) { a: u8, b: u8, c: noreturn align(8) };
+const NU = union { a: u8, b: u8, c: noreturn align(4) };
+fn noreturnAlign() void {
+    ok(@sizeOf(NA) == 8 and @alignOf(NA) == 8);
+    ok(@sizeOf(NU) == 4 and @alignOf(NU) == 4);
+    var x: u8 = 0x5a;
+    _ = &x;
+    var v: NA = .{ .b = x };
+    _ = &v;
+    ok(asBytes(&v)[0] == 1);
+    ok(asBytes(&v)[1] == 0x5a);
+    ok(@intFromPtr(&v.b) - @intFromPtr(&v) == 1);
+    ok(switch (v) {
+        .b => |p| p == 0x5a,
+        else => false,
+    });
+    const arr = [_]NA{ .{ .a = 7 }, .{ .b = 9 } };
+    ok(arr[1] == .b and arr[1].b == 9);
 }
