@@ -3441,7 +3441,8 @@ fn atomicElemType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!
     };
     if (!ok) return sema.fail(block, src, "expected bool, integer, float, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(ty)});
     const size = Type.abiSize(ip, ty);
-    if (size != 1 and size != 2 and size != 4 and size != 8) return sema.failUnsupported(block, src, "atomics on types of this size");
+    // Zero-bit types (u0) fold: every value is the same.
+    if (size != 0 and size != 1 and size != 2 and size != 4 and size != 8) return sema.failUnsupported(block, src, "atomics on types of this size");
 }
 
 /// The pointer operand of an atomic builtin, as a pointer to `elem_ty`.
@@ -3482,7 +3483,7 @@ fn zirAtomicLoad(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
     try sema.atomicElemType(block, src, elem_ty);
     const ptr = try sema.coerce(block, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .is_const = true } }), sema.resolveInst(extra.ptr), src);
     try sema.atomicOrder(block, src, extra.ordering);
-    if (block.is_comptime) return sema.analyzeLoad(block, src, ptr);
+    if (block.is_comptime or Type.abiSize(sema.ip, elem_ty) == 0) return sema.analyzeLoad(block, src, ptr);
     return sema.addTyOp(block, .atomic_load, elem_ty, ptr);
 }
 
@@ -3493,6 +3494,7 @@ fn zirAtomicStore(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
     const ptr, const elem_ty = try sema.atomicPtr(block, src, extra.ptr, false);
     const operand = try sema.coerce(block, elem_ty, sema.resolveInst(extra.operand), src);
     try sema.atomicOrder(block, src, extra.ordering);
+    if (Type.abiSize(sema.ip, elem_ty) == 0) return .void_value;
     if (block.is_comptime) {
         try sema.analyzeStore(block, src, ptr, operand);
     } else {
@@ -3540,7 +3542,9 @@ fn zirAtomicRmw(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
         try sema.analyzeStore(block, src, ptr, new);
         return old;
     }
-    if (class == .float and op != .Xchg) return sema.failUnsupported(block, src, "float @atomicRmw");
+    if (Type.abiSize(ip, elem_ty) == 0) return sema.analyzeLoad(block, src, ptr);
+    if (class == .float and op != .Xchg and Type.floatBits(ip, elem_ty) != 32 and Type.floatBits(ip, elem_ty) != 64)
+        return sema.failUnsupported(block, src, "@atomicRmw arithmetic on f16, f80, and f128");
     const payload = try sema.addExtra(Ir.AtomicRmw{ .ptr = ptr, .operand = operand, .op = @backingInt(op) });
     return sema.addInst(block, .{ .tag = .atomic_rmw, .data = .{ .ty_pl = .{ .ty = elem_ty, .payload = payload } } });
 }
@@ -3559,7 +3563,7 @@ fn zirCmpxchg(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     try sema.atomicOrder(block, src, extra.failure_order);
     const result_ty = try sema.optType(elem_ty);
     try sema.resolveLayout(block, src, result_ty);
-    if (block.is_comptime) {
+    if (block.is_comptime or Type.abiSize(ip, elem_ty) == 0) {
         const old = try sema.analyzeLoad(block, src, ptr);
         const eq = try sema.analyzeCmp(block, src, .eq, old, expected);
         if (sema.resolveValue(eq) == .bool_true) {

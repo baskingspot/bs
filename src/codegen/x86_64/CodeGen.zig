@@ -1257,6 +1257,28 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const mem = Mem.at(.rcx, 0);
     try cg.load(.rcx, x.ptr);
     try cg.load(.rdx, x.operand);
+    if (x.operation() != .Xchg and cg.isFloat(ty)) if (cg.sseType(ty)) |ft| {
+        // A compare-exchange loop on the bits, the arithmetic in SSE.
+        try cg.e.mov(size, .{ .reg = .rax }, .{ .mem = mem });
+        const top = try cg.e.newLabel();
+        cg.e.bind(top);
+        try cg.e.movToXmm(size, .xmm0, .{ .reg = .rax });
+        try cg.e.movToXmm(size, .xmm1, .{ .reg = .rdx });
+        switch (x.operation()) {
+            .Add => try cg.e.sse(.add, ft, .xmm0, .{ .reg = .xmm1 }),
+            .Sub => try cg.e.sse(.sub, ft, .xmm0, .{ .reg = .xmm1 }),
+            // As upstream: maxss/minss, which give the operand if either
+            // value is NaN.
+            .Max => try cg.e.sse(.max, ft, .xmm0, .{ .reg = .xmm1 }),
+            .Min => try cg.e.sse(.min, ft, .xmm0, .{ .reg = .xmm1 }),
+            else => unreachable,
+        }
+        try cg.e.movFromXmm(size, .{ .reg = .r8 }, .xmm0);
+        try cg.e.lockCmpxchg(size, mem, .r8);
+        try cg.e.jcc(.ne, .{ .label = top });
+        const dst = try cg.resultMem(inst, ty) orelse return;
+        return cg.storeReg(dst, .rax, bytes);
+    };
     switch (x.operation()) {
         .Xchg => {
             try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
