@@ -2,7 +2,7 @@
 
 This document fixes the boundaries between zap's stages so that the speed
 features in AGENTS.md (the on-disk per-declaration cache, parallel analysis of
-function bodies, the bytecode comptime evaluator, single-pass backends and
+function bodies, the bytecode comptime evaluator, fast SSA backends, and write-once
 linkers) can land later without redesigning the stages. AGENTS.md holds the
 scope and the settled decisions; this file says how they fit together. Change
 it when a boundary changes.
@@ -366,12 +366,12 @@ the laziness rule; unboxed integers in the frame; then a denser encoding.
 
 ### CodeGen (`src/codegen/<arch>/`)
 
-- Single pass per function, from IR to machine code. Debug strategy: every IR
+- Today: a single pass per function, from IR to machine code. Every IR
   value that outlives its instruction gets a stack slot; instructions load
-  operands into scratch registers, compute, and store. Variables are always in
-  memory, which is also what debuggers expect in Debug builds. A small
-  per-basic-block register cache may avoid redundant loads. No global
-  register allocation.
+  operands into scratch registers, compute, and store. No register
+  allocation. "Optimizing backend" below replaces this with one shared SSA
+  layer (designed 2026-11-03, for review); the bullets here describe the
+  code as it is until that lands.
 - Calling conventions: `.c` follows SysV for scalars: integers, bools, and
   pointers in GPRs (16-byte integers in register pairs), f16, f32, f64, and
   f128 in XMM registers, f80 in memory and returned in st0, and other values
@@ -469,6 +469,578 @@ the laziness rule; unboxed integers in the frame; then a denser encoding.
   are adrp pairs. Both were checked against the system assembler (GNU as
   for x86_64; clang's for aarch64, 32,771 instructions byte-identical,
   including every encodable logical immediate).
+
+### Optimizing backend (designed 2026-11-03, for review)
+
+Not built yet. AGENTS.md fixes the goal: one optimization level, Debug
+semantics, debuggable output, and optimization sized to compile fast. This
+section fixes how: one shared SSA layer per function, a short fixed list of
+passes, linear-scan register allocation, and a lowering per architecture.
+It replaces CodeGen's internals, not its boundaries: the input is still
+one function's typed IR, and the output is still one Atom and one
+`Atom.Debug`, per function, cached as today.
+
+**What the current backend costs.** Measured on libvaxis's text_input
+(main 8fe40fe, ReleaseFast zap): 2,432 functions, 295k IR instructions,
+3.09 MB of code, and 48–51 ms in `CodeGen.generate` with ZIR warm (the
+lead measured about 92 ms of backend in a full build). That is about
+170 ns and 10.5 bytes of code per IR instruction. Function sizes, in IR
+instructions: 493 have 4–15, 990 have 16–63, 675 have 64–255, 254 have
+256–1023, 20 have more. `Vaxis.render` is 138 KB (upstream Debug: 71
+KB), 25k instructions, and its frame is 34 KB. In it:
+
+| Pattern in `Vaxis.render` | Count | Fixed by |
+|---|---:|---|
+| a store to a slot followed by a load of the same slot | 1,033 | registers (pass 6) |
+| `setcc` to a slot, `movzx` back, `test`, `jcc` | 702 | compare/branch fusion (pass 5) |
+| `mov $imm, %ecx` and then an ALU op on rcx | 570 | immediates (pass 5) |
+| calls to a panic handler (of 636 calls) | 374 | cold-block layout (pass 4) |
+| `je` immediately followed by `jmp` | 607 | layout (pass 4) |
+| `jmp` to the next instruction | 345 | layout (pass 4) |
+| overflow bit materialized with `setb`/`seto` | 347 | overflow from flags (pass 5) |
+
+Upstream Debug's code is 1.9–2.2× smaller on the largest functions
+(`Vaxis.render`, `Parser.parse`, `sort.block.block`) and zap's binaries
+run 0.83–1.28× as long as upstream Debug's, 2.6–21.6× as long as
+upstream ReleaseSafe's (`bench/runtime.py`, below).
+
+#### Principles
+
+- **Per function, no interprocedural facts.** Every decision reads only
+  the function's own IR (and, once inlining lands, the bodies it inlines,
+  each through a recorded cache edge). Nothing reads a callee's register
+  usage or frame size. That keeps each Atom a function of its unit's
+  inputs, which the cache and parallel CodeGen both require.
+- **No code motion of memory operations.** Loads, stores, calls, atomics,
+  and inline assembly stay in IR order within their block. Pure values may
+  be folded into their user (an immediate, an address, a compare into a
+  branch) or removed when dead, but are not hoisted or sunk across
+  blocks. There is no memory SSA, no alias analysis, no GVN, and no LICM.
+  Line tables stay in source order, which is what a debugger stepping a
+  Debug build expects.
+- **Safety checks stay.** Sema's checks are semantics; the backend keeps
+  every one. It only makes them cheap: the failing path moves out of line,
+  and the check reads the flags its operation set.
+- **Fixed pass list, linear time.** Each pass is one walk over the
+  function (layout and liveness walk blocks once in a precomputed order).
+  No pass iterates to a fixpoint except branch shortening, which is
+  bounded (below).
+- **One layer, two architectures.** Construction, the passes, liveness,
+  register allocation, frame layout, and debug bookkeeping are shared.
+  Instruction selection, the ABI, register sets, and encoding are per
+  architecture, behind tables and a few hooks (see "What is per
+  architecture").
+
+#### The SSA form
+
+A function is a list of basic blocks in layout order; a block is a list
+of values, then a terminator (`jump`, `branch`, `switch`, `ret`,
+`unreachable`, or `noreturn_call`, which ends the block after an
+ordinary call: it emits `call`/`bl`, never a jump, because a panic
+handler prints the trace from its return address and needs the caller's
+frame). A value has an op, a type class, up to three inline operands (more in an extra array), and a source
+position. Operands are value indices or constants. Phis sit at the start
+of a block, one operand per predecessor in predecessor order. All arrays
+are flat (`std.MultiArrayList`), indices are `u32`, and a function's SSA
+is allocated in one arena that is reset for the next function on the same
+worker.
+
+Type classes, chosen once per IR type by the shared layer, with the
+architecture deciding the floating-point cases:
+
+- **scalar**: integers up to 64 bits, bools, pointers, f32, f64, and an
+  error code (`u16`). One SSA value, one register. f16 is a scalar on
+  both, with native arithmetic on aarch64 (Apple Silicon has FEAT_FP16,
+  in h registers) and compiler_rt calls on x86_64 (which take f16 in
+  xmm registers). `c_longdouble` is f64 on Apple arm64.
+- **pair**: values whose ABI layout is two scalars and that the IR takes
+  apart field by field: slices, `{ T, u1 }` from the overflow
+  instructions, error unions whose payload is a scalar (or void),
+  optionals with a scalar payload and a flag (later, 128-bit integers).
+  Two SSA values; `slice_ptr`, `slice_len`, `struct_field_val` of a pair,
+  `unwrap_errunion_*`, and `optional_payload` become free renames.
+- **memory**: everything else: larger structs, arrays, unions, f80,
+  f128 (whose compiler_rt calls take it in xmm or q registers, loaded
+  from and stored to the slot by the C ABI module), vectors, and
+  integers over 128 bits. The SSA value is the address of a frame slot holding the value, which is written once by the instruction
+  that defines it and read by its users; field reads are loads from that
+  address. Wide integers, f80/f128, and vectors keep today's limb-wise
+  and compiler_rt lowerings, operating on these addresses.
+
+**Narrow integers.** A register holding an integer narrower than the
+register (u3, i7, u8, u16, and u32 on 64-bit registers) has unspecified
+bits above the type's width. The lowering extends where the bits matter:
+compares (aarch64 folds the extend into `cmp w, w, uxtb`), division,
+right shifts, widening casts, overflow checks, and stores to memory. At
+every boundary a value is normalized (zero- or sign-extended to its ABI
+size, as today's invariant for memory): in memory, in call arguments and
+results of both conventions (Apple's C convention requires callers to
+extend arguments narrower than 32 bits), and in returns. So loads and
+incoming arguments are known extended, and lowering tracks that to skip
+redundant extensions. x86_64 may use 8- and 16-bit forms where they
+give the same result.
+
+The position is the IR's statement position (line, column) and the
+innermost open inline call (an index into the function's inline table),
+copied from the last `dbg_stmt` and `dbg_inline_begin`/`end` seen.
+
+**Construction** is one forward walk over the structured IR, using Braun
+et al.'s on-the-fly SSA construction (2013). The IR is structured, so the
+walk always knows when a block's predecessors are complete: a `block`'s
+exit is sealed when the walk leaves the block, a loop header when it
+leaves the loop (after the last `repeat`). In the same walk:
+
+- **Promoted allocs (mem2reg).** An `alloc` of a scalar or pair type
+  whose pointer is used only as the address operand of `load` and
+  `store` (never stored, passed, offset, or compared) becomes an SSA
+  variable: each store defines it, each load reads it, and phis appear at
+  merges. A store of `undefined` defines it as the 0xaa pattern, so a
+  read of an undefined variable still sees what Debug semantics promise.
+  Which allocs qualify is found by one scan of the IR before the walk
+  (per alloc: any use other than load/store address disqualifies it).
+  Other allocs keep their frame slot, as today.
+- **Trivial phis** (all operands the same value, or the phi itself) are
+  removed as Braun et al. describe; this is also copy propagation.
+- **Constant folding** of an operation whose operands are all constants
+  (now possible after promotion), with the IR's exact semantics: wrapping
+  arithmetic, shifts, compares, casts. A folded overflow check folds its
+  branch, which leaves the panic block unreachable.
+- **Conditions stay virtual.** A compare, `is_null`, `is_err`, or an
+  overflow bit is a value of class *flags* when its only user is the
+  terminator of its block, or a select in it; lowering then fuses it.
+  Any other use materializes it as a bool (`setcc`), as today.
+- **Cold blocks.** A block whose terminator is a call to a noreturn
+  function (the panic handlers, `@panic`, `unreachable` in safe mode) is
+  marked cold.
+
+#### The pass list
+
+In this order, each with the measured reason it is there:
+
+1. **Build** (above): promotion, trivial phis, folding, conditions,
+   cold marks. Removes the bulk of the store/reload traffic before
+   register allocation sees it, because most of render's 1,033
+   store-reload pairs are named variables and IR temporaries, not spills.
+2. **Dead code.** One backward sweep with use counts: values without
+   side effects and without uses go, and a dead value's operands lose a
+   use, so chains go in the same sweep. Removes the unused halves of
+   pairs (a `slice_len` nobody reads), loads whose result is dropped, and
+   the code of unused `save_err_return_trace_index`.
+3. **Block cleanup.** Blocks that only jump are bypassed (jump
+   threading of empty blocks) and unreachable blocks (after folding) are
+   dropped. One walk in reverse postorder.
+4. **Layout.** Blocks are placed in reverse postorder of the hot
+   successors, with each branch's cold side (the panic call, which in
+   render is 374 of 636 calls) moved to the end of the function. A
+   branch whose taken side is the next block inverts its condition so it
+   falls through. This removes jumps to the next instruction (345 in
+   render) and `je` + `jmp` pairs (607), and keeps hot loops dense. The
+   order is fixed here; later passes do not reorder blocks.
+5. **Lowering** (per architecture): instruction selection from SSA ops
+   to machine ops with virtual registers. It folds what the architecture
+   allows, asking hooks rather than assuming x86 shapes: an immediate
+   that fits the instruction (570 immediate loads in render), an address
+   into a load or store (x86_64 base + index·scale + disp; aarch64 only
+   the forms it has), a flags value into its branch, select, or `setcc`
+   user (702 materialize-and-test sequences), and an overflow bit into
+   `jo`/`jc` (347 materialized bits in render). Flags give overflow only
+   at the architecture's native widths: x86_64 8, 16, 32, and 64 bits,
+   aarch64 32 and 64 (`adds`/`subs` and `b.vs`/`b.cs`). Other widths
+   compare the result with its own extension (aarch64 `cmp w, w, uxtb`,
+   or a `tst` of the high bits) and branch on that; aarch64 32-bit
+   multiplication is `smull`/`umull` and `cmp x, w, sxtw`/`uxtw`, 64-bit
+   `smulh`/`umulh` and a compare. The (value, flag) pair from
+   construction covers all of them. Calls, divisions, shifts by a
+   register, and string instructions get their fixed-register constraints
+   and clobber sets here. A frame slot's address is "frame base plus an
+   offset known after pass 7", not a constant, so folding it into a load
+   or store is decided at emission (below). Constants are
+   rematerialized instead of spilled when the architecture says
+   recomputing costs no more than a reload (one load): most constants on
+   x86_64; on aarch64 a 64-bit constant can take four `movz`/`movk` and an
+   FP constant `adrp` + `ldr`, which spill like other values. A flags value is never
+   spilled; if something clobbers the flags between a compare and its
+   user, the compare is recomputed.
+6. **Liveness and linear-scan register allocation** (below).
+7. **Frame layout.** Spill slots, memory-class values, and the outgoing
+   argument area share the frame by lifetime: two slots whose live
+   ranges do not overlap get the same bytes (slots are assigned by the
+   same linear scan, by interval end, and each slot has its own
+   alignment: aarch64 q-register spills need 16 for the scaled form).
+   Allocs that were not promoted keep
+   their own slot for the whole function, because the IR does not mark
+   where a variable's lifetime ends and its address may escape. Today
+   every IR temporary has its own slot, which is how render's frame
+   reaches 34 KB. The frame shape is fixed: the frame record at the top
+   (x86_64 `push rbp`; aarch64 `stp x29, x30` first, fp = CFA − 16), the
+   saved callee-saved registers right below it, then spills and slots,
+   and the outgoing argument area at the bottom, at sp. x86_64 addresses
+   slots from rbp (disp32 always fits). aarch64 addresses them from sp
+   with positive scaled offsets, as clang does (sp stays fixed after the
+   prologue, since the outgoing area is part of the frame), places small
+   and hot slots nearest sp so their offsets fit `[sp, #uimm12 × size]`,
+   and reads incoming stack arguments at `[fp, #16 + n]`.
+8. **Emission.** Machine ops are encoded in layout order. Frame-slot
+   offsets are resolved here; an aarch64 offset that does not fit its
+   access becomes `add x16, sp, #hi, lsl 12` and `[x16, #lo]` (x16 is the
+   in-instruction scratch). Line rows are written when a value's position
+   changes, as today. Branches start in
+   their short form (rel8 on x86_64; aarch64's ranges are fixed per form)
+   and are lengthened when their target is out of range; each round only
+   lengthens, so it ends after at most a few rounds (bounded by the
+   number of branches, and in practice one or two). Because that moves
+   code, line rows, `Debug.Inline` ranges, and unwind offsets are recorded
+   against instruction indices and turned into byte offsets after the
+   last round, on both architectures. The prologue, the
+   epilogue, the stack probes (`___chkstk_darwin` on macOS), and the
+   unwind record come last, once the frame size and saved registers are
+   known.
+
+Not in the list, on purpose: global value numbering, loop-invariant code
+motion, bounds-check elimination, strength reduction beyond what
+lowering's folding does, and scheduling. Each needs either analysis
+that does not fit the budget or code motion that hurts debugging; they
+can be measured later against the same benchmarks.
+
+#### Register allocation
+
+Linear scan on SSA form (Wimmer and Franz, 2010), over the blocks in the
+layout order of pass 4:
+
+- **Liveness** is one backward walk over the blocks in reverse layout
+  order. The layout keeps each loop's blocks contiguous and puts every
+  block after its dominator (cold blocks, at the end, have no
+  successors), so only loops need more:
+  a value live at a loop header is extended over the whole loop (to the
+  end of its last block), which the walk does when it reaches the header,
+  without iterating. Intervals have holes (a value live into one branch
+  and not the other), which keeps registers free in cold paths.
+- **Allocation** walks intervals by start. A value gets a register of its
+  class (general or float/vector), preferring a hint: the register of a
+  phi operand, a fixed argument or result register it is moved to, or the
+  register of the operand an x86 two-address instruction overwrites. When
+  none is free, the interval that ends last is split and its rest
+  spilled; a constant is rematerialized at its next use instead. Values
+  live across a call prefer callee-saved registers; others prefer
+  caller-saved ones, so short functions save nothing.
+- **Resolution.** Phis and split intervals become moves at block edges,
+  sequenced as parallel moves (cycles broken with a swap on x86_64, a
+  scratch register on aarch64). A critical edge that needs moves gets a
+  block.
+- **Callee-saved registers** that the function uses are saved in the
+  prologue in a fixed layout per architecture, and restored in every
+  epilogue: on x86_64 pushed right after `push rbp; mov rbp, rsp`, in
+  register order; on aarch64 in whole pairs right below the frame record,
+  in register order (what compact unwind's MODE_FRAME requires). The set
+  is the unwind record's saved mask (below).
+- **Registers.** x86_64: general rax, rcx, rdx, rsi, rdi, r8–r11
+  (caller-saved) and rbx, r12–r15 (callee-saved); float xmm0–xmm15, all
+  caller-saved. rbp is the frame pointer and rsp the stack pointer; neither
+  is allocated. aarch64 (from the Mac thread's constraints): general
+  x0–x15 (caller-saved, x8 the indirect result register) and x19–x28
+  (callee-saved); never x18 (platform), x29 (frame pointer), x30 (link
+  register), or x16/x17 (clobbered by zap's import stubs and by
+  `___chkstk_darwin`; usable only as scratch inside one lowered
+  instruction); float/vector v0–v31, of which only the low 64 bits of
+  v8–v15 are callee-saved, so a 128-bit value live across a call is
+  spilled even there.
+- **Clobbers per call kind** are written out in the architecture's table.
+  x86_64: a plain call clobbers rax, rcx, rdx, rsi, rdi, r8–r11, xmm0–15,
+  and the flags. aarch64: a plain call clobbers x0–x17, x30, NZCV, v0–v7,
+  v16–v31, and the high halves of v8–v15; a thread-local access through
+  `tlv_get_addr` clobbers only x0, x16, x17, x30, and NZCV, provided the
+  lowering loads the thunk into x16 (`ldr x16, [x0]; blr x16`; clang uses
+  x9 and so clobbers it); `___chkstk_darwin` (prologue only) clobbers x9,
+  x16, x17, and NZCV. compiler_rt calls follow the C convention.
+
+**The `.auto` calling convention** follows from this, and stays private
+to zap (nothing outside zap calls an `.auto` function, so it changes
+freely; every caller and callee is regenerated together because zap's
+identity is in every cache key):
+
+- Arguments are classified like the C convention's register part:
+  scalars and pairs in general registers (x86_64 rdi, rsi, rdx, rcx, r8,
+  r9; aarch64 x0–x7) and floats in vector registers (xmm0–xmm7; v0–v7), in
+  order; a pair takes two consecutive general registers, and a pair that
+  does not fit entirely in registers goes on the stack, never split.
+  Arguments that
+  do not fit, and memory-class arguments, go in the outgoing stack area as
+  today (the callee reads them in place, so a large struct is copied once
+  by the caller, as now).
+- Results: scalars and pairs in rax/rdx (x0/x1), floats in xmm0 (v0);
+  others through a result pointer passed in rdi (x8, the indirect result
+  register, as Apple's C convention). Large aggregates stay in the
+  outgoing stack area on aarch64 too (the callee reads them at
+  `[fp, #16 + n]`); only the C ABI module passes aggregates over 16 bytes
+  by reference to a caller copy, and HFAs in v registers.
+- The error return trace pointer goes in a fixed register outside the
+  argument registers: rax on x86_64 (free at a call: only variadic C
+  calls use al) and x15 on aarch64, instead of today's r9. Not x9:
+  `___chkstk_darwin` takes the frame size in x9 and counts it down, so a
+  function with a frame over 4 KiB would lose the pointer in its
+  prologue. The callee keeps
+  it as a normal SSA value (an argument), so a function that never reads
+  it frees the register at once.
+- No registers are callee-saved beyond the platform's, so `.auto` and C
+  share the clobber table and C calls (to libSystem, or exported
+  functions) need no special casing beyond argument classification. The
+  C convention stays exactly SysV / Apple arm64 (including Apple's
+  deviations: callers extend arguments narrower than 32 bits, stack
+  arguments packed at natural alignment, variadic arguments on the stack
+  in 8-byte slots), and is the architecture's ABI module's job.
+
+Today's `.auto` passes every argument in memory and returns most values
+through memory; fib, which is almost only calls, runs 1.22× as long as
+upstream Debug's.
+
+#### What is per architecture
+
+Shared (in `src/codegen/`): the SSA types, construction, passes 1–4,
+liveness, linear scan, parallel-move sequencing, frame-slot assignment,
+line rows and inline records, and the driver that runs them and fills
+the Atom. Per architecture (`src/codegen/<arch>/`):
+
+- **Register info**: classes, allocatable, callee-saved and reserved
+  sets, argument and result registers per convention, clobber sets per
+  call kind, and the callee-save layout (x86_64 pushes, aarch64 pairs).
+- **ABI**: classification of parameters and results for C and `.auto`
+  (SysV; Apple arm64 with its deviations and HFAs), variadic calls, and
+  `va_list`.
+- **Lowering**: the machine op set, as a table giving each op's operand
+  constraints (defined and used registers, fixed registers, tied operands
+  for x86 two-address forms, clobbers), so the allocator is shared; and
+  the folding hooks: `immFits(op, value)`, `foldAddress(load or store,
+  address value)`, and how a flags value lowers (x86 flags and `jcc`;
+  aarch64 NZCV, `b.cond`, `cbz`/`cbnz`, `tbnz w, #0` for bools, `csel`,
+  `cset`). `immFits(op, width, value)` returns the form that encodes
+  the value, or none: aarch64 `add` against `sub` of the negation, `cmp`
+  against `cmn`, the `lsl 12` form, bitmask immediates (which differ
+  between 32 and 64 bits); `csel` takes no immediate (`csinc`, `csinv`,
+  `csneg` cover 0 and ±1). The rematerialization cost of a constant.
+  Globals: x86_64 RIP-relative; aarch64 `adrp` + `add`, or
+  `adrp` + a load or store with `pageoff12` folded in only when the
+  global's alignment is at least the access size (the linker rejects the
+  rest).
+- **Encoding**, branch shortening and relaxation (aarch64 `b.cond` and
+  `cbz` reach ±1 MiB, `tbz` ±32 KiB, so the encoder relaxes an
+  out-of-range one into an inverted branch over an unconditional one),
+  prologue and epilogue, stack probes, and the unwind record. Encoder
+  additions such as aarch64's LSE atomics (`cas`, `ldadd`, `swp`,
+  `ldar`/`stlr`, on every Apple Silicon chip, so no LL/SC loops) do not
+  touch the shared layer.
+- **Switches** lower to compare chains in the first version, as today
+  (a binary search over sorted cases when there are many). Jump tables
+  come later: they need data inside the text atom (x86_64 a RIP-relative
+  table of offsets; aarch64 `adr` to a label and label-difference words,
+  `adr x, T; ldrsw x, [x, idx, lsl 2]; add; br`), which neither encoder
+  has yet.
+
+Flags are one implicit value on both architectures, never allocatable,
+never spilled (see pass 5). Link-time values (error codes): x86_64 patches
+them into an instruction's immediate field (`value16`/`value32`); aarch64 needs an instruction form for
+them, and the cheapest is a new relocation kind that writes a link-time
+value into a `movz` imm16 field (zap links its own output, so no external
+linker must understand it), which makes an error compare `movz` + `cmp`
+instead of `adrp` + `ldr` + `cmp`. Decide before aarch64 lowering depends
+on either (relocation kinds are append-only). The Mac thread agrees;
+the kind writes a link-time value into imm16 (bits 5–20) of a `movz`
+(or a `movk`, with the shift taken from its `hw` field), and the linker
+checks the opcode and that the value fits 16 bits. Error codes are u16,
+so an error compare is `movz w16, #code; cmp wN, w16`, with x16 as the
+in-instruction scratch; a `movk lsl 16` kind can follow if a 32-bit
+link-time value is ever needed in code. The link thread adds the kind.
+
+#### Debug info
+
+- **Line rows** come from value positions, emitted in layout order when
+  the position changes, as `Encoder.line` does today. Cold blocks keep
+  their positions, so a panic call still maps to its check's line.
+- **Inlined frames.** `dbg_inline_begin`/`end` (Sema's runtime inline
+  calls today, the backend's inlining later) set the position's inline
+  index. Layout can split an inline call's code (its cold blocks move to
+  the end), so emission writes one `Debug.Inline` entry per contiguous
+  range, all with the same call information, as the link thread's
+  contract already allows.
+- **CFI and unwinding.** Frame pointers stay in every function that is
+  not naked, so std.debug's frame-pointer walk and every debugger keep
+  working. Saved callee-saved registers need more than today's
+  `Atom.Debug.Frame` can say, so the function's unwind information
+  becomes a small record: frame kind (none, frame pointer, outermost), a
+  stack size (u16, in 16-byte units, reserved now for aarch64's
+  FRAMELESS leaves, `0x02000000 | size / 16 << 12`, which may come
+  later), and a saved-register mask whose bits and layout each architecture fixes
+  (x86_64: rbx, r12–r15, pushed in that order below rbp, giving each a
+  `DW_CFA_offset`; aarch64: compact unwind's pair bits, x19/x20 = 0x1
+  through x27/x28 = 0x10 and d8/d9 = 0x100 through d14/d15 = 0x800, which
+  `__unwind_info` stores as is and which also give the DWARF offsets).
+  Unwind information describes the code, not its debug info, and the Mac
+  thread notes ld64 keeps `__unwind_info` in stripped links, so the
+  record moves from `Atom.Debug` into the Atom itself. Whether stripped
+  links write it is the linkers' decision. In the cache (reviewed by the
+  cache thread): the kind takes `debug_frame`'s byte in the atom record
+  header, and the mask and stack size two `u16`s of its unused bytes, so
+  records stay 64 bytes; it is written for every atom (data atoms: kind none, mask 0),
+  hashed by `contentsHash` (Incremental's function result hash stops
+  mixing in `Atom.Debug.frame`), validated by `check` (a known kind, and
+  only mask bits the architecture allows), and the pack magics are
+  bumped. The field shape is the link thread's.
+- **Variable locations** come later. Sema would emit a debug-variable
+  marker (name, value) where a variable is declared; the SSA keeps it as
+  a use that does not extend liveness; after allocation, each variable's
+  intervals give a location list (register, or frame slot), stored in a
+  new append-only `Atom.Debug` run and written as `DW_AT_location`
+  loclists by the linker. Promoted variables then stay visible in a
+  debugger; until then they are not (unpromoted ones keep their slot).
+  This is the one debuggability regression the design accepts in the
+  meantime, and it argues for landing locations soon after registers.
+
+#### Inlining within a budget (later step)
+
+Not in the first version; the cache edge it needs is fixed now, so the
+replay format can carry it.
+
+- **What inlines.** First, leaf functions: `.auto` functions whose SSA,
+  after their own passes, has at most a fixed number of values (start
+  with 30) and calls nothing except cold noreturn functions (panic
+  handlers). Not recursive, not `noinline`, not called through `@call(
+  .never_inline, ...)`, no `@returnAddress`/`@frameAddress`, and never
+  into a cold block. The decision reads only the callee's own SSA, so it
+  is the same in every build and independent of scheduling, and leaf-only
+  inlining cannot wait in a cycle. Inlining callees that themselves inline
+  (Go's mid-stack inlining) comes after, ordered bottom-up over the
+  call graph's strongly connected components.
+- **Where.** In the caller's construction (pass 1): the callee's SSA is
+  copied in with its arguments substituted, its positions marked with a
+  new inline call (`Debug.Inline`, with the callee as `inline_callees`
+  already records for Sema's inline calls), and the passes run over the
+  result.
+- **The cache edge** (reviewed by the cache thread). A new dependee,
+  `func_inline: f`, appended to the dependee and manifest `Tag`s, with
+  its producer edge to `f`'s `func` unit as `func_ies` has:
+  - **Who records it.** Every call site that passes the caller-side
+    rules (`.auto`, not `never_inline`, not in a cold block) records it,
+    whether or not `f` turned out inlinable. Otherwise an edit that makes
+    `f` inlinable would leave a green caller with its call while a full
+    build inlines, and the outputs would differ.
+  - **Its result hash** is a constant "not inlinable" marker when `f` is
+    over the budget or not a leaf, and otherwise the stable hash of `f`'s
+    inlinable SSA in a canonical encoding. So edits to a large `f` do not
+    touch its callers; only edits that change what would be inlined do.
+    Positions in the encoding are relative to `f`'s base line, as
+    `Debug.lines` are, so adding a line above `f` does not make its
+    callers red (their inline records' base lines are refreshed at relink
+    through `inline_callees`, as designed). Types and constants are named
+    by stable hash and callees by Nav key, never by InternPool index.
+  - **Recording comes from CodeGen**, not Sema: the caller's construction
+    pass finds the edges after Sema has recorded its dependencies. Emit
+    keeps a per-caller list, as `Emit.unit_refs` does for references,
+    deduplicated in first-occurrence (IR) order, and the recorder appends
+    it to the caller's dependencies.
+  - **Replay.** The result hash is stored per node like any other: a
+    green `f` needs no recomputation, and a red `f`'s new hash gives early
+    cutoff. In replay step 4, a queued function's green/red decision waits
+    on its `func_inline` dependencies as on an inferred-error-set claim
+    (`f` is compiled first when it is red). A caller that is red only
+    through `func_inline` still re-runs Sema, since IR is not cached.
+    Delta records carry dependencies generically. `ZAP_CACHE_CHECK` covers
+    the edge without changes: a missing edge shows as a caller whose
+    result changed without being predicted, so conformance runs with
+    edit-and-verify passes are its test.
+- **Getting the body on an edit build.** When a caller is re-analyzed
+  and `f` is green, the caller needs `f`'s SSA, which the cache does not
+  store (it stores Atoms). zap re-runs Sema and passes 1–3 on `f` without
+  emitting it: `f` is under the budget by definition, its dependencies
+  are loaded, and no format changes. `f`'s atom, dependencies, and
+  references stay the manifest's and nothing is recorded anew; since `f`
+  is green its analysis is deterministic and its side effects (error
+  names, which atoms name symbolically anyway) are ones a full build has
+  too. Each inlinable SSA is kept for the rest of the build, outside the
+  per-function arena. Storing `f`'s SSA in its store entry instead would
+  freeze an SSA closure encoding while Sema's types and the SSA still
+  move, and add store bytes for every inlinable function; it is the
+  fallback if edit-build profiles ever show the re-analysis. With
+  mid-stack inlining the re-analysis recurses bottom-up, still bounded by
+  the budget. In parallel CodeGen a caller waits for its callee's
+  inlinable form as it waits for a callee's inferred error set, a claim
+  like the others.
+- **What users see.** std 0.17's stack traces print one frame per
+  return address, named after the innermost inline range
+  (`Dwarf.getSymbols` ignores inline callers), so a panic inside an
+  inlined function shows the callee's line and loses the caller's frame.
+  Debuggers show both (they read `DW_TAG_inlined_subroutine`). Upstream
+  Debug never inlines, so this changes zap's panic traces relative to
+  upstream's; it is the owner's call whether that is acceptable or whether
+  functions containing safety checks stay out of line.
+
+#### Compile-time budget and how it is measured
+
+The backend is budgeted per IR instruction, single-threaded, on libvaxis
+text_input (295k IR instructions; today 170 ns each):
+
+| Stage | Budget per IR instruction | On libvaxis |
+|---|---:|---:|
+| Build (construction, promotion, folding) | 40 ns | 12 ms |
+| Passes 2–4 (dead code, cleanup, layout) | 20 ns | 6 ms |
+| Lowering | 40 ns | 12 ms |
+| Liveness and allocation | 60 ns | 18 ms |
+| Frame layout and emission | 40 ns | 12 ms |
+| Total | 200 ns | 59 ms |
+
+That is about 1.2× today's backend on one thread, for code that should
+be roughly half the size. The other half of the bill shrinks with the
+code: half the bytes to hash into content keys, store in the cache, and
+link. Parallel CodeGen (step 1 of "Parallel function bodies") takes the
+backend off Sema's critical path; this budget keeps it from becoming the
+long pole afterwards.
+
+Measuring it:
+
+- `ZAP_TIMING=1` gains one line per stage above, summed over functions.
+- `zig build bench-codegen` (new, like `bench-link`): runs the frontend
+  and Sema on libvaxis once in process, keeps every function's IR, then
+  runs the backend over all of it repeatedly and prints ns per IR
+  instruction per stage, code bytes per IR instruction, and the frame
+  bytes per function. Deterministic enough for A/B comparisons in one
+  session, and callgrind instruction counts of the same binary are exact.
+- `bench/runtime.py` times the generated code (below). Every backend
+  change reports its compile-time cost next to its run-time win, as
+  AGENTS.md asks.
+
+Generated-code baseline (main 8fe40fe, `python3 bench/runtime.py`,
+medians of 5 runs on the 4-core orb):
+
+| Program | zap | upstream Debug | upstream ReleaseSafe | zap / Debug | zap / ReleaseSafe |
+|---|---:|---:|---:|---:|---:|
+| fib | 188 ms | 154 ms | 72 ms | 1.22× | 2.6× |
+| sieve | 497 ms | 417 ms | 117 ms | 1.19× | 4.2× |
+| sort | 613 ms | 480 ms | 82 ms | 1.28× | 7.5× |
+| hash | 384 ms | 463 ms | 39 ms | 0.83× | 9.9× |
+| nbody | 418 ms | 442 ms | 19 ms | 0.94× | 21.6× |
+| fmt | 205 ms | 160 ms | 17 ms | 1.28× | 12.1× |
+
+Targets for the first version (registers, layout, fusion, `.auto` in
+registers, no inlining): faster than upstream Debug on every program, and
+within 3× of ReleaseSafe on fib and sieve. hash, nbody, and fmt are
+dominated by small std functions (hashing, vector arithmetic, the
+`Writer` interface) and need inlining to get closer.
+
+#### Landing it
+
+Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
+
+1. SSA construction and emission with no optimization: every op lowers
+   through a fallback that is today's per-instruction code (operands in
+   frame slots, scratch registers clobbered), so the output matches
+   today's in behavior. This lands the data structures and the driver.
+2. Lowering for scalar ops, the allocator, and frame-slot sharing; the
+   fallback remains for wide integers, f80, f128, and inline assembly
+   (which gets its constraints from the allocator later).
+3. `.auto` in registers, and the unwind record in the Atom (with the
+   link thread).
+4. Layout, fusion, overflow from flags, dead code, and branch shortening.
+5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
+   thread).
+6. DWARF variable locations; then leaf inlining with the cache edge.
 
 ### Linkers (`src/link/`)
 
