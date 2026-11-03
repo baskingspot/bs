@@ -5134,8 +5134,7 @@ fn isExternVar(ip: *const InternPool, nav: *const InternPool.Nav) bool {
 }
 
 /// `@export(&decl, .{ .name = ... })`: exports a declaration under a symbol
-/// name. Only the name is honored; linkage, section, and visibility are
-/// those of a strong global symbol in a static executable.
+/// name. The name, linkage, and visibility are honored; the section is not.
 fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
     try sema.bcRefuse();
     const ip = sema.ip;
@@ -5151,10 +5150,13 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     const options = try sema.resolveConstValue(block, src, try sema.coerce(block, options_ty, sema.resolveInst(extra.options), src), "export options must be comptime-known");
     const name_val = try sema.fieldValue(options, ip.structInfo(options_ty).fieldIndex(ip, "name").?);
     const name = try sema.resolveConstString(block, src, .fromInterned(name_val));
+    const info = ip.structInfo(options_ty);
+    const linkage: std.lang.GlobalLinkage = @enumFromInt(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "linkage").?)).int).?);
+    const visibility: std.lang.SymbolVisibility = @enumFromInt(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "visibility").?)).int).?);
     const nav_index = switch (ip.keyPayload(.ptr, ptr_val).base) {
         .nav => |n| n,
         .uav => |v| {
-            try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .uav = v.val }, .name = try sema.getString(name), .unit = sema.owner });
+            try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .uav = v.val }, .name = try sema.getString(name), .unit = sema.owner, .linkage = linkage, .visibility = visibility });
             return;
         },
         else => return sema.fail(block, src, "export target must be a global variable or a comptime-known constant", .{}),
@@ -5166,7 +5168,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
         else => nav_index,
     };
     if (ip.keyTag(val) == .func) try sema.queueFuncRef(src, val);
-    try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name), .unit = sema.owner });
+    try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name), .unit = sema.owner, .linkage = linkage, .visibility = visibility });
 }
 
 /// `@extern(T, .{ .name = ... })`: the address of a symbol defined

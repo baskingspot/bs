@@ -840,7 +840,7 @@ fn findExports(emit: *Emit) !void {
             .uav => |v| try emit.uavKey(v, 0),
         };
         if ((try seen.getOrPut(emit.gpa, name)).found_existing) continue;
-        try emit.exports.append(emit.gpa, .{ .key = key, .name = name });
+        try emit.exports.append(emit.gpa, .{ .key = key, .name = name, .weak = x.linkage == .weak, .visibility = x.visibility });
     }
 }
 

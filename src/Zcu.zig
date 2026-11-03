@@ -144,6 +144,11 @@ pub const Export = struct {
     /// The unit whose analysis made the export (`@export`), or null for an
     /// `export` declaration, which the namespace scan makes.
     unit: ?AnalUnit,
+    /// From `@export`'s options; an `export` declaration is strong and
+    /// default. Objects and shared objects write them (see
+    /// "Position-independent code" in docs/architecture.md).
+    linkage: std.lang.GlobalLinkage = .strong,
+    visibility: std.lang.SymbolVisibility = .default,
 };
 
 pub const FuncState = enum { queued, in_progress, done, failed };
