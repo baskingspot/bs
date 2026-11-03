@@ -1001,7 +1001,10 @@ pub fn indexOfHash(ip: *InternPool, hash: Hash) Allocator.Error!?Index {
     defer ip.by_hash_mutex.unlock(ip.io);
     for (ip.locals, 0..) |*local, tid| {
         const len = local.hashes.len.load(.acquire);
-        if (local.by_hash_len == len) continue;
+        // The static items lead local 0; their `hashes` entries are not
+        // their stable hashes (`static_hashes`), so they are not indexed.
+        if (tid == 0) local.by_hash_len = @max(local.by_hash_len, static_len);
+        if (local.by_hash_len >= len) continue;
         const hashes = local.hashes.view();
         try ip.by_hash.ensureUnusedCapacity(ip.gpa, len - local.by_hash_len);
         for (local.by_hash_len..len) |i| {
