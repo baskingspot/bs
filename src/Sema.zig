@@ -1657,7 +1657,11 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             break :blk sema.analyzeMinMax(block, block.nodeSrc(data.pl_node.src_node), tag, &.{ sema.resolveInst(extra.lhs), sema.resolveInst(extra.rhs) });
         },
-        .add_sat, .sub_sat, .mul_sat, .shl_sat, .shl_exact, .shr_exact => sema.failUnsupported(block, block.nodeSrc(data.pl_node.src_node), @tagName(tag)),
+        .add_sat, .sub_sat, .mul_sat, .shl_sat, .shl_exact, .shr_exact => blk: {
+            const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
+            const src = block.nodeSrc(data.pl_node.src_node);
+            break :blk sema.analyzeArithmetic(block, src, tag, sema.resolveInst(extra.lhs), sema.resolveInst(extra.rhs));
+        },
         .negate => sema.analyzeNegate(block, block.nodeSrc(data.un_node.src_node), sema.resolveInst(data.un_node.operand)),
         .negate_wrap => sema.analyzeNegateWrap(block, block.nodeSrc(data.un_node.src_node), sema.resolveInst(data.un_node.operand)),
         .bit_not => sema.analyzeBitNot(block, block.nodeSrc(data.un_node.src_node), sema.resolveInst(data.un_node.operand)),
@@ -2117,6 +2121,10 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
             const src = block.nodeSrc(extra.node);
             break :blk sema.analyzeOverflowBuiltin(block, src, ext.opcode, sema.resolveInst(extra.lhs), sema.resolveInst(extra.rhs));
+        },
+        .shl_with_overflow => blk: {
+            const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
+            break :blk sema.analyzeShlWithOverflow(block, block.nodeSrc(extra.node), sema.resolveInst(extra.lhs), sema.resolveInst(extra.rhs));
         },
         .std_lang_value => blk: {
             const which: Zir.Inst.StdLangValue = @fromBackingInt(ext.small);
@@ -3564,7 +3572,10 @@ fn requireRuntime(sema: *Sema, block: *Block, src: Src) CompileError!void {
 
 fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, uncasted_lhs: Ref, uncasted_rhs: Ref) CompileError!Ref {
     const ip = sema.ip;
-    if (tag == .shl or tag == .shr) return sema.analyzeShift(block, src, tag, uncasted_lhs, uncasted_rhs);
+    switch (tag) {
+        .shl, .shr, .shl_sat, .shl_exact, .shr_exact => return sema.analyzeShift(block, src, tag, uncasted_lhs, uncasted_rhs),
+        else => {},
+    }
     if (Type.class(ip, sema.typeOf(uncasted_lhs)) == .pointer and (tag == .add or tag == .sub or tag == .addwrap or tag == .subwrap))
         return sema.analyzePtrArithmetic(block, src, tag == .add or tag == .addwrap, uncasted_lhs, uncasted_rhs);
     const ty = try sema.resolvePeerTypes(block, src, &.{ uncasted_lhs, uncasted_rhs });
@@ -3633,6 +3644,24 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
             const ok = try sema.addBinOp(block, .cmp_eq, bit, .zero_u1);
             try sema.addSafetyCheck(block, ok, .integer_overflow, .none, .none);
             return result;
+        },
+        .add_sat, .sub_sat, .mul_sat => {
+            // The wrapped result, or on overflow the bound the exact result
+            // passed: for signed add and sub the one on lhs's side of zero,
+            // for signed mul the one with the product's sign.
+            const ov = try sema.addTyPlBin(block, switch (tag) {
+                .add_sat => .add_with_overflow,
+                .sub_sat => .sub_with_overflow,
+                else => .mul_with_overflow,
+            }, try sema.overflowTupleType(ty), lhs, rhs);
+            const result = try sema.addStructField(block, .struct_field_val, ty, ov, 0);
+            const bit = try sema.addStructField(block, .struct_field_val, .u1_type, ov, 1);
+            const overflowed = try sema.addBinOp(block, .cmp_neq, bit, .zero_u1);
+            const bound = if (!signed)
+                Ref.fromInterned(if (tag == .sub_sat) try sema.intValue(ty, 0) else try sema.maxIntValue(ty))
+            else
+                try sema.signedBound(block, ty, if (tag == .mul_sat) try sema.addBinOp(block, .xor, lhs, rhs) else lhs);
+            return sema.select(block, ty, overflowed, bound, result);
         },
         .addwrap, .add_unsafe => return sema.addBinOp(block, .add_wrap, lhs, rhs),
         .subwrap => return sema.addBinOp(block, .sub_wrap, lhs, rhs),
@@ -3746,9 +3775,9 @@ fn foldArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, ty: I
     var r = try BigInt.init(sema.arena);
     var wrap = false;
     switch (tag) {
-        .add, .addwrap, .add_unsafe => try r.add(&a, &b),
-        .sub, .subwrap => try r.sub(&a, &b),
-        .mul, .mulwrap => try r.mul(&a, &b),
+        .add, .addwrap, .add_unsafe, .add_sat => try r.add(&a, &b),
+        .sub, .subwrap, .sub_sat => try r.sub(&a, &b),
+        .mul, .mulwrap, .mul_sat => try r.mul(&a, &b),
         .bit_and => try r.bitAnd(&a, &b),
         .bit_or => try r.bitOr(&a, &b),
         .xor => try r.bitXor(&a, &b),
@@ -3787,6 +3816,8 @@ fn foldArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, ty: I
         const info = Type.intInfo(sema.ip, ty);
         if (wrap) {
             try r.truncate(&r, info.signedness, info.bits);
+        } else if (tag == .add_sat or tag == .sub_sat or tag == .mul_sat) {
+            try sema.saturate(&r, ty);
         } else if (!r.fitsInTwosComp(info.signedness, info.bits)) {
             return sema.fail(block, src, "overflow of integer type '{f}' with value '{f}'", .{ sema.fmtType(ty), r.toConst() });
         }
@@ -3806,30 +3837,130 @@ fn analyzeShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, lhs: Re
         return sema.fail(block, src, "mixed scalar and vector operands: '{f}' and '{f}'", .{ sema.fmtType(ty), sema.fmtType(sema.typeOf(uncasted_rhs)) });
     const class = Type.class(ip, ty);
     if (class != .int and class != .comptime_int) return sema.fail(block, src, "bit shifting operation expected integer type, found '{f}'", .{sema.fmtType(ty)});
+    // `<<|` takes any integer amount; AstGen coerces the others' amounts.
+    const sat = tag == .shl_sat;
+    const left = tag != .shr and tag != .shr_exact;
+    if (sat and !Type.isInt(ip, sema.typeOf(uncasted_rhs)) and sema.typeOf(uncasted_rhs) != .comptime_int_type)
+        return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(sema.typeOf(uncasted_rhs))});
     const rv = sema.resolveValue(uncasted_rhs);
     if (rv) |v| {
-        if (sema.isUndef(v)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        if (sema.isUndef(v)) {
+            if (sat) return .fromInterned(try sema.undefValue(ty));
+            return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        }
         if (sema.intSign(v) < 0) return sema.fail(block, src, "shift by negative amount '{f}'", .{sema.fmtValue(v)});
-        if (class == .int and (sema.ip.intValue(u64, v) orelse std.math.maxInt(u64)) >= Type.intInfo(ip, ty).bits)
+        if (!sat and class == .int and (sema.ip.intValue(u64, v) orelse std.math.maxInt(u64)) >= Type.intInfo(ip, ty).bits)
             return sema.fail(block, src, "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
     }
     if (sema.resolveValue(lhs)) |lv| if (rv) |v| {
-        if (sema.isUndef(lv)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        if (sema.isUndef(lv)) {
+            if (sat) return .fromInterned(lv);
+            return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        }
         const a = try sema.bigValue(lv);
-        const amount: usize = @intCast(sema.ip.intValue(u64, v).?);
         var r = try BigInt.init(sema.arena);
-        if (tag == .shl) try r.shiftLeft(&a, amount) else try r.shiftRight(&a, amount);
+        const amount = sema.ip.intValue(u64, v) orelse std.math.maxInt(u64);
+        if (sat and class == .int and (a.eqlZero() or amount >= Type.intInfo(ip, ty).bits)) {
+            // Every bit shifts out: zero stays zero, the rest saturate.
+            if (a.eqlZero()) return .fromInterned(lv);
+            return .fromInterned(if (a.isPositive()) try sema.maxIntValue(ty) else try sema.minIntValue(ty));
+        }
+        if (left) try r.shiftLeft(&a, @intCast(amount)) else try r.shiftRight(&a, @intCast(amount));
         if (class == .int) {
             const info = Type.intInfo(ip, ty);
-            try r.truncate(&r, info.signedness, info.bits);
+            if (sat) {
+                try sema.saturate(&r, ty);
+            } else if (tag == .shl_exact and !r.fitsInTwosComp(info.signedness, info.bits)) {
+                return sema.fail(block, src, "overflow of integer type '{f}' with value '{f}'", .{ sema.fmtType(ty), r.toConst() });
+            } else {
+                try r.truncate(&r, info.signedness, info.bits);
+            }
+        }
+        if (tag == .shr_exact) {
+            var back = try BigInt.init(sema.arena);
+            try back.shiftLeft(&r, @intCast(amount));
+            if (!back.eql(a)) return sema.fail(block, src, "exact shift shifted out 1 bits", .{});
         }
         return .fromInterned(try sema.bigToValue(ty, r.toConst()));
     };
     if (class == .comptime_int) return sema.fail(block, src, "LHS of shift must be a fixed-width integer type, or RHS must be comptime-known", .{});
     try sema.requireRuntime(block, src);
-    const shift_ty = try sema.intType(.unsigned, Type.log2IntBits(Type.intInfo(ip, ty).bits));
+    const bits = Type.intInfo(ip, ty).bits;
+    const shift_ty = try sema.intType(.unsigned, Type.log2IntBits(bits));
+    if (sat) return sema.shlSat(block, src, ty, shift_ty, lhs, uncasted_rhs);
     const rhs = try sema.coerce(block, shift_ty, uncasted_rhs, src);
-    return sema.addBinOp(block, if (tag == .shl) .shl else .shr, lhs, rhs);
+    if (block.want_safety and rv == null and !std.math.isPowerOfTwo(bits)) {
+        const ok = try sema.addBinOp(block, .cmp_lt, rhs, .fromInterned(try sema.intValue(shift_ty, bits)));
+        try sema.addSafetyCheck(block, ok, .shift_rhs_too_big, .none, .none);
+    }
+    const result = try sema.addBinOp(block, if (left) .shl else .shr, lhs, rhs);
+    if (block.want_safety and (tag == .shl_exact or tag == .shr_exact)) {
+        // Exact shifts shift out only zeros: shifting back restores lhs.
+        const back = try sema.addBinOp(block, if (left) .shr else .shl, result, rhs);
+        const ok = try sema.addBinOp(block, .cmp_eq, back, lhs);
+        try sema.addSafetyCheck(block, ok, if (left) .shl_overflow else .shr_overflow, .none, .none);
+    }
+    return result;
+}
+
+/// Runtime `lhs <<| rhs`: the shifted value, or the bound on lhs's side of
+/// zero when a nonzero bit shifts out or past the sign bit.
+fn shlSat(sema: *Sema, block: *Block, src: Src, ty: Index, shift_ty: Index, lhs: Ref, rhs: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const bits = Type.intInfo(ip, ty).bits;
+    var too_big: Ref = .fromInterned(.bool_false);
+    var amount: Ref = undefined;
+    if (sema.resolveValue(rhs)) |v| {
+        const n = ip.intValue(u64, v) orelse std.math.maxInt(u64);
+        if (n >= bits) too_big = .fromInterned(.bool_true);
+        amount = .fromInterned(try sema.intValue(shift_ty, if (n >= bits) 0 else n));
+    } else {
+        const rhs_ty = sema.typeOf(rhs);
+        const r = Type.intInfo(ip, rhs_ty);
+        if (r.signedness == .signed) return sema.fail(block, src, "shift by signed type '{f}'", .{sema.fmtType(rhs_ty)});
+        const s_bits = Type.intInfo(ip, shift_ty).bits;
+        var clamped = rhs;
+        if (r.bits >= 64 or (@as(u64, 1) << @intCast(r.bits)) > bits) {
+            const limit: Ref = .fromInterned(try sema.intValue(rhs_ty, bits));
+            too_big = try sema.addBinOp(block, .cmp_gte, rhs, limit);
+            clamped = try sema.select(block, rhs_ty, too_big, .fromInterned(try sema.intValue(rhs_ty, 0)), rhs);
+        }
+        amount = if (r.bits > s_bits)
+            try sema.addTyOp(block, .trunc, shift_ty, clamped)
+        else if (r.bits < s_bits)
+            try sema.addTyOp(block, .intcast, shift_ty, clamped)
+        else
+            clamped;
+    }
+    const shifted = try sema.addBinOp(block, .shl, lhs, amount);
+    const back = try sema.addBinOp(block, .shr, shifted, amount);
+    var overflowed = try sema.addBinOp(block, .cmp_neq, back, lhs);
+    if (too_big != Ref.fromInterned(.bool_false)) {
+        const nonzero = try sema.addBinOp(block, .cmp_neq, lhs, .fromInterned(try sema.intValue(ty, 0)));
+        overflowed = if (too_big == Ref.fromInterned(.bool_true))
+            nonzero
+        else
+            try sema.addBinOp(block, .bit_or, overflowed, try sema.addBinOp(block, .bit_and, too_big, nonzero));
+    }
+    const bound = if (Type.intInfo(ip, ty).signedness == .unsigned)
+        Ref.fromInterned(try sema.maxIntValue(ty))
+    else
+        try sema.signedBound(block, ty, lhs);
+    return sema.select(block, ty, overflowed, bound, shifted);
+}
+
+/// The minimum of signed `ty` if `sign_of` is negative, else its maximum.
+fn signedBound(sema: *Sema, block: *Block, ty: Index, sign_of: Ref) CompileError!Ref {
+    const negative = try sema.addBinOp(block, .cmp_lt, sign_of, .fromInterned(try sema.intValue(ty, 0)));
+    return sema.select(block, ty, negative, .fromInterned(try sema.minIntValue(ty)), .fromInterned(try sema.maxIntValue(ty)));
+}
+
+/// Clamps `r` to the range of integer type `ty`.
+fn saturate(sema: *Sema, r: *BigInt, ty: Index) !void {
+    const info = Type.intInfo(sema.ip, ty);
+    if (r.fitsInTwosComp(info.signedness, info.bits)) return;
+    const bound = if (r.isPositive()) try sema.maxIntValue(ty) else try sema.minIntValue(ty);
+    r.* = try sema.bigValue(bound);
 }
 
 fn analyzeNegate(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
@@ -3923,6 +4054,39 @@ fn analyzeOverflowBuiltin(sema: *Sema, block: *Block, src: Src, op: Zir.Inst.Ext
         .mul_with_overflow => .mul_with_overflow,
         else => unreachable,
     }, tuple_ty, lhs, rhs);
+}
+
+/// `@shlWithOverflow`: the wrapped shift and whether it shifted out bits
+/// that differ from the result's sign.
+fn analyzeShlWithOverflow(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_rhs: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const ty = sema.typeOf(lhs);
+    if (Type.class(ip, ty) != .int) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(ty)});
+    const info = Type.intInfo(ip, ty);
+    const shift_ty = try sema.intType(.unsigned, Type.log2IntBits(info.bits));
+    const rhs = try sema.coerce(block, shift_ty, uncasted_rhs, src);
+    const tuple_ty = try sema.overflowTupleType(ty);
+    const rv = sema.resolveValue(rhs);
+    if (rv) |v| if (!sema.isUndef(v) and ip.intValue(u64, v).? >= info.bits)
+        return sema.fail(block, src, "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
+    if (sema.resolveValue(lhs)) |lv| if (rv) |v| {
+        if (sema.isUndef(lv) or sema.isUndef(v)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        const a = try sema.bigValue(lv);
+        var r = try BigInt.init(sema.arena);
+        try r.shiftLeft(&a, @intCast(ip.intValue(u64, v).?));
+        const overflowed = !r.fitsInTwosComp(info.signedness, info.bits);
+        try r.truncate(&r, info.signedness, info.bits);
+        return .fromInterned(try sema.intern(.{ .aggregate = .{ .ty = tuple_ty, .storage = .{ .elems = &.{ try sema.bigToValue(ty, r.toConst()), if (overflowed) .one_u1 else .zero_u1 } } } }));
+    };
+    try sema.requireRuntime(block, src);
+    if (block.want_safety and rv == null and !std.math.isPowerOfTwo(info.bits)) {
+        const ok = try sema.addBinOp(block, .cmp_lt, rhs, .fromInterned(try sema.intValue(shift_ty, info.bits)));
+        try sema.addSafetyCheck(block, ok, .shift_rhs_too_big, .none, .none);
+    }
+    const result = try sema.addBinOp(block, .shl, lhs, rhs);
+    const back = try sema.addBinOp(block, .shr, result, rhs);
+    const bit = try sema.addUnOp(block, .int_from_bool, try sema.addBinOp(block, .cmp_neq, back, lhs));
+    return sema.aggregate(block, src, tuple_ty, &.{ result, bit });
 }
 
 // ---------------------------------------------------------------------------
