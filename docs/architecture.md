@@ -1157,20 +1157,197 @@ Rejected alternative: upstream-style persistence of the whole InternPool and
 dependency graph as one mmap-able snapshot per project. It loads faster but
 shares nothing across projects and ties the file format to in-memory layout.
 
-## Parallelism (milestone 6, designed now)
+## Parallelism
 
 - Frontend: files lower in parallel (see Frontend above).
-- Sema: container-level units resolve on demand; runtime function bodies are
-  queued and analyzed by a pool of workers, each with its own Sema instance and
-  arena. A unit's state (unresolved, in progress by worker N, done) is the only
-  synchronization point; a worker that needs a unit another worker holds
-  waits, and a wait cycle is reported as a dependency loop, as upstream does.
-- Resolving an inferred error set is one such synchronization point: a
-  worker that needs a callee's resolved set waits on the worker analyzing that
-  body, or analyzes it itself if nobody has started it.
-- CodeGen runs on the worker that analyzed the function, right after Sema,
-  while the IR is hot in cache.
-- Linking starts when all Atoms exist.
+- The cache records a build alongside the link, on every core (see
+  "Integration").
+- Linking is parallel within the linker.
+- Sema and CodeGen run on one thread today; the design below makes them
+  parallel.
+
+### Where a cold build's time goes (measured 2026-11-03)
+
+`ZAP_TIMING=1` prints wall time per stage. CodeGen runs inside
+`Zcu.analyzeAll` (Emit times `CodeGen.generate`); "Sema" is the rest of
+`analyzeAll`. "Record" is the wait for the cache after the link. ReleaseFast
+zap, 4-core orb, page cache warm; "ZIR warm" means std's ZIR was in the
+global cache but the compilation's directory was empty.
+
+| Program | Frontend | Sema | CodeGen | Emit | Link | Record | Total in zap |
+|---|---|---|---|---|---|---|---|
+| hello (std), ZIR warm | 4.8–5.0 | 114–119 | 41–43 | 1.1 | 3.2–3.7 | 10.5–14 | 175–183 ms |
+| hello (std), all cold | 173–196 | 150–163 | 45–50 | 1.1–1.2 | 3.5–3.9 | 12–13 | 389–419 ms |
+| behavior/floatop.zig (test mode), ZIR warm | 6.6–11 | 74–77 | 9.3–9.5 | 0.4 | 1.1 | 3.1–3.7 | 96–102 ms |
+| behavior/floatop.zig, all cold | 179–221 | 104–112 | 8.8–11 | 0.5 | 1.1–1.3 | 3.8–4.7 | 298–351 ms |
+| generated, 20k functions, 24.5k atoms (std-free) | 165–203 | 289–316 | 160–179 | 4.6–5.3 | 8.4–12 | 65–79 | 696–753 ms |
+| behavior/x86_64/binary.zig, ZIR warm | 33 | 6222 | 3753 | 0.3 | 330–690 | 230–490 | 10.8 s |
+
+- Function bodies are nearly all of Sema. The bodies analyzed from
+  `analyzeAll`'s queue loop, including the declarations and the nested
+  bodies (inferred error sets) they reach, are 128 of 132 ms of Sema on
+  hello (1660 bodies), 76 of 81 on floatop (507), 327 of 352 on the
+  generated program (19.6k), and 6.05 of 6.22 s on binary.zig. On
+  binary.zig only 545 of its 117k function instances come from the queue;
+  the rest are analyzed nested, when a caller needs their inferred error
+  set.
+- CodeGen is 26–37% of Sema plus CodeGen everywhere but floatop (11%).
+- The frontend is the largest cold stage for small programs: std's 560
+  files lower in parallel, but they are lowered and written to the cache
+  once. On the generated program it is one 20k-function file, which
+  AstGen lowers on one thread (165–200 ms), as upstream does.
+- For scale: upstream `zig build-exe` takes 383–418 ms for hello with a
+  warm global cache, and 1.64–1.73 s for the generated program (6.1 s
+  with an empty global cache, which builds compiler_rt).
+
+So the target is Sema's function bodies plus CodeGen: 155 of 180 ms on
+hello with ZIR warm, 470 of 720 ms on the generated program, and 10 of 10.8 s
+on binary.zig.
+
+### Parallel function bodies (designed 2026-11-03, for review)
+
+Not built yet; two threads change Sema daily. Three steps, each useful
+alone, sharing one hook.
+
+**Step 1: CodeGen on a pool, behind one Sema thread.** CodeGen reads the
+InternPool and Zcu without interning (it requests compiler_rt functions
+and declarations' data, which become locked appends). Sema stays serial;
+`sink.function` hands each IR, owned, to a pool of CodeGen workers, each
+with its own Emit output (below). Expected: Sema plus CodeGen goes from
+the sum to about Sema alone: 155 → ~120 ms on hello, 470 → ~310 ms on the
+generated program, 10 → ~6.3 s on binary.zig.
+
+**Step 2: function bodies on a pool.** Workers take queued function
+bodies; each worker runs Sema and then CodeGen on the same body while the
+IR is hot in cache, and anything a body needs (a declaration's value, a
+type's layout, a callee's inferred error set) is resolved by that worker
+on demand, as today, unless another worker holds it. With bodies at
+93–97% of Sema, 4 cores would take hello to roughly 50 ms of Sema plus
+CodeGen, the generated program to ~140 ms (its single-file frontend then
+dominates), and binary.zig to ~2.7 s.
+
+**Step 3: record each unit as it completes**, on the worker that finished
+it (below), so that `record`'s graph and store work overlap analysis and
+only numbering and the manifest write remain after the link.
+
+**Claiming units.** A unit's state is where workers synchronize, as the
+current `ensure*` functions already are (Nav `status`, `ContainerInfo.status`,
+`Zcu.funcs`, `comptime_decls`, the root types of files). Each state becomes
+an atomic word holding unresolved, in progress by worker N, done, or
+failed. `ensure*` claims an unresolved unit with a compare-and-swap and
+analyzes it on the calling worker; a done unit is read after an acquire
+load (its result fields are written before the release store that marks
+it done); a unit in progress on another worker is waited for. Before
+waiting, a worker records which unit it waits on and follows the chain
+owner → the unit that owner waits on → ...; reaching itself is a
+dependency loop. The chain is the same cycle a serial stack would find,
+but which unit reports it depends on timing, so the units on the cycle
+are marked and re-analyzed on one thread at the end, in the serial order,
+to report upstream's diagnostic. Waiting blocks the worker (a futex per
+state word), so a pool needs more workers than cores only if waits get
+long; measure first.
+
+**What is per function, and what is shared.**
+
+| State | Today | In parallel |
+|---|---|---|
+| `Sema` instance: arena, `ir_insts`, `inst_map`, `deps`, comptime allocations, `ies_names`, inline and branch counters, anonymous-type ordinals | per unit | per unit, unchanged |
+| InternPool items and strings | one thread (`Zcu.tid = .main`) | per-worker `Tid`, already sharded (below) |
+| Nav and `ContainerInfo` result fields | written by their unit | written by the claiming worker before marking done |
+| `Zcu.funcs`, `func_queue` | map and list | sharded state map; a work queue (per-worker deques with stealing) |
+| `Zcu.inferred_errors` | map | written by the body's worker before marking done; read after done |
+| `Zcu.deps` | map per unit | per-worker lists of (unit, dependees), merged and sorted by unit key at the end |
+| `Zcu.comptime_memo` | map | sharded map; two workers may compute the same call, the first insert wins, and both results are equal (memo keys and anonymous types inside are keyed by callee key and argument hashes) |
+| `Zcu.namespaces` | list, pointers into it | per-worker lists with the owner in the index, as InternPool does, so a namespace pointer stays valid; `decls` is fixed once the namespace is created |
+| `Zcu.errors`, `exports`, `test_functions`, `rt_helpers` | lists | locked appends; sorted at the end by unit key and source position (errors), declaration key (exports, tests), and key (compiler_rt requests), so their order does not depend on scheduling |
+| `Zcu.arena` | one arena | one per worker |
+| `ip.next_comptime_alloc` | counter | stays atomic: comptime allocations never escape their unit (see InternPool) |
+| Frontend files | loaded before analysis, compiler_rt on demand | `loadFile` takes a lock |
+
+**InternPool writes.** The pool is already built for this: each worker
+appends to its own `Local` shard (its `Tid` is in every new index), the
+deduplication maps are sharded by hash with a mutex per shard, and
+published items are immutable and read without locks. Two workers
+interning the same key race on the shard lock; the loser gets the
+winner's index. Indices therefore differ from run to run, which is fine
+because nothing persisted or ordered uses them (stable hashes and unit
+keys do). Work needed: `Zcu.tid` becomes a per-worker field passed through
+Sema; error values (below); and measuring shard-lock contention on the
+hottest keys (pointer and integer types), which may want per-worker
+lookup caches in front of the shards.
+
+**Inferred error sets.** A caller that needs a callee's resolved set calls
+`ensureFuncIes`, which is a unit claim like the others: done, read the
+set; queued and unclaimed, claim it and analyze the body on this worker
+(today's nested analysis); in progress elsewhere, wait, with the cycle
+check. A body that needs its own set while analyzing itself is the
+recursion case that is a dependency loop today, and stays one. On
+binary.zig most bodies are reached this way, so work stealing must not
+assume bodies come from the queue: a nested body's CodeGen runs right
+after its Sema on the worker that claimed it.
+
+**Emit and output order.** Each worker has an Emit output: its atoms,
+debug entries, owners, content-atom uses, and the declarations, error
+names, externs, and compiler_rt functions its code requested.
+Content-addressed atoms are deduplicated per worker and again at `finish`.
+The link order must not depend on scheduling, and today it is the order
+of discovery on one thread. In parallel, `finish` sorts owner groups by
+the node key the manifest uses (a unit's stable key hash; a content atom's
+key), with the link's own atoms last, then deduplicates as
+`groupByOwner` does now. Sorting 100k groups costs a few ms. It also keeps
+an edited unit's atoms in place, which a future in-place relink wants.
+Callers no longer sit next to their callees, which costs nothing
+measurable in a Debug build. Error codes for value relocations are
+assigned in that same order (below), and data for requested declarations
+is lowered at `finish` in declaration key order.
+
+**Error codes.** Codes are the one order-dependent value Sema computes:
+`ip.errorValue` numbers names in the order they are first interned. Runtime
+code only names errors (value relocations), so only comptime uses
+(`@intFromError`, an error integer folded into a constant) need a code
+during analysis. Codes come first from the last build's manifest
+(`seedErrors`). A name without one gets a provisional code when a unit
+first needs it, and the unit records that it read the code (the error
+node the manifest already has). At the end, the final assignment
+numbers the remaining names in the deterministic order above. Units whose
+provisional codes differ from the final ones, which happens only for new
+names read at comptime, are re-analyzed on one thread before Emit
+finishes. Their dependents follow over the recorded edges, which is
+the edit-build machinery.
+
+**The completion hook, and recording as units complete.** When a unit's
+result is final (a declaration resolved, a layout resolved, a `comptime`
+block done, a function body analyzed and generated), its worker calls
+`sink.unitDone(zcu, unit)`. Step 3 records the unit there, on that
+worker:
+- its node key, `src_hash`, and result hash (InternPool stable hashes,
+  or its atoms' contents once CodeGen has run);
+- its dependency edges as keys with their result hashes, all final
+  because a unit completes only after everything it read did;
+- its store lookup, and on a miss its entry, encoded into the build's new
+  pack at an offset taken from an atomic counter.
+
+At the end, `record` only sorts the recorded nodes into the canonical
+order, numbers the symbols, writes the manifest alongside the link, and
+places it after a successful link. On the generated program that moves
+the graph (39–47 ms) and the store lookups off the critical path, leaving
+the manifest (30–37 ms, itself parallelizable). Placement in the pack then
+depends on timing, so pack bytes differ between runs while every
+reference stays correct. The same hook is where an edit build loads a
+skipped unit's cached result (see "Edit builds").
+
+**What stays serial.** AstGen of a single file; the roots
+(`analyzeAll`'s comptime declarations, exports, and tests until bodies
+are queued, which is cheap); `finish`'s data lowering (5 ms on the
+generated program); and the re-analysis of dependency loops and of units
+that read provisional error codes.
+
+**Checking it.** `ZAP_THREADS=1` runs everything inline. The output
+binary and the manifest's atom order must be byte-identical across thread
+counts and runs, and conformance must not change. A debug option that
+shuffles the work queue and adds random yields at claim points exposes
+order dependence, and ThreadSanitizer builds of zap check the shared
+state.
 
 ## `builtin` and conformance
 
