@@ -1901,6 +1901,27 @@ fn cRet(cg: *CodeGen, operand: Ref) Error!void {
 /// Calls the compiler_rt function `name`, declared in
 /// `lib/compiler_rt/<file>`, with the C convention. Its symbol is the key of
 /// its function unit, which `Zcu` resolves and queues for analysis.
+/// Calls `name(dst, u, v, bits)`, one of compiler_rt's division helpers for
+/// integers of `ty`. The signed helpers clobber `u` and `v`, so they get
+/// copies.
+fn divEi4(cg: *CodeGen, file: []const u8, name: []const u8, dst: Mem, u: Mem, v: Mem, ty: Index) Error!void {
+    const key: SymbolKey = .fromName(try cg.emit.zcu.requestCompilerRt(file, name));
+    var u_arg = u;
+    var v_arg = v;
+    if (cg.signed(ty)) {
+        const size = Type.abiSize(cg.ip, ty);
+        u_arg = Mem.at(.rbp, try cg.allocSlot(size, 16));
+        v_arg = Mem.at(.rbp, try cg.allocSlot(size, 16));
+        try cg.copyMem(u_arg, u, size);
+        try cg.copyMem(v_arg, v, size);
+    }
+    try cg.e.lea(.qword, .rdi, dst);
+    try cg.e.lea(.qword, .rsi, u_arg);
+    try cg.e.lea(.qword, .rdx, v_arg);
+    try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = Type.intInfo(cg.ip, ty).bits });
+    try cg.e.call(.{ .sym = key });
+}
+
 fn rtCall(cg: *CodeGen, file: []const u8, name: []const u8, args: []const Val, ret_ty: Index, dst: ?Mem) Error!void {
     const key: SymbolKey = .fromName(try cg.emit.zcu.requestCompilerRt(file, name));
     try cg.cCallArgs(args, ret_ty, dst);
@@ -2524,43 +2545,53 @@ fn genWide(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
         .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
             const ty = cg.typeOf(data.bin_op.lhs);
             const dst = try cg.resultMem(inst, ty) orelse return;
-            if (cg.limbCount(ty) != 2) return cg.fail("division of integers wider than 128 bits", .{});
+            const n = cg.limbCount(ty);
             const lhs = try cg.wideVal(data.bin_op.lhs);
             const rhs = try cg.wideVal(data.bin_op.rhs);
             const s = cg.signed(ty);
-            const rt_ty: Index = if (s) .i128_type else .u128_type;
-            const l: Val = .{ .ty = rt_ty, .loc = lhs.loc };
-            const r: Val = .{ .ty = rt_ty, .loc = rhs.loc };
             const want_q = tag == .div_trunc or tag == .div_floor or tag == .div_ceil;
             const adjust = tag == .div_ceil or (s and (tag == .div_floor or tag == .mod));
-            const q_name = if (s) "__divti3" else "__udivti3";
-            const r_name = if (s) "__modti3" else "__umodti3";
-            if (!adjust) return cg.rtCall("udivmod.zig", if (want_q) q_name else r_name, &.{ l, r }, rt_ty, dst);
-            const rem = if (want_q) Mem.at(.rbp, try cg.allocSlot(16, 16)) else dst;
-            try cg.rtCall("udivmod.zig", r_name, &.{ l, r }, rt_ty, rem);
-            if (want_q) try cg.rtCall("udivmod.zig", q_name, &.{ l, r }, rt_ty, dst);
+            const rem = if (want_q and adjust) Mem.at(.rbp, try cg.allocSlot(@as(u64, n) * 8, 16)) else dst;
+            if (n == 2) {
+                const rt_ty: Index = if (s) .i128_type else .u128_type;
+                const l: Val = .{ .ty = rt_ty, .loc = lhs.loc };
+                const r: Val = .{ .ty = rt_ty, .loc = rhs.loc };
+                const q_name = if (s) "__divti3" else "__udivti3";
+                const r_name = if (s) "__modti3" else "__umodti3";
+                if (adjust or !want_q) try cg.rtCall("udivmod.zig", r_name, &.{ l, r }, rt_ty, rem);
+                if (want_q) try cg.rtCall("udivmod.zig", q_name, &.{ l, r }, rt_ty, dst);
+            } else {
+                // `__udivei4(q, u, v, bits)` and friends work on integers of
+                // their ABI size in memory; the signed ones clobber u and v.
+                const file = if (s) "divmodei4.zig" else "udivmodei4.zig";
+                const q_name = if (s) "__divei4" else "__udivei4";
+                const r_name = if (s) "__modei4" else "__umodei4";
+                if (adjust or !want_q) try cg.divEi4(file, r_name, rem, lhs.loc.mem, rhs.loc.mem, ty);
+                if (want_q) try cg.divEi4(file, q_name, dst, lhs.loc.mem, rhs.loc.mem, ty);
+            }
+            if (!adjust) return;
             // Adjust when the remainder is non-zero and, for floor and mod,
             // its sign differs from the divisor's; for ceil, when the exact
             // quotient is positive.
             const done = try e.newLabel();
             try e.mov(.qword, .{ .reg = .rax }, .{ .mem = rem });
-            try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .mem = limb(rem, 1) });
+            for (1..n) |i| try e.alu(.@"or", .qword, .{ .reg = .rax }, .{ .mem = limb(rem, @intCast(i)) });
             try e.jcc(.e, .{ .label = done });
             if (s) {
-                try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(rem, 1) });
-                try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .mem = limb(rhs.loc.mem, 1) });
+                try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(rem, n - 1) });
+                try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .mem = limb(rhs.loc.mem, n - 1) });
                 try e.jcc(if (tag == .div_ceil) .s else .ns, .{ .label = done });
             }
             switch (tag) {
-                .div_floor, .div_ceil => {
-                    try e.alu(if (tag == .div_floor) .sub else .add, .qword, .{ .mem = dst }, .{ .imm = 1 });
-                    try e.alu(if (tag == .div_floor) .sbb else .adc, .qword, .{ .mem = limb(dst, 1) }, .{ .imm = 0 });
+                .div_floor, .div_ceil => for (0..n) |i| {
+                    try e.alu(if (tag == .div_floor)
+                        (if (i == 0) .sub else .sbb)
+                    else
+                        (if (i == 0) .add else .adc), .qword, .{ .mem = limb(dst, @intCast(i)) }, .{ .imm = @intFromBool(i == 0) });
                 },
-                else => {
-                    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = rhs.loc.mem });
-                    try e.alu(.add, .qword, .{ .mem = dst }, .{ .reg = .rax });
-                    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(rhs.loc.mem, 1) });
-                    try e.alu(.adc, .qword, .{ .mem = limb(dst, 1) }, .{ .reg = .rax });
+                else => for (0..n) |i| {
+                    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = limb(rhs.loc.mem, @intCast(i)) });
+                    try e.alu(if (i == 0) .add else .adc, .qword, .{ .mem = limb(dst, @intCast(i)) }, .{ .reg = .rax });
                 },
             }
             e.bind(done);
