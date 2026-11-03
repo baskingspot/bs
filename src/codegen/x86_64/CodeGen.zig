@@ -87,6 +87,9 @@ has_asm: bool = false,
 /// Overflow operations whose results only their `struct_field_val`s read
 /// (`Home.pair`), and those two values (or `Ssa.no_tie`).
 pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
+/// The condition under which the last overflow operation whose bit its
+/// block's branch reads from the flags (`Home.fused`) overflowed.
+ovf_cc: Encoder.Cond = .o,
 /// Scratch for `.auto` argument classification (`argScratch`).
 arg_tys: std.ArrayList(Index) = .empty,
 arg_locs: std.ArrayList(AutoArg) = .empty,
@@ -933,6 +936,20 @@ fn planRegisters(cg: *CodeGen) Error!void {
                             def[j] = def[i];
                         };
                         try cg.pairs.put(cg.gpa, i, fields);
+                        // A bit only the block's branch tests stays in the
+                        // flags, if nothing between sets them.
+                        const bit = fields[1];
+                        if (bit != Ssa.no_tie and uses[bit] == 1 and cond != null and uses[@backingInt(cond.?)] == 1 and
+                            cg.ovfBitCmp(cond.?, bit) != null and ovfFlagsOnly(tags[i], Type.intInfo(cg.ip, cg.typeOf(ir.extraData(Ir.Bin, datas[i].ty_pl.payload).data.lhs)).bits) and
+                            for (values[k + 1 ..]) |next| switch (tags[@backingInt(next)]) {
+                                .dbg_stmt, .block => {},
+                                .struct_field_val => if (ir.extraData(Ir.StructField, datas[@backingInt(next)].ty_pl.payload).data.operand != inst.toRef()) break false,
+                                else => if (next != cond.?) break false,
+                            } else true)
+                        {
+                            cg.homes[bit] = .fused;
+                            reg[bit] = Ssa.no_reg;
+                        }
                     }
                 },
                 else => {},
@@ -1150,6 +1167,10 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
     switch (tag) {
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+            if (data.bin_op.lhs.toIndex()) |bit| if (cg.homes[@backingInt(bit)] == .fused) {
+                // An overflow bit left in the flags.
+                return if (cg.ovfBitCmp(inst, @backingInt(bit)).?) cg.ovf_cc else cg.ovf_cc.negate();
+            };
             const s = cg.signed(cg.typeOf(data.bin_op.lhs));
             const rhs = try cg.srcOperand(data.bin_op.rhs, .rcx);
             const lhs = try cg.regOf(data.bin_op.lhs, .rax);
@@ -2111,8 +2132,69 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     const ty = cg.typeOf(bin.lhs);
     const pair = cg.homes[@backingInt(inst)] == .pair;
     const dst = if (pair) undefined else try cg.resultMem(inst, tuple_ty) orelse return;
-    const info = Type.intInfo(ip, ty);
+    const fields = if (pair) cg.pairs.get(@backingInt(inst)).? else .{ Ssa.no_tie, Ssa.no_tie };
+    const in_flags = fields[1] != Ssa.no_tie and cg.homes[fields[1]] == .fused;
+    if (try cg.overflowArith(tag, bin, ty)) |cc| {
+        if (in_flags) {
+            cg.ovf_cc = cc;
+        } else {
+            try cg.e.setcc(cc, .{ .reg = .r11 });
+            try cg.e.movzx(.qword, .r11, .byte, .{ .reg = .r11 });
+        }
+    } else assert(!in_flags);
+    // Only moves from here on, which keep the flags.
+    if (pair) {
+        if (fields[0] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[0]), ty, .rax);
+        if (fields[1] != Ssa.no_tie and !in_flags) try cg.setResult(@fromBackingInt(fields[1]), .u1_type, .r11);
+        return;
+    }
+    const size = Type.abiSize(ip, ty);
+    try cg.storeReg(dst, .rax, size);
+    try cg.storeReg(offsetMem(dst, Type.fieldOffset(ip, tuple_ty, 1)), .r11, 1);
+}
+
+/// Computes an overflow operation's result into rax, normalized, and
+/// returns the condition under which it overflowed, or null if it set
+/// the bit in r11 instead (a multiplication of 33 to 63 bits, which needs
+/// both the flag and a truncation check; `ovfFlagsOnly`). Native widths
+/// read the flag of an operation at that width; others check whether
+/// truncating the 64-bit result changes it.
+fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index) Error!?Encoder.Cond {
+    const info = Type.intInfo(cg.ip, ty);
     const s = info.signedness == .signed;
+    const native: ?Size = switch (info.bits) {
+        8 => .byte,
+        16 => .word,
+        32 => .dword,
+        64 => .qword,
+        else => null,
+    };
+    if (native) |size| if (tag != .mul_with_overflow or size != .byte) {
+        if (tag == .mul_with_overflow) {
+            const rhs = try cg.regOf(bin.rhs, .rcx);
+            try cg.load(.rax, bin.lhs);
+            if (s) {
+                try cg.e.imul(size, .rax, .{ .reg = rhs }, null);
+            } else {
+                try cg.e.unary(.mul, size, .{ .reg = rhs }); // writes rdx too
+            }
+        } else {
+            // A memory operand is 8 bytes, so only at 64 bits.
+            const rhs = try cg.srcOperand(bin.rhs, .rcx);
+            try cg.load(.rax, bin.lhs);
+            try cg.e.alu(if (tag == .add_with_overflow) .add else .sub, size, .{ .reg = .rax }, rhs);
+        }
+        // Extend without touching the flags; a 32-bit operation
+        // zero-extends already.
+        switch (size) {
+            .byte, .word => if (s) try cg.e.movsx(.qword, .rax, size, .{ .reg = .rax }) else try cg.e.movzx(.qword, .rax, size, .{ .reg = .rax }),
+            .dword => if (s) try cg.e.movsx(.qword, .rax, .dword, .{ .reg = .rax }),
+            .qword => {},
+        }
+        return if (s or tag == .mul_with_overflow) .o else .b;
+    };
+    // A 64-bit operation, which overflowed if truncating it to `bits`
+    // changes it.
     switch (tag) {
         .add_with_overflow, .sub_with_overflow => {
             const rhs = try cg.srcOperand(bin.rhs, .rcx);
@@ -2130,33 +2212,39 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
         },
         else => unreachable,
     }
-    // Flag from the 64-bit operation: only meaningful at 64 bits, or for
-    // multiplications wider than 32 bits whose product can exceed 64 bits.
-    const cpu_flag = info.bits == 64 or (tag == .mul_with_overflow and info.bits > 32);
-    if (cpu_flag) {
-        const cond: Encoder.Cond = if (s or tag == .mul_with_overflow) .o else .b;
-        try cg.e.setcc(cond, .{ .reg = .r11 });
+    const flag_too = !ovfFlagsOnly(tag, info.bits);
+    if (flag_too) {
+        // The product can exceed 64 bits too.
+        try cg.e.setcc(.o, .{ .reg = .r11 });
         try cg.e.movzx(.qword, .r11, .byte, .{ .reg = .r11 });
-    } else {
-        try cg.e.alu(.xor, .dword, .{ .reg = .r11 }, .{ .reg = .r11 });
     }
-    if (info.bits < 64) {
-        // Overflowed if truncating to `bits` changes the value.
-        try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rax });
-        try cg.normalize(.rax, ty);
-        try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
-        try cg.e.setcc(.ne, .{ .reg = .rdx });
-        try cg.e.alu(.@"or", .byte, .{ .reg = .r11 }, .{ .reg = .rdx });
-    }
-    if (pair) {
-        const fields = cg.pairs.get(@backingInt(inst)).?;
-        if (fields[0] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[0]), ty, .rax);
-        if (fields[1] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[1]), .u1_type, .r11);
-        return;
-    }
-    const size = Type.abiSize(ip, ty);
-    try cg.storeReg(dst, .rax, size);
-    try cg.storeReg(offsetMem(dst, Type.fieldOffset(ip, tuple_ty, 1)), .r11, 1);
+    try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rax });
+    try cg.normalize(.rax, ty);
+    try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
+    if (!flag_too) return .ne;
+    try cg.e.setcc(.ne, .{ .reg = .rdx });
+    try cg.e.alu(.@"or", .byte, .{ .reg = .r11 }, .{ .reg = .rdx });
+    return null;
+}
+
+/// Whether an overflow operation on integers of `bits` bits reports its
+/// overflow in one condition (`overflowArith`).
+fn ovfFlagsOnly(tag: Inst.Tag, bits: u16) bool {
+    return tag != .mul_with_overflow or bits <= 32 or bits == 64;
+}
+
+/// For compare `cmp` of overflow bit `bit` with a constant: whether the
+/// compare is true when the operation overflowed (`cmp_eq(bit, 1)`,
+/// `cmp_neq(bit, 0)`) or not; null for another compare.
+fn ovfBitCmp(cg: *CodeGen, cmp: Inst.Index, bit: u32) ?bool {
+    const ir = cg.ir;
+    const tag = ir.instructions.items(.tag)[@backingInt(cmp)];
+    if (tag != .cmp_eq and tag != .cmp_neq) return null;
+    const bin = ir.instructions.items(.data)[@backingInt(cmp)].bin_op;
+    const lhs = bin.lhs.toIndex() orelse return null;
+    if (@backingInt(lhs) != bit) return null;
+    const v = intBits(cg.ip, bin.rhs.toInterned() orelse return null);
+    return (tag == .cmp_eq) == (v == 1);
 }
 
 /// A compare and branch per case item; the else block follows.
