@@ -2027,7 +2027,10 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .struct_init_empty, .struct_init_empty_result, .struct_init_empty_ref_result => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             const result_ty = try sema.resolveType(block, src, data.un_node.operand);
-            if (tag != .struct_init_empty_ref_result) break :blk sema.structInitEmpty(block, src, result_ty);
+            if (tag != .struct_init_empty_ref_result) {
+                const base = sema.unwrapOptEu(result_ty);
+                break :blk sema.coerce(block, result_ty, try sema.structInitEmpty(block, src, base), src);
+            }
             const ptr_ty = sema.unwrapOptEu(result_ty);
             if (ptr_ty == .generic_poison_type or Type.class(sema.ip, ptr_ty) != .pointer) break :blk sema.analyzeRef(block, src, .fromInterned(.empty_tuple));
             const p = Type.ptrInfo(sema.ip, ptr_ty);
@@ -2057,7 +2060,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .struct_init_field_type => blk: {
             const extra = sema.code.extraData(Zir.Inst.FieldType, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const ty = try sema.resolveType(block, src, extra.container_type);
+            const ty = sema.unwrapOptEu(try sema.resolveType(block, src, extra.container_type));
             break :blk .fromInterned(try sema.fieldTypeByName(block, src, ty, sema.zirString(extra.name_start)));
         },
         .struct_init_field_ptr => blk: {
@@ -2085,7 +2088,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk .fromInterned(try sema.intern(.{ .array_type = .{ .len = extra.elem_count, .child = p.child, .sentinel = p.sentinel } }));
         },
         .array_init_elem_type => blk: {
-            const ty = try sema.resolveType(block, block.nodeSrc(.zero), data.bin.lhs);
+            const ty = sema.unwrapOptEu(try sema.resolveType(block, block.nodeSrc(.zero), data.bin.lhs));
             if (ty == .generic_poison_type) break :blk .fromInterned(.generic_poison_type);
             const idx: usize = @backingInt(data.bin.rhs);
             break :blk .fromInterned(switch (sema.ip.indexToKey(ty)) {
@@ -8528,15 +8531,13 @@ fn structInitEmpty(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError
 }
 
 fn zirStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
-    const ip = sema.ip;
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const src = block.nodeSrc(data.src_node);
     const extra = sema.code.extraData(Zir.Inst.StructInit, data.payload_index);
     const n = extra.data.fields_len;
     var i = extra.end;
     var ty: Index = .none;
-    const Item = struct { name: []const u8, init: Ref };
-    const items = try sema.arena.alloc(Item, n);
+    const items = try sema.arena.alloc(StructInitItem, n);
     for (items) |*item| {
         const e = sema.code.extraData(Zir.Inst.StructInit.Item, i);
         i = e.end;
@@ -8556,6 +8557,16 @@ fn zirStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
         }
         return sema.anonStructInit(block, inst, data.src_node, names, inits);
     }
+    // As upstream, a result type `?T` or `E!T` initializes a `T`.
+    const base = sema.unwrapOptEu(ty);
+    if (base != ty) return sema.coerce(block, ty, try sema.structInitTyped(block, src, base, items), src);
+    return sema.structInitTyped(block, src, ty, items);
+}
+
+const StructInitItem = struct { name: []const u8, init: Ref };
+
+fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []const StructInitItem) CompileError!Ref {
+    const ip = sema.ip;
     if (ip.indexToKey(ty) == .union_type) {
         if (items.len != 1) return sema.fail(block, src, "union initialization expects exactly one field", .{});
         const fi = try sema.unionFieldIndex(block, src, ty, items[0].name);
@@ -8682,7 +8693,6 @@ fn zirValidatePtrArrayInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
 }
 
 fn zirArrayInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
-    const ip = sema.ip;
     const tag = sema.code.instructions.items(.tag)[@backingInt(inst)];
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const src = block.nodeSrc(data.src_node);
@@ -8703,8 +8713,16 @@ fn zirArrayInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
         const ty = try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } });
         return sema.aggregate(block, src, ty, elems);
     }
+    // As upstream, a result type `?T` or `E!T` initializes a `T`.
+    if (sema.unwrapOptEu(result_ty) != result_ty) {
+        return sema.coerce(block, result_ty, try sema.arrayInitTyped(block, src, sema.unwrapOptEu(result_ty), args[1..]), src);
+    }
+    return sema.arrayInitTyped(block, src, result_ty, args[1..]);
+}
+
+fn arrayInitTyped(sema: *Sema, block: *Block, src: Src, result_ty: Index, inits: []const Zir.Inst.Ref) CompileError!Ref {
+    const ip = sema.ip;
     var ty = result_ty;
-    const inits = args[1..];
     switch (ip.indexToKey(ty)) {
         .array_type => |a| {
             if (a.len != inits.len) return sema.fail(block, src, "expected {d} array elements; found {d}", .{ a.len, inits.len });

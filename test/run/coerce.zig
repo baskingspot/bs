@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "4\nabcd\n7\n9\n0\nB\n3\n10\n3\n6\n8\n"
+//! stdout: "4\nabcd\n7\n9\n0\nB\n3\n10\n3\n6\n8\n44\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -68,6 +68,13 @@ fn main() callconv(.c) noreturn {
         : [ret] "={eax}" (-> u32),
     );
     rt.printInt(r);
+    // Initializers whose result type is optional or an error union.
+    var lo: u8 = 2;
+    _ = &lo;
+    var opt_arr: ?[2]u8 = .{ lo, 5 };
+    _ = &opt_arr;
+    const empty_opt: ?Range = .{ .lo = 1 };
+    rt.printInt(span(.{ .lo = lo, .hi = 9 }) + span(empty_opt) + (pairOrFail(false) catch unreachable).hi - opt_arr.?[1] + opt_arr.?[0] + 1);
     rt.exit(0);
 }
 
@@ -77,6 +84,14 @@ inline fn table(comptime n: usize) [n]u8 {
         for (&out, 0..) |*o, i| o.* = @intCast(i * 3);
         return out;
     }
+}
+const Range = struct { lo: u8, hi: u8 = 20 };
+fn span(r: ?Range) u8 {
+    return if (r) |v| v.hi - v.lo else 0;
+}
+fn pairOrFail(fail: bool) error{Bad}!Range {
+    if (fail) return error.Bad;
+    return .{ .lo = 3 };
 }
 fn widen(fail: bool) struct { ?error{ A, B }, u64 } {
     const narrow: struct { ?error{A}, usize } = .{ if (fail) error.A else null, 5 };
