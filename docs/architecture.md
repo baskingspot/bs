@@ -3008,6 +3008,91 @@ shuffles the work queue and adds random yields at claim points exposes
 order dependence, and ThreadSanitizer builds of zap check the shared
 state.
 
+## The command line and `zap build` (built 2026-11-03)
+
+- zap is a drop-in for `zig build-exe`, `build-obj`, `run`, `test` and
+  `build`. `main.parseOptions` sorts every option upstream accepts, and
+  every one upstream's build runner passes, into four classes:
+  implemented (`-M`/`--dep`, `--name`, `-femit-bin`, `--cache-dir`,
+  `-fsingle-threaded`, `-freference-trace`, `--listen=-`, ...); ignored,
+  because it changes nothing zap does (link layout, C-only settings,
+  settings zap always has: `-ODebug`, `-static`, `-fno-PIE`, ...);
+  unsupported, which makes the compile fail with an `[unsupported]`
+  diagnostic naming the option and the way out; and unknown, also
+  `[unsupported]`. Response files (`@file`, which the runner writes for
+  long command lines) are expanded where an option is expected.
+- **Backend flags.** zap builds only Debug, where upstream's choice of
+  backend changes nothing a program means. So `-fllvm`, `-flld` and their
+  `-fno-` forms are accepted without a word and zap compiles with its own
+  backend and linker. `builtin.zig_backend` is upstream's Debug default for
+  the target, whatever the flags say: `.stage2_x86_64` on x86_64-linux,
+  `.stage2_llvm` on aarch64-macos. Example: uucode's `build.zig` builds its
+  Unicode table generator with `.use_llvm = true` in Debug; under `zap
+  build` that step compiles with zap, and libvaxis needs no `-Dllvm=false`.
+  Release modes (`-O` other than Debug), C, C++ and assembly sources,
+  libc and system libraries, translate-c and `@cImport` stay
+  `[unsupported]`. zap never hands a step to upstream zig.
+- **`zap build`** (`src/BuildRunner.zig`) does what upstream's `zig build`
+  does, with zap as the compiler. It compiles upstream's build runner,
+  `<zig lib>/compiler/Maker.zig`, with zap (Debug) into
+  `<global cache>/zap/o/<hash>/maker`, the hash taken from zap's identity
+  (`Incremental.compilationKey`'s store seed) and the zig lib directory. A
+  generated root module re-exports the runner's `main` and `std_options`
+  with upstream's ReleaseSafe log level (`.info`; Debug's default would
+  print the runner's debug logs). The compile runs from that directory so
+  its key, which includes the working directory, is the same for every
+  project, and a build that changed nothing reuses it without relinking.
+  zap then replaces itself with `maker build --zig-lib=<lib> --zig=<zap>
+  --global-cache=<global> --seed=<random> <user args>`. The runner
+  compiles `build.zig` (with `configurer.zig`) and every compile step by
+  running zap with `--listen=-`.
+- **The compiler protocol** (`main.serve`, std's `std.zig.Server`): zap
+  sends `zig_version` and the step's `config` (static, no libc), then
+  answers each `update` with `file_system_inputs` (every file the build
+  read, as `PathPrefix` + sub path relative to the zig lib dir, local or
+  global cache, build root or working directory), then either
+  `emit_digest` (with `cache_hit` when nothing was compiled) and an empty
+  error bundle, or the errors as an error bundle. The output is
+  `<local cache>/o/<digest>/<name>`, where the runner looks for it; the
+  digest is `Incremental.outputDigest`, a salted hash of the compilation's
+  key without `--listen=-`. It does not change with edits, so an edited
+  build relinks in place, and when the output's stat is unchanged
+  (`Incremental.noteOutput`) a no-change build does not touch it, so the
+  runner's InstallArtifact sees nothing to copy. The output directory
+  belongs to the compilation's cache directory, which can recompute its
+  digest: trimming the compilation is to delete it too (cache owner, not
+  built yet; nothing scans `o/`, which upstream's outputs share).
+  zap also creates `<local cache>/tmp`, which upstream's compiler creates
+  and the runner writes into.
+- **Errors over the protocol** travel as std's `ErrorBundle`, built by
+  `diag.toBundle` from zap's diagnostic records, and the runner renders
+  them in upstream's format: the message is prefixed with the code
+  (`[type-mismatch] ...`), notes keep their source lines, call frames are
+  notes worded as upstream's ("called inline here"), and the reference
+  trace keeps upstream's limit (`-freference-trace=n`, else two frames for
+  the first error that has a trace) and its hidden-frame count. A step zap
+  cannot build answers every update with one `[unsupported]` error, so the
+  runner reports it as that step's failure and builds the rest; commands
+  zap does not implement (`build-lib`, `translate-c`, `cc`, ...) are
+  served the same way. Without `--listen=-`, zap renders with its own
+  renderer (`--error-format`).
+- **Not yet:** `--watch` and long-lived sessions. Each `update` compiles as
+  a CLI build does, through the on-disk cache; the serve loop already
+  handles repeated updates, so `--watch` needs only the updates to reuse
+  the in-memory state. `zig build --watch` panics on Linux older than 6.5
+  (bench/README.md) before that matters here.
+- Measured (2026-11-03, orb, zap ReleaseFast, bench.py vaxis `zig-build`,
+  details in bench/README.md): first build of a project with the runner
+  cached 2.37 s (upstream 6.51 s), edit 139–144 ms (1.19–1.20 s), no edit
+  38 ms (24 ms: the Debug runner is slower than upstream's ReleaseSafe
+  one); the build.zig compile 0.69 s first, 1.7 ms unchanged, 0.21 s
+  after an edit (upstream 1.2 s, 6.7 ms, 1.2 s). Compiling the runner is
+  once per zap binary, about 3 s (upstream: once per global cache, 75 s
+  with LLVM). zap's own repository builds with `zap build`, and
+  `zap build test` passes the same 169 steps and 47 of 48 unit tests (1
+  skipped) as `zig build test`; its oracle steps find upstream zig on
+  PATH when the build's compiler is not a zig release.
+
 ## `builtin` and conformance
 
 - zap generates the `builtin` module itself. It reports

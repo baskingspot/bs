@@ -92,24 +92,7 @@ replay: ?*Replay = null,
 /// `zig_lib_dir` is the std that compilation uses.
 pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, target: []const u8, timing: bool) !Incremental {
     const build_start = Io.Clock.real.now(io);
-    // The compiler's identity: a rebuilt zap must not reuse what an older
-    // one cached. The ctime too, which only the kernel sets: a different
-    // zap copied over this file in place, keeping its inode, with the same
-    // size and its mtime restored (`cp` then `touch -d`, `rsync
-    // --inplace -t`), matches on the other three.
-    const exe = try std.process.openExecutable(io, .{});
-    const exe_stat = exe.stat(io);
-    exe.close(io);
-    const st = try exe_stat;
-    var id: std.ArrayList(u8) = .empty;
-    defer id.deinit(gpa);
-    try id.print(gpa, "zap\x00{d}\x00{d}\x00{d}\x00{d}\x00{s}\x00", .{ st.inode, st.size, st.mtime.toNanoseconds(), st.ctime.toNanoseconds(), target });
-    const store_seed = cache.hash(0, id.items);
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    try id.print(gpa, "{s}\x00{s}\x00", .{ cwd, zig_lib_dir });
-    for (args) |a| try id.print(gpa, "{s}\x00", .{a});
-    const key = cache.hash(1, id.items);
+    const store_seed, const key = try compilationKey(gpa, io, args, zig_lib_dir, target);
 
     const local = try Io.Dir.cwd().createDirPathOpen(io, dirs.local, .{});
     errdefer local.close(io);
@@ -135,6 +118,39 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         break :prev null;
     };
     return inc;
+}
+
+/// The store seed (the compiler's identity and the target) and the key of
+/// the compilation that `args` describes from the current directory (see
+/// `open`).
+pub fn compilationKey(gpa: Allocator, io: Io, args: []const []const u8, zig_lib_dir: []const u8, target: []const u8) !struct { Hash, Hash } {
+    // The compiler's identity: a rebuilt zap must not reuse what an older
+    // one cached. The ctime too, which only the kernel sets: a different
+    // zap copied over this file in place, keeping its inode, with the same
+    // size and its mtime restored (`cp` then `touch -d`, `rsync
+    // --inplace -t`), matches on the other three.
+    const exe = try std.process.openExecutable(io, .{});
+    const exe_stat = exe.stat(io);
+    exe.close(io);
+    const st = try exe_stat;
+    var id: std.ArrayList(u8) = .empty;
+    defer id.deinit(gpa);
+    try id.print(gpa, "zap\x00{d}\x00{d}\x00{d}\x00{d}\x00{s}\x00", .{ st.inode, st.size, st.mtime.toNanoseconds(), st.ctime.toNanoseconds(), target });
+    const store_seed = cache.hash(0, id.items);
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    try id.print(gpa, "{s}\x00{s}\x00", .{ cwd, zig_lib_dir });
+    for (args) |a| try id.print(gpa, "{s}\x00", .{a});
+    return .{ store_seed, cache.hash(1, id.items) };
+}
+
+/// The digest naming a `--listen=-` compilation's output directory,
+/// `<local cache>/o/<32 hex digits>` (std's `emit_digest`), from the
+/// compilation's key: it stays the same across edits, so the output is
+/// relinked in place, and the compilation's directory can find it.
+/// Salted apart from upstream's digests, which share `o/`.
+pub fn outputDigest(key: Hash) [16]u8 {
+    return @bitCast(cache.hash(0x7a61702d6f7574, std.mem.asBytes(&key)));
 }
 
 pub fn close(inc: *Incremental) void {

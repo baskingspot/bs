@@ -302,6 +302,63 @@ fn bundleLoc(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorBundle
     };
 }
 
+/// Adds `diags` to `wip` as root messages, for the compiler protocol
+/// (`--listen=-`), whose client renders them in upstream's format: the
+/// code prefixes the message (`[type-mismatch] ...`), each call frame is
+/// a note worded as upstream's, and the reference trace keeps upstream's
+/// limit: `ref_limit` frames (`-freference-trace=n`), else 2 for the first
+/// error that has a trace and none for the rest, then a frame counting the
+/// hidden ones.
+pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_limit: ?u32) !void {
+    var traced = false;
+    for (diags) |d| {
+        const limit: u32 = if (d.refs.len == 0) 0 else ref_limit orelse if (traced) 0 else 2;
+        if (d.refs.len != 0) traced = true;
+        const shown = @min(limit, d.refs.len);
+        const hidden = d.refs.len - shown;
+        const msg = if (d.code == .unclassified)
+            try wip.addString(d.msg)
+        else
+            try wip.printString("[{t}] {s}", .{ d.code, d.msg });
+        // Frames without a location cannot be shown; they count as hidden.
+        var refs: std.ArrayList(std.zig.ErrorBundle.ReferenceTrace) = .empty;
+        defer refs.deinit(wip.gpa);
+        for (d.refs[0..shown]) |r| {
+            const l = r.loc orelse continue;
+            try refs.append(wip.gpa, .{ .decl_name = try wip.addString(r.name), .src_loc = try bundleSrcLoc(wip, l, 0) });
+        }
+        const n_hidden: u32 = @intCast(hidden + (shown - refs.items.len));
+        if (limit != 0 and n_hidden != 0) try refs.append(wip.gpa, .{ .decl_name = n_hidden, .src_loc = .none });
+        const src_loc: std.zig.ErrorBundle.SourceLocationIndex = if (d.loc) |l| try bundleSrcLoc(wip, l, @intCast(refs.items.len)) else .none;
+        // The trace trails the message's source location.
+        if (d.loc != null) for (refs.items) |r| try wip.addReferenceTrace(r);
+        try wip.addRootErrorMessage(.{ .msg = msg, .count = d.count, .src_loc = src_loc, .notes_len = @intCast(d.notes.len) });
+        const notes_start = try wip.reserveNotes(@intCast(d.notes.len));
+        for (d.notes, notes_start..) |n, i| {
+            const note_msg = if (n.call) |kind| try wip.addString(switch (kind) {
+                .@"inline" => "called inline here",
+                .@"comptime" => "called at comptime here",
+            }) else try wip.addString(n.msg);
+            const note_loc: std.zig.ErrorBundle.SourceLocationIndex = if (n.loc) |l| try bundleSrcLoc(wip, l, 0) else .none;
+            const index = try wip.addErrorMessage(.{ .msg = note_msg, .count = n.count, .src_loc = note_loc });
+            wip.extra.items[i] = @backingInt(index);
+        }
+    }
+}
+
+fn bundleSrcLoc(wip: *std.zig.ErrorBundle.Wip, l: Loc, reference_trace_len: u32) !std.zig.ErrorBundle.SourceLocationIndex {
+    return wip.addSourceLocation(.{
+        .src_path = try wip.addString(l.path),
+        .line = l.line -| 1,
+        .column = l.col -| 1,
+        .span_start = l.start,
+        .span_main = l.main,
+        .span_end = l.end,
+        .source_line = if (l.source_line.len != 0) try wip.addString(l.source_line) else 0,
+        .reference_trace_len = reference_trace_len,
+    });
+}
+
 pub fn render(w: *Writer, diags: []const Diagnostic, format: Format) Writer.Error!void {
     switch (format) {
         .text => {

@@ -93,6 +93,9 @@ embed_files: std.StringArrayHashMapUnmanaged(EmbedFile) = .empty,
 rt_helpers: std.StringArrayHashMapUnmanaged(void) = .empty,
 /// `zap test`: collect the main module's tests into `builtin.test_functions`.
 is_test: bool = false,
+/// `-fsingle-threaded`: `threadlocal` variables are ordinary globals, as
+/// upstream (std's start code sets up no thread pointer then).
+single_threaded: bool = false,
 /// `zap test --test-filter`: keep only named tests whose fqn contains one.
 test_filters: []const []const u8 = &.{},
 /// Test declarations to run, in discovery order.
@@ -629,7 +632,7 @@ pub fn createContainerType(
             .is_pub = d.is_pub,
             .linkage = d.linkage,
             .is_const = d.kind != .@"var",
-            .is_threadlocal = d.is_threadlocal,
+            .is_threadlocal = d.is_threadlocal and !zcu.single_threaded,
         });
         switch (d.kind) {
             .@"const", .@"var" => {

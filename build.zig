@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
     addRunTests(b, exe, test_step, upstream_step);
     addObjAndRunTests(b, exe, test_step);
     addDiagTests(b, exe, test_step, upstream_step);
+    addBuildTest(b, exe);
 
     // Always ReleaseFast: a Debug build of zap says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
@@ -184,7 +185,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
 
         for ([_]bool{ false, true }) |upstream| {
             const compile = if (upstream) blk: {
-                const r = b.addSystemCommand(&.{ b.graph.zig_exe, "build-exe", "-fno-llvm", "-fno-lld" });
+                const r = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-llvm", "-fno-lld" });
                 r.addFileArg(b.path(src_path));
                 break :blk r;
             } else if (expect.rebuild_without.items.len != 0 or expect.lib_edit != null) blk: {
@@ -323,7 +324,7 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&run.step);
 
-        const up = b.addSystemCommand(&.{ b.graph.zig_exe, "build-exe", "-fno-emit-bin" });
+        const up = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-emit-bin" });
         up.setName(b.fmt("diag {s} (upstream rejects)", .{file}));
         up.addFileArg(b.path(src_path));
         up.addCheck(.{ .expect_stderr_match = "error: " });
@@ -343,7 +344,7 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     obj.addArg("build-obj");
     obj.addFileArg(b.path("test/obj/lib.zig"));
     const lib_o = obj.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
-    const exe = b.addSystemCommand(&.{ b.graph.zig_exe, "build-exe", "-fno-llvm", "-fno-lld" });
+    const exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-llvm", "-fno-lld" });
     exe.addFileArg(b.path("test/obj/main.zig"));
     exe.addFileArg(lib_o);
     const bin = exe.addPrefixedOutputFileArg("-femit-bin=", "main");
@@ -375,9 +376,38 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     test_step.dependOn(&zap_run.step);
 }
 
+/// `zap build` end to end: test/build/check.sh builds test/build/hello
+/// with zap as the build runner's compiler, in the default global cache,
+/// where zap keeps the build runner it compiles once per zap binary.
+fn addBuildTest(b: *std.Build, zap: *std.Build.Step.Compile) void {
+    const host = b.graph.host.result;
+    const step = b.step("test-build", "Check `zap build` end to end on test/build/hello");
+    if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
+    const run = b.addSystemCommand(&.{"sh"});
+    run.setName("zap build test/build/hello");
+    run.addFileArg(b.path("test/build/check.sh"));
+    run.addArtifactArg(zap);
+    run.addDirectoryArg(b.path("test/build/hello"));
+    _ = run.addOutputDirectoryArg("work");
+    run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    step.dependOn(&run.step);
+}
+
 fn defaultZigLibDir(b: *std.Build) []const u8 {
     const io = b.graph.io;
-    const zig_exe = std.Io.Dir.cwd().realPathFileAlloc(io, b.graph.zig_exe, b.allocator) catch |err|
-        std.debug.panic("unable to resolve zig executable path '{s}': {t}", .{ b.graph.zig_exe, err });
+    const zig = upstreamZig(b);
+    const zig_exe = std.Io.Dir.cwd().realPathFileAlloc(io, zig, b.allocator) catch |err|
+        std.debug.panic("unable to resolve zig executable path '{s}': {t}", .{ zig, err });
     return b.pathJoin(&.{ std.fs.path.dirname(zig_exe).?, "lib" });
+}
+
+/// Upstream zig, the oracle the tests compare zap with: the zig running
+/// this build, or under `zap build` (no zig release next to the
+/// compiler) `zig` on PATH.
+fn upstreamZig(b: *std.Build) []const u8 {
+    const io = b.graph.io;
+    const zig_exe = b.graph.zig_exe;
+    const real = std.Io.Dir.cwd().realPathFileAlloc(io, zig_exe, b.allocator) catch zig_exe;
+    if (std.Io.Dir.cwd().access(io, b.pathJoin(&.{ std.fs.path.dirname(real) orelse ".", "lib", "std", "std.zig" }), .{})) |_| return zig_exe else |_| {}
+    return b.findProgram(.{ .names = &.{"zig"} }) orelse std.debug.panic("'{s}' is not upstream zig, and no zig is on PATH", .{zig_exe});
 }

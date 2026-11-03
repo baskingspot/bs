@@ -14,6 +14,7 @@ pub const OutputMode = enum { Exe, Obj };
 pub const Options = struct {
     output_mode: OutputMode,
     is_test: bool,
+    single_threaded: bool = false,
 };
 
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
@@ -27,7 +28,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const link_mode: std.lang.LinkMode = .static;
     \\pub const unwind_tables: std.lang.UnwindTables = .async;
     \\pub const is_test = {s};
-    \\pub const single_threaded = false;
+    \\pub const single_threaded = {s};
     \\/// Deprecated; to be removed in 0.18.0. Use `target.abi` instead.
     \\pub const abi: std.Target.Abi = .none;
     \\/// Deprecated; to be removed in 0.18.0. Use `target.cpu` instead.
@@ -100,7 +101,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const omit_frame_pointer = false;
     \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
     \\
-    , .{ @tagName(opts.output_mode), if (opts.is_test) "true" else "false" });
+    , .{ @tagName(opts.output_mode), if (opts.is_test) "true" else "false", if (opts.single_threaded) "true" else "false" });
 }
 
 /// Writes the generated source to `<cache_dir>/builtin/<content hash>/builtin.zig`

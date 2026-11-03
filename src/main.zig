@@ -18,6 +18,7 @@ const usage =
     \\zap is a fast Debug-mode compiler for Zig 0.17.0.
     \\
     \\Commands:
+    \\  build            Build project from build.zig
     \\  build-exe        Create executable from source
     \\  build-obj        Create object from source
     \\  run              Create executable and run immediately
@@ -40,6 +41,9 @@ pub const Options = struct {
     /// `--cache-dir` and `--global-cache-dir`.
     cache_dir: ?[]const u8 = null,
     global_cache_dir: ?[]const u8 = null,
+    /// `--build-root`: the project's directory, for the paths of the
+    /// inputs a `--listen=-` build reports.
+    build_root: ?[]const u8 = null,
     /// Arguments after `--` for `zap run`.
     run_args: []const []const u8 = &.{},
     /// `zap test` only: the test runner's root source file (`--test-runner`).
@@ -56,16 +60,41 @@ pub const Options = struct {
     /// `--stack`: the main thread's stack size in bytes, which std's start
     /// code sets from PT_GNU_STACK; upstream's default is 16 MiB.
     stack_size: u64 = 16 * 1024 * 1024,
+    /// `-fsingle-threaded`.
+    single_threaded: bool = false,
+    /// `--listen=-`: serve std's compiler protocol on stdin and stdout
+    /// (`zig build`'s compile steps) instead of compiling once.
+    listen: bool = false,
+    /// `-freference-trace[=n]`: the reference trace frames of each error
+    /// under `--listen=-` (`diag.toBundle`); 0 for `-fno-reference-trace`.
+    reference_trace: ?u32 = null,
+    /// Why zap cannot build what the options ask for (a release mode, C
+    /// sources, LLVM), as a diagnostic's message: the first such option.
+    unsupported: ?[]const u8 = null,
     root_deps: []const []const u8 = &.{},
     modules: []const Frontend.ModuleArg = &.{},
 };
 
+/// Commands of upstream's CLI that `zig build` runs and zap does not
+/// implement, so that they fail with a diagnostic, over the compiler
+/// protocol when asked to.
+const unsupported_commands: std.StaticStringMap([]const u8) = .initComptime(.{
+    .{ "build-lib", "zap does not build libraries yet ('build-lib'); build this step with upstream zig" },
+    .{ "test-obj", "zap does not build test objects yet ('test-obj'); build this step with upstream zig" },
+    .{ "translate-c", "zap does not translate C ('translate-c', '@cImport'); build this step with upstream zig" },
+    .{ "cc", "zap does not compile C ('cc'); build this step with upstream zig" },
+    .{ "c++", "zap does not compile C++ ('c++'); build this step with upstream zig" },
+    .{ "objcopy", "zap does not implement 'objcopy'; run this step with upstream zig" },
+    .{ "fmt", "zap does not implement 'fmt'; run this step with upstream zig" },
+});
+
 pub fn main(init: std.process.Init) !void {
-    var stages: Stages = .{ .io = init.io, .last = .now(init.io, .awake) };
     const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 2) fatalUsage();
-    const cmd = args[1];
+    const raw_args = try init.minimal.args.toSlice(arena);
+    if (raw_args.len < 2) fatalUsage();
+    const cmd = raw_args[1];
+    if (std.mem.eql(u8, cmd, "build")) return @import("BuildRunner.zig").run(init, raw_args[2..]);
+    const args = raw_args;
     const command: Command = if (std.mem.eql(u8, cmd, "build-exe"))
         .build_exe
     else if (std.mem.eql(u8, cmd, "build-obj"))
@@ -80,168 +109,50 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         try Io.File.stdout().writeStreamingAll(init.io, usage);
         return;
+    } else if (unsupported_commands.get(cmd)) |msg| {
+        const listen = for (args[2..]) |a| {
+            if (std.mem.eql(u8, a, "--listen=-")) break true;
+        } else false;
+        const d: []const diag.Diagnostic = &.{.{ .code = .unsupported, .loc = null, .msg = msg }};
+        if (listen) return serveFailure(init, d, .Exe);
+        printDiagnostics(init.io, d, .text) catch {};
+        std.process.exit(1);
     } else fatal("unknown command: {s}", .{cmd});
 
-    const opts = try parseOptions(arena, command, args[2..]);
-    const zig_lib_dir = opts.zig_lib_dir orelse init.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir;
-    // Only the x86_64-linux backend exists so far; refuse aarch64-macos
-    // rather than silently writing an x86_64 ELF.
-    const native_ok = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
-    const target = opts.target orelse "native";
-    if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none") or
-        (std.mem.eql(u8, target, "native") and native_ok))
-    {} else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none") or
-        std.mem.eql(u8, target, "native"))
-    {
-        fatal("target '{s}': aarch64-macos code generation is not implemented yet; pass -target x86_64-linux", .{target});
-    } else fatal("unsupported target '{s}'; zap supports x86_64-linux and aarch64-macos", .{target});
-
-    const cache_dirs = Frontend.resolveCacheDirs(arena, init.io, init.environ_map, .{
-        .local = opts.cache_dir,
-        .global = opts.global_cache_dir,
-        .local_is_global = command == .run,
-    });
-    const is_test = command == .@"test";
-    const builtin_dir = try Builtin.writeToCache(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), .{
-        .output_mode = if (command == .build_obj) .Obj else .Exe,
-        .is_test = is_test,
-    });
-    // The on-disk cache: a build whose inputs did not change relinks the
-    // last build's Atoms and skips everything else.
-    const run_test = is_test and !opts.test_no_exec;
-    const stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path);
-    // The command line that describes the compilation: `zap run`'s
-    // arguments after `--` are the program's.
-    const compile_args = args[1 .. args.len - opts.run_args.len];
-    const out_path: ?[]const u8 = switch (opts.emit_bin) {
-        .none => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else if (command == .run) fatal("'zap run' needs a binary to run; remove -fno-emit-bin", .{}) else null,
-        .path => |p| p,
-        .default => if (run_test)
-            try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem)
-        else if (command == .run)
-            try runBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), compile_args, zig_lib_dir, stem)
-        else if (command == .build_obj)
-            try std.fmt.allocPrint(arena, "{s}.o", .{stem})
-        else
-            stem,
-    };
-    if (run_test or (command == .run and opts.emit_bin == .default)) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
-    // build-obj does not use the cache yet: a relink would also need the
-    // object's exports and imports in the manifest.
-    const use_cache = out_path != null and !opts.dump_ir and command != .build_obj and
-        !std.mem.eql(u8, init.environ_map.get("ZAP_CACHE") orelse "", "off");
-    // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
-    var inc: ?Incremental = if (use_cache) Incremental.open(init.gpa, init.io, cache_dirs, compile_args, zig_lib_dir, "x86_64-linux", init.environ_map.get("ZAP_CACHE_TIMING") != null) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => no_cache: {
-            std.log.warn("unable to use the cache: {t}", .{err});
-            break :no_cache null;
-        },
-    } else null;
-    defer if (inc) |*i| i.close();
-    if (inc) |*i| i.check = init.environ_map.get("ZAP_CACHE_CHECK") != null;
-    if (inc) |*i| i.stack_size = opts.stack_size;
-    if (inc) |*i| i.renew_output = command == .run;
-    if (inc) |*i| if (init.environ_map.get("ZAP_CACHE_VERIFY")) |v| {
-        i.verify = if (std.mem.eql(u8, v, "full")) .full else .replay;
-        i.verify_argv = args;
-        i.verify_environ = init.environ_map;
-    };
-    if (inc) |*i| if (init.environ_map.get("ZAP_CACHE_MAX_SIZE")) |v| {
-        i.max_bytes = @import("cache.zig").parseSize(v) orelse fatal("invalid ZAP_CACHE_MAX_SIZE '{s}': expected bytes, or a number and K, M, G, or T", .{v});
-    };
-    stages.on = init.environ_map.get("ZAP_TIMING") != null;
-    if (inc) |*i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
-        if (run_test) try runTest(init, out_path.?, opts.emit_bin != .path);
-        if (command == .run) {
-            i.close();
-            inc = null;
-            runExe(init, out_path.?, opts.run_args);
-        }
-        return;
-    };
-
-    const test_runner = opts.test_runner orelse try std.fs.path.join(arena, &.{ zig_lib_dir, "compiler", "test_runner.zig" });
-    var fe: Frontend = try .init(init.gpa, init.io, zig_lib_dir, .{
-        .root_src_path = if (is_test) test_runner else opts.root_src_path,
-        .builtin_dir = builtin_dir,
-        .main_src_path = if (is_test) opts.root_src_path else null,
-        .root_deps = opts.root_deps,
-        .modules = opts.modules,
-    });
-    defer fe.deinit();
-    try fe.enableCache(cache_dirs);
-    var errors: std.zig.ErrorBundle.Wip = try .init(init.gpa);
-    defer errors.deinit();
-    stages.mark("setup and cache check");
-    const ok = try fe.loadAll(&errors);
-    stages.mark("frontend");
-    if (init.environ_map.get("ZAP_FRONTEND_TIMING") != null) fe.printStats();
-    var bundle = try errors.toOwnedBundle("");
-    defer bundle.deinit(init.gpa);
-    if (bundle.errorMessageCount() > 0) {
-        var diags: std.ArrayList(diag.Diagnostic) = .empty;
-        const paths: diag.Paths = try .init(arena, init.io, zig_lib_dir);
-        try diag.fromBundle(arena, paths, bundle, &diags);
-        try printDiagnostics(init.io, diags.items, opts.error_format);
+    const opts = try parseOptions(arena, init.io, command, args[2..]);
+    if (opts.listen) return serve(init, args, opts);
+    if (opts.unsupported) |msg| {
+        printDiagnostics(init.io, &.{.{ .code = .unsupported, .loc = null, .msg = msg }}, opts.error_format) catch {};
         std.process.exit(1);
     }
-    std.debug.assert(ok);
 
-    var zcu: Zcu = try .init(init.gpa, init.io, &fe);
-    defer zcu.deinit();
-    zcu.is_test = is_test;
-    zcu.test_filters = opts.test_filters;
-    // `ZAP_COMPTIME_EVAL=n`: lower a function for the comptime evaluator
-    // after n walker runs (0: never), for testing it.
-    if (init.environ_map.get("ZAP_COMPTIME_EVAL")) |v| zcu.comptime_eval_threshold = std.fmt.parseInt(u32, v, 10) catch 0;
-    // `ZAP_UNIT_TIMING=n`: print the n units whose analysis took longest,
-    // not counting the units each analyzed in turn.
-    if (init.environ_map.get("ZAP_UNIT_TIMING")) |v| zcu.unit_timing = .{ .top = std.fmt.parseInt(u32, v, 10) catch 20 };
-    if (inc) |*i| try i.seedErrors(&zcu);
-    if (opts.dump_ir) {
-        var stdout_buf: [4096]u8 = undefined;
-        var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buf);
-        var sink: DumpSink = .{ .w = &stdout.interface };
-        try zcu.analyzeAll(&sink);
-        try stdout.interface.flush();
-        exitOnErrors(init, &zcu, opts.error_format);
-        return;
-    }
-    var emit: Emit = .init(init.gpa, &zcu);
-    defer emit.deinit();
-    emit.obj = command == .build_obj;
-    emit.stack_size = opts.stack_size;
-    // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
-    // n more times (`zig build bench-codegen`).
-    const bench_runs: u32 = if (init.environ_map.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
-    if (bench_runs != 0) emit.bench_irs = .empty;
-    if (inc) |*i| try i.beginReplay(&fe, &zcu, &emit, std.mem.eql(u8, init.environ_map.get("ZAP_CACHE_REPLAY") orelse "", "off"));
-    try zcu.analyzeAll(&emit);
-    if (bench_runs != 0) try emit.benchCodegen(bench_runs);
-    stages.markSplit("sema", "codegen", emit.codegen_ns);
-    zcu.printUnitTiming();
-    if (is_test) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {},
+    const job = try Job.init(init, args, opts);
+    // The command line that describes the compilation: `zap run`'s
+    // arguments after `--` are the program's.
+    const run_test = job.run_test;
+    const out_path: ?[]const u8 = switch (opts.emit_bin) {
+        .none => if (run_test) try testBinPath(arena, init.io, job.zapLocal(arena), job.stem) else if (command == .run) fatal("'zap run' needs a binary to run; remove -fno-emit-bin", .{}) else null,
+        .path => |p| p,
+        .default => if (run_test)
+            try testBinPath(arena, init.io, job.zapLocal(arena), job.stem)
+        else if (command == .run)
+            try runBinPath(arena, init.io, job.zapLocal(arena), job.compile_args, job.zig_lib_dir, job.stem)
+        else if (command == .build_obj)
+            try std.fmt.allocPrint(arena, "{s}.o", .{job.stem})
+        else
+            job.stem,
     };
-    exitOnErrors(init, &zcu, opts.error_format);
-    const bin_path = out_path orelse return;
-    const ready = try emit.finish();
-    stages.mark("emit");
-    exitOnErrors(init, &zcu, opts.error_format);
-    if (!ready) std.process.exit(1);
-    // The cache records the build while it links, and keeps the record
-    // only if the link succeeds.
-    if (inc) |*i| i.startRecord(&fe, &zcu, &emit);
-    const linked = try emit.link(init.io, Io.Dir.cwd(), bin_path);
-    stages.mark("link");
-    if (inc) |*i| i.finishRecord(linked);
-    if (linked) if (inc) |*i| i.noteOutput(Io.Dir.cwd(), bin_path);
-    stages.mark("cache record (after the link)");
-    stages.print();
-    if (stages.on) emit.codegen_stats.print("zap: codegen");
-    if (!linked) std.process.exit(1);
+    if (run_test or (command == .run and opts.emit_bin == .default)) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
+    var inc = job.openCache(out_path);
+    defer if (inc) |*i| i.close();
+    switch (try compile(init, &job, if (inc) |*i| i else null, out_path, .none, null)) {
+        .ok => {},
+        .errors => |diags| {
+            printDiagnostics(init.io, diags, opts.error_format) catch {};
+            std.process.exit(1);
+        },
+        .failed => std.process.exit(1),
+    }
     if (run_test) try runTest(init, out_path.?, opts.emit_bin != .path);
     if (command == .run) {
         // Releases the cache's lock: the program inherits nothing of zap.
@@ -249,6 +160,442 @@ pub fn main(init: std.process.Init) !void {
         inc = null;
         runExe(init, out_path.?, opts.run_args);
     }
+}
+
+/// What one compilation needs besides its output path, resolved from the
+/// options.
+pub const Job = struct {
+    opts: Options,
+    zig_lib_dir: []const u8,
+    cache_dirs: Frontend.CacheDirs,
+    builtin_dir: []const u8,
+    /// The command line that keys the compilation in the cache.
+    compile_args: []const []const u8,
+    stem: []const u8,
+    run_test: bool,
+    environ_map: *std.process.Environ.Map,
+    full_args: []const []const u8,
+    io: Io,
+    gpa: std.mem.Allocator,
+
+    pub fn init(init_: std.process.Init, args: []const []const u8, opts: Options) !Job {
+        const arena = init_.arena.allocator();
+        const zig_lib_dir = opts.zig_lib_dir orelse init_.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir;
+        const command = opts.command;
+        const cache_dirs = Frontend.resolveCacheDirs(arena, init_.io, init_.environ_map, .{
+            .local = opts.cache_dir,
+            .global = opts.global_cache_dir,
+            .local_is_global = command == .run,
+        });
+        const is_test = command == .@"test";
+        const builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), .{
+            .output_mode = if (command == .build_obj) .Obj else .Exe,
+            .is_test = is_test,
+            .single_threaded = opts.single_threaded,
+        });
+        // `--listen=-` does not change what is built, so it is not part
+        // of the compilation's key (nor of its output's digest).
+        var compile_args: std.ArrayList([]const u8) = .empty;
+        for (args[1 .. args.len - opts.run_args.len]) |a| {
+            if (!std.mem.eql(u8, a, "--listen=-")) try compile_args.append(arena, a);
+        }
+        return .{
+            .opts = opts,
+            .zig_lib_dir = zig_lib_dir,
+            .cache_dirs = cache_dirs,
+            .builtin_dir = builtin_dir,
+            .compile_args = compile_args.items,
+            .stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path),
+            .run_test = is_test and !opts.test_no_exec and !opts.listen,
+            .environ_map = init_.environ_map,
+            .full_args = args,
+            .io = init_.io,
+            .gpa = init_.gpa,
+        };
+    }
+
+    fn zapLocal(job: *const Job, arena: std.mem.Allocator) []const u8 {
+        return std.fs.path.join(arena, &.{ job.cache_dirs.local, "zap" }) catch fatal("out of memory", .{});
+    }
+
+    /// Opens the on-disk cache for a build into `out_path`: a build whose
+    /// inputs did not change relinks the last build's Atoms and skips
+    /// everything else.
+    pub fn openCache(job: *const Job, out_path: ?[]const u8) ?Incremental {
+        const env = job.environ_map;
+        // build-obj does not use the cache yet: a relink would also need the
+        // object's exports and imports in the manifest.
+        const use_cache = out_path != null and !job.opts.dump_ir and job.opts.command != .build_obj and
+            !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
+        if (!use_cache) return null;
+        // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
+        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, "x86_64-linux", env.get("ZAP_CACHE_TIMING") != null) catch |err| {
+            std.log.warn("unable to use the cache: {t}", .{err});
+            return null;
+        };
+        i.check = env.get("ZAP_CACHE_CHECK") != null;
+        i.stack_size = job.opts.stack_size;
+        // `zap run`'s program counts as used when it runs (`renew_output`);
+        // other outputs keep the stat the last link left, so that the next
+        // build can skip the link.
+        i.renew_output = job.opts.command == .run;
+        if (env.get("ZAP_CACHE_VERIFY")) |v| {
+            i.verify = if (std.mem.eql(u8, v, "full")) .full else .replay;
+            i.verify_argv = job.full_args;
+            i.verify_environ = env;
+        }
+        if (env.get("ZAP_CACHE_MAX_SIZE")) |v| {
+            i.max_bytes = @import("cache.zig").parseSize(v) orelse fatal("invalid ZAP_CACHE_MAX_SIZE '{s}': expected bytes, or a number and K, M, G, or T", .{v});
+        }
+        return i;
+    }
+};
+
+pub const Outcome = union(enum) {
+    /// `cache_hit`: the inputs had not changed and the output was relinked
+    /// from the cache.
+    ok: struct { cache_hit: bool },
+    errors: []const diag.Diagnostic,
+    /// Reported on stderr already (a failed link).
+    failed,
+};
+
+/// Compiles `job` into `out_path` (nothing for null), with `inc` as the
+/// cache. `inputs`, if given, gets every source file the build read, as
+/// absolute paths separated by zero bytes.
+pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8)) !Outcome {
+    const arena = init.arena.allocator();
+    const opts = job.opts;
+    const env = init.environ_map;
+    var stages: Stages = .{ .io = init.io, .last = .now(init.io, .awake) };
+    stages.on = env.get("ZAP_TIMING") != null;
+    if (inc_opt) |i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
+        if (inputs) |list| if (i.prev) |*m| for (0..m.inputCount()) |n| {
+            _, const path = m.input(@intCast(n));
+            try appendInput(arena, list, path);
+        };
+        return .{ .ok = .{ .cache_hit = true } };
+    };
+
+    const is_test = opts.command == .@"test";
+    const test_runner = opts.test_runner orelse try std.fs.path.join(arena, &.{ job.zig_lib_dir, "compiler", "test_runner.zig" });
+    const fe_node = prog.start("Load Sources", 0);
+    var fe: Frontend = try .init(init.gpa, init.io, job.zig_lib_dir, .{
+        .root_src_path = if (is_test) test_runner else opts.root_src_path,
+        .builtin_dir = job.builtin_dir,
+        .main_src_path = if (is_test) opts.root_src_path else null,
+        .root_deps = opts.root_deps,
+        .modules = opts.modules,
+    });
+    defer fe.deinit();
+    try fe.enableCache(job.cache_dirs);
+    var errors: std.zig.ErrorBundle.Wip = try .init(init.gpa);
+    defer errors.deinit();
+    stages.mark("setup and cache check");
+    const ok = try fe.loadAll(&errors);
+    stages.mark("frontend");
+    fe_node.end();
+    if (env.get("ZAP_FRONTEND_TIMING") != null) fe.printStats();
+    var path_buf: std.ArrayList(u8) = .empty;
+    if (inputs) |list| for (fe.files.items) |*f| {
+        try Incremental.inputPath(arena, &path_buf, &fe, f.module, f.sub_path);
+        try appendInput(arena, list, path_buf.items);
+    };
+    var bundle = try errors.toOwnedBundle("");
+    defer bundle.deinit(init.gpa);
+    const paths: diag.Paths = try .init(arena, init.io, job.zig_lib_dir);
+    if (bundle.errorMessageCount() > 0) {
+        var diags: std.ArrayList(diag.Diagnostic) = .empty;
+        try diag.fromBundle(arena, paths, bundle, &diags);
+        return .{ .errors = try dupeDiagnostics(arena, diags.items) };
+    }
+    std.debug.assert(ok);
+
+    var zcu: Zcu = try .init(init.gpa, init.io, &fe);
+    defer zcu.deinit();
+    defer if (inputs) |list| for (zcu.embed_files.values()) |f| {
+        Incremental.inputPath(arena, &path_buf, &fe, f.module, f.sub_path) catch {};
+        appendInput(arena, list, path_buf.items) catch {};
+    };
+    zcu.is_test = is_test;
+    zcu.single_threaded = opts.single_threaded;
+    zcu.test_filters = opts.test_filters;
+    // `ZAP_COMPTIME_EVAL=n`: lower a function for the comptime evaluator
+    // after n walker runs (0: never), for testing it.
+    if (env.get("ZAP_COMPTIME_EVAL")) |v| zcu.comptime_eval_threshold = std.fmt.parseInt(u32, v, 10) catch 0;
+    // `ZAP_UNIT_TIMING=n`: print the n units whose analysis took longest,
+    // not counting the units each analyzed in turn.
+    if (env.get("ZAP_UNIT_TIMING")) |v| zcu.unit_timing = .{ .top = std.fmt.parseInt(u32, v, 10) catch 20 };
+    if (inc_opt) |i| try i.seedErrors(&zcu);
+    if (opts.dump_ir) {
+        var stdout_buf: [4096]u8 = undefined;
+        var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buf);
+        var sink: DumpSink = .{ .w = &stdout.interface };
+        try zcu.analyzeAll(&sink);
+        try stdout.interface.flush();
+        if (zcu.errors.items.len != 0) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
+        return .{ .ok = .{ .cache_hit = false } };
+    }
+    var emit: Emit = .init(init.gpa, &zcu);
+    defer emit.deinit();
+    emit.obj = opts.command == .build_obj;
+    emit.stack_size = opts.stack_size;
+    // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
+    // n more times (`zig build bench-codegen`).
+    const bench_runs: u32 = if (env.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
+    if (bench_runs != 0) emit.bench_irs = .empty;
+    const sema_node = prog.start("Analyze and Generate Code", 0);
+    if (inc_opt) |i| try i.beginReplay(&fe, &zcu, &emit, std.mem.eql(u8, env.get("ZAP_CACHE_REPLAY") orelse "", "off"));
+    try zcu.analyzeAll(&emit);
+    if (bench_runs != 0) try emit.benchCodegen(bench_runs);
+    stages.markSplit("sema", "codegen", emit.codegen_ns);
+    sema_node.end();
+    zcu.printUnitTiming();
+    if (is_test) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    };
+    if (zcu.errors.items.len != 0) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
+    const bin_path = out_path orelse return .{ .ok = .{ .cache_hit = false } };
+    const link_node = prog.start("Link", 0);
+    defer link_node.end();
+    const ready = try emit.finish();
+    stages.mark("emit");
+    if (zcu.errors.items.len != 0) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
+    if (!ready) return .failed;
+    // The cache records the build while it links, and keeps the record
+    // only if the link succeeds.
+    if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
+    const linked = try emit.link(init.io, Io.Dir.cwd(), bin_path);
+    stages.mark("link");
+    if (inc_opt) |i| i.finishRecord(linked);
+    if (linked) if (inc_opt) |i| i.noteOutput(Io.Dir.cwd(), bin_path);
+    stages.mark("cache record (after the link)");
+    stages.print();
+    if (stages.on) emit.codegen_stats.print("zap: codegen");
+    if (!linked) return .failed;
+    return .{ .ok = .{ .cache_hit = false } };
+}
+
+/// `diags` with their strings copied to `arena`: they point into the Zcu
+/// and the Frontend's sources, which `compile` frees before it returns.
+fn dupeDiagnostics(arena: std.mem.Allocator, diags: []const diag.Diagnostic) ![]const diag.Diagnostic {
+    const S = struct {
+        fn loc(a: std.mem.Allocator, l: ?diag.Loc) !?diag.Loc {
+            var c = l orelse return null;
+            c.path = try a.dupe(u8, c.path);
+            c.source_line = try a.dupe(u8, c.source_line);
+            return c;
+        }
+    };
+    const out = try arena.dupe(diag.Diagnostic, diags);
+    for (out) |*d| {
+        d.msg = try arena.dupe(u8, d.msg);
+        d.loc = try S.loc(arena, d.loc);
+        const notes = try arena.dupe(diag.Note, d.notes);
+        for (notes) |*n| {
+            n.msg = try arena.dupe(u8, n.msg);
+            n.loc = try S.loc(arena, n.loc);
+        }
+        d.notes = notes;
+        const refs = try arena.dupe(diag.Ref, d.refs);
+        for (refs) |*r| {
+            r.name = try arena.dupe(u8, r.name);
+            r.loc = try S.loc(arena, r.loc);
+        }
+        d.refs = refs;
+    }
+    return out;
+}
+
+fn appendInput(arena: std.mem.Allocator, list: *std.ArrayList(u8), path: []const u8) !void {
+    if (list.items.len != 0) try list.append(arena, 0);
+    try list.appendSlice(arena, path);
+}
+
+// ---------------------------------------------------------------------------
+// The compiler protocol (`--listen=-`)
+
+/// Serves std's compiler protocol (std/zig/Server.zig) on stdin and stdout,
+/// as upstream's `--listen=-`: `zig build`'s compile steps send `update`
+/// and then `exit`. Each update builds into `<local cache>/o/<digest>/`
+/// and answers with the inputs it read, then either the errors or the
+/// digest; errors travel as an ErrorBundle (`diag.toBundle`).
+fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    var in_buf: [256]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var in = Io.File.stdin().readerStreaming(io, &in_buf);
+    var out = Io.File.stdout().writerStreaming(io, &out_buf);
+    var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
+    try server.serveStringMessage(.zig_version, zig_version);
+    try server.serveConfig(.{ .flags = .{
+        .output_mode = if (opts.command == .build_obj) .Obj else .Exe,
+        .link_mode = .static,
+        .link_libc = false,
+        .link_libcpp = false,
+        .link_libunwind = false,
+        .pie = false,
+    } });
+
+    const job: ?Job = if (opts.unsupported == null) try .init(init, args, opts) else null;
+    // The output goes where the build runner looks for it:
+    // `<local cache>/o/<hex digest>/<binary name>`.
+    var digest: [16]u8 = undefined;
+    var out_path: ?[]const u8 = null;
+    if (job) |*j| {
+        _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, "x86_64-linux");
+        digest = Incremental.outputDigest(key);
+        const name = if (opts.command == .build_obj) try std.fmt.allocPrint(arena, "{s}.o", .{j.stem}) else j.stem;
+        out_path = switch (opts.emit_bin) {
+            .none => null,
+            .path => |p| p,
+            .default => try std.fs.path.join(arena, &.{ j.cache_dirs.local, "o", &std.fmt.bytesToHex(digest, .lower), name }),
+        };
+        if (opts.emit_bin == .default) try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(out_path.?).?);
+        // Upstream's compiler creates the local cache's `tmp`, where the
+        // build runner then writes the configuration without creating it.
+        try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ j.cache_dirs.local, "tmp" }));
+    }
+    const root_node = std.Progress.start(io, .{});
+    defer root_node.end();
+
+    while (true) {
+        const hdr = server.receiveMessage() catch |err| switch (err) {
+            error.EndOfStream => return cleanExit(io),
+            else => |e| return e,
+        };
+        switch (hdr.tag) {
+            .exit => return cleanExit(io),
+            .update => {
+                try server.in.discardAll(hdr.bytes_len);
+                const j = if (job) |*j| j else {
+                    try serveErrors(&server, init.gpa, &.{.{ .code = .unsupported, .loc = null, .msg = opts.unsupported.? }}, null);
+                    continue;
+                };
+                var inputs: std.ArrayList(u8) = .empty;
+                var inc = j.openCache(out_path);
+                defer if (inc) |*i| i.close();
+                const outcome = try compile(init, j, if (inc) |*i| i else null, out_path, root_node, &inputs);
+                if (inputs.items.len != 0) {
+                    const prefixed = try prefixInputs(arena, io, inputs.items, j);
+                    try server.serveStringMessage(.file_system_inputs, prefixed);
+                }
+                switch (outcome) {
+                    .ok => |r| {
+                        if (out_path != null) try server.serveEmitDigest(&digest, .{ .flags = .{ .cache_hit = r.cache_hit } });
+                        try server.serveErrorBundle(.error_bundle, .empty);
+                    },
+                    .errors => |diags| try serveErrors(&server, init.gpa, diags, opts.reference_trace),
+                    .failed => try serveErrors(&server, init.gpa, &.{.{ .loc = null, .msg = "the link failed; its error is on zap's stderr" }}, null),
+                }
+            },
+            else => fatal("unrecognized message from client: 0x{x}", .{@backingInt(hdr.tag)}),
+        }
+    }
+}
+
+/// Answers every update with `diags`, for a command zap does not
+/// implement.
+fn serveFailure(init: std.process.Init, diags: []const diag.Diagnostic, output_mode: std.lang.OutputMode) !void {
+    const io = init.io;
+    var in_buf: [256]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var in = Io.File.stdin().readerStreaming(io, &in_buf);
+    var out = Io.File.stdout().writerStreaming(io, &out_buf);
+    var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
+    try server.serveStringMessage(.zig_version, zig_version);
+    try server.serveConfig(.{ .flags = .{ .output_mode = output_mode, .link_mode = .static, .link_libc = false, .link_libcpp = false, .link_libunwind = false, .pie = false } });
+    while (true) {
+        const hdr = server.receiveMessage() catch |err| switch (err) {
+            error.EndOfStream => return cleanExit(io),
+            else => |e| return e,
+        };
+        switch (hdr.tag) {
+            .exit => return cleanExit(io),
+            .update => {
+                try server.in.discardAll(hdr.bytes_len);
+                try serveErrors(&server, init.gpa, diags, null);
+            },
+            else => fatal("unrecognized message from client: 0x{x}", .{@backingInt(hdr.tag)}),
+        }
+    }
+}
+
+fn serveErrors(server: *std.zig.Server, gpa: std.mem.Allocator, diags: []const diag.Diagnostic, ref_limit: ?u32) !void {
+    var wip: std.zig.ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    try diag.toBundle(&wip, diags, ref_limit);
+    var bundle = try wip.toOwnedBundle("");
+    defer bundle.deinit(gpa);
+    try server.serveErrorBundle(.error_bundle, bundle);
+}
+
+/// The `file_system_inputs` message body: each absolute path relative to
+/// the first of the build runner's cache prefixes that contains it (zig
+/// lib, local cache, global cache, build root; else the working
+/// directory), as one prefix byte (`PathPrefix` + 1) and the sub path,
+/// separated by zero bytes.
+fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: *const Job) ![]const u8 {
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const Prefix = std.zig.Server.Message.PathPrefix;
+    const Root = struct { prefix: Prefix, path: []const u8 };
+    var roots: std.ArrayList(Root) = .empty;
+    try roots.append(arena, .{ .prefix = .zig_lib, .path = try std.fs.path.resolve(arena, &.{ cwd, job.zig_lib_dir }) });
+    try roots.append(arena, .{ .prefix = .local_cache, .path = try std.fs.path.resolve(arena, &.{ cwd, job.cache_dirs.local }) });
+    try roots.append(arena, .{ .prefix = .global_cache, .path = try std.fs.path.resolve(arena, &.{ cwd, job.cache_dirs.global }) });
+    if (job.opts.build_root) |br| try roots.append(arena, .{ .prefix = .build_root, .path = try std.fs.path.resolve(arena, &.{ cwd, br }) });
+    try roots.append(arena, .{ .prefix = .cwd, .path = cwd });
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, inputs, 0);
+    while (it.next()) |raw| {
+        const abs = try std.fs.path.resolve(arena, &.{ cwd, raw });
+        if (out.items.len != 0) try out.append(arena, 0);
+        for (roots.items) |r| {
+            if (abs.len > r.path.len and std.mem.startsWith(u8, abs, r.path) and abs[r.path.len] == '/') {
+                try out.append(arena, @backingInt(r.prefix) + 1);
+                try out.appendSlice(arena, abs[r.path.len + 1 ..]);
+                break;
+            }
+        } else {
+            try out.append(arena, @backingInt(Prefix.cwd) + 1);
+            try out.appendSlice(arena, abs);
+        }
+    }
+    return out.items;
+}
+
+fn cleanExit(io: Io) void {
+    _ = io;
+    std.process.exit(0);
+}
+
+/// The arguments a response file lists (`@file`, as upstream reads the
+/// ones `zig build` writes for long command lines): whitespace-separated,
+/// double-quoted with `\` escapes.
+fn readResponseFile(arena: std.mem.Allocator, io: Io, path: []const u8) ![]const []const u8 {
+    const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 30)) catch |err| fatal("unable to read response file '{s}': {t}", .{ path, err });
+    var out: std.ArrayList([]const u8) = .empty;
+    var k: usize = 0;
+    while (true) {
+        while (k < text.len and std.ascii.isWhitespace(text[k])) k += 1;
+        if (k == text.len) break;
+        var arg: std.ArrayList(u8) = .empty;
+        var quoted = false;
+        while (k < text.len and (quoted or !std.ascii.isWhitespace(text[k]))) : (k += 1) {
+            switch (text[k]) {
+                '"' => quoted = !quoted,
+                '\\' => if (k + 1 < text.len) {
+                    k += 1;
+                    try arg.append(arena, text[k]);
+                },
+                else => |c| try arg.append(arena, c),
+            }
+        }
+        try out.append(arena, arg.items);
+    }
+    return out.items;
 }
 
 /// Replaces zap with the program at `path`, as upstream's `zig run` does,
@@ -337,19 +684,7 @@ const Stages = struct {
     }
 };
 
-fn exitOnErrors(init: std.process.Init, zcu: *Zcu, format: diag.Format) void {
-    if (zcu.errors.items.len == 0) return;
-    renderErrors(init, zcu, format) catch {};
-    std.process.exit(1);
-}
-
-fn renderErrors(init: std.process.Init, zcu: *Zcu, format: diag.Format) !void {
-    const arena = init.arena.allocator();
-    const paths: diag.Paths = try .init(arena, init.io, zcu.fe.zig_lib_dir);
-    try printDiagnostics(init.io, try zcu.diagnostics(arena, paths), format);
-}
-
-fn printDiagnostics(io: Io, diags: []const diag.Diagnostic, format: diag.Format) !void {
+pub fn printDiagnostics(io: Io, diags: []const diag.Diagnostic, format: diag.Format) !void {
     var buf: [4096]u8 = undefined;
     var w = Io.File.stderr().writerStreaming(io, &buf);
     try diag.render(&w.interface, diags, format);
@@ -364,16 +699,102 @@ const DumpSink = struct {
     }
 };
 
-fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []const u8) !Options {
+/// Options that upstream accepts and that change nothing zap does: link
+/// layout, C-only settings, and settings zap already has.
+const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
+    // zap builds only Debug, where the backend is a preference that
+    // changes nothing a program means: zap uses its own backend and
+    // linker, and `builtin.zig_backend` stays upstream's Debug default for
+    // the target (docs/architecture.md, "The command line and `zap
+    // build`").
+    .{"-fllvm"},                           .{"-flld"},
+    .{"-fno-llvm"},                        .{"-fno-lld"},                  .{"-fnew-linker"},          .{"-fno-new-linker"},
+    .{"-fallow-so-scripts"},               .{"-fno-allow-so-scripts"},     .{"-fentry"},               .{"-fno-strip"},
+    .{"-fstack-check"},                    .{"-fno-stack-check"},          .{"-fstack-protector"},     .{"-fno-stack-protector"},
+    .{"-fno-omit-frame-pointer"},          .{"-ferror-tracing"},           .{"-fno-sanitize-thread"},  .{"-fno-fuzz"},
+    .{"-fvalgrind"},                       .{"-fno-PIC"},                  .{"-fno-PIE"},              .{"-fbuiltin"},
+    .{"-fno-builtin"},                     .{"-mred-zone"},                .{"-mno-red-zone"},         .{"-fno-sanitize-c"},
+    .{"-fsanitize-c=trap"},                .{"-fsanitize-c=full"},         .{"-fsanitize-c"},          .{"-gdwarf32"},
+    .{"-gdwarf64"},                        .{"-fasync-unwind-tables"},     .{"-ODebug"},               .{"-Odebug"},
+    .{"-static"},                          .{"--no-dynamic-linker"},       .{"--debug-compile-errors"}, .{"--debug-incremental"},
+    .{"--verbose-air"},                    .{"--verbose-llvm-ir"},         .{"--verbose-link"},        .{"--verbose-cc"},
+    .{"--verbose-llvm-cpu-features"},      .{"--time-report"},             .{"-fformatted-panics"},    .{"-fno-formatted-panics"},
+    .{"--eh-frame-hdr"},                   .{"--emit-relocs"},             .{"-ffunction-sections"},   .{"-fdata-sections"},
+    .{"--gc-sections"},                    .{"--no-gc-sections"},          .{"--no-dynamicbase"},      .{"-fallow-shlib-undefined"},
+    .{"-fno-allow-shlib-undefined"},       .{"-headerpad_max_install_names"}, .{"-dead_strip_dylibs"}, .{"-ObjC"},
+    .{"--discard-all"},                    .{"-fcompiler-rt"},             .{"-fno-compiler-rt"},      .{"-fubsan-rt"},
+    .{"-fno-ubsan-rt"},                    .{"-fdll-export-fns"},          .{"-fno-dll-export-fns"},   .{"-rdynamic"},
+    .{"--undefined-version"},              .{"--no-undefined-version"},    .{"--enable-new-dtags"},    .{"--disable-new-dtags"},
+    .{"-feach-lib-rpath"},                 .{"-fno-each-lib-rpath"},       .{"-fno-lto"},              .{"-fno-sanitize-coverage-trace-pc-guard"},
+    .{"-fincremental"},                    .{"-fno-incremental"},          .{"--debug-rt"},            .{"-femit-bin"},
+    .{"-search_paths_first"},              .{"-search_paths_first_static"}, .{"-search_dylibs_first"}, .{"-search_static_first"},
+    .{"-search_dylibs_only"},              .{"-search_static_only"},       .{"--compress-debug-sections=none"},
+});
+
+/// Ignored options that take a parameter.
+const ignored_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
+    .{"-I"},        .{"-isystem"},      .{"-iquote"},  .{"-idirafter"},   .{"-iframework"}, .{"-iframeworkwithsysroot"},
+    .{"-L"},        .{"-rpath"},        .{"--libc"},   .{"--sysroot"},    .{"--error-limit"}, .{"--debug-log"},
+    .{"--dynamic-linker"}, .{"-z"},     .{"--image-base"},
+});
+
+/// Options that ask for something zap does not do, as the diagnostic's
+/// message.
+const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
+    .{ "-fno-entry", "zap does not build executables without an entry point yet ('-fno-entry')" },
+    .{ "-fstrip", "zap does not strip debug info yet ('-fstrip'); remove '.strip = true'" },
+    .{ "-fomit-frame-pointer", "zap always keeps frame pointers ('-fomit-frame-pointer'); remove '.omit_frame_pointer = true'" },
+    .{ "-fno-error-tracing", "zap always has error return traces ('-fno-error-tracing'); remove '.error_tracing = false'" },
+    .{ "-fsanitize-thread", "zap has no ThreadSanitizer ('-fsanitize-thread'); build this step with upstream zig" },
+    .{ "-ffuzz", "zap does not build fuzz tests ('-ffuzz'); build this step with upstream zig" },
+    .{ "-fno-valgrind", "zap always emits Valgrind client requests ('-fno-valgrind'); remove '.valgrind = false'" },
+    .{ "-fPIC", "zap does not emit position-independent code ('-fPIC'); build this step with upstream zig" },
+    .{ "-fPIE", "zap does not emit position-independent executables ('-fPIE'); remove '.pie = true'" },
+    .{ "-funwind-tables", "zap only emits asynchronous unwind tables ('-funwind-tables')" },
+    .{ "-fno-unwind-tables", "zap only emits asynchronous unwind tables ('-fno-unwind-tables')" },
+    .{ "-dynamic", "zap links executables statically ('-dynamic'); build this step with upstream zig" },
+    .{ "-femit-asm", "zap does not emit assembly ('-femit-asm')" },
+    .{ "-femit-docs", "zap does not emit documentation ('-femit-docs'); build docs with upstream zig" },
+    .{ "-femit-implib", "zap does not emit import libraries ('-femit-implib')" },
+    .{ "-femit-llvm-bc", "zap has no LLVM backend ('-femit-llvm-bc')" },
+    .{ "-femit-llvm-ir", "zap has no LLVM backend ('-femit-llvm-ir')" },
+    .{ "-femit-h", "zap does not emit C headers ('-femit-h')" },
+    .{ "-fsanitize-coverage-trace-pc-guard", "zap does not instrument coverage ('-fsanitize-coverage-trace-pc-guard')" },
+    .{ "-cflags", "zap does not compile C sources ('-cflags'); build this step with upstream zig" },
+    .{ "-rcflags", "zap does not compile Windows resources ('-rcflags')" },
+    .{ "-x", "zap does not compile C sources ('-x'); build this step with upstream zig" },
+    .{ "--force_undefined", "zap does not support '--force_undefined' yet" },
+    .{ "-mcmodel", "zap only supports the default code model ('-mcmodel')" },
+    .{ "--script", "zap does not support linker scripts ('--script'); build this step with upstream zig" },
+    .{ "--version-script", "zap does not support version scripts ('--version-script')" },
+    .{ "--version", "zap does not build shared libraries ('--version')" },
+    .{ "-framework", "zap does not link frameworks yet ('-framework')" },
+    .{ "-needed_framework", "zap does not link frameworks yet ('-needed_framework')" },
+    .{ "-weak_framework", "zap does not link frameworks yet ('-weak_framework')" },
+    .{ "--subsystem", "zap does not target Windows ('--subsystem')" },
+    .{ "-municode", "zap does not target Windows ('-municode')" },
+});
+
+fn setUnsupported(opts: *Options, arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+    if (opts.unsupported == null) opts.unsupported = std.fmt.allocPrint(arena, fmt, args) catch fatal("out of memory", .{});
+}
+
+pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in: []const []const u8) !Options {
+    var args = args_in;
     var root: ?[]const u8 = null;
     var opts: Options = .{ .command = command, .root_src_path = undefined };
     var test_filters: std.ArrayList([]const u8) = .empty;
     var deps: std.ArrayList([]const u8) = .empty;
     var modules: std.ArrayList(Frontend.ModuleArg) = .empty;
     var i: usize = 0;
-    while (i < args.len) : (i += 1) {
+    while (i < args.len) : (i +%= 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--")) {
+        if (arg.len > 1 and arg[0] == '@') {
+            // Its arguments take its place.
+            args = try std.mem.concat(arena, []const u8, &.{ try readResponseFile(arena, io, arg[1..]), args[i + 1 ..] });
+            i = std.math.maxInt(usize);
+            continue;
+        } else if (std.mem.eql(u8, arg, "--")) {
             if (command != .run) fatal("unexpected '--' outside of 'zap run'", .{});
             opts.run_args = args[i + 1 ..];
             break;
@@ -385,12 +806,34 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
             opts.name = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "-target")) {
             opts.target = nextArg(args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "-mcpu")) {
+            const cpu = nextArg(args, &i, arg);
+            // zap generates code for the baseline x86_64 CPU, for native too.
+            if (!std.mem.eql(u8, cpu, "baseline") and !std.mem.eql(u8, cpu, "native") and !std.mem.eql(u8, cpu, "x86_64"))
+                setUnsupported(&opts, arena, "zap generates code for the baseline CPU only ('-mcpu {s}')", .{cpu});
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
             opts.cache_dir = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--global-cache-dir")) {
             opts.global_cache_dir = nextArg(args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--build-root")) {
+            opts.build_root = nextArg(args, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--listen=-")) {
+            opts.listen = true;
+        } else if (std.mem.startsWith(u8, arg, "--listen")) {
+            fatal("zap only listens on stdin and stdout ('--listen=-'), found '{s}'", .{arg});
+        } else if (std.mem.eql(u8, arg, "-fsingle-threaded")) {
+            opts.single_threaded = true;
+        } else if (std.mem.eql(u8, arg, "-fno-single-threaded")) {
+            opts.single_threaded = false;
+        } else if (std.mem.eql(u8, arg, "-freference-trace")) {
+            opts.reference_trace = 256;
+        } else if (std.mem.startsWith(u8, arg, "-freference-trace=")) {
+            const v = arg["-freference-trace=".len..];
+            opts.reference_trace = std.fmt.parseUnsigned(u32, v, 10) catch fatal("unable to parse reference_trace count '{s}'", .{v});
+        } else if (std.mem.eql(u8, arg, "-fno-reference-trace")) {
+            opts.reference_trace = 0;
         } else if (std.mem.eql(u8, arg, "--test-runner")) {
             opts.test_runner = nextTestArg(command, args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--test-filter")) {
@@ -402,7 +845,12 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
             try deps.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "-M")) {
             const spec = arg[2..];
-            const eq = std.mem.indexOfScalar(u8, spec, '=') orelse fatal("expected -Mname=path, found '{s}'", .{arg});
+            const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
+                // A module without a root source file holds C sources or
+                // link objects.
+                setUnsupported(&opts, arena, "zap does not build modules without a Zig root source file ('{s}'); build this step with upstream zig", .{arg});
+                continue;
+            };
             if (root == null) {
                 root = spec[eq + 1 ..];
                 opts.root_deps = try deps.toOwnedSlice(arena);
@@ -415,14 +863,35 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
         } else if (std.mem.eql(u8, arg, "--stack")) {
             const v = nextArg(args, &i, arg);
             opts.stack_size = std.fmt.parseUnsigned(u64, v, 0) catch fatal("invalid stack size: '{s}'", .{v});
-        } else if (std.mem.eql(u8, arg, "-fno-sanitize-thread")) {
-            // zap never builds with ThreadSanitizer.
-        } else if (std.mem.eql(u8, arg, "-ODebug") or std.mem.eql(u8, arg, "-Odebug")) {
-            // The only mode zap supports.
+        } else if (ignored_flags.has(arg)) {
+            // Changes nothing zap does.
+        } else if (ignored_flags_with_arg.has(arg)) {
+            _ = nextArg(args, &i, arg);
+        } else if (std.mem.startsWith(u8, arg, "-D") or std.mem.startsWith(u8, arg, "--build-id")) {
+            // A C macro; the build ID of a linked binary.
+        } else if (std.mem.startsWith(u8, arg, "-ofmt=")) {
+            if (!std.mem.eql(u8, arg, "-ofmt=elf")) setUnsupported(&opts, arena, "zap emits ELF on Linux only ('{s}')", .{arg});
         } else if (std.mem.startsWith(u8, arg, "-O")) {
-            fatal("zap only supports Debug builds; use upstream zig for '{s}'", .{arg});
+            setUnsupported(&opts, arena, "zap builds only Debug ('{s}'); drop the release mode (-Doptimize, --release) or build this step with upstream zig", .{arg});
+        } else if (std.mem.eql(u8, arg, "-lc") or std.mem.eql(u8, arg, "-lc++") or std.mem.startsWith(u8, arg, "-l") or
+            std.mem.startsWith(u8, arg, "-needed-l") or std.mem.startsWith(u8, arg, "-weak-l"))
+        {
+            setUnsupported(&opts, arena, "zap does not link libc or system libraries ('{s}'); build this step with upstream zig", .{arg});
+        } else if (unsupported_flags.get(arg)) |msg| {
+            setUnsupported(&opts, arena, "{s}", .{msg});
+        } else if (std.mem.startsWith(u8, arg, "-flto") or std.mem.startsWith(u8, arg, "-fentry=") or
+            std.mem.startsWith(u8, arg, "--export=") or std.mem.startsWith(u8, arg, "-fpatchable-function-entry=") or
+            std.mem.startsWith(u8, arg, "--compress-debug-sections="))
+        {
+            setUnsupported(&opts, arena, "zap does not support '{s}' yet", .{arg});
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            fatal("unsupported option: {s}", .{arg});
+            setUnsupported(&opts, arena, "zap does not support the option '{s}'", .{arg});
+        } else if (!std.mem.endsWith(u8, arg, ".zig")) {
+            const ext = std.fs.path.extension(arg);
+            if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib"))
+                setUnsupported(&opts, arena, "zap does not link object files or libraries ('{s}'); build this step with upstream zig", .{arg})
+            else
+                setUnsupported(&opts, arena, "zap does not compile C, C++, or assembly sources ('{s}'); build this step with upstream zig", .{arg});
         } else if (root == null) {
             root = arg;
             opts.root_deps = try deps.toOwnedSlice(arena);
@@ -430,10 +899,25 @@ fn parseOptions(arena: std.mem.Allocator, command: Command, args: []const []cons
             fatal("unexpected extra parameter: {s}", .{arg});
         }
     }
-    opts.root_src_path = root orelse fatal("expected a root source file", .{});
+    if (opts.target) |target| checkTarget(&opts, arena, target) else if (!(builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux))
+        setUnsupported(&opts, arena, "zap does not implement aarch64-macos code generation yet ('native'); pass -target x86_64-linux", .{});
+    opts.root_src_path = root orelse if (opts.unsupported != null) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
     opts.modules = modules.items;
     return opts;
+}
+
+/// Only the x86_64-linux backend exists so far; refuses aarch64-macos
+/// rather than silently writing an x86_64 ELF.
+fn checkTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8) void {
+    const native_ok = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
+    if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none") or
+        (std.mem.eql(u8, target, "native") and native_ok))
+    {} else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none") or
+        std.mem.eql(u8, target, "native"))
+    {
+        setUnsupported(opts, arena, "zap does not implement aarch64-macos code generation yet ('{s}'); pass -target x86_64-linux", .{target});
+    } else setUnsupported(opts, arena, "zap does not support the target '{s}'; it supports x86_64-linux and aarch64-macos", .{target});
 }
 
 fn nextTestArg(command: Command, args: []const []const u8, i: *usize, flag: []const u8) []const u8 {
