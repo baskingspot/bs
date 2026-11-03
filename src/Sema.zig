@@ -2258,21 +2258,20 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             const operand = sema.resolveInst(data.un_node.operand);
             const ty = sema.typeOf(operand);
-            // An optional pointer is its pointer, 0 for null.
-            if (Type.class(sema.ip, ty) == .optional and Type.optionalReprIsPtr(sema.ip, Type.childType(sema.ip, ty))) {
-                if (sema.resolveValue(operand)) |v| if (!sema.isUndef(v)) {
-                    const o = sema.ip.indexToKey(v).opt;
-                    if (o.val == .none) break :blk .fromInterned(try sema.intValue(.usize_type, 0));
-                    const pk = sema.ip.indexToKey(o.val).ptr;
-                    if (pk.base == .int) break :blk .fromInterned(try sema.intValue(.usize_type, pk.byte_offset));
+            // As upstream, a pointer or an optional pointer, not a slice.
+            const ptr_ty = if (Type.class(sema.ip, ty) == .optional) Type.childType(sema.ip, ty) else ty;
+            if (Type.class(sema.ip, ptr_ty) != .pointer or Type.isSlice(sema.ip, ptr_ty) or (ptr_ty != ty and !Type.optionalReprIsPtr(sema.ip, ptr_ty)))
+                return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ty)});
+            const ptr = operand;
+            if (sema.resolveValue(ptr)) |v0| {
+                if (sema.isUndef(v0)) break :blk .fromInterned(try sema.undefValue(.usize_type));
+                const v = switch (sema.ip.indexToKey(v0)) {
+                    .opt => |o| if (o.val == .none) break :blk .fromInterned(try sema.intValue(.usize_type, 0)) else o.val,
+                    else => v0,
                 };
-                if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: pointer address is not known until link time", .{});
-                break :blk sema.addUnOp(block, .int_from_ptr, operand);
+                if (sema.ip.indexToKey(v) == .ptr and sema.ip.indexToKey(v).ptr.base == .int)
+                    break :blk .fromInterned(try sema.intValue(.usize_type, sema.ip.indexToKey(v).ptr.byte_offset));
             }
-            if (Type.class(sema.ip, ty) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ty)});
-            const ptr = if (Type.isSlice(sema.ip, ty)) try sema.slicePtr(block, operand) else operand;
-            if (sema.resolveValue(ptr)) |v| if (sema.ip.indexToKey(v) == .ptr and sema.ip.indexToKey(v).ptr.base == .int)
-                break :blk .fromInterned(try sema.intValue(.usize_type, sema.ip.indexToKey(v).ptr.byte_offset));
             if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: pointer address is not known until link time", .{});
             break :blk sema.addUnOp(block, .int_from_ptr, ptr);
         },
