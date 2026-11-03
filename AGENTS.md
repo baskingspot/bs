@@ -16,8 +16,9 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   stays upstream's job; users run upstream `zig` for ReleaseFast and friends.
 - Out of scope unless the user asks: other targets, release modes, LLVM,
   `@cImport`/translate-c, the C backend, compiling C sources.
-- CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`. Integration with
-  `zig build` comes later.
+- CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`
+  (zap compiles and runs the build runner and serves its compile steps over the
+  `--listen=-` compiler protocol).
 - zap's main users are coding agents. Shape compile errors for them, not for
   humans: exact locations, the facts an agent needs to fix the error, and
   fixes where zap knows them, in a form a program can parse.
