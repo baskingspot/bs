@@ -141,7 +141,41 @@ pub const Diagnostic = struct {
     /// One line on what replaced an API or builtin that 0.17 lacks
     /// (`migrationHint`, `builtinHint`).
     hint: ?[]const u8 = null,
+    fixes: []const Fix = &.{},
 };
+
+/// How safely a fix applies (rustc's applicability).
+pub const Applicability = enum {
+    /// Apply as is: the program then compiles past this error and means
+    /// what its author wrote.
+    exact,
+    /// Valid code that may not be what the author meant (a cast that can
+    /// trap, a rename to the closest name).
+    maybe,
+    /// Valid code with a placeholder to replace (`@panic("TODO")`).
+    placeholder,
+};
+
+/// A source change that fixes an error: its edits apply together.
+pub const Fix = struct { applicability: Applicability, edits: []const Edit };
+
+/// Replace the bytes `start..end` (end exclusive) of `path` with `text`.
+pub const Edit = struct {
+    /// As `Loc.path`.
+    path: []const u8,
+    /// 1-based lines and byte columns of `start` and `end`.
+    line: u32,
+    col: u32,
+    end_line: u32,
+    end_col: u32,
+    start: u32,
+    end: u32,
+    text: []const u8,
+};
+
+/// A fix as Sema and AstGen make it: byte offsets into the error's file.
+pub const RawFix = struct { applicability: Applicability, edits: []const RawEdit };
+pub const RawEdit = struct { start: u32, end: u32, text: []const u8 };
 
 /// A frame of the reference trace: unit `name` referred onward at `loc`.
 pub const Ref = struct { name: []const u8, loc: ?Loc };
@@ -187,6 +221,27 @@ pub const Paths = struct {
             .source_line = lc.source_line,
             .in_lib = in_lib or force_lib,
         };
+    }
+
+    /// `raw`, made against `source` of `raw_path`, with its edits located.
+    pub fn fix(p: Paths, arena: std.mem.Allocator, raw_path: []const u8, source: []const u8, raw: RawFix) !Fix {
+        const path, _ = try p.display(arena, raw_path);
+        const edits = try arena.alloc(Edit, raw.edits.len);
+        for (edits, raw.edits) |*e, r| {
+            const a = std.zig.findLineColumn(source, r.start);
+            const b = std.zig.findLineColumn(source, r.end);
+            e.* = .{
+                .path = path,
+                .line = @intCast(a.line + 1),
+                .col = @intCast(a.column + 1),
+                .end_line = @intCast(b.line + 1),
+                .end_col = @intCast(b.column + 1),
+                .start = r.start,
+                .end = r.end,
+                .text = r.text,
+            };
+        }
+        return .{ .applicability = raw.applicability, .edits = edits };
     }
 };
 
@@ -278,8 +333,11 @@ test closeNames {
 }
 
 /// Appends the messages of an ErrorBundle (AstGen and parse errors) as
-/// diagnostics, classifying each message's code.
+/// diagnostics, classifying each message's code. Some errors read their
+/// file again for candidates and fixes.
 pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorBundle, out: *std.ArrayList(Diagnostic)) !void {
+    // The file read again most recently: a file's errors come together.
+    var reread: ?struct { path: []const u8, tree: std.zig.Ast } = null;
     for (bundle.getMessages()) |idx| {
         const m = bundle.getErrorMessage(idx);
         const notes = try arena.alloc(Note, m.notes_len);
@@ -289,33 +347,40 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
         }
         const msg = bundle.nullTerminatedString(m.msg);
         const code = classifyAstGen(msg);
-        const candidates: []const []const u8 = if (code == .undeclared and m.src_loc != .none)
-            undeclaredCandidates(arena, paths.io, bundle, m.src_loc, msg) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // The file changed or vanished since: no candidates.
-                else => &.{},
+        var candidates: []const []const u8 = &.{};
+        var fixes: []const Fix = &.{};
+        const needs_file = switch (code) {
+            .undeclared, .unused, .@"unused-label", .@"never-mutated", .@"pointless-discard", .@"unknown-builtin" => true,
+            else => false,
+        };
+        if (needs_file and m.src_loc != .none) facts: {
+            const sl = bundle.getSourceLocation(m.src_loc);
+            const path = bundle.nullTerminatedString(sl.src_path);
+            if (reread == null or !std.mem.eql(u8, reread.?.path, path)) {
+                reread = null;
+                const source = std.Io.Dir.cwd().readFileAllocOptions(paths.io, path, arena, .unlimited, .of(u8), 0) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // The file vanished since: no facts.
+                    else => break :facts,
+                };
+                reread = .{ .path = path, .tree = try std.zig.Ast.parse(arena, source, .{ .mode = .zig }) };
             }
-        else
-            &.{};
+            const tree = &reread.?.tree;
+            // The file changed since AstGen read it: its offsets mean nothing.
+            if (sl.span_main > tree.source.len or !std.mem.eql(u8, std.zig.findLineColumn(tree.source, sl.span_main).source_line, bundle.nullTerminatedString(sl.source_line))) break :facts;
+            if (code == .undeclared) if (quoted(msg)) |name| {
+                var names: std.ArrayList([]const u8) = .empty;
+                try scopeNames(arena, tree, sl.span_main, &names);
+                var close: std.ArrayList([]const u8) = .empty;
+                try closeNames(arena, name, names.items, false, &close);
+                candidates = close.items;
+            };
+            if (try astGenFix(arena, tree, code, msg, sl.span_main, candidates)) |raw|
+                fixes = try arena.dupe(Fix, &.{try paths.fix(arena, path, tree.source, raw)});
+        }
         const hint: ?[]const u8 = if (code == .@"unknown-builtin") if (quoted(msg)) |name| builtinHint(name) else null else null;
-        try out.append(arena, .{ .code = code, .loc = try bundleLoc(arena, paths, bundle, m.src_loc), .msg = msg, .count = m.count, .notes = notes, .candidates = candidates, .hint = hint });
+        try out.append(arena, .{ .code = code, .loc = try bundleLoc(arena, paths, bundle, m.src_loc), .msg = msg, .count = m.count, .notes = notes, .candidates = candidates, .hint = hint, .fixes = fixes });
     }
-}
-
-/// The names an undeclared identifier (AstGen's "use of undeclared
-/// identifier 'x'" at `sli`) could have meant, from the file parsed again
-/// (`scopeNames`), filtered by `closeNames`.
-fn undeclaredCandidates(arena: std.mem.Allocator, io: std.Io, bundle: std.zig.ErrorBundle, sli: std.zig.ErrorBundle.SourceLocationIndex, msg: []const u8) ![]const []const u8 {
-    const name = quoted(msg) orelse return &.{};
-    const sl = bundle.getSourceLocation(sli);
-    const path = bundle.nullTerminatedString(sl.src_path);
-    const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, arena, .unlimited, .of(u8), 0);
-    const tree = try std.zig.Ast.parse(arena, source, .{ .mode = .zig });
-    var names: std.ArrayList([]const u8) = .empty;
-    try scopeNames(arena, &tree, sl.span_main, &names);
-    var out: std.ArrayList([]const u8) = .empty;
-    try closeNames(arena, name, names.items, false, &out);
-    return out.items;
 }
 
 /// The text between the first and last `'` of `msg`, if any.
@@ -447,7 +512,6 @@ const primitive_names = [_][]const u8{
 /// captures declared before `offset` (block scopes are not tracked: a
 /// candidate is a hint), and the primitive names.
 fn scopeNames(arena: std.mem.Allocator, tree: *const std.zig.Ast, offset: u32, out: *std.ArrayList([]const u8)) !void {
-    const Ast = std.zig.Ast;
     try out.appendSlice(arena, &primitive_names);
     const tags = tree.nodes.items(.tag);
     var buf: [2]Ast.Node.Index = undefined;
@@ -541,7 +605,9 @@ pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_li
         // The trace trails the message's source location.
         if (d.loc != null) for (refs.items) |r| try wip.addReferenceTrace(r);
         // Candidates and the hint trail the notes as notes without a location.
-        const extra_notes = @as(u32, @intFromBool(d.candidates.len != 0)) + @intFromBool(d.hint != null);
+        var n_edits: u32 = 0;
+        for (d.fixes) |f| n_edits += @intCast(f.edits.len);
+        const extra_notes = @as(u32, @intFromBool(d.candidates.len != 0)) + @intFromBool(d.hint != null) + n_edits;
         const notes_len: u32 = @intCast(d.notes.len + extra_notes);
         try wip.addRootErrorMessage(.{ .msg = msg, .count = d.count, .src_loc = src_loc, .notes_len = notes_len });
         const notes_start = try wip.reserveNotes(notes_len);
@@ -568,7 +634,13 @@ pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_li
             // Not one statement: adding the message can move `extra`.
             const index = try wip.addErrorMessage(.{ .msg = try wip.printString("hint: {s}", .{h}), .src_loc = .none });
             wip.extra.items[i] = @backingInt(index);
+            i += 1;
         }
+        for (d.fixes) |f| for (f.edits) |e| {
+            const index = try wip.addErrorMessage(.{ .msg = try wip.printString("{f}", .{fmtEdit(f.applicability, e)}), .src_loc = .none });
+            wip.extra.items[i] = @backingInt(index);
+            i += 1;
+        };
     }
 }
 
@@ -629,6 +701,7 @@ fn renderText(w: *Writer, d: Diagnostic) Writer.Error!void {
         try w.writeByte('\n');
     }
     if (d.hint) |h| try w.print("  hint: {s}\n", .{h});
+    for (d.fixes) |f| for (f.edits) |e| try w.print("  {f}\n", .{fmtEdit(f.applicability, e)});
     // Frames in the zig lib directory carry nothing an agent can change;
     // they print only as a count next to the user's frames.
     if (user_frames != 0) {
@@ -662,6 +735,20 @@ fn renderText(w: *Writer, d: Diagnostic) Writer.Error!void {
         if (d.refs.len != user_refs) try w.print(" (+{d} std frames)", .{d.refs.len - user_refs});
         try w.writeByte('\n');
     }
+}
+
+/// An edit as the text output and error bundles show it:
+/// `fix[?] <path>:<line>:<col>-<line>:<col>: "<text>"`, the text as a Zig
+/// string literal (an insertion has equal ends, a deletion text "").
+fn fmtEdit(applicability: Applicability, e: Edit) std.fmt.Alt(FixEdit, formatEdit) {
+    return .{ .data = .{ applicability, e } };
+}
+
+const FixEdit = struct { Applicability, Edit };
+
+fn formatEdit(data: FixEdit, w: *Writer) Writer.Error!void {
+    const applicability, const e = data;
+    try w.print("fix{s} {s}:{d}:{d}-{d}:{d}: \"{f}\"", .{ if (applicability == .exact) "" else "?", e.path, e.line, e.col, e.end_line, e.end_col, std.zig.fmtString(e.text) });
 }
 
 /// The primary source line without its indentation, cut to a window around
@@ -717,6 +804,19 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
             n_notes += 1;
         }
     }
+    const JsonEdit = struct { file: []const u8, span: [2]u32, text: []const u8 };
+    const JsonFix = struct { applicability: Applicability, edits: []const JsonEdit };
+    var fixes_buf: [8]JsonFix = undefined;
+    var edits_buf: [16]JsonEdit = undefined;
+    var n_fixes: usize = 0;
+    var n_edits: usize = 0;
+    for (d.fixes) |f| {
+        if (n_fixes == fixes_buf.len or n_edits + f.edits.len > edits_buf.len) break;
+        for (f.edits, edits_buf[n_edits..][0..f.edits.len]) |e, *je| je.* = .{ .file = e.path, .span = .{ e.start, e.end }, .text = e.text };
+        fixes_buf[n_fixes] = .{ .applicability = f.applicability, .edits = edits_buf[n_edits..][0..f.edits.len] };
+        n_fixes += 1;
+        n_edits += f.edits.len;
+    }
     const obj: struct {
         code: ?Code,
         file: ?[]const u8 = null,
@@ -729,6 +829,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
         notes: ?[]const JsonNote,
         candidates: ?[]const []const u8,
         hint: ?[]const u8,
+        fixes: ?[]const JsonFix,
         calls: ?[]const JsonCall,
         ref: ?[]const JsonRef,
     } = .{
@@ -743,11 +844,396 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
         .notes = if (n_notes != 0) notes_buf[0..n_notes] else null,
         .candidates = if (d.candidates.len != 0) d.candidates else null,
         .hint = d.hint,
+        .fixes = if (n_fixes != 0) fixes_buf[0..n_fixes] else null,
         .calls = if (n_calls != 0) calls_buf[0..n_calls] else null,
         .ref = if (n_refs != 0) refs_buf[0..n_refs] else null,
     };
     try std.json.Stringify.value(obj, .{ .emit_null_optional_fields = false }, w);
     try w.writeByte('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Fixes (step 5)
+
+const Ast = std.zig.Ast;
+
+/// The fix for AstGen error `code` with message `msg` at byte `main` of
+/// `tree`'s source, if zap knows one.
+fn astGenFix(arena: std.mem.Allocator, tree: *const Ast, code: Code, msg: []const u8, main: u32, candidates: []const []const u8) !?RawFix {
+    const tok = tokenAt(tree, main) orelse return null;
+    switch (code) {
+        .unused => {
+            const name = tree.tokenSlice(tok);
+            if (std.mem.startsWith(u8, msg, "unused local ")) {
+                const semi = statementEnd(tree, tok) orelse return null;
+                const discard = try statementAfter(arena, tree, semi, indentOf(tree.source, tree.tokenStart(tok)), try std.fmt.allocPrint(arena, "_ = {s};", .{name}));
+                // An unused variable is never mutated either.
+                if (tok > 0 and tree.tokenTag(tok - 1) == .keyword_var)
+                    return try rawFix(arena, .exact, &.{ replaceToken(tree, tok - 1, "const"), discard });
+                return try rawFix(arena, .exact, &.{discard});
+            }
+            if (std.mem.eql(u8, msg, "unused function parameter")) {
+                const body = enclosingFnBody(tree, tok) orelse return null;
+                const lbrace = tree.firstToken(body);
+                const indent = try std.fmt.allocPrint(arena, "{s}    ", .{indentOf(tree.source, tree.tokenStart(lbrace))});
+                return try rawFix(arena, .exact, &.{try statementAfter(arena, tree, lbrace, indent, try std.fmt.allocPrint(arena, "_ = {s};", .{name}))});
+            }
+            if (std.mem.eql(u8, msg, "unused capture") or std.mem.eql(u8, msg, "unused switch tag capture"))
+                return captureFix(arena, tree, tok, msg[7] == 's');
+            return null;
+        },
+        .@"unused-label" => {
+            // `blk: ` goes, up to what follows it.
+            if (tree.tokenTag(tok) != .identifier or tree.tokenTag(tok + 1) != .colon) return null;
+            return try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(tok), .end = tree.tokenStart(tok + 2), .text = "" }});
+        },
+        .@"never-mutated" => {
+            if (tok == 0 or tree.tokenTag(tok - 1) != .keyword_var) return null;
+            return try rawFix(arena, .exact, &.{replaceToken(tree, tok - 1, "const")});
+        },
+        .@"pointless-discard" => {
+            // `_ = name;`, at `name`.
+            if (tok < 2 or tree.tokenTag(tok - 1) != .equal or !std.mem.eql(u8, tree.tokenSlice(tok - 2), "_") or tree.tokenTag(tok + 1) != .semicolon) return null;
+            const source = tree.source;
+            const start = tree.tokenStart(tok - 2);
+            const end = tokenEnd(tree, tok + 1);
+            const line_start = lineStart(source, start);
+            const line_end = lineEnd(source, end);
+            // Alone on its line: the line goes.
+            if (std.mem.trim(u8, source[line_start..start], " \t").len == 0 and std.mem.trim(u8, source[end..line_end], " \t\r").len == 0 and line_end < source.len)
+                return try rawFix(arena, .exact, &.{.{ .start = line_start, .end = line_end + 1, .text = "" }});
+            return try rawFix(arena, .exact, &.{.{ .start = start, .end = end, .text = "" }});
+        },
+        .@"unknown-builtin" => return builtinFix(arena, tree, tok),
+        .undeclared => return renameFix(arena, tree.source, tree.tokenStart(tok), tokenEnd(tree, tok), candidates),
+        else => return null,
+    }
+}
+
+fn rawFix(arena: std.mem.Allocator, applicability: Applicability, edits: []const RawEdit) !RawFix {
+    return .{ .applicability = applicability, .edits = try arena.dupe(RawEdit, edits) };
+}
+
+/// Renames the name at `start..end` to the only candidate, when it is one
+/// edit or a change of case away (a typo, not another name).
+pub fn renameFix(arena: std.mem.Allocator, source: []const u8, start: u32, end: u32, candidates: []const []const u8) !?RawFix {
+    if (candidates.len != 1 or end > source.len) return null;
+    const name = source[start..end];
+    const c = candidates[0];
+    if (!std.ascii.eqlIgnoreCase(name, c) and editDistance(name, c, 1) == null) return null;
+    return try rawFix(arena, .maybe, &.{.{ .start = start, .end = end, .text = c }});
+}
+
+/// Wraps the expression at `start..end` as `<before><expression><after>`
+/// (a cast). Null when the span is not exactly one expression's.
+pub fn wrapFix(arena: std.mem.Allocator, tree: *const Ast, start: u32, end: u32, before: []const u8, after: []const u8) !?RawFix {
+    if (!isExpression(tree, start, end)) return null;
+    return try rawFix(arena, .maybe, &.{.{ .start = start, .end = end, .text = try std.mem.concat(arena, u8, &.{ before, tree.source[start..end], after }) }});
+}
+
+/// Puts `try ` before the expression at `start..end`, an ignored error
+/// union, and `_ = ` before that if its payload is not `void` and the
+/// expression is a statement. Null outside an expression or in a `defer`,
+/// where `try` is not allowed.
+pub fn tryFix(arena: std.mem.Allocator, tree: *const Ast, start: u32, end: u32, payload_void: bool) !?RawFix {
+    if (!isExpression(tree, start, end)) return null;
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        switch (tree.nodeTag(node)) {
+            .@"defer", .@"errdefer" => {
+                if (tree.tokenStart(tree.firstToken(node)) <= start and end <= tokenEnd(tree, tree.lastToken(node))) return null;
+            },
+            else => {},
+        }
+    }
+    const tok = tokenAt(tree, start).?;
+    const statement = tok == 0 or switch (tree.tokenTag(tok - 1)) {
+        .semicolon, .l_brace, .r_brace => true,
+        else => false,
+    };
+    const text = if (statement and !payload_void) "_ = try " else "try ";
+    return try rawFix(arena, .maybe, &.{.{ .start = start, .end = start, .text = text }});
+}
+
+/// Whether `start..end` is exactly the span of an expression node.
+fn isExpression(tree: *const Ast, start: u32, end: u32) bool {
+    const first = tokenAt(tree, start) orelse return false;
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (tree.firstToken(node) != first or tokenEnd(tree, tree.lastToken(node)) != end) continue;
+        switch (tree.nodeTag(node)) {
+            .root, .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl, .container_field, .container_field_init, .container_field_align, .fn_decl, .test_decl => {},
+            else => return true,
+        }
+    }
+    return false;
+}
+
+/// Adds prongs `prongs` (`.b => @panic("TODO"),`) to the switch whose
+/// `switch` keyword starts at byte `offset`: each on its own line before
+/// the closing brace, or on the brace's line when the switch is on one.
+pub fn prongsFix(arena: std.mem.Allocator, tree: *const Ast, offset: u32, prongs: []const []const u8) !?RawFix {
+    const tok = tokenAt(tree, offset) orelse return null;
+    if (tree.tokenTag(tok) != .keyword_switch) return null;
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        switch (tree.nodeTag(node)) {
+            .@"switch", .switch_comma => {},
+            else => continue,
+        }
+        if (tree.nodeMainToken(node) != tok) continue;
+        const rbrace = tree.lastToken(node);
+        const prev = rbrace - 1;
+        const comma = tree.tokenTag(prev) != .comma and tree.tokenTag(prev) != .l_brace;
+        const source = tree.source;
+        const rbrace_start = tree.tokenStart(rbrace);
+        const line_start = lineStart(source, rbrace_start);
+        var text: std.ArrayList(u8) = .empty;
+        var edits: std.ArrayList(RawEdit) = .empty;
+        if (rbrace_start - line_start == indentOf(source, rbrace_start).len and tree.tokenStart(prev) < line_start) {
+            const indent = indentOf(source, rbrace_start);
+            for (prongs) |p| try text.print(arena, "{s}    {s}\n", .{ indent, p });
+            if (comma) try edits.append(arena, .{ .start = tokenEnd(tree, prev), .end = tokenEnd(tree, prev), .text = "," });
+            try edits.append(arena, .{ .start = line_start, .end = line_start, .text = text.items });
+        } else {
+            if (comma) try text.append(arena, ',');
+            for (prongs) |p| try text.print(arena, " {s}", .{p});
+            try edits.append(arena, .{ .start = tokenEnd(tree, prev), .end = tokenEnd(tree, prev), .text = text.items });
+        }
+        return .{ .applicability = .placeholder, .edits = edits.items };
+    }
+    return null;
+}
+
+/// The offset of the last whole-identifier occurrence of `name` in `text`
+/// (the name in `s.name` or `s.name()`).
+pub fn nameIn(text: []const u8, name: []const u8) ?u32 {
+    var end = text.len;
+    while (std.mem.lastIndexOf(u8, text[0..end], name)) |at| : (end = at) {
+        const after = at + name.len;
+        const ident = struct {
+            fn f(c: u8) bool {
+                return std.ascii.isAlphanumeric(c) or c == '_';
+            }
+        }.f;
+        if ((at == 0 or !ident(text[at - 1])) and (after == text.len or !ident(text[after]))) return @intCast(at);
+        if (at == 0) break;
+    }
+    return null;
+}
+
+/// Builtins of older releases that 0.17 renamed, as calls of the new
+/// ones: the old argument count and the replacement, where `{0}` and `{1}`
+/// stand for the old arguments.
+const builtin_rewrites = std.StaticStringMap(struct { u8, []const u8 }).initComptime(.{
+    .{ "@intToEnum", .{ 2, "@as({0}, @enumFromInt({1}))" } },
+    .{ "@enumToInt", .{ 1, "@intFromEnum({0})" } },
+    .{ "@intToFloat", .{ 2, "@as({0}, @floatFromInt({1}))" } },
+    .{ "@floatToInt", .{ 2, "@as({0}, @intFromFloat({1}))" } },
+    .{ "@ptrToInt", .{ 1, "@intFromPtr({0})" } },
+    .{ "@intToPtr", .{ 2, "@as({0}, @ptrFromInt({1}))" } },
+    .{ "@boolToInt", .{ 1, "@intFromBool({0})" } },
+    .{ "@errorToInt", .{ 1, "@intFromError({0})" } },
+    .{ "@intToError", .{ 1, "@errorFromInt({0})" } },
+    .{ "@errSetCast", .{ 2, "@as({0}, @errorCast({1}))" } },
+});
+
+/// Rewrites a call of a renamed builtin (`builtin_rewrites`) at `tok`.
+fn builtinFix(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenIndex) !?RawFix {
+    const n_args, const template = builtin_rewrites.get(tree.tokenSlice(tok)) orelse return null;
+    if (tree.tokenTag(tok + 1) != .l_paren) return null;
+    // The arguments' byte ranges, split at top-level commas.
+    var args: [2][2]u32 = undefined;
+    var n: usize = 0;
+    var depth: u32 = 0;
+    var t = tok + 2;
+    var arg_start = t;
+    while (true) : (t += 1) switch (tree.tokenTag(t)) {
+        .l_paren, .l_brace, .l_bracket => depth += 1,
+        .r_paren, .r_brace, .r_bracket => {
+            if (depth > 0) {
+                depth -= 1;
+                continue;
+            }
+            if (tree.tokenTag(t) != .r_paren) return null;
+            // A trailing comma ends no argument.
+            if (t > arg_start) {
+                if (n == args.len) return null;
+                args[n] = .{ tree.tokenStart(arg_start), tokenEnd(tree, t - 1) };
+                n += 1;
+            }
+            break;
+        },
+        .comma => if (depth == 0) {
+            if (n == args.len or t == arg_start) return null;
+            args[n] = .{ tree.tokenStart(arg_start), tokenEnd(tree, t - 1) };
+            n += 1;
+            arg_start = t + 1;
+        },
+        .eof => return null,
+        else => {},
+    };
+    if (n != n_args) return null;
+    var text: std.ArrayList(u8) = .empty;
+    var rest: []const u8 = template;
+    while (std.mem.indexOfScalar(u8, rest, '{')) |open| {
+        try text.appendSlice(arena, rest[0..open]);
+        const a = args[rest[open + 1] - '0'];
+        try text.appendSlice(arena, tree.source[a[0]..a[1]]);
+        rest = rest[open + 3 ..];
+    }
+    try text.appendSlice(arena, rest);
+    return try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(tok), .end = tokenEnd(tree, t), .text = text.items }});
+}
+
+/// Discards an unused capture at `tok` (`tag`: a switch prong's tag
+/// capture) the way AstGen allows: no capture where `_` would be "discard
+/// of capture" (a switch prong's only capture, `catch |err|`), else `_`
+/// (an `if`'s `else |err|` must stay to keep the operand an error union).
+/// An unused `for` counter goes with its `0..` input.
+fn captureFix(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenIndex, tag: bool) !?RawFix {
+    // The capture list `|...|` around `tok`.
+    var open = tok;
+    while (open > 0) : (open -= 1) switch (tree.tokenTag(open - 1)) {
+        .comma, .identifier, .asterisk => {},
+        else => break,
+    };
+    if (open == 0 or tree.tokenTag(open - 1) != .pipe) return null;
+    open -= 1;
+    var close = tok + 1;
+    while (tree.tokenTag(close) != .pipe) : (close += 1) switch (tree.tokenTag(close)) {
+        .comma, .identifier, .asterisk => {},
+        else => return null,
+    };
+    // `*x` is discarded whole.
+    const name_start = if (tree.tokenTag(tok - 1) == .asterisk) tok - 1 else tok;
+    const only = name_start == open + 1 and close == tok + 1;
+    const before = tree.tokenTag(open -| 1);
+    if (tag) {
+        // `|payload, tag|`: drop `, tag`.
+        if (tree.tokenTag(tok - 1) != .comma) return null;
+        return try rawFix(arena, .exact, &.{.{ .start = tokenEnd(tree, tok - 2), .end = tokenEnd(tree, tok), .text = "" }});
+    }
+    if (only and (before == .equal_angle_bracket_right or before == .keyword_catch)) {
+        // `|x| ` goes, up to what follows it.
+        return try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(open), .end = tree.tokenStart(close + 1), .text = "" }});
+    }
+    if (forCounter(tree, open, name_start)) |input| {
+        const index = captureIndex(tree, open, name_start);
+        var edits: [2]RawEdit = undefined;
+        // With its comma: the one before it, or after it when it is first.
+        edits[0] = if (index > 0)
+            .{ .start = tokenEnd(tree, tree.lastToken(input.prev.unwrap().?)), .end = tokenEnd(tree, tree.lastToken(input.node)), .text = "" }
+        else
+            .{ .start = tree.tokenStart(tree.firstToken(input.node)), .end = tree.tokenStart(tree.lastToken(input.node) + 2), .text = "" };
+        edits[1] = if (index > 0)
+            .{ .start = tokenEnd(tree, name_start - 2), .end = tokenEnd(tree, tok), .text = "" }
+        else
+            .{ .start = tree.tokenStart(name_start), .end = tree.tokenStart(tok + 2), .text = "" };
+        return try rawFix(arena, .exact, &edits);
+    }
+    return try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(name_start), .end = tokenEnd(tree, tok), .text = "_" }});
+}
+
+/// The position of the capture starting at `name_start` in the list
+/// opened by `open`.
+fn captureIndex(tree: *const Ast, open: Ast.TokenIndex, name_start: Ast.TokenIndex) usize {
+    var index: usize = 0;
+    for (open + 1..name_start) |t| index += @intFromBool(tree.tokenTag(@intCast(t)) == .comma);
+    return index;
+}
+
+/// When the capture at `name_start` of the list opened by `open` is a
+/// `for` loop's counter (its input an unbounded range, `0..`), that input
+/// and the one before it.
+fn forCounter(tree: *const Ast, open: Ast.TokenIndex, name_start: Ast.TokenIndex) ?struct { node: Ast.Node.Index, prev: Ast.Node.OptionalIndex } {
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const f = tree.fullFor(node) orelse continue;
+        if (f.payload_token != open + 1 and f.payload_token != open + 2) continue;
+        const index = captureIndex(tree, open, name_start);
+        if (index >= f.ast.inputs.len or f.ast.inputs.len < 2) return null;
+        const input = f.ast.inputs[index];
+        if (tree.nodeTag(input) != .for_range or tree.nodeData(input).node_and_opt_node[1] != .none) return null;
+        return .{ .node = input, .prev = if (index > 0) f.ast.inputs[index - 1].toOptional() else .none };
+    }
+    return null;
+}
+
+/// The body of the innermost function declaration around `tok`.
+fn enclosingFnBody(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.Node.Index {
+    var best: ?Ast.Node.Index = null;
+    var best_len: u32 = std.math.maxInt(u32);
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        const first = tree.firstToken(node);
+        const last = tree.lastToken(node);
+        if (tok < first or tok > last or last - first >= best_len) continue;
+        best = tree.nodeData(node).node_and_node[1];
+        best_len = last - first;
+    }
+    return best;
+}
+
+/// The `;` ending the statement that contains `tok`.
+fn statementEnd(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.TokenIndex {
+    var depth: u32 = 0;
+    var t = tok;
+    while (true) : (t += 1) switch (tree.tokenTag(t)) {
+        .l_paren, .l_brace, .l_bracket => depth += 1,
+        .r_paren, .r_brace, .r_bracket => depth = std.math.sub(u32, depth, 1) catch return null,
+        .semicolon => if (depth == 0) return t,
+        .eof => return null,
+        else => {},
+    };
+}
+
+/// Inserts statement `stmt` after token `tok`: on the next line with
+/// `indent` when `tok` ends its line, else on the same line.
+fn statementAfter(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenIndex, indent: []const u8, stmt: []const u8) !RawEdit {
+    const source = tree.source;
+    const end = tokenEnd(tree, tok);
+    const line_end = lineEnd(source, end);
+    if (line_end == source.len or tree.tokenStart(tok + 1) < line_end)
+        return .{ .start = end, .end = end, .text = try std.fmt.allocPrint(arena, " {s}", .{stmt}) };
+    return .{ .start = line_end + 1, .end = line_end + 1, .text = try std.fmt.allocPrint(arena, "{s}{s}\n", .{ indent, stmt }) };
+}
+
+fn replaceToken(tree: *const Ast, tok: Ast.TokenIndex, text: []const u8) RawEdit {
+    return .{ .start = tree.tokenStart(tok), .end = tokenEnd(tree, tok), .text = text };
+}
+
+/// The token starting at byte `offset`, if one does.
+fn tokenAt(tree: *const Ast, offset: u32) ?Ast.TokenIndex {
+    const starts = tree.tokens.items(.start);
+    var lo: usize = 0;
+    var hi: usize = starts.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (starts[mid] < offset) lo = mid + 1 else hi = mid;
+    }
+    return if (lo < starts.len and starts[lo] == offset) @intCast(lo) else null;
+}
+
+fn tokenEnd(tree: *const Ast, tok: Ast.TokenIndex) u32 {
+    return tree.tokenStart(tok) + @as(u32, @intCast(tree.tokenSlice(tok).len));
+}
+
+fn lineStart(source: []const u8, offset: u32) u32 {
+    return if (std.mem.lastIndexOfScalar(u8, source[0..offset], '\n')) |i| @intCast(i + 1) else 0;
+}
+
+fn lineEnd(source: []const u8, offset: u32) u32 {
+    return @intCast(std.mem.indexOfScalarPos(u8, source, offset, '\n') orelse source.len);
+}
+
+/// The indentation of the line holding byte `offset`.
+pub fn indentOf(source: []const u8, offset: u32) []const u8 {
+    const start = lineStart(source, offset);
+    var end = start;
+    while (end < source.len and (source[end] == ' ' or source[end] == '\t')) end += 1;
+    return source[start..end];
 }
 
 // ---------------------------------------------------------------------------

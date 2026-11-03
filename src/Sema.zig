@@ -1361,7 +1361,29 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
     const arena = zcu.arena.allocator();
     const owned = try arena.alloc([]const u8, close.items.len);
     for (owned, close.items) |*o, n| o.* = try arena.dupe(u8, n);
-    zcu.errors.items[zcu.errors.items.len - 1].candidates = owned;
+    last.candidates = owned;
+    // A typo of the only close name, where the error points at the name.
+    if (last.hint == null and last.file == sema.file) {
+        const source = try zcu.fe.source(@fromBackingInt(sema.file));
+        const at = if (last.span.end <= source.len) diag.nameIn(source[last.span.start..last.span.end], name) else null;
+        if (at) |offset| {
+            if (which == .fields) {
+                close.clearRetainingCapacity();
+                try diag.closeNames(sema.arena, name, names.items, false, &close);
+            }
+            const start: u32 = last.span.start + offset;
+            last.fix = try diag.renameFix(arena, source, start, start + @as(u32, @intCast(name.len)), close.items);
+        }
+    }
+}
+
+/// Gives the most recent error, at `src`, the fix `make` returns for the
+/// span of `src` (`diag.wrapFix`, `diag.tryFix`).
+fn addFix(sema: *Sema, src: Src, make: anytype, extra: anytype) CompileError!void {
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    const span = src.span(tree);
+    const last = &sema.zcu.errors.items[sema.zcu.errors.items.len - 1];
+    last.fix = try @call(.auto, make, .{ sema.zcu.arena.allocator(), tree, span.start, span.end } ++ extra);
 }
 
 /// Notes where struct, union, enum or opaque type `ty` is declared, on the
@@ -1398,7 +1420,7 @@ fn containerDecl(sema: *Sema, ty: Index) ?struct { file: u32, node: Ast.Node.Ind
 
 /// A switch on enum `enum_ty` (the tag of `union_ty`, if one) that lacks
 /// the prongs of fields `missing`, as upstream: a note per field, where it
-/// is declared, then where the type is.
+/// is declared, then where the type is. The fix adds the prongs.
 fn failSwitchEnum(sema: *Sema, block: *Block, src: Src, enum_ty: Index, union_ty: ?Index, missing: []const u32) CompileError {
     const ip = sema.ip;
     const zcu = sema.zcu;
@@ -1408,8 +1430,10 @@ fn failSwitchEnum(sema: *Sema, block: *Block, src: Src, enum_ty: Index, union_ty
     const names = ip.structInfo(enum_ty).field_names;
     const decl = sema.containerDecl(enum_ty) orelse if (union_ty) |u| sema.containerDecl(u) else null;
     const decl_tree = if (decl) |d| try zcu.fe.tree(@fromBackingInt(d.file)) else null;
-    for (missing) |fi| {
+    const prongs = try sema.arena.alloc([]const u8, missing.len);
+    for (missing, prongs) |fi, *prong| {
         const name = ip.stringSlice(names[fi]);
+        prong.* = try std.fmt.allocPrint(sema.arena, ".{f} => @panic(\"TODO\"),", .{std.zig.fmtId(name)});
         const field = if (decl) |d| fieldNameToken(decl_tree.?, d.node, name) else null;
         if (field) |t| {
             const start = decl_tree.?.tokenStart(t);
@@ -1418,6 +1442,7 @@ fn failSwitchEnum(sema: *Sema, block: *Block, src: Src, enum_ty: Index, union_ty
         } else try zcu.addNote(sema.file, span, "unhandled enumeration value: '{s}'", .{name});
     }
     if (decl) |d| try zcu.addDeclNote(d.file, decl_tree.?.nodeToSpan(d.node), "enum '{f}' declared here", .{sema.fmtType(enum_ty)});
+    zcu.errors.items[zcu.errors.items.len - 1].fix = try @import("diag.zig").prongsFix(zcu.arena.allocator(), tree, span.main, prongs);
     return err;
 }
 
@@ -6096,6 +6121,22 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
         .param => |p| if (p.func != .none) if (try sema.fnTypeExprSrc(p.func, p.index)) |loc|
             try sema.zcu.addDeclNote(loc.file, loc.span, "parameter type declared here", .{}),
     }
+    // A number that does not fit: the cast that says it does, checked at
+    // run time.
+    const cast: ?[]const u8 = switch (Type.class(ip, wanted)) {
+        .int => switch (Type.class(ip, actual)) {
+            .int => "@intCast(",
+            .float => "@intFromFloat(",
+            else => null,
+        },
+        .float => switch (Type.class(ip, actual)) {
+            .float => "@floatCast(",
+            .int => "@floatFromInt(",
+            else => null,
+        },
+        else => null,
+    };
+    if (cast) |c| try sema.addFix(src, @import("diag.zig").wrapFix, .{ c, ")" });
     return err;
 }
 
@@ -12705,7 +12746,11 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
                 const err = sema.fail(parent, src, "switch must handle all possibilities", .{});
                 const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
                 const span = src.span(tree);
-                for (prongs.items) |p| try sema.zcu.addNote(sema.file, span, "unhandled error value: 'error.{s}'", .{p});
+                for (prongs.items) |*p| {
+                    try sema.zcu.addNote(sema.file, span, "unhandled error value: 'error.{s}'", .{p.*});
+                    p.* = try std.fmt.allocPrint(sema.arena, "error.{f} => @panic(\"TODO\"),", .{std.zig.fmtId(p.*)});
+                }
+                sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = try @import("diag.zig").prongsFix(sema.zcu.arena.allocator(), tree, span.main, prongs.items);
                 return err;
             }
         } else if (!sema.isOwnIes(operand_ty))
@@ -13797,7 +13842,7 @@ fn ensureResultUsed(sema: *Sema, block: *Block, src: Src, ty: Index) CompileErro
     switch (Type.class(sema.ip, ty)) {
         .void, .noreturn => {},
         .error_set => return sema.fail(block, src, "error set of type '{f}' is ignored", .{sema.fmtType(ty)}),
-        .error_union => return sema.failIgnoredError(src, sema.fail(block, src, "error union of type '{f}' is ignored", .{sema.fmtType(ty)})),
+        .error_union => return sema.failIgnoredError(block, src, ty, sema.fail(block, src, "error union of type '{f}' is ignored", .{sema.fmtType(ty)})),
         else => {
             const err = sema.fail(block, src, "value of type '{f}' ignored", .{sema.fmtType(ty)});
             const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
@@ -13815,15 +13860,24 @@ fn zirEnsureResultNonError(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
     const ty = sema.typeOf(sema.resolveInst(data.operand));
     switch (Type.class(sema.ip, ty)) {
         .error_set => return sema.fail(block, src, "error set is discarded", .{}),
-        .error_union => return sema.failIgnoredError(src, sema.fail(block, src, "error union is discarded", .{})),
+        .error_union => return sema.failIgnoredError(block, src, ty, sema.fail(block, src, "error union is discarded", .{})),
         else => {},
     }
 }
 
-/// Returns `err`, an error union ignored at `src`, with upstream's note.
-fn failIgnoredError(sema: *Sema, src: Src, err: CompileError) CompileError {
+/// Returns `err`, error union type `ty` ignored at `src`, with upstream's
+/// note and `try` as the fix where the function can return the error.
+fn failIgnoredError(sema: *Sema, block: *Block, src: Src, ty: Index, err: CompileError) CompileError {
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     try sema.zcu.addNote(sema.file, src.span(tree), "consider using 'try', 'catch', or 'if'", .{});
+    const ret_ty = sema.currentRetTy(block);
+    if (ret_ty != .none and Type.class(sema.ip, ret_ty) == .error_union) {
+        const payload_void = switch (Type.class(sema.ip, sema.ip.keyPayload(.error_union_type, ty).payload_type)) {
+            .void, .noreturn => true,
+            else => false,
+        };
+        try sema.addFix(src, @import("diag.zig").tryFix, .{payload_void});
+    }
     return err;
 }
 

@@ -32,14 +32,17 @@ pub fn main() void {
 // ignored.zig:9:12: error[ignored-value]: error union of type '@typeInfo(@typeInfo(@TypeOf(ignored.mayFail)).@"fn".return_type.?).error_union.error_set!u8' is ignored
 //   | mayFail();
 //   note ignored.zig:9:12: consider using 'try', 'catch', or 'if'
+//   fix? ignored.zig:9:5-9:5: "_ = try "
 //   ref: main ignored.zig:24:10 (+3 std frames)
 // ignored.zig:12:16: error[ignored-value]: error union is discarded
 //   | _ = mayFail();
 //   note ignored.zig:12:16: consider using 'try', 'catch', or 'if'
+//   fix? ignored.zig:12:9-12:9: "try "
 //   ref: main ignored.zig:25:10 (+3 std frames)
 // ignored.zig:15:16: error[ignored-value]: error union of type '@typeInfo(@typeInfo(@TypeOf(ignored.mayFailVoid)).@"fn".return_type.?).error_union.error_set!void' is ignored
 //   | mayFailVoid();
 //   note ignored.zig:15:16: consider using 'try', 'catch', or 'if'
+//   fix? ignored.zig:15:5-15:5: "try "
 //   ref: main ignored.zig:26:10 (+3 std frames)
 // ignored.zig:18:10: error[ignored-value]: value of type 'u8' ignored
 //   | value();

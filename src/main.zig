@@ -413,6 +413,16 @@ fn dupeDiagnostics(arena: std.mem.Allocator, diags: []const diag.Diagnostic) ![]
         for (candidates) |*c| c.* = try arena.dupe(u8, c.*);
         d.candidates = candidates;
         if (d.hint) |h| d.hint = try arena.dupe(u8, h);
+        const fixes = try arena.dupe(diag.Fix, d.fixes);
+        for (fixes) |*f| {
+            const edits = try arena.dupe(diag.Edit, f.edits);
+            for (edits) |*e| {
+                e.path = try arena.dupe(u8, e.path);
+                e.text = try arena.dupe(u8, e.text);
+            }
+            f.edits = edits;
+        }
+        d.fixes = fixes;
     }
     return out;
 }

@@ -38,22 +38,26 @@ pub fn main() void {
 //   note switch_prongs.zig:1:21: unhandled enumeration value: 'b'
 //   note switch_prongs.zig:1:24: unhandled enumeration value: 'c'
 //   note switch_prongs.zig:1:11: enum 'switch_prongs.E' declared here: const E = enum { a, b, c };
+//   fix? switch_prongs.zig:7:1-7:1: "        .b => @panic(\"TODO\"),\n        .c => @panic(\"TODO\"),\n"
 //   ref: main switch_prongs.zig:28:14 (+3 std frames)
 // switch_prongs.zig:10:12: error[switch-incomplete]: switch must handle all possibilities
 //   | return switch (e) { .a => 1 };
 //   note switch_prongs.zig:1:21: unhandled enumeration value: 'b'
 //   note switch_prongs.zig:1:24: unhandled enumeration value: 'c'
 //   note switch_prongs.zig:1:11: enum 'switch_prongs.E' declared here: const E = enum { a, b, c };
+//   fix? switch_prongs.zig:10:32-10:32: ", .b => @panic(\"TODO\"), .c => @panic(\"TODO\"),"
 //   ref: main switch_prongs.zig:29:16 (+3 std frames)
 // switch_prongs.zig:13:12: error[switch-incomplete]: switch must handle all possibilities
 //   | return switch (x) {
 //   note switch_prongs.zig:2:32: unhandled enumeration value: 'b'
 //   note switch_prongs.zig:2:41: unhandled enumeration value: 'c d'
 //   note switch_prongs.zig:2:11: enum '@typeInfo(switch_prongs.U).@"union".tag_type.?' declared here: const U = union(enum) { a: u8, b: void, @"c d": u8 };
+//   fix? switch_prongs.zig:15:1-15:1: "        .b => @panic(\"TODO\"),\n        .@\"c d\" => @panic(\"TODO\"),\n"
 //   ref: main switch_prongs.zig:30:15 (+3 std frames)
 // switch_prongs.zig:18:26: error[switch-incomplete]: switch must handle all possibilities
 //   | return x catch |err| switch (err) {
 //   note switch_prongs.zig:18:26: unhandled error value: 'error.Y'
+//   fix? switch_prongs.zig:20:1-20:1: "        error.Y => @panic(\"TODO\"),\n"
 //   ref: main switch_prongs.zig:31:15 (+3 std frames)
 // switch_prongs.zig:23:12: error[switch-incomplete]: else prong required when switching on type 'anyerror'
 //   | return switch (x) {

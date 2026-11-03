@@ -3363,7 +3363,7 @@ e.zig:16:12: error[type-mismatch]: expected 'u32', found 'usize'
   note: u32 cannot represent all usize values
   note e.zig:13:29: return type declared here
   note e.zig:14:9: 'n' declared here: var n: usize = 0;
-  fix? e.zig:16:12-16:13: @intCast(n)
+  fix? e.zig:16:12-16:13: "@intCast(n)"
   ref: main e.zig:22:14
 3 errors
 ```
@@ -3432,15 +3432,19 @@ lines, each starting with a keyword:
   note[ <path>:<line>:<col>]: <message>[: <declaration source line>]
   candidates: <name>, <name>, ...
   hint: <one line>
-  fix[?] <path>:<line>:<col>-<line>:<col>: <replacement text>
+  fix[?] <path>:<line>:<col>-<line>:<col>: "<replacement text>"
   call: <path>:<line>:<col> inline|comptime, ..., +<n> std
   ref: <fn> <path>:<line>:<col> <- <fn> <path>:<line>:<col> (+<n> std frames)
   in <n> instances: <comptime args of the first ones>
 ```
 
 The output ends with `<n> errors`; there is no limit. Lines and columns are 1-based, and columns count
-bytes, as upstream. `fix:` is exact (apply as is); `fix?` is valid code
-that may not be what the author meant.
+bytes, as upstream. `fix` is exact (apply as is); `fix?` is valid code
+that may not be what the author meant, or has a placeholder
+(`@panic("TODO")`). The replacement is a Zig string literal, so
+insertions of whole lines (`"    _ = x;\n"`) and deletions (`""`) read
+unambiguously; equal ends mean an insertion. A fix with several edits
+prints one `fix` line per edit, and they apply together.
 
 **JSON lines.** One object per error, with short keys:
 `{"code", "file", "line", "col", "span": [start, end], "msg", "src",
@@ -3501,7 +3505,8 @@ pub const Diagnostic = struct {
     refs: []const Ref = &.{}, // the reference trace
     candidates: []const []const u8 = &.{},
     hint: ?[]const u8 = null,
-    // Later steps: fixes, instances.
+    fixes: []const Fix = &.{},
+    // Later: instances.
 };
 pub const Loc = struct {
     path: []const u8, // displayed: relative to the cwd, or to the zig lib directory
@@ -3513,7 +3518,8 @@ pub const Loc = struct {
     in_lib: bool, // std, builtin, compiler_rt: frames here collapse to a count
 };
 pub const Note = struct { loc: ?Loc, msg: []const u8, count: u32 = 1, call: ?CallKind = null };
-pub const Fix = struct { applicability: enum { exact, maybe, placeholder }, edits: []const Edit }; // step 5
+pub const Fix = struct { applicability: enum { exact, maybe, placeholder }, edits: []const Edit };
+pub const Edit = struct { path: []const u8, line: u32, col: u32, end_line: u32, end_col: u32, start: u32, end: u32, text: []const u8 };
 ```
 
 Locations stay absolute spans until rendered. Declaration-relative
@@ -3609,18 +3615,40 @@ code.
   and arity-change patterns such as `list.append(x)` on an unmanaged
   list.
 
-**Fixes zap knows**, first set:
+**Fixes zap knows**, first set (step 5, built):
 
 | error | fix | applicability |
 |---|---|---|
-| unused local, parameter or capture (AstGen) | insert `_ = name;` after the declaration, or at the start of the body for a parameter | exact |
+| unused local constant (AstGen) | insert `_ = name;` after the statement: on the next line, or on the same line when more follows it there (`{ const w = 5; }`) | exact |
+| unused local variable (AstGen) | the same, plus `var` → `const` (unused means never mutated too) | exact |
+| unused function parameter (AstGen) | insert `_ = name;` at the start of the body | exact |
+| unused capture (AstGen) | a switch prong's only capture and `catch \|err\|` go (`\|_\|` there is "discard of capture"); an `if`/`while` `else \|err\|` becomes `\|_\|`, since dropping it makes the operand an optional; a `for` counter goes with its `0..` input; other captures become `_` | exact |
+| unused switch tag capture (AstGen) | drop `, tag` | exact |
+| unused block, loop or switch label (AstGen) | drop `label: ` | exact |
 | local variable is never mutated (AstGen) | `var` → `const` | exact |
-| pointless discard (AstGen) | delete the `_ = name;` statement | exact |
-| invalid builtin `@intToEnum(T, x)` and the other renamed builtins | `@as(T, @enumFromInt(x))` | exact |
-| error union is discarded | insert `try ` when the function returns an error union | maybe |
-| integer or float narrowing mismatch | wrap in `@intCast`, `@floatCast`, `@floatFromInt`, ... | maybe |
-| failed lookup with one candidate at distance 1 | rename | maybe |
-| switch must handle all possibilities | add `.tag => @panic("TODO"),` prongs | placeholder |
+| pointless discard (AstGen) | delete the `_ = name;` statement, and its line when it is alone there | exact |
+| invalid builtin `@intToEnum(T, x)` and the other renamed builtins with a direct replacement (10) | `@as(T, @enumFromInt(x))`, `@intFromEnum(e)`, ... | exact |
+| error union ignored or discarded, where the function returns an error union | insert `try ` (`_ = try ` for a statement whose payload is not void); none inside `defer` | maybe |
+| integer or float mismatch | wrap in `@intCast`, `@floatCast`, `@floatFromInt` or `@intFromFloat` | maybe |
+| failed lookup (undeclared, member, field, method) with one candidate at distance 1 or differing in case, and no migration hint | rename | maybe |
+| switch must handle all possibilities (enum, tagged union, error set) | add `.tag => @panic("TODO"),` or `error.X => @panic("TODO"),` prongs | placeholder |
+
+AstGen's fixes are computed in `diag.fromBundle` from the failing file
+read and parsed again (as for its candidates), and only when the line
+AstGen reported is unchanged in it. Sema's are computed when the error is
+made, from the file's AST, and travel in `Zcu.ErrorMsg.fix`; each one
+checks that its span is exactly one expression (`diag.isExpression`)
+before wrapping it. Under `zap build` every edit becomes a location-less
+note in the error bundle, worded as the text line.
+
+Reaching upstream's messages for these errors also took four checks zap
+lacked, all upstream's: a call statement's ignored result (`f();` with
+an error union or a non-void value; zap checked only non-call
+expressions), `_ = f();` on an error union ("error union is discarded"),
+`if (x) {} else |err|` with a non-void payload ("error union payload is
+ignored"), and error-set switches without `else` ("unhandled error value"
+notes; `anyerror` needs `else`). The enum case gained upstream's
+"unhandled enumeration value" notes at each field.
 
 ### Where errors come from, and what changes
 
@@ -3797,6 +3825,12 @@ user modules (non-generic functions only) was proposed and not adopted.
   every case too.
 - **Fixes round-trip**: applying every `exact` fix must give a program
   that compiles, or that fails with the case's next expected error.
+  `python3 tools/diag/roundtrip.py [--all] test/diag/*.zig` checks it
+  (`--all` adds `maybe` and placeholder fixes): no error may remain or
+  appear at an edited place, by zap's and by upstream's account, and no
+  syntax error anywhere. New errors elsewhere are ones the fixed errors
+  hid, since AstGen errors stop Sema. It needs Python, so `zig build
+  test` does not run it yet; `zap fix` (step 8) will let it.
 - **Cache**: the corpus runs twice in one cache directory, the second time
   as a no-edit rebuild and then after an edit above each error. Output
   must be byte-identical, with `ZAP_CACHE_CHECK=1`.
@@ -3836,7 +3870,10 @@ unchanged:
    parsing the failing file again. Not yet: the value's origin on type
    mismatches, and inferred error sets by name.)
 4. The migration and pattern table. (Started: the first set above.)
-5. Fixes, first set.
+5. Fixes, first set. (Done: the table above, and
+   `tools/diag/roundtrip.py`, which applies a file's fixes round after
+   round and checks with zap and upstream that no error is left or made
+   at an edited place; all 33 corpus fixes pass.)
 6. The cache: failing builds commit the manifest for the units that
    succeeded.
 7. Alongside: `run.py --compile-errors`, and fixing zap's crashes and

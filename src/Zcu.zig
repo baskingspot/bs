@@ -326,6 +326,8 @@ pub const ErrorMsg = struct {
     candidates: []const []const u8 = &.{},
     /// What replaced the missing API (`diag.migrationHint`), static.
     hint: ?[]const u8 = null,
+    /// A fix in `file` (in `arena`).
+    fix: ?diag.RawFix = null,
 
     /// `count` repeats of the same note in a row (a recursive call's
     /// frames) render once, as upstream. `call` marks a call-site frame of
@@ -493,7 +495,11 @@ pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag
     for (zcu.errors.items) |e| {
         const notes = try arena.alloc(diag.Note, e.notes.len);
         for (notes, e.notes) |*n, en| n.* = .{ .loc = try zcu.diagLoc(arena, paths, en.file, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl };
-        try out.append(arena, .{ .code = e.code, .loc = try zcu.diagLoc(arena, paths, e.file, e.span), .msg = e.msg, .notes = notes, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint });
+        const fixes: []const diag.Fix = if (e.fix) |f|
+            try arena.dupe(diag.Fix, &.{try paths.fix(arena, zcu.file(e.file).display_path, try zcu.fe.source(@fromBackingInt(e.file)), f)})
+        else
+            &.{};
+        try out.append(arena, .{ .code = e.code, .loc = try zcu.diagLoc(arena, paths, e.file, e.span), .msg = e.msg, .notes = notes, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint, .fixes = fixes });
     }
     return out.items;
 }
