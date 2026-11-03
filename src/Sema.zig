@@ -1691,7 +1691,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .call => sema.zirCall(block, inst),
         .func, .func_inferred, .func_fancy => sema.zirFunc(block, inst),
         .field_call => sema.zirFieldCall(block, inst),
-        .builtin_call => sema.failUnsupported(block, block.nodeSrc(data.pl_node.src_node), "@call"),
+        .builtin_call => sema.zirBuiltinCall(block, inst),
         .ret_is_non_err, .is_non_err => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             break :blk sema.analyzeIsNonErr(block, src, sema.resolveInst(data.un_node.operand));
@@ -7639,7 +7639,35 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
 const CallArgs = union(enum) {
     /// Argument bodies of a ZIR `call`/`field_call`, after `first`.
     zir: struct { call_inst: Zir.Inst.Index, extra_end: usize, args_len: u32 },
+    /// Already analyzed arguments (`@call`), after `first`.
+    resolved: []const Ref,
+
+    fn len(args: CallArgs) usize {
+        return switch (args) {
+            .zir => |z| z.args_len,
+            .resolved => |r| r.len,
+        };
+    }
 };
+
+/// `@call(modifier, callee, args)`.
+fn zirBuiltinCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const ip = sema.ip;
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const src = block.nodeSrc(data.src_node);
+    const extra = sema.code.extraData(Zir.Inst.BuiltinCall, data.payload_index).data;
+    const modifier_ty = try sema.stdLangType(block, src, "CallModifier");
+    const modifier_val = try sema.resolveConstValue(block, src, try sema.coerce(block, modifier_ty, sema.resolveInst(extra.modifier), src), "call modifier must be comptime-known");
+    const modifier: std.lang.CallModifier = @fromBackingInt(@intCast(ip.intValue(u64, ip.indexToKey(modifier_val).enum_tag.int).?));
+    const callee = sema.resolveInst(extra.callee);
+    const args_tuple = sema.resolveInst(extra.args);
+    const args_ty = sema.typeOf(args_tuple);
+    if (ip.indexToKey(args_ty) != .tuple_type) return sema.fail(block, src, "expected a tuple, found '{f}'", .{sema.fmtType(args_ty)});
+    const n = ip.indexToKey(args_ty).tuple_type.types.len;
+    const args = try sema.arena.alloc(Ref, n);
+    for (args, 0..) |*a, k| a.* = try sema.tupleField(block, args_tuple, @intCast(k));
+    return sema.analyzeCall(block, src, callee, .none, .{ .resolved = args }, modifier);
+}
 
 fn zirCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
@@ -7647,7 +7675,7 @@ fn zirCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const extra = sema.code.extraData(Zir.Inst.Call, data.payload_index);
     const callee = sema.resolveInst(extra.data.callee);
     const modifier: std.lang.CallModifier = @fromBackingInt(@intCast(extra.data.flags.packed_modifier));
-    return sema.analyzeCall(block, src, callee, .none, .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len }, modifier);
+    return sema.analyzeCall(block, src, callee, .none, .{ .zir = .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len } }, modifier);
 }
 
 fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -7658,7 +7686,7 @@ fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const name = sema.zirString(extra.data.field_name_start);
     const obj = sema.resolveInst(extra.data.obj_ptr);
     const modifier: std.lang.CallModifier = @fromBackingInt(@intCast(extra.data.flags.packed_modifier));
-    const args: @FieldType(CallArgs, "zir") = .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len };
+    const args: CallArgs = .{ .zir = .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len } };
     const obj_ty = sema.typeOf(obj);
     if (obj_ty == .type_type) {
         const callee = try sema.fieldVal(block, src, obj, name);
@@ -7701,7 +7729,7 @@ fn analyzeCall(
     src: Src,
     callee: Ref,
     first_arg: Ref,
-    zir_args: @FieldType(CallArgs, "zir"),
+    call_args_in: CallArgs,
     modifier: std.lang.CallModifier,
 ) CompileError!Ref {
     const ip = sema.ip;
@@ -7732,7 +7760,7 @@ fn analyzeCall(
         else => return sema.fail(block, src, "type '{f}' not a function", .{sema.fmtType(callee_ty)}),
     };
     const fn_ty = ip.indexToKey(fn_ty_index).func_type;
-    const total_args = zir_args.args_len + @intFromBool(first_arg != .none);
+    const total_args = call_args_in.len() + @intFromBool(first_arg != .none);
     if (total_args != fn_ty.param_types.len) {
         return sema.fail(block, src, "expected {d} argument(s), found {d}", .{ fn_ty.param_types.len, total_args });
     }
@@ -7749,21 +7777,33 @@ fn analyzeCall(
         args[0] = if (fn_ty.param_types[0] == .generic_poison_type) first_arg else try sema.coerce(block, fn_ty.param_types[0], first_arg, src);
         arg_i = 1;
     }
-    var arg_start: u32 = zir_args.args_len;
-    for (0..zir_args.args_len) |k| {
-        const arg_end = sema.code.extra[zir_args.extra_end + k];
-        const body = sema.code.bodySlice(zir_args.extra_end + arg_start, arg_end - arg_start);
-        arg_start = arg_end;
-        // A generic parameter's type can depend on the arguments before it;
-        // it is the argument's result type, as upstream.
-        const param_ty = if (fn_ty.param_types[arg_i] == .generic_poison_type and func != .none)
-            try sema.genericParamType(block, src, func, args[0..arg_i])
-        else
-            fn_ty.param_types[arg_i];
-        try sema.inst_map.put(sema.gpa, zir_args.call_inst, .fromInterned(param_ty));
-        const arg = try sema.resolveInlineBody(block, body, zir_args.call_inst);
-        args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerce(block, param_ty, arg, src);
-        arg_i += 1;
+    switch (call_args_in) {
+        .zir => |zir_args| {
+            var arg_start: u32 = zir_args.args_len;
+            for (0..zir_args.args_len) |k| {
+                const arg_end = sema.code.extra[zir_args.extra_end + k];
+                const body = sema.code.bodySlice(zir_args.extra_end + arg_start, arg_end - arg_start);
+                arg_start = arg_end;
+                // A generic parameter's type can depend on the arguments before it;
+                // it is the argument's result type, as upstream.
+                const param_ty = if (fn_ty.param_types[arg_i] == .generic_poison_type and func != .none)
+                    try sema.genericParamType(block, src, func, args[0..arg_i])
+                else
+                    fn_ty.param_types[arg_i];
+                try sema.inst_map.put(sema.gpa, zir_args.call_inst, .fromInterned(param_ty));
+                const arg = try sema.resolveInlineBody(block, body, zir_args.call_inst);
+                args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerce(block, param_ty, arg, src);
+                arg_i += 1;
+            }
+        },
+        .resolved => |resolved| for (resolved) |arg| {
+            const param_ty = if (fn_ty.param_types[arg_i] == .generic_poison_type and func != .none)
+                try sema.genericParamType(block, src, func, args[0..arg_i])
+            else
+                fn_ty.param_types[arg_i];
+            args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerce(block, param_ty, arg, src);
+            arg_i += 1;
+        },
     }
 
     const ret_ty = fn_ty.return_type;
