@@ -314,6 +314,14 @@ pub const Block = struct {
         block_inst: Ir.Inst.Index,
         results: std.ArrayList(Ref) = .empty,
         brs: std.ArrayList(Ir.Inst.Index) = .empty,
+        /// Where each result comes from, for errors about it.
+        srcs: std.ArrayList(Src) = .empty,
+
+        pub fn deinit(m: *Merges, gpa: Allocator) void {
+            m.results.deinit(gpa);
+            m.brs.deinit(gpa);
+            m.srcs.deinit(gpa);
+        }
     };
 
     /// A comptime call, or a runtime inline call, being evaluated.
@@ -489,6 +497,7 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
         val_ref = try sema.coerce(&block, decl_ty, val_ref, .{ .base = decl.src_node, .loc = .var_init });
     }
     const val = try sema.resolveConstValue(&block, src, val_ref, "global variable initializer must be comptime-known");
+    if (sema.refersToComptimeAlloc(val)) return sema.fail(&block, .{ .base = decl.src_node, .loc = .var_init }, "global variable contains reference to comptime var", .{});
     nav.val = val;
     nav.ty = sema.ip.typeOf(val);
     // Emit lays out the value of any declaration code refers to.
@@ -1166,6 +1175,125 @@ fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: Comp
         try sema.zcu.addCallFrame(sema.file, src.span(tree), kind);
     }
     return err;
+}
+
+/// Fails if comptime-known `val` refers to a comptime variable: such a
+/// pointer cannot reach runtime code, which would see memory that only
+/// exists during analysis (upstream's `validateRuntimeValue`).
+fn validateRuntimeValue(sema: *Sema, block: *Block, src: Src, val: Ref) CompileError!void {
+    const v = sema.resolveValue(val) orelse return;
+    if (!sema.refersToComptimeAlloc(v)) return;
+    const err = sema.fail(block, src, "runtime value contains reference to comptime var", .{});
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    try sema.zcu.addNote(sema.file, src.span(tree), "comptime var pointers are not available at runtime", .{});
+    return err;
+}
+
+/// The source of argument `i` of the call at `src` (a method call's
+/// receiver is argument 0), or `src` itself when the call has no such
+/// argument node.
+fn callArgSrc(sema: *Sema, src: Src, has_receiver: bool, i: usize) Src {
+    const tree = sema.zcu.fe.tree(@fromBackingInt(sema.file)) catch return src;
+    const node = switch (src.loc) {
+        .node => |off| off.toAbsolute(src.base),
+        .node_abs => |n| n,
+        else => return src,
+    };
+    var buf: [2]Ast.Node.Index = undefined;
+    const params = if (tree.fullCall(buf[0..1], node)) |call| call.ast.params else tree.builtinCallParams(&buf, node) orelse return src;
+    var param = i;
+    if (has_receiver) {
+        if (i == 0) return src;
+        param -= 1;
+    }
+    if (param >= params.len) return src;
+    return .{ .base = src.base, .loc = .{ .node_abs = params[param] } };
+}
+
+/// The initializer of element `i` of aggregate type `ty` in the struct
+/// or array initialization at `src` (upstream's `init_elem`), or `src`.
+fn initElemSrc(sema: *Sema, src: Src, ty: Index, i: usize) Src {
+    const tree = sema.zcu.fe.tree(@fromBackingInt(sema.file)) catch return src;
+    const node = switch (src.loc) {
+        .node => |off| off.toAbsolute(src.base),
+        .node_abs => |n| n,
+        else => return src,
+    };
+    var buf: [2]Ast.Node.Index = undefined;
+    if (tree.fullArrayInit(&buf, node)) |ai|
+        return if (i < ai.ast.elements.len) .{ .base = src.base, .loc = .{ .node_abs = ai.ast.elements[i] } } else src;
+    const si = tree.fullStructInit(&buf, node) orelse return src;
+    // A struct initializer's field is located at its name, and named
+    // fields may be written in any order.
+    const field = if (sema.ip.keyTag(ty) == .struct_type) field: {
+        const name = sema.ip.stringSlice(sema.ip.structInfo(ty).field_names[i]);
+        for (si.ast.fields) |f| {
+            if (std.mem.eql(u8, tree.tokenSlice(tree.firstToken(f) - 2), name)) break :field f;
+        }
+        return src;
+    } else if (i < si.ast.fields.len) si.ast.fields[i] else return src;
+    return .{ .base = src.base, .loc = .{ .token = .init(tree.firstToken(src.base), tree.firstToken(field) - 2) } };
+}
+
+/// The operand of output (or input) `i` of the `asm` at `src`, or `src`.
+fn asmOperandSrc(sema: *Sema, src: Src, output: bool, i: usize) Src {
+    const tree = sema.zcu.fe.tree(@fromBackingInt(sema.file)) catch return src;
+    const node = switch (src.loc) {
+        .node => |off| off.toAbsolute(src.base),
+        .node_abs => |n| n,
+        else => return src,
+    };
+    const full = tree.fullAsm(node) orelse return src;
+    if (!output) {
+        if (i >= full.inputs.len) return src;
+        return .{ .base = src.base, .loc = .{ .node_abs = tree.nodeData(full.inputs[i]).node_and_token[0] } };
+    }
+    if (i >= full.outputs.len) return src;
+    const data = tree.nodeData(full.outputs[i]).opt_node_and_token;
+    if (data[0].unwrap()) |n| return .{ .base = src.base, .loc = .{ .node_abs = n } };
+    // The operand is the name before the `)` token.
+    return .{ .base = src.base, .loc = .{ .token = .init(tree.firstToken(src.base), data[1] - 1) } };
+}
+
+/// The indexed operand of the element access at `src`, or `src`.
+fn indexableSrc(sema: *Sema, src: Src) Src {
+    const tree = sema.zcu.fe.tree(@fromBackingInt(sema.file)) catch return src;
+    const node = switch (src.loc) {
+        .node => |off| off.toAbsolute(src.base),
+        .node_abs => |n| n,
+        else => return src,
+    };
+    if (tree.nodeTag(node) != .array_access) return src;
+    return .{ .base = src.base, .loc = .{ .node_abs = tree.nodeData(node).node_and_node[0] } };
+}
+
+/// The stored operand of the assignment or variable declaration at `src`
+/// (upstream's `node_offset_store_operand`), or `src` itself.
+fn storeOperandSrc(sema: *Sema, src: Src) Src {
+    const tree = sema.zcu.fe.tree(@fromBackingInt(sema.file)) catch return src;
+    const node = switch (src.loc) {
+        .node => |off| off.toAbsolute(src.base),
+        .node_abs => |n| n,
+        else => return src,
+    };
+    const operand: Ast.Node.Index = switch (tree.nodeTag(node)) {
+        .assign => tree.nodeData(node).node_and_node[1],
+        else => if (tree.fullVarDecl(node)) |vd| vd.ast.init_node.unwrap() orelse return src else return src,
+    };
+    return .{ .base = src.base, .loc = .{ .node_abs = operand } };
+}
+
+/// The operand of the `return` at `src`, or `src` for a bare `return`.
+fn returnOperandSrc(sema: *Sema, src: Src) Src {
+    const tree = sema.zcu.fe.tree(@fromBackingInt(sema.file)) catch return src;
+    const node = switch (src.loc) {
+        .node => |off| off.toAbsolute(src.base),
+        .node_abs => |n| n,
+        else => return src,
+    };
+    if (tree.nodeTag(node) != .@"return") return src;
+    const operand = tree.nodeData(node).opt_node.unwrap() orelse return src;
+    return .{ .base = src.base, .loc = .{ .node_abs = operand } };
 }
 
 /// Converts a dependency loop reported by the Zcu into a compile error here.
@@ -1847,12 +1975,13 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 if (!block.is_comptime) {
                     // To an enclosing runtime block (see `zirBlockInline`).
                     const brk = data.@"break";
-                    const target = sema.code.extraData(Zir.Inst.Break, brk.payload_index).data.block_inst;
+                    const brk_extra = sema.code.extraData(Zir.Inst.Break, brk.payload_index).data;
+                    const target = brk_extra.block_inst;
                     var it: ?*Block = block;
                     while (it) |cur| : (it = cur.parent) {
                         const label = cur.label orelse continue;
                         if (label.zir_block == target) {
-                            try sema.addBr(block, label, sema.resolveInst(brk.operand));
+                            try sema.addBr(block, label, sema.resolveInst(brk.operand), breakOperandSrc(block, brk_extra, block.nodeSrc(.zero)));
                             return;
                         }
                     }
@@ -1952,7 +2081,8 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 }
                 const operand = if (tags[@backingInt(inst)] == .ret_node) data.un_node.operand else data.un_tok.operand;
                 const src = if (tags[@backingInt(inst)] == .ret_node) block.nodeSrc(data.un_node.src_node) else block.tokSrc(data.un_tok.src_tok);
-                try sema.analyzeRet(block, sema.resolveInst(operand), src);
+                const operand_src = if (tags[@backingInt(inst)] == .ret_node) sema.returnOperandSrc(src) else src;
+                try sema.analyzeRet(block, sema.resolveInst(operand), src, operand_src);
                 return;
             },
             .save_err_ret_index => {
@@ -1973,7 +2103,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
             .ret_load => {
                 const src = block.nodeSrc(data.un_node.src_node);
                 const val = try sema.analyzeLoad(block, src, sema.resolveInst(data.un_node.operand));
-                try sema.analyzeRet(block, val, src);
+                try sema.analyzeRet(block, val, src, sema.returnOperandSrc(src));
                 return;
             },
             .ret_err_value => {
@@ -1981,7 +2111,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 const name = try sema.getString(data.str_tok.get(sema.code.*));
                 const err_ty = try sema.intern(.{ .error_set_type = &.{name} });
                 const val = try sema.intern(.{ .err = .{ .ty = err_ty, .name = name } });
-                try sema.analyzeRet(block, .fromInterned(val), src);
+                try sema.analyzeRet(block, .fromInterned(val), src, src);
                 return;
             },
             .@"unreachable" => {
@@ -2181,8 +2311,7 @@ fn zirBlock(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     child.label = &label;
     defer {
         child.instructions.deinit(sema.gpa);
-        label.merges.results.deinit(sema.gpa);
-        label.merges.brs.deinit(sema.gpa);
+        label.merges.deinit(sema.gpa);
     }
     // A comptime break to this block (from a nested inline body) delivers
     // the result directly.
@@ -2193,7 +2322,7 @@ fn zirBlock(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref 
             return result;
         }
         // Mixed: a runtime br plus a comptime break. Turn the latter into a br.
-        try sema.addBr(&child, &label, result);
+        try sema.addBr(&child, &label, result, parent.nodeSrc(data.src_node));
     }
     return sema.resolveBlock(parent, parent.nodeSrc(data.src_node), &child, &label.merges);
 }
@@ -2225,6 +2354,7 @@ fn resolveBlock(sema: *Sema, parent: *Block, src: Src, child: *Block, merges: *B
     if (sema.bc != null) for (results[1..]) |r| {
         if (sema.typeOf(r) != sema.typeOf(results[0])) try sema.bcRefuse();
     };
+    for (results, merges.srcs.items) |result, result_src| try sema.validateRuntimeValue(child, result_src, result);
     const result_ty = try sema.resolvePeerTypes(parent, src, results);
     try sema.resolveLayout(parent, src, result_ty);
     for (merges.brs.items, results) |br, result| {
@@ -2271,10 +2401,16 @@ fn coerceBrOperand(sema: *Sema, b: *Block, inst: Ir.Inst.Index, ty: Index, opera
     sema.ir_insts.set(@backingInt(inst), .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = block_ty, .payload = payload } } });
 }
 
-fn addBr(sema: *Sema, b: *Block, label: *Block.Label, operand: Ref) !void {
+fn addBr(sema: *Sema, b: *Block, label: *Block.Label, operand: Ref, src: Src) !void {
     const br = try sema.addInst(b, .{ .tag = .br, .data = .{ .br = .{ .block_inst = label.merges.block_inst, .operand = operand } } });
     try label.merges.results.append(sema.gpa, operand);
     try label.merges.brs.append(sema.gpa, br.toIndex().?);
+    try label.merges.srcs.append(sema.gpa, src);
+}
+
+/// Where the operand of ZIR `break` `extra` comes from.
+fn breakOperandSrc(b: *Block, extra: Zir.Inst.Break, fallback: Src) Src {
+    return if (extra.operand_src_node.unwrap()) |n| b.nodeSrc(n) else fallback;
 }
 
 fn zirBreak(sema: *Sema, b: *Block, inst: Zir.Inst.Index) CompileError!void {
@@ -2284,7 +2420,7 @@ fn zirBreak(sema: *Sema, b: *Block, inst: Zir.Inst.Index) CompileError!void {
     var it: ?*Block = b;
     while (it) |cur| : (it = cur.parent) {
         const label = cur.label orelse continue;
-        if (label.zir_block == extra.block_inst) return sema.addBr(b, label, operand);
+        if (label.zir_block == extra.block_inst) return sema.addBr(b, label, operand, breakOperandSrc(b, extra, b.nodeSrc(.zero)));
     }
     if (sema.bc != null and try sema.bcOsrExit(b, inst, extra.block_inst)) return;
     // The target is an inline block (for example an `inline` loop) outside
@@ -2326,8 +2462,7 @@ fn zirLoop(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     loop_block.loop = loop_inst;
     defer {
         loop_block.instructions.deinit(gpa);
-        label.merges.results.deinit(gpa);
-        label.merges.brs.deinit(gpa);
+        label.merges.deinit(gpa);
     }
     try sema.analyzeBodyInner(&loop_block, body);
     const loop_payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(loop_block.instructions.items.len) });
@@ -2342,6 +2477,7 @@ fn zirLoop(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         return .unreachable_value;
     }
     const src = parent.nodeSrc(data.src_node);
+    for (label.merges.results.items, label.merges.srcs.items) |result, result_src| try sema.validateRuntimeValue(parent, result_src, result);
     const result_ty = try sema.resolvePeerTypes(parent, src, label.merges.results.items);
     for (label.merges.brs.items, label.merges.results.items) |br, result| try sema.coerceBrOperand(&outer, br, result_ty, result, src);
     try sema.addBlock(parent, block_inst, result_ty, outer.instructions.items);
@@ -2369,7 +2505,9 @@ fn zirCondbr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!?[]
     return null;
 }
 
-fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src) CompileError!void {
+/// `operand_src` is the returned expression, where coercion errors point,
+/// as upstream.
+fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src, operand_src: Src) CompileError!void {
     if (b.inlining) |inlining| {
         // An inlined function's inferred error set is what its returns
         // produce.
@@ -2383,17 +2521,18 @@ fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src) CompileError!void 
             };
             ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = set, .payload_type = sema.ip.keyPayload(.error_union_type, ty).payload_type } });
         }
-        const coerced = try sema.coerce(b, ty, operand, src);
+        const coerced = try sema.coerce(b, ty, operand, operand_src);
         if (inlining.merges) |merges| if (!b.is_comptime) {
             if (!b.is_typeof and sema.isErrorType(ty)) try sema.maybePushErrorTrace(b, src, coerced);
             const br = try sema.addInst(b, .{ .tag = .br, .data = .{ .br = .{ .block_inst = merges.block_inst, .operand = coerced } } });
             try merges.results.append(sema.gpa, coerced);
             try merges.brs.append(sema.gpa, br.toIndex().?);
+            try merges.srcs.append(sema.gpa, operand_src);
             return;
         };
         // A return from a comptime block of a runtime inline call ends
         // the call with a comptime-known result (see `inlineCall`).
-        if (b.is_comptime) _ = try sema.resolveConstValue(b, src, coerced, "value returned at comptime must be comptime-known");
+        if (b.is_comptime) _ = try sema.resolveConstValue(b, operand_src, coerced, "value returned at comptime must be comptime-known");
         inlining.result = coerced;
         return error.ComptimeReturn;
     }
@@ -2401,7 +2540,8 @@ fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src) CompileError!void 
     if (sema.fn_ret_ty == .none) try sema.bcRefuse();
     if (b.is_comptime) return sema.fail(b, src, "function called at runtime cannot return value at comptime", .{});
     try sema.recordInferredErrors(b, src, operand);
-    const coerced = try sema.coerce(b, sema.fn_ret_ty, operand, src);
+    const coerced = try sema.coerce(b, sema.fn_ret_ty, operand, operand_src);
+    try sema.validateRuntimeValue(b, operand_src, coerced);
     if (sema.isErrorType(sema.fn_ret_ty)) try sema.maybePushErrorTrace(b, src, coerced);
     _ = try sema.addUnOp(b, .ret, coerced);
 }
@@ -8434,6 +8574,7 @@ fn zirStoreToInferredPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compi
             break;
         };
     }
+    if (!ia.is_const) try sema.validateRuntimeValue(block, sema.storeOperandSrc(src), operand);
     const store = try sema.addBinOp(block, .store, ptr, operand);
     try ia.stores.append(sema.gpa, store.toIndex().?);
 }
@@ -8475,6 +8616,7 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
         };
     }
     if ((try sema.isComptimeOnlyResolved(block, src, ty))) return sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
+    if (ia.is_const) for (operands) |op| try sema.validateRuntimeValue(block, src, op);
     try sema.resolveLayout(block, src, ty);
     const ptr_ty = try sema.allocPtrType(ty, ia.alignment);
     sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = ptr_ty };
@@ -8499,7 +8641,9 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ptr_ty)});
     const info = Type.ptrInfo(ip, ptr_ty);
     if (info.flags.is_const) return sema.fail(block, src, "cannot assign to constant", .{});
-    const operand = try sema.coerce(block, info.child, uncasted, src);
+    // Errors about the stored value point at it, as upstream.
+    const operand_src = sema.storeOperandSrc(src);
+    const operand = try sema.coerce(block, info.child, uncasted, operand_src);
     if (sema.resolveValue(ptr)) |pv| if (!sema.bcForeign(pv)) {
         if (sema.intoComptimeField(pv)) {
             // A store into a comptime field (or a part of it) only checks
@@ -8515,6 +8659,7 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     };
     try sema.trackConstStore(block, ptr, operand);
     try sema.requireRuntime(block, src);
+    try sema.validateRuntimeValue(block, operand_src, operand);
     try sema.resolveLayout(block, src, info.child);
     if (!Type.hasRuntimeBits(ip, info.child)) return;
     // The comptime evaluator stores through bit pointers as the walker does.
@@ -10557,6 +10702,8 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag)
         }
     };
     try sema.requireRuntime(block, src);
+    try sema.validateRuntimeValue(block, sema.callArgSrc(src, false, 0), dest);
+    try sema.validateRuntimeValue(block, sema.callArgSrc(src, false, 1), source);
     if ((try sema.isComptimeOnlyResolved(block, src, d.elem))) return sema.fail(block, src, "cannot copy comptime-only type '{f}' at runtime", .{sema.fmtType(d.elem)});
 
     // The IR form: `dest` gives the length, `source` is a pointer.
@@ -10612,6 +10759,8 @@ fn zirMemset(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         }
     };
     try sema.requireRuntime(block, src);
+    try sema.validateRuntimeValue(block, sema.callArgSrc(src, false, 0), dest);
+    try sema.validateRuntimeValue(block, sema.callArgSrc(src, false, 1), elem);
     if ((try sema.isComptimeOnlyResolved(block, src, d.elem))) return sema.fail(block, src, "cannot store comptime-only element '{f}' at runtime", .{sema.fmtType(d.elem)});
     _ = try sema.addBinOp(block, .memset, dest, elem);
     return .void_value;
@@ -10899,6 +11048,7 @@ fn elemPtrOfSlice(sema: *Sema, block: *Block, src: Src, slice: Ref, uncasted_ind
         if (iv) |v| return .fromInterned(try sema.ptrElemPtrVal(sema.ip.keyPayload(.slice, sv).ptr, sema.ip.intValue(u64, v).?));
     }
     try sema.requireRuntime(block, src);
+    try sema.validateRuntimeValue(block, sema.indexableSrc(src), slice);
     return sema.addTyPlBin(block, .slice_elem_ptr, elem_ptr_ty, slice, index);
 }
 
@@ -10913,6 +11063,7 @@ fn elemPtrOfArrayPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref)
     };
     try sema.requireRuntime(block, src);
     try sema.runtimeElemAccess(block, src, elem_ty);
+    try sema.validateRuntimeValue(block, sema.indexableSrc(src), ptr);
     return sema.addTyPlBin(block, .ptr_elem_ptr, result_ty, ptr, index);
 }
 
@@ -10925,6 +11076,7 @@ fn elemPtrOfManyPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) 
             return .fromInterned(try sema.ptrElemPtrVal(pv, sema.ip.intValue(u64, iv).?));
     };
     try sema.requireRuntime(block, src);
+    try sema.validateRuntimeValue(block, sema.indexableSrc(src), ptr);
     return sema.addTyPlBin(block, .ptr_elem_ptr, result_ty, ptr, index);
 }
 
@@ -11556,8 +11708,7 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     const block_inst = try sema.reserveInst();
     var label: Block.Label = .{ .zir_block = inst, .merges = .{ .block_inst = block_inst } };
     defer {
-        label.merges.results.deinit(gpa);
-        label.merges.brs.deinit(gpa);
+        label.merges.deinit(gpa);
     }
     var outer = parent.child();
     outer.label = &label;
@@ -11568,7 +11719,7 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     defer then_block.instructions.deinit(gpa);
     if (cond_val != .bool_false) {
         if (non_err.capture != .none) try sema.inst_map.put(gpa, inst, try sema.errUnionCapture(&then_block, src, eu, eu_ptr, non_err.capture));
-        if (try sema.analyzeInlineBody(&then_block, non_err.body, inst)) |result| try sema.addBr(&then_block, &label, result);
+        if (try sema.analyzeInlineBody(&then_block, non_err.body, inst)) |result| try sema.addBr(&then_block, &label, result, src);
     }
     var else_block = outer.condChild();
     defer else_block.instructions.deinit(gpa);
@@ -11577,7 +11728,7 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
         // Prong bodies refer to the error (the switch operand) as `inst`.
         try sema.inst_map.put(gpa, inst, code);
         const result = try sema.analyzeSwitch(&else_block, src, inst, code, .none);
-        if (sema.typeOf(result) != .noreturn_type) try sema.addBr(&else_block, &label, result);
+        if (sema.typeOf(result) != .noreturn_type) try sema.addBr(&else_block, &label, result, src);
     }
     if (cond_val) |v| {
         const chosen = if (v == .bool_true) &then_block else &else_block;
@@ -11941,8 +12092,7 @@ fn switchProngsRuntime(
     const block_inst = if (enclosing == null) try sema.reserveInst() else undefined;
     var label: Block.Label = .{ .zir_block = inst, .merges = .{ .block_inst = block_inst } };
     defer {
-        label.merges.results.deinit(gpa);
-        label.merges.brs.deinit(gpa);
+        label.merges.deinit(gpa);
     }
     var outer = parent.child();
     if (enclosing == null) outer.label = &label;
@@ -12012,8 +12162,7 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
     const loop_inst = try sema.reserveInst();
     var label: Block.Label = .{ .zir_block = inst, .merges = .{ .block_inst = block_inst } };
     defer {
-        label.merges.results.deinit(gpa);
-        label.merges.brs.deinit(gpa);
+        label.merges.deinit(gpa);
     }
     var outer = parent.child();
     outer.label = &label;
@@ -12237,7 +12386,7 @@ fn analyzeProng(sema: *Sema, block: *Block, c: SwitchCase, operand: Ref, capture
     }
     if (try sema.analyzeInlineBody(block, c.body, switch_inst)) |result| {
         // A prong ended with a comptime break to the switch.
-        try sema.addBr(block, labelOf(block, switch_inst).?, result);
+        try sema.addBr(block, labelOf(block, switch_inst).?, result, block.nodeSrc(.zero));
     }
 }
 
@@ -12285,6 +12434,7 @@ fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref
     }
     if (all_comptime) return .fromInterned(try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = vals } } }));
     try sema.requireRuntime(block, src);
+    for (elems, vals, 0..) |e, v, i| if (v != .none) try sema.validateRuntimeValue(block, sema.initElemSrc(src, ty, i), e);
     try sema.resolveLayout(block, src, ty);
     if (Type.isPackedStruct(sema.ip, ty) and sema.bc == null) {
         const backing = sema.ip.structInfo(ty).tag_type;
@@ -13391,17 +13541,23 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         if (is_type) {
             if (result_ty != .void_type) return sema.failUnsupported(block, src, "inline assembly with more than one result output");
             result_ty = try sema.resolveType(block, src, o.data.operand);
-        } else operand = sema.resolveInst(o.data.operand);
+        } else {
+            operand = sema.resolveInst(o.data.operand);
+            if (sema.resolveValue(operand)) |v| if (sema.refersToComptimeAlloc(v))
+                return sema.fail(block, sema.asmOperandSrc(src, true, k), "assembly output contains reference to comptime var", .{});
+        }
         try operands.append(gpa, .{
             .name = try sema.getString(sema.zirString(o.data.name)),
             .constraint = try sema.getString(sema.zirString(o.data.constraint)),
             .operand = operand,
         });
     }
-    for (0..small.inputs_len) |_| {
+    for (0..small.inputs_len) |k| {
         const in = sema.code.extraData(Zir.Inst.Asm.Input, i);
         i = in.end;
         var operand = sema.resolveInst(in.data.operand);
+        if (sema.resolveValue(operand)) |v| if (sema.refersToComptimeAlloc(v))
+            return sema.fail(block, sema.asmOperandSrc(src, false, k), "assembly input contains reference to comptime var", .{});
         const ty = sema.typeOf(operand);
         if (ty == .comptime_int_type) operand = try sema.coerce(block, .usize_type, operand, src);
         if ((try sema.isComptimeOnlyResolved(block, src, sema.typeOf(operand)))) return sema.fail(block, src, "inline assembly input of comptime-only type '{f}'", .{sema.fmtType(sema.typeOf(operand))});
@@ -13869,6 +14025,12 @@ fn analyzeCall(
         }
     }
     try sema.requireRuntime(block, src);
+    // Arguments of runtime parameters, by their position in `args`.
+    const inst_comptime_args = ip.keyPayload(.func, callee_func).comptime_args;
+    for (args, 0..) |a, i| {
+        if (inst_comptime_args.len != 0 and (i >= inst_comptime_args.len or inst_comptime_args[i] != .none)) continue;
+        try sema.validateRuntimeValue(block, sema.callArgSrc(src, first_arg != .none, i), a);
+    }
     const callee_fn_ty = ip.keyPayload(.func_type, ip.typeOf(callee_func));
     for (callee_fn_ty.param_types) |pt| {
         if (try sema.isComptimeOnlyResolved(block, src, pt)) return sema.fail(block, src, "parameter of comptime-only type '{f}' must be declared comptime", .{sema.fmtType(pt)});
@@ -14053,8 +14215,7 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref) C
 
     var merges: Block.Merges = .{ .block_inst = try sema.reserveInst() };
     defer {
-        merges.results.deinit(gpa);
-        merges.brs.deinit(gpa);
+        merges.deinit(gpa);
     }
     var inlining: Block.Inlining = .{ .func = func, .ret_ty = ret_ty, .args = comptime_args, .merges = &merges };
     var child: Block = .{
