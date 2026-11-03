@@ -45,6 +45,9 @@ dep_maps: std.ArrayList(@import("Incremental.zig").DependeeMap) = .empty,
 /// Recently interned strings by the address of their bytes, for
 /// `Sema.getString` (allocated on first use). Sema-only.
 string_cache: []StringCacheEntry = &.{},
+/// The pointer `Sema.navRef` makes to each resolved declaration, which
+/// code takes again and again. Sema-only.
+nav_ptrs: std.AutoHashMapUnmanaged(InternPool.NavIndex, InternPool.Index) = .empty,
 /// Analysis state of runtime function bodies.
 funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, FuncState) = .empty,
 func_queue: std.ArrayList(InternPool.Index) = .empty,
@@ -370,6 +373,7 @@ pub fn deinit(zcu: *Zcu) void {
     for (zcu.dep_maps.items) |*m| m.deinit(gpa);
     zcu.dep_maps.deinit(gpa);
     gpa.free(zcu.string_cache);
+    zcu.nav_ptrs.deinit(gpa);
     zcu.effect_uses.deinit(gpa);
     var bodies = zcu.comptime_bodies.valueIterator();
     while (bodies.next()) |b| switch (b.*) {

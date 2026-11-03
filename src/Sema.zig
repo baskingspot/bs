@@ -4851,6 +4851,9 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     // A referenced variable is emitted with its type's layout (`var global:
     // @This()` inside the struct leaves it unresolved until now).
     if (!nav.is_const) try sema.resolveLayoutIfIdle(block, src, nav.ty);
+    // The address of a resolved declaration is the same value each time.
+    const cacheable = nav.status == .resolved and nav.linkage != .@"extern" and !(nav.is_threadlocal and !block.is_comptime);
+    if (cacheable) if (sema.zcu.nav_ptrs.get(nav_index)) |ptr| return .fromInterned(ptr);
     // An explicit alignment shows in the pointer type, as upstream, even
     // when it is the natural one (`&f` for `fn f() align(1)`).
     const alignment: u6 = if (nav.alignment == 0) 0 else @intCast(std.math.log2_int(u64, nav.alignment) + 1);
@@ -4865,7 +4868,9 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     if (nav.is_threadlocal and !block.is_comptime) {
         return sema.addInst(block, .{ .tag = .tls_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(nav_index) } } });
     }
-    return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .nav = nav_index } } }));
+    const ptr = try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .nav = nav_index } } });
+    if (cacheable) try sema.zcu.nav_ptrs.put(sema.gpa, nav_index, ptr);
+    return .fromInterned(ptr);
 }
 
 fn isExternVar(ip: *const InternPool, nav: *const InternPool.Nav) bool {

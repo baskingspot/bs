@@ -2988,6 +2988,38 @@ new. What changed:
   its map rehashed every string's bytes on growth. String map entries now
   carry a 32-bit hash, as item entries carry `lookupHash`.
 
+Pointer and name round (against origin/main 40b29a8, same measures): zig
+workload 46.50 G → 45.44 G instructions (−2.3%), libvaxis 1.478 G →
+1.455 G (−1.6%); output identical. What changed, with each change's
+share on the zig workload:
+
+- Comptime loads through a pointer key (−0.46 G). Reading a field or an
+  element of a comptime-known aggregate (`a.f` through a pointer, `a[i]`
+  through an array or slice pointer, ZIR `elem_ptr_load`) built and
+  interned the field or element pointer only to load through it at once.
+  `loadField`, `loadElem` and `elemVal` now make its `InternPool.Ptr`
+  key, after the same checks `fieldPtr` and `elemPtr` make, and load
+  through the key (`comptimeLoadKey`, `mutLoadKey`). A load that would
+  need reinterpreting memory falls back to the pointer path, and so
+  does anything under the bytecode lowering (`sema.bc`), whose
+  dependency and memo records are left as they were.
+- `Sema.getString` keeps a 4096-entry direct-mapped cache in the Zcu
+  keyed by the address of the bytes and checked against the string
+  (−0.24 G): most names come from ZIR, and a unit interns the same few
+  over and over.
+- `navRef` keeps the pointer it made to a resolved, non-extern
+  declaration (`Zcu.nav_ptrs`, −0.29 G). The cache sits after
+  `ensureNavVal` and function queueing, so dependencies are unchanged.
+- Child blocks take their instruction list from a per-Sema pool and give
+  it back emptied (`Block.deinitInsts`, −0.06 G).
+
+All three caches are written and read by Sema only, so CodeGen workers
+never see them; once Sema is parallel they become per analysis thread,
+as `Zcu.dep_maps` does. What remains of new pointer values is `analyzeRef`
+(about 0.9 M calls: ZIR `ref` and `++` operands) and `fieldPtrAt` for
+stores and real references (about 0.45 M); after those come
+`instantiate`, `foldArithmetic` and aggregate interning.
+
 Measuring note: valgrind runs x87 arithmetic at 64-bit precision, so
 binaries a callgrind run emits can differ from native ones in `f80`
 constants that comptime computed (compiler_rt's `rem_pio2l`); compare
