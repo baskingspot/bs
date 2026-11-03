@@ -6009,6 +6009,34 @@ an agent waits for most. The change:
 - `ZAP_CACHE_CHECK` also compares replayed diagnostics with a fresh
   build's, as rendered text, byte for byte.
 
+**How it meets replay step 4b** (agreed with the cache thread; to be
+built after 4b lands):
+
+- *Emit, then record as usual.* After Sema errors, Emit finishes partly:
+  merge the jobs, stop the workers, lower the declarations and group the
+  atoms, but skip extern slots, the error table and the entry check. If
+  lowering itself fails, nothing is recorded. Marking green functions as
+  still needing codegen does not work: a green function keeps no IR, so
+  generating its code means analyzing it again.
+- *No link.* Record writes entry 0, no link node, and no `noteOutput`.
+  A `failed` bit in `Manifest.Flags` marks failed nodes, counted like
+  `base_unlinked`; `relinkIfUnchanged` refuses while the count is not 0,
+  so a no-edit build after an error never relinks the last good binary.
+- *Failed always loses.* Failed nodes are seeded like `stale` ones, and
+  `Replay.greenNode` answers red for a failed node before any other
+  check. A failed unit is recorded with its deps and refs and no
+  result, so the walk reaches it along the cold build's edges. On a
+  failing lazy build, a fallback from `recordDelta` skips the record
+  instead of rebuilding eagerly: the diagnostics are already final.
+- *The reference trace.* Each node records its first referrer (node and
+  span; the file follows from the referrer) in a base section and in
+  `NodeDelta`, and Replay supplies `referenced_by` from it for units it
+  hands to analysis that nothing in this build referred to. Recording a
+  node again keeps its old referrer while that one still refers to it,
+  so a lazy build names the same first referrer as a cold build.
+- Error order needs nothing: `zcu.errors` is sorted by unit key and
+  position, so the same failed set prints in the same order.
+
 ### Extra errors: zap-only checks (not adopted; background)
 
 The owner decided against zap-only checks for now (2026-11-03). This
