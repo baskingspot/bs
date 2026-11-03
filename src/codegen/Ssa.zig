@@ -95,6 +95,10 @@ pub const Live = struct {
     /// A clobber point (`liveness`) lies inside the interval, where the
     /// value is still needed afterwards.
     crosses: bool,
+    /// After `allocate`, for a value marked `want_pair` that got registers:
+    /// the register of its high eightbyte (`reg` holds the low one); else
+    /// `no_reg`.
+    reg2: u8,
     /// How the value is computed, from `plan`.
     fate: Fate,
     /// From `plan`, for a load of a promoted variable: the variable (an IR
@@ -123,6 +127,9 @@ pub const no_tie = std.math.maxInt(u32);
 
 pub const no_reg: u8 = 0xff;
 pub const want_reg: u8 = 0xfe;
+/// Like `want_reg`, for a value that needs two registers: a 9- to 16-byte
+/// value as its two eightbytes (`reg` the low, `reg2` the high one).
+pub const want_pair: u8 = 0xfd;
 
 pub const Value = struct {
     op: Op,
@@ -377,8 +384,8 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
 /// - Arguments are all moved at the entry, so an unused one, whose interval
 ///   ends there, takes no register.
 /// - Promotion: a non-volatile alloc whose type is in a general-purpose
-///   register (`ctx.inGpr`) and whose address is only loaded from and
-///   stored to, so it is never taken, gets `want_reg`, and its loads and
+///   register (`ctx.inGpr`) or two (`ctx.inPair`) and whose address is only loaded from and
+///   stored to, so it is never taken, gets `want_reg` (`want_pair`), and its loads and
 ///   stores are moves. This is mem2reg without renaming: the variable
 ///   keeps one register for its interval, which `liveness` extends over
 ///   the loops that use it, so it needs no phis. A load may share the
@@ -395,6 +402,7 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     const def = live.items(.def);
     const fate = live.items(.fate);
     const share = live.items(.share);
+    @memset(live.items(.reg2), no_reg);
     @memset(fate, .normal);
     @memset(share, no_tie);
     f.pairs.clearRetainingCapacity();
@@ -469,9 +477,11 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     const ty = datas[i].ty;
                     if (ty == .none) continue;
                     const info = Type.ptrInfo(ip, ty);
-                    if (info.flags.is_volatile or !ctx.inGpr(info.child)) continue;
+                    if (info.flags.is_volatile) continue;
+                    const pair = !ctx.inGpr(info.child);
+                    if (pair and !ctx.inPair(info.child)) continue;
                     count[i] = candidate;
-                    try f.candidates.append(gpa, i);
+                    try f.candidates.append(gpa, i | @as(u32, @intFromBool(pair)) << 31);
                 },
                 .load => if (fate[i] != .dead) {
                     const v = @backingInt(datas[i].ty_op.operand.toIndex() orelse continue);
@@ -494,16 +504,17 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     // A candidate whose every use is a load or a store's address is
     // promoted (see `plan`).
     const tie = live.items(.tie);
-    for (f.candidates.items) |v| {
+    for (f.candidates.items) |c| {
+        const v = c & ~(@as(u32, 1) << 31);
         if (candidate - count[v] == uses[v]) {
-            reg[v] = want_reg;
+            reg[v] = if (c >> 31 != 0) want_pair else want_reg;
             tie[v] = no_tie;
         }
         count[v] = no_tie;
     }
     for (f.var_loads.items) |l| {
         const v = datas[l].ty_op.operand.toIndex().?;
-        if (reg[@backingInt(v)] == want_reg and reg[l] == want_reg) share[l] = f.shareable(ir, @fromBackingInt(l), v);
+        if (reg[@backingInt(v)] == reg[l] and (reg[l] == want_reg or reg[l] == want_pair)) share[l] = f.shareable(ir, @fromBackingInt(l), v);
     }
 }
 
@@ -681,18 +692,21 @@ pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 }
 
 /// Linear-scan register allocation (Poletto and Sarkar) over the values
-/// `liveness` gave intervals and the architecture marked `want_reg`, with
-/// `n` registers, in order of definition. Only the registers in `survives`
-/// may hold a value that crosses a clobber point; a value that crosses
-/// none prefers the others. When none is free, the value whose interval
-/// ends last among those holding a register it could use is kept in memory
-/// for its whole life. Values stay in their register through their last
-/// use, so a result shares a register only with its tied operand. Returns
-/// the mask of registers used.
+/// `liveness` gave intervals and the architecture marked `want_reg` or
+/// `want_pair`, with `n` registers, in order of definition. Only the
+/// registers in `survives` may hold a value that crosses a clobber point;
+/// a value that crosses none prefers the others. When none is free, the
+/// value whose interval ends last among those holding a register it could
+/// use is kept in memory for its whole life. A pair gets two free
+/// registers or stays in memory, and is never evicted. Values stay in
+/// their registers through their last use, so a result shares a register
+/// only with its tied operand or, for a load of a promoted variable, with
+/// the variable (`Live.share`). Returns the mask of registers used.
 pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
     assert(n <= max_regs);
     const s = f.live.slice();
     const reg = s.items(.reg);
+    const reg2 = s.items(.reg2);
     const def = s.items(.def);
     const end = s.items(.end);
     const tie = s.items(.tie);
@@ -708,12 +722,13 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
     var used: u32 = 0;
     for (f.values.items(.inst)) |inst_index| {
         const inst = @backingInt(inst_index);
-        if (reg[inst] != want_reg) continue;
+        if (reg[inst] != want_reg and reg[inst] != want_pair) continue;
         var j: u8 = 0;
         while (j < active_len) {
             const a = active[j];
             if (end[a] < def[inst]) {
                 free |= @as(u32, 1) << @intCast(reg[a]);
+                if (reg2[a] != no_reg) free |= @as(u32, 1) << @intCast(reg2[a]);
                 active_len -= 1;
                 active[j] = active[active_len];
             } else j += 1;
@@ -723,12 +738,32 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
         if (v != no_tie and reg[v] < n) {
             reg[inst] = reg[v];
             held[reg[v]] = @max(held[reg[v]], end[inst]);
+            if (reg2[v] != no_reg) reg2[inst] = reg2[v];
+            continue;
+        }
+        if (reg[inst] == want_pair) {
+            // Two registers or none; a pair neither evicts nor is evicted.
+            const avail = free & usable;
+            if (@popCount(avail) < 2) {
+                reg[inst] = no_reg;
+                continue;
+            }
+            const pick = if (@popCount(avail & ~survives) >= 2 and !crosses[inst]) avail & ~survives else avail;
+            const lo: u8 = @intCast(@ctz(pick));
+            const hi: u8 = @intCast(@ctz(pick & ~(@as(u32, 1) << @intCast(lo))));
+            const bits = @as(u32, 1) << @intCast(lo) | @as(u32, 1) << @intCast(hi);
+            free &= ~bits;
+            used |= bits;
+            reg[inst] = lo;
+            reg2[inst] = hi;
+            active[active_len] = inst;
+            active_len += 1;
             continue;
         }
         const t = tie[inst];
         // Not a register a load shares, which its variable still holds.
         if (t != no_tie and end[t] == def[inst] and reg[t] < n and usable >> @intCast(reg[t]) & 1 != 0 and
-            (share[t] == no_tie or reg[share[t]] != reg[t]))
+            reg2[t] == no_reg and (share[t] == no_tie or reg[share[t]] != reg[t]))
         {
             // Take over the tied operand's register, which dies here.
             const k = std.mem.indexOfScalar(u32, active[0..active_len], t).?;
@@ -748,7 +783,7 @@ pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
         }
         var last: ?u8 = null;
         for (active[0..active_len], 0..) |a, k| {
-            if (usable >> @intCast(reg[a]) & 1 == 0 or held[reg[a]] >= def[inst]) continue;
+            if (usable >> @intCast(reg[a]) & 1 == 0 or held[reg[a]] >= def[inst] or reg2[a] != no_reg) continue;
             if (last == null or end[a] > end[active[last.?]]) last = @intCast(k);
         }
         const victim = if (last) |l| active[l] else {
