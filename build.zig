@@ -157,10 +157,10 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                     \\mkdir -p "$4.d"
                     \\cp "$3" "$4.d/rt.zig"
                     \\cp "$1" "$4.d/{0s}"
-                    \\"$5" build-exe "$4.d/{0s}" -femit-bin="$4"
+                    \\"$5" build-exe -target x86_64-linux "$4.d/{0s}" -femit-bin="$4"
                     \\cp "$2" "$4.d/{0s}"
-                    \\"$5" build-exe "$4.d/{0s}" -femit-bin="$4"
-                    \\"$5" build-exe "$4.d/{0s}" -femit-bin="$4"
+                    \\"$5" build-exe -target x86_64-linux "$4.d/{0s}" -femit-bin="$4"
+                    \\"$5" build-exe -target x86_64-linux "$4.d/{0s}" -femit-bin="$4"
                 , .{file}), "sh" });
                 r.addFileArg(before);
                 r.addFileArg(b.path(src_path));
@@ -168,7 +168,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 break :blk r;
             } else blk: {
                 const r = b.addRunArtifact(zap);
-                r.addArg("build-exe");
+                r.addArgs(&.{ "build-exe", "-target", "x86_64-linux" });
                 r.addFileArg(b.path(src_path));
                 break :blk r;
             };

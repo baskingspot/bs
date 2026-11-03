@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const build_options = @import("build_options");
 const Frontend = @import("Frontend.zig");
@@ -77,12 +78,17 @@ pub fn main(init: std.process.Init) !void {
 
     const opts = try parseOptions(arena, command, args[2..]);
     const zig_lib_dir = opts.zig_lib_dir orelse init.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir;
-    if (opts.target) |t| {
-        const supported = [_][]const u8{ "native", "x86_64-linux", "x86_64-linux-none", "aarch64-macos", "aarch64-macos-none" };
-        for (supported) |s| {
-            if (std.mem.eql(u8, t, s)) break;
-        } else fatal("unsupported target '{s}'; zap supports x86_64-linux and aarch64-macos", .{t});
-    }
+    // Only the x86_64-linux backend exists so far; refuse aarch64-macos
+    // rather than silently writing an x86_64 ELF.
+    const native_ok = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
+    const target = opts.target orelse "native";
+    if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none") or
+        (std.mem.eql(u8, target, "native") and native_ok))
+    {} else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none") or
+        std.mem.eql(u8, target, "native"))
+    {
+        fatal("target '{s}': aarch64-macos code generation is not implemented yet; pass -target x86_64-linux", .{target});
+    } else fatal("unsupported target '{s}'; zap supports x86_64-linux and aarch64-macos", .{target});
 
     const cache_dirs = Frontend.resolveCacheDirs(arena, init.io, init.environ_map, .{
         .local = opts.cache_dir,
