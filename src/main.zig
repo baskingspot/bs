@@ -26,6 +26,8 @@ const usage =
     \\  build-lib        Create static library from source
     \\  run              Create executable and run immediately
     \\  test             Perform unit testing
+    \\  fmt              Reformat Zig source into canonical form
+    \\  env              Print lib path, std path, cache directory, and version
     \\  version          Print the Zig version zap compiles
     \\  help             Print this help and exit
     \\
@@ -92,7 +94,6 @@ const unsupported_commands: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "cc", "zap does not compile C ('cc'); build this step with upstream zig" },
     .{ "c++", "zap does not compile C++ ('c++'); build this step with upstream zig" },
     .{ "objcopy", "zap does not implement 'objcopy'; run this step with upstream zig" },
-    .{ "fmt", "zap does not implement 'fmt'; run this step with upstream zig" },
 });
 
 pub fn main(init: std.process.Init) !void {
@@ -115,6 +116,10 @@ pub fn main(init: std.process.Init) !void {
     else if (std.mem.eql(u8, cmd, "version")) {
         try Io.File.stdout().writeStreamingAll(init.io, zig_version ++ "\n");
         return;
+    } else if (std.mem.eql(u8, cmd, "fmt")) {
+        return @import("fmt.zig").run(init.gpa, arena, init.io, raw_args[2..]);
+    } else if (std.mem.eql(u8, cmd, "env")) {
+        return printEnv(init);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         try Io.File.stdout().writeStreamingAll(init.io, usage);
         return;
@@ -442,6 +447,37 @@ fn emitDocs(init: std.process.Init, job: *const Job, path: []const u8, cache_hit
     }
     Docs.emit(init.gpa, io, job.zig_lib_dir, path, job.stem, &job.opts) catch |err|
         fatal("unable to emit docs to '{s}': {t}", .{ path, err });
+}
+
+/// `zap env`, in upstream's form (src/print_env.zig): tools ask the
+/// compiler for its lib directory this way (zls's tests run `<zig> env`
+/// with the zig that runs the build). Copyright (c) Zig contributors, MIT
+/// licensed (see upstream/LICENSE).
+fn printEnv(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const env = init.environ_map;
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const lib_dir = try std.fs.path.resolve(arena, &.{ cwd, env.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir });
+    const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
+    var buf: [4096]u8 = undefined;
+    var out = Io.File.stdout().writerStreaming(io, &buf);
+    var serializer: std.zon.Serializer = .{ .writer = &out.interface };
+    var root = try serializer.beginStruct(.{});
+    try root.field("zig_exe", try std.process.executablePathAlloc(io, arena), .{});
+    try root.field("lib_dir", lib_dir, .{});
+    try root.field("std_dir", try std.fs.path.join(arena, &.{ lib_dir, "std" }), .{});
+    try root.field("global_cache_dir", try std.fs.path.resolve(arena, &.{ cwd, dirs.global }), .{});
+    try root.field("version", zig_version, .{});
+    try root.field("target", "x86_64-linux-none", .{});
+    var env_struct = try root.beginStructField("env", .{});
+    inline for (@typeInfo(std.zig.EnvVar).@"enum".field_names) |field_name| {
+        try env_struct.field(field_name, @field(std.zig.EnvVar, field_name).get(env), .{});
+    }
+    try env_struct.end();
+    try root.end();
+    try out.interface.writeByte('\n');
+    try out.interface.flush();
 }
 
 /// The output's file name in its directory, as upstream names it.

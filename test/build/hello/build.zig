@@ -27,7 +27,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) }));
     const tests = b.addTest(.{ .root_module = mod });
-    b.step("test", "Run hello's tests").dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run hello's tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    // `zig fmt --check`, run by the compiler.
+    test_step.dependOn(&b.addFmt(.{ .paths = &.{b.path("src")}, .check = true }).step);
     // As zig-clap's: the test compile also emits docs, for every step.
     const docs = b.addInstallDirectory(.{ .source_dir = tests.getEmittedDocs(), .install_dir = .prefix, .install_subdir = "docs" });
     b.step("docs", "Install hello's docs").dependOn(&docs.step);

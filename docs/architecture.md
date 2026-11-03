@@ -3757,8 +3757,10 @@ state. Built for step 1:
 
 ## The command line and `zap build` (built 2026-11-03)
 
-- zap is a drop-in for `zig build-exe`, `build-obj`, `run`, `test` and
-  `build`. `main.parseOptions` sorts every option upstream accepts, and
+- zap is a drop-in for `zig build-exe`, `build-obj`, `build-lib`, `run`,
+  `test` and `build`, and for the two commands build steps and tools run
+  on the compiler: `fmt` (`b.addFmt`; upstream's src/fmt.zig, copied) and
+  `env` (zls's tests read the lib directory from it). `main.parseOptions` sorts every option upstream accepts, and
   every one upstream's build runner passes, into four classes:
   implemented (`-M`/`--dep`, `--name`, `-femit-bin`, `--cache-dir`,
   `-fsingle-threaded`, `-freference-trace`, `--listen=-`, ...); ignored,
