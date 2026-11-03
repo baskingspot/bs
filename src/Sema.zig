@@ -1724,7 +1724,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const index = sema.resolveInst(extra.rhs);
             const safety = tag == .elem_ptr_node or tag == .elem_ptr_load;
             break :blk switch (tag) {
-                .elem_ptr_node, .elem_ptr => sema.elemPtr(block, src, lhs, index, safety),
+                .elem_ptr_node => sema.elemPtr(block, src, lhs, index, safety),
+                .elem_ptr => sema.elemPtrOneLayer(block, src, lhs, index),
                 .elem_ptr_load => if (sema.zeroBitVectorElemPtr(sema.typeOf(lhs))) |elem_ty|
                     Ref.fromInterned(try sema.intValue(elem_ty, 0))
                 else if (sema.isBoolVectorPtr(sema.typeOf(lhs)) and sema.resolveValue(index) != null)
@@ -1748,7 +1749,26 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk sema.fieldVal(block, src, val, "len");
         },
         .slice_start, .slice_end, .slice_length, .slice_sentinel => sema.zirSlice(block, inst),
-        .slice_sentinel_ty => sema.failUnsupported(block, block.nodeSrc(data.un_node.src_node), "slice sentinels"),
+        .slice_sentinel_ty => blk: {
+            // The element type of what `lhs[a..b :s]` slices; the operand
+            // is a pointer to `lhs`.
+            const src = block.nodeSrc(data.un_node.src_node);
+            const ip = sema.ip;
+            const ptr_ty = sema.typeOf(sema.resolveInst(data.un_node.operand));
+            if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ptr_ty)});
+            const lhs_ty = Type.ptrInfo(ip, ptr_ty).child;
+            break :blk .fromInterned(switch (ip.indexToKey(lhs_ty)) {
+                .array_type => |a| a.child,
+                .ptr_type => |p| switch (p.flags.size) {
+                    .many, .c, .slice => p.child,
+                    .one => switch (ip.indexToKey(p.child)) {
+                        .array_type => |a| a.child,
+                        else => return sema.fail(block, src, "slice of single-item pointer cannot have sentinel", .{}),
+                    },
+                },
+                else => return sema.fail(block, src, "slice of non-array type '{f}'", .{sema.fmtType(lhs_ty)}),
+            });
+        },
         .for_len => sema.zirForLen(block, inst),
 
         // Optionals and error unions.
@@ -3443,6 +3463,8 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
         }
         return false;
     }
+    // `[*]T` to `*anyopaque`.
+    if (s.flags.size == .many and d.flags.size == .one and d.child == .anyopaque_type) return true;
     // `*[N]T` to `[*]T`.
     if (s.flags.size == .one and d.flags.size == .many) {
         if (s_array) |a| return a.child == d.child and (d.sentinel == .none or d.sentinel == a.sentinel);
@@ -6048,17 +6070,7 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src);
                 return sema.elemPtrOfManyPtr(block, src, try sema.analyzeLoad(block, src, ptr), index);
             },
-            .slice => {
-                const index = try sema.coerce(block, .usize_type, uncasted_index, src);
-                const slice = try sema.analyzeLoad(block, src, ptr);
-                if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, slice), false);
-                if (sema.resolveValue(slice)) |sv| if (sema.resolveValue(index)) |iv| {
-                    return .fromInterned(try sema.ptrElemPtrVal(sema.ip.indexToKey(sv).slice.ptr, sema.ip.intValue(u64, iv).?));
-                };
-                try sema.requireRuntime(block, src);
-                const elem_ptr_ty = try sema.ptrType(.{ .child = cp.child, .flags = .{ .is_const = cp.flags.is_const, .is_volatile = cp.flags.is_volatile } });
-                return sema.addTyPlBin(block, .slice_elem_ptr, elem_ptr_ty, slice, index);
-            },
+            .slice => return sema.elemPtrOfSlice(block, src, try sema.analyzeLoad(block, src, ptr), uncasted_index, safety),
         },
         .tuple_type => {
             const iv = sema.resolveValue(try sema.coerce(block, .usize_type, uncasted_index, src)) orelse return sema.fail(block, src, "tuple index must be comptime-known", .{});
@@ -6070,6 +6082,31 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
     }
     if (p.flags.size == .many or p.flags.size == .slice) return sema.fail(block, src, "expected pointer to an indexable object, found '{f}'", .{sema.fmtType(ptr_ty)});
     return sema.fail(block, src, "type '{f}' does not support indexing", .{sema.fmtType(child)});
+}
+
+/// `elem_ptr`: `&lhs[index]` where `lhs` itself is the pointer (a for
+/// loop's pointer capture).
+fn elemPtrOneLayer(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const ptr_ty = sema.typeOf(ptr);
+    if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src, "pointer capture of non pointer type '{f}'", .{sema.fmtType(ptr_ty)});
+    switch (Type.ptrInfo(ip, ptr_ty).flags.size) {
+        .one => return sema.elemPtr(block, src, ptr, uncasted_index, false),
+        .many, .c => return sema.elemPtrOfManyPtr(block, src, ptr, try sema.coerce(block, .usize_type, uncasted_index, src)),
+        .slice => return sema.elemPtrOfSlice(block, src, ptr, uncasted_index, false),
+    }
+}
+
+fn elemPtrOfSlice(sema: *Sema, block: *Block, src: Src, slice: Ref, uncasted_index: Ref, safety: bool) CompileError!Ref {
+    const cp = Type.ptrInfo(sema.ip, sema.typeOf(slice));
+    const index = try sema.coerce(block, .usize_type, uncasted_index, src);
+    if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, slice), cp.sentinel != .none);
+    if (sema.resolveValue(slice)) |sv| if (sema.resolveValue(index)) |iv| {
+        return .fromInterned(try sema.ptrElemPtrVal(sema.ip.indexToKey(sv).slice.ptr, sema.ip.intValue(u64, iv).?));
+    };
+    try sema.requireRuntime(block, src);
+    const elem_ptr_ty = try sema.ptrType(.{ .child = cp.child, .flags = .{ .is_const = cp.flags.is_const, .is_volatile = cp.flags.is_volatile } });
+    return sema.addTyPlBin(block, .slice_elem_ptr, elem_ptr_ty, slice, index);
 }
 
 fn elemPtrOfArrayPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, index: Ref) CompileError!Ref {
@@ -6103,7 +6140,8 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
         .ptr_type => |p| switch (p.flags.size) {
             .slice => {
                 const index = try sema.coerce(block, .usize_type, uncasted_index, src);
-                if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, lhs), false);
+                // The sentinel of a sentinel-terminated slice can be read.
+                if (safety) try sema.boundsCheck(block, src, index, try sema.sliceLen(block, lhs), p.sentinel != .none);
                 if (sema.resolveValue(lhs)) |sv| if (sema.resolveValue(index)) |iv| {
                     const ep = try sema.ptrElemPtrVal(ip.indexToKey(sv).slice.ptr, ip.intValue(u64, iv).?);
                     if (try sema.comptimeLoadOrNull(block, src, ep)) |v| return .fromInterned(v);
@@ -6153,6 +6191,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     var start_ref: Zir.Inst.Ref = undefined;
     var end_ref: Zir.Inst.Ref = .none;
     var len_ref: Zir.Inst.Ref = .none;
+    var sentinel_ref: Zir.Inst.Ref = .none;
     switch (tag) {
         .slice_start => {
             const e = sema.code.extraData(Zir.Inst.SliceStart, data.payload_index).data;
@@ -6167,12 +6206,18 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         },
         .slice_length => {
             const e = sema.code.extraData(Zir.Inst.SliceLength, data.payload_index).data;
-            if (e.sentinel != .none) return sema.failUnsupported(block, src, "slice sentinels");
             lhs_ref = e.lhs;
             start_ref = e.start;
             len_ref = e.len;
+            sentinel_ref = e.sentinel;
         },
-        .slice_sentinel => return sema.failUnsupported(block, src, "slice sentinels"),
+        .slice_sentinel => {
+            const e = sema.code.extraData(Zir.Inst.SliceSentinel, data.payload_index).data;
+            lhs_ref = e.lhs;
+            start_ref = e.start;
+            end_ref = e.end;
+            sentinel_ref = e.sentinel;
+        },
         else => unreachable,
     }
     const ptr = sema.resolveInst(lhs_ref);
@@ -6186,9 +6231,14 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     var is_const = Type.ptrInfo(ip, ptr_ty).flags.is_const;
     var ptr_align = Type.ptrInfo(ip, ptr_ty).flags.alignment;
     var elem_ty: Index = undefined;
+    // The sentinel of the sliced object, which the result keeps when it
+    // ends where the object does.
+    var ptr_sentinel: Index = .none;
+    var many_obj: Ref = .none;
     switch (ip.indexToKey(child)) {
         .array_type => |a| {
             elem_ty = a.child;
+            ptr_sentinel = a.sentinel;
             len = .fromInterned(try sema.intValue(.usize_type, a.len));
             base = try sema.coercePtrTo(block, ptr, try sema.ptrType(.{ .child = a.child, .flags = .{ .size = .many, .is_const = is_const } }));
         },
@@ -6200,18 +6250,23 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                 .one => {
                     const a = ip.indexToKey(cp.child).array_type;
                     elem_ty = a.child;
+                    ptr_sentinel = a.sentinel;
                     len = .fromInterned(try sema.intValue(.usize_type, a.len));
                     base = try sema.coercePtrTo(block, obj, try sema.ptrType(.{ .child = a.child, .flags = .{ .size = .many, .is_const = is_const } }));
                 },
                 .slice => {
                     elem_ty = cp.child;
+                    ptr_sentinel = cp.sentinel;
                     len = try sema.sliceLen(block, obj);
                     base = try sema.slicePtr(block, obj);
                     if (cp.sentinel != .none) base = try sema.coercePtrTo(block, base, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .many, .is_const = is_const } }));
                 },
                 .many, .c => {
                     elem_ty = cp.child;
+                    ptr_sentinel = cp.sentinel;
+                    many_obj = obj;
                     base = obj;
+                    if (cp.sentinel != .none) base = try sema.coercePtrTo(block, base, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .many, .is_const = is_const } }));
                 },
             }
         },
@@ -6225,13 +6280,36 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         end = try sema.analyzeArithmetic(block, src, .add, start, slice_len);
     } else if (end_ref != .none) {
         end = try sema.coerce(block, .usize_type, sema.resolveInst(end_ref), src);
+    } else if (len == .none) {
+        // `ptr[start..]` of a many-pointer is pointer arithmetic, keeping
+        // the pointer's type.
+        if (sentinel_ref != .none) return sema.failUnsupported(block, src, "sentinel-terminated slicing of many-item pointers");
+        return sema.analyzePtrArithmetic(block, src, true, many_obj, start);
     } else {
-        if (len == .none) return sema.fail(block, src, "slice of pointer must include end value", .{});
         end = len;
     }
-    if (len != .none) try sema.boundsCheck(block, src, end, len, true);
+    const slice_sentinel: Index = if (sentinel_ref != .none) blk: {
+        const casted = try sema.coerce(block, elem_ty, sema.resolveInst(sentinel_ref), src);
+        break :blk try sema.resolveConstValue(block, src, casted, "slice sentinel must be comptime-known");
+    } else .none;
+    if (len != .none) {
+        // The sliced object's sentinel may be included, and a slice sentinel
+        // must be within the object.
+        const len_s = if (ptr_sentinel == .none) len else try sema.analyzeArithmetic(block, src, .add, len, .fromInterned(.one_usize));
+        const end_s = if (slice_sentinel == .none) end else try sema.analyzeArithmetic(block, src, .add, end, .fromInterned(.one_usize));
+        try sema.boundsCheck(block, src, end_s, len_s, true);
+    }
     const start_val = sema.resolveValue(start);
     const end_val = sema.resolveValue(end);
+    // Whether the result ends where the sliced object does (not counting
+    // its sentinel).
+    const end_is_len = end_ref == .none and len_ref == .none or blk: {
+        if (len == .none) break :blk false;
+        const lv = sema.resolveValue(len) orelse break :blk false;
+        const ev = end_val orelse break :blk false;
+        break :blk ip.intValue(u64, lv).? == ip.intValue(u64, ev).?;
+    };
+    const result_sentinel: Index = if (slice_sentinel != .none) slice_sentinel else if (end_is_len) ptr_sentinel else .none;
     if (start_val != null and end_val != null) {
         const sv = ip.intValue(u64, start_val.?).?;
         const ev = ip.intValue(u64, end_val.?).?;
@@ -6268,15 +6346,16 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         ip.intValue(u64, end_val.?).? - ip.intValue(u64, start_val.?).?
     else
         null;
+    if (slice_sentinel != .none) try sema.checkSliceSentinel(block, src, new_ptr, start_val, end_val, start, end, elem_ty, slice_sentinel);
     if (known_len) |n| {
-        const array_ty = try sema.intern(.{ .array_type = .{ .len = n, .child = elem_ty } });
+        const array_ty = try sema.intern(.{ .array_type = .{ .len = n, .child = elem_ty, .sentinel = result_sentinel } });
         const result_ty = try sema.ptrType(.{ .child = array_ty, .flags = .{ .is_const = is_const, .alignment = result_align } });
         if (sema.resolveValue(new_ptr)) |pv| {
             if (sema.isUndef(pv)) return .fromInterned(try sema.undefValue(result_ty));
             const k = ip.indexToKey(pv).ptr;
             switch (k.base) {
                 .elem => |e| {
-                    if (try sema.isArrayPtrOfLen(e.base, elem_ty, n) and e.index == 0) return .fromInterned(e.base);
+                    if (try sema.isArrayPtrOfLen(e.base, elem_ty, n) and e.index == 0 and result_sentinel == .none) return .fromInterned(e.base);
                     // A pointer to the subarray starting at element `e.index`.
                     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = k.base } }));
                 },
@@ -6286,9 +6365,30 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         }
         return sema.addTyOp(block, .bitcast, result_ty, new_ptr);
     }
-    const slice_ty = try sema.ptrType(.{ .child = elem_ty, .flags = .{ .size = .slice, .is_const = is_const, .alignment = result_align } });
+    const slice_ty = try sema.ptrType(.{ .child = elem_ty, .sentinel = result_sentinel, .flags = .{ .size = .slice, .is_const = is_const, .alignment = result_align } });
     const new_len = try sema.analyzeArithmetic(block, src, .subwrap, end, start);
     return sema.makeSlice(block, slice_ty, new_ptr, new_len);
+}
+
+/// `ptr[start..end :s]` requires `ptr[end - start] == s`: checked at
+/// comptime when the memory is comptime-known, else at runtime.
+fn checkSliceSentinel(sema: *Sema, block: *Block, src: Src, many: Ref, start_val: ?Index, end_val: ?Index, start: Ref, end: Ref, elem_ty: Index, sentinel: Index) CompileError!void {
+    const ip = sema.ip;
+    if (start_val != null and end_val != null) if (sema.resolveValue(many)) |pv| if (try sema.comptimePtrRoot(pv) != .int) {
+        const idx = ip.intValue(u64, end_val.?).? - ip.intValue(u64, start_val.?).?;
+        const elem_ptr = try sema.ptrElemPtrVal(pv, idx);
+        if (try sema.comptimeLoadOrNull(block, src, elem_ptr)) |actual| {
+            if (actual != sentinel) return sema.fail(block, src, "value in memory does not match slice sentinel", .{});
+            return;
+        }
+    };
+    if (!block.want_safety or block.is_comptime) return;
+    const idx = try sema.analyzeArithmetic(block, src, .subwrap, end, start);
+    const elem_ptr = try sema.addTyPlBin(block, .ptr_add, sema.typeOf(many), many, idx);
+    const actual = try sema.analyzeLoad(block, src, elem_ptr);
+    const ok = try sema.analyzeCmp(block, src, .eq, actual, .fromInterned(sentinel));
+    _ = elem_ty;
+    try sema.addSafetyCheck(block, ok, .sentinel_mismatch, .fromInterned(sentinel), actual);
 }
 
 fn isArrayPtrOfLen(sema: *Sema, ptr: Index, elem_ty: Index, n: u64) !bool {

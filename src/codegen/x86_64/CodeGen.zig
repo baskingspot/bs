@@ -1186,6 +1186,17 @@ fn panic(cg: *CodeGen, id: Ir.PanicId, payload: u32) Error!void {
             try cg.panicWriteDec(bin.rhs);
             try cg.panicWriteStr("\n");
         },
+        .sentinel_mismatch => {
+            const bin = cg.ir.extraData(Ir.Bin, payload).data;
+            const ty = cg.typeOf(bin.lhs);
+            if (Type.isInt(cg.ip, ty) and Type.intInfo(cg.ip, ty).signedness == .unsigned and Type.abiSize(cg.ip, ty) <= 8) {
+                try cg.panicWriteStr("panic: sentinel mismatch: expected ");
+                try cg.panicWriteDec(bin.lhs);
+                try cg.panicWriteStr(", found ");
+                try cg.panicWriteDec(bin.rhs);
+                try cg.panicWriteStr("\n");
+            } else try cg.panicWriteStr("panic: sentinel mismatch\n");
+        },
         .unwrap_error => return cg.fail("panics that print error names", .{}),
         else => {
             var buf: [128]u8 = undefined;

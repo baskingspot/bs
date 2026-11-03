@@ -436,6 +436,8 @@ pub fn fieldOffset(ip: *const InternPool, ty: Index, i: usize) u64 {
         .union_type => unionLayout(ip, ty).payload_offset,
         .tuple_type => tupleLayout(ip, ty, i).field_offset,
         .array_type => |a| i * abiSize(ip, a.child),
+        // A slice's `ptr` and `len`.
+        .ptr_type => i * 8,
         else => unreachable,
     };
 }
