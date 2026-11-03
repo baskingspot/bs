@@ -470,7 +470,8 @@ origin/main 9d936c3).** libvaxis text_input 2.606 G → 1.901 G (−27%);
 and libvaxis's Sema 319–450 → 216–267 ms; a synthetic 47 k-row table of
 the same shape 21.8 k → 7.4 k instructions a row; hello 883 M → 871 M
 (−1.4%); binary.zig unchanged within noise (Sema 5.49–5.81 s before,
-5.34–5.87 s after; callgrind runs out of memory on it, before and after).
+5.34–5.87 s after; callgrind needs `--aspace-minaddr` on it, see
+bench/README.md).
 A row's remaining cost is the walker's generic per-instruction work (about
 16 ZIR instructions a row: four field types, four decl literals, four
 coercions, the struct init) and interning the row's aggregate.

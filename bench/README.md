@@ -79,6 +79,30 @@ Useful options: `--workloads hello,vaxis,zig`, `--modes build-exe,zig-build`,
 than upstream zig the defaults are the `build-exe` mode and the core
 scenarios (cold, cold-local, warm, edit-root, edit-lib).
 
+### Profiling with valgrind
+
+```sh
+zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3 -p /tmp/zapvg
+ZAP_CACHE=off valgrind --tool=callgrind --aspace-minaddr=0x100000000 \
+    /tmp/zapvg/bin/zap test upstream/test/behavior/x86_64/binary.zig --test-no-exec
+```
+
+- `-Dcpu=x86_64_v3`: valgrind 3.19 does not decode AVX-512, which a native
+  build of zap uses (SIGILL in `memset` at startup).
+- `--aspace-minaddr=0x100000000`: valgrind places mappings bottom-up from
+  about 0x4800000, and std's `PageAllocator` hints each new mapping just
+  below the previous one, without checking for wraparound. Once one
+  allocation is larger than the address of the last mapping (Emit's arena
+  reaches 127 MB on binary.zig), the hint wraps past zero, valgrind rejects
+  the mmap with EINVAL where Linux ignores a bad hint, and zap fails with
+  `error.OutOfMemory`. Starting mappings at 4 GiB keeps the hint in range.
+- Valgrind computes x87 `f80` arithmetic in 64-bit precision, and zap folds
+  comptime `f80` math in the host's `f80`, so files with comptime `f80`
+  math analyze differently under valgrind. binary.zig makes about 4% fewer
+  instantiations of its generic `binary` function (110,860 instead of
+  115,414) and emits a different binary. The counts are still useful for
+  comparing changes, but they don't describe exactly the native workload.
+
 The harness needs Python 3, git, network access on first use (to clone
 libvaxis and fetch its dependencies) and upstream zig 0.17.0 on `PATH`
 (`--setup-zig`), which prepares the workloads but is never timed. Scratch
