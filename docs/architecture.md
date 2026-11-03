@@ -1580,3 +1580,10 @@ state.
   upstream's per-test setup (`testing.allocator`, `testing.io`), it can use a
   smaller runner that speaks the same protocol; tests are matched to the
   baseline by name, so zap must produce upstream's test names.
+- `run.py --default-runner` measures `zap test` as a drop-in for `zig test`:
+  no `--test-runner`, so zap builds upstream's own
+  `lib/compiler/test_runner.zig`. The binary runs as `zig test` runs it and
+  its terminal output (`1/9 name...OK`, leak reports, the summary line) is
+  parsed; after a crash or timeout, the remaining tests run one at a time
+  through the runner's `--listen=-` protocol (`std.zig.Server`, as
+  `zig build test` drives it). Report both numbers.

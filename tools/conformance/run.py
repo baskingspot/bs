@@ -23,6 +23,14 @@ runner's "@zap-test" line protocol, documented in test_runner.zig, so any
 runner that speaks it works. A crash or timeout marks the running test and
 the binary is rerun with --start=<next index> to run the rest.
 
+With --default-runner, units are built as a user's `zig test` builds them,
+with the compiler's default runner (upstream's lib/compiler/test_runner.zig)
+and no --test-runner. The binary first runs as `zig test` runs it, and its
+terminal output ("1/9 name...OK", leak reports, the summary line) is parsed.
+After a crash or timeout, the rest of the tests run through the runner's
+--listen=- protocol (std.zig.Server, as `zig build test` drives it), one
+test at a time, restarting after each further crash.
+
 Portable to Linux and macOS: Python 3 standard library only.
 """
 
@@ -202,13 +210,10 @@ def compile_unit(compiler, unit, cfg, args, workdir):
     bin_path.parent.mkdir(parents=True, exist_ok=True)
     if bin_path.exists():
         bin_path.unlink()
-    argv = [
-        str(compiler), "test", str(unit_root(unit, workdir)),
-        "--test-runner", str(args.test_runner),
-        "-target", cfg["zig_target"],
-        "--test-no-exec",
-        f"-femit-bin={bin_path}",
-    ]
+    argv = [str(compiler), "test", str(unit_root(unit, workdir))]
+    if not args.default_runner:
+        argv += ["--test-runner", str(args.test_runner)]
+    argv += ["-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}"]
     for f in unit_filters(unit):
         argv += ["--test-filter", f]
     code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
@@ -309,12 +314,215 @@ def run_unit(bin_path, owns, args, workdir):
     return result
 
 
+# ---------------------------------------------------------------- default runner
+#
+# Upstream's lib/compiler/test_runner.zig speaks no @zap-test protocol. Run as
+# `zig test` runs it (no arguments, stderr not a terminal), it writes
+# "<i>/<n> <name>..." before each test and "OK", "SKIP" or "FAIL (<error>)"
+# after it; testing.allocator reports leaks after the result, and the run
+# ends with "All <n> tests passed." or "<p> passed; <s> skipped; <f> failed.".
+# With --listen=- it is a std.zig.Server that runs the tests it is asked for.
+
+CLIENT_EXIT, CLIENT_QUERY_TEST_METADATA, CLIENT_RUN_TEST = 0, 4, 5
+SERVER_ZIG_VERSION, SERVER_TEST_METADATA, SERVER_TEST_RESULTS, SERVER_TEST_STARTED = 0, 3, 4, 5
+TERMINAL_SUMMARY_RE = re.compile(r"^(All \d+ tests passed\.|\d+ passed; \d+ skipped; \d+ failed\.)", re.M)
+
+
+class ServerSession:
+    """A test binary run with --listen=-, driven like `zig build test`."""
+
+    def __init__(self, bin_path, workdir):
+        self.proc = subprocess.Popen(
+            [str(bin_path), "--listen=-"], cwd=workdir, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        with _live_lock:
+            _live.add(self.proc)
+        self.buf = b""
+        self.err = []
+        self.err_thread = threading.Thread(target=lambda: self.err.append(self.proc.stderr.read()), daemon=True)
+        self.err_thread.start()
+
+    def send(self, tag, body=b""):
+        self.proc.stdin.write(tag.to_bytes(4, "little") + len(body).to_bytes(4, "little") + body)
+        self.proc.stdin.flush()
+
+    def _read(self, n, deadline):
+        import select
+        fd = self.proc.stdout.fileno()
+        while len(self.buf) < n:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                raise TimeoutError
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise EOFError
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def receive(self, deadline):
+        hdr = self._read(8, deadline)
+        tag = int.from_bytes(hdr[:4], "little")
+        return tag, self._read(int.from_bytes(hdr[4:], "little"), deadline)
+
+    def close(self):
+        try:
+            self.send(CLIENT_EXIT)
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            kill_group(self.proc)
+            self.proc.wait()
+        self.err_thread.join(timeout=5)
+        with _live_lock:
+            _live.discard(self.proc)
+        return b"".join(self.err).decode("utf-8", "replace")
+
+    def kill(self):
+        kill_group(self.proc)
+        return self.close()
+
+
+def query_test_names(bin_path, args, workdir):
+    s = ServerSession(bin_path, workdir)
+    try:
+        deadline = time.monotonic() + args.run_timeout
+        tag, _ = s.receive(deadline)
+        if tag != SERVER_ZIG_VERSION:
+            raise EOFError
+        s.send(CLIENT_QUERY_TEST_METADATA)
+        tag, body = s.receive(deadline)
+        if tag != SERVER_TEST_METADATA:
+            raise EOFError
+        strings_len = int.from_bytes(body[0:4], "little")
+        n = int.from_bytes(body[4:8], "little")
+        offs = [int.from_bytes(body[8 + 4 * i:12 + 4 * i], "little") for i in range(n)]
+        strings = body[8 + 8 * n:8 + 8 * n + strings_len]
+        names = [strings[o:strings.index(b"\0", o)].decode("utf-8", "replace") for o in offs]
+        s.close()
+        return names, None
+    except (EOFError, TimeoutError, OSError):
+        return None, s.kill()
+
+
+def parse_terminal(err, names):
+    """Outcomes of the tests the terminal run reached: index -> (outcome,
+    detail); the last may be None (started, no result)."""
+    n = len(names)
+    starts = []
+    pos = 0
+    for i, name in enumerate(names):
+        marker = f"{i + 1}/{n} {name}..."
+        at = err.find(marker, pos)
+        if at < 0:
+            break
+        starts.append((i, at, at + len(marker)))
+        pos = at + len(marker)
+    out = {}
+    for k, (i, at, body) in enumerate(starts):
+        end = starts[k + 1][1] if k + 1 < len(starts) else len(err)
+        seg = err[body:end]
+        if k + 1 == len(starts):
+            m = TERMINAL_SUMMARY_RE.search(seg)
+            if m:
+                seg = seg[:m.start()]
+        m = re.search(r"(?:^|(?<=\.\.\.)|\n)(OK|SKIP|FAIL \((.*?)\))\n", seg)
+        if not m:
+            out[i] = (None, seg)
+            continue
+        if m.group(1) == "OK":
+            out[i] = ("leak" if "leaked" in seg[m.end():] else "pass", None)
+        elif m.group(1) == "SKIP":
+            out[i] = ("skip", None)
+        else:
+            out[i] = ("fail", m.group(2))
+    return out
+
+
+def run_unit_default(bin_path, owns, args, workdir):
+    names, err = query_test_names(bin_path, args, workdir)
+    if names is None:
+        return {"status": "incomplete", "log": "the test runner did not answer on --listen=-\n" + tail(err or ""), "tests": {}}
+    by_index = {}
+    code, out, err, timed_out = run_process([str(bin_path)], workdir, args.run_timeout)
+    parsed = parse_terminal(err, names)
+    for i, (outcome, detail) in parsed.items():
+        by_index[i] = [outcome, detail]
+    status, log = "ok", None
+    finished = TERMINAL_SUMMARY_RE.search(err) is not None and len(parsed) == len(names) and all(o for o, _ in parsed.values())
+    if not finished:
+        how = describe_exit(code, timed_out, args.run_timeout)
+        if not parsed or by_index[max(parsed)][0] is not None:
+            if len(parsed) != len(names):
+                status, log = "incomplete", how + "\n" + tail(err)
+        else:
+            last = max(parsed)
+            by_index[last] = ["timeout" if timed_out else "crash", how + "\n" + crash_log(by_index[last][1] or "")]
+            # The rest, one at a time through the server protocol.
+            start = last + 1
+            while start < len(names):
+                s = ServerSession(bin_path, workdir)
+                current = None
+                try:
+                    tag, _ = s.receive(time.monotonic() + args.run_timeout)
+                    for i in range(start, len(names)):
+                        current = i
+                        s.send(CLIENT_RUN_TEST, i.to_bytes(4, "little"))
+                        deadline = time.monotonic() + args.run_timeout
+                        while True:
+                            tag, body = s.receive(deadline)
+                            if tag == SERVER_TEST_RESULTS:
+                                break
+                        flags = int.from_bytes(body[4:12], "little")
+                        st = ("pass", "fail", "skip", "fail")[flags & 3]
+                        leaks = (flags >> 33) & ((1 << 31) - 1)
+                        by_index[i] = ["leak" if st == "pass" and leaks else st, None]
+                    s.close()
+                    break
+                except (EOFError, TimeoutError, OSError) as e:
+                    timed = isinstance(e, TimeoutError)
+                    serr = s.kill()
+                    if current is None:
+                        status, log = "incomplete", "the test runner did not answer on --listen=-\n" + tail(serr)
+                        break
+                    code = s.proc.returncode
+                    by_index[current] = ["timeout" if timed else "crash", describe_exit(code, timed, args.run_timeout) + "\n" + tail(serr, 1500)]
+                    start = current + 1
+    tests, details = {}, {}
+    for i in sorted(by_index):
+        name = names[i]
+        outcome, detail = by_index[i]
+        if not owns(name):
+            continue
+        key = name
+        n = 2
+        while key in tests:
+            key = f"{name}#{n}"
+            n += 1
+        tests[key] = outcome or "crash"
+        if detail and outcome != "pass":
+            details[key] = detail
+    result = {"status": status, "tests": tests}
+    if details:
+        result["details"] = details
+    if log:
+        result["log"] = log
+    return result
+
+
 def run_one(compiler, unit, cfg, args, workdir):
     bin_path, failure = compile_unit(compiler, unit, cfg, args, workdir)
     if failure:
         return failure
     try:
-        return run_unit(bin_path, lambda name: unit_owns(unit, name), args, workdir)
+        run = run_unit_default if args.default_runner else run_unit
+        return run(bin_path, lambda name: unit_owns(unit, name), args, workdir)
     finally:
         if not args.keep_binaries:
             bin_path.unlink(missing_ok=True)
@@ -525,7 +733,7 @@ def zap_target(zap, cfg, args, workdir):
         "target": cfg["name"],
         "zig_target": cfg["zig_target"],
         "compiler": str(zap),
-        "test_runner": str(args.test_runner),
+        "test_runner": "default" if args.default_runner else str(args.test_runner),
         "backend": backend,
         "baseline": {"compiler": baseline["compiler"], "backend": baseline["backend"]},
         "summary": {
@@ -545,7 +753,7 @@ def zap_target(zap, cfg, args, workdir):
     problems = ", ".join(f"{n} {STATUS_LABELS.get(s, s)}" for s, n in statuses.items() if s != "ok")
     note = f"; {unknown} tests not in baseline" if unknown else ""
     print(
-        f"{cfg['name']}: {passed}/{expected} behavior tests pass ({pct:.1f}% of upstream); "
+        f"{cfg['name']}{' (default runner)' if args.default_runner else ''}: {passed}/{expected} behavior tests pass ({pct:.1f}% of upstream); "
         f"{ok_files}/{len(files)} files compiled and ran"
         f"{'; ' + problems if problems else ''}{note} -> {rel(out)}"
     )
@@ -561,6 +769,7 @@ def main():
     p.add_argument("--zap", type=Path, help="zap executable (default: build zap with -Doptimize=ReleaseSafe)")
     p.add_argument("--zig", default="zig", help="upstream zig 0.17.0, used for --upstream and to build zap (default: zig on PATH)")
     p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, zap_runner.zig for zap until zap compiles test_runner.zig)")
+    p.add_argument("--default-runner", action="store_true", help="zap only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `zap test` without --test-runner does")
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
     p.add_argument("--compile-timeout", type=float, default=300, help="seconds per file compile")
