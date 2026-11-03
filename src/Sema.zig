@@ -412,7 +412,22 @@ pub const Src = struct {
         /// The function expression of a call (upstream's
         /// `node_offset_call_func`).
         call_func: Ast.Node.Offset,
+        /// An item of a case of the switch at `node` (upstream's
+        /// `switch_case_item` and its range ends).
+        switch_item: struct { node: Ast.Node.Offset, item: SwitchItem },
     },
+
+    /// Which item of a switch: ZIR numbers scalar cases (one item, not a
+    /// range) and multi cases apart, and single items and ranges of a case
+    /// apart.
+    pub const SwitchItem = packed struct(u32) {
+        case: u15,
+        multi: bool,
+        index: u14,
+        range: bool,
+        /// A range's last value rather than its first.
+        last: bool,
+    };
 
     pub fn span(src: Src, tree: *const Ast) Ast.Span {
         return switch (src.loc) {
@@ -465,6 +480,29 @@ pub const Src = struct {
                 const call = tree.fullCall(&buf, node) orelse return tree.nodeToSpan(node);
                 return tree.nodeToSpan(call.ast.fn_expr);
             },
+            .switch_item => |si| {
+                const node = si.node.toAbsolute(src.base);
+                const full = tree.fullSwitch(node) orelse return tree.nodeToSpan(node);
+                var counts: [2]u32 = .{ 0, 0 };
+                for (full.ast.cases) |case_node| {
+                    const case = tree.fullSwitchCase(case_node).?;
+                    if (case.ast.values.len == 0) continue;
+                    const multi = case.ast.values.len != 1 or tree.nodeTag(case.ast.values[0]) == .switch_range;
+                    const i = &counts[@intFromBool(multi)];
+                    defer i.* += 1;
+                    if (multi != si.item.multi or i.* != si.item.case) continue;
+                    var k: u32 = 0;
+                    for (case.ast.values) |v| {
+                        if ((tree.nodeTag(v) == .switch_range) != si.item.range) continue;
+                        defer k += 1;
+                        if (k != si.item.index) continue;
+                        if (!si.item.range) return tree.nodeToSpan(v);
+                        const first, const last = tree.nodeData(v).node_and_node;
+                        return tree.nodeToSpan(if (si.item.last) last else first);
+                    }
+                }
+                return tree.nodeToSpan(node);
+            },
         };
     }
 
@@ -481,6 +519,19 @@ pub const Src = struct {
     fn callFunc(src: Src) Src {
         const off = src.nodeOffset() orelse return src;
         return .{ .base = src.base, .loc = .{ .call_func = off } };
+    }
+
+    /// Item `index` (a range's first or last value with `range`) of case
+    /// `case` of the switch at `src`. Resolved only when rendered.
+    fn switchItem(src: Src, case: Zir.UnwrappedSwitchBlock.Case.Index, index: usize, range: ?enum { first, last }) Src {
+        const off = src.nodeOffset() orelse return src;
+        return .{ .base = src.base, .loc = .{ .switch_item = .{ .node = off, .item = .{
+            .case = std.math.cast(u15, case.value) orelse return src,
+            .multi = case.kind == .multi,
+            .index = std.math.cast(u14, index) orelse return src,
+            .range = range != null,
+            .last = range == .last,
+        } } } };
     }
 
     /// `src` as an offset from its base, if it is a node.
@@ -5481,11 +5532,13 @@ fn analyzeDeclLiteral(sema: *Sema, block: *Block, src: Src, name: []const u8, or
         // Upstream looks the name up as a member of the type: a container
         // with neither such a declaration nor such a tag has no member.
         switch (Type.class(sema.ip, ty)) {
-            // The tag itself, so that coercing it does not search again.
-            .@"enum" => if (do_coerce) {
+            // The tag itself, as upstream's member lookup gives it, so that
+            // coercing it does not search again.
+            .@"enum" => {
                 try sema.resolveLayout(block, src, ty);
                 const i = sema.ip.structInfo(ty).fieldIndex(sema.ip, name) orelse return sema.failNoMember(block, src, ty, name);
-                return sema.coerce(block, orig_ty, .fromInterned(try sema.enumTagValue(ty, i)), src);
+                const tag: Ref = .fromInterned(try sema.enumTagValue(ty, i));
+                return if (do_coerce) sema.coerce(block, orig_ty, tag, src) else tag;
             },
             .@"union" => {
                 try sema.resolveLayout(block, src, ty);
@@ -12508,15 +12561,17 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         const body = sema.code.bodySlice(extra_index, case.prong_info.body_len);
         extra_index += body.len;
         var items: std.ArrayList(Index) = .empty;
-        for (case.item_infos) |info| {
+        for (case.item_infos, 0..) |info, item_i| {
+            // Errors about an item point at it, as upstream.
+            const item_src = src.switchItem(case.index, item_i, null);
             if (info.unwrap() == .under) {
                 under_index = cases.items.len;
                 continue;
             }
             if (packed_ty != .none) {
                 // An item of the packed type, compared by its bits.
-                const item = try sema.switchItem(&item_block, src, inst, info, packed_ty, &extra_index);
-                try items.append(sema.arena, (try sema.reinterpretBits(&item_block, src, operand_ty, .fromInterned(item))).toInterned().?);
+                const item = try sema.switchItem(&item_block, item_src, inst, info, packed_ty, &extra_index);
+                try items.append(sema.arena, (try sema.reinterpretBits(&item_block, item_src, operand_ty, .fromInterned(item))).toInterned().?);
                 continue;
             }
             // An error outside the switched set may have a prong of
@@ -12527,15 +12582,15 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
                     if (std.mem.indexOfScalar(InternPool.String, names, name) == null) continue;
                 }
             }
-            try items.append(sema.arena, try sema.switchItem(&item_block, src, inst, info, operand_ty, &extra_index));
+            try items.append(sema.arena, try sema.switchItem(&item_block, item_src, inst, info, operand_ty, &extra_index));
         }
         // A prong left with no items is never taken.
         if (items.items.len == 0 and case.range_infos.len == 0 and case.item_infos.len != 0 and
             (under_index == null or under_index.? != cases.items.len)) continue;
         const ranges = try sema.arena.alloc([2]Index, case.range_infos.len);
-        for (case.range_infos, ranges) |pair, *range| {
-            range[0] = try sema.switchItem(&item_block, src, inst, pair[0], operand_ty, &extra_index);
-            range[1] = try sema.switchItem(&item_block, src, inst, pair[1], operand_ty, &extra_index);
+        for (case.range_infos, ranges, 0..) |pair, *range, range_i| {
+            range[0] = try sema.switchItem(&item_block, src.switchItem(case.index, range_i, .first), inst, pair[0], operand_ty, &extra_index);
+            range[1] = try sema.switchItem(&item_block, src.switchItem(case.index, range_i, .last), inst, pair[1], operand_ty, &extra_index);
         }
         try cases.append(sema.arena, .{
             .items = items.items,
