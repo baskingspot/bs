@@ -2460,42 +2460,19 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .int_from_ptr => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             const operand = sema.resolveInst(data.un_node.operand);
-            const ty = sema.typeOf(operand);
-            // As upstream, a pointer or an optional pointer, not a slice.
-            const ptr_ty = if (Type.class(sema.ip, ty) == .optional) Type.childType(sema.ip, ty) else ty;
-            if (Type.class(sema.ip, ptr_ty) != .pointer or Type.isSlice(sema.ip, ptr_ty) or (ptr_ty != ty and !Type.optionalReprIsPtr(sema.ip, ptr_ty)))
-                return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ty)});
-            const ptr = operand;
-            if (sema.resolveValue(ptr)) |v0| {
-                if (sema.isUndef(v0)) break :blk .fromInterned(try sema.undefValue(.usize_type));
-                const v = switch (sema.ip.indexToKey(v0)) {
-                    .opt => |o| if (o.val == .none) break :blk .fromInterned(try sema.intValue(.usize_type, 0)) else o.val,
-                    else => v0,
-                };
-                if (sema.ip.indexToKey(v) == .ptr and sema.ip.indexToKey(v).ptr.base == .int)
-                    break :blk .fromInterned(try sema.intValue(.usize_type, sema.ip.indexToKey(v).ptr.byte_offset));
-            }
-            if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: pointer address is not known until link time", .{});
-            break :blk sema.addUnOp(block, .int_from_ptr, ptr);
+            if (try sema.vectorUnary(block, src, operand, intFromPtr)) |r| break :blk r;
+            break :blk sema.intFromPtr(block, src, operand);
         },
         .ptr_from_int => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
             const ty = try sema.castDestType(block, src, extra.lhs, false);
-            const operand = try sema.coerce(block, .usize_type, sema.resolveInst(extra.rhs), src);
-            if (try sema.resolveDefinedValue(block, src, operand)) |v| {
-                const addr = sema.ip.intValue(u64, v).?;
-                // A non-null optional pointer is an `opt` around its pointer.
-                if (Type.class(sema.ip, ty) == .optional) {
-                    if (addr == 0) break :blk .fromInterned(try sema.intern(.{ .opt = .{ .ty = ty, .val = .none } }));
-                    const ptr = try sema.intern(.{ .ptr = .{ .ty = Type.childType(sema.ip, ty), .base = .int, .byte_offset = addr } });
-                    break :blk .fromInterned(try sema.intern(.{ .opt = .{ .ty = ty, .val = ptr } }));
-                }
-                if (addr == 0 and !Type.ptrInfo(sema.ip, ty).flags.is_allowzero and Type.ptrInfo(sema.ip, ty).flags.size != .c)
-                    return sema.fail(block, src, "pointer type '{f}' does not allow address zero", .{sema.fmtType(ty)});
-                break :blk .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .int, .byte_offset = addr } }));
+            const operand = sema.resolveInst(extra.rhs);
+            if (sema.vectorLen(ty)) |len| {
+                const ints = try sema.coerce(block, try sema.vectorType(len, .usize_type), operand, src);
+                break :blk (try sema.vectorCast(block, src, ty, ints, ptrFromInt)).?;
             }
-            break :blk sema.addTyOp(block, .ptr_from_int, ty, operand);
+            break :blk sema.ptrFromInt(block, src, ty, operand);
         },
         .ptr_cast => sema.analyzePtrCast(block, inst, .{ .ptr_cast = true }),
         .size_of, .bit_size_of => blk: {
@@ -3266,6 +3243,45 @@ fn stdCallingConvention(sema: *Sema, block: *Block, src: Src, cc_ty: Index, cc: 
 /// The destination type of a cast builtin from its result type: without an
 /// error union, and with `remove_opt` without an optional either (inside
 /// the error union, or at the top), as upstream's `resolveDestType`.
+/// `@intFromPtr` of a pointer or optional pointer.
+fn intFromPtr(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
+    const ty = sema.typeOf(operand);
+    // As upstream, a pointer or an optional pointer, not a slice.
+    const ptr_ty = if (Type.class(sema.ip, ty) == .optional) Type.childType(sema.ip, ty) else ty;
+    if (Type.class(sema.ip, ptr_ty) != .pointer or Type.isSlice(sema.ip, ptr_ty) or (ptr_ty != ty and !Type.optionalReprIsPtr(sema.ip, ptr_ty)))
+        return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ty)});
+    const ptr = operand;
+    if (sema.resolveValue(ptr)) |v0| {
+        if (sema.isUndef(v0)) return .fromInterned(try sema.undefValue(.usize_type));
+        const v = switch (sema.ip.indexToKey(v0)) {
+            .opt => |o| if (o.val == .none) return .fromInterned(try sema.intValue(.usize_type, 0)) else o.val,
+            else => v0,
+        };
+        if (sema.ip.indexToKey(v) == .ptr and sema.ip.indexToKey(v).ptr.base == .int)
+            return .fromInterned(try sema.intValue(.usize_type, sema.ip.indexToKey(v).ptr.byte_offset));
+    }
+    if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: pointer address is not known until link time", .{});
+    return sema.addUnOp(block, .int_from_ptr, ptr);
+}
+
+/// `@ptrFromInt` of an address to pointer type `ty`.
+fn ptrFromInt(sema: *Sema, block: *Block, src: Src, ty: Index, uncasted: Ref) CompileError!Ref {
+    const operand = try sema.coerce(block, .usize_type, uncasted, src);
+    if (try sema.resolveDefinedValue(block, src, operand)) |v| {
+        const addr = sema.ip.intValue(u64, v).?;
+        // A non-null optional pointer is an `opt` around its pointer.
+        if (Type.class(sema.ip, ty) == .optional) {
+            if (addr == 0) return .fromInterned(try sema.intern(.{ .opt = .{ .ty = ty, .val = .none } }));
+            const ptr = try sema.intern(.{ .ptr = .{ .ty = Type.childType(sema.ip, ty), .base = .int, .byte_offset = addr } });
+            return .fromInterned(try sema.intern(.{ .opt = .{ .ty = ty, .val = ptr } }));
+        }
+        if (addr == 0 and !Type.ptrInfo(sema.ip, ty).flags.is_allowzero and Type.ptrInfo(sema.ip, ty).flags.size != .c)
+            return sema.fail(block, src, "pointer type '{f}' does not allow address zero", .{sema.fmtType(ty)});
+        return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .int, .byte_offset = addr } }));
+    }
+    return sema.addTyOp(block, .ptr_from_int, ty, operand);
+}
+
 fn castDestType(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref, remove_opt: bool) CompileError!Index {
     const ip = sema.ip;
     var ty = try sema.resolveType(block, src, ref);
