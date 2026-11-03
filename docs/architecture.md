@@ -111,10 +111,14 @@ type two keys, or two types one. (It must still tell distinct types apart:
 their declarations' keys extend it.) The *display name* is separate from the
 key and follows upstream's form (`Parent__struct_<n>`), because `@typeName`
 results are observable and `test/behavior` checks them. Upstream's `n` counts
-anonymous types in analysis order; zap's is the type's instruction (for an
-anonymous struct literal, its source node) relative to the declaration, like
-the key, so that an edit above a declaration renames none of its types:
-nothing that reads a type's name records a dependency on it.
+anonymous types in analysis order; zap's is the type's instruction (an
+anonymous struct literal's too) relative to the declaration, like the key, so
+that an edit above a declaration renames none of its types: nothing that
+reads a type's name records a dependency on it. The exception is a `comptime`
+block's types: all the blocks of a namespace share the parent name
+`<namespace>.comptime`, so relative numbers would collide, and theirs are
+absolute instructions, which is safe because a comptime block is analyzed
+again in every edit build.
 
 When a unit reads another unit's result (a declaration's value, a type's
 layout, a function's signature) it goes through one Sema function that records
@@ -2548,7 +2552,8 @@ and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
   every evaluation, not only the one that created the namespace, so that
   the references do not depend on analysis order.
 - Anonymous types are named `Parent__struct_<n>` with `n` relative to
-  their declaration (see "Analysis units"): with absolute instructions,
+  their declaration, except in `comptime` blocks (see "Analysis units"):
+  with absolute instructions,
   a green unit's result kept the old name of a type in an edited file,
   and code reading `@typeName` went stale.
 - The error name table is written in code order, not use order, so that

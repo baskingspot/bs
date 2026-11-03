@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "reflect.S\n*const reflect.S\n[]const u8\n?*anyopaque\nreflect.G.Box(u8)\nreflect.E\nIo.Writer\nstruct { u8, bool }\nerror{A,B}!u32\nfn (u8) callconv(.c) void\n[3:0]u16\n@Vector(4, f32)\nfn () callconv(.c) noreturn\nanyerror\nreflect.G.Args(.y,(function 'main'),\"hi\"[0..2],.{ .a = 1, .b = &.{ ... } })\n9084\n16\nFoo\n4\n99\n117637633\n2\nreflect.H__struct_\nreflect.localName__func_.Inner\n"
+//! stdout: "reflect.S\n*const reflect.S\n[]const u8\n?*anyopaque\nreflect.G.Box(u8)\nreflect.E\nIo.Writer\nstruct { u8, bool }\nerror{A,B}!u32\nfn (u8) callconv(.c) void\n[3:0]u16\n@Vector(4, f32)\nfn () callconv(.c) noreturn\nanyerror\nreflect.G.Args(.y,(function 'main'),\"hi\"[0..2],.{ .a = 1, .b = &.{ ... } })\n9084\n16\nFoo\n4\n99\n117637633\n2\nreflect.H__struct_\nreflect.localName__func_.Inner\nreflect.main__struct_\nreflect.C.comptime__struct_\nreflect.C.comptime__struct_\nreflect.C.comptime__struct_\nreflect.C.comptime__struct_\n4\n"
 //! @typeName, @offsetOf, @bitOffsetOf, @FieldType, @intFromError, and @errorFromInt.
 const std = @import("std");
 const rt = @import("rt.zig");
@@ -29,6 +29,42 @@ fn localName(comptime T: type) []const u8 {
     _ = T;
     const Inner = struct {};
     return @typeName(Inner);
+}
+// Anonymous types made in different `comptime` blocks of one namespace
+// are named after `<namespace>.comptime` and have distinct names. Each
+// block exports its names, which `main` compares.
+const C = struct {
+    comptime {
+        @export(@typeName(struct { x: u8 }), .{ .name = "reflect_c0_decl" });
+        @export(@typeName(@TypeOf(.{ .a = 1 })), .{ .name = "reflect_c0_lit" });
+    }
+    comptime {
+        @export(@typeName(struct { y: u8 }), .{ .name = "reflect_c1_decl" });
+        @export(@typeName(@TypeOf(.{ .b = 2 })), .{ .name = "reflect_c1_lit" });
+    }
+};
+comptime {
+    _ = C;
+}
+extern const reflect_c0_decl: u8;
+extern const reflect_c0_lit: u8;
+extern const reflect_c1_decl: u8;
+extern const reflect_c1_lit: u8;
+fn printComptimeNames() void {
+    const names = [_][]const u8{
+        std.mem.span(@as([*:0]const u8, @ptrCast(&reflect_c0_decl))),
+        std.mem.span(@as([*:0]const u8, @ptrCast(&reflect_c0_lit))),
+        std.mem.span(@as([*:0]const u8, @ptrCast(&reflect_c1_decl))),
+        std.mem.span(@as([*:0]const u8, @ptrCast(&reflect_c1_lit))),
+    };
+    var distinct: u64 = 0;
+    for (names, 0..) |n, i| {
+        printWithoutNumbers(n);
+        for (names[0..i]) |m| {
+            if (std.mem.eql(u8, n, m)) break;
+        } else distinct += 1;
+    }
+    rt.printInt(distinct);
 }
 fn printWithoutNumbers(n: []const u8) void {
     var i: usize = 0;
@@ -78,6 +114,8 @@ fn main() callconv(.c) noreturn {
     rt.printInt(@sizeOf(@FieldType(FieldsOf(E, u16), "y")));
     printWithoutNumbers(@typeName(@FieldType(H, "f")));
     printWithoutNumbers(localName(u8));
+    printWithoutNumbers(@typeName(@TypeOf(.{ .a = 1 })));
+    printComptimeNames();
     rt.exit(0);
 }
 

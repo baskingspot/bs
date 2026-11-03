@@ -5368,26 +5368,7 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
         },
         .anon, .dbg_var => {},
     }
-    // Upstream's `type_fqn_ctx`: the function being analyzed (an instance
-    // of a generic function by its symbol name, see CodeGen), called
-    // inline, or whose signature a call evaluates, else the declaration,
-    // else the container whose fields are being resolved, else
-    // `<namespace>.comptime`.
-    const parent = if (block.inlining) |inlining|
-        ip.stringSlice(ip.getNav(ip.keyPayload(.func, inlining.func).owner_nav).fqn)
-    else if (block.signature != .none)
-        ip.stringSlice(ip.getNav(ip.keyPayload(.func, block.signature).owner_nav).fqn)
-    else if (sema.func != .none) parent: {
-        const func = ip.keyPayload(.func, sema.func);
-        const fqn = ip.stringSlice(ip.getNav(func.owner_nav).fqn);
-        if (func.generic_owner == .none) break :parent fqn;
-        break :parent try std.fmt.allocPrint(sema.arena, "{s}__func_{x:0>8}", .{ fqn, @as(u32, @truncate(ip.stableHash(sema.func))) });
-    } else if (sema.owner_nav != .none)
-        ip.stringSlice(ip.getNav(sema.owner_nav).fqn)
-    else switch (sema.owner) {
-        .type_layout, .struct_defaults => |ty| ip.stringSlice(ip.containerType(ty).?.name),
-        else => try std.fmt.allocPrint(sema.arena, "{s}.comptime", .{sema.zcu.namespacePtr(block.namespace).fqn}),
-    };
+    const parent = try sema.anonTypeParent(block);
     // `const T = struct {...};` in a function body: named after the local.
     const var_name: ?[]const u8 = if (strategy == .dbg_var) blk: {
         const tags = sema.code.instructions.items(.tag);
@@ -5398,15 +5379,46 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
         };
         break :blk null;
     } else null;
-    // Numbered from the declaration, as the key is, not by the absolute
-    // instruction: an edit above it must not rename the type, which
-    // nothing that reads its name would notice. (Upstream numbers them in
-    // analysis order.)
     const display = if (var_name) |n|
         try std.fmt.allocPrint(sema.arena, "{s}.{s}", .{ parent, n })
     else
-        try std.fmt.allocPrint(sema.arena, "{s}__{t}_{d}", .{ parent, kind, @as(i64, @backingInt(inst)) - @backingInt(sema.anonTypeBase(block)[1]) });
+        try std.fmt.allocPrint(sema.arena, "{s}__{t}_{d}", .{ parent, kind, sema.anonTypeNumber(block, inst) });
     return .{ .display = display, .key = try sema.anonTypeKey(block, inst, captures) };
+}
+
+/// The name an anonymous type made in `block` is numbered under, as
+/// upstream's `type_fqn_ctx`: the function being analyzed (an instance of
+/// a generic function by its symbol name, see CodeGen), called inline, or
+/// whose signature a call evaluates, else the declaration, else the
+/// container whose fields are being resolved, else `<namespace>.comptime`.
+fn anonTypeParent(sema: *Sema, block: *const Block) Allocator.Error![]const u8 {
+    const ip = sema.ip;
+    if (block.inlining) |inlining| return ip.stringSlice(ip.getNav(ip.keyPayload(.func, inlining.func).owner_nav).fqn);
+    if (block.signature != .none) return ip.stringSlice(ip.getNav(ip.keyPayload(.func, block.signature).owner_nav).fqn);
+    if (sema.func != .none) {
+        const func = ip.keyPayload(.func, sema.func);
+        const fqn = ip.stringSlice(ip.getNav(func.owner_nav).fqn);
+        if (func.generic_owner == .none) return fqn;
+        return std.fmt.allocPrint(sema.arena, "{s}__func_{x:0>8}", .{ fqn, @as(u32, @truncate(ip.stableHash(sema.func))) });
+    }
+    if (sema.owner_nav != .none) return ip.stringSlice(ip.getNav(sema.owner_nav).fqn);
+    return switch (sema.owner) {
+        .type_layout, .struct_defaults => |ty| ip.stringSlice(ip.containerType(ty).?.name),
+        else => std.fmt.allocPrint(sema.arena, "{s}.comptime", .{sema.zcu.namespacePtr(block.namespace).fqn}),
+    };
+}
+
+/// The number in `<parent>__struct_<n>` of an anonymous type made by
+/// instruction `inst` in `block`. Upstream counts them in analysis order;
+/// zap numbers them from the declaration, as the key is, so that an edit
+/// above it does not rename the type, which nothing that reads its name
+/// would notice. The `comptime` blocks of a namespace share a parent name,
+/// so theirs are absolute instructions instead, which keep them apart: a
+/// comptime block is analyzed again in every edit build.
+fn anonTypeNumber(sema: *Sema, block: *const Block, inst: Zir.Inst.Index) u32 {
+    const nav, const base = sema.anonTypeBase(block);
+    if (nav == .none and sema.owner == .comptime_decl) return @backingInt(inst);
+    return @backingInt(inst) - @backingInt(base);
 }
 
 /// The stable key of an anonymous container type made by ZIR instruction
@@ -13005,7 +13017,7 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
 
 /// `.{ .a = x, .b = y }` without a result type. Like upstream, its type is
 /// a struct equal by its literal and fields, with comptime-known fields
-/// as comptime fields, named `Parent__struct_<node offset>`.
+/// as comptime fields, named as other anonymous types (`anonTypeNumber`).
 fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: Ast.Node.Offset, names: []const InternPool.String, inits: []const Ref) CompileError!Ref {
     const ip = sema.ip;
     const src = block.nodeSrc(src_node);
@@ -13021,7 +13033,6 @@ fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: As
     }
 
     var site: std.Io.Writer.Allocating = .init(sema.arena);
-    var parent: std.Io.Writer.Allocating = .init(sema.arena);
     const owner_nav: InternPool.NavIndex = if (block.inlining) |inl|
         ip.keyPayload(.func, inl.func).owner_nav
     else switch (sema.owner) {
@@ -13030,23 +13041,18 @@ fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: As
     };
     if (owner_nav != .none) {
         site.writer.writeAll(ip.stringSlice(ip.getNav(owner_nav).key)) catch return error.OutOfMemory;
-        parent.writer.writeAll(ip.stringSlice(ip.getNav(owner_nav).fqn)) catch return error.OutOfMemory;
     } else {
         sema.zcu.unitKey(sema.owner, &site.writer) catch return error.OutOfMemory;
-        parent.writer.writeAll(sema.zcu.namespacePtr(block.namespace).fqn) catch return error.OutOfMemory;
     }
     site.writer.print("#lit{d}", .{@backingInt(src_node)}) catch return error.OutOfMemory;
-    // By its source node, relative to the declaration like `site`, so that
-    // an edit above it does not rename it (see `typeName`).
-    _ = inst;
-    parent.writer.print("__struct_{d}", .{@backingInt(src_node)}) catch return error.OutOfMemory;
+    const name = try std.fmt.allocPrint(sema.arena, "{s}__struct_{d}", .{ try sema.anonTypeParent(block), sema.anonTypeNumber(block, inst) });
 
     const ty = try sema.intern(.{ .tuple_type = .{
         .types = types,
         .values = values,
         .names = names,
         .site = try sema.getString(site.written()),
-        .name = try sema.getString(parent.written()),
+        .name = try sema.getString(name),
     } });
     return sema.aggregate(block, src, ty, inits);
 }
