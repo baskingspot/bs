@@ -370,7 +370,7 @@ the laziness rule; unboxed integers in the frame; then a denser encoding.
   value that outlives its instruction gets a stack slot; instructions load
   operands into scratch registers, compute, and store. No register
   allocation. "Optimizing backend" below replaces this with one shared SSA
-  layer (designed 2026-11-03, for review); the bullets here describe the
+  layer (accepted 2026-11-03, being built); the bullets here describe the
   code as it is until that lands.
 - Calling conventions: `.c` follows SysV for scalars: integers, bools, and
   pointers in GPRs (16-byte integers in register pairs), f16, f32, f64, and
@@ -470,7 +470,7 @@ the laziness rule; unboxed integers in the frame; then a denser encoding.
   for x86_64; clang's for aarch64, 32,771 instructions byte-identical,
   including every encodable logical immediate).
 
-### Optimizing backend (designed 2026-11-03, for review)
+### Optimizing backend (designed 2026-11-03, accepted by the owner; being built)
 
 Not built yet. AGENTS.md fixes the goal: one optimization level, Debug
 semantics, debuggable output, and optimization sized to compile fast. This
@@ -892,7 +892,8 @@ link-time value is ever needed in code. The link thread adds the kind.
   loclists by the linker. Promoted variables then stay visible in a
   debugger; until then they are not (unpromoted ones keep their slot).
   This is the one debuggability regression the design accepts in the
-  meantime, and it argues for landing locations soon after registers.
+  meantime (accepted by the owner, 2026-11-03), and it argues for landing
+  locations soon after registers.
 
 #### Inlining within a budget (later step)
 
@@ -969,8 +970,10 @@ replay format can carry it.
   inlined function shows the callee's line and loses the caller's frame.
   Debuggers show both (they read `DW_TAG_inlined_subroutine`). Upstream
   Debug never inlines, so this changes zap's panic traces relative to
-  upstream's; it is the owner's call whether that is acceptable or whether
-  functions containing safety checks stay out of line.
+  upstream's. The owner accepted this (2026-11-03): functions containing
+  safety checks inline like any other, since nearly all arithmetic is
+  checked; step 6 reports how much inlining such functions buys, to
+  confirm the call with numbers.
 
 #### Compile-time budget and how it is measured
 
