@@ -3885,16 +3885,24 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             },
             .@"fn" => {
                 // A function body coerces to a pointer to it.
+                // (See also the `.@"fn"` case below.)
                 const d = Type.ptrInfo(ip, dest_ty);
                 const v = val orelse return null;
                 if (d.flags.size != .one or ip.indexToKey(v) != .func) return null;
-                if (d.child != src_ty and !sema.fnTypeCoercible(src_ty, d.child)) return null;
+                if (d.child != src_ty and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
                 const f = ip.indexToKey(v).func;
                 if (f.generic_owner != .none) return null;
                 try sema.zcu.queueFunc(v);
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .nav = f.owner_nav } } }));
             },
             else => {},
+        },
+        // A function body coerces to a function type it can be called as;
+        // it keeps its own type.
+        .@"fn" => if (sc == .@"fn") {
+            const v = val orelse return null;
+            if (ip.indexToKey(v) != .func or !try sema.fnTypeCoercible(block, src, v, dest_ty)) return null;
+            return inst;
         },
         .vector, .array => if ((dc == .vector and (sc == .array or sc == .vector)) or (dc == .array and sc == .vector)) {
             // Between arrays and vectors of the same length, element by
@@ -4298,16 +4306,26 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     return null;
 }
 
-/// Whether a function of type `src` can be called as a `dst`: the same
-/// except that a `noreturn` function may stand for any return type.
-fn fnTypeCoercible(sema: *Sema, src: Index, dst: Index) bool {
+/// Whether function `func` can be called as a `dst`: the same type except
+/// that a `noreturn` function may stand for any return type, and a
+/// returned error set may be a subset of `dst`'s (resolving an inferred
+/// error set), as upstream.
+fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: Index) CompileError!bool {
     const ip = sema.ip;
-    if (Type.class(ip, src) != .@"fn" or Type.class(ip, dst) != .@"fn") return false;
+    const src = ip.typeOf(func);
+    if (Type.class(ip, dst) != .@"fn") return false;
     const s = ip.indexToKey(src).func_type;
     const d = ip.indexToKey(dst).func_type;
     if (s.cc != d.cc or s.is_generic or d.is_generic or s.param_types.len != d.param_types.len) return false;
     for (s.param_types, d.param_types) |a, b| if (a != b) return false;
-    return s.return_type == d.return_type or s.return_type == .noreturn_type;
+    if (s.return_type == d.return_type or s.return_type == .noreturn_type) return true;
+    const sr = ip.indexToKey(s.return_type);
+    const dr = ip.indexToKey(d.return_type);
+    if (sr != .error_union_type or dr != .error_union_type) return false;
+    if (sr.error_union_type.payload_type != dr.error_union_type.payload_type) return false;
+    var set = sr.error_union_type.error_set_type;
+    if (set == .adhoc_inferred_error_set_type) set = try sema.intern(.{ .inferred_error_set_type = func });
+    return sema.errorSetCoercible(block, src_loc, set, dr.error_union_type.error_set_type, .none);
 }
 
 fn makeSlice(sema: *Sema, block: *Block, slice_ty: Index, ptr: Ref, len: Ref) CompileError!Ref {

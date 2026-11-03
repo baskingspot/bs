@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -146,6 +146,13 @@ fn main() callconv(.c) noreturn {
     rt.printInt(useBig(1));
 
     const e: anyerror!u8 = error.Empty;
+    // A function with an inferred error set passed as a callback whose
+    // type names a superset.
+    var acc: Acc = .{};
+    eachBelow5(&acc, error{ Stop, Other }, Acc.add) catch |err| {
+        if (err == error.Stop) acc.sum += 10;
+    };
+    rt.printInt(acc.sum);
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
 }
 
@@ -204,3 +211,15 @@ fn useBig(k: u32) u64 {
         },
     }
 }
+
+fn eachBelow5(ctx: anytype, comptime E: type, comptime cb: fn (u32, @TypeOf(ctx)) E!void) E!void {
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) try cb(i, ctx);
+}
+const Acc = struct {
+    sum: u32 = 0,
+    fn add(i: u32, a: *Acc) !void {
+        if (i == 4) return error.Stop;
+        a.sum += i;
+    }
+};
