@@ -267,9 +267,16 @@ fn buildLineHeader(arena: Allocator, line: *std.Io.Writer, files: []const []cons
     var dirs: std.StringArrayHashMapUnmanaged(void) = .empty;
     try dirs.put(arena, unit_dir, {});
     const file_dirs = try arena.alloc(usize, files.len);
+    // Files share few directories: resolve each spelling once.
+    var by_dirname: std.StringHashMapUnmanaged(usize) = .empty;
     for (files, file_dirs) |f, *dir| {
-        const resolved = try std.fs.path.resolvePosix(arena, &.{ comp_dir, std.fs.path.dirnamePosix(f) orelse "." });
-        dir.* = (try dirs.getOrPut(arena, resolved)).index;
+        const dirname = std.fs.path.dirnamePosix(f) orelse ".";
+        const gop = try by_dirname.getOrPut(arena, dirname);
+        if (!gop.found_existing) {
+            const resolved = try std.fs.path.resolvePosix(arena, &.{ comp_dir, dirname });
+            gop.value_ptr.* = (try dirs.getOrPut(arena, resolved)).index;
+        }
+        dir.* = gop.value_ptr.*;
     }
     try line.writeAll(&.{ 1, DW.LNCT.path, DW.FORM.string });
     try line.writeUleb128(dirs.count());

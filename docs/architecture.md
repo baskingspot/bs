@@ -485,6 +485,15 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   another 10M per emit. Linking hello (std) takes about 3 ms before and
   after; x86_64/binary.zig (117k functions, 285 MB) takes 110–115 ms
   before and after into tmpfs, and is dominated by writeback on disk.
+  Debug info's share of real links: hello, 0.93 → 1.10 ms on 1 thread
+  (in memory), about 0.94M instructions per link, which resolving each
+  line program directory spelling once cut by 75k; binary.zig, 118 →
+  135 ms on 1 thread and 38.0 → 42.6 ms on 4, and about 62M of a cached
+  relink's 269M instructions (530 per function): about 18M decoding
+  each entry from its cache record (once for layout, once for writing),
+  7M in compiler_rt memcpy calls for names and fragments, and the rest
+  spread over sizing, unit and file lookups, FDEs, and sequence
+  wrappers, with no single hot spot.
 - Call frame information: std.debug unwinds x86_64-linux stacks with DWARF
   CFI (frame-pointer walking counts as unsafe there and is used only for
   panics), looking first for PT_GNU_EH_FRAME. So each `Debug` entry whose
