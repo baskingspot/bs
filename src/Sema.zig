@@ -7153,9 +7153,10 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     if (info.flags.is_const) return sema.fail(block, src, "cannot assign to constant", .{});
     const operand = try sema.coerce(block, info.child, uncasted, src);
     if (sema.resolveValue(ptr)) |pv| {
-        if (sema.comptime_field_ptrs.contains(pv)) {
-            const uav = sema.ip.indexToKey(pv).ptr.base.uav;
-            if (sema.resolveValue(operand) != uav.val)
+        if (sema.intoComptimeField(pv)) {
+            // A store into a comptime field (or a part of it) only checks
+            // that the value matches.
+            if (sema.resolveValue(operand) != try sema.comptimeLoadOrNull(block, src, pv))
                 return sema.fail(block, src, "value stored in comptime field does not match the default value of the field", .{});
             return;
         }
@@ -8522,8 +8523,9 @@ fn fieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) Co
     if (Type.class(ip, ptr_ty) != .pointer) {
         if (ptr_ty == .type_type) {
             const container = try sema.resolveConstValue(block, src, ptr, "types must be comptime-known");
+            // An enum tag or error is a value, referenced like a constant.
             const nav = (try sema.lookupInType(container, name)) orelse
-                return sema.fail(block, src, "'{f}' has no member named '{s}'", .{ sema.fmtType(container), name });
+                return sema.analyzeRef(block, src, try sema.namespaceLookupVal(block, src, container, name));
             return sema.navRef(block, src, nav);
         }
         return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ptr_ty)});
@@ -9011,6 +9013,22 @@ fn fieldPtrAlignment(sema: *Sema, block: *Block, src: Src, ptr_align: u6, aggreg
 /// A pointer to a comptime field's value `val`, through a pointer to its
 /// aggregate that is const or not. Stores through a mutable one must store
 /// the same value (see `analyzeStore`).
+/// Whether comptime-known pointer `ptr` points into a mutable comptime
+/// field.
+fn intoComptimeField(sema: *Sema, ptr: Index) bool {
+    var v = ptr;
+    while (true) {
+        if (sema.comptime_field_ptrs.contains(v)) return true;
+        const k = sema.ip.indexToKey(v);
+        if (k != .ptr) return false;
+        v = switch (k.ptr.base) {
+            .field => |f| f.base,
+            .elem => |e| e.base,
+            else => return false,
+        };
+    }
+}
+
 fn comptimeFieldPtr(sema: *Sema, is_const: bool, val: Index) CompileError!Ref {
     const ptr_ty = try sema.ptrType(.{ .child = sema.ip.typeOf(val), .flags = .{ .is_const = is_const } });
     const ptr = try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = val, .orig_ty = ptr_ty } } } });

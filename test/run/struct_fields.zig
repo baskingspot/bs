@@ -1,7 +1,9 @@
 //! exit: 0
 //! stdout: "4\n16\n5\n8\n8\n14\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n462\n"
-//! Comptime struct fields, comparing a function with a pointer to it, and
-//! the alignment of field pointers and aligned comptime variables.
+//! Comptime struct fields (stores into parts of them check the value),
+//! comparing a function with a pointer to it, the alignment of field
+//! pointers and aligned comptime variables, methods of enum tags named
+//! through their type, and pointers to zero-bit declarations.
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -13,6 +15,9 @@ pub export fn _start() callconv(.naked) noreturn {
 
 fn main() callconv(.c) noreturn {
     comptimeFields();
+    comptimeFieldParts();
+    if (Sym.line.width() != 2) unreachable;
+    if (voidPtr() != voidPtr()) unreachable;
     fnPtrCompare();
     fieldAlignment();
     rt.exit(0);
@@ -88,4 +93,27 @@ fn doTheTest2() void {
     if (@TypeOf(&b.x) != *align(1) u32) unreachable;
     if (@TypeOf(&v) != *align(8) u8) unreachable;
     b.x += v;
+}
+
+fn comptimeFieldParts() void {
+    const Arr = struct { comptime a: [2]u32 = .{ 1, 2 } };
+    var s: Arr = .{};
+    s.a[0] = 1;
+    const Pair = struct { a: u32, b: u32 };
+    const Holder = struct { comptime t: Pair = .{ .a = 1, .b = 2 } };
+    var u: Holder = .{};
+    u.t.b = 2;
+}
+
+const Sym = enum {
+    tee,
+    line,
+    fn width(s: Sym) u32 {
+        return @as(u32, @intFromEnum(s)) + 1;
+    }
+};
+
+const nothing = {};
+fn voidPtr() *const void {
+    return &nothing;
 }
