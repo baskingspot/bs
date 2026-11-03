@@ -8138,13 +8138,10 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     const ip = sema.ip;
     const gpa = sema.gpa;
     const sb = sema.code.getSwitchBlock(inst);
-    // A tagged union switches on its tag; prongs capture the payload.
-    var cond = operand;
-    if (Type.class(ip, sema.typeOf(operand)) == .@"union") {
-        try sema.resolveLayout(parent, src, sema.typeOf(operand));
-        if (ip.indexToKey(ip.structInfo(sema.typeOf(operand)).tag_type) != .enum_type) return sema.fail(parent, src, "switch on union with no attached enum", .{});
-        cond = try sema.unionTag(parent, src, operand);
-    }
+    // A tagged union switches on its tag; prongs capture the payload. A
+    // packed struct or union switches on its bits, as upstream.
+    const packed_ty: Index = if (Type.isPacked(ip, sema.typeOf(operand))) sema.typeOf(operand) else .none;
+    const cond = try sema.switchCond(parent, src, operand);
     const operand_ty = sema.typeOf(cond);
     switch (Type.class(ip, operand_ty)) {
         .int, .comptime_int, .bool, .error_set, .enum_literal, .type, .@"enum" => {},
@@ -8153,7 +8150,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     if (Type.class(ip, operand_ty) == .@"enum") try sema.resolveLayout(parent, src, operand_ty);
     const capture_inst: Zir.Inst.Index = sb.payload_capture_placeholder.unwrap() orelse inst;
     const tag_inst: Zir.Inst.Index = sb.tag_capture_placeholder.unwrap() orelse inst;
-    const is_union = Type.class(ip, sema.typeOf(operand)) == .@"union";
+    const is_union = Type.class(ip, sema.typeOf(operand)) == .@"union" and packed_ty == .none;
 
     // Evaluate the case items at comptime.
     var cases: std.ArrayList(SwitchCase) = .empty;
@@ -8171,6 +8168,12 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         for (case.item_infos) |info| {
             if (info.unwrap() == .under) {
                 under_index = cases.items.len;
+                continue;
+            }
+            if (packed_ty != .none) {
+                // An item of the packed type, compared by its bits.
+                const item = try sema.switchItem(&item_block, src, inst, info, packed_ty, &extra_index);
+                try items.append(sema.arena, (try sema.reinterpretBits(&item_block, src, operand_ty, .fromInterned(item))).toInterned().?);
                 continue;
             }
             try items.append(sema.arena, try sema.switchItem(&item_block, src, inst, info, operand_ty, &extra_index));
@@ -8296,7 +8299,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         };
     }
     const under_case = under_prong orelse else_case;
-    if (sb.has_continue) return sema.switchLoop(parent, src, inst, operand, cases.items, under_case, capture_inst);
+    if (sb.has_continue) return sema.switchLoop(parent, src, inst, operand, operand_ptr, cases.items, under_case, capture_inst);
 
     // Comptime-known operand: analyze only the matching prong.
     if (sema.resolveValue(cond)) |v| {
@@ -8444,19 +8447,34 @@ fn switchProngsRuntime(
 /// A labeled switch with `continue`. At comptime, prongs run until one
 /// does not continue. At runtime, the operand lives in a local and the
 /// prongs dispatch in a loop that `continue :label x` repeats.
-fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, operand: Ref, cases: []const SwitchCase, else_case: ?SwitchCase, capture_inst: Zir.Inst.Index) CompileError!Ref {
+fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, operand: Ref, operand_ptr: Ref, cases_in: []const SwitchCase, else_case_in: ?SwitchCase, capture_inst: Zir.Inst.Index) CompileError!Ref {
     const ip = sema.ip;
     const gpa = sema.gpa;
     const operand_ty = sema.typeOf(operand);
-    const is_union = Type.class(ip, operand_ty) == .@"union";
+    // With captures by reference the loop carries a pointer to the
+    // operand, and `continue :sw x` passes a pointer to `x`.
+    const is_ref = operand_ptr != .none;
+    const slot_ty = if (is_ref) sema.typeOf(operand_ptr) else operand_ty;
     // `continue :sw x` coerces `x` to the switch instruction, which
     // stands for the operand type (captures use placeholders).
     try sema.inst_map.put(gpa, inst, .fromInterned(operand_ty));
     defer _ = sema.inst_map.remove(inst);
+    // The prongs of one iteration, whose by-reference captures point to
+    // that iteration's operand.
+    const cases = try sema.arena.dupe(SwitchCase, cases_in);
+    var else_case = else_case_in;
+    const setPtr = struct {
+        fn f(cs: []SwitchCase, e: *?SwitchCase, p: Ref) void {
+            for (cs) |*c| c.operand_ptr = p;
+            if (e.*) |*x| x.operand_ptr = p;
+        }
+    }.f;
     if (parent.is_comptime) {
-        var cur = operand;
+        var cur_slot = if (is_ref) operand_ptr else operand;
         while (true) {
-            const cond = if (is_union) try sema.unionTag(parent, src, cur) else cur;
+            const cur = if (is_ref) try sema.analyzeLoad(parent, src, cur_slot) else cur_slot;
+            if (is_ref) setPtr(cases, &else_case, cur_slot);
+            const cond = try sema.switchCond(parent, src, cur);
             const v = sema.resolveValue(cond) orelse return sema.fail(parent, src, "unable to evaluate comptime expression", .{});
             const chosen = for (cases) |c| {
                 if (try sema.switchCaseMatches(c, v)) break c;
@@ -8468,7 +8486,7 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
                     const brk = sema.code.instructions.items(.data)[@backingInt(brk_inst)].@"break";
                     const extra = sema.code.extraData(Zir.Inst.Break, brk.payload_index).data;
                     if (sema.code.instructions.items(.tag)[@backingInt(brk_inst)] != .switch_continue or extra.block_inst != inst) return err;
-                    cur = try sema.coerce(parent, operand_ty, sema.resolveInst(brk.operand), src);
+                    cur_slot = try sema.coerce(parent, slot_ty, sema.resolveInst(brk.operand), src);
                     try sema.emitBackwardBranch(parent, src);
                     continue;
                 },
@@ -8490,19 +8508,36 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
     var outer = parent.child();
     outer.label = &label;
     defer outer.instructions.deinit(gpa);
-    const ptr = try sema.addInst(&outer, .{ .tag = .alloc, .data = .{ .ty = try sema.ptrType(.{ .child = operand_ty }) } });
-    _ = try sema.addBinOp(&outer, .store, ptr, operand);
-    label.switch_continue = .{ .loop_inst = loop_inst, .operand_ptr = ptr, .operand_ty = operand_ty };
+    const ptr = try sema.addInst(&outer, .{ .tag = .alloc, .data = .{ .ty = try sema.ptrType(.{ .child = slot_ty }) } });
+    _ = try sema.addBinOp(&outer, .store, ptr, if (is_ref) operand_ptr else operand);
+    label.switch_continue = .{ .loop_inst = loop_inst, .operand_ptr = ptr, .operand_ty = slot_ty };
     var loop_block = outer.condChild();
     defer loop_block.instructions.deinit(gpa);
-    const cur = try sema.analyzeLoad(&loop_block, src, ptr);
-    const cond = if (is_union) try sema.unionTag(&loop_block, src, cur) else cur;
+    const slot = try sema.analyzeLoad(&loop_block, src, ptr);
+    if (is_ref) setPtr(cases, &else_case, slot);
+    const cur = if (is_ref) try sema.analyzeLoad(&loop_block, src, slot) else slot;
+    const cond = try sema.switchCond(&loop_block, src, cur);
     try sema.emitSwitchProngs(&loop_block, src, inst, cond, cur, cases, else_case, capture_inst);
     const loop_payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(loop_block.instructions.items.len) });
     try sema.appendBody(loop_block.instructions.items);
     sema.ir_insts.set(@backingInt(loop_inst), .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = loop_payload } } });
     try outer.instructions.append(gpa, loop_inst);
     return sema.resolveBlock(parent, src, &outer, &label.merges);
+}
+
+/// What a switch on `operand` compares: a tagged union's tag, a packed
+/// struct's or union's bits, or the operand.
+fn switchCond(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const ty = sema.typeOf(operand);
+    if (Type.isPacked(ip, ty)) {
+        try sema.resolveLayout(block, src, ty);
+        return sema.reinterpretBits(block, src, ip.structInfo(ty).tag_type, operand);
+    }
+    if (Type.class(ip, ty) != .@"union") return operand;
+    try sema.resolveLayout(block, src, ty);
+    if (ip.indexToKey(ip.structInfo(ty).tag_type) != .enum_type) return sema.fail(block, src, "switch on union with no attached enum", .{});
+    return sema.unionTag(block, src, operand);
 }
 
 /// The prongs of a runtime switch on `cond`, added to `outer`, whose
@@ -8582,6 +8617,7 @@ fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: R
         }
         return sema.addTyOp(block, .bitcast, set, operand);
     }
+    if (Type.isPacked(ip, ty)) return operand;
     if (Type.class(ip, ty) != .@"union") return if (c.is_inline) .fromInterned(c.items[0]) else operand;
     if (c.items.len == 0) return operand;
     const info = ip.structInfo(ty);
@@ -8597,14 +8633,16 @@ fn bindSwitchCaptures(sema: *Sema, block: *Block, src: Src, c: SwitchCase, opera
     // labeled switch maps to its operand type.
     if (c.capture != .none) try sema.inst_map.put(sema.gpa, capture_inst, try sema.switchCapture(block, src, c, operand));
     if (c.tag_inst.unwrap()) |t| {
-        try sema.inst_map.put(sema.gpa, t, if (c.is_inline) .fromInterned(c.items[0]) else try sema.unionTag(block, src, operand));
+        // A prong with one item knows its tag, as upstream.
+        const known = c.is_inline or (c.items.len == 1 and c.ranges.len == 0);
+        try sema.inst_map.put(sema.gpa, t, if (known) .fromInterned(c.items[0]) else try sema.unionTag(block, src, operand));
     }
 }
 
 fn analyzeProng(sema: *Sema, block: *Block, c: SwitchCase, operand: Ref, capture_inst: Zir.Inst.Index, switch_inst: Zir.Inst.Index) CompileError!void {
     const ip = sema.ip;
     const op_ty = sema.typeOf(operand);
-    if (Type.class(ip, op_ty) == .@"union" and c.items.len != 0) {
+    if (Type.class(ip, op_ty) == .@"union" and !Type.isPacked(ip, op_ty) and c.items.len != 0) {
         // A prong whose union fields are all `noreturn` cannot be taken,
         // so upstream does not analyze its body.
         const info = ip.structInfo(op_ty);
