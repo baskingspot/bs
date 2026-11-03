@@ -3577,7 +3577,8 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                     };
                     return try sema.addTyOp(block, .bitcast, dest_ty, inst);
                 }
-                return null;
+                // `?T` to `??T`: wrapped like any payload.
+                if (Type.class(ip, child) != .optional) return null;
             }
             const payload = (try sema.coerceInner(block, child, inst, src)) orelse return null;
             if (sema.resolveValue(payload)) |pv| return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = pv } }));
@@ -3632,7 +3633,8 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 // A function body coerces to a pointer to it.
                 const d = Type.ptrInfo(ip, dest_ty);
                 const v = val orelse return null;
-                if (d.flags.size != .one or d.child != src_ty or ip.indexToKey(v) != .func) return null;
+                if (d.flags.size != .one or ip.indexToKey(v) != .func) return null;
+                if (d.child != src_ty and !sema.fnTypeCoercible(src_ty, d.child)) return null;
                 const f = ip.indexToKey(v).func;
                 if (f.generic_owner != .none) return null;
                 try sema.zcu.queueFunc(v);
@@ -3878,7 +3880,9 @@ fn naturalAlignment(sema: *Sema, ty: Index) ?u64 {
     const ip = sema.ip;
     if (!sema.layoutResolved(ty)) return null;
     return switch (Type.class(ip, ty)) {
-        .@"opaque", .@"fn" => null,
+        .@"opaque" => null,
+        // x86_64's minimum function alignment, as upstream.
+        .@"fn" => 1,
         else => if (Type.hasRuntimeBits(ip, ty)) Type.abiAlignment(ip, ty) else null,
     };
 }
@@ -3989,7 +3993,27 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         const len: Ref = .fromInterned(try sema.intValue(.usize_type, a.len));
         return try sema.makeSlice(block, dest_ty, ptr, len);
     }
+    // `[]T` to `[*]T`, keeping a sentinel.
+    if (s.flags.size == .slice and d.flags.size == .many) {
+        if (s.child != d.child and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
+        if (s.flags.is_const and !d.flags.is_const) return null;
+        if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return null;
+        const raw = try sema.slicePtr(block, inst);
+        return try sema.coercePtrTo(block, raw, dest_ty);
+    }
     return null;
+}
+
+/// Whether a function of type `src` can be called as a `dst`: the same
+/// except that a `noreturn` function may stand for any return type.
+fn fnTypeCoercible(sema: *Sema, src: Index, dst: Index) bool {
+    const ip = sema.ip;
+    if (Type.class(ip, src) != .@"fn" or Type.class(ip, dst) != .@"fn") return false;
+    const s = ip.indexToKey(src).func_type;
+    const d = ip.indexToKey(dst).func_type;
+    if (s.cc != d.cc or s.is_generic or d.is_generic or s.param_types.len != d.param_types.len) return false;
+    for (s.param_types, d.param_types) |a, b| if (a != b) return false;
+    return s.return_type == d.return_type or s.return_type == .noreturn_type;
 }
 
 fn makeSlice(sema: *Sema, block: *Block, slice_ty: Index, ptr: Ref, len: Ref) CompileError!Ref {
@@ -7548,6 +7572,9 @@ const SwitchCase = struct {
     is_inline: bool = false,
     /// The instruction a union tag capture binds, or `none`.
     tag_inst: Zir.Inst.OptionalIndex = .none,
+    /// The else prong of a switch on a known error set: the errors no
+    /// other prong handles, which are the capture's type.
+    else_errors: ?[]const InternPool.String = null,
 };
 
 fn zirSwitchBlock(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -7699,6 +7726,22 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         if (!try sema.switchCoversAllInts(cases.items, operand_ty)) return sema.fail(parent, src, "switch must handle all possibilities", .{});
     }
 
+    // The else capture of an error set switch has the errors the other
+    // prongs leave.
+    if (else_case) |*e| if (e.capture != .none and !e.is_inline and Type.class(ip, operand_ty) == .error_set) {
+        if (try sema.errorSetNames(parent, src, operand_ty)) |names| {
+            var rest: std.ArrayList(InternPool.String) = .empty;
+            for (names) |n| {
+                const handled = outer: for (cases.items) |c| {
+                    for (c.items) |item| {
+                        if (ip.indexToKey(item).err.name == n) break :outer true;
+                    }
+                } else false;
+                if (!handled) try rest.append(sema.arena, n);
+            }
+            e.else_errors = rest.items;
+        }
+    };
     // A `_` prong is the else prong of a non-exhaustive enum.
     const under_prong: ?SwitchCase = if (under_index) |k| cases.items[k] else null;
     if (else_case) |e| if (e.is_inline) {
@@ -7917,10 +7960,12 @@ fn switchProngsRuntime(
 fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: Ref) CompileError!Ref {
     const ip = sema.ip;
     const ty = sema.typeOf(operand);
-    if (Type.class(ip, ty) == .error_set and c.items.len != 0 and !c.is_inline) {
+    if (Type.class(ip, ty) == .error_set and (c.items.len != 0 or c.else_errors != null) and !c.is_inline) {
         // The capture's type is the set of the prong's errors.
-        const names = try sema.arena.alloc(InternPool.String, c.items.len);
-        for (names, c.items) |*n, item| n.* = ip.indexToKey(item).err.name;
+        const names = if (c.else_errors) |ee| try sema.arena.dupe(InternPool.String, ee) else try sema.arena.alloc(InternPool.String, c.items.len);
+        if (c.else_errors == null) for (names, c.items) |*n, item| {
+            n.* = ip.indexToKey(item).err.name;
+        };
         const set = try sema.errorSetType(names);
         if (sema.resolveValue(operand)) |v| {
             if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(set));
