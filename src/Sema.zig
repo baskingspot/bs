@@ -4291,7 +4291,10 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .int, .byte_offset = addr } }));
                 }
                 if (sc == .comptime_int) return null;
-                const addr = try sema.coerce(block, .usize_type, inst, src);
+                // A signed integer goes through isize, as upstream.
+                const signed = Type.intInfo(ip, src_ty).signedness == .signed;
+                var addr = try sema.coerce(block, if (signed) .isize_type else .usize_type, inst, src);
+                if (signed) addr = try sema.addTyOp(block, .bitcast, .usize_type, addr);
                 return try sema.addTyOp(block, .ptr_from_int, dest_ty, addr);
             },
             .@"fn" => {
@@ -5190,6 +5193,12 @@ fn analyzePtrDiff(sema: *Sema, block: *Block, src: Src, lhs: Ref, rhs: Ref) Comp
         const rk = ip.indexToKey(rv).ptr;
         if (lk.base == .int and rk.base == .int)
             return .fromInterned(try sema.intValue(.usize_type, (lk.byte_offset -% rk.byte_offset) / elem_size));
+        // Pointers into the same comptime memory: their offsets within it.
+        if (lk.base != .int and rk.base != .int and std.meta.eql(sema.ptrRootBase(lk), sema.ptrRootBase(rk))) {
+            const lo = try sema.comptimePtrOffset(block, src, lv);
+            const ro = try sema.comptimePtrOffset(block, src, rv);
+            return .fromInterned(try sema.intValue(.usize_type, (lo -% ro) / elem_size));
+        }
     };
     try sema.requireRuntime(block, src);
     const li = try sema.addUnOp(block, .int_from_ptr, lhs);
@@ -7045,6 +7054,40 @@ fn comptimePtrsEqual(sema: *Sema, a: InternPool.Ptr, b: InternPool.Ptr) ?bool {
     const rb = sema.ptrRootBase(b);
     if (!std.meta.eql(ra, rb)) return false;
     return null;
+}
+
+/// The byte offset of comptime pointer `ptr` within its allocation, as
+/// CodeGen's `ptrTarget` lays it out. A pointer to a packed struct field
+/// points to the struct's backing integer.
+fn comptimePtrOffset(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!u64 {
+    const ip = sema.ip;
+    const k = ip.indexToKey(ptr).ptr;
+    const base: u64 = switch (k.base) {
+        .field => |f| blk: {
+            const parent = try sema.comptimePtrOffset(block, src, f.base);
+            const container = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
+            try sema.resolveLayout(block, src, container);
+            break :blk parent + switch (ip.indexToKey(container)) {
+                .opt_type => 0,
+                .error_union_type => Type.errorUnionLayout(ip, container).payload_offset,
+                .ptr_type => f.index * 8,
+                else => Type.fieldOffset(ip, container, @intCast(f.index)),
+            };
+        },
+        .elem => |e| blk: {
+            const parent = try sema.comptimePtrOffset(block, src, e.base);
+            const base_ty = Type.ptrInfo(ip, ip.typeOf(e.base));
+            const elem_ty = switch (ip.indexToKey(base_ty.child)) {
+                .array_type => |a| if (base_ty.flags.size == .one) a.child else base_ty.child,
+                .vector_type => |v| if (base_ty.flags.size == .one) v.child else base_ty.child,
+                else => base_ty.child,
+            };
+            try sema.resolveLayout(block, src, elem_ty);
+            break :blk parent + e.index * Type.abiSize(ip, elem_ty);
+        },
+        else => 0,
+    };
+    return base +% k.byte_offset;
 }
 
 /// The allocation a comptime pointer points into.
