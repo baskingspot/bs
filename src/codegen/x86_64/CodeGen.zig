@@ -557,7 +557,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const name = ip.stringSlice(@fromBackingInt(data.ty_pl.payload));
             const weak = Type.class(ip, data.ty_pl.ty) == .optional;
             // Analyzes the compiler_rt function the slot will point to.
-            _ = try cg.emit.zcu.requestCompilerRtExport(name);
+            _ = try cg.emit.requestCompilerRtExport(name);
             const slot = try cg.emit.useExtern(name, weak);
             const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
             try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.sym(slot, 0) });
@@ -595,7 +595,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .error_name => {
             // The table holds a slice per error code.
-            cg.emit.uses_error_names = true;
+            try cg.emit.useErrorNames();
             const dst = try cg.resultMem(inst, .slice_const_u8_sentinel_0_type) orelse return;
             try cg.load(.rax, data.un_op);
             try cg.e.movzx(.dword, .rax, .word, .{ .reg = .rax });
@@ -2187,7 +2187,7 @@ fn cRet(cg: *CodeGen, operand: Ref) Error!void {
 /// integers of `ty`. The signed helpers clobber `u` and `v`, so they get
 /// copies.
 fn divEi4(cg: *CodeGen, file: []const u8, name: []const u8, dst: Mem, u: Mem, v: Mem, ty: Index) Error!void {
-    const key: SymbolKey = .fromName(try cg.emit.zcu.requestCompilerRt(file, name));
+    const key: SymbolKey = .fromName(try cg.emit.requestCompilerRt(file, name));
     var u_arg = u;
     var v_arg = v;
     if (cg.signed(ty)) {
@@ -2205,7 +2205,7 @@ fn divEi4(cg: *CodeGen, file: []const u8, name: []const u8, dst: Mem, u: Mem, v:
 }
 
 fn rtCall(cg: *CodeGen, file: []const u8, name: []const u8, args: []const Val, ret_ty: Index, dst: ?Mem) Error!void {
-    const key: SymbolKey = .fromName(try cg.emit.zcu.requestCompilerRt(file, name));
+    const key: SymbolKey = .fromName(try cg.emit.requestCompilerRt(file, name));
     try cg.cCallArgs(args, ret_ty, dst);
     try cg.e.call(.{ .sym = key });
     try cg.cCallResult(ret_ty, dst);
@@ -2560,7 +2560,7 @@ fn floatFromInt(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const abbrev = rtIntAbbrev(info.bits) orelse {
         // `__floateisf(a, bits)` and friends read the integer from memory.
         const name = try std.fmt.allocPrint(cg.emit.allocator(), "__float{s}ei{s}", .{ if (info.signedness == .unsigned) "un" else "", rtFloatAbbrev(Type.floatBits(ip, ty)) });
-        const key: SymbolKey = .fromName(try cg.emit.zcu.requestCompilerRt("float_from_int.zig", name));
+        const key: SymbolKey = .fromName(try cg.emit.requestCompilerRt("float_from_int.zig", name));
         try cg.e.lea(.qword, .rdi, try cg.valMem(operand));
         try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .imm = info.bits });
         try cg.e.call(.{ .sym = key });
@@ -2608,7 +2608,7 @@ fn intFromFloat(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         // `__fixsfei(r, bits, a)` and friends write the integer, of its
         // ABI size, to memory.
         const name = try std.fmt.allocPrint(cg.emit.allocator(), "__fix{s}{s}ei", .{ if (info.signedness == .unsigned) "uns" else "", rtFloatAbbrev(Type.floatBits(ip, float_ty)) });
-        const key: SymbolKey = .fromName(try cg.emit.zcu.requestCompilerRt("int_from_float.zig", name));
+        const key: SymbolKey = .fromName(try cg.emit.requestCompilerRt("int_from_float.zig", name));
         try cg.cCallArgs(&.{ .{ .ty = .usize_type, .loc = .{ .addr = dst } }, .{ .ty = .usize_type, .loc = .{ .imm = info.bits } }, operand }, .void_type, null);
         try cg.e.call(.{ .sym = key });
         return;

@@ -747,7 +747,9 @@ compilation (see "Integration" below).
   `src_hash`, ranges into the edge, reverse-edge, and atom-reference
   arrays, `tag`), an open-addressing key table, edges, reverse edges, atom
   references, input stat records (path, size, mtime, inode, content hash,
-  with a sentinel for racy mtimes), and error names in code order. Rewriting
+  with a sentinel for racy mtimes), error names in code order, and each
+  node's references (`refs`, indexed by a per-node `ref_starts` array,
+  with the names they use in `ref_names`). Rewriting
   the base costs ~20–35 ms here, so an edit build appends a log record
   instead (`Delta`): the changed and added nodes, inputs, and error names.
   `open` applies the log into a small in-memory overlay; a torn record at
@@ -1046,15 +1048,26 @@ as above, and for green units writes the result into Zcu state: `nav.ty`,
 function's references. It returns false for red units, and Zcu analyzes as today.
 Two things Sema must add, both narrow:
 
-- **References**, recorded like dependencies: which functions a unit
-  queued (`queueFunc` from `navRef`, calls, and coercions of a function
-  to a function pointer) and which declarations' data it requested. Some
-  come from Emit during CodeGen, not from Sema: compiler_rt helpers
-  (`requestCompilerRt`), `navKey`/`funcKey` from lowering values, and
-  the error name table. A function's reference list
-  holds both kinds. Loading a function replays them, so the set of linked
-  units is the set reachable this build, and functions no longer
-  referenced drop out of the link instead of lingering in the pack.
+- **References** (recorded since 2026-11-03): which functions a unit
+  queued (`Zcu.queueFuncFrom`, from `navRef`, calls, coercions of a
+  function to a function pointer, and `@export`), and what its code
+  requested from Emit during CodeGen (`Emit.unit_refs`): declarations'
+  data (`navKey`), error codes (`useError`), external symbols
+  (`useExtern`), compiler_rt helpers (`Emit.requestCompilerRt`,
+  `requestCompilerRtExport`), and the error name table
+  (`useErrorNames`). The manifest stores them per node (`Manifest.Ref`:
+  a node for functions and data, an error code, or a name), in the base
+  and in log records. Loading a function replays them, so the set of
+  linked units is the set reachable this build, and functions no longer
+  referenced drop out of the link instead of lingering in the pack. A
+  function is also reached when a unit resolves its inferred error set,
+  which analyzes and emits its body: replay reaches it through the
+  `func_ies` dependency the same way. `ZAP_CACHE_CHECK` verifies that
+  the recorded graph reaches every function the build analyzed from the
+  analysis roots (comptime declarations, exports, tests); every recorded
+  conformance unit passes, including x86_64's 184k functions. Function
+  pointers in a declaration's data are queued by the coercion that made
+  them, in Sema, so lowering values (`funcKey`) needs no reference.
 - **Result hashes at runtime**: `Replay` compares a re-analyzed unit's new
   result with the manifest's before its dependents decide, so the hashing
   `record` does today moves to one function both use.

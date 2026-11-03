@@ -797,6 +797,34 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     const use_units = try gpa.alloc(u32, emit.content_uses.items.len);
     defer gpa.free(use_units);
     for (emit.content_uses.items, use_units) |use, *u| u.* = try r.addUnit(use.unit);
+    // References: Sema's queued functions and Emit's requests, as unit
+    // items for now.
+    const func_ref_items = try gpa.alloc([2]u32, zcu.func_refs.count());
+    defer gpa.free(func_ref_items);
+    for (zcu.func_refs.keys(), func_ref_items) |fr, *it| it.* = .{ try r.addUnit(fr.from), try r.addUnit(.{ .func = fr.func }) };
+    const unit_ref_items = try gpa.alloc([2]u32, emit.unit_refs.items.len);
+    defer gpa.free(unit_ref_items);
+    for (emit.unit_refs.items, unit_ref_items) |ur, *it| it.* = .{
+        try r.addUnit(ur.unit),
+        if (ur.ref == .nav) try r.addUnit(.{ .nav_val = ur.ref.nav }) else Recorder.no_node,
+    };
+    // `ZAP_CACHE_CHECK`: the units analysis starts from, for
+    // `checkReferences`.
+    var root_items: std.ArrayList(u32) = .empty;
+    defer root_items.deinit(gpa);
+    if (inc.check) {
+        for (zcu.comptime_decls.keys()) |c| try root_items.append(gpa, try r.addUnit(.{ .comptime_decl = c }));
+        for (zcu.exports.items) |e| if (e.target == .nav) {
+            try root_items.append(gpa, try r.addUnit(.{ .nav_val = e.target.nav }));
+            const val = ip.getNav(e.target.nav).val;
+            if (ip.indexToKey(val) == .func) try root_items.append(gpa, try r.addUnit(.{ .func = val }));
+        };
+        for (zcu.test_functions.items) |nav| {
+            try root_items.append(gpa, try r.addUnit(.{ .nav_val = nav }));
+            const val = ip.getNav(nav).val;
+            if (val != .none and ip.indexToKey(val) == .func) try root_items.append(gpa, try r.addUnit(.{ .func = val }));
+        }
+    }
     const t_collect = now(io);
     try r.prepare(io);
     const t_keys = now(io);
@@ -822,6 +850,17 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         const index = try r.unitNode(u);
         try r.edges.append(gpa, .{ index, r.map.get(@backingInt(use.key)).? });
     }
+    // Nodes for the references' units, so that every node exists before
+    // the store and manifest passes.
+    for (func_ref_items) |it| {
+        _ = try r.unitNode(it[0]);
+        _ = try r.unitNode(it[1]);
+    }
+    for (unit_ref_items) |it| {
+        _ = try r.unitNode(it[0]);
+        if (it[1] != Recorder.no_node) _ = try r.unitNode(it[1]);
+    }
+    for (root_items.items) |*it| it.* = try r.unitNode(it.*);
     try r.group();
 
     // Each atom's debug info, and the atoms' hashes as their owners'
@@ -956,7 +995,40 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     var n_targets: usize = 0;
     for (emit.atoms.items) |*a| n_targets += a.targets.len;
     try b.ensureUnusedCapacity(emit.atoms.items.len, n_targets);
-    for (r.nodes.items, where) |n, w| {
+    // Each node's references, sorted by node and deduplicated.
+    const NodeRef = struct {
+        node: u32,
+        ref: Manifest.Ref,
+        fn lessThan(_: void, x: @This(), y: @This()) bool {
+            if (x.node != y.node) return x.node < y.node;
+            if (x.ref.kind != y.ref.kind) return @backingInt(x.ref.kind) < @backingInt(y.ref.kind);
+            return x.ref.value < y.ref.value;
+        }
+    };
+    var node_refs: std.ArrayList(NodeRef) = try .initCapacity(gpa, func_ref_items.len + unit_ref_items.len);
+    defer node_refs.deinit(gpa);
+    for (func_ref_items) |it| {
+        const from = try r.unitNode(it[0]);
+        const to = try r.unitNode(it[1]);
+        if (from != to) node_refs.appendAssumeCapacity(.{ .node = from, .ref = .{ .kind = .func, .value = to } });
+    }
+    for (emit.unit_refs.items, unit_ref_items) |ur, it| node_refs.appendAssumeCapacity(.{ .node = try r.unitNode(it[0]), .ref = switch (ur.ref) {
+        .nav => .{ .kind = .nav, .value = try r.unitNode(it[1]) },
+        .err => |name| .{ .kind = .err, .value = try ip.errorValue(name) },
+        .ext => |e| .{ .kind = if (e.weak) .ext_weak else .ext, .value = try b.addRefName(e.name) },
+        .rt => |key| .{ .kind = .rt, .value = try b.addRefName(key) },
+        .error_names => .{ .kind = .error_names, .value = 0 },
+    } });
+    std.mem.sortUnstable(NodeRef, node_refs.items, {}, NodeRef.lessThan);
+    var refs_of: std.ArrayList(Manifest.Ref) = .empty;
+    defer refs_of.deinit(gpa);
+    var next_ref: usize = 0;
+    for (r.nodes.items, where, 0..) |n, w, ni| {
+        refs_of.clearRetainingCapacity();
+        while (next_ref < node_refs.items.len and node_refs.items[next_ref].node == ni) : (next_ref += 1) {
+            const nr = node_refs.items[next_ref].ref;
+            if (refs_of.items.len == 0 or !std.meta.eql(refs_of.items[refs_of.items.len - 1], nr)) try refs_of.append(gpa, nr);
+        }
         refs.clearRetainingCapacity();
         symbols.clearRetainingCapacity();
         const loc: ?struct { u32, u64 } = switch (w) {
@@ -974,8 +1046,9 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
                 off += len;
             }
         }
-        _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps, .atoms = refs.items, .symbols = symbols.items });
+        _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps, .atoms = refs.items, .symbols = symbols.items, .refs = refs_of.items });
     }
+    if (inc.check) checkReferences(gpa, &r, root_items.items, &b);
     for (base_names.items) |name| _ = try b.addBasePack(name);
     b.entry = @backingInt(emit.entry.?);
     for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
@@ -1017,11 +1090,11 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         out.* = try gpa.dupe(u8, name);
         n_names += 1;
     }
-    const report = try std.fmt.allocPrint(gpa, "cache: recorded {d} nodes, {d} atoms, {d} inputs in {d:.2} ms alongside the link (graph {d:.2}: items {d:.2}, keys {d:.2}; store lookups {d:.2}: {d} reused, {d} put; manifest {d:.2} while the store writes: nodes and symbols {d:.2}, inputs {d:.2}, write {d:.2}; store's remainder {d:.2})", .{
-        r.nodes.items.len, emit.atoms.items.len, fe.files.items.len,    ms(t0, t6),
-        ms(t0, t1),        ms(t0, t_collect),    ms(t_collect, t_keys), ms(t1, t2),
-        reused,            n_put,                ms(t2, t5),            ms(t2, t3),
-        ms(t3, t4),        ms(t4, t5),           ms(t5, t6),
+    const report = try std.fmt.allocPrint(gpa, "cache: recorded {d} nodes, {d} atoms, {d} references, {d} inputs in {d:.2} ms alongside the link (graph {d:.2}: items {d:.2}, keys {d:.2}; store lookups {d:.2}: {d} reused, {d} put; manifest {d:.2} while the store writes: nodes and symbols {d:.2}, inputs {d:.2}, write {d:.2}; store's remainder {d:.2})", .{
+        r.nodes.items.len, emit.atoms.items.len, b.refs.items.len,      fe.files.items.len, ms(t0, t6),
+        ms(t0, t1),        ms(t0, t_collect),    ms(t_collect, t_keys), ms(t1, t2),         reused,
+        n_put,             ms(t2, t5),           ms(t2, t3),            ms(t3, t4),         ms(t4, t5),
+        ms(t5, t6),
     });
     return .{ .manifest = manifest, .base_names = names, .report = report };
 }
@@ -1250,6 +1323,66 @@ fn checkPrediction(inc: *Incremental, r: *const Recorder) void {
     std.debug.print("cache check: {d} nodes ({d} new); {d} seeds reach {d}; {d} results changed, {d} missed\n", .{
         nodes.len, added, seeds, seen.count(), changed, missed,
     });
+}
+
+/// `ZAP_CACHE_CHECK`: checks that the recorded graph reaches every function
+/// this build analyzed, from the units analysis starts from, over
+/// dependencies and references. A build that loads units from the cache
+/// queues functions only along references, so a function this misses
+/// would drop out of an edit build.
+fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *const Manifest.Builder) void {
+    const nodes = r.nodes.items;
+    var seen = std.DynamicBitSetUnmanaged.initEmpty(gpa, nodes.len) catch return;
+    defer seen.deinit(gpa);
+    var stack: std.ArrayList(u32) = .empty;
+    defer stack.deinit(gpa);
+    var k: Keyer = .{ .zcu = r.zcu, .key_buf = .init(gpa), .unit_buf = .init(gpa) };
+    defer k.key_buf.deinit();
+    defer k.unit_buf.deinit();
+    for (roots) |n| if (!seen.isSet(n)) {
+        seen.set(n);
+        stack.append(gpa, n) catch return;
+    };
+    while (stack.pop()) |n| {
+        const range = b.ref_ranges.items[n];
+        var next: std.ArrayList(u32) = .empty;
+        defer next.deinit(gpa);
+        // A function is reached only by a reference, or by resolving its
+        // inferred error set, which analyzes and emits its body: the
+        // `func_ies` dependee's edge to it. A green unit loaded from the
+        // cache reaches it the same way, through `ensureFuncIes`.
+        for (nodes[n].deps) |d| if (nodes[d].tag != .func or nodes[n].tag == .func_ies) next.append(gpa, d) catch return;
+        for (b.refs.items[range[0]..][0..range[1]]) |ref| switch (ref.kind) {
+            .func, .nav => next.append(gpa, ref.value) catch return,
+            .rt => {
+                const name = b.strings.items[b.ref_names.items[ref.value].off..][0..b.ref_names.items[ref.value].len];
+                const key = k.keyOf(.func, &.{name}) catch return;
+                if (r.map.get(key)) |f| next.append(gpa, f) catch return;
+            },
+            else => {},
+        };
+        for (next.items) |d| if (!seen.isSet(d)) {
+            seen.set(d);
+            stack.append(gpa, d) catch return;
+        };
+    }
+    var funcs: usize = 0;
+    var missed: usize = 0;
+    for (nodes, 0..) |n, i| {
+        if (n.tag != .func) continue;
+        funcs += 1;
+        if (seen.isSet(i)) continue;
+        missed += 1;
+        if (missed > 10) continue;
+        var name: std.Io.Writer.Allocating = .init(gpa);
+        defer name.deinit();
+        for (r.unit_list.items, r.unit_info) |u, info| if (info.key == n.key) {
+            r.zcu.unitKey(u, &name.writer) catch {};
+            break;
+        };
+        std.debug.print("cache check: function {s} is not reached by references\n", .{name.written()});
+    }
+    std.debug.print("cache check: references reach {d} of {d} functions\n", .{ funcs - missed, funcs });
 }
 
 /// Everything the linker emits for an atom but its name and key, like

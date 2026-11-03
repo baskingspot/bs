@@ -3413,7 +3413,7 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     try sema.ensureNavVal(block, src, nav_index);
     const nav = sema.ip.getNav(nav_index);
     // A generic function has no body of its own until a call instantiates it.
-    if (sema.ip.indexToKey(nav.val) == .func and !sema.ip.indexToKey(nav.ty).func_type.is_generic) try sema.zcu.queueFunc(nav.val);
+    if (sema.ip.indexToKey(nav.val) == .func and !sema.ip.indexToKey(nav.ty).func_type.is_generic) try sema.zcu.queueFuncFrom(sema.owner, nav.val);
     // An explicit alignment shows in the pointer type, as upstream.
     const alignment: u6 = if (nav.alignment == 0 or sema.naturalAlignment(nav.ty) == nav.alignment) 0 else @intCast(std.math.log2_int(u64, nav.alignment) + 1);
     const ptr_ty = try sema.ptrType(.{ .child = nav.ty, .flags = .{ .is_const = nav.is_const, .alignment = alignment } });
@@ -3465,7 +3465,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
         .func => |f| f.owner_nav,
         else => nav_index,
     };
-    if (ip.indexToKey(val) == .func) try sema.zcu.queueFunc(val);
+    if (ip.indexToKey(val) == .func) try sema.zcu.queueFuncFrom(sema.owner, val);
     try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .nav = export_nav }, .name = try sema.getString(name) });
 }
 
@@ -4365,7 +4365,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 if (d.child != src_ty and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
                 const f = ip.indexToKey(v).func;
                 if (f.generic_owner != .none) return null;
-                try sema.zcu.queueFunc(v);
+                try sema.zcu.queueFuncFrom(sema.owner, v);
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .nav = f.owner_nav } } }));
             },
             else => {},
@@ -11192,7 +11192,7 @@ fn analyzeCall(
     }
     if (callee_fn_ty.cc == .naked) return sema.fail(block, src, "unable to call function with naked calling convention", .{});
     try sema.declareDependency(.{ .nav_val = ip.indexToKey(callee_func).func.owner_nav });
-    try sema.zcu.queueFunc(callee_func);
+    try sema.zcu.queueFuncFrom(sema.owner, callee_func);
     for (callee_fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
     try sema.resolveLayout(block, src, callee_fn_ty.return_type);
     var call_ret_ty = callee_fn_ty.return_type;

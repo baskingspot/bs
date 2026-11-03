@@ -34,6 +34,9 @@ deps: std.AutoArrayHashMapUnmanaged(AnalUnit, []const Dependee) = .empty,
 /// Analysis state of runtime function bodies.
 funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, FuncState) = .empty,
 func_queue: std.ArrayList(InternPool.Index) = .empty,
+/// Which unit queued which function (`queueFuncFrom`), for the on-disk
+/// cache: a unit loaded from it queues them again.
+func_refs: std.AutoArrayHashMapUnmanaged(FuncRef, void) = .empty,
 next_func: usize = 0,
 /// Function bodies analyzed out of queue order (to resolve an inferred
 /// error set), waiting to be passed to the sink.
@@ -73,6 +76,8 @@ pub const Export = struct {
 };
 
 pub const FuncState = enum { queued, in_progress, done, failed };
+
+pub const FuncRef = struct { from: AnalUnit, func: InternPool.Index };
 
 pub const ComptimeDecl = struct {
     file: u32,
@@ -172,6 +177,7 @@ pub fn deinit(zcu: *Zcu) void {
     for (zcu.namespaces.items) |*ns| ns.decls.deinit(gpa);
     zcu.namespaces.deinit(gpa);
     zcu.deps.deinit(gpa);
+    zcu.func_refs.deinit(gpa);
     zcu.funcs.deinit(gpa);
     zcu.func_queue.deinit(gpa);
     for (zcu.ready_irs.items) |*ir| ir.deinit(gpa);
@@ -511,6 +517,14 @@ pub fn ensureFuncIes(zcu: *Zcu, func: InternPool.Index) Sema.CompileError!?[]con
     }
     if (zcu.anyerror_ies.contains(func)) return null;
     return zcu.inferred_errors.get(func) orelse &.{};
+}
+
+/// Queues `func` on behalf of unit `from`, which refers to it (a call, a
+/// reference to its declaration, a coercion to a function pointer, an
+/// export), and records the reference.
+pub fn queueFuncFrom(zcu: *Zcu, from: AnalUnit, func: InternPool.Index) !void {
+    try zcu.func_refs.put(zcu.gpa, .{ .from = from, .func = func }, {});
+    try zcu.queueFunc(func);
 }
 
 pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !void {

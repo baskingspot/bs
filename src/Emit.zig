@@ -45,6 +45,11 @@ entry: ?SymbolKey = null,
 atom_owners: std.ArrayList(Owner) = .empty,
 /// Content-addressed atoms each unit referred to.
 content_uses: std.ArrayList(ContentUse) = .empty,
+/// What each unit's code requested besides its atoms (declarations' data,
+/// error codes, external symbols, compiler_rt helpers, the error name
+/// table), possibly repeated, for the on-disk cache: a unit loaded from it
+/// requests them again.
+unit_refs: std.ArrayList(UnitRef) = .empty,
 /// The owner of atoms added now.
 owner: Owner = .link,
 /// Whether each owner's atoms are still adjacent in `atoms`; if not,
@@ -68,6 +73,19 @@ pub const Owner = union(enum) {
 
 pub const ContentUse = struct { unit: Zcu.AnalUnit, key: SymbolKey };
 
+pub const UnitRef = struct {
+    unit: Zcu.AnalUnit,
+    ref: union(enum) {
+        nav: InternPool.NavIndex,
+        err: InternPool.String,
+        /// `useExtern`; the name is owned by `externs`.
+        ext: struct { name: []const u8, weak: bool },
+        /// `requestCompilerRt`'s key, owned by `Zcu.rt_helpers`.
+        rt: []const u8,
+        error_names,
+    },
+};
+
 pub fn init(gpa: Allocator, zcu: *Zcu) Emit {
     return .{ .gpa = gpa, .arena = .init(gpa), .zcu = zcu };
 }
@@ -82,6 +100,7 @@ pub fn deinit(emit: *Emit) void {
     emit.externs.deinit(gpa);
     emit.atom_owners.deinit(gpa);
     emit.content_uses.deinit(gpa);
+    emit.unit_refs.deinit(gpa);
     emit.units_seen.deinit(gpa);
     emit.error_values.deinit(gpa);
     emit.arena.deinit();
@@ -162,7 +181,33 @@ pub fn useExtern(emit: *Emit, name: []const u8, weak: bool) !SymbolKey {
         gop.key_ptr.* = try emit.allocator().dupe(u8, name);
         gop.value_ptr.* = weak;
     } else if (!weak) gop.value_ptr.* = false;
+    try emit.addRef(.{ .ext = .{ .name = gop.key_ptr.*, .weak = weak } });
     return externSlotKey(name);
+}
+
+/// Records that the current unit's code requested `ref`.
+fn addRef(emit: *Emit, ref: @FieldType(UnitRef, "ref")) !void {
+    if (emit.owner == .unit) try emit.unit_refs.append(emit.gpa, .{ .unit = emit.owner.unit, .ref = ref });
+}
+
+/// `Zcu.requestCompilerRt` on behalf of the current unit.
+pub fn requestCompilerRt(emit: *Emit, file_name: []const u8, name: []const u8) ![]const u8 {
+    const key = try emit.zcu.requestCompilerRt(file_name, name);
+    try emit.addRef(.{ .rt = key });
+    return key;
+}
+
+/// `Zcu.requestCompilerRtExport` on behalf of the current unit.
+pub fn requestCompilerRtExport(emit: *Emit, name: []const u8) !?[]const u8 {
+    const key = try emit.zcu.requestCompilerRtExport(name) orelse return null;
+    try emit.addRef(.{ .rt = key });
+    return key;
+}
+
+/// Requests the error name table, which `@errorName` reads.
+pub fn useErrorNames(emit: *Emit) !void {
+    emit.uses_error_names = true;
+    try emit.addRef(.error_names);
 }
 
 fn externSlotKey(name: []const u8) SymbolKey {
@@ -354,6 +399,7 @@ pub fn funcKey(emit: *Emit, func: Index) !SymbolKey {
 /// The key of a declaration's data atom, requesting that it be emitted.
 pub fn navKey(emit: *Emit, nav: InternPool.NavIndex) !SymbolKey {
     try emit.navs.put(emit.gpa, nav, {});
+    try emit.addRef(.{ .nav = nav });
     return .fromName(try emit.unitName(.{ .nav_val = nav }));
 }
 
@@ -405,6 +451,7 @@ fn emitErrorNameTable(emit: *Emit) !void {
 
 pub fn useError(emit: *Emit, name: InternPool.String) !SymbolKey {
     try emit.errors.put(emit.gpa, name, {});
+    try emit.addRef(.{ .err = name });
     return errorKey(&emit.zcu.ip, name);
 }
 

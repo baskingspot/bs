@@ -21,6 +21,11 @@
 //! dependencies stay until the next base, so a walk may visit a unit that no
 //! longer depends on the changed node. Visiting it only re-checks it.
 //!
+//! A node also lists its references (`Ref`): what the unit requested that
+//! is not a dependency (functions it queued, declarations' data, error
+//! codes, external symbols, compiler_rt helpers), so that a unit loaded
+//! from the cache requests the same and the build reaches the same units.
+//!
 //! The store does not interpret nodes: a node is anything a unit can depend
 //! on (a declaration's value or type, a type's layout, a function body or
 //! inferred error set, a namespace name lookup, an error code), keyed by a
@@ -83,6 +88,11 @@ debug_files: []const u32,
 /// ascending.
 debug_atoms: []const u32,
 files: []const StrRef,
+/// Each node's references are `refs[ref_starts[i]..ref_starts[i + 1]]`.
+ref_starts: []const u32,
+refs: []const Ref,
+/// Names that `ext`, `ext_weak`, and `rt` references index.
+ref_names: []const StrRef,
 nodes: []const Node,
 /// Open-addressing table from `Node.key` to node index + 1 (0: empty),
 /// a power of two long, at most half full.
@@ -120,6 +130,32 @@ pub const Node = extern struct {
 };
 
 pub const StrRef = extern struct { off: u32, len: u32 };
+
+/// Something a unit requested that is not a dependency: what loading the
+/// unit from the cache must request again so that the build reaches the
+/// same units and emits the same data.
+pub const Ref = extern struct {
+    kind: Kind,
+    /// A node index (`func`, `nav`), an error code (`err`), an index for
+    /// `refName` (`ext`, `ext_weak`, `rt`), or 0.
+    value: u32,
+
+    pub const Kind = enum(u32) {
+        /// A function the unit queued.
+        func,
+        /// A declaration whose data the unit's code refers to.
+        nav,
+        /// An error code the unit's code uses.
+        err,
+        /// An external symbol the unit's code reads the address of.
+        ext,
+        ext_weak,
+        /// A compiler_rt function, by its declaration's key.
+        rt,
+        /// The error name table.
+        error_names,
+    };
+};
 
 pub const Symbol = extern struct {
     key: [2]u64,
@@ -243,11 +279,11 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN05".*;
-const log_magic = "ZAPMLG02".*;
+const magic = "ZAPMAN06".*;
+const log_magic = "ZAPMLG03".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
 
@@ -287,7 +323,8 @@ const RecordHeader = extern struct {
     strings_len: u32,
     n_symbols: u32,
     n_files: u32,
-    unused: [8]u8 = @splat(0),
+    n_ref_names: u32,
+    unused: [4]u8 = @splat(0),
 };
 
 /// A node's new state. `index` is an existing node, or the next new one.
@@ -300,7 +337,9 @@ const NodeDelta = extern struct {
     atoms_len: u32,
     targets_len: u32,
     tag: u8,
-    unused: [15]u8 = @splat(0),
+    unused: [3]u8 = @splat(0),
+    refs_len: u32,
+    unused2: [8]u8 = @splat(0),
 };
 
 /// An input's new stat. `index` is an existing input, or the next new one.
@@ -339,6 +378,7 @@ const Overlay = struct {
     /// The log's target runs, after the base's.
     targets: std.ArrayList(u32) = .empty,
     files: std.ArrayList([]const u8) = .empty,
+    ref_names: std.ArrayList([]const u8) = .empty,
     /// What `linkInput` returns, gathered on first use when nodes changed.
     gathered: ?LinkInput = null,
 
@@ -348,6 +388,7 @@ const Overlay = struct {
         atoms: []const Pack.AtomRef,
         numbered: []const NumberedAtom,
         debug_files: []const u32,
+        refs: []const Ref,
     };
     const InputState = struct { input: Input, path: []const u8 };
 
@@ -364,6 +405,7 @@ const Overlay = struct {
         o.added_symbols.deinit(gpa);
         o.targets.deinit(gpa);
         o.files.deinit(gpa);
+        o.ref_names.deinit(gpa);
         if (o.gathered) |g| {
             gpa.free(g.refs);
             gpa.free(g.numbered);
@@ -379,7 +421,9 @@ fn SectionType(comptime s: Section) type {
         .table, .edges, .redges => u32,
         .atom_refs => Pack.AtomRef,
         .inputs => Input,
-        .error_names, .bases, .files => StrRef,
+        .error_names, .bases, .files, .ref_names => StrRef,
+        .ref_starts => u32,
+        .refs => Ref,
         .symbols => Symbol,
         .numbered => NumberedAtom,
         .targets, .error_symbols, .debug_files, .debug_atoms => u32,
@@ -414,7 +458,8 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
     if (m.table.len == 0 or !std.math.isPowerOfTwo(m.table.len) or
         m.symbols.len <= m.symbol_len or
         m.numbered.len != m.atom_refs.len or m.debug_files.len != m.atom_refs.len or
-        m.error_symbols.len != m.error_names.len) return corrupt(io, &map);
+        m.error_symbols.len != m.error_names.len or
+        m.ref_starts.len != m.nodes.len + 1 or m.ref_starts[m.nodes.len] != m.refs.len) return corrupt(io, &map);
     errdefer m.overlay.deinit(gpa);
     try m.readLog(gpa, io, dir);
     return m;
@@ -467,13 +512,14 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
         const node_numbered = r.take(NumberedAtom, d[0].atoms_len);
         const node_files = r.take(u32, d[0].atoms_len);
         const node_targets = r.take(u32, d[0].targets_len);
+        const node_refs = r.take(Ref, d[0].refs_len);
         try o.targets.appendSlice(gpa, node_targets);
         const index = d[0].index;
         if (index == m.nodeCount()) {
             o.added_nodes += 1;
             try o.added_keys.put(gpa, d[0].key, index);
         }
-        try o.nodes.put(gpa, index, .{ .delta = &d[0], .deps = node_deps, .atoms = node_atoms, .numbered = node_numbered, .debug_files = node_files });
+        try o.nodes.put(gpa, index, .{ .delta = &d[0], .deps = node_deps, .atoms = node_atoms, .numbered = node_numbered, .debug_files = node_files, .refs = node_refs });
         for (node_deps) |dep| {
             const gop = try o.rdeps.getOrPut(gpa, dep);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -485,6 +531,7 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
     const error_symbols = r.take(u32, rh.n_errors);
     const symbols = r.take(Symbol, rh.n_symbols);
     const files = r.take(StrRef, rh.n_files);
+    const ref_names = r.take(StrRef, rh.n_ref_names);
     const strings = r.take(u8, rh.strings_len);
     for (input_deltas) |*d| {
         if (d.index == m.inputCount()) o.added_inputs += 1;
@@ -494,6 +541,7 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
     try o.error_symbols.appendSlice(gpa, error_symbols);
     for (symbols) |sym| _ = try o.added_symbols.getOrPut(gpa, sym.keyHash(), sym.number);
     for (files) |f| try o.files.append(gpa, strings[f.off..][0..f.len]);
+    for (ref_names) |f| try o.ref_names.append(gpa, strings[f.off..][0..f.len]);
     return rh.len;
 }
 
@@ -534,6 +582,23 @@ pub fn node(m: *const Manifest, index: u32) NodeInfo {
     if (m.overlay.nodes.get(index)) |s| return .{ .key = s.delta.key, .result_hash = s.delta.result_hash, .src_hash = s.delta.src_hash, .tag = s.delta.tag };
     const n = &m.nodes[index];
     return .{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = n.tag };
+}
+
+/// What node `index` requested besides its dependencies (`Ref`).
+pub fn nodeRefs(m: *const Manifest, index: u32) []const Ref {
+    if (m.overlay.nodes.get(index)) |s| return s.refs;
+    if (index >= m.nodes.len) return &.{};
+    return m.refs[m.ref_starts[index]..m.ref_starts[index + 1]];
+}
+
+/// The name an `ext`, `ext_weak`, or `rt` reference's value indexes.
+pub fn refName(m: *const Manifest, value: u32) []const u8 {
+    if (value < m.ref_names.len) return m.string(m.ref_names[value]);
+    return m.overlay.ref_names.items[value - m.ref_names.len];
+}
+
+pub fn refNameCount(m: *const Manifest) u32 {
+    return @intCast(m.ref_names.len + m.overlay.ref_names.items.len);
 }
 
 pub fn deps(m: *const Manifest, index: u32) []const u32 {
@@ -751,6 +816,9 @@ pub const NodeInit = struct {
     atoms: []const Pack.AtomRef = &.{},
     /// One per atom.
     symbols: []const AtomSymbols = &.{},
+    /// Node indices in `func` and `nav` references may be added later;
+    /// names come from `addRefName`.
+    refs: []const Ref = &.{},
 };
 
 /// Interns debug source paths; owns its keys.
@@ -795,6 +863,9 @@ pub const Delta = struct {
     files: std.ArrayList(StrRef) = .empty,
     /// Every debug file, filled on first use.
     file_table: FileTable = .{},
+    ref_names: std.ArrayList(StrRef) = .empty,
+    /// Every reference name, filled on first use.
+    ref_name_table: FileTable = .{},
     strings: std.ArrayList(u8) = .empty,
     scratch_numbered: std.ArrayList(NumberedAtom) = .empty,
     scratch_files: std.ArrayList(u32) = .empty,
@@ -814,6 +885,8 @@ pub const Delta = struct {
         d.symbol_map.deinit(gpa);
         d.files.deinit(gpa);
         d.file_table.deinit(gpa);
+        d.ref_names.deinit(gpa);
+        d.ref_name_table.deinit(gpa);
         d.strings.deinit(gpa);
         d.scratch_numbered.deinit(gpa);
         d.scratch_files.deinit(gpa);
@@ -858,6 +931,7 @@ pub const Delta = struct {
             .atoms_len = @intCast(n.atoms.len),
             .targets_len = @intCast(d.scratch_targets.items.len),
             .tag = n.tag,
+            .refs_len = @intCast(n.refs.len),
         };
         try appendPadded(gpa, &d.nodes, std.mem.asBytes(&delta));
         try appendPadded(gpa, &d.nodes, @ptrCast(n.deps));
@@ -865,6 +939,7 @@ pub const Delta = struct {
         try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_numbered.items));
         try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_files.items));
         try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_targets.items));
+        try appendPadded(gpa, &d.nodes, @ptrCast(n.refs));
         d.targets_len += delta.targets_len;
         d.n_nodes += 1;
     }
@@ -883,6 +958,16 @@ pub const Delta = struct {
         }
         const index, const new = try d.file_table.intern(d.gpa, path, base_files + @as(u32, @intCast(d.files.items.len)));
         if (new) try d.files.append(d.gpa, try d.addString(path));
+        return index;
+    }
+
+    /// The value of an `ext`, `ext_weak`, or `rt` reference to `name`.
+    pub fn addRefName(d: *Delta, name: []const u8) !u32 {
+        if (d.ref_name_table.map.count() == 0) {
+            for (0..d.base.refNameCount()) |i| _ = try d.ref_name_table.intern(d.gpa, d.base.refName(@intCast(i)), @intCast(i));
+        }
+        const index, const new = try d.ref_name_table.intern(d.gpa, name, d.base.refNameCount() + @as(u32, @intCast(d.ref_names.items.len)));
+        if (new) try d.ref_names.append(d.gpa, try d.addString(name));
         return index;
     }
 
@@ -920,6 +1005,7 @@ pub const Delta = struct {
         try appendPadded(gpa, &body, @ptrCast(d.error_symbols.items));
         try appendPadded(gpa, &body, @ptrCast(d.symbols.items));
         try appendPadded(gpa, &body, @ptrCast(d.files.items));
+        try appendPadded(gpa, &body, @ptrCast(d.ref_names.items));
         try appendPadded(gpa, &body, d.strings.items);
         const header: RecordHeader = .{
             .len = @intCast(@sizeOf(RecordHeader) + body.items.len),
@@ -930,6 +1016,7 @@ pub const Delta = struct {
             .strings_len = @intCast(d.strings.items.len),
             .n_symbols = @intCast(d.symbols.items.len),
             .n_files = @intCast(d.files.items.len),
+            .n_ref_names = @intCast(d.ref_names.items.len),
         };
         var offset = d.base.overlay.len;
         if (offset == 0) {
@@ -971,6 +1058,11 @@ pub const Builder = struct {
     bases: std.ArrayList(StrRef) = .empty,
     files: std.ArrayList(StrRef) = .empty,
     file_table: FileTable = .{},
+    /// Each node's range of `refs`, parallel to `nodes`.
+    ref_ranges: std.ArrayList([2]u32) = .empty,
+    refs: std.ArrayList(Ref) = .empty,
+    ref_names: std.ArrayList(StrRef) = .empty,
+    ref_name_table: FileTable = .{},
     strings: std.ArrayList(u8) = .empty,
     entry: Hash = 0,
     /// Each number's key.
@@ -996,6 +1088,10 @@ pub const Builder = struct {
         b.bases.deinit(gpa);
         b.files.deinit(gpa);
         b.file_table.deinit(gpa);
+        b.ref_ranges.deinit(gpa);
+        b.refs.deinit(gpa);
+        b.ref_names.deinit(gpa);
+        b.ref_name_table.deinit(gpa);
         b.strings.deinit(gpa);
         b.symbol_keys.deinit(gpa);
         b.symbol_map.deinit(gpa);
@@ -1016,6 +1112,11 @@ pub const Builder = struct {
         try b.error_names.appendSlice(gpa, base.error_names);
         try b.bases.appendSlice(gpa, base.bases);
         try b.files.appendSlice(gpa, base.files);
+        try b.ref_names.appendSlice(gpa, base.ref_names);
+        try b.refs.appendSlice(gpa, base.refs);
+        try b.ref_ranges.ensureTotalCapacity(gpa, base.nodeCount());
+        for (0..base.nodes.len) |i| b.ref_ranges.appendAssumeCapacity(.{ base.ref_starts[i], base.ref_starts[i + 1] - base.ref_starts[i] });
+        b.ref_ranges.appendNTimesAssumeCapacity(.{ 0, 0 }, base.nodeCount() - base.nodes.len);
         try b.strings.appendSlice(gpa, base.strings);
         const o = &base.overlay;
         // Number space: the base's and the log's, as they are.
@@ -1052,6 +1153,8 @@ pub const Builder = struct {
             try b.atom_refs.appendSlice(gpa, s.atoms);
             try b.numbered.appendSlice(gpa, s.numbered);
             try b.debug_files.appendSlice(gpa, s.debug_files);
+            b.ref_ranges.items[e.key_ptr.*] = .{ @intCast(b.refs.items.len), @intCast(s.refs.len) };
+            try b.refs.appendSlice(gpa, s.refs);
         }
         var kit = o.added_keys.iterator();
         while (kit.next()) |e| try b.added.put(gpa, e.key_ptr.*, e.value_ptr.*);
@@ -1065,6 +1168,8 @@ pub const Builder = struct {
         for (o.error_names.items) |name| try b.error_names.append(gpa, try b.addString(name));
         for (o.files.items) |f| try b.files.append(gpa, try b.addString(f));
         for (b.files.items, 0..) |f, i| _ = try b.file_table.intern(gpa, b.strings.items[f.off..][0..f.len], @intCast(i));
+        for (o.ref_names.items) |n| try b.ref_names.append(gpa, try b.addString(n));
+        for (b.ref_names.items, 0..) |n, i| _ = try b.ref_name_table.intern(gpa, b.strings.items[n.off..][0..n.len], @intCast(i));
         return b;
     }
 
@@ -1088,6 +1193,15 @@ pub const Builder = struct {
         });
         try b.edges.appendSlice(gpa, n.deps);
         b.nodes.items[index].targets_len = try b.appendAtoms(n);
+        try b.ref_ranges.append(gpa, .{ @intCast(b.refs.items.len), @intCast(n.refs.len) });
+        try b.refs.appendSlice(gpa, n.refs);
+        return index;
+    }
+
+    /// The value of an `ext`, `ext_weak`, or `rt` reference to `name`.
+    pub fn addRefName(b: *Builder, name: []const u8) !u32 {
+        const index, const new = try b.ref_name_table.intern(b.gpa, name, @intCast(b.ref_names.items.len));
+        if (new) try b.ref_names.append(b.gpa, try b.addString(name));
         return index;
     }
 
@@ -1110,6 +1224,8 @@ pub const Builder = struct {
         node_ptr.atoms_len = @intCast(n.atoms.len);
         try b.edges.appendSlice(b.gpa, n.deps);
         b.nodes.items[index].targets_len = try b.appendAtoms(n);
+        b.ref_ranges.items[index] = .{ @intCast(b.refs.items.len), @intCast(n.refs.len) };
+        try b.refs.appendSlice(b.gpa, n.refs);
     }
 
     /// Reserves room for `n_atoms` more atom references with `n_targets` more
@@ -1224,6 +1340,23 @@ pub const Builder = struct {
         for (b.edges.items) |d| {
             if (d >= nodes.len) return error.InvalidNodeIndex;
         }
+        // References, in node order.
+        const ref_starts = try gpa.alloc(u32, nodes.len + 1);
+        defer gpa.free(ref_starts);
+        var node_refs: std.ArrayList(Ref) = try .initCapacity(gpa, b.refs.items.len);
+        defer node_refs.deinit(gpa);
+        for (b.ref_ranges.items, 0..) |range, i| {
+            ref_starts[i] = @intCast(node_refs.items.len);
+            for (b.refs.items[range[0]..][0..range[1]]) |r| {
+                switch (r.kind) {
+                    .func, .nav => if (r.value >= nodes.len) return error.InvalidNodeIndex,
+                    .ext, .ext_weak, .rt => if (r.value >= b.ref_names.items.len) return error.InvalidRefName,
+                    .err, .error_names => {},
+                }
+                node_refs.appendAssumeCapacity(r);
+            }
+        }
+        ref_starts[nodes.len] = @intCast(node_refs.items.len);
         const numbered = try gpa.alloc(NumberedAtom, ref_count);
         defer gpa.free(numbered);
         const targets = try gpa.alloc(u32, target_count);
@@ -1369,6 +1502,9 @@ pub const Builder = struct {
             @ptrCast(debug_files),
             @ptrCast(debug_atoms),
             @ptrCast(b.files.items),
+            @ptrCast(ref_starts),
+            @ptrCast(node_refs.items),
+            @ptrCast(b.ref_names.items),
             b.strings.items,
         };
         const zeros: [16]u8 = @splat(0);
@@ -1427,9 +1563,10 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         // 0 <- 1 <- 2, and 2 also depends on 0 and on node 3, added after it.
         // Symbol keys are 0xa.. for atoms, 0xe.. for errors.
         _ = try b.addNode(.{ .key = 100, .result_hash = 1 });
+        const memcpy = try b.addRefName("memcpy");
         _ = try b.addNode(.{ .key = 101, .result_hash = 2, .src_hash = 7, .deps = &.{0}, .atoms = &.{.init(32, 64)}, .symbols = &.{
             .{ .key = 0xa1, .targets = &.{ 0xa3, 0xe1 }, .file = "a.zig" },
-        } });
+        }, .refs = &.{ .{ .kind = .func, .value = 3 }, .{ .kind = .ext, .value = memcpy }, .{ .kind = .err, .value = 2 }, .{ .kind = .error_names, .value = 0 } } });
         _ = try b.addNode(.{ .key = 102, .result_hash = 3, .deps = &.{ 1, 0, 3 } });
         _ = try b.addNode(.{ .key = 103, .result_hash = 4, .atoms = &.{.init(160, 16)}, .symbols = &.{
             .{ .key = 0xa3, .targets = &.{ 0xa1, 0xb0 } },
@@ -1478,9 +1615,11 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     {
         var d: Delta = .init(gpa, &m);
         defer d.deinit();
+        const rt = try d.addRefName("compiler_rt:x");
+        try t.expectEqual(1, rt);
         try d.update(2, .{ .key = 102, .result_hash = 33, .deps = &.{3}, .atoms = &.{.init(96, 48)}, .symbols = &.{
             .{ .key = 0xa2, .targets = &.{ 0xa1, 0xc0 }, .file = "b.zig" },
-        } });
+        }, .refs = &.{ .{ .kind = .rt, .value = rt }, .{ .kind = .nav, .value = 0 } } });
         try t.expectEqual(4, try d.addNode(.{ .key = 104, .result_hash = 5, .deps = &.{2} }));
         try d.setInput(0, a_path, try tmp.dir.statFile(io, "a.zig", .{}), 56, .fromNanoseconds(std.math.maxInt(i64)));
         try t.expectEqual(3, try d.addErrorName("Unexpected", 0xe3));
@@ -1496,10 +1635,10 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         try t.expectEqual(6, m2.symbol(0xc0));
         try d.update(2, .{ .key = 102, .result_hash = 33, .deps = &.{3}, .atoms = &.{.init(96, 48)}, .symbols = &.{
             .{ .key = 0xa2, .targets = &.{0xa1}, .file = "b.zig" },
-        } });
+        }, .refs = &.{ .{ .kind = .rt, .value = try d.addRefName("compiler_rt:x") }, .{ .kind = .nav, .value = 0 } } });
         try d.update(4, .{ .key = 104, .result_hash = 6, .deps = &.{2}, .atoms = &.{.init(208, 16)}, .symbols = &.{
             .{ .key = 0xa4, .targets = &.{ 0xa2, 0xe3 }, .file = "a.zig" },
-        } });
+        }, .refs = &.{.{ .kind = .ext_weak, .value = try d.addRefName("memcpy") }} });
         try d.setInput(null, b_path, try tmp.dir.statFile(io, "b.zig", .{}), 57, .fromNanoseconds(std.math.maxInt(i64)));
         try d.append(io, tmp.dir);
     }
@@ -1522,6 +1661,21 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             try t.expectEqual(2, m3.inputCount());
             try t.expectEqual(57, m3.input(1)[0].content_hash);
             try t.expectEqual(56, m3.input(0)[0].content_hash);
+            // References, with names from the base and the log.
+            try t.expectEqual(2, m3.refNameCount());
+            const r1 = m3.nodeRefs(1);
+            try t.expectEqual(4, r1.len);
+            try t.expectEqual(Ref{ .kind = .func, .value = 3 }, r1[0]);
+            try t.expectEqualStrings("memcpy", m3.refName(r1[1].value));
+            try t.expectEqual(Ref{ .kind = .err, .value = 2 }, r1[2]);
+            try t.expectEqual(Ref.Kind.error_names, r1[3].kind);
+            const r2 = m3.nodeRefs(2);
+            try t.expectEqual(2, r2.len);
+            try t.expectEqualStrings("compiler_rt:x", m3.refName(r2[0].value));
+            try t.expectEqual(Ref{ .kind = .nav, .value = 0 }, r2[1]);
+            try t.expectEqual(0, m3.nodeRefs(3).len);
+            try t.expectEqual(Ref.Kind.ext_weak, m3.nodeRefs(4)[0].kind);
+            try t.expectEqualStrings("memcpy", m3.refName(m3.nodeRefs(4)[0].value));
             var refs: std.ArrayList(u64) = .empty;
             defer refs.deinit(gpa);
             for (try m3.allAtomRefs(gpa)) |r| try refs.append(gpa, r.offset());
