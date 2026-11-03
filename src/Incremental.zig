@@ -884,6 +884,24 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     const store_bases = try gpa.alloc(u32, store.packs.len);
     defer gpa.free(store_bases);
     @memset(store_bases, 0);
+    // A linked store pack stays on disk, whole, for as long as the
+    // compilation's directory does, even after the store drops it. Where
+    // this build uses less of a large pack than the rest of it (the rule
+    // `Pack.compact` applies to dead bytes), its entries are written again
+    // into the new pack instead: a small program whose std entries landed
+    // in a big unit's 555 MB pack must not pin it.
+    {
+        const used = try gpa.alloc(u64, store.packs.len);
+        defer gpa.free(used);
+        @memset(used, 0);
+        for (where, r.nodes.items) |w, *n| if (w == .hit) {
+            used[w.hit.pack] += putter.entryLen(n);
+        };
+        for (where, r.nodes.items) |*w, *n| if (w.* == .hit) {
+            const size = store.packSize(w.hit.pack);
+            if (size >= min_pinned_pack and used[w.hit.pack] < size / 2) w.* = .{ .put = .{ .len = putter.entryLen(n) } };
+        };
+    }
     var reused: usize = 0;
     var entries: std.ArrayList(Store.IndexEntry) = .empty;
     defer entries.deinit(gpa);
@@ -1018,6 +1036,10 @@ fn maintain(inc: *Incremental, fe: *const Frontend) void {
     if (inc.timing) if (r) |m| std.debug.print("cache: local cache {d} directories, {d} MiB; deleted {d}, leaving {d} MiB, in {d:.2} ms beside the link\n", .{ m.scanned, m.bytes >> 20, m.deleted, m.bytes_after >> 20, ms(t0, now(inc.io)) });
     fe.trimCaches();
 }
+
+/// Store packs at least this large are linked only if a build uses at
+/// least half of one.
+const min_pinned_pack = 8 << 20;
 
 /// Where a node's store entry is.
 const Where = union(enum) {

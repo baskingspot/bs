@@ -163,6 +163,11 @@ pub fn atomsOffset(deps_len: usize) usize {
 
 pub const PackName = [32 + pack_ext.len]u8;
 
+/// The size of pack `i`.
+pub fn packSize(store: *const Store, i: u32) u64 {
+    return store.packs[i].size;
+}
+
 /// The file name of pack `i` in `dir`.
 pub fn packName(store: *const Store, i: u32) []const u8 {
     return &store.packs[i].name;
