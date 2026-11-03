@@ -9,6 +9,7 @@ const Ir = @import("Ir.zig");
 const Emit = @import("Emit.zig");
 const Incremental = @import("Incremental.zig");
 const Builtin = @import("Builtin.zig");
+const Archive = @import("link/Archive.zig");
 
 pub const zig_version = "0.17.0";
 
@@ -21,6 +22,7 @@ const usage =
     \\  build            Build project from build.zig
     \\  build-exe        Create executable from source
     \\  build-obj        Create object from source
+    \\  build-lib        Create static library from source
     \\  run              Create executable and run immediately
     \\  test             Perform unit testing
     \\  version          Print the Zig version zap compiles
@@ -28,7 +30,7 @@ const usage =
     \\
 ;
 
-pub const Command = enum { build_exe, build_obj, run, @"test" };
+pub const Command = enum { build_exe, build_obj, build_lib, run, @"test" };
 
 /// Options shared by the compile commands. Spelled like `zig build-exe`.
 pub const Options = struct {
@@ -82,7 +84,6 @@ pub const Options = struct {
 /// implement, so that they fail with a diagnostic, over the compiler
 /// protocol when asked to.
 const unsupported_commands: std.StaticStringMap([]const u8) = .initComptime(.{
-    .{ "build-lib", "zap does not build libraries yet ('build-lib'); build this step with upstream zig" },
     .{ "test-obj", "zap does not build test objects yet ('test-obj'); build this step with upstream zig" },
     .{ "translate-c", "zap does not translate C ('translate-c', '@cImport'); build this step with upstream zig" },
     .{ "cc", "zap does not compile C ('cc'); build this step with upstream zig" },
@@ -102,6 +103,8 @@ pub fn main(init: std.process.Init) !void {
         .build_exe
     else if (std.mem.eql(u8, cmd, "build-obj"))
         .build_obj
+    else if (std.mem.eql(u8, cmd, "build-lib"))
+        .build_lib
     else if (std.mem.eql(u8, cmd, "run"))
         .run
     else if (std.mem.eql(u8, cmd, "test"))
@@ -140,10 +143,8 @@ pub fn main(init: std.process.Init) !void {
             try testBinPath(arena, init.io, job.zapLocal(arena), job.stem)
         else if (command == .run)
             try runBinPath(arena, init.io, job.zapLocal(arena), job.compile_args, job.zig_lib_dir, job.stem)
-        else if (command == .build_obj)
-            try std.fmt.allocPrint(arena, "{s}.o", .{job.stem})
         else
-            job.stem,
+            try outputName(arena, command, job.stem),
     };
     if (run_test or (command == .run and opts.emit_bin == .default)) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
     var inc = job.openCache(out_path);
@@ -192,7 +193,11 @@ pub const Job = struct {
         });
         const is_test = command == .@"test";
         const builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), .{
-            .output_mode = if (command == .build_obj) .Obj else .Exe,
+            .output_mode = switch (command) {
+                .build_obj => .Obj,
+                .build_lib => .Lib,
+                else => .Exe,
+            },
             .is_test = is_test,
             .single_threaded = opts.single_threaded,
             .unwind_tables = opts.unwind_tables,
@@ -229,7 +234,7 @@ pub const Job = struct {
         const env = job.environ_map;
         // build-obj does not use the cache yet: a relink would also need the
         // object's exports and imports in the manifest.
-        const use_cache = out_path != null and !job.opts.dump_ir and job.opts.command != .build_obj and
+        const use_cache = out_path != null and !job.opts.dump_ir and job.opts.command != .build_obj and job.opts.command != .build_lib and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -355,7 +360,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     }
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
-    emit.obj = opts.command == .build_obj;
+    emit.obj = opts.command == .build_obj or opts.command == .build_lib;
     emit.stack_size = opts.stack_size;
     // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
     // n more times (`zig build bench-codegen`).
@@ -393,7 +398,19 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // A lazy edit build links from the manifest it appends to.
     const lazy_linked = if (inc_opt) |i| try i.finishLazy(&fe, &zcu, &emit, Io.Dir.cwd(), bin_path) else null;
     if (lazy_linked == null) if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
-    const linked = lazy_linked orelse try emit.link(init.io, Io.Dir.cwd(), bin_path);
+    // A static library is its object in an archive (link/Archive.zig); it
+    // does not use the cache, so it never links lazily.
+    const link_path = if (opts.command == .build_lib) try std.fmt.allocPrint(arena, "{s}.o.tmp", .{bin_path}) else bin_path;
+    var linked = lazy_linked orelse try emit.link(init.io, Io.Dir.cwd(), link_path);
+    if (linked and opts.command == .build_lib) {
+        defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
+        const obj = try Io.Dir.cwd().readFileAlloc(init.io, link_path, arena, .unlimited);
+        const member = try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(opts.root_src_path)});
+        Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, member, obj) catch |err| {
+            std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
+            linked = false;
+        };
+    }
     stages.mark("link");
     if (lazy_linked == null) if (inc_opt) |i| {
         i.finishRecord(linked);
@@ -404,6 +421,15 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     if (stages.on) emit.codegen_stats.print("zap: codegen");
     if (!linked) return .failed;
     return .{ .ok = .{ .cache_hit = false } };
+}
+
+/// The output's file name in its directory, as upstream names it.
+fn outputName(arena: std.mem.Allocator, command: Command, stem: []const u8) ![]const u8 {
+    return switch (command) {
+        .build_obj => std.fmt.allocPrint(arena, "{s}.o", .{stem}),
+        .build_lib => std.fmt.allocPrint(arena, "lib{s}.a", .{stem}),
+        else => stem,
+    };
 }
 
 /// `diags` with their strings copied to `arena`: they point into the Zcu
@@ -474,7 +500,11 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
     try server.serveStringMessage(.zig_version, zig_version);
     try server.serveConfig(.{ .flags = .{
-        .output_mode = if (opts.command == .build_obj) .Obj else .Exe,
+        .output_mode = switch (opts.command) {
+            .build_obj => .Obj,
+            .build_lib => .Lib,
+            else => .Exe,
+        },
         .link_mode = .static,
         .link_libc = false,
         .link_libcpp = false,
@@ -490,7 +520,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     if (job) |*j| {
         _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, "x86_64-linux");
         digest = Incremental.outputDigest(key);
-        const name = if (opts.command == .build_obj) try std.fmt.allocPrint(arena, "{s}.o", .{j.stem}) else j.stem;
+        const name = try outputName(arena, opts.command, j.stem);
         out_path = switch (opts.emit_bin) {
             .none => null,
             .path => |p| p,

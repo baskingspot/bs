@@ -9,7 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-pub const OutputMode = enum { Exe, Obj };
+pub const OutputMode = enum { Exe, Obj, Lib };
 
 pub const Options = struct {
     output_mode: OutputMode,

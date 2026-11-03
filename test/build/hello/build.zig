@@ -19,6 +19,12 @@ pub fn build(b: *std.Build) void {
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{ "a", "b" });
     b.step("run", "Run hello").dependOn(&run.step);
+    // A static library: its object in an archive.
+    b.installArtifact(b.addLibrary(.{ .name = "answer", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) }));
     const tests = b.addTest(.{ .root_module = mod });
     b.step("test", "Run hello's tests").dependOn(&b.addRunArtifact(tests).step);
 }

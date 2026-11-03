@@ -3820,7 +3820,7 @@ state. Built for step 1:
   the first error that has a trace) and its hidden-frame count. A step zap
   cannot build answers every update with one `[unsupported]` error, so the
   runner reports it as that step's failure and builds the rest; commands
-  zap does not implement (`build-lib`, `translate-c`, `cc`, ...) are
+  zap does not implement (`translate-c`, `cc`, `test-obj`, ...) are
   served the same way. Without `--listen=-`, zap renders with its own
   renderer (`--error-format`).
 - **Not yet:** `--watch` and long-lived sessions. Each `update` compiles as

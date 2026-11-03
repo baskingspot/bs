@@ -20,6 +20,8 @@ expect() { grep -qF -- "$1" "$work/log" || fail "expected '$1'"; }
 # A full build: the configurer, the exe (which asks for LLVM), the install.
 "$zap" build --summary all >"$work/log" 2>&1 || fail "zap build"
 [ "$(./zig-out/bin/hello x 2>&1)" = "hello 1" ] || fail "zig-out/bin/hello prints 'hello 1'"
+[ "$(ar t zig-out/lib/libanswer.a)" = "lib.o" ] || fail "zig-out/lib/libanswer.a holds lib.o"
+grep -q hello_answer zig-out/lib/libanswer.a || fail "libanswer.a's index names hello_answer"
 
 # Nothing changed: the compile step is a cache hit.
 "$zap" build --summary all >"$work/log" 2>&1 || fail "zap build (no change)"
