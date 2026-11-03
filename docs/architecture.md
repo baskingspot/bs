@@ -1321,7 +1321,11 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    sort 448 → 421, hash 300 → 297, nbody 457 → 456, fmt 155 → 149. What
    remains is mostly memory traffic: block results and loop variables
    through slots, slices and floats through memory (promotion, step 4's
-   successor).
+   successor). The decisions that do not depend on the architecture (dead
+   values, overflow pairs and bits left in the flags, branch-condition
+   fusion, unused arguments) are `Ssa.plan`, run after `liveness` and
+   recorded per value as a `Live.fate` beside its register; the
+   architecture answers `inGpr`, `fusable`, and `ovfFlagsOnly`.
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
 6. DWARF variable locations; then leaf inlining with the cache edge.

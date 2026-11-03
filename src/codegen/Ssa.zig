@@ -17,6 +17,8 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const Ir = @import("../Ir.zig");
 const Inst = Ir.Inst;
+const InternPool = @import("../InternPool.zig");
+const Type = @import("../Type.zig");
 
 const Func = @This();
 
@@ -43,6 +45,9 @@ targets: std.ArrayList(Block.Index) = .empty,
 /// innermost loop containing it (an index into `loops`, or `no_loop`).
 loops: std.ArrayList(Loop) = .empty,
 block_loop: std.ArrayList(u32) = .empty,
+/// The function contains inline assembly, so no value gets a register
+/// (its constraints do not come from the allocator yet).
+has_asm: bool = false,
 
 /// Liveness and register allocation, per IR instruction (values are IR
 /// instructions until the SSA gets its own ops). Positions number the
@@ -57,6 +62,9 @@ slots: Slots = .{},
 /// it in blocks that continue, and in blocks that do not (`ret`,
 /// `unreachable`, a noreturn call).
 clobbers: std.ArrayList([2]u32) = .empty,
+/// Overflow operations whose results only their `struct_field_val`s read
+/// (`Fate.pair`), and those two values (or `no_tie`), from `plan`.
+pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
 
 pub const no_loop = std.math.maxInt(u32);
 
@@ -84,6 +92,23 @@ pub const Live = struct {
     /// A clobber point (`liveness`) lies inside the interval, where the
     /// value is still needed afterwards.
     crosses: bool,
+    /// How the value is computed, from `plan`.
+    fate: Fate,
+};
+
+/// What `plan` decided for a value, beside its register.
+pub const Fate = enum(u8) {
+    /// Lowered into its register or its memory.
+    normal,
+    /// Nothing reads the value and computing it has no effect: it is not
+    /// emitted.
+    dead,
+    /// A condition its block's branch computes, or an overflow bit the
+    /// branch reads from the flags its operation set.
+    fused,
+    /// An overflow result that is not stored: its operation writes its
+    /// fields' values (see `pairs`).
+    pair,
 };
 
 pub const no_tie = std.math.maxInt(u32);
@@ -157,6 +182,7 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     for (&f.slots.free) |*l| l.deinit(gpa);
     f.slots.active.deinit(gpa);
     f.clobbers.deinit(gpa);
+    f.pairs.deinit(gpa);
 }
 
 pub fn blockInsts(f: *const Func, block: Block.Index) []const Inst.Index {
@@ -182,6 +208,10 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     try f.values.ensureTotalCapacity(gpa, ir.instructions.len);
     var b: Builder = .{ .f = f, .gpa = gpa, .ir = ir };
     try b.body(ir.mainBody());
+    const tags = ir.instructions.items(.tag);
+    f.has_asm = for (f.values.items(.inst)) |inst| {
+        if (tags[@backingInt(inst)] == .assembly) break true;
+    } else false;
 }
 
 /// Passes 3 and 4: bypasses blocks that only jump (`fwd`) and orders the
@@ -319,6 +349,137 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
         const i = @backingInt(inst);
         if (cl[w.end[i]][0] != cl[w.def[i]][0]) w.crosses[i] = true;
     }
+}
+
+/// Decisions after `liveness` that are the same on every architecture,
+/// recorded in `Live.fate`, `pairs`, and `reg`:
+/// - Pass 2: values that nothing reads and whose computation has no effect
+///   (`removable`) are `dead`. Their operands lose a use, so chains of them
+///   go in the same backward sweep (operands come first in the layout).
+///   Intervals stay as `liveness` computed them, which is only longer.
+/// - An overflow operation whose fields are read right after it, with
+///   nothing between that gets a register, and by nothing else, is a
+///   `pair`: the fields' intervals start at the operation, which writes
+///   them. Its bit is `fused` when only its block's branch tests it, if
+///   nothing between sets the flags and `ctx.ovfFlagsOnly(tag, bits)`.
+/// - A condition only its block's branch reads is `fused` if
+///   `ctx.fusable(inst)`.
+/// - Arguments are all moved at the entry, so an unused one, whose interval
+///   ends there, takes no register.
+/// Without inline assembly only pass 2 runs. `ctx.inGpr(ty)` says whether
+/// an overflow operation on `ty` runs in general-purpose registers.
+pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx: anytype) Allocator.Error!void {
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const insts = f.values.items(.inst);
+    const live = f.live.slice();
+    const uses = live.items(.uses);
+    const reg = live.items(.reg);
+    const def = live.items(.def);
+    const fate = live.items(.fate);
+    @memset(fate, .normal);
+    f.pairs.clearRetainingCapacity();
+    {
+        const Uses = struct {
+            uses: []u32,
+            pub fn use(c: @This(), ref: Inst.Ref) void {
+                if (ref.toIndex()) |i| c.uses[@backingInt(i)] -= 1;
+            }
+        };
+        var i = insts.len;
+        while (i > 0) {
+            i -= 1;
+            const inst = insts[i];
+            if (uses[@backingInt(inst)] != 0 or !removable(ir, ip, inst)) continue;
+            fate[@backingInt(inst)] = .dead;
+            reg[@backingInt(inst)] = no_reg;
+            forEachOperand(ir, inst, Uses{ .uses = uses });
+        }
+    }
+    if (f.has_asm) return;
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        const cond: ?Inst.Index = if (b.term.tag == .branch) datas[@backingInt(b.term.inst)].pl_op.operand.toIndex() else null;
+        const values = insts[b.start..][0..b.len];
+        for (values, 0..) |inst, k| {
+            const i = @backingInt(inst);
+            switch (tags[i]) {
+                .add_with_overflow, .sub_with_overflow, .mul_with_overflow => {
+                    const op_ty = ir.typeOf(ir.extraData(Ir.Bin, datas[i].ty_pl.payload).data.lhs, ip);
+                    if (!ctx.inGpr(op_ty)) continue;
+                    var fields: [2]u32 = .{ no_tie, no_tie };
+                    var n: u32 = 0;
+                    for (values[k + 1 ..]) |next| {
+                        const j = @backingInt(next);
+                        if (tags[j] == .dbg_stmt or fate[j] == .dead) continue;
+                        if (tags[j] != .struct_field_val) break;
+                        const sf = ir.extraData(Ir.StructField, datas[j].ty_pl.payload).data;
+                        if (sf.operand != inst.toRef() or fields[sf.index] != no_tie) break;
+                        fields[sf.index] = j;
+                        n += 1;
+                    }
+                    if (n == 0 or n != uses[i]) continue;
+                    fate[i] = .pair;
+                    for (fields) |j| if (j != no_tie) {
+                        def[j] = def[i];
+                    };
+                    try f.pairs.put(gpa, i, fields);
+                    const bit = fields[1];
+                    if (bit != no_tie and uses[bit] == 1 and cond != null and uses[@backingInt(cond.?)] == 1 and
+                        ovfBitCmp(ir, ip, cond.?, bit) != null and ctx.ovfFlagsOnly(tags[i], Type.intInfo(ip, op_ty).bits) and
+                        for (values[k + 1 ..]) |next| switch (tags[@backingInt(next)]) {
+                            .dbg_stmt, .block => {},
+                            .struct_field_val => if (ir.extraData(Ir.StructField, datas[@backingInt(next)].ty_pl.payload).data.operand != inst.toRef()) break false,
+                            else => if (next != cond.?) break false,
+                        } else true)
+                    {
+                        fate[bit] = .fused;
+                        reg[bit] = no_reg;
+                    }
+                },
+                .arg => if (uses[i] == 0) {
+                    reg[i] = no_reg;
+                },
+                else => if (cond != null and cond.? == inst and uses[i] == 1 and ctx.fusable(inst)) {
+                    fate[i] = .fused;
+                    reg[i] = no_reg;
+                },
+            }
+        }
+    }
+}
+
+/// Whether value `inst` may go unemitted when nothing reads it: it reads
+/// no volatile memory, writes nothing but its own result, cannot trap, and
+/// requests nothing from the linker that its users would not.
+fn removable(ir: *const Ir, ip: *const InternPool, inst: Inst.Index) bool {
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .not => true,
+        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float => true,
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => true,
+        .intcast, .trunc, .float_cast, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => true,
+        .int_from_bool, .int_from_ptr, .ptr_from_int, .ret_addr, .frame_addr, .save_err_return_trace_index => true,
+        .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_add, .slice_ptr, .slice_len, .slice => true,
+        .is_null, .is_non_null, .is_err, .is_non_err, .optional_payload, .wrap_optional => true,
+        .unwrap_errunion_payload, .unwrap_errunion_err, .wrap_errunion_payload, .wrap_errunion_err => true,
+        .aggregate_init, .union_init, .get_union_tag, .array_elem_val => true,
+        .load => !Type.ptrInfo(ip, ir.typeOf(data.ty_op.operand, ip)).flags.is_volatile,
+        else => false,
+    };
+}
+
+/// For compare `cmp` of overflow bit `bit` with a constant: whether the
+/// compare is true when the operation overflowed (`cmp_eq(bit, 1)`,
+/// `cmp_neq(bit, 0)`) or not; null for another compare.
+pub fn ovfBitCmp(ir: *const Ir, ip: *const InternPool, cmp: Inst.Index, bit: u32) ?bool {
+    const tag = ir.instructions.items(.tag)[@backingInt(cmp)];
+    if (tag != .cmp_eq and tag != .cmp_neq) return null;
+    const bin = ir.instructions.items(.data)[@backingInt(cmp)].bin_op;
+    const lhs = bin.lhs.toIndex() orelse return null;
+    if (@backingInt(lhs) != bit) return null;
+    const v = ip.intValue(u64, bin.rhs.toInterned() orelse return null) orelse return null;
+    return (tag == .cmp_eq) == (v == 1);
 }
 
 /// Whether a block with this terminator ends the function's execution.

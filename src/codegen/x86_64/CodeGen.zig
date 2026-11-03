@@ -84,9 +84,6 @@ cold_starts: std.ArrayList(ColdStart) = .empty,
 cold_open: std.ArrayList(OpenInline) = .empty,
 /// The function contains inline assembly, so no value gets a register.
 has_asm: bool = false,
-/// Overflow operations whose results only their `struct_field_val`s read
-/// (`Home.pair`), and those two values (or `Ssa.no_tie`).
-pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
 /// The condition under which the last overflow operation whose bit its
 /// block's branch reads from the flags (`Home.fused`) overflowed.
 ovf_cc: Encoder.Cond = .o,
@@ -190,7 +187,6 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.dbg_inline_callees.deinit(gpa);
         cg.dbg_files.deinit(gpa);
         cg.dbg_open.deinit(gpa);
-        cg.pairs.deinit(gpa);
         cg.arg_tys.deinit(gpa);
         cg.arg_locs.deinit(gpa);
         cg.cold_starts.deinit(gpa);
@@ -903,46 +899,31 @@ fn planRegisters(cg: *CodeGen) Error!void {
     if (cg.fn_ty.cc == .naked) return;
     const f = &cg.emit.ssa;
     const ir = cg.ir;
-    const tags = ir.instructions.items(.tag);
-    const insts = f.values.items(.inst);
     try f.live.resize(cg.gpa, ir.instructions.len);
     const live = f.live.slice();
-    const uses = live.items(.uses);
     const reg = live.items(.reg);
     @memset(reg, Ssa.no_reg);
-    cg.has_asm = for (insts) |inst| {
-        if (tags[@backingInt(inst)] == .assembly) break true;
-    } else false;
+    cg.has_asm = f.has_asm;
     // `clobbers` marks the values that want a register.
     try f.liveness(cg.gpa, ir, cg);
     cg.live = true;
-    // Pass 2: values that nothing reads and whose computation has no
-    // effect are not emitted. Their operands lose a use, so chains of them
-    // go in the same backward sweep (operands come first in the layout).
-    // Intervals stay as `liveness` computed them, which is only longer.
-    {
-        const Uses = struct {
-            uses: []u32,
-            pub fn use(c: @This(), ref: Ref) void {
-                if (ref.toIndex()) |i| c.uses[@backingInt(i)] -= 1;
-            }
-        };
-        var i = insts.len;
-        while (i > 0) {
-            i -= 1;
-            const inst = insts[i];
-            if (uses[@backingInt(inst)] != 0 or !cg.removable(inst)) continue;
-            cg.homes[@backingInt(inst)] = .dead;
-            reg[@backingInt(inst)] = Ssa.no_reg;
-            Ssa.forEachOperand(ir, inst, Uses{ .uses = uses });
+    try f.plan(cg.gpa, ir, cg.ip, cg);
+    const fate = live.items(.fate);
+    for (f.values.items(.inst)) |inst| {
+        const i = @backingInt(inst);
+        switch (fate[i]) {
+            .normal => {},
+            .dead => cg.homes[i] = .dead,
+            .fused => cg.homes[i] = .fused,
+            .pair => cg.homes[i] = .pair,
         }
     }
     if (cg.has_asm) {
         // No value gets a register, but a `{reg}` operand that names a
         // callee-saved register (cpuid's `={ebx}`) writes it, so the
         // prologue saves it.
-        for (insts) |inst| {
-            if (tags[@backingInt(inst)] != .assembly) continue;
+        for (f.values.items(.inst)) |inst| {
+            if (ir.instructions.items(.tag)[@backingInt(inst)] != .assembly) continue;
             const extra = ir.extraData(Ir.Asm, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload);
             var i = extra.end;
             for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
@@ -957,65 +938,8 @@ fn planRegisters(cg: *CodeGen) Error!void {
         }
         return;
     }
-    const datas = ir.instructions.items(.data);
-    const def = live.items(.def);
-    for (f.layout.items) |block| {
-        const b = f.blocks.items[@backingInt(block)];
-        const cond: ?Inst.Index = if (b.term.tag == .branch) datas[@backingInt(b.term.inst)].pl_op.operand.toIndex() else null;
-        const values = insts[b.start..][0..b.len];
-        for (values, 0..) |inst, k| {
-            const i = @backingInt(inst);
-            switch (tags[i]) {
-                .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, datas[i].ty_pl.payload).data.lhs))) {
-                    // Fields read right after the operation (with nothing
-                    // between that gets a register) take their values
-                    // from it: their intervals start at the operation.
-                    var fields: [2]u32 = .{ Ssa.no_tie, Ssa.no_tie };
-                    var n: u32 = 0;
-                    for (values[k + 1 ..]) |next| {
-                        const j = @backingInt(next);
-                        if (tags[j] == .dbg_stmt or cg.homes[j] == .dead) continue;
-                        if (tags[j] != .struct_field_val) break;
-                        const sf = ir.extraData(Ir.StructField, datas[j].ty_pl.payload).data;
-                        if (sf.operand != inst.toRef() or fields[sf.index] != Ssa.no_tie) break;
-                        fields[sf.index] = j;
-                        n += 1;
-                    }
-                    if (n != 0 and n == uses[i]) {
-                        cg.homes[i] = .pair;
-                        for (fields) |j| if (j != Ssa.no_tie) {
-                            def[j] = def[i];
-                        };
-                        try cg.pairs.put(cg.gpa, i, fields);
-                        // A bit only the block's branch tests stays in the
-                        // flags, if nothing between sets them.
-                        const bit = fields[1];
-                        if (bit != Ssa.no_tie and uses[bit] == 1 and cond != null and uses[@backingInt(cond.?)] == 1 and
-                            cg.ovfBitCmp(cond.?, bit) != null and ovfFlagsOnly(tags[i], Type.intInfo(cg.ip, cg.typeOf(ir.extraData(Ir.Bin, datas[i].ty_pl.payload).data.lhs)).bits) and
-                            for (values[k + 1 ..]) |next| switch (tags[@backingInt(next)]) {
-                                .dbg_stmt, .block => {},
-                                .struct_field_val => if (ir.extraData(Ir.StructField, datas[@backingInt(next)].ty_pl.payload).data.operand != inst.toRef()) break false,
-                                else => if (next != cond.?) break false,
-                            } else true)
-                        {
-                            cg.homes[bit] = .fused;
-                            reg[bit] = Ssa.no_reg;
-                        }
-                    }
-                },
-                else => {},
-            }
-            if (cond != null and cond.? == inst and uses[i] == 1 and cg.fusable(inst)) {
-                cg.homes[i] = .fused;
-                reg[i] = Ssa.no_reg;
-            }
-            // Arguments are all moved at the entry, so an unused one, whose
-            // interval ends there, must not take a register (or anything).
-            if (tags[i] == .arg and uses[i] == 0) reg[i] = Ssa.no_reg;
-        }
-    }
     cg.saved = f.allocate(alloc_regs.len, callee_saved) & callee_saved;
-    for (insts) |inst| {
+    for (f.values.items(.inst)) |inst| {
         const r = reg[@backingInt(inst)];
         if (r != Ssa.no_reg) cg.homes[@backingInt(inst)] = .{ .reg = alloc_regs[r] };
     }
@@ -1033,29 +957,8 @@ fn errFieldSize(layout: Type.ErrorUnionLayout) Size {
     };
 }
 
-/// Whether value `inst` may go unemitted when nothing reads it: it reads
-/// no volatile memory, writes nothing but its own result, cannot trap, and
-/// requests nothing from the linker that its users would not.
-fn removable(cg: *CodeGen, inst: Inst.Index) bool {
-    const ir = cg.ir;
-    const data = ir.instructions.items(.data)[@backingInt(inst)];
-    return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
-        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .not => true,
-        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float => true,
-        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => true,
-        .intcast, .trunc, .float_cast, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => true,
-        .int_from_bool, .int_from_ptr, .ptr_from_int, .ret_addr, .frame_addr, .save_err_return_trace_index => true,
-        .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_add, .slice_ptr, .slice_len, .slice => true,
-        .is_null, .is_non_null, .is_err, .is_non_err, .optional_payload, .wrap_optional => true,
-        .unwrap_errunion_payload, .unwrap_errunion_err, .wrap_errunion_payload, .wrap_errunion_err => true,
-        .aggregate_init, .union_init, .get_union_tag, .array_elem_val => true,
-        .load => !Type.ptrInfo(cg.ip, cg.typeOf(data.ty_op.operand)).flags.is_volatile,
-        else => false,
-    };
-}
-
 /// Whether `ty`'s values fit a general-purpose register.
-fn inGpr(cg: *CodeGen, ty: Index) bool {
+pub fn inGpr(cg: *CodeGen, ty: Index) bool {
     const ip = cg.ip;
     // Hot: decided by the type's class without computing its size where
     // possible.
@@ -1076,7 +979,7 @@ fn scalarOperand(cg: *CodeGen, ref: Ref) bool {
 }
 
 /// Whether condition `inst` can be computed by the branch it decides.
-fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
+pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
     return switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.scalarOperand(data.bin_op.lhs),
@@ -1253,7 +1156,7 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
             if (data.bin_op.lhs.toIndex()) |bit| if (cg.homes[@backingInt(bit)] == .fused) {
                 // An overflow bit left in the flags.
-                return if (cg.ovfBitCmp(inst, @backingInt(bit)).?) cg.ovf_cc else cg.ovf_cc.negate();
+                return if (Ssa.ovfBitCmp(cg.ir, cg.ip, inst, @backingInt(bit)).?) cg.ovf_cc else cg.ovf_cc.negate();
             };
             const s = cg.signed(cg.typeOf(data.bin_op.lhs));
             const rhs = try cg.srcOperand(data.bin_op.rhs, .rcx);
@@ -2219,7 +2122,7 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     const ty = cg.typeOf(bin.lhs);
     const pair = cg.homes[@backingInt(inst)] == .pair;
     const dst = if (pair) undefined else try cg.resultMem(inst, tuple_ty) orelse return;
-    const fields = if (pair) cg.pairs.get(@backingInt(inst)).? else .{ Ssa.no_tie, Ssa.no_tie };
+    const fields = if (pair) cg.ssa.pairs.get(@backingInt(inst)).? else .{ Ssa.no_tie, Ssa.no_tie };
     const in_flags = fields[1] != Ssa.no_tie and cg.homes[fields[1]] == .fused;
     if (try cg.overflowArith(tag, bin, ty)) |cc| {
         if (in_flags) {
@@ -2299,7 +2202,7 @@ fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index) Error!?Enc
         },
         else => unreachable,
     }
-    const flag_too = !ovfFlagsOnly(tag, info.bits);
+    const flag_too = !cg.ovfFlagsOnly(tag, info.bits);
     if (flag_too) {
         // The product can exceed 64 bits too.
         try cg.e.setcc(.o, .{ .reg = .r11 });
@@ -2316,22 +2219,8 @@ fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index) Error!?Enc
 
 /// Whether an overflow operation on integers of `bits` bits reports its
 /// overflow in one condition (`overflowArith`).
-fn ovfFlagsOnly(tag: Inst.Tag, bits: u16) bool {
+pub fn ovfFlagsOnly(_: *CodeGen, tag: Inst.Tag, bits: u16) bool {
     return tag != .mul_with_overflow or bits <= 32 or bits == 64;
-}
-
-/// For compare `cmp` of overflow bit `bit` with a constant: whether the
-/// compare is true when the operation overflowed (`cmp_eq(bit, 1)`,
-/// `cmp_neq(bit, 0)`) or not; null for another compare.
-fn ovfBitCmp(cg: *CodeGen, cmp: Inst.Index, bit: u32) ?bool {
-    const ir = cg.ir;
-    const tag = ir.instructions.items(.tag)[@backingInt(cmp)];
-    if (tag != .cmp_eq and tag != .cmp_neq) return null;
-    const bin = ir.instructions.items(.data)[@backingInt(cmp)].bin_op;
-    const lhs = bin.lhs.toIndex() orelse return null;
-    if (@backingInt(lhs) != bit) return null;
-    const v = intBits(cg.ip, bin.rhs.toInterned() orelse return null);
-    return (tag == .cmp_eq) == (v == 1);
 }
 
 /// A compare and branch per case item; the else block follows.
