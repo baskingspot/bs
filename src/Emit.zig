@@ -614,7 +614,10 @@ fn emitErrorNameTable(emit: *Emit) !void {
     @memset(bytes, 0);
     var refs: Atom.RelocList = .{};
     defer refs.deinit(gpa);
-    for (emit.errors.keys()) |name| {
+    // In code order, not use order, so that the atom is the same however
+    // the build reached its uses (an edit build loads some of them).
+    for (ip.error_names.items[1 .. max + 1]) |name| {
+        if (!emit.errors.contains(name)) continue;
         const s = ip.stringSlice(name);
         const z = try gpa.alloc(u8, s.len + 1);
         defer gpa.free(z);
