@@ -110,6 +110,10 @@ var safe_gpa: std.heap.SafeAllocator = .init(std.heap.smp_allocator, .{});
 pub fn main(init_std: std.process.Init) !void {
     var init = init_std;
     if (builtin.mode == .safe and !builtin.link_libc) init.gpa = safe_gpa.allocator();
+    // Reports leaks, as std.start does for the allocator it made.
+    defer if (builtin.mode == .safe and !builtin.link_libc) {
+        _ = safe_gpa.deinit();
+    };
     const arena = init.arena.allocator();
     const raw_args = try init.minimal.args.toSlice(arena);
     if (raw_args.len < 2) fatalUsage();
