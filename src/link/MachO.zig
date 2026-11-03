@@ -12,8 +12,9 @@
 //!                      __unwind_info (with debug info)
 //!   __DATA_CONST  rw-, read-only after fixups  __got, __const
 //!   __DATA        rw-  __data, __bss (memory only)
-//!   __LINKEDIT    r--  chained fixups, exports trie, symbol table, indirect
-//!                      symbol table, string table, code signature
+//!   __LINKEDIT    r--  chained fixups, exports trie, function starts,
+//!                      symbol table, indirect symbol table, string table,
+//!                      code signature
 //!
 //! `.rodata` atoms without absolute addresses go to __TEXT,__const; those
 //! with `aarch64_abs64` relocations go to __DATA_CONST,__const, because the
@@ -464,8 +465,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         2 * @sizeOf(macho.linkedit_data_command) + // chained fixups, exports trie
         @sizeOf(macho.symtab_command) + @sizeOf(macho.dysymtab_command) + dylinker_cmd_size +
         @sizeOf(macho.uuid_command) + @sizeOf(macho.build_version_command) + @sizeOf(macho.entry_point_command) +
-        dylib_cmd_size + @sizeOf(macho.linkedit_data_command); // code signature
-    var ncmds: u32 = 12;
+        dylib_cmd_size + 2 * @sizeOf(macho.linkedit_data_command); // function starts, code signature
+    var ncmds: u32 = 13;
     for (seg_present, seg_nsects) |p, n| if (p) {
         sizeofcmds += @sizeOf(macho.segment_command_64) + n * @sizeOf(macho.section_64);
         ncmds += 1;
@@ -479,7 +480,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var seg_file_end: [3]u64 = undefined;
     var seg_mem_end: [3]u64 = undefined;
     {
-        var at: u64 = cmds_end;
+        // Room for post-link tools to add load commands, as ld64's default
+        // -headerpad leaves.
+        var at: u64 = cmds_end + header_pad;
         for (sect_info, 0..) |info, s| {
             const seg = @backingInt(info.seg);
             if (s == 0 or sect_info[s - 1].seg != info.seg) {
@@ -511,7 +514,25 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const cf = ChainedFixupsLayout.init(n_segs, seg_present, fixups_seg, seg_start, seg_mem_end, options.imports);
     const fixups_off = linkedit_off;
     const trie_off = fixups_off + cf.size;
-    const symtab_off = trie_off + exports_trie.len;
+    // Function starts: ULEB128 deltas between the file offsets of
+    // successive functions, from 0, then a 0 and padding to 8 bytes.
+    // Without them lldb takes the binary for stripped and does not unwind
+    // by emulating instructions, which a fault in a prologue needs.
+    const func_starts_off = trie_off + exports_trie.len;
+    var func_starts_len: u64 = 0;
+    {
+        var prev: u64 = 0;
+        for (chunks) |*c| {
+            c.starts_off = func_starts_off + func_starts_len;
+            c.prev_func = prev;
+            if (c.first_func == Chunk.no_func) continue;
+            const first = starts[text] + c.bases[text] + c.first_func;
+            func_starts_len += ulebLen(first - prev) + c.starts_len;
+            prev = starts[text] + c.bases[text] + c.last_func;
+        }
+    }
+    const func_starts_size = std.mem.alignForward(u64, func_starts_len + 1, 8);
+    const symtab_off = func_starts_off + func_starts_size;
     const n_syms: u32 = n_atom_syms + 1 + n_imports;
     const indirect_off = symtab_off + @as(u64, n_syms) * @sizeOf(macho.nlist_64);
     const n_indirect = 2 * n_imports;
@@ -590,7 +611,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             .{ starts[got], starts[got] + sizes[got] },
             .{ starts[data_const], starts[data_const] + sizes[data_const] },
             .{ starts[data], starts[data] + sizes[data] },
-            .{ fixups_off, strtab_end },
+            .{ fixups_off, func_starts_off + func_starts_len },
+            .{ symtab_off, strtab_end },
             .{ sig_off, file_len },
         };
         var at: u64 = 0;
@@ -747,6 +769,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .current_version = 0x10000,
         .compatibility_version = 0x10000,
     } }, libsystem_path, dylib_cmd_size);
+    w.put(macho.linkedit_data_command{ .cmd = .FUNCTION_STARTS, .dataoff = @intCast(func_starts_off), .datasize = @intCast(func_starts_size) });
     w.put(macho.linkedit_data_command{ .cmd = .CODE_SIGNATURE, .dataoff = @intCast(sig_off), .datasize = @intCast(sig_size) });
     std.debug.assert(w.at == cmds_end);
 
@@ -997,6 +1020,12 @@ const Chunk = struct {
     n_syms: u32,
     str_len: u32,
     max_targets: u32,
+    /// Function starts: offsets within the chunk's __text of its first and
+    /// last function (atoms with code), or `no_func`, and the bytes of the
+    /// deltas between its functions.
+    first_func: u64,
+    last_func: u64,
+    starts_len: u32,
     // Filled in serially after `Link.layOut`.
     /// Where the chunk's atoms of each section start, within the section.
     bases: [n_sects]u64,
@@ -1007,6 +1036,12 @@ const Chunk = struct {
     /// The chunk's first symbol and first byte in the string table.
     sym: u32,
     str: u32,
+    /// Where the chunk's function starts go in __LINKEDIT, and the file
+    /// offset of the function before its first.
+    starts_off: u64,
+    prev_func: u64,
+
+    const no_func = std.math.maxInt(u64);
 };
 
 const Failure = struct { atom: usize, err: Error, diag: Diagnostic };
@@ -1186,12 +1221,20 @@ fn LinkOf(comptime Input: type) type {
                 .n_syms = 0,
                 .str_len = 0,
                 .max_targets = 0,
+                .first_func = undefined,
+                .last_func = undefined,
+                .starts_len = undefined,
                 .bases = undefined,
                 .lead_gaps = undefined,
                 .fixups = undefined,
                 .sym = undefined,
                 .str = undefined,
+                .starts_off = undefined,
+                .prev_func = undefined,
             };
+            var first_func: u64 = Chunk.no_func;
+            var last_func: u64 = 0;
+            var starts_len: u32 = 0;
             for (l.places[begin..end], begin..) |*p, i| {
                 // The numbered path's first read of each atom; the key
                 // path checked them in `gatherKeys`.
@@ -1245,12 +1288,20 @@ fn LinkOf(comptime Input: type) type {
                 };
                 c.sizes[s] = off + a.size();
                 c.aligns[s] = c.aligns[s].max(a.alignment);
+                // Atoms with code have distinct, ascending offsets.
+                if (s == text and a.bytes.len > 0) {
+                    if (first_func == Chunk.no_func) first_func = off else starts_len += ulebLen(off - last_func);
+                    last_func = off;
+                }
                 if (a.name.len > 0) {
                     c.n_syms += 1;
                     c.str_len += @intCast(a.name.len + 1);
                 }
                 c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
             }
+            c.first_func = first_func;
+            c.last_func = last_func;
+            c.starts_len = starts_len;
             l.chunks[chunk] = c;
         }
 
@@ -1278,6 +1329,8 @@ fn LinkOf(comptime Input: type) type {
             const end = @min(l.n_atoms, begin + chunk_len);
             var sym_off = l.symtab_off + @as(u64, c.sym) * @sizeOf(macho.nlist_64);
             var str_off = c.str;
+            var starts_off = c.starts_off;
+            var prev_func = c.prev_func;
             for (l.places[begin..end], begin..) |place, i| {
                 if (i + 4 < l.n_atoms) l.input.prefetch(i + 4, !numbered);
                 if (!numbered and i + 2 < l.n_atoms) for (l.input.atom(i + 2).targets) |t| l.symbols.prefetch(t);
@@ -1290,6 +1343,10 @@ fn LinkOf(comptime Input: type) type {
                     @memset(l.buf[start - place.gap .. start], 0);
                     const dst = l.buf[start..][0..a.bytes.len];
                     @memcpy(dst, a.bytes);
+                    if (place.section == text and a.bytes.len > 0) {
+                        starts_off += writeUleb(l.buf[starts_off..], start - prev_func);
+                        prev_func = start;
+                    }
                     const res = resolved[0..a.targets.len];
                     if (numbered) {
                         if (!l.resolveNumbered(a, i, chunk, res)) return;
@@ -1617,6 +1674,24 @@ const CmdWriter = struct {
 /// `__mh_execute_header` at offset 0: the root node, with no terminal and
 /// one edge to the child at offset 0x17, then the child, with a terminal of
 /// flags 0 and address 0 and no edges; zero-padded to 8 bytes.
+/// Bytes left free after the load commands.
+const header_pad = 32;
+
+fn ulebLen(v: u64) u32 {
+    return (64 - @clz(v | 1) + 6) / 7;
+}
+
+inline fn writeUleb(out: []u8, value: u64) u32 {
+    var v = value;
+    var i: u32 = 0;
+    while (v >= 0x80) : (v >>= 7) {
+        out[i] = @as(u8, @truncate(v)) | 0x80;
+        i += 1;
+    }
+    out[i] = @intCast(v);
+    return i + 1;
+}
+
 const exports_trie = "\x00\x01" ++ mh_execute_header ++ "\x00\x17" ++ "\x02\x00\x00\x00" ++ "\x00\x00\x00\x00\x00";
 comptime {
     std.debug.assert(2 + mh_execute_header.len + 2 == 0x17 and exports_trie.len % 8 == 0);
@@ -2039,6 +2114,35 @@ test "links many chunks of atoms and pages of fixups the same way on any number 
     defer gpa.free(four);
     try std.testing.expectEqualSlices(u8, one, four);
 
+    // The function starts list every function, the symbols in __text, in
+    // address order, across chunks.
+    {
+        var from_symtab: std.ArrayList(u64) = .empty;
+        const st = testMachOCommand(macho.symtab_command, one, .SYMTAB).?;
+        for (0..st.nsyms) |i| {
+            const sym = std.mem.bytesToValue(macho.nlist_64, one[st.symoff + i * @sizeOf(macho.nlist_64) ..][0..@sizeOf(macho.nlist_64)]);
+            // Not __mh_execute_header, the one external symbol.
+            if (sym.n_sect == 1 and !sym.n_type.bits.ext) try from_symtab.append(arena, sym.n_value - base_address);
+        }
+        std.mem.sortUnstable(u64, from_symtab.items, {}, std.sort.asc(u64));
+        const fs = testMachOCommand(macho.linkedit_data_command, one, .FUNCTION_STARTS).?;
+        try std.testing.expect(fs.datasize % 8 == 0 and fs.dataoff < st.symoff);
+        var r: std.Io.Reader = .fixed(one[fs.dataoff..][0..fs.datasize]);
+        var from_starts: std.ArrayList(u64) = .empty;
+        var addr: u64 = 0;
+        while (true) {
+            const delta = try r.takeLeb128(u64);
+            if (delta == 0) break;
+            addr += delta;
+            try from_starts.append(arena, addr);
+        }
+        try std.testing.expectEqual(n + 2, from_starts.items.len);
+        try std.testing.expectEqualSlices(u64, from_symtab.items, from_starts.items);
+        // Room after the load commands.
+        const hdr = std.mem.bytesToValue(macho.mach_header_64, one[0..@sizeOf(macho.mach_header_64)]);
+        try std.testing.expect(testMachOSection(one, "__text").?.offset >= @sizeOf(macho.mach_header_64) + hdr.sizeofcmds + 32);
+    }
+
     // Numbered symbols, as the cache's manifest supplies them: the atoms
     // the key-based link keeps, in its order, then the imports, numbered
     // densely, give the same bytes as the key-based link of those atoms.
@@ -2295,6 +2399,17 @@ test "writes a dSYM that std.debug symbolizes and __unwind_info for each functio
         }
     }
     try std.testing.expectEqual(null, testUnwindEncoding(one.exe, text_sect.addr + text_sect.size));
+}
+
+fn testMachOCommand(comptime T: type, bytes: []const u8, cmd: macho.LC) ?T {
+    const hdr = std.mem.bytesToValue(macho.mach_header_64, bytes[0..@sizeOf(macho.mach_header_64)]);
+    var at: usize = @sizeOf(macho.mach_header_64);
+    for (0..hdr.ncmds) |_| {
+        const lc = std.mem.bytesToValue(macho.load_command, bytes[at..][0..@sizeOf(macho.load_command)]);
+        if (lc.cmd == cmd) return std.mem.bytesToValue(T, bytes[at..][0..@sizeOf(T)]);
+        at += lc.cmdsize;
+    }
+    return null;
 }
 
 fn testMachOSection(bytes: []const u8, name: []const u8) ?macho.section_64 {

@@ -564,6 +564,23 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   so that unwinders step through a fault in a leaf. It comes with the
   aarch64 CodeGen, which knows which functions those are; until then
   such functions get `.none`.
+- Every Mach-O link, with or without debug info, has LC_FUNCTION_STARTS
+  in __LINKEDIT after the exports trie (as ld64 places it): ULEB128 deltas
+  between the file offsets of successive functions (atoms with code in
+  __text), from 0, then a 0 and padding to 8 bytes. ld64 writes it unless
+  told not to (`-no_function_starts`), and `strip` keeps it. lldb takes a
+  user binary without function starts or __eh_frame for stripped and turns
+  off unwinding by emulating instructions, so a fault in a prologue unwinds
+  through the caller's frame pointer and skips a frame. The deltas
+  between a chunk's functions depend only on where atoms went within the
+  chunk, so layout sizes them, a serial step places the chunks', and the
+  copy step writes them. The load commands are followed by 32 free bytes
+  before __text, as ld64's default -headerpad leaves, so tools such as
+  `install_name_tool -add_rpath` can add a command. Cost under callgrind on
+  the orb (three single-thread stripped key-path emits of bench-link --
+  macho): 464.8M → 477.5M instructions outside SHA-256 (+2.7%, about 50
+  per function), and 3593.8M → 3612.6M in SHA-256 for the 0.14 MiB more
+  that is signed.
 - Measured Mach-O link throughput (2026-11-02, Apple M4 Max, 12+4 cores,
   `zig build bench-link -- macho`, best of 15): the same 100k atoms with
   aarch64 relocations (970k: a constant reference is an adrp/add pair) and
