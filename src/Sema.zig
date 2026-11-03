@@ -3463,6 +3463,10 @@ fn analyzeDeclLiteral(sema: *Sema, block: *Block, src: Src, name: []const u8, or
     while (true) switch (sema.ip.indexToKey(ty)) {
         .opt_type => |c| ty = c,
         .error_union_type => |e| ty = e.payload_type,
+        // As upstream, a single-item pointer looks in its child type.
+        .ptr_type => |p| if (p.flags.size == .one) {
+            ty = p.child;
+        } else break,
         else => break,
     };
     if (ty == .calling_convention_type) {
