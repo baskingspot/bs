@@ -3674,9 +3674,35 @@ analysis:
    upstream's type identity. The rule: the name is a CAS-min by the
    creator's key. Comptime `@typeName` reads and error-message renderings
    of the name are recorded, and if the final name differs from one that
-   was read, the build reruns, as for provisional codes. Symbol names are
-   computed at `finish` and are fine already. Stage A first counts how
-   often two creators give different names.
+   was read, the build reruns, as for provisional codes.
+   - *Measured* (main 459e1fe, a counter in `createContainerType`):
+     types whose creators give different names number 56 on the std
+     tests, 108 on the zig workload and 5 on libvaxis
+     (`meta.FieldEnum(...)`, `hash_map.Custom(...).KV`,
+     `crypto.sha2.Sha2x32(...).Options`). Comptime `@typeName` reads
+     of container types number 10, 3 and 0, and none is of such a
+     type, so a read that the final name contradicts would be rare.
+   - *Where names go.* Symbol names are not computed at `finish`:
+     `createContainerType` copies the type's name into its namespace's
+     `fqn` and every declaration's `Nav.fqn`, nested anonymous types
+     take their name from those (`anonTypeParent`), CodeGen names a
+     function's atom from `Nav.fqn` while lowering it on a worker, and
+     Emit names data from it. Atom records keep those names. So a min
+     that changes after creation must reach stored names, atoms and
+     records, unless they are computed late from the type's final name.
+   - *Edit builds* need the creators that are live: a loaded unit
+     creates nothing, so each creator unit, and each memo entry whose
+     call created a type, must record its candidate for replay to
+     contribute. A type made only by loaded units' locators otherwise
+     keeps the name from the build that recorded it. Repro:
+     `@typeName(F(u8).S)` prints `F(u16).S` after `F(u16)` is removed
+     from main, while a clean build prints `F(u8).S`.
+   - *Parent namespace.* The winning creator also gives the type's
+     parent namespace, through which declarations inside the type look
+     names up. When the type is declared in a generic type's namespace
+     (`Custom(...).KV`), a later smaller creator changes what such a
+     lookup finds, so a lookup through a parent that loses is a read
+     like a name read.
 5. *Error codes and error sets.*
    - *Codes.* The last build's codes are seeded first (`seedErrors`,
      unchanged). A name with no seeded code gets a provisional code when
@@ -3887,12 +3913,41 @@ checks:
 - bench.py cold, cold-local and edit numbers before and after.
 
 0. *Prerequisites (Sema).* The `nav_ty` unit and function types that
-   resolve by-value parameter types (above). Both fix bugs today.
+   resolve by-value parameter types (above), both on main (459e1fe),
+   and before stage A:
+   - *Genericity out of the `func_type` key.* zap's function type key
+     holds which parameters are comptime (`comptime_bits`) and
+     `is_generic`, including parameters that are comptime only because
+     their type is comptime-only. So making `fn (S) void` reads `S`'s
+     field types, which upstream never does: its key holds only the
+     explicit `comptime` parameters, and a call decides the rest. The
+     read can loop where upstream cannot (`const FnPtr = ?*const fn
+     (@This()) void;` read by its own struct's field), so it is
+     speculative (`Zcu.speculating`): a loop gives up the read, and the
+     function type is made from what is known. That leaves a real cycle
+     order-dependent, which breaks stage A's determinism. It aborts 0
+     times on the zig workload, std and libvaxis, so it is not urgent.
+     The fix keys function types as upstream does and derives
+     genericity and runtime bits where they are used. That touches
+     about 25 `is_generic` sites in Sema and the cache's result
+     encoding.
 A. *Determinism, serially.* Rules 1–8 and the reruns they need, on one
    thread. Rule 1 may land first, alone. Before relying on reruns, count
    on std and the zig workload: units that read provisional codes, and
    types that two creators name differently. Drop conditional edges
    (rule 3).
+   - *Creator-independent type names* (item 4), in three parts:
+     (1) Sema/Zcu, about 3–4 days: a shared type's name and parent
+     namespace become the min by creator key within a build; `Nav.fqn`,
+     `Namespace.fqn` and anonymous type names are computed from the
+     final name instead of copied; comptime name reads and lookups
+     through a parent that then loses are recorded, and if one changes,
+     the build reruns once with names pinned. (2) The cache, about 2
+     days: each creator unit and each memo entry whose call created a
+     type records its candidate, and replay contributes the candidates
+     of loaded units. (3) Link and CodeGen, about 1–2 days: atom and
+     symbol names come from final names at link time and stay out of
+     atom records. Until then, see "Known regressions and limitations".
    - `ZAP_SCHED_FUZZ` gains two Sema modes. One shuffles the function
      queue and the order in which roots are queued. The other eagerly
      resolves random idle units at random points, as another worker
@@ -4787,3 +4842,28 @@ unchanged:
    wrong locations on upstream's compile-error cases. (Harness done; no
    crashes left.)
 8. Later: `zap explain` and `zap fix` (applies exact fixes).
+
+## Known regressions and limitations
+
+- *A type's name after an edit (since the on-disk cache).* A type with
+  more than one possible creator (one ZIR instruction and equal
+  captures, reached from instances that differ in what it does not
+  capture) is named, and given its parent namespace, by the first
+  creator, as upstream. An edit build can keep the name from the build
+  that recorded it, where a clean build names it after the first
+  creator left. Repro: `fn F(comptime T: type) type { return struct {
+  const S = struct { fn f() void {} }; const t: T = 0; }; }`; main calls
+  `F(u16).S.f()` and `F(u8).S.f()` and prints `@typeName(F(u8).S)`.
+  After the edit that removes the `F(u16)` call, the edit build prints
+  `main.F(u16).S`, while a clean build and upstream print `main.F(u8).S`,
+  and `S.f`'s symbol name is stale the same way. Measured on main
+  459e1fe: such types number 56 on the std tests, 108 on the zig
+  workload and 5 on libvaxis; comptime `@typeName` reads of them number
+  0 on all three, so the visible effect is a display or symbol name
+  after such an edit. The fix is part of parallel Sema stage A (step 2,
+  item 4 and stage A), which needs order-independent clean builds.
+- *Speculative function-type reads.* A function type reads its
+  by-value parameters' field types speculatively (`Zcu.speculating`); in
+  a real cycle the result depends on analysis order. It aborts 0 times
+  on the zig workload, std and libvaxis. Taking genericity out of the
+  `func_type` key fixes it, a prerequisite of stage A (step 2, item 0).
