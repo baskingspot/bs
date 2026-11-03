@@ -72,6 +72,9 @@ trace_slot: ?i32 = null,
 saved: u32 = 0,
 /// `Ssa.liveness` ran, so value slots are shared by lifetime.
 live: bool = false,
+/// Overflow operations whose results only their `struct_field_val`s read
+/// (`Home.pair`), and those two values (or `Ssa.no_tie`).
+pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
 /// Inline assembly marked the return address undefined (`.cfi_undefined
 /// %rip`): this is the outermost frame.
 outermost_frame: bool = false,
@@ -103,6 +106,9 @@ const Home = union(enum) {
     reg: Reg,
     /// A condition fused into its block's branch, which computes it.
     fused,
+    /// An overflow result that is not stored: its operation writes its
+    /// fields' values (see `pairs`).
+    pair,
     /// The value is stored at `[rbp + off]`.
     slot: i32,
     /// The value is the address `rbp + off` (an `alloc`).
@@ -160,6 +166,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.dbg_inline_callees.deinit(gpa);
         cg.dbg_files.deinit(gpa);
         cg.dbg_open.deinit(gpa);
+        cg.pairs.deinit(gpa);
     }
     @memset(cg.homes, .none);
     try cg.planRegisters();
@@ -408,7 +415,7 @@ fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
     if (ref.toIndex()) |inst| return switch (cg.homes[@backingInt(inst)]) {
         .none => .none,
         .reg => |r| .{ .reg = r },
-        .fused => unreachable, // read only by its branch
+        .fused, .pair => unreachable, // read only by their users
         .slot => |off| .{ .mem = Mem.at(.rbp, off) },
         .frame_addr => |off| .{ .addr = Mem.at(.rbp, off) },
     };
@@ -644,11 +651,39 @@ fn planRegisters(cg: *CodeGen) Error!void {
     const reg = live.items(.reg);
     const tie = live.items(.tie);
     const datas = ir.instructions.items(.data);
+    const def = live.items(.def);
     for (f.layout.items) |block| {
         const b = f.blocks.items[@backingInt(block)];
         const cond: ?Inst.Index = if (b.term.tag == .branch) datas[@backingInt(b.term.inst)].pl_op.operand.toIndex() else null;
-        for (insts[b.start..][0..b.len]) |inst| {
+        const values = insts[b.start..][0..b.len];
+        for (values, 0..) |inst, k| {
             const i = @backingInt(inst);
+            switch (tags[i]) {
+                .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, datas[i].ty_pl.payload).data.lhs))) {
+                    // Fields read right after the operation (with nothing
+                    // between that gets a register) take their values
+                    // from it: their intervals start at the operation.
+                    var fields: [2]u32 = .{ Ssa.no_tie, Ssa.no_tie };
+                    var n: u32 = 0;
+                    for (values[k + 1 ..]) |next| {
+                        const j = @backingInt(next);
+                        if (tags[j] == .dbg_stmt) continue;
+                        if (tags[j] != .struct_field_val) break;
+                        const sf = ir.extraData(Ir.StructField, datas[j].ty_pl.payload).data;
+                        if (sf.operand != inst.toRef() or fields[sf.index] != Ssa.no_tie) break;
+                        fields[sf.index] = j;
+                        n += 1;
+                    }
+                    if (n != 0 and n == uses[i]) {
+                        cg.homes[i] = .pair;
+                        for (fields) |j| if (j != Ssa.no_tie) {
+                            def[j] = def[i];
+                        };
+                        try cg.pairs.put(cg.gpa, i, fields);
+                    }
+                },
+                else => {},
+            }
             if (cond != null and cond.? == inst and uses[i] == 1 and cg.fusable(inst)) {
                 cg.homes[i] = .fused;
             } else if (cg.wantsReg(inst)) {
@@ -1224,6 +1259,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .struct_field_val => {
             const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+            if (sf.operand.toIndex()) |op| if (cg.homes[@backingInt(op)] == .pair) return; // written by the operation
             const ty = data.ty_pl.ty;
             const off = Type.fieldOffset(ip, cg.typeOf(sf.operand), sf.index);
             if (cg.passInRegs(ty)) {
@@ -1758,18 +1794,24 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     const bin = cg.ir.extraData(Ir.Bin, data.ty_pl.payload).data;
     const tuple_ty = data.ty_pl.ty;
     const ty = cg.typeOf(bin.lhs);
-    const dst = try cg.resultMem(inst, tuple_ty) orelse return;
+    const pair = cg.homes[@backingInt(inst)] == .pair;
+    const dst = if (pair) undefined else try cg.resultMem(inst, tuple_ty) orelse return;
     const info = Type.intInfo(ip, ty);
     const s = info.signedness == .signed;
-    try cg.load(.rax, bin.lhs);
-    try cg.load(.rcx, bin.rhs);
     switch (tag) {
-        .add_with_overflow => try cg.e.alu(.add, .qword, .{ .reg = .rax }, .{ .reg = .rcx }),
-        .sub_with_overflow => try cg.e.alu(.sub, .qword, .{ .reg = .rax }, .{ .reg = .rcx }),
-        .mul_with_overflow => if (s) {
-            try cg.e.imul(.qword, .rax, .{ .reg = .rcx }, null);
-        } else {
-            try cg.e.unary(.mul, .qword, .{ .reg = .rcx });
+        .add_with_overflow, .sub_with_overflow => {
+            const rhs = try cg.srcOperand(bin.rhs, .rcx);
+            try cg.load(.rax, bin.lhs);
+            try cg.e.alu(if (tag == .add_with_overflow) .add else .sub, .qword, .{ .reg = .rax }, rhs);
+        },
+        .mul_with_overflow => {
+            try cg.load(.rax, bin.lhs);
+            try cg.load(.rcx, bin.rhs);
+            if (s) {
+                try cg.e.imul(.qword, .rax, .{ .reg = .rcx }, null);
+            } else {
+                try cg.e.unary(.mul, .qword, .{ .reg = .rcx });
+            }
         },
         else => unreachable,
     }
@@ -1790,6 +1832,12 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
         try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
         try cg.e.setcc(.ne, .{ .reg = .rdx });
         try cg.e.alu(.@"or", .byte, .{ .reg = .r11 }, .{ .reg = .rdx });
+    }
+    if (pair) {
+        const fields = cg.pairs.get(@backingInt(inst)).?;
+        if (fields[0] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[0]), ty, .rax);
+        if (fields[1] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[1]), .u1_type, .r11);
+        return;
     }
     const size = Type.abiSize(ip, ty);
     try cg.storeReg(dst, .rax, size);
