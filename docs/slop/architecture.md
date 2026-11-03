@@ -836,6 +836,42 @@ comptime arguments are run-time values in the lowered code (uucode's
   memory, vectors are laid out as upstream's x86_64 backend lays them
   out without AVX: bool vectors bit-packed (element i is bit i % 8 of
   byte i / 8), other vectors like arrays, aligned to 16.
+  aarch64-macos scalarizes every vector operation for now (no NEON
+  lowering yet) and uses the same layout, though its upstream (LLVM)
+  bit-packs elements and aligns a vector to its size up to 16 (one
+  behavior test differs).
+- aarch64-macos (`src/codegen/aarch64/CodeGen.zig`) lowers the same SSA
+  form with the same per-instruction structure. It runs `Ssa.liveness`
+  and `Ssa.plan` (dead values, fused branch conditions, overflow pairs
+  and bits left in the flags); every value lives in a stack slot, shared
+  by lifetime, until register allocation (`Ssa.allocate`) is wired up.
+  Until then `plan`'s promotion changes nothing there (`inPair` and
+  `inFloat` say no, and the `want_reg` marks go unread), but a load
+  that `plan` forwards shares the stored value's slot, and a removed
+  instruction's constant pointers still request their symbols
+  (`keepSymbols`), as on x86_64. aarch64-macos builds use no cache yet:
+  a relink would need the Mach-O linker's inputs in the manifest.
+  Each function keeps a frame record (`stp x29, x30, [sp, #-16]!; mov
+  x29, sp`), so compact unwind's frame mode covers it, and addresses its
+  slots from sp above a fixed outgoing argument area (the most any call
+  needs, computed before emission). Frames over 4 KiB call
+  `___chkstk_darwin` from code after the body that the prologue branches
+  to. x9-x14 are per-instruction scratch, x16/x17 legalize addresses and
+  hold call targets. `.auto` passes values of up to 8 bytes in one of
+  x0-x7, up to 16 in two, f16/f32/f64 in v0-v7, the rest in the outgoing
+  area; results come back the same way or through x8, and the error
+  return trace pointer goes in x15. `.c` is Apple's AAPCS64: aggregates
+  over 16 bytes by the address of a caller's copy, stack arguments packed
+  at natural alignment, variadic arguments all on the stack in 8-byte
+  slots (`va_list` is a pointer); f80 and f128, which C lacks here, go in
+  two GPRs as compiler_rt's soft-float ABI declares them, and homogeneous
+  float aggregates and vectors are rejected for now. f16 arithmetic is
+  native (FEAT_FP16); f80 and f128 call compiler_rt. Atomics use LSE
+  (`ldadd`, `swp`, `cas`, ...) with acquire-release, `ldar`/`stlr` for
+  loads and stores. Inline assembly is parsed from GNU/LLVM syntax: the
+  loads, stores, moves, arithmetic, branches, barriers, hints, and `mrs`
+  of the thread registers that std uses; callee-saved registers a
+  template names are saved around it.
 - Panics are calls, as upstream: `@panic` and each failed safety check
   call the matching function of `std.lang.panic` (`integerOverflow`,
   `outOfBounds(index, len)`, `call(msg, null)`, ...), then `unreach`.
@@ -1585,6 +1621,8 @@ build, the passes, and the debug info treat them as Sema's inline calls
   function with `@trap` never inlines. `BS_INLINE=<budget>` sets the
   budget (`0` turns inlining off) and `BS_INLINE_SAFE=1` selects safe; a
   non-default setting gets its own cache target (`main.cacheTarget`).
+  aarch64-macos always inlines the safe variant until its synthetic
+  panic frames (below) land.
 - **When.** On the Sema thread, as Sema hands a function to the sink
   (`Emit.functionOwned`), before CodeGen gets it: `inline.scan` finds the
   candidate sites and the size, and `Emit.inlineFate` decides each
@@ -2222,7 +2260,8 @@ Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
    std's tests: 4.62 → 4.49 code bytes per IR instruction, allocation
    106 → 113–116, wall time within noise, binary 60.7 → 59.9 MB.
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
-   thread).
+   thread). Lowering, ABIs, inline assembly, liveness and `Ssa.plan` are
+   in (aarch64-macos conformance 98.0%); register allocation next.
 6. DWARF variable locations; then leaf inlining with the cache edge.
    *DWARF types and variables: paused by the owner, 2026-11-03.* bs
    keeps line tables, CFI, function names and inlined frames, the
@@ -7239,11 +7278,15 @@ and `zig build -Dtarget=aarch64-macos`.
 
 ## `builtin` and conformance
 
-- bs generates the `builtin` module itself. It reports
-  `zig_backend = .stage2_x86_64` on x86_64-linux so std and
-  `test/behavior` take the same paths they take for upstream's self-hosted
-  backend, which is also the benchmark baseline. The aarch64-macos choice is
-  made at milestone 5.
+- bs generates the `builtin` module itself (`src/Builtin.zig`).
+  `zig_backend` is upstream's Debug default for the target, whatever
+  `-fllvm` says: `.stage2_x86_64` on x86_64-linux, `.stage2_llvm` on
+  aarch64-macos (decided 2026-11-03). std and `test/behavior` then take
+  the paths they take upstream, and the conformance baseline stays
+  comparable. Where upstream's semantics depend on the backend, Sema
+  follows the target's (a packed field pointer's host size, for one); the
+  rest of aarch64-macos's `builtin` is upstream's `--show-builtin` for
+  `-target aarch64-macos` (apple_m1, macOS 15.0, libc linked, PIE).
 - Conformance is measured per test: the number of `upstream/test/behavior`
   tests bs compiles and passes, divided by the number upstream 0.17.1 passes
   on the same target with the same backend.
@@ -7264,7 +7307,8 @@ and `zig build -Dtarget=aarch64-macos`.
   `--test-filter behavior.test`. The baseline run also builds all of
   `behavior.zig` at once and checks that the per-file results are identical.
 - The harness passes the compiler a test runner with `--test-runner`
-  (default `tools/conformance/test_runner.zig`) and parses only the runner's
+  (default `tools/conformance/test_runner.zig`; for bs on x86_64-linux,
+  `bs_runner.zig`, which has its own `_start` and system calls) and parses only the runner's
   `@bs-test` line protocol on stdout, documented in that file. A test that
   crashes or times out is recorded and the binary is rerun with
   `--start=<next>`. Until bs compiles the default runner, which mirrors
