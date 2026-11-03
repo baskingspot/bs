@@ -476,7 +476,14 @@ fn structLayout(sema: *Sema, block: *Block, info: *InternPool.ContainerInfo, lay
         for (types, 0..) |ft, i| {
             try sema.resolveLayout(block, block.nodeSrc(.zero), ft);
             if (!Type.hasRuntimeBits(ip, ft)) {
+                // A zero-bit field with an explicit alignment still aligns
+                // the struct, as upstream (std.heap's `_: void align(8) =
+                // {}`); upstream may move it, so it takes no space here.
                 offsets[i] = offset;
+                if (aligns.len != 0 and aligns[i] != 0) {
+                    offsets[i] = std.mem.alignForward(u64, offset, aligns[i]);
+                    alignment = @max(alignment, aligns[i]);
+                }
                 continue;
             }
             // An explicit alignment can raise or lower the natural one.
