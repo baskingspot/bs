@@ -821,8 +821,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fsanitize-thread", "zap has no ThreadSanitizer ('-fsanitize-thread'); build this step with upstream zig" },
     .{ "-ffuzz", "zap does not build fuzz tests ('-ffuzz'); build this step with upstream zig" },
     .{ "-fno-valgrind", "zap always emits Valgrind client requests ('-fno-valgrind'); remove '.valgrind = false'" },
-    .{ "-fPIC", "zap does not emit position-independent code ('-fPIC'); build this step with upstream zig" },
-    .{ "-fPIE", "zap does not emit position-independent executables ('-fPIE'); remove '.pie = true'" },
     .{ "-dynamic", "zap links executables statically ('-dynamic'); build this step with upstream zig" },
     .{ "-femit-asm", "zap does not emit assembly ('-femit-asm')" },
     .{ "-femit-docs", "zap does not emit documentation ('-femit-docs'); build docs with upstream zig" },
@@ -873,6 +871,13 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             opts.emit_bin = .{ .path = arg["-femit-bin=".len..] };
         } else if (std.mem.eql(u8, arg, "-fno-emit-bin")) {
             opts.emit_bin = .none;
+        } else if (std.mem.eql(u8, arg, "-fPIC") or std.mem.eql(u8, arg, "-fPIE")) {
+            // On an executable, a preference that changes nothing a program
+            // means, as with -fllvm: zap links it static and non-PIE, and
+            // `builtin.position_independent_*` stay false. An object or
+            // library built non-PIC cannot go into a PIE or shared library.
+            if (command == .build_obj or command == .build_lib)
+                setUnsupported(&opts, arena, "zap does not emit position-independent code ('{s}'); build this step with upstream zig", .{arg});
         } else if (std.mem.eql(u8, arg, "--name")) {
             opts.name = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "-target")) {
@@ -956,6 +961,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             setUnsupported(&opts, arena, "zap does not link libc or system libraries ('{s}'); build this step with upstream zig", .{arg});
         } else if (unsupported_flags.get(arg)) |msg| {
             setUnsupported(&opts, arena, "{s}", .{msg});
+            // Their parameters: the C flags up to `--`, the language.
+            if (std.mem.eql(u8, arg, "-cflags") or std.mem.eql(u8, arg, "-rcflags")) {
+                while (i + 1 < args.len and !std.mem.eql(u8, args[i + 1], "--")) i += 1;
+                i += 1;
+            } else if (std.mem.eql(u8, arg, "-x")) _ = nextArg(args, &i, arg);
         } else if (std.mem.startsWith(u8, arg, "-flto") or std.mem.startsWith(u8, arg, "-fentry=") or
             std.mem.startsWith(u8, arg, "--export=") or std.mem.startsWith(u8, arg, "-fpatchable-function-entry=") or
             std.mem.startsWith(u8, arg, "--compress-debug-sections="))

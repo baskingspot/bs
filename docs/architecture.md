@@ -3776,6 +3776,16 @@ state. Built for step 1:
   `.stage2_llvm` on aarch64-macos. Example: uucode's `build.zig` builds its
   Unicode table generator with `.use_llvm = true` in Debug; under `zap
   build` that step compiles with zap, and libvaxis needs no `-Dllvm=false`.
+  The same rule covers `-fPIE` and `-fPIC` on executables (linuxwave's
+  `.pie = true`): zap links them static and non-PIE, which changes no
+  program meaning, only address randomization, and
+  `builtin.position_independent_code`/`_executable` stay false (true would
+  make std's start code relocate a binary that has no relocations). On
+  `build-obj` and `build-lib` they stay `[unsupported]`: a non-PIC object
+  cannot go into a PIE or a shared library. `-funwind-tables`,
+  `-fasync-unwind-tables` and `-fno-unwind-tables` set
+  `builtin.unwind_tables` as upstream does (ghostty asks for `.sync`);
+  zap emits asynchronous tables for each, which serve every request.
   Release modes (`-O` other than Debug), C, C++ and assembly sources,
   libc and system libraries, translate-c and `@cImport` stay
   `[unsupported]`. zap never hands a step to upstream zig.

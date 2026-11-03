@@ -12,9 +12,10 @@ pub fn build(b: *std.Build) void {
         .unwind_tables = .sync,
         .imports = &.{.{ .name = "greet", .module = b.createModule(.{ .root_source_file = b.path("src/greet.zig") }) }},
     });
-    // A Debug step that asks for LLVM, as uucode's table generator does:
-    // zap builds it with its own backend.
+    // A Debug step that asks for LLVM and PIE: zap builds it with its
+    // own backend, static and non-PIE.
     const exe = b.addExecutable(.{ .name = "hello", .root_module = mod, .use_llvm = true });
+    exe.pie = true;
     b.installArtifact(exe);
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{ "a", "b" });
