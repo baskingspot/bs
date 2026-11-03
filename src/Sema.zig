@@ -14975,7 +14975,8 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     const fn_ty = ip.keyPayload(.func_type, callee_ty);
     if (fn_ty.param_types.len == 0) return sema.fail(block, src, "member function '{s}' has no parameters", .{name});
     const first_ty = fn_ty.param_types[0];
-    const by_ptr = first_ty != .generic_poison_type and switch (Type.class(ip, first_ty)) {
+    // An `anytype` first parameter gets the pointer, as upstream.
+    const by_ptr = first_ty == .generic_poison_type or switch (Type.class(ip, first_ty)) {
         .pointer => true,
         .optional => Type.class(ip, Type.childType(ip, first_ty)) == .pointer,
         else => false,
