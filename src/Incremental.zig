@@ -71,14 +71,17 @@ recording: ?Io.Future(anyerror!Recorded) = null,
 pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, target: []const u8, timing: bool) !Incremental {
     const build_start = Io.Clock.real.now(io);
     // The compiler's identity: a rebuilt zap must not reuse what an older
-    // one cached.
+    // one cached. The ctime too, which only the kernel sets: a different
+    // zap copied over this file in place, keeping its inode, with the same
+    // size and its mtime restored (`cp` then `touch -d`, `rsync
+    // --inplace -t`), matches on the other three.
     const exe = try std.process.openExecutable(io, .{});
     const exe_stat = exe.stat(io);
     exe.close(io);
     const st = try exe_stat;
     var id: std.ArrayList(u8) = .empty;
     defer id.deinit(gpa);
-    try id.print(gpa, "zap\x00{d}\x00{d}\x00{d}\x00{s}\x00", .{ st.inode, st.size, st.mtime.toNanoseconds(), target });
+    try id.print(gpa, "zap\x00{d}\x00{d}\x00{d}\x00{d}\x00{s}\x00", .{ st.inode, st.size, st.mtime.toNanoseconds(), st.ctime.toNanoseconds(), target });
     const store_seed = cache.hash(0, id.items);
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
