@@ -2665,7 +2665,7 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         },
         else => return sema.fail(block, src, "zap does not support @typeInfo of '{f}' yet", .{sema.fmtType(ty)}),
     };
-    return .fromInterned(try sema.unionValue(block, src, info_ty, @tagName(class), payload));
+    return .fromInterned(try sema.unionValue(block, src, info_ty, if (class == .tuple) "struct" else @tagName(class), payload));
 }
 
 fn zirBitOp(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) CompileError!Ref {
@@ -7317,6 +7317,17 @@ fn switchProngsRuntime(
 fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: Ref) CompileError!Ref {
     const ip = sema.ip;
     const ty = sema.typeOf(operand);
+    if (Type.class(ip, ty) == .error_set and c.items.len != 0 and !c.is_inline) {
+        // The capture's type is the set of the prong's errors.
+        const names = try sema.arena.alloc(InternPool.String, c.items.len);
+        for (names, c.items) |*n, item| n.* = ip.indexToKey(item).err.name;
+        const set = try sema.errorSetType(names);
+        if (sema.resolveValue(operand)) |v| {
+            if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(set));
+            return .fromInterned(try sema.intern(.{ .err = .{ .ty = set, .name = ip.indexToKey(v).err.name } }));
+        }
+        return sema.addTyOp(block, .bitcast, set, operand);
+    }
     if (Type.class(ip, ty) != .@"union") return if (c.is_inline) .fromInterned(c.items[0]) else operand;
     if (c.items.len == 0) return operand;
     const info = ip.structInfo(ty);
