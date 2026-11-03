@@ -1,5 +1,5 @@
 //! exit: 3
-//! stdout: "84\n14\n10\n137\n28\n30\n8\n3\n11\n9\n6\n1\n213\n"
+//! stdout: "84\n14\n10\n137\n28\n30\n8\n3\n11\n9\n6\n1\n213\n20\n99\n20\n0\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -13,6 +13,20 @@ var counter: u32 = 0;
 
 fn bump(n: u32) void {
     counter += n;
+}
+
+/// An `inline for` left by a break inside runtime control flow yields the
+/// runtime-selected value, not the first iteration's.
+fn pickTen(x: u32) u32 {
+    return inline for (.{ 1, 2, 3 }) |v| {
+        if (x == v) break v * 10;
+    } else 99;
+}
+fn pickOrNull(x: u32) ?u32 {
+    const r: u32 = inline for (.{ 1, 2, 3 }) |v| {
+        if (x == v) break v * 10;
+    } else return null;
+    return r;
 }
 
 /// A 32-bit switch whose ranges cover every value needs no else.
@@ -110,6 +124,12 @@ fn main() callconv(.c) noreturn {
     var unit_len: u32 = 0xffffffff;
     _ = &unit_len;
     rt.printInt(unitKind(unit_len) + unitKind(5) * 10 + unitKind(0xfffffff5) * 100);
+    var two: u32 = 2;
+    _ = &two;
+    rt.printInt(pickTen(two));
+    rt.printInt(pickTen(7));
+    rt.printInt(pickOrNull(two) orelse 0);
+    rt.printInt(pickOrNull(7) orelse 0);
     rt.exit(if (b) 3 else 4);
 }
 

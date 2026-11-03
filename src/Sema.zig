@@ -1199,6 +1199,19 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 return;
             },
             .break_inline => {
+                if (!block.is_comptime) {
+                    // To an enclosing runtime block (see `zirBlockInline`).
+                    const brk = data.@"break";
+                    const target = sema.code.extraData(Zir.Inst.Break, brk.payload_index).data.block_inst;
+                    var it: ?*Block = block;
+                    while (it) |cur| : (it = cur.parent) {
+                        const label = cur.label orelse continue;
+                        if (label.zir_block == target) {
+                            try sema.addBr(block, label, sema.resolveInst(brk.operand));
+                            return;
+                        }
+                    }
+                }
                 sema.comptime_break_inst = inst;
                 return error.ComptimeBreak;
             },
@@ -1466,6 +1479,10 @@ fn condbrInlineBody(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
 }
 
 fn zirBlockInline(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    // In runtime code, an inline block (such as an `inline for`) may be
+    // left by a break inside runtime control flow: it is then a runtime
+    // block, as upstream.
+    if (!block.is_comptime) return sema.zirBlock(block, inst);
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const extra = sema.code.extraData(Zir.Inst.Block, data.payload_index);
     const body = sema.code.bodySlice(extra.end, extra.data.body_len);
