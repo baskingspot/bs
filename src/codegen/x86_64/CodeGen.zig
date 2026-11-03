@@ -2026,9 +2026,20 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
     if (!Type.hasRuntimeBits(ip, ty)) return;
     switch (ip.indexToKey(val)) {
         .undef => @memset(out, 0xaa),
-        .int => {
-            // Two's complement, little-endian, sign- or zero-extended to the
-            // ABI size.
+        // Two's complement, little-endian, sign- or zero-extended to the
+        // ABI size.
+        .int => |int| if (int.storage != .big) {
+            const v: u64 = switch (int.storage) {
+                .u64 => |x| x,
+                .i64 => |x| @bitCast(x),
+                .big => unreachable,
+            };
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, v, .little);
+            const n = @min(out.len, 8);
+            @memcpy(out[0..n], bytes[0..n]);
+            if (out.len > 8) @memset(out[8..], if (int.storage == .i64 and int.storage.i64 < 0) 0xff else 0);
+        } else {
             var space: [2]std.math.big.Limb = undefined;
             const big = ip.intToBig(val, &space);
             var m = try std.math.big.int.Managed.init(gpa);
@@ -2109,9 +2120,31 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
                     const n = at.lenIncludingSentinel();
                     switch (a.storage) {
                         .bytes => |s| @memcpy(out, ip.stringSlice(s)[0..out.len]),
-                        .elems => |elems| for (elems[0..n], 0..) |el, i| {
-                            const off: u32 = @intCast(i * esize);
-                            try lowerValue(emit, el, out[off..][0..esize], relocs, base_off + off);
+                        .elems => |elems| {
+                            // Tables repeat aggregate elements (uucode's
+                            // 47,360 rows have 135 distinct values): copy the
+                            // bytes of an element lowered before, unless it
+                            // needed relocations, whose requests each use
+                            // records again.
+                            var seen: std.AutoHashMapUnmanaged(Index, u32) = .empty;
+                            defer seen.deinit(gpa);
+                            const memo = n >= 16 and switch (Type.class(ip, at.child)) {
+                                .@"struct", .tuple, .@"union", .array, .optional, .error_union => true,
+                                else => false,
+                            };
+                            for (elems[0..n], 0..) |el, i| {
+                                const off: u32 = @intCast(i * esize);
+                                if (memo) {
+                                    const gop = try seen.getOrPut(gpa, el);
+                                    if (gop.found_existing) {
+                                        @memcpy(out[off..][0..esize], out[gop.value_ptr.*..][0..esize]);
+                                        continue;
+                                    }
+                                    const relocs_len = relocs.relocs.items.len;
+                                    try lowerValue(emit, el, out[off..][0..esize], relocs, base_off + off);
+                                    if (relocs.relocs.items.len == relocs_len) gop.value_ptr.* = off else _ = seen.remove(el);
+                                } else try lowerValue(emit, el, out[off..][0..esize], relocs, base_off + off);
+                            }
                         },
                         .repeated_elem => |el| for (0..n) |i| {
                             const elem = if (i == at.len and at.sentinel != .none) at.sentinel else el;

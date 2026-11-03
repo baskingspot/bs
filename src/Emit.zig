@@ -62,6 +62,18 @@ content_uses: std.ArrayList(ContentUse) = .empty,
 unit_refs: std.ArrayList(UnitRef) = .empty,
 /// The owner of atoms added now.
 owner: Owner = .link,
+/// `uavKey`'s results, by value and alignment. Each one's lowering
+/// requested `uav_refs[refs_start..][0..refs_len]` and used the content
+/// atoms `uav_uses[uses_start..][0..uses_len]`, which a later owner of a
+/// hit records again, as lowering anew would.
+uav_memo: std.AutoHashMapUnmanaged(struct { val: Index, alignment: u64 }, UavMemo) = .empty,
+uav_refs: std.ArrayList(@FieldType(UnitRef, "ref")) = .empty,
+uav_uses: std.ArrayList(SymbolKey) = .empty,
+/// Lowerings in progress that record into `uav_refs` and `uav_uses`.
+uav_capturing: u32 = 0,
+/// `exportTarget` calls, whose results can change while analysis runs: a
+/// lowering that made one is not memoized.
+export_lookups: u32 = 0,
 /// Whether each owner's atoms are still adjacent in `atoms`; if not,
 /// `finish` regroups them (`groupByOwner`).
 grouped: bool = true,
@@ -80,6 +92,8 @@ pub const Owner = union(enum) {
     /// Code the link needs regardless of units (the error name table).
     link,
 };
+
+const UavMemo = struct { key: SymbolKey, refs_start: u32, refs_len: u32, uses_start: u32, uses_len: u32 };
 
 pub const ContentUse = struct { unit: Zcu.AnalUnit, key: SymbolKey };
 
@@ -113,6 +127,9 @@ pub fn deinit(emit: *Emit) void {
     emit.atom_owners.deinit(gpa);
     emit.content_uses.deinit(gpa);
     emit.unit_refs.deinit(gpa);
+    emit.uav_memo.deinit(gpa);
+    emit.uav_refs.deinit(gpa);
+    emit.uav_uses.deinit(gpa);
     emit.units_seen.deinit(gpa);
     emit.error_values.deinit(gpa);
     emit.arena.deinit();
@@ -208,6 +225,13 @@ pub fn useExtern(emit: *Emit, name: []const u8, weak: bool) !SymbolKey {
 /// Records that the current unit's code requested `ref`.
 fn addRef(emit: *Emit, ref: @FieldType(UnitRef, "ref")) !void {
     if (emit.owner == .unit) try emit.unit_refs.append(emit.gpa, .{ .unit = emit.owner.unit, .ref = ref });
+    if (emit.uav_capturing != 0) try emit.uav_refs.append(emit.gpa, ref);
+}
+
+/// Records that the current unit's code used content atom `key`.
+fn addContentUse(emit: *Emit, key: SymbolKey) !void {
+    if (emit.owner == .unit) try emit.content_uses.append(emit.gpa, .{ .unit = emit.owner.unit, .key = key });
+    if (emit.uav_capturing != 0) try emit.uav_uses.append(emit.gpa, key);
 }
 
 /// `Zcu.requestCompilerRt` on behalf of the current unit.
@@ -311,6 +335,7 @@ fn lowerExternSlots(emit: *Emit) !bool {
 /// final link; an executable resolves it against compiler_rt, as upstream
 /// links it. Complete only once analysis is.
 pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
+    emit.export_lookups += 1;
     if (try emit.userExport(name)) |key| return key;
     if (emit.obj) return try emit.useImport(name, false);
     return if (try emit.zcu.requestCompilerRtExport(name)) |key| .fromName(key) else null;
@@ -444,7 +469,7 @@ pub fn addFunction(emit: *Emit, atom: Atom, debug: Atom.Debug) !void {
 pub fn contentAtom(emit: *Emit, alignment: u64, bytes: []const u8, targets: []const SymbolKey, relocs: []const Atom.Reloc) !SymbolKey {
     const a: std.mem.Alignment = .fromByteUnits(@max(alignment, 1));
     const key: SymbolKey = .fromContents(.rodata, a, bytes, targets, relocs);
-    if (emit.owner == .unit) try emit.content_uses.append(emit.gpa, .{ .unit = emit.owner.unit, .key = key });
+    try emit.addContentUse(key);
     const gop = try emit.content_keys.getOrPut(emit.gpa, key);
     if (gop.found_existing) return key;
     const owner = emit.owner;
@@ -533,18 +558,51 @@ pub fn useError(emit: *Emit, name: InternPool.String) !SymbolKey {
 }
 
 /// Lowers an anonymous constant into its own content-addressed atom,
-/// aligned to at least `alignment` (0 for its type's).
+/// aligned to at least `alignment` (0 for its type's). Memoized: a value's
+/// bytes and relocations are the same each time, so a repeated call only
+/// records again the uses that lowering it made.
 pub fn uavKey(emit: *Emit, val: Index, alignment: u64) !SymbolKey {
+    const gpa = emit.gpa;
+    if (emit.uav_memo.get(.{ .val = val, .alignment = alignment })) |m| {
+        // By index: recording into `uav_refs` and `uav_uses` for an outer
+        // lowering can grow them.
+        for (m.refs_start..m.refs_start + m.refs_len) |i| {
+            const ref = emit.uav_refs.items[i];
+            try emit.addRef(ref);
+        }
+        for (m.uses_start..m.uses_start + m.uses_len) |i| {
+            const use = emit.uav_uses.items[i];
+            try emit.addContentUse(use);
+        }
+        try emit.addContentUse(m.key);
+        return m.key;
+    }
     const ip = &emit.zcu.ip;
     const ty = ip.typeOf(val);
     const size = Type.abiSize(ip, ty);
-    const bytes = try emit.gpa.alloc(u8, size);
-    defer emit.gpa.free(bytes);
+    const bytes = try gpa.alloc(u8, size);
+    defer gpa.free(bytes);
     var refs: Atom.RelocList = .{};
-    defer refs.deinit(emit.gpa);
-    try CodeGen.lowerValue(emit, val, bytes, &refs, 0);
+    defer refs.deinit(gpa);
+    const refs_start: u32 = @intCast(emit.uav_refs.items.len);
+    const uses_start: u32 = @intCast(emit.uav_uses.items.len);
+    const lookups = emit.export_lookups;
+    {
+        emit.uav_capturing += 1;
+        defer emit.uav_capturing -= 1;
+        try CodeGen.lowerValue(emit, val, bytes, &refs, 0);
+    }
     refs.sort();
-    return emit.contentAtom(@max(alignment, Type.abiAlignment(ip, ty)), bytes, refs.targets.keys(), refs.relocs.items);
+    const key = try emit.contentAtom(@max(alignment, Type.abiAlignment(ip, ty)), bytes, refs.targets.keys(), refs.relocs.items);
+    if (emit.export_lookups == lookups) try emit.uav_memo.put(gpa, .{ .val = val, .alignment = alignment }, .{
+        .key = key,
+        .refs_start = refs_start,
+        .refs_len = @intCast(emit.uav_refs.items.len - refs_start),
+        .uses_start = uses_start,
+        // Without the use `contentAtom` just recorded for an outer lowering.
+        .uses_len = @intCast(emit.uav_uses.items.len - uses_start - @intFromBool(emit.uav_capturing != 0)),
+    });
+    return key;
 }
 
 fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
