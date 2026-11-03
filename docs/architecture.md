@@ -1229,10 +1229,8 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    share slots by interval (size classes rounded to 8 bytes up to 512).
    Functions with inline assembly keep every value in memory. The
    callee-saved registers a function uses are pushed after `mov rbp,
-   rsp`, as the design fixes, but the CFI does not describe them until
-   the unwind record lands (step 3): unwinding and stack traces only need
-   rbp and the return address, so only a debugger's view of those
-   registers in outer frames is wrong meanwhile.
+   rsp`, as the design fixes; until step 3's unwind record, the CFI did
+   not describe them.
    On libvaxis text_input (`ZAP_BENCH_CODEGEN=10`): 10.46 → 6.49 code
    bytes per IR instruction, 992 → 708 frame bytes per function, and
    146–151 → 184–190 ns per IR instruction (liveness and allocation 49,
@@ -1247,6 +1245,19 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    sieve.
 3. `.auto` in registers, and the unwind record in the Atom (with the
    link thread).
+   Built. The link thread's `Atom.unwind` (kind, saved mask, stack size)
+   replaces `Atom.Debug.frame`, is written for every atom and cached in
+   the atom record header, and gives each pushed register a
+   `DW_CFA_offset` after its push in .eh_frame. `.auto` passes values of
+   up to 8 bytes in rdi, rsi, rdx, rcx, r8, r9, values of 9 to 16 bytes
+   in two consecutive ones (their bytes as eightbytes; a pair never splits
+   with the stack), f16, f32, and f64 in xmm0–xmm7, and the rest in the
+   outgoing area; results in rax (and rdx) or xmm0, larger ones through a
+   pointer in rdi, which then takes the first argument register. The
+   error return trace pointer is in rax; a function that neither reads it
+   nor calls does not store it. The prologue moves arguments that got a
+   register there with a parallel move. Pairs (slices, error unions) still
+   live in memory inside a function until the SSA has a pair class.
 4. Layout, fusion, overflow from flags, dead code, and branch shortening.
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
