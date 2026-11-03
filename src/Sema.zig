@@ -490,6 +490,11 @@ pub const Src = struct {
         /// The return type of the function prototype (or declaration) at
         /// `node` (upstream's `node_offset_fn_type_ret_ty`).
         fn_ret_ty: Ast.Node.Offset,
+        /// The sentinel of the array or pointer type at `node`.
+        sentinel: Ast.Node.Offset,
+        /// The `callconv` expression of the function prototype (or
+        /// declaration) at `node` (upstream's `node_offset_fn_type_cc`).
+        fn_cc: Ast.Node.Offset,
         /// A part of field `index` of the container declaration at `node`
         /// (upstream's `container_field_name`, `_type`, `_align` and
         /// `_value`).
@@ -613,7 +618,7 @@ pub const Src = struct {
                         const last = tree.lastToken(inputs[inputs.len - 1]);
                         return .{ .start = start, .main = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)) };
                     },
-                    .error_union, .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .array_access => {
+                    .error_union, .merge_error_sets, .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .array_access => {
                         const lhs, const rhs = tree.nodeData(node).node_and_node;
                         return tree.nodeToSpan(if (o.index == 0) lhs else rhs);
                     },
@@ -665,6 +670,18 @@ pub const Src = struct {
                 var buf: [1]Ast.Node.Index = undefined;
                 const proto = tree.fullFnProto(&buf, node) orelse return tree.nodeToSpan(node);
                 return tree.nodeToSpan(proto.ast.return_type.unwrap() orelse node);
+            },
+            .sentinel => |off| {
+                const node = off.toAbsolute(src.base);
+                if (tree.fullArrayType(node)) |a| return tree.nodeToSpan(a.ast.sentinel.unwrap() orelse node);
+                if (tree.fullPtrType(node)) |p| return tree.nodeToSpan(p.ast.sentinel.unwrap() orelse node);
+                return tree.nodeToSpan(node);
+            },
+            .fn_cc => |off| {
+                const node = off.toAbsolute(src.base);
+                var buf: [1]Ast.Node.Index = undefined;
+                const proto = tree.fullFnProto(&buf, node) orelse return tree.nodeToSpan(node);
+                return tree.nodeToSpan(proto.ast.callconv_expr.unwrap() orelse node);
             },
             .container_field => |cf| {
                 const node = cf.node.toAbsolute(src.base);
@@ -912,6 +929,8 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
             try sema.undefValue(decl_ty);
         nav.ty = decl_ty;
         try sema.resolveLayoutIfIdle(&block, src, decl_ty);
+        if (Type.class(sema.ip, decl_ty) != .@"fn")
+            try sema.checkExtern(&block, src.varTy(), decl_ty, .other, "extern variable cannot have type '{f}'", .{FmtType{ .ip = sema.ip, .ty = decl_ty, .decl_note = false }});
         return sema.finish();
     }
     // Within the value body, the `declaration` instruction refers to the type.
@@ -3922,8 +3941,10 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .merge_error_sets => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const a = try sema.resolveType(block, src, extra.lhs);
-            const b = try sema.resolveType(block, src, extra.rhs);
+            const a = try sema.resolveType(block, src.operandSrc(0), extra.lhs);
+            const b = try sema.resolveType(block, src.operandSrc(1), extra.rhs);
+            for ([_]Index{ a, b }, 0..) |t, i| if (Type.class(sema.ip, t) != .error_set)
+                return sema.fail(block, src.operandSrc(@intCast(i)), "expected error set type, found '{f}'", .{sema.fmtType(t)});
             break :blk .fromInterned(try sema.mergeErrorSets(block, src, a, b));
         },
         .elem_type => blk: {
@@ -5793,6 +5814,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     const options = try sema.resolveConstValue(block, options_src, try sema.coerce(block, options_ty, sema.resolveInst(extra.options), options_src), "export options must be comptime-known");
     const name_val = try sema.fieldValue(options, ip.structInfo(options_ty).fieldIndex(ip, "name").?);
     const name = try sema.resolveConstString(block, options_src, .fromInterned(name_val));
+    if (name.len == 0) return sema.fail(block, options_src, "exported symbol name cannot be empty", .{});
     const info = ip.structInfo(options_ty);
     const linkage: std.lang.GlobalLinkage = @enumFromInt(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "linkage").?)).int).?);
     const visibility: std.lang.SymbolVisibility = @enumFromInt(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "visibility").?)).int).?);
@@ -5854,9 +5876,10 @@ fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
 // needs; stores, read-modify-writes, and cmpxchg use locked instructions,
 // which are sequentially consistent, so orderings are only validated.
 
-fn atomicOrder(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref) CompileError!void {
+fn atomicOrder(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref) CompileError!std.lang.AtomicOrder {
     const ty = try sema.stdLangType(block, src, "AtomicOrder");
-    _ = try sema.resolveConstValue(block, src, try sema.coerce(block, ty, sema.resolveInst(ref), src), "atomic order must be comptime-known");
+    const val = try sema.resolveConstValue(block, src, try sema.coerce(block, ty, sema.resolveInst(ref), src), "atomic order must be comptime-known");
+    return std.meta.stringToEnum(std.lang.AtomicOrder, sema.enumTagName(val).?).?;
 }
 
 fn atomicElemType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
@@ -5912,7 +5935,10 @@ fn zirAtomicLoad(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
     const elem_ty = try sema.resolveType(block, sema.callArgSrc(src, false, 0), extra.elem_type);
     try sema.atomicElemType(block, sema.callArgSrc(src, false, 0), elem_ty);
     const ptr = try sema.coerce(block, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .is_const = true } }), sema.resolveInst(extra.ptr), sema.callArgSrc(src, false, 1));
-    try sema.atomicOrder(block, sema.callArgSrc(src, false, 2), extra.ordering);
+    switch (try sema.atomicOrder(block, sema.callArgSrc(src, false, 2), extra.ordering)) {
+        .release, .acq_rel => return sema.fail(block, sema.callArgSrc(src, false, 2), "@atomicLoad atomic ordering must not be release or acq_rel", .{}),
+        else => {},
+    }
     if (block.is_comptime or Type.abiSize(sema.ip, elem_ty) == 0) return sema.analyzeLoad(block, src, ptr);
     return sema.addTyOp(block, .atomic_load, elem_ty, ptr);
 }
@@ -5923,7 +5949,10 @@ fn zirAtomicStore(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
     const src = block.nodeSrc(data.src_node);
     const ptr, const elem_ty = try sema.atomicPtr(block, sema.callArgSrc(src, false, 1), extra.ptr, false);
     const operand = try sema.coerce(block, elem_ty, sema.resolveInst(extra.operand), sema.callArgSrc(src, false, 2));
-    try sema.atomicOrder(block, sema.callArgSrc(src, false, 3), extra.ordering);
+    switch (try sema.atomicOrder(block, sema.callArgSrc(src, false, 3), extra.ordering)) {
+        .acquire, .acq_rel => return sema.fail(block, sema.callArgSrc(src, false, 3), "@atomicStore atomic ordering must not be acquire or acq_rel", .{}),
+        else => {},
+    }
     if (Type.abiSize(sema.ip, elem_ty) == 0) return .void_value;
     if (block.is_comptime) {
         try sema.analyzeStore(block, src, ptr, operand);
@@ -5944,7 +5973,8 @@ fn zirAtomicRmw(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const op_val = try sema.resolveConstValue(block, op_src, try sema.coerce(block, op_ty, sema.resolveInst(extra.operation), op_src), "'@atomicRmw' operation must be comptime-known");
     const op: std.lang.AtomicRmwOp = @fromBackingInt(@intCast(ip.intValue(u64, ip.keyPayload(.enum_tag, op_val).int).?));
     const operand = try sema.coerce(block, elem_ty, sema.resolveInst(extra.operand), sema.callArgSrc(src, false, 3));
-    try sema.atomicOrder(block, sema.callArgSrc(src, false, 4), extra.ordering);
+    if (try sema.atomicOrder(block, sema.callArgSrc(src, false, 4), extra.ordering) == .unordered)
+        return sema.fail(block, sema.callArgSrc(src, false, 4), "@atomicRmw atomic ordering must not be unordered", .{});
     const class = Type.class(ip, elem_ty);
     // Integers, packed structs, and pointers allow every operation.
     switch (class) {
@@ -5990,8 +6020,18 @@ fn zirCmpxchg(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     if (Type.class(ip, elem_ty) == .float) return sema.fail(block, src, "expected bool, integer, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(elem_ty)});
     const expected = try sema.coerce(block, elem_ty, sema.resolveInst(extra.expected_value), sema.callArgSrc(src, false, 2));
     const new = try sema.coerce(block, elem_ty, sema.resolveInst(extra.new_value), sema.callArgSrc(src, false, 3));
-    try sema.atomicOrder(block, sema.callArgSrc(src, false, 4), extra.success_order);
-    try sema.atomicOrder(block, sema.callArgSrc(src, false, 5), extra.failure_order);
+    const success_src = sema.callArgSrc(src, false, 4);
+    const failure_src = sema.callArgSrc(src, false, 5);
+    const success = try sema.atomicOrder(block, success_src, extra.success_order);
+    const failure = try sema.atomicOrder(block, failure_src, extra.failure_order);
+    if (@backingInt(success) < @backingInt(std.lang.AtomicOrder.monotonic))
+        return sema.fail(block, success_src, "success atomic ordering must be monotonic or stricter", .{});
+    if (@backingInt(failure) < @backingInt(std.lang.AtomicOrder.monotonic))
+        return sema.fail(block, failure_src, "failure atomic ordering must be monotonic or stricter", .{});
+    if (@backingInt(failure) > @backingInt(success))
+        return sema.fail(block, failure_src, "failure atomic ordering must be no stricter than success", .{});
+    if (failure == .release or failure == .acq_rel)
+        return sema.fail(block, failure_src, "failure atomic ordering must not be release or acq_rel", .{});
     const result_ty = try sema.optType(elem_ty);
     try sema.resolveLayout(block, src, result_ty);
     if (block.is_comptime or Type.abiSize(ip, elem_ty) == 0) {
@@ -6649,8 +6689,13 @@ fn zirHasDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const extra = sema.code.extraData(Zir.Inst.Bin, data.payload_index).data;
     const src = block.nodeSrc(data.src_node);
-    const ty = try sema.resolveType(block, src, extra.lhs);
-    const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.rhs));
+    const ty_src = sema.callArgSrc(src, false, 0);
+    const ty = try sema.resolveType(block, ty_src, extra.lhs);
+    switch (Type.class(sema.ip, ty)) {
+        .@"struct", .tuple, .@"enum", .@"union", .@"opaque" => {},
+        else => return sema.fail(block, ty_src, "expected struct, enum, union, or opaque; found '{f}'", .{sema.fmtType(ty)}),
+    }
+    const name = try sema.resolveConstString(block, sema.callArgSrc(src, false, 1), sema.resolveInst(extra.rhs));
     // Records exactly what was observed: whether this name exists.
     const nav = (try sema.lookupInType(ty, name)) orelse return .fromInterned(.bool_false);
     // Only a `pub` declaration counts, even in the same file, as upstream.
@@ -15002,9 +15047,11 @@ fn structInitEmpty(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError
             return sema.aggregate(block, src, ty, &.{});
         },
         .tuple_type => |t| if (t.types.len == 0) return .fromInterned(.empty_tuple),
-        else => if (ty == .void_type) return .void_value,
+        .union_type => return sema.fail(block, src, "union initializer must initialize one field", .{}),
+        else => {},
     }
-    return sema.fail(block, src, "type '{f}' does not support struct initialization syntax", .{sema.fmtType(ty)});
+    // As upstream: `{}` is an empty array initializer too.
+    return sema.fail(block, src, "type '{f}' does not support array initialization syntax", .{sema.fmtType(ty)});
 }
 
 fn zirStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -16307,8 +16354,11 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     var body_len: u32 = 0;
     var is_var_args = false;
     var noalias_bits: u32 = 0;
+    var is_noinline = false;
+    const cc_src: Src = .{ .base = src.base, .loc = .{ .fn_cc = data.src_node } };
     if (tag == .func_fancy) {
         const extra = sema.code.extraData(Zir.Inst.FuncFancy, data.payload_index);
+        is_noinline = extra.data.bits.is_noinline;
         body_len = extra.data.body_len;
         is_var_args = extra.data.bits.is_var_args;
         if (extra.data.bits.has_any_noalias) {
@@ -16325,7 +16375,7 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             cc_ref = sema.resolveInst(@fromBackingInt(sema.code.extra[extra.end]));
         }
         if (cc_ref != .none) {
-            const v = try sema.resolveConstValue(block, src, cc_ref, "calling convention must be comptime-known");
+            const v = try sema.resolveConstValue(block, cc_src, cc_ref, "calling convention must be comptime-known");
             cc = switch (ip.indexToKey(v)) {
                 .calling_convention => |c| c,
                 // A value of std's own `std.lang.CallingConvention` union
@@ -16334,13 +16384,14 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                 .un => |u| if (ip.typeOf(v) == (try sema.stdLangDecl(block, src, "CallingConvention")).toInterned().? and sema.enumTagName(u.tag) != null)
                     ip.keyPayload(.calling_convention, (try sema.callingConventionValue(block, src, sema.enumTagName(u.tag).?)).toInterned().?)
                 else
-                    return sema.fail(block, src, "expected calling convention, found '{f}'", .{sema.fmtType(ip.typeOf(v))}),
-                else => return sema.fail(block, src, "expected calling convention, found '{f}'", .{sema.fmtType(ip.typeOf(v))}),
+                    return sema.fail(block, cc_src, "expected calling convention, found '{f}'", .{sema.fmtType(ip.typeOf(v))}),
+                else => return sema.fail(block, cc_src, "expected calling convention, found '{f}'", .{sema.fmtType(ip.typeOf(v))}),
             };
         }
     } else {
         body_len = sema.code.extraData(Zir.Inst.Func, data.payload_index).data.body_len;
     }
+    if (is_noinline and cc == .@"inline") return sema.fail(block, cc_src, "'noinline' function cannot have calling convention 'inline'", .{});
     if (is_var_args) {
         if (cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
     }
@@ -16356,13 +16407,17 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     if (fn_info.inferred_error_set and Type.class(ip, ret_ty) == .error_set) try sema.validateErrorUnionPayload(block, ret_src, ret_ty);
     if (Type.class(ip, ret_ty) == .@"opaque")
         return sema.fail(block, ret_src, "opaque return type '{s}{f}' not allowed", .{ if (fn_info.inferred_error_set) "!" else "", sema.fmtType(ret_ty) });
-    for (params, 0..) |p, k| switch (Type.class(ip, p.ty)) {
-        .@"opaque", .noreturn => {
-            const param_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(k) } } };
-            return sema.fail(block, param_src, "parameter of {s}type '{f}' not allowed", .{ if (Type.class(ip, p.ty) == .@"opaque") "opaque " else "", sema.fmtType(p.ty) });
-        },
-        else => {},
-    };
+    for (params, 0..) |p, k| {
+        const param_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(k) } } };
+        switch (Type.class(ip, p.ty)) {
+            .@"opaque", .noreturn => return sema.fail(block, param_src, "parameter of {s}type '{f}' not allowed", .{ if (Type.class(ip, p.ty) == .@"opaque") "opaque " else "", sema.fmtType(p.ty) }),
+            // `noalias` on what is not a pointer at runtime, as upstream.
+            .pointer => {},
+            else => if (k < 32 and (noalias_bits >> @intCast(k)) & 1 != 0 and p.ty != .generic_poison_type and
+                !(Type.class(ip, p.ty) == .optional and Type.class(ip, Type.childType(ip, p.ty)) == .pointer))
+                return sema.fail(block, param_src, "non-pointer parameter declared noalias", .{}),
+        }
+    }
     // A generic return type stays generic_poison: instantiation adds the
     // inferred error set (see `calleeRetTy`).
     if (fn_info.inferred_error_set and ret_ty != .generic_poison_type) {
