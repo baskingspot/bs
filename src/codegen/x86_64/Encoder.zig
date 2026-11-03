@@ -233,6 +233,28 @@ pub fn movImmValue(e: *Encoder, dst: Reg, key: SymbolKey) !void {
     e.int(u32, 0);
 }
 
+/// Loads the address of the thread-local `sym` (in `.tdata` or `.tbss`),
+/// local-exec model, as upstream emits it: `mov dst, qword ptr fs:[0]`
+/// (the thread pointer, which points to itself on x86_64), then
+/// `lea dst, [dst + sym@tpoff]` with a 32-bit displacement that an
+/// `x86_64_tpoff32` relocation fills.
+pub fn leaThreadLocal(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
+    try e.reserve();
+    e.byte(0x64);
+    e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
+    e.byte(0x8b);
+    e.byte(modrmByte(0b00, dst.low(), 0b100));
+    e.byte(sibByte(0, 0b100, 0b101)); // no base, no index: [disp32]
+    e.int(u32, 0);
+    try e.reserve();
+    e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)), .b = ext(@backingInt(dst)) }, .{});
+    e.byte(0x8d);
+    e.byte(modrmByte(0b10, dst.low(), if (dst.low() == 0b100) 0b100 else dst.low()));
+    if (dst.low() == 0b100) e.byte(sibByte(0, 0b100, 0b100));
+    try e.reloc(.x86_64_tpoff32, sym, 0);
+    e.int(u32, 0);
+}
+
 pub fn lea(e: *Encoder, size: Size, dst: Reg, src: Mem) !void {
     assert(size != .byte);
     try e.reserve();
@@ -850,6 +872,19 @@ test "encodings with special cases match GNU as" {
         .init(0x5e, .x86_64_pc32, 1, -4),
         .init(0x63, .x86_64_pc32, 0, -4),
         .init(0x69, .value32, 1, 0),
+    }, e.refs.relocs.items);
+    // As GNU as assembles `mov rax, fs:0; lea rax, [rax + x@tpoff]` and
+    // the same with r12, which needs a SIB byte as a base.
+    e.code.clearRetainingCapacity();
+    e.refs.relocs.clearRetainingCapacity();
+    try e.leaThreadLocal(.rax, foo);
+    try e.leaThreadLocal(.r12, bar);
+    const tls_expected = "64488b042500000000" ++ "488d8000000000" ++ "644c8b242500000000" ++ "4d8da42400000000";
+    var tls_buf: [tls_expected.len / 2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&tls_buf, tls_expected), e.code.items);
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{
+        .init(12, .x86_64_tpoff32, 0, 0),
+        .init(29, .x86_64_tpoff32, 1, 0),
     }, e.refs.relocs.items);
 }
 

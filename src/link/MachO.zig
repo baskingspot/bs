@@ -79,8 +79,9 @@ pub const Import = struct {
 pub const Value = Elf.Value;
 pub const Diagnostic = Elf.Diagnostic;
 /// As for ELF; `InvalidRelocation` also covers relocation kinds of another
-/// architecture, absolute addresses in code, misaligned fixups, and
-/// addresses taken of imports other than through the GOT.
+/// architecture, absolute addresses in code, misaligned fixups,
+/// addresses taken of imports other than through the GOT, and thread-local
+/// atoms, which are not supported yet.
 pub const Error = Elf.Error;
 
 /// Links `atoms` and writes the executable to `sub_path` in `dir`, built
@@ -666,6 +667,11 @@ const Link = struct {
                 .rodata => if (n_abs > 0) data_const else text_const,
                 .data => data,
                 .bss => bss,
+                // Not implemented yet (see the file's doc comment).
+                .tdata, .tbss => {
+                    l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
+                    continue;
+                },
             };
             c.n_fixups[s] += n_abs;
             const off = a.alignment.forward(c.sizes[s]);
@@ -841,7 +847,7 @@ const Link = struct {
                         else => unreachable,
                     }
                 },
-                .x86_64_abs64, .x86_64_pc32 => return invalid,
+                .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32 => return invalid,
             }
         }
     }

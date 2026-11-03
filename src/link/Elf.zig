@@ -8,7 +8,8 @@
 //!   R   ELF header, program headers, .rodata, .eh_frame, .eh_frame_hdr
 //!       (the last two present if `Options.debug` is not empty)
 //!   RX  .text
-//!   RW  .data, then .bss (memory only)
+//!   RW  .tdata and .tbss (thread-local, present if used), .data, then
+//!       .bss (memory only)
 //!       .debug_abbrev, .debug_info, .debug_line, .debug_str (not loaded;
 //!       present if `Options.debug` is not empty)
 //!       .symtab, .strtab, .shstrtab, section headers (not loaded)
@@ -20,15 +21,20 @@
 //! them the debug passes stream through them in chunks of their own.
 //!
 //! Call frame information is one .eh_frame CIE and a fixed-size FDE per
-//! entry with a frame-pointer frame, indexed by a sorted .eh_frame_hdr
+//! entry with a frame (frame-pointer or outermost), indexed by a sorted .eh_frame_hdr
 //! search table that PT_GNU_EH_FRAME points to, which is where std.debug's
 //! unwinder looks first. Both sections are sized for every entry before
 //! the debug entries are read, so entries that get no FDE leave unused
 //! zero bytes after each section.
 //!
-//! TLS is not implemented. `.tdata` and `.tbss` will go at the start of the
-//! RW segment, before `.data`, covered by a PT_TLS program header, with
-//! TP-relative relocation kinds resolved against the end of that segment.
+//! Thread-local storage: .tdata and .tbss start the RW segment, covered by
+//! a PT_TLS program header (filesz the .tdata bytes, memsz through the end
+//! of .tbss, align the larger alignment), which is what the static TLS
+//! setup (std.os.linux.tls.initStatic) copies each thread's block from.
+//! .tbss takes room in the image, zeros in the file, so that no other
+//! section's addresses overlap the TLS segment's. Only the local-exec model
+//! exists (`x86_64_tpoff32`); TLS symbols' values are offsets in the TLS
+//! segment, as ld writes them for executables.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -115,7 +121,8 @@ pub const Error = Allocator.Error || std.Io.Cancelable || error{
     DuplicateSymbol,
     UndefinedSymbol,
     RelocationOverflow,
-    /// A relocation lies outside its atom, or is in a `.bss` atom.
+    /// A relocation lies outside its atom, or is in a `.bss` or `.tbss`
+    /// atom, or a TLS relocation targets a symbol that is not thread-local.
     InvalidRelocation,
     /// An atom's alignment is above 4 MiB.
     AlignmentTooLarge,
@@ -236,20 +243,33 @@ pub const FileOutput = struct {
 
 const page_size = 0x1000;
 
-/// Section header indices of the allocated sections; the order is the
-/// layout order. The debug sections, if any, follow, then .symtab, .strtab,
-/// and .shstrtab.
-const Shndx = enum(u16) { null, rodata, text, data, bss };
-/// Section header of each `Atom.Section`.
-const shndx_of = [4]Shndx{ .text, .rodata, .data, .bss };
+/// Section header index of each `Atom.Section`. The allocated sections'
+/// headers come in layout order: .rodata, .text, .tdata and .tbss if
+/// present, .data, .bss. Then .eh_frame and .eh_frame_hdr and the debug
+/// sections, if present, then .symtab, .strtab, and .shstrtab.
+fn shndxOf(has_tls: bool) [n_sections]u16 {
+    const t: u16 = @intFromBool(has_tls);
+    return .{ 2, 1, 3 + 2 * t, 4 + 2 * t, 3, 4 };
+}
+const n_sections = std.enums.values(Atom.Section).len;
+/// Padding within each section: int3 in code, zeros elsewhere.
+const fills = [n_sections]u8{ 0xcc, 0, 0, 0, 0, 0 };
+/// Sections with no bytes in the file.
+const zero_fill = [n_sections]bool{ false, false, false, true, false, true };
+const sym_types = [n_sections]elf.STT{ .FUNC, .OBJECT, .OBJECT, .OBJECT, .TLS, .TLS };
+
+/// The TLS segment's addresses [start, end), and the thread pointer, the
+/// end rounded up to the segment's alignment, as if the segment were the
+/// thread's TLS block (x86_64 TLS variant 2).
+const Tls = struct { start: u64, end: u64, tp: u64 };
 /// Where pass 1 placed an atom.
 const Place = packed struct(u64) {
     /// Offset within the chunk's part of the section.
-    offset: u40,
+    offset: u39,
     /// Alignment padding between the previous atom of the section and this
     /// one, which the copy pass fills.
     gap: u22,
-    section: u2,
+    section: u3,
 
     const duplicate: Place = @bitCast(@as(u64, std.math.maxInt(u64)));
 
@@ -267,7 +287,8 @@ const unset = std.math.maxInt(u32);
 const value_tag = 1 << 31;
 /// Section names. Outputs without debug info keep the prefix up to the
 /// names they use.
-const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_line\x00.debug_str\x00";
+const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00";
+const shstrtab_no_tls = shstrtab[0..shName(".tdata")];
 const shstrtab_no_cfi = shstrtab[0..shName(".eh_frame")];
 const shstrtab_no_debug = shstrtab[0..shName(".debug_abbrev")];
 
@@ -295,6 +316,8 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const rodata = @backingInt(Atom.Section.rodata);
     const data = @backingInt(Atom.Section.data);
     const bss = @backingInt(Atom.Section.bss);
+    const tdata = @backingInt(Atom.Section.tdata);
+    const tbss = @backingInt(Atom.Section.tbss);
 
     const n_chunks = std.math.divCeil(usize, atoms.len, chunk_len) catch unreachable;
     const n_threads = @max(1, @min(n_chunks, options.threads orelse std.Thread.getCpuCount() catch 1));
@@ -357,8 +380,8 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     try l.check(diag);
 
     // Place chunks within sections, and their symbols and names.
-    var sizes: [4]u64 = @splat(0);
-    var aligns: [4]std.mem.Alignment = @splat(.@"1");
+    var sizes: [n_sections]u64 = @splat(0);
+    var aligns: [n_sections]std.mem.Alignment = @splat(.@"1");
     var n_syms: u32 = 1;
     var strtab_len: u64 = 1;
     var max_targets: usize = 0;
@@ -396,11 +419,12 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
 
     // Section placement, as file offsets (for .bss, address - base).
     const has_rx = sizes[text] > 0;
-    const has_rw = sizes[data] > 0 or sizes[bss] > 0;
+    const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
+    const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls;
     const has_cfi = debug.len > 0;
-    const phnum: u16 = 2 + @as(u16, @intFromBool(has_rx)) + @intFromBool(has_rw) + @intFromBool(has_cfi);
+    const phnum: u16 = 2 + @as(u16, @intFromBool(has_rx)) + @intFromBool(has_rw) + @intFromBool(has_cfi) + @intFromBool(has_tls);
     const headers_end: u64 = @sizeOf(elf.Elf64.Ehdr) + phnum * @sizeOf(elf.Elf64.Phdr);
-    var starts: [4]u64 = undefined;
+    var starts: [n_sections]u64 = undefined;
     starts[rodata] = aligns[rodata].forward(headers_end);
     const rodata_end = starts[rodata] + sizes[rodata];
     // Room for an FDE per debug entry, and the terminator.
@@ -413,7 +437,15 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     starts[text] = aligns[text].forward(rx_start);
     const text_end = starts[text] + sizes[text];
     const rw_start = if (has_rw) std.mem.alignForward(u64, text_end, page_size) else text_end;
-    starts[data] = aligns[data].forward(rw_start);
+    // The TLS segment: its start and every thread's copy are aligned to
+    // its alignment, so offsets within it keep theirs.
+    const tls_align = aligns[tdata].max(aligns[tbss]);
+    const tls_start = tls_align.forward(rw_start);
+    starts[tdata] = tls_start;
+    const tdata_end = tls_start + sizes[tdata];
+    starts[tbss] = aligns[tbss].forward(tdata_end);
+    const tls_end = starts[tbss] + sizes[tbss];
+    starts[data] = aligns[data].forward(tls_end);
     const file_end = starts[data] + sizes[data];
     starts[bss] = aligns[bss].forward(file_end);
     const mem_end = starts[bss] + sizes[bss];
@@ -426,6 +458,11 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     if (numbered != null and mem_end >= value_tag) return error.OutOfMemory;
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
     l.base = base;
+    l.shndx = shndxOf(has_tls);
+    l.sym_bias = .{ 0, 0, 0, 0, base + tls_start, base + tls_start };
+    // Variant 2: the thread pointer is the end of the thread's TLS block,
+    // whose size is the segment's rounded up to its alignment.
+    l.tls = .{ .start = base + tls_start, .end = base + tls_end, .tp = base + tls_start + tls_align.forward(tls_end - tls_start) };
     try parallel(io, n_threads, l.n_resolve_tasks + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
     try l.check(diag);
     const entry_addr = if (numbered) |s| l.numberedAddr(addrs[s.entry]) else symbols.get(options.entry).?;
@@ -479,9 +516,9 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
     const strtab_off = symtab_off + @as(u64, n_syms) * @sizeOf(elf.Elf64.Sym);
     const shstrtab_off = strtab_off + strtab_len;
-    const shstr = if (has_debug) shstrtab else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
+    const shstr = if (has_tls) shstrtab else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_cfi)) + 4 * @as(u16, @intFromBool(has_debug));
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + 2 * @as(u16, @intFromBool(has_cfi)) + 4 * @as(u16, @intFromBool(has_debug));
     const buf = try out.buffer(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     l.buf = buf;
     adviseHugePages(buf);
@@ -492,7 +529,9 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     @memset(buf[headers_end..starts[rodata]], 0);
     @memset(buf[rodata_end..eh_off], 0);
     @memset(buf[r_end..starts[text]], 0);
-    @memset(buf[text_end..starts[data]], 0);
+    @memset(buf[text_end..tls_start], 0);
+    // .tbss's room in the file is zeros.
+    @memset(buf[tdata_end..starts[data]], 0);
     @memset(buf[str_off + str_size .. symtab_off], 0);
     @memset(buf[symtab_off..][0..@sizeOf(elf.Elf64.Sym)], 0);
     buf[strtab_off] = 0;
@@ -553,21 +592,22 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         .shstrndx = shnum - 1,
     });
     var ph_off: usize = @sizeOf(elf.Elf64.Ehdr);
-    const phdrs = [_]struct { bool, elf.PF, u64, u64, u64 }{
-        .{ true, .{ .R = true }, 0, r_end, r_end },
-        .{ has_rx, .{ .R = true, .X = true }, rx_start, text_end - rx_start, text_end - rx_start },
-        .{ has_rw, .{ .R = true, .W = true }, rw_start, file_end - rw_start, mem_end - rw_start },
+    const phdrs = [_]struct { bool, elf.PT, elf.PF, u64, u64, u64, u64 }{
+        .{ true, .LOAD, .{ .R = true }, 0, r_end, r_end, page_size },
+        .{ has_rx, .LOAD, .{ .R = true, .X = true }, rx_start, text_end - rx_start, text_end - rx_start, page_size },
+        .{ has_rw, .LOAD, .{ .R = true, .W = true }, rw_start, file_end - rw_start, mem_end - rw_start, page_size },
+        .{ has_tls, .TLS, .{ .R = true }, tls_start, sizes[tdata], tls_end - tls_start, tls_align.toByteUnits() },
     };
     for (phdrs) |p| if (p[0]) {
         writeStruct(buf[ph_off..], elf.Elf64.Phdr{
-            .type = .LOAD,
-            .flags = p[1],
-            .offset = p[2],
-            .vaddr = base + p[2],
-            .paddr = base + p[2],
-            .filesz = p[3],
-            .memsz = p[4],
-            .@"align" = page_size,
+            .type = p[1],
+            .flags = p[2],
+            .offset = p[3],
+            .vaddr = base + p[3],
+            .paddr = base + p[3],
+            .filesz = p[4],
+            .memsz = p[5],
+            .@"align" = p[6],
         });
         ph_off += @sizeOf(elf.Elf64.Phdr);
     };
@@ -605,11 +645,16 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         nonAlloc(shName(".debug_line"), .PROGBITS, line_off, line_size),
         nonAlloc(shName(".debug_str"), .PROGBITS, str_off, str_size),
     };
+    const tls_shdrs = [_]elf.Elf64.Shdr{
+        shdr(shName(".tdata"), .PROGBITS, .{ .ALLOC = true, .WRITE = true, .TLS = true }, base, starts[tdata], sizes[tdata], aligns[tdata]),
+        shdr(shName(".tbss"), .NOBITS, .{ .ALLOC = true, .WRITE = true, .TLS = true }, base, starts[tbss], sizes[tbss], aligns[tbss]),
+    };
     const strtab_ndx = shnum - 2;
     const shdrs = [_]elf.Elf64.Shdr{
         std.mem.zeroes(elf.Elf64.Shdr),
         shdr(shName(".rodata"), .PROGBITS, .{ .ALLOC = true }, base, starts[rodata], sizes[rodata], aligns[rodata]),
         shdr(shName(".text"), .PROGBITS, .{ .ALLOC = true, .EXECINSTR = true }, base, starts[text], sizes[text], aligns[text]),
+    } ++ tls_shdrs ++ [_]elf.Elf64.Shdr{
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
     } ++ cfi_shdrs ++ debug_shdrs ++ [_]elf.Elf64.Shdr{
@@ -618,9 +663,15 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
         nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
     var sh_at = shoff;
+    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ true, 2 }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ true, 3 } };
+    var group: usize = 0;
+    var group_end: usize = present[0][1];
     for (shdrs, 0..) |s, i| {
-        if (!has_cfi and i >= 5 and i < 5 + cfi_shdrs.len) continue;
-        if (!has_debug and i >= 5 + cfi_shdrs.len and i < 5 + cfi_shdrs.len + debug_shdrs.len) continue;
+        if (i == group_end) {
+            group += 1;
+            group_end += present[group][1];
+        }
+        if (!present[group][0]) continue;
         writeStruct(buf[sh_at..], s);
         sh_at += @sizeOf(elf.Elf64.Shdr);
     }
@@ -629,16 +680,16 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
 /// One `chunk_len` run of consecutive atoms.
 const Chunk = struct {
     // Filled in by `Link.layOut`.
-    sizes: [4]u64,
-    aligns: [4]std.mem.Alignment,
+    sizes: [n_sections]u64,
+    aligns: [n_sections]std.mem.Alignment,
     n_syms: u32,
     str_len: u32,
     max_targets: u32,
     // Filled in serially after `Link.layOut`.
     /// Where the chunk's atoms of each section start, within the section.
-    bases: [4]u64,
+    bases: [n_sections]u64,
     /// Padding before `bases`, which the chunk fills.
-    lead_gaps: [4]u64,
+    lead_gaps: [n_sections]u64,
     /// The chunk's first symbol in .symtab and first byte in .strtab.
     sym: u32,
     str: u32,
@@ -695,7 +746,14 @@ const Link = struct {
     values: *const SymbolTable = undefined,
     buf: []u8 = undefined,
     base: u64 = undefined,
-    section_addrs: [4]u64 = undefined,
+    section_addrs: [n_sections]u64 = undefined,
+    /// The TLS segment's addresses, and the thread pointer's place
+    /// relative to them.
+    tls: Tls = undefined,
+    shndx: [n_sections]u16 = undefined,
+    /// Subtracted from addresses for symbol values: thread-locals' values
+    /// are offsets in the TLS segment.
+    sym_bias: [n_sections]u64 = undefined,
     symtab_off: u64 = undefined,
     strtab_off: u64 = undefined,
     /// `max_targets` addresses per thread.
@@ -815,14 +873,14 @@ const Link = struct {
                     continue;
                 }
             }
-            if (a.section == .bss and (a.bytes.len != 0 or a.relocs.len != 0)) {
+            if (a.section.isZeroFill() and (a.bytes.len != 0 or a.relocs.len != 0)) {
                 l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
                 continue;
             }
             const s = @backingInt(a.section);
             const off = a.alignment.forward(c.sizes[s]);
             p.* = .{
-                .offset = std.math.cast(u40, off) orelse {
+                .offset = std.math.cast(u39, off) orelse {
                     l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
                     continue;
                 },
@@ -984,10 +1042,10 @@ const Link = struct {
     }
 
     fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
-        const fills: [3]u8 = .{ 0xcc, 0, 0 };
         const c = &l.chunks[chunk];
         const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
-        for (c.lead_gaps[0..3], c.bases[0..3], l.section_addrs[0..3], fills) |gap, chunk_base, sa, fill| {
+        for (c.lead_gaps, c.bases, l.section_addrs, fills, 0..) |gap, chunk_base, sa, fill, s| {
+            if (zero_fill[s]) continue;
             const start = sa - l.base + chunk_base;
             @memset(l.buf[start - gap .. start], fill);
         }
@@ -1011,7 +1069,7 @@ const Link = struct {
             }
             if (place.isDuplicate()) continue;
             const addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
-            if (place.section != @backingInt(Atom.Section.bss)) {
+            if (!zero_fill[place.section]) {
                 const start = addr - l.base;
                 @memset(l.buf[start - place.gap .. start], fills[place.section]);
                 const dst = l.buf[start..][0..a.bytes.len];
@@ -1026,7 +1084,7 @@ const Link = struct {
                     };
                 }
                 var diag: Diagnostic = .{};
-                applyRelocs(a, dst, addr, res, &diag) catch |err| return l.fail(chunk, i, err, diag);
+                applyRelocs(a, dst, addr, res, &l.tls, &diag) catch |err| return l.fail(chunk, i, err, diag);
             }
             var name: u32 = 0;
             if (a.name.len > 0) {
@@ -1037,10 +1095,10 @@ const Link = struct {
             }
             writeStruct(l.buf[sym_off..], elf.Elf64.Sym{
                 .name = name,
-                .info = .{ .type = if (a.section == .text) .FUNC else .OBJECT, .bind = .GLOBAL },
+                .info = .{ .type = sym_types[place.section], .bind = .GLOBAL },
                 .other = .{ .visibility = .DEFAULT },
-                .shndx = @backingInt(shndx_of[place.section]),
-                .value = addr,
+                .shndx = l.shndx[place.section],
+                .value = addr - l.sym_bias[place.section],
                 .size = a.size(),
             });
             sym_off += @sizeOf(elf.Elf64.Sym);
@@ -1214,7 +1272,7 @@ pub fn identical(a: *const Atom, b: *const Atom) bool {
 
 /// Applies `a`'s relocations to its copy `dst` at address `p_base`, with
 /// `resolved` holding the address or value of each of `a.targets`.
-inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const u64, diag: *Diagnostic) Error!void {
+inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const u64, tls: *const Tls, diag: *Diagnostic) Error!void {
     // One dispatch per relocation: each arm checks its own field width, and
     // another architecture's kind falls through to the error.
     for (a.relocs) |r| {
@@ -1230,6 +1288,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 const f = try relocField(a, dst, r.offset, 8, diag);
                 std.mem.writeInt(u64, f, s +% @as(u64, @bitCast(@as(i64, r.addend))), .little);
             },
+            .x86_64_tpoff32 => try tpoff32(a, r, dst, s, tls, diag),
             .value32 => {
                 const f = try relocField(a, dst, r.offset, 4, diag);
                 std.mem.writeInt(u32, f, std.math.cast(u32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
@@ -1249,6 +1308,18 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
             else => return invalidReloc(a, diag),
         }
     }
+}
+
+/// Out of line: thread-locals are rare, and the relocation loop keeps its
+/// registers for the common kinds.
+noinline fn tpoff32(a: *const Atom, r: Atom.Reloc, dst: []u8, s: u64, tls: *const Tls, diag: *Diagnostic) Error!void {
+    const f = try relocField(a, dst, r.offset, 4, diag);
+    if (s < tls.start or s >= tls.end) {
+        diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
+        return error.InvalidRelocation;
+    }
+    const v = @as(i64, @bitCast(s -% tls.tp)) +% r.addend;
+    std.mem.writeInt(i32, f, std.math.cast(i32, v) orelse return overflow(a, r, diag), .little);
 }
 
 inline fn relocField(a: *const Atom, dst: []u8, offset: u32, comptime width: comptime_int, diag: *Diagnostic) Error!*[width]u8 {
@@ -1372,6 +1443,167 @@ test "links and runs a program that writes from rodata and exits with 42" {
     const conflicting = [_]Atom{ atoms[0], .{ .key = start, .name = "other", .section = .text, .bytes = "\xc3" } };
     try std.testing.expectError(error.DuplicateSymbol, emit(gpa, io, &conflicting, .{ .entry = start, .diag = &diag }));
     try std.testing.expectEqualStrings("other", diag.atom);
+}
+
+test "thread-locals in .tdata and .tbss read back after static TLS setup" {
+    if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Encoder = @import("../codegen/x86_64/Encoder.zig");
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Thread-locals with mixed alignments, so the TLS segment's size is
+    // not a multiple of its alignment and the TP offsets depend on the
+    // rounding: a: u32 = 0x11223344, c: u8 align(16) = 7, b: u64 = 0,
+    // d: u32 align(32) = 0.
+    const a: SymbolKey = .fromName("a");
+    const b: SymbolKey = .fromName("b");
+    const c: SymbolKey = .fromName("c");
+    const d: SymbolKey = .fromName("d");
+    const area: SymbolKey = .fromName("tls_area");
+    const start: SymbolKey = .fromName("_start");
+    const base: i32 = @intCast((Options{ .entry = start }).base_address);
+
+    // _start does what std.os.linux.tls.initStatic does: find PT_TLS among
+    // the program headers (non-PIE, so at base + e_phoff), copy the
+    // initialization image to an aligned area, point fs at the end of the
+    // block rounded up to the alignment, which holds a pointer to itself.
+    var e: Encoder = .init(arena);
+    const found = try e.newLabel();
+    const next = try e.newLabel();
+    const fail = try e.newLabel();
+    try e.mov(.dword, .{ .reg = .rsi }, .{ .imm = base + @sizeOf(elf.Elf64.Ehdr) });
+    try e.movzx(.dword, .rcx, .word, .{ .mem = .{ .disp = base + @offsetOf(elf.Elf64.Ehdr, "phnum") } });
+    e.bind(next);
+    try e.alu(.cmp, .dword, .{ .mem = .at(.rsi, 0) }, .{ .imm = @backingInt(elf.PT.TLS) });
+    try e.jcc(.e, .{ .label = found });
+    try e.alu(.add, .qword, .{ .reg = .rsi }, .{ .imm = @sizeOf(elf.Elf64.Phdr) });
+    try e.alu(.sub, .dword, .{ .reg = .rcx }, .{ .imm = 1 });
+    try e.jcc(.ne, .{ .label = next });
+    try e.ud2();
+    e.bind(found);
+    try e.mov(.qword, .{ .reg = .r8 }, .{ .mem = .at(.rsi, @offsetOf(elf.Elf64.Phdr, "memsz")) });
+    try e.mov(.qword, .{ .reg = .r9 }, .{ .mem = .at(.rsi, @offsetOf(elf.Elf64.Phdr, "align")) });
+    try e.lea(.qword, .r8, .{ .base = .{ .reg = .r8 }, .index = .{ .reg = .r9 }, .disp = -1 });
+    try e.unary(.neg, .qword, .{ .reg = .r9 });
+    try e.alu(.@"and", .qword, .{ .reg = .r8 }, .{ .reg = .r9 }); // block size
+    try e.mov(.qword, .{ .reg = .rcx }, .{ .mem = .at(.rsi, @offsetOf(elf.Elf64.Phdr, "filesz")) });
+    try e.mov(.qword, .{ .reg = .rsi }, .{ .mem = .at(.rsi, @offsetOf(elf.Elf64.Phdr, "vaddr")) });
+    try e.lea(.qword, .rdi, .sym(area, 0));
+    try e.repMovsb(); // .tbss is the zeros already in the area
+    try e.lea(.qword, .rdi, .sym(area, 0));
+    try e.alu(.add, .qword, .{ .reg = .rdi }, .{ .reg = .r8 });
+    try e.mov(.qword, .{ .mem = .at(.rdi, 0) }, .{ .reg = .rdi });
+    try e.mov(.qword, .{ .reg = .rsi }, .{ .reg = .rdi });
+    try e.mov(.dword, .{ .reg = .rdi }, .{ .imm = 0x1002 }); // ARCH_SET_FS
+    try e.mov(.dword, .{ .reg = .rax }, .{ .imm = @backingInt(std.os.linux.SYS.arch_prctl) });
+    try e.syscall();
+    // Initial values, then writes read back through new lookups.
+    try e.leaThreadLocal(.rax, a);
+    try e.alu(.cmp, .dword, .{ .mem = .at(.rax, 0) }, .{ .imm = 0x11223344 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.mov(.dword, .{ .mem = .at(.rax, 0) }, .{ .imm = 0x55 });
+    try e.leaThreadLocal(.rbx, c);
+    try e.alu(.cmp, .byte, .{ .mem = .at(.rbx, 0) }, .{ .imm = 7 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.alu(.add, .byte, .{ .mem = .at(.rbx, 0) }, .{ .imm = 1 });
+    try e.leaThreadLocal(.r12, b);
+    try e.alu(.cmp, .qword, .{ .mem = .at(.r12, 0) }, .{ .imm = 0 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.mov(.qword, .{ .mem = .at(.r12, 0) }, .{ .imm = -2 });
+    try e.leaThreadLocal(.rdx, d);
+    try e.alu(.cmp, .dword, .{ .mem = .at(.rdx, 0) }, .{ .imm = 0 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.mov(.dword, .{ .mem = .at(.rdx, 0) }, .{ .imm = 9 });
+    // Each thread-local's own block address, aligned as declared.
+    try e.@"test"(.byte, .{ .reg = .rbx }, .{ .imm = 15 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.@"test"(.byte, .{ .reg = .rdx }, .{ .imm = 31 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.leaThreadLocal(.rax, a);
+    try e.alu(.cmp, .dword, .{ .mem = .at(.rax, 0) }, .{ .imm = 0x55 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.leaThreadLocal(.rax, c);
+    try e.alu(.cmp, .byte, .{ .mem = .at(.rax, 0) }, .{ .imm = 8 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.leaThreadLocal(.rax, b);
+    try e.alu(.cmp, .qword, .{ .mem = .at(.rax, 0) }, .{ .imm = -2 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.leaThreadLocal(.rax, d);
+    try e.alu(.cmp, .dword, .{ .mem = .at(.rax, 0) }, .{ .imm = 9 });
+    try e.jcc(.ne, .{ .label = fail });
+    // The writes went to the thread's copy, not the initialization image.
+    try e.movAbsSym(.rax, a, 0);
+    try e.alu(.cmp, .dword, .{ .mem = .at(.rax, 0) }, .{ .imm = 0x11223344 });
+    try e.jcc(.ne, .{ .label = fail });
+    try e.mov(.dword, .{ .reg = .rdi }, .{ .imm = 42 });
+    try e.mov(.dword, .{ .reg = .rax }, .{ .imm = 60 });
+    try e.syscall();
+    e.bind(fail);
+    try e.mov(.dword, .{ .reg = .rdi }, .{ .imm = 1 });
+    try e.mov(.dword, .{ .reg = .rax }, .{ .imm = 60 });
+    try e.syscall();
+    e.finish();
+
+    const atoms = [_]Atom{
+        .{ .key = start, .name = "_start", .section = .text, .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items },
+        .{ .key = a, .name = "a", .section = .tdata, .alignment = .@"4", .bytes = &.{ 0x44, 0x33, 0x22, 0x11 } },
+        .{ .key = b, .name = "b", .section = .tbss, .alignment = .@"8", .zero_fill = 8 },
+        .{ .key = c, .name = "c", .section = .tdata, .alignment = .@"16", .bytes = &.{7} },
+        .{ .key = d, .name = "d", .section = .tbss, .alignment = .@"32", .zero_fill = 4 },
+        .{ .key = .fromName("counter"), .name = "counter", .section = .data, .alignment = .@"8", .bytes = &@as([8]u8, @splat(0xab)) },
+        .{ .key = area, .name = "tls_area", .section = .bss, .alignment = .@"64", .zero_fill = 4096 },
+    };
+    const bytes = try emit(gpa, io, &atoms, .{ .entry = start });
+    defer gpa.free(bytes);
+
+    // PT_TLS: .tdata is a (0..4) and c (16..17); .tbss, aligned to 32, is
+    // b (32..40) and d (64..68), so filesz 17, memsz 68, align 32, and the
+    // thread pointer is 96 bytes past the segment's start. Symbols' values
+    // are their offsets in the segment.
+    const ehdr = std.mem.bytesAsValue(elf.Elf64.Ehdr, bytes[0..@sizeOf(elf.Elf64.Ehdr)]);
+    const phdrs = std.mem.bytesAsSlice(elf.Elf64.Phdr, bytes[ehdr.phoff..][0 .. ehdr.phnum * @sizeOf(elf.Elf64.Phdr)]);
+    var tls: ?elf.Elf64.Phdr = null;
+    var rw: ?elf.Elf64.Phdr = null;
+    for (phdrs) |ph| {
+        if (ph.type == .TLS) tls = ph;
+        if (ph.type == .LOAD and ph.flags.W) rw = ph;
+    }
+    try std.testing.expectEqual(17, tls.?.filesz);
+    try std.testing.expectEqual(68, tls.?.memsz);
+    try std.testing.expectEqual(32, tls.?.@"align");
+    try std.testing.expectEqual(rw.?.vaddr, tls.?.vaddr);
+    try std.testing.expectEqual(0, tls.?.vaddr % 32);
+    try std.testing.expectEqualSlices(u8, &([_]u8{ 0x44, 0x33, 0x22, 0x11 } ++ @as([12]u8, @splat(0)) ++ [_]u8{7}), bytes[tls.?.offset..][0..17]);
+    for ([_][]const u8{ "a", "c", "b", "d" }, [_]u64{ 0, 16, 32, 64 }) |name, offset| {
+        try std.testing.expectEqual(offset, testSymbolAddr(bytes, name).?);
+    }
+    // The first lea's displacement: a's offset minus 96.
+    const lea_a = std.mem.indexOf(u8, e.code.items, &.{ 0x48, 0x8d, 0x80 }).? + 3;
+    const text_off = ehdr.entry - @as(u64, @intCast(base));
+    try std.testing.expectEqual(-96, std.mem.readInt(i32, bytes[text_off + lea_a ..][0..4], .little));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try link(gpa, io, tmp.dir, "tls", &atoms, .{ .entry = start });
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/tls", .{tmp.sub_path});
+    defer gpa.free(path);
+    const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, result.term);
+
+    // A TLS relocation to a symbol that is not thread-local.
+    var diag: Diagnostic = .{};
+    var bad = atoms;
+    var be: Encoder = .init(arena);
+    try be.leaThreadLocal(.rax, area);
+    be.finish();
+    bad[0] = .{ .key = start, .name = "_start", .section = .text, .bytes = be.code.items, .targets = be.refs.targets.keys(), .relocs = be.refs.relocs.items };
+    try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &bad, .{ .entry = start, .diag = &diag }));
+    try std.testing.expectEqual(area, diag.target.?);
 }
 
 test "links many chunks of atoms the same way on any number of threads" {

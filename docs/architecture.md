@@ -220,7 +220,11 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   values: an integer of 1, 2, 4, or 8 bytes that the whole compilation
   assigns to the target key, such as an error code, passed to the linker
   rather than stored in any Atom. x86_64 addresses: absolute 64-bit,
-  PC-relative 32-bit. aarch64 addresses: absolute 64-bit (data only; Mach-O
+  PC-relative 32-bit, and TPOFF32, a thread-local's offset from the
+  thread pointer (local-exec; `Encoder.leaThreadLocal` emits upstream's
+  `mov r, fs:0; lea r, [r + sym@tpoff]`). New kinds are appended, since
+  the cache stores kinds by number. Sections: text, rodata, data, bss,
+  and thread-local tdata and tbss. aarch64 addresses: absolute 64-bit (data only; Mach-O
   turns it into a fixup), branch26 (b, bl), page21 (adrp) with pageoff12
   (add, or a load or store whose access size the linker reads from the
   instruction), and their GOT forms, which reach an import's GOT slot and
@@ -261,8 +265,18 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   ms, into fresh anonymous memory 10 ms. Mach-O keeps replacing, since
   macOS kills signed binaries modified in place. Segments: R (headers,
   .rodata, and with debug info .eh_frame and .eh_frame_hdr), RX (.text),
-  RW (.data, .bss). TLS will add .tdata and .tbss at the start of RW with
-  a PT_TLS header.
+  RW (.tdata, .tbss, .data, .bss). Thread-locals start RW, covered by
+  PT_TLS (filesz the .tdata bytes, memsz through .tbss, align the larger
+  section alignment), which std.os.linux.tls.initStatic copies each
+  thread's block from; .tbss takes room in the image (zeros in the file)
+  so no other section overlaps the TLS segment's addresses. TPOFF32
+  resolves to S + A - (TLS start + memsz rounded up to the alignment),
+  x86_64 variant 2, and TLS symbols' values are segment offsets. A
+  hand-built program with .tdata and .tbss variables of mixed alignments,
+  doing initStatic's setup itself, reads and writes them correctly; ld
+  -static on the same variables produces the same PT_TLS, symbol values,
+  and TP offsets. The section headers stay in address order, and outputs
+  without thread-locals are byte-identical to before.
 - Phases, each split into tasks over a thread pool: insert every key into a
   symbol table partitioned by the key's top bits (one thread per partition,
   first occurrence in input order wins); lay out chunks of 2048 atoms

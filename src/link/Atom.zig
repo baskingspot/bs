@@ -17,15 +17,15 @@ key: SymbolKey,
 name: []const u8,
 section: Section,
 alignment: std.mem.Alignment = .@"1",
-/// Machine code or initialized data. Must be empty for `.bss`.
+/// Machine code or initialized data. Must be empty for `.bss` and `.tbss`.
 bytes: []const u8 = &.{},
-/// Size of a `.bss` atom. Must be 0 for other sections.
+/// Size of a `.bss` or `.tbss` atom. Must be 0 for other sections.
 zero_fill: u64 = 0,
 /// The distinct symbols (or link-time values) this atom references, each
 /// once. Relocations refer to them by index, which keeps relocation records
 /// small and lets the linker resolve each key once per atom.
 targets: []const SymbolKey = &.{},
-/// Sorted by offset. Must be empty for `.bss`.
+/// Sorted by offset. Must be empty for `.bss` and `.tbss`.
 relocs: []const Reloc = &.{},
 /// 128-bit stable identity of a symbol. Derived from the unit key for
 /// declarations (`fromName`) and from the contents for anonymous constants
@@ -67,13 +67,25 @@ pub const SymbolKey = enum(u128) {
     const hash_key: [Hasher.key_length]u8 = "zap symbol key!!".*;
 };
 
-/// Where an atom is placed. Thread-local `.tdata`/`.tbss` will be added
-/// here; see the TLS note in `Elf.zig`.
+/// Where an atom is placed.
 pub const Section = enum(u8) {
     text,
     rodata,
     data,
     bss,
+    /// Thread-local variables, initialized from `bytes` (`.tdata`) or
+    /// zeroed (`.tbss`). Every thread gets its own copy; code reaches it
+    /// relative to the thread pointer (`x86_64_tpoff32`).
+    tdata,
+    tbss,
+
+    /// Whether atoms in the section are zero-filled, with no `bytes`.
+    pub fn isZeroFill(s: Section) bool {
+        // A shift and a test: cheaper in the linkers' per-atom loops than
+        // two compares.
+        const mask: u64 = 1 << @backingInt(Section.bss) | 1 << @backingInt(Section.tbss);
+        return mask >> @intCast(@backingInt(s) & 63) & 1 != 0;
+    }
 };
 
 /// 12 bytes: relocation records are about as numerous as instructions that
@@ -138,6 +150,15 @@ pub const Reloc = extern struct {
         /// 0. If S is defined in the image, the linker points the pair at S
         /// itself and turns the ldr into an add.
         aarch64_got_load_pageoff12,
+        /// x86_64 again, after the kinds above so their numbers, which
+        /// the cache stores, stay put.
+        ///
+        /// 32-bit signed offset of a thread-local symbol from the thread
+        /// pointer (fs), local-exec model: S + A - TLS end, where the TLS
+        /// end is the start of the TLS segment plus its memory size rounded
+        /// up to its alignment (ELF R_X86_64_TPOFF32, x86_64 TLS variant
+        /// 2). S must be in `.tdata` or `.tbss`.
+        x86_64_tpoff32,
     };
 };
 
@@ -305,7 +326,7 @@ comptime {
 }
 
 pub fn size(a: *const Atom) u64 {
-    return if (a.section == .bss) a.zero_fill else a.bytes.len;
+    return if (a.section.isZeroFill()) a.zero_fill else a.bytes.len;
 }
 
 test "content keys distinguish relocation targets" {
