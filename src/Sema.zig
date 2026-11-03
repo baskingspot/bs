@@ -12474,7 +12474,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
 /// a comptime_int at a run-time index; only `@intCast` takes it.
 fn runtimeElemAccess(sema: *Sema, block: *Block, src: Src, elem_ty: Index) CompileError!void {
     if (sema.bc != null and elem_ty == .comptime_int_type) return;
-    if (Type.isComptimeOnly(sema.ip, elem_ty))
+    if (try sema.isComptimeOnlyResolved(block, src, elem_ty))
         return sema.fail(block, src, "values of type '{f}' must be comptime-known, but index value is runtime-known", .{sema.fmtType(elem_ty)});
 }
 
