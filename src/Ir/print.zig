@@ -153,7 +153,7 @@ const Printer = struct {
             .panic => {
                 try w.print("{s}", .{@tagName(data.panic.id)});
                 switch (data.panic.id) {
-                    .out_of_bounds, .start_greater_than_end, .unwrap_error => {
+                    .out_of_bounds, .start_greater_than_end, .unwrap_error, .explicit => {
                         const bin = ir.extraData(Ir.Bin, data.panic.payload).data;
                         try w.writeAll(", ");
                         try p.ref(bin.lhs);

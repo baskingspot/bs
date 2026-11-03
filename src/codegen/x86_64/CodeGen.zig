@@ -1208,7 +1208,30 @@ fn panic(cg: *CodeGen, id: Ir.PanicId, payload: u32) Error!void {
                 try cg.panicWriteStr("\n");
             } else try cg.panicWriteStr("panic: sentinel mismatch\n");
         },
-        .unwrap_error => return cg.fail("panics that print error names", .{}),
+        .unwrap_error => {
+            const bin = cg.ir.extraData(Ir.Bin, payload).data;
+            try cg.panicWriteStr("panic: attempt to unwrap error: ");
+            // The error's name from the table `error_name` reads.
+            cg.emit.uses_error_names = true;
+            try cg.load(.rax, bin.lhs);
+            try cg.e.movzx(.dword, .rax, .word, .{ .reg = .rax });
+            try cg.e.shift(.shl, .qword, .{ .reg = .rax }, 4);
+            try cg.e.lea(.qword, .rcx, Mem.sym(Emit.error_name_table, 0));
+            try cg.e.alu(.add, .qword, .{ .reg = .rcx }, .{ .reg = .rax });
+            try cg.e.mov(.qword, .{ .reg = .rdi }, .{ .mem = Mem.at(.rcx, 0) });
+            try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .mem = Mem.at(.rcx, 8) });
+            try cg.e.call(.{ .sym = .fromName(panic_write) });
+            try cg.panicWriteStr("\n");
+        },
+        .explicit => {
+            const bin = cg.ir.extraData(Ir.Bin, payload).data;
+            try cg.panicWriteStr("panic: ");
+            const m = try cg.memOf(bin.lhs);
+            try cg.e.mov(.qword, .{ .reg = .rdi }, .{ .mem = m });
+            try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .mem = offsetMem(m, 8) });
+            try cg.e.call(.{ .sym = .fromName(panic_write) });
+            try cg.panicWriteStr("\n");
+        },
         else => {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "panic: {s}\n", .{id.message()}) catch unreachable;

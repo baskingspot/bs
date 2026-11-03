@@ -345,6 +345,8 @@ pub const PanicId = enum(u32) {
     unwrap_error,
     /// Formatted with the `Bin` payload: expected, found.
     sentinel_mismatch,
+    /// `@panic(msg)`; payload is `Bin` with `lhs` the `[]const u8` message.
+    explicit,
 
     pub fn message(id: PanicId) []const u8 {
         return switch (id) {
@@ -372,6 +374,7 @@ pub const PanicId = enum(u32) {
             .start_greater_than_end => "start index is larger than end index",
             .unwrap_error => "attempt to unwrap error",
             .sentinel_mismatch => "sentinel mismatch",
+            .explicit => "",
         };
     }
 };

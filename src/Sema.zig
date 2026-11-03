@@ -1246,8 +1246,10 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
             },
             .panic => {
                 const src = block.nodeSrc(data.un_node.src_node);
+                const msg = try sema.coerce(block, .slice_const_u8_type, sema.resolveInst(data.un_node.operand), src);
                 if (block.is_comptime) return sema.fail(block, src, "encountered @panic at comptime", .{});
-                return sema.failUnsupported(block, src, "@panic");
+                try sema.addPanic(block, .explicit, msg, .none);
+                return;
             },
             .compile_error => {
                 const src = block.nodeSrc(data.un_node.src_node);
