@@ -7462,8 +7462,19 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
             if (sema.resolveValue(index) == null) return sema.fail(block, src, "vector index not comptime known", .{});
             try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, v.len)), false);
             // Bool vectors are bit-packed; other vectors are laid out like arrays.
-            if (v.child == .bool_type and !(sema.resolveValue(ptr) != null and sema.resolveValue(index) != null))
-                return sema.failUnsupported(block, src, "runtime pointers to elements of bool vectors");
+            if (v.child == .bool_type and sema.resolveValue(ptr) == null) {
+                // A bit pointer into the vector's bytes, at its address.
+                try sema.requireRuntime(block, src);
+                const result_ty = try sema.ptrType(.{
+                    .child = .bool_type,
+                    .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .alignment = if (p.flags.alignment != 0) p.flags.alignment else @intCast(std.math.log2_int(u64, Type.abiAlignment(ip, child)) + 1) },
+                    .packed_offset = .{
+                        .host_size = @intCast(Type.abiSize(ip, child)),
+                        .bit_offset = @intCast(ip.intValue(u64, sema.resolveValue(index).?).?),
+                    },
+                });
+                return sema.addTyOp(block, .bitcast, result_ty, ptr);
+            }
             return sema.elemPtrOfArrayPtr(block, src, ptr, index);
         },
         .ptr_type => |cp| switch (cp.flags.size) {
