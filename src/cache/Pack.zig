@@ -4,8 +4,9 @@
 //! reading the records in place (`LinkAtoms`); which records are live is recorded in the manifest as
 //! `AtomRef`s. Old records stay where they are, so a manifest written
 //! before an append still describes the pack; when dead records outgrow
-//! live ones, `compact` rewrites the pack with only the live records, in
-//! link order, under a new id that the next manifest records.
+//! live ones, `compactOwn` rewrites the pack with only the live records
+//! under a new id that the next manifest records (a lazy build does this
+//! when it folds the manifest's log).
 //!
 //! A pack can also have base packs: global store packs hard-linked into
 //! the compilation's directory (`linkBase`), whose entries hold the Atoms
@@ -99,10 +100,22 @@ pub fn open(io: Io, dir: Io.Dir) !Pack {
 pub fn create(io: Io, dir: Io.Dir) !Pack {
     var header: Header = .{ .id = undefined };
     io.random(std.mem.asBytes(&header.id));
-    try cache.writeReplace(io, dir, sub_path, &.{std.mem.asBytes(&header)});
+    try writeEmpty(io, dir, header.id);
     const file = try dir.openFile(io, sub_path, .{ .mode = .read_write });
     errdefer file.close(io);
     return .{ .file = file, .id = header.id, .len = @sizeOf(Header), .map = try cache.mapOpenFile(io, file, @sizeOf(Header), false) };
+}
+
+/// Replaces the pack in `dir` with an empty one with id `id`, which a
+/// manifest already names.
+pub fn writeEmpty(io: Io, dir: Io.Dir, id: Hash) !void {
+    const header: Header = .{ .id = id };
+    try cache.writeReplace(io, dir, sub_path, &.{std.mem.asBytes(&header)});
+}
+
+/// Whether the pack holds no records of its own.
+pub fn isEmpty(p: *const Pack) bool {
+    return p.len == @sizeOf(Header);
 }
 
 pub fn close(p: *Pack, gpa: Allocator, io: Io) void {
@@ -295,6 +308,20 @@ pub fn liveBytes(refs: []const AtomRef) u64 {
     return n;
 }
 
+/// Whether the pack's own dead records outgrow its live ones among `refs`,
+/// so that `compactOwn` pays off. Base packs are not counted: they are
+/// shared with the store, and rewriting their records here would store
+/// them twice.
+pub fn shouldCompactOwn(p: *const Pack, refs: []const AtomRef) bool {
+    return p.len - @sizeOf(Header) > 2 * ownBytes(refs);
+}
+
+fn ownBytes(refs: []const AtomRef) u64 {
+    var n: u64 = 0;
+    for (refs) |r| n += if (r.pack == 0) r.len else 0;
+    return n;
+}
+
 /// Rewrites the pack with only the records at `refs`, in that order, under
 /// a new id, moving records out of base packs, and updates `refs`. Atoms
 /// decoded before stay valid until `close`. The caller writes a manifest
@@ -302,13 +329,24 @@ pub fn liveBytes(refs: []const AtomRef) u64 {
 /// base packs' links; a manifest left with the old id is ignored, which
 /// costs a rebuild from the global store but never a wrong link.
 pub fn compact(p: *Pack, gpa: Allocator, io: Io, dir: Io.Dir, refs: []AtomRef) !void {
+    return p.rewrite(gpa, io, dir, refs, .all);
+}
+
+/// `compact` for the pack's own records only: refs into base packs and
+/// the base packs stay as they are.
+pub fn compactOwn(p: *Pack, gpa: Allocator, io: Io, dir: Io.Dir, refs: []AtomRef) !void {
+    return p.rewrite(gpa, io, dir, refs, .own);
+}
+
+fn rewrite(p: *Pack, gpa: Allocator, io: Io, dir: Io.Dir, refs: []AtomRef, scope: enum { all, own }) !void {
     var header: Header = .{ .id = undefined };
     io.random(std.mem.asBytes(&header.id));
-    const buf = try gpa.alignedAlloc(u8, .@"16", @sizeOf(Header) + liveBytes(refs));
+    const buf = try gpa.alignedAlloc(u8, .@"16", @sizeOf(Header) + if (scope == .all) liveBytes(refs) else ownBytes(refs));
     defer gpa.free(buf);
     @memcpy(buf[0..@sizeOf(Header)], std.mem.asBytes(&header));
     var off: u64 = @sizeOf(Header);
     for (refs) |*r| {
+        if (scope == .own and r.pack != 0) continue;
         @memcpy(buf[off..][0..r.len], try p.record(r.*));
         r.* = .init(off, r.len);
         off += r.len;
@@ -319,8 +357,10 @@ pub fn compact(p: *Pack, gpa: Allocator, io: Io, dir: Io.Dir, refs: []AtomRef) !
     try p.retired.ensureUnusedCapacity(gpa, 1 + p.bases.items.len);
     const map = try cache.mapOpenFile(io, file, buf.len, false);
     p.retired.appendAssumeCapacity(p.map);
-    p.retired.appendSliceAssumeCapacity(p.bases.items);
-    p.bases.clearRetainingCapacity();
+    if (scope == .all) {
+        p.retired.appendSliceAssumeCapacity(p.bases.items);
+        p.bases.clearRetainingCapacity();
+    }
     p.file.close(io);
     p.* = .{ .file = file, .id = header.id, .len = buf.len, .map = map, .retired = p.retired, .bases = p.bases };
 }
@@ -425,6 +465,21 @@ test "base packs are linked, decoded, and compacted away" {
     try atoms_codec.expectEqualAtoms(atom, d.atom);
     try atoms_codec.expectEqualDebug(&debug, &d.debug.?);
     try std.testing.expectError(error.CorruptAtom, p.decode(.initIn(2, 0, 64), .x86_64));
+
+    // Compacting the pack's own records leaves the base's alone and drops
+    // the two dead own records.
+    var own: [1]AtomRef = undefined;
+    for (0..3) |_| try p.append(gpa, io, &.{atom}, &.{}, &own);
+    var both = [_]AtomRef{ refs[0], own[0] };
+    try std.testing.expect(p.shouldCompactOwn(&both));
+    try p.compactOwn(gpa, io, dir, &both);
+    try std.testing.expectEqual(refs[0], both[0]);
+    try std.testing.expectEqual(AtomRef.init(@sizeOf(Header), own[0].len), both[1]);
+    try std.testing.expectEqual(@sizeOf(Header) + own[0].len, p.len);
+    try std.testing.expectEqual(1, p.bases.items.len);
+    try std.testing.expect(!p.shouldCompactOwn(&both));
+    try atoms_codec.expectEqualAtoms(atom, (try p.decode(both[0], .x86_64)).atom);
+    try atoms_codec.expectEqualAtoms(atom, (try p.decode(both[1], .x86_64)).atom);
 
     // 48 foreign bytes against `len` live ones: not yet worth compacting.
     try std.testing.expect(!p.shouldCompact(liveBytes(&refs)));

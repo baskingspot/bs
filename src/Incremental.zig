@@ -962,6 +962,7 @@ fn finishRecordFallible(inc: *Incremental, linked: bool) !void {
     if (!linked) return r.discard(inc);
     defer r.discard(inc);
     try Manifest.Builder.place(&r.manifest, inc.io, inc.dir);
+    if (r.empty_pack) |id| try Pack.writeEmpty(inc.io, inc.dir, @bitCast(id));
     // Base packs the new manifest does not name.
     var it = inc.dir.iterate();
     while (it.next(inc.io) catch null) |e| {
@@ -1036,17 +1037,30 @@ pub fn finishLazy(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *cons
         return inc.fallBack();
     };
     const t2 = now(io);
-    var folded = false;
+    var folded: enum { no, yes, compacted } = .no;
     if (now_m.shouldFold()) {
         var b: Manifest.Builder = try .initFrom(gpa, &now_m);
         defer b.deinit();
-        try b.write(io, inc.dir, now_m.pack_id);
-        folded = true;
+        // The edits appended their atoms to the pack; the records they
+        // replaced are dead. Rewrite the pack's own records when those
+        // outgrow the live ones, so that the pack stays bounded by the
+        // folds as the log is.
+        const refs = try b.nodeAtomRefs();
+        defer gpa.free(refs);
+        if (r.pack.shouldCompactOwn(refs)) {
+            try r.pack.compactOwn(gpa, io, inc.dir, refs);
+            try b.setAtomRefs(refs);
+            folded = .compacted;
+        } else folded = .yes;
+        try b.write(io, inc.dir, r.pack.id);
     }
-    if (inc.timing) std.debug.print("cache: recorded the edits in {d:.2} ms; linked {d} atoms from the manifest in {d:.2} ms (gathered {d:.2}){s}\n", .{
-        ms(t0, t1), linked.atoms, ms(t1, now(io)), ms(t1, linked.gathered), if (folded) "; folded the log into a new base" else "",
+    if (inc.timing) std.debug.print("cache: recorded the edits in {d:.2} ms; linked {d} atoms from the manifest in {d:.2} ms (gathered {d:.2}){s}; {d:.2} ms in all\n", .{
+        ms(t0, t1), linked.atoms, ms(t1, t2), ms(t1, linked.gathered), switch (folded) {
+            .no => "",
+            .yes => "; folded the log into a new base",
+            .compacted => "; folded the log into a new base and compacted the pack",
+        }, ms(t0, now(io)),
     });
-    _ = t2;
     if (inc.verify == .replay) try inc.verifyReplay();
     return true;
 }
@@ -1595,6 +1609,11 @@ const Recorded = struct {
     manifest: Io.File.Atomic,
     /// The base packs the manifest names.
     base_names: []const []const u8,
+    /// The id of the empty pack the manifest names in place of the
+    /// compilation's pack, if that held records. (Bytes: std.Io.Threaded
+    /// frees an async result aligned past its Future's alignment with the
+    /// wrong alignment.)
+    empty_pack: ?[@sizeOf(Hash)]u8,
     /// For `ZAP_CACHE_TIMING`.
     report: []const u8,
 
@@ -2128,7 +2147,16 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             try b.addUnstattedInput(path_buf.items, content_hash);
     }
     const t4 = now(io);
-    var manifest = try b.writeUnplaced(io, inc.dir, pack.id);
+    // Every atom is in a store pack, so the pack's own records, which
+    // lazy edit builds appended, are all dead: the manifest names a new,
+    // empty pack, which `finishRecord` writes once it is placed.
+    var empty_pack: ?[@sizeOf(Hash)]u8 = null;
+    if (!pack.isEmpty()) {
+        var id: [@sizeOf(Hash)]u8 = undefined;
+        io.random(&id);
+        empty_pack = id;
+    }
+    var manifest = try b.writeUnplaced(io, inc.dir, if (empty_pack) |id| @bitCast(id) else pack.id);
     errdefer manifest.deinit(io);
     const t5 = now(io);
     const committed = try committing.await(io);
@@ -2152,7 +2180,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         (enc.words.items.len + result_words.items.len) * 4 / 1024, ms(t2, t5),           ms(t2, t3),            ms(t3, t4),          ms(t4, t5),
         ms(t5, t6),
     });
-    return .{ .manifest = manifest, .base_names = names, .report = report };
+    return .{ .manifest = manifest, .base_names = names, .empty_pack = empty_pack, .report = report };
 }
 
 const Encoded = struct {

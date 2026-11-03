@@ -1911,8 +1911,11 @@ granularity.
     it. (Go's one file per entry was measured and rejected, below.)
   - The project's local cache holds the manifest and a pack: one file with
     every Atom the last build linked. A rebuild maps the pack, appends the
-    Atoms it regenerated, and links from it, so the link reads one file. The
-    pack is compacted when its dead space grows past its live size.
+    Atoms it regenerated, and links from it, so the link reads one file.
+    When a lazy build folds the manifest's log, it rewrites the pack's own
+    records if their dead bytes exceed the live ones (`compactOwn`); a full
+    or eager build, whose atoms are all in store packs, names a new empty
+    pack.
   - Measured on the orb (2026-11-02, warm page cache): reading 30k 2 KB files
     took 70–84 ms; mapping and touching one 60 MB file took 2–3 ms. One file
     per entry is fine for occasional lookups and too slow for every link.
@@ -2033,9 +2036,16 @@ compilation (see "Integration" below).
   starts over without the cache), and `atom(i)` and `debug(j)` return
   values built by `atoms.view`. `compact`
   moves the live records, from every pack, into a new own pack in link
-  order when dead bytes (unreferenced records, and the base packs' other
-  entries, headers, and dependencies) exceed live ones. The manifest names
-  its base packs and the own pack's id.
+  order (`bench_cache` only: copying a big build's store records into the
+  own pack would store them twice). `compactOwn` rewrites only the own
+  pack's live records, in manifest order, and leaves refs into base packs
+  alone; `finishLazy` runs it when it folds the log and the own pack's
+  dead bytes exceed its live ones, then writes the base with the new id.
+  A full or eager build records every atom in store packs, so `record`
+  names a fresh id and `finishRecord` writes the empty pack with it once
+  the manifest is placed. Either way a crash in between leaves a manifest
+  whose pack id does not match, which costs a rebuild from the store, not
+  a wrong link. The manifest names its base packs and the own pack's id.
 - File contents are trusted once their lengths check out: indices inside
   them are not bounds-checked on each access. Records are host-endian (both
   targets are little-endian).
@@ -2769,8 +2779,8 @@ records only what changed, and links from the manifest.
 - Known gaps: `zap test` skips `populateTestFunctions` in a lazy build,
   since the test list is as linked (adding or removing a test falls
   back). Inputs touched without a change are rehashed until the next
-  build that records them. The pack grows with each record until a full
-  or eager build rewrites it (no compaction on fold yet).
+  build that records them. The own pack grows with each record until the
+  log folds, which compacts it when dead records dominate.
 
 **Debug info of green functions.** `src_hash` ignores a declaration's
 line, so lines added above a green function move its `base_line`

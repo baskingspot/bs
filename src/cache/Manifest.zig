@@ -1706,8 +1706,9 @@ pub const Builder = struct {
     }
 
     /// Replaces every live atom reference, given in node order as
-    /// `Manifest.linkInput` lists them, and drops the base packs: for a
-    /// manifest written after `Pack.compact`.
+    /// `Manifest.linkInput` lists them, and drops the base packs if no
+    /// reference names one: for a manifest written after `Pack.compact` or
+    /// `Pack.compactOwn`.
     pub fn setAtomRefs(b: *Builder, refs: []const Pack.AtomRef) !void {
         var i: usize = 0;
         for (b.nodes.items) |n| {
@@ -1716,7 +1717,23 @@ pub const Builder = struct {
             i += n.atoms_len;
         }
         if (i != refs.len) return error.InvalidAtomRefs;
-        b.bases.clearRetainingCapacity();
+        // After `Pack.compact`; `Pack.compactOwn` keeps refs into the bases.
+        for (refs) |r| {
+            if (r.pack != 0) break;
+        } else b.bases.clearRetainingCapacity();
+    }
+
+    /// Every node's atom refs, in node order, for `setAtomRefs`.
+    pub fn nodeAtomRefs(b: *const Builder) ![]Pack.AtomRef {
+        var n: usize = 0;
+        for (b.nodes.items) |nd| n += nd.atoms_len;
+        const refs = try b.gpa.alloc(Pack.AtomRef, n);
+        var i: usize = 0;
+        for (b.nodes.items) |nd| {
+            @memcpy(refs[i..][0..nd.atoms_len], b.atom_refs.items[nd.atoms_start..][0..nd.atoms_len]);
+            i += nd.atoms_len;
+        }
+        return refs;
     }
 
     /// Records an input file and its stat as of `build_start`.
