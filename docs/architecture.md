@@ -3199,12 +3199,12 @@ A thread that finds a unit in progress on another worker waits on the
 word (a futex wait on its value), after registering the wait (below).
 
 **Step 2, inferred error sets.** A caller that needs a callee's resolved
-set calls `ensureFuncIes`, which is a unit claim like the others: done, read the
-set; queued and unclaimed, claim it and analyze the body on this worker
+set calls `ensureFuncIes`, which is a unit claim like the others: done,
+read the set; queued and unclaimed, claim it and analyze the body on this worker
 (today's nested analysis); in progress elsewhere, wait, with the cycle
 check. A body that needs its own set while analyzing itself is the
 recursion case that is a dependency loop today, and stays one (reported
-through the deferred pass below). `ready_irs` goes away. On
+by the serial rerun below). `ready_irs` goes away. On
 binary.zig most bodies are reached this way, so work stealing must not
 assume bodies come from the queue: a nested body's CodeGen runs right
 after its Sema on the worker that claimed it.
@@ -3244,21 +3244,25 @@ serial build would have found after analyzing the unit itself.
   chain cannot dissolve under the walk. Walks are serialized, so of two
   workers closing a cycle exactly one sees it, and the other blocks. A
   deadlock is impossible: a wait that would close a cycle never blocks.
-- *Dependency loops.* Which unit finds a loop, and where, depends on
-  where the cycle was entered, so a loop is never reported where it is
-  found.
-  - The finder fails its requesting unit with `error.DependencyLoopDeferred`
-    instead of a diagnostic. Every unit that fails because of a deferred
-    unit is marked *deferred* too (a failed phase with no errors), and its
-    partial records are dropped: errors, dependencies, atoms, and memo
-    entries made after it.
-  - When the pool drains, the coordinator resets the deferred units to
-    unresolved and re-analyzes them on one thread, entering them in
-    unit-key order. That pass reports the loop as today.
-  - One worker takes the same path, so the diagnostic is the same for
-    every thread count. It may differ from today's serial build, which
-    entered the cycle in discovery order. Loops are compile errors, so
-    the extra pass costs nothing that matters.
+- *Reruns instead of undo.* Nothing can undo a unit inside a build: its
+  nav values, interned items, memo entries and the units that read them
+  stay. (Replay invalidates against the previous build's graph, in a new
+  build.) So where a parallel build's outcome could depend on the
+  schedule, it reruns the whole compilation in process, as `main.compile`
+  already reruns `compileReplaying` on `LazyFallback`. There are two
+  kinds:
+  - *Serial reruns.* A dependency loop, or a body that fails its branch
+    quota while a later caller could still raise it (rule 7). Which unit
+    finds a loop, and where, depends on where the cycle was entered. So a
+    parallel build stops at the first such event and reruns with one Sema
+    thread. With one worker the native stack is the logical stack and the
+    queue order is fixed, so that run reports exactly what a
+    `ZAP_SEMA_THREADS=1` build reports. A one-thread build never needs
+    this rerun. Both cases are compile errors, so their cost does not
+    matter.
+  - *Code reruns.* A unit read a provisional error code at comptime
+    (rule 5). The build reruns with the final codes seeded first, at
+    every thread count, one thread included.
 - *Readers that tolerate work in progress.* `resolveLayoutIfIdle`,
   `resolveStructFields` and `greenNode`'s shortcut follow the same rule.
   Whether they skip must not change the unit's result: the serial build
@@ -3297,7 +3301,15 @@ analysis:
      order.
 
    The manifest and the pack are then byte-identical for every schedule.
-   Step 3 later lets pack placement vary, but never references.
+   Step 3 later lets pack placement vary, but never references. A lazy
+   relink lays out the base's nodes followed by the delta's new ones,
+   not a full build's key order. That is fine for the manifest, which
+   verification matches by key. If lazy relinks must be byte-identical
+   to full builds, `linkInput` can merge the base's key-ordered atom
+   nodes with the log's new nodes by key, a cheap merge of two sorted
+   lists. Rule 1 can land on its own before the rest: the cache thread's
+   donor builds need it, because loading green units instead of
+   analyzing them changes atom order today.
 3. *Dependency records.* `deps`, `conditional_deps`, `func_refs` and
    `effect_uses` become per-worker logs, merged and sorted by unit key.
    A unit's own dependee list keeps the order that unit read them in. That
@@ -3325,21 +3337,32 @@ analysis:
 5. *Error codes and error sets.*
    - *Codes.* The last build's codes are seeded first (`seedErrors`,
      unchanged). A name with no seeded code gets a provisional code when
-     first used. At the serial end, the final assignment keeps the seeded
+     first used. When analysis ends, the final assignment keeps the seeded
      codes and numbers the new names in name order.
-   - *Comptime reads of codes.* A unit that read a provisional code at
+   - *Comptime reads of codes.* A unit that reads a provisional code at
      comptime (`@intFromError` or `@errorFromInt` folding, `error_value`
-     in the evaluator, `anyerror` name reads) records it. If its final
-     code differs, the unit is re-analyzed at the serial point with codes
-     fixed, using the edit-build machinery.
+     in the evaluator, `anyerror` name reads) marks the build. If any
+     final code differs from the provisional one it read, the build makes
+     a code rerun (above). Stage A first counts such units on std and the
+     zig workload. If the evaluator holds error values as codes, every
+     comptime use of an error would count, and reruns would be common:
+     that is the risk to measure before relying on this rule.
+   - *`.err` references.* They still carry codes (`Ref.value` is the
+     code). Edit-verify compares them only because its full-build child
+     seeds from the same manifest, and the rule keeps that true. Only
+     error set types stop reading codes.
    - *Error-set order.* `errorSetType` sorts a set's names by code, so an
      error set type's key, stable hash, layout and `@typeInfo` order all
      follow code order. Step 2 sorts by name bytes instead, so error set
-     types never read codes. Upstream sorts by string index, which is
-     interning order and just as arbitrary. This also removes today's
-     `--edit-verify` sensitivity of error set types to code order.
-     (Open question 3: conformance tests that depend on `@typeInfo`
-     error-set order.)
+     types never read codes. This also removes today's `--edit-verify`
+     sensitivity of error set types to code order. Upstream's order is an
+     interning artifact. For `const E = error{ Zeta, Alpha, Mid }; const
+     F = error{ Mid, Beta };`, upstream's `@typeInfo(…).error_set` gives
+     Alpha Mid Zeta for E and Mid Beta for F, which is neither name order
+     nor code order, and zap today gives Mid Zeta Alpha (code order).
+     Conformance does not depend on it. The lead accepted name order, the
+     location-sorted errors of rule 6, and the one-time change in codes
+     and link order (2026-11-03, pending the owner's approval of stage A).
    - One worker uses the same rules, so the codes of new names change
      once from today's first-use numbering.
 6. *Compile errors.*
@@ -3354,16 +3377,16 @@ analysis:
      it gets the reference-trace frames.
    - Which errors exist does not depend on order: analysis does not stop
      at an error, every referenced unit is analyzed, and loops go through
-     the deferred pass.
+     the serial rerun.
    - `referenced_by` keeps the smallest referrer by unit key (a CAS-min)
      instead of the first one, so reference traces change once.
 7. *`branch_quotas`.* A generic instance's quota is the largest any
    instantiating caller set, which is known only when all of them have
    run. Upstream has the same order dependence (ziglang/zig#22410). A
    body that succeeds under a lower quota gives the same result under a
-   higher one. So only a body that fails with "evaluation exceeded"
-   while its quota can still rise is deferred, to be re-run at the serial
-   point under the final quota.
+   higher one. So only a generic instance that fails with "evaluation
+   exceeded" in a parallel build triggers a serial rerun (above), which
+   reproduces the one-thread outcome.
 8. *Exports, tests and compiler_rt requests.* They become locked
    appends, sorted at the end: exports by declaration key, tests by file
    and source position (`populateTestFunctions` already does this), and
@@ -3425,32 +3448,58 @@ claims. Green checks of independent units then run in parallel.
   - The `deps` stack, with each `Green`'s `deps_start`, becomes per worker.
   - Per-node `state[]` is written under the unit's claim, so it gets a
     release store.
-  - The `visited`, `loaded`, `dead`, `data_refs` and `refresh` bitsets get
-    atomic ORs.
+  - The `loaded`, `dead`, `data_refs` and `refresh` bitsets get atomic
+    ORs.
+  - `visited` is also cleared: when the walk hands a node to analysis it
+    clears the node's bit, so a node that turns out green is walked again.
+    Either the clear stays on the coordinator while no worker can set that
+    bit, or a worker that finishes a handed-over node re-queues the walk
+    itself.
+  - `dependees`, a per-node cache that `greenNode` fills lazily, needs a
+    write-once publish, or is filled when `Replay.create` runs.
   - `unit_nodes`, `input_files`/`file_inputs` and `navs_by_key` are filled
     lazily today. They become concurrent maps, or are filled when
-    `Replay.create` runs.
-  - `decoder`, with its memo and single `miss` slot, `keyer`'s buffers and
-    `stats` become per worker.
+    `Replay.create` runs. `outdated` is fixed after `create`.
+  - The decoder's memo becomes one shared write-once map (item id →
+    Index, set by CAS). Racing writers store the same Index, since
+    interning dedups across tids. Per-worker memos would have every worker
+    decode the shared items (std's types, say) again. Its single `miss`
+    slot, `keyer`'s buffers and `stats` become per worker.
+  - `InternPool.indexOfHash`, which Resolver uses, already takes a mutex
+    and indexes every local. Stage E measures its contention.
   - Resolver loads and type creation take the worker's tid and arena.
   - `greenNode`'s `quota` refs raise `branch_quotas` under its lock.
 - *The walk.* `startWalk`, `walk` and `settle` stay on the coordinator.
   The walk hands outdated nodes to the pool: `ensure` for declarations
-  and layouts, `queueFunc` for bodies. `settle` runs when the pool drains.
+  and layouts, `queueFunc` for bodies. `settle` runs when the pool
+  drains, and with it the lazy Emit work (`lowerNavs`, `link_refs`, and
+  the `ensureNavVal` that `keepsNavData` calls). `recordDelta` and
+  `refreshDebug` append to the pack serially at the end, as now.
 - *Eager replay (4a).* `loadFunc` and `commit` write through
   `emit.owner` into the main Emit after `syncPending`. In step 2 they
   write into the worker's Emit output with its own owner. The key sort
   at `finish` makes their position irrelevant.
 - *Record and verification.* `record` reads frozen Zcu and Emit state
-  after the serial end, and its inputs are sorted (rule 2), so a
-  schedule cannot change the manifest. `--edit-verify` (which matches
-  nodes by key) and `ZAP_CACHE_CHECK` work unchanged. Their known
-  sensitivity to code order (`.err` refs and error set types) goes away
-  with rule 5.
-- *Global first-build reuse* (the cache thread's next step). It looks up
-  a unit in the store when the unit is reached. In step 2 that is the
-  claim, so the lookup runs on the claiming worker. Store reads are
-  read-only, and each worker has its own lookup scratch.
+  after analysis, and its inputs are sorted (rule 2), so a schedule
+  cannot change the manifest. `--edit-verify` (which matches nodes by
+  key) and `ZAP_CACHE_CHECK` work unchanged. Error set types stop
+  depending on code order (rule 5); `.err` refs still carry codes, which
+  the verify child seeds from the same manifest.
+- *Global first-build reuse* (the cache thread's next step, a donor
+  model). Every full record publishes its manifest, whose atoms are all
+  in store packs, to the global cache. A build with no manifest picks a
+  donor (same store seed and lib dir, ranked by builtin match, then by
+  shared inputs) and replays it like an edit build. Its "lookup" is
+  `greenNode` against the donor's graph on the claiming worker, which is
+  stage D, with no extra store reads. Until D, a donor build analyzes on
+  one thread, and a poorly matching donor (a different builtin, say)
+  would lose to a parallel cold build. So either D follows C closely, or
+  in stage C a build skips its donor when the expected coverage (the
+  outdated or seeded share, which the cache exposes) is low.
+- *Lazy fallback.* `LazyFallback` reruns the build eagerly on one thread
+  today, which took 13–15 s on the zig workload. From stage C, with more
+  than one Sema thread, the fallback reruns as a cold parallel build
+  (replay mode off).
 - *Failed builds committing their manifest* (diagnostics step 6). Errors
   are sorted (rule 6), and failed units are always red, so nothing
   changes for step 2.
@@ -3464,9 +3513,9 @@ checks:
 - the ThreadSanitizer build reports nothing with fuzzing on;
 - bench.py cold, cold-local and edit numbers before and after.
 
-A. *Determinism, serially.* Rules 1–8, poison-and-rerun loops, and the
-   serial end (fixpoint over compiler_rt `sync`, deferred loops,
-   provisional codes and quota deferrals), all on one thread.
+A. *Determinism, serially.* Rules 1–8 and code reruns, on one thread.
+   Rule 1 may land first, alone. Count the units that read provisional
+   codes on std and the zig workload before relying on code reruns.
    `ZAP_SCHED_FUZZ` gains a Sema mode that shuffles the function queue
    and the order in which roots are queued. A shuffled serial build
    exposes every order dependence that parallel analysis would, except
@@ -3482,7 +3531,9 @@ C. *Bodies on the pool, cold builds.* Claim words, the wait graph and
    the logical stack, deques with stealing, and Sema followed by CodeGen
    on one worker. Enabled by `ZAP_SEMA_THREADS` (default 1). A build with
    a manifest still analyzes on one thread. The fuzzer adds yields and
-   sleeps at claims, waits and steals. TSan runs over conformance.
+   sleeps at claims, waits and steals. TSan runs over conformance. Serial
+   reruns (loops, quota failures) come with this stage. So does the
+   donor-coverage cut-off and the cold fallback above.
 D. *Replay.* Replay's state as above. Edit builds and lazy loads use the
    pool.
 E. *Default on and tuning.* Shard-lock contention and per-worker lookup
@@ -3512,8 +3563,14 @@ E. *Default on and tuning.* Shard-lock contention and per-worker lookup
 4. (Cache) Are the key-sorted node numbering and delta numbering
    acceptable for the manifest format, and does the claim hook fit
    first-build reuse's lookups?
-5. (Both) Are there more places that read "in progress" as "on my stack"
+5. (Sema) Are there more places that read "in progress" as "on my stack"
    than the six listed under "the logical stack"?
+
+Cache review (2026-11-03) answered question 4: key-ordered numbering is
+acceptable, and donor reuse goes through `greenNode` (above). It also
+replaced in-build re-analysis with whole reruns, added Replay's
+`dependees`, `visited` clears and a shared decoder memo, and set the
+lazy fallback for stage C.
 
 **The completion hook, and recording as units complete.** When a unit's
 result is final (a declaration resolved, a layout resolved, a `comptime`
@@ -3540,10 +3597,10 @@ skipped unit's cached result (see "Edit builds").
 (`analyzeAll`'s comptime declarations, exports and tests) are walked on
 the coordinator, cheaply, though what they reach is claimed like
 anything else. compiler_rt resolution and the file loads it causes
-happen when the pool drains. Also serial: the serial end (the deferred
-dependency loops, units that read provisional error codes, bodies
-deferred for their branch quota), `finish`'s data lowering (5 ms on the
-generated program), emit, the link, and today's `record`.
+happen when the pool drains. Also serial: `finish`'s data lowering (5 ms
+on the generated program), emit, the link, and today's `record`.
+Reruns (loops, quota failures, provisional codes) repeat the whole
+compilation rather than a serial tail.
 
 **Checking it.** `ZAP_THREADS=1` runs everything inline (built for step
 1, where it means CodeGen on the Sema thread). The output
