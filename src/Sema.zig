@@ -8285,7 +8285,14 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                 },
                 .tuple => if (std.mem.eql(u8, name, "len")) return .fromInterned(try sema.intValue(.comptime_int_type, ip.indexToKey(p.child).tuple_type.types.len)) else return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
                 .@"struct", .@"union" => return sema.analyzeLoad(block, src, try sema.fieldPtr(block, src, lhs, name)),
-                .pointer, .type => return sema.fieldVal(block, src, try sema.analyzeLoad(block, src, lhs), name),
+                .pointer => {
+                    // `ptr.len` of a pointer to an array needs only its type.
+                    const cp = Type.ptrInfo(ip, p.child);
+                    if (cp.flags.size == .one and ip.indexToKey(cp.child) == .array_type and std.mem.eql(u8, name, "len"))
+                        return .fromInterned(try sema.intValue(.usize_type, ip.indexToKey(cp.child).array_type.len));
+                    return sema.fieldVal(block, src, try sema.analyzeLoad(block, src, lhs), name);
+                },
+                .type => return sema.fieldVal(block, src, try sema.analyzeLoad(block, src, lhs), name),
                 else => {},
             }
             return sema.fail(block, src, "no member named '{s}' in '{f}'", .{ name, sema.fmtType(p.child) });
@@ -8380,7 +8387,11 @@ fn fieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) Co
     const child = p.child;
     switch (Type.class(ip, child)) {
         .pointer => if (Type.ptrInfo(ip, child).flags.size == .one) {
-            return sema.fieldPtr(block, src, try sema.analyzeLoad(block, src, ptr), name);
+            const inner = try sema.analyzeLoad(block, src, ptr);
+            // `p.ptr` of a pointer to an array is a value, not a place.
+            if (std.mem.eql(u8, name, "ptr") and Type.class(ip, Type.ptrInfo(ip, child).child) == .array)
+                return sema.analyzeRef(block, src, try sema.fieldVal(block, src, inner, name));
+            return sema.fieldPtr(block, src, inner, name);
         } else if (Type.isSlice(ip, child)) {
             const i: u32 = if (std.mem.eql(u8, name, "ptr")) 0 else if (std.mem.eql(u8, name, "len")) 1 else return sema.fail(block, src, "no member named '{s}' in '{f}'", .{ name, sema.fmtType(child) });
             const field_ty = if (i == 0) try sema.elemValueType(child) else .usize_type;
