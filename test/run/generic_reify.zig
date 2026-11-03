@@ -1,9 +1,10 @@
 //! exit: 0
-//! stdout: "1\n4\n1\n8\n11\n1\n1\n8\n8\n7\n1\n1\n123\n124\n"
+//! stdout: "1\n4\n1\n8\n11\n1\n1\n8\n8\n7\n1\n1\n123\n124\n3\n"
 //! Tuple @fieldParentPtr and @offsetOf, comptime calls of generic functions
 //! returning comptime-only types, generic function coercion, comptime
 //! pointer equality, enum literal peers, @Struct field attributes, @Fn, and
-//! the noreturn tag of an empty enum.
+//! the noreturn tag of an empty enum, and a struct in a generic return
+//! type, which is the same type wherever a call instantiates it.
 const rt = @import("rt.zig");
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"
@@ -51,6 +52,19 @@ fn foo3(_: anytype, _: void) void {}
 fn higherOrder(x: anytype, f: fn (@TypeOf(x), void) void) void {
     _ = f(x, {});
 }
+const Air = struct {
+    extra: []const u32,
+    fn extraData(air: Air, comptime T: type, index: usize) struct { data: T, end: usize } {
+        return .{ .data = @intCast(air.extra[index]), .end = index + 1 };
+    }
+};
+const Legalize = struct {
+    air: Air,
+    fn extraData(l: *const Legalize, comptime T: type, index: usize) @TypeOf(Air.extraData(undefined, T, undefined)) {
+        return l.air.extraData(T, index);
+    }
+};
+
 fn main() callconv(.c) noreturn {
     var tuple: struct { u32, u32 } = .{ 1, 2 };
     b(&tuple == @as(@TypeOf(&tuple), @fieldParentPtr("1", &tuple[1])));
@@ -82,6 +96,8 @@ fn main() callconv(.c) noreturn {
     rt.printInt(c1({}, 123));
     const c2: fn (anytype, u32) u32 = foo2;
     rt.printInt(c2({}, 124));
+    const l: Legalize = .{ .air = .{ .extra = &.{ 1, 2, 3 } } };
+    rt.printInt(l.extraData(u16, 1).data + l.extraData(u8, 0).end);
     const bar: fn (anytype, anytype) void = foo3;
     higherOrder(1, bar);
     rt.exit(0);

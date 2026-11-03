@@ -269,6 +269,10 @@ pub const Block = struct {
     is_comptime: bool,
     label: ?*Label = null,
     inlining: ?*Inlining = null,
+    /// The function whose signature (parameter and return types) this
+    /// block evaluates for a call, outside of the call's `inlining`: types
+    /// it makes belong to that function, as upstream, not to the caller.
+    signature: Index = .none,
     /// Absolute AST node that ZIR source offsets in this body are relative to.
     src_base: Ast.Node.Index,
     want_safety: bool = true,
@@ -336,6 +340,7 @@ pub const Block = struct {
             .is_comptime = b.is_comptime,
             .label = null,
             .inlining = b.inlining,
+            .signature = b.signature,
             .src_base = b.src_base,
             .want_safety = b.want_safety,
             .loop = b.loop,
@@ -4591,12 +4596,15 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
         },
         .anon, .dbg_var => {},
     }
-    // Upstream's `type_fqn_ctx`: the function being analyzed or called
-    // inline (an instance of a generic function by its symbol name, see
-    // CodeGen), else the declaration, else the container whose fields are
-    // being resolved, else `<namespace>.comptime`.
+    // Upstream's `type_fqn_ctx`: the function being analyzed (an instance
+    // of a generic function by its symbol name, see CodeGen), called
+    // inline, or whose signature a call evaluates, else the declaration,
+    // else the container whose fields are being resolved, else
+    // `<namespace>.comptime`.
     const parent = if (block.inlining) |inlining|
         ip.stringSlice(ip.getNav(ip.indexToKey(inlining.func).func.owner_nav).fqn)
+    else if (block.signature != .none)
+        ip.stringSlice(ip.getNav(ip.indexToKey(block.signature).func.owner_nav).fqn)
     else if (sema.func != .none) parent: {
         const func = ip.indexToKey(sema.func).func;
         const fqn = ip.stringSlice(ip.getNav(func.owner_nav).fqn);
@@ -4640,6 +4648,8 @@ fn anonTypeKey(sema: *Sema, block: *Block, inst: Zir.Inst.Index, captures: []con
     const w = &aw.writer;
     const nav: InternPool.NavIndex = if (block.inlining) |inlining|
         ip.indexToKey(inlining.func).func.owner_nav
+    else if (block.signature != .none)
+        ip.indexToKey(block.signature).func.owner_nav
     else if (sema.func != .none)
         ip.indexToKey(sema.func).func.owner_nav
     else
@@ -13238,6 +13248,7 @@ fn calleeBlock(sema: *Sema, parent: *Block, func: Index) Block {
         .sema = sema,
         .namespace = nav.namespace,
         .is_comptime = true,
+        .signature = func,
         .src_base = decl.src_node,
         .want_safety = parent.want_safety,
     };
