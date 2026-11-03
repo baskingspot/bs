@@ -442,6 +442,15 @@ pub const Src = struct {
         /// The struct initializer field whose value is at `node`, located as
         /// upstream's `init_elem`: from its `.name` to the value's end.
         init_field: Ast.Node.Offset,
+        /// The field name of the struct init field whose initializer is at
+        /// `node` (upstream's `init_field_name`).
+        init_name: Ast.Node.Offset,
+        /// The type of the variable declared at `node`, or its name if it
+        /// has no type (upstream's `node_offset_var_decl_ty`).
+        var_ty: Ast.Node.Offset,
+        /// The `align` expression of the declaration at `node` (upstream's
+        /// `node_offset_var_decl_align` and `func_decl_align`).
+        decl_align: Ast.Node.Offset,
         /// The operand of a `return`.
         return_operand: Ast.Node.Offset,
         /// The element type of an array or pointer type.
@@ -516,6 +525,20 @@ pub const Src = struct {
                 const node = off.toAbsolute(src.base);
                 return tree.tokensToSpan(tree.firstToken(node) - 3, tree.lastToken(node), tree.nodeMainToken(node) - 2);
             },
+            .init_name => |off| return tree.tokenToSpan(tree.firstToken(off.toAbsolute(src.base)) - 2),
+            .var_ty => |off| {
+                const node = off.toAbsolute(src.base);
+                const v = tree.fullVarDecl(node) orelse return tree.nodeToSpan(node);
+                if (v.ast.type_node.unwrap()) |t| return tree.nodeToSpan(t);
+                return tree.tokenToSpan(v.ast.mut_token + 1);
+            },
+            .decl_align => |off| {
+                const node = off.toAbsolute(src.base);
+                if (tree.fullVarDecl(node)) |v| if (v.ast.align_node.unwrap()) |a| return tree.nodeToSpan(a);
+                var buf: [1]Ast.Node.Index = undefined;
+                if (tree.fullFnProto(&buf, node)) |f| if (f.ast.align_expr.unwrap()) |a| return tree.nodeToSpan(a);
+                return tree.nodeToSpan(node);
+            },
             .store_ptr => |off| {
                 const node = off.toAbsolute(src.base);
                 return tree.nodeToSpan(switch (tree.nodeTag(node)) {
@@ -559,7 +582,7 @@ pub const Src = struct {
             .operand => |o| {
                 const node = o.node.toAbsolute(src.base);
                 switch (tree.nodeTag(node)) {
-                    .negation, .negation_wrap, .bit_not, .bool_not => return tree.nodeToSpan(tree.nodeData(node).node),
+                    .negation, .negation_wrap, .bit_not, .bool_not, .@"try" => return tree.nodeToSpan(tree.nodeData(node).node),
                     // An `if`'s or `while`'s condition.
                     .if_simple, .@"if" => return tree.nodeToSpan(tree.fullIf(node).?.ast.cond_expr),
                     .while_simple, .while_cont, .@"while" => return tree.nodeToSpan(tree.fullWhile(node).?.ast.cond_expr),
@@ -673,8 +696,15 @@ pub const Src = struct {
     /// errors about the name point, as upstream. Resolved only when
     /// rendered.
     fn fieldName(src: Src) Src {
+        if (src.loc == .init_field) return .{ .base = src.base, .loc = .{ .init_name = src.loc.init_field } };
         const off = src.nodeOffset() orelse return src;
         return .{ .base = src.base, .loc = .{ .field_name = off } };
+    }
+
+    /// The type, or else the name, of the variable declared at `src`.
+    fn varTy(src: Src) Src {
+        const off = src.nodeOffset() orelse return src;
+        return .{ .base = src.base, .loc = .{ .var_ty = off } };
     }
 
     /// The function expression of the call at `src`. Resolved only when
@@ -846,7 +876,7 @@ fn navTypePhase(sema: *Sema, block: *Block, src: Src, nav: *InternPool.Nav, decl
     if (decl.align_body) |body| {
         const a_ref = try sema.coerce(block, .u32_type, try sema.resolveInlineBody(block, body, nav.zir_inst), src);
         const a = sema.ip.intValue(u64, try sema.resolveConstValue(block, src, a_ref, "alignment must be comptime-known")).?;
-        if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
+        if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, .{ .base = src.base, .loc = .{ .decl_align = .zero } }, "alignment value '{d}' is not a power of two", .{a});
         nav.alignment = a;
     }
     if (decl_ty != .none) nav.ty = decl_ty;
@@ -3981,7 +4011,14 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .atomic_rmw => sema.zirAtomicRmw(block, inst),
         .ret_is_non_err, .is_non_err => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
-            break :blk sema.analyzeIsNonErr(block, src, sema.resolveInst(data.un_node.operand));
+            const operand = sema.resolveInst(data.un_node.operand);
+            // As upstream's `checkErrorType`; a return's operand is not
+            // checked.
+            if (tag == .is_non_err) switch (Type.class(sema.ip, sema.typeOf(operand))) {
+                .error_set, .error_union, .undefined => {},
+                else => return sema.fail(block, src, "expected error union type, found '{f}'", .{sema.fmtType(sema.typeOf(operand))}),
+            };
+            break :blk sema.analyzeIsNonErr(block, src, operand);
         },
         .is_non_err_ptr => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
@@ -4138,18 +4175,21 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const ty = sema.unwrapOptEu(try sema.resolveType(block, src, extra.container_type));
             const key: NameKey = .{ .file = sema.file, .name = extra.name_start, .ty = ty, .kind = .field_type };
             if (sema.nameCacheGet(key)) |v| break :blk .fromInterned(@fromBackingInt(v));
-            const ft = try sema.fieldTypeByName(block, src, ty, sema.zirString(extra.name_start));
+            // Errors about the name point at it, as upstream.
+            const name_src: Src = .{ .base = src.base, .loc = .{ .init_name = data.pl_node.src_node } };
+            const ft = try sema.fieldTypeByName(block, name_src, ty, sema.zirString(extra.name_start));
             try sema.nameCachePut(key, @backingInt(ft));
             break :blk .fromInterned(ft);
         },
         .struct_init_field_ptr => blk: {
             const extra = sema.code.extraData(Zir.Inst.Field, data.pl_node.payload_index).data;
-            const src = block.nodeSrc(data.pl_node.src_node);
+            // The field's initializer; errors about the name point at it.
+            const src: Src = .{ .base = block.src_base, .loc = .{ .init_field = data.pl_node.src_node } };
             const ptr = sema.resolveInst(extra.lhs);
             const name = sema.zirString(extra.field_name_start);
             const child = Type.ptrInfo(sema.ip, sema.typeOf(ptr)).child;
             if (sema.ip.keyTag(child) == .union_type) {
-                break :blk sema.unionFieldPtr(block, src, ptr, try sema.unionFieldIndex(block, src, child, name), true);
+                break :blk sema.unionFieldPtr(block, src, ptr, try sema.unionFieldIndex(block, src.fieldName(), child, name), true);
             }
             break :blk sema.fieldPtr(block, src, ptr, name);
         },
@@ -5469,6 +5509,13 @@ fn ptrFromInt(sema: *Sema, block: *Block, src: Src, ty: Index, uncasted: Ref) Co
 fn castDestType(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref, remove_opt: bool) CompileError!Index {
     const ip = sema.ip;
     var ty = try sema.resolveType(block, src, ref);
+    if (ty == .generic_poison_type) {
+        // As upstream, named by the builtin: the call's main token.
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        const rest = tree.source[src.span(tree).main..];
+        const name = rest[0 .. std.mem.indexOfScalar(u8, rest, '(') orelse 0];
+        return sema.fail(block, src, "{s} must have a known result type", .{name});
+    }
     if (ip.keyTag(ty) == .error_union_type) ty = ip.keyPayload(.error_union_type, ty).payload_type;
     if (remove_opt and ip.keyTag(ty) == .opt_type) ty = ip.keyPayload(.opt_type, ty);
     return ty;
@@ -5895,13 +5942,13 @@ fn bitOffsetOf(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.Bin) Compil
     try sema.resolveLayout(block, src, ty);
     switch (ip.indexToKey(ty)) {
         .struct_type => {
-            const i = try sema.structFieldIndex(block, src, ty, name);
+            const i = try sema.structFieldIndex(block, sema.callArgSrc(src, false, 1), ty, name);
             if (ip.structInfo(ty).fieldIsComptime(i)) return sema.fail(block, src, "no offset available for comptime field", .{});
             if (Type.isPacked(ip, ty)) return Type.packedFieldBitOffset(ip, ty, i);
             return Type.fieldOffset(ip, ty, i) * 8;
         },
         .tuple_type => |t| {
-            const i = try sema.structFieldIndex(block, src, ty, name);
+            const i = try sema.structFieldIndex(block, sema.callArgSrc(src, false, 1), ty, name);
             if (t.values[i] != .none) return sema.fail(block, src, "no offset available for comptime field", .{});
             return Type.fieldOffset(ip, ty, i) * 8;
         },
@@ -5931,9 +5978,9 @@ fn fieldParentPtr(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.FieldPar
     const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.field_name));
     try sema.resolveLayout(block, src, parent_ty);
     const field_index: u32 = switch (ip.keyTag(parent_ty)) {
-        .struct_type => try sema.structFieldIndex(block, src, parent_ty, name),
-        .union_type => try sema.unionFieldIndex(block, src, parent_ty, name),
-        .tuple_type => try sema.structFieldIndex(block, src, parent_ty, name),
+        .struct_type => try sema.structFieldIndex(block, sema.callArgSrc(src, false, 0), parent_ty, name),
+        .union_type => try sema.unionFieldIndex(block, sema.callArgSrc(src, false, 0), parent_ty, name),
+        .tuple_type => try sema.structFieldIndex(block, sema.callArgSrc(src, false, 0), parent_ty, name),
         else => return sema.fail(block, src, "expected struct or union type, found '{f}'", .{sema.fmtType(parent_ty)}),
     };
     const field_ptr = sema.resolveInst(extra.field_ptr);
@@ -8671,7 +8718,7 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
                     const ok = try sema.addBinOp(block, .cmp_neq, rhs, zero);
                     try sema.addSafetyCheck(block, ok, .divide_by_zero, .none, .none);
                 } else if (sema.intSign(rv.?) == 0) {
-                    return sema.fail(block, src, "division by zero here causes illegal behavior", .{});
+                    return sema.fail(block, src.operandSrc(1), "division by zero here causes illegal behavior", .{});
                 }
                 const is_div = tag == .div_trunc or tag == .div_floor or tag == .div_ceil or tag == .div_exact;
                 if (signed and is_div) {
@@ -8842,7 +8889,7 @@ fn foldArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, ty: I
         .min => return if (a.order(b) == .gt) rv else lv,
         .max => return if (a.order(b) == .lt) rv else lv,
         .div, .div_trunc, .div_floor, .div_ceil, .div_exact, .rem, .mod, .mod_rem => {
-            if (b.eqlZero()) return sema.fail(block, src, "division by zero here causes illegal behavior", .{});
+            if (b.eqlZero()) return sema.fail(block, src.operandSrc(1), "division by zero here causes illegal behavior", .{});
             var q = try BigInt.init(sema.arena);
             var rem = try BigInt.init(sema.arena);
             switch (tag) {
@@ -8911,7 +8958,7 @@ fn analyzeShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, lhs: Re
         if (sema.intSign(v) < 0) return sema.fail(block, src, "shift by negative amount '{f}'", .{sema.fmtValue(v)});
         const amount = sema.ip.intValue(u64, v) orelse std.math.maxInt(u64);
         if (!sat and class == .int and amount > 0 and amount >= Type.intInfo(ip, ty).bits)
-            return sema.fail(block, src, "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
+            return sema.fail(block, src.operandSrc(1), "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
     }
     if (sema.resolveValue(lhs)) |lv| if (rv) |v| {
         if (sema.isUndef(lv)) {
@@ -9136,7 +9183,7 @@ fn analyzeShlWithOverflow(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncast
     const tuple_ty = try sema.overflowTupleType(ty);
     const rv = sema.resolveValue(rhs);
     if (rv) |v| if (!sema.isUndef(v) and ip.intValue(u64, v).? > 0 and ip.intValue(u64, v).? >= info.bits)
-        return sema.fail(block, src, "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
+        return sema.fail(block, src.operandSrc(1), "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
     if (sema.resolveValue(lhs)) |lv| if (rv) |v| {
         try sema.failUndefOperand(block, src, lv, v);
         const a = try sema.bigValue(lv);
@@ -9343,7 +9390,7 @@ fn analyzeFloatArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Ta
     if (lv != null and rv != null) {
         const a = lv.?;
         const b = rv.?;
-        if (!allow_div_zero and sema.isFloatZero(b)) return sema.fail(block, src, "division by zero here causes illegal behavior", .{});
+        if (!allow_div_zero and sema.isFloatZero(b)) return sema.fail(block, src.operandSrc(1), "division by zero here causes illegal behavior", .{});
         if (sema.isUndef(a) or sema.isUndef(b)) {
             if (can_be_ib) try sema.failUndefOperand(block, src, a, b);
             return .fromInterned(try sema.undefValue(ty));
@@ -9358,7 +9405,7 @@ fn analyzeFloatArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Ta
             if (can_be_ib) return sema.fail(block, src.operandSrc(@intCast(i)), "use of undefined value here causes illegal behavior", .{});
             return .fromInterned(try sema.undefValue(ty));
         }
-        if (i == 1 and !allow_div_zero and sema.isFloatZero(v)) return sema.fail(block, src, "division by zero here causes illegal behavior", .{});
+        if (i == 1 and !allow_div_zero and sema.isFloatZero(v)) return sema.fail(block, src.operandSrc(1), "division by zero here causes illegal behavior", .{});
     }
     try sema.requireRuntime(block, src);
     if (ty == .comptime_float_type) return sema.fail(block, src, "unable to resolve comptime value", .{});
@@ -9449,11 +9496,11 @@ fn analyzeMinMax(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operan
     const ip = sema.ip;
     const first_ty = sema.typeOf(operands[0]);
     const vector_len = sema.vectorLen(first_ty);
-    for (operands) |o| {
+    for (operands, 0..) |o, i| {
         const ty = sema.typeOf(o);
         const c = Type.class(ip, Type.scalarType(ip, ty));
         if (c != .int and c != .comptime_int and c != .float and c != .comptime_float)
-            return sema.fail(block, src, "expected number, found '{f}'", .{sema.fmtType(ty)});
+            return sema.fail(block, sema.callArgSrc(src, false, i), "expected number, found '{f}'", .{sema.fmtType(ty)});
         const len = sema.vectorLen(ty);
         if ((len == null) != (vector_len == null)) return sema.fail(block, src, "expected vector, found '{f}'", .{sema.fmtType(if (len == null) ty else first_ty)});
         if (len != null and len.? != vector_len.?) return sema.fail(block, src, "expected vector of length '{d}', found '{f}'", .{ vector_len.?, sema.fmtType(ty) });
@@ -9656,8 +9703,8 @@ fn analyzeFloatToInt(sema: *Sema, block: *Block, src: Src, dest_ty: Index, opera
     // A comptime_int operand is already integral: every rounding mode
     // leaves it unchanged.
     if (ty == .comptime_int_type) return sema.coerce(block, dest_ty, operand, src);
-    if (class != .float and class != .comptime_float) return sema.fail(block, src, "expected float type, found '{f}'", .{sema.fmtType(ty)});
-    if (sema.resolveValue(operand)) |v| return .fromInterned(try sema.intFromFloat(block, src, v, dest_ty, mode));
+    if (class != .float and class != .comptime_float) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected float type, found '{f}'", .{sema.fmtType(ty)});
+    if (sema.resolveValue(operand)) |v| return .fromInterned(try sema.intFromFloat(block, sema.callArgSrc(src, false, 0), v, dest_ty, mode));
     if (dest_ty == .comptime_int_type) return sema.fail(block, src, "unable to resolve comptime value", .{});
     try sema.requireRuntime(block, src);
     return sema.analyzeIntFromFloat(block, src, operand, dest_ty, mode);
@@ -9677,7 +9724,7 @@ fn analyzeFloatFromInt(sema: *Sema, block: *Block, src: Src, dest_ty: Index, ope
     const ty = sema.typeOf(operand);
     const dc = Type.class(ip, dest_ty);
     if (dc != .float and dc != .comptime_float) return sema.fail(block, src, "expected float result type, found '{f}'", .{sema.fmtType(dest_ty)});
-    if (Type.class(ip, ty) != .int and ty != .comptime_int_type) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(ty)});
+    if (Type.class(ip, ty) != .int and ty != .comptime_int_type) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected integer type, found '{f}'", .{sema.fmtType(ty)});
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
         return .fromInterned(try sema.floatValue(dest_ty, sema.toF128(v)));
@@ -9703,12 +9750,12 @@ fn analyzeFloatCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operan
     const sc = Type.class(ip, ty);
     if (dc != .float and dc != .comptime_float) return sema.fail(block, src, "expected float or vector type, found '{f}'", .{sema.fmtType(dest_ty)});
     if (ty == .comptime_int_type) return sema.analyzeFloatFromInt(block, src, dest_ty, operand);
-    if (sc != .float and sc != .comptime_float) return sema.fail(block, src, "expected float or vector type, found '{f}'", .{sema.fmtType(ty)});
+    if (sc != .float and sc != .comptime_float) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected float or vector type, found '{f}'", .{sema.fmtType(ty)});
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
         return .fromInterned(try sema.floatCast(v, dest_ty));
     }
-    if (dc == .comptime_float) return sema.fail(block, src, "unable to cast runtime value to 'comptime_float'", .{});
+    if (dc == .comptime_float) return sema.fail(block, sema.callArgSrc(src, false, 0), "unable to cast runtime value to 'comptime_float'", .{});
     try sema.requireRuntime(block, src);
     if (Type.floatBits(ip, dest_ty) == Type.floatBits(ip, ty)) return sema.addTyOp(block, .bitcast, dest_ty, operand);
     return sema.addTyOp(block, .float_cast, dest_ty, operand);
@@ -10238,7 +10285,7 @@ fn analyzeAlloc(sema: *Sema, block: *Block, src: Src, ty: Index, is_const: bool,
     if ((try sema.isComptimeOnlyResolved(block, src, ty))) {
         // A constant of a comptime-only type is comptime.
         if (is_const) return .fromInterned(try sema.createComptimeAlloc(ty, false));
-        return sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
+        return sema.fail(block, src.varTy(), "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
     }
     const ptr_ty = try sema.ptrType(.{ .child = ty });
     const ref = try sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = ptr_ty } });
@@ -10438,7 +10485,7 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
             return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = const_ty, .base = .{ .uav = .{ .val = v, .orig_ty = const_ty } } } }));
         };
     }
-    if ((try sema.isComptimeOnlyResolved(block, src, ty))) return sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
+    if ((try sema.isComptimeOnlyResolved(block, src, ty))) return sema.fail(block, src.varTy(), "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
     if (ia.is_const) for (operands) |op| try sema.validateRuntimeValue(block, src, op);
     try sema.resolveLayout(block, src, ty);
     const ptr_ty = try sema.allocPtrType(ty, ia.alignment);
@@ -13687,7 +13734,11 @@ fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_ptr: bool) Compi
     const operand = sema.resolveInst(extra.data.operand);
     const eu = if (is_ptr) try sema.analyzeLoad(parent, src, operand) else operand;
     const ty = sema.typeOf(eu);
-    if (Type.class(sema.ip, ty) != .error_union) return sema.fail(parent, src, "expected error union type, found '{f}'", .{sema.fmtType(ty)});
+    if (Type.class(sema.ip, ty) != .error_union) {
+        const err = sema.fail(parent, src.operandSrc(0), "expected error union type, found '{f}'", .{sema.fmtType(ty)});
+        try sema.addDeclaredHereNote(ty);
+        return err;
+    }
     const is_non_err = try sema.analyzeIsNonErr(parent, src, eu);
     if (sema.resolveValue(is_non_err)) |v| {
         if (v == .bool_true) return if (is_ptr) sema.errUnionPayloadPtr(parent, src, operand, false) else sema.errUnionPayload(parent, src, operand);
@@ -13761,7 +13812,11 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
         eu_ptr = eu;
         eu = try sema.analyzeLoad(parent, src, eu);
     }
-    if (Type.class(sema.ip, sema.typeOf(eu)) != .error_union) return sema.fail(parent, src, "expected error union type, found '{f}'", .{sema.fmtType(sema.typeOf(eu))});
+    if (Type.class(sema.ip, sema.typeOf(eu)) != .error_union) {
+        // At the `catch` or the `if`'s condition, as upstream.
+        const operand_src: Src = if (sb.catch_or_if_src_node_offset.unwrap()) |off| .{ .base = src.base, .loc = .{ .operand = .{ .node = off, .index = 0 } } } else src;
+        return sema.fail(parent, operand_src, "expected error union type, found '{f}'", .{sema.fmtType(sema.typeOf(eu))});
+    }
     const cond = try sema.analyzeIsNonErr(parent, src, eu);
     if (parent.is_comptime) {
         const v = sema.resolveValue(cond) orelse return sema.fail(parent, src, "unable to evaluate comptime expression", .{});
@@ -14647,7 +14702,7 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
         const elems = try sema.arena.alloc(Ref, t.types.len);
         @memset(elems, .none);
         for (items) |item| {
-            const idx = try sema.structFieldIndex(block, src, ty, item.name);
+            const idx = try sema.structFieldIndex(block, item.src, ty, item.name);
             elems[idx] = try sema.coerce(block, t.types[idx], item.init, item.src);
         }
         for (elems, t.values, 0..) |*e, v, k| {
@@ -14667,7 +14722,7 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
     for (items) |item| {
         const key: NameKey = .{ .file = sema.file, .name = item.name_start, .ty = ty, .kind = .field_index };
         const idx = sema.nameCacheGet(key) orelse idx: {
-            const idx = try sema.structFieldIndex(block, src, ty, item.name);
+            const idx = try sema.structFieldIndex(block, item.src, ty, item.name);
             try sema.nameCachePut(key, idx);
             break :idx idx;
         };
@@ -15149,14 +15204,15 @@ fn analyzeIntCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand:
     if (try sema.vectorCast(block, src, dest_ty, operand, analyzeIntCast)) |r| return r;
     const src_ty = sema.typeOf(operand);
     if (!Type.isInt(ip, dest_ty) and dest_ty != .comptime_int_type) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(dest_ty)});
-    if (!Type.isInt(ip, src_ty) and src_ty != .comptime_int_type) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(src_ty)});
+    // Errors about the operand point at it, as upstream.
+    if (!Type.isInt(ip, src_ty) and src_ty != .comptime_int_type) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected integer type, found '{f}'", .{sema.fmtType(src_ty)});
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
-        if (!sema.intFits(v, dest_ty)) return sema.fail(block, src, "type '{f}' cannot represent integer value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(v) });
+        if (!sema.intFits(v, dest_ty)) return sema.fail(block, sema.callArgSrc(src, false, 0), "type '{f}' cannot represent integer value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(v) });
         return .fromInterned(try sema.retypeInt(v, dest_ty));
     }
     try sema.requireRuntime(block, src);
-    if (dest_ty == .comptime_int_type) return sema.fail(block, src, "unable to cast runtime value to 'comptime_int'", .{});
+    if (dest_ty == .comptime_int_type) return sema.fail(block, sema.callArgSrc(src, false, 0), "unable to cast runtime value to 'comptime_int'", .{});
     if (dest_ty == src_ty) return operand;
     // Lowering (`runtimeElemAccess`): the evaluator checks the value fits.
     if (src_ty == .comptime_int_type) return sema.addTyOp(block, .intcast, dest_ty, operand);
@@ -15209,13 +15265,13 @@ fn analyzeTruncate(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand
     const src_ty = sema.typeOf(operand);
     if (dest_ty == .comptime_int_type) return sema.coerce(block, dest_ty, operand, src);
     if (!Type.isInt(ip, dest_ty)) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(dest_ty)});
-    if (!Type.isInt(ip, src_ty) and src_ty != .comptime_int_type) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(src_ty)});
+    if (!Type.isInt(ip, src_ty) and src_ty != .comptime_int_type) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected integer type, found '{f}'", .{sema.fmtType(src_ty)});
     const d = Type.intInfo(ip, dest_ty);
     if (d.bits == 0) return .fromInterned(try sema.intValue(dest_ty, 0));
     // As upstream: a truncation that drops no bits is a coercion.
     if (src_ty != .comptime_int_type) {
         const s = Type.intInfo(ip, src_ty);
-        if (s.signedness != d.signedness) return sema.fail(block, src, "expected {t} integer type, found '{f}'", .{ d.signedness, sema.fmtType(src_ty) });
+        if (s.signedness != d.signedness) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected {t} integer type, found '{f}'", .{ d.signedness, sema.fmtType(src_ty) });
         if (d.bits >= s.bits) return sema.coerce(block, dest_ty, operand, src);
     }
     if (sema.resolveValue(operand)) |v| {
