@@ -4847,6 +4847,15 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
                 };
             }
         }.f;
+        // A tuple peer (`v == .{ 1, 2 }`) contributes each field's type.
+        const tuple = ip.indexToKey(if (ca == .vector) b else a);
+        if (tuple == .tuple_type) {
+            const vec = elems(ip, if (ca == .vector) a else b).?;
+            if (tuple.tuple_type.types.len != vec[0]) return sema.fail(block, src, "vector length mismatch", .{});
+            var child = vec[1];
+            for (tuple.tuple_type.types) |t| child = try sema.peerPair(block, src, child, t);
+            return sema.vectorType(@intCast(vec[0]), child);
+        }
         const ea = elems(ip, a) orelse return sema.fail(block, src, "mixed scalar and vector operands: '{f}' and '{f}'", .{ sema.fmtType(a), sema.fmtType(b) });
         const eb = elems(ip, b) orelse return sema.fail(block, src, "mixed scalar and vector operands: '{f}' and '{f}'", .{ sema.fmtType(a), sema.fmtType(b) });
         if (ea[0] != eb[0]) return sema.fail(block, src, "vector length mismatch", .{});
@@ -11066,8 +11075,12 @@ fn coerceElem(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref
 /// An operand of a vector operation of type `vec_ty`. A vector of another
 /// element type stays as is: its elements coerce one at a time inside the
 /// operation, instead of in a separate pass over the vector.
+/// As upstream, only an array may stand in for a vector operand.
 fn vectorOperand(sema: *Sema, block: *Block, src: Src, vec_ty: Index, operand: Ref) CompileError!Ref {
-    if (sema.vectorLen(sema.typeOf(operand)) != null) return operand;
+    const ty = sema.typeOf(operand);
+    if (sema.vectorLen(ty) != null) return operand;
+    if (Type.class(sema.ip, ty) != .array)
+        return sema.fail(block, src, "mixed scalar and vector operands: '{f}' and '{f}'", .{ sema.fmtType(vec_ty), sema.fmtType(ty) });
     return sema.coerce(block, vec_ty, operand, src);
 }
 
