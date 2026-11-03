@@ -530,6 +530,20 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   so a pass right after layout counts them exactly before sections are
   placed, and the copy step writes them; a serial step writes the index.
   Without debug info there is no __unwind_info and the output is unchanged.
+  Verified on an M4 Max (macOS 26): std.debug's MachOFile symbolizes from
+  the dSYM; lldb resolves `breakpoint set --file demo.zig --line 37` and
+  `image lookup` to the compile unit and line entry (no Function, as
+  above); `dwarfdump --verify` is clean and the UUIDs match; objdump reads
+  the unwind info, with clang's encoding for frame-pointer functions; and
+  libunwind's `_Unwind_Backtrace` walks the same 4 frames through a
+  hand-built main -> a -> b -> c as through the same program built by
+  clang, and none without __unwind_info. Cost (bench-link -- macho, same
+  session, alternating with main): stripped emit unchanged (22.0–23.3 ms
+  on 1 thread); with debug info and the dSYM, +3.2 ms on 1 thread and
+  +0.6 ms on 16; linking to a file 6.8–7.1 ms against 5.7–5.9, so writing
+  the dSYM costs about 1.1 ms. Under callgrind on the orb, stripped emits
+  cost 0.05% more instructions outside SHA-256 (464.5M → 464.8M), from
+  code layout.
 - Measured Mach-O link throughput (2026-11-02, Apple M4 Max, 12+4 cores,
   `zig build bench-link -- macho`, best of 15): the same 100k atoms with
   aarch64 relocations (970k: a constant reference is an adrp/add pair) and
