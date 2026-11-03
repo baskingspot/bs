@@ -314,6 +314,10 @@ pub const Block = struct {
     /// loop (its `runtime_cond`/`runtime_loop`).
     runtime_depth: u32 = 0,
     runtime_src: ?Src = null,
+    /// The condition or loop of the last runtime branch analyzed directly
+    /// in this block (upstream's `runtime_cond`), for the note on a
+    /// comptime-only result that depends on it.
+    branch_src: ?Src = null,
     /// Inside `@TypeOf`'s operand: only the type of values matters.
     is_typeof: bool = false,
     /// A `comptime` block in a runtime function body: as upstream, it may
@@ -376,6 +380,7 @@ pub const Block = struct {
     /// switch prong, or loop body), unlike a labeled block's; `src` is the
     /// condition or loop, if the code has one.
     fn condChild(b: *Block, src: ?Src) Block {
+        if (src) |s| b.branch_src = s;
         var c = b.child();
         c.runtime_cond = true;
         c.runtime_depth = b.runtime_depth + 1;
@@ -3520,6 +3525,14 @@ fn resolveBlock(sema: *Sema, parent: *Block, src: Src, child: *Block, merges: *B
     for (results, merges.srcs.items) |result, result_src| try sema.validateRuntimeValue(child, result_src, result);
     const result_ty = try sema.resolvePeerTypes(parent, src, results);
     try sema.resolveLayout(parent, src, result_ty);
+    if (try sema.isComptimeOnlyResolved(parent, src, result_ty)) {
+        // As upstream: a runtime branch cannot choose a comptime value.
+        const err = sema.fail(parent, src, "value with comptime-only type '{f}' depends on runtime control flow", .{sema.fmtType(result_ty)});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        if (child.branch_src) |rs| try sema.zcu.addNote(sema.file, rs.span(tree), "runtime control flow here", .{});
+        try sema.explainWhyComptime(sema.file, src.span(tree), result_ty);
+        return err;
+    }
     for (merges.brs.items, results) |br, result| {
         try sema.coerceBrOperand(child, br, result_ty, result, src);
     }
@@ -5544,6 +5557,41 @@ fn failUnpackable(sema: *Sema, block: *Block, src: Src, comptime what: []const u
         else => try zcu.addNote(sema.file, span, "type does not have a bit-packed representation", .{}),
     }
     return err;
+}
+
+/// Upstream's `explainWhyTypeIsComptime`: notes on why `ty`, located at
+/// `span` of `file`, is comptime-only.
+fn explainWhyComptime(sema: *Sema, file: u32, span: Ast.Span, ty: Index) CompileError!void {
+    const ip = sema.ip;
+    const zcu = sema.zcu;
+    switch (Type.class(ip, ty)) {
+        .array, .vector, .optional => return sema.explainWhyComptime(file, span, Type.childType(ip, ty)),
+        .error_union => return sema.explainWhyComptime(file, span, ip.keyPayload(.error_union_type, ty).payload_type),
+        .@"fn" => try zcu.addNote(file, span, "use '*const {f}' for a function pointer type", .{FmtType{ .ip = ip, .ty = ty, .decl_note = false }}),
+        .type => try zcu.addNote(file, span, "types are not available at runtime", .{}),
+        .@"struct", .@"union" => {
+            const is_struct = Type.class(ip, ty) == .@"struct";
+            const info = ip.structInfo(ty);
+            for (info.field_types, 0..) |ft, i| {
+                if (is_struct and info.fieldIsComptime(i)) continue;
+                if (!Type.isComptimeOnly(ip, ft)) continue;
+                const decl = sema.containerDecl(ty) orelse return;
+                const tree = try zcu.fe.tree(@fromBackingInt(decl.file));
+                const field_span = (Src{ .base = decl.node, .loc = .{ .container_field = .{ .node = .zero, .index = @intCast(i), .part = .type } } }).span(tree);
+                try zcu.addNote(decl.file, field_span, "{s} requires comptime because of this field", .{if (is_struct) "struct" else "union"});
+                return sema.explainWhyComptime(decl.file, field_span, ft);
+            }
+        },
+        .tuple => {
+            const t = ip.keyPayload(.tuple_type, ty);
+            for (t.types, t.values) |ft, v| {
+                if (v != .none or !Type.isComptimeOnly(ip, ft)) continue;
+                try zcu.addNote(file, span, "tuple requires comptime because of field of type '{f}'", .{FmtType{ .ip = ip, .ty = ft, .decl_note = false }});
+                return sema.explainWhyComptime(file, span, ft);
+            }
+        },
+        else => {},
+    }
 }
 
 /// Upstream's `explainWhyTypeIsNotExtern`: notes on why `ty` failed
