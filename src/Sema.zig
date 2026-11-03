@@ -1007,6 +1007,8 @@ fn analyzeTypeLayout(zcu: *Zcu, ty: Index, field_types_only: bool) CompileError!
     else
         .none;
     try sema.structLayout(&block, info, decl.layout, explicit_backing, offsets, aligns);
+    if (decl.layout == .@"extern") for (types, 0..) |t, i|
+        try sema.checkExtern(&block, cont_src.fieldSrc(i, .type), t, .struct_field, "extern structs cannot contain fields of type '{f}'", .{FmtType{ .ip = ip, .ty = t, .decl_note = false }});
     for (aligns) |a| if (a != 0) {
         info.field_aligns = try ip.arena(Zcu.tid).dupe(u64, aligns);
         break;
@@ -1452,6 +1454,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     var comptime_state = false;
     for (types, 0..) |ft, i| {
         try sema.resolveLayout(&block, src, ft);
+        if (info.layout == .@"extern") try sema.checkExtern(&block, cont_src.fieldSrc(i, .type), ft, .union_field, "extern unions cannot contain fields of type '{f}'", .{FmtType{ .ip = ip, .ty = ft, .decl_note = false }});
         // As upstream, every field counts toward the size and alignment,
         // even one that cannot be active (`noreturn align(8)`).
         if (Type.hasRuntimeBits(ip, ft)) payload_size = @max(payload_size, Type.abiSize(ip, ft));
@@ -5219,16 +5222,154 @@ fn analyzeBitOp(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand
 /// zap's calling convention as a `std.lang.CallingConvention` value.
 fn stdCallingConvention(sema: *Sema, block: *Block, src: Src, cc_ty: Index, cc: InternPool.CallingConvention) CompileError!Index {
     const ip = sema.ip;
-    const name = switch (cc) {
+    const name = ccName(cc);
+    const i = try sema.unionFieldIndex(block, src, cc_ty, name);
+    const field_ty = ip.structInfo(cc_ty).field_types[i];
+    const payload = if (field_ty == .void_type) .void_value else try sema.structValue(block, src, field_ty, &.{});
+    return sema.intern(.{ .un = .{ .ty = cc_ty, .tag = try sema.unionFieldTagValue(cc_ty, i), .val = payload } });
+}
+
+/// The `std.lang.CallingConvention` tag of `cc`.
+fn ccName(cc: InternPool.CallingConvention) []const u8 {
+    return switch (cc) {
         .auto => "auto",
         .c => "x86_64_sysv",
         .naked => "naked",
         .@"inline" => "inline",
     };
-    const i = try sema.unionFieldIndex(block, src, cc_ty, name);
-    const field_ty = ip.structInfo(cc_ty).field_types[i];
-    const payload = if (field_ty == .void_type) .void_value else try sema.structValue(block, src, field_ty, &.{});
-    return sema.intern(.{ .un = .{ .ty = cc_ty, .tag = try sema.unionFieldTagValue(cc_ty, i), .val = payload } });
+}
+
+/// Upstream's `fnCallConvAllowsZigTypes`: otherwise parameters and the
+/// return type must be extern-compatible.
+fn ccAllowsZigTypes(cc: InternPool.CallingConvention) bool {
+    return cc == .auto or cc == .@"inline";
+}
+
+/// Where an extern-compatible type is required (upstream's
+/// `Type.ExternPosition`).
+const ExternPosition = enum { ret_ty, param_ty, union_field, struct_field, element, other };
+
+/// Upstream's `Type.validateExtern`: whether `ty`, whose layout is
+/// resolved, has a C-compatible representation in `position`.
+fn validateExtern(sema: *Sema, ty: Index, position: ExternPosition) bool {
+    const ip = sema.ip;
+    return switch (Type.class(ip, ty)) {
+        .type, .comptime_float, .comptime_int, .enum_literal, .undefined, .null, .error_union, .error_set, .tuple, .special => false,
+        .vector => position == .param_ty or position == .ret_ty,
+        .void => position != .param_ty and position != .other,
+        .noreturn => position == .ret_ty,
+        .@"opaque", .bool, .@"anyframe", .float => true,
+        .pointer => {
+            const p = Type.ptrInfo(ip, ty);
+            if (p.flags.size == .slice) return false;
+            if (Type.class(ip, p.child) == .@"fn") return p.flags.is_const and !ccAllowsZigTypes(ip.keyPayload(.func_type, p.child).cc);
+            return true;
+        },
+        .int => switch (Type.intInfo(ip, ty).bits) {
+            0, 8, 16, 32, 64, 128 => true,
+            else => false,
+        },
+        .@"fn" => position == .other and !ccAllowsZigTypes(ip.keyPayload(.func_type, ty).cc),
+        .@"enum" => sema.explicitIntTag(ty) and sema.validateExtern(ip.structInfo(ty).tag_type, position),
+        .@"struct", .@"union" => switch (ip.structInfo(ty).layout) {
+            .auto => false,
+            .@"extern" => true,
+            .@"packed" => sema.explicitIntTag(ty) and sema.validateExtern(ip.structInfo(ty).tag_type, position),
+        },
+        .array => switch (position) {
+            .ret_ty, .param_ty => false,
+            else => sema.validateExtern(Type.childType(ip, ty), .element),
+        },
+        .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, ty)),
+    };
+}
+
+/// Whether enum `ty` has an explicit integer tag type, or packed struct
+/// or union `ty` an explicit backing integer (upstream's `.explicit`
+/// modes). A union's generated tag enum has neither.
+fn explicitIntTag(sema: *Sema, ty: Index) bool {
+    const key = sema.ip.containerType(ty) orelse return false;
+    const code = &sema.zcu.file(key.file).zir;
+    if (reifyNode(code, key.zir_inst) != null) return sema.ip.keyTag(ty) == .enum_type or key.captures[1] != .none;
+    if (code.instructions.items(.tag)[@backingInt(key.zir_inst)] != .extended) return false;
+    return switch (code.instructions.items(.data)[@backingInt(key.zir_inst)].extended.opcode) {
+        .enum_decl => sema.ip.keyTag(ty) == .enum_type and code.getEnumDecl(key.zir_inst).tag_type_body != null,
+        .struct_decl => code.getStructDecl(key.zir_inst).backing_int_type_body != null,
+        .union_decl => sema.ip.keyTag(ty) == .union_type and code.getUnionDecl(key.zir_inst).arg_type_body != null,
+        else => false,
+    };
+}
+
+/// Upstream's `explainWhyTypeIsNotExtern`: notes on why `ty` failed
+/// `validateExtern` in `position`.
+fn explainWhyNotExtern(sema: *Sema, file: u32, span: Ast.Span, ty: Index, position: ExternPosition) CompileError!void {
+    const ip = sema.ip;
+    const zcu = sema.zcu;
+    switch (Type.class(ip, ty)) {
+        .void => try zcu.addNote(file, span, "'void' is a zero bit type", .{}),
+        .noreturn => try zcu.addNote(file, span, "'noreturn' is only allowed as a return type", .{}),
+        .pointer => if (Type.isSlice(ip, ty)) {
+            try zcu.addNote(file, span, "slices have no guaranteed in-memory representation", .{});
+        } else if (!Type.ptrInfo(ip, ty).flags.is_const) {
+            try zcu.addNote(file, span, "pointer to extern function must be 'const'", .{});
+        } else try sema.explainWhyNotExtern(file, span, Type.ptrInfo(ip, ty).child, .other),
+        .int => if (!std.math.isPowerOfTwo(Type.intInfo(ip, ty).bits)) {
+            try zcu.addNote(file, span, "only integers with 0 or power of two bits are extern compatible", .{});
+        } else {
+            try zcu.addNote(file, span, "only integers with 0, 8, 16, 32, 64 and 128 bits are extern compatible", .{});
+        },
+        .@"fn" => if (position != .other) {
+            try zcu.addNote(file, span, "type has no guaranteed in-memory representation", .{});
+            try zcu.addNote(file, span, "use '*const ' to make a function pointer type", .{});
+        } else switch (ip.keyPayload(.func_type, ty).cc) {
+            .auto => try zcu.addNote(file, span, "extern function must specify calling convention", .{}),
+            else => |cc| try zcu.addNote(file, span, "{s} function cannot be extern", .{ccName(cc)}),
+        },
+        .@"enum" => {
+            // Located at the enum's declaration, as upstream.
+            const decl = sema.containerDecl(ty).?;
+            const decl_span = (try zcu.fe.tree(@fromBackingInt(decl.file))).nodeToSpan(decl.node);
+            if (!sema.explicitIntTag(ty)) {
+                try zcu.addNote(decl.file, decl_span, "integer tag type of enum is inferred", .{});
+                try zcu.addNote(decl.file, decl_span, "consider explicitly specifying the integer tag type", .{});
+            } else {
+                const tag_ty = ip.structInfo(ty).tag_type;
+                try zcu.addNote(decl.file, decl_span, "enum tag type '{f}' is not extern compatible", .{sema.fmtType(tag_ty)});
+                try sema.explainWhyNotExtern(decl.file, decl_span, tag_ty, position);
+            }
+        },
+        .tuple => try zcu.addNote(file, span, "tuples have no guaranteed in-memory representation", .{}),
+        .@"struct", .@"union" => {
+            const kind = if (Type.class(ip, ty) == .@"struct") "struct" else "union";
+            if (ip.structInfo(ty).layout == .auto) {
+                try zcu.addNote(file, span, "{s} with automatic layout has no guaranteed in-memory representation", .{kind});
+            } else if (!sema.explicitIntTag(ty)) {
+                try zcu.addNote(file, span, "inferred backing integer of packed {s} has unspecified signedness", .{kind});
+            } else {
+                const backing = ip.structInfo(ty).tag_type;
+                try zcu.addNote(file, span, "packed {s} backing integer type '{f}' is not extern compatible", .{ kind, sema.fmtType(backing) });
+                try sema.explainWhyNotExtern(file, span, backing, position);
+            }
+        },
+        .array => switch (position) {
+            .ret_ty => try zcu.addNote(file, span, "arrays are not allowed as a return type", .{}),
+            .param_ty => try zcu.addNote(file, span, "arrays are not allowed as a parameter type", .{}),
+            else => try sema.explainWhyNotExtern(file, span, Type.childType(ip, ty), .element),
+        },
+        .vector => try zcu.addNote(file, span, "vectors have no guaranteed in-memory representation", .{}),
+        .optional => try zcu.addNote(file, span, "non-pointer optionals have no guaranteed in-memory representation", .{}),
+        else => {},
+    }
+}
+
+/// Fails at `src` with `fmt` (naming `ty`) unless `ty` is extern-compatible
+/// in `position`, explaining why, then where `ty` is declared, as upstream.
+fn checkExtern(sema: *Sema, block: *Block, src: Src, ty: Index, position: ExternPosition, comptime fmt: []const u8, args: anytype) CompileError!void {
+    if (sema.validateExtern(ty, position)) return;
+    const err = sema.fail(block, src, fmt, args);
+    try sema.explainWhyNotExtern(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), ty, position);
+    try sema.addDeclaredHereNote(ty);
+    return err;
 }
 
 /// `ty` without optional and error union wrappers: the type that a result
@@ -15714,11 +15855,23 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         if (cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
     }
 
+    // Errors about a parameter or the return type point at it, as upstream.
+    const ret_src: Src = .{ .base = src.base, .loc = .{ .fn_ret_ty = data.src_node } };
     var ret_ty: Index = if (fn_info.ret_ty_body.len != 0) blk: {
         if (fn_info.ret_ty_is_generic) break :blk .generic_poison_type;
         const ref = try sema.resolveInlineBody(block, fn_info.ret_ty_body, inst);
-        break :blk try sema.analyzeAsType(block, src, ref);
-    } else try sema.resolveType(block, src, fn_info.ret_ty_ref);
+        break :blk try sema.analyzeAsType(block, ret_src, ref);
+    } else try sema.resolveType(block, ret_src, fn_info.ret_ty_ref);
+    // As upstream's `isValidReturnType` and `isValidParamType`.
+    if (Type.class(ip, ret_ty) == .@"opaque")
+        return sema.fail(block, ret_src, "opaque return type '{s}{f}' not allowed", .{ if (fn_info.inferred_error_set) "!" else "", sema.fmtType(ret_ty) });
+    for (params, 0..) |p, k| switch (Type.class(ip, p.ty)) {
+        .@"opaque", .noreturn => {
+            const param_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(k) } } };
+            return sema.fail(block, param_src, "parameter of {s}type '{f}' not allowed", .{ if (Type.class(ip, p.ty) == .@"opaque") "opaque " else "", sema.fmtType(p.ty) });
+        },
+        else => {},
+    };
     // A generic return type stays generic_poison: instantiation adds the
     // inferred error set (see `calleeRetTy`).
     if (fn_info.inferred_error_set and ret_ty != .generic_poison_type) {
@@ -15731,12 +15884,32 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     // the function is called. A function type resolves only their field
     // types, as upstream's `comptimeOnlySema`, so that it may name a type
     // whose layout is being resolved.
-    if (body_len != 0) {
+    const is_decl = body_len != 0 or (sema.owner_nav != .none and ip.getNav(sema.owner_nav).linkage == .@"extern");
+    if (is_decl) {
         for (params) |p| try sema.resolveLayout(block, src, p.ty);
         try sema.resolveLayout(block, src, ret_ty);
     } else {
         var seen: std.AutoHashMapUnmanaged(Index, void) = .empty;
         for (params) |p| if (!p.is_comptime and p.ty != .generic_poison_type) try sema.resolveFieldTypesDeep(block, src, p.ty, &seen);
+    }
+    // A calling convention other than Zig's takes only extern-compatible
+    // types (upstream's `checkParamType` and `validateResolvedFuncType`).
+    if (!ccAllowsZigTypes(cc)) {
+        const cc_name = ccName(cc);
+        for (params, 0..) |p, k| {
+            const param_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(k) } } };
+            if (p.is_comptime) return sema.fail(block, param_src, "comptime parameters not allowed in function with calling convention '{s}'", .{cc_name});
+            if (p.ty == .generic_poison_type) return sema.fail(block, param_src, "generic parameters not allowed in function with calling convention '{s}'", .{cc_name});
+        }
+        if (ret_ty == .generic_poison_type) return sema.fail(block, ret_src, "generic return type not allowed in function with calling convention '{s}'", .{cc_name});
+        if (fn_info.inferred_error_set) return sema.fail(block, ret_src, "return type '!{f}' not allowed in function with calling convention '{s}'", .{ sema.fmtType(ip.keyPayload(.error_union_type, ret_ty).payload_type), cc_name });
+        if (is_decl) {
+            for (params, 0..) |p, k| {
+                const param_src: Src = .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(k) } } };
+                try sema.checkExtern(block, param_src, p.ty, .param_ty, "parameter of type '{f}' not allowed in function with calling convention '{s}'", .{ FmtType{ .ip = ip, .ty = p.ty, .decl_note = false }, cc_name });
+            }
+            try sema.checkExtern(block, ret_src, ret_ty, .ret_ty, "return type '{f}' not allowed in function with calling convention '{s}'", .{ FmtType{ .ip = ip, .ty = ret_ty, .decl_note = false }, cc_name });
+        }
     }
     var is_generic = ret_ty == .generic_poison_type;
     var comptime_bits: u32 = 0;
