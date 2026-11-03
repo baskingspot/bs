@@ -1131,10 +1131,17 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
 // ---------------------------------------------------------------------------
 // Diagnostics
 
+/// Reports an error at `src`. Its code follows from `fmt`
+/// (`diag.formatCode`); a new format needs an entry there.
 pub fn fail(sema: *Sema, block: *const Block, src: Src, comptime fmt: []const u8, args: anytype) CompileError {
+    return sema.failCode(block, src, comptime @import("diag.zig").formatCode(fmt), fmt, args);
+}
+
+/// `fail` with a code other than its format's.
+fn failCode(sema: *Sema, block: *const Block, src: Src, code: @import("diag.zig").Code, comptime fmt: []const u8, args: anytype) CompileError {
     _ = block;
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
-    try sema.zcu.addError(sema.file, src.span(tree), fmt, args);
+    try sema.zcu.addErrorCode(sema.file, src.span(tree), code, fmt, args);
     return error.AnalysisFail;
 }
 
@@ -4838,7 +4845,7 @@ const Zon = struct {
     fn fail(z: *const Zon, node: Node, comptime fmt: []const u8, args: anytype) CompileError {
         const msg = std.fmt.allocPrint(z.sema.arena, fmt, args) catch return error.OutOfMemory;
         const loc = z.tree.tokenLocation(0, z.tree.firstToken(node.getAstNode(z.zoir)));
-        return z.sema.fail(z.block, z.src, "{s}:{d}:{d}: {s}", .{ z.path, loc.line + 1, loc.column + 1, msg });
+        return z.sema.failCode(z.block, z.src, comptime @import("diag.zig").formatCode(fmt), "{s}:{d}:{d}: {s}", .{ z.path, loc.line + 1, loc.column + 1, msg });
     }
 
     fn lower(z: *const Zon, node: Node, ty: Index) CompileError!Index {

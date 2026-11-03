@@ -28,15 +28,15 @@ pub fn main() void {
 }
 
 // error
-// builtin_operands.zig:19:17: error: expected type 'lang.Signedness', found 'comptime_int'
+// builtin_operands.zig:19:17: error[type-mismatch]: expected type 'lang.Signedness', found 'comptime_int'
 //   | return @Int(0, 8);
 //   call: builtin_operands.zig:27:14 comptime
-// builtin_operands.zig:6:5: error: unknown copy length
+// builtin_operands.zig:6:5: error[unknown-length]: unknown copy length
 //   | @memcpy(dest, source);
 //   note builtin_operands.zig:6:13: destination type '[*]u8' provides no length
 //   note builtin_operands.zig:6:19: source type '[*]const u8' provides no length
-// builtin_operands.zig:10:24: error: non-packed struct 'builtin_operands.S' does not have a backing integer
+// builtin_operands.zig:10:24: error[bad-cast]: non-packed struct 'builtin_operands.S' does not have a backing integer
 //   | return @backingInt(s);
-// builtin_operands.zig:15:12: error: union 'builtin_operands.U' has no tag with value '@fromBackingInt(15)'
+// builtin_operands.zig:15:12: error[lossy-conversion]: union 'builtin_operands.U' has no tag with value '@fromBackingInt(15)'
 //   | return e;
 // 4 errors

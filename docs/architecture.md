@@ -3091,16 +3091,22 @@ the first reference only.
 
 **Codes.** Each code is a kebab-case name, never renamed or reused once
 released; a retired code stays reserved. A code names a kind of error, not
-a call site. Sema has about 464 `fail` calls with about 273 distinct
-formats, which group into roughly 60 to 80 codes. AstGen has 186 error
-sites with 118 distinct formats. A Sema code is passed at the call site
-(`sema.failCode(block, src, .no_member, fmt, args)`). The migration is
-mechanical and staged: `sema.fail` keeps working with code `unclassified`
-until every call site names one, and a unit test lists the remaining
-`unclassified` sites. An AstGen code comes from a table of upstream's
-message formats (pinned at 0.17.0, so the table is complete). A test
-extracts every format string from `AstGen.zig` and checks that each one
-maps to a code.
+a call site. Sema, the linker and the backends make about 470 errors from
+about 300 distinct formats, which group into 50 codes (`diag.Code`).
+An error's kind follows from its wording, so the code comes from the
+format string, not the call site: `Zcu.addError` and `Sema.fail` look it
+up at comptime in `diag.format_codes` (`diag.formatCode`), which costs
+nothing at run time and leaves the call sites unchanged. Formats starting
+with "zap " (what zap does not support yet) are `unsupported`. The rare
+format that needs another code passes it explicitly (`Sema.failCode`,
+`Zcu.addErrorCode`); ZON's errors take their inner message's code that
+way. A unit test tokenizes Sema.zig, Zcu.zig and Emit.zig and fails on any
+error format without a code, so a new format needs a table entry.
+AstGen has 186 error sites with 118 distinct formats; its codes come from
+a table of upstream's message formats (pinned at 0.17.0, so the table is
+complete), matched against the rendered message, and a test extracts
+every format string from `AstGen.zig` and checks that each one maps to a
+code.
 
 **Facts**, computed only on the error path from data Sema already has:
 
@@ -3336,8 +3342,8 @@ unchanged:
 1. The record and the text and JSON renderers, AstGen code
    classification, the token-efficiency rules (paths, collapsed std
    frames, no carets), and the `test/diag` corpus. (Done.)
-2. Codes on Sema's call sites, in batches, coordinated with the Sema
-   thread, which owns most of them.
+2. Codes for Sema's, the linker's and the backends' errors, from their
+   format strings. (Done.)
 3. Facts: candidates, declaration sites, user frame first, the reference
    trace from `referenced_by`, and inferred error sets printed by name.
 4. The migration and pattern table.

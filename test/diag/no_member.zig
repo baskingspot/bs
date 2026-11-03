@@ -6,6 +6,6 @@ pub fn main() void {
 }
 
 // error
-// no_member.zig:4:20: error: 'std' has no member named 'io'
+// no_member.zig:4:20: error[no-member]: 'std' has no member named 'io'
 //   | const out = std.io.getStdOut();
 // 1 error

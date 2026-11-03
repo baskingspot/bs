@@ -383,8 +383,13 @@ pub fn moduleRootFile(zcu: *Zcu, mod: @import("Frontend.zig").Module.Index) ?u32
 // Diagnostics
 
 pub fn addError(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
+    return zcu.addErrorCode(file_index, span, comptime diag.formatCode(fmt), fmt, args);
+}
+
+/// `addError` with a code other than its format's (`diag.formatCode`).
+pub fn addErrorCode(zcu: *Zcu, file_index: u32, span: Ast.Span, code: diag.Code, comptime fmt: []const u8, args: anytype) !void {
     const msg = try std.fmt.allocPrint(zcu.arena.allocator(), fmt, args);
-    try zcu.errors.append(zcu.gpa, .{ .file = file_index, .span = span, .msg = msg });
+    try zcu.errors.append(zcu.gpa, .{ .file = file_index, .span = span, .msg = msg, .code = code });
 }
 
 /// Adds a note to the most recent error.

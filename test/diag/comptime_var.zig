@@ -30,15 +30,15 @@ pub fn main() void {
 }
 
 // error
-// comptime_var.zig:20:25: error: global variable contains reference to comptime var
+// comptime_var.zig:20:25: error[comptime-var-escape]: global variable contains reference to comptime var
 //   | const decl: *u32 = blk: {
-// comptime_var.zig:6:14: error: runtime value contains reference to comptime var
+// comptime_var.zig:6:14: error[comptime-var-escape]: runtime value contains reference to comptime var
 //   | global = &x;
 //   note comptime_var.zig:6:14: comptime var pointers are not available at runtime
-// comptime_var.zig:11:22: error: runtime value contains reference to comptime var
+// comptime_var.zig:11:22: error[comptime-var-escape]: runtime value contains reference to comptime var
 //   | return if (cond) &x else global;
 //   note comptime_var.zig:11:22: comptime var pointers are not available at runtime
-// comptime_var.zig:16:27: error: runtime value contains reference to comptime var
+// comptime_var.zig:16:27: error[comptime-var-escape]: runtime value contains reference to comptime var
 //   | const s = .{ .i = i, .p = &x };
 //   note comptime_var.zig:16:27: comptime var pointers are not available at runtime
 // 4 errors

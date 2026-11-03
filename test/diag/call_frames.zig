@@ -15,7 +15,7 @@ pub fn main() void {
 }
 
 // error
-// call_frames.zig:2:12: error: exact division produced remainder
+// call_frames.zig:2:12: error[inexact-division]: exact division produced remainder
 //   | return @divExact(x, 2);
 //   call: call_frames.zig:6:16 comptime, call_frames.zig:10:19 comptime, call_frames.zig:14:23 comptime
 // 1 error
