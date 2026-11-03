@@ -1163,7 +1163,7 @@ fn LinkOf(comptime Input: type) type {
                     const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
                     const fn_addr: i64 = @intCast(addr);
                     const k = fde - c.frame_base;
-                    const fde_len = Dwarf.fdeSize(unwind);
+                    const fde_len = Dwarf.fdeSize(unwind, size);
                     Dwarf.writeFde(out[0][fde_at..][0..fde_len], unwind, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
                     fde_at += fde_len;
                     const entry = out[1][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
@@ -2222,8 +2222,9 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
         .{ .key = .fromName("naked"), .name = "naked", .section = .text, .bytes = &.{ 0xcc, 0xcc } },
         .{ .key = .fromName("f"), .name = "f", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .frame_pointer },
         // Saves rbx, r13, and r15: `push rbx` at 4, `push r13` at 5, and
-        // `push r15` at 7, after `push rbp; mov rbp, rsp`.
-        .{ .key = .fromName("g"), .name = "g", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .{ .kind = .frame_pointer, .saved = 0x15 } },
+        // `push r15` at 7, after `push rbp; mov rbp, rsp`; ends with its
+        // epilogue's `ret`.
+        .{ .key = .fromName("g"), .name = "g", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .{ .kind = .frame_pointer, .epilogue = true, .saved = 0x15 } },
         .{ .key = .fromName("_start"), .name = "_start", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .outermost },
     };
     const debug = [_]Atom.Debug{
@@ -2240,9 +2241,10 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
     const naked = f + code.len;
     const g = text + 96;
     const start = g + code.len;
-    // Three FDEs, g's with its three saved registers; the duplicate and
-    // the naked function leave their room unused.
-    try std.testing.expectEqual(Dwarf.cie.len + 2 * Dwarf.fde_size + Dwarf.max_fde_size + 4, testSection(out, ".eh_frame").?.size);
+    // Three FDEs, g's with its three saved registers and its epilogue; the
+    // duplicate and the naked function leave their room unused.
+    try std.testing.expectEqual(40, Dwarf.fdeSize(atoms[4].unwind, code.len));
+    try std.testing.expectEqual(Dwarf.cie.len + 2 * Dwarf.fde_size + 40 + 4, testSection(out, ".eh_frame").?.size);
     try std.testing.expectEqual(Dwarf.eh_frame_hdr_size + 3 * Dwarf.eh_frame_hdr_entry_size, testSection(out, ".eh_frame_hdr").?.size);
 
     // Set up the way std.debug.SelfInfo does from PT_GNU_EH_FRAME.
@@ -2301,7 +2303,7 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
             .{ .pc = g + 6, .rbx = 0xfb, .r13 = 0x13, .r15 = 0x15 },
             .{ .pc = g + 7, .rbx = 0xfb, .r13 = 0xf13, .r15 = 0x15 },
             .{ .pc = g + 9, .rbx = 0xfb, .r13 = 0xf13, .r15 = 0xf15 },
-            .{ .pc = g + code.len - 1, .rbx = 0xfb, .r13 = 0xf13, .r15 = 0xf15 },
+            .{ .pc = g + code.len - 2, .rbx = 0xfb, .r13 = 0xf13, .r15 = 0xf15 },
         };
         for (g_cases) |c| {
             var ctx: std.debug.cpu_context.Native = .{ .gprs = .initFill(0) };
@@ -2320,6 +2322,23 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
             try std.testing.expectEqual(c.rbx, unwinder.cpu_state.gprs.get(.rbx));
             try std.testing.expectEqual(c.r13, unwinder.cpu_state.gprs.get(.r13));
             try std.testing.expectEqual(c.r15, unwinder.cpu_state.gprs.get(.r15));
+        }
+        // At g's `ret`, after the epilogue's pops: the CFA is rsp + 8, and
+        // the registers' slots below rsp still hold their values.
+        {
+            var ctx: std.debug.cpu_context.Native = .{ .gprs = .initFill(0) };
+            ctx.gprs.set(.rip, g + code.len - 1);
+            ctx.gprs.set(.rsp, at(&g_stack, 4));
+            ctx.gprs.set(.rbp, 0x1111);
+            var unwinder: std.debug.Dwarf.SelfUnwinder = .init(&ctx);
+            defer unwinder.deinit();
+            const rules = try unwinder.computeRules(gpa, &unwind, 0, null);
+            try std.testing.expectEqual(0x2222, try unwinder.next(gpa, &rules));
+            try std.testing.expectEqual(at(&g_stack, 5), unwinder.cpu_state.gprs.get(.rsp));
+            try std.testing.expectEqual(0x1111, unwinder.cpu_state.gprs.get(.rbp));
+            try std.testing.expectEqual(0xfb, unwinder.cpu_state.gprs.get(.rbx));
+            try std.testing.expectEqual(0xf13, unwinder.cpu_state.gprs.get(.r13));
+            try std.testing.expectEqual(0xf15, unwinder.cpu_state.gprs.get(.r15));
         }
         // The outermost frame ends the stack: no return address.
         for ([_]u64{ start, start + 1, start + code.len - 1 }) |pc| {

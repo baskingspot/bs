@@ -48,11 +48,12 @@ const Header = extern struct {
     alignment: u8,
     has_debug: bool,
     /// `Atom.unwind`, for every atom: its kind (`Atom.Unwind.Kind`, checked
-    /// when decoding), saved registers, and stack size.
+    /// when decoding), saved registers, stack size, and epilogue.
     unwind_kind: u8,
     unwind_saved: u16,
     unwind_stack_size: u16,
-    unused: [12]u8 = @splat(0),
+    unwind_epilogue: u8,
+    unused: [11]u8 = @splat(0),
 };
 
 const DebugHeader = extern struct {
@@ -157,6 +158,7 @@ pub fn encode(atom: *const Atom, debug: ?*const Atom.Debug, out: []u8) void {
         .unwind_kind = @backingInt(atom.unwind.kind),
         .unwind_saved = atom.unwind.saved,
         .unwind_stack_size = atom.unwind.stack_size,
+        .unwind_epilogue = @intFromBool(atom.unwind.epilogue),
     };
     var w: std.Io.Writer = .fixed(out);
     w.writeAll(std.mem.asBytes(&header)) catch unreachable;
@@ -199,7 +201,8 @@ pub fn check(bytes: []align(alignment) const u8, arch: Atom.Unwind.Arch) ?usize 
     if (std.enums.fromInt(Atom.Section, h.section) == null) return null;
     if (h.alignment > std.math.maxInt(std.math.Log2Int(usize))) return null;
     const kind = std.enums.fromInt(Atom.Unwind.Kind, h.unwind_kind) orelse return null;
-    if (!Atom.Unwind.valid(.{ .kind = kind, .saved = h.unwind_saved, .stack_size = h.unwind_stack_size }, arch)) return null;
+    if (h.unwind_epilogue > 1) return null;
+    if (!Atom.Unwind.valid(.{ .kind = kind, .epilogue = h.unwind_epilogue != 0, .saved = h.unwind_saved, .stack_size = h.unwind_stack_size }, arch)) return null;
     var end: usize = @sizeOf(Header) + 16 * @as(usize, h.targets_len) + @sizeOf(Atom.Reloc) * @as(usize, h.relocs_len);
     end += @as(usize, h.bytes_len) + h.name_len;
     if (h.has_debug) {
@@ -302,7 +305,7 @@ pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug
         .zero_fill = @as(u64, h.zero_fill_hi) << 32 | h.zero_fill_lo,
         .targets = targets[0..h.targets_len],
         .relocs = relocs[0..h.relocs_len],
-        .unwind = .{ .kind = @fromBackingInt(h.unwind_kind), .saved = h.unwind_saved, .stack_size = h.unwind_stack_size },
+        .unwind = .{ .kind = @fromBackingInt(h.unwind_kind), .epilogue = h.unwind_epilogue != 0, .saved = h.unwind_saved, .stack_size = h.unwind_stack_size },
     }, .debug = debug };
 }
 
@@ -359,7 +362,7 @@ test "atoms round-trip through records" {
             .bytes = &.{ 0xe8, 0, 0, 0, 0, 0xc3 },
             .targets = &.{callee},
             .relocs = &.{.init(1, .x86_64_pc32, 0, -4)},
-            .unwind = .{ .kind = .frame_pointer, .saved = 0x13 },
+            .unwind = .{ .kind = .frame_pointer, .epilogue = true, .saved = 0x13 },
         },
         // More than 4 GiB of zero fill: the high half must survive.
         .{ .key = .fromName("big"), .name = "test:big", .section = .bss, .alignment = .@"8", .zero_fill = (5 << 32) + 3 },
@@ -405,13 +408,13 @@ test "atoms round-trip through records" {
     try std.testing.expectEqual(copy.len, off);
     // A truncated record is an error, not an out-of-bounds read.
     try std.testing.expectError(error.CorruptAtom, decode(copy[0 .. encodedLen(&atoms[0], &debug[0]) - 16], .x86_64));
-    // So is a bad section, alignment, or unwind kind, saved registers the
-    // architecture does not have or with no frame pointer, or debug
+    // So is a bad section, alignment, unwind kind, or epilogue flag, saved
+    // registers the architecture does not have or with no frame pointer, or debug
     // lengths that overrun the record (atom 0's debug header is at 64 +
     // 16 + 12).
     const len0 = encodedLen(&atoms[0], &debug[0]);
     try std.testing.expectEqual(len0, check(copy, .x86_64));
-    for ([_]struct { usize, u8 }{ .{ 44, 0xff }, .{ 45, 64 }, .{ 47, 3 }, .{ 47, 0 }, .{ 48, 0x33 }, .{ 49, 0x01 }, .{ 92 + 12, 0xff } }) |m| {
+    for ([_]struct { usize, u8 }{ .{ 44, 0xff }, .{ 45, 64 }, .{ 47, 3 }, .{ 47, 0 }, .{ 48, 0x33 }, .{ 49, 0x01 }, .{ 52, 2 }, .{ 92 + 12, 0xff } }) |m| {
         const saved = copy[m[0]];
         copy[m[0]] = m[1];
         try std.testing.expectEqual(null, check(copy, .x86_64));

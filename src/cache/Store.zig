@@ -83,7 +83,7 @@ const Header = extern struct {
     result_hash: Hash,
 };
 
-const pack_magic = "ZAPSTP03".*;
+const pack_magic = "ZAPSTP04".*;
 const pack_ext = ".zsp";
 
 const PackHeader = extern struct {

@@ -316,6 +316,12 @@ pub const Debug = struct {
 /// A function's unwind information (see `Atom.unwind`).
 pub const Unwind = extern struct {
     kind: Kind,
+    /// With `frame_pointer`: the function's one epilogue ends its code, so
+    /// its last instruction is the `ret` after the frame pointer's restore
+    /// (x86_64: `pop rbp; ret`, after which the CFA is rsp + 8). CodeGen
+    /// returns from elsewhere by jumping to it. False when the function
+    /// never returns.
+    epilogue: bool = false,
     /// The callee-saved registers the prologue saves, with `frame_pointer`
     /// only; the bits and the prologue are each architecture's (see
     /// `savedBits`):
@@ -357,10 +363,11 @@ pub const Unwind = extern struct {
     }
 
     /// Whether `u` is one `arch` can describe: saved registers only with
-    /// a frame pointer, and only `arch`'s.
+    /// a frame pointer and an epilogue only with a frame pointer, and
+    /// only `arch`'s saved registers.
     pub fn valid(u: Unwind, arch: Arch) bool {
         if (u.saved & ~savedBits(arch) != 0) return false;
-        return u.saved == 0 or u.kind == .frame_pointer;
+        return (u.saved == 0 and !u.epilogue) or u.kind == .frame_pointer;
     }
 };
 

@@ -732,7 +732,7 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
         part.n_runs += @intFromBool(units.new_run);
         if (a.unwind.kind != .none) {
             c.n_frames += 1;
-            c.frame_bytes += fdeSize(a.unwind);
+            c.frame_bytes += fdeSize(a.unwind, a.bytes.len);
         }
     }
 }
@@ -912,8 +912,8 @@ pub const ChunkWriter = struct {
 // Call frame information (.eh_frame and .eh_frame_hdr, x86_64). Every
 // function with a frame (`Atom.unwind` other than `none`) gets one FDE,
 // all sharing the CIE at the start of .eh_frame. An FDE's size depends on
-// its unwind record alone (`fdeSize`), so the layout pass sizes each
-// chunk's FDEs and the linker places them before writing any.
+// its unwind record and code size alone (`fdeSize`), so the layout pass
+// sizes each chunk's FDEs and the linker places them before writing any.
 
 /// The CIE at offset 0 of .eh_frame: augmentation "zR" with pc-relative
 /// sdata4 FDE pointers, code alignment 1, data alignment -8, and return
@@ -936,15 +936,36 @@ pub const cie = [_]u8{
 };
 // zig fmt: on
 
-/// The size of an FDE with up to two saved registers, and the largest.
+/// The size of an FDE with no saved registers in a function under 64 KiB,
+/// and the largest.
 pub const fde_size = 32;
-pub const max_fde_size = 40;
+pub const max_fde_size = 48;
 
-/// The size of the FDE of a function whose `unwind` is not `none`: the
-/// frame-pointer program and 3 bytes per saved register, padded to 8.
-pub fn fdeSize(u: Atom.Unwind) u32 {
-    const n: u32 = if (u.kind == .frame_pointer) @popCount(u.saved & Atom.Unwind.savedBits(.x86_64)) else 0;
-    return std.mem.alignForward(u32, @as(u32, frame_pointer_program.len) + 3 * n, 8);
+/// The size of the FDE of a `size`-byte function whose `unwind` is not
+/// `none`: the frame-pointer program, 3 bytes per saved register, and the
+/// epilogue's row, padded to 8.
+pub fn fdeSize(u: Atom.Unwind, size: u64) u32 {
+    if (u.kind != .frame_pointer) return fde_size;
+    const n: u32 = @popCount(u.saved & Atom.Unwind.savedBits(.x86_64));
+    const epilogue: u32 = if (epilogueAdvance(u, size)) |adv| advanceSize(adv) + 3 else 0;
+    return std.mem.alignForward(u32, @as(u32, frame_pointer_program.len) + 3 * n + epilogue, 8);
+}
+
+/// The distance from the prologue's last row to the `ret` that ends a
+/// `size`-byte function with an epilogue (`Atom.Unwind.epilogue`), or
+/// null without one or when `size` leaves no room for it.
+fn epilogueAdvance(u: Atom.Unwind, size: u64) ?u32 {
+    if (u.kind != .frame_pointer or !u.epilogue) return null;
+    var end: u64 = 4;
+    for (saved_regs, 0..) |r, bit| end += if (u.saved >> @intCast(bit) & 1 != 0) r.push_len else 0;
+    // At least `pop rbp; ret` after the prologue.
+    if (size < end + 2 or size > std.math.maxInt(u32)) return null;
+    return @intCast(size - 1 - end);
+}
+
+/// The length of the shortest advance_loc that moves `delta` bytes.
+fn advanceSize(delta: u32) u32 {
+    return if (delta < 64) 1 else if (delta < 1 << 8) 2 else if (delta < 1 << 16) 3 else 5;
 }
 
 /// The x86_64 callee-saved registers of `Atom.Unwind.saved`, in push
@@ -955,9 +976,10 @@ const saved_regs = [_]struct { dwarf: u8, push_len: u8 }{ .{ .dwarf = 3, .push_l
 /// its saved registers: after the 1-byte push, the CFA is rsp + 16 with
 /// rbp saved at CFA - 16; after the 3-byte mov, the CFA is rbp + 16 for
 /// the rest of the function. `writeFde` adds the saved registers, each
-/// from the end of its push. The one instruction between an epilogue's
-/// `pop rbp` and its `ret` is not described: CodeGen may return from
-/// several places.
+/// from the end of its push, and the epilogue's `ret`, where the CFA is
+/// rsp + 8 again. The saved registers' rules stay: their slots below rsp
+/// keep the values `pop` restored (in the red zone, which signal delivery
+/// skips), as in upstream's FDEs.
 // zig fmt: off
 const frame_pointer_program = [_]u8{
     0, 0, 0, 0, // length
@@ -992,20 +1014,25 @@ fn fdeTemplate(comptime program: []const u8) [fde_size]u8 {
 }
 
 comptime {
-    std.debug.assert(cie.len % 8 == 0 and fdeSize(.frame_pointer) == fde_size and outermost_program.len <= fde_size);
-    std.debug.assert(fdeSize(.{ .kind = .frame_pointer, .saved = 0x1f }) == max_fde_size);
+    std.debug.assert(cie.len % 8 == 0 and fdeSize(.frame_pointer, 0) == fde_size and outermost_program.len <= fde_size);
+    // An epilogue within 64 KiB of the prologue keeps the common size.
+    std.debug.assert(fdeSize(.{ .kind = .frame_pointer, .epilogue = true }, 1 << 16) == fde_size);
+    std.debug.assert(fdeSize(.{ .kind = .frame_pointer, .epilogue = true, .saved = 0x1f }, std.math.maxInt(u32)) == max_fde_size);
 }
 
-/// Writes the FDE at offset `fde_off` of .eh_frame, `fdeSize(u)` bytes of
-/// `out`, for the `size`-byte function `pc_rel` bytes after the FDE's
-/// pc_begin field, whose `unwind` is `u`, not `none`.
+/// Writes the FDE at offset `fde_off` of .eh_frame, `fdeSize(u, size)`
+/// bytes of `out`, for the `size`-byte function `pc_rel` bytes after the
+/// FDE's pc_begin field, whose `unwind` is `u`, not `none`.
 pub fn writeFde(out: []u8, u: Atom.Unwind, fde_off: u32, pc_rel: i32, size: u32) void {
     switch (u.kind) {
         .none => unreachable,
         .outermost => out[0..fde_size].* = outermost_fde,
-        .frame_pointer => if (u.saved == 0) {
-            out[0..fde_size].* = frame_pointer_fde;
-        } else writeSaved(out, u.saved),
+        .frame_pointer => {
+            const epilogue = epilogueAdvance(u, size);
+            if (u.saved == 0 and epilogue == null) {
+                out[0..fde_size].* = frame_pointer_fde;
+            } else writeFramePointer(out, u.saved, epilogue);
+        },
     }
     std.mem.writeInt(u32, out[4..8], fde_off + 4, .little);
     std.mem.writeInt(i32, out[8..12], pc_rel, .little);
@@ -1013,8 +1040,10 @@ pub fn writeFde(out: []u8, u: Atom.Unwind, fde_off: u32, pc_rel: i32, size: u32)
 }
 
 /// The frame-pointer FDE's program with the `saved` registers, each at
-/// CFA - 24 - 8k for the k-th pushed, from the end of its push.
-noinline fn writeSaved(out: []u8, saved: u16) void {
+/// CFA - 24 - 8k for the k-th pushed, from the end of its push, then, with
+/// an `epilogue` that many bytes after the last of those rows, CFA = rsp + 8
+/// from its `ret`.
+noinline fn writeFramePointer(out: []u8, saved: u16, epilogue: ?u32) void {
     out[0..frame_pointer_program.len].* = frame_pointer_program;
     var at: usize = frame_pointer_program.len;
     var k: u8 = 0;
@@ -1023,6 +1052,23 @@ noinline fn writeSaved(out: []u8, saved: u16) void {
         at += 3;
         k += 1;
     };
+    if (epilogue) |adv| {
+        switch (advanceSize(adv)) {
+            1 => out[at] = DW.CFA.advance_loc + @as(u8, @intCast(adv)),
+            2 => out[at..][0..2].* = .{ DW.CFA.advance_loc1, @intCast(adv) },
+            3 => {
+                out[at] = DW.CFA.advance_loc2;
+                std.mem.writeInt(u16, out[at + 1 ..][0..2], @intCast(adv), .little);
+            },
+            else => {
+                out[at] = DW.CFA.advance_loc4;
+                std.mem.writeInt(u32, out[at + 1 ..][0..4], adv, .little);
+            },
+        }
+        at += advanceSize(adv);
+        out[at..][0..3].* = .{ DW.CFA.def_cfa, 7, 8 }; // CFA = rsp + 8
+        at += 3;
+    }
     @memset(out[at..], DW.CFA.nop);
     std.mem.writeInt(u32, out[0..4], @intCast(out.len - 4), .little);
 }
