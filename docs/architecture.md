@@ -1580,6 +1580,49 @@ hash is the container's, and its result hash is the defaults' stable
 hashes, 0 for a field without one, or the type's identity before they are
 resolved.
 
+**Edge kinds.** Every recorded dependency edge carries a kind, so that
+the format replay freezes can grow without a new graph:
+
+- *plain*: U resolves D itself. Replay.load enters it, in order, with U
+  marked in progress.
+- *conditional*: comptime lowering read D because something else had
+  already resolved it (`Zcu.conditional_deps`; see "Comptime evaluator").
+  It invalidates (a changed D makes U possibly outdated) but Replay.load
+  does not enter it: a green U never needs D to intern its result. Green
+  units skip lowering, which has no effect on the output except through
+  memo entries: a red unit near the branch quota can succeed or fail
+  differently in an edit build than in a full build, the memo's existing
+  order dependence (as upstream's), which `ZAP_CACHE_VERIFY` may flag
+  only at the quota. Call counts differ between edit and full builds
+  (green units make no calls), so lowering happens at different points and
+  the recorded edge sets differ; both cover what the walker read.
+- *inlined body* (reserved; for the optimizer's inlining of small
+  functions): the caller's code copies the callee's body, so a changed
+  callee must invalidate the caller's CodeGen result but not its Sema
+  result. The edge goes to the callee's `func` node, whose result hash
+  must then cover the body the inliner copies (after the callee's own
+  inlining, so that inlining through several levels invalidates
+  transitively), not only the callee's machine code. Since IR is not
+  cached, an edit build re-analyzes such a caller in full for now; the
+  kind is what would let a later IR cache skip its Sema.
+
+The manifest will store the kind in the top 2 bits of each edge's node
+index (one value spare; 2^30 nodes is ample), with the replay format bump;
+until the conditional and inlined kinds have readers, every edge is plain,
+which over-predicts but is sound.
+
+**Roots and output kinds** (for `zap build-obj`, which skips the cache
+for now). Replay seeds its reference closure from a root list the
+manifest stores (comptime declarations, exports, the entry, tests), as
+`record` already gathers them, not from the entry; an object's roots are
+its exports. The manifest's entry is optional and its header records the
+output kind, so the relink picks `Elf` or `ElfObject` (the compilation
+key holds the arguments, so the kind cannot change within a compilation
+directory). An object's imports come from the recorded `useExtern`
+references of the units linked; exports already come from Emit.
+`ElfObject` takes the same numbered input as `Elf`, so the pack serves
+both. A format version bump and the linker side; no Sema hook.
+
 **Debug info of green functions.** `src_hash` ignores a declaration's
 line, so lines added above a green function move its `base_line`
 without re-analysis. For green functions in changed files, the relink
