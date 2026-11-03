@@ -1445,6 +1445,39 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    ns per IR instruction within noise (229–235 for both, allocation
    about +2); std's tests 6.65/6.39 → 6.68/6.51 s, allocation 69–75 →
    74–77 ns per IR instruction, binary −26 KB.
+   Copy elision, after it, in four parts:
+   - Forwarding (`Ssa.plan`, shared): a `*const` alloc whose uses are
+     loads and one store of an instruction's value, which comes before
+     the loads in the layout, is not emitted, nor is its store; each load
+     is that value (`Live.fwd`) and shares its home, so the value's
+     interval grows over the loads' intervals and the loops around them.
+     Sema makes such an alloc for every `const` local and capture, which
+     promotion gave a register and a move of their own.
+   - Frame addresses: a field pointer, or an element pointer with a
+     constant index, of an alloc in the frame is itself a frame address
+     (`Home.frame_addr`): no register, no code.
+   - Initializers and results (`planCopies`, before liveness): a `*const`
+     alloc stored to once with a value that always lives in memory is that
+     memory when the value is in place first (an argument in the incoming
+     area, or a slot that is then not shared); a value initializes at most
+     one alloc, so addresses stay distinct. In a function returning
+     through memory, a non-const alloc of the result type whose load every
+     `ret` returns as its block's last value is the result memory: its home
+     is the caller's pointer, and the load and the copy go.
+   - Call arguments (`planDeferred`, before allocation): a load of a value
+     in memory whose only user is a later `.auto` call in the same block,
+     with nothing between that writes memory, is read in place by the
+     call (`Home.deferred`), and its pointer lives until the call.
+   nbody's `Vec.sub` went from 64 instructions to 26. Against main
+   2cc5b3e (`bench/runtime.py`, two interleaved runs): nbody 279–283 →
+   158–174 ms, hash 224–236 → 185–191, fmt 100–103 → 92–93, sieve and
+   sort within noise; fib 117–123 → 139–141 with byte-identical code for
+   `fib`, only placed at another address. libvaxis: 5.03 → 4.49 code
+   bytes and 687 → 377 frame bytes per function, CodeGen 214–222 →
+   218–220 ns per IR instruction (allocation +9, emission −5). std's
+   tests: wall time within noise (6.50/5.98 → 6.23/6.27 s), allocation
+   +11–17 ns per IR instruction, 5.50 → 4.88 code bytes per IR
+   instruction, binary 52.2 → 49.1 MB.
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
 6. DWARF variable locations; then leaf inlining with the cache edge.
