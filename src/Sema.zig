@@ -1023,6 +1023,9 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     var size = payload_size;
     var alignment = payload_align;
     if (info.has_runtime_tag) {
+        const offsets = try ip.arena(Zcu.tid).alloc(u64, 2);
+        offsets[0..2].* = Type.unionTagPayloadOffsets(ip, info);
+        info.field_offsets = offsets;
         size += Type.abiSize(ip, info.tag_type);
         alignment = @max(alignment, Type.abiAlignment(ip, info.tag_type));
     }

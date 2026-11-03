@@ -2614,7 +2614,14 @@ What remains, by inclusive instructions on the zig workload:
 - CodeGen's constant lowering, not Sema: `Emit.uavKey` 10.3 G (16%), and
   `Type.unionLayout` (3.7 G) and `Type.tupleLayout` (2.3 G, through
   `Type.fieldOffset`) called from `CodeGen.lowerValue`, which recompute a
-  type's whole layout for each union constant or tuple field.
+  type's whole layout for each union constant or tuple field. Done: a
+  tagged union's layout records its tag and payload offsets in
+  `field_offsets`, so `unionLayout` reads them, and `lowerValue`
+  accumulates a tuple's offsets in one pass. The zig workload went from
+  76.4 G to 61.2 G instructions (−20%), wall time 11.50 → 10.96 s, with
+  identical output. `uavKey` is 3.8 G now (27 k constants lowered, about
+  140 values each); what remains is spread over `hasRuntimeBits` (0.9 G),
+  `abiSize` and key decodes.
 - `InternPool.indexToKey` 10 G self (15%): about 270 M decodes, many to
   read one field or the tag of a type. Done in the next round (below).
 - Each unit's dependency set (`deps_set`): 1.2 G in its lookups and

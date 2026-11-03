@@ -279,8 +279,9 @@ pub const ContainerInfo = struct {
     /// the defaults of non-`comptime` fields after the layout. Reified
     /// structs have theirs from the start.
     defaults_status: enum { none, wip, resolved, failed } = .none,
-    /// Structs only: byte offsets, or bit offsets in the backing integer
-    /// for packed structs.
+    /// Structs: byte offsets, or bit offsets in the backing integer for
+    /// packed structs. Unions with a runtime tag: the tag's and the
+    /// payload's byte offsets (`Type.unionLayout`); empty for other unions.
     field_offsets: []const u64 = &.{},
     /// Structs only: which fields are `comptime` (their value is the
     /// default, and they take no space). Empty when none is.

@@ -2962,6 +2962,10 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
                     }
                 } else {
                     const n = Type.fieldCount(ip, ty);
+                    // A tuple's offsets, accumulated as `Type.tupleLayout`
+                    // does: asking `fieldOffset` per field is quadratic.
+                    const is_tuple = ip.keyTag(ty) == .tuple_type;
+                    var tuple_off: u64 = 0;
                     for (0..n) |i| {
                         const ft = Type.fieldType(ip, ty, i);
                         if (!Type.hasRuntimeBits(ip, ft)) continue;
@@ -2971,8 +2975,9 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
                             .repeated_elem => |el| el,
                             .bytes => unreachable,
                         };
-                        const off: u32 = @intCast(Type.fieldOffset(ip, ty, i));
                         const size = Type.abiSize(ip, ft);
+                        const off: u32 = @intCast(if (is_tuple) std.mem.alignForward(u64, tuple_off, Type.abiAlignment(ip, ft)) else Type.fieldOffset(ip, ty, i));
+                        if (is_tuple) tuple_off = off + size;
                         try lowerValue(emit, el, out[off..][0..size], relocs, base_off + off);
                     }
                 },

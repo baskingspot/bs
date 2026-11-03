@@ -379,13 +379,20 @@ pub const UnionLayout = struct {
     payload_offset: u64,
     /// 0 if the union has no runtime tag.
     tag_size: u64,
-    payload_size: u64,
 };
 
-/// Upstream's union layout: the tag goes first unless the payload is more
-/// aligned than it.
+/// Where a union's tag and payload are, as its layout (Sema's
+/// `type_layout`) placed them.
 pub fn unionLayout(ip: *const InternPool, ty: Index) UnionLayout {
     const info = ip.structInfo(ty);
+    if (!info.has_runtime_tag) return .{ .tag_offset = 0, .payload_offset = 0, .tag_size = 0 };
+    return .{ .tag_offset = info.field_offsets[0], .payload_offset = info.field_offsets[1], .tag_size = abiSize(ip, info.tag_type) };
+}
+
+/// The tag's and the payload's offsets in a union with a runtime tag, for
+/// its layout to record: as upstream's `getUnionLayout`, the tag goes
+/// first unless the payload is more aligned than it.
+pub fn unionTagPayloadOffsets(ip: *const InternPool, info: *const InternPool.ContainerInfo) [2]u64 {
     var payload_size: u64 = 0;
     var payload_align: u64 = 1;
     for (info.field_types, 0..) |ft, i| {
@@ -393,11 +400,8 @@ pub fn unionLayout(ip: *const InternPool, ty: Index) UnionLayout {
         if (hasRuntimeBits(ip, ft)) payload_size = @max(payload_size, abiSize(ip, ft));
         payload_align = @max(payload_align, unionFieldAlign(ip, info, @intCast(i)));
     }
-    if (!info.has_runtime_tag) return .{ .tag_offset = 0, .payload_offset = 0, .tag_size = 0, .payload_size = payload_size };
-    const tag_size = abiSize(ip, info.tag_type);
-    if (abiAlignment(ip, info.tag_type) < payload_align)
-        return .{ .tag_offset = payload_size, .payload_offset = 0, .tag_size = tag_size, .payload_size = payload_size };
-    return .{ .tag_offset = 0, .payload_offset = tag_size, .tag_size = tag_size, .payload_size = payload_size };
+    if (abiAlignment(ip, info.tag_type) < payload_align) return .{ payload_size, 0 };
+    return .{ 0, abiSize(ip, info.tag_type) };
 }
 
 /// The alignment of union field `i`: its explicit `align(n)`, else its
