@@ -266,6 +266,7 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
                 _ = try cg.emit.zcu.requestCompilerRtExport(name);
                 return .{ .mem = Mem.sym(try cg.emit.useExtern(name, false), 0) };
             }
+            if (ptrToZeroBit(ip, val)) return .{ .imm = 0xaaaaaaaaaaaaaaaa };
             const t = try ptrTarget(cg.emit, val);
             return .{ .addr = Mem.sym(t.key, @intCast(t.off)) };
         },
@@ -1771,6 +1772,31 @@ fn explicitAlignment(ip: *const InternPool, ptr_ty: Index) u64 {
 }
 
 /// The symbol and offset a comptime-known pointer refers to.
+/// Whether pointer value `ptr` points into a declaration or constant
+/// without runtime bits (not a function or extern), which has no symbol:
+/// as upstream's lowerNavRef and lowerUavRef, such a pointer is undefined
+/// bytes.
+fn ptrToZeroBit(ip: *const InternPool, ptr: Index) bool {
+    var v = ptr;
+    while (true) {
+        const p = ip.indexToKey(v).ptr;
+        switch (p.base) {
+            .field => |f| v = f.base,
+            .elem => |e| v = e.base,
+            .nav => |n| {
+                const nav = ip.getNav(n);
+                if (nav.linkage == .@"extern") return false;
+                return switch (ip.indexToKey(nav.val)) {
+                    .func, .extern_func => false,
+                    else => !Type.hasRuntimeBits(ip, nav.ty),
+                };
+            },
+            .uav => |u| return !Type.hasRuntimeBits(ip, ip.typeOf(u.val)),
+            else => return false,
+        }
+    }
+}
+
 pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
     const ip = &emit.zcu.ip;
     const p = ip.indexToKey(ptr).ptr;
@@ -1870,6 +1896,8 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
         .ptr => |p| {
             if (p.base == .int) {
                 std.mem.writeInt(u64, out[0..8], p.byte_offset, .little);
+            } else if (ptrToZeroBit(ip, val)) {
+                @memset(out[0..8], 0xaa);
             } else {
                 const t = try ptrTarget(emit, val);
                 @memset(out[0..8], 0);
