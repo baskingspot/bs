@@ -25,6 +25,12 @@ fixups: std.ArrayList(Fixup) = .empty,
 /// After `finish`: the offsets, before relaxation, of the conditional
 /// branches it relaxed, in increasing order (see `finalOffset`).
 relaxed: std.ArrayList(u32) = .empty,
+/// The atom's `Debug.lines`, written by `finish` from `line_events` at the
+/// rows' final offsets.
+lines: Atom.LineProgram = .{},
+line_events: std.ArrayList(LineEvent) = .empty,
+
+const LineEvent = struct { offset: u32, kind: enum { row, switch_to }, a: u32, b: u32 };
 
 const unbound = std.math.maxInt(u32);
 
@@ -329,6 +335,19 @@ pub fn deinit(e: *Encoder) void {
     e.labels.deinit(e.gpa);
     e.fixups.deinit(e.gpa);
     e.relaxed.deinit(e.gpa);
+    e.lines.deinit(e.gpa);
+    e.line_events.deinit(e.gpa);
+}
+
+/// A line row at the current offset (see `Atom.LineProgram.addRow`).
+pub fn line(e: *Encoder, line_: u32, column: u32) !void {
+    try e.line_events.append(e.gpa, .{ .offset = @intCast(e.code.items.len), .kind = .row, .a = line_, .b = column });
+}
+
+/// Rows from here come from local file `file`, relative to base `base`
+/// (see `Atom.LineProgram.switchTo`).
+pub fn switchLines(e: *Encoder, file: u32, base: u32) !void {
+    try e.line_events.append(e.gpa, .{ .offset = @intCast(e.code.items.len), .kind = .switch_to, .a = file, .b = base });
 }
 
 /// Patches every reference to a label; every label must be bound. A
@@ -407,6 +426,11 @@ pub fn finish(e: *Encoder) (Allocator.Error || error{BranchOutOfRange})!void {
         }
     }
     e.fixups.clearRetainingCapacity();
+    for (e.line_events.items) |ev| switch (ev.kind) {
+        .row => try e.lines.addRow(e.gpa, e.finalOffset(ev.offset), ev.a, ev.b),
+        .switch_to => try e.lines.switchTo(e.gpa, ev.a, ev.b),
+    };
+    e.line_events.clearRetainingCapacity();
 }
 
 /// Where code that was at `offset` before `finish` relaxed branches is
@@ -841,6 +865,15 @@ fn rdSp(dst: Reg, sets_flags: bool) u32 {
 }
 
 /// `cmp lhs, rhs`: subs to zr.
+pub const CarryOp = enum(u2) { adc = 0b00, adcs = 0b01, sbc = 0b10, sbcs = 0b11 };
+
+/// `dst = src1 + src2 + C` (adc, adcs) or `src1 - src2 - !C` (sbc, sbcs),
+/// for arithmetic over several words.
+pub fn carry(e: *Encoder, op: CarryOp, width: Width, dst: Reg, src1: Reg, src2: Reg) !void {
+    try e.reserve();
+    e.word(0x1a000000 | width.sf() | (@as(u32, @backingInt(op)) << 29) | (src2.zrEnc() << 16) | (src1.zrEnc() << 5) | dst.zrEnc());
+}
+
 pub fn cmp(e: *Encoder, width: Width, lhs: Reg, rhs: AddOperand) !void {
     try e.addSub(.subs, width, .zr, lhs, rhs);
 }
@@ -1069,6 +1102,14 @@ pub fn b(e: *Encoder, target: Target) !void {
     try e.branch26(0x14000000, target);
 }
 
+/// Rewrites the instruction emitted earlier at offset `at` into `b label`,
+/// as a function's prologue jumps to frame allocation code placed after
+/// its body once the frame size is known.
+pub fn branchFrom(e: *Encoder, at: u32, label: Label) !void {
+    std.mem.writeInt(u32, e.code.items[at..][0..4], 0x14000000, .little);
+    try e.fixups.append(e.gpa, .{ .at = at, .label = label, .field = .imm26 });
+}
+
 /// `bl`, as `b`.
 pub fn bl(e: *Encoder, target: Target) !void {
     try e.branch26(0x94000000, target);
@@ -1133,6 +1174,31 @@ pub fn udf(e: *Encoder, imm: u16) !void {
     try e.reserve();
     e.word(imm);
 }
+
+/// An instruction this encoder has no function for, already encoded:
+/// inline assembly's hints and system instructions (`System` lists them).
+pub fn raw(e: *Encoder, insn: u32) !void {
+    try e.reserve();
+    e.word(insn);
+}
+
+/// Encodings of the operand-less system instructions and system register
+/// reads inline assembly uses, as the system assembler writes them.
+pub const System = struct {
+    pub const nop: u32 = 0xd503201f;
+    pub const yield: u32 = 0xd503203f;
+    pub const wfe: u32 = 0xd503205f;
+    pub const wfi: u32 = 0xd503207f;
+    pub const sev: u32 = 0xd503209f;
+    pub const sevl: u32 = 0xd50320bf;
+    pub const isb: u32 = 0xd5033fdf;
+    pub const clrex: u32 = 0xd503305f;
+    /// `dsb <option>`: or in the option (`Barrier`) at bit 8.
+    pub const dsb: u32 = 0xd503309f;
+    /// `mrs xt, tpidrro_el0` / `tpidr_el0`: or in the register.
+    pub const mrs_tpidrro_el0: u32 = 0xd53bd060;
+    pub const mrs_tpidr_el0: u32 = 0xd53bd040;
+};
 
 /// The stack probe before allocating a frame of `size` bytes, needed when
 /// `size` exceeds the 4 KiB guard page: `mov x9, #size; bl chkstk`, where
@@ -1467,6 +1533,11 @@ test "atomics, bit ops, and other step-5 encodings match the system assembler" {
     try e.strQ(.v2, .at(.x0, 8)); // stur q2, [x0, #8]
     try e.stpQ(.v8, .v9, .{ .base = .sp, .offset = .{ .pre = -32 } }); // stp q8, q9, [sp, #-32]!
     try e.udf(0x1234); // udf #0x1234
+    try e.carry(.adcs, .x, .x0, .x1, .zr); // adcs x0, x1, xzr
+    try e.carry(.sbc, .w, .x2, .x3, .x4); // sbc w2, w3, w4
+    try e.raw(System.isb); // isb
+    try e.raw(System.dsb | (@as(u32, @backingInt(Barrier.ish)) << 8)); // dsb ish
+    try e.raw(System.mrs_tpidrro_el0 | 3); // mrs x3, tpidrro_el0
     try e.stackProbe(0x186b0, chkstk); // mov x9, #0x86b0; movk x9, #1, lsl #16; bl ___chkstk_darwin
     try e.adr(.x16, table); // adr x16, table
     e.bind(case);
@@ -1475,10 +1546,10 @@ test "atomics, bit ops, and other step-5 encodings match the system assembler" {
     try e.finish();
     const want = hex("241845fa" ++ "40b0433a" ++ "2008c05a" ++ "2008c0da" ++ "c514c0da" ++ "0058200e" ++ "00b8310e" ++
         "208c621f" ++ "0410381e" ++ "05f0671e" ++ "e1ffe008" ++ "067d6448" ++ "628021f8" ++ "7f706178" ++ "20fcdf08" ++
-        "ffff9fc8" ++ "bf3b03d5" ++ "e10bc03d" ++ "0280803c" ++ "e827bfad" ++ "34120000" ++ "09d690d2" ++ "2900a0f2" ++
+        "ffff9fc8" ++ "bf3b03d5" ++ "e10bc03d" ++ "0280803c" ++ "e827bfad" ++ "34120000" ++ "20001fba" ++ "6200045a" ++ "df3f03d5" ++ "9f3b03d5" ++ "63d03bd5" ++ "09d690d2" ++ "2900a0f2" ++
         "00000094" ++ "30000010" ++ "00000000");
     try std.testing.expectEqualSlices(u8, &want, e.code.items);
-    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.init(0x5c, .aarch64_branch26, 0, 0)}, e.refs.relocs.items);
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{.init(0x70, .aarch64_branch26, 0, 0)}, e.refs.relocs.items);
 }
 
 test "bitmask immediates" {
