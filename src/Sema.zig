@@ -55,6 +55,9 @@ inst_map: InstMap = .{},
 insts_pool: std.ArrayList(std.ArrayList(Ir.Inst.Index)) = .empty,
 /// Stop a `type_layout` unit after its field types (`Zcu.ensureFieldTypes`).
 field_types_only: bool = false,
+/// Emptied `SwitchSeen`s to reuse: a switch evaluated in a comptime loop
+/// would otherwise allocate its sets from the arena every time.
+switch_seen_pool: std.ArrayList(SwitchSeen) = .empty,
 deps: std.ArrayList(Zcu.Dependee) = .empty,
 /// Per entry of `deps`: whether only a lowering for the comptime
 /// evaluator read it (see `Zcu.conditional_deps`).
@@ -466,6 +469,12 @@ pub const Src = struct {
         /// An item of a case of the switch at `node` (upstream's
         /// `switch_case_item` and its range ends).
         switch_item: struct { node: Ast.Node.Offset, item: SwitchItem },
+        /// The `else` prong of the switch at `node` (upstream's
+        /// `node_offset_switch_else_prong`).
+        switch_else: Ast.Node.Offset,
+        /// The capture, or tag capture, of a prong of the switch at `node`
+        /// (upstream's `switch_capture` and `switch_tag_capture`).
+        switch_capture: struct { node: Ast.Node.Offset, prong: SwitchProng },
         /// Operand `index` of the operator at `node`: a binary operator's,
         /// compound assignment's or array access's side, a slice's parts
         /// (operand, start, end, sentinel), a prefix operator's
@@ -496,9 +505,19 @@ pub const Src = struct {
         case: u15,
         multi: bool,
         index: u14,
-        range: bool,
-        /// A range's last value rather than its first.
-        last: bool,
+        /// An item, a range's first or last value, or the whole range
+        /// (`index` counts ranges for the last three).
+        part: SwitchItemPart,
+    };
+    pub const SwitchItemPart = enum(u2) { item, first, last, range };
+
+    pub const SwitchProng = packed struct(u32) {
+        case: u15,
+        multi: bool,
+        is_else: bool,
+        /// The tag capture rather than the payload capture.
+        tag: bool,
+        _: u14 = 0,
     };
 
     pub fn span(src: Src, tree: *const Ast) Ast.Span {
@@ -666,6 +685,33 @@ pub const Src = struct {
                 }
                 return tree.nodeToSpan(node);
             },
+            .switch_else => |off| {
+                const node = off.toAbsolute(src.base);
+                const full = tree.fullSwitch(node) orelse return tree.nodeToSpan(node);
+                for (full.ast.cases) |case_node| {
+                    if (tree.fullSwitchCase(case_node).?.ast.values.len == 0) return tree.nodeToSpan(case_node);
+                }
+                return tree.nodeToSpan(node);
+            },
+            .switch_capture => |sc| {
+                const node = sc.node.toAbsolute(src.base);
+                const full = tree.fullSwitch(node) orelse return tree.nodeToSpan(node);
+                var counts: [2]u32 = .{ 0, 0 };
+                const case_node = for (full.ast.cases) |case_node| {
+                    const case = tree.fullSwitchCase(case_node).?;
+                    if (case.ast.values.len == 0) {
+                        if (sc.prong.is_else) break case_node;
+                        continue;
+                    }
+                    const multi = case.ast.values.len != 1 or tree.nodeTag(case.ast.values[0]) == .switch_range;
+                    const i = &counts[@intFromBool(multi)];
+                    defer i.* += 1;
+                    if (!sc.prong.is_else and multi == sc.prong.multi and i.* == sc.prong.case) break case_node;
+                } else return tree.nodeToSpan(node);
+                var tok = tree.fullSwitchCase(case_node).?.payload_token orelse return tree.nodeToSpan(case_node);
+                if (sc.prong.tag) tok += if (tree.tokenTag(tok) == .asterisk) 3 else 2;
+                return tree.tokenToSpan(tok);
+            },
             .switch_item => |si| {
                 const node = si.node.toAbsolute(src.base);
                 const full = tree.fullSwitch(node) orelse return tree.nodeToSpan(node);
@@ -679,12 +725,14 @@ pub const Src = struct {
                     if (multi != si.item.multi or i.* != si.item.case) continue;
                     var k: u32 = 0;
                     for (case.ast.values) |v| {
-                        if ((tree.nodeTag(v) == .switch_range) != si.item.range) continue;
+                        if ((tree.nodeTag(v) == .switch_range) != (si.item.part != .item)) continue;
                         defer k += 1;
                         if (k != si.item.index) continue;
-                        if (!si.item.range) return tree.nodeToSpan(v);
-                        const first, const last = tree.nodeData(v).node_and_node;
-                        return tree.nodeToSpan(if (si.item.last) last else first);
+                        return tree.nodeToSpan(switch (si.item.part) {
+                            .item, .range => v,
+                            .first => tree.nodeData(v).node_and_node[0],
+                            .last => tree.nodeData(v).node_and_node[1],
+                        });
                     }
                 }
                 return tree.nodeToSpan(node);
@@ -714,16 +762,29 @@ pub const Src = struct {
         return .{ .base = src.base, .loc = .{ .call_func = off } };
     }
 
-    /// Item `index` (a range's first or last value with `range`) of case
-    /// `case` of the switch at `src`. Resolved only when rendered.
-    fn switchItem(src: Src, case: Zir.UnwrappedSwitchBlock.Case.Index, index: usize, range: ?enum { first, last }) Src {
+    /// Item `index` (or range `index`, or its first or last value, by
+    /// `part`) of case `case` of the switch at `src`. Resolved only when
+    /// rendered.
+    fn switchItem(src: Src, case: Zir.UnwrappedSwitchBlock.Case.Index, index: usize, part: SwitchItemPart) Src {
         const off = src.nodeOffset() orelse return src;
         return .{ .base = src.base, .loc = .{ .switch_item = .{ .node = off, .item = .{
             .case = std.math.cast(u15, case.value) orelse return src,
             .multi = case.kind == .multi,
             .index = std.math.cast(u14, index) orelse return src,
-            .range = range != null,
-            .last = range == .last,
+            .part = part,
+        } } } };
+    }
+
+    /// The capture (or tag capture, with `tag`) of case `case` of the
+    /// switch at `src`, or of its else prong if `case` is null. Resolved
+    /// only when rendered.
+    fn switchCapture(src: Src, case: ?Zir.UnwrappedSwitchBlock.Case.Index, tag: bool) Src {
+        const off = src.nodeOffset() orelse return src;
+        return .{ .base = src.base, .loc = .{ .switch_capture = .{ .node = off, .prong = .{
+            .case = if (case) |c| std.math.cast(u15, c.value) orelse return src else 0,
+            .multi = if (case) |c| c.kind == .multi else false,
+            .is_else = case == null,
+            .tag = tag,
         } } } };
     }
 
@@ -776,6 +837,8 @@ fn destroy(sema: *Sema) void {
     sema.inst_map.deinit(gpa);
     for (sema.insts_pool.items) |*l| l.deinit(gpa);
     sema.insts_pool.deinit(gpa);
+    for (sema.switch_seen_pool.items) |*s| s.deinit(gpa);
+    sema.switch_seen_pool.deinit(gpa);
     sema.deps.deinit(gpa);
     sema.deps_conditional.deinit(gpa);
     giveDepMap(sema.zcu, &sema.deps_set);
@@ -13880,9 +13943,24 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     const cond = try sema.switchCond(parent, src, operand);
     const operand_ty = sema.typeOf(cond);
     switch (Type.class(ip, operand_ty)) {
-        .int, .comptime_int, .bool, .error_set, .enum_literal, .type, .@"enum" => {},
-        .pointer => if (Type.isSlice(ip, operand_ty)) return sema.fail(parent, src, "switch on type '{f}'", .{sema.fmtType(operand_ty)}),
-        else => return sema.fail(parent, src, "zap does not support switching on '{f}' yet", .{sema.fmtType(operand_ty)}),
+        .int, .comptime_int, .bool, .error_set, .enum_literal, .type, .@"enum", .void, .@"fn" => {},
+        .pointer => if (Type.isSlice(ip, operand_ty)) return sema.fail(parent, src.operandSrc(0), "switch on type '{f}'", .{sema.fmtType(operand_ty)}),
+        .@"struct" => {
+            const err = sema.fail(parent, src.operandSrc(0), "switch on non-packed struct", .{});
+            try sema.addDeclaredHereNote(operand_ty);
+            return err;
+        },
+        .optional => {
+            const err = sema.fail(parent, src.operandSrc(0), "switch on optional type '{f}'", .{sema.fmtType(operand_ty)});
+            try sema.zcu.addNote(sema.file, src.operandSrc(0).span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "consider using '.?', 'orelse', or 'if'", .{});
+            return err;
+        },
+        .error_union => {
+            const err = sema.fail(parent, src.operandSrc(0), "switch on error union type '{f}'", .{sema.fmtType(operand_ty)});
+            try sema.zcu.addNote(sema.file, src.operandSrc(0).span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "consider using 'try', 'catch', or 'if'", .{});
+            return err;
+        },
+        else => return sema.fail(parent, src.operandSrc(0), "switch on type '{f}'", .{sema.fmtType(operand_ty)}),
     }
     if (Type.class(ip, operand_ty) == .@"enum") try sema.resolveLayout(parent, src, operand_ty);
     const capture_inst: Zir.Inst.Index = sb.payload_capture_placeholder.unwrap() orelse inst;
@@ -13897,23 +13975,36 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     item_block.comptime_reason = "switch prong values must be comptime-known";
     var extra_index = sb.end;
     var under_index: ?usize = null;
+    var seen = sema.switch_seen_pool.pop() orelse SwitchSeen{};
+    defer {
+        seen.values.clearRetainingCapacity();
+        seen.ranges.clearRetainingCapacity();
+        sema.switch_seen_pool.append(sema.gpa, seen) catch seen.deinit(sema.gpa);
+    }
+    var first_range: ?Src = null;
+    var under_src: ?Src = null;
     var it = sb.iterateCases();
     while (it.next()) |case| {
-        if (case.prong_info.has_tag_capture and !is_union) return sema.fail(parent, src, "cannot capture tag of non-union type '{f}'", .{sema.fmtType(sema.typeOf(operand))});
+        if (case.prong_info.has_tag_capture and !is_union) return sema.failTagCapture(parent, src.switchCapture(case.index, true), sema.typeOf(operand));
+        if (case.prong_info.capture == .by_ref and Type.class(ip, operand_ty) == .error_set)
+            return sema.fail(parent, src.switchCapture(case.index, false), "error set cannot be captured by reference", .{});
         const body = sema.code.bodySlice(extra_index, case.prong_info.body_len);
         extra_index += body.len;
         var items: std.ArrayList(Index) = .empty;
         for (case.item_infos, 0..) |info, item_i| {
             // Errors about an item point at it, as upstream.
-            const item_src = src.switchItem(case.index, item_i, null);
+            const item_src = src.switchItem(case.index, item_i, .item);
             if (info.unwrap() == .under) {
                 under_index = cases.items.len;
+                under_src = item_src;
                 continue;
             }
             if (packed_ty != .none) {
                 // An item of the packed type, compared by its bits.
                 const item = try sema.switchItem(&item_block, item_src, inst, info, packed_ty, &extra_index);
-                try items.append(sema.arena, (try sema.reinterpretBits(&item_block, item_src, operand_ty, .fromInterned(item))).toInterned().?);
+                const bits = (try sema.reinterpretBits(&item_block, item_src, operand_ty, .fromInterned(item))).toInterned().?;
+                try sema.validateSwitchItem(parent, &seen, item_src, bits, null, operand_ty);
+                try items.append(sema.arena, bits);
                 continue;
             }
             // An error outside the switched set may have a prong of
@@ -13924,7 +14015,9 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
                     if (std.mem.indexOfScalar(InternPool.String, names, name) == null) continue;
                 }
             }
-            try items.append(sema.arena, try sema.switchItem(&item_block, item_src, inst, info, operand_ty, &extra_index));
+            const item = try sema.switchItem(&item_block, item_src, inst, info, operand_ty, &extra_index);
+            try sema.validateSwitchItem(parent, &seen, item_src, item, null, operand_ty);
+            try items.append(sema.arena, item);
         }
         // A prong left with no items is never taken.
         if (items.items.len == 0 and case.range_infos.len == 0 and case.item_infos.len != 0 and
@@ -13933,6 +14026,12 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         for (case.range_infos, ranges, 0..) |pair, *range, range_i| {
             range[0] = try sema.switchItem(&item_block, src.switchItem(case.index, range_i, .first), inst, pair[0], operand_ty, &extra_index);
             range[1] = try sema.switchItem(&item_block, src.switchItem(case.index, range_i, .last), inst, pair[1], operand_ty, &extra_index);
+            const range_src = src.switchItem(case.index, range_i, .range);
+            if (first_range == null) first_range = range_src;
+            switch (Type.class(ip, operand_ty)) {
+                .int, .comptime_int => try sema.validateSwitchItem(parent, &seen, range_src, range[0], range[1], operand_ty),
+                else => {},
+            }
         }
         try cases.append(sema.arena, .{
             .items = items.items,
@@ -13954,9 +14053,61 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         .tag_inst = if (e.has_tag_capture) tag_inst.toOptional() else .none,
         .operand_ptr = operand_ptr,
     } else null;
-    if (else_case) |e| if (e.tag_inst != .none and !is_union) return sema.fail(parent, src, "cannot capture tag of non-union type '{f}'", .{sema.fmtType(sema.typeOf(operand))});
-    if (sb.has_under and (Type.class(ip, operand_ty) != .@"enum" or !ip.structInfo(operand_ty).nonexhaustive))
-        return sema.fail(parent, src, "'_' prong only allowed when switching on non-exhaustive enums", .{});
+    if (else_case) |e| if (e.tag_inst != .none and !is_union) return sema.failTagCapture(parent, src.switchCapture(null, true), sema.typeOf(operand));
+    if (else_case) |e| if (e.capture == .by_ref and Type.class(ip, operand_ty) == .error_set)
+        return sema.fail(parent, src.switchCapture(null, false), "error set cannot be captured by reference", .{});
+    if (first_range) |range_src| switch (Type.class(ip, operand_ty)) {
+        .int, .comptime_int => {},
+        else => {
+            const err = sema.fail(parent, src.operandSrc(0), "ranges not allowed when switching on type '{f}'", .{sema.fmtType(operand_ty)});
+            try sema.zcu.addNote(sema.file, range_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "range here", .{});
+            return err;
+        },
+    };
+    const else_src: Src = if (src.nodeOffset()) |off| .{ .base = src.base, .loc = .{ .switch_else = off } } else src;
+    if (sb.has_under and (is_union or Type.class(ip, operand_ty) != .@"enum" or !ip.structInfo(operand_ty).nonexhaustive)) {
+        const err = sema.fail(parent, src, "'_' prong only allowed when switching on non-exhaustive enums", .{});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        if (under_src) |u| try sema.zcu.addNote(sema.file, u.span(tree), "'_' prong here", .{});
+        try sema.zcu.addNote(sema.file, src.span(tree), "consider using 'else'", .{});
+        return err;
+    }
+    // As upstream, an else prong must be able to match something.
+    if (sb.else_case) |e| {
+        const all_handled = switch (Type.class(ip, operand_ty)) {
+            .@"enum" => all: {
+                const info = ip.structInfo(operand_ty);
+                if (info.nonexhaustive and !is_union and !sb.has_under) break :all false;
+                // The items are distinct values of the enum; an exhaustive
+                // enum's are all named.
+                if (!info.nonexhaustive or is_union) {
+                    if (seen.values.count() != info.field_defaults.len) break :all false;
+                } else for (info.field_defaults) |fv| {
+                    if (!seen.values.contains(try sema.intern(.{ .enum_tag = .{ .ty = operand_ty, .int = fv } }))) break :all false;
+                }
+                if (info.nonexhaustive and !is_union)
+                    return sema.fail(parent, else_src, "unreachable else prong; all explicit cases already handled", .{});
+                break :all true;
+            },
+            .error_set => all: {
+                // The items are distinct errors of the set.
+                const names = try sema.errorSetNames(parent, src, operand_ty) orelse break :all false;
+                if (seen.values.count() != names.len) break :all false;
+                // A prong of only `unreachable` or a return may stay; it
+                // is never analyzed, as upstream.
+                if (e.is_simple_noreturn) {
+                    else_case = null;
+                    break :all false;
+                }
+                break :all true;
+            },
+            .bool => seen.values.count() == 2,
+            .void => seen.values.count() == 1,
+            .int, .@"struct", .@"union" => sema.switchCoversAllInts(&seen, operand_ty),
+            else => false,
+        };
+        if (all_handled) return sema.fail(parent, else_src, "unreachable else prong; all cases already handled", .{});
+    }
     if (else_case == null and Type.class(ip, operand_ty) == .bool) {
         var seen_true = false;
         var seen_false = false;
@@ -13967,7 +14118,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     } else if (else_case == null and Type.class(ip, operand_ty) == .@"enum") {
         const info = ip.structInfo(operand_ty);
         // A union switches over its fields, whatever its tag type.
-        if (info.nonexhaustive and !sb.has_under and !is_union) return sema.fail(parent, src, "switch on non-exhaustive enum must include 'else' or '_' prong", .{});
+        if (info.nonexhaustive and !sb.has_under and !is_union) return sema.fail(parent, src, "switch on non-exhaustive enum must include 'else' or '_' prong or both", .{});
         var missing: std.ArrayList(u32) = .empty;
         for (info.field_defaults, 0..) |fv, fi| {
             const tv = try sema.intern(.{ .enum_tag = .{ .ty = operand_ty, .int = fv } });
@@ -14001,7 +14152,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         } else if (!sema.isOwnIes(operand_ty))
             return sema.fail(parent, src, "else prong required when switching on type '{f}'", .{sema.fmtType(.anyerror_type)}),
         .void => if (cases.items.len == 0) return sema.fail(parent, src, "switch must handle all possibilities", .{}),
-        .int, .@"struct", .@"union" => if (!try sema.switchCoversAllInts(parent, src, cases.items, operand_ty))
+        .int, .@"struct", .@"union" => if (!sema.switchCoversAllInts(&seen, operand_ty))
             return sema.fail(parent, src, "switch must handle all possibilities", .{}),
         else => return sema.fail(parent, src, "else prong required when switching on type '{f}'", .{sema.fmtType(operand_ty)}),
     };
@@ -14058,7 +14209,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     if (else_case) |e| if (e.is_inline) {
         // `inline else` becomes one inline prong per value no other prong
         // handles.
-        const all = try sema.switchAllValues(parent, src, operand_ty, under_prong != null or is_union);
+        const all = try sema.switchAllValues(parent, else_src, operand_ty, under_prong != null or is_union);
         for (all) |v| {
             for (cases.items) |c| {
                 if (try sema.switchCaseMatches(c, v)) break;
@@ -14183,6 +14334,76 @@ fn switchItem(sema: *Sema, block: *Block, src: Src, switch_inst: Zir.Inst.Index,
     return sema.resolveConstValue(block, src, coerced, "switch prong values must be comptime-known");
 }
 
+/// The items and ranges a switch has listed so far, for upstream's checks
+/// of duplicate values and ranges (`validateSwitchItemOrRange`).
+const SwitchSeen = struct {
+    /// Items of types without ranges, by value.
+    values: std.AutoHashMapUnmanaged(Index, Src) = .empty,
+    /// Integer items and ranges, sorted and disjoint.
+    ranges: std.ArrayList(struct { first: Index, last: Index, src: Src }) = .empty,
+
+    fn deinit(s: *SwitchSeen, gpa: Allocator) void {
+        s.values.deinit(gpa);
+        s.ranges.deinit(gpa);
+    }
+};
+
+fn intOrder(sema: *Sema, a: Index, b: Index) std.math.Order {
+    if (a == b) return .eq;
+    var sa: [2]std.math.big.Limb = undefined;
+    var sb: [2]std.math.big.Limb = undefined;
+    return sema.ip.intToBig(a, &sa).order(sema.ip.intToBig(b, &sb));
+}
+
+/// Records switch item `first` (the range `first...last`, if `last`) of
+/// type `ty`, failing as upstream if an earlier item or range has one of
+/// its values, or if the range is empty.
+fn validateSwitchItem(sema: *Sema, block: *Block, seen: *SwitchSeen, src: Src, first: Index, last: ?Index, ty: Index) CompileError!void {
+    const ip = sema.ip;
+    switch (Type.class(ip, ty)) {
+        .int, .comptime_int => {},
+        else => {
+            const prev = (try seen.values.fetchPut(sema.gpa, first, src)) orelse return;
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            const err = sema.fail(block, src, "duplicate switch value '{f}'", .{sema.fmtValue(first)});
+            try sema.zcu.addNote(sema.file, prev.value.span(tree), "previous value here", .{});
+            try sema.addDeclaredHereNote(if (ty == .type_type) first else ty);
+            return err;
+        },
+    }
+    const end = last orelse first;
+    if (last != null and sema.intOrder(first, end) == .gt) return sema.fail(block, src, "range start value is greater than the end value", .{});
+    // The first range that ends at or after `first`, as upstream's
+    // `RangeSet.add`; it overlaps unless it starts after `end`.
+    const ranges = seen.ranges.items;
+    var lo: usize = 0;
+    var hi = ranges.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (sema.intOrder(ranges[mid].last, first) == .lt) lo = mid + 1 else hi = mid;
+    }
+    if (lo != ranges.len and sema.intOrder(end, ranges[lo].first) != .lt) {
+        const prev = ranges[lo];
+        const overlap_start = if (sema.intOrder(first, prev.first) == .gt) first else prev.first;
+        const overlap_end = if (sema.intOrder(end, prev.last) == .lt) end else prev.last;
+        const prev_span = prev.src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+        if (overlap_start == overlap_end) {
+            const err = sema.fail(block, src, "duplicate switch value '{f}'", .{sema.fmtValue(overlap_start)});
+            try sema.zcu.addNote(sema.file, prev_span, "{s}", .{if (prev.first == prev.last) "previous value here" else "previous value inside range here"});
+            return err;
+        }
+        const err = sema.fail(block, src, "duplicate switch ranges", .{});
+        if (first == prev.first and end == prev.last) {
+            try sema.zcu.addNote(sema.file, prev_span, "previous range here", .{});
+        } else {
+            try sema.zcu.addNote(sema.file, prev_span, "overlaps with previous range here", .{});
+            try sema.zcu.addNote(sema.file, prev_span, "ranges overlap from '{f}' to '{f}'", .{ sema.fmtValue(overlap_start), sema.fmtValue(overlap_end) });
+        }
+        return err;
+    }
+    try seen.ranges.insert(sema.gpa, lo, .{ .first = first, .last = end, .src = src });
+}
+
 fn switchCaseMatches(sema: *Sema, c: SwitchCase, v: Index) !bool {
     for (c.items) |item| if (item == v) return true;
     for (c.ranges) |r| {
@@ -14195,40 +14416,27 @@ fn switchCaseMatches(sema: *Sema, c: SwitchCase, v: Index) !bool {
     return false;
 }
 
-/// Whether the items and ranges of `cases` cover every value of int type
-/// `ty`, or of packed type `ty`'s backing integer.
-fn switchCoversAllInts(sema: *Sema, block: *Block, src: Src, cases: []const SwitchCase, operand_ty: Index) !bool {
-    if (operand_ty == .comptime_int_type) return false;
+/// Whether the items and ranges `seen` cover every value of int type `ty`,
+/// or of packed type `ty`'s backing integer: they are distinct values of
+/// the type, so they do if there are as many as it has values.
+fn switchCoversAllInts(sema: *Sema, seen: *const SwitchSeen, ty: Index) bool {
     const ip = sema.ip;
-    const is_packed = Type.isPacked(ip, operand_ty);
-    const ty = if (is_packed) ip.structInfo(operand_ty).tag_type else operand_ty;
+    if (ty == .comptime_int_type) return false;
+    if (Type.isPacked(ip, ty)) {
+        const bits = Type.intInfo(ip, ip.structInfo(ty).tag_type).bits;
+        return bits < 64 and seen.values.count() == @as(u64, 1) << @intCast(bits);
+    }
+    // The prongs' ranges are disjoint, so they cover the type when their
+    // lengths add up to its size.
     const info = Type.intInfo(ip, ty);
-    if (info.bits > 64) return false;
-    const Interval = struct {
-        lo: i128,
-        hi: i128,
-        fn lessThan(_: void, x: @This(), y: @This()) bool {
-            return x.lo < y.lo;
-        }
-    };
-    var intervals: std.ArrayList(Interval) = .empty;
-    for (cases) |c| {
-        for (c.items) |item| {
-            const int = if (is_packed) (try sema.reinterpretBits(block, src, ty, .fromInterned(item))).toInterned() orelse return false else item;
-            const v = ip.intValue(i128, int) orelse return false;
-            try intervals.append(sema.arena, .{ .lo = v, .hi = v });
-        }
-        for (c.ranges) |r| try intervals.append(sema.arena, .{ .lo = ip.intValue(i128, r[0]).?, .hi = ip.intValue(i128, r[1]).? });
+    if (info.bits > 128) return false;
+    var count: u256 = 0;
+    for (seen.ranges.items) |r| {
+        const first: i256 = if (info.signedness == .signed) ip.intValue(i128, r.first).? else ip.intValue(u128, r.first).?;
+        const last: i256 = if (info.signedness == .signed) ip.intValue(i128, r.last).? else ip.intValue(u128, r.last).?;
+        count += @intCast(last - first + 1);
     }
-    std.mem.sort(Interval, intervals.items, {}, Interval.lessThan);
-    // Sweep: every value from min to max must be in some interval.
-    var next: i128 = ip.intValue(i128, try sema.minIntValue(ty)).?;
-    const max = ip.intValue(i128, try sema.maxIntValue(ty)).?;
-    for (intervals.items) |iv| {
-        if (iv.lo > next) return false;
-        next = @max(next, iv.hi + 1);
-    }
-    return next > max;
+    return count == @as(u256, 1) << @intCast(info.bits);
 }
 
 fn switchProngsRuntime(
@@ -14341,6 +14549,15 @@ fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, opera
     return sema.resolveBlock(parent, src, &outer, &label.merges);
 }
 
+/// A tag capture in a switch on `ty`, which is not a tagged union.
+fn failTagCapture(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError {
+    if (Type.class(sema.ip, ty) != .@"union") return sema.fail(block, src, "cannot capture tag of non-union type '{f}'", .{sema.fmtType(ty)});
+    const err = sema.fail(block, src, "cannot capture tag of packed union", .{});
+    try sema.addDeclaredHereNote(ty);
+    if (sema.containerDecl(ty)) |d| try sema.zcu.addNote(d.file, (try sema.zcu.fe.tree(@fromBackingInt(d.file))).nodeToSpan(d.node), "consider using a tagged union", .{});
+    return err;
+}
+
 /// What a switch on `operand` compares: a tagged union's tag, a packed
 /// struct's or union's bits, or the operand.
 fn switchCond(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
@@ -14352,7 +14569,11 @@ fn switchCond(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!R
     }
     if (Type.class(ip, ty) != .@"union") return operand;
     try sema.resolveLayout(block, src, ty);
-    if (ip.keyTag(ip.structInfo(ty).tag_type) != .enum_type) return sema.fail(block, src, "switch on union with no attached enum", .{});
+    if (ip.keyTag(ip.structInfo(ty).tag_type) != .enum_type) {
+        const err = sema.fail(block, src.operandSrc(0), "switch on union with no attached enum", .{});
+        if (sema.containerDecl(ty)) |d| try sema.zcu.addNote(d.file, (try sema.zcu.fe.tree(@fromBackingInt(d.file))).nodeToSpan(d.node), "consider 'union(enum)' here", .{});
+        return err;
+    }
     return sema.unionTag(block, src, operand);
 }
 

@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n42\n39\n5\n1\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n42\n39\n5\n1\n3\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -218,6 +218,16 @@ fn partlyWritten() u64 {
     return t;
 }
 
+// zbor (src/builder.zig): ranges that cover all of u64 make a switch
+// exhaustive without an `else`.
+fn headBytes(v: u64) u8 {
+    return switch (v) {
+        0x00...0x17 => 1,
+        0x18...0xffffffff => 2,
+        0x0000000100000000...0xffffffffffffffff => 3,
+    };
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -284,5 +294,8 @@ fn main() callconv(.c) noreturn {
     rt.printInt(liveAcrossClobber(seven));
     rt.printInt(comptime transmuteBytes(u64, [2]u32{ 5, 0 }));
     rt.printInt(@intFromBool(comptime partlyWritten() == 0xaaaaaaaaaaaaaa05));
+    var big: u64 = 0x1_0000_0000;
+    _ = &big;
+    rt.printInt(headBytes(big));
     rt.exit(0);
 }
