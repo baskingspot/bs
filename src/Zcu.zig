@@ -122,6 +122,9 @@ pub const ErrorMsg = struct {
     file: u32,
     span: Ast.Span,
     msg: []const u8,
+    notes: []const Note = &.{},
+
+    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8 };
 };
 
 pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
@@ -200,23 +203,42 @@ pub fn addError(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []cons
     try zcu.errors.append(zcu.gpa, .{ .file = file_index, .span = span, .msg = msg });
 }
 
+/// Adds a note to the most recent error.
+pub fn addNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
+    const arena = zcu.arena.allocator();
+    const e = &zcu.errors.items[zcu.errors.items.len - 1];
+    const notes = try arena.alloc(ErrorMsg.Note, e.notes.len + 1);
+    @memcpy(notes[0..e.notes.len], e.notes);
+    notes[e.notes.len] = .{ .file = file_index, .span = span, .msg = try std.fmt.allocPrint(arena, fmt, args) };
+    e.notes = notes;
+}
+
+fn srcLoc(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip, file_index: u32, span: Ast.Span) !std.zig.ErrorBundle.SourceLocationIndex {
+    const loc = std.zig.findLineColumn(try zcu.fe.source(@fromBackingInt(file_index)), span.main);
+    return wip.addSourceLocation(.{
+        .src_path = try wip.addString(zcu.file(file_index).display_path),
+        .span_start = span.start,
+        .span_main = span.main,
+        .span_end = span.end,
+        .line = @intCast(loc.line),
+        .column = @intCast(loc.column),
+        .source_line = try wip.addString(loc.source_line),
+    });
+}
+
 pub fn renderErrors(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip) !void {
     for (zcu.fe.late_errors.items) |b| try wip.addBundleAsRoots(b);
     for (zcu.errors.items) |e| {
-        const f = zcu.file(e.file);
-        const loc = std.zig.findLineColumn(try zcu.fe.source(@fromBackingInt(e.file)), e.span.main);
         try wip.addRootErrorMessage(.{
             .msg = try wip.addString(e.msg),
-            .src_loc = try wip.addSourceLocation(.{
-                .src_path = try wip.addString(f.display_path),
-                .span_start = e.span.start,
-                .span_main = e.span.main,
-                .span_end = e.span.end,
-                .line = @intCast(loc.line),
-                .column = @intCast(loc.column),
-                .source_line = try wip.addString(loc.source_line),
-            }),
+            .src_loc = try zcu.srcLoc(wip, e.file, e.span),
+            .notes_len = @intCast(e.notes.len),
         });
+        const start = try wip.reserveNotes(@intCast(e.notes.len));
+        for (e.notes, start..) |n, i| {
+            const note = try wip.addErrorMessage(.{ .msg = try wip.addString(n.msg), .src_loc = try zcu.srcLoc(wip, n.file, n.span) });
+            wip.extra.items[i] = @backingInt(note);
+        }
     }
 }
 

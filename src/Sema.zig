@@ -738,6 +738,17 @@ fn failUnsupported(sema: *Sema, block: *Block, src: Src, what: []const u8) Compi
     return sema.fail(block, src, "zap does not support {s} yet", .{what});
 }
 
+/// Notes call site `src` on the error a failed call reported (if it reported
+/// one since there were `n_errors`), and returns `err`.
+fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: CompileError, comptime note: []const u8) CompileError {
+    _ = block;
+    if (err == error.AnalysisFail and sema.zcu.errors.items.len > n_errors) {
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        try sema.zcu.addNote(sema.file, src.span(tree), note, .{});
+    }
+    return err;
+}
+
 /// Converts a dependency loop reported by the Zcu into a compile error here.
 fn depLoop(sema: *Sema, block: *Block, src: Src, err: CompileError) CompileError {
     return switch (err) {
@@ -1749,6 +1760,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.pl_node.src_node);
             break :blk sema.analyzeArithmetic(block, src, tag, sema.resolveInst(extra.lhs), sema.resolveInst(extra.rhs));
         },
+        .array_cat => sema.zirArrayCat(block, inst),
         .min, .max => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             break :blk sema.analyzeMinMax(block, block.nodeSrc(data.pl_node.src_node), tag, &.{ sema.resolveInst(extra.lhs), sema.resolveInst(extra.rhs) });
@@ -7655,6 +7667,119 @@ fn zirArrayInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     }
 }
 
+/// `lhs ++ rhs`: arrays, pointers to arrays, comptime-known slices, and
+/// tuples. The result is an array, or a constant pointer to one if either
+/// operand is a pointer; two tuples give a tuple.
+fn zirArrayCat(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const ip = sema.ip;
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const extra = sema.code.extraData(Zir.Inst.Bin, data.payload_index).data;
+    const src = block.nodeSrc(data.src_node);
+    const lhs = sema.resolveInst(extra.lhs);
+    const rhs = sema.resolveInst(extra.rhs);
+    const lhs_ty = sema.typeOf(lhs);
+    const rhs_ty = sema.typeOf(rhs);
+    const lhs_tuple = ip.indexToKey(lhs_ty) == .tuple_type;
+    const rhs_tuple = ip.indexToKey(rhs_ty) == .tuple_type;
+    if (lhs_tuple and rhs_tuple) {
+        const a = ip.indexToKey(lhs_ty).tuple_type;
+        const b = ip.indexToKey(rhs_ty).tuple_type;
+        if (a.types.len == 0) return rhs;
+        if (b.types.len == 0) return lhs;
+        const n = a.types.len + b.types.len;
+        const types = try sema.arena.alloc(Index, n);
+        const values = try sema.arena.alloc(Index, n);
+        @memcpy(types[0..a.types.len], a.types);
+        @memcpy(types[a.types.len..], b.types);
+        @memcpy(values[0..a.types.len], a.values);
+        @memcpy(values[a.types.len..], b.values);
+        const ty = try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } });
+        const elems = try sema.arena.alloc(Ref, n);
+        for (elems, 0..) |*e, i| e.* = if (i < a.types.len)
+            try sema.tupleField(block, lhs, @intCast(i))
+        else
+            try sema.tupleField(block, rhs, @intCast(i - a.types.len));
+        return sema.aggregate(block, src, ty, elems);
+    }
+    const l = try sema.arrayCatInfo(block, src, lhs, rhs_ty) orelse
+        return sema.fail(block, src, "expected indexable; found '{f}'", .{sema.fmtType(lhs_ty)});
+    const r = try sema.arrayCatInfo(block, src, rhs, lhs_ty) orelse
+        return sema.fail(block, src, "expected indexable; found '{f}'", .{sema.fmtType(rhs_ty)});
+    const elem_ty = try sema.peerPair(block, src, l.elem, r.elem);
+    // Both sentinels must agree; a lone sentinel is kept.
+    var sentinel: Index = .none;
+    if (l.sentinel != .none or r.sentinel != .none) {
+        const ls: Index = if (l.sentinel == .none) .none else sema.resolveValue(try sema.coerce(block, elem_ty, .fromInterned(l.sentinel), src)).?;
+        const rs: Index = if (r.sentinel == .none) .none else sema.resolveValue(try sema.coerce(block, elem_ty, .fromInterned(r.sentinel), src)).?;
+        sentinel = if (ls == .none) rs else if (rs == .none or rs == ls) ls else .none;
+    }
+    const len = l.len + r.len;
+    const result_ty = try sema.intern(.{ .array_type = .{ .len = len, .child = elem_ty, .sentinel = sentinel } });
+    const elems = try sema.arena.alloc(Ref, @intCast(len + @intFromBool(sentinel != .none)));
+    try sema.catElems(block, src, lhs, elem_ty, elems[0..@intCast(l.len)]);
+    try sema.catElems(block, src, rhs, elem_ty, elems[@intCast(l.len)..@intCast(len)]);
+    if (sentinel != .none) elems[@intCast(len)] = .fromInterned(sentinel);
+    const result = try sema.aggregate(block, src, result_ty, elems);
+    const is_ptr = Type.class(ip, lhs_ty) == .pointer or Type.class(ip, rhs_ty) == .pointer;
+    return if (is_ptr) sema.analyzeRef(block, src, result) else result;
+}
+
+const ArrayCatInfo = struct { elem: Index, len: u64, sentinel: Index };
+
+fn arrayCatInfo(sema: *Sema, block: *Block, src: Src, operand: Ref, peer_ty: Index) CompileError!?ArrayCatInfo {
+    const ip = sema.ip;
+    const ty = sema.typeOf(operand);
+    switch (ip.indexToKey(ty)) {
+        .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel },
+        .ptr_type => |p| switch (p.flags.size) {
+            .slice => {
+                const v = try sema.resolveConstValue(block, src, operand, "slice value being concatenated must be comptime-known");
+                if (sema.isUndef(v)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+                return .{ .elem = p.child, .len = ip.intValue(u64, ip.indexToKey(v).slice.len).?, .sentinel = p.sentinel };
+            },
+            .one => if (ip.indexToKey(p.child) == .array_type) {
+                const a = ip.indexToKey(p.child).array_type;
+                return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel };
+            },
+            .many, .c => {},
+        },
+        .tuple_type => |t| {
+            const peer_elem: Index = switch (ip.indexToKey(peer_ty)) {
+                .array_type => |a| a.child,
+                .ptr_type => |p| if (p.flags.size != .one)
+                    p.child
+                else if (ip.indexToKey(p.child) == .array_type)
+                    ip.indexToKey(p.child).array_type.child
+                else
+                    return null,
+                else => return null,
+            };
+            return .{ .elem = peer_elem, .len = t.types.len, .sentinel = .none };
+        },
+        else => {},
+    }
+    return null;
+}
+
+/// The elements of `++` operand `operand`, coerced to `elem_ty`.
+fn catElems(sema: *Sema, block: *Block, src: Src, operand: Ref, elem_ty: Index, out: []Ref) CompileError!void {
+    const ip = sema.ip;
+    const ty = sema.typeOf(operand);
+    // A comptime-known array (directly or behind a pointer) is read once.
+    var val: ?Index = if (sema.resolveValue(operand)) |v| switch (ip.indexToKey(ty)) {
+        .ptr_type => |p| if (p.flags.size == .one) try sema.comptimeLoadOrNull(block, src, v) else null,
+        else => v,
+    } else null;
+    if (val == .none) val = null;
+    for (out, 0..) |*e, i| {
+        const elem: Ref = if (val) |v|
+            .fromInterned(try sema.elemValue(v, i))
+        else
+            try sema.elemVal(block, src, operand, .fromInterned(try sema.intValue(.usize_type, i)), false);
+        e.* = try sema.coerce(block, elem_ty, elem, src);
+    }
+}
+
 fn zirOptEuBasePtrInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].un_node;
     const src = block.nodeSrc(data.src_node);
@@ -8333,10 +8458,14 @@ fn analyzeCall(
     if (comptime_call) {
         const vals = try sema.arena.alloc(Index, args.len);
         for (args, vals) |a, *v| v.* = try sema.resolveConstValue(block, src, a, "argument to function being called at comptime must be comptime-known");
-        return .fromInterned(try sema.callComptime(block, src, func, vals));
+        const n = sema.zcu.errors.items.len;
+        return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, "called at comptime from here"));
     }
 
-    if (fn_ty.cc == .@"inline" or modifier == .always_inline) return sema.inlineCall(block, src, func, args);
+    if (fn_ty.cc == .@"inline" or modifier == .always_inline) {
+        const n = sema.zcu.errors.items.len;
+        return sema.inlineCall(block, src, func, args) catch |err| return sema.noteCallSite(block, src, n, err, "called inline here");
+    }
 
     var callee_func = func;
     var call_args = args;
@@ -8347,7 +8476,8 @@ fn analyzeCall(
         if (Type.isComptimeOnly(ip, ip.indexToKey(ip.typeOf(callee_func)).func_type.return_type)) {
             const vals = try sema.arena.alloc(Index, args.len);
             for (args, vals) |a, *v| v.* = try sema.resolveConstValue(block, src, a, "argument to function being called at comptime must be comptime-known");
-            return .fromInterned(try sema.callComptime(block, src, func, vals));
+            const n = sema.zcu.errors.items.len;
+            return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, "called at comptime from here"));
         }
     }
     try sema.requireRuntime(block, src);
