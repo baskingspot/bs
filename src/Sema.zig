@@ -5537,7 +5537,7 @@ fn errorSetNames(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!?
         .error_set_type => |names| names,
         .inferred_error_set_type => |func| {
             if (func == sema.func) return null;
-            try sema.declareDependency(.{ .func_ies = func });
+            try sema.declareDep(.{ .func_ies = func }, if (sema.bc) |bc| bc.call_ies.contains(func) else false);
             try sema.bcRequire(sema.zcu.funcs.get(func) == .done);
             return sema.zcu.ensureFuncIes(func) catch |err| switch (err) {
                 error.DependencyLoop => return sema.fail(block, src, "unable to resolve inferred error set", .{}),
@@ -11696,7 +11696,7 @@ fn errSetIsEmpty(sema: *Sema, block: *Block, ty: Index) CompileError!bool {
             if (func == sema.func) return false;
             if (block.inlining) |inl| if (inl.ret_ty != .none and sema.ip.keyTag(inl.ret_ty) == .error_union_type and
                 sema.ip.keyPayload(.error_union_type, inl.ret_ty).error_set_type == ty) return false;
-            try sema.declareDependency(.{ .func_ies = func });
+            try sema.declareDep(.{ .func_ies = func }, if (sema.bc) |bc| bc.call_ies.contains(func) else false);
             try sema.bcRequire(sema.zcu.funcs.get(func) == .done);
             break :blk (sema.zcu.ensureFuncIes(func) catch |err| switch (err) {
                 error.DependencyLoop => return false,
@@ -14212,7 +14212,9 @@ fn analyzeCall(
         if (try sema.isComptimeOnlyResolved(block, src, pt)) return sema.fail(block, src, "parameter of comptime-only type '{f}' must be declared comptime", .{sema.fmtType(pt)});
     }
     if (callee_fn_ty.cc == .naked) return sema.fail(block, src, "unable to call function with naked calling convention", .{});
-    try sema.declareDependency(.{ .nav_val = ip.keyPayload(.func, callee_func).owner_nav });
+    // While lowering, the walker would call it at comptime, which does not
+    // read its declaration.
+    try sema.declareDep(.{ .nav_val = ip.keyPayload(.func, callee_func).owner_nav }, sema.bc != null);
     // The comptime evaluator calls it at comptime instead.
     if (sema.bc == null) try sema.zcu.queueFuncFrom(sema.owner, callee_func);
     for (callee_fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
@@ -14222,6 +14224,7 @@ fn analyzeCall(
         const eu = ip.keyPayload(.error_union_type, call_ret_ty);
         if (eu.error_set_type == .adhoc_inferred_error_set_type) {
             const ies = try sema.intern(.{ .inferred_error_set_type = callee_func });
+            if (sema.bc) |bc| try bc.call_ies.put(sema.arena, callee_func, {});
             call_ret_ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = ies, .payload_type = eu.payload_type } });
         }
     }
@@ -14664,6 +14667,10 @@ const BcLowering = struct {
     osr_code: ?*const Zir = null,
     /// `resolveInst` may hand out a run-time comptime_int.
     comptime_int_ok: bool = false,
+    /// Functions whose inferred error set types a call lowered as a
+    /// run-time call: the walker calls them at comptime, typed with the
+    /// ad hoc set, and reads no `func_ies` for them.
+    call_ies: std.AutoHashMapUnmanaged(Index, void) = .empty,
 };
 
 /// Backward branches a comptime loop takes, counting nested ones, before

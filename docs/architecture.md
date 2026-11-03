@@ -431,8 +431,14 @@ would run reads D, lowering places a `comptime_dep` instruction in the
 innermost runtime block, and a run that reaches it declares the plain edge,
 once per memoizable call in progress; a read outside any runtime block of
 the body (or in instructions lowering discards) is declared plain by every
-run (`Bytecode.entry_deps`). A plain declaration wins over a conditional
-one, and memo entries keep the flag. A unit's edges therefore cover what
+run (`Bytecode.entry_deps`). A call that lowering compiles as a run-time
+call is a comptime call to the walker (`callComptime`), which reads only
+the callee's `func_body` and types the result with the ad hoc error set.
+So the run-time call's own reads are conditional: the callee's owner
+`nav_val`, and the `func_ies` of an inferred error set that only such a
+call introduced (`BcLowering.call_ies`). If they were plain, a unit's
+plain edges would depend on which tier ran a call. A plain declaration
+wins over a conditional one, and memo entries keep the flag. A unit's edges therefore cover what
 the walker would have read (plain) plus the lowering's other reads
 (conditional), whichever tier ran its calls; since call counts differ
 between an edit build and a full build, so can where lowering happens and
