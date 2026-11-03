@@ -54,7 +54,15 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const runner_dir = try std.fmt.allocPrint(arena, "{s}/zap/o/{x:0>32}", .{ global, runner_hash });
     try Io.Dir.cwd().createDirPath(io, runner_dir);
     const runner_path = try std.fs.path.join(arena, &.{ runner_dir, "maker" });
-    {
+    // With zap's own zig lib directory, the pinned release's, which nobody
+    // edits, a runner that is as the last check left it is current: that
+    // saves the check's stat of every source the runner imports (about
+    // 3 ms of a 38 ms no-change build). A lib directory given with
+    // `--zig-lib=` or ZIG_LIB_DIR may be a source tree under edit, so it
+    // is always checked.
+    const stamp_path = try std.fs.path.join(arena, &.{ runner_dir, "maker.stat" });
+    const trusted_lib = lib_override == null and env.get("ZIG_LIB_DIR") == null;
+    if (!(trusted_lib and runnerUnchanged(io, runner_path, stamp_path))) {
         const root_path = try std.fs.path.join(arena, &.{ runner_dir, "root.zig" });
         const same = if (Io.Dir.cwd().readFileAlloc(io, root_path, arena, .limited(4096))) |old| std.mem.eql(u8, old, root_source) else |_| false;
         if (!same) {
@@ -63,8 +71,33 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
             try atomic.file.writeStreamingAll(io, root_source);
             try atomic.replace(io);
         }
+        try compileRunner(init, runner_dir, zig_lib_dir, global);
+        noteRunner(io, runner_path, stamp_path);
     }
 
+    const self_exe = try std.process.executablePathAlloc(io, arena);
+    var seed_bytes: [4]u8 = undefined;
+    io.random(&seed_bytes);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{
+        runner_path,
+        "build",
+        try std.fmt.allocPrint(arena, "--zig-lib={s}", .{zig_lib_dir}),
+        try std.fmt.allocPrint(arena, "--zig={s}", .{self_exe}),
+        try std.fmt.allocPrint(arena, "--global-cache={s}", .{global}),
+        try std.fmt.allocPrint(arena, "--seed=0x{x}", .{std.mem.readInt(u32, &seed_bytes, .little)}),
+    });
+    try argv.appendSlice(arena, user_args);
+    if (env.get("ZIG_VERBOSE_CMD") != null) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});
+    const err = std.process.replace(io, .{ .argv = argv.items, .environ_map = env });
+    main.fatal("the following command failed to execve with '{t}':\n{s}", .{ err, try std.mem.join(arena, " ", argv.items) });
+}
+
+/// Compiles the runner into `<runner_dir>/maker`, from that directory.
+fn compileRunner(init: std.process.Init, runner_dir: []const u8, zig_lib_dir: []const u8, global: []const u8) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const cwd = try std.process.currentPathAlloc(io, arena);
     // Compiled from its own directory, so that the compilation's key (which
     // includes the working directory) is the same for every project.
     try std.process.setCurrentPath(io, runner_dir);
@@ -94,21 +127,29 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
         }
     }
     try std.process.setCurrentPath(io, cwd);
+}
 
-    const self_exe = try std.process.executablePathAlloc(io, arena);
-    var seed_bytes: [4]u8 = undefined;
-    io.random(&seed_bytes);
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{
-        runner_path,
-        "build",
-        try std.fmt.allocPrint(arena, "--zig-lib={s}", .{zig_lib_dir}),
-        try std.fmt.allocPrint(arena, "--zig={s}", .{self_exe}),
-        try std.fmt.allocPrint(arena, "--global-cache={s}", .{global}),
-        try std.fmt.allocPrint(arena, "--seed=0x{x}", .{std.mem.readInt(u32, &seed_bytes, .little)}),
-    });
-    try argv.appendSlice(arena, user_args);
-    if (env.get("ZIG_VERBOSE_CMD") != null) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});
-    const err = std.process.replace(io, .{ .argv = argv.items, .environ_map = env });
-    main.fatal("the following command failed to execve with '{t}':\n{s}", .{ err, try std.mem.join(arena, " ", argv.items) });
+/// The runner's stat, as `noteRunner` recorded it after the last check.
+const RunnerStat = extern struct { inode: u64, size: u64, mtime: i64 };
+
+fn runnerStat(io: Io, path: []const u8) ?RunnerStat {
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    return .{ .inode = @intCast(st.inode), .size = st.size, .mtime = @intCast(st.mtime.toNanoseconds()) };
+}
+
+fn runnerUnchanged(io: Io, runner_path: []const u8, stamp_path: []const u8) bool {
+    var buf: [@sizeOf(RunnerStat)]u8 = undefined;
+    const bytes = Io.Dir.cwd().readFile(io, stamp_path, &buf) catch return false;
+    if (bytes.len != buf.len) return false;
+    const now = runnerStat(io, runner_path) orelse return false;
+    return std.mem.eql(u8, std.mem.asBytes(&now), bytes);
+}
+
+/// Records the stat of a runner that was just checked. Best effort.
+fn noteRunner(io: Io, runner_path: []const u8, stamp_path: []const u8) void {
+    const st = runnerStat(io, runner_path) orelse return;
+    var atomic = Io.Dir.cwd().createFileAtomic(io, stamp_path, .{ .replace = true }) catch return;
+    defer atomic.deinit(io);
+    atomic.file.writeStreamingAll(io, std.mem.asBytes(&st)) catch return;
+    atomic.replace(io) catch {};
 }
