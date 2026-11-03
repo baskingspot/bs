@@ -1255,7 +1255,12 @@ nothing.
 line, so lines added above a green function move its `base_line`
 without re-analysis. For green functions in changed files, the relink
 takes `base_line` from the new AST, the way it takes debug paths from the
-manifest's file table, and the manifest records the new value.
+manifest's file table, and the manifest records the new value. The same
+holds for the functions a green function inlines: an edit that moves a
+callee's lines leaves the caller green but its inline records' base lines
+stale, so the relink refreshes each inline's base line from its callee
+(which `Atom.Debug.inlines` records by nav or locator), and the verify
+edit scripts include moving an inlined callee's lines.
 
 Reviewed by the Sema thread (2026-11-03); its answers to the two open
 questions (calling back into `Zcu.ensure*`, anonymous types' ordinals) and
