@@ -7,6 +7,8 @@
 //!
 //!   R   ELF header, program headers, .rodata, .eh_frame, .eh_frame_hdr
 //!       (the last two present if `Options.debug` is not empty)
+//!       The first program header is PT_PHDR, as upstream's: a static
+//!       executable's std.posix.dl_iterate_phdr finds the load bias from it.
 //!   RX  .text
 //!   RW  .tdata and .tbss (thread-local, present if used), .data, then
 //!       .bss (memory only)
@@ -555,7 +557,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
     const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls;
     const has_cfi = n_debug > 0;
-    const phnum: u16 = 2 + @as(u16, @intFromBool(has_rx)) + @intFromBool(has_rw) + @intFromBool(has_cfi) + @intFromBool(has_tls);
+    const phnum: u16 = 3 + @as(u16, @intFromBool(has_rx)) + @intFromBool(has_rw) + @intFromBool(has_cfi) + @intFromBool(has_tls);
     const headers_end: u64 = @sizeOf(elf.Elf64.Ehdr) + phnum * @sizeOf(elf.Elf64.Phdr);
     var starts: [n_sections]u64 = undefined;
     starts[rodata] = aligns[rodata].forward(headers_end);
@@ -722,6 +724,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     });
     var ph_off: usize = @sizeOf(elf.Elf64.Ehdr);
     const phdrs = [_]struct { bool, elf.PT, elf.PF, u64, u64, u64, u64 }{
+        .{ true, .PHDR, .{ .R = true }, @sizeOf(elf.Elf64.Ehdr), phnum * @sizeOf(elf.Elf64.Phdr), phnum * @sizeOf(elf.Elf64.Phdr), 8 },
         .{ true, .LOAD, .{ .R = true }, 0, r_end, r_end, page_size },
         .{ has_rx, .LOAD, .{ .R = true, .X = true }, rx_start, text_end - rx_start, text_end - rx_start, page_size },
         .{ has_rw, .LOAD, .{ .R = true, .W = true }, rw_start, file_end - rw_start, mem_end - rw_start, page_size },
@@ -1809,6 +1812,15 @@ test "thread-locals in .tdata and .tbss read back after static TLS setup" {
     // are their offsets in the segment.
     const ehdr = std.mem.bytesAsValue(elf.Elf64.Ehdr, bytes[0..@sizeOf(elf.Elf64.Ehdr)]);
     const phdrs = std.mem.bytesAsSlice(elf.Elf64.Phdr, bytes[ehdr.phoff..][0 .. ehdr.phnum * @sizeOf(elf.Elf64.Phdr)]);
+    // PT_PHDR comes first and lies in the first, read-only PT_LOAD, as
+    // upstream's: std.posix.dl_iterate_phdr finds the load bias from it.
+    try std.testing.expectEqual(elf.PT.PHDR, phdrs[0].type);
+    try std.testing.expectEqual(0x40, phdrs[0].offset);
+    try std.testing.expectEqual(@as(u64, @intCast(base)) + 0x40, phdrs[0].vaddr);
+    try std.testing.expectEqual(ehdr.phnum * @sizeOf(elf.Elf64.Phdr), phdrs[0].filesz);
+    try std.testing.expectEqual(phdrs[0].filesz, phdrs[0].memsz);
+    try std.testing.expectEqual(8, phdrs[0].@"align");
+    try std.testing.expect(phdrs[1].type == .LOAD and phdrs[1].offset == 0 and phdrs[1].filesz >= phdrs[0].offset + phdrs[0].filesz);
     var tls: ?elf.Elf64.Phdr = null;
     var rw: ?elf.Elf64.Phdr = null;
     for (phdrs) |ph| {
