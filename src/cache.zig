@@ -84,9 +84,10 @@ pub fn parseSize(text: []const u8) ?u64 {
 /// directories total more than `max_bytes`, down to three quarters of it.
 /// A file hard-linked into several directories counts once, against the
 /// most recently used. Runs at most once a minute, so that it costs a build
-/// a few stats; `Incremental` runs it beside the link, and also, with
-/// `force`, after a build that started a directory. Returns null if it did
-/// not run.
+/// a few stats, and with `force`, which `Incremental` passes for a build
+/// that started a directory. `Incremental` runs it once the build's new
+/// pack is written, so that it counts. Returns null if it
+/// did not run.
 pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir, max_bytes: u64, force: bool) !?MaintainResult {
     const now = Io.Clock.real.now(io);
     var c = local_cache.openDir(io, "zap/c", .{ .iterate = true }) catch |err| switch (err) {
@@ -102,36 +103,72 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
     }
     try c.writeFile(io, .{ .sub_path = "trim", .data = "" });
 
-    const Compilation = struct { name: [32]u8, used: Io.Timestamp, bytes: u64 = 0 };
+    const File = struct { inode: u64, size: u64 };
+    const Compilation = struct {
+        name: [32]u8,
+        /// The lock file's mtime; null without one.
+        used: ?Io.Timestamp = null,
+        files: std.ArrayList(File) = .empty,
+        bytes: u64 = 0,
+    };
     var comps: std.ArrayList(Compilation) = .empty;
-    defer comps.deinit(gpa);
+    defer {
+        for (comps.items) |*comp| comp.files.deinit(gpa);
+        comps.deinit(gpa);
+    }
     var it = c.iterate();
     while (try it.next(io)) |e| {
         if (e.kind != .directory or e.name.len != 32) continue;
-        var buf: [64]u8 = undefined;
-        const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{e.name}) catch unreachable;
-        // A directory without a lock file is being created.
-        const stat = c.statFile(io, lock_path, .{}) catch continue;
-        try comps.append(gpa, .{ .name = e.name[0..32].*, .used = stat.mtime });
+        try comps.append(gpa, .{ .name = e.name[0..32].* });
     }
+    // Each directory's files, stat'ed on several threads: hundreds of
+    // directories take milliseconds on one.
+    const Worker = struct {
+        fn run(gpa_: std.mem.Allocator, io_: Io, c_: Io.Dir, comps_: []Compilation, first: usize, stride: usize) void {
+            var i = first;
+            while (i < comps_.len) : (i += stride) {
+                const comp = &comps_[i];
+                var d = c_.openDir(io_, &comp.name, .{ .iterate = true }) catch continue;
+                defer d.close(io_);
+                var files = d.iterate();
+                while (files.next(io_) catch null) |e| {
+                    if (e.kind != .file) continue;
+                    const stat = d.statFile(io_, e.name, .{}) catch continue;
+                    if (std.mem.eql(u8, e.name, "lock")) comp.used = stat.mtime;
+                    comp.files.append(gpa_, .{ .inode = @intCast(stat.inode), .size = stat.size }) catch return;
+                }
+            }
+        }
+    };
+    const n_threads = @max(1, @min(16, std.Thread.getCpuCount() catch 1, comps.items.len / 32));
+    var group: Io.Group = .init;
+    for (1..n_threads) |t| group.async(io, Worker.run, .{ gpa, io, c, comps.items, t, n_threads });
+    Worker.run(gpa, io, c, comps.items, 0, n_threads);
+    try group.await(io);
+    // A directory without a lock file is being created.
+    var n_comps: usize = 0;
+    for (comps.items) |*comp| {
+        if (comp.used == null) {
+            comp.files.deinit(gpa);
+            continue;
+        }
+        comps.items[n_comps] = comp.*;
+        n_comps += 1;
+    }
+    comps.shrinkRetainingCapacity(n_comps);
     // Most recently used first.
     std.mem.sortUnstable(Compilation, comps.items, {}, struct {
         fn newer(_: void, a: Compilation, b: Compilation) bool {
-            return a.used.compare(.gt, b.used);
+            return a.used.?.compare(.gt, b.used.?);
         }
     }.newer);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(gpa);
     var total: u64 = 0;
     for (comps.items) |*comp| {
-        var d = c.openDir(io, &comp.name, .{ .iterate = true }) catch continue;
-        defer d.close(io);
-        var files = d.iterate();
-        while (files.next(io) catch null) |e| {
-            if (e.kind != .file) continue;
-            const stat = d.statFile(io, e.name, .{}) catch continue;
-            if ((try seen.getOrPut(gpa, @intCast(stat.inode))).found_existing) continue;
-            comp.bytes += stat.size;
+        for (comp.files.items) |f| {
+            if ((try seen.getOrPut(gpa, f.inode)).found_existing) continue;
+            comp.bytes += f.size;
         }
         total += comp.bytes;
     }
@@ -143,7 +180,7 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
     while (i > 0) {
         i -= 1;
         const comp = &comps.items[i];
-        const old = comp.used.durationTo(now).toNanoseconds() > max_unused_compilation_ns;
+        const old = comp.used.?.durationTo(now).toNanoseconds() > max_unused_compilation_ns;
         if (!old and (!over or total <= target)) break;
         var buf: [64]u8 = undefined;
         const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{&comp.name}) catch unreachable;

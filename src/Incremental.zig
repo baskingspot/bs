@@ -755,9 +755,10 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     const gpa = inc.gpa;
     const io = inc.io;
     const t0 = now(io);
-    // Size limits, trimming, and the ZIR caches' garbage, beside the rest.
-    var maintaining = io.async(maintain, .{ inc, fe });
-    defer maintaining.await(io);
+    // The ZIR caches' garbage, beside the rest. (`Putter.writePack`
+    // applies the local cache's size limit.)
+    var trimming = io.async(Frontend.trimCaches, .{fe});
+    defer trimming.await(io);
     const ip = &zcu.ip;
     var r: Recorder = .{ .gpa = gpa, .zcu = zcu };
     defer r.deinit();
@@ -1097,15 +1098,13 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     return .{ .manifest = manifest, .base_names = names, .report = report };
 }
 
-/// The cache's upkeep that is not the store's (`Store.commit` maintains
-/// that): the local cache's size limit and trimming, and the ZIR caches'.
-/// Best effort.
-fn maintain(inc: *Incremental, fe: *const Frontend) void {
+/// The local cache's size limit and trimming (`Store.commit` maintains the
+/// store). Best effort.
+fn maintainLocal(inc: *const Incremental) void {
     // A new compilation directory is how the local cache grows.
     const t0 = now(inc.io);
     const r = cache.maintainCompilations(inc.gpa, inc.io, inc.local, inc.max_bytes, inc.prev == null) catch null;
     if (inc.timing) if (r) |m| std.debug.print("cache: local cache {d} directories, {d} MiB; deleted {d}, leaving {d} MiB, in {d:.2} ms beside the link\n", .{ m.scanned, m.bytes >> 20, m.deleted, m.bytes_after >> 20, ms(t0, now(inc.io)) });
-    fe.trimCaches();
 }
 
 /// Store packs at least this large are linked only if a build uses at
@@ -1183,7 +1182,11 @@ const Putter = struct {
 
     /// Writes the entries `where` puts, laid out as `entries` up to `end`,
     /// into the pack `Store.reserveName` named, if `any`, and commits it.
+    /// Then, while `record` writes the manifest, applies the local cache's
+    /// size limit, so that it counts the new pack; and also when writing
+    /// it fails, on a full disk say.
     fn writePack(p: Putter, io: Io, entries: []const Store.IndexEntry, end: u64, any: bool) !?Store.PackName {
+        defer p.inc.maintainLocal();
         if (!any) return null;
         var w: Store.PackWriter = undefined;
         try p.store.beginPack(io, p.inc.dir, &w);

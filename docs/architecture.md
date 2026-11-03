@@ -987,14 +987,21 @@ it and can flush every CPU's TLB.
   directories by their lock's mtime in `cache.maintainCompilations`,
   skipping those a build holds. A store pack that a compilation directory
   links keeps its space until the directory goes, which is why the local
-  limit counts the links. `record` runs the local scan beside the store
-  work, so builds do not wait for it: after a build that started a
-  directory (that is how the local cache grows) and otherwise at most
-  once a minute; a scan of 114 directories takes a few ms. Directories
-  unused for 5 days go regardless. The limit is enforced before a build
-  records, so the cache can pass it by the builds in flight: with a 1 GiB
-  limit, conformance runs by successive zap builds peak at 1.3 GB (the
-  x86_64 unit alone writes 630 MB). The ZIR caches are kept to the
+  limit counts the links. The local scan runs after a build that started
+  a directory (that is how the local cache grows) and otherwise at most
+  once a minute, once the build's new pack is in its directory, so that
+  the pack counts, while `record` writes the manifest; it stats the
+  directories on up to 16 threads (600 directories: 5–6 ms on this
+  4-core orb, overlapping the manifest's 8 ms). Directories unused for 5
+  days go regardless. The cache can pass the limit only by the packs of
+  builds still in flight (and by directories in use, which are never
+  deleted). Measured with conformance runs by successive zap builds (a
+  new identity each, `-j 16`), sampling `du` every second: with the
+  default 4G, six runs peak at 3.85 GB (before, when the scan ran before
+  the build's own pack was written: 4.47 GB after six); with 1G and two
+  such runs at a time, three rounds peak at 1.01 GB (before: 1.50 GB). A
+  limit below the working set cannot hold: two x86_64 units in use at
+  once are 1.1 GB. The ZIR caches are kept to the
   sources their index names (one version per path) plus a day of edits
   (`Frontend.trimCaches`, daily, also beside the store work).
 - **Why the cache grew without bound** (measured 2026-11-03): a
@@ -1008,6 +1015,13 @@ it and can flush every CPU's TLB.
   over a few days of compiler work. Merges could rewrite the large pack
   (above), and the old compilation directories' hard links kept merged and
   trimmed packs' space in use.
+- **Caches that still filled disks after the limit landed** (42–43 GB,
+  with 1.1 and 2.3 GB packs in compilation directories, linked up to 27
+  times): every one of those builds ran a zap built from a tree without
+  the limit (bases 775ce0b and 08a7029, before 7c31921). The 2.3 GB packs
+  were store merges of several zap builds' x86_64 packs, which the limit
+  now bounds, and their many links were directories pinning a big pack
+  for a few entries, which re-putting entries (above) now prevents.
 - **Writes that fail** (a full disk, say) cost reuse, not the build: a
   cache that cannot be opened is skipped with a warning; a recording that
   fails is discarded with a warning, as a damaged pack falls back; a ZIR
