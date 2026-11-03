@@ -5,7 +5,7 @@
 //! other instructions or InternPool values. Control flow is structured:
 //! `block`/`br`, `loop`/`repeat`, `cond_br`, and `switch_br` nest bodies, and
 //! every body ends with a `noreturn` instruction. Safety checks are explicit
-//! (`cond_br` to a `panic`), so CodeGen never decides semantics. The IR is
+//! (`cond_br` to a call of a `std.lang.panic` handler), so CodeGen never decides semantics. The IR is
 //! target-independent and precise enough to interpret.
 
 const std = @import("std");
@@ -228,8 +228,6 @@ pub const Inst = struct {
         unreach,
         /// `no_op`: `@trap()`.
         trap,
-        /// `panic`: a safety check failed.
-        panic,
 
         /// `pl_op` with `Call`: `operand` is the callee function value, or a
         /// function pointer for an indirect call.
@@ -333,75 +331,7 @@ pub const Inst = struct {
         br: struct { block_inst: Index, operand: Ref },
         repeat: struct { loop_inst: Index },
         dbg_stmt: struct { line: u32, column: u32 },
-        /// `payload` is a `Bin` for the formatted panics (see `PanicId`),
-        /// else unused.
-        panic: struct { id: PanicId, payload: u32 },
     };
-};
-
-/// The safety checks Sema emits. Messages match upstream's `std.debug`
-/// panic handler. (Milestone 3 calls `std.builtin.panic` instead.)
-pub const PanicId = enum(u32) {
-    reached_unreachable,
-    unwrap_null,
-    cast_to_null,
-    incorrect_alignment,
-    invalid_error_code,
-    integer_out_of_bounds,
-    integer_overflow,
-    shl_overflow,
-    shr_overflow,
-    divide_by_zero,
-    exact_division_remainder,
-    integer_part_out_of_bounds,
-    corrupt_switch,
-    shift_rhs_too_big,
-    invalid_enum_value,
-    for_len_mismatch,
-    copy_len_mismatch,
-    memcpy_alias,
-    noreturn_returned,
-    inactive_union_field,
-    /// Formatted with the `Bin` payload: index, len.
-    out_of_bounds,
-    /// Formatted with the `Bin` payload: start, end.
-    start_greater_than_end,
-    /// Formatted with the error's name; payload is `Bin` with `lhs` the error.
-    unwrap_error,
-    /// Formatted with the `Bin` payload: expected, found.
-    sentinel_mismatch,
-    /// `@panic(msg)`; payload is `Bin` with `lhs` the `[]const u8` message.
-    explicit,
-
-    pub fn message(id: PanicId) []const u8 {
-        return switch (id) {
-            .reached_unreachable => "reached unreachable code",
-            .unwrap_null => "attempt to use null value",
-            .cast_to_null => "cast causes pointer to be null",
-            .incorrect_alignment => "incorrect alignment",
-            .invalid_error_code => "invalid error code",
-            .integer_out_of_bounds => "integer does not fit in destination type",
-            .integer_overflow => "integer overflow",
-            .shl_overflow => "left shift overflowed bits",
-            .shr_overflow => "right shift overflowed bits",
-            .divide_by_zero => "division by zero",
-            .exact_division_remainder => "exact division produced remainder",
-            .integer_part_out_of_bounds => "integer part of floating point value out of bounds",
-            .corrupt_switch => "switch on corrupt value",
-            .shift_rhs_too_big => "shift amount is greater than the type size",
-            .invalid_enum_value => "invalid enum value",
-            .for_len_mismatch => "for loop over objects with non-equal lengths",
-            .copy_len_mismatch => "source and destination arguments have non-equal lengths",
-            .memcpy_alias => "@memcpy arguments alias",
-            .noreturn_returned => "'noreturn' function returned",
-            .inactive_union_field => "access of inactive union field",
-            .out_of_bounds => "index out of bounds",
-            .start_greater_than_end => "start index is larger than end index",
-            .unwrap_error => "attempt to unwrap error",
-            .sentinel_mismatch => "sentinel mismatch",
-            .explicit => "",
-        };
-    }
 };
 
 pub const Block = struct {
@@ -572,7 +502,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .int_from_bool => .u1_type,
         .int_from_ptr, .ret_addr, .frame_addr => .usize_type,
         .error_name => .slice_const_u8_sentinel_0_type,
-        .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap, .panic => .noreturn_type,
+        .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap => .noreturn_type,
         .call => ir.extraData(Call, data.pl_op.payload).data.ret_ty,
         .ptr_elem_val => blk: {
             const ptr = ip.indexToKey(ir.typeOf(data.bin_op.lhs, ip)).ptr_type;

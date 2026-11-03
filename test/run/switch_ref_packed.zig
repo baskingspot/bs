@@ -3,6 +3,7 @@
 //! Labeled switches with captures by reference, switches on packed structs
 //! and unions, and tag captures known from a single-item prong.
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"
         :

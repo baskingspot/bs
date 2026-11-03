@@ -1,6 +1,7 @@
 //! exit: 0
 //! stdout: "3\n0\n1\n9\n6\n2\n98\n12\n4\n7\n"
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 // For `std.lang.CallModifier`; std.start sees `_start` and stays out.
 const std = @import("std");
 

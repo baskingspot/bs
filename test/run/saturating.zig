@@ -1,8 +1,8 @@
 //! signal: ABRT
 //! stdout: "14874824514990236704\n14874824514990236704\n7078674556814143519\n7078674556814143519\n9223372036854775808\n18446744073709551615\n18446744073709551615\n32767\n18446744073709518848\n10\n28\n3\n16\n"
 //! stderr: "panic: shift amount is greater than the type size\n"
-//! upstream-signal: SEGV
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

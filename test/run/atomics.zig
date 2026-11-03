@@ -1,6 +1,7 @@
 //! exit: 0
 //! stdout: "5\n10\n15\n12\n268\n7\n9\n2\n253\n253\n251\n1\n4\n1\n1\n2\n11\n27\n"
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 // For `std.lang.AtomicOrder` and `AtomicRmwOp`; std.start sees `_start` and stays out.
 const std = @import("std");
 pub export fn _start() callconv(.naked) noreturn {

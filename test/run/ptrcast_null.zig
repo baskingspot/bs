@@ -1,8 +1,8 @@
 //! signal: ABRT
 //! stdout: "42\n1\n42\n"
 //! stderr: "panic: cast causes pointer to be null\n"
-//! upstream-signal: SEGV
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn { asm volatile ("call %[main:P]" : : [main] "X" (&main)); }
 const T = struct { x: u32 };
 var t: T = .{ .x = 42 };

@@ -43,6 +43,8 @@ func: Index = .none,
 /// Return type of the function whose body (runtime, or comptime-inlined)
 /// is being analyzed.
 fn_ret_ty: Index = .none,
+/// See `panicNamespace`; `.none` until resolved.
+panic_ns: Index = .none,
 ir_insts: std.MultiArrayList(Ir.Inst) = .empty,
 ir_extra: std.ArrayList(u32) = .empty,
 inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Ref) = .empty,
@@ -958,9 +960,100 @@ fn addStructField(sema: *Sema, block: *Block, tag: Ir.Inst.Tag, ty: Index, opera
     return sema.addInst(block, .{ .tag = tag, .data = .{ .ty_pl = .{ .ty = ty, .payload = payload } } });
 }
 
-fn addPanic(sema: *Sema, block: *Block, id: Ir.PanicId, lhs: Ref, rhs: Ref) !void {
-    const payload = if (lhs != .none) try sema.addExtra(Ir.Bin{ .lhs = lhs, .rhs = rhs }) else 0;
-    _ = try sema.addInst(block, .{ .tag = .panic, .data = .{ .panic = .{ .id = id, .payload = payload } } });
+/// The panics Sema emits, each a call of the `std.lang.panic` handler
+/// named after it (`integer_overflow` calls `integerOverflow`).
+const PanicId = enum(u32) {
+    reached_unreachable,
+    unwrap_null,
+    cast_to_null,
+    incorrect_alignment,
+    invalid_error_code,
+    integer_out_of_bounds,
+    integer_overflow,
+    shl_overflow,
+    shr_overflow,
+    divide_by_zero,
+    exact_division_remainder,
+    integer_part_out_of_bounds,
+    corrupt_switch,
+    shift_rhs_too_big,
+    invalid_enum_value,
+    for_len_mismatch,
+    copy_len_mismatch,
+    memcpy_alias,
+    noreturn_returned,
+    /// With the active and accessed tags.
+    inactive_union_field,
+    /// With the index and length.
+    out_of_bounds,
+    /// With the start and end.
+    start_greater_than_end,
+    /// With the error.
+    unwrap_error,
+    /// With the expected and found sentinels.
+    sentinel_mismatch,
+    /// `@panic(msg)`: calls `call(msg, null)`.
+    explicit,
+};
+
+fn addPanic(sema: *Sema, block: *Block, id: PanicId, lhs: Ref, rhs: Ref) CompileError!void {
+    // As upstream, call the handler in `std.lang.panic`.
+    const ns = try sema.panicNamespace(block);
+    const src = block.nodeSrc(.zero);
+    const name: []const u8, const args: []const Ref = switch (id) {
+        .explicit => .{ "call", &.{ lhs, .fromInterned(try sema.intern(.{ .opt = .{ .ty = try sema.optType(.usize_type), .val = .none } })) } },
+        .out_of_bounds => .{ "outOfBounds", &.{ lhs, rhs } },
+        .start_greater_than_end => .{ "startGreaterThanEnd", &.{ lhs, rhs } },
+        .sentinel_mismatch => .{ "sentinelMismatch", &.{ lhs, rhs } },
+        // zap tags an untagged union with an integer, which has no
+        // field names to report.
+        .inactive_union_field => if (Type.class(sema.ip, sema.typeOf(lhs)) == .@"enum")
+            .{ "inactiveUnionField", &.{ lhs, rhs } }
+        else
+            .{ "call", &.{ .fromInterned(try sema.stringLiteral("access of inactive union field")), .fromInterned(try sema.intern(.{ .opt = .{ .ty = try sema.optType(.usize_type), .val = .none } })) } },
+        .unwrap_error => .{ "unwrapError", &.{lhs} },
+        inline else => |tag| .{ comptime panicFnName(tag), &.{} },
+    };
+    const callee = try sema.namespaceLookupVal(block, src, ns, name);
+    _ = try sema.analyzeCall(block, src, callee, .none, .{ .resolved = try sema.arena.dupe(Ref, args) }, .auto);
+    _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+}
+
+/// `std.lang.panic`, the namespace of panic handlers: the root file's
+/// `panic` if it declares one, else std's default handler.
+fn panicNamespace(sema: *Sema, block: *Block) CompileError!Index {
+    if (sema.panic_ns != .none) return sema.panic_ns;
+    const src = block.nodeSrc(.zero);
+    // `std.lang.panic` is the root's namespace when it declares one; read
+    // it directly, which needs no std (the root's deprecated panic
+    // function does go through std).
+    const root_ty = try sema.zcu.fileRootType(sema.zcu.moduleRootFile(.root).?);
+    const root_panic: ?Index = if (try sema.lookupInType(root_ty, "panic")) |nav| blk: {
+        const val = try sema.navVal(block, src, nav);
+        break :blk if (sema.typeOf(val) == .type_type) try sema.analyzeAsType(block, src, val) else null;
+    } else null;
+    sema.panic_ns = root_panic orelse try sema.analyzeAsType(block, src, try sema.stdLangDecl(block, src, "panic"));
+    return sema.panic_ns;
+}
+
+/// The `std.lang.panic` function for a panic without operands:
+/// `integer_overflow` is `integerOverflow`.
+fn panicFnName(comptime id: PanicId) []const u8 {
+    const tag = @tagName(id);
+    var out: [tag.len]u8 = undefined;
+    var n: usize = 0;
+    var upper = false;
+    for (tag) |c| {
+        if (c == '_') {
+            upper = true;
+            continue;
+        }
+        out[n] = if (upper) std.ascii.toUpper(c) else c;
+        upper = false;
+        n += 1;
+    }
+    const final = out[0..n].*;
+    return &final;
 }
 
 /// Appends a body's length and instructions to `ir_extra`.
@@ -969,7 +1062,7 @@ fn appendBody(sema: *Sema, body: []const Ir.Inst.Index) !void {
 }
 
 /// Emits `if (!ok) panic(id)`.
-fn addSafetyCheck(sema: *Sema, block: *Block, ok: Ref, id: Ir.PanicId, lhs: Ref, rhs: Ref) !void {
+fn addSafetyCheck(sema: *Sema, block: *Block, ok: Ref, id: PanicId, lhs: Ref, rhs: Ref) !void {
     if (ok.toInterned()) |v| {
         if (v == .bool_true) return;
     }
@@ -1451,7 +1544,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
 
 fn isNoReturnInst(sema: *Sema, inst: Ir.Inst.Index) bool {
     return switch (sema.ir_insts.items(.tag)[@backingInt(inst)]) {
-        .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap, .panic => true,
+        .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap => true,
         else => false,
     };
 }
@@ -6953,7 +7046,7 @@ fn unionFieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, i: u32, initial
             const loaded = try sema.analyzeLoad(block, src, ptr);
             const active = try sema.addTyOp(block, .get_union_tag, info.tag_type, loaded);
             const ok = try sema.addBinOp(block, .cmp_eq, active, tag);
-            try sema.addSafetyCheck(block, ok, .inactive_union_field, .none, .none);
+            try sema.addSafetyCheck(block, ok, .inactive_union_field, active, tag);
         }
     }
     return sema.fieldPtrAt(block, src, ptr, field_ty, i);
@@ -10637,15 +10730,38 @@ fn zirShuffle(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
 
 const Frontend = @import("Frontend.zig");
 
+/// Appended to test sources: these tests have no std, so safety checks
+/// call these handlers, as a root `panic` namespace overrides std's.
+const test_panic =
+    \\
+    \\pub const panic = struct {
+    \\    pub fn integerOverflow() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn outOfBounds(_: usize, _: usize) noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn corruptSwitch() noreturn {
+    \\        @trap();
+    \\    }
+    \\};
+    \\
+;
+
 fn testAnalyze(source: []const u8) ![]u8 {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data = source });
+    const full = try std.mem.concat(gpa, u8, &.{ source, test_panic });
+    defer gpa.free(full);
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data = full });
     const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/t.zig", .{tmp.sub_path});
     defer gpa.free(root);
-    var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent" });
+    var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent", .load_std = false });
     defer fe.deinit();
     var fe_errors: std.zig.ErrorBundle.Wip = try .init(gpa);
     defer fe_errors.deinit();
@@ -10689,15 +10805,20 @@ test "dump: runtime add gets an overflow check, comptime operands fold" {
         \\  %3 = struct_field_val(u8, %2, 0)
         \\  %4 = struct_field_val(u1, %2, 1)
         \\  %5 = cmp_eq(%4, <u1, 0>)
-        \\  %7 = block(void, {
-        \\    %9 = cond_br(%5, {
-        \\      %8 = br(%7, <void, void>)
+        \\  %8 = block(void, {
+        \\    %10 = cond_br(%5, {
+        \\      %9 = br(%8, <void, void>)
         \\    }, {
-        \\      %6 = panic(integer_overflow)
+        \\      %6 = call(<fn () noreturn, t.panic.integerOverflow>, [])
+        \\      %7 = unreach()
         \\    })
         \\  })
-        \\  %10 = dbg_stmt(2:5)
-        \\  %11 = ret(%3)
+        \\  %11 = dbg_stmt(2:5)
+        \\  %12 = ret(%3)
+        \\}
+        \\fn t.panic.integerOverflow() noreturn {
+        \\  %0 = dbg_stmt(2:9)
+        \\  %1 = trap()
         \\}
         \\
     );
@@ -10718,32 +10839,46 @@ test "dump: slice indexing gets a bounds check" {
         \\  %5 = dbg_stmt(2:13)
         \\  %6 = load([*]const u8, %3)
         \\  %7 = cmp_lte(<usize, 0>, %1)
-        \\  %9 = block(void, {
-        \\    %11 = cond_br(%7, {
-        \\      %10 = br(%9, <void, void>)
+        \\  %10 = block(void, {
+        \\    %12 = cond_br(%7, {
+        \\      %11 = br(%10, <void, void>)
         \\    }, {
-        \\      %8 = panic(start_greater_than_end, <usize, 0>, %1)
+        \\      %8 = call(<fn (usize, usize) noreturn, t.panic.startGreaterThanEnd>, [<usize, 0>, %1])
+        \\      %9 = unreach()
         \\    })
         \\  })
-        \\  %12 = sub_wrap(%1, <usize, 0>)
-        \\  %13 = slice([]const u8, %6, %12)
-        \\  %14 = alloc(*const []const u8)
-        \\  %15 = store(%14, %13)
-        \\  %16 = dbg_stmt(2:19)
-        \\  %17 = load([]const u8, %14)
-        \\  %18 = slice_len(usize, %17)
-        \\  %19 = cmp_lt(%2, %18)
-        \\  %21 = block(void, {
-        \\    %23 = cond_br(%19, {
-        \\      %22 = br(%21, <void, void>)
+        \\  %13 = sub_wrap(%1, <usize, 0>)
+        \\  %14 = slice([]const u8, %6, %13)
+        \\  %15 = alloc(*const []const u8)
+        \\  %16 = store(%15, %14)
+        \\  %17 = dbg_stmt(2:19)
+        \\  %18 = load([]const u8, %15)
+        \\  %19 = slice_len(usize, %18)
+        \\  %20 = cmp_lt(%2, %19)
+        \\  %23 = block(void, {
+        \\    %25 = cond_br(%20, {
+        \\      %24 = br(%23, <void, void>)
         \\    }, {
-        \\      %20 = panic(out_of_bounds, %2, %18)
+        \\      %21 = call(<fn (usize, usize) noreturn, t.panic.outOfBounds>, [%2, %19])
+        \\      %22 = unreach()
         \\    })
         \\  })
-        \\  %24 = slice_elem_ptr(*const u8, %17, %2)
-        \\  %25 = load(u8, %24)
-        \\  %26 = dbg_stmt(2:5)
-        \\  %27 = ret(%25)
+        \\  %26 = slice_elem_ptr(*const u8, %18, %2)
+        \\  %27 = load(u8, %26)
+        \\  %28 = dbg_stmt(2:5)
+        \\  %29 = ret(%27)
+        \\}
+        \\fn t.panic.startGreaterThanEnd(usize, usize) noreturn {
+        \\  %0 = arg(usize, 0)
+        \\  %1 = arg(usize, 1)
+        \\  %2 = dbg_stmt(2:9)
+        \\  %3 = trap()
+        \\}
+        \\fn t.panic.outOfBounds(usize, usize) noreturn {
+        \\  %0 = arg(usize, 0)
+        \\  %1 = arg(usize, 1)
+        \\  %2 = dbg_stmt(2:9)
+        \\  %3 = trap()
         \\}
         \\
     );
@@ -10772,15 +10907,16 @@ test "dump: generic instances are shared and comptime calls fold" {
         \\  %7 = struct_field_val(u16, %6, 0)
         \\  %8 = struct_field_val(u1, %6, 1)
         \\  %9 = cmp_eq(%8, <u1, 0>)
-        \\  %11 = block(void, {
-        \\    %13 = cond_br(%9, {
-        \\      %12 = br(%11, <void, void>)
+        \\  %12 = block(void, {
+        \\    %14 = cond_br(%9, {
+        \\      %13 = br(%12, <void, void>)
         \\    }, {
-        \\      %10 = panic(integer_overflow)
+        \\      %10 = call(<fn () noreturn, t.panic.integerOverflow>, [])
+        \\      %11 = unreach()
         \\    })
         \\  })
-        \\  %14 = dbg_stmt(2:5)
-        \\  %15 = ret(%7)
+        \\  %15 = dbg_stmt(2:5)
+        \\  %16 = ret(%7)
         \\}
         \\fn t.max[u16](u16, u16) u16 {
         \\  %0 = arg(u16, 0)
@@ -10796,6 +10932,10 @@ test "dump: generic instances are shared and comptime calls fold" {
         \\  })
         \\  %8 = dbg_stmt(2:5)
         \\  %9 = ret(%3)
+        \\}
+        \\fn t.panic.integerOverflow() noreturn {
+        \\  %0 = dbg_stmt(2:9)
+        \\  %1 = trap()
         \\}
         \\
     );
@@ -10861,20 +11001,21 @@ test "dump: inferred error sets resolve through the callee's body" {
         \\  %3 = dbg_stmt(2:12)
         \\  %4 = is_non_err(%2)
         \\  %5 = block(u8, {
-        \\    %12 = cond_br(%4, {
+        \\    %13 = cond_br(%4, {
         \\      %6 = unwrap_errunion_payload(u8, %2)
         \\      %7 = br(%5, %6)
         \\    }, {
         \\      %8 = unwrap_errunion_err(@typeInfo(@typeInfo(@TypeOf(t.g)).@"fn".return_type.?).error_union.error_set, %2)
-        \\      %11 = switch_br(%8, [<@typeInfo(@typeInfo(@TypeOf(t.g)).@"fn".return_type.?).error_union.error_set, error.Zero>] => {
+        \\      %12 = switch_br(%8, [<@typeInfo(@typeInfo(@TypeOf(t.g)).@"fn".return_type.?).error_union.error_set, error.Zero>] => {
         \\        %9 = br(%5, <u8, 1>)
         \\      }, else => {
-        \\        %10 = panic(corrupt_switch)
+        \\        %10 = call(<fn () noreturn, t.panic.corruptSwitch>, [])
+        \\        %11 = unreach()
         \\      })
         \\    })
         \\  })
-        \\  %13 = dbg_stmt(2:5)
-        \\  %14 = ret(%5)
+        \\  %14 = dbg_stmt(2:5)
+        \\  %15 = ret(%5)
         \\}
         \\fn t.g(u8) (inferred error set)!u8 {
         \\  %0 = arg(u8, 0)
@@ -10891,6 +11032,10 @@ test "dump: inferred error sets resolve through the callee's body" {
         \\  %8 = dbg_stmt(3:5)
         \\  %9 = wrap_errunion_payload(@typeInfo(@typeInfo(@TypeOf(t.g)).@"fn".return_type.?).error_union.error_set!u8, %0)
         \\  %10 = ret(%9)
+        \\}
+        \\fn t.panic.corruptSwitch() noreturn {
+        \\  %0 = dbg_stmt(2:9)
+        \\  %1 = trap()
         \\}
         \\
     );
@@ -10917,7 +11062,7 @@ fn testTypeHashes(source: []const u8, out: []InternPool.Hash) !void {
     try tmp.dir.writeFile(io, .{ .sub_path = "t.zig", .data = source });
     const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/t.zig", .{tmp.sub_path});
     defer gpa.free(root);
-    var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent" });
+    var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent", .load_std = false });
     defer fe.deinit();
     var fe_errors: std.zig.ErrorBundle.Wip = try .init(gpa);
     defer fe_errors.deinit();

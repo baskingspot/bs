@@ -1,8 +1,8 @@
 //! signal: ABRT
 //! stdout: "9223372036854775808\n9223372036854775808\n32768\n9223372036854775808\n9223372036854775808\n"
 //! stderr: "panic: integer part of floating point value out of bounds\n"
-//! upstream-signal: SEGV
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

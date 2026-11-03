@@ -58,6 +58,105 @@ fn main(sp: [*]const usize) callconv(.c) noreturn {
     exit(0);
 }
 
+/// A minimal panic handler, like upstream's API but without formatting:
+/// writes `panic: <message>` to stderr and raises SIGABRT. As the root, the
+/// runner chooses it for every test.
+pub const panic = struct {
+    pub fn call(msg: []const u8, _: ?usize) noreturn {
+        _ = syscall3(1, 2, @intFromPtr("panic: ".ptr), "panic: ".len);
+        _ = syscall3(1, 2, @intFromPtr(msg.ptr), msg.len);
+        _ = syscall3(1, 2, @intFromPtr("\n".ptr), 1);
+        _ = syscall3(62, syscall3(39, 0, 0, 0), 6, 0); // kill(getpid(), SIGABRT)
+        exit(134);
+    }
+    pub fn sentinelMismatch(expected: anytype, found: @TypeOf(expected)) noreturn {
+        _ = .{ expected, found };
+        call("sentinel mismatch", null);
+    }
+    pub fn unwrapError(err: anyerror) noreturn {
+        call(@errorName(err), null);
+    }
+    pub fn outOfBounds(index: usize, len: usize) noreturn {
+        _ = .{ index, len };
+        call("index out of bounds", null);
+    }
+    pub fn startGreaterThanEnd(start: usize, end: usize) noreturn {
+        _ = .{ start, end };
+        call("start index is larger than end index", null);
+    }
+    pub fn inactiveUnionField(active: anytype, accessed: @TypeOf(active)) noreturn {
+        _ = .{ active, accessed };
+        call("access of inactive union field", null);
+    }
+    pub fn sliceCastLenRemainder(src_len: usize) noreturn {
+        _ = src_len;
+        call("slice length does not divide exactly into destination elements", null);
+    }
+    pub fn reachedUnreachable() noreturn {
+        call("reached unreachable code", null);
+    }
+    pub fn unwrapNull() noreturn {
+        call("attempt to use null value", null);
+    }
+    pub fn castToNull() noreturn {
+        call("cast causes pointer to be null", null);
+    }
+    pub fn incorrectAlignment() noreturn {
+        call("incorrect alignment", null);
+    }
+    pub fn invalidErrorCode() noreturn {
+        call("invalid error code", null);
+    }
+    pub fn unexpectedErrorCode(err: anyerror) noreturn {
+        call(@errorName(err), null);
+    }
+    pub fn integerOutOfBounds() noreturn {
+        call("integer does not fit in destination type", null);
+    }
+    pub fn integerOverflow() noreturn {
+        call("integer overflow", null);
+    }
+    pub fn shlOverflow() noreturn {
+        call("left shift overflowed bits", null);
+    }
+    pub fn shrOverflow() noreturn {
+        call("right shift overflowed bits", null);
+    }
+    pub fn divideByZero() noreturn {
+        call("division by zero", null);
+    }
+    pub fn exactDivisionRemainder() noreturn {
+        call("exact division produced remainder", null);
+    }
+    pub fn integerPartOutOfBounds() noreturn {
+        call("integer part of floating point value out of bounds", null);
+    }
+    pub fn corruptSwitch() noreturn {
+        call("switch on corrupt value", null);
+    }
+    pub fn shiftRhsTooBig() noreturn {
+        call("shift amount is greater than the type size", null);
+    }
+    pub fn invalidEnumValue() noreturn {
+        call("invalid enum value", null);
+    }
+    pub fn forLenMismatch() noreturn {
+        call("for loop over objects with non-equal lengths", null);
+    }
+    pub fn copyLenMismatch() noreturn {
+        call("source and destination arguments have non-equal lengths", null);
+    }
+    pub fn memcpyAlias() noreturn {
+        call("@memcpy arguments alias", null);
+    }
+    pub fn noreturnReturned() noreturn {
+        call("'noreturn' function returned", null);
+    }
+    pub fn loadUninstantiableType() noreturn {
+        call("attempt to load uninstantiable type", null);
+    }
+};
+
 /// The index in `--start=<index>`, or null for any other argument.
 fn parseStart(arg: [*:0]const u8) ?usize {
     const prefix = "--start=";

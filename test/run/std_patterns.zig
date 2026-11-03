@@ -8,6 +8,7 @@
 //! operand's range decides, const locals stored from a labeled block, and
 //! struct literals with an optional result type.
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

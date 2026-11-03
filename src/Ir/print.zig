@@ -180,21 +180,6 @@ const Printer = struct {
                 try w.writeAll(", else => ");
                 try p.braced(ir.bodySlice(i, sb.data.else_body_len), indent);
             },
-            .panic => {
-                try w.print("{s}", .{@tagName(data.panic.id)});
-                switch (data.panic.id) {
-                    .out_of_bounds, .start_greater_than_end, .unwrap_error, .explicit => {
-                        const bin = ir.extraData(Ir.Bin, data.panic.payload).data;
-                        try w.writeAll(", ");
-                        try p.ref(bin.lhs);
-                        if (bin.rhs != .none) {
-                            try w.writeAll(", ");
-                            try p.ref(bin.rhs);
-                        }
-                    },
-                    else => {},
-                }
-            },
             .call => {
                 const c = ir.extraData(Ir.Call, data.pl_op.payload);
                 try p.ref(data.pl_op.operand);

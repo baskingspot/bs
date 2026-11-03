@@ -1,6 +1,7 @@
 //! exit: 0
 //! stdout: "16\n10\n6\n3\n12\n"
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn { asm volatile ("call %[main:P]" : : [main] "X" (&main)); }
 const S = struct { a: u32, b: [2]u8 = .{ 7, 8 }, c: ?u16 = null };
 const U = union(enum) { x: u32, y: void };

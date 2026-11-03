@@ -1,6 +1,7 @@
 //! exit: 0
 //! stdout: "hello\n2\n3\n2\none\n"
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn { asm volatile ("call %[main:P]" : : [main] "X" (&main)); }
 var c: bool = true;
 var arr = [_]u8{ 1, 2, 3 };

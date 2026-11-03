@@ -1,6 +1,7 @@
 //! exit: 0
 //! stdout: "42\n7\n1\n6\n8\n8\n12\n"
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 // For `std.lang.ExportOptions`; std.start sees `_start` and stays out.
 const std = @import("std");
 

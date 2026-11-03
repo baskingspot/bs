@@ -3,6 +3,7 @@
 //! Explicit alignment on zero-bit struct fields and on global
 //! declarations.
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

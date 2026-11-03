@@ -1,7 +1,7 @@
 //! Turns analyzed functions into Atoms and links them: the sink that
 //! `Zcu.analyzeAll` hands each function's IR to. Owns every Atom's memory
 //! until the link, lowers the data the code refers to (declarations,
-//! anonymous constants, panic messages), and assigns error codes, which
+//! anonymous constants), and assigns error codes, which
 //! reach machine code only through `value*` relocations.
 
 const std = @import("std");
@@ -34,8 +34,6 @@ errors: std.AutoArrayHashMapUnmanaged(InternPool.String, void) = .empty,
 /// External symbols the code reads the address of (`@extern`), by name,
 /// and whether every reference is weak. `finish` writes each one's slot.
 externs: std.StringArrayHashMapUnmanaged(bool) = .empty,
-/// Whether any function calls the panic helpers.
-uses_panic: bool = false,
 /// Whether code reads `error_name_table`.
 uses_error_names: bool = false,
 /// Compile errors that codegen reports (unsupported constructs), rendered
@@ -64,7 +62,7 @@ pub const Owner = union(enum) {
     unit: Zcu.AnalUnit,
     /// A content-addressed constant, shared by the units that use it.
     content,
-    /// Code the link needs regardless of units (panic helpers).
+    /// Code the link needs regardless of units (the error name table).
     link,
 };
 
@@ -115,7 +113,6 @@ pub fn finish(emit: *Emit) !bool {
     while (i < emit.navs.count()) : (i += 1) {
         try emit.lowerNav(emit.navs.keys()[i]);
     }
-    if (emit.uses_panic) try CodeGen.emitPanicHelpers(emit);
     if (emit.uses_error_names) try emit.emitErrorNameTable();
 
     var entry: ?SymbolKey = null;

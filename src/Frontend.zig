@@ -40,6 +40,8 @@ file_map: std.StringHashMapUnmanaged(File.Index) = .empty,
 modules: std.ArrayList(Module) = .empty,
 /// The module whose tests `zap test` runs; `root` outside of tests.
 main_module: Module.Index = .root,
+/// See `Options.load_std`.
+load_std: bool,
 /// What `loadAll` and `loadFile` did, for `ZAP_FRONTEND_TIMING`.
 stats: Stats = .{},
 /// AstGen errors in files `loadFile` loaded, for the caller to report
@@ -122,10 +124,13 @@ pub const Options = struct {
     builtin_dir: []const u8,
     /// `zap test` only: root source file of the module under test.
     main_src_path: ?[]const u8 = null,
+    /// Whether `loadAll` loads std, which upstream always analyzes. Off only
+    /// in tests that have no lib directory.
+    load_std: bool = true,
 };
 
 pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
-    var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir };
+    var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir, .load_std = options.load_std };
     errdefer fe.deinit();
     try fe.addModule("root", options.root_src_path, .local);
     try fe.modules.append(gpa, .{
@@ -857,11 +862,16 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
     var n: usize = 0;
     roots[n] = .{ .module = .root, .sub_path = fe.module(.root).root_file };
     n += 1;
-    // `zap test` also analyzes the module under test and std.
+    // As upstream, std is always analyzed: std.start and the panic
+    // handlers in `std.lang.panic` come from it.
+    if (fe.load_std) {
+        roots[n] = .{ .module = .std, .sub_path = fe.module(.std).root_file };
+        n += 1;
+    }
+    // `zap test` also analyzes the module under test.
     if (fe.main_module != .root) {
         roots[n] = .{ .module = fe.main_module, .sub_path = fe.module(fe.main_module).root_file };
-        roots[n + 1] = .{ .module = .std, .sub_path = fe.module(.std).root_file };
-        n += 2;
+        n += 1;
     }
     var indices: [3]?File.Index = undefined;
     return fe.load(roots[0..n], indices[0..n], errors);
@@ -1176,7 +1186,7 @@ test "loads a file and its imports" {
     const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/main.zig", .{tmp.sub_path});
     defer gpa.free(root);
 
-    var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent" });
+    var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent", .load_std = false });
     defer fe.deinit();
     var errors: std.zig.ErrorBundle.Wip = try .init(gpa);
     defer errors.deinit();
@@ -1226,7 +1236,7 @@ test "reuses cached ZIR, drops stale guessed imports, and reports errors in cach
         ok: bool,
 
         fn init(r: *@This(), root_path: []const u8, cache_path: []const u8) !void {
-            r.fe = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root_path, .builtin_dir = "/nonexistent" });
+            r.fe = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root_path, .builtin_dir = "/nonexistent", .load_std = false });
             errdefer r.fe.deinit();
             try r.fe.enableCache(.{ .local = cache_path, .global = cache_path });
             r.errors = try .init(gpa);

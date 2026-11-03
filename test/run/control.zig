@@ -1,6 +1,7 @@
 //! exit: 3
 //! stdout: "84\n14\n10\n137\n28\n30\n8\n3\n11\n9\n6\n1\n213\n20\n99\n20\n0\n"
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"

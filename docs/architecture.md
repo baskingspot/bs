@@ -191,9 +191,15 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   like arrays, aligned to 16. No IR instruction is vector-specific, so a
   backend that wants SIMD can recognize the pattern or add instructions
   later without changing Sema's results.
-- Until milestone 3 routes safety panics to `std.builtin.panic`, a failed
-  check writes `panic: <upstream message>` to stderr through small runtime
-  helper Atoms and raises SIGABRT.
+- Panics are calls, as upstream: `@panic` and each failed safety check
+  call the matching function of `std.lang.panic` (`integerOverflow`,
+  `outOfBounds(index, len)`, `call(msg, null)`, ...), then `unreach`.
+  `std.lang.panic` is the root file's `panic` namespace if it declares one
+  (read directly, so it needs no std code), else std's
+  `FullPanic(defaultPanic)`. std is always loaded, as upstream analyzes
+  it; `Frontend.Options.load_std` is off only in tests without a lib
+  directory. std-free test programs declare a minimal root `panic`
+  (`test/run/rt.zig`, `tools/conformance/zap_runner.zig`).
 - Output is an **Atom**, defined in `src/link/Atom.zig`:
   - stable symbol key and name, section kind, alignment;
   - code or data bytes (or a size for zero-fill sections);
@@ -573,9 +579,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   `Zcu.analyzeAll` resolves a request, `Frontend.loadFile` loads the
   helper's file and the files it reaches that are not loaded yet, with the
   same work queue, and numbers them after the loaded ones. A program that
-  calls no helper loads none of compiler_rt (a std-free hello: 2 files
-  instead of 701; 0.6 ms cold instead of 180–190 ms, 0.3–0.5 ms warm
-  instead of 5.6–5.8 ms). AstGen errors in files loaded this way are
+  calls no helper loads none of compiler_rt (measured before std was
+  always loaded: a std-free hello took 2 files instead of 701; 0.6 ms
+  cold instead of 180–190 ms, 0.3–0.5 ms warm instead of 5.6–5.8 ms). AstGen errors in files loaded this way are
   reported with Sema's (`Frontend.late_errors`). CodeGen calls a helper
   through `Zcu.requestCompilerRt(file, name)`, which returns the stable key
   of the helper's function unit, `compiler_rt:compiler_rt/<file>:<name>`;
@@ -956,8 +962,8 @@ Two things Sema must add, both narrow:
   queued (`queueFunc` from `navRef`, calls, and coercions of a function
   to a function pointer) and which declarations' data it requested. Some
   come from Emit during CodeGen, not from Sema: compiler_rt helpers
-  (`requestCompilerRt`), `navKey`/`funcKey` from lowering values, the
-  panic helpers, and the error name table. A function's reference list
+  (`requestCompilerRt`), `navKey`/`funcKey` from lowering values, and
+  the error name table. A function's reference list
   holds both kinds. Loading a function replays them, so the set of linked
   units is the set reachable this build, and functions no longer
   referenced drop out of the link instead of lingering in the pack.

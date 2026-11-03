@@ -1,7 +1,7 @@
 //! signal: ABRT
 //! stderr: "panic: @memcpy arguments alias\n"
-//! upstream-signal: SEGV
 const rt = @import("rt.zig");
+pub const panic = rt.panic;
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile ("call %[main:P]"
