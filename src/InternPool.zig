@@ -748,7 +748,9 @@ const Shard = struct {
     /// Entries carry the item's `lookupHash`, so a probe rejects
     /// non-matching entries without loading the item.
     map: std.HashMapUnmanaged(Entry, void, EntryContext, 80) = .empty,
-    string_map: std.HashMapUnmanaged(String, void, StringContext, 80) = .empty,
+    /// Entries carry their string's hash, so neither growing nor a probe
+    /// hashes or loads another string's bytes.
+    string_map: std.HashMapUnmanaged(StringEntry, void, StringContext, 80) = .empty,
 };
 
 const Entry = struct { hash: u64, index: Index };
@@ -779,23 +781,35 @@ const KeyAdapter = struct {
     }
 };
 
+const StringEntry = struct { hash: u32, string: String };
+
+/// Spreads a string's 32-bit hash over the 64 bits the map reads (bucket
+/// from the low bits, fingerprint from the top 7).
+fn stringMapHash(h: u32) u64 {
+    return @as(u64, h) *% 0x9E3779B97F4A7C15;
+}
+
+fn stringHash(bytes: []const u8) u32 {
+    return @truncate(std.hash.Wyhash.hash(0, bytes));
+}
+
 const StringContext = struct {
-    ip: *const InternPool,
-    pub fn hash(ctx: StringContext, s: String) u64 {
-        return std.hash.Wyhash.hash(0, ctx.ip.stringSlice(s));
+    pub fn hash(_: StringContext, e: StringEntry) u64 {
+        return stringMapHash(e.hash);
     }
-    pub fn eql(_: StringContext, a: String, b: String) bool {
-        return a == b;
+    pub fn eql(_: StringContext, a: StringEntry, b: StringEntry) bool {
+        return a.string == b.string;
     }
 };
 
 const StringAdapter = struct {
     ip: *const InternPool,
-    pub fn hash(_: StringAdapter, bytes: []const u8) u64 {
-        return std.hash.Wyhash.hash(0, bytes);
+    bytes_hash: u32,
+    pub fn hash(sa: StringAdapter, _: []const u8) u64 {
+        return stringMapHash(sa.bytes_hash);
     }
-    pub fn eql(sa: StringAdapter, bytes: []const u8, s: String) bool {
-        return std.mem.eql(u8, bytes, sa.ip.stringSlice(s));
+    pub fn eql(sa: StringAdapter, bytes: []const u8, e: StringEntry) bool {
+        return e.hash == sa.bytes_hash and std.mem.eql(u8, bytes, sa.ip.stringSlice(e.string));
     }
 };
 
@@ -881,28 +895,35 @@ inline fn unwrapIndex(ip: *const InternPool, raw: u32) struct { local: *Local, i
 // ---------------------------------------------------------------------------
 // Strings
 
+/// The shard holding strings of hash `h`: chosen by high bits, since the
+/// map's bucket comes from the low ones.
+fn stringShard(ip: *const InternPool, h: u32) *Shard {
+    return &ip.shards[(h >> 16) & (ip.shards.len - 1)];
+}
+
 pub fn getString(ip: *InternPool, tid: Tid, bytes: []const u8) !String {
-    const h = std.hash.Wyhash.hash(0, bytes);
-    const shard = &ip.shards[h & (ip.shards.len - 1)];
+    const h = stringHash(bytes);
+    const shard = ip.stringShard(h);
     shard.mutex.lockUncancelable(ip.io);
     defer shard.mutex.unlock(ip.io);
-    const gop = try shard.string_map.getOrPutContextAdapted(ip.gpa, bytes, StringAdapter{ .ip = ip }, .{ .ip = ip });
-    if (gop.found_existing) return gop.key_ptr.*;
+    const gop = try shard.string_map.getOrPutAdapted(ip.gpa, bytes, StringAdapter{ .ip = ip, .bytes_hash = h });
+    if (gop.found_existing) return gop.key_ptr.string;
     const local = &ip.locals[@backingInt(tid)];
     const owned = try local.arena.allocator().dupe(u8, bytes);
     const i = try local.strings.append(ip.gpa, owned);
     const s: String = @fromBackingInt(ip.wrap(tid, i));
-    gop.key_ptr.* = s;
+    gop.key_ptr.* = .{ .hash = h, .string = s };
     return s;
 }
 
 /// The interned string `bytes`, or null if it was never interned.
 pub fn findString(ip: *const InternPool, bytes: []const u8) ?String {
-    const h = std.hash.Wyhash.hash(0, bytes);
-    const shard = &ip.shards[h & (ip.shards.len - 1)];
+    const h = stringHash(bytes);
+    const shard = ip.stringShard(h);
     shard.mutex.lockUncancelable(ip.io);
     defer shard.mutex.unlock(ip.io);
-    return shard.string_map.getKeyAdapted(bytes, StringAdapter{ .ip = ip });
+    const e = shard.string_map.getKeyAdapted(bytes, StringAdapter{ .ip = ip, .bytes_hash = h }) orelse return null;
+    return e.string;
 }
 
 pub fn stringSlice(ip: *const InternPool, s: String) []const u8 {
