@@ -182,6 +182,11 @@ pub fn build(b: *std.Build) void {
 ///                               (paths from the repository root) they
 ///                               replace the program's path, which one of
 ///                               them names
+///   //! targets: <target> ...   the targets the program is for (default
+///                               x86_64-linux); with aarch64-macos, an
+///                               aarch64-macos host also builds it for
+///                               that target and checks it (not the
+///                               rebuild headers)
 ///
 /// `test` builds each with bs and checks it; `test-upstream` does the same
 /// with upstream zig, so every program is checked against the oracle.
@@ -202,6 +207,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
     const io = b.graph.io;
     const host = b.graph.host.result;
     const host_runs_bs_output = host.cpu.arch == .x86_64 and host.os.tag == .linux;
+    const host_runs_macos_output = host.cpu.arch == .aarch64 and host.os.tag == .macos;
     // The headers are read here, while configuring.
     b.dependOnDirectoryContents(b.path("test/run"));
     var dir = b.root.openDir(io, "test/run", .{ .iterate = true }) catch |err|
@@ -244,6 +250,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             /// into one global cache; neither replays the other as a donor.
             donor_libc: bool = false,
             flags: std.ArrayList([]const u8) = .empty,
+            aarch64_macos: bool = false,
         } = .{};
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
@@ -279,6 +286,11 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                 if (key[8] == 'r') {
                     expect.rebuild_without.append(b.allocator, .{ first, second }) catch @panic("OOM");
                 } else expect.lib_edit = .{ .path = first, .text = second };
+            } else if (std.mem.eql(u8, key, "targets")) {
+                var targets = std.mem.tokenizeScalar(u8, value, ' ');
+                while (targets.next()) |t| {
+                    if (std.mem.eql(u8, t, "aarch64-macos")) expect.aarch64_macos = true else if (!std.mem.eql(u8, t, "x86_64-linux")) std.debug.panic("{s}: unknown target '{s}'", .{ src_path, t });
+                }
             } else if (std.mem.eql(u8, key, "stdout") or std.mem.eql(u8, key, "stderr")) {
                 const bytes = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 if (key[3] == 'o') expect.stdout = bytes else expect.stderr = bytes;
@@ -538,6 +550,19 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
             for (expect.stderr_contains.items) |part| run.addCheck(.{ .expect_stderr_match = part });
             run.addCheck(.{ .expect_term = if (expect.signal) |sig| .{ .signal = sig } else .{ .exited = expect.exit.? } });
             (if (upstream) upstream_step else test_step).dependOn(&run.step);
+        }
+        if (expect.aarch64_macos and host_runs_macos_output) {
+            const compile = b.addRunArtifact(bs);
+            compile.addArgs(&.{ "build-exe", "-target", "aarch64-macos" });
+            compile.addFileArg(b.path(src_path));
+            const bin = compile.addPrefixedOutputFileArg("-femit-bin=", name);
+            const run = std.Build.Step.Run.create(b, b.fmt("run {s} (aarch64-macos)", .{name}));
+            run.addFileArg(bin);
+            if (expect.stdout) |out| run.addCheck(.{ .expect_stdout_exact = out });
+            if (expect.stderr) |err| run.addCheck(.{ .expect_stderr_exact = err });
+            for (expect.stderr_contains.items) |part| run.addCheck(.{ .expect_stderr_match = part });
+            run.addCheck(.{ .expect_term = if (expect.signal) |sig| .{ .signal = sig } else .{ .exited = expect.exit.? } });
+            test_step.dependOn(&run.step);
         }
     }
 }
