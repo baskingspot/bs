@@ -5527,11 +5527,22 @@ fn analyzeIntFromFloat(sema: *Sema, block: *Block, src: Src, operand: Ref, int_t
     if (block.want_safety) {
         // The truncated value fits iff `min - 1 < x < max + 1`. `max + 1`
         // is a power of two; `min - 1` is used when the float type
-        // represents it, else the floats above it start at `min`.
+        // represents it (it needs `bits` significant bits), else the
+        // floats above it start at `min`, a power of two, unless that
+        // overflows to -inf.
         const hi = try sema.floatValue(float_ty, std.math.ldexp(@as(f128, 1), @as(i32, info.bits) - @intFromBool(info.signedness == .signed)));
-        const lo_exact: f128 = if (info.signedness == .unsigned) -1 else -std.math.ldexp(@as(f128, 1), @as(i32, info.bits) - 1) - 1;
-        const lo = try sema.floatValue(float_ty, lo_exact);
-        const lo_ok = if (sema.toF128(lo) == lo_exact or std.math.isInf(sema.toF128(lo)))
+        const precision: u16 = switch (Type.floatBits(ip, float_ty)) {
+            16 => 11,
+            32 => 24,
+            64 => 53,
+            80 => 64,
+            128 => 113,
+            else => unreachable,
+        };
+        const min_exact = info.signedness == .unsigned or info.bits <= precision;
+        const lo_val: f128 = if (info.signedness == .unsigned) -1 else -std.math.ldexp(@as(f128, 1), @as(i32, info.bits) - 1) - @as(f128, if (min_exact) 1 else 0);
+        const lo = try sema.floatValue(float_ty, lo_val);
+        const lo_ok = if (min_exact or std.math.isInf(sema.toF128(lo)))
             try sema.addBinOp(block, .cmp_gt, rounded, .fromInterned(lo))
         else
             try sema.addBinOp(block, .cmp_gte, rounded, .fromInterned(lo));
