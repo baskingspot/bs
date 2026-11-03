@@ -10364,7 +10364,7 @@ fn ptrRootBase(sema: *Sema, ptr: InternPool.Ptr) InternPool.Ptr.BaseAddr {
     while (true) switch (k.base) {
         .field => |f| k = sema.ip.keyPayload(.ptr, f.base),
         .elem => |e| k = sema.ip.keyPayload(.ptr, e.base),
-        .uav => |u| return .{ .uav = .{ .val = u.val, .orig_ty = .none } },
+        .uav => |u| return .{ .uav = .{ .val = u.val, .orig_ty = .none, .comptime_field = u.comptime_field } },
         else => return k.base,
     };
 }
@@ -12140,7 +12140,7 @@ fn intoComptimeField(sema: *Sema, ptr: Index) bool {
 
 fn comptimeFieldPtr(sema: *Sema, is_const: bool, val: Index) CompileError!Ref {
     const ptr_ty = try sema.ptrType(.{ .child = sema.ip.typeOf(val), .flags = .{ .is_const = is_const } });
-    const ptr = try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = val, .orig_ty = ptr_ty } } } });
+    const ptr = try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = val, .orig_ty = ptr_ty, .comptime_field = true } } } });
     if (!is_const) try sema.comptime_field_ptrs.put(sema.arena, ptr, {});
     return .fromInterned(ptr);
 }
@@ -15923,7 +15923,7 @@ fn refersToComptimeAlloc(sema: *Sema, val: Index) bool {
         // `const ptr = &comptime_var`).
         .ptr => switch (sema.ptrRootBase(ip.keyPayload(.ptr, val))) {
             .comptime_alloc => true,
-            .uav => |u| sema.refersToComptimeAlloc(u.val),
+            .uav => |u| u.comptime_field or sema.refersToComptimeAlloc(u.val),
             else => false,
         },
         .slice => sema.refersToComptimeAlloc(ip.keyPayload(.slice, val).ptr),

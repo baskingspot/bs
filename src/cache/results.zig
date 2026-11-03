@@ -270,7 +270,10 @@ pub const Encoder = struct {
                 try e.push(@backingInt(std.meta.activeTag(p.base)));
                 switch (p.base) {
                     .nav => |n| if (!try e.pushNav(n)) break :blk false,
-                    .uav => |u| if (!try e.pushRef(u.val) or !try e.pushRef(u.orig_ty)) break :blk false,
+                    .uav => |u| {
+                        if (!try e.pushRef(u.val) or !try e.pushRef(u.orig_ty)) break :blk false;
+                        try e.push(@intFromBool(u.comptime_field));
+                    },
                     .comptime_alloc => unreachable,
                     .int => {},
                     inline .field, .elem => |f| {
@@ -709,7 +712,7 @@ pub fn Decoder(comptime Resolver: type) type {
                     const base_tag: std.meta.Tag(InternPool.Ptr.BaseAddr) = @fromBackingInt(@intCast(c.next()));
                     break :blk .{ .ptr = .{ .ty = ty, .byte_offset = byte_offset, .base = switch (base_tag) {
                         .nav => .{ .nav = try d.nav(c) orelse return null },
-                        .uav => .{ .uav = .{ .val = try d.ref(c) orelse return null, .orig_ty = try d.ref(c) orelse return null } },
+                        .uav => .{ .uav = .{ .val = try d.ref(c) orelse return null, .orig_ty = try d.ref(c) orelse return null, .comptime_field = c.next() != 0 } },
                         .comptime_alloc => unreachable,
                         .int => .int,
                         .field => .{ .field = .{ .base = try d.ref(c) orelse return null, .index = c.next64() } },

@@ -516,7 +516,9 @@ pub const Ptr = struct {
         nav: NavIndex,
         /// An unnamed constant (string literals, `&comptime_value`).
         /// `orig_ty` is the pointer type the constant was referenced through.
-        uav: struct { val: Index, orig_ty: Index },
+        /// `comptime_field`: the value of a comptime field, which, as
+        /// upstream's `comptime_field` base, no runtime value may point to.
+        uav: struct { val: Index, orig_ty: Index, comptime_field: bool = false },
         /// A comptime-mutable allocation owned by a Sema instance. Never
         /// reaches runtime code; its id is not stable across runs.
         comptime_alloc: u32,
@@ -1228,7 +1230,7 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
         .ptr => |p| {
             const tag: u32, const a: u32, const b: u64 = switch (p.base) {
                 .nav => |n| .{ 0, @backingInt(n), 0 },
-                .uav => |u| .{ 1, idx(u.val), idx(u.orig_ty) },
+                .uav => |u| .{ if (u.comptime_field) 6 else 1, idx(u.val), idx(u.orig_ty) },
                 .comptime_alloc => |c| .{ 2, c, 0 },
                 .int => .{ 3, 0, 0 },
                 .field => |f| .{ 4, idx(f.base), f.index },
@@ -1394,7 +1396,7 @@ inline fn decodeItem(ip: *const InternPool, comptime tag: Tag, index: Index, ite
                 .ty = I.i(extra[d]),
                 .base = switch (extra[d + 1]) {
                     0 => .{ .nav = @fromBackingInt(a) },
-                    1 => .{ .uav = .{ .val = I.i(a), .orig_ty = I.i(@intCast(b)) } },
+                    1, 6 => |t| .{ .uav = .{ .val = I.i(a), .orig_ty = I.i(@intCast(b)), .comptime_field = t == 6 } },
                     2 => .{ .comptime_alloc = a },
                     3 => .int,
                     4 => .{ .field = .{ .base = I.i(a), .index = b } },
@@ -1691,6 +1693,7 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
                 .uav => |u| {
                     ip.hashIndex(&h, u.val);
                     ip.hashIndex(&h, u.orig_ty);
+                    h.int(u8, @intFromBool(u.comptime_field));
                 },
                 .comptime_alloc => |c| h.int(u32, c),
                 .int => {},
@@ -1895,6 +1898,7 @@ fn lookupHash(ip: *const InternPool, key: Key) u64 {
                 .uav => |a| {
                     h.int(u32, u.i(a.val));
                     h.int(u32, u.i(a.orig_ty));
+                    h.int(u8, @intFromBool(a.comptime_field));
                 },
                 .comptime_alloc => |c| h.int(u32, c),
                 .int => {},
@@ -2009,7 +2013,7 @@ inline fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
             if (std.meta.activeTag(x.base) != std.meta.activeTag(y.base)) return false;
             return switch (x.base) {
                 .nav => |n| n == y.base.nav,
-                .uav => |u| u.val == y.base.uav.val and u.orig_ty == y.base.uav.orig_ty,
+                .uav => |u| u.val == y.base.uav.val and u.orig_ty == y.base.uav.orig_ty and u.comptime_field == y.base.uav.comptime_field,
                 .comptime_alloc => |c| c == y.base.comptime_alloc,
                 .int => true,
                 .field => |f| f.base == y.base.field.base and f.index == y.base.field.index,
