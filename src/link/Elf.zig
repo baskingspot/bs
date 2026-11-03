@@ -705,7 +705,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.check(diag);
 
     // Headers.
-    var head: [@sizeOf(elf.Elf64.Ehdr) + 6 * @sizeOf(elf.Elf64.Phdr)]u8 = undefined;
+    var head: [@sizeOf(elf.Elf64.Ehdr) + 7 * @sizeOf(elf.Elf64.Phdr)]u8 = undefined;
     writeStruct(&head, elf.Elf64.Ehdr{
         .ident = .{ .class = .@"64", .data = .@"2LSB", .version = 1, .osabi = .NONE, .abiversion = 0 },
         .type = .EXEC,
