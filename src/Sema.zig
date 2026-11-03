@@ -7415,6 +7415,9 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
     if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ptr_ty)});
     const info = Type.ptrInfo(ip, ptr_ty);
     if (sema.resolveValue(ptr)) |pv| {
+        // Under @TypeOf only the type matters, also through a generic
+        // function's runtime parameter, which stands as undefined.
+        if (block.is_typeof and sema.isUndef(pv)) return .fromInterned(try sema.undefValue(info.child));
         if (try sema.comptimeLoadOrNull(block, src, pv)) |v| return .fromInterned(v);
     }
     try sema.resolveLayout(block, src, info.child);
