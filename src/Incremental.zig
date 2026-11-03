@@ -568,7 +568,7 @@ const Keyer = struct {
                 };
             },
             .func_ies => |func| {
-                var h: Hash = 0;
+                var h: Hash = @intFromBool(k.zcu.anyerror_ies.contains(func));
                 if (k.zcu.inferred_errors.get(func)) |names| {
                     // Order-independent: the set, not the discovery order.
                     for (names) |name| h +%= cache.hash(3, ip.stringSlice(name));

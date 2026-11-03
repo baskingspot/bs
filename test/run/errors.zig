@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n41\nNope\nBad\nother\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -154,7 +154,30 @@ fn main() callconv(.c) noreturn {
         if (err == error.Stop) acc.sum += 10;
     };
     rt.printInt(acc.sum);
+
+    // An inferred error set that takes in `anyerror` is `anyerror`.
+    rt.printInt(anyOuter(20) catch 0);
+    if (anyOuter(error.Nope)) |_| {} else |err| rt.print(@errorName(err));
+    rt.print("\n");
+    if (anyMixed(true, 1)) |_| {} else |err| rt.print(@errorName(err));
+    rt.print("\n");
+    if (anyUnwrap(error.Other)) |_| {} else |err| switch (err) {
+        error.Other => rt.print("other\n"),
+        else => rt.print("else\n"),
+    }
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
+}
+
+fn anyUnwrap(x: anyerror!u32) !u32 {
+    const a = try x;
+    return a * 2;
+}
+fn anyOuter(x: anyerror!u32) !u32 {
+    return try anyUnwrap(x) + 1;
+}
+fn anyMixed(b: bool, x: anyerror!u32) !u32 {
+    if (b) return error.Bad;
+    return anyUnwrap(x);
 }
 
 const Pair = struct { a: u32, b: [3]u8 };

@@ -67,6 +67,8 @@ comptime_field_ptrs: std.AutoHashMapUnmanaged(Index, void) = .empty,
 /// The errors `func` returns so far, for its inferred error set; published
 /// to `Zcu.inferred_errors` when its analysis ends. Arena-allocated.
 ies_names: std.ArrayList(InternPool.String) = .empty,
+/// Whether `func`'s inferred error set took in `anyerror`.
+ies_anyerror: bool = false,
 /// For each runtime bool vector being initialized through a result pointer,
 /// the `[N]bool` local its elements are stored to first: bit-packed
 /// elements have no addresses. Arena-allocated.
@@ -789,6 +791,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
 
     // One allocation per function, in the Zcu arena: a small gpa list per
     // function instance pins allocator pages for the whole compilation.
+    if (sema.ies_anyerror) try zcu.anyerror_ies.put(gpa, func_index, {});
     if (sema.ies_names.items.len != 0) {
         try zcu.inferred_errors.put(gpa, func_index, try zcu.arena.allocator().dupe(InternPool.String, sema.ies_names.items));
     }
@@ -4031,8 +4034,9 @@ fn errorSetType(sema: *Sema, names: []InternPool.String) !Index {
 
 /// The names of an explicit error set, or null for `anyerror` and
 /// inferred error sets.
-/// The names in error set `ty`, or null if it is `anyerror` or not yet
-/// known (the inferred error set of the function being analyzed). Resolving
+/// The names in error set `ty`, or null if it is `anyerror` (or an
+/// inferred error set resolved to it) or not yet known (the inferred error
+/// set of the function being analyzed). Resolving
 /// another function's inferred error set analyzes that function's body.
 fn errorSetNames(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!?[]const InternPool.String {
     return switch (sema.ip.indexToKey(ty)) {
@@ -4050,8 +4054,8 @@ fn errorSetNames(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!?
 }
 
 fn mergeErrorSets(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileError!Index {
-    const an = (try sema.errorSetNames(block, src, a)) orelse return if (a == .anyerror_type) .anyerror_type else sema.failUnsupported(block, src, "merging inferred error sets");
-    const bn = (try sema.errorSetNames(block, src, b)) orelse return if (b == .anyerror_type) .anyerror_type else sema.failUnsupported(block, src, "merging inferred error sets");
+    const an = (try sema.errorSetNames(block, src, a)) orelse return if (!sema.isOwnIes(a)) .anyerror_type else sema.failUnsupported(block, src, "merging inferred error sets");
+    const bn = (try sema.errorSetNames(block, src, b)) orelse return if (!sema.isOwnIes(b)) .anyerror_type else sema.failUnsupported(block, src, "merging inferred error sets");
     const names = try sema.arena.alloc(InternPool.String, an.len + bn.len);
     @memcpy(names[0..an.len], an);
     @memcpy(names[an.len..], bn);
@@ -4077,9 +4081,19 @@ fn recordInferredErrors(sema: *Sema, block: *Block, src: Src, operand: Ref) Comp
     try sema.addInferredErrors(block, src, set);
 }
 
-/// Adds the errors of `set` to the current function's inferred error set.
+/// Whether `ty` is the inferred error set of the function being analyzed.
+fn isOwnIes(sema: *Sema, ty: Index) bool {
+    const key = sema.ip.indexToKey(ty);
+    return key == .inferred_error_set_type and key.inferred_error_set_type == sema.func;
+}
+
+/// Adds the errors of `set` to the current function's inferred error set;
+/// `anyerror` makes it `anyerror`.
 fn addInferredErrors(sema: *Sema, block: *Block, src: Src, set: Index) CompileError!void {
-    const names = (try sema.errorSetNames(block, src, set)) orelse return;
+    const names = (try sema.errorSetNames(block, src, set)) orelse {
+        if (!sema.isOwnIes(set)) sema.ies_anyerror = true;
+        return;
+    };
     outer: for (names) |n| {
         for (sema.ies_names.items) |existing| if (existing == n) continue :outer;
         try sema.ies_names.append(sema.arena, n);
@@ -4519,9 +4533,7 @@ fn errorSetCoercible(sema: *Sema, block: *Block, src: Src, src_ty: Index, dest_t
     switch (ip.indexToKey(dest_ty)) {
         .inferred_error_set_type => |func| {
             if (func == sema.func) {
-                if (try sema.errorSetNames(block, src, src_ty)) |_| try sema.addInferredErrors(block, src, src_ty) else if (ip.indexToKey(src_ty) != .inferred_error_set_type) {
-                    return sema.fail(block, src, "zap does not support coercing '{f}' into an inferred error set yet", .{sema.fmtType(src_ty)});
-                }
+                try sema.addInferredErrors(block, src, src_ty);
             }
             return true;
         },

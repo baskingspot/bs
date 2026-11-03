@@ -45,6 +45,8 @@ comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, InternPool.Index) = .em
 /// Errors each function instance returns, for inferred error sets.
 /// Arena-allocated.
 inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, []const InternPool.String) = .empty,
+/// Function instances whose inferred error set is `anyerror`.
+anyerror_ies: std.AutoHashMapUnmanaged(InternPool.Index, void) = .empty,
 exports: std.ArrayList(Export) = .empty,
 /// Files read by `@embedFile`, each once; `Dependee.embed_file` indexes it.
 embed_files: std.StringArrayHashMapUnmanaged(EmbedFile) = .empty,
@@ -177,6 +179,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.comptime_decls.deinit(gpa);
     zcu.comptime_memo.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
+    zcu.anyerror_ies.deinit(gpa);
     zcu.exports.deinit(gpa);
     zcu.embed_files.deinit(gpa);
     zcu.rt_helpers.deinit(gpa);
@@ -487,8 +490,8 @@ pub fn ensureStructLayout(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!voi
 }
 
 /// Resolves the inferred error set of function instance `func`, analyzing
-/// its body if that has not happened yet.
-pub fn ensureFuncIes(zcu: *Zcu, func: InternPool.Index) Sema.CompileError![]const InternPool.String {
+/// its body if that has not happened yet; null if it is `anyerror`.
+pub fn ensureFuncIes(zcu: *Zcu, func: InternPool.Index) Sema.CompileError!?[]const InternPool.String {
     const gop = try zcu.funcs.getOrPut(zcu.gpa, func);
     if (!gop.found_existing) gop.value_ptr.* = .queued;
     switch (gop.value_ptr.*) {
@@ -506,6 +509,7 @@ pub fn ensureFuncIes(zcu: *Zcu, func: InternPool.Index) Sema.CompileError![]cons
             try zcu.ready_irs.append(zcu.gpa, ir);
         },
     }
+    if (zcu.anyerror_ies.contains(func)) return null;
     return zcu.inferred_errors.get(func) orelse &.{};
 }
 
