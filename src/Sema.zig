@@ -7795,8 +7795,17 @@ fn comptimeLoadStructural(sema: *Sema, block: *Block, src: Src, ptr: Index) Comp
         .field => |f| blk: {
             if (key.byte_offset != 0) return sema.reinterpretLoad(block, src, ptr);
             const parent = (try sema.comptimeLoadStructural(block, src, f.base)) orelse break :blk null;
-            if (ip.typeOf(parent) != Type.ptrInfo(ip, ip.typeOf(f.base)).child)
+            const parent_ty = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
+            if (ip.typeOf(parent) != parent_ty)
                 return sema.reinterpretLoad(block, src, ptr);
+            // An extern union's inactive field reads its bytes.
+            if (Type.class(ip, parent_ty) == .@"union" and ip.structInfo(parent_ty).layout == .@"extern" and ip.indexToKey(parent) == .un and
+                ip.indexToKey(parent).un.tag != try sema.unionFieldTagValue(parent_ty, @intCast(f.index)))
+            {
+                const field_ty = ip.structInfo(parent_ty).field_types[f.index];
+                try sema.resolveLayout(block, src, field_ty);
+                break :blk try sema.readMem(block, src, parent, 0, field_ty);
+            }
             break :blk try sema.fieldValue(parent, @intCast(f.index));
         },
         .elem => |e| blk: {
@@ -8321,6 +8330,21 @@ fn readMemBytes(sema: *Sema, ty: Index, buf: []const u8, undef: []const bool) Co
     const class = Type.class(ip, ty);
     const used: usize = if (class == .float) Type.floatBits(ip, ty) / 8 else buf.len;
     if (class == .void) return .void_value;
+    if (class == .@"union" and ip.structInfo(ty).layout == .@"extern") {
+        // The largest field whose bytes are all defined holds the
+        // value; the others read it back through its bytes.
+        const info = ip.structInfo(ty);
+        var best: ?struct { i: u32, size: u64, val: Index } = null;
+        for (info.field_types, 0..) |ft, i| {
+            const fs = Type.abiSize(ip, ft);
+            if (fs > buf.len or (best != null and fs <= best.?.size)) continue;
+            if (std.mem.indexOfScalar(bool, undef[0..@intCast(fs)], true) != null) continue;
+            const fv = (try sema.readMemBytes(ft, buf[0..@intCast(fs)], undef[0..@intCast(fs)])) orelse continue;
+            best = .{ .i = @intCast(i), .size = fs, .val = fv };
+        }
+        const b = best orelse return try sema.undefValue(ty);
+        return try sema.intern(.{ .un = .{ .ty = ty, .tag = try sema.unionFieldTagValue(ty, b.i), .val = b.val } });
+    }
     if (std.mem.indexOfScalar(bool, undef[0..used], true) != null) return try sema.undefValue(ty);
     switch (class) {
         .bool => return boolValue(buf[0] & 1 != 0),
@@ -8568,7 +8592,7 @@ fn unionFieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, i: u32, initial
         else => false,
     } else false;
     if (sema.resolveValue(ptr)) |pv| if (!runtime_var and try sema.comptimePtrRoot(pv) != .int) {
-        if (!initializing and info.layout != .@"packed") if (try sema.comptimeLoadOrNull(block, src, pv)) |uv| if (ip.indexToKey(uv) == .un) {
+        if (!initializing and info.layout == .auto) if (try sema.comptimeLoadOrNull(block, src, pv)) |uv| if (ip.indexToKey(uv) == .un) {
             const active = ip.indexToKey(uv).un.tag;
             if (active != try sema.unionFieldTagValue(union_ty, i)) {
                 const active_i = for (0..info.field_names.len) |k| {
@@ -8708,7 +8732,12 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                 if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(field_ty));
                 if (Type.isPacked(ip, ty)) return .fromInterned(try sema.fieldValue(v, i));
                 const u = ip.indexToKey(v).un;
-                if (u.tag != try sema.unionFieldTagValue(ty, i)) return sema.fail(block, src, "access of inactive union field '{s}'", .{name});
+                if (u.tag != try sema.unionFieldTagValue(ty, i)) {
+                    // An extern union's other fields read its bytes.
+                    if (ip.structInfo(ty).layout != .@"extern") return sema.fail(block, src, "access of inactive union field '{s}'", .{name});
+                    try sema.resolveLayout(block, src, field_ty);
+                    return .fromInterned(try sema.readMem(block, src, v, 0, field_ty));
+                }
                 return .fromInterned(u.val);
             }
             if (Type.isPacked(ip, ty)) {
