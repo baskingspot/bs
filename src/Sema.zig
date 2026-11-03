@@ -1375,19 +1375,63 @@ fn addDeclaredHereNote(sema: *Sema, ty: Index) CompileError!void {
         .@"opaque" => "opaque",
         else => return,
     };
-    const c = ip.containerType(ty) orelse return;
+    const decl = sema.containerDecl(ty) orelse return;
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(decl.file));
+    // A file's root struct has no declaration line to show.
+    if (decl.node == .root) return sema.zcu.addNote(decl.file, tree.nodeToSpan(decl.node), "{s} declared here", .{category});
+    try sema.zcu.addDeclNote(decl.file, tree.nodeToSpan(decl.node), "{s} declared here", .{category});
+}
+
+/// Where struct, union, enum or opaque type `ty` is declared.
+fn containerDecl(sema: *Sema, ty: Index) ?struct { file: u32, node: Ast.Node.Index } {
+    const c = sema.ip.containerType(ty) orelse return null;
     const code = &sema.zcu.file(c.file).zir;
     const node: Ast.Node.Index = reifyNode(code, c.zir_inst) orelse switch (code.instructions.items(.data)[@backingInt(c.zir_inst)].extended.opcode) {
         .struct_decl => code.getStructDecl(c.zir_inst).src_node,
         .union_decl => code.getUnionDecl(c.zir_inst).src_node,
         .enum_decl => code.getEnumDecl(c.zir_inst).src_node,
         .opaque_decl => code.getOpaqueDecl(c.zir_inst).src_node,
-        else => return,
+        else => return null,
     };
-    const tree = try sema.zcu.fe.tree(@fromBackingInt(c.file));
-    // A file's root struct has no declaration line to show.
-    if (node == .root) return sema.zcu.addNote(c.file, tree.nodeToSpan(node), "{s} declared here", .{category});
-    try sema.zcu.addDeclNote(c.file, tree.nodeToSpan(node), "{s} declared here", .{category});
+    return .{ .file = c.file, .node = node };
+}
+
+/// A switch on enum `enum_ty` (the tag of `union_ty`, if one) that lacks
+/// the prongs of fields `missing`, as upstream: a note per field, where it
+/// is declared, then where the type is.
+fn failSwitchEnum(sema: *Sema, block: *Block, src: Src, enum_ty: Index, union_ty: ?Index, missing: []const u32) CompileError {
+    const ip = sema.ip;
+    const zcu = sema.zcu;
+    const err = sema.fail(block, src, "switch must handle all possibilities", .{});
+    const tree = try zcu.fe.tree(@fromBackingInt(sema.file));
+    const span = src.span(tree);
+    const names = ip.structInfo(enum_ty).field_names;
+    const decl = sema.containerDecl(enum_ty) orelse if (union_ty) |u| sema.containerDecl(u) else null;
+    const decl_tree = if (decl) |d| try zcu.fe.tree(@fromBackingInt(d.file)) else null;
+    for (missing) |fi| {
+        const name = ip.stringSlice(names[fi]);
+        const field = if (decl) |d| fieldNameToken(decl_tree.?, d.node, name) else null;
+        if (field) |t| {
+            const start = decl_tree.?.tokenStart(t);
+            const end: u32 = start + @as(u32, @intCast(decl_tree.?.tokenSlice(t).len));
+            try zcu.addNote(decl.?.file, .{ .start = start, .main = start, .end = end }, "unhandled enumeration value: '{s}'", .{name});
+        } else try zcu.addNote(sema.file, span, "unhandled enumeration value: '{s}'", .{name});
+    }
+    if (decl) |d| try zcu.addDeclNote(d.file, decl_tree.?.nodeToSpan(d.node), "enum '{f}' declared here", .{sema.fmtType(enum_ty)});
+    return err;
+}
+
+/// The name token of field `name` of the container declared at `node`.
+fn fieldNameToken(tree: *const Ast, node: Ast.Node.Index, name: []const u8) ?Ast.TokenIndex {
+    var buf: [2]Ast.Node.Index = undefined;
+    const decl = tree.fullContainerDecl(&buf, node) orelse return null;
+    for (decl.ast.members) |m| {
+        const field = tree.fullContainerField(m) orelse continue;
+        const t = field.ast.main_token;
+        const slice = tree.tokenSlice(t);
+        if (std.mem.eql(u8, slice, name) or (slice.len > 3 and slice[0] == '@' and std.mem.eql(u8, slice[2 .. slice.len - 1], name))) return t;
+    }
+    return null;
 }
 
 const FmtType = struct {
@@ -2536,10 +2580,18 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 i += 1;
                 continue;
             },
+            .ensure_result_non_error => {
+                try sema.zirEnsureResultNonError(block, inst);
+                i += 1;
+                continue;
+            },
+            .ensure_err_union_payload_void => {
+                try sema.zirEnsureErrUnionPayloadVoid(block, inst);
+                i += 1;
+                continue;
+            },
             .dbg_var_ptr,
             .dbg_var_val,
-            .ensure_result_non_error,
-            .ensure_err_union_payload_void,
             .validate_struct_init_ty,
             .validate_struct_init_result_ty,
             .validate_array_init_ty,
@@ -12630,14 +12682,34 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         const info = ip.structInfo(operand_ty);
         // A union switches over its fields, whatever its tag type.
         if (info.nonexhaustive and !sb.has_under and !is_union) return sema.fail(parent, src, "switch on non-exhaustive enum must include 'else' or '_' prong", .{});
-        for (info.field_defaults) |fv| {
+        var missing: std.ArrayList(u32) = .empty;
+        for (info.field_defaults, 0..) |fv, fi| {
             const tv = try sema.intern(.{ .enum_tag = .{ .ty = operand_ty, .int = fv } });
             for (cases.items) |c| {
                 if (std.mem.indexOfScalar(Index, c.items, tv) != null) break;
-            } else return sema.fail(parent, src, "switch must handle all possibilities", .{});
+            } else try missing.append(sema.arena, @intCast(fi));
         }
+        if (missing.items.len != 0) return sema.failSwitchEnum(parent, src, operand_ty, if (is_union) sema.typeOf(operand) else null, missing.items);
     } else if (else_case == null) switch (Type.class(ip, operand_ty)) {
-        .error_set => {},
+        .error_set => if (try sema.errorSetNames(parent, src, operand_ty)) |names| {
+            var prongs: std.ArrayList([]const u8) = .empty;
+            for (names) |n| {
+                const handled = outer: for (cases.items) |c| {
+                    for (c.items) |item| {
+                        if (ip.keyPayload(.err, item).name == n) break :outer true;
+                    }
+                } else false;
+                if (!handled) try prongs.append(sema.arena, ip.stringSlice(n));
+            }
+            if (prongs.items.len != 0) {
+                const err = sema.fail(parent, src, "switch must handle all possibilities", .{});
+                const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+                const span = src.span(tree);
+                for (prongs.items) |p| try sema.zcu.addNote(sema.file, span, "unhandled error value: 'error.{s}'", .{p});
+                return err;
+            }
+        } else if (!sema.isOwnIes(operand_ty))
+            return sema.fail(parent, src, "else prong required when switching on type '{f}'", .{sema.fmtType(.anyerror_type)}),
         .void => if (cases.items.len == 0) return sema.fail(parent, src, "switch must handle all possibilities", .{}),
         .int, .@"struct", .@"union" => if (!try sema.switchCoversAllInts(parent, src, cases.items, operand_ty))
             return sema.fail(parent, src, "switch must handle all possibilities", .{}),
@@ -13717,13 +13789,61 @@ fn zirOptEuBasePtrInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compile
 
 fn zirEnsureResultUsed(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].un_node;
+    return sema.ensureResultUsed(block, block.nodeSrc(data.src_node), sema.typeOf(sema.resolveInst(data.operand)));
+}
+
+/// A statement's value of type `ty`, at `src`, must be void.
+fn ensureResultUsed(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
+    switch (Type.class(sema.ip, ty)) {
+        .void, .noreturn => {},
+        .error_set => return sema.fail(block, src, "error set of type '{f}' is ignored", .{sema.fmtType(ty)}),
+        .error_union => return sema.failIgnoredError(src, sema.fail(block, src, "error union of type '{f}' is ignored", .{sema.fmtType(ty)})),
+        else => {
+            const err = sema.fail(block, src, "value of type '{f}' ignored", .{sema.fmtType(ty)});
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            try sema.zcu.addNote(sema.file, src.span(tree), "all non-void values must be used", .{});
+            try sema.zcu.addNote(sema.file, src.span(tree), "to discard the value, assign it to '_'", .{});
+            return err;
+        },
+    }
+}
+
+/// `_ = x;` where `x` is an error, as upstream.
+fn zirEnsureResultNonError(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].un_node;
     const src = block.nodeSrc(data.src_node);
     const ty = sema.typeOf(sema.resolveInst(data.operand));
     switch (Type.class(sema.ip, ty)) {
+        .error_set => return sema.fail(block, src, "error set is discarded", .{}),
+        .error_union => return sema.failIgnoredError(src, sema.fail(block, src, "error union is discarded", .{})),
+        else => {},
+    }
+}
+
+/// Returns `err`, an error union ignored at `src`, with upstream's note.
+fn failIgnoredError(sema: *Sema, src: Src, err: CompileError) CompileError {
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    try sema.zcu.addNote(sema.file, src.span(tree), "consider using 'try', 'catch', or 'if'", .{});
+    return err;
+}
+
+/// `if (x) {} else |err| {}` and `x catch |err| {}` where `x`'s payload is
+/// not void need `|_|` for the payload, as upstream.
+fn zirEnsureErrUnionPayloadVoid(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].un_node;
+    const src = block.nodeSrc(data.src_node);
+    const ip = sema.ip;
+    var ty = sema.typeOf(sema.resolveInst(data.operand));
+    if (Type.class(ip, ty) == .pointer) ty = Type.childType(ip, ty);
+    if (Type.class(ip, ty) != .error_union) return;
+    switch (Type.class(ip, ip.keyPayload(.error_union_type, ty).payload_type)) {
         .void, .noreturn => {},
-        .error_set => return sema.fail(block, src, "error set is ignored", .{}),
-        .error_union => return sema.fail(block, src, "error union is ignored", .{}),
-        else => return sema.fail(block, src, "value of type '{f}' ignored", .{sema.fmtType(ty)}),
+        else => {
+            const err = sema.fail(block, src, "error union payload is ignored", .{});
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            try sema.zcu.addNote(sema.file, src.span(tree), "payload value can be explicitly ignored with '|_|'", .{});
+            return err;
+        },
     }
 }
 
@@ -14594,10 +14714,20 @@ fn zirCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const extra = sema.code.extraData(Zir.Inst.Call, data.payload_index);
     const callee = sema.resolveInst(extra.data.callee);
     const modifier: std.lang.CallModifier = @fromBackingInt(@intCast(extra.data.flags.packed_modifier));
-    return sema.analyzeCall(block, src, callee, .none, .{ .zir = .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len } }, modifier);
+    const result = try sema.analyzeCall(block, src, callee, .none, .{ .zir = .{ .call_inst = inst, .extra_end = extra.end, .args_len = extra.data.flags.args_len } }, modifier);
+    if (extra.data.flags.ensure_result_used) try sema.ensureResultUsed(block, src, sema.typeOf(result));
+    return result;
 }
 
 fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const result = try sema.fieldCall(block, inst);
+    if (sema.code.extraData(Zir.Inst.FieldCall, data.payload_index).data.flags.ensure_result_used)
+        try sema.ensureResultUsed(block, block.nodeSrc(data.src_node), sema.typeOf(result));
+    return result;
+}
+
+fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const ip = sema.ip;
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const src = block.nodeSrc(data.src_node);
