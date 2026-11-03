@@ -68,6 +68,8 @@ pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
 /// Scratch for `plan`: the allocs it considers promoting, and their loads.
 candidates: std.ArrayList(u32) = .empty,
 var_loads: std.ArrayList(u32) = .empty,
+/// The innermost loop around each of `var_loads`.
+var_load_loops: std.ArrayList(u32) = .empty,
 
 pub const no_loop = std.math.maxInt(u32);
 
@@ -106,6 +108,10 @@ pub const Live = struct {
     /// for its whole interval: the variable's interval contains it, and no
     /// store to the variable lies in it.
     share: u32,
+    /// From `plan`, for a load of a constant that is forwarded: the value
+    /// it reads (an IR instruction index), whose home the load shares;
+    /// else `no_tie`.
+    fwd: u32,
 };
 
 /// What `plan` decided for a value, beside its register.
@@ -207,6 +213,7 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.pairs.deinit(gpa);
     f.candidates.deinit(gpa);
     f.var_loads.deinit(gpa);
+    f.var_load_loops.deinit(gpa);
 }
 
 pub fn blockInsts(f: *const Func, block: Block.Index) []const Inst.Index {
@@ -413,6 +420,8 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     @memset(live.items(.reg2), no_reg);
     @memset(fate, .normal);
     @memset(share, no_tie);
+    const fwd = live.items(.fwd);
+    @memset(fwd, no_tie);
     f.pairs.clearRetainingCapacity();
     {
         const Uses = struct {
@@ -438,6 +447,10 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
     const candidate = no_tie - 1;
     f.candidates.clearRetainingCapacity();
     f.var_loads.clearRetainingCapacity();
+    f.var_load_loops.clearRetainingCapacity();
+    // A candidate's `fwd` holds its only store while forwarding is
+    // possible, then `no_fwd`.
+    const no_fwd = no_tie - 1;
     for (f.layout.items) |block| {
         const b = f.blocks.items[@backingInt(block)];
         const cond: ?Inst.Index = if (b.term.tag == .branch) datas[@backingInt(b.term.inst)].pl_op.operand.toIndex() else null;
@@ -486,8 +499,10 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     if (ty == .none) continue;
                     const info = Type.ptrInfo(ip, ty);
                     if (info.flags.is_volatile) continue;
-                    const class: u32 = if (ctx.inGpr(info.child)) 0 else if (ctx.inPair(info.child)) 1 else if (ctx.inFloat(info.child)) 2 else continue;
+                    // Class 3: only forwarded, never promoted.
+                    const class: u32 = if (ctx.inGpr(info.child)) 0 else if (ctx.inPair(info.child)) 1 else if (ctx.inFloat(info.child)) 2 else if (info.flags.is_const) 3 else continue;
                     count[i] = candidate;
+                    if (!info.flags.is_const) fwd[i] = no_fwd;
                     try f.candidates.append(gpa, i | class << 30);
                 },
                 .load => if (fate[i] != .dead) {
@@ -495,11 +510,13 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     if (count[v] == no_tie) continue;
                     count[v] -%= 1;
                     try f.var_loads.append(gpa, i);
+                    try f.var_load_loops.append(gpa, f.block_loop.items[@backingInt(block)]);
                 },
                 .store => {
                     const bin = datas[i].bin_op;
                     const v = @backingInt(bin.lhs.toIndex() orelse continue);
                     if (count[v] != no_tie and bin.rhs != bin.lhs) count[v] -%= 1;
+                    if (count[v] != no_tie) fwd[v] = if (fwd[v] == no_tie and bin.rhs.toIndex() != null) i else no_fwd;
                 },
                 else => if (cond != null and cond.? == inst and uses[i] == 1 and ctx.fusable(inst)) {
                     fate[i] = .fused;
@@ -508,25 +525,62 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
             }
         }
     }
+    // Forwarding needs the store before every load in the layout, as it
+    // dominates them.
+    for (f.var_loads.items) |l| {
+        const v = @backingInt(datas[l].ty_op.operand.toIndex().?);
+        if (fwd[v] < no_fwd and def[l] < def[fwd[v]]) fwd[v] = no_fwd;
+    }
     // A candidate whose every use is a load or a store's address is
-    // promoted (see `plan`).
+    // forwarded or promoted (see `plan`).
     const tie = live.items(.tie);
     for (f.candidates.items) |c| {
         const v = c & ~(@as(u32, 3) << 30);
         if (candidate - count[v] == uses[v]) {
-            reg[v] = switch (c >> 30) {
-                0 => want_reg,
-                1 => want_pair,
-                else => want_float,
-            };
-            tie[v] = no_tie;
+            if (fwd[v] < no_fwd) {
+                fate[v] = .dead;
+                fate[fwd[v]] = .dead;
+                reg[v] = no_reg;
+            } else if (c >> 30 != 3) {
+                reg[v] = switch (c >> 30) {
+                    0 => want_reg,
+                    1 => want_pair,
+                    else => want_float,
+                };
+                tie[v] = no_tie;
+            }
         }
         count[v] = no_tie;
     }
+    const crosses = live.items(.crosses);
+    const end = live.items(.end);
+    const cl = f.clobbers.items;
+    for (f.var_loads.items, f.var_load_loops.items) |l, loop| {
+        const v = datas[l].ty_op.operand.toIndex().?;
+        if (fate[@backingInt(v)] == .dead and fwd[@backingInt(v)] < no_fwd) {
+            // The load is the value stored, which lives through the
+            // load's interval and every loop around the load that does
+            // not contain its definition.
+            var w = @backingInt(datas[fwd[@backingInt(v)]].bin_op.rhs.toIndex().?);
+            if (fwd[w] != no_tie and tags[w] == .load) w = fwd[w];
+            fwd[l] = w;
+            reg[l] = no_reg;
+            var e = end[l];
+            var lp = loop;
+            while (lp != no_loop and f.loops.items[lp].start > def[w]) : (lp = f.loops.items[lp].parent) e = @max(e, f.loops.items[lp].end);
+            end[w] = @max(end[w], e);
+            // The load's `crosses` covers its uses; a clobber point between
+            // the definition and the load counts too, also in a block that
+            // does not continue.
+            crosses[w] = crosses[w] or crosses[l] or cl[end[w]][0] != cl[def[w]][0] or cl[def[l]][1] != cl[def[w]][1];
+        }
+    }
+    // After forwarding, which lengthens the intervals of values stored.
     for (f.var_loads.items) |l| {
         const v = datas[l].ty_op.operand.toIndex().?;
         if (reg[@backingInt(v)] == reg[l] and wants(reg[l])) share[l] = f.shareable(ir, @fromBackingInt(l), v);
     }
+    for (f.candidates.items) |c| fwd[c & ~(@as(u32, 3) << 30)] = no_tie;
 }
 
 /// `v` if load `load` of promoted variable `v` may share its register
@@ -557,7 +611,7 @@ fn shareable(f: *const Func, ir: *const Ir, load: Inst.Index, v: Inst.Index) u32
 /// Whether value `inst` may go unemitted when nothing reads it: it reads
 /// no volatile memory, writes nothing but its own result, cannot trap, and
 /// requests nothing from the linker that its users would not.
-fn removable(ir: *const Ir, ip: *const InternPool, inst: Inst.Index) bool {
+pub fn removable(ir: *const Ir, ip: *const InternPool, inst: Inst.Index) bool {
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .not => true,

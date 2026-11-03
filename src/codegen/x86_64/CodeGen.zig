@@ -1664,6 +1664,14 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .load => {
             const ty = data.ty_op.ty;
+            if (cg.live) {
+                // A forwarded constant is the value stored (`Live.fwd`).
+                const w = cg.ssa.live.items(.fwd)[@backingInt(inst)];
+                if (w != Ssa.no_tie) {
+                    cg.homes[@backingInt(inst)] = cg.homes[w];
+                    return;
+                }
+            }
             if (cg.varReg(data.ty_op.operand)) |r| return cg.setResult(inst, ty, r);
             if (cg.varXmm(data.ty_op.operand)) |x| return cg.setXmm(inst, ty, x);
             if (cg.pairOf(data.ty_op.operand)) |_| {
