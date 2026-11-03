@@ -498,6 +498,40 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             };
             try cg.e.setcc(cond, .{ .mem = dst });
         },
+        .atomic_load => {
+            const ty = data.ty_op.ty;
+            const size = Type.abiSize(ip, ty);
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            try cg.load(.rcx, data.ty_op.operand);
+            try cg.e.mov(sizeOf(size), .{ .reg = .rax }, .{ .mem = Mem.at(.rcx, 0) });
+            try cg.storeReg(dst, .rax, size);
+        },
+        .atomic_store => {
+            const size = Type.abiSize(ip, cg.typeOf(data.bin_op.rhs));
+            try cg.load(.rcx, data.bin_op.lhs);
+            try cg.load(.rax, data.bin_op.rhs);
+            try cg.e.xchg(sizeOf(size), .{ .mem = Mem.at(.rcx, 0) }, .rax);
+        },
+        .atomic_rmw => try cg.atomicRmw(inst, data),
+        .cmpxchg => {
+            const x = ir.extraData(Ir.Cmpxchg, data.ty_pl.payload).data;
+            const elem_ty = cg.typeOf(x.expected);
+            const size = sizeOf(Type.abiSize(ip, elem_ty));
+            try cg.load(.rcx, x.ptr);
+            try cg.load(.rax, x.expected);
+            try cg.load(.rdx, x.new);
+            try cg.e.lockCmpxchg(size, Mem.at(.rcx, 0), .rdx);
+            const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
+            if (Type.optionalReprIsPtr(ip, elem_ty)) {
+                // Null (0) on success, else the pointer found.
+                try cg.e.mov(.dword, .{ .reg = .r8 }, .{ .imm = 0 });
+                try cg.e.cmov(.ne, .qword, .r8, .{ .reg = .rax });
+                try cg.storeReg(dst, .r8, 8);
+            } else {
+                try cg.e.setcc(.ne, .{ .mem = offsetMem(dst, Type.optionalFlagOffset(ip, data.ty_pl.ty)) });
+                try cg.storeReg(dst, .rax, Type.abiSize(ip, elem_ty));
+            }
+        },
         .ret_addr, .frame_addr => {
             const dst = try cg.resultMem(inst, .usize_type) orelse return;
             if (tag == .ret_addr) {
@@ -1167,6 +1201,68 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     }
     if (callee_ty.cc == .c) return cg.cCallResult(ret_ty, dst);
     if (dst) |m| if (cg.passInRegs(ret_ty)) try cg.storeReg(m, .rax, Type.abiSize(ip, ret_ty));
+}
+
+/// `@atomicRmw`: xchg and lock xadd where x86 has them, else a lock
+/// cmpxchg loop that computes the new value in r8 from the old one in rax.
+fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
+    const ip = cg.ip;
+    const x = cg.ir.extraData(Ir.AtomicRmw, data.ty_pl.payload).data;
+    const ty = data.ty_pl.ty;
+    const bytes = Type.abiSize(ip, ty);
+    const size = sizeOf(bytes);
+    const mem = Mem.at(.rcx, 0);
+    try cg.load(.rcx, x.ptr);
+    try cg.load(.rdx, x.operand);
+    switch (x.operation()) {
+        .Xchg => {
+            try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
+            try cg.e.xchg(size, .{ .mem = mem }, .rax);
+        },
+        .Add, .Sub => {
+            try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rdx });
+            if (x.operation() == .Sub) try cg.e.unary(.neg, .qword, .{ .reg = .rax });
+            try cg.e.lockXadd(size, mem, .rax);
+        },
+        .And, .Nand, .Or, .Xor, .Max, .Min => {
+            const is_signed = Type.isInt(ip, ty) and Type.intInfo(ip, ty).signedness == .signed;
+            try cg.e.mov(size, .{ .reg = .rax }, .{ .mem = mem });
+            const top = try cg.e.newLabel();
+            cg.e.bind(top);
+            // r8 = the old value, extended like `rdx`.
+            switch (size) {
+                .qword => try cg.e.mov(.qword, .{ .reg = .r8 }, .{ .reg = .rax }),
+                else => if (is_signed)
+                    try cg.e.movsx(.qword, .r8, size, .{ .reg = .rax })
+                else
+                    try cg.e.movzx(.qword, .r8, size, .{ .reg = .rax }),
+            }
+            switch (x.operation()) {
+                .And, .Nand => {
+                    try cg.e.alu(.@"and", .qword, .{ .reg = .r8 }, .{ .reg = .rdx });
+                    if (x.operation() == .Nand) {
+                        try cg.e.unary(.not, .qword, .{ .reg = .r8 });
+                        if (ty == .bool_type) try cg.e.alu(.@"and", .qword, .{ .reg = .r8 }, .{ .imm = 1 });
+                    }
+                },
+                .Or => try cg.e.alu(.@"or", .qword, .{ .reg = .r8 }, .{ .reg = .rdx }),
+                .Xor => try cg.e.alu(.xor, .qword, .{ .reg = .r8 }, .{ .reg = .rdx }),
+                .Max, .Min => {
+                    try cg.e.alu(.cmp, .qword, .{ .reg = .r8 }, .{ .reg = .rdx });
+                    const take_operand: Encoder.Cond = switch (x.operation()) {
+                        .Max => if (is_signed) .l else .b,
+                        else => if (is_signed) .g else .a,
+                    };
+                    try cg.e.cmov(take_operand, .qword, .r8, .{ .reg = .rdx });
+                },
+                else => unreachable,
+            }
+            try cg.e.lockCmpxchg(size, mem, .r8);
+            try cg.e.jcc(.ne, .{ .label = top });
+        },
+    }
+    const dst = try cg.resultMem(inst, ty) orelse return;
+    try cg.storeReg(dst, .rax, bytes);
 }
 
 // ---------------------------------------------------------------------------

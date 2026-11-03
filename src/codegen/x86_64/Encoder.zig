@@ -436,6 +436,28 @@ pub fn xchg(e: *Encoder, size: Size, a: Rm, b: Reg) !void {
     try e.gprRm(size, 0x86, 0x87, .{ .reg = b }, a, 0);
 }
 
+/// `lock cmpxchg [dst], src`: if [dst] equals al/ax/eax/rax, stores `src`
+/// there (ZF set); else loads [dst] into it (ZF clear).
+pub fn lockCmpxchg(e: *Encoder, size: Size, dst: Mem, src: Reg) !void {
+    try e.lock0f(size, 0xb0, 0xb1, dst, src);
+}
+
+/// `lock xadd [dst], src`: adds `src` to [dst] and leaves the old value
+/// in `src`.
+pub fn lockXadd(e: *Encoder, size: Size, dst: Mem, src: Reg) !void {
+    try e.lock0f(size, 0xc0, 0xc1, dst, src);
+}
+
+fn lock0f(e: *Encoder, size: Size, op8: u8, op: u8, dst: Mem, src: Reg) !void {
+    try e.reserve();
+    e.byte(0xf0);
+    try e.modRm(.{
+        .op16 = size == .word,
+        .w = size == .qword,
+        .force_rex = size == .byte and src.needsRexAsByte(),
+    }, &.{ 0x0f, if (size == .byte) op8 else op }, @backingInt(src), rmGpr(.{ .mem = dst }), 0);
+}
+
 // ---------------------------------------------------------------- strings
 
 /// `rep movsb`: copies rcx bytes from [rsi] to [rdi], backwards if DF is set.

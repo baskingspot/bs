@@ -187,6 +187,18 @@ pub const Inst = struct {
         error_name,
         /// `ty_op`: `usize` to pointer.
         ptr_from_int,
+        /// `ty_op`: atomically load a `ty` from pointer `operand`.
+        atomic_load,
+        /// `bin_op`: atomically store `rhs` through pointer `lhs`
+        /// (sequentially consistent, which covers every ordering).
+        atomic_store,
+        /// `ty_pl` with `AtomicRmw`: atomically replace `*ptr` with
+        /// `op(*ptr, operand)`; the result is the old value, of type `ty`.
+        atomic_rmw,
+        /// `ty_pl` with `Cmpxchg`: if `*ptr == expected`, store `new`. The
+        /// result, of optional type `ty`, is null on success, else the value
+        /// found. Strong (x86's cmpxchg never fails spuriously).
+        cmpxchg,
         /// `no_op`: `@returnAddress()` and `@frameAddress()` of the
         /// function, as `usize`.
         ret_addr,
@@ -417,6 +429,23 @@ pub const Bin = struct {
     rhs: Inst.Ref,
 };
 
+pub const AtomicRmw = struct {
+    ptr: Inst.Ref,
+    operand: Inst.Ref,
+    /// A `std.lang.AtomicRmwOp`.
+    op: u32,
+
+    pub fn operation(x: AtomicRmw) std.lang.AtomicRmwOp {
+        return @fromBackingInt(@intCast(x.op));
+    }
+};
+
+pub const Cmpxchg = struct {
+    ptr: Inst.Ref,
+    expected: Inst.Ref,
+    new: Inst.Ref,
+};
+
 pub const StructField = struct {
     operand: Inst.Ref,
     index: u32,
@@ -502,6 +531,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .errunion_payload_ptr_set,
         .wrap_errunion_payload,
         .wrap_errunion_err,
+        .atomic_load,
         .get_union_tag,
         .tag_name,
         .clz,
@@ -525,8 +555,10 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .union_init,
         .assembly,
         .extern_ptr,
+        .atomic_rmw,
+        .cmpxchg,
         => data.ty_pl.ty,
-        .store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt => .void_type,
+        .store, .atomic_store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt => .void_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),

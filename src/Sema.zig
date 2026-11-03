@@ -1851,6 +1851,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .func, .func_inferred, .func_fancy => sema.zirFunc(block, inst),
         .field_call => sema.zirFieldCall(block, inst),
         .builtin_call => sema.zirBuiltinCall(block, inst),
+        .atomic_load => sema.zirAtomicLoad(block, inst),
+        .atomic_store => sema.zirAtomicStore(block, inst),
+        .atomic_rmw => sema.zirAtomicRmw(block, inst),
         .ret_is_non_err, .is_non_err => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             break :blk sema.analyzeIsNonErr(block, src, sema.resolveInst(data.un_node.operand));
@@ -2520,6 +2523,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         },
         .builtin_extern => sema.zirBuiltinExtern(block, inst),
         .field_parent_ptr => sema.zirFieldParentPtr(block, inst),
+        .cmpxchg => sema.zirCmpxchg(block, inst),
         .ret_addr, .frame_address => blk: {
             // Zero at comptime, as upstream.
             if (block.is_comptime) break :blk .fromInterned(.zero_usize);
@@ -2976,6 +2980,141 @@ fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
     if (is_weak and Type.class(ip, ty) != .optional) ty = try sema.optType(ty);
     if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
     return sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ty, .payload = @backingInt(try sema.getString(name)) } } });
+}
+
+// Atomics. x86_64 loads and stores are atomic for every ordering zap
+// needs; stores, read-modify-writes, and cmpxchg use locked instructions,
+// which are sequentially consistent, so orderings are only validated.
+
+fn atomicOrder(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref) CompileError!void {
+    const ty = try sema.stdLangType(block, src, "AtomicOrder");
+    _ = try sema.resolveConstValue(block, src, try sema.coerce(block, ty, sema.resolveInst(ref), src), "atomic ordering must be comptime-known");
+}
+
+fn atomicElemType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
+    const ip = sema.ip;
+    try sema.resolveLayout(block, src, ty);
+    const ok = switch (Type.class(ip, ty)) {
+        .int, .bool, .@"enum", .float => true,
+        .pointer => !Type.isSlice(ip, ty),
+        .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, ty)),
+        .@"struct" => Type.isPacked(ip, ty),
+        else => false,
+    };
+    if (!ok) return sema.fail(block, src, "expected bool, integer, float, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(ty)});
+    const size = Type.abiSize(ip, ty);
+    if (size != 1 and size != 2 and size != 4 and size != 8) return sema.failUnsupported(block, src, "atomics on types of this size");
+}
+
+/// The pointer operand of an atomic builtin, as a pointer to `elem_ty`.
+fn atomicPtr(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref, is_const: bool) CompileError!struct { Ref, Index } {
+    const ip = sema.ip;
+    const ptr = sema.resolveInst(ref);
+    const ptr_ty = sema.typeOf(ptr);
+    if (Type.class(ip, ptr_ty) != .pointer or Type.ptrInfo(ip, ptr_ty).flags.size != .one)
+        return sema.fail(block, src, "expected single pointer, found '{f}'", .{sema.fmtType(ptr_ty)});
+    const info = Type.ptrInfo(ip, ptr_ty);
+    if (!is_const and info.flags.is_const) return sema.fail(block, src, "cannot assign to constant", .{});
+    try sema.atomicElemType(block, src, info.child);
+    return .{ ptr, info.child };
+}
+
+fn zirAtomicLoad(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const extra = sema.code.extraData(Zir.Inst.AtomicLoad, data.payload_index).data;
+    const src = block.nodeSrc(data.src_node);
+    const elem_ty = try sema.resolveType(block, src, extra.elem_type);
+    try sema.atomicElemType(block, src, elem_ty);
+    const ptr = try sema.coerce(block, try sema.ptrType(.{ .child = elem_ty, .flags = .{ .is_const = true } }), sema.resolveInst(extra.ptr), src);
+    try sema.atomicOrder(block, src, extra.ordering);
+    if (block.is_comptime) return sema.analyzeLoad(block, src, ptr);
+    return sema.addTyOp(block, .atomic_load, elem_ty, ptr);
+}
+
+fn zirAtomicStore(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const extra = sema.code.extraData(Zir.Inst.AtomicStore, data.payload_index).data;
+    const src = block.nodeSrc(data.src_node);
+    const ptr, const elem_ty = try sema.atomicPtr(block, src, extra.ptr, false);
+    const operand = try sema.coerce(block, elem_ty, sema.resolveInst(extra.operand), src);
+    try sema.atomicOrder(block, src, extra.ordering);
+    if (block.is_comptime) {
+        try sema.analyzeStore(block, src, ptr, operand);
+    } else {
+        _ = try sema.addBinOp(block, .atomic_store, ptr, operand);
+    }
+    return .void_value;
+}
+
+fn zirAtomicRmw(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const ip = sema.ip;
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const extra = sema.code.extraData(Zir.Inst.AtomicRmw, data.payload_index).data;
+    const src = block.nodeSrc(data.src_node);
+    const ptr, const elem_ty = try sema.atomicPtr(block, src, extra.ptr, false);
+    const op_ty = try sema.stdLangType(block, src, "AtomicRmwOp");
+    const op_val = try sema.resolveConstValue(block, src, try sema.coerce(block, op_ty, sema.resolveInst(extra.operation), src), "atomic operation must be comptime-known");
+    const op: std.lang.AtomicRmwOp = @fromBackingInt(@intCast(ip.intValue(u64, ip.indexToKey(op_val).enum_tag.int).?));
+    const operand = try sema.coerce(block, elem_ty, sema.resolveInst(extra.operand), src);
+    try sema.atomicOrder(block, src, extra.ordering);
+    const class = Type.class(ip, elem_ty);
+    // Integers, packed structs, and pointers allow every operation.
+    switch (class) {
+        .@"enum" => if (op != .Xchg) return sema.fail(block, src, "@atomicRmw with enum only allowed with .Xchg", .{}),
+        .bool => if (op != .Xchg) return sema.fail(block, src, "@atomicRmw with bool only allowed with .Xchg", .{}),
+        .float => switch (op) {
+            .Xchg, .Add, .Sub, .Max, .Min => {},
+            else => return sema.fail(block, src, "@atomicRmw with float only allowed with .Xchg, .Add, .Sub, .Max, and .Min", .{}),
+        },
+        else => {},
+    }
+    if (block.is_comptime) {
+        if (op != .Xchg and class != .int and class != .float) return sema.failUnsupported(block, src, "comptime @atomicRmw on this type");
+        const old = try sema.analyzeLoad(block, src, ptr);
+        const new: Ref = switch (op) {
+            .Xchg => operand,
+            .Add => try sema.analyzeArithmetic(block, src, if (class == .float) .add else .addwrap, old, operand),
+            .Sub => try sema.analyzeArithmetic(block, src, if (class == .float) .sub else .subwrap, old, operand),
+            .And => try sema.analyzeArithmetic(block, src, .bit_and, old, operand),
+            .Or => try sema.analyzeArithmetic(block, src, .bit_or, old, operand),
+            .Xor => try sema.analyzeArithmetic(block, src, .xor, old, operand),
+            .Nand => try sema.analyzeBitNot(block, src, try sema.analyzeArithmetic(block, src, .bit_and, old, operand)),
+            .Max => try sema.analyzeMinMax(block, src, .max, &.{ old, operand }),
+            .Min => try sema.analyzeMinMax(block, src, .min, &.{ old, operand }),
+        };
+        try sema.analyzeStore(block, src, ptr, new);
+        return old;
+    }
+    if (class == .float and op != .Xchg) return sema.failUnsupported(block, src, "float @atomicRmw");
+    const payload = try sema.addExtra(Ir.AtomicRmw{ .ptr = ptr, .operand = operand, .op = @backingInt(op) });
+    return sema.addInst(block, .{ .tag = .atomic_rmw, .data = .{ .ty_pl = .{ .ty = elem_ty, .payload = payload } } });
+}
+
+/// `@cmpxchgStrong` and `@cmpxchgWeak`.
+fn zirCmpxchg(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const ip = sema.ip;
+    const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
+    const extra = sema.code.extraData(Zir.Inst.Cmpxchg, ext.operand).data;
+    const src = block.nodeSrc(extra.node);
+    const ptr, const elem_ty = try sema.atomicPtr(block, src, extra.ptr, false);
+    if (Type.class(ip, elem_ty) == .float) return sema.fail(block, src, "expected bool, integer, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(elem_ty)});
+    const expected = try sema.coerce(block, elem_ty, sema.resolveInst(extra.expected_value), src);
+    const new = try sema.coerce(block, elem_ty, sema.resolveInst(extra.new_value), src);
+    try sema.atomicOrder(block, src, extra.success_order);
+    try sema.atomicOrder(block, src, extra.failure_order);
+    const result_ty = try sema.optType(elem_ty);
+    try sema.resolveLayout(block, src, result_ty);
+    if (block.is_comptime) {
+        const old = try sema.analyzeLoad(block, src, ptr);
+        const eq = try sema.analyzeCmp(block, src, .eq, old, expected);
+        if (sema.resolveValue(eq) == .bool_true) {
+            try sema.analyzeStore(block, src, ptr, new);
+            return .fromInterned(try sema.intern(.{ .opt = .{ .ty = result_ty, .val = .none } }));
+        }
+        return sema.coerce(block, result_ty, old, src);
+    }
+    const payload = try sema.addExtra(Ir.Cmpxchg{ .ptr = ptr, .expected = expected, .new = new });
+    return sema.addInst(block, .{ .tag = .cmpxchg, .data = .{ .ty_pl = .{ .ty = result_ty, .payload = payload } } });
 }
 
 /// `@fieldParentPtr("field", field_ptr)`: the pointer to the struct or
