@@ -1,8 +1,11 @@
-//! Debug code generation for x86_64: one function's IR to one Atom, in a
-//! single pass. The strategy is the one in docs/architecture.md: every IR
-//! value with runtime bits lives in a stack slot, and each instruction loads
-//! its operands into scratch registers, computes, and stores its result.
-//! No value stays in a register across instructions.
+//! Code generation for x86_64: one function's IR to one Atom. The IR is
+//! first built into the shared SSA form (`../Ssa.zig`), whose blocks this
+//! file emits in layout order. Every value still lowers through the
+//! per-instruction code (step 1 of docs/architecture.md, "Optimizing
+//! backend"): every IR value with runtime bits lives in a stack slot, and
+//! each instruction loads its operands into scratch registers, computes,
+//! and stores its result. No value stays in a register across
+//! instructions.
 //!
 //! Frame: `push rbp; mov rbp, rsp; sub rsp, N`. Slots are at negative
 //! offsets from rbp; outgoing call arguments are at the bottom of the frame
@@ -36,6 +39,7 @@ const Emit = @import("../../Emit.zig");
 const Atom = @import("../../link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
+const Ssa = @import("../Ssa.zig");
 const Reg = Encoder.Reg;
 const Mem = Encoder.Mem;
 const Size = Encoder.Size;
@@ -49,11 +53,13 @@ ir: *const Ir,
 e: Encoder,
 fn_ty: InternPool.FuncType,
 homes: []Home,
+ssa: *const Ssa,
+/// Each SSA block's label, by block index.
+labels: []Encoder.Label,
 /// Bytes of stack slots below rbp.
 slots_size: u32 = 0,
 /// Largest outgoing argument area of any call.
 out_args_size: u32 = 0,
-blocks: std.AutoHashMapUnmanaged(Inst.Index, Encoder.Label) = .empty,
 /// rbp offset of the slot holding the result pointer (for results returned
 /// in memory).
 ret_ptr_slot: ?i32 = null,
@@ -111,6 +117,16 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const ip = &emit.zcu.ip;
     const func = ip.indexToKey(ir.func).func;
     const gpa = emit.gpa;
+    const t0 = std.Io.Timestamp.now(emit.zcu.io, .awake);
+    try emit.ssa.build(gpa, ir);
+    const t1 = std.Io.Timestamp.now(emit.zcu.io, .awake);
+    defer {
+        const s = &emit.codegen_stats;
+        s.build_ns += @intCast(t0.durationTo(t1).nanoseconds);
+        s.emit_ns += @intCast(t1.durationTo(.now(emit.zcu.io, .awake)).nanoseconds);
+        s.functions += 1;
+        s.ir_insts += ir.instructions.len;
+    }
     var cg: CodeGen = .{
         .emit = emit,
         .gpa = gpa,
@@ -119,11 +135,13 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .e = .init(gpa),
         .fn_ty = ip.indexToKey(func.ty).func_type,
         .homes = try gpa.alloc(Home, ir.instructions.len),
+        .ssa = &emit.ssa,
+        .labels = try gpa.alloc(Encoder.Label, emit.ssa.blocks.items.len),
     };
     defer {
         cg.e.deinit();
         gpa.free(cg.homes);
-        cg.blocks.deinit(gpa);
+        gpa.free(cg.labels);
         cg.dbg_inlines.deinit(gpa);
         cg.dbg_inline_names.deinit(gpa);
         cg.dbg_inline_callees.deinit(gpa);
@@ -144,7 +162,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         frame_patch = cg.e.code.items.len;
         try cg.setupParams();
     }
-    try cg.genBody(ir.mainBody());
+    try cg.emitBlocks();
     cg.e.finish();
 
     if (!naked) {
@@ -165,6 +183,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
             @memcpy(cg.e.code.items[sub_at + 5 ..][0..2], &[_]u8{ 0x66, 0x90 });
         }
     }
+
+    emit.codegen_stats.code_bytes += cg.e.code.items.len;
+    emit.codegen_stats.frame_bytes += cg.slots_size + cg.out_args_size;
 
     const arena = emit.allocator();
     const nav = ip.getNav(func.owner_nav);
@@ -553,19 +574,68 @@ fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 // ---------------------------------------------------------------------------
 // Instructions
 
-fn genBody(cg: *CodeGen, body: []const Inst.Index) Error!void {
-    for (body) |inst| try cg.genInst(inst);
+/// Emits the SSA blocks in layout order.
+fn emitBlocks(cg: *CodeGen) Error!void {
+    const f = cg.ssa;
+    for (cg.labels) |*l| l.* = try cg.e.newLabel();
+    for (f.layout.items, 0..) |block, i| {
+        cg.e.bind(cg.labels[@backingInt(block)]);
+        for (f.blockInsts(block)) |inst| try cg.genInst(inst);
+        const next: Ssa.Block.Index = if (i + 1 < f.layout.items.len) f.layout.items[i + 1] else .none;
+        try cg.genTerm(f.blocks.items[@backingInt(block)].term, next);
+    }
 }
 
+fn checkNaked(cg: *CodeGen, tag: Inst.Tag) Error!void {
+    if (cg.fn_ty.cc == .naked) switch (tag) {
+        .assembly, .trap, .unreach, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+        else => return cg.fail("'{t}' in a naked function", .{tag}),
+    };
+}
+
+/// Emits a block's terminator; `next` is the block after it in the layout.
+fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
+    const ir = cg.ir;
+    const tag = ir.instructions.items(.tag)[@backingInt(term.inst)];
+    const data = ir.instructions.items(.data)[@backingInt(term.inst)];
+    switch (term.tag) {
+        .noreturn => {},
+        .fallthrough => assert(@backingInt(next) == term.succ[0]),
+        .jump => {
+            try cg.checkNaked(tag);
+            if (tag == .br) switch (cg.homes[@backingInt(data.br.block_inst)]) {
+                .slot => |off| try cg.copyTo(Mem.at(.rbp, off), data.br.operand),
+                else => {},
+            };
+            try cg.e.jmp(.{ .label = cg.labels[term.succ[0]] });
+        },
+        .branch => {
+            try cg.checkNaked(tag);
+            assert(@backingInt(next) == term.succ[0]);
+            try cg.load(.rax, data.pl_op.operand);
+            try cg.e.@"test"(.byte, .{ .reg = .rax }, .{ .reg = .rax });
+            try cg.e.jcc(.e, .{ .label = cg.labels[term.succ[1]] });
+        },
+        .switch_br => {
+            try cg.checkNaked(tag);
+            assert(@backingInt(next) == term.succ[1]);
+            try cg.switchBr(data, term);
+        },
+        .ret => {
+            try cg.checkNaked(tag);
+            try cg.ret(data.un_op);
+        },
+        .unreach => try cg.e.ud2(),
+    }
+}
+
+/// Emits a value, from its IR instruction.
 fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
     const ip = cg.ip;
     const ir = cg.ir;
     const tag = ir.instructions.items(.tag)[@backingInt(inst)];
     const data = ir.instructions.items(.data)[@backingInt(inst)];
-    if (cg.fn_ty.cc == .naked) switch (tag) {
-        .assembly, .trap, .unreach, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
-        else => return cg.fail("'{t}' in a naked function", .{tag}),
-    };
+    try cg.checkNaked(tag);
     switch (tag) {
         .arg => {},
         // Only in bodies lowered for the comptime evaluator.
@@ -787,45 +857,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.storeReg(dst, .rax, Type.abiSize(ip, ty));
         },
 
-        .block => {
-            const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
-            _ = try cg.slotFor(inst, data.ty_pl.ty);
-            const label = try cg.e.newLabel();
-            try cg.blocks.put(cg.gpa, inst, label);
-            try cg.genBody(ir.bodySlice(extra.end, extra.data.body_len));
-            cg.e.bind(label);
-        },
-        .loop => {
-            const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
-            const label = try cg.e.newLabel();
-            cg.e.bind(label);
-            try cg.blocks.put(cg.gpa, inst, label);
-            try cg.genBody(ir.bodySlice(extra.end, extra.data.body_len));
-        },
-        .repeat => try cg.e.jmp(.{ .label = cg.blocks.get(data.repeat.loop_inst).? }),
-        .br => {
-            const target = data.br.block_inst;
-            switch (cg.homes[@backingInt(target)]) {
-                .slot => |off| try cg.copyTo(Mem.at(.rbp, off), data.br.operand),
-                else => {},
-            }
-            try cg.e.jmp(.{ .label = cg.blocks.get(target).? });
-        },
-        .cond_br => {
-            const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
-            const then_body = ir.bodySlice(extra.end, extra.data.then_body_len);
-            const else_body = ir.bodySlice(extra.end + then_body.len, extra.data.else_body_len);
-            try cg.load(.rax, data.pl_op.operand);
-            try cg.e.@"test"(.byte, .{ .reg = .rax }, .{ .reg = .rax });
-            const else_label = try cg.e.newLabel();
-            try cg.e.jcc(.e, .{ .label = else_label });
-            try cg.genBody(then_body);
-            cg.e.bind(else_label);
-            try cg.genBody(else_body);
-        },
-        .switch_br => try cg.switchBr(data),
-        .ret => try cg.ret(data.un_op),
-        .unreach, .trap => try cg.e.ud2(),
+        // The block's result, which each `br` writes (see `genTerm`).
+        .block => _ = try cg.slotFor(inst, data.ty_pl.ty),
+        .loop => {},
+        // Terminators (`genTerm`).
+        .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap => unreachable,
         .breakpoint => try cg.e.int3(),
         .call => try cg.call(inst, data),
 
@@ -1341,22 +1377,18 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     try cg.storeReg(offsetMem(dst, Type.fieldOffset(ip, tuple_ty, 1)), .r11, 1);
 }
 
-fn switchBr(cg: *CodeGen, data: Inst.Data) Error!void {
+/// A compare and branch per case item; the else block follows.
+fn switchBr(cg: *CodeGen, data: Inst.Data, term: Ssa.Term) Error!void {
     const ir = cg.ir;
     const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
     const wide = cg.isWideInt(cg.typeOf(data.pl_op.operand));
     if (!wide) try cg.load(.rax, data.pl_op.operand);
-    const Case = struct { label: Encoder.Label, body: []const Inst.Index };
-    var cases: std.ArrayList(Case) = .empty;
-    defer cases.deinit(cg.gpa);
     var i = extra.end;
-    for (0..extra.data.cases_len) |_| {
+    for (cg.ssa.switchCases(term, extra.data.cases_len)) |case_block| {
         const items_len = ir.extra[i];
-        const body_len = ir.extra[i + 1];
         const items = ir.refSlice(i + 2, items_len);
-        const body = ir.bodySlice(i + 2 + items_len, body_len);
-        i += 2 + items_len + body_len;
-        const label = try cg.e.newLabel();
+        i += 2 + items_len + ir.extra[i + 1];
+        const label = cg.labels[@backingInt(case_block)];
         for (items) |item| {
             if (wide) {
                 try cg.wideEqFlags(data.pl_op.operand, item);
@@ -1367,12 +1399,6 @@ fn switchBr(cg: *CodeGen, data: Inst.Data) Error!void {
             try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
             try cg.e.jcc(.e, .{ .label = label });
         }
-        try cases.append(cg.gpa, .{ .label = label, .body = body });
-    }
-    try cg.genBody(ir.bodySlice(i, extra.data.else_body_len));
-    for (cases.items) |c| {
-        cg.e.bind(c.label);
-        try cg.genBody(c.body);
     }
 }
 
@@ -1754,9 +1780,9 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
 
 fn asmCond(name: []const u8) ?Encoder.Cond {
     const conds = [_]struct { []const u8, Encoder.Cond }{
-        .{ "z", .e },  .{ "e", .e },  .{ "nz", .ne }, .{ "ne", .ne }, .{ "b", .b },   .{ "c", .b },
-        .{ "ae", .ae }, .{ "nc", .ae }, .{ "be", .be }, .{ "a", .a },   .{ "l", .l },   .{ "ge", .ge },
-        .{ "le", .le }, .{ "g", .g },  .{ "s", .s },   .{ "ns", .ns }, .{ "o", .o },   .{ "no", .no },
+        .{ "z", .e },   .{ "e", .e },   .{ "nz", .ne }, .{ "ne", .ne }, .{ "b", .b }, .{ "c", .b },
+        .{ "ae", .ae }, .{ "nc", .ae }, .{ "be", .be }, .{ "a", .a },   .{ "l", .l }, .{ "ge", .ge },
+        .{ "le", .le }, .{ "g", .g },   .{ "s", .s },   .{ "ns", .ns }, .{ "o", .o }, .{ "no", .no },
     };
     for (conds) |c| if (std.mem.eql(u8, name, c[0])) return c[1];
     return null;
@@ -1989,8 +2015,8 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
             };
             break :blk .{ .key = key, .off = 0 };
         } else
-            // A local constant declared `align(n)` keeps its alignment.
-            .{ .key = try emit.uavKey(u.val, if (u.orig_ty == .none) 0 else explicitAlignment(ip, u.orig_ty)), .off = 0 },
+        // A local constant declared `align(n)` keeps its alignment.
+        .{ .key = try emit.uavKey(u.val, if (u.orig_ty == .none) 0 else explicitAlignment(ip, u.orig_ty)), .off = 0 },
         .field => |f| blk: {
             var parent = try ptrTarget(emit, f.base);
             const container = Type.ptrInfo(ip, ip.typeOf(f.base)).child;

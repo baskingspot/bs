@@ -192,7 +192,12 @@ pub fn main(init: std.process.Init) !void {
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
     emit.obj = command == .build_obj;
+    // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
+    // n more times (`zig build bench-codegen`).
+    const bench_runs: u32 = if (init.environ_map.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
+    if (bench_runs != 0) emit.bench_irs = .empty;
     try zcu.analyzeAll(&emit);
+    if (bench_runs != 0) try emit.benchCodegen(bench_runs);
     stages.markSplit("sema", "codegen", emit.codegen_ns);
     if (is_test) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -212,6 +217,7 @@ pub fn main(init: std.process.Init) !void {
     if (inc) |*i| i.finishRecord(linked);
     stages.mark("cache record (after the link)");
     stages.print();
+    if (stages.on) emit.codegen_stats.print("zap: codegen");
     if (!linked) std.process.exit(1);
     if (run_test) try runTest(init, out_path.?, opts.emit_bin != .path);
     if (command == .run) {
@@ -425,6 +431,7 @@ test {
     _ = @import("codegen/x86_64/Encoder.zig");
     _ = @import("link/MachO.zig");
     _ = @import("codegen/aarch64/Encoder.zig");
+    _ = @import("codegen/Ssa.zig");
     _ = @import("InternPool.zig");
     _ = Zcu;
     _ = @import("Sema.zig");

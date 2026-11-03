@@ -16,6 +16,7 @@ const SymbolKey = Atom.SymbolKey;
 const Elf = @import("link/Elf.zig");
 const ElfObject = @import("link/ElfObject.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
+const Ssa = @import("codegen/Ssa.zig");
 
 const Emit = @This();
 
@@ -84,6 +85,51 @@ link_seen: bool = false,
 error_values: std.ArrayList(Elf.Value) = .empty,
 /// Time spent in `CodeGen.generate`, for `ZAP_TIMING`.
 codegen_ns: u64 = 0,
+/// `ZAP_BENCH_CODEGEN`: a copy of every function's IR, which
+/// `benchCodegen` generates again after analysis.
+bench_irs: ?std.ArrayList(Ir) = null,
+/// The SSA form of the function being generated, reused for the next.
+ssa: Ssa = .{},
+/// Per-stage backend time and size, for `ZAP_TIMING` and bench-codegen.
+codegen_stats: CodeGenStats = .{},
+
+pub const CodeGenStats = struct {
+    /// Building the SSA form from the IR.
+    build_ns: u64 = 0,
+    /// Lowering and encoding the SSA form, and making the Atom.
+    emit_ns: u64 = 0,
+    functions: u64 = 0,
+    ir_insts: u64 = 0,
+    /// Machine code of the functions, and their frames' slots and
+    /// outgoing argument areas.
+    code_bytes: u64 = 0,
+    frame_bytes: u64 = 0,
+
+    pub fn print(s: CodeGenStats, label: []const u8) void {
+        const per = struct {
+            fn f(ns: u64, n: u64) f64 {
+                return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(n, 1)));
+            }
+        }.f;
+        const ms = struct {
+            fn f(ns: u64) f64 {
+                return @as(f64, @floatFromInt(ns)) / 1e6;
+            }
+        }.f;
+        std.debug.print("{s}: {d} functions, {d} IR instructions; ssa build {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
+            label,
+            s.functions,
+            s.ir_insts,
+            ms(s.build_ns),
+            per(s.build_ns, s.ir_insts),
+            ms(s.emit_ns),
+            per(s.emit_ns, s.ir_insts),
+            per(s.build_ns + s.emit_ns, s.ir_insts),
+            per(s.code_bytes, s.ir_insts),
+            per(s.frame_bytes, s.functions),
+        });
+    }
+};
 
 pub const Owner = union(enum) {
     unit: Zcu.AnalUnit,
@@ -127,6 +173,11 @@ pub fn deinit(emit: *Emit) void {
     emit.atom_owners.deinit(gpa);
     emit.content_uses.deinit(gpa);
     emit.unit_refs.deinit(gpa);
+    emit.ssa.deinit(gpa);
+    if (emit.bench_irs) |*irs| {
+        for (irs.items) |*ir| ir.deinit(gpa);
+        irs.deinit(gpa);
+    }
     emit.uav_memo.deinit(gpa);
     emit.uav_refs.deinit(gpa);
     emit.uav_uses.deinit(gpa);
@@ -137,6 +188,17 @@ pub fn deinit(emit: *Emit) void {
 
 /// Sink callback from `Zcu.analyzeAll`.
 pub fn function(emit: *Emit, zcu: *Zcu, ir: *const Ir) !void {
+    if (emit.bench_irs) |*irs| {
+        var list = ir.instructions.toMultiArrayList();
+        try irs.append(emit.gpa, .{
+            .instructions = (try list.clone(emit.gpa)).slice(),
+            .extra = try emit.gpa.dupe(u32, ir.extra),
+            .func = ir.func,
+            .main_block = ir.main_block,
+            .rbrace_line = ir.rbrace_line,
+            .rbrace_column = ir.rbrace_column,
+        });
+    }
     emit.owner = .{ .unit = .{ .func = ir.func } };
     defer emit.owner = .link;
     const t0 = std.Io.Timestamp.now(zcu.io, .awake);
@@ -145,6 +207,23 @@ pub fn function(emit: *Emit, zcu: *Zcu, ir: *const Ir) !void {
         error.CodegenFail => emit.failed = true,
         else => |e| return e,
     };
+}
+
+/// `ZAP_BENCH_CODEGEN=n`: generates every function captured during
+/// analysis again, `runs` times, each into a fresh Emit, and prints the
+/// fastest run's stages. Code generation reads the Zcu without changing
+/// what a later build of the same functions produces.
+pub fn benchCodegen(emit: *Emit, runs: u32) !void {
+    const irs = emit.bench_irs orelse return;
+    var best: ?CodeGenStats = null;
+    for (0..runs) |_| {
+        var e: Emit = .init(emit.gpa, emit.zcu);
+        defer e.deinit();
+        for (irs.items) |*ir| try e.function(emit.zcu, ir);
+        const s = e.codegen_stats;
+        if (best == null or s.build_ns + s.emit_ns < best.?.build_ns + best.?.emit_ns) best = s;
+    }
+    if (best) |s| s.print("bench-codegen (fastest run)");
 }
 
 /// Lowers the remaining data and orders the atoms for `link`. Returns

@@ -63,6 +63,24 @@ pub fn build(b: *std.Build) void {
     const bench_link_run = b.addRunArtifact(bench_link);
     bench_link_run.addPassthruArgs();
     b.step("bench-link", "Measure link throughput on ~100k synthetic atoms (args: elf (default) or macho)").dependOn(&bench_link_run.step);
+
+    // zap itself, ReleaseFast, generating every function of a build 10
+    // more times after analysis (`ZAP_BENCH_CODEGEN`).
+    const bench_zap_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_zap_mod.addOptions("build_options", options);
+    const bench_zap = b.addExecutable(.{ .name = "zap", .root_module = bench_zap_mod });
+    bench_zap.stack_size = exe.stack_size;
+    const bench_codegen_run = b.addRunArtifact(bench_zap);
+    bench_codegen_run.setEnvironmentVariable("ZAP_BENCH_CODEGEN", "10");
+    bench_codegen_run.addArg("build-exe");
+    bench_codegen_run.addFileArg(b.path("bench/workloads/hello/hello.zig"));
+    bench_codegen_run.addArg("-fno-emit-bin");
+    bench_codegen_run.has_side_effects = true;
+    b.step("bench-codegen", "Measure the backend per stage, per IR instruction, on the hello workload (others: ZAP_BENCH_CODEGEN=n zap build-exe ...)").dependOn(&bench_codegen_run.step);
 }
 
 /// Each `test/run/*.zig` program (other than the shared `rt.zig`) starts

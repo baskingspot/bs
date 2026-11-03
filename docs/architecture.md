@@ -527,7 +527,7 @@ denser encoding.
 
 ### Optimizing backend (designed 2026-11-03, accepted by the owner; being built)
 
-Not built yet. AGENTS.md fixes the goal: one optimization level, Debug
+Step 1 is built (see "Landing it"). AGENTS.md fixes the goal: one optimization level, Debug
 semantics, debuggable output, and optimization sized to compile fast. This
 section fixes how: one shared SSA layer per function, a short fixed list of
 passes, linear-scan register allocation, and a lowering per architecture.
@@ -1053,13 +1053,16 @@ long pole afterwards.
 
 Measuring it:
 
-- `ZAP_TIMING=1` gains one line per stage above, summed over functions.
-- `zig build bench-codegen` (new, like `bench-link`): runs the frontend
-  and Sema on libvaxis once in process, keeps every function's IR, then
-  runs the backend over all of it repeatedly and prints ns per IR
-  instruction per stage, code bytes per IR instruction, and the frame
-  bytes per function. Deterministic enough for A/B comparisons in one
-  session, and callgrind instruction counts of the same binary are exact.
+- `ZAP_TIMING=1` prints a second line with each stage that exists so far,
+  summed over functions, per IR instruction (`Emit.CodeGenStats`).
+- `ZAP_BENCH_CODEGEN=n` makes zap keep a copy of every function's IR
+  during analysis and then run the backend over all of it n more times,
+  each into a fresh Emit, printing the fastest run's stages, code bytes
+  per IR instruction, and frame bytes per function. `zig build
+  bench-codegen` does that for the hello workload with a ReleaseFast zap;
+  for libvaxis, set the variable on bench.py's build-exe command line.
+  Deterministic enough for A/B comparisons in one session, and callgrind
+  instruction counts of the same binary are exact.
 - `bench/runtime.py` times the generated code (below). Every backend
   change reports its compile-time cost next to its run-time win, as
   AGENTS.md asks.
@@ -1090,6 +1093,15 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    through a fallback that is today's per-instruction code (operands in
    frame slots, scratch registers clobbered), so the output matches
    today's in behavior. This lands the data structures and the driver.
+   Built: `src/codegen/Ssa.zig` builds blocks from the structured IR (a
+   `block`'s exit, a loop header, both sides of a `cond_br`, a switch's
+   else and cases) with every IR instruction as one `fallback` value, and
+   x86_64 CodeGen emits the blocks in layout order, lowering terminators
+   itself. A block's result stays the `block` value's memory, written by
+   each `br`, until phis arrive with promotion; a loop's entry is a
+   `fallthrough` terminator until layout (pass 4) owns block order. The
+   output is byte-identical to the single-pass backend's (libvaxis
+   text_input, hello), and the build costs 10 ns per IR instruction.
 2. Lowering for scalar ops, the allocator, and frame-slot sharing; the
    fallback remains for wide integers, f80, f128, and inline assembly
    (which gets its constraints from the allocator later).
