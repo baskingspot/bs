@@ -24,6 +24,10 @@ pub fn build(b: *std.Build) void {
     exe_mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{ .name = "zap", .root_module = exe_mod });
+    // Comptime evaluation recurses on the native stack: a 1000-deep
+    // comptime recursion (the default branch quota) needs more than the
+    // usual 8 MiB. Upstream links zig with the same size.
+    exe.stack_size = 46 * 1024 * 1024;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

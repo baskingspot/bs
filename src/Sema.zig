@@ -1125,7 +1125,10 @@ fn analyzeInlineBody(sema: *Sema, block: *Block, body: []const Zir.Inst.Index, b
 fn emitBackwardBranch(sema: *Sema, block: *Block, src: Src) CompileError!void {
     sema.branch_count += 1;
     if (sema.branch_count > sema.branch_quota) {
-        return sema.fail(block, src, "evaluation exceeded {d} backwards branches", .{sema.branch_quota});
+        const err = sema.fail(block, src, "evaluation exceeded {d} backwards branches", .{sema.branch_quota});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        try sema.zcu.addNote(sema.file, src.span(tree), "use @setEvalBranchQuota() to raise the branch limit from {d}", .{sema.branch_quota});
+        return err;
     }
 }
 
@@ -7448,6 +7451,15 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         }
         cases = expanded;
     }
+    if (sema.resolveValue(cond) == null) {
+        // Each inline prong after the first counts as a backward branch,
+        // as upstream.
+        var first = true;
+        for (cases.items) |c| if (c.is_inline) {
+            if (!first) try sema.emitBackwardBranch(parent, src);
+            first = false;
+        };
+    }
     const under_case = under_prong orelse else_case;
 
     // Comptime-known operand: analyze only the matching prong.
@@ -8733,11 +8745,15 @@ fn analyzeCall(
     if (comptime_call) {
         const vals = try sema.arena.alloc(Index, args.len);
         for (args, vals) |a, *v| v.* = try sema.resolveConstValue(block, src, a, "argument to function being called at comptime must be comptime-known");
+        // Each comptime or inline call counts as a backward branch, as
+        // upstream.
+        try sema.emitBackwardBranch(block, src);
         const n = sema.zcu.errors.items.len;
-        return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, "called at comptime from here"));
+        return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, "called at comptime here"));
     }
 
     if (fn_ty.cc == .@"inline" or modifier == .always_inline) {
+        try sema.emitBackwardBranch(block, src);
         const n = sema.zcu.errors.items.len;
         return sema.inlineCall(block, src, func, args) catch |err| return sema.noteCallSite(block, src, n, err, "called inline here");
     }
@@ -8751,8 +8767,9 @@ fn analyzeCall(
         if (Type.isComptimeOnly(ip, ip.indexToKey(ip.typeOf(callee_func)).func_type.return_type)) {
             const vals = try sema.arena.alloc(Index, args.len);
             for (args, vals) |a, *v| v.* = try sema.resolveConstValue(block, src, a, "argument to function being called at comptime must be comptime-known");
+            try sema.emitBackwardBranch(block, src);
             const n = sema.zcu.errors.items.len;
-            return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, "called at comptime from here"));
+            return .fromInterned(sema.callComptime(block, src, func, vals) catch |err| return sema.noteCallSite(block, src, n, err, "called at comptime here"));
         }
     }
     try sema.requireRuntime(block, src);

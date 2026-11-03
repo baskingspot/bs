@@ -124,7 +124,9 @@ pub const ErrorMsg = struct {
     msg: []const u8,
     notes: []const Note = &.{},
 
-    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8 };
+    /// `count` repeats of the same note in a row (a recursive call's
+    /// frames) render once, as upstream.
+    pub const Note = struct { file: u32, span: Ast.Span, msg: []const u8, count: u32 = 1 };
 };
 
 pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
@@ -207,9 +209,17 @@ pub fn addError(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []cons
 pub fn addNote(zcu: *Zcu, file_index: u32, span: Ast.Span, comptime fmt: []const u8, args: anytype) !void {
     const arena = zcu.arena.allocator();
     const e = &zcu.errors.items[zcu.errors.items.len - 1];
+    const msg = try std.fmt.allocPrint(arena, fmt, args);
+    if (e.notes.len != 0) {
+        const last = e.notes[e.notes.len - 1];
+        if (last.file == file_index and last.span.main == span.main and std.mem.eql(u8, last.msg, msg)) {
+            @constCast(&e.notes[e.notes.len - 1]).count += 1;
+            return;
+        }
+    }
     const notes = try arena.alloc(ErrorMsg.Note, e.notes.len + 1);
     @memcpy(notes[0..e.notes.len], e.notes);
-    notes[e.notes.len] = .{ .file = file_index, .span = span, .msg = try std.fmt.allocPrint(arena, fmt, args) };
+    notes[e.notes.len] = .{ .file = file_index, .span = span, .msg = msg };
     e.notes = notes;
 }
 
@@ -236,7 +246,8 @@ pub fn renderErrors(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip) !void {
         });
         const start = try wip.reserveNotes(@intCast(e.notes.len));
         for (e.notes, start..) |n, i| {
-            const note = try wip.addErrorMessage(.{ .msg = try wip.addString(n.msg), .src_loc = try zcu.srcLoc(wip, n.file, n.span) });
+            const msg = if (n.count == 1) try wip.addString(n.msg) else try wip.printString("{s} ({d} times)", .{ n.msg, n.count });
+            const note = try wip.addErrorMessage(.{ .msg = msg, .src_loc = try zcu.srcLoc(wip, n.file, n.span) });
             wip.extra.items[i] = @backingInt(note);
         }
     }
