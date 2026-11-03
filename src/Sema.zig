@@ -1710,6 +1710,18 @@ fn noteEffects(sema: *Sema, ty: Index, file_root: bool) Allocator.Error!void {
     try zcu.effect_uses.put(zcu.gpa, .{ .unit = sema.owner, .ty = ty }, {});
 }
 
+/// Whether referring to a function of type `fn_ty` compiles its body, as
+/// upstream's `fnHasRuntimeBits`: a generic function has no body of its own
+/// until a call instantiates it, and one with a comptime-only parameter or
+/// result (`fn (anytype) type`, `fn (T: type) type`) runs only at comptime.
+fn fnHasRuntimeBits(sema: *Sema, fn_ty: Index) bool {
+    const ip = sema.ip;
+    const f = ip.keyPayload(.func_type, fn_ty);
+    if (f.is_generic or f.comptime_bits != 0) return false;
+    for (f.param_types) |p| if (Type.isComptimeOnly(ip, p)) return false;
+    return !Type.isComptimeOnly(ip, f.return_type);
+}
+
 /// Queues `func`, which this unit refers to other than by calling it (its
 /// address, an export).
 fn queueFuncRef(sema: *Sema, src: Src, func: Index) CompileError!void {
@@ -4846,8 +4858,7 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     }
     try sema.ensureNavVal(block, src, nav_index);
     const nav = sema.ip.getNav(nav_index);
-    // A generic function has no body of its own until a call instantiates it.
-    if (sema.ip.keyTag(nav.val) == .func and !sema.ip.keyPayload(.func_type, nav.ty).is_generic) try sema.queueFuncRef(src, nav.val);
+    if (sema.ip.keyTag(nav.val) == .func and sema.fnHasRuntimeBits(nav.ty)) try sema.queueFuncRef(src, nav.val);
     // A referenced variable is emitted with its type's layout (`var global:
     // @This()` inside the struct leaves it unresolved until now).
     if (!nav.is_const) try sema.resolveLayoutIfIdle(block, src, nav.ty);
@@ -6573,7 +6584,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 if (d.child != src_ty and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
                 const f = ip.keyPayload(.func, v);
                 if (f.generic_owner != .none) return null;
-                try sema.queueFuncRef(src, v);
+                if (sema.fnHasRuntimeBits(src_ty)) try sema.queueFuncRef(src, v);
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .{ .nav = f.owner_nav } } }));
             },
             else => {},

@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -30,6 +30,24 @@ fn atThroughPointer(h: *Holder) *u32 {
     return h.s.at(1);
 }
 
+// z2d (internal/util.zig): a generic function passed as a comptime
+// function pointer is instantiated by the calls, never compiled on its own.
+fn runCases(cases: anytype, comptime f: *const fn (case: anytype) u32) u32 {
+    var sum: u32 = 0;
+    for (cases) |c| sum += f(c);
+    return sum;
+}
+const Case = struct { expected: u32 };
+fn expected(c: anytype) u32 {
+    return c.expected;
+}
+
+// ghostty (lib/enum.zig): referring to a function with a comptime-only
+// parameter or result (`std.testing.refAllDecls`) does not compile it.
+fn Pair(n: []const u8) type {
+    return [n.len]u8;
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -43,5 +61,8 @@ fn main() callconv(.c) noreturn {
     var h: Holder = .{};
     atThroughPointer(&h).* = 5;
     rt.printInt(h.s.items[1]);
+
+    rt.printInt(runCases([_]Case{ .{ .expected = 40 }, .{ .expected = 2 } }, expected));
+    _ = &Pair;
     rt.exit(0);
 }
