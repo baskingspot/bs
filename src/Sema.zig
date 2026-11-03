@@ -2147,13 +2147,15 @@ fn coerceBrOperand(sema: *Sema, b: *Block, inst: Ir.Inst.Index, ty: Index, opera
     const moved: Ir.Inst.Index = @fromBackingInt(@intCast(sema.ir_insts.len));
     try sema.ir_insts.append(sema.gpa, .{ .tag = tag, .data = data });
     try coerce_block.instructions.append(sema.gpa, moved);
+    if (tag == .store) {
+        // A store-block needs an exit: a `br` to itself.
+        const exit: Ir.Inst.Index = @fromBackingInt(@intCast(sema.ir_insts.len));
+        try sema.ir_insts.append(sema.gpa, .{ .tag = .br, .data = .{ .br = .{ .block_inst = inst, .operand = .void_value } } });
+        try coerce_block.instructions.append(sema.gpa, exit);
+    }
     const payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(coerce_block.instructions.items.len) });
     try sema.appendBody(coerce_block.instructions.items);
     const block_ty: Index = if (tag == .br) .noreturn_type else .void_type;
-    if (tag == .store) {
-        // A store-block needs an exit: append `br` to it.
-        return sema.failUnsupported(b, src, "coercing stores to inferred allocations");
-    }
     sema.ir_insts.set(@backingInt(inst), .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = block_ty, .payload = payload } } });
 }
 
@@ -3747,6 +3749,8 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const names = try sema.arena.alloc(InternPool.String, n);
             const types = try sema.arena.alloc(Index, n);
             const attrs = try sema.arena.alloc(Index, n);
+            // Explicit field alignments are known with the layout.
+            if (class != .tuple) try sema.resolveLayout(block, src, ty);
             for (0..n) |i| {
                 types[i] = Type.fieldType(ip, ty, i);
                 var is_comptime = false;
@@ -3761,8 +3765,13 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     default = ip.structInfo(ty).field_defaults[i];
                     is_comptime = ip.structInfo(ty).fieldIsComptime(i);
                 }
+                const explicit_align: Index = if (class != .tuple and ip.structInfo(ty).field_aligns.len != 0 and ip.structInfo(ty).field_aligns[i] != 0)
+                    try sema.intValue(.usize_type, ip.structInfo(ty).field_aligns[i])
+                else
+                    .none;
                 attrs[i] = try sema.structValue(block, src, attrs_ty, &[_]S{
                     .{ "comptime", boolValue(is_comptime) },
+                    .{ "align", try sema.optValue(.usize_type, explicit_align) },
                     .{ "default_value_ptr", try sema.optRefValue(default) },
                 });
             }
@@ -3782,10 +3791,14 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             });
         },
         .@"union" => blk: {
+            try sema.resolveLayout(block, src, ty);
             const info = ip.structInfo(ty);
             const attrs_ty = try sema.stdLangType(block, src, "Type.Union.FieldAttributes");
             const attrs = try sema.arena.alloc(Index, info.field_types.len);
-            for (attrs) |*a| a.* = try sema.structValue(block, src, attrs_ty, &.{});
+            for (attrs, 0..) |*a, i| {
+                const explicit_align: Index = if (info.field_aligns.len != 0 and info.field_aligns[i] != 0) try sema.intValue(.usize_type, info.field_aligns[i]) else .none;
+                a.* = try sema.structValue(block, src, attrs_ty, &[_]S{.{ "align", try sema.optValue(.usize_type, explicit_align) }});
+            }
             const tagged = info.tag_type != .none and ip.indexToKey(info.tag_type) == .enum_type;
             break :blk try sema.structValue(block, src, try sema.stdLangType(block, src, "Type.Union"), &[_]S{
                 .{ "layout", try sema.enumValueByName(block, src, try sema.stdLangType(block, src, "Type.ContainerLayout"), @tagName(info.layout)) },
@@ -4451,21 +4464,7 @@ fn analyzeDeclLiteral(sema: *Sema, block: *Block, src: Src, name: []const u8, or
         } else break,
         else => break,
     };
-    if (ty == .calling_convention_type) {
-        const cc: InternPool.CallingConvention = if (std.mem.eql(u8, name, "c"))
-            .c
-        else if (std.mem.eql(u8, name, "naked"))
-            .naked
-        else if (std.mem.eql(u8, name, "auto"))
-            .auto
-        else if (std.mem.eql(u8, name, "inline"))
-            .@"inline"
-        else if (std.mem.eql(u8, name, "x86_64_sysv"))
-            .c
-        else
-            return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{name});
-        return .fromInterned(try sema.intern(.{ .calling_convention = cc }));
-    }
+    if (ty == .calling_convention_type) return sema.callingConventionValue(block, src, name);
     // No result type (an `anytype` parameter): an enum literal, as upstream.
     if (ty == .generic_poison_type or ty == .enum_literal_type or Type.class(sema.ip, ty) == .error_set)
         return .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(name) }));
@@ -4825,6 +4824,23 @@ fn addInferredErrors(sema: *Sema, block: *Block, src: Src, set: Index) CompileEr
 // ---------------------------------------------------------------------------
 // Coercion and peer type resolution
 
+/// The `std.lang.CallingConvention` named `name` (`.c`, `.auto`, ...).
+fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8) CompileError!Ref {
+    const cc: InternPool.CallingConvention = if (std.mem.eql(u8, name, "c"))
+        .c
+    else if (std.mem.eql(u8, name, "naked"))
+        .naked
+    else if (std.mem.eql(u8, name, "auto"))
+        .auto
+    else if (std.mem.eql(u8, name, "inline"))
+        .@"inline"
+    else if (std.mem.eql(u8, name, "x86_64_sysv"))
+        .c
+    else
+        return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{name});
+    return .fromInterned(try sema.intern(.{ .calling_convention = cc }));
+}
+
 fn coerce(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) CompileError!Ref {
     if (try sema.coerceInner(block, dest_ty, inst, src)) |r| return r;
     return sema.fail(block, src, "expected type '{f}', found '{f}'", .{ sema.fmtType(dest_ty), sema.fmtType(sema.typeOf(inst)) });
@@ -4840,6 +4856,20 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
     const val = sema.resolveValue(inst);
     const dc = Type.class(ip, dest_ty);
     const sc = Type.class(ip, src_ty);
+    // The inferred error set of an inline or comptime call (its return
+    // type, as `ret_type`) takes any errors, as upstream adds them to the
+    // call's set: the value keeps its own error set (see `analyzeRet`).
+    if (dc == .error_union and ip.indexToKey(dest_ty).error_union_type.error_set_type == .adhoc_inferred_error_set_type) {
+        const set: Index = switch (sc) {
+            .error_union => ip.indexToKey(src_ty).error_union_type.error_set_type,
+            .error_set => src_ty,
+            else => try sema.intern(.{ .error_set_type = &.{} }),
+        };
+        if (set != .adhoc_inferred_error_set_type) {
+            const payload = ip.indexToKey(dest_ty).error_union_type.payload_type;
+            return sema.coerceInner(block, try sema.intern(.{ .error_union_type = .{ .error_set_type = set, .payload_type = payload } }), inst, src);
+        }
+    }
     switch (dc) {
         .int, .comptime_int => if (sc == .int or sc == .comptime_int) {
             if (val) |v| {
@@ -4964,11 +4994,20 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 try sema.resolveLayout(block, src, dest_ty);
                 return try sema.addTyOp(block, .wrap_errunion_err, dest_ty, err);
             }
-            if (sc == .error_union) {
+            // An error union whose payload is an error union may take one
+            // as its payload instead.
+            const payload_is_eu = Type.class(ip, eu.payload_type) == .error_union;
+            if (sc == .error_union) eu: {
                 const s_eu = ip.indexToKey(src_ty).error_union_type;
                 // As upstream, the payload must coerce in memory.
-                if (s_eu.payload_type != eu.payload_type and !sema.payloadCoercibleInMemory(s_eu.payload_type, eu.payload_type)) return null;
-                if (!try sema.errorSetCoercible(block, src, s_eu.error_set_type, eu.error_set_type, if (val) |v| v else .none)) return null;
+                if (s_eu.payload_type != eu.payload_type and !sema.payloadCoercibleInMemory(s_eu.payload_type, eu.payload_type)) {
+                    if (payload_is_eu) break :eu;
+                    return null;
+                }
+                if (!try sema.errorSetCoercible(block, src, s_eu.error_set_type, eu.error_set_type, if (val) |v| v else .none)) {
+                    if (payload_is_eu) break :eu;
+                    return null;
+                }
                 if (val) |v| return .fromInterned(switch (ip.indexToKey(v)) {
                     .error_union => |e| try sema.intern(.{ .error_union = .{ .ty = dest_ty, .val = switch (e.val) {
                         .err_name => e.val,
@@ -4992,7 +5031,17 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             return try sema.addTyOp(block, .bitcast, dest_ty, inst);
         },
         .pointer => switch (sc) {
-            .pointer => return sema.coercePtr(block, dest_ty, inst),
+            .pointer => {
+                // Comparing an explicit alignment with a natural one needs
+                // the children's layouts.
+                const s = Type.ptrInfo(ip, src_ty);
+                const d = Type.ptrInfo(ip, dest_ty);
+                if (s.flags.alignment != d.flags.alignment) {
+                    try sema.resolveLayoutIfIdle(block, src, s.child);
+                    try sema.resolveLayoutIfIdle(block, src, d.child);
+                }
+                return sema.coercePtr(block, dest_ty, inst);
+            },
             .null => if (Type.ptrInfo(ip, dest_ty).flags.size == .c)
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .int, .byte_offset = 0 } })),
             .int, .comptime_int => if (Type.ptrInfo(ip, dest_ty).flags.size == .c) {
@@ -5148,7 +5197,8 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             return .fromInterned(try sema.intern(.{ .un = .{ .ty = dest_ty, .tag = tv, .val = try sema.undefOrVoid(field_ty) } }));
         },
         .special => if (dest_ty == .calling_convention_type and sc == .enum_literal) {
-            return null;
+            const v = val orelse return null;
+            return try sema.callingConventionValue(block, src, ip.stringSlice(ip.indexToKey(v).enum_literal));
         },
         // Field by field, as upstream's `coerceTupleToTuple`.
         .tuple => if (sc == .tuple) {
@@ -5332,7 +5382,8 @@ fn naturalAlignment(sema: *Sema, ty: Index) ?u64 {
         .@"opaque" => null,
         // x86_64's minimum function alignment, as upstream.
         .@"fn" => 1,
-        else => if (Type.hasRuntimeBits(ip, ty)) Type.abiAlignment(ip, ty) else null,
+        // Zero-bit types too, as upstream: `*u0` and `*align(1) u0` match.
+        else => Type.abiAlignment(ip, ty),
     };
 }
 
@@ -12676,6 +12727,13 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             const v = try sema.resolveConstValue(block, src, cc_ref, "calling convention must be comptime-known");
             cc = switch (ip.indexToKey(v)) {
                 .calling_convention => |c| c,
+                // A value of std's own `std.lang.CallingConvention` union
+                // (e.g. a typed `const`), which zap models as a special
+                // type; only its payload-free tags are supported.
+                .un => |u| if (ip.typeOf(v) == (try sema.stdLangDecl(block, src, "CallingConvention")).toInterned().? and sema.enumTagName(u.tag) != null)
+                    ip.indexToKey((try sema.callingConventionValue(block, src, sema.enumTagName(u.tag).?)).toInterned().?).calling_convention
+                else
+                    return sema.fail(block, src, "expected calling convention, found '{f}'", .{sema.fmtType(ip.typeOf(v))}),
                 else => return sema.fail(block, src, "expected calling convention, found '{f}'", .{sema.fmtType(ip.typeOf(v))}),
             };
         }
