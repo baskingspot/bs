@@ -9804,6 +9804,23 @@ fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) C
         if (sema.bitCastBits(d_elem)) |d_bits| if (sema.bitCastBits(s_elem) == d_bits and sema.vectorLen(d_elem) == null and sema.vectorLen(s_elem) == null)
             return (try sema.vectorCast(block, src, dest_ty, operand, bitCast)).?;
     };
+    // Arrays and vectors of elements with padding bits: their logical bits
+    // differ from their memory, so the bits are packed into an integer and
+    // unpacked again.
+    if (sema.logicalBits(dest_ty)) |d_bits| if (sema.logicalBits(src_ty)) |s_bits| {
+        if (d_bits != s_bits) return sema.fail(block, src, "@bitCast size mismatch: destination type '{f}' has {d} bits but source type '{f}' has {d} bits", .{ sema.fmtType(dest_ty), d_bits, sema.fmtType(src_ty), s_bits });
+        if (sema.resolveValue(operand)) |v| {
+            if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
+            var bits = try BigInt.init(sema.arena);
+            try sema.valueBits(v, &bits, 0);
+            return .fromInterned(try sema.bitsValue(dest_ty, bits.toConst(), 0));
+        }
+        try sema.requireRuntime(block, src);
+        if (d_bits > std.math.maxInt(u16)) return sema.failUnsupported(block, src, "@bitCast of more than 65535 bits with padded elements");
+        const host_ty = try sema.intType(.unsigned, @intCast(d_bits));
+        const host = try sema.packLogicalBits(block, src, operand, .fromInterned(try sema.intValue(host_ty, 0)), 0);
+        return sema.unpackLogicalBits(block, src, host, dest_ty, 0);
+    };
     return sema.failUnsupported(block, src, "@bitCast between these types");
 }
 
@@ -9848,7 +9865,55 @@ fn bitCastBits(sema: *Sema, ty: Index) ?u64 {
     };
 }
 
-/// ORs the bits of value `v` (see `bitCastBits`) into `out` at bit `offset`.
+/// The bits `@bitCast` sees in `ty`, as upstream: arrays and vectors are
+/// their elements' bits in order, without the padding each element has in
+/// memory. Null for types `@bitCast` does not accept.
+fn logicalBits(sema: *Sema, ty: Index) ?u64 {
+    const ip = sema.ip;
+    if (Type.isInt(ip, ty)) return Type.intInfo(ip, ty).bits;
+    return switch (ip.indexToKey(ty)) {
+        .array_type => |a| (sema.logicalBits(a.child) orelse return null) * (a.len + @intFromBool(a.sentinel != .none)),
+        .vector_type => |v| (sema.logicalBits(v.child) orelse return null) * v.len,
+        else => sema.bitCastBits(ty),
+    };
+}
+
+/// Runtime value `val` (see `logicalBits`) ORed into unsigned integer
+/// `host` at bit `offset`, one scalar at a time.
+fn packLogicalBits(sema: *Sema, block: *Block, src: Src, val: Ref, host: Ref, offset: u64) CompileError!Ref {
+    const ip = sema.ip;
+    const ty = sema.typeOf(val);
+    const len: u64 = switch (ip.indexToKey(ty)) {
+        .array_type => |a| a.len + @intFromBool(a.sentinel != .none),
+        .vector_type => |v| v.len,
+        else => return sema.packedInsert(block, host, @intCast(offset), val),
+    };
+    const eb = sema.logicalBits(Type.childType(ip, ty)).?;
+    var h = host;
+    for (0..len) |i| {
+        const elem = try sema.elemVal(block, src, val, .fromInterned(try sema.intValue(.usize_type, i)), false);
+        h = try sema.packLogicalBits(block, src, elem, h, offset + i * eb);
+    }
+    return h;
+}
+
+/// The value of type `ty` (see `logicalBits`) whose bits are those of
+/// runtime unsigned integer `host` from bit `offset`.
+fn unpackLogicalBits(sema: *Sema, block: *Block, src: Src, host: Ref, ty: Index, offset: u64) CompileError!Ref {
+    const ip = sema.ip;
+    const len: u64 = switch (ip.indexToKey(ty)) {
+        .array_type => |a| a.len,
+        .vector_type => |v| v.len,
+        else => return sema.packedExtract(block, host, @intCast(offset), ty),
+    };
+    const child = Type.childType(ip, ty);
+    const eb = sema.logicalBits(child).?;
+    const elems = try sema.arena.alloc(Ref, @intCast(len));
+    for (elems, 0..) |*e, i| e.* = try sema.unpackLogicalBits(block, src, host, child, offset + i * eb);
+    return sema.aggregate(block, src, ty, elems);
+}
+
+/// ORs the bits of value `v` (see `logicalBits`) into `out` at bit `offset`.
 fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) Allocator.Error!void {
     const ip = sema.ip;
     const ty = ip.typeOf(v);
@@ -9856,7 +9921,7 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) Allocator.Error!v
     switch (Type.class(ip, ty)) {
         .array => {
             const child = Type.childType(ip, ty);
-            const eb = sema.bitCastBits(child).?;
+            const eb = sema.logicalBits(child).?;
             const a = ip.indexToKey(ty).array_type;
             // `elemValue` at `len` is the sentinel.
             for (0..a.len + @intFromBool(a.sentinel != .none)) |i| try sema.valueBits(try sema.elemValue(v, i), out, offset + i * eb);
@@ -9864,7 +9929,7 @@ fn valueBits(sema: *Sema, v: Index, out: *BigInt, offset: u64) Allocator.Error!v
         },
         .vector => {
             const child = Type.childType(ip, ty);
-            const eb = sema.bitCastBits(child).?;
+            const eb = sema.logicalBits(child).?;
             for (0..ip.indexToKey(ty).vector_type.len) |i| try sema.valueBits(try sema.elemValue(v, i), out, offset + i * eb);
             return;
         },
@@ -9906,7 +9971,7 @@ fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) 
     switch (Type.class(ip, ty)) {
         .array => {
             const child = Type.childType(ip, ty);
-            const eb = sema.bitCastBits(child).?;
+            const eb = sema.logicalBits(child).?;
             const a = ip.indexToKey(ty).array_type;
             // The sentinel's bits are ignored; the aggregate stores it last.
             const elems = try sema.arena.alloc(Index, @intCast(a.lenIncludingSentinel()));
@@ -9916,7 +9981,7 @@ fn bitsValue(sema: *Sema, ty: Index, bits: std.math.big.int.Const, offset: u64) 
         },
         .vector => {
             const child = Type.childType(ip, ty);
-            const eb = sema.bitCastBits(child).?;
+            const eb = sema.logicalBits(child).?;
             const elems = try sema.arena.alloc(Index, ip.indexToKey(ty).vector_type.len);
             for (elems, 0..) |*e, i| e.* = try sema.bitsValue(child, bits, offset + i * eb);
             return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
