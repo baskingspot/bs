@@ -644,6 +644,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .switch_br => try cg.switchBr(data),
         .ret => try cg.ret(data.un_op),
         .unreach, .trap => try cg.e.ud2(),
+        .breakpoint => try cg.e.int3(),
         .call => try cg.call(inst, data),
 
         .struct_field_ptr => {

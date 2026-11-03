@@ -2691,6 +2691,23 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .in_comptime => .fromInterned(boolValue(block.is_comptime)),
         // Instrumentation and intrinsics are not something zap emits.
         .disable_instrumentation, .disable_intrinsics => .void_value,
+        .breakpoint => blk: {
+            const src = block.nodeSrc(@enumFromInt(@as(i32, @bitCast(ext.operand))));
+            if (block.is_comptime) return sema.fail(block, src, "encountered @breakpoint at comptime", .{});
+            _ = try sema.addInst(block, .{ .tag = .breakpoint, .data = .{ .no_op = {} } });
+            break :blk .void_value;
+        },
+        // A prefetch is only a hint; zap's code does without it, as
+        // upstream's Debug x86_64 backend may.
+        .prefetch => blk: {
+            const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
+            const src = block.nodeSrc(extra.node);
+            const ptr = sema.resolveInst(extra.lhs);
+            if (Type.class(sema.ip, sema.typeOf(ptr)) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(sema.typeOf(ptr))});
+            const opts_ty = try sema.analyzeAsType(block, src, try sema.stdLangDecl(block, src, "PrefetchOptions"));
+            _ = try sema.resolveConstValue(block, src, try sema.coerce(block, opts_ty, sema.resolveInst(extra.rhs), src), "prefetch options must be comptime-known");
+            break :blk .void_value;
+        },
         // Optimized float mode only licenses an optimizer; without one, as
         // in upstream's Debug backends, float operations are the same.
         .set_float_mode => blk: {
