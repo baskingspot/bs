@@ -21,6 +21,9 @@ refs: Atom.RelocList = .{},
 lines: Atom.LineProgram = .{},
 /// Offset each label is bound to, or `unbound`.
 labels: std.ArrayList(u32) = .empty,
+/// With `shorten`: per label, the number of `branches` before it, which
+/// are those emitted before it was bound.
+label_branches: std.ArrayList(u32) = .empty,
 /// rel32 fields that branch to a label not yet bound when they were emitted.
 fixups: std.ArrayList(struct { at: u32, label: Label }) = .empty,
 /// Whether `finishShortened` may shorten branches: set before emitting.
@@ -174,6 +177,7 @@ pub fn deinit(e: *Encoder) void {
     e.refs.deinit(e.gpa);
     e.lines.deinit(e.gpa);
     e.labels.deinit(e.gpa);
+    e.label_branches.deinit(e.gpa);
     e.fixups.deinit(e.gpa);
     e.branches.deinit(e.gpa);
     e.saved.deinit(e.gpa);
@@ -233,18 +237,7 @@ fn shortenBranches(e: *Encoder) Allocator.Error!void {
     @memset(short, true);
     try e.saved.resize(gpa, br.len + 1);
     const saved = e.saved.items;
-    // Per label, the number of branches before it.
-    const before = try gpa.alloc(u32, e.labels.items.len);
-    defer gpa.free(before);
-    for (e.labels.items, before) |l, *n| {
-        var lo: usize = 0;
-        var hi: usize = br.len;
-        while (lo < hi) {
-            const mid = (lo + hi) / 2;
-            if (br[mid].at < l) lo = mid + 1 else hi = mid;
-        }
-        n.* = @intCast(lo);
-    }
+    const before = e.label_branches.items;
     // The long forms are `e9 rel32` (5 bytes) and `0f 8x rel32` (6); the
     // short ones 2 bytes.
     while (true) {
@@ -302,6 +295,7 @@ fn shortenBranches(e: *Encoder) Allocator.Error!void {
 
 pub fn newLabel(e: *Encoder) Allocator.Error!Label {
     try e.labels.append(e.gpa, unbound);
+    if (e.shorten) try e.label_branches.append(e.gpa, 0);
     return @fromBackingInt(@intCast(e.labels.items.len - 1));
 }
 
@@ -309,6 +303,7 @@ pub fn newLabel(e: *Encoder) Allocator.Error!Label {
 pub fn bind(e: *Encoder, label: Label) void {
     assert(e.labels.items[@backingInt(label)] == unbound);
     e.labels.items[@backingInt(label)] = @intCast(e.code.items.len);
+    if (e.shorten) e.label_branches.items[@backingInt(label)] = @intCast(e.branches.items.len);
 }
 
 // ---------------------------------------------------------------- data movement
