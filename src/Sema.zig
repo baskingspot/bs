@@ -58,6 +58,9 @@ inferred_allocs: std.AutoHashMapUnmanaged(Ir.Inst.Index, InferredAlloc) = .empty
 /// Runtime `const` locals initialized through a result pointer that may
 /// still be comptime-known (see `foldConstAlloc`), by `alloc` instruction.
 const_allocs: std.AutoHashMapUnmanaged(Ir.Inst.Index, ConstAlloc) = .empty,
+/// Field indices of the bit pointers (`bitcast`s) into packed fields of
+/// `const_allocs`. Arena-allocated.
+packed_field_ptrs: std.AutoHashMapUnmanaged(Ir.Inst.Index, u32) = .empty,
 /// The errors `func` returns so far, for its inferred error set; published
 /// to `Zcu.inferred_errors` when its analysis ends. Arena-allocated.
 ies_names: std.ArrayList(InternPool.String) = .empty,
@@ -2469,7 +2472,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const ty = try sema.resolveType(block, src, data.un_node.operand);
             try sema.resolveLayout(block, src, ty);
             const size = if (Type.hasRuntimeBits(sema.ip, ty)) Type.abiSize(sema.ip, ty) else 0;
-            const bits = if (tag == .size_of) size else if (Type.isInt(sema.ip, ty)) Type.intInfo(sema.ip, ty).bits else if (ty == .bool_type) 1 else if (Type.class(sema.ip, ty) == .float) Type.floatBits(sema.ip, ty) else size * 8;
+            const bits = if (tag == .size_of) size else bitSize(sema.ip, ty);
             break :blk .fromInterned(try sema.intValue(.comptime_int_type, bits));
         },
         .align_of => blk: {
@@ -6304,7 +6307,7 @@ fn constAllocRoot(sema: *Sema, ptr: Ref) ?struct { alloc: Ir.Inst.Index, replaya
             },
             .bitcast, .optional_payload_ptr, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr => {
                 r = data.ty_op.operand;
-                replayable = false;
+                if (!sema.packed_field_ptrs.contains(i)) replayable = false;
             },
             else => return null,
         }
@@ -6384,6 +6387,11 @@ fn constAllocPtr(sema: *Sema, ptr: Ref, alloc: Ir.Inst.Index, id: u32) !?Index {
             const base = try sema.constAllocPtr(@fromBackingInt(bin[0]), alloc, id) orelse return null;
             const index = sema.resolveValue(@fromBackingInt(bin[1])) orelse return null;
             return try sema.ptrElemPtrVal(base, sema.ip.intValue(u64, index).?);
+        },
+        .bitcast => {
+            const index = sema.packed_field_ptrs.get(i) orelse return null;
+            const base = try sema.constAllocPtr(data.ty_op.operand, alloc, id) orelse return null;
+            return try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .field = .{ .base = base, .index = index } } } });
         },
         .optional_payload_ptr_set, .errunion_payload_ptr_set => {
             const base = try sema.constAllocPtr(data.ty_op.operand, alloc, id) orelse return null;
@@ -7513,6 +7521,19 @@ fn elemValueType(sema: *Sema, slice_ty: Index) !Index {
     return sema.ptrType(.{ .child = p.child, .sentinel = p.sentinel, .flags = .{ .size = .many, .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .is_allowzero = p.flags.is_allowzero, .alignment = p.flags.alignment } });
 }
 
+/// `@bitSizeOf(ty)`, as upstream's `Type.bitSize`: the bits of its
+/// representation, so a packed type's backing integer and an array's
+/// elements times their bits; other types' ABI size in bits.
+fn bitSize(ip: *InternPool, ty: Index) u64 {
+    switch (ip.indexToKey(ty)) {
+        .array_type => |a| return a.lenIncludingSentinel() * bitSize(ip, a.child),
+        .vector_type => |v| return v.len * bitSize(ip, v.child),
+        else => {},
+    }
+    if (Type.packedBits(ip, ty)) |bits| return bits;
+    return if (Type.hasRuntimeBits(ip, ty)) Type.abiSize(ip, ty) * 8 else 0;
+}
+
 fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i: u32) CompileError!Ref {
     const ip = sema.ip;
     const p = Type.ptrInfo(ip, sema.typeOf(ptr));
@@ -7538,7 +7559,7 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
             }
         }
         try sema.requireRuntime(block, src);
-        return sema.addTyOp(block, .bitcast, result_ty, ptr);
+        return sema.packedFieldPtr(block, ptr, result_ty, i);
     }
     if (ip.indexToKey(p.child) == .union_type and Type.isPacked(ip, p.child)) {
         // The union's address, alignment, and bit offset, as upstream.
@@ -7554,7 +7575,7 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
             }
         }
         try sema.requireRuntime(block, src);
-        return sema.addTyOp(block, .bitcast, result_ty, ptr);
+        return sema.packedFieldPtr(block, ptr, result_ty, i);
     }
     const result_ty = try sema.ptrType(.{ .child = field_ty, .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile } });
     if (sema.resolveValue(ptr)) |pv| {
@@ -7564,6 +7585,16 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
     }
     try sema.requireRuntime(block, src);
     return sema.addStructField(block, .struct_field_ptr, result_ty, ptr, i);
+}
+
+/// A runtime bit pointer to field `i` of the packed struct or union `ptr`
+/// addresses: the same address, so a `bitcast`. A const local's field
+/// pointers remember `i`, for `constAllocPtr`.
+fn packedFieldPtr(sema: *Sema, block: *Block, ptr: Ref, result_ty: Index, i: u32) CompileError!Ref {
+    const field_ptr = try sema.addTyOp(block, .bitcast, result_ty, ptr);
+    if (sema.const_allocs.count() != 0 and sema.constAllocRoot(ptr) != null)
+        try sema.packed_field_ptrs.put(sema.arena, field_ptr.toIndex().?, i);
+    return field_ptr;
 }
 
 fn sliceLen(sema: *Sema, block: *Block, slice: Ref) CompileError!Ref {
