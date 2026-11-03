@@ -3272,7 +3272,8 @@ fn navVal(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
 fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) CompileError!Ref {
     try sema.ensureNavVal(block, src, nav_index);
     const nav = sema.ip.getNav(nav_index);
-    if (sema.ip.indexToKey(nav.val) == .func) try sema.zcu.queueFunc(nav.val);
+    // A generic function has no body of its own until a call instantiates it.
+    if (sema.ip.indexToKey(nav.val) == .func and !sema.ip.indexToKey(nav.ty).func_type.is_generic) try sema.zcu.queueFunc(nav.val);
     // An explicit alignment shows in the pointer type, as upstream.
     const alignment: u6 = if (nav.alignment == 0 or sema.naturalAlignment(nav.ty) == nav.alignment) 0 else @intCast(std.math.log2_int(u64, nav.alignment) + 1);
     const ptr_ty = try sema.ptrType(.{ .child = nav.ty, .flags = .{ .is_const = nav.is_const, .alignment = alignment } });
@@ -10187,7 +10188,8 @@ fn analyzeCall(
     }
     switch (modifier) {
         .auto, .compile_time, .always_inline, .never_inline, .never_tail, .no_suspend => {},
-        else => return sema.fail(block, src, "zap does not support call modifier '{s}' yet", .{@tagName(modifier)}),
+        // As in upstream's x86_64 backend, only comptime calls can be tail calls.
+        .always_tail => if (!block.is_comptime) return sema.failUnsupported(block, src, "runtime tail calls"),
     }
 
     // Arguments are analyzed in the caller, with the call instruction
