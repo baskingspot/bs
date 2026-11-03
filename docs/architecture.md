@@ -204,6 +204,12 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   field by field or element by element holds a mutable tree that those
   stores write in place; it is interned only when read as a whole, so
   filling an n-element array costs O(n), not O(n²) interned aggregates.
+- Comptime strings stay bytes. A defined `[n]u8` value interns with
+  `bytes` storage (one InternPool string), and `++`, slicing at
+  comptime-known bounds, and reading a `[]const u8` as a name (`@field`,
+  `@hasField`, `@hasDecl`) copy those bytes instead of going element by
+  element. Upstream's compiler builds its x86_64 `mnemonic_table` from
+  about 100 k such concatenations.
 - All comptime calls go through one entry point that memoizes by (function,
   stable hashes of arguments). A memo entry keeps the dependencies its call
   declared, and a unit that reuses the result declares them too, as if it
