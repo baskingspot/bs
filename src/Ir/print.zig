@@ -54,7 +54,13 @@ const Printer = struct {
         try p.w.writeAll("<");
         try printType(p.ip, p.ip.typeOf(val), p.w);
         try p.w.writeAll(", ");
-        try printValue(p.ip, val, p.w);
+        // Functions by declaration and comptime arguments, which tell
+        // generic instances apart.
+        switch (p.ip.indexToKey(val)) {
+            .func => try printFuncName(p.ip, val, p.w),
+            .simple_value => |v| try p.w.writeAll(@tagName(v)),
+            else => try printValue(p.ip, val, p.w),
+        }
         try p.w.writeAll(">");
     }
 
@@ -348,10 +354,18 @@ pub fn printType(ip: *const InternPool, ty: InternPool.Index, w: *Writer) Writer
     }
 }
 
+/// Prints `val` as upstream's `Value.fmtValue` does (print_value.zig),
+/// nesting aggregates three levels deep.
 pub fn printValue(ip: *const InternPool, val: InternPool.Index, w: *Writer) Writer.Error!void {
+    return printValueDepth(ip, val, w, 3);
+}
+
+/// Upstream's `print_value.print`: aggregates more than `level` levels deep
+/// print as `.{ ... }`. `@typeName` renders generic arguments at level 1.
+pub fn printValueDepth(ip: *const InternPool, val: InternPool.Index, w: *Writer, level: u8) Writer.Error!void {
     if (val == .none) return w.writeAll("<none>");
     switch (ip.indexToKey(val)) {
-        .simple_value => |v| try w.writeAll(@tagName(v)),
+        .simple_value => |v| try w.writeAll(if (v == .void) "{}" else @tagName(v)),
         .undef => try w.writeAll("undefined"),
         .int => |int| switch (int.storage) {
             .u64 => |v| try w.print("{d}", .{v}),
@@ -365,57 +379,256 @@ pub fn printValue(ip: *const InternPool, val: InternPool.Index, w: *Writer) Writ
         .err => |e| try w.print("error.{s}", .{ip.stringSlice(e.name)}),
         .error_union => |e| switch (e.val) {
             .err_name => |n| try w.print("error.{s}", .{ip.stringSlice(n)}),
-            .payload => |p| try printValue(ip, p, w),
+            .payload => |p| try printValueDepth(ip, p, w, level),
         },
         .enum_literal => |s| try w.print(".{s}", .{ip.stringSlice(s)}),
-        .calling_convention => |cc| try w.print(".{s}", .{@tagName(cc)}),
-        .ptr => |p| {
-            switch (p.base) {
-                .nav => |n| try w.print("&{s}", .{ip.stringSlice(ip.getNav(n).fqn)}),
-                .uav => |u| {
-                    try w.writeAll("&");
-                    try printValue(ip, u.val, w);
-                },
-                .comptime_alloc => |c| try w.print("&(comptime alloc {d})", .{c}),
-                .int => try w.writeAll("@ptrFromInt(0)"),
-                .field => |f| {
-                    try w.writeAll("&(");
-                    try printValue(ip, f.base, w);
-                    try w.print(").field[{d}]", .{f.index});
-                },
-                .elem => |e| {
-                    try w.writeAll("&(");
-                    try printValue(ip, e.base, w);
-                    try w.print(")[{d}]", .{e.index});
-                },
+        .enum_tag => |e| {
+            const info = ip.structInfo(e.ty);
+            for (info.field_defaults, 0..) |tag, i| {
+                if (tag == e.int and i < info.field_names.len) return w.print(".{s}", .{ip.stringSlice(info.field_names[i])});
             }
-            if (p.byte_offset != 0) try w.print(" + {d}", .{p.byte_offset});
+            try w.writeAll("@fromBackingInt(");
+            if (level == 0) return w.writeAll("...)");
+            try printValueDepth(ip, e.int, w, level - 1);
+            try w.writeAll(")");
         },
+        .un => |u| {
+            if (level == 0) return w.writeAll(".{ ... }");
+            try w.writeAll(".{ ");
+            const names = ip.structInfo(u.ty).field_names;
+            const tag_int = switch (ip.indexToKey(u.tag)) {
+                .enum_tag => |t| t.int,
+                else => u.tag,
+            };
+            const index = intValue(ip, tag_int);
+            if (index != null and ip.indexToKey(u.tag) != .enum_tag and index.? < names.len) {
+                try w.print(".{s}", .{ip.stringSlice(names[@intCast(index.?)])});
+            } else {
+                try printValueDepth(ip, u.tag, w, level - 1);
+            }
+            try w.writeAll(" = ");
+            try printValueDepth(ip, u.val, w, level - 1);
+            try w.writeAll(" }");
+        },
+        .calling_convention => |cc| try w.print(".{s}", .{@tagName(cc)}),
+        .ptr => try printPtr(ip, val, .rvalue, w, level),
         .slice => |s| {
-            try printValue(ip, s.ptr, w);
+            if (ip.indexToKey(s.ptr) == .undef and intValue(ip, s.len) == 0) return w.writeAll("&.{}");
+            try printPtr(ip, s.ptr, null, w, level);
             try w.writeAll("[0..");
-            try printValue(ip, s.len, w);
+            if (level == 0) try w.writeAll("(...)") else try printValueDepth(ip, s.len, w, level - 1);
             try w.writeAll("]");
         },
-        .opt => |o| if (o.val == .none) try w.writeAll("null") else try printValue(ip, o.val, w),
-        .aggregate => |a| switch (a.storage) {
-            .bytes => |s| try w.print("\"{f}\"", .{std.zig.fmtString(ip.stringSlice(s))}),
-            .repeated_elem => |e| {
-                try w.writeAll(".{ ");
-                try printValue(ip, e, w);
-                try w.writeAll("** }");
-            },
-            .elems => |elems| {
-                try w.writeAll(".{");
-                for (elems, 0..) |e, i| {
-                    try w.writeAll(if (i == 0) " " else ", ");
-                    try printValue(ip, e, w);
-                }
-                try w.writeAll(if (elems.len == 0) "}" else " }");
-            },
-        },
-        .func => try printFuncName(ip, val, w),
+        .opt => |o| if (o.val == .none) try w.writeAll("null") else try printValueDepth(ip, o.val, w, level),
+        .aggregate => try printAggregate(ip, val, false, w, level),
+        .func => |f| try w.print("(function '{s}')", .{ip.stringSlice(ip.getNav(f.owner_nav).name)}),
+        .extern_func => |e| try w.print("(extern '{s}')", .{ip.stringSlice(e.name)}),
         else => try printType(ip, val, w),
+    }
+}
+
+fn intValue(ip: *const InternPool, val: InternPool.Index) ?u64 {
+    return switch (ip.indexToKey(val)) {
+        .int => |int| switch (int.storage) {
+            .u64 => |v| v,
+            .i64 => |v| std.math.cast(u64, v),
+            .big => null,
+        },
+        else => null,
+    };
+}
+
+const max_aggregate_items = 100;
+
+fn printAggregate(ip: *const InternPool, val: InternPool.Index, is_ref: bool, w: *Writer, level: u8) Writer.Error!void {
+    if (level == 0) {
+        if (is_ref) try w.writeByte('&');
+        return w.writeAll(".{ ... }");
+    }
+    const agg = ip.indexToKey(val).aggregate;
+    const len: u64 = switch (ip.indexToKey(agg.ty)) {
+        .struct_type => {
+            const names = ip.structInfo(agg.ty).field_names;
+            return printStructFields(ip, agg, names, is_ref, w, level);
+        },
+        .tuple_type => |t| if (t.names.len != 0) {
+            return printStructFields(ip, agg, t.names, is_ref, w, level);
+        } else t.types.len,
+        .array_type => |a| len: {
+            switch (agg.storage) {
+                .bytes => |b| if (a.lenIncludingSentinel() != 0) {
+                    const bytes = ip.stringSlice(b);
+                    const str = if (bytes[bytes.len - 1] == 0) bytes[0 .. bytes.len - 1] else bytes;
+                    try w.print("\"{f}\"", .{std.zig.fmtString(str)});
+                    if (!is_ref) try w.writeAll(".*");
+                    return;
+                },
+                .elems, .repeated_elem => {},
+            }
+            if (a.len == 1 and a.child == .u8_type) one_byte_str: {
+                const byte = intValue(ip, aggregateElem(agg, 0)) orelse break :one_byte_str;
+                try w.print("\"{f}\"", .{std.zig.fmtString(&.{@intCast(byte)})});
+                if (!is_ref) try w.writeAll(".*");
+                return;
+            }
+            break :len a.len;
+        },
+        .vector_type => |v| v.len,
+        else => unreachable,
+    };
+    if (is_ref) try w.writeByte('&');
+    switch (len) {
+        0 => try w.writeAll(".{}"),
+        1 => {
+            try w.writeAll(".{");
+            try printAggregateElem(ip, agg, 0, w, level - 1);
+            try w.writeAll("}");
+        },
+        else => {
+            try w.writeAll(".{ ");
+            for (0..@min(len, max_aggregate_items)) |i| {
+                if (i != 0) try w.writeAll(", ");
+                try printAggregateElem(ip, agg, i, w, level - 1);
+            }
+            if (len > max_aggregate_items) try w.writeAll(", ...");
+            try w.writeAll(" }");
+        },
+    }
+}
+
+fn printStructFields(ip: *const InternPool, agg: InternPool.Aggregate, names: []const InternPool.String, is_ref: bool, w: *Writer, level: u8) Writer.Error!void {
+    if (is_ref) try w.writeByte('&');
+    if (names.len == 0) return w.writeAll(".{}");
+    try w.writeAll(".{ ");
+    for (names[0..@min(names.len, max_aggregate_items)], 0..) |name, i| {
+        if (i != 0) try w.writeAll(", ");
+        try w.print(".{s} = ", .{ip.stringSlice(name)});
+        try printAggregateElem(ip, agg, i, w, level - 1);
+    }
+    try w.writeAll(" }");
+}
+
+fn aggregateElem(agg: InternPool.Aggregate, i: usize) InternPool.Index {
+    return switch (agg.storage) {
+        .elems => |elems| elems[i],
+        .repeated_elem => |e| e,
+        .bytes => unreachable,
+    };
+}
+
+fn printAggregateElem(ip: *const InternPool, agg: InternPool.Aggregate, i: usize, w: *Writer, level: u8) Writer.Error!void {
+    switch (agg.storage) {
+        .bytes => |b| try w.print("{d}", .{ip.stringSlice(b)[i]}),
+        .elems, .repeated_elem => try printValueDepth(ip, aggregateElem(agg, i), w, level),
+    }
+}
+
+const PtrKind = enum { lvalue, rvalue };
+
+/// Upstream's `printPtr`: a pointer into an unnamed constant aggregate
+/// prints as a reference to the aggregate (`"hi"[0..2]`, `&.{ 1, 2 }`),
+/// anything else as its derivation from a declaration or address.
+fn printPtr(ip: *const InternPool, ptr_val: InternPool.Index, want_kind: ?PtrKind, w: *Writer, level: u8) Writer.Error!void {
+    if (ip.indexToKey(ptr_val) == .undef) return w.writeAll("undefined");
+    // zap derives a many-pointer to a constant's first element through
+    // `elem` 0; upstream points at the constant itself.
+    var base = ip.indexToKey(ptr_val).ptr;
+    while (base.byte_offset == 0) switch (base.base) {
+        .elem => |e| if (e.index == 0) {
+            base = ip.indexToKey(e.base).ptr;
+        } else break,
+        else => break,
+    };
+    if (base.base == .uav and ip.indexToKey(base.base.uav.val) == .aggregate) {
+        return printAggregate(ip, base.base.uav.val, true, w, level);
+    }
+    try printPtrDerivation(ip, ptr_val, want_kind, w, level, 20);
+}
+
+fn printPtrDerivation(ip: *const InternPool, ptr_val: InternPool.Index, want_kind: ?PtrKind, w: *Writer, level: u8, depth: u8) Writer.Error!void {
+    if (depth == 0) return w.writeAll("...");
+    const p = ip.indexToKey(ptr_val).ptr;
+    const cast = p.byte_offset == 0 and castElemPtr(ip, p);
+    const result_kind: PtrKind = if (p.byte_offset != 0 or p.base == .int or cast) .rvalue else .lvalue;
+    const need_kind = want_kind orelse result_kind;
+    if (need_kind == .rvalue and result_kind == .lvalue) try w.writeByte('&');
+    if (p.base == .int) {
+        try w.writeAll("@as(");
+        try printType(ip, p.ty, w);
+        try w.print(", @ptrFromInt(0x{x}))", .{p.byte_offset});
+    } else if (p.byte_offset != 0) {
+        try w.writeAll("@as(");
+        try printType(ip, p.ty, w);
+        try w.writeAll(", @ptrFromInt(@intFromPtr(");
+        var no_offset = p;
+        no_offset.byte_offset = 0;
+        try printPtrBase(ip, no_offset, .rvalue, w, level, depth);
+        try w.print(") + {d}))", .{p.byte_offset});
+    } else if (cast) {
+        // Upstream's `offset_and_cast` step: `arr[1..]`'s `*[2]u8`, or a
+        // many-pointer into an array, is not the `*T` of the element.
+        try w.writeAll("@as(");
+        try printType(ip, p.ty, w);
+        try w.writeAll(", @ptrCast(");
+        try printPtrBase(ip, p, .rvalue, w, level, depth);
+        try w.writeAll("))");
+    } else {
+        try printPtrBase(ip, p, .lvalue, w, level, depth);
+    }
+    if (need_kind == .lvalue and result_kind == .rvalue) try w.writeAll(".*");
+}
+
+/// Whether element pointer `p` has another type than a single-item
+/// pointer to the element.
+fn castElemPtr(ip: *const InternPool, p: InternPool.Ptr) bool {
+    const e = switch (p.base) {
+        .elem => |e| e,
+        else => return false,
+    };
+    const ptr_ty = ip.indexToKey(p.ty).ptr_type;
+    const base_ty = ip.indexToKey(ip.indexToKey(e.base).ptr.ty).ptr_type;
+    const elem_ty = if (base_ty.flags.size == .one) switch (ip.indexToKey(base_ty.child)) {
+        .array_type => |a| a.child,
+        .vector_type => |v| v.child,
+        else => base_ty.child,
+    } else base_ty.child;
+    return ptr_ty.flags.size != .one or ptr_ty.child != elem_ty;
+}
+
+/// Prints pointer `p`, which has no byte offset, as an lvalue (`x.f[1]`),
+/// with a leading `&` for `.rvalue`.
+fn printPtrBase(ip: *const InternPool, p: InternPool.Ptr, kind: PtrKind, w: *Writer, level: u8, depth: u8) Writer.Error!void {
+    if (kind == .rvalue) try w.writeByte('&');
+    switch (p.base) {
+        .nav => |n| try w.writeAll(ip.stringSlice(ip.getNav(n).fqn)),
+        .uav => |u| {
+            try w.writeAll("@as(");
+            try printType(ip, ip.typeOf(u.val), w);
+            try w.writeAll(", ");
+            if (level == 0) try w.writeAll("...") else try printValueDepth(ip, u.val, w, level - 1);
+            try w.writeAll(")");
+        },
+        .comptime_alloc => |c| try w.print("(comptime alloc {d})", .{c}),
+        .int => unreachable,
+        .field => |f| {
+            try printPtrDerivation(ip, f.base, null, w, level, depth - 1);
+            const agg_ty = ip.indexToKey(ip.indexToKey(f.base).ptr.ty).ptr_type.child;
+            const names: []const InternPool.String = switch (ip.indexToKey(agg_ty)) {
+                .struct_type, .union_type => ip.structInfo(agg_ty).field_names,
+                .tuple_type => |t| t.names,
+                .ptr_type => return w.writeAll(if (f.index == 0) ".ptr" else ".len"),
+                else => &.{},
+            };
+            if (f.index < names.len) {
+                try w.print(".{s}", .{ip.stringSlice(names[@intCast(f.index)])});
+            } else {
+                try w.print("[{d}]", .{f.index});
+            }
+        },
+        .elem => |e| {
+            try printPtrDerivation(ip, e.base, null, w, level, depth - 1);
+            try w.print("[{d}]", .{e.index});
+        },
     }
 }
 

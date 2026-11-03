@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "reflect.S\n*const reflect.S\n[]const u8\n?*anyopaque\nreflect.G.Box(u8)\nreflect.E\nIo.Writer\nstruct { u8, bool }\nerror{A,B}!u32\nfn (u8) callconv(.c) void\n[3:0]u16\n@Vector(4, f32)\nfn () callconv(.c) noreturn\nanyerror\n9084\n16\nFoo\n4\n99\n117637633\n2\n"
+//! stdout: "reflect.S\n*const reflect.S\n[]const u8\n?*anyopaque\nreflect.G.Box(u8)\nreflect.E\nIo.Writer\nstruct { u8, bool }\nerror{A,B}!u32\nfn (u8) callconv(.c) void\n[3:0]u16\n@Vector(4, f32)\nfn () callconv(.c) noreturn\nanyerror\nreflect.G.Args(.y,(function 'main'),\"hi\"[0..2],.{ .a = 1, .b = &.{ ... } })\n9084\n16\nFoo\n4\n99\n117637633\n2\nreflect.H__struct_\nreflect.localName__func_.Inner\n"
 //! @typeName, @offsetOf, @bitOffsetOf, @FieldType, @intFromError, and @errorFromInt.
 const std = @import("std");
 const rt = @import("rt.zig");
@@ -16,7 +16,30 @@ const G = struct {
     fn Box(comptime T: type) type {
         return struct { v: T };
     }
+    fn Args(comptime e: E, comptime f: fn () callconv(.c) noreturn, comptime s: []const u8, comptime v: anytype) type {
+        return struct {
+            const x = .{ e, f, s, v };
+        };
+    }
 };
+// Anonymous types are named after the container whose fields they type,
+// and after a generic function instance including its `__func_` suffix.
+const H = struct { f: struct { a: u8 } };
+fn localName(comptime T: type) []const u8 {
+    _ = T;
+    const Inner = struct {};
+    return @typeName(Inner);
+}
+fn printWithoutNumbers(n: []const u8) void {
+    var i: usize = 0;
+    while (i < n.len) : (i += 1) {
+        rt.print(n[i..][0..1]);
+        if ((n[i] == '_' and i + 1 < n.len and std.ascii.isDigit(n[i + 1])) or std.mem.endsWith(u8, n[0 .. i + 1], "__func_")) {
+            while (i + 1 < n.len and std.ascii.isHex(n[i + 1])) i += 1;
+        }
+    }
+    rt.print("\n");
+}
 const E = enum { x, y };
 fn main() callconv(.c) noreturn {
     const names = [_][]const u8{
@@ -25,6 +48,7 @@ fn main() callconv(.c) noreturn {
         @typeName(std.Io.Writer),             @typeName(struct { u8, bool }), @typeName(error{ A, B }!u32),
         @typeName(fn (u8) callconv(.c) void), @typeName([3:0]u16),            @typeName(@Vector(4, f32)),
         @typeName(@TypeOf(main)),             @typeName(anyerror),
+        @typeName(G.Args(.y, main, "hi", .{ .a = 1, .b = &S{ .a = 1, .b = 2, .c = 3 } })),
     };
     for (names) |n| {
         rt.print(n);
@@ -52,6 +76,8 @@ fn main() callconv(.c) noreturn {
     // @typeInfo field names ([:0]const u8 elements) read as []const u8,
     // as @Struct's arguments are.
     rt.printInt(@sizeOf(@FieldType(FieldsOf(E, u16), "y")));
+    printWithoutNumbers(@typeName(@FieldType(H, "f")));
+    printWithoutNumbers(localName(u8));
     rt.exit(0);
 }
 

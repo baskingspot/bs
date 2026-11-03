@@ -4166,7 +4166,7 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
                 if (arg == .none) continue;
                 if (!first) w.writeAll(",") catch return error.OutOfMemory;
                 first = false;
-                (if (ip.isType(arg)) print.printType(ip, arg, w) else print.printValue(ip, arg, w)) catch return error.OutOfMemory;
+                (if (ip.isType(arg)) print.printType(ip, arg, w) else print.printValueDepth(ip, arg, w, 1)) catch return error.OutOfMemory;
             }
             w.writeAll(")") catch return error.OutOfMemory;
             return .{ .display = aw.written(), .key = try sema.anonTypeKey(block, inst, captures) };
@@ -4174,15 +4174,22 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
         .anon, .dbg_var => {},
     }
     // Upstream's `type_fqn_ctx`: the function being analyzed or called
-    // inline, else the declaration, else `<namespace>.comptime`.
+    // inline (an instance of a generic function by its symbol name, see
+    // CodeGen), else the declaration, else the container whose fields are
+    // being resolved, else `<namespace>.comptime`.
     const parent = if (block.inlining) |inlining|
         ip.stringSlice(ip.getNav(ip.indexToKey(inlining.func).func.owner_nav).fqn)
-    else if (sema.func != .none)
-        ip.stringSlice(ip.getNav(ip.indexToKey(sema.func).func.owner_nav).fqn)
-    else if (sema.owner_nav != .none)
+    else if (sema.func != .none) parent: {
+        const func = ip.indexToKey(sema.func).func;
+        const fqn = ip.stringSlice(ip.getNav(func.owner_nav).fqn);
+        if (func.generic_owner == .none) break :parent fqn;
+        break :parent try std.fmt.allocPrint(sema.arena, "{s}__func_{x:0>8}", .{ fqn, @as(u32, @truncate(ip.stableHash(sema.func))) });
+    } else if (sema.owner_nav != .none)
         ip.stringSlice(ip.getNav(sema.owner_nav).fqn)
-    else
-        try std.fmt.allocPrint(sema.arena, "{s}.comptime", .{sema.zcu.namespacePtr(block.namespace).fqn});
+    else switch (sema.owner) {
+        .type_layout, .struct_defaults => |ty| ip.stringSlice(ip.containerType(ty).?.name),
+        else => try std.fmt.allocPrint(sema.arena, "{s}.comptime", .{sema.zcu.namespacePtr(block.namespace).fqn}),
+    };
     // `const T = struct {...};` in a function body: named after the local.
     const var_name: ?[]const u8 = if (strategy == .dbg_var) blk: {
         const tags = sema.code.instructions.items(.tag);
