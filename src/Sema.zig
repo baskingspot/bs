@@ -2082,15 +2082,11 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .ref => sema.analyzeRef(block, block.tokSrc(data.un_tok.src_tok), sema.resolveInst(data.un_tok.operand)),
         .deref => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
-            const ptr = sema.resolveInst(data.un_node.operand);
-            try sema.checkDerefable(block, src, sema.typeOf(ptr));
-            break :blk sema.analyzeLoad(block, src, try sema.cPtrToSingle(block, src, ptr));
+            break :blk sema.analyzeLoad(block, src, try sema.derefPtr(block, src, sema.resolveInst(data.un_node.operand)));
         },
         .ref_deref => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
-            const ptr = sema.resolveInst(data.un_node.operand);
-            try sema.checkDerefable(block, src, sema.typeOf(ptr));
-            break :blk sema.cPtrToSingle(block, src, ptr);
+            break :blk sema.derefPtr(block, src, sema.resolveInst(data.un_node.operand));
         },
         .ret_ptr => sema.analyzeAlloc(block, block.nodeSrc(data.node), sema.currentRetTy(block), false, block.is_comptime),
 
@@ -2257,7 +2253,11 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const ptr_ty = sema.unwrapOptEu(result_ty);
             if (ptr_ty == .generic_poison_type or Type.class(sema.ip, ptr_ty) != .pointer) break :blk sema.analyzeRef(block, src, .fromInterned(.empty_tuple));
             const p = Type.ptrInfo(sema.ip, ptr_ty);
-            if (p.flags.size == .one) break :blk sema.analyzeRef(block, src, try sema.structInitEmpty(block, src, p.child));
+            if (p.flags.size == .one or p.flags.size == .c) {
+                // Through `*anyopaque`, `.{}` is untyped: the empty tuple.
+                if (p.child == .anyopaque_type) break :blk sema.analyzeRef(block, src, .fromInterned(.empty_tuple));
+                break :blk sema.analyzeRef(block, src, try sema.structInitEmpty(block, src, p.child));
+            }
             // `&.{}` as a slice or many-pointer: an empty array.
             const array_ty = try sema.intern(.{ .array_type = .{ .len = 0, .child = p.child, .sentinel = p.sentinel } });
             const ref = try sema.analyzeRef(block, src, try sema.structInitEmpty(block, src, array_ty));
@@ -4894,6 +4894,30 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         const len: Ref = .fromInterned(try sema.intValue(.usize_type, a.len));
         return try sema.makeSlice(block, dest_ty, ptr, len);
     }
+    // A pointer to a tuple to a const slice or array pointer: the tuple
+    // coerced to an array, by reference, as upstream. An empty tuple
+    // coerces to any slice.
+    if (s.flags.size == .one and ip.indexToKey(s.child) == .tuple_type and ip.indexToKey(s.child).tuple_type.names.len == 0 and
+        (d.flags.size == .slice or (d.flags.size == .one and ip.indexToKey(d.child) == .array_type)))
+    {
+        const n = ip.indexToKey(s.child).tuple_type.types.len;
+        if (!d.flags.is_const and !(n == 0 and d.flags.size == .slice)) return null;
+        const array_ty = if (d.flags.size == .slice) try sema.intern(.{ .array_type = .{ .len = n, .child = d.child, .sentinel = d.sentinel } }) else d.child;
+        const src = block.nodeSrc(.zero);
+        const array = if (n == 0)
+            try sema.structInitEmpty(block, src, array_ty)
+        else
+            (try sema.coerceInner(block, array_ty, try sema.analyzeLoad(block, src, inst), src)) orelse return null;
+        return sema.coercePtr(block, dest_ty, try sema.analyzeRef(block, src, array));
+    }
+    // A comptime-known `[]T` to `*[N]T` of its length, as upstream.
+    if (s.flags.size == .slice and d.flags.size == .one and ip.indexToKey(d.child) == .array_type) {
+        const v = sema.resolveValue(inst) orelse return null;
+        if (sema.isUndef(v) or ip.indexToKey(v).slice.len == .undef_usize) return null;
+        if (ip.intValue(u64, ip.indexToKey(v).slice.len).? != ip.indexToKey(d.child).array_type.len) return null;
+        const array_ptr = try sema.sliceToArrayPtr(block, block.nodeSrc(.zero), v);
+        return sema.coercePtr(block, dest_ty, array_ptr);
+    }
     // `[]T` to `[*]T`, keeping a sentinel.
     if (s.flags.size == .slice and d.flags.size == .many) {
         if (s.child != d.child and !sema.sameIntRepr(s.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
@@ -4992,6 +5016,17 @@ fn coercePtrTo(sema: *Sema, block: *Block, ptr: Ref, ty: Index) CompileError!Ref
                 const s = Type.ptrInfo(ip, src_ty);
                 const d = Type.ptrInfo(ip, ty);
                 if (s.flags.size == .one and d.flags.size != .one and ip.indexToKey(s.child) == .array_type and p.base != .int) {
+                    // A subarray of `buf` (from `buf[a..b]`) starts at an
+                    // element of `buf`, so later indices stay within `buf`.
+                    if (p.base == .elem and p.byte_offset == 0) {
+                        const parent = Type.ptrInfo(ip, ip.typeOf(p.base.elem.base));
+                        const parent_elem = switch (ip.indexToKey(parent.child)) {
+                            .array_type => |a| if (parent.flags.size == .one) a.child else parent.child,
+                            else => parent.child,
+                        };
+                        if (parent_elem == ip.indexToKey(s.child).array_type.child)
+                            return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = p.base } }));
+                    }
                     // Pointer to an array becomes a pointer to its first element.
                     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .elem = .{ .base = v, .index = 0 } } } }));
                 }
@@ -5142,15 +5177,22 @@ fn peerPtrs(sema: *Sema, a: Index, b: Index) !?Index {
                 .one => if (p_ip.indexToKey(p.child) == .array_type) blk: {
                     const arr = p_ip.indexToKey(p.child).array_type;
                     break :blk .{ .elem = arr.child, .sentinel = arr.sentinel, .size = .one, .p = p };
-                } else null,
+                } else if (p_ip.indexToKey(p.child) == .tuple_type and p_ip.indexToKey(p.child).tuple_type.types.len == 0)
+                    // `*const struct {}` (from `&.{}`) acts as a pointer
+                    // to an empty array of any element type.
+                    .{ .elem = .noreturn_type, .sentinel = .none, .size = .one, .p = p }
+                else
+                    null,
                 .slice, .many => .{ .elem = p.child, .sentinel = p.sentinel, .size = p.flags.size, .p = p },
                 .c => null,
             };
         }
     }.f;
-    const sa = seq(ip, a) orelse return null;
-    const sb = seq(ip, b) orelse return null;
-    if (sa.elem != sb.elem) return null;
+    var sa = seq(ip, a) orelse return null;
+    var sb = seq(ip, b) orelse return null;
+    if (sa.elem == .noreturn_type) sa.elem = sb.elem;
+    if (sb.elem == .noreturn_type) sb.elem = sa.elem;
+    if (sa.elem != sb.elem or sa.elem == .noreturn_type) return null;
     if (sa.p.flags.is_allowzero != sb.p.flags.is_allowzero) return null;
     const size: InternPool.PtrType.Size = if (sa.size == .many or sb.size == .many) blk: {
         if (sa.size == .slice or sb.size == .slice) return null;
@@ -7223,10 +7265,38 @@ fn cPtrToSingle(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref
     return sema.coercePtrTo(block, ptr, single_ty);
 }
 
-fn checkDerefable(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
-    if (Type.class(sema.ip, ty) != .pointer or Type.ptrInfo(sema.ip, ty).flags.size == .many or Type.ptrInfo(sema.ip, ty).flags.size == .slice) {
-        return sema.fail(block, src, "cannot dereference non-pointer type '{f}'", .{sema.fmtType(ty)});
+/// `ptr.*` as a single pointer: a C pointer, checked for null, or a
+/// comptime-known slice, as a pointer to an array of its length.
+fn derefPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref {
+    const ty = sema.typeOf(ptr);
+    if (Type.class(sema.ip, ty) != .pointer) return sema.fail(block, src, "cannot dereference non-pointer type '{f}'", .{sema.fmtType(ty)});
+    if (Type.ptrInfo(sema.ip, ty).flags.size == .many) return sema.fail(block, src, "index syntax required for unknown-length pointer type '{f}'", .{sema.fmtType(ty)});
+    if (Type.ptrInfo(sema.ip, ty).flags.size == .slice) {
+        const v = sema.resolveValue(ptr) orelse return sema.fail(block, src, "index syntax required to access runtime-known slice", .{});
+        if (sema.isUndef(v)) return sema.fail(block, src, "cannot dereference undefined value", .{});
+        return sema.sliceToArrayPtr(block, src, v);
     }
+    return sema.cPtrToSingle(block, src, ptr);
+}
+
+/// A comptime-known slice as a pointer to an array of its length, keeping
+/// its sentinel, as upstream's `sliceToArrayPtr`.
+fn sliceToArrayPtr(sema: *Sema, block: *Block, src: Src, slice: Index) CompileError!Ref {
+    const ip = sema.ip;
+    const k = ip.indexToKey(slice).slice;
+    if (k.len == .undef_usize) return sema.fail(block, src, "cannot dereference slice with undefined length", .{});
+    var info = Type.ptrInfo(ip, ip.typeOf(slice));
+    const array_ty = try sema.intern(.{ .array_type = .{ .len = ip.intValue(u64, k.len).?, .child = info.child, .sentinel = info.sentinel } });
+    info.flags.size = .one;
+    info.child = array_ty;
+    info.sentinel = .none;
+    const ptr_ty = try sema.ptrType(info);
+    const many = try sema.slicePtr(block, .fromInterned(slice));
+    const pv = sema.resolveValue(many).?;
+    if (sema.isUndef(pv)) return .fromInterned(try sema.undefValue(ptr_ty));
+    const p = ip.indexToKey(pv).ptr;
+    if (p.base == .elem and p.base.elem.index == 0 and ip.typeOf(p.base.elem.base) == ptr_ty) return .fromInterned(p.base.elem.base);
+    return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = p.base, .byte_offset = p.byte_offset } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -8826,6 +8896,9 @@ fn fieldPtrAlignment(sema: *Sema, block: *Block, src: Src, ptr_align: u6, aggreg
     }.f;
     switch (ip.indexToKey(aggregate_ty)) {
         .struct_type, .union_type, .tuple_type => try sema.resolveLayout(block, src, aggregate_ty),
+        // Both fields of a slice are 8 bytes, 8-aligned: an under-aligned
+        // slice's fields keep its alignment.
+        .ptr_type => return if (ptr_align != 0 and ptr_align < flag(8)) ptr_align else 0,
         else => return 0,
     }
     const aggregate_align: u64 = if (ptr_align != 0) @as(u64, 1) << (ptr_align - 1) else Type.abiAlignment(ip, aggregate_ty);
@@ -9244,7 +9317,12 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     } else if (len == .none) {
         // `ptr[start..]` of a many-pointer is pointer arithmetic, keeping
         // the pointer's type.
-        if (sentinel_ref != .none) return sema.failUnsupported(block, src, "sentinel-terminated slicing of many-item pointers");
+        // A sentinel must match the pointer's own, as upstream.
+        if (sentinel_ref != .none) {
+            const casted = try sema.coerce(block, elem_ty, sema.resolveInst(sentinel_ref), src);
+            const provided = try sema.resolveConstValue(block, src, casted, "slice sentinel must be comptime-known");
+            if (provided != ptr_sentinel) return sema.fail(block, src, "sentinel-terminated slicing of many-item pointer must match existing sentinel", .{});
+        }
         return sema.analyzePtrArithmetic(block, src, true, many_obj, start);
     } else {
         end = len;
@@ -9299,6 +9377,9 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         .fromInterned(try sema.undefValue(many_ty))
     else if (base_val != null and start_val != null and try sema.comptimePtrRoot(base_val.?) != .int)
         try sema.coercePtrToMany(try sema.ptrElemPtrVal(base_val.?, ip.intValue(u64, start_val.?).?), many_ty)
+    else if (base_val != null and start_val != null)
+        // A comptime-known address: fold the offset.
+        try sema.analyzePtrArithmetic(block, src, true, base, start)
     else
         try sema.addTyPlBin(block, .ptr_add, many_ty, base, start);
 

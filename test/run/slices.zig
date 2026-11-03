@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "3\n0\n1\n9\n6\n2\n98\n12\n4\n7\n"
+//! stdout: "3\n0\n1\n9\n6\n2\n98\n12\n4\n7\n5\n100\n155\n1\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 // For `std.lang.CallModifier`; std.start sees `_start` and stays out.
@@ -58,6 +58,29 @@ fn main() callconv(.c) noreturn {
     const aligned: []align(8) u8 = &words;
     const aligned_ptr: [*]align(8) u8 = aligned.ptr;
     rt.printInt(aligned_ptr[1]);
+    // A comptime-known slice dereferences to an array, and coerces to a
+    // pointer to an array of its length.
+    const ks: [:0]const u16 = &.{ 1, 2, 3 };
+    const ka = ks.*;
+    comptime if (@TypeOf(ka) != [3:0]u16 or ka[3] != 0) unreachable;
+    const kp: *const [3]u16 = ks;
+    rt.printInt(kp[2] + @as(u32, (&ks.*)[1]));
+    // `ptr[a.. :s]` of a many-pointer with the same sentinel.
+    const pz: [*:0]u8 = buf[0..3 :0];
+    rt.printInt(@as(u32, @intFromBool(@TypeOf(pz[1.. :0]) == [*:0]u8)) + pz[1.. :0][1]);
+    // A pointer to a tuple coerces to a const slice; `&.{}` peers with
+    // an array pointer as a slice.
+    const t: []const u8 = &.{ buf[4], 56, 54 };
+    rt.printInt(t[0] + t[2]);
+    const e = if (n == 0) &[1]u32{42} else &.{};
+    rt.printInt(@as(u32, @intFromBool(@TypeOf(e) == []const u32)) + e.len);
+    // Growing a comptime slice of a subarray reads the array behind it.
+    comptime {
+        var cb: [4]u8 = .{ 0, 1, 2, 3 };
+        var ci: []u8 = cb[0..1];
+        ci.len += 2;
+        if (ci[2] != 2) unreachable;
+    }
     rt.exit(0);
 }
 

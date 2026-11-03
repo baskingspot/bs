@@ -82,5 +82,10 @@ fn main() callconv(.c) noreturn {
     var arr = [_]u32{ 10, 20, 30, 40, 50 };
     rt.printInt(arrayPtrFields(&arr));
     rt.printInt(comptime arrayPtrFields(&.{ 10, 20, 30, 40, 50 }));
+
+    // `&.{}` through `*anyopaque` is the untyped empty tuple.
+    const opaque_ptr: *const anyopaque = &.{};
+    const empty: *const @TypeOf(.{}) = @ptrCast(@alignCast(opaque_ptr));
+    comptime if (@TypeOf(empty.*) != @TypeOf(.{})) unreachable;
     rt.exit(0);
 }
