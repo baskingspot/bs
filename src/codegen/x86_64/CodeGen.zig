@@ -2779,11 +2779,15 @@ fn wideCast(cg: *CodeGen, dst: Mem, ty: Index, v: Val) Error!void {
 }
 
 /// `dst = lhs * rhs` over `n` limbs, wrapping. `dst` must not overlap the
-/// operands. Uses rax, rcx, rdx, r8.
+/// operands, and must be addressed from rbp. Uses rax, rcx, rdx, rsi,
+/// rdi, and r8 through r11.
 fn mulLimbs(cg: *CodeGen, dst: Mem, lhs: Mem, rhs: Mem, n: u32) Error!void {
     const e = &cg.e;
     try e.alu(.xor, .dword, .{ .reg = .rax }, .{ .reg = .rax });
     for (0..n) |i| try e.mov(.qword, .{ .mem = limb(dst, @intCast(i)) }, .{ .reg = .rax });
+    // Unrolled, the schoolbook product is n^2/2 multiply steps of code;
+    // past a few limbs, loop over the columns instead.
+    if (n > 4) return cg.mulLimbsLoop(dst, lhs, rhs, n);
     for (0..n) |i| {
         // r8 carries the high half into the next column.
         try e.alu(.xor, .dword, .{ .reg = .r8 }, .{ .reg = .r8 });
@@ -2805,6 +2809,54 @@ fn mulLimbs(cg: *CodeGen, dst: Mem, lhs: Mem, rhs: Mem, n: u32) Error!void {
             try e.mov(.qword, .{ .reg = .r8 }, .{ .reg = .rdx });
         }
     }
+}
+
+fn mulLimbsLoop(cg: *CodeGen, dst: Mem, lhs: Mem, rhs: Mem, n: u32) Error!void {
+    const e = &cg.e;
+    const indexed = struct {
+        fn f(m: Mem, reg: Reg) Mem {
+            var r = m;
+            r.index = .{ .reg = reg, .scale = .@"8" };
+            return r;
+        }
+    }.f;
+    // rcx = i (lhs limb), rsi = j (rhs limb), r8 = carry, r9 = n - 1 - i
+    // (the column that keeps only the low half); r10 and r11 address the
+    // operands, which may be constants.
+    try e.lea(.qword, .r10, lhs);
+    try e.lea(.qword, .r11, rhs);
+    const lhs_at = Mem.at(.r10, 0);
+    const rhs_at = Mem.at(.r11, 0);
+    const outer = try e.newLabel();
+    const inner = try e.newLabel();
+    const last = try e.newLabel();
+    try e.alu(.xor, .dword, .{ .reg = .rcx }, .{ .reg = .rcx });
+    e.bind(outer);
+    try e.alu(.xor, .dword, .{ .reg = .r8 }, .{ .reg = .r8 });
+    try e.alu(.xor, .dword, .{ .reg = .rsi }, .{ .reg = .rsi });
+    try e.mov(.qword, .{ .reg = .r9 }, .{ .imm = n - 1 });
+    try e.alu(.sub, .qword, .{ .reg = .r9 }, .{ .reg = .rcx });
+    e.bind(inner);
+    try e.alu(.cmp, .qword, .{ .reg = .rsi }, .{ .reg = .r9 });
+    try e.jcc(.ae, .{ .label = last });
+    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = indexed(lhs_at, .rcx) });
+    try e.unary(.mul, .qword, .{ .mem = indexed(rhs_at, .rsi) });
+    try e.alu(.add, .qword, .{ .reg = .rax }, .{ .reg = .r8 });
+    try e.alu(.adc, .qword, .{ .reg = .rdx }, .{ .imm = 0 });
+    try e.lea(.qword, .rdi, .{ .base = .{ .reg = .rcx }, .index = .{ .reg = .rsi } });
+    try e.alu(.add, .qword, .{ .mem = indexed(dst, .rdi) }, .{ .reg = .rax });
+    try e.alu(.adc, .qword, .{ .reg = .rdx }, .{ .imm = 0 });
+    try e.mov(.qword, .{ .reg = .r8 }, .{ .reg = .rdx });
+    try e.alu(.add, .qword, .{ .reg = .rsi }, .{ .imm = 1 });
+    try e.jmp(.{ .label = inner });
+    e.bind(last);
+    try e.mov(.qword, .{ .reg = .rax }, .{ .mem = indexed(lhs_at, .rcx) });
+    try e.imul(.qword, .rax, .{ .mem = indexed(rhs_at, .rsi) }, null);
+    try e.alu(.add, .qword, .{ .reg = .rax }, .{ .reg = .r8 });
+    try e.alu(.add, .qword, .{ .mem = limb(dst, n - 1) }, .{ .reg = .rax });
+    try e.alu(.add, .qword, .{ .reg = .rcx }, .{ .imm = 1 });
+    try e.alu(.cmp, .qword, .{ .reg = .rcx }, .{ .imm = n });
+    try e.jcc(.b, .{ .label = outer });
 }
 
 /// Shifts the wide integer `v` of type `ty` by `amount` (less than its
