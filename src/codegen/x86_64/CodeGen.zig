@@ -79,6 +79,9 @@ has_asm: bool = false,
 /// Overflow operations whose results only their `struct_field_val`s read
 /// (`Home.pair`), and those two values (or `Ssa.no_tie`).
 pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
+/// Scratch for `.auto` argument classification (`argScratch`).
+arg_tys: std.ArrayList(Index) = .empty,
+arg_locs: std.ArrayList(AutoArg) = .empty,
 /// Inline assembly marked the return address undefined (`.cfi_undefined
 /// %rip`): this is the outermost frame.
 outermost_frame: bool = false,
@@ -171,6 +174,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.dbg_files.deinit(gpa);
         cg.dbg_open.deinit(gpa);
         cg.pairs.deinit(gpa);
+        cg.arg_tys.deinit(gpa);
+        cg.arg_locs.deinit(gpa);
     }
     @memset(cg.homes, .none);
     try cg.planRegisters();
@@ -384,13 +389,13 @@ const AutoClass = enum { none, gpr, gpr_pair, sse, memory };
 
 fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
     const ip = cg.ip;
-    if (!Type.hasRuntimeBits(ip, ty)) return .none;
     if (Type.class(ip, ty) == .float) return switch (Type.floatBits(ip, ty)) {
         16, 32, 64 => .sse,
         else => .memory,
     };
+    // Runtime IR has no comptime-only types, so size 0 means no bits.
     const size = Type.abiSize(ip, ty);
-    return if (size <= 8) .gpr else if (size <= 16) .gpr_pair else .memory;
+    return if (size == 0) .none else if (size <= 8) .gpr else if (size <= 16) .gpr_pair else .memory;
 }
 
 /// Where the `.auto` convention puts each argument, in order, given the
@@ -425,6 +430,13 @@ fn autoArgs(cg: *CodeGen, ret_ty: Index, tys: []const Index, locs: []AutoArg) u3
         }
     }
     return stack;
+}
+
+/// Buffers for `n` argument types and locations, reused by every call.
+fn argScratch(cg: *CodeGen, n: usize) Error!struct { []Index, []AutoArg } {
+    try cg.arg_tys.resize(cg.gpa, n);
+    try cg.arg_locs.resize(cg.gpa, n);
+    return .{ cg.arg_tys.items, cg.arg_locs.items };
 }
 
 /// Loads the `n` bytes (1 to 8) at `m` into `reg`, zero-extended. Uses r11
@@ -467,10 +479,12 @@ fn storeBytes(cg: *CodeGen, m: Mem, reg: Reg, n: u64) Error!void {
 }
 
 /// Loads `.auto` value `ref` of class `gpr` into `reg`.
-fn loadGpr(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
-    const size = Type.abiSize(cg.ip, cg.typeOf(ref));
-    if (cg.passInRegs(cg.typeOf(ref))) return cg.load(reg, ref);
-    try cg.loadBytes(reg, try cg.memOf(ref), size);
+fn loadGpr(cg: *CodeGen, reg: Reg, ref: Ref, ty: Index) Error!void {
+    const size = Type.abiSize(cg.ip, ty);
+    switch (size) {
+        1, 2, 4, 8 => try cg.load(reg, ref),
+        else => try cg.loadBytes(reg, try cg.memOf(ref), size),
+    }
 }
 
 /// Loads `.auto` value `ref` of class `gpr_pair` into `lo` and `hi`.
@@ -509,10 +523,7 @@ fn setupParams(cg: *CodeGen) Error!void {
         n += 1;
     }
     const args = ir.mainBody()[0..n];
-    const tys = try cg.gpa.alloc(Index, n);
-    defer cg.gpa.free(tys);
-    const locs = try cg.gpa.alloc(AutoArg, n);
-    defer cg.gpa.free(locs);
+    const tys, const locs = try cg.argScratch(n);
     for (args, tys) |inst, *ty| ty.* = ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
     _ = cg.autoArgs(ret_ty, tys, locs);
     // Arguments that live in memory first, then the moves into registers,
@@ -2110,7 +2121,7 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
         try cg.cRet(operand);
     } else switch (cg.autoClass(ty)) {
         .none => {},
-        .gpr => try cg.loadGpr(.rax, operand),
+        .gpr => try cg.loadGpr(.rax, operand, ty),
         .gpr_pair => try cg.loadPair(.rax, .rdx, operand),
         .sse => try cg.loadXmm(.xmm0, try cg.valOf(operand)),
         .memory => {
@@ -2155,10 +2166,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         for (args, vals) |arg, *v| v.* = try cg.valOf(arg);
         try cg.cCallArgs(vals, ret_ty, dst);
     } else {
-        const tys = try cg.gpa.alloc(Index, args.len);
-        defer cg.gpa.free(tys);
-        const locs = try cg.gpa.alloc(AutoArg, args.len);
-        defer cg.gpa.free(locs);
+        const tys, const locs = try cg.argScratch(args.len);
         for (args, tys) |arg, *ty| ty.* = cg.typeOf(arg);
         cg.out_args_size = @max(cg.out_args_size, cg.autoArgs(ret_ty, tys, locs));
         // The outgoing area first (copies use rax, rsi, rdi, and rcx), then
@@ -2166,8 +2174,8 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         // not in caller-saved registers: a call is a clobber point.
         for (args, locs) |arg, l| if (l == .stack) try cg.copyTo(Mem.at(.rsp, @intCast(l.stack)), arg);
         for (args, locs) |arg, l| if (l == .sse) try cg.loadXmm(xmm_args[l.sse], try cg.valOf(arg));
-        for (args, locs) |arg, l| switch (l) {
-            .gpr => |r| try cg.loadGpr(c_arg_regs[r], arg),
+        for (args, tys, locs) |arg, ty, l| switch (l) {
+            .gpr => |r| try cg.loadGpr(c_arg_regs[r], arg, ty),
             .gpr_pair => |r| try cg.loadPair(c_arg_regs[r], c_arg_regs[r + 1], arg),
             else => {},
         };
