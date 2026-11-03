@@ -625,10 +625,19 @@ pub fn printUnitTiming(zcu: *Zcu) void {
             return c.v[a] > c.v[b];
         }
     };
-    t.ns.sort(C{ .v = t.ns.values() });
+    t.ns.sortUnstable(C{ .v = t.ns.values() });
     var total: u64 = 0;
-    for (t.ns.values()) |v| total += v;
-    std.debug.print("unit timing: {d} units, {d:.1} ms\n", .{ t.ns.count(), @as(f64, @floatFromInt(total)) / 1e6 });
+    var by_kind: std.EnumArray(std.meta.Tag(AnalUnit), [2]u64) = .initFill(.{ 0, 0 });
+    for (t.ns.keys(), t.ns.values()) |unit, v| {
+        total += v;
+        const k = by_kind.getPtr(unit);
+        k[0] += 1;
+        k[1] += v;
+    }
+    std.debug.print("unit timing: {d} units, {d:.1} ms", .{ t.ns.count(), @as(f64, @floatFromInt(total)) / 1e6 });
+    var it = by_kind.iterator();
+    while (it.next()) |k| std.debug.print("; {s} {d}: {d:.1} ms", .{ @tagName(k.key), k.value[0], @as(f64, @floatFromInt(k.value[1])) / 1e6 });
+    std.debug.print("\n", .{});
     for (t.ns.keys()[0..@min(t.top, t.ns.count())], t.ns.values()[0..@min(t.top, t.ns.count())]) |unit, ns| {
         var buf: [256]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
