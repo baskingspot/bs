@@ -137,6 +137,40 @@ layout, a function's signature) it goes through one Sema function that records
 the dependency. Sema records dependencies from the first skeleton onward, even
 before anything persists them.
 
+Two units have a first phase that other code may need on its own, as
+upstream has separate units for them. Neither reads a unit that is still
+in progress:
+
+- A declaration that states its type (`Nav.has_type`) resolves its type
+  and alignment before its value (`Zcu.ensureNavTy`, `Nav.ty_status`).
+  Taking its address (`Sema.navRef`) needs only that, and records the
+  `nav_ty` dependency; its value is queued for `analyzeAll` (`nav_queue`),
+  as upstream's `ensureNavValAnalysisQueued`. So `var x: S = .{ .p = &y };
+  var y = &x;` resolves from either end, as upstream. A declaration
+  without a stated type, a function, or an extern needs its value.
+- A declared struct's or union's field types resolve before its layout
+  (`Zcu.ensureFieldTypes`, status `have_field_types`), as upstream's
+  `resolveFields`. A function type reads them, transitively, to tell
+  whether a by-value parameter is comptime-only
+  (`Sema.resolveFieldTypesDeep`), so its comptime bits do not depend on
+  which layouts happened to be resolved. It must not resolve the layout,
+  which may lead back to the type being resolved; a type whose field
+  types are being resolved further up is taken as it is, as upstream's
+  `comptimeOnlySema` does. Upstream never reads them for a function
+  type, so the read is speculative (`Zcu.speculating`): a dependency
+  loop it runs into (`const FnPtr = ?*const fn (@This()) void;` read by
+  its own struct's field) ends it with `error.Speculation`, unreported,
+  the units it started go back to unresolved, and the parameter type is
+  taken as it is. Only a real cycle stays order-dependent. The
+  dependency is conditional: a green unit's result does not need the
+  type's layout.
+
+When the phase runs on its own, its Sema keeps the dependencies it
+recorded (`Zcu.phase_deps`), and the unit, when it runs, declares them
+first and starts after the phase instead of analyzing it again: a second
+analysis could see other units in different states and give a different
+type than the one code already used.
+
 Within one unit, a repeated read may skip the lookup: a unit's dependencies
 are a set, so the dependencies the first read declared are already the
 unit's. Sema keeps two such caches, both per unit (per `Sema`) and in
@@ -2746,9 +2780,9 @@ and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
   pack and go to Emit with the unit as owner, with its constants'
   content atoms (once each, with their `content_uses`); its inferred
   error set comes from its `func_ies` node. Conditional edges are not
-  entered and not recorded again. A dependency on a declaration in
-  progress (`Sema.navRef` takes its address while it resolves) is
-  accepted without resolving it, unless the unit is outdated.
+  entered and not recorded again. A `nav_ty` dependency is brought up
+  to date with `ensureNavTy`, so loading a unit that took an address
+  does not need the declaration's value.
 - *Subjects* (a `subjects` section beside the results): each node's live
   unit or dependee, so that a green unit's dependencies are made from the
   manifest alone: a declaration, a type, a function, a namespace with the

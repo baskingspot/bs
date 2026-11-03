@@ -3337,10 +3337,10 @@ fn ptrToZeroBit(ip: *const InternPool, ptr: Index) bool {
             .nav => |n| {
                 const nav = ip.getNav(n);
                 if (nav.linkage == .@"extern") return false;
-                return switch (ip.keyTag(nav.val)) {
-                    .func, .extern_func => false,
-                    else => !Type.hasRuntimeBits(ip, nav.ty),
-                };
+                // By its type: a declaration whose address code took may
+                // have only its type resolved (`Zcu.ensureNavTy`) until
+                // `analyzeAll` resolves its value.
+                return Type.class(ip, nav.ty) != .@"fn" and !Type.hasRuntimeBits(ip, nav.ty);
             },
             .uav => |u| return switch (ip.keyTag(u.val)) {
                 .func, .extern_func => false,
@@ -3357,7 +3357,9 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
     var t: PtrTarget = switch (p.base) {
         .nav => |n| blk: {
             const nav = ip.getNav(n);
-            if (ip.keyTag(nav.val) == .func) break :blk .{ .key = try emit.funcKey(nav.val), .off = 0 };
+            // A data declaration's value may not be resolved yet (see
+            // `ptrToZeroBit`); a function's is.
+            if (Type.class(ip, nav.ty) == .@"fn" and ip.keyTag(nav.val) == .func) break :blk .{ .key = try emit.funcKey(nav.val), .off = 0 };
             break :blk .{ .key = try emit.navKey(n), .off = 0 };
         },
         .uav => |u| if (ip.keyTag(u.val) == .extern_func) blk: {

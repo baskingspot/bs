@@ -51,6 +51,8 @@ inst_map: InstMap = .{},
 /// Emptied instruction lists of finished blocks, which `Block.child`
 /// reuses: analysis makes millions of short-lived child blocks.
 insts_pool: std.ArrayList(std.ArrayList(Ir.Inst.Index)) = .empty,
+/// Stop a `type_layout` unit after its field types (`Zcu.ensureFieldTypes`).
+field_types_only: bool = false,
 deps: std.ArrayList(Zcu.Dependee) = .empty,
 /// Per entry of `deps`: whether only a lowering for the comptime
 /// evaluator read it (see `Zcu.conditional_deps`).
@@ -173,6 +175,10 @@ pub const CompileError = error{
     OutOfMemory,
     /// A unit depends on itself through the units it is resolving.
     DependencyLoop,
+    /// A dependency loop while `Zcu.speculating`: the speculative
+    /// resolution gives up, unreported, and the units it started go back
+    /// to unresolved (see `resolveFieldTypesDeep`).
+    Speculation,
     /// Comptime control flow: `sema.comptime_break_inst` breaks out to an
     /// enclosing body.
     ComptimeBreak,
@@ -626,19 +632,23 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     defer block.deinitInsts();
     const src = block.nodeSrc(.zero);
 
-    const decl_ty: Index = if (decl.type_body) |body| blk: {
-        const ref = try sema.resolveInlineBody(&block, body, nav.zir_inst);
-        break :blk try sema.analyzeAsType(&block, src, ref);
-    } else .none;
-    if (decl.align_body) |body| {
-        const a_ref = try sema.coerce(&block, .u32_type, try sema.resolveInlineBody(&block, body, nav.zir_inst), src);
-        const a = sema.ip.intValue(u64, try sema.resolveConstValue(&block, src, a_ref, "alignment must be comptime-known")).?;
-        if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(&block, src, "alignment value '{d}' is not a power of two", .{a});
-        nav.alignment = a;
-    }
+    // `Zcu.ensureNavTy` reported why the type failed.
+    if (nav.ty_status == .failed) return error.AnalysisFail;
     // A declared type is known before the value, so the value may take its
     // own address (`const foo: S = .{ .self = &foo }`), as upstream.
-    if (decl_ty != .none) nav.ty = decl_ty;
+    const decl_ty: Index = if (nav.ty_status == .resolved) blk: {
+        // `Zcu.ensureNavTy` resolved it on its own.
+        try sema.takePhaseDeps();
+        break :blk nav.ty;
+    } else blk: {
+        if (nav.has_type) nav.ty_status = .resolving;
+        const ty = sema.navTypePhase(&block, src, nav, decl) catch |err| {
+            if (nav.has_type) nav.ty_status = if (err == error.Speculation) .unresolved else .failed;
+            return err;
+        };
+        if (nav.has_type) nav.ty_status = .resolved;
+        break :blk ty;
+    };
     if (decl.linkage == .@"extern") {
         // `extern fn name(...) T;`: defined by an export of `name`, which
         // calls reach through a slot the linker fills (see `extern_ptr`).
@@ -664,6 +674,59 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     // Emit lays out the value of any declaration code refers to.
     try sema.resolveLayoutIfIdle(&block, src, nav.ty);
     try sema.finish();
+}
+
+/// The first phase of a declaration's `nav_val` unit: its declared type
+/// (`.none` if it states none) and alignment, set in `nav`.
+fn navTypePhase(sema: *Sema, block: *Block, src: Src, nav: *InternPool.Nav, decl: Zir.Inst.Declaration.Unwrapped) CompileError!Index {
+    const decl_ty: Index = if (decl.type_body) |body| blk: {
+        const ref = try sema.resolveInlineBody(block, body, nav.zir_inst);
+        break :blk try sema.analyzeAsType(block, src, ref);
+    } else .none;
+    if (decl.align_body) |body| {
+        const a_ref = try sema.coerce(block, .u32_type, try sema.resolveInlineBody(block, body, nav.zir_inst), src);
+        const a = sema.ip.intValue(u64, try sema.resolveConstValue(block, src, a_ref, "alignment must be comptime-known")).?;
+        if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
+        nav.alignment = a;
+    }
+    if (decl_ty != .none) nav.ty = decl_ty;
+    return decl_ty;
+}
+
+/// `Zcu.ensureNavTy`: the type phase of a declaration that states its
+/// type, ahead of its value. The `nav_val` unit declares the dependencies
+/// it recorded when it runs.
+pub fn analyzeNavTy(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!void {
+    const nav = zcu.ip.getNav(nav_index);
+    var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
+    defer arena_state.deinit();
+    var sema = create(zcu, arena_state.allocator(), nav.file, .{ .nav_val = nav_index });
+    defer sema.destroy();
+    sema.owner_nav = nav_index;
+    const decl = sema.code.getDeclaration(nav.zir_inst);
+    var block = sema.rootBlock(nav.namespace, decl.src_node, true);
+    defer block.deinitInsts();
+    _ = try sema.navTypePhase(&block, block.nodeSrc(.zero), nav, decl);
+    try sema.keepPhaseDeps();
+}
+
+/// Keeps what this unit's first phase depends on, for the rest of the
+/// unit (`takePhaseDeps`), when the phase ran on its own.
+fn keepPhaseDeps(sema: *Sema) !void {
+    const arena = sema.zcu.arena.allocator();
+    try sema.zcu.phase_deps.put(sema.gpa, sema.owner, .{
+        .deps = try arena.dupe(Zcu.Dependee, sema.deps.items),
+        .conditional = try arena.dupe(bool, sema.deps_conditional.items),
+    });
+}
+
+/// Declares the dependencies `keepPhaseDeps` kept for this unit, first, as
+/// if its first phase had run as part of it.
+fn takePhaseDeps(sema: *Sema) !void {
+    // Kept, not taken: a run that a speculation aborts (see
+    // `resolveFieldTypesDeep`) needs them again.
+    const kept = sema.zcu.phase_deps.get(sema.owner) orelse return;
+    for (kept.deps, kept.conditional) |d, c| try sema.declareDep(d, c);
 }
 
 /// Sets `builtin.test_functions` to the collected tests, if the test runner
@@ -741,6 +804,17 @@ pub fn analyzeComptimeDecl(zcu: *Zcu, c: Zcu.ComptimeDecl) CompileError!void {
 }
 
 pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
+    return analyzeTypeLayout(zcu, ty, false);
+}
+
+/// `Zcu.ensureFieldTypes`: the first phase of a declared struct's or
+/// union's `type_layout` unit, which then declares the dependencies it
+/// recorded and takes up from `.have_field_types`.
+pub fn analyzeFieldTypes(zcu: *Zcu, ty: Index) CompileError!void {
+    return analyzeTypeLayout(zcu, ty, true);
+}
+
+fn analyzeTypeLayout(zcu: *Zcu, ty: Index, field_types_only: bool) CompileError!void {
     const ip = &zcu.ip;
     const key = ip.containerType(ty).?;
     const info = ip.structInfo(ty);
@@ -748,6 +822,7 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     defer arena_state.deinit();
     var sema = create(zcu, arena_state.allocator(), key.file, .{ .type_layout = ty });
     defer sema.destroy();
+    sema.field_types_only = field_types_only;
     switch (ip.keyTag(ty)) {
         .struct_type => {},
         .enum_type => return sema.analyzeEnumLayout(key, info),
@@ -759,40 +834,21 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     var block = sema.rootBlock(info.namespace, decl.fields_baseline_src_node, true);
     defer block.deinitInsts();
 
-    info.status = .field_types_wip;
     const n = decl.field_names.len;
-    const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
-    const types = try ip.arena(Zcu.tid).alloc(Index, n);
     const defaults = try ip.arena(Zcu.tid).alloc(Index, n);
+    @memset(defaults, .none);
     const offsets = try ip.arena(Zcu.tid).alloc(u64, n);
     const aligns = try sema.arena.alloc(u64, n);
     @memset(aligns, 0);
-    var is_comptime: []bool = &.{};
     var it = decl.iterateFields();
-    while (it.next()) |field| {
-        const i = field.idx;
-        names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
-        if (field.is_comptime) {
-            if (decl.layout != .auto) return sema.fail(&block, block.nodeSrc(.zero), "{t} struct fields cannot be marked comptime", .{decl.layout});
-            if (is_comptime.len == 0) {
-                is_comptime = try ip.arena(Zcu.tid).alloc(bool, n);
-                @memset(is_comptime, false);
-            }
-            is_comptime[i] = true;
-        }
-        if (field.align_body) |body| {
-            if (decl.layout == .@"packed") return sema.fail(&block, block.nodeSrc(.zero), "unable to override alignment of packed struct fields", .{});
-            aligns[i] = try sema.resolveFieldAlign(&block, block.nodeSrc(.zero), try sema.resolveInlineBody(&block, body, key.zir_inst));
-        }
-        const ty_ref = try sema.resolveInlineBody(&block, field.type_body, key.zir_inst);
-        types[i] = try sema.analyzeAsType(&block, block.nodeSrc(.zero), ty_ref);
-        defaults[i] = .none;
-    }
-    info.field_names = names;
-    info.field_types = types;
-    info.field_is_comptime = is_comptime;
-    info.status = .have_field_types;
-
+    if (info.status == .have_field_types) {
+        // `Zcu.ensureFieldTypes` resolved them on their own.
+        try sema.takePhaseDeps();
+        if (info.field_aligns.len != 0) @memcpy(aligns, info.field_aligns);
+    } else try sema.structFieldTypes(&block, key, info, decl, aligns);
+    if (sema.field_types_only) return sema.keepPhaseDeps();
+    const types = info.field_types;
+    const is_comptime = info.field_is_comptime;
 
     const explicit_backing: Index = if (decl.backing_int_type_body) |body|
         try sema.analyzeAsType(&block, block.nodeSrc(.zero), try sema.resolveInlineBody(&block, body, key.zir_inst))
@@ -820,6 +876,45 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
         }
     }
     try sema.finish();
+}
+
+/// The first phase of a declared struct's layout: its fields' names,
+/// types, `comptime` flags and explicit alignments (into `aligns`, and
+/// `info.field_aligns` if any).
+fn structFieldTypes(sema: *Sema, block: *Block, key: InternPool.ContainerType, info: *InternPool.ContainerInfo, decl: Zir.UnwrappedStructDecl, aligns: []u64) CompileError!void {
+    const ip = sema.ip;
+    info.status = .field_types_wip;
+    const n = decl.field_names.len;
+    const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
+    const types = try ip.arena(Zcu.tid).alloc(Index, n);
+    var is_comptime: []bool = &.{};
+    var it = decl.iterateFields();
+    while (it.next()) |field| {
+        const i = field.idx;
+        names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
+        if (field.is_comptime) {
+            if (decl.layout != .auto) return sema.fail(block, block.nodeSrc(.zero), "{t} struct fields cannot be marked comptime", .{decl.layout});
+            if (is_comptime.len == 0) {
+                is_comptime = try ip.arena(Zcu.tid).alloc(bool, n);
+                @memset(is_comptime, false);
+            }
+            is_comptime[i] = true;
+        }
+        if (field.align_body) |body| {
+            if (decl.layout == .@"packed") return sema.fail(block, block.nodeSrc(.zero), "unable to override alignment of packed struct fields", .{});
+            aligns[i] = try sema.resolveFieldAlign(block, block.nodeSrc(.zero), try sema.resolveInlineBody(block, body, key.zir_inst));
+        }
+        const ty_ref = try sema.resolveInlineBody(block, field.type_body, key.zir_inst);
+        types[i] = try sema.analyzeAsType(block, block.nodeSrc(.zero), ty_ref);
+    }
+    info.field_names = names;
+    info.field_types = types;
+    info.field_is_comptime = is_comptime;
+    for (aligns) |a| if (a != 0) {
+        info.field_aligns = try ip.arena(Zcu.tid).dupe(u64, aligns);
+        break;
+    };
+    info.status = .have_field_types;
 }
 
 /// Evaluates the default values of a declared struct's non-`comptime`
@@ -1063,116 +1158,127 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
             .@"packed" => .@"packed",
         };
     } else kind = decl.kind;
-    info.status = .field_types_wip;
-    if (reify_node == null) {
-        const n = decl.field_names.len;
-        const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
-        const types = try ip.arena(Zcu.tid).alloc(Index, n);
-        if (decl.arg_type_body) |body| arg_ty = try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
-        var aligns: []u64 = &.{};
-        var it = decl.iterateFields();
-        while (it.next()) |field| {
-            const i = field.idx;
-            names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
-            types[i] = if (field.type_body) |body|
-                try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst))
-            else
-                .void_type;
-            if (field.align_body) |body| {
-                if (aligns.len == 0) {
-                    aligns = try ip.arena(Zcu.tid).alloc(u64, n);
-                    @memset(aligns, 0);
-                }
-                aligns[i] = try sema.resolveFieldAlign(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
-            }
+    phase: {
+        // A reified union's types come with it (`fillReifiedInfo`); the
+        // rest of the phase still sets its tag.
+        if (info.status == .have_field_types and reify_node == null) {
+            // `Zcu.ensureFieldTypes` resolved them on their own.
+            try sema.takePhaseDeps();
+            break :phase;
         }
-        info.field_names = names;
-        info.field_types = types;
-        info.field_aligns = aligns;
-    }
-    const names = info.field_names;
-    const types = info.field_types;
-    const n = names.len;
-
-    // The tag: a declared enum, a generated one, or (untagged auto-layout
-    // unions in Debug) a hidden integer safety tag.
-    switch (kind) {
-        .tagged_explicit => {
-            if (ip.keyTag(arg_ty) != .enum_type) return sema.fail(&block, src, "expected enum tag type, found '{f}'", .{sema.fmtType(arg_ty)});
-            try sema.resolveLayout(&block, src, arg_ty);
-            const tag_info = ip.structInfo(arg_ty);
-            if (tag_info.field_names.len != n) return sema.fail(&block, src, "union fields do not match tag type '{f}'", .{sema.fmtType(arg_ty)});
-            for (names) |name| {
-                if (tag_info.fieldIndex(ip, ip.stringSlice(name)) == null) return sema.fail(&block, src, "no field named '{s}' in enum '{f}'", .{ ip.stringSlice(name), sema.fmtType(arg_ty) });
-            }
-            info.tag_type = arg_ty;
-        },
-        .tagged_enum, .tagged_enum_explicit => {
-            const int_ty = if (arg_ty != .none) arg_ty else try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n));
-            const values = try ip.arena(Zcu.tid).alloc(Index, n);
-            var next: u64 = 0;
+        info.status = .field_types_wip;
+        if (reify_node == null) {
+            const n = decl.field_names.len;
+            const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
+            const types = try ip.arena(Zcu.tid).alloc(Index, n);
+            if (decl.arg_type_body) |body| arg_ty = try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
+            var aligns: []u64 = &.{};
             var it = decl.iterateFields();
             while (it.next()) |field| {
-                if (field.value_body) |body| {
-                    try sema.inst_map.put(sema.gpa, key.zir_inst, .fromInterned(int_ty));
-                    const ref = try sema.coerce(&block, int_ty, try sema.resolveInlineBody(&block, body, key.zir_inst), src);
-                    values[field.idx] = try sema.resolveConstValue(&block, src, ref, "enum tag value must be comptime-known");
-                    next = (ip.intValue(u64, values[field.idx]) orelse 0) + 1;
-                } else {
-                    values[field.idx] = try sema.intValue(int_ty, next);
-                    next += 1;
+                const i = field.idx;
+                names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
+                types[i] = if (field.type_body) |body|
+                    try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst))
+                else
+                    .void_type;
+                if (field.align_body) |body| {
+                    if (aligns.len == 0) {
+                        aligns = try ip.arena(Zcu.tid).alloc(u64, n);
+                        @memset(aligns, 0);
+                    }
+                    aligns[i] = try sema.resolveFieldAlign(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
                 }
             }
-            const tag_name = try std.fmt.allocPrint(sema.arena, "@typeInfo({s}).@\"union\".tag_type.?", .{ip.stringSlice(key.name)});
-            const tag_key = try std.fmt.allocPrint(sema.arena, "{s}@tag", .{ip.stringSlice(key.key)});
-            const tag_info = try ip.createContainerInfo(Zcu.tid, .{
-                .namespace = info.namespace,
-                .layout = .auto,
-                .status = .have_layout,
-                .field_names = names,
-                .field_defaults = values,
-                .tag_type = int_ty,
-                .size = Type.abiSize(ip, int_ty),
-                .alignment = Type.abiAlignment(ip, int_ty),
-            });
-            info.tag_type = try sema.intern(.{ .enum_type = .{
-                .file = key.file,
-                .zir_inst = key.zir_inst,
-                .captures = key.captures,
-                .name = try sema.getString(tag_name),
-                .key = try sema.getString(tag_key),
-                .info = tag_info,
-            } });
-        },
-        .auto => info.tag_type = try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n)),
-        .@"extern" => {},
-        .@"packed", .packed_explicit => {
-            // Every field has the backing integer's bit width.
-            info.status = .layout_wip;
-            if (n == 0) return sema.fail(&block, src, "packed union has no fields", .{});
-            for (types) |ft| try sema.resolveLayout(&block, src, ft);
-            const field_bits = try sema.arena.alloc(u16, n);
-            for (types, field_bits) |ft, *b| b.* = Type.packedBits(ip, ft) orelse {
-                if (Type.class(ip, ft) == .pointer) return sema.failUnsupported(&block, src, "pointer fields in packed unions");
-                return sema.fail(&block, src, "packed unions cannot contain fields of type '{f}'", .{sema.fmtType(ft)});
-            };
-            const backing = if (arg_ty != .none) blk: {
-                if (Type.class(ip, arg_ty) != .int) return sema.fail(&block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(arg_ty)});
-                for (field_bits) |b| if (b != Type.intInfo(ip, arg_ty).bits) return sema.fail(&block, src, "field bit width does not match backing integer", .{});
-                break :blk arg_ty;
-            } else blk: {
-                for (field_bits[1..]) |b| if (b != field_bits[0]) return sema.fail(&block, src, "field bit width does not match earlier field", .{});
-                break :blk try sema.intType(.unsigned, field_bits[0]);
-            };
-            info.tag_type = backing;
-            info.size = Type.abiSize(ip, backing);
-            info.alignment = Type.abiAlignment(ip, backing);
-            info.status = .have_layout;
-            sema.setComptimeOnly(info);
-            return sema.finish();
-        },
+            info.field_names = names;
+            info.field_types = types;
+            info.field_aligns = aligns;
+        }
+        const names = info.field_names;
+        const types = info.field_types;
+        const n = names.len;
+
+        // The tag: a declared enum, a generated one, or (untagged auto-layout
+        // unions in Debug) a hidden integer safety tag.
+        switch (kind) {
+            .tagged_explicit => {
+                if (ip.keyTag(arg_ty) != .enum_type) return sema.fail(&block, src, "expected enum tag type, found '{f}'", .{sema.fmtType(arg_ty)});
+                try sema.resolveLayout(&block, src, arg_ty);
+                const tag_info = ip.structInfo(arg_ty);
+                if (tag_info.field_names.len != n) return sema.fail(&block, src, "union fields do not match tag type '{f}'", .{sema.fmtType(arg_ty)});
+                for (names) |name| {
+                    if (tag_info.fieldIndex(ip, ip.stringSlice(name)) == null) return sema.fail(&block, src, "no field named '{s}' in enum '{f}'", .{ ip.stringSlice(name), sema.fmtType(arg_ty) });
+                }
+                info.tag_type = arg_ty;
+            },
+            .tagged_enum, .tagged_enum_explicit => {
+                const int_ty = if (arg_ty != .none) arg_ty else try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n));
+                const values = try ip.arena(Zcu.tid).alloc(Index, n);
+                var next: u64 = 0;
+                var it = decl.iterateFields();
+                while (it.next()) |field| {
+                    if (field.value_body) |body| {
+                        try sema.inst_map.put(sema.gpa, key.zir_inst, .fromInterned(int_ty));
+                        const ref = try sema.coerce(&block, int_ty, try sema.resolveInlineBody(&block, body, key.zir_inst), src);
+                        values[field.idx] = try sema.resolveConstValue(&block, src, ref, "enum tag value must be comptime-known");
+                        next = (ip.intValue(u64, values[field.idx]) orelse 0) + 1;
+                    } else {
+                        values[field.idx] = try sema.intValue(int_ty, next);
+                        next += 1;
+                    }
+                }
+                const tag_name = try std.fmt.allocPrint(sema.arena, "@typeInfo({s}).@\"union\".tag_type.?", .{ip.stringSlice(key.name)});
+                const tag_key = try std.fmt.allocPrint(sema.arena, "{s}@tag", .{ip.stringSlice(key.key)});
+                const tag_info = try ip.createContainerInfo(Zcu.tid, .{
+                    .namespace = info.namespace,
+                    .layout = .auto,
+                    .status = .have_layout,
+                    .field_names = names,
+                    .field_defaults = values,
+                    .tag_type = int_ty,
+                    .size = Type.abiSize(ip, int_ty),
+                    .alignment = Type.abiAlignment(ip, int_ty),
+                });
+                info.tag_type = try sema.intern(.{ .enum_type = .{
+                    .file = key.file,
+                    .zir_inst = key.zir_inst,
+                    .captures = key.captures,
+                    .name = try sema.getString(tag_name),
+                    .key = try sema.getString(tag_key),
+                    .info = tag_info,
+                } });
+            },
+            .auto => info.tag_type = try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n)),
+            .@"extern" => {},
+            .@"packed", .packed_explicit => {
+                // Every field has the backing integer's bit width.
+                info.status = .layout_wip;
+                if (n == 0) return sema.fail(&block, src, "packed union has no fields", .{});
+                for (types) |ft| try sema.resolveLayout(&block, src, ft);
+                const field_bits = try sema.arena.alloc(u16, n);
+                for (types, field_bits) |ft, *b| b.* = Type.packedBits(ip, ft) orelse {
+                    if (Type.class(ip, ft) == .pointer) return sema.failUnsupported(&block, src, "pointer fields in packed unions");
+                    return sema.fail(&block, src, "packed unions cannot contain fields of type '{f}'", .{sema.fmtType(ft)});
+                };
+                const backing = if (arg_ty != .none) blk: {
+                    if (Type.class(ip, arg_ty) != .int) return sema.fail(&block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(arg_ty)});
+                    for (field_bits) |b| if (b != Type.intInfo(ip, arg_ty).bits) return sema.fail(&block, src, "field bit width does not match backing integer", .{});
+                    break :blk arg_ty;
+                } else blk: {
+                    for (field_bits[1..]) |b| if (b != field_bits[0]) return sema.fail(&block, src, "field bit width does not match earlier field", .{});
+                    break :blk try sema.intType(.unsigned, field_bits[0]);
+                };
+                info.tag_type = backing;
+                info.size = Type.abiSize(ip, backing);
+                info.alignment = Type.abiAlignment(ip, backing);
+                info.status = .have_layout;
+                sema.setComptimeOnly(info);
+                return sema.finish();
+            },
+        }
+        info.status = .have_field_types;
+        if (sema.field_types_only) return sema.keepPhaseDeps();
     }
-    info.status = .have_field_types;
+    const types = info.field_types;
 
     info.status = .layout_wip;
     var payload_size: u64 = 0;
@@ -1943,6 +2049,70 @@ fn ensureNavVal(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex) 
     try sema.bcRequire(status == .resolved);
     if (status == .unresolved) try sema.noteReference(.{ .nav_val = nav }, src);
     sema.zcu.ensureNavVal(nav) catch |err| return sema.depLoop(block, src, err);
+}
+
+/// Resolves the field types of the structs and unions `ty` holds by value,
+/// recursively, without their layouts (`Zcu.ensureFieldTypes`), so that
+/// `Type.isComptimeOnly` answers from complete fields. A type whose field
+/// types are being resolved further up is taken as it is, as upstream's
+/// `comptimeOnlySema` assumes it is not comptime-only. The dependency is
+/// conditional: a green unit's result does not need the type's layout,
+/// and resolving it could lead back to the unit.
+fn resolveFieldTypesDeep(sema: *Sema, block: *Block, src: Src, ty: Index, seen: *std.AutoHashMapUnmanaged(Index, void)) CompileError!void {
+    const ip = sema.ip;
+    switch (Type.class(ip, ty)) {
+        .array, .vector, .optional => return sema.resolveFieldTypesDeep(block, src, Type.childType(ip, ty), seen),
+        .error_union => return sema.resolveFieldTypesDeep(block, src, ip.keyPayload(.error_union_type, ty).payload_type, seen),
+        .tuple => {
+            const t = ip.keyPayload(.tuple_type, ty);
+            for (t.types, t.values) |ft, fv| if (fv == .none) try sema.resolveFieldTypesDeep(block, src, ft, seen);
+            return;
+        },
+        .@"struct", .@"union" => {},
+        else => return,
+    }
+    const info = ip.structInfo(ty);
+    switch (info.status) {
+        .field_types_wip, .failed => return,
+        // Further up, past its field types.
+        .layout_wip => {},
+        .have_layout => {
+            // Its by-value fields' layouts, and so their field types, are
+            // resolved too.
+            try sema.declareDep(.{ .type_layout = ty }, true);
+            return;
+        },
+        .none => {
+            try sema.declareDep(.{ .type_layout = ty }, true);
+            try sema.bcRequire(false);
+            try sema.noteReference(.{ .type_layout = ty }, src);
+            // Speculatively: upstream never asks this of a function type,
+            // so a loop through a unit in progress (`const FnPtr =
+            // *const fn (@This()) void;` read by the struct's own field)
+            // is no error. The type is then taken without its fields, as
+            // `comptimeOnlySema` takes one whose fields are being resolved.
+            sema.zcu.speculating += 1;
+            const res = sema.zcu.ensureFieldTypes(ty);
+            sema.zcu.speculating -= 1;
+            res catch |err| switch (err) {
+                error.Speculation => return,
+                else => return sema.depLoop(block, src, err),
+            };
+        },
+        .have_field_types => try sema.declareDep(.{ .type_layout = ty }, true),
+    }
+    if ((try seen.getOrPut(sema.arena, ty)).found_existing) return;
+    for (info.field_types, 0..) |ft, i| if (!info.fieldIsComptime(i)) try sema.resolveFieldTypesDeep(block, src, ft, seen);
+}
+
+/// Resolves the type of declaration `nav` (`Zcu.ensureNavTy`), recording
+/// the `nav_ty` dependency: what taking its address reads.
+fn ensureNavTy(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) CompileError!void {
+    if (nav_index != sema.owner_nav) try sema.declareDependency(.{ .nav_ty = nav_index });
+    const nav = sema.ip.getNav(nav_index);
+    try sema.bcRequire(nav.ty_status == .resolved or nav.status == .resolved);
+    if (nav.status == .unresolved) try sema.noteReference(.{ .nav_val = nav_index }, src);
+    sema.zcu.ensureNavTy(nav_index) catch |err| return sema.depLoop(block, src, err);
 }
 
 /// Resolves the layout of `ty` and every type it contains by value.
@@ -4904,23 +5074,22 @@ fn navVal(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
 }
 
 fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) CompileError!Ref {
-    const pending = sema.ip.getNav(nav_index);
-    if (pending.status == .resolving and pending.ty != .none and pending.linkage == .normal and !pending.is_threadlocal) {
-        // Its own initializer (or one it depends on): the address needs
-        // only the declared type.
-        if (nav_index != sema.owner_nav) try sema.declareDependency(.{ .nav_val = nav_index });
-        const alignment: u6 = if (pending.alignment == 0 or sema.naturalAlignment(pending.ty) == pending.alignment) 0 else @intCast(std.math.log2_int(u64, pending.alignment) + 1);
-        const ptr_ty = try sema.ptrType(.{ .child = pending.ty, .flags = .{ .is_const = pending.is_const, .alignment = alignment } });
-        return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .nav = nav_index } } }));
-    }
-    try sema.ensureNavVal(block, src, nav_index);
+    // The address of a declaration that states its type needs only that
+    // type, as upstream's `nav_ty`, so its own value, or one its value
+    // reads, may take it (`var x: S = .{ .p = &y }; var y = &x;`). A
+    // function's address names the function, which is the value.
+    if (sema.ip.getNav(nav_index).has_type) {
+        try sema.ensureNavTy(block, src, nav_index);
+        if (Type.class(sema.ip, sema.ip.getNav(nav_index).ty) == .@"fn") try sema.ensureNavVal(block, src, nav_index);
+    } else try sema.ensureNavVal(block, src, nav_index);
     const nav = sema.ip.getNav(nav_index);
-    if (sema.ip.keyTag(nav.val) == .func and sema.fnHasRuntimeBits(nav.ty)) try sema.queueFuncRef(src, nav.val);
-    // A referenced variable is emitted with its type's layout (`var global:
-    // @This()` inside the struct leaves it unresolved until now).
-    if (!nav.is_const) try sema.resolveLayoutIfIdle(block, src, nav.ty);
+    if (nav.status == .resolved and sema.ip.keyTag(nav.val) == .func and sema.fnHasRuntimeBits(nav.ty)) try sema.queueFuncRef(src, nav.val);
+    // A referenced declaration is emitted with its type's layout (`var
+    // global: @This()` inside the struct leaves it unresolved until now),
+    // which its value resolved unless only its type is known yet.
+    if (!nav.is_const or nav.status != .resolved) try sema.resolveLayoutIfIdle(block, src, nav.ty);
     // The address of a resolved declaration is the same value each time.
-    const cacheable = nav.status == .resolved and nav.linkage != .@"extern" and !(nav.is_threadlocal and !block.is_comptime);
+    const cacheable = (nav.status == .resolved or nav.ty_status == .resolved) and nav.linkage != .@"extern" and !(nav.is_threadlocal and !block.is_comptime);
     if (cacheable) if (sema.zcu.nav_ptrs.get(nav_index)) |ptr| return .fromInterned(ptr);
     // An explicit alignment shows in the pointer type, as upstream, even
     // when it is the natural one (`&f` for `fn f() align(1)`).
@@ -14971,11 +15140,15 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     // As upstream, a function declaration's parameter and return types
     // have their layouts resolved, which records them as dependencies of
     // the declaration: whether a parameter is comptime-only decides how
-    // the function is called. A function type does not, so that it may
-    // name a type whose layout is being resolved.
+    // the function is called. A function type resolves only their field
+    // types, as upstream's `comptimeOnlySema`, so that it may name a type
+    // whose layout is being resolved.
     if (body_len != 0) {
         for (params) |p| try sema.resolveLayout(block, src, p.ty);
         try sema.resolveLayout(block, src, ret_ty);
+    } else {
+        var seen: std.AutoHashMapUnmanaged(Index, void) = .empty;
+        for (params) |p| if (!p.is_comptime and p.ty != .generic_poison_type) try sema.resolveFieldTypesDeep(block, src, p.ty, &seen);
     }
     var is_generic = ret_ty == .generic_poison_type;
     var comptime_bits: u32 = 0;

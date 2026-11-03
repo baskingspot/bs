@@ -580,12 +580,7 @@ fn greenNode(r: *Replay, unit: Zcu.AnalUnit) !?Green {
             r.noteMiss(unit, @tagName(dtag));
             return r.redAt(g);
         };
-        // A declaration in progress, which analysis reads only for its
-        // address (`Sema.navRef`): its result cannot have changed if this
-        // unit's dependencies did not.
-        const in_progress = dep == .nav_val and r.zcu.ip.getNav(dep.nav_val).status == .resolving;
-        if (in_progress and is_outdated) return r.redAt(g);
-        if (!in_progress and !r.ensure(dep)) return r.redAt(g);
+        if (!r.ensure(dep)) return r.redAt(g);
         // The subject decoded to an item with the recorded stable hash, so
         // only an outdated unit needs its dependencies' results compared.
         if (is_outdated) {
@@ -778,7 +773,8 @@ fn decodeDependee(r: *Replay, d: u32, tag: Tag) !?Zcu.Dependee {
 fn ensure(r: *Replay, dep: Zcu.Dependee) bool {
     const zcu = r.zcu;
     switch (dep) {
-        .nav_val, .nav_ty => |nav| zcu.ensureNavVal(nav) catch return false,
+        .nav_val => |nav| zcu.ensureNavVal(nav) catch return false,
+        .nav_ty => |nav| zcu.ensureNavTy(nav) catch return false,
         .type_layout => |ty| zcu.ensureStructLayout(ty) catch return false,
         .struct_defaults => |ty| zcu.ensureStructDefaults(ty) catch return false,
         .func_ies => |func| _ = zcu.ensureFuncIes(func) catch return false,

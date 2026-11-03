@@ -249,8 +249,15 @@ pub const Nav = struct {
     namespace: u32,
     hash: Hash,
     is_pub: bool,
+    /// Whether the declaration states its type (`const x: T = ...`), so
+    /// that its type resolves without its value (`Zcu.ensureNavTy`).
+    has_type: bool = false,
     // The fields below belong to the `nav_val` analysis unit.
     status: enum { unresolved, resolving, resolved, failed } = .unresolved,
+    /// The unit's first phase when the declaration states its type: the
+    /// type and alignment, which `Zcu.ensureNavTy` resolves on their own
+    /// for code that takes the declaration's address.
+    ty_status: enum { unresolved, resolving, resolved, failed } = .unresolved,
     ty: Index = .none,
     val: Index = .none,
     is_const: bool = true,

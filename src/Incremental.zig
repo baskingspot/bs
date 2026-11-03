@@ -1000,7 +1000,7 @@ pub const Keyer = struct {
                 const nav = ip.getNav(nav_index);
                 return .{
                     .key = try k.keyOf(.nav_ty, &.{ip.stringSlice(nav.key)}),
-                    .result_hash = if (nav.status == .resolved) ip.stableHash(ip.typeOf(nav.val)) else 0,
+                    .result_hash = if (nav.status == .resolved) ip.stableHash(ip.typeOf(nav.val)) else if (nav.ty_status == .resolved) ip.stableHash(nav.ty) else 0,
                 };
             },
             .func_body => |func| {
