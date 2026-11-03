@@ -529,3 +529,18 @@ test "an object's symbols and relocations" {
     try std.testing.expectEqual(7, std.mem.readInt(u32, bytes[section(shdrs, shstr, ".text").?.h.offset + 6 ..][0..4], .little));
     try std.testing.expectEqualDeep(&[_]Rela{.{ .offset = 0, .ty = @backingInt(elf.R_X86_64.@"64"), .name = "ext", .addend = 8 }}, relas(bytes, section(shdrs, shstr, ".rela.data").?.h, syms, strtab, &buf));
 }
+
+test "an object with no atoms" {
+    // A root with nothing exported, as most compile-error cases are.
+    const gpa = std.testing.allocator;
+    const bytes = try emit(gpa, std.testing.io, &.{}, .{ .entry = null }, .{});
+    defer gpa.free(bytes);
+    const ehdr = std.mem.bytesToValue(elf.Elf64.Ehdr, bytes[0..@sizeOf(elf.Elf64.Ehdr)]);
+    try std.testing.expectEqual(elf.ET.REL, ehdr.type);
+    const shdrs = std.mem.bytesAsSlice(elf.Elf64.Shdr, bytes[ehdr.shoff..][0 .. @as(usize, ehdr.shnum) * @sizeOf(elf.Elf64.Shdr)]);
+    for (shdrs) |h| {
+        try std.testing.expect(h.type != .RELA);
+        // Only section symbols, after the null one.
+        if (h.type == .SYMTAB) try std.testing.expectEqual(h.size / @sizeOf(elf.Elf64.Sym), h.info);
+    }
+}

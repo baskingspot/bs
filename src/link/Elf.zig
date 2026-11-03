@@ -1313,7 +1313,8 @@ pub fn parallel(io: std.Io, n_threads: usize, n_tasks: usize, ctx: anytype, comp
     };
     var next: std.atomic.Value(usize) = .init(0);
     var group: std.Io.Group = .init;
-    for (1..@min(n_threads, n_tasks)) |t| group.async(io, Worker.work, .{ ctx, &next, n_tasks, t });
+    // An object can have no atoms, and so no tasks.
+    for (1..@max(1, @min(n_threads, n_tasks))) |t| group.async(io, Worker.work, .{ ctx, &next, n_tasks, t });
     Worker.work(ctx, &next, n_tasks, 0);
     try group.await(io);
 }
