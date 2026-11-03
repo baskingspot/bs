@@ -17025,8 +17025,11 @@ fn analyzeCall(
     const is_inline = fn_ty.cc == .@"inline" or modifier == .always_inline;
     const comptime_call = block.is_comptime or modifier == .compile_time or
         (ret_ty != .generic_poison_type and try sema.isComptimeOnlyResolved(block, src, ret_ty) and !is_inline);
+    if (modifier == .never_inline and (comptime_call or is_inline))
+        return sema.fail(block, src, "cannot perform {s} call with 'never_inline' modifier", .{if (comptime_call) "comptime" else "inline"});
     if (func == .none) {
         if (comptime_call) return sema.failNeededComptime(block, src, "function pointer is not comptime-known");
+        if (is_inline) return sema.failNeededComptime(block, src.callFunc(), "function being called inline must be comptime-known");
         const callee_ptr = if (extern_func == .none) callee else blk: {
             const ptr_ty = try sema.ptrType(.{ .child = ip.typeOf(extern_func), .flags = .{ .is_const = true } });
             const name = ip.keyPayload(.extern_func, extern_func).name;

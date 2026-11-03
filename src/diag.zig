@@ -1283,6 +1283,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "'@cVaStart' only allowed in variadic functions", .@"bad-call" },
     .{ "arrays must be passed by reference to variadic function", .@"bad-call" },
     .{ "cannot call a generic function through a pointer", .@"bad-call" },
+    .{ "cannot perform {s} call with 'never_inline' modifier", .@"bad-call" },
     .{ "integer and float literals passed to variadic function must be casted to a fixed-size number type", .@"bad-call" },
     .{ "member function '{s}' has no parameters", .@"bad-call" },
     .{ "type '{f}' not a function", .@"bad-call" },
