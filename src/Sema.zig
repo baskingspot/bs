@@ -2896,9 +2896,24 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .int_from_error, .error_from_int => blk: {
             const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
             const src = block.nodeSrc(extra.node);
-            if (block.is_comptime) break :blk sema.failUnsupported(block, src, "comptime error codes");
             const to_int = ext.opcode == .int_from_error;
             const operand = try sema.coerce(block, if (to_int) .anyerror_type else .u16_type, sema.resolveInst(extra.operand), src);
+            // Comptime-known operands use this compilation's codes, which
+            // the manifest keeps stable across rebuilds (see "Error codes"
+            // in docs/architecture.md).
+            if (sema.resolveValue(operand)) |v| if (!sema.isUndef(v)) {
+                const ip = sema.ip;
+                if (to_int) break :blk .fromInterned(try sema.intValue(.u16_type, try ip.errorValue(ip.indexToKey(v).err.name)));
+                const code = ip.intValue(u64, v).?;
+                const name = name: {
+                    ip.errors_mutex.lockUncancelable(ip.io);
+                    defer ip.errors_mutex.unlock(ip.io);
+                    if (code == 0 or code >= ip.error_names.items.len) break :name null;
+                    break :name ip.error_names.items[@intCast(code)];
+                } orelse break :blk sema.fail(block, src, "integer value '{d}' represents no error", .{code});
+                break :blk .fromInterned(try sema.intern(.{ .err = .{ .ty = .anyerror_type, .name = name } }));
+            };
+            if (block.is_comptime) break :blk sema.fail(block, src, "unable to evaluate comptime expression", .{});
             break :blk sema.addTyOp(block, .bitcast, if (to_int) .u16_type else .anyerror_type, operand);
         },
         .ret_addr, .frame_address => blk: {
@@ -9588,8 +9603,10 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     const sb = sema.code.getSwitchBlock(inst);
     const non_err = sb.non_err_case.?;
     var eu = sema.resolveInst(sb.main_operand);
+    // A pointer to the error union, for a payload capture by reference.
+    var eu_ptr: Ref = .none;
     if (non_err.operand_is_ref) {
-        if (non_err.capture == .by_ref) return sema.failUnsupported(parent, src, "error union payload captures by reference");
+        eu_ptr = eu;
         eu = try sema.analyzeLoad(parent, src, eu);
     }
     if (Type.class(sema.ip, sema.typeOf(eu)) != .error_union) return sema.fail(parent, src, "expected error union type, found '{f}'", .{sema.fmtType(sema.typeOf(eu))});
@@ -9602,7 +9619,7 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
             try sema.inst_map.put(gpa, inst, code);
             return sema.analyzeSwitch(parent, src, inst, code, .none);
         }
-        if (non_err.capture != .none) try sema.inst_map.put(gpa, inst, try sema.errUnionPayload(parent, src, eu));
+        if (non_err.capture != .none) try sema.inst_map.put(gpa, inst, try sema.errUnionCapture(parent, src, eu, eu_ptr, non_err.capture));
         return (try sema.analyzeInlineBody(parent, non_err.body, inst)) orelse .unreachable_value;
     }
 
@@ -9620,7 +9637,7 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     var then_block = outer.condChild();
     defer then_block.instructions.deinit(gpa);
     if (cond_val != .bool_false) {
-        if (non_err.capture != .none) try sema.inst_map.put(gpa, inst, try sema.errUnionPayload(&then_block, src, eu));
+        if (non_err.capture != .none) try sema.inst_map.put(gpa, inst, try sema.errUnionCapture(&then_block, src, eu, eu_ptr, non_err.capture));
         if (try sema.analyzeInlineBody(&then_block, non_err.body, inst)) |result| try sema.addBr(&then_block, &label, result);
     }
     var else_block = outer.condChild();
@@ -9639,6 +9656,11 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
         try sema.addCondBr(&outer, cond, then_block.instructions.items, else_block.instructions.items);
     }
     return sema.resolveBlock(parent, src, &outer, &label.merges);
+}
+
+fn errUnionCapture(sema: *Sema, block: *Block, src: Src, eu: Ref, eu_ptr: Ref, capture: Zir.Inst.SwitchBlock.ProngInfo.Capture) CompileError!Ref {
+    if (capture == .by_ref) return sema.errUnionPayloadPtr(block, src, eu_ptr, false);
+    return sema.errUnionPayload(block, src, eu);
 }
 
 /// `operand_ptr` points to `operand` in a switch whose prongs may capture
@@ -9686,8 +9708,19 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
                 try items.append(sema.arena, (try sema.reinterpretBits(&item_block, src, operand_ty, .fromInterned(item))).toInterned().?);
                 continue;
             }
+            // An error outside the switched set may have a prong of
+            // `comptime unreachable`, as upstream; it never matches.
+            if (case.prong_info.is_comptime_unreach and info.unwrap() == .error_value and Type.class(ip, operand_ty) == .error_set) {
+                if (try sema.errorSetNames(parent, src, operand_ty)) |names| {
+                    const name = try sema.getString(sema.zirString(info.unwrap().error_value));
+                    if (std.mem.indexOfScalar(InternPool.String, names, name) == null) continue;
+                }
+            }
             try items.append(sema.arena, try sema.switchItem(&item_block, src, inst, info, operand_ty, &extra_index));
         }
+        // A prong left with no items is never taken.
+        if (items.items.len == 0 and case.range_infos.len == 0 and case.item_infos.len != 0 and
+            (under_index == null or under_index.? != cases.items.len)) continue;
         const ranges = try sema.arena.alloc([2]Index, case.range_infos.len);
         for (case.range_infos, ranges) |pair, *range| {
             range[0] = try sema.switchItem(&item_block, src, inst, pair[0], operand_ty, &extra_index);
