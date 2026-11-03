@@ -12,6 +12,7 @@ const std = @import("std");
 const DW = std.dwarf;
 const Allocator = std.mem.Allocator;
 const Atom = @import("Atom.zig");
+const ref = @import("Elf.zig").ref;
 const Dwarf = @This();
 
 /// The compile unit's header and entry, ending with its low_pc and high_pc.
@@ -196,6 +197,151 @@ fn writeSleb(out: []u8, value: u32) usize {
     }
     out[i] = @intCast(v);
     return i + 1;
+}
+
+// The per-entry passes, shared by the linkers. Entries are split into
+// chunks of `chunk_len`; one parallel pass sizes each chunk's entries and
+// collects its files (`layOutChunk`), a serial step places the chunks and
+// builds the file table (`placeChunks`), and the linker writes each chunk's
+// parts in place.
+
+pub const chunk_len = 2048;
+
+/// One `chunk_len` run of consecutive debug entries.
+pub const Chunk = struct {
+    // Filled in by `layOutChunk`.
+    /// Bytes of the chunk's subprogram entries and line sequences.
+    info_len: u64,
+    line_len: u64,
+    /// Entries with a `frame` other than `none`.
+    n_frames: u32,
+    /// Source files of the chunk's entries, in first-use order; the
+    /// linker's `file_of` indexes it.
+    files: std.StringArrayHashMapUnmanaged(void),
+    // Filled in by `placeChunks`.
+    /// Where the chunk's entries and sequences start, after the headers.
+    info_off: u64,
+    line_off: u64,
+    /// Entries with a frame in the chunks before this one.
+    frame_base: u32,
+    /// Index in the output's file table of each of `files`.
+    file_map: []u32,
+};
+
+/// The `file_of` of an entry whose atom was deduplicated away.
+pub const skip = std.math.maxInt(u32);
+
+/// Sizes the entries of debug chunk `chunk` and collects their files. `l`
+/// is a linker's shared state, with `gpa`, `input`, `n_atoms`, `n_debug`,
+/// `places`, `debug_chunks`, `file_of`, and `fail`; `task` is the chunk's
+/// failure slot and `text` the linkers' section number of code. The atoms
+/// of the entries are checked to ascend and be in range before `debug(j)`
+/// reads anything of theirs.
+pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
+    const begin = chunk * chunk_len;
+    const end = @min(l.n_debug, begin + chunk_len);
+    const c = &l.debug_chunks[chunk];
+    c.info_len = 0;
+    c.line_len = 0;
+    c.n_frames = 0;
+    // Functions from one file usually share its path's bytes, so a table by
+    // address saves hashing the path for most entries.
+    var by_addr: FilesByAddr = .{};
+    for (l.file_of[begin..end], begin..) |*file_of, j| {
+        file_of.* = skip;
+        const atom = l.input.debugAtom(j);
+        if (atom >= l.n_atoms or (j > 0 and l.input.debugAtom(j - 1) >= atom)) {
+            return l.fail(task, @min(atom, l.n_atoms), error.InvalidDebugInfo, .{});
+        }
+        const place = l.places[atom];
+        if (place.isDuplicate()) continue;
+        if (place.section != text) {
+            return l.fail(task, atom, error.InvalidDebugInfo, .{ .atom = l.input.atom(atom).name });
+        }
+        const debug = l.input.debug(j);
+        const d = ref(&debug);
+        file_of.* = by_addr.get(d.file) orelse index: {
+            const gop = c.files.getOrPut(l.gpa, d.file) catch return l.fail(task, atom, error.OutOfMemory, .{});
+            by_addr.put(d.file, @intCast(gop.index));
+            break :index @intCast(gop.index);
+        };
+        c.info_len += subprogramSize(d);
+        c.line_len += sequenceSize(d);
+        c.n_frames += @intFromBool(d.frame != .none);
+    }
+}
+
+/// Open addressing from a path's address and length to its index in a
+/// chunk's `files`. Holds up to 3/4 of its slots; paths past that are looked
+/// up by contents every time.
+const FilesByAddr = struct {
+    slots: [1024]Slot = @splat(.{ .ptr = 0, .len = 0, .index = 0 }),
+    count: usize = 0,
+
+    const Slot = struct { ptr: usize, len: usize, index: u32 };
+
+    fn home(file: []const u8) usize {
+        return @intCast((@intFromPtr(file.ptr) *% 0x9e3779b97f4a7c15) >> 54);
+    }
+
+    fn get(t: *const FilesByAddr, file: []const u8) ?u32 {
+        var i = home(file);
+        while (t.slots[i].ptr != 0) : (i = (i + 1) % t.slots.len) {
+            if (t.slots[i].ptr == @intFromPtr(file.ptr) and t.slots[i].len == file.len) return t.slots[i].index;
+        }
+        return null;
+    }
+
+    fn put(t: *FilesByAddr, file: []const u8, index: u32) void {
+        if (t.count >= t.slots.len / 4 * 3) return;
+        var i = home(file);
+        while (t.slots[i].ptr != 0) i = (i + 1) % t.slots.len;
+        t.slots[i] = .{ .ptr = @intFromPtr(file.ptr), .len = file.len, .index = index };
+        t.count += 1;
+    }
+};
+
+/// The chunks' totals and the output's file table.
+pub const Placed = struct {
+    info_len: u64 = 0,
+    line_len: u64 = 0,
+    n_frames: u32 = 0,
+    /// The output's file table, from the chunks' files in first-use order.
+    files: std.StringArrayHashMapUnmanaged(void) = .empty,
+    file_map: []u32 = &.{},
+
+    pub fn deinit(p: *Placed, gpa: Allocator) void {
+        p.files.deinit(gpa);
+        gpa.free(p.file_map);
+    }
+};
+
+/// Places the chunks after one another and builds the file table.
+pub fn placeChunks(gpa: Allocator, chunks: []Chunk) error{OutOfMemory}!Placed {
+    var p: Placed = .{};
+    errdefer p.deinit(gpa);
+    var n_chunk_files: usize = 0;
+    for (chunks) |*c| {
+        c.info_off = p.info_len;
+        c.line_off = p.line_len;
+        c.frame_base = p.n_frames;
+        p.info_len += c.info_len;
+        p.line_len += c.line_len;
+        p.n_frames += c.n_frames;
+        n_chunk_files += c.files.count();
+    }
+    p.file_map = try gpa.alloc(u32, n_chunk_files);
+    var at: usize = 0;
+    for (chunks) |*c| {
+        c.file_map = p.file_map[at..][0..c.files.count()];
+        at += c.files.count();
+        for (c.files.keys(), c.file_map) |f, *global| {
+            global.* = @intCast((try p.files.getOrPut(gpa, f)).index);
+        }
+    }
+    // The set_file operand is a fixed-width ULEB128.
+    if (p.files.count() >= 1 << 21) return error.OutOfMemory;
+    return p;
 }
 
 // Call frame information (.eh_frame and .eh_frame_hdr, x86_64). Every
