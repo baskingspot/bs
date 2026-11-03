@@ -1,15 +1,19 @@
 # zap
 
-zap is an independent Zig compiler aimed at Go-class compile speed for Debug
-builds. It does not track upstream: it compiles exactly one pinned Zig release
-(currently 0.17.0) and the std library shipped with it.
+zap is an independent Zig compiler aimed at Go-class compile speed. It does
+not track upstream: it compiles exactly one pinned Zig release (currently
+0.17.0) and the std library shipped with it.
 
 ## Scope
 
 - Targets: `x86_64-linux` (static ELF first) and `aarch64-macos` (Mach-O,
   dynamically linked against libSystem, ad-hoc code signed).
-- Debug semantics only: safety checks on, no optimizer. Users run upstream
-  `zig` for release builds.
+- One optimization level, as in Go: no `-O` modes. Every build has Debug
+  semantics (safety checks on, `builtin.mode == .Debug`) and always-on
+  optimization sized to compile fast (SSA, register allocation, inlining
+  within a budget). Output stays debuggable: line tables, frame pointers,
+  inlined frames. LLVM-class optimization (vectorization, heavy loop work)
+  stays upstream's job; users run upstream `zig` for ReleaseFast and friends.
 - Out of scope unless the user asks: other targets, release modes, LLVM,
   `@cImport`/translate-c, the C backend, compiling C sources.
 - CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`. Integration with
@@ -26,13 +30,17 @@ builds. It does not track upstream: it compiles exactly one pinned Zig release
     content and dependencies;
   - analyzing runtime function bodies in parallel;
   - a comptime evaluator that runs compiled bytecode instead of walking ZIR;
-  - simple single-pass backends and linkers that write their output once.
+  - fast backends: one shared SSA layer with a short, fixed pass list and
+    linear-scan register allocation, lowered per architecture;
+  - linkers that write their output once.
 - Don't defer performance. When a measurable win is available, take it,
   especially in formats and interfaces (Atoms, cache entries, IR) that get
   harder to change once other code depends on them.
 - Compile-time speed is a feature. Track it with benchmarks against upstream
   `zig` 0.17.0 Debug builds (self-hosted x86_64 backend), and do not land
-  regressions without saying so.
+  regressions without saying so. Track the speed of the code zap generates
+  against upstream Debug and ReleaseSafe builds the same way, and report
+  each backend change's compile-time cost next to its run-time win.
 
 ## Upstream reference
 
