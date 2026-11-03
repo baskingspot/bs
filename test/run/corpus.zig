@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -69,6 +69,13 @@ const Names = struct {
     }
 };
 
+// superhtml (css/Ast.zig): a function in an anonymous struct's field is
+// called with method syntax.
+fn twice(x: u32) u32 {
+    return 2 * x;
+}
+const rules = .{.{ .name = "a", .func = twice }};
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -101,5 +108,6 @@ fn main() callconv(.c) noreturn {
         break :blk l[0..l.len].*;
     };
     rt.printInt(@intFromBool(@TypeOf(arr) == [1]u8 and arr[0] == 'a'));
+    rt.printInt(@intFromBool(rules[0].func(21) == 42));
     rt.exit(0);
 }

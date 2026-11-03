@@ -14983,6 +14983,12 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
             return sema.analyzeCall(block, src, callee, .none, args, modifier);
         }
     }
+    // A tuple or anonymous struct has no declarations: only a field (`.{ .f
+    // = func }`) can be called.
+    if (ip.keyTag(container) == .tuple_type) {
+        const callee = try sema.fieldVal(block, src, obj, name);
+        return sema.analyzeCall(block, src, callee, .none, args, modifier);
+    }
     if (ip.keyTag(container) == .struct_type or ip.keyTag(container) == .union_type) {
         // A field holding a function (pointer) is called.
         try sema.resolveStructFields(block, src, container);
