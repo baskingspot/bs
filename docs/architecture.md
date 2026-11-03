@@ -148,9 +148,11 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   across runs uses stable hashes or unit keys. Deduplication does not need
   it: a lookup hashes the key's indices and string indices (what equality
   compares), mixing each field in as a 64-bit word with one multiply, and
-  only an item that is new computes its stable hash. Most lookups find
-  an existing item. Field names are interned too, so a lookup by name in
-  a container of more than a few fields
+  only an item that is new computes its stable hash. Integers, the most
+  common keys, first look in a small direct-mapped cache of the calling
+  thread's (`Local.int_cache`), which needs no key hash. Most lookups
+  find an existing item. Field names are interned too, so a lookup by
+  name in a container of more than a few fields
   compares string indices, not bytes.
 - Reads decode only what the caller uses. `indexToKey` builds a whole
   `Key`; hot code asks for the key's tag (`keyTag`, from the item tag

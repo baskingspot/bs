@@ -728,6 +728,18 @@ const Local = struct {
     structs: List(*ContainerInfo) = .{},
     /// Owns string bytes, limbs, navs, and struct infos.
     arena: std.heap.ArenaAllocator,
+    /// Integers this thread interned recently, direct-mapped by type and
+    /// value: `get` answers most integer keys (the walker's literals,
+    /// indices, and arithmetic results) here without hashing the key.
+    int_cache: [512]IntCacheEntry = @splat(.{}),
+};
+
+const IntCacheEntry = struct {
+    ty: Index = .none,
+    /// `storage` is `.i64` rather than `.u64`.
+    signed: bool = false,
+    value: u64 = 0,
+    index: Index = .none,
 };
 
 const Shard = struct {
@@ -1019,7 +1031,28 @@ pub fn indexOfHash(ip: *InternPool, hash: Hash) Allocator.Error!?Index {
 pub fn get(ip: *InternPool, tid: Tid, key_in: Key) Allocator.Error!Index {
     var bytes_buf: std.ArrayList(u8) = .empty;
     defer bytes_buf.deinit(ip.gpa);
-    const key = if (key_in == .aggregate) try ip.canonicalAggregate(tid, key_in.aggregate, &bytes_buf) else key_in;
+    // Integers first look in this thread's cache.
+    const cached: ?IntCacheEntry = if (key_in == .int) switch (key_in.int.storage) {
+        .u64 => |v| .{ .ty = key_in.int.ty, .value = v },
+        .i64 => |v| .{ .ty = key_in.int.ty, .signed = true, .value = @bitCast(v) },
+        .big => null,
+    } else null;
+    const slot: ?*IntCacheEntry = if (cached) |c| blk: {
+        const h = (c.value ^ (@as(u64, @backingInt(c.ty)) << 32)) *% 0x9e3779b97f4a7c15;
+        const e = &ip.locals[@backingInt(tid)].int_cache[@intCast(h >> 55)];
+        if (e.ty == c.ty and e.value == c.value and e.signed == c.signed) return e.index;
+        break :blk e;
+    } else null;
+    const index = try ip.getUncached(tid, key_in, &bytes_buf);
+    if (slot) |e| {
+        e.* = cached.?;
+        e.index = index;
+    }
+    return index;
+}
+
+fn getUncached(ip: *InternPool, tid: Tid, key_in: Key, bytes_buf: *std.ArrayList(u8)) Allocator.Error!Index {
+    const key = if (key_in == .aggregate) try ip.canonicalAggregate(tid, key_in.aggregate, bytes_buf) else key_in;
     const key_hash = ip.lookupHash(key);
     const shard = ip.shardOf(key_hash);
     shard.mutex.lockUncancelable(ip.io);
