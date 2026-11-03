@@ -150,10 +150,12 @@ pub const Paths = struct {
     /// Absolute and resolved.
     lib_dir: []const u8,
     cwd: []const u8,
+    /// Reads a failing file again for facts about its error (candidates).
+    io: std.Io,
 
     pub fn init(arena: std.mem.Allocator, io: std.Io, zig_lib_dir: []const u8) !Paths {
         const cwd = try std.process.currentPathAlloc(io, arena);
-        return .{ .lib_dir = try std.fs.path.resolve(arena, &.{ cwd, zig_lib_dir }), .cwd = cwd };
+        return .{ .lib_dir = try std.fs.path.resolve(arena, &.{ cwd, zig_lib_dir }), .cwd = cwd, .io = io };
     }
 
     pub fn display(p: Paths, arena: std.mem.Allocator, raw: []const u8) !struct { []const u8, bool } {
@@ -202,8 +204,9 @@ pub fn closeNames(arena: std.mem.Allocator, name: []const u8, names: []const []c
     const limit: usize = @min(2, @max(1, name.len / 3));
     const Scored = struct { name: []const u8, dist: usize };
     var found: std.ArrayList(Scored) = .empty;
-    for (names) |n| {
+    names: for (names) |n| {
         if (std.mem.eql(u8, n, name)) continue;
+        for (found.items) |f| if (std.mem.eql(u8, f.name, n)) continue :names;
         const dist: usize = if (std.ascii.eqlIgnoreCase(n, name)) 0 else editDistance(name, n, limit) orelse continue;
         try found.append(arena, .{ .name = n, .dist = dist });
     }
@@ -282,7 +285,98 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
             n.* = .{ .loc = try bundleLoc(arena, paths, bundle, nm.src_loc), .msg = bundle.nullTerminatedString(nm.msg), .count = nm.count };
         }
         const msg = bundle.nullTerminatedString(m.msg);
-        try out.append(arena, .{ .code = classifyAstGen(msg), .loc = try bundleLoc(arena, paths, bundle, m.src_loc), .msg = msg, .count = m.count, .notes = notes });
+        const code = classifyAstGen(msg);
+        const candidates: []const []const u8 = if (code == .undeclared and m.src_loc != .none)
+            undeclaredCandidates(arena, paths.io, bundle, m.src_loc, msg) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // The file changed or vanished since: no candidates.
+                else => &.{},
+            }
+        else
+            &.{};
+        try out.append(arena, .{ .code = code, .loc = try bundleLoc(arena, paths, bundle, m.src_loc), .msg = msg, .count = m.count, .notes = notes, .candidates = candidates });
+    }
+}
+
+/// The names an undeclared identifier (AstGen's "use of undeclared
+/// identifier 'x'" at `sli`) could have meant, from the file parsed again
+/// (`scopeNames`), filtered by `closeNames`.
+fn undeclaredCandidates(arena: std.mem.Allocator, io: std.Io, bundle: std.zig.ErrorBundle, sli: std.zig.ErrorBundle.SourceLocationIndex, msg: []const u8) ![]const []const u8 {
+    const open = std.mem.indexOfScalar(u8, msg, '\'') orelse return &.{};
+    const close = std.mem.lastIndexOfScalar(u8, msg, '\'') orelse return &.{};
+    if (close <= open + 1) return &.{};
+    const name = msg[open + 1 .. close];
+    const sl = bundle.getSourceLocation(sli);
+    const path = bundle.nullTerminatedString(sl.src_path);
+    const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, arena, .unlimited, .of(u8), 0);
+    const tree = try std.zig.Ast.parse(arena, source, .{ .mode = .zig });
+    var names: std.ArrayList([]const u8) = .empty;
+    try scopeNames(arena, &tree, sl.span_main, &names);
+    var out: std.ArrayList([]const u8) = .empty;
+    try closeNames(arena, name, names.items, false, &out);
+    return out.items;
+}
+
+/// Primitive names an identifier can mean without a declaration.
+const primitive_names = [_][]const u8{
+    "u8",           "u16",            "u32",         "u64",       "u128",     "usize",
+    "i8",           "i16",            "i32",         "i64",       "i128",     "isize",
+    "f16",          "f32",            "f64",         "f80",       "f128",     "bool",
+    "void",         "type",           "anyerror",    "anyopaque", "noreturn", "comptime_int",
+    "comptime_float", "c_int",        "c_uint",      "c_long",    "c_ulong",  "c_char",
+    "true",         "false",          "null",        "undefined",
+};
+
+/// Appends the names visible at byte `offset` of `tree`, roughly: every
+/// container-level declaration of the file, the parameters of the
+/// function around `offset`, and its local constants, variables and
+/// captures declared before `offset` (block scopes are not tracked: a
+/// candidate is a hint), and the primitive names.
+fn scopeNames(arena: std.mem.Allocator, tree: *const std.zig.Ast, offset: u32, out: *std.ArrayList([]const u8)) !void {
+    const Ast = std.zig.Ast;
+    try out.appendSlice(arena, &primitive_names);
+    const tags = tree.nodes.items(.tag);
+    var buf: [2]Ast.Node.Index = undefined;
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const members = if (node == .root) tree.rootDecls() else if (tree.fullContainerDecl(&buf, node)) |c| c.ast.members else continue;
+        for (members) |m| {
+            var proto_buf: [1]Ast.Node.Index = undefined;
+            const name_tok = if (tree.fullVarDecl(m)) |vd| vd.ast.mut_token + 1 else if (tree.fullFnProto(&proto_buf, m)) |fp| fp.name_token orelse continue else continue;
+            if (tree.tokenTag(name_tok) == .identifier) try out.append(arena, tree.tokenSlice(name_tok));
+        }
+    }
+    for (0..tree.nodes.len) |i| {
+        if (tags[i] != .fn_decl) continue;
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const first = tree.firstToken(node);
+        const last = tree.lastToken(node);
+        if (offset < tree.tokenStart(first) or offset > tree.tokenStart(last)) continue;
+        var proto_buf: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&proto_buf, node).?;
+        var it = proto.iterate(tree);
+        while (it.next()) |param| if (param.name_token) |t| try out.append(arena, tree.tokenSlice(t));
+        // Locals and captures before `offset`, by their tokens.
+        var t = first;
+        while (t < last and tree.tokenStart(t) < offset) : (t += 1) {
+            switch (tree.tokenTag(t)) {
+                .keyword_const, .keyword_var => if (tree.tokenTag(t + 1) == .identifier) try out.append(arena, tree.tokenSlice(t + 1)),
+                // A capture list follows `)`, `=>`, `catch` or `else`.
+                .pipe => if (t > 0) switch (tree.tokenTag(t - 1)) {
+                    .r_paren, .equal_angle_bracket_right, .keyword_catch, .keyword_else => {
+                        var c = t + 1;
+                        while (c < last) : (c += 1) switch (tree.tokenTag(c)) {
+                            .identifier => try out.append(arena, tree.tokenSlice(c)),
+                            .asterisk, .comma => {},
+                            else => break,
+                        };
+                        t = c;
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
     }
 }
 
