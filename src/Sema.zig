@@ -3751,10 +3751,7 @@ fn zirFieldParentPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileEr
     const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.field_name));
     try sema.resolveLayout(block, src, parent_ty);
     const field_index: u32 = switch (ip.indexToKey(parent_ty)) {
-        .struct_type => if (Type.isPacked(ip, parent_ty))
-            return sema.failUnsupported(block, src, "@fieldParentPtr of packed struct fields")
-        else
-            try sema.structFieldIndex(block, src, parent_ty, name),
+        .struct_type => try sema.structFieldIndex(block, src, parent_ty, name),
         .union_type => try sema.unionFieldIndex(block, src, parent_ty, name),
         .tuple_type => try sema.structFieldIndex(block, src, parent_ty, name),
         else => return sema.fail(block, src, "expected struct or union type, found '{f}'", .{sema.fmtType(parent_ty)}),
@@ -3768,6 +3765,14 @@ fn zirFieldParentPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileEr
             return sema.coercePtrTo(block, .fromInterned(k.base.field.base), dest_ty);
     };
     try sema.requireRuntime(block, src);
+    // A packed struct field's pointer has the struct's address (a bit
+    // pointer into its backing integer); its type must say which field.
+    if (Type.isPackedStruct(ip, parent_ty)) {
+        const fp = Type.ptrInfo(ip, sema.typeOf(field_ptr));
+        const dp = Type.ptrInfo(ip, dest_ty);
+        if (fp.packed_offset.bit_offset != dp.packed_offset.bit_offset + Type.packedFieldBitOffset(ip, parent_ty, field_index))
+            return sema.fail(block, src, "pointer type '{f}' is not a pointer to field '{s}' of '{f}'", .{ sema.fmtType(sema.typeOf(field_ptr)), name, sema.fmtType(parent_ty) });
+    }
     const offset = Type.fieldOffset(ip, parent_ty, field_index);
     const addr = try sema.addUnOp(block, .int_from_ptr, field_ptr);
     const parent_addr = if (offset == 0) addr else try sema.addBinOp(block, .sub_wrap, addr, .fromInterned(try sema.intValue(.usize_type, offset)));
