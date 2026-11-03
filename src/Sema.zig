@@ -2244,6 +2244,25 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk .fromInterned(captures[ext.small]);
         },
         .@"asm", .asm_expr => sema.zirAsm(block, inst),
+        .tuple_decl => blk: {
+            // `struct { T, U = init }`: fields with an init are comptime.
+            const extra = sema.code.extraData(Zir.Inst.TupleDecl, ext.operand);
+            const src = block.nodeSrc(extra.data.src_node);
+            const refs: []const Zir.Inst.Ref = @ptrCast(sema.code.extra[extra.end..][0 .. 2 * @as(usize, ext.small)]);
+            const types = try sema.arena.alloc(Index, ext.small);
+            const values = try sema.arena.alloc(Index, ext.small);
+            for (types, values, 0..) |*t, *v, k| {
+                t.* = try sema.resolveType(block, src, refs[2 * k]);
+                if (Type.class(sema.ip, t.*) == .@"opaque") return sema.fail(block, src, "opaque types have unknown size and therefore cannot be directly embedded in tuples", .{});
+                v.* = .none;
+                if (refs[2 * k + 1] != .none) {
+                    const init = try sema.coerce(block, t.*, sema.resolveInst(refs[2 * k + 1]), src);
+                    v.* = (try sema.resolveDefinedValue(block, src, init)) orelse
+                        return sema.fail(block, src, "unable to resolve comptime value: tuple field default value must be comptime-known", .{});
+                }
+            }
+            break :blk .fromInterned(try sema.intern(.{ .tuple_type = .{ .types = types, .values = values } }));
+        },
         .alloc => blk: {
             const extra = sema.code.extraData(Zir.Inst.AllocExtended, ext.operand);
             const small: Zir.Inst.AllocExtended.Small = @bitCast(ext.small);
