@@ -30,7 +30,15 @@ pub const Export = struct {
 
 /// A symbol the output references and another module defines. Relocations
 /// name it by `key`, which no atom may have.
-pub const Import = struct { key: SymbolKey, name: []const u8, weak: bool = false };
+pub const Import = struct {
+    key: SymbolKey,
+    name: []const u8,
+    weak: bool = false,
+    /// Reached PC-relative, so the final link must define it in its module
+    /// (STV_HIDDEN, and R_X86_64_PC32 rather than PLT32). Only objects
+    /// have hidden imports.
+    hidden: bool = false,
+};
 
 /// What makes an image a shared object.
 pub const Options = struct {

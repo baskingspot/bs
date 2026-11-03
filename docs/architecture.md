@@ -2041,10 +2041,19 @@ object (`-fPIC`, `-dynamic`), *pie* code that ends up in an executable.
   static executable for such links). A helper that
   saves the caller-saved registers around `__tls_get_addr`: 30 or more
   saves per access, for no gain over treating the access as a call.
-- Inline assembly gets `sym(%rip)` operands and the `.weak`/`.hidden`
-  directives, for std.pie's `lea _DYNAMIC(%rip)`, which std.start runs
-  in a `-fPIE` object whose root has `main` (static PIE start code). Only
-  that case needs it, so it comes last.
+- `@extern` with `.relocation = .pcrel` (IR `extern_pcrel`, built
+  2026-11-03): `lea dst, [rip + sym]`, with no slot. std.pie reads
+  `_DYNAMIC` so (zap reports `zig_backend = .stage2_x86_64`, so std.pie
+  takes upstream's self-hosted path, not its inline assembly), in the
+  start code of a `-fPIE` object whose root has `main`: a static PIE
+  relocates itself, and the slot's own RELATIVE relocation is not yet
+  applied when it looks for `_DYNAMIC`, so reading through the slot
+  crashed. In an object the symbol, unless exported, is an import marked
+  STV_HIDDEN and reached with R_X86_64_PC32 (not PLT32), as GNU as
+  writes `.weak _DYNAMIC; .hidden _DYNAMIC; lea _DYNAMIC(%rip)`; a
+  shared object resolves `_DYNAMIC` itself; an executable resolves the
+  name to an export or compiler_rt, and an undefined weak one is null.
+  Inline assembly needs no symbol operands for this, so it has none yet.
 - Non-pic code is byte-identical to today's.
 
 **Atoms.** Two relocation kinds, appended so stored numbers stay put:
@@ -2065,8 +2074,9 @@ object `.data.rel.ro` is under PT_GNU_RELRO, so it is read-only once
 relocated.
 
 **Objects** (`ElfObject`): `x86_64_pc32` to an import becomes
-R_X86_64_PLT32 (the only one is the call to `__tls_get_addr`; other
-imports are reached through slots), any other `x86_64_pc32` PC32,
+R_X86_64_PLT32 (the call to `__tls_get_addr`; other imports are reached
+through slots, or are hidden `extern_pcrel` targets, which stay PC32),
+any other `x86_64_pc32` PC32,
 `x86_64_abs64` R_X86_64_64 (the final link turns it into RELATIVE or a
 symbol relocation), `x86_64_tlsld` TLSLD against the variable's symbol,
 `x86_64_dtpoff32` DTPOFF32. A pic object has no TPOFF32 and no absolute
@@ -2152,8 +2162,11 @@ local-dynamic sequences to `mov rax, fs:0`) and upstream `zig build-exe
 `cc -shared -Wl,--whole-archive`. Thread-locals, data pointers, exported
 data, imports and panic traces work in each. A `-fPIE` object links into
 PIEs and is refused by `cc -shared` (TPOFF32), as `gcc -fPIE` objects
-are. `zig build test` keeps the upstream PIE (with a panic trace) and
-the upstream shared object.
+are. A `-fPIE` object whose root has `main` (std's start code and
+std.pie) links into a static PIE with upstream `zig build-exe -fPIE`,
+with its self-hosted linker and with `-fllvm -flld`, and runs. `zig
+build test` keeps the upstream PIE (with a panic trace), the upstream
+shared object and the static PIE of test/obj/args.zig.
 
 **Executables do not slow down.** zap's own executable link never sees
 the new kinds, since `build-exe` is not pic. The `.data.rel.ro` decision

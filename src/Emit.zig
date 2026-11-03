@@ -77,9 +77,8 @@ stack_size: u64 = 16 * 1024 * 1024,
 /// `-ffuzz`: CodeGen instruments the main module family's functions with
 /// coverage points (docs/architecture.md, "Fuzzing").
 fuzz: bool = false,
-/// In an object, the symbols other objects define, by name, and whether
-/// every reference is weak.
-imports: std.StringArrayHashMapUnmanaged(bool) = .empty,
+/// In an object, the symbols other objects define, by name.
+imports: std.StringArrayHashMapUnmanaged(ImportFlags) = .empty,
 /// In an object, its exports, once `finish` found them.
 exports: std.ArrayList(ElfObject.Export) = .empty,
 /// What produced each atom, for the on-disk cache (`Incremental`).
@@ -212,7 +211,16 @@ const Out = struct { start: Marks, end: Marks, failed: bool };
 
 const Side = union(enum) {
     rt: []const u8,
-    import: struct { name: []const u8, weak: bool },
+    import: struct { name: []const u8, flags: ImportFlags },
+};
+
+/// How an object refers to an imported symbol.
+const ImportFlags = struct {
+    /// Every reference is weak.
+    weak: bool = false,
+    /// Some reference is PC-relative (`pcrelTarget`), so the final link
+    /// must define the symbol in its module: GNU as's `.hidden`.
+    hidden: bool = false,
 };
 
 /// `Zcu.exports` as CodeGen may read them: a worker's snapshot, taken when
@@ -567,7 +575,7 @@ fn mergeOut(emit: *Emit, w: *const Emit, out: Out) Allocator.Error!void {
     defer emit.owner = saved;
     for (w.side.items[out.start.side..out.end.side]) |s| switch (s) {
         .rt => |key| _ = try emit.requestRtKey(key),
-        .import => |i| _ = try emit.useImport(i.name, i.weak),
+        .import => |i| _ = try emit.useImport(i.name, i.flags),
     };
     var d = out.start.debug;
     for (out.start.atoms..out.end.atoms) |i| {
@@ -731,7 +739,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none };
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
     defer emit.gpa.free(imports);
-    for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, weak| imp.* = .{ .key = importKey(name), .name = name, .weak = weak };
+    for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden };
     const result = if (emit.shared) shared: {
         const dynamic: ElfDynamic.Options = .{ .exports = emit.exports.items, .imports = imports, .soname = emit.soname };
         var shared_options = options;
@@ -835,18 +843,38 @@ fn importKey(name: []const u8) SymbolKey {
 /// In position-independent code, the key of `__tls_get_addr`, which the
 /// module that loads it, or a static executable's std, defines.
 pub fn tlsGetAddr(emit: *Emit) !SymbolKey {
-    return emit.useImport("__tls_get_addr", false);
+    return emit.useImport("__tls_get_addr", .{});
 }
 
 /// In an object, the key of `name`, which another object defines.
-fn useImport(emit: *Emit, name: []const u8, weak: bool) !SymbolKey {
+fn useImport(emit: *Emit, name: []const u8, flags: ImportFlags) !SymbolKey {
     const gop = try emit.imports.getOrPut(emit.gpa, name);
     if (!gop.found_existing) {
         gop.key_ptr.* = try emit.allocator().dupe(u8, name);
-        gop.value_ptr.* = weak;
-    } else if (!weak) gop.value_ptr.* = false;
-    if (emit.is_worker) try emit.side.append(emit.gpa, .{ .import = .{ .name = gop.key_ptr.*, .weak = weak } });
+        gop.value_ptr.* = flags;
+    } else {
+        gop.value_ptr.weak = gop.value_ptr.weak and flags.weak;
+        gop.value_ptr.hidden = gop.value_ptr.hidden or flags.hidden;
+    }
+    if (emit.is_worker) try emit.side.append(emit.gpa, .{ .import = .{ .name = gop.key_ptr.*, .flags = flags } });
     return importKey(name);
+}
+
+/// The symbol `@extern` with `.relocation = .pcrel` names, which code
+/// reaches PC-relative, or null for an undefined weak symbol in an image.
+/// In an object, a symbol it does not export is a hidden import: the
+/// final link must define it, as it defines `_DYNAMIC` for std.pie. A
+/// shared object defines `_DYNAMIC` itself and cannot reach an import
+/// PC-relative.
+pub fn pcrelTarget(emit: *Emit, name: []const u8, weak: bool) !?SymbolKey {
+    if (emit.obj and !emit.shared) return try emit.userExport(name) orelse try emit.useImport(name, .{ .weak = weak, .hidden = true });
+    if (emit.shared and std.mem.eql(u8, name, "_DYNAMIC")) return ElfDynamic.dynamic_key;
+    // Analyzes the compiler_rt function, for the unit's cached references.
+    _ = try emit.requestCompilerRtExport(name);
+    if (try emit.userExport(name) orelse try emit.rtExport(name)) |key| return key;
+    if (weak) return null;
+    try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
+    return error.CodegenFail;
 }
 
 /// Collects an object's exports: each name once, as `exportTarget` picks
@@ -883,9 +911,9 @@ fn lowerExternSlots(emit: *Emit) !bool {
     for (emit.externs.keys(), emit.externs.values()) |name, weak| {
         const target = if (emit.shared)
             try emit.userExport(name) orelse try emit.rtExport(name) orelse
-                if (std.mem.eql(u8, name, "_DYNAMIC")) ElfDynamic.dynamic_key else try emit.useImport(name, weak)
+                if (std.mem.eql(u8, name, "_DYNAMIC")) ElfDynamic.dynamic_key else try emit.useImport(name, .{ .weak = weak })
         else if (emit.obj)
-            try emit.userExport(name) orelse try emit.useImport(name, weak)
+            try emit.userExport(name) orelse try emit.useImport(name, .{ .weak = weak })
         else
             sectionBound(name) orelse try emit.exportTarget(name);
         if (target == null and !weak) {
@@ -928,9 +956,9 @@ pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
     emit.export_lookups += 1;
     if (try emit.userExport(name)) |key| return key;
     // A shared object links compiler_rt in, as upstream's do.
-    if (emit.obj and !emit.shared) return try emit.useImport(name, false);
+    if (emit.obj and !emit.shared) return try emit.useImport(name, .{});
     if (try emit.rtExport(name)) |key| return key;
-    if (emit.shared) return try emit.useImport(name, false);
+    if (emit.shared) return try emit.useImport(name, .{});
     return null;
 }
 

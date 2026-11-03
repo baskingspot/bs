@@ -151,7 +151,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
         next += 1;
     }
     const n_locals = next;
-    var import_index: std.HashMapUnmanaged(SymbolKey, u32, KeyContext, 80) = .empty;
+    var import_index: std.HashMapUnmanaged(SymbolKey, struct { index: u32, hidden: bool }, KeyContext, 80) = .empty;
     try import_index.ensureTotalCapacity(arena, @intCast(symbols.imports.len));
 
     // The symbol table, with the image's names, then the exports' and
@@ -192,14 +192,14 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
         symtab[next] = .{
             .name = @intCast(strtab.items.len),
             .info = .{ .type = .NOTYPE, .bind = if (imp.weak) .WEAK else .GLOBAL },
-            .other = .{ .visibility = .DEFAULT },
+            .other = .{ .visibility = if (imp.hidden) .HIDDEN else .DEFAULT },
             .shndx = elf.SHN_UNDEF,
             .value = 0,
             .size = 0,
         };
         try strtab.appendSlice(arena, imp.name);
         try strtab.append(arena, 0);
-        import_index.putAssumeCapacity(imp.key, next);
+        import_index.putAssumeCapacity(imp.key, .{ .index = next, .hidden = imp.hidden });
         next += 1;
     }
 
@@ -213,13 +213,15 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
         for (a.relocs) |r| {
             const t = a.targets[r.info.target];
             const local = sym_of.get(t);
-            const sym = if (local) |ts| index[ts] else import_index.get(t) orelse continue;
+            const imp = if (local == null) import_index.get(t) orelse continue else null;
+            const sym = if (local) |ts| index[ts] else imp.?.index;
             const ty: elf.R_X86_64 = switch (r.info.kind) {
                 .x86_64_abs64, .value64 => .@"64",
                 // An import reached PC-relative is a call (to
                 // `__tls_get_addr`; other imports are read from slots),
-                // which a shared object makes through its PLT.
-                .x86_64_pc32 => if (local == null) .PLT32 else .PC32,
+                // which a shared object makes through its PLT, unless it
+                // is hidden (`@extern` with `.relocation = .pcrel`).
+                .x86_64_pc32 => if (imp != null and !imp.?.hidden) .PLT32 else .PC32,
                 .x86_64_tpoff32 => .TPOFF32,
                 .x86_64_tlsld => .TLSLD,
                 .x86_64_dtpoff32 => .DTPOFF32,

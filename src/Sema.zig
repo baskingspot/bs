@@ -5193,14 +5193,16 @@ fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
     if (try sema.fieldValue(options, info.fieldIndex(ip, "is_thread_local").?) == .bool_true)
         return sema.failUnsupported(block, src, "thread-local externs");
     if (is_weak and Type.class(ip, ty) != .optional) ty = try sema.optType(ty);
+    const relocation = try sema.fieldValue(options, info.fieldIndex(ip, "relocation").?);
+    const pcrel = ip.intValue(u64, ip.keyPayload(.enum_tag, relocation).int).? == @backingInt(std.lang.ExternOptions.Relocation.pcrel);
     // A function's address is a comptime-known pointer to the extern
     // function, which CodeGen reads from the slot the link fills.
-    if (!is_weak and Type.class(ip, ty) == .pointer and Type.class(ip, Type.ptrInfo(ip, ty).child) == .@"fn") {
+    if (!is_weak and !pcrel and Type.class(ip, ty) == .pointer and Type.class(ip, Type.ptrInfo(ip, ty).child) == .@"fn") {
         const f = try sema.intern(.{ .extern_func = .{ .name = try sema.getString(name), .ty = Type.ptrInfo(ip, ty).child, .is_weak = false } });
         return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .uav = .{ .val = f, .orig_ty = ty } } } }));
     }
     if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
-    return sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ty, .payload = @backingInt(try sema.getString(name)) } } });
+    return sema.addInst(block, .{ .tag = if (pcrel) .extern_pcrel else .extern_ptr, .data = .{ .ty_pl = .{ .ty = ty, .payload = @backingInt(try sema.getString(name)) } } });
 }
 
 // Atomics. x86_64 loads and stores are atomic for every ordering zap

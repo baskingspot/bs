@@ -210,6 +210,12 @@ pub const Inst = struct {
         /// `InternPool.String` `payload`, as a pointer (or optional pointer,
         /// null for an undefined weak symbol) of type `ty`.
         extern_ptr,
+        /// `ty_pl`: as `extern_ptr`, for `@extern` with `.relocation =
+        /// .pcrel`: the address computed relative to the instruction, with
+        /// no slot and no load-time relocation, so it is right before a
+        /// static PIE has relocated itself (std.pie reads `_DYNAMIC` so).
+        /// The symbol must be defined in the module the final link makes.
+        extern_pcrel,
         /// `ty_pl`: the address of this thread's copy of the threadlocal
         /// variable whose `InternPool.NavIndex` is `payload`.
         tls_ptr,
@@ -556,6 +562,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .union_init,
         .assembly,
         .extern_ptr,
+        .extern_pcrel,
         .tls_ptr,
         .atomic_rmw,
         .cmpxchg,

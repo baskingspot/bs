@@ -505,6 +505,22 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     dl_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&dl_run.step);
 
+    // A -fPIE object with `main`, which upstream links into a static PIE:
+    // std.pie relocates it, reading `_DYNAMIC` PC-relative before then.
+    const pie_main = b.addRunArtifact(zap);
+    pie_main.addArgs(&.{ "build-obj", "-fPIE" });
+    pie_main.addFileArg(b.path("test/obj/args.zig"));
+    const pie_main_o = pie_main.addPrefixedOutputFileArg("-femit-bin=", "args.o");
+    const pie_exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fPIE", "-fno-llvm", "-fno-lld" });
+    pie_exe.addFileArg(pie_main_o);
+    const pie_exe_bin = pie_exe.addPrefixedOutputFileArg("-femit-bin=", "args");
+    const pie_main_run = std.Build.Step.Run.create(b, "run args (-fPIE object with main in a static PIE)");
+    pie_main_run.addFileArg(pie_exe_bin);
+    pie_main_run.addArgs(&.{ "a", "b c" });
+    pie_main_run.addCheck(.{ .expect_stdout_exact = "[a][b c]\n" });
+    pie_main_run.addCheck(.{ .expect_term = .{ .exited = 42 } });
+    test_step.dependOn(&pie_main_run.step);
+
     const zap_run = b.addRunArtifact(zap);
     zap_run.setName("zap run args");
     zap_run.addArg("run");

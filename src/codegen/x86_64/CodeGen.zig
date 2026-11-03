@@ -1087,7 +1087,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         live.items(.tie)[@backingInt(inst)] = if (class == .pair) Ssa.no_tie else cg.tiedOperand(inst);
     }
     return switch (tag) {
-        .arg, .ret_addr, .frame_addr, .extern_ptr, .err_return_trace, .save_err_return_trace_index, .set_err_return_trace => false,
+        .arg, .ret_addr, .frame_addr, .extern_ptr, .extern_pcrel, .err_return_trace, .save_err_return_trace_index, .set_err_return_trace => false,
         // Local-dynamic TLS calls `__tls_get_addr`.
         .tls_ptr => cg.emit.pic == .pic,
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => !cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)),
@@ -1503,7 +1503,7 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
         .wrap_errunion_err => true,
         .wrap_errunion_payload => !Type.hasRuntimeBits(cg.ip, cg.typeOf(data.ty_op.operand)) or cg.passInRegs(cg.typeOf(data.ty_op.operand)),
         .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => true,
-        .call, .atomic_load, .atomic_rmw, .ret_addr, .frame_addr, .extern_ptr, .err_return_trace, .save_err_return_trace_index, .tls_ptr, .get_union_tag => true,
+        .call, .atomic_load, .atomic_rmw, .ret_addr, .frame_addr, .extern_ptr, .extern_pcrel, .err_return_trace, .save_err_return_trace_index, .tls_ptr, .get_union_tag => true,
         .slice, .wrap_optional => true,
         else => false,
     };
@@ -2101,6 +2101,14 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const slot = try cg.emit.useExtern(name, weak);
             const d = cg.destReg(inst);
             try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = Mem.sym(slot, 0) });
+            try cg.setResult(inst, data.ty_pl.ty, d);
+        },
+        .extern_pcrel => {
+            const name = ip.stringSlice(@fromBackingInt(data.ty_pl.payload));
+            const weak = Type.class(ip, data.ty_pl.ty) == .optional;
+            const d = cg.destReg(inst);
+            // An undefined weak symbol in an image is null.
+            if (try cg.emit.pcrelTarget(name, weak)) |key| try cg.e.lea(.qword, d, Mem.sym(key, 0)) else try cg.e.mov(.dword, .{ .reg = d }, .{ .imm = 0 });
             try cg.setResult(inst, data.ty_pl.ty, d);
         },
         .c_va_start => try cg.cVaStart(inst, data.ty),
