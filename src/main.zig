@@ -76,6 +76,12 @@ pub const Options = struct {
     /// `-funwind-tables`, `-fasync-unwind-tables`, `-fno-unwind-tables`:
     /// only what `builtin.unwind_tables` says (Builtin.Options).
     unwind_tables: std.lang.UnwindTables = .async,
+    /// `-fPIC` on `build-obj` and `build-lib`, and `-fPIE` on `build-obj`
+    /// (which sets both): position-independent code (see
+    /// "Position-independent code" in docs/architecture.md). On executables
+    /// both are accepted and ignored.
+    pic: bool = false,
+    pie: bool = false,
     /// `--listen=-`: serve std's compiler protocol on stdin and stdout
     /// (`zig build`'s compile steps) instead of compiling once.
     listen: bool = false,
@@ -243,6 +249,8 @@ pub const Job = struct {
             .single_threaded = opts.single_threaded,
             .unwind_tables = opts.unwind_tables,
             .fuzz = opts.fuzz,
+            .pic = opts.pic,
+            .pie = opts.pie,
         });
         // An executable that fuzzes links the fuzzer, whose module family
         // has a builtin of its own, as upstream's separate compilation of
@@ -429,6 +437,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
     emit.obj = opts.command == .build_obj or opts.command == .build_lib;
+    emit.pic = if (opts.pie) .pie else if (opts.pic) .pic else .none;
     emit.stack_size = opts.stack_size;
     emit.fuzz = opts.fuzz;
     // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
@@ -997,10 +1006,16 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         } else if (std.mem.eql(u8, arg, "-fPIC") or std.mem.eql(u8, arg, "-fPIE")) {
             // On an executable, a preference that changes nothing a program
             // means, as with -fllvm: zap links it static and non-PIE, and
-            // `builtin.position_independent_*` stay false. An object or
-            // library built non-PIC cannot go into a PIE or shared library.
-            if (command == .build_obj or command == .build_lib)
-                setUnsupported(&opts, arena, "zap does not emit position-independent code ('{s}'); build this step with upstream zig", .{arg});
+            // `builtin.position_independent_*` stay false. Objects and
+            // libraries get position-independent code, as upstream's.
+            if (command == .build_obj or command == .build_lib) {
+                opts.pic = true;
+                if (std.mem.eql(u8, arg, "-fPIE") and command == .build_obj) opts.pie = true;
+            }
+        } else if (std.mem.eql(u8, arg, "-fno-PIC") or std.mem.eql(u8, arg, "-fno-PIE")) {
+            // As upstream: -fno-PIE leaves -fPIC alone.
+            if (std.mem.eql(u8, arg, "-fno-PIC")) opts.pic = false;
+            opts.pie = false;
         } else if (std.mem.eql(u8, arg, "--name")) {
             opts.name = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "-target")) {

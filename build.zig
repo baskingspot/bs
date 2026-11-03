@@ -441,6 +441,43 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     panic.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
     test_step.dependOn(&panic.step);
 
+    // The same object built -fPIC, linked by upstream into a static PIE
+    // (which relaxes local-dynamic TLS) and into a shared object that a
+    // dynamically linked program loads (which keeps it).
+    const pic = b.addRunArtifact(zap);
+    pic.addArgs(&.{ "build-obj", "-fPIC" });
+    pic.addFileArg(b.path("test/obj/lib.zig"));
+    const pic_o = pic.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
+    const pie = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fPIE", "-fno-llvm", "-fno-lld" });
+    pie.addFileArg(b.path("test/obj/main.zig"));
+    pie.addFileArg(pic_o);
+    const pie_bin = pie.addPrefixedOutputFileArg("-femit-bin=", "main");
+    const pie_run = std.Build.Step.Run.create(b, "run obj main (-fPIC object in a PIE)");
+    pie_run.addFileArg(pie_bin);
+    pie_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+    pie_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&pie_run.step);
+    const pie_panic = std.Build.Step.Run.create(b, "run obj main (-fPIC object in a PIE, panic)");
+    pie_panic.addFileArg(pie_bin);
+    pie_panic.addArg("panic");
+    pie_panic.addCheck(.{ .expect_stderr_match = " in zap_overflow (lib.zig)\n    return x + 250;\n" });
+    pie_panic.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
+    test_step.dependOn(&pie_panic.step);
+    const so = b.addSystemCommand(&.{ upstreamZig(b), "build-lib", "-dynamic", "--name", "zappic" });
+    so.addFileArg(pic_o);
+    const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libzappic.so");
+    const host_exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
+    host_exe.addFileArg(b.path("test/obj/main.zig"));
+    host_exe.addFileArg(so_file);
+    const host_bin = host_exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+    const so_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
+    so_run.setName("run obj main (-fPIC object in a shared object)");
+    so_run.addFileArg(so_file);
+    so_run.addFileArg(host_bin);
+    so_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+    so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&so_run.step);
+
     const zap_run = b.addRunArtifact(zap);
     zap_run.setName("zap run args");
     zap_run.addArg("run");

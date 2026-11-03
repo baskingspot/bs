@@ -1087,7 +1087,9 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         live.items(.tie)[@backingInt(inst)] = if (class == .pair) Ssa.no_tie else cg.tiedOperand(inst);
     }
     return switch (tag) {
-        .arg, .ret_addr, .frame_addr, .extern_ptr, .tls_ptr, .err_return_trace, .save_err_return_trace_index, .set_err_return_trace => false,
+        .arg, .ret_addr, .frame_addr, .extern_ptr, .err_return_trace, .save_err_return_trace_index, .set_err_return_trace => false,
+        // Local-dynamic TLS calls `__tls_get_addr`.
+        .tls_ptr => cg.emit.pic == .pic,
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => !cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)),
         .store => !cg.passInRegs(cg.typeOf(data.bin_op.rhs)),
         .call, .atomic_rmw => true,
@@ -2131,7 +2133,10 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .tls_ptr => {
             const key = try cg.emit.navKey(@fromBackingInt(data.ty_pl.payload));
             const d = cg.destReg(inst);
-            try cg.e.leaThreadLocal(d, key);
+            // Position-independent code that may end up in a shared object
+            // asks `__tls_get_addr` for the module's block: a call
+            // (`clobbers`).
+            if (cg.emit.pic == .pic) try cg.e.leaThreadLocalDynamic(d, key, try cg.emit.tlsGetAddr()) else try cg.e.leaThreadLocal(d, key);
             try cg.setResult(inst, data.ty_pl.ty, d);
         },
         .intcast, .trunc, .bitcast, .ptr_from_int => {

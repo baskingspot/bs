@@ -1952,9 +1952,11 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
     .debug_rnglists R_X86_64_32 against those sections, found by walking
     the sections as `Dwarf` wrote them (`Dwarf.relocatableFields`); each
     FDE's pc_begin becomes R_X86_64_PC32 against .text.
-  - Code is not position-independent (absolute addresses in .rodata):
-    link with upstream `zig build-exe` (static, non-PIE), `ld`, or `cc
-    -no-pie`; a PIE link works with text relocations and warnings.
+  - Without `-fPIC`/`-fPIE`, code is not position-independent (absolute
+    addresses in .rodata): link with upstream `zig build-exe` (static,
+    non-PIE), `ld`, or `cc -no-pie`; a PIE link works with text
+    relocations and warnings. With them, see "Position-independent code
+    and shared libraries" below.
   - Checked (2026-11-03): an object exporting functions and data,
     importing a function, and using a thread-local links with upstream
     `zig build-exe` (self-hosted linker and `-fllvm -flld`), `cc -no-pie`,
@@ -2054,7 +2056,7 @@ relocations follows from its relocations, so neither `Atom.Section` nor
 the atom gains a field.
 
 **Data with absolute addresses.** In a pic or pie image, a .rodata atom
-with an `x86_64_abs64` (or a `value64` naming a symbol) goes to
+with an `x86_64_abs64` goes to
 `.data.rel.ro` instead; extern slots are such atoms. A loader must write
 those words, and `lld` refuses dynamic relocations in a read-only
 segment (`ld` writes DT_TEXTREL, which hardened loaders refuse). Elf's
@@ -2069,13 +2071,17 @@ imports are reached through slots), any other `x86_64_pc32` PC32,
 symbol relocation), `x86_64_tlsld` TLSLD against the variable's symbol,
 `x86_64_dtpoff32` DTPOFF32. A pic object has no TPOFF32 and no absolute
 relocation outside .data, .data.rel.ro and the debug sections. Archives
-wrap the same object, as now.
+wrap the same object, as now. A pic object keeps each exported atom's
+local symbol next to the export's global one, and its relocations name
+the local symbol: a shared object's link refuses PC32 against a global
+symbol of default visibility, which could be preempted, and the object's
+code binds to its own definitions anyway.
 
 **Exports.** `Zcu.Export` gains linkage and visibility from `@export`'s
 options (an `export` declaration is strong and default). Today only the
 name is honored. Objects then bind weak exports STB_WEAK and mark hidden
 and protected ones; a shared object leaves hidden exports out of
-`.dynsym`; `.internal` linkage exports nothing. This is a small change to
+`.dynsym` (0.17's `GlobalLinkage` has only strong and weak). This is a small change to
 Sema (written here, reviewed by the Sema thread).
 
 **Shared objects** (`build-lib -dynamic`): `Elf.emit` with
@@ -4291,8 +4297,9 @@ state. Built for step 1:
   program meaning, only address randomization, and
   `builtin.position_independent_code`/`_executable` stay false (true would
   make std's start code relocate a binary that has no relocations). On
-  `build-obj` and `build-lib` they stay `[unsupported]`: a non-PIC object
-  cannot go into a PIE or a shared library. `-funwind-tables`,
+  `build-obj` and `build-lib` they produce position-independent code, as
+  upstream (see "Position-independent code and shared libraries").
+  `-funwind-tables`,
   `-fasync-unwind-tables` and `-fno-unwind-tables` set
   `builtin.unwind_tables` as upstream does (ghostty asks for `.sync`);
   zap emits asynchronous tables for each, which serve every request.

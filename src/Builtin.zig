@@ -20,6 +20,10 @@ pub const Options = struct {
     unwind_tables: std.lang.UnwindTables = .async,
     /// `-ffuzz`.
     fuzz: bool = false,
+    /// `-fPIC` and `-fPIE` on objects and libraries (see
+    /// "Position-independent code" in docs/architecture.md).
+    pic: bool = false,
+    pie: bool = false,
 };
 
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
@@ -99,14 +103,14 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const valgrind_support = true;
     \\pub const sanitize_thread = false;
     \\pub const fuzz = {s};
-    \\pub const position_independent_code = false;
-    \\pub const position_independent_executable = false;
+    \\pub const position_independent_code = {s};
+    \\pub const position_independent_executable = {s};
     \\pub const strip_debug_info = false;
     \\pub const code_model: std.lang.CodeModel = .default;
     \\pub const omit_frame_pointer = false;
     \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
     \\
-    , .{ @tagName(opts.output_mode), @tagName(opts.unwind_tables), if (opts.is_test) "true" else "false", if (opts.single_threaded) "true" else "false", if (opts.fuzz) "true" else "false" });
+    , .{ @tagName(opts.output_mode), @tagName(opts.unwind_tables), if (opts.is_test) "true" else "false", if (opts.single_threaded) "true" else "false", if (opts.fuzz) "true" else "false", if (opts.pic) "true" else "false", if (opts.pie) "true" else "false" });
 }
 
 /// Writes the generated source to `<cache_dir>/builtin/<content hash>/builtin.zig`

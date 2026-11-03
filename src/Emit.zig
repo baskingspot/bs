@@ -59,6 +59,11 @@ entry: ?SymbolKey = null,
 /// no entry, its exports are symbols for other objects, and symbols it
 /// does not define are imported from them.
 obj: bool = false,
+/// How code reaches thread-locals: `.pic` is position-independent code
+/// that may end up in a shared object (`-fPIC`), which uses the
+/// local-dynamic model; `.pie` and `.none` use local-exec. `.pic` and
+/// `.pie` images put .rodata with absolute addresses in .data.rel.ro.
+pic: enum { none, pic, pie } = .none,
 /// `--stack`: the executable's main thread stack size.
 stack_size: u64 = 16 * 1024 * 1024,
 /// `-ffuzz`: CodeGen instruments the main module family's functions with
@@ -346,6 +351,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
         w.is_worker = true;
         w.obj = emit.obj;
         w.fuzz = emit.fuzz;
+        w.pic = emit.pic;
     }
     const pool = try gpa.create(Pool);
     pool.* = .{ .io = io, .workers = workers, .fuzz = fuzz };
@@ -713,7 +719,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
-    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size };
+    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none };
     const result = if (emit.obj) obj: {
         const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
         defer emit.gpa.free(imports);
@@ -808,6 +814,12 @@ fn externSlotKey(name: []const u8) SymbolKey {
 fn importKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
     return .fromName(std.fmt.bufPrint(&buf, "import.{s}", .{name}) catch name);
+}
+
+/// In position-independent code, the key of `__tls_get_addr`, which the
+/// module that loads it, or a static executable's std, defines.
+pub fn tlsGetAddr(emit: *Emit) !SymbolKey {
+    return emit.useImport("__tls_get_addr", false);
 }
 
 /// In an object, the key of `name`, which another object defines.
