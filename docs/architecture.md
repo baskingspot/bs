@@ -3122,6 +3122,20 @@ byte-identical for every n.
   grows by 4–5% (std 601 → 624 MB, zig workload 1232 → 1296 MB): each
   worker keeps its own SSA scratch and constant memo, and IR waits in
   the queue.
+- *ReleaseSafe.* std.start gives a ReleaseSafe program SafeAllocator over
+  the page allocator, which reuses no memory: every freed bucket and
+  large block (a job's IR, CodeGen's scratch) is unmapped, and with
+  workers running, each unmap interrupts the other cores to flush their
+  TLBs, while page faults and unmaps contend on the address space's
+  lock: munmap was a quarter of the samples. `main` therefore gives a
+  ReleaseSafe zap SafeAllocator over SmpAllocator, which keeps the
+  double-free, mismatch and footer checks but lets freed memory be
+  reused; a write after free no longer faults. std's tests
+  (`ZAP_CACHE=off`, 4-core orb, two runs each), ReleaseSafe zap: one
+  thread 14.1–14.3 → 10.5 s, four threads 16.9–17.1 → 8.9–9.3 s, system
+  time at four threads 10.3–10.4 → 0.9 s, RSS unchanged (761 → 764 MB).
+  A ReleaseFast zap compiles the same allocator choice as before: one
+  thread 7.75–7.80 vs 7.78–8.26 s, four 6.73–6.83 vs 6.64–7.24 s (noise).
 
 Step 1 orders output by hand-over, not by the node key sort below: with
 one Sema thread, hand-over order is deterministic and keeps the serial

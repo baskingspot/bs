@@ -97,7 +97,19 @@ const unsupported_commands: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "objcopy", "zap does not implement 'objcopy'; run this step with upstream zig" },
 });
 
-pub fn main(init: std.process.Init) !void {
+/// The general-purpose allocator of a ReleaseSafe zap: std's SafeAllocator,
+/// as std.start would pick, but over SmpAllocator instead of the page
+/// allocator. Over the page allocator it reuses no memory, so every freed
+/// bucket and large block is unmapped, and with CodeGen workers each unmap
+/// interrupts every other core to flush its TLB: std's tests took 14 s on
+/// one thread and 17 s on four. It still catches double and mismatched
+/// frees and corrupted allocation footers; a write after free no longer
+/// faults, since the memory stays mapped.
+var safe_gpa: std.heap.SafeAllocator = .init(std.heap.smp_allocator, .{});
+
+pub fn main(init_std: std.process.Init) !void {
+    var init = init_std;
+    if (builtin.mode == .safe and !builtin.link_libc) init.gpa = safe_gpa.allocator();
     const arena = init.arena.allocator();
     const raw_args = try init.minimal.args.toSlice(arena);
     if (raw_args.len < 2) fatalUsage();
