@@ -144,7 +144,21 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
 
     if (!naked) {
         const frame = std.mem.alignForward(u32, cg.slots_size + cg.out_args_size, 16);
-        std.mem.writeInt(u32, cg.e.code.items[frame_patch - 4 ..][0..4], frame, .little);
+        if (frame <= 4096) {
+            std.mem.writeInt(u32, cg.e.code.items[frame_patch - 4 ..][0..4], frame, .little);
+        } else {
+            // A frame over a page is allocated by probing each page, as
+            // upstream, out of line: the prologue's `sub rsp, imm32` becomes
+            // a jump to the probes at the end, which jump back. The CFA is
+            // rbp-based by then, so the frame info holds throughout.
+            const stub: u32 = @intCast(cg.e.code.items.len);
+            const sub_at: u32 = @intCast(frame_patch - 7);
+            try cg.e.line(0, 0);
+            try cg.e.probedFrameAlloc(frame, @intCast(frame_patch));
+            cg.e.code.items[sub_at] = 0xe9;
+            std.mem.writeInt(i32, cg.e.code.items[sub_at + 1 ..][0..4], @intCast(@as(i64, stub) - @as(i64, sub_at + 5)), .little);
+            @memcpy(cg.e.code.items[sub_at + 5 ..][0..2], &[_]u8{ 0x66, 0x90 });
+        }
     }
 
     const arena = emit.allocator();
