@@ -1953,7 +1953,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk .fromInterned(try sema.vectorType(@intCast(len), child));
         },
         .anyframe_type => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(tag)),
-        .typeof => .fromInterned(sema.typeOf(sema.resolveInst(data.un_node.operand))),
+        .typeof => .fromInterned(try sema.typeOfWithIes(sema.resolveInst(data.un_node.operand))),
         .typeof_builtin => blk: {
             const extra = sema.code.extraData(Zir.Inst.Block, data.pl_node.payload_index);
             const body = sema.code.bodySlice(extra.end, extra.data.body_len);
@@ -1965,7 +1965,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             child.is_comptime = false;
             child.is_typeof = true;
             const operand = try sema.resolveInlineBody(&child, body, inst);
-            break :blk .fromInterned(sema.typeOf(operand));
+            break :blk .fromInterned(try sema.typeOfWithIes(operand));
         },
         .typeof_log2_int_type => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
@@ -4296,6 +4296,10 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 // (See also the `.@"fn"` case below.)
                 const d = Type.ptrInfo(ip, dest_ty);
                 const v = val orelse return null;
+                // An extern function's address is known at link time.
+                if (d.flags.size == .one and d.child == src_ty and ip.indexToKey(v) == .extern_func and !block.is_comptime) {
+                    return try sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = dest_ty, .payload = @backingInt(ip.indexToKey(v).extern_func.name) } } });
+                }
                 if (d.flags.size != .one or ip.indexToKey(v) != .func) return null;
                 if (d.child != src_ty and !try sema.fnTypeCoercible(block, src, v, d.child)) return null;
                 const f = ip.indexToKey(v).func;
@@ -4310,6 +4314,13 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
         .@"fn" => if (sc == .@"fn") {
             const v = val orelse return null;
             if (ip.indexToKey(v) != .func or !try sema.fnTypeCoercible(block, src, v, dest_ty)) return null;
+            // A generic function takes the parameter types of the type it
+            // coerces to, which its calls then coerce arguments to.
+            if (ip.indexToKey(dest_ty).func_type.is_generic and dest_ty != src_ty) {
+                var f = ip.indexToKey(v).func;
+                f.ty = dest_ty;
+                return .fromInterned(try sema.intern(.{ .func = f }));
+            }
             return inst;
         },
         .vector, .array => if ((dc == .vector and (sc == .array or sc == .vector)) or (dc == .array and sc == .vector)) {
@@ -4724,6 +4735,17 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         const raw = try sema.slicePtr(block, inst);
         return try sema.coercePtrTo(block, raw, dest_ty);
     }
+    // A pointer to a function, to a pointer to a function type it can be
+    // called as (`&f` to `*const @TypeOf(f)` names its inferred error set).
+    if (s.flags.size == .one and d.flags.size == .one and Type.class(ip, s.child) == .@"fn" and Type.class(ip, d.child) == .@"fn") {
+        const v = sema.resolveValue(inst) orelse return null;
+        const k = ip.indexToKey(v);
+        if (k != .ptr or k.ptr.base != .nav or k.ptr.byte_offset != 0) return null;
+        const func = ip.getNav(k.ptr.base.nav).val;
+        if (ip.indexToKey(func) != .func or ip.typeOf(func) != s.child) return null;
+        if (!try sema.fnTypeCoercible(block, block.nodeSrc(.zero), func, d.child)) return null;
+        return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = k.ptr.base } }));
+    }
     return null;
 }
 
@@ -4737,8 +4759,9 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
     if (Type.class(ip, dst) != .@"fn") return false;
     const s = ip.indexToKey(src).func_type;
     const d = ip.indexToKey(dst).func_type;
-    if (s.cc != d.cc or s.is_generic or d.is_generic or s.param_types.len != d.param_types.len) return false;
-    for (s.param_types, d.param_types) |a, b| if (a != b) return false;
+    if (s.cc != d.cc or s.is_generic != d.is_generic or s.comptime_bits != d.comptime_bits or s.param_types.len != d.param_types.len) return false;
+    // A generic parameter on either side matches, as upstream.
+    for (s.param_types, d.param_types) |a, b| if (a != b and a != .generic_poison_type and b != .generic_poison_type) return false;
     if (s.return_type == d.return_type or s.return_type == .noreturn_type) return true;
     const sr = ip.indexToKey(s.return_type);
     const dr = ip.indexToKey(d.return_type);
@@ -4747,6 +4770,21 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
     var set = sr.error_union_type.error_set_type;
     if (set == .adhoc_inferred_error_set_type) set = try sema.intern(.{ .inferred_error_set_type = func });
     return sema.errorSetCoercible(block, src_loc, set, dr.error_union_type.error_set_type, .none);
+}
+
+/// `@TypeOf` a function with an inferred error set names that set, as
+/// upstream, though the function value's type has the placeholder.
+fn typeOfWithIes(sema: *Sema, operand: Ref) CompileError!Index {
+    const ip = sema.ip;
+    const ty = sema.typeOf(operand);
+    const func = sema.resolveValue(operand) orelse return ty;
+    if (ip.indexToKey(func) != .func) return ty;
+    var f = ip.indexToKey(ty).func_type;
+    const ret = ip.indexToKey(f.return_type);
+    if (ret != .error_union_type or ret.error_union_type.error_set_type != .adhoc_inferred_error_set_type) return ty;
+    const ies = try sema.intern(.{ .inferred_error_set_type = func });
+    f.return_type = try sema.intern(.{ .error_union_type = .{ .error_set_type = ies, .payload_type = ret.error_union_type.payload_type } });
+    return sema.intern(.{ .func_type = f });
 }
 
 fn makeSlice(sema: *Sema, block: *Block, slice_ty: Index, ptr: Ref, len: Ref) CompileError!Ref {
@@ -10461,7 +10499,12 @@ fn zirFieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const fn_ty = ip.indexToKey(callee_ty).func_type;
     if (fn_ty.param_types.len == 0) return sema.fail(block, src, "member function '{s}' has no parameters", .{name});
     const first_ty = fn_ty.param_types[0];
-    const self: Ref = if (first_ty != .generic_poison_type and Type.class(ip, first_ty) == .pointer) self_ptr else try sema.analyzeLoad(block, src, self_ptr);
+    const by_ptr = first_ty != .generic_poison_type and switch (Type.class(ip, first_ty)) {
+        .pointer => true,
+        .optional => Type.class(ip, Type.childType(ip, first_ty)) == .pointer,
+        else => false,
+    };
+    const self: Ref = if (by_ptr) self_ptr else try sema.analyzeLoad(block, src, self_ptr);
     return sema.analyzeCall(block, src, callee, self, args, modifier);
 }
 
@@ -10576,8 +10619,11 @@ fn analyzeCall(
     }
 
     const ret_ty = fn_ty.return_type;
+    // An inline call with a comptime-only return type still runs its body
+    // at runtime, as upstream; its result must be comptime-known.
+    const is_inline = fn_ty.cc == .@"inline" or modifier == .always_inline;
     const comptime_call = block.is_comptime or modifier == .compile_time or
-        (ret_ty != .generic_poison_type and Type.isComptimeOnly(ip, ret_ty));
+        (ret_ty != .generic_poison_type and Type.isComptimeOnly(ip, ret_ty) and !is_inline);
     if (func == .none) {
         if (comptime_call) return sema.fail(block, src, "unable to resolve comptime value: function pointer is not comptime-known", .{});
         const callee_ptr = if (extern_func == .none) callee else blk: {
