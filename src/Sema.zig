@@ -1726,7 +1726,15 @@ fn fnHasRuntimeBits(sema: *Sema, fn_ty: Index) bool {
 /// address, an export).
 fn queueFuncRef(sema: *Sema, src: Src, func: Index) CompileError!void {
     try sema.bcRefuse();
-    if (try sema.zcu.queueFuncFrom(sema.owner, func)) try sema.noteReference(.{ .func = func }, src);
+    if (try sema.queueFuncFromOwner(func)) try sema.noteReference(.{ .func = func }, src);
+}
+
+/// Queues `func` on behalf of this unit (`Zcu.queueFuncFrom`), and of a
+/// unit that reuses the result of the memoizable call in progress.
+/// Returns whether `func` was queued now, for the first time.
+fn queueFuncFromOwner(sema: *Sema, func: Index) !bool {
+    if (sema.memo_start) |start| _ = try sema.memoCollect(.{ .func = func }, start);
+    return sema.zcu.queueFuncFrom(sema.owner, func);
 }
 
 /// Records that this unit refers to `unit` at `src`, if nothing referred to
@@ -1758,7 +1766,7 @@ fn declareDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !void {
             const m = sema.memo_dep_cache[h];
             if (m != 0 and m - 1 >= start and m - 1 < sema.memo_deps.items.len) switch (sema.memo_deps.items[m - 1]) {
                 .dep => |d| if (std.meta.eql(d.dependee, dependee) and (conditional or !d.conditional)) return,
-                .body, .effect => {},
+                .body, .effect, .func => {},
             };
         } else if (slot.* != 0) {
             const i = slot.* - 1;
@@ -1821,12 +1829,13 @@ fn giveDepMap(zcu: *Zcu, map: *DependeeMap) void {
 }
 
 /// What a memoizable comptime call in progress declared: a dependency, an
-/// evaluator body's (see `bcDeclareBody`), or a container type with
-/// effects (`noteEffects`).
+/// evaluator body's (see `bcDeclareBody`), a container type with effects
+/// (`noteEffects`), or a function it referred to (`queueFuncFromOwner`).
 const MemoCollected = union(enum) {
     dep: Zcu.MemoDep,
     body: *const Zcu.Bytecode,
     effect: Index,
+    func: Index,
 };
 
 /// Returns the entry's position in `memo_deps`.
@@ -1848,7 +1857,8 @@ fn memoCollect(sema: *Sema, entry: MemoCollected, start: u32) !u32 {
             if (gop.found_existing and gop.value_ptr.* >= start) return gop.value_ptr.*;
             gop.value_ptr.* = len;
         },
-        .effect => |ty| {
+        // A type and a function are never the same index.
+        .effect, .func => |ty| {
             const gop = try sema.memo_effect_pos.getOrPut(gpa, ty);
             if (gop.found_existing and gop.value_ptr.* >= start) return gop.value_ptr.*;
             gop.value_ptr.* = len;
@@ -1881,7 +1891,7 @@ fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.MemoDep {
             for (b.deps) |d| try S.add(&out, &index, sema.gpa, sema.arena, .{ .dependee = d, .conditional = true });
             for (b.entry_deps) |i| try S.add(&out, &index, sema.gpa, sema.arena, .{ .dependee = b.deps[i], .conditional = false });
         },
-        .effect => {},
+        .effect, .func => {},
     };
     return sema.zcu.arena.allocator().dupe(Zcu.MemoDep, out.items);
 }
@@ -1891,18 +1901,36 @@ fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.MemoDep {
 fn memoEffects(sema: *Sema, start: u32) ![]const Index {
     var out: std.ArrayList(Index) = .empty;
     for (sema.memo_deps.items[start..]) |e| switch (e) {
-        .dep => {},
+        .dep, .func => {},
         .body => |b| for (b.entry_effects) |i| if (std.mem.indexOfScalar(Index, out.items, b.effects[i]) == null) try out.append(sema.arena, b.effects[i]),
         .effect => |ty| if (std.mem.indexOfScalar(Index, out.items, ty) == null) try out.append(sema.arena, ty),
     };
     return sema.zcu.arena.allocator().dupe(Index, out.items);
 }
 
+/// The functions that the memoizable call whose entries start at `start`
+/// referred to, for its memo entry (a nested call's may repeat one).
+fn memoFuncs(sema: *Sema, start: u32) ![]const Index {
+    var n: usize = 0;
+    for (sema.memo_deps.items[start..]) |e| n += @intFromBool(e == .func);
+    const out = try sema.zcu.arena.allocator().alloc(Index, n);
+    n = 0;
+    for (sema.memo_deps.items[start..]) |e| if (e == .func) {
+        out[n] = e.func;
+        n += 1;
+    };
+    return out;
+}
+
 /// Reuses memo entry `memo`: declares what its call read and notes the
 /// containers with effects it evaluated.
-fn memoHit(sema: *Sema, memo: Zcu.Memo) !Index {
+fn memoHit(sema: *Sema, memo: Zcu.Memo) CompileError!Index {
     for (memo.deps) |d| try sema.declareDep(d.dependee, d.conditional);
     for (memo.effects) |ty| try sema.noteEffects(ty, true);
+    // A lowered body would not refer to them on each run, as
+    // `queueFuncRef` refuses.
+    if (memo.funcs.len != 0) try sema.bcRefuse();
+    for (memo.funcs) |func| _ = try sema.queueFuncFromOwner(func);
     return memo.result;
 }
 
@@ -4507,7 +4535,7 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
     const scope = sema.memoEnter();
     defer sema.memoLeave(scope);
     const result = try sema.typeInfo(block, src, ty);
-    try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.start), .effects = try sema.memoEffects(scope.start) });
+    try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.start), .effects = try sema.memoEffects(scope.start), .funcs = try sema.memoFuncs(scope.start) });
     return .fromInterned(result);
 }
 
@@ -15335,7 +15363,7 @@ fn analyzeCall(
     try sema.declareDep(.{ .nav_val = ip.keyPayload(.func, callee_func).owner_nav }, sema.bc != null);
     // The comptime evaluator calls it at comptime instead.
     if (sema.bc == null) {
-        if (try sema.zcu.queueFuncFrom(sema.owner, callee_func)) try sema.noteReference(.{ .func = callee_func }, src);
+        if (try sema.queueFuncFromOwner(callee_func)) try sema.noteReference(.{ .func = callee_func }, src);
     }
     for (callee_fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
     try sema.resolveLayout(block, src, callee_fn_ty.return_type);
@@ -15693,7 +15721,7 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
         },
     };
     if (memoizable and !sema.refersToComptimeAlloc(result)) {
-        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.?.start), .effects = try sema.memoEffects(scope.?.start) });
+        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.?.start), .effects = try sema.memoEffects(scope.?.start), .funcs = try sema.memoFuncs(scope.?.start) });
     } else if (sema.bc) |bc| if (bc.depth == 0) try sema.bcRefuse();
     return result;
 }

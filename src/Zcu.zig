@@ -154,6 +154,9 @@ pub const Memo = struct {
     /// The container types with effects the call evaluated, which a unit
     /// that reuses the result notes too (`effect_uses`).
     effects: []const InternPool.Index,
+    /// The functions the call referred to, which a unit that reuses the
+    /// result refers to too (`func_refs`).
+    funcs: []const InternPool.Index,
 };
 
 pub const MemoDep = struct {

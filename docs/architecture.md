@@ -239,8 +239,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   about 100 k such concatenations.
 - All comptime calls go through one entry point that memoizes by (function,
   stable hashes of arguments). A memo entry keeps the dependencies its call
-  declared, and a unit that reuses the result declares them too, as if it
-  had made the call. `@typeInfo(T)` goes through the same memo table,
+  declared and the functions it referred to (an `Io` vtable's), and a unit
+  that reuses the result declares and refers to them too, as if it had made
+  the call. `@typeInfo(T)` goes through the same memo table,
   keyed by `T`'s stable hash: its result depends only on `T` (and the
   declarations of `std.builtin` it reads, which the entry's dependencies
   record), and std.fmt and std.meta ask for the same types over and over.
