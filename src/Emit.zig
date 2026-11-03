@@ -221,6 +221,8 @@ const ImportFlags = struct {
     /// Some reference is PC-relative (`pcrelTarget`), so the final link
     /// must define the symbol in its module: GNU as's `.hidden`.
     hidden: bool = false,
+    /// A thread-local (`tlsTarget`).
+    tls: bool = false,
 };
 
 /// `Zcu.exports` as CodeGen may read them: a worker's snapshot, taken when
@@ -739,7 +741,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none };
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
     defer emit.gpa.free(imports);
-    for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden };
+    for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };
     const result = if (emit.shared) shared: {
         const dynamic: ElfDynamic.Options = .{ .exports = emit.exports.items, .imports = imports, .soname = emit.soname };
         var shared_options = options;
@@ -855,9 +857,29 @@ fn useImport(emit: *Emit, name: []const u8, flags: ImportFlags) !SymbolKey {
     } else {
         gop.value_ptr.weak = gop.value_ptr.weak and flags.weak;
         gop.value_ptr.hidden = gop.value_ptr.hidden or flags.hidden;
+        gop.value_ptr.tls = gop.value_ptr.tls or flags.tls;
     }
     if (emit.is_worker) try emit.side.append(emit.gpa, .{ .import = .{ .name = gop.key_ptr.*, .flags = flags } });
     return importKey(name);
+}
+
+pub const TlsTarget = struct {
+    key: SymbolKey,
+    /// Defined in the module the final link makes: the compilation's own.
+    local: bool,
+};
+
+/// The thread-local an `extern threadlocal` names: the compilation's
+/// export of that name, or in an object an import, which the final link
+/// resolves. zap's executables and shared objects import no thread-locals.
+pub fn tlsTarget(emit: *Emit, name: []const u8) !TlsTarget {
+    if (try emit.userExport(name)) |key| return .{ .key = key, .local = true };
+    if (emit.obj and !emit.shared) return .{ .key = try emit.useImport(name, .{ .tls = true }), .local = false };
+    if (emit.shared)
+        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap does not import thread-local symbols into shared objects yet: {s}", .{name})
+    else
+        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
+    return error.CodegenFail;
 }
 
 /// The symbol `@extern` with `.relocation = .pcrel` names, which code

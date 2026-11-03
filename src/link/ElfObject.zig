@@ -27,7 +27,8 @@
 //! Only x86_64 relocation kinds exist so far: R_X86_64_64, PC32 (PLT32 to
 //! an import), TPOFF32 (local-exec TLS, which requires the final link to be
 //! an executable), TLSLD and DTPOFF32 (local-dynamic TLS, in
-//! position-independent code), and 8, 16, 32, and 64 for `value*`
+//! position-independent code), GOTTPOFF and TLSGD (initial- and
+//! general-dynamic TLS, to `extern threadlocal` imports), and 8, 16, 32, and 64 for `value*`
 //! relocations that name a symbol. Without `Options.pic`, code is not
 //! position-independent: absolute addresses in .rodata need a non-PIE final
 //! link. With it, .rodata atoms holding absolute addresses are in
@@ -104,6 +105,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
     image_options.entry = null;
     image_options.values = values;
     image_options.diag = diag;
+    image_options.object = true;
     const image = try Elf.emit(gpa, io, atoms, image_options);
     errdefer gpa.free(image);
 
@@ -191,7 +193,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
     for (symbols.imports) |imp| {
         symtab[next] = .{
             .name = @intCast(strtab.items.len),
-            .info = .{ .type = .NOTYPE, .bind = if (imp.weak) .WEAK else .GLOBAL },
+            .info = .{ .type = if (imp.tls) .TLS else .NOTYPE, .bind = if (imp.weak) .WEAK else .GLOBAL },
             .other = .{ .visibility = if (imp.hidden) .HIDDEN else .DEFAULT },
             .shndx = elf.SHN_UNDEF,
             .value = 0,
@@ -225,6 +227,8 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
                 .x86_64_tpoff32 => .TPOFF32,
                 .x86_64_tlsld => .TLSLD,
                 .x86_64_dtpoff32 => .DTPOFF32,
+                .x86_64_gottpoff => .GOTTPOFF,
+                .x86_64_tlsgd => .TLSGD,
                 .value32 => .@"32",
                 .value16 => .@"16",
                 .value8 => .@"8",

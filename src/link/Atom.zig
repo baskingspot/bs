@@ -207,6 +207,20 @@ pub const Reloc = extern struct {
         /// 32-bit offset of thread-local S in its module's TLS block: S + A
         /// minus the start of the TLS segment (ELF R_X86_64_DTPOFF32).
         x86_64_dtpoff32,
+        /// x86_64 TLS for a thread-local another module may define
+        /// (`extern threadlocal`), in objects only: only `ElfObject` takes
+        /// them, as R_X86_64_GOTTPOFF and R_X86_64_TLSGD against an import,
+        /// and the final link resolves them; an image's link rejects them.
+        ///
+        /// 32-bit PC-relative address of the GOT entry holding S's offset
+        /// from the thread pointer, initial-exec model: in `add dst, [rip +
+        /// S@gottpoff]` after `mov dst, fs:0`. A = -4.
+        x86_64_gottpoff,
+        /// 32-bit PC-relative address of S's TLS GOT pair (module ID,
+        /// offset), general-dynamic model: in `data16 lea rdi, [rip +
+        /// S@tlsgd]`, which must be followed by the padded `call
+        /// __tls_get_addr`. A = -4.
+        x86_64_tlsgd,
     };
 };
 

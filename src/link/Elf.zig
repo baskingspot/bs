@@ -102,6 +102,10 @@ pub const Options = struct {
     /// sections. Implies `pic`; `base_address` should be 0, `entry` null,
     /// and `symbols` null.
     dynamic: ?*const ElfDynamic.Options = null,
+    /// The image is an object's (`ElfObject`), whose relocations replace
+    /// the fields: thread-local relocations to imports, which have no
+    /// address here, leave their fields alone.
+    object: bool = false,
 };
 
 pub const FileWrites = enum {
@@ -457,6 +461,8 @@ const Tls = struct {
     /// local-dynamic relocations. An object's image has no GOT: its value
     /// is a placeholder, since the object's relocations replace it.
     ld_got: ?u64 = null,
+    /// `Options.object`.
+    object: bool = false,
 };
 /// Where pass 1 placed an atom.
 const Place = packed struct(u64) {
@@ -759,6 +765,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .end = base + tls_end,
         .tp = base + tls_start + tls_align.forward(tls_end - tls_start),
         .ld_got = if (has_dyn) base + got_off else if (options.pic) base + tls_start else null,
+        .object = options.object,
     };
     if (dyn_opts) |d| {
         l.plt_start = base + plt_off;
@@ -1798,6 +1805,8 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
             },
             .x86_64_tpoff32 => try tpoff32(a, r, dst, s, tls, diag),
             .x86_64_tlsld, .x86_64_dtpoff32 => try tlsDynamic(a, r, dst, p_base, s, tls, diag),
+            // Only objects reach another module's thread-locals.
+            .x86_64_gottpoff, .x86_64_tlsgd => if (!tls.object) return invalidReloc(a, diag),
             .value32 => {
                 const f = try relocField(a, dst, r.offset, 4, diag);
                 std.mem.writeInt(u32, f, std.math.cast(u32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
@@ -1824,6 +1833,8 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
 noinline fn tpoff32(a: *const Atom, r: Atom.Reloc, dst: []u8, s: u64, tls: *const Tls, diag: *Diagnostic) Error!void {
     const f = try relocField(a, dst, r.offset, 4, diag);
     if (s < tls.start or s >= tls.end) {
+        // An object's import (`extern threadlocal`).
+        if (tls.object) return;
         diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
         return error.InvalidRelocation;
     }

@@ -1088,8 +1088,8 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
     }
     return switch (tag) {
         .arg, .ret_addr, .frame_addr, .extern_ptr, .extern_pcrel, .err_return_trace, .save_err_return_trace_index, .set_err_return_trace => false,
-        // Local-dynamic TLS calls `__tls_get_addr`.
-        .tls_ptr => cg.emit.pic == .pic,
+        // Local- and general-dynamic TLS call `__tls_get_addr`.
+        .tls_ptr, .extern_tls => cg.emit.pic == .pic,
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => !cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)),
         .store => !cg.passInRegs(cg.typeOf(data.bin_op.rhs)),
         .call, .atomic_rmw => true,
@@ -1503,7 +1503,7 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
         .wrap_errunion_err => true,
         .wrap_errunion_payload => !Type.hasRuntimeBits(cg.ip, cg.typeOf(data.ty_op.operand)) or cg.passInRegs(cg.typeOf(data.ty_op.operand)),
         .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => true,
-        .call, .atomic_load, .atomic_rmw, .ret_addr, .frame_addr, .extern_ptr, .extern_pcrel, .err_return_trace, .save_err_return_trace_index, .tls_ptr, .get_union_tag => true,
+        .call, .atomic_load, .atomic_rmw, .ret_addr, .frame_addr, .extern_ptr, .extern_pcrel, .err_return_trace, .save_err_return_trace_index, .tls_ptr, .extern_tls, .get_union_tag => true,
         .slice, .wrap_optional => true,
         else => false,
     };
@@ -2138,13 +2138,27 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
             try cg.setResult(inst, .usize_type, .rax);
         },
-        .tls_ptr => {
-            const key = try cg.emit.navKey(@fromBackingInt(data.ty_pl.payload));
+        .tls_ptr, .extern_tls => {
+            const t: Emit.TlsTarget = if (tag == .tls_ptr)
+                .{ .key = try cg.emit.navKey(@fromBackingInt(data.ty_pl.payload)), .local = true }
+            else
+                try cg.emit.tlsTarget(ip.stringSlice(@fromBackingInt(data.ty_pl.payload)));
             const d = cg.destReg(inst);
             // Position-independent code that may end up in a shared object
-            // asks `__tls_get_addr` for the module's block: a call
-            // (`clobbers`).
-            if (cg.emit.pic == .pic) try cg.e.leaThreadLocalDynamic(d, key, try cg.emit.tlsGetAddr()) else try cg.e.leaThreadLocal(d, key);
+            // asks `__tls_get_addr` for the module's block, or for another
+            // module's variable: a call (`clobbers`). An executable has
+            // its own variables in its static block, and finds another
+            // module's through the GOT.
+            if (t.local) {
+                if (cg.emit.pic == .pic) try cg.e.leaThreadLocalDynamic(d, t.key, try cg.emit.tlsGetAddr()) else try cg.e.leaThreadLocal(d, t.key);
+            } else switch (cg.emit.pic) {
+                .none => try cg.e.leaThreadLocal(d, t.key),
+                .pie => try cg.e.leaThreadLocalInitial(d, t.key),
+                .pic => {
+                    try cg.e.leaThreadLocalGeneral(t.key, try cg.emit.tlsGetAddr());
+                    try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = .rax });
+                },
+            }
             try cg.setResult(inst, data.ty_pl.ty, d);
         },
         .intcast, .trunc, .bitcast, .ptr_from_int => {

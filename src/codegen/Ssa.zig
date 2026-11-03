@@ -726,7 +726,7 @@ const LiveWalk = struct {
 pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
-        .arg, .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .ret_addr, .frame_addr, .extern_ptr, .extern_pcrel, .tls_ptr => {},
+        .arg, .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .ret_addr, .frame_addr, .extern_ptr, .extern_pcrel, .extern_tls, .tls_ptr => {},
         .err_return_trace, .save_err_return_trace_index, .breakpoint, .c_va_start, .block, .loop => {},
         .repeat, .unreach, .trap, .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect => {},
         .br => ctx.use(data.br.operand),

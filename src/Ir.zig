@@ -216,6 +216,10 @@ pub const Inst = struct {
         /// static PIE has relocated itself (std.pie reads `_DYNAMIC` so).
         /// The symbol must be defined in the module the final link makes.
         extern_pcrel,
+        /// `ty_pl`: as `extern_ptr`, for a thread-local symbol (`extern
+        /// threadlocal var`, `@extern` with `.is_thread_local`): the
+        /// address of this thread's copy. Never weak.
+        extern_tls,
         /// `ty_pl`: the address of this thread's copy of the threadlocal
         /// variable whose `InternPool.NavIndex` is `payload`.
         tls_ptr,
@@ -563,6 +567,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .assembly,
         .extern_ptr,
         .extern_pcrel,
+        .extern_tls,
         .tls_ptr,
         .atomic_rmw,
         .cmpxchg,

@@ -160,7 +160,7 @@ const Printer = struct {
                 try w.writeAll(", ");
                 try p.ref(x.new);
             },
-            .extern_ptr, .extern_pcrel => {
+            .extern_ptr, .extern_pcrel, .extern_tls => {
                 try p.ty(data.ty_pl.ty);
                 try w.print(", \"{s}\"", .{p.ip.stringSlice(@fromBackingInt(data.ty_pl.payload))});
             },

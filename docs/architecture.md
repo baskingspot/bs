@@ -2026,9 +2026,24 @@ object (`-fPIC`, `-dynamic`), *pie* code that ends up in an executable.
   `lea rdi, [rip + x@tlsld]; call __tls_get_addr@plt; lea dst, [rax +
   x@dtpoff]`. It is the canonical form linkers relax to local-exec
   (`mov rax, fs:0`, padded) when the object lands in an executable.
-  Zig's thread-locals are always defined in the image (Sema rejects
-  thread-local externs, which stay `[unsupported]`), so local-dynamic
-  covers them, and general-dynamic is not needed.
+  A thread-local the compilation defines (its own, or an export that an
+  `extern threadlocal` names) always uses these two models.
+- Thread-local externs (`extern threadlocal var`, `@extern` with
+  `.is_thread_local`; IR `extern_tls`, built 2026-11-03). Before, Sema
+  rejected the `@extern` form, but lowered `extern threadlocal var` to
+  an ordinary extern, so code reached the variable's initial image
+  instead of the thread's copy. Now the name resolves to the
+  compilation's export, as above, or in an object to an import of type
+  STT_TLS, reached by the model the final link needs: local-exec
+  (TPOFF32) in a non-pic object, which needs an executable, as upstream's
+  do; initial-exec in a pie object (`mov dst, fs:0; add dst, [rip +
+  x@gottpoff]`, R_X86_64_GOTTPOFF); general-dynamic in a pic object
+  (`data16 lea rdi, [rip + x@tlsgd]; data16 data16 rex.W call
+  __tls_get_addr@plt`, R_X86_64_TLSGD, the padded 16 bytes linkers
+  relax), a call like local-dynamic's. Weak thread-local externs stay
+  `[unsupported]`, and so do imports into zap's shared objects, which
+  would need a GOT pair with DTPMOD64/DTPOFF64 against the symbol;
+  executables have no imports.
 - The sequence is a call: in pic mode `CodeGen.clobbers` returns true for
   `tls_ptr`, so the allocator keeps nothing in rsi, rdi, r8 or r9 across
   it, as for calls; rax, rcx, rdx, r10 and r11 are scratch already, and no
@@ -2060,7 +2075,11 @@ object (`-fPIC`, `-dynamic`), *pie* code that ends up in an executable.
 `x86_64_tlsld` (the variable's module, R_X86_64_TLSLD: PC-relative to
 the module's TLS GOT pair, A = -4) and `x86_64_dtpoff32` (S + A minus the
 start of the TLS segment, R_X86_64_DTPOFF32). The call names the import
-`__tls_get_addr`. Nothing else changes: whether an atom needs dynamic
+`__tls_get_addr`. Thread-local externs add `x86_64_gottpoff` and
+`x86_64_tlsgd`, which only objects take (to imports); an image's link
+rejects them, and an object's image pass leaves every thread-local
+relocation to an import alone (`Elf.Options.object`), since the object's
+RELA records replace those fields. Nothing else changes: whether an atom needs dynamic
 relocations follows from its relocations, so neither `Atom.Section` nor
 the atom gains a field.
 
@@ -2079,7 +2098,8 @@ through slots, or are hidden `extern_pcrel` targets, which stay PC32),
 any other `x86_64_pc32` PC32,
 `x86_64_abs64` R_X86_64_64 (the final link turns it into RELATIVE or a
 symbol relocation), `x86_64_tlsld` TLSLD against the variable's symbol,
-`x86_64_dtpoff32` DTPOFF32. A pic object has no TPOFF32 and no absolute
+`x86_64_dtpoff32` DTPOFF32, `x86_64_gottpoff` GOTTPOFF, `x86_64_tlsgd`
+TLSGD. A pic object has no TPOFF32 and no absolute
 relocation outside .data, .data.rel.ro and the debug sections. Archives
 wrap the same object, as now. A pic object keeps each exported atom's
 local symbol next to the export's global one, and its relocations name
@@ -2166,7 +2186,14 @@ are. A `-fPIE` object whose root has `main` (std's start code and
 std.pie) links into a static PIE with upstream `zig build-exe -fPIE`,
 with its self-hosted linker and with `-fllvm -flld`, and runs. `zig
 build test` keeps the upstream PIE (with a panic trace), the upstream
-shared object and the static PIE of test/obj/args.zig.
+shared object and the static PIE of test/obj/args.zig. Thread-local
+externs: test/obj/tls.zig, whose thread-local test/obj/tls_main.zig
+defines, linked by upstream as a non-pic object into an executable, as
+a pie object into a PIE, and as a pic object into a shared object that
+the host loads, each checked from two threads (`zig build test`); by
+hand also with `cc -no-pie`, `cc -pie` (pie and pic objects) and `cc
+-shared` with a C host's `__thread` variable. test/run/extern_tls.zig
+covers an executable's own export.
 
 **Executables do not slow down.** zap's own executable link never sees
 the new kinds, since `build-exe` is not pic. The `.data.rel.ro` decision

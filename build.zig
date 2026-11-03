@@ -521,6 +521,39 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     pie_main_run.addCheck(.{ .expect_term = .{ .exited = 42 } });
     test_step.dependOn(&pie_main_run.step);
 
+    // A thread-local the host defines (`extern threadlocal`): local-exec
+    // in an executable, initial-exec in a PIE, general-dynamic in a shared
+    // object.
+    for ([_][]const u8{ "-fno-PIC", "-fPIE", "-fPIC" }) |mode| {
+        const tls = b.addRunArtifact(zap);
+        tls.addArgs(&.{ "build-obj", mode });
+        tls.addFileArg(b.path("test/obj/tls.zig"));
+        const tls_o = tls.addPrefixedOutputFileArg("-femit-bin=", "tls.o");
+        const tls_run = if (std.mem.eql(u8, mode, "-fPIC")) run: {
+            const tls_so = b.addSystemCommand(&.{ upstreamZig(b), "build-lib", "-dynamic", "--name", "zaptls" });
+            tls_so.addFileArg(tls_o);
+            const tls_so_file = tls_so.addPrefixedOutputFileArg("-femit-bin=", "libzaptls.so");
+            const tls_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
+            tls_host.addFileArg(b.path("test/obj/tls_main.zig"));
+            tls_host.addFileArg(tls_so_file);
+            const r = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
+            r.addFileArg(tls_so_file);
+            r.addFileArg(tls_host.addPrefixedOutputFileArg("-femit-bin=", "tls_main"));
+            break :run r;
+        } else run: {
+            const tls_exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-llvm", "-fno-lld", if (std.mem.eql(u8, mode, "-fPIE")) "-fPIE" else "-fno-PIE" });
+            tls_exe.addFileArg(b.path("test/obj/tls_main.zig"));
+            tls_exe.addFileArg(tls_o);
+            const r = std.Build.Step.Run.create(b, "run tls_main");
+            r.addFileArg(tls_exe.addPrefixedOutputFileArg("-femit-bin=", "tls_main"));
+            break :run r;
+        };
+        tls_run.setName(b.fmt("run tls_main (extern threadlocal, {s})", .{mode}));
+        tls_run.addCheck(.{ .expect_stdout_exact = "5 6 5 6\n" });
+        tls_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&tls_run.step);
+    }
+
     const zap_run = b.addRunArtifact(zap);
     zap_run.setName("zap run args");
     zap_run.addArg("run");

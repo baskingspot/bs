@@ -412,6 +412,43 @@ pub fn leaThreadLocalDynamic(e: *Encoder, dst: Reg, sym: SymbolKey, get_addr: Sy
     e.int(u32, 0);
 }
 
+/// `dst` = the address of thread-local `sym`, which another module may
+/// define, in position-independent code that ends up in an executable,
+/// initial-exec model: `mov dst, fs:0; add dst, [rip + sym@gottpoff]`,
+/// the form linkers relax to local-exec when the executable defines it.
+pub fn leaThreadLocalInitial(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
+    try e.reserve();
+    e.byte(0x64);
+    e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
+    e.byte(0x8b);
+    e.byte(modrmByte(0b00, dst.low(), 0b100));
+    e.byte(sibByte(0, 0b100, 0b101)); // no base, no index: [disp32]
+    e.int(u32, 0);
+    try e.reserve();
+    e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
+    e.byte(0x03);
+    e.byte(modrmByte(0b00, dst.low(), 0b101)); // [rip + disp32]
+    try e.reloc(.x86_64_gottpoff, sym, -4);
+    e.int(u32, 0);
+}
+
+/// rax = the address of thread-local `sym`, which another module may
+/// define, in position-independent code, general-dynamic model:
+/// `data16 lea rdi, [rip + sym@tlsgd]; data16 data16 rex.W call
+/// get_addr` (`__tls_get_addr`), padded to the 16 bytes linkers relax to
+/// initial-exec or local-exec. A call: it clobbers the caller-saved
+/// registers.
+pub fn leaThreadLocalGeneral(e: *Encoder, sym: SymbolKey, get_addr: SymbolKey) !void {
+    try e.reserve();
+    e.bytes(&.{ 0x66, 0x48, 0x8d, 0x3d }); // data16 lea rdi, [rip + disp32]
+    try e.reloc(.x86_64_tlsgd, sym, -4);
+    e.int(u32, 0);
+    try e.reserve();
+    e.bytes(&.{ 0x66, 0x66, 0x48, 0xe8 }); // data16 data16 rex.W call rel32
+    try e.reloc(.x86_64_pc32, get_addr, -4);
+    e.int(u32, 0);
+}
+
 pub fn lea(e: *Encoder, size: Size, dst: Reg, src: Mem) !void {
     assert(size != .byte);
     try e.reserve();
@@ -1121,6 +1158,24 @@ test "encodings with special cases match GNU as" {
         .init(3, .x86_64_tlsld, 0, -4),
         .init(8, .x86_64_pc32, 1, -4),
         .init(15, .x86_64_dtpoff32, 0, 0),
+    }, e.refs.relocs.items);
+    // As GNU as assembles `mov %fs:0, %r12; add x@gottpoff(%rip), %r12`,
+    // the same with rax, and `data16 lea x@tlsgd(%rip), %rdi; .word
+    // 0x6666; rex64 call __tls_get_addr@PLT`.
+    e.code.clearRetainingCapacity();
+    e.refs.relocs.clearRetainingCapacity();
+    try e.leaThreadLocalInitial(.r12, foo);
+    try e.leaThreadLocalInitial(.rax, foo);
+    try e.leaThreadLocalGeneral(foo, bar);
+    const ie_expected = "644c8b242500000000" ++ "4c032500000000" ++ "64488b042500000000" ++ "48030500000000" ++
+        "66488d3d00000000" ++ "666648e800000000";
+    var ie_buf: [ie_expected.len / 2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&ie_buf, ie_expected), e.code.items);
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{
+        .init(0xc, .x86_64_gottpoff, 0, -4),
+        .init(0x1c, .x86_64_gottpoff, 0, -4),
+        .init(0x24, .x86_64_tlsgd, 0, -4),
+        .init(0x2c, .x86_64_pc32, 1, -4),
     }, e.refs.relocs.items);
 }
 

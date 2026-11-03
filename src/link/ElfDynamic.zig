@@ -38,6 +38,8 @@ pub const Import = struct {
     /// (STV_HIDDEN, and R_X86_64_PC32 rather than PLT32). Only objects
     /// have hidden imports.
     hidden: bool = false,
+    /// A thread-local (STT_TLS). Only objects import thread-locals.
+    tls: bool = false,
 };
 
 /// What makes an image a shared object.
