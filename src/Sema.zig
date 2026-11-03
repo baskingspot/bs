@@ -6901,12 +6901,17 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             base = try sema.coercePtrTo(block, ptr, try sema.ptrType(.{ .child = a.child, .flags = .{ .size = .many, .is_const = is_const } }));
         },
         .ptr_type => |cp| {
-            const obj = try sema.analyzeLoad(block, src, ptr);
+            var obj = try sema.analyzeLoad(block, src, ptr);
             is_const = cp.flags.is_const;
             ptr_align = cp.flags.alignment;
             switch (cp.flags.size) {
                 .one => {
-                    const a = ip.indexToKey(cp.child).array_type;
+                    // `*T` slices like `*[1]T`, as upstream.
+                    if (ip.indexToKey(cp.child) != .array_type) {
+                        const arr_ty = try sema.intern(.{ .array_type = .{ .len = 1, .child = cp.child } });
+                        obj = try sema.coerce(block, try sema.ptrType(.{ .child = arr_ty, .flags = .{ .is_const = cp.flags.is_const, .is_volatile = cp.flags.is_volatile, .alignment = cp.flags.alignment } }), obj, src);
+                    }
+                    const a = ip.indexToKey(Type.ptrInfo(ip, sema.typeOf(obj)).child).array_type;
                     elem_ty = a.child;
                     ptr_sentinel = a.sentinel;
                     len = .fromInterned(try sema.intValue(.usize_type, a.len));
@@ -8350,7 +8355,51 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
         break :blk .{ e.lhs, e.rhs, block.nodeSrc(data.pl_node.src_node) };
     };
     const dest_ty = try sema.resolveType(block, src, dest_ref);
-    const operand = sema.resolveInst(operand_ref);
+    var operand = sema.resolveInst(operand_ref);
+    const ip = sema.ip;
+    const optPtr = struct {
+        fn f(p_ip: *InternPool, ty: Index) bool {
+            return Type.class(p_ip, ty) == .optional and Type.class(p_ip, Type.childType(p_ip, ty)) == .pointer and
+                Type.ptrInfo(p_ip, Type.childType(p_ip, ty)).flags.size != .slice;
+        }
+    }.f;
+    // Optional pointers: null stays null in an optional result; otherwise
+    // the pointer must not be null.
+    if (optPtr(ip, sema.typeOf(operand))) {
+        if (optPtr(ip, dest_ty)) {
+            const child = try sema.ptrCastInner(block, src, flags, Type.childType(ip, dest_ty), try sema.addTyOpOrFold(block, Type.childType(ip, sema.typeOf(operand)), operand));
+            if (sema.resolveValue(operand)) |v| if (!sema.isUndef(v) and ip.indexToKey(v).opt.val == .none) return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = .none } }));
+            if (sema.resolveValue(child)) |cv| return .fromInterned(try sema.intern(.{ .opt = .{ .ty = dest_ty, .val = cv } }));
+            return sema.addTyOp(block, .bitcast, dest_ty, operand);
+        }
+        if (sema.resolveValue(operand)) |v| {
+            if (!sema.isUndef(v) and ip.indexToKey(v).opt.val == .none) return sema.fail(block, src, "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
+        } else if (block.want_safety and Type.class(ip, dest_ty) == .pointer and !Type.ptrInfo(ip, dest_ty).flags.is_allowzero) {
+            try sema.requireRuntime(block, src);
+            const ok = try sema.addUnOp(block, .is_non_null, operand);
+            try sema.addSafetyCheck(block, ok, .cast_to_null, .none, .none);
+        }
+        operand = try sema.optionalPayload(block, src, operand, false);
+    } else if (optPtr(ip, dest_ty) and Type.class(ip, sema.typeOf(operand)) == .pointer) {
+        const child = try sema.ptrCastInner(block, src, flags, Type.childType(ip, dest_ty), operand);
+        return sema.coerce(block, dest_ty, child, src);
+    }
+    return sema.ptrCastInner(block, src, flags, dest_ty, operand);
+}
+
+/// `ty_op` to `ty` (a bitcast between optional and plain pointers), or the
+/// payload of a comptime-known optional pointer.
+fn addTyOpOrFold(sema: *Sema, block: *Block, ty: Index, operand: Ref) CompileError!Ref {
+    if (sema.resolveValue(operand)) |v| {
+        if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(ty));
+        const payload = sema.ip.indexToKey(v).opt.val;
+        return .fromInterned(if (payload == .none) try sema.intern(.{ .ptr = .{ .ty = ty, .base = .int, .byte_offset = 0 } }) else payload);
+    }
+    try sema.requireRuntime(block, block.nodeSrc(.zero));
+    return sema.addTyOp(block, .optional_payload, ty, operand);
+}
+
+fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCastFlags, dest_ty: Index, operand: Ref) CompileError!Ref {
     const src_ty = sema.typeOf(operand);
     if (Type.class(sema.ip, dest_ty) != .pointer or Type.class(sema.ip, src_ty) != .pointer)
         return sema.failUnsupported(block, src, "pointer casts involving non-pointer types");
@@ -8675,7 +8724,9 @@ fn analyzeCall(
                 if (k.base == .nav and k.byte_offset == 0) {
                     try sema.ensureNavVal(block, src, k.base.nav);
                     const nv = ip.getNav(k.base.nav).val;
-                    if (ip.indexToKey(nv) == .func) func = nv;
+                    // A pointer cast to another function type calls
+                    // indirectly.
+                    if (ip.indexToKey(nv) == .func and ip.typeOf(nv) == p.child) func = nv;
                 }
             };
             break :blk p.child;
