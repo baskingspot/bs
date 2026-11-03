@@ -16,6 +16,8 @@ const SymbolKey = Atom.SymbolKey;
 const Elf = @import("link/Elf.zig");
 const ElfObject = @import("link/ElfObject.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
+const CodeGenA64 = @import("codegen/aarch64/CodeGen.zig");
+const MachO = @import("link/MachO.zig");
 const Ssa = @import("codegen/Ssa.zig");
 
 const Emit = @This();
@@ -50,7 +52,8 @@ obj: bool = false,
 /// `--stack`: the executable's main thread stack size.
 stack_size: u64 = 16 * 1024 * 1024,
 /// In an object, the symbols other objects define, by name, and whether
-/// every reference is weak.
+/// every reference is weak. On aarch64-macos, the symbols libSystem
+/// defines.
 imports: std.StringArrayHashMapUnmanaged(bool) = .empty,
 /// In an object, its exports, once `finish` found them.
 exports: std.ArrayList(ElfObject.Export) = .empty,
@@ -209,7 +212,11 @@ pub fn function(emit: *Emit, zcu: *Zcu, ir: *const Ir) !void {
     defer emit.owner = .link;
     const t0 = std.Io.Timestamp.now(zcu.io, .awake);
     defer emit.codegen_ns += @intCast(t0.durationTo(.now(zcu.io, .awake)).nanoseconds);
-    CodeGen.generate(emit, ir) catch |err| switch (err) {
+    const generate = switch (zcu.ip.target) {
+        .x86_64_linux => &CodeGen.generate,
+        .aarch64_macos => &CodeGenA64.generate,
+    };
+    generate(emit, ir) catch |err| switch (err) {
         error.CodegenFail => emit.failed = true,
         else => |e| return e,
     };
@@ -249,19 +256,22 @@ pub fn finish(emit: *Emit) !bool {
     }
     if (emit.uses_error_names) try emit.emitErrorNameTable();
 
+    // On macOS, libSystem's start calls the C `main` that std.start
+    // exports.
+    const entry_name = if (ip.target == .aarch64_macos) "main" else "_start";
     var entry: ?SymbolKey = null;
     for (zcu.exports.items) |e| {
         if (e.target != .nav) continue;
         const nav = ip.getNav(e.target.nav);
         if (nav.status != .resolved) continue;
-        if (std.mem.eql(u8, ip.stringSlice(e.name), "_start") and ip.keyTag(nav.val) == .func) {
+        if (std.mem.eql(u8, ip.stringSlice(e.name), entry_name) and ip.keyTag(nav.val) == .func) {
             entry = try emit.funcKey(nav.val);
         }
     }
     if (emit.failed) return false;
     emit.entry = entry;
     if (entry == null and !emit.obj) {
-        try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap requires the root file to export '_start' (std.start is not supported yet)", .{});
+        try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap requires the root file to export '{s}' (std.start is not supported yet)", .{entry_name});
         return false;
     }
 
@@ -281,6 +291,16 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
+    if (emit.zcu.ip.target == .aarch64_macos) {
+        const imports = try emit.gpa.alloc(MachO.Import, emit.imports.count());
+        defer emit.gpa.free(imports);
+        for (imports, emit.imports.keys()) |*imp, name| imp.* = .{ .key = importKey(name), .name = name };
+        MachO.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry.?, .imports = imports, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd }) catch |err| {
+            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+            return false;
+        };
+        return true;
+    }
     const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size };
     const result = if (emit.obj) obj: {
         const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
@@ -401,7 +421,7 @@ fn lowerExternSlots(emit: *Emit) !bool {
         const bytes = try arena.alloc(u8, 8);
         @memset(bytes, 0);
         const targets: []const SymbolKey = if (target) |t| try arena.dupe(SymbolKey, &.{t}) else &.{};
-        const relocs: []const Atom.Reloc = if (target != null) try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, 0)}) else &.{};
+        const relocs: []const Atom.Reloc = if (target != null) try arena.dupe(Atom.Reloc, &.{.init(0, emit.abs64Kind(), 0, 0)}) else &.{};
         try emit.addAtom(.{
             .key = externSlotKey(name),
             .name = try std.fmt.allocPrint(arena, "extern.{s}", .{name}),
@@ -418,13 +438,27 @@ fn lowerExternSlots(emit: *Emit) !bool {
 /// The symbol exported as `name`, or null if there is none. In an object,
 /// a symbol that is not exported is imported, as upstream leaves it to the
 /// final link; an executable resolves it against compiler_rt, as upstream
-/// links it. Complete only once analysis is.
+/// links it, and on aarch64-macos then imports it from libSystem.
+/// Complete only once analysis is.
 pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
     emit.export_lookups += 1;
     if (try emit.userExport(name)) |key| return key;
     if (emit.obj) return try emit.useImport(name, false);
-    return if (try emit.zcu.requestCompilerRtExport(name)) |key| .fromName(key) else null;
+    if (try emit.zcu.requestCompilerRtExport(name)) |key| return .fromName(key);
+    if (emit.zcu.ip.target == .aarch64_macos) return try emit.useImport(name, false);
+    return null;
 }
+
+/// The relocation kind of a 64-bit absolute address in data.
+pub fn abs64Kind(emit: *const Emit) Atom.Reloc.Kind {
+    return switch (emit.zcu.ip.target) {
+        .x86_64_linux => .x86_64_abs64,
+        .aarch64_macos => .aarch64_abs64,
+    };
+}
+
+/// The symbol and offset a comptime-known pointer refers to.
+pub const ptrTarget = CodeGen.ptrTarget;
 
 /// The symbol the compilation exports as `name`, or null.
 fn userExport(emit: *Emit, name: []const u8) !?SymbolKey {
@@ -624,7 +658,7 @@ fn emitErrorNameTable(emit: *Emit) !void {
         @memcpy(z[0..s.len], s);
         z[s.len] = 0;
         const off: u32 = try ip.errorValue(name) * 16;
-        try refs.append(gpa, off, .x86_64_abs64, try emit.contentAtom(1, z, &.{}, &.{}), 0);
+        try refs.append(gpa, off, emit.abs64Kind(), try emit.contentAtom(1, z, &.{}, &.{}), 0);
         std.mem.writeInt(u64, bytes[off + 8 ..][0..8], s.len, .little);
     }
     refs.sort();

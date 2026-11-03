@@ -9,6 +9,7 @@ const Ir = @import("Ir.zig");
 const Emit = @import("Emit.zig");
 const Incremental = @import("Incremental.zig");
 const Builtin = @import("Builtin.zig");
+const InternPool = @import("InternPool.zig");
 
 pub const zig_version = "0.17.0";
 
@@ -84,17 +85,17 @@ pub fn main(init: std.process.Init) !void {
 
     const opts = try parseOptions(arena, command, args[2..]);
     const zig_lib_dir = opts.zig_lib_dir orelse init.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir;
-    // Only the x86_64-linux backend exists so far; refuse aarch64-macos
-    // rather than silently writing an x86_64 ELF.
-    const native_ok = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
-    const target = opts.target orelse "native";
-    if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none") or
-        (std.mem.eql(u8, target, "native") and native_ok))
-    {} else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none") or
-        std.mem.eql(u8, target, "native"))
-    {
-        fatal("target '{s}': aarch64-macos code generation is not implemented yet; pass -target x86_64-linux", .{target});
-    } else fatal("unsupported target '{s}'; zap supports x86_64-linux and aarch64-macos", .{target});
+    const native: InternPool.Target = if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) .aarch64_macos else .x86_64_linux;
+    const target_name = opts.target orelse "native";
+    const target: InternPool.Target = if (std.mem.eql(u8, target_name, "native"))
+        native
+    else if (std.mem.eql(u8, target_name, "x86_64-linux") or std.mem.eql(u8, target_name, "x86_64-linux-none"))
+        .x86_64_linux
+    else if (std.mem.eql(u8, target_name, "aarch64-macos") or std.mem.eql(u8, target_name, "aarch64-macos-none"))
+        .aarch64_macos
+    else
+        fatal("unsupported target '{s}'; zap supports x86_64-linux and aarch64-macos", .{target_name});
+    if (target == .aarch64_macos and command == .build_obj) fatal("build-obj for aarch64-macos is not supported yet", .{});
 
     const cache_dirs = Frontend.resolveCacheDirs(arena, init.io, init.environ_map, .{
         .local = opts.cache_dir,
@@ -105,6 +106,7 @@ pub fn main(init: std.process.Init) !void {
     const builtin_dir = try Builtin.writeToCache(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), .{
         .output_mode = if (command == .build_obj) .Obj else .Exe,
         .is_test = is_test,
+        .target = target,
     });
     // The on-disk cache: a build whose inputs did not change relinks the
     // last build's Atoms and skips everything else.
@@ -128,10 +130,12 @@ pub fn main(init: std.process.Init) !void {
     if (run_test or (command == .run and opts.emit_bin == .default)) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
     // build-obj does not use the cache yet: a relink would also need the
     // object's exports and imports in the manifest.
-    const use_cache = out_path != null and !opts.dump_ir and command != .build_obj and
+    // aarch64-macos does not use the cache yet: its relink would need the
+    // Mach-O linker's inputs in the manifest.
+    const use_cache = out_path != null and !opts.dump_ir and command != .build_obj and target == .x86_64_linux and
         !std.mem.eql(u8, init.environ_map.get("ZAP_CACHE") orelse "", "off");
     // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
-    var inc: ?Incremental = if (use_cache) Incremental.open(init.gpa, init.io, cache_dirs, compile_args, zig_lib_dir, "x86_64-linux", init.environ_map.get("ZAP_CACHE_TIMING") != null) catch |err| switch (err) {
+    var inc: ?Incremental = if (use_cache) Incremental.open(init.gpa, init.io, cache_dirs, compile_args, zig_lib_dir, target.name(), init.environ_map.get("ZAP_CACHE_TIMING") != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => no_cache: {
             std.log.warn("unable to use the cache: {t}", .{err});
@@ -190,6 +194,7 @@ pub fn main(init: std.process.Init) !void {
 
     var zcu: Zcu = try .init(init.gpa, init.io, &fe);
     defer zcu.deinit();
+    zcu.ip.target = target;
     zcu.is_test = is_test;
     zcu.test_filters = opts.test_filters;
     // `ZAP_COMPTIME_EVAL=n`: lower a function for the comptime evaluator

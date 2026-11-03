@@ -115,7 +115,9 @@ pub fn floatBits(ip: *const InternPool, ty: Index) u16 {
         .f16 => 16,
         .f32 => 32,
         .f64 => 64,
-        .f80, .c_longdouble => 80,
+        .f80 => 80,
+        // `long double` is `double` on aarch64-macos.
+        .c_longdouble => if (ip.target == .aarch64_macos) 64 else 80,
         .f128, .comptime_float => 128,
         else => unreachable,
     };
@@ -320,7 +322,8 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
             .f16 => 2,
             .f32 => 4,
             .f64 => 8,
-            .f80, .c_longdouble => 16,
+            .f80 => 16,
+            .c_longdouble => if (ip.target == .aarch64_macos) 8 else 16,
             .f128 => 16,
             else => unreachable,
         },

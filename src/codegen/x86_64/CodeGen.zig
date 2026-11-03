@@ -2985,7 +2985,7 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
             } else {
                 const t = try ptrTarget(emit, val);
                 @memset(out[0..8], 0);
-                try relocs.append(gpa, base_off, .x86_64_abs64, t.key, t.off);
+                try relocs.append(gpa, base_off, emit.abs64Kind(), t.key, t.off);
             }
         },
         .slice => |s| {

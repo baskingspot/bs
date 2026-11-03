@@ -4520,12 +4520,20 @@ fn analyzeBitOp(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand
     }, result_ty, operand);
 }
 
+/// The tag of `std.lang.CallingConvention` that `.c` is on the target.
+fn cCallingConventionName(sema: *Sema) []const u8 {
+    return switch (sema.ip.target) {
+        .x86_64_linux => "x86_64_sysv",
+        .aarch64_macos => "aarch64_aapcs_darwin",
+    };
+}
+
 /// zap's calling convention as a `std.lang.CallingConvention` value.
 fn stdCallingConvention(sema: *Sema, block: *Block, src: Src, cc_ty: Index, cc: InternPool.CallingConvention) CompileError!Index {
     const ip = sema.ip;
     const name = switch (cc) {
         .auto => "auto",
-        .c => "x86_64_sysv",
+        .c => sema.cCallingConventionName(),
         .naked => "naked",
         .@"inline" => "inline",
     };
@@ -5888,7 +5896,7 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
         .auto
     else if (std.mem.eql(u8, name, "inline"))
         .@"inline"
-    else if (std.mem.eql(u8, name, "x86_64_sysv"))
+    else if (std.mem.eql(u8, name, sema.cCallingConventionName()))
         .c
     else
         return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{name});
@@ -6671,8 +6679,8 @@ fn naturalAlignment(sema: *Sema, ty: Index) ?u64 {
     if (!sema.layoutResolved(ty)) return null;
     return switch (Type.class(ip, ty)) {
         .@"opaque" => null,
-        // x86_64's minimum function alignment, as upstream.
-        .@"fn" => 1,
+        // The target's minimum function alignment, as upstream.
+        .@"fn" => if (ip.target == .aarch64_macos) 4 else 1,
         // Zero-bit types too, as upstream: `*u0` and `*align(1) u0` match.
         else => Type.abiAlignment(ip, ty),
     };
@@ -11255,13 +11263,13 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
         }
     }
     // `std.builtin.CallingConvention` by its tag, as zap's `fn` types know
-    // them (`.c` is `.x86_64_sysv`).
+    // them (`.c` is the target's C convention, `cCallingConventionName`).
     const cc_val = try sema.structFieldValue(attrs, "callconv");
     const cc: InternPool.CallingConvention = switch (ip.indexToKey(cc_val)) {
         .calling_convention => |c| c,
         .un => |u| blk: {
             const tag = sema.enumTagName(u.tag).?;
-            break :blk if (std.mem.eql(u8, tag, "auto")) .auto else if (std.mem.eql(u8, tag, "x86_64_sysv")) .c else if (std.mem.eql(u8, tag, "naked")) .naked else if (std.mem.eql(u8, tag, "inline")) .@"inline" else return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{tag});
+            break :blk if (std.mem.eql(u8, tag, "auto")) .auto else if (std.mem.eql(u8, tag, sema.cCallingConventionName())) .c else if (std.mem.eql(u8, tag, "naked")) .naked else if (std.mem.eql(u8, tag, "inline")) .@"inline" else return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{tag});
         },
         else => unreachable,
     };
@@ -11565,7 +11573,12 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
             .child = field_ty,
             .flags = .{ .is_const = p.flags.is_const, .is_volatile = p.flags.is_volatile, .alignment = alignment },
             .packed_offset = .{
-                .host_size = if (p.packed_offset.host_size != 0) p.packed_offset.host_size else @intCast(Type.abiSize(ip, p.child)),
+                // As upstream's `fieldPtrType`, by backend: LLVM (aarch64-macos)
+                // hosts the bytes the bits need, the x86_64 backend the struct.
+                .host_size = if (p.packed_offset.host_size != 0) p.packed_offset.host_size else switch (ip.target) {
+                    .x86_64_linux => @intCast(Type.abiSize(ip, p.child)),
+                    .aarch64_macos => @intCast((@as(u32, Type.packedBits(ip, p.child).?) + 7) / 8),
+                },
                 .bit_offset = bit_offset,
             },
         });
