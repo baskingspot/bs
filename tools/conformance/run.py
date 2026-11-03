@@ -18,7 +18,7 @@ upstream's own test step reports (for example "behavior.basic.test.truncate"),
 which is what the compiler puts in builtin.test_functions.
 
 The compiler builds each unit with the test runner given by --test-runner
-(default: test_runner.zig for upstream, bs_runner.zig for bs); results are parsed from the
+(default: test_runner.zig; bs_runner.zig for bs on x86_64-linux); results are parsed from the
 runner's "@bs-test" line protocol, documented in test_runner.zig, so any
 runner that speaks it works. A crash or timeout marks the running test and
 the binary is rerun with --start=<next index> to run the rest.
@@ -246,6 +246,16 @@ def tail(text, limit=LOG_LIMIT):
 # ---------------------------------------------------------------- one unit
 
 
+def test_runner(args, cfg):
+    """The runner given with --test-runner, else test_runner.zig, except for
+    bs on x86_64-linux, which uses bs_runner.zig (its own `_start` and
+    system calls) until it compiles std.start there."""
+    if args.test_runner is not None:
+        return args.test_runner
+    bs_runner = not args.upstream and cfg["name"] == "x86_64-linux"
+    return HERE / ("bs_runner.zig" if bs_runner else "test_runner.zig")
+
+
 def compile_unit(compiler, unit, cfg, args, workdir, env=None):
     bin_path = workdir / "bin" / cfg["name"] / (unit[: -len(".zig")] + ".test")
     bin_path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,7 +272,7 @@ def compile_unit(compiler, unit, cfg, args, workdir, env=None):
         ),
     ]
     if not args.default_runner:
-        argv += ["--test-runner", str(args.test_runner)]
+        argv += ["--test-runner", str(test_runner(args, cfg))]
     argv += ["-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}"]
     for f in unit_filters(unit):
         argv += ["--test-filter", f]
@@ -705,7 +715,7 @@ def full_run(zig, cfg, args, workdir):
         "test",
         str(UPSTREAM_TEST / "behavior.zig"),
         "--test-runner",
-        str(args.test_runner),
+        str(test_runner(args, cfg)),
         "-target",
         cfg["zig_target"],
         "--test-no-exec",
@@ -841,7 +851,7 @@ def bs_target(bs, cfg, args, workdir):
         "target": cfg["name"],
         "zig_target": cfg["zig_target"],
         "compiler": str(bs),
-        "test_runner": "default" if args.default_runner else str(args.test_runner),
+        "test_runner": "default" if args.default_runner else str(test_runner(args, cfg)),
         "backend": backend,
         "baseline": {"compiler": baseline["compiler"], "backend": baseline["backend"]},
         "summary": {
@@ -1224,7 +1234,7 @@ def main():
     p.add_argument(
         "--test-runner",
         type=Path,
-        help="test runner passed to the compiler (default: test_runner.zig for --upstream, bs_runner.zig for bs until bs compiles test_runner.zig)",
+        help="test runner passed to the compiler (default: test_runner.zig, except bs_runner.zig for bs on x86_64-linux until bs compiles test_runner.zig there)",
     )
     p.add_argument(
         "--default-runner",
@@ -1266,9 +1276,8 @@ def main():
     p.add_argument("-v", "--verbose", action="store_true", help="print each file's result to stderr")
     args = p.parse_args()
 
-    if args.test_runner is None:
-        args.test_runner = HERE / ("test_runner.zig" if args.upstream else "bs_runner.zig")
-    args.test_runner = args.test_runner.resolve()
+    if args.test_runner is not None:
+        args.test_runner = args.test_runner.resolve()
     args.workdir = args.workdir.resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
     targets = args.target or list(TARGETS)
