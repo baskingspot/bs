@@ -43,6 +43,10 @@ live: std.MultiArrayList(Live) = .empty,
 /// Frame-slot sharing, filled as the architecture emits values in layout
 /// order (see `takeSlot`).
 slots: Slots = .{},
+/// Clobber points in `liveness`: per position, how many lie at or before
+/// it in blocks that continue, and in blocks that do not (`ret`,
+/// `unreachable`, a noreturn call).
+clobbers: std.ArrayList([2]u32) = .empty,
 
 pub const no_loop = std.math.maxInt(u32);
 
@@ -67,6 +71,9 @@ pub const Live = struct {
     /// operand's last use is the value's definition, because the lowering
     /// reads the other operands before writing the result over it.
     tie: u32,
+    /// A clobber point (`liveness`) lies inside the interval, where the
+    /// value is still needed afterwards.
+    crosses: bool,
 };
 
 pub const no_tie = std.math.maxInt(u32);
@@ -136,6 +143,7 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.live.deinit(gpa);
     for (&f.slots.free) |*l| l.deinit(gpa);
     f.slots.active.deinit(gpa);
+    f.clobbers.deinit(gpa);
 }
 
 pub fn blockInsts(f: *const Func, block: Block.Index) []const Inst.Index {
@@ -167,20 +175,49 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
 /// the condition of its own block's `branch` is read at the terminator:
 /// the architecture may fuse it into the branch, so its operands live until
 /// there.
-pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
+///
+/// `ctx.clobbers(inst)` and `ctx.termClobbers(block)` say which values
+/// and terminators may overwrite the registers that do not survive a
+/// call; a clobbering value writes its own result last. A value crosses a
+/// clobber point that lies after its definition and at or before its last
+/// use, except one in a block that does not continue, which matters only
+/// to the uses in that block after it.
+pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.Error!void {
     try f.live.resize(gpa, ir.instructions.len);
     const s = f.live.slice();
     @memset(s.items(.uses), 0);
     @memset(s.items(.reg), no_reg);
+    @memset(s.items(.crosses), false);
+    // Prefix counts of the clobber points by position.
+    try f.clobbers.resize(gpa, 2 * f.values.len + 3);
+    const cl = f.clobbers.items;
+    {
+        var counts: [2]u32 = .{ 0, 0 };
+        cl[0] = counts;
+        cl[1] = counts;
+        for (f.layout.items) |block| {
+            const b = f.blocks.items[@backingInt(block)];
+            const k: usize = @intFromBool(deadEnd(b.term.tag));
+            for (b.start..b.start + b.len) |i| {
+                if (ctx.clobbers(f.values.items(.inst)[i])) counts[k] += 1;
+                cl[2 * i + 2] = counts;
+                cl[2 * i + 3] = counts; // until the next value or terminator
+            }
+            if (ctx.termClobbers(block)) counts[k] += 1;
+            cl[2 * (b.start + b.len) + 1] = counts;
+            cl[2 * (b.start + b.len) + 2] = counts;
+        }
+    }
     for (&f.slots.free) |*l| l.clearRetainingCapacity();
     f.slots.active.clearRetainingCapacity();
-    var w: LiveWalk = .{ .uses = s.items(.uses), .def = s.items(.def), .end = s.items(.end), .loops = f.loops.items, .loop = no_loop, .pos = 0 };
+    var w: LiveWalk = .{ .uses = s.items(.uses), .def = s.items(.def), .end = s.items(.end), .crosses = s.items(.crosses), .clobbers = cl, .loops = f.loops.items, .loop = no_loop, .pos = 0, .dead_start = null };
     const insts = f.values.items(.inst);
     const datas = ir.instructions.items(.data);
     const tags = ir.instructions.items(.tag);
     for (f.layout.items) |block| {
         const b = f.blocks.items[@backingInt(block)];
         w.loop = f.block_loop.items[@backingInt(block)];
+        w.dead_start = if (deadEnd(b.term.tag)) 2 * b.start + 1 else null;
         const term_pos = 2 * (b.start + b.len) + 1;
         const term_data = datas[@backingInt(b.term.inst)];
         const cond: ?Inst.Index = if (b.term.tag == .branch) term_data.pl_op.operand.toIndex() else null;
@@ -205,21 +242,45 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
             .fallthrough, .noreturn, .unreach => {},
         }
     }
+    for (f.values.items(.inst)) |inst| {
+        const i = @backingInt(inst);
+        if (cl[w.end[i]][0] != cl[w.def[i]][0]) w.crosses[i] = true;
+    }
+}
+
+/// Whether a block with this terminator ends the function's execution.
+fn deadEnd(tag: Term.Tag) bool {
+    return switch (tag) {
+        .ret, .unreach, .noreturn => true,
+        else => false,
+    };
+}
+
+pub fn valuePos(i: usize) u32 {
+    return @intCast(2 * i + 2);
 }
 
 const LiveWalk = struct {
     uses: []u32,
     def: []u32,
     end: []u32,
+    crosses: []bool,
+    clobbers: []const [2]u32,
     loops: []const Loop,
     /// The innermost loop around the current block, and the position of
     /// the current use.
     loop: u32,
     pos: u32,
+    /// In a block that does not continue: the position before its first
+    /// value.
+    dead_start: ?u32,
 
     fn use(w: *LiveWalk, ref: Inst.Ref) void {
         const inst = @backingInt(ref.toIndex() orelse return);
         w.uses[inst] += 1;
+        if (w.dead_start) |start| {
+            if (w.clobbers[w.pos][1] != w.clobbers[@max(start, w.def[inst])][1]) w.crosses[inst] = true;
+        }
         // Live through the end of every loop around the use that does not
         // contain the definition.
         const d = w.def[inst];
@@ -304,17 +365,21 @@ pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 
 /// Linear-scan register allocation (Poletto and Sarkar) over the values
 /// `liveness` gave intervals and the architecture marked `want_reg`, with
-/// `n` registers, in order of definition. When none is free, the value
-/// whose interval ends last is kept in memory for its whole life. Values
-/// stay in their register through their last use, so a result shares a
-/// register only with its tied operand. Returns the mask of registers used.
-pub fn allocate(f: *Func, n: u8) u32 {
+/// `n` registers, in order of definition. Only the registers in `survives`
+/// may hold a value that crosses a clobber point; a value that crosses
+/// none prefers the others. When none is free, the value whose interval
+/// ends last among those holding a register it could use is kept in memory
+/// for its whole life. Values stay in their register through their last
+/// use, so a result shares a register only with its tied operand. Returns
+/// the mask of registers used.
+pub fn allocate(f: *Func, n: u8, survives: u32) u32 {
     assert(n <= max_regs);
     const s = f.live.slice();
     const reg = s.items(.reg);
     const def = s.items(.def);
     const end = s.items(.end);
     const tie = s.items(.tie);
+    const crosses = s.items(.crosses);
     var active: [max_regs]u32 = undefined;
     var active_len: u8 = 0;
     var free: u32 = (@as(u32, 1) << @intCast(n)) - 1;
@@ -331,32 +396,38 @@ pub fn allocate(f: *Func, n: u8) u32 {
                 active[j] = active[active_len];
             } else j += 1;
         }
+        const usable: u32 = if (crosses[inst]) survives else ~@as(u32, 0);
         const t = tie[inst];
-        if (t != no_tie and end[t] == def[inst] and reg[t] < n) {
+        if (t != no_tie and end[t] == def[inst] and reg[t] < n and usable >> @intCast(reg[t]) & 1 != 0) {
             // Take over the tied operand's register, which dies here.
             const k = std.mem.indexOfScalar(u32, active[0..active_len], t).?;
             reg[inst] = reg[t];
             active[k] = inst;
             continue;
         }
-        if (free != 0) {
-            const r: u8 = @intCast(@ctz(free));
-            free &= free - 1;
+        if (free & usable != 0) {
+            const pick = if (free & ~survives != 0 and !crosses[inst]) free & ~survives else free & usable;
+            const r: u8 = @intCast(@ctz(pick));
+            free &= ~(@as(u32, 1) << @intCast(r));
             used |= @as(u32, 1) << @intCast(r);
             reg[inst] = r;
             active[active_len] = inst;
             active_len += 1;
             continue;
         }
-        var last: u8 = 0;
+        var last: ?u8 = null;
         for (active[0..active_len], 0..) |a, k| {
-            if (end[a] > end[active[last]]) last = @intCast(k);
+            if (usable >> @intCast(reg[a]) & 1 == 0) continue;
+            if (last == null or end[a] > end[active[last.?]]) last = @intCast(k);
         }
-        const victim = active[last];
+        const victim = if (last) |l| active[l] else {
+            reg[inst] = no_reg;
+            continue;
+        };
         if (end[victim] > end[inst]) {
             reg[inst] = reg[victim];
             reg[victim] = no_reg;
-            active[last] = inst;
+            active[last.?] = inst;
         } else reg[inst] = no_reg;
     }
     return used;

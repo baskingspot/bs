@@ -1,14 +1,13 @@
 //! Code generation for x86_64: one function's IR to one Atom. The IR is
 //! first built into the shared SSA form (`../Ssa.zig`), whose blocks this
-//! file emits in layout order. Every value still lowers through the
-//! per-instruction code (step 1 of docs/architecture.md, "Optimizing
-//! backend"): every IR value with runtime bits lives in a stack slot, and
-//! each instruction loads its operands into scratch registers, computes,
-//! and stores its result. No value stays in a register across
-//! instructions.
+//! file emits in layout order. Values still lower through per-instruction
+//! code, but scalar values get registers from linear scan and the rest
+//! share stack slots by lifetime (step 2 of docs/architecture.md,
+//! "Optimizing backend"; see "Registers" below).
 //!
-//! Frame: `push rbp; mov rbp, rsp; sub rsp, N`. Slots are at negative
-//! offsets from rbp; outgoing call arguments are at the bottom of the frame
+//! Frame: `push rbp; mov rbp, rsp`, the callee-saved registers the function
+//! uses, `sub rsp, N`. Slots are at negative offsets from rbp, below the
+//! saved registers; outgoing call arguments are at the bottom of the frame
 //! (positive offsets from rsp).
 //!
 //! Calling conventions:
@@ -626,16 +625,52 @@ fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 // register get one from linear scan (`Ssa.allocate`); the rest, and those
 // it spills, live in slots as before. Every lowering, including the
 // per-instruction code, uses only caller-saved registers as scratch, and
-// calls preserve the callee-saved ones, so the allocator hands out only
-// callee-saved registers: a value keeps its register across instructions
-// and calls without constraints. The prologue saves the ones the function
-// uses. A register holds its value extended to 64 bits, as `load` leaves
-// it. Inline assembly names registers itself, so a function containing
-// some keeps every value in memory.
+// calls preserve the callee-saved ones, so a callee-saved register holds a
+// value across instructions and calls without constraints; the prologue
+// saves the ones the function uses. The scalar lowerings use only rax,
+// rcx, rdx, r10, and r11, so rsi, rdi, r8, and r9 also hold values whose
+// intervals contain no instruction that may write them (`clobbers`).
+// A register holds its value extended to 64 bits, as `load` leaves it.
+// Inline assembly names registers itself, so a function containing some
+// keeps every value in memory.
 
-/// The registers the allocator hands out, in the order the prologue saves
-/// them.
-const alloc_regs = [_]Reg{ .rbx, .r12, .r13, .r14, .r15 };
+/// The registers the allocator hands out: the callee-saved ones, in the
+/// order the prologue saves them, then the caller-saved ones no lowering
+/// uses as scratch except the clobbering ones (`clobbers`).
+const alloc_regs = [_]Reg{ .rbx, .r12, .r13, .r14, .r15, .rsi, .rdi, .r8, .r9 };
+const callee_saved: u32 = 0b11111;
+
+/// Whether value `inst`'s lowering may write rsi, rdi, r8, or r9 (for
+/// `Ssa.liveness`). The scalar lowerings use only rax, rcx, rdx, r10,
+/// and r11; calls, string instructions, and the C ABI use the others.
+pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
+    const ir = cg.ir;
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .arg, .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .block, .loop, .breakpoint => false,
+        .ret_addr, .frame_addr, .extern_ptr, .tls_ptr, .err_return_trace, .save_err_return_trace_index, .set_err_return_trace => false,
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow => !cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)),
+        .store => !cg.passInRegs(cg.typeOf(data.bin_op.rhs)),
+        .call, .atomic_rmw => true,
+        else => !cg.wantsReg(inst),
+    };
+}
+
+/// Whether block `block`'s terminator may write rsi, rdi, r8, or r9: a
+/// `br` copying a large result, a switch on a wide integer, or a return
+/// through memory.
+pub fn termClobbers(cg: *CodeGen, block: Ssa.Block.Index) bool {
+    const ir = cg.ir;
+    const term = cg.ssa.blocks.items[@backingInt(block)].term;
+    const data = ir.instructions.items(.data)[@backingInt(term.inst)];
+    return switch (term.tag) {
+        .jump => ir.instructions.items(.tag)[@backingInt(term.inst)] == .br and
+            Type.abiSize(cg.ip, ir.typeOfIndex(data.br.block_inst, cg.ip)) > 128,
+        .switch_br => cg.isWideInt(cg.typeOf(data.pl_op.operand)),
+        .ret => !cg.inGpr(cg.fn_ty.return_type),
+        .branch, .fallthrough, .noreturn, .unreach => false,
+    };
+}
 
 fn planRegisters(cg: *CodeGen) Error!void {
     if (cg.fn_ty.cc == .naked) return;
@@ -643,7 +678,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
     const ir = cg.ir;
     const tags = ir.instructions.items(.tag);
     const insts = f.values.items(.inst);
-    try f.liveness(cg.gpa, ir);
+    try f.liveness(cg.gpa, ir, cg);
     cg.live = true;
     for (insts) |inst| if (tags[@backingInt(inst)] == .assembly) return;
     const live = f.live.slice();
@@ -692,7 +727,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
             }
         }
     }
-    cg.saved = f.allocate(alloc_regs.len);
+    cg.saved = f.allocate(alloc_regs.len, callee_saved) & callee_saved;
     for (insts) |inst| {
         const r = reg[@backingInt(inst)];
         if (r != Ssa.no_reg) cg.homes[@backingInt(inst)] = .{ .reg = alloc_regs[r] };
