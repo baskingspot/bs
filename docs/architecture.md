@@ -4933,6 +4933,302 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   byte-vector compares change (`cmpBytes`: `mem.indexOfScalar` and
   `mem.eql` over 4 KiB run 2.7x faster).
 
+## C interop (milestone 9; designed 2026-11-03, for review)
+
+Goal, in order: `-lc` (dynamically linked executables against glibc on
+x86_64-linux, `builtin.link_libc` on both targets, std's tests with `-lc`
+as a conformance number); C headers translated to Zig; C sources, objects
+and archives. Programs that use none of them must not get slower to
+compile.
+
+### What upstream 0.17.0 does (checked on the orb, 2026-11-03)
+
+- **`@cImport` no longer exists.** 0.17.0's AstGen has no `c_import`,
+  and `const c = @cImport(@cInclude("stdio.h"));` fails with `error:
+  invalid builtin function: '@cImport'`. Headers become Zig through `zig
+  translate-c` (Aro, `lib/compiler/translate-c`), which `b.addTranslateC`
+  runs as `zig translate-c <flags> <file.h> --listen=-`: the step's output
+  is `<local cache>/o/<digest>/<name>.zig`, and the compile steps that use
+  it import it as an ordinary module (`-M<name>=<that path>`). So the
+  second goal is `zap translate-c`, not a Sema feature: Sema does not
+  change, and zap keeps its migration hint for `@cImport`. Upstream builds
+  translate-c with LLVM in ReleaseFast the first time it runs (53 s on
+  the orb); zap builds it in Debug in 1.35 s (corpus, cold local cache).
+- **`-lc`, native target** (no `-target`; `--verbose-link`): upstream asks
+  the system C compiler (`LibCInstallation.findNative`, which runs `cc`)
+  and links the system's `crt1.o crti.o crtbegin.o crtend.o crtn.o`,
+  `libm.so`, `libc.so` (a linker script: `libc.so.6`, `libc_nonshared.a`,
+  `ld-linux-x86-64.so.2`) and the empty `libpthread.a libdl.a librt.a
+  libutil.a`, with C headers from `/usr/include`. Without a system C
+  compiler it falls back to the next case.
+- **`-lc -target x86_64-linux-gnu[.version]`** (and native without `cc`):
+  upstream provides glibc itself. It compiles `crt1.o` and
+  `libc_nonshared.a` from glibc sources bundled in `lib/libc/glibc` with
+  Clang, generates stub `libc.so.6`, `libm.so.6`, `libpthread.so.0`,
+  `libdl.so.2`, `librt.so.1`, `libutil.so.1`, `libresolv.so.2` and
+  `ld-linux-x86-64.so.2` from `lib/libc/glibc/abilists` (every exported
+  symbol of every glibc version, with its library, kind, size and symbol
+  versions), and takes headers from `lib/libc/include`
+  (`std.zig.LibCDirs.detectFromBuilding`). No crti/crtn/crtbegin/crtend.
+  Its crt1.o for glibc 2.31 defines `_start` (calling
+  `__libc_start_main(main, argc, argv, __libc_csu_init, __libc_csu_fini,
+  rtld_fini, stack_end)`), `_IO_stdin_used`, `__data_start`; its
+  libc_nonshared.a has `atexit`, `at_quick_exit`, `__pthread_atfork`,
+  `__stack_chk_fail_local`, the stat and mknod wrappers of glibc ≤ 2.32,
+  and `__libc_csu_init`/`__libc_csu_fini` (glibc ≤ 2.33).
+- **The output** in both cases: ET_EXEC, not PIE, base 16 MiB, PT_INTERP
+  `/lib64/ld-linux-x86-64.so.2`, DT_NEEDED for libc and ld-linux (and
+  libm with the system's files, libpthread with the bundled 2.31 stubs
+  for a hello world), `.gnu.version` and
+  `.gnu.version_r` (each import bound to the version it had in the
+  target's glibc: `GLIBC_2.2.5`, `GLIBC_2.34`, ...), BIND_NOW.
+- **`builtin`** for `-lc` on glibc (`--show-builtin`): `link_mode =
+  .dynamic`, `abi = .gnu`, the target's glibc version (native: the
+  system's, 2.36 on the orb; `x86_64-linux-gnu`: 2.31), `dynamic_linker =
+  "/lib64/ld-linux-x86-64.so.2"`, `link_libc = true`, and
+  `position_independent_code = true` (upstream's `requiresPic`: linking
+  glibc), `position_independent_executable = false`. Without `-lc` the
+  native target's `abi` is `.gnu` too and `link_mode` static.
+  `-target x86_64-linux -lc` is static musl (the default ABI of
+  `x86_64-linux` is musl) and `x86_64-linux-none -lc` fails ("unable to
+  provide libc"). On aarch64-macos `link_libc` is always true (Darwin
+  requires libc), which the aarch64-codegen branch's builtin already says.
+- **C in Debug**: upstream runs `zig clang` per C source with
+  `-fsanitize=undefined` (recoverable, so it links its Zig `ubsan_rt`),
+  `-O0 -fno-omit-frame-pointer -mred-zone -fno-stack-protector -fPIC
+  -fno-PIE -gdwarf-4 -fasynchronous-unwind-tables`, the target and CPU
+  features, `-nostdinc` and `-isystem` for the libc headers,
+  `-D__GLIBC_MINOR__=N`, and `-MD -MV -MF <depfile>`, whose header list
+  goes into its cache manifest (`man.addDiscoveredDepFile`). translate-c
+  gets the same include and target flags (`addCommonCCArgs(.aro)`) and the
+  same depfile.
+
+### Decision 1: where crt1.o, libc_nonshared.a and libc.so come from
+
+Options:
+
+1. *The system* (upstream's native default): find the files with `cc`,
+   read `crt*.o` and `libc_nonshared.a` as relocatable objects, parse the
+   `libc.so` linker script, and read `libc.so.6`'s `.dynsym` and version
+   definitions. Needs a C compiler and libc6-dev on the host (and option 3
+   anyway as the fallback upstream has), and an ELF object, archive and
+   linker-script reader in step 1.
+2. *Upstream zig*: have upstream produce its crt1.o, libc_nonshared.a and
+   stubs (there is no command for it; scraping `--verbose-link` of a dummy
+   build). Needs upstream zig for every `-lc` program, even pure Zig ones,
+   and a full upstream compile the first time.
+3. *zap, from the zig lib directory* (recommended): what upstream does for
+   `-target x86_64-linux-gnu`, without Clang:
+   - **No libc.so.** The linker resolves imports against `abilists` (the
+     data upstream generates its stubs from; the parser is upstream's
+     `src/libs/glibc.zig`, copied with its notice): a name neither the
+     compilation nor compiler_rt exports is looked up in the target's
+     glibc version, giving its library and the newest symbol version at
+     or below the target's (upstream's `-lc` executables keep compiler_rt's
+     `fmod` too). The library gets a DT_NEEDED (libc.so.6 always, others
+     when used) and the import its `.gnu.version_r` entry. Strong names in
+     none of them are undefined, as today.
+   - **No crt1.o, crti.o, crtn.o.** zap's own glibc start file, Zig with
+     inline assembly in std.start's style (`.cfi_undefined %rip`, `%[x:P]`
+     symbol operands), generated like `builtin.zig` and added as an
+     analysis root when linking glibc: it exports `_start`, which does what
+     glibc's `sysdeps/x86_64/start.S` does (clear rbp, argc, argv, align the
+     stack, `__libc_start_main(main, argc, argv, init, fini, rtld_fini =
+     rdx, stack_end)`, hlt), and `_IO_stdin_used`. For glibc ≥ 2.34, init
+     and fini are null, as glibc's own crt1.o passes; for older targets
+     they are the file's `__libc_csu_init`/`__libc_csu_fini`, which run
+     the preinit, init and fini arrays as libc_nonshared.a's did. std's
+     start code then exports `main`, as upstream.
+   - **libc_nonshared.a** members are Zig functions in a second file,
+     resolved by name only when something references them (the
+     compiler_rt mechanism, `Zcu.requestCompilerRtKey`): `atexit` and
+     `at_quick_exit` (calling `__cxa_atexit`/`__cxa_at_quick_exit` with
+     `__dso_handle`, which the file defines hidden), `__pthread_atfork`,
+     `__stack_chk_fail_local`, and the stat/mknod wrappers for glibc ≤
+     2.32. std references none of them; C objects may.
+   - **Headers** for translate-c and C sources: `lib/libc/include` for the
+     target (`std.zig.LibCDirs.detectFromBuilding`, which zap calls as it
+     is) and `-D__GLIBC_MINOR__=N`, as upstream's bundled glibc. System
+     headers of other libraries still come from the native include and
+     library paths (`std.zig.system.NativePaths.detect`, as upstream does
+     when a step links system libraries).
+   - **glibc version**: `-target x86_64-linux-gnu.2.28` says it; for the
+     native target, upstream's detection (`std.zig.system`, which reads
+     the system's `libc.so.6`). It is part of the compilation key.
+
+   Native `-lc` then builds what upstream builds for
+   `-target x86_64-linux-gnu.<the system's version>`: the same libraries,
+   symbols and versions at run time; crt code and headers from the zig
+   lib directory instead of `/usr`. It needs no C compiler and no files
+   from the system, cross-compiles from macOS, and step 1 needs no object
+   reader. The cost: zap owns about a hundred lines of start code, and
+   musl stays `[unsupported]`. If the owner prefers option 1, step 1
+   grows by the object, archive, script and shared-object readers that
+   step 3 needs anyway, and option 3 remains its fallback.
+
+**`builtin`** follows upstream's text for the target (`abi`, `link_mode`,
+glibc version, `dynamic_linker`, `link_libc`,
+`position_independent_code = true`). zap's code stays executable code
+(local-exec thread-locals, absolute addresses), as it is for
+`build-exe -fPIE`: the output is a non-PIE executable, where that changes
+nothing a program means. `-lc` on aarch64-macos changes nothing (libSystem
+is always linked); `-target x86_64-linux[-musl] -lc` and
+`x86_64-linux-none -lc` are `[unsupported]`, naming
+`-target x86_64-linux-gnu`.
+
+**The link** (`Elf.Options.dynamic` with an executable kind, on the `pic`
+branch's `ElfDynamic`): ET_EXEC at 16 MiB as upstream; PT_PHDR, PT_INTERP,
+the three PT_LOADs, PT_DYNAMIC, PT_TLS, PT_GNU_RELRO, PT_GNU_EH_FRAME,
+PT_GNU_STACK. Zig code reaches every extern through an 8-byte slot
+(`Emit.lowerExternSlots`), so an import needs only a `R_X86_64_GLOB_DAT`
+on its slot: no PLT, no copy relocations. Slots, and any `.rodata` atom
+with an absolute relocation to an import, go to `.data.rel.ro` under
+RELRO, the `pic` branch's rule. `.dynsym` holds the imports (versioned
+through `.gnu.version`, `.gnu.version_r` per library) and no exports
+(upstream exports none without `-rdynamic`); `.dynamic` gets DT_NEEDED,
+DT_VERSYM, DT_VERNEED(NUM), DT_FLAGS BIND_NOW, DT_FLAGS_1 NOW, and the
+tables `ElfDynamic` writes for shared objects, as upstream's executable
+has (no DT_INIT/DT_FINI without crti/crtn).
+The executable's own thread-locals stay local-exec, in the static TLS
+block the loader sets up; std's start code no longer sets up TLS itself
+(it does not run `_start`). The relocation loop keeps its comptime flag,
+so static links compile as before.
+
+### Decision 2: how translated files and headers enter the cache
+
+- **The translate-c binary** is built by zap like the build runner:
+  `<zig lib>/compiler/translate-c/main.zig` with the `aro` module, Debug,
+  into `<global cache>/zap/o/<hash>/translate-c`, the hash taken from
+  zap's identity and the zig lib directory, compiled through zap's own
+  cache from a fixed directory, so every project shares it and a later
+  use costs a stat. It runs as a child, `--zig-integration` (errors come
+  back as an ErrorBundle on stdout), with upstream's arguments.
+- **A translation record** per translation, `<local cache>/zap/tc/<key>`
+  (small, one file; written through a temporary file and renamed). The
+  key hashes zap's store seed, the translate-c binary's identity, the
+  source path and the arguments that reach Aro (target, glibc version,
+  include directories, defines, flags, in order); file contents are not
+  in it. The record holds every file Aro read (the source and each header
+  from its `-MD` depfile) with its stat (inode, size, mtime, under the
+  frontend index's racy-mtime rule) and content hash, and the output's
+  content hash.
+- **The output** is `<local cache>/o/<key>/<name>.zig` and the digest
+  zap reports is the key, so it does not move when a header changes. The
+  compile step that imports it keeps its command line, hence its
+  compilation key, and builds an edit build of one changed file (upstream
+  reports a digest of the contents; its compile step then sees a new
+  path).
+- **A build of the step**: stat every recorded file; if all match, answer
+  with the digest and `cache_hit` without running translate-c. If stats
+  changed but contents did not, update the record and hit. Otherwise run
+  translate-c; if the output's bytes are unchanged, leave the file alone
+  (its stat stays, so the compile step's no-edit check holds), else
+  replace it atomically. `file_system_inputs` lists the source and every
+  header, so `--watch` and the runner see header edits.
+- **In the Zig compilation** the translated file is an ordinary input:
+  its ZIR is cached by content, its declarations have `src_hash`es, and a
+  header edit that changes one macro re-analyzes the declarations that
+  use it. Nothing new in the manifest, the store or the donor key: a
+  donor's translated module is matched by its file key (`<module>:` for a
+  root) and compared by content like any file.
+- **C objects** (step 3) use the same record shape (`<local cache>/zap/cc/
+  <key>` with the object next to it), keyed by the upstream zig binary's
+  identity instead of translate-c's. The compilation's manifest lists the
+  objects among its inputs (path and content hash), so a no-edit build
+  stats them like sources; how a relink reads their sections is the
+  linker's (step 3).
+- **For the cache thread** (it owns the formats): the manifest must keep
+  a dynamic executable's imports with their library and version, its
+  DT_NEEDED list and interpreter, so a relink without Sema writes the same
+  dynamic tables; the compilation key gains the glibc version (native:
+  detected, cached by the stat of the system's `libc.so.6`). The donor key
+  needs nothing: `-lc` changes `builtin.zig`, which replay checks like
+  any input, and import resolution happens at link time.
+
+### Decision 3: how `zap build` routes C
+
+- **Compile steps stay zap's.** A step whose command line has C sources
+  (`-cflags ... --`, `.c`, `.S`, `.s` files, modules without a Zig root),
+  objects or archives (`.o`, `.a`), or libraries (`-lc`, `-l<name>`) is
+  built by the same `zap build-*`: Zig through zap, each C source by
+  spawning upstream `zig clang` with the flags upstream's `addCCArgs`
+  builds (copied: the list above, for zap's target and baseline CPU), up
+  to the job count at once and while Sema runs, then one link by zap.
+  Debug C calls `__ubsan_handle_*`, which zap provides from upstream's
+  `lib/ubsan_rt.zig`, analyzed lazily as a module like compiler_rt.
+  Libraries of C only (libyaml, BearSSL, cmark-gfm) are `build-lib`
+  steps: zap compiles their sources and writes the archive with
+  `Archive.zig`, indexing the objects' global symbols.
+- **TranslateC steps** run `zap translate-c ... --listen=-`, served as
+  above. The CLI form prints the file to stdout, as upstream.
+- **`zap cc`, `zap c++`, `zap ar`, `zap ranlib`** (build scripts run them
+  as `b.graph.zig_exe`, which is zap under `zap build`) exec upstream
+  `zig` with the same arguments: they are Clang and LLVM tools, which zap
+  never runs itself. `objcopy` stays `[unsupported]` until needed.
+- **Finding upstream zig**: `ZAP_ZIG`, else `zig` on PATH, else
+  `~/.cache/zap/zig-<host>-0.17.0/zig`, accepted only if it reports
+  0.17.0 (checked once per binary, by stat, in the global cache). Without
+  one, a step with C fails with one `[unsupported]` diagnostic saying C
+  sources need upstream zig 0.17.0 and where zap looked. Pure Zig and
+  `-lc`-only programs never look.
+- **The config message** reports `link_libc` and `link_mode = .dynamic`
+  for such steps, as upstream.
+- **System libraries** (`-l<name>` other than glibc's) follow upstream's
+  search: `-L` directories and the native library paths, `lib<name>.so`
+  before `lib<name>.a`. Shared ones need a reader of `.dynsym` and version
+  definitions; static ones are archives of objects (step 3). C++
+  (`-lc++`, `.cpp` sources; upstream builds libc++ from source with
+  Clang) stays `[unsupported]` until an acceptance target needs it.
+
+### Linker split
+
+This thread builds step 1's link (dynamic executables on `ElfDynamic`:
+the executable kind, abilists imports with versions, PT_INTERP, DT_NEEDED,
+`.gnu.version*`) on top of the `pic` branch, with the link thread
+reviewing. The link thread takes, after its PIE work, the input side of
+step 3: ELF relocatable objects and archives as link inputs (their
+sections become atoms; their relocations, including GOTPCREL(X), PLT32
+and TLS models, against zap's and other objects' symbols; PLT stubs and
+copy relocations for C code that calls or reads imports directly;
+`.init_array`, COMDAT groups, mergeable strings, `.eh_frame`), and shared
+libraries as inputs. To be agreed with that thread.
+
+### Cost
+
+- Nothing runs unless the command line has `-lc`, C sources, objects or
+  libraries: the builtin text, the start file, abilists and the dynamic
+  link are all behind that, and the static relocation loop compiles as
+  before (comptime flag). Each step reports std's compile time against
+  main (`ZAP_CACHE=off zap test lib/std/std.zig --zig-lib-dir upstream/lib
+  --test-no-exec`, interleaved runs) and the compile time of `-lc`
+  programs against upstream (on the orb, upstream's native `-lc` hello:
+  4.3 s with an empty global cache, 0.38 s warm).
+- abilists is 247 KiB; parsing it for one target is a one-time cost per
+  build that links glibc, cached per (zig lib, version) in the global
+  cache as the resolved name table if it shows in profiles.
+
+### Steps and checks
+
+1. `-lc`: builtin, start file, abilists imports, dynamic executable link,
+   `run.py --std --libc` (std's tests built with `-lc -target
+   x86_64-linux-gnu`, upstream's test-matrix entry, against a new baseline
+   `baseline/std-x86_64-linux-gnu-libc.json`). Tests: a `-lc` program
+   calling libc functions and reading `environ` and `stdout`, under
+   `test/run`, compared with upstream.
+2. `zap translate-c` (CLI and `--listen=-`), the translate-c binary, the
+   translation records; a `b.addTranslateC` project under `zap build`,
+   including a header edit (one rebuild, no rebuild when unchanged).
+3. C sources through upstream `zig clang`, ubsan_rt, `.o`/`.a` inputs
+   (with the link thread), system libraries, C-only libraries,
+   forwarded `cc`/`ar`; the excluded corpus projects (http.zig, libxev,
+   zzz, zio, tokamak, zig-json, zigmod, Avalanche, zedis, supermd, buzz,
+   Ghostty's app) move into the corpus as they build.
+
+Each step's branch passes `zig build test test-upstream test-build`,
+conformance with `ZAP_CACHE_CHECK=1` (behavior `--edit-verify`, std, and
+from step 1 std with `-lc`), the std compile-time comparison with main,
+and `zig build -Dtarget=aarch64-macos`.
+
 ## `builtin` and conformance
 
 - zap generates the `builtin` module itself. It reports
