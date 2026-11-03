@@ -10472,7 +10472,12 @@ fn reinterpretLoad(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileErro
         const k = sema.ip.keyPayload(.ptr, ptr);
         if (k.byte_offset == 0 and k.base == .field) {
             const parent = (try sema.comptimeLoadOrNull(block, src, k.base.field.base)) orelse return null;
-            return try sema.fieldValue(parent, @intCast(k.base.field.index));
+            const v = try sema.fieldValue(parent, @intCast(k.base.field.index));
+            // The field viewed as a one-element array (`*T` to `*[1]T`).
+            if (sema.ip.keyTag(ty) == .array_type and sema.ip.keyPayload(.array_type, ty).len == 1 and
+                sema.ip.keyPayload(.array_type, ty).child == sema.ip.typeOf(v))
+                return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = &.{v} } } });
+            return v;
         }
         return sema.failUnsupported(block, src, "reinterpreting memory at comptime");
     };

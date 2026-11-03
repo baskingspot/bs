@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -59,6 +59,16 @@ fn lenField(args: anytype) usize {
 var global_opt: ?struct { x: u32, y: []const u8 } = null;
 var global_eu: error{Bad}!struct { x: u32 } = error.Bad;
 
+// zig-clap (clap.zig): a field seen as a one-element array (`*T` to
+// `*[1]T`) loads as the array at comptime.
+const Names = struct {
+    short: ?u8 = null,
+    fn longest(n: *const Names) []const u8 {
+        if (n.short) |*s| return @as(*const [1]u8, s);
+        return "";
+    }
+};
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -84,5 +94,12 @@ fn main() callconv(.c) noreturn {
     global_eu = .{ .x = 1 };
     rt.printInt(global_opt.?.x);
     rt.printInt((global_eu catch unreachable).x);
+
+    const arr = comptime blk: {
+        const n: Names = .{ .short = 'a' };
+        const l = n.longest();
+        break :blk l[0..l.len].*;
+    };
+    rt.printInt(@intFromBool(@TypeOf(arr) == [1]u8 and arr[0] == 'a'));
     rt.exit(0);
 }
