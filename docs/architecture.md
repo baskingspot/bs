@@ -4470,8 +4470,8 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   need no padding between atoms.
 - **Format changes** (append-only): `Atom.Section` gains `sancov_cntrs`
   and `sancov_pcs` (the cache stores the section as a byte and checks it
-  with `std.enums.fromInt`; `Elf.Place.section` has 3 bits, which now
-  are all used). The ELF linker places `__sancov_pcs1` after `.rodata`
+  with `std.enums.fromInt`; `Elf.Place.section` has 4 bits, for
+  these eight and `.data.rel.ro`, taken from the 38-bit offset). The ELF linker places `__sancov_pcs1` after `.rodata`
   in the R segment and `__sancov_cntrs` (NOBITS) after `.bss`, and
   writes their section headers only when they are not empty, so a build
   without `-ffuzz` links exactly as before. It defines the four

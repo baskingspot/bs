@@ -10,8 +10,10 @@
 //!       The first program header is PT_PHDR, as upstream's: a static
 //!       executable's std.posix.dl_iterate_phdr finds the load bias from it.
 //!   RX  .text
-//!   RW  .tdata and .tbss (thread-local, present if used), .data, then
-//!       .bss (memory only)
+//!   RW  .tdata and .tbss (thread-local, present if used), .data.rel.ro
+//!       (in a position-independent image, `Options.pic`, the .rodata
+//!       atoms that hold absolute addresses), .data, then .bss (memory
+//!       only)
 //!       .debug_abbrev, .debug_info, .debug_line, .debug_str (not loaded;
 //!       present if `Options.debug` is not empty)
 //!       .symtab, .strtab, .shstrtab, section headers (not loaded)
@@ -35,9 +37,11 @@
 //! of .tbss, align the larger alignment), which is what the static TLS
 //! setup (std.os.linux.tls.initStatic) copies each thread's block from.
 //! .tbss takes room in the image, zeros in the file, so that no other
-//! section's addresses overlap the TLS segment's. Only the local-exec model
-//! exists (`x86_64_tpoff32`); TLS symbols' values are offsets in the TLS
-//! segment, as ld writes them for executables.
+//! section's addresses overlap the TLS segment's. Executables use only the
+//! local-exec model (`x86_64_tpoff32`); TLS symbols' values are offsets in the TLS
+//! segment, as ld writes them for executables. A position-independent
+//! image (an object's) also takes local-dynamic relocations
+//! (`x86_64_tlsld`, `x86_64_dtpoff32`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -85,6 +89,10 @@ pub const Options = struct {
     symbols: ?Symbols = null,
     /// How `link` writes the file; for tests and benchmarks.
     file_writes: FileWrites = .auto,
+    /// The image is position-independent code: .rodata atoms holding
+    /// absolute addresses go to .data.rel.ro, which a loader may write, and
+    /// local-dynamic TLS relocations are allowed. Executables are not.
+    pic: bool = false,
 };
 
 pub const FileWrites = enum {
@@ -406,35 +414,49 @@ pub const MemoryOutput = struct {
 
 const page_size = 0x1000;
 
-/// Section header index of each `Atom.Section`. The allocated sections'
+/// Section header index of each output section. The allocated sections'
 /// headers come in layout order: .rodata, .text, .tdata and .tbss if
-/// present, .data, .bss, then __sancov_pcs1 and __sancov_cntrs if present
-/// (`-ffuzz`; their addresses are after .rodata and after .bss). Then
-/// .eh_frame and .eh_frame_hdr and the debug sections, if present, then
-/// .symtab, .strtab, and .shstrtab.
-fn shndxOf(has_tls: bool) [n_sections]u16 {
+/// present, .data.rel.ro if present, .data, .bss, then __sancov_pcs1 and
+/// __sancov_cntrs if present (`-ffuzz`; their addresses are after .rodata
+/// and after .bss). Then .eh_frame and .eh_frame_hdr and the debug
+/// sections, if present, then .symtab, .strtab, and .shstrtab.
+fn shndxOf(has_tls: bool, has_relro: bool) [n_sections]u16 {
     const t: u16 = @intFromBool(has_tls);
-    return .{ 2, 1, 3 + 2 * t, 4 + 2 * t, 3, 4, 6 + 2 * t, 5 + 2 * t };
+    const r: u16 = @intFromBool(has_relro);
+    return .{ 2, 1, 3 + 2 * t + r, 4 + 2 * t + r, 3, 4, 6 + 2 * t + r, 5 + 2 * t + r, 3 + 2 * t };
 }
-const n_sections = std.enums.values(Atom.Section).len;
+/// Output sections: one per `Atom.Section`, with the same index, then
+/// .data.rel.ro, where a position-independent image puts the .rodata atoms
+/// that hold absolute addresses (`Options.pic`).
+const n_sections = std.enums.values(Atom.Section).len + 1;
+const data_rel_ro = n_sections - 1;
 /// Padding within each section: int3 in code, zeros elsewhere.
-const fills = [n_sections]u8{ 0xcc, 0, 0, 0, 0, 0, 0, 0 };
+const fills = [n_sections]u8{ 0xcc, 0, 0, 0, 0, 0, 0, 0, 0 };
 /// Sections with no bytes in the file.
-const zero_fill = [n_sections]bool{ false, false, false, true, false, true, true, false };
-const sym_types = [n_sections]elf.STT{ .FUNC, .OBJECT, .OBJECT, .OBJECT, .TLS, .TLS, .OBJECT, .OBJECT };
+const zero_fill = [n_sections]bool{ false, false, false, true, false, true, true, false, false };
+const sym_types = [n_sections]elf.STT{ .FUNC, .OBJECT, .OBJECT, .OBJECT, .TLS, .TLS, .OBJECT, .OBJECT, .OBJECT };
 
 /// The TLS segment's addresses [start, end), and the thread pointer, the
 /// end rounded up to the segment's alignment, as if the segment were the
 /// thread's TLS block (x86_64 TLS variant 2).
-const Tls = struct { start: u64, end: u64, tp: u64 };
+const Tls = struct {
+    start: u64,
+    end: u64,
+    tp: u64,
+    /// The module's TLS GOT pair, which `x86_64_tlsld` points at, in a
+    /// position-independent image; null in an executable, which rejects
+    /// local-dynamic relocations. An object's image has no GOT: its value
+    /// is a placeholder, since the object's relocations replace it.
+    ld_got: ?u64 = null,
+};
 /// Where pass 1 placed an atom.
 const Place = packed struct(u64) {
     /// Offset within the chunk's part of the section.
-    offset: u39,
+    offset: u38,
     /// Alignment padding between the previous atom of the section and this
     /// one, which the copy pass fills.
     gap: u22,
-    section: u3,
+    section: u4,
 
     const duplicate: Place = @bitCast(@as(u64, std.math.maxInt(u64)));
 
@@ -452,7 +474,8 @@ const unset = std.math.maxInt(u32);
 const value_tag = 1 << 31;
 /// Section names. Outputs without debug info keep the prefix up to the
 /// names they use.
-const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00";
+const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00.data.rel.ro\x00";
+const shstrtab_no_relro = shstrtab[0..shName(".data.rel.ro")];
 const shstrtab_no_sancov = shstrtab[0..shName("__sancov_pcs1")];
 const shstrtab_no_tls = shstrtab[0..shName(".tdata")];
 const shstrtab_no_cfi = shstrtab[0..shName(".eh_frame")];
@@ -530,6 +553,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .n_partitions = n_partitions,
         .n_resolve_tasks = if (numbered == null) n_partitions else n_chunks,
         .numbered = numbered,
+        .pic = options.pic,
         .addrs = addrs,
         .places = places,
         .keys = keys,
@@ -593,7 +617,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const has_rx = sizes[text] > 0;
     const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
     const has_sancov = sizes[cntrs] > 0 or sizes[pcs] > 0;
-    const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls or sizes[cntrs] > 0;
+    const has_relro = sizes[data_rel_ro] > 0;
+    const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls or sizes[cntrs] > 0 or has_relro;
     const has_cfi = n_debug > 0;
     // Which program headers are written, of all the linker writes, in
     // order: PHDR; the R, RX, and RW LOADs; TLS; GNU_EH_FRAME; GNU_STACK.
@@ -625,7 +650,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const tdata_end = tls_start + sizes[tdata];
     starts[tbss] = aligns[tbss].forward(tdata_end);
     const tls_end = starts[tbss] + sizes[tbss];
-    starts[data] = aligns[data].forward(tls_end);
+    starts[data_rel_ro] = aligns[data_rel_ro].forward(tls_end);
+    const relro_end = starts[data_rel_ro] + sizes[data_rel_ro];
+    starts[data] = aligns[data].forward(relro_end);
     const file_end = starts[data] + sizes[data];
     starts[bss] = aligns[bss].forward(file_end);
     // The coverage counters, if any, are memory only after .bss.
@@ -640,8 +667,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     if (numbered != null and mem_end >= value_tag) return error.OutOfMemory;
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
     l.base = base;
-    l.shndx = shndxOf(has_tls);
-    l.sym_bias = .{ 0, 0, 0, 0, base + tls_start, base + tls_start, 0, 0 };
+    l.shndx = shndxOf(has_tls, has_relro);
+    l.sym_bias = .{ 0, 0, 0, 0, base + tls_start, base + tls_start, 0, 0, 0 };
     // The section bounds the linker defines.
     for (bound_sections, 0..) |sec, i| {
         const start = starts[@backingInt(sec)];
@@ -658,7 +685,12 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     }
     // Variant 2: the thread pointer is the end of the thread's TLS block,
     // whose size is the segment's rounded up to its alignment.
-    l.tls = .{ .start = base + tls_start, .end = base + tls_end, .tp = base + tls_start + tls_align.forward(tls_end - tls_start) };
+    l.tls = .{
+        .start = base + tls_start,
+        .end = base + tls_end,
+        .tp = base + tls_start + tls_align.forward(tls_end - tls_start),
+        .ld_got = if (options.pic) base + tls_start else null,
+    };
     try parallel(io, n_threads, l.n_resolve_tasks + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
     try l.check(diag);
     const entry_addr = if (numbered) |s| l.numberedAddr(addrs[s.entry]) else if (options.entry) |e| symbols.get(e).? else 0;
@@ -685,9 +717,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
     const strtab_off = symtab_off + @as(u64, n_syms) * @sizeOf(elf.Elf64.Sym);
     const shstrtab_off = strtab_off + strtab_len;
-    const shstr = if (has_sancov) shstrtab else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
+    const shstr = if (has_relro) shstrtab else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug));
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug));
     l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     switch (l.target) {
         .memory => |buf| {
@@ -721,7 +753,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.fill(r_end, starts[text] - r_end);
     try l.fill(text_end, tls_start - text_end);
     // .tbss's room in the file is zeros.
-    try l.fill(tdata_end, starts[data] - tdata_end);
+    try l.fill(tdata_end, starts[data_rel_ro] - tdata_end);
+    try l.fill(relro_end, starts[data] - relro_end);
     try l.fill(str_off + str_size, symtab_off - (str_off + str_size));
     try l.fill(symtab_off, @sizeOf(elf.Elf64.Sym));
     try l.fill(strtab_off, 1);
@@ -830,6 +863,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName(".rodata"), .PROGBITS, .{ .ALLOC = true }, base, starts[rodata], sizes[rodata], aligns[rodata]),
         shdr(shName(".text"), .PROGBITS, .{ .ALLOC = true, .EXECINSTR = true }, base, starts[text], sizes[text], aligns[text]),
     } ++ tls_shdrs ++ [_]elf.Elf64.Shdr{
+        shdr(shName(".data.rel.ro"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data_rel_ro], sizes[data_rel_ro], aligns[data_rel_ro]),
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
     } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ [_]elf.Elf64.Shdr{
@@ -839,7 +873,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     };
     var sh_buf: [shdrs.len * @sizeOf(elf.Elf64.Shdr)]u8 = undefined;
     var sh_at: usize = 0;
-    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ true, 3 } };
+    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ true, 3 } };
     var group: usize = 0;
     var group_end: usize = present[0][1];
     for (shdrs, 0..) |s, i| {
@@ -893,6 +927,8 @@ fn LinkOf(comptime Input: type) type {
         /// symbols, chunks.
         n_resolve_tasks: usize,
         numbered: ?Symbols,
+        /// `Options.pic`.
+        pic: bool,
         /// With numbered symbols, where each is (see `unset`).
         addrs: []u32,
         places: []Place,
@@ -1109,10 +1145,10 @@ fn LinkOf(comptime Input: type) type {
                     l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
                     continue;
                 }
-                const s = @backingInt(a.section);
+                const s = if (l.pic and a.section == .rodata and hasAbs(a)) data_rel_ro else @backingInt(a.section);
                 const off = a.alignment.forward(c.sizes[s]);
                 p.* = .{
-                    .offset = std.math.cast(u39, off) orelse {
+                    .offset = std.math.cast(u38, off) orelse {
                         l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
                         continue;
                     },
@@ -1553,6 +1589,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 std.mem.writeInt(u64, f, s +% @as(u64, @bitCast(@as(i64, r.addend))), .little);
             },
             .x86_64_tpoff32 => try tpoff32(a, r, dst, s, tls, diag),
+            .x86_64_tlsld, .x86_64_dtpoff32 => try tlsDynamic(a, r, dst, p_base, s, tls, diag),
             .value32 => {
                 const f = try relocField(a, dst, r.offset, 4, diag);
                 std.mem.writeInt(u32, f, std.math.cast(u32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
@@ -1583,6 +1620,26 @@ noinline fn tpoff32(a: *const Atom, r: Atom.Reloc, dst: []u8, s: u64, tls: *cons
         return error.InvalidRelocation;
     }
     const v = @as(i64, @bitCast(s -% tls.tp)) +% r.addend;
+    std.mem.writeInt(i32, f, std.math.cast(i32, v) orelse return overflow(a, r, diag), .little);
+}
+
+/// Whether `a` holds an absolute address, which a position-independent
+/// image's loader must write.
+fn hasAbs(a: *const Atom) bool {
+    for (a.relocs) |r| if (r.info.kind == .x86_64_abs64) return true;
+    return false;
+}
+
+/// Local-dynamic TLS: the GOT pair's PC-relative address, or `s`'s offset in
+/// the module's TLS block. Out of line, as `tpoff32`.
+noinline fn tlsDynamic(a: *const Atom, r: Atom.Reloc, dst: []u8, p_base: u64, s: u64, tls: *const Tls, diag: *Diagnostic) Error!void {
+    const f = try relocField(a, dst, r.offset, 4, diag);
+    const got = tls.ld_got orelse return invalidReloc(a, diag);
+    if (s < tls.start or s >= tls.end) {
+        diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
+        return error.InvalidRelocation;
+    }
+    const v = @as(i64, @bitCast(if (r.info.kind == .x86_64_tlsld) got -% (p_base + r.offset) else s -% tls.start)) +% r.addend;
     std.mem.writeInt(i32, f, std.math.cast(i32, v) orelse return overflow(a, r, diag), .little);
 }
 

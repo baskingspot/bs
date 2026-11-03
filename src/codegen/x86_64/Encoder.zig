@@ -393,6 +393,25 @@ pub fn leaThreadLocal(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
     e.int(u32, 0);
 }
 
+/// `dst` = the address of thread-local `sym` in position-independent
+/// code, local-dynamic model, in the form linkers relax to local-exec:
+/// `lea rdi, [rip + sym@tlsld]; call get_addr` (`__tls_get_addr`, which
+/// returns the module's TLS block in rax), then `lea dst, [rax +
+/// sym@dtpoff]`. A call: it clobbers the caller-saved registers.
+pub fn leaThreadLocalDynamic(e: *Encoder, dst: Reg, sym: SymbolKey, get_addr: SymbolKey) !void {
+    try e.reserve();
+    e.bytes(&.{ 0x48, 0x8d, 0x3d }); // lea rdi, [rip + disp32]
+    try e.reloc(.x86_64_tlsld, sym, -4);
+    e.int(u32, 0);
+    try e.call(.{ .sym = get_addr });
+    try e.reserve();
+    e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
+    e.byte(0x8d);
+    e.byte(modrmByte(0b10, dst.low(), 0b000)); // [rax + disp32]
+    try e.reloc(.x86_64_dtpoff32, sym, 0);
+    e.int(u32, 0);
+}
+
 pub fn lea(e: *Encoder, size: Size, dst: Reg, src: Mem) !void {
     assert(size != .byte);
     try e.reserve();
@@ -1088,6 +1107,20 @@ test "encodings with special cases match GNU as" {
     try std.testing.expectEqualDeep(&[_]Atom.Reloc{
         .init(12, .x86_64_tpoff32, 0, 0),
         .init(29, .x86_64_tpoff32, 1, 0),
+    }, e.refs.relocs.items);
+    // As GNU as assembles `lea x@tlsld(%rip), %rdi; call
+    // __tls_get_addr@PLT; lea x@dtpoff(%rax), %r12`, the form linkers
+    // relax.
+    e.code.clearRetainingCapacity();
+    e.refs.relocs.clearRetainingCapacity();
+    try e.leaThreadLocalDynamic(.r12, foo, bar);
+    const ld_expected = "488d3d00000000" ++ "e800000000" ++ "4c8da000000000";
+    var ld_buf: [ld_expected.len / 2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&ld_buf, ld_expected), e.code.items);
+    try std.testing.expectEqualDeep(&[_]Atom.Reloc{
+        .init(3, .x86_64_tlsld, 0, -4),
+        .init(8, .x86_64_pc32, 1, -4),
+        .init(15, .x86_64_dtpoff32, 0, 0),
     }, e.refs.relocs.items);
 }
 

@@ -195,6 +195,18 @@ pub const Reloc = extern struct {
         /// 64-bit add: TLV(S) & 0xfff into imm12, completing the address of
         /// S's descriptor after `aarch64_tlvp_page21`. A must be 0.
         aarch64_tlvp_pageoff12,
+        /// x86_64 local-dynamic TLS, in position-independent code only
+        /// (see "Position-independent code" in docs/architecture.md).
+        ///
+        /// 32-bit PC-relative address of the module's TLS GOT pair (module
+        /// ID, 0), which `__tls_get_addr` takes: GOT + A - P (ELF
+        /// R_X86_64_TLSLD), in `lea rdi, [rip + S@tlsld]`, which must be
+        /// followed by `call __tls_get_addr`. S is a thread-local of the
+        /// module; A = -4.
+        x86_64_tlsld,
+        /// 32-bit offset of thread-local S in its module's TLS block: S + A
+        /// minus the start of the TLS segment (ELF R_X86_64_DTPOFF32).
+        x86_64_dtpoff32,
     };
 };
 

@@ -24,11 +24,14 @@
 //!   .debug_line against .text, the units' offsets in other debug sections
 //!   against those, and each FDE's pc_begin in .eh_frame against .text.
 //!
-//! Only x86_64 relocation kinds exist so far: R_X86_64_64, PC32, TPOFF32
-//! (local-exec TLS, which requires the final link to be an executable), and
-//! 8, 16, 32, and 64 for `value*` relocations that name a symbol. Code is
-//! not position-independent: absolute addresses in .rodata need a non-PIE
-//! final link.
+//! Only x86_64 relocation kinds exist so far: R_X86_64_64, PC32 (PLT32 to
+//! an import), TPOFF32 (local-exec TLS, which requires the final link to be
+//! an executable), TLSLD and DTPOFF32 (local-dynamic TLS, in
+//! position-independent code), and 8, 16, 32, and 64 for `value*`
+//! relocations that name a symbol. Without `Options.pic`, code is not
+//! position-independent: absolute addresses in .rodata need a non-PIE final
+//! link. With it, .rodata atoms holding absolute addresses are in
+//! .data.rel.ro, so the object links into PIEs and shared objects.
 
 const std = @import("std");
 const elf = std.elf;
@@ -40,7 +43,12 @@ const SymbolKey = Atom.SymbolKey;
 
 /// A symbol the object defines for other objects: the atom `key`, as
 /// `name`.
-pub const Export = struct { key: SymbolKey, name: []const u8 };
+pub const Export = struct {
+    key: SymbolKey,
+    name: []const u8,
+    weak: bool = false,
+    visibility: std.lang.SymbolVisibility = .default,
+};
 /// A symbol the object references and another object defines. Relocations
 /// name it by `key`, which no atom may have.
 pub const Import = struct { key: SymbolKey, name: []const u8, weak: bool = false };
@@ -132,8 +140,13 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
             diag.* = .{ .atom = x.name, .target = x.key };
             return error.UndefinedSymbol;
         };
-        // Marks the local symbol as replaced.
-        if (std.mem.eql(u8, atoms[atom_of[s.*]].name, x.name)) index[s.*] = std.math.maxInt(u32);
+        // Marks the local symbol as replaced. In position-independent
+        // code the local symbol stays, and the object's own references
+        // name it: a reference to a global symbol of default visibility
+        // could be preempted, so a shared object's link would refuse it
+        // PC-relative, and the object's code binds to its own definitions
+        // (as upstream's does).
+        if (!options.pic and std.mem.eql(u8, atoms[atom_of[s.*]].name, x.name)) index[s.*] = std.math.maxInt(u32);
     }
     next = @intCast(1 + c.sections.items.len);
     for (index[1..]) |*x| {
@@ -167,7 +180,12 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
     for (symbols.exports, export_syms) |x, s| {
         var sym = c.localSym(c.image_symtab[s]);
         sym.name = @intCast(strtab.items.len);
-        sym.info.bind = .GLOBAL;
+        sym.info.bind = if (x.weak) .WEAK else .GLOBAL;
+        sym.other.visibility = switch (x.visibility) {
+            .default => .DEFAULT,
+            .hidden => .HIDDEN,
+            .protected => .PROTECTED,
+        };
         try strtab.appendSlice(arena, x.name);
         try strtab.append(arena, 0);
         if (index[s] == std.math.maxInt(u32)) index[s] = next;
@@ -198,11 +216,17 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Options, 
         const base = c.sectionOffset(s);
         for (a.relocs) |r| {
             const t = a.targets[r.info.target];
-            const sym = if (sym_of.get(t)) |ts| index[ts] else import_index.get(t) orelse continue;
+            const local = sym_of.get(t);
+            const sym = if (local) |ts| index[ts] else import_index.get(t) orelse continue;
             const ty: elf.R_X86_64 = switch (r.info.kind) {
                 .x86_64_abs64, .value64 => .@"64",
-                .x86_64_pc32 => .PC32,
+                // An import reached PC-relative is a call (to
+                // `__tls_get_addr`; other imports are read from slots),
+                // which a shared object makes through its PLT.
+                .x86_64_pc32 => if (local == null) .PLT32 else .PC32,
                 .x86_64_tpoff32 => .TPOFF32,
+                .x86_64_tlsld => .TLSLD,
+                .x86_64_dtpoff32 => .DTPOFF32,
                 .value32 => .@"32",
                 .value16 => .@"16",
                 .value8 => .@"8",
