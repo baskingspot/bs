@@ -1,9 +1,9 @@
 //! x86_64 machine code encoder for the Debug CodeGen. Appends one instruction
 //! per call to `code`; references to other symbols become `Atom.Reloc`s and
-//! branches to local labels are patched by `finish`. It always picks one
-//! encoding per form (rel32 branches, no short jumps) and does no
-//! instruction selection: invalid operand combinations are caller bugs and
-//! trip assertions.
+//! branches to local labels are resolved by `finish`, which shortens the
+//! ones whose target is in reach to rel8. Otherwise it picks one encoding
+//! per form and does no instruction selection: invalid operand combinations
+//! are caller bugs and trip assertions.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -23,6 +23,22 @@ lines: Atom.LineProgram = .{},
 labels: std.ArrayList(u32) = .empty,
 /// rel32 fields that branch to a label not yet bound when they were emitted.
 fixups: std.ArrayList(struct { at: u32, label: Label }) = .empty,
+/// Whether `finishShortened` may shorten branches: set before emitting.
+/// Code that computes its own offsets, such as inline assembly, must not.
+shorten: bool = false,
+/// With `shorten`: `jmp` and `jcc` instructions to labels, by offset,
+/// candidates for the short form.
+branches: std.ArrayList(struct { at: u32, label: Label }) = .empty,
+/// After `finish` shortened branches: per branch, the bytes saved by the
+/// branches before it (one more entry for the total), for `mapOffset`.
+saved: std.ArrayList(u32) = .empty,
+/// With `shorten`: line rows and file switches until `finishShortened`,
+/// which writes them to `lines` at their final offsets; afterwards they go
+/// there directly.
+line_events: std.ArrayList(LineEvent) = .empty,
+finished: bool = false,
+
+const LineEvent = struct { offset: u32, kind: enum { row, switch_to }, a: u32, b: u32 };
 
 const unbound = std.math.maxInt(u32);
 
@@ -159,12 +175,129 @@ pub fn deinit(e: *Encoder) void {
     e.lines.deinit(e.gpa);
     e.labels.deinit(e.gpa);
     e.fixups.deinit(e.gpa);
+    e.branches.deinit(e.gpa);
+    e.saved.deinit(e.gpa);
+    e.line_events.deinit(e.gpa);
 }
 
 /// Patches branches to labels. Every label must be bound.
 pub fn finish(e: *Encoder) void {
     for (e.fixups.items) |f| e.patchRel32(f.at, e.labels.items[@backingInt(f.label)]);
     e.fixups.clearRetainingCapacity();
+}
+
+/// `finish`, and with `shorten`, a `jmp` or `jcc` whose target is within
+/// rel8 reach takes the short form. Shortening only ever lengthens a
+/// branch back, so it ends after a few rounds. Relocations, labels, and
+/// line rows move with the code; `mapOffset` moves other offsets taken
+/// before.
+pub fn finishShortened(e: *Encoder) Allocator.Error!void {
+    e.finish();
+    if (e.branches.items.len != 0) try e.shortenBranches();
+    e.finished = true;
+    var cursor: usize = 0;
+    for (e.line_events.items) |ev| switch (ev.kind) {
+        .row => try e.lines.addRow(e.gpa, e.mapAscending(&cursor, ev.offset), ev.a, ev.b),
+        .switch_to => try e.lines.switchTo(e.gpa, ev.a, ev.b),
+    };
+}
+
+/// `mapOffset` for offsets that only grow from one call to the next,
+/// with `cursor` (starting at 0) kept between them.
+fn mapAscending(e: *const Encoder, cursor: *usize, off: u32) u32 {
+    if (e.saved.items.len == 0) return off;
+    const br = e.branches.items;
+    while (cursor.* < br.len and br[cursor.*].at < off) cursor.* += 1;
+    return off - e.saved.items[cursor.*];
+}
+
+/// Where code at offset `off` before `finish` is after it.
+pub fn mapOffset(e: *const Encoder, off: u32) u32 {
+    if (e.saved.items.len == 0) return off;
+    // The branches that start before `off`.
+    var lo: usize = 0;
+    var hi: usize = e.branches.items.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (e.branches.items[mid].at < off) lo = mid + 1 else hi = mid;
+    }
+    return off - e.saved.items[lo];
+}
+
+fn shortenBranches(e: *Encoder) Allocator.Error!void {
+    const gpa = e.gpa;
+    const br = e.branches.items;
+    const code = e.code.items;
+    const short = try gpa.alloc(bool, br.len);
+    defer gpa.free(short);
+    @memset(short, true);
+    try e.saved.resize(gpa, br.len + 1);
+    const saved = e.saved.items;
+    // Per label, the number of branches before it.
+    const before = try gpa.alloc(u32, e.labels.items.len);
+    defer gpa.free(before);
+    for (e.labels.items, before) |l, *n| {
+        var lo: usize = 0;
+        var hi: usize = br.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (br[mid].at < l) lo = mid + 1 else hi = mid;
+        }
+        n.* = @intCast(lo);
+    }
+    // The long forms are `e9 rel32` (5 bytes) and `0f 8x rel32` (6); the
+    // short ones 2 bytes.
+    while (true) {
+        var total: u32 = 0;
+        for (br, short, 0..) |b, s, i| {
+            saved[i] = total;
+            if (s) total += if (code[b.at] == 0xe9) 3 else 4;
+        }
+        saved[br.len] = total;
+        var changed = false;
+        for (br, short, 0..) |b, *s, i| {
+            if (!s.*) continue;
+            const from: i64 = b.at - saved[i] + 2;
+            const l = @backingInt(b.label);
+            const to: i64 = e.labels.items[l] - saved[before[l]];
+            if (std.math.cast(i8, to - from) == null) {
+                s.* = false;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+    if (saved[br.len] == 0) {
+        e.saved.clearRetainingCapacity();
+        return;
+    }
+    var out: std.ArrayList(u8) = try .initCapacity(gpa, code.len - saved[br.len]);
+    errdefer out.deinit(gpa);
+    var prev: u32 = 0;
+    for (br, short) |b, s| {
+        out.appendSliceAssumeCapacity(code[prev..b.at]);
+        const is_jmp = code[b.at] == 0xe9;
+        const l = @backingInt(b.label);
+        const to: i64 = e.labels.items[l] - saved[before[l]];
+        const at: i64 = @intCast(out.items.len);
+        if (s) {
+            out.appendAssumeCapacity(if (is_jmp) 0xeb else 0x70 | (code[b.at + 1] & 0xf));
+            out.appendAssumeCapacity(@bitCast(@as(i8, @intCast(to - (at + 2)))));
+        } else {
+            const len: u32 = if (is_jmp) 5 else 6;
+            out.appendSliceAssumeCapacity(code[b.at..][0 .. len - 4]);
+            var rel: [4]u8 = undefined;
+            std.mem.writeInt(i32, &rel, @intCast(to - (at + len)), .little);
+            out.appendSliceAssumeCapacity(&rel);
+        }
+        prev = b.at + if (is_jmp) @as(u32, 5) else 6;
+    }
+    out.appendSliceAssumeCapacity(code[prev..]);
+    e.code.deinit(gpa);
+    e.code = out;
+    var cursor: usize = 0;
+    for (e.refs.relocs.items) |*r| r.offset = e.mapAscending(&cursor, r.offset);
+    for (e.labels.items, before) |*l, n| l.* -= saved[n];
 }
 
 pub fn newLabel(e: *Encoder) Allocator.Error!Label {
@@ -223,7 +356,14 @@ pub fn movAbsSym(e: *Encoder, dst: Reg, sym: SymbolKey, addend: i64) !void {
 /// Records that the code from here on comes from zero-based `line_`,
 /// relative to the declaration, and zero-based `column`.
 pub fn line(e: *Encoder, line_: u32, column: u32) !void {
-    try e.lines.addRow(e.gpa, @intCast(e.code.items.len), line_, column);
+    if (!e.shorten or e.finished) return e.lines.addRow(e.gpa, @intCast(e.code.items.len), line_, column);
+    try e.line_events.append(e.gpa, .{ .offset = @intCast(e.code.items.len), .kind = .row, .a = line_, .b = column });
+}
+
+/// `Atom.LineProgram.switchTo` at the current offset.
+pub fn switchLines(e: *Encoder, file: u32, base: u32) !void {
+    if (!e.shorten or e.finished) return e.lines.switchTo(e.gpa, file, base);
+    try e.line_events.append(e.gpa, .{ .offset = @intCast(e.code.items.len), .kind = .switch_to, .a = file, .b = base });
 }
 
 /// `mov r32, imm32` with the immediate set at link time to the 32-bit
@@ -482,12 +622,14 @@ pub fn setDirection(e: *Encoder, backward: bool) !void {
 
 pub fn jmp(e: *Encoder, target: Target) !void {
     try e.reserve();
+    if (e.shorten and target == .label) try e.branches.append(e.gpa, .{ .at = @intCast(e.code.items.len), .label = target.label });
     e.byte(0xe9);
     try e.rel32(target);
 }
 
 pub fn jcc(e: *Encoder, cond: Cond, target: Target) !void {
     try e.reserve();
+    if (e.shorten and target == .label) try e.branches.append(e.gpa, .{ .at = @intCast(e.code.items.len), .label = target.label });
     e.bytes(&.{ 0x0f, 0x80 | @as(u8, @backingInt(cond)) });
     try e.rel32(target);
 }
@@ -969,6 +1111,37 @@ test "branches to labels bound before and after them" {
     e.finish();
     try std.testing.expectEqualSlices(u8, &.{ 0x0f, 0x84, 0x06, 0, 0, 0, 0xcc, 0xe9, 0xf4, 0xff, 0xff, 0xff, 0xc3 }, e.code.items);
     try std.testing.expectEqual(0, e.refs.relocs.items.len);
+}
+
+test "branches in reach take the short form and the code after them moves" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    e.shorten = true;
+    const top = try e.newLabel();
+    const out = try e.newLabel();
+    const far = try e.newLabel();
+    e.bind(top);
+    try e.jcc(.e, .{ .label = out }); // 0 -> 0: 74 07
+    try e.call(.{ .sym = .fromName("f") }); // 6 -> 2, relocation at 7 -> 3
+    try e.jmp(.{ .label = top }); // 11 -> 7: eb f7
+    e.bind(out); // 16 -> 9
+    try e.line(4, 2);
+    try e.ret();
+    // 130 bytes away even with the others short: stays long.
+    try e.jmp(.{ .label = far }); // 17 -> 10: e9 rel32 -> 145
+    for (0..130) |_| try e.int3();
+    e.bind(far); // 152 -> 145
+    try e.ret();
+    try e.finishShortened();
+    var want: [146]u8 = undefined;
+    @memcpy(want[0..15], &[_]u8{ 0x74, 0x07, 0xe8, 0, 0, 0, 0, 0xeb, 0xf7, 0xc3, 0xe9, 0x82, 0, 0, 0 });
+    @memset(want[15..145], 0xcc);
+    want[145] = 0xc3;
+    try std.testing.expectEqualSlices(u8, &want, e.code.items);
+    try std.testing.expectEqual(3, e.refs.relocs.items[0].offset);
+    try std.testing.expectEqual(9, e.mapOffset(16));
+    try std.testing.expectEqual(9, e.lines.state.offset);
 }
 
 test "bit scans, byte swaps, exchanges, and string ops match GNU as" {

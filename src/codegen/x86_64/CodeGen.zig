@@ -195,6 +195,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     }
     @memset(cg.homes, .none);
     try cg.planRegisters();
+    // Inline assembly may compute offsets in the code itself.
+    cg.e.shorten = !cg.has_asm;
     t2 = std.Io.Timestamp.now(emit.zcu.io, .awake);
 
     // The prologue belongs to the declaration's line.
@@ -213,7 +215,12 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         try cg.setupParams();
     }
     try cg.emitBlocks();
-    cg.e.finish();
+    try cg.e.finishShortened();
+    frame_patch = cg.e.mapOffset(@intCast(frame_patch));
+    for (cg.dbg_inlines.items) |*in| {
+        in.low = cg.e.mapOffset(in.low);
+        in.high = cg.e.mapOffset(in.high);
+    }
 
     if (!naked) {
         // The saved registers are pushed already.
@@ -322,7 +329,7 @@ fn beginInline(cg: *CodeGen, func: Index, site: Ir.DbgInline) Error!void {
         .parent = if (cg.dbg_open.getLastOrNull()) |o| o.index else Atom.Debug.Inline.none,
     });
     try cg.dbg_open.append(cg.gpa, .{ .index = index, .line = cg.dbg_line, .column = cg.dbg_column });
-    try cg.e.lines.switchTo(cg.gpa, file, index + 1);
+    try cg.e.switchLines(file, index + 1);
 }
 
 /// Ends the innermost inlined call: the code after it is the caller's,
@@ -331,9 +338,9 @@ fn endInline(cg: *CodeGen) Error!void {
     const open = cg.dbg_open.pop().?;
     cg.dbg_inlines.items[open.index].high = @intCast(cg.e.code.items.len);
     if (cg.dbg_open.getLastOrNull()) |parent| {
-        try cg.e.lines.switchTo(cg.gpa, cg.dbg_inlines.items[parent.index].file, parent.index + 1);
+        try cg.e.switchLines(cg.dbg_inlines.items[parent.index].file, parent.index + 1);
     } else {
-        try cg.e.lines.switchTo(cg.gpa, 0, 0);
+        try cg.e.switchLines(0, 0);
     }
     cg.dbg_line = open.line;
     cg.dbg_column = open.column;
@@ -1266,9 +1273,9 @@ fn emitBlocks(cg: *CodeGen) Error!void {
             try cg.dbg_inlines.append(cg.gpa, copy);
         }
         if (cg.dbg_open.getLastOrNull()) |o| {
-            try cg.e.lines.switchTo(cg.gpa, cg.dbg_inlines.items[o.index].file, o.index + 1);
+            try cg.e.switchLines(cg.dbg_inlines.items[o.index].file, o.index + 1);
         } else {
-            try cg.e.lines.switchTo(cg.gpa, 0, 0);
+            try cg.e.switchLines(0, 0);
         }
         cg.dbg_line = s.line;
         cg.dbg_column = s.column;
