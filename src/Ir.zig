@@ -187,6 +187,14 @@ pub const Inst = struct {
         error_name,
         /// `ty_op`: `usize` to pointer.
         ptr_from_int,
+        /// `no_op`: `@returnAddress()` and `@frameAddress()` of the
+        /// function, as `usize`.
+        ret_addr,
+        frame_addr,
+        /// `ty_pl`: the address of the external symbol whose name is the
+        /// `InternPool.String` `payload`, as a pointer (or optional pointer,
+        /// null for an undefined weak symbol) of type `ty`.
+        extern_ptr,
 
         /// `ty_pl` with `Block`: a body that `br` instructions exit with a
         /// value of type `ty`.
@@ -516,6 +524,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .aggregate_init,
         .union_init,
         .assembly,
+        .extern_ptr,
         => data.ty_pl.ty,
         .store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt => .void_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
@@ -524,7 +533,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .mul_add => ir.typeOf(data.pl_op.operand, ip),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => .bool_type,
         .int_from_bool => .u1_type,
-        .int_from_ptr => .usize_type,
+        .int_from_ptr, .ret_addr, .frame_addr => .usize_type,
         .error_name => .slice_const_u8_sentinel_0_type,
         .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap, .panic => .noreturn_type,
         .call => ir.extraData(Call, data.pl_op.payload).data.ret_ty,

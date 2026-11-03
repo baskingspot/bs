@@ -31,6 +31,9 @@ content_keys: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty,
 navs: std.AutoArrayHashMapUnmanaged(InternPool.NavIndex, void) = .empty,
 /// Error names referenced by `value*` relocations.
 errors: std.AutoArrayHashMapUnmanaged(InternPool.String, void) = .empty,
+/// External symbols the code reads the address of (`@extern`), by name,
+/// and whether every reference is weak. `finish` writes each one's slot.
+externs: std.StringArrayHashMapUnmanaged(bool) = .empty,
 /// Whether any function calls the panic helpers.
 uses_panic: bool = false,
 /// Whether code reads `error_name_table`.
@@ -68,6 +71,7 @@ pub fn deinit(emit: *Emit) void {
     emit.content_keys.deinit(gpa);
     emit.navs.deinit(gpa);
     emit.errors.deinit(gpa);
+    emit.externs.deinit(gpa);
     emit.atom_owners.deinit(gpa);
     emit.content_uses.deinit(gpa);
     emit.arena.deinit();
@@ -89,6 +93,8 @@ pub fn function(emit: *Emit, zcu: *Zcu, ir: *const Ir) !void {
 pub fn finish(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !bool {
     const zcu = emit.zcu;
     const ip = &zcu.ip;
+    // Before the declarations: a slot can request an exported one.
+    if (!try emit.lowerExternSlots()) return false;
     // Lowering a declaration can request more declarations.
     var i: usize = 0;
     while (i < emit.navs.count()) : (i += 1) {
@@ -127,6 +133,59 @@ pub fn finish(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !b
         return false;
     };
     return true;
+}
+
+/// The key of the 8-byte slot holding the address of external symbol
+/// `name`, requesting that `finish` write it.
+pub fn useExtern(emit: *Emit, name: []const u8, weak: bool) !SymbolKey {
+    const gop = try emit.externs.getOrPut(emit.gpa, name);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try emit.allocator().dupe(u8, name);
+        gop.value_ptr.* = weak;
+    } else if (!weak) gop.value_ptr.* = false;
+    return externSlotKey(name);
+}
+
+fn externSlotKey(name: []const u8) SymbolKey {
+    var buf: [256]u8 = undefined;
+    return .fromName(std.fmt.bufPrint(&buf, "extern.{s}", .{name}) catch name);
+}
+
+/// Writes the slot of each external symbol: the address of the export of
+/// that name, or 0 for an undefined weak symbol. Returns false after
+/// reporting an undefined strong symbol.
+fn lowerExternSlots(emit: *Emit) !bool {
+    const zcu = emit.zcu;
+    const ip = &zcu.ip;
+    const arena = emit.allocator();
+    var ok = true;
+    for (emit.externs.keys(), emit.externs.values()) |name, weak| {
+        const target: ?SymbolKey = for (zcu.exports.items) |x| {
+            if (!std.mem.eql(u8, ip.stringSlice(x.name), name)) continue;
+            const nav = ip.getNav(x.nav);
+            if (nav.status != .resolved) continue;
+            break if (ip.indexToKey(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x.nav);
+        } else null;
+        if (target == null and !weak) {
+            try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
+            ok = false;
+            continue;
+        }
+        const bytes = try arena.alloc(u8, 8);
+        @memset(bytes, 0);
+        const targets: []const SymbolKey = if (target) |t| try arena.dupe(SymbolKey, &.{t}) else &.{};
+        const relocs: []const Atom.Reloc = if (target != null) try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, 0)}) else &.{};
+        try emit.addAtom(.{
+            .key = externSlotKey(name),
+            .name = try std.fmt.allocPrint(arena, "extern.{s}", .{name}),
+            .section = .rodata,
+            .alignment = .@"8",
+            .bytes = bytes,
+            .targets = targets,
+            .relocs = relocs,
+        });
+    }
+    return ok;
 }
 
 pub fn allocator(emit: *Emit) Allocator {

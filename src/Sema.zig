@@ -2189,6 +2189,17 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             const operand = sema.resolveInst(data.un_node.operand);
             const ty = sema.typeOf(operand);
+            // An optional pointer is its pointer, 0 for null.
+            if (Type.class(sema.ip, ty) == .optional and Type.optionalReprIsPtr(sema.ip, Type.childType(sema.ip, ty))) {
+                if (sema.resolveValue(operand)) |v| if (!sema.isUndef(v)) {
+                    const o = sema.ip.indexToKey(v).opt;
+                    if (o.val == .none) break :blk .fromInterned(try sema.intValue(.usize_type, 0));
+                    const pk = sema.ip.indexToKey(o.val).ptr;
+                    if (pk.base == .int) break :blk .fromInterned(try sema.intValue(.usize_type, pk.byte_offset));
+                };
+                if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: pointer address is not known until link time", .{});
+                break :blk sema.addUnOp(block, .int_from_ptr, operand);
+            }
             if (Type.class(sema.ip, ty) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ty)});
             const ptr = if (Type.isSlice(sema.ip, ty)) try sema.slicePtr(block, operand) else operand;
             if (sema.resolveValue(ptr)) |v| if (sema.ip.indexToKey(v) == .ptr and sema.ip.indexToKey(v).ptr.base == .int)
@@ -2507,7 +2518,14 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             for (refs, 0..) |*r, k| r.* = sema.resolveInst(@fromBackingInt(sema.code.extra[extra.end + k]));
             break :blk .fromInterned(try sema.resolvePeerTypes(block, src, refs));
         },
-        .builtin_src, .ret_addr, .frame_address, .error_return_trace => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
+        .builtin_extern => sema.zirBuiltinExtern(block, inst),
+        .field_parent_ptr => sema.zirFieldParentPtr(block, inst),
+        .ret_addr, .frame_address => blk: {
+            // Zero at comptime, as upstream.
+            if (block.is_comptime) break :blk .fromInterned(.zero_usize);
+            break :blk sema.addInst(block, .{ .tag = if (ext.opcode == .ret_addr) .ret_addr else .frame_addr, .data = .{ .no_op = {} } });
+        },
+        .builtin_src, .error_return_trace => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
         else => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
     };
 }
@@ -2934,6 +2952,68 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     try sema.zcu.exports.append(sema.gpa, .{ .nav = export_nav, .name = try sema.getString(name) });
 }
 
+/// `@extern(T, .{ .name = ... })`: the address of a symbol defined
+/// elsewhere in the link. zap links everything it compiles into one static
+/// executable, so the symbol is one of the compilation's exports; an
+/// undefined weak symbol is null. The address is a runtime value, read from
+/// a slot the link fills in (see `Emit.finish`).
+fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const ip = sema.ip;
+    const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
+    const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
+    const src = block.nodeSrc(extra.node);
+    var ty = try sema.resolveType(block, src, extra.lhs);
+    const ptr_ty = if (Type.class(ip, ty) == .optional) Type.childType(ip, ty) else ty;
+    if (Type.class(ip, ptr_ty) != .pointer or Type.isSlice(ip, ptr_ty)) return sema.fail(block, src, "expected (optional) pointer", .{});
+    const options_ty = try sema.stdLangType(block, src, "ExternOptions");
+    const options = try sema.resolveConstValue(block, src, try sema.coerce(block, options_ty, sema.resolveInst(extra.rhs), src), "extern options must be comptime-known");
+    const info = ip.structInfo(options_ty);
+    const name = try sema.resolveConstString(block, src, .fromInterned(try sema.fieldValue(options, info.fieldIndex(ip, "name").?)));
+    const linkage = try sema.fieldValue(options, info.fieldIndex(ip, "linkage").?);
+    const is_weak = ip.intValue(u64, ip.indexToKey(linkage).enum_tag.int).? == @backingInt(std.lang.GlobalLinkage.weak);
+    if (try sema.fieldValue(options, info.fieldIndex(ip, "is_thread_local").?) == .bool_true)
+        return sema.failUnsupported(block, src, "thread-local externs");
+    if (is_weak and Type.class(ip, ty) != .optional) ty = try sema.optType(ty);
+    if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
+    return sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ty, .payload = @backingInt(try sema.getString(name)) } } });
+}
+
+/// `@fieldParentPtr("field", field_ptr)`: the pointer to the struct or
+/// union containing the field `field_ptr` points to.
+fn zirFieldParentPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const ip = sema.ip;
+    const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
+    const extra = sema.code.extraData(Zir.Inst.FieldParentPtr, ext.operand).data;
+    const src = block.nodeSrc(extra.src_node);
+    const dest_ty = try sema.resolveType(block, src, extra.parent_ptr_type);
+    if (Type.class(ip, dest_ty) != .pointer or Type.ptrInfo(ip, dest_ty).flags.size != .one)
+        return sema.fail(block, src, "expected single pointer type, found '{f}'", .{sema.fmtType(dest_ty)});
+    const parent_ty = Type.ptrInfo(ip, dest_ty).child;
+    const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.field_name));
+    try sema.resolveLayout(block, src, parent_ty);
+    const field_index: u32 = switch (ip.indexToKey(parent_ty)) {
+        .struct_type => if (Type.isPacked(ip, parent_ty))
+            return sema.failUnsupported(block, src, "@fieldParentPtr of packed struct fields")
+        else
+            try sema.structFieldIndex(block, src, parent_ty, name),
+        .union_type => try sema.unionFieldIndex(block, src, parent_ty, name),
+        else => return sema.fail(block, src, "expected struct or union type, found '{f}'", .{sema.fmtType(parent_ty)}),
+    };
+    const field_ptr = sema.resolveInst(extra.field_ptr);
+    if (Type.class(ip, sema.typeOf(field_ptr)) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(sema.typeOf(field_ptr))});
+    if (sema.resolveValue(field_ptr)) |v| if (!sema.isUndef(v)) {
+        const k = ip.indexToKey(v).ptr;
+        if (k.base == .field and k.base.field.index == field_index and k.byte_offset == 0 and
+            Type.ptrInfo(ip, ip.typeOf(k.base.field.base)).child == parent_ty)
+            return sema.coercePtrTo(block, .fromInterned(k.base.field.base), dest_ty);
+    };
+    try sema.requireRuntime(block, src);
+    const offset = Type.fieldOffset(ip, parent_ty, field_index);
+    const addr = try sema.addUnOp(block, .int_from_ptr, field_ptr);
+    const parent_addr = if (offset == 0) addr else try sema.addBinOp(block, .sub_wrap, addr, .fromInterned(try sema.intValue(.usize_type, offset)));
+    return sema.addTyOp(block, .ptr_from_int, dest_ty, parent_addr);
+}
+
 fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_tok;
     const extra = sema.code.extraData(Zir.Inst.Import, data.payload_index).data;
@@ -2965,6 +3045,12 @@ fn zirDeclLiteral(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
     const src = block.nodeSrc(data.src_node);
     const name = sema.zirString(extra.field_name_start);
     const orig_ty = try sema.resolveType(block, src, extra.lhs);
+    return sema.analyzeDeclLiteral(block, src, name, orig_ty, tag == .decl_literal);
+}
+
+/// `.name` with result type `orig_ty`: a declaration of `orig_ty` (or of
+/// its optional or error union payload), else an enum literal.
+fn analyzeDeclLiteral(sema: *Sema, block: *Block, src: Src, name: []const u8, orig_ty: Index, do_coerce: bool) CompileError!Ref {
     var ty = orig_ty;
     while (true) switch (sema.ip.indexToKey(ty)) {
         .opt_type => |c| ty = c,
@@ -2990,11 +3076,11 @@ fn zirDeclLiteral(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
     const nav = (try sema.lookupInType(ty, name)) orelse {
         // Not a declaration: an enum literal.
         const lit: Ref = .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(name) }));
-        if (tag == .decl_literal_no_coerce) return lit;
+        if (!do_coerce) return lit;
         return sema.coerce(block, orig_ty, lit, src);
     };
     const val = try sema.navVal(block, src, nav);
-    if (tag == .decl_literal_no_coerce) return val;
+    if (!do_coerce) return val;
     return sema.coerce(block, orig_ty, val, src);
 }
 
@@ -3684,8 +3770,11 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     if (d.flags.size == .c and s.flags.size != .slice)
         return s.child == d.child or d.child == .anyopaque_type or (s.flags.size == .one and s_array != null and s_array.?.child == d.child);
     if (s.flags.size == d.flags.size) {
-        if (d.sentinel != .none and d.sentinel != s.sentinel) return false;
+        if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;
         if (s.child == d.child) return true;
+        // Through a const pointer, a child may gain qualifiers itself
+        // (`[]?[*:0]u8` to `[]const ?[*:0]const u8`).
+        if (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child)) return true;
         if (d.child == .anyopaque_type and s.flags.size != .slice) return true;
         if (s.flags.size == .one and ip.indexToKey(d.child) == .array_type) {
             const b = ip.indexToKey(d.child).array_type;
@@ -3705,6 +3794,44 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     return false;
 }
 
+/// Whether a value of type `src` can be read as a `dst` in place, where
+/// `dst` differs only by adding const or volatile to pointers inside it.
+fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
+    if (src == dst) return true;
+    const ip = sema.ip;
+    const sk = ip.indexToKey(src);
+    const dk = ip.indexToKey(dst);
+    if (sk == .opt_type and dk == .opt_type) {
+        const sc = sk.opt_type;
+        const dc = dk.opt_type;
+        if (Type.class(ip, sc) != .pointer or Type.class(ip, dc) != .pointer) return false;
+        return sema.childCoercibleInMemory(sc, dc);
+    }
+    if (sk != .ptr_type or dk != .ptr_type) return false;
+    const s = sk.ptr_type;
+    const d = dk.ptr_type;
+    if (s.flags.size != d.flags.size) return false;
+    if (s.flags.is_const and !d.flags.is_const) return false;
+    if (s.flags.is_volatile and !d.flags.is_volatile) return false;
+    if (s.flags.is_allowzero != d.flags.is_allowzero) return false;
+    if (s.flags.alignment != d.flags.alignment) return false;
+    if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;
+    if (s.child == d.child) return true;
+    return d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child);
+}
+
+/// Whether sentinel `s` satisfies sentinel `d`, which may be of a
+/// differently qualified type (`null` of `?[*:0]u8` and of
+/// `?[*:0]const u8`).
+fn sentinelsMatch(sema: *Sema, s: Index, d: Index) bool {
+    if (s == d) return true;
+    if (s == .none or d == .none) return false;
+    const ip = sema.ip;
+    const sk = ip.indexToKey(s);
+    const dk = ip.indexToKey(d);
+    return sk == .opt and dk == .opt and sk.opt.val == .none and dk.opt.val == .none;
+}
+
 fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError!?Ref {
     const ip = sema.ip;
     const src_ty = sema.typeOf(inst);
@@ -3714,10 +3841,10 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     // `*[N]T` to `[]T`.
     if (s.flags.size == .one and d.flags.size == .slice and ip.indexToKey(s.child) == .array_type) {
         const a = ip.indexToKey(s.child).array_type;
-        if (a.child != d.child) return null;
+        if (a.child != d.child and !(d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) return null;
         // A pointer to a zero-length array coerces to any slice, even a mutable one.
         if (s.flags.is_const and !d.flags.is_const and a.len != 0) return null;
-        if (d.sentinel != .none and d.sentinel != a.sentinel) return null;
+        if (d.sentinel != .none and !sema.sentinelsMatch(a.sentinel, d.sentinel)) return null;
         const many_ty = try sema.ptrType(.{ .child = d.child, .sentinel = d.sentinel, .flags = .{ .size = .many, .is_const = d.flags.is_const, .is_volatile = d.flags.is_volatile } });
         const ptr = try sema.coercePtrTo(block, inst, many_ty);
         const len: Ref = .fromInterned(try sema.intValue(.usize_type, a.len));
@@ -3911,6 +4038,8 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
         .shl, .shr, .shl_sat, .shl_exact, .shr_exact => return sema.analyzeShift(block, src, tag, uncasted_lhs, uncasted_rhs),
         else => {},
     }
+    if (Type.class(ip, sema.typeOf(uncasted_lhs)) == .pointer and Type.class(ip, sema.typeOf(uncasted_rhs)) == .pointer and tag == .sub)
+        return sema.analyzePtrDiff(block, src, uncasted_lhs, uncasted_rhs);
     if (Type.class(ip, sema.typeOf(uncasted_lhs)) == .pointer and (tag == .add or tag == .sub or tag == .addwrap or tag == .subwrap))
         return sema.analyzePtrArithmetic(block, src, tag == .add or tag == .addwrap, uncasted_lhs, uncasted_rhs);
     const ty = try sema.resolvePeerTypes(block, src, &.{ uncasted_lhs, uncasted_rhs });
@@ -4051,6 +4180,29 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
 }
 
 /// `ptr + n` and `ptr - n` on many-item and C pointers.
+/// `lhs - rhs` of two pointers: the distance in elements, as upstream
+/// `(@intFromPtr(lhs) -% @intFromPtr(rhs)) / @sizeOf(T)`.
+fn analyzePtrDiff(sema: *Sema, block: *Block, src: Src, lhs: Ref, rhs: Ref) CompileError!Ref {
+    const ip = sema.ip;
+    const lp = Type.ptrInfo(ip, sema.typeOf(lhs));
+    const rp = Type.ptrInfo(ip, sema.typeOf(rhs));
+    if (lp.flags.size == .slice or rp.flags.size == .slice or lp.child != rp.child)
+        return sema.fail(block, src, "incompatible pointer arithmetic operands '{f}' and '{f}'", .{ sema.fmtType(sema.typeOf(lhs)), sema.fmtType(sema.typeOf(rhs)) });
+    const elem_size = @max(Type.abiSize(ip, lp.child), 1);
+    if (sema.resolveValue(lhs)) |lv| if (sema.resolveValue(rhs)) |rv| {
+        const lk = ip.indexToKey(lv).ptr;
+        const rk = ip.indexToKey(rv).ptr;
+        if (lk.base == .int and rk.base == .int)
+            return .fromInterned(try sema.intValue(.usize_type, (lk.byte_offset -% rk.byte_offset) / elem_size));
+    };
+    try sema.requireRuntime(block, src);
+    const li = try sema.addUnOp(block, .int_from_ptr, lhs);
+    const ri = try sema.addUnOp(block, .int_from_ptr, rhs);
+    const bytes = try sema.addBinOp(block, .sub_wrap, li, ri);
+    if (elem_size == 1) return bytes;
+    return sema.addBinOp(block, .div_trunc, bytes, .fromInterned(try sema.intValue(.usize_type, elem_size)));
+}
+
 fn analyzePtrArithmetic(sema: *Sema, block: *Block, src: Src, is_add: bool, ptr: Ref, uncasted_n: Ref) CompileError!Ref {
     const ip = sema.ip;
     const ptr_ty = sema.typeOf(ptr);
@@ -7521,7 +7673,8 @@ fn switchItem(sema: *Sema, block: *Block, src: Src, switch_inst: Zir.Inst.Index,
             defer _ = sema.inst_map.remove(switch_inst);
             break :blk try sema.resolveInlineBody(block, body, switch_inst);
         },
-        .enum_literal => |s| .fromInterned(try sema.intern(.{ .enum_literal = try sema.getString(sema.zirString(s)) })),
+        // A declaration of the operand type, else an enum literal.
+        .enum_literal => |s| try sema.analyzeDeclLiteral(block, src, sema.zirString(s), operand_ty, false),
         .error_value => |s| blk: {
             const name = try sema.getString(sema.zirString(s));
             const ty = try sema.intern(.{ .error_set_type = &.{name} });
@@ -8400,13 +8553,13 @@ fn addTyOpOrFold(sema: *Sema, block: *Block, ty: Index, operand: Ref) CompileErr
 }
 
 fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCastFlags, dest_ty: Index, operand: Ref) CompileError!Ref {
+    const ip = sema.ip;
     const src_ty = sema.typeOf(operand);
     if (Type.class(sema.ip, dest_ty) != .pointer or Type.class(sema.ip, src_ty) != .pointer)
         return sema.failUnsupported(block, src, "pointer casts involving non-pointer types");
     const d = Type.ptrInfo(sema.ip, dest_ty);
     const s = Type.ptrInfo(sema.ip, src_ty);
     if (s.flags.is_const and !d.flags.is_const and !flags.const_cast) return sema.fail(block, src, "@ptrCast discards const qualifier", .{});
-    const ip = sema.ip;
     if (s.flags.size == .slice and d.flags.size != .slice) {
         // The slice's pointer.
         const raw = try sema.slicePtr(block, operand);
@@ -8446,6 +8599,18 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
             try sema.addSafetyCheck(block, try sema.addBinOp(block, .cmp_eq, rem, .fromInterned(.zero_usize)), .exact_division_remainder, .none, .none);
         }
         return sema.makeSlice(block, dest_ty, many, new_len);
+    }
+    // `@alignCast` to a stricter alignment is checked at runtime.
+    if (flags.align_cast and block.want_safety and !block.is_comptime and sema.resolveValue(operand) == null) {
+        try sema.resolveLayout(block, src, d.child);
+        const da = sema.ptrAlignment(d) orelse 1;
+        const sa = sema.ptrAlignment(s) orelse 1;
+        if (da > sa and da > 1) {
+            const addr = try sema.addUnOp(block, .int_from_ptr, operand);
+            const low = try sema.addBinOp(block, .bit_and, addr, .fromInterned(try sema.intValue(.usize_type, da - 1)));
+            const ok = try sema.addBinOp(block, .cmp_eq, low, .fromInterned(.zero_usize));
+            try sema.addSafetyCheck(block, ok, .incorrect_alignment, .none, .none);
+        }
     }
     return sema.coercePtrTo(block, operand, dest_ty);
 }
