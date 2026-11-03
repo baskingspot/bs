@@ -71,7 +71,7 @@ pub const Dep = extern struct {
     result_hash: Hash,
 };
 
-const entry_magic = "ZAPUNT01".*;
+const entry_magic = "ZAPUNT02".*;
 
 const Header = extern struct {
     magic: [8]u8 = entry_magic,
@@ -83,7 +83,7 @@ const Header = extern struct {
     result_hash: Hash,
 };
 
-const pack_magic = "ZAPSTP01".*;
+const pack_magic = "ZAPSTP02".*;
 const pack_ext = ".zsp";
 
 const PackHeader = extern struct {

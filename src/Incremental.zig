@@ -888,6 +888,13 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
                         if (c.debug_of[ai]) |d| {
                             h +%= cache.hash(@truncate(h), d.lines) +% @backingInt(d.frame);
                             rest = rest *% 31 +% d.base_line +% cache.hash(6, d.file) +% cache.hash(7, d.name);
+                            rest = rest *% 31 +% cache.hash(8, d.unit);
+                            // Inline calls carry their callees' base lines,
+                            // which move without the caller changing.
+                            if (d.inlines.len | d.patches.len | d.files.len != 0) {
+                                rest = rest *% 31 +% cache.hash(9, d.files) +% cache.hash(10, d.inline_names) +%
+                                    cache.hash(11, @ptrCast(d.inlines)) +% cache.hash(12, @ptrCast(d.inline_callees)) +% cache.hash(13, @ptrCast(d.patches));
+                            }
                         }
                     }
                     n.result_hash = h;

@@ -7,8 +7,11 @@
 //!   Header (64 bytes)
 //!   targets      [targets_len]SymbolKey (16 bytes each)
 //!   relocs       [relocs_len]Reloc (12 bytes each)
-//!   DebugHeader  (16 bytes, if `has_debug`)
-//!   bytes, name, debug file, debug name, debug lines
+//!   DebugHeader  (40 bytes, if `has_debug`)
+//!   bytes, name
+//!   if `has_debug`: file, name, lines, unit, files, inline names;
+//!   then, aligned, patches (u32), inlines (`Atom.Debug.Inline`), and
+//!   inline callees (SymbolKey, 16-byte aligned)
 //!   zero padding to a multiple of 16
 //!
 //! The linkers take debug info apart from the atoms, as a slice of
@@ -54,11 +57,56 @@ const DebugHeader = extern struct {
     file_len: u32,
     name_len: u32,
     lines_len: u32,
+    unit_len: u32,
+    files_len: u32,
+    inline_names_len: u32,
+    /// Counts of elements: patches, and inlines (and inline callees).
+    patches_len: u32,
+    inlines_len: u32,
+    unused: u32 = 0,
 };
 
 comptime {
     std.debug.assert(@sizeOf(Header) == 64);
-    std.debug.assert(@sizeOf(DebugHeader) == 16);
+    std.debug.assert(@sizeOf(DebugHeader) == 40);
+    std.debug.assert(@alignOf(Atom.Debug.Inline) == 4);
+}
+
+/// Where a record's aligned debug runs start, given `off`, the offset in
+/// the record just past the inline names.
+const DebugRuns = struct {
+    patches: usize,
+    inlines: usize,
+    callees: usize,
+    end: usize,
+
+    fn at(off: usize, dh: DebugHeader) DebugRuns {
+        const patches = std.mem.alignForward(usize, off, 4);
+        const inlines = patches + 4 * @as(usize, dh.patches_len);
+        const callees = std.mem.alignForward(usize, inlines + @sizeOf(Atom.Debug.Inline) * @as(usize, dh.inlines_len), 16);
+        return .{ .patches = patches, .inlines = inlines, .callees = callees, .end = callees + 16 * @as(usize, dh.inlines_len) };
+    }
+};
+
+fn debugHeader(d: *const Atom.Debug) DebugHeader {
+    std.debug.assert(d.inline_callees.len == d.inlines.len);
+    return .{
+        .base_line = d.base_line,
+        .file_len = @intCast(d.file.len),
+        .name_len = @intCast(d.name.len),
+        .lines_len = @intCast(d.lines.len),
+        .unit_len = @intCast(d.unit.len),
+        .files_len = @intCast(d.files.len),
+        .inline_names_len = @intCast(d.inline_names.len),
+        .patches_len = @intCast(d.patches.len),
+        .inlines_len = @intCast(d.inlines.len),
+    };
+}
+
+/// The bytes of the debug strings: file, name, lines, unit, files, and
+/// inline names.
+fn debugBytesLen(dh: DebugHeader) usize {
+    return @as(usize, dh.file_len) + dh.name_len + dh.lines_len + dh.unit_len + dh.files_len + dh.inline_names_len;
 }
 
 /// Walks a link's debug slice, sorted by `Debug.atom`, alongside its atoms
@@ -80,7 +128,10 @@ pub const DebugCursor = struct {
 pub fn encodedLen(atom: *const Atom, debug: ?*const Atom.Debug) usize {
     var n: usize = @sizeOf(Header) + 16 * atom.targets.len + @sizeOf(Atom.Reloc) * atom.relocs.len;
     n += atom.bytes.len + atom.name.len;
-    if (debug) |d| n += @sizeOf(DebugHeader) + d.file.len + d.name.len + d.lines.len;
+    if (debug) |d| {
+        const dh = debugHeader(d);
+        n = DebugRuns.at(n + @sizeOf(DebugHeader) + debugBytesLen(dh), dh).end;
+    }
     return std.mem.alignForward(usize, n, alignment);
 }
 
@@ -106,18 +157,17 @@ pub fn encode(atom: *const Atom, debug: ?*const Atom.Debug, out: []u8) void {
     w.writeAll(std.mem.asBytes(&header)) catch unreachable;
     w.writeAll(@ptrCast(atom.targets)) catch unreachable;
     w.writeAll(@ptrCast(atom.relocs)) catch unreachable;
-    if (debug) |d| w.writeAll(std.mem.asBytes(&DebugHeader{
-        .base_line = d.base_line,
-        .file_len = @intCast(d.file.len),
-        .name_len = @intCast(d.name.len),
-        .lines_len = @intCast(d.lines.len),
-    })) catch unreachable;
+    if (debug) |d| w.writeAll(std.mem.asBytes(&debugHeader(d))) catch unreachable;
     w.writeAll(atom.bytes) catch unreachable;
     w.writeAll(atom.name) catch unreachable;
     if (debug) |d| {
-        w.writeAll(d.file) catch unreachable;
-        w.writeAll(d.name) catch unreachable;
-        w.writeAll(d.lines) catch unreachable;
+        for ([_][]const u8{ d.file, d.name, d.lines, d.unit, d.files, d.inline_names }) |bytes| w.writeAll(bytes) catch unreachable;
+        const runs = DebugRuns.at(w.end, debugHeader(d));
+        w.splatByteAll(0, runs.patches - w.end) catch unreachable;
+        w.writeAll(@ptrCast(d.patches)) catch unreachable;
+        w.writeAll(@ptrCast(d.inlines)) catch unreachable;
+        w.splatByteAll(0, runs.callees - w.end) catch unreachable;
+        w.writeAll(@ptrCast(d.inline_callees)) catch unreachable;
     }
     @memset(out[w.end..], 0);
 }
@@ -149,10 +199,43 @@ pub fn check(bytes: []align(alignment) const u8) ?usize {
         const dh_off = end - h.bytes_len - h.name_len;
         if (dh_off + @sizeOf(DebugHeader) > h.len) return null;
         const dh = std.mem.bytesToValue(DebugHeader, bytes[dh_off..][0..@sizeOf(DebugHeader)]);
-        end += @sizeOf(DebugHeader) + @as(usize, dh.file_len) + dh.name_len + dh.lines_len;
+        end = DebugRuns.at(end + @sizeOf(DebugHeader) + debugBytesLen(dh), dh).end;
     }
     if (end > h.len) return null;
+    if (h.has_debug) {
+        const v = view(bytes.ptr);
+        if (!debugValid(v.atom.bytes.len, &v.debug.?)) return null;
+    }
     return h.len;
+}
+
+/// Whether debug info whose runs are in bounds of its record is also
+/// consistent, so that the linker reads only within them: each inline
+/// call's name, file, parent (preorder), and code range within an atom of
+/// `atom_len` bytes, and each patch, ascending, a whole `set_file` or
+/// `advance_line` opcode within `lines` (see `LineProgram.switchTo`).
+fn debugValid(atom_len: usize, d: *const Atom.Debug) bool {
+    // 0-terminated, nonempty paths.
+    if (d.files.len != 0 and (d.files[0] == 0 or d.files[d.files.len - 1] != 0 or std.mem.indexOf(u8, d.files, "\x00\x00") != null)) return false;
+    const files = std.mem.countScalar(u8, d.files, 0);
+    for (d.inlines, 0..) |inl, i| {
+        if (@as(u64, inl.name_off) + inl.name_len > d.inline_names.len) return false;
+        if (inl.file > files) return false;
+        if (inl.parent != Atom.Debug.Inline.none and inl.parent >= i) return false;
+        if (inl.low > inl.high or inl.high > atom_len) return false;
+    }
+    var next: u64 = 0;
+    for (d.patches) |off| {
+        if (off < next or off >= d.lines.len) return false;
+        const width: u64 = switch (d.lines[off]) {
+            std.dwarf.LNS.set_file => 1 + 3,
+            std.dwarf.LNS.advance_line => 1 + 5,
+            else => return false,
+        };
+        next = @as(u64, off) + width;
+        if (next > d.lines.len) return false;
+    }
+    return true;
 }
 
 /// The atom and debug info of a record that passed `check`, without
@@ -178,12 +261,30 @@ pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug
         off += dh.file_len;
         const debug_name = rec[off..][0..dh.name_len];
         off += dh.name_len;
+        const lines = rec[off..][0..dh.lines_len];
+        off += dh.lines_len;
+        const unit = rec[off..][0..dh.unit_len];
+        off += dh.unit_len;
+        const files = rec[off..][0..dh.files_len];
+        off += dh.files_len;
+        const inline_names = rec[off..][0..dh.inline_names_len];
+        off += dh.inline_names_len;
+        const runs = DebugRuns.at(off, dh);
+        const patches: [*]const u32 = @ptrCast(@alignCast(rec + runs.patches));
+        const inlines: [*]const Atom.Debug.Inline = @ptrCast(@alignCast(rec + runs.inlines));
+        const callees: [*]const Atom.SymbolKey = @ptrCast(@alignCast(rec + runs.callees));
         break :d .{
             .file = file,
             .name = debug_name,
             .base_line = dh.base_line,
-            .lines = rec[off..][0..dh.lines_len],
+            .lines = lines,
             .frame = @fromBackingInt(@intCast(h.debug_frame)),
+            .unit = unit,
+            .files = files,
+            .inlines = inlines[0..dh.inlines_len],
+            .inline_names = inline_names,
+            .inline_callees = callees[0..dh.inlines_len],
+            .patches = patches[0..dh.patches_len],
         };
     } else null;
     return .{ .atom = .{
@@ -229,6 +330,12 @@ pub fn expectEqualDebug(expected: ?*const Atom.Debug, actual: ?*const Atom.Debug
         try t.expectEqual(e.base_line, a.base_line);
         try t.expectEqualSlices(u8, e.lines, a.lines);
         try t.expectEqual(e.frame, a.frame);
+        try t.expectEqualStrings(e.unit, a.unit);
+        try t.expectEqualSlices(u8, e.files, a.files);
+        try t.expectEqualSlices(u8, @ptrCast(e.inlines), @ptrCast(a.inlines));
+        try t.expectEqualSlices(u8, e.inline_names, a.inline_names);
+        try t.expectEqualSlices(Atom.SymbolKey, e.inline_callees, a.inline_callees);
+        try t.expectEqualSlices(u32, e.patches, a.patches);
     }
 }
 
@@ -251,7 +358,20 @@ test "atoms round-trip through records" {
     };
     // Atoms 0 and 2 have debug info; the cursor must skip atom 1.
     const debug = [_]Atom.Debug{
-        .{ .atom = 0, .file = "src/t.zig", .name = "f", .base_line = 41, .lines = &.{ 5, 0x13 }, .frame = .frame_pointer },
+        .{
+            .atom = 0,
+            .file = "src/t.zig",
+            .name = "f",
+            .base_line = 41,
+            .lines = &.{ 5, 0x13, 0x04, 0x81, 0x80, 0x00, 0x03, 0x81, 0x80, 0x80, 0x80, 0x00 },
+            .frame = .frame_pointer,
+            .unit = "src/main.zig",
+            .files = "lib/std/start.zig\x00",
+            .inlines = &.{.{ .name_off = 0, .name_len = 8, .file = 1, .base_line = 600, .call_line = 2, .call_column = 4, .low = 1, .high = 5, .parent = Atom.Debug.Inline.none }},
+            .inline_names = "callMain",
+            .inline_callees = &.{.fromName("std.start.callMain")},
+            .patches = &.{ 2, 6 },
+        },
         .{ .atom = 2, .file = "src/u.zig", .name = "g", .base_line = 7, .lines = &.{0x14}, .frame = .none },
     };
     var buf: std.ArrayList(u8) = .empty;
@@ -286,5 +406,56 @@ test "atoms round-trip through records" {
         copy[m[0]] = m[1];
         try std.testing.expectEqual(null, check(copy));
         copy[m[0]] = saved;
+    }
+}
+
+test "check rejects inconsistent debug runs" {
+    const good: Atom.Debug = .{
+        .file = "t.zig",
+        .name = "f",
+        .base_line = 1,
+        .lines = &.{ 0x04, 0x81, 0x80, 0x00, 0x03, 0x81, 0x80, 0x80, 0x80, 0x00, 0x13 },
+        .frame = .frame_pointer,
+        .files = "u.zig\x00",
+        .inlines = &.{
+            .{ .name_off = 0, .name_len = 1, .file = 1, .base_line = 3, .call_line = 0, .call_column = 0, .low = 0, .high = 4, .parent = Atom.Debug.Inline.none },
+            .{ .name_off = 1, .name_len = 1, .file = 0, .base_line = 5, .call_line = 0, .call_column = 0, .low = 1, .high = 2, .parent = 0 },
+        },
+        .inline_names = "gh",
+        .inline_callees = &.{ .fromName("g"), .fromName("h") },
+        .patches = &.{ 0, 4 },
+    };
+    try std.testing.expect(debugValid(4, &good));
+    var d = good;
+    const t = struct {
+        fn inl(base: Atom.Debug, i: usize, comptime field: []const u8, v: u32) [2]Atom.Debug.Inline {
+            var out = base.inlines[0..2].*;
+            @field(out[i], field) = v;
+            return out;
+        }
+    };
+    const cases = [_]struct { []const u8, [2]Atom.Debug.Inline }{
+        .{ "name", t.inl(good, 1, "name_len", 2) },
+        .{ "file", t.inl(good, 0, "file", 2) },
+        .{ "parent", t.inl(good, 1, "parent", 1) },
+        .{ "range", t.inl(good, 0, "high", 5) },
+        .{ "order", t.inl(good, 1, "low", 3) },
+    };
+    for (&cases) |*c| {
+        d.inlines = &c[1];
+        std.testing.expect(!debugValid(4, &d)) catch |err| {
+            std.debug.print("accepted a bad {s}\n", .{c[0]});
+            return err;
+        };
+    }
+    d = good;
+    for ([_][]const u32{ &.{ 4, 0 }, &.{ 0, 1 }, &.{ 0, 10 }, &.{ 0, 6 } }) |patches| {
+        d.patches = patches;
+        try std.testing.expect(!debugValid(4, &d));
+    }
+    d = good;
+    for ([_][]const u8{ "u.zig", "\x00", "u.zig\x00\x00" }) |files| {
+        d.files = files;
+        try std.testing.expect(!debugValid(4, &d));
     }
 }

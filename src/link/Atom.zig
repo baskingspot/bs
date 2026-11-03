@@ -243,6 +243,11 @@ pub const Debug = struct {
     /// The inline calls' names, which `Inline.name_off` and
     /// `Inline.name_len` slice (see `inlineName`).
     inline_names: []const u8 = "",
+    /// For the cache, not the linker: per inline call, the callee
+    /// declaration's stable key (`SymbolKey.fromName` of its `Nav.key`),
+    /// by which a relink can refresh `Inline.base_line` when the callee
+    /// moves but the caller is reused.
+    inline_callees: []const SymbolKey = &.{},
     /// Offsets in `lines` of the opcodes whose operands the linker
     /// rewrites, in order (see `LineProgram.switchTo`):
     /// - `DW_LNS_set_file`, then a ULEB128 padded to 3 bytes holding a
