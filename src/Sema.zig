@@ -2113,6 +2113,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 .elem_ptr => sema.elemPtrOneLayer(block, src, lhs, index),
                 .elem_ptr_load => if (sema.zeroBitVectorElemPtr(sema.typeOf(lhs))) |elem_ty|
                     Ref.fromInterned(try sema.intValue(elem_ty, 0))
+                else if (block.is_comptime and sema.resolveValue(lhs) == null and try sema.indexedOnePossibleValue(sema.typeOf(lhs)) != null)
+                    // A zero-bit element of runtime memory, read at comptime.
+                    Ref.fromInterned((try sema.indexedOnePossibleValue(sema.typeOf(lhs))).?)
                 else if (sema.isBoolVectorPtr(sema.typeOf(lhs)) and sema.resolveValue(index) != null)
                     // Bool vectors are bit-packed: load the vector, then the bit.
                     sema.elemVal(block, src, try sema.analyzeLoad(block, src, lhs), index, true)
@@ -6741,18 +6744,45 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
     if (sema.resolveValue(ptr)) |pv| {
         if (try sema.comptimeLoadOrNull(block, src, pv)) |v| return .fromInterned(v);
     }
-    try sema.requireRuntime(block, src);
     try sema.resolveLayout(block, src, info.child);
-    if (!Type.hasRuntimeBits(ip, info.child)) {
-        if (info.child == .void_type) return .void_value;
-        if (Type.isComptimeOnly(ip, info.child)) return sema.fail(block, src, "unable to load comptime-only type '{f}' at runtime", .{sema.fmtType(info.child)});
-    }
+    const zero_bit = !Type.hasRuntimeBits(ip, info.child) and !Type.isComptimeOnly(ip, info.child);
+    // Even at comptime, through a runtime pointer.
+    if (zero_bit) if (try sema.onePossibleValue(info.child)) |v| return .fromInterned(v);
+    try sema.requireRuntime(block, src);
+    if (Type.isComptimeOnly(ip, info.child)) return sema.fail(block, src, "unable to load comptime-only type '{f}' at runtime", .{sema.fmtType(info.child)});
     if (info.packed_offset.host_size != 0) {
         const host_ty = try sema.intType(.unsigned, info.packed_offset.host_size * 8);
         const host_ptr = try sema.addTyOp(block, .bitcast, try sema.ptrType(.{ .child = host_ty, .flags = .{ .is_const = true, .is_volatile = info.flags.is_volatile } }), ptr);
         return sema.packedExtract(block, try sema.addTyOp(block, .load, host_ty, host_ptr), info.packed_offset.bit_offset, info.child);
     }
     return sema.addTyOp(block, .load, info.child, ptr);
+}
+
+/// The only value of zero-bit runtime type `ty`, as upstream: loads of it
+/// are comptime-known. Null for types zap does not fold (unions, enums).
+fn onePossibleValue(sema: *Sema, ty: Index) CompileError!?Index {
+    const ip = sema.ip;
+    switch (ip.indexToKey(ty)) {
+        .simple_type => |s| return if (s == .void) .void_value else null,
+        .int_type => |t| return if (t.bits == 0) try sema.intValue(ty, 0) else null,
+        .array_type => |a| {
+            if (a.lenIncludingSentinel() == 0) return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = &.{} } } });
+            const elem = (try sema.onePossibleValue(a.child)) orelse return null;
+            return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .repeated_elem = elem } } });
+        },
+        .tuple_type => |t| {
+            const elems = try sema.arena.alloc(Index, t.types.len);
+            for (elems, t.types, t.values) |*e, ft, fv| e.* = if (fv != .none) fv else (try sema.onePossibleValue(ft)) orelse return null;
+            return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+        },
+        .struct_type => {
+            const field_types = ip.structInfo(ty).field_types;
+            const elems = try sema.arena.alloc(Index, field_types.len);
+            for (elems, field_types) |*e, ft| e.* = (try sema.onePossibleValue(ft)) orelse return null;
+            return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
+        },
+        else => return null,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8052,6 +8082,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
                     const ep = try sema.ptrElemPtrVal(ip.indexToKey(sv).slice.ptr, ip.intValue(u64, iv).?);
                     if (try sema.comptimeLoadOrNull(block, src, ep)) |v| return .fromInterned(v);
                 };
+                if (block.is_comptime) if (try sema.indexedOnePossibleValue(ty)) |v| return .fromInterned(v);
                 try sema.requireRuntime(block, src);
                 return sema.addBinOp(block, .slice_elem_val, lhs, index);
             },
@@ -8069,6 +8100,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
             const index = try sema.coerce(block, .usize_type, uncasted_index, src);
             if (safety or sema.resolveValue(index) != null) try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, a.len)), a.sentinel != .none);
             if (sema.resolveValue(lhs)) |v| if (sema.resolveValue(index)) |iv| return .fromInterned(try sema.elemValue(v, ip.intValue(u64, iv).?));
+            if (!Type.hasRuntimeBits(ip, a.child) and !Type.isComptimeOnly(ip, a.child)) if (try sema.onePossibleValue(a.child)) |v| return .fromInterned(v);
             try sema.requireRuntime(block, src);
             return sema.addBinOp(block, .array_elem_val, lhs, index);
         },
@@ -10784,6 +10816,25 @@ fn zeroBitVectorElemPtr(sema: *Sema, ty: Index) ?Index {
     if (ip.indexToKey(child) != .vector_type) return null;
     const elem = ip.indexToKey(child).vector_type.child;
     return if (Type.isInt(ip, elem) and Type.intInfo(ip, elem).bits == 0) elem else null;
+}
+
+/// The one possible value of the elements that indexing through pointer
+/// type `ty` (to an array or vector, or a slice or many-pointer) reads.
+fn indexedOnePossibleValue(sema: *Sema, ty: Index) CompileError!?Index {
+    const ip = sema.ip;
+    if (Type.class(ip, ty) != .pointer) return null;
+    const p = Type.ptrInfo(ip, ty);
+    const elem = switch (p.flags.size) {
+        .one => switch (ip.indexToKey(p.child)) {
+            .array_type, .vector_type => Type.childType(ip, p.child),
+            // A pointer to the slice or pointer being indexed.
+            .ptr_type => |cp| if (cp.flags.size != .one) cp.child else return null,
+            else => return null,
+        },
+        else => p.child,
+    };
+    if (Type.hasRuntimeBits(ip, elem) or Type.isComptimeOnly(ip, elem)) return null;
+    return sema.onePossibleValue(elem);
 }
 
 fn isBoolVectorPtr(sema: *Sema, ty: Index) bool {
