@@ -9035,6 +9035,7 @@ fn structInitEmpty(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError
     const ip = sema.ip;
     // `.{}` without a result type is the empty tuple.
     if (ty == .generic_poison_type) return .fromInterned(.empty_tuple);
+    if (ty == .clobbers_type) return .fromInterned(try sema.undefValue(.clobbers_type));
     switch (ip.indexToKey(ty)) {
         .struct_type => {
             try sema.resolveStructFields(block, src, ty);
@@ -9875,6 +9876,8 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const extra = sema.code.extraData(Zir.Inst.Asm, ext.operand);
     const small: Zir.Inst.Asm.Small = @bitCast(ext.small);
     const src = block.nodeSrc(extra.data.src_node);
+    // Container-level assembly: upstream's self-hosted backends drop it.
+    if (sema.func == .none and small.outputs_len == 0 and small.inputs_len == 0) return .void_value;
     if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: inline assembly", .{});
     const gpa = sema.gpa;
     var result_ty: Index = .void_type;

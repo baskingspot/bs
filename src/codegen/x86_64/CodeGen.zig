@@ -1340,13 +1340,40 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     // `r` inputs get registers that no `{reg}` constraint names.
     var used: u16 = 0;
     for (ops) |op| {
-        const c = std.mem.trimStart(u8, ip.stringSlice(op.constraint), "=");
+        const c = asmAlternative(std.mem.trimStart(u8, ip.stringSlice(op.constraint), "=+"));
         if (regConstraint(c)) |rn| if (parseReg(rn)) |r| {
             used |= @as(u16, 1) << @backingInt(r.reg);
         };
     }
+    // `=r` and `+r` outputs get registers that no other operand uses; a
+    // `+r` register starts with the operand's value.
+    const out_regs = try cg.gpa.alloc(Reg, outputs.len);
+    defer cg.gpa.free(out_regs);
+    for (outputs, out_regs) |out, *out_reg| {
+        const full = ip.stringSlice(out.constraint);
+        if (full.len == 0 or (full[0] != '=' and full[0] != '+')) return cg.fail("asm output constraint '{s}'", .{full});
+        const read = full[0] == '+';
+        const constraint = asmAlternative(full[1..]);
+        const ty = if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child;
+        if (std.mem.eql(u8, constraint, "r")) {
+            const reg = for ([_]Reg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9, .r10, .r11 }) |r| {
+                if (used & (@as(u16, 1) << @backingInt(r)) == 0) break r;
+            } else return cg.fail("asm with too many register operands", .{});
+            used |= @as(u16, 1) << @backingInt(reg);
+            out_reg.* = reg;
+            try names.put(cg.gpa, ip.stringSlice(out.name), .{ .reg = .{ .reg = reg, .size = sizeOf(Type.abiSize(ip, ty)) } });
+        } else {
+            const reg_name = regConstraint(constraint) orelse return cg.fail("asm output constraint '{s}'", .{full});
+            out_reg.* = (parseReg(reg_name) orelse return cg.fail("unknown register in asm constraint '{s}'", .{full})).reg;
+        }
+        if (read) {
+            if (out.operand == .none) return cg.fail("asm output constraint '{s}'", .{full});
+            try cg.load(out_reg.*, out.operand);
+            try cg.loadMem(out_reg.*, Mem.at(out_reg.*, 0), ty);
+        }
+    }
     for (inputs) |in| {
-        const constraint = ip.stringSlice(in.constraint);
+        const constraint = asmAlternative(ip.stringSlice(in.constraint));
         const is_r = std.mem.eql(u8, constraint, "r") or (std.mem.eql(u8, constraint, "rm") and cg.passInRegs(cg.typeOf(in.operand)));
         if (is_r) {
             const in_size = Type.abiSize(ip, cg.typeOf(in.operand));
@@ -1370,26 +1397,6 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             try names.put(cg.gpa, ip.stringSlice(in.name), arg);
         } else return cg.fail("asm input constraint '{s}'", .{constraint});
     }
-    // `=r` outputs get registers that no other operand uses.
-    const out_regs = try cg.gpa.alloc(Reg, outputs.len);
-    defer cg.gpa.free(out_regs);
-    for (outputs, out_regs) |out, *out_reg| {
-        const constraint = ip.stringSlice(out.constraint);
-        if (std.mem.eql(u8, constraint, "=r")) {
-            const ty = if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child;
-            const reg = for ([_]Reg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9, .r10, .r11 }) |r| {
-                if (used & (@as(u16, 1) << @backingInt(r)) == 0) break r;
-            } else return cg.fail("asm with too many register operands", .{});
-            used |= @as(u16, 1) << @backingInt(reg);
-            out_reg.* = reg;
-            try names.put(cg.gpa, ip.stringSlice(out.name), .{ .reg = .{ .reg = reg, .size = sizeOf(Type.abiSize(ip, ty)) } });
-            continue;
-        }
-        if (!std.mem.startsWith(u8, constraint, "=") or regConstraint(constraint[1..]) == null)
-            return cg.fail("asm output constraint '{s}'", .{constraint});
-        out_reg.* = (parseReg(regConstraint(constraint[1..]).?) orelse return cg.fail("unknown register in asm constraint '{s}'", .{constraint})).reg;
-    }
-
     try cg.assemble(ip.stringSlice(extra.data.source), &names);
 
     for (outputs, out_regs) |out, reg| {
@@ -1404,6 +1411,15 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             try cg.storeReg(Mem.at(tmp, 0), reg, Type.abiSize(ip, ty));
         }
     }
+}
+
+/// Of comma-separated alternative constraints, the register one if there
+/// is one, else the first.
+fn asmAlternative(c: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, c, ',') == null) return c;
+    var it = std.mem.splitScalar(u8, c, ',');
+    while (it.next()) |alt| if (std.mem.eql(u8, alt, "r")) return alt;
+    return c[0..std.mem.indexOfScalar(u8, c, ',').?];
 }
 
 fn regConstraint(c: []const u8) ?[]const u8 {
