@@ -13,6 +13,7 @@
 //!   aligned offsets of the outgoing area, read by the callee at rbp+16.
 //!   A result whose size is 1, 2, 4, or 8 bytes returns in rax; any other
 //!   result is written through a pointer the caller passes in rdi.
+//!   The caller's error return trace pointer goes in r9, as upstream.
 //! - `.c`: SysV for scalars: integers, bools, and pointers in GPRs (16-byte
 //!   integers in pairs), f16/f32/f64/f128 in XMM registers, f80 in memory
 //!   and returned in st0; other values in memory.
@@ -56,6 +57,10 @@ blocks: std.AutoHashMapUnmanaged(Inst.Index, Encoder.Label) = .empty,
 /// rbp offset of the slot holding the result pointer (for results returned
 /// in memory).
 ret_ptr_slot: ?i32 = null,
+/// rbp offset of the slot holding the error return trace pointer: an
+/// `.auto` function's from r9, another's from `set_err_return_trace`.
+/// Null in a function that has none, whose `.auto` calls pass null.
+trace_slot: ?i32 = null,
 /// Inline assembly marked the return address undefined (`.cfi_undefined
 /// %rip`): this is the outermost frame.
 outermost_frame: bool = false,
@@ -310,6 +315,10 @@ const c_arg_regs = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
 fn setupParams(cg: *CodeGen) Error!void {
     const ip = cg.ip;
     if (cg.fn_ty.cc == .c) return cg.setupCParams();
+    if (cg.fn_ty.cc == .auto) {
+        cg.trace_slot = try cg.allocSlot(8, 8);
+        try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, cg.trace_slot.?) }, .{ .reg = .r9 });
+    }
     const ret_ty = cg.fn_ty.return_type;
     if (Type.hasRuntimeBits(ip, ret_ty) and !cg.passInRegs(ret_ty)) {
         const off = try cg.allocSlot(8, 8);
@@ -708,6 +717,27 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
             try cg.load(.rdx, data.ty_op.operand);
             try cg.copyMem(dst, Mem.at(.rdx, 0), 24);
+        },
+        .err_return_trace => {
+            const dst = try cg.resultMem(inst, data.ty) orelse return;
+            try cg.loadTrace(.rax);
+            try cg.storeReg(dst, .rax, 8);
+        },
+        .set_err_return_trace => {
+            if (cg.trace_slot == null) cg.trace_slot = try cg.allocSlot(8, 8);
+            try cg.load(.rax, data.un_op);
+            try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, cg.trace_slot.?) }, .{ .reg = .rax });
+        },
+        .save_err_return_trace_index => {
+            if (data.ty_pl.ty == .none) return;
+            const dst = try cg.resultMem(inst, .usize_type) orelse return;
+            if (cg.trace_slot) |off| {
+                try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rbp, off) });
+                try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rax, @intCast(Type.fieldOffset(ip, data.ty_pl.ty, data.ty_pl.payload))) });
+            } else {
+                try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = 0 });
+            }
+            try cg.storeReg(dst, .rax, 8);
         },
         .tls_ptr => {
             const key = try cg.emit.navKey(@fromBackingInt(data.ty_pl.payload));
@@ -1365,6 +1395,15 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
     try cg.e.ret();
 }
 
+/// Loads the error return trace pointer, or null if the function has none.
+fn loadTrace(cg: *CodeGen, reg: Reg) Error!void {
+    if (cg.trace_slot) |off| {
+        try cg.e.mov(.qword, .{ .reg = reg }, .{ .mem = Mem.at(.rbp, off) });
+    } else {
+        try cg.e.mov(.dword, .{ .reg = reg }, .{ .imm = 0 });
+    }
+}
+
 fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ip = cg.ip;
     const ir = cg.ir;
@@ -1402,6 +1441,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     if (callee_ty.is_var_args) for (args) |arg| {
         if (cg.cClass(cg.typeOf(arg)) == .sse and va_sse < 8) va_sse += 1;
     };
+    if (callee_ty.cc == .auto) try cg.loadTrace(.r9);
     if (callee_val) |f| {
         if (callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
         try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });

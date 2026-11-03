@@ -210,6 +210,18 @@ pub const Inst = struct {
         /// `ty_pl`: the address of this thread's copy of the threadlocal
         /// variable whose `InternPool.NavIndex` is `payload`.
         tls_ptr,
+        /// `ty`: the function's error return trace, a `*StackTrace` or
+        /// `?*StackTrace` of type `ty`. An `.auto` function receives it from
+        /// its caller; another function sets it with `set_err_return_trace`.
+        err_return_trace,
+        /// `un_op`: make pointer `operand` the function's error return
+        /// trace (at the entry of a non-`.auto` function that needs one).
+        set_err_return_trace,
+        /// `ty_pl`: the `usize` field `payload` (`index`) of the error return
+        /// trace, whose type is the `StackTrace` `ty`. Sema creates these
+        /// before it knows whether a restore uses them: `ty` is `.none` for
+        /// an unused one, which has no code.
+        save_err_return_trace_index,
 
         /// `ty_pl` with `Block`: a body that `br` instructions exit with a
         /// value of type `ty`.
@@ -485,7 +497,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
         .arg => data.arg.ty,
-        .alloc, .c_va_start => data.ty,
+        .alloc, .c_va_start, .err_return_trace => data.ty,
         .c_va_arg, .c_va_copy,
         .load,
         .not,
@@ -537,14 +549,14 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .atomic_rmw,
         .cmpxchg,
         => data.ty_pl.ty,
-        .store, .atomic_store, .set_union_tag, .memcpy, .memmove, .memset, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .vector_store_elem, .breakpoint, .comptime_tick, .comptime_quota, .comptime_dep => .void_type,
+        .store, .atomic_store, .set_union_tag, .set_err_return_trace, .memcpy, .memmove, .memset, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .vector_store_elem, .breakpoint, .comptime_tick, .comptime_quota, .comptime_dep => .void_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),
         .mul_add => ir.typeOf(data.pl_op.operand, ip),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => .bool_type,
         .int_from_bool => .u1_type,
-        .int_from_ptr, .ret_addr, .frame_addr => .usize_type,
+        .int_from_ptr, .ret_addr, .frame_addr, .save_err_return_trace_index => .usize_type,
         .error_name => .slice_const_u8_sentinel_0_type,
         .repeat, .br, .cond_br, .switch_br, .ret, .unreach, .trap => .noreturn_type,
         .call => ir.extraData(Call, data.pl_op.payload).data.ret_ty,

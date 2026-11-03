@@ -156,6 +156,16 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   that CodeGen produces, so a cache hit skips both Sema and CodeGen.
 - Debug semantics: Sema emits safety checks (overflow, bounds, unwrap,
   unreachable) as explicit IR, as upstream does. No optimization passes.
+- Error return traces are explicit IR too, as upstream: a return of a
+  possible error calls `std.lang.returnError`, which pushes the return
+  address; handling an error (`catch`, `if`/`else`, a call whose error
+  result is discarded) restores the index saved before it
+  (`save_err_return_trace_index`, then a store through
+  `err_return_trace`). `.auto` functions share the caller's trace; a
+  non-`.auto` function that calls one creates its own at entry
+  (`set_err_return_trace`). With no liveness pass, a save that no restore
+  uses is marked unused by Sema and has no code. Off in compiler_rt (built in
+  a release mode upstream) and without std.
 - Target-independent, and precise enough to interpret. The bytecode comptime
   evaluator (milestone 6) runs lowered function bodies; it runs this IR
   directly (it may move to a denser encoding derived from it), and it does
@@ -353,7 +363,9 @@ the laziness rule; unboxed integers in the frame; then a denser encoding.
   in memory. Zap-to-zap calls (`.auto`) pass every argument in
   memory at 8-byte aligned offsets of the caller's outgoing area, return
   1-, 2-, 4-, and 8-byte results in rax, and return anything else through a
-  result pointer in rdi. Nothing outside zap observes `.auto`, so this can
+  result pointer in rdi. The caller's error return trace pointer goes in
+  r9 (as upstream's last argument register); the callee keeps it in a
+  frame slot. Nothing outside zap observes `.auto`, so this can
   change when a register allocator wants a different one.
 - Numerics: f32 and f64 use scalar SSE2 and f80 uses x87, as upstream
   does. f16 and f128 arithmetic, operations SSE2 lacks (rounding, fmod,
