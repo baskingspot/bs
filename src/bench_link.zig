@@ -253,7 +253,7 @@ fn benchNumbered(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, a
         for (a.targets) |t| try targets.append(arena, numbers.get(t).?);
     }
     var single = options;
-    single.symbols = .{ .atoms = atom_numbers, .targets = targets.items, .entry = numbers.get(options.entry).?, .len = @intCast(kept.items.len) };
+    single.symbols = .{ .atoms = atom_numbers, .targets = targets.items, .entry = numbers.get(options.entry.?).?, .len = @intCast(kept.items.len) };
     single.debug = debug.items;
 
     // The same atoms with their records back to back in link order, debug

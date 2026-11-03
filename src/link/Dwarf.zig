@@ -264,7 +264,7 @@ fn buildLineHeader(arena: Allocator, line: *std.Io.Writer, files: []const []cons
     try line.writeInt(u32, 0, .little); // header_length, set below
     try line.writeAll(&.{ 1, 1, 1 }); // minimum_instruction_length, maximum_operations_per_instruction, default_is_stmt
     try line.writeAll(&.{ @bitCast(@as(i8, Atom.LineProgram.line_base)), Atom.LineProgram.line_range, Atom.LineProgram.opcode_base });
-    try line.writeAll(&.{ 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1 }); // standard_opcode_lengths
+    try line.writeAll(&standard_opcode_lengths);
     var dirs: std.StringArrayHashMapUnmanaged(void) = .empty;
     try dirs.put(arena, unit_dir, {});
     const file_dirs = try arena.alloc(usize, files.len);
@@ -293,6 +293,89 @@ fn buildLineHeader(arena: Allocator, line: *std.Io.Writer, files: []const []cons
         try line.writeUleb128(dir);
     }
     std.mem.writeInt(u32, line.buffered()[8..12], @intCast(line.end - 12), .little);
+}
+
+/// Operands of the standard opcodes 1 to `opcode_base` - 1, as the line
+/// programs' headers declare them.
+const standard_opcode_lengths = [_]u8{ 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1 };
+
+/// What a field that a relocatable object relocates holds: an address in
+/// .text, or an offset in .debug_abbrev, .debug_str, .debug_line, or
+/// .debug_rnglists.
+pub const Field = enum { addr, abbrev, str, line, ranges };
+
+/// Calls `f(ctx, section, offset, field)`, `section` being `.info` or
+/// `.line`, for each field of `info` and `line`, .debug_info and
+/// .debug_line as `place` and `ChunkWriter` wrote them, that holds an
+/// address or an offset in another section, in order within each section.
+/// For relocatable output, where each becomes a relocation.
+pub fn relocatableFields(info: []const u8, line: []const u8, ctx: anytype, comptime f: anytype) !void {
+    var at: usize = 0;
+    while (at < info.len) {
+        const end = at + 4 + std.mem.readInt(u32, info[at..][0..4], .little);
+        // See `place`: the unit header, then producer, language, name,
+        // comp_dir, stmt_list, low_pc, ranges.
+        try f(ctx, .info, at + 8, .abbrev);
+        try f(ctx, .info, at + 13, .str);
+        var p = skipString(info, skipString(info, at + 19));
+        try f(ctx, .info, p, .line);
+        try f(ctx, .info, p + 4, .addr);
+        try f(ctx, .info, p + 12, .ranges);
+        p += 16;
+        while (p < end) {
+            const code = info[p];
+            p += 1;
+            switch (code) {
+                0 => {}, // the end of an entry's children
+                abbrev_subprogram, abbrev_subprogram_parent => {
+                    p = skipString(info, skipString(info, p));
+                    try f(ctx, .info, p, .addr);
+                    p += 20;
+                },
+                abbrev_inline, abbrev_inline_parent => {
+                    p = skipString(info, p);
+                    try f(ctx, .info, p, .addr);
+                    p += 24;
+                },
+                else => unreachable,
+            }
+        }
+        at = end;
+    }
+    at = 0;
+    while (at < line.len) {
+        const end = at + 4 + std.mem.readInt(u32, line[at..][0..4], .little);
+        var p = at + 12 + std.mem.readInt(u32, line[at + 8 ..][0..4], .little);
+        while (p < end) {
+            const op = line[p];
+            p += 1;
+            if (op >= Atom.LineProgram.opcode_base) continue;
+            switch (op) {
+                0 => {
+                    var len: u64 = 0;
+                    var shift: u6 = 0;
+                    while (true) : (shift += 7) {
+                        const b = line[p];
+                        p += 1;
+                        len |= @as(u64, b & 0x7f) << shift;
+                        if (b & 0x80 == 0) break;
+                    }
+                    if (line[p] == DW.LNE.set_address) try f(ctx, .line, p + 1, .addr);
+                    p += @intCast(len);
+                },
+                DW.LNS.fixed_advance_pc => p += 2,
+                else => for (0..standard_opcode_lengths[op - 1]) |_| {
+                    while (line[p] & 0x80 != 0) p += 1;
+                    p += 1;
+                },
+            }
+        }
+        at = end;
+    }
+}
+
+fn skipString(bytes: []const u8, at: usize) usize {
+    return std.mem.indexOfScalarPos(u8, bytes, at, 0).? + 1;
 }
 
 pub fn deinit(d: *Dwarf, gpa: Allocator) void {

@@ -107,7 +107,12 @@ pub fn main(init: std.process.Init) !void {
     const out_path: ?[]const u8 = switch (opts.emit_bin) {
         .none => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else null,
         .path => |p| p,
-        .default => if (run_test) try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem) else stem,
+        .default => if (run_test)
+            try testBinPath(arena, init.io, try std.fs.path.join(arena, &.{ cache_dirs.local, "zap" }), stem)
+        else if (command == .build_obj)
+            try std.fmt.allocPrint(arena, "{s}.o", .{stem})
+        else
+            stem,
     };
     if (run_test) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
     const use_cache = out_path != null and !opts.dump_ir and (command == .build_exe or is_test) and
@@ -172,10 +177,11 @@ pub fn main(init: std.process.Init) !void {
         exitOnErrors(init, &zcu);
         return;
     }
-    if (command != .build_exe and command != .@"test") fatal("{s}: zap only implements build-exe and test so far", .{@tagName(command)});
+    if (command == .run) fatal("run: not implemented yet", .{});
 
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
+    emit.obj = command == .build_obj;
     try zcu.analyzeAll(&emit);
     stages.markSplit("sema", "codegen", emit.codegen_ns);
     if (is_test) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
@@ -365,6 +371,7 @@ test {
     _ = @import("cache.zig");
     _ = @import("link/Atom.zig");
     _ = @import("link/Elf.zig");
+    _ = @import("link/ElfObject.zig");
     _ = @import("codegen/x86_64/Encoder.zig");
     _ = @import("link/MachO.zig");
     _ = @import("codegen/aarch64/Encoder.zig");

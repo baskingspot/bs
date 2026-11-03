@@ -14,6 +14,7 @@ const Zcu = @import("Zcu.zig");
 const Atom = @import("link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Elf = @import("link/Elf.zig");
+const ElfObject = @import("link/ElfObject.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 
 const Emit = @This();
@@ -41,6 +42,15 @@ uses_error_names: bool = false,
 failed: bool = false,
 /// The entry symbol, once `finish` found it.
 entry: ?SymbolKey = null,
+/// Whether the output is a relocatable object (`zap build-obj`): it needs
+/// no entry, its exports are symbols for other objects, and symbols it
+/// does not define are imported from them.
+obj: bool = false,
+/// In an object, the symbols other objects define, by name, and whether
+/// every reference is weak.
+imports: std.StringArrayHashMapUnmanaged(bool) = .empty,
+/// In an object, its exports, once `finish` found them.
+exports: std.ArrayList(ElfObject.Export) = .empty,
 /// What produced each atom, for the on-disk cache (`Incremental`).
 atom_owners: std.ArrayList(Owner) = .empty,
 /// Content-addressed atoms each unit referred to.
@@ -98,6 +108,8 @@ pub fn deinit(emit: *Emit) void {
     emit.navs.deinit(gpa);
     emit.errors.deinit(gpa);
     emit.externs.deinit(gpa);
+    emit.imports.deinit(gpa);
+    emit.exports.deinit(gpa);
     emit.atom_owners.deinit(gpa);
     emit.content_uses.deinit(gpa);
     emit.unit_refs.deinit(gpa);
@@ -127,6 +139,7 @@ pub fn finish(emit: *Emit) !bool {
     const ip = &zcu.ip;
     // Before the declarations: a slot can request an exported one.
     if (!try emit.lowerExternSlots()) return false;
+    if (emit.obj) try emit.findExports();
     // Lowering a declaration can request more declarations.
     var i: usize = 0;
     while (i < emit.navs.count()) : (i += 1) {
@@ -145,7 +158,7 @@ pub fn finish(emit: *Emit) !bool {
     }
     if (emit.failed) return false;
     emit.entry = entry;
-    if (entry == null) {
+    if (entry == null and !emit.obj) {
         try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap requires the root file to export '_start' (std.start is not supported yet)", .{});
         return false;
     }
@@ -166,7 +179,14 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
-    Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, .{ .entry = emit.entry.?, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd }) catch |err| {
+    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd };
+    const result = if (emit.obj) obj: {
+        const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
+        defer emit.gpa.free(imports);
+        for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, weak| imp.* = .{ .key = importKey(name), .name = name, .weak = weak };
+        break :obj ElfObject.link(emit.gpa, io, dir, sub_path, emit.atoms.items, options, .{ .exports = emit.exports.items, .imports = imports });
+    } else Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, options);
+    result catch |err| {
         std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
         return false;
     };
@@ -215,15 +235,55 @@ fn externSlotKey(name: []const u8) SymbolKey {
     return .fromName(std.fmt.bufPrint(&buf, "extern.{s}", .{name}) catch name);
 }
 
+/// The key relocations name an imported symbol by (see `useImport`).
+fn importKey(name: []const u8) SymbolKey {
+    var buf: [256]u8 = undefined;
+    return .fromName(std.fmt.bufPrint(&buf, "import.{s}", .{name}) catch name);
+}
+
+/// In an object, the key of `name`, which another object defines.
+fn useImport(emit: *Emit, name: []const u8, weak: bool) !SymbolKey {
+    const gop = try emit.imports.getOrPut(emit.gpa, name);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try emit.allocator().dupe(u8, name);
+        gop.value_ptr.* = weak;
+    } else if (!weak) gop.value_ptr.* = false;
+    return importKey(name);
+}
+
+/// Collects an object's exports: each name once, as `exportTarget` picks
+/// it, and only those with an atom.
+fn findExports(emit: *Emit) !void {
+    const ip = &emit.zcu.ip;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(emit.gpa);
+    for (emit.zcu.exports.items) |x| {
+        const name = ip.stringSlice(x.name);
+        const key = switch (x.target) {
+            .nav => |n| key: {
+                const nav = ip.getNav(n);
+                if (nav.status != .resolved) continue;
+                if (ip.indexToKey(nav.val) == .func) break :key try emit.funcKey(nav.val);
+                if (!Type.hasRuntimeBits(ip, ip.typeOf(nav.val))) continue;
+                break :key try emit.navKey(n);
+            },
+            .uav => |v| try emit.uavKey(v, 0),
+        };
+        if ((try seen.getOrPut(emit.gpa, name)).found_existing) continue;
+        try emit.exports.append(emit.gpa, .{ .key = key, .name = name });
+    }
+}
+
 /// Writes the slot of each external symbol: the address of the export of
-/// that name, or 0 for an undefined weak symbol. Returns false after
-/// reporting an undefined strong symbol.
+/// that name, or 0 for an undefined weak symbol; in an object, a symbol
+/// that is not exported is imported. Returns false after reporting an
+/// undefined strong symbol.
 fn lowerExternSlots(emit: *Emit) !bool {
     const zcu = emit.zcu;
     const arena = emit.allocator();
     var ok = true;
     for (emit.externs.keys(), emit.externs.values()) |name, weak| {
-        const target = try emit.exportTarget(name);
+        const target = if (emit.obj) try emit.userExport(name) orelse try emit.useImport(name, weak) else try emit.exportTarget(name);
         if (target == null and !weak) {
             try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
             ok = false;
@@ -246,9 +306,18 @@ fn lowerExternSlots(emit: *Emit) !bool {
     return ok;
 }
 
-/// The symbol exported as `name`, or null if there is none. Complete only
-/// once analysis is.
+/// The symbol exported as `name`, or null if there is none. In an object,
+/// a symbol that is not exported is imported, as upstream leaves it to the
+/// final link; an executable resolves it against compiler_rt, as upstream
+/// links it. Complete only once analysis is.
 pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
+    if (try emit.userExport(name)) |key| return key;
+    if (emit.obj) return try emit.useImport(name, false);
+    return if (try emit.zcu.requestCompilerRtExport(name)) |key| .fromName(key) else null;
+}
+
+/// The symbol the compilation exports as `name`, or null.
+fn userExport(emit: *Emit, name: []const u8) !?SymbolKey {
     const zcu = emit.zcu;
     const ip = &zcu.ip;
     for (zcu.exports.items) |x| {
@@ -261,7 +330,7 @@ pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
         if (nav.status != .resolved) continue;
         return if (ip.indexToKey(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x_nav);
     }
-    return if (try zcu.requestCompilerRtExport(name)) |key| .fromName(key) else null;
+    return null;
 }
 
 pub fn allocator(emit: *Emit) Allocator {

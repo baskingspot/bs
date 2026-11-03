@@ -846,6 +846,55 @@ the laziness rule; unboxed integers in the frame; then a denser encoding.
   (2026-11-03; 12.4 ms with the shared mapping; ELF, with DWARF:
   13.3 ms). SHA-256 of the 27 MiB output alone takes 8.8 ms on one thread,
   most of the gap to stripped ELF; the rest is the extra relocations.
+- Relocatable objects (`zap build-obj`, x86_64-linux;
+  `src/link/ElfObject.zig`, built 2026-11-03) come from the same Atoms.
+  The object is the executable image `Elf.emit` lays out (with no entry,
+  and imports resolved to 0), kept at the same file offsets, plus a new
+  tail: a RELA section per section with relocations, and the object's
+  symbol table. The executable link path is unchanged; an object costs the
+  image plus one serial pass over the atoms and debug info. ET_REL, no
+  program headers, section addresses 0; .eh_frame_hdr is dropped (the
+  final link writes its own), and an empty .note.GNU-stack is added.
+  .debug_str is SHF_MERGE|SHF_STRINGS as compilers write it (upstream's
+  linker mis-sizes the output's .debug_str otherwise).
+  - Symbols: a section symbol per section; a LOCAL symbol per atom, valued
+    at its section offset; a GLOBAL symbol per export (`Emit` collects
+    `Zcu.exports`; one per name; zap has no export linkage yet, so all are
+    strong), which replaces the atom's local symbol when the names match;
+    an undefined GLOBAL or WEAK symbol per import. In an object, an
+    `extern` that the compilation does not export is imported
+    (`Emit.useImport`) instead of resolved against compiler_rt or
+    rejected, as upstream leaves it to the final link; compiler_rt helpers
+    CodeGen calls are still compiled in, as local symbols. As upstream,
+    a root with `pub fn main` gets std.start's `_start` in an object too.
+  - Relocations against the target atom's symbol: R_X86_64_64, PC32,
+    TPOFF32 (local-exec, so the final link must be an executable), and
+    8/16/32/64 for `value*` relocations naming a symbol; targets with a
+    link-time value (error codes) stay resolved. Debug info: addresses in
+    .debug_info and .debug_line become R_X86_64_64 against .text, the units'
+    offsets into .debug_abbrev, .debug_str, .debug_line, and
+    .debug_rnglists R_X86_64_32 against those sections, found by walking
+    the sections as `Dwarf` wrote them (`Dwarf.relocatableFields`); each
+    FDE's pc_begin becomes R_X86_64_PC32 against .text.
+  - Code is not position-independent (absolute addresses in .rodata):
+    link with upstream `zig build-exe` (static, non-PIE), `ld`, or `cc
+    -no-pie`; a PIE link works with text relocations and warnings.
+  - Checked (2026-11-03): an object exporting functions and data,
+    importing a function, and using a thread-local links with upstream
+    `zig build-exe` (self-hosted linker and `-fllvm -flld`), `cc -no-pie`,
+    and `ld` (with its own `_start`), alongside an upstream-built object,
+    and runs correctly; gdb breaks on its functions by qualified name,
+    shows inlined frames and source lines, and unwinds through its FDEs;
+    a panic in its code prints upstream-style stack traces through both
+    objects' frames. `zig build test` checks the upstream link and the
+    panic trace (test/obj).
+  - Cost (ReleaseFast zap, orb, cache off, a copy of the program whose
+    code an export reaches): hello, link stage 6.5–8.3 ms for the object
+    against 3.1–4.3 ms for the executable, in a 230 ms build; libvaxis
+    text_input, 8.7–10.1 ms against 4.6–6.0 ms, in a 560 ms build.
+  - build-obj does not use the on-disk cache yet: a relink would need the
+    exports, the imports, and the output kind in the manifest, and
+    `ElfObject` to take the cache's input with numbered symbols.
 
 ### compiler_rt (decided 2026-11-02)
 

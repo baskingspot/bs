@@ -56,7 +56,9 @@ comptime {
 }
 
 pub const Options = struct {
-    entry: SymbolKey,
+    /// Null for no entry point (e_entry 0), as `ElfObject` builds its
+    /// image.
+    entry: ?SymbolKey,
     /// Integers assigned by the whole compilation, for relocation targets
     /// that are not symbols (see the `value*` relocation kinds).
     values: []const Value = &.{},
@@ -266,28 +268,31 @@ pub inline fn ref(p: anytype) switch (@typeInfo(@TypeOf(p.*))) {
     };
 }
 
-/// Overwrites the old output in place if it is a regular executable file
-/// with one link, not running (Linux refuses to open a running executable
+/// Overwrites the old output in place if it is a regular file, executable
+/// as the new output is or not, with one link, not running (Linux refuses to open a running executable
 /// for writing), and mostly in the page cache, since writing to a page that
 /// is not would first read it from disk. Otherwise replaces it with a new
 /// file, so that a running old executable keeps its own inode. The size
 /// changes with `ftruncate`, never through 0: ext4 starts writeback of a
 /// file truncated to 0 and rewritten when it is closed.
-const ReusedOutput = struct {
+pub const ReusedOutput = struct {
     dir: std.Io.Dir,
     sub_path: []const u8,
     writes: FileWrites,
+    /// Whether the output is an executable; only an old output of the same
+    /// kind is reused.
+    executable: bool = true,
     file: ?std.Io.File = null,
     map: []align(std.heap.page_size_min) u8 = &.{},
 
-    fn target(o: *ReusedOutput, io: std.Io, len: usize) !Target {
+    pub fn target(o: *ReusedOutput, io: std.Io, len: usize) !Target {
         const in_place = builtin.os.tag == .linux and o.reuse(io, len);
         if (!in_place) {
             o.dir.deleteFile(io, o.sub_path) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => |e| return e,
             };
-            o.file = try o.dir.createFile(io, o.sub_path, .{ .read = true, .permissions = .executable_file });
+            o.file = try o.dir.createFile(io, o.sub_path, .{ .read = true, .permissions = if (o.executable) .executable_file else .default_file });
             try o.file.?.setLength(io, len);
         }
         // Writing through the mapping pays a fault and page_mkwrite per
@@ -310,7 +315,7 @@ const ReusedOutput = struct {
     fn reuse(o: *ReusedOutput, io: std.Io, len: usize) bool {
         const file = o.dir.openFile(io, o.sub_path, .{ .mode = .read_write, .follow_symlinks = false }) catch return false;
         const st = file.stat(io) catch return closed(io, file);
-        if (st.kind != .file or st.nlink != 1 or @backingInt(st.permissions) & 0o111 == 0) return closed(io, file);
+        if (st.kind != .file or st.nlink != 1 or (@backingInt(st.permissions) & 0o111 != 0) != o.executable) return closed(io, file);
         file.setLength(io, len) catch return closed(io, file);
         const old_len = std.mem.alignBackward(usize, @min(len, st.size), std.heap.page_size_min);
         if (old_len > 0) {
@@ -341,7 +346,7 @@ const ReusedOutput = struct {
         return resident * 8 >= map.len / std.heap.page_size_min * 7;
     }
 
-    fn close(o: *ReusedOutput, io: std.Io) void {
+    pub fn close(o: *ReusedOutput, io: std.Io) void {
         if (o.map.len > 0) std.posix.munmap(o.map);
         if (o.file) |f| f.close(io);
     }
@@ -547,10 +552,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             addrs[v.symbol] = @intCast(value_tag + i);
         }
     } else {
-        if (symbols.get(options.entry) == null) {
-            diag.* = .{ .target = options.entry };
+        if (options.entry) |e| if (symbols.get(e) == null) {
+            diag.* = .{ .target = e };
             return error.UndefinedSymbol;
-        }
+        };
         values = try .init(options.values.len, 1);
         for (options.values) |v| values.getOrPut(v.key).* = .{ .key = v.key, .value = v.value, .used = true };
     }
@@ -607,7 +612,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     l.tls = .{ .start = base + tls_start, .end = base + tls_end, .tp = base + tls_start + tls_align.forward(tls_end - tls_start) };
     try parallel(io, n_threads, l.n_resolve_tasks + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
     try l.check(diag);
-    const entry_addr = if (numbered) |s| l.numberedAddr(addrs[s.entry]) else symbols.get(options.entry).?;
+    const entry_addr = if (numbered) |s| l.numberedAddr(addrs[s.entry]) else if (options.entry) |e| symbols.get(e).? else 0;
     if (entry_addr == null) {
         diag.* = .{ .target = options.entry };
         return error.UndefinedSymbol;

@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     const upstream_step = b.step("test-upstream", "Run the run tests with upstream zig, the oracle");
     addRunTests(b, exe, test_step, upstream_step);
+    addObjTests(b, exe, test_step);
 
     // Always ReleaseFast: a Debug build of zap says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
@@ -193,6 +194,37 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             (if (upstream) upstream_step else test_step).dependOn(&run.step);
         }
     }
+}
+
+/// `zap build-obj`: test/obj/lib.zig, linked into test/obj/main.zig by
+/// upstream zig, run normally and into a panic in the object's code, whose
+/// stack trace needs the object's debug info.
+fn addObjTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const host = b.graph.host.result;
+    if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
+    const obj = b.addRunArtifact(zap);
+    obj.addArg("build-obj");
+    obj.addFileArg(b.path("test/obj/lib.zig"));
+    const lib_o = obj.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
+    const exe = b.addSystemCommand(&.{ b.graph.zig_exe, "build-exe", "-fno-llvm", "-fno-lld" });
+    exe.addFileArg(b.path("test/obj/main.zig"));
+    exe.addFileArg(lib_o);
+    const bin = exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+
+    const run = std.Build.Step.Run.create(b, "run obj main");
+    run.addFileArg(bin);
+    run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+    run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&run.step);
+    const panic = std.Build.Step.Run.create(b, "run obj main (panic)");
+    panic.addFileArg(bin);
+    panic.addArg("panic");
+    panic.addCheck(.{ .expect_stderr_match = "panic: integer overflow\n" });
+    panic.addCheck(.{ .expect_stderr_match = "lib.zig:25:14: 0x" });
+    panic.addCheck(.{ .expect_stderr_match = " in zap_overflow (lib.zig)\n    return x + 250;\n" });
+    panic.addCheck(.{ .expect_stderr_match = "main.zig:14:39: 0x" });
+    panic.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
+    test_step.dependOn(&panic.step);
 }
 
 fn defaultZigLibDir(b: *std.Build) []const u8 {
