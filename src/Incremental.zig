@@ -27,6 +27,7 @@ const atoms_codec = cache.atoms;
 const Hash = cache.Hash;
 const Frontend = @import("Frontend.zig");
 const InternPool = @import("InternPool.zig");
+const Type = @import("Type.zig");
 const Zcu = @import("Zcu.zig");
 const Emit = @import("Emit.zig");
 const Atom = @import("link/Atom.zig");
@@ -406,12 +407,24 @@ const Recorder = struct {
     /// most of recording the graph, and only reads the Zcu.
     fn prepare(r: *Recorder, io: Io) !void {
         const gpa = r.gpa;
+        // `isComptimeOnly` caches its answers in the types, so it runs here,
+        // on one thread, before the layouts are hashed on every core.
+        const comptime_only = try gpa.alloc(bool, r.unit_list.items.len);
+        defer gpa.free(comptime_only);
+        for (r.unit_list.items, comptime_only) |u, *c| c.* = switch (u) {
+            .type_layout => |ty| switch (r.zcu.ip.indexToKey(ty)) {
+                .struct_type, .union_type => r.zcu.ip.structInfo(ty).status == .have_layout and Type.isComptimeOnly(&r.zcu.ip, ty),
+                else => false,
+            },
+            else => false,
+        };
         r.unit_info = try gpa.alloc(Info, r.unit_list.items.len);
         @memset(r.unit_info, .{});
         r.dependee_info = try gpa.alloc(Info, r.dependee_list.items.len);
         @memset(r.dependee_info, .{});
         try forChunks(io, r.unit_list.items.len + r.dependee_list.items.len, struct {
             r: *const Recorder,
+            comptime_only: []const bool,
 
             fn run(c: @This(), lo: usize, hi: usize, _: usize) !void {
                 var k: Keyer = .{ .zcu = c.r.zcu, .key_buf = .init(c.r.gpa), .unit_buf = .init(c.r.gpa) };
@@ -420,12 +433,12 @@ const Recorder = struct {
                 const n_units = c.r.unit_list.items.len;
                 for (lo..hi) |i| {
                     if (i < n_units)
-                        c.r.unit_info[i] = try k.unitInfo(c.r.unit_list.items[i])
+                        c.r.unit_info[i] = try k.unitInfo(c.r.unit_list.items[i], c.comptime_only[i])
                     else
                         c.r.dependee_info[i - n_units] = try k.dependeeInfo(c.r.dependee_list.items[i - n_units]);
                 }
             }
-        }{ .r = r });
+        }{ .r = r, .comptime_only = comptime_only });
     }
 
     /// The node of unit `i` (an index in `unit_list`).
@@ -560,20 +573,20 @@ const Keyer = struct {
         return @bitCast(h);
     }
 
-    fn unitInfo(k: *Keyer, unit: Zcu.AnalUnit) !Recorder.Info {
+    /// `comptime_only`: whether a `type_layout` unit's type is.
+    fn unitInfo(k: *Keyer, unit: Zcu.AnalUnit, comptime_only: bool) !Recorder.Info {
         const ip = &k.zcu.ip;
         var info: Recorder.Info = .{ .key = try k.keyOf(Recorder.unitTag(unit), &.{try k.unitKeyString(unit)}) };
         switch (unit) {
             .nav_val => |nav_index| {
                 const nav = ip.getNav(nav_index);
                 info.src_hash = k.srcHash(nav.file, nav.zir_inst);
-                if (nav.status == .resolved) info.result_hash = ip.stableHash(nav.val);
+                if (nav.status == .resolved) info.result_hash = navResultHash(ip, nav);
             },
             .type_layout => |ty| {
                 const c = ip.containerType(ty).?;
                 info.src_hash = k.srcHash(c.file, c.zir_inst);
-                // The type's identity; its layout is not hashed yet.
-                info.result_hash = ip.stableHash(ty);
+                info.result_hash = layoutResultHash(ip, ty, comptime_only);
             },
             .func => |func| {
                 const owner = ip.getNav(ip.indexToKey(func).func.owner_nav);
@@ -633,6 +646,55 @@ const Keyer = struct {
         }
     }
 };
+
+/// A resolved declaration's result: its value, and what dependents read
+/// besides it.
+fn navResultHash(ip: *const InternPool, nav: *const InternPool.Nav) Hash {
+    var h = std.hash.Wyhash.init(8);
+    h.update(std.mem.asBytes(&ip.stableHash(nav.val)));
+    h.update(&.{ @intFromBool(nav.is_const), @intFromBool(nav.is_threadlocal), @backingInt(nav.linkage) });
+    h.update(std.mem.asBytes(&nav.alignment));
+    const lo = h.final();
+    return @as(Hash, ip.stableHash(nav.val) >> 64 ^ lo) << 64 | lo;
+}
+
+/// A container type's layout result: everything its `ContainerInfo` tells
+/// dependents, with types by identity, so that early cutoff stops only
+/// when the layout is truly unchanged. `comptime_only` is in it: a field
+/// type gaining a `type` field can leave sizes and offsets alone. Before
+/// the layout is known (an opaque type, a failed one), the type's
+/// identity.
+fn layoutResultHash(ip: *const InternPool, ty: InternPool.Index, comptime_only: bool) Hash {
+    const id = ip.stableHash(ty);
+    const kind = std.meta.activeTag(ip.indexToKey(ty));
+    if (kind == .opaque_type) return id;
+    const info = ip.structInfo(ty);
+    if (info.status != .have_layout) return id;
+    var h = std.hash.Wyhash.init(9);
+    const Helper = struct {
+        fn index(hh: *std.hash.Wyhash, pool: *const InternPool, i: InternPool.Index) void {
+            const x: Hash = if (i == .none) 0 else pool.stableHash(i);
+            hh.update(std.mem.asBytes(&x));
+        }
+    };
+    h.update(std.mem.asBytes(&id));
+    h.update(&.{ @backingInt(info.layout), @intFromBool(info.nonexhaustive), @intFromBool(info.has_runtime_tag) });
+    for (info.field_names) |n| {
+        h.update(ip.stringSlice(n));
+        h.update(&.{0});
+    }
+    for (info.field_types) |t| Helper.index(&h, ip, t);
+    for (info.field_defaults) |d| Helper.index(&h, ip, d);
+    h.update(std.mem.sliceAsBytes(info.field_offsets));
+    h.update(std.mem.sliceAsBytes(info.field_is_comptime));
+    h.update(std.mem.sliceAsBytes(info.field_aligns));
+    Helper.index(&h, ip, info.tag_type);
+    h.update(std.mem.asBytes(&info.size));
+    h.update(std.mem.asBytes(&info.alignment));
+    h.update(&.{@intFromBool(comptime_only)});
+    const lo = h.final();
+    return @as(Hash, id >> 64 ^ lo) << 64 | lo;
+}
 
 /// Starts recording the build that `emit` is about to link, on another
 /// thread: `record` needs only the atoms and the Zcu, which the link does

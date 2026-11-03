@@ -990,9 +990,7 @@ it and can flush every CPU's TLB.
   into the manifest's log (not past the fold size). Before, that was a
   full rebuild and a full manifest rewrite.
 - Not yet: re-analyzing only the predicted units after an edit (designed
-  below); a layout hash for `type_layout` results (the type's identity
-  stands in, so a layout change is caught through its `src_hash`, not its
-  result); recording comptime side effects.
+  below); recording comptime side effects.
 
 ### Edit builds: replaying cached results (designed 2026-11-03, for review)
 
@@ -1151,8 +1149,10 @@ scheduling; outputs stay correct, but byte-identical output across cold
 builds would need sorting new names before assigning them at the end of
 analysis.
 
-**`type_layout` result hash.** Today a layout node's result is the type's
-identity, which is wrong under early cutoff: when a field's type grows,
+**`type_layout` result hash** (built 2026-11-03 in `record`, except the
+eager `comptime_only` and its recorded walk, which are Sema's). A layout
+node's result used to be the type's identity, which is wrong under early
+cutoff: when a field's type grows,
 the field type's layout result changes, ours is re-analyzed, and its
 unchanged identity would stop the walk before the functions that use our
 offsets. The result hash becomes the hash of the canonical `ContainerInfo`
@@ -1168,8 +1168,10 @@ comptime-only, leaving functions that take `S` at runtime green. So
 `comptime_only` is computed eagerly at `have_layout`, and the layouts that
 computation walks, through pointers too, are recorded as dependencies.
 `nav_val`'s result hash adds
-`is_const` and `linkage` to the value's stable hash, since dependents read
-those too.
+`is_const`, `is_threadlocal`, `linkage`, and `alignment` to the value's
+stable hash, since dependents read those too. Until Sema computes
+`comptime_only` at `have_layout`, `record` computes it, on one thread
+before hashing, since `isComptimeOnly` caches its answers in the types.
 
 **Debug info of green functions.** `src_hash` ignores a declaration's
 line, so lines added above a green function move its `base_line`
