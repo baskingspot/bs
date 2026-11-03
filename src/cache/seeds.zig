@@ -14,8 +14,9 @@
 //!   longer maps, or whose `src_hash` changed, is a seed (its units:
 //!   `nav_val`, `func`, `type_layout`, `struct_defaults`, `comptime_decl`,
 //!   and `func_body`, whose result is that hash);
-//! - a `namespace` node is a seed if its container's declaration names
-//!   changed (in order, as its result hashes them); a `namespace_name`
+//! - a `namespace` node is a seed if its container's declaration names, or
+//!   which of them are `pub`, changed (in order, as its result hashes
+//!   them); a `namespace_name`
 //!   node, if the name it looks up appeared, disappeared, or changed
 //!   `pub`;
 //! - an embedded file's node is a seed if the file changed;
@@ -113,7 +114,7 @@ fn isSeed(
                 const o = nextNamed(old, old_decls, &oi);
                 const w = nextNamed(new, new_decls, &ni);
                 if (o == null or w == null) return (o == null) != (w == null);
-                if (!std.mem.eql(u8, o.?.name, w.?.name)) return true;
+                if (!std.mem.eql(u8, o.?.name, w.?.name) or o.?.is_pub != w.?.is_pub) return true;
             }
         },
         .namespace_name => {

@@ -682,8 +682,12 @@ const Keyer = struct {
             },
             .namespace => |ns_index| {
                 const ns = k.zcu.namespacePtr(ns_index);
+                // The names, and which are `pub`: `@typeInfo`'s
+                // `decl_names` lists only those.
                 var h: Hash = 0;
-                for (ns.decls.keys()) |name| h = cache.hash(@truncate(h), ip.stringSlice(name)) ^ h;
+                for (ns.decls.keys(), ns.decls.values()) |name, nav| {
+                    h = cache.hash(@as(u64, @truncate(h)) ^ @intFromBool(ip.getNav(nav).is_pub), ip.stringSlice(name)) ^ h;
+                }
                 return .{ .key = try k.keyOf(.namespace, &.{ns.key}), .result_hash = h, .source = k.namespaceSource(ns) };
             },
             // The file's contents, by its path in its module.
