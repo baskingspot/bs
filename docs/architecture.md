@@ -2594,15 +2594,39 @@ What remains, by inclusive instructions on the zig workload:
   `Type.fieldOffset`) called from `CodeGen.lowerValue`, which recompute a
   type's whole layout for each union constant or tuple field.
 - `InternPool.indexToKey` 10 G self (15%): about 270 M decodes, many to
-  read one field or the tag of a type (`intInfo`, `abiSize`,
-  `hasRuntimeBits`, `resolveLayout`). Typed accessors that decode only
-  what the caller reads would take most of it.
+  read one field or the tag of a type. Done in the next round (below).
 - Each unit's dependency set (`deps_set`): 1.2 G in its lookups and
   growth.
 - Evaluator-shaped work: `mnemonic_table`'s remaining 0.6 s is a 100 k
   iteration comptime loop of `++`, `@tagName` and `@hasField` that the
-  walker runs; OSR sees the loop but does not take it over (not yet
-  investigated). `stringToEnum`'s comptime maps are similar.
+  walker runs. OSR cannot take it over: in the lowered body the loop
+  counter is a run-time value, and `prefix ++ @tagName(tag) ++ suffix`
+  needs comptime-known operands because their lengths fix the result's
+  type (the outer loop also calls generic `std.mem.findScalar`, which
+  lowering refuses). Only an evaluator with value-dependent types could
+  run it; see the next round for the walker side. `stringToEnum`'s
+  comptime maps are similar.
+
+Next round (against origin/main 990d930, same measures): zig workload
+63.39 G → 51.39 G instructions (−18.9%; Sema wall time 7.2–8.8 → 6.1–7.1 s,
+noisy), libvaxis 1.781 G → 1.515 G (−14.9%), hello 809 M → 713 M
+(−12.0%), binary.zig 69.7 G → 62.6 G (−10.2%). What changed:
+
+- Typed reads (see "InternPool"): about 460 `indexToKey(x).tag` sites and
+  every switch that captures no payload now decode only what they read;
+  `structInfo` reads the info word alone. `indexToKey` fell from 16% to
+  about 3% of the zig workload; the rest is mostly `get`'s equality,
+  which now decodes only the matching payload.
+- `unwrapIndex`, under every item read, computed its shift and branched
+  on the thread count; both are precomputed now.
+- `refersToComptimeAlloc` (every argument of every comptime call) caches
+  its answer per aggregate value: libvaxis passes uucode's tables again
+  and again.
+- On the `mnemonic_table` loop (a 1500-tag repro: 530 → 379 M
+  instructions): an enum tag's index tries its value as the index before
+  scanning the tags, and `@hasField`/`@field` read a constant byte array's
+  name without coercing and loading it. What remains is the walker's
+  per-operation interning (`InternPool.get` is 40% of the loop).
 
 ### Parallel function bodies (designed 2026-11-03, for review)
 
