@@ -315,6 +315,11 @@ pub const Namespace = struct {
     fqn: []const u8,
     /// Stable key prefix of declarations in this namespace.
     key: []const u8,
+    /// `key` without the captures of any type, its own or an enclosing
+    /// one's: the declarations' path from the file, which the keys of the
+    /// types they make extend with those types' own captures
+    /// (`Sema.anonTypeKey`).
+    path: []const u8,
     decls: std.AutoArrayHashMapUnmanaged(InternPool.String, InternPool.NavIndex) = .empty,
     /// Whether creating it queued `comptime`, exported or test
     /// declarations: effects beyond the type itself.
@@ -566,8 +571,21 @@ pub fn fileRootType(zcu: *Zcu, file_index: u32) !InternPool.Index {
 
 pub const ContainerKind = enum { @"struct", @"enum", @"union", @"opaque" };
 
+/// The end of a container type's stable key: the stable hashes of its
+/// captures, `(h1,h2)`, or nothing if it has none.
+pub fn writeCaptures(ip: *const InternPool, w: *std.Io.Writer, captures: []const InternPool.Index) std.Io.Writer.Error!void {
+    if (captures.len == 0) return;
+    try w.writeAll("(");
+    for (captures, 0..) |c, i| {
+        if (i != 0) try w.writeAll(",");
+        if (c != .none) try w.print("{x}", .{ip.stableHash(c)});
+    }
+    try w.writeAll(")");
+}
+
 /// Interns a declared container type of `kind` with display name `fqn` and
-/// stable key `key`. If it is new, creates its namespace and declarations
+/// stable key `key`, which ends with the type's captures
+/// (`writeCaptures`). If it is new, creates its namespace and declarations
 /// and queues its `comptime` and exported declarations. A type made by
 /// `@Struct`, `@Union`, or `@Enum` passes its `reified_layout`; it has no
 /// declarations.
@@ -618,15 +636,21 @@ pub fn createContainerType(
 
     const ns_index: u32 = @intCast(zcu.namespaces.items.len);
     si.namespace = ns_index;
+    const arena = zcu.arena.allocator();
+    // The caller's names may live in a Sema arena.
+    const ns_key = try arena.dupe(u8, key);
+    var caps: std.Io.Writer.Allocating = .init(zcu.gpa);
+    defer caps.deinit();
+    writeCaptures(ip, &caps.writer, captures) catch return error.OutOfMemory;
+    std.debug.assert(std.mem.endsWith(u8, key, caps.written()));
     try zcu.namespaces.append(zcu.gpa, .{
         .file = file_index,
         .parent = parent_ns,
         .owner_type = ty,
-        // The caller's names may live in a Sema arena.
-        .fqn = try zcu.arena.allocator().dupe(u8, fqn),
-        .key = try zcu.arena.allocator().dupe(u8, key),
+        .fqn = try arena.dupe(u8, fqn),
+        .key = ns_key,
+        .path = ns_key[0 .. key.len - caps.written().len],
     });
-    const arena = zcu.arena.allocator();
     const key_sep = if (parent_ns == Namespace.none) ":" else ".";
     const collect_tests = zcu.is_test and zcu.file(file_index).module == zcu.fe.main_module;
     const effects = zcu.comptime_decls.count() + zcu.exports.items.len + zcu.test_functions.items.len;

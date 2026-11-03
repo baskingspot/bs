@@ -5814,8 +5814,10 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
     const ip = sema.ip;
     switch (strategy) {
         .parent => if (sema.owner_nav != .none and block.inlining == null) {
-            const nav = ip.getNav(sema.owner_nav);
-            return .{ .display = ip.stringSlice(nav.fqn), .key = ip.stringSlice(nav.key) };
+            var aw: std.Io.Writer.Allocating = .init(sema.arena);
+            sema.writeTypePath(&aw.writer, sema.owner_nav) catch return error.OutOfMemory;
+            Zcu.writeCaptures(ip, &aw.writer, captures) catch return error.OutOfMemory;
+            return .{ .display = ip.stringSlice(ip.getNav(sema.owner_nav).fqn), .key = aw.written() };
         },
         .func => if (block.inlining) |inlining| {
             var aw: std.Io.Writer.Allocating = .init(sema.arena);
@@ -5901,60 +5903,47 @@ const AnonTypeNumber = struct {
 };
 
 /// The stable key of an anonymous container type made by ZIR instruction
-/// `inst` with `captures`: the key of the declaration whose code holds
-/// `inst`, the offset of `inst` from that declaration, and the stable
-/// hashes of the captures. A type's identity is its ZIR instruction and
-/// captures, as upstream (`InternPool` compares them), so its key is a
-/// function of exactly those: not of the arguments of the comptime call
-/// that made it, nor of how many types its unit made before. It must
-/// still tell distinct types apart, since their declarations' keys
-/// extend it.
-///
-/// So the declaration's key enters without the captures of the generic
-/// instances on its path: a type that captures none of an instance's
-/// arguments is one type for all instances (`fn F(comptime T: type) type
-/// { return struct {}; }`), and its key must not name whichever instance
-/// made it first. That would depend on analysis order, which differs
-/// between a full build and a replay that loads some instances green.
+/// `inst` with `captures`: the path of the declaration whose code holds
+/// `inst` (`writeTypePath`), the offset of `inst` from that declaration,
+/// and the stable hashes of the captures. A type's identity is its ZIR
+/// instruction and captures, as upstream (`InternPool` compares them), so
+/// its key is a function of exactly those: not of the arguments of the
+/// comptime call that made it, nor of which instance of an enclosing
+/// generic type made it first, nor of how many types its unit made
+/// before. It must still tell distinct types apart, since their
+/// declarations' keys extend it.
 fn anonTypeKey(sema: *Sema, block: *Block, inst: Zir.Inst.Index, captures: []const Index) Allocator.Error![]const u8 {
-    const ip = sema.ip;
-    var base_key: std.Io.Writer.Allocating = .init(sema.arena);
-    const nav, const base = sema.anonTypeBase(block);
-    // A `comptime` block, or a container's field types and defaults, if
-    // not a declaration.
-    if (nav != .none) {
-        base_key.writer.writeAll(ip.stringSlice(ip.getNav(nav).key)) catch return error.OutOfMemory;
-    } else sema.zcu.unitKey(sema.owner, &base_key.writer) catch return error.OutOfMemory;
     var aw: std.Io.Writer.Allocating = .init(sema.arena);
     const w = &aw.writer;
-    writeWithoutCaptures(w, base_key.written()) catch return error.OutOfMemory;
-    w.print("#{d}(", .{@as(i64, @backingInt(inst)) - @backingInt(base)}) catch return error.OutOfMemory;
-    for (captures, 0..) |c, i| {
-        if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
-        if (c != .none) w.print("{x}", .{ip.stableHash(c)}) catch return error.OutOfMemory;
-    }
-    w.writeAll(")") catch return error.OutOfMemory;
+    const nav, const base = sema.anonTypeBase(block);
+    sema.writeTypePath(w, nav) catch return error.OutOfMemory;
+    w.print("#{d}", .{@as(i64, @backingInt(inst)) - @backingInt(base)}) catch return error.OutOfMemory;
+    Zcu.writeCaptures(sema.ip, w, captures) catch return error.OutOfMemory;
     return aw.written();
 }
 
-/// Writes `key` with the capture lists this function writes, `#<n>(<hex>,
-/// ...)`, emptied.
-fn writeWithoutCaptures(w: *std.Io.Writer, key: []const u8) std.Io.Writer.Error!void {
-    var i: usize = 0;
-    while (i < key.len) {
-        try w.writeByte(key[i]);
-        i += 1;
-        if (key[i - 1] != '#') continue;
-        var j = i;
-        if (j < key.len and key[j] == '-') j += 1;
-        const digits = j;
-        while (j < key.len and std.ascii.isDigit(key[j])) j += 1;
-        if (j == digits or j == key.len or key[j] != '(') continue;
-        var end = j + 1;
-        while (end < key.len and (std.ascii.isHex(key[end]) or key[end] == ',')) end += 1;
-        if (end == key.len or key[end] != ')') continue;
-        try w.writeAll(key[i .. j + 1]);
-        i = end;
+/// The path of declaration `nav` from its file, without the captures of
+/// the types around it (`Namespace.path`), which the key of a type made in
+/// its code starts with; if `nav` is `none`, of this unit's `comptime`
+/// block, or of the container whose field types and defaults it resolves.
+/// Distinct instances of a generic type share one path, as they share the
+/// types they make that capture nothing of them.
+fn writeTypePath(sema: *Sema, w: *std.Io.Writer, nav: InternPool.NavIndex) std.Io.Writer.Error!void {
+    const ip = sema.ip;
+    const zcu = sema.zcu;
+    const ns_index = if (nav != .none) ip.getNav(nav).namespace else switch (sema.owner) {
+        .comptime_decl => |c| c.namespace,
+        .type_layout, .struct_defaults => |ty| ip.structInfo(ty).namespace,
+        else => unreachable,
+    };
+    const ns = zcu.namespacePtr(ns_index);
+    const sep = if (ns.parent == Zcu.Namespace.none) ":" else ".";
+    if (nav != .none) return w.print("{s}{s}{s}", .{ ns.path, sep, ip.stringSlice(ip.getNav(nav).name) });
+    switch (sema.owner) {
+        .comptime_decl => |c| try w.print("{s}{s}comptime#{d}", .{ ns.path, sep, c.ordinal }),
+        .type_layout => try w.print("{s}@layout", .{ns.path}),
+        .struct_defaults => try w.print("{s}@defaults", .{ns.path}),
+        else => unreachable,
     }
 }
 

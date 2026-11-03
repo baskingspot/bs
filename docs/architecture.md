@@ -95,10 +95,20 @@ the hashes of comptime arguments and captured values for instantiations and
 anonymous types. The same key, rendered, becomes the linker symbol name.
 
 Anonymous types (a `struct {}` expression inside a declaration or function
-body, or a type a function returns) are keyed by the key of the declaration
-whose code holds the type's ZIR instruction, the instruction's offset from
-that declaration's own instruction, and the stable hashes of the type's
-captured values: `decl.key#offset(capture hashes)`. Never by an absolute ZIR
+body, or a type a function returns) are keyed by the *path* of the
+declaration whose code holds the type's ZIR instruction, the instruction's
+offset from that declaration's own instruction, and the stable hashes of
+the type's captured values: `decl.path#offset(capture hashes)`, with no
+parentheses when it captures nothing. A declaration's path is its key
+without the captures of the types around it (`Namespace.path`), so all
+instances of a generic type give one path: `MultiArrayList`'s `sizes`
+makes `MultiArrayList#4.sizes#2`, whichever instance makes it first, since
+that struct captures nothing and is one type for all of them. A type
+named after its declaration (`const S = struct {...};`) is keyed by the
+declaration's path and its captures in the same way. Keys built on the
+declaration's key instead named the type after its first creator, so a
+unit loaded from one build recorded other keys than a full build that
+created it from another instance. Never by an absolute ZIR
 index, which shifts when unrelated code above changes; the relative offset
 only shifts when the declaration's own source changes, and then it is
 re-analyzed anyway. The key follows the type's identity, which is upstream's:
@@ -107,12 +117,8 @@ the same instruction with equal captures is the same type (two comptime calls
 one type, as behavior/struct.zig checks), and two identical `struct {}` texts
 are distinct instructions. So the key does not include a comptime call's
 arguments or an ordinal among the types a unit creates: either would give one
-type two keys, or two types one. Nor the captures of the generic instances on
-the declaration's key: `MultiArrayList(T).sizes` holds one struct for every
-`T`, since it captures no `T`, and keyed under the instance that made it first
-it was named by analysis order, which a replay that loads some instances
-green does not repeat (`anonTypeKey` empties those capture lists). (It must
-still tell distinct types apart: their declarations' keys extend it.) The *display name* is separate from the
+type two keys, or two types one. (It must still tell distinct types apart:
+their declarations' keys extend it.) The *display name* is separate from the
 key and follows upstream's form (`Parent__struct_<n>`), because `@typeName`
 results are observable and `test/behavior` checks them. Upstream's `n` counts
 anonymous types in analysis order; zap's is the type's instruction (an
@@ -3588,9 +3594,12 @@ analysis:
    - *`branch_quotas`* (rule 7).
 4. *Anonymous type names.* Names come from ZIR offsets and comptime
    ordinals (`typeName`, `anonTypeNumber`), not counters. One order
-   dependence remains: a container's key is file, ZIR instruction and
-   captures, so when two creators would name the same type differently,
-   the first creator names it. It happens, in upstream too: with `fn
+   dependence remains: a container's identity is file, ZIR instruction
+   and captures (its key, a path and the captures, follows it), so when
+   two creators would name the same type differently, the first creator
+   names it, and its parent namespace is the first creator's. An edit
+   build has the same problem today: a type made by a loaded unit keeps
+   the name from the build that recorded it. It happens, in upstream too: with `fn
    F(comptime x: u32) type { _ = x; return struct {}; }`, `F(1) == F(2)`,
    and both print `a.F(2)` if `F(2)` was created first (an inline
    function behaves the same). No name can come from the key alone, since
