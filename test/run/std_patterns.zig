@@ -1,11 +1,12 @@
 //! exit: 0
-//! stdout: "7\n1\n255\n255\n1\n0\n0\n4096\n9\n11\n67305985\n0\n4\n"
+//! stdout: "7\n1\n255\n255\n1\n0\n0\n4096\n9\n11\n67305985\n0\n4\n2\n2\n7\n10\n"
 //! Patterns std relies on: a generic namespace's declarations captured by
 //! nested types (resolved lazily, so a type can capture itself), a runtime
 //! block with one comptime-known result, @intFromPtr of optional pointers,
 //! switch prongs of `noreturn` union fields, comptime evaluation of
 //! arguments to comptime parameters, and comparisons that a runtime
-//! operand's range decides.
+//! operand's range decides, const locals stored from a labeled block, and
+//! struct literals with an optional result type.
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -110,6 +111,26 @@ fn H(comptime a: u4, comptime b: u4) type {
         }
     };
 }
+var gb: bool = true;
+fn lebLike(comptime signed: bool) u8 {
+    const a: u7, var fits: bool = switch (signed) {
+        false => blk: {
+            const ok = gb;
+            break :blk .{ 0, ok };
+        },
+        true => .{ 1, false },
+    };
+    _ = &fits;
+    if (!signed) comptime {
+        if (a != 0) unreachable;
+    };
+    const b: u7, const c = .{ 3, gb };
+    comptime {
+        if (b != 3) unreachable;
+    }
+    return @as(u8, a) + @intFromBool(fits) + @intFromBool(c);
+}
+const OS = struct { x: u32, y: u8 = 2 };
 fn main() callconv(.c) noreturn {
     var s: SM(u32) = .{};
     s.push(.{ .reg = .{ .a = 7, .b = 1 } });
@@ -143,5 +164,12 @@ fn main() callconv(.c) noreturn {
     const lens = [_]u8{ 0, 1 };
     rt.printInt(h.gen(&lens));
     rt.printInt(h2.gen(&lens));
+    rt.printInt(lebLike(false));
+    rt.printInt(lebLike(true));
+    var o: ?OS = .{ .x = 5 };
+    _ = &o;
+    rt.printInt(o.?.x + o.?.y);
+    const oc: ?OS = comptime .{ .x = 9, .y = 1 };
+    rt.printInt(oc.?.x + oc.?.y);
     rt.exit(0);
 }
