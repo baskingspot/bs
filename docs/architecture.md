@@ -2497,6 +2497,53 @@ So the target is Sema's function bodies plus CodeGen: 155 of 180 ms on
 hello with ZIR warm, 470 of 720 ms on the generated program, and 10 of 10.8 s
 on binary.zig.
 
+### Sema on upstream's compiler (measured 2026-11-03)
+
+bench.py's `zig` workload (upstream's src/main.zig without LLVM) is the
+largest program zap builds: 144 k units, of which 80 k are function bodies
+(6.9 s of 9.1 s of Sema, `ZAP_UNIT_TIMING=0`) and 51 k declarations
+(2.0 s). One declaration, x86_64 `Lower.zig`'s `mnemonic_table`, took
+1.1 s; the next largest units are 0.1–0.2 s (x86_64 CodeGen's 170 k-line
+`genBody`, `Encoding.mnemonic_to_encodings_map`, aarch64's instruction
+tables, std.meta.stringToEnum's comptime maps for large enums). The rest
+is a long tail, so whole-build costs matter more than any unit.
+
+Callgrind over the whole build (ReleaseFast `-Dcpu=x86_64_v3`, against
+origin/main 8cb47a5): 78.2 G → 62.8 G instructions (−20%). Wall time
+(ReleaseFast native, 3 runs): Sema 9.5–9.8 → 7.3–7.8 s. What changed:
+
+- `InternPool.get` hashed every lookup with the 128-bit stable hash (6.5 G,
+  8%); lookups now use `lookupHash` (see "InternPool"), and get fell from
+  13.5 G to 6.5 G inclusive.
+- `@typeInfo` was 52 k evaluations at 100 k instructions each (5.2 G); it
+  is memoized now (see "Comptime").
+- `mnemonic_table` (9.5 → 4.5 G for that unit alone): `@hasField` on a
+  1500-tag enum compared bytes against every tag (2.2 G), and comptime
+  strings were concatenated, sliced and read element by element (3.7 G).
+- 64-bit comptime arithmetic and integer bounds no longer go through big
+  integers.
+
+libvaxis text_input 1.900 G → 1.770 G instructions (−6.9%); hello 872 M
+→ 805 M (−7.7%); behavior/x86_64/binary.zig 72.7 G → 69.6 G (−4.3%,
+under valgrind with `--aspace-minaddr`, see bench/README.md).
+
+What remains, by inclusive instructions on the zig workload:
+
+- CodeGen's constant lowering, not Sema: `Emit.uavKey` 10.3 G (16%), and
+  `Type.unionLayout` (3.7 G) and `Type.tupleLayout` (2.3 G, through
+  `Type.fieldOffset`) called from `CodeGen.lowerValue`, which recompute a
+  type's whole layout for each union constant or tuple field.
+- `InternPool.indexToKey` 10 G self (15%): about 270 M decodes, many to
+  read one field or the tag of a type (`intInfo`, `abiSize`,
+  `hasRuntimeBits`, `resolveLayout`). Typed accessors that decode only
+  what the caller reads would take most of it.
+- Each unit's dependency set (`deps_set`): 1.2 G in its lookups and
+  growth.
+- Evaluator-shaped work: `mnemonic_table`'s remaining 0.6 s is a 100 k
+  iteration comptime loop of `++`, `@tagName` and `@hasField` that the
+  walker runs; OSR sees the loop but does not take it over (not yet
+  investigated). `stringToEnum`'s comptime maps are similar.
+
 ### Parallel function bodies (designed 2026-11-03, for review)
 
 Not built yet; two threads change Sema daily. Three steps, each useful
