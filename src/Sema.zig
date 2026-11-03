@@ -314,6 +314,7 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
         .union_type => return sema.analyzeUnionLayout(key, info),
         else => unreachable,
     }
+    if (reifyNode(sema.code, key.zir_inst)) |node| return sema.analyzeReifiedStructLayout(key, info, node);
     const decl = sema.code.getStructDecl(key.zir_inst);
     var block = sema.rootBlock(info.namespace, decl.fields_baseline_src_node, true);
     defer block.instructions.deinit(zcu.gpa);
@@ -324,12 +325,20 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     const types = try ip.arena(Zcu.tid).alloc(Index, n);
     const defaults = try ip.arena(Zcu.tid).alloc(Index, n);
     const offsets = try ip.arena(Zcu.tid).alloc(u64, n);
+    const aligns = try sema.arena.alloc(u64, n);
+    @memset(aligns, 0);
     var it = decl.iterateFields();
     while (it.next()) |field| {
         const i = field.idx;
         names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
         if (field.is_comptime) return sema.fail(&block, block.nodeSrc(.zero), "zap does not support comptime fields yet", .{});
-        if (field.align_body != null) return sema.fail(&block, block.nodeSrc(.zero), "zap does not support field alignment yet", .{});
+        if (field.align_body) |body| {
+            if (decl.layout == .@"packed") return sema.fail(&block, block.nodeSrc(.zero), "unable to override alignment of packed struct fields", .{});
+            const a_ref = try sema.coerce(&block, .u32_type, try sema.resolveInlineBody(&block, body, key.zir_inst), block.nodeSrc(.zero));
+            const a = ip.intValue(u64, try sema.resolveConstValue(&block, block.nodeSrc(.zero), a_ref, "struct field alignment must be comptime-known")).?;
+            if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(&block, block.nodeSrc(.zero), "alignment value '{d}' is not a power of two", .{a});
+            aligns[i] = a;
+        }
         const ty_ref = try sema.resolveInlineBody(&block, field.type_body, key.zir_inst);
         types[i] = try sema.analyzeAsType(&block, block.nodeSrc(.zero), ty_ref);
         defaults[i] = .none;
@@ -339,53 +348,11 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     info.status = .have_field_types;
 
 
-    info.status = .layout_wip;
-    if (decl.layout == .@"packed") {
-        // Fields are packed into the backing integer from bit 0.
-        const src = block.nodeSrc(.zero);
-        var bits: u64 = 0;
-        for (types, 0..) |ft, i| {
-            try sema.resolveLayout(&block, src, ft);
-            const fb = Type.packedBits(ip, ft) orelse {
-                if (Type.class(ip, ft) == .pointer) return sema.failUnsupported(&block, src, "pointer fields in packed structs");
-                return sema.fail(&block, src, "packed structs cannot contain fields of type '{f}'", .{sema.fmtType(ft)});
-            };
-            offsets[i] = bits;
-            bits += fb;
-        }
-        const backing: Index = if (decl.backing_int_type_body) |body| blk: {
-            const t = try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
-            if (Type.class(ip, t) != .int) return sema.fail(&block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(t)});
-            if (Type.intInfo(ip, t).bits != bits) return sema.fail(&block, src, "backing integer type '{f}' has bit size {d} but the struct fields have a total bit size of {d}", .{ sema.fmtType(t), Type.intInfo(ip, t).bits, bits });
-            break :blk t;
-        } else blk: {
-            if (bits > std.math.maxInt(u16)) return sema.fail(&block, src, "size of packed struct '{d}' exceeds maximum bit width of 65535", .{bits});
-            break :blk try sema.intType(.unsigned, @intCast(bits));
-        };
-        info.field_offsets = offsets;
-        info.tag_type = backing;
-        info.size = Type.abiSize(ip, backing);
-        info.alignment = Type.abiAlignment(ip, backing);
-    } else {
-        var offset: u64 = 0;
-        var alignment: u64 = 1;
-        for (types, 0..) |ft, i| {
-            try sema.resolveLayout(&block, block.nodeSrc(.zero), ft);
-            if (!Type.hasRuntimeBits(ip, ft)) {
-                offsets[i] = offset;
-                continue;
-            }
-            const a = Type.abiAlignment(ip, ft);
-            offset = std.mem.alignForward(u64, offset, a);
-            offsets[i] = offset;
-            offset += Type.abiSize(ip, ft);
-            alignment = @max(alignment, a);
-        }
-        info.field_offsets = offsets;
-        info.size = std.mem.alignForward(u64, offset, alignment);
-        info.alignment = alignment;
-    }
-    info.status = .have_layout;
+    const explicit_backing: Index = if (decl.backing_int_type_body) |body|
+        try sema.analyzeAsType(&block, block.nodeSrc(.zero), try sema.resolveInlineBody(&block, body, key.zir_inst))
+    else
+        .none;
+    try sema.structLayout(&block, info, decl.layout, explicit_backing, offsets, aligns);
 
     // Defaults may refer to the struct itself (for example its size), so
     // they are evaluated after the layout. Until then every field reads as
@@ -403,6 +370,87 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
     }
     info.field_defaults = defaults;
     try sema.finish();
+}
+
+/// The node of a `@Struct`, `@Union`, or `@Enum` instruction, or null if
+/// `inst` declares a container in source.
+fn reifyNode(code: *const Zir, inst: Zir.Inst.Index) ?Ast.Node.Index {
+    if (code.instructions.items(.tag)[@backingInt(inst)] != .extended) return null;
+    const ext = code.instructions.items(.data)[@backingInt(inst)].extended;
+    return switch (ext.opcode) {
+        .reify_struct => code.extraData(Zir.Inst.ReifyStruct, ext.operand).data.node,
+        .reify_union => code.extraData(Zir.Inst.ReifyUnion, ext.operand).data.node,
+        .reify_enum => code.extraData(Zir.Inst.ReifyEnum, ext.operand).data.node,
+        else => null,
+    };
+}
+
+/// A `@Struct` type's fields were set when it was created; its captures
+/// are the layout and the backing integer.
+fn analyzeReifiedStructLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPool.ContainerInfo, node: Ast.Node.Index) CompileError!void {
+    const ip = sema.ip;
+    var block = sema.rootBlock(info.namespace, node, true);
+    defer block.instructions.deinit(sema.gpa);
+    const layout = std.meta.stringToEnum(std.lang.Type.ContainerLayout, sema.enumTagName(key.captures[0]).?).?;
+    const backing = ip.indexToKey(key.captures[1]).opt.val;
+    const offsets = try ip.arena(Zcu.tid).alloc(u64, info.field_types.len);
+    try sema.structLayout(&block, info, layout, backing, offsets, &.{});
+    try sema.finish();
+}
+
+/// Computes the layout of a struct whose field types are known. `aligns`
+/// holds explicit field alignments (0 for none), or is empty.
+fn structLayout(sema: *Sema, block: *Block, info: *InternPool.ContainerInfo, layout: std.lang.Type.ContainerLayout, explicit_backing: Index, offsets: []u64, aligns: []const u64) CompileError!void {
+    const ip = sema.ip;
+    const types = info.field_types;
+    info.status = .layout_wip;
+    if (layout == .@"packed") {
+        // Fields are packed into the backing integer from bit 0.
+        const src = block.nodeSrc(.zero);
+        var bits: u64 = 0;
+        for (types, 0..) |ft, i| {
+            try sema.resolveLayout(block, src, ft);
+            const fb = Type.packedBits(ip, ft) orelse {
+                if (Type.class(ip, ft) == .pointer) return sema.failUnsupported(block, src, "pointer fields in packed structs");
+                return sema.fail(block, src, "packed structs cannot contain fields of type '{f}'", .{sema.fmtType(ft)});
+            };
+            offsets[i] = bits;
+            bits += fb;
+        }
+        const backing: Index = if (explicit_backing != .none) blk: {
+            const t = explicit_backing;
+            if (Type.class(ip, t) != .int) return sema.fail(block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(t)});
+            if (Type.intInfo(ip, t).bits != bits) return sema.fail(block, src, "backing integer type '{f}' has bit size {d} but the struct fields have a total bit size of {d}", .{ sema.fmtType(t), Type.intInfo(ip, t).bits, bits });
+            break :blk t;
+        } else blk: {
+            if (bits > std.math.maxInt(u16)) return sema.fail(block, src, "size of packed struct '{d}' exceeds maximum bit width of 65535", .{bits});
+            break :blk try sema.intType(.unsigned, @intCast(bits));
+        };
+        info.field_offsets = offsets;
+        info.tag_type = backing;
+        info.size = Type.abiSize(ip, backing);
+        info.alignment = Type.abiAlignment(ip, backing);
+    } else {
+        var offset: u64 = 0;
+        var alignment: u64 = 1;
+        for (types, 0..) |ft, i| {
+            try sema.resolveLayout(block, block.nodeSrc(.zero), ft);
+            if (!Type.hasRuntimeBits(ip, ft)) {
+                offsets[i] = offset;
+                continue;
+            }
+            // An explicit alignment can raise or lower the natural one.
+            const a = if (aligns.len != 0 and aligns[i] != 0) aligns[i] else Type.abiAlignment(ip, ft);
+            offset = std.mem.alignForward(u64, offset, a);
+            offsets[i] = offset;
+            offset += Type.abiSize(ip, ft);
+            alignment = @max(alignment, a);
+        }
+        info.field_offsets = offsets;
+        info.size = std.mem.alignForward(u64, offset, alignment);
+        info.alignment = alignment;
+    }
+    info.status = .have_layout;
 }
 
 fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPool.ContainerInfo) CompileError!void {
@@ -456,35 +504,51 @@ fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPo
 
 fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPool.ContainerInfo) CompileError!void {
     const ip = sema.ip;
-    const decl = sema.code.getUnionDecl(key.zir_inst);
-    var block = sema.rootBlock(info.namespace, decl.fields_baseline_src_node, true);
+    // A `@Union` type's fields were set when it was created; its captures
+    // are the layout and the tag type.
+    const reify_node = reifyNode(sema.code, key.zir_inst);
+    const decl = if (reify_node == null) sema.code.getUnionDecl(key.zir_inst) else undefined;
+    var block = sema.rootBlock(info.namespace, reify_node orelse decl.fields_baseline_src_node, true);
     defer block.instructions.deinit(sema.gpa);
     const src = block.nodeSrc(.zero);
-    if (decl.kind == .@"packed" or decl.kind == .packed_explicit) return sema.failUnsupported(&block, src, "packed unions");
+    var kind: Zir.Inst.UnionDecl.Kind = undefined;
+    var arg_ty: Index = .none;
+    if (reify_node != null) {
+        arg_ty = ip.indexToKey(key.captures[1]).opt.val;
+        const layout = std.meta.stringToEnum(std.lang.Type.ContainerLayout, sema.enumTagName(key.captures[0]).?).?;
+        kind = switch (layout) {
+            .auto => if (arg_ty != .none) .tagged_explicit else .auto,
+            .@"extern" => .@"extern",
+            .@"packed" => .@"packed",
+        };
+    } else kind = decl.kind;
+    if (kind == .@"packed" or kind == .packed_explicit) return sema.failUnsupported(&block, src, "packed unions");
     info.status = .field_types_wip;
-    const n = decl.field_names.len;
-    const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
-    const types = try ip.arena(Zcu.tid).alloc(Index, n);
-    const arg_ty: Index = if (decl.arg_type_body) |body|
-        try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst))
-    else
-        .none;
-    var it = decl.iterateFields();
-    while (it.next()) |field| {
-        const i = field.idx;
-        names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
-        if (field.align_body != null) return sema.failUnsupported(&block, src, "union field alignment");
-        types[i] = if (field.type_body) |body|
-            try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst))
-        else
-            .void_type;
+    if (reify_node == null) {
+        const n = decl.field_names.len;
+        const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
+        const types = try ip.arena(Zcu.tid).alloc(Index, n);
+        if (decl.arg_type_body) |body| arg_ty = try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
+        var it = decl.iterateFields();
+        while (it.next()) |field| {
+            const i = field.idx;
+            names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
+            if (field.align_body != null) return sema.failUnsupported(&block, src, "union field alignment");
+            types[i] = if (field.type_body) |body|
+                try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst))
+            else
+                .void_type;
+        }
+        info.field_names = names;
+        info.field_types = types;
     }
-    info.field_names = names;
-    info.field_types = types;
+    const names = info.field_names;
+    const types = info.field_types;
+    const n = names.len;
 
     // The tag: a declared enum, a generated one, or (untagged auto-layout
     // unions in Debug) a hidden integer safety tag.
-    switch (decl.kind) {
+    switch (kind) {
         .tagged_explicit => {
             if (ip.indexToKey(arg_ty) != .enum_type) return sema.fail(&block, src, "expected enum tag type, found '{f}'", .{sema.fmtType(arg_ty)});
             try sema.resolveLayout(&block, src, arg_ty);
@@ -499,7 +563,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
             const int_ty = if (arg_ty != .none) arg_ty else try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n));
             const values = try ip.arena(Zcu.tid).alloc(Index, n);
             var next: u64 = 0;
-            it = decl.iterateFields();
+            var it = decl.iterateFields();
             while (it.next()) |field| {
                 if (field.value_body) |body| {
                     try sema.inst_map.put(sema.gpa, key.zir_inst, .fromInterned(int_ty));
@@ -2268,6 +2332,33 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             });
         },
         .reify_pointer => sema.zirReifyPointer(block, ext),
+        .reify_struct => sema.zirReifyContainer(block, inst, ext, .@"struct"),
+        .reify_union => sema.zirReifyContainer(block, inst, ext, .@"union"),
+        .reify_enum => sema.zirReifyContainer(block, inst, ext, .@"enum"),
+        .reify_slice_arg_ty => blk: {
+            // `@Struct` and friends take their per-field arguments as
+            // arrays as long as the field names.
+            const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
+            const src = block.nodeSrc(extra.node);
+            const info: Zir.Inst.ReifySliceArgInfo = @fromBackingInt(@intCast(ext.small));
+            const in_ty: Index, const out_ty: Index = switch (info) {
+                .type_to_fn_param_attrs => .{ .type_type, try sema.stdLangType(block, src, "Type.Fn.ParamAttributes") },
+                .string_to_struct_field_type, .string_to_union_field_type => .{ .slice_const_u8_type, .type_type },
+                .string_to_struct_field_attrs => .{ .slice_const_u8_type, try sema.stdLangType(block, src, "Type.Struct.FieldAttributes") },
+                .string_to_union_field_attrs => .{ .slice_const_u8_type, try sema.stdLangType(block, src, "Type.Union.FieldAttributes") },
+            };
+            const operand = try sema.coerce(block, try sema.ptrType(.{ .child = in_ty, .flags = .{ .size = .slice, .is_const = true } }), sema.resolveInst(extra.operand), src);
+            const len = (try sema.constSliceElems(block, src, operand, "reified type arguments must be comptime-known")).len;
+            break :blk .fromInterned(try sema.ptrType(.{ .child = try sema.intern(.{ .array_type = .{ .len = len, .child = out_ty } }), .flags = .{ .is_const = true } }));
+        },
+        .reify_enum_value_slice_ty => blk: {
+            const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
+            const src = block.nodeSrc(extra.node);
+            const tag_ty = try sema.resolveType(block, src, extra.lhs);
+            const names = try sema.coerce(block, .slice_const_slice_const_u8_type, sema.resolveInst(extra.rhs), src);
+            const len = (try sema.constSliceElems(block, src, names, "enum field names must be comptime-known")).len;
+            break :blk .fromInterned(try sema.ptrType(.{ .child = try sema.intern(.{ .array_type = .{ .len = len, .child = tag_ty } }), .flags = .{ .is_const = true } }));
+        },
         .reify_tuple => blk: {
             const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
             const src = block.nodeSrc(extra.node);
@@ -2857,7 +2948,7 @@ fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.
         };
     }
     const name = try sema.typeName(block, name_strategy, inst, kind);
-    const ty = try sema.zcu.createContainerType(kind, sema.file, inst, captures, name.display, name.key, block.namespace);
+    const ty = try sema.zcu.createContainerType(kind, sema.file, inst, captures, name.display, name.key, block.namespace, null);
     return .fromInterned(ty);
 }
 
@@ -5992,6 +6083,108 @@ fn structFieldValue(sema: *Sema, val: Index, name: []const u8) !Index {
 }
 
 /// `@Pointer(size, attrs, child, sentinel)`.
+/// `@Struct`, `@Union`, and `@Enum`. The type's identity is the
+/// instruction and its canonicalized arguments (its captures); its fields
+/// are known at once, and a struct's or union's layout is resolved lazily
+/// like a declared type's (see `reifyNode`).
+fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.Inst.Extended.InstData, kind: Zcu.ContainerKind) CompileError!Ref {
+    const ip = sema.ip;
+    const node: Ast.Node.Index, const args: [4]Zir.Inst.Ref, const names_ref: Zir.Inst.Ref = switch (kind) {
+        .@"struct" => blk: {
+            const e = sema.code.extraData(Zir.Inst.ReifyStruct, ext.operand).data;
+            break :blk .{ e.node, .{ e.layout, e.backing_ty, e.field_types, e.field_attrs }, e.field_names };
+        },
+        .@"union" => blk: {
+            const e = sema.code.extraData(Zir.Inst.ReifyUnion, ext.operand).data;
+            break :blk .{ e.node, .{ e.layout, e.arg_ty, e.field_types, e.field_attrs }, e.field_names };
+        },
+        .@"enum" => blk: {
+            const e = sema.code.extraData(Zir.Inst.ReifyEnum, ext.operand).data;
+            break :blk .{ e.node, .{ e.tag_ty, e.mode, e.field_values, .none }, e.field_names };
+        },
+        .@"opaque" => unreachable,
+    };
+    const src: Src = .{ .base = node, .loc = .{ .node_abs = node } };
+    const reason = "reified type arguments must be comptime-known";
+    const name_vals = try sema.constSliceElems(block, src, try sema.coerce(block, .slice_const_slice_const_u8_type, sema.resolveInst(names_ref), src), reason);
+    const n = name_vals.len;
+    const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
+    for (name_vals, names, 0..) |v, *name, i| {
+        name.* = try sema.getString(try sema.resolveConstString(block, src, .fromInterned(v)));
+        for (names[0..i]) |prev| if (prev == name.*) return sema.fail(block, src, "duplicate {t} field name '{s}'", .{ kind, ip.stringSlice(prev) });
+    }
+
+    if (kind == .@"enum") {
+        const tag_ty = try sema.resolveType(block, src, args[0]);
+        if (Type.class(ip, tag_ty) != .int) return sema.fail(block, src, "tag type must be an integer type", .{});
+        const mode_ty = try sema.stdLangType(block, src, "Type.Enum.Mode");
+        const mode = try sema.resolveConstValue(block, src, try sema.coerce(block, mode_ty, sema.resolveInst(args[1]), src), reason);
+        const value_slice_ty = try sema.ptrType(.{ .child = tag_ty, .flags = .{ .size = .slice, .is_const = true } });
+        const values = try sema.constSliceElems(block, src, try sema.coerce(block, value_slice_ty, sema.resolveInst(args[2]), src), reason);
+        if (values.len != n) return sema.fail(block, src, "{d} enum field names but {d} values", .{ n, values.len });
+        for (values, 0..) |v, i| {
+            if (sema.isUndef(v)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+            for (values[0..i]) |prev| if (prev == v) return sema.fail(block, src, "enum tag value {f} already taken", .{sema.fmtValue(v)});
+        }
+        const captures = [_]Index{ tag_ty, mode, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = tag_ty } }), .storage = .{ .elems = values } } }) };
+        const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind);
+        const ty = try sema.zcu.createContainerType(kind, sema.file, inst, &captures, name.display, name.key, block.namespace, .auto);
+        const info = ip.structInfo(ty);
+        if (info.status == .none) {
+            info.field_names = names;
+            info.field_defaults = try ip.arena(Zcu.tid).dupe(Index, values);
+            info.tag_type = tag_ty;
+            info.nonexhaustive = std.mem.eql(u8, sema.enumTagName(mode).?, "nonexhaustive");
+            info.size = Type.abiSize(ip, tag_ty);
+            info.alignment = Type.abiAlignment(ip, tag_ty);
+            info.status = .have_layout;
+        }
+        return .fromInterned(ty);
+    }
+
+    const layout_ty = try sema.stdLangType(block, src, "Type.ContainerLayout");
+    const layout_val = try sema.resolveConstValue(block, src, try sema.coerce(block, layout_ty, sema.resolveInst(args[0]), src), reason);
+    if (sema.isUndef(layout_val)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+    const layout = std.meta.stringToEnum(std.lang.Type.ContainerLayout, sema.enumTagName(layout_val).?).?;
+    const arg_ty = try sema.resolveConstValue(block, src, try sema.coerce(block, try sema.optType(.type_type), sema.resolveInst(args[1]), src), reason);
+    const types = try sema.constSliceElems(block, src, try sema.coerce(block, .slice_const_type_type, sema.resolveInst(args[2]), src), reason);
+    if (types.len != n) return sema.fail(block, src, "{d} field names but {d} field types", .{ n, types.len });
+    const attrs_ty = try sema.stdLangType(block, src, if (kind == .@"struct") "Type.Struct.FieldAttributes" else "Type.Union.FieldAttributes");
+    const attrs = try sema.constSliceElems(block, src, try sema.coerce(block, try sema.ptrType(.{ .child = attrs_ty, .flags = .{ .size = .slice, .is_const = true } }), sema.resolveInst(args[3]), src), reason);
+    if (attrs.len != n) return sema.fail(block, src, "{d} field names but {d} field attributes", .{ n, attrs.len });
+    const defaults = try ip.arena(Zcu.tid).alloc(Index, n);
+    for (attrs, types, defaults) |a, ft, *d| {
+        if (sema.isUndef(a) or sema.isUndef(ft)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        if (ip.indexToKey(try sema.structFieldValue(a, "align")).opt.val != .none) return sema.failUnsupported(block, src, "field alignment");
+        d.* = .none;
+        if (kind != .@"struct") continue;
+        if (try sema.structFieldValue(a, "comptime") == .bool_true) return sema.failUnsupported(block, src, "comptime fields");
+        const dp = ip.indexToKey(try sema.structFieldValue(a, "default_value_ptr")).opt.val;
+        if (dp != .none) {
+            // The default value is behind a type-erased pointer.
+            var p = ip.indexToKey(dp).ptr;
+            p.ty = try sema.ptrType(.{ .child = ft, .flags = .{ .is_const = true } });
+            d.* = (try sema.comptimeLoadOrNull(block, src, try sema.intern(.{ .ptr = p }))) orelse
+                return sema.fail(block, src, "unable to resolve comptime value: default value must be comptime-known", .{});
+        }
+    }
+    // The captures are the canonical arguments: no pointers into comptime
+    // memory, which is neither stable nor immutable.
+    var captures: std.ArrayList(Index) = .empty;
+    try captures.appendSlice(sema.arena, &.{ layout_val, arg_ty, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = .type_type } }), .storage = .{ .elems = types } } }) });
+    try captures.appendSlice(sema.arena, defaults);
+    const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind);
+    const ty = try sema.zcu.createContainerType(kind, sema.file, inst, captures.items, name.display, name.key, block.namespace, layout);
+    const info = ip.structInfo(ty);
+    if (info.status == .none) {
+        info.field_names = names;
+        info.field_types = try ip.arena(Zcu.tid).dupe(Index, types);
+        info.field_defaults = defaults;
+        info.status = .have_field_types;
+    }
+    return .fromInterned(ty);
+}
+
 fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) CompileError!Ref {
     const ip = sema.ip;
     const extra = sema.code.extraData(Zir.Inst.ReifyPointer, ext.operand).data;

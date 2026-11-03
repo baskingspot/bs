@@ -226,7 +226,7 @@ pub fn renderErrors(zcu: *const Zcu, wip: *std.zig.ErrorBundle.Wip) !void {
 /// The root struct type of a file, creating it (and its namespace) on first use.
 pub fn fileRootType(zcu: *Zcu, file_index: u32) !InternPool.Index {
     if (zcu.file_root_types.items[file_index] != .none) return zcu.file_root_types.items[file_index];
-    const ty = try zcu.createContainerType(.@"struct", file_index, .main_struct_inst, &.{}, try zcu.fileFqn(file_index), try zcu.fileKey(file_index), Namespace.none);
+    const ty = try zcu.createContainerType(.@"struct", file_index, .main_struct_inst, &.{}, try zcu.fileFqn(file_index), try zcu.fileKey(file_index), Namespace.none, null);
     zcu.file_root_types.items[file_index] = ty;
     return ty;
 }
@@ -235,7 +235,9 @@ pub const ContainerKind = enum { @"struct", @"enum", @"union", @"opaque" };
 
 /// Interns a declared container type of `kind` with display name `fqn` and
 /// stable key `key`. If it is new, creates its namespace and declarations
-/// and queues its `comptime` and exported declarations.
+/// and queues its `comptime` and exported declarations. A type made by
+/// `@Struct`, `@Union`, or `@Enum` passes its `reified_layout`; it has no
+/// declarations.
 pub fn createContainerType(
     zcu: *Zcu,
     kind: ContainerKind,
@@ -245,10 +247,11 @@ pub fn createContainerType(
     fqn: []const u8,
     key: []const u8,
     parent_ns: u32,
+    reified_layout: ?std.lang.Type.ContainerLayout,
 ) !InternPool.Index {
     const ip = &zcu.ip;
     const zir = &zcu.file(file_index).zir;
-    const decls: []const Zir.Inst.Index, const layout: std.lang.Type.ContainerLayout = switch (kind) {
+    const decls: []const Zir.Inst.Index, const layout: std.lang.Type.ContainerLayout = if (reified_layout) |l| .{ &.{}, l } else switch (kind) {
         .@"struct" => blk: {
             const d = zir.getStructDecl(inst);
             break :blk .{ d.decls, d.layout };
