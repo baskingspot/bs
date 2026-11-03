@@ -88,6 +88,13 @@ refresh: std.DynamicBitSetUnmanaged = .{},
 stats: Stats = .{},
 /// `ZAP_CACHE_CHECK`: print each green unit that could not be loaded.
 check: bool = false,
+/// For a donor's replay (`Incremental.useDonor`): the source paths this
+/// build's debug info can name (`Atom.Debug.file`, `unit`, `files`). A
+/// donor's function whose debug info names another path (the same source
+/// in another project's directory) is analyzed again.
+debug_paths: ?std.StringHashMapUnmanaged(void) = null,
+/// How many of the frontend's files `debug_paths` has.
+debug_paths_files: usize = 0,
 
 const no_file = std.math.maxInt(u32);
 
@@ -108,11 +115,12 @@ pub const Stats = struct {
 
 /// Starts an edit build from manifest `m`: finds the inputs that changed
 /// since, the seeds, and what they reach. `fe` has loaded the files.
-pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Atom.Unwind.Arch, fe: *const Frontend, zcu: *Zcu, emit: *Emit, lazy: bool) !*Replay {
+pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Atom.Unwind.Arch, fe: *const Frontend, zcu: *Zcu, emit: *Emit, lazy: bool, donor: bool) !*Replay {
     const t0 = Io.Timestamp.now(io, .awake);
     var pack: Pack = try .open(io, dir);
     errdefer pack.close(gpa, io);
-    if (pack.id != m.pack_id) return error.PackMismatch;
+    // A donor's atoms are all in its base packs (`Incremental.useDonor`).
+    if (!donor and pack.id != m.pack_id) return error.PackMismatch;
     for (0..m.bases.len) |i| _ = try pack.addBase(gpa, io, dir, m.basePack(i));
     const n = m.nodeCount();
     const r = try gpa.create(Replay);
@@ -150,14 +158,32 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     const changed = &r.changed;
     var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.inputCount());
     defer seen.deinit(gpa);
+    // Files match inputs by key (`Manifest.Input.key`), which is what the
+    // nodes name them by: within a compilation keys and paths correspond,
+    // and a donor's file (`Incremental.useDonor`) is this build's file
+    // with the same key wherever it is, such as in another git worktree.
+    var by_key: std.StringHashMapUnmanaged(u32) = .empty;
+    defer by_key.deinit(gpa);
+    for (0..m.inputCount()) |i| _ = try by_key.getOrPutValue(gpa, m.inputKey(@intCast(i)), @intCast(i));
+    var key_buf: std.ArrayList(u8) = .empty;
+    defer key_buf.deinit(gpa);
     for (fe.files.items, 0..) |*f, fi| {
-        try Incremental.inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
-        const i = r.by_path.get(path_buf.items) orelse continue;
+        try Incremental.inputKey(gpa, &key_buf, fe, f.module, f.sub_path);
+        const i = by_key.get(key_buf.items) orelse continue;
         seen.set(i);
         r.input_files[i] = @intCast(fi + 1);
         try r.file_inputs.put(gpa, @intCast(fi), i);
         if (@as(Hash, @bitCast(f.content_hash)) != m.input(i)[0].content_hash)
             try changed.append(gpa, .{ .input = i, .file = @fromBackingInt(@as(u32, @intCast(fi))) });
+    }
+    // Inputs whose key names no file here: a donor's other project's
+    // files, or a module this build lacks. Changed, so that their nodes
+    // are outdated, whether or not the file is still on disk; inputs not
+    // loaded yet whose key holds here are checked below.
+    for (0..m.inputCount()) |i| {
+        if (seen.isSet(i) or try Incremental.inputKeyHolds(gpa, &path_buf, m, @intCast(i), fe)) continue;
+        seen.set(i);
+        try changed.append(gpa, .{ .input = @intCast(i), .file = null });
     }
     // Inputs not loaded yet (embedded files, compiler_rt), by their stat
     // and then their contents.
@@ -191,6 +217,18 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
         try stack.append(gpa, d);
     };
     r.stats.outdated = @intCast(r.outdated.count());
+    if (donor) {
+        r.debug_paths = .empty;
+        const d = &r.debug_paths.?;
+        for (fe.modules.items) |*mod| {
+            const unit = try std.fs.path.join(gpa, &.{ mod.root_dir, mod.root_file });
+            const gop = d.getOrPut(gpa, unit) catch |err| {
+                gpa.free(unit);
+                return err;
+            };
+            if (gop.found_existing) gpa.free(unit);
+        }
+    }
     r.stats.setup_ns = @intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds);
     return r;
 }
@@ -205,6 +243,11 @@ pub fn destroy(r: *Replay) void {
     r.data_refs.deinit(gpa);
     r.dead.deinit(gpa);
     r.refresh.deinit(gpa);
+    if (r.debug_paths) |*d| {
+        var it = d.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        d.deinit(gpa);
+    }
     gpa.free(r.state);
     gpa.free(r.dependees);
     r.maps.deinit(gpa);
@@ -382,6 +425,7 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
         const d = r.pack.decode(ref, r.arch) catch return r.miss(g, "atom");
         var debug = d.debug;
         if (debug) |*dbg| {
+            if (!try r.knowsDebugPaths(dbg)) return r.miss(g, "debug paths");
             if (changed_file) dbg.base_line = zcu.file(owner.file).zir.getDeclaration(owner.zir_inst).src_line;
             if (dbg.inlines.len != 0) dbg.inlines = try r.refreshInlines(dbg);
         }
@@ -906,9 +950,9 @@ pub fn fileOf(r: *Replay, input: u32) ?u32 {
         const fe = r.zcu.fe;
         var path_buf: std.ArrayList(u8) = .empty;
         defer path_buf.deinit(r.gpa);
-        const want = r.m.input(input)[1];
+        const want = r.m.inputKey(input);
         for (fe.files.items, 0..) |*f, fi| {
-            Incremental.inputPath(r.gpa, &path_buf, fe, f.module, f.sub_path) catch return null;
+            Incremental.inputKey(r.gpa, &path_buf, fe, f.module, f.sub_path) catch return null;
             if (!std.mem.eql(u8, path_buf.items, want)) continue;
             r.input_files[input] = @intCast(fi + 1);
             r.file_inputs.put(r.gpa, @intCast(fi), input) catch return null;
@@ -917,6 +961,24 @@ pub fn fileOf(r: *Replay, input: u32) ?u32 {
     }
     const v = r.input_files[input];
     return if (v == no_file) null else v - 1;
+}
+
+/// Whether `debug` names only paths this build's debug info can: always
+/// unless replaying a donor (`debug_paths`).
+fn knowsDebugPaths(r: *Replay, debug: *const Atom.Debug) !bool {
+    const paths = if (r.debug_paths) |*p| p else return true;
+    // Files loaded since (compiler_rt's, on demand).
+    const files = r.zcu.fe.files.items;
+    for (files[r.debug_paths_files..]) |*f| {
+        const gop = try paths.getOrPut(r.gpa, f.display_path);
+        if (!gop.found_existing) gop.key_ptr.* = try r.gpa.dupe(u8, f.display_path);
+    }
+    r.debug_paths_files = files.len;
+    if (!paths.contains(debug.file)) return false;
+    if (debug.unit.len != 0 and !paths.contains(debug.unit)) return false;
+    var it = std.mem.splitScalar(u8, debug.files, 0);
+    while (it.next()) |p| if (p.len != 0 and !paths.contains(p)) return false;
+    return true;
 }
 
 /// Instruction `inst` of input `input`'s recorded ZIR, in its ZIR now.

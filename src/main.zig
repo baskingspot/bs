@@ -276,6 +276,7 @@ pub const Job = struct {
             return null;
         };
         i.check = env.get("ZAP_CACHE_CHECK") != null;
+        i.donors = !std.mem.eql(u8, env.get("ZAP_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
         // `zap run`'s program counts as used when it runs (`renew_output`);
         // other outputs keep the stat the last link left, so that the next
@@ -381,6 +382,8 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // `ZAP_UNIT_TIMING=n`: print the n units whose analysis took longest,
     // not counting the units each analyzed in turn.
     if (env.get("ZAP_UNIT_TIMING")) |v| zcu.unit_timing = .{ .top = std.fmt.parseInt(u32, v, 10) catch 20 };
+    // A first build replays another compilation's graph, if one was published.
+    if (inc_opt) |i| if (!std.mem.eql(u8, replay_mode, "off")) try i.useDonor(&fe);
     if (inc_opt) |i| try i.seedErrors(&zcu);
     if (opts.dump_ir) {
         var stdout_buf: [4096]u8 = undefined;

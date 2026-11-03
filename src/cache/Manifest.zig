@@ -348,6 +348,11 @@ pub const Input = extern struct {
     /// Nanoseconds, or `racy_mtime` (see `Builder.addInput`).
     mtime: i64,
     path: StrRef,
+    /// The file's unit-key prefix, `<module name>:<path within it>`
+    /// (`Zcu.fileKey`): what the nodes' keys name the file by. A build
+    /// whose modules map the key to another file must not take the
+    /// nodes as its own (a donor's, see `Replay.create`).
+    key: StrRef,
 
     pub const racy_mtime = std.math.minInt(i64);
 
@@ -356,7 +361,7 @@ pub const Input = extern struct {
             in.mtime == stat.mtime.toNanoseconds();
     }
 
-    fn init(stat: Io.File.Stat, content_hash: Hash, build_start: Io.Timestamp, path: StrRef) Input {
+    fn init(stat: Io.File.Stat, content_hash: Hash, build_start: Io.Timestamp, path: StrRef, key: StrRef) Input {
         // A file modified within 2 s of the build's start could change again
         // within the timestamp granularity without changing its stat, so it
         // is recorded to be rehashed next time.
@@ -368,6 +373,7 @@ pub const Input = extern struct {
             .size = stat.size,
             .mtime = if (racy) racy_mtime else mtime,
             .path = path,
+            .key = key,
         };
     }
 };
@@ -375,8 +381,8 @@ pub const Input = extern struct {
 const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN10".*;
-const log_magic = "ZAPMLG04".*;
+const magic = "ZAPMAN11".*;
+const log_magic = "ZAPMLG05".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
 
@@ -472,11 +478,11 @@ const InputDelta = extern struct {
 
 comptime {
     std.debug.assert(@sizeOf(Node) == 80);
-    std.debug.assert(@sizeOf(Input) == 48);
+    std.debug.assert(@sizeOf(Input) == 64);
     std.debug.assert(@sizeOf(RecordHeader) == 64);
     std.debug.assert(@sizeOf(NodeDelta) == 96);
     std.debug.assert(@sizeOf(Symbol) == 24);
-    std.debug.assert(@sizeOf(InputDelta) == 64);
+    std.debug.assert(@sizeOf(InputDelta) == 80);
 }
 
 /// The log, applied. Slices point into `buf`.
@@ -525,7 +531,7 @@ const Overlay = struct {
         source: Source,
         source_name: ?[]const u8,
     };
-    const InputState = struct { input: Input, path: []const u8 };
+    const InputState = struct { input: Input, path: []const u8, key: []const u8 };
 
     fn deinit(o: *Overlay, gpa: Allocator) void {
         gpa.free(o.buf);
@@ -719,7 +725,11 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
     }
     for (input_deltas) |*d| {
         if (d.index == m.inputCount()) o.added_inputs += 1;
-        try o.inputs.put(gpa, d.index, .{ .input = d.input, .path = strings[d.input.path.off..][0..d.input.path.len] });
+        try o.inputs.put(gpa, d.index, .{
+            .input = d.input,
+            .path = strings[d.input.path.off..][0..d.input.path.len],
+            .key = strings[d.input.key.off..][0..d.input.key.len],
+        });
     }
     for (errors) |e| try o.error_names.append(gpa, strings[e.off..][0..e.len]);
     try o.error_symbols.appendSlice(gpa, error_symbols);
@@ -1049,6 +1059,12 @@ pub fn input(m: *const Manifest, index: u32) struct { Input, []const u8 } {
     return .{ in, m.string(in.path) };
 }
 
+/// `Input.key` of input `index`.
+pub fn inputKey(m: *const Manifest, index: u32) []const u8 {
+    if (m.overlay.inputs.get(index)) |s| return s.key;
+    return m.string(m.inputs[index].key);
+}
+
 pub fn errorCount(m: *const Manifest) u32 {
     return @intCast(m.error_names.len + m.overlay.error_names.items.len);
 }
@@ -1274,12 +1290,12 @@ pub const Delta = struct {
     }
 
     /// Records an input's new stat; `index` null adds an input.
-    pub fn setInput(d: *Delta, index: ?u32, path: []const u8, stat: Io.File.Stat, content_hash: Hash, build_start: Io.Timestamp) !void {
+    pub fn setInput(d: *Delta, index: ?u32, path: []const u8, key: []const u8, stat: Io.File.Stat, content_hash: Hash, build_start: Io.Timestamp) !void {
         const i = index orelse i: {
             d.added_inputs += 1;
             break :i d.base.inputCount() + d.added_inputs - 1;
         };
-        try d.inputs.append(d.gpa, .{ .input = .init(stat, content_hash, build_start, try d.addString(path)), .index = i });
+        try d.inputs.append(d.gpa, .{ .input = .init(stat, content_hash, build_start, try d.addString(path), try d.addString(key)), .index = i });
     }
 
     /// Sets a node's flags, the rest of it unchanged.
@@ -1737,15 +1753,15 @@ pub const Builder = struct {
     }
 
     /// Records an input file and its stat as of `build_start`.
-    pub fn addInput(b: *Builder, path: []const u8, stat: Io.File.Stat, content_hash: Hash, build_start: Io.Timestamp) !void {
-        try b.inputs.append(b.gpa, .init(stat, content_hash, build_start, try b.addString(path)));
+    pub fn addInput(b: *Builder, path: []const u8, key: []const u8, stat: Io.File.Stat, content_hash: Hash, build_start: Io.Timestamp) !void {
+        try b.inputs.append(b.gpa, .init(stat, content_hash, build_start, try b.addString(path), try b.addString(key)));
     }
 
     /// An input whose stat failed: it never matches, so the next build
     /// hashes it again. Keeps input indices equal to the build's file
     /// indices, which `Source.input` relies on.
-    pub fn addUnstattedInput(b: *Builder, path: []const u8, content_hash: Hash) !void {
-        try b.inputs.append(b.gpa, .{ .content_hash = content_hash, .inode = 0, .size = 0, .mtime = Input.racy_mtime, .path = try b.addString(path) });
+    pub fn addUnstattedInput(b: *Builder, path: []const u8, key: []const u8, content_hash: Hash) !void {
+        try b.inputs.append(b.gpa, .{ .content_hash = content_hash, .inode = 0, .size = 0, .mtime = Input.racy_mtime, .path = try b.addString(path), .key = try b.addString(key) });
     }
 
     /// Assigns the next error code to `name`, whose symbol key is `key`.
@@ -2083,7 +2099,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         _ = try b.addNode(.{ .key = 103, .result_hash = 4, .atoms = &.{.init(160, 16)}, .symbols = &.{
             .{ .key = 0xa3, .targets = &.{ 0xa1, 0xb0 } },
         } });
-        try b.addInput(a_path, try tmp.dir.statFile(io, "a.zig", .{}), 55, Io.Clock.real.now(io));
+        try b.addInput(a_path, "root:a.zig", try tmp.dir.statFile(io, "a.zig", .{}), 55, Io.Clock.real.now(io));
         try t.expectEqual(1, try b.addErrorName("OutOfMemory", 0xe1));
         try t.expectEqual(2, try b.addErrorName("Overflow", 0xe2));
         b.entry = 0xa1;
@@ -2138,7 +2154,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             .{ .key = 0xa2, .targets = &.{ 0xa1, 0xc0 }, .file = "b.zig" },
         }, .refs = &.{ .{ .kind = .rt, .value = rt }, .{ .kind = .nav, .value = 0 } } });
         try t.expectEqual(4, try d.addNode(.{ .key = 104, .result_hash = 5, .deps = &.{2} }));
-        try d.setInput(0, a_path, try tmp.dir.statFile(io, "a.zig", .{}), 56, .fromNanoseconds(std.math.maxInt(i64)));
+        try d.setInput(0, a_path, "root:a.zig", try tmp.dir.statFile(io, "a.zig", .{}), 56, .fromNanoseconds(std.math.maxInt(i64)));
         try t.expectEqual(3, try d.addErrorName("Unexpected", 0xe3));
         try d.append(io, tmp.dir);
     }
@@ -2163,7 +2179,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         try d.overrideItem(0, &.{ 30, 31, 32, 33, 34 });
         try d.setSource(1, .{ .input = 0, .inst = 13 });
         try d.setFlags(0, .{ .stale = true });
-        try d.setInput(null, b_path, try tmp.dir.statFile(io, "b.zig", .{}), 57, .fromNanoseconds(std.math.maxInt(i64)));
+        try d.setInput(null, b_path, "root:b.zig", try tmp.dir.statFile(io, "b.zig", .{}), 57, .fromNanoseconds(std.math.maxInt(i64)));
         try d.append(io, tmp.dir);
     }
     // A torn record at the end is ignored, and the next append replaces it.

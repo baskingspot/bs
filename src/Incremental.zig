@@ -59,8 +59,16 @@ arch: Atom.Unwind.Arch,
 /// Taken before the inputs are read; inputs modified after it are
 /// recorded as needing a rehash.
 build_start: Io.Timestamp,
-/// The last successful build's manifest, if any.
+/// The last successful build's manifest, if any; for a first build, the
+/// donor's (`useDonor`).
 prev: ?Manifest = null,
+/// What a donor's compilation must share with this one besides inputs
+/// (`donorKey`).
+donor_key: Hash,
+/// `ZAP_CACHE_DONOR=off` turns off publishing and using donors.
+donors: bool = true,
+/// The name of the donor `prev` is, if it is one.
+donor: ?[donor_name_len]u8 = null,
 /// `ZAP_CACHE_TIMING`: print where the cache's time goes.
 timing: bool,
 /// `ZAP_CACHE_CHECK`: check that the last manifest's reverse edges predict
@@ -109,6 +117,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .dir = dir,
         .lock = lock,
         .store_seed = store_seed,
+        .donor_key = try donorKey(gpa, io, store_seed, zig_lib_dir, args),
         .arch = if (std.mem.startsWith(u8, target, "aarch64")) .aarch64 else .x86_64,
         .build_start = build_start,
         .timing = timing,
@@ -205,7 +214,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         }
         const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |err| return inc.noRelink("{s}: {t}", .{ path, err });
         if (restat == null) restat = .init(gpa, m);
-        try restat.?.setInput(i, path, stat, in.content_hash, inc.build_start);
+        try restat.?.setInput(i, path, m.inputKey(i), stat, in.content_hash, inc.build_start);
     }
     const t1 = now(io);
     // Past the fold size, the inputs are rehashed until the next full build
@@ -337,8 +346,10 @@ fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bo
 pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emit, mode: []const u8) !void {
     const m = if (inc.prev) |*m| m else return;
     if (std.mem.eql(u8, mode, "off") or inc.verify == .full) return;
-    const lazy = !std.mem.eql(u8, mode, "eager");
-    const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy) catch |err| switch (err) {
+    // A donor's build records in full: its log would be relative to
+    // another compilation's manifest.
+    const lazy = !std.mem.eql(u8, mode, "eager") and inc.donor == null;
+    const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (inc.timing) std.debug.print("cache: not replaying: {t}\n", .{err});
@@ -349,6 +360,199 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     inc.replay = r;
     zcu.replay = r;
     emit.lazy = lazy;
+}
+
+// ---------------------------------------------------------------------------
+// First builds: donors
+
+/// Under `<global cache>`: manifests that other compilations published,
+/// each in a directory with hard links to the store packs it names
+/// (`publishDonor`), which a first build replays (`useDonor`). Inside the
+/// store's directory, so that its maintenance counts and trims them.
+const donors_path = "zap/store/" ++ Store.donors_dir;
+/// `<donor key, 32 hex digits>-<32 random hex digits>`.
+const donor_name_len = 65;
+/// Donors kept per donor key; `publishDonor` deletes the oldest past it.
+const max_donors_per_key = 4;
+/// A donor's manifest mtime is its last use, renewed at most this often.
+const donor_renew_ns = std.time.ns_per_hour;
+
+/// What another compilation must share with this one for its graph to be
+/// replayed here, beyond what the graph checks itself (inputs and
+/// red-green): zap and the target (`store_seed`), the std, and options
+/// Zcu reads without recording a dependency: `-fsingle-threaded` (whether
+/// declarations are threadlocal) and test filters (which tests exist).
+/// The builtin module is an input, so a donor whose builtin differs is
+/// valid, but loses most of std; `useDonor` ranks those last.
+fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, args: []const []const u8) !Hash {
+    var h: std.hash.Wyhash = .init(0x646f6e6f72);
+    h.update(std.mem.asBytes(&store_seed));
+    // Resolved: `--zig-lib-dir zig-lib` names another std in another
+    // directory.
+    if (Io.Dir.cwd().realPathFileAlloc(io, zig_lib_dir, gpa)) |lib| {
+        defer gpa.free(lib);
+        h.update(lib);
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => h.update(zig_lib_dir),
+    }
+    var single_threaded = false;
+    for (args, 0..) |a, i| {
+        if (std.mem.eql(u8, a, "-fsingle-threaded")) single_threaded = true;
+        if (std.mem.eql(u8, a, "-fno-single-threaded")) single_threaded = false;
+        if (std.mem.eql(u8, a, "--test-filter") and i + 1 < args.len) {
+            h.update("\x00filter\x00");
+            h.update(args[i + 1]);
+        }
+    }
+    h.update(if (single_threaded) "\x00st" else "\x00mt");
+    return cache.hash(3, std.mem.asBytes(&h.final()));
+}
+
+fn linkOrCopy(from: Io.Dir, name: []const u8, to: Io.Dir, io: Io) !void {
+    from.hardLink(name, to, name, io, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        error.CrossDevice, error.OperationUnsupported => try from.copyFile(name, to, name, io, .{}),
+        else => |e| return e,
+    };
+}
+
+/// For a first build (no manifest): takes as `prev` the donor with this
+/// compilation's donor key that has the same builtin module, then shares
+/// the most files with this build (same key and content; then the
+/// newest), and links its store
+/// packs into the compilation's directory. The build replays it as an edit
+/// build (`beginReplay`, eagerly, so that it links and records in full):
+/// the donor's other files are changed inputs (`Replay.create`), so what
+/// this build loads is what it shares with the donor, typically std.
+/// Without a donor, or if its packs cannot be linked, the build is cold.
+pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
+    if (inc.prev != null or !inc.donors or inc.verify == .full) return;
+    const gpa = inc.gpa;
+    const io = inc.io;
+    const t0 = now(io);
+    var donors = inc.global.openDir(io, donors_path, .{ .iterate = true }) catch return;
+    defer donors.close(io);
+    var key_buf: std.ArrayList(u8) = .empty;
+    defer key_buf.deinit(gpa);
+    // This build's files by key, as `Replay.create` matches them.
+    var by_key: std.StringHashMapUnmanaged(u32) = .empty;
+    defer {
+        var it = by_key.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        by_key.deinit(gpa);
+    }
+    for (fe.files.items, 0..) |*f, fi| {
+        try inputKey(gpa, &key_buf, fe, f.module, f.sub_path);
+        const gop = try by_key.getOrPut(gpa, key_buf.items);
+        if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, key_buf.items);
+        gop.value_ptr.* = @intCast(fi);
+    }
+    const Candidate = struct { name: [donor_name_len]u8, m: Manifest, builtin: bool, shared: u32, mtime: Io.Timestamp };
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer {
+        for (candidates.items) |*c| c.m.close(gpa, io);
+        candidates.deinit(gpa);
+    }
+    const prefix = std.fmt.hex(inc.donor_key);
+    var it = donors.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .directory or e.name.len != donor_name_len or !std.mem.startsWith(u8, e.name, &prefix)) continue;
+        var d = donors.openDir(io, e.name, .{}) catch continue;
+        defer d.close(io);
+        const stat = d.statFile(io, "manifest", .{}) catch continue;
+        var m = (Manifest.open(gpa, io, d) catch continue) orelse continue;
+        var c: Candidate = .{ .name = e.name[0..donor_name_len].*, .m = m, .builtin = false, .shared = 0, .mtime = stat.mtime };
+        for (0..m.inputCount()) |i| {
+            const in, _ = m.input(@intCast(i));
+            const fi = by_key.get(m.inputKey(@intCast(i))) orelse continue;
+            const f = fe.file(@fromBackingInt(fi));
+            if (@as(Hash, @bitCast(f.content_hash)) != in.content_hash) continue;
+            c.shared += 1;
+            if (f.module == .builtin) c.builtin = true;
+        }
+        candidates.append(gpa, c) catch |err| {
+            m.close(gpa, io);
+            return err;
+        };
+    }
+    std.mem.sortUnstable(Candidate, candidates.items, {}, struct {
+        fn better(_: void, a: Candidate, b: Candidate) bool {
+            if (a.builtin != b.builtin) return a.builtin;
+            if (a.shared != b.shared) return a.shared > b.shared;
+            return a.mtime.compare(.gt, b.mtime);
+        }
+    }.better);
+    for (candidates.items, 0..) |*c, ci| {
+        if (c.shared == 0) break;
+        var d = donors.openDir(io, &c.name, .{}) catch continue;
+        defer d.close(io);
+        // The packs, linked from the donor's own links: the store may have
+        // merged or trimmed them since.
+        const linked = for (0..c.m.bases.len) |i| {
+            linkOrCopy(d, c.m.basePack(i), inc.dir, io) catch break false;
+        } else true;
+        if (!linked) continue;
+        if (c.mtime.durationTo(Io.Clock.real.now(io)).toNanoseconds() > donor_renew_ns) d.setTimestampsNow(io, "manifest", .{}) catch {};
+        if (inc.timing) std.debug.print("cache: first build: replaying donor {s} ({d} of its {d} inputs are this build's, builtin {s}; {d} candidates) in {d:.2} ms\n", .{
+            &c.name, c.shared, c.m.inputCount(), if (c.builtin) "the same" else "different", candidates.items.len, ms(t0, now(io)),
+        });
+        inc.prev = c.m;
+        inc.donor = c.name;
+        _ = candidates.orderedRemove(ci);
+        return;
+    }
+    if (inc.timing) std.debug.print("cache: first build: no usable donor ({d} candidates)\n", .{candidates.items.len});
+}
+
+/// After a full record is placed: publishes the manifest as a donor for
+/// other compilations' first builds (`useDonor`). Every atom of a full
+/// record is in a store pack, so the donor is the manifest plus links to
+/// the packs it names, which keep them alive when the store merges or
+/// trims them. Built under a temporary name and renamed into place, so
+/// readers only see complete donors.
+fn publishDonor(inc: *Incremental, base_names: []const []const u8) !void {
+    if (!inc.donors or inc.verify == .full) return;
+    const gpa = inc.gpa;
+    const io = inc.io;
+    var donors = try inc.global.createDirPathOpen(io, donors_path, .{ .open_options = .{ .iterate = true } });
+    defer donors.close(io);
+    var rand: [16]u8 = undefined;
+    io.random(&rand);
+    var name: [donor_name_len]u8 = undefined;
+    _ = std.fmt.bufPrint(&name, "{s}-{s}", .{ &std.fmt.hex(inc.donor_key), &std.fmt.bytesToHex(rand, .lower) }) catch unreachable;
+    var tmp_name: [Store.donor_tmp_prefix.len + 32]u8 = undefined;
+    _ = std.fmt.bufPrint(&tmp_name, "{s}{s}", .{ Store.donor_tmp_prefix, &std.fmt.bytesToHex(rand, .lower) }) catch unreachable;
+    {
+        var tmp = try donors.createDirPathOpen(io, &tmp_name, .{});
+        defer tmp.close(io);
+        errdefer donors.deleteTree(io, &tmp_name) catch {};
+        try linkOrCopy(inc.dir, "manifest", tmp, io);
+        for (base_names) |n| try linkOrCopy(inc.dir, n, tmp, io);
+    }
+    donors.rename(&tmp_name, donors, &name, io) catch |err| {
+        donors.deleteTree(io, &tmp_name) catch {};
+        return err;
+    };
+    // The oldest donors of this key past the limit.
+    const Old = struct { name: [donor_name_len]u8, mtime: Io.Timestamp };
+    var same: std.ArrayList(Old) = .empty;
+    defer same.deinit(gpa);
+    var it = donors.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .directory or e.name.len != donor_name_len or !std.mem.startsWith(u8, e.name, name[0..32])) continue;
+        var path: [donor_name_len + "/manifest".len]u8 = undefined;
+        _ = std.fmt.bufPrint(&path, "{s}/manifest", .{e.name}) catch unreachable;
+        const stat = donors.statFile(io, &path, .{}) catch continue;
+        try same.append(gpa, .{ .name = e.name[0..donor_name_len].*, .mtime = stat.mtime });
+    }
+    if (same.items.len <= max_donors_per_key) return;
+    std.mem.sortUnstable(Old, same.items, {}, struct {
+        fn newer(_: void, a: Old, b: Old) bool {
+            return a.mtime.compare(.gt, b.mtime);
+        }
+    }.newer);
+    for (same.items[max_donors_per_key..]) |o| donors.deleteTree(io, &o.name) catch {};
 }
 
 /// Assigns the last build's error codes first, so that they keep their
@@ -963,6 +1167,7 @@ fn finishRecordFallible(inc: *Incremental, linked: bool) !void {
     defer r.discard(inc);
     try Manifest.Builder.place(&r.manifest, inc.io, inc.dir);
     if (r.empty_pack) |id| try Pack.writeEmpty(inc.io, inc.dir, @bitCast(id));
+    inc.publishDonor(r.base_names) catch |err| if (inc.timing) std.debug.print("cache: could not publish a donor: {t}\n", .{err});
     // Base packs the new manifest does not name.
     var it = inc.dir.iterate();
     while (it.next(inc.io) catch null) |e| {
@@ -1207,6 +1412,8 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     // Inputs: each file's, the changed ones' new stats, and new ones.
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
+    var key_buf: std.ArrayList(u8) = .empty;
+    defer key_buf.deinit(gpa);
     const file_inputs = try gpa.alloc(u32, fe.files.items.len);
     defer gpa.free(file_inputs);
     var n_inputs = m.inputCount();
@@ -1222,9 +1429,10 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
             n_inputs += 1;
         }
         try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+        try inputKey(gpa, &key_buf, fe, f.module, f.sub_path);
         const known = fi.* < m.inputCount();
         if (Io.Dir.cwd().statFile(io, path_buf.items, .{})) |stat|
-            try d.setInput(if (known) fi.* else null, path_buf.items, stat, @bitCast(f.content_hash), inc.build_start)
+            try d.setInput(if (known) fi.* else null, path_buf.items, key_buf.items, stat, @bitCast(f.content_hash), inc.build_start)
         else |_|
             return inc.lazyFallback("{s} is gone", .{path_buf.items});
     }
@@ -1240,7 +1448,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
             if (m.input(in)[0].content_hash == content_hash) continue;
         } else n_inputs += 1;
         const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch return inc.lazyFallback("{s} is gone", .{path_buf.items});
-        try d.setInput(known, path_buf.items, stat, content_hash, inc.build_start);
+        try d.setInput(known, path_buf.items, f.key, stat, content_hash, inc.build_start);
     }
 
     // Results, with this build's items after the manifest's: those it
@@ -2128,12 +2336,15 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     defer path_buf.deinit(gpa);
     // Input `i` is file `i` (`Manifest.Source.input`), then the embedded
     // files.
+    var key_buf: std.ArrayList(u8) = .empty;
+    defer key_buf.deinit(gpa);
     for (fe.files.items) |*f| {
         try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+        try inputKey(gpa, &key_buf, fe, f.module, f.sub_path);
         if (Io.Dir.cwd().statFile(io, path_buf.items, .{})) |stat|
-            try b.addInput(path_buf.items, stat, @bitCast(f.content_hash), inc.build_start)
+            try b.addInput(path_buf.items, key_buf.items, stat, @bitCast(f.content_hash), inc.build_start)
         else |_|
-            try b.addUnstattedInput(path_buf.items, @bitCast(f.content_hash));
+            try b.addUnstattedInput(path_buf.items, key_buf.items, @bitCast(f.content_hash));
     }
     // `@embedFile`d files are inputs too. Every input's content hash is
     // `Frontend.hashSource`'s, which `relinkIfUnchanged` checks a touched
@@ -2142,9 +2353,9 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
         const content_hash: Hash = @bitCast(Frontend.hashSource(f.bytes));
         if (Io.Dir.cwd().statFile(io, path_buf.items, .{})) |stat|
-            try b.addInput(path_buf.items, stat, content_hash, inc.build_start)
+            try b.addInput(path_buf.items, f.key, stat, content_hash, inc.build_start)
         else |_|
-            try b.addUnstattedInput(path_buf.items, content_hash);
+            try b.addUnstattedInput(path_buf.items, f.key, content_hash);
     }
     const t4 = now(io);
     // Every atom is in a store pack, so the pack's own records, which
@@ -2266,7 +2477,7 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
 fn maintainLocal(inc: *const Incremental) void {
     // A new compilation directory is how the local cache grows.
     const t0 = now(inc.io);
-    const r = cache.maintainCompilations(inc.gpa, inc.io, inc.local, inc.max_bytes, inc.prev == null) catch null;
+    const r = cache.maintainCompilations(inc.gpa, inc.io, inc.local, inc.max_bytes, inc.prev == null or inc.donor != null) catch null;
     if (inc.timing) if (r) |m| std.debug.print("cache: local cache {d} directories, {d} MiB; deleted {d}, leaving {d} MiB, in {d:.2} ms beside the link\n", .{ m.scanned, m.bytes >> 20, m.deleted, m.bytes_after >> 20, ms(t0, now(inc.io)) });
 }
 
@@ -2433,6 +2644,28 @@ pub fn inputPath(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, m
     try buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, sub_path });
 }
 
+/// `Manifest.Input.key` of a file: `Zcu.fileKey`.
+pub fn inputKey(gpa: Allocator, buf: *std.ArrayList(u8), fe: *const Frontend, module: Frontend.Module.Index, sub_path: []const u8) !void {
+    const mod = fe.module(module);
+    buf.clearRetainingCapacity();
+    try buf.print(gpa, "{s}:{s}", .{ mod.name, if (std.mem.eql(u8, sub_path, mod.root_file)) "" else sub_path });
+}
+
+/// Whether input `i` of `m` would be the same file in this build: its
+/// key's module exists here and puts the key at the input's path. Always
+/// so for the compilation's own manifest; a donor's (`useDonor`) can name
+/// the files of another project, or a module this build lacks.
+pub fn inputKeyHolds(gpa: Allocator, buf: *std.ArrayList(u8), m: *const Manifest, i: u32, fe: *const Frontend) !bool {
+    const key = m.inputKey(i);
+    const colon = std.mem.indexOfScalar(u8, key, ':') orelse return false;
+    const mod = for (fe.modules.items, 0..) |*mod, mi| {
+        if (std.mem.eql(u8, mod.name, key[0..colon])) break @as(Frontend.Module.Index, @fromBackingInt(@as(u32, @intCast(mi))));
+    } else return false;
+    const sub_path = key[colon + 1 ..];
+    try inputPath(gpa, buf, fe, mod, if (sub_path.len == 0) fe.module(mod).root_file else sub_path);
+    return std.mem.eql(u8, buf.items, m.input(i)[1]);
+}
+
 fn checkPrediction(inc: *Incremental, r: *const Recorder, fe: *const Frontend) void {
     inc.checkPredictionFallible(r, fe) catch |err| {
         std.debug.print("cache check: could not check the prediction: {t}\n", .{err});
@@ -2451,7 +2684,7 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
     const m = if (inc.prev) |*m| m else return;
     const n_prev = m.nodeCount();
 
-    // The inputs whose contents changed, by path.
+    // The inputs whose contents changed, by key (as `Replay.create`).
     var now_inputs: std.StringHashMapUnmanaged(struct { file: ?Frontend.File.Index, hash: Hash }) = .empty;
     defer {
         var it = now_inputs.keyIterator();
@@ -2461,24 +2694,27 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
     for (fe.files.items, 0..) |*f, i| {
-        try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
+        try inputKey(gpa, &path_buf, fe, f.module, f.sub_path);
         const gop = try now_inputs.getOrPut(gpa, path_buf.items);
         if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, path_buf.items);
         gop.value_ptr.* = .{ .file = @fromBackingInt(@as(u32, @intCast(i))), .hash = @bitCast(f.content_hash) };
     }
     for (r.zcu.embed_files.values()) |f| {
-        try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
-        const gop = try now_inputs.getOrPut(gpa, path_buf.items);
-        if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, path_buf.items);
+        const gop = try now_inputs.getOrPut(gpa, f.key);
+        if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, f.key);
         gop.value_ptr.* = .{ .file = null, .hash = @bitCast(Frontend.hashSource(f.bytes)) };
     }
     var changed: std.ArrayList(seeds.Changed) = .empty;
     defer changed.deinit(gpa);
     for (0..m.inputCount()) |j| {
-        const in, const path = m.input(@intCast(j));
-        // An input no longer read has no nodes in this build.
-        const now_in = now_inputs.get(path) orelse continue;
-        if (now_in.hash != in.content_hash) try changed.append(gpa, .{ .input = @intCast(j), .file = now_in.file });
+        const in, _ = m.input(@intCast(j));
+        if (now_inputs.get(m.inputKey(@intCast(j)))) |now_in| {
+            if (now_in.hash != in.content_hash) try changed.append(gpa, .{ .input = @intCast(j), .file = now_in.file });
+            continue;
+        }
+        // As `Replay.create`: an input whose key names no file here (a
+        // donor's) is changed; one this build did not read has no nodes.
+        if (!try inputKeyHolds(gpa, &path_buf, m, @intCast(j), fe)) try changed.append(gpa, .{ .input = @intCast(j), .file = null });
     }
     var seed_list: std.ArrayList(u32) = .empty;
     defer seed_list.deinit(gpa);
@@ -2504,10 +2740,22 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
     };
     var n_changed: usize = 0;
     var missed: usize = 0;
+    var keyer: Keyer = .init(r.zcu, gpa);
+    defer keyer.deinit();
+    const test_functions_key = try keyer.keyOf(.nav_val, &.{"builtin::test_functions"});
     for (nodes) |n| {
         const i = m.find(n.key) orelse continue;
         if (m.node(i).result_hash == n.result_hash) continue;
         n_changed += 1;
+        // The link's own atoms (the error name table, extern slots) follow
+        // from the whole build's error names and externs, not from edges:
+        // a full or eager build writes them again, and a lazy one falls
+        // back when they would change (`finishLazy`). A new error name in
+        // a program that uses the table changes the node with no path
+        // from a seed. The test list likewise: `populateTestFunctions`
+        // sets `builtin.test_functions` from the build's tests after
+        // analysis, and a lazy build falls back when the tests change.
+        if (n.tag == .link or n.key == test_functions_key) continue;
         if (seen.isSet(i)) continue;
         missed += 1;
         if (missed > 10) continue;

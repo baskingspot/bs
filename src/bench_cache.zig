@@ -102,7 +102,7 @@ pub fn main(init: std.process.Init) !void {
     }
     for (0..n_other_nodes) |_| _ = try builder.addNode(.{ .key = rand.int(u128), .result_hash = rand.int(u128) });
     const build_start = Io.Clock.real.now(io);
-    for (input_paths) |p| try builder.addInput(p, try cwd.statFile(io, p, .{}), rand.int(u128), build_start);
+    for (input_paths) |p| try builder.addInput(p, p, try cwd.statFile(io, p, .{}), rand.int(u128), build_start);
     for (0..n_errors) |i| {
         const name = try std.fmt.allocPrint(arena, "Error{d}", .{i});
         _ = try builder.addErrorName(name, @backingInt(Atom.SymbolKey.fromName(try std.fmt.allocPrint(arena, "error.{s}", .{name}))));

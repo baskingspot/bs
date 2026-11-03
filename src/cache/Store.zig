@@ -85,6 +85,13 @@ const Header = extern struct {
 
 const pack_magic = "ZAPSTP04".*;
 const pack_ext = ".zsp";
+/// Donors (`Incremental.publishDonor`): directories each holding a
+/// compilation's manifest and links to the packs it names. `maintain`
+/// trims them with the packs, by last use, counting the manifest and the
+/// linked packs the store itself no longer has.
+pub const donors_dir = "donors";
+/// A donor being written; `maintain` deletes one older than an hour.
+pub const donor_tmp_prefix = "tmp-";
 
 const PackHeader = extern struct {
     magic: [8]u8 = pack_magic,
@@ -772,18 +779,53 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
     }
     // Every pack, readable (`live`) or not (`OtherPack`), as candidates
     // for deletion.
-    const Candidate = struct { name: []const u8, size: u64, mtime: Io.Timestamp, order: i64, live: ?*const PackFile };
+    const Candidate = struct { name: []const u8, size: u64, mtime: Io.Timestamp, order: i64, live: ?*const PackFile, donor: bool = false };
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(gpa);
     var live: std.ArrayList(*const PackFile) = .empty;
     defer live.deinit(gpa);
     for (packs) |*p| try candidates.append(gpa, .{ .name = &p.name, .size = p.size, .mtime = p.mtime, .order = p.order, .live = p });
     for (others.items) |*o| try candidates.append(gpa, .{ .name = &o.name, .size = o.size, .mtime = o.mtime, .order = std.math.minInt(i64), .live = null });
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(gpa);
+    for (candidates.items) |c| try names.put(gpa, c.name, {});
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var donors: ?Io.Dir = dir.openDir(io, donors_dir, .{ .iterate = true }) catch null;
+    defer if (donors) |*d| d.close(io);
+    if (donors) |d| {
+        var it = d.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind != .directory) continue;
+            if (std.mem.startsWith(u8, e.name, donor_tmp_prefix)) {
+                const st = d.statFile(io, e.name, .{}) catch continue;
+                if (st.mtime.durationTo(options.now).toNanoseconds() > std.time.ns_per_hour) d.deleteTree(io, e.name) catch {};
+                continue;
+            }
+            var dd = d.openDir(io, e.name, .{ .iterate = true }) catch continue;
+            defer dd.close(io);
+            const manifest = dd.statFile(io, "manifest", .{}) catch continue;
+            var size = manifest.size;
+            var dit = dd.iterate();
+            while (try dit.next(io)) |f| {
+                if (!std.mem.endsWith(u8, f.name, pack_ext) or names.contains(f.name)) continue;
+                size += (dd.statFile(io, f.name, .{}) catch continue).size;
+            }
+            try candidates.append(gpa, .{
+                .name = try arena_state.allocator().dupe(u8, e.name),
+                .size = size,
+                .mtime = manifest.mtime,
+                .order = std.math.minInt(i64),
+                .live = null,
+                .donor = true,
+            });
+        }
+    }
     var total: u64 = 0;
     var n_kept: usize = 0;
     for (candidates.items) |c| {
         if (options.trim and c.mtime.durationTo(options.now).toNanoseconds() > max_unused_ns) {
-            dir.deleteFile(io, c.name) catch {};
+            if (c.donor) donors.?.deleteTree(io, c.name) catch {} else dir.deleteFile(io, c.name) catch {};
             result.deleted += 1;
             continue;
         }
@@ -806,7 +848,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
         const target = options.max_bytes - options.max_bytes / 4;
         for (candidates.items) |*c| {
             if (total <= target) break;
-            dir.deleteFile(io, c.name) catch continue;
+            if (c.donor) donors.?.deleteTree(io, c.name) catch continue else dir.deleteFile(io, c.name) catch continue;
             total -= c.size;
             result.evicted += 1;
             c.live = null;

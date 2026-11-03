@@ -1976,14 +1976,14 @@ granularity.
   A re-analyzed unit whose result hash is unchanged stops the walk (early
   cutoff). The cost is proportional to the edit, not to the program; a
   rebuild with no edit costs the stats and the manifest load.
-- **The global store is pull-based.** Entries live in a global cache
-  directory shared across projects, so std's functions compiled for one
-  project are hits for the next, the way Go reuses compiled std packages.
-  With no manifest (a project's first build), Sema looks up each unit it
-  reaches; an entry is valid if its `src_hash` matches and each recorded
-  dependency still has the recorded result hash (red-green). That build pays
-  per reached unit, which is acceptable because it would otherwise analyze
-  them all.
+- **First builds reuse other projects' graphs.** Entries live in a global
+  cache directory shared across projects, so std's functions compiled for
+  one project are reused by the next, the way Go reuses compiled std
+  packages. As built (2026-11-03, "First builds: donors" below), a first
+  build does not look units up one by one: it replays a whole manifest
+  that another compilation published, a donor, as an edit build in which
+  the donor's other files are changed inputs, and the replay's red-green
+  decides what is reused. The store's entries only deduplicate Atoms.
 - **Storage.** Two layers, split by who reads them:
   - The global store holds entries in immutable packs, git-style: each
     build writes its new entries as one pack file with a sorted key index,
@@ -2882,6 +2882,87 @@ test/run/panic_inline.zig rebuilds after such an edit and checks the
 trace. The verify
 edit scripts include moving an inlined callee's lines.
 
+**First builds: donors** (built 2026-11-03). A compilation's first build
+(no manifest in its directory: a new project, a new git worktree, a new
+command line) replays another compilation's manifest, a donor, instead of
+analyzing everything.
+
+- *Publishing.* After every full record (a cold or eager build), once the
+  manifest is placed, `publishDonor` hard-links it and the store packs it
+  names into `<global cache>/zap/store/donors/<donor key>-<random>/`,
+  built under a `tmp-` name and renamed into place, so readers see only
+  complete donors. Every atom of a full record is in a store pack, so the
+  donor needs nothing from the compilation's directory, and its links keep
+  the packs alive when the store merges or trims them. The newest 4 per
+  donor key are kept. A lazy build does not publish: its atoms are in the
+  compilation's own pack.
+- *The donor key* (`donorKey`): the store seed (zap and the target), the
+  std directory, and the options Zcu reads without recording a dependency
+  (`-fsingle-threaded`, which decides whether declarations are
+  threadlocal, and test filters). Everything else (the builtin module,
+  root and modules, every file) is an input the replay checks.
+- *Choosing.* `useDonor` runs after the frontend: among the donors of
+  this compilation's key, it takes the one whose builtin module is this
+  build's, then the one sharing the most input files (same path, same
+  key, same content), then the newest. It links the donor's packs into
+  the compilation's directory from the donor's own links; if that fails
+  (trimmed concurrently), it tries the next, and without one the build is
+  cold. Ranking reads each candidate's input table, well under 1 ms.
+- *Replaying.* The build is an edit build against the donor, eager so that
+  it records a full manifest of its own (a lazy record is a log relative
+  to the compilation's own manifest) and publishes it in turn. Error codes
+  are seeded from the donor (`seedErrors`). Inputs now carry their file's
+  key (`Manifest.Input.key`, `<module>:<path in it>`), and `Replay.create`
+  matches files to inputs by key, which is what nodes name files by:
+  within one compilation keys and paths correspond, and a donor's file is
+  this build's file with the same key wherever it is, so a git worktree
+  matches its donor's files and compares their contents. A donor's input
+  whose key names no file here and does not hold here (`inputKeyHolds`:
+  its module is missing, or puts the key at another path) is a changed
+  input with no new ZIR, so all its nodes are seeds: another project's
+  files, the same file under another module name. A module's root file is
+  keyed `<module>:` without its path (`Zcu.fileKey`), so the donor's root
+  file is this build's root file, changed, and std's `@import("root")` in
+  a donor's result names this build's root struct; whether its
+  declarations match is decided by the namespace dependencies, as in any
+  edit. A function's atom is loaded only if its debug info names paths
+  this build's would (`Replay.debug_paths`): source paths are as the
+  compiler opened them, so with relative paths a worktree's functions
+  load, and with absolute ones only std's do.
+- *Output.* The link order is a function of the atoms (`groupByOwner`), so
+  the output is the bytes of a full build with the same error codes. A
+  full build without a donor numbers codes by first use, which can differ
+  from the donor's: then the error values differ, and so do the names of
+  generic instances whose comptime arguments include error set types,
+  which list names in code order. Making those canonical is determinism
+  rule 5 of parallel Sema (names ordered by name, codes assigned at the
+  end).
+- *Bounds.* `Store.maintain` counts each donor as its manifest plus the
+  linked packs the store no longer has, trims donors by last use (the
+  manifest's mtime, renewed at most hourly when used) and age with the
+  packs, and deletes `tmp-` directories older than an hour.
+  `ZAP_CACHE_DONOR=off` turns publishing and use off.
+- *Why a whole graph, not per-unit lookups.* A unit's result names other
+  items by the manifest's item table, so an entry per unit would have to
+  carry its items' closure, and a first build would look up and check
+  each of thousands of units against the store. A donor is one mapped
+  file, red-green is the replay's, and nothing new is serialized.
+- *What it cannot reuse.* Knowledge spread over several projects: a build
+  replays one donor, so std units that only a third project analyzed are
+  analyzed again, and a donor with another builtin module (`zap test`
+  after `build-exe`) turns most of std red. Whatever reads codes or other
+  build-wide state through a path the graph does not record.
+- *What first builds found.* A donor replays a history that a full build
+  of this program never had, so it shows recordings that depend on
+  analysis order. `ZAP_CACHE_VERIFY` on first builds found two, both
+  fixed in Sema: anonymous types keyed under the generic instance that
+  made them first (above), and memo hits that did not refer to the
+  functions the memoized call referred to (`Zcu.Memo.funcs`), so only the
+  first caller's `func_refs` had them. That also broke lazy edit builds
+  without donors ("not linked"). And `builtin.test_functions` is set
+  after analysis from the build's tests, so `checkPrediction` exempts it
+  like the link node.
+
 Reviewed by the Sema thread (2026-11-03); its answers to the two open
 questions (calling back into `Zcu.ensure*`, anonymous types' ordinals) and
 its corrections (`comptime_only` in the layout hash, Emit-side references,
@@ -3150,8 +3231,8 @@ byte-identical for every n.
   ascending. `Emit.mergeJobs` waits for every job handed over and moves
   each job's output into the main Emit in job order (`mergeOut`), as if
   the function had been generated right after its analysis: atoms with
-  their owners (which keeps `grouped`/`groupByOwner` and the manifest's
-  node order as they were), debug entries renumbered, content uses, and
+  their owners (which keeps the manifest's node order as it was), debug
+  entries renumbered, content uses, and
   unit references, whose effects (declarations to lower, error names,
   extern slots, the error name table) are applied as `navKey` and friends
   would have. A content-addressed atom is kept unless the main Emit has

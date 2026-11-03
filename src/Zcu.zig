@@ -422,11 +422,17 @@ pub fn file(zcu: *const Zcu, index: u32) *const Frontend.File {
     return zcu.fe.file(@fromBackingInt(index));
 }
 
-/// The stable unit-key prefix of a file: module name and path within it.
+/// The stable unit-key prefix of a file: module name and path within it,
+/// with the path left out for the module's root file. That is what
+/// `@import("<module>")` names whatever file the module's root is, so that
+/// a cache entry recorded by another compilation (a donor, see
+/// `Incremental.useDonor`) refers to this compilation's root file: std's
+/// `@import("root")` is the main example.
 pub fn fileKey(zcu: *Zcu, index: u32) ![]const u8 {
     const f = zcu.file(index);
     const mod = zcu.fe.module(f.module);
-    return std.fmt.allocPrint(zcu.arena.allocator(), "{s}:{s}", .{ mod.name, f.sub_path });
+    const sub_path = if (std.mem.eql(u8, f.sub_path, mod.root_file)) "" else f.sub_path;
+    return std.fmt.allocPrint(zcu.arena.allocator(), "{s}:{s}", .{ mod.name, sub_path });
 }
 
 /// The display name of a file's root struct, as upstream renders it: the path

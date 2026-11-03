@@ -124,6 +124,15 @@ pub fn build(b: *std.Build) void {
 ///   //! rebuild-lib-without: "<lib path>" "<zig string>"
 ///                               the same edit in a file of zap's lib
 ///                               directory, of which the builds use a copy
+///   //! donor-without: "<zig string>"
+///                               zap first builds the program without this
+///                               text in another directory, then this one
+///                               with an empty local cache and the same
+///                               global cache, which replays the first as
+///                               a donor; checks that it did, then builds
+///                               it in full with the same error codes
+///                               (`ZAP_CACHE_VERIFY=full`), which compares
+///                               the nodes, and compares the outputs
 ///
 /// `test` builds each with zap and checks it; `test-upstream` does the same
 /// with upstream zig, so every program is checked against the oracle.
@@ -164,6 +173,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             /// Each text, and what the earlier version has instead.
             rebuild_without: std.ArrayList([2][]const u8) = .empty,
             lib_edit: ?struct { path: []const u8, text: []const u8 } = null,
+            donor_without: ?[]const u8 = null,
         } = .{};
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
@@ -178,6 +188,8 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             } else if (std.mem.eql(u8, key, "stderr-contains")) {
                 const bytes = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 expect.stderr_contains.append(b.allocator, bytes) catch @panic("OOM");
+            } else if (std.mem.eql(u8, key, "donor-without")) {
+                expect.donor_without = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
             } else if (std.mem.eql(u8, key, "rebuild-without")) {
                 const text = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 expect.rebuild_without.append(b.allocator, .{ text, "" }) catch @panic("OOM");
@@ -252,6 +264,31 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path("test/run/rt.zig"));
                 break :blk r;
+            } else if (expect.donor_without) |text| blk: {
+                const at = std.mem.indexOf(u8, source, text) orelse std.debug.panic("{s}: donor-without text not found", .{src_path});
+                const files = b.addWriteFiles();
+                const donor = files.add(file, b.fmt("{s}{s}", .{ source[0..at], source[at + text.len ..] }));
+                const zap_cmd = b.fmt("\"$5\" build-exe -target x86_64-linux --global-cache-dir \"$4.d/g\"", .{});
+                const r = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
+                    \\set -e
+                    \\rm -rf "$4.d"
+                    \\mkdir -p "$4.d/a" "$4.d/b"
+                    \\cp "$3" "$4.d/a/rt.zig"
+                    \\cp "$3" "$4.d/b/rt.zig"
+                    \\cp "$1" "$4.d/a/{[file]s}"
+                    \\cp "$2" "$4.d/b/{[file]s}"
+                    \\fail() {{ cat "$4.d/log" >&2; exit 1; }}
+                    \\{[zap]s} --cache-dir "$4.d/la" "$4.d/a/{[file]s}" -femit-bin="$4.d/a/out" 2>"$4.d/log" || fail
+                    \\ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lb" "$4.d/b/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
+                    \\grep -q "replaying donor" "$4.d/log" || {{ echo "no donor was replayed" >&2; fail; }}
+                    \\cp "$4" "$4.d/replayed"
+                    \\ZAP_CACHE_VERIFY=full ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lb" "$4.d/b/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
+                    \\cmp "$4" "$4.d/replayed" >&2
+                , .{ .file = file, .zap = zap_cmd }), "sh" });
+                r.addFileArg(donor);
+                r.addFileArg(b.path(src_path));
+                r.addFileArg(b.path("test/run/rt.zig"));
+                break :blk r;
             } else blk: {
                 const r = b.addRunArtifact(zap);
                 r.addArgs(&.{ "build-exe", "-target", "x86_64-linux" });
@@ -259,7 +296,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 break :blk r;
             };
             compile.addFileInput(b.path("test/run/rt.zig"));
-            const bin = if (!upstream and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null)) bin: {
+            const bin = if (!upstream and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null or expect.donor_without != null)) bin: {
                 const out = compile.addOutputFileArg(name);
                 compile.addArtifactArg(zap);
                 break :bin out;
