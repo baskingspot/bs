@@ -265,7 +265,10 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
         cg.homes[@backingInt(inst)] = .none;
         return .none;
     }
-    const home: Home = .{ .slot = try cg.allocSlot(Type.abiSize(cg.ip, ty), Type.abiAlignment(cg.ip, ty)) };
+    // A value's home is only copied from and to, never addressed as a `*T`
+    // (Sema takes addresses of `alloc`s, which realign themselves), so 16
+    // bytes suffice for any type, as for arguments, which have 8.
+    const home: Home = .{ .slot = try cg.allocSlot(Type.abiSize(cg.ip, ty), @min(Type.abiAlignment(cg.ip, ty), 16)) };
     cg.homes[@backingInt(inst)] = home;
     return home;
 }

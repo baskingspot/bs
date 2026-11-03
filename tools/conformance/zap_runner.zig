@@ -2,9 +2,10 @@
 //! --test-runner`). It speaks the same `@zap-test` line protocol as
 //! `test_runner.zig` (documented there) but needs little of std: its own
 //! `_start`, which sets up TLS as std.start does, raw `write` and `exit`
-//! system calls, and `builtin.test_functions`. It does
-//! not set up `std.testing.allocator` or `std.testing.io`, so tests that use
-//! them crash under it, and it reports a failing test without its error name.
+//! system calls, and `builtin.test_functions`. It sets up
+//! `std.testing.allocator` for each test as upstream's runner does (leaks
+//! are not reported), but not `std.testing.io`, so tests that use it crash
+//! under it, and it reports a failing test without its error name.
 //!
 //! Upstream zig 0.17.0 compiles it too, which keeps it honest.
 
@@ -17,7 +18,9 @@ const elf = std.elf;
 fn initTls(envp: [*]const usize) void {
     var i: usize = 0;
     while (envp[i] != 0) : (i += 1) {}
-    const auxv: [*]const elf.Auxv = @ptrCast(@alignCast(envp + i + 1));
+    const auxv: [*]elf.Auxv = @ptrCast(@alignCast(@constCast(envp + i + 1)));
+    // std (the page size, for one) reads the auxiliary vector from here.
+    std.os.linux.elf_aux_maybe = auxv;
     var at_phdr: usize = 0;
     var at_phnum: usize = 0;
     i = 0;
@@ -66,6 +69,12 @@ fn main(sp: [*]const usize) callconv(.c) noreturn {
         // Also on stderr, so the harness can cut out a crashing test's panic message.
         l.write(2);
         l.flush(1);
+        // A fresh testing allocator per test, as upstream's runner sets up.
+        std.testing.allocator_instance = .init(std.heap.page_allocator, .{
+            .canary = 0xc3a701ba,
+            .check_write_after_free = true,
+        });
+        defer _ = std.testing.allocator_instance.deinit();
         if (tests[i].func()) |_| {
             l.add("pass ");
         } else |err| {

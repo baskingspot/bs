@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "16\n16\n8\n8\n1\n1\n0\n1\n0\n0\n1\n0\n0\n842\n808\n404\n1616\n1\n1\n1\n1\n1\n1\n1\n1\n"
+//! stdout: "16\n16\n8\n8\n1\n1\n0\n1\n0\n0\n1\n0\n0\n842\n808\n404\n1616\n1\n1\n1\n1\n1\n1\n1\n1\n7\n9\n"
 //! Explicit alignment on zero-bit struct fields, global declarations,
 //! functions, local constants, union fields, and pointers to elements.
 const rt = @import("rt.zig");
@@ -83,5 +83,20 @@ fn main() callconv(.c) noreturn {
     rt.printInt(@intFromBool(@TypeOf(bigger[i..]) == []align(2) u64));
     const undef_slice: []align(1024) const u8 = undefined;
     rt.printInt(@intFromBool(@TypeOf(&undef_slice[0]) == *align(1024) const u8));
+    // Values of types aligned to more than 16 bytes, passed and returned.
+    var line = makeLine(7);
+    _ = &line;
+    rt.printInt(line.a);
+    rt.printInt(bump(line).a);
     rt.exit(0);
+}
+
+const Line = struct { a: u32, b: u8 align(64) = 1 };
+fn makeLine(a: u32) Line {
+    return .{ .a = a };
+}
+fn bump(l: Line) Line {
+    var r = l;
+    r.a += 2;
+    return r;
 }
