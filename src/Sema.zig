@@ -601,7 +601,7 @@ pub const Src = struct {
             .operand => |o| {
                 const node = o.node.toAbsolute(src.base);
                 switch (tree.nodeTag(node)) {
-                    .negation, .negation_wrap, .bit_not, .bool_not, .@"try" => return tree.nodeToSpan(tree.nodeData(node).node),
+                    .negation, .negation_wrap, .bit_not, .bool_not, .@"try", .optional_type => return tree.nodeToSpan(tree.nodeData(node).node),
                     // An `if`'s or `while`'s condition.
                     .if_simple, .@"if" => return tree.nodeToSpan(tree.fullIf(node).?.ast.cond_expr),
                     .while_simple, .while_cont, .@"while" => return tree.nodeToSpan(tree.fullWhile(node).?.ast.cond_expr),
@@ -613,7 +613,7 @@ pub const Src = struct {
                         const last = tree.lastToken(inputs[inputs.len - 1]);
                         return .{ .start = start, .main = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)) };
                     },
-                    .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .array_access => {
+                    .error_union, .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .array_access => {
                         const lhs, const rhs = tree.nodeData(node).node_and_node;
                         return tree.nodeToSpan(if (o.index == 0) lhs else rhs);
                     },
@@ -3874,15 +3874,23 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk .fromInterned(try sema.intern(.{ .array_type = .{ .len = len, .child = elem, .sentinel = sentinel } }));
         },
         .optional_type => blk: {
-            const src = block.nodeSrc(data.un_node.src_node);
-            break :blk .fromInterned(try sema.optType(try sema.resolveType(block, src, data.un_node.operand)));
+            const src = block.nodeSrc(data.un_node.src_node).operandSrc(0);
+            const child = try sema.resolveType(block, src, data.un_node.operand);
+            // As upstream.
+            switch (Type.class(sema.ip, child)) {
+                .@"opaque" => return sema.fail(block, src, "opaque type '{f}' cannot be optional", .{sema.fmtType(child)}),
+                .null => return sema.fail(block, src, "type '{f}' cannot be optional", .{sema.fmtType(child)}),
+                else => {},
+            }
+            break :blk .fromInterned(try sema.optType(child));
         },
         .error_union_type => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const set = try sema.resolveType(block, src, extra.lhs);
-            const payload = try sema.resolveType(block, src, extra.rhs);
-            if (Type.class(sema.ip, set) != .error_set) return sema.fail(block, src, "expected error set type, found '{f}'", .{sema.fmtType(set)});
+            const set = try sema.resolveType(block, src.operandSrc(0), extra.lhs);
+            const payload = try sema.resolveType(block, src.operandSrc(1), extra.rhs);
+            if (Type.class(sema.ip, set) != .error_set) return sema.fail(block, src.operandSrc(0), "expected error set type, found '{f}'", .{sema.fmtType(set)});
+            try sema.validateErrorUnionPayload(block, src.operandSrc(1), payload);
             break :blk .fromInterned(try sema.intern(.{ .error_union_type = .{ .error_set_type = set, .payload_type = payload } }));
         },
         .error_set_decl => blk: {
@@ -10664,11 +10672,21 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     _ = try sema.addBinOp(block, .store, ptr, operand);
 }
 
+/// As upstream: an error union's payload is neither opaque nor an error set.
+fn validateErrorUnionPayload(sema: *Sema, block: *Block, src: Src, payload: Index) CompileError!void {
+    switch (Type.class(sema.ip, payload)) {
+        .@"opaque" => return sema.fail(block, src, "error union with payload of opaque type '{f}' not allowed", .{sema.fmtType(payload)}),
+        .error_set => return sema.fail(block, src, "error union with payload of error set type '{f}' not allowed", .{sema.fmtType(payload)}),
+        else => {},
+    }
+}
+
 fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref {
     const ip = sema.ip;
     const ptr_ty = sema.typeOf(ptr);
     if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ptr_ty)});
     const info = Type.ptrInfo(ip, ptr_ty);
+    if (Type.class(ip, info.child) == .@"opaque") return sema.fail(block, src, "cannot load opaque type '{f}'", .{sema.fmtType(info.child)});
     if (sema.resolveValue(ptr)) |pv| if (!sema.bcForeign(pv)) {
         // Under @TypeOf only the type matters, also through a generic
         // function's runtime parameter, which stands as undefined.
@@ -15997,6 +16015,8 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
         // A single-item pointer provides a length: that of the bytes it
         // points to.
         if (s.flags.size != .one) return sema.fail(block, src, "cannot infer length of slice from '{f}'", .{sema.fmtType(src_ty)});
+        if (Type.class(ip, s.child) == .@"opaque")
+            return sema.fail(block, src, "cannot infer length of slice of '{f}' from pointer to opaque type '{f}' with unknown size", .{ sema.fmtType(d.child), sema.fmtType(s.child) });
         try sema.resolveLayout(block, src, d.child);
         try sema.resolveLayout(block, src, s.child);
         const src_elem: Index, const src_len: u64 = switch (ip.indexToKey(s.child)) {
@@ -16266,6 +16286,7 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         break :blk try sema.analyzeAsType(block, ret_src, ref);
     } else try sema.resolveType(block, ret_src, fn_info.ret_ty_ref);
     // As upstream's `isValidReturnType` and `isValidParamType`.
+    if (fn_info.inferred_error_set and Type.class(ip, ret_ty) == .error_set) try sema.validateErrorUnionPayload(block, ret_src, ret_ty);
     if (Type.class(ip, ret_ty) == .@"opaque")
         return sema.fail(block, ret_src, "opaque return type '{s}{f}' not allowed", .{ if (fn_info.inferred_error_set) "!" else "", sema.fmtType(ret_ty) });
     for (params, 0..) |p, k| switch (Type.class(ip, p.ty)) {
