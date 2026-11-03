@@ -178,15 +178,16 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
 ///
 /// `ctx.clobbers(inst)` and `ctx.termClobbers(block)` say which values
 /// and terminators may overwrite the registers that do not survive a
-/// call; a clobbering value writes its own result last. A value crosses a
+/// call; a clobbering value writes its own result last. `live` must have
+/// one entry per IR instruction already; `reg` and `tie` are the
+/// architecture's, which may mark them in `ctx.clobbers`. A value crosses a
 /// clobber point that lies after its definition and at or before its last
 /// use, except one in a block that does not continue, which matters only
 /// to the uses in that block after it.
 pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator.Error!void {
-    try f.live.resize(gpa, ir.instructions.len);
+    assert(f.live.len == ir.instructions.len);
     const s = f.live.slice();
     @memset(s.items(.uses), 0);
-    @memset(s.items(.reg), no_reg);
     @memset(s.items(.crosses), false);
     // Prefix counts of the clobber points by position.
     try f.clobbers.resize(gpa, 2 * f.values.len + 3);
@@ -690,4 +691,61 @@ test "an empty body falls through" {
     try std.testing.expectEqual(Term.Tag.fallthrough, entry.term.tag);
     try std.testing.expectEqual(@backingInt(L[1]), entry.term.succ[0]);
     try std.testing.expectEqual(Term.Tag.ret, f.blocks.items[@backingInt(L[1])].term.tag);
+}
+
+test "liveness extends over loops and ignores clobbers on paths that end" {
+    // fn f(c: bool, x: u64) void {
+    //     block { loop { cond_br(c, { not(x); br block }, { breakpoint; trap }) } }
+    //     ret
+    // }
+    const gpa = std.testing.allocator;
+    var insts: std.MultiArrayList(Inst) = .empty;
+    defer insts.deinit(gpa);
+    const extra = [_]u32{
+        2, 2, 5, 6, 7, 8, // 0: cond_br: then { not, br }, else { breakpoint, trap }
+        1, 4, // 6: loop body { cond_br }
+        1, 3, // 8: block body { loop }
+        4, 0, 1, 2, 9, // 10: main body { arg, arg, block, ret }
+    };
+    const ref = Inst.Index.toRef;
+    try insts.append(gpa, .{ .tag = .arg, .data = .{ .arg = .{ .ty = .bool_type, .index = 0 } } });
+    try insts.append(gpa, .{ .tag = .arg, .data = .{ .arg = .{ .ty = .u64_type, .index = 1 } } });
+    try insts.append(gpa, .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = 8 } } });
+    try insts.append(gpa, .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = 6 } } });
+    try insts.append(gpa, .{ .tag = .cond_br, .data = .{ .pl_op = .{ .operand = ref(@fromBackingInt(0)), .payload = 0 } } });
+    try insts.append(gpa, .{ .tag = .not, .data = .{ .ty_op = .{ .ty = .u64_type, .operand = ref(@fromBackingInt(1)) } } });
+    try insts.append(gpa, .{ .tag = .br, .data = .{ .br = .{ .block_inst = @fromBackingInt(2), .operand = .void_value } } });
+    try insts.append(gpa, .{ .tag = .breakpoint, .data = .{ .no_op = {} } });
+    try insts.append(gpa, .{ .tag = .trap, .data = .{ .no_op = {} } });
+    try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = .void_value } });
+    const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 10 };
+    var f: Func = .{};
+    defer f.deinit(gpa);
+    try f.build(gpa, &ir);
+    try f.live.resize(gpa, ir.instructions.len);
+
+    // Clobber points: the breakpoint, which is on the path that traps,
+    // and optionally the `not` in the loop.
+    const Ctx = struct {
+        not_clobbers: bool,
+        pub fn clobbers(c: @This(), inst: Inst.Index) bool {
+            return switch (@backingInt(inst)) {
+                7 => true,
+                5 => c.not_clobbers,
+                else => false,
+            };
+        }
+        pub fn termClobbers(_: @This(), _: Block.Index) bool {
+            return false;
+        }
+    };
+    try f.liveness(gpa, &ir, Ctx{ .not_clobbers = false });
+    const x = 1;
+    // x is defined before the loop and read in it: live through the loop's
+    // last terminator, not just to its read.
+    try std.testing.expectEqual(f.loops.items[0].end, f.live.items(.end)[x]);
+    try std.testing.expect(f.live.items(.end)[x] > f.live.items(.def)[5]);
+    try std.testing.expect(!f.live.items(.crosses)[x]);
+    try f.liveness(gpa, &ir, Ctx{ .not_clobbers = true });
+    try std.testing.expect(f.live.items(.crosses)[x]);
 }

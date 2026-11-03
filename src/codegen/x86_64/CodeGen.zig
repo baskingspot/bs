@@ -71,6 +71,8 @@ trace_slot: ?i32 = null,
 saved: u32 = 0,
 /// `Ssa.liveness` ran, so value slots are shared by lifetime.
 live: bool = false,
+/// The function contains inline assembly, so no value gets a register.
+has_asm: bool = false,
 /// Overflow operations whose results only their `struct_field_val`s read
 /// (`Home.pair`), and those two values (or `Ssa.no_tie`).
 pairs: std.AutoHashMapUnmanaged(u32, [2]u32) = .empty,
@@ -643,16 +645,27 @@ const callee_saved: u32 = 0b11111;
 /// Whether value `inst`'s lowering may write rsi, rdi, r8, or r9 (for
 /// `Ssa.liveness`). The scalar lowerings use only rax, rcx, rdx, r10,
 /// and r11; calls, string instructions, and the C ABI use the others.
+/// Also marks the values that want a register (`wantsReg`).
 pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
     const ir = cg.ir;
     const data = ir.instructions.items(.data)[@backingInt(inst)];
-    return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
-        .arg, .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .block, .loop, .breakpoint => false,
+    const tag = ir.instructions.items(.tag)[@backingInt(inst)];
+    switch (tag) {
+        .arg, .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .block, .loop, .breakpoint => return false,
+        else => {},
+    }
+    const want = !cg.has_asm and cg.wantsReg(inst);
+    if (want) {
+        const live = cg.emit.ssa.live.slice();
+        live.items(.reg)[@backingInt(inst)] = Ssa.want_reg;
+        live.items(.tie)[@backingInt(inst)] = cg.tiedOperand(inst);
+    }
+    return switch (tag) {
         .ret_addr, .frame_addr, .extern_ptr, .tls_ptr, .err_return_trace, .save_err_return_trace_index, .set_err_return_trace => false,
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => !cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)),
         .store => !cg.passInRegs(cg.typeOf(data.bin_op.rhs)),
         .call, .atomic_rmw => true,
-        else => !cg.wantsReg(inst),
+        else => !want,
     };
 }
 
@@ -664,7 +677,7 @@ pub fn termClobbers(cg: *CodeGen, block: Ssa.Block.Index) bool {
     const term = cg.ssa.blocks.items[@backingInt(block)].term;
     const data = ir.instructions.items(.data)[@backingInt(term.inst)];
     return switch (term.tag) {
-        .jump => ir.instructions.items(.tag)[@backingInt(term.inst)] == .br and
+        .jump => ir.instructions.items(.tag)[@backingInt(term.inst)] == .br and data.br.operand != Ref.void_value and
             Type.abiSize(cg.ip, ir.typeOfIndex(data.br.block_inst, cg.ip)) > 128,
         .switch_br => cg.isWideInt(cg.typeOf(data.pl_op.operand)),
         .ret => !cg.inGpr(cg.fn_ty.return_type),
@@ -678,13 +691,18 @@ fn planRegisters(cg: *CodeGen) Error!void {
     const ir = cg.ir;
     const tags = ir.instructions.items(.tag);
     const insts = f.values.items(.inst);
-    try f.liveness(cg.gpa, ir, cg);
-    cg.live = true;
-    for (insts) |inst| if (tags[@backingInt(inst)] == .assembly) return;
+    try f.live.resize(cg.gpa, ir.instructions.len);
     const live = f.live.slice();
     const uses = live.items(.uses);
     const reg = live.items(.reg);
-    const tie = live.items(.tie);
+    @memset(reg, Ssa.no_reg);
+    cg.has_asm = for (insts) |inst| {
+        if (tags[@backingInt(inst)] == .assembly) break true;
+    } else false;
+    // `clobbers` marks the values that want a register.
+    try f.liveness(cg.gpa, ir, cg);
+    cg.live = true;
+    if (cg.has_asm) return;
     const datas = ir.instructions.items(.data);
     const def = live.items(.def);
     for (f.layout.items) |block| {
@@ -721,9 +739,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
             }
             if (cond != null and cond.? == inst and uses[i] == 1 and cg.fusable(inst)) {
                 cg.homes[i] = .fused;
-            } else if (cg.wantsReg(inst)) {
-                reg[i] = Ssa.want_reg;
-                tie[i] = cg.tiedOperand(inst);
+                reg[i] = Ssa.no_reg;
             }
         }
     }
@@ -737,11 +753,14 @@ fn planRegisters(cg: *CodeGen) Error!void {
 /// Whether `ty`'s values fit a general-purpose register.
 fn inGpr(cg: *CodeGen, ty: Index) bool {
     const ip = cg.ip;
-    if (!cg.passInRegs(ty)) return false;
+    // Hot: decided by the type's class without computing its size where
+    // possible.
     return switch (Type.class(ip, ty)) {
-        .bool, .error_set, .int, .@"enum" => true,
+        .bool => true,
+        .int => Type.intInfo(ip, ty).bits -% 1 < 64,
         .pointer => !Type.isSlice(ip, ty),
         .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, ty)),
+        .error_set, .@"enum" => cg.passInRegs(ty),
         else => false,
     };
 }
@@ -769,8 +788,8 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) bool {
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     const tag = ir.instructions.items(.tag)[@backingInt(inst)];
     const wanted = switch (tag) {
-        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => cg.scalarOperand(data.bin_op.lhs),
-        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.scalarOperand(data.bin_op.lhs),
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => cg.inGpr(cg.typeOf(data.bin_op.lhs)),
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.inGpr(cg.typeOf(data.bin_op.lhs)),
         .not, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => !cg.isWideInt(cg.typeOf(data.ty_op.operand)),
         .intcast, .trunc, .bitcast, .ptr_from_int => cg.passInRegs(cg.typeOf(data.ty_op.operand)) and !cg.isWideInt(cg.typeOf(data.ty_op.operand)),
         .load, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err => true,
