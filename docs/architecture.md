@@ -213,7 +213,12 @@ the callee's body first. Early cutoff on the set keeps such callers green.
 - All comptime calls go through one entry point that memoizes by (function,
   stable hashes of arguments). A memo entry keeps the dependencies its call
   declared, and a unit that reuses the result declares them too, as if it
-  had made the call. Milestone 6 replaces the hot path behind this
+  had made the call. `@typeInfo(T)` goes through the same memo table,
+  keyed by `T`'s stable hash: its result depends only on `T` (and the
+  declarations of `std.builtin` it reads, which the entry's dependencies
+  record), and std.fmt and std.meta ask for the same types over and over.
+  Error sets are not memoized: the function whose inferred error set it is
+  sees it unresolved. Milestone 6 replaces the hot path behind this
   entry point with compiled bytecode for function instances whose types are
   fully known, falling back to ZIR walking for type-constructing code (see
   "Comptime evaluator" below).

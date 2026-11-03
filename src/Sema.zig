@@ -3762,6 +3762,26 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].un_node;
     const src = block.nodeSrc(data.src_node);
     const ty = try sema.resolveType(block, src, data.operand);
+    // Memoized like a comptime call: std.fmt and std.meta take the
+    // `@typeInfo` of the same types over and over. Not an error set's,
+    // which the function whose inferred set it is sees unresolved.
+    if (Type.class(ip, ty) == .error_set) return .fromInterned(try sema.typeInfo(block, src, ty));
+    var hasher: InternPool.Hasher = .init("type info");
+    hasher.int(InternPool.Hash, ip.stableHash(ty));
+    const key = hasher.final();
+    if (sema.zcu.comptime_memo.get(key)) |memo| {
+        for (memo.deps) |d| try sema.declareDep(d.dependee, d.conditional);
+        return .fromInterned(memo.result);
+    }
+    const scope = sema.memoEnter();
+    defer sema.memoLeave(scope);
+    const result = try sema.typeInfo(block, src, ty);
+    try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.start) });
+    return .fromInterned(result);
+}
+
+fn typeInfo(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!Index {
+    const ip = sema.ip;
     const info_ty = try sema.stdLangType(block, src, "Type");
     try sema.resolveLayout(block, src, ty);
     const S = struct { []const u8, Index };
@@ -3942,7 +3962,7 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         },
         else => return sema.fail(block, src, "zap does not support @typeInfo of '{f}' yet", .{sema.fmtType(ty)}),
     };
-    return .fromInterned(try sema.unionValue(block, src, info_ty, if (class == .tuple) "struct" else @tagName(class), payload));
+    return sema.unionValue(block, src, info_ty, if (class == .tuple) "struct" else @tagName(class), payload);
 }
 
 fn zirBitOp(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) CompileError!Ref {
@@ -14033,6 +14053,26 @@ fn calleeRetTy(sema: *Sema, callee_block: *Block, src: Src, func: Index) Compile
     return ty;
 }
 
+/// A memoizable computation in progress, whose dependencies `memoDeps`
+/// collects from `start` on.
+const MemoScope = struct { saved: ?u32, start: u32 };
+
+fn memoEnter(sema: *Sema) MemoScope {
+    const scope: MemoScope = .{ .saved = sema.memo_start, .start = @intCast(sema.memo_deps.items.len) };
+    sema.memo_start = scope.start;
+    sema.memo_epoch += 1;
+    return scope;
+}
+
+fn memoLeave(sema: *Sema, scope: MemoScope) void {
+    sema.memo_start = scope.saved;
+    if (scope.saved == null) {
+        sema.memo_deps.clearRetainingCapacity();
+        sema.memo_pos.clearRetainingCapacity();
+        sema.memo_body_pos.clearRetainingCapacity();
+    }
+}
+
 /// The one entry point for comptime calls. Memoized by the callee and the
 /// stable hashes of the arguments.
 fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []const Index) CompileError!Index {
@@ -14051,20 +14091,8 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
         for (memo.deps) |d| try sema.declareDep(d.dependee, d.conditional);
         return memo.result;
     };
-    const saved_memo_start = sema.memo_start;
-    const memo_start: u32 = @intCast(sema.memo_deps.items.len);
-    if (memoizable) {
-        sema.memo_start = memo_start;
-        sema.memo_epoch += 1;
-    }
-    defer if (memoizable) {
-        sema.memo_start = saved_memo_start;
-        if (saved_memo_start == null) {
-            sema.memo_deps.clearRetainingCapacity();
-            sema.memo_pos.clearRetainingCapacity();
-            sema.memo_body_pos.clearRetainingCapacity();
-        }
-    };
+    const scope: ?MemoScope = if (memoizable) sema.memoEnter() else null;
+    defer if (scope) |sc| sema.memoLeave(sc);
     // A lowered body runs once what each walker run of it would evaluate
     // again, which only memoized calls make equal.
     if (sema.bc) |bc| if (bc.depth == 0 and !memoizable) try sema.bcRefuse();
@@ -14086,7 +14114,7 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
         },
     };
     if (memoizable and !sema.refersToComptimeAlloc(result)) {
-        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(memo_start) });
+        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.?.start) });
     } else if (sema.bc) |bc| if (bc.depth == 0) try sema.bcRefuse();
     return result;
 }
