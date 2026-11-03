@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "1\n7\n3\n1\n0\n1\n1\n1\n9\n1\n42\n4\n4\n44\n7\n4294967295\n42\n13\n4\n"
+//! stdout: "1\n7\n3\n1\n0\n1\n1\n1\n9\n1\n42\n4\n4\n44\n7\n4294967295\n42\n13\n25\n31\n11\n4\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 // For `std.lang.ExternOptions`; std.start sees `_start` and stays out.
@@ -93,6 +93,13 @@ fn main() callconv(.c) noreturn {
     // Extern function declarations resolve to exports of their name.
     rt.printInt(api_add(4, 2));
     rt.printInt(zap_add(1, 3));
+    // A comptime-known @extern function pointer: called, held at runtime,
+    // and stored in data.
+    rt.printInt(add_ptr(2, 5));
+    var add_rt = add_ptr;
+    _ = &add_rt;
+    rt.printInt(add_rt(3, 1));
+    rt.printInt(add_table.f(1, 1));
     // @ptrCast into an optional slice.
     const ws = wordsOf(&word_buf).?;
     rt.printInt(ws.len + ws[1]);
@@ -130,3 +137,6 @@ var word_buf: [8]u8 align(4) = .{ 1, 0, 0, 0, 2, 0, 0, 0 };
 fn wordsOf(b: []u8) ?[]u32 {
     return @ptrCast(@alignCast(b));
 }
+const add_ptr = @extern(*const fn (u32, u32) callconv(.c) u32, .{ .name = "zap_add" });
+const AddTable = struct { f: *const fn (u32, u32) callconv(.c) u32 };
+var add_table: AddTable = .{ .f = add_ptr };

@@ -3522,6 +3522,12 @@ fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
     if (try sema.fieldValue(options, info.fieldIndex(ip, "is_thread_local").?) == .bool_true)
         return sema.failUnsupported(block, src, "thread-local externs");
     if (is_weak and Type.class(ip, ty) != .optional) ty = try sema.optType(ty);
+    // A function's address is a comptime-known pointer to the extern
+    // function, which CodeGen reads from the slot the link fills.
+    if (!is_weak and Type.class(ip, ty) == .pointer and Type.class(ip, Type.ptrInfo(ip, ty).child) == .@"fn") {
+        const f = try sema.intern(.{ .extern_func = .{ .name = try sema.getString(name), .ty = Type.ptrInfo(ip, ty).child, .is_weak = false } });
+        return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .uav = .{ .val = f, .orig_ty = ty } } } }));
+    }
     if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
     return sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ty, .payload = @backingInt(try sema.getString(name)) } } });
 }
@@ -4410,6 +4416,13 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
         // it keeps its own type.
         .@"fn" => if (sc == .@"fn") {
             const v = val orelse return null;
+            // An extern function retyped, as upstream's in-memory coercion.
+            if (ip.indexToKey(v) == .extern_func) {
+                if (!try sema.fnTypeCoercible(block, src, v, dest_ty)) return null;
+                var f = ip.indexToKey(v).extern_func;
+                f.ty = dest_ty;
+                return .fromInterned(try sema.intern(.{ .extern_func = f }));
+            }
             if (ip.indexToKey(v) != .func or !try sema.fnTypeCoercible(block, src, v, dest_ty)) return null;
             // A generic function takes the parameter types of the type it
             // coerces to, which its calls then coerce arguments to.
@@ -4900,6 +4913,7 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
         return false;
     }
     if (s.return_type == d.return_type or s.return_type == .noreturn_type or s.return_type == .generic_poison_type) return true;
+    if (sema.childCoercibleInMemory(s.return_type, d.return_type)) return true;
     const sr = ip.indexToKey(s.return_type);
     const dr = ip.indexToKey(d.return_type);
     if (sr != .error_union_type or dr != .error_union_type) return false;
@@ -11589,6 +11603,7 @@ fn analyzeCall(
             if (p.flags.size != .one or Type.class(ip, p.child) != .@"fn") return sema.fail(block, src, "type '{f}' not a function", .{sema.fmtType(callee_ty)});
             if (sema.resolveValue(callee)) |v| if (ip.indexToKey(v) == .ptr) {
                 const k = ip.indexToKey(v).ptr;
+                if (k.base == .uav and k.byte_offset == 0 and ip.indexToKey(k.base.uav.val) == .extern_func) extern_func = k.base.uav.val;
                 if (k.base == .nav and k.byte_offset == 0) {
                     try sema.ensureNavVal(block, src, k.base.nav);
                     const nv = ip.getNav(k.base.nav).val;

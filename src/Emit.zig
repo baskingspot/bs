@@ -220,20 +220,10 @@ fn externSlotKey(name: []const u8) SymbolKey {
 /// reporting an undefined strong symbol.
 fn lowerExternSlots(emit: *Emit) !bool {
     const zcu = emit.zcu;
-    const ip = &zcu.ip;
     const arena = emit.allocator();
     var ok = true;
     for (emit.externs.keys(), emit.externs.values()) |name, weak| {
-        const target: ?SymbolKey = for (zcu.exports.items) |x| {
-            if (!std.mem.eql(u8, ip.stringSlice(x.name), name)) continue;
-            const x_nav = switch (x.target) {
-                .nav => |n| n,
-                .uav => |v| break try emit.uavKey(v, 0),
-            };
-            const nav = ip.getNav(x_nav);
-            if (nav.status != .resolved) continue;
-            break if (ip.indexToKey(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x_nav);
-        } else if (try zcu.requestCompilerRtExport(name)) |key| .fromName(key) else null;
+        const target = try emit.exportTarget(name);
         if (target == null and !weak) {
             try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
             ok = false;
@@ -254,6 +244,24 @@ fn lowerExternSlots(emit: *Emit) !bool {
         });
     }
     return ok;
+}
+
+/// The symbol exported as `name`, or null if there is none. Complete only
+/// once analysis is.
+pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
+    const zcu = emit.zcu;
+    const ip = &zcu.ip;
+    for (zcu.exports.items) |x| {
+        if (!std.mem.eql(u8, ip.stringSlice(x.name), name)) continue;
+        const x_nav = switch (x.target) {
+            .nav => |n| n,
+            .uav => |v| return try emit.uavKey(v, 0),
+        };
+        const nav = ip.getNav(x_nav);
+        if (nav.status != .resolved) continue;
+        return if (ip.indexToKey(nav.val) == .func) try emit.funcKey(nav.val) else try emit.navKey(x_nav);
+    }
+    return if (try zcu.requestCompilerRtExport(name)) |key| .fromName(key) else null;
 }
 
 pub fn allocator(emit: *Emit) Allocator {

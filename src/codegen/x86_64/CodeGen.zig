@@ -257,6 +257,12 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
         .enum_tag => |e| if (cg.passInRegs(ty)) return .{ .imm = intBits(ip, e.int) },
         .ptr => |p| if (!Type.isSlice(ip, ty)) {
             if (p.base == .int) return .{ .imm = p.byte_offset };
+            // The address of an extern function is in its link slot.
+            if (p.base == .uav and ip.indexToKey(p.base.uav.val) == .extern_func and p.byte_offset == 0) {
+                const name = ip.stringSlice(ip.indexToKey(p.base.uav.val).extern_func.name);
+                _ = try cg.emit.zcu.requestCompilerRtExport(name);
+                return .{ .mem = Mem.sym(try cg.emit.useExtern(name, false), 0) };
+            }
             const t = try ptrTarget(cg.emit, val);
             return .{ .addr = Mem.sym(t.key, @intCast(t.off)) };
         },
@@ -1756,8 +1762,17 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
             if (ip.indexToKey(nav.val) == .func) break :blk .{ .key = try emit.funcKey(nav.val), .off = 0 };
             break :blk .{ .key = try emit.navKey(n), .off = 0 };
         },
-        // A local constant declared `align(n)` keeps its alignment.
-        .uav => |u| .{ .key = try emit.uavKey(u.val, if (u.orig_ty == .none) 0 else explicitAlignment(ip, u.orig_ty)), .off = 0 },
+        .uav => |u| if (ip.indexToKey(u.val) == .extern_func) blk: {
+            // An extern function's address in data: the export's symbol.
+            const name = ip.stringSlice(ip.indexToKey(u.val).extern_func.name);
+            const key = try emit.exportTarget(name) orelse {
+                try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
+                return error.CodegenFail;
+            };
+            break :blk .{ .key = key, .off = 0 };
+        } else
+            // A local constant declared `align(n)` keeps its alignment.
+            .{ .key = try emit.uavKey(u.val, if (u.orig_ty == .none) 0 else explicitAlignment(ip, u.orig_ty)), .off = 0 },
         .field => |f| blk: {
             var parent = try ptrTarget(emit, f.base);
             const container = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
