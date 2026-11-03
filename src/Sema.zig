@@ -1779,7 +1779,9 @@ fn isUndef(sema: *Sema, val: Index) bool {
 
 fn analyzeAsType(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileError!Index {
     const coerced = try sema.coerce(block, .type_type, ref, src);
-    return sema.resolveConstValue(block, src, coerced, "types must be comptime-known");
+    const val = try sema.resolveConstValue(block, src, coerced, "types must be comptime-known");
+    if (sema.isUndef(val)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+    return val;
 }
 
 fn resolveType(sema: *Sema, block: *Block, src: Src, zir_ref: Zir.Inst.Ref) CompileError!Index {
@@ -2138,7 +2140,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
             },
             .compile_error => {
                 const src = block.nodeSrc(data.un_node.src_node);
-                const msg = try sema.resolveConstString(block, src, sema.resolveInst(data.un_node.operand));
+                const msg = try sema.resolveConstString(block, sema.callArgSrc(src, false, 0), sema.resolveInst(data.un_node.operand));
                 return sema.fail(block, src, "{s}", .{msg});
             },
 
@@ -2785,14 +2787,18 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .indexable_ptr_elem_type => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             const ty = try sema.resolveType(block, src, data.un_node.operand);
+            try sema.checkMemOperand(block, src, ty);
             const p = Type.ptrInfo(sema.ip, ty);
             break :blk .fromInterned(if (p.flags.size == .one) Type.childType(sema.ip, p.child) else p.child);
         },
         .reify_int => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const sv = try sema.resolveConstValue(block, src, sema.resolveInst(extra.lhs), "signedness must be comptime-known");
-            const bits = try sema.resolveInt(block, src, extra.rhs, .u16_type, "bit count must be comptime-known");
+            const signedness_src = sema.callArgSrc(src, false, 0);
+            const signedness_ty = try sema.stdLangType(block, src, "Signedness");
+            const sv = try sema.resolveConstValue(block, signedness_src, try sema.coerce(block, signedness_ty, sema.resolveInst(extra.lhs), signedness_src), "signedness must be comptime-known");
+            if (sema.isUndef(sv)) return sema.fail(block, signedness_src, "use of undefined value here causes illegal behavior", .{});
+            const bits = try sema.resolveInt(block, sema.callArgSrc(src, false, 1), extra.rhs, .u16_type, "bit count must be comptime-known");
             const signedness: std.lang.Signedness = if (std.mem.eql(u8, sema.enumTagName(sv).?, "signed")) .signed else .unsigned;
             break :blk .fromInterned(try sema.intType(signedness, @intCast(bits)));
         },
@@ -3126,11 +3132,12 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const ty = sema.unwrapOptEu(try sema.resolveType(block, block.nodeSrc(.zero), data.bin.lhs));
             if (ty == .generic_poison_type) break :blk .fromInterned(.generic_poison_type);
             const idx: usize = @backingInt(data.bin.rhs);
+            // An index out of range is an error of the initialization.
             break :blk .fromInterned(switch (sema.ip.indexToKey(ty)) {
                 .array_type => |a| a.child,
                 .vector_type => |v| v.child,
-                .tuple_type => |t| t.types[idx],
-                .struct_type => sema.ip.structInfo(ty).field_types[idx],
+                .tuple_type => |t| if (idx < t.types.len) t.types[idx] else .generic_poison_type,
+                .struct_type => if (idx < sema.ip.structInfo(ty).field_types.len) sema.ip.structInfo(ty).field_types[idx] else .generic_poison_type,
                 else => .generic_poison_type,
             });
         },
@@ -3218,9 +3225,28 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 try sema.resolveLayout(block, src, ty);
                 break :blk sema.reinterpretBits(block, src, sema.ip.structInfo(ty).tag_type, operand);
             }
+            if (tag == .backing_int) {
+                const operand_src = sema.callArgSrc(src, false, 0);
+                switch (Type.class(sema.ip, ty)) {
+                    .@"enum" => {},
+                    .@"union" => {
+                        try sema.resolveLayout(block, src, ty);
+                        const tag_ty = sema.ip.structInfo(ty).tag_type;
+                        if (tag_ty == .none or sema.ip.keyTag(tag_ty) != .enum_type) {
+                            const err = sema.fail(block, operand_src, "non-packed union '{f}' does not have a backing integer", .{sema.fmtType(ty)});
+                            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+                            try sema.zcu.addNote(sema.file, operand_src.span(tree), "untagged union '{f}' does not have an enum tag with a backing integer", .{sema.fmtType(ty)});
+                            return err;
+                        }
+                    },
+                    .@"struct" => return sema.fail(block, operand_src, "non-packed struct '{f}' does not have a backing integer", .{sema.fmtType(ty)}),
+                    else => return sema.fail(block, operand_src, "expected enum, tagged union, packed union or packed struct, found '{f}'", .{sema.fmtType(ty)}),
+                }
+            }
             if (Type.class(sema.ip, ty) == .@"union") {
                 try sema.resolveLayout(block, src, ty);
-                if (sema.ip.keyTag(sema.ip.structInfo(ty).tag_type) != .enum_type) return sema.fail(block, src, "untagged union '{f}' cannot be converted to integer", .{sema.fmtType(ty)});
+                const tag_ty = sema.ip.structInfo(ty).tag_type;
+                if (tag_ty == .none or sema.ip.keyTag(tag_ty) != .enum_type) return sema.fail(block, src, "untagged union '{f}' cannot be converted to integer", .{sema.fmtType(ty)});
                 operand = try sema.unionTag(block, src, operand);
                 ty = sema.typeOf(operand);
             }
@@ -3641,9 +3667,10 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .reify_enum_value_slice_ty => blk: {
             const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
             const src = block.nodeSrc(extra.node);
-            const tag_ty = try sema.resolveType(block, src, extra.lhs);
-            const names = try sema.coerce(block, .slice_const_slice_const_u8_type, sema.resolveInst(extra.rhs), src);
-            const len = (try sema.constSliceElems(block, src, names, "enum field names must be comptime-known")).len;
+            const tag_ty = try sema.resolveType(block, sema.callArgSrc(src, false, 0), extra.lhs);
+            const names_src = sema.callArgSrc(src, false, 2);
+            const names = try sema.coerce(block, .slice_const_slice_const_u8_type, sema.resolveInst(extra.rhs), names_src);
+            const len = (try sema.constSliceElems(block, names_src, names, "enum field names must be comptime-known")).len;
             break :blk .fromInterned(try sema.ptrType(.{ .child = try sema.intern(.{ .array_type = .{ .len = len, .child = tag_ty } }), .flags = .{ .is_const = true } }));
         },
         .reify_tuple => blk: {
@@ -5385,7 +5412,9 @@ fn resolveConstString(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileErr
     };
     const coerced = try sema.coerce(block, .slice_const_u8_type, ref, src);
     const val = try sema.resolveConstValue(block, src, coerced, "string must be comptime-known");
+    if (sema.isUndef(val)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
     const slice = sema.ip.keyPayload(.slice, val);
+    if (sema.isUndef(slice.len)) return sema.fail(block, src, "use of slice with undefined length here causes illegal behavior", .{});
     const len = sema.ip.intValue(u64, slice.len).?;
     // Read as one array: a string built at comptime (`a ++ @tagName(t)`)
     // is stored as bytes.
@@ -5856,6 +5885,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             if (tag_ty == .none or ip.keyTag(tag_ty) != .enum_type) return null;
             const tag = (try sema.coerceInner(block, tag_ty, inst, src)) orelse return null;
             if (sema.resolveValue(tag) == null) {
+                if (ip.structInfo(tag_ty).nonexhaustive) return sema.fail(block, src, "runtime coercion to union '{f}' from non-exhaustive enum", .{sema.fmtType(dest_ty)});
                 // As upstream: when every field is zero-bit, the union is
                 // its tag.
                 for (info.field_types) |ft| {
@@ -5866,7 +5896,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 }
             }
             const tv = try sema.resolveConstValue(block, src, tag, "union tag must be comptime-known");
-            const i = sema.enumTagIndex(tv).?;
+            const i = sema.enumTagIndex(tv) orelse return sema.fail(block, src, "union '{f}' has no tag with value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(tv) });
             const field_ty = info.field_types[i];
             if (Type.hasRuntimeBits(ip, field_ty) or Type.class(ip, field_ty) == .noreturn)
                 return sema.fail(block, src, "coercion from enum '{f}' to union '{f}' must initialize '{f}' field '{s}'", .{ sema.fmtType(src_ty), sema.fmtType(dest_ty), sema.fmtType(field_ty), ip.stringSlice(info.field_names[i]) });
@@ -5961,21 +5991,23 @@ fn zirTagName(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     var ty = sema.typeOf(operand);
     if (Type.class(ip, ty) == .@"union") {
         try sema.resolveLayout(block, src, ty);
-        if (ip.keyTag(ip.structInfo(ty).tag_type) != .enum_type) return sema.fail(block, src, "union '{f}' is untagged", .{sema.fmtType(ty)});
+        const tag_ty = ip.structInfo(ty).tag_type;
+        if (tag_ty == .none or ip.keyTag(tag_ty) != .enum_type) return sema.fail(block, src, "union '{f}' is untagged", .{sema.fmtType(ty)});
         operand = try sema.unionTag(block, src, operand);
         ty = sema.typeOf(operand);
     }
     switch (Type.class(ip, ty)) {
         .enum_literal => {
             const v = try sema.resolveConstValue(block, src, operand, "enum literal must be comptime-known");
+            if (sema.isUndef(v)) return sema.fail(block, sema.callArgSrc(src, false, 0), "use of undefined value here causes illegal behavior", .{});
             return sema.tagNameValue(ip.stringSlice(ip.keyPayload(.enum_literal, v)));
         },
         .@"enum" => {},
-        else => return sema.fail(block, src, "expected enum or union; found '{f}'", .{sema.fmtType(ty)}),
+        else => return sema.fail(block, sema.callArgSrc(src, false, 0), "expected enum or union; found '{f}'", .{sema.fmtType(ty)}),
     }
     try sema.resolveLayout(block, src, ty);
     if (sema.resolveValue(operand)) |v| {
-        if (sema.isUndef(v)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        if (sema.isUndef(v)) return sema.fail(block, sema.callArgSrc(src, false, 0), "use of undefined value here causes illegal behavior", .{});
         const i = sema.enumTagIndex(v) orelse
             return sema.fail(block, src, "no field with value '{f}' in enum '{f}'", .{ sema.fmtValue(ip.keyPayload(.enum_tag, v).int), sema.fmtType(ty) });
         return sema.tagNameValue(ip.stringSlice(ip.structInfo(ty).field_names[i]));
@@ -10345,16 +10377,26 @@ fn fieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) Co
 fn memOperand(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!struct { elem: Index, len: Ref } {
     const ip = sema.ip;
     const ty = sema.typeOf(ptr);
-    if (Type.class(ip, ty) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ty)});
+    try sema.checkMemOperand(block, src, ty);
     const p = Type.ptrInfo(ip, ty);
     return switch (p.flags.size) {
         .slice => .{ .elem = p.child, .len = try sema.sliceLen(block, ptr) },
         .many, .c => .{ .elem = p.child, .len = .none },
-        .one => switch (ip.indexToKey(p.child)) {
-            .array_type => |a| .{ .elem = a.child, .len = .fromInterned(try sema.intValue(.usize_type, a.len)) },
-            else => sema.fail(block, src, "type '{f}' is not an indexable pointer", .{sema.fmtType(ty)}),
-        },
+        .one => .{ .elem = Type.childType(ip, p.child), .len = .fromInterned(try sema.intValue(.usize_type, ip.keyPayload(.array_type, p.child).len)) },
     };
+}
+
+/// Fails unless `ty` is a slice, a many pointer, or a pointer to an array.
+fn checkMemOperand(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
+    const ip = sema.ip;
+    if (Type.class(ip, ty) == .pointer) {
+        const p = Type.ptrInfo(ip, ty);
+        if (p.flags.size != .one or ip.keyTag(p.child) == .array_type) return;
+    }
+    const err = sema.fail(block, src, "type '{f}' is not an indexable pointer", .{sema.fmtType(ty)});
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    try sema.zcu.addNote(sema.file, src.span(tree), "operand must be a slice, a many pointer or a pointer to an array", .{});
+    return err;
 }
 
 /// The many-pointer or array pointer inside a `@memcpy` operand.
@@ -10404,6 +10446,17 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     };
     const src: Src = .{ .base = node, .loc = .{ .node_abs = node } };
     const reason = "reified type arguments must be comptime-known";
+    // The first argument is checked first, as upstream.
+    const arg0_src = sema.callArgSrc(src, false, 0);
+    // An enum's tag type, or a struct's or union's layout value.
+    const arg0: Index, const layout: std.lang.Type.ContainerLayout = if (kind == .@"enum")
+        .{ try sema.resolveType(block, arg0_src, args[0]), .auto }
+    else layout: {
+        const layout_ty = try sema.stdLangType(block, src, "Type.ContainerLayout");
+        const layout_val = try sema.resolveConstValue(block, arg0_src, try sema.coerce(block, layout_ty, sema.resolveInst(args[0]), arg0_src), reason);
+        if (sema.isUndef(layout_val)) return sema.fail(block, arg0_src, "use of undefined value here causes illegal behavior", .{});
+        break :layout .{ layout_val, std.meta.stringToEnum(std.lang.Type.ContainerLayout, sema.enumTagName(layout_val).?).? };
+    };
     const name_vals = try sema.constSliceElems(block, src, try sema.coerce(block, .slice_const_slice_const_u8_type, sema.resolveInst(names_ref), src), reason);
     const n = name_vals.len;
     const names = try sema.arena.alloc(InternPool.String, n);
@@ -10413,7 +10466,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     }
 
     if (kind == .@"enum") {
-        const tag_ty = try sema.resolveType(block, src, args[0]);
+        const tag_ty = arg0;
         // As upstream, an enum without fields may have tag type `noreturn`.
         if (Type.class(ip, tag_ty) != .int and !(tag_ty == .noreturn_type and n == 0)) return sema.fail(block, src, "tag type must be an integer type", .{});
         const mode_ty = try sema.stdLangType(block, src, "Type.Enum.Mode");
@@ -10432,10 +10485,6 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         return .fromInterned(ty);
     }
 
-    const layout_ty = try sema.stdLangType(block, src, "Type.ContainerLayout");
-    const layout_val = try sema.resolveConstValue(block, src, try sema.coerce(block, layout_ty, sema.resolveInst(args[0]), src), reason);
-    if (sema.isUndef(layout_val)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
-    const layout = std.meta.stringToEnum(std.lang.Type.ContainerLayout, sema.enumTagName(layout_val).?).?;
     const arg_ty = try sema.resolveConstValue(block, src, try sema.coerce(block, try sema.optType(.type_type), sema.resolveInst(args[1]), src), reason);
     const types = try sema.constSliceElems(block, src, try sema.coerce(block, .slice_const_type_type, sema.resolveInst(args[2]), src), reason);
     if (types.len != n) return sema.fail(block, src, "{d} field names but {d} field types", .{ n, types.len });
@@ -10474,7 +10523,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     // The captures are the canonical arguments: no pointers into comptime
     // memory, which is neither stable nor immutable.
     var captures: std.ArrayList(Index) = .empty;
-    try captures.appendSlice(sema.arena, &.{ layout_val, arg_ty, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = .type_type } }), .storage = .{ .elems = types } } }) });
+    try captures.appendSlice(sema.arena, &.{ arg0, arg_ty, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = .type_type } }), .storage = .{ .elems = types } } }) });
     try captures.appendSlice(sema.arena, defaults);
     if (any_align) try captures.appendSlice(sema.arena, align_vals);
     if (any_comptime) try captures.appendSlice(sema.arena, comptime_vals);
@@ -10664,17 +10713,30 @@ fn zirMemcpy(sema: *Sema, block: *Block, inst: Zir.Inst.Index, tag: Ir.Inst.Tag)
     const src = block.nodeSrc(data.src_node);
     var dest = sema.resolveInst(extra.lhs);
     var source = sema.resolveInst(extra.rhs);
-    const d = try sema.memOperand(block, src, dest);
-    const s = try sema.memOperand(block, src, source);
-    if (Type.ptrInfo(ip, sema.typeOf(dest)).flags.is_const) return sema.fail(block, src, "cannot copy to constant pointer", .{});
-    if (d.len == .none and s.len == .none) return sema.fail(block, src, "unknown copy length", .{});
+    const d = try sema.memOperand(block, sema.callArgSrc(src, false, 0), dest);
+    const s = try sema.memOperand(block, sema.callArgSrc(src, false, 1), source);
+    if (Type.ptrInfo(ip, sema.typeOf(dest)).flags.is_const) return sema.fail(block, sema.callArgSrc(src, false, 0), "cannot copy to constant pointer", .{});
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    const dest_src = sema.callArgSrc(src, false, 0);
+    const source_src = sema.callArgSrc(src, false, 1);
+    if (d.len == .none and s.len == .none) {
+        const err = sema.fail(block, src, "unknown copy length", .{});
+        try sema.zcu.addNote(sema.file, dest_src.span(tree), "destination type '{f}' provides no length", .{sema.fmtType(sema.typeOf(dest))});
+        try sema.zcu.addNote(sema.file, source_src.span(tree), "source type '{f}' provides no length", .{sema.fmtType(sema.typeOf(source))});
+        return err;
+    }
     if (d.elem != s.elem) return sema.fail(block, src, "pointer element type '{f}' cannot coerce into element type '{f}'", .{ sema.fmtType(s.elem), sema.fmtType(d.elem) });
     try sema.resolveLayout(block, src, d.elem);
 
     var len = if (d.len != .none) d.len else s.len;
     if (d.len != .none and s.len != .none) {
         if (sema.resolveValue(d.len)) |dl| if (sema.resolveValue(s.len)) |sl| {
-            if (dl != sl) return sema.fail(block, src, "non-matching copy lengths", .{});
+            if (dl != sl) {
+                const err = sema.fail(block, src, "non-matching copy lengths", .{});
+                try sema.zcu.addNote(sema.file, dest_src.span(tree), "length {f} here", .{sema.fmtValue(dl)});
+                try sema.zcu.addNote(sema.file, source_src.span(tree), "length {f} here", .{sema.fmtValue(sl)});
+                return err;
+            }
         };
         if (sema.resolveValue(d.len) == null) {
             if (sema.resolveValue(s.len) != null) len = s.len;
@@ -10734,8 +10796,8 @@ fn zirMemset(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     const extra = sema.code.extraData(Zir.Inst.Bin, data.payload_index).data;
     const src = block.nodeSrc(data.src_node);
     const dest = sema.resolveInst(extra.lhs);
-    const d = try sema.memOperand(block, src, dest);
-    if (Type.ptrInfo(ip, sema.typeOf(dest)).flags.is_const) return sema.fail(block, src, "cannot memset constant pointer", .{});
+    const d = try sema.memOperand(block, sema.callArgSrc(src, false, 0), dest);
+    if (Type.ptrInfo(ip, sema.typeOf(dest)).flags.is_const) return sema.fail(block, sema.callArgSrc(src, false, 0), "cannot memset constant pointer", .{});
     if (d.len == .none) return sema.fail(block, src, "unknown @memset length", .{});
     try sema.resolveLayout(block, src, d.elem);
     const elem = try sema.coerce(block, d.elem, sema.resolveInst(extra.rhs), src);
@@ -11847,11 +11909,13 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
                 if (std.mem.indexOfScalar(Index, c.items, tv) != null) break;
             } else return sema.fail(parent, src, "switch must handle all possibilities", .{});
         }
-    } else if (else_case == null and Type.class(ip, operand_ty) == .pointer) {
-        return sema.fail(parent, src, "else prong required when switching on type '{f}'", .{sema.fmtType(operand_ty)});
-    } else if (else_case == null and Type.class(ip, operand_ty) != .error_set) {
-        if (!try sema.switchCoversAllInts(cases.items, operand_ty)) return sema.fail(parent, src, "switch must handle all possibilities", .{});
-    }
+    } else if (else_case == null) switch (Type.class(ip, operand_ty)) {
+        .error_set => {},
+        .void => if (cases.items.len == 0) return sema.fail(parent, src, "switch must handle all possibilities", .{}),
+        .int, .@"struct", .@"union" => if (!try sema.switchCoversAllInts(parent, src, cases.items, operand_ty))
+            return sema.fail(parent, src, "switch must handle all possibilities", .{}),
+        else => return sema.fail(parent, src, "else prong required when switching on type '{f}'", .{sema.fmtType(operand_ty)}),
+    };
 
     // The else capture of an error set switch has the errors the other
     // prongs leave.
@@ -12042,12 +12106,15 @@ fn switchCaseMatches(sema: *Sema, c: SwitchCase, v: Index) !bool {
     return false;
 }
 
-/// Whether the items and ranges of `cases` cover every value of int type `ty`.
-fn switchCoversAllInts(sema: *Sema, cases: []const SwitchCase, ty: Index) !bool {
-    if (ty == .comptime_int_type) return false;
-    const info = Type.intInfo(sema.ip, ty);
-    if (info.bits > 64) return false;
+/// Whether the items and ranges of `cases` cover every value of int type
+/// `ty`, or of packed type `ty`'s backing integer.
+fn switchCoversAllInts(sema: *Sema, block: *Block, src: Src, cases: []const SwitchCase, operand_ty: Index) !bool {
+    if (operand_ty == .comptime_int_type) return false;
     const ip = sema.ip;
+    const is_packed = Type.isPacked(ip, operand_ty);
+    const ty = if (is_packed) ip.structInfo(operand_ty).tag_type else operand_ty;
+    const info = Type.intInfo(ip, ty);
+    if (info.bits > 64) return false;
     const Interval = struct {
         lo: i128,
         hi: i128,
@@ -12058,7 +12125,8 @@ fn switchCoversAllInts(sema: *Sema, cases: []const SwitchCase, ty: Index) !bool 
     var intervals: std.ArrayList(Interval) = .empty;
     for (cases) |c| {
         for (c.items) |item| {
-            const v = ip.intValue(i128, item) orelse return false;
+            const int = if (is_packed) (try sema.reinterpretBits(block, src, ty, .fromInterned(item))).toInterned() orelse return false else item;
+            const v = ip.intValue(i128, int) orelse return false;
             try intervals.append(sema.arena, .{ .lo = v, .hi = v });
         }
         for (c.ranges) |r| try intervals.append(sema.arena, .{ .lo = ip.intValue(i128, r[0]).?, .hi = ip.intValue(i128, r[1]).? });
@@ -13541,10 +13609,12 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         if (is_type) {
             if (result_ty != .void_type) return sema.failUnsupported(block, src, "inline assembly with more than one result output");
             result_ty = try sema.resolveType(block, src, o.data.operand);
+            try sema.validateAsmOutputType(block, sema.asmOperandSrc(src, true, k), result_ty);
         } else {
             operand = sema.resolveInst(o.data.operand);
             if (sema.resolveValue(operand)) |v| if (sema.refersToComptimeAlloc(v))
                 return sema.fail(block, sema.asmOperandSrc(src, true, k), "assembly output contains reference to comptime var", .{});
+            try sema.validateAsmOutputType(block, sema.asmOperandSrc(src, true, k), Type.childType(sema.ip, sema.typeOf(operand)));
         }
         try operands.append(gpa, .{
             .name = try sema.getString(sema.zirString(o.data.name)),
@@ -13580,6 +13650,27 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     });
     for (operands.items) |op| _ = try sema.addExtra(op);
     return sema.addInst(block, .{ .tag = .assembly, .data = .{ .ty_pl = .{ .ty = result_ty, .payload = payload } } });
+}
+
+/// Fails unless an `asm` output of type `ty` has a register-sized
+/// representation, as upstream checks.
+fn validateAsmOutputType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
+    const ip = sema.ip;
+    const note: ?[]const u8 = switch (Type.class(ip, ty)) {
+        .int, .float, .bool, .vector, .@"enum" => return,
+        .pointer => if (Type.isSlice(ip, ty)) "consider separate outputs for 'ptr' and 'len'" else return,
+        .optional => if (Type.optionalReprIsPtr(ip, Type.childType(ip, ty))) return else null,
+        .@"struct" => if (Type.isPacked(ip, ty)) return else "struct types cannot be passed to inline assembly",
+        .@"union" => if (Type.isPacked(ip, ty)) return else "union types cannot be passed to inline assembly",
+        .array => "array types cannot be passed to inline assembly",
+        else => null,
+    };
+    const err = sema.fail(block, src, "invalid inline assembly output type '{f}'", .{sema.fmtType(ty)});
+    if (note) |n| {
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        try sema.zcu.addNote(sema.file, src.span(tree), "{s}", .{n});
+    }
+    return err;
 }
 
 // ---------------------------------------------------------------------------
