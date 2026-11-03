@@ -18,6 +18,13 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   `@cImport`/translate-c, the C backend, compiling C sources.
 - CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`. Integration with
   `zig build` comes later.
+- zap's main users are coding agents. Shape compile errors for them, not for
+  humans: exact locations, the facts an agent needs to fix the error, and
+  fixes where zap knows them, in a form a program can parse.
+- zap may reject more than upstream: extra compile errors that catch real
+  mistakes are allowed. Everything else upstream accepts must still mean the
+  same, and upstream's std and `test/behavior` must still compile, since
+  they are the conformance measure.
 
 ## Architecture decisions
 
