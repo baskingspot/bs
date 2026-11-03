@@ -43,10 +43,10 @@ pub fn main() void {}
 //   ref: comptime uninstantiable.zig:18:9
 // uninstantiable.zig:22:18: error[type-mismatch]: expected type 'uninstantiable.S', found '@TypeOf(undefined)'
 //   | const s: S = undefined;
-//   note uninstantiable.zig:1:11: struct declared here: const S = struct { x: u64, n: noreturn };
 //   note uninstantiable.zig:22:18: cannot coerce to uninstantiable type 'uninstantiable.S'
+//   note uninstantiable.zig:1:11: struct declared here: const S = struct { x: u64, n: noreturn };
 // uninstantiable.zig:27:28: error[type-mismatch]: expected type 'uninstantiable.S', found '@TypeOf(undefined)'
 //   | _ = @unionInit(U, "a", undefined);
-//   note uninstantiable.zig:1:11: struct declared here: const S = struct { x: u64, n: noreturn };
 //   note uninstantiable.zig:27:28: cannot coerce to uninstantiable type 'uninstantiable.S'
+//   note uninstantiable.zig:1:11: struct declared here: const S = struct { x: u64, n: noreturn };
 // 6 errors

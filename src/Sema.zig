@@ -1257,7 +1257,7 @@ fn failCode(sema: *Sema, block: *const Block, src: Src, code: @import("diag.zig"
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     try sema.zcu.addErrorCode(sema.file, src.span(tree), code, fmt, args);
     sema.zcu.errors.items[sema.zcu.errors.items.len - 1].unit = sema.owner;
-    inline for (args) |arg| if (@TypeOf(arg) == FmtType) try sema.addDeclaredHereNote(arg.ty);
+    inline for (args) |arg| if (@TypeOf(arg) == FmtType) if (arg.decl_note) try sema.addDeclaredHereNote(arg.ty);
     return error.AnalysisFail;
 }
 
@@ -1338,6 +1338,8 @@ fn addDeclaredHereNote(sema: *Sema, ty: Index) CompileError!void {
 const FmtType = struct {
     ip: *const InternPool,
     ty: Index,
+    /// Whether `fail` notes where the type is declared.
+    decl_note: bool = true,
     pub fn format(f: FmtType, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try print.printType(f.ip, f.ty, w);
     }
@@ -5918,7 +5920,12 @@ fn coerceCtx(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src, ct
 noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index, actual: Index, ctx: CoerceCtx) CompileError {
     const ip = sema.ip;
     const npv = sema.layoutResolved(wanted) and Type.hasNoPossibleValue(ip, wanted);
-    const err = sema.fail(block, src, "expected type '{f}', found '{f}'", .{ sema.fmtType(wanted), sema.fmtType(actual) });
+    // Where the types are declared is noted after why they differ, by
+    // `noteTypeDifference`, as upstream's `InMemoryCoercionResult.report`.
+    const err = sema.fail(block, src, "expected type '{f}', found '{f}'", .{
+        FmtType{ .ip = ip, .ty = wanted, .decl_note = false },
+        FmtType{ .ip = ip, .ty = actual, .decl_note = false },
+    });
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     const span = src.span(tree);
     if (npv) try sema.zcu.addNote(sema.file, span, "cannot coerce to uninstantiable type '{f}'", .{sema.fmtType(wanted)});
@@ -5948,8 +5955,9 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
 
 /// Notes the first difference that keeps `actual` from coercing to
 /// `wanted`, descending into child types, as upstream's
-/// `InMemoryCoercionResult.report`. Types of different kinds get no note
-/// here (`fail` notes where declared types are declared).
+/// `InMemoryCoercionResult.report`. Where the types are unrelated (of
+/// different kinds, or different containers), notes where each is
+/// declared, as upstream's `no_match`.
 fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: Index) CompileError!void {
     const ip = sema.ip;
     const zcu = sema.zcu;
@@ -5958,7 +5966,7 @@ fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: 
     var actual = actual_ty;
     while (wanted != actual) {
         const class = Type.class(ip, wanted);
-        if (class != Type.class(ip, actual)) return;
+        if (class != Type.class(ip, actual)) return sema.noteDeclaredPair(wanted, actual);
         switch (class) {
             .int => {
                 const w = Type.intInfo(ip, wanted);
@@ -6035,9 +6043,16 @@ fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: 
                 }
                 return sema.notePtrDifference(span, wanted, actual, w, a, false);
             },
-            else => return,
+            else => return sema.noteDeclaredPair(wanted, actual),
         }
     }
+}
+
+/// The value's type first: upstream's `no_match` pair holds the source
+/// type in its `wanted` field, which `report` notes first.
+fn noteDeclaredPair(sema: *Sema, wanted: Index, actual: Index) CompileError!void {
+    try sema.addDeclaredHereNote(actual);
+    try sema.addDeclaredHereNote(wanted);
 }
 
 /// The pointer part of `noteTypeDifference`, in the order of upstream's
