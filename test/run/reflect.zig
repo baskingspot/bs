@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "reflect.S\n*const reflect.S\n[]const u8\n?*anyopaque\nreflect.G.Box(u8)\nreflect.E\nIo.Writer\nstruct { u8, bool }\nerror{A,B}!u32\nfn (u8) callconv(.c) void\n[3:0]u16\n@Vector(4, f32)\nfn () callconv(.c) noreturn\nanyerror\n9084\n16\nFoo\n"
+//! stdout: "reflect.S\n*const reflect.S\n[]const u8\n?*anyopaque\nreflect.G.Box(u8)\nreflect.E\nIo.Writer\nstruct { u8, bool }\nerror{A,B}!u32\nfn (u8) callconv(.c) void\n[3:0]u16\n@Vector(4, f32)\nfn () callconv(.c) noreturn\nanyerror\n9084\n16\nFoo\n4\n"
 //! @typeName, @offsetOf, @bitOffsetOf, @FieldType, @intFromError, and @errorFromInt.
 const std = @import("std");
 const rt = @import("rt.zig");
@@ -38,5 +38,8 @@ fn main() callconv(.c) noreturn {
     const back = @errorFromInt(i);
     rt.print(@errorName(back));
     rt.print("\n");
+    // Elements of a comptime slice of types, which have no size.
+    const field_types = @typeInfo(struct { a: u8, b: u32 }).@"struct".field_types;
+    rt.printInt(@sizeOf(field_types[1]));
     rt.exit(0);
 }

@@ -6440,10 +6440,20 @@ fn ptrElemPtrVal(sema: *Sema, ptr: Index, i: u64) !Index {
     if (p.flags.size == .one) {
         return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = ptr, .index = i } } } });
     }
-    return switch (key.base) {
-        .elem => |e| sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = e.base, .index = e.index + i } } } }),
-        else => sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = key.base, .byte_offset = key.byte_offset + i * Type.abiSize(ip, elem_ty) } }),
-    };
+    if (key.base == .elem) {
+        const e = key.base.elem;
+        return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = e.base, .index = e.index + i } } } });
+    }
+    // Byte offsets cannot tell zero-size elements (such as types) apart:
+    // index the array the pointer starts.
+    if (Type.abiSize(ip, elem_ty) == 0 and key.byte_offset == 0 and key.base == .uav) {
+        const arr_ty = ip.typeOf(key.base.uav.val);
+        if (ip.indexToKey(arr_ty) == .array_type and Type.childType(ip, arr_ty) == elem_ty) {
+            const arr_ptr = try sema.intern(.{ .ptr = .{ .ty = try sema.ptrType(.{ .child = arr_ty, .flags = .{ .is_const = p.flags.is_const } }), .base = key.base } });
+            return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = .{ .elem = .{ .base = arr_ptr, .index = i } } } });
+        }
+    }
+    return sema.intern(.{ .ptr = .{ .ty = elem_ptr_ty, .base = key.base, .byte_offset = key.byte_offset + i * Type.abiSize(ip, elem_ty) } });
 }
 
 // ---------------------------------------------------------------------------
@@ -7148,6 +7158,7 @@ fn elemPtrOfSlice(sema: *Sema, block: *Block, src: Src, slice: Ref, uncasted_ind
         return .fromInterned(try sema.ptrElemPtrVal(sema.ip.indexToKey(sv).slice.ptr, sema.ip.intValue(u64, iv).?));
     };
     try sema.requireRuntime(block, src);
+    try sema.resolveLayout(block, src, cp.child);
     const elem_ptr_ty = try sema.ptrType(.{ .child = cp.child, .flags = .{ .is_const = cp.flags.is_const, .is_volatile = cp.flags.is_volatile } });
     return sema.addTyPlBin(block, .slice_elem_ptr, elem_ptr_ty, slice, index);
 }
@@ -7320,6 +7331,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         },
         else => return sema.fail(block, src, "slice of non-array type '{f}'", .{sema.fmtType(child)}),
     }
+    try sema.resolveLayout(block, src, elem_ty);
     const start = try sema.coerce(block, .usize_type, sema.resolveInst(start_ref), src);
     var end: Ref = undefined;
     var slice_len: Ref = .none;
