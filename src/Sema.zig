@@ -2430,7 +2430,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .shuffle => sema.zirShuffle(block, inst),
         .splat_op_result_ty => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
-            const ty = try sema.resolveType(block, src, data.un_node.operand);
+            const ty = try sema.castDestType(block, src, data.un_node.operand, true);
             if (ty == .generic_poison_type) break :blk .fromInterned(.generic_poison_type);
             if (Type.class(sema.ip, ty) != .array and Type.class(sema.ip, ty) != .vector) return sema.fail(block, src, "expected array or vector result type for @splat, found '{f}'", .{sema.fmtType(ty)});
             break :blk .fromInterned(Type.childType(sema.ip, ty));
