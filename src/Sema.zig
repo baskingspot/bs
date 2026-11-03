@@ -1884,10 +1884,28 @@ fn bigToValue(sema: *Sema, ty: Index, big: BigIntConst) !Index {
 /// Whether a comptime-known integer fits in integer type `ty`.
 fn intFits(sema: *Sema, val: Index, ty: Index) bool {
     if (ty == .comptime_int_type) return true;
-    var space: [2]std.math.big.Limb = undefined;
-    const big = sema.ip.intToBig(val, &space);
     const info = Type.intInfo(sema.ip, ty);
-    return big.fitsInTwosComp(info.signedness, info.bits);
+    // Integers are stored as `u64` if non-negative, else `i64`, when they
+    // fit (`InternPool.getInt`).
+    switch (sema.ip.keyPayload(.int, val).storage) {
+        .u64 => |x| return switch (info.signedness) {
+            .unsigned => info.bits >= 64 or x >> @intCast(info.bits) == 0,
+            .signed => info.bits > 64 or (if (info.bits == 0) x == 0 else x >> @intCast(info.bits - 1) == 0),
+        },
+        .i64 => |x| return info.signedness == .signed and info.bits != 0 and
+            (info.bits >= 64 or x >= -(@as(i64, 1) << @intCast(info.bits - 1))),
+        .big => |big| return big.fitsInTwosComp(info.signedness, info.bits),
+    }
+}
+
+/// Integer value `val` as a value of integer type `ty`, which it fits.
+fn retypeInt(sema: *Sema, val: Index, ty: Index) !Index {
+    if (sema.ip.typeOf(val) == ty) return val;
+    return switch (sema.ip.keyPayload(.int, val).storage) {
+        .u64 => |x| sema.intern(.{ .int = .{ .ty = ty, .storage = .{ .u64 = x } } }),
+        .i64 => |x| sema.intern(.{ .int = .{ .ty = ty, .storage = .{ .i64 = x } } }),
+        .big => |big| sema.bigToValue(ty, big),
+    };
 }
 
 fn minIntValue(sema: *Sema, ty: Index) !Index {
@@ -5585,8 +5603,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             if (val) |v| {
                 if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
                 if (!sema.intFits(v, dest_ty)) return sema.fail(block, src, "type '{f}' cannot represent integer value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(v) });
-                var space: [2]std.math.big.Limb = undefined;
-                return .fromInterned(try sema.bigToValue(dest_ty, ip.intToBig(v, &space)));
+                return .fromInterned(try sema.retypeInt(v, dest_ty));
             }
             if (dc == .comptime_int or sc == .comptime_int) return sema.fail(block, src, "unable to resolve comptime value", .{});
             const s = Type.intInfo(ip, src_ty);
@@ -8354,12 +8371,25 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         if (!sema.isUndef(known) and Type.class(ip, other_ty) == .int) {
             // Ordered as `known op other`.
             const kop = if (side == 0) op else op.reverse();
-            var sk: [2]std.math.big.Limb = undefined;
-            var smin: [2]std.math.big.Limb = undefined;
-            var smax: [2]std.math.big.Limb = undefined;
-            const k = ip.intToBig(known, &sk);
-            const vs_min = k.order(ip.intToBig(try sema.minIntValue(other_ty), &smin));
-            const vs_max = k.order(ip.intToBig(try sema.maxIntValue(other_ty), &smax));
+            var vs_min: std.math.Order = undefined;
+            var vs_max: std.math.Order = undefined;
+            const info = Type.intInfo(ip, other_ty);
+            if (info.bits <= 64 and ip.keyPayload(.int, known).storage != .big) {
+                // Without interning the bounds (a comparison in a loop).
+                const k = ip.intValue(i128, known).?;
+                const value_bits: u7 = @intCast(info.bits - @intFromBool(info.signedness == .signed and info.bits != 0));
+                const max: i128 = (@as(i128, 1) << value_bits) - 1;
+                const min: i128 = if (info.signedness == .signed and info.bits != 0) -max - 1 else 0;
+                vs_min = std.math.order(k, min);
+                vs_max = std.math.order(k, max);
+            } else {
+                var sk: [2]std.math.big.Limb = undefined;
+                var smin: [2]std.math.big.Limb = undefined;
+                var smax: [2]std.math.big.Limb = undefined;
+                const k = ip.intToBig(known, &sk);
+                vs_min = k.order(ip.intToBig(try sema.minIntValue(other_ty), &smin));
+                vs_max = k.order(ip.intToBig(try sema.maxIntValue(other_ty), &smax));
+            }
             const res: ?bool = if (vs_min == .eq and vs_max == .eq) (std.math.Order.eq).compare(kop) else switch (kop) {
                 .eq => if (vs_min == .lt or vs_max == .gt) false else null,
                 .neq => if (vs_min == .lt or vs_max == .gt) true else null,
@@ -13030,8 +13060,7 @@ fn analyzeIntCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand:
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
         if (!sema.intFits(v, dest_ty)) return sema.fail(block, src, "type '{f}' cannot represent integer value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(v) });
-        var space: [2]std.math.big.Limb = undefined;
-        return .fromInterned(try sema.bigToValue(dest_ty, ip.intToBig(v, &space)));
+        return .fromInterned(try sema.retypeInt(v, dest_ty));
     }
     try sema.requireRuntime(block, src);
     if (dest_ty == .comptime_int_type) return sema.fail(block, src, "unable to cast runtime value to 'comptime_int'", .{});
