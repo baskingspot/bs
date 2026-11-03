@@ -76,7 +76,7 @@ pub const Options = struct {
 };
 
 pub const FileWrites = enum {
-    /// Whichever is faster in the case at hand.
+    /// pwrite (see `ReusedOutput.target`).
     auto,
     /// Through a shared mapping of the file.
     map,
@@ -275,7 +275,7 @@ const ReusedOutput = struct {
     file: ?std.Io.File = null,
     map: []align(std.heap.page_size_min) u8 = &.{},
 
-    fn target(o: *ReusedOutput, io: std.Io, len: usize, threads: usize) !Target {
+    fn target(o: *ReusedOutput, io: std.Io, len: usize) !Target {
         const in_place = builtin.os.tag == .linux and o.reuse(io, len);
         if (!in_place) {
             o.dir.deleteFile(io, o.sub_path) catch |err| switch (err) {
@@ -289,11 +289,12 @@ const ReusedOutput = struct {
         // page, and zeroing each new page of a new file first. pwrite pays
         // one more copy, from the thread's buffer, and ext4 takes the inode
         // lock for each write, so threads' writes do not overlap. Both mark
-        // every page dirty. Measured (docs/architecture.md): in place they
-        // tie on 1 thread and the mapping wins on 4; into a new file pwrite
-        // wins on 1 and 2 threads and they tie on 4.
+        // every page dirty. Measured (docs/architecture.md), pwrite wins or
+        // ties everywhere but in place on 4 threads, where the two machines
+        // measured disagree, and the mapping has been 1.5-4x slower in some
+        // sessions on both.
         const writes: FileWrites = switch (o.writes) {
-            .auto => if (!in_place and threads < 4) .pwrite else .map,
+            .auto => .pwrite,
             else => |w| w,
         };
         if (writes == .pwrite) return .{ .file = o.file.?.handle };
@@ -364,7 +365,7 @@ pub const MemoryOutput = struct {
         return o.buf;
     }
 
-    fn target(o: *MemoryOutput, io: std.Io, len: usize, _: usize) Error!Target {
+    fn target(o: *MemoryOutput, io: std.Io, len: usize) Error!Target {
         return .{ .memory = try o.buffer(io, len) };
     }
 };
@@ -435,7 +436,7 @@ fn shName(comptime name: []const u8) u32 {
     return comptime @intCast(std.mem.indexOf(u8, shstrtab, "\x00" ++ name ++ "\x00").? + 1);
 }
 
-/// Links the atoms of `input` into `out.target(io, len, threads)`.
+/// Links the atoms of `input` into `out.target(io, len)`.
 ///
 /// Work is split three ways, each spread over threads; the output does not
 /// depend on the thread count:
@@ -662,7 +663,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const shstr = if (has_tls) shstrtab else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
     const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + 2 * @as(u16, @intFromBool(has_cfi)) + 4 * @as(u16, @intFromBool(has_debug));
-    l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr), n_threads);
+    l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     switch (l.target) {
         .memory => |buf| {
             adviseHugePages(buf);

@@ -269,9 +269,9 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   inode. Reuse skips allocating and zeroing every page cache page again:
   on the orb, writing 38 MiB into a new file takes 31 ms, in place 11–15
   ms, into fresh anonymous memory 10 ms. Mach-O keeps replacing, since
-  macOS kills signed binaries modified in place. `link` writes through
-  the mapping when overwriting in place, and with pwrite into a new file on
-  fewer than 4 threads (see the numbers below). Segments: R (headers,
+  macOS kills signed binaries modified in place. `link` writes with
+  pwrite (see the numbers below); the mapping stays as an option, and
+  Mach-O writes through one. Segments: R (headers,
   .rodata, and with debug info .eh_frame and .eh_frame_hdr), RX (.text),
   RW (.tdata, .tbss, .data, .bss). Thread-locals start RW, covered by
   PT_TLS (filesz the .tdata bytes, memsz through .tbss, align the larger
@@ -400,7 +400,16 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   case of an edit-rebuild, the two tie on 1 thread and the mapping wins
   on 4; into a new file (first build, a running or uncached old output),
   pwrite wins by 15–20% on 1 and 2 threads and they tie on 4, where the
-  inode lock caps pwrite as threads grow. `auto` picks accordingly. A
+  inode lock caps pwrite as threads grow. Later sessions (2026-11-03)
+  disagree on 4 threads. On one orb, three runs of bench-link: in place,
+  numbered packed, the mapping wins by 0.7–2.6 ms (14.3–17.1 against
+  16.1–18.0 ms) and the key and scattered paths tie; into a new file the
+  two are within 1 ms. On another, right after a full test run: into a
+  new file, map 31.0 against pwrite 20.1 ms; in place, map 14.9 against
+  pwrite 12.3.
+  With the writeback slowdown of the mapping seen earlier (3–4x, not
+  reproduced on demand), the mapping's worst case outweighs its best, so
+  `auto` is pwrite everywhere. A
   small program links on 1 thread (fewer than 2048 atoms is one chunk).
 - Debug info (`src/link/Dwarf.zig`, shared with the Mach-O linker later) is
   DWARF 5 with one compile unit for the whole output: .debug_abbrev, a
