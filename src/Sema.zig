@@ -437,24 +437,58 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
         break;
     };
 
-    // Defaults may refer to the struct itself (for example its size), so
-    // they are evaluated after the layout. Until then every field reads as
-    // having no default.
+    // A `comptime` field's value is part of the layout, as upstream. It
+    // may refer to the struct itself (for example its size), so it is
+    // evaluated after the layout. The other fields' defaults are the
+    // `struct_defaults` unit's (`analyzeStructDefaults`); until then they
+    // read as `.none`.
     info.field_defaults = defaults;
-    it = decl.iterateFields();
-    while (it.next()) |field| {
-        const body = field.default_body orelse continue;
-        // Within the default body, the struct instruction stands for the
-        // field type (the result type of the default value).
-        try sema.inst_map.put(sema.gpa, key.zir_inst, .fromInterned(types[field.idx]));
-        const ref = try sema.resolveInlineBody(&block, body, key.zir_inst);
-        const coerced = try sema.coerce(&block, types[field.idx], ref, block.nodeSrc(.zero));
-        defaults[field.idx] = try sema.resolveConstValue(&block, block.nodeSrc(.zero), coerced, "struct field default value must be comptime-known");
+    if (is_comptime.len != 0) {
+        it = decl.iterateFields();
+        while (it.next()) |field| {
+            if (!field.is_comptime) continue;
+            const body = field.default_body orelse
+                return sema.fail(&block, block.nodeSrc(.zero), "comptime field without default initialization value", .{});
+            defaults[field.idx] = try sema.fieldDefault(&block, key.zir_inst, types[field.idx], body);
+        }
     }
-    if (is_comptime.len != 0) for (is_comptime, defaults) |c, d| if (c and d == .none)
-        return sema.fail(&block, block.nodeSrc(.zero), "comptime field without default initialization value", .{});
-    info.field_defaults = defaults;
     try sema.finish();
+}
+
+/// Evaluates the default values of a declared struct's non-`comptime`
+/// fields: its `struct_defaults` unit. They may read the struct's layout,
+/// or a containing type's (an inner struct's default `@sizeOf(Outer)`),
+/// which is why they are not part of the layout.
+pub fn analyzeStructDefaults(zcu: *Zcu, ty: Index) CompileError!void {
+    const ip = &zcu.ip;
+    const key = ip.containerType(ty).?;
+    const info = ip.structInfo(ty);
+    var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
+    defer arena_state.deinit();
+    var sema = create(zcu, arena_state.allocator(), key.file, .{ .struct_defaults = ty });
+    defer sema.destroy();
+    try sema.declareDependency(.{ .type_layout = ty });
+    const decl = sema.code.getStructDecl(key.zir_inst);
+    var block = sema.rootBlock(info.namespace, decl.fields_baseline_src_node, true);
+    defer block.instructions.deinit(zcu.gpa);
+    const defaults: []Index = @constCast(info.field_defaults);
+    var it = decl.iterateFields();
+    while (it.next()) |field| {
+        if (field.is_comptime) continue;
+        const body = field.default_body orelse continue;
+        defaults[field.idx] = try sema.fieldDefault(&block, key.zir_inst, info.field_types[field.idx], body);
+    }
+    try sema.finish();
+}
+
+/// A field's default value, from its ZIR body.
+fn fieldDefault(sema: *Sema, block: *Block, struct_inst: Zir.Inst.Index, field_ty: Index, body: []const Zir.Inst.Index) CompileError!Index {
+    // Within the default body, the struct instruction stands for the
+    // field type (the result type of the default value).
+    try sema.inst_map.put(sema.gpa, struct_inst, .fromInterned(field_ty));
+    const ref = try sema.resolveInlineBody(block, body, struct_inst);
+    const coerced = try sema.coerce(block, field_ty, ref, block.nodeSrc(.zero));
+    return sema.resolveConstValue(block, block.nodeSrc(.zero), coerced, "struct field default value must be comptime-known");
 }
 
 /// A field's `align(n)`: a comptime-known power of two.
@@ -1008,6 +1042,16 @@ fn resolveLayoutIfIdle(sema: *Sema, block: *Block, src: Src, ty: Index) CompileE
 fn isComptimeOnlyResolved(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!bool {
     try sema.resolveLayoutIfIdle(block, src, ty);
     return Type.isComptimeOnly(sema.ip, ty);
+}
+
+/// Resolves the layout and field defaults of a struct type, recording
+/// both, before its defaults are read (a struct init that omits fields,
+/// `@typeInfo`). Other container types have none.
+fn resolveStructDefaults(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
+    if (sema.ip.indexToKey(ty) != .struct_type) return;
+    try sema.resolveLayout(block, src, ty);
+    try sema.declareDependency(.{ .struct_defaults = ty });
+    sema.zcu.ensureStructDefaults(ty) catch |err| return sema.depLoop(block, src, err);
 }
 
 fn resolveStructFields(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
@@ -3071,7 +3115,7 @@ fn stdLangType(sema: *Sema, block: *Block, src: Src, path: []const u8) CompileEr
 /// their defaults.
 fn structValue(sema: *Sema, block: *Block, src: Src, ty: Index, fields: []const struct { []const u8, Index }) CompileError!Index {
     const ip = sema.ip;
-    try sema.resolveLayout(block, src, ty);
+    try sema.resolveStructDefaults(block, src, ty);
     const info = ip.structInfo(ty);
     const elems = try sema.arena.alloc(Index, info.field_types.len);
     @memcpy(elems, info.field_defaults);
@@ -3216,6 +3260,7 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             });
         },
         .@"struct", .tuple => blk: {
+            try sema.resolveStructDefaults(block, src, ty);
             const is_tuple = class == .tuple and ip.indexToKey(ty).tuple_type.names.len == 0;
             const n = Type.fieldCount(ip, ty);
             const attrs_ty = try sema.stdLangType(block, src, "Type.Struct.FieldAttributes");
@@ -4094,7 +4139,7 @@ fn anonTypeKey(sema: *Sema, block: *Block, inst: Zir.Inst.Index, captures: []con
         sema.zcu.unitKey(sema.owner, w) catch return error.OutOfMemory;
         break :blk switch (sema.owner) {
             .comptime_decl => |c| c.inst,
-            .type_layout => |ty| ip.containerType(ty).?.zir_inst,
+            .type_layout, .struct_defaults => |ty| ip.containerType(ty).?.zir_inst,
             else => unreachable,
         };
     };
@@ -7279,9 +7324,10 @@ fn onePossibleValue(sema: *Sema, ty: Index) CompileError!?Index {
             return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
         },
         .struct_type => {
-            const field_types = ip.structInfo(ty).field_types;
-            const elems = try sema.arena.alloc(Index, field_types.len);
-            for (elems, field_types) |*e, ft| e.* = (try sema.onePossibleValue(ft)) orelse return null;
+            // A `comptime` field has its value, part of the layout.
+            const info = ip.structInfo(ty);
+            const elems = try sema.arena.alloc(Index, info.field_types.len);
+            for (elems, info.field_types, 0..) |*e, ft, i| e.* = if (info.fieldIsComptime(i)) info.field_defaults[i] else (try sema.onePossibleValue(ft)) orelse return null;
             return try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = elems } } });
         },
         else => return null,
@@ -8781,6 +8827,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         info.field_names = names;
         info.field_types = try ip.arena(Zcu.tid).dupe(Index, types);
         info.field_defaults = defaults;
+        info.defaults_status = .resolved;
         if (any_align) {
             const aligns = try ip.arena(Zcu.tid).alloc(u64, n);
             for (aligns, align_vals) |*al, av| al.* = if (ip.indexToKey(av).opt.val == .none) 0 else ip.intValue(u64, ip.indexToKey(av).opt.val).?;
@@ -10666,6 +10713,7 @@ fn structInitEmpty(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError
     switch (ip.indexToKey(ty)) {
         .struct_type => {
             try sema.resolveStructFields(block, src, ty);
+            if (ip.structInfo(ty).field_types.len != 0) try sema.resolveStructDefaults(block, src, ty);
             const info = ip.structInfo(ty);
             const elems = try sema.arena.alloc(Ref, info.field_types.len);
             for (elems, 0..) |*e, i| {
@@ -10765,6 +10813,11 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
                 return sema.fail(block, src, "value stored in comptime field does not match the default value of the field", .{});
         }
     }
+    // Omitted fields take their defaults: a `comptime` field's from the
+    // layout, the others' from `struct_defaults`.
+    for (elems, 0..) |e, k| if (e == .none) {
+        if (info.fieldIsComptime(k)) try sema.resolveLayout(block, src, ty) else try sema.resolveStructDefaults(block, src, ty);
+    };
     for (elems, 0..) |*e, k| {
         if (e.* != .none) continue;
         const d = info.field_defaults[k];
@@ -10837,6 +10890,9 @@ fn zirValidatePtrStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Co
         const name = sema.zirString(sema.code.extraData(Zir.Inst.Field, d.payload_index).data.field_name_start);
         seen[try sema.structFieldIndex(block, src, ty, name)] = true;
     }
+    for (seen, 0..) |s, k| if (!s) {
+        if (info.fieldIsComptime(k)) try sema.resolveLayout(block, src, ty) else try sema.resolveStructDefaults(block, src, ty);
+    };
     for (seen, 0..) |s, k| {
         if (s) continue;
         const d = info.field_defaults[k];

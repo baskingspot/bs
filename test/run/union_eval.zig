@@ -2,8 +2,9 @@
 //! A tagged union with one possible field stores no tag, a union field
 //! holding a function pointer is called, a tagged union and its tag type
 //! are peers, `x and false` is comptime-known, a generic instance runs with
-//! its caller's branch quota, and a comptime block may compute runtime
-//! values it drops.
+//! its caller's branch quota, a comptime block may compute runtime
+//! values it drops, and an inner struct's field defaults may read the
+//! enclosing union's layout.
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -71,5 +72,14 @@ fn main() callconv(.c) noreturn {
     comptime {
         _ = arr[idx];
     }
+
+    const inner_a: Outer = .{ .a = .{} };
+    const inner_b: Outer = .{ .b = .{} };
+    if (inner_a.a.x != 5 or inner_b.b.y != 10) rt.exit(7);
     rt.exit(0);
 }
+
+const Outer = union {
+    a: struct { x: u32 = @alignOf(Outer) + 1 },
+    b: struct { y: u16 = @sizeOf(Outer) + 2 },
+};

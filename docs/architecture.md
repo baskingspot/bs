@@ -74,6 +74,9 @@ Sema's unit of work, of caching, and of parallelism is the *analysis unit*:
 
 - the value (and type) of a container-level declaration;
 - the layout of a struct, union, enum, or opaque type;
+- the default values of a struct's non-`comptime` fields, evaluated after
+  its layout (they may read it, or a containing type's: an inner struct's
+  `x: u32 = @alignOf(Outer)`), as upstream's `struct_defaults` unit;
 - the body of a runtime function instance (a non-generic function, or one
   instantiation of a generic function with its comptime arguments);
 - a `comptime` block, a `test` declaration, an `export`.
@@ -1202,8 +1205,11 @@ the result's items:
 - Per unit kind: `nav_val` stores ty, val, `is_const`, `linkage`,
   `alignment` (the explicit `align(n)`, 0 if none);
   `type_layout` stores the `ContainerInfo` fields (names, field types and
-  defaults by reference, offsets, which fields are `comptime`, explicit
-  field alignments, tag type, flags, size, alignment);
+  `comptime` field values by reference, offsets, which fields are
+  `comptime`, explicit field alignments, tag type, flags, size,
+  alignment); `struct_defaults` stores the other fields' default values
+  by reference (reified structs get theirs with the type, so the unit has
+  nothing to do);
   `func` stores its references (its Atoms are in the pack, its IR is
   never stored); `func_ies` stores the error names; `comptime_decl` stores
   its exports.
@@ -1234,7 +1240,11 @@ cutoff: when a field's type grows,
 the field type's layout result changes, ours is re-analyzed, and its
 unchanged identity would stop the walk before the functions that use our
 offsets. The result hash becomes the hash of the canonical `ContainerInfo`
-encoding above (field names, field types' and defaults' stable hashes,
+encoding above (field names, field types' and `comptime` field values'
+stable hashes (an enum's tag values; other struct defaults are the
+`struct_defaults` node's result, so editing one re-analyzes only the
+struct inits that omit the field and `@typeInfo`, not code that reads
+offsets),
 offsets, tag type and its values, non-exhaustiveness, runtime tag, size,
 alignment, and `comptime_only`), computed once the status reaches
 `have_layout`. Types reached only through pointers keep their identity:
@@ -1264,6 +1274,20 @@ stable hash, since dependents read those too. `record` reads
 `comptime_only` from the types, on every core: Sema has set it for every
 struct and union at `have_layout` (debug-asserted), so reading it writes
 nothing.
+
+**`struct_defaults`** (built 2026-11-03). A struct's non-`comptime` field
+defaults are their own unit, as upstream's: a default may read the
+struct's layout or a containing type's, which, evaluated inside the
+layout unit, was a dependency loop (`union { a: struct { x: u32 =
+@alignOf(@This()) } }`, behavior/union.zig). The unit depends on
+`type_layout(S)`; Sema reads defaults only after
+`resolveStructDefaults`, which records `Dependee.struct_defaults`: struct
+inits that omit a field, `@typeInfo`, and std.lang values Sema builds.
+`comptime` field values stay in the layout (a struct's one possible value
+and field reads need them, never the other defaults). The node's source
+hash is the container's, and its result hash is the defaults' stable
+hashes, 0 for a field without one, or the type's identity before they are
+resolved.
 
 **Debug info of green functions.** `src_hash` ignores a declaration's
 line, so lines added above a green function move its `base_line`

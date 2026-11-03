@@ -261,6 +261,7 @@ pub const Tag = enum(u8) {
     content,
     link,
     embed_file,
+    struct_defaults,
 };
 
 /// Keys that are hashes already.
@@ -288,6 +289,7 @@ const UnitContext = struct {
             .type_layout => |t| mix(1, @backingInt(t)),
             .func => |f| mix(2, @backingInt(f)),
             .comptime_decl => |c| mix(3 | @as(u64, c.file) << 8 | @as(u64, c.namespace) << 32, @as(u64, @backingInt(c.inst)) << 32 | c.ordinal),
+            .struct_defaults => |t| mix(4, @backingInt(t)),
         };
     }
     pub fn eql(_: UnitContext, a: Zcu.AnalUnit, b: Zcu.AnalUnit) bool {
@@ -306,6 +308,7 @@ const DependeeContext = struct {
             .namespace_name => |nn| mix(5 | @as(u64, nn.namespace) << 8, @backingInt(nn.name)),
             .namespace => |ns| mix(6, ns),
             .embed_file => |i| mix(7, i),
+            .struct_defaults => |t| mix(8, @backingInt(t)),
         };
     }
     pub fn eql(_: DependeeContext, a: Zcu.Dependee, b: Zcu.Dependee) bool {
@@ -321,8 +324,8 @@ const Recorder = struct {
     /// Each distinct unit and dependee, by index into `unit_list` and
     /// `dependee_list`, whose `Info` (key and hashes) `prepare` computes
     /// on every core before `unitNode` and `dependeeNode` make nodes of
-    /// them. Dependees that are units (`nav_val`, `type_layout`) are only
-    /// in `units`.
+    /// them. Dependees that are units (`nav_val`, `type_layout`,
+    /// `struct_defaults`) are only in `units`.
     units: std.HashMapUnmanaged(Zcu.AnalUnit, u32, UnitContext, std.hash_map.default_max_load_percentage) = .empty,
     dependees: std.HashMapUnmanaged(Zcu.Dependee, u32, DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
     unit_list: std.ArrayList(Zcu.AnalUnit) = .empty,
@@ -389,6 +392,7 @@ const Recorder = struct {
         const producer: u32 = switch (d) {
             .nav_val => |nav| return .{ .unit = try r.addUnit(.{ .nav_val = nav }) },
             .type_layout => |ty| return .{ .unit = try r.addUnit(.{ .type_layout = ty }) },
+            .struct_defaults => |ty| return .{ .unit = try r.addUnit(.{ .struct_defaults = ty }) },
             // With an edge to the unit that produces them.
             .nav_ty => |nav| try r.addUnit(.{ .nav_val = nav }),
             .func_ies => |func| try r.addUnit(.{ .func = func }),
@@ -453,7 +457,7 @@ const Recorder = struct {
         const info = &r.dependee_info[i];
         if (info.node != no_node) return info.node;
         const tag: Tag = switch (r.dependee_list.items[i]) {
-            .nav_val, .type_layout => unreachable,
+            .nav_val, .type_layout, .struct_defaults => unreachable,
             .nav_ty => .nav_ty,
             .func_ies => .func_ies,
             .func_body => .func_body,
@@ -477,6 +481,7 @@ const Recorder = struct {
             .type_layout => .type_layout,
             .func => .func,
             .comptime_decl => .comptime_decl,
+            .struct_defaults => .struct_defaults,
         };
     }
 
@@ -582,6 +587,11 @@ const Keyer = struct {
                 // The result is the function's atom, hashed in `record`.
             },
             .comptime_decl => |c| info.src_hash = k.srcHash(c.file, c.inst),
+            .struct_defaults => |ty| {
+                const c = ip.containerType(ty).?;
+                info.src_hash = k.srcHash(c.file, c.zir_inst);
+                info.result_hash = defaultsResultHash(ip, ty);
+            },
         }
         return info;
     }
@@ -589,7 +599,7 @@ const Keyer = struct {
     fn dependeeInfo(k: *Keyer, d: Zcu.Dependee) !Recorder.Info {
         const ip = &k.zcu.ip;
         switch (d) {
-            .nav_val, .type_layout => unreachable, // Units.
+            .nav_val, .type_layout, .struct_defaults => unreachable, // Units.
             .nav_ty => |nav_index| {
                 const nav = ip.getNav(nav_index);
                 return .{
@@ -672,7 +682,10 @@ fn layoutResultHash(ip: *const InternPool, ty: InternPool.Index) Hash {
         h.update(&.{0});
     }
     for (info.field_types) |t| Helper.index(&h, ip, t);
-    for (info.field_defaults) |d| Helper.index(&h, ip, d);
+    // Only `comptime` fields' values; the other defaults are the
+    // `struct_defaults` unit's result. Enums' tag values are all here.
+    const is_struct = kind == .struct_type;
+    for (info.field_defaults, 0..) |d, i| Helper.index(&h, ip, if (!is_struct or info.fieldIsComptime(i)) d else .none);
     h.update(std.mem.sliceAsBytes(info.field_offsets));
     h.update(std.mem.sliceAsBytes(info.field_is_comptime));
     h.update(std.mem.sliceAsBytes(info.field_aligns));
@@ -683,6 +696,23 @@ fn layoutResultHash(ip: *const InternPool, ty: InternPool.Index) Hash {
     // the rest are never comptime-only.
     if (kind == .struct_type or kind == .union_type) std.debug.assert(info.comptime_only == .yes or info.comptime_only == .no);
     h.update(&.{@intFromBool(info.comptime_only == .yes)});
+    const lo = h.final();
+    return @as(Hash, id >> 64 ^ lo) << 64 | lo;
+}
+
+/// A struct's `struct_defaults` result: its non-`comptime` fields' default
+/// values, 0 for a field without one. Before they are resolved, the
+/// type's identity.
+fn defaultsResultHash(ip: *const InternPool, ty: InternPool.Index) Hash {
+    const id = ip.stableHash(ty);
+    const info = ip.structInfo(ty);
+    if (info.defaults_status != .resolved) return id;
+    var h = std.hash.Wyhash.init(10);
+    h.update(std.mem.asBytes(&id));
+    for (info.field_defaults, 0..) |d, i| {
+        const x: Hash = if (d == .none or info.fieldIsComptime(i)) 0 else ip.stableHash(d);
+        h.update(std.mem.asBytes(&x));
+    }
     const lo = h.final();
     return @as(Hash, id >> 64 ^ lo) << 64 | lo;
 }

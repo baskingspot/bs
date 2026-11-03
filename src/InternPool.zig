@@ -261,9 +261,15 @@ pub const ContainerInfo = struct {
     field_names: []const String = &.{},
     /// Struct and union fields. Empty for enums.
     field_types: []const Index = &.{},
-    /// Structs: the default value, `.none` for fields without one.
+    /// Structs: the default value, `.none` for fields without one. A
+    /// `comptime` field's value belongs to the `type_layout` unit; the
+    /// others to the `struct_defaults` unit (see `defaults_status`).
     /// Enums: the tag value of each field, of type `tag_type`.
     field_defaults: []const Index = &.{},
+    /// Structs only: the `struct_defaults` unit's progress, which fills in
+    /// the defaults of non-`comptime` fields after the layout. Reified
+    /// structs have theirs from the start.
+    defaults_status: enum { none, wip, resolved, failed } = .none,
     /// Structs only: byte offsets, or bit offsets in the backing integer
     /// for packed structs.
     field_offsets: []const u64 = &.{},

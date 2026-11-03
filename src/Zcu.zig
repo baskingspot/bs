@@ -99,6 +99,9 @@ pub const AnalUnit = union(enum) {
     type_layout: InternPool.Index,
     func: InternPool.Index,
     comptime_decl: ComptimeDecl,
+    /// The default values of a declared struct's non-`comptime` fields,
+    /// evaluated after its layout, which they may read.
+    struct_defaults: InternPool.Index,
 };
 
 /// What a unit read from another unit. Recorded only through
@@ -124,6 +127,8 @@ pub const Dependee = union(enum) {
     namespace: u32,
     /// The contents of `embed_files[index]` (`@embedFile`).
     embed_file: u32,
+    /// The default values of a struct's non-`comptime` fields.
+    struct_defaults: InternPool.Index,
 };
 
 /// A file read by `@embedFile`.
@@ -456,6 +461,7 @@ pub fn unitKey(zcu: *Zcu, unit: AnalUnit, w: *std.Io.Writer) !void {
     switch (unit) {
         .nav_val => |nav| try w.writeAll(ip.stringSlice(ip.getNav(nav).key)),
         .type_layout => |ty| try w.print("{s}@layout", .{ip.stringSlice(ip.containerType(ty).?.key)}),
+        .struct_defaults => |ty| try w.print("{s}@defaults", .{ip.stringSlice(ip.containerType(ty).?.key)}),
         .func => |func| {
             const f = ip.indexToKey(func).func;
             try w.writeAll(ip.stringSlice(ip.getNav(f.owner_nav).key));
@@ -499,6 +505,24 @@ pub fn ensureStructLayout(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!voi
         info.status = .failed;
         return err;
     };
+}
+
+/// Resolves the default values of a struct whose layout is resolved (its
+/// `struct_defaults` unit).
+pub fn ensureStructDefaults(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!void {
+    const info = zcu.ip.structInfo(ty);
+    switch (info.defaults_status) {
+        .resolved => return,
+        .failed => return error.AnalysisFail,
+        .wip => return error.DependencyLoop,
+        .none => {},
+    }
+    info.defaults_status = .wip;
+    Sema.analyzeStructDefaults(zcu, ty) catch |err| {
+        info.defaults_status = .failed;
+        return err;
+    };
+    info.defaults_status = .resolved;
 }
 
 /// Resolves the inferred error set of function instance `func`, analyzing
