@@ -355,6 +355,30 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   key-based path, the numbered code costs that path 0.5% more instructions
   under callgrind (312.1M → 313.7M for three stripped emits), from code
   layout; wall-clock time does not show it.
+- Input without `Atom` structs (`Elf.linkInput`/`emitInput`): the linker
+  reads atoms through a comptime-duck-typed input with `AtomSlice`'s
+  declarations (`len`, `check(i)`, `atom(i)`, `debugLen`, `debugAtom(j)`,
+  `debug(j)`, `prefetch`, `prefetchDebug`), so a cache can hand it its
+  mapped pack records without decoding them into Atoms. `atom` and `debug`
+  may return a value, built from a record header with arithmetic, or a
+  pointer; the linker takes the address either way, so the slice input
+  (what `link`/`emit` wrap) copies nothing. `check(i)` validates atom
+  `i`'s record, and its debug record, wholly (bounds, section, alignment,
+  frame kind, header lengths), in the first pass that reads it
+  (gatherKeys for keys, layout for numbers); a false result fails the link
+  with `error.InvalidInput`, reporting the lowest such atom in
+  `Diagnostic.index`. The linker itself checks that `debugAtom(j)`
+  ascends and is in range before calling `debug(j)`.
+  `Symbols.targets_tail` continues `targets` (index k ≥ targets.len reads
+  `targets_tail[k - targets.len]`; no run may straddle), so a manifest's
+  base runs and its log's runs are passed without joining them. Cost to
+  the slice path (2026-11-03, callgrind, three single-thread key-path
+  emits): stripped 319.3M → 320.8M instructions (+0.49%), debug 424.1M →
+  426.8M (+0.62%), from code layout in layout and the debug-copy loop;
+  wall clock is within noise (interleaved best of 40, 1 / 4 threads:
+  stripped 35.8 / 12.4 → 36.5 / 12.4 ms, debug 45.8 / 15.9 → 47.0 / 16.0
+  ms). The cache's prototype measured a numbered 100k-atom relink at 8.1
+  ms instead of 10.3 with decoding.
 - Writing the file through the mapping or with pwrite (2026-11-03, same
   session, best of 15, ms; `Options.file_writes` forces either). Through
   the mapping, each page costs a fault and page_mkwrite, a new file's
