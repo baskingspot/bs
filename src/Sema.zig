@@ -9869,8 +9869,23 @@ fn mutPathKey(sema: *Sema, key: InternPool.Ptr, buf: []MutStep) ?MutPath {
             },
             .elem => |e| {
                 if (n == buf.len) return null;
-                buf[n] = .{ .index = e.index, .base_ptr_ty = ip.typeOf(e.base), .is_elem = true };
-                p = e.base;
+                var index = e.index;
+                var base = e.base;
+                // Element `index` of a subarray view (`*[k]T` at element
+                // `j` of an array of `T`, as slicing makes) is element
+                // `j + index` of that array.
+                while (true) {
+                    const view = ip.keyPayload(.ptr, base);
+                    if (view.byte_offset != 0 or view.base != .elem) break;
+                    const sub = ip.indexToKey(Type.ptrInfo(ip, view.ty).child);
+                    if (sub != .array_type or index >= sub.array_type.len) break;
+                    const outer = ip.indexToKey(Type.ptrInfo(ip, ip.typeOf(view.base.elem.base)).child);
+                    if (outer != .array_type or outer.array_type.child != sub.array_type.child) break;
+                    index += view.base.elem.index;
+                    base = view.base.elem.base;
+                }
+                buf[n] = .{ .index = index, .base_ptr_ty = ip.typeOf(base), .is_elem = true };
+                p = base;
             },
             else => return null,
         }

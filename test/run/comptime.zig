@@ -1,5 +1,6 @@
 //! exit: 7
-//! stdout: "55\n144\n25\n42\n9\n1099511627776\n2\n700\n20\n6\n5\n4\npow2\n13\n99\n48\n3\n7\n31\n1234\n7\n500\n"
+//! stdout: "55\n144\n25\n42\n9\n1099511627776\n2\n700\n20\n6\n5\n4\npow2\n13\n99\n48\n3\n7\n31\n1234\n7\n500\n1891\n11\n66\n"
+const std = @import("std");
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -71,6 +72,30 @@ const cells = blk: {
     break :blk a;
 };
 
+// Stores through subarray views (`buf[i..][0..n]`, as std.Io.Writer's
+// @memcpy makes) land in the array they view, also through a view of a
+// view, and a value read out before them does not see them.
+const views = blk: {
+    var buf: [8]u8 = @splat(0);
+    const s: []u8 = &buf;
+    @memcpy(s[2..][0..3], "abc");
+    const before = buf;
+    const v = s[1..][0..6];
+    @memcpy(v[4..][0..2], "xy");
+    v[0] = v[2] - 'a' + 'A';
+    break :blk [2][8]u8{ buf, before };
+};
+const json_len = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var buf: [8 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    var jws: std.json.Stringify = .{ .writer = &writer };
+    jws.beginArray() catch unreachable;
+    for (0..500) |i| jws.write(i) catch unreachable;
+    jws.endArray() catch unreachable;
+    break :blk writer.end;
+};
+
 // A local type may name a runtime parameter's type (std.sort.upperBound).
 fn addVia(context: anytype, x: u32) u32 {
     const S = struct {
@@ -126,5 +151,8 @@ fn main() callconv(.c) noreturn {
     rt.printInt(cells[2].v[0]);
     rt.printInt(cells[2].o.?);
     rt.printInt(cells[3].v[2]);
+    rt.printInt(json_len);
+    rt.printInt(@intFromBool(std.mem.eql(u8, &views[0], "\x00Babcxy\x00")) + 2 * @as(u64, @intFromBool(std.mem.eql(u8, &views[1], "\x00\x00abc\x00\x00\x00"))) + 8);
+    rt.printInt(views[0][1]);
     rt.exit(@intCast(@bitSizeOf(u7)));
 }
