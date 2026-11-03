@@ -52,6 +52,7 @@ pub const Options = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    var stages: Stages = .{ .io = init.io, .last = .now(init.io, .awake) };
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     if (args.len < 2) fatalUsage();
@@ -106,6 +107,7 @@ pub fn main(init: std.process.Init) !void {
     var inc: ?Incremental = if (use_cache) try Incremental.open(init.gpa, init.io, cache_dirs, args[1..], zig_lib_dir, "x86_64-linux", init.environ_map.get("ZAP_CACHE_TIMING") != null) else null;
     defer if (inc) |*i| i.close();
     if (inc) |*i| i.check = init.environ_map.get("ZAP_CACHE_CHECK") != null;
+    stages.on = init.environ_map.get("ZAP_TIMING") != null;
     if (inc) |*i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
         if (run_test) try runTest(init, out_path.?);
         return;
@@ -121,7 +123,9 @@ pub fn main(init: std.process.Init) !void {
     try fe.enableCache(cache_dirs);
     var errors: std.zig.ErrorBundle.Wip = try .init(init.gpa);
     defer errors.deinit();
+    stages.mark("setup and cache check");
     const ok = try fe.loadAll(&errors);
+    stages.mark("frontend");
     if (init.environ_map.get("ZAP_FRONTEND_TIMING") != null) fe.printStats();
     var bundle = try errors.toOwnedBundle("");
     defer bundle.deinit(init.gpa);
@@ -150,6 +154,7 @@ pub fn main(init: std.process.Init) !void {
     var emit: Emit = .init(init.gpa, &zcu);
     defer emit.deinit();
     try zcu.analyzeAll(&emit);
+    stages.markSplit("sema", "codegen", emit.codegen_ns);
     if (is_test) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {},
@@ -157,13 +162,17 @@ pub fn main(init: std.process.Init) !void {
     exitOnErrors(init, &zcu);
     const bin_path = out_path orelse return;
     const ready = try emit.finish();
+    stages.mark("emit");
     exitOnErrors(init, &zcu);
     if (!ready) std.process.exit(1);
     // The cache records the build while it links, and keeps the record
     // only if the link succeeds.
     if (inc) |*i| i.startRecord(&fe, &zcu, &emit);
     const linked = try emit.link(init.io, Io.Dir.cwd(), bin_path);
+    stages.mark("link");
     if (inc) |*i| try i.finishRecord(linked);
+    stages.mark("cache record (after the link)");
+    stages.print();
     if (!linked) std.process.exit(1);
     if (run_test) try runTest(init, out_path.?);
 }
@@ -182,6 +191,43 @@ fn testBinPath(arena: std.mem.Allocator, io: Io, cache_dir: []const u8, stem: []
     io.random(&r);
     return std.fmt.allocPrint(arena, "{s}/tmp/{s}-{x}", .{ cache_dir, stem, &r });
 }
+
+/// `ZAP_TIMING`: wall time per stage of a build.
+const Stages = struct {
+    io: Io,
+    on: bool = false,
+    last: Io.Timestamp,
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+    total_ns: u64 = 0,
+
+    fn mark(s: *Stages, name: []const u8) void {
+        s.markSplit(name, "", 0);
+    }
+
+    /// Ends a stage, of which `part_ns` went to `part`.
+    fn markSplit(s: *Stages, name: []const u8, part: []const u8, part_ns: u64) void {
+        const t = Io.Timestamp.now(s.io, .awake);
+        const ns: u64 = @intCast(s.last.durationTo(t).nanoseconds);
+        s.last = t;
+        s.total_ns += ns;
+        if (!s.on) return;
+        const ms = struct {
+            fn f(x: u64) f64 {
+                return @as(f64, @floatFromInt(x)) / 1e6;
+            }
+        }.f;
+        const out = if (part.len == 0)
+            std.fmt.bufPrint(s.buf[s.len..], "{s}{s} {d:.1}", .{ if (s.len == 0) "" else ", ", name, ms(ns) })
+        else
+            std.fmt.bufPrint(s.buf[s.len..], "{s}{s} {d:.1}, {s} {d:.1}", .{ if (s.len == 0) "" else ", ", name, ms(ns -| part_ns), part, ms(part_ns) });
+        s.len += (out catch return).len;
+    }
+
+    fn print(s: *Stages) void {
+        if (s.on) std.debug.print("zap: {d:.1} ms in main: {s}\n", .{ @as(f64, @floatFromInt(s.total_ns)) / 1e6, s.buf[0..s.len] });
+    }
+};
 
 fn exitOnErrors(init: std.process.Init, zcu: *Zcu) void {
     if (zcu.errors.items.len == 0) return;

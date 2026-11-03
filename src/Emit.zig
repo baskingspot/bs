@@ -57,6 +57,8 @@ units_seen: std.AutoHashMapUnmanaged(Zcu.AnalUnit, void) = .empty,
 link_seen: bool = false,
 /// The error codes `finish` assigned, for `link`.
 error_values: std.ArrayList(Elf.Value) = .empty,
+/// Time spent in `CodeGen.generate`, for `ZAP_TIMING`.
+codegen_ns: u64 = 0,
 
 pub const Owner = union(enum) {
     unit: Zcu.AnalUnit,
@@ -89,9 +91,10 @@ pub fn deinit(emit: *Emit) void {
 
 /// Sink callback from `Zcu.analyzeAll`.
 pub fn function(emit: *Emit, zcu: *Zcu, ir: *const Ir) !void {
-    _ = zcu;
     emit.owner = .{ .unit = .{ .func = ir.func } };
     defer emit.owner = .link;
+    const t0 = std.Io.Timestamp.now(zcu.io, .awake);
+    defer emit.codegen_ns += @intCast(t0.durationTo(.now(zcu.io, .awake)).nanoseconds);
     CodeGen.generate(emit, ir) catch |err| switch (err) {
         error.CodegenFail => emit.failed = true,
         else => |e| return e,
