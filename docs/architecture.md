@@ -882,9 +882,9 @@ if (zcu.replay) |r| if (try r.load(zcu, unit)) { mark resolved; return; }
 
 `Replay.load` (cache side, in `src/Incremental.zig`) decides green or red
 as above, and for green units writes the result into Zcu state: `nav.ty`,
-`nav.val`, `is_const`, `linkage`; a container's `ContainerInfo`; a
-function's inferred error names (`inferred_errors`); a function's
-references. It returns false for red units, and Zcu analyzes as today.
+`nav.val`, `is_const`, `linkage`, `alignment`; a container's
+`ContainerInfo`; a function's inferred error names (`inferred_errors`); a
+function's references. It returns false for red units, and Zcu analyzes as today.
 Two things Sema must add, both narrow:
 
 - **References**, recorded like dependencies: which functions a unit
@@ -963,7 +963,8 @@ the result's items:
   stable hashing; an escape is a compile error), and Zcu's per-run maps
   (`comptime_memo` starts empty; memoizing comptime calls across builds
   would be its own node kind later).
-- Per unit kind: `nav_val` stores ty, val, `is_const`, `linkage`;
+- Per unit kind: `nav_val` stores ty, val, `is_const`, `linkage`,
+  `alignment` (the explicit `align(n)`, 0 if none);
   `type_layout` stores the `ContainerInfo` fields (names, field types and
   defaults by reference, offsets, tag type, flags, size, alignment);
   `func` stores its references (its Atoms are in the pack, its IR is

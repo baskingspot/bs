@@ -246,6 +246,8 @@ pub const Nav = struct {
     val: Index = .none,
     is_const: bool = true,
     linkage: Zir.Inst.Declaration.Unwrapped.Linkage = .normal,
+    /// An explicit `align(n)` in bytes, or 0 for the type's alignment.
+    alignment: u64 = 0,
 };
 
 /// The fields and layout of a declared container type (struct, enum, union,

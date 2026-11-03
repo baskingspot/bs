@@ -425,7 +425,7 @@ fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
         .key = .fromName(try emit.unitName(.{ .nav_val = nav_index })),
         .name = ip.stringSlice(nav.fqn),
         .section = if (nav.is_const) .rodata else .data,
-        .alignment = .fromByteUnits(Type.abiAlignment(ip, ty)),
+        .alignment = .fromByteUnits(if (nav.alignment != 0) nav.alignment else Type.abiAlignment(ip, ty)),
         .bytes = bytes,
         .targets = try arena.dupe(SymbolKey, refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, refs.relocs.items),

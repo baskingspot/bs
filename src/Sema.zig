@@ -273,6 +273,12 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
         const ref = try sema.resolveInlineBody(&block, body, nav.zir_inst);
         break :blk try sema.analyzeAsType(&block, src, ref);
     } else .none;
+    if (decl.align_body) |body| {
+        const a_ref = try sema.coerce(&block, .u32_type, try sema.resolveInlineBody(&block, body, nav.zir_inst), src);
+        const a = sema.ip.intValue(u64, try sema.resolveConstValue(&block, src, a_ref, "alignment must be comptime-known")).?;
+        if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(&block, src, "alignment value '{d}' is not a power of two", .{a});
+        nav.alignment = a;
+    }
     if (decl.linkage == .@"extern") {
         // `extern fn name(...) T;`: defined by an export of `name`, which
         // calls reach through a slot the linker fills (see `extern_ptr`).
@@ -3097,7 +3103,9 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     try sema.ensureNavVal(block, src, nav_index);
     const nav = sema.ip.getNav(nav_index);
     if (sema.ip.indexToKey(nav.val) == .func) try sema.zcu.queueFunc(nav.val);
-    const ptr_ty = try sema.ptrType(.{ .child = nav.ty, .flags = .{ .is_const = nav.is_const } });
+    // An explicit alignment shows in the pointer type, as upstream.
+    const alignment: u6 = if (nav.alignment == 0 or sema.naturalAlignment(nav.ty) == nav.alignment) 0 else @intCast(std.math.log2_int(u64, nav.alignment) + 1);
+    const ptr_ty = try sema.ptrType(.{ .child = nav.ty, .flags = .{ .is_const = nav.is_const, .alignment = alignment } });
     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .nav = nav_index } } }));
 }
 
