@@ -2147,7 +2147,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .enum_from_int, .from_backing_int => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const ty = try sema.resolveType(block, src, extra.lhs);
+            const ty = try sema.castDestType(block, src, extra.lhs, true);
             if (Type.class(sema.ip, ty) != .@"enum") return sema.fail(block, src, "expected enum, found '{f}'", .{sema.fmtType(ty)});
             break :blk sema.enumFromInt(block, src, ty, sema.resolveInst(extra.rhs));
         },
@@ -2193,7 +2193,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .splat => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const ty = try sema.resolveType(block, src, extra.lhs);
+            const ty = try sema.castDestType(block, src, extra.lhs, true);
             if (sema.ip.indexToKey(ty) == .vector_type) {
                 const v = sema.ip.indexToKey(ty).vector_type;
                 const scalar = try sema.coerce(block, v.child, sema.resolveInst(extra.rhs), src);
@@ -2234,7 +2234,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .ptr_from_int => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const ty = try sema.resolveType(block, src, extra.lhs);
+            const ty = try sema.castDestType(block, src, extra.lhs, false);
             const operand = try sema.coerce(block, .usize_type, sema.resolveInst(extra.rhs), src);
             if (try sema.resolveDefinedValue(block, src, operand)) |v| {
                 const addr = sema.ip.intValue(u64, v).?;
@@ -2884,6 +2884,17 @@ fn stdCallingConvention(sema: *Sema, block: *Block, src: Src, cc_ty: Index, cc: 
 
 /// `ty` without optional and error union wrappers: the type that a result
 /// location of type `ty` initializes.
+/// The destination type of a cast builtin from its result type: without an
+/// error union, and with `remove_opt` without an optional either (inside
+/// the error union, or at the top), as upstream's `resolveDestType`.
+fn castDestType(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref, remove_opt: bool) CompileError!Index {
+    const ip = sema.ip;
+    var ty = try sema.resolveType(block, src, ref);
+    if (ip.indexToKey(ty) == .error_union_type) ty = ip.indexToKey(ty).error_union_type.payload_type;
+    if (remove_opt and ip.indexToKey(ty) == .opt_type) ty = ip.indexToKey(ty).opt_type;
+    return ty;
+}
+
 fn unwrapOptEu(sema: *Sema, ty: Index) Index {
     var t = ty;
     while (true) switch (sema.ip.indexToKey(t)) {
@@ -3194,7 +3205,7 @@ fn zirFieldParentPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileEr
     const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
     const extra = sema.code.extraData(Zir.Inst.FieldParentPtr, ext.operand).data;
     const src = block.nodeSrc(extra.src_node);
-    const dest_ty = try sema.resolveType(block, src, extra.parent_ptr_type);
+    const dest_ty = try sema.castDestType(block, src, extra.parent_ptr_type, false);
     if (Type.class(ip, dest_ty) != .pointer or Type.ptrInfo(ip, dest_ty).flags.size != .one)
         return sema.fail(block, src, "expected single pointer type, found '{f}'", .{sema.fmtType(dest_ty)});
     const parent_ty = Type.ptrInfo(ip, dest_ty).child;
@@ -8539,7 +8550,7 @@ fn zirIntCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const extra = sema.code.extraData(Zir.Inst.Bin, data.payload_index).data;
     const src = block.nodeSrc(data.src_node);
-    const dest_ty = try sema.resolveType(block, src, extra.lhs);
+    const dest_ty = try sema.castDestType(block, src, extra.lhs, true);
     return sema.analyzeIntCast(block, src, dest_ty, sema.resolveInst(extra.rhs));
 }
 
@@ -8591,7 +8602,7 @@ fn zirTruncate(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const extra = sema.code.extraData(Zir.Inst.Bin, data.payload_index).data;
     const src = block.nodeSrc(data.src_node);
-    const dest_ty = try sema.resolveType(block, src, extra.lhs);
+    const dest_ty = try sema.castDestType(block, src, extra.lhs, true);
     return sema.analyzeTruncate(block, src, dest_ty, sema.resolveInst(extra.rhs));
 }
 
@@ -8625,7 +8636,7 @@ fn zirBitCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const extra = sema.code.extraData(Zir.Inst.Bin, data.payload_index).data;
     const src = block.nodeSrc(data.src_node);
-    const dest_ty = try sema.resolveType(block, src, extra.lhs);
+    const dest_ty = try sema.castDestType(block, src, extra.lhs, true);
     const operand = sema.resolveInst(extra.rhs);
     const src_ty = sema.typeOf(operand);
     if (Type.isInt(ip, dest_ty) and Type.isInt(ip, src_ty)) {
@@ -8795,7 +8806,7 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
         const e = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
         break :blk .{ e.lhs, e.rhs, block.nodeSrc(data.pl_node.src_node) };
     };
-    const dest_ty = try sema.resolveType(block, src, dest_ref);
+    const dest_ty = try sema.castDestType(block, src, dest_ref, false);
     var operand = sema.resolveInst(operand_ref);
     const ip = sema.ip;
     const optPtr = struct {
@@ -8854,11 +8865,15 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
         return sema.coercePtrTo(block, raw, dest_ty);
     }
     if (d.flags.size == .slice and s.flags.size != .slice) {
-        // Only `*[N]T` provides a length.
-        if (s.flags.size != .one or ip.indexToKey(s.child) != .array_type) return sema.fail(block, src, "cannot infer length of slice from '{f}'", .{sema.fmtType(src_ty)});
-        const a = ip.indexToKey(s.child).array_type;
+        // A single-item pointer provides a length: that of the bytes it
+        // points to.
+        if (s.flags.size != .one) return sema.fail(block, src, "cannot infer length of slice from '{f}'", .{sema.fmtType(src_ty)});
         try sema.resolveLayout(block, src, d.child);
-        const bytes = a.len * Type.abiSize(ip, a.child);
+        try sema.resolveLayout(block, src, s.child);
+        const bytes = switch (ip.indexToKey(s.child)) {
+            .array_type => |a| a.len * Type.abiSize(ip, a.child), // not the sentinel
+            else => Type.abiSize(ip, s.child),
+        };
         const dsize = Type.abiSize(ip, d.child);
         if (dsize == 0 or bytes % dsize != 0) return sema.fail(block, src, "type '{f}' does not divide exactly into destination elements", .{sema.fmtType(s.child)});
         const many = try sema.coercePtrTo(block, operand, try sema.elemValueType(dest_ty));

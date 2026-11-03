@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "1\n7\n3\n1\n0\n1\n1\n1\n9\n1\n42\n"
+//! stdout: "1\n7\n3\n1\n0\n1\n1\n1\n9\n1\n42\n4\n4\n44\n7\n4294967295\n"
 const rt = @import("rt.zig");
 // For `std.lang.ExternOptions`; std.start sees `_start` and stays out.
 const std = @import("std");
@@ -78,5 +78,30 @@ fn main() callconv(.c) noreturn {
     // Calling a naked function through a pointer cast to `.c`.
     const f: *const fn () callconv(.c) u64 = @ptrCast(&nakedFortyTwo);
     rt.printInt(f());
+    // A single-item pointer cast to a slice covers its bytes; cast builtins
+    // take their destination from a result type without the error union
+    // (and, except @ptrCast, the optional).
+    const word: u32 = 0x01020304;
+    const word_bytes = bytesOf(&word);
+    rt.printInt(word_bytes.len);
+    rt.printInt(word_bytes[0]);
+    rt.printInt(narrow(300) catch 0);
+    var w: u32 = 7;
+    rt.printInt(optCast(&w).?.*);
+    rt.printInt(bitsOf(-1) catch 0);
     rt.exit(0);
+}
+
+fn bytesOf(x: *const u32) []const u8 {
+    return @ptrCast(x);
+}
+fn narrow(x: u64) error{Big}!u8 {
+    if (x > 1000) return error.Big;
+    return @intCast(x % 256);
+}
+fn optCast(p: *u32) ?*u8 {
+    return @ptrCast(p);
+}
+fn bitsOf(x: i32) error{X}!u32 {
+    return @bitCast(x);
 }
