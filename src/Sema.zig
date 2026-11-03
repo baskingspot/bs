@@ -296,6 +296,7 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
         else
             try sema.undefValue(decl_ty);
         nav.ty = decl_ty;
+        try sema.resolveLayoutIfIdle(&block, src, decl_ty);
         return sema.finish();
     }
     // Within the value body, the `declaration` instruction refers to the type.
@@ -307,6 +308,8 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
     const val = try sema.resolveConstValue(&block, src, val_ref, "global variable initializer must be comptime-known");
     nav.val = val;
     nav.ty = sema.ip.typeOf(val);
+    // Emit lays out the value of any declaration code refers to.
+    try sema.resolveLayoutIfIdle(&block, src, nav.ty);
     try sema.finish();
 }
 
@@ -6956,6 +6959,11 @@ fn analyzeRef(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!R
     const ty = sema.typeOf(operand);
     const ptr_ty = try sema.ptrType(.{ .child = ty, .flags = .{ .is_const = true } });
     if (sema.resolveValue(operand)) |v| {
+        // A reference to a function is a pointer to its declaration.
+        if (sema.ip.indexToKey(v) == .func) {
+            const f = sema.ip.indexToKey(v).func;
+            if (f.generic_owner == .none and sema.ip.getNav(f.owner_nav).val == v) return sema.navRef(block, src, f.owner_nav);
+        }
         try sema.resolveLayoutIfIdle(block, src, ty);
         return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = v, .orig_ty = ptr_ty } } } }));
     }

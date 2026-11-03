@@ -1,5 +1,5 @@
 //! exit: 5
-//! stdout: "65\n118\n17\n42\n32\n105\n5\n21\nzzzzzzz\nbc\n75\n9\n10\n1\n16\n56\n10\n"
+//! stdout: "65\n118\n17\n42\n32\n105\n5\n21\nzzzzzzz\nbc\n75\n9\n10\n1\n16\n56\n10\n7\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -30,6 +30,24 @@ const Vec = struct {
 };
 
 const Rect = struct { min: Vec, max: Vec };
+
+/// A global whose type is laid out only because a declaration points to it.
+const Holder = struct {
+    y: u8,
+    var g: @This() = undefined;
+    const p = &g;
+};
+
+/// A function reached through a local alias, then a pointer to it.
+const seven = struct {
+    fn f() u32 {
+        return 7;
+    }
+}.f;
+
+fn opaqueAddr(ptr: ?*anyopaque) usize {
+    return @intFromPtr(ptr) % 1;
+}
 
 fn sumSlice(xs: []const u32) u32 {
     var s: u32 = 0;
@@ -106,7 +124,11 @@ fn main() callconv(.c) noreturn {
     rt.printInt(@intFromBool(b));
     rt.printInt(x + y + z);
     rt.printInt(pv * qv);
-    rt.printInt(m + k);
+    rt.printInt(m + k + opaqueAddr(Holder.p));
+    const alias = seven;
+    var fp = &alias;
+    _ = &fp;
+    rt.printInt(fp());
     rt.exit(@intCast(arr.len));
 }
 
