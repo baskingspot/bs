@@ -31,7 +31,14 @@ expect "compile exe hello debug native cached"
 "$zap" build run >"$work/log" 2>&1 || fail "zap build run"
 expect "hello 2"
 "$zap" build test --summary all >"$work/log" 2>&1 || fail "zap build test"
-expect "run test 3 pass (3 total)"
+expect "run test 4 pass (4 total)"
+
+# Fuzzing: the runner rebuilds the tests with -ffuzz, zap instruments them
+# and links upstream's fuzzer, which finds the crash planted in "fuzz".
+# As upstream's, the runner exits 0 after reporting a crash.
+"$zap" build test --fuzz=5M >"$work/log" 2>&1 || true
+expect "panic: planted crash"
+expect "input saved to '.zig-cache/f/crash'"
 
 # Docs: upstream's viewer, its page, and the modules' sources.
 "$zap" build docs >"$work/log" 2>&1 || fail "zap build docs"

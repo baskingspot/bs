@@ -45,6 +45,9 @@ modules: std.ArrayList(Module) = .empty,
 main_module: Module.Index = .root,
 /// See `Options.load_std`.
 load_std: bool,
+/// The root module of the fuzzer's family (`Options.fuzzer_builtin_dir`),
+/// whose `std@fuzzer` and `builtin@fuzzer` follow it.
+fuzzer_root: ?Module.Index = null,
 /// What `loadAll` and `loadFile` did, for `ZAP_FRONTEND_TIMING`.
 stats: Stats = .{},
 /// AstGen errors in files `loadFile` loaded, for the caller to report
@@ -65,6 +68,13 @@ pub const Module = struct {
     /// Which of `caches` holds this module's ZIR: std's files are shared by
     /// every project through the global cache.
     cache: CacheKind,
+    /// The modules `@import("std")`, `@import("root")`, and
+    /// `@import("builtin")` name here: the main ones, except in the
+    /// fuzzer's family (`fuzzer_root`), which has its own, as upstream's
+    /// separate compilation of the fuzzer does.
+    std_mod: Index = .std,
+    root_mod: Index = .root,
+    builtin_mod: Index = .builtin,
 
     pub const Index = enum(u32) {
         root,
@@ -145,6 +155,11 @@ pub const Options = struct {
     /// `--dep`s of the root module, and the other modules.
     root_deps: []const []const u8 = &.{},
     modules: []const ModuleArg = &.{},
+    /// With `-ffuzz` on an executable: the directory of the fuzzer's
+    /// generated `builtin.zig`. The fuzzer (`<lib>/fuzzer.zig`) then joins
+    /// the compilation as a module family of its own (docs/architecture.md,
+    /// "Fuzzing").
+    fuzzer_builtin_dir: ?[]const u8 = null,
 };
 
 pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
@@ -204,6 +219,19 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     }.f;
     fe.modules.items[@backingInt(fe.main_module)].deps = try resolve(&fe, options.root_deps);
     for (options.modules, first_extra..) |m, k| fe.modules.items[k].deps = try resolve(&fe, m.deps);
+    if (options.fuzzer_builtin_dir) |dir| {
+        const root: Module.Index = @fromBackingInt(@intCast(fe.modules.items.len));
+        const family: [3]Module.Index = .{ @fromBackingInt(@backingInt(root) + 1), root, @fromBackingInt(@backingInt(root) + 2) };
+        try fe.modules.appendSlice(gpa, &.{
+            .{ .name = "root@fuzzer", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "fuzzer.zig"), .cache = .global },
+            .{ .name = "std@fuzzer", .root_dir = try std.fs.path.join(gpa, &.{ zig_lib_dir, "std" }), .root_file = try gpa.dupe(u8, "std.zig"), .cache = .global },
+            .{ .name = "builtin@fuzzer", .root_dir = try gpa.dupe(u8, dir), .root_file = try gpa.dupe(u8, "builtin.zig"), .cache = .global },
+        });
+        for (fe.modules.items[@backingInt(root)..]) |*m| {
+            m.std_mod, m.root_mod, m.builtin_mod = family;
+        }
+        fe.fuzzer_root = root;
+    }
     return fe;
 }
 
@@ -257,6 +285,16 @@ pub fn module(fe: *const Frontend, index: Module.Index) *const Module {
 /// `--dep`s, if any.
 pub fn depModule(fe: *const Frontend, from: Module.Index, name: []const u8) ?Module.Index {
     for (fe.module(from).deps) |d| if (std.mem.eql(u8, d.name, name)) return d.module;
+    return null;
+}
+
+/// The module `@import(name)` names in module `from` when `name` is
+/// `std`, `root`, or `builtin`: its family's.
+pub fn familyModule(fe: *const Frontend, from: Module.Index, name: []const u8) ?Module.Index {
+    const m = fe.module(from);
+    if (std.mem.eql(u8, name, "std")) return m.std_mod;
+    if (std.mem.eql(u8, name, "root")) return m.root_mod;
+    if (std.mem.eql(u8, name, "builtin")) return m.builtin_mod;
     return null;
 }
 
@@ -989,7 +1027,7 @@ fn freeImports(gpa: Allocator, imports: []const Import) void {
 /// through `@import`. Returns false and adds messages to `errors` if any file
 /// failed to lower. Call once.
 pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
-    var roots: [3]Root = undefined;
+    var roots: [5]Root = undefined;
     var n: usize = 0;
     roots[n] = .{ .module = .root, .sub_path = fe.module(.root).root_file };
     n += 1;
@@ -1004,7 +1042,14 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
         roots[n] = .{ .module = fe.main_module, .sub_path = fe.module(fe.main_module).root_file };
         n += 1;
     }
-    var indices: [3]?File.Index = undefined;
+    // The fuzzer's family: its root (whose exports the program's externs
+    // name) and its std, which is always analyzed, as the main one.
+    if (fe.fuzzer_root) |r| {
+        roots[n] = .{ .module = r, .sub_path = fe.module(r).root_file };
+        roots[n + 1] = .{ .module = fe.module(r).std_mod, .sub_path = fe.module(fe.module(r).std_mod).root_file };
+        n += 2;
+    }
+    var indices: [5]?File.Index = undefined;
     return fe.load(roots[0..n], indices[0..n], errors);
 }
 
@@ -1053,7 +1098,7 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
     var moved = false;
     defer l.deinit(moved);
 
-    var root_jobs: [3]*Job = undefined;
+    var root_jobs: [5]*Job = undefined;
     for (roots, root_jobs[0..roots.len]) |r, *j| j.* = try l.getJob(r.module, r.sub_path);
     l.work(.main);
     l.group.await(io) catch {};
@@ -1280,12 +1325,8 @@ fn collectImports(fe: *const Frontend, f: *const File, names: []const u8) ![]Imp
         else if (std.mem.endsWith(u8, name, ".zig")) .{
             .module = f.module,
             .sub_path = try std.fs.path.resolvePosix(gpa, &.{ std.fs.path.dirname(f.sub_path) orelse "", name }),
-        } else if (std.mem.eql(u8, name, "std"))
-            .{ .module = .std, .sub_path = try gpa.dupe(u8, fe.module(.std).root_file) }
-        else if (std.mem.eql(u8, name, "root"))
-            .{ .module = .root, .sub_path = try gpa.dupe(u8, fe.module(.root).root_file) }
-        else if (std.mem.eql(u8, name, "builtin"))
-            .{ .module = .builtin, .sub_path = try gpa.dupe(u8, fe.module(.builtin).root_file) }
+        } else if (fe.familyModule(f.module, name)) |m|
+            .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) }
         else
             // TODO: ZON imports go through ZonGen, not AstGen.
             continue;

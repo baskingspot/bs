@@ -4193,7 +4193,7 @@ state. Built for step 1:
   skipped) as `zig build test`; its oracle steps find upstream zig on
   PATH when the build's compiler is not a zig release.
 
-## Fuzzing (designed 2026-11-03; being built)
+## Fuzzing (designed and built 2026-11-03; x86_64-linux)
 
 Goal: upstream 0.17.0's built-in fuzzer works with zap on x86_64-linux:
 `-ffuzz`, `std.testing.fuzz`, and `zig build test --fuzz` under `zap
@@ -4297,7 +4297,11 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   (`Elf.Symbols.bounds`). Objects do not get the sections yet.
 - **Cache.** Instrumented atoms differ from plain ones, so the store
   seed and the compilation key include the flag (the target string gets
-  `+fuzz`), and so must the donor key.
+  `+fuzz`). The donor key hashes the store seed, so fuzz and plain builds
+  never donate to each other. The fuzzer's `std@fuzzer` files have the
+  same paths as `std`'s; the replay tells them apart because it matches
+  inputs by key (`<module>:<path>`), so an edit of a std file outdates
+  both copies.
 - **Cost when off**: one flag test per function in CodeGen and per
   `place`, and the linker's per-section arrays grow from 6 to 8 entries;
   no extra atoms, sections, analysis or format bytes.
@@ -4306,6 +4310,48 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   `--fuzz` without a limit also serves upstream's web UI, whose wasm
   client the runner compiles with the build's compiler for wasm32, which
   zap does not target; fuzzing and crash reports work without it.
+- **The fuzzer's hot loop.** Each run, the fuzzer reads the counters 64
+  at a time (`PcBitsetIterator.next`:
+  `@as(@Vector(64, u8), @splat(0)) != counters[0..64].*`). Sema maps a
+  runtime vector operation with a loop over the elements, about 25
+  instructions per element, which made that line 95% of the fuzzer's
+  time. Sema now lowers `==` and `!=` on byte vectors of 8 to 64
+  elements (multiples of 8) as u64 words (`cmpBytes`: xor, a carry-free
+  "byte is nonzero" test, and a multiply that gathers the eight top bits),
+  in every build: std's `mem.eql`, `indexOfScalar` and `countScalar` use
+  the same compare. SSE2 (`pcmpeqb`/`pmovmskb`) would be ten times
+  shorter again but needs vector registers in the backend.
+
+**Measured** (orb, 4 vCPU, ReleaseFast zap, 2026-11-03):
+
+- Finding bugs: `zap build test --fuzz=30M` finds the `key=zap!`
+  overflow above after 5.3 M and 4.5 M runs, about a minute, and missed
+  it in a third try cut off at 300 s (26 M runs); upstream LLVM finds it
+  after 6.7 M, 8.5 M and 6.2 M runs, 18 to 27 s. A `zap` prefix
+  (test/build/hello, `zig build test-build`) falls after 0.2 M to 0.6 M
+  runs, a few seconds (upstream LLVM: 0.28 M).
+  zap runs about 90 k inputs/s against upstream LLVM's 335 k/s: before
+  `cmpBytes` it ran 10 k/s. The rest is backend code quality (the
+  fuzzer's own code, `isFresh`, `SafeAllocator.init`) and zap having
+  about twice upstream's points (19 787 against 10 172 in the same test;
+  switch cases are 2 400 of them; the rest is probably branches Sema
+  adds itself, which upstream marks uninstrumented and zap's IR cannot
+  tell apart yet), each a counter the fuzzer reads per run.
+- Compile time, `zap test` of that test, cache off: 0.16 s plain, 0.34 s
+  with `-ffuzz` (the fuzzer's family analyzes std's code a second time;
+  86 MB against 48 MB peak). A rebuild with nothing changed takes 0.00 s
+  either way, and an edit of a function body 0.01 to 0.03 s. Upstream
+  `zig test -ffuzz -fllvm`, fresh cache: 27.9 s (7.6 s without
+  `-ffuzz`).
+- Run time of instrumented code (bench/runtime as tests, plain against
+  `-ffuzz`): fib 0.11 to 0.12 s, sieve 0.14 to 0.24 s, sort 0.38 to
+  0.40 s, hash and nbody within noise, fmt 0.12 to 0.13 s. Upstream LLVM
+  Debug pays more for its atomic adds: fib 0.14 to 0.70 s, sieve 0.51 to
+  1.00 s.
+- Off: std's tests compile in the same time as on main (median of 6,
+  6.76 s against 6.75 s), and in a hello world only the functions with
+  byte-vector compares change (`cmpBytes`: `mem.indexOfScalar` and
+  `mem.eql` over 4 KiB run 2.7x faster).
 
 ## `builtin` and conformance
 

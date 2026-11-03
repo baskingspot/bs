@@ -124,6 +124,9 @@ pub const Symbols = struct {
     /// Symbols whose value is a link-time integer (see the `value*`
     /// relocation kinds). An atom with the same number takes precedence.
     values: []const NumberedValue = &.{},
+    /// The numbers of the section bounds the linker defines, in
+    /// `bound_sections` order, or `no_bound` for one nothing references.
+    bounds: [bound_sections.len * 2]u32 = @splat(no_bound),
     entry: u32,
     /// Numbers are below this; numbers with no atom or value are
     /// undefined, which is an error only if a relocation uses one.
@@ -138,6 +141,22 @@ pub const NumberedAtom = extern struct {
 };
 
 pub const NumberedValue = struct { symbol: u32, value: u64 };
+
+/// The sections whose start and end the linker defines as symbols
+/// (`Atom.SymbolKey.sectionBound`), which the fuzzer finds the coverage
+/// arrays by (`__start___sancov_cntrs` and the others).
+pub const bound_sections = [_]Atom.Section{ .sancov_cntrs, .sancov_pcs };
+pub const no_bound = std.math.maxInt(u32);
+
+/// The keys of the section bounds: each section's start, then its end.
+pub fn boundKeys() [bound_sections.len * 2]SymbolKey {
+    var keys: [bound_sections.len * 2]SymbolKey = undefined;
+    for (bound_sections, 0..) |sec, i| {
+        keys[2 * i] = .sectionBound(sec, .start);
+        keys[2 * i + 1] = .sectionBound(sec, .stop);
+    }
+    return keys;
+}
 
 pub const Diagnostic = struct {
     /// Atom whose definition or relocation failed.
@@ -389,18 +408,20 @@ const page_size = 0x1000;
 
 /// Section header index of each `Atom.Section`. The allocated sections'
 /// headers come in layout order: .rodata, .text, .tdata and .tbss if
-/// present, .data, .bss. Then .eh_frame and .eh_frame_hdr and the debug
-/// sections, if present, then .symtab, .strtab, and .shstrtab.
+/// present, .data, .bss, then __sancov_pcs1 and __sancov_cntrs if present
+/// (`-ffuzz`; their addresses are after .rodata and after .bss). Then
+/// .eh_frame and .eh_frame_hdr and the debug sections, if present, then
+/// .symtab, .strtab, and .shstrtab.
 fn shndxOf(has_tls: bool) [n_sections]u16 {
     const t: u16 = @intFromBool(has_tls);
-    return .{ 2, 1, 3 + 2 * t, 4 + 2 * t, 3, 4 };
+    return .{ 2, 1, 3 + 2 * t, 4 + 2 * t, 3, 4, 6 + 2 * t, 5 + 2 * t };
 }
 const n_sections = std.enums.values(Atom.Section).len;
 /// Padding within each section: int3 in code, zeros elsewhere.
-const fills = [n_sections]u8{ 0xcc, 0, 0, 0, 0, 0 };
+const fills = [n_sections]u8{ 0xcc, 0, 0, 0, 0, 0, 0, 0 };
 /// Sections with no bytes in the file.
-const zero_fill = [n_sections]bool{ false, false, false, true, false, true };
-const sym_types = [n_sections]elf.STT{ .FUNC, .OBJECT, .OBJECT, .OBJECT, .TLS, .TLS };
+const zero_fill = [n_sections]bool{ false, false, false, true, false, true, true, false };
+const sym_types = [n_sections]elf.STT{ .FUNC, .OBJECT, .OBJECT, .OBJECT, .TLS, .TLS, .OBJECT, .OBJECT };
 
 /// The TLS segment's addresses [start, end), and the thread pointer, the
 /// end rounded up to the segment's alignment, as if the segment were the
@@ -431,7 +452,8 @@ const unset = std.math.maxInt(u32);
 const value_tag = 1 << 31;
 /// Section names. Outputs without debug info keep the prefix up to the
 /// names they use.
-const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00";
+const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00";
+const shstrtab_no_sancov = shstrtab[0..shName("__sancov_pcs1")];
 const shstrtab_no_tls = shstrtab[0..shName(".tdata")];
 const shstrtab_no_cfi = shstrtab[0..shName(".eh_frame")];
 const shstrtab_no_debug = shstrtab[0..shName(".debug_abbrev")];
@@ -464,6 +486,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const bss = @backingInt(Atom.Section.bss);
     const tdata = @backingInt(Atom.Section.tdata);
     const tbss = @backingInt(Atom.Section.tbss);
+    const cntrs = @backingInt(Atom.Section.sancov_cntrs);
+    const pcs = @backingInt(Atom.Section.sancov_pcs);
 
     const n_chunks = std.math.divCeil(usize, n_atoms, chunk_len) catch unreachable;
     const n_threads = @max(1, @min(n_chunks, options.threads orelse std.Thread.getCpuCount() catch 1));
@@ -561,14 +585,15 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             diag.* = .{ .target = e };
             return error.UndefinedSymbol;
         };
-        values = try .init(options.values.len, 1);
+        values = try .init(options.values.len + 2 * bound_sections.len, 1);
         for (options.values) |v| values.getOrPut(v.key).* = .{ .key = v.key, .value = v.value, .used = true };
     }
 
     // Section placement, as file offsets (for .bss, address - base).
     const has_rx = sizes[text] > 0;
     const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
-    const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls;
+    const has_sancov = sizes[cntrs] > 0 or sizes[pcs] > 0;
+    const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls or sizes[cntrs] > 0;
     const has_cfi = n_debug > 0;
     // Which program headers are written, of all the linker writes, in
     // order: PHDR; the R, RX, and RW LOADs; TLS; GNU_EH_FRAME; GNU_STACK.
@@ -579,12 +604,15 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var starts: [n_sections]u64 = undefined;
     starts[rodata] = aligns[rodata].forward(headers_end);
     const rodata_end = starts[rodata] + sizes[rodata];
+    // The coverage PC table, if any, follows .rodata in the R segment.
+    starts[pcs] = aligns[pcs].forward(rodata_end);
+    const pcs_end = starts[pcs] + sizes[pcs];
     // Room for an FDE per debug entry, and the terminator.
-    const eh_off = std.mem.alignForward(u64, rodata_end, 8);
+    const eh_off = std.mem.alignForward(u64, pcs_end, 8);
     const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.max_fde_size + 4 else 0;
     const hdr_off = eh_off + eh_room;
     const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + n_debug * Dwarf.eh_frame_hdr_entry_size else 0;
-    const r_end = if (has_cfi) hdr_off + hdr_room else rodata_end;
+    const r_end = if (has_cfi) hdr_off + hdr_room else pcs_end;
     const rx_start = if (has_rx) std.mem.alignForward(u64, r_end, page_size) else r_end;
     starts[text] = aligns[text].forward(rx_start);
     const text_end = starts[text] + sizes[text];
@@ -600,7 +628,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     starts[data] = aligns[data].forward(tls_end);
     const file_end = starts[data] + sizes[data];
     starts[bss] = aligns[bss].forward(file_end);
-    const mem_end = starts[bss] + sizes[bss];
+    // The coverage counters, if any, are memory only after .bss.
+    starts[cntrs] = aligns[cntrs].forward(starts[bss] + sizes[bss]);
+    const mem_end = starts[cntrs] + sizes[cntrs];
     // Call frame information holds 32-bit offsets between any two parts of
     // the image.
     if (has_cfi and mem_end > std.math.maxInt(i32)) return error.OutOfMemory;
@@ -611,7 +641,21 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
     l.base = base;
     l.shndx = shndxOf(has_tls);
-    l.sym_bias = .{ 0, 0, 0, 0, base + tls_start, base + tls_start };
+    l.sym_bias = .{ 0, 0, 0, 0, base + tls_start, base + tls_start, 0, 0 };
+    // The section bounds the linker defines.
+    for (bound_sections, 0..) |sec, i| {
+        const start = starts[@backingInt(sec)];
+        const ends = [2]u64{ start, start + sizes[@backingInt(sec)] };
+        if (numbered) |s| {
+            for (ends, s.bounds[2 * i ..][0..2]) |at, n| {
+                if (n == no_bound) continue;
+                if (n >= addrs.len) return error.InvalidSymbols;
+                addrs[n] = @intCast(at);
+            }
+        } else for (ends, [2]SymbolKey{ .sectionBound(sec, .start), .sectionBound(sec, .stop) }) |at, key| {
+            values.getOrPut(key).* = .{ .key = key, .value = base + at, .used = true };
+        }
+    }
     // Variant 2: the thread pointer is the end of the thread's TLS block,
     // whose size is the segment's rounded up to its alignment.
     l.tls = .{ .start = base + tls_start, .end = base + tls_end, .tp = base + tls_start + tls_align.forward(tls_end - tls_start) };
@@ -641,9 +685,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
     const strtab_off = symtab_off + @as(u64, n_syms) * @sizeOf(elf.Elf64.Sym);
     const shstrtab_off = strtab_off + strtab_len;
-    const shstr = if (has_tls) shstrtab else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
+    const shstr = if (has_sancov) shstrtab else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug));
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug));
     l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     switch (l.target) {
         .memory => |buf| {
@@ -672,7 +716,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // Padding between sections; padding within a section is filled by the
     // atom or chunk after it.
     try l.fill(headers_end, starts[rodata] - headers_end);
-    try l.fill(rodata_end, eh_off - rodata_end);
+    try l.fill(rodata_end, starts[pcs] - rodata_end);
+    try l.fill(pcs_end, eh_off - pcs_end);
     try l.fill(r_end, starts[text] - r_end);
     try l.fill(text_end, tls_start - text_end);
     // .tbss's room in the file is zeros.
@@ -775,6 +820,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName(".tdata"), .PROGBITS, .{ .ALLOC = true, .WRITE = true, .TLS = true }, base, starts[tdata], sizes[tdata], aligns[tdata]),
         shdr(shName(".tbss"), .NOBITS, .{ .ALLOC = true, .WRITE = true, .TLS = true }, base, starts[tbss], sizes[tbss], aligns[tbss]),
     };
+    const sancov_shdrs = [_]elf.Elf64.Shdr{
+        shdr(shName("__sancov_pcs1"), .PROGBITS, .{ .ALLOC = true }, base, starts[pcs], sizes[pcs], aligns[pcs]),
+        shdr(shName("__sancov_cntrs"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[cntrs], sizes[cntrs], aligns[cntrs]),
+    };
     const strtab_ndx = shnum - 2;
     const shdrs = [_]elf.Elf64.Shdr{
         std.mem.zeroes(elf.Elf64.Shdr),
@@ -783,14 +832,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     } ++ tls_shdrs ++ [_]elf.Elf64.Shdr{
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
-    } ++ cfi_shdrs ++ debug_shdrs ++ [_]elf.Elf64.Shdr{
+    } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ [_]elf.Elf64.Shdr{
         .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = n_syms, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
         nonAlloc(shName(".strtab"), .STRTAB, strtab_off, strtab_len),
         nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
     var sh_buf: [shdrs.len * @sizeOf(elf.Elf64.Shdr)]u8 = undefined;
     var sh_at: usize = 0;
-    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ true, 2 }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ true, 3 } };
+    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ true, 3 } };
     var group: usize = 0;
     var group_end: usize = present[0][1];
     for (shdrs, 0..) |s, i| {

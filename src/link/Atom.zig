@@ -71,6 +71,14 @@ pub const SymbolKey = enum(u128) {
         return @fromBackingInt(@intCast(h.finalInt()));
     }
 
+    /// The linker-defined start or end of an output section, which
+    /// `@extern` names `__start_<name>`/`__stop_<name>`. Only the
+    /// coverage sections have them.
+    pub fn sectionBound(section: Section, bound: enum { start, stop }) SymbolKey {
+        var buf: [64]u8 = undefined;
+        return .fromName(std.fmt.bufPrint(&buf, "section.{t}.{t}", .{ section, bound }) catch unreachable);
+    }
+
     const Hasher = std.crypto.auth.siphash.SipHash128(1, 3);
     const hash_key: [Hasher.key_length]u8 = "zap symbol key!!".*;
 };
@@ -86,12 +94,19 @@ pub const Section = enum(u8) {
     /// relative to the thread pointer (`x86_64_tpoff32`).
     tdata,
     tbss,
+    /// Coverage instrumentation (`-ffuzz`; docs/architecture.md,
+    /// "Fuzzing"): one zero-filled byte per coverage point
+    /// (`__sancov_cntrs`), and one address per point, in the same order
+    /// (`__sancov_pcs1`). The linker keeps each section's atoms in input
+    /// order and defines its start and end (`SymbolKey.sectionBound`).
+    sancov_cntrs,
+    sancov_pcs,
 
     /// Whether atoms in the section are zero-filled, with no `bytes`.
     pub fn isZeroFill(s: Section) bool {
         // A shift and a test: cheaper in the linkers' per-atom loops than
         // two compares.
-        const mask: u64 = 1 << @backingInt(Section.bss) | 1 << @backingInt(Section.tbss);
+        const mask: u64 = 1 << @backingInt(Section.bss) | 1 << @backingInt(Section.tbss) | 1 << @backingInt(Section.sancov_cntrs);
         return mask >> @intCast(@backingInt(s) & 63) & 1 != 0;
     }
 };

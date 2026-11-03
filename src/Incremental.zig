@@ -296,6 +296,10 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
     const gathered = now(io);
+    // The section bounds the linker defines, where atoms name them
+    // (`-ffuzz`'s coverage arrays).
+    var bounds: [Elf.bound_sections.len * 2]u32 = @splat(Elf.no_bound);
+    for (&bounds, Elf.boundKeys()) |*b, key| b.* = m.symbol(@backingInt(key)) orelse Elf.no_bound;
 
     var diag: Elf.Diagnostic = .{};
     Elf.linkInput(gpa, io, out_dir, sub_path, input, .{
@@ -305,6 +309,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             .targets = in.targets,
             .targets_tail = in.targets_tail,
             .values = values,
+            .bounds = bounds,
             .entry = m.entry_symbol,
             .len = m.symbolLen(),
         },

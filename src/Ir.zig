@@ -24,6 +24,9 @@ main_block: u32,
 /// `dbg_stmt`, for the epilogue's line row.
 rbrace_line: u32 = 0,
 rbrace_column: u32 = 0,
+/// The body called `@disableInstrumentation()`: no coverage points under
+/// `-ffuzz`.
+disable_instrumentation: bool = false,
 
 pub fn deinit(ir: *Ir, gpa: std.mem.Allocator) void {
     ir.instructions.deinit(gpa);

@@ -45,6 +45,8 @@ func: Index = .none,
 fn_ret_ty: Index = .none,
 /// See `panicNamespace`; `.none` until resolved.
 panic_ns: Index = .none,
+/// `@disableInstrumentation()` ran in `func`'s body (`Ir.disable_instrumentation`).
+disable_instrumentation: bool = false,
 ir_insts: std.MultiArrayList(Ir.Inst) = .empty,
 ir_extra: std.ArrayList(u32) = .empty,
 inst_map: InstMap = .{},
@@ -1408,6 +1410,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
         .main_block = main_block,
         .rbrace_line = src_locs.rbrace_line,
         .rbrace_column = @as(u16, @truncate(src_locs.columns >> 16)),
+        .disable_instrumentation = sema.disable_instrumentation,
     };
     _ = &ir;
     return ir;
@@ -2316,7 +2319,7 @@ fn panicNamespace(sema: *Sema, block: *Block) CompileError!Index {
     // `std.lang.panic` is the root's namespace when it declares one; read
     // it directly, which needs no std (the root's deprecated panic
     // function does go through std).
-    const root_ty = try sema.fileRootType(sema.zcu.moduleRootFile(.root).?);
+    const root_ty = try sema.fileRootType(sema.zcu.moduleRootFile(sema.family().root_mod).?);
     const root_panic: ?Index = if (try sema.lookupInType(root_ty, "panic")) |nav| blk: {
         const val = try sema.navVal(block, src, nav);
         break :blk if (sema.typeOf(val) == .type_type) try sema.analyzeAsType(block, src, val) else null;
@@ -4324,8 +4327,14 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         },
         // A body lowered for the comptime evaluator only runs at comptime.
         .in_comptime => .fromInterned(boolValue(block.is_comptime or sema.bc != null)),
-        // Instrumentation and intrinsics are not something zap emits.
-        .disable_instrumentation, .disable_intrinsics => .void_value,
+        // As upstream, the runtime function being analyzed (through any
+        // inline calls) gets no coverage instrumentation (`-ffuzz`).
+        .disable_instrumentation => blk: {
+            if (sema.func != .none) sema.disable_instrumentation = true;
+            break :blk .void_value;
+        },
+        // Intrinsics are not something zap emits.
+        .disable_intrinsics => .void_value,
         .breakpoint => blk: {
             const src = block.nodeSrc(@enumFromInt(@as(i32, @bitCast(ext.operand))));
             if (block.is_comptime) return sema.fail(block, src, "encountered @breakpoint at comptime", .{});
@@ -4540,14 +4549,7 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const file = sema.zcu.file(sema.file);
     const fe = sema.zcu.fe;
     // A module name embeds that module's root file, as upstream.
-    const named: ?Frontend.Module.Index = if (std.mem.eql(u8, name, "std"))
-        .std
-    else if (std.mem.eql(u8, name, "root"))
-        .root
-    else if (std.mem.eql(u8, name, "builtin"))
-        .builtin
-    else
-        fe.depModule(file.module, name);
+    const named: ?Frontend.Module.Index = fe.familyModule(file.module, name) orelse fe.depModule(file.module, name);
     if (named) |m| {
         try sema.bcRefuse();
         const index = sema.zcu.embedFile(m, fe.module(m).root_file) catch |err| switch (err) {
@@ -4594,6 +4596,10 @@ fn zirBuiltinSrc(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Co
         "test"
     else if (file.module == .root and fe.main_module == .root)
         std.fs.path.stem(module.root_file)
+    else if (std.mem.indexOfScalar(u8, module.name, '@')) |at|
+        // The fuzzer's family (`std@fuzzer`), named as in upstream's
+        // separate compilation of it.
+        module.name[0..at]
     else
         module.name;
     const strings = [_][]const u8{ module_name, file.sub_path, fn_name };
@@ -4701,6 +4707,9 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
     if (Type.class(ip, ty) == .error_set) return .fromInterned(try sema.typeInfo(block, src, ty));
     var hasher: InternPool.Hasher = .init("type info");
     hasher.int(InternPool.Hash, ip.stableHash(ty));
+    // Each module family's `std.lang.Type` is its own.
+    const std_mod = sema.family().std_mod;
+    if (std_mod != .std) hasher.int(u32, @backingInt(std_mod));
     const key = hasher.final();
     if (sema.zcu.comptime_memo.get(key)) |memo| return .fromInterned(try sema.memoHit(memo));
     const scope = sema.memoEnter();
@@ -5020,9 +5029,15 @@ fn unwrapOptEu(sema: *Sema, ty: Index) Index {
     };
 }
 
+/// The module whose family's std, root, and builtin the analyzed code
+/// names (`Frontend.Module.std_mod`).
+fn family(sema: *const Sema) *const Frontend.Module {
+    return sema.zcu.fe.module(sema.zcu.file(sema.file).module);
+}
+
 /// The value of `std.lang.<path>`, where `path` may be dotted.
 fn stdLangDecl(sema: *Sema, block: *Block, src: Src, path: []const u8) CompileError!Ref {
-    const std_file = sema.zcu.moduleRootFile(.std) orelse return sema.fail(block, src, "std.lang.{s} requires the std module", .{path});
+    const std_file = sema.zcu.moduleRootFile(sema.family().std_mod) orelse return sema.fail(block, src, "std.lang.{s} requires the std module", .{path});
     var cur: Ref = try sema.namespaceLookupVal(block, src, try sema.fileRootType(std_file), "lang", src);
     var it = std.mem.splitScalar(u8, path, '.');
     while (it.next()) |part| {
@@ -5489,12 +5504,8 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         const key = try std.fmt.allocPrint(sema.arena, "{d}:{s}", .{ @backingInt(this_file.module), sub });
         const file_index = fe.file_map.get(key) orelse return sema.fail(block, src, "unable to find '{s}'", .{path});
         break :blk @backingInt(file_index);
-    } else if (std.mem.eql(u8, path, "std"))
-        sema.zcu.moduleRootFile(.std).?
-    else if (std.mem.eql(u8, path, "root"))
-        sema.zcu.moduleRootFile(.root).?
-    else if (std.mem.eql(u8, path, "builtin"))
-        sema.zcu.moduleRootFile(.builtin).?
+    } else if (fe.familyModule(this_file.module, path)) |m|
+        sema.zcu.moduleRootFile(m).?
     else if (std.mem.endsWith(u8, path, ".zon"))
         return .fromInterned(try sema.importZon(block, src, path, null, extra.res_ty))
     else

@@ -18,6 +18,8 @@ pub const Options = struct {
     /// `builtin.unwind_tables` (`-funwind-tables` and friends). zap emits
     /// asynchronous tables for each, which serve every kind of request.
     unwind_tables: std.lang.UnwindTables = .async,
+    /// `-ffuzz`.
+    fuzz: bool = false,
 };
 
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
@@ -96,7 +98,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const have_error_return_tracing = true;
     \\pub const valgrind_support = true;
     \\pub const sanitize_thread = false;
-    \\pub const fuzz = false;
+    \\pub const fuzz = {s};
     \\pub const position_independent_code = false;
     \\pub const position_independent_executable = false;
     \\pub const strip_debug_info = false;
@@ -104,7 +106,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const omit_frame_pointer = false;
     \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
     \\
-    , .{ @tagName(opts.output_mode), @tagName(opts.unwind_tables), if (opts.is_test) "true" else "false", if (opts.single_threaded) "true" else "false" });
+    , .{ @tagName(opts.output_mode), @tagName(opts.unwind_tables), if (opts.is_test) "true" else "false", if (opts.single_threaded) "true" else "false", if (opts.fuzz) "true" else "false" });
 }
 
 /// Writes the generated source to `<cache_dir>/builtin/<content hash>/builtin.zig`

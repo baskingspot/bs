@@ -36,6 +36,9 @@ cold_start: u32 = 0,
 /// itself, or where it jumps if it is bypassed (`place`).
 cold: std.ArrayList(bool) = .empty,
 fwd: std.ArrayList(Block.Index) = .empty,
+/// Per block, from `place` with `cover` (`-ffuzz`): whether it is a
+/// coverage point, whose code starts by setting its counter.
+covered: std.ArrayList(bool) = .empty,
 /// Switch successors: per switch, its case blocks in IR order.
 extra: std.ArrayList(Block.Index) = .empty,
 /// For each IR instruction that a `br` or `repeat` targets (`block`,
@@ -202,6 +205,7 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.order.deinit(gpa);
     f.cold.deinit(gpa);
     f.fwd.deinit(gpa);
+    f.covered.deinit(gpa);
     f.extra.deinit(gpa);
     f.targets.deinit(gpa);
     f.loops.deinit(gpa);
@@ -260,7 +264,12 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
 /// exists on its path. Slot sharing (`takeSlot`) assumes emission in
 /// position order, so the architecture gives the values of cold blocks
 /// slots of their own.
-pub fn place(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
+///
+/// With `cover` (`-ffuzz`), it also picks the coverage points (`covered`;
+/// docs/architecture.md, "Fuzzing"): the entry, and every successor of a
+/// `branch` or `switch_br` whose successors are all hot; a branch with a
+/// cold side (a safety check) gets none. A covered block is not bypassed.
+pub fn place(f: *Func, gpa: Allocator, ir: *const Ir, cover: bool) Allocator.Error!void {
     const n = f.blocks.items.len;
     f.order.clearRetainingCapacity();
     try f.order.ensureTotalCapacity(gpa, f.layout.items.len);
@@ -270,13 +279,35 @@ pub fn place(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     for (f.fwd.items, 0..) |*t, i| t.* = @fromBackingInt(@intCast(i));
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
-    const insts = f.values.items(.inst);
+    try f.covered.resize(gpa, n);
+    @memset(f.covered.items, false);
+    if (cover) {
+        const covered = f.covered.items;
+        covered[@backingInt(f.layout.items[0])] = true;
+        for (f.layout.items) |block| {
+            const term = f.blocks.items[@backingInt(block)].term;
+            switch (term.tag) {
+                .branch => if (!f.endsCold(ir, term.succ[0]) and !f.endsCold(ir, term.succ[1])) {
+                    covered[term.succ[0]] = true;
+                    covered[term.succ[1]] = true;
+                },
+                .switch_br => {
+                    const cases_len = ir.extraData(Ir.SwitchBr, datas[@backingInt(term.inst)].pl_op.payload).data.cases_len;
+                    for (f.switchCases(term, cases_len)) |c| {
+                        if (!f.endsCold(ir, @backingInt(c))) covered[@backingInt(c)] = true;
+                    }
+                    if (!f.endsCold(ir, term.succ[1])) covered[term.succ[1]] = true;
+                },
+                else => {},
+            }
+        }
+    }
     // Each bypassable block points at its successor; then chains are
     // followed, and a block on a cycle of them (an empty endless loop)
     // keeps its code.
     for (f.layout.items[1..]) |block| {
         const b = f.blocks.items[@backingInt(block)];
-        if (b.len != 0) continue;
+        if (b.len != 0 or f.covered.items[@backingInt(block)]) continue;
         const only_jumps = switch (b.term.tag) {
             .fallthrough => true,
             .jump => tags[@backingInt(b.term.inst)] == .repeat or datas[@backingInt(b.term.inst)].br.operand == Inst.Ref.void_value,
@@ -292,9 +323,7 @@ pub fn place(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     }
     for (f.layout.items, 0..) |block, i| {
         if (i != 0 and f.fwd.items[@backingInt(block)] != block) continue;
-        const b = f.blocks.items[@backingInt(block)];
-        const cold = i != 0 and b.len != 0 and (b.term.tag == .noreturn or b.term.tag == .unreach) and
-            tags[@backingInt(insts[b.start + b.len - 1])] == .call;
+        const cold = i != 0 and f.endsCold(ir, @backingInt(block));
         f.cold.items[@backingInt(block)] = cold;
         if (!cold) f.order.appendAssumeCapacity(block);
     }
@@ -302,6 +331,14 @@ pub fn place(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     for (f.layout.items) |block| {
         if (f.cold.items[@backingInt(block)]) f.order.appendAssumeCapacity(block);
     }
+}
+
+/// Whether block `index` ends with a call of a noreturn function (a
+/// failing check's panic, `@panic`).
+fn endsCold(f: *const Func, ir: *const Ir, index: u32) bool {
+    const b = f.blocks.items[index];
+    return b.len != 0 and (b.term.tag == .noreturn or b.term.tag == .unreach) and
+        ir.instructions.items(.tag)[@backingInt(f.values.items(.inst)[b.start + b.len - 1])] == .call;
 }
 
 /// Computes each value's uses and live interval (`live`). A value that is

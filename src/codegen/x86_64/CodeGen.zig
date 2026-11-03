@@ -94,6 +94,10 @@ in_cold: bool = false,
 /// been emitted in place: its row and the inlined calls open there
 /// (`cold_open[open_start..][0..open_len]`).
 cold_starts: std.ArrayList(ColdStart) = .empty,
+/// `-ffuzz`: the key of the function's coverage counters, and the code
+/// offset of each coverage point, in counter order.
+cover_key: SymbolKey = undefined,
+cover_pcs: std.ArrayList(u32) = .empty,
 cold_open: std.ArrayList(OpenInline) = .empty,
 /// The function contains inline assembly, so no value gets a register.
 has_asm: bool = false,
@@ -185,7 +189,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const gpa = emit.gpa;
     const t0 = std.Io.Timestamp.now(emit.zcu.io, .awake);
     try emit.ssa.build(gpa, ir);
-    try emit.ssa.place(gpa, ir);
+    const cover = emit.fuzz and instrumented(emit, ir);
+    try emit.ssa.place(gpa, ir, cover);
     const t1 = std.Io.Timestamp.now(emit.zcu.io, .awake);
     var t2 = t1;
     defer {
@@ -223,7 +228,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.copy_private.deinit(gpa);
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
+        cg.cover_pcs.deinit(gpa);
     }
+    if (cover) cg.cover_key = Emit.coverageKeys(try emit.funcKey(ir.func))[0];
     @memset(cg.homes, .none);
     try cg.planRegisters();
     // Inline assembly may compute offsets in the code itself.
@@ -254,6 +261,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     }
     try cg.e.finishShortened();
     frame_patch = cg.e.mapOffset(@intCast(frame_patch));
+    for (cg.cover_pcs.items) |*pc| pc.* = cg.e.mapOffset(pc.*);
     for (cg.dbg_inlines.items) |*in| {
         in.low = cg.e.mapOffset(in.low);
         in.high = cg.e.mapOffset(in.high);
@@ -330,6 +338,28 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         // pushes `alloc_regs`' callee-saved ones in that order.
         .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else .{ .kind = .frame_pointer, .epilogue = epilogue_last, .saved = @intCast(cg.saved) },
     }, debug);
+    if (cover) try emit.addCoverage(try emit.funcKey(ir.func), cg.cover_pcs.items);
+}
+
+/// Whether `-ffuzz` instruments the function: not in compiler_rt or the
+/// fuzzer's own module family, not naked, and not after
+/// `@disableInstrumentation()` (docs/architecture.md, "Fuzzing").
+fn instrumented(emit: *Emit, ir: *const Ir) bool {
+    const ip = &emit.zcu.ip;
+    const func = ip.keyPayload(.func, ir.func);
+    if (ir.disable_instrumentation or ip.keyPayload(.func_type, func.ty).cc == .naked) return false;
+    const module = emit.zcu.file(ip.getNav(func.owner_nav).file).module;
+    return module != .compiler_rt and emit.zcu.fe.module(module).std_mod == .std;
+}
+
+/// A coverage point at the start of a covered block: its counter is set
+/// (`mov byte [rip + counters + i], 1`, which needs no register and
+/// leaves the flags), and its address joins the PC table. The entry's
+/// address is the function's own, as upstream's.
+fn coverPoint(cg: *CodeGen, entry: bool) Error!void {
+    const i: i32 = @intCast(cg.cover_pcs.items.len);
+    try cg.cover_pcs.append(cg.gpa, if (entry) 0 else @intCast(cg.e.code.items.len));
+    try cg.e.mov(.byte, .{ .mem = .sym(cg.cover_key, i) }, .{ .imm = 1 });
 }
 
 /// Starts the code of a call of `func` inlined at `site`, relative to the
@@ -1797,6 +1827,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
 
 fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!void {
     cg.e.bind(cg.labels[@backingInt(block)]);
+    if (cg.ssa.covered.items[@backingInt(block)]) try cg.coverPoint(block == cg.ssa.layout.items[0]);
     for (cg.ssa.blockInsts(block)) |inst| {
         if (cg.homes[@backingInt(inst)] != .dead) try cg.genInst(inst);
     }

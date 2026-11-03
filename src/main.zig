@@ -70,6 +70,9 @@ pub const Options = struct {
     stack_size: u64 = 16 * 1024 * 1024,
     /// `-fsingle-threaded`.
     single_threaded: bool = false,
+    /// `-ffuzz`: instrument the program for upstream's fuzzer and link it
+    /// (docs/architecture.md, "Fuzzing").
+    fuzz: bool = false,
     /// `-funwind-tables`, `-fasync-unwind-tables`, `-fno-unwind-tables`:
     /// only what `builtin.unwind_tables` says (Builtin.Options).
     unwind_tables: std.lang.UnwindTables = .async,
@@ -206,6 +209,8 @@ pub const Job = struct {
     zig_lib_dir: []const u8,
     cache_dirs: Frontend.CacheDirs,
     builtin_dir: []const u8,
+    /// The fuzzer's `builtin` (`-ffuzz` on an executable), else null.
+    fuzzer_builtin_dir: ?[]const u8,
     /// The command line that keys the compilation in the cache.
     compile_args: []const []const u8,
     stem: []const u8,
@@ -234,7 +239,22 @@ pub const Job = struct {
             .is_test = is_test,
             .single_threaded = opts.single_threaded,
             .unwind_tables = opts.unwind_tables,
+            .fuzz = opts.fuzz,
         });
+        // An executable that fuzzes links the fuzzer, whose module family
+        // has a builtin of its own, as upstream's separate compilation of
+        // it (a static library) does. As upstream's, a non-test executable
+        // fails to link: only the test runner provides the `runner_*`
+        // functions the fuzzer calls back.
+        const fuzzer_builtin_dir: ?[]const u8 = if (opts.fuzz and command != .build_obj and command != .build_lib)
+            try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), .{
+                .output_mode = .Lib,
+                .is_test = false,
+                .single_threaded = opts.single_threaded,
+                .unwind_tables = opts.unwind_tables,
+            })
+        else
+            null;
         // `--listen=-` does not change what is built, so it is not part
         // of the compilation's key (nor of its output's digest).
         var compile_args: std.ArrayList([]const u8) = .empty;
@@ -246,6 +266,7 @@ pub const Job = struct {
             .zig_lib_dir = zig_lib_dir,
             .cache_dirs = cache_dirs,
             .builtin_dir = builtin_dir,
+            .fuzzer_builtin_dir = fuzzer_builtin_dir,
             .compile_args = compile_args.items,
             .stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path),
             .run_test = is_test and !opts.test_no_exec and !opts.listen,
@@ -254,6 +275,12 @@ pub const Job = struct {
             .io = init_.io,
             .gpa = init_.gpa,
         };
+    }
+
+    /// The target as the cache keys it: instrumented atoms (`-ffuzz`)
+    /// differ from plain ones, so they get store entries of their own.
+    fn cacheTarget(job: *const Job) []const u8 {
+        return if (job.opts.fuzz) "x86_64-linux+fuzz" else "x86_64-linux";
     }
 
     fn zapLocal(job: *const Job, arena: std.mem.Allocator) []const u8 {
@@ -271,7 +298,7 @@ pub const Job = struct {
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
-        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, "x86_64-linux", env.get("ZAP_CACHE_TIMING") != null) catch |err| {
+        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.cacheTarget(), env.get("ZAP_CACHE_TIMING") != null) catch |err| {
             std.log.warn("unable to use the cache: {t}", .{err});
             return null;
         };
@@ -342,6 +369,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .main_src_path = if (is_test) opts.root_src_path else null,
         .root_deps = opts.root_deps,
         .modules = opts.modules,
+        .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
@@ -398,6 +426,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     defer emit.deinit();
     emit.obj = opts.command == .build_obj or opts.command == .build_lib;
     emit.stack_size = opts.stack_size;
+    emit.fuzz = opts.fuzz;
     // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
     // n more times (`zig build bench-codegen`).
     const bench_runs: u32 = if (env.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
@@ -598,7 +627,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     var out_path: ?[]const u8 = null;
     var docs_path: ?[]const u8 = null;
     if (job) |*j| {
-        _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, "x86_64-linux");
+        _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.cacheTarget());
         digest = Incremental.outputDigest(key);
         const name = try outputName(arena, opts.command, j.stem);
         out_path = switch (opts.emit_bin) {
@@ -905,7 +934,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fomit-frame-pointer", "zap always keeps frame pointers ('-fomit-frame-pointer'); remove '.omit_frame_pointer = true'" },
     .{ "-fno-error-tracing", "zap always has error return traces ('-fno-error-tracing'); remove '.error_tracing = false'" },
     .{ "-fsanitize-thread", "zap has no ThreadSanitizer ('-fsanitize-thread'); build this step with upstream zig" },
-    .{ "-ffuzz", "zap does not build fuzz tests ('-ffuzz'); build this step with upstream zig" },
     .{ "-fno-valgrind", "zap always emits Valgrind client requests ('-fno-valgrind'); remove '.valgrind = false'" },
     .{ "-dynamic", "zap links executables statically ('-dynamic'); build this step with upstream zig" },
     .{ "-femit-asm", "zap does not emit assembly ('-femit-asm')" },
@@ -994,6 +1022,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             opts.single_threaded = true;
         } else if (std.mem.eql(u8, arg, "-fno-single-threaded")) {
             opts.single_threaded = false;
+        } else if (std.mem.eql(u8, arg, "-ffuzz")) {
+            // Objects would need the coverage sections and their symbols.
+            if (command == .build_obj or command == .build_lib)
+                setUnsupported(&opts, arena, "zap does not instrument objects or libraries for fuzzing yet ('-ffuzz'); fuzz an executable or a test", .{});
+            opts.fuzz = true;
         } else if (std.mem.eql(u8, arg, "-funwind-tables")) {
             opts.unwind_tables = .sync;
         } else if (std.mem.eql(u8, arg, "-fasync-unwind-tables")) {

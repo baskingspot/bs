@@ -524,7 +524,7 @@ fn appendNote(zcu: *Zcu, note: ErrorMsg.Note) !void {
 
 fn diagLoc(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, file_index: u32, span: Ast.Span) !diag.Loc {
     const f = zcu.file(file_index);
-    return paths.loc(arena, f.display_path, try zcu.fe.source(@fromBackingInt(file_index)), span.start, span.main, span.end, f.module == .builtin);
+    return paths.loc(arena, f.display_path, try zcu.fe.source(@fromBackingInt(file_index)), span.start, span.main, span.end, f.module == zcu.fe.module(f.module).builtin_mod);
 }
 
 /// This compilation's errors as diagnostics: AstGen errors of files loaded
@@ -1035,9 +1035,17 @@ pub fn compilerRtExport(name: []const u8) ?RtExport {
 }
 
 /// The files analysis starts from: builtin, std (whose start code imports
-/// the root module) and, under `zap test`, the module under test.
-pub fn rootFiles(zcu: *Zcu) [3]?u32 {
-    return .{ 0, zcu.moduleRootFile(.std), zcu.moduleRootFile(zcu.fe.main_module) };
+/// the root module), under `zap test` the module under test, and with
+/// `-ffuzz` the fuzzer's root (for its exports) and its std.
+pub fn rootFiles(zcu: *Zcu) [5]?u32 {
+    const fuzzer = zcu.fe.fuzzer_root;
+    return .{
+        0,
+        zcu.moduleRootFile(.std),
+        zcu.moduleRootFile(zcu.fe.main_module),
+        if (fuzzer) |r| zcu.moduleRootFile(r) else null,
+        if (fuzzer) |r| zcu.moduleRootFile(zcu.fe.module(r).std_mod) else null,
+    };
 }
 
 fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {

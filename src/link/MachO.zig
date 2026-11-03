@@ -1337,6 +1337,9 @@ fn LinkOf(comptime Input: type) type {
                     .bss => bss,
                     .tdata => thread_data,
                     .tbss => thread_bss,
+                    // Coverage atoms come only from `-ffuzz`, which is
+                    // x86_64-linux only for now.
+                    .sancov_cntrs, .sancov_pcs => unreachable,
                 };
                 c.n_fixups[s] += n_abs;
                 var off = a.alignment.forward(c.sizes[s]);

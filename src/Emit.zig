@@ -61,6 +61,9 @@ entry: ?SymbolKey = null,
 obj: bool = false,
 /// `--stack`: the executable's main thread stack size.
 stack_size: u64 = 16 * 1024 * 1024,
+/// `-ffuzz`: CodeGen instruments the main module family's functions with
+/// coverage points (docs/architecture.md, "Fuzzing").
+fuzz: bool = false,
 /// In an object, the symbols other objects define, by name, and whether
 /// every reference is weak.
 imports: std.StringArrayHashMapUnmanaged(bool) = .empty,
@@ -342,6 +345,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
         w.* = .init(gpa, emit.zcu);
         w.is_worker = true;
         w.obj = emit.obj;
+        w.fuzz = emit.fuzz;
     }
     const pool = try gpa.create(Pool);
     pool.* = .{ .io = io, .workers = workers, .fuzz = fuzz };
@@ -645,6 +649,7 @@ pub fn benchCodegen(emit: *Emit, runs: u32) !void {
     for (0..runs) |_| {
         var e: Emit = .init(emit.gpa, emit.zcu);
         defer e.deinit();
+        e.fuzz = emit.fuzz;
         for (irs.items) |*ir| try e.generateFunction(ir);
         const s = e.codegen_stats;
         if (best == null or s.build_ns + s.alloc_ns + s.emit_ns < best.?.build_ns + best.?.alloc_ns + best.?.emit_ns) best = s;
@@ -848,7 +853,7 @@ fn lowerExternSlots(emit: *Emit) !bool {
     const arena = emit.allocator();
     var ok = true;
     for (emit.externs.keys(), emit.externs.values()) |name, weak| {
-        const target = if (emit.obj) try emit.userExport(name) orelse try emit.useImport(name, weak) else try emit.exportTarget(name);
+        const target = if (emit.obj) try emit.userExport(name) orelse try emit.useImport(name, weak) else sectionBound(name) orelse try emit.exportTarget(name);
         if (target == null and !weak) {
             try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
             ok = false;
@@ -869,6 +874,16 @@ fn lowerExternSlots(emit: *Emit) !bool {
         });
     }
     return ok;
+}
+
+/// The section bound the linker defines as `name` (`__start___sancov_cntrs`
+/// and the others), which an executable's `@extern` reaches.
+fn sectionBound(name: []const u8) ?SymbolKey {
+    inline for (.{ .{ Atom.Section.sancov_cntrs, "__sancov_cntrs" }, .{ Atom.Section.sancov_pcs, "__sancov_pcs1" } }) |s| {
+        if (std.mem.eql(u8, name, "__start_" ++ s[1])) return .sectionBound(s[0], .start);
+        if (std.mem.eql(u8, name, "__stop_" ++ s[1])) return .sectionBound(s[0], .stop);
+    }
+    return null;
 }
 
 /// The symbol exported as `name`, or null if there is none. In an object,
@@ -1045,6 +1060,41 @@ pub fn addFunction(emit: *Emit, atom: Atom, debug: Atom.Debug) !void {
     d.atom = @intCast(emit.atoms.items.len);
     try emit.addAtom(atom);
     emit.debug.appendAssumeCapacity(d);
+}
+
+/// The keys of function `func`'s coverage counters and PC table
+/// (`-ffuzz`).
+pub fn coverageKeys(func: SymbolKey) [2]SymbolKey {
+    var buf: [40]u8 = undefined;
+    const k = std.mem.asBytes(&func);
+    return .{
+        .fromName(std.fmt.bufPrint(&buf, "cntrs.{x}", .{k}) catch unreachable),
+        .fromName(std.fmt.bufPrint(&buf, "pcs.{x}", .{k}) catch unreachable),
+    };
+}
+
+/// Adds the coverage atoms of function `func`, whose coverage points are
+/// at code offsets `pcs`: a counter per point (`sancov_cntrs`), and its
+/// address (`sancov_pcs`). Added together, so that the linker, which keeps
+/// each section's atoms in input order, lines the arrays up.
+pub fn addCoverage(emit: *Emit, func: SymbolKey, pcs: []const u32) !void {
+    if (pcs.len == 0) return;
+    const keys = coverageKeys(func);
+    const arena = emit.allocator();
+    const bytes = try arena.alloc(u8, 8 * pcs.len);
+    @memset(bytes, 0);
+    const relocs = try arena.alloc(Atom.Reloc, pcs.len);
+    for (relocs, pcs, 0..) |*r, pc, i| r.* = .init(@intCast(8 * i), .x86_64_abs64, 0, @intCast(pc));
+    try emit.addAtom(.{ .key = keys[0], .name = "", .section = .sancov_cntrs, .zero_fill = pcs.len });
+    try emit.addAtom(.{
+        .key = keys[1],
+        .name = "",
+        .section = .sancov_pcs,
+        .alignment = .@"8",
+        .bytes = bytes,
+        .targets = try arena.dupe(SymbolKey, &.{func}),
+        .relocs = relocs,
+    });
 }
 
 /// Adds a content-addressed rodata atom for `bytes` and its sorted `relocs`

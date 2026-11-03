@@ -21,3 +21,14 @@ test "greet" {
 test "unwind tables" {
     try std.testing.expectEqual(.sync, @import("builtin").unwind_tables);
 }
+
+// `zap build test --fuzz` finds the planted crash (check.sh).
+test "fuzz" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [8]u8 = undefined;
+            const n = smith.slice(&buf);
+            if (n >= 3 and buf[0] == 'z' and buf[1] == 'a' and buf[2] == 'p') @panic("planted crash");
+        }
+    }.testOne, .{});
+}
