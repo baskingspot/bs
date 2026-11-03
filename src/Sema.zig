@@ -8375,8 +8375,9 @@ fn zirBitCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
 /// integer, a float, or an array of them without padding bits.
 fn bitCastBits(sema: *Sema, ty: Index) ?u64 {
     const ip = sema.ip;
+    // Covers `usize` and the other named integer types too.
+    if (Type.isInt(ip, ty)) return Type.intInfo(ip, ty).bits;
     return switch (ip.indexToKey(ty)) {
-        .int_type => |info| info.bits,
         .array_type => |a| blk: {
             if (a.sentinel != .none) break :blk null;
             const eb = sema.bitCastBits(a.child) orelse break :blk null;
