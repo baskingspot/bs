@@ -3987,13 +3987,14 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
             const ty = try sema.castDestType(block, src, extra.lhs, true);
+            const operand_src = sema.callArgSrc(src, false, 0);
             if (tag == .from_backing_int and Type.isPacked(sema.ip, ty)) {
                 try sema.resolveLayout(block, src, ty);
-                const int = try sema.coerce(block, sema.ip.structInfo(ty).tag_type, sema.resolveInst(extra.rhs), src);
+                const int = try sema.coerce(block, sema.ip.structInfo(ty).tag_type, sema.resolveInst(extra.rhs), operand_src);
                 break :blk sema.reinterpretBits(block, src, ty, int);
             }
             if (Type.class(sema.ip, ty) != .@"enum") return sema.fail(block, src, "expected enum, found '{f}'", .{sema.fmtType(ty)});
-            break :blk sema.enumFromInt(block, src, ty, sema.resolveInst(extra.rhs));
+            break :blk sema.enumFromInt(block, src, operand_src, ty, sema.resolveInst(extra.rhs), tag == .enum_from_int);
         },
         .tag_name => sema.zirTagName(block, inst),
         .type_name => blk: {
@@ -7019,17 +7020,23 @@ fn enumTagIndex(sema: *Sema, val: Index) ?u32 {
     return null;
 }
 
-fn enumFromInt(sema: *Sema, block: *Block, src: Src, ty: Index, uncasted: Ref) CompileError!Ref {
+/// `@enumFromInt` (`any_int`) or `@fromBackingInt` (the operand coerces to
+/// the tag type) of `uncasted` at `operand_src`.
+fn enumFromInt(sema: *Sema, block: *Block, src: Src, operand_src: Src, ty: Index, uncasted: Ref, any_int: bool) CompileError!Ref {
     const ip = sema.ip;
     try sema.resolveLayout(block, src, ty);
     const info = ip.structInfo(ty);
     const int_ty = info.tag_type;
-    // Any integer converts, as upstream: a value out of the tag type's
-    // range is an invalid enum value, like one that names no tag.
+    if (sema.resolveValue(uncasted)) |v| if (sema.isUndef(v))
+        return sema.fail(block, operand_src, "use of undefined value here causes illegal behavior", .{});
     const uncasted_ty = sema.typeOf(uncasted);
-    const operand = if (Type.isInt(ip, uncasted_ty) and uncasted_ty != int_ty) operand: {
+    // An enum with no tags has none for any integer.
+    if (any_int and info.field_defaults.len == 0 and !info.nonexhaustive and (Type.isInt(ip, uncasted_ty) or uncasted_ty == .comptime_int_type)) if (sema.resolveValue(uncasted)) |v|
+        return sema.fail(block, src, "enum '{f}' has no tag with value '{f}'", .{ sema.fmtType(ty), sema.fmtValue(v) });
+    // `@enumFromInt` converts any integer, as upstream: a value out of the
+    // tag type's range is an invalid enum value, like one that names no tag.
+    const operand = if (any_int and (Type.isInt(ip, uncasted_ty) or uncasted_ty == .comptime_int_type) and uncasted_ty != int_ty) operand: {
         if (sema.resolveValue(uncasted)) |v| {
-            if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(ty));
             if (!sema.intFits(v, int_ty)) return if (info.nonexhaustive)
                 sema.failCode(block, src, .@"lossy-conversion", "int value '{f}' out of range of non-exhaustive enum '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) })
             else
@@ -7039,9 +7046,8 @@ fn enumFromInt(sema: *Sema, block: *Block, src: Src, ty: Index, uncasted: Ref) C
         try sema.requireRuntime(block, src);
         if (block.want_safety) try sema.intRangeCheck(block, uncasted, int_ty, .invalid_enum_value);
         break :operand try sema.addTyOp(block, .intcast, int_ty, uncasted);
-    } else try sema.coerce(block, int_ty, uncasted, src);
+    } else try sema.coerce(block, int_ty, uncasted, operand_src);
     if (sema.resolveValue(operand)) |v| {
-        if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(ty));
         const val = try sema.intern(.{ .enum_tag = .{ .ty = ty, .int = v } });
         if (!info.nonexhaustive and sema.enumTagIndex(val) == null)
             return sema.fail(block, src, "enum '{f}' has no tag with value '{f}'", .{ sema.fmtType(ty), sema.fmtValue(v) });
