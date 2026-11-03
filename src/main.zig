@@ -27,6 +27,7 @@ const usage =
     \\  run              Create executable and run immediately
     \\  test             Perform unit testing
     \\  fmt              Reformat Zig source into canonical form
+    \\  ast-check        Look for simple compile errors in any set of files
     \\  env              Print lib path, std path, cache directory, and version
     \\  version          Print the Zig version zap compiles
     \\  help             Print this help and exit
@@ -118,6 +119,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     } else if (std.mem.eql(u8, cmd, "fmt")) {
         return @import("fmt.zig").run(init.gpa, arena, init.io, raw_args[2..]);
+    } else if (std.mem.eql(u8, cmd, "ast-check")) {
+        return @import("ast_check.zig").run(arena, init.io, raw_args[2..]);
     } else if (std.mem.eql(u8, cmd, "env")) {
         return printEnv(init);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {

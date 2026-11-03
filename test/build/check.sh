@@ -40,6 +40,9 @@ tar tf zig-out/docs/sources.tar | grep -qx test/main.zig || fail "sources.tar ho
 
 # `zap env` for tools that ask the compiler (zls's tests).
 "$zap" env | grep -q '\.lib_dir = ' || fail "zap env prints .lib_dir"
+# `zap ast-check` on stdin, as zls runs it for unused-variable fixes.
+printf 'fn f() void {\n    const y = 1;\n}\n' | "$zap" ast-check --color off 2>"$work/log" && fail "zap ast-check fails on an unused constant"
+expect "<stdin>:2:11: error: unused local constant"
 
 # An edit: the output changes in place.
 sed -i 's/"hello"/"howdy"/' src/greet.zig
