@@ -4839,6 +4839,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             break :blk .fromInterned(try sema.intern(.{ .opt = .{ .ty = opt_ty, .val = .none } }));
         },
         .builtin_src => sema.zirBuiltinSrc(block, ext),
+        .compile_log => sema.zirCompileLog(block, ext),
         else => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
     };
 }
@@ -15036,6 +15037,29 @@ fn ensureResultUsed(sema: *Sema, block: *Block, src: Src, ty: Index) CompileErro
             return err;
         },
     }
+}
+
+/// `@compileLog(args)`: one output line, `@as(T, v)` for each argument,
+/// as upstream. The build fails once analysis ends (`Zcu.failed`).
+fn zirCompileLog(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) CompileError!Ref {
+    // A side effect the comptime evaluator does not replay.
+    try sema.bcRefuse();
+    const extra = sema.code.extraData(Zir.Inst.NodeMultiOp, ext.operand);
+    const args = sema.code.refSlice(extra.end, ext.small);
+    const zcu = sema.zcu;
+    var aw: std.Io.Writer.Allocating = .init(zcu.arena.allocator());
+    const w = &aw.writer;
+    for (args, 0..) |a, i| {
+        const arg = sema.resolveInst(a);
+        (if (i != 0) w.writeAll(", ") else {}) catch return error.OutOfMemory;
+        (if (sema.resolveValue(arg)) |v|
+            w.print("@as({f}, {f})", .{ sema.fmtType(sema.typeOf(arg)), sema.fmtValue(v) })
+        else
+            w.print("@as({f}, [runtime value])", .{sema.fmtType(sema.typeOf(arg))})) catch return error.OutOfMemory;
+    }
+    const tree = try zcu.fe.tree(@fromBackingInt(sema.file));
+    try zcu.compile_logs.append(zcu.gpa, .{ .unit = sema.owner, .file = sema.file, .span = block.nodeSrc(extra.data.src_node).span(tree), .text = aw.written() });
+    return .void_value;
 }
 
 /// `_ = x;` where `x` is an error, as upstream.

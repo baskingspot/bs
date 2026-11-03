@@ -89,6 +89,7 @@ pub const Code = enum(u16) {
     @"caught-error",
     @"comptime-trap",
     @"compile-error",
+    @"compile-log",
     @"undefined-symbol",
 };
 
@@ -142,6 +143,9 @@ pub const Diagnostic = struct {
     /// (`migrationHint`, `builtinHint`).
     hint: ?[]const u8 = null,
     fixes: []const Fix = &.{},
+    /// `@compileLog` output lines, on the compile-log error or else the
+    /// last error; the renderers print them together after the errors.
+    log: []const []const u8 = &.{},
 };
 
 /// How safely a fix applies (rustc's applicability).
@@ -661,10 +665,18 @@ pub fn render(w: *Writer, diags: []const Diagnostic, format: Format) Writer.Erro
     switch (format) {
         .text => {
             for (diags) |d| try renderText(w, d);
+            for (diags) |d| if (d.log.len != 0) {
+                try w.writeAll("Compile Log Output:\n");
+                for (d.log) |l| try w.print("{s}\n", .{l});
+            };
             try w.print("{d} error{s}\n", .{ diags.len, if (diags.len == 1) "" else "s" });
         },
         .json => {
             for (diags) |d| try renderJson(w, d);
+            for (diags) |d| if (d.log.len != 0) {
+                try std.json.Stringify.value(.{ .compile_log = d.log }, .{}, w);
+                try w.writeByte('\n');
+            };
             try w.print("{{\"summary\":{{\"errors\":{d}}}}}\n", .{diags.len});
         },
     }

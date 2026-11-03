@@ -525,7 +525,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         var sink: DumpSink = .{ .w = &stdout.interface };
         try zcu.analyzeAll(&sink);
         try stdout.interface.flush();
-        if (zcu.errors.items.len != 0) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
+        if (zcu.failed()) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
         return .{ .ok = .{ .cache_hit = false } };
     }
     var emit: Emit = .init(init.gpa, &zcu);
@@ -598,13 +598,13 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         error.OutOfMemory => return error.OutOfMemory,
         else => {},
     };
-    if (zcu.errors.items.len != 0) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
+    if (zcu.failed()) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
     const bin_path = out_path orelse return .{ .ok = .{ .cache_hit = false } };
     const link_node = prog.start("Link", 0);
     defer link_node.end();
     const ready = try emit.finish();
     stages.mark("emit");
-    if (zcu.errors.items.len != 0) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
+    if (zcu.failed()) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
     if (!ready) return .failed;
     // The cache records the build while it links, and keeps the record
     // only if the link succeeds.
@@ -730,6 +730,9 @@ fn dupeDiagnostics(arena: std.mem.Allocator, diags: []const diag.Diagnostic) ![]
             f.edits = edits;
         }
         d.fixes = fixes;
+        const log = try arena.dupe([]const u8, d.log);
+        for (log) |*l| l.* = try arena.dupe(u8, l.*);
+        d.log = log;
     }
     return out;
 }
@@ -868,7 +871,13 @@ fn serveErrors(server: *std.zig.Server, gpa: std.mem.Allocator, diags: []const d
     var wip: std.zig.ErrorBundle.Wip = try .init(gpa);
     defer wip.deinit();
     try diag.toBundle(&wip, diags, ref_limit);
-    var bundle = try wip.toOwnedBundle("");
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(gpa);
+    for (diags) |d| for (d.log) |l| {
+        try log.appendSlice(gpa, l);
+        try log.append(gpa, '\n');
+    };
+    var bundle = try wip.toOwnedBundle(log.items);
     defer bundle.deinit(gpa);
     try server.serveErrorBundle(.error_bundle, bundle);
 }

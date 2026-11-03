@@ -138,6 +138,9 @@ test_filters: []const []const u8 = &.{},
 /// Test declarations to run, in discovery order.
 test_functions: std.ArrayList(InternPool.NavIndex) = .empty,
 errors: std.ArrayList(ErrorMsg) = .empty,
+/// `@compileLog` lines in analysis order (`Sema.zirCompileLog`). Like an
+/// error, any fails the build.
+compile_logs: std.ArrayList(CompileLog) = .empty,
 /// Which units' analysis evaluated a container declaration or `@import`
 /// whose namespace has `effects` (`Sema.createContainerType`). The cache
 /// makes an edit build analyze such a unit again rather than load it,
@@ -485,6 +488,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.rt_helpers.deinit(gpa);
     zcu.test_functions.deinit(gpa);
     zcu.errors.deinit(gpa);
+    zcu.compile_logs.deinit(gpa);
     zcu.file_root_types.deinit(gpa);
     zcu.ip.deinit();
     zcu.arena.deinit();
@@ -631,7 +635,7 @@ pub fn failed(zcu: *const Zcu) bool {
 }
 
 /// This compilation's errors as diagnostics: AstGen errors of files loaded
-/// during analysis first, then Sema's.
+/// during analysis first, then Sema's, then `@compileLog`'s.
 pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag.Diagnostic {
     var out: std.ArrayList(diag.Diagnostic) = .empty;
     for (zcu.fe.late_errors.items) |b| try diag.fromBundle(arena, paths, b, &out);
@@ -654,7 +658,64 @@ pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag
             &.{};
         try out.append(arena, .{ .code = e.code, .loc = try zcu.diagLocIn(arena, paths, e.file, e.embed, e.span), .msg = e.msg, .notes = notes, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint, .fixes = fixes });
     }
+    if (zcu.compile_logs.items.len != 0) try zcu.compileLogDiagnostics(arena, paths, &out);
     return out.items;
+}
+
+/// `@compileLog`'s output, as upstream: each logging unit's lines
+/// together, units in source order (the first call of each). With no
+/// other error, it is the error "found compile log statement" at the first
+/// unit's first call, the others' as "also here" notes; else the output
+/// rides on the last error.
+fn compileLogDiagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, out: *std.ArrayList(diag.Diagnostic)) !void {
+    // The first log of each unit, in order of appearance.
+    var firsts: std.ArrayList(usize) = .empty;
+    for (zcu.compile_logs.items, 0..) |l, i| {
+        for (firsts.items) |f| {
+            if (std.meta.eql(zcu.compile_logs.items[f].unit, l.unit)) break;
+        } else try firsts.append(arena, i);
+    }
+    const Ctx = struct {
+        zcu: *const Zcu,
+        fn lessThan(c: @This(), a: usize, b: usize) bool {
+            const la = c.zcu.compile_logs.items[a];
+            const lb = c.zcu.compile_logs.items[b];
+            const order = std.mem.order(u8, c.zcu.file(la.file).display_path, c.zcu.file(lb.file).display_path);
+            return order == .lt or (order == .eq and la.span.start < lb.span.start);
+        }
+    };
+    std.mem.sort(usize, firsts.items, Ctx{ .zcu = zcu }, Ctx.lessThan);
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (firsts.items) |f| {
+        const unit = zcu.compile_logs.items[f].unit;
+        for (zcu.compile_logs.items) |l| if (std.meta.eql(l.unit, unit)) try lines.append(arena, l.text);
+    }
+    if (out.items.len != 0) {
+        out.items[out.items.len - 1].log = lines.items;
+        return;
+    }
+    const first = zcu.compile_logs.items[firsts.items[0]];
+    // One note per other logging unit; units logging at the same place in
+    // a row (instantiations of one function) share a note with a count.
+    var notes: std.ArrayList(diag.Note) = .empty;
+    var prev = first;
+    for (firsts.items[1..]) |f| {
+        const l = zcu.compile_logs.items[f];
+        if (notes.items.len != 0 and l.file == prev.file and l.span.start == prev.span.start) {
+            notes.items[notes.items.len - 1].count += 1;
+        } else {
+            try notes.append(arena, .{ .loc = try zcu.diagLoc(arena, paths, l.file, l.span), .msg = "also here" });
+        }
+        prev = l;
+    }
+    try out.append(arena, .{
+        .code = .@"compile-log",
+        .loc = try zcu.diagLoc(arena, paths, first.file, first.span),
+        .msg = "found compile log statement",
+        .notes = notes.items,
+        .refs = try zcu.referenceTrace(arena, paths, first.unit),
+        .log = lines.items,
+    });
 }
 
 /// The chain of first references that led analysis to `unit`, nearest

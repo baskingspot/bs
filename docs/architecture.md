@@ -5805,6 +5805,13 @@ ignore unknown keys.
 renderers. Sema keeps recording `Zcu.ErrorMsg` (file, absolute
 `Ast.Span`, message, notes), which gains a `code`, and notes gain `call`,
 which marks a call-site frame (`Zcu.addCallFrame`, from `noteCallSite`).
+An error or note with `embed` set is located in an embedded file (an
+imported ZON file) instead of a frontend file. `@compileLog` output is
+`Zcu.compile_logs`, one line per call with its unit; it fails the build
+like an error (`Zcu.failed`) and renders after the diagnostics as
+upstream's "Compile Log Output:" block (`Diagnostic.log`), with a "found
+compile log statement" error and an "also here" note per other logging
+unit when nothing else failed.
 At the end, `Zcu.diagnostics` resolves every error, AstGen's included
 (`diag.fromBundle`), into the record that is rendered:
 
@@ -5819,6 +5826,7 @@ pub const Diagnostic = struct {
     candidates: []const []const u8 = &.{},
     hint: ?[]const u8 = null,
     fixes: []const Fix = &.{},
+    log: []const []const u8 = &.{}, // compile log lines, after the diagnostics
     // Later: instances.
 };
 pub const Loc = struct {
