@@ -8002,7 +8002,10 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         // The sliced object's sentinel may be included, and a slice sentinel
         // must be within the object.
         const len_s = if (ptr_sentinel == .none) len else try sema.analyzeArithmetic(block, src, .add, len, .fromInterned(.one_usize));
-        const end_s = if (slice_sentinel == .none) end else try sema.analyzeArithmetic(block, src, .add, end, .fromInterned(.one_usize));
+        // As upstream, comptime-known bounds only need `end` within the
+        // object; the sentinel check then reads the containing memory.
+        const both_known = sema.resolveValue(end) != null and sema.resolveValue(len) != null;
+        const end_s = if (slice_sentinel == .none or both_known) end else try sema.analyzeArithmetic(block, src, .add, end, .fromInterned(.one_usize));
         try sema.boundsCheck(block, src, end_s, len_s, true);
     }
     const start_val = sema.resolveValue(start);
