@@ -27,7 +27,6 @@ const atoms_codec = cache.atoms;
 const Hash = cache.Hash;
 const Frontend = @import("Frontend.zig");
 const InternPool = @import("InternPool.zig");
-const Type = @import("Type.zig");
 const Zcu = @import("Zcu.zig");
 const Emit = @import("Emit.zig");
 const Atom = @import("link/Atom.zig");
@@ -59,8 +58,10 @@ prev: ?Manifest = null,
 /// `ZAP_CACHE_TIMING`: print where the cache's time goes.
 timing: bool,
 /// `ZAP_CACHE_CHECK`: check that the last manifest's reverse edges predict
-/// every result this build changed.
+/// every result this build changed, and that the recorded references
+/// reach every function. A gap fails the build (`finishRecord`).
 check: bool = false,
+check_failed: std.atomic.Value(bool) = .init(false),
 /// The recording `startRecord` runs while the build links.
 recording: ?Io.Future(anyerror!Recorded) = null,
 
@@ -407,24 +408,12 @@ const Recorder = struct {
     /// most of recording the graph, and only reads the Zcu.
     fn prepare(r: *Recorder, io: Io) !void {
         const gpa = r.gpa;
-        // `isComptimeOnly` caches its answers in the types, so it runs here,
-        // on one thread, before the layouts are hashed on every core.
-        const comptime_only = try gpa.alloc(bool, r.unit_list.items.len);
-        defer gpa.free(comptime_only);
-        for (r.unit_list.items, comptime_only) |u, *c| c.* = switch (u) {
-            .type_layout => |ty| switch (r.zcu.ip.indexToKey(ty)) {
-                .struct_type, .union_type => r.zcu.ip.structInfo(ty).status == .have_layout and Type.isComptimeOnly(&r.zcu.ip, ty),
-                else => false,
-            },
-            else => false,
-        };
         r.unit_info = try gpa.alloc(Info, r.unit_list.items.len);
         @memset(r.unit_info, .{});
         r.dependee_info = try gpa.alloc(Info, r.dependee_list.items.len);
         @memset(r.dependee_info, .{});
         try forChunks(io, r.unit_list.items.len + r.dependee_list.items.len, struct {
             r: *const Recorder,
-            comptime_only: []const bool,
 
             fn run(c: @This(), lo: usize, hi: usize, _: usize) !void {
                 var k: Keyer = .{ .zcu = c.r.zcu, .key_buf = .init(c.r.gpa), .unit_buf = .init(c.r.gpa) };
@@ -433,12 +422,12 @@ const Recorder = struct {
                 const n_units = c.r.unit_list.items.len;
                 for (lo..hi) |i| {
                     if (i < n_units)
-                        c.r.unit_info[i] = try k.unitInfo(c.r.unit_list.items[i], c.comptime_only[i])
+                        c.r.unit_info[i] = try k.unitInfo(c.r.unit_list.items[i])
                     else
                         c.r.dependee_info[i - n_units] = try k.dependeeInfo(c.r.dependee_list.items[i - n_units]);
                 }
             }
-        }{ .r = r, .comptime_only = comptime_only });
+        }{ .r = r });
     }
 
     /// The node of unit `i` (an index in `unit_list`).
@@ -573,8 +562,7 @@ const Keyer = struct {
         return @bitCast(h);
     }
 
-    /// `comptime_only`: whether a `type_layout` unit's type is.
-    fn unitInfo(k: *Keyer, unit: Zcu.AnalUnit, comptime_only: bool) !Recorder.Info {
+    fn unitInfo(k: *Keyer, unit: Zcu.AnalUnit) !Recorder.Info {
         const ip = &k.zcu.ip;
         var info: Recorder.Info = .{ .key = try k.keyOf(Recorder.unitTag(unit), &.{try k.unitKeyString(unit)}) };
         switch (unit) {
@@ -586,7 +574,7 @@ const Keyer = struct {
             .type_layout => |ty| {
                 const c = ip.containerType(ty).?;
                 info.src_hash = k.srcHash(c.file, c.zir_inst);
-                info.result_hash = layoutResultHash(ip, ty, comptime_only);
+                info.result_hash = layoutResultHash(ip, ty);
             },
             .func => |func| {
                 const owner = ip.getNav(ip.indexToKey(func).func.owner_nav);
@@ -664,7 +652,7 @@ fn navResultHash(ip: *const InternPool, nav: *const InternPool.Nav) Hash {
 /// type gaining a `type` field can leave sizes and offsets alone. Before
 /// the layout is known (an opaque type, a failed one), the type's
 /// identity.
-fn layoutResultHash(ip: *const InternPool, ty: InternPool.Index, comptime_only: bool) Hash {
+fn layoutResultHash(ip: *const InternPool, ty: InternPool.Index) Hash {
     const id = ip.stableHash(ty);
     const kind = std.meta.activeTag(ip.indexToKey(ty));
     if (kind == .opaque_type) return id;
@@ -691,7 +679,10 @@ fn layoutResultHash(ip: *const InternPool, ty: InternPool.Index, comptime_only: 
     Helper.index(&h, ip, info.tag_type);
     h.update(std.mem.asBytes(&info.size));
     h.update(std.mem.asBytes(&info.alignment));
-    h.update(&.{@intFromBool(comptime_only)});
+    // Sema sets it when a struct's or union's layout resolves; enums and
+    // the rest are never comptime-only.
+    if (kind == .struct_type or kind == .union_type) std.debug.assert(info.comptime_only == .yes or info.comptime_only == .no);
+    h.update(&.{@intFromBool(info.comptime_only == .yes)});
     const lo = h.final();
     return @as(Hash, id >> 64 ^ lo) << 64 | lo;
 }
@@ -720,6 +711,13 @@ fn finishRecordFallible(inc: *Incremental, linked: bool) !void {
     const t0 = now(inc.io);
     var r = try inc.recording.?.await(inc.io);
     inc.recording = null;
+    if (inc.check_failed.load(.monotonic)) {
+        // Loudly, so that a conformance run with the check on cannot hide
+        // a gap; the gaps are printed above.
+        r.discard(inc);
+        std.debug.print("error: ZAP_CACHE_CHECK found gaps in the recorded dependencies or references\n", .{});
+        std.process.exit(1);
+    }
     const waited = ms(t0, now(inc.io));
     if (!linked) return r.discard(inc);
     defer r.discard(inc);
@@ -1048,7 +1046,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         }
         _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps, .atoms = refs.items, .symbols = symbols.items, .refs = refs_of.items });
     }
-    if (inc.check) checkReferences(gpa, &r, root_items.items, &b);
+    if (inc.check and !checkReferences(gpa, &r, root_items.items, &b)) inc.check_failed.store(true, .monotonic);
     for (base_names.items) |name| _ = try b.addBasePack(name);
     b.entry = @backingInt(emit.entry.?);
     for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
@@ -1320,6 +1318,7 @@ fn checkPrediction(inc: *Incremental, r: *const Recorder) void {
             std.debug.print("cache check:   {t} {x} {s}\n", .{ @as(Tag, @fromBackingInt(@intCast(dn.tag))), dn.key, name.written() });
         }
     }
+    if (missed != 0) inc.check_failed.store(true, .monotonic);
     std.debug.print("cache check: {d} nodes ({d} new); {d} seeds reach {d}; {d} results changed, {d} missed\n", .{
         nodes.len, added, seeds, seen.count(), changed, missed,
     });
@@ -1330,9 +1329,9 @@ fn checkPrediction(inc: *Incremental, r: *const Recorder) void {
 /// dependencies and references. A build that loads units from the cache
 /// queues functions only along references, so a function this misses
 /// would drop out of an edit build.
-fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *const Manifest.Builder) void {
+fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *const Manifest.Builder) bool {
     const nodes = r.nodes.items;
-    var seen = std.DynamicBitSetUnmanaged.initEmpty(gpa, nodes.len) catch return;
+    var seen = std.DynamicBitSetUnmanaged.initEmpty(gpa, nodes.len) catch return true;
     defer seen.deinit(gpa);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
@@ -1341,7 +1340,7 @@ fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *c
     defer k.unit_buf.deinit();
     for (roots) |n| if (!seen.isSet(n)) {
         seen.set(n);
-        stack.append(gpa, n) catch return;
+        stack.append(gpa, n) catch return true;
     };
     while (stack.pop()) |n| {
         const range = b.ref_ranges.items[n];
@@ -1351,19 +1350,19 @@ fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *c
         // inferred error set, which analyzes and emits its body: the
         // `func_ies` dependee's edge to it. A green unit loaded from the
         // cache reaches it the same way, through `ensureFuncIes`.
-        for (nodes[n].deps) |d| if (nodes[d].tag != .func or nodes[n].tag == .func_ies) next.append(gpa, d) catch return;
+        for (nodes[n].deps) |d| if (nodes[d].tag != .func or nodes[n].tag == .func_ies) next.append(gpa, d) catch return true;
         for (b.refs.items[range[0]..][0..range[1]]) |ref| switch (ref.kind) {
-            .func, .nav => next.append(gpa, ref.value) catch return,
+            .func, .nav => next.append(gpa, ref.value) catch return true,
             .rt => {
                 const name = b.strings.items[b.ref_names.items[ref.value].off..][0..b.ref_names.items[ref.value].len];
-                const key = k.keyOf(.func, &.{name}) catch return;
-                if (r.map.get(key)) |f| next.append(gpa, f) catch return;
+                const key = k.keyOf(.func, &.{name}) catch return true;
+                if (r.map.get(key)) |f| next.append(gpa, f) catch return true;
             },
             else => {},
         };
         for (next.items) |d| if (!seen.isSet(d)) {
             seen.set(d);
-            stack.append(gpa, d) catch return;
+            stack.append(gpa, d) catch return true;
         };
     }
     var funcs: usize = 0;
@@ -1383,6 +1382,7 @@ fn checkReferences(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *c
         std.debug.print("cache check: function {s} is not reached by references\n", .{name.written()});
     }
     std.debug.print("cache check: references reach {d} of {d} functions\n", .{ funcs - missed, funcs });
+    return missed == 0;
 }
 
 /// Everything the linker emits for an atom but its name and key, like

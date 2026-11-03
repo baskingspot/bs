@@ -1233,9 +1233,9 @@ a parameter is comptime-only decides how the function is called. So
 `nav_val`'s result hash adds
 `is_const`, `is_threadlocal`, `linkage`, and `alignment` to the value's
 stable hash, since dependents read those too. `record` reads
-`comptime_only` from the types; `isComptimeOnly` still caches answers
-for types that have field types but no layout yet, so record keeps
-reading it on one thread.
+`comptime_only` from the types, on every core: Sema has set it for every
+struct and union at `have_layout` (debug-asserted), so reading it writes
+nothing.
 
 **Debug info of green functions.** `src_hash` ignores a declaration's
 line, so lines added above a green function move its `base_line`
