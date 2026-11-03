@@ -8562,7 +8562,12 @@ fn unionFieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, i: u32, initial
     const union_ty = Type.ptrInfo(ip, sema.typeOf(ptr)).child;
     const info = ip.structInfo(union_ty);
     const field_ty = info.field_types[i];
-    if (sema.resolveValue(ptr)) |pv| if (try sema.comptimePtrRoot(pv) != .int) {
+    // A runtime variable's union gets its tag set and checked at runtime.
+    const runtime_var = if (sema.resolveValue(ptr)) |pv| ip.indexToKey(pv) == .ptr and !block.is_comptime and switch (sema.ptrRootBase(ip.indexToKey(pv).ptr)) {
+        .nav => |n| !ip.getNav(n).is_const,
+        else => false,
+    } else false;
+    if (sema.resolveValue(ptr)) |pv| if (!runtime_var and try sema.comptimePtrRoot(pv) != .int) {
         if (!initializing and info.layout != .@"packed") if (try sema.comptimeLoadOrNull(block, src, pv)) |uv| if (ip.indexToKey(uv) == .un) {
             const active = ip.indexToKey(uv).un.tag;
             if (active != try sema.unionFieldTagValue(union_ty, i)) {
