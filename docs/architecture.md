@@ -1359,8 +1359,8 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    same session: fib 123 → 118 ms, sieve 268 → 137, sort 370 → 291,
    hash 239 → 239, nbody 405–410 → 407–449 (noise), fmt 134 → 114.
    Still to come: renaming (a variable in different registers on
-   different paths), floats in registers, and copy elision for larger
-   aggregates.
+   different paths), floats in registers (below), and copy elision for
+   larger aggregates.
    Division, after it: unsigned division by a constant divides without
    `div` (a shift and mask for a power of two; else a multiply by a magic
    number, Granlund and Montgomery 1994, with the add-and-halve fixup when
@@ -1377,6 +1377,29 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    benchmarks within noise; libvaxis 5.02 → 5.03 code bytes per IR
    instruction and CodeGen ns per IR instruction within noise; std's
    tests the same wall time, binary +8 KB.
+   Floats in registers, after it: f32 and f64 are a third register class
+   (`want_float`; `Ssa.allocate` takes `n_float` registers numbered after
+   the general ones, and `plan` promotes variables of `ctx.inFloat`
+   types). On x86_64 the class is xmm8–xmm15: lowerings use xmm0 and xmm1
+   as scratch and calls pass arguments in xmm0–xmm7, so homes never
+   overlap either, and since every XMM register is caller-saved, only a
+   value whose interval crosses no clobber point gets one (no `.auto`
+   callee-saved XMM registers yet). In registers: arithmetic, min/max,
+   negation and `@abs` (a sign mask), `@sqrt`, f32↔f64 casts,
+   integer-to-float conversions, loads, field and element reads, `.auto`
+   arguments, call results, block results, and promoted variables. The
+   ordered comparisons (`<`, `<=`, `>`, `>=`) fuse into their branch
+   (`ucomis` and `a`/`ae`, with the operands swapped for `<` and `<=`,
+   so NaN is false); `==` and `!=` need two flags and give a bool in a
+   register. A float operation is no longer a clobber point, and neither
+   is a float `ret`. Other code reads a float in a register from a
+   spill slot written at the read (`spillXmm`), or through `movq`.
+   Against main 8d05200: nbody 421–448 → 312–313 ms, the other
+   benchmarks within noise (`bench/runtime.py`, two interleaved runs);
+   libvaxis code bytes per IR instruction unchanged (5.03) and CodeGen
+   ns per IR instruction within noise (229–235 for both, allocation
+   about +2); std's tests 6.65/6.39 → 6.68/6.51 s, allocation 69–75 →
+   74–77 ns per IR instruction, binary −26 KB.
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
 6. DWARF variable locations; then leaf inlining with the cache edge.
