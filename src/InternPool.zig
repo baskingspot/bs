@@ -300,6 +300,13 @@ pub const ContainerInfo = struct {
     }
 
     pub fn fieldIndex(info: *const ContainerInfo, ip: *const InternPool, name: []const u8) ?u32 {
+        // Names are interned: past a few fields, comparing string indices
+        // beats comparing bytes (`@hasField` on a 1500-tag enum).
+        if (info.field_names.len > 8) {
+            const s = ip.findString(name) orelse return null;
+            const i = std.mem.indexOfScalar(u32, @ptrCast(info.field_names), @backingInt(s)) orelse return null;
+            return @intCast(i);
+        }
         for (info.field_names, 0..) |n, i| {
             if (std.mem.eql(u8, ip.stringSlice(n), name)) return @intCast(i);
         }
@@ -853,6 +860,15 @@ pub fn getString(ip: *InternPool, tid: Tid, bytes: []const u8) !String {
     const s: String = @fromBackingInt(ip.wrap(tid, i));
     gop.key_ptr.* = s;
     return s;
+}
+
+/// The interned string `bytes`, or null if it was never interned.
+pub fn findString(ip: *const InternPool, bytes: []const u8) ?String {
+    const h = std.hash.Wyhash.hash(0, bytes);
+    const shard = &ip.shards[h & (ip.shards.len - 1)];
+    shard.mutex.lockUncancelable(ip.io);
+    defer shard.mutex.unlock(ip.io);
+    return shard.string_map.getKeyAdapted(bytes, StringAdapter{ .ip = ip });
 }
 
 pub fn stringSlice(ip: *const InternPool, s: String) []const u8 {
