@@ -8,6 +8,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        // As ghostty's: zap accepts it and says so in builtin.unwind_tables.
+        .unwind_tables = .sync,
         .imports = &.{.{ .name = "greet", .module = b.createModule(.{ .root_source_file = b.path("src/greet.zig") }) }},
     });
     // A Debug step that asks for LLVM, as uucode's table generator does:

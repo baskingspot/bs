@@ -15,6 +15,9 @@ pub const Options = struct {
     output_mode: OutputMode,
     is_test: bool,
     single_threaded: bool = false,
+    /// `builtin.unwind_tables` (`-funwind-tables` and friends). zap emits
+    /// asynchronous tables for each, which serve every kind of request.
+    unwind_tables: std.lang.UnwindTables = .async,
 };
 
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
@@ -26,7 +29,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\
     \\pub const output_mode: std.lang.OutputMode = .{s};
     \\pub const link_mode: std.lang.LinkMode = .static;
-    \\pub const unwind_tables: std.lang.UnwindTables = .async;
+    \\pub const unwind_tables: std.lang.UnwindTables = .{s};
     \\pub const is_test = {s};
     \\pub const single_threaded = {s};
     \\/// Deprecated; to be removed in 0.18.0. Use `target.abi` instead.
@@ -101,7 +104,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const omit_frame_pointer = false;
     \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
     \\
-    , .{ @tagName(opts.output_mode), if (opts.is_test) "true" else "false", if (opts.single_threaded) "true" else "false" });
+    , .{ @tagName(opts.output_mode), @tagName(opts.unwind_tables), if (opts.is_test) "true" else "false", if (opts.single_threaded) "true" else "false" });
 }
 
 /// Writes the generated source to `<cache_dir>/builtin/<content hash>/builtin.zig`

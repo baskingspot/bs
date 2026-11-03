@@ -29,7 +29,7 @@ expect "compile exe hello debug native cached"
 "$zap" build run >"$work/log" 2>&1 || fail "zap build run"
 expect "hello 2"
 "$zap" build test --summary all >"$work/log" 2>&1 || fail "zap build test"
-expect "run test 2 pass (2 total)"
+expect "run test 3 pass (3 total)"
 
 # An edit: the output changes in place.
 sed -i 's/"hello"/"howdy"/' src/greet.zig
@@ -56,6 +56,7 @@ if "$zap" build -Doptimize=ReleaseFast >"$work/log" 2>&1; then fail "zap build s
 expect "error: [unsupported] zap builds only Debug ('-Ofast')"
 
 # build.zig itself fails to compile.
+line=$(($(wc -l <build.zig) + 1))
 echo "fn unused() void { const y = 1; }" >>build.zig
 if "$zap" build >"$work/log" 2>&1; then fail "zap build succeeded with a broken build.zig"; fi
-expect "build.zig:23:26: error: [unused] unused local constant"
+expect "build.zig:$line:26: error: [unused] unused local constant"

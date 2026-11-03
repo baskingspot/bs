@@ -62,6 +62,9 @@ pub const Options = struct {
     stack_size: u64 = 16 * 1024 * 1024,
     /// `-fsingle-threaded`.
     single_threaded: bool = false,
+    /// `-funwind-tables`, `-fasync-unwind-tables`, `-fno-unwind-tables`:
+    /// only what `builtin.unwind_tables` says (Builtin.Options).
+    unwind_tables: std.lang.UnwindTables = .async,
     /// `--listen=-`: serve std's compiler protocol on stdin and stdout
     /// (`zig build`'s compile steps) instead of compiling once.
     listen: bool = false,
@@ -192,6 +195,7 @@ pub const Job = struct {
             .output_mode = if (command == .build_obj) .Obj else .Exe,
             .is_test = is_test,
             .single_threaded = opts.single_threaded,
+            .unwind_tables = opts.unwind_tables,
         });
         // `--listen=-` does not change what is built, so it is not part
         // of the compilation's key (nor of its output's digest).
@@ -754,7 +758,7 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fvalgrind"},                       .{"-fno-PIC"},                  .{"-fno-PIE"},              .{"-fbuiltin"},
     .{"-fno-builtin"},                     .{"-mred-zone"},                .{"-mno-red-zone"},         .{"-fno-sanitize-c"},
     .{"-fsanitize-c=trap"},                .{"-fsanitize-c=full"},         .{"-fsanitize-c"},          .{"-gdwarf32"},
-    .{"-gdwarf64"},                        .{"-fasync-unwind-tables"},     .{"-ODebug"},               .{"-Odebug"},
+    .{"-gdwarf64"},                        .{"-ODebug"},                   .{"-Odebug"},
     .{"-static"},                          .{"--no-dynamic-linker"},       .{"--debug-compile-errors"}, .{"--debug-incremental"},
     .{"--verbose-air"},                    .{"--verbose-llvm-ir"},         .{"--verbose-link"},        .{"--verbose-cc"},
     .{"--verbose-llvm-cpu-features"},      .{"--time-report"},             .{"-fformatted-panics"},    .{"-fno-formatted-panics"},
@@ -789,8 +793,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fno-valgrind", "zap always emits Valgrind client requests ('-fno-valgrind'); remove '.valgrind = false'" },
     .{ "-fPIC", "zap does not emit position-independent code ('-fPIC'); build this step with upstream zig" },
     .{ "-fPIE", "zap does not emit position-independent executables ('-fPIE'); remove '.pie = true'" },
-    .{ "-funwind-tables", "zap only emits asynchronous unwind tables ('-funwind-tables')" },
-    .{ "-fno-unwind-tables", "zap only emits asynchronous unwind tables ('-fno-unwind-tables')" },
     .{ "-dynamic", "zap links executables statically ('-dynamic'); build this step with upstream zig" },
     .{ "-femit-asm", "zap does not emit assembly ('-femit-asm')" },
     .{ "-femit-docs", "zap does not emit documentation ('-femit-docs'); build docs with upstream zig" },
@@ -866,6 +868,12 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             opts.single_threaded = true;
         } else if (std.mem.eql(u8, arg, "-fno-single-threaded")) {
             opts.single_threaded = false;
+        } else if (std.mem.eql(u8, arg, "-funwind-tables")) {
+            opts.unwind_tables = .sync;
+        } else if (std.mem.eql(u8, arg, "-fasync-unwind-tables")) {
+            opts.unwind_tables = .async;
+        } else if (std.mem.eql(u8, arg, "-fno-unwind-tables")) {
+            opts.unwind_tables = .none;
         } else if (std.mem.eql(u8, arg, "-freference-trace")) {
             opts.reference_trace = 256;
         } else if (std.mem.startsWith(u8, arg, "-freference-trace=")) {

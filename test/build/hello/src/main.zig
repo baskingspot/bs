@@ -17,3 +17,7 @@ test add {
 test "greet" {
     try std.testing.expectEqualStrings("hello", greet.word);
 }
+
+test "unwind tables" {
+    try std.testing.expectEqual(.sync, @import("builtin").unwind_tables);
+}
