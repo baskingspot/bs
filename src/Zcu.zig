@@ -137,6 +137,9 @@ pub const Reference = struct { from: AnalUnit, file: u32, src: Sema.Src };
 pub const Memo = struct {
     result: InternPool.Index,
     deps: []const MemoDep,
+    /// The container types with effects the call evaluated, which a unit
+    /// that reuses the result notes too (`effect_uses`).
+    effects: []const InternPool.Index,
 };
 
 pub const MemoDep = struct {
@@ -155,6 +158,12 @@ pub const Bytecode = struct {
     /// outside any runtime block of the body), which every run declares as
     /// plain dependencies.
     entry_deps: []const u32,
+    /// The container types with effects lowering evaluated (see
+    /// `effect_uses`): a run notes those its `comptime_effect`
+    /// instructions reach, and those at `entry_effects` (evaluated outside
+    /// any runtime block of the body).
+    effects: []const InternPool.Index,
+    entry_effects: []const u32,
     /// For a generic function's specialization, per parameter: its type,
     /// and its value if the body has it comptime-known. Empty otherwise.
     params: []const BytecodeParam,
@@ -174,6 +183,8 @@ pub const Bytecode = struct {
         gpa.free(b.ints);
         gpa.free(b.deps);
         gpa.free(b.entry_deps);
+        gpa.free(b.effects);
+        gpa.free(b.entry_effects);
         gpa.free(b.params);
         b.in_frame.deinit(gpa);
         gpa.destroy(b);

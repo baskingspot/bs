@@ -2545,12 +2545,18 @@ and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
   `comptime`, exported or test declarations has `Namespace.effects`. A
   unit whose analysis evaluated such a type's declaration or `@import`
   (`Zcu.effect_uses`, noted by `Sema.createContainerType` and
-  `Sema.fileRootType`, not during a lowering) gets an `analyze` reference
+  `Sema.fileRootType`) gets an `analyze` reference
   unless loading it makes the type anyway: the type is its value, or the
   subject of one of its plain dependencies. Otherwise a green unit that
   made such a type would skip its `comptime` blocks and exports. Noted on
   every evaluation, not only the one that created the namespace, so that
-  the references do not depend on analysis order.
+  the references do not depend on analysis order. That includes reusing
+  the type without evaluating its code again, as dependencies are
+  declared: a memo entry keeps the types its call noted
+  (`Zcu.Memo.effects`) and a hit notes them, and a lowering for the
+  comptime evaluator, which folds the comptime calls it makes or reuses,
+  marks where the walker would note one (`comptime_effect`,
+  `Zcu.Bytecode.effects`) for the units whose runs reach it.
 - Anonymous types are named `Parent__struct_<n>` with `n` relative to
   their declaration, except in `comptime` blocks (see "Analysis units"):
   with absolute instructions,

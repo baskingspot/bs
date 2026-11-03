@@ -299,7 +299,7 @@ pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
     switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
         .arg, .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .ret_addr, .frame_addr, .extern_ptr, .tls_ptr => {},
         .err_return_trace, .save_err_return_trace_index, .breakpoint, .c_va_start, .block, .loop => {},
-        .repeat, .unreach, .trap, .comptime_tick, .comptime_quota, .comptime_dep => {},
+        .repeat, .unreach, .trap, .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect => {},
         .br => ctx.use(data.br.operand),
         .ret, .error_name, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err, .set_err_return_trace => ctx.use(data.un_op),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ctx.use(data.un_op),

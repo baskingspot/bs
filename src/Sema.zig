@@ -73,9 +73,11 @@ name_cache: std.AutoHashMapUnmanaged(NameKey, u32) = .empty,
 /// innermost last, for their memo entries (see `Zcu.Memo`): the entries
 /// from `memo_start` on are the innermost call's. Empty outside calls.
 memo_deps: std.ArrayList(MemoCollected) = .empty,
-/// The last entry of `memo_deps` for each dependee and evaluator body.
+/// The last entry of `memo_deps` for each dependee, evaluator body and
+/// container type with effects.
 memo_pos: std.HashMapUnmanaged(Zcu.Dependee, u32, @import("Incremental.zig").DependeeContext, std.hash_map.default_max_load_percentage) = .empty,
 memo_body_pos: std.AutoHashMapUnmanaged(*const Zcu.Bytecode, u32) = .empty,
+memo_effect_pos: std.AutoHashMapUnmanaged(Index, u32) = .empty,
 /// Null outside memoizable comptime calls.
 memo_start: ?u32 = null,
 /// Counts the memoizable calls started: a dependency declared at the
@@ -469,6 +471,7 @@ fn destroy(sema: *Sema) void {
     sema.memo_deps.deinit(gpa);
     sema.memo_pos.deinit(gpa);
     sema.memo_body_pos.deinit(gpa);
+    sema.memo_effect_pos.deinit(gpa);
     sema.bc_undo.deinit(gpa);
     sema.bc_declared.deinit(gpa);
     sema.comptime_allocs.deinit(gpa);
@@ -1409,13 +1412,24 @@ fn createContainerType(sema: *Sema, kind: Zcu.ContainerKind, file_index: u32, in
 }
 
 /// Records in `Zcu.effect_uses` that this unit evaluated container type
-/// `ty`, if creating its namespace had effects.
+/// `ty`, if creating its namespace had effects. As a dependency is
+/// declared: a memoizable call in progress records it for its memo entry,
+/// whose hits note it again, and a lowering for the comptime evaluator
+/// (not its owner's analysis) marks where the code reads it, for the units
+/// whose runs reach that (`Zcu.Bytecode.effects`).
 fn noteEffects(sema: *Sema, ty: Index) Allocator.Error!void {
-    // A lowering for the comptime evaluator is not its owner's analysis.
-    if (sema.bc != null) return;
     const zcu = sema.zcu;
     const ns = zcu.ip.structInfo(ty).namespace;
-    if (ns != Zcu.Namespace.none and zcu.namespaces.items[ns].effects) try zcu.effect_uses.put(zcu.gpa, .{ .unit = sema.owner, .ty = ty }, {});
+    if (ns == Zcu.Namespace.none or !zcu.namespaces.items[ns].effects) return;
+    if (sema.memo_start) |start| _ = try sema.memoCollect(.{ .effect = ty }, start);
+    if (sema.bc) |bc| {
+        const index = std.mem.indexOfScalar(Index, bc.effects.items, ty) orelse blk: {
+            try bc.effects.append(sema.arena, ty);
+            break :blk bc.effects.items.len - 1;
+        };
+        return sema.bcEvent(.comptime_effect, @intCast(index));
+    }
+    try zcu.effect_uses.put(zcu.gpa, .{ .unit = sema.owner, .ty = ty }, {});
 }
 
 /// Queues `func`, which this unit refers to other than by calling it (its
@@ -1454,7 +1468,7 @@ fn declareDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !void {
             const m = sema.memo_dep_cache[h];
             if (m != 0 and m - 1 >= start and m - 1 < sema.memo_deps.items.len) switch (sema.memo_deps.items[m - 1]) {
                 .dep => |d| if (std.meta.eql(d.dependee, dependee) and (conditional or !d.conditional)) return,
-                .body => {},
+                .body, .effect => {},
             };
         } else if (slot.* != 0) {
             const i = slot.* - 1;
@@ -1465,7 +1479,7 @@ fn declareDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !void {
     slot.* = index + 1;
     // The code the walker runs reads it here; a plain read is declared
     // where a run reaches it.
-    if (sema.bc != null and !conditional) try sema.bcDepEvent(index);
+    if (sema.bc != null and !conditional) try sema.bcEvent(.comptime_dep, index);
     if (sema.memo_start) |start| sema.memo_dep_cache[h] = 1 + try sema.memoCollect(.{ .dep = .{ .dependee = dependee, .conditional = conditional } }, start);
 }
 
@@ -1493,11 +1507,13 @@ fn addDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !u32 {
     return len;
 }
 
-/// What a memoizable comptime call in progress declared: a dependency, or
-/// an evaluator body's (see `bcDeclareBody`).
+/// What a memoizable comptime call in progress declared: a dependency, an
+/// evaluator body's (see `bcDeclareBody`), or a container type with
+/// effects (`noteEffects`).
 const MemoCollected = union(enum) {
     dep: Zcu.MemoDep,
     body: *const Zcu.Bytecode,
+    effect: Index,
 };
 
 /// Returns the entry's position in `memo_deps`.
@@ -1515,6 +1531,11 @@ fn memoCollect(sema: *Sema, entry: MemoCollected, start: u32) !u32 {
         },
         .body => |b| {
             const gop = try sema.memo_body_pos.getOrPut(gpa, b);
+            if (gop.found_existing and gop.value_ptr.* >= start) return gop.value_ptr.*;
+            gop.value_ptr.* = len;
+        },
+        .effect => |ty| {
+            const gop = try sema.memo_effect_pos.getOrPut(gpa, ty);
             if (gop.found_existing and gop.value_ptr.* >= start) return gop.value_ptr.*;
             gop.value_ptr.* = len;
         },
@@ -1546,8 +1567,29 @@ fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.MemoDep {
             for (b.deps) |d| try S.add(&out, &index, sema.gpa, sema.arena, .{ .dependee = d, .conditional = true });
             for (b.entry_deps) |i| try S.add(&out, &index, sema.gpa, sema.arena, .{ .dependee = b.deps[i], .conditional = false });
         },
+        .effect => {},
     };
     return sema.zcu.arena.allocator().dupe(Zcu.MemoDep, out.items);
+}
+
+/// The container types with effects that the memoizable call whose
+/// entries start at `start` evaluated, for its memo entry.
+fn memoEffects(sema: *Sema, start: u32) ![]const Index {
+    var out: std.ArrayList(Index) = .empty;
+    for (sema.memo_deps.items[start..]) |e| switch (e) {
+        .dep => {},
+        .body => |b| for (b.entry_effects) |i| if (std.mem.indexOfScalar(Index, out.items, b.effects[i]) == null) try out.append(sema.arena, b.effects[i]),
+        .effect => |ty| if (std.mem.indexOfScalar(Index, out.items, ty) == null) try out.append(sema.arena, ty),
+    };
+    return sema.zcu.arena.allocator().dupe(Index, out.items);
+}
+
+/// Reuses memo entry `memo`: declares what its call read and notes the
+/// containers with effects it evaluated.
+fn memoHit(sema: *Sema, memo: Zcu.Memo) !Index {
+    for (memo.deps) |d| try sema.declareDep(d.dependee, d.conditional);
+    for (memo.effects) |ty| try sema.noteEffects(ty);
+    return memo.result;
 }
 
 fn ensureNavVal(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex) CompileError!void {
@@ -4092,14 +4134,11 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
     var hasher: InternPool.Hasher = .init("type info");
     hasher.int(InternPool.Hash, ip.stableHash(ty));
     const key = hasher.final();
-    if (sema.zcu.comptime_memo.get(key)) |memo| {
-        for (memo.deps) |d| try sema.declareDep(d.dependee, d.conditional);
-        return .fromInterned(memo.result);
-    }
+    if (sema.zcu.comptime_memo.get(key)) |memo| return .fromInterned(try sema.memoHit(memo));
     const scope = sema.memoEnter();
     defer sema.memoLeave(scope);
     const result = try sema.typeInfo(block, src, ty);
-    try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.start) });
+    try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.start), .effects = try sema.memoEffects(scope.start) });
     return .fromInterned(result);
 }
 
@@ -14808,6 +14847,7 @@ fn memoLeave(sema: *Sema, scope: MemoScope) void {
         sema.memo_deps.clearRetainingCapacity();
         sema.memo_pos.clearRetainingCapacity();
         sema.memo_body_pos.clearRetainingCapacity();
+        sema.memo_effect_pos.clearRetainingCapacity();
     }
 }
 
@@ -14824,11 +14864,8 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
     }
     const key = hasher.final();
     try sema.declareDependency(.{ .func_body = func });
-    if (memoizable) if (sema.zcu.comptime_memo.get(key)) |memo| {
-        // What the call read, this unit reads by reusing its result.
-        for (memo.deps) |d| try sema.declareDep(d.dependee, d.conditional);
-        return memo.result;
-    };
+    // What the call read, this unit reads by reusing its result.
+    if (memoizable) if (sema.zcu.comptime_memo.get(key)) |memo| return sema.memoHit(memo);
     const scope: ?MemoScope = if (memoizable) sema.memoEnter() else null;
     defer if (scope) |sc| sema.memoLeave(sc);
     // A lowered body runs once what each walker run of it would evaluate
@@ -14852,7 +14889,7 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
         },
     };
     if (memoizable and !sema.refersToComptimeAlloc(result)) {
-        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.?.start) });
+        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.?.start), .effects = try sema.memoEffects(scope.?.start) });
     } else if (sema.bc) |bc| if (bc.depth == 0) try sema.bcRefuse();
     return result;
 }
@@ -14958,6 +14995,9 @@ const BcLowering = struct {
     /// run-time call: the walker calls them at comptime, typed with the
     /// ad hoc set, and reads no `func_ies` for them.
     call_ies: std.AutoHashMapUnmanaged(Index, void) = .empty,
+    /// The containers with effects lowering evaluated (`noteEffects`), for
+    /// `Zcu.Bytecode.effects`. Arena-allocated.
+    effects: std.ArrayList(Index) = .empty,
 };
 
 /// Backward branches a comptime loop takes, counting nested ones, before
@@ -15058,6 +15098,7 @@ noinline fn bcOsr(sema: *Sema, block: *Block, body: []const Zir.Inst.Index) Comp
     defer sema.bc_first_alloc = saved_first;
     for (b.deps) |d| try sema.declareDep(d, true);
     for (b.entry_deps) |i| try sema.declareDep(b.deps[i], false);
+    for (b.entry_effects) |i| try sema.noteEffects(b.effects[i]);
     const declared = try sema.arena.alloc(u32, b.deps.len);
     @memset(declared, std.math.maxInt(u32));
     const n = b.ir.instructions.len;
@@ -15074,6 +15115,7 @@ noinline fn bcOsr(sema: *Sema, block: *Block, body: []const Zir.Inst.Index) Comp
         .overflow = vals[n..],
         .in_frame = &b.in_frame,
         .deps = b.deps,
+        .effects = b.effects,
         .declared = declared,
         .args = &.{},
         .block = block,
@@ -15194,14 +15236,16 @@ fn bcLogNode(sema: *Sema, id: u32, node: *MutValue) !void {
 /// comptime block's instructions are dropped, but the walker runs it again
 /// on every call.
 /// While lowering, marks where the code being analyzed reads dependency
-/// `index` (see `Zcu.Bytecode.deps`), in the innermost runtime block. A
-/// read outside one, or in instructions lowering discards, stays unmarked
-/// and every run declares it (`entry_deps`).
-fn bcDepEvent(sema: *Sema, index: u32) Allocator.Error!void {
+/// `index` (`comptime_dep`, see `Zcu.Bytecode.deps`) or evaluates a
+/// container with effects (`comptime_effect`, `Zcu.Bytecode.effects`), in
+/// the innermost runtime block. A read outside one, or in instructions
+/// lowering discards, stays unmarked and every run declares it
+/// (`entry_deps`, `entry_effects`).
+fn bcEvent(sema: *Sema, comptime tag: Ir.Inst.Tag, index: u32) Allocator.Error!void {
     var b = sema.bc_block orelse return;
     while (b.is_comptime) b = b.parent orelse return;
     if (b.instructions.items.len != 0 and sema.isNoReturnInst(b.instructions.getLast())) return;
-    try sema.ir_insts.append(sema.gpa, .{ .tag = .comptime_dep, .data = .{ .dep = index } });
+    try sema.ir_insts.append(sema.gpa, .{ .tag = tag, .data = .{ .dep = index } });
     try b.instructions.append(sema.gpa, @fromBackingInt(@intCast(sema.ir_insts.len - 1)));
 }
 
@@ -15268,17 +15312,25 @@ fn bcFinish(sema: *Sema, ok: bool, n_errors: usize, params: []const Zcu.Bytecode
     errdefer in_frame.deinit(gpa);
     // Plain reads no reachable `comptime_dep` marks.
     var marked = try std.DynamicBitSetUnmanaged.initEmpty(sema.arena, deps.len);
-    bcMarkDeps(&ir, ir.mainBody(), &marked);
+    var marked_effects = try std.DynamicBitSetUnmanaged.initEmpty(sema.arena, bc.effects.items.len);
+    bcMarkDeps(&ir, ir.mainBody(), &marked, &marked_effects);
     var entry_deps: std.ArrayList(u32) = .empty;
     defer entry_deps.deinit(gpa);
     for (sema.deps_conditional.items, 0..) |c, i| if (!c and !marked.isSet(i)) try entry_deps.append(gpa, @intCast(i));
     const entry = try entry_deps.toOwnedSlice(gpa);
     errdefer gpa.free(entry);
+    const effects = try gpa.dupe(Index, bc.effects.items);
+    errdefer gpa.free(effects);
+    var entry_effects: std.ArrayList(u32) = .empty;
+    defer entry_effects.deinit(gpa);
+    for (0..effects.len) |i| if (!marked_effects.isSet(i)) try entry_effects.append(gpa, @intCast(i));
+    const entry_eff = try entry_effects.toOwnedSlice(gpa);
+    errdefer gpa.free(entry_eff);
     const body_params = try gpa.dupe(Zcu.BytecodeParam, params);
     errdefer gpa.free(body_params);
     const body = try gpa.create(Zcu.Bytecode);
     const ints = try bcInts(gpa, sema.ip, &ir, &in_frame);
-    body.* = .{ .ir = ir, .deps = deps, .entry_deps = entry, .params = body_params, .in_frame = in_frame, .ints = ints };
+    body.* = .{ .ir = ir, .deps = deps, .entry_deps = entry, .effects = effects, .entry_effects = entry_eff, .params = body_params, .in_frame = in_frame, .ints = ints };
     return .{ .ready = body };
 }
 
@@ -15314,23 +15366,24 @@ fn bcIntOp(tag: Ir.Inst.Tag, x: i128, y: i128) ?i128 {
     return if (o == 0) r else null;
 }
 
-/// Sets the dependencies the `comptime_dep` instructions reachable from
-/// `body` mark.
-fn bcMarkDeps(ir: *const Ir, body: []const Ir.Inst.Index, marked: *std.DynamicBitSetUnmanaged) void {
+/// Sets the dependencies and effects the `comptime_dep` and
+/// `comptime_effect` instructions reachable from `body` mark.
+fn bcMarkDeps(ir: *const Ir, body: []const Ir.Inst.Index, marked: *std.DynamicBitSetUnmanaged, marked_effects: *std.DynamicBitSetUnmanaged) void {
     const tags = ir.instructions.items(.tag);
     const datas = ir.instructions.items(.data);
     for (body) |inst| {
         const data = datas[@backingInt(inst)];
         switch (tags[@backingInt(inst)]) {
             .comptime_dep => marked.set(data.dep),
+            .comptime_effect => marked_effects.set(data.dep),
             .block, .loop => {
                 const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
-                bcMarkDeps(ir, ir.bodySlice(extra.end, extra.data.body_len), marked);
+                bcMarkDeps(ir, ir.bodySlice(extra.end, extra.data.body_len), marked, marked_effects);
             },
             .cond_br => {
                 const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
-                bcMarkDeps(ir, ir.bodySlice(extra.end, extra.data.then_body_len), marked);
-                bcMarkDeps(ir, ir.bodySlice(extra.end + extra.data.then_body_len, extra.data.else_body_len), marked);
+                bcMarkDeps(ir, ir.bodySlice(extra.end, extra.data.then_body_len), marked, marked_effects);
+                bcMarkDeps(ir, ir.bodySlice(extra.end + extra.data.then_body_len, extra.data.else_body_len), marked, marked_effects);
             },
             .switch_br => {
                 const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
@@ -15339,10 +15392,10 @@ fn bcMarkDeps(ir: *const Ir, body: []const Ir.Inst.Index, marked: *std.DynamicBi
                     const items_len = ir.extra[at];
                     const body_len = ir.extra[at + 1];
                     at += 2 + items_len;
-                    bcMarkDeps(ir, ir.bodySlice(at, body_len), marked);
+                    bcMarkDeps(ir, ir.bodySlice(at, body_len), marked, marked_effects);
                     at += body_len;
                 }
-                bcMarkDeps(ir, ir.bodySlice(at, extra.data.else_body_len), marked);
+                bcMarkDeps(ir, ir.bodySlice(at, extra.data.else_body_len), marked, marked_effects);
             },
             else => {},
         }
@@ -15453,6 +15506,7 @@ fn bcInFrame(gpa: Allocator, ir: *const Ir) Allocator.Error!std.DynamicBitSetUnm
         .comptime_tick,
         .comptime_quota,
         .comptime_dep,
+        .comptime_effect,
         => {},
         else => unreachable, // Not in `bcSupported`.
     };
@@ -15619,6 +15673,7 @@ fn bcSupported(tag: Ir.Inst.Tag) bool {
         .comptime_tick,
         .comptime_quota,
         .comptime_dep,
+        .comptime_effect,
         .comptime_exit,
         => true,
         else => false,
@@ -15740,6 +15795,7 @@ const BcFrame = struct {
     overflow: []Index,
     in_frame: *const std.DynamicBitSetUnmanaged,
     deps: []const Zcu.Dependee,
+    effects: []const Index,
     /// See `Sema.bc_declared`.
     declared: []u32,
     args: []const Index,
@@ -15843,6 +15899,7 @@ fn bcRun(sema: *Sema, caller: *Block, src: Src, func: Index, body: *const Zcu.By
         .overflow = vals[n..],
         .in_frame = &body.in_frame,
         .deps = body.deps,
+        .effects = body.effects,
         .declared = declared,
         .args = run_args,
         .block = &block,
@@ -15866,6 +15923,7 @@ fn bcDeclareBody(sema: *Sema, body: *const Zcu.Bytecode) Allocator.Error![]u32 {
     @memset(gop.value_ptr.*, std.math.maxInt(u32));
     for (body.deps) |d| _ = try sema.addDep(d, true);
     for (body.entry_deps) |i| _ = try sema.addDep(body.deps[i], false);
+    for (body.entry_effects) |i| try sema.noteEffects(body.effects[i]);
     return gop.value_ptr.*;
 }
 
@@ -16015,6 +16073,10 @@ fn bcExec(sema: *Sema, f: *BcFrame, body: []const Ir.Inst.Index) BcError!BcExit 
                     try sema.declareDep(f.deps[data.dep], false);
                     f.declared[data.dep] = sema.memo_epoch;
                 }
+                continue;
+            },
+            .comptime_effect => {
+                try sema.noteEffects(f.effects[data.dep]);
                 continue;
             },
             .block => blk: {

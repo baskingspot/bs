@@ -1267,7 +1267,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
     switch (tag) {
         .arg => {},
         // Only in bodies lowered for the comptime evaluator.
-        .comptime_tick, .comptime_quota, .comptime_dep, .comptime_exit => unreachable,
+        .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect, .comptime_exit => unreachable,
         .dbg_stmt => {
             cg.dbg_line = data.dbg_stmt.line;
             cg.dbg_column = data.dbg_stmt.column;

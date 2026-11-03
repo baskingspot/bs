@@ -89,7 +89,7 @@ const Printer = struct {
             },
             .dbg_inline_end, .comptime_tick => {},
             .comptime_quota => try w.print("{d}", .{data.quota}),
-            .comptime_dep => try w.print("{d}", .{data.dep}),
+            .comptime_dep, .comptime_effect => try w.print("{d}", .{data.dep}),
             .comptime_exit => {
                 try p.ref(data.pl_op.operand);
                 try w.print(", zir %{d}", .{data.pl_op.payload});
