@@ -1192,6 +1192,11 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 i += 1;
                 continue;
             },
+            .@"export" => {
+                try sema.zirExport(block, inst);
+                i += 1;
+                continue;
+            },
             .validate_destructure => return sema.failUnsupported(block, block.nodeSrc(.zero), "destructuring"),
             .set_runtime_safety => {
                 const src = block.nodeSrc(data.un_node.src_node);
@@ -2083,7 +2088,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const captures = sema.ip.containerType(ns.owner_type).?.captures;
             break :blk .fromInterned(captures[ext.small]);
         },
-        .@"asm" => sema.zirAsm(block, inst),
+        .@"asm", .asm_expr => sema.zirAsm(block, inst),
         .alloc => blk: {
             const extra = sema.code.extraData(Zir.Inst.AllocExtended, ext.operand);
             const small: Zir.Inst.AllocExtended.Small = @bitCast(ext.small);
@@ -2656,6 +2661,38 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     if (sema.ip.indexToKey(nav.val) == .func) try sema.zcu.queueFunc(nav.val);
     const ptr_ty = try sema.ptrType(.{ .child = nav.ty, .flags = .{ .is_const = nav.is_const } });
     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .nav = nav_index } } }));
+}
+
+/// `@export(&decl, .{ .name = ... })`: exports a declaration under a symbol
+/// name. Only the name is honored; linkage, section, and visibility are
+/// those of a strong global symbol in a static executable.
+fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
+    const ip = sema.ip;
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
+    const extra = sema.code.extraData(Zir.Inst.Export, data.payload_index).data;
+    const src = block.nodeSrc(data.src_node);
+    const ptr = sema.resolveInst(extra.exported);
+    const ptr_val = try sema.resolveConstValue(block, src, ptr, "export target must be comptime-known");
+    const ptr_ty = ip.typeOf(ptr_val);
+    if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src, "expected pointer type, found '{f}'", .{sema.fmtType(ptr_ty)});
+    if (Type.isSlice(ip, ptr_ty)) return sema.fail(block, src, "export target cannot be slice", .{});
+    const options_ty = try sema.stdLangType(block, src, "ExportOptions");
+    const options = try sema.resolveConstValue(block, src, try sema.coerce(block, options_ty, sema.resolveInst(extra.options), src), "export options must be comptime-known");
+    const name_val = try sema.fieldValue(options, ip.structInfo(options_ty).fieldIndex(ip, "name").?);
+    const name = try sema.resolveConstString(block, src, .fromInterned(name_val));
+    const nav_index = switch (ip.indexToKey(ptr_val).ptr.base) {
+        .nav => |n| n,
+        .uav => return sema.failUnsupported(block, src, "exporting anonymous values"),
+        else => return sema.fail(block, src, "export target must be a global variable or a comptime-known constant", .{}),
+    };
+    try sema.ensureNavVal(block, src, nav_index);
+    const val = ip.getNav(nav_index).val;
+    const export_nav = switch (ip.indexToKey(val)) {
+        .func => |f| f.owner_nav,
+        else => nav_index,
+    };
+    if (ip.indexToKey(val) == .func) try sema.zcu.queueFunc(val);
+    try sema.zcu.exports.append(sema.gpa, .{ .nav = export_nav, .name = try sema.getString(name) });
 }
 
 fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -7486,7 +7523,10 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     // Clobbers need no handling: CodeGen keeps no values in registers
     // across instructions.
     const payload = try sema.addExtra(Ir.Asm{
-        .source = try sema.getString(sema.zirString(extra.data.asm_source)),
+        .source = if (ext.opcode == .asm_expr)
+            try sema.getString(try sema.resolveConstString(block, src, sema.resolveInst(@fromBackingInt(@backingInt(extra.data.asm_source)))))
+        else
+            try sema.getString(sema.zirString(extra.data.asm_source)),
         .outputs_len = small.outputs_len,
         .inputs_len = small.inputs_len,
         .is_volatile = @intFromBool(small.is_volatile),
