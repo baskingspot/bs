@@ -1002,6 +1002,18 @@ fn planRegisters(cg: *CodeGen) Error!void {
     }
 }
 
+/// How wide to write an error union's error code: through the padding
+/// before the payload, up to 8 bytes, so that reading the error union as
+/// whole words later forwards from the store instead of stalling on it.
+fn errFieldSize(layout: Type.ErrorUnionLayout) Size {
+    return switch (@min(layout.payload_offset, 8)) {
+        0, 2 => .word,
+        4 => .dword,
+        8 => .qword,
+        else => unreachable,
+    };
+}
+
 /// Whether value `inst` may go unemitted when nothing reads it: it reads
 /// no volatile memory, writes nothing but its own result, cannot trap, and
 /// requests nothing from the linker that its users would not.
@@ -1800,7 +1812,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const d = cg.destReg(inst);
             if (tag == .errunion_payload_ptr_set) {
                 try cg.load(d, data.ty_op.operand);
-                try cg.e.mov(.word, .{ .mem = Mem.at(d, @intCast(layout.err_offset)) }, .{ .imm = 0 });
+                try cg.e.mov(errFieldSize(layout), .{ .mem = Mem.at(d, @intCast(layout.err_offset)) }, .{ .imm = 0 });
                 if (off != 0) try cg.e.alu(.add, .qword, .{ .reg = d }, .{ .imm = @intCast(off) });
             } else try cg.addrPlus(d, data.ty_op.operand, off);
             try cg.setResult(inst, data.ty_op.ty, d);
@@ -1810,10 +1822,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const dst = try cg.resultMem(inst, eu_ty) orelse return;
             const layout = Type.errorUnionLayout(ip, eu_ty);
             if (tag == .wrap_errunion_payload) {
-                try cg.e.mov(.word, .{ .mem = offsetMem(dst, layout.err_offset) }, .{ .imm = 0 });
+                try cg.e.mov(errFieldSize(layout), .{ .mem = offsetMem(dst, layout.err_offset) }, .{ .imm = 0 });
                 try cg.copyTo(offsetMem(dst, layout.payload_offset), data.ty_op.operand);
             } else {
-                try cg.copyTo(offsetMem(dst, layout.err_offset), data.ty_op.operand);
+                const r = try cg.regOf(data.ty_op.operand, .rax);
+                try cg.storeReg(offsetMem(dst, layout.err_offset), r, errFieldSize(layout).bytes());
             }
         },
         .aggregate_init => {
