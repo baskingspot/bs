@@ -29,6 +29,47 @@ extra: std.ArrayList(Block.Index) = .empty,
 /// For each IR instruction that a `br` or `repeat` targets (`block`,
 /// `loop`), the block those jump to; indexed by IR instruction.
 targets: std.ArrayList(Block.Index) = .empty,
+/// Loops, outer ones before the loops they contain, and per block the
+/// innermost loop containing it (an index into `loops`, or `no_loop`).
+loops: std.ArrayList(Loop) = .empty,
+block_loop: std.ArrayList(u32) = .empty,
+
+/// Liveness and register allocation, per IR instruction (values are IR
+/// instructions until the SSA gets its own ops). Positions number the
+/// values and terminators in layout order: value `i` is at `2 * i + 2`,
+/// and the terminator of a block whose values end before value `i` at
+/// `2 * i + 1`.
+live: std.MultiArrayList(Live) = .empty,
+
+pub const no_loop = std.math.maxInt(u32);
+
+/// A loop's blocks are contiguous in the layout: positions `start` (its
+/// header's first value) through `end` (its last block's terminator).
+pub const Loop = struct { start: u32, end: u32, parent: u32 };
+
+pub const Live = struct {
+    /// Uses as an operand, by values and terminators.
+    uses: u32,
+    /// The interval the value occupies a register for: from its
+    /// definition through its last use, and through the end of every loop
+    /// that uses it without defining it.
+    def: u32,
+    end: u32,
+    /// Before `allocate`: `want` for a value the architecture would keep in
+    /// a register, else `no_reg`. After: the register's index in the
+    /// architecture's list, or `no_reg`.
+    reg: u8,
+    /// Set by the architecture with `want`: the operand (an IR instruction
+    /// index, or `no_tie`) whose register the value may take when the
+    /// operand's last use is the value's definition, because the lowering
+    /// reads the other operands before writing the result over it.
+    tie: u32,
+};
+
+pub const no_tie = std.math.maxInt(u32);
+
+pub const no_reg: u8 = 0xff;
+pub const want_reg: u8 = 0xfe;
 
 pub const Value = struct {
     op: Op,
@@ -87,6 +128,9 @@ pub fn deinit(f: *Func, gpa: Allocator) void {
     f.layout.deinit(gpa);
     f.extra.deinit(gpa);
     f.targets.deinit(gpa);
+    f.loops.deinit(gpa);
+    f.block_loop.deinit(gpa);
+    f.live.deinit(gpa);
 }
 
 pub fn blockInsts(f: *const Func, block: Block.Index) []const Inst.Index {
@@ -105,12 +149,208 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     f.layout.clearRetainingCapacity();
     f.extra.clearRetainingCapacity();
     f.targets.clearRetainingCapacity();
+    f.loops.clearRetainingCapacity();
+    f.block_loop.clearRetainingCapacity();
     try f.targets.appendNTimes(gpa, .none, ir.instructions.len);
     // At most one value per IR instruction.
     try f.values.ensureTotalCapacity(gpa, ir.instructions.len);
     var b: Builder = .{ .f = f, .gpa = gpa, .ir = ir };
     try b.body(ir.mainBody());
 }
+
+/// Computes each value's uses and live interval (`live`). A value that is
+/// the condition of its own block's `branch` is read at the terminator:
+/// the architecture may fuse it into the branch, so its operands live until
+/// there.
+pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
+    try f.live.resize(gpa, ir.instructions.len);
+    const s = f.live.slice();
+    @memset(s.items(.uses), 0);
+    @memset(s.items(.reg), no_reg);
+    var w: LiveWalk = .{ .uses = s.items(.uses), .def = s.items(.def), .end = s.items(.end), .loops = f.loops.items, .loop = no_loop, .pos = 0 };
+    const insts = f.values.items(.inst);
+    const datas = ir.instructions.items(.data);
+    const tags = ir.instructions.items(.tag);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        w.loop = f.block_loop.items[@backingInt(block)];
+        const term_pos = 2 * (b.start + b.len) + 1;
+        const term_data = datas[@backingInt(b.term.inst)];
+        const cond: ?Inst.Index = if (b.term.tag == .branch) term_data.pl_op.operand.toIndex() else null;
+        for (b.start..b.start + b.len) |i| {
+            const inst = insts[i];
+            const p: u32 = @intCast(2 * i + 2);
+            w.def[@backingInt(inst)] = p;
+            w.end[@backingInt(inst)] = p;
+            w.pos = if (cond != null and cond.? == inst) term_pos else p;
+            forEachOperand(ir, inst, &w);
+        }
+        w.pos = term_pos;
+        switch (b.term.tag) {
+            .jump => if (tags[@backingInt(b.term.inst)] == .br) w.use(term_data.br.operand),
+            .branch, .switch_br => w.use(term_data.pl_op.operand),
+            .ret => w.use(term_data.un_op),
+            .fallthrough, .noreturn, .unreach => {},
+        }
+    }
+}
+
+const LiveWalk = struct {
+    uses: []u32,
+    def: []u32,
+    end: []u32,
+    loops: []const Loop,
+    /// The innermost loop around the current block, and the position of
+    /// the current use.
+    loop: u32,
+    pos: u32,
+
+    fn use(w: *LiveWalk, ref: Inst.Ref) void {
+        const inst = @backingInt(ref.toIndex() orelse return);
+        w.uses[inst] += 1;
+        // Live through the end of every loop around the use that does not
+        // contain the definition.
+        const d = w.def[inst];
+        var end = w.pos;
+        var l = w.loop;
+        while (l != no_loop and w.loops[l].start > d) : (l = w.loops[l].parent) end = w.loops[l].end;
+        w.end[inst] = @max(w.end[inst], end);
+    }
+};
+
+/// Calls `ctx.use(ref)` for each operand of the value `inst` (not for a
+/// terminator's operands, nor for the bodies a `block` or `loop` holds).
+pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .arg, .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .ret_addr, .frame_addr, .extern_ptr, .tls_ptr => {},
+        .err_return_trace, .save_err_return_trace_index, .breakpoint, .c_va_start, .block, .loop => {},
+        .repeat, .unreach, .trap, .comptime_tick, .comptime_quota, .comptime_dep => {},
+        .br => ctx.use(data.br.operand),
+        .ret, .error_name, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err, .set_err_return_trace => ctx.use(data.un_op),
+        .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ctx.use(data.un_op),
+        .load, .not, .intcast, .trunc, .float_cast, .float_from_int, .int_from_float, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => ctx.use(data.ty_op.operand),
+        .ptr_from_int, .atomic_load, .slice_ptr, .slice_len, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set, .wrap_optional => ctx.use(data.ty_op.operand),
+        .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => ctx.use(data.ty_op.operand),
+        .wrap_errunion_payload, .wrap_errunion_err, .get_union_tag, .tag_name, .c_va_arg, .c_va_copy => ctx.use(data.ty_op.operand),
+        .store, .add_wrap, .sub_wrap, .mul_wrap, .add_float, .sub_float, .mul_float, .div_float, .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
+            ctx.use(data.bin_op.lhs);
+            ctx.use(data.bin_op.rhs);
+        },
+        .min_float, .max_float, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+            ctx.use(data.bin_op.lhs);
+            ctx.use(data.bin_op.rhs);
+        },
+        .atomic_store, .ptr_elem_val, .slice_elem_val, .array_elem_val, .set_union_tag, .memcpy, .memmove, .memset => {
+            ctx.use(data.bin_op.lhs);
+            ctx.use(data.bin_op.rhs);
+        },
+        .add_with_overflow, .sub_with_overflow, .mul_with_overflow, .ptr_elem_ptr, .slice_elem_ptr, .slice, .ptr_add => {
+            const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+            ctx.use(bin.lhs);
+            ctx.use(bin.rhs);
+        },
+        .mul_add, .vector_store_elem => {
+            const bin = ir.extraData(Ir.Bin, data.pl_op.payload).data;
+            ctx.use(data.pl_op.operand);
+            ctx.use(bin.lhs);
+            ctx.use(bin.rhs);
+        },
+        .cond_br, .switch_br, .comptime_exit => ctx.use(data.pl_op.operand),
+        .struct_field_ptr, .struct_field_val, .union_init => ctx.use(ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand),
+        .atomic_rmw => {
+            const x = ir.extraData(Ir.AtomicRmw, data.ty_pl.payload).data;
+            ctx.use(x.ptr);
+            ctx.use(x.operand);
+        },
+        .cmpxchg => {
+            const x = ir.extraData(Ir.Cmpxchg, data.ty_pl.payload).data;
+            ctx.use(x.ptr);
+            ctx.use(x.expected);
+            ctx.use(x.new);
+        },
+        .aggregate_init => {
+            const extra = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
+            for (ir.refSlice(extra.end, extra.data.len)) |elem| ctx.use(elem);
+        },
+        .call => {
+            const extra = ir.extraData(Ir.Call, data.pl_op.payload);
+            ctx.use(data.pl_op.operand);
+            for (ir.refSlice(extra.end, extra.data.args_len)) |arg| ctx.use(arg);
+        },
+        .assembly => {
+            const extra = ir.extraData(Ir.Asm, data.ty_pl.payload);
+            var i = extra.end;
+            for (0..extra.data.outputs_len + extra.data.inputs_len) |_| {
+                const operand: Inst.Ref = @fromBackingInt(ir.extra[i + 2]);
+                if (operand != .none) ctx.use(operand);
+                i += 3;
+            }
+        },
+    }
+}
+
+/// Linear-scan register allocation (Poletto and Sarkar) over the values
+/// `liveness` gave intervals and the architecture marked `want_reg`, with
+/// `n` registers, in order of definition. When none is free, the value
+/// whose interval ends last is kept in memory for its whole life. Values
+/// stay in their register through their last use, so a result shares a
+/// register only with its tied operand. Returns the mask of registers used.
+pub fn allocate(f: *Func, n: u8) u32 {
+    assert(n <= max_regs);
+    const s = f.live.slice();
+    const reg = s.items(.reg);
+    const def = s.items(.def);
+    const end = s.items(.end);
+    const tie = s.items(.tie);
+    var active: [max_regs]u32 = undefined;
+    var active_len: u8 = 0;
+    var free: u32 = (@as(u32, 1) << @intCast(n)) - 1;
+    var used: u32 = 0;
+    for (f.values.items(.inst)) |inst_index| {
+        const inst = @backingInt(inst_index);
+        if (reg[inst] != want_reg) continue;
+        var j: u8 = 0;
+        while (j < active_len) {
+            const a = active[j];
+            if (end[a] < def[inst]) {
+                free |= @as(u32, 1) << @intCast(reg[a]);
+                active_len -= 1;
+                active[j] = active[active_len];
+            } else j += 1;
+        }
+        const t = tie[inst];
+        if (t != no_tie and end[t] == def[inst] and reg[t] < n) {
+            // Take over the tied operand's register, which dies here.
+            const k = std.mem.indexOfScalar(u32, active[0..active_len], t).?;
+            reg[inst] = reg[t];
+            active[k] = inst;
+            continue;
+        }
+        if (free != 0) {
+            const r: u8 = @intCast(@ctz(free));
+            free &= free - 1;
+            used |= @as(u32, 1) << @intCast(r);
+            reg[inst] = r;
+            active[active_len] = inst;
+            active_len += 1;
+            continue;
+        }
+        var last: u8 = 0;
+        for (active[0..active_len], 0..) |a, k| {
+            if (end[a] > end[active[last]]) last = @intCast(k);
+        }
+        const victim = active[last];
+        if (end[victim] > end[inst]) {
+            reg[inst] = reg[victim];
+            reg[victim] = no_reg;
+            active[last] = inst;
+        } else reg[inst] = no_reg;
+    }
+    return used;
+}
+
+pub const max_regs = 16;
 
 const Builder = struct {
     f: *Func,
@@ -121,9 +361,12 @@ const Builder = struct {
     cur: Block.Index = .none,
     /// The last IR instruction seen.
     last: Inst.Index = undefined,
+    /// The innermost loop being built.
+    loop: u32 = no_loop,
 
     fn newBlock(b: *Builder) Allocator.Error!Block.Index {
         try b.f.blocks.append(b.gpa, .{ .start = 0, .len = 0, .term = undefined });
+        try b.f.block_loop.append(b.gpa, b.loop);
         return @fromBackingInt(@intCast(b.f.blocks.items.len - 1));
     }
 
@@ -174,11 +417,17 @@ const Builder = struct {
             .loop => {
                 try b.value(inst);
                 const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
+                const loop: u32 = @intCast(b.f.loops.items.len);
+                try b.f.loops.append(b.gpa, .{ .start = undefined, .end = undefined, .parent = b.loop });
+                b.loop = loop;
                 const header = try b.newBlock();
                 b.f.targets.items[@backingInt(inst)] = header;
                 // Falls through into the header.
                 try b.open(header);
+                b.f.loops.items[loop].start = 2 * @as(u32, @intCast(b.f.values.len)) + 2;
                 try b.body(ir.bodySlice(extra.end, extra.data.body_len));
+                b.f.loops.items[loop].end = 2 * @as(u32, @intCast(b.f.values.len)) + 1;
+                b.loop = b.f.loops.items[loop].parent;
             },
             .br => try b.terminate(.{ .tag = .jump, .inst = inst, .succ = .{ @backingInt(b.f.targets.items[@backingInt(data.br.block_inst)]), 0 } }),
             .repeat => try b.terminate(.{ .tag = .jump, .inst = inst, .succ = .{ @backingInt(b.f.targets.items[@backingInt(data.repeat.loop_inst)]), 0 } }),

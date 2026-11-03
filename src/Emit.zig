@@ -98,6 +98,8 @@ codegen_stats: CodeGenStats = .{},
 pub const CodeGenStats = struct {
     /// Building the SSA form from the IR.
     build_ns: u64 = 0,
+    /// Liveness and register allocation.
+    alloc_ns: u64 = 0,
     /// Lowering and encoding the SSA form, and making the Atom.
     emit_ns: u64 = 0,
     functions: u64 = 0,
@@ -118,15 +120,17 @@ pub const CodeGenStats = struct {
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.f;
-        std.debug.print("{s}: {d} functions, {d} IR instructions; ssa build {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
+        std.debug.print("{s}: {d} functions, {d} IR instructions; ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
             label,
             s.functions,
             s.ir_insts,
             ms(s.build_ns),
             per(s.build_ns, s.ir_insts),
+            ms(s.alloc_ns),
+            per(s.alloc_ns, s.ir_insts),
             ms(s.emit_ns),
             per(s.emit_ns, s.ir_insts),
-            per(s.build_ns + s.emit_ns, s.ir_insts),
+            per(s.build_ns + s.alloc_ns + s.emit_ns, s.ir_insts),
             per(s.code_bytes, s.ir_insts),
             per(s.frame_bytes, s.functions),
         });
@@ -223,7 +227,7 @@ pub fn benchCodegen(emit: *Emit, runs: u32) !void {
         defer e.deinit();
         for (irs.items) |*ir| try e.function(emit.zcu, ir);
         const s = e.codegen_stats;
-        if (best == null or s.build_ns + s.emit_ns < best.?.build_ns + best.?.emit_ns) best = s;
+        if (best == null or s.build_ns + s.alloc_ns + s.emit_ns < best.?.build_ns + best.?.alloc_ns + best.?.emit_ns) best = s;
     }
     if (best) |s| s.print("bench-codegen (fastest run)");
 }

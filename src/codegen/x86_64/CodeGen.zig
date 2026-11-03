@@ -67,6 +67,9 @@ ret_ptr_slot: ?i32 = null,
 /// `.auto` function's from r9, another's from `set_err_return_trace`.
 /// Null in a function that has none, whose `.auto` calls pass null.
 trace_slot: ?i32 = null,
+/// The callee-saved registers the function's values use (`alloc_regs`
+/// bits), which the prologue saves below rbp and every return restores.
+saved: u32 = 0,
 /// Inline assembly marked the return address undefined (`.cfi_undefined
 /// %rip`): this is the outermost frame.
 outermost_frame: bool = false,
@@ -94,6 +97,10 @@ pub const Error = Allocator.Error || error{CodegenFail};
 /// Where an instruction's value lives.
 const Home = union(enum) {
     none,
+    /// The value is in this register (see `planRegisters`).
+    reg: Reg,
+    /// A condition fused into its block's branch, which computes it.
+    fused,
     /// The value is stored at `[rbp + off]`.
     slot: i32,
     /// The value is the address `rbp + off` (an `alloc`).
@@ -103,6 +110,8 @@ const Home = union(enum) {
 /// Where an operand's value can be read.
 const Loc = union(enum) {
     none,
+    /// The value is in a register, extended to 64 bits.
+    reg: Reg,
     /// The value is stored in memory.
     mem: Mem,
     /// The value is the address of this memory.
@@ -120,10 +129,12 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const t0 = std.Io.Timestamp.now(emit.zcu.io, .awake);
     try emit.ssa.build(gpa, ir);
     const t1 = std.Io.Timestamp.now(emit.zcu.io, .awake);
+    var t2 = t1;
     defer {
         const s = &emit.codegen_stats;
         s.build_ns += @intCast(t0.durationTo(t1).nanoseconds);
-        s.emit_ns += @intCast(t1.durationTo(.now(emit.zcu.io, .awake)).nanoseconds);
+        s.alloc_ns += @intCast(t1.durationTo(t2).nanoseconds);
+        s.emit_ns += @intCast(t2.durationTo(.now(emit.zcu.io, .awake)).nanoseconds);
         s.functions += 1;
         s.ir_insts += ir.instructions.len;
     }
@@ -149,14 +160,19 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.dbg_open.deinit(gpa);
     }
     @memset(cg.homes, .none);
+    try cg.planRegisters();
+    t2 = std.Io.Timestamp.now(emit.zcu.io, .awake);
 
     // The prologue belongs to the declaration's line.
     try cg.e.line(0, 0);
     const naked = cg.fn_ty.cc == .naked;
     var frame_patch: usize = 0;
+    const saved_size = 8 * @popCount(cg.saved);
     if (!naked) {
         try cg.e.push(.rbp);
         try cg.e.mov(.qword, .{ .reg = .rbp }, .{ .reg = .rsp });
+        for (alloc_regs, 0..) |r, i| if (cg.saved >> @intCast(i) & 1 != 0) try cg.e.push(r);
+        cg.slots_size = saved_size;
         // Placeholder large enough for the imm32 form; patched below.
         try cg.e.alu(.sub, .qword, .{ .reg = .rsp }, .{ .imm = 0x10000 });
         frame_patch = cg.e.code.items.len;
@@ -166,7 +182,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     cg.e.finish();
 
     if (!naked) {
-        const frame = std.mem.alignForward(u32, cg.slots_size + cg.out_args_size, 16);
+        // The saved registers are pushed already.
+        const frame = std.mem.alignForward(u32, cg.slots_size + cg.out_args_size, 16) - saved_size;
         if (frame <= 4096) {
             std.mem.writeInt(u32, cg.e.code.items[frame_patch - 4 ..][0..4], frame, .little);
         } else {
@@ -378,6 +395,8 @@ fn typeOf(cg: *CodeGen, ref: Ref) Index {
 fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
     if (ref.toIndex()) |inst| return switch (cg.homes[@backingInt(inst)]) {
         .none => .none,
+        .reg => |r| .{ .reg = r },
+        .fused => unreachable, // read only by its branch
         .slot => |off| .{ .mem = Mem.at(.rbp, off) },
         .frame_addr => |off| .{ .addr = Mem.at(.rbp, off) },
     };
@@ -389,7 +408,14 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
     const ty = ip.typeOf(val);
     if (!Type.hasRuntimeBits(ip, ty)) return .none;
     switch (ip.indexToKey(val)) {
-        .undef => if (cg.passInRegs(ty)) return .{ .imm = 0xaaaa_aaaa_aaaa_aaaa },
+        .undef => if (cg.passInRegs(ty)) {
+            // The 0xaa bytes of its size, extended as a load extends them.
+            const bits: u6 = @intCast(Type.abiSize(ip, ty) * 8 % 64);
+            const v: u64 = 0xaaaa_aaaa_aaaa_aaaa;
+            if (bits == 0) return .{ .imm = v };
+            if (cg.signed(ty)) return .{ .imm = @bitCast(@as(i64, @bitCast(v << @intCast(64 - @as(u7, bits)))) >> @intCast(64 - @as(u7, bits))) };
+            return .{ .imm = v >> @intCast(64 - @as(u7, bits)) };
+        },
         .int => if (cg.passInRegs(ty)) return .{ .imm = intBits(ip, val) },
         .float => |f| if (cg.passInRegs(ty)) return .{ .imm = @truncate(f.bits()) },
         .simple_value => |s| switch (s) {
@@ -440,6 +466,7 @@ fn load(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
     const ty = cg.typeOf(ref);
     switch (try cg.locOf(ref)) {
         .none => try cg.e.mov(.dword, .{ .reg = reg }, .{ .imm = 0 }),
+        .reg => |r| if (r != reg) try cg.e.mov(.qword, .{ .reg = reg }, .{ .reg = r }),
         .imm => |v| try cg.e.mov(.qword, .{ .reg = reg }, .{ .imm = @bitCast(v) }),
         .addr => |m| try cg.e.lea(.qword, reg, m),
         .err => |name| try cg.loadError(reg, name),
@@ -488,6 +515,7 @@ fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
     const loc = try cg.locOf(ref);
     switch (loc) {
         .none => {},
+        .reg => |r| try cg.storeReg(dst, r, size),
         .mem => |src| try cg.copyMem(dst, src, size),
         .imm => |v| if (cg.passInRegs(ty)) {
             try cg.e.mov(.qword, .{ .reg = .rax }, .{ .imm = @bitCast(v) });
@@ -572,6 +600,307 @@ fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 }
 
 // ---------------------------------------------------------------------------
+// Registers
+//
+// Values of scalar types (integers up to 64 bits, bools, pointers, error
+// codes, optional pointers) that the instructions below compute in a
+// register get one from linear scan (`Ssa.allocate`); the rest, and those
+// it spills, live in slots as before. Every lowering, including the
+// per-instruction code, uses only caller-saved registers as scratch, and
+// calls preserve the callee-saved ones, so the allocator hands out only
+// callee-saved registers: a value keeps its register across instructions
+// and calls without constraints. The prologue saves the ones the function
+// uses. A register holds its value extended to 64 bits, as `load` leaves
+// it. Inline assembly names registers itself, so a function containing
+// some keeps every value in memory.
+
+/// The registers the allocator hands out, in the order the prologue saves
+/// them.
+const alloc_regs = [_]Reg{ .rbx, .r12, .r13, .r14, .r15 };
+
+fn planRegisters(cg: *CodeGen) Error!void {
+    if (cg.fn_ty.cc == .naked) return;
+    const f = &cg.emit.ssa;
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    const insts = f.values.items(.inst);
+    for (insts) |inst| if (tags[@backingInt(inst)] == .assembly) return;
+    try f.liveness(cg.gpa, ir);
+    const live = f.live.slice();
+    const uses = live.items(.uses);
+    const reg = live.items(.reg);
+    const tie = live.items(.tie);
+    const datas = ir.instructions.items(.data);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        const cond: ?Inst.Index = if (b.term.tag == .branch) datas[@backingInt(b.term.inst)].pl_op.operand.toIndex() else null;
+        for (insts[b.start..][0..b.len]) |inst| {
+            const i = @backingInt(inst);
+            if (cond != null and cond.? == inst and uses[i] == 1 and cg.fusable(inst)) {
+                cg.homes[i] = .fused;
+            } else if (cg.wantsReg(inst)) {
+                reg[i] = Ssa.want_reg;
+                tie[i] = cg.tiedOperand(inst);
+            }
+        }
+    }
+    cg.saved = f.allocate(alloc_regs.len);
+    for (insts) |inst| {
+        const r = reg[@backingInt(inst)];
+        if (r != Ssa.no_reg) cg.homes[@backingInt(inst)] = .{ .reg = alloc_regs[r] };
+    }
+}
+
+/// Whether `ty`'s values fit a general-purpose register.
+fn inGpr(cg: *CodeGen, ty: Index) bool {
+    const ip = cg.ip;
+    if (!cg.passInRegs(ty)) return false;
+    return switch (Type.class(ip, ty)) {
+        .bool, .error_set, .int, .@"enum" => true,
+        .pointer => !Type.isSlice(ip, ty),
+        .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, ty)),
+        else => false,
+    };
+}
+
+/// Whether integer, bool, or pointer operand `ref` takes the scalar paths.
+fn scalarOperand(cg: *CodeGen, ref: Ref) bool {
+    const ty = cg.typeOf(ref);
+    return !cg.isFloat(ty) and !cg.isWideInt(ty) and cg.passInRegs(ty);
+}
+
+/// Whether condition `inst` can be computed by the branch it decides.
+fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    return switch (cg.ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.scalarOperand(data.bin_op.lhs),
+        .is_err, .is_non_err, .is_null, .is_non_null => true,
+        else => false,
+    };
+}
+
+/// Whether value `inst` is computed by code that leaves it in a register
+/// (`setResult`).
+fn wantsReg(cg: *CodeGen, inst: Inst.Index) bool {
+    const ir = cg.ir;
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    const tag = ir.instructions.items(.tag)[@backingInt(inst)];
+    const wanted = switch (tag) {
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => cg.scalarOperand(data.bin_op.lhs),
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.scalarOperand(data.bin_op.lhs),
+        .not, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => !cg.isWideInt(cg.typeOf(data.ty_op.operand)),
+        .intcast, .trunc, .bitcast, .ptr_from_int => cg.passInRegs(cg.typeOf(data.ty_op.operand)) and !cg.isWideInt(cg.typeOf(data.ty_op.operand)),
+        .load, .int_from_bool, .int_from_ptr, .is_null, .is_non_null, .is_err, .is_non_err => true,
+        .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_add, .ptr_elem_val, .slice_elem_val => true,
+        .slice_ptr, .slice_len, .optional_payload, .optional_payload_ptr, .optional_payload_ptr_set => true,
+        .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => true,
+        .call, .atomic_load, .atomic_rmw, .ret_addr, .frame_addr, .extern_ptr, .err_return_trace, .save_err_return_trace_index, .tls_ptr, .get_union_tag => true,
+        else => false,
+    };
+    return wanted and cg.inGpr(ir.typeOfIndex(inst, cg.ip));
+}
+
+/// The operand whose register value `inst`'s lowering may write its result
+/// to: the first, which every lowering reads before it writes the result
+/// (it reads the others first, or they are in memory).
+fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
+    const T = struct {
+        first: ?Ref = null,
+        pub fn use(t: *@This(), ref: Ref) void {
+            if (t.first == null) t.first = ref;
+        }
+    };
+    var t: T = .{};
+    Ssa.forEachOperand(cg.ir, inst, &t);
+    const first = t.first orelse return Ssa.no_tie;
+    return if (first.toIndex()) |i| @backingInt(i) else Ssa.no_tie;
+}
+
+/// The register to compute value `inst` in: its home, or rax for a value
+/// kept in memory.
+fn destReg(cg: *CodeGen, inst: Inst.Index) Reg {
+    return switch (cg.homes[@backingInt(inst)]) {
+        .reg => |r| r,
+        else => .rax,
+    };
+}
+
+/// Moves value `inst` of type `ty`, computed in `reg` and extended to 64
+/// bits, to its home.
+fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void {
+    switch (cg.homes[@backingInt(inst)]) {
+        .reg => |r| if (r != reg) try cg.e.mov(.qword, .{ .reg = r }, .{ .reg = reg }),
+        else => {
+            const m = try cg.resultMem(inst, ty) orelse return;
+            try cg.storeReg(m, reg, Type.abiSize(cg.ip, ty));
+        },
+    }
+}
+
+/// A register holding `ref`, extended to 64 bits: its home, or `scratch`
+/// loaded with it.
+fn regOf(cg: *CodeGen, ref: Ref, scratch: Reg) Error!Reg {
+    if (ref.toIndex()) |inst| switch (cg.homes[@backingInt(inst)]) {
+        .reg => |r| return r,
+        else => {},
+    };
+    try cg.load(scratch, ref);
+    return scratch;
+}
+
+/// `ref` as the source of a 64-bit instruction: its register, an immediate
+/// that fits sign-extended in 32 bits, its memory if it is 8 bytes, or
+/// `scratch` loaded with it.
+fn srcOperand(cg: *CodeGen, ref: Ref, scratch: Reg) Error!Encoder.Operand {
+    switch (try cg.locOf(ref)) {
+        .reg => |r| return .{ .reg = r },
+        .imm => |v| if (std.math.cast(i32, @as(i64, @bitCast(v)))) |x| return .{ .imm = x },
+        .mem => |m| if (Type.abiSize(cg.ip, cg.typeOf(ref)) == 8) return .{ .mem = m },
+        else => {},
+    }
+    try cg.load(scratch, ref);
+    return .{ .reg = scratch };
+}
+
+/// The memory pointer `ptr` points to. May use r10.
+fn ptrMem(cg: *CodeGen, ptr: Ref) Error!Mem {
+    switch (try cg.locOf(ptr)) {
+        .addr => |m| return m,
+        .reg => |r| return Mem.at(r, 0),
+        else => {
+            try cg.load(.r10, ptr);
+            return Mem.at(.r10, 0);
+        },
+    }
+}
+
+/// `d = ptr + off`.
+fn addrPlus(cg: *CodeGen, d: Reg, ptr: Ref, off: u64) Error!void {
+    switch (try cg.locOf(ptr)) {
+        .addr => |m| try cg.e.lea(.qword, d, offsetMem(m, off)),
+        .reg => |r| if (off != 0)
+            try cg.e.lea(.qword, d, Mem.at(r, @intCast(off)))
+        else if (r != d)
+            try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = r }),
+        else => {
+            try cg.load(d, ptr);
+            if (off != 0) try cg.e.alu(.add, .qword, .{ .reg = d }, .{ .imm = @intCast(off) });
+        },
+    }
+}
+
+/// Stores the `size`-byte value `ref` to `m`, which is not based on rax.
+fn storeVal(cg: *CodeGen, m: Mem, ref: Ref, size: u64) Error!void {
+    switch (try cg.locOf(ref)) {
+        .reg => |r| return cg.storeReg(m, r, size),
+        .imm => |v| if (size < 8 or std.math.cast(i32, @as(i64, @bitCast(v))) != null)
+            return cg.e.mov(sizeOf(size), .{ .mem = m }, .{ .imm = @bitCast(v) }),
+        else => {},
+    }
+    try cg.load(.rax, ref);
+    try cg.storeReg(m, .rax, size);
+}
+
+/// `d = base + index * size`, where `base` is a pointer or, if `is_slice`,
+/// a slice. Uses rcx.
+fn elemAddrTo(cg: *CodeGen, d: Reg, is_slice: bool, base: Ref, index: Ref, size: u64) Error!void {
+    const base_reg: Reg = if (is_slice) blk: {
+        try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = try cg.memOf(base) });
+        break :blk d;
+    } else try cg.regOf(base, d);
+    if (index.toInterned() != null) switch (try cg.locOf(index)) {
+        .imm => |v| if (std.math.cast(i32, @as(i64, @bitCast(v)) *% @as(i64, @intCast(size)))) |off| {
+            if (off != 0) return cg.e.lea(.qword, d, Mem.at(base_reg, off));
+            if (base_reg != d) try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = base_reg });
+            return;
+        },
+        else => {},
+    };
+    const idx = try cg.regOf(index, .rcx);
+    const scale: ?Mem.Scale = switch (size) {
+        1 => .@"1",
+        2 => .@"2",
+        4 => .@"4",
+        8 => .@"8",
+        else => null,
+    };
+    if (size == 0) {
+        if (base_reg != d) try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = base_reg });
+    } else if (scale) |sc| {
+        try cg.e.lea(.qword, d, .{ .base = .{ .reg = base_reg }, .index = .{ .reg = idx, .scale = sc } });
+    } else {
+        try cg.e.imul(.qword, .rcx, .{ .reg = idx }, @intCast(size));
+        try cg.e.lea(.qword, d, .{ .base = .{ .reg = base_reg }, .index = .{ .reg = .rcx } });
+    }
+}
+
+/// Sets the flags for condition `inst` (a compare, `is_err`, or `is_null`
+/// and their negations) and returns the condition code that holds when it
+/// is true.
+fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
+    const ip = cg.ip;
+    const tag = cg.ir.instructions.items(.tag)[@backingInt(inst)];
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    switch (tag) {
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+            const s = cg.signed(cg.typeOf(data.bin_op.lhs));
+            const rhs = try cg.srcOperand(data.bin_op.rhs, .rcx);
+            const lhs = try cg.regOf(data.bin_op.lhs, .rax);
+            try cg.e.alu(.cmp, .qword, .{ .reg = lhs }, rhs);
+            return switch (tag) {
+                .cmp_lt => if (s) .l else .b,
+                .cmp_lte => if (s) .le else .be,
+                .cmp_eq => .e,
+                .cmp_gte => if (s) .ge else .ae,
+                .cmp_gt => if (s) .g else .a,
+                .cmp_neq => .ne,
+                else => unreachable,
+            };
+        },
+        .is_err, .is_non_err => {
+            const src = try cg.memOf(data.un_op);
+            try cg.e.alu(.cmp, .word, .{ .mem = src }, .{ .imm = 0 });
+            return if (tag == .is_err) .ne else .e;
+        },
+        .is_null, .is_non_null => {
+            const opt_ty = cg.typeOf(data.un_op);
+            const child = Type.childType(ip, opt_ty);
+            if (Type.optionalReprIsPtr(ip, child)) {
+                const r = try cg.regOf(data.un_op, .rax);
+                try cg.e.@"test"(.qword, .{ .reg = r }, .{ .reg = r });
+            } else if (Type.optionalReprIsPayload(ip, child)) {
+                // A slice's `ptr` or an error code; zero is null.
+                const src = try cg.memOf(data.un_op);
+                try cg.e.alu(.cmp, if (Type.isSlice(ip, child)) .qword else .word, .{ .mem = src }, .{ .imm = 0 });
+            } else {
+                const src = try cg.memOf(data.un_op);
+                try cg.e.alu(.cmp, .byte, .{ .mem = offsetMem(src, Type.optionalFlagOffset(ip, opt_ty)) }, .{ .imm = 0 });
+            }
+            return if (tag == .is_null) .e else .ne;
+        },
+        else => unreachable,
+    }
+}
+
+/// The function's epilogue: restores the saved registers and returns.
+fn epilogue(cg: *CodeGen) Error!void {
+    // The epilogue belongs to the closing brace, as in upstream's line tables.
+    try cg.e.line(cg.ir.rbrace_line, cg.ir.rbrace_column);
+    if (cg.saved != 0) {
+        try cg.e.lea(.qword, .rsp, Mem.at(.rbp, -8 * @as(i32, @popCount(cg.saved))));
+        var i: usize = alloc_regs.len;
+        while (i > 0) {
+            i -= 1;
+            if (cg.saved >> @intCast(i) & 1 != 0) try cg.e.pop(alloc_regs[i]);
+        }
+    } else {
+        try cg.e.mov(.qword, .{ .reg = .rsp }, .{ .reg = .rbp });
+    }
+    try cg.e.pop(.rbp);
+    try cg.e.ret();
+}
+
+// ---------------------------------------------------------------------------
 // Instructions
 
 /// Emits the SSA blocks in layout order.
@@ -612,8 +941,13 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         .branch => {
             try cg.checkNaked(tag);
             assert(@backingInt(next) == term.succ[0]);
-            try cg.load(.rax, data.pl_op.operand);
-            try cg.e.@"test"(.byte, .{ .reg = .rax }, .{ .reg = .rax });
+            const cond = data.pl_op.operand;
+            if (cond.toIndex()) |c| if (cg.homes[@backingInt(c)] == .fused) {
+                const cc = try cg.condFlags(c);
+                return cg.e.jcc(cc.negate(), .{ .label = cg.labels[term.succ[1]] });
+            };
+            const r = try cg.regOf(cond, .rax);
+            try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
             try cg.e.jcc(.e, .{ .label = cg.labels[term.succ[1]] });
         },
         .switch_br => {
@@ -667,7 +1001,14 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             cg.homes[@backingInt(inst)] = .{ .slot = home };
         },
         .load => {
-            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
+            const ty = data.ty_op.ty;
+            if (cg.passInRegs(ty)) {
+                const m = try cg.ptrMem(data.ty_op.operand);
+                const d = cg.destReg(inst);
+                try cg.loadMem(d, m, ty);
+                return cg.setResult(inst, ty, d);
+            }
+            const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.load(.r10, data.ty_op.operand);
             try cg.copyMem(dst, Mem.at(.r10, 0), Type.abiSize(ip, data.ty_op.ty));
         },
@@ -675,6 +1016,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const val = data.bin_op.rhs;
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
+            if (cg.passInRegs(cg.typeOf(val))) return cg.storeVal(try cg.ptrMem(data.bin_op.lhs), val, size);
             try cg.load(.r10, data.bin_op.lhs);
             if (val.toInterned()) |v| if (ip.indexToKey(v) == .undef) return cg.fillMem(Mem.at(.r10, 0), size, 0xaa);
             try cg.copyTo(Mem.at(.r10, 0), val);
@@ -684,9 +1026,17 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = cg.typeOf(data.bin_op.lhs);
             if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
-            const dst = try cg.resultMem(inst, ty) orelse return;
-            try cg.binOp(tag, ty, data.bin_op.lhs, data.bin_op.rhs);
-            try cg.storeReg(dst, .rax, Type.abiSize(ip, ty));
+            switch (tag) {
+                .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr => {
+                    const d = cg.destReg(inst);
+                    try cg.intOp(d, tag, ty, data.bin_op.lhs, data.bin_op.rhs);
+                    try cg.setResult(inst, ty, d);
+                },
+                else => {
+                    try cg.binOp(tag, ty, data.bin_op.lhs, data.bin_op.rhs);
+                    try cg.setResult(inst, ty, .rax);
+                },
+            }
         },
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => if (cg.isWideInt(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)))
             try cg.genWide(inst, tag, data)
@@ -698,43 +1048,30 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .not => {
             const ty = data.ty_op.ty;
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
-            const dst = try cg.resultMem(inst, ty) orelse return;
-            try cg.load(.rax, data.ty_op.operand);
+            const d = cg.destReg(inst);
+            try cg.load(d, data.ty_op.operand);
             if (ty == .bool_type) {
-                try cg.e.alu(.xor, .dword, .{ .reg = .rax }, .{ .imm = 1 });
+                try cg.e.alu(.xor, .dword, .{ .reg = d }, .{ .imm = 1 });
             } else {
-                try cg.e.unary(.not, .qword, .{ .reg = .rax });
-                try cg.normalize(.rax, ty);
+                try cg.e.unary(.not, .qword, .{ .reg = d });
+                try cg.normalize(d, ty);
             }
-            try cg.storeReg(dst, .rax, Type.abiSize(ip, ty));
+            try cg.setResult(inst, ty, d);
         },
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
             const ty = cg.typeOf(data.bin_op.lhs);
             if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
-            const dst = try cg.resultMem(inst, .bool_type) orelse return;
-            try cg.load(.rax, data.bin_op.lhs);
-            try cg.load(.rcx, data.bin_op.rhs);
-            try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
-            const s = cg.signed(ty);
-            const cond: Encoder.Cond = switch (tag) {
-                .cmp_lt => if (s) .l else .b,
-                .cmp_lte => if (s) .le else .be,
-                .cmp_eq => .e,
-                .cmp_gte => if (s) .ge else .ae,
-                .cmp_gt => if (s) .g else .a,
-                .cmp_neq => .ne,
-                else => unreachable,
-            };
-            try cg.e.setcc(cond, .{ .mem = dst });
+            try cg.genCond(inst);
         },
         .atomic_load => {
             const ty = data.ty_op.ty;
             const size = Type.abiSize(ip, ty);
-            const dst = try cg.resultMem(inst, ty) orelse return;
+            if (size == 0) return;
             try cg.load(.rcx, data.ty_op.operand);
-            try cg.e.mov(sizeOf(size), .{ .reg = .rax }, .{ .mem = Mem.at(.rcx, 0) });
-            try cg.storeReg(dst, .rax, size);
+            const d = cg.destReg(inst);
+            try cg.loadMem(d, Mem.at(.rcx, 0), ty);
+            try cg.setResult(inst, ty, d);
         },
         .atomic_store => {
             const size = Type.abiSize(ip, cg.typeOf(data.bin_op.rhs));
@@ -763,13 +1100,13 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
         },
         .ret_addr, .frame_addr => {
-            const dst = try cg.resultMem(inst, .usize_type) orelse return;
+            const d = cg.destReg(inst);
             if (tag == .ret_addr) {
-                try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rbp, 8) });
+                try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = Mem.at(.rbp, 8) });
             } else {
-                try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rbp });
+                try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = .rbp });
             }
-            try cg.storeReg(dst, .rax, 8);
+            try cg.setResult(inst, .usize_type, d);
         },
         .extern_ptr => {
             const name = ip.stringSlice(@fromBackingInt(data.ty_pl.payload));
@@ -777,9 +1114,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             // Analyzes the compiler_rt function the slot will point to.
             _ = try cg.emit.requestCompilerRtExport(name);
             const slot = try cg.emit.useExtern(name, weak);
-            const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
-            try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.sym(slot, 0) });
-            try cg.storeReg(dst, .rax, 8);
+            const d = cg.destReg(inst);
+            try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = Mem.sym(slot, 0) });
+            try cg.setResult(inst, data.ty_pl.ty, d);
         },
         .c_va_start => try cg.cVaStart(inst, data.ty),
         .c_va_arg => try cg.cVaArg(inst, data.ty_op.ty, data.ty_op.operand),
@@ -789,9 +1126,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, Mem.at(.rdx, 0), 24);
         },
         .err_return_trace => {
-            const dst = try cg.resultMem(inst, data.ty) orelse return;
-            try cg.loadTrace(.rax);
-            try cg.storeReg(dst, .rax, 8);
+            const d = cg.destReg(inst);
+            try cg.loadTrace(d);
+            try cg.setResult(inst, data.ty, d);
         },
         .set_err_return_trace => {
             if (cg.trace_slot == null) cg.trace_slot = try cg.allocSlot(8, 8);
@@ -800,31 +1137,32 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .save_err_return_trace_index => {
             if (data.ty_pl.ty == .none) return;
-            const dst = try cg.resultMem(inst, .usize_type) orelse return;
             if (cg.trace_slot) |off| {
                 try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rbp, off) });
                 try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.at(.rax, @intCast(Type.fieldOffset(ip, data.ty_pl.ty, data.ty_pl.payload))) });
             } else {
                 try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = 0 });
             }
-            try cg.storeReg(dst, .rax, 8);
+            try cg.setResult(inst, .usize_type, .rax);
         },
         .tls_ptr => {
             const key = try cg.emit.navKey(@fromBackingInt(data.ty_pl.payload));
-            const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
-            try cg.e.leaThreadLocal(.rax, key);
-            try cg.storeReg(dst, .rax, 8);
+            const d = cg.destReg(inst);
+            try cg.e.leaThreadLocal(d, key);
+            try cg.setResult(inst, data.ty_pl.ty, d);
         },
         .intcast, .trunc, .bitcast, .ptr_from_int => {
             const ty = data.ty_op.ty;
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(cg.typeOf(data.ty_op.operand))) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
+            if (cg.passInRegs(ty) and cg.passInRegs(cg.typeOf(data.ty_op.operand))) {
+                const d = cg.destReg(inst);
+                try cg.load(d, data.ty_op.operand);
+                if (Type.isInt(ip, ty)) try cg.normalize(d, ty);
+                return cg.setResult(inst, ty, d);
+            }
             const dst = try cg.resultMem(inst, ty) orelse return;
             const size = Type.abiSize(ip, ty);
-            if (cg.passInRegs(ty) and cg.passInRegs(cg.typeOf(data.ty_op.operand))) {
-                try cg.load(.rax, data.ty_op.operand);
-                if (Type.isInt(ip, ty)) try cg.normalize(.rax, ty);
-                try cg.storeReg(dst, .rax, size);
-            } else if (Type.abiSize(ip, cg.typeOf(data.ty_op.operand)) != size) {
+            if (Type.abiSize(ip, cg.typeOf(data.ty_op.operand)) != size) {
                 // A bitcast between a vector and an array or integer
                 // without its padding: the low bytes.
                 const n = @min(size, Type.abiSize(ip, cg.typeOf(data.ty_op.operand)));
@@ -851,10 +1189,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, Mem.at(.rcx, 0), 16);
         },
         .int_from_bool, .int_from_ptr => {
-            const ty = ir.typeOfIndex(inst, ip);
-            const dst = try cg.resultMem(inst, ty) orelse return;
-            try cg.load(.rax, data.un_op);
-            try cg.storeReg(dst, .rax, Type.abiSize(ip, ty));
+            const d = cg.destReg(inst);
+            try cg.load(d, data.un_op);
+            try cg.setResult(inst, ir.typeOfIndex(inst, ip), d);
         },
 
         // The block's result, which each `br` writes (see `genTerm`).
@@ -867,26 +1204,31 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
 
         .struct_field_ptr => {
             const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
-            const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
             const container = Type.ptrInfo(ip, cg.typeOf(sf.operand)).child;
-            try cg.load(.rax, sf.operand);
-            const off = Type.fieldOffset(ip, container, sf.index);
-            if (off != 0) try cg.e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = @intCast(off) });
-            try cg.storeReg(dst, .rax, 8);
+            const d = cg.destReg(inst);
+            try cg.addrPlus(d, sf.operand, Type.fieldOffset(ip, container, sf.index));
+            try cg.setResult(inst, data.ty_pl.ty, d);
         },
         .struct_field_val => {
             const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
-            const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
-            const src = try cg.memOf(sf.operand);
+            const ty = data.ty_pl.ty;
             const off = Type.fieldOffset(ip, cg.typeOf(sf.operand), sf.index);
-            try cg.copyMem(dst, offsetMem(src, off), Type.abiSize(ip, data.ty_pl.ty));
+            if (cg.passInRegs(ty)) {
+                const src = try cg.memOf(sf.operand);
+                const d = cg.destReg(inst);
+                try cg.loadMem(d, offsetMem(src, off), ty);
+                return cg.setResult(inst, ty, d);
+            }
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const src = try cg.memOf(sf.operand);
+            try cg.copyMem(dst, offsetMem(src, off), Type.abiSize(ip, ty));
         },
         .ptr_elem_ptr, .slice_elem_ptr, .ptr_add => {
             const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
-            const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
-            const elem_ty = if (tag == .ptr_add) Type.ptrInfo(ip, data.ty_pl.ty).child else Type.ptrInfo(ip, data.ty_pl.ty).child;
-            try cg.elemAddr(.rax, tag == .slice_elem_ptr, bin.lhs, bin.rhs, Type.abiSize(ip, elem_ty));
-            try cg.storeReg(dst, .rax, 8);
+            const elem_ty = Type.ptrInfo(ip, data.ty_pl.ty).child;
+            const d = cg.destReg(inst);
+            try cg.elemAddrTo(d, tag == .slice_elem_ptr, bin.lhs, bin.rhs, Type.abiSize(ip, elem_ty));
+            try cg.setResult(inst, data.ty_pl.ty, d);
         },
         .vector_store_elem => {
             const bin = ir.extraData(Ir.Bin, data.pl_op.payload).data;
@@ -913,8 +1255,14 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .ptr_elem_val, .slice_elem_val => {
             const ty = ir.typeOfIndex(inst, ip);
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const size = Type.abiSize(ip, ty);
+            if (cg.passInRegs(ty)) {
+                try cg.elemAddrTo(.r10, tag == .slice_elem_val, data.bin_op.lhs, data.bin_op.rhs, size);
+                const d = cg.destReg(inst);
+                try cg.loadMem(d, Mem.at(.r10, 0), ty);
+                return cg.setResult(inst, ty, d);
+            }
+            const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.elemAddr(.r10, tag == .slice_elem_val, data.bin_op.lhs, data.bin_op.rhs, size);
             try cg.copyMem(dst, Mem.at(.r10, 0), size);
         },
@@ -940,9 +1288,10 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.copyMem(dst, Mem.at(.r10, 0), size);
         },
         .slice_ptr, .slice_len => {
-            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
             const src = try cg.memOf(data.ty_op.operand);
-            try cg.copyMem(dst, offsetMem(src, if (tag == .slice_len) 8 else 0), 8);
+            const d = cg.destReg(inst);
+            try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = offsetMem(src, if (tag == .slice_len) 8 else 0) });
+            try cg.setResult(inst, data.ty_op.ty, d);
         },
         .slice => {
             const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
@@ -953,42 +1302,33 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.storeReg(offsetMem(dst, 8), .rax, 8);
         },
 
-        .is_null, .is_non_null => {
-            const dst = try cg.resultMem(inst, .bool_type) orelse return;
-            const opt_ty = cg.typeOf(data.un_op);
-            const child = Type.childType(ip, opt_ty);
-            if (Type.optionalReprIsPtr(ip, child)) {
-                try cg.load(.rax, data.un_op);
-                try cg.e.@"test"(.qword, .{ .reg = .rax }, .{ .reg = .rax });
-            } else if (Type.optionalReprIsPayload(ip, child)) {
-                // A slice's `ptr` or an error code; zero is null.
-                const src = try cg.memOf(data.un_op);
-                try cg.e.alu(.cmp, if (Type.isSlice(ip, child)) .qword else .word, .{ .mem = src }, .{ .imm = 0 });
-            } else {
-                const src = try cg.memOf(data.un_op);
-                try cg.e.alu(.cmp, .byte, .{ .mem = offsetMem(src, Type.optionalFlagOffset(ip, opt_ty)) }, .{ .imm = 0 });
-            }
-            try cg.e.setcc(if (tag == .is_null) .e else .ne, .{ .mem = dst });
-        },
+        .is_null, .is_non_null, .is_err, .is_non_err => try cg.genCond(inst),
         .optional_payload => {
-            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
             const child = data.ty_op.ty;
             if (Type.optionalReprIsPtr(ip, child)) {
-                try cg.copyTo(dst, data.ty_op.operand);
-            } else {
-                try cg.copyMem(dst, try cg.memOf(data.ty_op.operand), Type.abiSize(ip, child));
+                const d = cg.destReg(inst);
+                try cg.load(d, data.ty_op.operand);
+                return cg.setResult(inst, child, d);
             }
+            if (cg.passInRegs(child)) {
+                const src = try cg.memOf(data.ty_op.operand);
+                const d = cg.destReg(inst);
+                try cg.loadMem(d, src, child);
+                return cg.setResult(inst, child, d);
+            }
+            const dst = try cg.resultMem(inst, child) orelse return;
+            try cg.copyMem(dst, try cg.memOf(data.ty_op.operand), Type.abiSize(ip, child));
         },
         .optional_payload_ptr, .optional_payload_ptr_set => {
-            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
-            try cg.load(.rax, data.ty_op.operand);
+            const d = cg.destReg(inst);
+            try cg.load(d, data.ty_op.operand);
             if (tag == .optional_payload_ptr_set) {
                 const opt_ty = Type.ptrInfo(ip, cg.typeOf(data.ty_op.operand)).child;
                 if (!Type.optionalReprIsPayload(ip, Type.childType(ip, opt_ty))) {
-                    try cg.e.mov(.byte, .{ .mem = Mem.at(.rax, @intCast(Type.optionalFlagOffset(ip, opt_ty))) }, .{ .imm = 1 });
+                    try cg.e.mov(.byte, .{ .mem = Mem.at(d, @intCast(Type.optionalFlagOffset(ip, opt_ty))) }, .{ .imm = 1 });
                 }
             }
-            try cg.storeReg(dst, .rax, 8);
+            try cg.setResult(inst, data.ty_op.ty, d);
         },
         .wrap_optional => {
             const opt_ty = data.ty_op.ty;
@@ -998,29 +1338,32 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.e.mov(.byte, .{ .mem = offsetMem(dst, Type.optionalFlagOffset(ip, opt_ty)) }, .{ .imm = 1 });
             }
         },
-        .is_err, .is_non_err => {
-            const dst = try cg.resultMem(inst, .bool_type) orelse return;
-            const src = try cg.memOf(data.un_op);
-            try cg.e.alu(.cmp, .word, .{ .mem = src }, .{ .imm = 0 });
-            try cg.e.setcc(if (tag == .is_err) .ne else .e, .{ .mem = dst });
-        },
         .unwrap_errunion_payload, .unwrap_errunion_err => {
-            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
+            const ty = data.ty_op.ty;
             const eu_ty = cg.typeOf(data.ty_op.operand);
             const layout = Type.errorUnionLayout(ip, eu_ty);
-            const src = try cg.memOf(data.ty_op.operand);
             const off = if (tag == .unwrap_errunion_err) layout.err_offset else layout.payload_offset;
-            try cg.copyMem(dst, offsetMem(src, off), Type.abiSize(ip, data.ty_op.ty));
+            if (cg.passInRegs(ty)) {
+                const src = try cg.memOf(data.ty_op.operand);
+                const d = cg.destReg(inst);
+                try cg.loadMem(d, offsetMem(src, off), ty);
+                return cg.setResult(inst, ty, d);
+            }
+            const dst = try cg.resultMem(inst, ty) orelse return;
+            const src = try cg.memOf(data.ty_op.operand);
+            try cg.copyMem(dst, offsetMem(src, off), Type.abiSize(ip, ty));
         },
         .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => {
-            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
             const eu_ty = Type.ptrInfo(ip, cg.typeOf(data.ty_op.operand)).child;
             const layout = Type.errorUnionLayout(ip, eu_ty);
-            try cg.load(.rax, data.ty_op.operand);
-            if (tag == .errunion_payload_ptr_set) try cg.e.mov(.word, .{ .mem = Mem.at(.rax, @intCast(layout.err_offset)) }, .{ .imm = 0 });
             const off = if (tag == .unwrap_errunion_err_ptr) layout.err_offset else layout.payload_offset;
-            if (off != 0) try cg.e.alu(.add, .qword, .{ .reg = .rax }, .{ .imm = @intCast(off) });
-            try cg.storeReg(dst, .rax, 8);
+            const d = cg.destReg(inst);
+            if (tag == .errunion_payload_ptr_set) {
+                try cg.load(d, data.ty_op.operand);
+                try cg.e.mov(.word, .{ .mem = Mem.at(d, @intCast(layout.err_offset)) }, .{ .imm = 0 });
+                if (off != 0) try cg.e.alu(.add, .qword, .{ .reg = d }, .{ .imm = @intCast(off) });
+            } else try cg.addrPlus(d, data.ty_op.operand, off);
+            try cg.setResult(inst, data.ty_op.ty, d);
         },
         .wrap_errunion_payload, .wrap_errunion_err => {
             const eu_ty = data.ty_op.ty;
@@ -1069,9 +1412,15 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
         },
         .get_union_tag => {
-            const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
+            const ty = data.ty_op.ty;
             const layout = Type.unionLayout(ip, cg.typeOf(data.ty_op.operand));
             const src = try cg.memOf(data.ty_op.operand);
+            if (cg.passInRegs(ty)) {
+                const d = cg.destReg(inst);
+                try cg.loadMem(d, offsetMem(src, layout.tag_offset), ty);
+                return cg.setResult(inst, ty, d);
+            }
+            const dst = try cg.resultMem(inst, ty) orelse return;
             try cg.copyMem(dst, offsetMem(src, layout.tag_offset), layout.tag_size);
         },
         .memcpy, .memmove => {
@@ -1128,11 +1477,10 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .clz, .ctz, .popcount, .byte_swap, .bit_reverse => {
             const ty = data.ty_op.ty;
             if (cg.isWideInt(cg.typeOf(data.ty_op.operand))) return cg.wideBitOp(inst, tag, data);
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const bits = Type.intInfo(ip, cg.typeOf(data.ty_op.operand)).bits;
             try cg.bitOp(tag, bits, data.ty_op.operand);
             if (tag == .byte_swap or tag == .bit_reverse) try cg.normalize(.rax, ty);
-            try cg.storeReg(dst, .rax, Type.abiSize(ip, ty));
+            try cg.setResult(inst, ty, .rax);
         },
         .tag_name => {
             // A compare chain over the tags; each name is a content atom.
@@ -1270,6 +1618,64 @@ fn scaleAdd(cg: *CodeGen, reg: Reg, index: Reg, size: u64) Error!void {
     if (size == 0) return;
     if (size != 1) try cg.e.imul(.qword, index, .{ .reg = index }, @intCast(size));
     try cg.e.alu(.add, .qword, .{ .reg = reg }, .{ .reg = index });
+}
+
+/// A condition as a bool, unless its branch computes it.
+fn genCond(cg: *CodeGen, inst: Inst.Index) Error!void {
+    if (cg.homes[@backingInt(inst)] == .fused) return;
+    const cond = try cg.condFlags(inst);
+    const d = cg.destReg(inst);
+    try cg.e.setcc(cond, .{ .reg = d });
+    try cg.e.movzx(.dword, d, .byte, .{ .reg = d });
+    try cg.setResult(inst, .bool_type, d);
+}
+
+/// `d = lhs op rhs` for the operations with a two-operand form, normalized
+/// to `ty`. `d` is not the register of an operand. Uses rcx.
+fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void {
+    const e = &cg.e;
+    switch (tag) {
+        .shl, .shr => {
+            const op: Encoder.ShiftOp = if (tag == .shl) .shl else if (cg.signed(ty)) .sar else .shr;
+            const count: ?u8 = switch (try cg.locOf(rhs)) {
+                .imm => |v| @intCast(v & 63),
+                else => null,
+            };
+            if (count == null) try cg.load(.rcx, rhs);
+            try cg.load(d, lhs);
+            try e.shift(op, .qword, .{ .reg = d }, count);
+        },
+        .mul_wrap => {
+            const src = try cg.srcOperand(rhs, .rcx);
+            switch (src) {
+                .imm => |v| try e.imul(.qword, d, .{ .reg = try cg.regOf(lhs, d) }, @intCast(v)),
+                .reg => |r| {
+                    try cg.load(d, lhs);
+                    try e.imul(.qword, d, .{ .reg = r }, null);
+                },
+                .mem => |m| {
+                    try cg.load(d, lhs);
+                    try e.imul(.qword, d, .{ .mem = m }, null);
+                },
+            }
+        },
+        else => {
+            const src = try cg.srcOperand(rhs, .rcx);
+            try cg.load(d, lhs);
+            try e.alu(switch (tag) {
+                .add_wrap => .add,
+                .sub_wrap => .sub,
+                .bit_and => .@"and",
+                .bit_or => .@"or",
+                .xor => .xor,
+                else => unreachable,
+            }, .qword, .{ .reg = d }, src);
+        },
+    }
+    switch (tag) {
+        .bit_and, .bit_or, .xor => {}, // stay extended
+        else => try cg.normalize(d, ty),
+    }
 }
 
 /// Computes `lhs op rhs` on 64-bit extended operands into rax, normalized
@@ -1414,11 +1820,7 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
             try cg.load(.rax, operand);
         }
     }
-    // The epilogue belongs to the closing brace, as in upstream's line tables.
-    try cg.e.line(cg.ir.rbrace_line, cg.ir.rbrace_column);
-    try cg.e.mov(.qword, .{ .reg = .rsp }, .{ .reg = .rbp });
-    try cg.e.pop(.rbp);
-    try cg.e.ret();
+    try cg.epilogue();
 }
 
 /// Loads the error return trace pointer, or null if the function has none.
@@ -1444,7 +1846,9 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const callee_fn_ty = cg.typeOf(callee_ref);
     const callee_ty = ip.indexToKey(if (Type.class(ip, callee_fn_ty) == .pointer) Type.ptrInfo(ip, callee_fn_ty).child else callee_fn_ty).func_type;
     const ret_ty = extra.data.ret_ty;
-    const dst = try cg.resultMem(inst, ret_ty);
+    // A result in rax goes to its home after the call.
+    const in_rax = cg.passInRegs(ret_ty) and (callee_ty.cc != .c or cg.cClass(ret_ty) == .int);
+    const dst = if (in_rax) null else try cg.resultMem(inst, ret_ty);
     if (callee_ty.cc == .c) {
         const vals = try cg.gpa.alloc(Val, args.len);
         defer cg.gpa.free(vals);
@@ -1477,8 +1881,15 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         if (callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
         try cg.e.callIndirect(.{ .reg = .r11 });
     }
+    if (in_rax) {
+        // C callees leave the bits above a narrow result unspecified.
+        const size = Type.abiSize(ip, ret_ty);
+        if (callee_ty.cc == .c and size < 8) {
+            if (cg.signed(ret_ty)) try cg.e.movsx(.qword, .rax, sizeOf(size), .{ .reg = .rax }) else try cg.e.movzx(.qword, .rax, sizeOf(size), .{ .reg = .rax });
+        }
+        return cg.setResult(inst, ret_ty, .rax);
+    }
     if (callee_ty.cc == .c) return cg.cCallResult(ret_ty, dst);
-    if (dst) |m| if (cg.passInRegs(ret_ty)) try cg.storeReg(m, .rax, Type.abiSize(ip, ret_ty));
 }
 
 /// `@atomicRmw`: xchg and lock xadd where x86 has them, else a lock
@@ -1511,8 +1922,7 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         try cg.e.movFromXmm(size, .{ .reg = .r8 }, .xmm0);
         try cg.e.lockCmpxchg(size, mem, .r8);
         try cg.e.jcc(.ne, .{ .label = top });
-        const dst = try cg.resultMem(inst, ty) orelse return;
-        return cg.storeReg(dst, .rax, bytes);
+        return cg.setResult(inst, ty, .rax);
     };
     switch (x.operation()) {
         .Xchg => {
@@ -1561,8 +1971,11 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             try cg.e.jcc(.ne, .{ .label = top });
         },
     }
-    const dst = try cg.resultMem(inst, ty) orelse return;
-    try cg.storeReg(dst, .rax, bytes);
+    if (bytes < 8 and Type.hasRuntimeBits(ip, ty)) {
+        // The old value in the low bytes of rax, extended like a load.
+        if (cg.signed(ty)) try cg.e.movsx(.qword, .rax, size, .{ .reg = .rax }) else try cg.e.movzx(.qword, .rax, size, .{ .reg = .rax });
+    }
+    try cg.setResult(inst, ty, .rax);
 }
 
 // ---------------------------------------------------------------------------
@@ -2280,6 +2693,7 @@ fn memVal(ty: Index, m: Mem) Val {
 fn loadVal(cg: *CodeGen, reg: Reg, v: Val) Error!void {
     switch (v.loc) {
         .none => try cg.e.mov(.dword, .{ .reg = reg }, .{ .imm = 0 }),
+        .reg => |r| if (r != reg) try cg.e.mov(.qword, .{ .reg = reg }, .{ .reg = r }),
         .imm => |x| try cg.e.mov(.qword, .{ .reg = reg }, .{ .imm = @bitCast(x) }),
         .addr => |m| try cg.e.lea(.qword, reg, m),
         .err => |name| try cg.loadError(reg, name),
