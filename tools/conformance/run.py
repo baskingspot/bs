@@ -945,6 +945,13 @@ def parse_case(path):
         if m and not expected:
             cfg[m.group(1)] = m.group(2)
         elif text:
+            # Upstream names the case file itself as 'tmp.zig:' when the
+            # errors span several files; zap_lines() writes it as ':'.
+            if text.startswith("tmp.zig:"):
+                text = text[len("tmp.zig"):]
+            # Some cases omit the leading ':' before the line.
+            elif re.match(r"^\d+:\d+: (error|note): ", text):
+                text = ":" + text
             expected.append(text)
     return cfg, expected
 
@@ -974,10 +981,19 @@ def zap_lines(stderr, case_name):
         here = lambda o: os.path.basename(o.get("file", "")) == case_name
         prefix = ":" if here(d) else os.path.basename(d.get("file", "")) + ":"
         errors.append(f"{prefix}{d.get('line', 0)}:{d.get('col', 0)}: error: {d['msg']}")
+        times = lambda o: f" ({o['count']} times)" if o.get("count") else ""
         for n in d.get("notes", []):
-            notes.append(f":{n['line']}:{n['col']}: note: {n['msg']}" if "line" in n and here(n) else f"?: note: {n['msg']}")
+            msg = n["msg"] + times(n)
+            if "line" not in n:
+                notes.append(f"?: note: {msg}")
+            elif here(n):
+                notes.append(f":{n['line']}:{n['col']}: note: {msg}")
+            else:
+                # Upstream names imported files (ZON) and writes ':?:?:'
+                # for the rest; run_case() matches either form.
+                notes.append(f"{os.path.basename(n['file'])}:{n['line']}:{n['col']}: note: {msg}")
         for c in d.get("calls", []):
-            msg = "called inline here" if c["kind"] == "inline" else "called at comptime here"
+            msg = ("called inline here" if c["kind"] == "inline" else "called at comptime here") + times(c)
             notes.append(f":{c['line']}:{c['col']}: note: {msg}" if here(c) else f"?: note: {msg}")
     return errors, notes
 
@@ -1005,6 +1021,10 @@ def run_case(compiler, path, cfg, expected, args, workdir):
     # root.
     root = out_dir / "tmp.zig"
     shutil.copyfile(path, root)
+    # Cases import ZON files from the corpus's own subdirectories.
+    for sub in path.parent.iterdir():
+        if sub.is_dir() and not (out_dir / sub.name).exists():
+            (out_dir / sub.name).symlink_to(sub.resolve())
     if cfg.get("is_test") == "true":
         argv = [str(compiler), "test", "--test-no-exec", f"-Mroot={root}", f"-femit-bin={out_dir / 'case.test'}"]
     elif cfg.get("output_mode", "Obj").lower() == "exe":
@@ -1029,7 +1049,8 @@ def run_case(compiler, path, cfg, expected, args, workdir):
         locs = lambda ls: sorted(l.split(": error:")[0] for l in ls)
         if sorted(errors) == sorted(exp_errors):
             r["status"] = "exact"
-            r["notes_match"] = sorted(notes) == sorted(exp_notes)
+            other = lambda ln: re.sub(r"^[^:\s]+:\d+:\d+: note: ", "?: note: ", ln) if ln not in exp_notes else ln
+            r["notes_match"] = sorted(map(other, notes)) == sorted(exp_notes)
         elif locs(errors) == locs(exp_errors):
             r["status"] = "same_location"
         else:
