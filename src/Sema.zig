@@ -9542,7 +9542,12 @@ fn analyzeCall(
                 else
                     fn_ty.param_types[arg_i];
                 try sema.inst_map.put(sema.gpa, zir_args.call_inst, .fromInterned(param_ty));
-                const arg = try sema.resolveInlineBody(block, body, zir_args.call_inst);
+                // As upstream, an argument to a comptime parameter is
+                // evaluated at comptime.
+                var ct_block = block.child();
+                defer ct_block.instructions.deinit(sema.gpa);
+                if (arg_i < 32 and (fn_ty.comptime_bits >> @intCast(arg_i)) & 1 != 0) ct_block.is_comptime = true;
+                const arg = try sema.resolveInlineBody(if (ct_block.is_comptime) &ct_block else block, body, zir_args.call_inst);
                 args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerce(block, param_ty, arg, src);
                 arg_i += 1;
             }
