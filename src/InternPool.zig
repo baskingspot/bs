@@ -245,6 +245,7 @@ pub const Nav = struct {
     ty: Index = .none,
     val: Index = .none,
     is_const: bool = true,
+    is_threadlocal: bool = false,
     linkage: Zir.Inst.Declaration.Unwrapped.Linkage = .normal,
     /// An explicit `align(n)` in bytes, or 0 for the type's alignment.
     alignment: u64 = 0,

@@ -367,6 +367,7 @@ pub fn createContainerType(
             .is_pub = d.is_pub,
             .linkage = d.linkage,
             .is_const = d.kind != .@"var",
+            .is_threadlocal = d.is_threadlocal,
         });
         switch (d.kind) {
             .@"const", .@"var" => {

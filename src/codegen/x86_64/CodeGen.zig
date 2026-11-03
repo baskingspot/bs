@@ -563,6 +563,12 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = Mem.sym(slot, 0) });
             try cg.storeReg(dst, .rax, 8);
         },
+        .tls_ptr => {
+            const key = try cg.emit.navKey(@fromBackingInt(data.ty_pl.payload));
+            const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
+            try cg.e.leaThreadLocal(.rax, key);
+            try cg.storeReg(dst, .rax, 8);
+        },
         .intcast, .trunc, .bitcast, .ptr_from_int => {
             const ty = data.ty_op.ty;
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(cg.typeOf(data.ty_op.operand))) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);

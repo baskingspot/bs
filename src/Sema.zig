@@ -2002,13 +2002,13 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             const ptr = sema.resolveInst(data.un_node.operand);
             try sema.checkDerefable(block, src, sema.typeOf(ptr));
-            break :blk sema.analyzeLoad(block, src, ptr);
+            break :blk sema.analyzeLoad(block, src, try sema.cPtrToSingle(block, src, ptr));
         },
         .ref_deref => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             const ptr = sema.resolveInst(data.un_node.operand);
             try sema.checkDerefable(block, src, sema.typeOf(ptr));
-            break :blk ptr;
+            break :blk sema.cPtrToSingle(block, src, ptr);
         },
         .ret_ptr => sema.analyzeAlloc(block, block.nodeSrc(data.node), sema.currentRetTy(block), false, block.is_comptime),
 
@@ -3280,6 +3280,11 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     if (nav.linkage == .@"extern") {
         if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
         return sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(nav.name) } } });
+    }
+    // Each thread has its own copy of a threadlocal variable, at an offset
+    // from the thread pointer.
+    if (nav.is_threadlocal and !block.is_comptime) {
+        return sema.addInst(block, .{ .tag = .tls_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(nav_index) } } });
     }
     return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .nav = nav_index } } }));
 }
@@ -6724,8 +6729,26 @@ fn analyzeRef(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!R
     return alloc;
 }
 
+/// Dereferencing a C pointer goes through a single pointer, checked for
+/// null, as upstream.
+fn cPtrToSingle(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref {
+    var info = Type.ptrInfo(sema.ip, sema.typeOf(ptr));
+    if (info.flags.size != .c) return ptr;
+    info.flags.size = .one;
+    info.flags.is_allowzero = false;
+    const single_ty = try sema.ptrType(info);
+    if (sema.resolveValue(ptr)) |v| {
+        const k = sema.ip.indexToKey(v);
+        if (k == .ptr and k.ptr.base == .int and k.ptr.byte_offset == 0) return sema.fail(block, src, "unable to unwrap null", .{});
+    } else if (block.want_safety and !block.is_comptime) {
+        const ok = try sema.addBinOp(block, .cmp_neq, try sema.addUnOp(block, .int_from_ptr, ptr), .fromInterned(.zero_usize));
+        try sema.addSafetyCheck(block, ok, .unwrap_null, .none, .none);
+    }
+    return sema.coercePtrTo(block, ptr, single_ty);
+}
+
 fn checkDerefable(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!void {
-    if (Type.class(sema.ip, ty) != .pointer or Type.ptrInfo(sema.ip, ty).flags.size != .one) {
+    if (Type.class(sema.ip, ty) != .pointer or Type.ptrInfo(sema.ip, ty).flags.size == .many or Type.ptrInfo(sema.ip, ty).flags.size == .slice) {
         return sema.fail(block, src, "cannot dereference non-pointer type '{f}'", .{sema.fmtType(ty)});
     }
 }

@@ -146,6 +146,10 @@ const Printer = struct {
                 try p.ty(data.ty_pl.ty);
                 try w.print(", \"{s}\"", .{p.ip.stringSlice(@fromBackingInt(data.ty_pl.payload))});
             },
+            .tls_ptr => {
+                try p.ty(data.ty_pl.ty);
+                try w.print(", {s}", .{p.ip.stringSlice(p.ip.getNav(@fromBackingInt(data.ty_pl.payload)).fqn)});
+            },
             .repeat => try w.print("%{d}", .{@backingInt(data.repeat.loop_inst)}),
             .br => {
                 try w.print("%{d}, ", .{@backingInt(data.br.block_inst)});

@@ -1,13 +1,33 @@
 //! A smaller test runner for zap's conformance harness (`run.py
 //! --test-runner`). It speaks the same `@zap-test` line protocol as
-//! `test_runner.zig` (documented there) but needs no std: its own `_start`,
-//! raw `write` and `exit` system calls, and `builtin.test_functions`. It does
+//! `test_runner.zig` (documented there) but needs little of std: its own
+//! `_start`, which sets up TLS as std.start does, raw `write` and `exit`
+//! system calls, and `builtin.test_functions`. It does
 //! not set up `std.testing.allocator` or `std.testing.io`, so tests that use
 //! them crash under it, and it reports a failing test without its error name.
 //!
 //! Upstream zig 0.17.0 compiles it too, which keeps it honest.
 
 const builtin = @import("builtin");
+const std = @import("std");
+const elf = std.elf;
+
+/// Sets up thread-local storage the way std.start does, from the program
+/// headers the auxiliary vector (after `envp`) points to.
+fn initTls(envp: [*]const usize) void {
+    var i: usize = 0;
+    while (envp[i] != 0) : (i += 1) {}
+    const auxv: [*]const elf.Auxv = @ptrCast(@alignCast(envp + i + 1));
+    var at_phdr: usize = 0;
+    var at_phnum: usize = 0;
+    i = 0;
+    while (auxv[i].a_type != elf.AT.NULL) : (i += 1) switch (auxv[i].a_type) {
+        elf.AT.PHNUM => at_phnum = auxv[i].a_un.a_val,
+        elf.AT.PHDR => at_phdr = auxv[i].a_un.a_val,
+        else => {},
+    };
+    std.os.linux.tls.initStatic(@as([*]elf.ElfN.Phdr, @ptrFromInt(at_phdr))[0..at_phnum]);
+}
 
 pub export fn _start() callconv(.naked) noreturn {
     asm volatile (
@@ -23,6 +43,7 @@ pub export fn _start() callconv(.naked) noreturn {
 fn main(sp: [*]const usize) callconv(.c) noreturn {
     const argc = sp[0];
     const argv: [*]const [*:0]const u8 = @ptrCast(sp + 1);
+    initTls(sp + argc + 2);
     var start: usize = 0;
     var a: usize = 1;
     while (a < argc) : (a += 1) {

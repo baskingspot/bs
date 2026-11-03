@@ -207,6 +207,9 @@ pub const Inst = struct {
         /// `InternPool.String` `payload`, as a pointer (or optional pointer,
         /// null for an undefined weak symbol) of type `ty`.
         extern_ptr,
+        /// `ty_pl`: the address of this thread's copy of the threadlocal
+        /// variable whose `InternPool.NavIndex` is `payload`.
+        tls_ptr,
 
         /// `ty_pl` with `Block`: a body that `br` instructions exit with a
         /// value of type `ty`.
@@ -492,6 +495,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .union_init,
         .assembly,
         .extern_ptr,
+        .tls_ptr,
         .atomic_rmw,
         .cmpxchg,
         => data.ty_pl.ty,
