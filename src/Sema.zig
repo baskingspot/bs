@@ -123,6 +123,9 @@ pub const Block = struct {
     pub const Label = struct {
         zir_block: Zir.Inst.Index,
         merges: Merges,
+        /// A runtime labeled switch: `continue :label x` stores `x` here
+        /// and repeats `loop_inst`.
+        switch_continue: ?struct { loop_inst: Ir.Inst.Index, operand_ptr: Ref, operand_ty: Index } = null,
     };
 
     pub const Merges = struct {
@@ -1122,6 +1125,8 @@ fn analyzeInlineBody(sema: *Sema, block: *Block, body: []const Zir.Inst.Index, b
             const brk = sema.code.instructions.items(.data)[@backingInt(sema.comptime_break_inst)].@"break";
             const extra = sema.code.extraData(Zir.Inst.Break, brk.payload_index).data;
             if (extra.block_inst != break_target) return error.ComptimeBreak;
+            // `continue :sw x` targets the switch too but restarts it.
+            if (sema.code.instructions.items(.tag)[@backingInt(sema.comptime_break_inst)] == .switch_continue) return error.ComptimeBreak;
             return sema.resolveInst(brk.operand);
         },
         else => |e| return e,
@@ -1159,6 +1164,11 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 return;
             },
             .break_inline => {
+                sema.comptime_break_inst = inst;
+                return error.ComptimeBreak;
+            },
+            .switch_continue => {
+                if (!block.is_comptime) if (try sema.zirSwitchContinue(block, inst)) return;
                 sema.comptime_break_inst = inst;
                 return error.ComptimeBreak;
             },
@@ -1538,6 +1548,25 @@ fn zirBreak(sema: *Sema, b: *Block, inst: Zir.Inst.Index) CompileError!void {
     // of runtime control flow.
     sema.comptime_break_inst = inst;
     return error.ComptimeBreak;
+}
+
+/// `continue :sw x` in a runtime labeled switch: store the new operand and
+/// repeat the switch's dispatch loop. False if the switch is comptime.
+fn zirSwitchContinue(sema: *Sema, b: *Block, inst: Zir.Inst.Index) CompileError!bool {
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].@"break";
+    const extra = sema.code.extraData(Zir.Inst.Break, data.payload_index).data;
+    var it: ?*Block = b;
+    while (it) |cur| : (it = cur.parent) {
+        const label = cur.label orelse continue;
+        if (label.zir_block != extra.block_inst) continue;
+        const sc = label.switch_continue orelse return false;
+        const src = b.nodeSrc(extra.operand_src_node.unwrap() orelse .zero);
+        const operand = try sema.coerce(b, sc.operand_ty, sema.resolveInst(data.operand), src);
+        try sema.analyzeStore(b, src, sc.operand_ptr, operand);
+        _ = try sema.addInst(b, .{ .tag = .repeat, .data = .{ .repeat = .{ .loop_inst = sc.loop_inst } } });
+        return true;
+    }
+    return false;
 }
 
 fn zirLoop(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -7888,7 +7917,6 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
     const ip = sema.ip;
     const gpa = sema.gpa;
     const sb = sema.code.getSwitchBlock(inst);
-    if (sb.has_continue) return sema.failUnsupported(parent, src, "labeled switch continue");
     // A tagged union switches on its tag; prongs capture the payload.
     var cond = operand;
     if (Type.class(ip, sema.typeOf(operand)) == .@"union") {
@@ -8047,6 +8075,7 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         };
     }
     const under_case = under_prong orelse else_case;
+    if (sb.has_continue) return sema.switchLoop(parent, src, inst, operand, cases.items, under_case, capture_inst);
 
     // Comptime-known operand: analyze only the matching prong.
     if (sema.resolveValue(cond)) |v| {
@@ -8166,15 +8195,90 @@ fn switchProngsRuntime(
     var outer = parent.child();
     if (enclosing == null) outer.label = &label;
     defer outer.instructions.deinit(gpa);
+    try sema.emitSwitchProngs(&outer, src, inst, cond, operand, cases, else_case, capture_inst);
+    if (enclosing != null) {
+        try parent.instructions.appendSlice(gpa, outer.instructions.items);
+        return .unreachable_value;
+    }
+    return sema.resolveBlock(parent, src, &outer, &label.merges);
+}
 
+/// A labeled switch with `continue`. At comptime, prongs run until one
+/// does not continue. At runtime, the operand lives in a local and the
+/// prongs dispatch in a loop that `continue :label x` repeats.
+fn switchLoop(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, operand: Ref, cases: []const SwitchCase, else_case: ?SwitchCase, capture_inst: Zir.Inst.Index) CompileError!Ref {
+    const ip = sema.ip;
+    const gpa = sema.gpa;
+    const operand_ty = sema.typeOf(operand);
+    const is_union = Type.class(ip, operand_ty) == .@"union";
+    // `continue :sw x` coerces `x` to the switch instruction, which
+    // stands for the operand type (captures use placeholders).
+    try sema.inst_map.put(gpa, inst, .fromInterned(operand_ty));
+    defer _ = sema.inst_map.remove(inst);
+    if (parent.is_comptime) {
+        var cur = operand;
+        while (true) {
+            const cond = if (is_union) try sema.unionTag(parent, src, cur) else cur;
+            const v = sema.resolveValue(cond) orelse return sema.fail(parent, src, "unable to evaluate comptime expression", .{});
+            const chosen = for (cases) |c| {
+                if (try sema.switchCaseMatches(c, v)) break c;
+            } else else_case orelse return sema.fail(parent, src, "switch must handle all possibilities", .{});
+            try sema.bindSwitchCaptures(parent, src, chosen, cur, capture_inst);
+            const result = sema.analyzeInlineBody(parent, chosen.body, inst) catch |err| switch (err) {
+                error.ComptimeBreak => {
+                    const brk_inst = sema.comptime_break_inst;
+                    const brk = sema.code.instructions.items(.data)[@backingInt(brk_inst)].@"break";
+                    const extra = sema.code.extraData(Zir.Inst.Break, brk.payload_index).data;
+                    if (sema.code.instructions.items(.tag)[@backingInt(brk_inst)] != .switch_continue or extra.block_inst != inst) return err;
+                    cur = try sema.coerce(parent, operand_ty, sema.resolveInst(brk.operand), src);
+                    try sema.emitBackwardBranch(parent, src);
+                    continue;
+                },
+                else => return err,
+            };
+            return result orelse .unreachable_value;
+        }
+    }
+    try sema.requireRuntime(parent, src);
+    if (Type.isComptimeOnly(ip, operand_ty)) return sema.failUnsupported(parent, src, "runtime labeled switches on comptime-only types");
+    try sema.resolveLayout(parent, src, operand_ty);
+    const block_inst = try sema.reserveInst();
+    const loop_inst = try sema.reserveInst();
+    var label: Block.Label = .{ .zir_block = inst, .merges = .{ .block_inst = block_inst } };
+    defer {
+        label.merges.results.deinit(gpa);
+        label.merges.brs.deinit(gpa);
+    }
+    var outer = parent.child();
+    outer.label = &label;
+    defer outer.instructions.deinit(gpa);
+    const ptr = try sema.addInst(&outer, .{ .tag = .alloc, .data = .{ .ty = try sema.ptrType(.{ .child = operand_ty }) } });
+    _ = try sema.addBinOp(&outer, .store, ptr, operand);
+    label.switch_continue = .{ .loop_inst = loop_inst, .operand_ptr = ptr, .operand_ty = operand_ty };
+    var loop_block = outer.child();
+    defer loop_block.instructions.deinit(gpa);
+    const cur = try sema.analyzeLoad(&loop_block, src, ptr);
+    const cond = if (is_union) try sema.unionTag(&loop_block, src, cur) else cur;
+    try sema.emitSwitchProngs(&loop_block, src, inst, cond, cur, cases, else_case, capture_inst);
+    const loop_payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(loop_block.instructions.items.len) });
+    try sema.appendBody(loop_block.instructions.items);
+    sema.ir_insts.set(@backingInt(loop_inst), .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = loop_payload } } });
+    try outer.instructions.append(gpa, loop_inst);
+    return sema.resolveBlock(parent, src, &outer, &label.merges);
+}
+
+/// The prongs of a runtime switch on `cond`, added to `outer`, whose
+/// label the prongs break to.
+fn emitSwitchProngs(sema: *Sema, outer: *Block, src: Src, inst: Zir.Inst.Index, cond: Ref, operand: Ref, cases: []const SwitchCase, else_case: ?SwitchCase, capture_inst: Zir.Inst.Index) CompileError!void {
+    const gpa = sema.gpa;
     if (cases.len == 1 and else_case == null and sema.resolveValue(cond) != null) {
         // A comptime-known operand selected this prong.
-        try sema.analyzeProng(&outer, cases[0], operand, capture_inst, inst);
+        try sema.analyzeProng(outer, cases[0], operand, capture_inst, inst);
     } else {
         var any_ranges = false;
         for (cases) |c| any_ranges = any_ranges or c.ranges.len != 0;
         if (any_ranges) {
-            try sema.switchAsCondBrs(&outer, src, cases, else_case, cond, operand, capture_inst, inst);
+            try sema.switchAsCondBrs(outer, src, cases, else_case, cond, operand, capture_inst, inst);
         } else {
             // switch_br: cases with items, then the else body.
             var bodies: std.ArrayList(u32) = .empty;
@@ -8200,14 +8304,9 @@ fn switchProngsRuntime(
             const payload = try sema.addExtra(Ir.SwitchBr{ .cases_len = @intCast(cases.len), .else_body_len = @intCast(else_block.instructions.items.len) });
             try sema.ir_extra.appendSlice(gpa, bodies.items);
             try sema.appendBody(else_block.instructions.items);
-            _ = try sema.addInst(&outer, .{ .tag = .switch_br, .data = .{ .pl_op = .{ .operand = cond, .payload = payload } } });
+            _ = try sema.addInst(outer, .{ .tag = .switch_br, .data = .{ .pl_op = .{ .operand = cond, .payload = payload } } });
         }
     }
-    if (enclosing != null) {
-        try parent.instructions.appendSlice(gpa, outer.instructions.items);
-        return .unreachable_value;
-    }
-    return sema.resolveBlock(parent, src, &outer, &label.merges);
 }
 
 /// The label of the runtime block of ZIR block `inst` enclosing `block`.
@@ -8256,7 +8355,9 @@ fn switchCapture(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: R
 }
 
 fn bindSwitchCaptures(sema: *Sema, block: *Block, src: Src, c: SwitchCase, operand: Ref, capture_inst: Zir.Inst.Index) CompileError!void {
-    try sema.inst_map.put(sema.gpa, capture_inst, if (c.capture == .none) operand else try sema.switchCapture(block, src, c, operand));
+    // Without a capture, `capture_inst` may be the switch itself, which a
+    // labeled switch maps to its operand type.
+    if (c.capture != .none) try sema.inst_map.put(sema.gpa, capture_inst, try sema.switchCapture(block, src, c, operand));
     if (c.tag_inst.unwrap()) |t| {
         try sema.inst_map.put(sema.gpa, t, if (c.is_inline) .fromInterned(c.items[0]) else try sema.unionTag(block, src, operand));
     }
