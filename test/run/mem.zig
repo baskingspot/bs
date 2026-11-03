@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "hello\n3\nxxxxxhello\n4\n9\n0\nabcabcdefg\nbcdefgg\n10\n"
+//! stdout: "hello\n3\nxxxxxhello\n4\n9\n0\nabcabcdefg\nbcdefgg\n10\n0\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -10,6 +10,20 @@ pub export fn _start() callconv(.naked) noreturn {
 }
 
 const Pair = struct { a: u32, b: u16 };
+
+/// Locals aligned beyond the 16-byte frame, at several stack depths.
+/// Returns the sum of their misalignments, which must be 0.
+fn overAligned(depth: u32) u64 {
+    var lines: [3]u8 align(128) = .{ 1, 2, 3 };
+    var small align(64) = @as(u8, 5);
+    var low: u32 align(1) = 9;
+    _ = &low;
+    lines[2] += small;
+    small = 0;
+    var miss = @intFromPtr(&lines) % 128 + @intFromPtr(&small) % 64 + (lines[2] - 8) + (low - 9);
+    if (depth > 0) miss += overAligned(depth - 1);
+    return miss;
+}
 
 fn comptimeSum() u32 {
     var buf: [4]u32 = undefined;
@@ -61,5 +75,6 @@ fn main() callconv(.c) noreturn {
     var big2: [300]u8 = undefined;
     big2 = big;
     rt.printInt(big2[299] + big2[0] - 4);
+    rt.printInt(overAligned(5));
     rt.exit(0);
 }

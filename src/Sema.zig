@@ -2408,8 +2408,6 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const extra = sema.code.extraData(Zir.Inst.AllocExtended, ext.operand);
             const small: Zir.Inst.AllocExtended.Small = @bitCast(ext.small);
             const src = block.nodeSrc(extra.data.src_node);
-            // Only the type's own alignment, which needs no other pointer
-            // type, is supported.
             const alignment: u64 = if (small.has_align) blk2: {
                 const align_ref = try sema.coerce(block, .u29_type, sema.resolveInst(@fromBackingInt(sema.code.extra[extra.end + @intFromBool(small.has_type)])), src);
                 break :blk2 sema.ip.intValue(u64, try sema.resolveConstValue(block, src, align_ref, "alignment must be comptime-known")).?;
@@ -2423,11 +2421,12 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 break :blk ref;
             }
             const ty = try sema.resolveType(block, src, @fromBackingInt(sema.code.extra[extra.end]));
+            const ptr = try sema.analyzeAlloc(block, src, ty, small.is_const, small.is_comptime);
             if (alignment != 0) {
-                try sema.resolveLayout(block, src, ty);
-                if (alignment != Type.abiAlignment(sema.ip, ty)) return sema.failUnsupported(block, src, "local variables aligned differently from their type");
+                const alloc_inst = ptr.toIndex() orelse return sema.failUnsupported(block, src, "aligned comptime variables");
+                sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = try sema.allocPtrType(ty, alignment) };
             }
-            break :blk sema.analyzeAlloc(block, src, ty, small.is_const, small.is_comptime);
+            break :blk ptr;
         },
         .select => sema.zirSelect(block, ext),
         .min_multi, .max_multi => blk: {
@@ -5982,6 +5981,13 @@ fn zirBoolBr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_or: bool) Com
 // ---------------------------------------------------------------------------
 // Memory
 
+/// The type of a pointer to a local of type `ty` declared `align(alignment)`
+/// (0 if not), whose layout is resolved.
+fn allocPtrType(sema: *Sema, ty: Index, alignment: u64) !Index {
+    const flag: u6 = if (alignment == 0 or alignment == Type.abiAlignment(sema.ip, ty)) 0 else @intCast(std.math.log2_int(u64, alignment) + 1);
+    return sema.ptrType(.{ .child = ty, .flags = .{ .alignment = flag } });
+}
+
 fn analyzeAlloc(sema: *Sema, block: *Block, src: Src, ty: Index, is_const: bool, force_comptime: bool) CompileError!Ref {
     if (block.is_comptime or force_comptime) return .fromInterned(try sema.createComptimeAlloc(ty, is_const));
     try sema.resolveLayout(block, src, ty);
@@ -6166,8 +6172,7 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
     }
     if (Type.isComptimeOnly(sema.ip, ty)) return sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
     try sema.resolveLayout(block, src, ty);
-    if (ia.alignment != 0 and ia.alignment != Type.abiAlignment(sema.ip, ty)) return sema.failUnsupported(block, src, "local variables aligned differently from their type");
-    const ptr_ty = try sema.ptrType(.{ .child = ty });
+    const ptr_ty = try sema.allocPtrType(ty, ia.alignment);
     sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = ptr_ty };
     for (ia.stores.items, operands) |store, op| try sema.coerceBrOperand(block, store, ty, op, src);
     if (ia.is_const) {

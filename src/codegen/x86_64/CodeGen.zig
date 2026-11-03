@@ -432,9 +432,21 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .alloc => {
             // An inferred alloc whose initializer never completes.
             if (data.ty == .none) return;
-            const child = Type.ptrInfo(ip, data.ty).child;
-            const off = try cg.allocSlot(@max(Type.abiSize(ip, child), 1), Type.abiAlignment(ip, child));
-            cg.homes[@backingInt(inst)] = .{ .frame_addr = off };
+            const info = Type.ptrInfo(ip, data.ty);
+            const size = @max(Type.abiSize(ip, info.child), 1);
+            const alignment = @max(Type.abiAlignment(ip, info.child), if (info.flags.alignment == 0) 1 else @as(u64, 1) << @intCast(info.flags.alignment - 1));
+            if (alignment <= 16) {
+                cg.homes[@backingInt(inst)] = .{ .frame_addr = try cg.allocSlot(size, alignment) };
+                return;
+            }
+            // rbp is only 16-byte aligned: align the address at run time
+            // within a buffer large enough for any rbp, and keep it in a slot.
+            const buf = try cg.allocSlot(size + alignment - 16, 16);
+            const home = try cg.allocSlot(8, 8);
+            try cg.e.lea(.qword, .rax, Mem.at(.rbp, buf + @as(i32, @intCast(alignment - 16))));
+            try cg.e.alu(.@"and", .qword, .{ .reg = .rax }, .{ .imm = -@as(i64, @intCast(alignment)) });
+            try cg.e.mov(.qword, .{ .mem = Mem.at(.rbp, home) }, .{ .reg = .rax });
+            cg.homes[@backingInt(inst)] = .{ .slot = home };
         },
         .load => {
             const dst = try cg.resultMem(inst, data.ty_op.ty) orelse return;
