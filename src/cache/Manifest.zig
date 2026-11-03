@@ -28,6 +28,19 @@
 //! that have dependencies, a source hash, or Atoms. A node keeps its index
 //! and key for as long as the base lasts.
 //!
+//! The manifest also numbers the link's symbols, so that a relink passes
+//! `Elf.Options.symbols` straight from the mapping and the linker hashes
+//! no keys: a table from every key a live atom defines or references
+//! (error-code keys and the entry included) to a dense number, a
+//! `NumberedAtom` per atom reference, and the atoms' target numbers, one
+//! contiguous run per atom, a node's runs in its atoms' order. A log record
+//! numbers only its new keys, after the existing ones, and appends its
+//! runs; writing a base renumbers in link order (atoms first, as they are
+//! linked, then the targets nothing defines, then error codes) and drops
+//! the keys nothing uses. It also interns the atoms' debug source paths,
+//! so that every function of a file shares one path and the linker
+//! matches them by address.
+//!
 //! Base file: `Header`, then each section at a 16-byte aligned offset.
 //! Log file: `LogHeader`, then records (`RecordHeader` and its body), each
 //! checksummed; a torn record at the end is ignored and overwritten.
@@ -38,6 +51,7 @@ const Allocator = std.mem.Allocator;
 const cache = @import("../cache.zig");
 const Pack = @import("Pack.zig");
 const Hash = cache.Hash;
+pub const NumberedAtom = @import("../link/Elf.zig").NumberedAtom;
 
 const Manifest = @This();
 
@@ -48,6 +62,22 @@ id: Hash,
 pack_id: Hash,
 /// The link's entry symbol (an `Atom.SymbolKey`), or 0.
 entry: Hash,
+/// The entry's number, and how many numbers the base uses.
+entry_symbol: u32,
+symbol_len: u32,
+/// Open-addressing table from symbol key to number, about 80% full (see
+/// `symbolSlot`); empty slots have number `no_symbol`.
+symbols: []const Symbol,
+/// One per atom reference, indexed the same way.
+numbered: []const NumberedAtom,
+/// The atoms' target numbers (see the file's doc comment).
+targets: []const u32,
+/// The number of each error's key, by code - 1.
+error_symbols: []const u32,
+/// Each atom reference's debug source path, an index into `files`, or
+/// `no_file`.
+debug_files: []const u32,
+files: []const StrRef,
 nodes: []const Node,
 /// Open-addressing table from `Node.key` to node index + 1 (0: empty),
 /// a power of two long, at most half full.
@@ -79,10 +109,103 @@ pub const Node = extern struct {
     atoms_len: u32,
     /// Opaque to the store.
     tag: u8,
-    unused: [7]u8 = @splat(0),
+    unused: [3]u8 = @splat(0),
+    /// Length of the node's target run, which starts at its first atom's.
+    targets_len: u32,
 };
 
 pub const StrRef = extern struct { off: u32, len: u32 };
+
+pub const Symbol = extern struct {
+    key: [2]u64,
+    number: u32,
+    unused: u32 = 0,
+
+    fn init(key: Hash, number: u32) Symbol {
+        return .{ .key = @bitCast(key), .number = number };
+    }
+
+    fn keyHash(s: Symbol) Hash {
+        return @bitCast(s.key);
+    }
+};
+
+pub const no_symbol = std.math.maxInt(u32);
+pub const no_file = std.math.maxInt(u32);
+
+/// Where a key's probe starts in a symbol table of `len` slots. The table
+/// need not be a power of two long, so it stays about 30 bytes per key;
+/// only an edit's new keys are looked up in it.
+fn symbolSlot(key: Hash, len: usize) usize {
+    return @intCast((@as(u128, @as(u64, @truncate(key))) * len) >> 64);
+}
+
+/// Symbol key to number in memory: open addressing over `Symbol`s, so that
+/// a lookup touches one cache line; numbering a build's keys is a lookup
+/// per relocation target.
+const SymbolMap = struct {
+    slots: []Symbol = &.{},
+    count: u32 = 0,
+
+    pub const empty: SymbolMap = .{};
+
+    fn deinit(m: *SymbolMap, gpa: Allocator) void {
+        gpa.free(m.slots);
+    }
+
+    fn get(m: *const SymbolMap, key: Hash) ?u32 {
+        if (m.slots.len == 0) return null;
+        const mask = m.slots.len - 1;
+        var i: usize = @as(usize, @truncate(key)) & mask;
+        while (true) : (i = (i + 1) & mask) {
+            const s = m.slots[i];
+            if (s.number == no_symbol) return null;
+            if (s.keyHash() == key) return s.number;
+        }
+    }
+
+    /// The number of `key`, which becomes `new` if `key` has none.
+    fn getOrPut(m: *SymbolMap, gpa: Allocator, key: Hash, new: u32) !struct { u32, bool } {
+        if (2 * (m.count + 1) > m.slots.len) try m.grow(gpa);
+        const mask = m.slots.len - 1;
+        var i: usize = @as(usize, @truncate(key)) & mask;
+        while (true) : (i = (i + 1) & mask) {
+            const s = &m.slots[i];
+            if (s.number == no_symbol) {
+                s.* = .init(key, new);
+                m.count += 1;
+                return .{ new, true };
+            }
+            if (s.keyHash() == key) return .{ s.number, false };
+        }
+    }
+
+    fn ensureUnusedCapacity(m: *SymbolMap, gpa: Allocator, n: usize) !void {
+        while (2 * (m.count + n) > m.slots.len) try m.grow(gpa);
+    }
+
+    fn grow(m: *SymbolMap, gpa: Allocator) !void {
+        const old = m.slots;
+        m.slots = try gpa.alloc(Symbol, @max(64, 2 * old.len));
+        @memset(m.slots, .{ .key = .{ 0, 0 }, .number = no_symbol });
+        const mask = m.slots.len - 1;
+        for (old) |s| {
+            if (s.number == no_symbol) continue;
+            var i: usize = @as(usize, @truncate(s.keyHash())) & mask;
+            while (m.slots[i].number != no_symbol) i = (i + 1) & mask;
+            m.slots[i] = s;
+        }
+        gpa.free(old);
+    }
+};
+
+/// A new atom's symbols, for numbering: its key, its targets' keys, and
+/// its debug source path, if it has debug info.
+pub const AtomSymbols = struct {
+    key: Hash,
+    targets: []const Hash,
+    file: ?[]const u8 = null,
+};
 
 pub const Input = extern struct {
     content_hash: Hash,
@@ -115,17 +238,18 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, files, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN03".*;
-const log_magic = "ZAPMLG01".*;
+const magic = "ZAPMAN04".*;
+const log_magic = "ZAPMLG02".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
 
 const Header = extern struct {
     magic: [8]u8 = magic,
-    unused: [8]u8 = @splat(0),
+    symbol_len: u32,
+    entry_symbol: u32,
     id: Hash,
     pack_id: Hash,
     entry: Hash,
@@ -139,9 +263,13 @@ const LogHeader = extern struct {
 };
 
 /// One build's changes. The body: `n_nodes` node changes (each a
-/// `NodeDelta`, then its dependencies and atom references, each padded to
-/// 16 bytes), `n_inputs` `InputDelta`s, `n_errors` `StrRef`s (padded), and
-/// `strings_len` string bytes (padded) that the inputs and errors refer to.
+/// `NodeDelta`, then its dependencies, atom references, numbered atoms,
+/// debug files, and target run, each padded to 16 bytes), `n_inputs`
+/// `InputDelta`s, `n_errors` `StrRef`s and as many error symbols,
+/// `n_symbols` new `Symbol`s, `n_files` new debug files' `StrRef`s, and
+/// `strings_len` string bytes that the inputs, errors, and files refer to,
+/// each padded. Numbered atoms' `targets` index the base's targets
+/// followed by the runs of the log so far.
 const RecordHeader = extern struct {
     magic: u32 = record_magic,
     /// Of the whole record, a multiple of 16.
@@ -152,6 +280,9 @@ const RecordHeader = extern struct {
     n_inputs: u32,
     n_errors: u32,
     strings_len: u32,
+    n_symbols: u32,
+    n_files: u32,
+    unused: [8]u8 = @splat(0),
 };
 
 /// A node's new state. `index` is an existing node, or the next new one.
@@ -162,8 +293,9 @@ const NodeDelta = extern struct {
     index: u32,
     deps_len: u32,
     atoms_len: u32,
+    targets_len: u32,
     tag: u8,
-    unused: [3]u8 = @splat(0),
+    unused: [15]u8 = @splat(0),
 };
 
 /// An input's new stat. `index` is an existing input, or the next new one.
@@ -176,8 +308,9 @@ const InputDelta = extern struct {
 comptime {
     std.debug.assert(@sizeOf(Node) == 80);
     std.debug.assert(@sizeOf(Input) == 48);
-    std.debug.assert(@sizeOf(RecordHeader) == 32);
-    std.debug.assert(@sizeOf(NodeDelta) == 64);
+    std.debug.assert(@sizeOf(RecordHeader) == 48);
+    std.debug.assert(@sizeOf(NodeDelta) == 80);
+    std.debug.assert(@sizeOf(Symbol) == 24);
     std.debug.assert(@sizeOf(InputDelta) == 64);
 }
 
@@ -195,14 +328,21 @@ const Overlay = struct {
     inputs: std.AutoHashMapUnmanaged(u32, InputState) = .empty,
     added_inputs: u32 = 0,
     error_names: std.ArrayList([]const u8) = .empty,
-    /// Every live atom reference in node order, built on first use when
-    /// nodes changed.
-    all_refs: ?[]Pack.AtomRef = null,
+    error_symbols: std.ArrayList(u32) = .empty,
+    /// Keys the log numbered.
+    added_symbols: SymbolMap = .empty,
+    /// The log's target runs, after the base's.
+    targets: std.ArrayList(u32) = .empty,
+    files: std.ArrayList([]const u8) = .empty,
+    /// What `linkInput` returns, gathered on first use when nodes changed.
+    gathered: ?LinkInput = null,
 
     const NodeState = struct {
         delta: *const NodeDelta,
         deps: []const u32,
         atoms: []const Pack.AtomRef,
+        numbered: []const NumberedAtom,
+        debug_files: []const u32,
     };
     const InputState = struct { input: Input, path: []const u8 };
 
@@ -215,7 +355,16 @@ const Overlay = struct {
         o.rdeps.deinit(gpa);
         o.inputs.deinit(gpa);
         o.error_names.deinit(gpa);
-        if (o.all_refs) |r| gpa.free(r);
+        o.error_symbols.deinit(gpa);
+        o.added_symbols.deinit(gpa);
+        o.targets.deinit(gpa);
+        o.files.deinit(gpa);
+        if (o.gathered) |g| {
+            gpa.free(g.refs);
+            gpa.free(g.numbered);
+            gpa.free(g.debug_files);
+            gpa.free(g.targets);
+        }
     }
 };
 
@@ -225,7 +374,10 @@ fn SectionType(comptime s: Section) type {
         .table, .edges, .redges => u32,
         .atom_refs => Pack.AtomRef,
         .inputs => Input,
-        .error_names, .bases => StrRef,
+        .error_names, .bases, .files => StrRef,
+        .symbols => Symbol,
+        .numbered => NumberedAtom,
+        .targets, .error_symbols, .debug_files => u32,
         .strings => u8,
     };
 }
@@ -244,6 +396,8 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
     m.id = h.id;
     m.pack_id = h.pack_id;
     m.entry = h.entry;
+    m.entry_symbol = h.entry_symbol;
+    m.symbol_len = h.symbol_len;
     m.overlay = .{};
     inline for (comptime std.enums.values(Section)) |s| {
         const T = SectionType(s);
@@ -252,7 +406,10 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
             return corrupt(io, &map);
         @field(m, @tagName(s)) = @as([*]const T, @ptrCast(@alignCast(bytes.ptr + r.offset)))[0..r.len];
     }
-    if (m.table.len == 0 or !std.math.isPowerOfTwo(m.table.len)) return corrupt(io, &map);
+    if (m.table.len == 0 or !std.math.isPowerOfTwo(m.table.len) or
+        m.symbols.len <= m.symbol_len or
+        m.numbered.len != m.atom_refs.len or m.debug_files.len != m.atom_refs.len or
+        m.error_symbols.len != m.error_names.len) return corrupt(io, &map);
     errdefer m.overlay.deinit(gpa);
     try m.readLog(gpa, io, dir);
     return m;
@@ -302,12 +459,16 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
         const d = r.take(NodeDelta, 1);
         const node_deps = r.take(u32, d[0].deps_len);
         const node_atoms = r.take(Pack.AtomRef, d[0].atoms_len);
+        const node_numbered = r.take(NumberedAtom, d[0].atoms_len);
+        const node_files = r.take(u32, d[0].atoms_len);
+        const node_targets = r.take(u32, d[0].targets_len);
+        try o.targets.appendSlice(gpa, node_targets);
         const index = d[0].index;
         if (index == m.nodeCount()) {
             o.added_nodes += 1;
             try o.added_keys.put(gpa, d[0].key, index);
         }
-        try o.nodes.put(gpa, index, .{ .delta = &d[0], .deps = node_deps, .atoms = node_atoms });
+        try o.nodes.put(gpa, index, .{ .delta = &d[0], .deps = node_deps, .atoms = node_atoms, .numbered = node_numbered, .debug_files = node_files });
         for (node_deps) |dep| {
             const gop = try o.rdeps.getOrPut(gpa, dep);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -316,12 +477,18 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
     }
     const input_deltas = r.take(InputDelta, rh.n_inputs);
     const errors = r.take(StrRef, rh.n_errors);
+    const error_symbols = r.take(u32, rh.n_errors);
+    const symbols = r.take(Symbol, rh.n_symbols);
+    const files = r.take(StrRef, rh.n_files);
     const strings = r.take(u8, rh.strings_len);
     for (input_deltas) |*d| {
         if (d.index == m.inputCount()) o.added_inputs += 1;
         try o.inputs.put(gpa, d.index, .{ .input = d.input, .path = strings[d.input.path.off..][0..d.input.path.len] });
     }
     for (errors) |e| try o.error_names.append(gpa, strings[e.off..][0..e.len]);
+    try o.error_symbols.appendSlice(gpa, error_symbols);
+    for (symbols) |sym| _ = try o.added_symbols.getOrPut(gpa, sym.keyHash(), sym.number);
+    for (files) |f| try o.files.append(gpa, strings[f.off..][0..f.len]);
     return rh.len;
 }
 
@@ -387,34 +554,110 @@ pub fn atoms(m: *const Manifest, index: u32) []const Pack.AtomRef {
     return m.atom_refs[n.atoms_start..][0..n.atoms_len];
 }
 
-/// Every live atom reference, in node order: what to link.
-pub fn allAtomRefs(m: *Manifest, gpa: Allocator) ![]const Pack.AtomRef {
-    if (m.overlay.nodes.count() == 0) return m.atom_refs;
-    if (m.overlay.all_refs) |r| return r;
+/// What to link: every live atom reference in node order, with its
+/// numbered atom and debug file, and the target runs they index.
+pub const LinkInput = struct {
+    refs: []const Pack.AtomRef,
+    numbered: []const NumberedAtom,
+    debug_files: []const u32,
+    targets: []const u32,
+};
+
+/// Slices of the mapping when the log changed no node; otherwise gathered
+/// once and kept until `close`.
+pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
+    const o = &m.overlay;
+    if (o.nodes.count() == 0) return .{ .refs = m.atom_refs, .numbered = m.numbered, .debug_files = m.debug_files, .targets = m.targets };
+    if (o.gathered) |g| return g;
     // The base's references are in node order: copy the runs between
     // changed nodes whole instead of visiting every node.
-    const changed = try gpa.alloc(u32, m.overlay.nodes.count());
+    const changed = try gpa.alloc(u32, o.nodes.count());
     defer gpa.free(changed);
-    var it = m.overlay.nodes.keyIterator();
+    var it = o.nodes.keyIterator();
     for (changed) |*c| c.* = it.next().?.*;
     std.mem.sortUnstable(u32, changed, {}, std.sort.asc(u32));
     var refs: std.ArrayList(Pack.AtomRef) = try .initCapacity(gpa, m.atom_refs.len);
-    errdefer refs.deinit(gpa);
+    defer refs.deinit(gpa);
+    var numbered: std.ArrayList(NumberedAtom) = try .initCapacity(gpa, m.atom_refs.len);
+    defer numbered.deinit(gpa);
+    var debug_files: std.ArrayList(u32) = try .initCapacity(gpa, m.atom_refs.len);
+    defer debug_files.deinit(gpa);
     var base_done: usize = 0;
     for (changed) |i| {
-        if (i < m.nodes.len) {
-            const n = m.nodes[i];
-            try refs.appendSlice(gpa, m.atom_refs[base_done..n.atoms_start]);
-            base_done = n.atoms_start + n.atoms_len;
-        } else if (base_done < m.atom_refs.len) {
-            try refs.appendSlice(gpa, m.atom_refs[base_done..]);
-            base_done = m.atom_refs.len;
+        const hi = if (i < m.nodes.len) m.nodes[i].atoms_start else m.atom_refs.len;
+        if (base_done < hi) {
+            try refs.appendSlice(gpa, m.atom_refs[base_done..hi]);
+            try numbered.appendSlice(gpa, m.numbered[base_done..hi]);
+            try debug_files.appendSlice(gpa, m.debug_files[base_done..hi]);
+            base_done = hi;
         }
-        try refs.appendSlice(gpa, m.overlay.nodes.get(i).?.atoms);
+        if (i < m.nodes.len) base_done = m.nodes[i].atoms_start + m.nodes[i].atoms_len;
+        const st = o.nodes.get(i).?;
+        try refs.appendSlice(gpa, st.atoms);
+        try numbered.appendSlice(gpa, st.numbered);
+        try debug_files.appendSlice(gpa, st.debug_files);
     }
     try refs.appendSlice(gpa, m.atom_refs[base_done..]);
-    m.overlay.all_refs = try refs.toOwnedSlice(gpa);
-    return m.overlay.all_refs.?;
+    try numbered.appendSlice(gpa, m.numbered[base_done..]);
+    try debug_files.appendSlice(gpa, m.debug_files[base_done..]);
+    const targets = try std.mem.concat(gpa, u32, &.{ m.targets, o.targets.items });
+    errdefer gpa.free(targets);
+    const g: LinkInput = .{
+        .refs = try refs.toOwnedSlice(gpa),
+        .numbered = try numbered.toOwnedSlice(gpa),
+        .debug_files = try debug_files.toOwnedSlice(gpa),
+        .targets = targets,
+    };
+    o.gathered = g;
+    return g;
+}
+
+/// Every live atom reference, in node order.
+pub fn allAtomRefs(m: *Manifest, gpa: Allocator) ![]const Pack.AtomRef {
+    return (try m.linkInput(gpa)).refs;
+}
+
+/// How many symbol numbers the manifest uses: those it links take numbers
+/// below this.
+pub fn symbolLen(m: *const Manifest) u32 {
+    return m.symbol_len + m.overlay.added_symbols.count;
+}
+
+/// The number of a symbol key, if it has one.
+pub fn symbol(m: *const Manifest, key: Hash) ?u32 {
+    if (findSymbolIn(m.symbols, key)) |n| return n;
+    return m.overlay.added_symbols.get(key);
+}
+
+fn findSymbolIn(table: []const Symbol, key: Hash) ?u32 {
+    var i = symbolSlot(key, table.len);
+    while (true) {
+        const s = table[i];
+        if (s.number == no_symbol) return null;
+        if (s.keyHash() == key) return s.number;
+        i += 1;
+        if (i == table.len) i = 0;
+    }
+}
+
+/// The number of the key of the error with code `code`.
+pub fn errorSymbol(m: *const Manifest, code: u32) u32 {
+    if (code - 1 < m.error_symbols.len) return m.error_symbols[code - 1];
+    return m.overlay.error_symbols.items[code - 1 - m.error_symbols.len];
+}
+
+pub fn fileCount(m: *const Manifest) u32 {
+    return @intCast(m.files.len + m.overlay.files.items.len);
+}
+
+/// A debug source path, by its index in `debug_files`.
+pub fn file(m: *const Manifest, index: u32) []const u8 {
+    if (index < m.files.len) return m.string(m.files[index]);
+    return m.overlay.files.items[index - m.files.len];
+}
+
+fn targetsLen(m: *const Manifest) u32 {
+    return @intCast(m.targets.len + m.overlay.targets.items.len);
 }
 
 pub fn basePack(m: *const Manifest, i: usize) []const u8 {
@@ -475,6 +718,31 @@ pub const NodeInit = struct {
     /// Indices of nodes, which may be added later.
     deps: []const u32 = &.{},
     atoms: []const Pack.AtomRef = &.{},
+    /// One per atom.
+    symbols: []const AtomSymbols = &.{},
+};
+
+/// Interns debug source paths; owns its keys.
+const FileTable = struct {
+    map: std.StringHashMapUnmanaged(u32) = .empty,
+
+    fn deinit(ft: *FileTable, gpa: Allocator) void {
+        var it = ft.map.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        ft.map.deinit(gpa);
+    }
+
+    /// The index of `path`, which becomes `next` if it is new.
+    fn intern(ft: *FileTable, gpa: Allocator, path: []const u8, next: u32) !struct { u32, bool } {
+        const gop = try ft.map.getOrPut(gpa, path);
+        if (gop.found_existing) return .{ gop.value_ptr.*, false };
+        gop.key_ptr.* = gpa.dupe(u8, path) catch |err| {
+            ft.map.removeByPtr(gop.key_ptr);
+            return err;
+        };
+        gop.value_ptr.* = next;
+        return .{ next, true };
+    }
 };
 
 /// One build's changes to a manifest, appended to its log.
@@ -487,17 +755,38 @@ pub const Delta = struct {
     inputs: std.ArrayList(InputDelta) = .empty,
     added_inputs: u32 = 0,
     errors: std.ArrayList(StrRef) = .empty,
+    error_symbols: std.ArrayList(u32) = .empty,
+    /// Keys this delta numbered.
+    symbols: std.ArrayList(Symbol) = .empty,
+    symbol_map: SymbolMap = .empty,
+    /// Target numbers this delta appended.
+    targets_len: u32 = 0,
+    files: std.ArrayList(StrRef) = .empty,
+    /// Every debug file, filled on first use.
+    file_table: FileTable = .{},
     strings: std.ArrayList(u8) = .empty,
+    scratch_numbered: std.ArrayList(NumberedAtom) = .empty,
+    scratch_files: std.ArrayList(u32) = .empty,
+    scratch_targets: std.ArrayList(u32) = .empty,
 
     pub fn init(gpa: Allocator, base: *const Manifest) Delta {
         return .{ .gpa = gpa, .base = base };
     }
 
     pub fn deinit(d: *Delta) void {
-        d.nodes.deinit(d.gpa);
-        d.inputs.deinit(d.gpa);
-        d.errors.deinit(d.gpa);
-        d.strings.deinit(d.gpa);
+        const gpa = d.gpa;
+        d.nodes.deinit(gpa);
+        d.inputs.deinit(gpa);
+        d.errors.deinit(gpa);
+        d.error_symbols.deinit(gpa);
+        d.symbols.deinit(gpa);
+        d.symbol_map.deinit(gpa);
+        d.files.deinit(gpa);
+        d.file_table.deinit(gpa);
+        d.strings.deinit(gpa);
+        d.scratch_numbered.deinit(gpa);
+        d.scratch_files.deinit(gpa);
+        d.scratch_targets.deinit(gpa);
     }
 
     /// Replaces a node's state after it was analyzed again. Its key stays.
@@ -515,6 +804,20 @@ pub const Delta = struct {
     }
 
     fn appendNode(d: *Delta, index: u32, n: NodeInit) !void {
+        std.debug.assert(n.symbols.len == n.atoms.len);
+        const gpa = d.gpa;
+        d.scratch_numbered.clearRetainingCapacity();
+        d.scratch_files.clearRetainingCapacity();
+        d.scratch_targets.clearRetainingCapacity();
+        const first_target = d.base.targetsLen() + d.targets_len;
+        for (n.symbols) |s| {
+            try d.scratch_numbered.append(gpa, .{
+                .symbol = try d.symbolNumber(s.key),
+                .targets = first_target + @as(u32, @intCast(d.scratch_targets.items.len)),
+            });
+            for (s.targets) |t| try d.scratch_targets.append(gpa, try d.symbolNumber(t));
+            try d.scratch_files.append(gpa, if (s.file) |f| try d.fileIndex(f) else no_file);
+        }
         const delta: NodeDelta = .{
             .key = n.key,
             .result_hash = n.result_hash,
@@ -522,12 +825,34 @@ pub const Delta = struct {
             .index = index,
             .deps_len = @intCast(n.deps.len),
             .atoms_len = @intCast(n.atoms.len),
+            .targets_len = @intCast(d.scratch_targets.items.len),
             .tag = n.tag,
         };
-        try appendPadded(d.gpa, &d.nodes, std.mem.asBytes(&delta));
-        try appendPadded(d.gpa, &d.nodes, @ptrCast(n.deps));
-        try appendPadded(d.gpa, &d.nodes, @ptrCast(n.atoms));
+        try appendPadded(gpa, &d.nodes, std.mem.asBytes(&delta));
+        try appendPadded(gpa, &d.nodes, @ptrCast(n.deps));
+        try appendPadded(gpa, &d.nodes, @ptrCast(n.atoms));
+        try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_numbered.items));
+        try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_files.items));
+        try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_targets.items));
+        d.targets_len += delta.targets_len;
         d.n_nodes += 1;
+    }
+
+    fn symbolNumber(d: *Delta, key: Hash) !u32 {
+        if (d.base.symbol(key)) |n| return n;
+        const n, const new = try d.symbol_map.getOrPut(d.gpa, key, d.base.symbolLen() + @as(u32, @intCast(d.symbols.items.len)));
+        if (new) try d.symbols.append(d.gpa, .init(key, n));
+        return n;
+    }
+
+    fn fileIndex(d: *Delta, path: []const u8) !u32 {
+        const base_files = d.base.fileCount();
+        if (d.file_table.map.count() == 0) {
+            for (0..base_files) |i| _ = try d.file_table.intern(d.gpa, d.base.file(@intCast(i)), @intCast(i));
+        }
+        const index, const new = try d.file_table.intern(d.gpa, path, base_files + @as(u32, @intCast(d.files.items.len)));
+        if (new) try d.files.append(d.gpa, try d.addString(path));
+        return index;
     }
 
     /// Records an input's new stat; `index` null adds an input.
@@ -539,9 +864,10 @@ pub const Delta = struct {
         try d.inputs.append(d.gpa, .{ .input = .init(stat, content_hash, build_start, try d.addString(path)), .index = i });
     }
 
-    /// Assigns the next error code to `name`.
-    pub fn addErrorName(d: *Delta, name: []const u8) !u32 {
+    /// Assigns the next error code to `name`, whose symbol key is `key`.
+    pub fn addErrorName(d: *Delta, name: []const u8, key: Hash) !u32 {
         try d.errors.append(d.gpa, try d.addString(name));
+        try d.error_symbols.append(d.gpa, try d.symbolNumber(key));
         return d.base.errorCount() + @as(u32, @intCast(d.errors.items.len));
     }
 
@@ -560,6 +886,9 @@ pub const Delta = struct {
         try body.appendSlice(gpa, d.nodes.items);
         try appendPadded(gpa, &body, @ptrCast(d.inputs.items));
         try appendPadded(gpa, &body, @ptrCast(d.errors.items));
+        try appendPadded(gpa, &body, @ptrCast(d.error_symbols.items));
+        try appendPadded(gpa, &body, @ptrCast(d.symbols.items));
+        try appendPadded(gpa, &body, @ptrCast(d.files.items));
         try appendPadded(gpa, &body, d.strings.items);
         const header: RecordHeader = .{
             .len = @intCast(@sizeOf(RecordHeader) + body.items.len),
@@ -568,6 +897,8 @@ pub const Delta = struct {
             .n_inputs = @intCast(d.inputs.items.len),
             .n_errors = @intCast(d.errors.items.len),
             .strings_len = @intCast(d.strings.items.len),
+            .n_symbols = @intCast(d.symbols.items.len),
+            .n_files = @intCast(d.files.items.len),
         };
         var offset = d.base.overlay.len;
         if (offset == 0) {
@@ -598,13 +929,25 @@ pub const Builder = struct {
     nodes: std.ArrayList(Node) = .empty,
     edges: std.ArrayList(u32) = .empty,
     atom_refs: std.ArrayList(Pack.AtomRef) = .empty,
+    /// Parallel to `atom_refs`. Numbers are the builder's own until `write`
+    /// renumbers them.
+    numbered: std.ArrayList(NumberedAtom) = .empty,
+    debug_files: std.ArrayList(u32) = .empty,
+    targets: std.ArrayList(u32) = .empty,
     inputs: std.ArrayList(Input) = .empty,
     error_names: std.ArrayList(StrRef) = .empty,
+    error_symbols: std.ArrayList(u32) = .empty,
     bases: std.ArrayList(StrRef) = .empty,
+    files: std.ArrayList(StrRef) = .empty,
+    file_table: FileTable = .{},
     strings: std.ArrayList(u8) = .empty,
     entry: Hash = 0,
+    /// Each number's key.
+    symbol_keys: std.ArrayList(Hash) = .empty,
+    /// Keys numbered since `base`, or all of them without one.
+    symbol_map: SymbolMap = .empty,
     /// The manifest this one started from: finds its nodes, which keep their
-    /// indices. Nodes added since are in `added`.
+    /// indices, and its symbols. Nodes added since are in `added`.
     base: ?*const Manifest = null,
     added: std.AutoHashMapUnmanaged(Hash, u32) = .empty,
 
@@ -613,10 +956,18 @@ pub const Builder = struct {
         b.nodes.deinit(gpa);
         b.edges.deinit(gpa);
         b.atom_refs.deinit(gpa);
+        b.numbered.deinit(gpa);
+        b.debug_files.deinit(gpa);
+        b.targets.deinit(gpa);
         b.inputs.deinit(gpa);
         b.error_names.deinit(gpa);
+        b.error_symbols.deinit(gpa);
         b.bases.deinit(gpa);
+        b.files.deinit(gpa);
+        b.file_table.deinit(gpa);
         b.strings.deinit(gpa);
+        b.symbol_keys.deinit(gpa);
+        b.symbol_map.deinit(gpa);
         b.added.deinit(gpa);
     }
 
@@ -628,11 +979,27 @@ pub const Builder = struct {
         try b.nodes.appendSlice(gpa, base.nodes);
         try b.edges.appendSlice(gpa, base.edges);
         try b.atom_refs.appendSlice(gpa, base.atom_refs);
+        try b.numbered.appendSlice(gpa, base.numbered);
+        try b.debug_files.appendSlice(gpa, base.debug_files);
         try b.inputs.appendSlice(gpa, base.inputs);
         try b.error_names.appendSlice(gpa, base.error_names);
         try b.bases.appendSlice(gpa, base.bases);
+        try b.files.appendSlice(gpa, base.files);
         try b.strings.appendSlice(gpa, base.strings);
         const o = &base.overlay;
+        // Number space: the base's and the log's, as they are.
+        try b.targets.appendSlice(gpa, base.targets);
+        try b.targets.appendSlice(gpa, o.targets.items);
+        try b.error_symbols.appendSlice(gpa, base.error_symbols);
+        try b.error_symbols.appendSlice(gpa, o.error_symbols.items);
+        try b.symbol_keys.resize(gpa, base.symbolLen());
+        @memset(b.symbol_keys.items, 0);
+        for (base.symbols) |s| {
+            if (s.number != no_symbol) b.symbol_keys.items[s.number] = s.keyHash();
+        }
+        for (o.added_symbols.slots) |s| {
+            if (s.number != no_symbol) b.symbol_keys.items[s.number] = s.keyHash();
+        }
         try b.nodes.resize(gpa, base.nodeCount());
         var nit = o.nodes.iterator();
         while (nit.next()) |e| {
@@ -648,9 +1015,12 @@ pub const Builder = struct {
                 .rdeps_len = 0,
                 .atoms_start = @intCast(b.atom_refs.items.len),
                 .atoms_len = @intCast(s.atoms.len),
+                .targets_len = s.delta.targets_len,
             };
             try b.edges.appendSlice(gpa, s.deps);
             try b.atom_refs.appendSlice(gpa, s.atoms);
+            try b.numbered.appendSlice(gpa, s.numbered);
+            try b.debug_files.appendSlice(gpa, s.debug_files);
         }
         var kit = o.added_keys.iterator();
         while (kit.next()) |e| try b.added.put(gpa, e.key_ptr.*, e.value_ptr.*);
@@ -662,6 +1032,8 @@ pub const Builder = struct {
             b.inputs.items[e.key_ptr.*] = in;
         }
         for (o.error_names.items) |name| try b.error_names.append(gpa, try b.addString(name));
+        for (o.files.items) |f| try b.files.append(gpa, try b.addString(f));
+        for (b.files.items, 0..) |f, i| _ = try b.file_table.intern(gpa, b.strings.items[f.off..][0..f.len], @intCast(i));
         return b;
     }
 
@@ -681,9 +1053,10 @@ pub const Builder = struct {
             .rdeps_len = 0,
             .atoms_start = @intCast(b.atom_refs.items.len),
             .atoms_len = @intCast(n.atoms.len),
+            .targets_len = undefined,
         });
         try b.edges.appendSlice(gpa, n.deps);
-        try b.atom_refs.appendSlice(gpa, n.atoms);
+        b.nodes.items[index].targets_len = try b.appendAtoms(n);
         return index;
     }
 
@@ -705,7 +1078,61 @@ pub const Builder = struct {
         node_ptr.atoms_start = @intCast(b.atom_refs.items.len);
         node_ptr.atoms_len = @intCast(n.atoms.len);
         try b.edges.appendSlice(b.gpa, n.deps);
-        try b.atom_refs.appendSlice(b.gpa, n.atoms);
+        b.nodes.items[index].targets_len = try b.appendAtoms(n);
+    }
+
+    /// Reserves room for `n_atoms` more atom references with `n_targets` more
+    /// target numbers in all, and about as many new symbols as atoms.
+    pub fn ensureUnusedCapacity(b: *Builder, n_atoms: usize, n_targets: usize) !void {
+        const gpa = b.gpa;
+        try b.atom_refs.ensureUnusedCapacity(gpa, n_atoms);
+        try b.numbered.ensureUnusedCapacity(gpa, n_atoms);
+        try b.debug_files.ensureUnusedCapacity(gpa, n_atoms);
+        try b.targets.ensureUnusedCapacity(gpa, n_targets);
+        try b.symbol_keys.ensureUnusedCapacity(gpa, n_atoms + n_atoms / 8);
+        try b.symbol_map.ensureUnusedCapacity(gpa, n_atoms + n_atoms / 8);
+    }
+
+    /// Appends a node's atom references and numbers their symbols; returns
+    /// the length of its target run.
+    fn appendAtoms(b: *Builder, n: NodeInit) !u32 {
+        std.debug.assert(n.symbols.len == n.atoms.len);
+        const gpa = b.gpa;
+        try b.atom_refs.appendSlice(gpa, n.atoms);
+        const first: u32 = @intCast(b.targets.items.len);
+        for (n.symbols) |s| {
+            try b.numbered.append(gpa, .{ .symbol = try b.symbolNumber(s.key), .targets = @intCast(b.targets.items.len) });
+            for (s.targets) |t| try b.targets.append(gpa, try b.symbolNumber(t));
+            try b.debug_files.append(gpa, if (s.file) |f| try b.fileIndex(f) else no_file);
+        }
+        return @as(u32, @intCast(b.targets.items.len)) - first;
+    }
+
+    fn symbolNumber(b: *Builder, key: Hash) !u32 {
+        if (b.base) |m| if (m.symbol(key)) |n| return n;
+        const n, const new = try b.symbol_map.getOrPut(b.gpa, key, @intCast(b.symbol_keys.items.len));
+        if (new) try b.symbol_keys.append(b.gpa, key);
+        return n;
+    }
+
+    fn fileIndex(b: *Builder, path: []const u8) !u32 {
+        const index, const new = try b.file_table.intern(b.gpa, path, @intCast(b.files.items.len));
+        if (new) try b.files.append(b.gpa, try b.addString(path));
+        return index;
+    }
+
+    /// Replaces every live atom reference, given in node order as
+    /// `Manifest.linkInput` lists them, and drops the base packs: for a
+    /// manifest written after `Pack.compact`.
+    pub fn setAtomRefs(b: *Builder, refs: []const Pack.AtomRef) !void {
+        var i: usize = 0;
+        for (b.nodes.items) |n| {
+            if (i + n.atoms_len > refs.len) return error.InvalidAtomRefs;
+            @memcpy(b.atom_refs.items[n.atoms_start..][0..n.atoms_len], refs[i..][0..n.atoms_len]);
+            i += n.atoms_len;
+        }
+        if (i != refs.len) return error.InvalidAtomRefs;
+        b.bases.clearRetainingCapacity();
     }
 
     /// Records an input file and its stat as of `build_start`.
@@ -713,10 +1140,11 @@ pub const Builder = struct {
         try b.inputs.append(b.gpa, .init(stat, content_hash, build_start, try b.addString(path)));
     }
 
-    /// Assigns the next error code to `name`. Codes are only appended, so
-    /// existing errors keep theirs.
-    pub fn addErrorName(b: *Builder, name: []const u8) !u32 {
+    /// Assigns the next error code to `name`, whose symbol key is `key`.
+    /// Codes are only appended, so existing errors keep theirs.
+    pub fn addErrorName(b: *Builder, name: []const u8, key: Hash) !u32 {
         try b.error_names.append(b.gpa, try b.addString(name));
+        try b.error_symbols.append(b.gpa, try b.symbolNumber(key));
         return @intCast(b.error_names.items.len);
     }
 
@@ -738,30 +1166,109 @@ pub const Builder = struct {
         const gpa = b.gpa;
         const nodes = try gpa.dupe(Node, b.nodes.items);
         defer gpa.free(nodes);
+        const entry_old: u32 = if (b.entry != 0) try b.symbolNumber(b.entry) else no_symbol;
 
-        // Compact edges and atom references, dropping replaced ranges.
+        // Compact edges, atom references, and target runs, dropping
+        // replaced ranges, unless there are none and they are in order, as
+        // when every node was added to an empty builder.
         var edge_count: usize = 0;
         var ref_count: usize = 0;
+        var target_count: usize = 0;
+        var in_order = true;
         for (nodes) |n| {
+            if (n.deps_start != edge_count or n.atoms_start != ref_count or
+                (n.atoms_len != 0 and b.numbered.items[n.atoms_start].targets != target_count)) in_order = false;
             edge_count += n.deps_len;
             ref_count += n.atoms_len;
+            target_count += n.targets_len;
         }
-        const edges = try gpa.alloc(u32, edge_count);
-        defer gpa.free(edges);
-        const refs = try gpa.alloc(Pack.AtomRef, ref_count);
-        defer gpa.free(refs);
-        edge_count = 0;
-        ref_count = 0;
-        for (nodes) |*n| {
-            for (b.edges.items[n.deps_start..][0..n.deps_len]) |d| {
-                if (d >= nodes.len) return error.InvalidNodeIndex;
+        for (b.edges.items) |d| {
+            if (d >= nodes.len) return error.InvalidNodeIndex;
+        }
+        const numbered = try gpa.alloc(NumberedAtom, ref_count);
+        defer gpa.free(numbered);
+        const targets = try gpa.alloc(u32, target_count);
+        defer gpa.free(targets);
+        var compacted: struct { edges: []u32 = &.{}, refs: []Pack.AtomRef = &.{}, debug_files: []u32 = &.{} } = .{};
+        defer {
+            gpa.free(compacted.edges);
+            gpa.free(compacted.refs);
+            gpa.free(compacted.debug_files);
+        }
+        var edges: []const u32 = b.edges.items;
+        var refs: []const Pack.AtomRef = b.atom_refs.items;
+        var debug_files: []const u32 = b.debug_files.items;
+        if (in_order and edge_count == edges.len and ref_count == refs.len and target_count == b.targets.items.len) {
+            @memcpy(numbered, b.numbered.items);
+            @memcpy(targets, b.targets.items);
+        } else {
+            compacted.edges = try gpa.alloc(u32, edge_count);
+            compacted.refs = try gpa.alloc(Pack.AtomRef, ref_count);
+            compacted.debug_files = try gpa.alloc(u32, ref_count);
+            edge_count = 0;
+            ref_count = 0;
+            target_count = 0;
+            for (nodes) |*n| {
+                @memcpy(compacted.edges[edge_count..][0..n.deps_len], b.edges.items[n.deps_start..][0..n.deps_len]);
+                n.deps_start = @intCast(edge_count);
+                edge_count += n.deps_len;
+                const node_numbered = b.numbered.items[n.atoms_start..][0..n.atoms_len];
+                @memcpy(compacted.refs[ref_count..][0..n.atoms_len], b.atom_refs.items[n.atoms_start..][0..n.atoms_len]);
+                @memcpy(compacted.debug_files[ref_count..][0..n.atoms_len], b.debug_files.items[n.atoms_start..][0..n.atoms_len]);
+                if (n.atoms_len != 0) {
+                    const old_first = node_numbered[0].targets;
+                    @memcpy(targets[target_count..][0..n.targets_len], b.targets.items[old_first..][0..n.targets_len]);
+                    for (numbered[ref_count..][0..n.atoms_len], node_numbered) |*out, in| {
+                        out.* = .{ .symbol = in.symbol, .targets = @intCast(target_count + (in.targets - old_first)) };
+                    }
+                }
+                n.atoms_start = @intCast(ref_count);
+                ref_count += n.atoms_len;
+                target_count += n.targets_len;
             }
-            @memcpy(edges[edge_count..][0..n.deps_len], b.edges.items[n.deps_start..][0..n.deps_len]);
-            n.deps_start = @intCast(edge_count);
-            edge_count += n.deps_len;
-            @memcpy(refs[ref_count..][0..n.atoms_len], b.atom_refs.items[n.atoms_start..][0..n.atoms_len]);
-            n.atoms_start = @intCast(ref_count);
-            ref_count += n.atoms_len;
+            edges = compacted.edges;
+            refs = compacted.refs;
+            debug_files = compacted.debug_files;
+        }
+
+        // Renumber in link order: the atoms, then targets no atom defines,
+        // then error codes and the entry. Keys nothing uses lose their
+        // numbers.
+        const new_of = try gpa.alloc(u32, b.symbol_keys.items.len);
+        defer gpa.free(new_of);
+        @memset(new_of, no_symbol);
+        var next: u32 = 0;
+        for (numbered) |*na| {
+            if (new_of[na.symbol] != no_symbol) return error.DuplicateSymbol;
+            new_of[na.symbol] = next;
+            na.symbol = next;
+            next += 1;
+        }
+        const renumber = struct {
+            fn f(map: []u32, n: *u32, old: u32) u32 {
+                if (map[old] == no_symbol) {
+                    map[old] = n.*;
+                    n.* += 1;
+                }
+                return map[old];
+            }
+        }.f;
+        for (targets) |*t| t.* = renumber(new_of, &next, t.*);
+        const error_symbols = try gpa.alloc(u32, b.error_symbols.items.len);
+        defer gpa.free(error_symbols);
+        for (error_symbols, b.error_symbols.items) |*out, old| out.* = renumber(new_of, &next, old);
+        const entry_symbol = if (entry_old != no_symbol) renumber(new_of, &next, entry_old) else no_symbol;
+        const symbols = try gpa.alloc(Symbol, @as(usize, next) + next / 4 + 16);
+        defer gpa.free(symbols);
+        @memset(symbols, .{ .key = .{ 0, 0 }, .number = no_symbol });
+        for (b.symbol_keys.items, new_of) |key, n| {
+            if (n == no_symbol) continue;
+            var slot = symbolSlot(key, symbols.len);
+            while (symbols[slot].number != no_symbol) {
+                slot += 1;
+                if (slot == symbols.len) slot = 0;
+            }
+            symbols[slot] = .init(key, n);
         }
 
         // Reverse edges: count, prefix sums, fill.
@@ -795,7 +1302,14 @@ pub const Builder = struct {
             table[slot] = @intCast(i + 1);
         }
 
-        var header: Header = .{ .id = undefined, .pack_id = pack_id, .entry = b.entry, .sections = undefined };
+        var header: Header = .{
+            .id = undefined,
+            .pack_id = pack_id,
+            .entry = b.entry,
+            .symbol_len = next,
+            .entry_symbol = entry_symbol,
+            .sections = undefined,
+        };
         io.random(std.mem.asBytes(&header.id));
         const parts: [std.enums.values(Section).len][]const u8 = .{
             @ptrCast(nodes),
@@ -806,6 +1320,12 @@ pub const Builder = struct {
             @ptrCast(b.inputs.items),
             @ptrCast(b.error_names.items),
             @ptrCast(b.bases.items),
+            @ptrCast(symbols),
+            @ptrCast(numbered),
+            @ptrCast(targets),
+            @ptrCast(error_symbols),
+            @ptrCast(debug_files),
+            @ptrCast(b.files.items),
             b.strings.items,
         };
         const zeros: [16]u8 = @splat(0);
@@ -857,13 +1377,19 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         var b: Builder = .{ .gpa = gpa };
         defer b.deinit();
         // 0 <- 1 <- 2, and 2 also depends on 0 and on node 3, added after it.
+        // Symbol keys are 0xa.. for atoms, 0xe.. for errors.
         _ = try b.addNode(.{ .key = 100, .result_hash = 1 });
-        _ = try b.addNode(.{ .key = 101, .result_hash = 2, .src_hash = 7, .deps = &.{0}, .atoms = &.{.init(32, 64)} });
+        _ = try b.addNode(.{ .key = 101, .result_hash = 2, .src_hash = 7, .deps = &.{0}, .atoms = &.{.init(32, 64)}, .symbols = &.{
+            .{ .key = 0xa1, .targets = &.{ 0xa3, 0xe1 }, .file = "a.zig" },
+        } });
         _ = try b.addNode(.{ .key = 102, .result_hash = 3, .deps = &.{ 1, 0, 3 } });
-        _ = try b.addNode(.{ .key = 103, .result_hash = 4, .atoms = &.{.init(160, 16)} });
+        _ = try b.addNode(.{ .key = 103, .result_hash = 4, .atoms = &.{.init(160, 16)}, .symbols = &.{
+            .{ .key = 0xa3, .targets = &.{ 0xa1, 0xb0 } },
+        } });
         try b.addInput(a_path, try tmp.dir.statFile(io, "a.zig", .{}), 55, Io.Clock.real.now(io));
-        try t.expectEqual(1, try b.addErrorName("OutOfMemory"));
-        try t.expectEqual(2, try b.addErrorName("Overflow"));
+        try t.expectEqual(1, try b.addErrorName("OutOfMemory", 0xe1));
+        try t.expectEqual(2, try b.addErrorName("Overflow", 0xe2));
+        b.entry = 0xa1;
         try b.write(io, tmp.dir, 0xabc);
     }
     var m = (try Manifest.open(gpa, io, tmp.dir)).?;
@@ -876,6 +1402,19 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     try t.expectEqualSlices(u32, &.{2}, m.rdeps(1)[0]);
     try t.expectEqual(64, m.atoms(1)[0].len);
     try t.expectEqualStrings("Overflow", m.errorName(2));
+    // Numbered in link order: atoms, then other targets, then errors.
+    {
+        const in = try m.linkInput(gpa);
+        try t.expectEqual(5, m.symbolLen());
+        try t.expectEqual(0, m.entry_symbol);
+        try t.expectEqual(1, m.symbol(0xa3));
+        try t.expectEqual(null, m.symbol(0xa2));
+        try t.expectEqualSlices(NumberedAtom, &.{ .{ .symbol = 0, .targets = 0 }, .{ .symbol = 1, .targets = 2 } }, in.numbered);
+        try t.expectEqualSlices(u32, &.{ 1, 2, 0, 3 }, in.targets);
+        try t.expectEqual(4, m.errorSymbol(2));
+        try t.expectEqualSlices(u32, &.{ 0, no_file }, in.debug_files);
+        try t.expectEqualStrings("a.zig", m.file(0));
+    }
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(gpa);
     try m.changedInputs(gpa, io, &changed);
@@ -890,10 +1429,12 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     {
         var d: Delta = .init(gpa, &m);
         defer d.deinit();
-        try d.update(2, .{ .key = 102, .result_hash = 33, .deps = &.{3}, .atoms = &.{.init(96, 48)} });
+        try d.update(2, .{ .key = 102, .result_hash = 33, .deps = &.{3}, .atoms = &.{.init(96, 48)}, .symbols = &.{
+            .{ .key = 0xa2, .targets = &.{ 0xa1, 0xc0 }, .file = "b.zig" },
+        } });
         try t.expectEqual(4, try d.addNode(.{ .key = 104, .result_hash = 5, .deps = &.{2} }));
         try d.setInput(0, a_path, try tmp.dir.statFile(io, "a.zig", .{}), 56, .fromNanoseconds(std.math.maxInt(i64)));
-        try t.expectEqual(3, try d.addErrorName("Unexpected"));
+        try t.expectEqual(3, try d.addErrorName("Unexpected", 0xe3));
         try d.append(io, tmp.dir);
     }
     var m2 = (try Manifest.open(gpa, io, tmp.dir)).?;
@@ -901,7 +1442,15 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         defer m2.close(gpa, io);
         var d: Delta = .init(gpa, &m2);
         defer d.deinit();
-        try d.update(4, .{ .key = 104, .result_hash = 6, .deps = &.{2}, .atoms = &.{.init(208, 16)} });
+        // Node 2 again, now without its target 0xc0, which no atom uses
+        // any more but keeps its number until the next base.
+        try t.expectEqual(6, m2.symbol(0xc0));
+        try d.update(2, .{ .key = 102, .result_hash = 33, .deps = &.{3}, .atoms = &.{.init(96, 48)}, .symbols = &.{
+            .{ .key = 0xa2, .targets = &.{0xa1}, .file = "b.zig" },
+        } });
+        try d.update(4, .{ .key = 104, .result_hash = 6, .deps = &.{2}, .atoms = &.{.init(208, 16)}, .symbols = &.{
+            .{ .key = 0xa4, .targets = &.{ 0xa2, 0xe3 }, .file = "a.zig" },
+        } });
         try d.setInput(null, b_path, try tmp.dir.statFile(io, "b.zig", .{}), 57, .fromNanoseconds(std.math.maxInt(i64)));
         try d.append(io, tmp.dir);
     }
@@ -928,6 +1477,24 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             defer refs.deinit(gpa);
             for (try m3.allAtomRefs(gpa)) |r| try refs.append(gpa, r.offset());
             try t.expectEqualSlices(u64, &.{ 32, 96, 160, 208 }, refs.items);
+            // The numbers can change when a base is written; what they
+            // stand for cannot.
+            const in = try m3.linkInput(gpa);
+            const expected = [_]struct { Hash, []const Hash, ?[]const u8 }{
+                .{ 0xa1, &.{ 0xa3, 0xe1 }, "a.zig" },
+                .{ 0xa2, &.{0xa1}, "b.zig" },
+                .{ 0xa3, &.{ 0xa1, 0xb0 }, null },
+                .{ 0xa4, &.{ 0xa2, 0xe3 }, "a.zig" },
+            };
+            try t.expectEqual(expected.len, in.numbered.len);
+            for (expected, in.numbered, in.debug_files) |e, na, f| {
+                try t.expectEqual(m3.symbol(e[0]).?, na.symbol);
+                for (e[1], in.targets[na.targets..][0..e[1].len]) |key, number| try t.expectEqual(m3.symbol(key).?, number);
+                if (e[2]) |name| try t.expectEqualStrings(name, m3.file(f)) else try t.expectEqual(no_file, f);
+            }
+            try t.expectEqual(m3.symbol(0xe3).?, m3.errorSymbol(3));
+            try t.expectEqual(m3.symbol(0xe2).?, m3.errorSymbol(2));
+            try t.expectEqual(m3.symbol(0xa1).?, m3.entry_symbol);
         }
     }.check;
     var m3 = (try Manifest.open(gpa, io, tmp.dir)).?;
@@ -935,7 +1502,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     // The log's reverse edges join the base's, which keep node 2's old
     // dependency on node 0 until the next base.
     try t.expectEqualSlices(u32, &.{ 1, 2 }, m3.rdeps(0)[0]);
-    try t.expectEqualSlices(u32, &.{2}, m3.rdeps(3)[1]);
+    try t.expectEqualSlices(u32, &.{ 2, 2 }, m3.rdeps(3)[1]);
     try t.expectEqualSlices(u32, &.{ 4, 4 }, m3.rdeps(2)[1]);
     {
         var d: Delta = .init(gpa, &m3);
@@ -948,6 +1515,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
 
     // Folding writes the same state as a new base, without a log.
     {
+        try t.expectEqual(9, m4.symbolLen());
         var b: Builder = try .initFrom(gpa, &m4);
         defer b.deinit();
         try t.expectEqual(4, b.find(104));
@@ -958,6 +1526,17 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     defer m5.close(gpa, io);
     try t.expectEqual(0, m5.overlay.len);
     try expectLogged(&m5);
+    // Renumbered in link order, without 0xc0.
+    try t.expectEqual(8, m5.symbolLen());
+    try t.expectEqual(null, m5.symbol(0xc0));
+    for ((try m5.linkInput(gpa)).numbered, 0..) |na, i| try t.expectEqual(i, na.symbol);
     try t.expectEqualSlices(u32, &.{1}, m5.rdeps(0)[0]);
     try t.expectEqualSlices(u32, &.{4}, m5.rdeps(2)[0]);
+
+    // The link needs each key defined once.
+    var b: Builder = .{ .gpa = gpa };
+    defer b.deinit();
+    _ = try b.addNode(.{ .key = 1, .result_hash = 0, .atoms = &.{.init(0, 16)}, .symbols = &.{.{ .key = 0xa1, .targets = &.{} }} });
+    _ = try b.addNode(.{ .key = 2, .result_hash = 0, .atoms = &.{.init(16, 16)}, .symbols = &.{.{ .key = 0xa1, .targets = &.{} }} });
+    try t.expectError(error.DuplicateSymbol, b.write(io, tmp.dir, 0xabc));
 }

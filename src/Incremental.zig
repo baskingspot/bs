@@ -136,26 +136,29 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     defer pack.close(gpa, io);
     if (pack.id != m.pack_id) return false;
     for (0..m.bases.len) |i| _ = pack.addBase(gpa, io, inc.dir, m.basePack(i)) catch return false;
-    const refs = try m.allAtomRefs(gpa);
-    const atoms = try gpa.alloc(Atom, refs.len);
+    const in = try m.linkInput(gpa);
+    const atoms = try gpa.alloc(Atom, in.refs.len);
     defer gpa.free(atoms);
     var debug: std.ArrayList(Atom.Debug) = .empty;
     defer debug.deinit(gpa);
-    pack.decodeAll(gpa, io, refs, atoms, &debug) catch |err| switch (err) {
+    const files = try gpa.alloc([]const u8, m.fileCount());
+    defer gpa.free(files);
+    for (files, 0..) |*f, i| f.* = m.file(@intCast(i));
+    pack.decodeAll(gpa, io, in.refs, atoms, &debug, .{ .of = in.debug_files, .names = files }) catch |err| switch (err) {
         error.CorruptAtom => return false,
         else => |e| return e,
     };
     const t2 = now(io);
 
-    const values = try gpa.alloc(Elf.Value, m.errorCount());
+    const values = try gpa.alloc(Elf.NumberedValue, m.errorCount());
     defer gpa.free(values);
-    for (values, 1..) |*v, code| v.* = .{ .key = Emit.errorKeyFromName(m.errorName(@intCast(code))), .value = code };
+    for (values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
     var diag: Elf.Diagnostic = .{};
     Elf.link(gpa, io, out_dir, sub_path, atoms, .{
         .entry = @fromBackingInt(m.entry),
-        .values = values,
+        .symbols = .{ .atoms = in.numbered, .targets = in.targets, .values = values, .entry = m.entry_symbol, .len = m.symbolLen() },
         .diag = &diag,
         .debug = debug.items,
         .comp_dir = cwd,
@@ -499,22 +502,30 @@ pub fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Em
     defer b.deinit();
     var refs: std.ArrayList(Pack.AtomRef) = .empty;
     defer refs.deinit(gpa);
+    var symbols: std.ArrayList(Manifest.AtomSymbols) = .empty;
+    defer symbols.deinit(gpa);
+    var n_targets: usize = 0;
+    for (emit.atoms.items) |*a| n_targets += a.targets.len;
+    try b.ensureUnusedCapacity(emit.atoms.items.len, n_targets);
     for (r.nodes.items, where) |n, w| {
         refs.clearRetainingCapacity();
+        symbols.clearRetainingCapacity();
         if (w) |loc| {
             const base_pack = if (loc.pack == in_batch) new_base else loc.pack;
             var off = loc.entry_offset + Store.atomsOffset(n.deps.items.len);
             for (n.atoms.items) |ai| {
-                const len = atoms_codec.encodedLen(&emit.atoms.items[ai], debug_of[ai]);
+                const a = &emit.atoms.items[ai];
+                const len = atoms_codec.encodedLen(a, debug_of[ai]);
                 try refs.append(gpa, .initIn(base_pack, off, @intCast(len)));
+                try symbols.append(gpa, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (debug_of[ai]) |d| d.file else null });
                 off += len;
             }
         }
-        _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps.items, .atoms = refs.items });
+        _ = try b.addNode(.{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = @backingInt(n.tag), .deps = n.deps.items, .atoms = refs.items, .symbols = symbols.items });
     }
     for (base_names.items) |name| _ = try b.addBasePack(name);
     b.entry = @backingInt(emit.entry.?);
-    for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name));
+    for (ip.error_names.items[1..]) |name| _ = try b.addErrorName(ip.stringSlice(name), @backingInt(Emit.errorKey(ip, name)));
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
     for (fe.files.items) |*f| {

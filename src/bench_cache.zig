@@ -6,7 +6,8 @@
 //!
 //! - no-edit rebuild: lock, map the manifest, stat every input;
 //! - relink: map the pack, decode every Atom, `Elf.emit` straight from the
-//!   mapping (checked against an emit of the original Atoms);
+//!   mapping with the manifest's numbered symbols (checked against an emit
+//!   of the original Atoms), and by keys for comparison;
 //! - edit rebuild storage work: append a unit's new Atoms, find its
 //!   dependents, write the next manifest;
 //! - compaction, and the global store (a first build's puts and commit,
@@ -53,7 +54,13 @@ pub fn main(init: std.process.Init) !void {
         n.* = try std.fmt.allocPrint(arena, "bench:file{d}.zig:decl{d}", .{ i % 500, i });
         k.* = .fromName(n.*);
     }
-    const atoms, const debug = try generate(arena, rand, keys, names);
+    const all_atoms, const all_debug = try generate(arena, rand, keys, names);
+    // What the link keeps: the first of the atoms sharing a key. A
+    // compilation's manifest holds each key once.
+    const atoms, const debug = try dedupe(arena, all_atoms, all_debug);
+    const debug_of = try arena.alloc(?*const Atom.Debug, atoms.len);
+    @memset(debug_of, null);
+    for (debug) |*d| debug_of[d.atom] = d;
     var atom_bytes: usize = 0;
     for (atoms) |*a| atom_bytes += a.bytes.len;
 
@@ -80,17 +87,27 @@ pub fn main(init: std.process.Init) !void {
     const t_append = since(io, t);
     t = now(io);
     var builder: Manifest.Builder = .{ .gpa = gpa };
+    const symbols = try arena.alloc(Manifest.AtomSymbols, atoms.len);
+    for (symbols, atoms, debug_of) |*s, a, d| s.* = .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (d) |x| x.file else null };
+    var n_targets: usize = 0;
+    for (atoms) |a| n_targets += a.targets.len;
+    try builder.ensureUnusedCapacity(atoms.len, n_targets);
     for (0..n_units) |u| {
         const lo = u * atoms.len / n_units;
         const hi = (u + 1) * atoms.len / n_units;
         var deps: [deps_per_unit]u32 = undefined;
         for (&deps) |*d| d.* = rand.uintLessThan(u32, n_units + n_other_nodes);
-        _ = try builder.addNode(.{ .key = rand.int(u128), .result_hash = rand.int(u128), .src_hash = rand.int(u128), .deps = &deps, .atoms = refs[lo..hi] });
+        _ = try builder.addNode(.{ .key = rand.int(u128), .result_hash = rand.int(u128), .src_hash = rand.int(u128), .deps = &deps, .atoms = refs[lo..hi], .symbols = symbols[lo..hi] });
     }
     for (0..n_other_nodes) |_| _ = try builder.addNode(.{ .key = rand.int(u128), .result_hash = rand.int(u128) });
     const build_start = Io.Clock.real.now(io);
     for (input_paths) |p| try builder.addInput(p, try cwd.statFile(io, p, .{}), rand.int(u128), build_start);
-    for (0..n_errors) |i| _ = try builder.addErrorName(try std.fmt.allocPrint(arena, "Error{d}", .{i}));
+    for (0..n_errors) |i| {
+        const name = try std.fmt.allocPrint(arena, "Error{d}", .{i});
+        _ = try builder.addErrorName(name, @backingInt(Atom.SymbolKey.fromName(try std.fmt.allocPrint(arena, "error.{s}", .{name}))));
+    }
+    builder.entry = @backingInt(keys[0]);
+    const t_fill = since(io, t);
     try builder.write(io, dir, pack.id);
     builder.deinit();
     const t_manifest = since(io, t);
@@ -119,34 +136,35 @@ pub fn main(init: std.process.Init) !void {
         noedit.add(.{ ns(t0, t1), ns(t1, t2), ns(t2, t3), ns(t0, t4) });
     }
 
-    // ---- Relink from the pack.
+    // ---- Relink from the pack, numbered by the manifest, and by keys.
     const parallel: Elf.Options = .{ .entry = keys[0], .comp_dir = "/bench", .debug = debug };
-    const expected = try Elf.emit(gpa, io, atoms, parallel);
+    const expected = try Elf.emit(gpa, io, all_atoms, .{ .entry = keys[0], .comp_dir = "/bench", .debug = all_debug });
     defer gpa.free(expected);
     var relink: Stats = .{};
+    var relink_keys: Stats = .{};
     var emit_memory: Stats = .{};
     const decoded = try gpa.alloc(Atom, atoms.len);
     defer gpa.free(decoded);
     var decoded_debug: std.ArrayList(Atom.Debug) = .empty;
     defer decoded_debug.deinit(gpa);
     for (0..runs) |i| {
+        relink.add(try relinkOnce(gpa, io, dir, decoded, &decoded_debug, keys[0], if (i == 0) expected else null));
+
         const t0 = now(io);
         var m = (try Manifest.open(gpa, io, dir)).?;
         var p: Pack = try .open(io, dir);
-        if (p.id != m.pack_id) @panic("pack id mismatch");
-        const t1 = now(io);
         decoded_debug.clearRetainingCapacity();
-        try p.decodeAll(gpa, io, try m.allAtomRefs(gpa), decoded, &decoded_debug);
-        const t2 = now(io);
+        try p.decodeAll(gpa, io, try m.allAtomRefs(gpa), decoded, &decoded_debug, null);
+        const t1 = now(io);
         var from_pack = parallel;
         from_pack.debug = decoded_debug.items;
         const out = try Elf.emit(gpa, io, decoded, from_pack);
-        const t3 = now(io);
-        if (i == 0 and !std.mem.eql(u8, out, expected)) @panic("relink from the pack differs");
+        const t2 = now(io);
+        if (i == 0 and !std.mem.eql(u8, out, expected)) @panic("relink by keys differs");
         gpa.free(out);
         p.close(gpa, io);
         m.close(gpa, io);
-        relink.add(.{ ns(t0, t1), ns(t1, t2), ns(t2, t3), ns(t0, t3) });
+        relink_keys.add(.{ 0, ns(t0, t1), ns(t1, t2), ns(t0, t2) });
 
         const t4 = now(io);
         const out2 = try Elf.emit(gpa, io, atoms, parallel);
@@ -167,7 +185,7 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(new_atoms);
         var new_debug: std.ArrayList(Atom.Debug) = .empty;
         defer new_debug.deinit(gpa);
-        try p.decodeAll(gpa, io, old_refs, new_atoms, &new_debug);
+        try p.decodeAll(gpa, io, old_refs, new_atoms, &new_debug, null);
         const new_refs = try gpa.alloc(Pack.AtomRef, old_refs.len);
         defer gpa.free(new_refs);
         const t0 = now(io);
@@ -187,8 +205,12 @@ pub fn main(init: std.process.Init) !void {
         };
         closure_size = seen.count();
         const t2 = now(io);
+        const new_symbols = try gpa.alloc(Manifest.AtomSymbols, new_atoms.len);
+        defer gpa.free(new_symbols);
+        for (new_symbols, new_atoms) |*s, a| s.* = .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets) };
+        for (new_debug.items) |dbg| new_symbols[dbg.atom].file = dbg.file;
         var d: Manifest.Delta = .init(gpa, &m);
-        try d.update(node, .{ .key = m.node(node).key, .result_hash = rand.int(u128), .src_hash = rand.int(u128), .deps = m.deps(node), .atoms = new_refs });
+        try d.update(node, .{ .key = m.node(node).key, .result_hash = rand.int(u128), .src_hash = rand.int(u128), .deps = m.deps(node), .atoms = new_refs, .symbols = new_symbols });
         try d.append(io, dir);
         d.deinit();
         const t3 = now(io);
@@ -202,10 +224,12 @@ pub fn main(init: std.process.Init) !void {
     for (0..runs) |_| {
         const t0 = now(io);
         var m = (try Manifest.open(gpa, io, dir)).?;
-        _ = try m.allAtomRefs(gpa);
+        _ = try m.linkInput(gpa);
         open_logged.add(.{ since(io, t0), 0, 0, 0 });
         m.close(gpa, io);
     }
+    var relink_logged: Stats = .{};
+    for (0..runs) |i| relink_logged.add(try relinkOnce(gpa, io, dir, decoded, &decoded_debug, keys[0], if (i == 0) expected else null));
     const log_size: u64 = (try dir.statFile(io, "manifest.log", .{})).size;
     var fold_ns: u64 = 0;
     {
@@ -218,8 +242,10 @@ pub fn main(init: std.process.Init) !void {
         fold_ns = since(io, t0);
     }
 
-    // ---- Compaction: every atom appended again, so half the pack is dead.
+    // ---- Compaction: every atom appended again, so half the pack is
+    // dead, then a manifest renumbered in link order.
     var compaction_ns: u64 = 0;
+    var renumber_ns: u64 = 0;
     var compacted_size: u64 = 0;
     var uncompacted_size: u64 = 0;
     {
@@ -227,6 +253,7 @@ pub fn main(init: std.process.Init) !void {
         defer m.close(gpa, io);
         var p: Pack = try .open(io, dir);
         defer p.close(gpa, io);
+        // The units' atoms are in key order, as the manifest links them.
         const new_refs = try gpa.alloc(Pack.AtomRef, atoms.len);
         defer gpa.free(new_refs);
         try p.append(gpa, io, atoms, debug, new_refs);
@@ -237,7 +264,15 @@ pub fn main(init: std.process.Init) !void {
         try p.compact(gpa, io, dir, new_refs);
         compaction_ns = since(io, t0);
         compacted_size = p.len;
+        const t1 = now(io);
+        var b: Manifest.Builder = try .initFrom(gpa, &m);
+        defer b.deinit();
+        try b.setAtomRefs(new_refs);
+        try b.write(io, dir, p.id);
+        renumber_ns = since(io, t1);
     }
+    var relink_packed: Stats = .{};
+    for (0..runs) |i| relink_packed.add(try relinkOnce(gpa, io, dir, decoded, &decoded_debug, keys[0], if (i == 0) expected else null));
 
     var n_relocs: usize = 0;
     var n_edges: usize = 0;
@@ -252,12 +287,15 @@ pub fn main(init: std.process.Init) !void {
         n_units, n_units + n_other_nodes, n_edges, n_inputs, n_errors, atoms.len, mib(atom_bytes), n_relocs,
     });
     print("files: manifest {d:.1} MiB, pack {d:.1} MiB\n", .{ mib(manifest_size), mib(pack_size) });
-    print("cold save: pack append {d:.2} ms, manifest write {d:.2} ms\n", .{ ms(t_append), ms(t_manifest) });
+    print("cold save: pack append {d:.2} ms, manifest {d:.2} ms (fill the builder {d:.2}, write {d:.2})\n", .{ ms(t_append), ms(t_manifest), ms(t_fill), ms(t_manifest - t_fill) });
     print("no-edit rebuild (median / best of {d}): {d:.3} / {d:.3} ms\n", .{ runs, ms(noedit.median(3)), ms(noedit.best(3)) });
     print("  lock {d:.3}, map manifest {d:.3}, stat {d} inputs {d:.3}\n", .{ ms(noedit.median(0)), ms(noedit.median(1)), n_inputs, ms(noedit.median(2)) });
-    print("relink (median / best): {d:.2} / {d:.2} ms\n", .{ ms(relink.median(3)), ms(relink.best(3)) });
-    print("  map manifest and pack {d:.3}, decode {d} atoms {d:.2}, Elf.emit from the mapping {d:.2} (from memory {d:.2})\n", .{
-        ms(relink.median(0)), atoms.len, ms(relink.median(1)), ms(relink.median(2)), ms(emit_memory.median(0)),
+    print("relink, numbered by the manifest (median / best): {d:.2} / {d:.2} ms\n", .{ ms(relink.median(3)), ms(relink.best(3)) });
+    print("  map manifest and pack {d:.3}, decode {d} atoms {d:.2}, Elf.emit from the mapping {d:.2}\n", .{
+        ms(relink.median(0)), atoms.len, ms(relink.median(1)), ms(relink.median(2)),
+    });
+    print("  by keys instead: {d:.2} / {d:.2} ms (decode {d:.2}, Elf.emit {d:.2}; from memory {d:.2})\n", .{
+        ms(relink_keys.median(3)), ms(relink_keys.best(3)), ms(relink_keys.median(1)), ms(relink_keys.median(2)), ms(emit_memory.median(0)),
     });
     print("edit rebuild storage work (median / best): {d:.2} / {d:.2} ms\n", .{ ms(edit.median(3)), ms(edit.best(3)) });
     print("  append atoms {d:.3}, dependents walk ({d} nodes, no early cutoff) {d:.2}, manifest log record {d:.3}\n", .{
@@ -266,8 +304,67 @@ pub fn main(init: std.process.Init) !void {
     print("open with {d} log records ({d:.1} KiB) and gather atom refs (median): {d:.3} ms; fold into a new base: {d:.2} ms\n", .{
         runs, @as(f64, @floatFromInt(log_size)) / 1024, ms(open_logged.median(0)), ms(fold_ns),
     });
-    print("compaction: {d:.1} -> {d:.1} MiB in {d:.2} ms\n", .{ mib(uncompacted_size), mib(compacted_size), ms(compaction_ns) });
+    print("relink with the log's records: {d:.2} / {d:.2} ms (decode {d:.2}, Elf.emit {d:.2})\n", .{
+        ms(relink_logged.median(3)), ms(relink_logged.best(3)), ms(relink_logged.median(1)), ms(relink_logged.median(2)),
+    });
+    print("compaction: {d:.1} -> {d:.1} MiB in {d:.2} ms, manifest renumbered in link order {d:.2} ms\n", .{ mib(uncompacted_size), mib(compacted_size), ms(compaction_ns), ms(renumber_ns) });
+    print("relink after compaction, numbered and packed: {d:.2} / {d:.2} ms (map {d:.3}, decode {d:.2}, Elf.emit {d:.2})\n", .{
+        ms(relink_packed.median(3)), ms(relink_packed.best(3)), ms(relink_packed.median(0)), ms(relink_packed.median(1)), ms(relink_packed.median(2)),
+    });
     try benchStores(gpa, io, arena, rand, work, atoms, debug, keys[0]);
+}
+
+/// A relink as `Incremental` does it: map the manifest and pack, decode
+/// the atoms with interned debug paths, and `Elf.emit` with the manifest's
+/// numbered symbols. Checks the output against `expected`, if given.
+fn relinkOnce(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, decoded: []Atom, decoded_debug: *std.ArrayList(Atom.Debug), entry: Atom.SymbolKey, expected: ?[]const u8) ![4]u64 {
+    const t0 = now(io);
+    var m = (try Manifest.open(gpa, io, dir)).?;
+    defer m.close(gpa, io);
+    var p: Pack = try .open(io, dir);
+    defer p.close(gpa, io);
+    if (p.id != m.pack_id) @panic("pack id mismatch");
+    const t1 = now(io);
+    const in = try m.linkInput(gpa);
+    var names: [512][]const u8 = undefined;
+    for (names[0..m.fileCount()], 0..) |*f, i| f.* = m.file(@intCast(i));
+    decoded_debug.clearRetainingCapacity();
+    try p.decodeAll(gpa, io, in.refs, decoded, decoded_debug, .{ .of = in.debug_files, .names = names[0..m.fileCount()] });
+    const t2 = now(io);
+    var values: [n_errors]Elf.NumberedValue = undefined;
+    for (&values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };
+    const out = try Elf.emit(gpa, io, decoded, .{
+        .entry = entry,
+        .comp_dir = "/bench",
+        .debug = decoded_debug.items,
+        .symbols = .{ .atoms = in.numbered, .targets = in.targets, .values = &values, .entry = m.entry_symbol, .len = m.symbolLen() },
+    });
+    defer gpa.free(out);
+    const t3 = now(io);
+    if (expected) |e| if (!std.mem.eql(u8, out, e)) @panic("numbered relink from the pack differs");
+    return .{ ns(t0, t1), ns(t1, t2), ns(t2, t3), ns(t0, t3) };
+}
+
+/// The first of the atoms sharing a key, with their debug entries.
+fn dedupe(arena: std.mem.Allocator, all: []const Atom, all_debug: []const Atom.Debug) !struct { []Atom, []Atom.Debug } {
+    var seen: std.AutoHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    var kept: std.ArrayList(Atom) = .empty;
+    const new_index = try arena.alloc(u32, all.len);
+    for (all, new_index) |a, *ni| {
+        if ((try seen.getOrPut(arena, a.key)).found_existing) {
+            ni.* = std.math.maxInt(u32);
+            continue;
+        }
+        ni.* = @intCast(kept.items.len);
+        try kept.append(arena, a);
+    }
+    var debug: std.ArrayList(Atom.Debug) = .empty;
+    for (all_debug) |d| if (new_index[d.atom] != std.math.maxInt(u32)) {
+        var nd = d;
+        nd.atom = new_index[d.atom];
+        try debug.append(arena, nd);
+    };
+    return .{ kept.items, debug.items };
 }
 
 /// The global store: a first build's 30k puts and commit, lookups with 1,
@@ -429,7 +526,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                 for (0..5) |_| {
                     const t0 = now(io);
                     decoded_debug.clearRetainingCapacity();
-                    try p.decodeAll(gpa, io, refs, decoded, &decoded_debug);
+                    try p.decodeAll(gpa, io, refs, decoded, &decoded_debug, null);
                     const t1 = now(io);
                     var o = options;
                     o.debug = decoded_debug.items;

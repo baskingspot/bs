@@ -122,11 +122,12 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   of the same precision, as upstream does.
 - Error codes. `anyerror` integers are assigned per compilation and live only
   in memory; IR and Atoms refer to errors by name, and machine code gets the
-  integers through link-time value relocations. A unit whose result depends on
-  an integer (comptime `@intFromError`, or an error integer folded into a
-  constant) records an `error_code(name)` dependency. The per-project manifest
+  integers through link-time value relocations. The per-project manifest
   keeps last build's name-to-code assignment and only appends new names, so
-  existing codes, and units that depend on them, stay stable across rebuilds.
+  existing codes, and units whose results depend on one (comptime
+  `@intFromError`, an error integer folded into a constant), stay stable
+  across rebuilds without a dependency on the code (see "Edit builds"
+  below).
 - Pointers into comptime-mutable memory (`comptime var`, comptime
   allocations) are local to the unit that created them. They are excluded from
   stable hashing and persistence and must not escape a unit's result; an
@@ -569,7 +570,7 @@ compilation (see "Integration" below).
   arrays, `tag`), an open-addressing key table, edges, reverse edges, atom
   references, input stat records (path, size, mtime, inode, content hash,
   with a sentinel for racy mtimes), and error names in code order. Rewriting
-  the 8 MB base costs ~25–35 ms here, so an edit build appends a log record
+  the base costs ~20–35 ms here, so an edit build appends a log record
   instead (`Delta`): the changed and added nodes, inputs, and error names.
   `open` applies the log into a small in-memory overlay; a torn record at
   the end is dropped and overwritten. When the log passes a quarter of the
@@ -577,6 +578,26 @@ compilation (see "Integration" below).
   Reverse edges are a superset while a log exists: a node's old reverse
   edges stay until the next base, so a walk may re-check a unit that no
   longer depends on the edit, never miss one.
+- **Symbol numbering** (in the manifest, for `Elf.Options.symbols`): a
+  table from every key a live atom defines or references (error-code keys
+  and the entry included) to a dense number (24-byte slots, about 80%
+  full, so ~30 bytes per key; only an edit's new keys are looked up in it),
+  a `NumberedAtom` (own number, start of its target run) per atom
+  reference, the target numbers (one run per atom, a node's runs
+  contiguous in its atoms' order), each error's number, and the entry's.
+  A relink passes these slices straight from the mapping, and the linker
+  hashes no keys. A log record numbers only its new keys, after the
+  existing ones, and appends its runs; while a log exists, `linkInput`
+  gathers the atom arrays and concatenates the runs once (~1.2 ms more at
+  100k atoms). Writing a base renumbers in link order (the atoms as they
+  are linked, then targets no atom defines, then error codes and the
+  entry) with array lookups, not key hashing, and drops keys nothing uses;
+  a manifest written after pack compaction (`Builder.setAtomRefs`)
+  therefore numbers the packed atoms 0..n. The link needs each key defined
+  once, so `write` rejects a duplicate. The manifest also interns debug
+  source paths (`files`, and a file index per atom reference), and
+  `Pack.decodeAll` hands every debug entry its file's one copy, so the
+  linker matches files by address.
 - **Pack** (`cache/Pack.zig`): the compilation's own append-only pack plus
   base packs, store packs hard-linked into the compilation's directory. An
   `AtomRef` is 12 bytes: pack (0 for the own pack, else a base), offset in
@@ -598,20 +619,21 @@ compilation (see "Integration" below).
 Measured with `zig build bench-cache` (ReleaseFast, 4-core orb, warm page
 cache; the orb varies ±40% run to run) on a synthetic compilation of 30k
 units plus 30k other nodes, 300k edges, 600 inputs, 2000 error names, and
-103,750 Atoms (22 MiB of code and data, 650k relocations): manifest 8.2 MiB,
-pack 55 MiB.
+100,000 Atoms with distinct keys (22 MiB of code and data, 650k
+relocations): manifest 14.9 MiB, pack 55 MiB.
 
 | Step | Time |
 |---|---|
-| No-edit rebuild: lock, map manifest, stat 600 inputs | 0.29–0.56 ms |
-| Open manifest with 15 log records, gather atom refs | 0.24 ms |
-| Edit storage work: append one unit's Atoms, log record | 0.02 ms |
+| No-edit rebuild: lock, map manifest, stat 600 inputs | 0.29–0.57 ms |
+| Open manifest with 15 log records, gather link input | 1.3–1.8 ms |
+| Edit storage work: append one unit's Atoms, log record | 0.1 ms |
 | Dependents walk over 29,978 nodes (no early cutoff) | 1.9–2.5 ms |
-| Relink: map pack, decode 103,750 Atoms and debug on 4 threads | 3.1–5.2 ms |
-| `Elf.emit` from the mapped pack (from memory) | 10.8–12.8 ms (10.0–12.2 ms) |
-| Cold save: pack append, manifest base | 100–120 ms, 30–44 ms |
-| Fold log into a new base | 22–58 ms |
-| Compaction, 166 → 55 MiB | 80–164 ms |
+| Relink, numbered: map, decode 100,000 Atoms on 4 threads, `Elf.emit` | 15.0–15.2 ms (decode 6.3–6.8, emit 8.4–8.6) |
+| Relink by keys, as before numbering | 20.8–21.9 ms (decode 5.8–6.3, emit 15.1–15.4) |
+| Relink, numbered, after compaction (packed in link order) | 12.4–15.4 ms (emit 7.2–8.7) |
+| Cold save: pack append, manifest base | 80–120 ms, 70–107 ms (numbering the keys 47–74 of it) |
+| Fold log into a new base (renumbers) | 41–71 ms |
+| Compaction, 164 → 55 MiB; manifest renumbered after it | 156–230 ms; 41–54 ms |
 | Store, first build: 30k puts on 4 threads, then commit (68 MiB) | 17–23 ms, 43–48 ms |
 | Store get, validate, decode, per entry, with 1 / 8 / 64 packs | 0.25 / 0.3–0.5 / 0.7–0.9 µs |
 | Store miss, per key, with 1 / 8 / 64 packs | 0.06 / 0.2 / 1.0 µs |
@@ -648,8 +670,8 @@ store) takes 42 ms, the relink decodes from it as fast as from an own pack
 - **No-edit builds** (`relinkIfUnchanged`, before the frontend): lock the
   compilation, map the manifest, stat its inputs (every file the frontend
   loaded, with content hashes and the racy-mtime rule); if none changed,
-  decode the Atoms from the base packs and link with the manifest's entry
-  symbol and error codes. Frontend, Sema, and CodeGen do not run. A
+  decode the Atoms from the base packs and link with the manifest's
+  numbered symbols, entry, and error codes. Frontend, Sema, and CodeGen do not run. A
   conformance unit loading 562 files (std in test mode): 0.64–0.9 ms in
   zap (0.4–0.6 of it the stats), 2 ms wall, against 14–19 ms for a full build.
 - **Recording** (`record`, after a successful link): Emit tags each atom
@@ -676,11 +698,162 @@ store) takes 42 ms, the relink decodes from it as fast as from an own pack
 - `ZAP_CACHE_TIMING=1` prints the cache's time; `ZAP_CACHE=off` disables
   it. Compilation directories unused for 5 days are deleted (they hold hard
   links that keep trimmed store packs' space in use).
-- Not yet: re-analyzing only the predicted units after an edit, which needs
-  Sema to load the results of units it skips; a layout hash for
-  `type_layout` results (the type's identity stands in, so a layout change
-  is caught through its `src_hash`, not its result); recording comptime
-  side effects.
+- Not yet: re-analyzing only the predicted units after an edit (designed
+  below); a layout hash for `type_layout` results (the type's identity
+  stands in, so a layout change is caught through its `src_hash`, not its
+  result); recording comptime side effects.
+
+### Edit builds: replaying cached results (designed 2026-11-03, for review)
+
+Not built yet: Sema's set of types and values is still growing, and this
+waits until hello world through `std.debug.print` compiles. What an edit
+build does, and what it needs from Sema, Zcu, and the InternPool:
+
+**Flow.** The no-edit check finds changed inputs. The frontend loads every
+file as today (unchanged files are ZIR cache hits). Before Sema runs,
+`Incremental` computes the *seeds* from the changed files alone: for each
+node the manifest lists for a changed file (a new `sources` section: per
+input, its nodes and a locator for each: declaration name path, plus the
+ZIR offset relative to the declaration for container types and the ordinal
+for `comptime` blocks), it resolves the locator in the new ZIR and compares
+`src_hash`; `namespace_name`, `namespace`, and `func_body` nodes are
+recomputed from ZIR, as `record` computes them. A missing locator is a
+seed. The *possibly outdated* set is everything reachable from the seeds
+over reverse edges (`Manifest.rdeps`, already fast: 2 ms for 30k nodes).
+Sema then runs from the usual roots, and every unit it reaches is either
+re-analyzed or loaded:
+
+- not possibly outdated: **load** its cached result;
+- possibly outdated: bring its dependencies up to date first (recursively,
+  in manifest order, loading or analyzing each); if every dependency's new
+  result hash equals the manifest's and its own `src_hash` is unchanged,
+  load it (early cutoff), else **re-analyze** it and compute its new result
+  hash.
+
+Only re-analyzed functions reach CodeGen. The link takes green nodes'
+Atoms from the pack, appends the new ones (`Pack.append`), writes a
+`Manifest.Delta` (new atoms numbered with only their targets looked up),
+and links the numbered input.
+
+**The hook** is in Zcu, in the functions that already own unit state, so
+Sema itself does not change:
+
+```zig
+// Zcu: set by Incremental for an edit build, null otherwise.
+replay: ?*Replay = null,
+
+// ensureNavVal, ensureStructLayout, ensureFuncIes, before calling Sema:
+if (zcu.replay) |r| if (try r.load(zcu, unit)) { mark resolved; return; }
+// analyzeAll, for a queued function: a loaded function is `done` without
+// IR; its recorded references are queued instead of analyzing its body.
+// analyzeAll, for a comptime declaration: a loaded one replays its exports.
+```
+
+`Replay.load` (cache side, in `src/Incremental.zig`) decides green or red
+as above, and for green units writes the result into Zcu state: `nav.ty`,
+`nav.val`, `is_const`, `linkage`; a container's `ContainerInfo`; a
+function's inferred error names (`inferred_errors`); a function's
+references. It returns false for red units, and Zcu analyzes as today.
+Two things Sema must add, both narrow:
+
+- **References**, recorded like dependencies: which functions a unit
+  queued (`queueFunc` from `navRef` and calls), which declarations' data it
+  requested (`Emit.navKey`), and which compiler_rt helpers it asked for.
+  Loading a function replays them, so the set of linked units is the set
+  reachable this build, and functions no longer referenced drop out of the
+  link instead of lingering in the pack.
+- **Result hashes at runtime**: `Replay` compares a re-analyzed unit's new
+  result with the manifest's before its dependents decide, so the hashing
+  `record` does today moves to one function both use.
+
+**Serialized results.** A result is the closure of InternPool items it
+references, encoded canonically in a store entry's payload (the opaque
+`payload` field `Store.Batch.put` already has), plus a small header naming
+the result's items:
+
+- Items in post-order (children first), each its stable hash and its `Key`
+  with every `Index` operand replaced by a reference: a static index (below
+  `static_len`), or the stable hash of an item earlier in the closure.
+  Identical results encode to identical bytes, so the entry's result hash
+  and the payload agree.
+- Loading walks the closure: an item whose stable hash the InternPool
+  already has (a new `ip.indexOfHash`, which needs a stable-hash index
+  next to the deduplication maps) is skipped; otherwise its `Key` is built
+  with resolved operands and interned with `ip.get`. After interning,
+  `ip.stableHash(index)` must equal the recorded hash; a mismatch is a bug,
+  reported as a cache miss that re-analyzes the unit.
+- Key kinds, all by contents: `int_type`, `ptr_type`, `array_type`,
+  `vector_type`, `opt_type`, `anyframe_type`, `error_union_type`,
+  `simple_type`, `tuple_type`, `error_set_type` (names inline),
+  `func_type`, `simple_value`, `undef`, `int` (big limbs inline), `float`
+  (exact bits), `err`, `error_union`, `enum_literal`, `enum_tag`, `un`,
+  `slice`, `opt`, `aggregate` (`bytes` inline), `calling_convention`.
+  Strings are inline.
+- Key kinds that name source, by locator instead of ZIR index (indices
+  shift when unrelated code above changes): `struct_type`, `enum_type`,
+  `union_type`, `opaque_type` as (owning declaration's key, ZIR offset of
+  the container instruction relative to that declaration, captures, display
+  name, stable key); the owning declaration's `src_hash` is unchanged
+  whenever the type is green, so the relative offset still finds the same
+  instruction. Interning one goes through a Zcu function that creates the
+  type and scans its namespace as analysis does (Sema thread). `func` as
+  (owner declaration's key, relative ZIR offset, generic owner, comptime
+  arguments); `inferred_error_set_type` as its function; `ptr` with a
+  `nav` base as the declaration's key, resolved through namespaces (which
+  may load the namespaces' owners in turn).
+- Never in a result: `comptime_alloc` pointers (already excluded from
+  stable hashing; an escape is a compile error), and Zcu's per-run maps
+  (`comptime_memo` starts empty; memoizing comptime calls across builds
+  would be its own node kind later).
+- Per unit kind: `nav_val` stores ty, val, `is_const`, `linkage`;
+  `type_layout` stores the `ContainerInfo` fields (names, field types and
+  defaults by reference, offsets, tag type, flags, size, alignment);
+  `func` stores its references (its Atoms are in the pack, its IR is
+  never stored); `func_ies` stores the error names; `comptime_decl` stores
+  its exports.
+
+**Error codes and inferred error sets.** Codes stay append-only per
+compilation (`seedErrors` assigns the manifest's names first), so a name's
+code never changes while the compilation directory lives, including names
+only a skipped unit uses. That makes an `error_code(name)` dependency
+unnecessary: a comptime `@intFromError` result cannot go stale, and the
+dependency kind proposed earlier is dropped. New names from re-analyzed
+units take the next codes and go to the Delta. A function's inferred error
+set is the `func_ies` node: a green function's names come from its payload,
+so `ensureFuncIes` on a skipped function does not analyze its body; a
+re-analyzed function whose set is unchanged keeps callers green, and a
+changed set re-analyzes exactly the callers that resolved it. With
+parallel Sema the codes of names first seen in the same build depend on
+scheduling; outputs stay correct, but byte-identical output across cold
+builds would need sorting new names before assigning them at the end of
+analysis.
+
+**`type_layout` result hash.** Today a layout node's result is the type's
+identity, which is wrong under early cutoff: when a field's type grows,
+the field type's layout result changes, ours is re-analyzed, and its
+unchanged identity would stop the walk before the functions that use our
+offsets. The result hash becomes the hash of the canonical `ContainerInfo`
+encoding above (field names, field types' and defaults' stable hashes,
+offsets, tag type and its values, non-exhaustiveness, runtime tag, size,
+alignment), computed once the status reaches `have_layout`. Types reached
+only through pointers keep their identity: pointer types hash by the child
+type's identity, so self-referential types need no recursion.
+`comptime_only` is derived and not hashed. `nav_val`'s result hash adds
+`is_const` and `linkage` to the value's stable hash, since dependents read
+those too.
+
+**Debug info of green functions.** `src_hash` ignores a declaration's
+line, so lines added above a green function move its `base_line`
+without re-analysis. For green functions in changed files, the relink
+takes `base_line` from the new AST, the way it takes debug paths from the
+manifest's file table, and the manifest records the new value.
+
+Open questions for review: whether `Replay.load` may call back into
+`Zcu.ensure*` for a green unit's dependencies (it must, to materialize
+types its value names), and how that interacts with dependency-loop
+detection; whether anonymous types' ordinals, used in their stable keys,
+come out the same when the enclosing unit is loaded instead of analyzed
+(they must not be recomputed: a loaded type keeps its recorded key).
 
 What the cache must get right, or edit-rebuilds will not be Go-class:
 

@@ -186,10 +186,18 @@ pub fn decode(p: *const Pack, ref: AtomRef) DecodeError!atoms_codec.Decoded {
     return d;
 }
 
+/// Interned debug source paths (see `Manifest.debug_files`): the atom at
+/// `refs[i]` has its debug info's path at `names[of[i]]`.
+pub const DebugFiles = struct {
+    of: []const u32,
+    names: []const []const u8,
+};
+
 /// Decodes the atoms at `refs` into `out`, ready to link, and appends
 /// their debug info to `debug`, sorted by `atom`, an index into `out`.
-/// Runs on one thread per CPU: writing the `Atom`s is most of the cost.
-/// `gpa` must be thread-safe.
+/// With `files`, every debug path is replaced by its interned copy, so
+/// that the linker matches paths by address. Runs on one thread per CPU:
+/// writing the `Atom`s is most of the cost. `gpa` must be thread-safe.
 pub fn decodeAll(
     p: *const Pack,
     gpa: Allocator,
@@ -197,7 +205,9 @@ pub fn decodeAll(
     refs: []const AtomRef,
     out: []Atom,
     debug: *std.ArrayList(Atom.Debug),
+    files: ?DebugFiles,
 ) (DecodeError || Allocator.Error || Io.Cancelable)!void {
+    if (files) |f| std.debug.assert(f.of.len == refs.len);
     const Chunk = struct {
         first: u32,
         refs: []const AtomRef,
@@ -205,19 +215,24 @@ pub fn decodeAll(
         debug: std.ArrayList(Atom.Debug) = .empty,
         err: ?(DecodeError || Allocator.Error) = null,
 
-        fn decode(c: *@This(), pack: *const Pack, a: Allocator) void {
-            c.decodeOrFail(pack, a) catch |e| {
+        fn decode(c: *@This(), pack: *const Pack, a: Allocator, fs: ?DebugFiles) void {
+            c.decodeOrFail(pack, a, fs) catch |e| {
                 c.err = e;
             };
         }
 
-        fn decodeOrFail(c: *@This(), pack: *const Pack, a: Allocator) !void {
+        fn decodeOrFail(c: *@This(), pack: *const Pack, a: Allocator, fs: ?DebugFiles) !void {
             for (c.refs, c.out, c.first..) |r, *atom, i| {
                 const d = try pack.decode(r);
                 atom.* = d.atom;
                 if (d.debug) |dbg| {
                     var e = dbg;
                     e.atom = @intCast(i);
+                    if (fs) |f| {
+                        const index = f.of[i];
+                        if (index >= f.names.len) return error.CorruptAtom;
+                        e.file = f.names[index];
+                    }
                     try c.debug.append(a, e);
                 }
             }
@@ -233,8 +248,8 @@ pub fn decodeAll(
     }
     defer for (chunks[0..n]) |*c| c.debug.deinit(gpa);
     var group: Io.Group = .init;
-    for (chunks[1..n]) |*c| group.async(io, Chunk.decode, .{ c, p, gpa });
-    chunks[0].decode(p, gpa);
+    for (chunks[1..n]) |*c| group.async(io, Chunk.decode, .{ c, p, gpa, files });
+    chunks[0].decode(p, gpa, files);
     try group.await(io);
     var n_debug: usize = 0;
     for (chunks[0..n]) |*c| {
@@ -320,11 +335,17 @@ test "append, reopen, decode, and compact" {
     defer decoded_debug.deinit(gpa);
     // Atom a comes second here, so its debug entry must name index 1.
     const order = [_]AtomRef{ refs[1], refs[0], refs[2] };
-    try p.decodeAll(gpa, io, &order, &decoded, &decoded_debug);
+    try p.decodeAll(gpa, io, &order, &decoded, &decoded_debug, null);
     for ([_]usize{ 1, 0, 2 }, decoded) |e, a| try atoms_codec.expectEqualAtoms(atoms[e], a);
     try std.testing.expectEqual(1, decoded_debug.items.len);
     try std.testing.expectEqual(1, decoded_debug.items[0].atom);
     try atoms_codec.expectEqualDebug(&debug[0], &decoded_debug.items[0]);
+    // With interned files, each debug entry takes its file's one copy.
+    const names: []const []const u8 = &.{ "x.zig", "y.zig" };
+    const no_file = std.math.maxInt(u32);
+    decoded_debug.clearRetainingCapacity();
+    try p.decodeAll(gpa, io, &order, &decoded, &decoded_debug, .{ .of = &.{ no_file, 1, no_file }, .names = names });
+    try std.testing.expectEqual(names[1].ptr, decoded_debug.items[0].file.ptr);
     try std.testing.expectError(error.CorruptAtom, p.decode(.init(p.len, 64)));
 
     // Only b and a are live, in that order.
