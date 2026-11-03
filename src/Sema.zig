@@ -15168,6 +15168,17 @@ fn aggregate(sema: *Sema, block: *Block, src: Src, ty: Index, elems: []const Ref
     try sema.requireRuntime(block, src);
     for (elems, vals, 0..) |e, v, i| if (v != .none and sema.refersToComptimeAlloc(v)) try sema.validateRuntimeValue(block, sema.initElemSrc(src, ty, i), e);
     try sema.resolveLayout(block, src, ty);
+    const class = Type.class(sema.ip, ty);
+    if ((class == .@"struct" or class == .tuple) and try sema.isComptimeOnlyResolved(block, src, ty)) {
+        // As upstream, at the first runtime-known field.
+        const i = std.mem.indexOfScalar(Index, vals, .none).?;
+        const elem_src = sema.initElemSrc(src, ty, i);
+        const err = sema.fail(block, elem_src, "unable to resolve comptime value", .{});
+        const span = elem_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+        try sema.zcu.addNote(sema.file, span, "initializer of comptime-only {s} '{f}' must be comptime-known", .{ if (class == .tuple) "tuple" else "struct", FmtType{ .ip = sema.ip, .ty = ty, .decl_note = false } });
+        try sema.explainWhyComptime(sema.file, span, ty);
+        return err;
+    }
     if (Type.isPackedStruct(sema.ip, ty) and sema.bc == null) {
         const backing = sema.ip.structInfo(ty).tag_type;
         var host: Ref = .fromInterned(try sema.intValue(backing, 0));
@@ -15258,6 +15269,18 @@ fn structInitTyped(sema: *Sema, block: *Block, src: Src, ty: Index, items: []con
         // As upstream, before the value is converted.
         try sema.checkUnionFieldInstantiable(block, src, ip.structInfo(ty).field_types[fi]);
         const init = try sema.coerce(block, ip.structInfo(ty).field_types[fi], items[0].init, items[0].src);
+        if (sema.resolveValue(init) == null and !block.is_comptime) {
+            try sema.resolveLayout(block, src, ty);
+            if (try sema.isComptimeOnlyResolved(block, src, ty)) {
+                // As upstream, at the field's name.
+                const name_src = items[0].src.fieldName();
+                const err = sema.fail(block, name_src, "unable to resolve comptime value", .{});
+                const span = name_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+                try sema.zcu.addNote(sema.file, span, "initializer of comptime-only union '{f}' must be comptime-known", .{FmtType{ .ip = ip, .ty = ty, .decl_note = false }});
+                try sema.explainWhyComptime(sema.file, span, ty);
+                return err;
+            }
+        }
         return sema.unionInit(block, src, ty, fi, init);
     }
     if (ip.keyTag(ty) == .tuple_type) {
