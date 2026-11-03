@@ -18,7 +18,7 @@ upstream's own test step reports (for example "behavior.basic.test.truncate"),
 which is what the compiler puts in builtin.test_functions.
 
 The compiler builds each unit with the test runner given by --test-runner
-(default: test_runner.zig for upstream, zap_runner.zig for zap); results are parsed from the
+(default: test_runner.zig; zap_runner.zig for zap on x86_64-linux); results are parsed from the
 runner's "@zap-test" line protocol, documented in test_runner.zig, so any
 runner that speaks it works. A crash or timeout marks the running test and
 the binary is rerun with --start=<next index> to run the rest.
@@ -236,6 +236,16 @@ def tail(text, limit=LOG_LIMIT):
 # ---------------------------------------------------------------- one unit
 
 
+def test_runner(args, cfg):
+    """The runner given with --test-runner, else test_runner.zig, except for
+    zap on x86_64-linux, which uses zap_runner.zig (its own `_start` and
+    system calls) until it compiles std.start there."""
+    if args.test_runner is not None:
+        return args.test_runner
+    zap_runner = not args.upstream and cfg["name"] == "x86_64-linux"
+    return HERE / ("zap_runner.zig" if zap_runner else "test_runner.zig")
+
+
 def compile_unit(compiler, unit, cfg, args, workdir, env=None):
     bin_path = workdir / "bin" / cfg["name"] / (unit[: -len(".zig")] + ".test")
     bin_path.parent.mkdir(parents=True, exist_ok=True)
@@ -244,7 +254,7 @@ def compile_unit(compiler, unit, cfg, args, workdir, env=None):
     editable = args.edit_verify and unit != ROOT_UNIT
     argv = [str(compiler), "test", str(unit_root(unit, workdir, editable) if env is None else workdir / "units" / unit[: -len(".zig")] / "behavior.zig")]
     if not args.default_runner:
-        argv += ["--test-runner", str(args.test_runner)]
+        argv += ["--test-runner", str(test_runner(args, cfg))]
     argv += ["-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}"]
     for f in unit_filters(unit):
         argv += ["--test-filter", f]
@@ -668,7 +678,7 @@ def full_run(zig, cfg, args, workdir):
     bin_path.parent.mkdir(parents=True, exist_ok=True)
     argv = [
         str(zig), "test", str(UPSTREAM_TEST / "behavior.zig"),
-        "--test-runner", str(args.test_runner),
+        "--test-runner", str(test_runner(args, cfg)),
         "-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}",
     ]
     code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout * 4)
@@ -797,7 +807,7 @@ def zap_target(zap, cfg, args, workdir):
         "target": cfg["name"],
         "zig_target": cfg["zig_target"],
         "compiler": str(zap),
-        "test_runner": "default" if args.default_runner else str(args.test_runner),
+        "test_runner": "default" if args.default_runner else str(test_runner(args, cfg)),
         "backend": backend,
         "baseline": {"compiler": baseline["compiler"], "backend": baseline["backend"]},
         "summary": {
@@ -1085,7 +1095,7 @@ def main():
     p.add_argument("--target", action="append", choices=sorted(TARGETS), help="target to run (repeatable; default: all)")
     p.add_argument("--zap", type=Path, help="zap executable (default: build zap with -Doptimize=ReleaseSafe)")
     p.add_argument("--zig", default="zig", help="upstream zig 0.17.0, used for --upstream and to build zap (default: zig on PATH)")
-    p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, zap_runner.zig for zap until zap compiles test_runner.zig)")
+    p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig, except zap_runner.zig for zap on x86_64-linux until zap compiles test_runner.zig there)")
     p.add_argument("--default-runner", action="store_true", help="zap only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `zap test` without --test-runner does")
     p.add_argument("--std", action="store_true", help="measure upstream's std tests (lib/std/std.zig, default runner) instead of test/behavior")
     p.add_argument("--compile-errors", action="store_true", help="zap only: measure diagnostics on upstream's test/cases/compile_errors instead of test/behavior")
@@ -1100,9 +1110,8 @@ def main():
     p.add_argument("-v", "--verbose", action="store_true", help="print each file's result to stderr")
     args = p.parse_args()
 
-    if args.test_runner is None:
-        args.test_runner = HERE / ("test_runner.zig" if args.upstream else "zap_runner.zig")
-    args.test_runner = args.test_runner.resolve()
+    if args.test_runner is not None:
+        args.test_runner = args.test_runner.resolve()
     args.workdir = args.workdir.resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
     targets = args.target or list(TARGETS)
