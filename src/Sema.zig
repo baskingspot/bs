@@ -7815,7 +7815,12 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     const cond = try sema.analyzeIsNonErr(parent, src, eu);
     if (parent.is_comptime) {
         const v = sema.resolveValue(cond) orelse return sema.fail(parent, src, "unable to evaluate comptime expression", .{});
-        if (v == .bool_false) return sema.analyzeSwitch(parent, src, inst, try sema.errUnionCode(parent, src, eu), .none);
+        if (v == .bool_false) {
+            // Prong bodies refer to the error (the switch operand) as `inst`.
+            const code = try sema.errUnionCode(parent, src, eu);
+            try sema.inst_map.put(gpa, inst, code);
+            return sema.analyzeSwitch(parent, src, inst, code, .none);
+        }
         if (non_err.capture != .none) try sema.inst_map.put(gpa, inst, try sema.errUnionPayload(parent, src, eu));
         return (try sema.analyzeInlineBody(parent, non_err.body, inst)) orelse .unreachable_value;
     }
@@ -7841,6 +7846,8 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
     defer else_block.instructions.deinit(gpa);
     if (cond_val != .bool_true) {
         const code = try sema.errUnionCode(&else_block, src, eu);
+        // Prong bodies refer to the error (the switch operand) as `inst`.
+        try sema.inst_map.put(gpa, inst, code);
         const result = try sema.analyzeSwitch(&else_block, src, inst, code, .none);
         if (sema.typeOf(result) != .noreturn_type) try sema.addBr(&else_block, &label, result);
     }

@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n"
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -140,6 +140,11 @@ fn main() callconv(.c) noreturn {
     any_eu = error.B;
     rt.printInt(narrowEu(any_eu) catch 9);
 
+    // In `if (x) |payload| ... else |err| switch (err)`, prongs see `err`.
+    rt.printInt(useBig(5));
+    rt.printInt(useBig(0));
+    rt.printInt(useBig(1));
+
     const e: anyerror!u8 = error.Empty;
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
 }
@@ -179,4 +184,23 @@ fn narrowSet(e: anyerror) error{ A, B } {
 }
 fn narrowEu(x: anyerror!u8) error{B}!u8 {
     return @errorCast(x);
+}
+
+const Big = struct { a: u64, b: u64 };
+fn makeBig(k: u32) error{ X, Y }!Big {
+    if (k == 0) return error.X;
+    if (k == 1) return error.Y;
+    return .{ .a = k, .b = 1 };
+}
+fn useBig(k: u32) u64 {
+    if (makeBig(k)) |r| {
+        return r.a;
+    } else |err| switch (err) {
+        error.X => return 100,
+        else => {
+            rt.print(@errorName(err));
+            rt.print("\n");
+            return 200;
+        },
+    }
 }
