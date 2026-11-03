@@ -8117,30 +8117,47 @@ fn zirForLen(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     const extra = sema.code.extraData(Zir.Inst.MultiOp, data.payload_index);
     const args = sema.code.refSlice(extra.end, extra.data.operands_len);
     const src = block.nodeSrc(data.src_node);
+    // As upstream: a comptime-known length wins, many-pointers have none,
+    // and the other lengths are checked against it at runtime.
     var len: Ref = .none;
+    var len_known = false;
+    var runtime_lens: std.ArrayList(Ref) = .empty;
     var i: usize = 0;
     while (i < args.len) : (i += 2) {
         const a = args[i];
         const b = args[i + 1];
-        if (a == .none and b == .none) continue;
+        if (a == .none) continue;
         const this_len = if (b == .none) blk: {
             const obj = sema.resolveInst(a);
-            break :blk try sema.fieldVal(block, src, obj, "len");
+            const ty = sema.typeOf(obj);
+            if (Type.class(sema.ip, ty) == .pointer) switch (Type.ptrInfo(sema.ip, ty).flags.size) {
+                .many, .c => continue,
+                .one, .slice => {},
+            };
+            break :blk try sema.coerce(block, .usize_type, try sema.fieldVal(block, src, obj, "len"), src);
         } else blk: {
             const start = try sema.coerce(block, .usize_type, sema.resolveInst(a), src);
             const end = try sema.coerce(block, .usize_type, sema.resolveInst(b), src);
+            if (sema.resolveValue(start) == .zero_usize) break :blk end;
             break :blk try sema.analyzeArithmetic(block, src, .sub, end, start);
         };
-        if (len == .none) {
-            len = this_len;
-        } else if (block.want_safety) {
-            const ok = try sema.analyzeCmp(block, src, .eq, len, this_len);
-            if (sema.resolveValue(ok)) |v| {
-                if (v != .bool_true) return sema.fail(block, src, "non-matching for loop lengths", .{});
-            } else try sema.addSafetyCheck(block, ok, .for_len_mismatch, .none, .none);
+        if (try sema.resolveDefinedValue(block, src, this_len)) |v| {
+            if (len_known) {
+                if (v != sema.resolveValue(len).?) return sema.fail(block, src, "non-matching for loop lengths", .{});
+            } else {
+                if (len != .none) try runtime_lens.append(sema.arena, len);
+                len = this_len;
+                len_known = true;
+            }
+            continue;
         }
+        if (len == .none) len = this_len else try runtime_lens.append(sema.arena, this_len);
     }
     if (len == .none) return sema.fail(block, src, "unbounded for loop", .{});
+    if (block.want_safety) for (runtime_lens.items) |l| {
+        const ok = try sema.analyzeCmp(block, src, .eq, len, l);
+        try sema.addSafetyCheck(block, ok, .for_len_mismatch, .none, .none);
+    };
     return len;
 }
 
