@@ -29,16 +29,6 @@ WORK = os.path.join(CORPUS_DIR, ".work")
 # Appended to the edit line: keeps the line count, and differs per edit.
 EDIT_SUFFIX = " std.mem.doNotOptimizeAway(@as(u32, {n}));"
 
-# Flags of upstream's command lines that zap does not take and that do not
-# change what a pure-Zig x86_64-linux Debug build means: dropped silently.
-ZAP_DROP = {"-fno-sanitize-c", "-fllvm", "-fno-llvm", "-fno-lld", "-fno-strip", "-fno-omit-frame-pointer",
-            "-funwind-tables", "-fno-sanitize-thread", "-freference-trace", "-fno-single-threaded"}
-ZAP_DROP_ARG = {"--listen=-": 0, "--build-root": 1, "--zig-lib-dir": 1}
-# Flags zap does not implement yet that change semantics (builtin values):
-# dropped, and recorded as a difference.
-ZAP_DROP_NOTE = {"-fsingle-threaded", "-fPIC", "-fPIE"}
-
-
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
@@ -140,30 +130,14 @@ def strip_common(words, cache_dir, out):
     return res
 
 
-def upstream_argv(zig, words, cache_dir, out):
+def compile_argv(compiler, words, cache_dir, out):
+    """The command line of a target for either compiler: zap takes all of
+    upstream's flags."""
     rest = strip_common(words, cache_dir, out)
     # The baseline is upstream's Debug default on x86_64-linux: the
     # self-hosted backend, even where the build script asks for LLVM.
     rest = ["-fno-llvm" if w == "-fllvm" else w for w in rest]
-    return [zig, words[1], *rest]
-
-
-def zap_argv(zap, words, cache_dir, out):
-    rest = strip_common(words, cache_dir, out)
-    res, notes = [], []
-    i = 0
-    while i < len(rest):
-        w = rest[i]
-        if w in ZAP_DROP:
-            pass
-        elif w in ZAP_DROP_ARG:
-            i += ZAP_DROP_ARG[w]
-        elif w in ZAP_DROP_NOTE:
-            notes.append(w)
-        else:
-            res.append(w)
-        i += 1
-    return [zap, words[1], *res], sorted(set(notes))
+    return [compiler, words[1], *rest]
 
 
 def timed(argv, cwd, env=None, timeout=1800):
@@ -240,11 +214,8 @@ def build_target(proj, src, words, tgt, compilers, args):
         shutil.rmtree(cache, ignore_errors=True)
         if os.path.exists(out):
             os.remove(out)
-        if which == "zig":
-            argv, notes = upstream_argv(comp, words, cache, out), []
-        else:
-            argv, notes = zap_argv(comp, words, cache, out)
-        r = {"argv": shlex.join(argv), "notes": notes}
+        argv = compile_argv(comp, words, cache, out)
+        r = {"argv": shlex.join(argv)}
         log(f"  {which}: {name}")
         secs, code, output = timed(argv, src)
         r["cold_local"] = secs

@@ -50,11 +50,8 @@ a full build with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`; not timed).
     build-time tools becomes `-Odebug`, and upstream's `-fllvm` becomes
     `-fno-llvm`, so the baseline is upstream's Debug default on x86_64-linux
     (the self-hosted backend).
-  - zap drops flags it does not take that do not change a pure-Zig
-    x86_64-linux Debug build (`--build-root`, `--zig-lib-dir`,
-    `-fno-sanitize-c`, ...). Flags that change `builtin` but that zap does
-    not implement yet (`-fsingle-threaded`, `-fPIC`) are dropped and
-    recorded in the result's `notes`.
+  - zap gets the same command line as upstream: it takes every flag the
+    corpus's build scripts pass.
 - Both binaries run from the same path (programs print `argv[0]`). A test
   binary's verdict is its exit status and summary line (`All N tests
   passed.`); an executable's is its exit status and stdout.
