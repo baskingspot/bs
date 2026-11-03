@@ -14,6 +14,7 @@ const Ast = std.zig.Ast;
 const Zir = std.zig.Zir;
 
 const Frontend = @import("Frontend.zig");
+const cache = @import("cache.zig");
 const InternPool = @import("InternPool.zig");
 const Ir = @import("Ir.zig");
 const Sema = @import("Sema.zig");
@@ -45,6 +46,8 @@ comptime_memo: std.AutoHashMapUnmanaged(InternPool.Hash, InternPool.Index) = .em
 /// Arena-allocated.
 inferred_errors: std.AutoHashMapUnmanaged(InternPool.Index, []const InternPool.String) = .empty,
 exports: std.ArrayList(Export) = .empty,
+/// Files read by `@embedFile`, each once; `Dependee.embed_file` indexes it.
+embed_files: std.StringArrayHashMapUnmanaged(EmbedFile) = .empty,
 /// compiler_rt functions that CodeGen calls, by the stable key of their
 /// declaration; `analyzeAll` resolves each and queues its body.
 rt_helpers: std.StringArrayHashMapUnmanaged(void) = .empty,
@@ -107,6 +110,21 @@ pub const Dependee = union(enum) {
     /// The names of all declarations of namespace `namespace` (`@typeInfo`
     /// lists them).
     namespace: u32,
+    /// The contents of `embed_files[index]` (`@embedFile`).
+    embed_file: u32,
+};
+
+/// A file read by `@embedFile`.
+pub const EmbedFile = struct {
+    /// Stable key: the module's name and the file's path in it,
+    /// `module:sub/path`.
+    key: []const u8,
+    module: Frontend.Module.Index,
+    sub_path: []const u8,
+    /// `cache.hash` of the contents.
+    hash: u128,
+    /// Arena-allocated, without a sentinel.
+    bytes: []const u8,
 };
 
 pub const Namespace = struct {
@@ -160,6 +178,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.comptime_memo.deinit(gpa);
     zcu.inferred_errors.deinit(gpa);
     zcu.exports.deinit(gpa);
+    zcu.embed_files.deinit(gpa);
     zcu.rt_helpers.deinit(gpa);
     zcu.test_functions.deinit(gpa);
     zcu.errors.deinit(gpa);
@@ -169,6 +188,19 @@ pub fn deinit(zcu: *Zcu) void {
 }
 
 pub const tid: InternPool.Tid = .main;
+
+/// Reads file `sub_path` of module `module` for `@embedFile`, once per
+/// compilation; returns its `embed_files` index.
+pub fn embedFile(zcu: *Zcu, module: Frontend.Module.Index, sub_path: []const u8) !u32 {
+    const arena = zcu.arena.allocator();
+    const mod = zcu.fe.module(module);
+    const key = try std.fmt.allocPrint(arena, "{s}:{s}", .{ mod.name, sub_path });
+    if (zcu.embed_files.getIndex(key)) |i| return @intCast(i);
+    const path = try std.fs.path.join(arena, &.{ mod.root_dir, sub_path });
+    const bytes = try Io.Dir.cwd().readFileAlloc(zcu.fe.io, path, arena, .unlimited);
+    try zcu.embed_files.put(zcu.gpa, key, .{ .key = key, .module = module, .sub_path = key[mod.name.len + 1 ..], .hash = cache.hash(0, bytes), .bytes = bytes });
+    return @intCast(zcu.embed_files.count() - 1);
+}
 
 pub fn file(zcu: *const Zcu, index: u32) *const Frontend.File {
     return zcu.fe.file(@fromBackingInt(index));

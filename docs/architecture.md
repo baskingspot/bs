@@ -846,11 +846,13 @@ it and can flush every CPU's TLB.
   with its owner (a unit, a content-addressed constant, or the link's own
   code) and each unit's uses of constants. The manifest gets one node per
   unit and per dependee kind (`nav_ty`, `func_body`, `func_ies`,
-  `namespace_name`, `namespace`), with edges from `Zcu.deps`, each node's
-  `src_hash` (its declaration's, from ZIR) and result hash (InternPool
-  stable hashes; function and constant atoms' contents; inferred error set
-  names; which declaration a name finds; a namespace's names), the error
-  names in code order, the entry, and the inputs. Each node with Atoms is a
+  `namespace_name`, `namespace`, `embed_file`), with edges from
+  `Zcu.deps`, each node's `src_hash` (its declaration's, from ZIR) and
+  result hash (InternPool stable hashes; function and constant atoms'
+  contents; inferred error set names; which declaration a name finds; a
+  namespace's names; an embedded file's contents, keyed by its module and
+  path), the error names in code order, the entry, and the inputs
+  (source files and `@embedFile`d files). Each node with Atoms is a
   store entry keyed by (store seed, node key, `src_hash`); an entry already
   in the store with the same result hash is referenced where it is,
   otherwise it goes into the build's new store pack. Nodes are written in
@@ -919,7 +921,8 @@ input, its nodes and a locator for each: declaration name path, plus the
 ZIR offset relative to the declaration for container types and the ordinal
 for `comptime` blocks), it resolves the locator in the new ZIR and compares
 `src_hash`; `namespace_name`, `namespace`, and `func_body` nodes are
-recomputed from ZIR, as `record` computes them. A missing locator is a
+recomputed from ZIR, as `record` computes them, and a changed embedded
+file's `embed_file` node is a seed. A missing locator is a
 seed. The *possibly outdated* set is everything reachable from the seeds
 over reverse edges (`Manifest.rdeps`, already fast: 2 ms for 30k nodes).
 Sema then runs from the usual roots, and every unit it reaches is either

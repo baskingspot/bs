@@ -222,6 +222,7 @@ pub const Tag = enum(u8) {
     namespace,
     content,
     link,
+    embed_file,
 };
 
 /// Keys that are hashes already.
@@ -266,6 +267,7 @@ const DependeeContext = struct {
             .func_ies => |f| mix(4, @backingInt(f)),
             .namespace_name => |nn| mix(5 | @as(u64, nn.namespace) << 8, @backingInt(nn.name)),
             .namespace => |ns| mix(6, ns),
+            .embed_file => |i| mix(7, i),
         };
     }
     pub fn eql(_: DependeeContext, a: Zcu.Dependee, b: Zcu.Dependee) bool {
@@ -352,7 +354,7 @@ const Recorder = struct {
             // With an edge to the unit that produces them.
             .nav_ty => |nav| try r.addUnit(.{ .nav_val = nav }),
             .func_ies => |func| try r.addUnit(.{ .func = func }),
-            .func_body, .namespace_name, .namespace => no_node,
+            .func_body, .namespace_name, .namespace, .embed_file => no_node,
         };
         const gop = try r.dependees.getOrPut(r.gpa, d);
         if (!gop.found_existing) {
@@ -419,6 +421,7 @@ const Recorder = struct {
             .func_body => .func_body,
             .namespace_name => .namespace_name,
             .namespace => .namespace,
+            .embed_file => .embed_file,
         };
         const index, const new = try r.node(info.key, tag);
         info.node = index;
@@ -585,6 +588,11 @@ const Keyer = struct {
                 var h: Hash = 0;
                 for (ns.decls.keys()) |name| h = cache.hash(@truncate(h), ip.stringSlice(name)) ^ h;
                 return .{ .key = try k.keyOf(.namespace, &.{ns.key}), .result_hash = h };
+            },
+            // The file's contents, by its path in its module.
+            .embed_file => |i| {
+                const f = k.zcu.embed_files.values()[i];
+                return .{ .key = try k.keyOf(.embed_file, &.{f.key}), .result_hash = f.hash };
             },
         }
     }
@@ -848,6 +856,14 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         try path_buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, f.sub_path });
         const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch continue;
         try b.addInput(path_buf.items, stat, @bitCast(f.content_hash), inc.build_start);
+    }
+    // `@embedFile`d files are inputs too.
+    for (zcu.embed_files.values()) |f| {
+        const mod = fe.module(f.module);
+        path_buf.clearRetainingCapacity();
+        try path_buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, f.sub_path });
+        const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch continue;
+        try b.addInput(path_buf.items, stat, f.hash, inc.build_start);
     }
     const t4 = now(io);
     var manifest = try b.writeUnplaced(io, inc.dir, pack.id);

@@ -1863,6 +1863,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .decl_val => sema.zirDeclVal(block, inst, false),
         .decl_ref => sema.zirDeclVal(block, inst, true),
         .import => sema.zirImport(block, inst),
+        .embed_file => sema.zirEmbedFile(block, inst),
         .decl_literal, .decl_literal_no_coerce => sema.zirDeclLiteral(block, inst),
 
         // Types.
@@ -2876,6 +2877,31 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .builtin_src => sema.zirBuiltinSrc(block, ext),
         else => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
     };
+}
+
+/// `@embedFile(path)`: the file's bytes as a string literal. The path is
+/// relative to the current file and must stay inside its module.
+fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
+    const data = sema.code.instructions.items(.data)[@backingInt(inst)].un_node;
+    const src = block.nodeSrc(data.src_node);
+    const name = try sema.resolveConstString(block, src, sema.resolveInst(data.operand));
+    if (name.len == 0) return sema.fail(block, src, "file path name cannot be empty", .{});
+    const file = sema.zcu.file(sema.file);
+    const module = sema.zcu.fe.module(file.module);
+    const root: []const u8 = module.abs_root_dir orelse
+        std.Io.Dir.cwd().realPathFileAlloc(sema.zcu.fe.io, module.root_dir, sema.arena) catch |err|
+            return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
+    const dir = std.fs.path.dirname(file.sub_path) orelse "";
+    const full = try std.fs.path.resolveAllocPosix(sema.arena, &.{ root, dir, name });
+    if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
+        return sema.fail(block, src, "embed of file outside package path: '{s}'", .{name});
+    const sub_path = full[root.len + 1 ..];
+    const index = sema.zcu.embedFile(file.module, sub_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return sema.fail(block, src, "unable to open '{s}': {t}", .{ name, err }),
+    };
+    try sema.declareDependency(.{ .embed_file = index });
+    return .fromInterned(try sema.stringLiteral(sema.zcu.embed_files.values()[index].bytes));
 }
 
 /// `@src()`: a `std.builtin.SourceLocation` of the enclosing function, as
