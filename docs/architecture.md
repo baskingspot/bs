@@ -749,8 +749,28 @@ store) takes 42 ms, the relink decodes from it as fast as from an own pack
   store entry keyed by (store seed, node key, `src_hash`); an entry already
   in the store with the same result hash is referenced where it is,
   otherwise it goes into the build's new store pack. Nodes are written in
-  the order of their first Atom, so a relink reproduces the build's output
-  byte for byte. 630 nodes take 1.3–1.9 ms to record.
+  the order of their first Atom, each with its Atoms grouped.
+- **Link order**: the linker lays out atoms in chunks of input positions,
+  so its output depends on the input order and on duplicates, not just on
+  the set of atoms. A fresh build therefore links exactly the list the
+  manifest replays: Emit tracks, as atoms are added, whether each owner's
+  atoms are still adjacent (one hash insert per unit), and if not,
+  `finish` regroups them, owners in the order of their first atom, and
+  drops later atoms with a key already seen (`Emit.groupByOwner`). A
+  relink then reproduces the fresh build byte for byte for any
+  alignments; the test in `src/Emit.zig` mixes alignments, duplicate
+  constants, and a unit whose atoms are split.
+- **Cost of recording**: on a generated std-free program of 20k functions
+  and 5k globals (24.5k atoms, 68.6k nodes, 196k edges; 0.9 s to build),
+  `record` takes 118–122 ms: the graph 45–49, store puts 20–21, commit
+  20–22, manifest 30–33 (nodes and symbols 16–17, write 14–17). Numbering
+  the symbols is 4–6 ms of the manifest's share (the nodes loop takes
+  13 ms without it). The graph took 116–125 ms before each unit's and
+  dependee's node was memoized (its key string was rendered and hashed
+  once per edge), the maps hashed their small keys with a multiply instead
+  of byte-wise Wyhash, edges and atoms went to two flat arrays grouped by
+  counting sort instead of two lists per node, and atom contents were
+  hashed with Wyhash instead of SipHash. 630 nodes take 1.3–1.9 ms.
 - **Error codes**: the last build's names are assigned first
   (`seedErrors`), so codes stay stable across builds.
 - **Prediction check** (`ZAP_CACHE_CHECK=1`): compares a build's nodes with
@@ -820,11 +840,14 @@ references. It returns false for red units, and Zcu analyzes as today.
 Two things Sema must add, both narrow:
 
 - **References**, recorded like dependencies: which functions a unit
-  queued (`queueFunc` from `navRef` and calls), which declarations' data it
-  requested (`Emit.navKey`), and which compiler_rt helpers it asked for.
-  Loading a function replays them, so the set of linked units is the set
-  reachable this build, and functions no longer referenced drop out of the
-  link instead of lingering in the pack.
+  queued (`queueFunc` from `navRef`, calls, and coercions of a function
+  to a function pointer) and which declarations' data it requested. Some
+  come from Emit during CodeGen, not from Sema: compiler_rt helpers
+  (`requestCompilerRt`), `navKey`/`funcKey` from lowering values, the
+  panic helpers, and the error name table. A function's reference list
+  holds both kinds. Loading a function replays them, so the set of linked
+  units is the set reachable this build, and functions no longer
+  referenced drop out of the link instead of lingering in the pack.
 - **Result hashes at runtime**: `Replay` compares a re-analyzed unit's new
   result with the manifest's before its dependents decide, so the hashing
   `record` does today moves to one function both use.
@@ -862,8 +885,28 @@ the result's items:
   type and scans its namespace as analysis does (Sema thread). `func` as
   (owner declaration's key, relative ZIR offset, generic owner, comptime
   arguments); `inferred_error_set_type` as its function; `ptr` with a
-  `nav` base as the declaration's key, resolved through namespaces (which
-  may load the namespaces' owners in turn).
+  `nav` base as the declaration's key, resolved to a `NavIndex` by
+  namespace lookup alone.
+- Interning a closure never calls `Zcu.ensure*`: container types come
+  from `createContainerType` and a namespace scan, which need no
+  declaration's value, and a `nav` pointer needs only the `NavIndex`.
+  Otherwise `const Node = struct { next: ?*Node }` would report a false
+  dependency loop: loading Node's layout interns `*Node`, which would load
+  `nav_val(Node)` while it is in progress.
+- `Replay.load` does call back into `Zcu.ensure*` to bring a possibly
+  outdated unit's dependencies up to date, but only along the edges the
+  manifest recorded for it, in their order, with the unit marked in
+  progress exactly as analysis marks it. Those edges were taken while the
+  unit was in progress, so they are acyclic, and a real loop introduced by
+  an edit shows up the way it does in analysis.
+- Anonymous types keep their recorded stable keys when loaded. Ordinals
+  are per unit (`Sema.anon_types`) or per comptime call
+  (`Inlining.anon_types`, keyed by the callee's key and argument hashes),
+  so a green unit reproduces them; an edit that shifts a red unit's
+  ordinals changes its result hash, and its dependents re-analyze. A
+  comptime call that is not memoizable (an argument references a comptime
+  allocation) can give two distinct types one key; such types stay out of
+  results, or are keyed by call-site ordinal.
 - Never in a result: `comptime_alloc` pointers (already excluded from
   stable hashing; an escape is a compile error), and Zcu's per-run maps
   (`comptime_memo` starts empty; memoizing comptime calls across builds
@@ -874,6 +917,9 @@ the result's items:
   `func` stores its references (its Atoms are in the pack, its IR is
   never stored); `func_ies` stores the error names; `comptime_decl` stores
   its exports.
+- `builtin.test_functions` is filled outside unit analysis
+  (`populateTestFunctions`, after all tests are known), so the test list is
+  its own node, and adding or removing a test changes it.
 
 **Error codes and inferred error sets.** Codes stay append-only per
 compilation (`seedErrors` assigns the manifest's names first), so a name's
@@ -898,10 +944,16 @@ unchanged identity would stop the walk before the functions that use our
 offsets. The result hash becomes the hash of the canonical `ContainerInfo`
 encoding above (field names, field types' and defaults' stable hashes,
 offsets, tag type and its values, non-exhaustiveness, runtime tag, size,
-alignment), computed once the status reaches `have_layout`. Types reached
-only through pointers keep their identity: pointer types hash by the child
-type's identity, so self-referential types need no recursion.
-`comptime_only` is derived and not hashed. `nav_val`'s result hash adds
+alignment, and `comptime_only`), computed once the status reaches
+`have_layout`. Types reached only through pointers keep their identity:
+pointer types hash by the child type's identity, so self-referential types
+need no recursion. `comptime_only` must be in the hash: if `F` gains a
+`type` field, its size and offsets can stay the same, and a struct `S` with
+a field of type `F` or `*F` would keep its hash while becoming
+comptime-only, leaving functions that take `S` at runtime green. So
+`comptime_only` is computed eagerly at `have_layout`, and the layouts that
+computation walks, through pointers too, are recorded as dependencies.
+`nav_val`'s result hash adds
 `is_const` and `linkage` to the value's stable hash, since dependents read
 those too.
 
@@ -911,12 +963,10 @@ without re-analysis. For green functions in changed files, the relink
 takes `base_line` from the new AST, the way it takes debug paths from the
 manifest's file table, and the manifest records the new value.
 
-Open questions for review: whether `Replay.load` may call back into
-`Zcu.ensure*` for a green unit's dependencies (it must, to materialize
-types its value names), and how that interacts with dependency-loop
-detection; whether anonymous types' ordinals, used in their stable keys,
-come out the same when the enclosing unit is loaded instead of analyzed
-(they must not be recomputed: a loaded type keeps its recorded key).
+Reviewed by the Sema thread (2026-11-03); its answers to the two open
+questions (calling back into `Zcu.ensure*`, anonymous types' ordinals) and
+its corrections (`comptime_only` in the layout hash, Emit-side references,
+the test list) are folded in above.
 
 What the cache must get right, or edit-rebuilds will not be Go-class:
 
