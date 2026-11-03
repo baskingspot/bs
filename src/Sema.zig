@@ -4312,6 +4312,12 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
         if (Type.class(ip, sc) != .pointer or Type.class(ip, dc) != .pointer) return false;
         return sema.childCoercibleInMemory(sc, dc);
     }
+    // `*T` read as `?*T`: a pointer-like optional is its pointer, as
+    // upstream (`*const *anyopaque` to `*const ?*anyopaque`).
+    if (sk == .ptr_type and dk == .opt_type and sk.ptr_type.flags.size != .slice and !sk.ptr_type.flags.is_allowzero) {
+        const dc = dk.opt_type;
+        if (Type.class(ip, dc) == .pointer and Type.optionalReprIsPtr(ip, dc)) return sema.childCoercibleInMemory(src, dc);
+    }
     if (sk != .ptr_type or dk != .ptr_type) return false;
     const s = sk.ptr_type;
     const d = dk.ptr_type;
