@@ -402,10 +402,7 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
         }
         if (field.align_body) |body| {
             if (decl.layout == .@"packed") return sema.fail(&block, block.nodeSrc(.zero), "unable to override alignment of packed struct fields", .{});
-            const a_ref = try sema.coerce(&block, .u32_type, try sema.resolveInlineBody(&block, body, key.zir_inst), block.nodeSrc(.zero));
-            const a = ip.intValue(u64, try sema.resolveConstValue(&block, block.nodeSrc(.zero), a_ref, "struct field alignment must be comptime-known")).?;
-            if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(&block, block.nodeSrc(.zero), "alignment value '{d}' is not a power of two", .{a});
-            aligns[i] = a;
+            aligns[i] = try sema.resolveFieldAlign(&block, block.nodeSrc(.zero), try sema.resolveInlineBody(&block, body, key.zir_inst));
         }
         const ty_ref = try sema.resolveInlineBody(&block, field.type_body, key.zir_inst);
         types[i] = try sema.analyzeAsType(&block, block.nodeSrc(.zero), ty_ref);
@@ -445,6 +442,14 @@ pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
         return sema.fail(&block, block.nodeSrc(.zero), "comptime field without default initialization value", .{});
     info.field_defaults = defaults;
     try sema.finish();
+}
+
+/// A field's `align(n)`: a comptime-known power of two.
+fn resolveFieldAlign(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileError!u64 {
+    const a_ref = try sema.coerce(block, .u32_type, ref, src);
+    const a = sema.ip.intValue(u64, try sema.resolveConstValue(block, src, a_ref, "field alignment must be comptime-known")).?;
+    if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
+    return a;
 }
 
 /// The node of a `@Struct`, `@Union`, or `@Enum` instruction, or null if
@@ -506,31 +511,41 @@ fn structLayout(sema: *Sema, block: *Block, info: *InternPool.ContainerInfo, lay
         info.size = Type.abiSize(ip, backing);
         info.alignment = Type.abiAlignment(ip, backing);
     } else {
-        var offset: u64 = 0;
+        // As upstream's resolveStructLayout: an explicit alignment can raise
+        // or lower the natural one, and an auto layout lays fields out in
+        // descending alignment, sorted exactly as upstream sorts them.
+        const field_aligns = try sema.arena.alloc(u64, types.len);
+        const order = try sema.arena.alloc(u32, types.len);
+        const omitted = std.math.maxInt(u32);
         var alignment: u64 = 1;
-        for (types, 0..) |ft, i| {
+        for (types, field_aligns, order, 0..) |ft, *fa, *o, i| {
+            offsets[i] = 0;
             if (info.fieldIsComptime(i)) {
-                offsets[i] = 0;
+                o.* = omitted;
                 continue;
             }
             try sema.resolveLayout(block, block.nodeSrc(.zero), ft);
-            if (!Type.hasRuntimeBits(ip, ft)) {
-                // A zero-bit field with an explicit alignment still aligns
-                // the struct, as upstream (std.heap's `_: void align(8) =
-                // {}`); upstream may move it, so it takes no space here.
-                offsets[i] = offset;
-                if (aligns.len != 0 and aligns[i] != 0) {
-                    offsets[i] = std.mem.alignForward(u64, offset, aligns[i]);
-                    alignment = @max(alignment, aligns[i]);
+            fa.* = if (aligns.len != 0 and aligns[i] != 0) aligns[i] else Type.abiAlignment(ip, ft);
+            alignment = @max(alignment, fa.*);
+            o.* = @intCast(i);
+        }
+        if (layout == .auto) {
+            const Ctx = struct {
+                aligns: []const u64,
+                fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                    if (a == omitted) return false;
+                    if (b == omitted) return true;
+                    return ctx.aligns[a] > ctx.aligns[b];
                 }
-                continue;
-            }
-            // An explicit alignment can raise or lower the natural one.
-            const a = if (aligns.len != 0 and aligns[i] != 0) aligns[i] else Type.abiAlignment(ip, ft);
-            offset = std.mem.alignForward(u64, offset, a);
+            };
+            std.mem.sortUnstable(u32, order, Ctx{ .aligns = field_aligns }, Ctx.lessThan);
+        }
+        var offset: u64 = 0;
+        for (order) |i| {
+            if (i == omitted) continue;
+            offset = std.mem.alignForward(u64, offset, field_aligns[i]);
             offsets[i] = offset;
-            offset += Type.abiSize(ip, ft);
-            alignment = @max(alignment, a);
+            offset += Type.abiSize(ip, types[i]);
         }
         info.field_offsets = offsets;
         info.size = std.mem.alignForward(u64, offset, alignment);
@@ -615,18 +630,26 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
         const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
         const types = try ip.arena(Zcu.tid).alloc(Index, n);
         if (decl.arg_type_body) |body| arg_ty = try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
+        var aligns: []u64 = &.{};
         var it = decl.iterateFields();
         while (it.next()) |field| {
             const i = field.idx;
             names[i] = try ip.getString(Zcu.tid, sema.code.nullTerminatedString(field.name));
-            if (field.align_body != null) return sema.failUnsupported(&block, src, "union field alignment");
             types[i] = if (field.type_body) |body|
                 try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst))
             else
                 .void_type;
+            if (field.align_body) |body| {
+                if (aligns.len == 0) {
+                    aligns = try ip.arena(Zcu.tid).alloc(u64, n);
+                    @memset(aligns, 0);
+                }
+                aligns[i] = try sema.resolveFieldAlign(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
+            }
         }
         info.field_names = names;
         info.field_types = types;
+        info.field_aligns = aligns;
     }
     const names = info.field_names;
     const types = info.field_types;
@@ -715,11 +738,11 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     info.status = .layout_wip;
     var payload_size: u64 = 0;
     var payload_align: u64 = 1;
-    for (types) |ft| {
+    for (types, 0..) |ft, i| {
         try sema.resolveLayout(&block, src, ft);
         if (Type.class(ip, ft) == .noreturn) continue;
         if (Type.hasRuntimeBits(ip, ft)) payload_size = @max(payload_size, Type.abiSize(ip, ft));
-        payload_align = @max(payload_align, Type.abiAlignment(ip, ft));
+        payload_align = @max(payload_align, Type.unionFieldAlign(ip, info, @intCast(i)));
     }
     var size = payload_size;
     var alignment = payload_align;
@@ -7910,7 +7933,6 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         av.* = try sema.structFieldValue(a, "align");
         cv.* = .bool_false;
         if (ip.indexToKey(av.*).opt.val != .none) {
-            if (kind != .@"struct") return sema.failUnsupported(block, src, "union field alignment");
             const bytes = ip.intValue(u64, ip.indexToKey(av.*).opt.val).?;
             if (bytes == 0 or !std.math.isPowerOfTwo(bytes)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{bytes});
             any_align = true;
@@ -8208,9 +8230,13 @@ fn fieldPtrAlignment(sema: *Sema, block: *Block, src: Src, ptr_align: u6, aggreg
             }
             if (info.fieldIsComptime(i)) return if (explicit != 0) flag(explicit) else 0;
         },
-        .union_type => if (ip.structInfo(aggregate_ty).layout != .auto) {
-            if (ptr_align != 0) return ptr_align;
-            return if (Type.abiAlignment(ip, field_ty) == aggregate_align) 0 else flag(aggregate_align);
+        .union_type => {
+            const info = ip.structInfo(aggregate_ty);
+            if (info.layout != .auto) {
+                if (ptr_align != 0) return ptr_align;
+                return if (Type.abiAlignment(ip, field_ty) == aggregate_align) 0 else flag(aggregate_align);
+            }
+            if (info.field_aligns.len != 0) explicit = info.field_aligns[i];
         },
         else => {},
     }

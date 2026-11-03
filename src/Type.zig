@@ -184,6 +184,24 @@ pub fn optionalReprIsPtr(ip: *const InternPool, child: Index) bool {
     };
 }
 
+/// Whether `?ty` is represented as `ty` with a zero first word meaning
+/// null, as upstream's optionalReprIsPayload: single and many pointers,
+/// slices (null `ptr`), and error sets (error code 0).
+pub fn optionalReprIsPayload(ip: *const InternPool, child: Index) bool {
+    return switch (ip.indexToKey(child)) {
+        .ptr_type => |p| p.flags.size != .c and !p.flags.is_allowzero,
+        .error_set_type, .inferred_error_set_type => true,
+        .simple_type => |s| s == .anyerror,
+        else => false,
+    };
+}
+
+/// Whether no value of `ty` can exist: `noreturn`, or an exhaustive enum
+/// without fields (its tag type is `noreturn`). Asserts a resolved layout.
+pub fn hasNoPossibleValue(ip: *const InternPool, ty: Index) bool {
+    return ty == .noreturn_type or (class(ip, ty) == .@"enum" and ip.structInfo(ty).tag_type == .noreturn_type);
+}
+
 /// Whether values of this type exist only at compile time.
 pub fn isComptimeOnly(ip: *const InternPool, ty: Index) bool {
     var hit_cycle = false;
@@ -283,7 +301,7 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
         },
         .optional => blk: {
             const child = childType(ip, ty);
-            if (optionalReprIsPtr(ip, child)) break :blk 8;
+            if (optionalReprIsPayload(ip, child)) break :blk abiSize(ip, child);
             if (!hasRuntimeBits(ip, child)) break :blk 1;
             break :blk std.mem.alignForward(u64, abiSize(ip, child) + 1, abiAlignment(ip, child));
         },
@@ -315,11 +333,7 @@ pub fn abiAlignment(ip: *const InternPool, ty: Index) u64 {
             if (v.child == .bool_type) break :blk if (v.len > 64) 16 else std.math.ceilPowerOfTwoAssert(u64, (v.len + 7) / 8);
             break :blk if (abiSize(ip, v.child) == 0) 1 else 16;
         },
-        .optional => blk: {
-            const child = childType(ip, ty);
-            if (optionalReprIsPtr(ip, child)) break :blk 8;
-            break :blk abiAlignment(ip, child);
-        },
+        .optional => abiAlignment(ip, childType(ip, ty)),
         .error_union => errorUnionLayout(ip, ty).alignment,
         .@"struct", .@"union" => blk: {
             const info = ip.structInfo(ty);
@@ -371,16 +385,23 @@ pub fn unionLayout(ip: *const InternPool, ty: Index) UnionLayout {
     const info = ip.structInfo(ty);
     var payload_size: u64 = 0;
     var payload_align: u64 = 1;
-    for (info.field_types) |ft| {
+    for (info.field_types, 0..) |ft, i| {
         if (class(ip, ft) == .noreturn) continue;
         if (hasRuntimeBits(ip, ft)) payload_size = @max(payload_size, abiSize(ip, ft));
-        payload_align = @max(payload_align, abiAlignment(ip, ft));
+        payload_align = @max(payload_align, unionFieldAlign(ip, info, @intCast(i)));
     }
     if (!info.has_runtime_tag) return .{ .tag_offset = 0, .payload_offset = 0, .tag_size = 0, .payload_size = payload_size };
     const tag_size = abiSize(ip, info.tag_type);
     if (abiAlignment(ip, info.tag_type) < payload_align)
         return .{ .tag_offset = payload_size, .payload_offset = 0, .tag_size = tag_size, .payload_size = payload_size };
     return .{ .tag_offset = 0, .payload_offset = tag_size, .tag_size = tag_size, .payload_size = payload_size };
+}
+
+/// The alignment of union field `i`: its explicit `align(n)`, else its
+/// type's.
+pub fn unionFieldAlign(ip: *const InternPool, info: *const InternPool.ContainerInfo, i: u32) u64 {
+    if (info.field_aligns.len != 0 and info.field_aligns[i] != 0) return info.field_aligns[i];
+    return abiAlignment(ip, info.field_types[i]);
 }
 
 /// The runtime tag value of union field `field`: its enum tag, or for a

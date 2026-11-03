@@ -748,6 +748,10 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (Type.optionalReprIsPtr(ip, child)) {
                 try cg.load(.rax, data.un_op);
                 try cg.e.@"test"(.qword, .{ .reg = .rax }, .{ .reg = .rax });
+            } else if (Type.optionalReprIsPayload(ip, child)) {
+                // A slice's `ptr` or an error code; zero is null.
+                const src = try cg.memOf(data.un_op);
+                try cg.e.alu(.cmp, if (Type.isSlice(ip, child)) .qword else .word, .{ .mem = src }, .{ .imm = 0 });
             } else {
                 const src = try cg.memOf(data.un_op);
                 try cg.e.alu(.cmp, .byte, .{ .mem = offsetMem(src, Type.optionalFlagOffset(ip, opt_ty)) }, .{ .imm = 0 });
@@ -768,7 +772,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.load(.rax, data.ty_op.operand);
             if (tag == .optional_payload_ptr_set) {
                 const opt_ty = Type.ptrInfo(ip, cg.typeOf(data.ty_op.operand)).child;
-                if (!Type.optionalReprIsPtr(ip, Type.childType(ip, opt_ty))) {
+                if (!Type.optionalReprIsPayload(ip, Type.childType(ip, opt_ty))) {
                     try cg.e.mov(.byte, .{ .mem = Mem.at(.rax, @intCast(Type.optionalFlagOffset(ip, opt_ty))) }, .{ .imm = 1 });
                 }
             }
@@ -778,7 +782,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const opt_ty = data.ty_op.ty;
             const dst = try cg.resultMem(inst, opt_ty) orelse return;
             try cg.copyTo(dst, data.ty_op.operand);
-            if (!Type.optionalReprIsPtr(ip, Type.childType(ip, opt_ty))) {
+            if (!Type.optionalReprIsPayload(ip, Type.childType(ip, opt_ty))) {
                 try cg.e.mov(.byte, .{ .mem = offsetMem(dst, Type.optionalFlagOffset(ip, opt_ty)) }, .{ .imm = 1 });
             }
         },
@@ -1828,7 +1832,7 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
             const child = Type.childType(ip, ty);
             @memset(out, 0);
             if (o.val == .none) return;
-            if (Type.optionalReprIsPtr(ip, child)) return lowerValue(emit, o.val, out, relocs, base_off);
+            if (Type.optionalReprIsPayload(ip, child)) return lowerValue(emit, o.val, out, relocs, base_off);
             const size = Type.abiSize(ip, child);
             try lowerValue(emit, o.val, out[0..size], relocs, base_off);
             out[size] = 1;
