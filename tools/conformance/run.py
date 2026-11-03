@@ -31,6 +31,12 @@ After a crash or timeout, the rest of the tests run through the runner's
 --listen=- protocol (std.zig.Server, as `zig build test` drives it), one
 test at a time, restarting after each further crash.
 
+With --std, the measure is upstream's std tests instead: lib/std/std.zig
+built as one `zig test` unit with the default runner and --zig-lib-dir
+upstream/lib (the source tree, which has std's testdata), as
+`zig build test-std` builds its Debug entry for the target. Results are
+parsed as with --default-runner and compared with baseline/std-<target>.json.
+
 Portable to Linux and macOS: Python 3 standard library only.
 """
 
@@ -51,6 +57,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 UPSTREAM_TEST = REPO / "upstream" / "test"
+UPSTREAM_LIB = REPO / "upstream" / "lib"
 BASELINE_DIR = HERE / "baseline"
 FORMAT = 1
 
@@ -759,6 +766,100 @@ def zap_target(zap, cfg, args, workdir):
     )
 
 
+# ---------------------------------------------------------------- std mode
+
+
+def std_target(compiler, cfg, args, workdir):
+    """--std: upstream's std tests as one unit, built by `compiler`."""
+    baseline_path = BASELINE_DIR / f"std-{cfg['name']}.json"
+    baseline = None
+    if not args.upstream:
+        if not baseline_path.exists():
+            print(f"{cfg['name']} std: no baseline; run with --upstream --std on a {cfg['name']} host first")
+            return
+        baseline = json.loads(baseline_path.read_text())
+    bin_path = workdir / "bin" / cfg["name"] / "std.test"
+    bin_path.parent.mkdir(parents=True, exist_ok=True)
+    bin_path.unlink(missing_ok=True)
+    argv = [
+        str(compiler), "test", str(UPSTREAM_LIB / "std" / "std.zig"), "--zig-lib-dir", str(UPSTREAM_LIB),
+        "-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}",
+    ]
+    if args.upstream:
+        # A fresh cache, so that the baseline's compile time is a cold build.
+        cache = workdir / "std-zig-cache"
+        shutil.rmtree(cache, ignore_errors=True)
+        argv += ["--cache-dir", str(cache / "local"), "--global-cache-dir", str(cache / "global")]
+    timeout = args.compile_timeout * 4
+    start = time.monotonic()
+    code, out, err, timed_out = run_process(argv, workdir, timeout)
+    compile_s = time.monotonic() - start
+    if code == 0 and not timed_out and bin_path.exists():
+        run_args = argparse.Namespace(**vars(args))
+        run_args.run_timeout = max(args.run_timeout, 600)
+        try:
+            r = run_unit_default(bin_path, lambda _name: True, run_args, workdir)
+        finally:
+            if not args.keep_binaries:
+                bin_path.unlink(missing_ok=True)
+    else:
+        status = "compile_timeout" if timed_out else "compile_crash" if code < 0 else "compile_error"
+        if args.upstream:
+            sys.exit(f"error: upstream failed to compile std's tests:\n{tail(err + out)}")
+        r = {"status": status, "log": describe_exit(code, timed_out, timeout) + "\n" + tail(err + out), "tests": {}}
+    counts = count_outcomes(r["tests"].values())
+    data = {
+        "format": FORMAT,
+        "target": cfg["name"],
+        "zig_target": cfg["zig_target"],
+        "compiler": str(compiler),
+        "compile_seconds": round(compile_s, 1),
+        "status": r["status"],
+        "summary": {"tests": len(r["tests"]), **{k: v for k, v in counts.items() if k != "not_run"}},
+    }
+    if "log" in r:
+        data["log"] = r["log"]
+    if args.upstream:
+        zig_version = subprocess.run([str(compiler), "version"], capture_output=True, text=True).stdout.strip()
+        data["compiler"] = f"zig {zig_version}"
+        data["tests"] = r["tests"]
+        out_path = args.out or baseline_path
+        write_json(out_path, data)
+        print(
+            f"{cfg['name']} std: upstream zig {zig_version}: {counts['pass']} pass, {counts['skip']} skip, "
+            f"{len(r['tests']) - counts['pass'] - counts['skip']} fail of {len(r['tests'])} tests; "
+            f"compiled in {compile_s:.1f}s -> {rel(out_path)}"
+        )
+        return
+    # Upstream's tests first, in upstream order, with zap's outcome.
+    merged = {}
+    passed = expected = 0
+    for key, up in baseline["tests"].items():
+        got = r["tests"].get(key, "not_run")
+        merged[key] = {"upstream": up, "zap": got}
+        if up == "pass":
+            expected += 1
+            passed += got == "pass"
+    for key, got in r["tests"].items():
+        if key not in merged:
+            merged[key] = {"upstream": "absent", "zap": got}
+    unknown = sum(1 for t in merged.values() if t["upstream"] == "absent")
+    pct = 100.0 * passed / expected if expected else 0.0
+    data["summary"] = {"pass": passed, "of": expected, "percent": round(pct, 2), "unknown_tests": unknown}
+    data["baseline"] = {"compiler": baseline["compiler"], "compile_seconds": baseline["compile_seconds"]}
+    data["tests"] = merged
+    if "details" in r:
+        data["details"] = r["details"]
+    out_path = args.out or workdir / f"std-{cfg['name']}.json"
+    write_json(out_path, data)
+    note = f"; {unknown} tests not in baseline" if unknown else ""
+    status = "" if r["status"] == "ok" else f"; {STATUS_LABELS.get(r['status'], r['status'])}"
+    print(
+        f"{cfg['name']} std: {passed}/{expected} std tests pass ({pct:.1f}% of upstream){status}{note}; "
+        f"compiled in {compile_s:.1f}s (upstream baseline {baseline['compile_seconds']:.1f}s) -> {rel(out_path)}"
+    )
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -770,6 +871,7 @@ def main():
     p.add_argument("--zig", default="zig", help="upstream zig 0.17.0, used for --upstream and to build zap (default: zig on PATH)")
     p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, zap_runner.zig for zap until zap compiles test_runner.zig)")
     p.add_argument("--default-runner", action="store_true", help="zap only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `zap test` without --test-runner does")
+    p.add_argument("--std", action="store_true", help="measure upstream's std tests (lib/std/std.zig, default runner) instead of test/behavior")
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
     p.add_argument("--compile-timeout", type=float, default=300, help="seconds per file compile")
@@ -804,6 +906,8 @@ def main():
             cfg = dict(TARGETS[name], name=name)
             if name not in runnable:
                 print(f"{name}: not run (needs an {name} host)")
+            elif args.std:
+                std_target(compiler, cfg, args, args.workdir)
             elif args.upstream:
                 upstream_target(compiler, cfg, args, args.workdir)
             else:

@@ -1863,3 +1863,16 @@ state.
   parsed; after a crash or timeout, the remaining tests run one at a time
   through the runner's `--listen=-` protocol (`std.zig.Server`, as
   `zig build test` drives it). Report both numbers.
+- `run.py --std` is the next measure: upstream's std tests,
+  `upstream/lib/std/std.zig` built as one `zap test` unit with the default
+  runner, `--zig-lib-dir upstream/lib` (the source tree; the binary
+  release's `lib/` lacks std's testdata), and the same `-target`, as
+  `zig build test-std` builds its Debug entry. When the root is
+  `<zig_lib_dir>/std/std.zig`, the root module is std itself (upstream's
+  `main_mod_is_std`), not a second copy of it. Results are parsed as with
+  `--default-runner` and compared per test with the committed
+  `baseline/std-<target>.json`; `run.py --upstream --std` recomputes it,
+  including a cold compile time from a fresh zig cache. The baseline CPU
+  matters: upstream built for the host CPU runs two fewer tests (the
+  bitsliced AES cross-checks) and runs `math.lerp`, which it skips without
+  FMA.
