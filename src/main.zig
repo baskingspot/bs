@@ -104,9 +104,19 @@ pub fn main(init: std.process.Init) !void {
     if (run_test) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
     const use_cache = out_path != null and !opts.dump_ir and (command == .build_exe or is_test) and
         !std.mem.eql(u8, init.environ_map.get("ZAP_CACHE") orelse "", "off");
-    var inc: ?Incremental = if (use_cache) try Incremental.open(init.gpa, init.io, cache_dirs, args[1..], zig_lib_dir, "x86_64-linux", init.environ_map.get("ZAP_CACHE_TIMING") != null) else null;
+    // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
+    var inc: ?Incremental = if (use_cache) Incremental.open(init.gpa, init.io, cache_dirs, args[1..], zig_lib_dir, "x86_64-linux", init.environ_map.get("ZAP_CACHE_TIMING") != null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => no_cache: {
+            std.log.warn("unable to use the cache: {t}", .{err});
+            break :no_cache null;
+        },
+    } else null;
     defer if (inc) |*i| i.close();
     if (inc) |*i| i.check = init.environ_map.get("ZAP_CACHE_CHECK") != null;
+    if (inc) |*i| if (init.environ_map.get("ZAP_CACHE_MAX_SIZE")) |v| {
+        i.max_bytes = @import("cache.zig").parseSize(v) orelse fatal("invalid ZAP_CACHE_MAX_SIZE '{s}': expected bytes, or a number and K, M, G, or T", .{v});
+    };
     stages.on = init.environ_map.get("ZAP_TIMING") != null;
     if (inc) |*i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
         if (run_test) try runTest(init, out_path.?);
@@ -170,7 +180,7 @@ pub fn main(init: std.process.Init) !void {
     if (inc) |*i| i.startRecord(&fe, &zcu, &emit);
     const linked = try emit.link(init.io, Io.Dir.cwd(), bin_path);
     stages.mark("link");
-    if (inc) |*i| try i.finishRecord(linked);
+    if (inc) |*i| i.finishRecord(linked);
     stages.mark("cache record (after the link)");
     stages.print();
     if (!linked) std.process.exit(1);

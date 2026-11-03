@@ -25,7 +25,8 @@
 //!
 //! Trimming is per pack: a pack records its last use in its mtime
 //! (refreshed at most hourly), and maintenance deletes packs unused for
-//! `max_unused_ns`. So that a pack does not live on for a few of its
+//! `max_unused_ns`, and the least recently used ones while the packs total
+//! more than `max_bytes`. So that a pack does not live on for a few of its
 //! entries, a hit in a pack older than `copy_forward_ns` is written again
 //! by the build's `commit`; live entries move to young packs and old packs
 //! fall out of use.
@@ -53,6 +54,8 @@ packs: []PackFile,
 opened: Io.Timestamp,
 /// Hits in old packs, written again by the next `commit`.
 forward: std.ArrayList(Forward) = .empty,
+/// `commit` evicts the least recently used packs while they total more.
+max_bytes: u64 = cache.default_max_bytes,
 forward_mutex: Io.Mutex = .init,
 /// The id of the pack the next `commit` writes, if `reserveName` chose it.
 next_id: ?Hash = null,
@@ -527,7 +530,7 @@ pub fn commitPack(store: *Store, gpa: Allocator, io: Io, w: *PackWriter, entries
     const name = try finishPack(gpa, io, w, all.items, off, now, now);
     if (keep) |k| try placeInStore(io, k, store.dir, &name);
     store.refreshUsed(io);
-    try maintainIfDue(gpa, io, store.dir, store.packs.len + 1);
+    store.maintainIfDue(gpa, io, off + PackHeader.indexLen(all.items.len));
     return name;
 }
 
@@ -549,7 +552,9 @@ fn placeInStore(io: Io, keep: Io.Dir, store_dir: Io.Dir, name: []const u8) !void
 pub fn commit(store: *Store, gpa: Allocator, io: Io, batches: []Batch, keep: ?Io.Dir) !?PackName {
     const name = try store.write(gpa, io, batches, keep);
     store.refreshUsed(io);
-    try maintainIfDue(gpa, io, store.dir, store.packs.len + 1);
+    var new_bytes: u64 = 0;
+    if (name) |n| new_bytes = if (store.dir.statFile(io, &n, .{})) |st| st.size else |_| 0;
+    store.maintainIfDue(gpa, io, new_bytes);
     return name;
 }
 
@@ -690,30 +695,37 @@ fn writeSegments(gpa: Allocator, io: Io, f: Io.File, parts: []const *const Batch
     for (errs[0..n_threads]) |e| if (e) |err| return err;
 }
 
-/// Merges packs when there are more than `max_packs`, and deletes unused
-/// ones once a day, unless another build is doing so.
-fn maintainIfDue(gpa: Allocator, io: Io, dir: Io.Dir, n_packs: usize) !void {
+/// After a commit that wrote a pack of `new_bytes`: merges packs when there
+/// are more than `max_packs`, evicts packs when they total more than
+/// `max_bytes`, and deletes unused ones once a day, unless another build is
+/// doing so. Maintenance is best effort; its failures do not fail the
+/// commit.
+fn maintainIfDue(store: *const Store, gpa: Allocator, io: Io, new_bytes: u64) void {
     const now = Io.Clock.real.now(io);
-    const trim_due = if (dir.statFile(io, "trim", .{})) |stat|
+    const trim_due = if (store.dir.statFile(io, "trim", .{})) |stat|
         stat.mtime.durationTo(now).toNanoseconds() >= trim_interval_ns
-    else |err| switch (err) {
-        error.FileNotFound => true,
-        else => |e| return e,
-    };
-    if (!trim_due and n_packs <= max_packs) return;
-    _ = try maintain(gpa, io, dir, .{ .trim = trim_due, .now = now });
+    else |_|
+        true;
+    var bytes = new_bytes;
+    for (store.packs) |*p| bytes += p.size;
+    const n_packs = store.packs.len + @intFromBool(new_bytes != 0);
+    if (!trim_due and n_packs <= max_packs and bytes <= store.max_bytes) return;
+    _ = maintain(gpa, io, store.dir, .{ .trim = trim_due, .now = now, .max_bytes = store.max_bytes }) catch {};
 }
 
 pub const MaintainOptions = struct {
     trim: bool,
     now: Io.Timestamp,
+    max_bytes: u64 = cache.default_max_bytes,
 };
 
-pub const MaintainResult = struct { deleted: u32 = 0, merged: u32 = 0 };
+pub const MaintainResult = struct { deleted: u32 = 0, evicted: u32 = 0, merged: u32 = 0 };
 
 /// Under the store's maintenance lock, unless another build holds it:
-/// deletes packs unused for `max_unused_ns` if `options.trim`, then merges
-/// the smallest packs into one while there are more than `max_packs`.
+/// deletes packs unused for `max_unused_ns` if `options.trim`; while the
+/// packs total more than `options.max_bytes`, deletes the least recently
+/// used down to three quarters of it; then, while there are more than
+/// `max_packs`, merges the smallest into one.
 pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !MaintainResult {
     const lock_file = try dir.createFile(io, "lock", .{ .truncate = false });
     defer lock_file.close(io);
@@ -734,49 +746,89 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
         } else try live.append(gpa, p);
     }
     if (options.trim) try dir.writeFile(io, .{ .sub_path = "trim", .data = "" });
-    if (live.items.len <= max_packs) return result;
 
-    // Merge packs adjacent in lookup order, so that the merged pack takes
-    // their place in it and lookups still find the newest copy of a key,
-    // down to half the limit. Of those runs, merge the one with the fewest
-    // bytes, so that large packs are rarely rewritten.
-    const run_len = live.items.len - max_packs / 2 + 1;
-    var run_size: u64 = 0;
-    for (live.items[0..run_len]) |p| run_size += p.size;
-    var best_start: usize = 0;
-    var best_size = run_size;
-    for (run_len..live.items.len) |i| {
-        run_size = run_size + live.items[i].size - live.items[i - run_len].size;
-        if (run_size < best_size) {
-            best_size = run_size;
-            best_start = i - run_len + 1;
+    var total: u64 = 0;
+    for (live.items) |p| total += p.size;
+    if (total > options.max_bytes) {
+        // Least recently used first. The space of a pack that a
+        // compilation directory links stays in use until that directory
+        // drops it (`cache.maintainCompilations`).
+        const by_use = try gpa.dupe(*const PackFile, live.items);
+        defer gpa.free(by_use);
+        std.mem.sortUnstable(*const PackFile, by_use, {}, struct {
+            fn older(_: void, a: *const PackFile, b: *const PackFile) bool {
+                return a.mtime.compare(.lt, b.mtime) or (a.mtime.compare(.eq, b.mtime) and a.order < b.order);
+            }
+        }.older);
+        const target = options.max_bytes - options.max_bytes / 4;
+        for (by_use) |p| {
+            if (total <= target) break;
+            dir.deleteFile(io, &p.name) catch continue;
+            total -= p.size;
+            result.evicted += 1;
+            for (live.items, 0..) |q, i| if (q == p) {
+                _ = live.orderedRemove(i);
+                break;
+            };
         }
     }
-    // Newest first, as `live` is.
-    const merge = live.items[best_start..][0..run_len];
+    if (live.items.len <= max_packs) return result;
+
+    // Merge the smallest packs, down to half the limit, so that large
+    // packs are rarely rewritten: a rewrite costs their size again, and
+    // while a compilation directory still links the old pack, as much
+    // disk. The merged pack takes the place in lookup order of the newest
+    // of them, so an entry is dropped where a pack left out of the merge
+    // and newer than the entry's own holds the same key: lookups still
+    // find the newest copy of every key.
+    const n_merge = live.items.len - max_packs / 2 + 1;
+    const merge = try gpa.alloc(bool, live.items.len);
+    defer gpa.free(merge);
+    @memset(merge, false);
+    {
+        const by_size = try gpa.alloc(u32, live.items.len);
+        defer gpa.free(by_size);
+        for (by_size, 0..) |*s, i| s.* = @intCast(i);
+        std.mem.sortUnstable(u32, by_size, live.items, struct {
+            fn smaller(ps: []const *const PackFile, a: u32, b: u32) bool {
+                return ps[a].size < ps[b].size or (ps[a].size == ps[b].size and a < b);
+            }
+        }.smaller);
+        for (by_size[0..n_merge]) |i| merge[i] = true;
+    }
+    var size: u64 = 0;
     var count: usize = 0;
     var created: i64 = std.math.maxInt(i64);
+    var order: i64 = std.math.minInt(i64);
     var mtime: Io.Timestamp = .zero;
-    for (merge) |p| {
+    for (live.items, merge) |p, m| if (m) {
+        size += p.size;
         count += p.keys.len;
         created = @min(created, p.created);
+        order = @max(order, p.order);
         if (p.mtime.compare(.gt, mtime)) mtime = p.mtime;
-    }
+    };
     var merged: Batch = .{
-        .bytes = try .initCapacity(gpa, @intCast(best_size)),
+        .bytes = try .initCapacity(gpa, @intCast(size)),
         .index = try .initCapacity(gpa, count),
     };
     defer merged.deinit(gpa);
-    for (merge) |p| {
-        for (p.keys, 0..) |k, i| try merged.putRaw(gpa, k, p.entryBytes(i));
-    }
+    // Newest first, as `live` is.
+    for (live.items, merge, 0..) |p, m, pi| if (m) {
+        keys: for (p.keys, 0..) |k, i| {
+            for (live.items[0..pi], merge[0..pi]) |q, qm| {
+                if (!qm and q.find(k) != null) continue :keys;
+            }
+            try merged.putRaw(gpa, k, p.entryBytes(i));
+        }
+    };
     // `writePack` keeps the first copy of a key: the newest pack's.
-    const name = try writePack(gpa, io, dir, &.{&merged}, created, merge[0].order, null);
+    const name = try writePack(gpa, io, dir, &.{&merged}, created, order, null);
     // The merged pack was last used when the most recently used of its
     // parts was.
     try dir.setTimestamps(io, &name, .{ .modify_timestamp = .{ .new = mtime } });
-    for (merge) |p| dir.deleteFile(io, &p.name) catch {};
-    result.merged = @intCast(merge.len);
+    for (live.items, merge) |p, m| if (m) dir.deleteFile(io, &p.name) catch {};
+    result.merged = @intCast(n_merge);
     return result;
 }
 
@@ -894,6 +946,67 @@ test "entries round-trip through packs, are checked, copied forward, merged, and
     const r = try maintain(gpa, io, store_dir, .{ .trim = true, .now = later });
     try t.expectEqual(max_packs / 2, r.deleted);
     try t.expectEqual(0, try countPacks(io, store_dir));
+}
+
+test "merges leave large packs alone, and the size limit evicts the least recently used" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const t = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const big_payload = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(big_payload);
+    @memset(big_payload, 'b');
+    // Key 5 in the oldest pack, then again in a large one; then small packs
+    // until a commit merges. The merge takes the smallest, which include
+    // the oldest pack and are newer than the large one as a group, so the
+    // oldest pack's copy of 5 must not shadow the large pack's.
+    for (0..max_packs + 1) |i| {
+        var store: Store = try .open(gpa, io, tmp.dir);
+        defer store.close(gpa, io);
+        var batch: Batch = .{};
+        defer batch.deinit(gpa);
+        switch (i) {
+            0 => _ = try batch.put(gpa, 5, .{ .src_hash = 0, .result_hash = 1 }),
+            1 => _ = try batch.put(gpa, 5, .{ .src_hash = 0, .result_hash = 2, .payload = big_payload }),
+            else => {},
+        }
+        // The oldest pack is the smallest.
+        _ = try batch.put(gpa, 100 + i, .{ .src_hash = 0, .result_hash = i, .payload = if (i == 0) "" else big_payload[0..256] });
+        _ = try store.commit(gpa, io, (&batch)[0..1], null);
+        // Distinct `order`s.
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    var store_dir = try tmp.dir.openDir(io, "zap/store", .{ .iterate = true });
+    defer store_dir.close(io);
+    try t.expectEqual(max_packs / 2, try countPacks(io, store_dir));
+    var big_name: PackName = undefined;
+    {
+        var store: Store = try .open(gpa, io, tmp.dir);
+        defer store.close(gpa, io);
+        try t.expectEqual(2, (try store.get(gpa, io, 5)).?.resultHash());
+        for (0..max_packs + 1) |i| try t.expectEqual(i, (try store.get(gpa, io, 100 + i)).?.resultHash());
+        // The large pack was not rewritten: it still holds one entry
+        // besides 5. The oldest pack was merged, without its 5.
+        var big: ?*const PackFile = null;
+        for (store.packs) |*p| if (big == null or p.size > big.?.size) {
+            big = p;
+        };
+        try t.expectEqual(2, big.?.keys.len);
+        big_name = big.?.name;
+        for (store.packs) |*p| if (p != big) try t.expect(p.find(5) == null);
+    }
+    // Over the limit, the least recently used packs go first: here the
+    // large one, after which the rest fit.
+    const now = Io.Clock.real.now(io);
+    try store_dir.setTimestamps(io, &big_name, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-std.time.ns_per_hour)) } });
+    const r = try maintain(gpa, io, store_dir, .{ .trim = false, .now = now, .max_bytes = 64 << 10 });
+    try t.expectEqual(1, r.evicted);
+    try t.expectError(error.FileNotFound, store_dir.statFile(io, &big_name, .{}));
+    var store: Store = try .open(gpa, io, tmp.dir);
+    defer store.close(gpa, io);
+    try t.expectEqual(null, try store.get(gpa, io, 5));
+    try t.expectEqual(0, (try store.get(gpa, io, 100)).?.resultHash());
 }
 
 test "a pack written in place reads back like a committed batch" {

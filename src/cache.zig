@@ -45,46 +45,120 @@ pub fn compilationDir(io: Io, local_cache: Io.Dir, key: Hash) !Io.Dir {
 /// changed under it. The global store needs no lock.
 pub fn lock(io: Io, dir: Io.Dir) !Io.File {
     const f = try dir.createFile(io, "lock", .{ .truncate = false, .lock = .exclusive });
-    // Records use for `trimCompilations`.
+    // Records use for `maintainCompilations`.
     f.setTimestampsNow(io) catch {};
     return f;
 }
 
 /// Compilation directories unused this long are deleted by
-/// `trimCompilations`. They hold hard links to store packs, which keep
+/// `maintainCompilations`. They hold hard links to store packs, which keep
 /// those packs' disk space in use after the store trims them.
 pub const max_unused_compilation_ns = 5 * std.time.ns_per_day;
 
-/// Deletes the compilation directories under `local_cache` whose lock
-/// file was last touched more than `max_unused_compilation_ns` ago, at
-/// most once a day, skipping those a build holds. `lock` touches it.
-pub fn trimCompilations(io: Io, local_cache: Io.Dir) !void {
+/// The default size limit of each of the local cache's compilation
+/// directories and the global store; `ZAP_CACHE_MAX_SIZE` overrides it.
+pub const default_max_bytes: u64 = 4 << 30;
+
+/// `maintainCompilations` scans at most this often.
+const compilations_scan_ns = std.time.ns_per_min;
+
+/// Parses a size limit: bytes, or a number followed by K, M, G, or T
+/// (binary multiples).
+pub fn parseSize(text: []const u8) ?u64 {
+    if (text.len == 0) return null;
+    const shift: u6 = switch (std.ascii.toUpper(text[text.len - 1])) {
+        'K' => 10,
+        'M' => 20,
+        'G' => 30,
+        'T' => 40,
+        else => 0,
+    };
+    const digits = if (shift == 0) text else text[0 .. text.len - 1];
+    const n = std.fmt.parseInt(u64, digits, 10) catch return null;
+    return std.math.shlExact(u64, n, shift) catch null;
+}
+
+/// Deletes compilation directories under `local_cache`, skipping those a
+/// build holds: those whose lock file (touched by `lock`) is older than
+/// `max_unused_compilation_ns`, then the least recently used while the
+/// directories total more than `max_bytes`, down to three quarters of it.
+/// A file hard-linked into several directories counts once, against the
+/// most recently used. Runs at most once a minute, so that it costs a build
+/// a few stats; `Incremental` runs it beside the link, and also, with
+/// `force`, after a build that started a directory. Returns null if it did
+/// not run.
+pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir, max_bytes: u64, force: bool) !?MaintainResult {
     const now = Io.Clock.real.now(io);
     var c = local_cache.openDir(io, "zap/c", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return null,
         else => |e| return e,
     };
     defer c.close(io);
     if (c.statFile(io, "trim", .{})) |stat| {
-        if (stat.mtime.durationTo(now).toNanoseconds() < std.time.ns_per_day) return;
+        if (!force and stat.mtime.durationTo(now).toNanoseconds() < compilations_scan_ns) return null;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => |e| return e,
     }
     try c.writeFile(io, .{ .sub_path = "trim", .data = "" });
+
+    const Compilation = struct { name: [32]u8, used: Io.Timestamp, bytes: u64 = 0 };
+    var comps: std.ArrayList(Compilation) = .empty;
+    defer comps.deinit(gpa);
     var it = c.iterate();
     while (try it.next(io)) |e| {
-        if (e.kind != .directory) continue;
+        if (e.kind != .directory or e.name.len != 32) continue;
         var buf: [64]u8 = undefined;
-        const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{e.name}) catch continue;
+        const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{e.name}) catch unreachable;
+        // A directory without a lock file is being created.
         const stat = c.statFile(io, lock_path, .{}) catch continue;
-        if (stat.mtime.durationTo(now).toNanoseconds() < max_unused_compilation_ns) continue;
+        try comps.append(gpa, .{ .name = e.name[0..32].*, .used = stat.mtime });
+    }
+    // Most recently used first.
+    std.mem.sortUnstable(Compilation, comps.items, {}, struct {
+        fn newer(_: void, a: Compilation, b: Compilation) bool {
+            return a.used.compare(.gt, b.used);
+        }
+    }.newer);
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(gpa);
+    var total: u64 = 0;
+    for (comps.items) |*comp| {
+        var d = c.openDir(io, &comp.name, .{ .iterate = true }) catch continue;
+        defer d.close(io);
+        var files = d.iterate();
+        while (files.next(io) catch null) |e| {
+            if (e.kind != .file) continue;
+            const stat = d.statFile(io, e.name, .{}) catch continue;
+            if ((try seen.getOrPut(gpa, @intCast(stat.inode))).found_existing) continue;
+            comp.bytes += stat.size;
+        }
+        total += comp.bytes;
+    }
+    var result: MaintainResult = .{ .scanned = @intCast(comps.items.len), .bytes = total };
+    const over = total > max_bytes;
+    const target = max_bytes - max_bytes / 4;
+    // Least recently used first.
+    var i = comps.items.len;
+    while (i > 0) {
+        i -= 1;
+        const comp = &comps.items[i];
+        const old = comp.used.durationTo(now).toNanoseconds() > max_unused_compilation_ns;
+        if (!old and (!over or total <= target)) break;
+        var buf: [64]u8 = undefined;
+        const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{&comp.name}) catch unreachable;
         const f = c.openFile(io, lock_path, .{ .mode = .read_write }) catch continue;
         defer f.close(io);
         if (!(f.tryLock(io, .exclusive) catch false)) continue;
-        c.deleteTree(io, e.name) catch {};
+        c.deleteTree(io, &comp.name) catch continue;
+        total -= comp.bytes;
+        result.deleted += 1;
     }
+    result.bytes_after = total;
+    return result;
 }
+
+pub const MaintainResult = struct { scanned: u32, deleted: u32 = 0, bytes: u64, bytes_after: u64 = 0 };
 
 /// Maps `sub_path` read-only, or returns null if it does not exist.
 pub fn mapFile(io: Io, dir: Io.Dir, sub_path: []const u8) !?Io.File.MemoryMap {
@@ -126,6 +200,48 @@ pub fn hash(seed: u64, bytes: []const u8) Hash {
     const lo = std.hash.Wyhash.hash(seed, bytes);
     const hi = std.hash.Wyhash.hash(seed ^ 0x9e3779b97f4a7c15, bytes);
     return @as(Hash, hi) << 64 | lo;
+}
+
+test "maintainCompilations evicts the least recently used unlocked directories past the limit" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const t = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try t.expectEqual(4 << 30, parseSize("4G"));
+    try t.expectEqual(512 << 20, parseSize("512m"));
+    try t.expectEqual(1000, parseSize("1000"));
+    try t.expectEqual(null, parseSize("4X"));
+    try t.expectEqual(null, parseSize(""));
+
+    // a is the least recently used, then b (held by a build), then c. a
+    // shares a file with c, which counts against c, the more recent.
+    const now = Io.Clock.real.now(io);
+    const names = [_]Hash{ 0xa, 0xb, 0xc };
+    var dirs: [3]Io.Dir = undefined;
+    for (names, &dirs, 0..) |key, *d, i| {
+        d.* = try compilationDir(io, tmp.dir, key);
+        const l = try lock(io, d.*);
+        l.close(io);
+        try d.writeFile(io, .{ .sub_path = "manifest", .data = &(@as([300]u8, @splat(0))) });
+        const age: i64 = @intCast(3 - i);
+        try d.setTimestamps(io, "lock", .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-age * std.time.ns_per_hour)) } });
+    }
+    defer for (dirs) |d| d.close(io);
+    try dirs[2].writeFile(io, .{ .sub_path = "shared.zsp", .data = &(@as([200]u8, @splat(0))) });
+    try dirs[2].hardLink("shared.zsp", dirs[0], "shared.zsp", io, .{});
+    const held = try dirs[1].openFile(io, "lock", .{ .mode = .read_write, .lock = .exclusive });
+    defer held.close(io);
+
+    // 1100 bytes against a limit of 900: down to 675 takes a (300) and,
+    // skipping b, c (500).
+    try t.expectEqual(2, (try maintainCompilations(gpa, io, tmp.dir, 900, false)).?.deleted);
+    var c = try tmp.dir.openDir(io, "zap/c", .{});
+    defer c.close(io);
+    for (names, [_]bool{ false, true, false }) |key, kept| {
+        const hex = std.fmt.hex(key);
+        if (kept) _ = try c.statFile(io, &hex, .{}) else try t.expectError(error.FileNotFound, c.statFile(io, &hex, .{}));
+    }
 }
 
 test {

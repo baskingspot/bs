@@ -38,6 +38,11 @@ gpa: Allocator,
 io: Io,
 /// `<global cache>`, for the store.
 global: Io.Dir,
+/// `<local cache>`, whose compilation directories `record` trims.
+local: Io.Dir,
+/// The size limit of the store and of the local cache's compilation
+/// directories (`ZAP_CACHE_MAX_SIZE`).
+max_bytes: u64 = cache.default_max_bytes,
 /// The compilation's directory, locked by `lock` until `close`.
 dir: Io.Dir,
 lock: Io.File,
@@ -79,9 +84,8 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
     for (args) |a| try id.print(gpa, "{s}\x00", .{a});
     const key = cache.hash(1, id.items);
 
-    var local = try Io.Dir.cwd().createDirPathOpen(io, dirs.local, .{});
-    defer local.close(io);
-    cache.trimCompilations(io, local) catch {};
+    const local = try Io.Dir.cwd().createDirPathOpen(io, dirs.local, .{});
+    errdefer local.close(io);
     const dir = try cache.compilationDir(io, local, key);
     errdefer dir.close(io);
     const lock = try cache.lock(io, dir);
@@ -91,6 +95,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .gpa = gpa,
         .io = io,
         .global = global,
+        .local = local,
         .dir = dir,
         .lock = lock,
         .store_seed = store_seed,
@@ -108,6 +113,7 @@ pub fn close(inc: *Incremental) void {
     }
     if (inc.prev) |*m| m.close(inc.gpa, inc.io);
     inc.global.close(inc.io);
+    inc.local.close(inc.io);
     inc.lock.close(inc.io);
     inc.dir.close(inc.io);
 }
@@ -132,9 +138,25 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(gpa);
     try m.changedInputs(gpa, io, &changed);
-    if (changed.items.len != 0) {
-        if (inc.timing) std.debug.print("cache: {d} inputs changed, first {s}\n", .{ changed.items.len, m.input(changed.items[0])[1] });
-        return false;
+    // Inputs whose stats changed but whose contents did not (touched,
+    // checked out again, or too new to trust when recorded) get their new
+    // stats in the manifest's log after the relink.
+    var restat: ?Manifest.Delta = null;
+    defer if (restat) |*d| d.deinit();
+    for (changed.items) |i| {
+        const in, const path = m.input(i);
+        const same = same: {
+            const src = Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch break :same false;
+            defer gpa.free(src);
+            break :same @as(Hash, @bitCast(Frontend.hashSource(src))) == in.content_hash;
+        };
+        if (!same) {
+            if (inc.timing) std.debug.print("cache: {d} inputs changed, first {s}\n", .{ changed.items.len, path });
+            return false;
+        }
+        const stat = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+        if (restat == null) restat = .init(gpa, m);
+        try restat.?.setInput(i, path, stat, in.content_hash, inc.build_start);
     }
     const t1 = now(io);
 
@@ -176,8 +198,11 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
             return err;
         },
     };
-    if (inc.timing) std.debug.print("cache: no input changed; relinked {d} atoms in {d:.2} ms (manifest and {d} stats {d:.2}, packs mapped and input gathered {d:.2}, link {d:.2})\n", .{
-        in.refs.len, ms(t0, now(io)), m.inputCount(), ms(t0, t1), ms(t1, t2), ms(t2, now(io)),
+    // Past the fold size, the inputs are rehashed until the next full build
+    // writes a new base, so that the log stays bounded.
+    if (restat) |*d| if (!m.shouldFold()) d.append(io, inc.dir) catch {};
+    if (inc.timing) std.debug.print("cache: no input changed; relinked {d} atoms in {d:.2} ms (manifest and {d} stats {d:.2}, {d} rehashed; packs mapped and input gathered {d:.2}, link {d:.2})\n", .{
+        in.refs.len, ms(t0, now(io)), m.inputCount(), ms(t0, t1), changed.items.len, ms(t1, t2), ms(t2, now(io)),
     });
     return true;
 }
@@ -610,8 +635,15 @@ pub fn startRecord(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *con
 /// Waits for the recording `startRecord` started, and if the link
 /// succeeded, makes it the compilation's manifest. A failed link discards
 /// it, so the next build starts from the last successful one. (Its store
-/// entries stay: they are valid results whichever way the link went.)
-pub fn finishRecord(inc: *Incremental, linked: bool) !void {
+/// entries stay: they are valid results whichever way the link went.) A
+/// recording that fails, on a full disk for one, costs the next build its
+/// reuse but not this build its success: it is reported as a warning.
+pub fn finishRecord(inc: *Incremental, linked: bool) void {
+    inc.finishRecordFallible(linked) catch |err|
+        std.log.warn("the cache did not record this build: {t}", .{err});
+}
+
+fn finishRecordFallible(inc: *Incremental, linked: bool) !void {
     const t0 = now(inc.io);
     var r = try inc.recording.?.await(inc.io);
     inc.recording = null;
@@ -621,7 +653,7 @@ pub fn finishRecord(inc: *Incremental, linked: bool) !void {
     try Manifest.Builder.place(&r.manifest, inc.io, inc.dir);
     // Base packs the new manifest does not name.
     var it = inc.dir.iterate();
-    while (try it.next(inc.io)) |e| {
+    while (it.next(inc.io) catch null) |e| {
         if (!std.mem.endsWith(u8, e.name, ".zsp")) continue;
         for (r.base_names) |name| {
             if (std.mem.eql(u8, name, e.name)) break;
@@ -652,6 +684,9 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     const gpa = inc.gpa;
     const io = inc.io;
     const t0 = now(io);
+    // Size limits, trimming, and the ZIR caches' garbage, beside the rest.
+    var maintaining = io.async(maintain, .{ inc, fe });
+    defer maintaining.await(io);
     const ip = &zcu.ip;
     var r: Recorder = .{ .gpa = gpa, .zcu = zcu };
     defer r.deinit();
@@ -755,6 +790,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     // builds the manifest, so that they are never all in memory.
     var store: Store = try .open(gpa, io, inc.global);
     defer store.close(gpa, io);
+    store.max_bytes = inc.max_bytes;
     var pack: Pack = try .open(io, inc.dir);
     defer pack.close(gpa, io);
     const where = try gpa.alloc(Where, r.nodes.items.len);
@@ -857,13 +893,15 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch continue;
         try b.addInput(path_buf.items, stat, @bitCast(f.content_hash), inc.build_start);
     }
-    // `@embedFile`d files are inputs too.
+    // `@embedFile`d files are inputs too. Every input's content hash is
+    // `Frontend.hashSource`'s, which `relinkIfUnchanged` checks a touched
+    // input against.
     for (zcu.embed_files.values()) |f| {
         const mod = fe.module(f.module);
         path_buf.clearRetainingCapacity();
         try path_buf.print(gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse mod.root_dir, std.fs.path.sep, f.sub_path });
         const stat = Io.Dir.cwd().statFile(io, path_buf.items, .{}) catch continue;
-        try b.addInput(path_buf.items, stat, f.hash, inc.build_start);
+        try b.addInput(path_buf.items, stat, @bitCast(Frontend.hashSource(f.bytes)), inc.build_start);
     }
     const t4 = now(io);
     var manifest = try b.writeUnplaced(io, inc.dir, pack.id);
@@ -890,6 +928,17 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
         ms(t3, t4),        ms(t4, t5),           ms(t5, t6),
     });
     return .{ .manifest = manifest, .base_names = names, .report = report };
+}
+
+/// The cache's upkeep that is not the store's (`Store.commit` maintains
+/// that): the local cache's size limit and trimming, and the ZIR caches'.
+/// Best effort.
+fn maintain(inc: *Incremental, fe: *const Frontend) void {
+    // A new compilation directory is how the local cache grows.
+    const t0 = now(inc.io);
+    const r = cache.maintainCompilations(inc.gpa, inc.io, inc.local, inc.max_bytes, inc.prev == null) catch null;
+    if (inc.timing) if (r) |m| std.debug.print("cache: local cache {d} directories, {d} MiB; deleted {d}, leaving {d} MiB, in {d:.2} ms beside the link\n", .{ m.scanned, m.bytes >> 20, m.deleted, m.bytes_after >> 20, ms(t0, now(inc.io)) });
+    fe.trimCaches();
 }
 
 /// Where a node's store entry is.

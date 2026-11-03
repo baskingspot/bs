@@ -696,6 +696,7 @@ compilation (see "Integration" below).
 <global cache>/zap/store/<32 hex>.zsp       Store packs (shared by all projects)
 <global cache>/zap/store/lock               flock held by maintenance (merging, trimming)
 <global cache>/zap/store/trim               when packs were last trimmed
+<local cache>/zap/c/trim                    when compilation directories were last scanned
 <local cache>/zap/c/<32 hex>/               one compilation, keyed by root, target, options, output
     lock          flock held by the build that owns the directory; its mtime is the last use
     <32 hex>.zsp  base packs: hard links to the store packs holding the last build's Atoms
@@ -729,12 +730,19 @@ compilation (see "Integration" below).
   decreasing `order` (when their newest entry was written) without a
   system call, so a key's newest entry wins, and `Entry.isValid` is the
   red-green check. Past 16 packs, `commit` merges, under a non-blocking
-  lock, the run of packs adjacent in lookup order with the fewest bytes,
-  down to 8, so lookup order is kept and large packs are rarely rewritten.
-  A pack records its last use in its mtime (refreshed at most hourly) and
-  is deleted after 5 days unused; a hit in a pack older than 2.5 days is
-  written again by the build's `commit`, so live entries move to young
-  packs and one used entry does not keep an old pack alive.
+  lock, the smallest packs, down to 8, into one that takes the lookup
+  position of the newest of them; an entry is dropped where an unmerged
+  pack newer than the entry's own holds the same key, so lookups still
+  find every key's newest copy. Large packs are never rewritten to merge
+  small ones: an earlier policy merged the cheapest run of adjacent packs,
+  which could include a 555 MB pack, and the rewrite cost its size again
+  in writes and, while compilation directories still linked the old
+  inode, in disk. A pack records its last use in its mtime (refreshed at
+  most hourly) and is deleted after 5 days unused, and while the packs
+  total more than the size limit (below) the least recently used are
+  deleted down to three quarters of it; a hit in a pack older than 2.5
+  days is written again by the build's `commit`, so live entries move to
+  young packs and one used entry does not keep an old pack alive.
 - **Manifest** (`cache/Manifest.zig`): nodes (80 bytes: key, result hash,
   `src_hash`, ranges into the edge, reverse-edge, and atom-reference
   arrays, `tag`), an open-addressing key table, edges, reverse edges, atom
@@ -931,8 +939,46 @@ it and can flush every CPU's TLB.
   changed must be reachable from them over the last manifest's reverse
   edges. This is the set an edit build will re-analyze.
 - `ZAP_CACHE_TIMING=1` prints the cache's time; `ZAP_CACHE=off` disables
-  it. Compilation directories unused for 5 days are deleted (they hold hard
-  links that keep trimmed store packs' space in use).
+  it.
+- **Size limits and trimming**. `ZAP_CACHE_MAX_SIZE` (bytes, or a number
+  with K, M, G, or T; default 4G) limits the global store's packs and,
+  separately, the local cache's compilation directories, each counted
+  once per inode. Past it, the least recently used go, down to three
+  quarters: store packs by mtime in `commit`'s maintenance, compilation
+  directories by their lock's mtime in `cache.maintainCompilations`,
+  skipping those a build holds. A store pack that a compilation directory
+  links keeps its space until the directory goes, which is why the local
+  limit counts the links. `record` runs the local scan beside the store
+  work, so builds do not wait for it: after a build that started a
+  directory (that is how the local cache grows) and otherwise at most
+  once a minute; a scan of 114 directories takes a few ms. Directories
+  unused for 5 days go regardless. The limit is enforced before a build
+  records, so the cache can pass it by the builds in flight: with a 1 GiB
+  limit, conformance runs by successive zap builds peak at 1.3 GB (the
+  x86_64 unit alone writes 630 MB). The ZIR caches are kept to the
+  sources their index names (one version per path) plus a day of edits
+  (`Frontend.trimCaches`, daily, also beside the store work).
+- **Why the cache grew without bound** (measured 2026-11-03): a
+  conformance run with an empty cache writes 696 MB that stays (653 MB in
+  114 compilation directories, of which the x86_64 unit's are a 555 MB
+  store pack and a 79 MB manifest; 56 MB of ZIR), and zap writes 1.36 GB
+  in all with the test binaries. A warm run writes 0 bytes to the cache.
+  But the store seed and compilation keys include zap's own identity,
+  so every rebuilt zap writes everything again under new names, and
+  nothing was deleted for 5 days: 650 MB per rebuild-and-run, about 40 GB
+  over a few days of compiler work. Merges could rewrite the large pack
+  (above), and the old compilation directories' hard links kept merged and
+  trimmed packs' space in use.
+- **Writes that fail** (a full disk, say) cost reuse, not the build: a
+  cache that cannot be opened is skipped with a warning; a recording that
+  fails is discarded with a warning, as a damaged pack falls back; a ZIR
+  cache write failure is reported once. The generated `builtin.zig` is the
+  exception: it must exist on disk to be compiled, as upstream's must.
+- **Touched but unchanged inputs**: when inputs' stats changed but their
+  contents' hashes did not (a touch, a checkout, or an input too new to
+  trust when recorded), the build still relinks, and their new stats go
+  into the manifest's log (not past the fold size). Before, that was a
+  full rebuild and a full manifest rewrite.
 - Not yet: re-analyzing only the predicted units after an edit (designed
   below); a layout hash for `type_layout` results (the type's identity
   stands in, so a layout change is caught through its `src_hash`, not its

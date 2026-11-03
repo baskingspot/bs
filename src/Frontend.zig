@@ -34,6 +34,9 @@ zig_lib_dir: []const u8,
 /// On-disk ZIR caches, indexed by `Module.cache`. Null entries (the default)
 /// keep everything in memory.
 caches: [2]?CacheDir = .{ null, null },
+/// Set at the first failure to write ZIR or an index to a cache, which
+/// alone is reported.
+zir_save_failed: std.atomic.Value(bool) = .init(false),
 files: std.ArrayList(File) = .empty,
 /// Maps `"<module index>:<sub_path>"` to its file.
 file_map: std.StringHashMapUnmanaged(File.Index) = .empty,
@@ -267,13 +270,19 @@ pub fn resolveCacheDirs(
 }
 
 /// Makes `loadAll` read and write ZIR in `dirs`. Call before `loadAll`.
+/// Trims the ZIR caches (`CacheDir.trim`). Best effort; `Incremental`
+/// runs it beside the link.
+pub fn trimCaches(fe: *const Frontend) void {
+    for (&fe.caches) |*c| if (c.*) |*cd| cd.trim(fe.gpa, fe.io) catch {};
+}
+
 pub fn enableCache(fe: *Frontend, dirs: CacheDirs) !void {
     const gpa = fe.gpa;
     const start = Io.Clock.awake.now(fe.io);
     defer fe.stats.open_ns = @intCast(start.durationTo(Io.Clock.awake.now(fe.io)).toNanoseconds());
-    fe.caches[@backingInt(CacheKind.local)] = try .open(gpa, fe.io, dirs.local);
+    fe.caches[@backingInt(CacheKind.local)] = try .openOrWarn(gpa, fe.io, dirs.local);
     if (!std.mem.eql(u8, dirs.local, dirs.global))
-        fe.caches[@backingInt(CacheKind.global)] = try .open(gpa, fe.io, dirs.global);
+        fe.caches[@backingInt(CacheKind.global)] = try .openOrWarn(gpa, fe.io, dirs.global);
     for (fe.modules.items) |*m| {
         m.abs_root_dir = Io.Dir.cwd().realPathFileAlloc(fe.io, m.root_dir, gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -294,6 +303,7 @@ fn cacheFor(fe: *Frontend, mod: *const Module) ?*CacheDir {
 ///   Written once to a temporary file and linked into place; never changed.
 /// - `index`: `IndexHeader` then `IndexEntry`s sorted by `path_hash`.
 ///   Rewritten through a temporary file when a build learns new stats.
+/// - `trim`: empty; its mtime is when `trim` last ran.
 const CacheDir = struct {
     dir: Io.Dir,
     /// Entries loaded at `open`, sorted by `path_hash`; they point into
@@ -303,13 +313,20 @@ const CacheDir = struct {
 
     const sub_path = "zap" ++ std.fs.path.sep_str ++ "zir";
 
-    fn open(gpa: Allocator, io: Io, path: []const u8) !CacheDir {
+    /// Opens the cache in `path`, or warns and returns null if it cannot
+    /// (a full disk, for one): the build goes on without it.
+    fn openOrWarn(gpa: Allocator, io: Io, path: []const u8) Allocator.Error!?CacheDir {
         const full = try std.fs.path.join(gpa, &.{ path, sub_path });
         defer gpa.free(full);
-        const dir = Io.Dir.cwd().openDir(io, full, .{}) catch |err| switch (err) {
-            error.FileNotFound => Io.Dir.cwd().createDirPathOpen(io, full, .{}) catch |e|
-                std.process.fatal("unable to create cache directory '{s}': {t}", .{ full, e }),
-            else => std.process.fatal("unable to open cache directory '{s}': {t}", .{ full, err }),
+        const dir = Io.Dir.cwd().openDir(io, full, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => Io.Dir.cwd().createDirPathOpen(io, full, .{ .open_options = .{ .iterate = true } }) catch |e| {
+                std.log.warn("unable to create cache directory '{s}': {t}", .{ full, e });
+                return null;
+            },
+            else => {
+                std.log.warn("unable to open cache directory '{s}': {t}", .{ full, err });
+                return null;
+            },
         };
         var cd: CacheDir = .{ .dir = dir, .index = &.{}, .index_bytes = &.{} };
         cd.loadIndex(gpa, io) catch |err| switch (err) {
@@ -323,6 +340,41 @@ const CacheDir = struct {
     fn deinit(cd: *CacheDir, gpa: Allocator, io: Io) void {
         gpa.free(cd.index_bytes);
         cd.dir.close(io);
+    }
+
+    /// Deletes the ZIR that the index on disk does not name and that is
+    /// more than a day old, and other files left that long (temporary files
+    /// of interrupted builds), at most once a day. That keeps the cache to
+    /// the sources last seen at each path, plus a day of edits. A build
+    /// whose index entry names deleted ZIR lowers the file again.
+    fn trim(cd: *const CacheDir, gpa: Allocator, io: Io) !void {
+        const now = Io.Clock.real.now(io);
+        if (cd.dir.statFile(io, "trim", .{})) |stat| {
+            if (stat.mtime.durationTo(now).toNanoseconds() < std.time.ns_per_day) return;
+        } else |_| {}
+        try cd.dir.writeFile(io, .{ .sub_path = "trim", .data = "" });
+        var named: std.AutoHashMapUnmanaged(Hash, void) = .empty;
+        defer named.deinit(gpa);
+        {
+            var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_bytes = &.{} };
+            try index.loadIndex(gpa, io);
+            defer gpa.free(index.index_bytes);
+            try named.ensureTotalCapacity(gpa, @intCast(index.index.len));
+            for (index.index) |e| named.putAssumeCapacity(e.content_hash, {});
+        }
+        var it = cd.dir.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind != .file or std.mem.eql(u8, e.name, "index") or std.mem.eql(u8, e.name, "trim")) continue;
+            var hash: Hash = undefined;
+            if (e.name.len == 2 * hash.len) {
+                if (std.fmt.hexToBytes(&hash, e.name)) |_| {
+                    if (named.contains(hash)) continue;
+                } else |_| {}
+            }
+            const stat = cd.dir.statFile(io, e.name, .{}) catch continue;
+            if (stat.mtime.durationTo(now).toNanoseconds() < std.time.ns_per_day) continue;
+            cd.dir.deleteFile(io, e.name) catch {};
+        }
     }
 
     fn loadIndex(cd: *CacheDir, gpa: Allocator, io: Io) !void {
@@ -585,8 +637,9 @@ comptime {
 
 /// Names cached ZIR: two seeded Wyhash passes, salted with the Zig version
 /// whose AstGen produced it. Not cryptographic; twice as fast as Blake3,
-/// which took 5% of a cold build's CPU time.
-fn hashSource(src: []const u8) Hash {
+/// which took 5% of a cold build's CPU time. Also the content hash of the
+/// cache manifest's source inputs (`File.content_hash`).
+pub fn hashSource(src: []const u8) Hash {
     const salt = comptime std.hash.Wyhash.hash(0, "zap zir " ++ builtin.zig_version_string);
     const lo = std.hash.Wyhash.hash(salt, src);
     const hi = std.hash.Wyhash.hash(salt ^ 0x9e3779b97f4a7c15, src);
@@ -1007,8 +1060,8 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
                 return a.path_hash < b.path_hash;
             }
         }.lessThan);
-        cd.writeIndex(gpa, io, updates.items) catch |err|
-            std.log.warn("unable to write ZIR cache index: {t}", .{err});
+        cd.writeIndex(gpa, io, updates.items) catch |err| if (!fe.zir_save_failed.swap(true, .monotonic))
+            std.log.warn("unable to write ZIR cache index: {t}; not reporting further failures", .{err});
     }
 
     const end = Io.Clock.awake.now(io);
@@ -1115,7 +1168,8 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {},
             }
-        } else |err| std.log.warn("unable to cache ZIR of '{s}': {t}", .{ f.display_path, err });
+        } else |err| if (!fe.zir_save_failed.swap(true, .monotonic))
+            std.log.warn("unable to cache ZIR of '{s}': {t}; not reporting further failures", .{ f.display_path, err });
     }
     // No cache to map it from: copy it out of the arena.
     var insts = try zir.instructions.toMultiArrayList().clone(gpa);
