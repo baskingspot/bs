@@ -42,6 +42,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const arena = init.arena.allocator();
+    direct_mode = init.environ_map.get("DIRECT") != null;
     const cwd = Io.Dir.cwd();
     cwd.deleteTree(io, work_path) catch {};
     const work = try cwd.createDirPathOpen(io, work_path, .{});
@@ -318,6 +319,7 @@ pub fn main(init: std.process.Init) !void {
 /// the atoms with interned debug paths, and `Elf.emit` with the manifest's
 /// numbered symbols. Checks the output against `expected`, if given.
 fn relinkOnce(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, decoded: []Atom, decoded_debug: *std.ArrayList(Atom.Debug), entry: Atom.SymbolKey, expected: ?[]const u8) ![4]u64 {
+    if (direct_mode) return relinkDirect(gpa, io, dir, entry, expected);
     const t0 = now(io);
     var m = (try Manifest.open(gpa, io, dir)).?;
     defer m.close(gpa, io);
@@ -342,6 +344,41 @@ fn relinkOnce(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, decoded: []Atom, deco
     defer gpa.free(out);
     const t3 = now(io);
     if (expected) |e| if (!std.mem.eql(u8, out, e)) @panic("numbered relink from the pack differs");
+    return .{ ns(t0, t1), ns(t1, t2), ns(t2, t3), ns(t0, t3) };
+}
+
+var direct_mode = false;
+
+fn relinkDirect(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, entry: Atom.SymbolKey, expected: ?[]const u8) ![4]u64 {
+    const t0 = now(io);
+    var m = (try Manifest.open(gpa, io, dir)).?;
+    defer m.close(gpa, io);
+    var p: Pack = try .open(io, dir);
+    defer p.close(gpa, io);
+    if (p.id != m.pack_id) @panic("pack id mismatch");
+    const t1 = now(io);
+    const in = try m.linkInput(gpa);
+    var names: [512][]const u8 = undefined;
+    for (names[0..m.fileCount()], 0..) |*f, i| f.* = m.file(@intCast(i));
+    var mems: [64][*]align(16) const u8 = undefined;
+    mems[0] = p.map.memory.ptr;
+    for (p.bases.items, 1..) |b, i| mems[i] = b.memory.ptr;
+    var debug_atoms: std.ArrayList(u32) = .empty;
+    defer debug_atoms.deinit(gpa);
+    try debug_atoms.ensureTotalCapacity(gpa, in.debug_files.len);
+    for (in.debug_files, 0..) |f, i| if (f != Manifest.no_file) debug_atoms.appendAssumeCapacity(@intCast(i));
+    const input: Pack.LinkAtoms = .{ .mems = mems[0 .. 1 + p.bases.items.len], .refs = in.refs, .debug_atoms = debug_atoms.items, .files = .{ .of = in.debug_files, .names = names[0..m.fileCount()] } };
+    const t2 = now(io);
+    var values: [n_errors]Elf.NumberedValue = undefined;
+    for (&values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };
+    const out = try Elf.emitInput(gpa, io, input, .{
+        .entry = entry,
+        .comp_dir = "/bench",
+        .symbols = .{ .atoms = in.numbered, .targets = in.targets, .values = &values, .entry = m.entry_symbol, .len = m.symbolLen() },
+    });
+    defer gpa.free(out);
+    const t3 = now(io);
+    if (expected) |e| if (!std.mem.eql(u8, out, e)) @panic("direct relink from the pack differs");
     return .{ ns(t0, t1), ns(t1, t2), ns(t2, t3), ns(t0, t3) };
 }
 

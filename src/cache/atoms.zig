@@ -178,6 +178,42 @@ pub fn decode(bytes: []align(alignment) const u8) DecodeError!Decoded {
     }, .debug = debug, .len = h.len };
 }
 
+/// `decode` without checks, for records already validated.
+pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug: ?Atom.Debug } {
+    const h: *const Header = @ptrCast(rec);
+    var off: usize = @sizeOf(Header);
+    const targets: [*]const Atom.SymbolKey = @ptrCast(@alignCast(rec + off));
+    off += 16 * @as(usize, h.targets_len);
+    const relocs: [*]const Atom.Reloc = @ptrCast(@alignCast(rec + off));
+    off += @sizeOf(Atom.Reloc) * @as(usize, h.relocs_len);
+    var dh: DebugHeader = undefined;
+    if (h.has_debug) {
+        dh = std.mem.bytesToValue(DebugHeader, rec[off..][0..@sizeOf(DebugHeader)]);
+        off += @sizeOf(DebugHeader);
+    }
+    const bytes = rec[off..][0..h.bytes_len];
+    off += h.bytes_len;
+    const name = rec[off..][0..h.name_len];
+    off += h.name_len;
+    const debug: ?Atom.Debug = if (h.has_debug) d: {
+        const file = rec[off..][0..dh.file_len];
+        off += dh.file_len;
+        const dname = rec[off..][0..dh.name_len];
+        off += dh.name_len;
+        break :d .{ .file = file, .name = dname, .base_line = dh.base_line, .lines = rec[off..][0..dh.lines_len], .frame = @fromBackingInt(@intCast(h.debug_frame)) };
+    } else null;
+    return .{ .atom = .{
+        .key = h.key,
+        .name = name,
+        .section = @fromBackingInt(@intCast(h.section)),
+        .alignment = @fromBackingInt(@intCast(h.alignment)),
+        .bytes = bytes,
+        .zero_fill = @as(u64, h.zero_fill_hi) << 32 | h.zero_fill_lo,
+        .targets = targets[0..h.targets_len],
+        .relocs = relocs[0..h.relocs_len],
+    }, .debug = debug };
+}
+
 fn take(rec: []const u8, off: *usize, len: usize) []const u8 {
     defer off.* += len;
     return rec[off.*..][0..len];

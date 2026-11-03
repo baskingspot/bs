@@ -139,11 +139,55 @@ pub const Error = Allocator.Error || std.Io.Cancelable || error{
 /// overwritten in place when that is safe (see `ReusedOutput`), which
 /// saves the kernel allocating and zeroing every page again.
 pub fn link(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, atoms: []const Atom, options: Options) !void {
+    return linkInput(gpa, io, dir, sub_path, AtomSlice{ .atoms = atoms, .debug_entries = options.debug }, options);
+}
+
+/// `link` with the atoms and their debug info read from `input` (see
+/// `AtomSlice` for the interface); `options.debug` is not used.
+pub fn linkInput(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, input: anytype, options: Options) !void {
     var out: ReusedOutput = .{ .dir = dir, .sub_path = sub_path };
     defer out.close(io);
     errdefer dir.deleteFile(io, sub_path) catch {};
-    try build(gpa, io, atoms, options, &out);
+    try build(gpa, io, input, options, &out);
 }
+
+/// The linker's input: atoms, by index in link order, and their debug
+/// entries, sorted by atom. Linking reads each atom several times, so
+/// `atom` must be cheap; its slices must stay valid until the link
+/// returns. Any type with these declarations works, such as the cache's
+/// mapped packs, which build each `Atom` from its record's header.
+pub const AtomSlice = struct {
+    atoms: []const Atom,
+    debug_entries: []const Atom.Debug,
+
+    pub inline fn len(s: AtomSlice) usize {
+        return s.atoms.len;
+    }
+    pub inline fn atom(s: AtomSlice, i: usize) Atom {
+        return s.atoms[i];
+    }
+    pub inline fn debugLen(s: AtomSlice) usize {
+        return s.debug_entries.len;
+    }
+    pub inline fn debug(s: AtomSlice, j: usize) Atom.Debug {
+        return s.debug_entries[j];
+    }
+    /// Atom `i` is copied soon.
+    pub inline fn prefetch(s: AtomSlice, i: usize, comptime keys: bool) void {
+        const n = &s.atoms[i];
+        prefetchSlice(u8, n.bytes[0..@min(n.bytes.len, 64)]);
+        if (keys) prefetchSlice(SymbolKey, n.targets);
+        prefetchSlice(Atom.Reloc, n.relocs);
+        prefetchSlice(u8, n.name);
+    }
+    /// Debug entry `j` is written soon.
+    pub inline fn prefetchDebug(s: AtomSlice, j: usize) void {
+        const n = &s.debug_entries[j];
+        prefetchSlice(u8, n.lines);
+        prefetchSlice(u8, n.name);
+        @prefetch(&s.atoms[n.atom].bytes.len, .{});
+    }
+};
 
 /// Overwrites the old output in place if it is a regular executable file
 /// with one link, not running (Linux refuses to open a running executable
@@ -216,7 +260,16 @@ const ReusedOutput = struct {
 pub fn emit(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options) Error![]u8 {
     var out: MemoryOutput = .{ .gpa = gpa };
     errdefer gpa.free(out.buf);
-    try build(gpa, io, atoms, options, &out);
+    try build(gpa, io, AtomSlice{ .atoms = atoms, .debug_entries = options.debug }, options, &out);
+    return out.buf;
+}
+
+/// `emit` with the atoms and their debug info read from `input` (see
+/// `AtomSlice`).
+pub fn emitInput(gpa: Allocator, io: std.Io, input: anytype, options: Options) Error![]u8 {
+    var out: MemoryOutput = .{ .gpa = gpa };
+    errdefer gpa.free(out.buf);
+    try build(gpa, io, input, options, &out);
     return out.buf;
 }
 
@@ -309,7 +362,9 @@ fn shName(comptime name: []const u8) u32 {
 ///     keep their input order within a section.
 ///  3. Copy: each chunk copies its atoms' bytes, applies their relocations,
 ///     and writes their symbols; chunks write disjoint parts of the output.
-fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out: anytype) !void {
+fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anytype) !void {
+    const Link = LinkOf(@TypeOf(input));
+    const n_atoms = input.len();
     var unused_diag: Diagnostic = .{};
     const diag = options.diag orelse &unused_diag;
     const text = @backingInt(Atom.Section.text);
@@ -319,47 +374,48 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const tdata = @backingInt(Atom.Section.tdata);
     const tbss = @backingInt(Atom.Section.tbss);
 
-    const n_chunks = std.math.divCeil(usize, atoms.len, chunk_len) catch unreachable;
+    const n_chunks = std.math.divCeil(usize, n_atoms, chunk_len) catch unreachable;
     const n_threads = @max(1, @min(n_chunks, options.threads orelse std.Thread.getCpuCount() catch 1));
     // Every partition scans all atoms, so use no more than there are threads.
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
     const numbered = options.symbols;
-    if (numbered) |s| if (s.atoms.len != atoms.len or s.entry >= s.len) return error.InvalidSymbols;
-    var symbols: SymbolTable = if (numbered == null) try .init(atoms.len, n_partitions) else .empty;
+    if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len) return error.InvalidSymbols;
+    var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
     defer symbols.deinit();
     // With numbered symbols, each number's address or value.
     const addrs = try gpa.alloc(u32, if (numbered) |s| s.len else 0);
     defer gpa.free(addrs);
-    const places = try gpa.alloc(Place, atoms.len);
+    const places = try gpa.alloc(Place, n_atoms);
     defer gpa.free(places);
-    const keys = try gpa.alloc(SymbolKey, if (numbered == null) atoms.len else 0);
+    const keys = try gpa.alloc(SymbolKey, if (numbered == null) n_atoms else 0);
     defer gpa.free(keys);
     populate(std.mem.sliceAsBytes(places));
     populate(std.mem.sliceAsBytes(keys));
     const chunks = try gpa.alloc(Chunk, n_chunks);
     defer gpa.free(chunks);
-    const debug = options.debug;
-    const n_debug_chunks = std.math.divCeil(usize, debug.len, chunk_len) catch unreachable;
+    const n_debug = input.debugLen();
+    const n_debug_chunks = std.math.divCeil(usize, n_debug, chunk_len) catch unreachable;
     const debug_chunks = try gpa.alloc(DebugChunk, n_debug_chunks);
     defer gpa.free(debug_chunks);
     for (debug_chunks) |*c| c.files = .empty;
     defer for (debug_chunks) |*c| c.files.deinit(gpa);
-    const file_of = try gpa.alloc(u32, debug.len);
+    const file_of = try gpa.alloc(u32, n_debug);
     defer gpa.free(file_of);
     // Atom chunks, then debug chunks.
     const failures = try gpa.alloc(?Failure, @max(n_chunks + n_debug_chunks, n_partitions));
     defer gpa.free(failures);
     var l: Link = .{
         .gpa = gpa,
-        .debug = debug,
+        .input = input,
+        .n_atoms = n_atoms,
+        .n_debug = n_debug,
         .debug_chunks = debug_chunks,
         .file_of = file_of,
         .n_partitions = n_partitions,
         .n_resolve_tasks = if (numbered == null) n_partitions else n_chunks,
         .numbered = numbered,
         .addrs = addrs,
-        .atoms = atoms,
         .places = places,
         .keys = keys,
         .chunks = chunks,
@@ -421,7 +477,7 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const has_rx = sizes[text] > 0;
     const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
     const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls;
-    const has_cfi = debug.len > 0;
+    const has_cfi = n_debug > 0;
     const phnum: u16 = 2 + @as(u16, @intFromBool(has_rx)) + @intFromBool(has_rw) + @intFromBool(has_cfi) + @intFromBool(has_tls);
     const headers_end: u64 = @sizeOf(elf.Elf64.Ehdr) + phnum * @sizeOf(elf.Elf64.Phdr);
     var starts: [n_sections]u64 = undefined;
@@ -429,9 +485,9 @@ fn build(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options, out:
     const rodata_end = starts[rodata] + sizes[rodata];
     // Room for an FDE per debug entry, and the terminator.
     const eh_off = std.mem.alignForward(u64, rodata_end, 8);
-    const eh_room = if (has_cfi) Dwarf.cie.len + debug.len * Dwarf.fde_size + 4 else 0;
+    const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.fde_size + 4 else 0;
     const hdr_off = eh_off + eh_room;
-    const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + debug.len * Dwarf.eh_frame_hdr_entry_size else 0;
+    const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + n_debug * Dwarf.eh_frame_hdr_entry_size else 0;
     const r_end = if (has_cfi) hdr_off + hdr_room else rodata_end;
     const rx_start = if (has_rx) std.mem.alignForward(u64, r_end, page_size) else r_end;
     starts[text] = aligns[text].forward(rx_start);
@@ -717,394 +773,393 @@ const DebugChunk = struct {
 
 const Failure = struct { atom: usize, err: Error, diag: Diagnostic };
 
-/// State shared by the threads of `emit`.
-const Link = struct {
-    gpa: Allocator,
-    debug: []const Atom.Debug,
-    debug_chunks: []DebugChunk,
-    /// Index into its chunk's `files` of each debug entry, or `skip`.
-    file_of: []u32,
-    n_partitions: usize,
-    /// `resolveAddrs` tasks: partitions of `symbols`, or with numbered
-    /// symbols, chunks.
-    n_resolve_tasks: usize,
-    numbered: ?Symbols,
-    /// With numbered symbols, where each is (see `unset`).
-    addrs: []u32,
-    atoms: []const Atom,
-    places: []Place,
-    /// The atoms' keys, packed, so that every partition can scan them.
-    keys: []SymbolKey,
-    chunks: []Chunk,
-    /// Maps a key to the index of the atom kept for it, and from
-    /// `resolveAddrs` on to its address.
-    symbols: *SymbolTable,
-    /// One slot per task. A phase reports the failure of the lowest atom,
-    /// whatever the thread timing.
-    failures: []?Failure,
-    // Set before `copy`.
-    values: *const SymbolTable = undefined,
-    buf: []u8 = undefined,
-    base: u64 = undefined,
-    section_addrs: [n_sections]u64 = undefined,
-    /// The TLS segment's addresses, and the thread pointer's place
-    /// relative to them.
-    tls: Tls = undefined,
-    shndx: [n_sections]u16 = undefined,
-    /// Subtracted from addresses for symbol values: thread-locals' values
-    /// are offsets in the TLS segment.
-    sym_bias: [n_sections]u64 = undefined,
-    symtab_off: u64 = undefined,
-    strtab_off: u64 = undefined,
-    /// `max_targets` addresses per thread.
-    resolved: []u64 = undefined,
-    max_targets: usize = undefined,
-    /// Where the chunks' subprogram entries and line sequences start.
-    info_off: u64 = undefined,
-    line_off: u64 = undefined,
-    /// File offsets of .eh_frame and .eh_frame_hdr.
-    eh_off: u64 = undefined,
-    hdr_off: u64 = undefined,
+/// State shared by the threads of `emit`, reading atoms from an `Input`
+/// (see `AtomSlice`).
+fn LinkOf(comptime Input: type) type {
+    return struct {
+        const Link = @This();
+        gpa: Allocator,
+        input: Input,
+        n_atoms: usize,
+        n_debug: usize,
+        debug_chunks: []DebugChunk,
+        /// Index into its chunk's `files` of each debug entry, or `skip`.
+        file_of: []u32,
+        n_partitions: usize,
+        /// `resolveAddrs` tasks: partitions of `symbols`, or with numbered
+        /// symbols, chunks.
+        n_resolve_tasks: usize,
+        numbered: ?Symbols,
+        /// With numbered symbols, where each is (see `unset`).
+        addrs: []u32,
+        places: []Place,
+        /// The atoms' keys, packed, so that every partition can scan them.
+        keys: []SymbolKey,
+        chunks: []Chunk,
+        /// Maps a key to the index of the atom kept for it, and from
+        /// `resolveAddrs` on to its address.
+        symbols: *SymbolTable,
+        /// One slot per task. A phase reports the failure of the lowest atom,
+        /// whatever the thread timing.
+        failures: []?Failure,
+        // Set before `copy`.
+        values: *const SymbolTable = undefined,
+        buf: []u8 = undefined,
+        base: u64 = undefined,
+        section_addrs: [n_sections]u64 = undefined,
+        /// The TLS segment's addresses, and the thread pointer's place
+        /// relative to them.
+        tls: Tls = undefined,
+        shndx: [n_sections]u16 = undefined,
+        /// Subtracted from addresses for symbol values: thread-locals' values
+        /// are offsets in the TLS segment.
+        sym_bias: [n_sections]u64 = undefined,
+        symtab_off: u64 = undefined,
+        strtab_off: u64 = undefined,
+        /// `max_targets` addresses per thread.
+        resolved: []u64 = undefined,
+        max_targets: usize = undefined,
+        /// Where the chunks' subprogram entries and line sequences start.
+        info_off: u64 = undefined,
+        line_off: u64 = undefined,
+        /// File offsets of .eh_frame and .eh_frame_hdr.
+        eh_off: u64 = undefined,
+        hdr_off: u64 = undefined,
 
-    fn check(l: *Link, diag: *Diagnostic) Error!void {
-        var first: ?Failure = null;
-        for (l.failures) |f| if (f) |failure| {
-            if (first == null or failure.atom < first.?.atom) first = failure;
-        };
-        @memset(l.failures, null);
-        const failure = first orelse return;
-        diag.* = failure.diag;
-        return failure.err;
-    }
+        fn check(l: *Link, diag: *Diagnostic) Error!void {
+            var first: ?Failure = null;
+            for (l.failures) |f| if (f) |failure| {
+                if (first == null or failure.atom < first.?.atom) first = failure;
+            };
+            @memset(l.failures, null);
+            const failure = first orelse return;
+            diag.* = failure.diag;
+            return failure.err;
+        }
 
-    fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
-        if (l.failures[task] == null) l.failures[task] = .{ .atom = atom, .err = err, .diag = diag };
-    }
+        fn fail(l: *Link, task: usize, atom: usize, err: Error, diag: Diagnostic) void {
+            if (l.failures[task] == null) l.failures[task] = .{ .atom = atom, .err = err, .diag = diag };
+        }
 
-    fn atomAddr(l: *const Link, index: u64) u64 {
-        const p = l.places[index];
-        return l.section_addrs[p.section] + l.chunks[index / chunk_len].bases[p.section] + p.offset;
-    }
+        fn atomAddr(l: *const Link, index: u64) u64 {
+            const p = l.places[index];
+            return l.section_addrs[p.section] + l.chunks[index / chunk_len].bases[p.section] + p.offset;
+        }
 
-    /// Replaces atom indices with addresses in one partition of `symbols`,
-    /// so that resolving a relocation target is one lookup. With numbered
-    /// symbols, sets the addresses of one chunk's atoms' numbers instead.
-    fn resolveAddrs(l: *Link, task: usize, _: usize) void {
-        const s = l.numbered orelse {
-            for (l.symbols.partitionEntries(task)) |*e| {
-                if (e.used) e.value = l.atomAddr(e.value);
+        /// Replaces atom indices with addresses in one partition of `symbols`,
+        /// so that resolving a relocation target is one lookup. With numbered
+        /// symbols, sets the addresses of one chunk's atoms' numbers instead.
+        fn resolveAddrs(l: *Link, task: usize, _: usize) void {
+            const s = l.numbered orelse {
+                for (l.symbols.partitionEntries(task)) |*e| {
+                    if (e.used) e.value = l.atomAddr(e.value);
+                }
+                return;
+            };
+            const begin = task * chunk_len;
+            const end = @min(l.n_atoms, begin + chunk_len);
+            for (s.atoms[begin..end], begin..) |n, i| {
+                if (n.symbol >= l.addrs.len) return l.fail(task, i, error.InvalidSymbols, .{ .atom = l.input.atom(i).name });
+                l.addrs[n.symbol] = @intCast(l.atomAddr(i) - l.base);
             }
-            return;
-        };
-        const begin = task * chunk_len;
-        const end = @min(l.atoms.len, begin + chunk_len);
-        for (s.atoms[begin..end], begin..) |n, i| {
-            if (n.symbol >= l.addrs.len) return l.fail(task, i, error.InvalidSymbols, .{ .atom = l.atoms[i].name });
-            l.addrs[n.symbol] = @intCast(l.atomAddr(i) - l.base);
         }
-    }
 
-    /// The address or value an `addrs` entry stands for.
-    fn numberedAddr(l: *const Link, e: u32) ?u64 {
-        if (e < value_tag) return l.base + e;
-        if (e == unset) return null;
-        return l.numbered.?.values[e - value_tag].value;
-    }
-
-    fn populateOutput(l: *Link, part: usize, _: usize) void {
-        const begin = part * populate_len;
-        populate(l.buf[begin..@min(l.buf.len, begin + populate_len)]);
-    }
-
-    fn gatherKeys(l: *Link, chunk: usize, _: usize) void {
-        const begin = chunk * chunk_len;
-        const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
-        for (atoms, l.keys[begin..][0..atoms.len]) |*a, *k| k.* = a.key;
-    }
-
-    /// Inserts the keys of one partition, in input order, so the first atom
-    /// with a key is the one kept. Writes nothing but the partition, which
-    /// keeps threads off each other's cache lines.
-    fn dedup(l: *Link, partition: usize, _: usize) void {
-        l.symbols.populate(partition);
-        const keys = l.keys;
-        for (keys, 0..) |key, i| {
-            if (i + 16 < keys.len and l.symbols.partition(keys[i + 16]) == partition) l.symbols.prefetch(keys[i + 16]);
-            if (l.symbols.partition(key) != partition) continue;
-            const e = l.symbols.getOrPut(key);
-            if (!e.used) e.* = .{ .key = key, .value = i, .used = true };
+        /// The address or value an `addrs` entry stands for.
+        fn numberedAddr(l: *const Link, e: u32) ?u64 {
+            if (e < value_tag) return l.base + e;
+            if (e == unset) return null;
+            return l.numbered.?.values[e - value_tag].value;
         }
-    }
 
-    /// Lays out one chunk's atoms within each section, as if the chunk's
-    /// part of every section started at 0.
-    fn layOutKeyed(l: *Link, chunk: usize, _: usize) void {
-        l.layOut(chunk, false);
-    }
+        fn populateOutput(l: *Link, part: usize, _: usize) void {
+            const begin = part * populate_len;
+            populate(l.buf[begin..@min(l.buf.len, begin + populate_len)]);
+        }
 
-    fn layOutNumbered(l: *Link, chunk: usize, _: usize) void {
-        l.layOut(chunk, true);
-    }
+        fn gatherKeys(l: *Link, chunk: usize, _: usize) void {
+            const begin = chunk * chunk_len;
+            const end = @min(l.n_atoms, begin + chunk_len);
+            for (l.keys[begin..end], begin..) |*k, i| k.* = l.input.atom(i).key;
+        }
 
-    /// The key-based and numbered paths are compiled apart, so that each
-    /// is as tight as if it were the only one.
-    fn layOut(l: *Link, chunk: usize, comptime numbered: bool) void {
-        const begin = chunk * chunk_len;
-        const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
-        var c: Chunk = .{
-            .sizes = @splat(0),
-            .aligns = @splat(.@"1"),
-            .n_syms = 0,
-            .str_len = 0,
-            .max_targets = 0,
-            .bases = undefined,
-            .lead_gaps = undefined,
-            .sym = undefined,
-            .str = undefined,
-        };
-        defer l.chunks[chunk] = c;
-        for (atoms, l.places[begin..][0..atoms.len], begin..) |*a, *p, i| {
-            if (!numbered) {
-                if (i + 16 < l.keys.len) l.symbols.prefetch(l.keys[i + 16]);
-                const kept = l.symbols.get(l.keys[i]).?;
-                if (kept != i) {
-                    if (!identical(&l.atoms[kept], a)) l.fail(chunk, i, error.DuplicateSymbol, .{ .atom = a.name, .target = a.key });
-                    p.* = .duplicate;
+        /// Inserts the keys of one partition, in input order, so the first atom
+        /// with a key is the one kept. Writes nothing but the partition, which
+        /// keeps threads off each other's cache lines.
+        fn dedup(l: *Link, partition: usize, _: usize) void {
+            l.symbols.populate(partition);
+            const keys = l.keys;
+            for (keys, 0..) |key, i| {
+                if (i + 16 < keys.len and l.symbols.partition(keys[i + 16]) == partition) l.symbols.prefetch(keys[i + 16]);
+                if (l.symbols.partition(key) != partition) continue;
+                const e = l.symbols.getOrPut(key);
+                if (!e.used) e.* = .{ .key = key, .value = i, .used = true };
+            }
+        }
+
+        /// Lays out one chunk's atoms within each section, as if the chunk's
+        /// part of every section started at 0.
+        fn layOutKeyed(l: *Link, chunk: usize, _: usize) void {
+            l.layOut(chunk, false);
+        }
+
+        fn layOutNumbered(l: *Link, chunk: usize, _: usize) void {
+            l.layOut(chunk, true);
+        }
+
+        /// The key-based and numbered paths are compiled apart, so that each
+        /// is as tight as if it were the only one.
+        fn layOut(l: *Link, chunk: usize, comptime numbered: bool) void {
+            const begin = chunk * chunk_len;
+            const end = @min(l.n_atoms, begin + chunk_len);
+            var c: Chunk = .{
+                .sizes = @splat(0),
+                .aligns = @splat(.@"1"),
+                .n_syms = 0,
+                .str_len = 0,
+                .max_targets = 0,
+                .bases = undefined,
+                .lead_gaps = undefined,
+                .sym = undefined,
+                .str = undefined,
+            };
+            defer l.chunks[chunk] = c;
+            for (l.places[begin..end], begin..) |*p, i| {
+                const a = &l.input.atom(i);
+                if (!numbered) {
+                    if (i + 16 < l.keys.len) l.symbols.prefetch(l.keys[i + 16]);
+                    const kept = l.symbols.get(l.keys[i]).?;
+                    if (kept != i) {
+                        if (!identical(&l.input.atom(kept), a)) l.fail(chunk, i, error.DuplicateSymbol, .{ .atom = a.name, .target = a.key });
+                        p.* = .duplicate;
+                        continue;
+                    }
+                }
+                if (a.section.isZeroFill() and (a.bytes.len != 0 or a.relocs.len != 0)) {
+                    l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
                     continue;
                 }
+                const s = @backingInt(a.section);
+                const off = a.alignment.forward(c.sizes[s]);
+                p.* = .{
+                    .offset = std.math.cast(u39, off) orelse {
+                        l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
+                        continue;
+                    },
+                    .gap = std.math.cast(u22, off - c.sizes[s]) orelse {
+                        l.fail(chunk, i, error.AlignmentTooLarge, .{ .atom = a.name });
+                        continue;
+                    },
+                    .section = @intCast(s),
+                };
+                c.sizes[s] = off + a.size();
+                c.aligns[s] = c.aligns[s].max(a.alignment);
+                c.n_syms += 1;
+                if (a.name.len > 0) c.str_len += @intCast(a.name.len + 1);
+                c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
             }
-            if (a.section.isZeroFill() and (a.bytes.len != 0 or a.relocs.len != 0)) {
-                l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
-                continue;
-            }
-            const s = @backingInt(a.section);
-            const off = a.alignment.forward(c.sizes[s]);
-            p.* = .{
-                .offset = std.math.cast(u39, off) orelse {
-                    l.fail(chunk, i, error.OutOfMemory, .{ .atom = a.name });
-                    continue;
-                },
-                .gap = std.math.cast(u22, off - c.sizes[s]) orelse {
-                    l.fail(chunk, i, error.AlignmentTooLarge, .{ .atom = a.name });
-                    continue;
-                },
-                .section = @intCast(s),
-            };
-            c.sizes[s] = off + a.size();
-            c.aligns[s] = c.aligns[s].max(a.alignment);
-            c.n_syms += 1;
-            if (a.name.len > 0) c.str_len += @intCast(a.name.len + 1);
-            c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
-        }
-    }
-
-    const skip = std.math.maxInt(u32);
-
-    fn resolveAddrsAndLayOutDebug(l: *Link, task: usize, thread: usize) void {
-        if (task < l.n_resolve_tasks) l.resolveAddrs(task, thread) else l.layOutDebug(task - l.n_resolve_tasks);
-    }
-
-    /// Sizes one chunk's debug entries and collects their files. Entries
-    /// for atoms that were deduplicated away are skipped.
-    fn layOutDebug(l: *Link, chunk: usize) void {
-        const begin = chunk * chunk_len;
-        const entries = l.debug[begin..@min(l.debug.len, begin + chunk_len)];
-        const c = &l.debug_chunks[chunk];
-        c.info_len = 0;
-        c.line_len = 0;
-        c.n_fdes = 0;
-        // Functions from one file usually share its path's bytes, so a
-        // table by address saves hashing the path for most entries.
-        var by_addr: FilesByAddr = .{};
-        const task = l.chunks.len + chunk;
-        for (entries, l.file_of[begin..][0..entries.len], begin..) |*d, *file_of, j| {
-            file_of.* = skip;
-            if (d.atom >= l.atoms.len or (j > 0 and l.debug[j - 1].atom >= d.atom)) {
-                return l.fail(task, @min(d.atom, l.atoms.len), error.InvalidDebugInfo, .{});
-            }
-            const place = l.places[d.atom];
-            if (place.isDuplicate()) continue;
-            if (place.section != @backingInt(Atom.Section.text)) {
-                return l.fail(task, d.atom, error.InvalidDebugInfo, .{ .atom = l.atoms[d.atom].name });
-            }
-            file_of.* = by_addr.get(d.file) orelse index: {
-                const gop = c.files.getOrPut(l.gpa, d.file) catch return l.fail(task, d.atom, error.OutOfMemory, .{});
-                by_addr.put(d.file, @intCast(gop.index));
-                break :index @intCast(gop.index);
-            };
-            c.info_len += Dwarf.subprogramSize(d);
-            c.line_len += Dwarf.sequenceSize(d);
-            c.n_fdes += @intFromBool(d.frame != .none);
-        }
-    }
-
-    /// Open addressing from a path's address and length to its index in a
-    /// chunk's `files`. Holds up to 3/4 of its slots; paths past that are
-    /// looked up by contents every time.
-    const FilesByAddr = struct {
-        slots: [1024]Slot = @splat(.{ .ptr = 0, .len = 0, .index = 0 }),
-        count: usize = 0,
-
-        const Slot = struct { ptr: usize, len: usize, index: u32 };
-
-        fn home(file: []const u8) usize {
-            return @intCast((@intFromPtr(file.ptr) *% 0x9e3779b97f4a7c15) >> 54);
         }
 
-        fn get(t: *const FilesByAddr, file: []const u8) ?u32 {
-            var i = home(file);
-            while (t.slots[i].ptr != 0) : (i = (i + 1) % t.slots.len) {
-                if (t.slots[i].ptr == @intFromPtr(file.ptr) and t.slots[i].len == file.len) return t.slots[i].index;
-            }
-            return null;
+        const skip = std.math.maxInt(u32);
+
+        fn resolveAddrsAndLayOutDebug(l: *Link, task: usize, thread: usize) void {
+            if (task < l.n_resolve_tasks) l.resolveAddrs(task, thread) else l.layOutDebug(task - l.n_resolve_tasks);
         }
 
-        fn put(t: *FilesByAddr, file: []const u8, index: u32) void {
-            if (t.count >= t.slots.len / 4 * 3) return;
-            var i = home(file);
-            while (t.slots[i].ptr != 0) i = (i + 1) % t.slots.len;
-            t.slots[i] = .{ .ptr = @intFromPtr(file.ptr), .len = file.len, .index = index };
-            t.count += 1;
+        /// Sizes one chunk's debug entries and collects their files. Entries
+        /// for atoms that were deduplicated away are skipped.
+        fn layOutDebug(l: *Link, chunk: usize) void {
+            const begin = chunk * chunk_len;
+            const end = @min(l.n_debug, begin + chunk_len);
+            const c = &l.debug_chunks[chunk];
+            c.info_len = 0;
+            c.line_len = 0;
+            c.n_fdes = 0;
+            // Functions from one file usually share its path's bytes, so a
+            // table by address saves hashing the path for most entries.
+            var by_addr: FilesByAddr = .{};
+            const task = l.chunks.len + chunk;
+            var prev: ?u32 = if (begin > 0) l.input.debug(begin - 1).atom else null;
+            for (l.file_of[begin..end], begin..) |*file_of, j| {
+                const d = &l.input.debug(j);
+                file_of.* = skip;
+                if (d.atom >= l.n_atoms or (prev != null and prev.? >= d.atom)) {
+                    return l.fail(task, @min(d.atom, l.n_atoms), error.InvalidDebugInfo, .{});
+                }
+                prev = d.atom;
+                const place = l.places[d.atom];
+                if (place.isDuplicate()) continue;
+                if (place.section != @backingInt(Atom.Section.text)) {
+                    return l.fail(task, d.atom, error.InvalidDebugInfo, .{ .atom = l.input.atom(d.atom).name });
+                }
+                file_of.* = by_addr.get(d.file) orelse index: {
+                    const gop = c.files.getOrPut(l.gpa, d.file) catch return l.fail(task, d.atom, error.OutOfMemory, .{});
+                    by_addr.put(d.file, @intCast(gop.index));
+                    break :index @intCast(gop.index);
+                };
+                c.info_len += Dwarf.subprogramSize(d);
+                c.line_len += Dwarf.sequenceSize(d);
+                c.n_fdes += @intFromBool(d.frame != .none);
+            }
+        }
+
+        /// Open addressing from a path's address and length to its index in a
+        /// chunk's `files`. Holds up to 3/4 of its slots; paths past that are
+        /// looked up by contents every time.
+        const FilesByAddr = struct {
+            slots: [1024]Slot = @splat(.{ .ptr = 0, .len = 0, .index = 0 }),
+            count: usize = 0,
+
+            const Slot = struct { ptr: usize, len: usize, index: u32 };
+
+            fn home(file: []const u8) usize {
+                return @intCast((@intFromPtr(file.ptr) *% 0x9e3779b97f4a7c15) >> 54);
+            }
+
+            fn get(t: *const FilesByAddr, file: []const u8) ?u32 {
+                var i = home(file);
+                while (t.slots[i].ptr != 0) : (i = (i + 1) % t.slots.len) {
+                    if (t.slots[i].ptr == @intFromPtr(file.ptr) and t.slots[i].len == file.len) return t.slots[i].index;
+                }
+                return null;
+            }
+
+            fn put(t: *FilesByAddr, file: []const u8, index: u32) void {
+                if (t.count >= t.slots.len / 4 * 3) return;
+                var i = home(file);
+                while (t.slots[i].ptr != 0) i = (i + 1) % t.slots.len;
+                t.slots[i] = .{ .ptr = @intFromPtr(file.ptr), .len = file.len, .index = index };
+                t.count += 1;
+            }
+        };
+
+        fn copyAll(l: *Link, task: usize, thread: usize) void {
+            if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len);
+            if (l.numbered == null) l.copy(task, thread, false) else l.copyNumbered(task, thread);
+        }
+
+        /// Writes one chunk's subprogram entries, line sequences, FDEs, and
+        /// search table entries.
+        noinline fn copyDebug(l: *Link, chunk: usize) void {
+            const begin = chunk * chunk_len;
+            const end = @min(l.n_debug, begin + chunk_len);
+            const c = &l.debug_chunks[chunk];
+            var info_off = l.info_off + c.info_off;
+            var line_off = l.line_off + c.line_off;
+            var fde = c.fde_base;
+            const hdr_addr: i64 = @intCast(l.base + l.hdr_off);
+            for (l.file_of[begin..end], begin..) |file_of, j| {
+                // The entries stream; their fragments, names, and atoms do not.
+                if (j + 12 < end) l.input.prefetchDebug(j + 12);
+                if (file_of == skip) continue;
+                const d = &l.input.debug(j);
+                const addr = l.atomAddr(d.atom);
+                const size = l.input.atom(d.atom).bytes.len;
+                const file = c.file_map[file_of];
+                info_off += Dwarf.writeSubprogram(l.buf[info_off..], d, addr, size, file);
+                line_off += Dwarf.writeSequence(l.buf[line_off..], d, addr, size, file);
+                if (d.frame != .none) {
+                    const fde_off: u32 = @intCast(Dwarf.cie.len + @as(u64, fde) * Dwarf.fde_size);
+                    const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
+                    const fn_addr: i64 = @intCast(addr);
+                    Dwarf.writeFde(l.buf[l.eh_off + fde_off ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
+                    const entry = l.buf[l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, fde) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
+                    std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
+                    std.mem.writeInt(i32, entry[4..8], @intCast(fde_addr - hdr_addr), .little);
+                    fde += 1;
+                }
+            }
+        }
+
+        /// Sets `res` to the addresses or values of the targets of `a`, atom
+        /// `i`, from `addrs`.
+        fn resolveNumbered(l: *Link, a: *const Atom, i: usize, chunk: usize, res: []u64) bool {
+            const s = l.numbered.?;
+            const first = s.atoms[i].targets;
+            if (first > s.targets.len or s.targets.len - first < a.targets.len) {
+                l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name });
+                return false;
+            }
+            for (s.targets[first..][0..a.targets.len], res, a.targets) |n, *r, t| {
+                if (n >= l.addrs.len) {
+                    l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name, .target = t });
+                    return false;
+                }
+                const e = l.addrs[n];
+                r.* = if (e < value_tag) l.base + e else l.numberedAddr(e) orelse {
+                    l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
+                    return false;
+                };
+            }
+            return true;
+        }
+
+        /// Copies one chunk's atoms, applies their relocations, and writes
+        /// their symbols.
+        /// Out of line, so that the key-based `copy` compiles as if alone.
+        noinline fn copyNumbered(l: *Link, chunk: usize, thread: usize) void {
+            l.copy(chunk, thread, true);
+        }
+
+        fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
+            const c = &l.chunks[chunk];
+            const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
+            for (c.lead_gaps, c.bases, l.section_addrs, fills, 0..) |gap, chunk_base, sa, fill, s| {
+                if (zero_fill[s]) continue;
+                const start = sa - l.base + chunk_base;
+                @memset(l.buf[start - gap .. start], fill);
+            }
+            const begin = chunk * chunk_len;
+            const end = @min(l.n_atoms, begin + chunk_len);
+            var sym_off = l.symtab_off + @as(u64, c.sym) * @sizeOf(elf.Elf64.Sym);
+            var str_off = c.str;
+            for (l.places[begin..end], begin..) |place, i| {
+                // An atom's bytes, targets, relocations, and name, and its
+                // targets' `symbols` entries, are scattered in memory; start
+                // those misses a few atoms ahead.
+                if (i + 4 < l.n_atoms) l.input.prefetch(i + 4, !numbered);
+                if (i + 2 < l.n_atoms) {
+                    if (!numbered) for (l.input.atom(i + 2).targets) |t| l.symbols.prefetch(t);
+                }
+                if (place.isDuplicate()) continue;
+                const a = &l.input.atom(i);
+                const addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
+                if (!zero_fill[place.section]) {
+                    const start = addr - l.base;
+                    @memset(l.buf[start - place.gap .. start], fills[place.section]);
+                    const dst = l.buf[start..][0..a.bytes.len];
+                    @memcpy(dst, a.bytes);
+                    const res = resolved[0..a.targets.len];
+                    if (numbered) {
+                        if (!l.resolveNumbered(a, i, chunk, res)) return;
+                    } else for (a.targets, res) |t, *r| {
+                        r.* = l.symbols.get(t) orelse l.values.get(t) orelse {
+                            l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
+                            return;
+                        };
+                    }
+                    var diag: Diagnostic = .{};
+                    applyRelocs(a, dst, addr, res, &l.tls, &diag) catch |err| return l.fail(chunk, i, err, diag);
+                }
+                var name: u32 = 0;
+                if (a.name.len > 0) {
+                    name = str_off;
+                    @memcpy(l.buf[l.strtab_off + str_off ..][0..a.name.len], a.name);
+                    l.buf[l.strtab_off + str_off + a.name.len] = 0;
+                    str_off += @intCast(a.name.len + 1);
+                }
+                writeStruct(l.buf[sym_off..], elf.Elf64.Sym{
+                    .name = name,
+                    .info = .{ .type = sym_types[place.section], .bind = .GLOBAL },
+                    .other = .{ .visibility = .DEFAULT },
+                    .shndx = l.shndx[place.section],
+                    .value = addr - l.sym_bias[place.section],
+                    .size = a.size(),
+                });
+                sym_off += @sizeOf(elf.Elf64.Sym);
+            }
         }
     };
-
-    fn copyAll(l: *Link, task: usize, thread: usize) void {
-        if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len);
-        if (l.numbered == null) l.copy(task, thread, false) else l.copyNumbered(task, thread);
-    }
-
-    /// Writes one chunk's subprogram entries, line sequences, FDEs, and
-    /// search table entries.
-    noinline fn copyDebug(l: *Link, chunk: usize) void {
-        const begin = chunk * chunk_len;
-        const entries = l.debug[begin..@min(l.debug.len, begin + chunk_len)];
-        const c = &l.debug_chunks[chunk];
-        var info_off = l.info_off + c.info_off;
-        var line_off = l.line_off + c.line_off;
-        var fde = c.fde_base;
-        const hdr_addr: i64 = @intCast(l.base + l.hdr_off);
-        for (entries, l.file_of[begin..][0..entries.len], 0..) |*d, file_of, j| {
-            // The entries stream; their fragments, names, and atoms do not.
-            if (j + 12 < entries.len) {
-                const n = &entries[j + 12];
-                prefetchSlice(u8, n.lines);
-                prefetchSlice(u8, n.name);
-                @prefetch(&l.atoms[n.atom].bytes.len, .{});
-                @prefetch(&l.places[n.atom], .{});
-            }
-            if (file_of == skip) continue;
-            const addr = l.atomAddr(d.atom);
-            const size = l.atoms[d.atom].bytes.len;
-            const file = c.file_map[file_of];
-            info_off += Dwarf.writeSubprogram(l.buf[info_off..], d, addr, size, file);
-            line_off += Dwarf.writeSequence(l.buf[line_off..], d, addr, size, file);
-            if (d.frame != .none) {
-                const fde_off: u32 = @intCast(Dwarf.cie.len + @as(u64, fde) * Dwarf.fde_size);
-                const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
-                const fn_addr: i64 = @intCast(addr);
-                Dwarf.writeFde(l.buf[l.eh_off + fde_off ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
-                const entry = l.buf[l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, fde) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
-                std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
-                std.mem.writeInt(i32, entry[4..8], @intCast(fde_addr - hdr_addr), .little);
-                fde += 1;
-            }
-        }
-    }
-
-    /// Sets `res` to the addresses or values of the targets of `a`, atom
-    /// `i`, from `addrs`.
-    fn resolveNumbered(l: *Link, a: *const Atom, i: usize, chunk: usize, res: []u64) bool {
-        const s = l.numbered.?;
-        const first = s.atoms[i].targets;
-        if (first > s.targets.len or s.targets.len - first < a.targets.len) {
-            l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name });
-            return false;
-        }
-        for (s.targets[first..][0..a.targets.len], res, a.targets) |n, *r, t| {
-            if (n >= l.addrs.len) {
-                l.fail(chunk, i, error.InvalidSymbols, .{ .atom = a.name, .target = t });
-                return false;
-            }
-            const e = l.addrs[n];
-            r.* = if (e < value_tag) l.base + e else l.numberedAddr(e) orelse {
-                l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
-                return false;
-            };
-        }
-        return true;
-    }
-
-    /// Copies one chunk's atoms, applies their relocations, and writes
-    /// their symbols.
-    /// Out of line, so that the key-based `copy` compiles as if alone.
-    noinline fn copyNumbered(l: *Link, chunk: usize, thread: usize) void {
-        l.copy(chunk, thread, true);
-    }
-
-    fn copy(l: *Link, chunk: usize, thread: usize, comptime numbered: bool) void {
-        const c = &l.chunks[chunk];
-        const resolved = l.resolved[thread * l.max_targets ..][0..l.max_targets];
-        for (c.lead_gaps, c.bases, l.section_addrs, fills, 0..) |gap, chunk_base, sa, fill, s| {
-            if (zero_fill[s]) continue;
-            const start = sa - l.base + chunk_base;
-            @memset(l.buf[start - gap .. start], fill);
-        }
-        const begin = chunk * chunk_len;
-        const atoms = l.atoms[begin..@min(l.atoms.len, begin + chunk_len)];
-        var sym_off = l.symtab_off + @as(u64, c.sym) * @sizeOf(elf.Elf64.Sym);
-        var str_off = c.str;
-        for (atoms, l.places[begin..][0..atoms.len], begin..) |*a, place, i| {
-            // An atom's bytes, targets, relocations, and name, and its
-            // targets' `symbols` entries, are scattered in memory; start
-            // those misses a few atoms ahead.
-            if (i + 4 < l.atoms.len) {
-                const n = &l.atoms[i + 4];
-                prefetchSlice(u8, n.bytes[0..@min(n.bytes.len, 64)]);
-                if (!numbered) prefetchSlice(SymbolKey, n.targets);
-                prefetchSlice(Atom.Reloc, n.relocs);
-                prefetchSlice(u8, n.name);
-            }
-            if (i + 2 < l.atoms.len) {
-                if (!numbered) for (l.atoms[i + 2].targets) |t| l.symbols.prefetch(t);
-            }
-            if (place.isDuplicate()) continue;
-            const addr = l.section_addrs[place.section] + c.bases[place.section] + place.offset;
-            if (!zero_fill[place.section]) {
-                const start = addr - l.base;
-                @memset(l.buf[start - place.gap .. start], fills[place.section]);
-                const dst = l.buf[start..][0..a.bytes.len];
-                @memcpy(dst, a.bytes);
-                const res = resolved[0..a.targets.len];
-                if (numbered) {
-                    if (!l.resolveNumbered(a, i, chunk, res)) return;
-                } else for (a.targets, res) |t, *r| {
-                    r.* = l.symbols.get(t) orelse l.values.get(t) orelse {
-                        l.fail(chunk, i, error.UndefinedSymbol, .{ .atom = a.name, .target = t });
-                        return;
-                    };
-                }
-                var diag: Diagnostic = .{};
-                applyRelocs(a, dst, addr, res, &l.tls, &diag) catch |err| return l.fail(chunk, i, err, diag);
-            }
-            var name: u32 = 0;
-            if (a.name.len > 0) {
-                name = str_off;
-                @memcpy(l.buf[l.strtab_off + str_off ..][0..a.name.len], a.name);
-                l.buf[l.strtab_off + str_off + a.name.len] = 0;
-                str_off += @intCast(a.name.len + 1);
-            }
-            writeStruct(l.buf[sym_off..], elf.Elf64.Sym{
-                .name = name,
-                .info = .{ .type = sym_types[place.section], .bind = .GLOBAL },
-                .other = .{ .visibility = .DEFAULT },
-                .shndx = l.shndx[place.section],
-                .value = addr - l.sym_bias[place.section],
-                .size = a.size(),
-            });
-            sym_off += @sizeOf(elf.Elf64.Sym);
-        }
-    }
-};
+}
 
 /// Runs `task(ctx, i, thread)` for every i < n_tasks on up to `n_threads`
 /// threads, the calling thread included.

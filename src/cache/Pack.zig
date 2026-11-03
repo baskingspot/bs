@@ -186,6 +186,54 @@ pub fn decode(p: *const Pack, ref: AtomRef) DecodeError!atoms_codec.Decoded {
     return d;
 }
 
+/// The linker's input (the interface of `Elf.AtomSlice`), read straight
+/// from the mapped records: each `Atom` is built from its record's header
+/// when the linker asks for it, so nothing is decoded up front.
+pub const LinkAtoms = struct {
+    /// Each pack's mapping, by pack index.
+    mems: []const [*]align(16) const u8,
+    refs: []const AtomRef,
+    /// The atoms that have debug info, ascending.
+    debug_atoms: []const u32,
+    files: DebugFiles,
+
+    pub fn len(in: LinkAtoms) usize {
+        return in.refs.len;
+    }
+
+    inline fn rec(in: LinkAtoms, i: usize) [*]align(16) const u8 {
+        const r = in.refs[i];
+        return @alignCast(in.mems[r.pack] + r.offset());
+    }
+
+    pub fn atom(in: LinkAtoms, i: usize) Atom {
+        return atoms_codec.view(in.rec(i)).atom;
+    }
+
+    pub fn debugLen(in: LinkAtoms) usize {
+        return in.debug_atoms.len;
+    }
+
+    pub fn debug(in: LinkAtoms, j: usize) Atom.Debug {
+        const i = in.debug_atoms[j];
+        var d = atoms_codec.view(in.rec(i)).debug.?;
+        d.atom = i;
+        d.file = in.files.names[in.files.of[i]];
+        return d;
+    }
+
+    pub fn prefetch(in: LinkAtoms, i: usize, comptime keys: bool) void {
+        _ = keys;
+        const p = in.rec(i);
+        @prefetch(p, .{});
+        @prefetch(p + 64, .{});
+    }
+
+    pub fn prefetchDebug(in: LinkAtoms, j: usize) void {
+        @prefetch(in.rec(in.debug_atoms[j]), .{});
+    }
+};
+
 /// Interned debug source paths (see `Manifest.debug_files`): the atom at
 /// `refs[i]` has its debug info's path at `names[of[i]]`.
 pub const DebugFiles = struct {
