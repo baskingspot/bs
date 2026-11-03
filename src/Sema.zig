@@ -7368,7 +7368,12 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
     if (sema.vectorLen(ty)) |len| {
         const lhs = try sema.vectorOperand(block, src, ty, uncasted_lhs);
         const rhs = try sema.vectorOperand(block, src, ty, uncasted_rhs);
-        return sema.vectorMap(block, src, len, ty, &.{ lhs, rhs }, VectorArith{ .tag = tag, .elem_ty = Type.childType(ip, ty) });
+        const elem_ty = Type.childType(ip, ty);
+        // Upstream asks whether the vector type itself is a signed integer,
+        // which it never is, so `/` on vectors of signed integers is not an
+        // error there: it divides by truncation (zigimg's jpeg decoder).
+        const signed_div = tag == .div and Type.class(ip, elem_ty) == .int and Type.intInfo(ip, elem_ty).signedness == .signed;
+        return sema.vectorMap(block, src, len, ty, &.{ lhs, rhs }, VectorArith{ .tag = if (signed_div) .div_trunc else tag, .elem_ty = elem_ty });
     }
     const is_bool = ty == .bool_type;
     const class = Type.class(ip, ty);

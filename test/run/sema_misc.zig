@@ -1,9 +1,10 @@
 //! exit: 0
-//! stdout: "1\n1\n6\n7\n24\n5\n21\n24\n15\n72\n100\n300\n1\nsema_misc.main.Local\nsema_misc.make(u8)\nfn (...) callconv(.c) void\nfn (usize, bool, ...) callconv(.c) usize\nfn (noalias []u8) void\n25\n25\n"
+//! stdout: "1\n1\n6\n7\n24\n5\n21\n24\n15\n72\n100\n300\n1\nsema_misc.main.Local\nsema_misc.make(u8)\nfn (...) callconv(.c) void\nfn (usize, bool, ...) callconv(.c) usize\nfn (noalias []u8) void\n25\n25\n7\n13\n"
 //! Comptime-known packed const locals, calls through a `*const type`,
 //! @bitSizeOf, named tuple initialization, many-pointer peer types,
 //! anonymous type names, variadic and noalias function types, and
-//! `.ptr`/`.len` of a pointer to an array reached through a parameter.
+//! `.ptr`/`.len` of a pointer to an array reached through a parameter,
+//! and `/` on vectors of signed integers.
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -87,5 +88,12 @@ fn main() callconv(.c) noreturn {
     const opaque_ptr: *const anyopaque = &.{};
     const empty: *const @TypeOf(.{}) = @ptrCast(@alignCast(opaque_ptr));
     comptime if (@TypeOf(empty.*) != @TypeOf(.{})) unreachable;
+
+    // `/` on vectors of signed integers truncates, as upstream accepts it.
+    var num: @Vector(2, i32) = .{ -7, 7 };
+    num += @splat(0);
+    const quot = num / @as(@Vector(2, i32), @splat(2));
+    rt.printInt(@intCast(quot[0] + 10));
+    rt.printInt(@intCast(quot[1] + 10));
     rt.exit(0);
 }
