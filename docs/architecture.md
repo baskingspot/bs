@@ -1596,20 +1596,25 @@ the format replay freezes can grow without a new graph:
   only at the quota. Call counts differ between edit and full builds
   (green units make no calls), so lowering happens at different points and
   the recorded edge sets differ; both cover what the walker read.
-- *inlined body* (reserved; for the optimizer's inlining of small
-  functions): the caller's code copies the callee's body, so a changed
-  callee must invalidate the caller's CodeGen result but not its Sema
-  result. The edge goes to the callee's `func` node, whose result hash
-  must then cover the body the inliner copies (after the callee's own
-  inlining, so that inlining through several levels invalidates
-  transitively), not only the callee's machine code. Since IR is not
-  cached, an edit build re-analyzes such a caller in full for now; the
-  kind is what would let a later IR cache skip its Sema.
+
+The optimizer's inlining (see "Optimizing backend") needs no third kind:
+a caller depends on the dependee `func_inline: f`, whose tag already says
+that it invalidates the caller's CodeGen, not its Sema. Its producer is
+`f`'s `func` unit (as `func_ies`'s), its result hash is the canonical
+hash of `f`'s inlinable SSA (positions relative to `f`'s base line;
+types and constants by stable hash, callees by Nav key), or a constant
+"not inlinable" marker, and every call site that passes the caller-side
+rules records it whether or not `f` was inlined, so that an edit that
+makes `f` inlinable reaches callers that call it. CodeGen records these
+edges (a per-caller list beside `Emit.unit_refs`). A caller red only
+through them still re-runs Sema, since IR is not cached; a green `f`
+whose body a red caller needs is re-analyzed without being emitted, its
+manifest data kept (option (a) there).
 
 The manifest will store the kind in the top 2 bits of each edge's node
-index (one value spare; 2^30 nodes is ample), with the replay format bump;
-until the conditional and inlined kinds have readers, every edge is plain,
-which over-predicts but is sound.
+index (two values spare; 2^30 nodes is ample), with the replay format
+bump; until conditional edges have a reader, every edge is plain, which
+over-predicts but is sound.
 
 **Roots and output kinds** (for `zap build-obj`, which skips the cache
 for now). Replay seeds its reference closure from a root list the
