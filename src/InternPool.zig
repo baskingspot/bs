@@ -551,6 +551,12 @@ pub const Key = union(enum) {
     /// (zap links statically, so another part of the program).
     extern_func: ExternFunc,
     calling_convention: CallingConvention,
+    /// A container type's capture of declaration `nav` from an enclosing
+    /// generic namespace (ZIR's `decl_val`/`decl_ref` captures). The
+    /// declaration is resolved only when the type's body reads the capture,
+    /// as upstream, so a type may capture the declaration that it is the
+    /// value of. Appears only in `ContainerType.captures`.
+    nav_capture: struct { nav: NavIndex, by_ref: bool },
 };
 
 pub const ExternFunc = struct {
@@ -608,6 +614,8 @@ const Tag = enum(u8) {
     func,
     extern_func,
     calling_convention,
+    nav_capture_val,
+    nav_capture_ref,
 };
 
 const Item = struct {
@@ -985,6 +993,7 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
             return .{ .tag = .type_error_set, .data = start };
         },
         .inferred_error_set_type => |f| return .{ .tag = .type_inferred_error_set, .data = idx(f) },
+        .nav_capture => |c| return .{ .tag = if (c.by_ref) .nav_capture_ref else .nav_capture_val, .data = @backingInt(c.nav) },
         .struct_type, .enum_type, .union_type, .opaque_type => |t| {
             const start = try ip.addExtra(local, &.{ t.file, @backingInt(t.zir_inst), @backingInt(t.name), @backingInt(t.info), @intCast(t.captures.len), @backingInt(t.key) });
             _ = try ip.addExtra(local, @ptrCast(t.captures));
@@ -1113,6 +1122,7 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         .type_error_union => .{ .error_union_type = .{ .error_set_type = I.i(extra[d]), .payload_type = I.i(extra[d + 1]) } },
         .type_error_set => .{ .error_set_type = @ptrCast(extra[d + 1 ..][0..extra[d]]) },
         .type_inferred_error_set => .{ .inferred_error_set_type = I.i(d) },
+        .nav_capture_val, .nav_capture_ref => .{ .nav_capture = .{ .nav = @fromBackingInt(d), .by_ref = item.tag == .nav_capture_ref } },
         .type_struct, .type_enum, .type_union, .type_opaque => blk: {
             const c: ContainerType = .{
                 .file = extra[d],
@@ -1318,6 +1328,10 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
             ip.hashIndex(&h, t.child);
         },
         .opt_type, .anyframe_type, .inferred_error_set_type, .undef => |i| ip.hashIndex(&h, i),
+        .nav_capture => |c| {
+            h.int(Hash, ip.getNav(c.nav).hash);
+            h.int(u8, @intFromBool(c.by_ref));
+        },
         .error_union_type => |t| {
             ip.hashIndex(&h, t.error_set_type);
             ip.hashIndex(&h, t.payload_type);
@@ -1470,6 +1484,7 @@ fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
         .opt_type => |x| x == b.opt_type,
         .anyframe_type => |x| x == b.anyframe_type,
         .inferred_error_set_type => |x| x == b.inferred_error_set_type,
+        .nav_capture => |x| x.nav == b.nav_capture.nav and x.by_ref == b.nav_capture.by_ref,
         .undef => |x| x == b.undef,
         .error_union_type => |x| x.error_set_type == b.error_union_type.error_set_type and x.payload_type == b.error_union_type.payload_type,
         .error_set_type => |x| eqlIdx(String, x, b.error_set_type),
@@ -1591,6 +1606,7 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
             .func => |x| x.ty,
             .extern_func => |x| x.ty,
             .calling_convention => .calling_convention_type,
+            .nav_capture => .generic_poison_type,
         },
     };
 }

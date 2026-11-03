@@ -2355,7 +2355,14 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .closure_get => blk: {
             const ns = sema.zcu.namespacePtr(block.namespace);
             const captures = sema.ip.containerType(ns.owner_type).?.captures;
-            break :blk .fromInterned(captures[ext.small]);
+            const cap = captures[ext.small];
+            if (sema.ip.indexToKey(cap) == .nav_capture) {
+                // A captured declaration resolves when it is read.
+                const c = sema.ip.indexToKey(cap).nav_capture;
+                const src = block.nodeSrc(@enumFromInt(@as(i32, @bitCast(ext.operand))));
+                break :blk if (c.by_ref) sema.navRef(block, src, c.nav) else sema.navVal(block, src, c.nav);
+            }
+            break :blk .fromInterned(cap);
         },
         .@"asm", .asm_expr => sema.zirAsm(block, inst),
         .tuple_decl => blk: {
@@ -3458,8 +3465,10 @@ fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.
                 const loaded = try sema.analyzeLoad(block, src, sema.resolveInst(i.toRef()));
                 break :blk try sema.resolveConstValue(block, src, loaded, "captured value must be comptime-known");
             },
-            .decl_val => |name| try sema.resolveConstValue(block, src, try sema.navVal(block, src, try sema.lookupName(block, src, sema.zirString(name))), "captured value must be comptime-known"),
-            .decl_ref => |name| try sema.resolveConstValue(block, src, try sema.navRef(block, src, try sema.lookupName(block, src, sema.zirString(name))), "captured value must be comptime-known"),
+            // As upstream, a captured declaration is resolved only when the
+            // type's body reads it: the type may be that declaration's value.
+            .decl_val => |name| try sema.intern(.{ .nav_capture = .{ .nav = try sema.lookupName(block, src, sema.zirString(name)), .by_ref = false } }),
+            .decl_ref => |name| try sema.intern(.{ .nav_capture = .{ .nav = try sema.lookupName(block, src, sema.zirString(name)), .by_ref = true } }),
         };
     }
     const name = try sema.typeName(block, name_strategy, inst, kind);

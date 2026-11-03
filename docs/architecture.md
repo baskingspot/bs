@@ -901,7 +901,11 @@ the result's items:
   (owner declaration's key, relative ZIR offset, generic owner, comptime
   arguments); `inferred_error_set_type` as its function; `ptr` with a
   `nav` base as the declaration's key, resolved to a `NavIndex` by
-  namespace lookup alone.
+  namespace lookup alone; `nav_capture` (a container type's capture of a
+  declaration from an enclosing generic namespace, ZIR's
+  `decl_val`/`decl_ref` captures, by value or by reference) the same way.
+  Such a capture stays unresolved until the type's body reads it, as
+  upstream, because the type may be that declaration's own value.
 - Interning a closure never calls `Zcu.ensure*`: container types come
   from `createContainerType` and a namespace scan, which need no
   declaration's value, and a `nav` pointer needs only the `NavIndex`.
