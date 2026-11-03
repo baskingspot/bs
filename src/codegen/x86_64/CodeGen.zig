@@ -74,6 +74,12 @@ trace_slot: ?i32 = null,
 saved: u32 = 0,
 /// `Ssa.liveness` ran, so value slots are shared by lifetime.
 live: bool = false,
+/// The function's one epilogue, which ends its code (`Atom.Unwind.epilogue`):
+/// returns other than one in the last block emitted jump to it. Null until
+/// a return needs it.
+ret_label: ?Encoder.Label = null,
+/// `ret_label` is bound: the epilogue is emitted.
+ret_bound: bool = false,
 /// Emitting the cold blocks, after the others: their values get slots of
 /// their own (see `Ssa.place`).
 in_cold: bool = false,
@@ -222,6 +228,12 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         try cg.setupParams();
     }
     try cg.emitBlocks();
+    if (cg.ret_label != null and !cg.ret_bound) {
+        // The last block does not return: the epilogue follows it, in the
+        // function's own line table.
+        if (cg.in_cold or cg.dbg_open.items.len != 0) try cg.e.switchLines(0, 0);
+        try cg.epilogue();
+    }
     try cg.e.finishShortened();
     frame_patch = cg.e.mapOffset(@intCast(frame_patch));
     for (cg.dbg_inlines.items) |*in| {
@@ -229,6 +241,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         in.high = cg.e.mapOffset(in.high);
     }
 
+    // Whether the epilogue's `ret` ends the code; out-of-line stack probes
+    // follow it otherwise.
+    var epilogue_last = cg.ret_bound;
     if (!naked) {
         // The saved registers are pushed already.
         const frame = std.mem.alignForward(u32, cg.slots_size + cg.out_args_size, 16) - saved_size;
@@ -240,6 +255,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
             // a jump to the probes at the end, which jump back. The CFA is
             // rbp-based by then, so the frame info holds throughout.
             const stub: u32 = @intCast(cg.e.code.items.len);
+            epilogue_last = false;
             const sub_at: u32 = @intCast(frame_patch - 7);
             try cg.e.line(0, 0);
             try cg.e.probedFrameAlloc(frame, @intCast(frame_patch));
@@ -294,7 +310,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
         // `cg.saved` has `Atom.Unwind.saved`'s x86_64 bits: the prologue
         // pushes `alloc_regs`' callee-saved ones in that order.
-        .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else .{ .kind = .frame_pointer, .saved = @intCast(cg.saved) },
+        .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else .{ .kind = .frame_pointer, .epilogue = epilogue_last, .saved = @intCast(cg.saved) },
     }, debug);
 }
 
@@ -1345,8 +1361,12 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
     }
 }
 
-/// The function's epilogue: restores the saved registers and returns.
+/// The function's epilogue, at `ret_label`: restores the saved registers
+/// and returns.
 fn epilogue(cg: *CodeGen) Error!void {
+    if (cg.ret_label == null) cg.ret_label = try cg.e.newLabel();
+    cg.e.bind(cg.ret_label.?);
+    cg.ret_bound = true;
     // The epilogue belongs to the closing brace, as in upstream's line tables.
     try cg.e.line(cg.ir.rbrace_line, cg.ir.rbrace_column);
     if (cg.saved != 0) {
@@ -1469,7 +1489,7 @@ fn genTerm(cg: *CodeGen, term: Ssa.Term, next: Ssa.Block.Index) Error!void {
         },
         .ret => {
             try cg.checkNaked(tag);
-            try cg.ret(data.un_op);
+            try cg.ret(data.un_op, next);
         },
         .unreach => try cg.e.ud2(),
     }
@@ -2483,7 +2503,9 @@ fn switchBr(cg: *CodeGen, data: Inst.Data, term: Ssa.Term) Error!void {
     }
 }
 
-fn ret(cg: *CodeGen, operand: Ref) Error!void {
+/// Returns `operand`: in the block emitted last (`next` is none), through
+/// the epilogue in place, and elsewhere by jumping to it.
+fn ret(cg: *CodeGen, operand: Ref, next: Ssa.Block.Index) Error!void {
     const ty = cg.fn_ty.return_type;
     if (cg.fn_ty.cc == .c) {
         try cg.cRet(operand);
@@ -2497,7 +2519,9 @@ fn ret(cg: *CodeGen, operand: Ref) Error!void {
             try cg.copyTo(Mem.at(.r10, 0), operand);
         },
     }
-    try cg.epilogue();
+    if (next == .none) return cg.epilogue();
+    if (cg.ret_label == null) cg.ret_label = try cg.e.newLabel();
+    try cg.e.jmp(.{ .label = cg.ret_label.? });
 }
 
 /// Loads the error return trace pointer, or null if the function has none.

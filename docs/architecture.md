@@ -912,7 +912,7 @@ layout order of pass 4:
   scratch register on aarch64). A critical edge that needs moves gets a
   block.
 - **Callee-saved registers** that the function uses are saved in the
-  prologue in a fixed layout per architecture, and restored in every
+  prologue in a fixed layout per architecture, and restored in the
   epilogue: on x86_64 pushed right after `push rbp; mov rbp, rsp`, in
   register order; on aarch64 in whole pairs right below the frame record,
   in register order (what compact unwind's MODE_FRAME requires). The set
@@ -1594,8 +1594,8 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   CFI (frame-pointer walking counts as unsafe there and is used only for
   panics), looking first for PT_GNU_EH_FRAME. So each `Debug` entry whose
   atom's `unwind` (`Atom.Unwind`) is `.frame_pointer` or `.outermost`
-  gets an FDE: 32 bytes, or 40 for a function that saves more than two
-  registers.
+  gets an FDE: 32 bytes for one that saves at most one register (and
+  is under 64 KiB), up to 48 for one that saves all five.
   `.outermost` (std.start's `_start`, `.cfi_undefined rip`) keeps the
   CIE's CFA of rsp+8 and marks rip undefined, which ends std.debug's
   unwind (SelfUnwinder returns 0). `.frame_pointer` describes CodeGen's
@@ -1603,26 +1603,35 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   CFA-16, then rbp+16), then the callee-saved registers it pushes
   (`Unwind.saved`: rbx, r12–r15, in that order), each with a
   `DW_CFA_offset` at CFA − 24 − 8k from the end of its push, so every
-  instruction of the prologue unwinds right; all share one CIE in an
+  instruction of the prologue unwinds right, and with `Unwind.epilogue`
+  (x86_64 CodeGen has one epilogue per function, at the end of its code,
+  which other returns jump to, as upstream's backend does) a
+  `DW_CFA_def_cfa rsp, 8` row at its `ret`, upstream's epilogue row. The
+  saved registers' rules stay: their slots below rsp keep the values the
+  pops restored, in the red zone that signal delivery skips; all share one CIE in an
   allocated .eh_frame, with an entry each in .eh_frame_hdr's sorted
   search table; naked functions (`.none`) get none. Both sections are
   sized for every entry, at the largest FDE, before the entries are read,
   so they need no pass before section placement; the debug layout pass
   sizes each chunk's FDEs, and the same chunked debug tasks as the rest
   write them; the room FDEs do not use stays zero after each section. Not described:
-  the `ret` after each epilogue's `pop rbp` (CodeGen returns from several
-  places; gdb's epilogue sniffer covers it), functions without `Debug`
-  (runtime helpers), and naked functions other than an outermost one.
+  the `ret` of a function whose frame exceeds a page (its out-of-line
+  stack probes follow the epilogue, so `epilogue` is false; gdb's
+  epilogue sniffer covers it), functions without `Debug` (runtime
+  helpers), and naked functions other than an outermost one.
   Verified with gdb (its dwarf2 unwinder, at
-  entry, after the push, and in the body), `readelf
-  --debug-dump=frames-interp` (same rows as upstream's FDEs, minus
-  upstream's epilogue row), and std.debug's own unwinder
+  entry, after the push, in the body, and at the epilogue's `ret`), `readelf
+  --debug-dump=frames-interp` (the same rows as upstream's FDEs), and
+  std.debug's own unwinder
   (`Dwarf.SelfUnwinder` through PT_GNU_EH_FRAME, both its search-table and
   sorted-FDE lookups) walking a trapped zap process's stack from a ptrace
   harness, and on a synthetic stack in a unit test. Cost on bench-link:
   about 3M more instructions per debug emit (40 bytes per function; 406.4M
   → 415.5M for three single-thread emits), within wall-clock noise; none
-  for stripped emits (312.1M). Cost (bench-link with a line row every
+  for stripped emits (312.1M). The epilogue row adds about 8.5 ns per
+  FDE on one thread (writing 100k FDEs: 0.44 → 1.29 ms, in the link's
+  parallel debug chunks); bench-link's functions take that path since
+  then. Cost (bench-link with a line row every
   8..40 bytes, 3.4 MiB of fragments, output 27.4 → 35.7 MiB): emit
   +10–11 ms on one thread and +3.5–4.5 ms on four in the session below
   (+6.5–8 and +2.3–3.3 ms on a quieter orb); about 2–5 µs of the 55–90 µs
