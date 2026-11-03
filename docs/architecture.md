@@ -499,12 +499,11 @@ comptime arguments are run-time values in the lowered code (uucode's
 
 ### CodeGen (`src/codegen/<arch>/`)
 
-- Today: a single pass per function, from IR to machine code. Every IR
-  value that outlives its instruction gets a stack slot; instructions load
-  operands into scratch registers, compute, and store. No register
-  allocation. "Optimizing backend" below replaces this with one shared SSA
-  layer (accepted 2026-11-03, being built); the bullets here describe the
-  code as it is until that lands.
+- Today: the IR is built into the shared SSA form, and each instruction
+  is lowered by per-instruction code; scalar values get registers from
+  linear scan and other values share stack slots by lifetime (steps 1 and
+  2 of "Optimizing backend" below, accepted 2026-11-03, being built). The
+  bullets here describe the code as it is until the rest lands.
 - Calling conventions: `.c` follows SysV for scalars: integers, bools, and
   pointers in GPRs (16-byte integers in register pairs), f16, f32, f64, and
   f128 in XMM registers, f80 in memory and returned in st0, and other values
@@ -650,7 +649,21 @@ upstream ReleaseSafe's (`bench/runtime.py`, below).
   branch) or removed when dead, but are not hoisted or sunk across
   blocks. There is no memory SSA, no alias analysis, no GVN, and no LICM.
   Line tables stay in source order, which is what a debugger stepping a
-  Debug build expects.
+  Debug build expects. This is a rule of the default mode's pass list,
+  not of the SSA form or the allocator: nothing below assumes memory
+  operations stay put, so a later mode can relax it.
+- **A pass list per mode.** The driver runs the pass list of the build's
+  mode. There is one mode today (`builtin.mode` stays `.debug`); a
+  ReleaseSafe mode may follow milestone 7 (`builtin.mode == .safe`, with
+  more passes, including ones that move code). Passes read and write only
+  the SSA, so a mode adds or drops passes without changing the others.
+- **Room for facts.** The default mode's longer-term target is Go-level
+  code, about 1.2–2× behind GCC and Clang, after inlining and a few more
+  of Go's passes (bounds-check elimination, `prove`). So the SSA can carry
+  facts that such passes use and produce, beside the values rather than
+  in their ops: a value's known range, a block that is a failing check's
+  cold path (the cold marks below), and that an operation cannot overflow
+  after a check. Step 4's cold marks are the first such fact.
 - **Safety checks stay.** Sema's checks are semantics; the backend keeps
   every one. It only makes them cheap: the failing path moves out of line,
   and the check reads the flags its operation set.
@@ -1183,6 +1196,46 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
 2. Lowering for scalar ops, the allocator, and frame-slot sharing; the
    fallback remains for wide integers, f80, f128, and inline assembly
    (which gets its constraints from the allocator later).
+   Built, as an interim form of the design that keeps the per-instruction
+   lowering: values are still IR instructions, and `Ssa.liveness` gives
+   each one an interval in layout positions (extended over every loop that
+   reads it without defining it) and counts clobber points. `Ssa.allocate`
+   is linear scan without splitting: a value that does not fit is kept in
+   memory for its whole life. x86_64 values of scalar types (integers up
+   to 64 bits, bools, pointers, error codes, optional pointers) that the
+   lowering leaves in a register get one of rbx, r12–r15, which every
+   lowering leaves alone and calls preserve, or, when their interval
+   contains no clobber point, of rsi, rdi, r8, r9 (the scalar lowerings use
+   only rax, rcx, rdx, r10, r11 as scratch; calls, string instructions,
+   and the fallback clobber the rest). A clobber point in a block that ends
+   the function (a return, or the panic call of a failing check) matters
+   only to later uses in that block. Registers hold values extended to 64
+   bits, a stronger rule than the narrow-integer rule above, which the
+   lowering may relax later. A result may take its first operand's
+   register when that operand dies there. Three pieces of later passes
+   came along because they fall out of the intervals: a compare,
+   `is_err`, or `is_null` used only by its block's branch is computed by
+   the branch, an overflow operation whose tuple only its two field reads
+   use writes the fields' registers directly, and values kept in memory
+   share slots by interval (size classes rounded to 8 bytes up to 512).
+   Functions with inline assembly keep every value in memory. The
+   callee-saved registers a function uses are pushed after `mov rbp,
+   rsp`, as the design fixes, but the CFI does not describe them until
+   the unwind record lands (step 3): unwinding and stack traces only need
+   rbp and the return address, so only a debugger's view of those
+   registers in outer frames is wrong meanwhile.
+   On libvaxis text_input (`ZAP_BENCH_CODEGEN=10`): 10.46 → 6.49 code
+   bytes per IR instruction, 992 → 708 frame bytes per function, and
+   146–151 → 184–190 ns per IR instruction (liveness and allocation 49,
+   emission 124 instead of 137). Callgrind on hello: `CodeGen.generate`
+   271 M → 262 M instructions, of which planning (liveness, allocation,
+   and the register classes) is 55 M. `bench/runtime.py`, step 1 against
+   step 2, medians of 5 (upstream Debug and ReleaseSafe as measured with
+   step 2): fib 199 → 124 ms (Debug 157, ReleaseSafe 70), sieve 559 →
+   291 (383, 119), sort 614 → 410 (453, 85), hash 379 → 247 (438, 37),
+   nbody 428 → 384 (468, 20), fmt 201 → 145 (167, 17): faster than
+   upstream Debug on all six, and within 3× of ReleaseSafe on fib and
+   sieve.
 3. `.auto` in registers, and the unwind record in the Atom (with the
    link thread).
 4. Layout, fusion, overflow from flags, dead code, and branch shortening.
