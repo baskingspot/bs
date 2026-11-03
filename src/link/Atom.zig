@@ -220,11 +220,53 @@ pub const Debug = struct {
     /// `LineProgram`. It starts from address = the atom's start, line =
     /// `base_line` + 1, column 0, and uses the standard opcodes and the
     /// special-opcode parameters of `LineProgram`; the linker wraps it in a
-    /// sequence and copies it unchanged.
+    /// sequence and copies it, rewriting only the operands at `patches`.
     lines: []const u8,
     /// How the function's frame unwinds; the linker writes call frame
     /// information (an FDE) from it.
     frame: Frame,
+    /// The compile unit: the basename of the module's root source file, as
+    /// upstream names its units ("std.zig"). Each distinct unit is one
+    /// unit of the output; "" is the unit of the first file.
+    unit: []const u8 = "",
+    /// Other source files `lines` switches to, with `file`'s path rules.
+    /// A local file index is 0 for `file` and k + 1 for `files[k]`.
+    files: []const []const u8 = &.{},
+    /// Calls inlined into the function, in preorder (a call's parent
+    /// precedes it, and its first child, if any, follows it at once).
+    inlines: []const Inline = &.{},
+    /// Offsets in `lines` of the opcodes whose operands the linker
+    /// rewrites, in order (see `LineProgram.switchTo`):
+    /// - `DW_LNS_set_file`, then a ULEB128 padded to 3 bytes holding a
+    ///   local file index, which becomes the output's file index;
+    /// - `DW_LNS_advance_line`, then an SLEB128 padded to 5 bytes holding a
+    ///   base, 0 for the function's and k + 1 for `inlines[k]`'s, which
+    ///   becomes the difference between that base line and the previous
+    ///   such patch's (at first, the function's).
+    /// A fragment without patches is copied unchanged.
+    patches: []const u32 = &.{},
+
+    pub const Inline = struct {
+        /// The callee's simple name.
+        name: []const u8,
+        /// The callee's source file, as a local file index.
+        file: u32,
+        /// Zero-based line of the callee declaration's first line.
+        base_line: u32,
+        /// Zero-based line of the call, relative to the parent's
+        /// `base_line`, and zero-based column. The call is in the parent's
+        /// file.
+        call_line: u32,
+        call_column: u32,
+        /// The inlined code: offsets `low..high` in the atom.
+        low: u32,
+        high: u32,
+        /// Index in `inlines` of the inline call containing this one, or
+        /// `none` for a call directly in the function.
+        parent: u32,
+
+        pub const none = std.math.maxInt(u32);
+    };
 
     pub const Frame = enum(u8) {
         /// No unwind info, as for naked functions.
@@ -243,6 +285,8 @@ pub const Debug = struct {
 /// Builds `Debug.lines` from rows in increasing code offset.
 pub const LineProgram = struct {
     bytes: std.ArrayList(u8) = .empty,
+    /// `Debug.patches`.
+    patches: std.ArrayList(u32) = .empty,
     /// Registers after the last row, relative to the atom.
     state: State = .{},
     /// Registers before the last row, and where it starts in `bytes`, so a
@@ -259,6 +303,33 @@ pub const LineProgram = struct {
 
     pub fn deinit(lp: *LineProgram, gpa: std.mem.Allocator) void {
         lp.bytes.deinit(gpa);
+        lp.patches.deinit(gpa);
+    }
+
+    /// Makes the rows after it come from local file index `file`, with
+    /// lines relative to `base` (0 for the function's base line, k + 1 for
+    /// `inlines[k]`'s). Line arguments stay relative to whichever base is
+    /// in effect, so the line register is that base's line + 1 + the row's
+    /// line, and moving any declaration changes only a base line.
+    pub fn switchTo(lp: *LineProgram, gpa: std.mem.Allocator, file: u32, base: u32) !void {
+        std.debug.assert(file < 1 << 21);
+        try lp.bytes.ensureUnusedCapacity(gpa, 4 + 6);
+        try lp.patches.ensureUnusedCapacity(gpa, 2);
+        lp.patches.appendAssumeCapacity(@intCast(lp.bytes.items.len));
+        lp.bytes.appendSliceAssumeCapacity(&.{ std.dwarf.LNS.set_file, @as(u8, @truncate(file)) | 0x80, @as(u8, @truncate(file >> 7)) | 0x80, @intCast(file >> 14) });
+        lp.patches.appendAssumeCapacity(@intCast(lp.bytes.items.len));
+        lp.bytes.appendAssumeCapacity(std.dwarf.LNS.advance_line);
+        lp.bytes.appendSliceAssumeCapacity(&paddedSleb(base));
+        // A row at the offset of the last one adds to it from here.
+        lp.prev = lp.state;
+        lp.prev_len = lp.bytes.items.len;
+    }
+
+    /// `v` as an SLEB128 padded to 5 bytes.
+    pub fn paddedSleb(v: i64) [5]u8 {
+        var out: [5]u8 = undefined;
+        for (&out, 0..) |*b, i| b.* = @as(u7, @truncate(@as(u64, @bitCast(v >> @intCast(7 * i))))) | @as(u8, if (i < 4) 0x80 else 0);
+        return out;
     }
 
     /// Adds a row: the code at `offset` comes from zero-based `line`

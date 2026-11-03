@@ -418,7 +418,7 @@ const unset = std.math.maxInt(u32);
 const value_tag = 1 << 31;
 /// Section names. Outputs without debug info keep the prefix up to the
 /// names they use.
-const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00";
+const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00";
 const shstrtab_no_tls = shstrtab[0..shName(".tdata")];
 const shstrtab_no_cfi = shstrtab[0..shName(".eh_frame")];
 const shstrtab_no_debug = shstrtab[0..shName(".debug_abbrev")];
@@ -476,8 +476,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const n_debug_chunks = std.math.divCeil(usize, n_debug, chunk_len) catch unreachable;
     const debug_chunks = try gpa.alloc(Dwarf.Chunk, n_debug_chunks);
     defer gpa.free(debug_chunks);
-    for (debug_chunks) |*c| c.files = .empty;
-    defer for (debug_chunks) |*c| c.files.deinit(gpa);
+    @memset(debug_chunks, .empty);
+    defer for (debug_chunks) |*c| c.deinit(gpa);
     const file_of = try gpa.alloc(u32, n_debug);
     defer gpa.free(file_of);
     // Atom chunks, then debug chunks.
@@ -606,22 +606,21 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         return error.UndefinedSymbol;
     }
 
-    // Place the debug chunks, and build the file table from their files in
-    // first-use order.
-    var placed = try Dwarf.placeChunks(gpa, debug_chunks);
+    // Place the debug chunks, and build the file and unit tables from their
+    // files and units in first-use order.
+    var placed = try Dwarf.placeChunks(gpa, debug_chunks, options.comp_dir);
     defer placed.deinit(gpa);
-    const files = placed.files;
-    const info_len = placed.info_len;
-    const line_len = placed.line_len;
-    var dwarf: Dwarf = if (files.count() > 0) try .init(gpa, files.keys(), options.comp_dir) else .{};
+    const has_debug = placed.files.count() > 0;
+    var dwarf: Dwarf = if (has_debug) try .init(gpa, &placed, options.comp_dir, base + starts[text]) else .{};
     defer dwarf.deinit(gpa);
 
-    const has_debug = files.count() > 0;
     const abbrev_off = file_end;
     const info_off = abbrev_off + if (has_debug) Dwarf.abbrev.len else 0;
-    const info_size = if (has_debug) dwarf.info_header.len + info_len + 1 else 0;
-    const line_off = info_off + info_size;
-    const line_size = if (has_debug) dwarf.line_header.len + line_len else 0;
+    const info_size = placed.info_size;
+    const ranges_off = info_off + info_size;
+    const ranges_size = if (has_debug) placed.ranges_size else 0;
+    const line_off = ranges_off + ranges_size;
+    const line_size = if (has_debug) dwarf.line_header.len + placed.line_len else 0;
     const str_off = line_off + line_size;
     const str_size = if (has_debug) Dwarf.str.len else 0;
     const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
@@ -629,7 +628,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const shstrtab_off = strtab_off + strtab_len;
     const shstr = if (has_tls) shstrtab else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + 2 * @as(u16, @intFromBool(has_cfi)) + 4 * @as(u16, @intFromBool(has_debug));
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug));
     l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     switch (l.target) {
         .memory => |buf| {
@@ -647,7 +646,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             }
             for (debug_chunks) |*c| {
                 const fde_len = @as(u64, c.n_frames) * (Dwarf.fde_size + Dwarf.eh_frame_hdr_entry_size);
-                l.scratch_len = @max(l.scratch_len, c.info_len + c.line_len + fde_len);
+                const lens = c.lens();
+                l.scratch_len = @max(l.scratch_len, lens.info + lens.ranges + c.line_len + fde_len);
             }
             l.scratch = try gpa.alloc(u8, n_threads * l.scratch_len);
         },
@@ -678,14 +678,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         try l.fill(hdr_off + hdr_size, r_end - (hdr_off + hdr_size));
     }
     if (has_debug) {
-        // Debug info covers all of .text, so atoms without `debug` resolve to
-        // the compile unit but to no function or line.
-        const text_addr = base + starts[text];
         try l.put(abbrev_off, &Dwarf.abbrev);
-        dwarf.finishInfoHeader(info_size, text_addr, sizes[text]);
-        try l.put(info_off, dwarf.info_header);
-        try l.fill(info_off + info_size - 1, 1); // end of the unit's children
-        dwarf.finishLineHeader(line_size);
+        l.info_off = info_off;
+        l.ranges_off = ranges_off;
+        try dwarf.heads(&placed, &l, Link.putDebug);
         try l.put(line_off, dwarf.line_header);
         try l.put(str_off, Dwarf.str);
     }
@@ -697,7 +693,6 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     l.strtab_off = strtab_off;
     l.resolved = resolved;
     l.max_targets = max_targets;
-    l.info_off = info_off + dwarf.info_header.len;
     l.line_off = line_off + dwarf.line_header.len;
     l.eh_off = eh_off;
     l.hdr_off = hdr_off;
@@ -777,6 +772,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const debug_shdrs = [_]elf.Elf64.Shdr{
         nonAlloc(shName(".debug_abbrev"), .PROGBITS, abbrev_off, Dwarf.abbrev.len),
         nonAlloc(shName(".debug_info"), .PROGBITS, info_off, info_size),
+        nonAlloc(shName(".debug_rnglists"), .PROGBITS, ranges_off, ranges_size),
         nonAlloc(shName(".debug_line"), .PROGBITS, line_off, line_size),
         nonAlloc(shName(".debug_str"), .PROGBITS, str_off, str_size),
     };
@@ -886,8 +882,10 @@ fn LinkOf(comptime Input: type) type {
         /// `max_targets` addresses per thread.
         resolved: []u64 = undefined,
         max_targets: usize = undefined,
-        /// Where the chunks' subprogram entries and line sequences start.
+        /// File offsets of .debug_info and .debug_rnglists, and of the line
+        /// sequences, after the line program's header.
         info_off: u64 = undefined,
+        ranges_off: u64 = undefined,
         line_off: u64 = undefined,
         /// File offsets of .eh_frame and .eh_frame_hdr.
         eh_off: u64 = undefined,
@@ -1109,18 +1107,40 @@ fn LinkOf(comptime Input: type) type {
             const begin = chunk * chunk_len;
             const end = @min(l.n_debug, begin + chunk_len);
             const c = &l.debug_chunks[chunk];
-            const offsets = [4]u64{
-                l.info_off + c.info_off,
+            const task = l.chunks.len + chunk;
+            const offsets = [3]u64{
                 l.line_off + c.line_off,
                 l.eh_off + Dwarf.cie.len + @as(u64, c.frame_base) * Dwarf.fde_size,
                 l.hdr_off + Dwarf.eh_frame_hdr_size + @as(u64, c.frame_base) * Dwarf.eh_frame_hdr_entry_size,
             };
-            const out = l.parts(thread, 4, offsets, .{ c.info_len, c.line_len, @as(u64, c.n_frames) * Dwarf.fde_size, @as(u64, c.n_frames) * Dwarf.eh_frame_hdr_entry_size });
-            defer l.writeParts(l.chunks.len + chunk, begin, 4, offsets, out);
+            const lens = [3]u64{ c.line_len, @as(u64, c.n_frames) * Dwarf.fde_size, @as(u64, c.n_frames) * Dwarf.eh_frame_hdr_entry_size };
+            const out = l.parts(thread, 3, offsets, lens);
+            // Each unit's part of the subprogram entries and range lists:
+            // in place, or in the scratch after `out`.
+            const units = c.units.values();
+            const pieces = l.gpa.alloc([]u8, 4 * units.len) catch return l.fail(task, begin, error.OutOfMemory, .{});
+            defer l.gpa.free(pieces);
+            const info = pieces[0..units.len];
+            const ranges = pieces[units.len..][0..units.len];
+            {
+                var at: usize = thread * l.scratch_len + lens[0] + lens[1] + lens[2];
+                for (units, info, ranges) |p, *i, *r| switch (l.target) {
+                    .memory => |buf| {
+                        i.* = buf[l.info_off + p.info_off ..][0..p.info_len];
+                        r.* = buf[l.ranges_off + p.ranges_off ..][0 .. p.n_runs * Dwarf.range_len];
+                    },
+                    .file => {
+                        i.* = l.scratch[at..][0..p.info_len];
+                        at += p.info_len;
+                        r.* = l.scratch[at..][0 .. p.n_runs * Dwarf.range_len];
+                        at += r.len;
+                    },
+                };
+            }
+            @memcpy(pieces[2 * units.len ..], pieces[0 .. 2 * units.len]);
+            var w: Dwarf.ChunkWriter = .{ .c = c, .info = pieces[2 * units.len ..][0..units.len], .ranges = pieces[3 * units.len ..], .aranges = &.{}, .line = out[0], .text_addr = l.section_addrs[@backingInt(Atom.Section.text)] };
             // A local copy: writes to `out` could alias `l`.
             const input = l.input;
-            var info_off: usize = 0;
-            var line_off: usize = 0;
             var fde = c.frame_base;
             const hdr_addr: i64 = @intCast(l.base + l.hdr_off);
             for (l.file_of[begin..end], begin..) |file_of, j| {
@@ -1135,20 +1155,32 @@ fn LinkOf(comptime Input: type) type {
                 const atom = input.debugAtom(j);
                 const addr = l.atomAddr(atom);
                 const size = input.atom(atom).bytes.len;
-                const file = c.file_map[file_of];
-                info_off += Dwarf.writeSubprogram(out[0][info_off..], d, addr, size, file);
-                line_off += Dwarf.writeSequence(out[1][line_off..], d, addr, size, file);
+                w.entry(d, addr, size, file_of);
                 if (d.frame != .none) {
                     const fde_off: u32 = @intCast(Dwarf.cie.len + @as(u64, fde) * Dwarf.fde_size);
                     const fde_addr: i64 = @intCast(l.base + l.eh_off + fde_off);
                     const fn_addr: i64 = @intCast(addr);
                     const k = fde - c.frame_base;
-                    Dwarf.writeFde(out[2][@as(usize, k) * Dwarf.fde_size ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
-                    const entry = out[3][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
+                    Dwarf.writeFde(out[1][@as(usize, k) * Dwarf.fde_size ..][0..Dwarf.fde_size], d.frame, fde_off, @intCast(fn_addr - (fde_addr + 8)), @intCast(size));
+                    const entry = out[2][@as(usize, k) * Dwarf.eh_frame_hdr_entry_size ..][0..8];
                     std.mem.writeInt(i32, entry[0..4], @intCast(fn_addr - hdr_addr), .little);
                     std.mem.writeInt(i32, entry[4..8], @intCast(fde_addr - hdr_addr), .little);
                     fde += 1;
                 }
+            }
+            w.finish();
+            l.writeParts(task, begin, 3, offsets, out);
+            if (l.target == .file) for (units, info, ranges) |p, i, r| {
+                l.writeParts(task, begin, 2, .{ l.info_off + p.info_off, l.ranges_off + p.ranges_off }, .{ i, r });
+            };
+        }
+
+        /// Writes `bytes` at `offset` of a debug section.
+        fn putDebug(l: *Link, section: Dwarf.Section, offset: u64, bytes: []const u8) Error!void {
+            switch (section) {
+                .info => try l.put(l.info_off + offset, bytes),
+                .ranges => try l.put(l.ranges_off + offset, bytes),
+                .aranges => {},
             }
         }
 
@@ -1898,6 +1930,8 @@ test "links many chunks of atoms the same way on any number of threads" {
     var debug: std.ArrayList(Atom.Debug) = .empty;
     var expected: u32 = 0;
     const files = [_][]const u8{ "a.zig", "dir/b.zig", "/abs/c.zig", "dir/d.zig" };
+    // "" is the unit of the first file.
+    const units = [_][]const u8{ "root.zig", "std.zig", "" };
     for (0..n) |i| {
         var e: Encoder = .init(arena);
         try e.line(0, 0);
@@ -1912,9 +1946,11 @@ test "links many chunks of atoms the same way on any number of threads" {
         e.finish();
         expected +%= @intCast(i % 50 + 1);
         const alignments = [_]std.mem.Alignment{ .@"1", .@"16", .@"64" };
-        // Files change every 1000 functions, so chunks share some.
+        // Files change every 1000 functions, so chunks share some, and
+        // units every 300, so units have several ranges in a chunk and
+        // span chunks.
         const name = try std.fmt.allocPrint(arena, "f{d}", .{i});
-        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = e.lines.bytes.items, .frame = .frame_pointer });
+        try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i / 1000 % files.len], .name = name, .base_line = @intCast(i), .lines = e.lines.bytes.items, .frame = .frame_pointer, .unit = units[i / 300 % units.len] });
         try atoms.append(arena, .{ .key = fkey(i), .name = name, .section = .text, .alignment = alignments[i % 3], .bytes = e.code.items, .targets = e.refs.targets.keys(), .relocs = e.refs.relocs.items });
         try atoms.append(arena, constants[i % 50]);
         if (i % 7 == 0) try atoms.append(arena, .{ .key = fkey(n + i), .name = "pad", .section = .bss, .alignment = .@"8", .zero_fill = i % 13 });
@@ -1969,6 +2005,8 @@ test "links many chunks of atoms the same way on any number of threads" {
         const addr = testSymbolAddr(one, name).?;
         const loc = try testSymbolize(di, arena, addr + 7);
         try std.testing.expectEqualStrings(name, loc.name);
+        const unit = units[index / 300 % units.len];
+        try std.testing.expectEqualStrings(if (unit.len > 0) unit else files[0], loc.unit);
         try std.testing.expectEqual(index + 2, loc.line);
         try std.testing.expectEqual(5, loc.column);
         const file = files[index / 1000 % files.len];
@@ -2060,6 +2098,74 @@ test "line programs decode with std.debug.Dwarf" {
     try std.testing.expectEqualStrings("g", g.name);
 
     try std.testing.expectError(error.InvalidDebugInfo, emit(gpa, io, &atoms, .{ .entry = key, .debug = &.{ debug[1], debug[0] } }));
+
+    // Units and inline calls. `main` (unit main.zig) inlines `callMain`
+    // from start.zig at offsets 8..40, which inlines `inner` from mem.zig
+    // at 16..24; `g` is in unit std.zig, and `k` in main.zig again. As
+    // upstream's traces print them, an address takes the name of its
+    // innermost inline call and the line of the inlined code.
+    var mp: Atom.LineProgram = .{};
+    try mp.addRow(arena, 0, 0, 0); // main.zig:11:1
+    try mp.addRow(arena, 4, 2, 4); // main.zig:13:5
+    try mp.switchTo(arena, 1, 1);
+    try mp.addRow(arena, 8, 88, 63); // start.zig:789:64
+    try mp.switchTo(arena, 2, 2);
+    try mp.addRow(arena, 16, 5, 8); // mem.zig:56:9
+    try mp.switchTo(arena, 1, 1);
+    try mp.addRow(arena, 24, 89, 4); // start.zig:790:5
+    try mp.switchTo(arena, 0, 0);
+    try mp.addRow(arena, 40, 4, 4); // main.zig:15:5
+    const inlines = [_]Atom.Debug.Inline{
+        .{ .name = "callMain", .file = 1, .base_line = 700, .call_line = 2, .call_column = 4, .low = 8, .high = 40, .parent = Atom.Debug.Inline.none },
+        .{ .name = "inner", .file = 2, .base_line = 50, .call_line = 88, .call_column = 62, .low = 16, .high = 24, .parent = 0 },
+    };
+    const code64: [64]u8 = @splat(0xcc);
+    const main_key: SymbolKey = .fromName("main");
+    const atoms2 = [_]Atom{
+        .{ .key = .fromName("no debug"), .name = "h", .section = .text, .bytes = &.{ 0xc3, 0xc3, 0xc3 } },
+        .{ .key = main_key, .name = "main", .section = .text, .alignment = .@"16", .bytes = &code64 },
+        .{ .key = .fromName("g"), .name = "g", .section = .text, .bytes = &.{0xc3} },
+        .{ .key = .fromName("k"), .name = "k", .section = .text, .bytes = &.{0xc3} },
+    };
+    const debug2 = [_]Atom.Debug{
+        .{ .atom = 1, .file = "src/main.zig", .name = "main", .base_line = 10, .lines = mp.bytes.items, .frame = .frame_pointer, .unit = "main.zig", .files = &.{ "/zig/std/start.zig", "/zig/std/mem.zig" }, .inlines = &inlines, .patches = mp.patches.items },
+        .{ .atom = 2, .file = "/zig/std/start.zig", .name = "g", .base_line = 0, .lines = &.{}, .frame = .none, .unit = "std.zig" },
+        .{ .atom = 3, .file = "src/main.zig", .name = "k", .base_line = 30, .lines = &.{}, .frame = .none, .unit = "main.zig" },
+    };
+    const out2 = try emit(gpa, io, &atoms2, .{ .entry = main_key, .debug = &debug2, .comp_dir = "/work" });
+    defer gpa.free(out2);
+    var ef2 = try testElfFile(io, out2);
+    defer ef2.deinit(std.debug.getDebugInfoAllocator());
+    const di2 = &ef2.dwarf.?;
+    const main_addr = testSymbolAddr(out2, "main").?;
+    const expected2 = [_]struct { offset: u32, name: []const u8, file: []const u8, line: u64, column: u64 }{
+        .{ .offset = 4, .name = "main", .file = "/work/src/main.zig", .line = 13, .column = 5 },
+        .{ .offset = 10, .name = "callMain", .file = "/zig/std/start.zig", .line = 789, .column = 64 },
+        .{ .offset = 18, .name = "inner", .file = "/zig/std/mem.zig", .line = 56, .column = 9 },
+        .{ .offset = 30, .name = "callMain", .file = "/zig/std/start.zig", .line = 790, .column = 5 },
+        .{ .offset = 50, .name = "main", .file = "/work/src/main.zig", .line = 15, .column = 5 },
+    };
+    for (expected2) |e| {
+        const loc = try testSymbolize(di2, arena, main_addr + e.offset);
+        try std.testing.expectEqualStrings(e.name, loc.name);
+        try std.testing.expectEqualStrings("main.zig", loc.unit);
+        try std.testing.expectEqualStrings(e.file, loc.file);
+        try std.testing.expectEqual(e.line, loc.line);
+        try std.testing.expectEqual(e.column, loc.column);
+    }
+    try std.testing.expectEqualStrings("std.zig", (try testSymbolize(di2, arena, testSymbolAddr(out2, "g").?)).unit);
+    try std.testing.expectEqualStrings("main.zig", (try testSymbolize(di2, arena, testSymbolAddr(out2, "k").?)).unit);
+    // Code before the first function with debug info is in no unit.
+    var no_unit: std.ArrayList(std.debug.Symbol) = .empty;
+    try std.testing.expectError(error.MissingDebugInfo, di2.getSymbols(arena, arena, .little, testSymbolAddr(out2, "h").?, false, &no_unit));
+    // Malformed inline calls and patches are rejected.
+    for ([_]Atom.Debug{
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &.{ inlines[1], inlines[0] }, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = &inlines, .patches = &.{1} },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files[0..1], .inlines = &inlines, .patches = mp.patches.items },
+        .{ .atom = 1, .file = "m.zig", .name = "m", .base_line = 0, .lines = mp.bytes.items, .frame = .none, .files = debug2[0].files, .inlines = inlines[0..1], .patches = mp.patches.items },
+    }) |bad| try std.testing.expectError(error.InvalidDebugInfo, emit(gpa, io, &atoms2, .{ .entry = main_key, .debug = &.{bad} }));
+
     const stripped = try emit(gpa, io, &atoms, .{ .entry = key });
     defer gpa.free(stripped);
     try std.testing.expect(std.mem.indexOf(u8, stripped, ".debug_") == null);
@@ -2209,10 +2315,10 @@ fn testSymbolAddr(elf_bytes: []const u8, name: []const u8) ?u64 {
     return null;
 }
 
-fn testSymbolize(di: *std.debug.Dwarf, arena: Allocator, addr: u64) !struct { name: []const u8, file: []const u8, line: u64, column: u64 } {
+fn testSymbolize(di: *std.debug.Dwarf, arena: Allocator, addr: u64) !struct { name: []const u8, unit: []const u8, file: []const u8, line: u64, column: u64 } {
     var symbols: std.ArrayList(std.debug.Symbol) = .empty;
     try di.getSymbols(arena, arena, .little, addr, false, &symbols);
     const sym = symbols.items[0];
     const loc = sym.source_location orelse return error.MissingDebugInfo;
-    return .{ .name = sym.name orelse return error.MissingDebugInfo, .file = loc.file_name, .line = loc.line, .column = loc.column };
+    return .{ .name = sym.name orelse return error.MissingDebugInfo, .unit = sym.compile_unit_name.?, .file = loc.file_name, .line = loc.line, .column = loc.column };
 }

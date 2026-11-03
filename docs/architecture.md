@@ -427,19 +427,48 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   `auto` is pwrite everywhere. A
   small program links on 1 thread (fewer than 2048 atoms is one chunk).
 - Debug info (`src/link/Dwarf.zig`, shared with the Mach-O linker) is
-  DWARF 5 with one compile unit for the whole output: .debug_abbrev, a
-  .debug_info subprogram entry per function with `debug` (name, low_pc,
-  high_pc, decl_file, decl_line), and one .debug_line sequence per such
-  function. Per-entry sizes depend only on the entry (the file index is a
-  padded ULEB128), so a pass over chunks of 2048 `Debug` entries, run in
-  the same parallel step as address resolution, sizes them and dedups their
-  file paths; a serial step merges the paths into the file table, whose
-  directories are resolved against `comp_dir`; the debug chunks are then
-  written in place as extra tasks of the copy step. Entries whose atom lost
-  to a duplicate are skipped. gdb (`break file.zig:N`, `break fn`, `bt`) and
-  std.debug's ElfFile/Dwarf read it; std.debug requires a .debug_str, so
-  it holds the producer string. Per-module compile units, types,
-  variables, and rbrace (epilogue) rows come later.
+  DWARF 5: .debug_abbrev; in .debug_info a compile unit per
+  `Debug.unit` (the module's root file basename, which upstream names its
+  units after and std.debug prints as "in main (hello.zig)"), holding a
+  subprogram entry per function with `debug` (name, low_pc, high_pc,
+  decl_file, decl_line) and an inlined_subroutine entry per
+  `Debug.inlines` call (name, low_pc, high_pc, call_file, call_line,
+  call_column; nested by `parent`); one .debug_line program that every
+  unit shares (stmt_list 0), with a sequence per function; and each
+  unit's address ranges in .debug_rnglists, as DW_RLE_offset_pair entries
+  with offsets padded to 5 bytes, one per run of consecutive entries of
+  the unit within a chunk. A run also covers code without `Debug`
+  between its functions; code before the first or after the last
+  function of a run is in no unit. Per-entry sizes depend only on the
+  entry (file indices and range offsets are padded LEB128s), so a pass
+  over chunks of 2048 `Debug` entries, run in the same parallel step as
+  address resolution, sizes them, checks their inline calls and patches,
+  and dedups their file paths and units (both first by address: a
+  chunk's entries usually share the same path and unit bytes); a serial
+  step merges the paths into the file table, whose directories are
+  resolved against `comp_dir`, and places each unit's header, the
+  chunks' parts of it in chunk order, and its range list; the debug
+  chunks are then written in place as extra tasks of the copy step, each
+  entry into its unit's part. A fragment is copied unchanged unless it
+  has `Debug.patches`: a `set_file` operand (padded to 3 bytes) becomes
+  the output's file index, and an `advance_line` operand (padded to 5
+  bytes) naming a base (the function's or an inline call's) becomes the
+  difference from the previous base, so rows of inlined code stay
+  relative to the callee's declaration and moving any declaration
+  changes only a base line (`LineProgram.switchTo` writes the pair).
+  Entries whose atom lost to a duplicate are skipped. gdb (`break
+  file.zig:N`, `break fn`, `bt`, which shows inlined frames with their
+  call sites) and std.debug's ElfFile/Dwarf read it; std.debug requires a
+  .debug_str, so it holds the producer string. Types, variables, and
+  rbrace (epilogue) rows come later. Cost under callgrind (three
+  single-thread emits of bench-link, one unit, no inline calls): stripped
+  links unchanged (+513 instructions), debug links +16.7M (5.6M per emit,
+  about 70 per function, against 35M per emit for all debug info);
+  with 20 units interleaved entry by entry, the worst case for runs,
+  another 10M per emit. Linking hello (std) takes about 3 ms before and
+  after; x86_64/binary.zig (117k functions, 285 MB) is dominated by
+  writing the file and within noise (552–670 ms before, 345–568 after,
+  alternating).
 - Call frame information: std.debug unwinds x86_64-linux stacks with DWARF
   CFI (frame-pointer walking counts as unsafe there and is used only for
   panics), looking first for PT_GNU_EH_FRAME. So each `Debug` entry whose
@@ -516,12 +545,11 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   SHA-256 that are the same in both): 463.1M → 464.5M (+0.31%), from code
   layout; wall clock within noise.
 - Mach-O debug info (`Options.debug`) goes where macOS's tools look. The
-  DWARF is ELF's (one compile unit, a subprogram and a line sequence per
-  entry, from the same `Dwarf.zig` passes) in a dSYM bundle,
+  DWARF is ELF's (from the same `Dwarf.zig` passes) in a dSYM bundle,
   `<exe>.dSYM/Contents/Resources/DWARF/<exe>`: an MH_DSYM file with the
   executable's UUID, its segment and section commands without contents
   (as dsymutil and upstream Zig write them), and a __DWARF segment, which
-  also holds a .debug_aranges set covering __text: lldb trusts a dSYM's
+  also holds a .debug_aranges set per unit with its ranges: lldb trusts a dSYM's
   aranges to be complete (dsymutil always writes them) and maps no address
   to a unit without them. lldb shows no Function for DW_LANG_Zig units (it
   has no Zig type system); upstream's self-hosted backend has the same
