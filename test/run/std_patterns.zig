@@ -1,9 +1,11 @@
 //! exit: 0
-//! stdout: "7\n1\n255\n255\n1\n0\n0\n4096\n9\n11\n"
+//! stdout: "7\n1\n255\n255\n1\n0\n0\n4096\n9\n11\n67305985\n0\n4\n"
 //! Patterns std relies on: a generic namespace's declarations captured by
 //! nested types (resolved lazily, so a type can capture itself), a runtime
 //! block with one comptime-known result, @intFromPtr of optional pointers,
-//! and switch prongs of `noreturn` union fields.
+//! switch prongs of `noreturn` union fields, comptime evaluation of
+//! arguments to comptime parameters, and comparisons that a runtime
+//! operand's range decides.
 const rt = @import("rt.zig");
 
 pub export fn _start() callconv(.naked) noreturn {
@@ -76,6 +78,38 @@ fn unmap(memory: []align(page) u8) usize {
     return take(memory.ptr[0..memory.len]) + take2(memory.ptr);
 }
 var page_buf: [8192]u8 align(page) = undefined;
+const Alignment = enum(u6) {
+    @"1" = 0,
+    @"8" = 3,
+    _,
+    pub fn toByteUnits(a: Alignment) usize {
+        return @as(usize, 1) << @backingInt(a);
+    }
+    pub fn of(comptime T: type) Alignment {
+        return @fromBackingInt(@intCast(@ctz(@as(usize, @alignOf(T)))));
+    }
+};
+fn swapAligned(comptime S: type, comptime a: Alignment, ptr: *align(a.toByteUnits()) S) void {
+    ptr.* = @byteSwap(ptr.*);
+}
+fn swap(comptime S: type, ptr: *S) void {
+    swapAligned(S, .of(S), ptr);
+}
+fn H(comptime a: u4, comptime b: u4) type {
+    return struct {
+        linked: if (a == b) void else [4]u8 = undefined,
+        fn gen(self: *@This(), lens: []const u8) u32 {
+            var n: u32 = 0;
+            for (a + 1..b + 1) |bits| {
+                for (lens) |l| {
+                    self.linked[l] = @intCast(bits);
+                    n += 1;
+                }
+            }
+            return n;
+        }
+    };
+}
 fn main() callconv(.c) noreturn {
     var s: SM(u32) = .{};
     s.push(.{ .reg = .{ .a = 7, .b = 1 } });
@@ -101,5 +135,13 @@ fn main() callconv(.c) noreturn {
     rt.printInt(val(m));
     const pm: []u8 = page_buf[0..10];
     rt.printInt(unmap(@alignCast(pm)));
+    var x: u32 = 0x01020304;
+    swap(u32, &x);
+    rt.printInt(x);
+    var h: H(3, 3) = .{};
+    var h2: H(1, 3) = .{};
+    const lens = [_]u8{ 0, 1 };
+    rt.printInt(h.gen(&lens));
+    rt.printInt(h2.gen(&lens));
     rt.exit(0);
 }

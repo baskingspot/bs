@@ -5867,6 +5867,32 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
 
     const lv = sema.resolveValue(lhs);
     const rv = sema.resolveValue(rhs);
+    // A comptime-known operand compared with the runtime operand's whole
+    // range may decide the result, even if the other is undefined, as
+    // upstream (so the branch not taken is never analyzed).
+    for ([2]?Index{ lv, rv }, 0..) |maybe_known, side| {
+        const known = maybe_known orelse continue;
+        const other_ty = if (side == 0) rt else lt;
+        if (!sema.isUndef(known) and Type.class(ip, other_ty) == .int) {
+            // Ordered as `known op other`.
+            const kop = if (side == 0) op else op.reverse();
+            var sk: [2]std.math.big.Limb = undefined;
+            var smin: [2]std.math.big.Limb = undefined;
+            var smax: [2]std.math.big.Limb = undefined;
+            const k = ip.intToBig(known, &sk);
+            const vs_min = k.order(ip.intToBig(try sema.minIntValue(other_ty), &smin));
+            const vs_max = k.order(ip.intToBig(try sema.maxIntValue(other_ty), &smax));
+            const res: ?bool = if (vs_min == .eq and vs_max == .eq) (std.math.Order.eq).compare(kop) else switch (kop) {
+                .eq => if (vs_min == .lt or vs_max == .gt) false else null,
+                .neq => if (vs_min == .lt or vs_max == .gt) true else null,
+                .lt => if (vs_min == .lt) true else if (vs_max != .lt) false else null,
+                .gt => if (vs_max == .gt) true else if (vs_min != .gt) false else null,
+                .lte => if (vs_min != .gt) true else if (vs_max == .gt) false else null,
+                .gte => if (vs_max != .lt) true else if (vs_min == .lt) false else null,
+            };
+            if (res) |r| return .fromInterned(boolValue(r));
+        }
+    }
     if (lv != null and rv != null) {
         if (sema.isUndef(lv.?) or sema.isUndef(rv.?)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
         var sa: [2]std.math.big.Limb = undefined;
@@ -5875,24 +5901,6 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         return .fromInterned(boolValue(order.compare(op)));
     }
     try sema.requireRuntime(block, src);
-    // A comptime-known operand outside the other's range decides the result.
-    if (lv != null or rv != null) {
-        const known = if (lv) |v| v else rv.?;
-        const other_ty = if (lv != null) rt else lt;
-        if (Type.class(ip, other_ty) == .int and !sema.intFits(known, other_ty)) {
-            const known_is_big = sema.intSign(known) > 0;
-            // Relation of the runtime operand to the known one.
-            const runtime_lt_known = known_is_big;
-            const runtime_on_left = lv == null;
-            const left_lt_right = if (runtime_on_left) runtime_lt_known else !runtime_lt_known;
-            return .fromInterned(boolValue(switch (op) {
-                .eq => false,
-                .neq => true,
-                .lt, .lte => left_lt_right,
-                .gt, .gte => !left_lt_right,
-            }));
-        }
-    }
     var ty: Index = undefined;
     if (lc == .comptime_int) ty = rt else if (rc == .comptime_int) ty = lt else {
         const a = Type.intInfo(ip, lt);
