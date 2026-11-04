@@ -412,7 +412,8 @@ pub fn emit(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Options) E
 }
 
 /// `emit` with the atoms and their debug info read from `input` (see
-/// `linkInput`).
+/// `linkInput`). The buffer is advised for huge pages, which can split its
+/// mapping in several: free it, but do not resize it.
 pub fn emitInput(gpa: Allocator, io: std.Io, input: anytype, options: Options) Error![]u8 {
     var out: MemoryOutput = .{ .gpa = gpa };
     errdefer gpa.free(out.buf);

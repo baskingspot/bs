@@ -86,8 +86,12 @@ pub fn emit(gpa: Allocator, io: std.Io, atoms: []const Atom, options: Elf.Option
 /// `emit` with the atoms read from `input` (see `linkInput`).
 pub fn emitInput(gpa: Allocator, io: std.Io, input: anytype, options: Elf.Options, symbols: Symbols) Elf.Error![]u8 {
     const obj = try build(gpa, io, input, options, symbols);
-    defer gpa.free(obj.tail);
-    const out = try gpa.realloc(obj.image, obj.prefix.len + obj.tail.len);
+    defer obj.deinit(gpa);
+    // A new buffer, not the image resized: `Elf.emitInput` advised the
+    // image for huge pages, which splits its mapping, and the page
+    // allocator cannot grow a split mapping in place (mremap fails).
+    const out = try gpa.alloc(u8, obj.prefix.len + obj.tail.len);
+    @memcpy(out[0..obj.prefix.len], obj.prefix);
     @memcpy(out[obj.prefix.len..], obj.tail);
     return out;
 }
@@ -573,6 +577,36 @@ test "an object's symbols and relocations" {
     try std.testing.expectEqualDeep(&[_]Rela{.{ .offset = 1, .ty = @backingInt(elf.R_X86_64.PC32), .name = "helper", .addend = -4 }}, relas(bytes, rela_text, syms, strtab, &buf));
     try std.testing.expectEqual(7, std.mem.readInt(u32, bytes[section(shdrs, shstr, ".text").?.h.offset + 6 ..][0..4], .little));
     try std.testing.expectEqualDeep(&[_]Rela{.{ .offset = 0, .ty = @backingInt(elf.R_X86_64.@"64"), .name = "ext", .addend = 8 }}, relas(bytes, section(shdrs, shstr, ".rela.data").?.h, syms, strtab, &buf));
+}
+
+test "an object larger than a huge page" {
+    // The image `Elf.emitInput` builds is advised for huge pages, which
+    // splits its mapping in three once it holds an aligned 2 MiB range.
+    // The object's relocation records make it larger than the image, and
+    // growing the image in place fails across those mappings.
+    const gpa = std.testing.allocator;
+    const big = try gpa.alloc(u8, 6 << 20);
+    defer gpa.free(big);
+    @memset(big, 0x5a);
+    const n = 1 << 15;
+    const relocs = try gpa.alloc(Atom.Reloc, n);
+    defer gpa.free(relocs);
+    for (relocs, 0..) |*r, i| r.* = .init(@intCast(8 * i), .x86_64_abs64, 0, 0);
+    const slots = try gpa.alloc(u8, 8 * n);
+    defer gpa.free(slots);
+    @memset(slots, 0);
+    const key: SymbolKey = .fromName("big");
+    const ext: SymbolKey = .fromName("import.ext");
+    const atoms = [_]Atom{
+        .{ .key = key, .name = "big", .section = .rodata, .alignment = .@"16", .bytes = big },
+        .{ .key = .fromName("slots"), .name = "slots", .section = .data, .alignment = .@"8", .bytes = slots, .targets = &.{ext}, .relocs = relocs },
+    };
+    const bytes = try emit(gpa, std.testing.io, &atoms, .{ .entry = null }, .{
+        .exports = &.{.{ .key = key, .name = "big" }},
+        .imports = &.{.{ .key = ext, .name = "ext" }},
+    });
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, big) != null);
 }
 
 test "an object with no atoms" {
