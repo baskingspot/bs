@@ -1025,7 +1025,7 @@ class Gen:
             (2, "switch"), (3, "callstmt"), (2, "ptr"), (2, "aggr"), (1, "slice"), (1, "opt"),
             (1, "defer"), (1, "guard"), (1, "labeled"), (1, "inlinefor"), (1, "brk"), (1, "ret"),
             (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
-            (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"),
+            (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -1969,6 +1969,86 @@ class Gen:
             out.append("}")
             self.byref.append(("bp", name, t, None))
         out.append("")
+
+    def s_window(self, ctx):
+        """Loops over windows `sl[i..][0..N]` of a runtime slice, with the
+        guard in the loop condition, before the loop, or on a shrinking
+        bound; indices stepping by more than 1, wrapping near the type's
+        maximum, or starting past the end. Each has a near miss whose
+        check must stay (what prove's offset and loop-start facts decide)."""
+        t = self.rand_int_type()
+        a, b = self.rt_int(ctx, Int(False, 8)), self.rt_int(ctx, Int(False, 8))
+        if a is None or b is None:
+            return self.s_prove(ctx)
+        ctx["fn"].risky = True
+        ra, rb = self.conv(a, Int(False, 8), USIZE), self.conv(b, Int(False, 8), USIZE)
+        L = self.r.randint(4, 16)
+        arr, sl, i = self.fresh("wa"), self.fresh("ws"), self.fresh("wi")
+        n = self.r.randint(1, 4)
+        r = self.r.randrange(n)
+        step = self.pick([1, 1, 2, 3, n])
+        near = self.chance(0.35)
+        tn = t.name()
+        e = lambda x: self.emit(ctx, x)
+        e(f"var {arr}: [{L}]{tn} = @splat({self.int_expr(ctx, t, 1)});")
+        e(f"{arr}[{self.r.randrange(L)}] = {self.int_expr(ctx, t, 1)};")
+        e(f"const {sl}: []const {tn} = {arr}[{ra} % {L // 2}..{L} - {rb} % {L // 2}];")
+
+        def body(x):
+            ctx["indent"] += 1
+            self.sink(ctx, x, t)
+            ctx["indent"] -= 1
+
+        k = self.r.randrange(5)
+        if k == 0:
+            # The guard is the loop condition.
+            e(f"var {i}: usize = {ra} % 3;")
+            cond = f"{i} < {sl}.len" if near else f"{i} + {n} <= {sl}.len"
+            e(f"while ({cond}) : ({i} += {step}) {{")
+            body(f"{sl}[{i}..][0..{n}][{r}]")
+            e("}")
+        elif k == 1:
+            # One guard before the loop covers every window.
+            m = self.r.randint(1, 3)
+            e(f"if ({sl}.len >= {n * m - 1 if near else n * m}) {{")
+            ctx["indent"] += 1
+            e(f"for (0..{m}) |{i}| {{")
+            body(f"{sl}[{i} * {n} ..][0..{n}][{r}]")
+            e("}")
+            ctx["indent"] -= 1
+            e("}")
+        elif k == 2:
+            # A shrinking bound.
+            e(f"var {i}: usize = {sl}.len;")
+            e(f"while ({i} {'> 0' if near else f'>= {n}'}) : ({i} -= @min({step}, {i})) {{")
+            body(f"{sl}[{i} - {n} ..][0..{n}][{r}]")
+            e("}")
+        elif k == 3:
+            # Wrapping +% near the maximum: i +% N <= len says nothing.
+            it = self.fresh("wt")
+            e(f"var {i}: usize = {self.bare((1 << 64) - 1)} - ({ra} & 7);")
+            e(f"var {it}: u8 = 0;")
+            e(f"while ({it} < 12) : ({{ {i} +%= {step}; {it} += 1; }}) {{")
+            ctx["indent"] += 1
+            g = f"{i} +% {n} <= {sl}.len" if near else f"{i} <= {sl}.len and {sl}.len - {i} >= {n}"
+            e(f"if ({g}) {{")
+            body(f"{sl}[{i}..][0..{n}][{r}]")
+            e("}")
+            ctx["indent"] -= 1
+            e("}")
+        else:
+            # A runtime start, possibly past the end; the body may move it.
+            end = self.fresh("we")
+            e(f"const {end}: usize = @min({sl}.len{' + 1' if near and self.chance(0.5) else ''}, {rb} % {L + 2});")
+            e(f"var {i}: usize = {ra} % {L + 2};")
+            e(f"while ({i} < {end}) : ({i} += {step}) {{")
+            body(f"{sl}[{i}]")
+            if near and self.chance(0.5):
+                ctx["indent"] += 1
+                e(f"if (({i} & 1) == 0) {i} += 1;")
+                ctx["indent"] -= 1
+                body(f"{sl}[{i}]")
+            e("}")
 
     def prove_more(self, ctx, k, t, v, near, body, I):
         """More of s_prove: checked adds in compares, blocks left by a
