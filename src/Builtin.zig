@@ -38,6 +38,8 @@ pub const Options = struct {
     glibc: ?std.SemanticVersion = null,
     /// `-lc++`.
     link_libcpp: bool = false,
+    /// `-mcpu` (`cpu.resolve`).
+    cpu: std.Target.Cpu = @import("cpu.zig").baseline,
 };
 
 /// zap's start code for executables that link glibc, in place of glibc's
@@ -127,6 +129,12 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     // code, as upstream's (`--show-builtin`).
     const exe_libc = libc and opts.output_mode == .Exe;
     const glibc = opts.glibc orelse std.SemanticVersion{ .major = 2, .minor = 31, .patch = 0 };
+    // As upstream: every enabled feature, in the feature list's order.
+    var features: std.ArrayList(u8) = .empty;
+    defer features.deinit(gpa);
+    for (opts.cpu.arch.allFeaturesList(), 0..) |feature, i| {
+        if (opts.cpu.features.isEnabled(@intCast(i))) try features.print(gpa, "        .{f},\n", .{std.zig.fmtIdPU(feature.name)});
+    }
     return std.fmt.allocPrint(gpa,
     \\const std = @import("std");
     \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
@@ -143,23 +151,9 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\/// Deprecated; to be removed in 0.18.0. Use `target.cpu` instead.
     \\pub const cpu: std.Target.Cpu = .{{
     \\    .arch = .x86_64,
-    \\    .model = &std.Target.x86.cpu.x86_64,
+    \\    .model = &std.Target.x86.cpu.{f},
     \\    .features = std.Target.x86.featureSet(&.{{
-    \\        .@"64bit",
-    \\        .cmov,
-    \\        .cx8,
-    \\        .fxsr,
-    \\        .idivq_to_divl,
-    \\        .macrofusion,
-    \\        .mmx,
-    \\        .nopl,
-    \\        .slow_3ops_lea,
-    \\        .slow_incdec,
-    \\        .sse,
-    \\        .sse2,
-    \\        .vzeroupper,
-    \\        .x87,
-    \\    }}),
+    \\{s}    }}),
     \\}};
     \\/// Deprecated; to be removed in 0.18.0. Use `target.os` instead.
     \\pub const os: std.Target.Os = .{{
@@ -217,6 +211,8 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         if (opts.is_test) "true" else "false",
         if (opts.single_threaded) "true" else "false",
         if (libc) "gnu" else "none",
+        std.zig.fmtIdPU(opts.cpu.model.name),
+        features.items,
         glibc.major,
         glibc.minor,
         glibc.patch,

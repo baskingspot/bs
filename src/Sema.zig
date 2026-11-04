@@ -20859,10 +20859,6 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref, 
 // analyzed with its usual checks, and the results are reassembled with
 // `aggregate_init`.
 
-/// The architecture `codegen/vector.zig` answers for: zap's one Sema
-/// target so far.
-const vector_arch: std.Target.Cpu.Arch = .x86_64;
-
 /// Whether `op` on `operands`, of vector type `ty`, is emitted as one
 /// instruction on whole vectors: the backend lowers it natively, it runs
 /// at runtime (not in a comptime block, nor in a body lowered for the
@@ -20871,7 +20867,7 @@ const vector_arch: std.Target.Cpu.Arch = .x86_64;
 /// elements, which the scalarized operations fold.
 fn vectorNative(sema: *Sema, block: *Block, op: vector.Op, ty: Index, operands: []const Ref) CompileError!bool {
     if (block.is_comptime or sema.bc != null) return false;
-    if (!vector.native(vector_arch, sema.ip, op, ty)) return false;
+    if (!vector.native(&sema.zcu.cpu, sema.ip, op, ty)) return false;
     var runtime = false;
     for (operands) |o| {
         if (sema.typeOf(o) != ty) return false;
@@ -21328,7 +21324,7 @@ fn zirSelect(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstData) C
     // As `vectorNative`; a runtime predicate selects between comptime-known
     // vectors too.
     const runtime = sema.resolveValue(pred) == null or sema.resolveValue(a) == null or sema.resolveValue(b) == null;
-    if (runtime and !block.is_comptime and sema.bc == null and vector.native(vector_arch, ip, .select, vec_ty) and
+    if (runtime and !block.is_comptime and sema.bc == null and vector.native(&sema.zcu.cpu, ip, .select, vec_ty) and
         !try sema.hasUndefElem(pred) and !try sema.hasUndefElem(a) and !try sema.hasUndefElem(b))
     {
         const payload = try sema.addExtra(Ir.Select{ .pred = pred, .a = a, .b = b });
@@ -21381,8 +21377,8 @@ fn zirShuffle(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     // backend handles as the result; an undefined `b` is one of `a`'s type.
     const native = !block.is_comptime and sema.bc == null and a_len != 0 and
         (sema.resolveValue(a) == null or (b_len != 0 and sema.resolveValue(b) == null)) and
-        vector.native(vector_arch, ip, .shuffle, res_ty) and vector.native(vector_arch, ip, .shuffle, sema.typeOf(a)) and
-        (b_len == 0 or vector.native(vector_arch, ip, .shuffle, sema.typeOf(b))) and
+        vector.native(&sema.zcu.cpu, ip, .shuffle, res_ty) and vector.native(&sema.zcu.cpu, ip, .shuffle, sema.typeOf(a)) and
+        (b_len == 0 or vector.native(&sema.zcu.cpu, ip, .shuffle, sema.typeOf(b))) and
         !try sema.hasUndefElem(a) and (b_len == 0 or !try sema.hasUndefElem(b));
     const elems = try sema.arena.alloc(Ref, mask_len);
     for (elems, 0..) |*e, i| {

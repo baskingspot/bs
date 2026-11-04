@@ -1250,7 +1250,7 @@ Explicit `@Vector` code is lowered to SIMD registers, as upstream's Debug
 backend does, not scalarized. The split has three parts:
 
 - **Which operations** (`src/codegen/vector.zig`, target-neutral):
-  `native(arch, ip, op, ty)` says whether the backend for `arch` lowers
+  `native(cpu, ip, op, ty)` says whether the backend for `cpu` lowers
   `op` on vectors of type `ty` in SIMD registers. Lanes are integers of
   8, 16, 32 or 64 bits, f32 and f64; bool vectors are bits. Sema asks it
   before emitting an operation on whole vectors (`vectorNative`: runtime
@@ -1260,9 +1260,10 @@ backend does, not scalarized. The split has three parts:
   each element is extracted (`array_elem_val`, or folded when
   comptime-known), the scalar operation is analyzed with its usual
   safety checks, and the results are reassembled with `aggregate_init`.
-  So an answer may change only together with the backend. Sema's
-  architecture is a constant (`Sema.vector_arch`, x86_64) until Sema
-  gets target plumbing; aarch64 answers false until NEON lowering lands.
+  So an answer may change only together with the backend. Sema asks
+  for `Zcu.cpu`, which main.zig sets from `-mcpu` (x86_64 only until the
+  aarch64 backend's target plumbing replaces it: `TODO(aarch64-rebased)`
+  there); aarch64 answers false until NEON lowering lands.
 - **The IR**: the existing element-wise tags (`add_wrap`, `sub_wrap`,
   `mul_wrap`, `bit_and`, `bit_or`, `xor`, `not`, `add_float` ...
   `max_float`, `neg_float`, `abs_float`, `sqrt`) carry vector operands,
@@ -1287,10 +1288,9 @@ backend does, not scalarized. The split has three parts:
   point: a vector variable stays in xmm8–xmm15 across them, as a loop's
   accumulator does.
 
-What the x86_64 backend lowers natively, at baseline SSE2 (zap accepts
-only `-mcpu=baseline` today): wrapping add, subtract and negate and
-bitwise ops on integer lanes, multiply on 16- and 32-bit lanes
-(`pmullw`; `pmuludq` twice), `@min`/`@max` on 8- to 32-bit lanes
+What the x86_64 backend lowers natively, at baseline SSE2: wrapping
+add, subtract and negate and bitwise ops on integer lanes, multiply on
+16- and 32-bit lanes (`pmullw`; `pmuludq` twice), `@min`/`@max` on 8- to 32-bit lanes
 (`pminub`, `pminsw`, the other signedness with sign bits flipped,
 32-bit lanes compare and blend), float add, subtract, multiply, divide,
 negate, `@abs` and `@sqrt`, float `@min`/`@max` (`minps` with the
@@ -1310,7 +1310,7 @@ saturating arithmetic, division and remainder of integers, 64-bit
 `@min`/`@max`, float reductions (a left fold, in element order, as
 upstream; a tree would change the rounding and which zero `@min`
 returns), integers wider than 64 bits, f16, f80 and f128, and anything
-longer than 128 bytes or 64 bools. With SSE4.1 (`-mcpu` features, once zap accepts them) `pmulld`,
+longer than 128 bytes or 64 bools. With SSE4.1 (`-mcpu` features) `pmulld`,
 `pminsd`/`pmaxsd`, `pcmpeqq` and `pblendvb` would replace the SSE2
 sequences; AVX changes the vector ABI and is a separate decision.
 
@@ -6308,8 +6308,9 @@ libraries as inputs. To be agreed with that thread.
   with its x86_64 backend.
 - **Aro's arguments** are upstream's (`Compilation.translateC`, read from
   the argv upstream's zig passes its translate-c binary) for zap's
-  target: `-mcpu` is the baseline CPU, so CPU feature macros are the
-  baseline's; the triple is the native one without `-target` (glibc's
+  target: `-mcpu` is zap's CPU (the baseline unless `-mcpu` says
+  otherwise), so CPU feature macros are its; the triple is the native
+  one without `-target` (glibc's
   ABI and detected version, with or without `-lc`, as upstream's native
   target), `x86_64-linux-none` for `-target x86_64-linux`. `-lc` adds
   `-fPIC`, `-D__GLIBC_MINOR__` and glibc's headers from the zig lib
@@ -7297,6 +7298,25 @@ computes the right one instead of copying the bug:
   slot the loader writes (R_X86_64_TPOFF64; "Thread-locals imported from
   shared libraries"), and print the right values. C objects' accesses to
   the same variable were never affected.
+
+Where upstream supports more than zap generates code for, zap narrows
+the choice instead of failing:
+
+- *CPU models and features.* zap accepts x86_64 CPU models and features
+  up to x86-64-v2 (SSE4.2, `src/cpu.zig`), puts them in `builtin.cpu` as
+  upstream does, and keys the cache on them. The default is the
+  baseline CPU, also where upstream defaults to the native one (no
+  `-mcpu`, which is also what `zig build` passes for its native default
+  and `-Dcpu=native`). An explicit AVX feature or a model that has one
+  (`haswell`, `x86_64_v3`), or any other feature past x86-64-v2
+  (`pclmul`), is refused with a message naming the features. Only
+  `-mcpu=native` is clamped: the host's model becomes `x86_64_v2` when
+  the host has all of its instructions, else `x86_64`, plus the host's
+  features zap accepts; std takes its SSE paths, as upstream's on a CPU
+  without AVX.
+  With `cx16` (x86-64-v2) upstream also allows 128-bit atomics; zap
+  keeps refusing them (`Sema.atomicElemType`'s 64-bit limit), since its
+  CodeGen has no `cmpxchg16b` lowering.
 
 ## Known regressions and limitations
 

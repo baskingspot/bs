@@ -108,6 +108,8 @@ pub const Options = struct {
     /// system's for the native target, as upstream's native target; null
     /// for `x86_64-linux`.
     glibc_version: ?std.SemanticVersion,
+    /// `-mcpu` (`cpu.resolve`).
+    cpu: std.Target.Cpu = @import("cpu.zig").baseline,
     link_libc: bool,
     /// `-lc++`: libc++'s headers and configuration for every source, as
     /// upstream gives them to C sources too.
@@ -412,7 +414,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         const st = Io.Dir.cwd().statFile(io, p, .{}) catch break :id "";
         break :id try std.fmt.allocPrint(s, "{s}\x00{d}\x00{d}\x00{d}", .{ p, st.inode, st.size, st.mtime.toNanoseconds() });
     } else "";
-    const target = try cTarget(io, o.glibc_version);
+    const target = try cTarget(io, o.glibc_version, o.cpu);
     const common = try commonArgs(ra, &target, lib, o);
 
     // The runtime libraries first, to know how many of their sources to
@@ -546,12 +548,14 @@ pub fn destroy(b: *Batch) void {
 }
 
 /// The target C compiles for: glibc's version names the ABI, as the
-/// native target does upstream; zap's CPU is the baseline.
-pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion) !std.Target {
+/// native target does upstream, and `cpu` is the compilation's (`-mcpu`).
+pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion, cpu: std.Target.Cpu) !std.Target {
     var buf: [64]u8 = undefined;
     const text = if (glibc_version) |v| try std.fmt.bufPrint(&buf, "x86_64-linux-gnu.{f}", .{v}) else "x86_64-linux-none";
     const query = try std.Target.Query.parse(.{ .arch_os_abi = text, .cpu_features = "baseline" });
-    return std.zig.system.resolveTargetQuery(io, query);
+    var target = try std.zig.system.resolveTargetQuery(io, query);
+    target.cpu = cpu;
+    return target;
 }
 
 /// The arguments that depend only on the target and the lib directory.

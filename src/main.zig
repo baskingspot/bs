@@ -17,6 +17,7 @@ const ElfShared = @import("link/ElfShared.zig");
 const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
 const CSource = @import("CSource.zig");
+const cpu_mod = @import("cpu.zig");
 
 pub const zig_version = "0.17.1";
 
@@ -55,6 +56,9 @@ pub const Options = struct {
     /// `-femit-docs[=path]`: the autodocs directory (Docs.zig).
     emit_docs: union(enum) { default, path: []const u8, none } = .none,
     target: ?[]const u8 = null,
+    /// `-mcpu`, resolved (`cpu.resolve`): the baseline unless it names a
+    /// CPU up to x86-64-v2.
+    cpu: std.Target.Cpu = cpu_mod.baseline,
     zig_lib_dir: ?[]const u8 = null,
     /// `--cache-dir` and `--global-cache-dir`.
     cache_dir: ?[]const u8 = null,
@@ -313,7 +317,10 @@ pub fn main(init_std: std.process.Init) !void {
 /// Valgrind. ('=' is in no module's name.)
 /// Atoms inlined other than by default (`inlining`) get entries of their
 /// own too, as `+inline<budget>` and `s` for the safe variant, and
-/// atoms with every check kept (`ZAP_PROVE=off`) as `+noprove`.
+/// atoms with every check kept (`ZAP_PROVE=off`) as `+noprove`. A CPU
+/// other than the baseline (`-mcpu`), which changes builtin and the code
+/// generated for every function, follows the target as `@<model>` and its
+/// feature words (`cpu.cacheName`).
 fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.process.Environ.Map) ![]const u8 {
     const inl = inlining(env);
     const default_inl = inl.budget == inline_ir.budget and !inl.safe;
@@ -322,9 +329,11 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
     } else true;
     const unsafe = opts.optimize == .fast or opts.optimize == .small;
     const prove_on = proving(env);
-    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on) return "x86_64-linux";
+    const cpu_name = try cpu_mod.cacheName(arena, opts.cpu);
+    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes and prove_on and cpu_name.len == 0) return "x86_64-linux";
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(arena, "x86_64-linux");
+    try s.appendSlice(arena, cpu_name);
     if (opts.fuzz) {
         try s.appendSlice(arena, "+fuzz");
         if (!opts.root_fuzz) try s.appendSlice(arena, "-root");
@@ -412,6 +421,7 @@ pub const Job = struct {
             .dynamic = opts.dynamic,
             .glibc = if (opts.link_libc) opts.glibc_version else null,
             .link_libcpp = opts.link_libcpp,
+            .cpu = opts.cpu,
         };
         const builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), builtin_opts);
         // A module whose `-O`, `-ferror-tracing` or `-fvalgrind` differs
@@ -442,6 +452,7 @@ pub const Job = struct {
                 .optimize = .fast,
                 .error_tracing = false,
                 .valgrind = false,
+                .cpu = opts.cpu,
             })
         else
             null;
@@ -671,6 +682,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .zig_lib_dir = job.zig_lib_dir,
         .local_cache = job.cache_dirs.local,
         .glibc_version = glibc_version,
+        .cpu = opts.cpu,
         .link_libc = opts.link_libc,
         .link_libcpp = opts.link_libcpp,
         .cxx_runtime = cxxRuntime(opts),
@@ -771,6 +783,9 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     zcu.is_test = is_test;
     zcu.name_pins = pins.*;
     zcu.single_threaded = opts.single_threaded;
+    // TODO(aarch64-rebased): the CPU of `opts.zap_target` (apple_m1 for
+    // aarch64-macos), which `vector.native` answers for.
+    zcu.cpu = opts.cpu;
     zcu.link_libc = opts.link_libc;
     zcu.link_libcpp = opts.link_libcpp;
     zcu.test_filters = opts.test_filters;
@@ -1568,12 +1583,16 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.eql(u8, arg, "--name")) {
             opts.name = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "-target")) {
-            opts.target = nextArg(args, &i, arg);
-        } else if (std.mem.eql(u8, arg, "-mcpu")) {
-            const cpu = nextArg(args, &i, arg);
-            // zap generates code for the baseline x86_64 CPU, for native too.
-            if (!std.mem.eql(u8, cpu, "baseline") and !std.mem.eql(u8, cpu, "native") and !std.mem.eql(u8, cpu, "x86_64"))
-                setUnsupported(&opts, arena, "zap generates code for the baseline CPU only ('-mcpu {s}')", .{cpu});
+            const t = nextArg(args, &i, arg);
+            // `zig build` names the native OS with the CPU's architecture
+            // when it passes a CPU (`-target x86_64-native -mcpu x86_64_v2`
+            // for `-Dcpu=x86_64_v2`).
+            opts.target = if (std.mem.eql(u8, t, "native-native") or std.mem.eql(u8, t, @tagName(builtin.cpu.arch) ++ "-native")) "native" else t;
+        } else if (std.mem.eql(u8, arg, "-mcpu") or std.mem.startsWith(u8, arg, "-mcpu=")) {
+            const text = if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else nextArg(args, &i, arg);
+            const r = cpu_mod.resolve(arena, io, text);
+            opts.cpu = r.cpu;
+            if (r.refused) |msg| setUnsupported(&opts, arena, "{s}", .{msg});
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
@@ -2135,6 +2154,7 @@ pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
 test {
     _ = Frontend;
     _ = @import("cache.zig");
+    _ = @import("cpu.zig");
     _ = @import("link/Atom.zig");
     _ = @import("link/Elf.zig");
     _ = @import("link/ElfObject.zig");

@@ -145,6 +145,9 @@ is_test: bool = false,
 /// `-fsingle-threaded`: `threadlocal` variables are ordinary globals, as
 /// upstream (std's start code sets up no thread pointer then).
 single_threaded: bool = false,
+/// `-mcpu`: the CPU code is generated for, whose features say which vector
+/// operations the backend lowers natively (`codegen/vector.zig`).
+cpu: std.Target.Cpu = @import("cpu.zig").baseline,
 /// `-lc`: `extern "c"` declarations may be used (`Sema.checkExternLibName`).
 link_libc: bool = false,
 /// `-lc++`: `extern "c++"` and `extern "unwind"` declarations may be used.

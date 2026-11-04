@@ -33,6 +33,9 @@ const Request = struct {
     /// system's without `-target`, as upstream's native target, with or
     /// without `-lc`; null for `x86_64-linux(-none)`.
     glibc_version: ?std.SemanticVersion,
+    /// `-mcpu`, as for a compilation (`cpu.resolve`): it sets the macros
+    /// the headers see (`__SSE4_1__`).
+    cpu: std.Target.Cpu,
     /// The user's C flags (include directories, macros), in order.
     cc_args: []const []const u8,
     /// `std.zig.system.NativePaths`' include directories, after libc's:
@@ -57,7 +60,7 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-freference-trace"}, .{"-fno-reference-trace"}, .{"-fstack-check"}, .{"-fno-stack-check"},
 });
 const ignored_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
-    .{"--name"}, .{"--color"}, .{"-mcpu"}, .{"--error-limit"}, .{"--debug-log"},
+    .{"--name"}, .{"--color"}, .{"--error-limit"}, .{"--debug-log"},
 });
 
 fn parse(init: std.process.Init, args: []const []const u8) !Request {
@@ -74,6 +77,10 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
             opts.listen = true;
         } else if (std.mem.eql(u8, arg, "-target")) {
             opts.target = next(args, &i);
+        } else if (std.mem.eql(u8, arg, "-mcpu") or std.mem.startsWith(u8, arg, "-mcpu=")) {
+            const r = @import("cpu.zig").resolve(arena, io, if (arg.len > "-mcpu".len) arg["-mcpu=".len..] else next(args, &i));
+            opts.cpu = r.cpu;
+            if (r.refused) |msg| main.setUnsupported(&opts, arena, "{s}", .{msg});
         } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
             opts.zig_lib_dir = next(args, &i);
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
@@ -145,6 +152,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         .source = source orelse if (opts.unsupported != null) "" else main.fatal("expected a C source file to translate", .{}),
         .link_libc = opts.link_libc,
         .glibc_version = opts.glibc_version,
+        .cpu = opts.cpu,
         .cc_args = cc_args.items,
         .native_includes = native_includes,
         .listen = opts.listen,
@@ -267,7 +275,8 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     });
     const query_text = if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "x86_64-linux-gnu.{f}", .{v}) else "x86_64-linux-none";
     const query = try std.Target.Query.parse(.{ .arch_os_abi = query_text, .cpu_features = "baseline" });
-    const target = try std.zig.system.resolveTargetQuery(io, query);
+    var target = try std.zig.system.resolveTargetQuery(io, query);
+    target.cpu = req.cpu;
     if (req.link_libc) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
     try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ lib, "include" }) });
     if (req.link_libc) {

@@ -107,10 +107,10 @@ pub fn narrow(ip: *const InternPool, ty: Index) bool {
 pub const max_bytes = 128;
 pub const max_bools = 64;
 
-/// Whether the backend for `arch` lowers `op` natively on vectors of type
+/// Whether the backend for `cpu` lowers `op` natively on vectors of type
 /// `ty` (the operands' type; for `select` and `shuffle` the result's).
-pub fn native(arch: std.Target.Cpu.Arch, ip: *const InternPool, op: Op, ty: Index) bool {
-    switch (arch) {
+pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Index) bool {
+    switch (cpu.arch) {
         .x86_64 => {},
         // NEON lowering comes with the aarch64 backend.
         else => return false,
