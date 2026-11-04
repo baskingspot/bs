@@ -1736,13 +1736,16 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         opts.root_deps = try dropDeps(arena, opts.root_deps, rootless.items);
         for (modules.items) |*m| m.deps = try dropDeps(arena, m.deps, rootless.items);
     }
-    opts.root_fuzz = root_fuzz orelse fuzz orelse false;
+    // Per-module flags after the last `-M` belong to no module, unless the
+    // root file is given by position.
+    if (positional_root) {
+        root_fuzz = fuzz;
+        root_mode = mode;
+    }
+    opts.root_fuzz = root_fuzz orelse false;
     // As upstream's `Config.resolve` and `Module.create`: error tracing and
     // Valgrind client requests are on in Debug and off in ReleaseSafe
     // unless asked for.
-    // Those after the last `-M` belong to no module, unless the root file
-    // is given by position.
-    if (positional_root) root_mode = mode;
     opts.optimize = root_mode.optimize orelse .debug;
     opts.error_tracing = root_mode.error_tracing orelse (opts.optimize == .debug);
     opts.valgrind = root_mode.valgrind orelse (opts.optimize == .debug);
