@@ -2718,6 +2718,12 @@ through them.
   `throw 5`, a static constructor and `thread_local` with a dynamic
   initializer give upstream's result. The C thread keeps the committed
   test with its `-lc++`.
+- `__dso_handle`, which C++ passes to `__cxa_atexit`: crtbegin.o defines
+  it, which zap does not link, so when nothing else does, the
+  resolution (after compiler_rt, before shared libraries) defines it as
+  an 8-byte rodata atom, as lld defines it; only its address in the
+  image matters. The `-lc` C object test registers an exit handler with
+  it.
 - Keyed links only, like `local_symbols`; builds with inputs do not
   relink from the manifest.
 - Tests: the C object test (test/link_input/ub.c) checks the trace's

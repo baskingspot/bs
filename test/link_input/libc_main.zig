@@ -5,10 +5,12 @@ extern fn c_fmt(x: c_int) [*:0]const u8;
 extern fn c_errno() c_int;
 extern fn c_puts(s: [*:0]const u8) void;
 extern fn c_qsort() c_int;
+extern fn c_atexit() void;
 export fn zig_twice(x: c_int) c_int {
     return 2 * x;
 }
 pub fn main() void {
+    c_atexit();
     c_puts(c_fmt(21));
     std.debug.print("{d} {d}\n", .{ c_errno(), c_qsort() });
 }

@@ -839,6 +839,15 @@ fn Converter(comptime Ctx: type) type {
             if (try c.ctx.zigExport(name)) |key| return .{ .key = key, .offset = 0 };
             if (try c.in.lookup(name)) |t| return t;
             if (try c.ctx.rtExport(name)) |key| return .{ .key = key, .offset = 0 };
+            // The image's own handle, which C++ code passes to
+            // `__cxa_atexit` and `__cxa_thread_atexit`: crtbegin.o defines
+            // it, which zap does not link, so the linker does, as lld.
+            // Only its address matters, which must be in the image.
+            if (std.mem.eql(u8, name, "__dso_handle")) {
+                const key: SymbolKey = .fromName("obj:__dso_handle");
+                try c.atoms.append(c.in.arena, .{ .key = key, .name = name, .section = .rodata, .alignment = .@"8", .bytes = &@as([8]u8, @splat(0)) });
+                return .{ .key = key, .offset = 0 };
+            }
             if (try c.ctx.importSym(name, weak)) |key| return .{ .key = key, .offset = 0, .import = true };
             return null;
         }
