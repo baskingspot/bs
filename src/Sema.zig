@@ -400,6 +400,10 @@ pub const Block = struct {
         merges: ?*Merges = null,
         /// The runtime inline call this one is in, if any.
         parent: ?*const Inlining = null,
+        /// The errors stored through the call's return pointer (`ret_ptr`),
+        /// whose type has the placeholder set: what `ret_load` returns
+        /// (see `analyzeRet`). `none` until something is stored.
+        ret_ptr_errors: Index = .none,
     };
 
     pub const Param = struct {
@@ -4350,12 +4354,23 @@ fn zirCondbr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!?[]
 
 /// `operand_src` is the returned expression, where coercion errors point,
 /// as upstream.
-fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src, operand_src: Src) CompileError!void {
+fn analyzeRet(sema: *Sema, b: *Block, operand_in: Ref, src: Src, operand_src: Src) CompileError!void {
+    var operand = operand_in;
     if (b.inlining) |inlining| {
         // An inlined function's inferred error set is what its returns
         // produce.
         var ty = inlining.ret_ty;
         if (sema.ip.keyTag(ty) == .error_union_type and sema.ip.keyPayload(.error_union_type, ty).error_set_type == .adhoc_inferred_error_set_type) {
+            // Loaded from the return pointer (`ret_load`): the value has
+            // the placeholder set and carries the errors stored there.
+            if (sema.typeOf(operand) == ty) {
+                const set = if (inlining.ret_ptr_errors != .none) inlining.ret_ptr_errors else try sema.intern(.{ .error_set_type = &.{} });
+                const stored_ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = set, .payload_type = sema.ip.keyPayload(.error_union_type, ty).payload_type } });
+                operand = if (sema.resolveValue(operand)) |v| .fromInterned(switch (sema.ip.indexToKey(v)) {
+                    .error_union => |e| try sema.intern(.{ .error_union = .{ .ty = stored_ty, .val = e.val } }),
+                    else => try sema.undefValue(stored_ty),
+                }) else try sema.addTyOp(b, .bitcast, stored_ty, operand);
+            }
             const op_ty = sema.typeOf(operand);
             const set: Index = switch (Type.class(sema.ip, op_ty)) {
                 .error_union => sema.ip.keyPayload(.error_union_type, op_ty).error_set_type,
@@ -8545,6 +8560,9 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             else => try sema.intern(.{ .error_set_type = &.{} }),
         };
         if (set != .adhoc_inferred_error_set_type) {
+            // A value stored through the return pointer keeps its errors
+            // in the call's, for `ret_load`.
+            if (block.inlining) |inl| inl.ret_ptr_errors = if (inl.ret_ptr_errors == .none) set else try sema.mergeErrorSets(block, src, inl.ret_ptr_errors, set);
             const payload = ip.keyPayload(.error_union_type, dest_ty).payload_type;
             return sema.coerceInner(block, try sema.intern(.{ .error_union_type = .{ .error_set_type = set, .payload_type = payload } }), inst, src);
         }

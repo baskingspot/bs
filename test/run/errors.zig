@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n41\nNope\nBad\nother\nA\n7\nGenericFailure\nWeird name!\n1\n"
+//! stdout: "42\n1\n2\n42\nempty\n21\n2\n100\n1\n1\n13\n13\n104\n63\n4\n4\n7\n1\n0\n1\nBadDigit\nEmpty\n0\n7\n99\n23\n3\n98\n97\n4\nB\n5\n9\n5\n100\nY\n200\n16\n41\nNope\nBad\nother\nA\n7\nGenericFailure\nWeird name!\n1\n100\n8\n200\n9\n300\n12\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -193,6 +193,13 @@ fn main() callconv(.c) noreturn {
     const merged = @typeInfo(error{ MergeOne, MergeTwo } || error{MergeThree}).error_set.error_names.?;
     comptime if (merged.len != 3 or merged[1][6] != 'w' or merged[2][6] != 'h') unreachable;
     comptime if (@hasDecl(Hidden, "secret") or !@hasDecl(Hidden, "open")) unreachable;
+    // An inline callee's struct result goes through its return pointer:
+    // the caller's inferred set still gets exactly its errors.
+    for ([_][2]u8{ .{ 0, 0 }, .{ 0, 1 }, .{ 1, 0 }, .{ 1, 1 }, .{ 2, 0 }, .{ 2, 5 } }) |c| {
+        var in = c;
+        _ = &in;
+        rt.printInt(viaRetPtr(&in));
+    }
     rt.exit(if (e) |_| 1 else |err| if (err == error.Empty) 0 else 2);
 }
 
@@ -306,3 +313,32 @@ const Acc = struct {
         a.sum += i;
     }
 };
+
+const Res = struct { n: u8, m: u8 = 7 };
+fn parseRes(in: []const u8) !Res {
+    if (in[0] == 1) return resOrWorse(in);
+    if (in[0] == 2) return resOrDeep(in);
+    return resOrBad(in);
+}
+inline fn resOrBad(in: []const u8) !Res {
+    if (in[1] == 0) return error.Bad;
+    return .{ .n = 1 };
+}
+inline fn resOrWorse(in: []const u8) !Res {
+    return if (in[1] == 0) error.Worse else .{ .n = 2 };
+}
+fn deep(x: u8) error{Deep}!Res {
+    if (x == 0) return error.Deep;
+    return .{ .n = x };
+}
+inline fn resOrDeep(in: []const u8) !Res {
+    return deep(in[1]);
+}
+fn viaRetPtr(in: []const u8) u64 {
+    const r = parseRes(in) catch |err| return switch (err) {
+        error.Bad => 100,
+        error.Worse => 200,
+        error.Deep => 300,
+    };
+    return r.n + r.m;
+}
