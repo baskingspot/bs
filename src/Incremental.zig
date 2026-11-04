@@ -1755,6 +1755,23 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
             return inc.lazyFallback("exports or tests changed", .{});
         if (!refs_eql or m.node(f).result_hash != n.result_hash) w.* = true;
     }
+    // A function generated again that a unit left green exports
+    // (`Replay.greenNode`): its atom's name would be the declaration's,
+    // since `Emit.nameAtoms` names functions from this build's exports.
+    {
+        var exported = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+        defer exported.deinit(gpa);
+        for (0..n_prev) |i| {
+            const refs = m.nodeRefs(@intCast(i));
+            for (refs) |ref| {
+                if (ref.kind != .analyze) continue;
+                for (refs) |fr| if (fr.kind == .func and fr.value < n_prev) exported.set(fr.value);
+                break;
+            }
+        }
+        for (nodes, final, write) |n, f, w| if (w and f < n_prev and n.tag == .func and exported.isSet(f))
+            return inc.lazyFallback("a function an @export names was generated again", .{});
+    }
     // Tests or exports in a new namespace: as above.
     for (nodes, final, 0..) |n, f, ni| if (f >= n_prev and n.tag == .namespace) {
         for (node_refs.items[ref_starts[ni]..ref_starts[ni + 1]]) |nr| {

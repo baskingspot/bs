@@ -3594,7 +3594,12 @@ once, where store payloads would repeat `[]const u8` in every entry.
   set (an edit build can add the first reader); `comptime_decl` has
   no result, only its dependencies and references. A unit that `@export`s (`Zcu.Export.unit`; null
   for `export` declarations, which the namespace scan recreates) has an
-  `analyze` reference, so an edit build analyzes it rather than load it.
+  `analyze` reference, so an eager edit build analyzes it rather than
+  load it. A lazy one leaves it green like any other unit (its exports
+  stay in the manifest), unless it is outdated and a dependency's result
+  changed: std.start's `@export(&main, ...)` under `-lc` depends on the
+  root's `main`, so without this every edit there would run it again
+  and fall back.
 - `builtin.test_functions` is filled outside unit analysis
   (`populateTestFunctions`, after all tests are known), so the test list is
   its own node, and adding or removing a test changes it.
@@ -3914,7 +3919,9 @@ records only what changed, and links from the manifest.
   again in the same process as an eager edit build, with the log
   untouched (`error.LazyFallback`, which `main.compile` catches, so that
   the `--listen=-` server falls back too):
-  an `@export` that ran again, exported or test declarations added or
+  an `@export` that ran again, a function generated again that an
+  `@export` left green names (`Emit.nameAtoms` would name its atom after
+  the declaration), exported or test declarations added or
   removed, a declaration's data lowered for the first time without its
   unit being analyzed, or a change in the link's inputs outside the atoms
   (external symbols, whether the error name table is written, and new

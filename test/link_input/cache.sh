@@ -113,16 +113,13 @@ lc_objects() {
     gcc -fPIE -c copy.c -o copy.o
 }
 if command -v gcc >/dev/null; then
-    # Edits go to a file without exports: a file whose export ran again
-    # builds eagerly.
-    sed -i 's/c_fmt(21)/c_fmt(@import("lc_arg.zig").arg)/' libc_main.zig
-    echo 'pub const arg = 21;' >lc_arg.zig
     lc_objects
     build "no manifest" "x=21 twice=42"
     rm main
     build "no input changed; relinked" "x=21 twice=42"
-    echo 'pub const arg = 22;' >lc_arg.zig
-    build "inputs changed, first $work/lc_arg.zig" "x=22 twice=44"
+    # Lazy, though std.start's `@export(&main, ...)` depends on `main`.
+    sed -i 's/c_fmt(21)/c_fmt(22)/' libc_main.zig
+    build "inputs changed, first $work/libc_main.zig" "x=22 twice=44"
     lazy "-lc: the Zig code changed"
     sed -i 's/x=%d/X=%d/' libc.c
     lc_objects
