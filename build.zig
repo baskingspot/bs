@@ -731,6 +731,26 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     so_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
     so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&so_run.step);
+    // As upstream's `Config.resolve`: a static library finds its `-l`
+    // shared libraries and leaves them out; without `-static` linking one
+    // makes the library shared, which zap does not build yet.
+    for ([_]bool{ true, false }) |static| {
+        const lsys = b.addSystemCommand(&.{ "sh", "-c", "set -e; z=$(realpath \"$1\") so=$(realpath \"$2\") src=$(realpath \"$4\"); cd \"$5\"; \"$z\" build-lib -L\"$(dirname \"$so\")\" -lzappic $3 -femit-bin=liblsys.a \"$src\"; ar t liblsys.a", "sh" });
+        lsys.setName(b.fmt("zap build-lib -lzappic{s}", .{if (static) " -static" else ""}));
+        lsys.addArtifactArg(zap);
+        lsys.addFileArg(so_file);
+        lsys.addArg(if (static) "-static" else "");
+        lsys.addFileArg(b.path("test/obj/lib.zig"));
+        _ = lsys.addOutputDirectoryArg("work");
+        if (static) {
+            lsys.addCheck(.{ .expect_stdout_exact = "lib.o\n" });
+            lsys.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        } else {
+            lsys.addCheck(.{ .expect_stderr_match = "zap does not link libraries into shared libraries yet ('-lzappic')" });
+            lsys.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        }
+        test_step.dependOn(&lsys.step);
+    }
 
     // The same library as zap's own shared object, loaded by a program
     // upstream links against it and by a C program with dlopen.

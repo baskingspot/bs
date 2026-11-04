@@ -1722,6 +1722,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // `-l` names, resolved against `lib_dirs` once all arguments are read.
     var libs: std.ArrayList(LibQuery) = .empty;
     var lib_dirs: std.ArrayList([]const u8) = .empty;
+    // `-static` and `-dynamic`, the last one given (upstream's `link_mode`).
+    var link_mode: ?std.lang.LinkMode = null;
     var lib_search: LibQuery.Search = .{};
     var rpaths: std.ArrayList([]const u8) = .empty;
     var sysroot = false;
@@ -1789,12 +1791,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             }
         } else if (std.mem.eql(u8, arg, "-dynamic")) {
             lib_search = .{ .strategy = .mode_first, .static = false };
-            // Shared objects, which are position-independent; executables
-            // stay static.
-            if (command == .build_lib) {
-                opts.dynamic = true;
-                opts.pic = true;
-            } else opts.exe_dynamic = true;
+            link_mode = .dynamic;
         } else if (std.mem.startsWith(u8, arg, "-fsoname=")) {
             opts.soname = .{ .name = arg["-fsoname=".len..] };
         } else if (std.mem.eql(u8, arg, "-fsoname")) {
@@ -1929,6 +1926,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             opts.stack_size = std.fmt.parseUnsigned(u64, v, 0) catch fatal("invalid stack size: '{s}'", .{v});
         } else if (LibQuery.searches.get(arg)) |search| {
             lib_search = search;
+            if (std.mem.eql(u8, arg, "-static")) link_mode = .static;
         } else if (std.mem.eql(u8, arg, "-L")) {
             try lib_dirs.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "-L")) {
@@ -1988,8 +1986,6 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             } else if (libcpp_names.has(name)) {
                 opts.link_libcpp = true;
                 opts.link_libc = true;
-            } else if (command == .build_obj or command == .build_lib) {
-                setUnsupported(&opts, arena, "zap does not link libraries into objects or libraries yet ('-l{s}'); build this step with upstream zig", .{name});
             } else {
                 try libs.append(arena, .{ .name = name, .at = link_inputs.items.len, .search = lib_search });
                 try link_inputs.append(arena, "");
@@ -2030,6 +2026,15 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     }
     if (opts.target) |target| checkTarget(&opts, arena, target) else if (!(builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux))
         setUnsupported(&opts, arena, "zap does not implement aarch64-macos code generation yet ('native'); pass -target x86_64-linux", .{});
+    // The last of `-static` and `-dynamic` (upstream's `link_mode`). Shared
+    // objects are position-independent; executables stay static unless
+    // they link libc.
+    if (link_mode == .dynamic) {
+        if (command == .build_lib) {
+            opts.dynamic = true;
+            opts.pic = true;
+        } else opts.exe_dynamic = true;
+    }
     if (opts.exe_dynamic and !opts.link_libc and command != .build_lib)
         setUnsupported(&opts, arena, "zap links executables statically unless they link libc ('-dynamic'); add -lc or build this step with upstream zig", .{});
     // As upstream (`requiresPIC`): glibc makes objects and libraries
@@ -2079,13 +2084,22 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             fatal("unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
     }
     // As upstream, an object or a static library links nothing: it leaves
-    // archive inputs out, and a static library holds object inputs as
-    // members after its own object. Merging objects into an object (or a
-    // shared library) is a relocatable link zap does not do yet.
+    // archive and shared library inputs out (`-l` names are still found),
+    // and a static library holds object inputs as members after its own
+    // object. Merging objects into an object (or a shared library) is a
+    // relocatable link zap does not do yet.
     if (command == .build_obj or command == .build_lib) {
+        // As upstream's `Config.resolve`, a library that links a shared
+        // one without `-static` or `-dynamic` is shared.
+        if (command == .build_lib and link_mode == null) for (link_inputs.items) |path| if (isSharedLib(path)) {
+            opts.dynamic = true;
+            opts.pic = true;
+        };
+        if (opts.dynamic and libs.items.len != 0)
+            setUnsupported(&opts, arena, "zap does not link libraries into shared libraries yet ('-l{s}'); build this step with upstream zig", .{libs.items[0].name});
         var kept: usize = 0;
         for (link_inputs.items) |path| {
-            if (std.mem.eql(u8, std.fs.path.extension(path), ".a")) {
+            if (std.mem.eql(u8, std.fs.path.extension(path), ".a") or (!opts.dynamic and isSharedLib(path))) {
                 Io.Dir.cwd().access(io, path, .{}) catch fatal("{s}: file not found", .{path});
                 continue;
             }

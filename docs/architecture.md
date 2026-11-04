@@ -3093,7 +3093,11 @@ thread's abilists imports. No bytes come from it.
   `std.zig.system.NativePaths` follow the `-L` ones, as upstream's
   `want_native_include_dirs`. `-L` directories that do not exist are
   dropped (upstream warns). A name found nowhere is a fatal error, as
-  upstream's.
+  upstream's. An object or static library still finds its `-l` names but
+  links none of them (raylib's `build-lib -lGL -lX11 ... -static`). As
+  in upstream's `Config.resolve` (`any_dyn_libs`), a library that links
+  a shared library without `-static` is a shared library, which is
+  `[unsupported]` with `-l` for now.
 - DT_RUNPATH: the `-rpath` arguments, then, on the native target, the
   `-L` directories, deduplicated and joined with `:` (upstream's rule).
   No RUNPATH without either, so other `-lc` outputs stay byte-identical.
