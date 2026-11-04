@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -145,6 +145,16 @@ fn readWith(comptime cb: *const fn (r: error{ Eof, Reset }!u32) u32, r: error{ E
     return cb(r);
 }
 
+// tokamak (util/shm.zig): a zero-terminated slice coerces to a C pointer.
+fn cStrLen(s: [*c]const u8) u64 {
+    var n: u64 = 0;
+    while (s[n] != 0) n += 1;
+    return n;
+}
+fn passName(name: [:0]const u8) u64 {
+    return cStrLen(name);
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -201,5 +211,6 @@ fn main() callconv(.c) noreturn {
     var eof: error{ Eof, Reset }!u32 = error.Reset;
     _ = &eof;
     rt.printInt(readWith(readCb, eof));
+    rt.printInt(passName("tokamak"));
     rt.exit(0);
 }

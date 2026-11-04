@@ -7496,6 +7496,14 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
         const raw = try sema.slicePtr(block, inst);
         return try sema.coercePtrTo(block, raw, dest_ty);
     }
+    // A zero-terminated `[:0]T` to `[*c]T`, as upstream.
+    if (s.flags.size == .slice and d.flags.size == .c) {
+        if (s.child != d.child and !sema.sameScalarRepr(s.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child))) return null;
+        if (s.flags.is_const and !d.flags.is_const) return null;
+        if (s.sentinel == .none or Type.class(ip, s.child) != .int or s.sentinel != try sema.intValue(s.child, 0)) return null;
+        const raw = try sema.slicePtr(block, inst);
+        return try sema.coercePtrTo(block, raw, dest_ty);
+    }
     // A pointer to a function, to a pointer to a function type it can be
     // called as (`&f` to `*const @TypeOf(f)` names its inferred error set).
     if (s.flags.size == .one and d.flags.size == .one and Type.class(ip, s.child) == .@"fn" and Type.class(ip, d.child) == .@"fn") {
