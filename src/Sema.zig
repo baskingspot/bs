@@ -12747,10 +12747,23 @@ fn comptimeLoadStructuralKey(sema: *Sema, block: *Block, src: Src, key: InternPo
         },
         .int => null,
         .field => |f| blk: {
+            const parent_ty = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
+            // A payload pointer (`&opt.?`) whose optional or error union
+            // has since lost its payload, as upstream.
+            switch (Type.class(ip, parent_ty)) {
+                .optional, .error_union => if (key.byte_offset == 0) if (try sema.comptimeLoadStructural(block, src, f.base)) |parent| if (!sema.isUndef(parent)) switch (ip.indexToKey(parent)) {
+                    .opt => |o| if (o.val == .none) return sema.fail(block, src, "attempt to use null value", .{}),
+                    .error_union => |e| switch (e.val) {
+                        .err_name => |name| return sema.fail(block, src, "attempt to unwrap error: {s}", .{ip.stringSlice(name)}),
+                        .payload => {},
+                    },
+                    else => {},
+                },
+                else => {},
+            }
             if (try sema.mutLoadKey(key, load_ty)) |v| break :blk v;
             if (key.byte_offset != 0) return sema.reinterpretLoadOrNull(block, src, ptr);
             const parent = (try sema.comptimeLoadStructural(block, src, f.base)) orelse break :blk null;
-            const parent_ty = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
             if (ip.typeOf(parent) != parent_ty)
                 return sema.reinterpretLoadOrNull(block, src, ptr);
             // An extern union's inactive field reads its bytes.
