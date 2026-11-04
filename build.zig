@@ -151,10 +151,26 @@ pub fn build(b: *std.Build) void {
 ///   //! flags: <arguments>      extra arguments for both compilers,
 ///                               separated by spaces (such as
 ///                               `-OReleaseSafe`); not with the rebuild
-///                               and donor headers
+///                               and donor headers. With `-M` modules
+///                               (paths from the repository root) they
+///                               replace the program's path, which one of
+///                               them names
 ///
 /// `test` builds each with zap and checks it; `test-upstream` does the same
 /// with upstream zig, so every program is checked against the oracle.
+/// A run test's `//! flags:` and its source: the path, unless the flags
+/// give `-M` modules, whose files become inputs instead.
+fn addFlags(b: *std.Build, r: *std.Build.Step.Run, flags: []const []const u8, src_path: []const u8) void {
+    var modules = false;
+    for (flags) |f| {
+        r.addArg(f);
+        if (!std.mem.startsWith(u8, f, "-M")) continue;
+        modules = true;
+        r.addFileInput(b.path(f[std.mem.indexOfScalar(u8, f, '=').? + 1 ..]));
+    }
+    if (!modules) r.addFileArg(b.path(src_path));
+}
+
 fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step) void {
     const io = b.graph.io;
     const host = b.graph.host.result;
@@ -249,8 +265,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             const compile = if (upstream) blk: {
                 const r = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-llvm", "-fno-lld" });
                 if (expect.libc) r.addArgs(&.{ "-target", "x86_64-linux-gnu", "-lc" });
-                r.addArgs(expect.flags.items);
-                r.addFileArg(b.path(src_path));
+                addFlags(b, r, expect.flags.items, src_path);
                 break :blk r;
             } else if (expect.rebuild_without.items.len != 0 or expect.lib_edit != null) blk: {
                 // Build the earlier version, then this one at the same path,
@@ -374,8 +389,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             } else blk: {
                 const r = b.addRunArtifact(zap);
                 r.addArgs(if (expect.libc) &.{ "build-exe", "-target", "x86_64-linux-gnu", "-lc" } else &.{ "build-exe", "-target", "x86_64-linux" });
-                r.addArgs(expect.flags.items);
-                r.addFileArg(b.path(src_path));
+                addFlags(b, r, expect.flags.items, src_path);
                 break :blk r;
             };
             compile.addFileInput(b.path("test/run/rt.zig"));

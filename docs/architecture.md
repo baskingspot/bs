@@ -394,10 +394,13 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   non-`.auto` function that calls one creates its own at entry
   (`set_err_return_trace`). With no liveness pass, a save that no restore
   uses is marked unused by Sema and has no code. Off in compiler_rt (built in
-  a release mode upstream), without std, and in modules whose error tracing
-  is off (`Frontend.Module.error_tracing`: `-fno-error-tracing`, and
-  ReleaseSafe's default, as upstream's). When no module traces (upstream's
-  `any_error_tracing`), non-`.auto` functions set up no trace either.
+  a release mode upstream) and without std. Per module, as upstream's
+  (`Frontend.Module.error_tracing`: `-fno-error-tracing`, and ReleaseSafe's
+  default): returns push in every module once any module traces
+  (`any_error_tracing`, `Sema.pushes_traces`), while saving, restoring
+  and `@errorReturnTrace` follow the module of the code being analyzed,
+  in an inline call the callee's (`Sema.error_tracing`). When no module
+  traces, nothing pushes and non-`.auto` functions set up no trace.
 - Target-independent, and precise enough to interpret. The bytecode comptime
   evaluator (milestone 6) runs lowered function bodies; it runs this IR
   directly (it may move to a denser encoding derived from it), and it does

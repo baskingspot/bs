@@ -149,10 +149,16 @@ bc_block: ?*Block = null,
 /// `has_error_trace`: an `.auto` function gets one from its caller; another
 /// needs one set up at entry once it calls an `.auto` function.
 has_error_trace: bool = false,
-/// Whether `func` keeps error return traces: as upstream's module option
-/// (`Frontend.Module.error_tracing`), with std, except in compiler_rt
-/// (built in a release mode) and naked functions (which have no frame).
+/// Whether the code being analyzed saves and restores error return traces
+/// and reads them (`@errorReturnTrace`): as upstream, its module's option
+/// (`Frontend.Module.error_tracing`), so an inline call follows the
+/// callee's module (`CalleeScope`); and only where `pushes_traces`.
 error_tracing: bool = false,
+/// Whether `func`'s returns push onto the error return trace: as upstream,
+/// in every module once any module traces (`any_error_tracing`), with std,
+/// except in compiler_rt (built in a release mode upstream, with no
+/// tracing) and naked functions (which have no frame).
+pushes_traces: bool = false,
 /// The error return trace's index on entry to the function or inline call
 /// being analyzed (`save_err_return_trace_index`), or `.none`.
 err_ret_index_on_entry: Ref = .none,
@@ -1784,8 +1790,8 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     const last_arg_index = block.instructions.items.len;
     sema.has_error_trace = fn_ty.cc == .auto;
     const has_std = zcu.moduleRootFile(.std) != null;
-    const module = zcu.file(nav.file).module;
-    sema.error_tracing = has_std and fn_ty.cc != .naked and module != .compiler_rt and zcu.fe.module(module).error_tracing;
+    sema.pushes_traces = has_std and fn_ty.cc != .naked and zcu.file(nav.file).module != .compiler_rt and zcu.fe.any_error_tracing;
+    sema.error_tracing = sema.moduleTraces(nav.file);
     sema.err_ret_index_on_entry = try sema.analyzeSaveErrRetIndex(&block);
     block.error_return_trace_index = sema.err_ret_index_on_entry;
 
@@ -3844,6 +3850,12 @@ fn setupErrorReturnTrace(sema: *Sema, block: *Block, last_arg_index: usize) Comp
     try block.instructions.insertSlice(sema.gpa, last_arg_index, b.instructions.items);
 }
 
+/// Whether the code of file `file` keeps error return traces in the
+/// function being analyzed (`error_tracing`).
+fn moduleTraces(sema: *const Sema, file: u32) bool {
+    return sema.pushes_traces and sema.zcu.fe.module(sema.zcu.file(file).module).error_tracing;
+}
+
 /// The trace's current index, for a later restore. Unused until a restore
 /// marks it (see `Ir.Inst.Tag.save_err_return_trace_index`).
 fn analyzeSaveErrRetIndex(sema: *Sema, block: *Block) CompileError!Ref {
@@ -3869,7 +3881,7 @@ fn traceInfo(sema: *Sema, block: *Block, src: Src) CompileError!*TraceInfo {
 /// Pushes the return address onto the trace if `operand`, the value
 /// returned, is an error.
 fn maybePushErrorTrace(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!void {
-    if (!sema.error_tracing) return;
+    if (!sema.pushes_traces) return;
     const is_non_err = try sema.analyzeIsNonErr(block, src, operand);
     if (is_non_err.toInterned()) |v| if (v == .bool_true) return;
     if (is_non_err.toInterned() != null) return sema.callReturnError(block, src);
@@ -17514,13 +17526,15 @@ const CalleeScope = struct {
     code: *const Zir,
     file: u32,
     inst_map: InstMap,
+    error_tracing: bool,
 
     fn enter(sema: *Sema, func: Index) CalleeScope {
         const nav = sema.ip.getNav(sema.ip.keyPayload(.func, func).owner_nav);
-        const saved: CalleeScope = .{ .code = sema.code, .file = sema.file, .inst_map = sema.inst_map };
+        const saved: CalleeScope = .{ .code = sema.code, .file = sema.file, .inst_map = sema.inst_map, .error_tracing = sema.error_tracing };
         sema.code = &sema.zcu.file(nav.file).zir;
         sema.file = nav.file;
         sema.inst_map = .{};
+        sema.error_tracing = sema.moduleTraces(nav.file);
         return saved;
     }
 
@@ -17529,6 +17543,7 @@ const CalleeScope = struct {
         sema.code = saved.code;
         sema.file = saved.file;
         sema.inst_map = saved.inst_map;
+        sema.error_tracing = saved.error_tracing;
     }
 };
 
