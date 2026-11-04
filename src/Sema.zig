@@ -1607,7 +1607,9 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                 // As upstream: a union field the enum lacks, an enum field the
                 // union lacks, then a field out of the enum's order.
                 for (names, 0..) |name, i| if (tag_info.fieldIndex(ip, ip.stringSlice(name)) == null) {
-                    return sema.fail(&block, cont_src.fieldSrc(@intCast(i), .name), "no field named '{s}' in enum '{f}'", .{ ip.stringSlice(name), sema.fmtType(arg_ty) });
+                    // A `@Union`'s at its field names, as upstream.
+                    const field_src = if (reify_node != null) sema.callArgSrc(src, false, 2) else cont_src.fieldSrc(@intCast(i), .name);
+                    return sema.fail(&block, field_src, "no field named '{s}' in enum '{f}'", .{ ip.stringSlice(name), sema.fmtType(arg_ty) });
                 };
                 for (tag_info.field_names, 0..) |name, k| {
                     const ui = info.fieldIndex(ip, ip.stringSlice(name)) orelse {
@@ -9573,8 +9575,12 @@ fn analyzeIntFromBool(sema: *Sema, block: *Block, src: Src, uncasted: Ref) Compi
 }
 
 fn analyzeBoolNot(sema: *Sema, block: *Block, src: Src, uncasted: Ref) CompileError!Ref {
+    // As upstream, errors are at the operand.
+    const ty = sema.typeOf(uncasted);
+    if (sema.vectorLen(ty) != null and Type.childType(sema.ip, ty) != .bool_type)
+        return sema.fail(block, src.operandSrc(0), "boolean not operation on type '{f}'", .{sema.fmtType(ty)});
     if (try sema.vectorUnary(block, src, uncasted, analyzeBoolNot)) |r| return r;
-    const operand = try sema.coerce(block, .bool_type, uncasted, src);
+    const operand = try sema.coerce(block, .bool_type, uncasted, src.operandSrc(0));
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(v);
         return .fromInterned(boolValue(v != .bool_true));
@@ -9583,10 +9589,13 @@ fn analyzeBoolNot(sema: *Sema, block: *Block, src: Src, uncasted: Ref) CompileEr
 }
 
 fn analyzeBitNot(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
+    const operand_ty = sema.typeOf(operand);
+    const scalar_ty = if (sema.vectorLen(operand_ty) != null) Type.childType(sema.ip, operand_ty) else operand_ty;
+    if (scalar_ty != .bool_type and Type.class(sema.ip, scalar_ty) != .int)
+        return sema.fail(block, src.operandSrc(0), "bitwise not operation on type '{f}'", .{sema.fmtType(operand_ty)});
     if (try sema.vectorUnary(block, src, operand, analyzeBitNot)) |r| return r;
     const ty = sema.typeOf(operand);
     if (ty == .bool_type) return sema.analyzeBoolNot(block, src, operand);
-    if (Type.class(sema.ip, ty) != .int) return sema.fail(block, src, "unable to perform binary not operation on type '{f}'", .{sema.fmtType(ty)});
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(v);
         const a = try sema.bigValue(v);
@@ -10533,12 +10542,16 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
                 const t = s.typeOf(r);
                 if (Type.class(s.ip, t) != .@"union") return r;
                 try s.resolveLayout(b, sr, t);
-                if (s.ip.keyTag(s.ip.structInfo(t).tag_type) != .enum_type) return s.fail(b, sr, "comparison of union and enum literal is only valid for tagged union types", .{});
+                if (s.ip.keyTag(s.ip.structInfo(t).tag_type) != .enum_type) {
+                    const err = s.fail(b, sr, "comparison of union and enum literal is only valid for tagged union types", .{});
+                    if (s.containerDecl(t)) |d| try s.zcu.addNote(d.file, (try s.zcu.fe.tree(@fromBackingInt(d.file))).nodeToSpan(d.node), "union '{f}' is not a tagged union", .{s.fmtType(t)});
+                    return err;
+                }
                 return s.unionTag(b, sr, r);
             }
         }.f;
-        const l0 = try tag_of(sema, block, src, lhs);
-        const r0 = try tag_of(sema, block, src, rhs);
+        const l0 = try tag_of(sema, block, src.operandSrc(0), lhs);
+        const r0 = try tag_of(sema, block, src.operandSrc(1), rhs);
         const ty = if (Type.class(ip, sema.typeOf(l0)) == .@"enum") sema.typeOf(l0) else sema.typeOf(r0);
         const l = try sema.coerce(block, ty, l0, src);
         const r = try sema.coerce(block, ty, r0, src);
@@ -12965,7 +12978,12 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     const names = try sema.arena.alloc(InternPool.String, n);
     for (name_vals, names, 0..) |v, *name, i| {
         name.* = try sema.getString(try sema.resolveConstString(block, src, .fromInterned(v)));
-        for (names[0..i]) |prev| if (prev == name.*) return sema.fail(block, src, "duplicate {t} field name '{s}'", .{ kind, ip.stringSlice(prev) });
+        // As upstream, at the names, noting the earlier field.
+        for (names[0..i], 0..) |prev, k| if (prev == name.*) {
+            const err = sema.fail(block, names_src, "duplicate {t} field '{s}' at index '{d}'", .{ kind, ip.stringSlice(prev), i });
+            try sema.zcu.addNote(sema.file, names_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "previous field at index '{d}'", .{k});
+            return err;
+        };
     }
 
     if (kind == .@"enum") {
@@ -12981,7 +12999,11 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         if (values.len != n) return sema.fail(block, src, "{d} enum field names but {d} values", .{ n, values.len });
         for (values, 0..) |v, i| {
             if (sema.isUndef(v)) return sema.fail(block, values_src, "use of undefined value here causes illegal behavior", .{});
-            for (values[0..i]) |prev| if (prev == v) return sema.fail(block, src, "enum tag value {f} already taken", .{sema.fmtValue(v)});
+            for (values[0..i], 0..) |prev, k| if (prev == v) {
+                const err = sema.fail(block, values_src, "enum tag value '{f}' for field '{s}' already taken", .{ sema.fmtValue(v), ip.stringSlice(names[i]) });
+                try sema.zcu.addNote(sema.file, values_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "previous occurrence in field '{s}'", .{ip.stringSlice(names[k])});
+                return err;
+            };
         }
         const captures = [_]Index{ tag_ty, mode, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = tag_ty } }), .storage = .{ .elems = values } } }) };
         const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, &captures);
@@ -13015,7 +13037,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         cv.* = .bool_false;
         if (ip.keyPayload(.opt, av.*).val != .none) {
             const bytes = ip.intValue(u64, ip.keyPayload(.opt, av.*).val).?;
-            if (bytes == 0 or !std.math.isPowerOfTwo(bytes)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{bytes});
+            if (bytes == 0 or !std.math.isPowerOfTwo(bytes)) return sema.fail(block, attrs_src, "alignment value '{d}' is not a power of two", .{bytes});
             any_align = true;
         }
         d.* = .none;
@@ -13036,12 +13058,13 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
     var captures: std.ArrayList(Index) = .empty;
     try captures.appendSlice(sema.arena, &.{ arg0, arg_ty, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = .type_type } }), .storage = .{ .elems = types } } }) });
     try captures.appendSlice(sema.arena, defaults);
+    if (any_align and layout == .@"packed") return sema.fail(block, attrs_src, "packed {t} fields cannot be aligned", .{kind});
     if (any_align) try captures.appendSlice(sema.arena, align_vals);
     if (any_comptime) try captures.appendSlice(sema.arena, comptime_vals);
     if (any_comptime) {
-        if (layout != .auto) return sema.fail(block, src, "{t} struct fields cannot be marked comptime", .{layout});
+        if (layout != .auto) return sema.fail(block, attrs_src, "{t} struct fields cannot be marked comptime", .{layout});
         for (comptime_vals, defaults) |c, d| if (c == .bool_true and d == .none)
-            return sema.fail(block, src, "comptime field without default initialization value", .{});
+            return sema.fail(block, attrs_src, "comptime field without default initialization value", .{});
     }
     const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, captures.items);
     const ty = try sema.createContainerType(kind, sema.file, inst, captures.items, name.name, name.key, block.namespace, layout);
@@ -17102,7 +17125,7 @@ fn analyzeCall(
         },
         .pointer => blk: {
             const p = Type.ptrInfo(ip, callee_ty);
-            if (p.flags.size != .one or Type.class(ip, p.child) != .@"fn") return sema.fail(block, src, "type '{f}' not a function", .{sema.fmtType(callee_ty)});
+            if (p.flags.size != .one or Type.class(ip, p.child) != .@"fn") return sema.fail(block, src.callFunc(), "type '{f}' not a function", .{sema.fmtType(callee_ty)});
             if (sema.resolveValue(callee)) |v| if (ip.keyTag(v) == .ptr) {
                 const k = ip.keyPayload(.ptr, v);
                 if (k.base == .uav and k.byte_offset == 0 and ip.keyTag(k.base.uav.val) == .extern_func) extern_func = k.base.uav.val;
@@ -17123,15 +17146,36 @@ fn analyzeCall(
             };
             break :blk p.child;
         },
-        else => return sema.fail(block, src, "type '{f}' not a function", .{sema.fmtType(callee_ty)}),
+        .optional => {
+            const err = sema.fail(block, src.callFunc(), "cannot call optional type '{f}'", .{sema.fmtType(callee_ty)});
+            try sema.zcu.addNote(sema.file, src.callFunc().span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "consider using '.?', 'orelse' or 'if'", .{});
+            return err;
+        },
+        else => return sema.fail(block, src.callFunc(), "type '{f}' not a function", .{sema.fmtType(callee_ty)}),
     };
     const fn_ty = ip.keyPayload(.func_type, fn_ty_index);
     const total_args = call_args_in.len() + @intFromBool(first_arg != .none);
-    if (fn_ty.is_var_args) {
-        if (total_args < fn_ty.param_types.len) return sema.fail(block, src, "expected at least {d} argument(s), found {d}", .{ fn_ty.param_types.len, total_args });
+    if (fn_ty.is_var_args and total_args >= fn_ty.param_types.len) {
         if (block.is_comptime or modifier == .compile_time) return sema.fail(block, src, "unable to call variadic function at comptime", .{});
     } else if (total_args != fn_ty.param_types.len) {
-        return sema.fail(block, src, "expected {d} argument(s), found {d}", .{ fn_ty.param_types.len, total_args });
+        // As upstream: at the callee, counting a method's arguments
+        // without its receiver, with a note at the function.
+        const member = first_arg != .none;
+        const n = fn_ty.param_types.len - @intFromBool(member);
+        const found = total_args - @intFromBool(member);
+        const at_least = fn_ty.is_var_args;
+        const err = if (member)
+            (if (at_least) sema.fail(block, src.callFunc(), "member function expected at least {d} argument(s), found {d}", .{ n, found }) else sema.fail(block, src.callFunc(), "member function expected {d} argument(s), found {d}", .{ n, found }))
+        else
+            (if (at_least) sema.fail(block, src.callFunc(), "expected at least {d} argument(s), found {d}", .{ n, found }) else sema.fail(block, src.callFunc(), "expected {d} argument(s), found {d}", .{ n, found }));
+        if (ip.keyAs(.func, func)) |f| {
+            const nav = ip.getNav(f.owner_nav);
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(nav.file));
+            var buf: [1]Ast.Node.Index = undefined;
+            if (tree.fullFnProto(&buf, sema.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_node)) |proto|
+                try sema.zcu.addNote(nav.file, tree.tokenToSpan(proto.ast.fn_token), "function declared here", .{});
+        }
+        return err;
     }
     switch (modifier) {
         .auto, .compile_time, .always_inline, .never_inline, .never_tail, .no_suspend => {},
@@ -19550,7 +19594,8 @@ fn vectorCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref
     const d_len = sema.vectorLen(dest_ty);
     const s_len = sema.vectorLen(sema.typeOf(operand));
     if (d_len == null and s_len == null) return null;
-    if (d_len == null or s_len == null) return sema.fail(block, src, "expected vector of length {d}, found '{f}'", .{ d_len orelse s_len.?, sema.fmtType(if (d_len == null) dest_ty else sema.typeOf(operand)) });
+    // As upstream, a vector and a scalar mismatch at the operand.
+    if (d_len == null or s_len == null) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected type '{f}', found '{f}'", .{ sema.fmtType(dest_ty), sema.fmtType(sema.typeOf(operand)) });
     if (d_len.? != s_len.?) return sema.fail(block, src, "vector length mismatch: {d} and {d}", .{ d_len.?, s_len.? });
     return try sema.vectorMap(block, src, d_len.?, dest_ty, &.{operand}, VectorCast{ .f = f, .elem_ty = Type.childType(sema.ip, dest_ty) });
 }
