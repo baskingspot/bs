@@ -724,6 +724,8 @@ const Walker = struct {
         }
         w.stats = stats;
         s.facts.shrinkRetainingCapacity(depth);
+        // Blocks push and pop their exits in balance.
+        std.debug.assert(s.exits.items.len == s.saved_exits.items.len);
         @memcpy(s.exits.items, s.saved_exits.items);
         s.exit_facts.clearRetainingCapacity();
         try s.exit_facts.appendSlice(gpa, s.saved_exit_facts.items);
