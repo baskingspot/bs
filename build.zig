@@ -868,6 +868,25 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         run.addCheck(.{ .expect_stderr_exact = expect });
         run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&run.step);
+        if (!std.mem.eql(u8, v.name, "zig cc")) continue;
+        // The same sources given to zap, which compiles them with upstream's
+        // Clang (CSource.zig), with the archives of the first variant.
+        const src = b.addRunArtifact(zap);
+        src.setName("zap build-exe with C sources");
+        src.addArgs(&.{ "build-exe", "-cflags", "-fcommon", "--" });
+        src.addFileArg(b.path("test/link_input/lib.c"));
+        src.addArgs(&.{ "-cflags", "-fPIC", "--" });
+        src.addFileArg(b.path("test/link_input/tls.c"));
+        src.addFileArg(b.path("test/link_input/tlsie.c"));
+        src.addFileArg(b.path("test/link_input/main.zig"));
+        for (archives) |input| src.addFileArg(input);
+        src.setEnvironmentVariable("ZAP_ZIG", zig);
+        const src_bin = src.addPrefixedOutputFileArg("-femit-bin=", "main");
+        const src_run = std.Build.Step.Run.create(b, "run zap build of C sources");
+        src_run.addFileArg(src_bin);
+        src_run.addCheck(.{ .expect_stderr_exact = expect });
+        src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&src_run.step);
     }
 
     // A C object calling glibc, in a -lc executable: its calls go through
@@ -888,6 +907,20 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&run.step);
+    // The same C as a source of a -lc build, compiled by zap with upstream's
+    // Clang and its Debug defaults (ubsan, PIC).
+    const src_exe = b.addRunArtifact(zap);
+    src_exe.setName("zap build-exe -lc with a C source");
+    src_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+    src_exe.addFileArg(b.path("test/link_input/libc_main.zig"));
+    src_exe.addFileArg(b.path("test/link_input/libc.c"));
+    src_exe.setEnvironmentVariable("ZAP_ZIG", zig);
+    const src_run = std.Build.Step.Run.create(b, "run zap -lc build of a C source");
+    src_run.addFileArg(src_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    src_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\n" });
+    src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
+    src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&src_run.step);
 
     // Undefined behavior and a smashed stack in C reach ubsan_rt's and the
     // stack protector's panics.

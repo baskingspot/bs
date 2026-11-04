@@ -5522,6 +5522,72 @@ libraries as inputs. To be agreed with that thread.
   program): a header edit translates again, a touched header is
   `translate-c cached`.
 
+### Step 3, C sources, as built (2026-11-04)
+
+- **Options** (`main.parseOptions`), as upstream's: `-I`, `-isystem`,
+  `-idirafter`, `-iwithsysroot`, `--embed-dir=` (each directory once per
+  group and module, as `ClangSearchSanitizer`) and `-D` collect in
+  `cc_argv`, which the next `-M` takes together with the `.c` files given
+  since the last `-M` and the module's C options (`-fsanitize-c[=trap|
+  full]`, `-fno-sanitize-c`, `-m[no-]red-zone`, `-f[no-]builtin`,
+  `-f[no-]PIC`; unset ones take the root module's, then Debug's
+  default). A root file given by position takes what is left; else what
+  is left is `global_cc_argv`. `-cflags ... --` applies to the C files
+  after it. `-ffunction-sections`, `-fdata-sections`, `-fPIE` and
+  `--verbose-cc` are global. Other C, C++ and assembly sources, modules
+  without a Zig root, and C sources in `build-obj`/`build-lib` stay
+  `[unsupported]`.
+- **Clang's arguments** (`CSource.zig`) are upstream's `addCCArgs` for
+  zap's target and the baseline CPU, in Debug: the triple from the glibc
+  version (native: detected, with or without `-lc`, as upstream's native
+  target; `x86_64-linux`: no libc), `-fPIC` with `-lc`
+  (`requiresPic`), glibc's headers from the zig lib directory (decision
+  1, as translate-c), `-fno-stack-protector` always (upstream's Debug
+  backend for Zig has none, which turns it off for the compilation's C
+  too), the sanitizer flags of `sanitize_c`, every CPU feature, then
+  `global_cc_argv`, the module's `cc_argv` and the file's `-cflags`.
+  zap leaves out `--serialize-diagnostics` and reads Clang's text
+  errors instead (`-fno-caret-diagnostics`: `path:line:col: error:`,
+  with notes), which become ordinary diagnostics. The objects are byte
+  for byte upstream's for `-target x86_64-linux-gnu.2.36 -lc
+  -mcpu=baseline` and for the native target without `-lc`; upstream's
+  native `-lc` reads the system's `/usr/include` instead (decision 1).
+- **Running**: upstream zig is `ZAP_ZIG`, else `zig` on PATH, else
+  `~/.cache/zap/zig-0.17.0/zig` or `zig-<host>-0.17.0/zig`; its
+  version is checked (`zig version`, 5 ms) only when something must
+  compile. The compiles start before the frontend, on up to the CPU
+  count of tasks (`Io.Group.concurrent`, each running `zig clang`), and
+  the first `Emit.sync` (the end of the main analysis) waits for them
+  and adds their objects to `ElfInput`, so archive members and
+  compiler_rt are pulled for them as for `.o` inputs.
+- **Records**: as translate-c's (`ToolRecord.zig`, shared): the key
+  covers zap, upstream zig's path and stat, Clang's arguments without the
+  depfile and output paths, and the source's absolute path; the object
+  is `<local cache>/o/<key>/<stem>.o`, the record `zap/tc/<key>`, so the
+  cache's trimming covers both. A build whose C files and headers all
+  stat as recorded runs no Clang; a header edit recompiles the files
+  that read it.
+- **Not cached yet**: a build with C sources skips zap's on-disk cache,
+  as one with `.o`/`.a` inputs does, until the manifest records inputs
+  of the object kind (the cache thread's part); every build of such a
+  program analyzes and generates its Zig again, while its C objects come
+  from their records.
+- **Runtime**: Debug C calls `__ubsan_handle_*` and, with `-lc`,
+  glibc; C sources root ubsan_rt and ssp (`Frontend.Options.c_runtimes`)
+  as object inputs do, and their glibc references resolve as an object's
+  (the link thread's `obj-inputs2`).
+- **Cost** (ReleaseFast, test/link_input's `libc_main.zig` with
+  `libc.c` and `-lc`): cold 0.58 s against upstream's 0.78 s with a warm
+  global cache; unchanged 0.16 s (0.41 s), a C edit 0.16 s (0.41 s),
+  since Clang runs while Sema does; a Zig edit 0.17 s (0.33 s), a full
+  Zig build until the cache takes C objects. std's compile time does not
+  change (5.96 s against main's 6.20 s).
+- **Checks**: build.zig's `addLinkInputTests` builds test/link_input's
+  `lib.c`, `tls.c` and `tlsie.c` as C sources (`-cflags`, `-fPIC`) with
+  the archives of the `zig cc` variant, and `libc.c` as the C source of
+  a `-lc` program, with ubsan on, and expects the output of upstream's
+  link of the same inputs.
+
 ### Steps and checks
 
 1. `-lc`: builtin, start file, abilists imports, dynamic executable link,

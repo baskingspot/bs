@@ -26,6 +26,7 @@ const ElfObject = @import("link/ElfObject.zig");
 const ElfDynamic = @import("link/ElfDynamic.zig");
 const Glibc = @import("link/Glibc.zig");
 const ElfInput = @import("link/ElfInput.zig");
+const CSource = @import("CSource.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const Ssa = @import("codegen/Ssa.zig");
 const inline_ir = @import("codegen/inline.zig");
@@ -89,6 +90,10 @@ glibc: ?*const Glibc = null,
 /// An executable's object and archive inputs, which `sync` pulls archive
 /// members for and `finish` converts into atoms.
 inputs: ?*ElfInput = null,
+/// C sources compiling while the build analyzes (CSource.zig): the first
+/// `sync` waits for them and adds their objects to `inputs`, before it
+/// pulls archive members and compiler_rt for them.
+c_batch: ?*CSource.Batch = null,
 /// In an object, the symbols other objects define, by name.
 imports: std.StringArrayHashMapUnmanaged(ImportFlags) = .empty,
 /// In an object, its exports, once `finish` found them.
@@ -748,6 +753,15 @@ fn publish(pool: *Pool, gpa: Allocator) !void {
 /// functions requested so far to the Zcu.
 pub fn sync(emit: *Emit, zcu: *Zcu) !void {
     try emit.mergeJobs();
+    if (emit.c_batch) |b| {
+        emit.c_batch = null;
+        const in = emit.inputs.?;
+        for ((try b.wait()).objects) |o| in.addObject(o.path, o.bytes) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            // As `convertInputs` reports the inputs' problems.
+            else => try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{try std.fmt.allocPrint(emit.allocator(), "unable to link '{s}': {t}", .{ o.path, err })}),
+        };
+    }
     if (emit.inputs) |in| try emit.pullInputs(in);
     for (emit.rt_pending.keys()) |key| _ = try zcu.requestCompilerRtKey(key);
     emit.rt_pending.clearRetainingCapacity();

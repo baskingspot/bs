@@ -15,6 +15,7 @@ const Archive = @import("link/Archive.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
+const CSource = @import("CSource.zig");
 
 pub const zig_version = "0.17.0";
 
@@ -104,6 +105,16 @@ pub const Options = struct {
     /// in command-line order (docs/architecture.md, "Object, archive and
     /// shared-library inputs").
     link_inputs: []const []const u8 = &.{},
+    /// C source files, each with its module's C arguments and options,
+    /// compiled by upstream's Clang (CSource.zig), and the settings they
+    /// share.
+    c_sources: []const CSource = &.{},
+    c_global_cc_argv: []const []const u8 = &.{},
+    c_pie: bool = false,
+    function_sections: bool = false,
+    data_sections: bool = false,
+    /// `--verbose-cc`: print each Clang command line, as upstream.
+    verbose_cc: bool = false,
     /// `-fsoname=<name>` and `-fno-soname`; by default the shared object's
     /// file name, as upstream's.
     soname: union(enum) { default, name: []const u8, none } = .default,
@@ -368,9 +379,10 @@ pub const Job = struct {
         const env = job.environ_map;
         // The numbered link has no position-independent layout yet (`Elf`);
         // -fPIE and -dynamic imply -fPIC (and -lc on objects and
-        // libraries). Builds with object or archive inputs skip it until
-        // the manifest keeps them (the cache thread's part of stage A).
-        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and job.opts.link_inputs.len == 0 and
+        // libraries). Builds with object or archive inputs or C sources skip
+        // it until the manifest keeps them (the cache thread's part of
+        // stage A).
+        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and job.opts.link_inputs.len == 0 and job.opts.c_sources.len == 0 and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -427,7 +439,10 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // A build whose analysis read a type name that then changed builds
     // again with the first attempt's final names (`Zcu.finalizeNames`).
     var pins: ?*const Zcu.NamePins = null;
-    while (true) return compileReplaying(init, job, inc_opt, out_path, prog, inputs, replay_mode, &pins) catch |err| switch (err) {
+    // C sources compile while the build analyzes, once for every attempt.
+    const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0) try startC(init, job) else null;
+    defer if (c_batch) |b| CSource.destroy(b);
+    while (true) return compileReplaying(init, job, inc_opt, out_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
         error.LazyFallback => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             replay_mode = "eager";
@@ -448,7 +463,30 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     };
 }
 
-fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins) !Outcome {
+/// Starts compiling the job's C sources (CSource.zig).
+fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
+    const opts = &job.opts;
+    // The target's glibc names the ABI: without -lc too for the native
+    // target, as upstream's.
+    const glibc_version = opts.glibc_version orelse if (opts.target == null)
+        if (std.zig.system.resolveTargetQuery(init.io, .{})) |native| (if (native.abi.isGnu()) native.os.version_range.linux.glibc else null) else |_| null
+    else
+        null;
+    return CSource.start(init.gpa, init.io, init.environ_map, opts.c_sources, .{
+        .zig_lib_dir = job.zig_lib_dir,
+        .local_cache = job.cache_dirs.local,
+        .glibc_version = glibc_version,
+        .link_libc = opts.link_libc,
+        .pie = opts.c_pie,
+        .function_sections = opts.function_sections,
+        .data_sections = opts.data_sections,
+        .unwind_tables = opts.unwind_tables,
+        .global_cc_argv = opts.c_global_cc_argv,
+        .verbose = opts.verbose_cc,
+    });
+}
+
+fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch) !Outcome {
     const arena = init.arena.allocator();
     const opts = job.opts;
     const env = init.environ_map;
@@ -474,7 +512,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .modules = opts.modules,
         .fuzz = opts.root_fuzz,
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
-        .c_runtimes = opts.link_inputs.len != 0,
+        .c_runtimes = opts.link_inputs.len != 0 or opts.c_sources.len != 0,
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
@@ -568,6 +606,10 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         }
         emit.inputs = &link_inputs;
     }
+    if (c_batch) |b| {
+        emit.inputs = &link_inputs;
+        emit.c_batch = b;
+    }
     // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
     // n more times (`zig build bench-codegen`).
     const bench_runs: u32 = if (env.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
@@ -598,6 +640,17 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         error.OutOfMemory => return error.OutOfMemory,
         else => {},
     };
+    if (c_batch) |b| {
+        const c = try b.wait();
+        if (inputs) |list| {
+            var it = std.mem.splitScalar(u8, c.inputs, 0);
+            while (it.next()) |p| if (p.len != 0) try appendInput(arena, list, p);
+        }
+        if (c.errors.len != 0) {
+            const zig_errors = if (zcu.failed()) try zcu.diagnostics(arena, paths) else &.{};
+            return .{ .errors = try dupeDiagnostics(arena, try std.mem.concat(arena, diag.Diagnostic, &.{ zig_errors, c.errors })) };
+        }
+    }
     if (zcu.failed()) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
     const bin_path = out_path orelse return .{ .ok = .{ .cache_hit = false } };
     const link_node = prog.start("Link", 0);
@@ -1067,9 +1120,9 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fsanitize-c=trap"},                .{"-fsanitize-c=full"},         .{"-fsanitize-c"},          .{"-gdwarf32"},
     .{"-gdwarf64"},                        .{"-ODebug"},                   .{"-Odebug"},
     .{"-static"},                          .{"--no-dynamic-linker"},       .{"--debug-compile-errors"}, .{"--debug-incremental"},
-    .{"--verbose-air"},                    .{"--verbose-llvm-ir"},         .{"--verbose-link"},        .{"--verbose-cc"},
+    .{"--verbose-air"},                    .{"--verbose-llvm-ir"},         .{"--verbose-link"},
     .{"--verbose-llvm-cpu-features"},      .{"--time-report"},             .{"-fformatted-panics"},    .{"-fno-formatted-panics"},
-    .{"--eh-frame-hdr"},                   .{"--emit-relocs"},             .{"-ffunction-sections"},   .{"-fdata-sections"},
+    .{"--eh-frame-hdr"},                   .{"--emit-relocs"},
     .{"--gc-sections"},                    .{"--no-gc-sections"},          .{"--no-dynamicbase"},      .{"-fallow-shlib-undefined"},
     .{"-fno-allow-shlib-undefined"},       .{"-headerpad_max_install_names"}, .{"-dead_strip_dylibs"}, .{"-ObjC"},
     .{"--discard-all"},                    .{"-fcompiler-rt"},             .{"-fno-compiler-rt"},      .{"-fubsan-rt"},
@@ -1083,10 +1136,25 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
 
 /// Ignored options that take a parameter.
 const ignored_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
-    .{"-I"},        .{"-isystem"},      .{"-iquote"},  .{"-idirafter"},   .{"-iframework"}, .{"-iframeworkwithsysroot"},
+    .{"-iquote"},   .{"-iframework"},   .{"-iframeworkwithsysroot"},
     .{"-L"},        .{"-rpath"},        .{"--libc"},   .{"--sysroot"},    .{"--error-limit"}, .{"--debug-log"},
     .{"--dynamic-linker"}, .{"-z"},     .{"--image-base"},
 });
+
+/// Include directory options of C, with their group's bit (upstream's
+/// `ClangSearchSanitizer`, which drops a directory given twice in a group).
+const cc_include_flags: std.StaticStringMap(u8) = .initComptime(.{
+    .{ "-I", 1 }, .{ "-isystem", 1 << 1 }, .{ "-iwithsysroot", 1 << 2 }, .{ "-idirafter", 1 << 3 },
+});
+
+fn addInclude(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), seen: *std.StringHashMapUnmanaged(u8), group: u8, arg: []const u8, dir: []const u8, joined: bool) !void {
+    const gop = try seen.getOrPut(arena, dir);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    if (gop.value_ptr.* & group != 0) return;
+    gop.value_ptr.* |= group;
+    try argv.append(arena, arg);
+    if (!joined) try argv.append(arena, dir);
+}
 
 /// Options that ask for something zap does not do, as the diagnostic's
 /// message.
@@ -1103,7 +1171,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-femit-llvm-ir", "zap has no LLVM backend ('-femit-llvm-ir')" },
     .{ "-femit-h", "zap does not emit C headers ('-femit-h')" },
     .{ "-fsanitize-coverage-trace-pc-guard", "zap does not instrument coverage ('-fsanitize-coverage-trace-pc-guard')" },
-    .{ "-cflags", "zap does not compile C sources ('-cflags'); build this step with upstream zig" },
     .{ "-rcflags", "zap does not compile Windows resources ('-rcflags')" },
     .{ "-x", "zap does not compile C sources ('-x'); build this step with upstream zig" },
     .{ "--force_undefined", "zap does not support '--force_undefined' yet" },
@@ -1136,9 +1203,25 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     // the last one left.
     var fuzz: ?bool = null;
     var root_fuzz: ?bool = null;
+    // C, as upstream's: `-I`, `-D` and the like collect in `cc_argv`, which
+    // the next `-M` takes, with the C files given since the last one and
+    // the module's C options; what is left after the last `-M` applies to
+    // every module (`global_cc_argv`). `-cflags ... --` applies to the C
+    // files after it.
+    var cc_argv: std.ArrayList([]const u8) = .empty;
+    var cc_seen: std.StringHashMapUnmanaged(u8) = .empty;
+    var extra_cflags: []const []const u8 = &.{};
+    var c_files: std.ArrayList(CSource) = .empty;
+    var c_owned: usize = 0;
+    var c_flags: CSource.Flags = .{};
+    var root_c_flags: ?CSource.Flags = null;
     var i: usize = 0;
     while (i < args.len) : (i +%= 1) {
         const arg = args[i];
+        if (c_flags.parse(arg)) {
+            // A module's C option; -fPIC and -fno-PIC mean more below.
+            if (!std.mem.endsWith(u8, arg, "PIC")) continue;
+        }
         if (arg.len > 1 and arg[0] == '@') {
             // Its arguments take its place.
             args = try std.mem.concat(arena, []const u8, &.{ try readResponseFile(arena, io, arg[1..]), args[i + 1 ..] });
@@ -1159,6 +1242,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         } else if (std.mem.eql(u8, arg, "-fno-emit-docs")) {
             opts.emit_docs = .none;
         } else if (std.mem.eql(u8, arg, "-fPIC") or std.mem.eql(u8, arg, "-fPIE")) {
+            if (std.mem.eql(u8, arg, "-fPIE")) opts.c_pie = true;
             // On an executable, a preference that changes nothing a program
             // means, as with -fllvm: zap links it static and non-PIE, and
             // `builtin.position_independent_*` stay false. Objects and
@@ -1184,6 +1268,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             // As upstream: -fno-PIE leaves -fPIC alone.
             if (std.mem.eql(u8, arg, "-fno-PIC")) opts.pic = false;
             opts.pie = false;
+            if (std.mem.eql(u8, arg, "-fno-PIE")) opts.c_pie = false;
         } else if (std.mem.eql(u8, arg, "--name")) {
             opts.name = nextArg(args, &i, arg);
         } else if (std.mem.eql(u8, arg, "-target")) {
@@ -1251,8 +1336,18 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
                 opts.root_name = spec[0..eq];
                 opts.root_deps = try deps.toOwnedSlice(arena);
                 root_fuzz = fuzz;
+                root_c_flags = c_flags;
             } else try modules.append(arena, .{ .name = spec[0..eq], .path = spec[eq + 1 ..], .deps = try deps.toOwnedSlice(arena), .fuzz = fuzz });
             fuzz = null;
+            // The module's C files, arguments and options.
+            const module_cc = try cc_argv.toOwnedSlice(arena);
+            for (c_files.items[c_owned..]) |*f| {
+                f.cc_argv = module_cc;
+                f.flags = c_flags;
+            }
+            c_owned = c_files.items.len;
+            cc_seen.clearRetainingCapacity();
+            c_flags = .{};
         } else if (std.mem.startsWith(u8, arg, "--error-format=")) {
             const v = arg["--error-format=".len..];
             opts.error_format = std.meta.stringToEnum(diag.Format, v) orelse fatal("invalid --error-format '{s}': expected 'text' or 'json'", .{v});
@@ -1265,8 +1360,33 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             // Changes nothing zap does.
         } else if (ignored_flags_with_arg.has(arg)) {
             _ = nextArg(args, &i, arg);
-        } else if (std.mem.startsWith(u8, arg, "-D") or std.mem.startsWith(u8, arg, "--build-id")) {
-            // A C macro; the build ID of a linked binary.
+        } else if (std.mem.startsWith(u8, arg, "--build-id")) {
+            // The build ID of a linked binary.
+        } else if (std.mem.eql(u8, arg, "-D")) {
+            try cc_argv.appendSlice(arena, &.{ arg, nextArg(args, &i, arg) });
+        } else if (std.mem.startsWith(u8, arg, "-D")) {
+            try cc_argv.append(arena, arg);
+        } else if (cc_include_flags.get(arg)) |group| {
+            try addInclude(arena, &cc_argv, &cc_seen, group, arg, nextArg(args, &i, arg), false);
+        } else if (std.mem.startsWith(u8, arg, "-I")) {
+            try addInclude(arena, &cc_argv, &cc_seen, 1, arg, arg[2..], true);
+        } else if (std.mem.startsWith(u8, arg, "--embed-dir=")) {
+            try addInclude(arena, &cc_argv, &cc_seen, 1 << 5, arg, arg["--embed-dir=".len..], true);
+        } else if (std.mem.eql(u8, arg, "-cflags")) {
+            var flags: std.ArrayList([]const u8) = .empty;
+            while (true) {
+                i += 1;
+                if (i >= args.len) fatal("expected -- after -cflags", .{});
+                if (std.mem.eql(u8, args[i], "--")) break;
+                try flags.append(arena, args[i]);
+            }
+            extra_cflags = flags.items;
+        } else if (std.mem.eql(u8, arg, "--verbose-cc")) {
+            opts.verbose_cc = true;
+        } else if (std.mem.eql(u8, arg, "-ffunction-sections")) {
+            opts.function_sections = true;
+        } else if (std.mem.eql(u8, arg, "-fdata-sections")) {
+            opts.data_sections = true;
         } else if (std.mem.startsWith(u8, arg, "-ofmt=")) {
             if (!std.mem.eql(u8, arg, "-ofmt=elf")) setUnsupported(&opts, arena, "zap emits ELF on Linux only ('{s}')", .{arg});
         } else if (std.mem.startsWith(u8, arg, "-O")) {
@@ -1280,7 +1400,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         } else if (unsupported_flags.get(arg)) |msg| {
             setUnsupported(&opts, arena, "{s}", .{msg});
             // Their parameters: the C flags up to `--`, the language.
-            if (std.mem.eql(u8, arg, "-cflags") or std.mem.eql(u8, arg, "-rcflags")) {
+            if (std.mem.eql(u8, arg, "-rcflags")) {
                 while (i + 1 < args.len and !std.mem.eql(u8, args[i + 1], "--")) i += 1;
                 i += 1;
             } else if (std.mem.eql(u8, arg, "-x")) _ = nextArg(args, &i, arg);
@@ -1293,7 +1413,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             setUnsupported(&opts, arena, "zap does not support the option '{s}'", .{arg});
         } else if (!std.mem.endsWith(u8, arg, ".zig")) {
             const ext = std.fs.path.extension(arg);
-            if ((std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a")) and command != .build_obj and command != .build_lib) {
+            if (std.mem.eql(u8, ext, ".c")) {
+                if (command == .build_obj or command == .build_lib)
+                    setUnsupported(&opts, arena, "zap does not compile C sources into objects or libraries yet ('{s}'); build this step with upstream zig", .{arg});
+                try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{} });
+            } else if ((std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a")) and command != .build_obj and command != .build_lib) {
                 try link_inputs.append(arena, arg);
             } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a"))
                 setUnsupported(&opts, arena, "zap does not link object files into objects or libraries yet ('{s}'); build this step with upstream zig", .{arg})
@@ -1324,6 +1448,20 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     opts.test_filters = test_filters.items;
     opts.link_inputs = link_inputs.items;
     opts.modules = modules.items;
+    // A root file given by position owns what no -M took, as upstream's.
+    if (positional_root) {
+        root_c_flags = c_flags;
+        const module_cc = try cc_argv.toOwnedSlice(arena);
+        for (c_files.items[c_owned..]) |*f| {
+            f.cc_argv = module_cc;
+            f.flags = c_flags;
+        }
+        c_owned = c_files.items.len;
+    }
+    if (c_owned != c_files.items.len) fatal("C source file '{s}' has no parent module", .{c_files.items[c_owned].path});
+    for (c_files.items) |*f| f.flags = f.flags.inherit(root_c_flags orelse .{});
+    opts.c_sources = c_files.items;
+    opts.c_global_cc_argv = cc_argv.items;
     // As upstream, a root file given without `-M` names its module "test"
     // under `zap test`, else after the file (not `--name`).
     if (positional_root) opts.root_name = if (command == .@"test") "test" else std.fs.path.stem(opts.root_src_path);
