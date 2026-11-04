@@ -4643,6 +4643,20 @@ records only what changed, and links from the manifest.
   `BS_CACHE_CHECK` walks the graph the build leaves in full
   (`checkLiveReach`) and requires the same `reached` flags and linked
   nodes.
+- *Touching only the cone's part of the manifest* (2026-11-04). The
+  setup and the record around the cone walk cost per edit, not per
+  node: the overlay keeps a bitset of the nodes the log touched, so
+  `node`, `nodeRefs`, `flags` and the other accessors read an untouched
+  node straight from the base without a hash lookup; the base stores
+  the reached flags as words (`reached_bits`, `Manifest.reachedSet`);
+  `Replay.create` stats only the inputs the frontend did not load, and
+  seeds and `inChangedInput` test a changed-input bitset. The record
+  updates flags only for nodes whose flags can differ (the cone, the
+  outdated, the analyzed, what reach gained or lost, and every node in
+  a build that assumed nothing), finds exported nodes through `rrefs`,
+  and skips `checkLinkInputs` unless a checked or written node has
+  external or error-name references. zls Server.zig edit: setup 10.4 →
+  4.2 ms.
 - *Loading on demand.* A green unit's result is decoded only when
   analysis reads it (`ensureNavVal` and the rest). Writing a result into
   the Zcu first brings the unit's plain dependencies up to date, as

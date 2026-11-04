@@ -137,6 +137,10 @@ redges: []const u32,
 /// `rref_nodes[rref_starts[i]..rref_starts[i + 1]]`, ascending.
 rref_starts: []const u32,
 rref_nodes: []const u32,
+/// The base nodes' `Flags.reached`, a bit each (bit `i % 32` of word
+/// `i / 32`), so that an edit build reads them without touching the
+/// nodes (`reachedSet`).
+reached_bits: []const u32,
 atom_refs: []const Pack.AtomRef,
 inputs: []const Input,
 /// Error names in code order: the error with code `c` is `c - 1`.
@@ -496,10 +500,10 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, rref_starts, rref_nodes, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, atom_names, atom_name_bytes, strings };
+const Section = enum { nodes, table, edges, redges, rref_starts, rref_nodes, reached_bits, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, atom_names, atom_name_bytes, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN15".*;
+const magic = "ZAPMAN16".*;
 const log_magic = "ZAPMLG08".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
@@ -622,6 +626,9 @@ const Overlay = struct {
     rdeps: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty,
     /// Reverse references set in the log, as `rdeps`.
     rrefs: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty,
+    /// The nodes any of the maps above or `flags` and `sources` has, so
+    /// that the accessors look up only those (`touched`).
+    touched: std.DynamicBitSetUnmanaged = .{},
     inputs: std.AutoHashMapUnmanaged(u32, InputState) = .empty,
     added_inputs: u32 = 0,
     error_names: std.ArrayList([]const u8) = .empty,
@@ -676,6 +683,7 @@ const Overlay = struct {
         var rit = o.rrefs.valueIterator();
         while (rit.next()) |l| l.deinit(gpa);
         o.rrefs.deinit(gpa);
+        o.touched.deinit(gpa);
         o.inputs.deinit(gpa);
         o.error_names.deinit(gpa);
         o.error_symbols.deinit(gpa);
@@ -702,7 +710,7 @@ const Overlay = struct {
 fn SectionType(comptime s: Section) type {
     return switch (s) {
         .nodes => Node,
-        .table, .edges, .redges, .rref_starts, .rref_nodes => u32,
+        .table, .edges, .redges, .rref_starts, .rref_nodes, .reached_bits => u32,
         .atom_refs => Pack.AtomRef,
         .inputs => Input,
         .error_names, .bases, .files, .ref_names => StrRef,
@@ -753,6 +761,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
         m.error_symbols.len != m.error_names.len or
         m.ref_starts.len != m.nodes.len + 1 or m.ref_starts[m.nodes.len] != m.refs.len or
         m.rref_starts.len != m.nodes.len + 1 or m.rref_starts[m.nodes.len] != m.rref_nodes.len or
+        m.reached_bits.len != (m.nodes.len + 31) / 32 or
         m.sources.len != m.nodes.len or
         m.result_starts.len != m.nodes.len + 1 or m.result_starts[m.nodes.len] != m.results.len or
         m.subject_starts.len != m.nodes.len + 1 or m.subject_starts[m.nodes.len] != m.subjects.len or
@@ -793,6 +802,35 @@ fn readLog(m: *Manifest, gpa: Allocator, io: Io, dir: Io.Dir) !void {
     var off: usize = @sizeOf(LogHeader);
     while (try m.applyRecord(gpa, @alignCast(o.buf[off..]))) |rec_len| off += rec_len;
     o.len = off;
+    o.touched = try .initEmpty(gpa, m.nodeCount());
+    inline for (.{ &o.nodes, &o.rdeps, &o.rrefs, &o.flags, &o.sources }) |map| {
+        var it = map.keyIterator();
+        while (it.next()) |k| if (k.* < o.touched.bit_length) o.touched.set(k.*);
+    }
+}
+
+/// The nodes whose `Flags.reached` is set, from the base's bits and the
+/// nodes the log changed.
+pub fn reachedSet(m: *const Manifest, gpa: Allocator) !std.DynamicBitSetUnmanaged {
+    var set = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.nodeCount());
+    errdefer set.deinit(gpa);
+    const bytes = std.mem.sliceAsBytes(m.reached_bits);
+    @memcpy(std.mem.sliceAsBytes(set.masks[0 .. (set.bit_length + @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt) - 1) / @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt)])[0..bytes.len], bytes);
+    var it = m.overlay.touched.iterator(.{});
+    while (it.next()) |i| set.setValue(i, m.flags(@intCast(i)).reached);
+    for (m.nodes.len..set.bit_length) |i| set.setValue(i, m.flags(@intCast(i)).reached);
+    return set;
+}
+
+/// Whether the log changed anything about node `index`.
+fn touched(m: *const Manifest, index: u32) bool {
+    return index < m.overlay.touched.bit_length and m.overlay.touched.isSet(index);
+}
+
+/// Node `index`'s state in the log, or null if the log did not set it.
+fn overlayNode(m: *const Manifest, index: u32) ?Overlay.NodeState {
+    if (!m.touched(index)) return null;
+    return m.overlay.nodes.get(index);
 }
 
 /// Applies the record at the start of `rest`, or returns null if there is
@@ -937,36 +975,36 @@ fn findIn(nodes: []const Node, table: []const u32, key: Hash) ?u32 {
 pub const NodeInfo = struct { key: Hash, result_hash: Hash, src_hash: Hash, tag: u8 };
 
 pub fn node(m: *const Manifest, index: u32) NodeInfo {
-    if (m.overlay.nodes.get(index)) |s| return .{ .key = s.delta.key, .result_hash = s.delta.result_hash, .src_hash = s.delta.src_hash, .tag = s.delta.tag };
+    if (m.overlayNode(index)) |s| return .{ .key = s.delta.key, .result_hash = s.delta.result_hash, .src_hash = s.delta.src_hash, .tag = s.delta.tag };
     const n = &m.nodes[index];
     return .{ .key = n.key, .result_hash = n.result_hash, .src_hash = n.src_hash, .tag = n.tag };
 }
 
 /// What node `index` requested besides its dependencies (`Ref`).
 pub fn nodeRefs(m: *const Manifest, index: u32) []const Ref {
-    if (m.overlay.nodes.get(index)) |s| return s.refs;
+    if (m.overlayNode(index)) |s| return s.refs;
     if (index >= m.nodes.len) return &.{};
     return m.refs[m.ref_starts[index]..m.ref_starts[index + 1]];
 }
 
 /// Node `index`'s source.
 pub fn source(m: *const Manifest, index: u32) Source {
-    if (m.overlay.nodes.get(index)) |s| return s.source;
-    if (m.overlay.sources.get(index)) |s| return s;
+    if (m.overlayNode(index)) |s| return s.source;
+    if (m.touched(index)) if (m.overlay.sources.get(index)) |s| return s;
     return if (index < m.sources.len) m.sources[index] else .none;
 }
 
 /// Node `index`'s flags.
 pub fn flags(m: *const Manifest, index: u32) Flags {
-    if (m.overlay.nodes.get(index)) |s| return s.flags;
-    if (m.overlay.flags.get(index)) |f| return f;
+    if (m.overlayNode(index)) |s| return s.flags;
+    if (m.touched(index)) if (m.overlay.flags.get(index)) |f| return f;
     return if (index < m.nodes.len) m.nodes[index].flags else .{};
 }
 
 /// The declaration name a `namespace_name` node looks up, if `index` is
 /// one.
 pub fn sourceName(m: *const Manifest, index: u32) ?[]const u8 {
-    if (m.overlay.nodes.get(index)) |s| return s.source_name;
+    if (m.overlayNode(index)) |s| return s.source_name;
     if (index >= m.nodes.len) return null;
     var lo: usize = 0;
     var hi: usize = m.source_names.len;
@@ -992,7 +1030,7 @@ pub fn refNameCount(m: *const Manifest) u32 {
 
 /// Node `index`'s dependencies, as `Edge` words.
 pub fn deps(m: *const Manifest, index: u32) []const u32 {
-    if (m.overlay.nodes.get(index)) |s| return s.deps;
+    if (m.overlayNode(index)) |s| return s.deps;
     const n = m.nodes[index];
     return m.edges[n.deps_start..][0..n.deps_len];
 }
@@ -1000,7 +1038,7 @@ pub fn deps(m: *const Manifest, index: u32) []const u32 {
 /// Node `index`'s result in the format of `results.zig`, or empty if it has
 /// none.
 pub fn result(m: *const Manifest, index: u32) []const u32 {
-    if (m.overlay.nodes.get(index)) |s| return s.result;
+    if (m.overlayNode(index)) |s| return s.result;
     if (index >= m.nodes.len) return &.{};
     return m.results[m.result_starts[index]..m.result_starts[index + 1]];
 }
@@ -1008,7 +1046,7 @@ pub fn result(m: *const Manifest, index: u32) []const u32 {
 /// Node `index`'s subject in the format of `results.zig`, or empty, as
 /// `result`.
 pub fn subject(m: *const Manifest, index: u32) []const u32 {
-    if (m.overlay.nodes.get(index)) |s| return s.subject;
+    if (m.overlayNode(index)) |s| return s.subject;
     if (index >= m.nodes.len) return &.{};
     return m.subjects[m.subject_starts[index]..m.subject_starts[index + 1]];
 }
@@ -1032,7 +1070,7 @@ pub fn typeNameNodes(m: *const Manifest, ty: Hash) []const TypeNameRef {
 /// Node `index`'s type name offers and reads (`results.Names`), or empty,
 /// as `result`.
 pub fn typeNames(m: *const Manifest, index: u32) []const u32 {
-    if (m.overlay.nodes.get(index)) |s| return s.names;
+    if (m.overlayNode(index)) |s| return s.names;
     if (index >= m.nodes.len) return &.{};
     return m.type_names[m.type_name_starts[index]..m.type_name_starts[index + 1]];
 }
@@ -1079,7 +1117,7 @@ pub fn rdeps(m: *const Manifest, index: u32) [2][]const u32 {
         const n = m.nodes[index];
         break :b m.redges[n.rdeps_start..][0..n.rdeps_len];
     } else &.{};
-    const logged: []const u32 = if (m.overlay.rdeps.get(index)) |l| l.items else &.{};
+    const logged: []const u32 = if (!m.touched(index)) &.{} else if (m.overlay.rdeps.get(index)) |l| l.items else &.{};
     return .{ base, logged };
 }
 
@@ -1087,7 +1125,7 @@ pub fn rdeps(m: *const Manifest, index: u32) [2][]const u32 {
 /// base's, then the log's. A superset, as `rdeps`.
 pub fn rrefs(m: *const Manifest, index: u32) [2][]const u32 {
     const base: []const u32 = if (index < m.nodes.len) m.rref_nodes[m.rref_starts[index]..m.rref_starts[index + 1]] else &.{};
-    const logged: []const u32 = if (m.overlay.rrefs.get(index)) |l| l.items else &.{};
+    const logged: []const u32 = if (!m.touched(index)) &.{} else if (m.overlay.rrefs.get(index)) |l| l.items else &.{};
     return .{ base, logged };
 }
 
@@ -1101,14 +1139,14 @@ pub fn reachRef(kind: Ref.Kind) bool {
 }
 
 pub fn atoms(m: *const Manifest, index: u32) []const Pack.AtomRef {
-    if (m.overlay.nodes.get(index)) |s| return s.atoms;
+    if (m.overlayNode(index)) |s| return s.atoms;
     const n = m.nodes[index];
     return m.atom_refs[n.atoms_start..][0..n.atoms_len];
 }
 
 /// Node `index`'s atoms' names, parallel to `atoms(index)`.
 pub fn atomNames(m: *const Manifest, index: u32) AtomNames {
-    if (m.overlay.nodes.get(index)) |s| return .{ .names = s.atom_names, .bytes = s.name_bytes };
+    if (m.overlayNode(index)) |s| return .{ .names = s.atom_names, .bytes = s.name_bytes };
     const n = m.nodes[index];
     return .{ .names = m.atom_names[n.atoms_start..][0..n.atoms_len], .bytes = m.atom_name_bytes };
 }
@@ -2294,6 +2332,13 @@ pub const Builder = struct {
             };
         }
 
+        const reached_bits = try gpa.alloc(u32, (nodes.len + 31) / 32);
+        defer gpa.free(reached_bits);
+        @memset(reached_bits, 0);
+        for (nodes, 0..) |n, i| if (n.flags.reached) {
+            reached_bits[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+        };
+
         const debug_atoms = try debugAtoms(gpa, debug_files);
         defer gpa.free(debug_atoms);
 
@@ -2331,6 +2376,7 @@ pub const Builder = struct {
             @ptrCast(redges),
             @ptrCast(rref_starts),
             @ptrCast(rrefs_out),
+            @ptrCast(reached_bits),
             @ptrCast(refs),
             @ptrCast(b.inputs.items),
             @ptrCast(b.error_names.items),

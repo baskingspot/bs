@@ -49,6 +49,8 @@ outdated: std.DynamicBitSetUnmanaged,
 state: []State,
 /// Inputs whose contents changed, with their instruction maps.
 maps: seeds.InstMaps = .{},
+/// The same inputs, a bit each (`inChangedInput`).
+changed_input: std.DynamicBitSetUnmanaged = .{},
 /// Changed inputs `lateMap` tried to map.
 late_mapped: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// Whether `lateMap` failed for one, whose old ZIR was gone (the global
@@ -256,13 +258,14 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
         try changed.append(gpa, .{ .input = @intCast(i), .file = null });
     }
     // Inputs not loaded yet (embedded files, compiler_rt), by their stat
-    // and then their contents.
-    var stat_changed: std.ArrayList(u32) = .empty;
-    defer stat_changed.deinit(gpa);
-    try m.changedInputs(gpa, io, &stat_changed);
-    for (stat_changed.items) |i| {
+    // and then their contents. The frontend compared the others' contents.
+    for (0..m.inputCount()) |i_usize| {
+        const i: u32 = @intCast(i_usize);
         if (seen.isSet(i)) continue;
         const in, const path = m.input(i);
+        if (Io.Dir.cwd().statFile(io, path, .{})) |stat| {
+            if (in.matches(stat)) continue;
+        } else |_| {}
         const same = same: {
             const src = Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch break :same false;
             defer gpa.free(src);
@@ -275,6 +278,8 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     var seed_list: std.ArrayList(u32) = .empty;
     defer seed_list.deinit(gpa);
     _ = try seeds.compute(gpa, m, fe, changed.items, &seed_list, &r.maps);
+    r.changed_input = try .initEmpty(gpa, m.inputCount());
+    for (changed.items) |c| r.changed_input.set(c.input);
     r.stats.seeds = @intCast(seed_list.items.len);
     var stack = seed_list;
     seed_list = .empty;
@@ -343,9 +348,8 @@ fn assumeReached(r: *Replay) !void {
     const gpa = r.gpa;
     const m = r.m;
     const n = m.nodeCount();
-    var reached = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
+    var reached = try m.reachedSet(gpa);
     defer reached.deinit(gpa);
-    for (0..n) |i| if (m.flags(@intCast(i)).reached) reached.set(i);
     var cone = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
     defer cone.deinit(gpa);
     var list: std.ArrayList(u32) = .empty;
@@ -418,6 +422,7 @@ pub fn destroy(r: *Replay) void {
     const gpa = r.gpa;
     r.pack.close(gpa, r.io);
     r.outdated.deinit(gpa);
+    r.changed_input.deinit(gpa);
     r.visited.deinit(gpa);
     r.roots.deinit(gpa);
     r.assumed.deinit(gpa);
@@ -1233,14 +1238,12 @@ fn inlineMoved(r: *Replay, d: u32, depth: u32) !bool {
 }
 
 fn inChangedInput(r: *Replay, n: u32) bool {
-    const src = r.m.source(n);
-    return src.input != Manifest.Source.no_input and r.maps.maps.contains(src.input);
+    const input = r.m.source(n).input;
+    return input < r.changed_input.bit_length and r.changed_input.isSet(input);
 }
 
 fn namespaceOutdated(r: *Replay, n: u32) bool {
-    if (r.outdated.isSet(n)) return true;
-    const src = r.m.source(n);
-    if (src.input != Manifest.Source.no_input and r.maps.maps.contains(src.input)) return true;
+    if (r.outdated.isSet(n) or r.inChangedInput(n)) return true;
     for (r.m.nodeRefs(n)) |ref| if (ref.kind == .root and r.outdated.isSet(ref.value)) return true;
     return false;
 }

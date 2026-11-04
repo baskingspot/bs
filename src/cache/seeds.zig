@@ -96,11 +96,16 @@ pub fn compute(gpa: Allocator, m: *const Manifest, fe: *const Frontend, changed:
     }
     if (changed.len == 0) return stats;
 
+    // Most nodes' inputs did not change: a bit each says so without
+    // hashing.
+    var is_changed = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.inputCount());
+    defer is_changed.deinit(gpa);
+    for (changed) |c| is_changed.set(c.input);
     for (0..m.nodeCount()) |i_usize| {
         const i: u32 = @intCast(i_usize);
         const src = m.source(i);
-        if (src.input == Manifest.Source.no_input) continue;
-        const ctx = &ctxs[by_input.get(src.input) orelse continue];
+        if (src.input == Manifest.Source.no_input or src.input >= is_changed.bit_length or !is_changed.isSet(src.input)) continue;
+        const ctx = &ctxs[by_input.get(src.input).?];
         if (try isSeed(gpa, m, i, src, ctx.old, ctx.new, &ctx.map, &ctx.names)) try seeds.append(gpa, i);
     }
     if (maps) |out| for (changed, ctxs) |c, *ctx| {
