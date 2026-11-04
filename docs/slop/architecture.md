@@ -1642,7 +1642,9 @@ build, the passes, and the debug info treat them as Sema's inline calls
   `@frameAddress`, inline assembly, error return trace access). Its size is its instructions with code
   outside cold bodies, less `block`s, their `br`s and the fields of an
   overflow operation's result (`Scanner.free`), plus the sizes of the
-  callees inlined into it (mid-stack inlining); the budget is 30. A function whose callees are
+  callees inlined into it (mid-stack inlining); the budget is 30, and
+  twice that for a call inside a loop of the caller (`loop_factor`: its
+  cost is paid each iteration, its code once). A function whose callees are
   not all inlined is not inlinable itself, so only leaves and functions
   that become leaves inline, and every decision reads the callee's own
   IR, the same in every build and schedule.
@@ -1745,8 +1747,13 @@ build, the passes, and the debug info treat them as Sema's inline calls
   other runtime benchmarks 0; std's test build +0.5–1%, the zig workload
   0, IR +5%, binaries +4% (std tests) and +9% (zig). A lower budget under
   this measure drops inlines that matter (at 24 nbody +27%, at 20 sort
-  +15%). A budget of 100 for calls inside loops took sort −4% and vaxis
-  −2% more, for +1.3% compile and binaries +10–13%.
+  +15%).
+- **The loop budget** (the same way, against the size measure alone):
+  60 for calls inside loops gives sort −3.2%, vaxis −1.7%, hash −0.7%,
+  zig fmt −0.4%, the zls tests −0.2% outside the unwinder (+2.5% in
+  all), the other runtime benchmarks 0; std's test build +0.3% and the
+  zig workload 0, IR +3%, binaries +3%. 100 adds little more (sort and
+  hash within 0.1%).
 - **What users see.** std 0.17's stack traces print one frame per return
   address, named after the innermost inline range (`Dwarf.getSymbols`
   ignores inline callers, and `resolve_inline_callers` cannot help on

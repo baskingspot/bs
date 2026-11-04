@@ -1225,7 +1225,7 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
             // callee's unit).
             const in_changed = switch (dtag) {
                 .func_body => r.inChangedInput(d),
-                .func_inline => try r.inlineMoved(d, inline_ir.budget),
+                .func_inline => try r.inlineMoved(d, inline_ir.budget * inline_ir.loop_factor),
                 else => continue,
             };
             if (!in_changed) continue;
@@ -1237,8 +1237,8 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
 }
 
 /// Whether the function of `func_inline` node `d` is inlined, and it, or
-/// one it inlines in turn (at most `depth` levels down, which the budget
-/// bounds), is in a changed input; makes the dependees of those it
+/// one it inlines in turn (at most `depth` levels down, which the loop
+/// budget bounds), is in a changed input; makes the dependees of those it
 /// inlines that are.
 fn inlineMoved(r: *Replay, d: u32, depth: u32) !bool {
     const m = r.m;

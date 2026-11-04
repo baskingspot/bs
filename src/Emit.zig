@@ -704,7 +704,10 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
                 all = false;
                 continue;
             },
-            .yes => |y| y,
+            .yes => |y| if (y.size <= emit.inline_budget * @as(u32, if (site.in_loop) inline_ir.loop_factor else 1)) y else {
+                all = false;
+                continue;
+            },
         };
         const body = emit.inlineBody(site.callee) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -719,7 +722,8 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
         try bodies.append(gpa, body);
         try splices.append(gpa, .{ .site = site, .body = undefined });
     }
-    const inlinable = all and size <= emit.inline_budget;
+    // Up to the loop budget: a caller decides per site.
+    const inlinable = all and size <= emit.inline_budget * inline_ir.loop_factor;
     // Of its own body, before the splices.
     const loaded = emit.inline_fates.contains(func);
     const own_hash: cache.Hash = if (inlinable and !loaded) try inline_ir.hashBody(gpa, &zcu.ip, &ir) else 0;

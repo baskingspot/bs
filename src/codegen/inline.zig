@@ -12,15 +12,20 @@ const Inst = Ir.Inst;
 const Zcu = @import("../Zcu.zig");
 const Zir = std.zig.Zir;
 
-/// The most instructions with hot code (`Scan.size`) an inlinable body
-/// has, after its own callees are inlined.
+/// The most instructions with hot code (`Scan.size`) a body inlined at a
+/// call outside loops has, after its own callees are inlined.
 pub const budget = 30;
+/// A call inside a loop inlines callees up to this many times the budget:
+/// its cost is paid once per iteration, the code once.
+pub const loop_factor = 2;
 
 /// A call that may be inlined: a direct call of an `.auto` function, not
 /// `never_inline`, outside cold code. `line:column` is the call's statement
 /// position.
 pub const Site = struct {
     call: Inst.Index,
+    /// Inside a `loop` of the caller (`loop_factor`).
+    in_loop: bool,
     callee: Index,
     line: u32,
     column: u32,
@@ -91,6 +96,8 @@ const Scanner = struct {
     ir: *const Ir,
     sites: *std.ArrayList(Site),
     out: Scan = .{},
+    /// `loop`s the scan is inside.
+    loops: u32 = 0,
     line: u32 = 0,
     column: u32 = 0,
 
@@ -115,7 +122,10 @@ const Scanner = struct {
                 .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect, .comptime_exit => unreachable,
                 .block, .loop => {
                     const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
+                    const loop = tag == .loop;
+                    s.loops += @intFromBool(loop);
                     try s.body(ir.bodySlice(extra.end, extra.data.body_len), cold);
+                    s.loops -= @intFromBool(loop);
                 },
                 .cond_br => {
                     const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
@@ -188,7 +198,7 @@ const Scanner = struct {
             s.out.inlinable = false;
             return;
         }
-        try s.sites.append(s.gpa, .{ .call = inst, .callee = callee, .line = s.line, .column = s.column });
+        try s.sites.append(s.gpa, .{ .call = inst, .in_loop = s.loops != 0, .callee = callee, .line = s.line, .column = s.column });
     }
 };
 
