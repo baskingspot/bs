@@ -621,8 +621,9 @@ const Overlay = struct {
     item_overrides: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// What `linkInput` returns, gathered on first use when nodes changed.
     gathered: ?LinkInput = null,
-    /// `LinkInput.names`, made on first use.
-    link_names: ?[]const []const u8 = null,
+    /// `LinkInput.names` when the base is linked as it is (not
+    /// `gathered`, which owns its own), made on first use.
+    base_link_names: ?[]const []const u8 = null,
 
     const NodeState = struct {
         delta: *const NodeDelta,
@@ -667,8 +668,9 @@ const Overlay = struct {
             gpa.free(g.numbered);
             gpa.free(g.debug_files);
             gpa.free(g.debug_atoms);
+            gpa.free(g.names);
         }
-        if (o.link_names) |n| gpa.free(n);
+        if (o.base_link_names) |n| gpa.free(n);
     }
 };
 
@@ -1082,11 +1084,11 @@ pub const LinkInput = struct {
 pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
     const o = &m.overlay;
     if (o.nodes.count() == 0 and o.flags.count() == 0 and m.base_unlinked == 0) {
-        if (o.link_names == null) {
+        if (o.base_link_names == null) {
             const names = try gpa.alloc([]const u8, m.atom_names.len);
             const all: AtomNames = .{ .names = m.atom_names, .bytes = m.atom_name_bytes };
             for (names, 0..) |*n, k| n.* = all.name(k);
-            o.link_names = names;
+            o.base_link_names = names;
         }
         return .{
             .refs = m.atom_refs,
@@ -1095,7 +1097,7 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
             .debug_atoms = m.debug_atoms,
             .targets = m.targets,
             .targets_tail = o.targets.items,
-            .names = o.link_names.?,
+            .names = o.base_link_names.?,
         };
     }
     if (o.gathered) |g| return g;
@@ -1137,7 +1139,6 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
     try appendRun(gpa, m, &refs, &numbered, &debug_files, &names, run_start, run_end);
     const debug_atoms = try debugAtoms(gpa, debug_files.items);
     errdefer gpa.free(debug_atoms);
-    o.link_names = try names.toOwnedSlice(gpa);
     const g: LinkInput = .{
         .refs = try refs.toOwnedSlice(gpa),
         .numbered = try numbered.toOwnedSlice(gpa),
@@ -1145,7 +1146,7 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
         .debug_atoms = debug_atoms,
         .targets = m.targets,
         .targets_tail = o.targets.items,
-        .names = o.link_names.?,
+        .names = try names.toOwnedSlice(gpa),
     };
     o.gathered = g;
     return g;
