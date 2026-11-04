@@ -277,7 +277,11 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
             continue
         argv = compile_argv(comp, target_words, cache, out)
         r = {"argv": shlex.join(argv)}
-        secs, code, output = timed(argv, src)
+        # A cold build without donors: a donor (another compilation's
+        # result in zap's global store) makes the time depend on what the
+        # store holds.
+        env = dict(os.environ, ZAP_CACHE_DONOR="off") if which == "zap" else None
+        secs, code, output = timed(argv, src, env)
         r["cold_local"] = tc_secs + secs
         r["compile_exit"] = code
         if code != 0:

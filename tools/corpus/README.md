@@ -47,6 +47,9 @@ a full build with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`; not timed).
   - The build-system plumbing goes (`--listen=-`, the cache directories);
     each build gets an empty local cache and the user's global cache
     (`cold-local`) and emits to `.work/out/`. Tests add `--test-no-exec`.
+    zap's cold build runs with `ZAP_CACHE_DONOR=off`: a first build that
+    replays a donor from the global store takes a time that depends on
+    what the store holds.
   - Every build is Debug: a release `-O` some build scripts force on their
     build-time tools becomes `-Odebug`, and upstream's `-fllvm` becomes
     `-fno-llvm`, so the baseline is upstream's Debug default on x86_64-linux
