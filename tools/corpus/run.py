@@ -78,6 +78,9 @@ def setup(proj, zig, refresh):
     if sh(["git", "rev-parse", "HEAD"], src).stdout.strip() != proj["commit"]:
         sh(["git", "fetch", "--quiet", "origin", proj["commit"]], src, check=False)
         sh(["git", "checkout", "--quiet", "--force", "--detach", proj["commit"]], src)
+    if proj.get("submodules"):
+        # Vendored C sources (buzz's mimalloc, pcre2, ...).
+        sh(["git", "submodule", "update", "--quiet", "--init", "--recursive"], src)
     # Data packages a target's run needs (`fetch`), unpacked under .work/fetch/.
     for name, url in proj.get("fetch", {}).items():
         h = sh([zig, "fetch", url], WORK).stdout.strip()
