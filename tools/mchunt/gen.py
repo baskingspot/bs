@@ -1015,6 +1015,7 @@ class Gen:
             (2, "switch"), (3, "callstmt"), (2, "ptr"), (2, "aggr"), (1, "slice"), (1, "opt"),
             (1, "defer"), (1, "guard"), (1, "labeled"), (1, "inlinefor"), (1, "brk"), (1, "ret"),
             (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
+            (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -1380,7 +1381,7 @@ class Gen:
         """A check next to the comparisons that decide it, or nearly do
         (what a prover of safety checks reasons about). The near misses
         must keep their check: they fire for some values."""
-        k = self.r.randrange(11)
+        k = self.r.randrange(16)
         t = self.pick([Int(False, 8), Int(True, 8), Int(False, 16), Int(True, 16), U32, Int(True, 32), U64,
                        USIZE, Int(False, 5), Int(True, 7)])
         x = self.rt_int(ctx, t)
@@ -1513,6 +1514,79 @@ class Gen:
             self.emit(ctx, f"if ({j} < {a1}.len) {{")
             body(f"{a1}[{j}] ^ {a2}[{j}]")
             I()
+        elif k == 11:
+            # A wrapping add in the comparison: i +% c <= n says nothing
+            # about i when the add wraps.
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+            j = self.fresh("pj")
+            src = f"{self.conv(v, t, USIZE)}" if not near else f"({self.conv(v, t, USIZE)} | 0xfffffffffffffff0)"
+            self.emit(ctx, f"const {j}: usize = {src};")
+            c = self.r.randint(1, 3)
+            self.emit(ctx, f"if ({j} +% {c} <= {arr}.len) {{")
+            body(f"{arr}[{j}]")
+            I()
+        elif k == 12:
+            # A store between the check and the use, in a variable.
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+            j = self.fresh("pj")
+            self.emit(ctx, f"var {j}: usize = {self.conv(v, t, USIZE)};")
+            self.emit(ctx, f"if ({j} < {arr}.len) {{")
+            ctx["indent"] += 1
+            self.emit(ctx, f"{j} +%= 1;" if near else f"{j} = ({j} +% 1) % {ln};")
+            self.sink(ctx, f"{arr}[{j}]", t)
+            ctx["indent"] -= 1
+            I()
+        elif k == 13:
+            # A check carried around a back edge.
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+            j = self.fresh("pj")
+            step = self.r.randint(1, 3)
+            self.emit(ctx, f"var {j}: usize = {self.conv(v, t, USIZE)} % {ln + 1};")
+            self.emit(ctx, "while (true) {")
+            ctx["indent"] += 1
+            self.emit(ctx, f"if ({j} {'>' if near else '>='} {ln}) break;")
+            self.sink(ctx, f"{arr}[{j}]", t)
+            self.emit(ctx, f"{j} += {step};")
+            ctx["indent"] -= 1
+            I()
+        elif k == 14:
+            # A bound on a value of another width or sign than the index.
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+            if t.signed:
+                # s < len does not make s a valid index while s may be negative.
+                self.emit(ctx, f"if ({v} < {ln}{'' if near else f' and {v} >= 0'}) {{")
+                body(f"{arr}[@intCast({v})]")
+            else:
+                # A truncated copy below the bound says nothing about the value.
+                tr = Int(False, max(1, min(t.bits, 8) - 1)) if t.bits > 1 else t
+                if near:
+                    self.emit(ctx, f"if (@as({tr.name()}, @truncate({v})) < {ln}) {{")
+                else:
+                    self.emit(ctx, f"if ({v} < {ln}) {{")
+                body(f"{arr}[{self.conv(v, t, USIZE)}]")
+            I()
+        elif k == 15:
+            # Stored, then compared through a cast (the load's value is the
+            # stored one, not the one before the store).
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            w = self.fresh("pw")
+            self.emit(ctx, f"var {w}: {n} = {v};")
+            self.emit(ctx, f"{w} +%= {self.r.randint(1, 2) if t.max() >= 2 else 0};")
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({w});")
+            j = self.fresh("pj")
+            self.emit(ctx, f"const {j}: usize = {self.conv(w, t, USIZE)};")
+            self.emit(ctx, f"if ({j} {'<=' if near else '<'} {arr}.len) {{")
+            body(f"{arr}[{j}]")
+            I()
         else:
             # i <= n proves nothing about a[i] when a.len == n.
             arr = self.fresh("pa")
@@ -1523,6 +1597,268 @@ class Gen:
             self.emit(ctx, f"if ({j} {'<=' if near else '<'} {arr}.len) {{")
             body(f"{arr}[{j}]")
             I()
+
+    # ------------------------------------------------------------ backend shapes
+    def leaves(self, e, t, depth=0):
+        """The integer places inside a value of type t at e."""
+        if is_int(t):
+            return [(e, t)]
+        out = []
+        if isinstance(t, Struct) and depth < 3:
+            for fn, ft in t.fields:
+                out += self.leaves(f"{e}.{fn}", ft, depth + 1)
+        elif isinstance(t, Array) and depth < 3:
+            for i in range(t.n):
+                out += self.leaves(f"{e}[{i}]", t.elem, depth + 1)
+        return out
+
+    def init_fields(self, ctx, e, t):
+        """Assigns every scalar of e, one store each."""
+        if is_int(t):
+            self.emit(ctx, f"{e} = {self.int_expr(ctx, t, 1)};")
+        elif isinstance(t, Bool):
+            self.emit(ctx, f"{e} = {self.bool_expr(ctx, 1)};")
+        elif isinstance(t, Enum):
+            self.emit(ctx, f"{e} = .{self.pick(t.tags)[0]};")
+        elif isinstance(t, Struct):
+            for fn, ft in t.fields:
+                self.init_fields(ctx, f"{e}.{fn}", ft)
+        elif isinstance(t, Array):
+            if t.n > 3 and is_int(t.elem) and self.chance(0.5):
+                self.emit(ctx, f"{e} = @splat({self.int_expr(ctx, t.elem, 1)});")
+            else:
+                for i in range(t.n):
+                    self.init_fields(ctx, f"{e}[{i}]", t.elem)
+
+    def leaf_ops(self, ctx, lv, n):
+        """Field-by-field reads, writes and copies between scalars."""
+        for _ in range(n):
+            e, t = self.pick(lv)
+            k = self.r.random()
+            if k < 0.4:
+                self.emit(ctx, f"{e} {self.pick(['=', '+%=', '^=', '*%=', '-%=', '|='])} {self.int_expr(ctx, t, 1)};")
+            elif k < 0.7:
+                e2, t2 = self.pick(lv)
+                self.emit(ctx, f"{e} = {self.conv(e2, t2, t)};")
+            else:
+                self.sink(ctx, e, t)
+
+    def s_sroa(self, ctx):
+        """An aggregate local written and read field by field (what scalar
+        replacement turns into registers)."""
+        if self.structs and self.chance(0.65):
+            t = self.pick(self.structs)
+        else:
+            t = Array(self.rand_int_type(), self.r.randint(2, 6))
+        lv = self.leaves("X", t)
+        if not lv:
+            return self.s_aggr(ctx)
+        name = self.fresh("sr")
+        if self.chance(0.5):
+            self.emit(ctx, f"var {name}: {t.name()} = undefined;")
+            self.init_fields(ctx, name, t)
+        else:
+            self.emit(ctx, f"var {name}: {t.name()} = {self.value_expr(ctx, t, 1)};")
+        lv = [(name + e[1:], ft) for e, ft in lv]
+        self.emit(ctx, f"_ = &{name};")
+        self.leaf_ops(ctx, lv, self.r.randint(2, 6))
+        if self.chance(0.4):
+            # A whole copy, then the original changes: the copy keeps its values.
+            cp = self.fresh("sc")
+            self.emit(ctx, f"const {cp} = {name};")
+            self.leaf_ops(ctx, lv, self.r.randint(1, 3))
+            self.sink_value(ctx, cp, t)
+        if self.chance(0.3):
+            # Through a loop: the scalars are live around the back edge.
+            i = self.fresh("ix")
+            self.emit(ctx, f"for (0..{self.r.randint(1, 4)}) |{i}| {{")
+            ctx["indent"] += 1
+            e, ft = self.pick(lv)
+            self.emit(ctx, f"{e} +%= {self.conv(i, USIZE, ft)};")
+            self.leaf_ops(ctx, lv, self.r.randint(1, 2))
+            ctx["indent"] -= 1
+            self.emit(ctx, "}")
+        self.sink_value(ctx, name, t)
+
+    def s_addr(self, ctx):
+        """Loads and stores at a pointer plus a constant offset, below the
+        pointer too (address modes)."""
+        et = self.rand_int_type()
+        n = self.r.randint(3, 8)
+        arr = self.fresh("ad")
+        if self.chance(0.5):
+            self.emit(ctx, f"var {arr}: [{n}]{et.name()} = .{{ {', '.join(self.lit(et) for _ in range(n))} }};")
+        else:
+            self.emit(ctx, f"var {arr}: [{n}]{et.name()} = @splat({self.int_expr(ctx, et, 1)});")
+        k = self.r.randint(1, n - 1)
+        mp, q = self.fresh("mp"), self.fresh("q")
+        self.emit(ctx, f"const {mp}: [*]{et.name()} = &{arr};")
+        self.emit(ctx, f"const {q} = {mp} + {k};")
+        self.emit(ctx, f"{q}[0] +%= {self.int_expr(ctx, et, 1)};")
+        for _ in range(self.r.randint(2, 6)):
+            # Element offset from q in [-k, n-1-k].
+            off = self.r.randint(-k, n - 1 - k)
+            if off >= 0:
+                at = f"{q}[{off}]" if self.chance(0.6) else f"({q} + {off})[0]"
+            else:
+                at = f"({q} - {-off})[0]" if self.chance(0.6) else f"({mp} + {k + off})[0]"
+            w = self.r.random()
+            if w < 0.45:
+                self.emit(ctx, f"{at} {self.pick(['=', '+%=', '^=', '-%='])} {self.int_expr(ctx, et, 1)};")
+            elif w < 0.7:
+                self.sink(ctx, at, et)
+            elif w < 0.85:
+                # A runtime index from the offset base.
+                rt = self.rt_int(ctx, Int(False, 8))
+                if rt is None:
+                    continue
+                self.sink(ctx, f"({q} - {k})[{self.conv(rt, Int(False, 8), USIZE)} % {n}]", et)
+            else:
+                lo = self.r.randint(0, n - 1)
+                hi = self.r.randint(lo, n)
+                sl = self.fresh("sl")
+                self.emit(ctx, f"const {sl} = ({q} - {k})[{lo}..{hi}];")
+                self.emit(ctx, f"for ({sl}) |x| mix({self.to_u64('x', et)});" if not ctx["fn"].pure
+                          else f"_ = {sl}.len;")
+        self.emit(ctx, f"_ = &{arr};")
+        self.sink_value(ctx, arr, Array(et, n))
+
+    def s_parent(self, ctx):
+        """Writes through @fieldParentPtr of a field pointer."""
+        cands = [s for s in self.structs if s.layout != "packed" and len(s.fields) >= 2]
+        if not cands:
+            return self.s_addr(ctx)
+        t = self.pick(cands)
+        lv = self.leaves("X", t)
+        if not lv:
+            return self.s_sroa(ctx)
+        fn, ft = self.pick(t.fields)
+        if self.chance(0.4):
+            # An element of an array of structs.
+            n = self.r.randint(2, 4)
+            arr = self.fresh("pa")
+            self.emit(ctx, f"var {arr}: [{n}]{t.name()} = .{{ {', '.join(self.global_init(t) for _ in range(n))} }};")
+            base = f"{arr}[{self.r.randrange(n)}]"
+            whole, wt = arr, Array(t, n)
+        else:
+            s = self.fresh("ps")
+            self.emit(ctx, f"var {s}: {t.name()} = {self.value_expr(ctx, t, 1)};")
+            base, whole, wt = s, s, t
+        fp, par = self.fresh("fp"), self.fresh("pp")
+        self.emit(ctx, f"const {fp} = &{base}.{fn};")
+        # The field pointer only promises the field's alignment.
+        al = "1" if self.chance(0.3) else f"@alignOf({ft.name()})"
+        self.emit(ctx, f"const {par}: *align({al}) {t.name()} = @fieldParentPtr(\"{fn}\", {fp});")
+        plv = [(par + e[1:], lt) for e, lt in lv] + [(base + e[1:], lt) for e, lt in lv]
+        if is_int(ft):
+            plv.append((f"{fp}.*", ft))
+        e, lt = self.pick(lv)
+        self.emit(ctx, f"{par}{e[1:]} {self.pick(['+%=', '^=', '='])} {self.int_expr(ctx, lt, 1)};")
+        self.leaf_ops(ctx, plv, self.r.randint(2, 5))
+        self.emit(ctx, f"_ = &{whole};")
+        self.sink_value(ctx, whole, wt)
+
+    def s_live(self, ctx):
+        """Many values live across calls (callee-saved registers, spills,
+        coalescing)."""
+        n = self.r.randint(5, 14)
+        names = []
+        for _ in range(n):
+            t = self.rand_int_type()
+            v = self.fresh("lv")
+            self.emit(ctx, f"const {v}: {t.name()} = {self.int_expr(ctx, t, 1)};")
+            names.append((v, t))
+        for _ in range(self.r.randint(1, 3)):
+            if not ctx["fn"].pure and self.chance(0.3):
+                v, t = self.pick(names)
+                self.emit(ctx, f"mix({self.to_u64(v, t)});")
+            else:
+                self.s_callstmt(ctx)
+            if self.chance(0.4):
+                # Some die here, the rest stay live across the next call.
+                v, t = names.pop(self.r.randrange(len(names)))
+                self.sink(ctx, v, t)
+                if not names:
+                    return
+        if self.chance(0.5):
+            self.sink(ctx, " ^ ".join(self.to_u64(v, t) for v, t in names), U64)
+        else:
+            for v, t in names:
+                self.sink(ctx, v, t)
+
+    def s_byref(self, ctx):
+        """A by-value aggregate argument that aliases a global the callee
+        writes, the result location, or a pointer argument."""
+        if ctx["fn"].pure or not self.byref:
+            return self.s_live(ctx)
+        kind, name, t, g = self.pick(self.byref)
+        if kind == "bv":
+            self.sink(ctx, f"{name}({g})", U64)
+            return
+        locs = [p for p in self.paths(ctx, lambda x: x.name() == t.name(), writable=True, depth=1)
+                if not self.in_packed(p[0])]
+        if locs and self.chance(0.7):
+            steps, _, _ = self.pick(locs)
+            lv = self.render_path(ctx, steps, writing=True)
+        else:
+            lv = self.fresh("br")
+            self.emit(ctx, f"var {lv}: {t.name()} = {self.value_expr(ctx, t, 1)};")
+            self.emit(ctx, f"_ = &{lv};")
+        if kind == "ru":
+            # The result location is the argument.
+            self.emit(ctx, f"{lv} = {name}({lv});")
+        else:
+            self.sink(ctx, f"{name}(&{lv}, {lv})", U64)
+        self.sink_value(ctx, lv, t)
+
+    def byref_helpers(self):
+        """Top-level helpers for s_byref; self.byref lists them."""
+        out = self.out
+        self.byref = []
+
+        def digest(e, t):
+            return " ^ ".join(f"({self.to_u64(x, xt)} *% {2 * j + 1})" for j, (x, xt) in enumerate(self.leaves(e, t))) or "0"
+
+        for g in self.globals:
+            t = g.ty
+            if g.kind != "global" or not isinstance(t, (Struct, Array)) or not self.leaves("s", t):
+                continue
+            e, et = self.pick(self.leaves(g.name, t))
+            name = f"bv_{g.name}"
+            out.append(f"fn {name}(s: {t.name()}) u64 {{")
+            out.append(f"    const d0 = {digest('s', t)};")
+            out.append(f"    {e} {self.pick(['+%=', '^='])} {self.lit(et)};")
+            out.append(f"    mix(d0);")
+            out.append(f"    return {digest('s', t)};")
+            out.append("}")
+            self.byref.append(("bv", name, t, g.name))
+        tys = list(self.structs) + [Array(self.rand_int_type(), self.r.randint(2, 4))]
+        for i, t in enumerate(tys):
+            lv = self.leaves("r", t)
+            if not lv:
+                continue
+            name = f"ru{i}"
+            out.append(f"fn {name}(s: {t.name()}) {t.name()} {{")
+            out.append(f"    var r = s;")
+            for e, et in self.r.sample(lv, min(len(lv), 3)):
+                e2, et2 = self.pick(lv)
+                out.append(f"    {e} = {self.conv('s' + e2[1:], et2, et)} +% {self.lit(et)};")
+            out.append(f"    mix({self.to_u64('s' + lv[0][0][1:], lv[0][1])});")
+            out.append("    return r;")
+            out.append("}")
+            self.byref.append(("ru", name, t, None))
+            if isinstance(t, Struct) and t.layout == "packed":
+                continue
+            name = f"bp{i}"
+            e, et = self.pick(lv)
+            out.append(f"fn {name}(p: *{t.name()}, s: {t.name()}) u64 {{")
+            out.append(f"    const d0 = {digest('s', t)};")
+            out.append(f"    p{e[1:]} {self.pick(['+%=', '^='])} {self.lit(et)};")
+            out.append(f"    mix(d0);")
+            out.append(f"    return {digest('s', t)};")
+            out.append("}")
+            self.byref.append(("bp", name, t, None))
+        out.append("")
 
     def s_switch(self, ctx):
         if self.chance(0.3):
@@ -1967,6 +2303,7 @@ class Gen:
         out.append("    ck ^= ck >> 29;")
         out.append("}")
         out.append("")
+        self.byref_helpers()
         nf = max(2, int(self.r.randint(3, 9) * self.size))
         for i in range(nf):
             self.gen_function(i, max(3, int(self.r.randint(4, 16) * self.size)))

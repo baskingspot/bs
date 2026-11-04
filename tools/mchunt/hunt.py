@@ -282,8 +282,15 @@ def main():
     seen_path = os.path.join(H.WORK, "branches.json")
     seen = json.load(open(seen_path)) if os.path.exists(seen_path) else {}
     fresh = not os.path.exists(seen_path)
-    queue = []
+    # Queued and running campaigns survive a restart (a running one starts over).
+    queue_path = os.path.join(H.WORK, "queue.json")
+    queue = [tuple(x) for x in json.load(open(queue_path))] if os.path.exists(queue_path) else []
     rebuilt["campaign"] = None
+
+    def save_queue():
+        c = rebuilt["campaign"]
+        cur = [(c["branch"], c["sha"])] if c is not None else []
+        json.dump(cur + queue, open(queue_path, "w"))
 
     def branch_heads():
         if not args.branches:
@@ -303,6 +310,7 @@ def main():
                 log(f"branch {b} at {h[:10]}: queued")
                 queue.append((b, h))
         json.dump(seen, open(seen_path, "w"), indent=1)
+        save_queue()
 
     def start_campaign():
         if rebuilt["campaign"] is not None or not queue:
@@ -323,6 +331,7 @@ def main():
         with lock:
             rebuilt["campaign"] = {"branch": b, "sha": h, "tools": t, "base": base, "left": args.branch_programs,
                                    "done": 0, "findings": [], "t0": time.time()}
+        save_queue()
         log(f"campaign {b} {h[:10]} (base {mb[:10]}): {args.branch_programs} programs")
 
     def follower():
@@ -392,7 +401,7 @@ def main():
                     rec = fut.result()
                 except Exception as e:
                     log(f"worker error: {e!r}")
-                    continue
+                    rec = {"result": "discard", "seed": None}
                 stats.add(rec)
                 c = fut.campaign
                 if c is not None:
@@ -403,6 +412,7 @@ def main():
                         finish_campaign(c)
                         with lock:
                             rebuilt["campaign"] = None
+                        save_queue()
                 if rec["result"] not in ("pass", "discard"):
                     log(f"seed {rec['seed']}: {rec['result']} {rec.get('sig', rec.get('why', ''))}")
                 if rec["result"].replace("branch-", "") in ("miscompile", "bs-crash", "bs-reject") and not args.no_reduce:
