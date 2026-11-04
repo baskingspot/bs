@@ -156,3 +156,11 @@ fn main() callconv(.c) noreturn {
     rt.printInt(views[0][1]);
     rt.exit(@intCast(@bitSizeOf(u7)));
 }
+
+// As upstream, a comptime declaration may compute runtime values nothing
+// needs.
+var lazy_rt: u32 = 5;
+comptime {
+    _ = lazy_rt;
+    _ = lazy_rt + 1;
+}

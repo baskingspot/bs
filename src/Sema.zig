@@ -1083,6 +1083,10 @@ pub fn analyzeComptimeDecl(zcu: *Zcu, c: Zcu.ComptimeDecl) CompileError!void {
     const decl = sema.code.getDeclaration(c.inst);
     var block = sema.rootBlock(c.namespace, decl.src_node, true);
     defer block.deinitInsts();
+    // As a `comptime` block in a function body, and upstream: runtime
+    // values may be computed as long as nothing comptime needs them
+    // (`_ = runtime_var;`).
+    block.discards_runtime = true;
     _ = try sema.resolveInlineBody(&block, decl.value_body.?, c.inst);
     try sema.finish();
 }
@@ -3174,7 +3178,9 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                         try sema.runtimeBreak(block, sema.comptime_break_inst)) return else return err,
                     else => return err,
                 };
-                if (sema.resolveValue(result) == null)
+                // Within comptime code, a `comptime` block is a no-op, as
+                // upstream.
+                if (sema.resolveValue(result) == null and !block.is_comptime)
                     return sema.failNeededComptime(block, block.nodeSrc(data.pl_node.src_node), child.comptime_reason.?);
                 break :blk result;
             },
@@ -8887,11 +8893,13 @@ fn overflowTupleType(sema: *Sema, ty: Index) !Index {
 }
 
 fn requireRuntime(sema: *Sema, block: *Block, src: Src) CompileError!void {
-    if (block.is_comptime and !block.discards_runtime) {
-        const err = sema.fail(block, src, "unable to evaluate comptime expression", .{});
-        if (block.comptime_reason) |r| try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "{s}", .{r});
-        return err;
-    }
+    if (block.is_comptime and !block.discards_runtime) return sema.failComptimeExpr(block, src);
+}
+
+fn failComptimeExpr(sema: *Sema, block: *Block, src: Src) CompileError {
+    const err = sema.fail(block, src, "unable to evaluate comptime expression", .{});
+    if (block.comptime_reason) |r| try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "{s}", .{r});
+    return err;
 }
 
 /// A runtime load at `src`. In a comptime block it is the loaded value
@@ -10887,7 +10895,9 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
         }
     };
     try sema.trackConstStore(block, ptr, operand);
-    try sema.requireRuntime(block, src);
+    // A runtime store fails even in a comptime block that drops runtime
+    // instructions, as upstream.
+    if (block.is_comptime) return sema.failComptimeExpr(block, src);
     try sema.validateRuntimeValue(block, operand_src, operand);
     try sema.resolveLayout(block, src, info.child);
     if (!Type.hasRuntimeBits(ip, info.child)) return;
@@ -16487,8 +16497,9 @@ fn zirAsm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const small: Zir.Inst.Asm.Small = @bitCast(ext.small);
     const src = block.nodeSrc(extra.data.src_node);
     // Container-level assembly: upstream's self-hosted backends drop it.
-    if (sema.func == .none and small.outputs_len == 0 and small.inputs_len == 0) return .void_value;
-    if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: inline assembly", .{});
+    if (sema.func == .none and block.inlining == null and small.outputs_len == 0 and small.inputs_len == 0) return .void_value;
+    // Even in a comptime block that drops runtime instructions, as upstream.
+    if (block.is_comptime) return sema.failComptimeExpr(block, src);
     const gpa = sema.gpa;
     var result_ty: Index = .void_type;
     var operands: std.ArrayList(Ir.Asm.Operand) = .empty;
@@ -17039,7 +17050,12 @@ fn analyzeCall(
     if (modifier == .never_inline and (comptime_call or is_inline))
         return sema.fail(block, src, "cannot perform {s} call with 'never_inline' modifier", .{if (comptime_call) "comptime" else "inline"});
     if (func == .none) {
-        if (comptime_call) return sema.failNeededComptime(block, src, "function pointer is not comptime-known");
+        if (extern_func != .none and (comptime_call or is_inline)) {
+            const err = sema.fail(block, src, "{s} call of extern function", .{if (comptime_call) "comptime" else "inline"});
+            if (block.comptime_reason) |r| try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "{s}", .{r});
+            return err;
+        }
+        if (comptime_call) return sema.failNeededComptime(block, src.callFunc(), "function pointer is not comptime-known");
         if (is_inline) return sema.failNeededComptime(block, src.callFunc(), "function being called inline must be comptime-known");
         const callee_ptr = if (extern_func == .none) callee else blk: {
             const ptr_ty = try sema.ptrType(.{ .child = ip.typeOf(extern_func), .flags = .{ .is_const = true } });
@@ -17198,6 +17214,9 @@ fn calleeBlock(sema: *Sema, parent: *Block, func: Index) Block {
         .runtime_depth = parent.runtime_depth,
         .runtime_src = parent.runtime_src,
         .runtime_loop = parent.runtime_loop,
+        // A call evaluated where runtime instructions are dropped drops
+        // its own, as upstream evaluates it lazily.
+        .discards_runtime = parent.discards_runtime,
     };
 }
 
