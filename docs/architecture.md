@@ -1349,6 +1349,14 @@ reductions native (`vector.native` answers by `cpu`). AVX changes the
 vector ABI and is a separate decision. Results are the same bits at
 every level; `-mcpu` is part of the cache key (`cacheTarget`).
 
+Compare zap with upstream bit for bit at a pinned CPU: `zig run
+-fno-llvm -mcpu=baseline` (or `x86_64_v2`) against zap at the same
+level. Upstream's default is the native CPU, and with AVX its Debug
+backend lowers some vector operations differently: on an AVX host the
+f64 `@reduce(.Min/.Max/.Add/.Mul)` of 16 lanes in a mixed NaN, infinity
+and signed-zero test gives other bits than its own baseline build, which
+zap matches.
+
 **aarch64 NEON (planned, with the aarch64 backend).** `vector.native`
 keeps its target-neutral signature; its aarch64 arm (now `false`) gets
 its own answers next to the x86_64 ones, and the backend's lowering goes
