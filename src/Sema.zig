@@ -13754,7 +13754,12 @@ fn namespaceLookupVal(sema: *Sema, block: *Block, src: Src, container: Index, na
         return sema.failNoMember(block, miss_src, container, name);
     };
     const n = ip.getNav(nav);
-    if (!n.is_pub and n.file != sema.file) return sema.fail(block, src, "'{s}' is not marked 'pub'", .{name});
+    if (!n.is_pub and n.file != sema.file) {
+        const err = sema.fail(block, src, "'{s}' is not marked 'pub'", .{name});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(n.file));
+        try sema.zcu.addDeclNote(n.file, tree.nodeToSpan(sema.zcu.file(n.file).zir.getDeclaration(n.zir_inst).src_node), "declared here", .{});
+        return err;
+    }
     return sema.navVal(block, src, nav);
 }
 
