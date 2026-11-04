@@ -677,16 +677,87 @@ pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag
         }
     }.lessThan);
     for (errors) |e| {
-        const notes = try arena.alloc(diag.Note, e.notes.len);
-        for (notes, e.notes) |*n, en| n.* = .{ .loc = if (en.no_loc) null else try zcu.diagLocIn(arena, paths, en.file, en.embed, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl };
-        const fixes: []const diag.Fix = if (e.fix) |f|
-            try arena.dupe(diag.Fix, &.{try paths.fix(arena, zcu.file(e.file).display_path, try zcu.fe.source(@fromBackingInt(e.file)), f)})
-        else
-            &.{};
-        try out.append(arena, .{ .code = e.code, .loc = if (e.no_loc) null else try zcu.diagLocIn(arena, paths, e.file, e.embed, e.span), .msg = e.msg, .notes = notes, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint, .fixes = fixes });
+        var notes: std.ArrayList(diag.Note) = try .initCapacity(arena, e.notes.len + 1);
+        for (e.notes) |en| notes.appendAssumeCapacity(.{ .loc = if (en.no_loc) null else try zcu.diagLocIn(arena, paths, en.file, en.embed, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl });
+        var raw_fix = e.fix;
+        if (e.fix == null) if (try zcu.argumentOrigin(arena, paths, e)) |o| {
+            if (o.note.msg) |msg| notes.appendAssumeCapacity(.{ .loc = try zcu.diagLoc(arena, paths, o.file, o.note.span), .msg = msg, .decl = o.note.decl });
+            if (o.note.fix) |f| {
+                raw_fix = f;
+                raw_fix.?.file = o.file;
+            }
+        };
+        const fixes: []const diag.Fix = if (raw_fix) |f| fixes: {
+            const fix_file = f.file orelse e.file;
+            const fix = try paths.fix(arena, zcu.file(fix_file).display_path, try zcu.fe.source(@fromBackingInt(fix_file)), f) orelse break :fixes &.{};
+            break :fixes try arena.dupe(diag.Fix, &.{fix});
+        } else &.{};
+        try out.append(arena, .{ .code = e.code, .loc = if (e.no_loc) null else try zcu.diagLocIn(arena, paths, e.file, e.embed, e.span), .msg = e.msg, .notes = notes.items, .refs = try zcu.referenceTrace(arena, paths, e.unit), .candidates = e.candidates, .hint = e.hint, .fixes = fixes });
     }
     if (zcu.compile_logs.items.len != 0) try zcu.compileLogDiagnostics(arena, paths, &out);
     return out.items;
+}
+
+/// For error `e` raised in std inside a generic function that the user's
+/// code called with an error union or optional where it meant the payload
+/// (a `print` argument or `free`'s slice without `try`): where that
+/// argument comes from in the user's file, and the fix there
+/// (`diag.originNote`). The function is the first in the reference trace
+/// that a file outside the Zig lib directory refers to. An argument inside
+/// a tuple counts only if the error names its type (`for type 'E![]u8'`).
+fn argumentOrigin(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, e: ErrorMsg) !?struct { file: u32, note: diag.OriginNote } {
+    const ip = &zcu.ip;
+    if (e.embed or e.no_loc) return null;
+    _, const in_lib = try paths.display(arena, zcu.file(e.file).display_path);
+    if (!in_lib) return null;
+    var unit = e.unit orelse return null;
+    const site = while (zcu.referenced_by.get(unit)) |r| : (unit = r.from) {
+        _, const lib = try paths.display(arena, zcu.file(r.file).display_path);
+        if (!lib) break r;
+    } else return null;
+    const func = ip.keyAs(.func, switch (unit) {
+        .func => |f| f,
+        else => return null,
+    }) orelse return null;
+    if (func.generic_owner == .none) return null;
+    const params = ip.keyPayload(.func_type, func.ty).param_types;
+    const Arg = struct { param: usize, field: ?usize, ty: InternPool.Index };
+    var found: ?Arg = null;
+    var count: usize = 0;
+    for (params, 0..) |p, i| {
+        if (ip.keyTag(p) == .error_union_type or ip.keyTag(p) == .opt_type) {
+            found = .{ .param = i, .field = null, .ty = p };
+            count += 1;
+        } else if (ip.keyAs(.tuple_type, p)) |t| for (t.types, 0..) |ft, j| {
+            if (ip.keyTag(ft) != .error_union_type and ip.keyTag(ft) != .opt_type) continue;
+            const quoted = try std.fmt.allocPrint(arena, "'{s}'", .{try print.typeAlloc(ip, ft, arena)});
+            if (std.mem.indexOf(u8, e.msg, quoted) == null) continue;
+            found = .{ .param = i, .field = j, .ty = ft };
+            count += 1;
+        };
+    }
+    if (count != 1) return null;
+    const arg = found.?;
+    // The instance's type has its runtime parameters only: the call's
+    // argument is the one at the `arg.param`th runtime parameter.
+    var call_param = arg.param;
+    var runtime: usize = 0;
+    for (func.comptime_args, 0..) |c, i| if (c == .none) {
+        if (runtime == arg.param) {
+            call_param = i;
+            break;
+        }
+        runtime += 1;
+    };
+    const n_params = @max(params.len, func.comptime_args.len);
+    const tree = try zcu.fe.tree(@fromBackingInt(site.file));
+    const span = site.src.span(tree);
+    const node = diag.callArgument(tree, span.start, span.end, n_params, call_param, arg.field) orelse return null;
+    const node_span = tree.nodeToSpan(node);
+    const origin = diag.valueOrigin(tree, node_span.start, node_span.end, .self) orelse return null;
+    const kind: diag.OriginKind = if (ip.keyTag(arg.ty) == .opt_type) .optional else .error_union;
+    const note = try diag.originNote(arena, tree, origin, kind, diag.fnReturnsError(tree, tree.firstToken(node)), true) orelse return null;
+    return .{ .file = site.file, .note = note };
 }
 
 /// `@compileLog`'s output, as upstream: each logging unit's lines

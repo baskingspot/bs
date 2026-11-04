@@ -180,8 +180,10 @@ pub const Edit = struct {
     text: []const u8,
 };
 
-/// A fix as Sema and AstGen make it: byte offsets into the error's file.
-pub const RawFix = struct { applicability: Applicability, edits: []const RawEdit };
+/// A fix as Sema and AstGen make it: byte offsets into the error's file,
+/// or into file `file` (a Zcu file index) for an error raised in std about
+/// the user's code.
+pub const RawFix = struct { applicability: Applicability, edits: []const RawEdit, file: ?u32 = null };
 pub const RawEdit = struct { start: u32, end: u32, text: []const u8 };
 
 /// A frame of the reference trace: unit `name` referred onward at `loc`.
@@ -231,8 +233,10 @@ pub const Paths = struct {
     }
 
     /// `raw`, made against `source` of `raw_path`, with its edits located.
-    pub fn fix(p: Paths, arena: std.mem.Allocator, raw_path: []const u8, source: []const u8, raw: RawFix) !Fix {
-        const path, _ = try p.display(arena, raw_path);
+    /// Null in the Zig lib directory: std is not the user's to edit.
+    pub fn fix(p: Paths, arena: std.mem.Allocator, raw_path: []const u8, source: []const u8, raw: RawFix) !?Fix {
+        const path, const in_lib = try p.display(arena, raw_path);
+        if (in_lib) return null;
         const edits = try arena.alloc(Edit, raw.edits.len);
         for (edits, raw.edits) |*e, r| {
             const a = std.zig.findLineColumn(source, r.start);
@@ -383,8 +387,9 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
                 try closeNames(arena, name, names.items, false, &close);
                 candidates = close.items;
             };
-            if (try astGenFix(arena, tree, code, msg, sl.span_main, candidates)) |raw|
-                fixes = try arena.dupe(Fix, &.{try paths.fix(arena, path, tree.source, raw)});
+            if (try astGenFix(arena, tree, code, msg, sl.span_main, candidates)) |raw| if (try paths.fix(arena, path, tree.source, raw)) |f| {
+                fixes = try arena.dupe(Fix, &.{f});
+            };
             if (try astGenHint(arena, tree, code, msg, sl.span_main)) |h| hint = h;
         }
         try out.append(arena, .{ .code = code, .loc = try bundleLoc(arena, paths, bundle, m.src_loc), .msg = msg, .count = m.count, .notes = notes, .candidates = candidates, .hint = hint, .fixes = fixes });
@@ -1177,6 +1182,100 @@ pub fn unwrapFix(arena: std.mem.Allocator, tree: *const Ast, node: Ast.Node.Inde
     };
     if (!suffix) return try rawFix(arena, .maybe, &.{.{ .start = start, .end = start, .text = "try " }});
     return try rawFix(arena, .maybe, &.{ .{ .start = start, .end = start, .text = "(try " }, .{ .start = end, .end = end, .text = ")" } });
+}
+
+/// What is wrong with a value whose origin an error notes.
+pub const OriginKind = enum { error_union, optional, @"const" };
+
+/// A note on where a value comes from, and the fix there.
+pub const OriginNote = struct {
+    span: Ast.Span,
+    /// Null when the error already says it at the use.
+    msg: ?[]const u8,
+    /// The note shows its source line.
+    decl: bool,
+    fix: ?RawFix,
+};
+
+/// The note and fix for a value of kind `kind` from `origin`. An error
+/// union or optional held by a local is noted at the local's initializer,
+/// the call that returned it, which the fix unwraps (with `try` only if
+/// `can_try`, where the function can return the error); one that is not a
+/// local's is unwrapped where it is, and noted there only if `at_use` (an
+/// error raised elsewhere, in std, about this argument). A constant local
+/// is noted at its declaration, which the fix makes `var`. `at_use` notes
+/// show their source lines, which the error's (in std) does not.
+pub fn originNote(arena: std.mem.Allocator, tree: *const Ast, origin: Origin, kind: OriginKind, can_try: bool, at_use: bool) !?OriginNote {
+    switch (kind) {
+        .@"const" => {
+            const local = origin.local orelse return null;
+            if (tree.tokenTag(local.mut_tok) != .keyword_const) return null;
+            return .{
+                .span = tree.tokenToSpan(local.mut_tok + 1),
+                .msg = try std.fmt.allocPrint(arena, "'{s}' is declared 'const'; declare it with 'var'{s} to modify it", .{ local.name, if (local.var_ok) "" else " and a type" }),
+                .decl = true,
+                .fix = try varFix(arena, tree, local),
+            };
+        },
+        .error_union, .optional => {
+            const what, const how = if (kind == .error_union) .{ "error union", "'try' or 'catch'" } else .{ "optional", "'.?' or 'orelse'" };
+            var node = origin.node;
+            var msg: ?[]const u8 = null;
+            if (origin.local) |local| {
+                node = local.init.unwrap() orelse return null;
+                var buf: [1]Ast.Node.Index = undefined;
+                const callee: ?[]const u8 = if (tree.fullCall(&buf, node)) |call| tree.getNodeSource(call.ast.fn_expr) else null;
+                msg = if (callee != null and callee.?.len <= 60)
+                    try std.fmt.allocPrint(arena, "'{s}' holds the {s} returned by '{s}'; consider using {s} here", .{ local.name, what, callee.?, how })
+                else
+                    try std.fmt.allocPrint(arena, "'{s}' holds this {s}; consider using {s} here", .{ local.name, what, how });
+            } else if (at_use) {
+                msg = try std.fmt.allocPrint(arena, "this argument is an {s}; consider using {s} here", .{ what, how });
+            }
+            const fix = if (kind == .optional)
+                try unwrapFix(arena, tree, node, .optional)
+            else if (can_try)
+                try unwrapFix(arena, tree, node, .@"try")
+            else
+                null;
+            if (msg == null and fix == null) return null;
+            return .{ .span = tree.nodeToSpan(node), .msg = msg, .decl = at_use, .fix = fix };
+        },
+    }
+}
+
+/// Argument `param` of the call at `start..end` of a function with
+/// `n_params` parameters (a method call's receiver is the first), or with
+/// `field`, element `field` of that argument, an anonymous tuple `.{...}`.
+pub fn callArgument(tree: *const Ast, start: u32, end: u32, n_params: usize, param: usize, field: ?usize) ?Ast.Node.Index {
+    const node = expressionAt(tree, start, end) orelse return null;
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buf, node) orelse return null;
+    const args = call.ast.params;
+    if (n_params < args.len or n_params - args.len > 1 or param < n_params - args.len) return null;
+    const arg = args[param - (n_params - args.len)];
+    const index = field orelse return arg;
+    var buf2: [2]Ast.Node.Index = undefined;
+    const init = tree.fullArrayInit(&buf2, arg) orelse return null;
+    if (init.ast.type_expr != .none or index >= init.ast.elements.len) return null;
+    return init.ast.elements[index];
+}
+
+/// Whether the function declaration around `tok` returns an error union,
+/// as its return type is written (`!T`, `E!T`).
+pub fn fnReturnsError(tree: *const Ast, tok: Ast.TokenIndex) bool {
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        if (tok < tree.firstToken(node) or tok > tree.lastToken(node)) continue;
+        // The innermost: a function declared in a nested container.
+        if (enclosingFnBody(tree, tok) != tree.nodeData(node).node_and_node[1]) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buf, tree.nodeData(node).node_and_node[0]) orelse return false;
+        const ret = proto.ast.return_type.unwrap() orelse return false;
+        return tree.nodeTag(ret) == .error_union or tree.tokenTag(tree.firstToken(ret) - 1) == .bang;
+    }
+    return false;
 }
 
 /// Adds prongs `prongs` (`.b => @panic("TODO"),`) to the switch whose

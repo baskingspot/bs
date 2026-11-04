@@ -158,12 +158,13 @@ def score(case, seed_src, cc, show):
             r["cand"] = any(case.answer in x.get("candidates", []) for x in diags)
         # A fix of an error on a changed line, or one that edits a changed
         # line (a `var` at the declaration for an error at the use).
-        edit_lines = lambda x: {case.src.count("\n", 0, e["span"][0]) + 1 for f in x.get("fixes", []) for e in f["edits"]}
-        at = [x for x in main_diags if x.get("fixes") and (x.get("line") in lines or edit_lines(x) & lines)]
+        # An error raised in std can carry a fix in main.zig.
+        edit_lines = lambda x: {case.src.count("\n", 0, e["span"][0]) + 1 for f in x.get("fixes", []) for e in f["edits"] if e.get("file") == "main.zig"}
+        at = [x for x in diags if x.get("fixes") and ((x in main_diags and x.get("line") in lines) or edit_lines(x) & lines)]
         if at:
             src = case.src
             for _ in range(5):
-                fixes = [f for x in cc.zap_json(d) for f in x.get("fixes", []) if f["applicability"] != "placeholder"]
+                fixes = [f for x in cc.zap_json(d) for f in x.get("fixes", []) if f["applicability"] != "placeholder" and all(e.get("file") == "main.zig" for e in f["edits"])]
                 if not fixes:
                     break
                 src = apply_fixes(src, fixes)

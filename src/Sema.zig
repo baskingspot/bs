@@ -14004,54 +14004,25 @@ fn failInvalidFieldAccess(sema: *Sema, block: *Block, src: Src, ty: Index, name:
     return err;
 }
 
-/// What is wrong with a value, for `noteOrigin`.
-const OriginKind = enum { error_union, optional, @"const" };
+const OriginKind = @import("diag.zig").OriginKind;
 
 /// Notes where the value at `operand` (`depth` into it) comes from, for
-/// the most recent error, and gives the error the fix there, as agents
-/// need when the mistake is at the declaration rather than the use. An
-/// error union or optional held by a local is noted at the local's
-/// initializer, the call that returned it, which the fix unwraps (with
-/// `try` only where the function can return the error); one that is not
-/// a local's is unwrapped where it is used. A constant local is noted at
-/// its declaration, which the fix makes `var`.
+/// the most recent error, and gives the error the fix there
+/// (`diag.originNote`), as agents need when the mistake is at the
+/// declaration rather than the use. `try` is offered only where the
+/// function can return the error.
 fn noteOrigin(sema: *Sema, block: *Block, operand: Src, depth: @import("diag.zig").OriginDepth, kind: OriginKind) CompileError!void {
     const diag = @import("diag.zig");
     const zcu = sema.zcu;
     const tree = try zcu.fe.tree(@fromBackingInt(sema.file));
     const span = operand.span(tree);
     const origin = diag.valueOrigin(tree, span.start, span.end, depth) orelse return;
-    const arena = zcu.arena.allocator();
-    const fix = switch (kind) {
-        .@"const" => fix: {
-            const local = origin.local orelse return;
-            if (tree.tokenTag(local.mut_tok) != .keyword_const) return;
-            if (local.var_ok)
-                try zcu.addDeclNote(sema.file, tree.tokenToSpan(local.mut_tok + 1), "'{s}' is declared 'const'; declare it with 'var' to modify it", .{local.name})
-            else
-                try zcu.addDeclNote(sema.file, tree.tokenToSpan(local.mut_tok + 1), "'{s}' is declared 'const'; declare it with 'var' and a type to modify it", .{local.name});
-            break :fix try diag.varFix(arena, tree, local);
-        },
-        .error_union, .optional => fix: {
-            var node = origin.node;
-            if (origin.local) |local| {
-                node = local.init.unwrap() orelse return;
-                const what, const how = if (kind == .error_union) .{ "error union", "'try' or 'catch'" } else .{ "optional", "'.?' or 'orelse'" };
-                var buf: [1]Ast.Node.Index = undefined;
-                const callee: ?[]const u8 = if (tree.fullCall(&buf, node)) |call| tree.getNodeSource(call.ast.fn_expr) else null;
-                if (callee != null and callee.?.len <= 60)
-                    try zcu.addNote(sema.file, tree.nodeToSpan(node), "'{s}' holds the {s} returned by '{s}'; consider using {s} here", .{ local.name, what, callee.?, how })
-                else
-                    try zcu.addNote(sema.file, tree.nodeToSpan(node), "'{s}' holds this {s}; consider using {s} here", .{ local.name, what, how });
-            }
-            if (kind == .optional) break :fix try diag.unwrapFix(arena, tree, node, .optional);
-            const ret_ty = sema.currentRetTy(block);
-            if (ret_ty == .none or Type.class(sema.ip, ret_ty) != .error_union) return;
-            break :fix try diag.unwrapFix(arena, tree, node, .@"try");
-        },
-    };
+    const ret_ty = sema.currentRetTy(block);
+    const can_try = ret_ty != .none and Type.class(sema.ip, ret_ty) == .error_union;
+    const note = try diag.originNote(zcu.arena.allocator(), tree, origin, kind, can_try, false) orelse return;
+    if (note.msg) |msg| try zcu.appendNote(.{ .file = sema.file, .span = note.span, .msg = msg, .decl = note.decl });
     const last = &zcu.errors.items[zcu.errors.items.len - 1];
-    if (last.fix == null) last.fix = fix;
+    if (last.fix == null) last.fix = note.fix;
 }
 
 /// A struct's or opaque type's missing member is reported at

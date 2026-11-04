@@ -6900,7 +6900,12 @@ that may not be what the author meant, or has a placeholder
 (`@panic("TODO")`). The replacement is a Zig string literal, so
 insertions of whole lines (`"    _ = x;\n"`) and deletions (`""`) read
 unambiguously; equal ends mean an insertion. A fix with several edits
-prints one `fix` line per edit, and they apply together.
+prints one `fix` line per edit, and they apply together. Each edit names
+its file, which need not be the error's: an error raised in std about a
+user's argument (a `print` argument or `free`'s slice that is an error
+union) carries a note at the argument's origin in the user's file and
+the fix there (`Zcu.argumentOrigin`). No fix edits a file under the zig
+lib directory.
 
 **JSON lines.** One object per error, with short keys:
 `{"code", "file", "line", "col", "span": [start, end], "msg", "src",
