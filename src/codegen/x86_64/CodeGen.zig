@@ -1496,7 +1496,9 @@ fn planRegisters(cg: *CodeGen) Error!void {
         _ = cg.autoArgs(cg.fn_ty.return_type, tys, locs);
         const hint = live.items(.hint);
         for (args, locs) |inst, l| switch (l) {
-            .gpr, .ref => |r| hint[@backingInt(inst)][0] = allocIndex(c_arg_regs[r]),
+            .gpr => |r| hint[@backingInt(inst)][0] = allocIndex(c_arg_regs[r]),
+            .ref => |r| hint[@backingInt(inst)] = .{ allocIndex(c_arg_regs[r]), Ssa.hint_pinned },
+            .ref_stack => hint[@backingInt(inst)][1] = Ssa.hint_pinned,
             .gpr_pair => |r| hint[@backingInt(inst)] = .{ allocIndex(c_arg_regs[r]), allocIndex(c_arg_regs[r + 1]) },
             else => {},
         };
