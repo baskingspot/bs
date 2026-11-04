@@ -9733,13 +9733,16 @@ fn fnTypeCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (s.cc != d.cc or s.stack_align != d.stack_align or s.is_var_args != d.is_var_args or s.comptime_bits != d.comptime_bits or
         s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits or
         sema.fnHasRuntimeBits(src) != sema.fnHasRuntimeBits(dst)) return false;
+    // Parameters and the return value are copied, so they coerce as read
+    // only (`[*c]T` passes as `?*T`, `?*align(16) T` returns as `?*T`), as
+    // upstream's `coerceInMemoryAllowedFns` with `dest_is_mut` false.
     for (s.param_types, d.param_types) |a, b| {
         if (a == b or sema.paramPtrCoercible(b, a)) continue;
-        if (sema.errorCoercibleInMemory(b, a)) continue;
+        if (sema.errorCoercibleInMemory(b, a) or sema.childCoercibleInMemory(b, a)) continue;
         return false;
     }
     if (s.return_type == d.return_type or s.return_type == .noreturn_type) return true;
-    return sema.errorCoercibleInMemory(s.return_type, d.return_type);
+    return sema.errorCoercibleInMemory(s.return_type, d.return_type) or sema.childCoercibleInMemory(s.return_type, d.return_type);
 }
 
 /// Whether an error set or error union `s` reads in place as a `d`: its

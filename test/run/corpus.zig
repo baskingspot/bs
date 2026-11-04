@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n41\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n41\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -260,6 +260,29 @@ inline fn offsetBy(i: anytype, j: @TypeOf(registry_index - i)) @TypeOf(registry_
     return j - i;
 }
 
+// ziglua (lib.zig): runtime function pointers coerce to C callback types
+// whose parameter is a C pointer where the function takes an optional
+// pointer, or whose result is less aligned.
+const LuaState = opaque {};
+const LuaDebug = extern struct { x: c_int };
+fn luaHook(s: ?*LuaState, d: ?*LuaDebug) callconv(.c) void {
+    _ = s;
+    d.?.x = 7;
+}
+var lua_block: [16]u8 align(16) = undefined;
+fn luaAlloc(ud: ?*anyopaque, p: ?*anyopaque, o: usize, n: usize) callconv(.c) ?*align(16) anyopaque {
+    _ = .{ ud, p, o };
+    return if (n == 0) null else &lua_block;
+}
+const LuaCHook = ?*const fn (?*LuaState, [*c]LuaDebug) callconv(.c) void;
+const LuaCAlloc = ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque;
+noinline fn setHook(f: *const fn (?*LuaState, ?*LuaDebug) callconv(.c) void) LuaCHook {
+    return f;
+}
+noinline fn setAlloc(f: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*align(16) anyopaque) LuaCAlloc {
+    return f;
+}
+
 // zig-libs (strRepeat): a comptime @bitCast of a nested array costs time
 // and memory linear in its length (quadratic ran out of memory).
 const repeat_grid: [30000][4]u8 = @splat("(?:)".*);
@@ -349,6 +372,11 @@ fn main() callconv(.c) noreturn {
     _ = &up;
     rt.printInt(@intCast(-upvalueIndex(up)));
     rt.printInt(@intCast(offsetBy(up, 5)));
+    var dbg: LuaDebug = .{ .x = 0 };
+    setHook(&luaHook).?(null, &dbg);
+    rt.printInt(@intCast(dbg.x));
+    const alloc = setAlloc(&luaAlloc).?;
+    rt.printInt(@intFromBool(alloc(null, null, 0, 16) == @as(*anyopaque, &lua_block) and alloc(null, null, 16, 0) == null));
     var last: usize = repeated.len - 1;
     _ = &last;
     rt.printInt(repeated[last]);
