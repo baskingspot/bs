@@ -96,6 +96,10 @@ pub const Module = struct {
     /// saves, pushes and restores error return traces in the module's
     /// functions.
     error_tracing: bool = true,
+    /// Whether Sema adds safety checks to the module's functions: not in
+    /// ReleaseFast and ReleaseSmall (as resolved for it), nor in the
+    /// fuzzer's family, which upstream builds ReleaseFast.
+    safety: bool = true,
     /// `name` is `gpa`'s (an extra builtin's, `ModuleArg.builtin_dir`).
     owned_name: bool = false,
 
@@ -107,6 +111,10 @@ pub const Module = struct {
         _,
     };
 };
+
+fn safeMode(o: std.lang.Optimize) bool {
+    return o == .debug or o == .safe;
+}
 
 pub const CacheKind = enum(u1) { local, global };
 
@@ -202,6 +210,8 @@ pub const Options = struct {
     fuzz: bool = false,
     /// `-ferror-tracing` on the main module, inherited as `fuzz`.
     error_tracing: bool = true,
+    /// `-O` on the main module, inherited as `fuzz`.
+    optimize: std.lang.Optimize = .debug,
     /// With `-ffuzz` on an executable: the directory of the fuzzer's
     /// generated `builtin.zig`. The fuzzer (`<lib>/fuzzer.zig`) then joins
     /// the compilation as a module family of its own (docs/architecture.md,
@@ -297,6 +307,8 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     // Error tracing likewise.
     for ([_]Module.Index{ .root, .std, .builtin, fe.main_module }) |m| fe.modules.items[@backingInt(m)].error_tracing = options.error_tracing;
     fe.any_error_tracing = options.error_tracing;
+    for ([_]Module.Index{ .root, .std, .builtin, fe.main_module }) |m| fe.modules.items[@backingInt(m)].safety = safeMode(options.optimize);
+    for (options.modules, first_extra..) |m, k| fe.modules.items[k].safety = safeMode(m.optimize orelse options.optimize);
     for (options.modules, first_extra..) |m, k| {
         const et = m.error_tracing orelse options.error_tracing;
         fe.modules.items[k].error_tracing = et;
@@ -334,7 +346,9 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         });
         for (fe.modules.items[@backingInt(root)..]) |*m| {
             m.std_mod, m.root_mod, m.builtin_mod = family;
-            m.error_tracing = false; // ReleaseFast, as upstream builds it
+            // ReleaseFast, as upstream builds it.
+            m.error_tracing = false;
+            m.safety = false;
         }
         fe.fuzzer_root = root;
     }

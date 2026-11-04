@@ -6,8 +6,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("{s} {d}{s}\n", .{ greet.word, args.len - 1, mode });
 }
 
-/// greet's mode, which greet inherits from this module, unless Debug.
-const mode = if (greet.mode == .debug) "" else " " ++ @tagName(greet.mode);
+/// greet's mode, which greet inherits from this module, unless Debug,
+/// and whether a bare union lacks the safety tag (ReleaseFast and Small).
+const mode = if (greet.mode == .debug) "" else " " ++ @tagName(greet.mode) ++ if (@sizeOf(Bare) == 8) " untagged" else "";
+const Bare = union { a: u64, b: u8 };
 
 fn add(a: u32, b: u32) u32 {
     return a + b;

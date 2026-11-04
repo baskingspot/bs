@@ -1760,7 +1760,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
         const n = names.len;
 
         // The tag: a declared enum, a generated one, or (untagged auto-layout
-        // unions in Debug) a hidden integer safety tag.
+        // unions in Debug and ReleaseSafe) a hidden integer safety tag.
         switch (kind) {
             .tagged_explicit => {
                 if (ip.keyTag(arg_ty) != .enum_type) return sema.fail(&block, arg_src, "expected enum tag type, found '{f}'", .{sema.fmtType(arg_ty)});
@@ -1822,7 +1822,11 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                     .info = tag_info,
                 } }, tag_name);
             },
-            .auto => info.tag_type = try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n)),
+            // As upstream's `wantSafeTypes`: only where the declaring
+            // module has safety checks.
+            .auto => if (sema.zcu.fe.module(sema.zcu.file(key.file).module).safety) {
+                info.tag_type = try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n));
+            },
             .@"extern" => {},
             .@"packed", .packed_explicit => {
                 // Every field has the backing integer's bit width.
@@ -1937,9 +1941,10 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     defer block.deinitInsts();
     const gpa = zcu.gpa;
     // Upstream builds compiler_rt and the fuzzer (`-ffuzz`; its module
-    // family has a std of its own) in ReleaseFast: no safety checks.
+    // family has a std of its own) in ReleaseFast: no safety checks, as in
+    // any module built in ReleaseFast or ReleaseSmall (`zap build`'s).
     const module = zcu.file(nav.file).module;
-    if (module == .compiler_rt or zcu.fe.module(module).std_mod != .std) block.want_safety = false;
+    if (module == .compiler_rt or !zcu.fe.module(module).safety) block.want_safety = false;
 
     for (fn_ty.param_types) |pt| try sema.resolveLayout(&block, block.nodeSrc(.zero), pt);
     try sema.resolveLayout(&block, block.nodeSrc(.zero), fn_ty.return_type);

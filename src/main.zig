@@ -302,7 +302,8 @@ pub fn main(init_std: std.process.Init) !void {
 /// module whose flag differs from the root module's, as `+name` or
 /// `-name` (`-root` if the root module does not fuzz).
 /// Error tracing off in the root module (`-fno-error-tracing`,
-/// ReleaseSafe's default) likewise, as `=notrace`; and each module whose
+/// ReleaseSafe's default) likewise, as `=notrace`; safety checks off in
+/// it (ReleaseFast and ReleaseSmall), as `=nosafety`; and each module whose
 /// `-O`, `-ferror-tracing` or `-fvalgrind` differs from the root module's,
 /// and so has a builtin of its own that no node key names, as
 /// `=<name>:<mode>` with `t` or `n` for tracing and `v` or `n` for
@@ -315,7 +316,8 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
     const same_modes = for (opts.modules) |m| {
         if (m.optimize.? != opts.optimize or m.error_tracing.? != opts.error_tracing or m.valgrind.? != opts.valgrind) break false;
     } else true;
-    if (!opts.fuzz and default_inl and opts.error_tracing and same_modes) return "x86_64-linux";
+    const unsafe = opts.optimize == .fast or opts.optimize == .small;
+    if (!opts.fuzz and default_inl and opts.error_tracing and !unsafe and same_modes) return "x86_64-linux";
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(arena, "x86_64-linux");
     if (opts.fuzz) {
@@ -326,6 +328,7 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
         }
     }
     if (!opts.error_tracing) try s.appendSlice(arena, "=notrace");
+    if (unsafe) try s.appendSlice(arena, "=nosafety");
     for (opts.modules) |m| {
         if (m.optimize.? == opts.optimize and m.error_tracing.? == opts.error_tracing and m.valgrind.? == opts.valgrind) continue;
         try s.print(arena, "={s}:{t}{c}{c}", .{ m.name, m.optimize.?, "nt"[@intFromBool(m.error_tracing.?)], "nv"[@intFromBool(m.valgrind.?)] });
@@ -670,6 +673,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .modules = opts.modules,
         .fuzz = opts.root_fuzz,
         .error_tracing = opts.error_tracing,
+        .optimize = opts.optimize,
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
         // Only executables link the C runtimes; a library's C objects
         // reach them when an executable links the library, as upstream's.
@@ -1382,6 +1386,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     var args = args_in;
     var root: ?[]const u8 = null;
     var positional_root = false;
+    // A ReleaseFast or ReleaseSmall `-O`, which only `zap build` steps may use.
+    var unsafe_mode: ?[]const u8 = null;
     var opts: Options = .{ .command = command, .root_src_path = undefined };
     var test_filters: std.ArrayList([]const u8) = .empty;
     var link_inputs: std.ArrayList([]const u8) = .empty;
@@ -1511,10 +1517,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         } else if (std.mem.eql(u8, arg, "-O") or (std.mem.startsWith(u8, arg, "-O") and !std.mem.eql(u8, arg, "-ObjC"))) {
             const v = if (arg.len == 2) nextArg(args, &i, arg) else arg[2..];
             const o = std.lang.Optimize.fromString(v) orelse fatal("unrecognized optimization mode: '{s}'", .{v});
-            // zap compiles ReleaseSafe with its one code generation, with
-            // upstream's builtin and defaults for the mode; it removes no
-            // safety checks.
-            if (o == .fast or o == .small) setUnsupported(&opts, arena, "zap builds only Debug and ReleaseSafe ('{s}'); use -OReleaseSafe or build this step with upstream zig", .{arg});
+            // zap compiles every mode with its one code generation, with
+            // upstream's builtin and defaults for the mode. ReleaseFast and
+            // ReleaseSmall (no safety checks) only for `zap build`'s steps,
+            // which a project's build script may ask for.
+            if (o == .fast or o == .small) unsafe_mode = arg;
             mode.optimize = o;
         } else if (std.mem.eql(u8, arg, "-funwind-tables")) {
             opts.unwind_tables = .sync;
@@ -1788,6 +1795,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         root_mode = mode;
     }
     opts.root_fuzz = root_fuzz orelse false;
+    if (unsafe_mode) |a| if (!opts.listen)
+        setUnsupported(&opts, arena, "zap builds only Debug and ReleaseSafe on the command line ('{s}'); use -OReleaseSafe, or upstream zig for an optimized build", .{a});
     // As upstream's `Config.resolve` and `Module.create`: error tracing and
     // Valgrind client requests are on in Debug and off in ReleaseSafe
     // unless asked for.

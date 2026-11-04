@@ -136,9 +136,12 @@ sed -i 's/std.io.print/std.debug.print/' src/main.zig
 "$zap" build run -Doptimize=ReleaseSafe >"$work/log" 2>&1 || fail "zap build run in ReleaseSafe"
 expect " 2 safe"
 
-# A step zap does not build fails with a diagnostic, not a crash.
-if "$zap" build -Doptimize=ReleaseFast >"$work/log" 2>&1; then fail "zap build succeeded in ReleaseFast"; fi
-expect "error: [unsupported] zap builds only Debug and ReleaseSafe ('-Ofast')"
+# ReleaseFast and ReleaseSmall: zap's one code generation without safety
+# checks, so a bare union has no safety tag, as upstream's.
+"$zap" build run -Doptimize=ReleaseFast >"$work/log" 2>&1 || fail "zap build run in ReleaseFast"
+expect " 2 fast untagged"
+"$zap" build run -Doptimize=ReleaseSmall >"$work/log" 2>&1 || fail "zap build run in ReleaseSmall"
+expect " 2 small untagged"
 
 # build.zig itself fails to compile.
 line=$(($(wc -l <build.zig) + 1))

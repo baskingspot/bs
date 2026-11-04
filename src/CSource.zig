@@ -423,8 +423,13 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         const dep_at = try appendArgs(arena, &argv, common, src.path, .{
             .lang = src.lang,
             .optimize = src.flags.optimize orelse .debug,
-            // As upstream's `Module.create`: trapping in ReleaseSafe.
-            .sanitize_c = src.flags.sanitize_c orelse @as(std.zig.SanitizeC, if (src.flags.optimize == .safe) .trap else .full),
+            // As upstream's `Module.create`: trapping in ReleaseSafe, none
+            // in ReleaseFast and ReleaseSmall.
+            .sanitize_c = src.flags.sanitize_c orelse @as(std.zig.SanitizeC, switch (src.flags.optimize orelse .debug) {
+                .debug => .full,
+                .safe => .trap,
+                .fast, .small => .off,
+            }),
             .red_zone = src.flags.red_zone orelse true,
             .no_builtin = src.flags.no_builtin orelse false,
             .stack_protector = o.link_libc and (src.flags.stack_protector orelse o.stack_protector),

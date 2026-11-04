@@ -5357,11 +5357,22 @@ state. Built for step 1:
   gives each set of module options one. Error tracing changes IR with no
   dependency recording it, so it salts the store seed (`cacheTarget`:
   `=notrace`, and `=<module>:<mode><t|n><v|n>` for each module with a
-  builtin of its own). ReleaseFast and ReleaseSmall stay `[unsupported]`.
+  builtin of its own).
   C sources of a ReleaseSafe module get upstream's flags for the mode
   (`-O2`, `-D_FORTIFY_SOURCE=2`, `-Werror=date-time`, UBSan in trap mode;
   `CSource.Flags.optimize`), taken like the other C module options from
   the module or else the root module.
+- **ReleaseFast and ReleaseSmall** are `[unsupported]` on the command
+  line, and accepted in `zap build`'s steps (`--listen=-`), whose build
+  scripts may ask for them (supermd builds its translate-c tool
+  ReleaseFast). They compile with the same code generation, with
+  `builtin.mode` `.fast` or `.small`, error tracing and Valgrind off, and
+  no safety checks in the module's functions (`Frontend.Module.safety`;
+  `@setRuntimeSafety(true)` still adds them) and no hidden safety tag in
+  the untagged unions it declares, as upstream's. That changes
+  IR with no dependency recording it, so a root module without them
+  salts the store seed with `=nosafety`. Their C sources get `-DNDEBUG`,
+  `-O2` or `-Os`, and no UBSan, as upstream's.
 - **Backend flags.** zap generates the same code in Debug and ReleaseSafe,
   where upstream's choice of backend changes nothing a program means. So `-fllvm`, `-flld` and their
   `-fno-` forms are accepted without a word and zap compiles with its own
