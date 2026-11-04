@@ -121,12 +121,17 @@ pub fn build(b: *std.Build) void {
 ///                               headers removed (repeatable: each text;
 ///                               `rebuild-replace: "<this>" "<earlier>"`
 ///                               replaces it instead), then as it is,
-///                               then without again, then as it is, then
-///                               once more with nothing changed, all in the
-///                               same place reusing its cache, and checks
-///                               the last build. The edit builds compare
+///                               then without again, then as it is,
+///                               without, and as it is, then once more with
+///                               nothing changed, all in the same place
+///                               reusing its cache, and checks the last
+///                               build. The first two edit builds compare
 ///                               themselves with full builds
-///                               (`ZAP_CACHE_VERIFY`, `ZAP_CACHE_CHECK`).
+///                               (`ZAP_CACHE_VERIFY`, `ZAP_CACHE_CHECK`),
+///                               whose manifest then replaces theirs; the
+///                               next three chain on the edit builds' own
+///                               log, and only the last of them compares
+///                               itself with a full build.
 ///   //! rebuild-lib-without: "<lib path>" "<zig string>"
 ///                               the same edit in a file of zap's lib
 ///                               directory, of which the builds use a copy
@@ -290,6 +295,10 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                     \\{[lib_after]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
                     \\cp "$1" "$4.d/{[file]s}"
                     \\{[lib_before]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
+                    \\cp "$2" "$4.d/{[file]s}"
+                    \\{[lib_after]s}ZAP_CACHE_CHECK=1 {[zap]s}
+                    \\cp "$1" "$4.d/{[file]s}"
+                    \\{[lib_before]s}ZAP_CACHE_CHECK=1 {[zap]s}
                     \\cp "$2" "$4.d/{[file]s}"
                     \\{[lib_after]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
                     \\{[zap]s}{[relink_check]s}
