@@ -4184,14 +4184,16 @@ analyzing everything.
   `-ffuzz` does, when they land.
 - *Choosing.* `useDonor` runs after the frontend: among the donors of
   this compilation's key, it takes the one whose builtin module is this
-  build's, then the one sharing the most input files (same path, same
-  key, same content), then the newest. It links the donor's packs into
+  build's, then one it can replay lazily (below), then the one sharing
+  the most input files (same path, same key, same content), then the
+  newest. It links the donor's packs into
   the compilation's directory from the donor's own links; if that fails
   (trimmed concurrently), it tries the next, and without one the build is
-  cold. Ranking reads each candidate's input table, well under 1 ms.
-- *Replaying.* The build is an edit build against the donor, eager so that
-  it records a full manifest of its own (a lazy record is a log relative
-  to the compilation's own manifest) and publishes it in turn. Error codes
+  cold. Ranking reads each candidate's input and path tables, well under
+  1 ms.
+- *Replaying.* The build is an edit build against the donor, lazy where
+  it can be (below) and otherwise eager, so that it records a full
+  manifest of its own and publishes it in turn. Error codes
   are seeded from the donor (`seedErrors`). Inputs now carry their file's
   key (`Manifest.Input.key`, `<module>:<path in it>`), and `Replay.create`
   matches files to inputs by key, which is what nodes name files by:
@@ -4210,10 +4212,44 @@ analyzing everything.
   file is this build's root file, changed, and std's `@import("root")` in
   a donor's result names this build's root struct; whether its
   declarations match is decided by the namespace dependencies, as in any
-  edit. A function's atom is loaded only if its debug info names paths
-  this build's would (`Replay.debug_paths`): source paths are as the
-  compiler opened them, so with relative paths a worktree's functions
-  load, and with absolute ones only std's do.
+  edit. In an eager replay, a function's atom is loaded only if its debug
+  info names paths this build's would (`Replay.debug_paths`): source paths
+  are as the compiler opened them, so with relative paths a worktree's
+  functions load, and with absolute ones only std's do.
+- *Lazy donor builds* (built 2026-11-04). A donor build is a lazy edit
+  build against the donor's manifest: it walks from the roots, loads only
+  what analysis reads, and links from the manifest. `finishLazy`
+  hard-links the donor's manifest into the compilation's directory as its
+  base (`installDonorBase`; bases are replaced, never written in place,
+  as `publishDonor` already relies on) and appends the build's log to
+  it, under an empty own pack with the id the donor's manifest names
+  (`Pack.writeEmpty`; a donor's atoms are all in store packs). The log
+  also records each file that has this build's contents but another path
+  or stat than the donor's input (another worktree), so the next build's
+  stat check passes. Like any lazy build it does not publish a donor.
+  `Replay.donorEager` keeps a donor build eager in three cases:
+  - the donor has inputs whose key names no file here (another
+    project's files): a log keeps the donor's inputs, and those would stay
+    changed inputs in every later build;
+  - the donor's debug info names a path this build does not write (a
+    worktree built with absolute paths, or another working directory):
+    the walk links green functions as recorded, so their paths must be
+    this build's. A manifest's path table lists every path its atoms name,
+    compile units and inlined callees' files included
+    (`Manifest.AtomSymbols.other_files`), so this reads the table, not
+    the records (scanning 135 k records' debug info took 31 ms on the zig
+    workload); `useDonor` ranks donors that pass right after the builtin
+    match;
+  - the build has object, archive or shared library inputs, whose paths
+    the log would keep.
+
+  Cold-local (empty local cache, a donor of the same program in the
+  global cache), ReleaseFast, median of 10, eager → lazy: hello 71 → 14
+  ms, zig workload 3710 → 673 ms, a fresh zls worktree 459 → 54 ms,
+  vaxis 223 → 130 ms. Each output is byte-identical to a build without the
+  cache, and ZAP_CACHE_VERIFY reports 0 differences. What remains on the
+  zig workload is mostly the frontend (584 ms): cold-local empties the
+  local cache, which holds the project files' ZIR.
 - *Output.* The link order is a function of the atoms (`groupByOwner`), so
   the output is the bytes of a full build with the same error codes. A
   full build without a donor numbers codes by first use, which can differ
@@ -4247,15 +4283,6 @@ analyzing everything.
   without donors ("not linked"). And `builtin.test_functions` is set
   after analysis from the build's tests, so `checkPrediction` exempts it
   like the link node.
-- *Follow-up: lazy donor builds.* A donor build replays eagerly, so that
-  it records a full manifest of its own: on a fresh zls worktree its
-  first build spends 207 ms loading and analyzing in Sema and 121 ms
-  recording, against 34 ms in the frontend. A lazy one would hard-link
-  the donor's manifest as its base and log the differences (inputs with
-  new paths and keys, the units it analyzed) as an edit build does,
-  loading only what the build reaches. It needs Delta records for input
-  path and key changes, and the debug-path check per loaded function;
-  not built.
 
 Reviewed by the Sema thread (2026-11-03); its answers to the two open
 questions (calling back into `Zcu.ensure*`, anonymous types' ordinals) and

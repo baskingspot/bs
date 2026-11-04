@@ -76,6 +76,9 @@ deps: std.ArrayList(Zcu.Dependee) = .empty,
 /// build records only what changed (`Incremental.recordLazy`). Otherwise
 /// every unit the build reaches is loaded or analyzed (step 4a).
 lazy: bool = false,
+/// Why a donor's build that asked to be lazy replays eagerly instead
+/// (`donorEager`).
+eager_why: ?[]const u8 = null,
 /// The nodes `walk` reached: the units a full build would analyze, whose
 /// atoms the build links.
 visited: std.DynamicBitSetUnmanaged = .{},
@@ -201,6 +204,8 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     for (0..m.inputCount()) |i| _ = try by_key.getOrPutValue(gpa, m.inputKey(@intCast(i)), @intCast(i));
     var key_buf: std.ArrayList(u8) = .empty;
     defer key_buf.deinit(gpa);
+    // Whether a donor has inputs this build lacks.
+    var missing = false;
     for (fe.files.items, 0..) |*f, fi| {
         try Incremental.inputKey(gpa, &key_buf, fe, f.module, f.sub_path);
         const i = by_key.get(key_buf.items) orelse continue;
@@ -219,6 +224,7 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
         if (Incremental.isLinkInput(m.inputKey(@intCast(i)))) seen.set(i);
         if (seen.isSet(i) or try Incremental.inputKeyHolds(gpa, &path_buf, m, @intCast(i), fe)) continue;
         seen.set(i);
+        missing = true;
         try changed.append(gpa, .{ .input = @intCast(i), .file = null });
     }
     // Inputs not loaded yet (embedded files, compiler_rt), by their stat
@@ -265,8 +271,43 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
             if (gop.found_existing) gpa.free(unit);
         }
     }
+    if (donor and lazy) if (try r.donorEager(fe, missing)) |why| {
+        r.lazy = false;
+        r.eager_why = why;
+    } else {
+        // Its log's atoms go to a pack of this compilation's own, under
+        // the id the donor's manifest names: the donor's own pack holds
+        // none of its atoms.
+        const own: ?Pack = own: {
+            Pack.writeEmpty(io, dir, m.pack_id) catch break :own null;
+            var p = Pack.open(io, dir) catch break :own null;
+            for (0..m.bases.len) |i| _ = p.addBase(gpa, io, dir, m.basePack(i)) catch {
+                p.close(gpa, io);
+                break :own null;
+            };
+            break :own p;
+        };
+        if (own) |p| {
+            r.pack.close(gpa, io);
+            r.pack = p;
+        } else {
+            r.lazy = false;
+            r.eager_why = "its pack could not be made";
+        }
+    };
     r.stats.setup_ns = @intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds);
     return r;
+}
+
+/// Why a donor's build must replay eagerly, or null if it can be lazy and
+/// log what differs from the donor (`Incremental.finishLazy`): the
+/// donor's inputs this build lacks, or debug paths this build does not
+/// write (`Incremental.donorPathsKnown`).
+fn donorEager(r: *Replay, fe: *const Frontend, missing: bool) !?[]const u8 {
+    if (missing) return "the donor has files this build lacks";
+    for (r.m.atom_refs) |ref| if (ref.pack == 0) return "the donor's atoms are not all in store packs";
+    if (!try Incremental.donorPathsKnown(r.gpa, r.m, fe)) return "the donor's debug info names paths this build does not";
+    return null;
 }
 
 pub fn destroy(r: *Replay) void {

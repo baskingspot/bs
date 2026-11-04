@@ -378,10 +378,42 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                     \\cp "$2" "$4.d/b/{[file]s}"
                     \\ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lb" "$4.d/b/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
                     \\grep -q "replaying donor" "$4.d/log" || {{ echo "no donor was replayed" >&2; fail; }}
+                    \\{[mode_check]s}
                     \\cp "$4" "$4.d/replayed"
                     \\ZAP_CACHE_VERIFY=full ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lb" "$4.d/b/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
                     \\cmp "$4" "$4.d/replayed" >&2
-                , .{ .file = file, .zap = zap_cmd, .donor_dir = if (expect.donor_here) "b" else "a" }), "sh" });
+                    \\{[moved]s}
+                , .{
+                    .file = file,
+                    .zap = zap_cmd,
+                    .donor_dir = if (expect.donor_here) "b" else "a",
+                    // A donor at this path is replayed lazily; one
+                    // elsewhere names other absolute paths, so eagerly.
+                    .mode_check = if (expect.donor_here)
+                        \\grep -q "the walk reached" "$4.d/log" || { echo "the donor was not replayed lazily" >&2; fail; }
+                    else
+                        \\grep -q "replaying the donor eagerly" "$4.d/log" || { echo "the donor was not replayed eagerly" >&2; fail; }
+                    ,
+                    // Built by relative path from its own directory, the
+                    // donor in another directory is replayed lazily (a
+                    // worktree), and the log records this build's paths:
+                    // the next build finds nothing changed. It adds the
+                    // donor's missing code as new nodes, which link last,
+                    // so only the programs' output is compared.
+                    .moved = if (expect.donor_here) "" else b.fmt(
+                        \\set -- "$1" "$2" "$3" "$(realpath "$4")" "$(realpath "$5")"
+                        \\(cd "$4.d/a" && {[zap]s} --cache-dir "$4.d/la2" {[file]s} -femit-bin="$4.d/a/out2") 2>"$4.d/log" || fail
+                        \\mkdir -p "$4.d/c" && cp "$4.d/b/{[file]s}" "$4.d/b/rt.zig" "$4.d/c/"
+                        \\(cd "$4.d/c" && ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved") 2>"$4.d/log" || fail
+                        \\grep -q "the walk reached" "$4.d/log" || {{ echo "the moved program's donor was not replayed lazily" >&2; fail; }}
+                        \\(cd "$4.d/c" && ZAP_CACHE_TIMING=1 {[zap]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved") 2>"$4.d/log" || fail
+                        \\grep -q "no input changed" "$4.d/log" || {{ echo "the build after the moved program's first build found changes" >&2; fail; }}
+                        \\(cd "$4.d/c" && ZAP_CACHE_VERIFY=full ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved2") 2>"$4.d/log" || fail
+                        \\"$4.d/moved" >"$4.d/moved.out" 2>&1 || true
+                        \\"$4.d/moved2" >"$4.d/moved2.out" 2>&1 || true
+                        \\cmp "$4.d/moved.out" "$4.d/moved2.out" >&2
+                    , .{ .file = file, .zap = zap_cmd }),
+                }), "sh" });
                 r.addFileArg(donor);
                 r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path("test/run/rt.zig"));

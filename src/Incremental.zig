@@ -235,6 +235,9 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     const io = inc.io;
     const t0 = now(io);
     const m = if (inc.prev) |*m| m else return inc.noRelink("no manifest", .{});
+    // Set by a first attempt that builds again (`LazyFallback`,
+    // `NamesRerun`): the donor's output is another compilation's.
+    if (inc.donor != null) return inc.noRelink("the manifest is a donor's", .{});
     if (inc.verify == .full) return inc.noRelink("verifying an edit build", .{});
     if (m.output != inc.output) return inc.noRelink("the manifest links another kind of output", .{});
     if (m.entry == 0 and inc.output == .exe) return inc.noRelink("no entry point", .{});
@@ -772,12 +775,14 @@ fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bo
 pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emit, mode: []const u8) !void {
     const m = if (inc.prev) |*m| m else return;
     if (std.mem.eql(u8, mode, "off") or inc.verify == .full) return;
-    // A donor's build records in full: its log would be relative to
-    // another compilation's manifest. So does a build whose objects or
-    // archives or shared libraries changed (`linkInputsChanged`,
-    // `link_objects_pending`).
-    const lazy = !std.mem.eql(u8, mode, "eager") and inc.donor == null and
-        (inc.link_objects.len + inc.link_shared.len == 0 or (!inc.link_objects_pending and !try inc.linkInputsChanged(m)));
+    // A build whose objects or archives or shared libraries changed
+    // records in full (`linkInputsChanged`, `link_objects_pending`), and so
+    // does a donor's with any: the log would keep the donor's paths. A
+    // donor's build is lazy only where `Replay.donorEager` allows; its log
+    // then follows the donor's manifest (`finishLazy`).
+    const has_inputs = inc.link_objects.len + inc.link_shared.len != 0;
+    const lazy = !std.mem.eql(u8, mode, "eager") and
+        (!has_inputs or (inc.donor == null and !inc.link_objects_pending and !try inc.linkInputsChanged(m)));
     const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -785,12 +790,13 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
             return;
         },
     };
+    if (r.eager_why) |why| if (inc.timing) std.debug.print("cache: replaying the donor eagerly: {s}\n", .{why});
     r.check = inc.check;
     r.timing = inc.timing;
     inc.replay = r;
     zcu.replay = r;
-    emit.lazy = lazy;
-    emit.inputs_deferred = lazy and inc.link_objects.len != 0;
+    emit.lazy = r.lazy;
+    emit.inputs_deferred = r.lazy and inc.link_objects.len != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -904,7 +910,7 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
         if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, key_buf.items);
         gop.value_ptr.* = @intCast(fi);
     }
-    const Candidate = struct { name: [donor_name_len]u8, m: Manifest, builtin: bool, shared: u32, mtime: Io.Timestamp };
+    const Candidate = struct { name: [donor_name_len]u8, m: Manifest, builtin: bool, lazy: bool, shared: u32, mtime: Io.Timestamp };
     var candidates: std.ArrayList(Candidate) = .empty;
     defer {
         for (candidates.items) |*c| c.m.close(gpa, io);
@@ -918,15 +924,21 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
         defer d.close(io);
         const stat = d.statFile(io, "manifest", .{}) catch continue;
         var m = (Manifest.open(gpa, io, d) catch continue) orelse continue;
-        var c: Candidate = .{ .name = e.name[0..donor_name_len].*, .m = m, .builtin = false, .shared = 0, .mtime = stat.mtime };
+        var c: Candidate = .{ .name = e.name[0..donor_name_len].*, .m = m, .builtin = false, .lazy = true, .shared = 0, .mtime = stat.mtime };
         for (0..m.inputCount()) |i| {
             const in, _ = m.input(@intCast(i));
-            const fi = by_key.get(m.inputKey(@intCast(i))) orelse continue;
+            const fi = by_key.get(m.inputKey(@intCast(i))) orelse {
+                // As `Replay.create`: an input that names no file here.
+                if (c.lazy and !isLinkInput(m.inputKey(@intCast(i))) and !(inputKeyHolds(gpa, &key_buf, &m, @intCast(i), fe) catch false)) c.lazy = false;
+                continue;
+            };
             const f = fe.file(@fromBackingInt(fi));
             if (@as(Hash, @bitCast(f.content_hash)) != in.content_hash) continue;
             c.shared += 1;
             if (f.module == .builtin) c.builtin = true;
         }
+        // Ranking only: a failure counts as eager.
+        if (c.lazy) c.lazy = donorPathsKnown(gpa, &m, fe) catch false;
         candidates.append(gpa, c) catch |err| {
             m.close(gpa, io);
             return err;
@@ -935,6 +947,8 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
     std.mem.sortUnstable(Candidate, candidates.items, {}, struct {
         fn better(_: void, a: Candidate, b: Candidate) bool {
             if (a.builtin != b.builtin) return a.builtin;
+            // One this build can replay lazily (`Replay.donorEager`).
+            if (a.lazy != b.lazy) return a.lazy;
             if (a.shared != b.shared) return a.shared > b.shared;
             return a.mtime.compare(.gt, b.mtime);
         }
@@ -959,6 +973,69 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
         return;
     }
     if (inc.timing) std.debug.print("cache: first build: no usable donor ({d} candidates)\n", .{candidates.items.len});
+}
+
+/// Whether every debug path donor manifest `m`'s atoms name is one this
+/// build writes. A lazy donor build links the green functions' atoms as
+/// the donor recorded them, so their paths must be this build's: each is
+/// a file's as the compiler opened it, its module's directory joined with
+/// its path in the module (`Frontend`), and `m`'s path table lists every
+/// one, compile units and inlined callees' files included
+/// (`Manifest.AtomSymbols.other_files`).
+pub fn donorPathsKnown(gpa: Allocator, m: *const Manifest, fe: *const Frontend) !bool {
+    var paths: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = paths.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        paths.deinit(gpa);
+    }
+    const add = struct {
+        fn add(g: Allocator, set: *std.StringHashMapUnmanaged(void), parts: []const []const u8) !void {
+            const p = try std.fs.path.join(g, parts);
+            const gop = set.getOrPut(g, p) catch |err| {
+                g.free(p);
+                return err;
+            };
+            if (gop.found_existing) g.free(p);
+        }
+    }.add;
+    for (fe.modules.items) |*mod| try add(gpa, &paths, &.{ mod.root_dir, mod.root_file });
+    for (0..m.inputCount()) |i| {
+        const key = m.inputKey(@intCast(i));
+        if (isLinkInput(key)) continue;
+        const colon = std.mem.indexOfScalar(u8, key, ':') orelse continue;
+        const mod = for (fe.modules.items) |*mod| {
+            if (std.mem.eql(u8, mod.name, key[0..colon])) break mod;
+        } else continue;
+        const sub = key[colon + 1 ..];
+        try add(gpa, &paths, &.{ mod.root_dir, if (sub.len == 0) mod.root_file else sub });
+    }
+    for (0..m.fileCount()) |i| if (!paths.contains(m.file(@intCast(i)))) return false;
+    return true;
+}
+
+/// Makes the donor's manifest this compilation's base, which a lazy donor
+/// build's log follows (`finishLazy`): hard-linked, as `publishDonor`
+/// links a compilation's base into the donors. Bases are replaced, never
+/// written in place.
+fn installDonorBase(inc: *Incremental) !void {
+    const io = inc.io;
+    var buf: [donors_path.len + 1 + donor_name_len]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ donors_path, &inc.donor.? }) catch unreachable;
+    var d = try inc.global.openDir(io, path, .{});
+    defer d.close(io);
+    inc.dir.deleteFile(io, "manifest.log") catch {};
+    inc.dir.deleteFile(io, "manifest") catch {};
+    try linkOrCopy(d, "manifest", inc.dir, io);
+}
+
+/// Undoes `installDonorBase` in a donor build that does not finish lazily:
+/// the compilation had no manifest, and the donor's would pass for its
+/// own (a relink of the donor's output, say).
+fn dropDonorBase(inc: *Incremental) void {
+    if (inc.donor == null) return;
+    inc.dir.deleteFile(inc.io, "manifest.log") catch {};
+    inc.dir.deleteFile(inc.io, "manifest") catch {};
 }
 
 /// After a full record is placed: publishes the manifest as a donor for
@@ -1696,6 +1773,11 @@ pub fn finishLazy(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *cons
     const t0 = now(io);
     const m = &inc.prev.?;
     const old_log = m.overlay.len;
+    if (inc.donor != null) inc.installDonorBase() catch |err| {
+        if (inc.timing) std.debug.print("cache: building again eagerly: the donor's manifest could not be linked: {t}\n", .{err});
+        return inc.fallBack();
+    };
+    errdefer inc.dropDonorBase();
     inc.recordDelta(fe, zcu, emit, r) catch |err| switch (err) {
         error.Fallback => return inc.fallBack(),
         else => return err,
@@ -1739,6 +1821,17 @@ pub fn finishLazy(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *cons
     return true;
 }
 
+/// Whether manifest `m`'s input `in` has file `f`'s path and stat.
+fn sameInput(inc: *const Incremental, m: *const Manifest, in: u32, fe: *const Frontend, f: *const Frontend.File) !bool {
+    var path_buf: std.ArrayList(u8) = .empty;
+    defer path_buf.deinit(inc.gpa);
+    try inputPath(inc.gpa, &path_buf, fe, f.module, f.sub_path);
+    const rec, const path = m.input(in);
+    if (!std.mem.eql(u8, path, path_buf.items)) return false;
+    const stat = Io.Dir.cwd().statFile(inc.io, path, .{}) catch return false;
+    return rec.matches(stat);
+}
+
 /// Truncates the manifest's log to `len` bytes, dropping the records
 /// appended since (0: no log).
 fn dropLog(inc: *Incremental, len: u64) void {
@@ -1750,6 +1843,7 @@ fn dropLog(inc: *Incremental, len: u64) void {
 
 /// Ends the lazy replay, for the caller to build again eagerly.
 fn fallBack(inc: *Incremental) error{LazyFallback} {
+    inc.dropDonorBase();
     inc.endReplay();
     return error.LazyFallback;
 }
@@ -1915,7 +2009,9 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     for (fe.files.items, file_inputs, 0..) |*f, *fi, i| {
         if (rp.file_inputs.get(@intCast(i))) |in| {
             fi.* = in;
-            if (!changed_input.isSet(in)) continue;
+            // A donor's file with this build's contents may be elsewhere
+            // (another worktree) or have another stat.
+            if (!changed_input.isSet(in)) if (inc.donor == null or try inc.sameInput(m, in, fe, f)) continue;
         } else {
             fi.* = n_inputs;
             n_inputs += 1;
@@ -2012,7 +2108,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         for (n.atoms) |ai| {
             const a = &emit.atoms.items[ai];
             try atom_refs.append(gpa, new_refs[atom_at[ai]]);
-            try symbols.append(gpa, named(ip, emit, ai, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (g.debug_of[ai]) |dbg| dbg.file else null }));
+            try symbols.append(gpa, named(ip, emit, ai, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (g.debug_of[ai]) |dbg| dbg.file else null, .other_files = if (g.debug_of[ai]) |dbg| .{ dbg.unit, dbg.files } else .{ "", "" } }));
         }
         var source = n.source;
         if (source.input != Manifest.Source.no_input) {
@@ -2368,7 +2464,10 @@ fn rewriteKept(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32, final
             renamed = true;
         }
     }
-    for (debug.items) |dbg| symbols[dbg.atom].file = dbg.file;
+    for (debug.items) |dbg| {
+        symbols[dbg.atom].file = dbg.file;
+        symbols[dbg.atom].other_files = .{ dbg.unit, dbg.files };
+    }
     var type_names = m.typeNames(i);
     var rewritten: std.ArrayList(u32) = .empty;
     defer rewritten.deinit(gpa);
@@ -2957,7 +3056,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
                 const a = &emit.atoms.items[ai];
                 const len = atoms_codec.encodedLen(a, debug_of[ai]);
                 try refs.append(gpa, .initIn(l[0], off, @intCast(len)));
-                try symbols.append(gpa, named(ip, emit, ai, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (debug_of[ai]) |d| d.file else null }));
+                try symbols.append(gpa, named(ip, emit, ai, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (debug_of[ai]) |d| d.file else null, .other_files = if (debug_of[ai]) |d| .{ d.unit, d.files } else .{ "", "" } }));
                 off += len;
             }
         }

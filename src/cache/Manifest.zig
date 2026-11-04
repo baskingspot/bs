@@ -44,7 +44,9 @@
 //! linked, then the targets nothing defines, then error codes) and drops
 //! the keys nothing uses. It also interns the atoms' debug source paths,
 //! so that every function of a file shares one path and the linker
-//! matches them by address, and lists the atoms that have debug info, so
+//! matches them by address (the table also lists the compile units and
+//! inlined callees' files the records name, so that it holds every path
+//! the atoms do), and lists the atoms that have debug info, so
 //! that a relink reads the records in place (`Pack.LinkAtoms`) and decodes
 //! nothing.
 //!
@@ -432,6 +434,11 @@ pub const AtomSymbols = struct {
     key: Hash,
     targets: []const Hash,
     file: ?[]const u8 = null,
+    /// The atom's other debug source paths: its compile unit's, and the
+    /// NUL-separated files of the functions it inlines. Only interned
+    /// into `files`, so that the table lists every path the atoms name
+    /// (`Replay.donorEager` reads it).
+    other_files: [2][]const u8 = .{ "", "" },
     name: []const u8 = "",
     /// The type whose name the first `prefix_len` bytes of `name` are,
     /// by stable hash, or 0.
@@ -1418,6 +1425,12 @@ pub const Delta = struct {
             });
             for (s.targets) |t| try d.scratch_targets.append(gpa, try d.symbolNumber(t));
             try d.scratch_files.append(gpa, if (s.file) |f| try d.fileIndex(f) else no_file);
+            for (s.other_files) |list| {
+                var it = std.mem.splitScalar(u8, list, 0);
+                while (it.next()) |f| {
+                    if (f.len != 0) _ = try d.fileIndex(f);
+                }
+            }
             const name = try d.addString(s.name);
             try d.scratch_names.append(gpa, .{ .parent = @bitCast(s.parent), .off = name.off, .len = name.len, .prefix_len = s.prefix_len });
         }
@@ -1930,6 +1943,12 @@ pub const Builder = struct {
             try b.numbered.append(gpa, .{ .symbol = try b.symbolNumber(s.key), .targets = @intCast(b.targets.items.len) });
             for (s.targets) |t| try b.targets.append(gpa, try b.symbolNumber(t));
             try b.debug_files.append(gpa, if (s.file) |f| try b.fileIndex(f) else no_file);
+            for (s.other_files) |list| {
+                var it = std.mem.splitScalar(u8, list, 0);
+                while (it.next()) |f| {
+                    if (f.len != 0) _ = try b.fileIndex(f);
+                }
+            }
             const name = try b.addAtomName(s.name);
             try b.atom_names.append(gpa, .{ .parent = @bitCast(s.parent), .off = name.off, .len = name.len, .prefix_len = s.prefix_len });
         }
