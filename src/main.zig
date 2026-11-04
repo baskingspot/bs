@@ -184,13 +184,26 @@ const unsupported_commands: std.StaticStringMap([]const u8) = .initComptime(.{
 /// one thread and 17 s on four. It still catches double and mismatched
 /// frees and corrupted allocation footers; a write after free no longer
 /// faults, since the memory stays mapped.
-var safe_gpa: std.heap.SafeAllocator = .init(std.heap.smp_allocator, .{});
+///
+/// A Debug zap's is std.start's choice, SafeAllocator over the page
+/// allocator (a write after free faults), without the stack trace it
+/// records per allocation, which made a Debug zap 3–4x slower and
+/// `zig build test` with it (2026-11-04). `ZAP_ALLOC_TRACES=<frames>`
+/// records them again, to find where a leaked or doubly freed block came
+/// from.
+var safe_gpa: std.heap.SafeAllocator = undefined;
+const own_gpa = (builtin.mode == .safe or builtin.mode == .debug) and !builtin.link_libc;
 
 pub fn main(init_std: std.process.Init) !void {
     var init = init_std;
-    if (builtin.mode == .safe and !builtin.link_libc) init.gpa = safe_gpa.allocator();
+    if (own_gpa) {
+        safe_gpa = if (builtin.mode == .safe) .init(std.heap.smp_allocator, .{}) else .init(std.heap.page_allocator, .{
+            .stack_trace_frames = if (init.environ_map.get("ZAP_ALLOC_TRACES")) |v| std.fmt.parseInt(usize, v, 10) catch 7 else 0,
+        });
+        init.gpa = safe_gpa.allocator();
+    }
     // Reports leaks, as std.start does for the allocator it made.
-    defer if (builtin.mode == .safe and !builtin.link_libc) {
+    defer if (own_gpa) {
         _ = safe_gpa.deinit();
     };
     const arena = init.arena.allocator();

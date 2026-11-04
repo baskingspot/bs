@@ -4656,6 +4656,15 @@ byte-identical for every n.
   time at four threads 10.3–10.4 → 0.9 s, RSS unchanged (761 → 764 MB).
   A ReleaseFast zap compiles the same allocator choice as before: one
   thread 7.75–7.80 vs 7.78–8.26 s, four 6.73–6.83 vs 6.64–7.24 s (noise).
+- *Debug.* std.start's SafeAllocator also records a 7-frame stack trace
+  per allocation in Debug, which was three quarters of a Debug zap's
+  time (a link-input build 5.4 → 1.8 s), and `zig build test` runs a
+  Debug zap. `main` gives a Debug zap the same SafeAllocator over the
+  page allocator, so a write after free still faults, without the
+  traces; `ZAP_ALLOC_TRACES=<frames>` records them again to find where a
+  leaked or doubly freed block came from. Over SmpAllocator, as
+  ReleaseSafe, would save another 13% of `zig build test` (174 → 151 s
+  after an edit, system time 114 → 64 s) at the cost of that fault.
 
 Step 1 orders output by hand-over, not by the node key sort below: with
 one Sema thread, hand-over order is deterministic and keeps the serial
