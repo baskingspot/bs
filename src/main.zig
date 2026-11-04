@@ -267,18 +267,21 @@ pub fn main(init_std: std.process.Init) !void {
     const job = try Job.init(init, args, opts);
     // The command line that describes the compilation: `bs run`'s
     // arguments after `--` are the program's.
+    // As upstream's, `bs run` and `bs test` put a binary without a path in
+    // the cache, and with -fno-emit-bin only compile: there is nothing to
+    // run.
     const run_test = job.run_test;
     const out_path: ?[]const u8 = switch (opts.emit_bin) {
-        .none => if (run_test) try testBinPath(arena, init.io, job.bsLocal(arena), job.stem) else if (command == .run) fatal("'bs run' needs a binary to run; remove -fno-emit-bin", .{}) else null,
+        .none => null,
         .path => |p| p,
         .default => if (run_test)
             try testBinPath(arena, init.io, job.bsLocal(arena), job.stem)
-        else if (command == .run)
+        else if (command == .run or command == .@"test")
             try runBinPath(arena, init.io, job.bsLocal(arena), job.compile_args, job.zig_lib_dir, job.stem)
         else
             try outputName(arena, command, opts.dynamic, job.stem),
     };
-    if (run_test or (command == .run and opts.emit_bin == .default)) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
+    if (opts.emit_bin == .default and (command == .run or command == .@"test")) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
     var inc = job.openCache(out_path);
     defer if (inc) |*i| i.close();
     switch (try compile(init, &job, if (inc) |*i| i else null, out_path, null, .none, null)) {
@@ -296,12 +299,12 @@ pub fn main(init_std: std.process.Init) !void {
     };
     if (docs_path) |p| try emitDocs(init, &job, p, false);
     if (run_test) try runTest(init, out_path.?, opts.emit_bin != .path);
-    if (command == .run) {
+    if (command == .run) if (out_path) |p| {
         // Releases the cache's lock: the program inherits nothing of bs.
         if (inc) |*i| i.close();
         inc = null;
-        runExe(init, out_path.?, opts.run_args);
-    }
+        runExe(init, p, opts.run_args);
+    };
 }
 
 /// The target as the cache keys it, salting the store seed and so the
@@ -492,7 +495,7 @@ pub const Job = struct {
             .link_objects = link_objects,
             .link_shared = link_shared,
             .stem = opts.name orelse if (is_test) "test" else if (opts.c_only or opts.c_exe) std.fs.path.stem(if (opts.c_sources.len != 0) opts.c_sources[0].path else if (opts.link_inputs.len != 0) opts.link_inputs[0] else opts.root_name) else std.fs.path.stem(opts.root_src_path),
-            .run_test = is_test and !opts.test_no_exec and !opts.listen,
+            .run_test = is_test and !opts.test_no_exec and !opts.listen and opts.emit_bin != .none,
             .environ_map = init_.environ_map,
             .full_args = args,
             .io = init_.io,
@@ -543,10 +546,11 @@ pub const Job = struct {
             else => .exe,
         };
         i.archive_stem = std.fs.path.stem(job.opts.root_src_path);
-        // `bs run`'s program counts as used when it runs (`renew_output`);
-        // other outputs keep the stat the last link left, so that the next
-        // build can skip the link.
-        i.renew_output = job.opts.command == .run;
+        // `bs run`'s program counts as used when it runs, as does the test
+        // binary `bs test --test-no-exec` leaves in the cache
+        // (`renew_output`); other outputs keep the stat the last link left,
+        // so that the next build can skip the link.
+        i.renew_output = job.opts.command == .run or (job.opts.command == .@"test" and job.opts.emit_bin == .default and !job.opts.listen);
         if (env.get("BS_CACHE_VERIFY")) |v| {
             i.verify = if (std.mem.eql(u8, v, "full")) .full else .replay;
             i.verify_argv = job.full_args;
@@ -1609,7 +1613,9 @@ fn runBinPath(arena: std.mem.Allocator, io: Io, cache_dir: []const u8, compile_a
 /// Runs a test binary, then deletes it if it is `temporary`: named by
 /// `testBinPath` for this build alone.
 fn runTest(init: std.process.Init, path: []const u8, temporary: bool) !void {
-    var child = try std.process.spawn(init.io, .{ .argv = &.{path} });
+    // A path without a slash would be looked up in PATH.
+    const exe = if (std.mem.indexOfScalar(u8, path, '/') == null) try std.fs.path.join(init.arena.allocator(), &.{ ".", path }) else path;
+    var child = try std.process.spawn(init.io, .{ .argv = &.{exe} });
     const term = try child.wait(init.io);
     if (temporary) Io.Dir.cwd().deleteFile(init.io, path) catch {};
     switch (term) {

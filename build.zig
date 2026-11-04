@@ -949,6 +949,18 @@ fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     src_stem.addCheck(.{ .expect_stdout_exact = "srcmod\n" });
     test_step.dependOn(&src_stem.step);
 
+    // -fno-emit-bin: as upstream's, `bs test` compiles the tests and runs
+    // nothing; this test fails if it runs.
+    const no_bin_test = b.addRunArtifact(bs);
+    no_bin_test.setName("bs test -fno-emit-bin");
+    no_bin_test.addArgs(&.{ "test", "-fno-emit-bin" });
+    no_bin_test.addFileArg(b.path("test/obj/failing_test.zig"));
+    no_bin_test.addArg("--global-cache-dir");
+    _ = no_bin_test.addOutputDirectoryArg("no-bin-test-cache");
+    no_bin_test.addCheck(.{ .expect_stderr_exact = "" });
+    no_bin_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&no_bin_test.step);
+
     // A module under test that imports itself by its `-M` name. It is
     // named "root" like upstream's test runner, and another module "main";
     // the cache check fails if a module shares a cache key with the test
