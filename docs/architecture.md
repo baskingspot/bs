@@ -5505,6 +5505,21 @@ state. Built for step 1:
   built yet; nothing scans `o/`, which upstream's outputs share).
   zap also creates `<local cache>/tmp`, which upstream's compiler creates
   and the runner writes into.
+- **Inputs under zap's own lib directory are not reported.** Of the
+  `file_system_inputs`, files of the pinned release's lib directory, the
+  one zap was built with, are left out (`main.prefixInputs`); they are
+  about 700 of a configure script's 720 (std and std.Build). The runner
+  records the configure script's inputs in its configuration cache
+  manifest: it stats them on every build, and when the build script
+  cannot be cached (it runs a process, such as ziggy's `git describe` or
+  monstar's pkg-config) it hashes every one of them again on every build.
+  It also records each compile step's inputs for `--watch`. Nobody edits
+  the pinned lib directory, so the runner gains nothing from them: with
+  them, the runner's own time in a no-change `zap build` of ziggy was
+  58 ms, without them 8 ms (bench/README.md). This is the
+  trust the runner's stamp already places in that directory (an edit
+  there needs `--zig-lib`, ZIG_LIB_DIR, or a cleared cache to be seen);
+  with another lib directory, every input is reported, as upstream does.
 - **Errors over the protocol** travel as std's `ErrorBundle`, built by
   `diag.toBundle` from zap's diagnostic records, and the runner renders
   them in upstream's format: the message is prefixed with the code

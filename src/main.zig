@@ -1083,10 +1083,8 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
                 var inc = j.openCache(out_path);
                 defer if (inc) |*i| i.close();
                 const outcome = try compile(init, j, if (inc) |*i| i else null, out_path, root_node, &inputs);
-                if (inputs.items.len != 0) {
-                    const prefixed = try prefixInputs(arena, io, inputs.items, .{ .zig_lib_dir = j.zig_lib_dir, .cache_dirs = j.cache_dirs, .build_root = j.opts.build_root });
-                    try server.serveStringMessage(.file_system_inputs, prefixed);
-                }
+                const prefixed = try prefixInputs(arena, io, inputs.items, .{ .zig_lib_dir = j.zig_lib_dir, .cache_dirs = j.cache_dirs, .build_root = j.opts.build_root });
+                if (prefixed.len != 0) try server.serveStringMessage(.file_system_inputs, prefixed);
                 switch (outcome) {
                     .ok => |r| {
                         if (docs_path) |p| try emitDocs(init, j, p, r.cache_hit);
@@ -1152,8 +1150,17 @@ fn serveErrors(server: *std.zig.Server, gpa: std.mem.Allocator, diags: []const d
 /// the first of the build runner's cache prefixes that contains it (zig
 /// lib, local cache, global cache, build root; else the working
 /// directory), as one prefix byte (`PathPrefix` + 1) and the sub path,
-/// separated by zero bytes.
+/// separated by zero bytes; empty when there is nothing to report, which
+/// is then not sent (the runner cannot parse an empty list).
+///
+/// Files of zap's own zig lib directory (the pinned release's, which
+/// nobody edits; see `BuildRunner`) are left out, about 700 of a
+/// configure script's 720: the runner would otherwise stat them for every
+/// configuration cache check, hash them all whenever its build script
+/// cannot be cached, and record each as a `--watch` input. With another
+/// lib directory (`--zig-lib-dir`, ZIG_LIB_DIR), every file is reported.
 pub fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: struct { zig_lib_dir: []const u8, cache_dirs: Frontend.CacheDirs, build_root: ?[]const u8 }) ![]const u8 {
+    if (inputs.len == 0) return "";
     const cwd = try std.process.currentPathAlloc(io, arena);
     const Prefix = std.zig.Server.Message.PathPrefix;
     const Root = struct { prefix: Prefix, path: []const u8 };
@@ -1163,23 +1170,42 @@ pub fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: s
     try roots.append(arena, .{ .prefix = .global_cache, .path = try std.fs.path.resolve(arena, &.{ cwd, job.cache_dirs.global }) });
     if (job.build_root) |br| try roots.append(arena, .{ .prefix = .build_root, .path = try std.fs.path.resolve(arena, &.{ cwd, br }) });
     try roots.append(arena, .{ .prefix = .cwd, .path = cwd });
+    const trusted_lib = std.mem.eql(u8, roots.items[0].path, try std.fs.path.resolve(arena, &.{ cwd, build_options.zig_lib_dir }));
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, inputs, 0);
     while (it.next()) |raw| {
         const abs = try std.fs.path.resolve(arena, &.{ cwd, raw });
-        if (out.items.len != 0) try out.append(arena, 0);
         for (roots.items) |r| {
             if (abs.len > r.path.len and std.mem.startsWith(u8, abs, r.path) and abs[r.path.len] == '/') {
+                if (r.prefix == .zig_lib and trusted_lib) break;
+                if (out.items.len != 0) try out.append(arena, 0);
                 try out.append(arena, @backingInt(r.prefix) + 1);
                 try out.appendSlice(arena, abs[r.path.len + 1 ..]);
                 break;
             }
         } else {
+            if (out.items.len != 0) try out.append(arena, 0);
             try out.append(arena, @backingInt(Prefix.cwd) + 1);
             try out.appendSlice(arena, abs);
         }
     }
     return out.items;
+}
+
+test prefixInputs {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    const lib = try std.fs.path.resolve(arena, &.{build_options.zig_lib_dir});
+    const dirs: Frontend.CacheDirs = .{ .local = "/p/.zig-cache", .global = "/g" };
+    const inputs = try std.mem.join(arena, "\x00", &.{ try std.fs.path.join(arena, &.{ lib, "std/std.zig" }), "/p/build.zig", "/g/p/dep/build.zig" });
+    // zap's own lib directory: its files are left out.
+    try std.testing.expectEqualStrings("\x05build.zig\x00\x04p/dep/build.zig", try prefixInputs(arena, io, inputs, .{ .zig_lib_dir = lib, .cache_dirs = dirs, .build_root = "/p" }));
+    // Nothing else to report: nothing to send.
+    try std.testing.expectEqualStrings("", try prefixInputs(arena, io, inputs[0..std.mem.indexOfScalar(u8, inputs, 0).?], .{ .zig_lib_dir = lib, .cache_dirs = dirs, .build_root = "/p" }));
+    // Another lib directory: every file.
+    try std.testing.expectEqualStrings("\x02std/std.zig\x00\x05build.zig", try prefixInputs(arena, io, "/l/std/std.zig\x00/p/build.zig", .{ .zig_lib_dir = "/l", .cache_dirs = dirs, .build_root = "/p" }));
 }
 
 fn cleanExit(io: Io) void {

@@ -208,14 +208,12 @@ fn serve(init: std.process.Init, req: *const Request) !void {
                     continue;
                 }
                 const r = try translate(init, req);
-                if (r.inputs.len != 0) {
-                    const prefixed = try main.prefixInputs(arena, io, r.inputs, .{
-                        .zig_lib_dir = req.zig_lib_dir,
-                        .cache_dirs = req.cache_dirs,
-                        .build_root = req.build_root,
-                    });
-                    try server.serveStringMessage(.file_system_inputs, prefixed);
-                }
+                const prefixed = try main.prefixInputs(arena, io, r.inputs, .{
+                    .zig_lib_dir = req.zig_lib_dir,
+                    .cache_dirs = req.cache_dirs,
+                    .build_root = req.build_root,
+                });
+                if (prefixed.len != 0) try server.serveStringMessage(.file_system_inputs, prefixed);
                 if (r.errors) |body| {
                     try server.serveStringMessage(.error_bundle, body);
                 } else {
