@@ -978,6 +978,14 @@ GENERIC = [
         lambda src: re.finditer(r"(\))\.\?", src),
         lambda src, m, k: _replace(src, m.start() + 1, m.end(), ""),
     ),
+    # `best.? /= 2` -> `best /= 2`
+    Generic(
+        "missing-unwrap-local",
+        "optional",
+        lambda m: [[".?", "orelse"]],
+        lambda src: re.finditer(r"(?<![\w.])([a-z_]\w*)\.\?", src),
+        lambda src, m, k: _replace(src, m.end(1), m.end(), ""),
+    ),
     Generic(
         "var-to-const",
         "mutability",
