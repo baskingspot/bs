@@ -835,6 +835,131 @@ pub fn movups(e: *Encoder, dst: XmmRm, src: XmmRm) !void {
     }
 }
 
+// ---------------------------------------------------------------- packed SSE
+
+/// Two-operand packed SSE2 instructions, `dst = dst op src`, by their
+/// opcode after 0F; all take the 0x66 prefix. A memory `src` must be
+/// 16-byte aligned.
+pub const PackedOp = enum(u8) {
+    punpcklbw = 0x60,
+    punpcklwd = 0x61,
+    punpckldq = 0x62,
+    packsswb = 0x63,
+    pcmpgtb = 0x64,
+    pcmpgtw = 0x65,
+    pcmpgtd = 0x66,
+    packuswb = 0x67,
+    punpckhbw = 0x68,
+    punpckhwd = 0x69,
+    punpckhdq = 0x6a,
+    packssdw = 0x6b,
+    punpcklqdq = 0x6c,
+    punpckhqdq = 0x6d,
+    pcmpeqb = 0x74,
+    pcmpeqw = 0x75,
+    pcmpeqd = 0x76,
+    paddq = 0xd4,
+    pmullw = 0xd5,
+    pminub = 0xda,
+    pand = 0xdb,
+    pmaxub = 0xde,
+    pandn = 0xdf,
+    pminsw = 0xea,
+    por = 0xeb,
+    pmaxsw = 0xee,
+    pxor = 0xef,
+    pmuludq = 0xf4,
+    psubb = 0xf8,
+    psubw = 0xf9,
+    psubd = 0xfa,
+    psubq = 0xfb,
+    paddb = 0xfc,
+    paddw = 0xfd,
+    paddd = 0xfe,
+};
+
+pub fn pint(e: *Encoder, op: PackedOp, dst: Xmm, src: XmmRm) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = true }, &.{ 0x0f, @backingInt(op) }, @backingInt(dst), rmXmm(src), 0);
+}
+
+/// addps/addpd and friends on all lanes (the scalar ops' opcodes without
+/// their prefix). A memory `src` must be 16-byte aligned.
+pub fn ps(e: *Encoder, op: SseOp, ty: Float, dst: Xmm, src: XmmRm) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = ty == .f64 }, &.{ 0x0f, @backingInt(op) }, @backingInt(dst), rmXmm(src), 0);
+}
+
+/// cmpps/cmppd with predicate `pred` (0 eq, 1 lt, 2 le, 3 unord, 4 neq,
+/// 5 nlt, 6 nle, 7 ord): each lane all ones where it holds.
+pub fn cmpp(e: *Encoder, ty: Float, dst: Xmm, src: XmmRm, pred: u8) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = ty == .f64 }, &.{ 0x0f, 0xc2 }, @backingInt(dst), rmXmm(src), 1);
+    e.byte(pred);
+}
+
+pub const Pshuf = enum { d, lw, hw };
+
+/// pshufd (dwords), pshuflw (the low four words; the high qword is
+/// copied), pshufhw (the high four words): each lane chosen by two bits
+/// of `imm`.
+pub fn pshuf(e: *Encoder, kind: Pshuf, dst: Xmm, src: XmmRm, imm: u8) !void {
+    try e.reserve();
+    const o: Opts = switch (kind) {
+        .d => .{ .op16 = true },
+        .lw => .{ .prefix = 0xf2 },
+        .hw => .{ .prefix = 0xf3 },
+    };
+    try e.modRm(o, &.{ 0x0f, 0x70 }, @backingInt(dst), rmXmm(src), 1);
+    e.byte(imm);
+}
+
+pub const PshiftOp = enum { psrlw, psraw, psllw, psrld, psrad, pslld, psrlq, psrldq, psllq, pslldq };
+
+/// Shifts of every lane by `count` bits (psrldq/pslldq: of the whole
+/// register by `count` bytes).
+pub fn pshift(e: *Encoder, op: PshiftOp, dst: Xmm, count: u8) !void {
+    const opcode: u8, const ext_: u4 = switch (op) {
+        .psrlw => .{ 0x71, 2 },
+        .psraw => .{ 0x71, 4 },
+        .psllw => .{ 0x71, 6 },
+        .psrld => .{ 0x72, 2 },
+        .psrad => .{ 0x72, 4 },
+        .pslld => .{ 0x72, 6 },
+        .psrlq => .{ 0x73, 2 },
+        .psrldq => .{ 0x73, 3 },
+        .psllq => .{ 0x73, 6 },
+        .pslldq => .{ 0x73, 7 },
+    };
+    try e.reserve();
+    try e.modRm(.{ .op16 = true }, &.{ 0x0f, opcode }, ext_, .{ .reg = @backingInt(dst) }, 1);
+    e.byte(count);
+}
+
+/// pmovmskb: the top bit of each byte of `src` into the low 16 bits of
+/// `dst`, the rest zero.
+pub fn pmovmskb(e: *Encoder, dst: Reg, src: Xmm) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = true }, &.{ 0x0f, 0xd7 }, @backingInt(dst), .{ .reg = @backingInt(src) }, 0);
+}
+
+/// movmskps/movmskpd: the sign bit of each lane of `src` into `dst`.
+pub fn movmskp(e: *Encoder, ty: Float, dst: Reg, src: Xmm) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = ty == .f64 }, &.{ 0x0f, 0x50 }, @backingInt(dst), .{ .reg = @backingInt(src) }, 0);
+}
+
+/// movdqa (`aligned`) or movdqu: all 128 bits, register to register,
+/// load, or store.
+pub fn movdq(e: *Encoder, aligned: bool, dst: XmmRm, src: XmmRm) !void {
+    try e.reserve();
+    const o: Opts = if (aligned) .{ .op16 = true } else .{ .prefix = 0xf3 };
+    switch (dst) {
+        .reg => |d| try e.modRm(o, &.{ 0x0f, 0x6f }, @backingInt(d), rmXmm(src), 0),
+        .mem => try e.modRm(o, &.{ 0x0f, 0x7f }, @backingInt(src.reg), rmXmm(dst), 0),
+    }
+}
+
 // ---------------------------------------------------------------- x87
 
 /// Memory operand of an x87 load or store: f32, f64, or f80.
@@ -1308,6 +1433,37 @@ test "movups, x87 instructions, and double shifts match GNU as" {
     try e.shiftDouble(false, .{ .reg = .r10 }, .r9); // 4d 0f ad ca
     const expected = "0f1008" ++ "440f114df0" ++ "0f10da" ++ "db6c2408" ++ "db7de0" ++ "41db2a" ++ "d900" ++ "dd1c24" ++
         "dee9" ++ "def9" ++ "d9fa" ++ "dfe9" ++ "ddd8" ++ "480fa5d0" ++ "4d0fadca";
+    var buf: [expected.len / 2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
+}
+
+test "packed SSE instructions match GNU as" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    try e.pint(.paddb, .xmm1, .{ .reg = .xmm2 });
+    try e.pint(.pcmpeqb, .xmm9, .{ .mem = .at(.rbp, -32) });
+    try e.pint(.pxor, .xmm0, .{ .reg = .xmm15 });
+    try e.pint(.psubq, .xmm8, .{ .reg = .xmm3 });
+    try e.ps(.add, .f32, .xmm2, .{ .reg = .xmm10 });
+    try e.ps(.mul, .f64, .xmm1, .{ .mem = .at(.rax, 0) });
+    try e.cmpp(.f32, .xmm3, .{ .reg = .xmm4 }, 1);
+    try e.cmpp(.f64, .xmm11, .{ .mem = .at(.r12, 16) }, 4);
+    try e.pshuf(.d, .xmm2, .{ .reg = .xmm12 }, 0x4e);
+    try e.pshuf(.lw, .xmm2, .{ .reg = .xmm3 }, 0xb1);
+    try e.pshuf(.hw, .xmm9, .{ .reg = .xmm3 }, 0);
+    try e.pshift(.psrlw, .xmm1, 8);
+    try e.pshift(.pslld, .xmm10, 31);
+    try e.pshift(.psrldq, .xmm3, 4);
+    try e.pshift(.psllq, .xmm2, 1);
+    try e.pmovmskb(.rax, .xmm9);
+    try e.pmovmskb(.r10, .xmm1);
+    try e.movmskp(.f32, .rcx, .xmm2);
+    try e.movmskp(.f64, .r11, .xmm14);
+    try e.movdq(true, .{ .reg = .xmm1 }, .{ .mem = .at(.rbp, -16) });
+    try e.movdq(false, .{ .mem = .at(.r10, 8) }, .{ .reg = .xmm9 });
+    try e.movdq(false, .{ .reg = .xmm0 }, .{ .mem = .{ .base = .rip, .disp = 0 } });
+    const expected = "660ffcca66440f744de066410fefc766440ffbc3410f58d2660f59080fc2dc0166450fc25c24100466410f70d44ef20f70d3b1f3440f70cb00660f71d10866410f72f21f660f73db04660f73f20166410fd7c166440fd7d10f50ca66450f50de660f6f4df0f3450f7f4a08f30f6f0500000000";
     var buf: [expected.len / 2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
 }
