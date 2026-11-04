@@ -39,6 +39,19 @@ BS_INLINE_SAFE = Config("bs-inline-safe", "bs", env={"BS_INLINE_SAFE": "1"})
 ALWAYS = [BS_DEBUG, BS_SAFE, BS_NOINLINE]
 TRIAGE = [UP_SAFE, BS_INLINE_SAFE]
 BY_NAME = {c.name: c for c in [UP_DEBUG, UP_SAFE, BS_DEBUG, BS_SAFE, BS_NOINLINE, BS_INLINE_SAFE]}
+# What every configuration is compared with: upstream Debug, or with
+# set_ref_env, bs itself with a pass turned off (no upstream run at all).
+ORACLE = UP_DEBUG
+REPORT = [UP_DEBUG, UP_SAFE]
+
+
+def set_ref_env(env):
+    """Makes bs under `env` (such as {"BS_PROVE": "off"}) the oracle."""
+    global ORACLE, TRIAGE, REPORT
+    ORACLE = Config("bs-ref", "bs", env=env)
+    BY_NAME[ORACLE.name] = ORACLE
+    TRIAGE = [BS_INLINE_SAFE]
+    REPORT = [ORACLE]
 
 
 class Tools:

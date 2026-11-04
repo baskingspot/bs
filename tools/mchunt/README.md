@@ -16,6 +16,8 @@ zig build -Doptimize=ReleaseFast
 python3 tools/mchunt/hunt.py                         # hunt with zig-out/bin/bs until ^C
 python3 tools/mchunt/hunt.py --follow --hours 8      # bs from origin/main, rebuilt when it moves
 python3 tools/mchunt/hunt.py --one 1234              # one seed, with its outcomes
+python3 tools/mchunt/hunt.py --file p.zig            # one saved program, with its outcomes
+python3 tools/mchunt/hunt.py --ref-env BS_PROVE=off # bs against bs with a pass off; no upstream
 python3 tools/mchunt/gen.py 1234 > p.zig             # just the program
 python3 tools/mchunt/reduce.py tools/mchunt/.work/found/miscompile-1234
 python3 tools/mchunt/reduce.py p.zig --bad bs --control bs-noinline > small.zig
@@ -46,6 +48,12 @@ The classes of finding (`.work/found/<class>-<seed>/`):
 Seeds whose program upstream rejects (a comptime overflow the generator
 did not foresee) are discarded; `upstream-signal` and `upstream-timeout`
 count programs that upstream Debug's binary crashed or hung on.
+
+With `--ref-env VAR=VALUE`, bs under that environment replaces
+upstream as the oracle (`bs-ref` in reports): a pass switched off must
+not change any program's output or panic. With upstream out of the loop
+a program takes a fraction of the time, and upstream's own backend bugs
+drop out.
 
 ## Outcomes
 

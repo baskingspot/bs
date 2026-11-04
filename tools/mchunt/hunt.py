@@ -59,18 +59,18 @@ def signature(cls, bad, up, res):
     return f"{cls}|{','.join(bad)}|{up.kind()}|{first.kind()}"
 
 
-def check(seed, tools, size, branch=None, base=None):
+def check(seed, tools, size, branch=None, base=None, text=None):
     """Runs one seed. Returns a small record; saves findings. For a
     branch campaign, `base` is bs from origin/main: a finding is run
     again with it to tell the branch's regressions from main's bugs."""
     scratch = H.new_scratch()
     try:
         src = os.path.join(scratch, f"p{seed}.zig")
-        text = gen.generate(seed, size)
+        text = text or gen.generate(seed, size)
         with open(src, "w") as f:
             f.write(text)
         t0 = time.time()
-        up = H.run_config(tools, H.UP_DEBUG, src, scratch)
+        up = H.run_config(tools, H.ORACLE, src, scratch)
         rec = {"seed": seed, "up": up.status, "lines": len(text.splitlines())}
         if not up.compiled():
             if up.status == "compile-crash":
@@ -127,6 +127,8 @@ def save_finding(seed, text, tools, up, res, cls, bad, sig, extra=None):
         "outcomes": {"zig": up.to_json(), **{n: o.to_json() for n, o in res.items()}},
         **(extra or {}),
     }
+    if H.ORACLE.kind == "bs":
+        meta["ref_env"] = H.ORACLE.env
     with open(os.path.join(d, "meta.json"), "w") as f:
         json.dump(meta, f, indent=1)
     return d
@@ -196,7 +198,7 @@ def recheck_findings(tools):
         try:
             src = os.path.join(scratch, "p.zig")
             shutil.copy(prog, src)
-            up = H.run_config(tools, H.UP_DEBUG, src, scratch)
+            up = H.run_config(tools, H.ORACLE, src, scratch)
             still = any(H.run_config(tools, H.BY_NAME[n], src, scratch).key() != up.key() for n in meta["bad"])
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -252,9 +254,18 @@ def main():
     ap.add_argument("--no-reduce", action="store_true")
     ap.add_argument("--per-sig", type=int, default=2, help="reductions per finding signature")
     ap.add_argument("--one", type=int, help="check one seed and print its outcomes")
+    ap.add_argument("--file", help="check one saved program and print its outcomes")
+    ap.add_argument("--ref-env", metavar="VAR=VALUE", action="append",
+                    help="compare bs with bs under this environment (such as BS_PROVE=off) instead of upstream")
     args = ap.parse_args()
 
     tools = H.Tools(args.bs, args.zig)
+    if args.ref_env:
+        H.set_ref_env(dict(e.split("=", 1) for e in args.ref_env))
+    if args.file:
+        # A saved program (a seed's text changes with the generator).
+        print(json.dumps(check(0, tools, args.size, text=open(args.file).read()), indent=1))
+        return
     if args.one is not None:
         rec = check(args.one, tools, args.size)
         print(json.dumps(rec, indent=1))

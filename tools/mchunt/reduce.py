@@ -80,7 +80,7 @@ class Property:
                 return False
         elif not b.compiled() or norm_kind(b) != self.bad_kind:
             return False
-        up = H.run_config(self.tools, H.UP_DEBUG, src, self.scratch)
+        up = H.run_config(self.tools, H.ORACLE, src, self.scratch)
         if up.status not in ("ok", "panic") or norm_kind(up) != self.up_kind:
             return False
         if self.cls == "miscompile" and up.key() == b.key():
@@ -516,6 +516,8 @@ def reduce_finding(d, bs=None, zig=None, minutes=90):
     reduced.json and report.md there."""
     tools = H.Tools(bs, zig)
     meta = json.load(open(os.path.join(d, "meta.json")))
+    if meta.get("ref_env"):
+        H.set_ref_env(meta["ref_env"])
     prop = property_for(meta, tools)
     logf = open(os.path.join(d, "reduce.log"), "a")
 
@@ -546,15 +548,15 @@ def describe(d, text, tools, meta):
         src = os.path.join(scratch, "repro.zig")
         with open(src, "w") as f:
             f.write(text)
-        res = {c.name: H.run_config(tools, c, src, scratch) for c in [H.UP_DEBUG, H.UP_SAFE] + H.ALWAYS + H.TRIAGE[1:]}
+        res = {c.name: H.run_config(tools, c, src, scratch) for c in H.REPORT + H.ALWAYS + [H.BS_INLINE_SAFE]}
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     json.dump({n: o.to_json() for n, o in res.items()}, open(os.path.join(d, "reduced.json"), "w"), indent=1)
-    up = res["zig"]
+    up = res[H.ORACLE.name]
     agree = [n for n, o in res.items() if o.key() == up.key()]
     differ = [n for n, o in res.items() if o.key() != up.key()]
     rep = [f"# {meta['class']} (seed {meta['seed']})", "",
-           f"bs {meta.get('bs_rev', '?')[:12]}; agree with upstream Debug: {', '.join(agree)}; "
+           f"bs {meta.get('bs_rev', '?')[:12]}; agree with {H.ORACLE.name}: {', '.join(agree)}; "
            f"differ: {', '.join(differ)}", "", "```zig", text.rstrip(), "```", ""]
     for n, o in res.items():
         rep += [f"## {n}", "```", o.text(), "```", ""]
@@ -579,7 +581,7 @@ def main():
     scratch = H.new_scratch()
     src = os.path.join(scratch, "p.zig")
     open(src, "w").write(text)
-    up = H.run_config(tools, H.UP_DEBUG, src, scratch)
+    up = H.run_config(tools, H.ORACLE, src, scratch)
     b = H.run_config(tools, H.BY_NAME[args.bad or "bs"], src, scratch)
     shutil.rmtree(scratch, ignore_errors=True)
     cls = "miscompile" if b.compiled() else ("bs-crash" if b.status == "compile-crash" else "bs-reject")
