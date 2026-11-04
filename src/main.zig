@@ -47,6 +47,9 @@ pub const Command = enum { build_exe, build_obj, build_lib, run, @"test" };
 pub const Options = struct {
     command: Command,
     root_src_path: []const u8,
+    /// The root module's directory if not `root_src_path`'s (only for
+    /// tools zap builds, `Frontend.Options.root_dir`); no flag sets it.
+    root_dir: ?[]const u8 = null,
     name: ?[]const u8 = null,
     emit_bin: union(enum) { default, path: []const u8, none } = .default,
     /// `-femit-docs[=path]`: the autodocs directory (Docs.zig).
@@ -646,6 +649,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const fe_node = prog.start("Load Sources", 0);
     var fe: Frontend = try .init(init.gpa, init.io, job.zig_lib_dir, .{
         .root_src_path = if (is_test) test_runner else opts.root_src_path,
+        .root_dir = opts.root_dir,
         .builtin_dir = job.builtin_dir,
         .main_src_path = if (is_test) opts.root_src_path else null,
         .root_name = opts.root_name,

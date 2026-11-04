@@ -377,7 +377,7 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, tru
         "--zig-lib-dir", lib,
         "--cache-dir",   global,
         "--global-cache-dir", global,
-    }, "Compiling translate-c (first time setup)", "translate-c", try std.fmt.allocPrint(arena, "{s}/compiler/translate-c/main.zig", .{lib}));
+    }, "Compiling translate-c (first time setup)", "translate-c", try std.fmt.allocPrint(arena, "{s}/compiler/translate-c/main.zig", .{lib}), try std.fmt.allocPrint(arena, "{s}/compiler", .{lib}));
     BuildRunner.noteTool(io, exe, stamp);
     return exe;
 }

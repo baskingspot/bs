@@ -177,6 +177,10 @@ pub const Stats = struct {
 pub const Options = struct {
     /// Root source file of the root module (the test runner under `zap test`).
     root_src_path: []const u8,
+    /// The root module's directory when it is not the root file's own:
+    /// upstream roots translate-c, whose root file imports `../util.zig`,
+    /// at `lib/compiler`. `root_src_path` starts with it and a '/'.
+    root_dir: ?[]const u8 = null,
     /// Directory holding the generated `builtin.zig`.
     builtin_dir: []const u8,
     /// `zap test` only: root source file of the module under test.
@@ -226,7 +230,12 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     // for the root module of a `zap build-exe`, which `@import("root")`
     // finds. The names start with '=', which no `-M` name can hold, so no
     // other module's keys are theirs.
-    try fe.addModule("=root", options.root_src_path, .local);
+    if (options.root_dir) |dir| try fe.modules.append(gpa, .{
+        .name = "=root",
+        .root_dir = try gpa.dupe(u8, dir),
+        .root_file = try gpa.dupe(u8, options.root_src_path[dir.len + 1 ..]),
+        .cache = .local,
+    }) else try fe.addModule("=root", options.root_src_path, .local);
     try fe.modules.append(gpa, .{
         .name = "std",
         .root_dir = try std.fs.path.join(gpa, &.{ zig_lib_dir, "std" }),

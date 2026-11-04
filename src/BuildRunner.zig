@@ -79,7 +79,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
             "--zig-lib-dir", zig_lib_dir,
             "--cache-dir",   global,
             "--global-cache-dir", global,
-        }, "Compiling build runner", "build runner", try std.fmt.allocPrint(arena, "{s}/compiler/Maker.zig", .{zig_lib_dir}));
+        }, "Compiling build runner", "build runner", try std.fmt.allocPrint(arena, "{s}/compiler/Maker.zig", .{zig_lib_dir}), null);
         noteTool(io, runner_path, stamp_path);
     }
 
@@ -103,14 +103,16 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
 
 /// Compiles one of upstream's programs that zap runs (the build runner,
 /// translate-c) with `compile_args`, from `dir`, where its binary goes.
-pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []const []const u8, progress: []const u8, what: []const u8, root: []const u8) !void {
+/// `root_dir` is the root module's directory if not the root file's.
+pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []const []const u8, progress: []const u8, what: []const u8, root: []const u8, root_dir: ?[]const u8) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const cwd = try std.process.currentPathAlloc(io, arena);
     // Compiled from its own directory, so that the compilation's key (which
     // includes the working directory) is the same for every project.
     try std.process.setCurrentPath(io, dir);
-    const opts = try main.parseOptions(arena, io, init.environ_map, .build_exe, compile_args[2..]);
+    var opts = try main.parseOptions(arena, io, init.environ_map, .build_exe, compile_args[2..]);
+    opts.root_dir = root_dir;
     const job: main.Job = try .init(init, compile_args, opts);
     {
         const prog = std.Progress.start(io, .{ .root_name = progress });
