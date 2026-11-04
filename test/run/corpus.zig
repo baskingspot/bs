@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n42\n39\n5\n1\n3\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -144,6 +144,14 @@ fn readCb(r: error{ Eof, Reset, Canceled }!u32) u32 {
 fn readWith(comptime cb: *const fn (r: error{ Eof, Reset }!u32) u32, r: error{ Eof, Reset }!u32) u32 {
     return cb(r);
 }
+// libxev (watcher/stream.zig): such a callback called inline through the
+// coerced pointer is inlined with the pointer's parameter types.
+fn readCbWide(r: error{ Eof, Reset, Canceled }!u32) u32 {
+    return r catch |e| if (e == error.Reset) 2 else 1;
+}
+fn readInline(comptime cb: *const fn (r: error{ Eof, Reset }!u32) u32, r: error{ Eof, Reset }!u32) u32 {
+    return @call(.always_inline, cb, .{r});
+}
 
 // tokamak (util/shm.zig): a zero-terminated slice coerces to a C pointer.
 fn cStrLen(s: [*c]const u8) u64 {
@@ -284,6 +292,7 @@ fn main() callconv(.c) noreturn {
     var eof: error{ Eof, Reset }!u32 = error.Reset;
     _ = &eof;
     rt.printInt(readWith(readCb, eof));
+    rt.printInt(readInline(readCbWide, eof));
     rt.printInt(passName("tokamak"));
     const Tag = @typeInfo(Schema).@"union".tag_type.?;
     rt.printInt(@intFromBool(@hasDecl(Schema, "jsonStringify") and !@hasDecl(Tag, "jsonStringify")));

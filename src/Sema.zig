@@ -17166,6 +17166,10 @@ fn analyzeCall(
                     // A pointer cast to another function type calls
                     // indirectly.
                     if (ip.keyTag(nv) == .func and ip.typeOf(nv) == p.child) func = nv;
+                    // An inline call inlines the function with the
+                    // pointer's parameter types, as upstream (libxev's
+                    // callbacks, whose parameters take more errors).
+                    if (ip.keyTag(nv) == .func and func == .none and modifier == .always_inline) func = nv;
                     // At comptime, it calls the function and coerces the
                     // result, as upstream.
                     if (ip.keyTag(nv) == .func and func == .none and (block.is_comptime or modifier == .compile_time)) {
