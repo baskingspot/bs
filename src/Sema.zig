@@ -10389,6 +10389,15 @@ fn analyzeShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, lhs: Re
     };
     if (class == .comptime_int) return sema.fail(block, src, "LHS of shift must be a fixed-width integer type, or RHS must be comptime-known", .{});
     if (rv) |v| if (sema.intSign(v) == 0) return lhs;
+    // A known left operand with a runtime amount, as upstream: `undefined`
+    // is illegal (or stays `undefined` for `<<|`), and zero stays zero.
+    if (rv == null) if (sema.resolveValue(lhs)) |lv| {
+        if (sema.isUndef(lv)) {
+            if (sat) return lhs;
+            return sema.failUndefAt(block, src.operandSrc(0));
+        }
+        if (sema.intSign(lv) == 0) return lhs;
+    };
     try sema.requireRuntime(block, src);
     const bits = Type.intInfo(ip, ty).bits;
     const shift_ty = try sema.intType(.unsigned, Type.log2IntBits(bits));
@@ -10596,6 +10605,15 @@ fn analyzeShlWithOverflow(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncast
         try r.truncate(&r, info.signedness, info.bits);
         return .fromInterned(try sema.intern(.{ .aggregate = .{ .ty = tuple_ty, .storage = .{ .elems = &.{ try sema.bigToValue(ty, r.toConst()), if (overflowed) .one_u1 else .zero_u1 } } } }));
     };
+    // One known operand, as upstream: `undefined` is illegal, and a zero
+    // amount or a zero left operand cannot overflow.
+    if (rv) |v| {
+        if (sema.isUndef(v)) return sema.failUndefAt(block, src.operandSrc(1));
+        if (sema.intSign(v) == 0) return sema.aggregate(block, src, tuple_ty, &.{ lhs, .fromInterned(.zero_u1) });
+    } else if (sema.resolveValue(lhs)) |lv| {
+        if (sema.isUndef(lv)) return sema.failUndefAt(block, src.operandSrc(0));
+        if (sema.intSign(lv) == 0) return sema.aggregate(block, src, tuple_ty, &.{ lhs, .fromInterned(.zero_u1) });
+    }
     try sema.requireRuntime(block, src);
     if (block.want_safety and rv == null and !std.math.isPowerOfTwo(info.bits)) {
         const ok = try sema.addBinOp(block, .cmp_lt, rhs, .fromInterned(try sema.intValue(shift_ty, info.bits)));
