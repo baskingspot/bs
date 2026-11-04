@@ -825,7 +825,25 @@ pub const Src = struct {
             .container_field => |cf| {
                 const node = cf.node.toAbsolute(src.base);
                 var buf: [2]Ast.Node.Index = undefined;
-                const decl = tree.fullContainerDecl(&buf, node) orelse return tree.nodeToSpan(node);
+                const decl = tree.fullContainerDecl(&buf, node) orelse {
+                    // A reified type: the argument of `@Enum(_, _, names,
+                    // values)`, `@Struct(_, _, names, types, attrs)` or
+                    // `@Union(_, _, names, types, attrs)` that holds the
+                    // part, as upstream.
+                    const args = tree.builtinCallParams(&buf, node) orelse return tree.nodeToSpan(node);
+                    const builtin = tree.tokenSlice(tree.firstToken(node));
+                    const arg: ?u32 = if (std.mem.eql(u8, builtin, "@Enum")) switch (cf.part) {
+                        .name => 2,
+                        .value => 3,
+                        else => null,
+                    } else if (std.mem.eql(u8, builtin, "@Struct") or std.mem.eql(u8, builtin, "@Union")) switch (cf.part) {
+                        .name => 2,
+                        .type => 3,
+                        .value => 4,
+                        .@"align" => if (builtin[1] == 'S') 4 else null,
+                    } else null;
+                    return tree.nodeToSpan(if (arg) |a| (if (a < args.len) args[a] else node) else node);
+                };
                 var i: u32 = 0;
                 for (decl.ast.members) |m| {
                     const field = tree.fullContainerField(m) orelse continue;
@@ -5410,7 +5428,7 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const dir = std.fs.path.dirname(file.sub_path) orelse "";
     const full = try std.fs.path.resolveAllocPosix(sema.arena, &.{ root, dir, name });
     if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
-        return sema.fail(block, src, "embed of file outside package path: '{s}'", .{name});
+        return sema.fail(block, sema.callArgSrc(src, false, 0), "embed of file outside package path: '{s}'", .{name});
     const sub_path = full[root.len + 1 ..];
     try sema.bcRefuse();
     const index = sema.zcu.embedFile(file.module, sub_path) catch |err| switch (err) {
@@ -18176,6 +18194,18 @@ fn analyzeCall(
 
     if (fn_ty.cc == .@"inline" or modifier == .always_inline) {
         try sema.emitBackwardBranch(block, src);
+        // As upstream: an inline call with no comptime-known argument
+        // inside another such call of the same function would inline
+        // forever.
+        if (for (args) |a| {
+            if (sema.resolveValue(a) != null) break false;
+        } else true) {
+            var it: ?*const Block.Inlining = block.inlining;
+            while (it) |p| : (it = p.parent) {
+                if (p.merges != null and p.func == func and std.mem.allEqual(Index, p.args, .none))
+                    return sema.fail(block, src, "inline call is recursive", .{});
+            }
+        }
         const n = sema.zcu.errors.items.len;
         return sema.inlineCall(block, src, func, args, first_arg != .none) catch |err| return sema.noteCallSite(block, src, n, err, .@"inline");
     }
@@ -18430,7 +18460,7 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref, h
     defer {
         merges.deinit(gpa);
     }
-    var inlining: Block.Inlining = .{ .func = func, .ret_ty = ret_ty, .args = comptime_args, .merges = &merges };
+    var inlining: Block.Inlining = .{ .func = func, .ret_ty = ret_ty, .args = comptime_args, .merges = &merges, .parent = caller.inlining };
     var child: Block = .{
         .parent = null,
         .sema = sema,
