@@ -1104,7 +1104,15 @@ fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
         .xmm => unreachable, // `locOf` gives memory
         .none => {},
         .reg => |r| try cg.storeReg(dst, r, size),
-        .mem => |src| try cg.copyMem(dst, src, size),
+        .mem => |src| {
+            // A call's result was just stored by the callee 8 bytes at a
+            // time, and a 16-byte load of two such stores cannot be
+            // forwarded from them: it waits for both to retire.
+            const tags = cg.ir.instructions.items(.tag);
+            const just_stored = if (ref.toIndex()) |i| tags[@backingInt(i)] == .call else false;
+            if (just_stored and size <= copy_inline_max) return cg.copyTail(dst, src, size);
+            try cg.copyMem(dst, src, size);
+        },
         .imm => |v| if (cg.passInRegs(ty)) {
             try cg.e.mov(.qword, .{ .reg = .rax }, .{ .imm = @bitCast(v) });
             try cg.storeReg(dst, .rax, size);
