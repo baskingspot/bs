@@ -51,6 +51,11 @@ load_std: bool,
 /// whose `=std@fuzzer` and `=builtin@fuzzer` follow it. Their names hold
 /// an '=', which no `-M` name can, so no other module's keys are theirs.
 fuzzer_root: ?Module.Index = null,
+/// With `Options.c_runtimes`: the module of `<lib>/ubsan_rt.zig`, whose
+/// `__ubsan_handle_*` exports `zig cc`'s Debug objects call. It shares
+/// the main std and builtin. compiler_rt's `ssp_sub_path` is a root then
+/// too, for `__stack_chk_fail` and `__stack_chk_guard`.
+ubsan_rt: ?Module.Index = null,
 /// What `loadAll` and `loadFile` did, for `ZAP_FRONTEND_TIMING`.
 stats: Stats = .{},
 /// AstGen errors in files `loadFile` loaded, for the caller to report
@@ -174,6 +179,10 @@ pub const Options = struct {
     /// the compilation as a module family of its own (docs/architecture.md,
     /// "Fuzzing").
     fuzzer_builtin_dir: ?[]const u8 = null,
+    /// The executable links C objects: their runtimes join the
+    /// compilation for their exports, as upstream links them for C code
+    /// (`c_runtimes`).
+    c_runtimes: bool = false,
 };
 
 pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
@@ -260,8 +269,15 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         }
         fe.fuzzer_root = root;
     }
+    if (options.c_runtimes) {
+        fe.ubsan_rt = @fromBackingInt(@intCast(fe.modules.items.len));
+        try fe.modules.append(gpa, .{ .name = "=ubsan_rt", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "ubsan_rt.zig"), .cache = .global });
+    }
     return fe;
 }
+
+/// compiler_rt's stack protector, a root with `ubsan_rt` (`c_runtimes`).
+pub const ssp_sub_path = "compiler_rt/ssp.zig";
 
 fn addModule(fe: *Frontend, name: []const u8, root_src_path: []const u8, cache: CacheKind) !void {
     try fe.modules.append(fe.gpa, .{
@@ -1067,7 +1083,7 @@ fn freeImports(gpa: Allocator, imports: []const Import) void {
 /// through `@import`. Returns false and adds messages to `errors` if any file
 /// failed to lower. Call once.
 pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
-    var roots: [5]Root = undefined;
+    var roots: [7]Root = undefined;
     var n: usize = 0;
     roots[n] = .{ .module = .root, .sub_path = fe.module(.root).root_file };
     n += 1;
@@ -1089,7 +1105,12 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
         roots[n + 1] = .{ .module = fe.module(r).std_mod, .sub_path = fe.module(fe.module(r).std_mod).root_file };
         n += 2;
     }
-    var indices: [5]?File.Index = undefined;
+    if (fe.ubsan_rt) |u| {
+        roots[n] = .{ .module = u, .sub_path = fe.module(u).root_file };
+        roots[n + 1] = .{ .module = .compiler_rt, .sub_path = ssp_sub_path };
+        n += 2;
+    }
+    var indices: [7]?File.Index = undefined;
     return fe.load(roots[0..n], indices[0..n], errors);
 }
 

@@ -461,6 +461,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .modules = opts.modules,
         .fuzz = opts.root_fuzz,
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
+        .c_runtimes = opts.link_inputs.len != 0,
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);

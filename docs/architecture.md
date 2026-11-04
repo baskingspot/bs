@@ -2605,11 +2605,20 @@ differs from the design above:
   through a content-addressed stub atom, `jmp [rip + slot]`, whose slot
   is the content-addressed 8-byte atom GOT references use, with an
   `x86_64_abs64` that the executable's link turns into R_X86_64_64.
-- Not yet: init and fini arrays (an error names the section),
-  ubsan_rt and compiler_rt's stack protector for `zig cc`'s Debug
-  objects (until then the tests compile with `-fno-sanitize=undefined
-  -fno-stack-protector`), the symbol side list for .symtab, `-l`/`-L`,
-  and a COMDAT test.
+- The C runtimes: with inputs, `<lib>/ubsan_rt.zig` (a module of its
+  own, `Frontend.ubsan_rt`, sharing the main std and builtin) and
+  compiler_rt's `ssp.zig` become roots for their exports
+  (`Zcu.rootFiles`; compiler_rt's other export blocks stay unanalyzed),
+  as upstream links ubsan_rt and compiler_rt for C. `zig cc`'s Debug
+  objects call `__ubsan_handle_*` and `__stack_chk_fail`, which then
+  resolve as Zig exports, before compiler_rt and glibc, as upstream's
+  order has them. One difference: upstream builds compiler_rt with the
+  trapping panic, so its `__stack_chk_fail` stops on an illegal
+  instruction, where zap's, analyzed in the program, panics with
+  "stack smashing detected".
+- Not yet: init and fini arrays (an error names the section), the
+  symbol side list for .symtab, `-l`/`-L`, copy relocations, and a COMDAT
+  test.
 
 **Stages and checks.**
 1. A: objects and archives into zap's static and `-lc` executables (the

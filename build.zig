@@ -785,12 +785,11 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     const expect = "44 108 12 gamma hello from C 0 4 9 copied\nthread 712\n712 4 23\n";
     const zig = upstreamZig(b);
     const cc = b.findProgram(.{ .names = &.{"cc"} });
-    // Without ubsan and the stack protector, whose runtimes zap does not
-    // link yet.
+    // `zig cc`'s Debug objects call ubsan_rt and the stack protector.
     const variants = [_]struct { name: []const u8, cc: []const []const u8 }{
-        .{ .name = "zig cc", .cc = &.{ zig, "cc", "-fno-sanitize=undefined", "-fno-stack-protector" } },
-        .{ .name = "zig cc -fPIC", .cc = &.{ zig, "cc", "-fno-sanitize=undefined", "-fno-stack-protector", "-fPIC" } },
-        .{ .name = "cc", .cc = &.{ cc orelse "", "-fno-stack-protector" } },
+        .{ .name = "zig cc", .cc = &.{ zig, "cc" } },
+        .{ .name = "zig cc -fPIC", .cc = &.{ zig, "cc", "-fPIC" } },
+        .{ .name = "cc", .cc = &.{cc orelse ""} },
     };
     for (variants) |v| {
         if (v.cc[0].len == 0) continue;
@@ -831,7 +830,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // A C object calling glibc, in a -lc executable: its calls go through
     // stubs, its GOT loads through the imports' slots. Upstream compiles
     // C as -fPIC under -lc.
-    const c = b.addSystemCommand(&.{ zig, "cc", "-fno-sanitize=undefined", "-fno-stack-protector", "-fPIC", "-c" });
+    const c = b.addSystemCommand(&.{ zig, "cc", "-fPIC", "-c" });
     c.addFileArg(b.path("test/link_input/libc.c"));
     const libc_o = c.addPrefixedOutputFileArg("-o", "libc.o");
     const exe = b.addRunArtifact(zap);
@@ -846,6 +845,26 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&run.step);
+
+    // Undefined behavior and a smashed stack in C reach ubsan_rt's and the
+    // stack protector's panics.
+    const ub = b.addSystemCommand(&.{ zig, "cc", "-fstack-protector-all", "-fno-sanitize=bounds", "-c" });
+    ub.addFileArg(b.path("test/link_input/ub.c"));
+    const ub_o = ub.addPrefixedOutputFileArg("-o", "ub.o");
+    const ub_exe = b.addRunArtifact(zap);
+    ub_exe.addArg("build-exe");
+    ub_exe.addFileArg(b.path("test/link_input/ub_main.zig"));
+    ub_exe.addFileArg(ub_o);
+    ub_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+    const ub_bin = ub_exe.addPrefixedOutputFileArg("-femit-bin=", "main");
+    for ([_][2][]const u8{ .{ "o", "panic: signed integer overflow: 5 + 2147483647 cannot be represented in type 'int'\n" }, .{ "s", "panic: stack smashing detected\n" } }) |case| {
+        const r = std.Build.Step.Run.create(b, b.fmt("run zap link of a C object ({s})", .{case[0]}));
+        r.addFileArg(ub_bin);
+        r.addArg(case[0]);
+        r.addCheck(.{ .expect_stderr_match = case[1] });
+        r.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
+        test_step.dependOn(&r.step);
+    }
 }
 
 fn upstreamZig(b: *std.Build) []const u8 {

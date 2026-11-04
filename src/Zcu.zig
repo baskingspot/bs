@@ -536,8 +536,13 @@ pub fn fileFqn(zcu: *Zcu, index: u32) ![]const u8 {
 
 /// The root file of module `mod`, if anything loaded it.
 pub fn moduleRootFile(zcu: *Zcu, mod: @import("Frontend.zig").Module.Index) ?u32 {
+    return zcu.moduleFile(mod, zcu.fe.module(mod).root_file);
+}
+
+/// The loaded file `sub_path` of module `mod`, if any.
+pub fn moduleFile(zcu: *Zcu, mod: @import("Frontend.zig").Module.Index, sub_path: []const u8) ?u32 {
     var buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "{d}:{s}", .{ @backingInt(mod), zcu.fe.module(mod).root_file }) catch return null;
+    const key = std.fmt.bufPrint(&buf, "{d}:{s}", .{ @backingInt(mod), sub_path }) catch return null;
     const index = zcu.fe.file_map.get(key) orelse return null;
     return @backingInt(index);
 }
@@ -750,11 +755,15 @@ pub fn createContainerType(
     const effects = zcu.comptime_decls.count() + zcu.exports.items.len + zcu.test_functions.items.len;
     var comptime_ordinal: u32 = 0;
     var unnamed_tests: u32 = 0;
+    // compiler_rt's export blocks are not analyzed, except the stack
+    // protector's when it is a root (`Frontend.ubsan_rt`).
+    const f = zcu.file(file_index);
+    const skip_comptime = f.module == .compiler_rt and !(zcu.fe.ubsan_rt != null and std.mem.eql(u8, f.sub_path, @import("Frontend.zig").ssp_sub_path));
     for (decls) |decl_inst| {
         const d = zir.getDeclaration(decl_inst);
         const simple: []const u8 = switch (d.kind) {
             .@"comptime" => {
-                if (zcu.file(file_index).module == .compiler_rt) continue;
+                if (skip_comptime) continue;
                 try zcu.comptime_decls.put(zcu.gpa, .{ .file = file_index, .inst = decl_inst, .namespace = ns_index, .ordinal = comptime_ordinal }, .queued);
                 comptime_ordinal += 1;
                 continue;
@@ -1302,16 +1311,20 @@ pub fn compilerRtExport(name: []const u8) ?RtExport {
 }
 
 /// The files analysis starts from: builtin, std (whose start code imports
-/// the root module), under `zap test` the module under test, and with
-/// `-ffuzz` the fuzzer's root (for its exports) and its std.
-pub fn rootFiles(zcu: *Zcu) [5]?u32 {
+/// the root module), under `zap test` the module under test, with
+/// `-ffuzz` the fuzzer's root (for its exports) and its std, and with C
+/// objects ubsan_rt and compiler_rt's stack protector (for theirs).
+pub fn rootFiles(zcu: *Zcu) [7]?u32 {
     const fuzzer = zcu.fe.fuzzer_root;
+    const ubsan_rt = zcu.fe.ubsan_rt;
     return .{
         0,
         zcu.moduleRootFile(.std),
         zcu.moduleRootFile(zcu.fe.main_module),
         if (fuzzer) |r| zcu.moduleRootFile(r) else null,
         if (fuzzer) |r| zcu.moduleRootFile(zcu.fe.module(r).std_mod) else null,
+        if (ubsan_rt) |r| zcu.moduleRootFile(r) else null,
+        if (ubsan_rt != null) zcu.moduleFile(.compiler_rt, @import("Frontend.zig").ssp_sub_path) else null,
     };
 }
 
