@@ -10,7 +10,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         // As ghostty's: zap accepts it and says so in builtin.unwind_tables.
         .unwind_tables = .sync,
-        .imports = &.{.{ .name = "greet", .module = b.createModule(.{ .root_source_file = b.path("src/greet.zig") }) }},
+        .imports = &.{.{ .name = "greet", .module = b.createModule(.{
+            .root_source_file = b.path("src/greet.zig"),
+            // `zig build --fuzz` instruments the tests but not this module.
+            .fuzz = false,
+        }) }},
     });
     // A Debug step that asks for LLVM and PIE: zap builds it with its
     // own backend, static and non-PIE.

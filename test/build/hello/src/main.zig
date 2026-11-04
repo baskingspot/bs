@@ -28,6 +28,7 @@ test "fuzz" {
         fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
             var buf: [8]u8 = undefined;
             const n = smith.slice(&buf);
+            _ = greet.pick(n);
             if (n >= 3 and buf[0] == 'z' and buf[1] == 'a' and buf[2] == 'p') @panic("planted crash");
         }
     }.testOne, .{});

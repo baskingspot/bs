@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
     addRunTests(b, exe, test_step, upstream_step);
     addObjAndRunTests(b, exe, test_step);
     addDiagTests(b, exe, test_step, upstream_step);
-    addBuildTest(b, exe);
+    addBuildTest(b, exe, build_web_wasm);
 
     // Always ReleaseFast: a Debug build of zap says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
@@ -642,7 +642,7 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
 /// `zap build` end to end: test/build/check.sh builds test/build/hello
 /// with zap as the build runner's compiler, in the default global cache,
 /// where zap keeps the build runner it compiles once per zap binary.
-fn addBuildTest(b: *std.Build, zap: *std.Build.Step.Compile) void {
+fn addBuildTest(b: *std.Build, zap: *std.Build.Step.Compile, build_web_wasm: std.Build.LazyPath) void {
     const host = b.graph.host.result;
     const step = b.step("test-build", "Check `zap build` end to end on test/build/hello");
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
@@ -652,6 +652,7 @@ fn addBuildTest(b: *std.Build, zap: *std.Build.Step.Compile) void {
     run.addArtifactArg(zap);
     run.addDirectoryArg(b.path("test/build/hello"));
     _ = run.addOutputDirectoryArg("work");
+    run.addFileArg(build_web_wasm);
     run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     step.dependOn(&run.step);
 }

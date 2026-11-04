@@ -2,11 +2,12 @@
 # `zig build test-build`: builds test/build/hello with `zap build` from a
 # copy in a scratch directory and checks what the build runner reports.
 #   $1 zap  $2 test/build/hello  $3 scratch directory
+#   $4 the build web client zap embeds (build-web.wasm)
 set -eu
 unset ZIG_LOCAL_CACHE_DIR ZIG_LIB_DIR
 rm -rf "$3"
 mkdir -p "$3"
-zap=$(realpath "$1") src=$(realpath "$2") work=$(realpath "$3")
+zap=$(realpath "$1") src=$(realpath "$2") work=$(realpath "$3") wasm=$(realpath "$4")
 cp -r "$src" "$work/hello"
 cd "$work/hello"
 
@@ -39,6 +40,34 @@ expect "run test 4 pass (4 total)"
 "$zap" build test --fuzz=5M >"$work/log" 2>&1 || true
 expect "panic: planted crash"
 expect "input saved to '.zig-cache/f/crash'"
+# Per-module -fno-fuzz: the runner passes greet's `.fuzz = false`, so the
+# fuzz test's own branches store to coverage counters and greet.pick's
+# do not.
+bin=$(sed -n "s|^failed command: \(\./\.zig-cache/o/[0-9a-f]*/test\) .*|\1|p" "$work/log")
+[ -n "$bin" ] || fail "the log names the fuzz test binary"
+stores() {
+    objdump -d --no-show-raw-insn "$bin" | awk -v f="^<$1>:\$" '$2 ~ f { on = 1; next } /^$/ { on = 0 } on' |
+        grep -c 'movb   \$0x1,.*(%rip)' || true
+}
+[ "$(stores 'main\\.test\\.fuzz.*\\.testOne')" -gt 0 ] || fail "the fuzz test's branches store to coverage counters"
+[ "$(stores 'greet\\.pick')" -eq 0 ] || fail "greet.pick (-fno-fuzz) stores to no coverage counter"
+
+# Unlimited fuzzing serves the web UI; its client is the wasm zap embeds,
+# built with upstream zig ($4).
+setsid "$zap" build test --fuzz --webui=127.0.0.1:0 >"$work/web" 2>&1 &
+web=$!
+trap 'kill -- -$web 2>/dev/null || true' EXIT
+port=
+for _ in $(seq 300); do
+    port=$(sed -n 's|.*web interface listening at http://127\.0\.0\.1:\([0-9]*\)/.*|\1|p' "$work/web")
+    [ -n "$port" ] && break
+    sleep 0.2
+done
+[ -n "$port" ] || { cp "$work/web" "$work/log"; fail "the web UI listens"; }
+curl -sf -o "$work/main.wasm" "http://127.0.0.1:$port/main.wasm" || fail "GET /main.wasm"
+[ "$(sha256sum <"$work/main.wasm")" = "$(sha256sum <"$wasm")" ] || fail "the served main.wasm is zap's embedded client"
+kill -- -$web
+trap - EXIT
 
 # Docs: upstream's viewer, its page, and the modules' sources.
 "$zap" build docs >"$work/log" 2>&1 || fail "zap build docs"
