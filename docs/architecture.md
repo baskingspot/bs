@@ -5473,12 +5473,14 @@ state. Built for step 1:
   translate-c` translates headers (see "C interop"). zap never hands a step to upstream zig.
 - **`zap build`** (`src/BuildRunner.zig`) does what upstream's `zig build`
   does, with zap as the compiler. It compiles upstream's build runner,
-  `<zig lib>/compiler/Maker.zig`, with zap (Debug) into
-  `<global cache>/zap/o/<hash>/maker`, the hash taken from zap's identity
-  (`Incremental.compilationKey`'s store seed) and the zig lib directory. A
-  generated root module re-exports the runner's `main` and `std_options`
-  with upstream's ReleaseSafe log level (`.info`; Debug's default would
-  print the runner's debug logs). The compile runs from that directory so
+  `<zig lib>/compiler/Maker.zig`, with zap in ReleaseSafe as upstream
+  does, into `<global cache>/zap/o/<hash>/maker`, the hash taken from
+  zap's identity (`Incremental.compilationKey`'s store seed), the zig lib
+  directory and the mode. ReleaseSafe is zap's one code generation, but
+  std takes its ReleaseSafe paths: the runner's `SafeAllocator` captures
+  no stack trace per allocation (in Debug, DWARF unwinding on every
+  allocation was the largest item of a no-change build's runner time),
+  no error return traces, and upstream's `.info` log level. The compile runs from that directory so
   its key, which includes the working directory, is the same for every
   project, and a build that changed nothing reuses it without relinking.
   zap then replaces itself with `maker build --zig-lib=<lib> --zig=<zap>
