@@ -1039,12 +1039,29 @@ pub fn inPair(cg: *CodeGen, ty: Index) bool {
     };
 }
 
+/// Whether every value of integer type `src`, extended to 64 bits by its
+/// signedness, is the same register contents as type `dst`'s.
+fn intFits(src: Type.IntInfo, dst: Type.IntInfo) bool {
+    if (src.signedness == dst.signedness) return src.bits <= dst.bits;
+    return src.signedness == .unsigned and src.bits < dst.bits;
+}
+
 /// Truncates the 64-bit value in `reg` to integer type `ty` and extends it
 /// back, so it is normalized.
 fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
     if (!Type.isInt(cg.ip, ty)) return; // bools stay 0 or 1
     const info = Type.intInfo(cg.ip, ty);
     if (info.bits >= 64) return;
+    switch (info.bits) {
+        8, 16, 32 => |b| {
+            const size = sizeOf(b / 8);
+            return if (info.signedness == .signed)
+                cg.e.movsx(.qword, reg, size, .{ .reg = reg })
+            else
+                cg.e.movzx(if (b == 32) .qword else .dword, reg, size, .{ .reg = reg });
+        },
+        else => {},
+    }
     const shift: u8 = @intCast(64 - info.bits);
     try cg.e.shift(.shl, .qword, .{ .reg = reg }, shift);
     try cg.e.shift(if (info.signedness == .signed) .sar else .shr, .qword, .{ .reg = reg }, shift);
@@ -1077,6 +1094,17 @@ fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
 /// uses as scratch except the clobbering ones (`clobbers`).
 const alloc_regs = [_]Reg{ .rbx, .r12, .r13, .r14, .r15, .rsi, .rdi, .r8, .r9 };
 const callee_saved: u32 = 0b11111;
+
+/// A `Live.hint` for the value a `ret` returns that is computed in rax
+/// (`planRegisters`), outside `alloc_regs`.
+const hint_rax: u8 = 0xfd;
+
+/// `r`'s index in `alloc_regs`, or `Ssa.no_reg`.
+fn allocIndex(r: Reg) u8 {
+    const i = std.mem.indexOfScalar(Reg, &alloc_regs, r) orelse return Ssa.no_reg;
+    return @intCast(i);
+}
+
 /// The XMM registers the allocator hands out, after `alloc_regs`. Float
 /// lowerings use xmm0 and xmm1 as scratch, and calls pass arguments in
 /// xmm0-xmm7. All are caller-saved, so they hold only values whose
@@ -1187,6 +1215,49 @@ fn planRegisters(cg: *CodeGen) Error!void {
         return;
     }
     try cg.planDeferred();
+    @memset(live.items(.hint), .{ Ssa.no_reg, Ssa.no_reg });
+    if (cg.fn_ty.cc == .auto) {
+        // Arguments prefer the registers they arrive in, which saves
+        // their moves at the entry.
+        const tags = ir.instructions.items(.tag);
+        var n: usize = 0;
+        for (ir.mainBody()) |inst| {
+            if (tags[@backingInt(inst)] != .arg) break;
+            n += 1;
+        }
+        const args = ir.mainBody()[0..n];
+        const tys, const locs = try cg.argScratch(n);
+        for (args, tys) |inst, *ty| ty.* = ir.instructions.items(.data)[@backingInt(inst)].arg.ty;
+        _ = cg.autoArgs(cg.fn_ty.return_type, tys, locs);
+        const hint = live.items(.hint);
+        for (args, locs) |inst, l| switch (l) {
+            .gpr => |r| hint[@backingInt(inst)][0] = allocIndex(c_arg_regs[r]),
+            .gpr_pair => |r| hint[@backingInt(inst)] = .{ allocIndex(c_arg_regs[r]), allocIndex(c_arg_regs[r + 1]) },
+            else => {},
+        };
+    }
+    if (cg.fn_ty.cc == .auto and cg.autoClass(cg.fn_ty.return_type) == .gpr and cg.passInRegs(cg.fn_ty.return_type)) {
+        // A value only its block's `ret` reads, computed last, is
+        // computed in rax, where it is returned.
+        const tags = ir.instructions.items(.tag);
+        const hint = live.items(.hint);
+        for (f.layout.items) |block| {
+            const b = f.blocks.items[@backingInt(block)];
+            if (b.term.tag != .ret) continue;
+            const w = ir.instructions.items(.data)[@backingInt(b.term.inst)].un_op.toIndex() orelse continue;
+            const last = for (0..b.len) |k| {
+                const v = f.blockInsts(block)[b.len - 1 - k];
+                switch (tags[@backingInt(v)]) {
+                    .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+                    else => break v,
+                }
+            } else continue;
+            const wi = @backingInt(w);
+            if (last != w or reg[wi] != Ssa.want_reg or fate[wi] != .normal or live.items(.uses)[wi] != 1) continue;
+            reg[wi] = Ssa.no_reg;
+            hint[wi][0] = hint_rax;
+        }
+    }
     cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved) & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
@@ -1194,7 +1265,10 @@ fn planRegisters(cg: *CodeGen) Error!void {
         switch (fate[i]) {
             .normal => {
                 const r = reg[i];
-                if (r == Ssa.no_reg) continue;
+                if (r == Ssa.no_reg) {
+                    if (live.items(.hint)[i][0] == hint_rax) cg.homes[i] = .{ .reg = .rax };
+                    continue;
+                }
                 cg.homes[i] = if (r >= alloc_regs.len) .{ .xmm = float_regs[r - alloc_regs.len] } else if (reg2[i] != Ssa.no_reg) .{ .regs = .{ .lo = alloc_regs[r], .hi = alloc_regs[reg2[i]] } } else .{ .reg = alloc_regs[r] };
             },
             .dead => cg.homes[i] = .dead,
@@ -2243,6 +2317,20 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = cg.typeOf(data.bin_op.lhs);
             if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
+            // `x + 0`, `x * 1`, `x / 1` and the like are `x` (slicing from
+            // 0, `sliceAsBytes` of bytes).
+            if (Type.isInt(ip, ty)) if (data.bin_op.rhs.toInterned()) |v| if (ip.keyTag(v) == .int) if (ip.intValue(u64, v)) |c| {
+                const identity: ?u64 = switch (tag) {
+                    .add_wrap, .sub_wrap, .bit_or, .xor, .shl, .shr => 0,
+                    .mul_wrap, .div_trunc, .div_floor, .div_ceil => 1,
+                    else => null,
+                };
+                if (c == identity) {
+                    const d = cg.destReg(inst);
+                    try cg.load(d, data.bin_op.lhs);
+                    return cg.setResult(inst, ty, d);
+                }
+            };
             switch (tag) {
                 .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr => {
                     const d = cg.destReg(inst);
@@ -2398,8 +2486,31 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(cg.typeOf(data.ty_op.operand))) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
             if (cg.passInRegs(ty) and cg.passInRegs(cg.typeOf(data.ty_op.operand))) {
                 const d = cg.destReg(inst);
-                try cg.load(d, data.ty_op.operand);
-                if (Type.isInt(ip, ty)) try cg.normalize(d, ty);
+                const src_ty = cg.typeOf(data.ty_op.operand);
+                if (!Type.isInt(ip, ty) or (Type.isInt(ip, src_ty) and intFits(Type.intInfo(ip, src_ty), Type.intInfo(ip, ty)))) {
+                    try cg.load(d, data.ty_op.operand);
+                } else {
+                    const info = Type.intInfo(ip, ty);
+                    const src = try cg.locOf(data.ty_op.operand);
+                    if (src == .imm and info.bits < 64) {
+                        // Truncated and extended here.
+                        const sh: u6 = @intCast(64 - info.bits);
+                        const v: u64 = if (info.signedness == .signed)
+                            @bitCast(@as(i64, @bitCast(src.imm << sh)) >> sh)
+                        else
+                            src.imm << sh >> sh;
+                        try cg.e.mov(.qword, .{ .reg = d }, .{ .imm = @bitCast(v) });
+                    } else if (src == .reg and (info.bits == 8 or info.bits == 16 or info.bits == 32)) {
+                        // Extend straight from the operand's register.
+                        if (info.signedness == .signed)
+                            try cg.e.movsx(.qword, d, sizeOf(info.bits / 8), .{ .reg = src.reg })
+                        else
+                            try cg.e.movzx(if (info.bits == 32) .qword else .dword, d, sizeOf(info.bits / 8), .{ .reg = src.reg });
+                    } else {
+                        try cg.load(d, data.ty_op.operand);
+                        try cg.normalize(d, ty);
+                    }
+                }
                 return cg.setResult(inst, ty, d);
             }
             const dst = try cg.resultMem(inst, ty) orelse return;
@@ -2544,16 +2655,25 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .slice => {
             const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
             if (cg.pairOf(inst.toRef())) |d| {
-                // The length first: the pointer may be in `d.hi`.
+                // Each half straight to its register unless the other half
+                // is in it.
+                const lhs = try cg.locOf(bin.lhs);
+                const rhs = try cg.locOf(bin.rhs);
+                if (!(rhs == .reg and rhs.reg == d.lo)) {
+                    try cg.load(d.lo, bin.lhs);
+                    return cg.load(d.hi, bin.rhs);
+                }
+                if (!(lhs == .reg and lhs.reg == d.hi)) {
+                    try cg.load(d.hi, bin.rhs);
+                    return cg.load(d.lo, bin.lhs);
+                }
                 try cg.load(.rax, bin.lhs);
                 try cg.load(d.hi, bin.rhs);
                 return cg.e.mov(.qword, .{ .reg = d.lo }, .{ .reg = .rax });
             }
             const dst = try cg.resultMem(inst, data.ty_pl.ty) orelse return;
-            try cg.load(.rax, bin.lhs);
-            try cg.storeReg(dst, .rax, 8);
-            try cg.load(.rax, bin.rhs);
-            try cg.storeReg(offsetMem(dst, 8), .rax, 8);
+            try cg.storeVal(dst, bin.lhs, 8);
+            try cg.storeVal(offsetMem(dst, 8), bin.rhs, 8);
         },
 
         .is_null, .is_non_null, .is_err, .is_non_err => try cg.genCond(inst),
@@ -3061,8 +3181,8 @@ fn binOp(cg: *CodeGen, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void 
     try cg.load(.rax, lhs);
     if (!s) if (rhs.toInterned()) |v| switch (tag) {
         .div_trunc, .div_floor, .div_ceil, .rem, .mod => if (intBits(cg.ip, v) != 0) {
-            try cg.divConst(tag, intBits(cg.ip, v), Type.intInfo(cg.ip, ty).bits);
-            return cg.normalize(.rax, ty);
+            // The result is at most the dividend: it stays normalized.
+            return cg.divConst(tag, intBits(cg.ip, v), Type.intInfo(cg.ip, ty).bits);
         },
         else => {},
     };
@@ -3197,6 +3317,7 @@ fn divConst(cg: *CodeGen, tag: Inst.Tag, d: u64, bits: u16) Error!void {
                 try e.imul(.qword, .rdx, .{ .reg = .rax }, null);
             }
             try e.alu(.sub, .qword, .{ .reg = .rcx }, .{ .reg = .rdx });
+            if (tag != .div_ceil) return e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
             try e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rcx });
         }
     }
@@ -3231,7 +3352,10 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     const dst = if (pair) undefined else try cg.resultMem(inst, tuple_ty) orelse return;
     const fields = if (pair) cg.ssa.pairs.get(@backingInt(inst)).? else .{ Ssa.no_tie, Ssa.no_tie };
     const in_flags = fields[1] != Ssa.no_tie and cg.homes[fields[1]] == .fused;
-    if (try cg.overflowArith(tag, bin, ty)) |cc| {
+    // The value's field computed in its own register, when it has one.
+    const d: Reg = if (pair and fields[0] != Ssa.no_tie and cg.homes[fields[0]] == .reg) cg.homes[fields[0]].reg else .rax;
+    const res, const cond = try cg.overflowArith(tag, bin, ty, d);
+    if (cond) |cc| {
         if (in_flags) {
             cg.ovf_cc = cc;
         } else {
@@ -3241,7 +3365,7 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     } else assert(!in_flags);
     // Only moves from here on, which keep the flags.
     if (pair) {
-        if (fields[0] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[0]), ty, .rax);
+        if (fields[0] != Ssa.no_tie) try cg.setResult(@fromBackingInt(fields[0]), ty, res);
         if (fields[1] != Ssa.no_tie and !in_flags) try cg.setResult(@fromBackingInt(fields[1]), .u1_type, .r11);
         return;
     }
@@ -3250,13 +3374,15 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     try cg.storeReg(offsetMem(dst, Type.fieldOffset(ip, tuple_ty, 1)), .r11, 1);
 }
 
-/// Computes an overflow operation's result into rax, normalized, and
-/// returns the condition under which it overflowed, or null if it set
-/// the bit in r11 instead (a multiplication of 33 to 63 bits, which needs
+/// Computes an overflow operation's result, normalized, into `d` (if it
+/// is an addition or subtraction at a native width and `d` does not hold
+/// the right operand) or rax, and returns that register and the
+/// condition under which it overflowed, or null if it set the bit in r11
+/// instead (a multiplication of 33 to 63 bits, which needs
 /// both the flag and a truncation check; `ovfFlagsOnly`). Native widths
 /// read the flag of an operation at that width; others check whether
 /// truncating the 64-bit result changes it.
-fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index) Error!?Encoder.Cond {
+fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index, d: Reg) Error!struct { Reg, ?Encoder.Cond } {
     const info = Type.intInfo(cg.ip, ty);
     const s = info.signedness == .signed;
     const native: ?Size = switch (info.bits) {
@@ -3266,6 +3392,7 @@ fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index) Error!?Enc
         64 => .qword,
         else => null,
     };
+    var r: Reg = if (tag == .mul_with_overflow) .rax else d;
     if (native) |size| if (tag != .mul_with_overflow or size != .byte) {
         if (tag == .mul_with_overflow) {
             const rhs = try cg.regOf(bin.rhs, .rcx);
@@ -3278,17 +3405,18 @@ fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index) Error!?Enc
         } else {
             // A memory operand is 8 bytes, so only at 64 bits.
             const rhs = try cg.srcOperand(bin.rhs, .rcx);
-            try cg.load(.rax, bin.lhs);
-            try cg.e.alu(if (tag == .add_with_overflow) .add else .sub, size, .{ .reg = .rax }, rhs);
+            if (rhs == .reg and rhs.reg == r) r = .rax;
+            try cg.load(r, bin.lhs);
+            try cg.e.alu(if (tag == .add_with_overflow) .add else .sub, size, .{ .reg = r }, rhs);
         }
         // Extend without touching the flags; a 32-bit operation
         // zero-extends already.
         switch (size) {
-            .byte, .word => if (s) try cg.e.movsx(.qword, .rax, size, .{ .reg = .rax }) else try cg.e.movzx(.qword, .rax, size, .{ .reg = .rax }),
-            .dword => if (s) try cg.e.movsx(.qword, .rax, .dword, .{ .reg = .rax }),
+            .byte, .word => if (s) try cg.e.movsx(.qword, r, size, .{ .reg = r }) else try cg.e.movzx(.qword, r, size, .{ .reg = r }),
+            .dword => if (s) try cg.e.movsx(.qword, r, .dword, .{ .reg = r }),
             .qword => {},
         }
-        return if (s or tag == .mul_with_overflow) .o else .b;
+        return .{ r, if (s or tag == .mul_with_overflow) .o else .b };
     };
     // A 64-bit operation, which overflowed if truncating it to `bits`
     // changes it.
@@ -3318,10 +3446,10 @@ fn overflowArith(cg: *CodeGen, tag: Inst.Tag, bin: Ir.Bin, ty: Index) Error!?Enc
     try cg.e.mov(.qword, .{ .reg = .rdx }, .{ .reg = .rax });
     try cg.normalize(.rax, ty);
     try cg.e.alu(.cmp, .qword, .{ .reg = .rax }, .{ .reg = .rdx });
-    if (!flag_too) return .ne;
+    if (!flag_too) return .{ .rax, .ne };
     try cg.e.setcc(.ne, .{ .reg = .rdx });
     try cg.e.alu(.@"or", .byte, .{ .reg = .r11 }, .{ .reg = .rdx });
-    return null;
+    return .{ .rax, null };
 }
 
 /// Whether an overflow operation on integers of `bits` bits reports its

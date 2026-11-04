@@ -104,6 +104,11 @@ pub const Live = struct {
     /// the register of its high eightbyte (`reg` holds the low one); else
     /// `no_reg`.
     reg2: u8,
+    /// Set by the architecture before `allocate`: the registers (low and
+    /// high eightbyte) the value is best computed in, such as an
+    /// argument's, taken when free; else `no_reg`. `allocate` sets
+    /// `hint_saved` on its own.
+    hint: [2]u8,
     /// How the value is computed, from `plan`.
     fate: Fate,
     /// From `plan`, for a load of a promoted variable: the variable (an IR
@@ -135,6 +140,9 @@ pub const Fate = enum(u8) {
 pub const no_tie = std.math.maxInt(u32);
 
 pub const no_reg: u8 = 0xff;
+/// A `Live.hint` for a value whose tied user crosses a clobber point: it
+/// prefers a register in `survives`.
+pub const hint_saved: u8 = 0xfe;
 pub const want_reg: u8 = 0xfe;
 /// Like `want_reg`, for a value that needs two registers: a 9- to 16-byte
 /// value as its two eightbytes (`reg` the low, `reg2` the high one).
@@ -613,6 +621,67 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
         const v = datas[l].ty_op.operand.toIndex().?;
         if (reg[@backingInt(v)] == reg[l] and wants(reg[l])) share[l] = f.shareable(ir, @fromBackingInt(l), v);
     }
+    // A value whose only use stores it to a promoted variable may be
+    // computed in the variable's register (`Live.share`), so the store is
+    // no move. The store is in the value's block, or in an arm of its
+    // block's branch that follows past dead ends (the failing check of an
+    // overflowing `+=`). So may a value whose only use is its block's
+    // `br`, in the register of the block's result, which nothing reads
+    // before the block ends.
+    for (f.layout.items, 0..) |block, k| {
+        const b = f.blocks.items[@backingInt(block)];
+        if (b.term.tag == .jump and tags[@backingInt(b.term.inst)] == .br) br: {
+            const br = datas[@backingInt(b.term.inst)].br;
+            const v = @backingInt(br.block_inst);
+            const w = @backingInt(br.operand.toIndex() orelse break :br);
+            if (reg[v] != reg[w] or (reg[w] != want_reg and reg[w] != want_float)) break :br;
+            if (uses[w] != 1 or fate[w] != .normal or share[w] != no_tie or end[w] != valuePos(b.start + b.len) - 1) break :br;
+            if (tags[w] == .block or def[w] < valuePos(b.start)) break :br;
+            f.shareTies(ir, @fromBackingInt(w), @fromBackingInt(v), valuePos(b.start));
+        }
+        if (f.var_loads.items.len != 0) for (insts[b.start..][0..b.len], b.start..) |inst, idx| {
+            const i = @backingInt(inst);
+            if (tags[i] != .store) continue;
+            const bin = datas[i].bin_op;
+            const v = @backingInt(bin.lhs.toIndex() orelse continue);
+            const w = @backingInt(bin.rhs.toIndex() orelse continue);
+            if (tags[v] != .alloc or reg[v] != reg[w] or (reg[w] != want_reg and reg[w] != want_float)) continue;
+            if (uses[w] != 1 or fate[w] != .normal or share[w] != no_tie or end[w] != valuePos(idx) or def[w] <= def[v]) continue;
+            if (tags[w] == .block) continue;
+            var start = valuePos(b.start);
+            if (def[w] < start) {
+                // Every block between runs no further or only jumps here,
+                // and no terminator on the way reads the variable's
+                // register. The branch leaves for this block or for a dead
+                // end between.
+                var j = k;
+                const ok = while (j > 0 and k - j < 4) {
+                    j -= 1;
+                    const pi = f.layout.items[j];
+                    const pb = f.blocks.items[@backingInt(pi)];
+                    if (f.termReadsShared(ir, pb.term, @fromBackingInt(v))) break false;
+                    if (def[w] >= valuePos(pb.start)) {
+                        start = valuePos(pb.start);
+                        if (pb.term.tag != .branch) break false;
+                        var here = false;
+                        for (pb.term.succ) |succ| {
+                            const t = f.fwd.items[succ];
+                            if (t == block) {
+                                here = true;
+                            } else {
+                                const tb = f.blocks.items[@backingInt(t)];
+                                if (!deadEnd(tb.term.tag) or valuePos(tb.start) < def[w] or tb.start >= b.start) break;
+                            }
+                        } else break here;
+                        break false;
+                    }
+                    if (!deadEnd(pb.term.tag) and f.fwd.items[@backingInt(pi)] != block) break false;
+                } else false;
+                if (!ok) continue;
+            }
+            if (f.storeShares(ir, @fromBackingInt(w), @fromBackingInt(v), idx)) f.shareTies(ir, @fromBackingInt(w), @fromBackingInt(v), start);
+        };
+    }
     for (f.candidates.items) |c| fwd[c & ~(@as(u32, 3) << 30)] = no_tie;
 }
 
@@ -640,6 +709,102 @@ fn shareable(f: *const Func, ir: *const Ir, load: Inst.Index, v: Inst.Index) u32
     }
     return @backingInt(v);
 }
+
+/// Lets value `w` share `v`'s register (`Live.share`), and so the chain
+/// of tied operands that compute it from position `start` on, each read
+/// only by the next, while nothing between reads the register.
+fn shareTies(f: *Func, ir: *const Ir, w: Inst.Index, v: Inst.Index, start: u32) void {
+    const live = f.live.slice();
+    const share = live.items(.share);
+    const uses = live.items(.uses);
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const reg = live.items(.reg);
+    const tie = live.items(.tie);
+    const fate = live.items(.fate);
+    share[@backingInt(w)] = @backingInt(v);
+    var x = @backingInt(w);
+    while (true) {
+        const u = tie[x];
+        if (u == no_tie or uses[u] != 1 or end[u] != def[x] or def[u] < start or fate[u] != .normal) break;
+        if (reg[u] != reg[@backingInt(w)] or share[u] != no_tie or ir.instructions.items(.tag)[u] == .block) break;
+        if (!f.storeShares(ir, @fromBackingInt(u), v, (def[x] - 2) / 2)) break;
+        share[u] = @backingInt(v);
+        x = u;
+    }
+}
+
+/// Whether value `w`, stored to promoted variable `v` by the value at
+/// index `store` and by nothing else, may be computed in `v`'s register:
+/// nothing from `w`'s definition up to the store reads that register (a
+/// load of `v`, or a use of a load that shares it), except an operand that
+/// `w`'s lowering reads before writing its result (its tied operand, a
+/// call's arguments, an overflow operation's operands for its fields).
+/// The terminators on the way are the caller's.
+fn storeShares(f: *const Func, ir: *const Ir, w: Inst.Index, v: Inst.Index, store: usize) bool {
+    const live = f.live.slice();
+    const def = live.items(.def);
+    const fate = live.items(.fate);
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const first = (def[@backingInt(w)] - 2) / 2 + 1;
+    if (store > first + 64) return false;
+    const reads_all = switch (tags[@backingInt(w)]) {
+        .call => true,
+        .struct_field_val => blk: {
+            const op = ir.extraData(Ir.StructField, datas[@backingInt(w)].ty_pl.payload).data.operand.toIndex() orelse break :blk false;
+            break :blk fate[@backingInt(op)] == .pair;
+        },
+        else => false,
+    };
+    // With its tied operand in the register too, the lowering writes the
+    // register only after reading every operand.
+    const t = live.items(.tie)[@backingInt(w)];
+    if (!reads_all and (t == no_tie or live.items(.share)[t] != @backingInt(v))) {
+        var c: SharedReads = .{ .f = f, .ir = ir, .v = v, .tie = t };
+        forEachOperand(ir, w, &c);
+        if (c.other) return false;
+    }
+    for (f.values.items(.inst)[first..store]) |inst| {
+        const i = @backingInt(inst);
+        if (fate[i] == .dead) continue;
+        if (tags[i] == .load and datas[i].ty_op.operand == v.toRef()) return false;
+        var c: SharedReads = .{ .f = f, .ir = ir, .v = v, .tie = no_tie };
+        forEachOperand(ir, inst, &c);
+        if (c.other) return false;
+    }
+    return true;
+}
+
+/// Whether terminator `term` reads a load that shares promoted variable
+/// `v`'s register.
+fn termReadsShared(f: *const Func, ir: *const Ir, term: Term, v: Inst.Index) bool {
+    const data = ir.instructions.items(.data)[@backingInt(term.inst)];
+    var c: SharedReads = .{ .f = f, .ir = ir, .v = v, .tie = no_tie };
+    switch (term.tag) {
+        .jump => if (ir.instructions.items(.tag)[@backingInt(term.inst)] == .br) c.use(data.br.operand),
+        .branch, .switch_br => c.use(data.pl_op.operand),
+        .ret => c.use(data.un_op),
+        .fallthrough, .noreturn, .unreach => {},
+    }
+    return c.other;
+}
+
+/// For `forEachOperand`: finds operands that are loads sharing promoted
+/// variable `v`'s register, other than `tie`.
+const SharedReads = struct {
+    f: *const Func,
+    ir: *const Ir,
+    v: Inst.Index,
+    tie: u32,
+    other: bool = false,
+
+    fn use(c: *SharedReads, ref: Inst.Ref) void {
+        const l = @backingInt(ref.toIndex() orelse return);
+        if (c.f.live.items(.share)[l] != @backingInt(c.v)) return;
+        if (l != c.tie) c.other = true;
+    }
+};
 
 /// Whether value `inst` may go unemitted when nothing reads it: it reads
 /// no volatile memory, writes nothing but its own result, cannot trap, and
@@ -801,7 +966,8 @@ pub fn forEachOperand(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// registers or stays in memory, and is never evicted. Values stay in
 /// their registers through their last use, so a result shares a register
 /// only with its tied operand or, for a load of a promoted variable, with
-/// the variable (`Live.share`). Returns the mask of registers used.
+/// the variable (`Live.share`). A free register the value's `hint` names
+/// comes before the others. Returns the mask of registers used.
 pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32) u32 {
     const total = n + n_float;
     assert(total <= max_regs);
@@ -815,11 +981,31 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32) u32 {
     const tie = s.items(.tie);
     const crosses = s.items(.crosses);
     const share = s.items(.share);
+    const hint = s.items(.hint);
     var active: [max_regs]u32 = undefined;
     // Per register: the last end of the loads sharing it with its current
     // holder (`Live.share`), which may not be evicted before then. Loads
     // that share are not in `active`; their holder outlives them.
     var held: [max_regs]u32 = @splat(0);
+    // A value whose tied user crosses a clobber point prefers a register
+    // that survives it, which the user can then take over. The registers
+    // values not yet allocated are hinted to (arguments, all at the
+    // start) are `pending`, which the others avoid while they can.
+    var pending: u32 = 0;
+    {
+        const insts = f.values.items(.inst);
+        var k = insts.len;
+        while (k > 0) {
+            k -= 1;
+            const x = @backingInt(insts[k]);
+            if (!wants(reg[x])) continue;
+            pending |= regBit(hint[x][0]) | regBit(hint[x][1]);
+            if (!(crosses[x] or hint[x][0] == hint_saved)) continue;
+            const t = tie[x];
+            if (t == no_tie or end[t] != def[x] or crosses[t] or reg[t] != reg[x] or hint[t][0] != no_reg) continue;
+            hint[t][0] = hint_saved;
+        }
+    }
     var active_len: u8 = 0;
     var free: u32 = gprs | floats;
     var used: u32 = 0;
@@ -836,6 +1022,8 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32) u32 {
                 active[j] = active[active_len];
             } else j += 1;
         }
+        const h = hint[inst];
+        pending &= ~(regBit(h[0]) | regBit(h[1]));
         const usable: u32 = (if (reg[inst] == want_float) floats else gprs) & if (crosses[inst]) survives else ~@as(u32, 0);
         const v = share[inst];
         if (v != no_tie and reg[v] < total) {
@@ -851,9 +1039,11 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32) u32 {
                 reg[inst] = no_reg;
                 continue;
             }
-            const pick = if (@popCount(avail & ~survives) >= 2 and !crosses[inst]) avail & ~survives else avail;
-            const lo: u8 = @intCast(@ctz(pick));
-            const hi: u8 = @intCast(@ctz(pick & ~(@as(u32, 1) << @intCast(lo))));
+            const cheap = if (@popCount(avail & ~survives) >= 2 and !crosses[inst]) avail & ~survives else avail;
+            const pick = if (@popCount(cheap & ~pending) >= 2) cheap & ~pending else cheap;
+            const lo: u8 = if (h[0] < max_regs and avail >> @intCast(h[0]) & 1 != 0) h[0] else @intCast(@ctz(pick & ~regBit(h[1])));
+            const rest = avail & ~regBit(lo);
+            const hi: u8 = if (h[1] < max_regs and rest >> @intCast(h[1]) & 1 != 0) h[1] else @intCast(@ctz(if (pick & rest != 0) pick & rest else rest));
             const bits = @as(u32, 1) << @intCast(lo) | @as(u32, 1) << @intCast(hi);
             free &= ~bits;
             used |= bits;
@@ -875,8 +1065,11 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32) u32 {
             continue;
         }
         if (free & usable != 0) {
-            const pick = if (free & usable & ~survives != 0 and !crosses[inst]) free & usable & ~survives else free & usable;
-            const r: u8 = @intCast(@ctz(pick));
+            const cheap = if (h[0] == hint_saved and free & usable & survives != 0)
+                free & usable & survives
+            else if (free & usable & ~survives != 0 and !crosses[inst]) free & usable & ~survives else free & usable;
+            const pick = if (cheap & ~pending != 0) cheap & ~pending else if (free & usable & ~pending != 0) free & usable & ~pending else cheap;
+            const r: u8 = if (h[0] < max_regs and (free & usable) >> @intCast(h[0]) & 1 != 0) h[0] else @intCast(@ctz(pick));
             free &= ~(@as(u32, 1) << @intCast(r));
             used |= @as(u32, 1) << @intCast(r);
             reg[inst] = r;
@@ -903,6 +1096,11 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32) u32 {
 }
 
 pub const max_regs = 32;
+
+/// The mask of register `r`, or 0 for `no_reg`.
+fn regBit(r: u8) u32 {
+    return if (r < max_regs) @as(u32, 1) << @intCast(r) else 0;
+}
 
 /// Frame slots shared by lifetime (pass 7): a value's slot is free for
 /// another value once the position passes the end of its interval. Slots

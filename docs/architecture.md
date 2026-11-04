@@ -1688,6 +1688,45 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    tests: wall time within noise (6.50/5.98 → 6.23/6.27 s), allocation
    +11–17 ns per IR instruction, 5.50 → 4.88 code bytes per IR
    instruction, binary 52.2 → 49.1 MB.
+   Copy coalescing, after inlining: values computed straight into the
+   register a move would take them to.
+   - A value whose only use stores it to a promoted variable shares the
+     variable's register (`Live.share`, as a load does), and so does the
+     chain of tied operands computing it, when nothing from its
+     definition to the store reads the variable's old value: no load of
+     the variable, no use of a load sharing its register other than the
+     value's tied operand (a call reads all its arguments, and an
+     overflow operation all its operands, before writing the result),
+     and no terminator on the way. The store is in the value's block, or
+     in the arm its block's branch takes when the other arm, between
+     them in the layout, ends the function (the failing check of
+     `i += 1`). A value whose only use is its block's `br` shares the
+     block result's register the same way; nothing reads that register
+     before the block ends.
+   - An overflow operation at a native width adds or subtracts in its
+     value field's register.
+   - Hints (`Live.hint`): an `.auto` argument prefers the register it
+     arrives in, which the values allocated before it avoid while they
+     can; a value whose tied user crosses a clobber point prefers a
+     callee-saved register, which the user then takes over. On x86_64
+     the value a `ret` returns in one register, when it is the block's
+     last value, is computed in rax.
+   - Lowering: narrowing to 8, 16, or 32 bits is one `movzx`/`movsx`
+     (from the operand's register for a cast) instead of a shift pair; a
+     cast that cannot change the bits is a move, and of a constant the
+     narrowed constant; `x + 0`, `x - 0`, `x * 1`, `x / 1`, `x | 0`,
+     `x ^ 0`, and shifts by 0 are `x` (slicing from 0, `sliceAsBytes`);
+     a remainder by a constant goes to rax directly.
+   Against main 23e407f (`bench/runtime.py`, 9 runs): sieve 160 → 154
+   ms, hash 229 → 223, fmt 103 → 100, sort and nbody within noise; fib
+   137 → 152 with fewer instructions in `fib`, which starts 48 bytes
+   into a 64-byte line instead of at one (the placement noise above).
+   fmt's binary: 284,537 → 273,549 instructions, register-to-register
+   moves 41,306 → 33,511. The zig workload: 3.92 → 3.83 code bytes per
+   IR instruction, allocation 114–117 → 128–135 ns per IR instruction,
+   emission and wall time within noise (10.33/10.33 → 10.35/10.24 s).
+   std's tests: 4.62 → 4.49 code bytes per IR instruction, allocation
+   106 → 113–116, wall time within noise, binary 60.7 → 59.9 MB.
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
 6. DWARF variable locations; then leaf inlining with the cache edge.
