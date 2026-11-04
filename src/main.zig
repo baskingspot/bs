@@ -1119,7 +1119,7 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fno-builtin"},                     .{"-mred-zone"},                .{"-mno-red-zone"},         .{"-fno-sanitize-c"},
     .{"-fsanitize-c=trap"},                .{"-fsanitize-c=full"},         .{"-fsanitize-c"},          .{"-gdwarf32"},
     .{"-gdwarf64"},                        .{"-ODebug"},                   .{"-Odebug"},
-    .{"-static"},                          .{"--no-dynamic-linker"},       .{"--debug-compile-errors"}, .{"--debug-incremental"},
+    .{"--no-dynamic-linker"},              .{"--debug-compile-errors"},    .{"--debug-incremental"},
     .{"--verbose-air"},                    .{"--verbose-llvm-ir"},         .{"--verbose-link"},
     .{"--verbose-llvm-cpu-features"},      .{"--time-report"},             .{"-fformatted-panics"},    .{"-fno-formatted-panics"},
     .{"--eh-frame-hdr"},                   .{"--emit-relocs"},
@@ -1130,14 +1130,13 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"--undefined-version"},              .{"--no-undefined-version"},    .{"--enable-new-dtags"},    .{"--disable-new-dtags"},
     .{"-feach-lib-rpath"},                 .{"-fno-each-lib-rpath"},       .{"-fno-lto"},              .{"-fno-sanitize-coverage-trace-pc-guard"},
     .{"-fincremental"},                    .{"-fno-incremental"},          .{"--debug-rt"},            .{"-femit-bin"},
-    .{"-search_paths_first"},              .{"-search_paths_first_static"}, .{"-search_dylibs_first"}, .{"-search_static_first"},
-    .{"-search_dylibs_only"},              .{"-search_static_only"},       .{"--compress-debug-sections=none"},
+    .{"--compress-debug-sections=none"},
 });
 
 /// Ignored options that take a parameter.
 const ignored_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
     .{"-iquote"},   .{"-iframework"},   .{"-iframeworkwithsysroot"},
-    .{"-L"},        .{"-rpath"},        .{"--libc"},   .{"--sysroot"},    .{"--error-limit"}, .{"--debug-log"},
+    .{"-rpath"},    .{"--libc"},   .{"--sysroot"},    .{"--error-limit"}, .{"--debug-log"},
     .{"--dynamic-linker"}, .{"-z"},     .{"--image-base"},
 });
 
@@ -1196,6 +1195,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     var opts: Options = .{ .command = command, .root_src_path = undefined };
     var test_filters: std.ArrayList([]const u8) = .empty;
     var link_inputs: std.ArrayList([]const u8) = .empty;
+    // `-l` names, resolved against `lib_dirs` once all arguments are read.
+    var libs: std.ArrayList(LibQuery) = .empty;
+    var lib_dirs: std.ArrayList([]const u8) = .empty;
+    var lib_search: LibQuery.Search = .{};
     var deps: std.ArrayList([]const u8) = .empty;
     var modules: std.ArrayList(Frontend.ModuleArg) = .empty;
     // `-ffuzz` and `-fno-fuzz` are per module, as upstream's: each `-M`
@@ -1252,6 +1255,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
                 if (std.mem.eql(u8, arg, "-fPIE") and command == .build_obj) opts.pie = true;
             }
         } else if (std.mem.eql(u8, arg, "-dynamic")) {
+            lib_search = .{ .strategy = .mode_first, .static = false };
             // Shared objects, which are position-independent; executables
             // stay static.
             if (command == .build_lib) {
@@ -1356,6 +1360,12 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         } else if (std.mem.eql(u8, arg, "--stack")) {
             const v = nextArg(args, &i, arg);
             opts.stack_size = std.fmt.parseUnsigned(u64, v, 0) catch fatal("invalid stack size: '{s}'", .{v});
+        } else if (LibQuery.searches.get(arg)) |search| {
+            lib_search = search;
+        } else if (std.mem.eql(u8, arg, "-L")) {
+            try lib_dirs.append(arena, nextArg(args, &i, arg));
+        } else if (std.mem.startsWith(u8, arg, "-L")) {
+            try lib_dirs.append(arena, arg[2..]);
         } else if (ignored_flags.has(arg)) {
             // Changes nothing zap does.
         } else if (ignored_flags_with_arg.has(arg)) {
@@ -1393,9 +1403,17 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             setUnsupported(&opts, arena, "zap builds only Debug ('{s}'); drop the release mode (-Doptimize, --release) or build this step with upstream zig", .{arg});
         } else if (std.mem.startsWith(u8, arg, "-l") and glibc_libs.has(arg[2..])) {
             opts.link_libc = true;
-        } else if (std.mem.eql(u8, arg, "-lc++") or std.mem.startsWith(u8, arg, "-l") or
-            std.mem.startsWith(u8, arg, "-needed-l") or std.mem.startsWith(u8, arg, "-weak-l"))
-        {
+        } else if (!std.mem.eql(u8, arg, "-lc++") and (std.mem.startsWith(u8, arg, "-l") or std.mem.eql(u8, arg, "--library"))) {
+            const name = if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--library")) nextArg(args, &i, arg) else arg[2..];
+            if (glibc_libs.has(name)) {
+                opts.link_libc = true;
+            } else if (command == .build_obj or command == .build_lib) {
+                setUnsupported(&opts, arena, "zap does not link libraries into objects or libraries yet ('-l{s}'); build this step with upstream zig", .{name});
+            } else {
+                try libs.append(arena, .{ .name = name, .at = link_inputs.items.len, .search = lib_search });
+                try link_inputs.append(arena, "");
+            }
+        } else if (std.mem.eql(u8, arg, "-lc++") or std.mem.startsWith(u8, arg, "-needed-l") or std.mem.startsWith(u8, arg, "-weak-l")) {
             setUnsupported(&opts, arena, "zap does not link libc or system libraries ('{s}'); build this step with upstream zig", .{arg});
         } else if (unsupported_flags.get(arg)) |msg| {
             setUnsupported(&opts, arena, "{s}", .{msg});
@@ -1446,6 +1464,16 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena, io);
     opts.root_src_path = root orelse if (opts.unsupported != null) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
+    for (libs.items) |q| {
+        link_inputs.items[q.at] = try q.find(arena, io, lib_dirs.items) orelse {
+            setUnsupported(&opts, arena, "zap does not search the system's library directories yet ('-l{s}', not in the -L directories); build this step with upstream zig", .{q.name});
+            break;
+        };
+        if (!std.mem.endsWith(u8, link_inputs.items[q.at], ".a")) {
+            setUnsupported(&opts, arena, "zap does not link shared libraries yet ('-l{s}' is '{s}'); build this step with upstream zig", .{ q.name, link_inputs.items[q.at] });
+            break;
+        }
+    }
     opts.link_inputs = link_inputs.items;
     opts.modules = modules.items;
     // A root file given by position owns what no -M took, as upstream's.
@@ -1550,6 +1578,56 @@ fn loadGlibc(init: std.process.Init, job: *const Job) !Glibc {
     if (g.newest().order(want) == .lt) std.log.warn("zap cannot link new glibc version {f}; providing instead {f}", .{ want, g.newest() });
     return g;
 }
+
+/// A `-l` library, found as upstream's `link.resolveLibInput` finds one
+/// by its search strategy and preferred mode.
+const LibQuery = struct {
+    name: []const u8,
+    /// Its place in `Options.link_inputs`.
+    at: usize,
+    search: Search,
+
+    const Search = struct {
+        strategy: enum { paths_first, mode_first, no_fallback } = .paths_first,
+        static: bool = false,
+    };
+
+    /// The options that set the search for the `-l` after them.
+    const searches: std.StaticStringMap(Search) = .initComptime(.{
+        .{ "-search_paths_first", Search{} },
+        .{ "-search_paths_first_static", Search{ .static = true } },
+        .{ "-search_dylibs_first", Search{ .strategy = .mode_first } },
+        .{ "-search_static_first", Search{ .strategy = .mode_first, .static = true } },
+        .{ "-search_dylibs_only", Search{ .strategy = .no_fallback } },
+        .{ "-search_static_only", Search{ .strategy = .no_fallback, .static = true } },
+        .{ "-static", Search{ .strategy = .no_fallback, .static = true } },
+    });
+
+    /// The library's path, `lib<name>.so` or `lib<name>.a` in one of
+    /// `dirs`, or null if there is none.
+    fn find(q: LibQuery, arena: std.mem.Allocator, io: Io, dirs: []const []const u8) !?[]const u8 {
+        const preferred: []const u8 = if (q.search.static) ".a" else ".so";
+        const other: []const u8 = if (q.search.static) ".so" else ".a";
+        switch (q.search.strategy) {
+            .paths_first => for (dirs) |dir| {
+                if (try exists(arena, io, dir, q.name, preferred)) |p| return p;
+                if (try exists(arena, io, dir, q.name, other)) |p| return p;
+            },
+            .mode_first, .no_fallback => {
+                for (dirs) |dir| if (try exists(arena, io, dir, q.name, preferred)) |p| return p;
+                if (q.search.strategy == .mode_first) {
+                    for (dirs) |dir| if (try exists(arena, io, dir, q.name, other)) |p| return p;
+                }
+            },
+        }
+        return null;
+    }
+
+    fn exists(arena: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8, ext: []const u8) !?[]const u8 {
+        const path = try std.fmt.allocPrint(arena, "{s}{s}lib{s}{s}", .{ dir, if (dir.len == 0 or dir[dir.len - 1] == '/') "" else "/", name, ext });
+        return if (Io.Dir.cwd().access(io, path, .{})) |_| path else |_| null;
+    }
+};
 
 /// glibc's libraries, which `-l` links as part of libc (upstream's
 /// `std.zig.target.isLibCLibName` for glibc).

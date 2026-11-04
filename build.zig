@@ -902,7 +902,10 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         exe.setName(b.fmt("zap build-exe with {s} objects", .{v.name}));
         exe.addArg("build-exe");
         exe.addFileArg(b.path("test/link_input/main.zig"));
-        for ([_]std.Build.LazyPath{ lib, tls, tlsie, archives[0], archives[1] }) |input| exe.addFileArg(input);
+        for ([_]std.Build.LazyPath{ lib, tls, tlsie, archives[0] }) |input| exe.addFileArg(input);
+        // The second archive by name (`-l`, `-L`).
+        exe.addArg("-la2");
+        exe.addPrefixedDirectoryArg("-L", archives[1].dirname());
         exe.setEnvironmentVariable("ZAP_CACHE", "off");
         const bin = exe.addPrefixedOutputFileArg("-femit-bin=", "main");
         const run = std.Build.Step.Run.create(b, b.fmt("run zap link of {s} objects", .{v.name}));
