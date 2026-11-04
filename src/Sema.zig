@@ -8246,7 +8246,9 @@ fn naturalAlignment(sema: *Sema, ty: Index) ?u64 {
     const ip = sema.ip;
     if (!sema.layoutResolved(ty)) return null;
     return switch (Type.class(ip, ty)) {
-        .@"opaque" => null,
+        // As upstream's abiAlignment, so that an over-aligned pointer
+        // coerces to `*anyopaque`.
+        .@"opaque" => 1,
         // x86_64's minimum function alignment, as upstream.
         .@"fn" => 1,
         // Zero-bit types too, as upstream: `*u0` and `*align(1) u0` match.

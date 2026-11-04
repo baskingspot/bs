@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -236,6 +236,12 @@ fn headBytes(v: u64) u8 {
     };
 }
 
+// monstar (dbus/Connection.zig): an over-aligned pointer coerces to
+// `*anyopaque`, whose alignment is 1, as upstream.
+fn opaqueAddr(p: ?*const anyopaque) u64 {
+    return @intFromPtr(p);
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -306,5 +312,7 @@ fn main() callconv(.c) noreturn {
     var big: u64 = 0x1_0000_0000;
     _ = &big;
     rt.printInt(headBytes(big));
+    var aligned: [80]u8 align(8) = undefined;
+    rt.printInt(@intFromBool(opaqueAddr(&aligned) == @intFromPtr(&aligned)));
     rt.exit(0);
 }
