@@ -99,10 +99,12 @@ edit. Geometric-mean speedups: 2.0x cold-local over 83 targets (123.7 s
 vs 61.1 s in total) and 25.7x on edit builds over 45 (91.6 s vs 3.6 s).
 The libc projects' edit builds now go through zap's cache: 24.4x over
 their 6 targets (8.9 s vs 0.34 s). ghostty's props-unigen and
-symbols-unigen edit builds take 0.39 s and 0.94 s instead of 0.04 s: on
-this main, an edit above an anonymous struct passed to a generic that
-holds another anonymous struct builds again in full ("a type's name
-changed"). Single samples sometimes spike by 0.5–4 s, on different
+symbols-unigen edit builds take 0.39 s and 0.94 s, where 4f846d0 took
+0.04 s but linked stale names: an edit above an anonymous struct passed
+to a generic that holds another anonymous struct renames a type whose
+functions would load from the pack under their old names, so zap
+detects it and builds again in full ("a type's name changed") until
+atoms are named at link time. Single samples sometimes spike by 0.5–4 s, on different
 targets from run to run, so the zap rows of the ten projects that spiked
 in the first run come from a second run.
 
