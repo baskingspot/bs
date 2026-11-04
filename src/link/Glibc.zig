@@ -40,6 +40,28 @@ pub const lib_ld: u8 = 2;
 pub const abilists_path = "libc/glibc/abilists";
 pub const interp = "/lib64/ld-linux-x86-64.so.2";
 
+/// The names glibc gives the data object `name` names, at one address, or
+/// none. abilists does not say which names share one, so an executable
+/// that copies one of them (R_X86_64_COPY) defines the others at its copy
+/// too, as a link against the real libc.so.6 does, since glibc's own code
+/// uses them.
+pub fn dataAliases(name: []const u8) []const []const u8 {
+    for (data_aliases) |group| {
+        for (group) |n| if (std.mem.eql(u8, n, name)) return group;
+    }
+    return &.{};
+}
+
+const data_aliases = [_][]const []const u8{
+    &.{ "environ", "_environ", "__environ" },
+    &.{ "program_invocation_name", "__progname_full" },
+    &.{ "program_invocation_short_name", "__progname" },
+    &.{ "timezone", "__timezone" },
+    &.{ "daylight", "__daylight" },
+    &.{ "tzname", "__tzname" },
+    &.{ "signgam", "__signgam" },
+};
+
 /// A symbol as a reference binds to it at link time: its library and its
 /// default version at the target version (the newest one at or below it).
 pub const Symbol = struct {
@@ -144,8 +166,10 @@ pub fn deinit(g: *Glibc) void {
 /// name, so the tables do not depend on the order code requested them, and
 /// gives each its library and version. DT_NEEDED lists libc.so.6 always,
 /// as upstream, and the other libraries used, in upstream's link order.
-/// Strings are allocated in `arena`.
-pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
+/// `copies` are the imports the executable copies instead (`Emit.copies`),
+/// which become its exports, each with the aliases `dataAliases` gives
+/// that nothing imports. Strings are allocated in `arena`.
+pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
     std.mem.sortUnstable(ElfObject.Import, imports, {}, struct {
         fn lt(_: void, a: ElfObject.Import, b: ElfObject.Import) bool {
             return std.mem.lessThan(u8, a.name, b.name);
@@ -154,6 +178,7 @@ pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Im
     var used: [libs.len]bool = @splat(false);
     used[lib_c] = true;
     for (imports) |imp| used[(g.get(imp.name) orelse return error.NotInGlibc).lib] = true;
+    for (copies) |c| used[(g.get(c.name) orelse return error.NotInGlibc).lib] = true;
     var needed: std.ArrayList([]const u8) = .empty;
     var lib_index: [libs.len]u32 = undefined;
     for (libs, used, &lib_index) |lib, u, *index| if (u) {
@@ -165,7 +190,21 @@ pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Im
         imp.version = try g.versionName(arena, sym.version);
         imp.library = lib_index[sym.lib];
     }
-    return .{ .imports = imports, .interp = interp, .needed = needed.items };
+    // Each copy, then the other names glibc gives the same object, which
+    // its own code may use instead.
+    var exports: std.ArrayList(ElfDynamic.Export) = .empty;
+    for (copies) |c| {
+        const name = c.name;
+        // The copy itself first: its relocation names it.
+        for ([_][]const []const u8{ &.{name}, dataAliases(name) }, [_]bool{ false, true }) |list, alias| for (list) |n| {
+            if (alias and (std.mem.eql(u8, n, name) or for (imports) |imp| {
+                if (std.mem.eql(u8, imp.name, n)) break true;
+            } else false)) continue;
+            const sym = g.get(n) orelse continue;
+            try exports.append(arena, .{ .key = c.key, .name = n, .copy = .{ .version = try g.versionName(arena, sym.version), .library = lib_index[sym.lib], .alias = alias } });
+        };
+    }
+    return .{ .exports = exports.items, .imports = imports, .interp = interp, .needed = needed.items };
 }
 
 pub fn get(g: *const Glibc, name: []const u8) ?Symbol {

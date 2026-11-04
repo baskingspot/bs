@@ -2571,8 +2571,20 @@ symbol or a local becomes (section atom, value + addend).
   needs them. Upstream's C flags under `-lc` (`-fPIC`) produce none, but
   GCC's `-fPIE`, Debian `cc`'s default, does: it reads `stdout` with
   R_X86_64_PC32 and relies on a copy relocation (checked 2026-11-04; the
-  design first said it read through the GOT). Until zap makes them, it
-  is an error naming the object, the section and the symbol.
+  design first said it read through the GOT). zap makes them for glibc's
+  data objects (abilists gives their sizes): a zero-fill .bss atom of the
+  object's size takes the import's key, so every reference to the import,
+  Zig's extern slot included, uses the copy; the import leaves the
+  dynamic imports and becomes a versioned, defined .dynsym entry
+  (`ElfDynamic.Export.copy`) with an R_X86_64_COPY. abilists does not say
+  which names share an address, so `Glibc.dataAliases` lists glibc's
+  (`environ`, `_environ`, `__environ` and a few more): the executable
+  defines them at the copy too, since glibc's start code sets
+  `__environ`. Upstream's link against its abilists stubs (`-target
+  x86_64-linux-gnu`) misses those aliases and leaves `environ` null; its
+  native link against the system's libc.so.6 gets them, as zap does. A
+  function's address taken without the GOT (R_X86_64_32 in non-PIC code)
+  would need a canonical PLT entry and is still an error.
 
 **Merged sections.** SHF_MERGE|SHF_STRINGS sections (`.rodata.str1.1`,
 which clang always emits) split into one content-addressed atom per
@@ -2705,9 +2717,9 @@ differs from the design above:
   when there are `-l` names, which zap does not yet.
 - Tests: a constructor test (priorities across two objects, a
   destructor, with and without `-lc`), a COMDAT pair written in
-  assembly (in both orders), and an archive passed with `-l`/`-L`.
-- Not yet: copy relocations, and timing SQLite and zlib links against
-  upstream.
+  assembly (in both orders), GCC `-fPIE` code reading `stdout` and
+  `environ`, and an archive passed with `-l`/`-L`.
+- Not yet: timing SQLite and zlib links against upstream.
 
 **Stages and checks.**
 1. A: objects and archives into zap's static and `-lc` executables (the

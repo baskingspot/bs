@@ -26,6 +26,20 @@ pub const Export = struct {
     name: []const u8,
     weak: bool = false,
     visibility: std.lang.SymbolVisibility = .default,
+    /// In an executable: the atom is a copy of a library's data object,
+    /// which the loader fills from the library's (R_X86_64_COPY), and
+    /// which every module then uses, the library too. Versioned as the
+    /// import it replaces (`Import.version` and `Import.library`).
+    copy: ?Copy = null,
+
+    pub const Copy = struct {
+        version: ?[]const u8,
+        library: u32,
+        /// Another name of an earlier export's copy, which the library
+        /// defines at the same address (`environ` and `__environ`): it
+        /// gets a symbol but no relocation of its own.
+        alias: bool = false,
+    };
 };
 
 /// A symbol the output references and another module defines. Relocations
@@ -199,6 +213,8 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
     var verneed_count: u32 = 0;
     const versioned = for (o.imports) |imp| {
         if (imp.version != null) break true;
+    } else for (o.exports) |x| {
+        if (x.copy != null and x.copy.?.version != null) break true;
     } else false;
     if (versioned) {
         versym = try arena.alloc(u16, n_syms);
@@ -208,16 +224,21 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
         var prev_need_at: usize = 0;
         for (o.needed, needed, 0..) |_, file, lib| {
             var versions: std.ArrayList([]const u8) = .empty;
-            for (o.imports, 1..) |imp, k| {
-                const v = imp.version orelse continue;
-                if (imp.library != lib) continue;
+            for (0..n_syms - 1) |k| {
+                const v, const in_lib = if (k < n_imports)
+                    .{ o.imports[k].version orelse continue, o.imports[k].library }
+                else c: {
+                    const cp = o.exports[exports.items[k - n_imports]].copy orelse continue;
+                    break :c .{ cp.version orelse continue, cp.library };
+                };
+                if (in_lib != lib) continue;
                 const vi = for (versions.items, 0..) |seen, j| {
                     if (std.mem.eql(u8, seen, v)) break j;
                 } else blk: {
                     try versions.append(arena, v);
                     break :blk versions.items.len - 1;
                 };
-                versym[k] = next_index + @as(u16, @intCast(vi));
+                versym[k + 1] = next_index + @as(u16, @intCast(vi));
             }
             if (versions.items.len == 0) continue;
             const need_at = verneed.items.len;

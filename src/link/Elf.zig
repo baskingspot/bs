@@ -688,6 +688,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const dyn: ?ElfDynamic.Tables = if (dyn_opts) |d| try ElfDynamic.tables(dyn_arena.allocator(), d.*) else null;
     const has_dyn = dyn != null;
     const n_imports: u64 = if (dyn_opts) |d| d.imports.len else 0;
+    var n_copies: u64 = 0;
+    if (dyn_opts) |d| for (d.exports) |x| {
+        n_copies += @intFromBool(x.copy != null and !x.copy.?.alias);
+    };
     var dyn_exports: []u64 = &.{};
     var n_rela: u64 = 0;
     if (dyn) |*t| {
@@ -776,7 +780,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const interp_size: u64 = if (exe_dyn) dyn_opts.?.interp.?.len + 1 else 0;
     var r_tables_end = headers_end;
     if (dyn) |*t| {
-        if (!exe_dyn) n_rela += @intFromBool(has_tls) + n_imports;
+        n_rela += if (exe_dyn) n_copies else @intFromBool(has_tls) + n_imports;
         dynsym_off = std.mem.alignForward(u64, interp_off + interp_size, 8);
         dynstr_off = dynsym_off + t.dynsymSize();
         hash_off = std.mem.alignForward(u64, dynstr_off + t.dynstr.len, 8);
@@ -1003,8 +1007,15 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             try l.put(versym_off, t.versym);
             try l.put(verneed_off, t.verneed);
         }
-        const tail = try a.alloc(elf.Elf64.Rela, if (exe_dyn) 0 else @intFromBool(has_tls) + n_imports);
+        const tail = try a.alloc(elf.Elf64.Rela, if (exe_dyn) n_copies else @intFromBool(has_tls) + n_imports);
         var k: usize = 0;
+        // An executable's copies of library data, which the loader fills.
+        if (n_copies != 0) for (t.exports, dyn_exports, 0..) |i, atom, pos| {
+            const cp = d.exports[i].copy orelse continue;
+            if (cp.alias) continue;
+            tail[k] = .{ .offset = l.atomAddr(atom), .info = .{ .type = @backingInt(elf.R_X86_64.COPY), .sym = @intCast(1 + n_imports + pos) }, .addend = 0 };
+            k += 1;
+        };
         if (has_tls and !exe_dyn) {
             tail[0] = .{ .offset = base + got_off, .info = .{ .type = @backingInt(elf.R_X86_64.DTPMOD64), .sym = 0 }, .addend = 0 };
             k = 1;

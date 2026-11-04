@@ -96,6 +96,9 @@ inputs: ?*ElfInput = null,
 c_batch: ?*CSource.Batch = null,
 /// In an object, the symbols other objects define, by name.
 imports: std.StringArrayHashMapUnmanaged(ImportFlags) = .empty,
+/// The imports the executable copies (R_X86_64_COPY) and their sizes, a
+/// subset of `imports`, for data C objects reach without the GOT.
+copies: std.StringArrayHashMapUnmanaged(u16) = .empty,
 /// In an object, its exports, once `finish` found them.
 exports: std.ArrayList(ElfObject.Export) = .empty,
 /// What produced each atom, for the on-disk cache (`Incremental`).
@@ -386,6 +389,7 @@ pub fn deinit(emit: *Emit) void {
     emit.errors.deinit(gpa);
     emit.externs.deinit(gpa);
     emit.imports.deinit(gpa);
+    emit.copies.deinit(gpa);
     emit.exports.deinit(gpa);
     emit.atom_owners.deinit(gpa);
     emit.content_uses.deinit(gpa);
@@ -819,6 +823,16 @@ const InputResolver = struct {
         if (g.get(name) == null) return null;
         return try r.emit.useImport(name, .{ .weak = weak });
     }
+
+    /// The executable's copy of glibc's data object `name`, an import
+    /// already (`importSym`), or null if it is not one. The copy takes
+    /// the import's key, so every reference to the import uses it.
+    pub fn copySym(r: InputResolver, name: []const u8) !?SymbolKey {
+        const sym = r.emit.glibc.?.get(name).?;
+        if (!sym.object or sym.size == 0) return null;
+        try r.emit.copies.put(r.emit.gpa, r.emit.imports.getKey(name).?, sym.size);
+        return importKey(name);
+    }
 };
 
 /// Converts the inputs into atoms, after the externs' slots took their
@@ -828,6 +842,15 @@ fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
     for (in.errors.items) |msg| try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{msg});
     if (in.errors.items.len != 0) return false;
     for (converted.atoms) |atom| try emit.addAtom(atom);
+    for (emit.copies.keys(), emit.copies.values()) |name, size| try emit.addAtom(.{
+        .key = importKey(name),
+        .name = name,
+        .section = .bss,
+        // As the object's own alignment, which abilists does not give:
+        // the largest power of two dividing its size, up to 32.
+        .alignment = .fromByteUnits(@as(u64, 1) << @min(@ctz(size), 5)),
+        .zero_fill = size,
+    });
     try emit.error_values.appendSlice(emit.gpa, converted.values);
     emit.input_symbols = converted.symbols;
     return true;
@@ -1147,9 +1170,16 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     defer emit.gpa.free(imports);
     for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };
     const result = if (emit.glibc) |g| exe: {
+        // The copied imports, moved to the end, are the executable's own
+        // symbols.
+        var n_imports: usize = 0;
+        for (imports, 0..) |imp, i| if (!emit.copies.contains(imp.name)) {
+            std.mem.swap(ElfObject.Import, &imports[n_imports], &imports[i]);
+            n_imports += 1;
+        };
         var arena_state: std.heap.ArenaAllocator = .init(emit.gpa);
         defer arena_state.deinit();
-        const dynamic = g.dynamicOptions(arena_state.allocator(), imports) catch |err| switch (err) {
+        const dynamic = g.dynamicOptions(arena_state.allocator(), imports[0..n_imports], imports[n_imports..]) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             // Imports in an executable come from glibc only (exportTarget,
             // ElfInput).

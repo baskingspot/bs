@@ -358,7 +358,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
                 return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
             break :g &glibc_loaded.?;
         };
-        dynamic = g.dynamicOptions(arena, imports.items) catch |err| switch (err) {
+        dynamic = g.dynamicOptions(arena, imports.items, &.{}) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.NotInGlibc => return inc.noLink("an import glibc does not define", .{}),
         };

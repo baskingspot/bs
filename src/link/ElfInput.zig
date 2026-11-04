@@ -751,8 +751,10 @@ fn Converter(comptime Ctx: type) type {
         /// A relocation to a shared library's symbol: an absolute address
         /// stays one, which the loader writes; a call goes through a stub
         /// that jumps through the symbol's slot; GOT-relative code uses
-        /// the slot. Reading an import's data PC-relative would need a
-        /// copy relocation.
+        /// the slot. Data the code reaches PC-relative or by a 32-bit
+        /// address (GCC's -fPIE and non-PIC code) is copied into the
+        /// executable (`ctx.copySym`), and every reference then uses the
+        /// copy.
         fn importReloc(c: *C, index: u32, r: elf.Elf64_Rela, bytes: []const u8) !void {
             const o = c.o;
             const off = r.r_offset;
@@ -765,11 +767,21 @@ fn Converter(comptime Ctx: type) type {
                 .GOTPCREL, .GOTPCRELX, .REX_GOTPCRELX => try c.add(off, .x86_64_pc32, .{ .key = try c.slot(t), .offset = 0 }, r.r_addend),
                 .PLT32, .PC32 => {
                     const op = if (off >= 1) bytes[@intCast(off - 1)] else 0;
-                    if (ty == .PC32 and op != 0xe8 and op != 0xe9) return c.fail("{s}: zap does not make copy relocations yet: section '{s}' reads {s}, which a shared library defines, PC-relative (GCC's -fPIE does); compile it with -fPIC", .{ o.path, o.sectionName(index), o.symName(sym) });
-                    try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t), .offset = 0 }, r.r_addend);
+                    if (ty == .PLT32 or op == 0xe8 or op == 0xe9) return c.add(off, .x86_64_pc32, .{ .key = try c.stub(t), .offset = 0 }, r.r_addend);
+                    try c.add(off, .x86_64_pc32, .{ .key = try c.copied(index, sym) orelse return, .offset = 0 }, r.r_addend);
                 },
+                .@"32", .@"32S" => try c.add(off, if (ty == .@"32") .x86_64_abs32 else .x86_64_abs32s, .{ .key = try c.copied(index, sym) orelse return, .offset = 0 }, r.r_addend),
                 else => try c.fail("{s}: zap does not link relocation R_X86_64_{s} against {s}, which a shared library defines, yet", .{ o.path, @tagName(ty), o.symName(sym) }),
             }
+        }
+
+        /// The executable's copy of the data object `sym` names, or null
+        /// after reporting that it is not one.
+        fn copied(c: *C, index: u32, sym: elf.Elf64_Sym) !?SymbolKey {
+            const o = c.o;
+            if (try c.ctx.copySym(o.symName(sym))) |key| return key;
+            try c.fail("{s}: section '{s}' takes the address of {s}, a function a shared library defines, without the GOT (non-PIC code does), which zap does not link yet; compile it with -fPIC", .{ o.path, o.sectionName(index), o.symName(sym) });
+            return null;
         }
 
         /// A stub that jumps through `t`'s slot (`jmp [rip + slot]`),

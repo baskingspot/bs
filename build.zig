@@ -967,6 +967,25 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);
 
+    // GCC's -fPIE reads glibc's data PC-relative: the executable copies
+    // `stdout` and `environ` (with its aliases, which glibc's start code
+    // sets), and glibc, C and Zig all use the copies.
+    if (cc) |gcc| {
+        const cc_copy = b.addSystemCommand(&.{ gcc, "-fPIE", "-c" });
+        cc_copy.addFileArg(b.path("test/link_input/copy.c"));
+        const copy_exe = b.addRunArtifact(zap);
+        copy_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+        copy_exe.addFileArg(b.path("test/link_input/copy_main.zig"));
+        copy_exe.addFileArg(cc_copy.addPrefixedOutputFileArg("-o", "copy.o"));
+        copy_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, "run zap link of copied glibc data");
+        r.addFileArg(copy_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addCheck(.{ .expect_stdout_exact = "via stdout\n" });
+        r.addCheck(.{ .expect_stderr_exact = "1 true\n" });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
+
     // Constructors run in priority order across two objects, before main;
     // the destructor runs only with -lc, whose exit runs the fini array.
     var ctors: [2]std.Build.LazyPath = undefined;
