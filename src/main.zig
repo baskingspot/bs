@@ -194,6 +194,16 @@ const unsupported_commands: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "objcopy", "bs does not implement 'objcopy'; run this step with upstream zig" },
 });
 
+/// A segfault handler runs on the signal stack, which every thread keeps
+/// in its thread-local storage, zeroed when the thread starts (std's
+/// default size, 256 KiB). Only a build with runtime safety installs the
+/// handler, so a ReleaseFast bs keeps no signal stack: each process saves
+/// mapping, zeroing and unmapping it, which was 0.3 ms and 68 of the 282
+/// page faults of a `zig build` compile step that the cache answers.
+pub const std_options: std.Options = .{
+    .signal_stack_size = if (std.debug.default_enable_segfault_handler) 1 << 18 else null,
+};
+
 /// The general-purpose allocator of a ReleaseSafe bs: std's SafeAllocator,
 /// as std.start would pick, but over SmpAllocator instead of the page
 /// allocator. Over the page allocator it reuses no memory, so every freed
