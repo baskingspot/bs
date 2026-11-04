@@ -100,6 +100,11 @@ debug_files: []const u32,
 /// The atom references whose `debug_files` entry is not `no_file`,
 /// ascending.
 debug_atoms: []const u32,
+/// Each atom reference's symbol name, parallel to `atom_refs`: the
+/// records keep none, so that a loaded atom takes its type's final name
+/// (docs/architecture.md, "Type names").
+atom_names: []const AtomName,
+atom_name_bytes: []const u8,
 files: []const StrRef,
 /// Each node's references are `refs[ref_starts[i]..ref_starts[i + 1]]`.
 ref_starts: []const u32,
@@ -182,6 +187,37 @@ pub const Flags = packed struct(u8) {
 };
 
 pub const StrRef = extern struct { off: u32, len: u32 };
+
+/// An atom's symbol name: `len` bytes at `off` in `atom_name_bytes` (in
+/// its log record's strings, for a node the log changed), the first
+/// `prefix_len` of which are the final name of the type with stable hash
+/// `parent` (0: none), after which an edit build renames it when that
+/// type's name changes.
+pub const AtomName = extern struct {
+    parent: [2]u64 = .{ 0, 0 },
+    off: u32,
+    len: u32,
+    prefix_len: u32 = 0,
+    unused: u32 = 0,
+
+    pub fn parentHash(an: AtomName) Hash {
+        return @bitCast(an.parent);
+    }
+};
+
+/// A node's atoms' names (`Manifest.atomNames`).
+pub const AtomNames = struct {
+    names: []const AtomName,
+    bytes: []const u8,
+
+    /// Atom `k`'s name; empty if it lies outside the bytes (a damaged
+    /// manifest).
+    pub fn name(an: AtomNames, k: usize) []const u8 {
+        const n = an.names[k];
+        if (n.off > an.bytes.len or n.len > an.bytes.len - n.off) return "";
+        return an.bytes[n.off..][0..n.len];
+    }
+};
 
 /// A dependency edge as stored in `edges` and passed in `NodeInit.deps`:
 /// the node depended on, and how. Replay brings only plain dependencies up
@@ -390,12 +426,17 @@ const SymbolMap = struct {
     }
 };
 
-/// A new atom's symbols, for numbering: its key, its targets' keys, and
-/// its debug source path, if it has debug info.
+/// A new atom's symbols, for numbering: its key, its targets' keys, its
+/// debug source path, if it has debug info, and its name (`AtomName`).
 pub const AtomSymbols = struct {
     key: Hash,
     targets: []const Hash,
     file: ?[]const u8 = null,
+    name: []const u8 = "",
+    /// The type whose name the first `prefix_len` bytes of `name` are,
+    /// by stable hash, or 0.
+    parent: Hash = 0,
+    prefix_len: u32 = 0,
 };
 
 pub const Input = extern struct {
@@ -435,11 +476,11 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, atom_names, atom_name_bytes, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN13".*;
-const log_magic = "ZAPMLG06".*;
+const magic = "ZAPMAN14".*;
+const log_magic = "ZAPMLG07".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
 
@@ -464,8 +505,9 @@ const LogHeader = extern struct {
 
 /// One build's changes. The body: `n_nodes` node changes (each a
 /// `NodeDelta`, then its dependencies, atom references, numbered atoms,
-/// debug files, target run, references, result, subject and names, each padded
-/// to 16 bytes), `n_inputs` `InputDelta`s, `n_errors` `StrRef`s and as
+/// debug files, atom names (whose bytes are in the record's strings),
+/// target run, references, result, subject and names, each padded to 16
+/// bytes), `n_inputs` `InputDelta`s, `n_errors` `StrRef`s and as
 /// many error symbols, `n_symbols` new `Symbol`s, `n_files` new debug
 /// files' `StrRef`s, `n_ref_names` reference names' `StrRef`s, the
 /// starts of `n_items` new result items in the `item_words` words that
@@ -544,6 +586,7 @@ comptime {
     std.debug.assert(@sizeOf(InputDelta) == 80);
     std.debug.assert(@sizeOf(LinkSymbol) == 32);
     std.debug.assert(@sizeOf(TypeNameRef) == 48);
+    std.debug.assert(@sizeOf(AtomName) == 32);
 }
 
 /// The log, applied. Slices point into `buf`.
@@ -578,6 +621,8 @@ const Overlay = struct {
     item_overrides: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// What `linkInput` returns, gathered on first use when nodes changed.
     gathered: ?LinkInput = null,
+    /// `LinkInput.names`, made on first use.
+    link_names: ?[]const []const u8 = null,
 
     const NodeState = struct {
         delta: *const NodeDelta,
@@ -585,6 +630,9 @@ const Overlay = struct {
         atoms: []const Pack.AtomRef,
         numbered: []const NumberedAtom,
         debug_files: []const u32,
+        atom_names: []const AtomName,
+        /// The record's strings, which `atom_names` index.
+        name_bytes: []const u8,
         refs: []const Ref,
         result: []const u32,
         subject: []const u32,
@@ -620,6 +668,7 @@ const Overlay = struct {
             gpa.free(g.debug_files);
             gpa.free(g.debug_atoms);
         }
+        if (o.link_names) |n| gpa.free(n);
     }
 };
 
@@ -632,6 +681,8 @@ fn SectionType(comptime s: Section) type {
         .error_names, .bases, .files, .ref_names => StrRef,
         .ref_starts, .items, .item_starts, .results, .result_starts, .subjects, .subject_starts, .type_names, .type_name_starts => u32,
         .type_name_index => TypeNameRef,
+        .atom_names => AtomName,
+        .atom_name_bytes => u8,
         .refs => Ref,
         .sources => Source,
         .source_names => SourceName,
@@ -671,7 +722,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
     }
     if (m.table.len == 0 or !std.math.isPowerOfTwo(m.table.len) or
         m.symbols.len <= m.symbol_len or
-        m.numbered.len != m.atom_refs.len or m.debug_files.len != m.atom_refs.len or
+        m.numbered.len != m.atom_refs.len or m.debug_files.len != m.atom_refs.len or m.atom_names.len != m.atom_refs.len or
         m.error_symbols.len != m.error_names.len or
         m.ref_starts.len != m.nodes.len + 1 or m.ref_starts[m.nodes.len] != m.refs.len or
         m.sources.len != m.nodes.len or
@@ -732,12 +783,16 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
     const NamedState = struct { index: u32, name: StrRef };
     var named: std.ArrayList(NamedState) = .empty;
     defer named.deinit(gpa);
+    // So are its atoms' names.
+    var with_atoms: std.ArrayList(u32) = .empty;
+    defer with_atoms.deinit(gpa);
     for (0..rh.n_nodes) |_| {
         const d = r.take(NodeDelta, 1);
         const node_deps = r.take(u32, d[0].deps_len);
         const node_atoms = r.take(Pack.AtomRef, d[0].atoms_len);
         const node_numbered = r.take(NumberedAtom, d[0].atoms_len);
         const node_files = r.take(u32, d[0].atoms_len);
+        const node_atom_names = r.take(AtomName, d[0].atoms_len);
         const node_targets = r.take(u32, d[0].targets_len);
         const node_refs = r.take(Ref, d[0].refs_len);
         const node_result = r.take(u32, d[0].result_len);
@@ -755,6 +810,8 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
             .atoms = node_atoms,
             .numbered = node_numbered,
             .debug_files = node_files,
+            .atom_names = node_atom_names,
+            .name_bytes = &.{},
             .refs = node_refs,
             .result = node_result,
             .subject = node_subject,
@@ -766,6 +823,7 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
         _ = o.flags.remove(index);
         _ = o.sources.remove(index);
         if (d[0].source_name.len != 0) try named.append(gpa, .{ .index = index, .name = d[0].source_name });
+        if (d[0].atoms_len != 0) try with_atoms.append(gpa, index);
         for (node_deps) |dep| {
             const gop = try o.rdeps.getOrPut(gpa, Edge.nodeOf(dep));
             if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -785,6 +843,7 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
     const source_deltas = r.take(SourceDelta, rh.n_sources);
     const strings = r.take(u8, rh.strings_len);
     for (named.items) |n| o.nodes.getPtr(n.index).?.source_name = strings[n.name.off..][0..n.name.len];
+    for (with_atoms.items) |n| o.nodes.getPtr(n).?.name_bytes = strings;
     const words_base: u32 = @intCast(o.item_words.items.len);
     for (item_starts) |st| try o.item_starts.append(gpa, words_base + st);
     for (overrides) |ov| try o.item_overrides.put(gpa, ov.id, words_base + ov.start);
@@ -997,9 +1056,16 @@ pub fn atoms(m: *const Manifest, index: u32) []const Pack.AtomRef {
     return m.atom_refs[n.atoms_start..][0..n.atoms_len];
 }
 
+/// Node `index`'s atoms' names, parallel to `atoms(index)`.
+pub fn atomNames(m: *const Manifest, index: u32) AtomNames {
+    if (m.overlay.nodes.get(index)) |s| return .{ .names = s.atom_names, .bytes = s.name_bytes };
+    const n = m.nodes[index];
+    return .{ .names = m.atom_names[n.atoms_start..][0..n.atoms_len], .bytes = m.atom_name_bytes };
+}
+
 /// What to link: every live atom reference in node order, with its
-/// numbered atom and debug file, the atoms that have debug info, and the
-/// target runs they index: the base's, then the log's (as
+/// numbered atom, debug file and name, the atoms that have debug info,
+/// and the target runs they index: the base's, then the log's (as
 /// `Elf.Symbols.targets` and `targets_tail`).
 pub const LinkInput = struct {
     refs: []const Pack.AtomRef,
@@ -1008,20 +1074,30 @@ pub const LinkInput = struct {
     debug_atoms: []const u32,
     targets: []const u32,
     targets_tail: []const u32,
+    names: []const []const u8,
 };
 
 /// Slices of the mapping when the log changed no node and no node is
 /// `unlinked`; otherwise gathered once and kept until `close`.
 pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
     const o = &m.overlay;
-    if (o.nodes.count() == 0 and o.flags.count() == 0 and m.base_unlinked == 0) return .{
-        .refs = m.atom_refs,
-        .numbered = m.numbered,
-        .debug_files = m.debug_files,
-        .debug_atoms = m.debug_atoms,
-        .targets = m.targets,
-        .targets_tail = o.targets.items,
-    };
+    if (o.nodes.count() == 0 and o.flags.count() == 0 and m.base_unlinked == 0) {
+        if (o.link_names == null) {
+            const names = try gpa.alloc([]const u8, m.atom_names.len);
+            const all: AtomNames = .{ .names = m.atom_names, .bytes = m.atom_name_bytes };
+            for (names, 0..) |*n, k| n.* = all.name(k);
+            o.link_names = names;
+        }
+        return .{
+            .refs = m.atom_refs,
+            .numbered = m.numbered,
+            .debug_files = m.debug_files,
+            .debug_atoms = m.debug_atoms,
+            .targets = m.targets,
+            .targets_tail = o.targets.items,
+            .names = o.link_names.?,
+        };
+    }
     if (o.gathered) |g| return g;
     var refs: std.ArrayList(Pack.AtomRef) = try .initCapacity(gpa, m.atom_refs.len);
     defer refs.deinit(gpa);
@@ -1029,6 +1105,8 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
     defer numbered.deinit(gpa);
     var debug_files: std.ArrayList(u32) = try .initCapacity(gpa, m.atom_refs.len);
     defer debug_files.deinit(gpa);
+    var names: std.ArrayList([]const u8) = try .initCapacity(gpa, m.atom_refs.len);
+    defer names.deinit(gpa);
     // The base's references are in node order: copy runs of base nodes
     // whole instead of one node at a time.
     var run_start: usize = 0;
@@ -1041,22 +1119,25 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
             const n = m.nodes[i];
             if (n.atoms_len == 0) continue;
             if (n.atoms_start != run_end) {
-                try appendRun(gpa, m, &refs, &numbered, &debug_files, run_start, run_end);
+                try appendRun(gpa, m, &refs, &numbered, &debug_files, &names, run_start, run_end);
                 run_start = n.atoms_start;
             }
             run_end = n.atoms_start + n.atoms_len;
             continue;
         }
         if (st == null or !linked or st.?.atoms.len == 0) continue;
-        try appendRun(gpa, m, &refs, &numbered, &debug_files, run_start, run_end);
+        try appendRun(gpa, m, &refs, &numbered, &debug_files, &names, run_start, run_end);
         run_start = run_end;
         try refs.appendSlice(gpa, st.?.atoms);
         try numbered.appendSlice(gpa, st.?.numbered);
         try debug_files.appendSlice(gpa, st.?.debug_files);
+        const node_names: AtomNames = .{ .names = st.?.atom_names, .bytes = st.?.name_bytes };
+        for (0..node_names.names.len) |k| try names.append(gpa, node_names.name(k));
     }
-    try appendRun(gpa, m, &refs, &numbered, &debug_files, run_start, run_end);
+    try appendRun(gpa, m, &refs, &numbered, &debug_files, &names, run_start, run_end);
     const debug_atoms = try debugAtoms(gpa, debug_files.items);
     errdefer gpa.free(debug_atoms);
+    o.link_names = try names.toOwnedSlice(gpa);
     const g: LinkInput = .{
         .refs = try refs.toOwnedSlice(gpa),
         .numbered = try numbered.toOwnedSlice(gpa),
@@ -1064,16 +1145,19 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
         .debug_atoms = debug_atoms,
         .targets = m.targets,
         .targets_tail = o.targets.items,
+        .names = o.link_names.?,
     };
     o.gathered = g;
     return g;
 }
 
-fn appendRun(gpa: Allocator, m: *const Manifest, refs: *std.ArrayList(Pack.AtomRef), numbered: *std.ArrayList(NumberedAtom), debug_files: *std.ArrayList(u32), lo: usize, hi: usize) !void {
+fn appendRun(gpa: Allocator, m: *const Manifest, refs: *std.ArrayList(Pack.AtomRef), numbered: *std.ArrayList(NumberedAtom), debug_files: *std.ArrayList(u32), names: *std.ArrayList([]const u8), lo: usize, hi: usize) !void {
     if (lo == hi) return;
     try refs.appendSlice(gpa, m.atom_refs[lo..hi]);
     try numbered.appendSlice(gpa, m.numbered[lo..hi]);
     try debug_files.appendSlice(gpa, m.debug_files[lo..hi]);
+    const run: AtomNames = .{ .names = m.atom_names[lo..hi], .bytes = m.atom_name_bytes };
+    for (0..hi - lo) |k| try names.append(gpa, run.name(k));
 }
 
 /// The indices of `debug_files` that are not `no_file`.
@@ -1273,6 +1357,7 @@ pub const Delta = struct {
     sources: std.ArrayList(SourceDelta) = .empty,
     scratch_numbered: std.ArrayList(NumberedAtom) = .empty,
     scratch_files: std.ArrayList(u32) = .empty,
+    scratch_names: std.ArrayList(AtomName) = .empty,
     scratch_targets: std.ArrayList(u32) = .empty,
 
     pub fn init(gpa: Allocator, base: *const Manifest) Delta {
@@ -1299,6 +1384,7 @@ pub const Delta = struct {
         d.sources.deinit(gpa);
         d.scratch_numbered.deinit(gpa);
         d.scratch_files.deinit(gpa);
+        d.scratch_names.deinit(gpa);
         d.scratch_targets.deinit(gpa);
     }
 
@@ -1321,6 +1407,7 @@ pub const Delta = struct {
         const gpa = d.gpa;
         d.scratch_numbered.clearRetainingCapacity();
         d.scratch_files.clearRetainingCapacity();
+        d.scratch_names.clearRetainingCapacity();
         d.scratch_targets.clearRetainingCapacity();
         const first_target = d.base.targetsLen() + d.targets_len;
         for (n.symbols) |s| {
@@ -1330,6 +1417,8 @@ pub const Delta = struct {
             });
             for (s.targets) |t| try d.scratch_targets.append(gpa, try d.symbolNumber(t));
             try d.scratch_files.append(gpa, if (s.file) |f| try d.fileIndex(f) else no_file);
+            const name = try d.addString(s.name);
+            try d.scratch_names.append(gpa, .{ .parent = @bitCast(s.parent), .off = name.off, .len = name.len, .prefix_len = s.prefix_len });
         }
         const delta: NodeDelta = .{
             .key = n.key,
@@ -1353,6 +1442,7 @@ pub const Delta = struct {
         try appendPadded(gpa, &d.nodes, @ptrCast(n.atoms));
         try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_numbered.items));
         try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_files.items));
+        try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_names.items));
         try appendPadded(gpa, &d.nodes, @ptrCast(d.scratch_targets.items));
         try appendPadded(gpa, &d.nodes, @ptrCast(n.refs));
         try appendPadded(gpa, &d.nodes, @ptrCast(n.result));
@@ -1504,6 +1594,9 @@ pub const Builder = struct {
     /// renumbers them.
     numbered: std.ArrayList(NumberedAtom) = .empty,
     debug_files: std.ArrayList(u32) = .empty,
+    /// Parallel to `atom_refs`, naming bytes in `atom_name_bytes`.
+    atom_names: std.ArrayList(AtomName) = .empty,
+    atom_name_bytes: std.ArrayList(u8) = .empty,
     targets: std.ArrayList(u32) = .empty,
     inputs: std.ArrayList(Input) = .empty,
     error_names: std.ArrayList(StrRef) = .empty,
@@ -1552,6 +1645,8 @@ pub const Builder = struct {
         b.atom_refs.deinit(gpa);
         b.numbered.deinit(gpa);
         b.debug_files.deinit(gpa);
+        b.atom_names.deinit(gpa);
+        b.atom_name_bytes.deinit(gpa);
         b.targets.deinit(gpa);
         b.inputs.deinit(gpa);
         b.error_names.deinit(gpa);
@@ -1590,6 +1685,8 @@ pub const Builder = struct {
         try b.atom_refs.appendSlice(gpa, base.atom_refs);
         try b.numbered.appendSlice(gpa, base.numbered);
         try b.debug_files.appendSlice(gpa, base.debug_files);
+        try b.atom_names.appendSlice(gpa, base.atom_names);
+        try b.atom_name_bytes.appendSlice(gpa, base.atom_name_bytes);
         try b.inputs.appendSlice(gpa, base.inputs);
         try b.error_names.appendSlice(gpa, base.error_names);
         try b.bases.appendSlice(gpa, base.bases);
@@ -1686,6 +1783,13 @@ pub const Builder = struct {
             try b.atom_refs.appendSlice(gpa, s.atoms);
             try b.numbered.appendSlice(gpa, s.numbered);
             try b.debug_files.appendSlice(gpa, s.debug_files);
+            const node_names: AtomNames = .{ .names = s.atom_names, .bytes = s.name_bytes };
+            for (s.atom_names, 0..) |an, k| try b.atom_names.append(gpa, .{
+                .parent = an.parent,
+                .off = (try b.addAtomName(node_names.name(k))).off,
+                .len = an.len,
+                .prefix_len = an.prefix_len,
+            });
             b.ref_ranges.items[e.key_ptr.*] = .{ @intCast(b.refs.items.len), @intCast(s.refs.len) };
             try b.refs.appendSlice(gpa, s.refs);
         }
@@ -1807,6 +1911,7 @@ pub const Builder = struct {
         try b.atom_refs.ensureUnusedCapacity(gpa, n_atoms);
         try b.numbered.ensureUnusedCapacity(gpa, n_atoms);
         try b.debug_files.ensureUnusedCapacity(gpa, n_atoms);
+        try b.atom_names.ensureUnusedCapacity(gpa, n_atoms);
         try b.targets.ensureUnusedCapacity(gpa, n_targets);
         try b.symbol_keys.ensureUnusedCapacity(gpa, n_atoms + n_atoms / 8);
         try b.symbol_map.ensureUnusedCapacity(gpa, n_atoms + n_atoms / 8);
@@ -1823,8 +1928,16 @@ pub const Builder = struct {
             try b.numbered.append(gpa, .{ .symbol = try b.symbolNumber(s.key), .targets = @intCast(b.targets.items.len) });
             for (s.targets) |t| try b.targets.append(gpa, try b.symbolNumber(t));
             try b.debug_files.append(gpa, if (s.file) |f| try b.fileIndex(f) else no_file);
+            const name = try b.addAtomName(s.name);
+            try b.atom_names.append(gpa, .{ .parent = @bitCast(s.parent), .off = name.off, .len = name.len, .prefix_len = s.prefix_len });
         }
         return @as(u32, @intCast(b.targets.items.len)) - first;
+    }
+
+    fn addAtomName(b: *Builder, name: []const u8) !StrRef {
+        const off: u32 = @intCast(b.atom_name_bytes.items.len);
+        try b.atom_name_bytes.appendSlice(b.gpa, name);
+        return .{ .off = off, .len = @intCast(name.len) };
     }
 
     fn symbolNumber(b: *Builder, key: Hash) !u32 {
@@ -1985,15 +2098,19 @@ pub const Builder = struct {
         defer gpa.free(numbered);
         const targets = try gpa.alloc(u32, target_count);
         defer gpa.free(targets);
-        var compacted: struct { edges: []u32 = &.{}, refs: []Pack.AtomRef = &.{}, debug_files: []u32 = &.{} } = .{};
+        var compacted: struct { edges: []u32 = &.{}, refs: []Pack.AtomRef = &.{}, debug_files: []u32 = &.{}, atom_names: []AtomName = &.{}, atom_name_bytes: std.ArrayList(u8) = .empty } = .{};
         defer {
             gpa.free(compacted.edges);
             gpa.free(compacted.refs);
             gpa.free(compacted.debug_files);
+            gpa.free(compacted.atom_names);
+            compacted.atom_name_bytes.deinit(gpa);
         }
         var edges: []const u32 = b.edges.items;
         var refs: []const Pack.AtomRef = b.atom_refs.items;
         var debug_files: []const u32 = b.debug_files.items;
+        var atom_names: []const AtomName = b.atom_names.items;
+        var atom_name_bytes: []const u8 = b.atom_name_bytes.items;
         if (in_order and edge_count == edges.len and ref_count == refs.len and target_count == b.targets.items.len) {
             @memcpy(numbered, b.numbered.items);
             @memcpy(targets, b.targets.items);
@@ -2001,6 +2118,7 @@ pub const Builder = struct {
             compacted.edges = try gpa.alloc(u32, edge_count);
             compacted.refs = try gpa.alloc(Pack.AtomRef, ref_count);
             compacted.debug_files = try gpa.alloc(u32, ref_count);
+            compacted.atom_names = try gpa.alloc(AtomName, ref_count);
             edge_count = 0;
             ref_count = 0;
             target_count = 0;
@@ -2011,6 +2129,13 @@ pub const Builder = struct {
                 const node_numbered = b.numbered.items[n.atoms_start..][0..n.atoms_len];
                 @memcpy(compacted.refs[ref_count..][0..n.atoms_len], b.atom_refs.items[n.atoms_start..][0..n.atoms_len]);
                 @memcpy(compacted.debug_files[ref_count..][0..n.atoms_len], b.debug_files.items[n.atoms_start..][0..n.atoms_len]);
+                // Only live names' bytes: replaced atoms' go.
+                const live_names: AtomNames = .{ .names = b.atom_names.items[n.atoms_start..][0..n.atoms_len], .bytes = b.atom_name_bytes.items };
+                for (compacted.atom_names[ref_count..][0..n.atoms_len], live_names.names, 0..) |*out, in, k| {
+                    out.* = in;
+                    out.off = @intCast(compacted.atom_name_bytes.items.len);
+                    try compacted.atom_name_bytes.appendSlice(gpa, live_names.name(k));
+                }
                 if (n.atoms_len != 0) {
                     const old_first = node_numbered[0].targets;
                     @memcpy(targets[target_count..][0..n.targets_len], b.targets.items[old_first..][0..n.targets_len]);
@@ -2025,6 +2150,8 @@ pub const Builder = struct {
             edges = compacted.edges;
             refs = compacted.refs;
             debug_files = compacted.debug_files;
+            atom_names = compacted.atom_names;
+            atom_name_bytes = compacted.atom_name_bytes.items;
         }
 
         // Renumber in link order: the atoms, then targets no atom defines,
@@ -2147,6 +2274,8 @@ pub const Builder = struct {
             @ptrCast(node_names),
             @ptrCast(name_starts),
             @ptrCast(name_index.items),
+            @ptrCast(atom_names),
+            atom_name_bytes,
             b.strings.items,
         };
         const zeros: [16]u8 = @splat(0);
@@ -2235,14 +2364,14 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         _ = try b.addNode(.{ .key = 100, .result_hash = 1 });
         const memcpy = try b.addRefName("memcpy");
         _ = try b.addNode(.{ .key = 101, .result_hash = 2, .src_hash = 7, .deps = &.{0}, .atoms = &.{.init(32, 64)}, .symbols = &.{
-            .{ .key = 0xa1, .targets = &.{ 0xa3, 0xe1 }, .file = "a.zig" },
+            .{ .key = 0xa1, .targets = &.{ 0xa3, 0xe1 }, .file = "a.zig", .name = "T.f", .parent = 0x55, .prefix_len = 1 },
         }, .refs = &.{ .{ .kind = .func, .value = 3 }, .{ .kind = .ext, .value = memcpy }, .{ .kind = .err, .value = 2 }, .{ .kind = .error_names, .value = 0 } }, .source = .{ .input = 0, .inst = 12 }, .result = &.{ 7, 8, 9 }, .names = &names_1 });
         // Node 2's dependency on node 0 is conditional.
         _ = try b.addNode(.{ .key = 102, .result_hash = 3, .deps = &.{ 1, Edge.init(0, .conditional), 3 }, .source = .{ .input = 0, .inst = 0 }, .source_name = "x", .result = &.{5} });
         b.items = &.{ 1, 2, 3, 4, 5, 6 };
         b.item_starts = &.{ 0, 5 };
         _ = try b.addNode(.{ .key = 103, .result_hash = 4, .atoms = &.{.init(160, 16)}, .symbols = &.{
-            .{ .key = 0xa3, .targets = &.{ 0xa1, 0xb0 } },
+            .{ .key = 0xa3, .targets = &.{ 0xa1, 0xb0 }, .name = "c" },
         } });
         try b.addInput(a_path, "root:a.zig", try tmp.dir.statFile(io, "a.zig", .{}), 55, Io.Clock.real.now(io));
         try t.expectEqual(1, try b.addErrorName("OutOfMemory", 0xe1));
@@ -2315,10 +2444,10 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         // any more but keeps its number until the next base.
         try t.expectEqual(6, m2.symbol(0xc0));
         try d.update(2, .{ .key = 102, .result_hash = 33, .deps = &.{3}, .atoms = &.{.init(96, 48)}, .symbols = &.{
-            .{ .key = 0xa2, .targets = &.{0xa1}, .file = "b.zig" },
+            .{ .key = 0xa2, .targets = &.{0xa1}, .file = "b.zig", .name = "b2" },
         }, .refs = &.{ .{ .kind = .rt, .value = try d.addRefName("compiler_rt:x") }, .{ .kind = .nav, .value = 0 } } });
         try d.update(4, .{ .key = 104, .result_hash = 6, .deps = &.{2}, .atoms = &.{.init(208, 16)}, .symbols = &.{
-            .{ .key = 0xa4, .targets = &.{ 0xa2, 0xe3 }, .file = "a.zig" },
+            .{ .key = 0xa4, .targets = &.{ 0xa2, 0xe3 }, .file = "a.zig", .name = "d" },
         }, .refs = &.{.{ .kind = .ext_weak, .value = try d.addRefName("memcpy") }}, .result = &.{ 70, 71 }, .subject = &.{72}, .names = &names_4, .source = .{ .input = 1, .inst = 5 }, .flags = .{ .stale = true } });
         // A new result item after the base's two, and the first replaced;
         // a node's source and another's flags, the rest of them as they
@@ -2400,13 +2529,20 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             // The numbers can change when a base is written; what they
             // stand for cannot.
             const in = try m3.linkInput(gpa);
-            const expected = [_]struct { Hash, []const Hash, ?[]const u8 }{
-                .{ 0xa1, &.{ 0xa3, 0xe1 }, "a.zig" },
-                .{ 0xa2, &.{0xa1}, "b.zig" },
-                .{ 0xa3, &.{ 0xa1, 0xb0 }, null },
-                .{ 0xa4, &.{ 0xa2, 0xe3 }, "a.zig" },
+            const expected = [_]struct { Hash, []const Hash, ?[]const u8, []const u8 }{
+                .{ 0xa1, &.{ 0xa3, 0xe1 }, "a.zig", "T.f" },
+                .{ 0xa2, &.{0xa1}, "b.zig", "b2" },
+                .{ 0xa3, &.{ 0xa1, 0xb0 }, null, "c" },
+                .{ 0xa4, &.{ 0xa2, 0xe3 }, "a.zig", "d" },
             };
             try t.expectEqual(expected.len, in.numbered.len);
+            // Symbol names, from the base and the log, and what renames
+            // them.
+            for (expected, in.names) |e, name| try t.expectEqualStrings(e[3], name);
+            try t.expectEqualStrings("b2", m3.atomNames(2).name(0));
+            try t.expectEqual(0x55, m3.atomNames(1).names[0].parentHash());
+            try t.expectEqual(1, m3.atomNames(1).names[0].prefix_len);
+            try t.expectEqual(0, m3.atomNames(4).names[0].parentHash());
             for (expected, in.numbered, in.debug_files) |e, na, f| {
                 try t.expectEqual(m3.symbol(e[0]).?, na.symbol);
                 const runs = if (na.targets < in.targets.len) in.targets[na.targets..] else in.targets_tail[na.targets - in.targets.len ..];
@@ -2455,6 +2591,8 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     defer m5.close(gpa, io);
     try t.expectEqual(0, m5.overlay.len);
     try expectLogged(&m5);
+    // Only live atoms' names.
+    try t.expectEqualStrings("T.fb2cd", m5.atom_name_bytes);
     // Renumbered in link order, without 0xc0.
     try t.expectEqual(8, m5.symbolLen());
     try t.expectEqual(null, m5.symbol(0xc0));

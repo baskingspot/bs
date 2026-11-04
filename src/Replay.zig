@@ -449,8 +449,11 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
     var atoms: std.ArrayList(struct { atom: Atom, debug: ?Atom.Debug }) = .empty;
     defer atoms.deinit(r.gpa);
     const changed_file = r.isChangedFile(owner.file);
-    for (m.atoms(g.node)) |ref| {
-        const d = r.pack.decode(ref, r.arch) catch return r.miss(g, "atom");
+    // Records keep no names: the manifest does.
+    const names = m.atomNames(g.node);
+    for (m.atoms(g.node), 0..) |ref, k| {
+        var d = r.pack.decode(ref, r.arch) catch return r.miss(g, "atom");
+        d.atom.name = names.name(k);
         var debug = d.debug;
         if (debug) |*dbg| {
             if (!try r.knowsDebugPaths(dbg)) return r.miss(g, "debug paths");
@@ -464,7 +467,12 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
     for (m.deps(g.node)) |e| {
         const d = Manifest.Edge.nodeOf(e);
         if (m.node(d).tag != @backingInt(Tag.content)) continue;
-        for (m.atoms(d)) |ref| try content.append(r.gpa, (r.pack.decode(ref, r.arch) catch return r.miss(g, "content atom")).atom);
+        const content_names = m.atomNames(d);
+        for (m.atoms(d), 0..) |ref, k| {
+            var a = (r.pack.decode(ref, r.arch) catch return r.miss(g, "content atom")).atom;
+            a.name = content_names.name(k);
+            try content.append(r.gpa, a);
+        }
     }
     const refs = try r.resolveRefs(g, true) orelse return r.miss(g, "references");
     defer r.gpa.free(refs);

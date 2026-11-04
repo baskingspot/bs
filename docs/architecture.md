@@ -178,8 +178,10 @@ below):
   (test/run/type_names.zig forces one).
 - *Atom names.* CodeGen runs while names can still change, on workers,
   so a function's or declaration's atom is named in `Emit.finish`
-  (`Emit.nameAtoms`), after `finalizeNames`. A loaded unit's atoms keep
-  the name their record has.
+  (`Emit.nameAtoms`), after `finalizeNames`, and so is a unit's atom that
+  an eager edit build loaded. `Emit.atom_names` keeps, for the cache,
+  which type's name each atom's name starts with (`nav.parent`; none for
+  an export's name).
 - *Parents.* A type's namespace's parent is the nearest enclosing
   namespace that is not inside a function (`Namespace.parent`,
   `Namespace.in_fn`). AstGen tunnels every reference to a declaration of
@@ -211,8 +213,8 @@ below):
     for `effects` references: a memoized call offers again on a hit,
     but a body that the comptime evaluator lowered has folded the
     call away. The creator, and so the name, does not, so
-    `ZAP_CACHE_VERIFY` checks names through the atoms' records, not
-    each node's offers.
+    `ZAP_CACHE_VERIFY` checks names through the atoms' names, not each
+    node's offers.
   - *Replay* (`Replay.contributeNames`, first in `finalizeNames`). The
     nodes a build *keeps* are the live ones whose units it did not
     analyze: those an eager build loaded, or those a lazy build's walk
@@ -2879,8 +2881,9 @@ compilation (see "Integration" below).
 ```
 
 - **Atom records** (`cache/atoms.zig`): 16-byte aligned, a 64-byte header,
-  then targets, relocations, an optional debug header, then bytes, name, and
-  debug strings. `check` validates a record once (lengths within it,
+  then targets, relocations, an optional debug header, then bytes and
+  debug strings (no symbol name: the manifest keeps those, "Type
+  names"). `check` validates a record once (lengths within it,
   section, alignment, frame kind, debug header lengths); `view` then builds
   the `Atom` and its `Atom.Debug` from the header without checks, their
   slices pointing into the record. A function's debug info is the record's
@@ -3194,8 +3197,9 @@ it and can flush every CPU's TLB.
   exception: it must exist on disk to be compiled, as upstream's must.
 - **Reuse means identical records**: `record` reuses a store entry when
   its result hash, counts, and atom-record length match, and the hash it
-  compares covers everything a record holds (symbol key, name, debug
-  file, name, and base line), not only the contents. Until 2026-11-03 it
+  compares covers everything a record holds (symbol key, debug file,
+  name, and base line; records keep no symbol names since 2026-11-04),
+  not only the contents. Until 2026-11-03 it
   covered contents and line numbers only, so an entry written by another
   compilation whose atoms had other names was reused, the manifest's atom
   references took this build's lengths, and the next relink failed its

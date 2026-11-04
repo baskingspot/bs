@@ -103,6 +103,10 @@ copies: std.StringArrayHashMapUnmanaged(u16) = .empty,
 exports: std.ArrayList(ElfObject.Export) = .empty,
 /// What produced each atom, for the on-disk cache (`Incremental`).
 atom_owners: std.ArrayList(Owner) = .empty,
+/// After `finish`, parallel to `atoms`: where each atom's name comes from
+/// a type's (`nameAtoms`), for the cache, which renames a loaded atom when
+/// the type's final name changes.
+atom_names: std.ArrayList(AtomName) = .empty,
 /// Content-addressed atoms each unit referred to.
 content_uses: std.ArrayList(ContentUse) = .empty,
 /// What each unit's code requested besides its atoms (declarations' data,
@@ -349,6 +353,11 @@ pub const CodeGenStats = struct {
     }
 };
 
+/// An atom's name is type `parent`'s name, which is its first
+/// `prefix_len` bytes, and the rest; `parent` is `.none` for a name that
+/// comes from no type.
+pub const AtomName = struct { parent: Index = .none, prefix_len: u32 = 0 };
+
 pub const Owner = union(enum) {
     unit: Zcu.AnalUnit,
     /// A content-addressed constant, shared by the units that use it.
@@ -392,6 +401,7 @@ pub fn deinit(emit: *Emit) void {
     emit.copies.deinit(gpa);
     emit.exports.deinit(gpa);
     emit.atom_owners.deinit(gpa);
+    emit.atom_names.deinit(gpa);
     emit.content_uses.deinit(gpa);
     emit.unit_refs.deinit(gpa);
     emit.link_refs.deinit(gpa);
@@ -1055,8 +1065,8 @@ pub fn finish(emit: *Emit) !bool {
     if (emit.lazy) {
         try emit.lowerNavs();
         if (emit.failed) return false;
-        try emit.nameAtoms();
         try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
+        try emit.nameAtoms();
         return true;
     }
     // Before the declarations: a slot can request an exported one.
@@ -1082,8 +1092,8 @@ pub fn finish(emit: *Emit) !bool {
         return false;
     }
 
-    try emit.nameAtoms();
     try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
+    try emit.nameAtoms();
     // An object's symbols by name, not in the order analysis or the
     // cache's loading found them, so that the object is a function of its
     // atoms as the link order is (`groupByOwner`).
@@ -1114,15 +1124,18 @@ pub fn finish(emit: *Emit) !bool {
 /// (docs/architecture.md, "Type names").
 pub const name_later: []const u8 = "(named later)";
 
-/// Names the atoms of declarations and functions made this build from the
-/// final names. A function's symbol name is upstream's: the declaration's
+/// Names the atoms of declarations and functions, those this build made
+/// and those it loaded, from the final names (docs/architecture.md, "Type
+/// names"). A function's symbol name is upstream's: the declaration's
 /// qualified name, with `__func_` and a stable hash for an instance of a
 /// generic function (upstream numbers them by InternPool index), or its
 /// export name. Names may repeat, like upstream's local symbols; the
-/// atom's key is its identity.
+/// atom's key is its identity. Fills `atom_names`.
 fn nameAtoms(emit: *Emit) !void {
     const ip = &emit.zcu.ip;
     const arena = emit.allocator();
+    try emit.atom_names.resize(emit.gpa, emit.atoms.items.len);
+    @memset(emit.atom_names.items, .{});
     // The last export of a declaration names its function.
     var exported: std.AutoHashMapUnmanaged(InternPool.NavIndex, InternPool.String) = .empty;
     defer exported.deinit(emit.gpa);
@@ -1132,12 +1145,15 @@ fn nameAtoms(emit: *Emit) !void {
     defer parents.deinit(emit.gpa);
     var aw: std.Io.Writer.Allocating = .init(emit.gpa);
     defer aw.deinit();
-    for (emit.atoms.items, emit.atom_owners.items) |*atom, owner| {
-        if (atom.name.ptr != name_later.ptr) continue;
-        const nav_index, const func_index: Index = switch (owner.unit) {
-            .nav_val => |nav| .{ nav, .none },
-            .func => |f| .{ ip.keyPayload(.func, f).owner_nav, f },
-            else => unreachable,
+    for (emit.atoms.items, emit.atom_owners.items, emit.atom_names.items) |*atom, owner, *info| {
+        const nav_index, const func_index: Index = switch (owner) {
+            .unit => |unit| switch (unit) {
+                .nav_val => |nav| .{ nav, .none },
+                // Not the coverage arrays (`addCoverage`).
+                .func => |f| if (atom.section == .text) .{ ip.keyPayload(.func, f).owner_nav, f } else continue,
+                else => continue,
+            },
+            .content, .link => continue,
         };
         const generic = func_index != .none and ip.keyPayload(.func, func_index).generic_owner != .none;
         if (func_index != .none and !generic) if (exported.get(nav_index)) |name| {
@@ -1151,6 +1167,7 @@ fn nameAtoms(emit: *Emit) !void {
             print.writeTypeName(ip, nav.parent, &aw.writer, .render) catch return error.OutOfMemory;
             gop.value_ptr.* = try arena.dupe(u8, aw.written());
         }
+        info.* = .{ .parent = nav.parent, .prefix_len = @intCast(gop.value_ptr.len) };
         atom.name = if (generic)
             try std.fmt.allocPrint(arena, "{s}.{s}__func_{x:0>8}", .{ gop.value_ptr.*, ip.stringSlice(nav.name), @as(u32, @truncate(ip.stableHash(func_index))) })
         else
@@ -1944,7 +1961,7 @@ test "a relink in the manifest's order reproduces the fresh link, with mixed ali
                 next_debug += 1;
                 break :f "t.zig";
             } else null;
-            try symbols.append(gpa, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = file });
+            try symbols.append(gpa, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = file, .name = a.name });
             if (i + 1 < atoms.items.len and std.meta.eql(owners.items[i + 1], owners.items[i]) and owners.items[i] != .content) continue;
             _ = try b.addNode(.{ .key = i, .result_hash = 0, .atoms = refs[first .. i + 1], .symbols = symbols.items });
             symbols.clearRetainingCapacity();
@@ -1956,8 +1973,9 @@ test "a relink in the manifest's order reproduces the fresh link, with mixed ali
     var m = (try cache.Manifest.open(gpa, io, tmp.dir)).?;
     defer m.close(gpa, io);
     const in = try m.linkInput(gpa);
-    const input = try pack.linkAtoms(gpa, .x86_64, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = &.{m.file(0)} });
+    var input = try pack.linkAtoms(gpa, .x86_64, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = &.{m.file(0)} });
     defer input.deinit(gpa);
+    input.names = in.names;
     const relinked = try Elf.emitInput(gpa, io, input, .{
         .entry = start,
         .symbols = .{ .atoms = in.numbered, .targets = in.targets, .targets_tail = in.targets_tail, .entry = m.entry_symbol, .len = m.symbolLen() },

@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
     t = now(io);
     var builder: Manifest.Builder = .{ .gpa = gpa };
     const symbols = try arena.alloc(Manifest.AtomSymbols, atoms.len);
-    for (symbols, atoms, debug_of) |*s, a, d| s.* = .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (d) |x| x.file else null };
+    for (symbols, atoms, debug_of) |*s, a, d| s.* = .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (d) |x| x.file else null, .name = a.name };
     var n_targets: usize = 0;
     for (atoms) |a| n_targets += a.targets.len;
     try builder.ensureUnusedCapacity(atoms.len, n_targets);
@@ -153,7 +153,8 @@ pub fn main(init: std.process.Init) !void {
         const in = try m.linkInput(gpa);
         var files: [512][]const u8 = undefined;
         for (files[0..m.fileCount()], 0..) |*f, j| f.* = m.file(@intCast(j));
-        const input = try p.linkAtoms(gpa, .x86_64, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files[0..m.fileCount()] });
+        var input = try p.linkAtoms(gpa, .x86_64, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files[0..m.fileCount()] });
+        input.names = in.names;
         defer input.deinit(gpa);
         const t1 = now(io);
         const out = try Elf.emitInput(gpa, io, input, parallel);
@@ -213,7 +214,7 @@ pub fn main(init: std.process.Init) !void {
         const t2 = now(io);
         const new_symbols = try gpa.alloc(Manifest.AtomSymbols, new_atoms.len);
         defer gpa.free(new_symbols);
-        for (new_symbols, new_atoms) |*s, a| s.* = .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets) };
+        for (new_symbols, new_atoms) |*s, a| s.* = .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .name = a.name };
         for (new_debug.items) |dbg| new_symbols[dbg.atom].file = dbg.file;
         var d: Manifest.Delta = .init(gpa, &m);
         try d.update(node, .{ .key = m.node(node).key, .result_hash = rand.int(u128), .src_hash = rand.int(u128), .deps = m.deps(node), .atoms = new_refs, .symbols = new_symbols });
@@ -335,7 +336,8 @@ fn relinkOnce(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, entry: Atom.SymbolKey
     const in = try m.linkInput(gpa);
     var names: [512][]const u8 = undefined;
     for (names[0..m.fileCount()], 0..) |*f, i| f.* = m.file(@intCast(i));
-    const input = try p.linkAtoms(gpa, .x86_64, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = names[0..m.fileCount()] });
+    var input = try p.linkAtoms(gpa, .x86_64, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = names[0..m.fileCount()] });
+    input.names = in.names;
     defer input.deinit(gpa);
     var values: [n_errors]Elf.NumberedValue = undefined;
     for (&values, 1..) |*v, code| v.* = .{ .symbol = m.errorSymbol(@intCast(code)), .value = code };

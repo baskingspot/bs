@@ -8,7 +8,8 @@
 //!   targets      [targets_len]SymbolKey (16 bytes each)
 //!   relocs       [relocs_len]Reloc (12 bytes each)
 //!   DebugHeader  (40 bytes, if `has_debug`)
-//!   bytes, name
+//!   bytes, name (always empty: the manifest keeps symbol names,
+//!   `Manifest.atom_names`, so that a name can change without its record)
 //!   if `has_debug`: file, name, lines, unit, files, inline names;
 //!   then, aligned, patches (u32), inlines (`Atom.Debug.Inline`), and
 //!   inline callees (SymbolKey, 16-byte aligned)
@@ -131,7 +132,7 @@ pub const DebugCursor = struct {
 /// The length of the record of `atom` with `debug`.
 pub fn encodedLen(atom: *const Atom, debug: ?*const Atom.Debug) usize {
     var n: usize = @sizeOf(Header) + 16 * atom.targets.len + @sizeOf(Atom.Reloc) * atom.relocs.len;
-    n += atom.bytes.len + atom.name.len;
+    n += atom.bytes.len;
     if (debug) |d| {
         const dh = debugHeader(d);
         n = DebugRuns.at(n + @sizeOf(DebugHeader) + debugBytesLen(dh), dh).end;
@@ -140,13 +141,14 @@ pub fn encodedLen(atom: *const Atom, debug: ?*const Atom.Debug) usize {
 }
 
 /// Writes the record of `atom` with `debug` to `out`, which is
-/// `encodedLen(atom, debug)` bytes.
+/// `encodedLen(atom, debug)` bytes. Not its name: a decoded atom's is
+/// empty.
 pub fn encode(atom: *const Atom, debug: ?*const Atom.Debug, out: []u8) void {
     std.debug.assert(out.len == encodedLen(atom, debug));
     const header: Header = .{
         .key = atom.key,
         .len = @intCast(out.len),
-        .name_len = @intCast(atom.name.len),
+        .name_len = 0,
         .bytes_len = @intCast(atom.bytes.len),
         .targets_len = @intCast(atom.targets.len),
         .relocs_len = @intCast(atom.relocs.len),
@@ -166,7 +168,6 @@ pub fn encode(atom: *const Atom, debug: ?*const Atom.Debug, out: []u8) void {
     w.writeAll(@ptrCast(atom.relocs)) catch unreachable;
     if (debug) |d| w.writeAll(std.mem.asBytes(&debugHeader(d))) catch unreachable;
     w.writeAll(atom.bytes) catch unreachable;
-    w.writeAll(atom.name) catch unreachable;
     if (debug) |d| {
         for ([_][]const u8{ d.file, d.name, d.lines, d.unit, d.files, d.inline_names }) |bytes| w.writeAll(bytes) catch unreachable;
         const runs = DebugRuns.at(w.end, debugHeader(d));
@@ -317,10 +318,10 @@ pub fn decode(bytes: []align(alignment) const u8, arch: Atom.Unwind.Arch) Decode
     return .{ .atom = v.atom, .debug = v.debug, .len = len };
 }
 
+/// Compares atoms, ignoring the name, which records do not keep.
 pub fn expectEqualAtoms(expected: Atom, actual: Atom) !void {
     const t = std.testing;
     try t.expectEqual(expected.key, actual.key);
-    try t.expectEqualStrings(expected.name, actual.name);
     try t.expectEqual(expected.section, actual.section);
     try t.expectEqual(expected.alignment, actual.alignment);
     try t.expectEqualSlices(u8, expected.bytes, actual.bytes);
@@ -401,6 +402,7 @@ test "atoms round-trip through records" {
     for (atoms, 0..) |expected, i| {
         const actual = try decode(@alignCast(copy[off..]), .x86_64);
         try expectEqualAtoms(expected, actual.atom);
+        try std.testing.expectEqualStrings("", actual.atom.name);
         try expectEqualDebug(cursor.of(i), if (actual.debug) |*d| d else null);
         off += actual.len;
     }

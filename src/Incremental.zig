@@ -307,8 +307,9 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     const files = try gpa.alloc([]const u8, m.fileCount());
     defer gpa.free(files);
     for (files, 0..) |*f, i| f.* = m.file(@intCast(i));
-    const input = try pack.linkAtoms(gpa, inc.arch, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
+    var input = try pack.linkAtoms(gpa, inc.arch, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
     defer input.deinit(gpa);
+    input.names = in.names;
     // An object's exports and imports; its imports are 0 in the image
     // (`ElfObject.linkInput`).
     var exports: std.ArrayList(ElfObject.Export) = .empty;
@@ -1640,7 +1641,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         for (n.atoms) |ai| {
             const a = &emit.atoms.items[ai];
             try atom_refs.append(gpa, new_refs[atom_at[ai]]);
-            try symbols.append(gpa, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (g.debug_of[ai]) |dbg| dbg.file else null });
+            try symbols.append(gpa, named(ip, emit, ai, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (g.debug_of[ai]) |dbg| dbg.file else null }));
         }
         var source = n.source;
         if (source.input != Manifest.Source.no_input) {
@@ -1916,7 +1917,14 @@ fn refreshDebug(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32) !voi
     try rp.pack.append(gpa, inc.io, atoms.items, debug.items, refs);
     const symbols = try gpa.alloc(Manifest.AtomSymbols, atoms.items.len);
     defer gpa.free(symbols);
-    for (symbols, atoms.items) |*s, a| s.* = .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets) };
+    const names = m.atomNames(i);
+    for (symbols, atoms.items, names.names, 0..) |*s, a, an, k| s.* = .{
+        .key = @backingInt(a.key),
+        .targets = @ptrCast(a.targets),
+        .name = names.name(k),
+        .parent = an.parentHash(),
+        .prefix_len = an.prefix_len,
+    };
     for (debug.items) |dbg| symbols[dbg.atom].file = dbg.file;
     const n = m.node(i);
     try d.update(i, .{
@@ -2251,7 +2259,7 @@ const Graph = struct {
                         for (n.atoms) |ai| {
                             const a = &c.atoms[ai];
                             h = h *% 31 +% contentsHash(a);
-                            rest = rest *% 31 +% cache.hash(@truncate(@backingInt(a.key)), a.name);
+                            rest = rest *% 31 +% cache.hash(@truncate(@backingInt(a.key)), "");
                             if (c.debug_of[ai]) |d| {
                                 h +%= cache.hash(@truncate(h), d.lines);
                                 rest = rest *% 31 +% d.base_line +% cache.hash(6, d.file) +% cache.hash(7, d.name);
@@ -2476,7 +2484,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
                 const a = &emit.atoms.items[ai];
                 const len = atoms_codec.encodedLen(a, debug_of[ai]);
                 try refs.append(gpa, .initIn(l[0], off, @intCast(len)));
-                try symbols.append(gpa, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (debug_of[ai]) |d| d.file else null });
+                try symbols.append(gpa, named(ip, emit, ai, .{ .key = @backingInt(a.key), .targets = @ptrCast(a.targets), .file = if (debug_of[ai]) |d| d.file else null }));
                 off += len;
             }
         }
@@ -3402,6 +3410,16 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
             V.report(r, ni, n, "different atoms", &differ);
             continue;
         }
+        // Symbol names, which the manifest keeps and an edit build may
+        // have renamed without touching the records.
+        const prev_names = m.atomNames(pi);
+        for (n.atoms, 0..) |ai, k| if (!std.mem.eql(u8, emit.atoms.items[ai].name, prev_names.name(k)) or
+            named(&r.zcu.ip, emit, ai, .{ .key = 0, .targets = &.{} }).parent != prev_names.names[k].parentHash())
+        {
+            V.report(r, ni, n, "different atom name", &differ);
+            if (differ <= 20) std.debug.print("cache verify:   full build {s}\ncache verify:   edit build {s}\n", .{ emit.atoms.items[ai].name, prev_names.name(k) });
+            break;
+        };
         for (n.atoms, prev_atoms) |ai, ref| {
             const a = &emit.atoms.items[ai];
             try buf.resize(gpa, atoms_codec.encodedLen(a, debug_of[ai]));
@@ -3428,6 +3446,19 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
     }
     std.debug.print("cache verify: {d} nodes compared with the edit build's, {d} differ\n", .{ r.nodes.items.len, differ });
     return differ == 0;
+}
+
+/// `s` with atom `ai`'s symbol name, which the manifest keeps
+/// (`Manifest.AtomName`).
+fn named(ip: *const InternPool, emit: *const Emit, ai: usize, s: Manifest.AtomSymbols) Manifest.AtomSymbols {
+    var out = s;
+    out.name = emit.atoms.items[ai].name;
+    const an = emit.atom_names.items[ai];
+    if (an.parent != .none) {
+        out.parent = ip.stableHash(an.parent);
+        out.prefix_len = an.prefix_len;
+    }
+    return out;
 }
 
 fn contentsHash(a: *const Atom) Hash {

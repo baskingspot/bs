@@ -232,6 +232,9 @@ pub const LinkAtoms = struct {
     debug_atoms: []const u32,
     /// Without them, debug paths are the records' own copies.
     files: ?DebugFiles,
+    /// The atom at `refs[i]` is named `names[i]`: records keep no names
+    /// (`Manifest.atom_names`). Without them, names are empty.
+    names: ?[]const []const u8 = null,
 
     pub fn deinit(in: LinkAtoms, gpa: Allocator) void {
         gpa.free(in.mems);
@@ -258,7 +261,9 @@ pub const LinkAtoms = struct {
     }
 
     pub inline fn atom(in: LinkAtoms, i: usize) Atom {
-        return atoms_codec.view(in.rec(i)).atom;
+        var a = atoms_codec.view(in.rec(i)).atom;
+        if (in.names) |ns| a.name = ns[i];
+        return a;
     }
 
     pub inline fn debugLen(in: LinkAtoms) usize {
@@ -409,6 +414,12 @@ test "append, reopen, decode, and compact" {
     const d = input.debug(0);
     try atoms_codec.expectEqualDebug(&debug[0], &d);
     try std.testing.expectEqual(names[1].ptr, d.file.ptr);
+    // Records keep no names; the manifest supplies them.
+    try std.testing.expectEqualStrings("", input.atom(0).name);
+    var named = input;
+    named.names = &.{ "x.b", "x.a", "", "", "", "" };
+    try std.testing.expectEqualStrings("x.b", named.atom(0).name);
+    try std.testing.expectEqualStrings("x.a", named.atom(1).name);
     // Past the end of the pack, in a pack that is not there.
     try std.testing.expect(!input.check(3));
     try std.testing.expect(!input.check(4));
@@ -446,7 +457,7 @@ test "base packs are linked, decoded, and compacted away" {
     defer dir.close(io);
 
     // A store pack: 48 bytes of something else, then a record.
-    const atom: Atom = .{ .key = .fromName("f"), .name = "t:f", .section = .text, .bytes = &.{0xc3} };
+    const atom: Atom = .{ .key = .fromName("f"), .name = "t:f", .section = .text, .bytes = &.{ 0x90, 0x90, 0x90, 0xc3 } };
     const debug: Atom.Debug = .{ .file = "t.zig", .name = "f", .base_line = 1, .lines = &.{1} };
     const len = atoms_codec.encodedLen(&atom, &debug);
     const bytes = try gpa.alloc(u8, 48 + len);
