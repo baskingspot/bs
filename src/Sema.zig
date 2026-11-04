@@ -8444,9 +8444,17 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
     switch (ctx) {
         .none => {},
         .ret => |func| if (func != .none and !sema.isTestFunc(func)) if (try sema.fnTypeExprSrc(func, null)) |loc| {
-            if (sema.isErrorType(actual) and !sema.isErrorType(wanted))
-                try sema.zcu.addDeclNote(loc.file, loc.span, "function cannot return an error", .{})
-            else
+            if (sema.isErrorType(actual) and !sema.isErrorType(wanted)) {
+                try sema.zcu.addDeclNote(loc.file, loc.span, "function cannot return an error", .{});
+                // `!T` lets it.
+                if (!sema.inLib(loc.file)) {
+                    const arena = sema.zcu.arena.allocator();
+                    const source = try sema.zcu.fe.source(@fromBackingInt(loc.file));
+                    const last = &sema.zcu.errors.items[sema.zcu.errors.items.len - 1];
+                    last.hint = try std.fmt.allocPrint(arena, "return type '!{s}' lets the function return errors", .{source[loc.span.start..loc.span.end]});
+                    last.fix = .{ .applicability = .maybe, .edits = try arena.dupe(@import("diag.zig").RawEdit, &.{.{ .start = loc.span.start, .end = loc.span.start, .text = "!" }}), .file = loc.file };
+                }
+            } else
                 try sema.zcu.addDeclNote(loc.file, loc.span, "function return type declared here", .{});
         },
         .param => |p| if (p.func != .none) if (try sema.fnTypeExprSrc(p.func, p.index)) |loc|

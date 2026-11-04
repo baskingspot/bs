@@ -28,6 +28,8 @@ pub fn main() void {
 // osr_reached.zig:17:39: error[type-mismatch]: expected type 'u32', found 'error{Short}'
 //   | while (n > 0) : (n -= 1) total += try nextByte(&it);
 //   note osr_reached.zig:11:10: function cannot return an error: fn sum() u32 {
+//   hint: return type '!u32' lets the function return errors
+//   fix? osr_reached.zig:11:10-11:10: "!"
 //   call: osr_reached.zig:21:14 comptime
 //   ref: main osr_reached.zig:24:9 (+3 std frames)
 // 1 error
