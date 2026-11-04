@@ -1014,7 +1014,7 @@ class Gen:
             (10, "decl"), (9, "assign"), (6, "sink"), (4, "if"), (3, "while"), (3, "for"),
             (2, "switch"), (3, "callstmt"), (2, "ptr"), (2, "aggr"), (1, "slice"), (1, "opt"),
             (1, "defer"), (1, "guard"), (1, "labeled"), (1, "inlinefor"), (1, "brk"), (1, "ret"),
-            (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"),
+            (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -1320,6 +1320,52 @@ class Gen:
         self.wpick([(3, self.s_assign), (1, self.s_callstmt), (1, self.s_sink)])(ctx)
         self.emit(ctx, f"const {b}: {t.name()} = {e};")
         self.sink(ctx, f"{a} ^ {b}", t) if self.chance(0.5) else self.sink(ctx, f"{a} -% {b}", t)
+
+    def s_vector(self, ctx):
+        """Explicit @Vector code, lowered to SIMD registers by both
+        compilers: element-wise operations, compares and @select, then
+        reductions and element reads folded into the checksum."""
+        et = self.pick([Int(False, 8), Int(False, 16), U32, U64, Int(True, 8), Int(True, 16), Int(True, 32),
+                        Int(True, 64)] + [t for t in self.ints if t.bits <= 64 and self.chance(0.2)])
+        n = self.pick([2, 4, 8, 16, 3, 5])
+        vt = f"@Vector({n}, {et.name()})"
+        arrs = [p for p in self.paths(ctx, lambda x: isinstance(x, Array) and x.n == n and x.elem.name() == et.name())]
+
+        def operand():
+            k = self.r.random()
+            if arrs and k < 0.3:
+                return self.render_path(ctx, self.pick(arrs)[0])
+            if k < 0.5:
+                return f"@as({vt}, @splat({self.int_expr(ctx, et, 2)}))"
+            return f"{vt}{{ {', '.join(self.int_expr(ctx, et, 1) for _ in range(n))} }}"
+
+        a, b, r = self.fresh("va"), self.fresh("vb"), self.fresh("vr")
+        self.emit(ctx, f"const {a}: {vt} = {operand()};")
+        self.emit(ctx, f"const {b}: {vt} = {operand()};")
+        k = self.r.random()
+        if k < 0.45:
+            e = f"{a} {self.pick(['+%', '-%', '*%', '&', '|', '^', '+|', '-|'])} {b}"
+        elif k < 0.6:
+            e = f"@{self.pick(['min', 'max'])}({a}, {b})"
+        elif k < 0.75:
+            e = f"@select({et.name()}, {a} {self.pick(['<', '<=', '==', '!=', '>', '>='])} {b}, {a}, {b})"
+        elif k < 0.85 and et.bits > 1:
+            e = f"({a} {self.pick(['<<', '>>'])} @as(@Vector({n}, std.math.Log2Int({et.name()})), @splat({self.r.randrange(et.bits)}))) ^ {b}"
+        elif k < 0.92:
+            e = f"~{a} ^ {b}"
+        else:
+            e = f"-%{a} +% {b}"
+        self.emit(ctx, f"const {r}: {vt} = {e};")
+        red = self.pick([".Xor", ".And", ".Or", ".Min", ".Max"])
+        self.sink(ctx, f"@reduce({red}, {r})", et)
+        if self.chance(0.6):
+            self.sink(ctx, f"{r}[{self.r.randrange(n)}]", et)
+        if self.chance(0.4):
+            arr = self.fresh("vx")
+            self.emit(ctx, f"const {arr}: [{n}]{et.name()} = {r};")
+            self.sink(ctx, f"{arr}[{self.index(ctx, n, allow_oob=False)}]", et)
+        if self.chance(0.3):
+            self.sink(ctx, f"@as(u{n}, @bitCast({a} == {b}))", Int(False, n))
 
     def s_switch(self, ctx):
         if self.chance(0.3):
