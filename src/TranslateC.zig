@@ -258,7 +258,8 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     // directory is trusted not to change.
     const trusted = init.environ_map.get("ZIG_LIB_DIR") == null and
         std.mem.eql(u8, lib, try std.fs.path.resolve(arena, &.{ cwd_path, build_options.zig_lib_dir }));
-    const exe, const exe_hash = try ensureBinary(init, lib, global, trusted);
+    const exe, const exe_hash, const use = try ensureBinary(init, lib, global, trusted);
+    defer if (use) |f| f.close(io);
 
     // Upstream's arguments, with the depfile and output paths left for
     // last so that the key does not depend on them.
@@ -364,8 +365,10 @@ fn mcpuArg(arena: std.mem.Allocator, target: *const std.Target) ![]const u8 {
 /// Builds translate-c once per bs binary and zig lib directory, into
 /// `<global cache>/bs/o/<hash>/translate-c`, as the build runner, and
 /// returns its path and the hash of its contents, kept beside it in
-/// `translate-c.hash` while the binary stats as the stamp says.
-fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, trusted: bool) !struct { []const u8, cache.Hash } {
+/// `translate-c.hash` while the binary stats as the stamp says. Also
+/// returns the directory's use (`cache.useTool`), held while the binary
+/// runs.
+fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, trusted: bool) !struct { []const u8, cache.Hash, ?Io.File } {
     const arena = init.arena.allocator();
     const io = init.io;
     const seed, _ = try Incremental.compilationKey(arena, io, &.{}, lib, "x86_64-linux");
@@ -374,8 +377,10 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, tru
     const exe = try std.fs.path.join(arena, &.{ dir, "translate-c" });
     const stamp = try std.fs.path.join(arena, &.{ dir, "translate-c.stat" });
     const hash_path = try std.fs.path.join(arena, &.{ dir, "translate-c.hash" });
-    if (trusted and BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h };
     try Io.Dir.cwd().createDirPath(io, dir);
+    const use = cache.useTool(io, dir) catch null;
+    errdefer if (use) |f| f.close(io);
+    if (trusted and BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h, use };
     try BuildRunner.compileTool(init, dir, &.{
         "bs",                                                                              "build-exe",
         "--dep",                                                                           "aro",
@@ -386,13 +391,13 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, tru
         "--global-cache-dir",                                                              global,
     }, "Compiling translate-c (first time setup)", "translate-c", try std.fmt.allocPrint(arena, "{s}/compiler/translate-c/main.zig", .{lib}), try std.fmt.allocPrint(arena, "{s}/compiler", .{lib}));
     // The binary's contents, hashed again only when it changed.
-    if (BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h };
+    if (BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h, use };
     const content = cache.hash(0, try Io.Dir.cwd().readFileAlloc(io, exe, arena, .unlimited));
     var bytes: [16]u8 = undefined;
     std.mem.writeInt(cache.Hash, &bytes, content, .little);
     // The stamp vouches for the hash file, so it follows it.
     if (Io.Dir.cwd().writeFile(io, .{ .sub_path = hash_path, .data = &bytes, .flags = .{} })) |_| BuildRunner.noteTool(io, exe, stamp) else |_| {}
-    return .{ exe, content };
+    return .{ exe, content, use };
 }
 
 fn readHash(io: Io, path: []const u8) ?cache.Hash {

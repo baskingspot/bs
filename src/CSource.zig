@@ -156,6 +156,10 @@ pub const Batch = struct {
     jobs: []Job,
     /// The C++ runtime libraries an executable links (`Options.cxx_runtime`).
     archives: []Archive = &.{},
+    /// The tool directories of the runtime libraries found in the global
+    /// cache, held until `destroy` so that maintenance keeps them
+    /// (`cache.useTool`).
+    tool_locks: std.ArrayList(Io.File) = .empty,
     group: Io.Group = .init,
     next: std.atomic.Value(usize) = .init(0),
     /// Upstream zig, or why there is none.
@@ -397,6 +401,13 @@ pub const Batch = struct {
         const members = try arena.alloc(@import("link/Archive.zig").Input, jobs.len);
         for (members, jobs) |*m, j| m.* = .{ .name = std.fs.path.basename(j.out_path), .bytes = try Io.Dir.cwd().readFileAlloc(io, j.out_path, arena, .unlimited) };
         try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(a.path).?);
+        // Marked as a tool, and held until the batch reads it.
+        if (cache.useTool(io, std.fs.path.dirname(a.path).?)) |use| {
+            b.tool_locks.append(b.gpa, use) catch |err| {
+                use.close(io);
+                return err;
+            };
+        } else |_| {}
         try @import("link/Archive.zig").write(b.gpa, io, Io.Dir.cwd(), a.path, members);
     }
 };
@@ -542,6 +553,10 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     const b = try gpa.create(Batch);
     errdefer gpa.destroy(b);
     b.* = .{ .gpa = gpa, .io = io, .jobs = &.{}, .zig = undefined, .paths = undefined, .verbose = o.verbose, .result_arena = .init(gpa) };
+    errdefer {
+        for (b.tool_locks.items) |f| f.close(io);
+        b.tool_locks.deinit(gpa);
+    }
     const ra = b.result_arena.allocator();
     b.paths = try .init(ra, io, o.zig_lib_dir);
     var scratch: std.heap.ArenaAllocator = .init(gpa);
@@ -579,10 +594,22 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         for (runtime.items[first..]) |rj| for (rj.argv) |a| try h.print(s, "{s}\x00", .{a});
         const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(cache.hash(2, h.items))), .lower);
         const path = try std.fs.path.join(ra, &.{ o.global_cache, "bs", "o", &hex, try std.fmt.allocPrint(s, "lib{s}.a", .{rl.name}) });
-        if (Io.Dir.cwd().access(io, path, .{})) |_| {
+        const found = found: {
+            const use = cache.useTool(io, std.fs.path.dirname(path).?) catch break :found false;
+            Io.Dir.cwd().access(io, path, .{}) catch {
+                use.close(io);
+                break :found false;
+            };
+            b.tool_locks.append(gpa, use) catch |err| {
+                use.close(io);
+                return err;
+            };
+            break :found true;
+        };
+        if (found) {
             runtime.shrinkRetainingCapacity(first);
             try archives.append(ra, .{ .path = path });
-        } else |_| {
+        } else {
             var rand: [8]u8 = undefined;
             io.random(&rand);
             const tmp_dir = try std.fs.path.join(ra, &.{ o.global_cache, "bs", "tmp", try std.fmt.allocPrint(s, "{s}-{s}", .{ rl.name, &std.fmt.bytesToHex(rand, .lower) }) });
@@ -697,6 +724,8 @@ pub fn destroy(b: *Batch) void {
     }
     for (b.jobs) |*j| j.arena.deinit();
     gpa.free(b.jobs);
+    for (b.tool_locks.items) |f| f.close(b.io);
+    b.tool_locks.deinit(gpa);
     b.result_arena.deinit();
     gpa.destroy(b);
 }

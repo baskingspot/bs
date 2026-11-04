@@ -68,6 +68,37 @@ pub fn lock(io: Io, dir: Io.Dir) !Io.File {
     return f;
 }
 
+/// The file in a global tool directory (`bs/o/<hash>`: the C++ runtime
+/// libraries, glibc's libc_nonshared.a, the build runner, translate-c)
+/// that marks it in use: a build holds a shared lock on it while it may
+/// still read the tool, and its mtime is the tool's last use.
+pub const tool_use_name = "used";
+
+/// Marks the tool directory `dir_path` in use until the returned file is
+/// closed: takes a shared lock on its `used` file, which
+/// `maintainCompilations` must take exclusively to delete the directory,
+/// and renews the file's mtime, by which maintenance ranks the tool. Fails
+/// if the directory does not exist. A caller takes it before checking
+/// that the tool is there, so that a tool it finds stays until it closes
+/// the file.
+pub fn useTool(io: Io, dir_path: []const u8) !Io.File {
+    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{});
+    defer dir.close(io);
+    const f = try dir.createFile(io, tool_use_name, .{ .truncate = false, .lock = .shared });
+    f.setTimestampsNow(io) catch {};
+    return f;
+}
+
+/// Entries in `bs/o` and translation records used this recently are not
+/// deleted over the size limit: they hold no lock, and a build that just
+/// found one may not have read it yet.
+const in_use_grace_ns = std.time.ns_per_hour;
+
+/// Over the size limit, a tool goes after the compilations and programs
+/// used up to this much later than it: rebuilding one (libc++ and
+/// libc++abi, the build runner) takes tens of seconds.
+const tool_bias_ns = std.time.ns_per_day;
+
 /// Compilation directories unused this long are deleted by
 /// `maintainCompilations`. They hold hard links to store packs, which keep
 /// those packs' disk space in use after the store trims them.
@@ -113,12 +144,13 @@ pub fn parseSize(text: []const u8) ?u64 {
 /// most recently used. `bs run`'s program directories (`bs/o`) count
 /// and go the same way, by the program's mtime, which every run renews by
 /// relinking it or, when nothing changed, by touching it
-/// (`Incremental.renew_output`); one is not locked, so a run that relinks the least
-/// recently used program at the moment it goes fails, and the next run
-/// builds it again. `bs translate-c`'s records (`bs/tc/<key>`) count
+/// (`Incremental.renew_output`). Tools in `bs/o` (`useTool`) go by their
+/// `used` file's mtime, ranked `tool_bias_ns` later, and only while no
+/// build holds them. `bs translate-c`'s records (`bs/tc/<key>`) count
 /// with their outputs (`o/<key>/`) and go the same way, by the record's
 /// mtime, which every hit renews; the record goes first, so a half-deleted
-/// translation is a miss. Test binaries in `bs/tmp` that a killed build left
+/// translation is a miss. Programs and records, which have no lock, are
+/// kept over the limit while used within `in_use_grace_ns`. Test binaries in `bs/tmp` that a killed build left
 /// go after a day. Runs at most once a minute, so that it costs a build
 /// a few stats, and with `force`, which `Incremental` passes for a build
 /// that started a directory. `Incremental` runs it once the build's new
@@ -145,9 +177,10 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
     trimTemporary(io, local_cache, now);
 
     const File = struct { inode: u64, size: u64 };
-    const Kind = enum { compilation, run, translation };
+    const Kind = enum { compilation, run, tool, translation };
     const Entry = struct {
-        /// `bs/c/<name>`, `bs/o/<name>`, or `bs/tc/<name>`.
+        /// `bs/c/<name>`, `bs/o/<name>` (a program or a tool), or
+        /// `bs/tc/<name>`.
         name_buf: [32]u8,
         name_len: u8,
         kind: Kind,
@@ -160,6 +193,11 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
 
         fn name(e: *const @This()) []const u8 {
             return e.name_buf[0..e.name_len];
+        }
+
+        /// When it was used, for ranking: a tool as if later.
+        fn rank(e: *const @This()) Io.Timestamp {
+            return if (e.kind == .tool) e.used.?.addDuration(.fromNanoseconds(tool_bias_ns)) else e.used.?;
         }
     };
     var entries: std.ArrayList(Entry) = .empty;
@@ -192,7 +230,7 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
                 }
                 var d = switch (entry.kind) {
                     .compilation => c_.openDir(io_, entry.name(), .{ .iterate = true }),
-                    .run => o_.?.openDir(io_, entry.name(), .{ .iterate = true }),
+                    .run, .tool => o_.?.openDir(io_, entry.name(), .{ .iterate = true }),
                     .translation => local.openDir(io_, std.fmt.bufPrint(&path_buf, "o/{s}", .{entry.name()}) catch unreachable, .{ .iterate = true }),
                 } catch continue;
                 defer d.close(io_);
@@ -202,8 +240,15 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
                     const stat = d.statFile(io_, e.name, .{}) catch continue;
                     switch (entry.kind) {
                         // A run that reuses the program renews its
-                        // mtime.
-                        .run => if (entry.used == null or stat.mtime.compare(.gt, entry.used.?)) {
+                        // mtime; a tool's use renews its `used` file's,
+                        // which alone counts once it has one.
+                        .run => if (std.mem.eql(u8, e.name, tool_use_name)) {
+                            entry.kind = .tool;
+                            entry.used = stat.mtime;
+                        } else if (entry.used == null or stat.mtime.compare(.gt, entry.used.?)) {
+                            entry.used = stat.mtime;
+                        },
+                        .tool => if (std.mem.eql(u8, e.name, tool_use_name)) {
                             entry.used = stat.mtime;
                         },
                         .compilation => if (std.mem.eql(u8, e.name, "lock")) {
@@ -234,7 +279,7 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
     // Most recently used first.
     std.mem.sortUnstable(Entry, entries.items, {}, struct {
         fn newer(_: void, a: Entry, b: Entry) bool {
-            return a.used.?.compare(.gt, b.used.?);
+            return a.rank().compare(.gt, b.rank());
         }
     }.newer);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
@@ -255,11 +300,20 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
     while (i > 0) {
         i -= 1;
         const e = &entries.items[i];
-        const old = e.used.?.durationTo(now).toNanoseconds() > max_unused_compilation_ns;
+        const age = e.used.?.durationTo(now).toNanoseconds();
+        const old = age > max_unused_compilation_ns;
         if (!old and (!over or total <= target)) break;
+        if (!old and age < in_use_grace_ns and (e.kind == .run or e.kind == .translation)) continue;
         var buf: [64]u8 = undefined;
         switch (e.kind) {
             .run => o.?.deleteTree(io, e.name()) catch continue,
+            .tool => {
+                const use_path = std.fmt.bufPrint(&buf, "{s}/" ++ tool_use_name, .{e.name()}) catch unreachable;
+                const f = o.?.openFile(io, use_path, .{ .mode = .read_write }) catch continue;
+                defer f.close(io);
+                if (!(f.tryLock(io, .exclusive) catch false)) continue;
+                o.?.deleteTree(io, e.name()) catch continue;
+            },
             .compilation => {
                 const lock_path = std.fmt.bufPrint(&buf, "{s}/lock", .{e.name()}) catch unreachable;
                 const f = c.openFile(io, lock_path, .{ .mode = .read_write }) catch continue;
@@ -431,4 +485,73 @@ test {
     _ = Store;
     _ = Manifest;
     _ = Pack;
+}
+
+test "maintainCompilations keeps tools in use and recent programs, and ranks tools after newer compilations" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const t = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const now = Io.Clock.real.now(io);
+    const ago = struct {
+        fn ts(n: Io.Timestamp, ns: i64) Io.Timestamp {
+            return n.addDuration(.fromNanoseconds(-ns));
+        }
+    }.ts;
+    const hour = std.time.ns_per_hour;
+    // A compilation used an hour ago (400 bytes), and in `bs/o` libc++,
+    // held by a build, used four days ago, the build runner three days
+    // ago, libunwind three hours ago, and a program just written (100
+    // bytes each).
+    var d = try compilationDir(io, tmp.dir, 0xc);
+    defer d.close(io);
+    (try lock(io, d)).close(io);
+    try d.writeFile(io, .{ .sub_path = "manifest", .data = &(@as([400]u8, @splat(0))) });
+    try d.setTimestamps(io, "lock", .{ .modify_timestamp = .{ .new = ago(now, hour) } });
+    const Entry = struct { name: []const u8, file: []const u8, age: i64, tool: bool };
+    const entries = [_]Entry{
+        .{ .name = "aaaa", .file = "libc++.a", .age = 96 * hour, .tool = true },
+        .{ .name = "bbbb", .file = "maker", .age = 72 * hour, .tool = true },
+        .{ .name = "cccc", .file = "libunwind.a", .age = 3 * hour, .tool = true },
+        .{ .name = "dddd", .file = "prog", .age = 0, .tool = false },
+    };
+    for (entries) |e| {
+        var buf: [64]u8 = undefined;
+        var od = try tmp.dir.createDirPathOpen(io, try std.fmt.bufPrint(&buf, "bs/o/{s}", .{e.name}), .{});
+        defer od.close(io);
+        try od.writeFile(io, .{ .sub_path = e.file, .data = &(@as([100]u8, @splat(0))) });
+        try od.setTimestamps(io, e.file, .{ .modify_timestamp = .{ .new = ago(now, e.age) } });
+        if (e.tool) {
+            try od.writeFile(io, .{ .sub_path = tool_use_name, .data = "" });
+            try od.setTimestamps(io, tool_use_name, .{ .modify_timestamp = .{ .new = ago(now, e.age) } });
+        }
+    }
+    var o = try tmp.dir.openDir(io, "bs/o", .{});
+    defer o.close(io);
+    const held = held: {
+        const p = try o.realPathFileAlloc(io, "aaaa", gpa);
+        defer gpa.free(p);
+        break :held try useTool(io, p);
+    };
+    // As if the build had found libc++ four days ago and held it since.
+    try held.setTimestamps(io, .{ .modify_timestamp = .{ .new = ago(now, 96 * hour) } });
+
+    // 800 bytes against a limit of 400, down to 300: the build runner
+    // goes, libc++ is held, and then the compilation goes before
+    // libunwind, though libunwind was used before it.
+    const r = (try maintainCompilations(gpa, io, tmp.dir, 400, true)).?;
+    try t.expectEqual(5, r.scanned);
+    try t.expectEqual(2, r.deleted);
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, "bs/c/" ++ std.fmt.hex(@as(Hash, 0xc)), .{}));
+    for (entries, [_]bool{ true, false, true, true }) |e, kept| {
+        if (kept) _ = try o.statFile(io, e.name, .{}) else try t.expectError(error.FileNotFound, o.statFile(io, e.name, .{}));
+    }
+    // Once the build is done, libc++ goes, and libunwind with it under a
+    // smaller limit; the program, used within the grace period, stays.
+    held.close(io);
+    try t.expectEqual(2, (try maintainCompilations(gpa, io, tmp.dir, 100, true)).?.deleted);
+    for (entries, [_]bool{ false, false, false, true }) |e, kept| {
+        if (kept) _ = try o.statFile(io, e.name, .{}) else try t.expectError(error.FileNotFound, o.statFile(io, e.name, .{}));
+    }
 }

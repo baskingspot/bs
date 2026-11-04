@@ -4005,7 +4005,20 @@ it and can flush every CPU's TLB.
   translate-c`'s records (`bs/tc/<key>`) count with their outputs
   (`o/<key>/`) and go the same way, by the record's mtime, which every
   hit renews; eviction deletes the record first, so that a half-deleted
-  translation is a miss. `bs
+  translation is a miss. Tools in `bs/o` (the C++ runtime libraries,
+  libc_nonshared.a, the build runner, translate-c) are marked in use by a
+  `used` file (`cache.useTool`): a build that finds one takes a shared
+  lock on it before checking that the tool is there and holds it while it
+  may read the tool (a C batch until `destroy`, translate-c while it runs,
+  the build runner until it replaces the process), renewing its mtime.
+  Maintenance deletes a tool only after taking that lock exclusively, and
+  ranks tools a day later than their last use (`tool_bias_ns`), since
+  rebuilding one takes tens of seconds. Programs and translation records,
+  which have no lock, are kept over the limit while used within the last
+  hour (`in_use_grace_ns`). Before this (2026-11-04), a concurrent build's
+  maintenance deleted libc++abi.a and libunwind.a between another build's
+  check and its read: tools were never renewed, so they ranked as old as
+  their first build. `bs
   test` deletes its binary (`bs/tmp`) once it ran; ones a killed build
   left go after a day. A store pack that a compilation directory
   links keeps its space until the directory goes, which is why the local

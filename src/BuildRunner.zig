@@ -42,6 +42,9 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const runner_dir = try std.fmt.allocPrint(arena, "{s}/bs/o/{x:0>32}", .{ global, runner_hash });
     try Io.Dir.cwd().createDirPath(io, runner_dir);
     const runner_path = try std.fs.path.join(arena, &.{ runner_dir, "maker" });
+    // Held until the runner replaces this process (the file closes on
+    // exec), so that maintenance keeps the runner it finds.
+    _ = cache.useTool(io, runner_dir) catch {};
     // With bs's own zig lib directory, the pinned release's, which nobody
     // edits, a runner that is as the last check left it is current: that
     // saves the check's stat of every source the runner imports (about
