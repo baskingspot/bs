@@ -93,16 +93,24 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ip.keyTag(cg.typeOf(data.bin_op.lhs)) == .vector_type,
         .neg_float, .abs_float, .sqrt => ip.keyTag(cg.typeOf(data.un_op)) == .vector_type,
         .not => ip.keyTag(data.ty_op.ty) == .vector_type,
-        // Between vectors of 9 to 16 bytes, from register to register.
-        // (Smaller ones move through a GPR as integers do.)
+        // Between 16-byte vectors in XMM registers, or one and a 16-byte
+        // value in memory (an array, a wide integer): one movdqu.
+        // (Smaller vectors move through a GPR as integers do.)
         .bitcast => blk: {
             const ty = data.ty_op.ty;
             const src_ty = cg.typeOf(data.ty_op.operand);
-            break :blk inXmm(ip, ty) and inXmm(ip, src_ty) and Type.abiSize(ip, ty) == 16 and Type.abiSize(ip, src_ty) == 16;
+            if (Type.abiSize(ip, ty) != 16 or Type.abiSize(ip, src_ty) != 16) break :blk false;
+            break :blk (inXmm(ip, ty) or inXmm(ip, src_ty)) and (inXmm(ip, ty) or inMem(cg, ty)) and (inXmm(ip, src_ty) or inMem(cg, src_ty));
         },
         .aggregate_init => isSplat(cg, data),
         else => false,
     };
+}
+
+/// Whether values of 16-byte type `ty` live in memory, never in
+/// registers.
+fn inMem(cg: *CodeGen, ty: Index) bool {
+    return !inXmm(cg.ip, ty) and !cg.inPair(ty);
 }
 
 /// Whether `aggregate_init` `data` broadcasts one runtime element to a
@@ -138,11 +146,14 @@ pub fn deferOperands(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index)
         cg: *CodeGen,
         before: []const Inst.Index,
         at: u32,
+        /// A bitcast reads its operand, an array or a wide integer, in
+        /// place too.
+        bitcast: bool,
         pub fn use(t: @This(), ref: Ref) void {
             const c = t.cg;
             const ip = c.ip;
             const i = ref.toIndex() orelse return;
-            if (shape(ip, c.typeOf(ref)) == null) return;
+            if (shape(ip, c.typeOf(ref)) == null and !t.bitcast) return;
             const ii = @backingInt(i);
             const live = c.ssa.live.slice();
             if (live.items(.uses)[ii] != 1 or c.homes[ii] != .none) return;
@@ -157,6 +168,9 @@ pub fn deferOperands(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index)
                 .bitcast => {
                     const l = data.ty_op.operand.toIndex() orelse return;
                     if (tags[@backingInt(l)] != .load or live.items(.fate)[ii] != .normal) return;
+                    // A 16-byte bitcast reads its load in place itself, at
+                    // its own position, which a view would move here.
+                    if (c.homes[@backingInt(l)] != .none) return;
                     if (Type.abiSize(ip, c.typeOf(data.ty_op.operand)) < Type.abiSize(ip, data.ty_op.ty)) return;
                     c.deferLoad(data.ty_op.operand, t.before, t.at);
                     if (c.homes[@backingInt(l)] != .deferred) return;
@@ -169,7 +183,8 @@ pub fn deferOperands(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index)
         }
     };
     const pos = cg.ssa.live.items(.def)[@backingInt(inst)];
-    Ssa.forEachOperand(cg.ir, inst, T{ .cg = cg, .before = before, .at = pos });
+    const bitcast = cg.ir.instructions.items(.tag)[@backingInt(inst)] == .bitcast;
+    Ssa.forEachOperand(cg.ir, inst, T{ .cg = cg, .before = before, .at = pos, .bitcast = bitcast });
 }
 
 /// For `deferOperands`: `@reduce(.Min, @select(T, pred, iota, @splat(m)))`
@@ -347,12 +362,12 @@ fn chunk(cg: *CodeGen, ref: Ref, k: u32) Error!Chunk {
     const ip = cg.ip;
     if (ref.toInterned()) |v| {
         const ty = ip.typeOf(v);
-        if (splatBits(cg, v)) |all_bits| {
-            const lb = shape(ip, ty).?.lane.bytes();
+        if (shape(ip, ty)) |s| if (splatBits(cg, v)) |all_bits| {
+            const lb = s.lane.bytes();
             const bits = all_bits & lenMask(lb * 8);
             if (bits == 0) return .zero;
             if (bits == lenMask(lb * 8)) return .ones;
-        }
+        };
         return switch (try cg.locOf(ref)) {
             .mem => |m| .{ .mem = CodeGen.offsetMem(m, 16 * k) },
             else => unreachable, // a vector constant lives in memory
@@ -485,22 +500,32 @@ fn has(cg: *CodeGen, f: std.Target.x86.Feature) bool {
     return cg.emit.zcu.cpu.has(.x86, f);
 }
 
-/// Each lane's sign bit set, in `r`, for unsigned compares as signed ones.
-fn signBits(cg: *CodeGen, r: Xmm, lane: Lane) Error!void {
-    if (lane == .i64) {
-        try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @bitCast(@as(u64, 1 << 63)) });
-        try cg.e.movToXmm(.qword, r, .{ .reg = .rcx });
-        return cg.e.pshuf(.d, r, .{ .reg = r }, 0x44);
-    }
-    const pattern: u32 = switch (lane) {
-        .i8 => 0x8080_8080,
-        .i16 => 0x8000_8000,
-        .i32 => 0x8000_0000,
+/// 16 bytes of lanes with only their sign bit set, for unsigned compares
+/// as signed ones.
+fn signMem(cg: *CodeGen, lane: Lane) Error!Mem {
+    return laneConst(cg, lane.bytes(), switch (lane) {
+        .i8 => struct {
+            fn f(_: u32) u64 {
+                return 0x80;
+            }
+        }.f,
+        .i16 => struct {
+            fn f(_: u32) u64 {
+                return 0x8000;
+            }
+        }.f,
+        .i32 => struct {
+            fn f(_: u32) u64 {
+                return 0x8000_0000;
+            }
+        }.f,
+        .i64 => struct {
+            fn f(_: u32) u64 {
+                return 1 << 63;
+            }
+        }.f,
         else => unreachable,
-    };
-    try cg.e.mov(.dword, .{ .reg = .rcx }, .{ .imm = pattern });
-    try cg.e.movToXmm(.dword, r, .{ .reg = .rcx });
-    try cg.e.pshuf(.d, r, .{ .reg = r }, 0);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -598,16 +623,16 @@ fn minMax(cg: *CodeGen, max: bool, lane: Lane, signed: bool, r: Xmm, b: Xmm) Err
                 .i8 => if (max) .pmaxsb else .pminsb,
                 else => if (max) .pmaxuw else .pminuw,
             }, r, .{ .reg = b });
-            if (flip) {
-                try signBits(cg, .xmm2, lane);
-                try e.pint(.pxor, r, .{ .reg = .xmm2 });
-                try e.pint(.pxor, b, .{ .reg = .xmm2 });
+            const sign: ?Mem = if (flip) try signMem(cg, lane) else null;
+            if (sign) |m| {
+                try e.pint(.pxor, r, .{ .mem = m });
+                try e.pint(.pxor, b, .{ .mem = m });
             }
             try e.pint(switch (lane) {
                 .i8 => if (max) .pmaxub else .pminub,
                 else => if (max) .pmaxsw else .pminsw,
             }, r, .{ .reg = b });
-            if (flip) try e.pint(.pxor, r, .{ .reg = .xmm2 });
+            if (sign) |m| try e.pint(.pxor, r, .{ .mem = m });
         },
         .i32, .i64 => {
             if (lane == .i32 and sse41) return e.pint38(if (signed)
@@ -618,9 +643,9 @@ fn minMax(cg: *CodeGen, max: bool, lane: Lane, signed: bool, r: Xmm, b: Xmm) Err
             try e.movdq(true, .{ .reg = .xmm2 }, .{ .reg = if (max) b else r });
             try e.movdq(true, .{ .reg = .xmm3 }, .{ .reg = if (max) r else b });
             if (!signed) {
-                try signBits(cg, .xmm4, lane);
-                try e.pint(.pxor, .xmm2, .{ .reg = .xmm4 });
-                try e.pint(.pxor, .xmm3, .{ .reg = .xmm4 });
+                const m = try signMem(cg, lane);
+                try e.pint(.pxor, .xmm2, .{ .mem = m });
+                try e.pint(.pxor, .xmm3, .{ .mem = m });
             }
             try pcmpgt(cg, lane, .xmm2, .{ .reg = .xmm3 });
             try e.pint(.pand, b, .{ .reg = .xmm2 });
@@ -712,7 +737,7 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
     const a, const b = if (swap) .{ rhs, lhs } else .{ lhs, rhs };
     const n = s.perChunk();
     const biased = !s.lane.isFloat() and !signed and op != .eq and op != .neq;
-    if (biased) try signBits(cg, .xmm3, s.lane);
+    const sign: ?Mem = if (biased) try signMem(cg, s.lane) else null;
     for (0..s.chunks()) |kk| {
         const k: u32 = @intCast(kk);
         try loadChunk(cg, .xmm0, a, k);
@@ -753,8 +778,8 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
                     try pcmpgt(cg, s.lane, .xmm0, try srcChunk(cg, b, k, .xmm1));
                 } else {
                     try loadChunk(cg, .xmm1, b, k);
-                    try e.pint(.pxor, .xmm0, .{ .reg = .xmm3 });
-                    try e.pint(.pxor, .xmm1, .{ .reg = .xmm3 });
+                    try e.pint(.pxor, .xmm0, .{ .mem = sign.? });
+                    try e.pint(.pxor, .xmm1, .{ .mem = sign.? });
                     try pcmpgt(cg, s.lane, .xmm0, .{ .reg = .xmm1 });
                 }
             }
@@ -838,7 +863,7 @@ fn reduce(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, operand: R
         else => false,
     };
     const lanes_signed = if (flip) !signed else signed;
-    if (flip) try signBits(cg, .xmm5, s.lane);
+    const sign: ?Mem = if (flip) try signMem(cg, s.lane) else null;
     for (0..chunks) |kk| {
         const k: u32 = @intCast(kk);
         const r: Xmm = if (k == 0) .xmm0 else .xmm1;
@@ -864,7 +889,7 @@ fn reduce(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, operand: R
             if (identity != lenMask(bits)) try e.pint(.pand, r, .{ .mem = try constMem(cg, keep) });
             if (identity != 0) try e.pint(.por, r, .{ .mem = try constMem(cg, fill) });
         }
-        if (flip) try e.pint(.pxor, r, .{ .reg = .xmm5 });
+        if (sign) |m| try e.pint(.pxor, r, .{ .mem = m });
         if (k != 0) try combine(cg, op, s.lane, lanes_signed, .xmm0, .xmm1);
     }
     var width: u32 = if (chunks > 1) 16 else std.math.ceilPowerOfTwoAssert(u32, s.bytes());
@@ -874,7 +899,7 @@ fn reduce(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, operand: R
         try e.pshift(.psrldq, .xmm1, @intCast(width));
         try combine(cg, op, s.lane, lanes_signed, .xmm0, .xmm1);
     }
-    if (flip) try e.pint(.pxor, .xmm0, .{ .reg = .xmm5 });
+    if (sign) |m| try e.pint(.pxor, .xmm0, .{ .mem = m });
     const d = cg.destReg(inst);
     switch (s.lane) {
         .i64 => try e.movFromXmm(.qword, .{ .reg = d }, .xmm0),

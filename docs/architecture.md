@@ -1283,7 +1283,11 @@ backend does, not scalarized. The split has three parts:
   is a vector operation, or a bitcast of one, is read in place by that
   operation (`Home.deferred`, `Home.view`), so
   `@as(@Vector(64, u8), @splat(0)) != p[0..64].*` is four
-  `movdqu`/`pcmpeqb`/`pmovmskb` triples and no copies. The lowerings
+  `movdqu`/`pcmpeqb`/`pmovmskb` triples and no copies. A bitcast between a
+  16-byte vector and a 16-byte array, wide integer or f128 is one
+  `movdqu` (`vector.lowers`), so `@as(V, @bitCast(p[i..][0..16].*))`
+  loads straight into an XMM register, and the bitcast is no clobber
+  point. The lowerings
   use only rax, rcx, rdx, r10, r11 and xmm0–xmm5, so none is a clobber
   point: a vector variable stays in xmm8–xmm15 across them, as a loop's
   accumulator does.
