@@ -91,6 +91,7 @@ pub const Code = enum(u16) {
     @"compile-error",
     @"compile-log",
     @"undefined-symbol",
+    @"naked-fn",
 };
 
 /// A location, resolved for rendering.
@@ -1301,7 +1302,12 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "integer and float literals passed to variadic function must be casted to a fixed-size number type", .@"bad-call" },
     .{ "member function '{s}' has no parameters", .@"bad-call" },
     .{ "type '{f}' not a function", .@"bad-call" },
-    .{ "unable to call function with naked calling convention", .@"bad-call" },
+    .{ "unable to call function with calling convention '{s}'", .@"bad-call" },
+    .{ "runtime {s} not allowed in naked function", .@"naked-fn" },
+    .{ "runtime @panic not allowed in naked function", .@"naked-fn" },
+    .{ "runtime safety check not allowed in naked function", .@"naked-fn" },
+    .{ "local variable in naked function", .@"naked-fn" },
+    .{ "cannot return from naked function", .@"naked-fn" },
     .{ "variadic function does not support '{s}' calling convention", .@"bad-call" },
     .{ "calling convention '{s}' only available on architectures {s}", .@"bad-fn-type" },
     .{ "@bitCast size mismatch: destination type '{f}' has {d} bits but source type '{f}' has {d} bits", .@"bad-cast" },

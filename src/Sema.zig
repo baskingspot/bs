@@ -40,6 +40,9 @@ owner: Zcu.AnalUnit,
 owner_nav: InternPool.NavIndex = .none,
 /// The runtime function whose body is being analyzed, or `.none`.
 func: Index = .none,
+/// Whether `func` has the naked calling convention, which rules out
+/// stack use and runtime calls in its body and in its inline callees.
+func_is_naked: bool = false,
 /// Return type of the function whose body (runtime, or comptime-inlined)
 /// is being analyzed.
 fn_ret_ty: Index = .none,
@@ -1824,6 +1827,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     var sema = create(zcu, arena_state.allocator(), nav.file, .{ .func = func_index });
     defer sema.destroy();
     sema.func = func_index;
+    sema.func_is_naked = fn_ty.cc == .naked;
     sema.branch_quota = @max(sema.branch_quota, sema.zcu.branch_quotas.get(func_index) orelse 0);
     sema.fn_ret_ty = fn_ty.return_type;
     if (ip.keyTag(fn_ty.return_type) == .error_union_type) {
@@ -2860,8 +2864,14 @@ fn addPanic(sema: *Sema, block: *Block, id: PanicId, lhs: Ref, rhs: Ref) Compile
         return;
     }
     // As upstream, call the handler in `std.lang.panic`.
-    const ns = try sema.panicNamespace(block);
     const src = block.nodeSrc(.zero);
+    if (sema.func_is_naked) {
+        if (id == .explicit) return sema.fail(block, src, "runtime @panic not allowed in naked function", .{});
+        const err = sema.fail(block, src, "runtime safety check not allowed in naked function", .{});
+        try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "use @setRuntimeSafety to disable runtime safety", .{});
+        return err;
+    }
+    const ns = try sema.panicNamespace(block);
     const name: []const u8, const args: []const Ref = switch (id) {
         .explicit => .{ "call", &.{ lhs, .fromInterned(try sema.intern(.{ .opt = .{ .ty = try sema.optType(.usize_type), .val = .none } })) } },
         .out_of_bounds => .{ "outOfBounds", &.{ lhs, rhs } },
@@ -3463,6 +3473,14 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
             .@"unreachable" => {
                 const src = block.nodeSrc(data.@"unreachable".src_node);
                 if (block.is_comptime) return sema.fail(block, src, "reached unreachable code", .{});
+                if (block.want_safety and sema.func_is_naked) {
+                    // As upstream: the check would call a panic handler.
+                    const err = sema.fail(block, src, "runtime safety check not allowed in naked function", .{});
+                    const span = src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+                    try sema.zcu.addNote(sema.file, span, "use @setRuntimeSafety to disable runtime safety", .{});
+                    try sema.zcu.addNote(sema.file, span, "the end of a naked function is implicitly unreachable", .{});
+                    return err;
+                }
                 if (block.want_safety) {
                     try sema.addPanic(block, .reached_unreachable, .none, .none);
                 } else {
@@ -3932,6 +3950,11 @@ fn analyzeRet(sema: *Sema, b: *Block, operand: Ref, src: Src, operand_src: Src) 
     }
     // A loop lowered for `bcOsr` outside of a call: the walker reports it.
     if (sema.fn_ret_ty == .none) try sema.bcRefuse();
+    if (sema.func_is_naked) {
+        const err = sema.fail(b, src, "cannot return from naked function", .{});
+        try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "can only return using assembly", .{});
+        return err;
+    }
     if (b.is_comptime) return sema.fail(b, src, "function called at runtime cannot return value at comptime", .{});
     try sema.recordInferredErrors(b, src, operand);
     const coerced = try sema.coerceCtx(b, sema.fn_ret_ty, operand, operand_src, .{ .ret = sema.func });
@@ -11119,6 +11142,7 @@ fn analyzeAlloc(sema: *Sema, block: *Block, src: Src, ty: Index, is_const: bool,
         if (is_const) return .fromInterned(try sema.createComptimeAlloc(ty, false));
         return sema.failComptimeVar(block, src.varTy(), ty);
     }
+    if (sema.func_is_naked and Type.hasRuntimeBits(sema.ip, ty)) return sema.fail(block, src, "local variable in naked function", .{});
     const ptr_ty = try sema.ptrType(.{ .child = ty });
     const ref = try sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = ptr_ty } });
     if (is_const) try sema.const_allocs.put(sema.gpa, ref.toIndex().?, .{ .block = block });
@@ -11326,6 +11350,7 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
     }
     if (ia.is_const) for (operands) |op| try sema.validateRuntimeValue(block, src, op);
     try sema.resolveLayout(block, src, ty);
+    if (sema.func_is_naked and Type.hasRuntimeBits(sema.ip, ty)) return sema.fail(block, src, "local variable in naked function", .{});
     const ptr_ty = try sema.allocPtrType(ty, ia.alignment);
     sema.ir_insts.items(.data)[@backingInt(alloc_inst)] = .{ .ty = ptr_ty };
     for (ia.stores.items, operands) |store, op| try sema.coerceBrOperand(block, store, ty, op, src);
@@ -17652,6 +17677,11 @@ fn analyzeCall(
         else => return sema.fail(block, src.callFunc(), "type '{f}' not a function", .{sema.fmtType(callee_ty)}),
     };
     const fn_ty = ip.keyPayload(.func_type, fn_ty_index);
+    if (fn_ty.cc == .naked) {
+        const err = sema.fail(block, src.callFunc(), "unable to call function with calling convention '{s}'", .{"naked"});
+        if (ip.keyAs(.func, func)) |f| try sema.noteFnDeclared(f.owner_nav);
+        return err;
+    }
     const total_args = call_args_in.len() + @intFromBool(first_arg != .none);
     if (fn_ty.is_var_args and total_args >= fn_ty.param_types.len) {
         if (block.is_comptime or modifier == .compile_time) return sema.fail(block, src, "unable to call variadic function at comptime", .{});
@@ -17666,13 +17696,7 @@ fn analyzeCall(
             (if (at_least) sema.fail(block, src.callFunc(), "member function expected at least {d} argument(s), found {d}", .{ n, found }) else sema.fail(block, src.callFunc(), "member function expected {d} argument(s), found {d}", .{ n, found }))
         else
             (if (at_least) sema.fail(block, src.callFunc(), "expected at least {d} argument(s), found {d}", .{ n, found }) else sema.fail(block, src.callFunc(), "expected {d} argument(s), found {d}", .{ n, found }));
-        if (ip.keyAs(.func, func)) |f| {
-            const nav = ip.getNav(f.owner_nav);
-            const tree = try sema.zcu.fe.tree(@fromBackingInt(nav.file));
-            var buf: [1]Ast.Node.Index = undefined;
-            if (tree.fullFnProto(&buf, sema.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_node)) |proto|
-                try sema.zcu.addNote(nav.file, tree.tokenToSpan(proto.ast.fn_token), "function declared here", .{});
-        }
+        if (ip.keyAs(.func, func)) |f| try sema.noteFnDeclared(f.owner_nav);
         return err;
     }
     switch (modifier) {
@@ -17769,6 +17793,7 @@ fn analyzeCall(
         }
         if (comptime_call) return sema.failNeededComptime(block, src.callFunc(), "function pointer is not comptime-known");
         if (is_inline) return sema.failNeededComptime(block, src.callFunc(), "function being called inline must be comptime-known");
+        if (sema.func_is_naked) return sema.failNakedCall(block, src, call_args_in);
         const callee_ptr = if (extern_func == .none) callee else blk: {
             const ptr_ty = try sema.ptrType(.{ .child = ip.typeOf(extern_func), .flags = .{ .is_const = true } });
             const name = ip.keyPayload(.extern_func, extern_func).name;
@@ -17799,6 +17824,7 @@ fn analyzeCall(
         return sema.inlineCall(block, src, func, args, first_arg != .none) catch |err| return sema.noteCallSite(block, src, n, err, .@"inline");
     }
 
+    if (sema.func_is_naked) return sema.failNakedCall(block, src, call_args_in);
     var callee_func = func;
     var call_args = args;
     if (fn_ty.is_generic) {
@@ -17824,7 +17850,6 @@ fn analyzeCall(
     for (callee_fn_ty.param_types) |pt| {
         if (try sema.isComptimeOnlyResolved(block, src, pt)) return sema.fail(block, src, "parameter of comptime-only type '{f}' must be declared comptime", .{sema.fmtType(pt)});
     }
-    if (callee_fn_ty.cc == .naked) return sema.fail(block, src, "unable to call function with naked calling convention", .{});
     // While lowering, the walker would call it at comptime, which does not
     // read its declaration.
     try sema.declareDep(.{ .nav_val = ip.keyPayload(.func, callee_func).owner_nav }, sema.bc != null);
@@ -17963,6 +17988,22 @@ fn mapCalleeParams(sema: *Sema, callee_block: *Block, caller: *Block, src: Src, 
         try sema.inst_map.put(sema.gpa, inst, .fromInterned(val));
         i += 1;
     }
+}
+
+/// Adds a "function declared here" note at the `fn` token of function
+/// declaration `nav`.
+fn noteFnDeclared(sema: *Sema, nav_index: InternPool.NavIndex) CompileError!void {
+    const nav = sema.ip.getNav(nav_index);
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(nav.file));
+    var buf: [1]Ast.Node.Index = undefined;
+    if (tree.fullFnProto(&buf, sema.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_node)) |proto|
+        try sema.zcu.addNote(nav.file, tree.tokenToSpan(proto.ast.fn_token), "function declared here", .{});
+}
+
+/// Fails a runtime call at `src` in a naked function, as upstream.
+fn failNakedCall(sema: *Sema, block: *Block, src: Src, args: CallArgs) CompileError {
+    // `@call` passes its arguments resolved, as a tuple.
+    return sema.fail(block, src, "runtime {s} not allowed in naked function", .{if (args == .resolved) "@call" else "call"});
 }
 
 /// A runtime call of inline function `func`: its body analyzed in the
