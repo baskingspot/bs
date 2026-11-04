@@ -81,11 +81,21 @@ fresh checkout), `--results NAME` (write `.work/NAME.json` and
 
 ## Scope
 
-bs compiles no C, so only targets that build without C sources are in the
-corpus. Linking glibc (`-lc`) and translating C headers (`bs translate-c`)
-are in: libxev, zio, zedis and tokamak link libc, and tokamak translates
-its `src/c.h`. Projects that need C sources or other C libraries are
-listed under `excluded` in the manifest with the reason.
+bs compiles no C itself: C sources go to upstream's `zig cc`, the same
+compiler in both builds. Linking glibc (`-lc`) and translating C headers
+(`bs translate-c`) are in: libxev, zio, zedis and tokamak link libc, and
+tokamak translates its `src/c.h`. zig-sqlite, raylib-zig, ziglua, zigmod,
+buzz, supermd and zflecs compile C sources (raylib's C-only `raylib`
+library and ziglua's `lua` are targets of their own, timed but not run;
+buzz's vendored C comes from git submodules, `"submodules": true`).
+Projects left out are listed under `excluded` in the manifest with the
+reason.
+
+The 15 projects after tokamak in the manifest (zig-sqlite through
+zig-libs, all MIT) were added on 2026-11-04 to find what bs still cannot
+build; their open bs bugs and upstream's own failures (buzz's tail calls,
+zmath's vector rounding on upstream's self-hosted backend) are in each
+target's `note`.
 
 ## Scoreboard
 

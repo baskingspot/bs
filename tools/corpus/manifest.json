@@ -1100,6 +1100,406 @@
      "note": "Bug in tokamak, not bs; reported here in upstream style, not patched. Title: meta.transmute reads through a misaligned pointer (dom.document.test_0 panics with 'incorrect alignment'). Where: src/meta.zig:221 `pub inline fn transmute(comptime T: type, val: anytype) T { const tmp: *const T = @ptrCast(@alignCast(&val)); return tmp.*; }`, called by src/dom/local_name.zig:14 `meta.transmute(u128, x)` with x a ShortString, an extern struct { len21: u8, buf: [15]u8 } of alignment 1. `&val` is only 1-aligned, so the @alignCast to *const u128 (alignment 16) is illegal behavior whenever the parameter's stack slot is not 16-aligned; the safety check panics. Upstream 0.17.0 Debug passes tokamak's test only because its frame happens to put that slot on a 16-byte boundary. Reproduction (panics under upstream 0.17.0 and bs alike): const ShortString = extern struct { len21: u8 = 1, buf: [15]u8 = @splat(0) }; inline fn transmute(comptime T: type, val: anytype) T { const tmp: *const T = @ptrCast(@alignCast(&val)); return tmp.*; } noinline fn parse(n: u8) u128 { var pad: [3]u8 = .{ n, n, n }; _ = &pad; return transmute(u128, ShortString{ .len21 = pad[1] }); } pub fn main() void { _ = parse(4); } Suggested fix: `return @bitCast(val)` where the sizes match, or copy the bytes: `var tmp: T = undefined; @memcpy(std.mem.asBytes(&tmp), std.mem.asBytes(&val)); return tmp;`. With the copy, bs and upstream give the same 88 passed, 1 failed (http.client: AddressInUse in both)."
     }
    ]
+  },
+  {
+   "name": "zig-sqlite",
+   "url": "https://github.com/nDimensional/zig-sqlite",
+   "commit": "0c79b81d7f93c696261f6949e207c4497551b229",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "raylib-zig",
+   "url": "https://github.com/raylib-zig/raylib-zig",
+   "commit": "28bbe30112f605da918db00eff53a75ce1aa9180",
+   "ref": "devel",
+   "license": "MIT",
+   "build": [
+    [
+     "test"
+    ],
+    [
+     "examples"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "raylib",
+     "note": "C only: raylib's C sources, compiled by upstream zig cc in both builds; needs X11 and GL development libraries (.agents/setup)."
+    },
+    {
+     "name": "test"
+    },
+    {
+     "name": "basic_window"
+    },
+    {
+     "name": "bunnymark"
+    },
+    {
+     "name": "models_heightmap"
+    },
+    {
+     "name": "gui_message_box"
+    },
+    {
+     "name": "raymarching"
+    }
+   ]
+  },
+  {
+   "name": "json-zig",
+   "url": "https://github.com/sakakibara/json-zig",
+   "commit": "0387d4242c567d580a7035250b3306e198e7f98e",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "json-fuzz"
+    }
+   ]
+  },
+  {
+   "name": "ziglua",
+   "url": "https://github.com/natecraddock/ziglua",
+   "commit": "89b445c92113170c4ca2ff16b256cd24f300c743",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "lua",
+     "note": "C only: Lua's C sources."
+    },
+    {
+     "name": "test",
+     "note": "bs bug, open: bs rejects four things upstream accepts. translate-c's inline lua_upvalueindex(i: anytype) @TypeOf(LUA_REGISTRYINDEX - i) fails with 'use of undefined value' when called with a runtime i, and three runtime function-pointer coercions are refused: a ?*T parameter to [*c]T and back, and a ?*align(16) anyopaque return to ?*anyopaque."
+    }
+   ]
+  },
+  {
+   "name": "zqlite.zig",
+   "url": "https://github.com/karlseguin/zqlite.zig",
+   "commit": "865223b734a5113f731ab1eb1d7d81c8ac252913",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "http.zig",
+   "url": "https://github.com/karlseguin/http.zig",
+   "commit": "1bb71ff128a044b1645df91046473c38abbf965c",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "example_1"
+    }
+   ]
+  },
+  {
+   "name": "zigmod",
+   "url": "https://github.com/nektro/zigmod",
+   "commit": "a46dc2edcf3c78c7e1dddf24b13888c8c55addb2",
+   "ref": "master",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zigmod"
+    }
+   ]
+  },
+  {
+   "name": "buzz",
+   "url": "https://github.com/buzz-language/buzz",
+   "commit": "77e28595e641cec188b8a6536b7c7886c9b13f0f",
+   "ref": "main",
+   "license": "MIT",
+   "submodules": true,
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "note": "Both compilers refuse it: buzz's VM uses guaranteed tail calls (src/vm.zig:904), which upstream's x86_64 backend does not support, so upstream builds buzz with LLVM only. bs gives the same error ([unsupported]); kept for the Sema coverage up to that point."
+    },
+    {
+     "name": "buzz_behavior",
+     "note": "As buzz's test: both compilers refuse the tail call at src/vm.zig:904."
+    },
+    {
+     "name": "buzz_lsp",
+     "note": "As buzz's test: both compilers refuse the tail call at src/vm.zig:904."
+    }
+   ]
+  },
+  {
+   "name": "supermd",
+   "url": "https://github.com/kristoff-it/supermd",
+   "commit": "d294f18f05b9f8ca908bbbe3778ae313ace629de",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "docgen"
+    }
+   ]
+  },
+  {
+   "name": "zflecs",
+   "url": "https://github.com/zig-gamedev/zflecs",
+   "commit": "d753086b63d9e6bffa717281e8e20545d97c8fc9",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zflecs-tests"
+    }
+   ]
+  },
+  {
+   "name": "zmath",
+   "url": "https://github.com/zig-gamedev/zmath",
+   "commit": "43250209495cfb8a1a8d56c2977c563139c6eafe",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "zmath-tests",
+     "note": "Upstream's self-hosted backend fails here ('genSetReg called with a value larger than dst_reg' in round, ceil, floor and trunc on vectors); zmath builds with LLVM by default. bs compiles it and passes all 78 tests, as upstream's LLVM Debug build (-fllvm -Odebug) does."
+    },
+    {
+     "name": "zmath-benchmarks",
+     "note": "As zmath-tests: upstream's self-hosted backend fails on the vector rounding functions; bs compiles it."
+    }
+   ]
+  },
+  {
+   "name": "zig-msgpack",
+   "url": "https://github.com/zigcc/zig-msgpack",
+   "commit": "5884caaa3fcbcd315dbe88c3033e1fc60142071a",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    }
+   ]
+  },
+  {
+   "name": "zig-toml",
+   "url": "https://github.com/sam701/zig-toml",
+   "commit": "ad204acbf239a2b819d86845f8ba650532786126",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "example1"
+    }
+   ]
+  },
+  {
+   "name": "zig-regex",
+   "url": "https://github.com/zig-utils/zig-regex",
+   "commit": "fdd9c2e333ea6ac2fd06d080d939ef7f11d61b1b",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test"
+    },
+    {
+     "name": "regex"
+    }
+   ]
+  },
+  {
+   "name": "zig-libs",
+   "url": "https://github.com/zaxified/zig-libs",
+   "commit": "a24e5ac6df29dbebf0369bea1935f7d2e9aee87c",
+   "ref": "main",
+   "license": "MIT",
+   "build": [
+    [
+     "test-xml",
+     "test-yaml",
+     "test-regex",
+     "test-jinja",
+     "test-protobuf",
+     "test-json5",
+     "test-raft",
+     "test-cbor",
+     "test-ini",
+     "test-tar",
+     "test-trie",
+     "test-qr",
+     "-Dselfhosted=true",
+     "-Dstrict-debug=true"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "xml"
+    },
+    {
+     "name": "yaml"
+    },
+    {
+     "name": "regex",
+     "note": "bs bug, open: a ReleaseFast bs runs out of memory (over 6 GB) on the test 'compile: past max_insts on the heap ...': its comptime strRepeat bit-casts a [30000][4]u8 @splat to [120000]u8, and bs's comptime @bitCast of a nested array takes memory quadratic in its length (upstream: 130 MB). A Debug or ReleaseSafe bs crashes earlier, in AstGen's recursion over unicode_tables.zig's 3800-operand '++' chain, because bs's worker threads get std's 16 MiB default stack where upstream's get 60 MiB. Upstream's run aborts in the test 'deep nesting compiles ... on a 512 KiB thread stack' (stack overflow in Debug), so this target does not pass under upstream either."
+    },
+    {
+     "name": "jinja"
+    },
+    {
+     "name": "protobuf"
+    },
+    {
+     "name": "json5"
+    },
+    {
+     "name": "raft"
+    },
+    {
+     "name": "cbor"
+    },
+    {
+     "name": "ini"
+    },
+    {
+     "name": "tar",
+     "note": "bs bug, open: the test 'packDir: a 400-level deep tree packs on a 1 MiB stack' overflows its 1 MiB thread stack under bs. bs gives std.compress.flate.Compress.init a 690 KB frame (three copies of the 230 KB Compress) where upstream's is 230 KB."
+    },
+    {
+     "name": "trie"
+    },
+    {
+     "name": "qr",
+     "note": "bs bug, open: bs reports 'runtime value contains reference to comptime var' for a runtime index into a field of a comptime-built anonymous struct (const t = blk: { var exp: [512]u8 = ...; break :blk .{ .exp = exp }; }; t.exp[i]). Upstream accepts it."
+    }
+   ]
   }
  ],
  "excluded": [
@@ -1110,15 +1510,7 @@
   },
   {
    "name": "zzz",
-   "reason": "links libc and BearSSL (C) in every artifact"
-  },
-  {
-   "name": "http.zig",
-   "reason": "every artifact links libc (-lc)"
-  },
-  {
-   "name": "zigmod",
-   "reason": "links libyaml (C) and libc"
+   "reason": "MPL-2.0, not MIT-compatible; it also links libc and BearSSL (C) in every artifact"
   },
   {
    "name": "Avalanche",
@@ -1133,16 +1525,6 @@
    "name": "zig-yaml",
    "url": "https://github.com/kubkon/zig-yaml",
    "reason": "master (e5cf8ac) declares 0.16.0 and its build.zig does not build with 0.17.0"
-  },
-  {
-   "name": "supermd",
-   "url": "https://github.com/kristoff-it/supermd",
-   "reason": "links cmark-gfm (C)"
-  },
-  {
-   "name": "buzz",
-   "url": "https://github.com/buzz-language/buzz",
-   "reason": "links libc and C sources (mimalloc, linenoise)"
   },
   {
    "name": "monstar",
@@ -1173,6 +1555,21 @@
    "name": "ZCS",
    "url": "https://github.com/Games-by-Mason/ZCS",
    "reason": "targets 0.16.0-dev; its tracy dependency's build.zig fails on 0.17.0"
+  },
+  {
+   "name": "mecha",
+   "url": "https://github.com/Hejsil/mecha",
+   "reason": "declares minimum_zig_version 0.15.1 and does not build with 0.17.1"
+  },
+  {
+   "name": "zqlite (ghostkellz)",
+   "url": "https://github.com/ghostkellz/zqlite",
+   "reason": "targets 0.18.0-dev"
+  },
+  {
+   "name": "zig-libs (other modules)",
+   "url": "https://github.com/zaxified/zig-libs",
+   "reason": "the corpus takes 12 of its 256 modules. Its p384 and montint assembly fails upstream's self-hosted backend ('invalid mnemonic movabsq'), which breaks dns, http, websocket and mqtt; zstd, brotli and decimal take too long in Debug"
   }
  ]
 }
