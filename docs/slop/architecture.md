@@ -5007,9 +5007,12 @@ records only what changed, and links from the manifest.
   node: the overlay keeps a bitset of the nodes the log touched, so
   `node`, `nodeRefs`, `flags` and the other accessors read an untouched
   node straight from the base without a hash lookup; the base stores
-  the reached flags as words (`reached_bits`, `Manifest.reachedSet`);
+  the reached flags as words (`reached_bits`, `Manifest.reachedSet`)
+  and the stale nodes as a list (`stale_nodes`, `Manifest.staleNodes`);
   `Replay.create` stats only the inputs the frontend did not load, and
-  seeds and `inChangedInput` test a changed-input bitset. The record
+  lists the nodes in changed inputs once, in one pass over the base's
+  sources (`Manifest.nodesOfInputs`), for the seeds, the cone and the
+  record's source rewrites. The record
   updates flags only for nodes whose flags can differ (the cone, the
   outdated, the analyzed, what reach gained or lost, and every node in
   a build that assumed nothing), finds exported nodes through `rrefs`,

@@ -51,6 +51,8 @@ state: []State,
 maps: seeds.InstMaps = .{},
 /// The same inputs, a bit each (`inChangedInput`).
 changed_input: std.DynamicBitSetUnmanaged = .{},
+/// The nodes in those inputs, in order (`Manifest.nodesOfInputs`).
+changed_nodes: std.ArrayList(u32) = .empty,
 /// Changed inputs `lateMap` tried to map.
 late_mapped: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// Whether `lateMap` failed for one, whose old ZIR was gone (the global
@@ -74,8 +76,11 @@ input_files_seen: usize = 0,
 file_inputs: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 /// Inputs by path.
 by_path: std.StringHashMapUnmanaged(u32) = .empty,
-/// Each node's dependee, once decoded (`dependee`).
-dependees: []?Zcu.Dependee,
+/// Each node's dependee, once decoded (`dependee`): set where
+/// `has_dependee` is. From the page allocator and never cleared, so that
+/// only the pages of the nodes decoded are touched.
+dependees: []Zcu.Dependee,
+has_dependee: std.DynamicBitSetUnmanaged,
 /// Units' nodes, as their subjects were decoded.
 unit_nodes: std.AutoHashMapUnmanaged(Zcu.AnalUnit, u32) = .empty,
 decoder: results.Decoder(Resolver),
@@ -204,7 +209,8 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
         .arch = arch,
         .outdated = try .initEmpty(gpa, n),
         .state = try gpa.alloc(State, n),
-        .dependees = try gpa.alloc(?Zcu.Dependee, n),
+        .dependees = try std.heap.page_allocator.alloc(Zcu.Dependee, n),
+        .has_dependee = try .initEmpty(gpa, n),
         .input_files = try gpa.alloc(u32, m.inputCount()),
         .decoder = try .init(gpa, &zcu.ip, m.resultItems(), .{ .r = undefined }),
         .keyer = .init(zcu, gpa),
@@ -217,7 +223,6 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     };
     r.decoder.resolver = .{ .r = r };
     @memset(r.state, .unknown);
-    @memset(r.dependees, null);
     @memset(r.input_files, 0);
 
     // Each loaded file's input, and the inputs that changed.
@@ -279,15 +284,16 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
 
     var seed_list: std.ArrayList(u32) = .empty;
     defer seed_list.deinit(gpa);
-    _ = try seeds.compute(gpa, m, fe, changed.items, &seed_list, &r.maps);
     r.changed_input = try .initEmpty(gpa, m.inputCount());
     for (changed.items) |c| r.changed_input.set(c.input);
+    if (changed.items.len != 0) try m.nodesOfInputs(gpa, &r.changed_input, &r.changed_nodes);
+    _ = try seeds.compute(gpa, m, fe, changed.items, r.changed_nodes.items, &seed_list, &r.maps);
     r.stats.seeds = @intCast(seed_list.items.len);
     var stack = seed_list;
     seed_list = .empty;
     defer stack.deinit(gpa);
     // Nodes an earlier lazy build left unchecked, as if edited again.
-    if (lazy) for (0..n) |i| if (m.flags(@intCast(i)).stale) try stack.append(gpa, @intCast(i));
+    if (lazy) try m.staleNodes(gpa, &stack);
     for (stack.items) |i| r.outdated.set(i);
     while (stack.pop()) |i| for (m.rdeps(i)) |part| for (part) |d| if (!r.outdated.isSet(d)) {
         r.outdated.set(d);
@@ -356,12 +362,12 @@ fn assumeReached(r: *Replay) !void {
     defer cone.deinit(gpa);
     var list: std.ArrayList(u32) = .empty;
     defer list.deinit(gpa);
-    for (0..n) |i_usize| {
-        const i: u32 = @intCast(i_usize);
-        if (!reached.isSet(i) or !(r.outdated.isSet(i) or r.inChangedInput(i))) continue;
-        cone.set(i);
-        try list.append(gpa, i);
-    }
+    // The reached nodes outdated or in a changed input, in order.
+    cone.setUnion(r.outdated);
+    for (r.changed_nodes.items) |i| cone.set(i);
+    cone.setIntersection(reached);
+    var cone_it = cone.iterator(.{});
+    while (cone_it.next()) |i| try list.append(gpa, @intCast(i));
     // What the walk must also walk for them, in turn for what it adds.
     var k: usize = 0;
     while (k < list.items.len) : (k += 1) {
@@ -425,6 +431,7 @@ pub fn destroy(r: *Replay) void {
     r.pack.close(gpa, r.io);
     r.outdated.deinit(gpa);
     r.changed_input.deinit(gpa);
+    r.changed_nodes.deinit(gpa);
     r.visited.deinit(gpa);
     r.roots.deinit(gpa);
     r.assumed.deinit(gpa);
@@ -453,7 +460,8 @@ pub fn destroy(r: *Replay) void {
         d.deinit(gpa);
     }
     gpa.free(r.state);
-    gpa.free(r.dependees);
+    std.heap.page_allocator.free(r.dependees);
+    r.has_dependee.deinit(gpa);
     r.maps.deinit(gpa);
     r.changed.deinit(gpa);
     gpa.free(r.input_files);
@@ -1016,9 +1024,10 @@ fn miss(r: *Replay, g: Green, what: []const u8) bool {
 /// The live dependee of node `d` (of kind `tag`), from its subject.
 /// Memoized: many units share each dependency.
 fn dependee(r: *Replay, d: u32, tag: Tag) !?Zcu.Dependee {
-    if (r.dependees[d]) |dep| return dep;
+    if (r.has_dependee.isSet(d)) return r.dependees[d];
     const dep = try r.decodeDependee(d, tag) orelse return null;
     r.dependees[d] = dep;
+    r.has_dependee.set(d);
     return dep;
 }
 

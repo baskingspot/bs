@@ -61,8 +61,9 @@ pub const InstMaps = struct {
 };
 
 /// Appends the seeds of `changed` to `seeds`, in node order, and if `maps`
-/// is not null, puts each changed input's map there.
-pub fn compute(gpa: Allocator, m: *const Manifest, fe: *const Frontend, changed: []const Changed, seeds: *std.ArrayList(u32), maps: ?*InstMaps) !Stats {
+/// is not null, puts each changed input's map there. `nodes` are the
+/// nodes in the changed inputs, in order (`Manifest.nodesOfInputs`).
+pub fn compute(gpa: Allocator, m: *const Manifest, fe: *const Frontend, changed: []const Changed, nodes: []const u32, seeds: *std.ArrayList(u32), maps: ?*InstMaps) !Stats {
     var stats: Stats = .{};
     const Ctx = struct {
         old: ?Frontend.OldZir = null,
@@ -96,15 +97,8 @@ pub fn compute(gpa: Allocator, m: *const Manifest, fe: *const Frontend, changed:
     }
     if (changed.len == 0) return stats;
 
-    // Most nodes' inputs did not change: a bit each says so without
-    // hashing.
-    var is_changed = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.inputCount());
-    defer is_changed.deinit(gpa);
-    for (changed) |c| is_changed.set(c.input);
-    for (0..m.nodeCount()) |i_usize| {
-        const i: u32 = @intCast(i_usize);
+    for (nodes) |i| {
         const src = m.source(i);
-        if (src.input == Manifest.Source.no_input or src.input >= is_changed.bit_length or !is_changed.isSet(src.input)) continue;
         const ctx = &ctxs[by_input.get(src.input).?];
         if (try isSeed(gpa, m, i, src, ctx.old, ctx.new, &ctx.map, &ctx.names)) try seeds.append(gpa, i);
     }

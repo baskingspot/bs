@@ -141,6 +141,9 @@ rref_nodes: []const u32,
 /// `i / 32`), so that an edit build reads them without touching the
 /// nodes (`reachedSet`).
 reached_bits: []const u32,
+/// The base nodes whose `Flags.stale` is set, in order, so that an edit
+/// build finds them without touching the nodes (`staleNodes`).
+stale_nodes: []const u32,
 atom_refs: []const Pack.AtomRef,
 inputs: []const Input,
 /// Error names in code order: the error with code `c` is `c - 1`.
@@ -500,10 +503,10 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, rref_starts, rref_nodes, reached_bits, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, atom_names, atom_name_bytes, strings };
+const Section = enum { nodes, table, edges, redges, rref_starts, rref_nodes, reached_bits, stale_nodes, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, atom_names, atom_name_bytes, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN16".*;
+const magic = "ZAPMAN17".*;
 const log_magic = "ZAPMLG08".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
@@ -711,7 +714,7 @@ const Overlay = struct {
 fn SectionType(comptime s: Section) type {
     return switch (s) {
         .nodes => Node,
-        .table, .edges, .redges, .rref_starts, .rref_nodes, .reached_bits => u32,
+        .table, .edges, .redges, .rref_starts, .rref_nodes, .reached_bits, .stale_nodes => u32,
         .atom_refs => Pack.AtomRef,
         .inputs => Input,
         .error_names, .bases, .files, .ref_names => StrRef,
@@ -769,6 +772,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
         m.type_name_starts.len != m.nodes.len + 1 or m.type_name_starts[m.nodes.len] != m.type_names.len or
         (m.item_starts.len != 0 and m.item_starts[m.item_starts.len - 1] >= m.items.len)) return corrupt(io, &map);
     for (m.type_name_index) |t| if (t.node >= m.nodes.len) return corrupt(io, &map);
+    for (m.stale_nodes) |i| if (i >= m.nodes.len) return corrupt(io, &map);
     for (m.link_symbols) |ls| {
         if (ls.name.off > m.strings.len or ls.name.len > m.strings.len - ls.name.off or ls.flags > 7) return corrupt(io, &map);
     }
@@ -821,6 +825,30 @@ pub fn reachedSet(m: *const Manifest, gpa: Allocator) !std.DynamicBitSetUnmanage
     while (it.next()) |i| set.setValue(i, m.flags(@intCast(i)).reached);
     for (m.nodes.len..set.bit_length) |i| set.setValue(i, m.flags(@intCast(i)).reached);
     return set;
+}
+
+/// Appends the nodes whose `Flags.stale` is set: the base's list, and the
+/// nodes the log changed.
+pub fn staleNodes(m: *const Manifest, gpa: Allocator, out: *std.ArrayList(u32)) !void {
+    for (m.stale_nodes) |i| if (!m.touched(i)) try out.append(gpa, i);
+    var it = m.overlay.touched.iterator(.{});
+    while (it.next()) |i| if (m.flags(@intCast(i)).stale) try out.append(gpa, @intCast(i));
+    for (m.nodes.len..m.nodeCount()) |i| if (!m.touched(@intCast(i)) and m.flags(@intCast(i)).stale) try out.append(gpa, @intCast(i));
+}
+
+/// Appends the nodes whose `Source.input` is set in `inputs`, in node
+/// order: one pass over the base's sources, looking up only the nodes the
+/// log changed.
+pub fn nodesOfInputs(m: *const Manifest, gpa: Allocator, inputs: *const std.DynamicBitSetUnmanaged, out: *std.ArrayList(u32)) !void {
+    for (m.sources, 0..) |base, i_usize| {
+        const i: u32 = @intCast(i_usize);
+        const src = if (m.touched(i)) m.source(i) else base;
+        if (src.input < inputs.bit_length and inputs.isSet(src.input)) try out.append(gpa, i);
+    }
+    for (m.sources.len..m.nodeCount()) |i_usize| {
+        const src = m.source(@intCast(i_usize));
+        if (src.input < inputs.bit_length and inputs.isSet(src.input)) try out.append(gpa, @intCast(i_usize));
+    }
 }
 
 /// Whether the log changed anything about node `index`.
@@ -2355,6 +2383,10 @@ pub const Builder = struct {
             reached_bits[i / 32] |= @as(u32, 1) << @intCast(i % 32);
         };
 
+        var stale_nodes: std.ArrayList(u32) = .empty;
+        defer stale_nodes.deinit(gpa);
+        for (nodes, 0..) |n, i| if (n.flags.stale) try stale_nodes.append(gpa, @intCast(i));
+
         const debug_atoms = try debugAtoms(gpa, debug_files);
         defer gpa.free(debug_atoms);
 
@@ -2393,6 +2425,7 @@ pub const Builder = struct {
             @ptrCast(rref_starts),
             @ptrCast(rrefs_out),
             @ptrCast(reached_bits),
+            @ptrCast(stale_nodes.items),
             @ptrCast(refs),
             @ptrCast(b.inputs.items),
             @ptrCast(b.error_names.items),
@@ -2653,6 +2686,23 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             try t.expectEqual(true, m3.flags(0).stale);
             try t.expectEqual(true, m3.flags(4).stale);
             try t.expectEqual(false, m3.flags(2).stale);
+            // The lists match the per-node accessors, in the log and folded.
+            var stale: std.ArrayList(u32) = .empty;
+            defer stale.deinit(gpa);
+            try m3.staleNodes(gpa, &stale);
+            std.mem.sort(u32, stale.items, {}, std.sort.asc(u32));
+            try t.expectEqualSlices(u32, &.{ 0, 4 }, stale.items);
+            var in1 = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m3.inputCount());
+            defer in1.deinit(gpa);
+            in1.set(1);
+            var of_in1: std.ArrayList(u32) = .empty;
+            defer of_in1.deinit(gpa);
+            try m3.nodesOfInputs(gpa, &in1, &of_in1);
+            var want: std.ArrayList(u32) = .empty;
+            defer want.deinit(gpa);
+            for (0..m3.nodeCount()) |i| if (m3.source(@intCast(i)).input == 1) try want.append(gpa, @intCast(i));
+            try t.expect(want.items.len != 0);
+            try t.expectEqualSlices(u32, want.items, of_in1.items);
             try t.expectEqual(96, m3.atoms(2)[0].offset());
             try t.expectEqualStrings("OutOfMemory", m3.errorName(1));
             try t.expectEqualStrings("Unexpected", m3.errorName(3));

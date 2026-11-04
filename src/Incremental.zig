@@ -2615,12 +2615,12 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     defer written.deinit(gpa);
     for (final, write) |f, w| if (w and f < n_prev) written.set(f);
     // The others' flags, and the sources and lines in changed inputs.
-    for (0..n_prev) |i_usize| {
-        const i: u32 = @intCast(i_usize);
-        if (written.isSet(i)) continue;
-        if (check.isSet(i)) try setFlags(rp, &d, i, &live, &reached, &in_graph);
+    var check_it = check.iterator(.{});
+    while (check_it.next()) |i| if (!written.isSet(i)) try setFlags(rp, &d, @intCast(i), &live, &reached, &in_graph);
+    for (rp.changed_nodes.items) |i| {
+        if (i >= n_prev or written.isSet(i)) continue;
         const src = m.source(i);
-        if (src.input == Manifest.Source.no_input or src.inst == Manifest.Source.no_inst or src.input >= changed_input.bit_length or !changed_input.isSet(src.input)) continue;
+        if (src.inst == Manifest.Source.no_inst) continue;
         const inst = rp.mapInst(src.input, @fromBackingInt(src.inst));
         const new_inst: u32 = if (inst) |x| @backingInt(x) else Manifest.Source.no_inst;
         if (new_inst != src.inst) try d.setSource(i, .{ .input = src.input, .inst = new_inst });
@@ -4098,7 +4098,13 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
     var seed_list: std.ArrayList(u32) = .empty;
     defer seed_list.deinit(gpa);
     const t0 = now(io);
-    const stats = try seeds.compute(gpa, m, fe, changed.items, &seed_list, null);
+    var changed_set = try std.DynamicBitSetUnmanaged.initEmpty(gpa, m.inputCount());
+    defer changed_set.deinit(gpa);
+    for (changed.items) |c| changed_set.set(c.input);
+    var changed_nodes: std.ArrayList(u32) = .empty;
+    defer changed_nodes.deinit(gpa);
+    try m.nodesOfInputs(gpa, &changed_set, &changed_nodes);
+    const stats = try seeds.compute(gpa, m, fe, changed.items, changed_nodes.items, &seed_list, null);
     const seeds_ms = ms(t0, now(io));
 
     var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
