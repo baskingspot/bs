@@ -4723,8 +4723,8 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   `build-lib`, and for aarch64-macos, is `[unsupported]` for now.
 - **The fuzzer is a module family, not a second compilation.** zap
   compiles `<zig lib>/fuzzer.zig` in the same compilation as the program,
-  but as its own *module family*: the root `fuzzer` (fuzzer.zig), its own
-  `std@fuzzer` (std's files again) and `builtin@fuzzer` (output mode
+  but as its own *module family*: the root `=root@fuzzer` (fuzzer.zig), its
+  own `=std@fuzzer` (std's files again) and `=builtin@fuzzer` (output mode
   `Lib`, `is_test` and `fuzz` false). Every module names the modules that
   `@import("std")`, `@import("root")` and `@import("builtin")` resolve to
   (`Frontend.Module.std_mod`, `root_mod`, `builtin_mod`; the main ones
@@ -4738,7 +4738,8 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   Exports and externs still meet by name across families, as with
   compiler_rt: the test runner's `extern fn fuzzer_init` resolves to
   fuzzer.zig's `export fn`, and fuzzer.zig's `extern fn runner_test_run`
-  to the test runner's. Unit keys stay unique because module names do.
+  to the test runner's. Unit keys stay unique because module names do:
+  the family's names hold an '=', which no `-M` name can.
   Why not a separate compilation linked in: zap's linker does not read
   objects, and a second Zcu would need its own cache manifest, relink
   path, error numbering and symbol-key salt. As a family, the fuzzer gets
@@ -4790,7 +4791,7 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
 - **Cache.** Instrumented atoms differ from plain ones, so the store
   seed and the compilation key include the flag (the target string gets
   `+fuzz`). The donor key hashes the store seed, so fuzz and plain builds
-  never donate to each other. The fuzzer's `std@fuzzer` files have the
+  never donate to each other. The fuzzer's `=std@fuzzer` files have the
   same paths as `std`'s; the replay tells them apart because it matches
   inputs by key (`<module>:<path>`), so an edit of a std file outdates
   both copies.

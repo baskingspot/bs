@@ -48,7 +48,8 @@ root_name: []const u8 = "root",
 /// See `Options.load_std`.
 load_std: bool,
 /// The root module of the fuzzer's family (`Options.fuzzer_builtin_dir`),
-/// whose `std@fuzzer` and `builtin@fuzzer` follow it.
+/// whose `=std@fuzzer` and `=builtin@fuzzer` follow it. Their names hold
+/// an '=', which no `-M` name can, so no other module's keys are theirs.
 fuzzer_root: ?Module.Index = null,
 /// What `loadAll` and `loadFile` did, for `ZAP_FRONTEND_TIMING`.
 stats: Stats = .{},
@@ -238,9 +239,9 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         const root: Module.Index = @fromBackingInt(@intCast(fe.modules.items.len));
         const family: [3]Module.Index = .{ @fromBackingInt(@backingInt(root) + 1), root, @fromBackingInt(@backingInt(root) + 2) };
         try fe.modules.appendSlice(gpa, &.{
-            .{ .name = "root@fuzzer", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "fuzzer.zig"), .cache = .global },
-            .{ .name = "std@fuzzer", .root_dir = try std.fs.path.join(gpa, &.{ zig_lib_dir, "std" }), .root_file = try gpa.dupe(u8, "std.zig"), .cache = .global },
-            .{ .name = "builtin@fuzzer", .root_dir = try gpa.dupe(u8, dir), .root_file = try gpa.dupe(u8, "builtin.zig"), .cache = .global },
+            .{ .name = "=root@fuzzer", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "fuzzer.zig"), .cache = .global },
+            .{ .name = "=std@fuzzer", .root_dir = try std.fs.path.join(gpa, &.{ zig_lib_dir, "std" }), .root_file = try gpa.dupe(u8, "std.zig"), .cache = .global },
+            .{ .name = "=builtin@fuzzer", .root_dir = try gpa.dupe(u8, dir), .root_file = try gpa.dupe(u8, "builtin.zig"), .cache = .global },
         });
         for (fe.modules.items[@backingInt(root)..]) |*m| {
             m.std_mod, m.root_mod, m.builtin_mod = family;
@@ -298,9 +299,10 @@ pub fn displayName(fe: *const Frontend, index: Module.Index) []const u8 {
     if (index == fe.main_module) return fe.root_name;
     if (index == .root) return "root";
     const name = fe.module(index).name;
-    // The fuzzer's family (`std@fuzzer`), named as in upstream's separate
-    // compilation of it.
-    return name[0 .. std.mem.indexOfScalar(u8, name, '@') orelse name.len];
+    // The fuzzer's family (`=std@fuzzer`), named as in upstream's
+    // separate compilation of it.
+    if (std.mem.startsWith(u8, name, "=")) return name[1..std.mem.indexOfScalar(u8, name, '@').?];
+    return name;
 }
 
 pub fn module(fe: *const Frontend, index: Module.Index) *const Module {
