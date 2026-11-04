@@ -2532,13 +2532,18 @@ fn cVaArg(cg: *CodeGen, inst: Inst.Index, ty: Index, list: Ref) Error!void {
 //
 // Templates use the GNU/LLVM aarch64 syntax. bs assembles the loads,
 // stores, moves, arithmetic, branches, and system instructions that std
-// and system-call stubs use. Every value lives in memory, so operands get
+// and system-call stubs use, and the NEON instructions of std's crypto
+// (AES, PMULL, SHA-256). Every value lives in memory, so operands get
 // scratch registers: `{xN}` constraints that register, `r` a free one of
-// x0-x15; `X`, `i`, and `n` inputs are substituted as symbols or
-// immediates. Callee-saved registers the template names are saved around
-// it.
+// x0-x15, `w` a free SIMD register and `x` one of v0-v15; a digit ties an
+// input to that output's register. `X`, `i`, `n`, and `N` inputs are
+// substituted as symbols or immediates. Callee-saved registers the
+// template names or the operands get are saved around it.
 
-const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64, reg: Reg };
+const AsmArg = union(enum) { sym: struct { key: SymbolKey, off: i32 }, imm: i64, reg: Reg, vreg: VReg };
+
+/// The register an output is in.
+const AsmOut = union(enum) { gpr: Reg, fpr: VReg };
 
 fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const ip = cg.ip;
@@ -2567,6 +2572,11 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             used |= @as(u64, 1) << @backingInt(r.reg);
         };
     }
+    // SIMD registers the template names; `w` and `x` operands get others.
+    var vused: u32 = 0;
+    for (0..32) |r| {
+        if (mentionsVReg(source, @intCast(r))) vused |= @as(u32, 1) << @intCast(r);
+    }
     const free_regs = [_]Reg{ .x9, .x10, .x11, .x12, .x13, .x14, .x15, .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7, .x8 };
     // Callee-saved registers the template mentions, saved to slots first.
     var saved: [10]?Mem = @splat(null);
@@ -2577,12 +2587,17 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
             saved[r - 19] = m;
         }
     }
-    const out_regs = try cg.gpa.alloc(Reg, outputs.len);
+    // v8-v15, whose low halves are callee-saved: saved whole when the
+    // template names them or an operand gets one.
+    var vsaved: [8]?Mem = @splat(null);
+    const out_regs = try cg.gpa.alloc(AsmOut, outputs.len);
     defer cg.gpa.free(out_regs);
     for (outputs, out_regs) |out, *out_reg| {
         const full = ip.stringSlice(out.constraint);
         if (full.len == 0 or (full[0] != '=' and full[0] != '+')) return cg.fail("asm output constraint '{s}'", .{full});
         const read = full[0] == '+';
+        // Early clobbers need nothing more: each operand has a register of
+        // its own.
         const constraint = asmAlternative(std.mem.trimStart(u8, full[1..], "&"));
         const ty = if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child;
         if (std.mem.eql(u8, constraint, "r")) {
@@ -2590,22 +2605,52 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
                 if (used & (@as(u64, 1) << @backingInt(r)) == 0) break r;
             } else return cg.fail("asm with too many register operands", .{});
             used |= @as(u64, 1) << @backingInt(reg);
-            out_reg.* = reg;
+            out_reg.* = .{ .gpr = reg };
             try names.put(cg.gpa, ip.stringSlice(out.name), .{ .reg = reg });
+        } else if (vecConstraint(constraint)) |low| {
+            const v = try cg.asmVReg(&vused, &vsaved, low);
+            out_reg.* = .{ .fpr = v };
+            try names.put(cg.gpa, ip.stringSlice(out.name), .{ .vreg = v });
         } else {
             const reg_name = regConstraint(constraint) orelse return cg.fail("asm output constraint '{s}'", .{full});
-            out_reg.* = (parseReg(reg_name) orelse return cg.fail("unknown register in asm constraint '{s}'", .{full})).reg;
+            out_reg.* = .{ .gpr = (parseReg(reg_name) orelse return cg.fail("unknown register in asm constraint '{s}'", .{full})).reg };
         }
         if (read) {
             if (out.operand == .none) return cg.fail("asm output constraint '{s}'", .{full});
-            try cg.load(out_reg.*, out.operand);
-            try cg.loadMem(out_reg.*, .at(out_reg.*, 0), ty);
+            switch (out_reg.*) {
+                .gpr => |r| {
+                    try cg.load(r, out.operand);
+                    try cg.loadMem(r, .at(r, 0), ty);
+                },
+                .fpr => |v| {
+                    try cg.load(.x17, out.operand);
+                    try cg.loadFp(v, .{ .ty = ty, .loc = .{ .mem = .at(.x17, 0) } });
+                },
+            }
         }
+    }
+    // SIMD inputs first: loading one uses x9 and x16, which may be `r`
+    // operands.
+    for (inputs) |in| {
+        const constraint = asmAlternative(ip.stringSlice(in.constraint));
+        if (vecConstraint(constraint)) |low| {
+            const v = try cg.asmVReg(&vused, &vsaved, low);
+            try cg.loadFp(v, try cg.valOf(in.operand));
+            try names.put(cg.gpa, ip.stringSlice(in.name), .{ .vreg = v });
+        } else if (tiedOutput(constraint, outputs.len)) |k| switch (out_regs[k]) {
+            .fpr => |v| try cg.loadFp(v, try cg.valOf(in.operand)),
+            .gpr => {},
+        };
     }
     for (inputs) |in| {
         const constraint = asmAlternative(ip.stringSlice(in.constraint));
         const is_r = std.mem.eql(u8, constraint, "r") or (std.mem.eql(u8, constraint, "rm") and cg.passInRegs(cg.typeOf(in.operand)));
-        if (is_r) {
+        if (vecConstraint(constraint) != null) {
+            // Loaded above.
+        } else if (tiedOutput(constraint, outputs.len)) |k| switch (out_regs[k]) {
+            .gpr => |r| try cg.load(r, in.operand),
+            .fpr => {},
+        } else if (is_r) {
             const reg = for (free_regs) |r| {
                 if (used & (@as(u64, 1) << @backingInt(r)) == 0) break r;
             } else return cg.fail("asm with too many register operands", .{});
@@ -2615,7 +2660,7 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         } else if (regConstraint(constraint)) |reg_name| {
             const reg = parseReg(reg_name) orelse return cg.fail("unknown register '{s}' in asm constraint", .{reg_name});
             try cg.load(reg.reg, in.operand);
-        } else if (std.mem.eql(u8, constraint, "X") or std.mem.eql(u8, constraint, "i") or std.mem.eql(u8, constraint, "n")) {
+        } else if (std.mem.eql(u8, constraint, "X") or std.mem.eql(u8, constraint, "i") or std.mem.eql(u8, constraint, "n") or std.mem.eql(u8, constraint, "N")) {
             const arg: AsmArg = switch (try cg.locOf(in.operand)) {
                 .imm => |v| .{ .imm = @bitCast(v) },
                 .addr => |m| if (m.base == .sym) .{ .sym = .{ .key = m.base.sym, .off = m.off } } else return cg.fail("asm input '{s}' must be comptime-known", .{constraint}),
@@ -2629,17 +2674,78 @@ fn assembly(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     try cg.assemble(source, &names);
 
     for (outputs, out_regs) |out, reg| {
-        if (out.operand == .none) {
-            const ty = data.ty_pl.ty;
-            const dst = try cg.resultMem(inst, ty) orelse continue;
-            try cg.storeReg(dst, reg, Type.abiSize(ip, ty));
-        } else {
-            const ty = Type.ptrInfo(ip, cg.typeOf(out.operand)).child;
+        const ty = if (out.operand == .none) data.ty_pl.ty else Type.ptrInfo(ip, cg.typeOf(out.operand)).child;
+        const dst: Mem = if (out.operand == .none) try cg.resultMem(inst, ty) orelse continue else dst: {
             try cg.load(.x17, out.operand);
-            try cg.storeReg(.at(.x17, 0), reg, Type.abiSize(ip, ty));
+            break :dst .at(.x17, 0);
+        };
+        switch (reg) {
+            .gpr => |r| try cg.storeReg(dst, r, Type.abiSize(ip, ty)),
+            .fpr => |v| try cg.storeFp(dst, v, Type.abiSize(ip, ty)),
         }
     }
     for (saved, 19..) |m, r| if (m) |slot| try cg.loadMem(@fromBackingInt(@intCast(r)), slot, .usize_type);
+    for (vsaved, 8..) |m, r| if (m) |slot| try cg.e.ldrQ(@fromBackingInt(@intCast(r)), try cg.access(slot, 16, .x16));
+}
+
+/// The SIMD register constraints: `w`, any of v0-v31, and `x`, one of
+/// v0-v15 (whether only those).
+fn vecConstraint(c: []const u8) ?bool {
+    if (std.mem.eql(u8, c, "w")) return false;
+    if (std.mem.eql(u8, c, "x")) return true;
+    return null;
+}
+
+/// The output a digit constraint ties an input to.
+fn tiedOutput(c: []const u8, outputs: usize) ?usize {
+    const k = std.fmt.parseInt(usize, c, 10) catch return null;
+    return if (k < outputs) k else null;
+}
+
+/// A SIMD register for an asm operand that `used` does not have, of
+/// v0-v15 if `low`: v16-v31 first, then v0-v7, then v8-v15, which are
+/// saved to `vsaved` first.
+fn asmVReg(cg: *CodeGen, used: *u32, vsaved: *[8]?Mem, low: bool) Error!VReg {
+    const order = [_]u5{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    for (order) |r| {
+        if (low and r >= 16) continue;
+        if (used.* & (@as(u32, 1) << r) != 0) continue;
+        used.* |= @as(u32, 1) << r;
+        if (r >= 8 and r < 16) try cg.saveVReg(vsaved, r);
+        return @fromBackingInt(r);
+    }
+    return cg.fail("asm with too many SIMD register operands", .{});
+}
+
+/// Saves v`r`, one of v8-v15, to a slot in `vsaved` unless it is saved.
+fn saveVReg(cg: *CodeGen, vsaved: *[8]?Mem, r: u5) Error!void {
+    if (vsaved[r - 8] != null) return;
+    const m = try cg.allocSlot(16, 16);
+    try cg.e.strQ(@fromBackingInt(r), try cg.access(m, 16, .x16));
+    vsaved[r - 8] = m;
+}
+
+/// Whether template `source` names SIMD register `r` (`v3`, `q3.4s`,
+/// `d3`, ...), outside `%[name]` operand references.
+fn mentionsVReg(source: []const u8, r: u8) bool {
+    var k: usize = 0;
+    while (k < source.len) {
+        if (source[k] == '%') {
+            k = (std.mem.indexOfScalarPos(u8, source, k, ']') orelse return false) + 1;
+            continue;
+        }
+        if (std.mem.indexOfScalar(u8, "vqdshb", source[k]) != null and (k == 0 or !std.ascii.isAlphanumeric(source[k - 1]) and source[k - 1] != '_')) {
+            var end = k + 1;
+            while (end < source.len and std.ascii.isDigit(source[end])) end += 1;
+            if (end > k + 1 and (end == source.len or !std.ascii.isAlphanumeric(source[end]) and source[end] != '_')) {
+                if ((std.fmt.parseInt(u8, source[k + 1 .. end], 10) catch 255) == r) return true;
+            }
+            k = end;
+            continue;
+        }
+        k += 1;
+    }
+    return false;
 }
 
 /// Whether template `source` names register x`r` or w`r`.
@@ -2707,7 +2813,43 @@ const AsmOperand = union(enum) {
     mem: Encoder.Mem,
     /// A bare word: a barrier option or system register.
     name: []const u8,
+    /// A SIMD register (`v3.16b`, `q3`, `%[name].4s`), with the
+    /// arrangement it is written with.
+    vreg: struct { reg: VReg, arr: ?Arrangement },
+    /// A list of consecutive SIMD registers (`{v3.16b}`).
+    vlist: struct { first: VReg, len: u3, arr: ?Arrangement },
 };
+
+/// A vector register's arrangement suffix (`.16b`, `.4s`, ...).
+const Arrangement = enum {
+    @"8b",
+    @"16b",
+    @"4h",
+    @"8h",
+    @"2s",
+    @"4s",
+    @"1d",
+    @"2d",
+    @"1q",
+
+    /// The Q bit of an instruction on whole vectors of this arrangement.
+    fn q(a: Arrangement) u32 {
+        return switch (a) {
+            .@"8b", .@"4h", .@"2s", .@"1d" => 0,
+            .@"16b", .@"8h", .@"4s", .@"2d", .@"1q" => 1,
+        };
+    }
+};
+
+/// A SIMD register written as `v3`, `q3`, `d3`, `s3`, `h3` or `b3`,
+/// optionally with an arrangement (`v3.4s`).
+fn parseVReg(tok: []const u8) ?AsmOperand {
+    if (tok.len < 2 or std.mem.indexOfScalar(u8, "vqdshb", tok[0]) == null) return null;
+    const dot = std.mem.indexOfScalar(u8, tok, '.') orelse tok.len;
+    const n = std.fmt.parseInt(u5, tok[1..dot], 10) catch return null;
+    const arr: ?Arrangement = if (dot == tok.len) null else std.meta.stringToEnum(Arrangement, tok[dot + 1 ..]) orelse return null;
+    return .{ .vreg = .{ .reg = @fromBackingInt(n), .arr = arr } };
+}
 
 fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.StringHashMapUnmanaged(AsmArg), locals: *LocalLabels) Error!void {
     var line = line_in;
@@ -2737,8 +2879,8 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
     var start: usize = 0;
     for (rest, 0..) |c, k| {
         switch (c) {
-            '[' => depth += 1,
-            ']' => depth -|= 1,
+            '[', '{' => depth += 1,
+            ']', '}' => depth -|= 1,
             else => {},
         }
         if ((c == ',' and depth == 0) or k == rest.len - 1) {
@@ -2785,14 +2927,41 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
         return .{ .mem = .{ .base = base, .offset = if (pre) .{ .pre = o } else .{ .imm = o } } };
     }
     if (tok[0] == '#') return cg.asmOperand(tok[1..], names, locals, line);
+    if (tok[0] == '{') {
+        // A register list: `{v1.16b}`, `{v1.16b, v2.16b}`, `{%[t].16b}`.
+        if (tok[tok.len - 1] != '}') return cg.fail("bad asm register list: '{s}'", .{line});
+        var it = std.mem.tokenizeAny(u8, tok[1 .. tok.len - 1], ", \t");
+        var list: ?AsmOperand = null;
+        while (it.next()) |r| {
+            const v = switch (try cg.asmOperand(r, names, locals, line)) {
+                .vreg => |v| v,
+                else => return cg.fail("bad asm register list: '{s}'", .{line}),
+            };
+            if (list) |*l| {
+                if (@backingInt(v.reg) != (@as(u32, @backingInt(l.vlist.first)) + l.vlist.len) % 32 or l.vlist.len == 4)
+                    return cg.fail("bad asm register list: '{s}'", .{line});
+                l.vlist.len += 1;
+            } else list = .{ .vlist = .{ .first = v.reg, .len = 1, .arr = v.arr } };
+        }
+        return list orelse cg.fail("bad asm register list: '{s}'", .{line});
+    }
     if (tok[0] == '%') {
-        // `%[name]`, `%x[name]`, `%w[name]`.
+        // `%[name]`, `%x[name]`, `%w[name]`, `%q[name]`, and a SIMD
+        // operand's arrangement after it (`%[name].16b`).
         var t = tok[1..];
         var width: ?Encoder.Width = null;
         if (t.len > 0 and (t[0] == 'x' or t[0] == 'w')) {
             width = if (t[0] == 'x') .x else .w;
             t = t[1..];
+        } else if (t.len > 0 and std.mem.indexOfScalar(u8, "qdshb", t[0]) != null) {
+            t = t[1..];
         }
+        var arr: ?Arrangement = null;
+        if (std.mem.lastIndexOfScalar(u8, t, ']')) |close| if (close + 1 < t.len) {
+            if (t[close + 1] != '.') return cg.fail("bad asm operand '{s}'", .{tok});
+            arr = std.meta.stringToEnum(Arrangement, t[close + 2 ..]) orelse return cg.fail("bad asm operand '{s}'", .{tok});
+            t = t[0 .. close + 1];
+        };
         if (t.len < 3 or t[0] != '[' or t[t.len - 1] != ']') return cg.fail("bad asm operand '{s}'", .{tok});
         var name = t[1 .. t.len - 1];
         // LLVM's `%[name:w]` form of the modifier.
@@ -2803,10 +2972,12 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
             name = name[0..colon];
         }
         const arg = names.get(name) orelse return cg.fail("unknown asm operand '{s}'", .{tok});
+        if (arg != .vreg and arr != null) return cg.fail("bad asm operand '{s}'", .{tok});
         return switch (arg) {
             .reg => |r| .{ .reg = .{ .reg = r, .width = width orelse .x } },
             .imm => |v| .{ .imm = v },
             .sym => |s| .{ .sym = .{ .key = s.key, .off = s.off } },
+            .vreg => |v| if (width != null) cg.fail("asm operand modifier '{s}' on a SIMD register", .{tok}) else .{ .vreg = .{ .reg = v, .arr = arr } },
         };
     }
     if (std.mem.eql(u8, tok, ".")) {
@@ -2821,6 +2992,7 @@ fn asmOperand(cg: *CodeGen, tok: []const u8, names: *const std.StringHashMapUnma
         return .{ .label = locals.fwd[n].? };
     }
     if (parseReg(tok)) |r| return .{ .reg = r };
+    if (parseVReg(tok)) |v| return v;
     if (tok[0] == '-' or std.ascii.isDigit(tok[0])) {
         return .{ .imm = std.fmt.parseInt(i64, tok, 0) catch return cg.fail("bad asm immediate '{s}'", .{tok}) };
     }
@@ -2835,6 +3007,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     const e = &cg.e;
     const eql = std.mem.eql;
     const System = Encoder.System;
+    if (try cg.asmNeon(mnemonic, ops, line)) return;
     if (ops.len == 0) {
         const word: ?u32 = if (eql(u8, mnemonic, "nop")) System.nop else if (eql(u8, mnemonic, "yield")) System.yield else if (eql(u8, mnemonic, "wfe")) System.wfe else if (eql(u8, mnemonic, "wfi")) System.wfi else if (eql(u8, mnemonic, "sev")) System.sev else if (eql(u8, mnemonic, "sevl")) System.sevl else if (eql(u8, mnemonic, "isb")) System.isb else if (eql(u8, mnemonic, "clrex")) System.clrex else null;
         if (word) |w| return e.raw(w);
@@ -2967,6 +3140,95 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         };
     };
     return cg.asmUnsupported(line);
+}
+
+/// The NEON instructions std's crypto uses on whole vectors, in the
+/// standard syntax (`eor v0.16b, v1.16b, v2.16b`) and Apple's
+/// (`sha256su0.4s v0, v1`, the arrangement on the mnemonic). Returns false
+/// for an instruction that is not one of them.
+fn asmNeon(cg: *CodeGen, mnemonic_in: []const u8, ops: []const AsmOperand, line: []const u8) Error!bool {
+    if (ops.len == 0 or (ops[0] != .vreg)) return false;
+    const dot = std.mem.indexOfScalar(u8, mnemonic_in, '.') orelse mnemonic_in.len;
+    const mnemonic = mnemonic_in[0..dot];
+    const suffix: ?Arrangement = if (dot == mnemonic_in.len) null else std.meta.stringToEnum(Arrangement, mnemonic_in[dot + 1 ..]) orelse return cg.asmUnsupported(line);
+    const Shape = enum { two, three, ext, tbl, movi };
+    const Insn = struct { []const u8, Shape, u32 };
+    // Base encodings with Q clear (or fixed) and the registers zero.
+    const table = [_]Insn{
+        .{ "mov", .two, 0x0EA01C00 }, // orr Vd, Vn, Vn
+        .{ "aese", .two, 0x4E284800 },
+        .{ "aesd", .two, 0x4E285800 },
+        .{ "aesmc", .two, 0x4E286800 },
+        .{ "aesimc", .two, 0x4E287800 },
+        .{ "sha256su0", .two, 0x5E282800 },
+        .{ "eor", .three, 0x2E201C00 },
+        .{ "and", .three, 0x0E201C00 },
+        .{ "orr", .three, 0x0EA01C00 },
+        .{ "pmull", .three, 0x0EE0E000 }, // Vd.1q, Vn.1d, Vm.1d
+        .{ "pmull2", .three, 0x4EE0E000 }, // Vd.1q, Vn.2d, Vm.2d
+        .{ "sha256h", .three, 0x5E004000 },
+        .{ "sha256h2", .three, 0x5E005000 },
+        .{ "sha256su1", .three, 0x5E006000 },
+        .{ "ext", .ext, 0x2E000000 },
+        .{ "tbl", .tbl, 0x0E000000 },
+        .{ "movi", .movi, 0x0F000400 },
+    };
+    const insn = for (table) |t| {
+        if (std.mem.eql(u8, t[0], mnemonic)) break t;
+    } else return false;
+    const d = ops[0].vreg;
+    const arr = d.arr orelse suffix;
+    // The Q bit of the instructions whose encoding above leaves it clear.
+    const q: u32 = switch (insn[2] >> 30 & 1) {
+        0 => if (std.mem.eql(u8, mnemonic, "pmull")) 0 else (arr orelse return cg.asmUnsupported(line)).q(),
+        else => 0,
+    };
+    const v = struct {
+        fn at(o: []const AsmOperand, k: usize) ?u32 {
+            return if (k < o.len and o[k] == .vreg) @backingInt(o[k].vreg.reg) else null;
+        }
+    }.at;
+    const rd: u32 = @backingInt(d.reg);
+    const word: u32 = switch (insn[1]) {
+        .two => w: {
+            const rn = v(ops, 1) orelse return cg.asmUnsupported(line);
+            if (ops.len != 2) return cg.asmUnsupported(line);
+            const rm: u32 = if (std.mem.eql(u8, mnemonic, "mov")) rn << 16 else 0;
+            break :w insn[2] | q << 30 | rm | rn << 5 | rd;
+        },
+        .three => w: {
+            const rn = v(ops, 1) orelse return cg.asmUnsupported(line);
+            const rm = v(ops, 2) orelse return cg.asmUnsupported(line);
+            if (ops.len != 3) return cg.asmUnsupported(line);
+            break :w insn[2] | q << 30 | rm << 16 | rn << 5 | rd;
+        },
+        .ext => w: {
+            const rn = v(ops, 1) orelse return cg.asmUnsupported(line);
+            const rm = v(ops, 2) orelse return cg.asmUnsupported(line);
+            if (ops.len != 4 or ops[3] != .imm or ops[3].imm < 0 or ops[3].imm > (@as(i64, 8) << @intCast(q)) - 1) return cg.asmUnsupported(line);
+            break :w insn[2] | q << 30 | rm << 16 | @as(u32, @intCast(ops[3].imm)) << 11 | rn << 5 | rd;
+        },
+        .tbl => w: {
+            if (ops.len != 3 or ops[1] != .vlist) return cg.asmUnsupported(line);
+            const rm = v(ops, 2) orelse return cg.asmUnsupported(line);
+            const l = ops[1].vlist;
+            break :w insn[2] | q << 30 | rm << 16 | @as(u32, l.len - 1) << 13 | @as(u32, @backingInt(l.first)) << 5 | rd;
+        },
+        .movi => w: {
+            // An 8-bit immediate in each byte (`.16b`, `.8b`) or each
+            // word, unshifted (`.4s`, `.2s`).
+            if (ops.len != 2 or ops[1] != .imm or ops[1].imm < 0 or ops[1].imm > 255) return cg.asmUnsupported(line);
+            const cmode: u32 = switch (arr.?) {
+                .@"8b", .@"16b" => 0b1110,
+                .@"2s", .@"4s" => 0b0000,
+                else => return cg.asmUnsupported(line),
+            };
+            const imm: u32 = @intCast(ops[1].imm);
+            break :w insn[2] | q << 30 | (imm >> 5) << 16 | cmode << 12 | (imm & 31) << 5 | rd;
+        },
+    };
+    try cg.e.raw(word);
+    return true;
 }
 
 // ---------------------------------------------------------------- floats

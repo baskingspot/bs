@@ -884,8 +884,17 @@ comptime arguments are run-time values in the lowered code (uucode's
   (`ldadd`, `swp`, `cas`, ...) with acquire-release, `ldar`/`stlr` for
   loads and stores. Inline assembly is parsed from GNU/LLVM syntax: the
   loads, stores, moves, arithmetic, branches, barriers, hints, and `mrs`
-  of the thread registers that std uses; callee-saved registers a
-  template names are saved around it.
+  of the thread registers that std uses, and the NEON instructions of
+  std's AES, GHASH/POLYVAL and SHA-256 code (`aese`/`aesmc`, `pmull`,
+  `sha256h`, `ext`, `tbl`, `movi`, ...), in both `v0.16b` and Apple's
+  `sha256h.4s` suffix spelling. `w` and `x` operands (v0-v31, v0-v15)
+  take v16-v31 first, then v0-v7, then v8-v15, whose low halves are
+  callee-saved and so are saved whole around the template, as are the
+  callee-saved registers the template names; `%q[x]` and `%[x].4s`
+  pick the register's form. A digit constraint ties an input to an
+  output's register.
+  Vector-typed asm operands load and store through memory, since
+  vector values themselves stay scalarized.
 - Panics are calls, as upstream: `@panic` and each failed safety check
   call the matching function of `std.lang.panic` (`integerOverflow`,
   `outOfBounds(index, len)`, `call(msg, null)`, ...), then `unreach`.
@@ -1453,8 +1462,8 @@ Salsa20, BLAKE3 and SHA-256 in TLS):
    scalarized on x86_64 today; NEON `shl`/`ushr`/`sri` would make
    shifts by a splat worth adding on both. SHA-256 on apple_m1 (which
    has the sha2 feature) is inline assembly with `@Vector(4, u32)`
-   operands in V registers (`w` constraints), so asm operands of vector
-   type come with this step.
+   operands in V registers (`w` constraints); those operands already
+   work through memory, so this step only keeps them in registers.
 3. 16-bit lanes (UTF-16 ASCII checks, ghostty's surrogate test), and
    `@truncate` of a vector to bytes (`xtn`; scalarized on both today).
 4. f32 lanes for graphics and linear-algebra code (none on the checked
