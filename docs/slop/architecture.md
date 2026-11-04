@@ -2997,7 +2997,9 @@ names, before layout, and Elf fills in the exports' values after it.
   records are not first, so there is no DT_RELACOUNT (upstream writes
   none either). An `x86_64_abs64` in .text fails the link: code must not
   need the loader to write it.
-- `.dynamic`: DT_SONAME (`lib<name>.so` by default, `-fsoname=`,
+- `.dynamic`: DT_SONAME (`lib<name>.so` by default, `lib<name>.so.<major>`
+  with `--version`, which also names the file
+  `lib<name>.so.<major>.<minor>.<patch>`, as upstream's; `-fsoname=`,
   `-fno-soname`), HASH, GNU_HASH, SYMTAB, SYMENT, STRTAB, STRSZ, RELA,
   RELASZ, RELAENT, FLAGS, FLAGS_1. There is no DT_NEEDED: imports resolve
   against what the loader has already loaded (the host program, its
@@ -7232,7 +7234,8 @@ diagnostics.
 - **`-lc++`**, and `-lstdc++`, `-lc++abi`, `-lsupc++` (upstream's
   `is_libcpp_lib_name`), imply `-lc` and set `builtin.link_libcpp` and
   the `--listen=-` configuration's `link_libcpp`/`link_libunwind`. An
-  executable (and `bs test`/`run`) links libc++.a, libc++abi.a and
+  executable (and `bs test`/`run`) and a shared library (fmt's libfmt.so,
+  test/link_input/so_cxx.cpp, 2026-11-04) link libc++.a, libc++abi.a and
   libunwind.a; a static library or object only takes the flags, as
   upstream links the runtime libraries only into executables and shared
   libraries. Like C sources, `-lc++` roots ubsan_rt and ssp.

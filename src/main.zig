@@ -161,8 +161,13 @@ pub const Options = struct {
     /// `--verbose-cc`: print each Clang command line, as upstream.
     verbose_cc: bool = false,
     /// `-fsoname=<name>` and `-fno-soname`; by default the shared object's
-    /// file name, as upstream's.
+    /// file name, as upstream's: `lib<name>.so`, with `version`
+    /// `lib<name>.so.<major>`.
     soname: union(enum) { default, name: []const u8, none } = .default,
+    /// `--version`: a shared library's version, which names its file
+    /// (`lib<name>.so.<major>.<minor>.<patch>`) and its soname, as
+    /// upstream's; `zig build` makes the symbolic links to it.
+    version: ?std.SemanticVersion = null,
     /// `--listen=-`: serve std's compiler protocol on stdin and stdout
     /// (`zig build`'s compile steps) instead of compiling once.
     listen: bool = false,
@@ -283,7 +288,7 @@ pub fn main(init_std: std.process.Init) !void {
         else if (command == .run or command == .@"test")
             try runBinPath(arena, init.io, job.bsLocal(arena), job.compile_args, job.zig_lib_dir, job.stem)
         else
-            try outputName(arena, command, opts.dynamic, job.stem),
+            try outputName(arena, command, opts.dynamic, opts.version, job.stem),
     };
     if (opts.emit_bin == .default and (command == .run or command == .@"test")) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
     var inc = job.openCache(out_path);
@@ -899,7 +904,7 @@ fn appendCInputs(arena: std.mem.Allocator, list: *std.ArrayList(u8), c_inputs: [
 /// Whether the build links the C++ runtime libraries: an executable with
 /// `-lc++`, as upstream builds them for executables and shared libraries.
 fn cxxRuntime(opts: *const Options) bool {
-    return opts.link_libcpp and opts.command != .build_obj and opts.command != .build_lib;
+    return opts.link_libcpp and opts.command != .build_obj and (opts.command != .build_lib or opts.dynamic);
 }
 
 /// Whether the build links glibc's libc_nonshared.a: an executable or
@@ -1069,7 +1074,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     emit.pic = if (opts.pie) .pie else if (opts.pic) .pic else .none;
     emit.shared = opts.dynamic;
     if (opts.dynamic) emit.soname = switch (opts.soname) {
-        .default => try outputName(arena, .build_lib, true, job.stem),
+        .default => if (opts.version) |v| try std.fmt.allocPrint(arena, "lib{s}.so.{d}", .{ job.stem, v.major }) else try outputName(arena, .build_lib, true, null, job.stem),
         .name => |n| n,
         .none => null,
     };
@@ -1272,10 +1277,15 @@ fn printEnv(init: std.process.Init) !void {
 }
 
 /// The output's file name in its directory, as upstream names it.
-fn outputName(arena: std.mem.Allocator, command: Command, dynamic: bool, stem: []const u8) ![]const u8 {
+fn outputName(arena: std.mem.Allocator, command: Command, dynamic: bool, version: ?std.SemanticVersion, stem: []const u8) ![]const u8 {
     return switch (command) {
         .build_obj => std.fmt.allocPrint(arena, "{s}.o", .{stem}),
-        .build_lib => std.fmt.allocPrint(arena, "lib{s}.{s}", .{ stem, if (dynamic) "so" else "a" }),
+        .build_lib => if (!dynamic)
+            std.fmt.allocPrint(arena, "lib{s}.a", .{stem})
+        else if (version) |v|
+            std.fmt.allocPrint(arena, "lib{s}.so.{d}.{d}.{d}", .{ stem, v.major, v.minor, v.patch })
+        else
+            std.fmt.allocPrint(arena, "lib{s}.so", .{stem}),
         else => stem,
     };
 }
@@ -1376,7 +1386,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     var outs: [2]Out = undefined;
     if (job) |*j| {
         _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.cache_target);
-        const name = try outputName(arena, opts.command, opts.dynamic, j.stem);
+        const name = try outputName(arena, opts.command, opts.dynamic, opts.version, j.stem);
         // A step without a binary (`-fno-emit-bin`, such as a `check`
         // step) still links one there when the cache can take the build:
         // the cache answers a build whose inputs did not change only from
@@ -1786,7 +1796,6 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-mcmodel", "bs only supports the default code model ('-mcmodel')" },
     .{ "--script", "bs does not support linker scripts ('--script'); build this step with upstream zig" },
     .{ "--version-script", "bs does not support version scripts ('--version-script')" },
-    .{ "--version", "bs does not build shared libraries ('--version')" },
     .{ "-framework", "bs does not link frameworks yet ('-framework')" },
     .{ "-needed_framework", "bs does not link frameworks yet ('-needed_framework')" },
     .{ "-weak_framework", "bs does not link frameworks yet ('-weak_framework')" },
@@ -1888,6 +1897,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             opts.soname = .default;
         } else if (std.mem.eql(u8, arg, "-fno-soname")) {
             opts.soname = .none;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            const v = nextArg(args, &i, arg);
+            opts.version = std.SemanticVersion.parse(v) catch fatal("unable to parse --version '{s}'", .{v});
         } else if (std.mem.eql(u8, arg, "-fno-PIC") or std.mem.eql(u8, arg, "-fno-PIE")) {
             // As upstream: -fno-PIE leaves -fPIC alone.
             if (std.mem.eql(u8, arg, "-fno-PIC")) opts.pic = false;

@@ -1617,6 +1617,24 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
     cxx_run.addCheck(.{ .expect_stderr_exact = "result 151, link_libcpp true\n" });
     cxx_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&cxx_run.step);
+    // A shared library of C++ only, versioned: libc++ is built into it,
+    // and the loader finds it by its soname, libsxx.so.1, as upstream's.
+    const so_cxx = b.addRunArtifact(bs);
+    so_cxx.setName("bs build-lib -dynamic -lc++ --version with a C++ source");
+    so_cxx.addArgs(&.{ "build-lib", "-dynamic", "-lc++", "-target", "x86_64-linux-gnu", "--name", "sxx", "--version", "1.2.3" });
+    so_cxx.addFileArg(b.path("test/link_input/so_cxx.cpp"));
+    so_cxx.setEnvironmentVariable("BS_ZIG", zig);
+    const so_cxx_file = so_cxx.addPrefixedOutputFileArg("-femit-bin=", "libsxx.so.1.2.3");
+    const so_cxx_host = b.addSystemCommand(&.{ zig, "build-exe", "-lc" });
+    so_cxx_host.addFileArg(b.path("test/link_input/so_cxx_main.zig"));
+    so_cxx_host.addFileArg(so_cxx_file);
+    const so_cxx_run = b.addSystemCommand(&.{ "sh", "-c", "d=$(mktemp -d) && cp \"$1\" \"$d/libsxx.so.1\" && LD_LIBRARY_PATH=$d \"$2\"; r=$?; rm -rf \"$d\"; exit $r", "sh" });
+    so_cxx_run.setName("run so_cxx_main.zig (bs shared library of C++)");
+    so_cxx_run.addFileArg(so_cxx_file);
+    so_cxx_run.addFileArg(so_cxx_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    so_cxx_run.addCheck(.{ .expect_stderr_exact = "sxx 6 9\n" });
+    so_cxx_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&so_cxx_run.step);
 
     // translate-c with a system library takes the native include
     // directories (here NIX_CFLAGS_COMPILE's) ahead of the user's
