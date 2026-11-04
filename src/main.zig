@@ -502,18 +502,22 @@ pub const Job = struct {
         return std.fs.path.join(arena, &.{ job.cache_dirs.local, "zap" }) catch fatal("out of memory", .{});
     }
 
+    /// Whether a build with an output can use the on-disk cache.
+    pub fn cacheable(job: *const Job) bool {
+        // The numbered link has no position-independent layout yet (`Elf`);
+        // -fPIE and -dynamic imply -fPIC (and -lc on objects and
+        // libraries). A library of C only has no Zig to cache; its
+        // objects have their records.
+        return !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and
+            !std.mem.eql(u8, job.environ_map.get("ZAP_CACHE") orelse "", "off");
+    }
+
     /// Opens the on-disk cache for a build into `out_path`: a build whose
     /// inputs did not change relinks the last build's Atoms and skips
     /// everything else.
     pub fn openCache(job: *const Job, out_path: ?[]const u8) ?Incremental {
         const env = job.environ_map;
-        // The numbered link has no position-independent layout yet (`Elf`);
-        // -fPIE and -dynamic imply -fPIC (and -lc on objects and
-        // libraries). A library of C only has no Zig to cache; its
-        // objects have their records.
-        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and
-            !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
-        if (!use_cache) return null;
+        if (out_path == null or !job.cacheable()) return null;
         const tests_std = job.opts.command == .@"test" and
             (Frontend.testsStd(job.gpa, job.zig_lib_dir, job.opts.root_src_path) catch fatal("out of memory", .{}));
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -1112,12 +1116,18 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
         _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.cache_target);
         digest = Incremental.outputDigest(key);
         const name = try outputName(arena, opts.command, opts.dynamic, j.stem);
+        // A step without a binary (`-fno-emit-bin`, such as a `check`
+        // step) still links one there when the cache can take the build:
+        // the cache answers a build whose inputs did not change only from
+        // a linked output, and the runner sends such steps an update on
+        // every build. The runner does not look at the binary.
+        const hidden = opts.emit_bin == .none and j.cacheable();
         out_path = switch (opts.emit_bin) {
-            .none => null,
+            .none => if (hidden) try std.fs.path.join(arena, &.{ j.cache_dirs.local, "o", &std.fmt.bytesToHex(digest, .lower), name }) else null,
             .path => |p| p,
             .default => try std.fs.path.join(arena, &.{ j.cache_dirs.local, "o", &std.fmt.bytesToHex(digest, .lower), name }),
         };
-        if (opts.emit_bin == .default) try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(out_path.?).?);
+        if (opts.emit_bin == .default or hidden) try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(out_path.?).?);
         docs_path = switch (opts.emit_docs) {
             .none => null,
             .path => |p| p,
