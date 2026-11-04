@@ -38,6 +38,7 @@ const ElfObject = @import("link/ElfObject.zig");
 const ElfDynamic = @import("link/ElfDynamic.zig");
 const Glibc = @import("link/Glibc.zig");
 const Archive = @import("link/Archive.zig");
+const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const Replay = @import("Replay.zig");
@@ -490,7 +491,22 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     const symbols: ElfObject.Symbols = .{ .exports = exports.items, .imports = imports.items };
     const result = switch (inc.output) {
         .exe => Elf.linkInput(gpa, io, out_dir, sub_path, input, options),
-        .obj => ElfObject.linkInput(gpa, io, out_dir, sub_path, input, options, symbols),
+        .obj => if (inc.link_objects.len == 0) ElfObject.linkInput(gpa, io, out_dir, sub_path, input, options, symbols) else obj: {
+            // The Zig object merged with the object inputs and the C
+            // objects, as `main.writeMerged` merges them.
+            const obj = ElfObject.emitInput(gpa, io, input, options, symbols) catch |err| break :obj err;
+            defer gpa.free(obj);
+            const inputs = try arena.alloc(ElfMerge.Input, 1 + inc.link_objects.len);
+            inputs[0] = .{ .path = sub_path, .bytes = obj };
+            for (inputs[1..], inc.link_objects) |*in_obj, path| in_obj.* = .{ .path = path, .bytes = try inc.mapInput(arena, &maps, path) orelse return null };
+            var why: []const u8 = "";
+            const merged = ElfMerge.merge(gpa, arena, inputs, &why) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => return inc.noLink("{s}", .{why}),
+            };
+            defer gpa.free(merged);
+            break :obj out_dir.writeFile(io, .{ .sub_path = sub_path, .data = merged });
+        },
         .lib => lib: {
             const obj = ElfObject.emitInput(gpa, io, input, options, symbols) catch |err| break :lib err;
             defer gpa.free(obj);

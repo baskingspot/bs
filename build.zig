@@ -1257,6 +1257,58 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
             test_step.dependOn(&tls_run.step);
         }
     }
+    // build-obj with a C source and a C object: one merged object
+    // (link/ElfMerge.zig), which upstream's linker and zap's link as
+    // upstream's own merged object links. Then C++ objects whose COMDAT
+    // groups repeat, merged with the second copies dropped, and linked by
+    // upstream's `zig c++`: exceptions still unwind through them.
+    {
+        const tls_o = b.addSystemCommand(&.{ zig, "cc", "-fPIC", "-c" });
+        tls_o.addFileArg(b.path("test/link_input/tls.c"));
+        const merge = b.addRunArtifact(zap);
+        merge.setName("zap build-obj with a C source and a C object");
+        merge.addArg("build-obj");
+        merge.addFileArg(b.path("test/link_input/merge_lib.zig"));
+        merge.addFileArg(b.path("test/link_input/merge.c"));
+        merge.addFileArg(tls_o.addPrefixedOutputFileArg("-o", "tls.o"));
+        merge.setEnvironmentVariable("ZAP_CACHE", "off");
+        merge.setEnvironmentVariable("ZAP_ZIG", zig);
+        const merged = merge.addPrefixedOutputFileArg("-femit-bin=", "merged.o");
+        const up_exe = b.addSystemCommand(&.{ zig, "build-exe" });
+        up_exe.addFileArg(b.path("test/link_input/merge_main.zig"));
+        up_exe.addFileArg(merged);
+        const zap_exe = b.addRunArtifact(zap);
+        zap_exe.addArg("build-exe");
+        zap_exe.addFileArg(b.path("test/link_input/merge_main.zig"));
+        zap_exe.addFileArg(merged);
+        zap_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        for ([_]*std.Build.Step.Run{ up_exe, zap_exe }, [_][]const u8{ "upstream's", "zap's" }) |link, who| {
+            const r = std.Build.Step.Run.create(b, b.fmt("run {s} link of zap's merged object", .{who}));
+            r.addFileArg(link.addPrefixedOutputFileArg("-femit-bin=", "main"));
+            r.addCheck(.{ .expect_stderr_exact = "44 bee 6 712\n" });
+            r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+            test_step.dependOn(&r.step);
+        }
+        const cxx = b.addRunArtifact(zap);
+        cxx.setName("zap build-obj with C++ objects");
+        cxx.addArg("build-obj");
+        cxx.addFileArg(b.path("test/link_input/merge_lib.zig"));
+        cxx.addFileArg(b.path("test/link_input/merge.c"));
+        for ([_][]const u8{ "merge1", "merge2" }) |stem| {
+            const o = b.addSystemCommand(&.{ zig, "c++", "-c" });
+            o.addFileArg(b.path(b.fmt("test/link_input/{s}.cpp", .{stem})));
+            cxx.addFileArg(o.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{stem})));
+        }
+        cxx.setEnvironmentVariable("ZAP_CACHE", "off");
+        cxx.setEnvironmentVariable("ZAP_ZIG", zig);
+        const cxx_link = b.addSystemCommand(&.{ zig, "c++" });
+        cxx_link.addFileArg(cxx.addPrefixedOutputFileArg("-femit-bin=", "merged.o"));
+        const r = std.Build.Step.Run.create(b, "run upstream's link of zap's merged C++ object");
+        r.addFileArg(cxx_link.addPrefixedOutputFileArg("-o", "main"));
+        r.addCheck(.{ .expect_stdout_exact = "caught neg\n10 8 1 4\n" });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
     // An executable of C only, as upstream builds one: its main is C's.
     {
         const cexe = b.addRunArtifact(zap);

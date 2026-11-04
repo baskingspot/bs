@@ -79,3 +79,24 @@ if [ $cmd = build-lib ]; then
     ZAP_CACHE=off "$zap" build-obj lib.zig --global-cache-dir global -femit-bin=without-archive.o >log 2>&1 || fail "build-obj"
     cmp -s with-archive.o without-archive.o || fail "build-obj leaves archive inputs out"
 fi
+
+# As upstream's: an object merges its object inputs and C objects after the
+# Zig object (a relocatable link, link/ElfMerge.zig), also when it relinks
+# or edits through the cache.
+if [ $cmd = build-obj ]; then
+    printf 'export fn d_one() u32 { return 1; }\n' >d.zig
+    printf 'int c_two(void) { return 2; }\n' >c.c
+    ZAP_CACHE=off "$zap" build-obj d.zig --global-cache-dir global -femit-bin=d.o >log 2>&1 || fail "build-obj d.zig"
+    inputs="d.o c.c"
+    rm -rf local global
+    mkdir -p global/zap
+    cp -r "$seed/zap/zir" global/zap
+    cp "$src" lib.zig
+    build build-obj lib.o "recorded"
+    defined=$(nm lib.o | awk '$2 == "T" && ($3 == "d_one" || $3 == "c_two" || $3 == "zap_add") { print $3 }' | sort | tr '\n' ' ')
+    [ "$defined" = "c_two d_one zap_add " ] || fail "lib.o defines zap_add, d_one and c_two (got '$defined')"
+    rm lib.o
+    build build-obj lib.o "relinked"
+    sed 's/return counter + calls;/return counter + calls + 1;/' "$src" >lib.zig
+    build build-obj lib.o "linked 2"
+fi

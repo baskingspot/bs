@@ -6407,14 +6407,36 @@ libraries as inputs. To be agreed with that thread.
   `--verbose-cc` are global. Assembly sources, and C
   sources in `build-obj` and `build-lib -dynamic` (which would need the
   objects linked into the output) stay `[unsupported]`.
+- **Relocatable links** (`build-obj` with object inputs or C sources,
+  built 2026-11-04; `link/ElfMerge.zig`), as upstream's `flushObject`:
+  the Zig object (written by `ElfObject` as before), then the object
+  inputs, then the C objects, merged as `ld -r` merges them. Inputs stay
+  ELF, not Atoms: sections with the same name (and COMDAT group) are
+  concatenated in input order at their alignment, symbols and RELA
+  relocations are renumbered and moved by each piece's offset, and a
+  relocation against an input's section symbol names the output
+  section's with the piece's offset added. COMDAT groups repeat only
+  once (the first input's), with a `.group` section listing the members
+  and their relocation sections; the FDEs of dropped members go too,
+  and debug relocations against them point at 0. Globals: one per name,
+  a strong definition over a weak one over COMMON over references, two
+  strong definitions an error, the most restrictive visibility. .eh_frame
+  pieces follow each other without padding or zero terminators, which
+  LLD reads as the end of the section. `.llvm_addrsig` is dropped. A C
+  object only (no Zig module) is merged the same way. Upstream also
+  dedupes merged strings and rebuilds .eh_frame; zap's output links to
+  the same program (test/link_input/merge*: upstream's linker, LLD with
+  C++ COMDATs and exceptions, and zap's) and keeps C and Zig lines in
+  traces. The cache relinks the Zig object and merges again
+  (`Incremental.linkFrom`; test/obj/cache.sh).
 - **Static libraries** (2026-11-04), as upstream's: the archive holds
   the Zig object (`<root stem>.o`), then the object inputs (named after
   their files, as given), then one member per C source (`<stem>.o`),
   with one symbol index over all of them (`Archive.write` takes the
   members). Archive inputs of `build-lib` and `build-obj` are left out,
-  as upstream leaves them (a missing one is an error); object inputs of
-  `build-obj` and `build-lib -dynamic` need a relocatable link and stay
-  `[unsupported]`. A cached library relinks as its Zig object plus the
+  as upstream leaves them (a missing one is an error). Object inputs
+  and C sources of `build-obj` are merged into the object (below). A
+  cached library relinks as its Zig object plus the
   other members read again (`Incremental.linkFrom`); it does not link
   them as an executable's inputs (built 2026-11-04). A module without a root source
   file (`-M<name>`, which `zig build` passes for a library of C only)

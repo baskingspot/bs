@@ -13,6 +13,7 @@ const Incremental = @import("Incremental.zig");
 const cache = @import("cache.zig");
 const Builtin = @import("Builtin.zig");
 const Archive = @import("link/Archive.zig");
+const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const Docs = @import("Docs.zig");
@@ -799,7 +800,8 @@ const InputsRecord = struct {
 fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_path: ?[]const u8, alt_path: ?[]const u8, inputs: ?*std.ArrayList(u8)) !Outcome {
     const arena = init.arena.allocator();
     const io = init.io;
-    const stamp_path: ?[]const u8 = if (out_path != null) path: {
+    // The stamp covers the C objects and the output, not object inputs.
+    const stamp_path: ?[]const u8 = if (out_path != null and job.opts.link_inputs.len == 0) path: {
         _, const key = try Incremental.compilationKey(arena, io, job.compile_args, job.zig_lib_dir, "c archive");
         break :path try std.fs.path.join(arena, &.{ job.zapLocal(arena), "car", &std.fmt.bytesToHex(@as([16]u8, @bitCast(key)), .lower) });
     } else null;
@@ -816,12 +818,17 @@ fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_
     if (inputs) |list| try appendCInputs(arena, list, c.inputs);
     if (c.errors.len != 0) return .{ .errors = try dupeDiagnostics(arena, c.errors) };
     const bin_path = alt_path orelse out_path orelse return .{ .ok = .{ .cache_hit = false } };
-    const members = try arena.alloc(Archive.Input, c.objects.len);
-    for (members, c.objects) |*m, o| m.* = .{ .name = o.member, .bytes = o.bytes };
-    Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members) catch |err| {
-        std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
-        return .failed;
-    };
+    if (job.opts.command == .build_obj) {
+        if (!try writeMerged(init, bin_path, null, job.opts.link_inputs, c.objects)) return .failed;
+    } else {
+        var members: std.ArrayList(Archive.Input) = .empty;
+        for (job.opts.link_inputs) |path| try members.append(arena, .{ .name = std.fs.path.basename(path), .bytes = try readInput(init, path) });
+        for (c.objects) |o| try members.append(arena, .{ .name = o.member, .bytes = o.bytes });
+        Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items) catch |err| {
+            std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
+            return .failed;
+        };
+    }
     // Best effort: without the stamp, the next build writes the archive.
     if (stamp_path) |sp| if (CSource.archiveStamp(b, arena, bin_path) catch null) |stamp| {
         var bytes: [16]u8 = undefined;
@@ -834,6 +841,38 @@ fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_
         };
     };
     return .{ .ok = .{ .cache_hit = false, .at_alt = alt_path != null } };
+}
+
+fn readInput(init: std.process.Init, path: []const u8) ![]u8 {
+    return Io.Dir.cwd().readFileAlloc(init.io, path, init.arena.allocator(), .unlimited) catch |err| switch (err) {
+        error.OutOfMemory => |e| e,
+        else => fatal("unable to read '{s}': {t}", .{ path, err }),
+    };
+}
+
+/// Writes the object merging the Zig object `zig_obj` (if any), the object
+/// inputs and the C objects, in that order, as upstream's `build-obj`
+/// does (link/ElfMerge.zig). Returns false after reporting an error.
+fn writeMerged(init: std.process.Init, bin_path: []const u8, zig_obj: ?[]const u8, link_inputs: []const []const u8, c_objects: []const CSource.Object) !bool {
+    const arena = init.arena.allocator();
+    var inputs: std.ArrayList(ElfMerge.Input) = .empty;
+    if (zig_obj) |bytes| try inputs.append(arena, .{ .path = bin_path, .bytes = bytes });
+    for (link_inputs) |path| try inputs.append(arena, .{ .path = path, .bytes = try readInput(init, path) });
+    for (c_objects) |o| try inputs.append(arena, .{ .path = o.path, .bytes = o.bytes });
+    var why: []const u8 = "";
+    const merged = ElfMerge.merge(init.gpa, arena, inputs.items, &why) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => {
+            std.log.err("{s}", .{why});
+            return false;
+        },
+    };
+    defer init.gpa.free(merged);
+    Io.Dir.cwd().writeFile(init.io, .{ .sub_path = bin_path, .data = merged }) catch |err| {
+        std.log.err("unable to write '{s}': {t}", .{ bin_path, err });
+        return false;
+    };
+    return true;
 }
 
 /// Appends the files the C sources read, each once: sources share most of
@@ -1124,11 +1163,18 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // A lazy edit build links from the manifest it appends to.
     const lazy_linked = if (inc_opt) |i| try i.finishLazy(&fe, &zcu, &emit, Io.Dir.cwd(), bin_path) else null;
     if (lazy_linked == null) if (inc_opt) |i| i.startRecord(&fe, &zcu, &emit);
-    // A static library is its object in an archive (link/Archive.zig); a
-    // lazy edit build writes the archive itself.
+    // A static library is its object in an archive (link/Archive.zig); an
+    // object with object inputs or C sources merges them (`writeMerged`).
+    // A lazy edit build writes either itself.
     const archive = opts.command == .build_lib and !opts.dynamic;
-    const link_path = if (archive) try std.fmt.allocPrint(arena, "{s}.o.tmp", .{bin_path}) else bin_path;
+    const merged = opts.command == .build_obj and (opts.link_inputs.len != 0 or c_batch != null);
+    const link_path = if (archive or merged) try std.fmt.allocPrint(arena, "{s}.o.tmp", .{bin_path}) else bin_path;
     var linked = lazy_linked orelse try emit.link(init.io, Io.Dir.cwd(), link_path);
+    if (linked and lazy_linked == null and merged) {
+        defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
+        const obj = try Io.Dir.cwd().readFileAlloc(init.io, link_path, arena, .unlimited);
+        linked = try writeMerged(init, bin_path, obj, opts.link_inputs, if (c_batch) |b| (try b.wait()).objects else &.{});
+    }
     if (linked and lazy_linked == null and archive) {
         defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
         const obj = try Io.Dir.cwd().readFileAlloc(init.io, link_path, arena, .unlimited);
@@ -2044,22 +2090,23 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     if (opts.link_libc and opts.dynamic and command == .build_lib)
         setUnsupported(&opts, arena, "zap does not link shared libraries against glibc yet ('-dynamic' with '-lc'); build this step with upstream zig", .{});
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena, io);
-    // A static library holds the C objects as members; an object or a
-    // shared library would need them linked into it.
-    if (c_files.items.len != 0 and (command == .build_obj or (command == .build_lib and opts.dynamic)))
+    // A static library holds the C objects as members, and an object
+    // merges them (`ElfMerge`); a shared library would need them linked
+    // into it.
+    if (c_files.items.len != 0 and command == .build_lib and opts.dynamic)
         setUnsupported(&opts, arena, "zap does not compile C sources into objects or shared libraries yet ('{s}'); build this step with upstream zig", .{c_files.items[0].path});
     // C sources without any module: a library or executable of C only, as
     // upstream's.
-    if (root == null and !rootless_root and c_files.items.len != 0 and command != .build_obj and command != .@"test") rootless_root = true;
+    if (root == null and !rootless_root and c_files.items.len != 0 and command != .@"test") rootless_root = true;
     if (root == null and rootless_root) {
         // An executable whose main is C's, as upstream's; zap needs glibc
         // for its start code (`Builtin.glibc_start`).
         if ((command == .build_exe or command == .run) and opts.link_libc and c_files.items.len != 0)
             opts.c_exe = true
-        else if (command != .build_lib or opts.dynamic)
-            setUnsupported(&opts, arena, "zap builds modules without a Zig root source file only into static libraries of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", .{opts.root_name})
+        else if ((command != .build_lib and command != .build_obj) or opts.dynamic)
+            setUnsupported(&opts, arena, "zap builds modules without a Zig root source file only into static libraries and objects of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", .{opts.root_name})
         else if (c_files.items.len == 0)
-            setUnsupported(&opts, arena, "zap builds a library without a Zig root source file only from C sources ('-M{s}')", .{opts.root_name})
+            setUnsupported(&opts, arena, "zap builds a library or object without a Zig root source file only from C sources ('-M{s}')", .{opts.root_name})
         else
             opts.c_only = true;
     }
@@ -2084,10 +2131,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             fatal("unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
     }
     // As upstream, an object or a static library links nothing: it leaves
-    // archive and shared library inputs out (`-l` names are still found),
-    // and a static library holds object inputs as members after its own
-    // object. Merging objects into an object (or a shared library) is a
-    // relocatable link zap does not do yet.
+    // archive and shared library inputs out (`-l` names are still found).
+    // A static library holds object inputs as members after its own
+    // object, and an object merges them (`ElfMerge`); linking them into a
+    // shared library is not done yet.
     if (command == .build_obj or command == .build_lib) {
         // As upstream's `Config.resolve`, a library that links a shared
         // one without `-static` or `-dynamic` is shared.
@@ -2103,8 +2150,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                 Io.Dir.cwd().access(io, path, .{}) catch fatal("{s}: file not found", .{path});
                 continue;
             }
-            if (command == .build_obj or opts.dynamic)
-                setUnsupported(&opts, arena, "zap does not link object files into objects or shared libraries yet ('{s}'); build this step with upstream zig", .{path});
+            if (opts.dynamic)
+                setUnsupported(&opts, arena, "zap does not link object files into shared libraries yet ('{s}'); build this step with upstream zig", .{path});
             link_inputs.items[kept] = path;
             kept += 1;
         }
