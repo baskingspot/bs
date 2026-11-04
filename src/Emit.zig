@@ -1234,9 +1234,16 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         defer arena_state.deinit();
         var dynamic = g.dynamicOptions(arena_state.allocator(), imports[0..n_imports], imports[n_imports..], emit.shared_libs) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
-            // Imports in an executable come from the shared libraries and
-            // glibc only (`libraryDefines`).
-            error.NotInGlibc => unreachable,
+            // Imports come from the shared libraries and glibc only
+            // (`libraryDefines`), but a unit an edit build loaded may
+            // import a name a changed library no longer defines.
+            error.NotInGlibc => {
+                for (imports) |imp| if (!emit.libraryDefines(imp.name)) {
+                    std.debug.print("error: undefined symbol: {s} (no shared library or glibc defines it)\n", .{imp.name});
+                    break;
+                };
+                return false;
+            },
         };
         dynamic.runpath = emit.runpath;
         var exe_options = options;

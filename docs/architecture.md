@@ -2777,9 +2777,24 @@ thread's abilists imports. No bytes come from it.
 - DT_RUNPATH: the `-rpath` arguments, then, on the native target, the
   `-L` directories, deduplicated and joined with `:` (upstream's rule).
   No RUNPATH without either, so other `-lc` outputs stay byte-identical.
-  The cache writes the same RUNPATH (`Incremental.runpath`); builds with
-  `.so` inputs skip the cache, as builds with objects did before
-  obj-inputs3.
+  The cache writes the same RUNPATH (`Incremental.runpath`).
+- Cached (2026-11-04): `.so` files are link-only manifest inputs after
+  the objects (`Incremental.link_shared`, keyed `:link:<path>`, in the
+  compilation key as `--zap-link-input=`). CodeGen depends on them only
+  through `exportTarget`, whose `importKey(name)` is the same whichever
+  library defines a name, so atoms depend on whether some library
+  defines a name, not which. A relink, numbered or keyed with objects,
+  maps and parses them again (`loadShared`, an mmap and a .dynsym walk)
+  for the import versions, DT_NEEDED and copy sizes; a lazy edit build
+  uses main.zig's parse, which every build makes for CodeGen. A changed
+  `.so` makes the edit build eager (`linkInputsChanged`), so Emit.finish
+  binds the externs again; a loaded unit's import that the new library
+  no longer defines is an error ("undefined symbol: X (no shared library
+  or glibc defines it)"), and a relink that meets one builds instead.
+  test/link_input/cache.sh checks a `-lc -lshared` program without and
+  with a `-fPIE` C object: cold, unchanged, a deleted output, a Zig edit
+  (lazy), a relink from a lazy build's log, a rebuilt library with the
+  same symbols (eager), and a library that drops an imported name.
 - Test: `run zap link of a shared library` builds `libshared.so` with
   upstream `zig cc -shared` and a version script, and links a Zig main
   and a `-fPIE` C object against it with `-lc -lshared -L`; it checks

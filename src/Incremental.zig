@@ -39,6 +39,7 @@ const ElfDynamic = @import("link/ElfDynamic.zig");
 const Glibc = @import("link/Glibc.zig");
 const Archive = @import("link/Archive.zig");
 const ElfInput = @import("link/ElfInput.zig");
+const ElfShared = @import("link/ElfShared.zig");
 const Replay = @import("Replay.zig");
 
 const Incremental = @This();
@@ -108,6 +109,16 @@ link_objects: []const []const u8 = &.{},
 /// missed, and upstream's Clang is compiling it), so they may differ from
 /// the manifest's: the build replays eagerly, as after an edited object.
 link_objects_pending: bool = false,
+/// Such an executable's shared library inputs, absolute, in command-line
+/// order: link-only inputs after `link_objects`. A relink parses them
+/// again for the dynamic tables (`loadShared`), and a build after one
+/// changed replays eagerly, as after a changed object: `Emit.finish` then
+/// binds the externs again, and an import no library defines any more is
+/// an error.
+link_shared: []const []const u8 = &.{},
+/// The parsed `link_shared`, if the build parsed them (main.zig does in
+/// every build, for CodeGen's `exportTarget`).
+shared: ?[]const ElfShared = null,
 /// Such an executable's DT_RUNPATH (`Options.runpath` in main.zig).
 runpath: ?[]const u8 = null,
 /// Whether a build that does not relink renews the output's mtime, as a
@@ -228,15 +239,16 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     if (m.entry == 0 and inc.output == .exe) return inc.noRelink("no entry point", .{});
     // The same link inputs, in order: a C source's object can move.
     {
+        const n_link = inc.link_objects.len + inc.link_shared.len;
         var n: usize = 0;
         for (0..m.inputCount()) |i| {
             const key = m.inputKey(@intCast(i));
             if (!isLinkInput(key)) continue;
-            if (n == inc.link_objects.len or !std.mem.eql(u8, key[link_input_prefix.len..], inc.link_objects[n]))
+            if (n == n_link or !std.mem.eql(u8, key[link_input_prefix.len..], inc.linkPath(n)))
                 return inc.noRelink("the link inputs are not the last build's", .{});
             n += 1;
         }
-        if (n != inc.link_objects.len) return inc.noRelink("the link inputs are not the last build's", .{});
+        if (n != n_link) return inc.noRelink("the link inputs are not the last build's", .{});
     }
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(gpa);
@@ -269,6 +281,11 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         linked.atoms, ms(t0, now(io)), m.inputCount(), ms(t0, t1), changed.items.len, ms(t1, linked.gathered), ms(linked.gathered, now(io)),
     });
     return true;
+}
+
+/// Link-only input `n`: of `link_objects`, then of `link_shared`.
+fn linkPath(inc: *const Incremental, n: usize) []const u8 {
+    return if (n < inc.link_objects.len) inc.link_objects[n] else inc.link_shared[n - inc.link_objects.len];
 }
 
 /// Whether manifest `m`'s input `i`, whose stat changed, still has the
@@ -409,11 +426,16 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
         break :g &glibc_loaded.?;
     };
-    if (inc.link_objects.len != 0) return inc.linkWithInputs(arena, m, &input, in.numbered, exports.items, imports.items, glibc, out_dir, sub_path, cwd, gathered);
+    // Mapped, not read: the shared libraries' names point into them, and
+    // the objects' atoms, until the link returns.
+    var maps: std.ArrayList(Io.File.MemoryMap) = .empty;
+    defer for (maps.items) |*mm| mm.destroy(io);
+    const shared: []const ElfShared = if (!exe_dyn) &.{} else inc.shared orelse (try inc.loadShared(arena, &maps)) orelse return null;
+    if (inc.link_objects.len != 0) return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, imports.items, glibc, shared, out_dir, sub_path, cwd, gathered);
     if (glibc) |g| {
-        dynamic = g.dynamicOptions(arena, imports.items, &.{}, &.{}) catch |err| switch (err) {
+        dynamic = g.dynamicOptions(arena, imports.items, &.{}, shared) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
-            error.NotInGlibc => return inc.noLink("an import glibc does not define", .{}),
+            error.NotInGlibc => return inc.noLink("an import no shared library or glibc defines", .{}),
         };
         dynamic.runpath = inc.runpath;
         dynamic_imports = try arena.alloc(u32, imports.items.len);
@@ -466,6 +488,39 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
 
 const Linked = struct { atoms: usize, gathered: Io.Timestamp };
 
+/// Maps link input `path` into `maps`, or returns null after saying why.
+fn mapInput(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io.File.MemoryMap), path: []const u8) !?[]const u8 {
+    const io = inc.io;
+    const mapped = map: {
+        const f = Io.Dir.cwd().openFile(io, path, .{}) catch |err| break :map err;
+        defer f.close(io);
+        const len = f.length(io) catch |err| break :map err;
+        if (len == 0) break :map error.EmptyFile;
+        try maps.ensureUnusedCapacity(arena, 1);
+        break :map cache.mapOpenFile(io, f, len, true);
+    } catch |err| {
+        _ = inc.noRelink("{s}: {t}", .{ path, err });
+        return null;
+    };
+    maps.appendAssumeCapacity(mapped);
+    return mapped.memory;
+}
+
+/// Parses `link_shared`, mapped into `maps`, or returns null after saying
+/// why.
+fn loadShared(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io.File.MemoryMap)) !?[]const ElfShared {
+    const shared = try arena.alloc(ElfShared, inc.link_shared.len);
+    for (shared, inc.link_shared) |*lib, path| {
+        const bytes = try inc.mapInput(arena, maps, path) orelse return null;
+        lib.* = ElfShared.parse(arena, path, bytes) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            _ = inc.noRelink("{s}: {t}", .{ path, err });
+            return null;
+        };
+    }
+    return shared;
+}
+
 /// `linkFrom` for an executable with object and archive inputs, whose
 /// atoms the manifest does not hold: it converts them again, as
 /// `Emit.finish` does, and appends them to the manifest's atoms, where a
@@ -477,12 +532,14 @@ const Linked = struct { atoms: usize, gathered: Io.Timestamp };
 fn linkWithInputs(
     inc: *Incremental,
     arena: Allocator,
+    maps: *std.ArrayList(Io.File.MemoryMap),
     m: *Manifest,
     pack_atoms: *const Pack.LinkAtoms,
     numbered: []const Elf.NumberedAtom,
     exports: []const ElfObject.Export,
     imports: []ElfObject.Import,
     glibc: ?*const Glibc,
+    shared: []const ElfShared,
     out_dir: Io.Dir,
     sub_path: []const u8,
     cwd: []const u8,
@@ -491,19 +548,8 @@ fn linkWithInputs(
     const gpa = inc.gpa;
     const io = inc.io;
     var objects: ElfInput = .{ .arena = arena };
-    // Mapped, not read: the atoms point into them until the link returns.
-    var maps: std.ArrayList(Io.File.MemoryMap) = .empty;
-    defer for (maps.items) |*mm| mm.destroy(io);
     for (inc.link_objects) |path| {
-        const bytes = bytes: {
-            const f = Io.Dir.cwd().openFile(io, path, .{}) catch |err| return inc.noLink("{s}: {t}", .{ path, err });
-            defer f.close(io);
-            const len = f.length(io) catch |err| return inc.noLink("{s}: {t}", .{ path, err });
-            if (len == 0) return inc.noLink("{s} is empty", .{path});
-            try maps.ensureUnusedCapacity(arena, 1);
-            maps.appendAssumeCapacity(cache.mapOpenFile(io, f, len, true) catch |err| return inc.noLink("{s}: {t}", .{ path, err }));
-            break :bytes maps.items[maps.items.len - 1].memory;
-        };
+        const bytes = try inc.mapInput(arena, maps, path) orelse return null;
         const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
         (if (is_archive) objects.addArchive(path, bytes) else objects.addObject(path, bytes)) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
@@ -515,6 +561,7 @@ fn linkWithInputs(
     const Resolver = struct {
         exports: *const std.StringHashMapUnmanaged(Atom.SymbolKey),
         glibc: ?*const Glibc,
+        shared: []const ElfShared,
         copies: *std.StringArrayHashMapUnmanaged(u64),
         arena: Allocator,
 
@@ -532,21 +579,26 @@ fn linkWithInputs(
         pub fn importSym(r: @This(), name: []const u8, weak: bool) !?Atom.SymbolKey {
             _ = weak;
             const g = r.glibc orelse return null;
-            if (g.get(name) == null) return null;
+            if (Glibc.sharedSymbol(r.shared, name) == null and g.get(name) == null) return null;
             return Emit.importKey(name);
         }
 
         pub fn copySym(r: @This(), name: []const u8) !?Atom.SymbolKey {
-            const sym = r.glibc.?.get(name).?;
-            if (!sym.object or sym.size == 0) return null;
-            try r.copies.put(r.arena, try r.arena.dupe(u8, name), sym.size);
+            const size: u64 = if (Glibc.sharedSymbol(r.shared, name)) |s|
+                if (s.sym.object) s.sym.size else 0
+            else s: {
+                const sym = r.glibc.?.get(name).?;
+                break :s if (sym.object) sym.size else 0;
+            };
+            if (size == 0) return null;
+            try r.copies.put(r.arena, try r.arena.dupe(u8, name), size);
             return Emit.importKey(name);
         }
     };
     var export_keys: std.StringHashMapUnmanaged(Atom.SymbolKey) = .empty;
     for (exports) |x| _ = try export_keys.getOrPutValue(arena, x.name, x.key);
     var copies: std.StringArrayHashMapUnmanaged(u64) = .empty;
-    const resolver: Resolver = .{ .exports = &export_keys, .glibc = glibc, .copies = &copies, .arena = arena };
+    const resolver: Resolver = .{ .exports = &export_keys, .glibc = glibc, .shared = shared, .copies = &copies, .arena = arena };
     // The archive members the Zig code's externs pull: those of the
     // linked nodes and the link's own atoms.
     var externs: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -594,10 +646,9 @@ fn linkWithInputs(
             std.mem.swap(ElfObject.Import, &imports[n], &imports[i]);
             n += 1;
         };
-        // No shared libraries: builds with them skip the cache.
-        dynamic = g.dynamicOptions(arena, imports[0..n], imports[n..], &.{}) catch |err| switch (err) {
+        dynamic = g.dynamicOptions(arena, imports[0..n], imports[n..], shared) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
-            error.NotInGlibc => return inc.noLink("an import glibc does not define", .{}),
+            error.NotInGlibc => return inc.noLink("an import no shared library or glibc defines", .{}),
         };
         dynamic.runpath = inc.runpath;
     }
@@ -686,9 +737,10 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     if (std.mem.eql(u8, mode, "off") or inc.verify == .full) return;
     // A donor's build records in full: its log would be relative to
     // another compilation's manifest. So does a build whose objects or
-    // archives changed (`linkInputsChanged`, `link_objects_pending`).
+    // archives or shared libraries changed (`linkInputsChanged`,
+    // `link_objects_pending`).
     const lazy = !std.mem.eql(u8, mode, "eager") and inc.donor == null and
-        (inc.link_objects.len == 0 or (!inc.link_objects_pending and !try inc.linkInputsChanged(m)));
+        (inc.link_objects.len + inc.link_shared.len == 0 or (!inc.link_objects_pending and !try inc.linkInputsChanged(m)));
     const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -1632,11 +1684,13 @@ pub fn finishLazy(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *cons
         try b.write(io, inc.dir, r.pack.id);
     }
     if (inc.timing) std.debug.print("cache: recorded the edits in {d:.2} ms; linked {d} atoms from the manifest in {d:.2} ms (gathered {d:.2}){s}; {d:.2} ms in all\n", .{
-        ms(t0, t1), linked.atoms, ms(t1, t2), ms(t1, linked.gathered), switch (folded) {
+        ms(t0, t1),      linked.atoms, ms(t1, t2), ms(t1, linked.gathered),
+        switch (folded) {
             .no => "",
             .yes => "; folded the log into a new base",
             .compacted => "; folded the log into a new base and compacted the pack",
-        }, ms(t0, now(io)),
+        },
+        ms(t0, now(io)),
     });
     if (inc.verify == .replay) try inc.verifyReplay();
     return true;
@@ -2918,7 +2972,8 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             try b.addUnstattedInput(path_buf.items, f.key, content_hash);
     }
     // Link-only inputs, by the same rule.
-    for (inc.link_objects) |path| {
+    for (0..inc.link_objects.len + inc.link_shared.len) |n| {
+        const path = inc.linkPath(n);
         const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
         defer gpa.free(bytes);
         key_buf.clearRetainingCapacity();

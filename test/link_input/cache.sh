@@ -138,3 +138,69 @@ if command -v gcc >/dev/null; then
     build "inputs changed, first $work/libc.o" "X=22 twice=44"
     eager "-lc: an object changed"
 fi
+
+# Shared libraries: link-only inputs too, after the objects. A relink
+# parses them again for the dynamic tables; a changed one replays eagerly.
+cp "$src"/shared.c "$src"/shared.map "$src"/shared_main.zig "$src"/shared_user.c .
+so() {
+    "$zig" cc -shared -fPIC shared.c -Wl,--version-script=shared.map -Wl,-soname,libshared.so -o libshared.so
+}
+cat >so_main.zig <<'ZIG'
+const std = @import("std");
+extern fn shared_get() c_int;
+extern fn shared_twice(x: c_int) c_int;
+pub fn main() void {
+    std.debug.print("{d} {d}\n", .{ shared_get(), shared_twice(21) });
+}
+ZIG
+so
+# Without objects: the numbered relink.
+args="build-exe -lc -lshared -L. so_main.zig"
+rm -rf local
+build "no manifest" "42 42"
+build "not relinking" "42 42"
+rm main
+build "no input changed; relinked" "42 42"
+sed -i 's/shared_twice(21)/shared_twice(22)/' so_main.zig
+build "inputs changed, first $work/so_main.zig" "42 44"
+lazy ".so: the Zig code changed"
+sed -i 's/shared_twice(22)/shared_twice(23)/' so_main.zig
+ZAP_CACHE_TIMING=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >cached.log 2>&1 || fail ".so: an edit without verifying"
+lazy ".so: an edit without verifying"
+mv main edited
+ZAP_CACHE_TIMING=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail ".so: a relink from the log"
+grep -qF "no input changed; relinked" log || fail ".so: expected a relink from the log"
+cmp -s main edited || fail ".so: the relink from the log differs from the edit build's output"
+# The same symbols, other code.
+sed -i 's/return 2 \* x/return x + x/' shared.c
+so
+build "inputs changed, first $work/libshared.so" "42 46"
+eager ".so: the library changed"
+# A library that no longer defines a name the Zig code imports.
+sed -i 's/^int shared_twice.*$//; s/global: shared_twice;//' shared.c shared.map
+so
+if ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1; then
+    fail ".so: a dropped symbol linked"
+fi
+grep -qF "shared_twice" log || fail ".so: the error does not name the dropped symbol"
+! grep -qiE "panic|unreachable" log || fail ".so: a dropped symbol crashed zap"
+cp "$src"/shared.c "$src"/shared.map .
+so
+
+# With objects: the keyed relink, whose C object reads the library's data
+# PC-relative (GCC's -fPIE), so the executable copies it.
+if command -v gcc >/dev/null; then
+    gcc -fPIE -c shared_user.c -o shared_user.o
+    args="build-exe -lc -lshared -L. shared_main.zig shared_user.o"
+    rm -rf local
+    build "no manifest" "42 143 42 143"
+    rm main
+    build "no input changed; relinked" "42 143 42 143"
+    sed -i 's/shared_twice(21)/shared_twice(22)/' shared_main.zig
+    build "inputs changed, first $work/shared_main.zig" "42 143 44 143"
+    lazy ".so with objects: the Zig code changed"
+    sed -i 's/return 2 \* x/return x + x/' shared.c
+    so
+    build "inputs changed, first $work/libshared.so" "42 143 44 143"
+    eager ".so with objects: the library changed"
+fi

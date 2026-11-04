@@ -341,6 +341,8 @@ pub const Job = struct {
     compile_args: []const []const u8,
     /// `opts.link_inputs`, absolute (`Incremental.link_objects`).
     link_objects: []const []const u8,
+    /// `opts.shared_libs`, absolute (`Incremental.link_shared`).
+    link_shared: []const []const u8,
     stem: []const u8,
     run_test: bool,
     environ_map: *std.process.Environ.Map,
@@ -414,13 +416,17 @@ pub const Job = struct {
         // spell for the native target. Keys only: `full_args` stay as given.
         if (opts.link_libc) try compile_args.append(arena, try std.fmt.allocPrint(arena, "--zap-glibc={f}", .{opts.glibc_version.?}));
         // The files the object and library arguments name, which `-l`
-        // finds in the `-L` directories: the cache's link-only inputs.
+        // finds in the `-L` directories: the cache's link-only inputs,
+        // objects and archives, then shared libraries.
         const link_objects = try arena.alloc([]const u8, opts.link_inputs.len);
-        if (link_objects.len != 0) {
+        const link_shared = try arena.alloc([]const u8, opts.shared_libs.len);
+        if (link_objects.len + link_shared.len != 0) {
             const cwd = try std.process.currentPathAlloc(init_.io, arena);
-            for (link_objects, opts.link_inputs) |*abs, path| {
-                abs.* = try std.fs.path.resolve(arena, &.{ cwd, path });
-                try compile_args.append(arena, try std.fmt.allocPrint(arena, "--zap-link-input={s}", .{abs.*}));
+            for ([_][]const []const u8{ opts.link_inputs, opts.shared_libs }, [_][][]const u8{ link_objects, link_shared }) |paths, absolute| {
+                for (absolute, paths) |*abs, path| {
+                    abs.* = try std.fs.path.resolve(arena, &.{ cwd, path });
+                    try compile_args.append(arena, try std.fmt.allocPrint(arena, "--zap-link-input={s}", .{abs.*}));
+                }
             }
         }
         return .{
@@ -432,6 +438,7 @@ pub const Job = struct {
             .cache_target = try cacheTarget(arena, &opts, init_.environ_map),
             .compile_args = compile_args.items,
             .link_objects = link_objects,
+            .link_shared = link_shared,
             .stem = opts.name orelse if (is_test) "test" else if (opts.c_only) std.fs.path.stem(opts.c_sources[0].path) else std.fs.path.stem(opts.root_src_path),
             .run_test = is_test and !opts.test_no_exec and !opts.listen,
             .environ_map = init_.environ_map,
@@ -453,9 +460,8 @@ pub const Job = struct {
         // The numbered link has no position-independent layout yet (`Elf`);
         // -fPIE and -dynamic imply -fPIC (and -lc on objects and
         // libraries). A library of C only has no Zig to cache; its
-        // objects have their records. Builds with shared library inputs
-        // skip it until the manifest keeps them.
-        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and job.opts.shared_libs.len == 0 and
+        // objects have their records.
+        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -467,6 +473,7 @@ pub const Job = struct {
         i.donors = !std.mem.eql(u8, env.get("ZAP_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
         i.link_objects = job.link_objects;
+        i.link_shared = job.link_shared;
         if (job.opts.link_libc and !job.opts.pic) {
             i.glibc_version = job.opts.glibc_version;
             i.glibc_lib_dir = job.zig_lib_dir;
@@ -736,6 +743,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         };
     }
     emit.shared_libs = shared_libs;
+    if (inc_opt) |i| i.shared = shared_libs;
     var link_inputs: ElfInput = .{ .arena = arena };
     // An executable links the C objects and the C++ runtime libraries; a
     // static library holds the objects as members.
