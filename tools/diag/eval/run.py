@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Scores zap's compile errors on the mistakes coding agents make.
+
+Upstream's compile-error suite tests what upstream thought of. This eval
+tests what agents write: Zig against an older std (0.11 to 0.16 APIs in
+0.17 code), misspelled names, a missing `try`, and the like. It takes
+the seed programs in seeds/ (correct 0.17 code that zap and upstream
+compile), rewrites each one into mistakes by the rules in rules.py, and
+compiles every mistake with zap and with upstream zig.
+
+A case whose rewrite upstream still accepts is not a mistake and is
+dropped. For each remaining case it checks, for zap and for upstream:
+
+- loc:    the first error is on a line the rewrite changed;
+- facts:  the output (as an agent reads it: text, with source lines and
+          notes) contains what the fix needs, such as the 0.17 name of an
+          API (the rule's `facts`);
+
+and for zap alone:
+
+- cand:   a candidate list names the right identifier (rules with an
+          answer);
+- fix:    zap offers a fix at a changed line; applying zap's fixes round
+          after round either restores the seed ("restored"), or gives a
+          program upstream compiles ("compiles"), or neither ("wrong");
+- accept: zap and upstream agree that the program is wrong. A
+          disagreement is a bug in zap and is listed.
+
+Usage:
+
+    python3 tools/diag/eval/run.py --zap zig-out/bin/zap [--jobs 3] [--out eval.json]
+    python3 tools/diag/eval/run.py --filter arraylist --show   # print each case's outputs
+
+The report lists the score per category and the cases where upstream's
+output alone lacks the facts ("upstream leaves the agent guessing").
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+sys.path.insert(0, HERE)
+import rules  # noqa: E402
+
+SEEDS = os.path.join(HERE, "seeds")
+
+
+def run(cmd, cwd, env=None):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, timeout=300)
+    return p.returncode, p.stdout + p.stderr
+
+
+class Compilers:
+    def __init__(self, zap, zig, cache):
+        self.zap = zap
+        self.zig = zig
+        self.cache = cache
+        self.env = dict(os.environ, ZAP_CACHE="off")
+
+    def zap_json(self, d):
+        _, out = run([self.zap, "build-exe", "-fno-emit-bin", "--error-format=json", "main.zig"], d, self.env)
+        diags = []
+        for line in out.splitlines():
+            if line.startswith("{"):
+                obj = json.loads(line)
+                if "summary" not in obj:
+                    diags.append(obj)
+        return diags
+
+    def zap_text(self, d):
+        return run([self.zap, "build-exe", "-fno-emit-bin", "main.zig"], d, self.env)
+
+    def upstream(self, d):
+        return run([self.zig, "build-exe", "-fno-emit-bin", "--cache-dir", self.cache, "main.zig"], d)
+
+
+def upstream_errors(text):
+    """(line, msg, note lines) of each error in upstream's output, with
+    lines in main.zig only (0 elsewhere)."""
+    out = []
+    for line in text.splitlines():
+        for kind in (": error: ", ": note: "):
+            head, sep, msg = line.partition(kind)
+            if sep:
+                break
+        else:
+            continue
+        path, ln, _ = head.rsplit(":", 2) if head.count(":") >= 2 else (head, "0", "0")
+        ln = int(ln) if path.endswith("main.zig") and ln.isdigit() else 0
+        if kind == ": error: ":
+            out.append((ln, msg, []))
+        elif out:
+            out[-1][2].append(ln)
+    return out
+
+
+def has_facts(text, facts):
+    return all(any(alt in text for alt in group) for group in facts)
+
+
+def apply_fixes(src, fixes):
+    """`src` with `fixes` applied, skipping any that overlaps an earlier one."""
+    taken, edits = [], []
+    for fix in fixes:
+        spans = [e["span"] for e in fix["edits"]]
+        if any(s < te and ts < e or s == e == ts for s, e in spans for ts, te in taken):
+            continue
+        taken += spans
+        edits += fix["edits"]
+    data = src.encode()
+    out, pos = b"", 0
+    for e in sorted(edits, key=lambda e: e["span"][0]):
+        s, t = e["span"]
+        out += data[pos:s] + e["text"].encode()
+        pos = t
+    return (out + data[pos:]).decode()
+
+
+def norm(src):
+    return " ".join(src.split())
+
+
+def score(case, seed_src, cc, show):
+    d = tempfile.mkdtemp(prefix="zap-eval-")
+    try:
+        path = os.path.join(d, "main.zig")
+        with open(path, "w") as f:
+            f.write(case.src)
+        up_code, up_text = cc.upstream(d)
+        if up_code == 0:
+            return {"id": case.id, "dropped": "upstream accepts"}
+        zap_code, zap_text = cc.zap_text(d)
+        r = {"id": case.id, "rule": case.rule.id, "category": case.rule.category, "since": case.rule.since,
+             "seed": case.seed, "lines": case.lines}
+        if zap_code == 0:
+            r["accept"] = "zap accepts"
+            return r
+        diags = cc.zap_json(d)
+        main_diags = [x for x in diags if x.get("file") == "main.zig"]
+        up_errs = upstream_errors(up_text)
+        lines = set(case.lines)
+        # The first error points at a changed line, itself or by a note.
+        r["zap_loc"] = bool(diags) and any(x.get("file") == "main.zig" and x.get("line") in lines for x in [diags[0]] + diags[0].get("notes", []))
+        r["up_loc"] = bool(up_errs) and any(ln in lines for ln in [up_errs[0][0]] + up_errs[0][2])
+        r["zap_facts"] = has_facts(zap_text, case.facts)
+        r["up_facts"] = has_facts(up_text, case.facts)
+        r["zap_first"] = (f"{diags[0].get('file')}:{diags[0].get('line')}: {diags[0]['msg']}" if diags else "")
+        r["up_first"] = (f"main.zig:{up_errs[0][0]}: {up_errs[0][1]}" if up_errs else up_text.strip().split("\n")[0])
+        if case.answer:
+            r["cand"] = any(case.answer in x.get("candidates", []) for x in diags)
+        at = [x for x in main_diags if x.get("line") in lines and x.get("fixes")]
+        if at:
+            src = case.src
+            for _ in range(5):
+                fixes = [f for x in cc.zap_json(d) for f in x.get("fixes", []) if f["applicability"] != "placeholder"]
+                if not fixes:
+                    break
+                src = apply_fixes(src, fixes)
+                with open(path, "w") as f:
+                    f.write(src)
+            if norm(src) == norm(seed_src):
+                r["fix"] = "restored"
+            else:
+                code, text = cc.upstream(d)
+                edited = set(rules.changed_lines(case.src, src))
+                if code == 0:
+                    r["fix"] = "compiles"
+                elif any(ln in edited for ln, _, _ in upstream_errors(text)):
+                    # An error is left or made where a fix edited.
+                    r["fix"] = "wrong"
+                else:
+                    # The fixed errors are gone; others they hid are not.
+                    r["fix"] = "partial"
+                r["fixed_src"] = src
+        if show:
+            r["zap_text"] = zap_text
+            r["up_text"] = up_text
+        return r
+    finally:
+        shutil.rmtree(d)
+
+
+def pct(n, d):
+    return f"{n}/{d} ({100 * n // d if d else 0}%)"
+
+
+def report(results):
+    kept = [r for r in results if "dropped" not in r]
+    dropped = [r for r in results if "dropped" in r]
+    print(f"{len(kept)} cases ({len(dropped)} rewrites dropped: upstream accepts them)\n")
+    cats = sorted({r["category"] for r in kept})
+    hdr = f"{'category':<13}{'cases':>6}  {'loc zap/up':>13}  {'facts zap/up':>13}  {'cand':>7}  {'fix ok/partial/offered':>23}"
+    print(hdr)
+    print("-" * len(hdr))
+    for cat in cats + ["all"]:
+        rs = [r for r in kept if cat == "all" or r["category"] == cat]
+        scored = [r for r in rs if "accept" not in r]
+        n = len(rs)
+        zl = sum(r.get("zap_loc", False) for r in scored)
+        ul = sum(r.get("up_loc", False) for r in scored)
+        zf = sum(r.get("zap_facts", False) for r in scored)
+        uf = sum(r.get("up_facts", False) for r in scored)
+        cand = [r for r in scored if "cand" in r]
+        fixes = [r for r in scored if "fix" in r]
+        good = sum(r["fix"] in ("restored", "compiles") for r in fixes)
+        part = sum(r["fix"] == "partial" for r in fixes)
+        print(f"{cat:<13}{n:>6}  {zl:>5} / {ul:<5}  {zf:>5} / {uf:<5}  {sum(r['cand'] for r in cand):>3}/{len(cand):<3}  {good:>7} / {part:<3} / {len(fixes):<6}")
+    bad = [r for r in kept if "accept" in r]
+    if bad:
+        print("\nzap accepts what upstream rejects:")
+        for r in bad:
+            print(f"  {r['id']}")
+    wrong = [r for r in kept if r.get("fix") == "wrong"]
+    if wrong:
+        print("\nfixes that leave or make an error where they edit:")
+        for r in wrong:
+            print(f"  {r['id']}")
+    print("\nupstream leaves the agent guessing (no facts), and zap:")
+    for r in kept:
+        if "accept" in r or r.get("up_facts"):
+            continue
+        mark = "ok  " if r.get("zap_facts") else "MISS"
+        print(f"  {mark} {r['id']:<40} {r['up_first'][:110]}")
+    print("\nzap misses the facts or the location:")
+    for r in kept:
+        if "accept" in r or (r.get("zap_facts") and r.get("zap_loc")):
+            continue
+        what = ("" if r.get("zap_loc") else "loc ") + ("" if r.get("zap_facts") else "facts")
+        print(f"  {what:<10} {r['id']:<40} {r['zap_first'][:110]}")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--zap", default=os.path.join(REPO, "zig-out/bin/zap"))
+    p.add_argument("--zig", default="zig")
+    p.add_argument("--jobs", type=int, default=3)
+    p.add_argument("--out", help="write every case's result as JSON")
+    p.add_argument("--filter", help="only cases whose id contains this")
+    p.add_argument("--show", action="store_true", help="print each case's source and both outputs")
+    p.add_argument("--list", action="store_true", help="list the cases and exit")
+    args = p.parse_args()
+
+    seeds = {}
+    for f in sorted(os.listdir(SEEDS)):
+        if f.endswith(".zig"):
+            seeds[f[:-4]] = open(os.path.join(SEEDS, f)).read()
+    cases = [c for rule in rules.RULES for name, src in seeds.items() for c in rule.cases(name, src)]
+    if args.filter:
+        cases = [c for c in cases if args.filter in c.id]
+    if args.list:
+        for c in cases:
+            print(c.id, c.lines)
+        return
+
+    cache = tempfile.mkdtemp(prefix="zap-eval-cache-")
+    cc = Compilers(os.path.abspath(args.zap), args.zig, cache)
+    try:
+        # The seeds themselves must compile with both.
+        for name, src in seeds.items():
+            d = tempfile.mkdtemp(prefix="zap-eval-seed-")
+            with open(os.path.join(d, "main.zig"), "w") as f:
+                f.write(src)
+            for who, (code, out) in (("upstream", cc.upstream(d)), ("zap", cc.zap_text(d))):
+                if code != 0:
+                    sys.exit(f"seed {name} does not compile with {who}:\n{out}")
+            shutil.rmtree(d)
+        with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
+            results = list(ex.map(lambda c: score(c, seeds[c.seed], cc, args.show), cases))
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+
+    if args.show:
+        by_id = {c.id: c for c in cases}
+        for r in results:
+            print(f"===== {r['id']} {r.get('dropped', '')}")
+            if "dropped" in r:
+                continue
+            print(by_id[r["id"]].src)
+            print("--- zap\n" + r.get("zap_text", ""))
+            print("--- upstream\n" + r.get("up_text", ""))
+            if "fixed_src" in r:
+                print("--- after zap's fixes\n" + r["fixed_src"])
+    report(results)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(results, f, indent=1)
+
+
+if __name__ == "__main__":
+    main()
