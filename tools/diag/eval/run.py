@@ -20,7 +20,8 @@ and for zap alone:
 
 - cand:   a candidate list names the right identifier (rules with an
           answer);
-- fix:    zap offers a fix at a changed line; applying zap's fixes round
+- fix:    zap offers a fix of an error at a changed line, or one that
+          edits a changed line; applying zap's fixes round
           after round either restores the seed ("restored"), or gives a
           program upstream compiles ("compiles"), or neither ("wrong");
 - accept: zap and upstream agree that the program is wrong. A
@@ -155,7 +156,10 @@ def score(case, seed_src, cc, show):
         r["up_first"] = (f"main.zig:{up_errs[0][0]}: {up_errs[0][1]}" if up_errs else up_text.strip().split("\n")[0])
         if case.answer:
             r["cand"] = any(case.answer in x.get("candidates", []) for x in diags)
-        at = [x for x in main_diags if x.get("line") in lines and x.get("fixes")]
+        # A fix of an error on a changed line, or one that edits a changed
+        # line (a `var` at the declaration for an error at the use).
+        edit_lines = lambda x: {case.src.count("\n", 0, e["span"][0]) + 1 for f in x.get("fixes", []) for e in f["edits"]}
+        at = [x for x in main_diags if x.get("fixes") and (x.get("line") in lines or edit_lines(x) & lines)]
         if at:
             src = case.src
             for _ in range(5):
