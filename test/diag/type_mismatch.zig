@@ -20,15 +20,15 @@ pub fn main() void {
 }
 
 // error
-// type_mismatch.zig:18:10: error[type-mismatch]: expected type 'u32', found 'u64'
-//   | take(big);
-//   note type_mismatch.zig:18:10: unsigned 32-bit int cannot represent all possible unsigned 64-bit values
-//   note type_mismatch.zig:5:12: parameter type declared here: fn take(x: u32) void {
-//   fix? type_mismatch.zig:18:10-18:13: "@intCast(big)"
 // type_mismatch.zig:2:12: error[type-mismatch]: expected type 'u32', found 'usize'
 //   | return n;
 //   note type_mismatch.zig:2:12: unsigned 32-bit int cannot represent all possible unsigned 64-bit values
 //   note type_mismatch.zig:1:18: function return type declared here: fn len(n: usize) u32 {
 //   fix? type_mismatch.zig:2:12-2:13: "@intCast(n)"
 //   ref: main type_mismatch.zig:15:12 (+3 std frames)
+// type_mismatch.zig:18:10: error[type-mismatch]: expected type 'u32', found 'u64'
+//   | take(big);
+//   note type_mismatch.zig:18:10: unsigned 32-bit int cannot represent all possible unsigned 64-bit values
+//   note type_mismatch.zig:5:12: parameter type declared here: fn take(x: u32) void {
+//   fix? type_mismatch.zig:18:10-18:13: "@intCast(big)"
 // 2 errors

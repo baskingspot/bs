@@ -591,7 +591,17 @@ fn diagLoc(zcu: *const Zcu, arena: Allocator, paths: diag.Paths, file_index: u32
 pub fn diagnostics(zcu: *const Zcu, arena: Allocator, paths: diag.Paths) ![]diag.Diagnostic {
     var out: std.ArrayList(diag.Diagnostic) = .empty;
     for (zcu.fe.late_errors.items) |b| try diag.fromBundle(arena, paths, b, &out);
-    for (zcu.errors.items) |e| {
+    // By location, as upstream sorts them, rather than in analysis order,
+    // which can change with the order functions are generated in.
+    const errors = try arena.dupe(ErrorMsg, zcu.errors.items);
+    std.sort.block(ErrorMsg, errors, zcu, struct {
+        fn lessThan(z: *const Zcu, a: ErrorMsg, b: ErrorMsg) bool {
+            if (a.file != b.file) return std.mem.order(u8, z.file(a.file).display_path, z.file(b.file).display_path) == .lt;
+            if (a.span.main != b.span.main) return a.span.main < b.span.main;
+            return std.mem.order(u8, a.msg, b.msg) == .lt;
+        }
+    }.lessThan);
+    for (errors) |e| {
         const notes = try arena.alloc(diag.Note, e.notes.len);
         for (notes, e.notes) |*n, en| n.* = .{ .loc = try zcu.diagLoc(arena, paths, en.file, en.span), .msg = en.msg, .count = en.count, .call = en.call, .decl = en.decl };
         const fixes: []const diag.Fix = if (e.fix) |f|

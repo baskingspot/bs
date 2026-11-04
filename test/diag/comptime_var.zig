@@ -48,13 +48,6 @@ pub fn main() void {
 }
 
 // error
-// comptime_var.zig:20:25: error[comptime-var-escape]: global variable contains reference to comptime var
-//   | const decl: *u32 = blk: {
-//   ref: main comptime_var.zig:47:9 (+3 std frames)
-// comptime_var.zig:37:17: error[comptime-var-escape]: runtime value contains reference to comptime var
-//   | return read(&s.a) + read(&tuple[1]) + known.*;
-//   note comptime_var.zig:37:17: comptime var pointers are not available at runtime
-//   ref: main comptime_var.zig:42:22 (+3 std frames)
 // comptime_var.zig:6:14: error[comptime-var-escape]: runtime value contains reference to comptime var
 //   | global = &x;
 //   note comptime_var.zig:6:14: comptime var pointers are not available at runtime
@@ -67,7 +60,14 @@ pub fn main() void {
 //   | const s = .{ .i = i, .p = &x };
 //   note comptime_var.zig:16:27: comptime var pointers are not available at runtime
 //   ref: main comptime_var.zig:45:10 (+3 std frames)
+// comptime_var.zig:20:25: error[comptime-var-escape]: global variable contains reference to comptime var
+//   | const decl: *u32 = blk: {
+//   ref: main comptime_var.zig:47:9 (+3 std frames)
 // comptime_var.zig:27:19: error[comptime-var-escape]: global variable contains reference to comptime var
 //   | const field_ptr = &tuple[0];
 //   ref: globalFieldPtr comptime_var.zig:33:9 <- main comptime_var.zig:46:19 (+3 std frames)
+// comptime_var.zig:37:17: error[comptime-var-escape]: runtime value contains reference to comptime var
+//   | return read(&s.a) + read(&tuple[1]) + known.*;
+//   note comptime_var.zig:37:17: comptime var pointers are not available at runtime
+//   ref: main comptime_var.zig:42:22 (+3 std frames)
 // 6 errors

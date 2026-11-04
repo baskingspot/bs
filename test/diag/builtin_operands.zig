@@ -28,10 +28,6 @@ pub fn main() void {
 }
 
 // error
-// builtin_operands.zig:19:17: error[type-mismatch]: expected type 'lang.Signedness', found 'comptime_int'
-//   | return @Int(0, 8);
-//   note std/lang.zig:967:24: enum declared here: pub const Signedness = enum(u1) {
-//   call: builtin_operands.zig:27:14 comptime
 // builtin_operands.zig:6:5: error[unknown-length]: unknown copy length
 //   | @memcpy(dest, source);
 //   note builtin_operands.zig:6:13: destination type '[*]u8' provides no length
@@ -45,4 +41,8 @@ pub fn main() void {
 //   | return e;
 //   note builtin_operands.zig:3:11: union declared here: const U = union(E) { a, b };
 //   ref: main builtin_operands.zig:26:16 (+3 std frames)
+// builtin_operands.zig:19:17: error[type-mismatch]: expected type 'lang.Signedness', found 'comptime_int'
+//   | return @Int(0, 8);
+//   note std/lang.zig:967:24: enum declared here: pub const Signedness = enum(u1) {
+//   call: builtin_operands.zig:27:14 comptime
 // 4 errors
