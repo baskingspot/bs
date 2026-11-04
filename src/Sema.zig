@@ -2155,7 +2155,7 @@ fn attachCandidates(sema: *Sema, names: []const []const u8, name: []const u8, fi
     const owned = try arena.alloc([]const u8, close.items.len);
     for (owned, close.items) |*o, n| o.* = try arena.dupe(u8, n);
     last.candidates = owned;
-    // A typo of the only close name, where the error points at the name.
+    // A typo of the closest name, where the error points at the name.
     if (last.hint == null and last.file == sema.file) {
         const source = try zcu.fe.source(@fromBackingInt(sema.file));
         const at = if (last.span.end <= source.len) diag.nameIn(source[last.span.start..last.span.end], name) else null;

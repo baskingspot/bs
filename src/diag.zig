@@ -1072,14 +1072,20 @@ fn rawFix(arena: std.mem.Allocator, applicability: Applicability, edits: []const
     return .{ .applicability = applicability, .edits = try arena.dupe(RawEdit, edits) };
 }
 
-/// Renames the name at `start..end` to the only candidate, when it is one
-/// edit or a change of case away (a typo, not another name).
+/// Renames the name at `start..end` to the closest candidate, when it is
+/// one edit or a change of case away (a typo, not another name) and no
+/// other candidate is (`ordder` → `order`, not `orderZ`).
 pub fn renameFix(arena: std.mem.Allocator, source: []const u8, start: u32, end: u32, candidates: []const []const u8) !?RawFix {
-    if (candidates.len != 1 or end > source.len) return null;
+    if (candidates.len == 0 or end > source.len) return null;
     const name = source[start..end];
-    const c = candidates[0];
-    if (!std.ascii.eqlIgnoreCase(name, c) and editDistance(name, c, 1) == null) return null;
-    return try rawFix(arena, .maybe, &.{.{ .start = start, .end = end, .text = c }});
+    const oneEdit = struct {
+        fn f(a: []const u8, b: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(a, b) or editDistance(a, b, 1) != null;
+        }
+    }.f;
+    if (!oneEdit(name, candidates[0])) return null;
+    if (candidates.len > 1 and oneEdit(name, candidates[1])) return null;
+    return try rawFix(arena, .maybe, &.{.{ .start = start, .end = end, .text = candidates[0] }});
 }
 
 /// Wraps the expression at `start..end` as `<before><expression><after>`
