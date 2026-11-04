@@ -3394,11 +3394,11 @@ value model:
   not by exported symbol (`__cmptf2` serves `__lttf2`, `fmodq` is exported
   as `fmodf128`).
 - Externs and the link resolve names compiler_rt exports to its functions
-  (`Zcu.compilerRtExport`): every function upstream's compiler_rt exports
-  for x86_64-linux, from src/compiler_rt_exports.zig, which
-  tools/compiler_rt_exports.py generates by compiling upstream's
-  compiler_rt in Debug and pairing each exported name with the function
-  symbol at its address. That covers what C objects call (soft float such
+  and variables (`Zcu.compilerRtExport`): every one upstream's
+  compiler_rt exports for x86_64-linux, from src/compiler_rt_exports.zig,
+  which tools/compiler_rt_exports.py generates by compiling upstream's
+  compiler_rt in Debug and pairing each exported name with the
+  declaration's symbol at its section and address. That covers what C objects call (soft float such
   as `__eqtf2` and `__extendhfsf2`, 128-bit division, `__atomic_*`), the
   libm functions, and, as upstream defines them in every binary,
   `memcpy`, `memmove`, `memset`, `memcmp`, `bcmp` and `strlen` (the Debug
@@ -3407,6 +3407,13 @@ value model:
   (`compiler_rt::memcmp`, as `Zcu.fileKey` names a module root). The
   stack protector's functions are left out: builds with C objects root
   compiler_rt/ssp.zig, so they are the compilation's own exports.
+  Function multiversioning's CPU model (fmv.zig, which
+  `__builtin_cpu_init` and `__builtin_cpu_supports` use) is declared in
+  a nested struct, which its key names
+  (`compiler_rt:compiler_rt/fmv.zig:x86.__cpu_model`) and
+  `resolveCompilerRt` walks; its variables `__cpu_model` and
+  `__cpu_features2` are lowered as declarations' data (`Emit.finish`)
+  and reached from their requesters as a function is.
   aarch64-macos exports the same set but for three x86 names
   (`__gnu_h2f_ieee`, `__gnu_f2h_ieee`, `__zig_probe_stack`), which its
   objects do not call.
@@ -7360,9 +7367,3 @@ the choice instead of failing:
   a real cycle the result depends on analysis order. It aborts 0 times
   on the zig workload, std and libvaxis. Taking genericity out of the
   `func_type` key fixes it, a prerequisite of stage A (step 2, item 0).
-- *Function multiversioning stubs.* Zig 0.17.1's compiler_rt adds
-  `fmv.zig`, whose x86_64 part exports `__cpu_indicator_init` from a
-  nested struct and the data `__cpu_model` and `__cpu_features2`.
-  zap's compiler_rt table (`src/compiler_rt_exports.zig`) names only
-  top-level functions, so C code that calls `__builtin_cpu_supports` or
-  uses `target_clones` fails to link where upstream links it.

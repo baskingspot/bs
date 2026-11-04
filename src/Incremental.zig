@@ -2654,7 +2654,7 @@ const ReachItem = struct {
 };
 
 /// `from` requested compiler_rt helper `key`: it reaches the helper's
-/// function and its file's roots.
+/// function or variable and its file's roots.
 fn addRtReach(r: *Recorder, items: *std.ArrayList(ReachItem), from: @FieldType(ReachItem, "from"), key: []const u8) !void {
     const zcu = r.zcu;
     const ip = &zcu.ip;
@@ -2663,7 +2663,13 @@ fn addRtReach(r: *Recorder, items: *std.ArrayList(ReachItem), from: @FieldType(R
     const nav = ip.getNav(nav_index);
     const root = zcu.file_root_types.items[nav.file];
     if (root != .none) try items.append(r.gpa, .{ .from = from, .kind = .effects, .to = try r.addDependee(.{ .namespace = ip.structInfo(root).namespace }) });
-    if (nav.status == .resolved and ip.keyTag(nav.val) == .func) try items.append(r.gpa, .{ .from = from, .kind = .func, .to = .{ .unit = try r.addUnit(.{ .func = nav.val }) } });
+    if (nav.status != .resolved) return;
+    if (ip.keyTag(nav.val) == .func) {
+        try items.append(r.gpa, .{ .from = from, .kind = .func, .to = .{ .unit = try r.addUnit(.{ .func = nav.val }) } });
+    } else {
+        // A variable's data (`Emit.finish`).
+        try items.append(r.gpa, .{ .from = from, .kind = .nav, .to = .{ .unit = try r.addUnit(.{ .nav_val = nav_index }) } });
+    }
 }
 
 /// The graph of a build's units, dependees, and atoms that `record`

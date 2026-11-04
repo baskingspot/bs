@@ -1252,7 +1252,8 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&cexe_run.step);
     }
     // compiler_rt for C: f128 and f16 conversions, comparisons and
-    // arithmetic, 128-bit division and lock-based atomics, which zap
+    // arithmetic, 128-bit division, lock-based atomics and the CPU model
+    // of function multiversioning (data as well as functions), which zap
     // generates from upstream's compiler_rt (baseline, so that f16 needs
     // it too). Two more objects reference a name nothing defines: one
     // error names both.
@@ -1268,7 +1269,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         rt_exe.setEnvironmentVariable("ZAP_CACHE", "off");
         const rt_run = std.Build.Step.Run.create(b, "run zap link of a C object calling compiler_rt");
         rt_run.addFileArg(rt_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
-        rt_run.addCheck(.{ .expect_stderr_exact = "2.25 1 0 -6 0.375 1024 25 2.5\n" });
+        rt_run.addCheck(.{ .expect_stderr_exact = "2.25 1 0 -6 0.375 1024 25 2.5 56\n" });
         rt_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&rt_run.step);
         const undef = b.addRunArtifact(zap);

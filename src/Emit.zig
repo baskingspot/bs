@@ -1143,6 +1143,13 @@ pub fn finish(emit: *Emit) !bool {
     const ip = &zcu.ip;
     try emit.mergeJobs();
     emit.analyzing = false;
+    // The compiler_rt variables the link resolved names to (fmv.zig's
+    // `__cpu_model`), as their functions are queued (`resolveCompilerRt`).
+    for (zcu.rt_helpers.values()) |nav_index| {
+        if (nav_index == .none) continue;
+        const nav = ip.getNav(nav_index);
+        if (nav.status == .resolved and ip.keyTag(nav.val) != .func) try emit.navs.put(emit.gpa, nav_index, {});
+    }
     // The threads go back to the Io for the cache's recording and the
     // link, which run concurrently.
     if (emit.pool) |pool| stopWorkers(pool);

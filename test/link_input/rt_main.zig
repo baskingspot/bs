@@ -11,9 +11,10 @@ extern fn rt_half_up(h: f16) f32;
 extern fn rt_half_down(f: f32) f16;
 extern fn rt_div(a: u128, b: u128) c_ulonglong;
 extern fn rt_atomic(x: c_long) c_long;
+extern fn rt_cpu() c_int;
 pub fn main() void {
     const q = rt_widen(1.5);
-    std.debug.print("{d} {d} {d} {d} {d} {d} {d} {d}\n", .{
+    std.debug.print("{d} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
         rt_narrow(rt_mul(q, q)),
         rt_eq(q, rt_widen(1.5)),
         rt_lt(q, rt_widen(1.25)),
@@ -22,5 +23,6 @@ pub fn main() void {
         rt_div(@as(u128, 1) << 100, @as(u128, 1) << 90),
         rt_atomic(5),
         @as(f32, rt_half_down(2.5)),
+        rt_cpu(),
     });
 }

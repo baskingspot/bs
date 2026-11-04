@@ -1611,7 +1611,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "extern symbol cannot have type '{f}'", .@"bad-export" },
     .{ "export target must be a global variable or a comptime-known constant", .@"bad-export" },
     .{ "compiler_rt file '{s}' not found", .@"bad-import" },
-    .{ "compiler_rt has no function '{s}'", .@"bad-import" },
+    .{ "compiler_rt has no declaration '{s}'", .@"bad-import" },
     .{ "embed of file outside package path: '{s}'", .@"bad-import" },
     .{ "file path name cannot be empty", .@"bad-import" },
     .{ "import of file outside module path: '{s}'", .@"bad-import" },

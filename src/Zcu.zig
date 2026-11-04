@@ -136,9 +136,10 @@ branch_quotas: std.AutoHashMapUnmanaged(InternPool.Index, u32) = .empty,
 exports: std.ArrayList(Export) = .empty,
 /// Files read by `@embedFile`, each once; `Dependee.embed_file` indexes it.
 embed_files: std.StringArrayHashMapUnmanaged(EmbedFile) = .empty,
-/// compiler_rt functions that CodeGen calls, by the stable key of their
+/// compiler_rt functions that CodeGen calls and the functions and
+/// variables the link resolves names to, by the stable key of their
 /// declaration; `analyzeAll` resolves each to its declaration (`.none`
-/// until then) and queues its body.
+/// until then) and queues a function's body.
 rt_helpers: std.StringArrayHashMapUnmanaged(InternPool.NavIndex) = .empty,
 /// `zap test`: collect the main module's tests into `builtin.test_functions`.
 is_test: bool = false,
@@ -1439,9 +1440,9 @@ pub fn requestCompilerRtKey(zcu: *Zcu, key: []const u8) ![]const u8 {
 
 pub const RtExport = struct { file: []const u8, decl: []const u8 };
 
-/// The compiler_rt function exporting `name` (`__eqtf2`, `__udivti3`,
-/// `sinf`, `sqrtf128`, `memcpy`, ...), or null if compiler_rt does not
-/// export `name`. For `@extern` references and C objects, which upstream
+/// The compiler_rt function or variable exporting `name` (`__eqtf2`,
+/// `__udivti3`, `sinf`, `sqrtf128`, `memcpy`, `__cpu_model`, ...), or null
+/// if compiler_rt does not export `name`. For `@extern` references and C objects, which upstream
 /// resolves against the compiler_rt it links. The table is upstream's
 /// export list (src/compiler_rt_exports.zig); the memory functions are the
 /// ones upstream exports in Debug builds (not `.small`).
@@ -1486,16 +1487,29 @@ fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
         else => return zcu.addError(0, no_span, "unable to load compiler_rt file '{s}': {t}", .{ sub_path, err }),
     } orelse return zcu.addError(0, no_span, "compiler_rt file '{s}' not found", .{sub_path});
     try zcu.file_root_types.appendNTimes(zcu.gpa, .none, zcu.fe.files.items.len - zcu.file_root_types.items.len);
-    const ty = try zcu.fileRootType(@backingInt(file_index));
-    const ns = zcu.ip.structInfo(ty).namespace;
-    const nav = zcu.namespaces.items[ns].decls.get(try zcu.ip.getString(tid, name)) orelse
-        return zcu.addError(@backingInt(file_index), no_span, "compiler_rt has no function '{s}'", .{name});
+    var ty = try zcu.fileRootType(@backingInt(file_index));
+    // A dotted name is in a nested container (fmv.zig's `x86`).
+    var parts = std.mem.splitScalar(u8, name, '.');
+    const nav = while (true) {
+        const part = parts.next().?;
+        const nav = zcu.namespaces.items[zcu.ip.structInfo(ty).namespace].decls.get(try zcu.ip.getString(tid, part)) orelse
+            return zcu.addError(@backingInt(file_index), no_span, "compiler_rt has no declaration '{s}'", .{name});
+        if (parts.peek() == null) break nav;
+        zcu.ensureNavVal(nav) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        ty = zcu.ip.getNav(nav).val;
+    };
     zcu.rt_helpers.getPtr(key).?.* = nav;
     zcu.ensureNavVal(nav) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return,
     };
-    _ = try zcu.queueFunc(zcu.ip.getNav(nav).val);
+    // A variable's data is lowered with the other declarations'
+    // (`Emit.finish`).
+    const val = zcu.ip.getNav(nav).val;
+    if (zcu.ip.keyTag(val) == .func) _ = try zcu.queueFunc(val);
 }
 
 /// Hands a function's IR to the sink: a sink with `functionOwned` keeps it
