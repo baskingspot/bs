@@ -1753,12 +1753,35 @@ are `-ffuzz` coverage points, are only learned from.
   overflow, or for `a - b` when `b <= a` holds (`i + 1` after `i < len`,
   `n - 1` after `n >= 2`); the operation's value read then becomes the
   wrapping operation, so the overflow bit is not computed.
+- **Offsets.** An unsigned value that is a chain of constant additions
+  is `x + c`. From `x + c < y` (or `<=`), when no addition in `x + c`
+  can have wrapped (each an overflow operation whose check passed, or
+  one made wrapping by a proof, never `+%`), follow `x + d < y` for `d
+  <= c` (`<=` when `d == c` and the fact is `<=`), so `x <= y`, `x + d`
+  cannot overflow, and a `+%` chain bounded so computes `x + d`; and `x +
+  c <= x + d` for `c <= d` when both sums are exact. So `s[i..][0..16]`
+  after `i + 32 < s.len` keeps none of its three checks, nor does the
+  next block's at `i + 16`, derived from the exact `i += 16` that made
+  the new `i`, not from a later load.
+- **Loops.** A fact from before a loop on a variable the loop loads,
+  `v + c < y`, is a candidate at the loop's start, where loads of `v`
+  before any store name the variable at the loop's entry. The body is
+  walked assuming the candidates; at every `repeat` each must hold for
+  what `v` holds there (from the exit test before it, such as
+  findScalarPos's `if (i + 32 >= s.len) break`), which by induction makes
+  them hold at every iteration's start. If one does not, every decision
+  of that walk is undone and the body walked again without them, so a
+  loop is walked at most twice, and loops nested in a walk with
+  candidates take none.
 - **Turning it off.** `ZAP_PROVE=off` keeps every check (its own cache
   target, `+noprove`). A program whose output or panic differs between
   on and off has found a bug in a proof, with no oracle needed. The
   soundness argument for each rule is next to it in `prove.zig`; the run
   tests `prove_wrap`, `prove_load`, `prove_width`, and `prove_exit`
-  each hold a program whose check a rule once removed unproven.
+  each hold a program whose check a rule once removed unproven, and
+  `prove_offset_wrap`, `prove_offset_store`, `prove_offset_loop`, and
+  `prove_offset_retry` one that a wrong offset or loop rule would
+  remove.
 
 #### Compile-time budget and how it is measured
 
