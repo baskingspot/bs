@@ -1467,8 +1467,11 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
     return ok;
 }
 
+/// A file's key in the stat index, salted like `hashSource`: a zap built
+/// with another Zig release (another AstGen) keeps its own entries rather
+/// than taking this one's content hash for a file it hashes differently.
 fn pathHash(mod: *const Module, sub_path: []const u8) u64 {
-    var h: std.hash.Wyhash = .init(0);
+    var h: std.hash.Wyhash = .init(comptime std.hash.Wyhash.hash(0, "zap zir " ++ builtin.zig_version_string));
     h.update(mod.abs_root_dir.?);
     h.update("/");
     h.update(sub_path);
