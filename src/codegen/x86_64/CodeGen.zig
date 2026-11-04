@@ -90,6 +90,8 @@ live: bool = false,
 ret_label: ?Encoder.Label = null,
 /// `ret_label` is bound: the epilogue is emitted.
 ret_bound: bool = false,
+/// Where the epilogue's `ret` ends, before shortening.
+ret_end: u32 = 0,
 /// Emitting the cold blocks, after the others: their values get slots of
 /// their own (see `Ssa.place`).
 in_cold: bool = false,
@@ -271,9 +273,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         in.high = cg.e.mapOffset(in.high);
     }
 
-    // Whether the epilogue's `ret` ends the code; out-of-line stack probes
-    // follow it otherwise.
-    var epilogue_last = cg.ret_bound;
+    // The stack probes after the code, if any (`Atom.Unwind.probes`).
+    var probes: u32 = 0;
     if (!naked) {
         // The saved registers are pushed already.
         const frame = std.mem.alignForward(u32, cg.slots_size + cg.out_args_size, 16) - saved_size;
@@ -285,13 +286,13 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
             // a jump to the probes at the end, which jump back. The CFA is
             // rbp-based by then, so the frame info holds throughout.
             const stub: u32 = @intCast(cg.e.code.items.len);
-            epilogue_last = false;
             const sub_at: u32 = @intCast(frame_patch - 7);
             try cg.e.line(0, 0);
             try cg.e.probedFrameAlloc(frame, @intCast(frame_patch));
             cg.e.code.items[sub_at] = 0xe9;
             std.mem.writeInt(i32, cg.e.code.items[sub_at + 1 ..][0..4], @intCast(@as(i64, stub) - @as(i64, sub_at + 5)), .little);
             @memcpy(cg.e.code.items[sub_at + 5 ..][0..2], &[_]u8{ 0x66, 0x90 });
+            probes = @intCast(cg.e.code.items.len - stub);
         }
     }
 
@@ -332,7 +333,13 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
         // `cg.saved` has `Atom.Unwind.saved`'s x86_64 bits: the prologue
         // pushes `alloc_regs`' callee-saved ones in that order.
-        .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else .{ .kind = .frame_pointer, .epilogue = @intFromBool(epilogue_last), .saved = @intCast(cg.saved) },
+        .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else .{
+            .kind = .frame_pointer,
+            // The `ret`'s distance from the end, past the stubs and probes.
+            .epilogue = if (cg.ret_bound) @intCast(cg.e.code.items.len - cg.e.mapOffset(cg.ret_end - 1)) else 0,
+            .probes = @intCast(probes),
+            .saved = @intCast(cg.saved),
+        },
     }, debug);
     if (cover) try emit.addCoverage(try emit.funcKey(ir.func), cg.cover_pcs.items);
 }
@@ -1796,6 +1803,7 @@ fn epilogue(cg: *CodeGen) Error!void {
     }
     try cg.e.pop(.rbp);
     try cg.e.ret();
+    cg.ret_end = @intCast(cg.e.code.items.len);
 }
 
 // ---------------------------------------------------------------------------
