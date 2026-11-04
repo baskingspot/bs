@@ -3362,7 +3362,9 @@ thread's abilists imports. No bytes come from it.
   2026-11-04, when bs listed every one): a library is alive when a
   strong reference resolves to it, from the compilation's imports and
   copies or from a live library's undefined symbols (`ElfShared.undefs`),
-  transitively. Weak references from C keep no library alive, and a weak
+  transitively. Glibc's libraries are needed the same way: a live
+  library's strong `__tls_get_addr` needs ld-linux-x86-64.so.2 (fixed
+  2026-11-04, from fmt's shared build). Weak references from C keep no library alive, and a weak
   import of a library that is not alive is unversioned; a Zig `@extern`
   with weak linkage is imported strong in an executable, as upstream's
   linker binds it, and keeps its library. A library's reference to a

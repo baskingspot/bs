@@ -201,7 +201,8 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
     // keeps them (`Object.markLive`, `SharedObject.markLive`): one that a
     // strong reference resolves to, from the compilation (`imports`, the
     // copies) or from a live library. A weak reference keeps none alive,
-    // nor one to a name the compilation defines. Then glibc's.
+    // nor one to a name the compilation defines. Then glibc's, those the
+    // compilation or a live library imports from.
     var own: std.StringHashMapUnmanaged(void) = .empty;
     if (shared.len != 0) for (defined) |x| try own.put(arena, x.name, {});
     const alive = try arena.alloc(bool, shared.len);
@@ -214,9 +215,16 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
         alive[s.lib] = true;
         try work.append(arena, s.lib);
     };
+    var used: [libs.len]bool = @splat(false);
+    used[lib_c] = true;
     while (work.pop()) |lib| for (shared[lib].undefs) |u| {
         if (u.weak or own.contains(u.name)) continue;
-        const s = sharedSymbol(shared, u.name) orelse continue;
+        const s = sharedSymbol(shared, u.name) orelse {
+            // Glibc's libraries are alive the same way: a live library's
+            // `__tls_get_addr` needs ld-linux-x86-64.so.2.
+            if (g.get(u.name)) |sym| used[sym.lib] = true;
+            continue;
+        };
         if (alive[s.lib]) continue;
         alive[s.lib] = true;
         try work.append(arena, s.lib);
@@ -227,8 +235,6 @@ fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copie
         index.* = @intCast(needed.items.len);
         try needed.append(arena, lib.soname);
     };
-    var used: [libs.len]bool = @splat(false);
-    used[lib_c] = true;
     for ([_][]const ElfObject.Import{ imports, copies }) |list| for (list) |imp| {
         if (sharedSymbol(shared, imp.name) == null) used[
             (g.get(imp.name) orelse if (executable) return error.NotInGlibc else continue).lib
@@ -384,4 +390,18 @@ test load {
     try std.testing.expect(g99.newest().order(.{ .major = 2, .minor = 99, .patch = 0 }) == .lt);
     try expect(&g99, fba.allocator(), "__libc_start_main", "libc.so.6", "GLIBC_2.34");
     try std.testing.expectError(error.UnsupportedVersion, load(gpa, contents, .{ .major = 2, .minor = 0, .patch = 5 }));
+
+    // A live library's strong imports keep glibc's libraries needed too,
+    // as upstream's: its `__tls_get_addr` needs ld-linux-x86-64.so.2, a
+    // weak `sin` keeps libm out, and nothing references libb.so.
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lib_a: ElfShared = .{ .path = "liba.so", .soname = "liba.so", .undefs = &.{ .{ .name = "__tls_get_addr", .weak = false }, .{ .name = "sin", .weak = true } } };
+    try lib_a.symbols.put(arena, "a", .{ .version = null, .object = false, .size = 0, .value = 0 });
+    const lib_b: ElfShared = .{ .path = "libb.so", .soname = "libb.so", .undefs = &.{.{ .name = "cos", .weak = false }} };
+    var imports = [_]ElfObject.Import{.{ .key = .fromName("a"), .name = "a" }};
+    const opts = try g236.dynamicOptions(arena, &imports, &.{}, &.{}, &.{ lib_a, lib_b });
+    try std.testing.expectEqual(3, opts.needed.len);
+    for (opts.needed, [_][]const u8{ "liba.so", "libc.so.6", "ld-linux-x86-64.so.2" }) |got, want| try std.testing.expectEqualStrings(want, got);
 }
