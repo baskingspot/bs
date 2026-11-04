@@ -11157,10 +11157,11 @@ fn writeMemBytes(sema: *Sema, v: Index, buf: []u8, undef: []bool) CompileError!b
 }
 
 /// The value of type `ty` whose memory is `buf`, or null if `ty` has no
-/// byte representation at comptime. A scalar with an undefined byte is
-/// undefined.
-fn readMemBytes(sema: *Sema, ty: Index, buf: []const u8, undef: []const bool) CompileError!?Index {
+/// byte representation at comptime. A scalar whose bytes are all undefined
+/// is undefined.
+fn readMemBytes(sema: *Sema, ty: Index, buf_in: []const u8, undef: []const bool) CompileError!?Index {
     const ip = sema.ip;
+    var buf = buf_in;
     if (sema.memChildCount(ty)) |n| {
         const elems = try sema.arena.alloc(Index, n);
         for (elems, 0..) |*e, i| {
@@ -11192,7 +11193,17 @@ fn readMemBytes(sema: *Sema, ty: Index, buf: []const u8, undef: []const bool) Co
         const b = best orelse return try sema.undefValue(ty);
         return try sema.intern(.{ .un = .{ .ty = ty, .tag = try sema.unionFieldTagValue(ty, b.i), .val = b.val } });
     }
-    if (std.mem.indexOfScalar(bool, undef[0..used], true) != null) return try sema.undefValue(ty);
+    if (std.mem.indexOfScalar(bool, undef[0..used], true) != null) {
+        // Like upstream, undefined memory reads as 0xaa bytes once part of
+        // the scalar is written, so a value written a byte at a time
+        // through a `*[N]u8` view becomes defined.
+        if (std.mem.indexOfScalar(bool, undef[0..used], false) == null) return try sema.undefValue(ty);
+        const filled = try sema.arena.dupe(u8, buf);
+        for (filled[0..used], undef[0..used]) |*b, u| {
+            if (u) b.* = 0xaa;
+        }
+        buf = filled;
+    }
     switch (class) {
         .bool => return boolValue(buf[0] & 1 != 0),
         .int => return try sema.intFromMemBytes(ty, buf),

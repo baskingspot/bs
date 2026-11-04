@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n42\n39\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n42\n39\n5\n1\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -202,6 +202,22 @@ noinline fn liveAcrossClobber(x: u64) u64 {
     return a +% b;
 }
 
+// tokamak (meta.zig): a comptime variable written a byte at a time
+// through a `*[N]u8` view is defined once written; bytes never written
+// read as 0xaa, as upstream.
+fn transmuteBytes(comptime T: type, val: anytype) T {
+    var tmp: T = undefined;
+    const src: *const [@sizeOf(T)]u8 = @ptrCast(&val);
+    @memcpy(@as(*[@sizeOf(T)]u8, @ptrCast(&tmp)), src);
+    return tmp;
+}
+fn partlyWritten() u64 {
+    var t: u64 = undefined;
+    const p: *[8]u8 = @ptrCast(&t);
+    p[0] = 5;
+    return t;
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -266,5 +282,7 @@ fn main() callconv(.c) noreturn {
     var seven: u64 = 7;
     _ = &seven;
     rt.printInt(liveAcrossClobber(seven));
+    rt.printInt(comptime transmuteBytes(u64, [2]u32{ 5, 0 }));
+    rt.printInt(@intFromBool(comptime partlyWritten() == 0xaaaaaaaaaaaaaa05));
     rt.exit(0);
 }
