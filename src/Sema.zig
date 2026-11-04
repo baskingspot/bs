@@ -1807,6 +1807,9 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
         possible_tags += 1;
         if (Type.isComptimeOnly(ip, ft)) comptime_state = true;
     }
+    // As upstream: an extern union's fields are extern types, so it has
+    // no possible value only if it has no fields.
+    if (info.layout == .@"extern" and possible_tags == 0) return sema.fail(&block, cont_src, "extern union has no fields", .{});
     info.has_runtime_tag = info.tag_type != .none and possible_tags > 1 and !comptime_state and Type.hasRuntimeBits(ip, info.tag_type);
     var size = payload_size;
     var alignment = payload_align;
@@ -2037,6 +2040,17 @@ fn addDeclaredHereNote(sema: *Sema, ty: Index) CompileError!void {
     // A file's root struct has no declaration line to show.
     if (decl.node == .root) return sema.zcu.addNote(decl.file, tree.nodeToSpan(decl.node), "{s} declared here", .{category});
     try sema.zcu.addDeclNote(decl.file, tree.nodeToSpan(decl.node), "{s} declared here", .{category});
+}
+
+/// Fails `builtin` at `src` on packed type `ty`, whose backing integer
+/// is inferred, as upstream: it could change with the fields.
+fn failAmbiguousBackingInt(sema: *Sema, block: *Block, src: Src, ty: Index, builtin: []const u8) CompileError {
+    const err = sema.fail(block, src, "{s} is ambiguous for type '{f}'", .{ builtin, FmtType{ .ip = sema.ip, .ty = ty, .decl_note = false } });
+    const decl = sema.containerDecl(ty) orelse return err;
+    const span = (try sema.zcu.fe.tree(@fromBackingInt(decl.file))).nodeToSpan(decl.node);
+    try sema.zcu.addNote(decl.file, span, "backing integer type of {s} is inferred", .{if (Type.class(sema.ip, ty) == .@"struct") "struct" else "union"});
+    try sema.zcu.addNote(decl.file, span, "consider explicitly specifying the backing integer type", .{});
+    return err;
 }
 
 /// Where struct, union, enum or opaque type `ty` is declared.
@@ -4684,6 +4698,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             if (tag == .backing_int and Type.isPacked(sema.ip, ty)) {
                 // A packed struct's or union's backing integer: its bits.
                 try sema.resolveLayout(block, src, ty);
+                if (!sema.explicitIntTag(ty)) return sema.failAmbiguousBackingInt(block, sema.callArgSrc(src, false, 0), ty, "@backingInt");
                 break :blk sema.reinterpretBits(block, src, sema.ip.structInfo(ty).tag_type, operand);
             }
             if (tag == .backing_int) {
@@ -4729,8 +4744,14 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 else => break,
             };
             if (ty == .generic_poison_type) break :blk .fromInterned(ty);
-            if (Type.class(sema.ip, ty) != .@"enum" and !Type.isPacked(sema.ip, ty)) return sema.fail(block, src, "expected enum or packed type, found '{f}'", .{sema.fmtType(ty)});
+            switch (Type.class(sema.ip, ty)) {
+                .@"enum" => {},
+                .@"struct" => if (!Type.isPacked(sema.ip, ty)) return sema.fail(block, src, "non-packed struct '{f}' does not have a backing integer", .{sema.fmtType(ty)}),
+                .@"union" => if (!Type.isPacked(sema.ip, ty)) return sema.fail(block, src, "non-packed union '{f}' does not have a backing integer", .{sema.fmtType(ty)}),
+                else => return sema.fail(block, src, "expected enum, packed union or packed struct, found '{f}'", .{sema.fmtType(ty)}),
+            }
             try sema.resolveLayout(block, src, ty);
+            if (Type.class(sema.ip, ty) != .@"enum" and !sema.explicitIntTag(ty)) return sema.failAmbiguousBackingInt(block, src, ty, "@fromBackingInt");
             break :blk .fromInterned(sema.ip.structInfo(ty).tag_type);
         },
         .enum_from_int, .from_backing_int => blk: {
@@ -4843,6 +4864,8 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             try sema.resolveLayout(block, src, ty);
             if (tag == .size_of and Type.hasNoPossibleValue(sema.ip, ty))
                 return sema.fail(block, sema.callArgSrc(src, false, 0), "no size available for uninstantiable type '{f}'", .{sema.fmtType(ty)});
+            if (tag == .size_of and try sema.isComptimeOnlyResolved(block, src, ty))
+                return sema.fail(block, sema.callArgSrc(src, false, 0), "no size available for comptime-only type '{f}'", .{sema.fmtType(ty)});
             const size = if (Type.hasRuntimeBits(sema.ip, ty)) Type.abiSize(sema.ip, ty) else 0;
             const bits = if (tag == .size_of) size else bitSize(sema.ip, ty);
             break :blk .fromInterned(try sema.intValue(.comptime_int_type, bits));
@@ -5299,6 +5322,10 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         },
         .builtin_src => sema.zirBuiltinSrc(block, ext),
         .compile_log => sema.zirCompileLog(block, ext),
+        // As upstream on targets other than WebAssembly (zap's Sema only
+        // analyzes for x86_64 so far).
+        .wasm_memory_size => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.UnNode, ext.operand).data.node), "builtin @wasmMemorySize is available when targeting WebAssembly; targeted CPU architecture is {s}", .{"x86_64"}),
+        .wasm_memory_grow => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.BinNode, ext.operand).data.node), "builtin @wasmMemoryGrow is available when targeting WebAssembly; targeted CPU architecture is {s}", .{"x86_64"}),
         else => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
     };
 }
