@@ -1369,7 +1369,7 @@ fn analyzeTypeLayout(zcu: *Zcu, ty: Index, field_types_only: bool) CompileError!
     const is_comptime = info.field_is_comptime;
 
     const explicit_backing: Index = if (decl.backing_int_type_body) |body|
-        try sema.analyzeAsType(&block, block.nodeSrc(.zero), try sema.resolveInlineBody(&block, body, key.zir_inst))
+        try sema.analyzeArgBody(&block, decl.arg_baseline_src_node, body, key.zir_inst)
     else
         .none;
     try sema.structLayout(&block, cont_src, info, decl.layout, explicit_backing, offsets, aligns);
@@ -1632,6 +1632,16 @@ fn setComptimeOnly(sema: *Sema, info: *InternPool.ContainerInfo) void {
     info.comptime_only = if (yes) .yes else .no;
 }
 
+/// A container's backing or tag type (`enum(T)`, `union(enum(T))`,
+/// `packed struct(T)`), whose body's source nodes are relative to the
+/// argument itself (`arg_baseline_src_node`, as AstGen 0.17.1 emits them).
+fn analyzeArgBody(sema: *Sema, block: *Block, baseline: Ast.Node.Index, body: []const Zir.Inst.Index, zir_inst: Zir.Inst.Index) CompileError!Index {
+    const outer = block.src_base;
+    block.src_base = baseline;
+    defer block.src_base = outer;
+    return sema.analyzeAsType(block, block.nodeSrc(.zero), try sema.resolveInlineBody(block, body, zir_inst));
+}
+
 fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPool.ContainerInfo) CompileError!void {
     const ip = sema.ip;
     const decl = sema.code.getEnumDecl(key.zir_inst);
@@ -1640,7 +1650,7 @@ fn analyzeEnumLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternPo
     const src = block.nodeSrc(.zero);
     info.status = .field_types_wip;
     const tag_ty: Index = if (decl.tag_type_body) |body| blk: {
-        const t = try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
+        const t = try sema.analyzeArgBody(&block, decl.arg_baseline_src_node, body, key.zir_inst);
         // As upstream, an exhaustive enum without fields is backed by
         // `noreturn`, and only such an enum.
         const empty_exhaustive = decl.field_names.len == 0 and !decl.nonexhaustive;
@@ -1700,7 +1710,10 @@ fn enumTagValues(sema: *Sema, block: *Block, cont_src: Src, zir_inst: Zir.Inst.I
         values[i] = if (field.value_body) |body| blk: {
             try sema.inst_map.put(sema.gpa, zir_inst, .fromInterned(tag_ty));
             const ref = try sema.coerce(block, tag_ty, try sema.resolveInlineBody(block, body, zir_inst), val_src);
-            break :blk try sema.resolveConstValue(block, val_src, ref, "enum tag value must be comptime-known");
+            const val = try sema.resolveConstValue(block, val_src, ref, "enum tag value must be comptime-known");
+            // As upstream 0.17.1 (`resolveConstDefinedValue`).
+            if (sema.isUndef(val)) return sema.fail(block, val_src, "use of undefined value here causes illegal behavior", .{});
+            break :blk val;
         } else blk: {
             if (!next.toConst().fitsInTwosComp(info.signedness, info.bits))
                 return sema.fail(block, val_src, "enum tag value '{f}' too large for type '{f}'", .{ next.toConst(), sema.fmtType(tag_ty) });
@@ -1753,7 +1766,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
             const n = decl.field_names.len;
             const names = try ip.arena(Zcu.tid).alloc(InternPool.String, n);
             const types = try ip.arena(Zcu.tid).alloc(Index, n);
-            if (decl.arg_type_body) |body| arg_ty = try sema.analyzeAsType(&block, src, try sema.resolveInlineBody(&block, body, key.zir_inst));
+            if (decl.arg_type_body) |body| arg_ty = try sema.analyzeArgBody(&block, decl.arg_baseline_src_node, body, key.zir_inst);
             var aligns: []u64 = &.{};
             var it = decl.iterateFields();
             while (it.next()) |field| {
@@ -5038,13 +5051,16 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     break :blk sema.coerce(block, p.child, operand, src);
                 },
                 .slice, .many => {
-                    // `&.{...}`: coerce to an array of the element type.
-                    const len: u64 = switch (ip.indexToKey(operand_ty)) {
-                        .array_type => |a| a.len,
-                        .tuple_type => |t| t.types.len,
+                    // `&.{...}`: coerce to an array of the element type,
+                    // keeping the operand's sentinel, as upstream 0.17.1
+                    // (`&[_:0]u8{...}` as a `[]const u8` still ends in 0).
+                    const len: u64, const sentinel: Index = switch (ip.indexToKey(operand_ty)) {
+                        .array_type => |a| .{ a.len, a.sentinel },
+                        .vector_type => |v| .{ v.len, .none },
+                        .tuple_type => |t| .{ t.types.len, .none },
                         else => return sema.fail(block, src, "expected array of '{f}', found '{f}'", .{ sema.fmtType(p.child), sema.fmtType(operand_ty) }),
                     };
-                    const want = try sema.intern(.{ .array_type = .{ .len = len, .child = p.child, .sentinel = p.sentinel } });
+                    const want = try sema.intern(.{ .array_type = .{ .len = len, .child = p.child, .sentinel = if (sentinel == .none) .none else try sema.resolveConstValue(block, src, try sema.coerce(block, p.child, .fromInterned(sentinel), src), "array sentinel value must be comptime-known") } });
                     break :blk sema.coerce(block, want, operand, src);
                 },
                 .c => break :blk operand,
@@ -8765,11 +8781,14 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             const len: u64 = if (dc == .vector) ip.keyPayload(.vector_type, dest_ty).len else ip.keyPayload(.array_type, dest_ty).len;
             const s_len: u64 = if (sc == .vector) ip.keyPayload(.vector_type, src_ty).len else ip.keyPayload(.array_type, src_ty).len;
             if (len != s_len) return null;
-            if (dc == .array and ip.keyPayload(.array_type, dest_ty).sentinel != .none) return null;
+            // A vector to a sentinel-terminated array gets the sentinel
+            // after its elements, as upstream 0.17.1.
+            const sentinel: Index = if (dc == .array) ip.keyPayload(.array_type, dest_ty).sentinel else .none;
+            if (sentinel != .none and sc != .vector) return null;
             const dest_elem = Type.childType(ip, dest_ty);
             const src_elem = Type.childType(ip, src_ty);
             const same = dest_elem == src_elem;
-            if (val == null and !block.is_comptime) {
+            if (val == null and !block.is_comptime and sentinel == .none) {
                 // Arrays and vectors of non-bool elements share a layout
                 // (vectors only add padding at the end).
                 if (same and dest_elem != .bool_type) return try sema.addTyOp(block, .bitcast, dest_ty, inst);
@@ -8777,11 +8796,12 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                     return try sema.vectorMap(block, src, @intCast(len), dest_ty, &.{inst}, VectorCast{ .f = coerceElem, .elem_ty = dest_elem });
                 }
             }
-            const elems = try sema.arena.alloc(Ref, @intCast(len));
-            for (elems, 0..) |*e, i| {
+            const elems = try sema.arena.alloc(Ref, @intCast(len + @intFromBool(sentinel != .none)));
+            for (elems[0..@intCast(len)], 0..) |*e, i| {
                 const elem = try sema.vectorElem(block, inst, @intCast(i));
                 e.* = if (same) elem else (try sema.coerceInner(block, dest_elem, elem, src)) orelse return null;
             }
+            if (sentinel != .none) elems[@intCast(len)] = .fromInterned(sentinel);
             return try sema.aggregate(block, src, dest_ty, elems);
         } else if (dc == .vector and sc == .tuple) {
             const v = ip.keyPayload(.vector_type, dest_ty);
