@@ -3867,6 +3867,11 @@ share on the zig workload:
   `ensureNavVal` and function queueing, so dependencies are unchanged.
 - Child blocks take their instruction list from a per-Sema pool and give
   it back emptied (`Block.deinitInsts`, −0.06 G).
+- `analyzeRef` keeps the pointer it made to each comptime-known value
+  (`Zcu.uav_refs`) and `*const T` for each type (`Zcu.ref_ptr_types`):
+  code evaluated again and again references the same values (zig
+  workload −0.11 G, −0.24%). `resolveLayoutIfIdle` still runs on every
+  reference, so dependencies are unchanged.
 
 All three caches are written and read by Sema only, so CodeGen workers
 never see them; once Sema is parallel they become per analysis thread,
@@ -4381,7 +4386,7 @@ Zcu.zig, InternPool.zig or Type.zig apart from `Type.codegen_worker`.
 | `comptime_memo` | cache | sharded; first insert wins; entries in the inserting worker's arena; path-independent deps (rule 3) |
 | `comptime_bodies` | cache with order-dependent run counts | sharded; atomic run counter; lowering claimed by CAS while other threads keep walking (no wait). `Bytecode` is immutable once `.ready` |
 | `comptime_osr_off` | cache, insert-only | sharded set |
-| `comptime_alloc_refs`, `string_literals`, `string_cache`, `nav_ptrs` | pure caches (`string_cache` and `nav_ptrs` came with m6-ptr; `nav_ptrs` is written only after the nav's done load) | per worker |
+| `comptime_alloc_refs`, `string_literals`, `string_cache`, `nav_ptrs`, `uav_refs`, `ref_ptr_types` | pure caches (`string_cache` and `nav_ptrs` came with m6-ptr; `nav_ptrs` is written only after the nav's done load) | per worker |
 | `inferred_errors`, `anyerror_ies` | unit results | written before the body's done store |
 | `namespaces` | list; indices stored in Navs, ContainerInfos, dependees | per-worker chunked lists with the owner in the index, as InternPool does, so `namespacePtr` stays valid. Indices are not persisted (`ns.key` is) |
 | `file_root_types` | create-once | CAS on the slot (above) |

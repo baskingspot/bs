@@ -49,6 +49,14 @@ string_cache: []StringCacheEntry = &.{},
 /// The pointer `Sema.navRef` makes to each resolved declaration, which
 /// code takes again and again. Sema-only.
 nav_ptrs: std.AutoHashMapUnmanaged(InternPool.NavIndex, InternPool.Index) = .empty,
+/// The const pointer `Sema.analyzeRef` makes to each comptime-known value:
+/// code evaluated again and again takes the same values' addresses
+/// (`@typeInfo(T).@"struct".fields`, a method call on a constant).
+/// Sema-only.
+uav_refs: std.AutoHashMapUnmanaged(InternPool.Index, InternPool.Index) = .empty,
+/// `*const T` for each `T` that `Sema.analyzeRef` took a reference of.
+/// Sema-only.
+ref_ptr_types: std.AutoHashMapUnmanaged(InternPool.Index, InternPool.Index) = .empty,
 /// Analysis state of runtime function bodies.
 funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, FuncState) = .empty,
 func_queue: std.ArrayList(InternPool.Index) = .empty,
@@ -442,6 +450,8 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.nav_queue.deinit(gpa);
     zcu.phase_deps.deinit(gpa);
     zcu.nav_ptrs.deinit(gpa);
+    zcu.uav_refs.deinit(gpa);
+    zcu.ref_ptr_types.deinit(gpa);
     zcu.effect_uses.deinit(gpa);
     zcu.name_offers.deinit(gpa);
     zcu.name_reads.deinit(gpa);

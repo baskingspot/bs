@@ -10047,21 +10047,34 @@ fn packedInsert(sema: *Sema, block: *Block, host: Ref, bit_offset: u16, val: Ref
 
 fn analyzeRef(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
     const ty = sema.typeOf(operand);
-    const ptr_ty = try sema.ptrType(.{ .child = ty, .flags = .{ .is_const = true } });
     if (sema.resolveValue(operand)) |v| {
         // A reference to a function is a pointer to its declaration.
         if (sema.ip.keyTag(v) == .func) {
             const f = sema.ip.keyPayload(.func, v);
             if (f.generic_owner == .none and sema.ip.getNav(f.owner_nav).val == v) return sema.navRef(block, src, f.owner_nav);
         }
+        // Declares the layout dependency on every reference, cached or not.
         try sema.resolveLayoutIfIdle(block, src, ty);
-        return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = v, .orig_ty = ptr_ty } } } }));
+        if (sema.zcu.uav_refs.get(v)) |ptr| return .fromInterned(ptr);
+        const ptr_ty = try sema.refPtrType(ty);
+        const ptr = try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = v, .orig_ty = ptr_ty } } } });
+        try sema.zcu.uav_refs.put(sema.gpa, v, ptr);
+        return .fromInterned(ptr);
     }
+    const ptr_ty = try sema.refPtrType(ty);
     try sema.requireRuntime(block, src);
     try sema.resolveLayout(block, src, ty);
     const alloc = try sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = ptr_ty } });
     _ = try sema.addBinOp(block, .store, alloc, operand);
     return alloc;
+}
+
+/// `*const ty`, the type of `analyzeRef`'s result (`Zcu.ref_ptr_types`).
+fn refPtrType(sema: *Sema, ty: Index) !Index {
+    if (sema.zcu.ref_ptr_types.get(ty)) |p| return p;
+    const p = try sema.ptrType(.{ .child = ty, .flags = .{ .is_const = true } });
+    try sema.zcu.ref_ptr_types.put(sema.gpa, ty, p);
+    return p;
 }
 
 /// Dereferencing a C pointer goes through a single pointer, checked for
