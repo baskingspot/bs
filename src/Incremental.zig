@@ -3997,98 +3997,141 @@ fn reachedNow(inc: *Incremental, rp: *Replay, nodes: []const Node, final: []cons
     }
     if (rp.assumed.bit_length == 0) return reached;
     const assumed = &rp.assumed;
-    // The assumed nodes the walked ones reach now, and those they reached
-    // before (the cone's recorded edges).
+    // Walked nodes found no longer reached: the walk may have entered one
+    // only from an assumed node that goes.
+    const n_words = (n_all + word_bits - 1) / word_bits;
+    const n_prev_words = (n_prev + word_bits - 1) / word_bits;
+    var excluded = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
+    defer excluded.deinit(gpa);
     var entered = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
     defer entered.deinit(gpa);
-    var walked = try reached.clone(gpa);
+    var walked = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
     defer walked.deinit(gpa);
-    {
-        for (0..(n_prev + word_bits - 1) / word_bits) |w| walked.masks[w] &= ~assumed.masks[w];
+    var cand = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    defer cand.deinit(gpa);
+    var solid = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
+    defer solid.deinit(gpa);
+    var lost: std.ArrayList(u32) = .empty;
+    defer lost.deinit(gpa);
+    var cands: std.ArrayList(u32) = .empty;
+    defer cands.deinit(gpa);
+    while (true) {
+        // The assumed nodes the walked ones reach now, and those they
+        // reached before (the cone's recorded edges, and those of the
+        // walked nodes no longer reached).
+        entered.unsetAll();
+        for (0..n_words) |k| walked.masks[k] = reached.masks[k] & ~excluded.masks[k];
+        for (0..n_prev_words) |k| walked.masks[k] &= ~assumed.masks[k];
         var wit = walked.iterator(.{});
         while (wit.next()) |x| {
             try g.next(gpa, @intCast(x), &next);
             for (next.items) |t| if (t < n_prev and assumed.isSet(t)) entered.set(t);
         }
-    }
-    var lost: std.ArrayList(u32) = .empty;
-    defer lost.deinit(gpa);
-    {
-        var it = rp.cone.iterator(.{});
-        while (it.next()) |x| {
-            next.clearRetainingCapacity();
-            try reachNext(m.deps(@intCast(x)), m.nodeRefs(@intCast(x)), &next, gpa);
-            for (next.items) |t| if (t < n_prev and assumed.isSet(t) and !entered.isSet(t)) try lost.append(gpa, t);
+        lost.clearRetainingCapacity();
+        for ([_]*const std.DynamicBitSetUnmanaged{ &rp.cone, &excluded }) |set| {
+            var it = set.iterator(.{});
+            while (it.next()) |x| if (x < n_prev) {
+                next.clearRetainingCapacity();
+                try reachNext(m.deps(@intCast(x)), m.nodeRefs(@intCast(x)), &next, gpa);
+                for (next.items) |t| if (t < n_prev and assumed.isSet(t) and !entered.isSet(t)) try lost.append(gpa, t);
+            };
         }
-    }
-    if (lost.items.len == 0) return reached;
-    // The candidates: what the lost entries reach among the assumed.
-    var cand = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
-    defer cand.deinit(gpa);
-    for (lost.items) |t| if (!cand.isSet(t)) {
-        cand.set(t);
-        try stack.append(gpa, t);
-    };
-    var cands: std.ArrayList(u32) = .empty;
-    defer cands.deinit(gpa);
-    while (stack.pop()) |x| {
-        try cands.append(gpa, x);
-        if (g.written_at[x] != NewGraph.none) return inc.lazyFallback("a node taken as reached was written", .{});
-        next.clearRetainingCapacity();
-        try reachNext(m.deps(x), m.nodeRefs(x), &next, gpa);
-        for (next.items) |t| if (assumed.isSet(t) and !cand.isSet(t)) {
+        if (lost.items.len == 0 and excluded.count() == 0) return reached;
+        // The candidates: what the lost entries reach among the assumed.
+        cand.unsetAll();
+        cands.clearRetainingCapacity();
+        for (lost.items) |t| if (!cand.isSet(t)) {
             cand.set(t);
             try stack.append(gpa, t);
         };
-    }
-    // Those still reached: entered now, or named by an assumed node that
-    // is not a candidate (reverse edges are a superset: each is checked),
-    // and what they reach among the candidates.
-    for (cands.items) |x| {
-        const keep = entered.isSet(x) or keep: {
-            for ([_][2][]const u32{ m.rdeps(x), m.rrefs(x) }) |parts| for (parts) |part| for (part) |p| {
-                if (!assumed.isSet(p) or cand.isSet(p)) continue;
-                next.clearRetainingCapacity();
-                try reachNext(m.deps(p), m.nodeRefs(p), &next, gpa);
-                if (std.mem.indexOfScalar(u32, next.items, x) != null) break :keep true;
+        while (stack.pop()) |x| {
+            try cands.append(gpa, x);
+            if (g.written_at[x] != NewGraph.none) return inc.lazyFallback("a node taken as reached was written", .{});
+            next.clearRetainingCapacity();
+            try reachNext(m.deps(x), m.nodeRefs(x), &next, gpa);
+            for (next.items) |t| if (assumed.isSet(t) and !cand.isSet(t)) {
+                cand.set(t);
+                try stack.append(gpa, t);
             };
-            break :keep false;
+        }
+        // Those still reached: entered now, or named by an assumed node
+        // that is not a candidate (reverse edges are a superset: each is
+        // checked), and what they reach among the candidates.
+        for (cands.items) |x| {
+            if (entered.isSet(x) or try namedByAssumed(gpa, m, assumed, &cand, x, &next)) try stack.append(gpa, x);
+        }
+        while (stack.pop()) |x| {
+            if (!cand.isSet(x)) continue;
+            cand.unset(x);
+            next.clearRetainingCapacity();
+            try reachNext(m.deps(x), m.nodeRefs(x), &next, gpa);
+            for (next.items) |t| if (cand.isSet(t)) try stack.append(gpa, t);
+        }
+        // The walked nodes still reached: from the roots, and from the
+        // cone's entries that an assumed node that stays names, over the
+        // edges as they are now.
+        solid.unsetAll();
+        for (rp.roots.items) |x| if (!solid.isSet(x)) {
+            solid.set(x);
+            try stack.append(gpa, x);
         };
-        if (keep) try stack.append(gpa, x);
+        for (rp.entries.items) |x| if (!solid.isSet(x) and try namedByAssumed(gpa, m, assumed, &cand, x, &next)) {
+            solid.set(x);
+            try stack.append(gpa, x);
+        };
+        while (stack.pop()) |x| {
+            try g.next(gpa, x, &next);
+            for (next.items) |t| {
+                if (solid.isSet(t) or g.isDead(t) or (t < n_prev and assumed.isSet(t))) continue;
+                solid.set(t);
+                try stack.append(gpa, t);
+            }
+        }
+        // Walked nodes that are not: if they are the ones found before,
+        // done; else find what goes without them.
+        var grew = false;
+        for (0..n_words) |k| {
+            const more = walked.masks[k] & ~solid.masks[k];
+            if (more != 0) grew = true;
+            excluded.masks[k] |= more;
+        }
+        if (!grew) break;
     }
-    while (stack.pop()) |x| {
-        if (!cand.isSet(x)) continue;
-        cand.unset(x);
-        next.clearRetainingCapacity();
-        try reachNext(m.deps(x), m.nodeRefs(x), &next, gpa);
-        for (next.items) |t| if (cand.isSet(t)) try stack.append(gpa, t);
+    // The rest are no longer reached. The walk decided nothing about a
+    // walked node that goes, or a full build would not have.
+    var xit = excluded.iterator(.{});
+    while (xit.next()) |x| {
+        if (x >= n_prev or g.written_at[x] != NewGraph.none or rp.state[x] != .unknown or m.typeNames(@intCast(x)).len != 0)
+            return inc.lazyFallback("the walk decided a node that is no longer reached", .{});
+        reached.unset(x);
+        rp.visited.unset(x);
     }
-    // The rest are no longer reached.
     var it = cand.iterator(.{});
     while (it.next()) |x| {
         if (m.typeNames(@intCast(x)).len != 0) return inc.lazyFallback("a type's name came from a unit no longer reached", .{});
-        // The walk entered the cone from it (`Replay.assumeReached`).
-        next.clearRetainingCapacity();
-        try reachNext(m.deps(@intCast(x)), m.nodeRefs(@intCast(x)), &next, gpa);
-        for (next.items) |t| if (!assumed.isSet(t) and rp.visited.isSet(t))
-            return inc.lazyFallback("a node no longer reached named one the walk went to", .{});
         reached.unset(x);
         rp.visited.unset(x);
     }
     return reached;
 }
 
-/// `BS_CACHE_CHECK` for a lazy build: the `reached` flags it records,
-/// and the nodes with atoms it links (`live`), against a full walk of the
-/// graph it leaves (`NewGraph`) from the roots.
-fn checkLiveReach(inc: *Incremental, rp: *const Replay, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, live: *const std.DynamicBitSetUnmanaged, reached: *const std.DynamicBitSetUnmanaged) !void {
-    const gpa = inc.gpa;
-    const m = rp.m;
-    const n_all = live.bit_length;
-    var g: NewGraph = try .init(gpa, rp, nodes, final, write, node_refs, ref_starts, n_all);
-    defer g.deinit(gpa);
-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
-    defer seen.deinit(gpa);
+/// Whether an assumed node outside `cand` names `x` among the references
+/// reach follows (reverse edges are a superset: each is checked).
+fn namedByAssumed(gpa: Allocator, m: *const Manifest, assumed: *const std.DynamicBitSetUnmanaged, cand: *const std.DynamicBitSetUnmanaged, x: u32, next: *std.ArrayList(u32)) !bool {
+    for ([_][2][]const u32{ m.rdeps(x), m.rrefs(x) }) |parts| for (parts) |part| for (part) |p| {
+        if (!assumed.isSet(p) or cand.isSet(p)) continue;
+        next.clearRetainingCapacity();
+        try reachNext(m.deps(p), m.nodeRefs(p), next, gpa);
+        if (std.mem.indexOfScalar(u32, next.items, x) != null) return true;
+    };
+    return false;
+}
+
+/// The nodes a walk from the roots reaches in the graph a lazy build
+/// leaves (`NewGraph`).
+fn fullReach(gpa: Allocator, rp: *const Replay, g: *const NewGraph) !std.DynamicBitSetUnmanaged {
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, g.written_at.len);
+    errdefer seen.deinit(gpa);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
     var next: std.ArrayList(u32) = .empty;
@@ -4104,6 +4147,20 @@ fn checkLiveReach(inc: *Incremental, rp: *const Replay, nodes: []const Node, fin
             try stack.append(gpa, t);
         };
     }
+    return seen;
+}
+
+/// `BS_CACHE_CHECK` for a lazy build: the `reached` flags it records,
+/// and the nodes with atoms it links (`live`), against a full walk of the
+/// graph it leaves (`NewGraph`) from the roots.
+fn checkLiveReach(inc: *Incremental, rp: *const Replay, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, live: *const std.DynamicBitSetUnmanaged, reached: *const std.DynamicBitSetUnmanaged) !void {
+    const gpa = inc.gpa;
+    const m = rp.m;
+    const n_all = live.bit_length;
+    var g: NewGraph = try .init(gpa, rp, nodes, final, write, node_refs, ref_starts, n_all);
+    defer g.deinit(gpa);
+    var seen = try fullReach(gpa, rp, &g);
+    defer seen.deinit(gpa);
     var differ: [4]usize = @splat(0);
     for (0..n_all) |i_usize| {
         const i: u32 = @intCast(i_usize);

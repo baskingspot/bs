@@ -4645,8 +4645,18 @@ records only what changed, and links from the manifest.
   candidates, and those that a remaining assumed node or a walked node
   still reaches stay. The rest are no longer reached and not linked. A
   build falls back to eager if one that goes offered or read type names
-  (`contributeNames` counted it) or named a cone node the walk visited
-  (its entry may have been only that). With the cone past half the
+  (`contributeNames` counted it). A walked node may have been entered
+  only from an assumed node that goes, so the record also finds the
+  walked nodes still reached: from the roots and from the entries an
+  assumed node that stays names, over the edges as they are now. Those
+  it does not reach go too, and the assumed nodes only they reached
+  become candidates; this repeats until nothing more goes, and the build
+  falls back only if the walk analyzed, wrote or took a type name from a
+  node that goes. (On vaxis, an edit in Vaxis.zig makes a struct type
+  declared in the edited function, its function and that function's
+  inferred error set new each time, and the old ones go; that had made
+  every such edit build eager, 140 against 28 ms.)
+  With the cone past half the
   reached nodes, or in a donor's build, it walks everything as before.
   `BS_CACHE_CHECK` walks the graph the build leaves in full
   (`checkLiveReach`) and requires the same `reached` flags and linked
