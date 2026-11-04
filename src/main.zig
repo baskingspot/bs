@@ -100,6 +100,11 @@ pub const Options = struct {
     /// target (see "C interop" in docs/architecture.md).
     link_libc: bool = false,
     glibc_version: ?std.SemanticVersion = null,
+    /// `-lc++` (or `-lstdc++`, `-lc++abi`, `-lsupc++`, as upstream): libc++'s
+    /// headers for the C and C++ sources, and in an executable libc++,
+    /// libc++abi and libunwind, built from the lib directory (CSource.zig).
+    /// Implies `link_libc`.
+    link_libcpp: bool = false,
     /// `-dynamic` on an executable, which only `-lc` makes one.
     exe_dynamic: bool = false,
     /// ELF objects (`.o`) and archives (`.a`) to link into the executable,
@@ -121,7 +126,14 @@ pub const Options = struct {
     /// archive holds their objects, and zap analyzes no Zig.
     c_only: bool = false,
     c_global_cc_argv: []const []const u8 = &.{},
+    /// `std.zig.system.NativePaths`' include directories, which upstream's
+    /// C takes after libc's when a native build names system libraries
+    /// (`native_system_include_paths`).
+    c_native_includes: []const []const u8 = &.{},
     c_pie: bool = false,
+    /// `-fllvm`: the backend upstream would use, which zap does not, but
+    /// which gives the compilation's C a stack protector upstream.
+    use_llvm: bool = false,
     function_sections: bool = false,
     data_sections: bool = false,
     /// `--verbose-cc`: print each Clang command line, as upstream.
@@ -340,6 +352,7 @@ pub const Job = struct {
             .pie = opts.pie,
             .dynamic = opts.dynamic,
             .glibc = if (opts.link_libc) opts.glibc_version else null,
+            .link_libcpp = opts.link_libcpp,
         });
         // An executable that fuzzes links the fuzzer, whose module family
         // has a builtin of its own, as upstream's separate compilation of
@@ -466,7 +479,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // again with the first attempt's final names (`Zcu.finalizeNames`).
     var pins: ?*const Zcu.NamePins = null;
     // C sources compile while the build analyzes, once for every attempt.
-    const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0) try startC(init, job) else null;
+    const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0 or cxxRuntime(&job.opts)) try startC(init, job) else null;
     defer if (c_batch) |b| CSource.destroy(b);
     if (job.opts.c_only) return compileCOnly(init, c_batch.?, out_path, inputs);
     // The C objects are link-only inputs of the cache, after the object
@@ -517,6 +530,12 @@ fn appendCInputs(arena: std.mem.Allocator, list: *std.ArrayList(u8), c_inputs: [
     while (it.next()) |p| if (p.len != 0) try appendInput(arena, list, p);
 }
 
+/// Whether the build links the C++ runtime libraries: an executable with
+/// `-lc++`, as upstream builds them for executables and shared libraries.
+fn cxxRuntime(opts: *const Options) bool {
+    return opts.link_libcpp and opts.command != .build_obj and opts.command != .build_lib;
+}
+
 /// Starts compiling the job's C sources (CSource.zig).
 fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     const opts = &job.opts;
@@ -531,11 +550,17 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .local_cache = job.cache_dirs.local,
         .glibc_version = glibc_version,
         .link_libc = opts.link_libc,
+        .link_libcpp = opts.link_libcpp,
+        .cxx_runtime = cxxRuntime(opts),
+        .global_cache = job.cache_dirs.global,
+        .single_threaded = opts.single_threaded,
+        .stack_protector = opts.c_only or opts.use_llvm,
         .pie = opts.c_pie,
         .function_sections = opts.function_sections,
         .data_sections = opts.data_sections,
         .unwind_tables = opts.unwind_tables,
         .global_cc_argv = opts.c_global_cc_argv,
+        .native_includes = opts.c_native_includes,
         .verbose = opts.verbose_cc,
     });
 }
@@ -580,7 +605,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
         // Only executables link the C runtimes; a library's C objects
         // reach them when an executable links the library, as upstream's.
-        .c_runtimes = opts.command != .build_obj and opts.command != .build_lib and (opts.link_inputs.len != 0 or opts.c_sources.len != 0),
+        .c_runtimes = opts.command != .build_obj and opts.command != .build_lib and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp),
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
@@ -688,8 +713,8 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         }
         emit.inputs = &link_inputs;
     }
-    // An executable links the C objects; a static library holds them as
-    // members.
+    // An executable links the C objects and the C++ runtime libraries; a
+    // static library holds the objects as members.
     if (c_batch) |b| if (!emit.obj) {
         emit.inputs = &link_inputs;
         emit.c_batch = b;
@@ -903,8 +928,8 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
         },
         .link_mode = if (opts.dynamic or (opts.link_libc and opts.command != .build_obj and opts.command != .build_lib)) .dynamic else .static,
         .link_libc = opts.link_libc,
-        .link_libcpp = false,
-        .link_libunwind = false,
+        .link_libcpp = opts.link_libcpp,
+        .link_libunwind = opts.link_libcpp,
         .pie = false,
     } });
 
@@ -1467,6 +1492,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             // native directories with one.
             _ = nextArg(args, &i, arg);
             sysroot = true;
+        } else if (std.mem.eql(u8, arg, "-fllvm") or std.mem.eql(u8, arg, "-fno-llvm")) {
+            // zap uses its own backend either way (see `ignored_flags`).
+            opts.use_llvm = arg[2] == 'l';
         } else if (ignored_flags.has(arg)) {
             // Changes nothing zap does.
         } else if (ignored_flags_with_arg.has(arg)) {
@@ -1504,9 +1532,15 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             setUnsupported(&opts, arena, "zap builds only Debug ('{s}'); drop the release mode (-Doptimize, --release) or build this step with upstream zig", .{arg});
         } else if (std.mem.startsWith(u8, arg, "-l") and glibc_libs.has(arg[2..])) {
             opts.link_libc = true;
-        } else if (!std.mem.eql(u8, arg, "-lc++") and (std.mem.startsWith(u8, arg, "-l") or std.mem.eql(u8, arg, "--library"))) {
+        } else if (std.mem.startsWith(u8, arg, "-l") and libcpp_names.has(arg[2..])) {
+            opts.link_libcpp = true;
+            opts.link_libc = true;
+        } else if (std.mem.startsWith(u8, arg, "-l") or std.mem.eql(u8, arg, "--library")) {
             const name = if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--library")) nextArg(args, &i, arg) else arg[2..];
             if (glibc_libs.has(name)) {
+                opts.link_libc = true;
+            } else if (libcpp_names.has(name)) {
+                opts.link_libcpp = true;
                 opts.link_libc = true;
             } else if (command == .build_obj or command == .build_lib) {
                 setUnsupported(&opts, arena, "zap does not link libraries into objects or libraries yet ('-l{s}'); build this step with upstream zig", .{name});
@@ -1514,7 +1548,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                 try libs.append(arena, .{ .name = name, .at = link_inputs.items.len, .search = lib_search });
                 try link_inputs.append(arena, "");
             }
-        } else if (std.mem.eql(u8, arg, "-lc++") or std.mem.startsWith(u8, arg, "-needed-l") or std.mem.startsWith(u8, arg, "-weak-l")) {
+        } else if (std.mem.startsWith(u8, arg, "-needed-l") or std.mem.startsWith(u8, arg, "-weak-l")) {
             setUnsupported(&opts, arena, "zap does not link libc or system libraries ('{s}'); build this step with upstream zig", .{arg});
         } else if (unsupported_flags.get(arg)) |msg| {
             setUnsupported(&opts, arena, "{s}", .{msg});
@@ -1532,8 +1566,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             setUnsupported(&opts, arena, "zap does not support the option '{s}'", .{arg});
         } else if (!std.mem.endsWith(u8, arg, ".zig")) {
             const ext = std.fs.path.extension(arg);
-            if (std.mem.eql(u8, ext, ".c")) {
-                try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{} });
+            if (CSource.Lang.ofPath(arg)) |lang| {
+                try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{}, .lang = lang });
             } else if ((std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or isSharedLib(arg)) and command != .build_obj and command != .build_lib) {
                 try link_inputs.append(arena, arg);
             } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a"))
@@ -1587,6 +1621,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         if (std.zig.system.resolveTargetQuery(io, .{})) |target| {
             if (std.zig.system.NativePaths.detect(arena, io, &target, environ_map)) |paths| {
                 for (paths.lib_dirs.items) |dir| if (Io.Dir.cwd().access(io, dir, .{})) |_| try search_dirs.append(arena, dir) else |_| {};
+                opts.c_native_includes = paths.include_dirs.items;
             } else |_| {}
         } else |_| {}
     }
@@ -1788,6 +1823,8 @@ const LibQuery = struct {
 /// glibc's libraries, which `-l` links as part of libc (upstream's
 /// `std.zig.target.isLibCLibName` for glibc).
 const glibc_libs: std.StaticStringMap(void) = .initComptime(.{ .{"c"}, .{"m"}, .{"rt"}, .{"pthread"}, .{"util"}, .{"resolv"}, .{"dl"} });
+/// The names `-l` takes for libc++ (upstream's `target_util.is_libcpp_lib_name`).
+const libcpp_names: std.StaticStringMap(void) = .initComptime(.{ .{"c++"}, .{"stdc++"}, .{"c++abi"}, .{"supc++"} });
 
 pub fn isGlibcLib(name: []const u8) bool {
     return glibc_libs.has(name);

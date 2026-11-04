@@ -1,7 +1,11 @@
-//! C source files, compiled by upstream's Clang (`zig clang`) with the
-//! arguments upstream's `Compilation.addCCArgs` gives them for zap's
+//! C and C++ source files, compiled by upstream's Clang (`zig clang`) with
+//! the arguments upstream's `Compilation.addCCArgs` gives them for zap's
 //! target and the baseline CPU, in Debug (docs/architecture.md, "C
-//! interop"). zap never compiles C itself.
+//! interop"). zap never compiles C or C++ itself. With `-lc++`, an
+//! executable also links libc++, libc++abi and libunwind, which this file
+//! builds from the zig lib directory's sources as upstream's
+//! `libs/libcxx.zig` and `libs/libunwind.zig` do, once per configuration,
+//! into the global cache.
 //!
 //! The compiles start before analysis and run while Sema does; the build
 //! adds their objects to its link inputs at its first sync point
@@ -28,6 +32,24 @@ extra_flags: []const []const u8,
 /// The owning module's C arguments (`-I`, `-D`, ...) and options.
 cc_argv: []const []const u8,
 flags: Flags,
+lang: Lang = .c,
+
+/// The languages Clang compiles here, as upstream's `FileExt` classifies
+/// them; assembly only in libunwind.
+pub const Lang = enum {
+    c,
+    cpp,
+    asm_cpp,
+
+    /// The language of a source file argument, by its extension, or null
+    /// if it is not one zap compiles.
+    pub fn ofPath(path: []const u8) ?Lang {
+        const ext = std.fs.path.extension(path);
+        if (std.mem.eql(u8, ext, ".c")) return .c;
+        for ([_][]const u8{ ".C", ".cc", ".cpp", ".cxx", ".stub", ".c++" }) |e| if (std.mem.eql(u8, ext, e)) return .cpp;
+        return null;
+    }
+};
 
 /// The per-module options that change a C compile, as upstream's
 /// `Module.create` resolves them: unset takes the root module's, then the
@@ -37,6 +59,7 @@ pub const Flags = struct {
     red_zone: ?bool = null,
     no_builtin: ?bool = null,
     pic: ?bool = null,
+    stack_protector: ?bool = null,
 
     pub fn inherit(f: Flags, root: Flags) Flags {
         var r = f;
@@ -63,6 +86,10 @@ pub const Flags = struct {
             f.no_builtin = false;
         } else if (eql(u8, arg, "-fno-builtin")) {
             f.no_builtin = true;
+        } else if (eql(u8, arg, "-fstack-protector")) {
+            f.stack_protector = true;
+        } else if (eql(u8, arg, "-fno-stack-protector")) {
+            f.stack_protector = false;
         } else if (eql(u8, arg, "-fPIC")) {
             f.pic = true;
         } else if (eql(u8, arg, "-fno-PIC")) {
@@ -81,12 +108,27 @@ pub const Options = struct {
     /// for `x86_64-linux`.
     glibc_version: ?std.SemanticVersion,
     link_libc: bool,
+    /// `-lc++`: libc++'s headers and configuration for every source, as
+    /// upstream gives them to C sources too.
+    link_libcpp: bool = false,
+    /// An executable with `-lc++`: build (or find) the C++ runtime
+    /// libraries and link them (`Batch.Result.archives`).
+    cxx_runtime: bool = false,
+    /// Where the C++ runtime libraries go: `<global>/zap/o/<key>/`.
+    global_cache: []const u8 = "",
+    single_threaded: bool = false,
+    /// Upstream's default stack protector for the compilation's C: with
+    /// libc, unless its Zig code goes through the self-hosted backend,
+    /// which has none (`Module.create`): a library of C only, or `-fllvm`.
+    stack_protector: bool = false,
     pie: bool,
     function_sections: bool,
     data_sections: bool,
     unwind_tables: std.lang.UnwindTables,
     /// `cc_argv` left after the last `-M`, before every module's own.
     global_cc_argv: []const []const u8,
+    /// `-isystem` directories after libc's (`main.Options.c_native_includes`).
+    native_includes: []const []const u8 = &.{},
     /// `--verbose-cc`.
     verbose: bool = false,
 };
@@ -96,11 +138,14 @@ pub const Batch = struct {
     gpa: std.mem.Allocator,
     io: Io,
     jobs: []Job,
+    /// The C++ runtime libraries an executable links (`Options.cxx_runtime`).
+    archives: []Archive = &.{},
     group: Io.Group = .init,
     next: std.atomic.Value(usize) = .init(0),
     /// Upstream zig, or why there is none.
     zig: Zig,
-    /// How many sources Clang compiles: those whose record missed.
+    /// How many sources Clang compiles: those whose record missed, and
+    /// the C++ runtime libraries' sources when one is built.
     misses: usize = 0,
     paths: diag.Paths,
     verbose: bool,
@@ -118,8 +163,11 @@ pub const Batch = struct {
         /// go at `dep_at` and the end.
         argv: []const []const u8,
         dep_at: usize,
+        /// Empty for a C++ runtime library's source, which has no record.
         record_path: []const u8,
         out_path: []const u8,
+        /// The runtime library (`Batch.archives`) the object goes into.
+        archive: ?u8 = null,
         old_output: ?cache.Hash = null,
         start_ns: i96,
         /// Set by `run`.
@@ -135,9 +183,20 @@ pub const Batch = struct {
         inputs: []const u8 = "",
     };
 
+    /// A C++ runtime library: in the global cache already, or built by
+    /// this batch's jobs from `first` on into `tmp_dir`.
+    const Archive = struct {
+        path: []const u8,
+        tmp_dir: []const u8 = "",
+        first: usize = 0,
+        len: usize = 0,
+    };
+
     pub const Result = struct {
         /// In command-line order.
         objects: []const Object,
+        /// The C++ runtime libraries, in link order.
+        archives: []const Object = &.{},
         errors: []const diag.Diagnostic,
         /// Every file Clang read, zero-separated.
         inputs: []const u8,
@@ -168,15 +227,18 @@ pub const Batch = struct {
                 return;
             },
         };
-        const tmp_dir = try std.fs.path.join(arena, &.{ std.fs.path.dirname(std.fs.path.dirname(j.record_path).?).?, "tmp" });
-        try Io.Dir.cwd().createDirPath(io, tmp_dir);
-        var rand: [8]u8 = undefined;
-        io.random(&rand);
-        const tmp_base = try std.fs.path.join(arena, &.{ tmp_dir, &std.fmt.bytesToHex(rand, .lower) });
-        const dep_path = try std.fmt.allocPrint(arena, "{s}-cc.d", .{tmp_base});
-        const tmp_out = try std.fmt.allocPrint(arena, "{s}-cc.o", .{tmp_base});
+        // A runtime library's object goes straight into its build
+        // directory; a record's output, once Clang succeeds.
+        const dep_path, const tmp_out = if (j.archive != null) .{ try std.fmt.allocPrint(arena, "{s}.d", .{j.out_path}), j.out_path } else paths: {
+            const tmp_dir = try std.fs.path.join(arena, &.{ std.fs.path.dirname(std.fs.path.dirname(j.record_path).?).?, "tmp" });
+            try Io.Dir.cwd().createDirPath(io, tmp_dir);
+            var rand: [8]u8 = undefined;
+            io.random(&rand);
+            const tmp_base = try std.fs.path.join(arena, &.{ tmp_dir, &std.fmt.bytesToHex(rand, .lower) });
+            break :paths .{ try std.fmt.allocPrint(arena, "{s}-cc.d", .{tmp_base}), try std.fmt.allocPrint(arena, "{s}-cc.o", .{tmp_base}) };
+        };
         defer Io.Dir.cwd().deleteFile(io, dep_path) catch {};
-        defer Io.Dir.cwd().deleteFile(io, tmp_out) catch {};
+        defer if (j.archive == null) Io.Dir.cwd().deleteFile(io, tmp_out) catch {};
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(arena, zig);
         try argv.appendSlice(arena, j.argv[1..j.dep_at]);
@@ -184,13 +246,21 @@ pub const Batch = struct {
         try argv.appendSlice(arena, j.argv[j.dep_at..]);
         try argv.appendSlice(arena, &.{ "-c", "-o", tmp_out });
         if (b.verbose) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});
-        const res = try std.process.run(arena, io, .{
+        // Warnings can run to megabytes (highway's -Wall -Wextra: 17 MB
+        // for one file); only a failure keeps them, for its errors.
+        var run_arena: std.heap.ArenaAllocator = .init(b.gpa);
+        defer run_arena.deinit();
+        const res = try std.process.run(run_arena.allocator(), io, .{
             .argv = argv.items,
             .stdout_limit = .limited(1 << 20),
-            .stderr_limit = .limited(16 << 20),
+            .stderr_limit = .unlimited,
         });
         if (!res.term.success()) {
-            j.state = .{ .failed = if (res.stderr.len != 0) res.stderr else try std.fmt.allocPrint(arena, "clang failed ({f})", .{res.term}) };
+            j.state = .{ .failed = if (res.stderr.len != 0) try arena.dupe(u8, res.stderr) else try std.fmt.allocPrint(arena, "clang failed ({f})", .{res.term}) };
+            return;
+        }
+        if (j.archive != null) {
+            j.state = .done;
             return;
         }
         // Warnings print as upstream's `zig cc` would; upstream's build
@@ -226,6 +296,7 @@ pub const Batch = struct {
             switch (j.state) {
                 .pending => unreachable,
                 .done => {
+                    if (j.archive != null) continue;
                     const bytes = Io.Dir.cwd().readFileAlloc(b.io, j.out_path, arena, .unlimited) catch |err| {
                         try errors.append(arena, .{ .loc = null, .msg = try std.fmt.allocPrint(arena, "unable to read the object of '{s}' ({s}): {t}", .{ j.source, j.out_path, err }) });
                         continue;
@@ -236,17 +307,46 @@ pub const Batch = struct {
                 .err => |msg| try errors.append(arena, .{ .loc = null, .msg = try arena.dupe(u8, msg) }),
             }
         }
-        b.result = .{ .objects = objects.items, .errors = errors.items, .inputs = inputs.items };
+        var archives: std.ArrayList(Object) = .empty;
+        for (b.archives) |a| {
+            if (a.len != 0) {
+                b.writeArchive(arena, a) catch |err| {
+                    try errors.append(arena, .{ .loc = null, .msg = try std.fmt.allocPrint(arena, "unable to build '{s}': {t}", .{ a.path, err }) });
+                    continue;
+                };
+            }
+            const bytes = Io.Dir.cwd().readFileAlloc(b.io, a.path, arena, .unlimited) catch |err| {
+                try errors.append(arena, .{ .loc = null, .msg = try std.fmt.allocPrint(arena, "unable to read '{s}': {t}", .{ a.path, err }) });
+                continue;
+            };
+            try archives.append(arena, .{ .path = a.path, .bytes = bytes, .member = std.fs.path.basename(a.path) });
+        }
+        b.result = .{ .objects = objects.items, .archives = archives.items, .errors = errors.items, .inputs = inputs.items };
         return &b.result.?;
+    }
+
+    /// Archives a runtime library's objects into the global cache, unless
+    /// one of them failed to compile (its error is reported already).
+    fn writeArchive(b: *Batch, arena: std.mem.Allocator, a: Archive) !void {
+        const io = b.io;
+        defer Io.Dir.cwd().deleteTree(io, a.tmp_dir) catch {};
+        const jobs = b.jobs[a.first..][0..a.len];
+        for (jobs) |j| if (j.state != .done) return error.CompileFailed;
+        const members = try arena.alloc(@import("link/Archive.zig").Input, jobs.len);
+        for (members, jobs) |*m, j| m.* = .{ .name = std.fs.path.basename(j.out_path), .bytes = try Io.Dir.cwd().readFileAlloc(io, j.out_path, arena, .unlimited) };
+        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(a.path).?);
+        try @import("link/Archive.zig").write(b.gpa, io, Io.Dir.cwd(), a.path, members);
     }
 };
 
 /// Where the objects are, in command-line order, compiled or not yet:
-/// a record's output keeps its path across edits of the source.
+/// a record's output keeps its path across edits of the source. Then the
+/// C++ runtime libraries, whose paths name their configuration.
 pub fn objectPaths(b: *const Batch, arena: std.mem.Allocator) ![]const []const u8 {
-    const paths = try arena.alloc([]const u8, b.jobs.len);
-    for (paths, b.jobs) |*p, j| p.* = try arena.dupe(u8, j.out_path);
-    return paths;
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (b.jobs) |j| if (j.archive == null) try paths.append(arena, try arena.dupe(u8, j.out_path));
+    for (b.archives) |a| try paths.append(arena, try arena.dupe(u8, a.path));
+    return paths.items;
 }
 
 pub const Object = struct {
@@ -258,17 +358,19 @@ pub const Object = struct {
 
 /// Starts compiling `sources`: looks each up in its record, and runs Clang
 /// for the others on up to the CPU count of tasks while the caller goes on.
+/// With `o.cxx_runtime`, also builds the C++ runtime libraries that are not
+/// in the global cache.
 pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, sources: []const CSource, o: Options) !*Batch {
     const b = try gpa.create(Batch);
     errdefer gpa.destroy(b);
-    b.* = .{ .gpa = gpa, .io = io, .jobs = try gpa.alloc(Batch.Job, sources.len), .zig = undefined, .paths = undefined, .verbose = o.verbose, .result_arena = .init(gpa) };
-    for (b.jobs) |*j| j.arena = .init(gpa);
-    b.paths = try .init(b.result_arena.allocator(), io, o.zig_lib_dir);
+    b.* = .{ .gpa = gpa, .io = io, .jobs = &.{}, .zig = undefined, .paths = undefined, .verbose = o.verbose, .result_arena = .init(gpa) };
+    const ra = b.result_arena.allocator();
+    b.paths = try .init(ra, io, o.zig_lib_dir);
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     const s = scratch.allocator();
     const cwd_path = try std.process.currentPathAlloc(io, s);
-    const lib = try std.fs.path.resolve(s, &.{ cwd_path, o.zig_lib_dir });
+    const lib = try std.fs.path.resolve(ra, &.{ cwd_path, o.zig_lib_dir });
     const local = try std.fs.path.resolve(s, &.{ cwd_path, o.local_cache });
     const start_ns = Io.Clock.real.now(io).toNanoseconds();
 
@@ -280,20 +382,59 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         break :id try std.fmt.allocPrint(s, "{s}\x00{d}\x00{d}\x00{d}", .{ p, st.inode, st.size, st.mtime.toNanoseconds() });
     } else "";
     const target = try cTarget(io, o.glibc_version);
-    const common = try commonArgs(b.result_arena.allocator(), &target, lib, o);
+    const common = try commonArgs(ra, &target, lib, o);
+
+    // The runtime libraries first, to know how many of their sources to
+    // compile.
+    var runtime: std.ArrayList(RuntimeJob) = .empty;
+    var archives: std.ArrayList(Batch.Archive) = .empty;
+    if (o.cxx_runtime) for (runtime_libs) |rl| {
+        const first = runtime.items.len;
+        try runtimeJobs(ra, &runtime, rl, common, lib, o);
+        // Keyed by upstream zig and every compile's arguments, which name
+        // the lib directory's sources; not by zap, whose rebuilds do not
+        // change the library.
+        var h: std.ArrayList(u8) = .empty;
+        try h.print(s, "zap c++ runtime 1\x00{s}\x00{s}\x00", .{ zig_id, rl.name });
+        for (runtime.items[first..]) |rj| for (rj.argv) |a| try h.print(s, "{s}\x00", .{a});
+        const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(cache.hash(2, h.items))), .lower);
+        const path = try std.fs.path.join(ra, &.{ o.global_cache, "zap", "o", &hex, try std.fmt.allocPrint(s, "lib{s}.a", .{rl.name}) });
+        if (Io.Dir.cwd().access(io, path, .{})) |_| {
+            runtime.shrinkRetainingCapacity(first);
+            try archives.append(ra, .{ .path = path });
+        } else |_| {
+            var rand: [8]u8 = undefined;
+            io.random(&rand);
+            const tmp_dir = try std.fs.path.join(ra, &.{ o.global_cache, "zap", "tmp", try std.fmt.allocPrint(s, "{s}-{s}", .{ rl.name, &std.fmt.bytesToHex(rand, .lower) }) });
+            try Io.Dir.cwd().createDirPath(io, tmp_dir);
+            try archives.append(ra, .{ .path = path, .tmp_dir = tmp_dir, .first = sources.len + first, .len = runtime.items.len - first });
+        }
+    };
+    b.archives = archives.items;
+    b.jobs = try gpa.alloc(Batch.Job, sources.len + runtime.items.len);
+    for (b.jobs) |*j| j.arena = .init(gpa);
 
     var misses: usize = 0;
-    for (sources, b.jobs) |src, *j| {
+    for (sources, b.jobs[0..sources.len]) |src, *j| {
         const arena = j.arena.allocator();
         var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(arena, &.{ "zig", "clang", src.path });
-        try argv.appendSlice(arena, common.before_dep);
-        // glibc requires PIC (`requiresPic`); else the module's, default off.
-        const pic = o.link_libc or (src.flags.pic orelse false);
-        try argv.appendSlice(arena, &.{ if (o.pie) "-fPIE" else "-fno-PIE", if (pic) "-fPIC" else "-fno-PIC", "-gdwarf-4", "-gdwarf32", "-fno-lto" });
-        const dep_at = argv.items.len;
-        try moduleArgs(arena, &argv, common, src.flags, o);
-        try argv.appendSlice(arena, common.features);
+        const dep_at = try appendArgs(arena, &argv, common, src.path, .{
+            .lang = src.lang,
+            .sanitize_c = src.flags.sanitize_c orelse .full,
+            .red_zone = src.flags.red_zone orelse true,
+            .no_builtin = src.flags.no_builtin orelse false,
+            .stack_protector = o.link_libc and (src.flags.stack_protector orelse o.stack_protector),
+            // glibc requires PIC (`requiresPic`); else the module's, default off.
+            .pic = o.link_libc or (src.flags.pic orelse false),
+            .pie = o.pie,
+            .function_sections = o.function_sections,
+            .data_sections = o.data_sections,
+            .unwind_tables = o.unwind_tables,
+            .link_libc = o.link_libc,
+            .native = true,
+            .libcpp = o.link_libcpp,
+            .libunwind = o.link_libcpp,
+        });
         try argv.appendSlice(arena, o.global_cc_argv);
         try argv.appendSlice(arena, src.cc_argv);
         try argv.appendSlice(arena, src.extra_flags);
@@ -325,6 +466,20 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         };
         misses += 1;
     }
+    for (archives.items, 0..) |a, ai| if (a.len != 0) for (runtime.items[a.first - sources.len ..][0..a.len], b.jobs[a.first..][0..a.len]) |rj, *j| {
+        j.* = .{
+            .arena = j.arena,
+            .source = rj.argv[2],
+            .abs_source = rj.argv[2],
+            .argv = rj.argv,
+            .dep_at = rj.dep_at,
+            .record_path = "",
+            .out_path = try std.fs.path.join(ra, &.{ a.tmp_dir, try std.fmt.allocPrint(ra, "{s}.o", .{std.fs.path.stem(rj.argv[2])}) }),
+            .archive = @intCast(ai),
+            .start_ns = start_ns,
+        };
+        misses += 1;
+    };
     // Only a build that compiles C needs upstream zig, and checks its
     // version once.
     b.zig = if (misses == 0) .{ .path = "" } else if (zig.found) |p|
@@ -359,61 +514,334 @@ pub fn cTarget(io: Io, glibc_version: ?std.SemanticVersion) !std.Target {
     return std.zig.system.resolveTargetQuery(io, query);
 }
 
+/// The arguments that depend only on the target and the lib directory.
 const Common = struct {
-    /// From `--no-default-config` to before the depfile.
-    before_dep: []const []const u8,
-    /// glibc's macro and the include directories.
-    includes: []const []const u8,
+    triple: []const u8,
+    /// `-D__GLIBC_MINOR__=<n>` with `-lc`.
+    glibc_minor: []const u8,
+    lib: []const u8,
+    /// The glibc headers' `-isystem` pairs, with `-lc`.
+    libc_includes: []const []const u8,
+    /// The native include directories' `-isystem` pairs, for the user's
+    /// sources only, as upstream's runtime libraries have none.
+    native_includes: []const []const u8,
+    /// libc++'s configuration (`libcxx.addCxxArgs`), for every source of a
+    /// `-lc++` compilation and for libc++'s and libc++abi's own.
+    cxx_defines: []const []const u8,
     /// `-Xclang -target-cpu ...` and every feature.
     features: []const []const u8,
+    /// The same for the assembler (`-Xclangas`), for assembly sources.
+    asm_features: []const []const u8,
 };
 
-/// The arguments every source shares, in upstream's order
-/// (`addCCArgs`, `addCommonCCArgs`).
 fn commonArgs(arena: std.mem.Allocator, target: *const std.Target, lib: []const u8, o: Options) !Common {
-    var before: std.ArrayList([]const u8) = .empty;
-    try before.appendSlice(arena, &.{ "--no-default-config", "-fno-caret-diagnostics", "-target", try std.zig.llvm.Builder.tripleForTarget(arena, target) });
-    var includes: std.ArrayList([]const u8) = .empty;
-    if (o.link_libc) try includes.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{o.glibc_version.?.minor}));
-    try includes.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ lib, "include" }) });
+    var libc_includes: std.ArrayList([]const u8) = .empty;
     if (o.link_libc) {
         const dirs = try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, target);
-        for (dirs.libc_include_dir_list) |d| try includes.appendSlice(arena, &.{ "-isystem", d });
+        for (dirs.libc_include_dir_list) |d| try libc_includes.appendSlice(arena, &.{ "-isystem", d });
     }
+    var native_includes: std.ArrayList([]const u8) = .empty;
+    for (o.native_includes) |d| try native_includes.appendSlice(arena, &.{ "-isystem", d });
     var features: std.ArrayList([]const u8) = .empty;
+    var asm_features: std.ArrayList([]const u8) = .empty;
     try features.appendSlice(arena, &.{ "-Xclang", "-target-cpu", "-Xclang", target.cpu.model.llvm_name.? });
+    try asm_features.appendSlice(arena, &.{ "-Xclangas", "-target-cpu", "-Xclangas", target.cpu.model.llvm_name.? });
     for (target.cpu.arch.allFeaturesList(), 0..) |feature, i| {
         const name = feature.llvm_name orelse continue;
         if (std.mem.startsWith(u8, name, "soft-float") or std.mem.startsWith(u8, name, "hard-float") or std.mem.startsWith(u8, name, "x32")) continue;
         const on = target.cpu.features.isEnabled(@intCast(i));
-        try features.appendSlice(arena, &.{ "-Xclang", "-target-feature", "-Xclang", try std.fmt.allocPrint(arena, "{c}{s}", .{ "-+"[@intFromBool(on)], name }) });
+        const f = try std.fmt.allocPrint(arena, "{c}{s}", .{ "-+"[@intFromBool(on)], name });
+        try features.appendSlice(arena, &.{ "-Xclang", "-target-feature", "-Xclang", f });
+        try asm_features.appendSlice(arena, &.{ "-Xclangas", "-target-feature", "-Xclangas", f });
     }
-    return .{ .before_dep = before.items, .includes = includes.items, .features = features.items };
+    // As upstream's `addCxxArgs` with the runtime libraries' optimization
+    // (`compilerRtOptMode`: ReleaseFast on this target, for Debug too).
+    var cxx: std.ArrayList([]const u8) = .empty;
+    try cxx.appendSlice(arena, &.{
+        "-D_LIBCPP_ABI_VERSION=1",
+        "-D_LIBCPP_ABI_NAMESPACE=__1",
+        if (o.single_threaded) "-D_LIBCPP_HAS_THREADS=0" else "-D_LIBCPP_HAS_THREADS=1",
+        "-D_LIBCPP_HAS_MONOTONIC_CLOCK",
+        "-D_LIBCPP_HAS_TERMINAL",
+        "-D_LIBCPP_HAS_MUSL_LIBC=0",
+        "-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS",
+        "-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS",
+        "-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=0",
+        "-D_LIBCPP_HAS_FILESYSTEM=1",
+        "-D_LIBCPP_HAS_RANDOM_DEVICE",
+        "-D_LIBCPP_HAS_LOCALIZATION",
+        "-D_LIBCPP_HAS_UNICODE",
+        "-D_LIBCPP_HAS_WIDE_CHARACTERS",
+        "-D_LIBCPP_HAS_NO_STD_MODULES",
+        "-D_LIBCPP_HAS_TIME_ZONE_DATABASE",
+        "-D_LIBCPP_PSTL_BACKEND_SERIAL",
+        "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE",
+        "-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_IGNORE",
+    });
+    // glibc 2.16 introduced aligned_alloc.
+    if (o.glibc_version) |v| if (v.order(.{ .major = 2, .minor = 16, .patch = 0 }) == .lt) try cxx.append(arena, "-D_LIBCPP_HAS_LIBRARY_ALIGNED_ALLOCATION=0");
+    return .{
+        .triple = try std.zig.llvm.Builder.tripleForTarget(arena, target),
+        .glibc_minor = if (o.glibc_version) |v| try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{v.minor}) else "",
+        .lib = lib,
+        .libc_includes = libc_includes.items,
+        .native_includes = native_includes.items,
+        .cxx_defines = cxx.items,
+        .features = features.items,
+        .asm_features = asm_features.items,
+    };
 }
 
-/// The arguments after the depfile up to the CPU, some of which depend on
-/// the module's options.
-fn moduleArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common: Common, flags: Flags, o: Options) !void {
+/// How one compile is configured: its language and its module's options,
+/// as upstream's `addCCArgs` reads them.
+const Mode = struct {
+    lang: Lang,
+    /// The runtime libraries' optimization (`compilerRtOptMode`), else
+    /// Debug.
+    fast: bool = false,
+    sanitize_c: std.zig.SanitizeC,
+    red_zone: bool,
+    no_builtin: bool,
+    /// `-fstack-protector-strong` with upstream's buffer size.
+    stack_protector: bool = false,
+    pic: bool,
+    pie: bool,
+    function_sections: bool,
+    data_sections: bool,
+    unwind_tables: std.lang.UnwindTables,
+    link_libc: bool,
+    /// The native include directories (`Common.native_includes`).
+    native: bool = false,
+    /// libc++'s include directories and configuration (`-lc++`).
+    libcpp: bool,
+    /// libunwind's include directory, which `-lc++` links on Linux.
+    libunwind: bool,
+};
+
+/// Appends `zig clang <path>` and upstream's arguments for it in
+/// upstream's order (`addCCArgs`, `addCommonCCArgs`) up to the CPU
+/// features, and returns where the depfile arguments go.
+fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common: Common, path: []const u8, m: Mode) !usize {
+    try argv.appendSlice(arena, &.{ "zig", "clang", path, "--no-default-config" });
+    if (m.lang != .asm_cpp) try argv.append(arena, "-fno-caret-diagnostics");
+    try argv.appendSlice(arena, &.{ "-target", common.triple });
+    try argv.appendSlice(arena, &.{ if (m.pie) "-fPIE" else "-fno-PIE", if (m.pic) "-fPIC" else "-fno-PIC", "-gdwarf-4", "-gdwarf32", "-fno-lto" });
+    const dep_at = argv.items.len;
     try argv.appendSlice(arena, &.{ "-fhosted", "-nostdinc" });
-    try argv.appendSlice(arena, common.includes);
-    try argv.append(arena, "-fno-spell-checking");
-    switch (flags.sanitize_c orelse .full) {
-        .off => {},
-        .trap => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fsanitize-trap=undefined" }),
-        .full => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fno-sanitize=vptr", "-fno-sanitize=function" }),
+    if (m.lang == .cpp) try argv.append(arena, "-nostdinc++");
+    if (m.fast) try argv.append(arena, "-DNDEBUG");
+    if (m.link_libc) try argv.append(arena, common.glibc_minor);
+    if (m.libcpp) {
+        try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libcxx", "include" }), "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libcxxabi", "include" }) });
+        try argv.appendSlice(arena, common.cxx_defines);
     }
-    try argv.appendSlice(arena, &.{ "-O0", if (flags.red_zone orelse true) "-mred-zone" else "-mno-red-zone", "-fno-omit-frame-pointer" });
+    try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "include" }) });
+    if (m.link_libc) try argv.appendSlice(arena, common.libc_includes);
+    if (m.native) try argv.appendSlice(arena, common.native_includes);
+    if (m.libunwind) try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libunwind", "include" }) });
+    if (m.lang != .asm_cpp) {
+        try argv.append(arena, "-fno-spell-checking");
+        if (m.fast) try argv.append(arena, "-Werror=date-time");
+        switch (m.sanitize_c) {
+            .off => {},
+            .trap => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fsanitize-trap=undefined" }),
+            .full => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fno-sanitize=vptr", "-fno-sanitize=function" }),
+        }
+        try argv.append(arena, if (m.fast) "-O2" else "-O0");
+    }
+    try argv.appendSlice(arena, &.{ if (m.red_zone) "-mred-zone" else "-mno-red-zone", "-fno-omit-frame-pointer" });
     // Upstream's Debug backend for Zig code has no stack protector, which
-    // turns it off for the compilation's C too (`Module.create`).
-    try argv.append(arena, "-fno-stack-protector");
-    try argv.append(arena, if (flags.no_builtin orelse false) "-fno-builtin" else "-fbuiltin");
-    try argv.append(arena, if (o.function_sections) "-ffunction-sections" else "-fno-function-sections");
-    try argv.append(arena, if (o.data_sections) "-fdata-sections" else "-fno-data-sections");
-    switch (o.unwind_tables) {
+    // turns it off for the compilation's C too (`Module.create`); the
+    // runtime libraries have none either.
+    if (m.stack_protector) try argv.appendSlice(arena, &.{ "-fstack-protector-strong", "--param", "ssp-buffer-size=4" }) else try argv.append(arena, "-fno-stack-protector");
+    try argv.append(arena, if (m.no_builtin) "-fno-builtin" else "-fbuiltin");
+    try argv.append(arena, if (m.function_sections) "-ffunction-sections" else "-fno-function-sections");
+    try argv.append(arena, if (m.data_sections) "-fdata-sections" else "-fno-data-sections");
+    switch (m.unwind_tables) {
         .none => try argv.appendSlice(arena, &.{ "-fno-unwind-tables", "-fno-asynchronous-unwind-tables" }),
         .sync => try argv.appendSlice(arena, &.{ "-fno-asynchronous-unwind-tables", "-funwind-tables" }),
         .async => try argv.append(arena, "-fasynchronous-unwind-tables"),
     }
+    try argv.appendSlice(arena, common.features);
+    if (m.lang == .asm_cpp) try argv.appendSlice(arena, common.asm_features);
+    return dep_at;
+}
+
+// The C++ runtime libraries, as upstream's `src/libs/libcxx.zig` and
+// `src/libs/libunwind.zig` build them for x86_64-linux-gnu.
+// Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
+
+const RuntimeLib = struct {
+    /// `lib<name>.a`.
+    name: []const u8,
+    /// The sources, relative to the lib directory.
+    dir: []const u8,
+    files: []const []const u8,
+    /// Sources only a multi-threaded build has.
+    thread_files: []const []const u8 = &.{},
+};
+
+/// In link order, as upstream links them after the program's objects.
+const runtime_libs = [_]RuntimeLib{
+    .{ .name = "c++", .dir = "libcxx", .files = &libcxx_base_files, .thread_files = &libcxx_thread_files },
+    .{ .name = "c++abi", .dir = "libcxxabi", .files = &libcxxabi_files },
+    .{ .name = "unwind", .dir = "libunwind", .files = &unwind_files },
+};
+
+const libcxxabi_files = [_][]const u8{
+    "src/cxa_aux_runtime.cpp",
+    "src/cxa_default_handlers.cpp",
+    "src/cxa_demangle.cpp",
+    "src/cxa_exception_storage.cpp",
+    "src/cxa_guard.cpp",
+    "src/cxa_handlers.cpp",
+    "src/cxa_vector.cpp",
+    "src/cxa_virtual.cpp",
+    "src/stdlib_exception.cpp",
+    "src/stdlib_stdexcept.cpp",
+    "src/stdlib_typeinfo.cpp",
+    "src/stdlib_new_delete.cpp",
+    "src/abort_message.cpp",
+    "src/fallback_malloc.cpp",
+    "src/private_typeinfo.cpp",
+    "src/cxa_exception.cpp",
+    "src/cxa_personality.cpp",
+    // A single-threaded build leaves this one out.
+    "src/cxa_thread_atexit.cpp",
+};
+
+// Upstream's list without `src/support/win32/` (Windows only) and
+// `src/filesystem/int128_builtins.cpp`, which upstream omits.
+const libcxx_base_files = [_][]const u8{
+    "src/algorithm.cpp",
+    "src/any.cpp",
+    "src/bind.cpp",
+    "src/call_once.cpp",
+    "src/charconv.cpp",
+    "src/chrono.cpp",
+    "src/error_category.cpp",
+    "src/exception.cpp",
+    "src/expected.cpp",
+    "src/filesystem/directory_entry.cpp",
+    "src/filesystem/directory_iterator.cpp",
+    "src/filesystem/filesystem_clock.cpp",
+    "src/filesystem/filesystem_error.cpp",
+    "src/filesystem/operations.cpp",
+    "src/filesystem/path.cpp",
+    "src/fstream.cpp",
+    "src/functional.cpp",
+    "src/hash.cpp",
+    "src/ios.cpp",
+    "src/ios.instantiations.cpp",
+    "src/iostream.cpp",
+    "src/locale.cpp",
+    "src/memory.cpp",
+    "src/memory_resource.cpp",
+    "src/new.cpp",
+    "src/new_handler.cpp",
+    "src/new_helpers.cpp",
+    "src/optional.cpp",
+    "src/ostream.cpp",
+    "src/print.cpp",
+    "src/random.cpp",
+    "src/random_shuffle.cpp",
+    "src/regex.cpp",
+    "src/ryu/d2fixed.cpp",
+    "src/ryu/d2s.cpp",
+    "src/ryu/f2s.cpp",
+    "src/stdexcept.cpp",
+    "src/string.cpp",
+    "src/strstream.cpp",
+    "src/system_error.cpp",
+    "src/typeinfo.cpp",
+    "src/valarray.cpp",
+    "src/variant.cpp",
+    "src/vector.cpp",
+    "src/verbose_abort.cpp",
+};
+
+const libcxx_thread_files = [_][]const u8{
+    "src/atomic.cpp",
+    "src/barrier.cpp",
+    "src/condition_variable.cpp",
+    "src/condition_variable_destructor.cpp",
+    "src/future.cpp",
+    "src/mutex.cpp",
+    "src/mutex_destructor.cpp",
+    "src/shared_mutex.cpp",
+    "src/thread.cpp",
+};
+
+const unwind_files = [_][]const u8{
+    "src/libunwind.cpp",
+    "src/Unwind-EHABI.cpp",
+    "src/Unwind-seh.cpp",
+    "src/UnwindLevel1.c",
+    "src/UnwindLevel1-gcc-ext.c",
+    "src/Unwind-sjlj.c",
+    "src/Unwind-wasm.c",
+    "src/UnwindRegistersRestore.S",
+    "src/UnwindRegistersSave.S",
+    "src/gcc_personality_v0.c",
+};
+
+const RuntimeJob = struct { argv: []const []const u8, dep_at: usize };
+
+/// Appends the compiles of runtime library `rl`, with the flags upstream's
+/// sub-compilation gives each source: its root module's (ReleaseFast, PIC,
+/// no sanitizer, sections, asynchronous unwind tables, glibc), then the
+/// library's own.
+fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: RuntimeLib, common: Common, lib: []const u8, o: Options) !void {
+    const join = std.fs.path.join;
+    const cxx_include = try join(arena, &.{ lib, "libcxx", "include" });
+    const cxxabi_include = try join(arena, &.{ lib, "libcxxabi", "include" });
+    const cxx_src_include = try join(arena, &.{ lib, "libcxx", "src" });
+    const threads = !o.single_threaded;
+    for ([2][]const []const u8{ rl.files, if (threads) rl.thread_files else &.{} }) |files| for (files) |file| {
+        const is_cxxabi = std.mem.eql(u8, rl.name, "c++abi");
+        if (is_cxxabi and !threads and std.mem.eql(u8, file, "src/cxa_thread_atexit.cpp")) continue;
+        const path = try join(arena, &.{ lib, rl.dir, file });
+        const lang: Lang = if (std.mem.endsWith(u8, file, ".S")) .asm_cpp else if (std.mem.endsWith(u8, file, ".c")) .c else .cpp;
+        var argv: std.ArrayList([]const u8) = .empty;
+        const dep_at = try appendArgs(arena, &argv, common, path, .{
+            .lang = lang,
+            .fast = true,
+            .sanitize_c = .off,
+            .red_zone = true,
+            .no_builtin = false,
+            .pic = true,
+            .pie = false,
+            .function_sections = true,
+            .data_sections = true,
+            .unwind_tables = .async,
+            .link_libc = true,
+            .libcpp = false,
+            .libunwind = false,
+        });
+        if (std.mem.eql(u8, rl.name, "unwind")) {
+            switch (lang) {
+                .c => try argv.appendSlice(arena, &.{ "-std=c99", "-fexceptions" }),
+                .cpp => try argv.appendSlice(arena, &.{ "-fno-exceptions", "-fno-rtti" }),
+                .asm_cpp => {},
+            }
+            try argv.appendSlice(arena, &.{ "-w", "-I", try join(arena, &.{ lib, "libunwind", "include" }), "-D_LIBUNWIND_HIDE_SYMBOLS", "-Wa,--noexecstack", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-fvisibility-global-new-delete=force-hidden", "-D_LIBUNWIND_IS_NATIVE_ONLY" });
+            // The compilation's own mode, which is Debug.
+            try argv.append(arena, "-D_DEBUG");
+            if (!threads) try argv.append(arena, "-D_LIBUNWIND_HAS_NO_THREADS");
+        } else if (is_cxxabi) {
+            try argv.appendSlice(arena, common.cxx_defines);
+            try argv.appendSlice(arena, &.{ "-w", "-DNDEBUG", "-D_LIBCPP_BUILDING_LIBRARY", "-D_LIBCXXABI_BUILDING_LIBRARY" });
+            if (!threads) try argv.append(arena, "-D_LIBCXXABI_HAS_NO_THREADS");
+            if (o.glibc_version.?.order(.{ .major = 2, .minor = 18, .patch = 0 }) != .lt) try argv.append(arena, "-DHAVE___CXA_THREAD_ATEXIT_IMPL");
+            try argv.appendSlice(arena, &.{ "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-nostdinc++", "-fstrict-aliasing", "-std=c++23" });
+            try argv.appendSlice(arena, &.{ "-I", cxxabi_include, "-I", cxx_include, "-I", cxx_src_include });
+        } else {
+            try argv.appendSlice(arena, common.cxx_defines);
+            try argv.appendSlice(arena, &.{ "-w", "-DNDEBUG", "-DLIBC_NAMESPACE=__llvm_libc_common_utils", "-D_LIBCPP_BUILDING_LIBRARY", "-DLIBCXX_BUILDING_LIBCXXABI", "-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-faligned-allocation", "-nostdinc++", "-std=c++23" });
+            try argv.appendSlice(arena, &.{ "-I", cxx_include, "-I", cxxabi_include, "-I", cxx_src_include, "-I", try join(arena, &.{ lib, "libcxx", "libc" }) });
+        }
+        try out.append(arena, .{ .argv = argv.items, .dep_at = dep_at });
+    };
 }
 
 const Found = struct { found: ?[]const u8, looked: []const u8 };

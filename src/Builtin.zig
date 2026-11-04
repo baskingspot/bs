@@ -32,6 +32,8 @@ pub const Options = struct {
     /// code, which glibc's crt1.o would provide, comes with it
     /// (`glibc_start`).
     glibc: ?std.SemanticVersion = null,
+    /// `-lc++`.
+    link_libcpp: bool = false,
 };
 
 /// zap's start code for executables that link glibc, in place of glibc's
@@ -163,7 +165,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const mode = optimize;
     \\pub const optimize: std.lang.Optimize = .debug;
     \\pub const link_libc = {s};
-    \\pub const link_libcpp = false;
+    \\pub const link_libcpp = {s};
     \\pub const have_error_return_tracing = true;
     \\pub const valgrind_support = true;
     \\pub const sanitize_thread = false;
@@ -187,6 +189,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         glibc.patch,
         if (libc) ".init(\"/lib64/ld-linux-x86-64.so.2\")" else ".none",
         if (libc) "true" else "false",
+        if (opts.link_libcpp) "true" else "false",
         if (opts.fuzz) "true" else "false",
         if (opts.pic or libc) "true" else "false",
         if (opts.pie) "true" else "false",

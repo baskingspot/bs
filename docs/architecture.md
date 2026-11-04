@@ -5752,7 +5752,7 @@ libraries as inputs. To be agreed with that thread.
   default). A root file given by position takes what is left; else what
   is left is `global_cc_argv`. `-cflags ... --` applies to the C files
   after it. `-ffunction-sections`, `-fdata-sections`, `-fPIE` and
-  `--verbose-cc` are global. Other C, C++ and assembly sources, and C
+  `--verbose-cc` are global. Assembly sources, and C
   sources in `build-obj` and `build-lib -dynamic` (which would need the
   objects linked into the output) stay `[unsupported]`.
 - **Static libraries** (2026-11-04), as upstream's: the archive holds
@@ -5778,9 +5778,9 @@ libraries as inputs. To be agreed with that thread.
   version (native: detected, with or without `-lc`, as upstream's native
   target; `x86_64-linux`: no libc), `-fPIC` with `-lc`
   (`requiresPic`), glibc's headers from the zig lib directory (decision
-  1, as translate-c), `-fno-stack-protector` always (upstream's Debug
+  1, as translate-c), `-fno-stack-protector` (upstream's Debug
   backend for Zig has none, which turns it off for the compilation's C
-  too), the sanitizer flags of `sanitize_c`, every CPU feature, then
+  too; step 4 has the exceptions), the sanitizer flags of `sanitize_c`, every CPU feature, then
   `global_cc_argv`, the module's `cc_argv` and the file's `-cflags`.
   zap leaves out `--serialize-diagnostics` and reads Clang's text
   errors instead (`-fno-caret-diagnostics`: `path:line:col: error:`,
@@ -5834,6 +5834,80 @@ libraries as inputs. To be agreed with that thread.
   the archives of the `zig cc` variant, and `libc.c` as the C source of
   a `-lc` program, with ubsan on, and expects the output of upstream's
   link of the same inputs.
+
+### Step 4: C++, as built (2026-11-04; approved in AGENTS.md aba67e5)
+
+zap compiles no C++ either: `.C`, `.cc`, `.cpp`, `.cxx`, `.c++` and
+`.stub` sources (upstream's `FileExt.cpp`) go to upstream `zig clang`
+like C sources (`CSource.Lang`), with the same records, cache inputs and
+diagnostics.
+
+- **Arguments** (`CSource.appendArgs`, one function for C, C++ and
+  libunwind's assembly, in upstream's `addCCArgs` order): C++ adds
+  `-nostdinc++`; with `-lc++`, every source (C too, as upstream) gets
+  `-isystem` libcxx/include and libcxxabi/include and libc++'s
+  configuration (`libcxx.addCxxArgs`: ABI version and namespace,
+  threads, `_LIBCPP_PSTL_BACKEND_SERIAL`, and the runtime libraries'
+  hardening, `_LIBCPP_HARDENING_MODE_NONE` with the `IGNORE` assertion
+  semantic, since upstream derives it from `compilerRtOptMode`, which is
+  ReleaseFast on this target even in Debug), then libunwind's include
+  directory after libc's. All 83 command lines of a `-lc++` executable
+  (libc++, libc++abi, libunwind and the user's source) equal upstream's
+  `--verbose-cc` for `-target x86_64-linux-gnu -lc++` apart from the
+  CPU features (zap's baseline) and, natively, the libc include
+  directories (decision 1); monstar's simdutf, highway and ghostty-vt's
+  `src/simd/*.cpp` match the same way.
+- **Stack protector**: as upstream's `Module.create`, a C or C++ source
+  gets `-fstack-protector-strong --param ssp-buffer-size=4` when the
+  compilation links libc and its Zig code has no self-hosted backend: a
+  library of C only (`c_only`), or `-fllvm`, which zap otherwise
+  ignores; a module's `-fstack-protector`/`-fno-stack-protector` wins.
+  Otherwise `-fno-stack-protector`, as before.
+- **Native include directories** (upstream's
+  `native_system_include_paths`): a native build without `--sysroot`
+  that names system libraries (`-l<name>` other than libc's and libc++'s)
+  gives its C and C++ sources the `std.zig.system.NativePaths` include
+  directories after libc's, as it already searched their library
+  directories. This was a gap of step 3's C sources too.
+- **`-lc++`**, and `-lstdc++`, `-lc++abi`, `-lsupc++` (upstream's
+  `is_libcpp_lib_name`), imply `-lc` and set `builtin.link_libcpp` and
+  the `--listen=-` configuration's `link_libcpp`/`link_libunwind`. An
+  executable (and `zap test`/`run`) links libc++.a, libc++abi.a and
+  libunwind.a; a static library or object only takes the flags, as
+  upstream links the runtime libraries only into executables and shared
+  libraries. Like C sources, `-lc++` roots ubsan_rt and ssp.
+- **Runtime libraries** (`CSource.runtime_libs`, copied from upstream's
+  `src/libs/libcxx.zig` and `libunwind.zig` with their MIT notice): each
+  source with upstream's sub-compilation flags (ReleaseFast, PIC, no
+  sanitizer, function and data sections, asynchronous unwind tables,
+  then the library's own defines and visibility). They compile in the
+  same Clang batch as the user's sources, at
+  `<global>/zap/tmp/<lib>-<random>/`, and `Batch.wait` writes
+  `<global>/zap/o/<key>/lib<name>.a` (`Archive.write`, atomically) and
+  removes the directory. The key hashes upstream zig's identity, the
+  library name and every compile's arguments, not zap's identity (a new
+  zap builds the same library), and trusts the lib directory, as the
+  build runner's translate-c does. A build whose archives exist runs
+  nothing for them. The archives follow the C objects as link inputs
+  (`ElfInput.addArchive`; `Emit.sync`) and as the cache's
+  `link_objects`, so an unchanged rebuild stats them and skips the link.
+  Upstream links them as `libunwind libc++ <objects> libc++abi`; zap's
+  archives resolve as one group (`ElfInput.pull` loops until nothing more
+  is pulled), so the order does not change which members load.
+- **Exceptions** need the objects' `.eh_frame` and `.gcc_except_table`
+  and `__dso_handle`, which are the link thread's stage B (`c-frames`).
+  test/link_input/cxx.cpp throws through three frames with a
+  `std::string` cleanup, catches by type, reads `typeid(...).name()`,
+  and has a static constructor and `thread_local` values with dynamic
+  initializers; build.zig's "zap build-exe -lc++ with a C++ source"
+  expects upstream's output.
+- **Cost** (ReleaseFast, test/link_input's `cxx_main.zig` with `cxx.cpp`,
+  `-lc++ -target x86_64-linux-gnu`, against upstream): empty caches
+  11.7 s (upstream 41.7 s, which also builds compiler_rt, glibc's stubs
+  and its own Zig); a new local cache with a warm global one 0.75 s
+  (1.04 s); unchanged 0.007 s (0.39 s); a `.cpp` edit 0.62–0.68 s
+  (0.90–1.07 s), nearly all of it Clang on libc++'s headers; a Zig edit
+  0.12 s (0.39 s). Builds without C++ do not change.
 
 ### Steps and checks
 

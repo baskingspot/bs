@@ -993,6 +993,21 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);
+    // A C++ source with -lc++: libc++, libc++abi and libunwind built from
+    // the lib directory as upstream builds them, exceptions through C++
+    // frames, RTTI, a static constructor and thread_local.
+    const cxx_exe = b.addRunArtifact(zap);
+    cxx_exe.setName("zap build-exe -lc++ with a C++ source");
+    cxx_exe.addArgs(&.{ "build-exe", "-lc++", "-target", "x86_64-linux-gnu" });
+    cxx_exe.addFileArg(b.path("test/link_input/cxx_main.zig"));
+    cxx_exe.addFileArg(b.path("test/link_input/cxx.cpp"));
+    cxx_exe.setEnvironmentVariable("ZAP_ZIG", zig);
+    const cxx_run = std.Build.Step.Run.create(b, "run zap -lc++ build of a C++ source");
+    cxx_run.addFileArg(cxx_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    cxx_run.addCheck(.{ .expect_stdout_exact = "caught: boom at depth 4\ntype: 7Derived\nctor 42, tls tls42!, sum 6\n" });
+    cxx_run.addCheck(.{ .expect_stderr_exact = "result 151, link_libcpp true\n" });
+    cxx_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&cxx_run.step);
 
     // GCC's -fPIE reads glibc's data PC-relative: the executable copies
     // `stdout` and `environ` (with its aliases, which glibc's start code
