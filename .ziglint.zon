@@ -1,0 +1,8 @@
+.{
+    .paths = .{ "build.zig", "src", "tools", "bench" },
+    .rules = .{
+        // bs keeps long lines: tables of flags and messages read better
+        // unwrapped.
+        .Z024 = .{ .enabled = false },
+    },
+}
