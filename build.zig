@@ -1373,6 +1373,18 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         r.addCheck(.{ .expect_stderr_exact = "44 bee 6 712 810\nthread: 712 810\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
+        // An executable that defines the library's exported thread-locals
+        // preempts them.
+        const preempt_host = b.addSystemCommand(&.{ zig, "cc" });
+        preempt_host.addFileArg(b.path("test/link_input/so_preempt.c"));
+        preempt_host.addFileArg(so_file);
+        const preempt = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
+        preempt.setName("run so_preempt (thread-locals preempting a zap shared library's)");
+        preempt.addFileArg(so_file);
+        preempt.addFileArg(preempt_host.addPrefixedOutputFileArg("-o", "so_preempt"));
+        preempt.addCheck(.{ .expect_stdout_exact = "100012 200310 1000 2003\n" });
+        preempt.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&preempt.step);
     }
     // An executable of C only, as upstream builds one: its main is C's.
     {

@@ -259,6 +259,14 @@ pub const Reloc = extern struct {
         /// R_X86_64_IRELATIVE, addend S + A), in an image the loader
         /// relocates: the slot `jmp [rip + slot]` stubs read.
         x86_64_irelative,
+        /// A shared object's exported thread-local S, which an executable
+        /// may preempt: the loader writes S's module ID (ELF
+        /// R_X86_64_DTPMOD64 against S), S's offset in it (DTPOFF64), and
+        /// S's 16-byte TLS descriptor (TLSDESC). S + A must be the address
+        /// of an export with default visibility.
+        x86_64_dtpmod64_sym,
+        x86_64_dtpoff64_sym,
+        x86_64_tlsdesc_sym,
     };
 };
 

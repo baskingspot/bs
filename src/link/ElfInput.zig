@@ -1003,7 +1003,7 @@ fn Converter(comptime Ctx: type) type {
                     }
                     const t = try c.target(r.r_sym(), 0) orelse return 0;
                     if (try c.sharedTlsImport(r, t)) return 0;
-                    try c.add(off, .x86_64_pc32, .{ .key = try c.tlsPair(t, .x86_64_tlsdesc), .offset = 0 }, r.r_addend);
+                    try c.add(off, .x86_64_pc32, .{ .key = try c.tlsPair(t, .x86_64_tlsdesc, try c.preemptible(r.r_sym())), .offset = 0 }, r.r_addend);
                     return 0;
                 },
                 .GOTTPOFF, .TPOFF32, .@"32", .@"32S" => {
@@ -1108,7 +1108,7 @@ fn Converter(comptime Ctx: type) type {
                     // rdi points at a (module, offset) pair the loader
                     // completes (`tlsPair`), and the call stays.
                     if (c.in.shared) {
-                        try c.add(off, .x86_64_pc32, .{ .key = try c.tlsPair(t, .x86_64_dtpmod64), .offset = 0 }, r.r_addend);
+                        try c.add(off, .x86_64_pc32, .{ .key = try c.tlsPair(t, .x86_64_dtpmod64, try c.preemptible(r.r_sym())), .offset = 0 }, r.r_addend);
                         return 0;
                     }
                     // data16 lea rdi, [rip + x@tlsgd]; data16 data16 rex.W
@@ -1241,13 +1241,27 @@ fn Converter(comptime Ctx: type) type {
             return true;
         }
 
-        /// A shared object's 16-byte pair for its own thread-local `t`,
-        /// which the loader completes: with `.x86_64_dtpmod64`, the
-        /// (module, offset) pair `__tls_get_addr` takes, whose offset in
-        /// the module's block is known; with `.x86_64_tlsdesc`, its TLS
-        /// descriptor. Content-addressed, so references to one variable
-        /// share it.
-        fn tlsPair(c: *C, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
+        /// Whether symbol `s`, a thread-local the shared object defines,
+        /// is one it exports with default visibility
+        /// (`Inputs.dynamicExports`), which an executable may preempt.
+        fn preemptible(c: *C, s: u32) !bool {
+            const sym = c.o.syms[s];
+            if (s < c.o.first_global or sym.st_bind() == elf.STB_LOCAL) return false;
+            const name = c.o.symName(sym);
+            if (try c.ctx.zigExport(name) != null) return false;
+            const d = c.in.defs.get(name) orelse return false;
+            // STV_DEFAULT 0.
+            return c.in.objects.items[d.object].syms[d.sym].st_other & 3 == 0;
+        }
+
+        /// A shared object's 16-byte pair for its thread-local `t`, which
+        /// the loader completes: with `.x86_64_dtpmod64`, the (module,
+        /// offset) pair `__tls_get_addr` takes; with `.x86_64_tlsdesc`,
+        /// its TLS descriptor. Relative to the symbol if `preempt`, so
+        /// that an executable's definition wins as upstream's; else the
+        /// module's own, whose offset in its block is known.
+        /// Content-addressed, so references to one variable share it.
+        fn tlsPair(c: *C, t: Target, kind: Atom.Reloc.Kind, preempt: bool) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
             const targets = try arena.dupe(SymbolKey, &.{t.key});
             const off = std.math.cast(i32, t.offset) orelse {
@@ -1255,7 +1269,9 @@ fn Converter(comptime Ctx: type) type {
                 return t.key;
             };
             const relocs = if (kind == .x86_64_tlsdesc)
-                try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_tlsdesc, 0, off)})
+                try arena.dupe(Atom.Reloc, &.{.init(0, if (preempt) .x86_64_tlsdesc_sym else .x86_64_tlsdesc, 0, off)})
+            else if (preempt)
+                try arena.dupe(Atom.Reloc, &.{ .init(0, .x86_64_dtpmod64_sym, 0, off), .init(8, .x86_64_dtpoff64_sym, 0, off) })
             else
                 try arena.dupe(Atom.Reloc, &.{ .init(0, .x86_64_dtpmod64, 0, 0), .init(8, .x86_64_dtpoff32, 0, off) });
             const zeros: []const u8 = &@as([16]u8, @splat(0));

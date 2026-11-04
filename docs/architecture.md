@@ -6470,10 +6470,13 @@ libraries as inputs. To be agreed with that thread.
   (module, offset) pair the loader completes (R_X86_64_DTPMOD64,
   `x86_64_dtpmod64`), TLSLD the module's pair, and a TLS descriptor
   (GCC's `-mtls-dialect=gnu2`) a 16-byte descriptor (R_X86_64_TLSDESC
-  with no symbol, `x86_64_tlsdesc`) whose call stays. Each binds the
-  library's own definition, where upstream's linker lets an executable
-  preempt an exported thread-local (DTPMOD64/DTPOFF64 or TLSDESC
-  against the symbol). Refused with a diagnostic: non-PIC relocations
+  with no symbol, `x86_64_tlsdesc`) whose call stays. A thread-local
+  the library exports with default visibility binds through its export
+  instead, as upstream's (`x86_64_dtpmod64_sym`, `x86_64_dtpoff64_sym`,
+  `x86_64_tlsdesc_sym`: DTPMOD64/DTPOFF64 or TLSDESC against the
+  .dynsym symbol), so an executable that defines the same thread-local
+  preempts it (test/link_input/so_preempt.c); hidden, protected and
+  static ones bind the library's own. Refused with a diagnostic: non-PIC relocations
   (R_X86_64_32, 32S, TPOFF32, GOTTPOFF), Clang's `_TLS_MODULE_BASE_`
   descriptors, and another module's thread-locals. Upstream also
   exports ubsan_rt's handlers (weak); zap does not. Shared libraries
