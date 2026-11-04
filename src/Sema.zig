@@ -21657,7 +21657,29 @@ fn vectorCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref
     // As upstream, a vector and a scalar mismatch at the operand.
     if (d_len == null or s_len == null) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected type '{f}', found '{f}'", .{ sema.fmtType(dest_ty), sema.fmtType(sema.typeOf(operand)) });
     if (d_len.? != s_len.?) return sema.fail(block, src, "vector length mismatch: {d} and {d}", .{ d_len.?, s_len.? });
+    if (f == &analyzeIntCast or f == &analyzeTruncate) if (try sema.vectorIntCast(block, dest_ty, operand, f == &analyzeTruncate)) |r| return r;
     return try sema.vectorMap(block, src, d_len.?, dest_ty, &.{operand}, VectorCast{ .f = f, .elem_ty = Type.childType(sema.ip, dest_ty) });
+}
+
+/// `@intCast` (or with `truncate`, `@truncate`) of integer vector
+/// `operand` to vector type `dest_ty` of the same length as one `intcast`
+/// (`trunc`) when the backend lowers it (`vectorNative`): an `@intCast`
+/// only when every source value fits the destination, so no lane needs
+/// the range check; a `@truncate` when it keeps the signedness and drops
+/// bits, as the scalar one requires. Else null.
+fn vectorIntCast(sema: *Sema, block: *Block, dest_ty: Index, operand: Ref, truncate: bool) CompileError!?Ref {
+    const ip = sema.ip;
+    const src_ty = sema.typeOf(operand);
+    const s_elem = Type.childType(ip, src_ty);
+    const d_elem = Type.childType(ip, dest_ty);
+    if (!Type.isInt(ip, s_elem) or !Type.isInt(ip, d_elem)) return null;
+    const s = Type.intInfo(ip, s_elem);
+    const d = Type.intInfo(ip, d_elem);
+    const ok = if (truncate)
+        s.signedness == d.signedness and d.bits < s.bits
+    else if (s.signedness == d.signedness) d.bits > s.bits else s.signedness == .unsigned and d.bits > s.bits;
+    if (!ok or !try sema.vectorNative(block, .{ .cast = dest_ty }, src_ty, &.{operand})) return null;
+    return try sema.addTyOp(block, if (truncate) .trunc else .intcast, dest_ty, operand);
 }
 
 fn zirReduce(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {

@@ -39,6 +39,9 @@ pub const Op = union(enum) {
     reduce: Ir.ReduceOp,
     select,
     shuffle,
+    /// `@intCast` that widens (every source value fits the destination,
+    /// so no lane needs a check) or `@truncate`, to this vector type.
+    cast: Index,
 };
 
 /// The element of a vector type as a SIMD lane.
@@ -131,6 +134,13 @@ pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Ind
         };
     }
     if (len * l.bytes() > max_bytes) return false;
+    // Between full-width integer lanes of up to 128 bytes, each a
+    // different width (SSE2 unpacks and packs).
+    if (op == .cast) {
+        const d = lane(ip, op.cast) orelse return false;
+        if (d == .bool or d.isFloat() or l.isFloat() or d == l) return false;
+        return len * d.bytes() <= max_bytes and !narrow(ip, ty) and !narrow(ip, op.cast);
+    }
     if (narrow(ip, ty)) switch (op) {
         .bit_and, .bit_or, .xor, .cmp, .select, .shuffle, .min, .max => {},
         // `~` keeps sign-extended lanes extended, not zero-extended ones.
@@ -155,5 +165,6 @@ pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Ind
             .mul => l == .i16 or l == .i32,
         },
         .shuffle => true,
+        .cast => unreachable,
     };
 }

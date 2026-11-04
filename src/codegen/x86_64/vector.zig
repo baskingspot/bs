@@ -93,6 +93,8 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ip.keyTag(cg.typeOf(data.bin_op.lhs)) == .vector_type,
         .neg_float, .abs_float, .sqrt => ip.keyTag(cg.typeOf(data.un_op)) == .vector_type,
         .not => ip.keyTag(data.ty_op.ty) == .vector_type,
+        // Sema emits these on vectors only when `shared.native` says so.
+        .intcast, .trunc => ip.keyTag(data.ty_op.ty) == .vector_type,
         // Between 16-byte vectors in XMM registers, or one and a 16-byte
         // value in memory (an array, a wide integer): one movdqu.
         // (Smaller vectors move through a GPR as integers do.)
@@ -113,13 +115,15 @@ fn inMem(cg: *CodeGen, ty: Index) bool {
     return !inXmm(cg.ip, ty) and !cg.inPair(ty);
 }
 
-/// Whether `aggregate_init` `data` broadcasts one runtime element to a
-/// vector of lanes (`splat`).
+/// Whether `aggregate_init` `data` broadcasts one element to a vector of
+/// lanes (`splat`).
 fn isSplat(cg: *CodeGen, data: Inst.Data) bool {
     if (shape(cg.ip, data.ty_pl.ty) == null) return false;
     const extra = cg.ir.extraData(Ir.Aggregate, data.ty_pl.payload);
     const elems = cg.ir.refSlice(extra.end, extra.data.len);
-    if (elems[0].toInterned() != null) return false;
+    // A constant element (after the rewrite rules fold one) is
+    // broadcast too, but not an undefined one.
+    if (elems[0].toInterned()) |v| if (cg.ip.keyTag(v) == .undef) return false;
     for (elems[1..]) |x| if (x != elems[0]) return false;
     return true;
 }
@@ -292,6 +296,7 @@ fn reduceIndex(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, opera
 pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
     const ip = cg.ip;
     switch (tag) {
+        .intcast, .trunc => try cast(cg, inst, data.ty_op.ty, data.ty_op.operand),
         .cmp_vector => {
             const x = cg.ir.extraData(Ir.VectorCmp, data.ty_pl.payload).data;
             try compare(cg, inst, data.ty_pl.ty, x.operator(), x.lhs, x.rhs);
@@ -347,17 +352,25 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
         else => {
             const ty = cg.typeOf(data.bin_op.lhs);
             if (isBits(ip, ty)) {
-                // Bitwise operations on bool vectors' bits.
+                // Bitwise operations on bool vectors' bits, in the
+                // result's register (commuted when the right side is in
+                // it), from the right side's register when it has one.
                 const d = cg.destReg(inst);
-                try cg.load(.rax, data.bin_op.lhs);
-                try cg.load(.rcx, data.bin_op.rhs);
+                const lhs, const rhs = if (gprOf(cg, data.bin_op.rhs) == d and data.bin_op.lhs != data.bin_op.rhs)
+                    .{ data.bin_op.rhs, data.bin_op.lhs }
+                else
+                    .{ data.bin_op.lhs, data.bin_op.rhs };
+                try cg.load(d, lhs);
+                const src: Reg = gprOf(cg, rhs) orelse blk: {
+                    try cg.load(.rcx, rhs);
+                    break :blk .rcx;
+                };
                 try cg.e.alu(switch (tag) {
                     .bit_and => .@"and",
                     .bit_or => .@"or",
                     .xor => .xor,
                     else => unreachable,
-                }, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
-                if (d != .rax) try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = .rax });
+                }, .qword, .{ .reg = d }, .{ .reg = src });
                 return cg.setResult(inst, ty, d);
             }
             try arith(cg, inst, tag, ty, data.bin_op.lhs, data.bin_op.rhs);
@@ -391,6 +404,25 @@ fn splatBits(cg: *CodeGen, val: Index) ?u64 {
     };
     return switch (ip.indexToKey(e)) {
         .int => CodeGen.intBits(ip, e),
+        .float => |f| @truncate(f.bits()),
+        else => null,
+    };
+}
+
+/// The general-purpose register value `ref` is in, if any.
+fn gprOf(cg: *CodeGen, ref: Ref) ?Reg {
+    const i = ref.toIndex() orelse return null;
+    return switch (cg.homes[@backingInt(i)]) {
+        .reg => |r| r,
+        else => null,
+    };
+}
+
+/// The bits of integer or float constant `val`, as `splatBits` reads an
+/// element.
+fn constBits(cg: *CodeGen, val: Index) ?u64 {
+    return switch (cg.ip.indexToKey(val)) {
+        .int => CodeGen.intBits(cg.ip, val),
         .float => |f| @truncate(f.bits()),
         else => null,
     };
@@ -459,6 +491,100 @@ fn srcChunk(cg: *CodeGen, ref: Ref, k: u32, scratch: Xmm) Error!XmmRm {
             try loadFrom(cg, scratch, c);
             return .{ .reg = scratch };
         },
+    }
+}
+
+/// `@intCast` that widens or `@truncate` (`intcast`, `trunc`) of integer
+/// vector `operand` to vector type `ty`, chunk by chunk in xmm0. Widening
+/// moves each result chunk's source bytes to the bottom of a register and
+/// interleaves its lanes with zeros or, for a signed source, their sign
+/// masks, once per doubling. Truncating packs pairs of source chunks into
+/// one with lanes half as wide (`packTree`).
+fn cast(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void {
+    const ip = cg.ip;
+    const e = &cg.e;
+    const src_ty = cg.typeOf(operand);
+    const s = shape(ip, src_ty).?;
+    const d = shape(ip, ty).?;
+    const dst = try Dst.of(cg, inst, ty);
+    const widen = d.lane.bytes() > s.lane.bytes();
+    const ratio = if (widen) d.lane.bytes() / s.lane.bytes() else s.lane.bytes() / d.lane.bytes();
+    const signed = Type.intInfo(ip, Type.childType(ip, src_ty)).signedness == .signed;
+    for (0..d.chunks()) |jj| {
+        const j: u32 = @intCast(jj);
+        if (!widen) {
+            try packTree(cg, operand, s, d.lane, j * ratio, ratio, .xmm0);
+        } else {
+            const off = j * 16 / ratio;
+            try loadChunk(cg, .xmm0, operand, off / 16);
+            if (off % 16 != 0) try e.pshift(.psrldq, .xmm0, @intCast(off % 16));
+            var l = s.lane;
+            while (l != d.lane) : (l = wider(l)) {
+                try e.pint(.pxor, .xmm1, .{ .reg = .xmm1 });
+                if (signed) try e.pint(switch (l) {
+                    .i8 => .pcmpgtb,
+                    .i16 => .pcmpgtw,
+                    else => .pcmpgtd,
+                }, .xmm1, .{ .reg = .xmm0 });
+                try e.pint(switch (l) {
+                    .i8 => .punpcklbw,
+                    .i16 => .punpcklwd,
+                    else => .punpckldq,
+                }, .xmm0, .{ .reg = .xmm1 });
+            }
+        }
+        try dst.put(cg, .xmm0, j);
+    }
+}
+
+fn wider(l: shared.Lane) shared.Lane {
+    return switch (l) {
+        .i8 => .i16,
+        .i16 => .i32,
+        .i32 => .i64,
+        else => unreachable,
+    };
+}
+
+/// Computes in `r` one chunk of lanes `out` from the `count` source chunks
+/// of `operand` (shape `s`) from `first` on, a power of two: the two halves
+/// computed in lanes twice as wide, in `r` and the next register, then
+/// each lane's low half kept, in order. Source chunks past the operand's
+/// are padding, never read. Uses `r` up to xmm3 and xmm5.
+fn packTree(cg: *CodeGen, operand: Ref, s: Shape, out: shared.Lane, first: u32, count: u32, r: Xmm) Error!void {
+    const e = &cg.e;
+    if (count == 1) return loadChunk(cg, r, operand, first);
+    const in = wider(out);
+    const b: Xmm = @enumFromInt(@intFromEnum(r) + 1);
+    try packTree(cg, operand, s, in, first, count / 2, r);
+    // The right half, or the left again when it is all padding.
+    const right = first + count / 2 < s.chunks();
+    if (right) try packTree(cg, operand, s, in, first + count / 2, count / 2, b);
+    const src: Xmm = if (right) b else r;
+    switch (out) {
+        // packuswb saturates, so clear each word's high byte first.
+        .i8 => {
+            try e.pint(.pcmpeqw, .xmm5, .{ .reg = .xmm5 });
+            try e.pshift(.psrlw, .xmm5, 8);
+            try e.pint(.pand, r, .{ .reg = .xmm5 });
+            if (right) try e.pint(.pand, b, .{ .reg = .xmm5 });
+            try e.pint(.packuswb, r, .{ .reg = src });
+        },
+        // packssdw saturates, so sign-extend each dword's low word first.
+        .i16 => {
+            const both = [_]Xmm{ r, b };
+            for (both[0..if (right) 2 else 1]) |x| {
+                try e.pshift(.pslld, x, 16);
+                try e.pshift(.psrad, x, 16);
+            }
+            try e.pint(.packssdw, r, .{ .reg = src });
+        },
+        .i32 => {
+            try e.pshuf(.d, r, .{ .reg = r }, 0x08);
+            if (right) try e.pshuf(.d, b, .{ .reg = b }, 0x08);
+            try e.pint(.punpcklqdq, r, .{ .reg = src });
+        },
+        else => unreachable,
     }
 }
 
@@ -771,16 +897,23 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
     // The compare computed and whether its mask is inverted: integers
     // compare equal or greater, floats with cmpps's predicates.
     const swap = !s.lane.isFloat() and (op == .lt or op == .gte);
-    const invert = !s.lane.isFloat() and (op == .neq or op == .lte or op == .gte);
-    const a, const b = if (swap) .{ rhs, lhs } else .{ lhs, rhs };
+    // A compare against a constant that splits the lanes at their sign
+    // bit is the sign bits (`signTest`), which movmsk reads directly.
+    const st = signTest(cg, op_ty, op, lhs, rhs);
+    const invert = if (st) |x| x.invert else !s.lane.isFloat() and (op == .neq or op == .lte or op == .gte);
+    const a, const b = if (st) |x| .{ x.operand, x.operand } else if (swap) .{ rhs, lhs } else .{ lhs, rhs };
     const n = s.perChunk();
-    const biased = !s.lane.isFloat() and !signed and op != .eq and op != .neq;
+    const biased = st == null and !s.lane.isFloat() and !signed and op != .eq and op != .neq;
     const sign: ?Mem = if (biased) try signMem(cg, s.lane) else null;
     // One chunk's lane bits go straight to the result's register.
     const t: Reg = if (s.chunks() == 1) d else .rcx;
     for (0..s.chunks()) |kk| {
         const k: u32 = @intCast(kk);
-        try loadChunk(cg, .xmm0, a, k);
+        // A sign test reads a register operand in place, but for 16-bit
+        // lanes, which it packs first.
+        const c = try chunk(cg, a, k);
+        const x: Xmm = if (st != null and s.lane != .i16 and c == .reg) c.reg else .xmm0;
+        if (x == .xmm0) try loadFrom(cg, .xmm0, c);
         if (s.lane.isFloat()) {
             const pred: u8 = switch (op) {
                 .eq => 0,
@@ -798,7 +931,8 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
                 try e.movmskp(s.float(), t, .xmm0);
             }
         } else {
-            if ((op == .eq or op == .neq) and s.lane == .i64 and has(cg, .sse4_1)) {
+            // A sign test reads the lanes' sign bits as they are.
+            if (st != null) {} else if ((op == .eq or op == .neq) and s.lane == .i64 and has(cg, .sse4_1)) {
                 try e.pint38(.pcmpeqq, .xmm0, try srcChunk(cg, b, k, .xmm1));
             } else if (op == .eq or op == .neq) {
                 try e.pint(switch (s.lane) {
@@ -824,14 +958,14 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
                 }
             }
             switch (s.lane) {
-                .i8 => try e.pmovmskb(t, .xmm0),
+                .i8 => try e.pmovmskb(t, x),
                 .i16 => {
                     try e.pint(.packsswb, .xmm0, .{ .reg = .xmm0 });
                     try e.pmovmskb(t, .xmm0);
                     try e.movzx(.dword, t, .byte, .{ .reg = t });
                 },
-                .i32 => try e.movmskp(.f32, t, .xmm0),
-                .i64 => try e.movmskp(.f64, t, .xmm0),
+                .i32 => try e.movmskp(.f32, t, x),
+                .i64 => try e.movmskp(.f64, t, x),
                 else => unreachable,
             }
         }
@@ -847,6 +981,51 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
     if (s.chunks() * n > s.len) try andImm(cg, d, mask);
     if (invert) try xorImm(cg, d, mask);
     try cg.setResult(inst, ty, d);
+}
+
+/// For `compare`: integer `lhs op rhs` with one side a constant splat
+/// that makes it a test of the other side's sign bits: unsigned `x >=
+/// 2^(n-1)` and `x > 2^(n-1) - 1`, signed `x < 0` and `x <= -1`, or
+/// (`invert`) their negations. Not for narrow lanes, whose sign bit is
+/// not the lane's.
+fn signTest(cg: *CodeGen, ty: Index, op: std.math.CompareOperator, lhs: Ref, rhs: Ref) ?struct { operand: Ref, invert: bool } {
+    const ip = cg.ip;
+    const s = shape(ip, ty).?;
+    if (s.lane.isFloat() or shared.narrow(ip, ty)) return null;
+    // `x op c`, with `c op x` turned around.
+    const x: Ref, const c: Index, const o: std.math.CompareOperator = if (rhs.toInterned()) |v|
+        .{ lhs, v, op }
+    else if (lhs.toInterned()) |v|
+        .{ rhs, v, op.reverse() }
+    else
+        return null;
+    if (x.toInterned() != null) return null;
+    const bits = s.lane.bytes() * 8;
+    const k = (splatBits(cg, c) orelse return null) & lenMask(bits);
+    const half = @as(u64, 1) << @intCast(bits - 1);
+    const signed = Type.intInfo(ip, Type.childType(ip, ty)).signedness == .signed;
+    // The value whose `x >= k` (and so `x > k - 1`) is the sign bit.
+    const at = if (signed) 0 else half;
+    const below = (at -% 1) & lenMask(bits);
+    // Signed lanes are set below 0, so the sign is `x < 0`.
+    const set_ops: [2]std.math.CompareOperator = if (signed) .{ .lt, .lte } else .{ .gte, .gt };
+    const ks: [2]u64 = .{ at, below };
+    for (set_ops, ks) |so, kv| if (k == kv) {
+        if (o == so) return .{ .operand = x, .invert = false };
+        if (o == negated(so)) return .{ .operand = x, .invert = true };
+    };
+    return null;
+}
+
+fn negated(op: std.math.CompareOperator) std.math.CompareOperator {
+    return switch (op) {
+        .lt => .gte,
+        .lte => .gt,
+        .gt => .lte,
+        .gte => .lt,
+        .eq => .neq,
+        .neq => .eq,
+    };
 }
 
 /// `@reduce` of bool vector `operand`'s bits.
@@ -1191,6 +1370,15 @@ fn splat(cg: *CodeGen, inst: Inst.Index, ty: Index, elem: Ref) Error!void {
     const e = &cg.e;
     const dst = try Dst.of(cg, inst, ty);
     const r = dst.home orelse .xmm0;
+    // A constant (once the rewrite rules fold one): its 16 bytes.
+    if (elem.toInterned()) |v| if (!shared.narrow(cg.ip, ty)) if (constBits(cg, v)) |bits| {
+        const lb = s.lane.bytes();
+        var b: [16]u8 = undefined;
+        for (0..16) |i| b[i] = @truncate(bits >> @intCast(8 * (i % lb)));
+        try cg.e.movdq(true, .{ .reg = r }, .{ .mem = try constMem(cg, b) });
+        for (0..s.chunks()) |k| try dst.put(cg, r, @intCast(k));
+        return;
+    };
     if (s.lane.isFloat()) {
         try cg.loadXmm(r, try cg.valOf(elem));
     } else {

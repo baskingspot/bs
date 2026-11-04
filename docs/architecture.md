@@ -1320,8 +1320,16 @@ vectors (unsigned through sign-flipped `pcmpgt`; floats with `cmpps`;
 by lane through memory), `@reduce` on integer lanes with `and`, `or`,
 `xor`, `+`, `min` and `max` (not 64-bit lanes) and `*` (16- and 32-bit
 lanes), as a tree of halves with the padding lanes set to the
-identity, `@splat`, and bitwise ops and `and`/`or`/`xor` reductions on
-bool vectors. Upstream's Debug backend scalarizes compares, selects and
+identity, `@splat` (a constant one, which the rewrite rules may fold
+from a call, loaded from read-only data), `@intCast` that widens
+(`punpckl` with zeros or the lanes' sign masks, once per doubling; a
+narrowing one keeps its per-lane checks and stays scalar) and
+`@truncate` (pairs of chunks packed with `packuswb`, `packssdw` after
+clearing or sign-extending what saturation would change, or `pshufd`),
+and bitwise ops and `and`/`or`/`xor` reductions on bool vectors. A
+compare against a constant that splits the lanes at their sign bit
+(unsigned `x >= 0x80`, signed `x < 0`, their negations) is the sign
+bits themselves, one `pmovmskb` or `movmskps`. Upstream's Debug backend scalarizes compares, selects and
 shuffles; doing them here keeps results bit for bit (the same lanes,
 padding never observable). Still scalarized: shifts, overflow and
 saturating arithmetic, division and remainder of integers, 64-bit

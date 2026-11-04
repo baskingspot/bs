@@ -3371,7 +3371,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .intcast, .trunc, .bitcast, .ptr_from_int => {
             const ty = data.ty_op.ty;
             if (cg.homes[@backingInt(inst)] == .view) return;
-            if (tag == .bitcast and vector.lowers(cg, inst)) return vector.gen(cg, inst, tag, data);
+            if (tag != .ptr_from_int and vector.lowers(cg, inst)) return vector.gen(cg, inst, tag, data);
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(cg.typeOf(data.ty_op.operand))) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
             if (cg.passInRegs(ty) and cg.passInRegs(cg.typeOf(data.ty_op.operand))) {
                 const d = cg.destReg(inst);
