@@ -1035,6 +1035,19 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     cxx_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&cxx_run.step);
 
+    // translate-c with a system library takes the native include
+    // directories (here NIX_CFLAGS_COMPILE's) ahead of the user's
+    // -isystem, as upstream's `native_system_include_paths`.
+    const tc_native = b.addRunArtifact(zap);
+    tc_native.setName("zap translate-c -l<lib> takes the native include directories");
+    tc_native.addArgs(&.{ "translate-c", "-lfoo", "-isystem" });
+    tc_native.addDirectoryArg(b.path("test/link_input/tc_native/shadow"));
+    tc_native.addFileArg(b.path("test/link_input/tc_native/s.h"));
+    tc_native.setCwd(b.path("."));
+    tc_native.setEnvironmentVariable("NIX_CFLAGS_COMPILE", "-isystem test/link_input/tc_native/sys");
+    tc_native.addCheck(.{ .expect_stdout_match = "pub extern fn tcn_native() c_int;" });
+    test_step.dependOn(&tc_native.step);
+
     // GCC's -fPIE reads glibc's data PC-relative: the executable copies
     // `stdout` and `environ` (with its aliases, which glibc's start code
     // sets), and glibc, C and Zig all use the copies.

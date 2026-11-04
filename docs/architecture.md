@@ -5818,7 +5818,12 @@ libraries as inputs. To be agreed with that thread.
   target), `x86_64-linux-none` for `-target x86_64-linux`. `-lc` adds
   `-fPIC`, `-D__GLIBC_MINOR__` and glibc's headers from the zig lib
   directory (`LibCDirs.detectFromBuilding`); the binary itself still adds
-  the native include paths (`/usr/include`), as upstream's does. Output
+  the native include paths (`/usr/include`) after all of these, as
+  upstream's does. A native `-l<name>` other than libc's and libc++'s
+  also puts them right after libc's headers, ahead of the user's flags
+  (upstream's `native_system_include_paths`), so a system header shadows
+  one of the same name in a user's `-isystem` directory, as upstream.
+  Output
   matches upstream's byte for byte for `-mcpu=baseline` (tokamak's
   `c.h` without `-lc`) and for `-target x86_64-linux-gnu.2.36 -lc`
   (stdio.h).

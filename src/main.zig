@@ -1917,6 +1917,10 @@ const glibc_libs: std.StaticStringMap(void) = .initComptime(.{ .{"c"}, .{"m"}, .
 /// The names `-l` takes for libc++ (upstream's `target_util.is_libcpp_lib_name`).
 const libcpp_names: std.StaticStringMap(void) = .initComptime(.{ .{"c++"}, .{"stdc++"}, .{"c++abi"}, .{"supc++"} });
 
+pub fn isLibcppLib(name: []const u8) bool {
+    return libcpp_names.has(name);
+}
+
 pub fn isGlibcLib(name: []const u8) bool {
     return glibc_libs.has(name);
 }

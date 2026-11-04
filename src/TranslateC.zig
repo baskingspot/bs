@@ -35,6 +35,10 @@ const Request = struct {
     glibc_version: ?std.SemanticVersion,
     /// The user's C flags (include directories, macros), in order.
     cc_args: []const []const u8,
+    /// `std.zig.system.NativePaths`' include directories, after libc's:
+    /// upstream's `native_system_include_paths`, which a native target
+    /// gets when the command names system libraries.
+    native_includes: []const []const u8 = &.{},
     listen: bool,
     zig_lib_dir: []const u8,
     cache_dirs: Frontend.CacheDirs,
@@ -61,6 +65,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     const io = init.io;
     var source: ?[]const u8 = null;
     var cc_args: std.ArrayList([]const u8) = .empty;
+    var named_libs = false;
     var opts: main.Options = .{ .command = .build_exe, .root_src_path = "" };
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -88,8 +93,9 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
             if (arg.len == 2) i += 1;
         } else if (std.mem.startsWith(u8, arg, "-l")) {
             // glibc's libraries link libc; other libraries (the build
-            // runner passes pkg-config's) change nothing translate-c reads.
-            if (main.isGlibcLib(arg[2..])) opts.link_libc = true;
+            // runner passes pkg-config's) add the native include
+            // directories, as upstream's `want_native_include_dirs`.
+            if (main.isGlibcLib(arg[2..])) opts.link_libc = true else if (!main.isLibcppLib(arg[2..])) named_libs = true;
         } else if (std.mem.startsWith(u8, arg, "-needed-l") or std.mem.startsWith(u8, arg, "-weak-l") or
             std.mem.startsWith(u8, arg, "-search_") or std.mem.eql(u8, arg, "-pthread"))
         {
@@ -115,11 +121,15 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         }
     }
     const target = opts.target orelse "native";
+    var native_includes: []const []const u8 = &.{};
     if (std.mem.eql(u8, target, "native")) {
         if (!(@import("builtin").cpu.arch == .x86_64 and @import("builtin").os.tag == .linux))
             main.setUnsupported(&opts, arena, "zap translates C only for x86_64-linux so far ('native'); pass -target x86_64-linux", .{})
         else if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
             if (native.abi.isGnu()) opts.glibc_version = native.os.version_range.linux.glibc;
+            if (named_libs) if (std.zig.system.NativePaths.detect(arena, io, &native, init.environ_map)) |paths| {
+                native_includes = paths.include_dirs.items;
+            } else |_| {};
         } else |_| {}
         if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena, io);
     } else {
@@ -136,6 +146,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         .link_libc = opts.link_libc,
         .glibc_version = opts.glibc_version,
         .cc_args = cc_args.items,
+        .native_includes = native_includes,
         .listen = opts.listen,
         .zig_lib_dir = opts.zig_lib_dir orelse init.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir,
         .cache_dirs = Frontend.resolveCacheDirs(arena, io, init.environ_map, .{ .local = opts.cache_dir, .global = opts.global_cache_dir }),
@@ -266,6 +277,7 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
         const dirs = try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, &target);
         for (dirs.libc_include_dir_list) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
     }
+    for (req.native_includes) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
     try argv.appendSlice(arena, &.{ "-O0", "-target", try target.zigTriple(arena), try mcpuArg(arena, &target) });
     try argv.appendSlice(arena, req.cc_args);
 
