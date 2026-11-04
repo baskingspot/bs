@@ -1035,6 +1035,10 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
             return sema.fail(&block, .{ .base = src.base, .loc = .{ .decl_addrspace = .zero } }, "cannot specify addrspace of {s}", .{what});
         }
     }
+    // A container-level `var` exists at runtime, as upstream checks at its
+    // initializer.
+    if (!nav.is_const and try sema.isComptimeOnlyResolved(&block, src, sema.ip.typeOf(val)))
+        return sema.failComptimeVar(&block, .{ .base = decl.src_node, .loc = .var_init }, sema.ip.typeOf(val));
     nav.val = val;
     nav.ty = sema.ip.typeOf(val);
     // Emit lays out the value of any declaration code refers to.
@@ -10970,14 +10974,27 @@ fn allocPtrType(sema: *Sema, ty: Index, alignment: u64) !Index {
     return sema.ptrType(.{ .child = ty, .flags = .{ .alignment = flag } });
 }
 
+/// A runtime variable of comptime-only type `ty`, declared at `src`, as
+/// upstream's validateVarType: with why the type is comptime-only.
+fn failComptimeVar(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError {
+    const err = sema.fail(block, src, "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
+    const span = src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+    try sema.explainWhyComptime(sema.file, span, ty);
+    if (ty == .comptime_int_type or ty == .comptime_float_type)
+        try sema.zcu.addNote(sema.file, span, "to modify this variable at runtime, it must be given an explicit fixed-size number type", .{});
+    return err;
+}
+
 fn analyzeAlloc(sema: *Sema, block: *Block, src: Src, ty: Index, is_const: bool, force_comptime: bool) CompileError!Ref {
     if (block.is_comptime or (force_comptime and !(sema.bcOsrVar(block) and !try sema.isComptimeOnlyResolved(block, src, ty))))
         return .fromInterned(try sema.createComptimeVar(block, ty, is_const));
+    if (!is_const and Type.class(sema.ip, ty) == .@"opaque")
+        return sema.fail(block, src.varTy(), "non-extern variable with opaque type '{f}'", .{sema.fmtType(ty)});
     try sema.resolveLayout(block, src, ty);
     if ((try sema.isComptimeOnlyResolved(block, src, ty))) {
         // A constant of a comptime-only type is comptime.
         if (is_const) return .fromInterned(try sema.createComptimeAlloc(ty, false));
-        return sema.fail(block, src.varTy(), "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
+        return sema.failComptimeVar(block, src.varTy(), ty);
     }
     const ptr_ty = try sema.ptrType(.{ .child = ty });
     const ref = try sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = ptr_ty } });
@@ -11182,7 +11199,7 @@ fn zirResolveInferredAlloc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Com
         // A constant that was not comptime-known above was stored under a
         // runtime condition, as upstream.
         if (ia.is_const) return sema.fail(block, src, "value with comptime-only type '{f}' depends on runtime control flow", .{sema.fmtType(ty)});
-        return sema.fail(block, src.varTy(), "variable of type '{f}' must be const or comptime", .{sema.fmtType(ty)});
+        return sema.failComptimeVar(block, src.varTy(), ty);
     }
     if (ia.is_const) for (operands) |op| try sema.validateRuntimeValue(block, src, op);
     try sema.resolveLayout(block, src, ty);
