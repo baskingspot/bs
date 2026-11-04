@@ -897,6 +897,28 @@ pub fn pint(e: *Encoder, op: PackedOp, dst: Xmm, src: XmmRm) !void {
     try e.modRm(.{ .op16 = true }, &.{ 0x0f, @backingInt(op) }, @backingInt(dst), rmXmm(src), 0);
 }
 
+/// SSSE3 and SSE4.1/4.2 integer ops with the 66 0f 38 xx encoding, for
+/// CPUs that have them (`-mcpu`).
+pub const PackedOp38 = enum(u8) {
+    pshufb = 0x00,
+    pcmpeqq = 0x29,
+    pcmpgtq = 0x37,
+    pminsb = 0x38,
+    pminsd = 0x39,
+    pminuw = 0x3a,
+    pminud = 0x3b,
+    pmaxsb = 0x3c,
+    pmaxsd = 0x3d,
+    pmaxuw = 0x3e,
+    pmaxud = 0x3f,
+    pmulld = 0x40,
+};
+
+pub fn pint38(e: *Encoder, op: PackedOp38, dst: Xmm, src: XmmRm) !void {
+    try e.reserve();
+    try e.modRm(.{ .op16 = true }, &.{ 0x0f, 0x38, @backingInt(op) }, @backingInt(dst), rmXmm(src), 0);
+}
+
 /// addps/addpd and friends on all lanes (the scalar ops' opcodes without
 /// their prefix). A memory `src` must be 16-byte aligned.
 pub fn ps(e: *Encoder, op: SseOp, ty: Float, dst: Xmm, src: XmmRm) !void {
@@ -1494,7 +1516,11 @@ test "packed SSE instructions match GNU as" {
     try e.movdq(true, .{ .reg = .xmm1 }, .{ .mem = .at(.rbp, -16) });
     try e.movdq(false, .{ .mem = .at(.r10, 8) }, .{ .reg = .xmm9 });
     try e.movdq(false, .{ .reg = .xmm0 }, .{ .mem = .{ .base = .rip, .disp = 0 } });
-    const expected = "660ffcca66440f744de066410fefc766440ffbc3410f58d2660f59080fc2dc0166450fc25c24100466410f70d44ef20f70d3b1f3440f70cb00660f71d10866410f72f21f660f73db04660f73f20166410fd7c166440fd7d10f50ca66450f50de660f6f4df0f3450f7f4a08f30f6f0500000000";
+    try e.pint38(.pshufb, .xmm1, .{ .reg = .xmm2 });
+    try e.pint38(.pmulld, .xmm9, .{ .mem = .at(.rbp, -16) });
+    try e.pint38(.pcmpgtq, .xmm0, .{ .reg = .xmm15 });
+    try e.pint38(.pmaxud, .xmm12, .{ .reg = .xmm3 });
+    const expected = "660ffcca66440f744de066410fefc766440ffbc3410f58d2660f59080fc2dc0166450fc25c24100466410f70d44ef20f70d3b1f3440f70cb00660f71d10866410f72f21f660f73db04660f73f20166410fd7c166440fd7d10f50ca66450f50de660f6f4df0f3450f7f4a08f30f6f0500000000660f3800ca66440f38404df066410f3837c766440f383fe3";
     var buf: [expected.len / 2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
 }

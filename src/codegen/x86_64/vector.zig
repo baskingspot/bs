@@ -480,8 +480,18 @@ fn laneConst(cg: *CodeGen, lane_bytes: u32, f: *const fn (u32) u64) Error!Mem {
     return constMem(cg, b);
 }
 
+/// Whether the target CPU has x86 feature `f` (`-mcpu`).
+fn has(cg: *CodeGen, f: std.Target.x86.Feature) bool {
+    return cg.emit.zcu.cpu.has(.x86, f);
+}
+
 /// Each lane's sign bit set, in `r`, for unsigned compares as signed ones.
 fn signBits(cg: *CodeGen, r: Xmm, lane: Lane) Error!void {
+    if (lane == .i64) {
+        try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @bitCast(@as(u64, 1 << 63)) });
+        try cg.e.movToXmm(.qword, r, .{ .reg = .rcx });
+        return cg.e.pshuf(.d, r, .{ .reg = r }, 0x44);
+    }
     const pattern: u32 = switch (lane) {
         .i8 => 0x8080_8080,
         .i16 => 0x8000_8000,
@@ -515,7 +525,9 @@ fn arith(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, ty: Index, lhs: Ref, rhs
             }, s.float(), r, try srcChunk(cg, rhs, k, .xmm1)),
             .mul_wrap => switch (s.lane) {
                 .i16 => try e.pint(.pmullw, r, try srcChunk(cg, rhs, k, .xmm1)),
-                .i32 => {
+                .i32 => if (has(cg, .sse4_1)) {
+                    try e.pint38(.pmulld, r, try srcChunk(cg, rhs, k, .xmm1));
+                } else {
                     try loadChunk(cg, .xmm1, rhs, k);
                     try mul32(cg, r, .xmm1);
                 },
@@ -557,10 +569,11 @@ fn isSigned(cg: *CodeGen, ty: Index) bool {
 }
 
 /// `r *%= b` on 32-bit lanes: the even lanes' products, then the odd
-/// lanes' (moved to even positions), interleaved again. Uses xmm2 and
-/// xmm3.
+/// lanes' (moved to even positions), interleaved again; pmulld with
+/// SSE4.1. Uses xmm2 and xmm3.
 fn mul32(cg: *CodeGen, r: Xmm, b: Xmm) Error!void {
     const e = &cg.e;
+    if (has(cg, .sse4_1)) return e.pint38(.pmulld, r, .{ .reg = b });
     try e.pshuf(.d, .xmm2, .{ .reg = r }, 0xf5);
     try e.pshuf(.d, .xmm3, .{ .reg = b }, 0xf5);
     try e.pint(.pmuludq, r, .{ .reg = b });
@@ -570,15 +583,21 @@ fn mul32(cg: *CodeGen, r: Xmm, b: Xmm) Error!void {
     try e.pint(.punpckldq, r, .{ .reg = .xmm2 });
 }
 
-/// `r = @min(r, b)` (or `@max`) on integer lanes of 8, 16, or 32 bits:
-/// SSE2 has unsigned byte and signed word forms, which the other byte
-/// and word signedness reach with the sign bits flipped; 32-bit lanes
-/// compare and blend. Clobbers `b`, xmm2-xmm4, and rcx.
+/// `r = @min(r, b)` (or `@max`) on integer lanes: SSE2 has unsigned
+/// byte and signed word forms, which the other byte and word signedness
+/// reach with the sign bits flipped; 32-bit lanes compare and blend.
+/// SSE4.1 has every 8-, 16-, and 32-bit form; 64-bit lanes compare
+/// (SSE4.2) and blend. Clobbers `b`, xmm2-xmm4, and rcx.
 fn minMax(cg: *CodeGen, max: bool, lane: Lane, signed: bool, r: Xmm, b: Xmm) Error!void {
     const e = &cg.e;
+    const sse41 = has(cg, .sse4_1);
     switch (lane) {
         .i8, .i16 => {
-            const flip = signed == (lane == .i8);
+            const flip = signed != (lane == .i16);
+            if (flip and sse41) return e.pint38(switch (lane) {
+                .i8 => if (max) .pmaxsb else .pminsb,
+                else => if (max) .pmaxuw else .pminuw,
+            }, r, .{ .reg = b });
             if (flip) {
                 try signBits(cg, .xmm2, lane);
                 try e.pint(.pxor, r, .{ .reg = .xmm2 });
@@ -590,7 +609,11 @@ fn minMax(cg: *CodeGen, max: bool, lane: Lane, signed: bool, r: Xmm, b: Xmm) Err
             }, r, .{ .reg = b });
             if (flip) try e.pint(.pxor, r, .{ .reg = .xmm2 });
         },
-        .i32 => {
+        .i32, .i64 => {
+            if (lane == .i32 and sse41) return e.pint38(if (signed)
+                (if (max) .pmaxsd else .pminsd)
+            else
+                (if (max) .pmaxud else .pminud), r, .{ .reg = b });
             // mask = r > b for min, b > r for max; then b where mask, else r.
             try e.movdq(true, .{ .reg = .xmm2 }, .{ .reg = if (max) b else r });
             try e.movdq(true, .{ .reg = .xmm3 }, .{ .reg = if (max) r else b });
@@ -599,7 +622,7 @@ fn minMax(cg: *CodeGen, max: bool, lane: Lane, signed: bool, r: Xmm, b: Xmm) Err
                 try e.pint(.pxor, .xmm2, .{ .reg = .xmm4 });
                 try e.pint(.pxor, .xmm3, .{ .reg = .xmm4 });
             }
-            try e.pint(.pcmpgtd, .xmm2, .{ .reg = .xmm3 });
+            try pcmpgt(cg, lane, .xmm2, .{ .reg = .xmm3 });
             try e.pint(.pand, b, .{ .reg = .xmm2 });
             try e.pint(.pandn, .xmm2, .{ .reg = r });
             try e.movdq(true, .{ .reg = r }, .{ .reg = .xmm2 });
@@ -607,6 +630,16 @@ fn minMax(cg: *CodeGen, max: bool, lane: Lane, signed: bool, r: Xmm, b: Xmm) Err
         },
         else => unreachable,
     }
+}
+
+/// `r = r > src` per signed integer lane; 64-bit lanes need SSE4.2.
+fn pcmpgt(cg: *CodeGen, lane: Lane, r: Xmm, src: XmmRm) Error!void {
+    if (lane == .i64) return cg.e.pint38(.pcmpgtq, r, src);
+    try cg.e.pint(switch (lane) {
+        .i8 => .pcmpgtb,
+        .i16 => .pcmpgtw,
+        else => .pcmpgtd,
+    }, r, src);
 }
 
 /// Float `@min`/`@max` as the scalar lowering: `rhs` where `lhs` is NaN,
@@ -700,7 +733,9 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
                 try e.movmskp(s.float(), .rcx, .xmm0);
             }
         } else {
-            if (op == .eq or op == .neq) {
+            if ((op == .eq or op == .neq) and s.lane == .i64 and has(cg, .sse4_1)) {
+                try e.pint38(.pcmpeqq, .xmm0, try srcChunk(cg, b, k, .xmm1));
+            } else if (op == .eq or op == .neq) {
                 try e.pint(switch (s.lane) {
                     .i8 => .pcmpeqb,
                     .i16 => .pcmpeqw,
@@ -715,20 +750,12 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
                 // a > b (after the swap), unsigned as signed after flipping
                 // the sign bits.
                 if (signed) {
-                    try e.pint(switch (s.lane) {
-                        .i8 => .pcmpgtb,
-                        .i16 => .pcmpgtw,
-                        else => .pcmpgtd,
-                    }, .xmm0, try srcChunk(cg, b, k, .xmm1));
+                    try pcmpgt(cg, s.lane, .xmm0, try srcChunk(cg, b, k, .xmm1));
                 } else {
                     try loadChunk(cg, .xmm1, b, k);
                     try e.pint(.pxor, .xmm0, .{ .reg = .xmm3 });
                     try e.pint(.pxor, .xmm1, .{ .reg = .xmm3 });
-                    try e.pint(switch (s.lane) {
-                        .i8 => .pcmpgtb,
-                        .i16 => .pcmpgtw,
-                        else => .pcmpgtd,
-                    }, .xmm0, .{ .reg = .xmm1 });
+                    try pcmpgt(cg, s.lane, .xmm0, .{ .reg = .xmm1 });
                 }
             }
             switch (s.lane) {
@@ -800,11 +827,14 @@ fn reduce(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, operand: R
     // Lanes past the length are read only if a full chunk follows or the
     // last one's lanes are not a power of two in bytes.
     const pad = tail != 0 and (chunks > 1 or !std.math.isPowerOfTwo(tail));
-    // Min and max of the signedness SSE2 lacks (`minMax`) run on lanes
-    // with their sign bits flipped (in xmm5), once for the whole tree.
+    // Min and max of the signedness the CPU lacks (`minMax`) run on
+    // lanes with their sign bits flipped (in xmm5), once for the whole
+    // tree.
+    const sse41 = has(cg, .sse4_1);
     const flip = (op == .min or op == .max) and switch (s.lane) {
-        .i8 => signed,
-        .i16, .i32 => !signed,
+        .i8 => signed and !sse41,
+        .i16, .i32 => !signed and !sse41,
+        .i64 => !signed,
         else => false,
     };
     const lanes_signed = if (flip) !signed else signed;
@@ -951,7 +981,8 @@ fn select(cg: *CodeGen, inst: Inst.Index, ty: Index, pred: Ref, a: Ref, b: Ref) 
 }
 
 /// `@shuffle`: pshufd when one operand's dwords (or qwords) are permuted
-/// within one register, else lane by lane through memory.
+/// within one register, pshufb on each operand with SSSE3, else lane by
+/// lane through memory.
 fn shuffle(cg: *CodeGen, inst: Inst.Index, ty: Index, a: Ref, b: Ref, mask: Index) Error!void {
     const ip = cg.ip;
     const s = shape(ip, ty).?;
@@ -983,6 +1014,31 @@ fn shuffle(cg: *CodeGen, inst: Inst.Index, ty: Index, a: Ref, b: Ref, mask: Inde
         const dst = try Dst.of(cg, inst, ty);
         const r = dst.home orelse .xmm0;
         try e.pshuf(.d, r, try srcChunk(cg, src, 0, .xmm1), imm);
+        return dst.put(cg, r, 0);
+    }
+    if (has(cg, .ssse3) and s.bytes() <= 16 and shape(ip, cg.typeOf(a)).?.bytes() <= 16 and shape(ip, cg.typeOf(b)).?.bytes() <= 16) {
+        // Each operand's bytes to their result positions, the others
+        // zeroed (0x80), then the two or'ed.
+        var masks: [2][16]u8 = .{ @splat(0x80), @splat(0x80) };
+        var used: [2]bool = .{ false, false };
+        for (0..s.len) |i| {
+            if (undef[i]) continue;
+            const which: usize = if (sel[i] >= 0) 0 else 1;
+            const lane: u32 = @intCast(if (sel[i] >= 0) sel[i] else ~sel[i]);
+            used[which] = true;
+            for (0..lb) |q| masks[which][i * lb + q] = @intCast(lane * lb + q);
+        }
+        const dst = try Dst.of(cg, inst, ty);
+        const r = destFor(cg, dst, a, b);
+        var first = true;
+        for ([2]Ref{ a, b }, masks, used) |src, m, u| {
+            if (!u) continue;
+            const t: Xmm = if (first) r else .xmm1;
+            try loadChunk(cg, t, src, 0);
+            try e.pint38(.pshufb, t, .{ .mem = try constMem(cg, m) });
+            if (!first) try e.pint(.por, r, .{ .reg = .xmm1 });
+            first = false;
+        }
         return dst.put(cg, r, 0);
     }
     // Lane by lane: both operands in memory, the result built in its own.

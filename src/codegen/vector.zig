@@ -115,6 +115,9 @@ pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Ind
         // NEON lowering comes with the aarch64 backend.
         else => return false,
     }
+    // SSE4.2 orders 64-bit integers (pcmpgtq); SSE2 only in many
+    // instructions.
+    const order64 = cpu.has(.x86, .sse4_2);
     const l = lane(ip, ty) orelse return false;
     const len = ip.keyPayload(.vector_type, ty).len;
     if (len == 0) return false;
@@ -139,17 +142,15 @@ pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Ind
         // SSE2 multiplies 16-bit lanes, and 32-bit ones through pmuludq.
         .mul_wrap => l == .i16 or l == .i32,
         .add_float, .sub_float, .mul_float, .div_float, .neg, .abs, .sqrt => l.isFloat(),
-        // SSE2 orders 64-bit integers only in many instructions.
-        .min, .max => l != .i64,
-        // A bool vector result lives in a general-purpose register;
-        // 64-bit lanes only compare equal, as for `min`.
-        .cmp => |c| len <= max_bools and (l != .i64 or c == .eq or c == .neq),
+        .min, .max => l != .i64 or order64,
+        // A bool vector result lives in a general-purpose register.
+        .cmp => |c| len <= max_bools and (l != .i64 or order64 or c == .eq or c == .neq),
         .select => len <= max_bools,
         // Float reductions are left folds, whose order a tree would
         // change.
         .reduce => |r| switch (r) {
             .@"and", .@"or", .xor, .add => !l.isFloat(),
-            .min, .max => !l.isFloat() and l != .i64,
+            .min, .max => !l.isFloat() and (l != .i64 or order64),
             .mul => l == .i16 or l == .i32,
         },
         .shuffle => true,

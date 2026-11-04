@@ -1244,7 +1244,7 @@ Today's `.auto` passes every argument in memory and returns most values
 through memory; fib, which is almost only calls, runs 1.22× as long as
 upstream Debug's.
 
-#### Vectors (built 2026-11-04, x86_64 SSE2)
+#### Vectors (built 2026-11-04, x86_64 SSE2 to SSE4.2)
 
 Explicit `@Vector` code is lowered to SIMD registers, as upstream's Debug
 backend does, not scalarized. The split has three parts:
@@ -1310,9 +1310,18 @@ saturating arithmetic, division and remainder of integers, 64-bit
 `@min`/`@max`, float reductions (a left fold, in element order, as
 upstream; a tree would change the rounding and which zero `@min`
 returns), integers wider than 64 bits, f16, f80 and f128, and anything
-longer than 128 bytes or 64 bools. With SSE4.1 (`-mcpu` features) `pmulld`,
-`pminsd`/`pmaxsd`, `pcmpeqq` and `pblendvb` would replace the SSE2
-sequences; AVX changes the vector ABI and is a separate decision.
+longer than 128 bytes or 64 bools.
+
+With `-mcpu` features (`src/cpu.zig`; up to x86-64-v2, see "Deliberate
+differences from upstream") CodeGen reads `Zcu.cpu` and uses: SSSE3
+`pshufb` for every `@shuffle` of up to 16 bytes (one per operand with a
+constant byte mask, `por`ed); SSE4.1 `pmulld`, the byte, word and dword
+`@min`/`@max` SSE2 lacks (`pminsb`, `pminuw`, `pminsd`, `pminud` and
+their `max`), so no sign flipping, and `pcmpeqq`; SSE4.2 `pcmpgtq`,
+which makes 64-bit ordering compares, `@min`/`@max` and their
+reductions native (`vector.native` answers by `cpu`). AVX changes the
+vector ABI and is a separate decision. Results are the same bits at
+every level; `-mcpu` is part of the cache key (`cacheTarget`).
 
 Narrow integers (`u4`, `i24`) sit in their ABI-size lane, extended as
 in memory, so the operations that keep lanes extended treat them as
