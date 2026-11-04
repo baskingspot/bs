@@ -985,6 +985,137 @@ fn isExpression(tree: *const Ast, start: u32, end: u32) bool {
     return false;
 }
 
+/// The node whose span is exactly `start..end`, other than a declaration.
+fn expressionAt(tree: *const Ast, start: u32, end: u32) ?Ast.Node.Index {
+    const first = tokenAt(tree, start) orelse return null;
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (tree.firstToken(node) != first or tokenEnd(tree, tree.lastToken(node)) != end) continue;
+        switch (tree.nodeTag(node)) {
+            .root, .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl, .container_field, .container_field_init, .container_field_align, .fn_decl, .test_decl => {},
+            else => return node,
+        }
+    }
+    return null;
+}
+
+/// A local `const` or `var` declaration.
+pub const Local = struct {
+    name: []const u8,
+    /// Its `const` or `var` token.
+    mut_tok: Ast.TokenIndex,
+    init: Ast.Node.OptionalIndex,
+    /// Whether it has a type, or an initializer whose type is not
+    /// comptime-only, so that `var` keeps it valid (`const a = 1;` needs
+    /// a type as well).
+    var_ok: bool,
+};
+
+/// Where a value comes from: the expression that holds it, and the local
+/// declaration that expression names, if it is a local's name.
+pub const Origin = struct {
+    node: Ast.Node.Index,
+    local: ?Local,
+};
+
+/// How far `valueOrigin` looks through the expression it is given.
+pub const OriginDepth = enum {
+    /// The expression itself.
+    self,
+    /// The operand of a field access or an indexing expression (`x` in
+    /// `x.f` and `x[i]`), an error about which points at the whole.
+    operand,
+    /// The variable whose memory a place expression names: `x` in `x`,
+    /// `x.f.g`, `x[i]`, `&x`, and in a method call's callee `x.m`.
+    root,
+};
+
+/// The origin of the value of the expression at `start..end`.
+pub fn valueOrigin(tree: *const Ast, start: u32, end: u32, depth: OriginDepth) ?Origin {
+    var node = expressionAt(tree, start, end) orelse return null;
+    switch (depth) {
+        .self => {},
+        .operand => switch (tree.nodeTag(node)) {
+            .field_access => node = tree.nodeData(node).node_and_token[0],
+            .array_access => node = tree.nodeData(node).node_and_node[0],
+            else => {},
+        },
+        .root => while (true) switch (tree.nodeTag(node)) {
+            .field_access => node = tree.nodeData(node).node_and_token[0],
+            .array_access => node = tree.nodeData(node).node_and_node[0],
+            .address_of => node = tree.nodeData(node).node,
+            .grouped_expression => node = tree.nodeData(node).node_and_token[0],
+            else => break,
+        },
+    }
+    return .{ .node = node, .local = if (tree.nodeTag(node) == .identifier) localNamed(tree, tree.nodeMainToken(node)) else null };
+}
+
+/// The local declaration in scope at `use` that its identifier names.
+/// Zig has no shadowing, so it is the one declaration of that name in the
+/// enclosing function whose block holds `use`.
+fn localNamed(tree: *const Ast, use: Ast.TokenIndex) ?Local {
+    const body = enclosingFnBody(tree, use) orelse return null;
+    const body_first = tree.firstToken(body);
+    const body_last = tree.lastToken(body);
+    const name = tree.tokenSlice(use);
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const decl = tree.fullVarDecl(node) orelse continue;
+        const mut_tok = decl.ast.mut_token;
+        if (mut_tok < body_first or mut_tok >= use or mut_tok > body_last) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(mut_tok + 1), name)) continue;
+        // The innermost block around the declaration must hold `use`.
+        var inner: ?Ast.Node.Index = null;
+        for (0..tree.nodes.len) |j| {
+            const b: Ast.Node.Index = @enumFromInt(j);
+            switch (tree.nodeTag(b)) {
+                .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+                else => continue,
+            }
+            if (tree.firstToken(b) > mut_tok or tree.lastToken(b) < mut_tok) continue;
+            if (inner == null or tree.firstToken(b) > tree.firstToken(inner.?)) inner = b;
+        }
+        const scope = inner orelse continue;
+        if (use > tree.lastToken(scope)) continue;
+        const literal = if (decl.ast.init_node.unwrap()) |init| switch (tree.nodeTag(init)) {
+            .number_literal, .char_literal, .enum_literal => true,
+            else => false,
+        } else false;
+        return .{ .name = name, .mut_tok = mut_tok, .init = decl.ast.init_node, .var_ok = decl.ast.type_node != .none or !literal };
+    }
+    return null;
+}
+
+/// Turns the `const` of `local` into `var`.
+pub fn varFix(arena: std.mem.Allocator, tree: *const Ast, local: Local) !?RawFix {
+    if (tree.tokenTag(local.mut_tok) != .keyword_const or !local.var_ok) return null;
+    return try rawFix(arena, .maybe, &.{replaceToken(tree, local.mut_tok, "var")});
+}
+
+/// Unwraps the error union or optional value of expression `node`: puts
+/// `try ` before it, in parentheses when a suffix operator follows it, or
+/// `.?` after it. Null unless `node` is a primary or suffix expression
+/// (which `try` and `.?` take whole), or in a `defer`.
+pub fn unwrapFix(arena: std.mem.Allocator, tree: *const Ast, node: Ast.Node.Index, how: enum { @"try", optional }) !?RawFix {
+    switch (tree.nodeTag(node)) {
+        .identifier, .field_access, .array_access, .unwrap_optional, .deref, .grouped_expression, .call, .call_comma, .call_one, .call_one_comma, .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {},
+        else => return null,
+    }
+    const start = tree.tokenStart(tree.firstToken(node));
+    const last = tree.lastToken(node);
+    const end = tokenEnd(tree, last);
+    if (how == .optional) return try rawFix(arena, .maybe, &.{.{ .start = end, .end = end, .text = ".?" }});
+    // Not in a `defer`.
+    if (try tryFix(arena, tree, start, end, true) == null) return null;
+    const suffix = switch (tree.tokenTag(last + 1)) {
+        .period, .l_bracket, .l_paren, .period_asterisk => true,
+        else => false,
+    };
+    if (!suffix) return try rawFix(arena, .maybe, &.{.{ .start = start, .end = start, .text = "try " }});
+    return try rawFix(arena, .maybe, &.{ .{ .start = start, .end = start, .text = "(try " }, .{ .start = end, .end = end, .text = ")" } });
+}
+
 /// Adds prongs `prongs` (`.b => @panic("TODO"),`) to the switch whose
 /// `switch` keyword starts at byte `offset`: each on its own line before
 /// the closing brace, or on the brace's line when the switch is on one.

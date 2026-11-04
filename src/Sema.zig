@@ -8253,6 +8253,15 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
         else => null,
     };
     if (cast) |c| try sema.addFix(src, @import("diag.zig").wrapFix, .{ c, ")" });
+    // Where the value comes from, after upstream's notes.
+    if (ip.keyTag(actual) == .error_union_type and ip.keyPayload(.error_union_type, actual).payload_type == wanted)
+        try sema.noteOrigin(block, src, .self, .error_union)
+    else if (ip.keyTag(actual) == .opt_type and ip.keyPayload(.opt_type, actual) == wanted)
+        try sema.noteOrigin(block, src, .self, .optional)
+    else if (Type.class(ip, wanted) == .pointer and Type.class(ip, actual) == .pointer and
+        !Type.ptrInfo(ip, wanted).flags.is_const and Type.ptrInfo(ip, actual).flags.is_const)
+        // A pointer to a constant where a mutable one is wanted.
+        try sema.noteOrigin(block, src, .root, .@"const");
     return err;
 }
 
@@ -10002,7 +10011,15 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
     const class = Type.class(ip, ty);
     if (class == .float or class == .comptime_float) return sema.analyzeFloatArithmetic(block, src, tag, ty, uncasted_lhs, uncasted_rhs);
     if (!(class == .int or class == .comptime_int or (is_bool and (tag == .bit_and or tag == .bit_or or tag == .xor)))) {
-        return sema.fail(block, src, "invalid operands to binary expression: '{f}' and '{f}'", .{ sema.fmtType(sema.typeOf(uncasted_lhs)), sema.fmtType(sema.typeOf(uncasted_rhs)) });
+        const err = sema.fail(block, src, "invalid operands to binary expression: '{f}' and '{f}'", .{ sema.fmtType(sema.typeOf(uncasted_lhs)), sema.fmtType(sema.typeOf(uncasted_rhs)) });
+        for ([_]Ref{ uncasted_lhs, uncasted_rhs }, 0..) |operand, i| switch (Type.class(ip, sema.typeOf(operand))) {
+            .optional, .error_union => {
+                try sema.noteUnwrap(block, src.operandSrc(@intCast(i)), .self, sema.typeOf(operand));
+                break;
+            },
+            else => {},
+        };
+        return err;
     }
     const lhs = try sema.coerce(block, ty, uncasted_lhs, src);
     const rhs = try sema.coerce(block, ty, uncasted_rhs, src);
@@ -12068,7 +12085,11 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
     // Errors about the destination and the stored value point at them, as
     // upstream.
     const ptr_src: Src = if (src.nodeOffset()) |off| .{ .base = src.base, .loc = .{ .store_ptr = off } } else src;
-    if (info.flags.is_const) return sema.fail(block, ptr_src, "cannot assign to constant", .{});
+    if (info.flags.is_const) {
+        const err = sema.fail(block, ptr_src, "cannot assign to constant", .{});
+        try sema.noteOrigin(block, ptr_src, .root, .@"const");
+        return err;
+    }
     const operand_src = sema.storeOperandSrc(src);
     const operand = try sema.coerce(block, info.child, uncasted, operand_src);
     if (sema.resolveValue(ptr)) |pv| if (!sema.bcForeign(pv)) {
@@ -13922,7 +13943,58 @@ fn failInvalidFieldAccess(sema: *Sema, block: *Block, src: Src, ty: Index, name:
     if (!supports) return sema.fail(block, src, "type '{f}' does not support field access", .{sema.fmtType(ty)});
     const err = sema.fail(block, src, "{s} type '{f}' does not support field access", .{ kind.?, sema.fmtType(ty) });
     try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "{s}", .{if (Type.class(ip, ty) == .optional) "consider using '.?', 'orelse', or 'if'" else "consider using 'try', 'catch', or 'if'"});
+    try sema.noteOrigin(block, src, .operand, if (Type.class(ip, ty) == .optional) .optional else .error_union);
     return err;
+}
+
+/// What is wrong with a value, for `noteOrigin`.
+const OriginKind = enum { error_union, optional, @"const" };
+
+/// Notes where the value at `operand` (`depth` into it) comes from, for
+/// the most recent error, and gives the error the fix there, as agents
+/// need when the mistake is at the declaration rather than the use. An
+/// error union or optional held by a local is noted at the local's
+/// initializer, the call that returned it, which the fix unwraps (with
+/// `try` only where the function can return the error); one that is not
+/// a local's is unwrapped where it is used. A constant local is noted at
+/// its declaration, which the fix makes `var`.
+fn noteOrigin(sema: *Sema, block: *Block, operand: Src, depth: @import("diag.zig").OriginDepth, kind: OriginKind) CompileError!void {
+    const diag = @import("diag.zig");
+    const zcu = sema.zcu;
+    const tree = try zcu.fe.tree(@fromBackingInt(sema.file));
+    const span = operand.span(tree);
+    const origin = diag.valueOrigin(tree, span.start, span.end, depth) orelse return;
+    const arena = zcu.arena.allocator();
+    const fix = switch (kind) {
+        .@"const" => fix: {
+            const local = origin.local orelse return;
+            if (tree.tokenTag(local.mut_tok) != .keyword_const) return;
+            if (local.var_ok)
+                try zcu.addDeclNote(sema.file, tree.tokenToSpan(local.mut_tok + 1), "'{s}' is declared 'const'; declare it with 'var' to modify it", .{local.name})
+            else
+                try zcu.addDeclNote(sema.file, tree.tokenToSpan(local.mut_tok + 1), "'{s}' is declared 'const'; declare it with 'var' and a type to modify it", .{local.name});
+            break :fix try diag.varFix(arena, tree, local);
+        },
+        .error_union, .optional => fix: {
+            var node = origin.node;
+            if (origin.local) |local| {
+                node = local.init.unwrap() orelse return;
+                const what, const how = if (kind == .error_union) .{ "error union", "'try' or 'catch'" } else .{ "optional", "'.?' or 'orelse'" };
+                var buf: [1]Ast.Node.Index = undefined;
+                const callee: ?[]const u8 = if (tree.fullCall(&buf, node)) |call| tree.getNodeSource(call.ast.fn_expr) else null;
+                if (callee != null and callee.?.len <= 60)
+                    try zcu.addNote(sema.file, tree.nodeToSpan(node), "'{s}' holds the {s} returned by '{s}'; consider using {s} here", .{ local.name, what, callee.?, how })
+                else
+                    try zcu.addNote(sema.file, tree.nodeToSpan(node), "'{s}' holds this {s}; consider using {s} here", .{ local.name, what, how });
+            }
+            if (kind == .optional) break :fix try diag.unwrapFix(arena, tree, node, .optional);
+            const ret_ty = sema.currentRetTy(block);
+            if (ret_ty == .none or Type.class(sema.ip, ret_ty) != .error_union) return;
+            break :fix try diag.unwrapFix(arena, tree, node, .@"try");
+        },
+    };
+    const last = &zcu.errors.items[zcu.errors.items.len - 1];
+    if (last.fix == null) last.fix = fix;
 }
 
 /// A struct's or opaque type's missing member is reported at
@@ -14063,6 +14135,7 @@ fn checkMemOperand(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError
     const err = sema.fail(block, src, "type '{f}' is not an indexable pointer", .{sema.fmtType(ty)});
     const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
     try sema.zcu.addNote(sema.file, src.span(tree), "operand must be a slice, a many pointer or a pointer to an array", .{});
+    try sema.noteUnwrap(block, src, .self, ty);
     return err;
 }
 
@@ -14869,7 +14942,23 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
         else => {},
     }
     if (p.flags.size == .many or p.flags.size == .slice) return sema.fail(block, src, "expected pointer to an indexable object, found '{f}'", .{sema.fmtType(ptr_ty)});
-    return sema.fail(block, src, "type '{f}' does not support indexing", .{sema.fmtType(child)});
+    const err = sema.fail(block, src, "type '{f}' does not support indexing", .{sema.fmtType(child)});
+    try sema.noteUnwrap(block, src, .operand, child);
+    return err;
+}
+
+/// Notes on the most recent error, about the value at `src` (`depth`
+/// into it) of type `ty`, that an optional or error union needs
+/// unwrapping first, and where it comes from (`noteOrigin`).
+fn noteUnwrap(sema: *Sema, block: *Block, src: Src, depth: @import("diag.zig").OriginDepth, ty: Index) CompileError!void {
+    const kind: OriginKind = switch (Type.class(sema.ip, ty)) {
+        .optional => .optional,
+        .error_union => .error_union,
+        else => return,
+    };
+    const span = src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+    try sema.zcu.addNote(sema.file, span, "{s}", .{if (kind == .optional) "consider using '.?', 'orelse', or 'if'" else "consider using 'try', 'catch', or 'if'"});
+    try sema.noteOrigin(block, src, depth, kind);
 }
 
 /// `elem_ptr`: `&lhs[index]` where `lhs` itself is the pointer (a for
@@ -15008,7 +15097,11 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
             const iv = sema.resolveValue(try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1))) orelse return sema.fail(block, src, "tuple index must be comptime-known", .{});
             return sema.tupleField(block, lhs, @intCast(ip.intValue(u64, iv).?));
         },
-        else => return sema.fail(block, src, "type '{f}' does not support indexing", .{sema.fmtType(ty)}),
+        else => {
+            const err = sema.fail(block, src, "type '{f}' does not support indexing", .{sema.fmtType(ty)});
+            try sema.noteUnwrap(block, src, .operand, ty);
+            return err;
+        },
     }
 }
 
@@ -15373,7 +15466,16 @@ fn zirForLen(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
                 const err = sema.fail(block, arg_src, "type '{f}' is not indexable and not a range", .{sema.fmtType(ty)});
                 const span = arg_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
                 try sema.zcu.addNote(sema.file, span, "for loop operand must be a range, array, slice, tuple, or vector", .{});
-                if (Type.class(ip, ty) == .error_union) try sema.zcu.addNote(sema.file, span, "consider using 'try', 'catch', or 'if'", .{});
+                if (Type.class(ip, ty) == .error_union) {
+                    try sema.zcu.addNote(sema.file, span, "consider using 'try', 'catch', or 'if'", .{});
+                    // The input alone (`arg_src` of the first spans them all).
+                    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+                    const input: Src = if (src.nodeOffset()) |off| if (tree.fullFor(off.toAbsolute(src.base))) |f|
+                        .{ .base = src.base, .loc = .{ .node_abs = f.ast.inputs[i / 2] } }
+                    else
+                        arg_src else arg_src;
+                    try sema.noteOrigin(block, input, .self, .error_union);
+                }
                 return err;
             }
             break :blk try sema.coerce(block, .usize_type, try sema.fieldVal(block, src, obj, "len"), src);
@@ -18546,8 +18648,11 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
             return sema.analyzeCall(block, src, callee, .none, args, modifier);
         }
     }
-    const nav = (try sema.lookupInType(container, name)) orelse
-        return sema.withCandidates(sema.fail(block, src.callFunc(), "no field or member function named '{s}' in '{f}'", .{ name, sema.fmtType(container) }), container, name, .fields_and_members);
+    const nav = (try sema.lookupInType(container, name)) orelse {
+        const err = sema.withCandidates(sema.fail(block, src.callFunc(), "no field or member function named '{s}' in '{f}'", .{ name, sema.fmtType(container) }), container, name, .fields_and_members);
+        try sema.noteUnwrap(block, src.callFunc(), .operand, container);
+        return err;
+    };
     const callee = try sema.navVal(block, src, nav);
     const callee_ty = sema.typeOf(callee);
     // As upstream's fieldCallBind, a declaration is a member function only
