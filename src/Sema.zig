@@ -57,8 +57,6 @@ inst_map: InstMap = .{},
 /// Emptied instruction lists of finished blocks, which `Block.child`
 /// reuses: analysis makes millions of short-lived child blocks.
 insts_pool: std.ArrayList(std.ArrayList(Ir.Inst.Index)) = .empty,
-/// Stop a `type_layout` unit after its field types (`Zcu.ensureFieldTypes`).
-field_types_only: bool = false,
 /// Why this unit's next layout request asks (`resolveLayoutFor`).
 dep_reason: DepReason = .none,
 /// Resolving the declared type of `owner`'s declaration: its `nav_ty` in
@@ -203,7 +201,7 @@ pub const CompileError = error{
     DependencyLoop,
     /// A dependency loop while `Zcu.speculating`: the speculative
     /// resolution gives up, unreported, and the units it started go back
-    /// to unresolved (see `resolveFieldTypesDeep`).
+    /// to unresolved (see `Replay`'s `func_inline`).
     Speculation,
     /// Comptime control flow: `sema.comptime_break_inst` breaks out to an
     /// enclosing body.
@@ -1239,8 +1237,7 @@ fn keepPhaseDeps(sema: *Sema) !void {
 /// Declares the dependencies `keepPhaseDeps` kept for this unit, first, as
 /// if its first phase had run as part of it.
 fn takePhaseDeps(sema: *Sema) !void {
-    // Kept, not taken: a run that a speculation aborts (see
-    // `resolveFieldTypesDeep`) needs them again.
+    // Kept, not taken: a run that a speculation aborts needs them again.
     const kept = sema.zcu.phase_deps.get(sema.owner) orelse return;
     for (kept.deps, kept.conditional) |d, c| try sema.declareDep(d, c);
 }
@@ -1324,17 +1321,6 @@ pub fn analyzeComptimeDecl(zcu: *Zcu, c: Zcu.ComptimeDecl) CompileError!void {
 }
 
 pub fn analyzeStructLayout(zcu: *Zcu, ty: Index) CompileError!void {
-    return analyzeTypeLayout(zcu, ty, false);
-}
-
-/// `Zcu.ensureFieldTypes`: the first phase of a declared struct's or
-/// union's `type_layout` unit, which then declares the dependencies it
-/// recorded and takes up from `.have_field_types`.
-pub fn analyzeFieldTypes(zcu: *Zcu, ty: Index) CompileError!void {
-    return analyzeTypeLayout(zcu, ty, true);
-}
-
-fn analyzeTypeLayout(zcu: *Zcu, ty: Index, field_types_only: bool) CompileError!void {
     const ip = &zcu.ip;
     const key = ip.containerType(ty).?;
     const info = ip.structInfo(ty);
@@ -1342,7 +1328,6 @@ fn analyzeTypeLayout(zcu: *Zcu, ty: Index, field_types_only: bool) CompileError!
     defer arena_state.deinit();
     var sema = create(zcu, arena_state.allocator(), key.file, .{ .type_layout = ty });
     defer sema.destroy();
-    sema.field_types_only = field_types_only;
     switch (ip.keyTag(ty)) {
         .struct_type => {},
         .enum_type => return sema.analyzeEnumLayout(key, info),
@@ -1363,12 +1348,7 @@ fn analyzeTypeLayout(zcu: *Zcu, ty: Index, field_types_only: bool) CompileError!
     const aligns = try sema.arena.alloc(u64, n);
     @memset(aligns, 0);
     var it = decl.iterateFields();
-    if (info.status == .have_field_types) {
-        // `Zcu.ensureFieldTypes` resolved them on their own.
-        try sema.takePhaseDeps();
-        if (info.field_aligns.len != 0) @memcpy(aligns, info.field_aligns);
-    } else try sema.structFieldTypes(&block, key, info, decl, aligns);
-    if (sema.field_types_only) return sema.keepPhaseDeps();
+    try sema.structFieldTypes(&block, key, info, decl, aligns);
     const types = info.field_types;
     const is_comptime = info.field_is_comptime;
 
@@ -1757,14 +1737,9 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
             .@"packed" => .@"packed",
         };
     } else kind = decl.kind;
-    phase: {
+    {
         // A reified union's types come with it (`fillReifiedInfo`); the
         // rest of the phase still sets its tag.
-        if (info.status == .have_field_types and reify_node == null) {
-            // `Zcu.ensureFieldTypes` resolved them on their own.
-            try sema.takePhaseDeps();
-            break :phase;
-        }
         info.status = .field_types_wip;
         if (reify_node == null) {
             const n = decl.field_names.len;
@@ -1910,7 +1885,6 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
             },
         }
         info.status = .have_field_types;
-        if (sema.field_types_only) return sema.keepPhaseDeps();
     }
     const types = info.field_types;
 
@@ -1987,7 +1961,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     try sema.resolveLayout(&block, block.nodeSrc(.zero), fn_ty.return_type);
     // A generic function has no runtime body; asking for one can only
     // mean resolving its inferred error set, as upstream says.
-    if (fn_ty.is_generic and func.generic_owner == .none)
+    if (func.generic_owner == .none and Type.fnIsGeneric(ip, fn_ty))
         return sema.fail(&block, block.nodeSrc(.zero), "cannot resolve inferred error set of generic function type '{f}'", .{sema.fmtType(func.ty)});
 
     const fn_info = sema.code.getFnInfo(func.zir_inst);
@@ -2788,9 +2762,7 @@ fn noteEffects(sema: *Sema, ty: Index, file_root: bool) Allocator.Error!void {
 fn fnHasRuntimeBits(sema: *Sema, fn_ty: Index) bool {
     const ip = sema.ip;
     const f = ip.keyPayload(.func_type, fn_ty);
-    if (f.is_generic or f.comptime_bits != 0) return false;
-    for (f.param_types) |p| if (Type.isComptimeOnly(ip, p)) return false;
-    return !Type.isComptimeOnly(ip, f.return_type);
+    return !Type.fnIsGeneric(ip, f) and !Type.isComptimeOnly(ip, f.return_type);
 }
 
 /// Queues `func`, which this unit refers to other than by calling it (its
@@ -3040,62 +3012,6 @@ fn ensureNavVal(sema: *Sema, block: *Block, src: Src, nav: InternPool.NavIndex) 
     try sema.pushDep(src, .{ .nav_val = nav });
     defer sema.popDep();
     sema.zcu.ensureNavVal(nav) catch |err| return sema.depLoop(block, src, err);
-}
-
-/// Resolves the field types of the structs and unions `ty` holds by value,
-/// recursively, without their layouts (`Zcu.ensureFieldTypes`), so that
-/// `Type.isComptimeOnly` answers from complete fields. A type whose field
-/// types are being resolved further up is taken as it is, as upstream's
-/// `comptimeOnlySema` assumes it is not comptime-only. The dependency is
-/// conditional: a green unit's result does not need the type's layout,
-/// and resolving it could lead back to the unit.
-fn resolveFieldTypesDeep(sema: *Sema, block: *Block, src: Src, ty: Index, seen: *std.AutoHashMapUnmanaged(Index, void)) CompileError!void {
-    const ip = sema.ip;
-    switch (Type.class(ip, ty)) {
-        .array, .vector, .optional => return sema.resolveFieldTypesDeep(block, src, Type.childType(ip, ty), seen),
-        .error_union => return sema.resolveFieldTypesDeep(block, src, ip.keyPayload(.error_union_type, ty).payload_type, seen),
-        .tuple => {
-            const t = ip.keyPayload(.tuple_type, ty);
-            for (t.types, t.values) |ft, fv| if (fv == .none) try sema.resolveFieldTypesDeep(block, src, ft, seen);
-            return;
-        },
-        .@"struct", .@"union" => {},
-        else => return,
-    }
-    const info = ip.structInfo(ty);
-    switch (info.status) {
-        .field_types_wip, .failed => return,
-        // Further up, past its field types.
-        .layout_wip => {},
-        .have_layout => {
-            // Its by-value fields' layouts, and so their field types, are
-            // resolved too.
-            try sema.declareDep(.{ .type_layout = ty }, true);
-            return;
-        },
-        .none => {
-            try sema.declareDep(.{ .type_layout = ty }, true);
-            try sema.bcRequire(false);
-            try sema.noteReference(.{ .type_layout = ty }, src);
-            // Speculatively: upstream never asks this of a function type,
-            // so a loop through a unit in progress (`const FnPtr =
-            // *const fn (@This()) void;` read by the struct's own field)
-            // is no error. The type is then taken without its fields, as
-            // `comptimeOnlySema` takes one whose fields are being resolved.
-            try sema.pushDep(src, .{ .type_layout = ty });
-            sema.zcu.speculating += 1;
-            const res = sema.zcu.ensureFieldTypes(ty);
-            sema.popDep();
-            sema.zcu.speculating -= 1;
-            res catch |err| switch (err) {
-                error.Speculation => return,
-                else => return sema.depLoop(block, src, err),
-            };
-        },
-        .have_field_types => try sema.declareDep(.{ .type_layout = ty }, true),
-    }
-    if ((try seen.getOrPut(sema.arena, ty)).found_existing) return;
-    for (info.field_types, 0..) |ft, i| if (!info.fieldIsComptime(i)) try sema.resolveFieldTypesDeep(block, src, ft, seen);
 }
 
 /// Resolves the type of declaration `nav` (`Zcu.ensureNavTy`), recording
@@ -6243,7 +6159,7 @@ fn typeInfo(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!Index 
             const pattrs_ty = try sema.stdLangType(block, src, "Type.Fn.ParamAttributes");
             const ptypes = try sema.arena.alloc(Index, f.param_types.len);
             const pattrs = try sema.arena.alloc(Index, f.param_types.len);
-            var is_generic = f.is_generic;
+            var is_generic = false;
             for (f.param_types, ptypes, pattrs, 0..) |pt, *t, *a, i| {
                 const generic = pt == .generic_poison_type;
                 if (generic or (i < 32 and (f.comptime_bits >> @intCast(i)) & 1 != 0) or (!generic and (try sema.isComptimeOnlyResolved(block, src, pt)))) is_generic = true;
@@ -8535,8 +8451,10 @@ fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: 
                 if (w.is_var_args != a.is_var_args)
                     return zcu.addNote(file, span, "{s}variadic function cannot cast into a {s}variadic function", .{ if (a.is_var_args) "" else "non-", if (w.is_var_args) "" else "non-" });
                 if (w.cc != a.cc) return zcu.addNote(file, span, "calling convention '{s}' cannot cast into calling convention '{s}'", .{ @tagName(a.cc), @tagName(w.cc) });
-                if (w.is_generic != a.is_generic)
-                    return zcu.addNote(file, span, "{s}generic function cannot cast into a {s}generic function", .{ if (a.is_generic) "" else "non-", if (w.is_generic) "" else "non-" });
+                const w_generic = !sema.fnHasRuntimeBits(wanted);
+                const a_generic = !sema.fnHasRuntimeBits(actual);
+                if (w_generic != a_generic)
+                    return zcu.addNote(file, span, "{s}generic function cannot cast into a {s}generic function", .{ if (a_generic) "" else "non-", if (w_generic) "" else "non-" });
                 const ret_ok = a.return_type == w.return_type or a.return_type == .noreturn_type or a.return_type == .generic_poison_type or
                     sema.childCoercibleInMemory(a.return_type, w.return_type) or
                     (ip.keyTag(a.return_type) == .error_union_type and ip.keyTag(w.return_type) == .error_union_type and
@@ -8550,6 +8468,13 @@ fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: 
                 if (w.param_types.len != a.param_types.len)
                     return zcu.addNote(file, span, "function with {d} parameters cannot cast into a function with {d} parameters", .{ a.param_types.len, w.param_types.len });
                 for (a.param_types, w.param_types, 0..) |ap, wp, i| {
+                    if (i < 32) {
+                        const bit = @as(u32, 1) << @intCast(i);
+                        const a_ct = a.comptime_bits & bit != 0;
+                        const w_ct = w.comptime_bits & bit != 0;
+                        if (a_ct != w_ct and !(a_ct and wp != .generic_poison_type and Type.isComptimeOnly(ip, wp)))
+                            return zcu.addNote(file, span, "{s}comptime parameter {d} cannot cast into a {s}comptime parameter", .{ if (a_ct) "" else "non-", i, if (w_ct) "" else "non-" });
+                    }
                     if (ap == wp or ap == .generic_poison_type or wp == .generic_poison_type or sema.paramPtrCoercible(wp, ap) or
                         sema.cPtrOptCoercibleInMemory(wp, ap) or sema.cPtrOptCoercibleInMemory(ap, wp)) continue;
                     try zcu.addNote(file, span, "parameter {d} '{f}' cannot cast into '{f}'", .{ i, sema.fmtType(ap), sema.fmtType(wp) });
@@ -8958,7 +8883,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             if (ip.keyTag(v) != .func or !try sema.fnTypeCoercible(block, src, v, dest_ty)) return null;
             // A generic function takes the parameter types of the type it
             // coerces to, which its calls then coerce arguments to.
-            if (ip.keyPayload(.func_type, dest_ty).is_generic and dest_ty != src_ty) {
+            if (dest_ty != src_ty and Type.fnIsGeneric(ip, ip.keyPayload(.func_type, dest_ty))) {
                 var f = ip.keyPayload(.func, v);
                 f.ty = dest_ty;
                 return .fromInterned(try sema.intern(.{ .func = f }));
@@ -9589,17 +9514,23 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
     if (Type.class(ip, dst) != .@"fn") return false;
     const s = ip.keyPayload(.func_type, src);
     const d = ip.keyPayload(.func_type, dst);
-    if (s.cc != d.cc or s.is_var_args != d.is_var_args or s.is_generic != d.is_generic or
+    if (s.cc != d.cc or s.is_var_args != d.is_var_args or
         s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits) return false;
+    // Whether either is generic, as upstream: from the parameter and return
+    // types' layouts, which a declaration has resolved already.
+    for (d.param_types) |b| try sema.resolveLayout(block, src_loc, b);
+    try sema.resolveLayout(block, src_loc, d.return_type);
+    if (sema.fnHasRuntimeBits(src) != sema.fnHasRuntimeBits(dst)) return false;
+    // As upstream, a `comptime` parameter may drop the annotation where its
+    // type is comptime-only: it stays comptime-known either way.
+    if (s.comptime_bits != d.comptime_bits) for (d.param_types, 0..) |b, i| {
+        if (i >= 32) break;
+        const bit = @as(u32, 1) << @intCast(i);
+        if (s.comptime_bits & bit == d.comptime_bits & bit) continue;
+        if (s.comptime_bits & bit == 0 or b == .generic_poison_type or !Type.isComptimeOnly(ip, b)) return false;
+    };
     // Parameters coerce the other way, in memory; a generic one matches any.
-    for (s.param_types, d.param_types, 0..) |a, b, i| {
-        // `comptime` must match, except where zap made a parameter of a
-        // comptime-only type implicitly comptime and upstream does not.
-        const bit = @as(u32, 1) << @intCast(@min(i, 31));
-        if (i < 32 and (s.comptime_bits & bit) != (d.comptime_bits & bit)) {
-            const comptime_side = if (s.comptime_bits & bit != 0) a else b;
-            if (comptime_side == .generic_poison_type or !(try sema.isComptimeOnlyResolved(block, src_loc, comptime_side))) return false;
-        }
+    for (s.param_types, d.param_types) |a, b| {
         if (a == b or a == .generic_poison_type or b == .generic_poison_type) continue;
         if (sema.paramPtrCoercible(b, a)) continue;
         if (sema.cPtrOptCoercibleInMemory(b, a) or sema.cPtrOptCoercibleInMemory(a, b)) continue;
@@ -9632,8 +9563,9 @@ fn fnTypeCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     const ip = sema.ip;
     const s = ip.keyPayload(.func_type, src);
     const d = ip.keyPayload(.func_type, dst);
-    if (s.cc != d.cc or s.is_var_args != d.is_var_args or s.is_generic != d.is_generic or s.comptime_bits != d.comptime_bits or
-        s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits) return false;
+    if (s.cc != d.cc or s.is_var_args != d.is_var_args or s.comptime_bits != d.comptime_bits or
+        s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits or
+        sema.fnHasRuntimeBits(src) != sema.fnHasRuntimeBits(dst)) return false;
     for (s.param_types, d.param_types) |a, b| {
         if (a == b or sema.paramPtrCoercible(b, a)) continue;
         if (sema.errorCoercibleInMemory(b, a)) continue;
@@ -14558,17 +14490,12 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
     };
     const is_var_args = try sema.structFieldValue(attrs, "varargs") == .bool_true;
     if (is_var_args and cc != .c and cc != .x86_64_win) return sema.failVarArgsCc(block, sema.callArgSrc(src, false, 3), cc);
-    var is_generic = false;
-    for (params) |pt| if ((try sema.isComptimeOnlyResolved(block, src, pt))) {
-        is_generic = true;
-    };
     return .fromInterned(try sema.intern(.{ .func_type = .{
         .param_types = try sema.arena.dupe(Index, params),
         .return_type = ret_ty,
         .cc = cc,
         .is_var_args = is_var_args,
         .noalias_bits = noalias_bits,
-        .is_generic = is_generic or (try sema.isComptimeOnlyResolved(block, src, ret_ty)),
     } }));
 }
 
@@ -18588,16 +18515,13 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     // As upstream, a function declaration's parameter and return types
     // have their layouts resolved, which records them as dependencies of
     // the declaration: whether a parameter is comptime-only decides how
-    // the function is called. A function type resolves only their field
-    // types, as upstream's `comptimeOnlySema`, so that it may name a type
-    // whose layout is being resolved.
+    // the function is called (`Type.fnIsGeneric`). A function type reads
+    // nothing about them, so it may name a type whose layout is being
+    // resolved.
     const is_decl = body_len != 0 or (sema.owner_nav != .none and ip.getNav(sema.owner_nav).linkage == .@"extern");
     if (is_decl) {
         for (params) |p| try sema.resolveLayout(block, src, p.ty);
         try sema.resolveLayout(block, src, ret_ty);
-    } else {
-        var seen: std.AutoHashMapUnmanaged(Index, void) = .empty;
-        for (params) |p| if (!p.is_comptime and p.ty != .generic_poison_type) try sema.resolveFieldTypesDeep(block, src, p.ty, &seen);
     }
     // A calling convention other than Zig's takes only extern-compatible
     // types (upstream's `checkParamType` and `validateResolvedFuncType`).
@@ -18618,19 +18542,15 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             try sema.checkExtern(block, ret_src, ret_ty, .ret_ty, "return type '{f}' not allowed in function with calling convention '{s}'", .{ FmtType{ .ip = ip, .ty = ret_ty, .decl_note = false }, cc_name });
         }
     }
-    var is_generic = ret_ty == .generic_poison_type;
     var comptime_bits: u32 = 0;
     const param_types = try sema.arena.alloc(Index, params.len);
     for (params, param_types, 0..) |p, *t, k| {
         t.* = p.ty;
-        // Parameters of comptime-only types are implicitly comptime.
-        const is_comptime = p.is_comptime or (p.ty != .generic_poison_type and Type.isComptimeOnly(ip, p.ty));
-        if (is_comptime) {
+        if (p.is_comptime) {
             // Like upstream, only the first 32 parameters can be comptime.
             if (k >= 32) return sema.fail(block, src, "zap does not support comptime parameters after the 32nd", .{});
             comptime_bits |= @as(u32, 1) << @intCast(k);
         }
-        if (is_comptime or p.ty == .generic_poison_type) is_generic = true;
     }
     const fn_ty = try sema.intern(.{ .func_type = .{
         .param_types = param_types,
@@ -18639,7 +18559,6 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         .is_var_args = is_var_args,
         .comptime_bits = comptime_bits,
         .noalias_bits = noalias_bits,
-        .is_generic = is_generic,
     } });
     if (body_len == 0) return .fromInterned(fn_ty);
     if (sema.owner_nav == .none) return sema.fail(block, src, "function declared outside of a declaration", .{});
@@ -18961,15 +18880,12 @@ fn analyzeCall(
                     fn_ty.param_types[arg_i];
                 try sema.inst_map.put(sema.gpa, zir_args.call_inst, .fromInterned(param_ty));
                 // As upstream, an argument to a comptime parameter is
-                // evaluated at comptime.
+                // evaluated at comptime. One to a parameter of a
+                // comptime-only type is evaluated at runtime and only needs
+                // to be comptime-known.
                 var ct_block = block.child();
                 defer ct_block.deinitInsts();
-                // A parameter of a comptime-only type is comptime too
-                // (`comptime_bits`), but its argument is evaluated at
-                // runtime and only needs to be comptime-known.
-                if (arg_i < 32 and (fn_ty.comptime_bits >> @intCast(arg_i)) & 1 != 0 and
-                    (func == .none or param_ty == .generic_poison_type or !Type.isComptimeOnly(ip, param_ty) or sema.paramDeclaredComptime(func, arg_i)))
-                {
+                if (arg_i < 32 and (fn_ty.comptime_bits >> @intCast(arg_i)) & 1 != 0) {
                     ct_block.is_comptime = true;
                     ct_block.comptime_reason = "argument to comptime parameter must be comptime-known";
                 }
@@ -19015,6 +18931,10 @@ fn analyzeCall(
     if (modifier == .never_inline and (comptime_call or is_inline))
         return sema.fail(block, src, "cannot perform {s} call with 'never_inline' modifier", .{if (comptime_call) "comptime" else "inline"});
     if (func == .none) {
+        for (fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
+        try sema.resolveLayout(block, src, ret_ty);
+        // As upstream, also a comptime-only result.
+        if (!sema.fnHasRuntimeBits(fn_ty_index)) return sema.failNeededComptime(block, src.callFunc(), "generic function being called must be comptime-known");
         if (extern_func != .none and (comptime_call or is_inline)) {
             const err = sema.fail(block, src, "{s} call of extern function", .{if (comptime_call) "comptime" else "inline"});
             if (block.comptime_reason) |r| try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "{s}", .{r});
@@ -19028,10 +18948,7 @@ fn analyzeCall(
             const name = ip.keyPayload(.extern_func, extern_func).name;
             break :blk try sema.addInst(block, .{ .tag = .extern_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(name) } } });
         };
-        if (fn_ty.is_generic) return sema.fail(block, src, "cannot call a generic function through a pointer", .{});
         try sema.requireRuntime(block, src);
-        for (fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
-        try sema.resolveLayout(block, src, ret_ty);
         if (modifier == .always_tail) return sema.failTailCall(block, src);
         if (fn_ty.cc == .auto) sema.has_error_trace = true;
         const payload = try sema.addExtra(Ir.Call{ .ret_ty = ret_ty, .args_len = @intCast(args.len) });
@@ -19072,7 +18989,7 @@ fn analyzeCall(
     if (sema.func_is_naked) return sema.failNakedCall(block, src, call_args_in);
     var callee_func = func;
     var call_args = args;
-    if (fn_ty.is_generic) {
+    if (Type.fnIsGeneric(ip, fn_ty)) {
         const inst = try sema.instantiate(block, src, func, args, first_arg != .none);
         callee_func = inst.func;
         call_args = inst.runtime_args;
@@ -19213,25 +19130,6 @@ fn calleeBlock(sema: *Sema, parent: *Block, func: Index) Block {
         // its own, as upstream evaluates it lazily.
         .discards_runtime = parent.discards_runtime,
     };
-}
-
-/// Whether parameter `i` of `func` is declared `comptime`, which
-/// `comptime_bits` does not tell from being of a comptime-only type.
-fn paramDeclaredComptime(sema: *Sema, func: Index, i: usize) bool {
-    const ip = sema.ip;
-    const f = ip.keyPayload(.func, func);
-    const code = &sema.zcu.file(ip.getNav(f.owner_nav).file).zir;
-    var k: usize = 0;
-    for (code.getFnInfo(f.zir_inst).param_body) |inst| {
-        const tag = code.instructions.items(.tag)[@backingInt(inst)];
-        switch (tag) {
-            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {},
-            else => continue,
-        }
-        if (k == i) return tag == .param_comptime or tag == .param_anytype_comptime;
-        k += 1;
-    }
-    return false;
 }
 
 /// Maps the parameters of `func` (whose ZIR is current) to `args`, evaluating
@@ -20181,7 +20079,8 @@ fn bcLowerBody(sema: *Sema, func_index: Index, args: []const Index, params: *std
     defer ct.deinitInsts();
     const src = block.nodeSrc(.zero);
     const fn_info = sema.code.getFnInfo(func.zir_inst);
-    const comptime_args = try sema.arena.alloc(Index, if (fn_ty.is_generic) args.len else 0);
+    const is_generic = Type.fnIsGeneric(ip, fn_ty);
+    const comptime_args = try sema.arena.alloc(Index, if (is_generic) args.len else 0);
     var runtime_types: std.ArrayList(Index) = .empty;
     var zir_param_i: u32 = 0;
     for (fn_info.param_body) |inst| {
@@ -20192,7 +20091,7 @@ fn bcLowerBody(sema: *Sema, func_index: Index, args: []const Index, params: *std
         }
         defer zir_param_i += 1;
         const k = zir_param_i;
-        const pt = if (!fn_ty.is_generic) fn_ty.param_types[k] else switch (tag) {
+        const pt = if (!is_generic) fn_ty.param_types[k] else switch (tag) {
             .param_anytype, .param_anytype_comptime => ip.typeOf(args[k]),
             else => if (fn_ty.param_types[k] != .generic_poison_type) fn_ty.param_types[k] else blk: {
                 const data = sema.code.instructions.items(.data)[@backingInt(inst)];
@@ -20204,7 +20103,7 @@ fn bcLowerBody(sema: *Sema, func_index: Index, args: []const Index, params: *std
         try sema.bcRequire(sema.layoutResolved(pt));
         // As `instantiate`: comptime parameters, and arguments of
         // comptime-only types, are comptime-known in the body.
-        if (fn_ty.is_generic and ((fn_ty.comptime_bits >> @intCast(k)) & 1 != 0 or Type.isComptimeOnly(ip, pt))) {
+        if (is_generic and ((k < 32 and (fn_ty.comptime_bits >> @intCast(k)) & 1 != 0) or Type.isComptimeOnly(ip, pt))) {
             const coerced = try sema.coerce(&ct, pt, .fromInterned(args[k]), src);
             const val = coerced.toInterned() orelse return sema.bcRefuse();
             comptime_args[k] = val;
@@ -20215,7 +20114,7 @@ fn bcLowerBody(sema: *Sema, func_index: Index, args: []const Index, params: *std
         // Comptime-only values do not fit the IR.
         if (Type.isComptimeOnly(ip, pt)) return sema.bcRefuse();
         const arg_i: u32 = @intCast(runtime_types.items.len);
-        if (fn_ty.is_generic) {
+        if (is_generic) {
             comptime_args[k] = .none;
             try params.append(sema.arena, .{ .ty = pt, .val = .none });
         }
@@ -20228,7 +20127,7 @@ fn bcLowerBody(sema: *Sema, func_index: Index, args: []const Index, params: *std
         };
         try sema.inst_map.put(gpa, inst, ref);
     }
-    const ret_ty = if (!fn_ty.is_generic) fn_ty.return_type else try sema.calleeRetTy(&ct, func_index, null);
+    const ret_ty = if (!is_generic) fn_ty.return_type else try sema.calleeRetTy(&ct, func_index, null);
     // Inferred error sets need the runtime body; `noreturn` functions
     // cannot return a value to the walker.
     if (ret_ty == .noreturn_type) return sema.bcRefuse();
@@ -20237,7 +20136,7 @@ fn bcLowerBody(sema: *Sema, func_index: Index, args: []const Index, params: *std
     try sema.bcRequire(sema.layoutResolved(ret_ty));
     if (Type.isComptimeOnly(ip, ret_ty)) return sema.bcRefuse();
     sema.fn_ret_ty = ret_ty;
-    sema.func = if (!fn_ty.is_generic) func_index else try sema.intern(.{ .func = .{
+    sema.func = if (!is_generic) func_index else try sema.intern(.{ .func = .{
         .owner_nav = func.owner_nav,
         .ty = try sema.intern(.{ .func_type = .{ .param_types = runtime_types.items, .return_type = ret_ty, .cc = fn_ty.cc } }),
         .zir_inst = func.zir_inst,
@@ -20350,7 +20249,7 @@ fn bcCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []const Inde
     // A generic function has a body per specialization: the values of its
     // comptime arguments and the types of the others.
     const fn_ty = ip.keyPayload(.func_type, ip.indexToKey(func).func.ty);
-    const body_key: InternPool.Hash = if (!fn_ty.is_generic) ip.stableHash(func) else blk: {
+    const body_key: InternPool.Hash = if (!Type.fnIsGeneric(ip, fn_ty)) ip.stableHash(func) else blk: {
         if (args.len > 32) return .none;
         var hasher: InternPool.Hasher = .init("comptime specialization");
         hasher.int(InternPool.Hash, ip.stableHash(func));

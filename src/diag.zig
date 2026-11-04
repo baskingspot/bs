@@ -1721,7 +1721,6 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "invalid inline assembly output type '{f}'", .@"bad-asm" },
     .{ "'@cVaStart' only allowed in variadic functions", .@"bad-call" },
     .{ "arrays must be passed by reference to variadic function", .@"bad-call" },
-    .{ "cannot call a generic function through a pointer", .@"bad-call" },
     .{ "cannot perform {s} call with 'never_inline' modifier", .@"bad-call" },
     .{ "{s} call of extern function", .@"comptime-required" },
     .{ "unable to perform '{t}' call at compile-time", .@"bad-call" },

@@ -242,6 +242,17 @@ pub fn isComptimeOnly(ip: *const InternPool, ty: Index) bool {
     return comptimeOnly(ip, ty, &hit_cycle);
 }
 
+/// Whether a call to a function of type `f` instantiates it: a parameter
+/// is declared `comptime`, is of a generic type or a comptime-only one, or
+/// the return type is generic. Reads the parameter types' fields, which
+/// must be resolved: a declaration's are (`Sema.funcCommon`), a function
+/// type's only where Sema resolves them before asking.
+pub fn fnIsGeneric(ip: *const InternPool, f: InternPool.FuncType) bool {
+    if (f.comptime_bits != 0 or f.return_type == .generic_poison_type) return true;
+    for (f.param_types) |p| if (p == .generic_poison_type or isComptimeOnly(ip, p)) return true;
+    return false;
+}
+
 /// Set on CodeGen worker threads (see `Emit.Pool`), which read types while
 /// the Sema thread analyzes: `comptimeOnly` there neither writes the
 /// per-type cache nor trusts its in-progress mark.

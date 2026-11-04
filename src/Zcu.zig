@@ -72,16 +72,17 @@ nav_queue: std.ArrayList(InternPool.NavIndex) = .empty,
 /// field defaults: their `struct_defaults` units, which `analyzeAll`
 /// analyzes whether or not anything reads a default (`queueDefaults`).
 defaults_queue: std.ArrayList(InternPool.Index) = .empty,
-/// Nonzero while Sema resolves something it may do without
-/// (`Sema.resolveFieldTypesDeep`): a dependency loop then ends that
-/// instead of being reported (`error.Speculation`).
+/// Nonzero while something is resolved that may be done without (an
+/// inlining decision a replay makes out of order, `Replay`'s
+/// `func_inline`): a dependency loop then ends that instead of being
+/// reported (`error.Speculation`).
 speculating: u32 = 0,
 /// What each unit in progress asked for, innermost last: the edges a
 /// dependency loop's error reports (`Sema.failDepLoop`).
 dep_stack: std.ArrayList(Sema.DepFrame) = .empty,
 /// The dependencies a unit's first phase recorded when it ran on its own
-/// (`ensureNavTy`, `ensureFieldTypes`), which the rest of the unit
-/// declares first instead of analyzing the phase again.
+/// (`ensureNavTy`), which the rest of the unit declares first instead of
+/// analyzing the phase again.
 phase_deps: std.AutoHashMapUnmanaged(AnalUnit, PhaseDeps) = .empty,
 /// Which unit queued which function (`queueFuncFrom`), for the on-disk
 /// cache: a unit loaded from it queues them again.
@@ -1281,7 +1282,6 @@ pub fn ensureNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) Sema.CompileError
 pub fn ensureStructLayout(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!void {
     const info = zcu.ip.structInfo(ty);
     switch (info.status) {
-        // `ensureFieldTypes` may have loaded the layout from the cache.
         .have_layout => return if (info.defaults_status == .none) zcu.queueDefaults(ty),
         .failed => return error.AnalysisFail,
         .field_types_wip, .layout_wip => return zcu.loop(),
@@ -1323,30 +1323,6 @@ fn queueDefaults(zcu: *Zcu, ty: InternPool.Index) !void {
         if (!gop.found_existing) gop.value_ptr.* = .{ .from = .{ .type_layout = ty }, .file = key.file, .src = .{ .base = decl.src_node, .loc = .{ .node = .zero } } };
         return;
     }
-}
-
-/// Resolves the field types of a struct or union without its layout: the
-/// first phase of its `type_layout` unit, as upstream's `resolveFields`.
-/// A function type reads them to tell whether a parameter is
-/// comptime-only, and must not need the parameter's layout, which may
-/// lead back to the type being resolved.
-pub fn ensureFieldTypes(zcu: *Zcu, ty: InternPool.Index) Sema.CompileError!void {
-    const info = zcu.ip.structInfo(ty);
-    switch (info.status) {
-        .have_field_types, .layout_wip, .have_layout => return,
-        .failed => return error.AnalysisFail,
-        .field_types_wip => return zcu.loop(),
-        .none => {},
-    }
-    if (zcu.replay) |r| {
-        info.status = .layout_wip;
-        if (r.loadLayout(ty)) return;
-        info.status = .none;
-    }
-    Sema.analyzeFieldTypes(zcu, ty) catch |err| {
-        info.status = if (err == error.Speculation) .none else .failed;
-        return err;
-    };
 }
 
 /// Resolves the default values of a struct whose layout is resolved (its

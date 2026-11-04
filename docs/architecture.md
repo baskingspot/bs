@@ -313,33 +313,29 @@ layout, a function's signature) it goes through one Sema function that records
 the dependency. Sema records dependencies from the first skeleton onward, even
 before anything persists them.
 
-Two units have a first phase that other code may need on its own, as
-upstream has separate units for them. Neither reads a unit that is still
-in progress:
+One unit has a first phase that other code may need on its own, as
+upstream has a separate unit for it. It does not read a unit that is
+still in progress: a declaration that states its type (`Nav.has_type`)
+resolves its type and alignment before its value (`Zcu.ensureNavTy`,
+`Nav.ty_status`). Taking its address (`Sema.navRef`) needs only that,
+and records the `nav_ty` dependency; its value is queued for
+`analyzeAll` (`nav_queue`), as upstream's `ensureNavValAnalysisQueued`.
+So `var x: S = .{ .p = &y }; var y = &x;` resolves from either end, as
+upstream. A declaration without a stated type, a function, or an extern
+needs its value.
 
-- A declaration that states its type (`Nav.has_type`) resolves its type
-  and alignment before its value (`Zcu.ensureNavTy`, `Nav.ty_status`).
-  Taking its address (`Sema.navRef`) needs only that, and records the
-  `nav_ty` dependency; its value is queued for `analyzeAll` (`nav_queue`),
-  as upstream's `ensureNavValAnalysisQueued`. So `var x: S = .{ .p = &y };
-  var y = &x;` resolves from either end, as upstream. A declaration
-  without a stated type, a function, or an extern needs its value.
-- A declared struct's or union's field types resolve before its layout
-  (`Zcu.ensureFieldTypes`, status `have_field_types`), as upstream's
-  `resolveFields`. A function type reads them, transitively, to tell
-  whether a by-value parameter is comptime-only
-  (`Sema.resolveFieldTypesDeep`), so its comptime bits do not depend on
-  which layouts happened to be resolved. It must not resolve the layout,
-  which may lead back to the type being resolved; a type whose field
-  types are being resolved further up is taken as it is, as upstream's
-  `comptimeOnlySema` does. Upstream never reads them for a function
-  type, so the read is speculative (`Zcu.speculating`): a dependency
-  loop it runs into (`const FnPtr = ?*const fn (@This()) void;` read by
-  its own struct's field) ends it with `error.Speculation`, unreported,
-  the units it started go back to unresolved, and the parameter type is
-  taken as it is. Only a real cycle stays order-dependent. The
-  dependency is conditional: a green unit's result does not need the
-  type's layout.
+A function type reads nothing about its parameter types, so it may name
+a type whose layout is being resolved (`const FnPtr = ?*const fn
+(@This()) void;` read by its own struct's field). Its key, as
+upstream's, holds only the parameters declared `comptime`
+(`comptime_bits`); whether a call instantiates the function
+(`Type.fnIsGeneric`: a `comptime` parameter, a generic or comptime-only
+parameter type, or a generic return type) and whether it has runtime
+bits (`Sema.fnHasRuntimeBits`, which a comptime-only return type also
+denies) are derived where they are used. Those read the parameter and
+return types' layouts: a declaration resolves them (`Sema.funcCommon`),
+and a call through a pointer or a coercion between function types
+resolves them first, as upstream's `ensureLayoutResolved`.
 
 When the phase runs on its own, its Sema keeps the dependencies it
 recorded (`Zcu.phase_deps`), and the unit, when it runs, declares them
@@ -5625,25 +5621,11 @@ checks:
 - the ThreadSanitizer build reports nothing with fuzzing on;
 - bench.py cold, cold-local and edit numbers before and after.
 
-0. *Prerequisites (Sema).* The `nav_ty` unit and function types that
-   resolve by-value parameter types (above), both on main (459e1fe),
-   and before stage A:
-   - *Genericity out of the `func_type` key.* zap's function type key
-     holds which parameters are comptime (`comptime_bits`) and
-     `is_generic`, including parameters that are comptime only because
-     their type is comptime-only. So making `fn (S) void` reads `S`'s
-     field types, which upstream never does: its key holds only the
-     explicit `comptime` parameters, and a call decides the rest. The
-     read can loop where upstream cannot (`const FnPtr = ?*const fn
-     (@This()) void;` read by its own struct's field), so it is
-     speculative (`Zcu.speculating`): a loop gives up the read, and the
-     function type is made from what is known. That leaves a real cycle
-     order-dependent, which breaks stage A's determinism. It aborts 0
-     times on the zig workload, std and libvaxis, so it is not urgent.
-     The fix keys function types as upstream does and derives
-     genericity and runtime bits where they are used. That touches
-     about 25 `is_generic` sites in Sema and the cache's result
-     encoding.
+0. *Prerequisites (Sema).* The `nav_ty` unit (above), on main
+   (459e1fe), and function types keyed as upstream's, with genericity
+   derived where it is used (above), so making one reads nothing about
+   its parameter types and no result depends on the order a cycle is
+   entered in. Both done.
 A. *Determinism, serially.* Rules 1–8 and the reruns they need, on one
    thread. Rule 1 may land first, alone. Before relying on reruns, count
    on std and the zig workload: units that read provisional codes, and
@@ -7647,8 +7629,4 @@ the choice instead of failing:
 
 ## Known regressions and limitations
 
-- *Speculative function-type reads.* A function type reads its
-  by-value parameters' field types speculatively (`Zcu.speculating`); in
-  a real cycle the result depends on analysis order. It aborts 0 times
-  on the zig workload, std and libvaxis. Taking genericity out of the
-  `func_type` key fixes it, a prerequisite of stage A (step 2, item 0).
+None at present.
