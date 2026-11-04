@@ -1,0 +1,208 @@
+{
+ "date": "2026-11-04",
+ "commit": "e778bf6",
+ "machine": {
+  "cpus": 4,
+  "kernel": "6.1.158+",
+  "cpu": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "mem_gib": 7.8
+ },
+ "note": "Amp orb, 4 vCPU",
+ "started": "2026-11-04 20:58",
+ "zap": "/tmp/zap-m7-out/bin/zap",
+ "zig": "/home/user/.local/bin/zig",
+ "runtime": {
+  "runtime": {
+   "runs": 5,
+   "machine_note": "Amp orb, 4 vCPU",
+   "results": {
+    "fib": {
+     "zap": {
+      "median_s": 0.11303876199235674,
+      "min_s": 0.11264293099520728,
+      "max_s": 0.11436350100848358,
+      "compile_s": 0.229816599006881
+     },
+     "Debug": {
+      "median_s": 0.19345328499912284,
+      "min_s": 0.18808664300013334,
+      "max_s": 0.1991258629859658,
+      "compile_s": 0.8781891260005068
+     },
+     "ReleaseSafe": {
+      "median_s": 0.07141445099841803,
+      "min_s": 0.07078584699775092,
+      "max_s": 0.11338414100464433,
+      "compile_s": 16.59771121200174
+     }
+    },
+    "sieve": {
+     "zap": {
+      "median_s": 0.12600755000312347,
+      "min_s": 0.1242377930029761,
+      "max_s": 0.126088103002985,
+      "compile_s": 0.21176711400039494
+     },
+     "Debug": {
+      "median_s": 0.41681606900237966,
+      "min_s": 0.41393509099725634,
+      "max_s": 0.4298301060043741,
+      "compile_s": 0.45492833500611596
+     },
+     "ReleaseSafe": {
+      "median_s": 0.10478307100129314,
+      "min_s": 0.10405425800126977,
+      "max_s": 0.11311961499450263,
+      "compile_s": 17.157253392011626
+     }
+    },
+    "sort": {
+     "zap": {
+      "median_s": 0.26032869500340894,
+      "min_s": 0.25847297901054844,
+      "max_s": 0.3028491449949797,
+      "compile_s": 0.21060528700763825
+     },
+     "Debug": {
+      "median_s": 0.5708781749999616,
+      "min_s": 0.56701784300094,
+      "max_s": 0.5830169269902399,
+      "compile_s": 0.4529769639921142
+     },
+     "ReleaseSafe": {
+      "median_s": 0.08962117599730846,
+      "min_s": 0.0886690220067976,
+      "max_s": 0.08996740799921099,
+      "compile_s": 17.52983092299837
+     }
+    },
+    "hash": {
+     "zap": {
+      "median_s": 0.29253668599994853,
+      "min_s": 0.2821597649890464,
+      "max_s": 0.32337082498997916,
+      "compile_s": 0.20891033299267292
+     },
+     "Debug": {
+      "median_s": 0.648046570000588,
+      "min_s": 0.620797927986132,
+      "max_s": 0.6912308979954105,
+      "compile_s": 0.4370482759986771
+     },
+     "ReleaseSafe": {
+      "median_s": 0.04556802799925208,
+      "min_s": 0.04446019101305865,
+      "max_s": 0.0465103370079305,
+      "compile_s": 17.08808387099998
+     }
+    },
+    "nbody": {
+     "zap": {
+      "median_s": 0.05938963100197725,
+      "min_s": 0.05913271599274594,
+      "max_s": 0.062110211001709104,
+      "compile_s": 0.20715201500570402
+     },
+     "Debug": {
+      "median_s": 0.43579435399442445,
+      "min_s": 0.4316890449990751,
+      "max_s": 0.4584135460027028,
+      "compile_s": 0.42725281899038237
+     },
+     "ReleaseSafe": {
+      "median_s": 0.02121399600582663,
+      "min_s": 0.020667700009653345,
+      "max_s": 0.02167233200452756,
+      "compile_s": 18.970622590000858
+     }
+    },
+    "fmt": {
+     "zap": {
+      "median_s": 0.10264870099490508,
+      "min_s": 0.10214951999660116,
+      "max_s": 0.11905951099470258,
+      "compile_s": 0.21160846600832883
+     },
+     "Debug": {
+      "median_s": 0.20213646099728066,
+      "min_s": 0.2013160750066163,
+      "max_s": 0.21423199999844655,
+      "compile_s": 0.45458745799260214
+     },
+     "ReleaseSafe": {
+      "median_s": 0.022842539998237044,
+      "min_s": 0.021626061003189534,
+      "max_s": 0.030730386992217973,
+      "compile_s": 16.780689102000906
+     }
+    }
+   }
+  },
+  "realworld": {
+   "compiler": "/tmp/zap-m7-out/bin/zap",
+   "runs": 5,
+   "results": {
+    "zig-fmt": {
+     "zap": {
+      "median": 2.4005861090117833,
+      "min": 2.2801970349974,
+      "max": 2.557117313001072
+     },
+     "Debug": {
+      "median": 4.110802502007573,
+      "min": 4.046138428006088,
+      "max": 4.30358883900044
+     }
+    },
+    "zig-sema": {
+     "zap": {
+      "median": 7.012159773003077,
+      "min": 6.745836856003734,
+      "max": 7.4500555120030185
+     },
+     "Debug": {
+      "median": 11.57439733899082,
+      "min": 11.367241982006817,
+      "max": 12.158856114008813
+     }
+    },
+    "vaxis": {
+     "zap": {
+      "median": 0.6885260269918945,
+      "min": 0.6688895460101776,
+      "max": 0.732586224010447
+     },
+     "Debug": {
+      "median": 1.0859931199956918,
+      "min": 1.0437501590058673,
+      "max": 1.2284894729964435
+     },
+     "ReleaseSafe": {
+      "median": 0.2322498189896578,
+      "min": 0.22979275800753385,
+      "max": 0.30642605500179343
+     }
+    },
+    "zls-test": {
+     "zap": {
+      "median": 1.0035729149967665,
+      "min": 0.9818646869971417,
+      "max": 1.0221862710022833
+     },
+     "Debug": {
+      "median": 1.6119325259933248,
+      "min": 1.5488530529983109,
+      "max": 1.6995750019996194
+     },
+     "ReleaseSafe": {
+      "median": 0.252985309009091,
+      "min": 0.2524280999932671,
+      "max": 0.2973443189985119
+     }
+    }
+   }
+  }
+ },
+ "finished": "2026-11-04 21:03",
+ "findings": "## Findings\n\nRun time only, with zap from main e778bf6 (the m7 backend stack and prove-offsets). The compile-time rows of the 0.17.1 scoreboard stand; see the cold check below.\n\n**Against d47bcde, in this session** (`--parts runtime` with each zap, back to back; zap / upstream Debug / upstream ReleaseSafe):\n\n| Program | zap d47bcde | zap e778bf6 | change |\n| --- | ---: | ---: | ---: |\n| fib | 118 ms | 113 ms | \u22124% |\n| sieve | 130 ms | 126 ms | \u22123% |\n| sort | 255 ms | 260 ms | +2% |\n| hash | 286 ms | 293 ms | +2% |\n| nbody | 200 ms | **59 ms** | \u221271% |\n| fmt | 148 ms | 103 ms | noise: upstream Debug's fmt also read 280 ms in d47bcde's run, against 202 ms in e778bf6's and 201 ms in the 0.17.1 scoreboard |\n\nnbody is now 2.8x ReleaseSafe's time (was 7.9\u20138.3x). The other five are within noise of d47bcde.\n\n| Workload | zap d47bcde | zap e778bf6 |\n| --- | ---: | ---: |\n| zig-fmt | 2.35 s | 2.40 s |\n| zig-sema | 6.56 s | 7.01 s |\n| vaxis | 740 ms | 689 ms (\u22127%) |\n| zls-test | 1.10 s | 1.00 s (\u22129%) |\n\nzig-sema's 7.01 s is noise. Two interleaved A/B rounds afterwards (`realworld.py --no-upstream --runs 7`, alternating the two zaps) gave zig-sema 6.54 / 6.50 s on d47bcde and 6.53 / 6.44 s on e778bf6. zig-fmt was 2.39 / 2.33 s against 2.32 / 2.25 s.\n\n**Compile time, cold check** (bench.py, median of 3\u20135, the same two A/B rounds): hello cold 452 / 465 ms (d47bcde) against 433 / 452 ms (e778bf6); vaxis 711 / 690 against 660 / 662 ms; std cold 8.15 against 8.27 s; cold-local with donors hello 17.0 / 16.7, vaxis 31.4 / 30.7, std 88 / 83 ms. Nothing moves beyond noise, so the 0.17.1 compile-time rows stand.\n"
+}
