@@ -1932,6 +1932,7 @@ fn refreshDebug(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32) !voi
         .source_name = m.sourceName(i),
         .result = m.result(i),
         .subject = m.subject(i),
+        .names = m.typeNames(i),
         .flags = .{},
     });
 }
