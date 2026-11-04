@@ -1609,7 +1609,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    ns per IR instruction within noise (229–235 for both, allocation
    about +2); std's tests 6.65/6.39 → 6.68/6.51 s, allocation 69–75 →
    74–77 ns per IR instruction, binary −26 KB.
-   Copy elision, after it, in four parts:
+   Copy elision, after it, in five parts:
    - Forwarding (`Ssa.plan`, shared): a `*const` alloc whose uses are
      loads and one store of an instruction's value, which comes before
      the loads in the layout, is not emitted, nor is its store; each load
@@ -1628,10 +1628,25 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
      through memory, a non-const alloc of the result type whose load every
      `ret` returns as its block's last value is the result memory: its home
      is the caller's pointer, and the load and the copy go.
-   - Call arguments (`planDeferred`, before allocation): a load of a value
-     in memory whose only user is a later `.auto` call in the same block,
-     with nothing between that writes memory, is read in place by the
-     call (`Home.deferred`), and its pointer lives until the call.
+   - Call arguments and results (`planDeferred`, before allocation): a
+     load of a value in memory whose only user is a later `.auto` call, or
+     the `ret` of a function returning through memory, in the same block,
+     with nothing between that writes memory, is read in place by the call
+     or `ret` (`Home.deferred`), and its pointer lives until then.
+   - Stored aggregates (`planDeferred`): an `aggregate_init` or
+     `union_init` in memory whose only user is the store right after it
+     is built in the stored-to memory (`in_place`); no element is read
+     from memory lazily, so writing it early changes nothing.
+     With them, a `@splat` (an `aggregate_init` of one repeated element)
+     over 128 bytes writes the element until it spans 64 bytes, doubles
+     that by copies up to 512, and repeats it with one overlapping
+     `rep movsb` (below a 512-byte distance that leaves the fast-string
+     path). A 16 KB splat of a 128-byte struct into a result, returned
+     through an over-aligned alloc: 28,915 → 647 code bytes, 4,125 → 91
+     movs, frame 0xc210 → 0x4190 bytes, 21.0 → 3.4–4.8 s for 10M calls
+     (upstream Debug 3.4–3.7 s; the spread is the 16-aligned frame's
+     placement against 64-byte lines). Compile time within noise on std
+     and the zig workload; std's binary −87 KB.
    nbody's `Vec.sub` went from 64 instructions to 26. Against main
    2cc5b3e (`bench/runtime.py`, two interleaved runs): nbody 279–283 →
    158–174 ms, hash 224–236 → 185–191, fmt 100–103 → 92–93, sieve and

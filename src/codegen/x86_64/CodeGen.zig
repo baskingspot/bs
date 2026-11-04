@@ -75,6 +75,9 @@ copy_private: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// From `planCopies`: values whose slot is that of the block their `br`
 /// exits, by value.
 slot_alias: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+/// From `planDeferred`: aggregates built in the memory of the store that
+/// is their only user, with the store's pointer, by value.
+in_place: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
 /// rbp offset of the slot holding the error return trace pointer: an
 /// `.auto` function's from r9, another's from `set_err_return_trace`.
 /// Null in a function that has none, whose `.auto` calls pass null.
@@ -244,6 +247,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.copy_of.deinit(gpa);
         cg.copy_private.deinit(gpa);
         cg.slot_alias.deinit(gpa);
+        cg.in_place.deinit(gpa);
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
         cg.stub_chains.deinit(gpa);
@@ -484,8 +488,11 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
     return home;
 }
 
-/// The memory of a result slot.
+/// The memory of a result slot, or of the store that is the value's only
+/// user (`in_place`), with r10 as the base if its pointer is not in a
+/// register.
 fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
+    if (cg.in_place.count() != 0) if (cg.in_place.get(@backingInt(inst))) |ptr| return try cg.ptrMem(ptr);
     return switch (try cg.slotFor(inst, ty)) {
         .slot => |off| Mem.at(.rbp, off),
         else => null,
@@ -1179,7 +1186,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
         }
         return;
     }
-    cg.planDeferred();
+    try cg.planDeferred();
     cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved) & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
@@ -1294,13 +1301,57 @@ fn planCopies(cg: *CodeGen) Error!void {
     }
 }
 
-/// Before allocation: a load of a value that lives in memory whose only
-/// user is a later `.auto` call in the same block, with nothing between
-/// that may write memory, is not copied to a slot of its own: the call
-/// copies the argument from where the load points (`Home.deferred`). The
-/// pointer then lives until the call. The call copies its arguments one
-/// at a time, and the outgoing area does not overlap the memory read.
-fn planDeferred(cg: *CodeGen) void {
+/// Before allocation, copies decided with liveness:
+/// - A load of a value that lives in memory whose only user is a later
+///   `.auto` call, or the `ret` of a function that returns through memory,
+///   in the same block, with nothing between that may write memory, is not
+///   copied to a slot of its own: the call or `ret` copies the value from
+///   where the load points (`Home.deferred`). The pointer then lives until
+///   that use. The call copies its arguments one at a time, and neither
+///   the outgoing area nor the caller's result memory overlaps the memory
+///   read.
+/// - An aggregate or union in memory whose only user is a store right
+///   after it is built in the stored-to memory (`in_place`). The store's
+///   pointer is live across the aggregate's lowering, which clobbers, so
+///   it is not in a register the lowering writes. The elements are values
+///   already computed, and none is read from memory lazily (a deferred
+///   load's only user is a call or `ret`), so writing the memory early
+///   changes nothing.
+fn planDeferred(cg: *CodeGen) Error!void {
+    const ir = cg.ir;
+    const f = cg.ssa;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const fate = f.live.items(.fate);
+    const ret_deferred = cg.fn_ty.cc == .auto and cg.autoClass(cg.fn_ty.return_type) == .memory;
+    for (f.layout.items) |block| {
+        const values = f.blockInsts(block);
+        for (values, 0..) |u, k| {
+            if (fate[@backingInt(u)] != .normal) continue;
+            switch (tags[@backingInt(u)]) {
+                .call => {
+                    const data = datas[@backingInt(u)];
+                    const callee_fn_ty = cg.typeOf(data.pl_op.operand);
+                    const callee_ty = if (Type.class(cg.ip, callee_fn_ty) == .pointer) Type.ptrInfo(cg.ip, callee_fn_ty).child else callee_fn_ty;
+                    if (cg.ip.keyPayload(.func_type, callee_ty).cc != .auto) continue;
+                    const extra = ir.extraData(Ir.Call, data.pl_op.payload);
+                    for (ir.refSlice(extra.end, extra.data.args_len)) |arg| cg.deferLoad(arg, values[0..k], f.live.items(.def)[@backingInt(u)]);
+                },
+                .store => try cg.storeInPlace(u, values[0..k]),
+                else => {},
+            }
+        }
+        const b = f.blocks.items[@backingInt(block)];
+        if (ret_deferred and b.term.tag == .ret and tags[@backingInt(b.term.inst)] == .ret) {
+            cg.deferLoad(datas[@backingInt(b.term.inst)].un_op, values, 2 * (b.start + b.len) + 1);
+        }
+    }
+}
+
+/// Defers load `arg` (`planDeferred`) if it is one of the last `before`
+/// values with only values that write no memory after it, and its only
+/// user is at position `at`.
+fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, at: u32) void {
     const ir = cg.ir;
     const f = cg.ssa;
     const tags = ir.instructions.items(.tag);
@@ -1314,46 +1365,60 @@ fn planDeferred(cg: *CodeGen) void {
     const share = live.items(.share);
     const fwd = live.items(.fwd);
     const cl = f.clobbers.items;
-    for (f.layout.items) |block| {
-        const values = f.blockInsts(block);
-        for (values, 0..) |u, k| {
-            if (tags[@backingInt(u)] != .call or fate[@backingInt(u)] != .normal) continue;
-            const data = datas[@backingInt(u)];
-            const callee_fn_ty = cg.typeOf(data.pl_op.operand);
-            const callee_ty = if (Type.class(cg.ip, callee_fn_ty) == .pointer) Type.ptrInfo(cg.ip, callee_fn_ty).child else callee_fn_ty;
-            if (cg.ip.keyPayload(.func_type, callee_ty).cc != .auto) continue;
-            const extra = ir.extraData(Ir.Call, data.pl_op.payload);
-            for (ir.refSlice(extra.end, extra.data.args_len)) |arg| {
-                const l = arg.toIndex() orelse continue;
-                const li = @backingInt(l);
-                if (tags[li] != .load or uses[li] != 1 or fate[li] != .normal or fwd[li] != Ssa.no_tie) continue;
-                const ty = datas[li].ty_op.ty;
-                if (Type.abiSize(cg.ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty)) continue;
-                if (!Ssa.removable(ir, cg.ip, l)) continue; // volatile
-                // `l` lies before the call in this block, with only values
-                // that write no memory between.
-                const found = for (0..@min(k, 32)) |j| {
-                    const v = values[k - 1 - j];
-                    if (v == l) break true;
-                    switch (tags[@backingInt(v)]) {
-                        .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
-                        else => if (!Ssa.removable(ir, cg.ip, v)) break false,
-                    }
-                } else false;
-                if (!found) continue;
-                const ptr = datas[li].ty_op.operand;
-                if (ptr.toIndex()) |p0| {
-                    var p = @backingInt(p0);
-                    if (fwd[p] != Ssa.no_tie) p = fwd[p];
-                    if (share[p] != Ssa.no_tie or fate[p] != .normal) continue;
-                    const at = def[@backingInt(u)];
-                    end[p] = @max(end[p], at);
-                    crosses[p] = crosses[p] or cl[at][0] != cl[def[p]][0] or cl[at][1] != cl[def[p]][1];
-                }
-                cg.homes[li] = .deferred;
-            }
+    const l = arg.toIndex() orelse return;
+    const li = @backingInt(l);
+    if (tags[li] != .load or uses[li] != 1 or fate[li] != .normal or fwd[li] != Ssa.no_tie) return;
+    if (cg.homes[li] != .none) return; // the result's own alloc (`planCopies`)
+    const ty = datas[li].ty_op.ty;
+    if (Type.abiSize(cg.ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty)) return;
+    if (!Ssa.removable(ir, cg.ip, l)) return; // volatile
+    const found = for (0..@min(before.len, 32)) |j| {
+        const v = before[before.len - 1 - j];
+        if (v == l) break true;
+        switch (tags[@backingInt(v)]) {
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            else => if (!Ssa.removable(ir, cg.ip, v)) break false,
         }
+    } else false;
+    if (!found) return;
+    const ptr = datas[li].ty_op.operand;
+    if (ptr.toIndex()) |p0| {
+        var p = @backingInt(p0);
+        if (fwd[p] != Ssa.no_tie) p = fwd[p];
+        if (share[p] != Ssa.no_tie or fate[p] != .normal) return;
+        end[p] = @max(end[p], at);
+        crosses[p] = crosses[p] or cl[at][0] != cl[def[p]][0] or cl[at][1] != cl[def[p]][1];
     }
+    cg.homes[li] = .deferred;
+}
+
+/// Builds the aggregate that store `st` stores in place (`planDeferred`)
+/// if it is the last of the `before` values, ignoring debug markers.
+fn storeInPlace(cg: *CodeGen, st: Inst.Index, before: []const Inst.Index) Error!void {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const tags = ir.instructions.items(.tag);
+    const live = cg.ssa.live.slice();
+    const bin = ir.instructions.items(.data)[@backingInt(st)].bin_op;
+    const v = bin.rhs.toIndex() orelse return;
+    const vi = @backingInt(v);
+    if (tags[vi] != .aggregate_init and tags[vi] != .union_init) return;
+    if (live.items(.uses)[vi] != 1 or live.items(.fate)[vi] != .normal) return;
+    const prev = for (0..before.len) |j| {
+        const x = before[before.len - 1 - j];
+        switch (tags[@backingInt(x)]) {
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            else => break x,
+        }
+    } else return;
+    if (prev != v) return;
+    const ty = cg.typeOf(bin.rhs);
+    if (Type.abiSize(ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty) or cg.inFloat(ty)) return;
+    if (Type.ptrInfo(ip, cg.typeOf(bin.lhs)).flags.is_volatile) return;
+    // An initializer that is its `*const` alloc's memory (`planCopies`).
+    if (cg.copy_private.count() != 0 and cg.copy_private.contains(vi)) return;
+    if (cg.homes[vi] != .none) return;
+    try cg.in_place.put(cg.gpa, vi, bin.lhs);
 }
 
 /// A `copy_of` entry for an alloc that is not a copy.
@@ -2139,6 +2204,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const val = data.bin_op.rhs;
             const size = Type.abiSize(ip, cg.typeOf(val));
             if (size == 0) return;
+            // Built in place (`planDeferred`).
+            if (cg.in_place.count() != 0) if (val.toIndex()) |v| if (cg.in_place.contains(@backingInt(v))) return;
             // A `*const` alloc that is its initializer's memory (`planCopies`).
             if (cg.copy_of.count() != 0) if (data.bin_op.lhs.toIndex()) |a| if (val.toIndex()) |v| switch (cg.homes[@backingInt(a)]) {
                 .frame_addr => |off| if (cg.homes[@backingInt(v)] == .slot and cg.homes[@backingInt(v)].slot == off) return,
