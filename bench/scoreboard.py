@@ -385,7 +385,7 @@ def main():
         zig = subprocess.run(["which", args.zig], stdout=subprocess.PIPE, text=True).stdout.strip() or args.zig
         os.makedirs(WORK, exist_ok=True)
         now = lambda: datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
-        data = {"date": datetime.date.today().isoformat(), "commit": git("rev-parse", "--short", "HEAD"),
+        data = {"date": datetime.date.today().isoformat(), "commit": args.zap_commit or git("rev-parse", "--short", "HEAD"),
                 "machine": machine(), "note": args.note, "started": now(), "zap": zap, "zig": zig}
         for part in args.parts.split(","):
             measure(data, part, zap, zig, args.note, out)
