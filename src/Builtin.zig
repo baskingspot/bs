@@ -173,7 +173,6 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         \\        .fptoint,
         \\        .fullfp16,
         \\        .fuse_address,
-        \\        .fuse_aes,
         \\        .fuse_arith_logic,
         \\        .fuse_crypto_eor,
         \\        .fuse_csel,

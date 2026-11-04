@@ -360,7 +360,11 @@ pub fn abiSize(ip: *const InternPool, ty: Index) u64 {
             // Upstream's stage2_x86_64 layout: bools are bits, other
             // elements are laid out like an array.
             const v = ip.keyPayload(.vector_type, ty);
-            const bytes = if (v.child == .bool_type) (v.len + 7) / 8 else v.len * abiSize(ip, v.child);
+            var bytes = if (v.child == .bool_type) (v.len + 7) / 8 else v.len * abiSize(ip, v.child);
+            // As LLVM on aarch64-macos, a vector rounds up to a power of
+            // two bytes, except one of f80 or f128, soft floats there.
+            if (ip.target == .aarch64_macos and bytes != 0 and v.child != .f80_type and v.child != .f128_type)
+                bytes = std.math.ceilPowerOfTwoAssert(u64, bytes);
             break :blk std.mem.alignForward(u64, bytes, abiAlignment(ip, ty));
         },
         .optional => blk: {

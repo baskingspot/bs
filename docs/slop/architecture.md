@@ -837,9 +837,10 @@ comptime arguments are run-time values in the lowered code (uucode's
   out without AVX: bool vectors bit-packed (element i is bit i % 8 of
   byte i / 8), other vectors like arrays, aligned to 16.
   aarch64-macos scalarizes every vector operation for now (no NEON
-  lowering yet) and uses the same layout, though its upstream (LLVM)
-  bit-packs elements and aligns a vector to its size up to 16 (one
-  behavior test differs).
+  lowering yet) and uses the same layout, except that a vector's size
+  rounds up to a power of two bytes (not for f80 or f128 elements), as
+  LLVM's does there; LLVM also bit-packs elements and aligns a vector to
+  its size up to 16 (one behavior test differs).
 - aarch64-macos (`src/codegen/aarch64/CodeGen.zig`) lowers the same SSA
   form with the same per-instruction structure. It runs `Ssa.liveness`
   and `Ssa.plan` (dead values, fused branch conditions, overflow pairs

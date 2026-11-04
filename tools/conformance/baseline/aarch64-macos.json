@@ -2,15 +2,15 @@
  "format": 1,
  "target": "aarch64-macos",
  "zig_target": "aarch64-macos-none",
- "compiler": "zig 0.17.0",
+ "compiler": "zig 0.17.1",
  "backend": "stage2_llvm",
  "summary": {
   "files": 113,
   "file_status": {
    "ok": 113
   },
-  "tests": 2097,
-  "pass": 2064,
+  "tests": 2116,
+  "pass": 2083,
   "skip": 33,
   "fail": 0,
   "leak": 0,
@@ -18,8 +18,8 @@
   "timeout": 0
  },
  "full_run_check": {
-  "tests": 2097,
-  "pass": 2064,
+  "tests": 2116,
+  "pass": 2083,
   "mismatches": {}
  },
  "files_without_tests": [
@@ -81,6 +81,8 @@
     "behavior.align.test.read 128-bit field from default aligned struct in stack memory": "pass",
     "behavior.align.test.read 128-bit field from default aligned struct in global memory": "pass",
     "behavior.align.test.struct field explicit alignment": "pass",
+    "behavior.align.test.nested struct field alignment": "pass",
+    "behavior.align.test.nested union field alignment": "pass",
     "behavior.align.test.align(N) on functions": "pass",
     "behavior.align.test.comptime alloc alignment": "skip",
     "behavior.align.test.@alignCast null": "pass",
@@ -138,6 +140,7 @@
     "behavior.array.test.type coercion of anon struct literal to array": "pass",
     "behavior.array.test.array with comptime-only element type": "pass",
     "behavior.array.test.tuple to array handles sentinel": "pass",
+    "behavior.array.test.array-like to array handles sentinel": "pass",
     "behavior.array.test.array init of container level array variable": "pass",
     "behavior.array.test.runtime initialized sentinel-terminated array literal": "pass",
     "behavior.array.test.array of array agregate init": "pass",
@@ -358,6 +361,7 @@
     "behavior.bitcast.test.@bitCast packed struct of floats": "pass",
     "behavior.bitcast.test.comptime @bitCast packed struct to int and back": "pass",
     "behavior.bitcast.test.bitcast vector to integer and back": "pass",
+    "behavior.bitcast.test.bitcast vector elementwise": "pass",
     "behavior.bitcast.test.bitcast nan float does not modify signaling bit": "pass",
     "behavior.bitcast.test.@bitCast of packed struct of bools all true": "pass",
     "behavior.bitcast.test.@bitCast of packed struct of bools all false": "pass",
@@ -367,7 +371,9 @@
     "behavior.bitcast.test.@bitCast packed struct to array of bits": "pass",
     "behavior.bitcast.test.@bitCast nested arrays of vectors": "pass",
     "behavior.bitcast.test.@bitCast nested arrays of bool to scalar": "pass",
-    "behavior.bitcast.test.@bitCast deeply nested arrays to scalar": "pass"
+    "behavior.bitcast.test.@bitCast deeply nested arrays to scalar": "pass",
+    "behavior.bitcast.test.@bitCast between float and vector": "pass",
+    "behavior.bitcast.test.@bitCast to vectors of f80 and f128": "pass"
    }
   },
   "bitreverse.zig": {
@@ -491,6 +497,7 @@
     "behavior.cast.test.single-item pointer of array to slice to unknown length pointer": "pass",
     "behavior.cast.test.cast *[1][*]const u8 to [*]const ?[*]const u8": "pass",
     "behavior.cast.test.@intCast on vector": "pass",
+    "behavior.cast.test.@intCast signed vector to narrower unsigned vector": "pass",
     "behavior.cast.test.@floatCast cast down": "pass",
     "behavior.cast.test.peer type resolution: unreachable, error set, unreachable": "pass",
     "behavior.cast.test.peer cast: error set any anyerror": "pass",
@@ -588,6 +595,7 @@
     "behavior.cast.test.@intFromPtr on vector": "pass",
     "behavior.cast.test.@floatFromInt on vector": "pass",
     "behavior.cast.test.@intFromFloat on vector": "pass",
+    "behavior.cast.test.@floatFromInt and @intFromFloat on vectors of any length": "pass",
     "behavior.cast.test.@intFromBool on vector": "pass",
     "behavior.cast.test.numeric coercions with undefined": "pass",
     "behavior.cast.test.15-bit int to float": "pass",
@@ -600,7 +608,8 @@
     "behavior.cast.test.@intFromFloat boundary cases": "pass",
     "behavior.cast.test.@intFromFloat vector boundary cases": "pass",
     "behavior.cast.test.coerce enum to union with zero-bit fields through local variables": "pass",
-    "behavior.cast.test.coercing a coerced function": "pass"
+    "behavior.cast.test.coercing a coerced function": "pass",
+    "behavior.cast.test.pointer to empty tuple coerces to any slice": "pass"
    }
   },
   "cast_int.zig": {
@@ -649,7 +658,9 @@
     "behavior.comptime_memory.test.comptime store of reinterpreted zero-bit type": "pass",
     "behavior.comptime_memory.test.comptime store to extern struct reinterpreted as byte array": "pass",
     "behavior.comptime_memory.test.reinterpret sentinel-terminated array as packed struct": "pass",
-    "behavior.comptime_memory.test.reinterpret pointer as optional pointer via double-pointer coercion": "pass"
+    "behavior.comptime_memory.test.reinterpret pointer as optional pointer via double-pointer coercion": "pass",
+    "behavior.comptime_memory.test.comptime store to sentinel-terminated array in an extern struct": "pass",
+    "behavior.comptime_memory.test.comptime store to repeated string bytes": "pass"
    }
   },
   "const_slice_child.zig": {
@@ -838,7 +849,8 @@
     "behavior.error.test.compare error union to error set": "pass",
     "behavior.error.test.'if' ignores error via local while 'else' ignores error directly": "pass",
     "behavior.error.test.@errorCast into own inferred error set": "pass",
-    "behavior.error.test.@errorCast into other inferred error set": "pass"
+    "behavior.error.test.@errorCast into other inferred error set": "pass",
+    "behavior.error.test.error union with vector type": "pass"
    }
   },
   "eval.zig": {
@@ -971,7 +983,8 @@
     "behavior.extern.test.function extern symbol": "pass",
     "behavior.extern.test.function extern symbol matches extern decl": "pass",
     "behavior.extern.test.coerce extern function types": "pass",
-    "behavior.extern.test.pass extern function to function": "pass"
+    "behavior.extern.test.pass extern function to function": "pass",
+    "behavior.extern.test.@extern binds to strong @export over weak @export": "pass"
    }
   },
   "field_parent_ptr.zig": {
@@ -1273,6 +1286,7 @@
     "behavior.if.test.else if expression": "pass",
     "behavior.if.test.unwrap mutable global var": "pass",
     "behavior.if.test.labeled break inside comptime if inside runtime if": "pass",
+    "behavior.if.test.labeled break from comptime block inside runtime if": "pass",
     "behavior.if.test.const result loc, runtime if cond, else unreachable": "pass",
     "behavior.if.test.if copies its payload": "pass",
     "behavior.if.test.if prongs cast to expected type instead of peer type resolution": "pass",
@@ -1925,6 +1939,7 @@
     "behavior.slice.test.slice type with custom alignment": "pass",
     "behavior.slice.test.obtaining a null terminated slice": "pass",
     "behavior.slice.test.empty array to slice": "pass",
+    "behavior.slice.test.comptime-known slice of a global constant": "pass",
     "behavior.slice.test.@ptrCast slice to pointer": "pass",
     "behavior.slice.test.slice multi-pointer without end": "pass",
     "behavior.slice.test.slice syntax resulting in pointer-to-array": "pass",
@@ -2504,6 +2519,7 @@
     "behavior.union.test.comptime equality of extern unions with same tag": "pass",
     "behavior.union.test.union tag is set when initiated as a temporary value at runtime": "pass",
     "behavior.union.test.extern union most-aligned field is smaller": "pass",
+    "behavior.union.test.union constant trailing padding": "pass",
     "behavior.union.test.return an extern union from C calling convention": "pass",
     "behavior.union.test.noreturn field in union": "pass",
     "behavior.union.test.@unionInit uses tag value instead of field index": "pass",
@@ -2540,6 +2556,7 @@
     "behavior.union.test.copied union field doesn't alias source": "pass",
     "behavior.union.test.create union(enum) from other union(enum)": "pass",
     "behavior.union.test.matching captures causes union equivalence": "pass",
+    "behavior.union.test.capture used as explicit field value": "pass",
     "behavior.union.test.signed enum tag with negative value": "pass",
     "behavior.union.test.union @FieldType": "pass",
     "behavior.union.test.tagged union @FieldType": "pass",
@@ -2564,7 +2581,8 @@
     "behavior.var_args.test.variadic functions": "pass",
     "behavior.var_args.test.copy VaList": "pass",
     "behavior.var_args.test.unused VaList arg": "pass",
-    "behavior.var_args.test.floating point VaList args": "skip"
+    "behavior.var_args.test.floating point VaList args": "skip",
+    "behavior.var_args.test.overflowed frame varargs": "pass"
    }
   },
   "vector.zig": {
@@ -2627,7 +2645,8 @@
     "behavior.vector.test.index into comptime-known vector is comptime-known": "pass",
     "behavior.vector.test.arithmetic on zero-length vectors": "pass",
     "behavior.vector.test.@reduce on bool vector": "pass",
-    "behavior.vector.test.bitcast vector to array of smaller vectors": "pass"
+    "behavior.vector.test.bitcast vector to array of smaller vectors": "pass",
+    "behavior.vector.test.runtime index into comptime-known array of aggregates holding a vector": "pass"
    }
   },
   "void.zig": {
