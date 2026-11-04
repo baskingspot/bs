@@ -1057,6 +1057,17 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         undef.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&undef.step);
     }
+    {
+        const dead = b.addRunArtifact(zap);
+        dead.setName("zap build-exe links the data a discarded load reads");
+        dead.addArg("build-exe");
+        dead.addFileArg(b.path("test/link_input/dead_load.zig"));
+        dead.setEnvironmentVariable("ZAP_CACHE", "off");
+        _ = dead.addPrefixedOutputFileArg("-femit-bin=", "dead_load");
+        dead.addCheck(.{ .expect_stderr_match = "undefined symbol: nope" });
+        dead.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        test_step.dependOn(&dead.step);
+    }
     // A C++ source with -lc++: libc++, libc++abi and libunwind built from
     // the lib directory as upstream builds them, exceptions through C++
     // frames, RTTI, a static constructor and thread_local.

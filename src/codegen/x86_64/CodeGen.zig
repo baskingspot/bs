@@ -2129,11 +2129,57 @@ fn emitBlocks(cg: *CodeGen) Error!void {
     }
 }
 
+/// Requests the declarations and external symbols that the constant
+/// operands of `inst`, which the SSA removed, point to, as if the code
+/// were generated: upstream's Debug code keeps such a load, so the
+/// declaration's data is linked, and an undefined symbol it names is an
+/// error (`_ = p.*` for `var p: *u8 = &undefined_extern`).
+fn keepSymbols(cg: *CodeGen, inst: Ir.Inst.Index) Error!void {
+    var refs: std.ArrayList(Ir.Inst.Ref) = .empty;
+    defer refs.deinit(cg.gpa);
+    const Collect = struct {
+        refs: *std.ArrayList(Ir.Inst.Ref),
+        gpa: std.mem.Allocator,
+        failed: *bool,
+        pub fn use(c: @This(), ref: Ir.Inst.Ref) void {
+            if (ref.toInterned() != null) c.refs.append(c.gpa, ref) catch {
+                c.failed.* = true;
+            };
+        }
+    };
+    var failed = false;
+    Ssa.forEachOperand(cg.ir, inst, Collect{ .refs = &refs, .gpa = cg.gpa, .failed = &failed });
+    if (failed) return error.OutOfMemory;
+    const ip = cg.ip;
+    for (refs.items) |ref| {
+        var v = ref.toInterned().?;
+        if (ip.keyTag(v) == .opt) v = ip.keyPayload(.opt, v).val;
+        if (v == .none or ip.keyTag(v) != .ptr or Type.isSlice(ip, ip.typeOf(v)) or ptrToZeroBit(ip, v)) continue;
+        var root = v;
+        while (true) switch (ip.keyPayload(.ptr, root).base) {
+            .field => |f| root = f.base,
+            .elem => |e| root = e.base,
+            else => break,
+        };
+        switch (ip.keyPayload(.ptr, root).base) {
+            .nav => |n| if (ip.getNav(n).linkage != .@"extern") {
+                _ = try ptrTarget(cg.emit, v);
+            },
+            .uav => |u| switch (ip.keyTag(u.val)) {
+                .extern_var => _ = try cg.emit.useExtern(ip.stringSlice(ip.keyPayload(.extern_var, u.val).name), false),
+                .extern_func => _ = try cg.emit.useExtern(ip.stringSlice(ip.keyPayload(.extern_func, u.val).name), false),
+                else => {},
+            },
+            else => {},
+        }
+    }
+}
+
 fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!void {
     cg.e.bind(cg.labels[@backingInt(block)]);
     if (cg.ssa.covered.items[@backingInt(block)]) try cg.coverPoint(block == cg.ssa.layout.items[0]);
     for (cg.ssa.blockInsts(block)) |inst| {
-        if (cg.homes[@backingInt(inst)] != .dead) try cg.genInst(inst);
+        if (cg.homes[@backingInt(inst)] != .dead) try cg.genInst(inst) else try cg.keepSymbols(inst);
     }
     try cg.genTerm(cg.ssa.blocks.items[@backingInt(block)].term, next);
 }
