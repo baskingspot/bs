@@ -250,8 +250,7 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     // directory is trusted not to change.
     const trusted = init.environ_map.get("ZIG_LIB_DIR") == null and
         std.mem.eql(u8, lib, try std.fs.path.resolve(arena, &.{ cwd_path, build_options.zig_lib_dir }));
-    const exe = try ensureBinary(init, lib, global, trusted);
-    const exe_stat = try cwd.statFile(io, exe, .{});
+    const exe, const exe_hash = try ensureBinary(init, lib, global, trusted);
 
     // Upstream's arguments, with the depfile and output paths left for
     // last so that the key does not depend on them.
@@ -279,13 +278,13 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     try argv.appendSlice(arena, &.{ "-O0", "-target", try target.zigTriple(arena), try mcpuArg(arena, &target) });
     try argv.appendSlice(arena, req.cc_args);
 
-    // The key: zap, the binary (rebuilt in place when a zig lib directory
-    // under edit changes), the working directory and the arguments.
+    // The key: the binary's contents, which zap's code generation makes
+    // (a new zap that builds the same bytes keeps the records), the working
+    // directory and the arguments.
     var key_args: std.ArrayList([]const u8) = .empty;
-    try key_args.append(arena, try std.fmt.allocPrint(arena, "{d}\x00{d}\x00{d}\x00{d}", .{ exe_stat.inode, exe_stat.size, exe_stat.mtime.toNanoseconds(), exe_stat.ctime.toNanoseconds() }));
     try key_args.appendSlice(arena, argv.items[1..]);
     try key_args.append(arena, source);
-    _, const key = try Incremental.compilationKey(arena, io, key_args.items, lib, "translate-c");
+    const key = try ToolRecord.key(arena, io, "translate-c", &std.fmt.bytesToHex(@as([16]u8, @bitCast(exe_hash)), .lower), lib, key_args.items);
     const digest: [16]u8 = @bitCast(key);
     const hex = std.fmt.bytesToHex(digest, .lower);
     const record_path = try std.fs.path.join(arena, &.{ local, "zap", "tc", &hex });
@@ -355,16 +354,18 @@ fn mcpuArg(arena: std.mem.Allocator, target: *const std.Target) ![]const u8 {
 
 /// Builds translate-c once per zap binary and zig lib directory, into
 /// `<global cache>/zap/o/<hash>/translate-c`, as the build runner, and
-/// returns its path.
-fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, trusted: bool) ![]const u8 {
+/// returns its path and the hash of its contents, kept beside it in
+/// `translate-c.hash` while the binary stats as the stamp says.
+fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, trusted: bool) !struct { []const u8, cache.Hash } {
     const arena = init.arena.allocator();
     const io = init.io;
     const seed, _ = try Incremental.compilationKey(arena, io, &.{}, lib, "x86_64-linux");
-    const h = cache.hash(3, try std.mem.concat(arena, u8, &.{ std.mem.asBytes(&seed), lib }));
-    const dir = try std.fmt.allocPrint(arena, "{s}/zap/o/{x:0>32}", .{ global, h });
+    const dir_hash = cache.hash(3, try std.mem.concat(arena, u8, &.{ std.mem.asBytes(&seed), lib }));
+    const dir = try std.fmt.allocPrint(arena, "{s}/zap/o/{x:0>32}", .{ global, dir_hash });
     const exe = try std.fs.path.join(arena, &.{ dir, "translate-c" });
     const stamp = try std.fs.path.join(arena, &.{ dir, "translate-c.stat" });
-    if (trusted and BuildRunner.toolUnchanged(io, exe, stamp)) return exe;
+    const hash_path = try std.fs.path.join(arena, &.{ dir, "translate-c.hash" });
+    if (trusted and BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h };
     try Io.Dir.cwd().createDirPath(io, dir);
     try BuildRunner.compileTool(init, dir, &.{
         "zap",           "build-exe",
@@ -376,6 +377,19 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, tru
         "--cache-dir",   global,
         "--global-cache-dir", global,
     }, "Compiling translate-c (first time setup)", "translate-c", try std.fmt.allocPrint(arena, "{s}/compiler/translate-c/main.zig", .{lib}), try std.fmt.allocPrint(arena, "{s}/compiler", .{lib}));
-    BuildRunner.noteTool(io, exe, stamp);
-    return exe;
+    // The binary's contents, hashed again only when it changed.
+    if (BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h };
+    const content = cache.hash(0, try Io.Dir.cwd().readFileAlloc(io, exe, arena, .unlimited));
+    var bytes: [16]u8 = undefined;
+    std.mem.writeInt(cache.Hash, &bytes, content, .little);
+    // The stamp vouches for the hash file, so it follows it.
+    if (Io.Dir.cwd().writeFile(io, .{ .sub_path = hash_path, .data = &bytes, .flags = .{} })) |_| BuildRunner.noteTool(io, exe, stamp) else |_| {}
+    return .{ exe, content };
+}
+
+fn readHash(io: Io, path: []const u8) ?cache.Hash {
+    var buf: [16]u8 = undefined;
+    const bytes = Io.Dir.cwd().readFile(io, path, &buf) catch return null;
+    if (bytes.len != 16) return null;
+    return std.mem.readInt(cache.Hash, &buf, .little);
 }

@@ -13,7 +13,7 @@ const Io = std.Io;
 const cache = @import("cache.zig");
 
 /// A record: `Header`, `n` `Entry`s, then the paths.
-const record_magic = "ZAPTC001".*;
+const record_magic = "ZAPTC002".*;
 const Header = extern struct {
     magic: [8]u8 = record_magic,
     output_hash: cache.Hash,
@@ -49,6 +49,22 @@ fn entry(st: Io.File.Stat, hash: cache.Hash, path_len: usize, start_ns: i96) Ent
         .path_len = @intCast(path_len),
         .hash = hash,
     };
+}
+
+/// A record's key: the tool that makes the output (`tool_id`: upstream
+/// zig's identity for Clang, the binary's content hash for translate-c),
+/// the working directory, the zig lib directory and the arguments, which
+/// end with the source. Not zap's identity: zap only chooses the
+/// arguments, and everything else the tool reads is a recorded file,
+/// checked by content.
+pub fn key(gpa: std.mem.Allocator, io: Io, kind: []const u8, tool_id: []const u8, lib: []const u8, args: []const []const u8) !cache.Hash {
+    var id: std.ArrayList(u8) = .empty;
+    defer id.deinit(gpa);
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    try id.print(gpa, "{s}\x00{s}\x00{s}\x00{s}\x00", .{ kind, tool_id, cwd, lib });
+    for (args) |a| try id.print(gpa, "{s}\x00", .{a});
+    return cache.hash(4, id.items);
 }
 
 pub const Check = union(enum) {

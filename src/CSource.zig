@@ -19,7 +19,6 @@ const std = @import("std");
 const Io = std.Io;
 const cache = @import("cache.zig");
 const diag = @import("diag.zig");
-const Incremental = @import("Incremental.zig");
 const ToolRecord = @import("ToolRecord.zig");
 
 const CSource = @This();
@@ -483,10 +482,9 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         const abs_source = try std.fs.path.resolve(arena, &.{ cwd_path, src.path });
 
         var key_args: std.ArrayList([]const u8) = .empty;
-        try key_args.append(s, zig_id);
         try key_args.appendSlice(s, argv.items[1..]);
         try key_args.append(s, abs_source);
-        _, const key = try Incremental.compilationKey(s, io, key_args.items, lib, "cc");
+        const key = try ToolRecord.key(s, io, "cc", zig_id, lib, key_args.items);
         const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(key)), .lower);
         j.* = .{
             .arena = j.arena,

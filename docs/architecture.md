@@ -6068,8 +6068,8 @@ so static links compile as before.
   back as an ErrorBundle on stdout), with upstream's arguments.
 - **A translation record** per translation, `<local cache>/zap/tc/<key>`
   (small, one file; written through a temporary file and renamed). The
-  key hashes zap's store seed, the translate-c binary's identity, the
-  source path and the arguments that reach Aro (target, glibc version,
+  key hashes the translate-c binary's contents (not zap's identity: a
+  new zap that builds the same binary keeps the records), the source path and the arguments that reach Aro (target, glibc version,
   include directories, defines, flags, in order); file contents are not
   in it. The record holds every file Aro read (the source and each header
   from its `-MD` depfile) with its stat (inode, size, mtime, under the
@@ -6294,11 +6294,14 @@ libraries as inputs. To be agreed with that thread.
   Debug, compiled by zap from `<global cache>/zap/o/<hash>/` like the
   build runner (`BuildRunner.compileTool`, `toolUnchanged`).
 - **Records** (`<local cache>/zap/tc/<key>`): a header (magic
-  `ZAPTC001`, the output's hash, counts), one 48-byte entry per file
+  `ZAPTC002`, the output's hash, counts), one 48-byte entry per file
   (inode, size, mtime or racy, path length, content hash), then the
-  absolute paths. The key (`Incremental.compilationKey` over the binary's
-  stat, Aro's arguments and the source's absolute path, so zap, the
-  working directory and the zig lib directory too) names the output,
+  absolute paths. The key (`ToolRecord.key` over the binary's content
+  hash, kept in `translate-c.hash` beside it and recomputed when the
+  binary's stat stamp changes, Aro's arguments and the source's absolute
+  path, the working directory and the zig lib directory; not zap's
+  identity, since zap's code generation reaches the output only through
+  the binary) names the output,
   `<local cache>/o/<key>/<stem>.zig`, and is the digest. A hit stats the
   files, rehashes those whose stats changed, and rewrites the record when
   only stats changed, else touches it (its mtime is its last use, for
@@ -6384,8 +6387,17 @@ libraries as inputs. To be agreed with that thread.
   and adds their objects to `ElfInput`, so archive members and
   compiler_rt are pulled for them as for `.o` inputs.
 - **Records**: as translate-c's (`ToolRecord.zig`, shared): the key
-  covers zap, upstream zig's path and stat, Clang's arguments without the
-  depfile and output paths, and the source's absolute path; the object
+  covers upstream zig's path and stat, Clang's arguments without the
+  depfile and output paths, the source's absolute path, the working
+  directory and the zig lib directory, and not zap's identity, so a new
+  zap keeps the objects (SDL3's 473 took 37 s to compile again). zap
+  writes no file Clang reads: everything else Clang reads (the source,
+  every header, libc's and libc++'s from the lib directory included) is
+  in the depfile, so in the record by content. The runtime libraries
+  (libc++, libunwind, libc_nonshared) have no records: their archives
+  are keyed by upstream zig's identity and their compiles' arguments,
+  trusting the lib directory's sources by path as the build runner does;
+  the object
   is `<local cache>/o/<key>/<stem>.o`, the record `zap/tc/<key>`, so the
   cache's trimming covers both. A build whose C files and headers all
   stat as recorded runs no Clang; a header edit recompiles the files
