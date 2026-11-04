@@ -5305,9 +5305,15 @@ libraries as inputs. To be agreed with that thread.
   object's, and their names extend the section name table, whose
   shorter prefixes the other outputs keep.
 - **Not cached yet.** A `-lc` build skips the on-disk cache
-  (`Job.openCache`; `Elf.build` refuses a numbered dynamic executable,
-  whose imports it keys by SymbolKey), and the
-  manifest does not keep the imports. The cache thread's `objcache`
+  (`Job.openCache`), and the manifest does not keep the imports. `Elf`
+  takes numbered dynamic executables (2026-11-04): the imports' numbers
+  (`Symbols.dynamic_imports`) map to `import_tag + i` in the address
+  table, which stands for the key-based stand-in address, since that
+  lies outside the image and is no offset from its base; which absolute
+  relocations need the loader is still decided by the targets' keys,
+  which numbered atoms keep. A unit test links an executable calling
+  `puts` and `exit` through slots both ways, compares the bytes, and runs
+  it under ld.so. The cache thread's `objcache`
   branch adds `Manifest.link_symbols`; on it, step 1b adds `needed`,
   `interp` and versioned import kinds (ZAPMAN13), numbered dynamic links,
   and `-lc` with the glibc version in the donor key and compilation key.

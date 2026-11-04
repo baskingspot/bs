@@ -151,7 +151,7 @@ pub const Symbols = struct {
     bounds: [bound_sections.len * 2]u32 = @splat(no_bound),
     /// With `Options.dynamic`, the numbers its key-based link finds by key:
     /// its imports', parallel to `ElfDynamic.Options.imports`, which
-    /// resolve to their PLT stubs; its exports' atoms', parallel to
+    /// resolve to their PLT stubs (in an executable, to stand-ins); its exports' atoms', parallel to
     /// `ElfDynamic.Options.exports`; and `_DYNAMIC`'s
     /// (`ElfDynamic.dynamic_key`), or `no_bound` if nothing references it.
     dynamic_imports: []const u32 = &.{},
@@ -498,6 +498,10 @@ const chunk_len = 2048;
 /// the table small, as relocations index it at random.
 const unset = std.math.maxInt(u32);
 const value_tag = 1 << 31;
+/// With numbered symbols, a dynamically linked executable's `i`-th import
+/// is `import_tag + i` in `addrs`, standing for its key-based stand-in
+/// address (`exe_import_base`); values stay below it.
+const import_tag = unset - (1 << 20);
 /// Section names. Outputs without debug info keep the prefix up to the
 /// names they use.
 const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00.data.rel.ro\x00.dynsym\x00.dynstr\x00.hash\x00.gnu.hash\x00.rela.dyn\x00.plt\x00.dynamic\x00.got\x00.interp\x00.gnu.version\x00.gnu.version_r\x00";
@@ -551,9 +555,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
     defer symbols.deinit();
     const exe_dyn = if (options.dynamic) |d| d.executable() else false;
-    // A dynamic executable's imports are keyed by SymbolKey
-    // (`exe_imports`); numbered links of one are not built yet.
-    if (numbered != null and exe_dyn) return error.InvalidSymbols;
+    // Numbered imports' entries are `import_tag + i` (`numberedAddr`).
+    if (numbered != null and exe_dyn and options.dynamic.?.imports.len > unset - import_tag) return error.InvalidSymbols;
     const exe_imports: ?[]SymbolKey = if (exe_dyn) try gpa.alloc(SymbolKey, options.dynamic.?.imports.len) else null;
     defer if (exe_imports) |k| gpa.free(k);
     if (exe_imports) |keys_out| {
@@ -689,7 +692,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     if (numbered) |s| {
         // Atoms, numbered in `resolveAddrs`, take precedence over values.
         @memset(addrs, unset);
-        if (s.values.len >= unset - value_tag) return error.InvalidSymbols;
+        if (s.values.len >= import_tag - value_tag) return error.InvalidSymbols;
         for (s.values, 0..) |v, i| {
             if (v.symbol >= addrs.len) return error.InvalidSymbols;
             addrs[v.symbol] = @intCast(value_tag + i);
@@ -837,7 +840,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         if (numbered) |s| {
             for (s.dynamic_imports, 0..) |n, i| {
                 if (n >= addrs.len) return error.InvalidSymbols;
-                addrs[n] = @intCast(plt_off + i * ElfDynamic.plt_entry_size);
+                // An executable's stand-ins lie outside the image, so not
+                // at offsets from its base.
+                addrs[n] = if (exe_dyn) @intCast(import_tag + i) else @intCast(plt_off + i * ElfDynamic.plt_entry_size);
             }
             if (s.dynamic != no_bound) {
                 if (s.dynamic >= addrs.len) return error.InvalidSymbols;
@@ -1293,6 +1298,7 @@ fn LinkOf(comptime Input: type) type {
         fn numberedAddr(l: *const Link, e: u32) ?u64 {
             if (e < value_tag) return l.base + e;
             if (e == unset) return null;
+            if (e >= import_tag) return l.plt_start + (e - import_tag) * ElfDynamic.plt_entry_size;
             return l.numbered.?.values[e - value_tag].value;
         }
 
@@ -2291,6 +2297,82 @@ test "a shared object links the same with numbered symbols" {
     numbered_options.diag = &diag;
     try std.testing.expectError(error.UndefinedSymbol, emit(gpa, io, &atoms, numbered_options));
     try std.testing.expectEqualStrings("f", diag.atom);
+}
+
+test "a dynamically linked executable links the same with numbered symbols and runs" {
+    if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .linux) return error.SkipZigTest;
+    // Only where glibc's loader is (as `-lc` executables need).
+    std.Io.Dir.cwd().access(std.testing.io, "/lib64/ld-linux-x86-64.so.2", .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const start: SymbolKey = .fromName("_start");
+    const msg: SymbolKey = .fromName("msg");
+    const puts: SymbolKey = .fromName("import.puts");
+    const exit: SymbolKey = .fromName("import.exit");
+    const puts_slot: SymbolKey = .fromName("extern.puts");
+    const exit_slot: SymbolKey = .fromName("extern.exit");
+    const own: SymbolKey = .fromName("own");
+    // `lea rdi, [rip + msg]; call [rip + puts]; mov edi, 42; call [rip +
+    // exit]`, through the imports' slots, as Zig code calls externs.
+    const code = "\x48\x8d\x3d\x00\x00\x00\x00" ++ "\xff\x15\x00\x00\x00\x00" ++ "\xbf\x2a\x00\x00\x00" ++ "\xff\x15\x00\x00\x00\x00";
+    const zeros: [8]u8 = @splat(0);
+    const atoms = [_]Atom{
+        .{ .key = start, .name = "_start", .section = .text, .bytes = code, .targets = &.{ msg, puts_slot, exit_slot }, .relocs = &.{
+            .init(3, .x86_64_pc32, 0, -4),
+            .init(9, .x86_64_pc32, 1, -4),
+            .init(20, .x86_64_pc32, 2, -4),
+        } },
+        .{ .key = msg, .name = "msg", .section = .rodata, .bytes = "hi from ld.so\x00" },
+        // The slots, in .rodata, move to .data.rel.ro for the loader.
+        .{ .key = puts_slot, .name = "extern.puts", .section = .rodata, .alignment = .@"8", .bytes = &zeros, .targets = &.{puts}, .relocs = &.{.init(0, .x86_64_abs64, 0, 0)} },
+        .{ .key = exit_slot, .name = "extern.exit", .section = .rodata, .alignment = .@"8", .bytes = &zeros, .targets = &.{exit}, .relocs = &.{.init(0, .x86_64_abs64, 0, 0)} },
+        // An address of the image's own stays static.
+        .{ .key = own, .name = "own", .section = .data, .alignment = .@"8", .bytes = &zeros, .targets = &.{msg}, .relocs = &.{.init(0, .x86_64_abs64, 0, 0)} },
+    };
+    const dynamic: ElfDynamic.Options = .{
+        .imports = &.{
+            .{ .key = exit, .name = "exit", .version = "GLIBC_2.2.5", .library = 0 },
+            .{ .key = puts, .name = "puts", .version = "GLIBC_2.2.5", .library = 0 },
+        },
+        .interp = "/lib64/ld-linux-x86-64.so.2",
+        .needed = &.{"libc.so.6"},
+    };
+    const options: Options = .{ .entry = start, .dynamic = &dynamic };
+    const bytes = try emit(gpa, io, &atoms, options);
+    defer gpa.free(bytes);
+    try std.testing.expectEqual(elf.ET.EXEC, @as(elf.ET, @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[16..18], .little)))));
+
+    // Numbers: the atoms in order, then exit and puts.
+    const numbering = [_]SymbolKey{ start, msg, puts_slot, exit_slot, own, exit, puts };
+    var numbered_atoms: [atoms.len]NumberedAtom = undefined;
+    var targets: std.ArrayList(u32) = .empty;
+    defer targets.deinit(gpa);
+    for (atoms, &numbered_atoms, 0..) |a, *n, i| {
+        n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
+        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.indexOfScalar(SymbolKey, &numbering, t).?));
+    }
+    var numbered_options = options;
+    numbered_options.symbols = .{
+        .atoms = &numbered_atoms,
+        .targets = targets.items,
+        .dynamic_imports = &.{ 5, 6 },
+        .entry = 0,
+        .len = numbering.len,
+    };
+    const numbered = try emit(gpa, io, &atoms, numbered_options);
+    defer gpa.free(numbered);
+    try std.testing.expectEqualSlices(u8, bytes, numbered);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "dyn", .data = numbered, .flags = .{ .permissions = .executable_file } });
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/dyn", .{tmp.sub_path});
+    defer gpa.free(path);
+    const result = try std.process.run(gpa, io, .{ .argv = &.{path} });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    try std.testing.expectEqualStrings("hi from ld.so\n", result.stdout);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, result.term);
 }
 
 test "thread-locals in .tdata and .tbss read back after static TLS setup" {
