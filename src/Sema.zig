@@ -9410,16 +9410,42 @@ noinline fn failUndefAt(sema: *Sema, block: *Block, src: Src) CompileError {
     return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
 }
 
+/// Fails pointer arithmetic other than what upstream allows: subtracting
+/// two pointers (`pointers`), or adding or subtracting an integer.
+fn failInvalidPtrArithmetic(sema: *Sema, block: *Block, src: Src, pointers: bool) CompileError {
+    const err = if (pointers)
+        sema.fail(block, src, "invalid pointer-pointer arithmetic operator", .{})
+    else
+        sema.fail(block, src, "invalid pointer-integer arithmetic operator", .{});
+    const span = src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+    if (pointers)
+        try sema.zcu.addNote(sema.file, span, "pointer-pointer arithmetic only supports subtraction", .{})
+    else
+        try sema.zcu.addNote(sema.file, span, "pointer-integer arithmetic only supports addition and subtraction", .{});
+    return err;
+}
+
 fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, uncasted_lhs: Ref, uncasted_rhs: Ref) CompileError!Ref {
     const ip = sema.ip;
     switch (tag) {
         .shl, .shr, .shl_sat, .shl_exact, .shr_exact => return sema.analyzeShift(block, src, tag, uncasted_lhs, uncasted_rhs),
         else => {},
     }
-    if (Type.class(ip, sema.typeOf(uncasted_lhs)) == .pointer and Type.class(ip, sema.typeOf(uncasted_rhs)) == .pointer and tag == .sub)
-        return sema.analyzePtrDiff(block, src, uncasted_lhs, uncasted_rhs);
-    if (Type.class(ip, sema.typeOf(uncasted_lhs)) == .pointer and (tag == .add or tag == .sub or tag == .addwrap or tag == .subwrap))
-        return sema.analyzePtrArithmetic(block, src, tag == .add or tag == .addwrap, uncasted_lhs, uncasted_rhs);
+    // As upstream: two pointers other than slices only subtract, and a
+    // many-item or C pointer only adds or subtracts an integer. Others
+    // are operands of their peer type.
+    if (Type.class(ip, sema.typeOf(uncasted_lhs)) == .pointer) {
+        const l_size = Type.ptrInfo(ip, sema.typeOf(uncasted_lhs)).flags.size;
+        const rt = sema.typeOf(uncasted_rhs);
+        if (Type.class(ip, rt) == .pointer and l_size != .slice and Type.ptrInfo(ip, rt).flags.size != .slice) {
+            if (tag != .sub) return sema.failInvalidPtrArithmetic(block, src, true);
+            return sema.analyzePtrDiff(block, src, uncasted_lhs, uncasted_rhs);
+        }
+        if (l_size == .many or l_size == .c) {
+            if (tag != .add and tag != .sub) return sema.failInvalidPtrArithmetic(block, src, false);
+            return sema.analyzePtrArithmetic(block, src, tag == .add, uncasted_lhs, uncasted_rhs);
+        }
+    }
     const ty = try sema.resolvePeerTypes(block, src, &.{ uncasted_lhs, uncasted_rhs });
     if (sema.vectorLen(ty)) |len| {
         const lhs = try sema.vectorOperand(block, src, ty, uncasted_lhs);
@@ -9622,10 +9648,11 @@ fn analyzePtrDiff(sema: *Sema, block: *Block, src: Src, lhs: Ref, rhs: Ref) Comp
         }
     }.f;
     const elem_ty = elem(ip, lp);
-    if (lp.flags.size == .slice or rp.flags.size == .slice or elem_ty != elem(ip, rp))
+    if (elem_ty != elem(ip, rp))
         return sema.fail(block, src, "incompatible pointer arithmetic operands '{f}' and '{f}'", .{ sema.fmtType(sema.typeOf(lhs)), sema.fmtType(sema.typeOf(rhs)) });
     try sema.resolveLayout(block, src, elem_ty);
-    const elem_size = @max(Type.abiSize(ip, elem_ty), 1);
+    const elem_size = Type.abiSize(ip, elem_ty);
+    if (elem_size == 0) return sema.fail(block, src, "pointer subtraction requires element type '{f}' to have runtime bits", .{sema.fmtType(elem_ty)});
     if (sema.resolveValue(lhs)) |lv| if (sema.resolveValue(rhs)) |rv| {
         const lk = ip.keyPayload(.ptr, lv);
         const rk = ip.keyPayload(.ptr, rv);
@@ -10852,6 +10879,24 @@ fn boolOp(sema: *Sema, block: *Block, tag: Ir.Inst.Tag, a: Ref, b: Ref) CompileE
     return sema.addBinOp(block, tag, a, b);
 }
 
+fn compareOperatorName(op: std.math.CompareOperator) []const u8 {
+    return switch (op) {
+        .lt => "<",
+        .lte => "<=",
+        .eq => "==",
+        .gte => ">=",
+        .gt => ">",
+        .neq => "!=",
+    };
+}
+
+/// Fails comparison `op` at `src` of operands whose peer type does not
+/// support it, as upstream (or their peer type resolution's error).
+fn failNotComparable(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator, lhs: Ref, rhs: Ref) CompileError {
+    const ty = try sema.resolvePeerTypes(block, src, &.{ lhs, rhs });
+    return sema.fail(block, src, "operator {s} not allowed for type '{f}'", .{ compareOperatorName(op), sema.fmtType(ty) });
+}
+
 fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator, lhs: Ref, rhs: Ref) CompileError!Ref {
     const ip = sema.ip;
     const lt = sema.typeOf(lhs);
@@ -10873,7 +10918,7 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
 
     // Comparison with `null`.
     if (lc == .null or rc == .null) {
-        if (!is_eq) return sema.fail(block, src, "operator {s} not allowed for type '{f}'", .{ @tagName(op), sema.fmtType(if (lc == .null) rt else lt) });
+        if (!is_eq) return sema.fail(block, src, "operator {s} not allowed for type '{f}'", .{ compareOperatorName(op), sema.fmtType(if (lc == .null) rt else lt) });
         const other = if (lc == .null) rhs else lhs;
         const other_ty = sema.typeOf(other);
         if (Type.class(ip, other_ty) == .null) return .fromInterned(boolValue(op == .eq));
@@ -10938,6 +10983,8 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
     if (is_eq and (lc == .@"enum" or rc == .@"enum" or lc == .@"union" or rc == .@"union") and
         (lc == .@"enum" or lc == .enum_literal or lc == .@"union") and (rc == .@"enum" or rc == .enum_literal or rc == .@"union"))
     {
+        // Two unions are compared as unions, which only packed ones are.
+        if (lc == .@"union" and rc == .@"union") return sema.failNotComparable(block, src, op, lhs, rhs);
         // Compare tags: a union compares by its tag.
         const tag_of = struct {
             fn f(s: *Sema, b: *Block, sr: Src, r: Ref) CompileError!Ref {
@@ -10984,7 +11031,7 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
     if (lc == .pointer and rc == .pointer and !is_eq) {
         // Only C pointers are ordered, as upstream.
         for ([_]Index{ lt, rt }) |t| if (Type.ptrInfo(ip, t).flags.size != .c)
-            return sema.fail(block, src, "operator {s} not allowed for type '{f}'", .{ @tagName(op), sema.fmtType(t) });
+            return sema.fail(block, src, "operator {s} not allowed for type '{f}'", .{ compareOperatorName(op), sema.fmtType(t) });
         // Ordered comparison compares addresses: comptime-known for
         // addresses from integers or within the same comptime memory.
         if (sema.resolveValue(lhs)) |a| if (sema.resolveValue(rhs)) |b| {
@@ -11008,6 +11055,7 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         return sema.addBinOp(block, tag, try sema.addUnOp(block, .int_from_ptr, lhs), try sema.addUnOp(block, .int_from_ptr, rhs));
     }
     if (lc == .pointer and rc == .pointer) {
+        if (Type.ptrInfo(ip, lt).flags.size == .slice or Type.ptrInfo(ip, rt).flags.size == .slice) return sema.failNotComparable(block, src, op, lhs, rhs);
         if (sema.resolveValue(lhs)) |a| if (sema.resolveValue(rhs)) |b| {
             if (sema.isUndef(a) or sema.isUndef(b)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
             const ka = ip.indexToKey(a);
@@ -11040,7 +11088,9 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
     const l_float = lc == .float or lc == .comptime_float;
     const r_float = rc == .float or rc == .comptime_float;
     if ((l_float or r_float) and (l_int or l_float) and (r_int or r_float)) return sema.cmpFloat(block, src, op, lhs, rhs);
-    if (!l_int or !r_int) return sema.fail(block, src, "operator {s} not allowed for types '{f}' and '{f}'", .{ @tagName(op), sema.fmtType(lt), sema.fmtType(rt) });
+    // As upstream, other types are compared as their peer type, which
+    // must be comparable.
+    if (!l_int or !r_int) return sema.failNotComparable(block, src, op, lhs, rhs);
 
     const lv = sema.resolveValue(lhs);
     const rv = sema.resolveValue(rhs);
