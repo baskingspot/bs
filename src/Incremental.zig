@@ -115,6 +115,9 @@ glibc: ?*const Glibc = null,
 /// eagerly (`linkInputsChanged`), so that `Emit.finish` binds the externs
 /// again.
 link_objects: []const []const u8 = &.{},
+/// The index in `link_objects` where the C objects and the C++ runtime's
+/// archives start, which `ElfInput.addArchive` takes as `runtime`.
+link_runtime_from: usize = std.math.maxInt(usize),
 /// Some of `link_objects` are still being made (a C source's record
 /// missed, and upstream's Clang is compiling it), so they may differ from
 /// the manifest's: the build replays eagerly, as after an edited object.
@@ -729,11 +732,11 @@ fn linkWithInputs(
 ) !?Linked {
     const gpa = inc.gpa;
     const io = inc.io;
-    var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null };
-    for (inc.link_objects) |path| {
+    var objects: ElfInput = .{ .arena = arena, .dynamic = glibc != null, .shared_libs = shared };
+    for (inc.link_objects, 0..) |path, n| {
         const bytes = try inc.mapInput(arena, maps, path) orelse return null;
         const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
-        (if (is_archive) objects.addArchive(path, bytes) else objects.addObject(path, bytes)) catch |err| switch (err) {
+        (if (is_archive) objects.addArchive(path, bytes, n >= inc.link_runtime_from) else objects.addObject(path, bytes)) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             else => return inc.noLink("{s}: {t}", .{ path, err }),
         };

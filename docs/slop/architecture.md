@@ -3370,7 +3370,14 @@ thread's abilists imports. No bytes come from it.
 - Resolution order: Zig exports, then objects, then compiler_rt, then
   the shared libraries in input order, then glibc (`Emit.libraryDefines`
   answers for the last two; `exportTarget`, `InputResolver.importSym`
-  and the PC-relative import error use it).
+  and the PC-relative import error use it). Archive members are pulled
+  before that, except that the C++ runtime's archives (libc++,
+  libc++abi, libunwind, libc_nonshared.a: `ElfInput.addArchive`'s
+  `runtime`) supply no name a given `.so` defines, since upstream's lld
+  sees them after every input (2026-11-04: an executable took libc++'s
+  operator new and exported it over fmt's libfmt.so's). User archives
+  still pull before any `.so`, whatever their order on the command
+  line; lld's order would let an earlier `.so` win there too.
 - `Glibc.dynamicOptions` puts the given `.so` files that are alive in
   DT_NEEDED, in input order and before glibc's libraries, as upstream's
   linker keeps them (`Object.markLive`, `SharedObject.markLive`; fixed

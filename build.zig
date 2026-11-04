@@ -1813,6 +1813,27 @@ fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std
         test_step.dependOn(&r.step);
     }
 
+    // A shared library's operator new replaces libc++'s, which the C++
+    // runtime's archive would otherwise supply, as upstream links it.
+    {
+        const lib = b.addSystemCommand(&.{ upstreamZig(b), "c++", "-shared", "-fPIC", "-Wl,-soname,libcxxnew.so" });
+        lib.addFileArg(b.path("test/link_input/cxx_new.cpp"));
+        const lib_file = lib.addPrefixedOutputFileArg("-o", "libcxxnew.so");
+        const new_exe = b.addRunArtifact(bs);
+        new_exe.addArgs(&.{ "build-exe", "-lc", "-lc++" });
+        new_exe.addFileArg(lib_file);
+        new_exe.addFileArg(b.path("test/link_input/cxx_new_main.cpp"));
+        new_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        new_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const r = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
+        r.setName("run bs link of a C++ executable with a shared library's operator new");
+        r.addFileArg(lib_file);
+        r.addFileArg(new_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addCheck(.{ .expect_stdout_exact = "42 1\n" });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
+
     // Constructors run in priority order across two objects, before main;
     // the destructor runs only with -lc, whose exit runs the fini array.
     var ctors: [2]std.Build.LazyPath = undefined;

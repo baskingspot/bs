@@ -615,6 +615,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // and archive arguments, as `ElfInput` takes them.
     if (c_batch) |b| if (inc_opt) |i| {
         i.link_objects = try std.mem.concat(init.arena.allocator(), []const u8, &.{ job.link_objects, try CSource.objectPaths(b, init.arena.allocator()) });
+        i.link_runtime_from = job.link_objects.len;
     };
     while (true) return compileReplaying(init, job, inc_opt, if (rec) |*r| r else null, out_path, alt_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
         error.LazyFallback => {
@@ -1114,6 +1115,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // runtime libraries; a static library holds the objects as members.
     link_inputs.shared = emit.shared;
     link_inputs.dynamic = glibc != null or emit.shared;
+    link_inputs.shared_libs = shared_libs;
     if (c_batch) |b| if (!emit.obj or emit.shared) {
         emit.inputs = &link_inputs;
         emit.c_batch = b;
@@ -1143,7 +1145,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
             const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
                 fatal("unable to read '{s}': {t}", .{ path, err });
             const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
-            (if (is_archive) link_inputs.addArchive(path, bytes) else link_inputs.addObject(path, bytes)) catch |err| switch (err) {
+            (if (is_archive) link_inputs.addArchive(path, bytes, false) else link_inputs.addObject(path, bytes)) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
                 error.InvalidObject => fatal("'{s}' is not an x86_64 ELF relocatable object", .{path}),
                 error.InvalidArchive => fatal("'{s}' is not a valid archive", .{path}),

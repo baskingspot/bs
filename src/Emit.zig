@@ -887,7 +887,7 @@ pub fn sync(emit: *Emit, zcu: *Zcu) !void {
             // As `convertInputs` reports the inputs' problems.
             else => try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{try std.fmt.allocPrint(emit.allocator(), "unable to link '{s}': {t}", .{ o.path, err })}),
         };
-        for ((try b.wait()).archives) |a| in.addArchive(a.path, a.bytes) catch |err| switch (err) {
+        for ((try b.wait()).archives) |a| in.addArchive(a.path, a.bytes, true) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             else => try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{try std.fmt.allocPrint(emit.allocator(), "unable to link '{s}': {t}", .{ a.path, err })}),
         };

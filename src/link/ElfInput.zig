@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 const Atom = @import("Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Archive = @import("Archive.zig");
+const ElfShared = @import("ElfShared.zig");
 const Elf = @import("Elf.zig");
 const ElfDynamic = @import("ElfDynamic.zig");
 
@@ -43,6 +44,10 @@ shared: bool = false,
 /// shared object): GNU indirect functions resolve through it
 /// (`ifuncAtoms`); otherwise they are errors.
 dynamic: bool = false,
+/// The shared libraries the link imports from. Upstream's linker sees
+/// them before the C++ runtime's archives (`addArchive`'s `runtime`), so
+/// a name one of them defines pulls no member from those archives.
+shared_libs: []const ElfShared = &.{},
 
 pub const Def = struct { object: u32, sym: u32, weak: bool };
 pub const Common = struct { size: u64, alignment: u64 };
@@ -52,6 +57,7 @@ const ArchiveInput = struct {
     reader: Archive.Reader,
     /// Member header offsets already pulled.
     pulled: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    runtime: bool,
 };
 
 pub const Error = error{ OutOfMemory, InvalidObject, InvalidArchive, ThinArchive };
@@ -171,8 +177,11 @@ pub fn addObject(in: *Inputs, path: []const u8, bytes: []const u8) Error!void {
 
 /// Adds an archive, whose members load when they define a name the
 /// inputs or the caller need (`pull`).
-pub fn addArchive(in: *Inputs, path: []const u8, bytes: []const u8) Error!void {
-    try in.archives.append(in.arena, .{ .path = path, .reader = try .init(in.arena, bytes) });
+/// `runtime` marks an archive the link adds after every input, as
+/// upstream's linker sees libc++, libc++abi, libunwind and
+/// libc_nonshared.a (`shared_libs`).
+pub fn addArchive(in: *Inputs, path: []const u8, bytes: []const u8, runtime: bool) Error!void {
+    try in.archives.append(in.arena, .{ .path = path, .reader = try .init(in.arena, bytes), .runtime = runtime });
 }
 
 fn load(in: *Inputs, o: Object) Error!void {
@@ -235,6 +244,9 @@ pub fn pull(in: *Inputs, wanted: []const []const u8, ctx: anytype) !usize {
         for (in.archives.items) |*ar| for (ar.reader.symbols) |sym| {
             if (!in.undefs.contains(sym.name) or in.defs.contains(sym.name) or in.commons.contains(sym.name)) continue;
             if (try ctx.zigExport(sym.name) != null) continue;
+            if (ar.runtime and for (in.shared_libs) |lib| {
+                if (lib.symbols.contains(sym.name)) break true;
+            } else false) continue;
             if ((try ar.pulled.getOrPut(in.arena, sym.member)).found_existing) continue;
             const m = try ar.reader.member(sym.member);
             const path = try std.fmt.allocPrint(in.arena, "{s}({s})", .{ ar.path, m.name });
