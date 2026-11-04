@@ -1324,49 +1324,108 @@ class Gen:
 
     def s_vector(self, ctx):
         """Explicit @Vector code, lowered to SIMD registers by both
-        compilers: element-wise operations, compares and @select, then
-        reductions and element reads folded into the checksum."""
+        compilers: element-wise operations on lanes of any width,
+        compares, @select, @shuffle, casts, then reductions, mask
+        searches and element reads folded into the checksum."""
+        odd = [Int(False, 4), Int(True, 24), Int(False, 33), Int(False, 1), Int(True, 7), Int(False, 12),
+               Int(True, 48), Int(False, 63), Int(True, 3)]
         et = self.pick([Int(False, 8), Int(False, 16), U32, U64, Int(True, 8), Int(True, 16), Int(True, 32),
-                        Int(True, 64)] + [t for t in self.ints if t.bits <= 64 and self.chance(0.2)])
-        n = self.pick([2, 4, 8, 16, 3, 5])
-        vt = f"@Vector({n}, {et.name()})"
-        arrs = [p for p in self.paths(ctx, lambda x: isinstance(x, Array) and x.n == n and x.elem.name() == et.name())]
+                        Int(True, 64)] + odd + [t for t in self.ints if t.bits <= 64 and self.chance(0.2)])
+        n = self.pick([2, 4, 8, 16, 3, 5, 4, 8, 32 if et.bits <= 16 else 6])
+        en = et.name()
+        vt = f"@Vector({n}, {en})"
+        arrs = [p for p in self.paths(ctx, lambda x: isinstance(x, Array) and x.n == n and x.elem.name() == en)]
+        texts = []
 
         def operand():
             k = self.r.random()
-            if arrs and k < 0.3:
-                return self.render_path(ctx, self.pick(arrs)[0])
-            if k < 0.5:
-                return f"@as({vt}, @splat({self.int_expr(ctx, et, 2)}))"
-            return f"{vt}{{ {', '.join(self.int_expr(ctx, et, 1) for _ in range(n))} }}"
+            if arrs and k < 0.25:
+                e = self.render_path(ctx, self.pick(arrs)[0])
+            elif k < 0.45:
+                e = f"@as({vt}, @splat({self.int_expr(ctx, et, 2)}))"
+            elif k < 0.52 and not et.signed and et.max() >= n - 1:
+                e = f"std.simd.iota({en}, {n})"
+            else:
+                e = f"{vt}{{ {', '.join(self.int_expr(ctx, et, 1) for _ in range(n))} }}"
+            texts.append(e)
+            return e
 
-        a, b, r = self.fresh("va"), self.fresh("vb"), self.fresh("vr")
+        a, b = self.fresh("va"), self.fresh("vb")
         self.emit(ctx, f"const {a}: {vt} = {operand()};")
-        self.emit(ctx, f"const {b}: {vt} = {operand()};")
-        k = self.r.random()
-        if k < 0.45:
-            e = f"{a} {self.pick(['+%', '-%', '*%', '&', '|', '^', '+|', '-|'])} {b}"
-        elif k < 0.6:
-            e = f"@{self.pick(['min', 'max'])}({a}, {b})"
-        elif k < 0.75:
-            e = f"@select({et.name()}, {a} {self.pick(['<', '<=', '==', '!=', '>', '>='])} {b}, {a}, {b})"
-        elif k < 0.85 and et.bits > 1:
-            e = f"({a} {self.pick(['<<', '>>'])} @as(@Vector({n}, std.math.Log2Int({et.name()})), @splat({self.r.randrange(et.bits)}))) ^ {b}"
-        elif k < 0.92:
-            e = f"~{a} ^ {b}"
-        else:
-            e = f"-%{a} +% {b}"
-        self.emit(ctx, f"const {r}: {vt} = {e};")
-        red = self.pick([".Xor", ".And", ".Or", ".Min", ".Max"])
-        self.sink(ctx, f"@reduce({red}, {r})", et)
-        if self.chance(0.6):
-            self.sink(ctx, f"{r}[{self.r.randrange(n)}]", et)
-        if self.chance(0.4):
-            arr = self.fresh("vx")
-            self.emit(ctx, f"const {arr}: [{n}]{et.name()} = {r};")
-            self.sink(ctx, f"{arr}[{self.index(ctx, n, allow_oob=False)}]", et)
         if self.chance(0.3):
-            self.sink(ctx, f"@as(u{n}, @bitCast({a} == {b}))", Int(False, n))
+            # Lanes written one at a time.
+            self.emit(ctx, f"var {b}: {vt} = {operand()};")
+            for _ in range(self.r.randint(1, 3)):
+                self.emit(ctx, f"{b}[{self.r.randrange(n)}] = {self.int_expr(ctx, et, 1)};")
+        else:
+            self.emit(ctx, f"const {b}: {vt} = {operand()};")
+        rt = any(self.is_rt(t) for t in texts)
+        cur = [a, b]
+        for step in range(self.r.randint(1, 3)):
+            # Each result feeds the next; the first step reads both operands.
+            x, y = (a, b) if step == 0 else (cur[-1], self.pick(cur))
+            if self.chance(0.5):
+                x, y = y, x
+            r = self.fresh("vr")
+            k = self.r.random()
+            if k < 0.3:
+                e = f"{x} {self.pick(['+%', '-%', '*%', '&', '|', '^', '+|', '-|', '*|'])} {y}"
+            elif k < 0.38:
+                e = f"@{self.pick(['min', 'max'])}({x}, {y})"
+            elif k < 0.5:
+                e = f"@select({en}, {x} {self.pick(['<', '<=', '==', '!=', '>', '>='])} {y}, {x}, {y})"
+            elif k < 0.6:
+                mask = [self.r.randrange(n) if self.chance(0.5) else -1 - self.r.randrange(n) for _ in range(n)]
+                e = f"@shuffle({en}, {x}, {y}, @Vector({n}, i32){{ {', '.join(map(str, mask))} }})"
+            elif k < 0.68 and et.bits > 1:
+                amts = [str(self.r.randrange(et.bits)) for _ in range(n)]
+                e = f"({x} {self.pick(['<<', '>>'])} @Vector({n}, std.math.Log2Int({en})){{ {', '.join(amts)} }}) ^ {y}"
+            elif k < 0.73:
+                e = f"~{x} ^ {y}"
+            elif k < 0.78:
+                e = f"-%{x} +% {y}"
+            elif k < 0.83 and not et.signed:
+                e = f"@divTrunc({x}, {y} | @as({vt}, @splat(1))) +% @rem({x}, {y} | @as({vt}, @splat(1)))"
+            elif k < 0.88:
+                e = self.pick([f"std.simd.reverseOrder({x})", f"std.simd.rotateElementsLeft({x}, {self.r.randrange(n)})",
+                               f"std.simd.shiftElementsRight({x}, {self.r.randrange(n)}, {self.int_expr(ctx, et, 1)})"]) + f" ^ {y}"
+            elif k < 0.94 and rt:
+                # Checked lanes: the check fires for the lane that overflows.
+                ctx["fn"].risky = True
+                e = f"{x} {self.pick(['+', '-', '*'])} {y}"
+            else:
+                # Through a wider lane type and back.
+                w = Int(et.signed, min(64, et.bits * 2 + 1))
+                e = f"@as({vt}, @truncate(@as(@Vector({n}, {w.name()}), {x}) +% @as(@Vector({n}, {w.name()}), {y})))"
+            self.emit(ctx, f"const {r}: {vt} = {e};")
+            cur.append(r)
+        r = cur[-1]
+        red = self.pick([".Xor", ".And", ".Or", ".Min", ".Max", ".Add", ".Mul"])
+        self.sink(ctx, f"@reduce({red}, {r})", et)
+        if self.chance(0.5):
+            self.sink(ctx, f"{r}[{self.r.randrange(n)}]", et)
+        if self.chance(0.3):
+            arr = self.fresh("vx")
+            self.emit(ctx, f"const {arr}: [{n}]{en} = {r};")
+            self.sink(ctx, f"{arr}[{self.index(ctx, n, allow_oob=False)}]", et)
+        if self.chance(0.5):
+            m = self.fresh("vm")
+            self.emit(ctx, f"const {m} = {self.pick(cur)} {self.pick(['<', '<=', '==', '!=', '>', '>='])} {self.pick(cur)};")
+            k = self.r.random()
+            if k < 0.25:
+                self.sink(ctx, f"@as(u{n}, @bitCast({m}))", Int(False, n))
+            elif k < 0.45:
+                self.sink(ctx, f"@as(u8, @intFromBool(@reduce({self.pick(['.Or', '.And'])}, {m})))", Int(False, 8))
+            elif k < 0.75:
+                f_ = self.pick(["firstTrue", "lastTrue"])
+                self.sink(ctx, f"(if (std.simd.{f_}({m})) |ix| @as(u64, ix) + 1 else 0)", U64)
+            else:
+                self.sink(ctx, f"@as(u64, std.simd.countTrues({m}))", U64)
+        if self.chance(0.25):
+            f_ = self.pick(["popCount", "clz", "ctz"])
+            self.sink(ctx, f"@reduce(.Add, @as(@Vector({n}, u16), @{f_}({r})))", Int(False, 16))
+        if self.chance(0.15) and et.signed:
+            self.sink(ctx, f"@reduce(.Max, @abs({r}))", Int(False, et.bits))
 
     def rt_int(self, ctx, t):
         """A runtime-known integer expression of type `t` (from a path),
