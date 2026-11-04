@@ -36,6 +36,9 @@ built as one `zig test` unit with the default runner and --zig-lib-dir
 upstream/lib (the source tree, which has std's testdata), as
 `zig build test-std` builds its Debug entry for the target. Results are
 parsed as with --default-runner and compared with baseline/std-<target>.json.
+--std --libc links glibc (-lc, -target <arch>-linux-gnu, upstream's
+test-matrix entry for std with libc) and compares with
+baseline/std-<target>-gnu-libc.json.
 
 With --compile-errors, the measure is diagnostics instead: every case in
 upstream's test/cases/compile_errors that applies to the target, compiled
@@ -828,7 +831,12 @@ def zap_target(zap, cfg, args, workdir):
 
 
 def std_target(compiler, cfg, args, workdir):
-    """--std: upstream's std tests as one unit, built by `compiler`."""
+    """--std: upstream's std tests as one unit, built by `compiler`.
+
+    With --libc, linked against glibc: `-lc` and the target's gnu ABI,
+    upstream's test-matrix entry for std with libc (`x86_64-linux-gnu`)."""
+    if args.libc:
+        cfg = dict(cfg, name=cfg["name"] + "-gnu-libc", zig_target=cfg["zig_target"].rsplit("-", 1)[0] + "-gnu")
     baseline_path = BASELINE_DIR / f"std-{cfg['name']}.json"
     baseline = None
     if not args.upstream:
@@ -842,7 +850,7 @@ def std_target(compiler, cfg, args, workdir):
     argv = [
         str(compiler), "test", str(UPSTREAM_LIB / "std" / "std.zig"), "--zig-lib-dir", str(UPSTREAM_LIB),
         "-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}",
-    ]
+    ] + (["-lc"] if args.libc else [])
     if args.upstream:
         # A fresh cache, so that the baseline's compile time is a cold build.
         cache = workdir / "std-zig-cache"
@@ -1090,6 +1098,7 @@ def main():
     p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, zap_runner.zig for zap until zap compiles test_runner.zig)")
     p.add_argument("--default-runner", action="store_true", help="zap only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `zap test` without --test-runner does")
     p.add_argument("--std", action="store_true", help="measure upstream's std tests (lib/std/std.zig, default runner) instead of test/behavior")
+    p.add_argument("--libc", action="store_true", help="with --std: link glibc (-lc, -target <arch>-linux-gnu), baseline/std-<target>-gnu-libc.json")
     p.add_argument("--compile-errors", action="store_true", help="zap only: measure diagnostics on upstream's test/cases/compile_errors instead of test/behavior")
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")

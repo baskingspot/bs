@@ -24,6 +24,7 @@ const SymbolKey = Atom.SymbolKey;
 const Elf = @import("link/Elf.zig");
 const ElfObject = @import("link/ElfObject.zig");
 const ElfDynamic = @import("link/ElfDynamic.zig");
+const Glibc = @import("link/Glibc.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const Ssa = @import("codegen/Ssa.zig");
 
@@ -78,6 +79,9 @@ stack_size: u64 = 16 * 1024 * 1024,
 /// `-ffuzz`: CodeGen instruments the main module family's functions with
 /// coverage points (docs/architecture.md, "Fuzzing").
 fuzz: bool = false,
+/// An executable that links glibc (`-lc`): names neither the compilation
+/// nor compiler_rt exports resolve to glibc's symbols, imported.
+glibc: ?*const Glibc = null,
 /// In an object, the symbols other objects define, by name.
 imports: std.StringArrayHashMapUnmanaged(ImportFlags) = .empty,
 /// In an object, its exports, once `finish` found them.
@@ -387,6 +391,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
         w.fuzz = emit.fuzz;
         w.pic = emit.pic;
         w.shared = emit.shared;
+        w.glibc = emit.glibc;
     }
     const pool = try gpa.create(Pool);
     pool.* = .{ .io = io, .workers = workers, .fuzz = fuzz };
@@ -829,7 +834,38 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
     defer emit.gpa.free(imports);
     for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };
-    const result = if (emit.shared) shared: {
+    const result = if (emit.glibc) |g| exe: {
+        // Imports in name order, so the dynamic tables do not depend on
+        // the order code requested them.
+        std.mem.sortUnstable(ElfObject.Import, imports, {}, struct {
+            fn lt(_: void, a: ElfObject.Import, b: ElfObject.Import) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lt);
+        var arena_state: std.heap.ArenaAllocator = .init(emit.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        // libc.so.6 always, as upstream; the others when used, in
+        // upstream's link order.
+        var used: [Glibc.libs.len]bool = @splat(false);
+        used[Glibc.lib_c] = true;
+        for (imports) |imp| used[g.get(imp.name).?.lib] = true;
+        var needed: std.ArrayList([]const u8) = .empty;
+        var lib_index: [Glibc.libs.len]u32 = undefined;
+        for (Glibc.libs, used, &lib_index) |lib, u, *index| if (u) {
+            index.* = @intCast(needed.items.len);
+            try needed.append(arena, lib.soname);
+        };
+        for (imports) |*imp| {
+            const sym = g.get(imp.name).?;
+            imp.version = try g.versionName(arena, sym.version);
+            imp.library = lib_index[sym.lib];
+        }
+        const dynamic: ElfDynamic.Options = .{ .imports = imports, .interp = Glibc.interp, .needed = needed.items };
+        var exe_options = options;
+        exe_options.dynamic = &dynamic;
+        break :exe Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, exe_options);
+    } else if (emit.shared) shared: {
         const dynamic: ElfDynamic.Options = .{ .exports = emit.exports.items, .imports = imports, .soname = emit.soname };
         var shared_options = options;
         shared_options.base_address = 0;
@@ -980,6 +1016,10 @@ pub fn pcrelTarget(emit: *Emit, name: []const u8, weak: bool) !?SymbolKey {
     _ = try emit.requestCompilerRtExport(name);
     if (try emit.userExport(name) orelse try emit.rtExport(name)) |key| return key;
     if (weak) return null;
+    if (emit.glibc) |g| if (g.get(name) != null) {
+        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "PC-relative reference to imported symbol {s}, which glibc defines; reach it through an extern slot (drop '.relocation = .pcrel')", .{name});
+        return error.CodegenFail;
+    };
     try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
     return error.CodegenFail;
 }
@@ -1072,7 +1112,10 @@ pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
     if (try emit.userExport(name)) |key| return key;
     // A shared object links compiler_rt in, as upstream's do.
     if (emit.obj and !emit.shared) return try emit.useImport(name, .{});
+    // compiler_rt before libc, as upstream: its `fmod` and `memcpy` stay
+    // in the executable, and only names it lacks are imported.
     if (try emit.rtExport(name)) |key| return key;
+    if (emit.glibc) |g| if (g.get(name) != null) return try emit.useImport(name, .{});
     if (emit.shared) return try emit.useImport(name, .{});
     return null;
 }

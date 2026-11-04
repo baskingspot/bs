@@ -12,6 +12,7 @@ const Incremental = @import("Incremental.zig");
 const Builtin = @import("Builtin.zig");
 const Archive = @import("link/Archive.zig");
 const Docs = @import("Docs.zig");
+const Glibc = @import("link/Glibc.zig");
 
 pub const zig_version = "0.17.0";
 
@@ -89,6 +90,13 @@ pub const Options = struct {
     pie: bool = false,
     /// `-dynamic` on `build-lib`: a shared object, position-independent.
     dynamic: bool = false,
+    /// `-lc` (or another of glibc's libraries, `-lm`, `-lpthread`, ...):
+    /// link glibc dynamically, with `glibc_version` resolved from the
+    /// target (see "C interop" in docs/architecture.md).
+    link_libc: bool = false,
+    glibc_version: ?std.SemanticVersion = null,
+    /// `-dynamic` on an executable, which only `-lc` makes one.
+    exe_dynamic: bool = false,
     /// `-fsoname=<name>` and `-fno-soname`; by default the shared object's
     /// file name, as upstream's.
     soname: union(enum) { default, name: []const u8, none } = .default,
@@ -284,6 +292,7 @@ pub const Job = struct {
             .pic = opts.pic,
             .pie = opts.pie,
             .dynamic = opts.dynamic,
+            .glibc = if (opts.link_libc) opts.glibc_version else null,
         });
         // An executable that fuzzes links the fuzzer, whose module family
         // has a builtin of its own, as upstream's separate compilation of
@@ -332,8 +341,10 @@ pub const Job = struct {
     pub fn openCache(job: *const Job, out_path: ?[]const u8) ?Incremental {
         const env = job.environ_map;
         // The numbered link has no position-independent layout yet (`Elf`);
-        // -fPIE and -dynamic imply -fPIC.
-        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and
+        // -fPIE and -dynamic imply -fPIC. Nor do executables that link libc
+        // use the cache yet: the manifest does not keep their dynamic
+        // imports.
+        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and !job.opts.link_libc and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -491,6 +502,12 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     };
     emit.stack_size = opts.stack_size;
     emit.fuzz = opts.fuzz;
+    // Only executables link glibc: an object or a static library with
+    // -lc is an ordinary one, as upstream's.
+    const links_glibc = opts.link_libc and opts.command != .build_obj and opts.command != .build_lib;
+    var glibc: ?Glibc = if (links_glibc) try loadGlibc(init, job) else null;
+    defer if (glibc) |*g| g.deinit();
+    if (glibc) |*g| emit.glibc = g;
     // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
     // n more times (`zig build bench-codegen`).
     const bench_runs: u32 = if (env.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
@@ -683,8 +700,8 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
             .build_lib => .Lib,
             else => .Exe,
         },
-        .link_mode = .static,
-        .link_libc = false,
+        .link_mode = if (opts.dynamic or (opts.link_libc and opts.command != .build_obj and opts.command != .build_lib)) .dynamic else .static,
+        .link_libc = opts.link_libc,
         .link_libcpp = false,
         .link_libunwind = false,
         .pie = false,
@@ -1080,7 +1097,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             if (command == .build_lib) {
                 opts.dynamic = true;
                 opts.pic = true;
-            } else setUnsupported(&opts, arena, "zap links executables statically ('-dynamic'); build this step with upstream zig", .{});
+            } else opts.exe_dynamic = true;
         } else if (std.mem.startsWith(u8, arg, "-fsoname=")) {
             opts.soname = .{ .name = arg["-fsoname=".len..] };
         } else if (std.mem.eql(u8, arg, "-fsoname")) {
@@ -1178,7 +1195,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             if (!std.mem.eql(u8, arg, "-ofmt=elf")) setUnsupported(&opts, arena, "zap emits ELF on Linux only ('{s}')", .{arg});
         } else if (std.mem.startsWith(u8, arg, "-O")) {
             setUnsupported(&opts, arena, "zap builds only Debug ('{s}'); drop the release mode (-Doptimize, --release) or build this step with upstream zig", .{arg});
-        } else if (std.mem.eql(u8, arg, "-lc") or std.mem.eql(u8, arg, "-lc++") or std.mem.startsWith(u8, arg, "-l") or
+        } else if (std.mem.startsWith(u8, arg, "-l") and glibc_libs.has(arg[2..])) {
+            opts.link_libc = true;
+        } else if (std.mem.eql(u8, arg, "-lc++") or std.mem.startsWith(u8, arg, "-l") or
             std.mem.startsWith(u8, arg, "-needed-l") or std.mem.startsWith(u8, arg, "-weak-l"))
         {
             setUnsupported(&opts, arena, "zap does not link libc or system libraries ('{s}'); build this step with upstream zig", .{arg});
@@ -1212,6 +1231,15 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     }
     if (opts.target) |target| checkTarget(&opts, arena, target) else if (!(builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux))
         setUnsupported(&opts, arena, "zap does not implement aarch64-macos code generation yet ('native'); pass -target x86_64-linux", .{});
+    if (opts.exe_dynamic and !opts.link_libc and command != .build_lib)
+        setUnsupported(&opts, arena, "zap links executables statically unless they link libc ('-dynamic'); add -lc or build this step with upstream zig", .{});
+    // As upstream (`requiresPIC`): glibc makes objects and libraries
+    // position-independent, as their builtin says. zap links executables
+    // itself, non-PIE.
+    if (opts.link_libc and (command == .build_obj or command == .build_lib)) opts.pic = true;
+    if (opts.link_libc and opts.dynamic and command == .build_lib)
+        setUnsupported(&opts, arena, "zap does not link shared libraries against glibc yet ('-dynamic' with '-lc'); build this step with upstream zig", .{});
+    if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena, io);
     opts.root_src_path = root orelse if (opts.unsupported != null) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
     opts.modules = modules.items;
@@ -1262,11 +1290,74 @@ fn checkTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8) voi
     const native_ok = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
     if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none") or
         (std.mem.eql(u8, target, "native") and native_ok))
-    {} else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none") or
+    {} else if (std.mem.startsWith(u8, target, "x86_64-linux-gnu")) {
+        // `x86_64-linux-gnu[.version]`: glibc, of that version or upstream's
+        // default for the target.
+        const rest = target["x86_64-linux-gnu".len..];
+        if (rest.len == 0) {
+            opts.glibc_version = default_glibc;
+        } else if (rest[0] == '.') {
+            opts.glibc_version = std.SemanticVersion.parse(rest[1..]) catch parse: {
+                const v = std.SemanticVersion.parse(std.fmt.allocPrint(arena, "{s}.0", .{rest[1..]}) catch fatal("out of memory", .{})) catch {
+                    setUnsupported(opts, arena, "invalid glibc version in target '{s}'", .{target});
+                    return;
+                };
+                break :parse v;
+            };
+        } else setUnsupported(opts, arena, "zap does not support the target '{s}'; it supports x86_64-linux and aarch64-macos", .{target});
+        if (opts.glibc_version != null and !opts.link_libc)
+            setUnsupported(opts, arena, "zap supports '{s}' only with -lc; drop the ABI or add -lc", .{target});
+    } else if (std.mem.eql(u8, target, "aarch64-macos") or std.mem.eql(u8, target, "aarch64-macos-none") or
         std.mem.eql(u8, target, "native"))
     {
         setUnsupported(opts, arena, "zap does not implement aarch64-macos code generation yet ('{s}'); pass -target x86_64-linux", .{target});
     } else setUnsupported(opts, arena, "zap does not support the target '{s}'; it supports x86_64-linux and aarch64-macos", .{target});
+}
+
+/// glibc's symbols at the build's version, from the zig lib directory.
+fn loadGlibc(init: std.process.Init, job: *const Job) !Glibc {
+    const path = try std.fs.path.join(init.gpa, &.{ job.zig_lib_dir, Glibc.abilists_path });
+    defer init.gpa.free(path);
+    const contents = Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(1 << 20)) catch |err|
+        fatal("unable to read glibc's symbols from '{s}': {t}", .{ path, err });
+    defer init.gpa.free(contents);
+    const want = job.opts.glibc_version.?;
+    const g = Glibc.load(init.gpa, contents, want) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.UnsupportedVersion => fatal("zap cannot link glibc {f}: '{s}' does not list it", .{ want, path }),
+        error.InvalidAbilists => fatal("unable to read glibc's symbols from '{s}': the file is damaged", .{path}),
+    };
+    // As upstream's warning.
+    if (g.newest().order(want) == .lt) std.log.warn("zap cannot link new glibc version {f}; providing instead {f}", .{ want, g.newest() });
+    return g;
+}
+
+/// glibc's libraries, which `-l` links as part of libc (upstream's
+/// `std.zig.target.isLibCLibName` for glibc).
+const glibc_libs: std.StaticStringMap(void) = .initComptime(.{ .{"c"}, .{"m"}, .{"rt"}, .{"pthread"}, .{"util"}, .{"resolv"}, .{"dl"} });
+
+/// Upstream's glibc version for `x86_64-linux-gnu` without one.
+const default_glibc: std.SemanticVersion = .{ .major = 2, .minor = 31, .patch = 0 };
+
+/// Settles the glibc a `-lc` build links: the target's version, or for the
+/// native target the system's, which upstream detects the same way. Other
+/// libcs are not supported.
+fn resolveGlibc(opts: *Options, arena: std.mem.Allocator, io: Io) void {
+    if (opts.glibc_version != null) return;
+    const target = opts.target orelse "native";
+    if (!std.mem.eql(u8, target, "native")) {
+        setUnsupported(opts, arena, "zap links only glibc ('-lc' with target '{s}', whose libc is musl or none); pass -target x86_64-linux-gnu or no target", .{target});
+        return;
+    }
+    const native = std.zig.system.resolveTargetQuery(io, .{}) catch |err| {
+        setUnsupported(opts, arena, "unable to detect the native libc for -lc: {t}", .{err});
+        return;
+    };
+    if (native.os.tag != .linux or !native.abi.isGnu()) {
+        setUnsupported(opts, arena, "zap links only glibc ('-lc'), and this system's libc is not glibc ({t}); pass -target x86_64-linux-gnu", .{native.abi});
+        return;
+    }
+    opts.glibc_version = native.os.version_range.linux.glibc;
 }
 
 fn nextTestArg(command: Command, args: []const []const u8, i: *usize, flag: []const u8) []const u8 {
@@ -1296,6 +1387,7 @@ test {
     _ = @import("link/Atom.zig");
     _ = @import("link/Elf.zig");
     _ = @import("link/ElfObject.zig");
+    _ = @import("link/Glibc.zig");
     _ = @import("codegen/x86_64/Encoder.zig");
     _ = @import("link/MachO.zig");
     _ = @import("codegen/aarch64/Encoder.zig");

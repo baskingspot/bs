@@ -4676,8 +4676,8 @@ state. Built for step 1:
   `builtin.unwind_tables` as upstream does (ghostty asks for `.sync`);
   zap emits asynchronous tables for each, which serve every request.
   Release modes (`-O` other than Debug), C, C++ and assembly sources,
-  libc and system libraries, translate-c and `@cImport` stay
-  `[unsupported]`. zap never hands a step to upstream zig.
+  system libraries and translate-c stay `[unsupported]`; `-lc` links
+  glibc (see "C interop"). zap never hands a step to upstream zig.
 - **`zap build`** (`src/BuildRunner.zig`) does what upstream's `zig build`
   does, with zap as the compiler. It compiles upstream's build runner,
   `<zig lib>/compiler/Maker.zig`, with zap (Debug) into
@@ -5077,7 +5077,8 @@ is always linked); `-target x86_64-linux[-musl] -lc` and
 `-target x86_64-linux-gnu`.
 
 **The link** (`Elf.Options.dynamic` with an executable kind, on the `pic`
-branch's `ElfDynamic`): ET_EXEC at 16 MiB as upstream; PT_PHDR, PT_INTERP,
+branch's `ElfDynamic`): ET_EXEC at zap's usual base (upstream's 16 MiB
+changes nothing a program means); PT_PHDR, PT_INTERP,
 the three PT_LOADs, PT_DYNAMIC, PT_TLS, PT_GNU_RELRO, PT_GNU_EH_FRAME,
 PT_GNU_STACK. Zig code reaches every extern through an 8-byte slot
 (`Emit.lowerExternSlots`), so an import needs only a `R_X86_64_GLOB_DAT`
@@ -5086,9 +5087,10 @@ with an absolute relocation to an import, go to `.data.rel.ro` under
 RELRO, the `pic` branch's rule. `.dynsym` holds the imports (versioned
 through `.gnu.version`, `.gnu.version_r` per library) and no exports
 (upstream exports none without `-rdynamic`); `.dynamic` gets DT_NEEDED,
-DT_VERSYM, DT_VERNEED(NUM), DT_FLAGS BIND_NOW, DT_FLAGS_1 NOW, and the
-tables `ElfDynamic` writes for shared objects, as upstream's executable
-has (no DT_INIT/DT_FINI without crti/crtn).
+DT_VERSYM, DT_VERNEED(NUM), DT_DEBUG (for debuggers; upstream's
+self-hosted linker leaves it out), DT_FLAGS BIND_NOW, DT_FLAGS_1 NOW, and
+the tables `ElfDynamic` writes for shared objects (no DT_INIT/DT_FINI
+without crti/crtn).
 The executable's own thread-locals stay local-exec, in the static TLS
 block the loader sets up; std's start code no longer sets up TLS itself
 (it does not run `_start`). The relocation loop keeps its comptime flag,
@@ -5206,6 +5208,76 @@ libraries as inputs. To be agreed with that thread.
 - abilists is 247 KiB; parsing it for one target is a one-time cost per
   build that links glibc, cached per (zig lib, version) in the global
   cache as the resolved name table if it shows in profiles.
+
+### Step 1 as built (2026-11-04)
+
+- **Options** (`main.parseOptions`): `-lc`, `-lm`, `-lpthread`, `-ldl`,
+  `-lrt`, `-lutil` and `-lresolv` (upstream's `isLibCLibName` for glibc)
+  set `link_libc`; `-target x86_64-linux-gnu[.version]` names the glibc
+  version (2.31 by default, as upstream), the native target detects the
+  system's (`std.zig.system.resolveTargetQuery`, only for `-lc`); other
+  targets with `-lc` are `[unsupported]`. `-dynamic` on an executable is
+  accepted with `-lc`. Objects and static libraries with `-lc` are
+  ordinary ones, as upstream's (static `link_mode`, no start code, externs
+  left to the final link), but position-independent (upstream's
+  `requiresPIC` for glibc), as their builtin says; `build-lib -dynamic -lc` is `[unsupported]`
+  for now. A glibc newer than abilists' newest links against the newest,
+  with upstream's warning. Over `--listen=-`, the config message reports
+  `link_libc` and a dynamic link mode.
+- **`builtin`** (`Builtin.generate` with `glibc`): upstream's text for
+  `x86_64-linux-gnu.<version> -lc` (checked line by line against
+  `--show-builtin`), plus one line, `comptime { _ = @import
+  ("glibc_start.zig"); }`, which is not a declaration, so
+  `@typeInfo(builtin)` stays upstream's. The start file sits next to
+  builtin.zig in its content-addressed directory, whose hash covers both.
+  Builds without `-lc` get the same builtin.zig bytes as before.
+- **Start code** (`Builtin.glibc_start`): a naked `_start` (CFI
+  undefined rip) passes the stack pointer and rdx to `startMain`, which
+  calls `__libc_start_main(main, argc, argv, null, null, rtld_fini,
+  sp)`; it also exports `_IO_stdin_used`. Init and fini are null for
+  every glibc version: no Zig code needs init arrays, and C objects
+  (step 3) bring the question back for targets before 2.34.
+- **Imports** (`src/link/Glibc.zig`, `Emit.exportTarget`): the abilists
+  parser keeps, per name, the first library in upstream's link order
+  (m, c, ld, resolv, then the libraries merged into libc in 2.34, only
+  for older targets) with a version at or below the target's, and its
+  newest such version. A name neither the compilation nor compiler_rt
+  exports resolves to it, as upstream's order (its `fmod` stays in the
+  executable). `Emit.link` sorts the imports by name, lists
+  libc.so.6 and the libraries used in DT_NEEDED, and gives each import
+  its version. A hello world's 96 imports bind to the same versions as
+  upstream's native `-lc` build on the orb (upstream imports three more:
+  `__tls_get_addr`, `getrandom`, `sendfile`, which zap's lazy analysis
+  does not reach).
+- **Elf** (`Options.dynamic` with `interp`): imports take stand-in
+  addresses outside the image (`exe_import_base`), so an absolute
+  relocation to one becomes `R_X86_64_64` against its symbol and a
+  PC-relative one overflows. Layout counts and the copy pass write
+  .rela.dyn records only for absolute relocations to imports (a sorted
+  key list, binary-searched per absolute relocation), and only .rodata
+  atoms with one go to .data.rel.ro. No PLT, no GOT; .interp,
+  .gnu.version and .gnu.version_r get section headers after the shared
+  object's, and their names extend the section name table, whose
+  shorter prefixes the other outputs keep.
+- **Not cached yet.** A `-lc` build skips the on-disk cache
+  (`Job.openCache`; `Elf.build` refuses a numbered dynamic executable,
+  whose imports it keys by SymbolKey), and the
+  manifest does not keep the imports. The cache thread's `objcache`
+  branch adds `Manifest.link_symbols`; on it, step 1b adds `needed`,
+  `interp` and versioned import kinds (ZAPMAN13), numbered dynamic links,
+  and `-lc` with the glibc version in the donor key and compilation key.
+- **Checks**: `run.py --std --libc` 3350/3350 (upstream 3350 pass, 37
+  skip; compiled in 8.5 s against upstream's 17.8 s);
+  test/run/libc.zig (functions, a variadic call, libm, `environ` and
+  `stdout`, a callback, malloc, threads and thread-locals, an exit
+  status), compared with upstream's `-target x86_64-linux-gnu -lc`
+  build; a panic's stack trace through libc's frames matches upstream's,
+  with zap's start code as the outermost frame.
+- **Found on the way**: zap passes a slice to a variadic function, which
+  upstream rejects ("cannot pass '[:0]const u8' to variadic function"):
+  zap has no extern-type validation (`validateExtern`) for variadic
+  arguments or C-callconv parameters. It accepts more than upstream;
+  it is Sema's to fix.
 
 ### Steps and checks
 

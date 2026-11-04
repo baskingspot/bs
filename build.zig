@@ -185,6 +185,8 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             donor_without: ?[]const u8 = null,
             /// `donor-here`: the donor is built at the same path.
             donor_here: bool = false,
+            /// Linked against glibc: `-target x86_64-linux-gnu -lc`.
+            libc: bool = false,
         } = .{};
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
@@ -199,6 +201,8 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             } else if (std.mem.eql(u8, key, "stderr-contains")) {
                 const bytes = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 expect.stderr_contains.append(b.allocator, bytes) catch @panic("OOM");
+            } else if (std.mem.eql(u8, key, "libc")) {
+                expect.libc = std.mem.eql(u8, value, "true");
             } else if (std.mem.eql(u8, key, "donor-without") or std.mem.eql(u8, key, "donor-here-without")) {
                 expect.donor_without = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 expect.donor_here = key.len != "donor-without".len;
@@ -223,6 +227,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
         for ([_]bool{ false, true }) |upstream| {
             const compile = if (upstream) blk: {
                 const r = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-llvm", "-fno-lld" });
+                if (expect.libc) r.addArgs(&.{ "-target", "x86_64-linux-gnu", "-lc" });
                 r.addFileArg(b.path(src_path));
                 break :blk r;
             } else if (expect.rebuild_without.items.len != 0 or expect.lib_edit != null) blk: {
@@ -303,7 +308,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 break :blk r;
             } else blk: {
                 const r = b.addRunArtifact(zap);
-                r.addArgs(&.{ "build-exe", "-target", "x86_64-linux" });
+                r.addArgs(if (expect.libc) &.{ "build-exe", "-target", "x86_64-linux-gnu", "-lc" } else &.{ "build-exe", "-target", "x86_64-linux" });
                 r.addFileArg(b.path(src_path));
                 break :blk r;
             };
@@ -453,6 +458,31 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     panic.addCheck(.{ .expect_stderr_match = "main.zig:14:39: 0x" });
     panic.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
     test_step.dependOn(&panic.step);
+
+    // With -lc an object stays an ordinary one (its extern is not looked
+    // up in glibc) but position-independent, as upstream's, which upstream
+    // links into a -lc PIE.
+    const lc_obj = b.addRunArtifact(zap);
+    lc_obj.addArgs(&.{ "build-obj", "-lc", "-target", "x86_64-linux-gnu" });
+    lc_obj.addFileArg(b.path("test/obj/lib.zig"));
+    const lc_o = lc_obj.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
+    const lc_exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-fPIE", "-target", "x86_64-linux-gnu" });
+    lc_exe.addFileArg(b.path("test/obj/main.zig"));
+    lc_exe.addFileArg(lc_o);
+    const lc_run = std.Build.Step.Run.create(b, "run obj main (-lc object in a PIE)");
+    lc_run.addFileArg(lc_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    lc_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+    lc_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&lc_run.step);
+    // Shared libraries against glibc are not built yet: a diagnostic, not
+    // an executable in a .so's name.
+    const lc_so = b.addRunArtifact(zap);
+    lc_so.setName("zap build-lib -dynamic -lc (unsupported)");
+    lc_so.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "-fno-emit-bin" });
+    lc_so.addFileArg(b.path("test/obj/lib.zig"));
+    lc_so.addCheck(.{ .expect_stderr_match = "zap does not link shared libraries against glibc yet" });
+    lc_so.addCheck(.{ .expect_term = .{ .exited = 1 } });
+    test_step.dependOn(&lc_so.step);
 
     // The same object built -fPIC, linked by upstream into a static PIE
     // (which relaxes local-dynamic TLS) and into a shared object that a
