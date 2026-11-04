@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n41\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n41\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -250,6 +250,16 @@ fn optCStrLen(s: ?[*:0]const u8) u64 {
     return cStrLen(c);
 }
 
+// ziglua (lib.zig): an inline function's return type, and a later
+// parameter's type, do arithmetic on a runtime `anytype` argument.
+const registry_index = -(@divTrunc(@as(c_int, 2147483647), @as(c_int, 2)) + @as(c_int, 1000));
+inline fn upvalueIndex(i: anytype) @TypeOf(registry_index - i) {
+    return registry_index - i;
+}
+inline fn offsetBy(i: anytype, j: @TypeOf(registry_index - i)) @TypeOf(registry_index - i) {
+    return j - i;
+}
+
 // zig-libs (strRepeat): a comptime @bitCast of a nested array costs time
 // and memory linear in its length (quadratic ran out of memory).
 const repeat_grid: [30000][4]u8 = @splat("(?:)".*);
@@ -335,6 +345,10 @@ fn main() callconv(.c) noreturn {
     _ = &one;
     const c_one: [*c]const u8 = one;
     rt.printInt(c_one[1]);
+    var up: i32 = 1;
+    _ = &up;
+    rt.printInt(@intCast(-upvalueIndex(up)));
+    rt.printInt(@intCast(offsetBy(up, 5)));
     var last: usize = repeated.len - 1;
     _ = &last;
     rt.printInt(repeated[last]);

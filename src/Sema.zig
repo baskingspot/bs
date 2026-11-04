@@ -19560,30 +19560,14 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref, h
         try sema.inst_map.put(gpa, inst, args[i]);
         i += 1;
     }
-    // The return type, evaluated at comptime, sees a runtime argument as an
-    // undefined value of its type, as a generic call's does: it may only
-    // use the type (`[refs.len]T` takes a `ref` of the argument).
-    i = 0;
-    for (fn_info.param_body) |inst| {
-        switch (sema.code.instructions.items(.tag)[@backingInt(inst)]) {
-            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {},
-            else => continue,
-        }
-        if (comptime_args[i] == .none) try sema.inst_map.put(gpa, inst, .fromInterned(try sema.undefValue(sema.typeOf(args[i]))));
-        i += 1;
-    }
+    // The return type, evaluated at comptime, sees a runtime argument as
+    // that runtime value, as upstream: `@TypeOf(c - i)` analyzes the
+    // subtraction as runtime code, and a comptime `&` of it gives a value
+    // only its type can be read from (`[refs.len]T`). An undefined value
+    // instead failed arithmetic on it.
     // With an inferred error set, the result's error set is what the
     // returns produce (see `analyzeRet`).
     const ret_ty = try sema.calleeRetTy(&ct_block, func, null);
-    i = 0;
-    for (fn_info.param_body) |inst| {
-        switch (sema.code.instructions.items(.tag)[@backingInt(inst)]) {
-            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {},
-            else => continue,
-        }
-        if (comptime_args[i] == .none) try sema.inst_map.put(gpa, inst, args[i]);
-        i += 1;
-    }
     try sema.declareDependency(.{ .func_body = func });
 
     var merges: Block.Merges = .{ .block_inst = try sema.reserveInst() };
@@ -19675,8 +19659,9 @@ fn genericParamType(sema: *Sema, caller: *Block, src: Src, func: Index, prior: [
             .param_anytype, .param_anytype_comptime => if (i == prior.len) return .generic_poison_type,
             else => continue,
         }
-        const val: Index = sema.resolveValue(prior[i]) orelse try sema.undefValue(sema.typeOf(prior[i]));
-        try sema.inst_map.put(sema.gpa, inst, .fromInterned(val));
+        // A runtime argument stays runtime, as in `inlineCall`'s return
+        // type: `j: @TypeOf(c - i)` only reads its type.
+        try sema.inst_map.put(sema.gpa, inst, if (sema.resolveValue(prior[i])) |v| .fromInterned(v) else prior[i]);
         i += 1;
     }
     unreachable;
