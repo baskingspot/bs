@@ -2328,6 +2328,51 @@ fn failUnsupported(sema: *Sema, block: *Block, src: Src, what: []const u8) Compi
 
 /// Notes call site `src` on the error a failed call reported (if it reported
 /// one since there were `n_errors`), and returns `err`.
+/// For an inline call at `src` of a std function with arguments `args`
+/// that failed with one error raised in std (there were `n_errors`
+/// before), where the one argument that is an error union or optional is
+/// what std could not handle (`std.math.round` of a `?f64`): notes that
+/// argument's origin at the user's call and gives the error the fix there
+/// (`diag.originNote`), as `Zcu.argumentOrigin` does for generic calls,
+/// whose arguments' types it reads from the instance.
+noinline fn noteInlineArgOrigin(sema: *Sema, block: *Block, src: Src, args: []const Ref, has_receiver: bool, n_errors: usize) CompileError!void {
+    const diag = @import("diag.zig");
+    const zcu = sema.zcu;
+    if (zcu.errors.items.len != n_errors + 1) return;
+    {
+        const last = zcu.errors.items[zcu.errors.items.len - 1];
+        if (last.fix != null or last.embed or last.no_loc or !sema.inLib(last.file) or sema.inLib(sema.file)) return;
+    }
+    var found: ?usize = null;
+    for (args, 0..) |a, i| switch (Type.class(sema.ip, sema.typeOf(a))) {
+        .optional, .error_union => {
+            if (found != null or (has_receiver and i == 0)) return;
+            found = i;
+        },
+        else => {},
+    };
+    const i = found orelse return;
+    const tree = try zcu.fe.tree(@fromBackingInt(sema.file));
+    const span = sema.callArgSrc(src, has_receiver, i).span(tree);
+    const origin = diag.valueOrigin(tree, span.start, span.end, .self) orelse return;
+    const kind: OriginKind = if (Type.class(sema.ip, sema.typeOf(args[i])) == .optional) .optional else .error_union;
+    const ret_ty = sema.currentRetTy(block);
+    const note = try diag.originNote(zcu.arena.allocator(), tree, origin, kind, ret_ty != .none and Type.class(sema.ip, ret_ty) == .error_union, true) orelse return;
+    if (note.msg) |msg| try zcu.appendNote(.{ .file = sema.file, .span = note.span, .msg = msg, .decl = note.decl });
+    if (note.fix) |fix| {
+        const last = &zcu.errors.items[zcu.errors.items.len - 1];
+        last.fix = fix;
+        last.fix.?.file = sema.file;
+    }
+}
+
+/// Whether file `file` is under the zig lib directory (std, compiler_rt).
+fn inLib(sema: *Sema, file: u32) bool {
+    const fe = sema.zcu.fe;
+    const root = fe.module(fe.files.items[file].module).root_dir;
+    return std.mem.startsWith(u8, root, fe.zig_lib_dir);
+}
+
 fn noteCallSite(sema: *Sema, block: *Block, src: Src, n_errors: usize, err: CompileError, kind: @import("diag.zig").CallKind) CompileError {
     _ = block;
     if (err == error.AnalysisFail and sema.zcu.errors.items.len > n_errors) {
@@ -19018,7 +19063,10 @@ fn analyzeCall(
             }
         }
         const n = sema.zcu.errors.items.len;
-        return sema.inlineCall(block, src, func, args, first_arg != .none) catch |err| return sema.noteCallSite(block, src, n, err, .@"inline");
+        return sema.inlineCall(block, src, func, args, first_arg != .none) catch |err| {
+            if (err == error.AnalysisFail) try sema.noteInlineArgOrigin(block, src, args, first_arg != .none, n);
+            return sema.noteCallSite(block, src, n, err, .@"inline");
+        };
     }
 
     if (sema.func_is_naked) return sema.failNakedCall(block, src, call_args_in);
