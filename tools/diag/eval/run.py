@@ -9,7 +9,8 @@ compile), rewrites each one into mistakes by the rules in rules.py, and
 compiles every mistake with zap and with upstream zig. A seed named
 `build_*.zig` is a build.zig instead, configured with `build -l` next to
 a hello-world src/main.zig, so build scripts written against an older
-std.Build are scored through the `zap build` path.
+std.Build are scored through the `zap build` path. A seed named
+`test_*.zig` is compiled with `test`, so its test blocks count.
 
 A case whose rewrite upstream still accepts is not a mistake and is
 dropped. For each remaining case it checks, for zap and for upstream:
@@ -68,7 +69,15 @@ BUILD_MAIN = 'const std = @import("std");\npub fn main() void {\n    std.debug.p
 
 
 def seed_file(seed):
-    return "build.zig" if seed.startswith("build_") else "main.zig"
+    if seed.startswith("build_"):
+        return "build.zig"
+    return "tests.zig" if seed.startswith("test_") else "main.zig"
+
+
+def compile_cmd(fname):
+    """The subcommand that compiles a seed file: its tests for `test_*`
+    seeds (tests.zig), else as an executable."""
+    return "test" if fname == "tests.zig" else "build-exe"
 
 
 def write_case(d, seed, src):
@@ -92,7 +101,7 @@ class Compilers:
             # `zap build` renders upstream's text, with zap's facts as notes.
             _, out = self.zap_text(d, fname)
             return parse_bundle_text(out, d)
-        _, out = run([self.zap, "build-exe", "-fno-emit-bin", "--error-format=json", fname], d, self.env)
+        _, out = run([self.zap, compile_cmd(fname), "-fno-emit-bin", "--error-format=json", fname], d, self.env)
         diags = []
         for line in out.splitlines():
             if line.startswith("{"):
@@ -104,12 +113,12 @@ class Compilers:
     def zap_text(self, d, fname):
         if fname == "build.zig":
             return run([self.zap, "build", "-l"], d, self.env)
-        return run([self.zap, "build-exe", "-fno-emit-bin", fname], d, self.env)
+        return run([self.zap, compile_cmd(fname), "-fno-emit-bin", fname], d, self.env)
 
     def upstream(self, d, fname):
         if fname == "build.zig":
             return run([self.zig, "build", "-l", "--cache-dir", os.path.join(d, ".zig-cache")], d)
-        return run([self.zig, "build-exe", "-fno-emit-bin", "--cache-dir", self.cache, fname], d)
+        return run([self.zig, compile_cmd(fname), "-fno-emit-bin", "--cache-dir", self.cache, fname], d)
 
 
 def zig_unescape(text):

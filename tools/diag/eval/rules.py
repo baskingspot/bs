@@ -336,7 +336,7 @@ GENERIC = [
     Generic("typo-field", "typo", lambda m: [[m.group(2)]],
             lambda src: re.finditer(r"\b(p|c|kv|entry|s|self|stat|parsed|r)\.(\w{3,})\b", src), _typo_at(2), lambda m: m.group(2)),
     Generic("missing-try", "error-union", lambda m: [["'try'", "`try`"]],
-            lambda src: re.finditer(r"(?<=[=(] )try |^(\s+)try ", src),
+            lambda src: re.finditer(r"(?<=[=(] )try |^(\s+)try ", src, re.M),
             lambda src, m, k: _replace(src, m.start(), m.end(), m.group(1) or "")),
     Generic("missing-unwrap", "optional", lambda m: [[".?", "orelse"]],
             lambda src: re.finditer(r"(\))\.\?", src),
