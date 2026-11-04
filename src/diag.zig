@@ -1411,6 +1411,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "union initialization expects exactly one field", .@"bad-init" },
     .{ "cannot initialize multiple union fields at once; unions can only have one active field", .@"bad-init" },
     .{ "cannot store runtime value in compile time variable", .@"comptime-required" },
+    .{ "cannot store comptime-only type '{f}' at runtime", .@"comptime-only" },
     .{ "value stored in comptime field does not match the default value of the field", .@"bad-init" },
     .{ "'@memcpy' arguments alias", .@"bad-operands" },
     .{ "@atomicLoad atomic ordering must not be release or acq_rel", .@"bad-operands" },

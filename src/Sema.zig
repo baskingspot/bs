@@ -11513,11 +11513,18 @@ fn analyzeStore(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted: Ref) C
         }
     };
     try sema.trackConstStore(block, ptr, operand);
+    try sema.resolveLayout(block, src, info.child);
+    // (The comptime evaluator's lowered code stores comptime variables of
+    // the walker's at run time.)
+    if (Type.isComptimeOnly(ip, info.child) and sema.bc == null) {
+        const err = sema.fail(block, src, "cannot store comptime-only type '{f}' at runtime", .{sema.fmtType(info.child)});
+        try sema.zcu.addNote(sema.file, ptr_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "operation is runtime due to this pointer", .{});
+        return err;
+    }
     // A runtime store fails even in a comptime block that drops runtime
     // instructions, as upstream.
     if (block.is_comptime) return sema.failComptimeExpr(block, src);
     try sema.validateRuntimeValue(block, operand_src, operand);
-    try sema.resolveLayout(block, src, info.child);
     if (!Type.hasRuntimeBits(ip, info.child)) return;
     // The comptime evaluator stores through bit pointers as the walker does.
     if (info.packed_offset.host_size != 0 and sema.bc == null) {
