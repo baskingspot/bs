@@ -3640,6 +3640,39 @@ noinline fn failIntRange(sema: *Sema, block: *Block, src: Src, ty: Index, val: I
     return err;
 }
 
+/// "cannot represent integer value" for a comptime-known shift amount
+/// `val` that does not fit `ty`, the shifted operand's log2 integer type
+/// (`log2_inst`, a `typeof_log2_int_type`, makes it), with what the amount
+/// means and the fixes that keep its meaning: a wider operand for a left
+/// shift, or `std.math.shl`/`shr`, which allow overshifting.
+noinline fn failShiftAmount(sema: *Sema, block: *Block, src: Src, ty: Index, val: Index, log2_inst: Zir.Inst.Index) CompileError {
+    const ip = sema.ip;
+    const err = sema.fail(block, src, "type '{f}' cannot represent integer value '{f}'", .{ sema.fmtType(ty), sema.fmtValue(val) });
+    const operand_ty = Type.scalarType(ip, sema.typeOf(sema.resolveInst(sema.code.instructions.items(.data)[@backingInt(log2_inst)].un_node.operand)));
+    if (!Type.isInt(ip, operand_ty)) return err;
+    const info = Type.intInfo(ip, operand_ty);
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    const span = src.span(tree);
+    const shift = @import("diag.zig").shiftOf(tree, span.start, span.end);
+    const lhs = if (shift) |sh| sh.lhs else "x";
+    const amount = ip.intValue(u64, val);
+    try sema.zcu.addNote(sema.file, span, "shifting '{f}' by {d} or more is not allowed; '{f}' holds 0 to {d}", .{ sema.fmtType(operand_ty), info.bits, sema.fmtType(ty), info.bits -| 1 });
+    if (amount) |a| {
+        const left = if (shift) |sh| sh.left else true;
+        if (left and a < 65535) {
+            // The smallest power-of-two width at least 8 whose shifts reach it.
+            var wide: u32 = 8;
+            while (wide <= a) wide *= 2;
+            try sema.zcu.addNote(sema.file, span, "to keep the shifted-out bits, widen the operand: `@as({c}{d}, {s}) << {d}`; for a result of 0, use `std.math.shl({f}, {s}, {d})`, which allows shifting by {d} or more", .{
+                @as(u8, if (info.signedness == .signed) 'i' else 'u'), wide, lhs, a, sema.fmtType(operand_ty), lhs, a, info.bits,
+            });
+        } else if (!left) {
+            try sema.zcu.addNote(sema.file, span, "use `std.math.shr({f}, {s}, {d})`, which allows shifting by {d} or more", .{ sema.fmtType(operand_ty), lhs, a, info.bits });
+        }
+    }
+    return err;
+}
+
 fn intFits(sema: *Sema, val: Index, ty: Index) bool {
     if (ty == .comptime_int_type) return true;
     const info = Type.intInfo(sema.ip, ty);
@@ -4767,6 +4800,11 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             // the shift reports it, as upstream.
             if (tag == .as_shift_operand and dest == .comptime_int_type and sema.resolveValue(operand) == null and Type.isInt(sema.ip, sema.typeOf(operand)))
                 break :blk operand;
+            // A shift amount (`x << 8`, `x >>= 8`) that does not fit the
+            // shifted operand's log2 type.
+            if (extra.dest_type.toIndex()) |dest_inst| if (sema.code.instructions.items(.tag)[@backingInt(dest_inst)] == .typeof_log2_int_type and Type.isInt(sema.ip, dest))
+                if (sema.resolveValue(operand)) |v| if ((Type.isInt(sema.ip, sema.typeOf(operand)) or sema.typeOf(operand) == .comptime_int_type) and !sema.isUndef(v) and !sema.intFits(v, dest))
+                    return sema.failShiftAmount(block, src, dest, v, dest_inst);
             break :blk sema.coerce(block, dest, operand, src);
         },
 

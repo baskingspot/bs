@@ -1358,6 +1358,24 @@ pub fn fnReturnsError(tree: *const Ast, tok: Ast.TokenIndex) bool {
     return false;
 }
 
+/// The shift whose amount is the expression at `start..end`: its shifted
+/// operand's source and its direction.
+pub fn shiftOf(tree: *const Ast, start: u32, end: u32) ?struct { lhs: []const u8, left: bool } {
+    const rhs = expressionAt(tree, start, end) orelse return null;
+    for (0..tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const left = switch (tree.nodeTag(node)) {
+            .shl, .assign_shl => true,
+            .shr, .assign_shr => false,
+            else => continue,
+        };
+        const l, const r = tree.nodeData(node).node_and_node;
+        if (r != rhs) continue;
+        return .{ .lhs = tree.getNodeSource(l), .left = left };
+    }
+    return null;
+}
+
 /// Adds prongs `prongs` (`.b => @panic("TODO"),`) to the switch whose
 /// `switch` keyword starts at byte `offset`: each on its own line before
 /// the closing brace, or on the brace's line when the switch is on one.
