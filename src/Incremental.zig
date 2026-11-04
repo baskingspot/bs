@@ -296,23 +296,33 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     var objects_changed: usize = 0;
     for (changed.items) |i| {
         const in, const path = m.input(i);
-        var hash = in.content_hash;
-        if (!try inc.sameContents(m, i)) {
+        const hash = try inc.contentHash(path);
+        if (hash != in.content_hash) {
             if (!objects_may_change or inc.output != .exe or !inc.isLinkObject(m.inputKey(i))) {
                 if (inc.timing) std.debug.print("cache: {d} inputs changed, first {s}\n", .{ changed.items.len, path });
                 return false;
             }
-            hash = try inc.contentHash(path) orelse return inc.noRelink("{s}: unreadable", .{path});
+            if (hash == null) return inc.noRelink("{s}: unreadable", .{path});
             objects_changed += 1;
         }
         const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |err| return inc.noRelink("{s}: {t}", .{ path, err });
         if (restat == null) restat = .init(gpa, m);
-        try restat.?.setInput(i, path, m.inputKey(i), stat, hash, inc.build_start);
+        try restat.?.setInput(i, path, m.inputKey(i), stat, hash.?, inc.build_start);
+    }
+    // Only lazy edit builds fold the log: a session of C edits alone
+    // builds eagerly, writing a new base, once the log is twice the fold
+    // size, rather than parse a log that keeps growing.
+    if (objects_changed != 0 and m.overlay.len > m.map.memory.len / 2) {
+        restat.?.deinit();
+        restat = null;
+        return inc.noRelink("the manifest's log is past twice its fold size", .{});
     }
     const t1 = now(io);
     // Past the fold size, the inputs are rehashed until the next full build
-    // writes a new base, so that the log stays bounded.
-    defer if (restat) |*d| if (!m.shouldFold()) d.append(io, inc.dir) catch {};
+    // writes a new base, so that the log stays bounded; but changed
+    // objects' new contents are recorded, or every later build would
+    // relink again.
+    defer if (restat) |*d| if (!m.shouldFold() or objects_changed != 0) d.append(io, inc.dir) catch {};
     if (objects_changed == 0 and inc.outputUnchanged(out_dir, sub_path)) {
         if (inc.timing) std.debug.print("cache: no input changed and the output is as the last link left it; not relinking ({d:.2} ms, {d} rehashed)\n", .{ ms(t0, now(io)), changed.items.len });
         return true;
@@ -349,8 +359,8 @@ fn linkPath(inc: *const Incremental, n: usize) []const u8 {
     return if (n < inc.link_objects.len) inc.link_objects[n] else inc.link_shared[n - inc.link_objects.len];
 }
 
-/// The content hash `sameContents` compares, of the file at `path`, or
-/// null if it cannot be read.
+/// The content hash the manifest records for an input, of the file at
+/// `path`, or null if it cannot be read.
 fn contentHash(inc: *const Incremental, path: []const u8) !?Hash {
     const src = Io.Dir.cwd().readFileAlloc(inc.io, path, inc.gpa, .unlimited) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
@@ -736,34 +746,26 @@ fn linkWithInputs(
         shared: []const ElfShared,
         copies: *std.StringArrayHashMapUnmanaged(u64),
         arena: Allocator,
-        /// With changed objects: the manifest and its linked symbols, and
-        /// whether an object needs a compiler_rt function the last build
-        /// did not generate, which a full build's `sync` would request
-        /// (even for a weak reference, which would link as 0 here).
-        m: *const Manifest,
-        live: ?*const std.DynamicBitSetUnmanaged,
-        missing_rt: *bool,
+        /// The imports the objects ask for, as a full build's link
+        /// requests them (`Emit.InputResolver.importSym`).
+        requested_imports: *std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void),
 
         pub fn zigExport(r: @This(), name: []const u8) !?Atom.SymbolKey {
             return r.exports.get(name);
         }
 
-        pub fn rtExport(r: @This(), name: []const u8) !?Atom.SymbolKey {
+        pub fn rtExport(_: @This(), name: []const u8) !?Atom.SymbolKey {
             if (Emit.arrayBound(name)) |key| return key;
             const e = Zcu.compilerRtExport(name) orelse return null;
             var buf: [128]u8 = undefined;
-            const key: Atom.SymbolKey = .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl));
-            if (r.live) |live| {
-                const n = r.m.symbol(@backingInt(key));
-                if (n == null or !live.isSet(n.?)) r.missing_rt.* = true;
-            }
-            return key;
+            return .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl));
         }
 
         pub fn importSym(r: @This(), name: []const u8, weak: bool) !?Atom.SymbolKey {
             _ = weak;
             const g = r.glibc orelse return null;
             if (Glibc.sharedSymbol(r.shared, name) == null and g.get(name) == null) return null;
+            try r.requested_imports.put(r.arena, Emit.importKey(name), {});
             return Emit.importKey(name);
         }
 
@@ -784,16 +786,14 @@ fn linkWithInputs(
     var copies: std.StringArrayHashMapUnmanaged(u64) = .empty;
     var live = try std.DynamicBitSetUnmanaged.initEmpty(arena, m.symbolLen());
     for (numbered) |na| live.set(na.symbol);
-    var missing_rt = false;
+    var requested_imports: std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
     const resolver: Resolver = .{
         .exports = &export_keys,
         .glibc = glibc,
         .shared = shared,
         .copies = &copies,
         .arena = arena,
-        .m = m,
-        .live = if (inc.objects_changed) &live else null,
-        .missing_rt = &missing_rt,
+        .requested_imports = &requested_imports,
     };
     // The archive members the Zig code's externs pull: those of the
     // linked nodes and the link's own atoms.
@@ -808,9 +808,17 @@ fn linkWithInputs(
     if (objects.errors.items.len != 0) return inc.noLink("{s}", .{objects.errors.items[0]});
     var overrides: std.AutoHashMapUnmanaged(usize, Atom) = .empty;
     if (inc.objects_changed) {
-        if (missing_rt) return inc.noLink("a changed object needs a compiler_rt function the last build did not generate", .{});
-        overrides = try reboundSlots(arena, m, pack_atoms, numbered, &live, &objects, &export_keys, imports, glibc, shared) orelse
-            return inc.noLink("a changed object binds an extern to what the last build did not generate", .{});
+        // A damaged pack record (`LinkAtoms.check`): build from scratch.
+        const same = sameObjectRequests(arena, m, pack_atoms, &live, &objects, &requested_imports) catch |err| switch (err) {
+            error.InvalidInput => return inc.noLink("{t}", .{err}),
+            else => |e| return e,
+        };
+        if (!same) return inc.noLink("the changed objects need other compiler_rt functions or imports than the last build's", .{});
+        const rebound = reboundSlots(arena, m, pack_atoms, numbered, &live, &objects, &export_keys, imports, glibc, shared) catch |err| switch (err) {
+            error.InvalidInput => return inc.noLink("{t}", .{err}),
+            else => |e| return e,
+        };
+        overrides = rebound orelse return inc.noLink("a changed object binds an extern to what the last build did not generate", .{});
     }
 
     // The converted atoms and the glibc data copies, without those whose
@@ -881,6 +889,72 @@ fn linkWithInputs(
     return .{ .atoms = numbered.len + extra.items.len, .gathered = gathered };
 }
 
+/// Whether changed objects ask a full build for the compiler_rt functions
+/// and imports the last build's objects asked for (`Emit.pullInputs`,
+/// `Emit.InputResolver`): the manifest's imports and live compiler_rt
+/// functions that no linked Zig atom references, which stay either way. More would need
+/// what the last build did not generate; fewer would keep what a full
+/// build drops, and the manifest would go on recording them.
+fn sameObjectRequests(
+    arena: Allocator,
+    m: *const Manifest,
+    pack_atoms: *const Pack.LinkAtoms,
+    live: *const std.DynamicBitSetUnmanaged,
+    objects: *const ElfInput,
+    requested_imports: *const std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void),
+) !bool {
+    // What the last build's objects asked for: the imports and the live
+    // compiler_rt functions, less those the Zig code needs (struck below).
+    var old: std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    for (m.link_symbols) |ls| if (ls.kind == .import) try old.put(arena, @fromBackingInt(ls.key), {});
+    for (@import("compiler_rt_exports.zig").exports) |e| {
+        var buf: [128]u8 = undefined;
+        const key: Atom.SymbolKey = .fromName(Zcu.compilerRtKey(&buf, e[1], e[2]));
+        const n = m.symbol(@backingInt(key)) orelse continue;
+        if (live.isSet(n)) try old.put(arena, key, {});
+    }
+    // What the new objects ask for.
+    var new: std.AutoArrayHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    for (requested_imports.keys()) |key| try new.put(arena, key, {});
+    var names: std.ArrayList([]const u8) = .empty;
+    try objects.undefinedSince(0, &names, arena);
+    for (names.items) |name| if (Zcu.compilerRtExport(name)) |e| {
+        var buf: [128]u8 = undefined;
+        try new.put(arena, .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl)), {});
+    };
+    // Strike what the linked atoms reference, and the compiler_rt
+    // functions and imports their units requested (an extern's compiler_rt
+    // function is requested even when an object defines the name): those
+    // stay either way. A compiler_rt function only objects asked for that
+    // referenced itself would be struck too; none does.
+    for (0..pack_atoms.len()) |i| {
+        if (!pack_atoms.check(i)) return error.InvalidInput;
+        for (pack_atoms.atom(i).targets) |t| {
+            _ = old.swapRemove(t);
+            _ = new.swapRemove(t);
+        }
+    }
+    for (0..m.nodeCount()) |i_usize| {
+        const i: u32 = @intCast(i_usize);
+        if (m.node(i).tag == @backingInt(Tag.link) or m.atoms(i).len == 0 or m.flags(i).unlinked) continue;
+        for (m.nodeRefs(i)) |ref| {
+            const key: Atom.SymbolKey = switch (ref.kind) {
+                .rt => .fromName(m.refName(ref.value)),
+                .import => k: {
+                    const name = m.refName(ref.value);
+                    break :k Emit.importKey(name[0 .. std.mem.indexOfScalar(u8, name, 0) orelse name.len]);
+                },
+                else => continue,
+            };
+            _ = old.swapRemove(key);
+            _ = new.swapRemove(key);
+        }
+    }
+    if (old.count() != new.count()) return false;
+    for (old.keys()) |key| if (!new.contains(key)) return false;
+    return true;
+}
+
 /// The Zig code's extern slots bound again against changed link objects,
 /// as `Emit.lowerExternSlots` binds them in a full build: the
 /// compilation's export, then the objects' definition (at its section
@@ -918,24 +992,20 @@ fn reboundSlots(
     for (imports) |imp| try import_keys.put(arena, imp.key, {});
     for (numbered, 0..) |na, i| {
         const slot = slots.get(na.symbol) orelse continue;
+        if (!pack_atoms.check(i)) return error.InvalidInput;
         const a = pack_atoms.atom(i);
         const nul = std.mem.indexOfScalar(u8, slot, 0);
         const name = slot[0 .. nul orelse slot.len];
         const off: i64 = if (nul) |z| std.fmt.parseInt(i64, slot[z + 1 ..], 10) catch return null else 0;
-        const target: ?Emit.ExternTarget = if (export_keys.get(name)) |k| .{ .key = k } else if (try objects.lookup(name)) |t|
+        const in_object = try objects.lookup(name);
+        const target: ?Emit.ExternTarget = if (export_keys.get(name)) |k| .{ .key = k } else if (in_object) |t|
             .{ .key = t.key, .addend = @intCast(t.offset) }
         else if (Emit.sectionBound(name) orelse Emit.arrayBound(name)) |k| .{ .key = k } else t: {
             if (Zcu.compilerRtExport(name)) |e| {
                 var buf: [128]u8 = undefined;
-                const key: Atom.SymbolKey = .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl));
-                const n = m.symbol(@backingInt(key)) orelse return null;
-                if (!live.isSet(n)) return null;
-                break :t .{ .key = key };
+                break :t .{ .key = .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl)) };
             }
-            if (glibc) |g| if (Glibc.sharedSymbol(shared, name) != null or g.get(name) != null) {
-                if (!import_keys.contains(Emit.importKey(name))) return null;
-                break :t .{ .key = Emit.importKey(name) };
-            };
+            if (glibc) |g| if (Glibc.sharedSymbol(shared, name) != null or g.get(name) != null) break :t .{ .key = Emit.importKey(name) };
             break :t null;
         };
         const recorded: ?Emit.ExternTarget = if (a.relocs.len == 0) null else .{ .key = a.targets[a.relocs[0].info.target], .addend = a.relocs[0].addend };
@@ -947,6 +1017,15 @@ fn reboundSlots(
         };
         const addend = std.math.cast(i32, t.addend + off) orelse return null;
         if (recorded) |r| if (r.key == t.key and r.addend == addend) continue;
+        // Only from one object's definition to another's (or from
+        // nothing, for a weak extern): a slot that leaves or takes a
+        // compiler_rt function, an import, an export or a bound changes
+        // what a full build generates and imports for it.
+        if (export_keys.get(name) != null or in_object == null) return null;
+        if (recorded) |r| {
+            if (import_keys.contains(r.key) or r.key == Emit.sectionBound(name) or r.key == Emit.arrayBound(name)) return null;
+            if (m.symbol(@backingInt(r.key))) |n| if (live.isSet(n)) return null;
+        }
         var b = a;
         b.targets = try arena.dupe(Atom.SymbolKey, &.{t.key});
         b.relocs = try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, addend)});

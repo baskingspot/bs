@@ -3423,11 +3423,15 @@ differs from the design above:
   extern slots are bound again as `Emit.lowerExternSlots` binds them
   (`reboundSlots`: the compilation's export, the objects' definition at
   its section atom's key and offset, which an object's contents name,
-  then a section bound, compiler_rt, an import, or 0 for a weak extern),
-  and it builds instead when a full build would bind one, or an object's
-  own reference, to a compiler_rt function or import the last build did
-  not generate, or when a declaration's data names an object's atom
-  without a slot (its old key is then undefined). Otherwise an edited
+  then a section bound, compiler_rt, an import, or 0 for a weak extern).
+  It builds instead when a slot would move to or from anything but an
+  object's definition; when the objects ask for other compiler_rt
+  functions or imports than the last build's did (`sameObjectRequests`:
+  the manifest's imports and live compiler_rt functions that no linked
+  Zig atom references or unit requested), since a full build would
+  generate more, or drop what the old objects needed and the manifest
+  would keep recording; or when a declaration's data names an object's
+  atom without a slot (its old key is then undefined). Otherwise an edited
   object, or a Zig edit together with it, makes the edit build eager
   (`linkInputsChanged`), which binds the externs again and generates any
   compiler_rt function the object now needs. A lazy build does not load the objects, so one that writes a

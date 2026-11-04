@@ -153,10 +153,11 @@ build "1 link inputs changed and nothing else; relinked" "52 43"
 
 # A C edit relinks from the manifest, with the Zig code's extern slots
 # bound again as a full build binds them: a data, a thread-local and a
-# function extern that move within their sections, and a C fmod that
-# comes before compiler_rt's. It builds when the C needs a compiler_rt
-# function the last build did not generate, or when a declaration's data
-# names C's data without a slot.
+# function extern that move within their sections. It builds when a slot
+# moves to or from what is not an object's (a C fmod before compiler_rt's),
+# when the C needs more or fewer compiler_rt functions or imports than the
+# last build's (a full build would generate or drop them), or when a
+# declaration's data names C's data without a slot.
 cat >crelink.c <<'C'
 int c_pad = 1;
 int c_y = 7;
@@ -180,9 +181,20 @@ build "1 link inputs changed and nothing else; relinked" "y=7 tls=5 fn=4 fmod=1"
 sed -i 's/^int c_y/int c_w = 3;\nint c_y/; s/^__thread int c_tls/__thread int c_tls0 = 1;\n__thread int c_tls/' crelink.c
 build "1 link inputs changed and nothing else; relinked" "y=7 tls=5 fn=4 fmod=1"
 echo 'double fmod(double a, double b) { (void)a; (void)b; return 42; }' >>crelink.c
-build "1 link inputs changed and nothing else; relinked" "y=7 tls=5 fn=4 fmod=42"
+build "not relinking: a changed object binds an extern" "y=7 tls=5 fn=4 fmod=42"
 sed -i 's/x + 2/(long)((__float128)x * 2) - x + 1/' crelink.c
-build "not relinking: a changed object needs a compiler_rt function" "y=7 tls=5 fn=3 fmod=42"
+build "not relinking: the changed objects need other" "y=7 tls=5 fn=3 fmod=42"
+sed -i 's/(long)((__float128)x \* 2) - x + 1/x + 2/' crelink.c
+build "not relinking: the changed objects need other" "y=7 tls=5 fn=4 fmod=42"
+sed -i '1i #include <stdio.h>\n#include <stdlib.h>' crelink.c
+echo 'void c_env(void) { puts(getenv("HOME") ? "home" : "none"); }' >>crelink.c
+build "not relinking: the changed objects need other" "y=7 tls=5 fn=4 fmod=42"
+sed -i 's/x + 2/x + 3/' crelink.c
+build "1 link inputs changed and nothing else; relinked" "y=7 tls=5 fn=5 fmod=42"
+sed -i '/c_env/d' crelink.c
+build "not relinking: the changed objects need other" "y=7 tls=5 fn=5 fmod=42"
+sed -i 's/x + 3/(long)((__float128)x * 2) - x + 1/' crelink.c
+build "" "y=7 tls=5 fn=3 fmod=42"
 sed -i 's/^pub fn main/var y_ptr: *c_int = \&c_y;\npub fn main/; s/c_y, c_tls/y_ptr.*, c_tls/' crelink.zig
 build "" "y=7 tls=5 fn=3 fmod=42"
 sed -i 's/- x + 1/- x + 2/' crelink.c
