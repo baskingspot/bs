@@ -16143,6 +16143,17 @@ fn zirValidatePtrStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Co
     const first = sema.code.instructions.items(.data)[@backingInt(field_ptrs[0])].pl_node;
     const obj_ptr = sema.resolveInst(sema.code.extraData(Zir.Inst.Field, first.payload_index).data.lhs);
     const ty = Type.ptrInfo(ip, sema.typeOf(obj_ptr)).child;
+    if (ip.keyTag(ty) == .union_type and field_ptrs.len > 1) {
+        // As upstream, with a note at each initializer after the first.
+        const err = sema.fail(block, src, "cannot initialize multiple union fields at once; unions can only have one active field", .{});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        for (field_ptrs[1..]) |fp| {
+            const name_src: Src = .{ .base = block.src_base, .loc = .{ .init_name = sema.code.instructions.items(.data)[@backingInt(fp)].pl_node.src_node } };
+            try sema.zcu.addNote(sema.file, name_src.span(tree), "additional initializer here", .{});
+        }
+        try sema.addDeclaredHereNote(ty);
+        return err;
+    }
     if (ip.keyTag(ty) != .struct_type) return;
     const info = ip.structInfo(ty);
     const seen = try sema.arena.alloc(bool, info.field_types.len);
