@@ -13832,6 +13832,7 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
                 .type => return sema.fieldVal(block, src, try sema.analyzeLoad(block, src, lhs), name),
                 else => {},
             }
+            if (Type.class(ip, p.child) == .optional or Type.class(ip, p.child) == .error_union) return sema.failInvalidFieldAccess(block, src, p.child, name);
             return sema.fail(block, src, "no member named '{s}' in '{f}'", .{ name, sema.fmtType(p.child) });
         },
         .@"struct", .tuple => {
@@ -13879,7 +13880,32 @@ fn fieldVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, name: []const u8) Co
         },
         else => {},
     }
-    return sema.fail(block, src, "type '{f}' does not support field access", .{sema.fmtType(ty)});
+    return sema.failInvalidFieldAccess(block, src, ty, name);
+}
+
+/// Upstream's failWithInvalidFieldAccess: an optional or error union
+/// whose payload has the field gets a note on unwrapping it.
+fn failInvalidFieldAccess(sema: *Sema, block: *Block, src: Src, ty: Index, name: []const u8) CompileError {
+    const ip = sema.ip;
+    const kind: ?[]const u8, const payload: Index = switch (Type.class(ip, ty)) {
+        .optional => .{ "optional", Type.childType(ip, ty) },
+        .error_union => .{ "error union", ip.keyPayload(.error_union_type, ty).payload_type },
+        else => .{ null, .none },
+    };
+    const supports = payload != .none and switch (Type.class(ip, payload)) {
+        .array => std.mem.eql(u8, name, "len"),
+        .pointer => blk: {
+            const p = Type.ptrInfo(ip, payload);
+            if (p.flags.size == .slice) break :blk std.mem.eql(u8, name, "ptr") or std.mem.eql(u8, name, "len");
+            break :blk Type.class(ip, p.child) == .array and std.mem.eql(u8, name, "len");
+        },
+        .type, .@"struct", .@"union" => true,
+        else => false,
+    };
+    if (!supports) return sema.fail(block, src, "type '{f}' does not support field access", .{sema.fmtType(ty)});
+    const err = sema.fail(block, src, "{s} type '{f}' does not support field access", .{ kind.?, sema.fmtType(ty) });
+    try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "{s}", .{if (Type.class(ip, ty) == .optional) "consider using '.?', 'orelse', or 'if'" else "consider using 'try', 'catch', or 'if'"});
+    return err;
 }
 
 /// A struct's or opaque type's missing member is reported at
@@ -13991,7 +14017,7 @@ fn fieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) Co
         .@"union" => return sema.unionFieldPtr(block, src, ptr, try sema.unionFieldIndex(block, src, child, name), false),
         else => {},
     }
-    return sema.fail(block, src, "type '{f}' does not support field access", .{sema.fmtType(child)});
+    return sema.failInvalidFieldAccess(block, src, child, name);
 }
 
 /// The many-pointer type of a slice's `ptr` field.

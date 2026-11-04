@@ -1282,6 +1282,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "slice of non-array type '{f}'", .@"bad-access" },
     .{ "slice of single-item pointer cannot have sentinel", .@"bad-access" },
     .{ "type '{f}' does not support field access", .@"bad-access" },
+    .{ "{s} type '{f}' does not support field access", .@"bad-access" },
     .{ "expected struct, enum, union, or opaque; found '{f}'", .@"operand-type" },
     .{ "type '{f}' does not support indexing", .@"bad-access" },
     .{ "type '{f}' is not indexable and not a range", .@"bad-access" },
