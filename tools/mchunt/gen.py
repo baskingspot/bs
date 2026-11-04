@@ -2298,7 +2298,9 @@ class Gen:
             ctx["indent"] += 1
             g = f"{i} +% {n} <= {sl}.len" if near else f"{i} <= {sl}.len and {sl}.len - {i} >= {n}"
             e(f"if ({g}) {{")
-            body(f"{sl}[{i}..][0..{n}][{r}]")
+            # Upstream (0.17.1, Debug and LLVM) checks sl[i..][0..n] with a
+            # wrapping i + n, so the near miss indexes one element instead.
+            body(f"{sl}[{i}]" if near else f"{sl}[{i}..][0..{n}][{r}]")
             e("}")
             ctx["indent"] -= 1
             e("}")
