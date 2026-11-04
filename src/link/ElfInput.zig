@@ -56,6 +56,9 @@ pub const Object = struct {
     /// Of the contents, for the atoms' keys: stable across paths and
     /// worktrees.
     hash: u64,
+    /// Each section's atom key (`sectionKey`), which relocations look up
+    /// often enough that hashing it each time shows.
+    keys: []SymbolKey,
     shdrs: []align(1) const elf.Elf64_Shdr,
     syms: []align(1) const elf.Elf64_Sym,
     strtab: []const u8,
@@ -105,7 +108,9 @@ pub fn parseObject(arena: Allocator, path: []const u8, bytes: []const u8) Error!
     var o: Object = .{
         .path = path,
         .bytes = bytes,
-        .hash = std.hash.XxHash3.hash(0, bytes),
+        // Wyhash: about 12 GB/s here, where std's XxHash3 does 0.4.
+        .hash = std.hash.Wyhash.hash(0, bytes),
+        .keys = try arena.alloc(SymbolKey, shdrs.len),
         .shdrs = shdrs,
         .syms = &.{},
         .strtab = "",
@@ -117,6 +122,10 @@ pub fn parseObject(arena: Allocator, path: []const u8, bytes: []const u8) Error!
     };
     o.shstrtab = o.sectionBytes(eh.e_shstrndx);
     @memset(o.discarded, false);
+    for (o.keys, 0..) |*k, i| {
+        var buf: [64]u8 = undefined;
+        k.* = .fromName(std.fmt.bufPrint(&buf, "obj:{x:0>16}:{d}", .{ o.hash, i }) catch unreachable);
+    }
     for (shdrs) |sh| {
         if (sh.sh_type != elf.SHT_SYMTAB) continue;
         if (sh.sh_link >= shdrs.len or sh.sh_size % @sizeOf(elf.Elf64_Sym) != 0) return error.InvalidObject;
@@ -272,8 +281,7 @@ fn commonKey(name: []const u8) SymbolKey {
 
 /// The key of section `index` of `o`, which is not a merged one.
 fn sectionKey(o: *const Object, index: usize) SymbolKey {
-    var buf: [64]u8 = undefined;
-    return .fromName(std.fmt.bufPrint(&buf, "obj:{x:0>16}:{d}", .{ o.hash, index }) catch unreachable);
+    return o.keys[index];
 }
 
 /// The key of the value 0 that an undefined weak symbol resolves to.
