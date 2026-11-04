@@ -1174,10 +1174,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
                 l.scratch_len = @max(l.scratch_len, lens.info + lens.ranges + lens.line + fde_len);
             }
             for (inputs) |s| l.scratch_len = @max(l.scratch_len, s.bytes.len);
-            l.scratch = try gpa.alloc(u8, n_threads * l.scratch_len);
+            // In huge pages where the kernel has them: a few faults instead
+            // of one per page, and as few to tear down at the end.
+            const scratch_len = std.mem.alignForward(usize, n_threads * l.scratch_len, SymbolTable.huge_page.toByteUnits());
+            l.scratch = (std.heap.page_allocator.rawAlloc(scratch_len, SymbolTable.huge_page, @returnAddress()) orelse return error.OutOfMemory)[0..scratch_len];
+            adviseHugePages(l.scratch);
         },
     }
-    defer gpa.free(l.scratch);
+    defer if (l.scratch.len != 0) std.heap.page_allocator.rawFree(l.scratch, SymbolTable.huge_page, @returnAddress());
 
     // Padding between sections; padding within a section is filled by the
     // atom or chunk after it.
@@ -1995,7 +1999,13 @@ fn LinkOf(comptime Input: type) type {
 
         fn copyAll(l: *Link, task: usize, thread: usize) void {
             if (task >= l.chunks.len + l.debug_chunks.len) return l.copyInput(task - l.chunks.len - l.debug_chunks.len, thread);
-            if (task >= l.chunks.len) return l.copyDebug(task - l.chunks.len, thread);
+            // The debug chunks first: they take longer than the atom chunks,
+            // so starting them first leaves less of the phase to one thread.
+            if (task < l.debug_chunks.len) return l.copyDebug(task, thread);
+            return l.copyChunk(task - l.debug_chunks.len, thread);
+        }
+
+        fn copyChunk(l: *Link, task: usize, thread: usize) void {
             if (l.dynamic) return l.copyDynamic(task, thread);
             if (l.numbered == null) l.copy(task, thread, false, false) else l.copyNumbered(task, thread);
         }
