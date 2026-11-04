@@ -940,7 +940,8 @@ def parse_case(path):
         return None
     cfg, expected = {}, []
     for ln in src[at + len("\n// error\n"):].splitlines():
-        text = ln[3:] if ln.startswith("// ") else ""
+        # As upstream's manifest parser: `//` then optional whitespace.
+        text = ln[2:].strip(" \t") if ln.startswith("//") else ""
         m = re.match(r"^(\w+)=(.*)$", text)
         if m and not expected:
             cfg[m.group(1)] = m.group(2)
