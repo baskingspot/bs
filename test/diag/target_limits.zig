@@ -1,5 +1,5 @@
 // Runtime tail calls and atomics wider than 64 bits are beyond upstream's
-// x86_64 backend at the baseline CPU; zap reports both as upstream does.
+// x86_64 backend at the baseline CPU; bs reports both as upstream does.
 // Comptime and inline calls are not tail calls.
 fn plain(n: u32) u32 {
     return n;

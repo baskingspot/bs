@@ -1,5 +1,5 @@
 //! A C object whose undefined behavior and smashed stack reach the
-//! runtimes zap links for C (ubsan_rt, compiler_rt's stack protector).
+//! runtimes bs links for C (ubsan_rt, compiler_rt's stack protector).
 const std = @import("std");
 extern fn c_overflow(x: c_int) c_int;
 extern fn c_smash(s: [*:0]const u8) void;

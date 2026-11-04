@@ -170,7 +170,6 @@ pub fn Handles(comptime HandleType: type) type {
 }
 
 test "handles" {
-
     var handles: Handles(EntityClass(.{
         .index_bits = 4,
         .version_bits = 4,

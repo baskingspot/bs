@@ -1,7 +1,7 @@
-//! Compile errors as zap reports them: a record with a stable code,
+//! Compile errors as bs reports them: a record with a stable code,
 //! resolved locations and notes, rendered as text (the default) or as JSON
 //! lines (`--error-format=json`). See "Diagnostics" in
-//! docs/architecture.md for the output form and its rules.
+//! docs/slop/architecture.md for the output form and its rules.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -412,7 +412,7 @@ fn quoted(msg: []const u8) ?[]const u8 {
 // Migration and pattern hints (step 4)
 
 /// What replaced std APIs that models still write from older releases, by
-/// (container, missing name). The container is named as zap prints it,
+/// (container, missing name). The container is named as bs prints it,
 /// without generic arguments (`array_list.Aligned`); a name of `*` covers
 /// every missing name of the container. Seeded from
 /// `tools/diag/std_removed.py` (0.11 to 0.15 against 0.17, most used
@@ -526,7 +526,7 @@ const migration_map = std.StaticStringMap([]const u8).initComptime(kvs: {
 });
 
 /// The migration hint for a failed lookup of `name` in the container
-/// zap prints as `container` (generic arguments are ignored), where the
+/// bs prints as `container` (generic arguments are ignored), where the
 /// source goes on to access `next` (`AnyWriter` in `std.io.AnyWriter`):
 /// a hint for `name.next` wins over one for `name`.
 pub fn migrationHint(container: []const u8, name: []const u8, next: ?[]const u8) ?[]const u8 {
@@ -545,7 +545,7 @@ pub fn migrationHint(container: []const u8, name: []const u8, next: ?[]const u8)
 }
 
 /// Mechanical rewrites of a name 0.17 removed, where the replacement means
-/// the same: the container as zap prints it without generic arguments, the
+/// the same: the container as bs prints it without generic arguments, the
 /// name, the text that must follow the name in the source (replaced with
 /// it), and the replacement.
 const migration_fixes = [_]struct { []const u8, []const u8, []const u8, []const u8 }{
@@ -631,12 +631,12 @@ test migrationHint {
 
 /// Primitive names an identifier can mean without a declaration.
 const primitive_names = [_][]const u8{
-    "u8",           "u16",            "u32",         "u64",       "u128",     "usize",
-    "i8",           "i16",            "i32",         "i64",       "i128",     "isize",
-    "f16",          "f32",            "f64",         "f80",       "f128",     "bool",
-    "void",         "type",           "anyerror",    "anyopaque", "noreturn", "comptime_int",
-    "comptime_float", "c_int",        "c_uint",      "c_long",    "c_ulong",  "c_char",
-    "true",         "false",          "null",        "undefined",
+    "u8",             "u16",   "u32",      "u64",       "u128",     "usize",
+    "i8",             "i16",   "i32",      "i64",       "i128",     "isize",
+    "f16",            "f32",   "f64",      "f80",       "f128",     "bool",
+    "void",           "type",  "anyerror", "anyopaque", "noreturn", "comptime_int",
+    "comptime_float", "c_int", "c_uint",   "c_long",    "c_ulong",  "c_char",
+    "true",           "false", "null",     "undefined",
 };
 
 /// Appends the names visible at byte `offset` of `tree`, roughly: every
@@ -649,7 +649,7 @@ fn scopeNames(arena: std.mem.Allocator, tree: *const std.zig.Ast, offset: u32, o
     const tags = tree.nodes.items(.tag);
     var buf: [2]Ast.Node.Index = undefined;
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const members = if (node == .root) tree.rootDecls() else if (tree.fullContainerDecl(&buf, node)) |c| c.ast.members else continue;
         for (members) |m| {
             var proto_buf: [1]Ast.Node.Index = undefined;
@@ -659,7 +659,7 @@ fn scopeNames(arena: std.mem.Allocator, tree: *const std.zig.Ast, offset: u32, o
     }
     for (0..tree.nodes.len) |i| {
         if (tags[i] != .fn_decl) continue;
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const first = tree.firstToken(node);
         const last = tree.lastToken(node);
         if (offset < tree.tokenStart(first) or offset > tree.tokenStart(last)) continue;
@@ -1000,7 +1000,7 @@ fn renderJson(w: *Writer, d: Diagnostic) Writer.Error!void {
 const Ast = std.zig.Ast;
 
 /// The fix for AstGen error `code` with message `msg` at byte `main` of
-/// `tree`'s source, if zap knows one.
+/// `tree`'s source, if bs knows one.
 fn astGenFix(arena: std.mem.Allocator, tree: *const Ast, code: Code, msg: []const u8, main: u32, candidates: []const []const u8) !?RawFix {
     const tok = tokenAt(tree, main) orelse return null;
     switch (code) {
@@ -1111,7 +1111,7 @@ pub fn wrapFix(arena: std.mem.Allocator, tree: *const Ast, start: u32, end: u32,
 pub fn tryFix(arena: std.mem.Allocator, tree: *const Ast, start: u32, end: u32, payload_void: bool) !?RawFix {
     if (!isExpression(tree, start, end)) return null;
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         switch (tree.nodeTag(node)) {
             .@"defer", .@"errdefer" => {
                 if (tree.tokenStart(tree.firstToken(node)) <= start and end <= tokenEnd(tree, tree.lastToken(node))) return null;
@@ -1142,7 +1142,7 @@ pub fn keywordFix(arena: std.mem.Allocator, tree: *const Ast, at: u32, from: std
 fn isExpression(tree: *const Ast, start: u32, end: u32) bool {
     const first = tokenAt(tree, start) orelse return false;
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (tree.firstToken(node) != first or tokenEnd(tree, tree.lastToken(node)) != end) continue;
         switch (tree.nodeTag(node)) {
             .root, .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl, .container_field, .container_field_init, .container_field_align, .fn_decl, .test_decl => {},
@@ -1156,7 +1156,7 @@ fn isExpression(tree: *const Ast, start: u32, end: u32) bool {
 fn expressionAt(tree: *const Ast, start: u32, end: u32) ?Ast.Node.Index {
     const first = tokenAt(tree, start) orelse return null;
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (tree.firstToken(node) != first or tokenEnd(tree, tree.lastToken(node)) != end) continue;
         switch (tree.nodeTag(node)) {
             .root, .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl, .container_field, .container_field_init, .container_field_align, .fn_decl, .test_decl => {},
@@ -1232,7 +1232,7 @@ fn localNamed(tree: *const Ast, use: Ast.TokenIndex) ?Local {
     const name = tree.tokenSlice(use);
     var best: ?Local = null;
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const decl = tree.fullVarDecl(node) orelse continue;
         const mut_tok = decl.ast.mut_token;
         if (mut_tok < body_first or mut_tok >= use or mut_tok > body_last) continue;
@@ -1240,7 +1240,7 @@ fn localNamed(tree: *const Ast, use: Ast.TokenIndex) ?Local {
         // The innermost block around the declaration must hold `use`.
         var inner: ?Ast.Node.Index = null;
         for (0..tree.nodes.len) |j| {
-            const b: Ast.Node.Index = @enumFromInt(j);
+            const b: Ast.Node.Index = @fromBackingInt(@intCast(j));
             switch (tree.nodeTag(b)) {
                 .block, .block_semicolon, .block_two, .block_two_semicolon => {},
                 else => continue,
@@ -1383,7 +1383,7 @@ pub fn fnReturnsError(tree: *const Ast, tok: Ast.TokenIndex) bool {
 pub fn shiftOf(tree: *const Ast, start: u32, end: u32) ?struct { lhs: []const u8, left: bool } {
     const rhs = expressionAt(tree, start, end) orelse return null;
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const left = switch (tree.nodeTag(node)) {
             .shl, .assign_shl => true,
             .shr, .assign_shr => false,
@@ -1403,7 +1403,7 @@ pub fn prongsFix(arena: std.mem.Allocator, tree: *const Ast, offset: u32, prongs
     const tok = tokenAt(tree, offset) orelse return null;
     if (tree.tokenTag(tok) != .keyword_switch) return null;
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         switch (tree.nodeTag(node)) {
             .@"switch", .switch_comma => {},
             else => continue,
@@ -1468,8 +1468,8 @@ const builtin_rewrites = std.StaticStringMap(struct { u8, []const u8 }).initComp
 /// Casts that took their type as their first argument before 0.11 and
 /// take it from the result type now; checked against 0.17's builtins.
 const result_type_casts = std.StaticStringMap(void).initComptime(.{
-    .{"@intCast"},      .{"@truncate"},     .{"@bitCast"},   .{"@floatCast"}, .{"@ptrCast"},
-    .{"@enumFromInt"},  .{"@floatFromInt"}, .{"@intFromFloat"}, .{"@ptrFromInt"}, .{"@errorCast"},
+    .{"@intCast"},     .{"@truncate"},     .{"@bitCast"},      .{"@floatCast"},  .{"@ptrCast"},
+    .{"@enumFromInt"}, .{"@floatFromInt"}, .{"@intFromFloat"}, .{"@ptrFromInt"}, .{"@errorCast"},
 });
 
 /// The hint for AstGen error `code` with message `msg` at byte `main` of
@@ -1599,7 +1599,7 @@ fn captureIndex(tree: *const Ast, open: Ast.TokenIndex, name_start: Ast.TokenInd
 /// and the one before it.
 fn forCounter(tree: *const Ast, open: Ast.TokenIndex, name_start: Ast.TokenIndex) ?struct { node: Ast.Node.Index, prev: Ast.Node.OptionalIndex } {
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         const f = tree.fullFor(node) orelse continue;
         if (f.payload_token != open + 1 and f.payload_token != open + 2) continue;
         const index = captureIndex(tree, open, name_start);
@@ -1625,7 +1625,7 @@ fn enclosingFn(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.Node.Index {
     var best: ?Ast.Node.Index = null;
     var best_len: u32 = std.math.maxInt(u32);
     for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(i));
         if (tree.nodeTag(node) != .fn_decl and tree.nodeTag(node) != .test_decl) continue;
         const first = tree.firstToken(node);
         const last = tree.lastToken(node);
@@ -1701,11 +1701,11 @@ pub fn indentOf(source: []const u8, offset: u32) []const u8 {
 
 /// The code of a Sema, linker or backend error, by the format string it is
 /// made from (`Zcu.addError`, `Sema.fail`): an error's kind follows from
-/// its wording, so call sites name no code. Formats zap invents for what it
-/// does not support yet start with "zap ". Unknown formats are
+/// its wording, so call sites name no code. Formats bs invents for what it
+/// does not support yet start with "bs ". Unknown formats are
 /// `unclassified`; a test checks that none remain.
 pub fn formatCode(fmt: []const u8) Code {
-    if (std.mem.startsWith(u8, fmt, "zap ")) return .unsupported;
+    if (std.mem.startsWith(u8, fmt, "bs ")) return .unsupported;
     return format_codes.get(fmt) orelse .unclassified;
 }
 
@@ -1975,7 +1975,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "unable to evaluate comptime expression", .@"comptime-required" },
     .{ "unable to evaluate comptime expression: memory is runtime-known", .@"comptime-required" },
     .{ "unable to evaluate comptime expression: pointer address is not known until link time", .@"comptime-required" },
-    .{ "unable to evaluate comptime expression: zap resolves extern symbols at link time", .@"comptime-required" },
+    .{ "unable to evaluate comptime expression: bs resolves extern symbols at link time", .@"comptime-required" },
     .{ "unable to resolve comptime value", .@"comptime-required" },
     .{ "unable to resolve comptime value", .@"comptime-required" },
     .{ "unable to store to this memory at comptime", .@"comptime-required" },

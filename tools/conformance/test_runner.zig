@@ -1,18 +1,18 @@
-//! Test runner for zap's conformance harness (`tools/conformance/run.py`).
+//! Test runner for bs's conformance harness (`tools/conformance/run.py`).
 //!
 //! It runs `builtin.test_functions` in order and reports each test on stdout
 //! with the line protocol below, one write per line, so results survive a
 //! crash in a later test. The harness parses only this protocol, so any runner
 //! that speaks it can be passed with `--test-runner`, including a smaller one
-//! that zap can compile before it can compile this one.
+//! that bs can compile before it can compile this one.
 //!
-//!     @zap-test v1 <count> <backend>  header: number of tests, builtin.zig_backend
-//!     @zap-test start <i> <name>    test i (0-based) is about to run
-//!     @zap-test pass <i>
-//!     @zap-test skip <i>            the test returned error.SkipZigTest
-//!     @zap-test fail <i> <error>    the test returned another error
-//!     @zap-test leak <i>            the test passed but leaked testing.allocator memory
-//!     @zap-test done                every test from the start index ran
+//!     @bs-test v1 <count> <backend>  header: number of tests, builtin.zig_backend
+//!     @bs-test start <i> <name>    test i (0-based) is about to run
+//!     @bs-test pass <i>
+//!     @bs-test skip <i>            the test returned error.SkipZigTest
+//!     @bs-test fail <i> <error>    the test returned another error
+//!     @bs-test leak <i>            the test passed but leaked testing.allocator memory
+//!     @bs-test done                every test from the start index ran
 //!
 //! A test with a start line and no result line crashed or timed out. The
 //! harness then reruns the binary with `--start=<i+1>` to run the rest.
@@ -80,7 +80,7 @@ fn line(parts: []const []const u8) void {
 fn lineTo(fd: std.posix.fd_t, parts: []const []const u8) void {
     var buf: [4096]u8 = undefined;
     var len: usize = 0;
-    append(&buf, &len, "@zap-test ");
+    append(&buf, &len, "@bs-test ");
     for (parts) |part| append(&buf, &len, part);
     // Keep the newline even if a long test name was truncated.
     if (len == buf.len) len -= 1;

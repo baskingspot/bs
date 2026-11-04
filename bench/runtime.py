@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Run-time benchmarks: the speed of the code zap generates.
+"""Run-time benchmarks: the speed of the code bs generates.
 
-Builds each program in bench/runtime/ with zap and with upstream zig 0.17.1
+Builds each program in bench/runtime/ with bs and with upstream zig 0.17.1
 in Debug (self-hosted x86_64 backend) and ReleaseSafe (LLVM), checks that
 all three print the same output, and reports the median wall time of each
 binary. See bench/README.md.
@@ -53,17 +53,17 @@ def fmt_ms(s):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--compiler", default="zig-out/bin/zap", help="zap binary (default: zig-out/bin/zap)")
+    ap.add_argument("--compiler", default="zig-out/bin/bs", help="bs binary (default: zig-out/bin/bs)")
     ap.add_argument("--zig", default="zig", help="upstream zig 0.17.1 (default: zig on PATH)")
     ap.add_argument("--programs", default=",".join(PROGRAMS), help="comma-separated subset of " + ",".join(PROGRAMS))
     ap.add_argument("--runs", type=int, default=5, help="runs per binary (default 5)")
-    ap.add_argument("--no-upstream", action="store_true", help="time only zap's binaries")
+    ap.add_argument("--no-upstream", action="store_true", help="time only bs's binaries")
     ap.add_argument("--out", help="write PATH.md and PATH.json")
     ap.add_argument("--machine-note", default=platform.machine(), help="describes the machine in the report")
     args = ap.parse_args()
 
-    zap = os.path.abspath(args.compiler)
-    builds = [("zap", lambda src, out: [zap, "build-exe", src, f"-femit-bin={out}"])]
+    bs = os.path.abspath(args.compiler)
+    builds = [("bs", lambda src, out: [bs, "build-exe", src, f"-femit-bin={out}"])]
     if not args.no_upstream:
         builds += [
             ("Debug", lambda src, out: [args.zig, "build-exe", "-fno-llvm", "-fno-lld", src, f"-femit-bin={out}"]),
@@ -71,7 +71,7 @@ def main():
         ]
 
     results = {}
-    with tempfile.TemporaryDirectory(prefix="zap-runtime-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bs-runtime-") as tmp:
         for prog in args.programs.split(","):
             src = os.path.join(PROGRAMS_DIR, f"{prog}.zig")
             results[prog] = {}
@@ -90,16 +90,16 @@ def main():
     lines = [
         "# Run-time benchmarks",
         "",
-        f"Median wall time of {args.runs} runs; `{os.path.basename(zap)}` against upstream zig 0.17.1. "
+        f"Median wall time of {args.runs} runs; `{os.path.basename(bs)}` against upstream zig 0.17.1. "
         f"{args.machine_note}, {os.cpu_count()} CPUs.",
         "",
-        "| Program | " + " | ".join(names) + (" | zap / Debug | zap / ReleaseSafe |" if len(names) == 3 else " |"),
+        "| Program | " + " | ".join(names) + (" | bs / Debug | bs / ReleaseSafe |" if len(names) == 3 else " |"),
         "|---|" + "---:|" * (len(names) + (2 if len(names) == 3 else 0)),
     ]
     for prog, r in results.items():
         row = [fmt_ms(r[n]["median_s"]) for n in names]
         if len(names) == 3:
-            z = r["zap"]["median_s"]
+            z = r["bs"]["median_s"]
             row += [f"{z / r['Debug']['median_s']:.2f}×", f"{z / r['ReleaseSafe']['median_s']:.1f}×"]
         lines.append(f"| {prog} | " + " | ".join(row) + " |")
     report = "\n".join(lines) + "\n"

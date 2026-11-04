@@ -893,7 +893,7 @@
     {
      "name": "example-c-tty",
      "run": [],
-     "note": "Bug in upstream std, not zap (docs/architecture.md, \"Deliberate differences from upstream\"): with -lc on x86_64-linux-gnu, std.c.termios is linux.termios (NCCS 19, 44 bytes) while glibc's tcgetattr writes its own struct termios (NCCS 32 plus ispeed/ospeed, 60 bytes). The 16 extra bytes land on posix.tcgetattr's spilled result pointer in zap's frame, so the forked child segfaults in PosixTty.makeRaw and main's WIFEXITED assert fails; upstream's frames (LLVM and -fno-llvm) put dead slots there and pass. Expected to fail under zap until std sizes termios for glibc."
+     "note": "Bug in upstream std, not bs (docs/slop/architecture.md, \"Deliberate differences from upstream\"): with -lc on x86_64-linux-gnu, std.c.termios is linux.termios (NCCS 19, 44 bytes) while glibc's tcgetattr writes its own struct termios (NCCS 32 plus ispeed/ospeed, 60 bytes). The 16 extra bytes land on posix.tcgetattr's spilled result pointer in bs's frame, so the forked child segfaults in PosixTty.makeRaw and main's WIFEXITED assert fails; upstream's frames (LLVM and -fno-llvm) put dead slots there and pass. Expected to fail under bs until std sizes termios for glibc."
     }
    ]
   },
@@ -1036,7 +1036,7 @@
     {
      "name": "coro-demo",
      "run": [],
-     "note": "Upstream's build aborts here, zap's does not: the demo gives each coroutine a 64 KiB stack, and upstream's Debug frames fault below the committed part of it ('Coroutine stack overflow!', guard page fault false), while zap's smaller frames fit and the demo prints sum = 10."
+     "note": "Upstream's build aborts here, bs's does not: the demo gives each coroutine a 64 KiB stack, and upstream's Debug frames fault below the committed part of it ('Coroutine stack overflow!', guard page fault false), while bs's smaller frames fit and the demo prints sum = 10."
     },
     {
      "name": "mutex-demo",
@@ -1097,7 +1097,7 @@
       "src/dom/parser.zig",
       "                    const el = try doc.createElement(tag);"
      ],
-     "note": "Bug in tokamak, not zap; reported here in upstream style, not patched. Title: meta.transmute reads through a misaligned pointer (dom.document.test_0 panics with 'incorrect alignment'). Where: src/meta.zig:221 `pub inline fn transmute(comptime T: type, val: anytype) T { const tmp: *const T = @ptrCast(@alignCast(&val)); return tmp.*; }`, called by src/dom/local_name.zig:14 `meta.transmute(u128, x)` with x a ShortString, an extern struct { len21: u8, buf: [15]u8 } of alignment 1. `&val` is only 1-aligned, so the @alignCast to *const u128 (alignment 16) is illegal behavior whenever the parameter's stack slot is not 16-aligned; the safety check panics. Upstream 0.17.0 Debug passes tokamak's test only because its frame happens to put that slot on a 16-byte boundary. Reproduction (panics under upstream 0.17.0 and zap alike): const ShortString = extern struct { len21: u8 = 1, buf: [15]u8 = @splat(0) }; inline fn transmute(comptime T: type, val: anytype) T { const tmp: *const T = @ptrCast(@alignCast(&val)); return tmp.*; } noinline fn parse(n: u8) u128 { var pad: [3]u8 = .{ n, n, n }; _ = &pad; return transmute(u128, ShortString{ .len21 = pad[1] }); } pub fn main() void { _ = parse(4); } Suggested fix: `return @bitCast(val)` where the sizes match, or copy the bytes: `var tmp: T = undefined; @memcpy(std.mem.asBytes(&tmp), std.mem.asBytes(&val)); return tmp;`. With the copy, zap and upstream give the same 88 passed, 1 failed (http.client: AddressInUse in both)."
+     "note": "Bug in tokamak, not bs; reported here in upstream style, not patched. Title: meta.transmute reads through a misaligned pointer (dom.document.test_0 panics with 'incorrect alignment'). Where: src/meta.zig:221 `pub inline fn transmute(comptime T: type, val: anytype) T { const tmp: *const T = @ptrCast(@alignCast(&val)); return tmp.*; }`, called by src/dom/local_name.zig:14 `meta.transmute(u128, x)` with x a ShortString, an extern struct { len21: u8, buf: [15]u8 } of alignment 1. `&val` is only 1-aligned, so the @alignCast to *const u128 (alignment 16) is illegal behavior whenever the parameter's stack slot is not 16-aligned; the safety check panics. Upstream 0.17.0 Debug passes tokamak's test only because its frame happens to put that slot on a 16-byte boundary. Reproduction (panics under upstream 0.17.0 and bs alike): const ShortString = extern struct { len21: u8 = 1, buf: [15]u8 = @splat(0) }; inline fn transmute(comptime T: type, val: anytype) T { const tmp: *const T = @ptrCast(@alignCast(&val)); return tmp.*; } noinline fn parse(n: u8) u128 { var pad: [3]u8 = .{ n, n, n }; _ = &pad; return transmute(u128, ShortString{ .len21 = pad[1] }); } pub fn main() void { _ = parse(4); } Suggested fix: `return @bitCast(val)` where the sizes match, or copy the bytes: `var tmp: T = undefined; @memcpy(std.mem.asBytes(&tmp), std.mem.asBytes(&val)); return tmp;`. With the copy, bs and upstream give the same 88 passed, 1 failed (http.client: AddressInUse in both)."
     }
    ]
   }

@@ -5,7 +5,7 @@
 //! numbers its instruction), and so the type its generic instance makes,
 //! which captures nothing and so stays the same type: the edit build
 //! loads that type's functions, whose symbols must take the new name
-//! without the build being redone (docs/architecture.md, "Type names").
+//! without the build being redone (docs/slop/architecture.md, "Type names").
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 

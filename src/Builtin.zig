@@ -1,9 +1,9 @@
 //! The generated `builtin` module: `@import("builtin")`.
 //!
-//! The text follows upstream Zig 0.17.1's `src/Builtin.zig` output for zap's
+//! The text follows upstream Zig 0.17.1's `src/Builtin.zig` output for bs's
 //! one Linux configuration: x86_64-linux-none, Debug or ReleaseSafe, the
 //! self-hosted x86_64 backend, static linking.
-//! Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
+//! Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 const std = @import("std");
 const Io = std.Io;
@@ -15,7 +15,7 @@ pub const Options = struct {
     output_mode: OutputMode,
     is_test: bool,
     single_threaded: bool = false,
-    /// `builtin.unwind_tables` (`-funwind-tables` and friends). zap emits
+    /// `builtin.unwind_tables` (`-funwind-tables` and friends). bs emits
     /// asynchronous tables for each, which serve every kind of request.
     unwind_tables: std.lang.UnwindTables = .async,
     /// `-ffuzz`.
@@ -25,14 +25,14 @@ pub const Options = struct {
     error_tracing: bool = true,
     valgrind: bool = true,
     /// `-fPIC` and `-fPIE` on objects and libraries (see
-    /// "Position-independent code" in docs/architecture.md).
+    /// "Position-independent code" in docs/slop/architecture.md).
     pic: bool = false,
     pie: bool = false,
     /// `-dynamic` on a library.
     dynamic: bool = false,
     /// `-lc`: glibc of this version, linked dynamically. As upstream, the
     /// ABI is gnu, and glibc makes code position-independent
-    /// (`requiresPic`), which zap's executables need not be. The start
+    /// (`requiresPic`), which bs's executables need not be. The start
     /// code, which glibc's crt1.o would provide, comes with it
     /// (`glibc_start`).
     glibc: ?std.SemanticVersion = null,
@@ -42,12 +42,12 @@ pub const Options = struct {
     cpu: std.Target.Cpu = @import("cpu.zig").baseline,
 };
 
-/// zap's start code for executables that link glibc, in place of glibc's
-/// crt1.o (see "C interop" in docs/architecture.md). It sits next to
+/// bs's start code for executables that link glibc, in place of glibc's
+/// crt1.o (see "C interop" in docs/slop/architecture.md). It sits next to
 /// builtin.zig, which imports it from a `comptime` block (not a
 /// declaration, so `@typeInfo(builtin)` is upstream's).
 pub const glibc_start =
-    \\//! zap's start code for executables that link glibc, in place of
+    \\//! bs's start code for executables that link glibc, in place of
     \\//! glibc's crt1.o: `_start` calls `__libc_start_main` with the `main`
     \\//! that std's start code exports, as glibc's sysdeps/x86_64/start.S
     \\//! does. glibc 2.34 and later run the init arrays themselves when
@@ -95,12 +95,12 @@ pub const glibc_start =
 ;
 
 /// The root file of an executable whose main is C's (a module of C sources
-/// only, linking glibc). Upstream analyzes no Zig for it; zap's executables
+/// only, linking glibc). Upstream analyzes no Zig for it; bs's executables
 /// need a Zig root for the start code, compiler_rt and ubsan_rt. std's
 /// start code still runs, and declares `_start` unless the root does;
 /// `glibc_start.zig` exports it.
 pub const c_main =
-    \\//! zap's root file for an executable whose `main` is C's: glibc_start.zig
+    \\//! bs's root file for an executable whose `main` is C's: glibc_start.zig
     \\//! calls it, and std's start code exports neither `main` nor `_start`.
     \\
     \\pub const _start = {};
@@ -136,74 +136,74 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         if (opts.cpu.features.isEnabled(@intCast(i))) try features.print(gpa, "        .{f},\n", .{std.zig.fmtIdPU(feature.name)});
     }
     return std.fmt.allocPrint(gpa,
-    \\const std = @import("std");
-    \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
-    \\pub const zig_version_string = "0.17.1";
-    \\pub const zig_backend = std.lang.CompilerBackend.stage2_x86_64;
-    \\
-    \\pub const output_mode: std.lang.OutputMode = .{s};
-    \\pub const link_mode: std.lang.LinkMode = .{s};
-    \\pub const unwind_tables: std.lang.UnwindTables = .{s};
-    \\pub const is_test = {s};
-    \\pub const single_threaded = {s};
-    \\/// Deprecated; to be removed in 0.18.0. Use `target.abi` instead.
-    \\pub const abi: std.Target.Abi = .{s};
-    \\/// Deprecated; to be removed in 0.18.0. Use `target.cpu` instead.
-    \\pub const cpu: std.Target.Cpu = .{{
-    \\    .arch = .x86_64,
-    \\    .model = &std.Target.x86.cpu.{f},
-    \\    .features = std.Target.x86.featureSet(&.{{
-    \\{s}    }}),
-    \\}};
-    \\/// Deprecated; to be removed in 0.18.0. Use `target.os` instead.
-    \\pub const os: std.Target.Os = .{{
-    \\    .tag = .linux,
-    \\    .version_range = .{{ .linux = .{{
-    \\        .range = .{{
-    \\            .min = .{{
-    \\                .major = 5,
-    \\                .minor = 10,
-    \\                .patch = 0,
-    \\            }},
-    \\            .max = .{{
-    \\                .major = 7,
-    \\                .minor = 2,
-    \\                .patch = 0,
-    \\            }},
-    \\        }},
-    \\        .glibc = .{{
-    \\            .major = {d},
-    \\            .minor = {d},
-    \\            .patch = {d},
-    \\        }},
-    \\        .android = 29,
-    \\    }}}},
-    \\}};
-    \\pub const target: std.Target = .{{
-    \\    .cpu = cpu,
-    \\    .os = os,
-    \\    .abi = abi,
-    \\    .ofmt = object_format,
-    \\    .dynamic_linker = {s},
-    \\}};
-    \\/// Deprecated; to be removed in 0.18.0. Use `target.ofmt` instead.
-    \\pub const object_format: std.Target.ObjectFormat = .elf;
-    \\/// Deprecated, to be removed after 0.18.0
-    \\pub const mode = optimize;
-    \\pub const optimize: std.lang.Optimize = .{s};
-    \\pub const link_libc = {s};
-    \\pub const link_libcpp = {s};
-    \\pub const have_error_return_tracing = {s};
-    \\pub const valgrind_support = {s};
-    \\pub const sanitize_thread = false;
-    \\pub const fuzz = {s};
-    \\pub const position_independent_code = {s};
-    \\pub const position_independent_executable = {s};
-    \\pub const strip_debug_info = false;
-    \\pub const code_model: std.lang.CodeModel = .default;
-    \\pub const omit_frame_pointer = false;
-    \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
-    \\{s}
+        \\const std = @import("std");
+        \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
+        \\pub const zig_version_string = "0.17.1";
+        \\pub const zig_backend = std.lang.CompilerBackend.stage2_x86_64;
+        \\
+        \\pub const output_mode: std.lang.OutputMode = .{s};
+        \\pub const link_mode: std.lang.LinkMode = .{s};
+        \\pub const unwind_tables: std.lang.UnwindTables = .{s};
+        \\pub const is_test = {s};
+        \\pub const single_threaded = {s};
+        \\/// Deprecated; to be removed in 0.18.0. Use `target.abi` instead.
+        \\pub const abi: std.Target.Abi = .{s};
+        \\/// Deprecated; to be removed in 0.18.0. Use `target.cpu` instead.
+        \\pub const cpu: std.Target.Cpu = .{{
+        \\    .arch = .x86_64,
+        \\    .model = &std.Target.x86.cpu.{f},
+        \\    .features = std.Target.x86.featureSet(&.{{
+        \\{s}    }}),
+        \\}};
+        \\/// Deprecated; to be removed in 0.18.0. Use `target.os` instead.
+        \\pub const os: std.Target.Os = .{{
+        \\    .tag = .linux,
+        \\    .version_range = .{{ .linux = .{{
+        \\        .range = .{{
+        \\            .min = .{{
+        \\                .major = 5,
+        \\                .minor = 10,
+        \\                .patch = 0,
+        \\            }},
+        \\            .max = .{{
+        \\                .major = 7,
+        \\                .minor = 2,
+        \\                .patch = 0,
+        \\            }},
+        \\        }},
+        \\        .glibc = .{{
+        \\            .major = {d},
+        \\            .minor = {d},
+        \\            .patch = {d},
+        \\        }},
+        \\        .android = 29,
+        \\    }}}},
+        \\}};
+        \\pub const target: std.Target = .{{
+        \\    .cpu = cpu,
+        \\    .os = os,
+        \\    .abi = abi,
+        \\    .ofmt = object_format,
+        \\    .dynamic_linker = {s},
+        \\}};
+        \\/// Deprecated; to be removed in 0.18.0. Use `target.ofmt` instead.
+        \\pub const object_format: std.Target.ObjectFormat = .elf;
+        \\/// Deprecated, to be removed after 0.18.0
+        \\pub const mode = optimize;
+        \\pub const optimize: std.lang.Optimize = .{s};
+        \\pub const link_libc = {s};
+        \\pub const link_libcpp = {s};
+        \\pub const have_error_return_tracing = {s};
+        \\pub const valgrind_support = {s};
+        \\pub const sanitize_thread = false;
+        \\pub const fuzz = {s};
+        \\pub const position_independent_code = {s};
+        \\pub const position_independent_executable = {s};
+        \\pub const strip_debug_info = false;
+        \\pub const code_model: std.lang.CodeModel = .default;
+        \\pub const omit_frame_pointer = false;
+        \\pub var test_functions: []const std.lang.TestFn = &.{{}}; // overwritten later
+        \\{s}
     , .{
         @tagName(opts.output_mode),
         if (opts.dynamic or exe_libc) "dynamic" else "static",

@@ -1,14 +1,14 @@
-//! `zap build`: compiles upstream's build runner (`lib/compiler/Maker.zig`)
-//! with zap and replaces zap with it, as upstream's `zig build` does, but
-//! with `--zig=<zap>`: the runner then compiles `build.zig` (with
-//! `lib/compiler/configurer.zig`) and every compile step by running zap
+//! `bs build`: compiles upstream's build runner (`lib/compiler/Maker.zig`)
+//! with bs and replaces bs with it, as upstream's `zig build` does, but
+//! with `--zig=<bs>`: the runner then compiles `build.zig` (with
+//! `lib/compiler/configurer.zig`) and every compile step by running bs
 //! with `--listen=-` (`main.serve`).
 //!
 //! Upstream compiles the runner once per global cache in ReleaseSafe with
-//! LLVM (75 s on the bench orb); zap compiles it in ReleaseSafe too (its
+//! LLVM (75 s on the bench orb); bs compiles it in ReleaseSafe too (its
 //! one code generation, but std's ReleaseSafe paths: no allocation stack
-//! traces, no error return traces, `.info` logging), once per zap binary
-//! and zig lib directory, into `<global cache>/zap/o/<hash>/maker`, and a
+//! traces, no error return traces, `.info` logging), once per bs binary
+//! and zig lib directory, into `<global cache>/bs/o/<hash>/maker`, and a
 //! build with nothing changed reuses it without relinking.
 
 const std = @import("std");
@@ -35,14 +35,14 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const dirs = Frontend.resolveCacheDirs(arena, io, env, .{ .local_is_global = true });
     const global = try std.fs.path.resolve(arena, &.{ cwd, dirs.global });
 
-    // One runner per zap binary, zig lib directory and mode.
+    // One runner per bs binary, zig lib directory and mode.
     const mode = "-OReleaseSafe";
     const seed, _ = try Incremental.compilationKey(arena, io, &.{}, zig_lib_dir, "x86_64-linux");
     const runner_hash = cache.hash(2, try std.mem.concat(arena, u8, &.{ std.mem.asBytes(&seed), zig_lib_dir, mode }));
-    const runner_dir = try std.fmt.allocPrint(arena, "{s}/zap/o/{x:0>32}", .{ global, runner_hash });
+    const runner_dir = try std.fmt.allocPrint(arena, "{s}/bs/o/{x:0>32}", .{ global, runner_hash });
     try Io.Dir.cwd().createDirPath(io, runner_dir);
     const runner_path = try std.fs.path.join(arena, &.{ runner_dir, "maker" });
-    // With zap's own zig lib directory, the pinned release's, which nobody
+    // With bs's own zig lib directory, the pinned release's, which nobody
     // edits, a runner that is as the last check left it is current: that
     // saves the check's stat of every source the runner imports (about
     // 3 ms of a 38 ms no-change build). A lib directory given with
@@ -52,11 +52,11 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     const trusted_lib = lib_override == null and env.get("ZIG_LIB_DIR") == null;
     if (!(trusted_lib and toolUnchanged(io, runner_path, stamp_path))) {
         try compileTool(init, runner_dir, &.{
-            "zap",           "build-exe",
-            mode,            try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/Maker.zig", .{zig_lib_dir}),
-            "--name",        "maker",
-            "--zig-lib-dir", zig_lib_dir,
-            "--cache-dir",   global,
+            "bs",                 "build-exe",
+            mode,                 try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/Maker.zig", .{zig_lib_dir}),
+            "--name",             "maker",
+            "--zig-lib-dir",      zig_lib_dir,
+            "--cache-dir",        global,
             "--global-cache-dir", global,
         }, "Compiling build runner", "build runner", try std.fmt.allocPrint(arena, "{s}/compiler/Maker.zig", .{zig_lib_dir}), null);
         noteTool(io, runner_path, stamp_path);
@@ -80,7 +80,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     main.fatal("the following command failed to execve with '{t}':\n{s}", .{ err, try std.mem.join(arena, " ", argv.items) });
 }
 
-/// Compiles one of upstream's programs that zap runs (the build runner,
+/// Compiles one of upstream's programs that bs runs (the build runner,
 /// translate-c) with `compile_args`, from `dir`, where its binary goes.
 /// `root_dir` is the root module's directory if not the root file's.
 pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []const []const u8, progress: []const u8, what: []const u8, root: []const u8, root_dir: ?[]const u8) !void {
@@ -102,9 +102,9 @@ pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []cons
             .ok => {},
             .errors => |diags| {
                 main.printDiagnostics(io, diags, .text) catch {};
-                main.fatal("zap could not compile the {s} ({s})", .{ what, root });
+                main.fatal("bs could not compile the {s} ({s})", .{ what, root });
             },
-            .failed => main.fatal("zap could not link the {s} ({s})", .{ what, root }),
+            .failed => main.fatal("bs could not link the {s} ({s})", .{ what, root }),
         }
     }
     try std.process.setCurrentPath(io, cwd);

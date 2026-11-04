@@ -1,7 +1,7 @@
-//! `zap fmt`: upstream's `zig fmt`, copied unchanged from upstream 0.17.1's
+//! `bs fmt`: upstream's `zig fmt`, copied unchanged from upstream 0.17.1's
 //! src/fmt.zig, so that `zig build` fmt steps (`b.addFmt`) run under
-//! `zap build`. Copyright (c) Zig contributors. MIT licensed (see
-//! upstream/LICENSE).
+//! `bs build`. Copyright (c) Zig contributors. MIT licensed (see
+//! LICENSE-ZIG).
 
 const std = @import("std");
 const Io = std.Io;

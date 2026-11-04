@@ -1,6 +1,6 @@
 //! exit: 0
 //! stdout: "476\n6\n6765\n55\n258\n55\n18\n28739\n1228\n606\n179668\n88\n582\n708\n710\n11200\n"
-// Comptime calls repeated often enough for zap's comptime evaluator to run
+// Comptime calls repeated often enough for bs's comptime evaluator to run
 // them from lowered IR instead of the ZIR walker; the results must be the
 // walker's (and upstream's).
 const rt = @import("rt.zig");

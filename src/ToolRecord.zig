@@ -1,5 +1,5 @@
-//! The records of outputs zap makes with upstream's tools (translate-c's
-//! Zig files, Clang's objects): `<local cache>/zap/tc/<key>` lists every
+//! The records of outputs bs makes with upstream's tools (translate-c's
+//! Zig files, Clang's objects): `<local cache>/bs/tc/<key>` lists every
 //! file the tool read (from its `-MD` depfile) with its stat and content
 //! hash, and the output's hash; the output is `<local cache>/o/<key>/`.
 //! The key covers the tool, its arguments and the source path, not the
@@ -54,7 +54,7 @@ fn entry(st: Io.File.Stat, hash: cache.Hash, path_len: usize, start_ns: i96) Ent
 /// A record's key: the tool that makes the output (`tool_id`: upstream
 /// zig's identity for Clang, the binary's content hash for translate-c),
 /// the working directory, the zig lib directory and the arguments, which
-/// end with the source. Not zap's identity: zap only chooses the
+/// end with the source. Not bs's identity: bs only chooses the
 /// arguments, and everything else the tool reads is a recorded file,
 /// checked by content.
 pub fn key(gpa: std.mem.Allocator, io: Io, kind: []const u8, tool_id: []const u8, lib: []const u8, args: []const []const u8) !cache.Hash {

@@ -31,7 +31,7 @@
 //! by the build's `commit`; live entries move to young packs and old packs
 //! fall out of use.
 //!
-//! The global cache's ZIR (`<global cache>/zap/zir/<32 hex>`, every
+//! The global cache's ZIR (`<global cache>/bs/zir/<32 hex>`, every
 //! project's, `Frontend`) counts and goes with the packs: each file is a
 //! candidate by its mtime, which a build that maps it renews daily.
 //!
@@ -50,7 +50,7 @@ const Hash = cache.Hash;
 
 const Store = @This();
 
-/// `<global cache>/zap/store`.
+/// `<global cache>/bs/store`.
 dir: Io.Dir,
 /// Newest first.
 packs: []PackFile,
@@ -60,7 +60,7 @@ opened: Io.Timestamp,
 forward: std.ArrayList(Forward) = .empty,
 /// `commit` evicts the least recently used packs while they total more.
 max_bytes: u64 = cache.default_max_bytes,
-/// The size of the packs `open` found but could not read: another zap's
+/// The size of the packs `open` found but could not read: another bs's
 /// format, or damaged. They count toward `max_bytes` too.
 other_bytes: u64 = 0,
 forward_mutex: Io.Mutex = .init,
@@ -228,9 +228,9 @@ fn nameOf(id: Hash) PackName {
     return name;
 }
 
-/// Maps every pack in `<global_cache>/zap/store`.
+/// Maps every pack in `<global_cache>/bs/store`.
 pub fn open(gpa: Allocator, io: Io, global_cache: Io.Dir) !Store {
-    const dir = try global_cache.createDirPathOpen(io, "zap/store", .{ .open_options = .{ .iterate = true } });
+    const dir = try global_cache.createDirPathOpen(io, "bs/store", .{ .open_options = .{ .iterate = true } });
     errdefer dir.close(io);
     var others: std.ArrayList(OtherPack) = .empty;
     defer others.deinit(gpa);
@@ -240,10 +240,10 @@ pub fn open(gpa: Allocator, io: Io, global_cache: Io.Dir) !Store {
     return .{ .dir = dir, .packs = packs, .opened = Io.Clock.real.now(io), .other_bytes = other_bytes };
 }
 
-/// A pack that `openPack` cannot read: written by a zap whose pack format
+/// A pack that `openPack` cannot read: written by a bs whose pack format
 /// differs (which may still use it), or damaged. Maintenance counts it
 /// toward the size limit and deletes it by its mtime, as any other pack,
-/// but never because it is unreadable, so that two zap versions sharing
+/// but never because it is unreadable, so that two bs versions sharing
 /// a store do not delete each other's packs.
 const OtherPack = struct { name: [32 + pack_ext.len]u8, size: u64, mtime: Io.Timestamp };
 
@@ -1119,7 +1119,7 @@ test "entries round-trip through packs, are checked, copied forward, merged, and
         _ = try batch.put(gpa, 1000 + i, .{ .src_hash = 0, .result_hash = 0 });
         _ = try store.commit(gpa, io, (&batch)[0..1], null);
     }
-    var store_dir = try tmp.dir.openDir(io, "zap/store", .{ .iterate = true });
+    var store_dir = try tmp.dir.openDir(io, "bs/store", .{ .iterate = true });
     defer store_dir.close(io);
     try t.expectEqual(max_packs / 2, try countPacks(io, store_dir));
     {
@@ -1166,7 +1166,7 @@ test "merges leave large packs alone, and the size limit evicts the least recent
         // Distinct `order`s.
         try io.sleep(.fromMilliseconds(2), .awake);
     }
-    var store_dir = try tmp.dir.openDir(io, "zap/store", .{ .iterate = true });
+    var store_dir = try tmp.dir.openDir(io, "bs/store", .{ .iterate = true });
     defer store_dir.close(io);
     try t.expectEqual(max_packs / 2, try countPacks(io, store_dir));
     var big_name: PackName = undefined;
@@ -1222,8 +1222,8 @@ test "merges leave large packs alone, and the size limit evicts the least recent
     // The global cache's ZIR counts and goes with the packs, by mtime: an
     // hour-old file is evicted before the newer packs, and one unused for
     // `max_unused_ns` is trimmed. Its other files are not candidates.
-    try tmp.dir.createDirPath(io, "zap/zir");
-    var zd = try tmp.dir.openDir(io, "zap/zir", .{});
+    try tmp.dir.createDirPath(io, "bs/zir");
+    var zd = try tmp.dir.openDir(io, "bs/zir", .{});
     defer zd.close(io);
     const zir_old = "0123456789abcdef0123456789abcdef";
     const zir_new = "fedcba9876543210fedcba9876543210";
@@ -1247,9 +1247,9 @@ test "the store's limit holds for ZIR written by builds that commit nothing" {
     const t = std.testing;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var store_dir = try tmp.dir.createDirPathOpen(io, "zap/store", .{ .open_options = .{ .iterate = true } });
+    var store_dir = try tmp.dir.createDirPathOpen(io, "bs/store", .{ .open_options = .{ .iterate = true } });
     defer store_dir.close(io);
-    var zd = try tmp.dir.createDirPathOpen(io, "zap/zir", .{});
+    var zd = try tmp.dir.createDirPathOpen(io, "bs/zir", .{});
     defer zd.close(io);
     // No pack, so a commit's estimate sees nothing; 2 MiB of ZIR against a
     // 1.5 MiB limit, the older file written an hour ago.

@@ -4,7 +4,6 @@ const std = @import("std");
 const expectEqual = std.testing.expectEqual;
 const math = std.math;
 
-
 /// Convert degrees to radians.
 pub fn toRadians(degrees: anytype) @TypeOf(degrees) {
     const T = @TypeOf(degrees);

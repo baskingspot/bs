@@ -12,8 +12,8 @@ fn describe(c: Color) []const u8 {
 pub fn main() void {
     var raw: u8 = 2;
     _ = &raw;
-    const c: Color = @enumFromInt(raw);
-    const back: u8 = @intFromEnum(c);
+    const c: Color = @fromBackingInt(@intCast(raw));
+    const back: u8 = @backingInt(c);
     const parsed = std.meta.stringToEnum(Color, "green") orelse .red;
     std.debug.print("{s} {d} {s} {s}\n", .{ @tagName(c), back, describe(parsed), describe(c) });
 }

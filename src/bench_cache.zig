@@ -1,5 +1,5 @@
 //! Cache storage benchmark: `zig build bench-cache`. Builds a synthetic
-//! compilation the size docs/architecture.md targets (30k units, about 100k
+//! compilation the size docs/slop/architecture.md targets (30k units, about 100k
 //! Atoms shaped like bench-link's mixed set, 60k dependency nodes with 10
 //! dependencies per unit, 600 input files, 2000 error names), saves it as a
 //! manifest and pack, and times what rebuilds would do with them:
@@ -15,7 +15,7 @@
 //!   lookups as a project's first build would do them, maintenance, and
 //!   concurrent builds).
 //!
-//! Works in /tmp/zap-bench-cache, with a warm page cache.
+//! Works in /tmp/bs-bench-cache, with a warm page cache.
 
 const std = @import("std");
 const Io = std.Io;
@@ -37,7 +37,7 @@ const deps_per_unit = 10;
 const n_inputs = 600;
 const n_errors = 2000;
 const runs = 15;
-const work_path = "/tmp/zap-bench-cache";
+const work_path = "/tmp/bs-bench-cache";
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -493,8 +493,8 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
             for ([_]bool{ false, true }) |cross| {
                 if (cross and !shm_ok) continue;
                 const store_root = if (cross) shm: {
-                    Io.Dir.cwd().deleteTree(io, "/dev/shm/zap-bench-cache") catch {};
-                    break :shm try Io.Dir.cwd().createDirPathOpen(io, "/dev/shm/zap-bench-cache", .{});
+                    Io.Dir.cwd().deleteTree(io, "/dev/shm/bs-bench-cache") catch {};
+                    break :shm try Io.Dir.cwd().createDirPathOpen(io, "/dev/shm/bs-bench-cache", .{});
                 } else try work.createDirPathOpen(io, if (cross) "x" else "hl-store", .{});
                 const cdir = try work.createDirPathOpen(io, if (cross) "hl-c-cross" else "hl-c", .{});
                 var st: Store = try .open(gpa, io, store_root);
@@ -549,7 +549,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                     gpa.free(out);
                     relink.add(.{ ns(t0, t1), ns(t1, t2), 0, 0 });
                 }
-                if (cross) Io.Dir.cwd().deleteTree(io, "/dev/shm/zap-bench-cache") catch {};
+                if (cross) Io.Dir.cwd().deleteTree(io, "/dev/shm/bs-bench-cache") catch {};
                 print("  first build writing Atoms once ({s}): commit into the compilation dir and {s} {d:.0} ms; relink from it: gather {d:.2} ms, Elf.emitInput {d:.2} ms (same output)\n", .{
                     if (cross) "store on tmpfs" else "same file system", if (cross) "copy to the store" else "hard-link into the store", ms(t_keep), ms(relink.median(0)), ms(relink.median(1)),
                 });
@@ -595,7 +595,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
                 k, ms(open_s.median(0)), ms(get.median(0)) * 1000 / n_units, ms(miss.median(0)) * 1000 / n_units,
             });
             if (k == 8) {
-                const sdir = try kroot.openDir(io, "zap/store", .{ .iterate = true });
+                const sdir = try kroot.openDir(io, "bs/store", .{ .iterate = true });
                 t = now(io);
                 const r = try Store.maintain(gpa, io, sdir, .{ .trim = true, .now = Io.Clock.real.now(io) });
                 const trim = since(io, t);
@@ -605,7 +605,7 @@ fn benchStores(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, rand: s
             if (k == 64) {
                 // Trimming scans the packs; merging 57 of them takes the store
                 // back to 8.
-                const sdir = try kroot.openDir(io, "zap/store", .{ .iterate = true });
+                const sdir = try kroot.openDir(io, "bs/store", .{ .iterate = true });
                 t = now(io);
                 const r1 = try Store.maintain(gpa, io, sdir, .{ .trim = true, .now = Io.Clock.real.now(io) });
                 const trim = since(io, t);

@@ -1,7 +1,7 @@
 //! Semantic analysis: ZIR to InternPool types and values, and to typed IR
 //! for runtime function bodies.
 //!
-//! One `Sema` analyzes one analysis unit (see docs/architecture.md): a
+//! One `Sema` analyzes one analysis unit (see docs/slop/architecture.md): a
 //! declaration's value, a struct's layout, a `comptime` declaration, or a
 //! runtime function body. Everything a unit reads from another unit goes
 //! through `declareDependency`. Comptime code is evaluated by walking ZIR;
@@ -393,7 +393,7 @@ pub const Block = struct {
         /// Comptime arguments (`none` for runtime ones), for naming types
         /// the call returns.
         args: []const Index,
-                /// A runtime call of an inline function: returns break to this
+        /// A runtime call of an inline function: returns break to this
         /// block. Null for comptime calls.
         merges: ?*Merges = null,
         /// The runtime inline call this one is in, if any.
@@ -1084,7 +1084,7 @@ fn rootBlock(sema: *Sema, namespace: u32, src_base: Ast.Node.Index, is_comptime:
 }
 
 /// As upstream's `handleExternLibName`: a declaration from libc needs
-/// `-lc`, and zap links neither libc++ nor libunwind.
+/// `-lc`, and bs links neither libc++ nor libunwind.
 fn checkExternLibName(sema: *Sema, block: *Block, decl_src: Src, name: []const u8) CompileError!void {
     // `-lc++` also links libunwind, as upstream's executables do.
     const what = if (std.mem.eql(u8, name, "c"))
@@ -1956,7 +1956,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     const gpa = zcu.gpa;
     // Upstream builds compiler_rt and the fuzzer (`-ffuzz`; its module
     // family has a std of its own) in ReleaseFast: no safety checks, as in
-    // any module built in ReleaseFast or ReleaseSmall (`zap build`'s).
+    // any module built in ReleaseFast or ReleaseSmall (`bs build`'s).
     const module = zcu.file(nav.file).module;
     if (module == .compiler_rt or !zcu.fe.module(module).safety) block.want_safety = false;
 
@@ -2300,7 +2300,7 @@ fn validateArrayElemType(sema: *Sema, block: *Block, elem_src: Src, elem: Index)
 }
 
 fn failUnsupported(sema: *Sema, block: *Block, src: Src, what: []const u8) CompileError {
-    return sema.fail(block, src, "zap does not support {s} yet", .{what});
+    return sema.fail(block, src, "bs does not support {s} yet", .{what});
 }
 
 /// Notes call site `src` on the error a failed call reported (if it reported
@@ -2477,7 +2477,7 @@ fn depLoop(sema: *Sema, block: *Block, src: Src, err: CompileError) CompileError
 }
 
 /// Why a unit asks for a type's layout, for a dependency loop's error:
-/// upstream's `LayoutResolveReason`, where zap tells them apart.
+/// upstream's `LayoutResolveReason`, where bs tells them apart.
 pub const DepReason = enum {
     none,
     field,
@@ -2511,7 +2511,7 @@ pub const DepUnit = union(enum) {
     other,
 
     /// The same unit, or with `loose`, the same declaration's type or
-    /// value: zap resolves a declaration's type in its value's unit when
+    /// value: bs resolves a declaration's type in its value's unit when
     /// nothing asked for the type first.
     fn same(a: DepUnit, b: DepUnit, loose: bool) bool {
         if (std.meta.eql(a, b)) return a != .other;
@@ -3181,7 +3181,7 @@ fn addInst(sema: *Sema, block: *Block, inst: Ir.Inst) !Ref {
 /// and stores check where they are written; `addInst` is the backstop.
 fn checkAddressSpace(sema: *Sema, block: *Block, src: Src, as: std.lang.AddressSpace) CompileError!void {
     if (as == .generic or block.is_typeof) return;
-    return sema.fail(block, src, "zap does not support memory accesses through pointers in address space '{t}' yet", .{as});
+    return sema.fail(block, src, "bs does not support memory accesses through pointers in address space '{t}' yet", .{as});
 }
 
 fn addExtra(sema: *Sema, value: anytype) !u32 {
@@ -3277,7 +3277,7 @@ fn addPanic(sema: *Sema, block: *Block, id: PanicId, lhs: Ref, rhs: Ref) Compile
         .out_of_bounds => .{ "outOfBounds", &.{ lhs, rhs } },
         .start_greater_than_end => .{ "startGreaterThanEnd", &.{ lhs, rhs } },
         .sentinel_mismatch => .{ "sentinelMismatch", &.{ lhs, rhs } },
-        // zap tags an untagged union with an integer, which has no
+        // bs tags an untagged union with an integer, which has no
         // field names to report.
         .inactive_union_field => if (Type.class(sema.ip, sema.typeOf(lhs)) == .@"enum")
             .{ "inactiveUnionField", &.{ lhs, rhs } }
@@ -3315,15 +3315,15 @@ fn panicNamespace(sema: *Sema, block: *Block) CompileError!Index {
 const panic_handlers = blk: {
     const Params = enum { msg, generic2, err, len, len2, none };
     const list = .{
-        .{ "call", .msg },                     .{ "sentinelMismatch", .generic2 },     .{ "unwrapError", .err },
-        .{ "outOfBounds", .len2 },             .{ "startGreaterThanEnd", .len2 },      .{ "inactiveUnionField", .generic2 },
-        .{ "sliceCastLenRemainder", .len },    .{ "reachedUnreachable", .none },       .{ "unwrapNull", .none },
-        .{ "castToNull", .none },              .{ "incorrectAlignment", .none },       .{ "invalidErrorCode", .none },
-        .{ "unexpectedErrorCode", .err },      .{ "integerOutOfBounds", .none },       .{ "integerOverflow", .none },
-        .{ "shlOverflow", .none },             .{ "shrOverflow", .none },              .{ "divideByZero", .none },
-        .{ "exactDivisionRemainder", .none },  .{ "integerPartOutOfBounds", .none },   .{ "corruptSwitch", .none },
-        .{ "shiftRhsTooBig", .none },          .{ "invalidEnumValue", .none },         .{ "forLenMismatch", .none },
-        .{ "copyLenMismatch", .none },         .{ "memcpyAlias", .none },              .{ "noreturnReturned", .none },
+        .{ "call", .msg },                    .{ "sentinelMismatch", .generic2 },   .{ "unwrapError", .err },
+        .{ "outOfBounds", .len2 },            .{ "startGreaterThanEnd", .len2 },    .{ "inactiveUnionField", .generic2 },
+        .{ "sliceCastLenRemainder", .len },   .{ "reachedUnreachable", .none },     .{ "unwrapNull", .none },
+        .{ "castToNull", .none },             .{ "incorrectAlignment", .none },     .{ "invalidErrorCode", .none },
+        .{ "unexpectedErrorCode", .err },     .{ "integerOutOfBounds", .none },     .{ "integerOverflow", .none },
+        .{ "shlOverflow", .none },            .{ "shrOverflow", .none },            .{ "divideByZero", .none },
+        .{ "exactDivisionRemainder", .none }, .{ "integerPartOutOfBounds", .none }, .{ "corruptSwitch", .none },
+        .{ "shiftRhsTooBig", .none },         .{ "invalidEnumValue", .none },       .{ "forLenMismatch", .none },
+        .{ "copyLenMismatch", .none },        .{ "memcpyAlias", .none },            .{ "noreturnReturned", .none },
         .{ "loadUninstantiableType", .none },
     };
     var out: [list.len]struct { []const u8, Params } = undefined;
@@ -5521,12 +5521,12 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             if (sema.ip.keyTag(cap) == .nav_capture) {
                 // A captured declaration resolves when it is read.
                 const c = sema.ip.keyPayload(.nav_capture, cap);
-                const src = block.nodeSrc(@enumFromInt(@as(i32, @bitCast(ext.operand))));
+                const src = block.nodeSrc(@fromBackingInt(@intCast(@as(i32, @bitCast(ext.operand)))));
                 break :blk if (c.by_ref) sema.navRef(block, src, c.nav) else sema.navVal(block, src, c.nav);
             }
             if (sema.ip.keyTag(cap) == .runtime_capture) {
                 // Only its type is known; as upstream, only `@TypeOf` reads it.
-                const src = block.nodeSrc(@enumFromInt(@as(i32, @bitCast(ext.operand))));
+                const src = block.nodeSrc(@fromBackingInt(@intCast(@as(i32, @bitCast(ext.operand)))));
                 if (!block.is_typeof) {
                     // Outside any function: a type's field (a default, say).
                     if (sema.func == .none) {
@@ -5626,7 +5626,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 .clobbers => .fromInterned(.clobbers_type),
                 .calling_convention_c => .fromInterned(try sema.intern(.{ .calling_convention = .c })),
                 .calling_convention_inline => .fromInterned(try sema.intern(.{ .calling_convention = .@"inline" })),
-                .spirv_type_options => sema.fail(block, src, "zap does not support std.lang.{s}", .{@tagName(which)}),
+                .spirv_type_options => sema.fail(block, src, "bs does not support std.lang.{s}", .{@tagName(which)}),
                 else => sema.stdLangDecl(block, src, switch (which) {
                     .atomic_order => "AtomicOrder",
                     .atomic_rmw_op => "AtomicRmwOp",
@@ -5712,15 +5712,15 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             if (sema.func != .none) sema.disable_instrumentation = true;
             break :blk .void_value;
         },
-        // Intrinsics are not something zap emits.
+        // Intrinsics are not something bs emits.
         .disable_intrinsics => .void_value,
         .breakpoint => blk: {
-            const src = block.nodeSrc(@enumFromInt(@as(i32, @bitCast(ext.operand))));
+            const src = block.nodeSrc(@fromBackingInt(@intCast(@as(i32, @bitCast(ext.operand)))));
             if (block.is_comptime) return sema.fail(block, src, "encountered @breakpoint at comptime", .{});
             _ = try sema.addInst(block, .{ .tag = .breakpoint, .data = .{ .no_op = {} } });
             break :blk .void_value;
         },
-        // A prefetch is only a hint; zap's code does without it, as
+        // A prefetch is only a hint; bs's code does without it, as
         // upstream's Debug x86_64 backend may.
         .prefetch => blk: {
             const extra = sema.code.extraData(Zir.Inst.BinNode, ext.operand).data;
@@ -5874,7 +5874,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const operand = try sema.coerce(block, if (to_int) .anyerror_type else .u16_type, sema.resolveInst(extra.operand), src);
             // Comptime-known operands use this compilation's codes, which
             // the manifest keeps stable across rebuilds (see "Error codes"
-            // in docs/architecture.md).
+            // in docs/slop/architecture.md).
             if (sema.resolveValue(operand)) |v| if (!sema.isUndef(v)) {
                 const ip = sema.ip;
                 if (to_int) break :blk .fromInterned(try sema.intValue(.u16_type, try ip.errorValue(ip.keyPayload(.err, v).name)));
@@ -5916,7 +5916,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         },
         .builtin_src => sema.zirBuiltinSrc(block, ext),
         .compile_log => sema.zirCompileLog(block, ext),
-        // As upstream on targets other than WebAssembly (zap's Sema only
+        // As upstream on targets other than WebAssembly (bs's Sema only
         // analyzes for x86_64 so far).
         .wasm_memory_size => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.UnNode, ext.operand).data.node), "builtin @wasmMemorySize is available when targeting WebAssembly; targeted CPU architecture is {s}", .{"x86_64"}),
         .wasm_memory_grow => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.BinNode, ext.operand).data.node), "builtin @wasmMemoryGrow is available when targeting WebAssembly; targeted CPU architecture is {s}", .{"x86_64"}),
@@ -5951,7 +5951,7 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const module = fe.module(file.module);
     const root: []const u8 = module.abs_root_dir orelse
         std.Io.Dir.cwd().realPathFileAlloc(sema.zcu.fe.io, module.root_dir, sema.arena) catch |err|
-            return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
+        return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
     const dir = std.fs.path.dirname(file.sub_path) orelse "";
     const full = try std.fs.path.resolveAllocPosix(sema.arena, &.{ root, dir, name });
     if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
@@ -6283,7 +6283,7 @@ fn typeInfo(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!Index 
                 .{ "param_attrs", try sema.sliceValue(pattrs_ty, pattrs) },
             });
         },
-        else => return sema.fail(block, src, "zap does not support @typeInfo of '{f}' yet", .{sema.fmtType(ty)}),
+        else => return sema.fail(block, src, "bs does not support @typeInfo of '{f}' yet", .{sema.fmtType(ty)}),
     };
     return sema.unionValue(block, src, info_ty, if (class == .tuple) "struct" else @tagName(class), payload);
 }
@@ -6765,7 +6765,7 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
         // An extern function's, as `@extern` gives it.
         if (block.is_comptime and sema.ip.keyTag(nav.val) == .extern_func)
             return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .uav = .{ .val = nav.val, .orig_ty = ptr_ty } } } }));
-        if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
+        if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: bs resolves extern symbols at link time", .{});
         return sema.addInst(block, .{ .tag = if (nav.is_threadlocal) .extern_tls else .extern_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(nav.name) } } });
     }
     // Each thread has its own copy of a threadlocal variable, at an offset
@@ -6848,8 +6848,8 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     const name = try sema.resolveConstString(block, options_src, .fromInterned(name_val));
     if (name.len == 0) return sema.fail(block, if (src.nodeOffset()) |off| .{ .base = src.base, .loc = .{ .option_name = off } } else src, "exported symbol name cannot be empty", .{});
     const info = ip.structInfo(options_ty);
-    const linkage: std.lang.GlobalLinkage = @enumFromInt(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "linkage").?)).int).?);
-    const visibility: std.lang.SymbolVisibility = @enumFromInt(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "visibility").?)).int).?);
+    const linkage: std.lang.GlobalLinkage = @fromBackingInt(@intCast(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "linkage").?)).int).?));
+    const visibility: std.lang.SymbolVisibility = @fromBackingInt(@intCast(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "visibility").?)).int).?));
     const nav_index = switch (ip.keyPayload(.ptr, ptr_val).base) {
         .nav => |n| n,
         .uav => |v| {
@@ -6875,7 +6875,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
 }
 
 /// `@extern(T, .{ .name = ... })`: the address of a symbol defined
-/// elsewhere in the link. zap links everything it compiles into one static
+/// elsewhere in the link. bs links everything it compiles into one static
 /// executable, so the symbol is one of the compilation's exports; an
 /// undefined weak symbol is null. The address is a runtime value, read from
 /// a slot the link fills in (see `Emit.finish`).
@@ -6930,11 +6930,11 @@ fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
     // A thread-local's or a DLL import's address is not comptime-known,
     // as upstream's.
     if (block.is_comptime and (is_tls or dll_import)) if (block.comptime_reason) |r| return sema.failNeededComptime(block, src, r);
-    if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
+    if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: bs resolves extern symbols at link time", .{});
     return sema.addInst(block, .{ .tag = if (is_tls) .extern_tls else if (pcrel) .extern_pcrel else .extern_ptr, .data = .{ .ty_pl = .{ .ty = ty, .payload = @backingInt(try sema.getString(name)) } } });
 }
 
-// Atomics. x86_64 loads and stores are atomic for every ordering zap
+// Atomics. x86_64 loads and stores are atomic for every ordering bs
 // needs; stores, read-modify-writes, and cmpxchg use locked instructions,
 // which are sequentially consistent, so orderings are only validated.
 
@@ -7303,7 +7303,7 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
 // ZON imports
 //
 // Ported from upstream's src/Sema/LowerZon.zig.
-// Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
+// Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 /// `@import("x.zon")`: the file's value, of type `res_ty_ref` if it has one.
 /// The file is read like an `@embedFile`, so the importing unit depends on
@@ -7322,7 +7322,7 @@ fn importZon(sema: *Sema, block: *Block, src: Src, path: []const u8, dep: ?Front
         const module = sema.zcu.fe.module(file.module);
         const root: []const u8 = module.abs_root_dir orelse
             std.Io.Dir.cwd().realPathFileAlloc(sema.zcu.fe.io, module.root_dir, sema.arena) catch |err|
-                return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
+            return sema.fail(block, src, "unable to resolve module directory '{s}': {t}", .{ module.root_dir, err });
         const dir = std.fs.path.dirname(file.sub_path) orelse "";
         const full = try std.fs.path.resolveAllocPosix(sema.arena, &.{ root, dir, path });
         if (full.len <= root.len + 1 or !std.mem.startsWith(u8, full, root) or full[root.len] != '/')
@@ -7610,7 +7610,7 @@ const Zon = struct {
             .@"union" => {
                 try sema.resolveLayout(z.block, z.src, ty);
                 const info = ip.structInfo(ty);
-                if (info.layout == .@"packed") return z.fail(node, "zap does not support packed unions in ZON yet", .{});
+                if (info.layout == .@"packed") return z.fail(node, "bs does not support packed unions in ZON yet", .{});
                 const name, const field_node: ?Node = switch (node.get(z.zoir)) {
                     .enum_literal => |n| .{ n.get(z.zoir), null },
                     .struct_literal => |f| blk: {
@@ -7854,7 +7854,7 @@ fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.
 const TypeName = struct {
     /// Upstream's `@typeName`, as this creator gives it.
     name: Zcu.NameCandidate,
-    /// Stable key (see "Analysis units" in docs/architecture.md).
+    /// Stable key (see "Analysis units" in docs/slop/architecture.md).
     key: []const u8,
 };
 
@@ -7956,7 +7956,7 @@ fn anonTypeParent(sema: *Sema, block: *const Block, b: *print.TemplateBuilder) A
 
 /// The number in `<parent>__struct_<n>` of an anonymous type made by
 /// instruction `inst` in `block`. Upstream counts them in analysis order;
-/// zap numbers them from the declaration, as the key is, so that an edit
+/// bs numbers them from the declaration, as the key is, so that an edit
 /// above it does not rename the type, which nothing that reads its name
 /// would notice (a function of the type is loaded from the cache with its
 /// symbol name). The `comptime` blocks of a namespace share a parent name,
@@ -8135,7 +8135,7 @@ fn resolveAddressSpace(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileEr
     if (sema.isUndef(val)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
     const name = sema.enumTagName(val).?;
     const as = std.meta.stringToEnum(std.lang.AddressSpace, name).?;
-    // As `std.Target.supportsAddressSpace` for x86_64, zap's one Sema target.
+    // As `std.Target.supportsAddressSpace` for x86_64, bs's one Sema target.
     switch (as) {
         .generic, .gs, .fs, .ss => {},
         else => return sema.fail(block, src, "pointers with address space '{s}' are not supported on x86", .{name}),
@@ -8288,7 +8288,7 @@ fn addInferredErrors(sema: *Sema, block: *Block, src: Src, set: Index) CompileEr
 // ---------------------------------------------------------------------------
 // Coercion and peer type resolution
 
-/// The `std.lang.CallingConvention` named `name` (`.c`, `.auto`, ...): zap's
+/// The `std.lang.CallingConvention` named `name` (`.c`, `.auto`, ...): bs's
 /// `calling_convention` value for the conventions it has, otherwise std's
 /// union with default options, which a function declaration checks as
 /// upstream does before it reports the convention (`internCallconv`).
@@ -8330,7 +8330,7 @@ const Callconv = struct {
     stack_align: ?u64 = null,
 };
 
-/// The calling convention value `val` names: zap's `calling_convention`
+/// The calling convention value `val` names: bs's `calling_convention`
 /// value, or a value of std's `std.lang.CallingConvention` union (`.{
 /// .x86_64_sysv = .{ .incoming_stack_alignment = 32 } }`). Options other
 /// than `incoming_stack_alignment` are not supported.
@@ -8347,20 +8347,20 @@ fn callconvOf(sema: *Sema, block: *Block, src: Src, val: Index) CompileError!Cal
             const fv = try sema.fieldValue(u.val, @intCast(i));
             if (std.mem.eql(u8, ip.stringSlice(field_name), "incoming_stack_alignment")) {
                 if (ip.indexToKey(fv) == .opt and ip.keyPayload(.opt, fv).val != .none) cc.stack_align = ip.intValue(u64, ip.keyPayload(.opt, fv).val).?;
-            } else if (d == .none or fv != d) return sema.fail(block, src, "zap does not support options of calling convention '{s}' yet", .{name});
+            } else if (d == .none or fv != d) return sema.fail(block, src, "bs does not support options of calling convention '{s}' yet", .{name});
         }
     }
     return cc;
 }
 
-/// zap's calling convention for `cc` and its `FuncType.stack_align`, after
+/// bs's calling convention for `cc` and its `FuncType.stack_align`, after
 /// upstream's checks that do not depend on the function: the alignment is
 /// a power of two, the convention is the target's.
 fn internCallconv(sema: *Sema, block: *Block, src: Src, cc: Callconv) CompileError!struct { InternPool.CallingConvention, u7 } {
     const a = cc.stack_align orelse 0;
     if (cc.stack_align != null and !std.math.isPowerOfTwo(a))
         return sema.fail(block, src, "calling convention incoming stack alignment '{d}' is not a power of two", .{a});
-    const zap_cc: InternPool.CallingConvention = switch (cc.tag) {
+    const bs_cc: InternPool.CallingConvention = switch (cc.tag) {
         .auto => .auto,
         .naked => .naked,
         .@"inline" => .@"inline",
@@ -8369,7 +8369,7 @@ fn internCallconv(sema: *Sema, block: *Block, src: Src, cc: Callconv) CompileErr
         else => {
             // As upstream, a convention of another architecture is an
             // error, and so is one that upstream's own x86_64 backend does
-            // not support: zap supports the same ones.
+            // not support: bs supports the same ones.
             if (cc.tag != .async) {
                 const archs = std.Target.Cpu.Arch.fromCallingConvention(cc.tag);
                 if (std.mem.indexOfScalar(std.Target.Cpu.Arch, archs, .x86_64) == null) {
@@ -8381,10 +8381,10 @@ fn internCallconv(sema: *Sema, block: *Block, src: Src, cc: Callconv) CompileErr
             return sema.fail(block, src, "calling convention '{s}' not supported by compiler backend 'stage2_x86_64'", .{@tagName(cc.tag)});
         },
     };
-    return .{ zap_cc, if (cc.stack_align != null) @intCast(std.math.log2_int(u64, a) + 1) else 0 };
+    return .{ bs_cc, if (cc.stack_align != null) @intCast(std.math.log2_int(u64, a) + 1) else 0 };
 }
 
-/// The type a struct initializer with result type `ty` initializes: zap's
+/// The type a struct initializer with result type `ty` initializes: bs's
 /// `calling_convention_type`, which `callconv` expressions have as their
 /// result type, stands for std's `std.lang.CallingConvention` union, so
 /// `.{ .x86_64_sysv = .{} }` initializes that (`callconvOf`).
@@ -8464,8 +8464,7 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
                     last.hint = try std.fmt.allocPrint(arena, "return type '!{s}' lets the function return errors", .{source[loc.span.start..loc.span.end]});
                     last.fix = .{ .applicability = .maybe, .edits = try arena.dupe(@import("diag.zig").RawEdit, &.{.{ .start = loc.span.start, .end = loc.span.start, .text = "!" }}), .file = loc.file };
                 }
-            } else
-                try sema.zcu.addDeclNote(loc.file, loc.span, "function return type declared here", .{});
+            } else try sema.zcu.addDeclNote(loc.file, loc.span, "function return type declared here", .{});
         },
         .param => |p| if (p.func != .none) if (try sema.fnTypeExprSrc(p.func, p.index)) |loc|
             try sema.zcu.addDeclNote(loc.file, loc.span, "parameter type declared here", .{}),
@@ -12194,7 +12193,7 @@ fn foldConstAlloc(sema: *Sema, block: *Block, src: Src, alloc: Ir.Inst.Index) Co
 }
 
 /// Runtime pointer `ptr` into `alloc`, as a pointer into comptime alloc
-/// `id`; null for derivations zap does not replay.
+/// `id`; null for derivations bs does not replay.
 fn constAllocPtr(sema: *Sema, ptr: Ref, alloc: Ir.Inst.Index, id: u32) !?Index {
     const i = ptr.toIndex().?;
     const ty = sema.typeOf(ptr);
@@ -12435,7 +12434,7 @@ fn analyzeLoad(sema: *Sema, block: *Block, src: Src, ptr: Ref) CompileError!Ref 
 }
 
 /// The only value of zero-bit runtime type `ty`, as upstream: loads of it
-/// are comptime-known. Null for types zap does not fold (unions, enums).
+/// are comptime-known. Null for types bs does not fold (unions, enums).
 fn onePossibleValue(sema: *Sema, ty: Index) CompileError!?Index {
     const ip = sema.ip;
     switch (ip.indexToKey(ty)) {
@@ -12918,7 +12917,7 @@ fn comptimePtrRoot(sema: *Sema, ptr: Index) !PtrRoot {
 }
 
 /// Whether two comptime-known pointers into memory (not from integers)
-/// are equal, or null if zap cannot tell without their layouts.
+/// are equal, or null if bs cannot tell without their layouts.
 fn comptimePtrsEqual(sema: *Sema, a: InternPool.Ptr, b: InternPool.Ptr) ?bool {
     if (std.meta.eql(a.base, b.base) and a.byte_offset == b.byte_offset) return true;
     // Pointers into different allocations differ.
@@ -13177,7 +13176,7 @@ fn subArray(sema: *Sema, val: Index, start: u64, load_ty: Index) !Index {
 /// The value pointer `key` loads from root value `val`: `val` itself, or an
 /// element of array `val` that a pointer with a byte offset (from a
 /// many-pointer or a cast to the element type) addresses. Null if the
-/// pointer reinterprets memory in a way zap does not model.
+/// pointer reinterprets memory in a way bs does not model.
 fn loadAtOffset(sema: *Sema, val: Index, key: InternPool.Ptr, load_ty: Index) !?Index {
     const ip = sema.ip;
     if (val == .none) return val;
@@ -13334,7 +13333,7 @@ fn comptimeStore(sema: *Sema, block: *Block, src: Src, ptr: Index, val: Index) C
 
 /// The value at the root of pointer `ptr` (a comptime variable, an
 /// anonymous constant, or a declaration) and `ptr`'s byte offset in it, or
-/// null if a step of the pointer has no byte offset zap models.
+/// null if a step of the pointer has no byte offset bs models.
 fn ptrMemRoot(sema: *Sema, ptr: Index) ?struct { base: InternPool.Ptr.BaseAddr, offset: u64 } {
     const ip = sema.ip;
     var k = ip.keyPayload(.ptr, ptr);
@@ -14621,7 +14620,7 @@ fn ccSupportsVarArgs(tag: std.lang.CallingConvention.Tag) bool {
 }
 
 /// As upstream's `checkCallConvSupportsVarArgs`; the note lists x86_64's
-/// conventions, the only target zap generates code for so far.
+/// conventions, the only target bs generates code for so far.
 fn failVarArgsCc(sema: *Sema, block: *Block, src: Src, tag: std.lang.CallingConvention.Tag) CompileError {
     const err = sema.fail(block, src, "variadic function does not support '{s}' calling convention", .{@tagName(tag)});
     try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "supported calling conventions: 'x86_64_sysv', 'x86_64_x32', 'x86_64_win'", .{});
@@ -14650,7 +14649,7 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
             noalias_bits |= @as(u32, 1) << @intCast(i);
         }
     }
-    // `std.builtin.CallingConvention` by its tag, as zap's `fn` types know
+    // `std.builtin.CallingConvention` by its tag, as bs's `fn` types know
     // them (`.c` is `.x86_64_sysv`).
     const parsed_cc = try sema.callconvOf(block, src, try sema.structFieldValue(attrs, "callconv"));
     const is_var_args = try sema.structFieldValue(attrs, "varargs") == .bool_true;
@@ -14692,7 +14691,7 @@ fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) 
         try sema.validateAlign(block, sema.callArgSrc(src, false, 1), a);
         alignment = @intCast(std.math.log2_int(u64, a) + 1);
     }
-    // As upstream, any address space; runtime uses of one zap cannot
+    // As upstream, any address space; runtime uses of one bs cannot
     // lower fail where they happen (`addInst`).
     const as_val = ip.keyPayload(.opt, try sema.structFieldValue(attrs, "addrspace")).val;
     const address_space: std.lang.AddressSpace = if (as_val == .none) .generic else std.meta.stringToEnum(std.lang.AddressSpace, sema.enumTagName(as_val).?).?;
@@ -18713,7 +18712,7 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
             parsed_cc = switch (ip.indexToKey(v)) {
                 .calling_convention => try sema.callconvOf(block, cc_src, v),
                 // A value of std's own `std.lang.CallingConvention` union
-                // (e.g. a typed `const`), which zap models as a special
+                // (e.g. a typed `const`), which bs models as a special
                 // type.
                 .un => if (ip.typeOf(v) == (try sema.stdLangDecl(block, src, "CallingConvention")).toInterned().?)
                     try sema.callconvOf(block, cc_src, v)
@@ -18818,7 +18817,7 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         t.* = p.ty;
         if (p.is_comptime) {
             // Like upstream, only the first 32 parameters can be comptime.
-            if (k >= 32) return sema.fail(block, src, "zap does not support comptime parameters after the 32nd", .{});
+            if (k >= 32) return sema.fail(block, src, "bs does not support comptime parameters after the 32nd", .{});
             comptime_bits |= @as(u32, 1) << @intCast(k);
         }
     }
@@ -19780,7 +19779,7 @@ fn refersToComptimeAlloc(sema: *Sema, val: Index) bool {
 // A function the ZIR walker has run often enough at comptime is lowered
 // once to typed IR, the way its runtime body would be (with the few
 // differences below), and later comptime calls of it run that IR on
-// interned values instead of walking ZIR again. See docs/architecture.md,
+// interned values instead of walking ZIR again. See docs/slop/architecture.md,
 // "Comptime evaluator", for the design and the rules that keep its
 // results and errors those of the walker:
 //

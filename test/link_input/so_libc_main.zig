@@ -1,4 +1,4 @@
-//! Loads the shared library `zap build-lib -dynamic -lc` links from
+//! Loads the shared library `bs build-lib -dynamic -lc` links from
 //! so_libc.zig and so_libc.c.
 const std = @import("std");
 extern fn z_describe(v: c_int, out: [*]u8, len: usize) c_int;

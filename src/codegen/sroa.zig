@@ -1,4 +1,4 @@
-//! Scalar replacement of aggregates (docs/architecture.md, "Rewrite
+//! Scalar replacement of aggregates (docs/slop/architecture.md, "Rewrite
 //! rules"): a local struct whose address never escapes, used only through
 //! its fields' pointers and whole loads and stores, becomes one local per
 //! field, which CodeGen then keeps in registers. Inlining makes most of

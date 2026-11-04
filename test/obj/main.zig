@@ -1,8 +1,8 @@
 const std = @import("std");
 
-extern fn zap_add(a: u32, b: u32) u32;
-extern fn zap_call_c(x: u32) u32;
-extern fn zap_overflow(x: u8) u8;
+extern fn bs_add(a: u32, b: u32) u32;
+extern fn bs_call_c(x: u32) u32;
+extern fn bs_overflow(x: u8) u8;
 extern var shared: u64;
 
 export fn c_twice(x: u32) u32 {
@@ -11,9 +11,9 @@ export fn c_twice(x: u32) u32 {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len > 1) _ = zap_overflow(10);
+    if (args.len > 1) _ = bs_overflow(10);
     var buf: [64]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &buf);
-    try out.interface.print("{d} {d} {d}\n", .{ zap_add(5, 1), shared, zap_call_c(20) });
+    try out.interface.print("{d} {d} {d}\n", .{ bs_add(5, 1), shared, bs_call_c(20) });
     try out.interface.flush();
 }

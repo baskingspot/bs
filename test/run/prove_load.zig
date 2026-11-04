@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: index out of bounds: index 1, len 1\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): a load is the
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): a load is the
 //! value the variable held where it runs. `v +%= 1` reads `v` before the
 //! store; read as `v`'s later value, `v + 1` would be `v` itself and
 //! `j <= a.len` would prove `j < a.len`.

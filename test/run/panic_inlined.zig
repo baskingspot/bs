@@ -13,7 +13,7 @@
 // A panic in functions the backend inlines into `main` (`leaf`, `upper`,
 // `top`), through Sema's inline call of `middle`: the stack trace has the
 // frames of the uninlined calls, as upstream's, which `zig build test`
-// also compares with zap's trace of the program built without inlining.
+// also compares with bs's trace of the program built without inlining.
 // Upstream folds `middle` into `upper`'s frame, which keeps `upper`'s
 // call's line under `middle`'s name.
 const std = @import("std");

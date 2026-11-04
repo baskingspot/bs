@@ -1,4 +1,4 @@
-// SysV aggregates between C and Zig (build.zig, "zap build-exe with C
+// SysV aggregates between C and Zig (build.zig, "bs build-exe with C
 // aggregates"): each value is checked on the receiving side, so a wrong
 // register or eightbyte shows as a wrong line.
 #include <stdarg.h>

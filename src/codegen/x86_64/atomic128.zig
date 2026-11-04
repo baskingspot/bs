@@ -9,7 +9,7 @@
 //! rdx:rax. A load is a cmpxchg16b of zero with zero, a store and every
 //! `@atomicRmw` a cmpxchg16b loop (upstream lowers the read-modify-write
 //! operations the same way; its 0.17.0 backend fails on 128-bit loads and
-//! stores, where zap does what LLVM does).
+//! stores, where bs does what LLVM does).
 //!
 //! These instructions are clobber points (`CodeGen.clobbers`), so the
 //! caller-saved registers are free. rbx is callee-saved and may hold a

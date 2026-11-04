@@ -5,7 +5,7 @@ pub const llvm_has_csky: bool = false;
 pub const llvm_has_arc: bool = false;
 pub const llvm_has_xtensa: bool = false;
 pub const debug_gpa: bool = false;
-pub const @"src.dev.Env" = enum (u4) {
+pub const @"src.dev.Env" = enum(u4) {
     bootstrap = 0,
     core = 1,
     full = 2,
@@ -24,12 +24,12 @@ pub const @"src.dev.Env" = enum (u4) {
     spork8 = 15,
 };
 pub const dev: @"src.dev.Env" = .full;
-pub const @"build.IoMode" = enum (u1) {
+pub const @"build.IoMode" = enum(u1) {
     threaded = 0,
     evented = 1,
 };
 pub const io_mode: @"build.IoMode" = .threaded;
-pub const @"build.ValueInterpretMode" = enum (u1) {
+pub const @"build.ValueInterpretMode" = enum(u1) {
     direct = 0,
     by_name = 1,
 };

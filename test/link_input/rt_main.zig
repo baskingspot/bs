@@ -1,4 +1,4 @@
-//! Calls test/link_input/rt.c, whose compiler_rt references zap resolves
+//! Calls test/link_input/rt.c, whose compiler_rt references bs resolves
 //! as upstream does (build.zig, `addLinkInputTests`).
 const std = @import("std");
 extern fn rt_widen(d: f64) f128;

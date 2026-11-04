@@ -1,4 +1,4 @@
-//! Removing checks that facts prove (docs/architecture.md, "Proving
+//! Removing checks that facts prove (docs/slop/architecture.md, "Proving
 //! checks"), as Go's `prove`: one walk over a function's IR that keeps the
 //! comparisons known to hold at each point, from the branches that lead
 //! there and from the checks already passed, and turns a safety check
@@ -13,7 +13,7 @@
 //! version that changes at each store, at each loop entry (a later store
 //! in the loop reaches the loop's start), and after each merge of paths
 //! that stored it. A `*const` alloc is the value stored to it, and
-//! `slice_len` of equal slices are equal. `ZAP_PROVE=off` turns the pass
+//! `slice_len` of equal slices are equal. `BS_PROVE=off` turns the pass
 //! off. Each rule says next to it why it holds.
 //!
 //! Proven: compares (bounds checks `i < len`, `start <= end`) from facts on
@@ -233,7 +233,7 @@ fn classify(ip: *const InternPool, ir: *const Ir, kind: []Kind) void {
                 else => k.*,
             };
         },
-        else => Ssa.forEachOperand(ir, @enumFromInt(i), e),
+        else => Ssa.forEachOperand(ir, @fromBackingInt(@intCast(i)), e),
     };
     for (kind) |*k| if (k.* == .stored_once) {
         k.* = .constant;

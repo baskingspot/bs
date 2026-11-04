@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Differential miscompile hunter for zap (see tools/mchunt/README.md).
+"""Differential miscompile hunter for bs (see tools/mchunt/README.md).
 
 Generates random well-defined Zig programs (gen.py), compiles each with
-upstream zig 0.17.1 (Debug, the oracle) and with zap in several
+upstream zig 0.17.1 (Debug, the oracle) and with bs in several
 configurations, runs them, and compares what they print and how they
 exit. A mismatch is triaged (upstream ReleaseSafe as a second oracle,
 pass toggles), saved under .work/found/, and minimized (reduce.py).
 
     python3 tools/mchunt/hunt.py                  # hunt until interrupted
-    python3 tools/mchunt/hunt.py --hours 3 --follow   # rebuild zap when origin/main moves
+    python3 tools/mchunt/hunt.py --hours 3 --follow   # rebuild bs when origin/main moves
 """
 
 import argparse
@@ -34,13 +34,13 @@ def log(msg):
 
 
 def classify(up, res):
-    """Names the finding for a mismatch, or None when every zap
+    """Names the finding for a mismatch, or None when every bs
     configuration agrees with upstream."""
-    bad = sorted(n for n, o in res.items() if n.startswith("zap") and o.key() != up.key())
+    bad = sorted(n for n, o in res.items() if n.startswith("bs") and o.key() != up.key())
     if not bad:
         return None, bad
     safe = res.get("zig-safe")
-    zd = res.get("zap")
+    zd = res.get("bs")
     if safe is not None and safe.compiled() and safe.key() != up.key():
         # Upstream disagrees with itself: Debug (x86_64 backend) against
         # ReleaseSafe (LLVM).
@@ -48,9 +48,9 @@ def classify(up, res):
             return "upstream-debug-bug", bad
         return "oracle-split", bad
     if any(res[n].status == "compile-crash" for n in bad):
-        return "zap-crash", bad
+        return "bs-crash", bad
     if any(res[n].status in ("compile-error", "compile-timeout") for n in bad):
-        return "zap-reject", bad
+        return "bs-reject", bad
     return "miscompile", bad
 
 
@@ -110,7 +110,7 @@ def save_finding(seed, text, tools, up, res, cls, bad, sig):
     with open(os.path.join(d, "orig.zig"), "w") as f:
         f.write(text)
     meta = {
-        "seed": seed, "class": cls, "bad": bad, "sig": sig, "zap": tools.zap, "zap_rev": zap_rev(tools.zap),
+        "seed": seed, "class": cls, "bad": bad, "sig": sig, "bs": tools.bs, "bs_rev": bs_rev(tools.bs),
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "outcomes": {"zig": up.to_json(), **{n: o.to_json() for n, o in res.items()}},
     }
@@ -119,11 +119,11 @@ def save_finding(seed, text, tools, up, res, cls, bad, sig):
     return d
 
 
-def zap_rev(path):
-    """The commit a zap binary was built from, when it came from
-    `build_zap` (.work/zap/<sha>/bin/zap); else the checkout's HEAD."""
+def bs_rev(path):
+    """The commit a bs binary was built from, when it came from
+    `build_bs` (.work/bs/<sha>/bin/bs); else the checkout's HEAD."""
     parts = path.split(os.sep)
-    if "zap" in parts and len(parts) >= 3 and parts[-2] == "bin":
+    if "bs" in parts and len(parts) >= 3 and parts[-2] == "bin":
         cand = parts[-3]
         if len(cand) == 40:
             return cand
@@ -133,11 +133,11 @@ def zap_rev(path):
         return "?"
 
 
-def build_zap(sha):
-    """Builds zap at `sha` (ReleaseFast) in a worktree under .work and
+def build_bs(sha):
+    """Builds bs at `sha` (ReleaseFast) in a worktree under .work and
     returns the binary's path. Cached per commit."""
-    dest = os.path.join(H.WORK, "zap", sha)
-    binp = os.path.join(dest, "bin", "zap")
+    dest = os.path.join(H.WORK, "bs", sha)
+    binp = os.path.join(dest, "bin", "bs")
     if os.path.exists(binp):
         return binp
     tree = os.path.join(H.WORK, "tree")
@@ -149,11 +149,11 @@ def build_zap(sha):
     up = os.path.join(H.REPO_DIR, "upstream")
     if os.path.exists(up) and not os.path.exists(os.path.join(tree, "upstream")):
         os.symlink(os.path.realpath(up), os.path.join(tree, "upstream"))
-    log(f"building zap {sha[:10]} (ReleaseFast)")
+    log(f"building bs {sha[:10]} (ReleaseFast)")
     p = subprocess.run(["zig", "build", "-Doptimize=ReleaseFast", "--prefix", dest], cwd=tree,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if p.returncode != 0 or not os.path.exists(binp):
-        raise RuntimeError(f"building zap at {sha} failed:\n{p.stdout[-3000:]}")
+        raise RuntimeError(f"building bs at {sha} failed:\n{p.stdout[-3000:]}")
     return binp
 
 
@@ -174,7 +174,7 @@ def recheck_findings(tools):
         if not os.path.exists(mp):
             continue
         meta = json.load(open(mp))
-        if meta.get("fixed_in") or meta["class"] not in ("miscompile", "zap-crash", "zap-reject"):
+        if meta.get("fixed_in") or meta["class"] not in ("miscompile", "bs-crash", "bs-reject"):
             continue
         prog = os.path.join(d, "reduced.zig") if os.path.exists(os.path.join(d, "reduced.zig")) else os.path.join(d, "orig.zig")
         scratch = H.new_scratch()
@@ -186,7 +186,7 @@ def recheck_findings(tools):
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
         if not still:
-            meta["fixed_in"] = zap_rev(tools.zap)
+            meta["fixed_in"] = bs_rev(tools.bs)
             json.dump(meta, open(mp, "w"), indent=1)
             log(f"{name}: fixed in {meta['fixed_in'][:10]}")
 
@@ -219,20 +219,20 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1), help="hunting workers")
     ap.add_argument("--reducers", type=int, default=1, help="concurrent reductions")
-    ap.add_argument("--zap", help="zap binary (default zig-out/bin/zap; with --follow, built from origin/main)")
+    ap.add_argument("--bs", help="bs binary (default zig-out/bin/bs; with --follow, built from origin/main)")
     ap.add_argument("--zig", help="upstream zig 0.17.1 (default: zig on PATH)")
     ap.add_argument("--seed", type=int, help="first seed (default: random)")
     ap.add_argument("--count", type=int, help="stop after this many programs")
     ap.add_argument("--hours", type=float, help="stop after this long")
     ap.add_argument("--size", type=float, default=1.0, help="program size factor")
     ap.add_argument("--follow", action="store_true",
-                    help="hunt with zap built from origin/main; rebuild and recheck findings whenever it moves")
+                    help="hunt with bs built from origin/main; rebuild and recheck findings whenever it moves")
     ap.add_argument("--no-reduce", action="store_true")
     ap.add_argument("--per-sig", type=int, default=2, help="reductions per finding signature")
     ap.add_argument("--one", type=int, help="check one seed and print its outcomes")
     args = ap.parse_args()
 
-    tools = H.Tools(args.zap, args.zig)
+    tools = H.Tools(args.bs, args.zig)
     if args.one is not None:
         rec = check(args.one, tools, args.size)
         print(json.dumps(rec, indent=1))
@@ -241,10 +241,10 @@ def main():
     current = None
     if args.follow:
         current = origin_main()
-        tools = H.Tools(build_zap(current), args.zig)
-    if not os.path.exists(tools.zap):
-        sys.exit(f"no zap at {tools.zap}: build it with `zig build -Doptimize=ReleaseFast` or pass --follow")
-    log(f"zap {tools.zap} ({zap_rev(tools.zap)[:10]}), zig {tools.zig}, {args.jobs} workers")
+        tools = H.Tools(build_bs(current), args.zig)
+    if not os.path.exists(tools.bs):
+        sys.exit(f"no bs at {tools.bs}: build it with `zig build -Doptimize=ReleaseFast` or pass --follow")
+    log(f"bs {tools.bs} ({bs_rev(tools.bs)[:10]}), zig {tools.zig}, {args.jobs} workers")
 
     import random
     seed = args.seed if args.seed is not None else random.randrange(1 << 40)
@@ -262,7 +262,7 @@ def main():
                 sha = origin_main()
                 if sha and sha != rebuilt["sha"]:
                     log(f"origin/main moved to {sha[:10]}")
-                    path = build_zap(sha)
+                    path = build_bs(sha)
                     t = H.Tools(path, args.zig)
                     with lock:
                         rebuilt["tools"], rebuilt["sha"] = t, sha
@@ -307,12 +307,12 @@ def main():
                 stats.add(rec)
                 if rec["result"] not in ("pass", "discard"):
                     log(f"seed {rec['seed']}: {rec['result']} {rec.get('sig', rec.get('why', ''))}")
-                if rec["result"] in ("miscompile", "zap-crash", "zap-reject") and not args.no_reduce:
+                if rec["result"] in ("miscompile", "bs-crash", "bs-reject") and not args.no_reduce:
                     n = sig_reduced.get(rec["sig"], 0)
                     if n < args.per_sig:
                         sig_reduced[rec["sig"]] = n + 1
                         import reduce as R
-                        reductions.add(red.submit(R.reduce_finding, rec["dir"], rebuilt["tools"].zap, tools.zig))
+                        reductions.add(red.submit(R.reduce_finding, rec["dir"], rebuilt["tools"].bs, tools.zig))
             if time.time() - last > 60:
                 last = time.time()
                 log(stats.line())

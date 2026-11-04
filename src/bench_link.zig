@@ -44,10 +44,10 @@ const n_data = 4_000;
 const n_bss = 1_000;
 const n_hot = 512;
 const runs = 15;
-const out_path = "/tmp/zap-bench-link.out";
+const out_path = "/tmp/bs-bench-link.out";
 /// Held for the whole run: two runs at once would write `out_path` under
 /// each other, and skew each other's timings.
-const lock_path = "/tmp/zap-bench-link.lock";
+const lock_path = "/tmp/bs-bench-link.lock";
 
 const n_imports = 64;
 

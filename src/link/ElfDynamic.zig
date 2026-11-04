@@ -1,8 +1,8 @@
-//! The dynamic sections of an x86_64 ELF shared object (`zap build-lib
+//! The dynamic sections of an x86_64 ELF shared object (`bs build-lib
 //! -dynamic`), which `Elf` lays out and writes when `Options.dynamic` is
 //! set: .dynsym, .dynstr, .hash, .gnu.hash, the .plt stubs, and .dynamic.
 //! See "Position-independent code and shared libraries" in
-//! docs/architecture.md.
+//! docs/slop/architecture.md.
 //!
 //! Everything here depends only on the exports' and imports' names, so it
 //! is built before layout; only the defined symbols' values, which need

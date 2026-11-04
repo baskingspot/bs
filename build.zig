@@ -4,25 +4,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // zap compiles the std library of exactly one Zig release. By default it
-    // uses the lib directory of the zig that builds zap, which `.agents/setup`
+    // bs compiles the std library of exactly one Zig release. By default it
+    // uses the lib directory of the zig that builds bs, which `.agents/setup`
     // pins to 0.17.1.
     const zig_lib_dir = b.option(
         []const u8,
         "zig-lib-dir",
-        "Default Zig 0.17.1 lib directory baked into zap (default: next to the building zig)",
+        "Default Zig 0.17.1 lib directory baked into bs (default: next to the building zig)",
     ) orelse defaultZigLibDir(b);
 
     const options = b.addOptions();
     options.addOption([]const u8, "zig_lib_dir", zig_lib_dir);
 
-    // `-Dsanitize-thread`: a ThreadSanitizer build of zap, for checking the
+    // `-Dsanitize-thread`: a ThreadSanitizer build of bs, for checking the
     // state CodeGen workers share with the Sema thread (see "Parallel
-    // function bodies" in docs/architecture.md). Build it with
+    // function bodies" in docs/slop/architecture.md). Build it with
     // -Doptimize=ReleaseFast, where libc's malloc is the allocator, which
     // ThreadSanitizer intercepts; std's SafeAllocator hands memory between
     // threads in ways it cannot see, and every reuse then looks like a race.
-    const sanitize_thread = b.option(bool, "sanitize-thread", "Build zap with ThreadSanitizer (use with -Doptimize=ReleaseFast)") orelse false;
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Build bs with ThreadSanitizer (use with -Doptimize=ReleaseFast)") orelse false;
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
     const build_web_wasm = buildWebWasm(b, zig_lib_dir);
     exe_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
 
-    const exe = b.addExecutable(.{ .name = "zap", .root_module = exe_mod });
+    const exe = b.addExecutable(.{ .name = "bs", .root_module = exe_mod });
     // Comptime evaluation recurses on the native stack: a 1000-deep
     // comptime recursion (the default branch quota) needs more than the
     // usual 8 MiB. Upstream links zig with the same size.
@@ -49,21 +49,21 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
-    b.step("run", "Run zap").dependOn(&run_cmd.step);
+    b.step("run", "Run bs").dependOn(&run_cmd.step);
 
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
-    // After zap, as one of its users (`spreadZapUsers`), so that it does
-    // not hold a worker when zap's users start.
+    // After bs, as one of its users (`spreadBsUsers`), so that it does
+    // not hold a worker when bs's users start.
     unit_tests.step.dependOn(&exe.step);
     takes(b, &unit_tests.step, 7);
-    const test_step = b.step("test", "Run zap's unit tests and run tests");
+    const test_step = b.step("test", "Run bs's unit tests and run tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     const upstream_step = b.step("test-upstream", "Run the run tests with upstream zig, the oracle");
     // A global cache holding the ZIR of the std files that every build
     // lowers, which the tests that need an empty global cache start from
     // instead of spending 5 s of CPU each on AstGen.
     const zir = b.addRunArtifact(exe);
-    zir.setName("zap: global cache with std's ZIR");
+    zir.setName("bs: global cache with std's ZIR");
     zir.addArgs(&.{ "build-exe", "-fno-emit-bin", "-target", "x86_64-linux" });
     zir.addFileArg(b.path("test/run/corpus.zig"));
     zir.addArg("--global-cache-dir");
@@ -73,9 +73,9 @@ pub fn build(b: *std.Build) void {
     const translate_c = addLinkInputTests(b, exe, test_step, std_zir);
     addDiagTests(b, exe, test_step, upstream_step, std_zir);
     const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);
-    spreadZapUsers(b, &exe.step, &zir.step, &.{ test_step, build_test_step });
+    spreadBsUsers(b, &exe.step, &zir.step, &.{ test_step, build_test_step });
 
-    // Always ReleaseFast: a Debug build of zap says nothing about its speed.
+    // Always ReleaseFast: a Debug build of bs says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
         .root_source_file = b.path("src/bench_link.zig"),
         .target = target,
@@ -97,25 +97,25 @@ pub fn build(b: *std.Build) void {
     bench_link_run.addPassthruArgs();
     b.step("bench-link", "Measure link throughput on ~100k synthetic atoms (args: elf (default) or macho)").dependOn(&bench_link_run.step);
 
-    // zap itself, ReleaseFast, generating every function of a build 10
-    // more times after analysis (`ZAP_BENCH_CODEGEN`).
-    const bench_zap_mod = b.createModule(.{
+    // bs itself, ReleaseFast, generating every function of a build 10
+    // more times after analysis (`BS_BENCH_CODEGEN`).
+    const bench_bs_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_zap_mod.addOptions("build_options", options);
-    bench_zap_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
-    bench_zap_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
-    const bench_zap = b.addExecutable(.{ .name = "zap", .root_module = bench_zap_mod });
-    bench_zap.stack_size = exe.stack_size;
-    const bench_codegen_run = b.addRunArtifact(bench_zap);
-    bench_codegen_run.setEnvironmentVariable("ZAP_BENCH_CODEGEN", "10");
+    bench_bs_mod.addOptions("build_options", options);
+    bench_bs_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
+    bench_bs_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
+    const bench_bs = b.addExecutable(.{ .name = "bs", .root_module = bench_bs_mod });
+    bench_bs.stack_size = exe.stack_size;
+    const bench_codegen_run = b.addRunArtifact(bench_bs);
+    bench_codegen_run.setEnvironmentVariable("BS_BENCH_CODEGEN", "10");
     bench_codegen_run.addArg("build-exe");
     bench_codegen_run.addFileArg(b.path("bench/workloads/hello/hello.zig"));
     bench_codegen_run.addArg("-fno-emit-bin");
     bench_codegen_run.has_side_effects = true;
-    b.step("bench-codegen", "Measure the backend per stage, per IR instruction, on the hello workload (others: ZAP_BENCH_CODEGEN=n zap build-exe ...)").dependOn(&bench_codegen_run.step);
+    b.step("bench-codegen", "Measure the backend per stage, per IR instruction, on the hello workload (others: BS_BENCH_CODEGEN=n bs build-exe ...)").dependOn(&bench_codegen_run.step);
 }
 
 /// Each `test/run/*.zig` program (other than the shared `rt.zig`) starts
@@ -130,7 +130,7 @@ pub fn build(b: *std.Build) void {
 ///                               for output with addresses, such as stack
 ///                               traces)
 ///   //! rebuild-without: "<zig string>"
-///                               zap first builds the program with the
+///                               bs first builds the program with the
 ///                               first occurrence of this text after the
 ///                               headers removed (repeatable: each text;
 ///                               `rebuild-replace: "<this>" "<earlier>"`
@@ -141,22 +141,22 @@ pub fn build(b: *std.Build) void {
 ///                               reusing its cache, and checks the last
 ///                               build. The first two edit builds compare
 ///                               themselves with full builds
-///                               (`ZAP_CACHE_VERIFY`, `ZAP_CACHE_CHECK`),
+///                               (`BS_CACHE_VERIFY`, `BS_CACHE_CHECK`),
 ///                               whose manifest then replaces theirs; the
 ///                               next three chain on the edit builds' own
 ///                               log, and only the last of them compares
 ///                               itself with a full build.
 ///   //! rebuild-lib-without: "<lib path>" "<zig string>"
-///                               the same edit in a file of zap's lib
+///                               the same edit in a file of bs's lib
 ///                               directory, of which the builds use a copy
 ///   //! donor-without: "<zig string>"
-///                               zap first builds the program without this
+///                               bs first builds the program without this
 ///                               text in another directory, then this one
 ///                               with an empty local cache and the same
 ///                               global cache, which replays the first as
 ///                               a donor; checks that it did, then builds
 ///                               it in full with the same error codes
-///                               (`ZAP_CACHE_VERIFY=full`), which compares
+///                               (`BS_CACHE_VERIFY=full`), which compares
 ///                               the nodes, and compares the outputs
 ///   //! donor-here-without: "<zig string>"
 ///                               the same, with the donor built at this
@@ -170,7 +170,7 @@ pub fn build(b: *std.Build) void {
 ///                               replace the program's path, which one of
 ///                               them names
 ///
-/// `test` builds each with zap and checks it; `test-upstream` does the same
+/// `test` builds each with bs and checks it; `test-upstream` does the same
 /// with upstream zig, so every program is checked against the oracle.
 /// A run test's `//! flags:` and its source: the path, unless the flags
 /// give `-M` modules, whose files become inputs instead.
@@ -185,10 +185,10 @@ fn addFlags(b: *std.Build, r: *std.Build.Step.Run, flags: []const []const u8, sr
     if (!modules) r.addFileArg(b.path(src_path));
 }
 
-fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
+fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const io = b.graph.io;
     const host = b.graph.host.result;
-    const host_runs_zap_output = host.cpu.arch == .x86_64 and host.os.tag == .linux;
+    const host_runs_bs_output = host.cpu.arch == .x86_64 and host.os.tag == .linux;
     // The headers are read here, while configuring.
     b.dependOnDirectoryContents(b.path("test/run"));
     var dir = b.root.openDir(io, "test/run", .{ .iterate = true }) catch |err|
@@ -314,35 +314,39 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 }
                 // Quiet unless a build fails: the checks print to stderr.
                 const target = if (expect.libc) "-target x86_64-linux-gnu -lc" else "-target x86_64-linux";
-                const zap_cmd = b.fmt("\"$5\" build-exe {s} \"$4.d/{s}\" -femit-bin=\"$4\"{s} 2>\"$4.d/log\" || {{ cat \"$4.d/log\" >&2; exit 1; }}", .{ target, file, lib_flag });
+                const bs_cmd = b.fmt("\"$5\" build-exe {s} \"$4.d/{s}\" -femit-bin=\"$4\"{s} 2>\"$4.d/log\" || {{ cat \"$4.d/log\" >&2; exit 1; }}", .{ target, file, lib_flag });
                 // With -lc, a relink from the manifest after the output is
                 // gone, which rebuilds the dynamic tables from abilists,
                 // must give a full build's bytes.
                 const relink_check = if (expect.libc) b.fmt(
                     \\
                     \\rm "$4"
-                    \\{[zap]s}
-                    \\ZAP_CACHE=off "$5" build-exe {[target]s} "$4.d/{[file]s}" -femit-bin="$4.d/full"
+                    \\{[bs]s}
+                    \\BS_CACHE=off "$5" build-exe {[target]s} "$4.d/{[file]s}" -femit-bin="$4.d/full"
                     \\cmp "$4" "$4.d/full" >&2
-                , .{ .zap = zap_cmd, .target = target, .file = file }) else "";
-                const r = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
-                    \\set -e
-                    \\mkdir -p "$4.d"
-                    \\cp "$3" "$4.d/rt.zig"
-                    \\{[setup]s}cp "$1" "$4.d/{[file]s}"
-                    \\{[lib_before]s}{[zap]s}
-                    \\cp "$2" "$4.d/{[file]s}"
-                    \\{[lib_after]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
-                    \\cp "$1" "$4.d/{[file]s}"
-                    \\{[lib_before]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
-                    \\cp "$2" "$4.d/{[file]s}"
-                    \\{[lib_after]s}ZAP_CACHE_CHECK=1 {[zap]s}
-                    \\cp "$1" "$4.d/{[file]s}"
-                    \\{[lib_before]s}ZAP_CACHE_CHECK=1 {[zap]s}
-                    \\cp "$2" "$4.d/{[file]s}"
-                    \\{[lib_after]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
-                    \\{[zap]s}{[relink_check]s}
-                , .{ .setup = lib_setup, .file = file, .lib_before = lib_before, .lib_after = lib_after, .zap = zap_cmd, .relink_check = relink_check }), "sh" });
+                , .{ .bs = bs_cmd, .target = target, .file = file }) else "";
+                const r = b.addSystemCommand(&.{
+                    "sh", "-c",
+                    b.fmt(
+                        \\set -e
+                        \\mkdir -p "$4.d"
+                        \\cp "$3" "$4.d/rt.zig"
+                        \\{[setup]s}cp "$1" "$4.d/{[file]s}"
+                        \\{[lib_before]s}{[bs]s}
+                        \\cp "$2" "$4.d/{[file]s}"
+                        \\{[lib_after]s}BS_CACHE_VERIFY=1 BS_CACHE_CHECK=1 {[bs]s}
+                        \\cp "$1" "$4.d/{[file]s}"
+                        \\{[lib_before]s}BS_CACHE_VERIFY=1 BS_CACHE_CHECK=1 {[bs]s}
+                        \\cp "$2" "$4.d/{[file]s}"
+                        \\{[lib_after]s}BS_CACHE_CHECK=1 {[bs]s}
+                        \\cp "$1" "$4.d/{[file]s}"
+                        \\{[lib_before]s}BS_CACHE_CHECK=1 {[bs]s}
+                        \\cp "$2" "$4.d/{[file]s}"
+                        \\{[lib_after]s}BS_CACHE_VERIFY=1 BS_CACHE_CHECK=1 {[bs]s}
+                        \\{[bs]s}{[relink_check]s}
+                    , .{ .setup = lib_setup, .file = file, .lib_before = lib_before, .lib_after = lib_after, .bs = bs_cmd, .relink_check = relink_check }),
+                    "sh",
+                });
                 r.addFileArg(before);
                 r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path("test/run/rt.zig"));
@@ -353,24 +357,28 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 // CodeGen resolves glibc's names to imports.
                 const static = "\"$5\" build-exe -target x86_64-linux";
                 const libc = "\"$5\" build-exe -target x86_64-linux-gnu -lc";
-                const r = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
-                    \\set -e
-                    \\rm -rf "$4.d"
-                    \\mkdir -p "$4.d/a"
-                    \\cp "$3" "$4.d/a/rt.zig"
-                    \\cp "$1" "$4.d/a/{[file]s}"
-                    \\log="$4.d/log"
-                    \\fail() {{ cat "$log" >&2; exit 1; }}
-                    \\nodonor() {{ if grep -q "replaying donor" "$log"; then echo "a build replayed a donor built with other libc settings" >&2; fail; fi; }}
-                    \\mkdir -p "$4.d/g1/zap" "$4.d/g2/zap"; cp -r "$6/zap/zir" "$4.d/g1/zap"; cp -r "$6/zap/zir" "$4.d/g2/zap"
-                    \\{[static]s} --global-cache-dir "$4.d/g1" --cache-dir "$4.d/l1" "$4.d/a/{[file]s}" -femit-bin="$4.d/s1" 2>"$4.d/log" || fail
-                    \\ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[libc]s} --global-cache-dir "$4.d/g1" --cache-dir "$4.d/l2" "$4.d/a/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
-                    \\nodonor
-                    \\{[libc]s} --global-cache-dir "$4.d/g2" --cache-dir "$4.d/l3" "$4.d/a/{[file]s}" -femit-bin="$4.d/c2" 2>"$4.d/log" || fail
-                    \\ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[static]s} --global-cache-dir "$4.d/g2" --cache-dir "$4.d/l4" "$4.d/a/{[file]s}" -femit-bin="$4.d/s2" 2>"$4.d/log" || fail
-                    \\nodonor
-                    \\"$4.d/s2" 2>"$4.d/log" || fail
-                , .{ .file = file, .static = static, .libc = libc }), "sh" });
+                const r = b.addSystemCommand(&.{
+                    "sh", "-c",
+                    b.fmt(
+                        \\set -e
+                        \\rm -rf "$4.d"
+                        \\mkdir -p "$4.d/a"
+                        \\cp "$3" "$4.d/a/rt.zig"
+                        \\cp "$1" "$4.d/a/{[file]s}"
+                        \\log="$4.d/log"
+                        \\fail() {{ cat "$log" >&2; exit 1; }}
+                        \\nodonor() {{ if grep -q "replaying donor" "$log"; then echo "a build replayed a donor built with other libc settings" >&2; fail; fi; }}
+                        \\mkdir -p "$4.d/g1/bs" "$4.d/g2/bs"; cp -r "$6/bs/zir" "$4.d/g1/bs"; cp -r "$6/bs/zir" "$4.d/g2/bs"
+                        \\{[static]s} --global-cache-dir "$4.d/g1" --cache-dir "$4.d/l1" "$4.d/a/{[file]s}" -femit-bin="$4.d/s1" 2>"$4.d/log" || fail
+                        \\BS_CACHE_TIMING=1 BS_CACHE_CHECK=1 {[libc]s} --global-cache-dir "$4.d/g1" --cache-dir "$4.d/l2" "$4.d/a/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
+                        \\nodonor
+                        \\{[libc]s} --global-cache-dir "$4.d/g2" --cache-dir "$4.d/l3" "$4.d/a/{[file]s}" -femit-bin="$4.d/c2" 2>"$4.d/log" || fail
+                        \\BS_CACHE_TIMING=1 BS_CACHE_CHECK=1 {[static]s} --global-cache-dir "$4.d/g2" --cache-dir "$4.d/l4" "$4.d/a/{[file]s}" -femit-bin="$4.d/s2" 2>"$4.d/log" || fail
+                        \\nodonor
+                        \\"$4.d/s2" 2>"$4.d/log" || fail
+                    , .{ .file = file, .static = static, .libc = libc }),
+                    "sh",
+                });
                 r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path("test/run/rt.zig"));
@@ -379,63 +387,67 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 const at = std.mem.indexOf(u8, source, text) orelse std.debug.panic("{s}: donor-without text not found", .{src_path});
                 const files = b.addWriteFiles();
                 const donor = files.add(file, b.fmt("{s}{s}", .{ source[0..at], source[at + text.len ..] }));
-                const zap_cmd = b.fmt("\"$5\" build-exe -target x86_64-linux --global-cache-dir \"$4.d/g\"", .{});
-                const r = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
-                    \\set -e
-                    \\rm -rf "$4.d"
-                    \\mkdir -p "$4.d/a" "$4.d/b"
-                    \\cp "$3" "$4.d/a/rt.zig"
-                    \\cp "$3" "$4.d/b/rt.zig"
-                    \\cp "$1" "$4.d/{[donor_dir]s}/{[file]s}"
-                    \\mkdir -p "$4.d/g/zap"; cp -r "$6/zap/zir" "$4.d/g/zap"
-                    \\log="$4.d/log"
-                    \\fail() {{ cat "$log" >&2; exit 1; }}
-                    \\{[zap]s} --cache-dir "$4.d/la" "$4.d/{[donor_dir]s}/{[file]s}" -femit-bin="$4.d/a/out" 2>"$4.d/log" || fail
-                    \\cp "$2" "$4.d/b/{[file]s}"
-                    \\ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lb" "$4.d/b/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
-                    \\grep -q "replaying donor" "$4.d/log" || {{ echo "no donor was replayed" >&2; fail; }}
-                    \\{[mode_check]s}
-                    \\cp "$4" "$4.d/replayed"
-                    \\ZAP_CACHE_VERIFY=full ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lb" "$4.d/b/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
-                    \\cmp "$4" "$4.d/replayed" >&2
-                    \\{[moved]s}
-                , .{
-                    .file = file,
-                    .zap = zap_cmd,
-                    .donor_dir = if (expect.donor_here) "b" else "a",
-                    // A donor at this path is replayed lazily; one
-                    // elsewhere names other absolute paths, so eagerly.
-                    .mode_check = if (expect.donor_here)
-                        \\grep -q "the walk reached" "$4.d/log" || { echo "the donor was not replayed lazily" >&2; fail; }
-                    else
-                        \\grep -q "replaying the donor eagerly" "$4.d/log" || { echo "the donor was not replayed eagerly" >&2; fail; }
-                    ,
-                    // Built by relative path from its own directory, the
-                    // donor in another directory is replayed lazily (a
-                    // worktree), and the log records this build's paths:
-                    // the next build finds nothing changed. It adds the
-                    // donor's missing code as new nodes, which link last,
-                    // so only the programs' output is compared.
-                    .moved = if (expect.donor_here) "" else b.fmt(
-                        \\set -- "$1" "$2" "$3" "$(realpath "$4")" "$(realpath "$5")"
-                        \\(cd "$4.d/a" && {[zap]s} --cache-dir "$4.d/la2" {[file]s} -femit-bin="$4.d/a/out2") 2>"$4.d/log" || fail
-                        \\mkdir -p "$4.d/c" && cp "$4.d/b/{[file]s}" "$4.d/b/rt.zig" "$4.d/c/"
-                        \\(cd "$4.d/c" && ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved") 2>"$4.d/log" || fail
-                        \\grep -q "the walk reached" "$4.d/log" || {{ echo "the moved program's donor was not replayed lazily" >&2; fail; }}
-                        \\(cd "$4.d/c" && ZAP_CACHE_TIMING=1 {[zap]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved") 2>"$4.d/log" || fail
-                        \\grep -q "no input changed" "$4.d/log" || {{ echo "the build after the moved program's first build found changes" >&2; fail; }}
-                        \\(cd "$4.d/c" && ZAP_CACHE_VERIFY=full ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved2") 2>"$4.d/log" || fail
-                        \\"$4.d/moved" >"$4.d/moved.out" 2>&1 || true
-                        \\"$4.d/moved2" >"$4.d/moved2.out" 2>&1 || true
-                        \\cmp "$4.d/moved.out" "$4.d/moved2.out" >&2
-                    , .{ .file = file, .zap = zap_cmd }),
-                }), "sh" });
+                const bs_cmd = b.fmt("\"$5\" build-exe -target x86_64-linux --global-cache-dir \"$4.d/g\"", .{});
+                const r = b.addSystemCommand(&.{
+                    "sh", "-c",
+                    b.fmt(
+                        \\set -e
+                        \\rm -rf "$4.d"
+                        \\mkdir -p "$4.d/a" "$4.d/b"
+                        \\cp "$3" "$4.d/a/rt.zig"
+                        \\cp "$3" "$4.d/b/rt.zig"
+                        \\cp "$1" "$4.d/{[donor_dir]s}/{[file]s}"
+                        \\mkdir -p "$4.d/g/bs"; cp -r "$6/bs/zir" "$4.d/g/bs"
+                        \\log="$4.d/log"
+                        \\fail() {{ cat "$log" >&2; exit 1; }}
+                        \\{[bs]s} --cache-dir "$4.d/la" "$4.d/{[donor_dir]s}/{[file]s}" -femit-bin="$4.d/a/out" 2>"$4.d/log" || fail
+                        \\cp "$2" "$4.d/b/{[file]s}"
+                        \\BS_CACHE_TIMING=1 BS_CACHE_CHECK=1 {[bs]s} --cache-dir "$4.d/lb" "$4.d/b/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
+                        \\grep -q "replaying donor" "$4.d/log" || {{ echo "no donor was replayed" >&2; fail; }}
+                        \\{[mode_check]s}
+                        \\cp "$4" "$4.d/replayed"
+                        \\BS_CACHE_VERIFY=full BS_CACHE_CHECK=1 {[bs]s} --cache-dir "$4.d/lb" "$4.d/b/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
+                        \\cmp "$4" "$4.d/replayed" >&2
+                        \\{[moved]s}
+                    , .{
+                        .file = file,
+                        .bs = bs_cmd,
+                        .donor_dir = if (expect.donor_here) "b" else "a",
+                        // A donor at this path is replayed lazily; one
+                        // elsewhere names other absolute paths, so eagerly.
+                        .mode_check = if (expect.donor_here)
+                            \\grep -q "the walk reached" "$4.d/log" || { echo "the donor was not replayed lazily" >&2; fail; }
+                        else
+                            \\grep -q "replaying the donor eagerly" "$4.d/log" || { echo "the donor was not replayed eagerly" >&2; fail; }
+                        ,
+                        // Built by relative path from its own directory, the
+                        // donor in another directory is replayed lazily (a
+                        // worktree), and the log records this build's paths:
+                        // the next build finds nothing changed. It adds the
+                        // donor's missing code as new nodes, which link last,
+                        // so only the programs' output is compared.
+                        .moved = if (expect.donor_here) "" else b.fmt(
+                            \\set -- "$1" "$2" "$3" "$(realpath "$4")" "$(realpath "$5")"
+                            \\(cd "$4.d/a" && {[bs]s} --cache-dir "$4.d/la2" {[file]s} -femit-bin="$4.d/a/out2") 2>"$4.d/log" || fail
+                            \\mkdir -p "$4.d/c" && cp "$4.d/b/{[file]s}" "$4.d/b/rt.zig" "$4.d/c/"
+                            \\(cd "$4.d/c" && BS_CACHE_TIMING=1 BS_CACHE_CHECK=1 {[bs]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved") 2>"$4.d/log" || fail
+                            \\grep -q "the walk reached" "$4.d/log" || {{ echo "the moved program's donor was not replayed lazily" >&2; fail; }}
+                            \\(cd "$4.d/c" && BS_CACHE_TIMING=1 {[bs]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved") 2>"$4.d/log" || fail
+                            \\grep -q "no input changed" "$4.d/log" || {{ echo "the build after the moved program's first build found changes" >&2; fail; }}
+                            \\(cd "$4.d/c" && BS_CACHE_VERIFY=full BS_CACHE_CHECK=1 {[bs]s} --cache-dir "$4.d/lc" {[file]s} -femit-bin="$4.d/moved2") 2>"$4.d/log" || fail
+                            \\"$4.d/moved" >"$4.d/moved.out" 2>&1 || true
+                            \\"$4.d/moved2" >"$4.d/moved2.out" 2>&1 || true
+                            \\cmp "$4.d/moved.out" "$4.d/moved2.out" >&2
+                        , .{ .file = file, .bs = bs_cmd }),
+                    }),
+                    "sh",
+                });
                 r.addFileArg(donor);
                 r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path("test/run/rt.zig"));
                 break :blk r;
             } else blk: {
-                const r = b.addRunArtifact(zap);
+                const r = b.addRunArtifact(bs);
                 r.addArgs(if (expect.libc) &.{ "build-exe", "-target", "x86_64-linux-gnu", "-lc" } else &.{ "build-exe", "-target", "x86_64-linux" });
                 addFlags(b, r, expect.flags.items, src_path);
                 break :blk r;
@@ -448,57 +460,60 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             }
             const bin = if (!upstream and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null or expect.donor_without != null or expect.donor_libc)) bin: {
                 const out = compile.addOutputFileArg(name);
-                compile.addArtifactArg(zap);
+                compile.addArtifactArg(bs);
                 compile.addDirectoryArg(std_zir);
                 break :bin out;
             } else compile.addPrefixedOutputFileArg("-femit-bin=", name);
             // CodeGen on worker threads gives the same output as on the
-            // Sema thread (`ZAP_THREADS`); checked on programs that use
+            // Sema thread (`BS_THREADS`); checked on programs that use
             // compiler_rt helpers, constants, error names and generics.
             if (!upstream and isThreadChecked(file)) {
-                compile.setEnvironmentVariable("ZAP_THREADS", "4");
-                compile.setEnvironmentVariable("ZAP_CACHE", "off");
-                const serial = b.addRunArtifact(zap);
-                serial.setName(b.fmt("compile {s} (ZAP_THREADS=1)", .{name}));
+                compile.setEnvironmentVariable("BS_THREADS", "4");
+                compile.setEnvironmentVariable("BS_CACHE", "off");
+                const serial = b.addRunArtifact(bs);
+                serial.setName(b.fmt("compile {s} (BS_THREADS=1)", .{name}));
                 serial.addArgs(&.{ "build-exe", "-target", "x86_64-linux" });
                 serial.addFileArg(b.path(src_path));
                 serial.addFileInput(b.path("test/run/rt.zig"));
-                serial.setEnvironmentVariable("ZAP_THREADS", "1");
-                serial.setEnvironmentVariable("ZAP_CACHE", "off");
+                serial.setEnvironmentVariable("BS_THREADS", "1");
+                serial.setEnvironmentVariable("BS_CACHE", "off");
                 const serial_bin = serial.addPrefixedOutputFileArg("-femit-bin=", name);
                 const same = b.addSystemCommand(&.{"cmp"});
-                same.setName(b.fmt("{s}: ZAP_THREADS=4 and 1 build the same", .{name}));
+                same.setName(b.fmt("{s}: BS_THREADS=4 and 1 build the same", .{name}));
                 same.addFileArg(bin);
                 same.addFileArg(serial_bin);
                 test_step.dependOn(&same.step);
             }
             // A panic in inlined code has the stack trace of the program
-            // built without inlining (docs/architecture.md, "Synthetic
+            // built without inlining (docs/slop/architecture.md, "Synthetic
             // panic frames"), addresses aside.
-            if (!upstream and host_runs_zap_output and isTraceChecked(file)) {
-                const plain = b.addRunArtifact(zap);
-                plain.setName(b.fmt("compile {s} (ZAP_INLINE=0)", .{name}));
+            if (!upstream and host_runs_bs_output and isTraceChecked(file)) {
+                const plain = b.addRunArtifact(bs);
+                plain.setName(b.fmt("compile {s} (BS_INLINE=0)", .{name}));
                 plain.addArgs(&.{ "build-exe", "-target", "x86_64-linux" });
                 plain.addFileArg(b.path(src_path));
-                plain.setEnvironmentVariable("ZAP_INLINE", "0");
-                plain.setEnvironmentVariable("ZAP_CACHE", "off");
+                plain.setEnvironmentVariable("BS_INLINE", "0");
+                plain.setEnvironmentVariable("BS_CACHE", "off");
                 const plain_bin = plain.addPrefixedOutputFileArg("-femit-bin=", name);
-                const same = b.addSystemCommand(&.{ "sh", "-c",
+                const same = b.addSystemCommand(&.{
+                    "sh", "-c",
                     \\set -e
                     \\mask() { sed -E 's/0x[0-9a-f]+/0x?/g; s/thread [0-9]+/thread ?/'; }
                     \\{ "$1" 2>&1 >/dev/null; } 2>/dev/null | mask >"$3.inlined" || true
                     \\{ "$2" 2>&1 >/dev/null; } 2>/dev/null | mask >"$3.plain" || true
                     \\diff "$3.plain" "$3.inlined" >&2
                     \\touch "$3"
-                , "sh" });
-                same.setName(b.fmt("{s}: the trace matches ZAP_INLINE=0's", .{name}));
+                    ,
+                    "sh",
+                });
+                same.setName(b.fmt("{s}: the trace matches BS_INLINE=0's", .{name}));
                 same.addFileArg(bin);
                 same.addFileArg(plain_bin);
                 _ = same.addOutputFileArg("trace");
                 test_step.dependOn(&same.step);
             }
-            if (!upstream and !host_runs_zap_output) {
-                // zap emits x86_64-linux executables; elsewhere only check
+            if (!upstream and !host_runs_bs_output) {
+                // bs emits x86_64-linux executables; elsewhere only check
                 // that they compile.
                 test_step.dependOn(&compile.step);
                 continue;
@@ -529,17 +544,17 @@ fn isThreadChecked(file: []const u8) bool {
 }
 
 /// Each `test/diag/*.zig` program is a compile error. It ends with a block
-/// of `//` comment lines giving zap's exact standard error:
+/// of `//` comment lines giving bs's exact standard error:
 ///
 ///   // error
 ///   // args: --error-format=json      (optional: more arguments)
 ///   // <expected stderr line>
 ///   // ...
 ///
-/// `test` runs `zap build-exe -fno-emit-bin <file>` from test/diag and
+/// `test` runs `bs build-exe -fno-emit-bin <file>` from test/diag and
 /// checks stderr and exit status 1; `test-upstream` checks that upstream
 /// zig rejects the program too.
-fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
+fn addDiagTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const io = b.graph.io;
     b.dependOnDirectoryContents(b.path("test/diag"));
     var dir = b.root.openDir(io, "test/diag", .{ .iterate = true }) catch |err|
@@ -583,7 +598,7 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
             expected.append(b.allocator, '\n') catch @panic("OOM");
         }
 
-        const run = b.addRunArtifact(zap);
+        const run = b.addRunArtifact(bs);
         run.setName(b.fmt("diag {s}", .{file}));
         run.setCwd(b.path("test/diag"));
         // An explicit target, so the expected diagnostics print on a Mac
@@ -592,7 +607,7 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
         var arg_it = std.mem.tokenizeScalar(u8, args, ' ');
         while (arg_it.next()) |a| run.addArg(a);
         run.addFileInput(b.path(src_path));
-        run.setEnvironmentVariable("ZAP_CACHE", "off");
+        run.setEnvironmentVariable("BS_CACHE", "off");
         run.addCheck(.{ .expect_stderr_exact = expected.items });
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
         takes(b, &run.step, 2);
@@ -602,24 +617,28 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
             // earlier version's build.
             const files = b.addWriteFiles();
             const before = files.add(file, text);
-            const edit = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
-                \\set -e
-                \\before=$(realpath "$1"); now=$(realpath "$2"); zap=$(realpath "$4")
-                \\mkdir -p "$3/g/zap"; cp -r "$5/zap/zir" "$3/g/zap"
-                \\cd "$3"
-                \\cp "$before" {[file]s}
-                \\"$zap" build-exe -target x86_64-linux {[file]s} -femit-bin=out --cache-dir l --global-cache-dir g{[args]s} 2>log || {{ cat log >&2; exit 2; }}
-                \\cp "$now" {[file]s}
-                \\exec "$zap" build-exe -target x86_64-linux {[file]s} -femit-bin=out --cache-dir l --global-cache-dir g{[args]s}
-            , .{ .file = file, .args = if (args.len == 0) "" else b.fmt(" {s}", .{args}) }), "sh" });
+            const edit = b.addSystemCommand(&.{
+                "sh", "-c",
+                b.fmt(
+                    \\set -e
+                    \\before=$(realpath "$1"); now=$(realpath "$2"); bs=$(realpath "$4")
+                    \\mkdir -p "$3/g/bs"; cp -r "$5/bs/zir" "$3/g/bs"
+                    \\cd "$3"
+                    \\cp "$before" {[file]s}
+                    \\"$bs" build-exe -target x86_64-linux {[file]s} -femit-bin=out --cache-dir l --global-cache-dir g{[args]s} 2>log || {{ cat log >&2; exit 2; }}
+                    \\cp "$now" {[file]s}
+                    \\exec "$bs" build-exe -target x86_64-linux {[file]s} -femit-bin=out --cache-dir l --global-cache-dir g{[args]s}
+                , .{ .file = file, .args = if (args.len == 0) "" else b.fmt(" {s}", .{args}) }),
+                "sh",
+            });
             edit.setName(b.fmt("diag {s} (edit build)", .{file}));
             edit.addFileArg(before);
             edit.addFileArg(b.path(src_path));
             _ = edit.addOutputDirectoryArg("edit");
-            edit.addArtifactArg(zap);
+            edit.addArtifactArg(bs);
             edit.addDirectoryArg(std_zir);
             // Every line but the reference traces, whose frames for units
-            // loaded green the edit build lacks (docs/architecture.md).
+            // loaded green the edit build lacks (docs/slop/architecture.md).
             var edit_lines = std.mem.splitScalar(u8, expected.items, '\n');
             while (edit_lines.next()) |line| {
                 if (line.len != 0 and !std.mem.startsWith(u8, line, "  ref: ")) edit.addCheck(.{ .expect_stderr_match = b.fmt("{s}\n", .{line}) });
@@ -638,15 +657,15 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
     }
 }
 
-/// `zap build-obj`: test/obj/lib.zig, linked into test/obj/main.zig by
+/// `bs build-obj`: test/obj/lib.zig, linked into test/obj/main.zig by
 /// upstream zig, run normally and into a panic in the object's code, whose
 /// stack trace needs the object's debug info, and edited through the cache
-/// as an object and a library (test/obj/cache.sh). `zap run`: test/obj/args.zig,
+/// as an object and a library (test/obj/cache.sh). `bs run`: test/obj/args.zig,
 /// whose arguments and exit status must pass through.
-fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
+fn addObjAndRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const host = b.graph.host.result;
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
-    const obj = b.addRunArtifact(zap);
+    const obj = b.addRunArtifact(bs);
     obj.addArg("build-obj");
     obj.addFileArg(b.path("test/obj/lib.zig"));
     const lib_o = obj.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
@@ -665,15 +684,15 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     panic.addArg("panic");
     panic.addCheck(.{ .expect_stderr_match = "panic: integer overflow\n" });
     panic.addCheck(.{ .expect_stderr_match = "lib.zig:25:14: 0x" });
-    panic.addCheck(.{ .expect_stderr_match = " in zap_overflow (lib.zig)\n    return x + 250;\n" });
-    panic.addCheck(.{ .expect_stderr_match = "main.zig:14:39: 0x" });
+    panic.addCheck(.{ .expect_stderr_match = " in bs_overflow (lib.zig)\n    return x + 250;\n" });
+    panic.addCheck(.{ .expect_stderr_match = "main.zig:14:38: 0x" });
     panic.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
     test_step.dependOn(&panic.step);
 
     // With -lc an object stays an ordinary one (its extern is not looked
     // up in glibc) but position-independent, as upstream's, which upstream
     // links into a -lc PIE.
-    const lc_obj = b.addRunArtifact(zap);
+    const lc_obj = b.addRunArtifact(bs);
     lc_obj.addArgs(&.{ "build-obj", "-lc", "-target", "x86_64-linux-gnu" });
     lc_obj.addFileArg(b.path("test/obj/lib.zig"));
     const lc_o = lc_obj.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
@@ -688,20 +707,20 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // Shared libraries that link glibc: lib.zig, whose c_twice the program
     // that loads it defines, and so_libc.zig with a C source, which call
     // glibc through versioned imports; upstream links the programs.
-    for ([_][]const u8{ "test/obj/lib.zig", "test/link_input/so_libc.zig" }, [_][]const u8{ "test/obj/main.zig", "test/link_input/so_libc_main.zig" }, [_][]const u8{ "zaplc", "so_libc" }) |lib_src, main_src, name| {
-        const lc_so = b.addRunArtifact(zap);
-        lc_so.setName(b.fmt("zap build-lib -dynamic -lc {s}", .{std.fs.path.basename(lib_src)}));
+    for ([_][]const u8{ "test/obj/lib.zig", "test/link_input/so_libc.zig" }, [_][]const u8{ "test/obj/main.zig", "test/link_input/so_libc_main.zig" }, [_][]const u8{ "bslc", "so_libc" }) |lib_src, main_src, name| {
+        const lc_so = b.addRunArtifact(bs);
+        lc_so.setName(b.fmt("bs build-lib -dynamic -lc {s}", .{std.fs.path.basename(lib_src)}));
         lc_so.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "--name", name });
         lc_so.addFileArg(b.path(lib_src));
         const with_c = std.mem.eql(u8, name, "so_libc");
         if (with_c) lc_so.addFileArg(b.path("test/link_input/so_libc.c"));
-        lc_so.setEnvironmentVariable("ZAP_ZIG", upstreamZig(b));
+        lc_so.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
         const lc_so_file = lc_so.addPrefixedOutputFileArg("-femit-bin=", b.fmt("lib{s}.so", .{name}));
         const lc_so_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
         lc_so_host.addFileArg(b.path(main_src));
         lc_so_host.addFileArg(lc_so_file);
         const lc_so_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
-        lc_so_run.setName(b.fmt("run {s} (zap shared library linking glibc)", .{std.fs.path.basename(main_src)}));
+        lc_so_run.setName(b.fmt("run {s} (bs shared library linking glibc)", .{std.fs.path.basename(main_src)}));
         lc_so_run.addFileArg(lc_so_file);
         lc_so_run.addFileArg(lc_so_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
         if (with_c) lc_so_run.addCheck(.{ .expect_stderr_exact = "z[c7:1]\nz[c42:2]\n" }) else lc_so_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
@@ -712,7 +731,7 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // The same object built -fPIC, linked by upstream into a static PIE
     // (which relaxes local-dynamic TLS) and into a shared object that a
     // dynamically linked program loads (which keeps it).
-    const pic = b.addRunArtifact(zap);
+    const pic = b.addRunArtifact(bs);
     pic.addArgs(&.{ "build-obj", "-fPIC" });
     pic.addFileArg(b.path("test/obj/lib.zig"));
     const pic_o = pic.addPrefixedOutputFileArg("-femit-bin=", "lib.o");
@@ -728,12 +747,12 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     const pie_panic = std.Build.Step.Run.create(b, "run obj main (-fPIC object in a PIE, panic)");
     pie_panic.addFileArg(pie_bin);
     pie_panic.addArg("panic");
-    pie_panic.addCheck(.{ .expect_stderr_match = " in zap_overflow (lib.zig)\n    return x + 250;\n" });
+    pie_panic.addCheck(.{ .expect_stderr_match = " in bs_overflow (lib.zig)\n    return x + 250;\n" });
     pie_panic.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
     test_step.dependOn(&pie_panic.step);
-    const so = b.addSystemCommand(&.{ upstreamZig(b), "build-lib", "-dynamic", "--name", "zappic" });
+    const so = b.addSystemCommand(&.{ upstreamZig(b), "build-lib", "-dynamic", "--name", "bspic" });
     so.addFileArg(pic_o);
-    const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libzappic.so");
+    const so_file = so.addPrefixedOutputFileArg("-femit-bin=", "libbspic.so");
     const host_exe = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
     host_exe.addFileArg(b.path("test/obj/main.zig"));
     host_exe.addFileArg(so_file);
@@ -747,11 +766,11 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     test_step.dependOn(&so_run.step);
     // As upstream's `Config.resolve`: a static library finds its `-l`
     // shared libraries and leaves them out; without `-static` linking one
-    // makes the library shared, which zap does not build yet.
+    // makes the library shared, which bs does not build yet.
     for ([_]bool{ true, false }) |static| {
-        const lsys = b.addSystemCommand(&.{ "sh", "-c", "set -e; z=$(realpath \"$1\") so=$(realpath \"$2\") src=$(realpath \"$4\"); cd \"$5\"; \"$z\" build-lib -L\"$(dirname \"$so\")\" -lzappic $3 -femit-bin=liblsys.a \"$src\"; ar t liblsys.a", "sh" });
-        lsys.setName(b.fmt("zap build-lib -lzappic{s}", .{if (static) " -static" else ""}));
-        lsys.addArtifactArg(zap);
+        const lsys = b.addSystemCommand(&.{ "sh", "-c", "set -e; z=$(realpath \"$1\") so=$(realpath \"$2\") src=$(realpath \"$4\"); cd \"$5\"; \"$z\" build-lib -L\"$(dirname \"$so\")\" -lbspic $3 -femit-bin=liblsys.a \"$src\"; ar t liblsys.a", "sh" });
+        lsys.setName(b.fmt("bs build-lib -lbspic{s}", .{if (static) " -static" else ""}));
+        lsys.addArtifactArg(bs);
         lsys.addFileArg(so_file);
         lsys.addArg(if (static) "-static" else "");
         lsys.addFileArg(b.path("test/obj/lib.zig"));
@@ -760,24 +779,24 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
             lsys.addCheck(.{ .expect_stdout_exact = "lib.o\n" });
             lsys.addCheck(.{ .expect_term = .{ .exited = 0 } });
         } else {
-            lsys.addCheck(.{ .expect_stderr_match = "zap does not link libraries into shared libraries yet ('-lzappic')" });
+            lsys.addCheck(.{ .expect_stderr_match = "bs does not link libraries into shared libraries yet ('-lbspic')" });
             lsys.addCheck(.{ .expect_term = .{ .exited = 1 } });
         }
         test_step.dependOn(&lsys.step);
     }
 
-    // The same library as zap's own shared object, loaded by a program
+    // The same library as bs's own shared object, loaded by a program
     // upstream links against it and by a C program with dlopen.
-    const zso = b.addRunArtifact(zap);
-    zso.addArgs(&.{ "build-lib", "-dynamic", "--name", "zapso" });
+    const zso = b.addRunArtifact(bs);
+    zso.addArgs(&.{ "build-lib", "-dynamic", "--name", "bsso" });
     zso.addFileArg(b.path("test/obj/lib.zig"));
-    const zso_file = zso.addPrefixedOutputFileArg("-femit-bin=", "libzapso.so");
+    const zso_file = zso.addPrefixedOutputFileArg("-femit-bin=", "libbsso.so");
     const zso_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
     zso_host.addFileArg(b.path("test/obj/main.zig"));
     zso_host.addFileArg(zso_file);
     const zso_host_bin = zso_host.addPrefixedOutputFileArg("-femit-bin=", "main");
     const zso_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
-    zso_run.setName("run obj main (zap shared object)");
+    zso_run.setName("run obj main (bs shared object)");
     zso_run.addFileArg(zso_file);
     zso_run.addFileArg(zso_host_bin);
     zso_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
@@ -786,7 +805,7 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     const dl_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
     dl_host.addFileArg(b.path("test/obj/dl.c"));
     const dl_bin = dl_host.addPrefixedOutputFileArg("-femit-bin=", "dl");
-    const dl_run = std.Build.Step.Run.create(b, "run dl.c (dlopen of zap shared object)");
+    const dl_run = std.Build.Step.Run.create(b, "run dl.c (dlopen of bs shared object)");
     dl_run.addFileArg(dl_bin);
     dl_run.addFileArg(zso_file);
     dl_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
@@ -795,7 +814,7 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
 
     // A -fPIE object with `main`, which upstream links into a static PIE:
     // std.pie relocates it, reading `_DYNAMIC` PC-relative before then.
-    const pie_main = b.addRunArtifact(zap);
+    const pie_main = b.addRunArtifact(bs);
     pie_main.addArgs(&.{ "build-obj", "-fPIE" });
     pie_main.addFileArg(b.path("test/obj/args.zig"));
     const pie_main_o = pie_main.addPrefixedOutputFileArg("-femit-bin=", "args.o");
@@ -813,14 +832,14 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // in an executable, initial-exec in a PIE, general-dynamic in a shared
     // object.
     for ([_][]const u8{ "-fno-PIC", "-fPIE", "-fPIC" }) |mode| {
-        const tls = b.addRunArtifact(zap);
+        const tls = b.addRunArtifact(bs);
         tls.addArgs(&.{ "build-obj", mode });
         tls.addFileArg(b.path("test/obj/tls.zig"));
         const tls_o = tls.addPrefixedOutputFileArg("-femit-bin=", "tls.o");
         const tls_run = if (std.mem.eql(u8, mode, "-fPIC")) run: {
-            const tls_so = b.addSystemCommand(&.{ upstreamZig(b), "build-lib", "-dynamic", "--name", "zaptls" });
+            const tls_so = b.addSystemCommand(&.{ upstreamZig(b), "build-lib", "-dynamic", "--name", "bstls" });
             tls_so.addFileArg(tls_o);
-            const tls_so_file = tls_so.addPrefixedOutputFileArg("-femit-bin=", "libzaptls.so");
+            const tls_so_file = tls_so.addPrefixedOutputFileArg("-femit-bin=", "libbstls.so");
             const tls_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
             tls_host.addFileArg(b.path("test/obj/tls_main.zig"));
             tls_host.addFileArg(tls_so_file);
@@ -845,9 +864,9 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // build-obj and build-lib through the cache: test/obj/cache.sh.
     for ([_][]const u8{ "build-obj", "build-lib" }) |cmd| {
         const cache = b.addSystemCommand(&.{"sh"});
-        cache.setName(b.fmt("zap {s} cache", .{cmd}));
+        cache.setName(b.fmt("bs {s} cache", .{cmd}));
         cache.addFileArg(b.path("test/obj/cache.sh"));
-        cache.addArtifactArg(zap);
+        cache.addArtifactArg(bs);
         cache.addFileArg(b.path("test/obj/lib.zig"));
         _ = cache.addOutputDirectoryArg("work");
         cache.addArg(cmd);
@@ -860,9 +879,9 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // Donors kept per program: test/run/donor_own.sh.
     {
         const donor = b.addSystemCommand(&.{"sh"});
-        donor.setName("zap donor own");
+        donor.setName("bs donor own");
         donor.addFileArg(b.path("test/run/donor_own.sh"));
-        donor.addArtifactArg(zap);
+        donor.addArtifactArg(bs);
         _ = donor.addOutputDirectoryArg("work");
         donor.addDirectoryArg(std_zir);
         donor.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -872,9 +891,9 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // A compiler_rt edit without its old ZIR: test/run/edit_rt_old_zir.sh.
     {
         const rt = b.addSystemCommand(&.{"sh"});
-        rt.setName("zap compiler_rt edit without old ZIR");
+        rt.setName("bs compiler_rt edit without old ZIR");
         rt.addFileArg(b.path("test/run/edit_rt_old_zir.sh"));
-        rt.addArtifactArg(zap);
+        rt.addArtifactArg(bs);
         _ = rt.addOutputDirectoryArg("work");
         rt.addArg(defaultZigLibDir(b));
         rt.addDirectoryArg(std_zir);
@@ -883,20 +902,20 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&rt.step);
     }
 
-    const zap_run = b.addRunArtifact(zap);
-    zap_run.setName("zap run args");
-    zap_run.addArg("run");
-    zap_run.addFileArg(b.path("test/obj/args.zig"));
-    zap_run.addArg("--global-cache-dir");
-    _ = zap_run.addOutputDirectoryArg("run-cache");
-    zap_run.addArgs(&.{ "--", "a", "b c", "" });
-    zap_run.addCheck(.{ .expect_stdout_exact = "[a][b c][]\n" });
-    zap_run.addCheck(.{ .expect_term = .{ .exited = 43 } });
-    takes(b, &zap_run.step, 5);
-    test_step.dependOn(&zap_run.step);
+    const bs_run = b.addRunArtifact(bs);
+    bs_run.setName("bs run args");
+    bs_run.addArg("run");
+    bs_run.addFileArg(b.path("test/obj/args.zig"));
+    bs_run.addArg("--global-cache-dir");
+    _ = bs_run.addOutputDirectoryArg("run-cache");
+    bs_run.addArgs(&.{ "--", "a", "b c", "" });
+    bs_run.addCheck(.{ .expect_stdout_exact = "[a][b c][]\n" });
+    bs_run.addCheck(.{ .expect_term = .{ .exited = 43 } });
+    takes(b, &bs_run.step, 5);
+    test_step.dependOn(&bs_run.step);
 
     // Modules rooted at a ZON file and at a plain file.
-    const mods = b.addRunArtifact(zap);
+    const mods = b.addRunArtifact(bs);
     mods.addArgs(&.{ "build-exe", "--dep", "config", "--dep", "version", "--dep", "back" });
     mods.addPrefixedFileArg("-Mapp=", b.path("test/obj/modules.zig"));
     mods.addPrefixedFileArg("-Mconfig=", b.path("test/obj/mod/config.zon"));
@@ -906,23 +925,23 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     const mods_bin = mods.addPrefixedOutputFileArg("-femit-bin=", "modules");
     const mods_run = std.Build.Step.Run.create(b, "run modules");
     mods_run.addFileArg(mods_bin);
-    mods_run.addCheck(.{ .expect_stdout_exact = "zap 3 0.17.0-dev 31 31 app\n" });
+    mods_run.addCheck(.{ .expect_stdout_exact = "bs 3 0.17.0-dev 30 31 app\n" });
     mods_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&mods_run.step);
 
     // `@src()` names the root module by its `-M` name; a second build
-    // (`zap run` without `-M`) shares the first one's global cache, so it
+    // (`bs run` without `-M`) shares the first one's global cache, so it
     // takes the first as its donor if the donor key lets it.
-    const src_app = b.addRunArtifact(zap);
-    src_app.setName("zap run @src module app");
+    const src_app = b.addRunArtifact(bs);
+    src_app.setName("bs run @src module app");
     src_app.addArg("run");
     src_app.addPrefixedFileArg("-Mapp=", b.path("test/obj/mod/srcmod.zig"));
     src_app.addArg("--global-cache-dir");
     const src_cache = src_app.addOutputDirectoryArg("src-module-cache");
     src_app.addCheck(.{ .expect_stdout_exact = "app\n" });
     takes(b, &src_app.step, 5);
-    const src_stem = b.addRunArtifact(zap);
-    src_stem.setName("zap run @src module stem");
+    const src_stem = b.addRunArtifact(bs);
+    src_stem.setName("bs run @src module stem");
     src_stem.addArg("run");
     src_stem.addFileArg(b.path("test/obj/mod/srcmod.zig"));
     src_stem.addArg("--global-cache-dir");
@@ -934,9 +953,9 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // named "root" like upstream's test runner, and another module "main";
     // the cache check fails if a module shares a cache key with the test
     // runner or the module under test.
-    const self_test = b.addRunArtifact(zap);
-    self_test.setName("zap test self import");
-    self_test.setEnvironmentVariable("ZAP_CACHE_CHECK", "1");
+    const self_test = b.addRunArtifact(bs);
+    self_test.setName("bs test self import");
+    self_test.setEnvironmentVariable("BS_CACHE_CHECK", "1");
     self_test.addArgs(&.{ "test", "--dep", "self=root", "--dep", "main" });
     self_test.addPrefixedFileArg("-Mroot=", b.path("test/obj/mod/self.zig"));
     self_test.addPrefixedFileArg("-Mmain=", b.path("test/obj/mod/seven.zig"));
@@ -953,16 +972,16 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // second's donor. If it were, `Allocating` would load green without
     // the reference that reaches its test, and the cache check would fail.
     const lib_dir = defaultZigLibDir(b);
-    const user_test = b.addRunArtifact(zap);
-    user_test.setName("zap test a std user");
+    const user_test = b.addRunArtifact(bs);
+    user_test.setName("bs test a std user");
     user_test.addArgs(&.{ "test", "--zig-lib-dir", lib_dir, "--test-filter", "Allocating" });
     user_test.addFileArg(b.path("test/obj/writer_test.zig"));
     user_test.addArg("--global-cache-dir");
     const std_cache = user_test.addOutputDirectoryArg("std-test-cache");
     user_test.addCheck(.{ .expect_stderr_match = "All 1 tests passed." });
-    const std_test = b.addRunArtifact(zap);
-    std_test.setName("zap test std after a std user");
-    std_test.setEnvironmentVariable("ZAP_CACHE_CHECK", "1");
+    const std_test = b.addRunArtifact(bs);
+    std_test.setName("bs test std after a std user");
+    std_test.setEnvironmentVariable("BS_CACHE_CHECK", "1");
     std_test.addArgs(&.{ "test", "--zig-lib-dir", lib_dir, "--test-filter", "Allocating" });
     std_test.addFileArg(.{ .cwd_relative = b.pathJoin(&.{ lib_dir, "std", "std.zig" }) });
     std_test.addArg("--global-cache-dir");
@@ -972,21 +991,21 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     test_step.dependOn(&std_test.step);
 }
 
-/// `zap build` end to end: test/build/check.sh builds test/build/hello
-/// with zap as the build runner's compiler, in the default global cache,
-/// where zap keeps the build runner it compiles once per zap binary. Its
+/// `bs build` end to end: test/build/check.sh builds test/build/hello
+/// with bs as the build runner's compiler, in the default global cache,
+/// where bs keeps the build runner it compiles once per bs binary. Its
 /// first part compiles the runner; the others wait for it and run at once,
 /// shape after `translate_c` has compiled translate-c there.
-fn addBuildTest(b: *std.Build, zap: *std.Build.Step.Compile, build_web_wasm: std.Build.LazyPath, translate_c: ?*std.Build.Step) *std.Build.Step {
+fn addBuildTest(b: *std.Build, bs: *std.Build.Step.Compile, build_web_wasm: std.Build.LazyPath, translate_c: ?*std.Build.Step) *std.Build.Step {
     const host = b.graph.host.result;
-    const step = b.step("test-build", "Check `zap build` end to end on test/build/hello");
+    const step = b.step("test-build", "Check `bs build` end to end on test/build/hello");
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return step;
     var first: ?*std.Build.Step = null;
     for ([_][]const u8{ "build", "shape", "fuzz", "misc" }, [_]u32{ 32, 5, 20, 8 }) |part, seconds| {
         const run = b.addSystemCommand(&.{"sh"});
-        run.setName(b.fmt("zap build test/build/hello ({s})", .{part}));
+        run.setName(b.fmt("bs build test/build/hello ({s})", .{part}));
         run.addFileArg(b.path("test/build/check.sh"));
-        run.addArtifactArg(zap);
+        run.addArtifactArg(bs);
         run.addDirectoryArg(b.path("test/build/hello"));
         _ = run.addOutputDirectoryArg("work");
         run.addFileArg(build_web_wasm);
@@ -1002,25 +1021,25 @@ fn addBuildTest(b: *std.Build, zap: *std.Build.Step.Compile, build_web_wasm: std
 
 /// The build runner starts a ready step on a worker thread only while one
 /// of its `-j` workers (default: one fewer than the CPUs) is free, and
-/// otherwise runs it at once in the thread that made it ready. When zap is
-/// built, that one thread would make the few hundred steps that run zap
+/// otherwise runs it at once in the thread that made it ready. When bs is
+/// built, that one thread would make the few hundred steps that run bs
 /// ready and run most of them itself, one after another, while the other
 /// workers sat idle (measured: 1.4 steps busy on average on 4 CPUs).
-/// Instead each step that runs zap waits for one of `-j` gates, which wait
-/// for zap and then `first`, so that each gate's thread runs its share,
+/// Instead each step that runs bs waits for one of `-j` gates, which wait
+/// for bs and then `first`, so that each gate's thread runs its share,
 /// dealt heaviest first to the gate with the least work so far by `takes`
-/// (the runner shuffles the order each gate runs them in). Their waits on zap and `first` move to the gate: the thread
+/// (the runner shuffles the order each gate runs them in). Their waits on bs and `first` move to the gate: the thread
 /// that finished either would run the step otherwise. (A step that waits
 /// for another of them, as test/build's parts do, runs on that one's
 /// thread.)
-fn spreadZapUsers(b: *std.Build, zap: *std.Build.Step, first: *std.Build.Step, roots: []const *std.Build.Step) void {
+fn spreadBsUsers(b: *std.Build, bs: *std.Build.Step, first: *std.Build.Step, roots: []const *std.Build.Step) void {
     const Step = std.Build.Step;
     const workers = @max(1, (std.Thread.getCpuCount() catch 1) -| 1);
     const gates = b.allocator.alloc(*Step, workers) catch @panic("OOM");
     const loads = b.allocator.alloc(usize, workers) catch @panic("OOM");
     for (gates, loads, 0..) |*g, *load, i| {
         const gate = b.allocator.create(Step.TopLevel) catch @panic("OOM");
-        gate.* = .{ .step = .init(.{ .tag = .top_level, .name = b.fmt("zap users {d}", .{i}), .owner = b }), .description = "" };
+        gate.* = .{ .step = .init(.{ .tag = .top_level, .name = b.fmt("bs users {d}", .{i}), .owner = b }), .description = "" };
         gate.step.dependOn(first);
         g.* = &gate.step;
         load.* = 0;
@@ -1032,7 +1051,7 @@ fn spreadZapUsers(b: *std.Build, zap: *std.Build.Step, first: *std.Build.Step, r
     while (i < seen.count()) : (i += 1) {
         const s = seen.keys()[i];
         for (s.dependencies.items) |d| seen.put(b.allocator, d, {}) catch @panic("OOM");
-        if (s != first and std.mem.indexOfScalar(*Step, s.dependencies.items, zap) != null) users.append(b.allocator, s) catch @panic("OOM");
+        if (s != first and std.mem.indexOfScalar(*Step, s.dependencies.items, bs) != null) users.append(b.allocator, s) catch @panic("OOM");
     }
     std.mem.sort(*Step, users.items, {}, struct {
         fn heavier(_: void, x: *Step, y: *Step) bool {
@@ -1042,14 +1061,14 @@ fn spreadZapUsers(b: *std.Build, zap: *std.Build.Step, first: *std.Build.Step, r
     for (users.items) |s| {
         const least = std.mem.indexOfMin(usize, loads);
         for (s.dependencies.items) |*d| {
-            if (d.* == zap or d.* == first) d.* = gates[least];
+            if (d.* == bs or d.* == first) d.* = gates[least];
         }
         loads[least] += stepSeconds(s);
     }
 }
 
-/// About how many seconds a step that runs zap takes with a Debug zap on a
-/// 4-CPU orb, where it is more than 1, for `spreadZapUsers`.
+/// About how many seconds a step that runs bs takes with a Debug bs on a
+/// 4-CPU orb, where it is more than 1, for `spreadBsUsers`.
 var step_seconds: std.AutoHashMapUnmanaged(*std.Build.Step, u32) = .empty;
 
 fn takes(b: *std.Build, s: *std.Build.Step, seconds: u32) void {
@@ -1070,15 +1089,15 @@ fn defaultZigLibDir(b: *std.Build) []const u8 {
 
 /// lib/docs/wasm of `zig_lib_dir` compiled as upstream's compiler compiles
 /// it for `-femit-docs` (`workerDocsWasm`): wasm32, ReleaseSmall, the same
-/// CPU features. zap has no wasm backend, so upstream zig builds it, once.
+/// CPU features. bs has no wasm backend, so upstream zig builds it, once.
 fn docsWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
-        upstreamZig(b),  "build-exe",
-        "-target",       "wasm32-freestanding",
-        "-mcpu",         "baseline+atomics+reference_types",
+        upstreamZig(b),   "build-exe",
+        "-target",        "wasm32-freestanding",
+        "-mcpu",          "baseline+atomics+reference_types",
         "-OReleaseSmall", "-fno-entry",
-        "-rdynamic",     "--name",
-        "main",          "--dep",
+        "-rdynamic",      "--name",
+        "main",           "--dep",
         "Walk",
     });
     cmd.addPrefixedFileArg("-Mroot=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "main.zig" }) });
@@ -1093,16 +1112,16 @@ fn docsWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
 /// `docsWasm`.
 fn buildWebWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
-        upstreamZig(b), "build-exe",
-        "-target",      "wasm32-freestanding",
-        "-mcpu",        "baseline+atomics+bulk_memory+multivalue+mutable_globals+nontrapping_fptoint+reference_types+sign_ext",
+        upstreamZig(b),  "build-exe",
+        "-target",       "wasm32-freestanding",
+        "-mcpu",         "baseline+atomics+bulk_memory+multivalue+mutable_globals+nontrapping_fptoint+reference_types+sign_ext",
         "-OReleaseFast", "-fno-entry",
-        "-rdynamic",    "-fsingle-threaded",
-        // Without its DWARF: 0.4 MB in zap instead of 2.4 MB.
-        "-fstrip",      "--name",
-        "build-web",
-        "--dep",        "Walk",
-        "--dep",        "html_render",
+        "-rdynamic",     "-fsingle-threaded",
+        // Without its DWARF: 0.4 MB in bs instead of 2.4 MB.
+        "-fstrip",       "--name",
+        "build-web",     "--dep",
+        "Walk",          "--dep",
+        "html_render",
     });
     cmd.addPrefixedFileArg("-Mroot=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "build-web", "main.zig" }) });
     cmd.addPrefixedFileArg("-MWalk=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "Walk.zig" }) });
@@ -1111,16 +1130,16 @@ fn buildWebWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
     return cmd.addPrefixedOutputFileArg("-femit-bin=", "build-web.wasm");
 }
 
-/// Upstream zig, the oracle the tests compare zap with: the zig running
-/// this build, or under `zap build` (no zig release next to the
+/// Upstream zig, the oracle the tests compare bs with: the zig running
+/// this build, or under `bs build` (no zig release next to the
 /// compiler) `zig` on PATH.
-/// C objects and archives that zap links into an executable
-/// (docs/architecture.md, "Object, archive and shared-library inputs"):
+/// C objects and archives that bs links into an executable
+/// (docs/slop/architecture.md, "Object, archive and shared-library inputs"):
 /// upstream's `zig cc` and the system's `cc` compile them, non-PIC and
 /// -fPIC, and the program must print what upstream's link of the same
 /// inputs prints.
-/// Returns the step that compiles translate-c with zap first.
-fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, std_zir: std.Build.LazyPath) ?*std.Build.Step {
+/// Returns the step that compiles translate-c with bs first.
+fn addLinkInputTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build.Step, std_zir: std.Build.LazyPath) ?*std.Build.Step {
     const host = b.graph.host.result;
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return null;
     const expect = "44 108 12 gamma hello from C 0 4 9 copied\nthread 712\n712 4 23\nextern data data 30 30\nextern data data 23 111 1\n";
@@ -1154,30 +1173,30 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
             a.* = ar.addOutputFileArg(b.fmt("lib{s}.a", .{src[0..2]}));
             ar.addFileArg(compile(b, v.cc, src, &.{}));
         }
-        const exe = b.addRunArtifact(zap);
-        exe.setName(b.fmt("zap build-exe with {s} objects", .{v.name}));
+        const exe = b.addRunArtifact(bs);
+        exe.setName(b.fmt("bs build-exe with {s} objects", .{v.name}));
         exe.addArg("build-exe");
         exe.addFileArg(b.path("test/link_input/main.zig"));
         for ([_]std.Build.LazyPath{ lib, tls, tlsie, archives[0] }) |input| exe.addFileArg(input);
         // The second archive by name (`-l`, `-L`).
         exe.addArg("-la2");
         exe.addPrefixedDirectoryArg("-L", archives[1].dirname());
-        exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        exe.setEnvironmentVariable("BS_CACHE", "off");
         const bin = exe.addPrefixedOutputFileArg("-femit-bin=", "main");
-        const run = std.Build.Step.Run.create(b, b.fmt("run zap link of {s} objects", .{v.name}));
+        const run = std.Build.Step.Run.create(b, b.fmt("run bs link of {s} objects", .{v.name}));
         run.addFileArg(bin);
         run.addCheck(.{ .expect_stderr_exact = expect });
         run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&run.step);
         if (!std.mem.eql(u8, v.name, "zig cc")) continue;
-        // The same sources given to zap, which compiles them with upstream's
+        // The same sources given to bs, which compiles them with upstream's
         // Clang (CSource.zig), the archives too, as libraries of C only.
         for (&archives, [_][]const u8{ "a1", "a2" }) |*a, stem| {
-            const lib_c = b.addRunArtifact(zap);
-            lib_c.setName(b.fmt("zap build-lib of {s}.c", .{stem}));
+            const lib_c = b.addRunArtifact(bs);
+            lib_c.setName(b.fmt("bs build-lib of {s}.c", .{stem}));
             lib_c.addArgs(&.{ "build-lib", "-mcpu", "baseline", "--name", stem });
             lib_c.addFileArg(b.path(b.fmt("test/link_input/{s}.c", .{stem})));
-            lib_c.setEnvironmentVariable("ZAP_ZIG", zig);
+            lib_c.setEnvironmentVariable("BS_ZIG", zig);
             a.* = lib_c.addPrefixedOutputFileArg("-femit-bin=", b.fmt("lib{s}.a", .{stem}));
         }
         // Upstream's archive of the same C is the same bytes, with its own
@@ -1186,12 +1205,12 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         up_lib.addFileArg(b.path("test/link_input/a1.c"));
         const up_a1 = up_lib.addPrefixedOutputFileArg("-femit-bin=", "liba1.a");
         const same = b.addSystemCommand(&.{"cmp"});
-        same.setName("zap's archive of C is upstream's");
+        same.setName("bs's archive of C is upstream's");
         same.addFileArg(archives[0]);
         same.addFileArg(up_a1);
         test_step.dependOn(&same.step);
-        const src = b.addRunArtifact(zap);
-        src.setName("zap build-exe with C sources");
+        const src = b.addRunArtifact(bs);
+        src.setName("bs build-exe with C sources");
         src.addArgs(&.{ "build-exe", "-cflags", "-fcommon", "--" });
         src.addFileArg(b.path("test/link_input/lib.c"));
         src.addArgs(&.{ "-cflags", "-fPIC", "--" });
@@ -1199,9 +1218,9 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         src.addFileArg(b.path("test/link_input/tlsie.c"));
         src.addFileArg(b.path("test/link_input/main.zig"));
         for (archives) |input| src.addFileArg(input);
-        src.setEnvironmentVariable("ZAP_ZIG", zig);
+        src.setEnvironmentVariable("BS_ZIG", zig);
         const src_bin = src.addPrefixedOutputFileArg("-femit-bin=", "main");
-        const src_run = std.Build.Step.Run.create(b, "run zap build of C sources");
+        const src_run = std.Build.Step.Run.create(b, "run bs build of C sources");
         src_run.addFileArg(src_bin);
         src_run.addCheck(.{ .expect_stderr_exact = expect });
         src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1212,11 +1231,11 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // step makes one: no Zig root and no C sources. The library holds the
     // objects, the object merges them; upstream links a program with each.
     {
-        const lib = b.addRunArtifact(zap);
-        lib.setName("zap build-lib -static of objects only");
+        const lib = b.addRunArtifact(bs);
+        lib.setName("bs build-lib -static of objects only");
         lib.addArgs(&.{ "build-lib", "-static", "--name", "a12" });
-        const obj_only = b.addRunArtifact(zap);
-        obj_only.setName("zap build-obj of objects only");
+        const obj_only = b.addRunArtifact(bs);
+        obj_only.setName("bs build-obj of objects only");
         obj_only.addArgs(&.{ "build-obj", "--name", "a12" });
         for ([_][]const u8{ "a1", "a2" }) |stem| {
             const o = b.addSystemCommand(&.{ zig, "cc", "-c" });
@@ -1233,7 +1252,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
             const exe = b.addSystemCommand(&.{ zig, "build-exe" });
             exe.addFileArg(b.path("test/link_input/a12_main.zig"));
             exe.addFileArg(out);
-            const r = std.Build.Step.Run.create(b, b.fmt("run upstream's link of zap's {s} of objects only", .{what}));
+            const r = std.Build.Step.Run.create(b, b.fmt("run upstream's link of bs's {s} of objects only", .{what}));
             r.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
             r.addCheck(.{ .expect_stderr_exact = "12\n" });
             r.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1247,28 +1266,28 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     const c = b.addSystemCommand(&.{ zig, "cc", "-fPIC", "-c" });
     c.addFileArg(b.path("test/link_input/libc.c"));
     const libc_o = c.addPrefixedOutputFileArg("-o", "libc.o");
-    const exe = b.addRunArtifact(zap);
-    exe.setName("zap build-exe -lc with a C object");
+    const exe = b.addRunArtifact(bs);
+    exe.setName("bs build-exe -lc with a C object");
     exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
     exe.addFileArg(b.path("test/link_input/libc_main.zig"));
     exe.addFileArg(libc_o);
-    exe.setEnvironmentVariable("ZAP_CACHE", "off");
-    exe.setEnvironmentVariable("ZAP_ZIG", zig);
-    const run = std.Build.Step.Run.create(b, "run zap -lc link of a C object");
+    exe.setEnvironmentVariable("BS_CACHE", "off");
+    exe.setEnvironmentVariable("BS_ZIG", zig);
+    const run = std.Build.Step.Run.create(b, "run bs -lc link of a C object");
     run.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
     run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
     run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&run.step);
-    // The same C as a source of a -lc build, compiled by zap with upstream's
+    // The same C as a source of a -lc build, compiled by bs with upstream's
     // Clang and its Debug defaults (ubsan, PIC).
-    const src_exe = b.addRunArtifact(zap);
-    src_exe.setName("zap build-exe -lc with a C source");
+    const src_exe = b.addRunArtifact(bs);
+    src_exe.setName("bs build-exe -lc with a C source");
     src_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
     src_exe.addFileArg(b.path("test/link_input/libc_main.zig"));
     src_exe.addFileArg(b.path("test/link_input/libc.c"));
-    src_exe.setEnvironmentVariable("ZAP_ZIG", zig);
-    const src_run = std.Build.Step.Run.create(b, "run zap -lc build of a C source");
+    src_exe.setEnvironmentVariable("BS_ZIG", zig);
+    const src_run = std.Build.Step.Run.create(b, "run bs -lc build of a C source");
     src_run.addFileArg(src_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
     src_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
@@ -1290,14 +1309,14 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
             const obj = b.addSystemCommand(v.cc);
             obj.addArgs(&.{ "-mtls-dialect=gnu2", "-c" });
             obj.addFileArg(b.path("test/link_input/tlsdesc.c"));
-            const tls_exe = b.addRunArtifact(zap);
-            tls_exe.setName(b.fmt("zap build-exe{s} with a {s} -mtls-dialect=gnu2 object", .{ if (v.lc) " -lc" else "", v.name }));
+            const tls_exe = b.addRunArtifact(bs);
+            tls_exe.setName(b.fmt("bs build-exe{s} with a {s} -mtls-dialect=gnu2 object", .{ if (v.lc) " -lc" else "", v.name }));
             tls_exe.addArg("build-exe");
             if (v.lc) tls_exe.addArgs(&.{ "-lc", "-target", "x86_64-linux-gnu" });
             tls_exe.addFileArg(b.path("test/link_input/tlsdesc_main.zig"));
             tls_exe.addFileArg(obj.addPrefixedOutputFileArg("-o", "tlsdesc.o"));
-            tls_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-            const tls_run = std.Build.Step.Run.create(b, b.fmt("run zap{s} link of a {s} -mtls-dialect=gnu2 object", .{ if (v.lc) " -lc" else "", v.name }));
+            tls_exe.setEnvironmentVariable("BS_CACHE", "off");
+            const tls_run = std.Build.Step.Run.create(b, b.fmt("run bs{s} link of a {s} -mtls-dialect=gnu2 object", .{ if (v.lc) " -lc" else "", v.name }));
             tls_run.addFileArg(tls_exe.addPrefixedOutputFileArg("-femit-bin=", "tlsdesc"));
             tls_run.addCheck(.{ .expect_stderr_exact = expect_tls });
             tls_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1305,39 +1324,39 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         }
     }
     // build-obj with a C source and a C object: one merged object
-    // (link/ElfMerge.zig), which upstream's linker and zap's link as
+    // (link/ElfMerge.zig), which upstream's linker and bs's link as
     // upstream's own merged object links. Then C++ objects whose COMDAT
     // groups repeat, merged with the second copies dropped, and linked by
     // upstream's `zig c++`: exceptions still unwind through them.
     {
         const tls_o = b.addSystemCommand(&.{ zig, "cc", "-fPIC", "-c" });
         tls_o.addFileArg(b.path("test/link_input/tls.c"));
-        const merge = b.addRunArtifact(zap);
-        merge.setName("zap build-obj with a C source and a C object");
+        const merge = b.addRunArtifact(bs);
+        merge.setName("bs build-obj with a C source and a C object");
         merge.addArg("build-obj");
         merge.addFileArg(b.path("test/link_input/merge_lib.zig"));
         merge.addFileArg(b.path("test/link_input/merge.c"));
         merge.addFileArg(tls_o.addPrefixedOutputFileArg("-o", "tls.o"));
-        merge.setEnvironmentVariable("ZAP_CACHE", "off");
-        merge.setEnvironmentVariable("ZAP_ZIG", zig);
+        merge.setEnvironmentVariable("BS_CACHE", "off");
+        merge.setEnvironmentVariable("BS_ZIG", zig);
         const merged = merge.addPrefixedOutputFileArg("-femit-bin=", "merged.o");
         const up_exe = b.addSystemCommand(&.{ zig, "build-exe" });
         up_exe.addFileArg(b.path("test/link_input/merge_main.zig"));
         up_exe.addFileArg(merged);
-        const zap_exe = b.addRunArtifact(zap);
-        zap_exe.addArg("build-exe");
-        zap_exe.addFileArg(b.path("test/link_input/merge_main.zig"));
-        zap_exe.addFileArg(merged);
-        zap_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-        for ([_]*std.Build.Step.Run{ up_exe, zap_exe }, [_][]const u8{ "upstream's", "zap's" }) |link, who| {
-            const r = std.Build.Step.Run.create(b, b.fmt("run {s} link of zap's merged object", .{who}));
+        const bs_exe = b.addRunArtifact(bs);
+        bs_exe.addArg("build-exe");
+        bs_exe.addFileArg(b.path("test/link_input/merge_main.zig"));
+        bs_exe.addFileArg(merged);
+        bs_exe.setEnvironmentVariable("BS_CACHE", "off");
+        for ([_]*std.Build.Step.Run{ up_exe, bs_exe }, [_][]const u8{ "upstream's", "bs's" }) |link, who| {
+            const r = std.Build.Step.Run.create(b, b.fmt("run {s} link of bs's merged object", .{who}));
             r.addFileArg(link.addPrefixedOutputFileArg("-femit-bin=", "main"));
             r.addCheck(.{ .expect_stderr_exact = "44 bee 6 712\n" });
             r.addCheck(.{ .expect_term = .{ .exited = 0 } });
             test_step.dependOn(&r.step);
         }
-        const cxx = b.addRunArtifact(zap);
-        cxx.setName("zap build-obj with C++ objects");
+        const cxx = b.addRunArtifact(bs);
+        cxx.setName("bs build-obj with C++ objects");
         cxx.addArg("build-obj");
         cxx.addFileArg(b.path("test/link_input/merge_lib.zig"));
         cxx.addFileArg(b.path("test/link_input/merge.c"));
@@ -1346,11 +1365,11 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
             o.addFileArg(b.path(b.fmt("test/link_input/{s}.cpp", .{stem})));
             cxx.addFileArg(o.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{stem})));
         }
-        cxx.setEnvironmentVariable("ZAP_CACHE", "off");
-        cxx.setEnvironmentVariable("ZAP_ZIG", zig);
+        cxx.setEnvironmentVariable("BS_CACHE", "off");
+        cxx.setEnvironmentVariable("BS_ZIG", zig);
         const cxx_link = b.addSystemCommand(&.{ zig, "c++" });
         cxx_link.addFileArg(cxx.addPrefixedOutputFileArg("-femit-bin=", "merged.o"));
-        const r = std.Build.Step.Run.create(b, "run upstream's link of zap's merged C++ object");
+        const r = std.Build.Step.Run.create(b, "run upstream's link of bs's merged C++ object");
         r.addFileArg(cxx_link.addPrefixedOutputFileArg("-o", "main"));
         r.addCheck(.{ .expect_stdout_exact = "caught neg\n10 8 1 4\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1368,20 +1387,20 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         const desc_a = b.addSystemCommand(&.{ zig, "ar", "rcs" });
         const desc_lib = desc_a.addOutputFileArg("libdesc.a");
         desc_a.addFileArg(desc_o.addPrefixedOutputFileArg("-o", "so_desc.o"));
-        const zso_inputs = b.addRunArtifact(zap);
-        zso_inputs.setName("zap build-lib -dynamic with a C source, a C object and an archive");
-        zso_inputs.addArgs(&.{ "build-lib", "-dynamic", "--name", "zapinputs" });
+        const zso_inputs = b.addRunArtifact(bs);
+        zso_inputs.setName("bs build-lib -dynamic with a C source, a C object and an archive");
+        zso_inputs.addArgs(&.{ "build-lib", "-dynamic", "--name", "bsinputs" });
         zso_inputs.addFileArg(b.path("test/link_input/so_lib.zig"));
         zso_inputs.addFileArg(b.path("test/link_input/merge.c"));
         zso_inputs.addFileArg(tls_o.addPrefixedOutputFileArg("-o", "tls.o"));
         zso_inputs.addFileArg(desc_lib);
-        zso_inputs.setEnvironmentVariable("ZAP_ZIG", zig);
-        const so_file = zso_inputs.addPrefixedOutputFileArg("-femit-bin=", "libzapinputs.so");
+        zso_inputs.setEnvironmentVariable("BS_ZIG", zig);
+        const so_file = zso_inputs.addPrefixedOutputFileArg("-femit-bin=", "libbsinputs.so");
         const so_host = b.addSystemCommand(&.{ zig, "build-exe", "-lc" });
         so_host.addFileArg(b.path("test/link_input/so_main.zig"));
         so_host.addFileArg(so_file);
         const r = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
-        r.setName("run so_main (zap shared library with inputs)");
+        r.setName("run so_main (bs shared library with inputs)");
         r.addFileArg(so_file);
         r.addFileArg(so_host.addPrefixedOutputFileArg("-femit-bin=", "so_main"));
         r.addCheck(.{ .expect_stderr_exact = "44 bee 6 712 810\nthread: 712 810\n" });
@@ -1393,7 +1412,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         preempt_host.addFileArg(b.path("test/link_input/so_preempt.c"));
         preempt_host.addFileArg(so_file);
         const preempt = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
-        preempt.setName("run so_preempt (thread-locals preempting a zap shared library's)");
+        preempt.setName("run so_preempt (thread-locals preempting a bs shared library's)");
         preempt.addFileArg(so_file);
         preempt.addFileArg(preempt_host.addPrefixedOutputFileArg("-o", "so_preempt"));
         preempt.addCheck(.{ .expect_stdout_exact = "100012 200310 1000 2003\n" });
@@ -1402,12 +1421,12 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     }
     // An executable of C only, as upstream builds one: its main is C's.
     {
-        const cexe = b.addRunArtifact(zap);
-        cexe.setName("zap build-exe -lc with only C sources");
+        const cexe = b.addRunArtifact(bs);
+        cexe.setName("bs build-exe -lc with only C sources");
         cexe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
         cexe.addFileArg(b.path("test/link_input/cmain.c"));
-        cexe.setEnvironmentVariable("ZAP_ZIG", zig);
-        const cexe_run = std.Build.Step.Run.create(b, "run zap -lc build of only C sources");
+        cexe.setEnvironmentVariable("BS_ZIG", zig);
+        const cexe_run = std.Build.Step.Run.create(b, "run bs -lc build of only C sources");
         cexe_run.addFileArg(cexe.addPrefixedOutputFileArg("-femit-bin=", "cmain"));
         cexe_run.addArg("5");
         cexe_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
@@ -1416,7 +1435,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     }
     // compiler_rt for C: f128 and f16 conversions, comparisons and
     // arithmetic, 128-bit division, lock-based atomics and the CPU model
-    // of function multiversioning (data as well as functions), which zap
+    // of function multiversioning (data as well as functions), which bs
     // generates from upstream's compiler_rt (baseline, so that f16 needs
     // it too). Two more objects reference a name nothing defines: one
     // error names both.
@@ -1424,19 +1443,19 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         const rt_c = b.addSystemCommand(&.{ zig, "cc", "-mcpu=baseline", "-Wno-atomic-alignment", "-c" });
         rt_c.addFileArg(b.path("test/link_input/rt.c"));
         const rt_o = rt_c.addPrefixedOutputFileArg("-o", "rt.o");
-        const rt_exe = b.addRunArtifact(zap);
-        rt_exe.setName("zap build-exe with a C object calling compiler_rt");
+        const rt_exe = b.addRunArtifact(bs);
+        rt_exe.setName("bs build-exe with a C object calling compiler_rt");
         rt_exe.addArg("build-exe");
         rt_exe.addFileArg(b.path("test/link_input/rt_main.zig"));
         rt_exe.addFileArg(rt_o);
-        rt_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-        const rt_run = std.Build.Step.Run.create(b, "run zap link of a C object calling compiler_rt");
+        rt_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const rt_run = std.Build.Step.Run.create(b, "run bs link of a C object calling compiler_rt");
         rt_run.addFileArg(rt_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
         rt_run.addCheck(.{ .expect_stderr_exact = "2.25 1 0 -6 0.375 1024 25 2.5 56\n" });
         rt_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&rt_run.step);
-        const undef = b.addRunArtifact(zap);
-        undef.setName("zap build-exe reports an undefined symbol once");
+        const undef = b.addRunArtifact(bs);
+        undef.setName("bs build-exe reports an undefined symbol once");
         undef.addArg("build-exe");
         undef.addFileArg(b.path("test/link_input/rt_main.zig"));
         undef.addFileArg(rt_o);
@@ -1445,7 +1464,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
             u.addFileArg(b.path("test/link_input/undef.c"));
             undef.addFileArg(u.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{name})));
         }
-        undef.setEnvironmentVariable("ZAP_CACHE", "off");
+        undef.setEnvironmentVariable("BS_CACHE", "off");
         _ = undef.addPrefixedOutputFileArg("-femit-bin=", "main");
         undef.addCheck(.{ .expect_stderr_match = "undef1.o, " });
         undef.addCheck(.{ .expect_stderr_match = "undef2.o)\n" });
@@ -1462,50 +1481,50 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         const o = b.addSystemCommand(&.{ zig, "cc", "-fPIC", "-c" });
         o.addFileArg(b.path("test/link_input/ifunc.c"));
         const ifunc_o = o.addPrefixedOutputFileArg("-o", "ifunc.o");
-        const ifunc_exe = b.addRunArtifact(zap);
-        ifunc_exe.setName("zap build-exe -lc with GNU indirect functions");
+        const ifunc_exe = b.addRunArtifact(bs);
+        ifunc_exe.setName("bs build-exe -lc with GNU indirect functions");
         ifunc_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
         ifunc_exe.addFileArg(b.path("test/link_input/ifunc_main.zig"));
         ifunc_exe.addFileArg(ifunc_o);
-        ifunc_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-        const ifunc_exe_run = std.Build.Step.Run.create(b, "run zap's link of GNU indirect functions");
+        ifunc_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const ifunc_exe_run = std.Build.Step.Run.create(b, "run bs's link of GNU indirect functions");
         ifunc_exe_run.addFileArg(ifunc_exe.addPrefixedOutputFileArg("-femit-bin=", "ifunc"));
         ifunc_exe_run.addCheck(.{ .expect_stderr_exact = expect_ifunc });
         ifunc_exe_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&ifunc_exe_run.step);
-        const ifunc_lib = b.addRunArtifact(zap);
-        ifunc_lib.setName("zap build-lib -dynamic with GNU indirect functions");
-        ifunc_lib.addArgs(&.{ "build-lib", "-dynamic", "--name", "zapifunc" });
+        const ifunc_lib = b.addRunArtifact(bs);
+        ifunc_lib.setName("bs build-lib -dynamic with GNU indirect functions");
+        ifunc_lib.addArgs(&.{ "build-lib", "-dynamic", "--name", "bsifunc" });
         ifunc_lib.addFileArg(b.path("test/link_input/ifunc_lib.zig"));
         ifunc_lib.addFileArg(ifunc_o);
-        const ifunc_lib_file = ifunc_lib.addPrefixedOutputFileArg("-femit-bin=", "libzapifunc.so");
+        const ifunc_lib_file = ifunc_lib.addPrefixedOutputFileArg("-femit-bin=", "libbsifunc.so");
         const ifunc_lib_host = b.addSystemCommand(&.{ zig, "build-exe", "-lc" });
         ifunc_lib_host.addFileArg(b.path("test/link_input/ifunc_main.zig"));
         ifunc_lib_host.addFileArg(ifunc_lib_file);
         const ifunc_lib_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
-        ifunc_lib_run.setName("run ifunc_main (zap shared library with GNU indirect functions)");
+        ifunc_lib_run.setName("run ifunc_main (bs shared library with GNU indirect functions)");
         ifunc_lib_run.addFileArg(ifunc_lib_file);
         ifunc_lib_run.addFileArg(ifunc_lib_host.addPrefixedOutputFileArg("-femit-bin=", "ifunc_main"));
         ifunc_lib_run.addCheck(.{ .expect_stderr_exact = expect_ifunc });
         ifunc_lib_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&ifunc_lib_run.step);
-        const ifunc_static = b.addRunArtifact(zap);
-        ifunc_static.setName("zap build-exe refuses GNU indirect functions without libc");
+        const ifunc_static = b.addRunArtifact(bs);
+        ifunc_static.setName("bs build-exe refuses GNU indirect functions without libc");
         ifunc_static.addArg("build-exe");
         ifunc_static.addFileArg(b.path("test/link_input/ifunc_main.zig"));
         ifunc_static.addFileArg(ifunc_o);
-        ifunc_static.setEnvironmentVariable("ZAP_CACHE", "off");
+        ifunc_static.setEnvironmentVariable("BS_CACHE", "off");
         _ = ifunc_static.addPrefixedOutputFileArg("-femit-bin=", "ifunc");
-        ifunc_static.addCheck(.{ .expect_stderr_match = "ifunc.o: zap links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: c_triple\n" });
+        ifunc_static.addCheck(.{ .expect_stderr_match = "ifunc.o: bs links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: c_triple\n" });
         ifunc_static.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&ifunc_static.step);
     }
     {
-        const dead = b.addRunArtifact(zap);
-        dead.setName("zap build-exe links the data a discarded load reads");
+        const dead = b.addRunArtifact(bs);
+        dead.setName("bs build-exe links the data a discarded load reads");
         dead.addArg("build-exe");
         dead.addFileArg(b.path("test/link_input/dead_load.zig"));
-        dead.setEnvironmentVariable("ZAP_CACHE", "off");
+        dead.setEnvironmentVariable("BS_CACHE", "off");
         _ = dead.addPrefixedOutputFileArg("-femit-bin=", "dead_load");
         dead.addCheck(.{ .expect_stderr_match = "undefined symbol: nope" });
         dead.addCheck(.{ .expect_term = .{ .exited = 1 } });
@@ -1514,13 +1533,13 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // A C++ source with -lc++: libc++, libc++abi and libunwind built from
     // the lib directory as upstream builds them, exceptions through C++
     // frames, RTTI, a static constructor and thread_local.
-    const cxx_exe = b.addRunArtifact(zap);
-    cxx_exe.setName("zap build-exe -lc++ with a C++ source");
+    const cxx_exe = b.addRunArtifact(bs);
+    cxx_exe.setName("bs build-exe -lc++ with a C++ source");
     cxx_exe.addArgs(&.{ "build-exe", "-lc++", "-target", "x86_64-linux-gnu" });
     cxx_exe.addFileArg(b.path("test/link_input/cxx_main.zig"));
     cxx_exe.addFileArg(b.path("test/link_input/cxx.cpp"));
-    cxx_exe.setEnvironmentVariable("ZAP_ZIG", zig);
-    const cxx_run = std.Build.Step.Run.create(b, "run zap -lc++ build of a C++ source");
+    cxx_exe.setEnvironmentVariable("BS_ZIG", zig);
+    const cxx_run = std.Build.Step.Run.create(b, "run bs -lc++ build of a C++ source");
     cxx_run.addFileArg(cxx_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
     cxx_run.addCheck(.{ .expect_stdout_exact = "caught: boom at depth 4\ntype: 7Derived\nctor 42, tls tls42!, sum 6\n" });
     cxx_run.addCheck(.{ .expect_stderr_exact = "result 151, link_libcpp true\n" });
@@ -1530,8 +1549,8 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // translate-c with a system library takes the native include
     // directories (here NIX_CFLAGS_COMPILE's) ahead of the user's
     // -isystem, as upstream's `native_system_include_paths`.
-    const tc_native = b.addRunArtifact(zap);
-    tc_native.setName("zap translate-c -l<lib> takes the native include directories");
+    const tc_native = b.addRunArtifact(bs);
+    tc_native.setName("bs translate-c -l<lib> takes the native include directories");
     tc_native.addArgs(&.{ "translate-c", "-lfoo", "-isystem" });
     tc_native.addDirectoryArg(b.path("test/link_input/tc_native/shadow"));
     tc_native.addFileArg(b.path("test/link_input/tc_native/s.h"));
@@ -1545,13 +1564,13 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // pointer, and variadic aggregates. Upstream prints the same except
     // `zig_va`, whose @cVaArg of aggregates its self-hosted backend gets
     // wrong (32791); C's answer is 55.
-    const abi_exe = b.addRunArtifact(zap);
-    abi_exe.setName("zap build-exe with C aggregates");
+    const abi_exe = b.addRunArtifact(bs);
+    abi_exe.setName("bs build-exe with C aggregates");
     abi_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
     abi_exe.addFileArg(b.path("test/link_input/abi_main.zig"));
     abi_exe.addFileArg(b.path("test/link_input/abi.c"));
-    abi_exe.setEnvironmentVariable("ZAP_ZIG", zig);
-    const abi_run = std.Build.Step.Run.create(b, "run zap build with C aggregates");
+    abi_exe.setEnvironmentVariable("BS_ZIG", zig);
+    const abi_run = std.Build.Step.Run.create(b, "run bs build with C aggregates");
     abi_run.addFileArg(abi_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
     abi_run.addCheck(.{ .expect_stdout_exact = "c_s16 1 2 0.5 1.5 4 5 6\nc_mix 7 0.5 3.25 9.5 10 11 12 13 14 15\nc_dsi 5 1 2 3 4 5 6 7 8 9\nptr 30 60\nzig_mix 103 101.5 102.25\nzig_dsi 0.75 1 2 3\nzig_va 55\n" });
     abi_run.addCheck(.{ .expect_stderr_exact = "2 3 | 14 1 6.5 | 1.5 2.5 3.5 | 3 2 1 | 0.25 { 7, 8, 9 }\nc_va 55\nzig_s16 10 20 0.5 0.25 1 2 3\nzig_mix 3 1.5 2.25 4.5 { 1, 2, 3 } 4 5 6\nzig_dsi 9 1 2 3 4 5 6 7 8 9\n" });
@@ -1559,13 +1578,13 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     test_step.dependOn(&abi_run.step);
 
     // The Win64 convention (`.x86_64_win`, C's ms_abi) both ways.
-    const win_exe = b.addRunArtifact(zap);
-    win_exe.setName("zap build-exe with Win64 calls");
+    const win_exe = b.addRunArtifact(bs);
+    win_exe.setName("bs build-exe with Win64 calls");
     win_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
     win_exe.addFileArg(b.path("test/link_input/win64_main.zig"));
     win_exe.addFileArg(b.path("test/link_input/win64.c"));
-    win_exe.setEnvironmentVariable("ZAP_ZIG", zig);
-    const win_run = std.Build.Step.Run.create(b, "run zap build with Win64 calls");
+    win_exe.setEnvironmentVariable("BS_ZIG", zig);
+    const win_run = std.Build.Step.Run.create(b, "run bs build with Win64 calls");
     win_run.addFileArg(win_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
     win_run.addCheck(.{ .expect_stdout_exact = "c_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\nva u64 1\nva f64 2.5\nva u64 3\nva f64 4.5\nzig via ptr 32.5\nzig byref 15 77\nzig va 109.75 42\n" });
     win_run.addCheck(.{ .expect_stderr_exact = "byref 42 9 mix 32.5 s8 2 1 u128 80000000000000000\nzig_win_mix 1 2.5 3 4 5.5 6 7 8 9.5 10.5 11 12.5\nsum 42\n" });
@@ -1573,13 +1592,13 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     test_step.dependOn(&win_run.step);
 
     // Bool vectors of 65 to 128 elements as C arguments, one GPR each.
-    const vb_exe = b.addRunArtifact(zap);
-    vb_exe.setName("zap build-exe with C bool vectors");
+    const vb_exe = b.addRunArtifact(bs);
+    vb_exe.setName("bs build-exe with C bool vectors");
     vb_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
     vb_exe.addFileArg(b.path("test/link_input/vecbool_main.zig"));
     vb_exe.addFileArg(b.path("test/link_input/vecbool.c"));
-    vb_exe.setEnvironmentVariable("ZAP_ZIG", zig);
-    const vb_run = std.Build.Step.Run.create(b, "run zap build with C bool vectors");
+    vb_exe.setEnvironmentVariable("BS_ZIG", zig);
+    const vb_run = std.Build.Step.Run.create(b, "run bs build with C bool vectors");
     vb_run.addFileArg(vb_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
     vb_run.addCheck(.{ .expect_stdout_exact = "c_v 10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\nc_iv 1 2 3 4  10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\nc_v7 1 2 3 4 5 6 7  10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\nc_v 10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\n" });
     vb_run.addCheck(.{ .expect_stderr_exact = "zig_v 01001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010\nzig_iv -1 -2 -3 -4 01001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010\nzig_v 01001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010\n" });
@@ -1588,15 +1607,15 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
 
     // Assembly sources: `.S` through the preprocessor (an include and a
     // `-D` from `-cflags`), `.s` as is, as upstream passes them to Clang.
-    const asm_exe = b.addRunArtifact(zap);
-    asm_exe.setName("zap build-exe with assembly sources");
+    const asm_exe = b.addRunArtifact(bs);
+    asm_exe.setName("bs build-exe with assembly sources");
     asm_exe.addArg("build-exe");
     asm_exe.addFileArg(b.path("test/link_input/asm_main.zig"));
     asm_exe.addArgs(&.{ "-cflags", "-DASM_EXTRA=100", "--" });
     asm_exe.addFileArg(b.path("test/link_input/asm_cpp.S"));
     asm_exe.addFileArg(b.path("test/link_input/asm_plain.s"));
-    asm_exe.setEnvironmentVariable("ZAP_ZIG", zig);
-    const asm_run = std.Build.Step.Run.create(b, "run zap build with assembly sources");
+    asm_exe.setEnvironmentVariable("BS_ZIG", zig);
+    const asm_run = std.Build.Step.Run.create(b, "run bs build with assembly sources");
     asm_run.addFileArg(asm_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
     asm_run.addCheck(.{ .expect_stderr_exact = "142 42\n" });
     asm_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1608,12 +1627,12 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     if (cc) |gcc| {
         const cc_copy = b.addSystemCommand(&.{ gcc, "-fPIE", "-c" });
         cc_copy.addFileArg(b.path("test/link_input/copy.c"));
-        const copy_exe = b.addRunArtifact(zap);
+        const copy_exe = b.addRunArtifact(bs);
         copy_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
         copy_exe.addFileArg(b.path("test/link_input/copy_main.zig"));
         copy_exe.addFileArg(cc_copy.addPrefixedOutputFileArg("-o", "copy.o"));
-        copy_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-        const r = std.Build.Step.Run.create(b, "run zap link of copied glibc data");
+        copy_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, "run bs link of copied glibc data");
         r.addFileArg(copy_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
         r.addCheck(.{ .expect_stdout_exact = "via stdout\n" });
         r.addCheck(.{ .expect_stderr_exact = "1 true\n" });
@@ -1633,13 +1652,13 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         const lib_dir = so.addPrefixedOutputFileArg("-o", "libshared.so").dirname();
         const user = b.addSystemCommand(if (cc) |gcc| &.{ gcc, "-fPIE", "-c" } else &.{ zig, "cc", "-c" });
         user.addFileArg(b.path("test/link_input/shared_user.c"));
-        const so_exe = b.addRunArtifact(zap);
+        const so_exe = b.addRunArtifact(bs);
         so_exe.addArgs(&.{ "build-exe", "-lc", "-lshared" });
         so_exe.addPrefixedDirectoryArg("-L", lib_dir);
         so_exe.addFileArg(b.path("test/link_input/shared_main.zig"));
         so_exe.addFileArg(user.addPrefixedOutputFileArg("-o", "shared_user.o"));
-        so_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-        const r = std.Build.Step.Run.create(b, "run zap link of a shared library");
+        so_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, "run bs link of a shared library");
         r.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
         r.addCheck(.{ .expect_stderr_exact = "42 143 42 143\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1654,7 +1673,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         const so = b.addSystemCommand(&.{ zig, "cc", "-shared", "-fPIC", "-Wl,-soname,libsotls.so" });
         so.addFileArg(b.path("test/link_input/so_tls.c"));
         const lib_dir = so.addPrefixedOutputFileArg("-o", "libsotls.so").dirname();
-        const so_exe = b.addRunArtifact(zap);
+        const so_exe = b.addRunArtifact(bs);
         so_exe.addArgs(&.{ "build-exe", "-lc", "-lsotls" });
         so_exe.addPrefixedDirectoryArg("-L", lib_dir);
         so_exe.addFileArg(b.path("test/link_input/so_tls_main.zig"));
@@ -1664,8 +1683,8 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
             user.addFileArg(b.path("test/link_input/so_tls_user.c"));
             so_exe.addFileArg(user.addPrefixedOutputFileArg("-o", b.fmt("so_tls_{s}.o", .{name})));
         }
-        so_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-        const r = std.Build.Step.Run.create(b, "run zap link of a shared library's thread-local");
+        so_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, "run bs link of a shared library's thread-local");
         r.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
         r.addCheck(.{ .expect_stderr_exact = "main: 3 3 3 3 103\nset: 1114 1114 1114 1114 1214\nthread: 3 3 3 3 103\nafter: 1114 1114 1114 1114 1214\n" });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1679,21 +1698,24 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // call back into the program's Zig and C definitions, which it
     // exports. Upstream links the same.
     {
-        const libs = b.addSystemCommand(&.{ "sh", "-c",
+        const libs = b.addSystemCommand(&.{
+            "sh", "-c",
             \\set -e; z=$1; d=$2; s=$3
             \\for x in a b c; do "$z" cc -shared -fPIC -Wl,-soname,libneeded_$x.so "$s/needed_$x.c" -o "$d/libneeded_$x.so"; done
             \\"$z" cc -shared -fPIC -DNEEDED_D -Wl,-soname,libneeded_d.so "$s/needed_c.c" -o "$d/libneeded_d.so"
-        , "sh", zig });
+            ,
+            "sh", zig,
+        });
         const lib_dir = libs.addOutputDirectoryArg("needed");
         libs.addDirectoryArg(b.path("test/link_input"));
-        const so_exe = b.addRunArtifact(zap);
+        const so_exe = b.addRunArtifact(bs);
         so_exe.addArgs(&.{ "build-exe", "-lc", "-lneeded_a", "-lneeded_b", "-lneeded_c", "-lneeded_d" });
         so_exe.addPrefixedDirectoryArg("-L", lib_dir);
         so_exe.addFileArg(b.path("test/link_input/needed_main.zig"));
         so_exe.addFileArg(b.path("test/link_input/needed_ref.c"));
-        so_exe.setEnvironmentVariable("ZAP_ZIG", upstreamZig(b));
-        so_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-        const r = std.Build.Step.Run.create(b, "run zap link of unneeded shared libraries");
+        so_exe.setEnvironmentVariable("BS_ZIG", upstreamZig(b));
+        so_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, "run bs link of unneeded shared libraries");
         r.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
         r.addCheck(.{ .expect_stdout_exact = "" });
         r.addCheck(.{ .expect_stderr_exact = "42 0\n" });
@@ -1710,12 +1732,12 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         o.* = cc_ctor.addPrefixedOutputFileArg("-o", b.fmt("ctor{d}.o", .{i}));
     }
     for ([_][]const []const u8{ &.{"build-exe"}, &.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" } }, [_][]const u8{ "", "fini\n" }) |args, fini| {
-        const ctor_exe = b.addRunArtifact(zap);
+        const ctor_exe = b.addRunArtifact(bs);
         ctor_exe.addArgs(args);
         ctor_exe.addFileArg(b.path("test/link_input/ctor_main.zig"));
         for (ctors) |o| ctor_exe.addFileArg(o);
-        ctor_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-        const r = std.Build.Step.Run.create(b, b.fmt("run zap link of C constructors{s}", .{if (fini.len == 0) "" else " with -lc"}));
+        ctor_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, b.fmt("run bs link of C constructors{s}", .{if (fini.len == 0) "" else " with -lc"}));
         r.addFileArg(ctor_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
         r.addCheck(.{ .expect_stderr_exact = b.fmt("{{ 101, 150, 200, 1, 2 }}\n{s}", .{fini}) });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1731,12 +1753,12 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         o.* = as.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{src[0..7]}));
     }
     for ([_][2]usize{ .{ 0, 1 }, .{ 1, 0 } }, [_][]const u8{ "11 11\n", "22 22\n" }) |order, expect_comdat| {
-        const comdat_exe = b.addRunArtifact(zap);
+        const comdat_exe = b.addRunArtifact(bs);
         comdat_exe.addArg("build-exe");
         comdat_exe.addFileArg(b.path("test/link_input/comdat_main.zig"));
         for (order) |k| comdat_exe.addFileArg(comdats[k]);
-        comdat_exe.setEnvironmentVariable("ZAP_CACHE", "off");
-        const r = std.Build.Step.Run.create(b, b.fmt("run zap link of COMDAT groups ({d} first)", .{order[0] + 1}));
+        comdat_exe.setEnvironmentVariable("BS_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, b.fmt("run bs link of COMDAT groups ({d} first)", .{order[0] + 1}));
         r.addFileArg(comdat_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
         r.addCheck(.{ .expect_stderr_exact = expect_comdat });
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
@@ -1748,17 +1770,17 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     const ub = b.addSystemCommand(&.{ zig, "cc", "-fstack-protector-all", "-fno-sanitize=bounds", "-c" });
     ub.addFileArg(b.path("test/link_input/ub.c"));
     const ub_o = ub.addPrefixedOutputFileArg("-o", "ub.o");
-    const ub_exe = b.addRunArtifact(zap);
+    const ub_exe = b.addRunArtifact(bs);
     ub_exe.addArg("build-exe");
     ub_exe.addFileArg(b.path("test/link_input/ub_main.zig"));
     ub_exe.addFileArg(ub_o);
-    ub_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+    ub_exe.setEnvironmentVariable("BS_CACHE", "off");
     const ub_bin = ub_exe.addPrefixedOutputFileArg("-femit-bin=", "main");
     // The trace shows the C frame's line, from the object's DWARF, and
     // unwinds through it by its .eh_frame FDE.
     const trace_o = [_][]const u8{ "panic: signed integer overflow: 5 + 2147483647 cannot be represented in type 'int'\n", "ub.c:2:34: 0x", " in c_overflow (", "ub_main.zig:10:63: 0x" };
     for ([_]struct { []const u8, []const []const u8 }{ .{ "o", &trace_o }, .{ "s", &.{"panic: stack smashing detected\n"} } }) |case| {
-        const r = std.Build.Step.Run.create(b, b.fmt("run zap link of a C object ({s})", .{case[0]}));
+        const r = std.Build.Step.Run.create(b, b.fmt("run bs link of a C object ({s})", .{case[0]}));
         r.addFileArg(ub_bin);
         r.addArg(case[0]);
         for (case[1]) |m| r.addCheck(.{ .expect_stderr_match = m });
@@ -1770,9 +1792,9 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // whose parts run at once.
     for ([_][]const u8{ "objects", "c-sources", "lc-objects", "shared", "shared-objects" }) |part| {
         const cache = b.addSystemCommand(&.{"sh"});
-        cache.setName(b.fmt("zap build-exe with link inputs, cached ({s})", .{part}));
+        cache.setName(b.fmt("bs build-exe with link inputs, cached ({s})", .{part}));
         cache.addFileArg(b.path("test/link_input/cache.sh"));
-        cache.addArtifactArg(zap);
+        cache.addArtifactArg(bs);
         cache.addArg(zig);
         cache.addDirectoryArg(b.path("test/link_input"));
         _ = cache.addOutputDirectoryArg("work");

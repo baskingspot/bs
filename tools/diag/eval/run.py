@@ -1,39 +1,39 @@
 #!/usr/bin/env python3
-"""Scores zap's compile errors on the mistakes coding agents make.
+"""Scores bs's compile errors on the mistakes coding agents make.
 
 Upstream's compile-error suite tests what upstream thought of. This eval
 tests what agents write: Zig against an older std (0.11 to 0.16 APIs in
 0.17 code), misspelled names, a missing `try`, and the like. It takes
-the seed programs in seeds/ (correct 0.17 code that zap and upstream
+the seed programs in seeds/ (correct 0.17 code that bs and upstream
 compile), rewrites each one into mistakes by the rules in rules.py, and
-compiles every mistake with zap and with upstream zig. A seed named
+compiles every mistake with bs and with upstream zig. A seed named
 `build_*.zig` is a build.zig instead, configured with `build -l` next to
 a hello-world src/main.zig, so build scripts written against an older
-std.Build are scored through the `zap build` path. A seed named
+std.Build are scored through the `bs build` path. A seed named
 `test_*.zig` is compiled with `test`, so its test blocks count.
 
 A case whose rewrite upstream still accepts is not a mistake and is
-dropped. For each remaining case it checks, for zap and for upstream:
+dropped. For each remaining case it checks, for bs and for upstream:
 
 - loc:    the first error is on a line the rewrite changed;
 - facts:  the output (as an agent reads it: text, with source lines and
           notes) contains what the fix needs, such as the 0.17 name of an
           API (the rule's `facts`);
 
-and for zap alone:
+and for bs alone:
 
 - cand:   a candidate list names the right identifier (rules with an
           answer);
-- fix:    zap offers a fix of an error at a changed line, or one that
-          edits a changed line; applying zap's fixes round
+- fix:    bs offers a fix of an error at a changed line, or one that
+          edits a changed line; applying bs's fixes round
           after round either restores the seed ("restored"), or gives a
           program upstream compiles ("compiles"), or neither ("wrong");
-- accept: zap and upstream agree that the program is wrong. A
-          disagreement is a bug in zap and is listed.
+- accept: bs and upstream agree that the program is wrong. A
+          disagreement is a bug in bs and is listed.
 
 Usage:
 
-    python3 tools/diag/eval/run.py --zap zig-out/bin/zap [--jobs 3] [--out eval.json]
+    python3 tools/diag/eval/run.py --bs zig-out/bin/bs [--jobs 3] [--out eval.json]
     python3 tools/diag/eval/run.py --filter arraylist --show   # print each case's outputs
 
 The report lists the score per category and the cases where upstream's
@@ -90,18 +90,18 @@ def write_case(d, seed, src):
 
 
 class Compilers:
-    def __init__(self, zap, zig, cache):
-        self.zap = zap
+    def __init__(self, bs, zig, cache):
+        self.bs = bs
         self.zig = zig
         self.cache = cache
-        self.env = dict(os.environ, ZAP_CACHE="off")
+        self.env = dict(os.environ, BS_CACHE="off")
 
-    def zap_json(self, d, fname):
+    def bs_json(self, d, fname):
         if fname == "build.zig":
-            # `zap build` renders upstream's text, with zap's facts as notes.
-            _, out = self.zap_text(d, fname)
+            # `bs build` renders upstream's text, with bs's facts as notes.
+            _, out = self.bs_text(d, fname)
             return parse_bundle_text(out, d)
-        _, out = run([self.zap, compile_cmd(fname), "-fno-emit-bin", "--error-format=json", fname], d, self.env)
+        _, out = run([self.bs, compile_cmd(fname), "-fno-emit-bin", "--error-format=json", fname], d, self.env)
         diags = []
         for line in out.splitlines():
             if line.startswith("{"):
@@ -110,10 +110,10 @@ class Compilers:
                     diags.append(obj)
         return diags
 
-    def zap_text(self, d, fname):
+    def bs_text(self, d, fname):
         if fname == "build.zig":
-            return run([self.zap, "build", "-l"], d, self.env)
-        return run([self.zap, compile_cmd(fname), "-fno-emit-bin", fname], d, self.env)
+            return run([self.bs, "build", "-l"], d, self.env)
+        return run([self.bs, compile_cmd(fname), "-fno-emit-bin", fname], d, self.env)
 
     def upstream(self, d, fname):
         if fname == "build.zig":
@@ -146,8 +146,8 @@ def zig_unescape(text):
 
 
 def parse_bundle_text(text, d):
-    """zap's diagnostics as `zap_json` gives them, from the upstream-style
-    text of `zap build`: errors and notes with a location, and the
+    """bs's diagnostics as `bs_json` gives them, from the upstream-style
+    text of `bs build`: errors and notes with a location, and the
     candidates, hint and fixes it renders as notes without one. Fix spans
     are byte offsets, found from line and column in the edited file."""
     diags = []
@@ -236,7 +236,7 @@ def norm(src):
 
 
 def score(case, seed_src, cc, show):
-    d = tempfile.mkdtemp(prefix="zap-eval-")
+    d = tempfile.mkdtemp(prefix="bs-eval-")
     try:
         fname = seed_file(case.seed)
         path = os.path.join(d, fname)
@@ -244,22 +244,22 @@ def score(case, seed_src, cc, show):
         up_code, up_text = cc.upstream(d, fname)
         if up_code == 0:
             return {"id": case.id, "dropped": "upstream accepts"}
-        zap_code, zap_text = cc.zap_text(d, fname)
+        bs_code, bs_text = cc.bs_text(d, fname)
         r = {"id": case.id, "rule": case.rule.id, "category": case.rule.category, "since": case.rule.since,
              "seed": case.seed, "lines": case.lines}
-        if zap_code == 0:
-            r["accept"] = "zap accepts"
+        if bs_code == 0:
+            r["accept"] = "bs accepts"
             return r
-        diags = cc.zap_json(d, fname)
+        diags = cc.bs_json(d, fname)
         main_diags = [x for x in diags if x.get("file") == fname]
         up_errs = upstream_errors(up_text, fname)
         lines = set(case.lines)
         # The first error points at a changed line, itself or by a note.
-        r["zap_loc"] = bool(diags) and any(x.get("file") == fname and x.get("line") in lines for x in [diags[0]] + diags[0].get("notes", []))
+        r["bs_loc"] = bool(diags) and any(x.get("file") == fname and x.get("line") in lines for x in [diags[0]] + diags[0].get("notes", []))
         r["up_loc"] = bool(up_errs) and any(ln in lines for ln in [up_errs[0][0]] + up_errs[0][2])
-        r["zap_facts"] = has_facts(zap_text, case.facts)
+        r["bs_facts"] = has_facts(bs_text, case.facts)
         r["up_facts"] = has_facts(up_text, case.facts)
-        r["zap_first"] = (f"{diags[0].get('file')}:{diags[0].get('line')}: {diags[0]['msg']}" if diags else "")
+        r["bs_first"] = (f"{diags[0].get('file')}:{diags[0].get('line')}: {diags[0]['msg']}" if diags else "")
         r["up_first"] = (f"{fname}:{up_errs[0][0]}: {up_errs[0][1]}" if up_errs else up_text.strip().split("\n")[0])
         if case.answer:
             r["cand"] = any(case.answer in x.get("candidates", []) for x in diags)
@@ -271,7 +271,7 @@ def score(case, seed_src, cc, show):
         if at:
             src = case.src
             for _ in range(5):
-                fixes = [f for x in cc.zap_json(d, fname) for f in x.get("fixes", []) if f["applicability"] != "placeholder" and all(e.get("file") == fname for e in f["edits"])]
+                fixes = [f for x in cc.bs_json(d, fname) for f in x.get("fixes", []) if f["applicability"] != "placeholder" and all(e.get("file") == fname for e in f["edits"])]
                 if not fixes:
                     break
                 src = apply_fixes(src, fixes)
@@ -292,7 +292,7 @@ def score(case, seed_src, cc, show):
                     r["fix"] = "partial"
                 r["fixed_src"] = src
         if show:
-            r["zap_text"] = zap_text
+            r["bs_text"] = bs_text
             r["up_text"] = up_text
         return r
     finally:
@@ -308,16 +308,16 @@ def report(results):
     dropped = [r for r in results if "dropped" in r]
     print(f"{len(kept)} cases ({len(dropped)} rewrites dropped: upstream accepts them)\n")
     cats = sorted({r["category"] for r in kept})
-    hdr = f"{'category':<13}{'cases':>6}  {'loc zap/up':>13}  {'facts zap/up':>13}  {'cand':>7}  {'fix ok/partial/offered':>23}"
+    hdr = f"{'category':<13}{'cases':>6}  {'loc bs/up':>13}  {'facts bs/up':>13}  {'cand':>7}  {'fix ok/partial/offered':>23}"
     print(hdr)
     print("-" * len(hdr))
     for cat in cats + ["all"]:
         rs = [r for r in kept if cat == "all" or r["category"] == cat]
         scored = [r for r in rs if "accept" not in r]
         n = len(rs)
-        zl = sum(r.get("zap_loc", False) for r in scored)
+        zl = sum(r.get("bs_loc", False) for r in scored)
         ul = sum(r.get("up_loc", False) for r in scored)
-        zf = sum(r.get("zap_facts", False) for r in scored)
+        zf = sum(r.get("bs_facts", False) for r in scored)
         uf = sum(r.get("up_facts", False) for r in scored)
         cand = [r for r in scored if "cand" in r]
         fixes = [r for r in scored if "fix" in r]
@@ -326,7 +326,7 @@ def report(results):
         print(f"{cat:<13}{n:>6}  {zl:>5} / {ul:<5}  {zf:>5} / {uf:<5}  {sum(r['cand'] for r in cand):>3}/{len(cand):<3}  {good:>7} / {part:<3} / {len(fixes):<6}")
     bad = [r for r in kept if "accept" in r]
     if bad:
-        print("\nzap accepts what upstream rejects:")
+        print("\nbs accepts what upstream rejects:")
         for r in bad:
             print(f"  {r['id']}")
     wrong = [r for r in kept if r.get("fix") == "wrong"]
@@ -334,23 +334,23 @@ def report(results):
         print("\nfixes that leave or make an error where they edit:")
         for r in wrong:
             print(f"  {r['id']}")
-    print("\nupstream leaves the agent guessing (no facts), and zap:")
+    print("\nupstream leaves the agent guessing (no facts), and bs:")
     for r in kept:
         if "accept" in r or r.get("up_facts"):
             continue
-        mark = "ok  " if r.get("zap_facts") else "MISS"
+        mark = "ok  " if r.get("bs_facts") else "MISS"
         print(f"  {mark} {r['id']:<40} {r['up_first'][:110]}")
-    print("\nzap misses the facts or the location:")
+    print("\nbs misses the facts or the location:")
     for r in kept:
-        if "accept" in r or (r.get("zap_facts") and r.get("zap_loc")):
+        if "accept" in r or (r.get("bs_facts") and r.get("bs_loc")):
             continue
-        what = ("" if r.get("zap_loc") else "loc ") + ("" if r.get("zap_facts") else "facts")
-        print(f"  {what:<10} {r['id']:<40} {r['zap_first'][:110]}")
+        what = ("" if r.get("bs_loc") else "loc ") + ("" if r.get("bs_facts") else "facts")
+        print(f"  {what:<10} {r['id']:<40} {r['bs_first'][:110]}")
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--zap", default=os.path.join(REPO, "zig-out/bin/zap"))
+    p.add_argument("--bs", default=os.path.join(REPO, "zig-out/bin/bs"))
     p.add_argument("--zig", default="zig")
     p.add_argument("--jobs", type=int, default=3)
     p.add_argument("--out", help="write every case's result as JSON")
@@ -371,14 +371,14 @@ def main():
             print(c.id, c.lines)
         return
 
-    cache = tempfile.mkdtemp(prefix="zap-eval-cache-")
-    cc = Compilers(os.path.abspath(args.zap), args.zig, cache)
+    cache = tempfile.mkdtemp(prefix="bs-eval-cache-")
+    cc = Compilers(os.path.abspath(args.bs), args.zig, cache)
     try:
         # The seeds themselves must compile with both.
         for name, src in seeds.items():
-            d = tempfile.mkdtemp(prefix="zap-eval-seed-")
+            d = tempfile.mkdtemp(prefix="bs-eval-seed-")
             write_case(d, name, src)
-            for who, (code, out) in (("upstream", cc.upstream(d, seed_file(name))), ("zap", cc.zap_text(d, seed_file(name)))):
+            for who, (code, out) in (("upstream", cc.upstream(d, seed_file(name))), ("bs", cc.bs_text(d, seed_file(name)))):
                 if code != 0:
                     sys.exit(f"seed {name} does not compile with {who}:\n{out}")
             shutil.rmtree(d)
@@ -394,10 +394,10 @@ def main():
             if "dropped" in r:
                 continue
             print(by_id[r["id"]].src)
-            print("--- zap\n" + r.get("zap_text", ""))
+            print("--- bs\n" + r.get("bs_text", ""))
             print("--- upstream\n" + r.get("up_text", ""))
             if "fixed_src" in r:
-                print("--- after zap's fixes\n" + r["fixed_src"])
+                print("--- after bs's fixes\n" + r["fixed_src"])
     report(results)
     if args.out:
         with open(args.out, "w") as f:

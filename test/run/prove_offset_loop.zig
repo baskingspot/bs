@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: index out of bounds: index 76, len 64\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): `i + 32 <
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): `i + 32 <
 //! len` before the loop holds at its start only if it holds again at
 //! the back edge. The exit test there gives only `i < len`, so
 //! `s[i..][0..16]` keeps its checks, and the fourth iteration (`i` 60)

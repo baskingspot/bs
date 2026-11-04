@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs the pinned upstream Zig toolchain (used to build zap and as the
+# Installs the pinned upstream Zig toolchain (used to build bs and as the
 # reference/oracle compiler) and the matching upstream source tree (for
 # test/behavior and reading Sema/InternPool). Idempotent. Runs on
 # x86_64-linux (orbs) and aarch64-macos (Mac satellites).
@@ -24,7 +24,7 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cache="$HOME/.cache/zap"
+cache="$HOME/.cache/bs"
 mkdir -p "$cache" "$HOME/.local/bin"
 
 sha256() { # file
@@ -62,7 +62,7 @@ time fetch "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_VERSION.tar.xz" \
 
 # Orbs are disposable, so zig goes on PATH there. A Mac satellite is the
 # owner's own machine with its own zig; don't shadow it. Use
-# ~/.cache/zap/zig-aarch64-macos-$ZIG_VERSION/zig explicitly there.
+# ~/.cache/bs/zig-aarch64-macos-$ZIG_VERSION/zig explicitly there.
 if [ "$ZIG_HOST" = x86_64-linux ]; then
   ln -sfn "$bin_dir/zig" "$HOME/.local/bin/zig"
 fi

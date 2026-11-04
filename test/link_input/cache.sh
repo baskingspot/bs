@@ -2,25 +2,25 @@
 # `zig build test`: an executable with object and archive inputs through
 # the cache. The objects are link-only inputs: each build, edited in a
 # scratch copy, must give the bytes of a build without the cache, and edit
-# builds check themselves against full builds (ZAP_CACHE_VERIFY,
-# ZAP_CACHE_CHECK). C sources' objects are link inputs the same way.
-#   $1 zap  $2 upstream zig  $3 test/link_input  $4 scratch directory
+# builds check themselves against full builds (BS_CACHE_VERIFY,
+# BS_CACHE_CHECK). C sources' objects are link inputs the same way.
+#   $1 bs  $2 upstream zig  $3 test/link_input  $4 scratch directory
 #   $5 the part to check, each its own build step, so that they run at once:
 #      objects, c-sources, lc-objects, shared, shared-objects
 #   $6 a global cache holding std's ZIR, which the empty one starts from
 set -eu
-unset ZIG_LOCAL_CACHE_DIR ZIG_GLOBAL_CACHE_DIR ZAP_CACHE ZAP_CACHE_VERIFY ZAP_CACHE_CHECK
+unset ZIG_LOCAL_CACHE_DIR ZIG_GLOBAL_CACHE_DIR BS_CACHE BS_CACHE_VERIFY BS_CACHE_CHECK
 rm -rf "$4"
 mkdir -p "$4"
-zap=$(realpath "$1") zig=$2 src=$(realpath "$3") work=$(realpath "$4") part=$5
-mkdir -p "$work/global/zap"
-cp -r "$6/zap/zir" "$work/global/zap"
+bs=$(realpath "$1") zig=$2 src=$(realpath "$3") work=$(realpath "$4") part=$5
+mkdir -p "$work/global/bs"
+cp -r "$6/bs/zir" "$work/global/bs"
 cd "$work"
 cp "$src"/main.zig "$src"/lib.c "$src"/tls.c "$src"/tlsie.c "$src"/a1.c "$src"/a2.c "$src"/libc.c "$src"/libc_main.zig "$src"/copy.c "$src"/asm_main.zig "$src"/asm.h "$src"/asm_cpp.S "$src"/asm_plain.s .
-export ZAP_ZIG="$zig"
+export BS_ZIG="$zig"
 
 fail() {
-    echo "zap link input cache check failed: $1" >&2
+    echo "bs link input cache check failed: $1" >&2
     [ -f log ] && cat log >&2
     exit 1
 }
@@ -36,16 +36,16 @@ objects() {
     done
 }
 
-# $1 what the build must say (ZAP_CACHE_TIMING), $2 what the program
+# $1 what the build must say (BS_CACHE_TIMING), $2 what the program
 # prints; the build's log stays in cached.log. The build without the cache
 # runs once per set of inputs: a build that changed none compares with the
 # last one's bytes.
 build() {
-    ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 ZAP_CACHE_VERIFY=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail "$1"
+    BS_CACHE_TIMING=1 BS_CACHE_CHECK=1 BS_CACHE_VERIFY=1 "$bs" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail "$1"
     cp log cached.log
     grep -qF -- "$1" log || fail "expected '$1'"
     full=full-$( (echo "$args"; cat ./*.zig ./*.c ./*.h ./*.S ./*.s ./*.o ./*.a ./*.so 2>/dev/null) | sha256sum | cut -c1-16)
-    [ -f "$full" ] || ZAP_CACHE=off "$zap" $args --global-cache-dir global -femit-bin="$full" >log 2>&1 || fail "$1: without the cache"
+    [ -f "$full" ] || BS_CACHE=off "$bs" $args --global-cache-dir global -femit-bin="$full" >log 2>&1 || fail "$1: without the cache"
     cmp -s main "$full" || fail "$1: the output differs from a build without the cache"
     ./main >out 2>&1 || fail "$1: the program failed"
     grep -qF -- "$2" out || fail "$1: the program printed '$(cat out)'"
@@ -105,13 +105,13 @@ lazy "a function's constant changed"
 sed -i 's/fn_table\[i\](1) });/fn_table[i](1) });\n    std.debug.print("more {d}\\n", .{([_]*const fn () callconv(.c) c_int{@extern(*const fn () callconv(.c) c_int, .{ .name = "unused_member_fn" })})[i]()});/' main.zig
 build "external symbols changed" "more 1"
 eager "a function's constant names a new symbol"
-# Without ZAP_CACHE_VERIFY, whose full build writes a new base, a lazy
+# Without BS_CACHE_VERIFY, whose full build writes a new base, a lazy
 # edit build leaves a log; a relink from it links what the edit build did.
 sed -i 's/{d} {d} {d}!\\n"/{d} {d} {d}?\\n"/' main.zig
-ZAP_CACHE_TIMING=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >cached.log 2>&1 || fail "an edit without verifying"
+BS_CACHE_TIMING=1 "$bs" $args --cache-dir local --global-cache-dir global -femit-bin=main >cached.log 2>&1 || fail "an edit without verifying"
 lazy "an edit without verifying"
 mv main edited
-ZAP_CACHE_TIMING=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail "a relink from the log"
+BS_CACHE_TIMING=1 "$bs" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail "a relink from the log"
 grep -qF "no input changed; relinked" log || fail "expected a relink from the log"
 cmp -s main edited || fail "the relink from the log differs from the edit build's output"
 ./main >out 2>&1 && grep -qF -- "?" out || fail "the relink from the log lost the edit"
@@ -176,7 +176,7 @@ printf '#define LIBV 1\n' >libv.h
 printf '#include "libv.h"\nint libv_a(void) { return LIBV; }\n' >libv_a.c
 printf '#include "libv.h"\nint libv_b(void) { return LIBV + 1; }\n' >libv_b.c
 touch -d '1 minute ago' libv.h libv_a.c libv_b.c
-clib() { ZAP_CACHE_TIMING=1 "$zap" build-lib libv_a.c libv_b.c --cache-dir local --global-cache-dir global -femit-bin=libv.a >log 2>&1 || fail "C library: $1"; }
+clib() { BS_CACHE_TIMING=1 "$bs" build-lib libv_a.c libv_b.c --cache-dir local --global-cache-dir global -femit-bin=libv.a >log 2>&1 || fail "C library: $1"; }
 clib "first build"
 first=$(stat -c %i libv.a)
 clib "no change"
@@ -249,10 +249,10 @@ sed -i 's/shared_twice(21)/shared_twice(22)/' so_main.zig
 build "inputs changed, first $work/so_main.zig" "42 44"
 lazy ".so: the Zig code changed"
 sed -i 's/shared_twice(22)/shared_twice(23)/' so_main.zig
-ZAP_CACHE_TIMING=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >cached.log 2>&1 || fail ".so: an edit without verifying"
+BS_CACHE_TIMING=1 "$bs" $args --cache-dir local --global-cache-dir global -femit-bin=main >cached.log 2>&1 || fail ".so: an edit without verifying"
 lazy ".so: an edit without verifying"
 mv main edited
-ZAP_CACHE_TIMING=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail ".so: a relink from the log"
+BS_CACHE_TIMING=1 "$bs" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail ".so: a relink from the log"
 grep -qF "no input changed; relinked" log || fail ".so: expected a relink from the log"
 cmp -s main edited || fail ".so: the relink from the log differs from the edit build's output"
 # The same symbols, other code.
@@ -263,11 +263,11 @@ eager ".so: the library changed"
 # A library that no longer defines a name the Zig code imports.
 sed -i 's/^int shared_twice.*$//; s/global: shared_twice;//' shared.c shared.map
 so
-if ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1; then
+if BS_CACHE_TIMING=1 BS_CACHE_CHECK=1 "$bs" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1; then
     fail ".so: a dropped symbol linked"
 fi
 grep -qF "shared_twice" log || fail ".so: the error does not name the dropped symbol"
-! grep -qiE "panic|unreachable" log || fail ".so: a dropped symbol crashed zap"
+! grep -qiE "panic|unreachable" log || fail ".so: a dropped symbol crashed bs"
 ;;
 
 shared-objects)

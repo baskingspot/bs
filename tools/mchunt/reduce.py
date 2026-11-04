@@ -2,14 +2,14 @@
 """Minimizes a Zig program while a mismatch persists (tools/mchunt).
 
     python3 tools/mchunt/reduce.py .work/found/miscompile-1234
-    python3 tools/mchunt/reduce.py prog.zig --bad zap      # any program
+    python3 tools/mchunt/reduce.py prog.zig --bad bs      # any program
 
 The property kept is the finding's: upstream zig (Debug) compiles the
-program and runs it to a normal exit or a panic, and the failing zap
+program and runs it to a normal exit or a panic, and the failing bs
 configuration compiles it and disagrees, with the same kinds of outcome
-as the original (say, upstream exits normally and zap panics with
+as the original (say, upstream exits normally and bs panics with
 "integer overflow"). A control configuration that agreed with upstream
-originally (zap with ZAP_INLINE=0, say) must keep agreeing, so the
+originally (bs with BS_INLINE=0, say) must keep agreeing, so the
 reduction stays on the same bug and keeps its attribution.
 
 Passes, repeated until nothing shrinks: delete statements and
@@ -70,10 +70,10 @@ class Property:
         if not ok:
             return False
         b = H.run_config(self.tools, self.bad, src, self.scratch)
-        if self.cls == "zap-crash":
+        if self.cls == "bs-crash":
             if b.status != "compile-crash" or first_error(b.detail) != self.err:
                 return False
-        elif self.cls == "zap-reject":
+        elif self.cls == "bs-reject":
             if b.status != "compile-error" or first_error(b.detail) != self.err:
                 return False
         elif not b.compiled() or norm_kind(b) != self.bad_kind:
@@ -488,12 +488,12 @@ class Reducer:
 
 
 def property_for(meta, tools):
-    bad = "zap" if "zap" in meta["bad"] else meta["bad"][0]
+    bad = "bs" if "bs" in meta["bad"] else meta["bad"][0]
     oc = meta["outcomes"]
     up = H.Outcome(**{k: oc["zig"][k] for k in ("status", "lines", "code", "detail")})
     b = H.Outcome(**{k: oc[bad][k] for k in ("status", "lines", "code", "detail")})
     control = None
-    for c in ("zap-noinline", "zap-inline-safe", "zap-safe", "zap"):
+    for c in ("bs-noinline", "bs-inline-safe", "bs-safe", "bs"):
         if c in oc and c not in meta["bad"] and c != bad:
             control = c
             break
@@ -501,10 +501,10 @@ def property_for(meta, tools):
     return Property(tools, bad, norm_kind(up), norm_kind(b), control, cls, first_error(b.detail) if not b.compiled() else "")
 
 
-def reduce_finding(d, zap=None, zig=None, minutes=90):
+def reduce_finding(d, bs=None, zig=None, minutes=90):
     """Reduces the finding in directory `d`; writes reduced.zig,
     reduced.json and report.md there."""
-    tools = H.Tools(zap, zig)
+    tools = H.Tools(bs, zig)
     meta = json.load(open(os.path.join(d, "meta.json")))
     prop = property_for(meta, tools)
     logf = open(os.path.join(d, "reduce.log"), "a")
@@ -515,7 +515,7 @@ def reduce_finding(d, zap=None, zig=None, minutes=90):
 
     text = open(os.path.join(d, "orig.zig")).read()
     log(f"reducing with {prop.bad.name} (control {prop.control.name if prop.control else '-'}), "
-        f"upstream {prop.up_kind!r}, zap {prop.bad_kind!r}")
+        f"upstream {prop.up_kind!r}, bs {prop.bad_kind!r}")
     try:
         r = Reducer(prop, log, time.time() + minutes * 60)
         out = r.run(text)
@@ -544,7 +544,7 @@ def describe(d, text, tools, meta):
     agree = [n for n, o in res.items() if o.key() == up.key()]
     differ = [n for n, o in res.items() if o.key() != up.key()]
     rep = [f"# {meta['class']} (seed {meta['seed']})", "",
-           f"zap {meta.get('zap_rev', '?')[:12]}; agree with upstream Debug: {', '.join(agree)}; "
+           f"bs {meta.get('bs_rev', '?')[:12]}; agree with upstream Debug: {', '.join(agree)}; "
            f"differ: {', '.join(differ)}", "", "```zig", text.rstrip(), "```", ""]
     for n, o in res.items():
         rep += [f"## {n}", "```", o.text(), "```", ""]
@@ -555,25 +555,25 @@ def describe(d, text, tools, meta):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("target", help="a finding directory, or a .zig file (with --bad)")
-    ap.add_argument("--bad", help="for a .zig file: the failing configuration (zap, zap-safe, zap-noinline, ...)")
+    ap.add_argument("--bad", help="for a .zig file: the failing configuration (bs, bs-safe, bs-noinline, ...)")
     ap.add_argument("--control", help="for a .zig file: a configuration that must keep agreeing with upstream")
-    ap.add_argument("--zap")
+    ap.add_argument("--bs")
     ap.add_argument("--zig")
     ap.add_argument("--minutes", type=float, default=90)
     args = ap.parse_args()
     if os.path.isdir(args.target):
-        print(reduce_finding(args.target, args.zap, args.zig, args.minutes))
+        print(reduce_finding(args.target, args.bs, args.zig, args.minutes))
         return
-    tools = H.Tools(args.zap, args.zig)
+    tools = H.Tools(args.bs, args.zig)
     text = open(args.target).read()
     scratch = H.new_scratch()
     src = os.path.join(scratch, "p.zig")
     open(src, "w").write(text)
     up = H.run_config(tools, H.UP_DEBUG, src, scratch)
-    b = H.run_config(tools, H.BY_NAME[args.bad or "zap"], src, scratch)
+    b = H.run_config(tools, H.BY_NAME[args.bad or "bs"], src, scratch)
     shutil.rmtree(scratch, ignore_errors=True)
-    cls = "miscompile" if b.compiled() else ("zap-crash" if b.status == "compile-crash" else "zap-reject")
-    prop = Property(tools, args.bad or "zap", norm_kind(up), norm_kind(b), args.control, cls,
+    cls = "miscompile" if b.compiled() else ("bs-crash" if b.status == "compile-crash" else "bs-reject")
+    prop = Property(tools, args.bad or "bs", norm_kind(up), norm_kind(b), args.control, cls,
                     first_error(b.detail) if not b.compiled() else "")
     try:
         out = Reducer(prop, lambda m: print(m, file=sys.stderr), time.time() + args.minutes * 60).run(text)

@@ -1,6 +1,6 @@
 //! The unit the backends hand to the linkers: one function's machine code, or
 //! one piece of data, with symbolic relocations. See "CodeGen" and "Linkers"
-//! in docs/architecture.md.
+//! in docs/slop/architecture.md.
 //!
 //! An Atom holds no InternPool indices and no addresses, so it can be cached
 //! on disk and relinked unchanged. It does not own its slices; whoever
@@ -81,7 +81,7 @@ pub const SymbolKey = enum(u128) {
     }
 
     const Hasher = std.crypto.auth.siphash.SipHash128(1, 3);
-    const hash_key: [Hasher.key_length]u8 = "zap symbol key!!".*;
+    const hash_key: [Hasher.key_length]u8 = "bs symbol key!!!".*;
 };
 
 /// Where an atom is placed.
@@ -95,7 +95,7 @@ pub const Section = enum(u8) {
     /// relative to the thread pointer (`x86_64_tpoff32`).
     tdata,
     tbss,
-    /// Coverage instrumentation (`-ffuzz`; docs/architecture.md,
+    /// Coverage instrumentation (`-ffuzz`; docs/slop/architecture.md,
     /// "Fuzzing"): one zero-filled byte per coverage point
     /// (`__sancov_cntrs`), and one address per point, in the same order
     /// (`__sancov_pcs1`). The linker keeps each section's atoms in input
@@ -104,7 +104,7 @@ pub const Section = enum(u8) {
     sancov_pcs,
     /// Arrays of function addresses the start code runs before `main`
     /// (`.preinit_array`, then `.init_array`) and at exit (`.fini_array`),
-    /// from C objects (docs/architecture.md, "Object, archive and
+    /// from C objects (docs/slop/architecture.md, "Object, archive and
     /// shared-library inputs"). The linker keeps each section's atoms in
     /// input order, so its producer orders them by priority, and defines
     /// its start and end (`__init_array_start` and the others).
@@ -206,7 +206,7 @@ pub const Reloc = extern struct {
         /// S's descriptor after `aarch64_tlvp_page21`. A must be 0.
         aarch64_tlvp_pageoff12,
         /// x86_64 local-dynamic TLS, in position-independent code only
-        /// (see "Position-independent code" in docs/architecture.md).
+        /// (see "Position-independent code" in docs/slop/architecture.md).
         ///
         /// 32-bit PC-relative address of the module's TLS GOT pair (module
         /// ID, 0), which `__tls_get_addr` takes: GOT + A - P (ELF
@@ -232,7 +232,7 @@ pub const Reloc = extern struct {
         /// __tls_get_addr`. A = -4.
         x86_64_tlsgd,
         /// 32-bit absolute addresses, in non-PIE code from C objects
-        /// (docs/architecture.md, "Object, archive and shared-library
+        /// (docs/slop/architecture.md, "Object, archive and shared-library
         /// inputs"), which only non-PIE executables take: S + A,
         /// zero-extended and checked to fit u32 (ELF R_X86_64_32), and
         /// sign-extended and checked to fit i32 (R_X86_64_32S).

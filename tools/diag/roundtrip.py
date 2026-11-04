@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Checks that zap's fixes fix what they claim to.
+"""Checks that bs's fixes fix what they claim to.
 
-For each Zig file, applies the fixes zap reports (`--error-format=json`)
+For each Zig file, applies the fixes bs reports (`--error-format=json`)
 to a copy, round after round until none are left, and checks each round
-by zap's account and by upstream zig's: no error may remain or appear at
+by bs's account and by upstream zig's: no error may remain or appear at
 an edited place, and no syntax error anywhere. Other new errors are the
 ones the fixed errors hid (AstGen errors stop Sema). The design's "fixes
-round-trip" test ("Diagnostics" in docs/architecture.md):
+round-trip" test ("Diagnostics" in docs/slop/architecture.md):
 
     python3 tools/diag/roundtrip.py test/diag/*.zig
     python3 tools/diag/roundtrip.py --all test/diag/*.zig  # `maybe` and placeholders too
@@ -25,11 +25,11 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def zap_errors(zap, path):
-    """zap's diagnostics for `path` (run from its directory), as dicts."""
+def bs_errors(bs, path):
+    """bs's diagnostics for `path` (run from its directory), as dicts."""
     out = subprocess.run(
-        [zap, "build-exe", "-target", "x86_64-linux", "-fno-emit-bin", "--error-format=json", os.path.basename(path)],
-        cwd=os.path.dirname(path), capture_output=True, text=True, env=dict(os.environ, ZAP_CACHE="off"),
+        [bs, "build-exe", "-target", "x86_64-linux", "-fno-emit-bin", "--error-format=json", os.path.basename(path)],
+        cwd=os.path.dirname(path), capture_output=True, text=True, env=dict(os.environ, BS_CACHE="off"),
     )
     diags = []
     for line in out.stdout.splitlines() + out.stderr.splitlines():
@@ -87,14 +87,14 @@ def at_edit(offset, ranges):
     return any(s <= offset <= e for s, e in ranges)
 
 
-def check(zap, zig, case, kinds):
-    tmp = tempfile.mkdtemp(prefix="zap-roundtrip-")
+def check(bs, zig, case, kinds):
+    tmp = tempfile.mkdtemp(prefix="bs-roundtrip-")
     try:
         path = os.path.join(tmp, os.path.basename(case))
         shutil.copy(case, path)
         problems = []
         n_applied = 0
-        before = zap_errors(zap, path)
+        before = bs_errors(bs, path)
         for _ in range(20):
             fixes = [f for d in before for f in d.get("fixes", []) if f["applicability"] in kinds]
             if not fixes:
@@ -102,15 +102,15 @@ def check(zap, zig, case, kinds):
             applied, ranges = apply(path, fixes)
             n_applied += len(applied)
             fixed = sorted(d["msg"] for d in before if any(f in applied for f in d.get("fixes", [])))
-            for d in zap_errors(zap, path):
+            for d in bs_errors(bs, path):
                 if d.get("code") == "syntax" or ("span" in d and at_edit(d["span"][0], ranges)):
-                    problems.append(f"after fixing {fixed}, zap: {d.get('line')}:{d.get('col')}: {d['msg']}")
+                    problems.append(f"after fixing {fixed}, bs: {d.get('line')}:{d.get('col')}: {d['msg']}")
             for offset, msg in upstream_errors(zig, path):
                 if at_edit(offset, ranges) or (msg.startswith("expected ") and not msg.startswith("expected type ")):
                     problems.append(f"after fixing {fixed}, upstream: {msg}")
             if problems:
                 break
-            before = zap_errors(zap, path)
+            before = bs_errors(bs, path)
         return n_applied, problems, open(path).read() if problems else None
     finally:
         shutil.rmtree(tmp)
@@ -118,7 +118,7 @@ def check(zap, zig, case, kinds):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--zap", default=os.path.join(REPO, "zig-out/bin/zap"))
+    p.add_argument("--bs", default=os.path.join(REPO, "zig-out/bin/bs"))
     p.add_argument("--zig", default="zig")
     p.add_argument("--all", action="store_true", help="also apply `maybe` and placeholder fixes")
     p.add_argument("files", nargs="+")
@@ -127,7 +127,7 @@ def main():
     failed = 0
     total = 0
     for case in args.files:
-        n, problems, src = check(os.path.abspath(args.zap), args.zig, os.path.abspath(case), kinds)
+        n, problems, src = check(os.path.abspath(args.bs), args.zig, os.path.abspath(case), kinds)
         total += n
         if problems:
             failed += 1

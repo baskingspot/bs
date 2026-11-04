@@ -1,4 +1,4 @@
-/* A shared library that zap's executables import from (build.zig,
+/* A shared library that bs's executables import from (build.zig,
  * `addLinkInputTests`): versioned functions, and a data object with an
  * alias that the library's own code uses. */
 int shared_counter = 41;

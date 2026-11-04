@@ -1,5 +1,5 @@
-//! A smaller test runner for zap's conformance harness (`run.py
-//! --test-runner`). It speaks the same `@zap-test` line protocol as
+//! A smaller test runner for bs's conformance harness (`run.py
+//! --test-runner`). It speaks the same `@bs-test` line protocol as
 //! `test_runner.zig` (documented there) but needs little of std: its own
 //! `_start`, which sets up TLS as std.start does, raw `write` and `exit`
 //! system calls, and `builtin.test_functions`. It sets up
@@ -205,7 +205,7 @@ const Line = struct {
     len: usize = 0,
 
     fn add(l: *Line, s: []const u8) void {
-        if (l.len == 0) l.raw("@zap-test ");
+        if (l.len == 0) l.raw("@bs-test ");
         l.raw(s);
     }
 

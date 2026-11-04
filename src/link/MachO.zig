@@ -40,7 +40,7 @@
 //! (`Dwarf.zig`), goes in a dSYM bundle next to the executable, matched to
 //! it by UUID, which lldb and std.debug read; `__TEXT,__unwind_info` holds
 //! compact unwind entries from each entry's `frame`, which libunwind, lldb,
-//! and std.debug's unwinder read. There is no __eh_frame: the frames zap
+//! and std.debug's unwinder read. There is no __eh_frame: the frames bs
 //! describes all have compact encodings, as LLVM and ld64 emit them.
 //!
 //! Thread-locals work as with ld64: `.tdata` and `.tbss` atoms make up the
@@ -2134,7 +2134,7 @@ test "links and runs a program that writes from __TEXT,__const and exits with 42
     const io = std.testing.io;
     const Encoder = @import("../codegen/aarch64/Encoder.zig");
 
-    const msg_text = "Hello from zap!\n";
+    const msg_text = "Hello from bs!\n";
     const msg: SymbolKey = .fromContents(.rodata, .@"1", msg_text, &.{}, &.{});
     const msg_ptr: SymbolKey = .fromName("msg_ptr");
     const write_ptr: SymbolKey = .fromName("write_ptr");

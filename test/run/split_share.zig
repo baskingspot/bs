@@ -3,7 +3,7 @@
 //! A value loaded in a promoted variable's register (`Live.share`) that
 //! lives across a call keeps that register when the variable is evicted
 //! later, and must then be saved around the call itself. mchunt seed
-//! 404209511203, reduced; zap printed "ck end 1". Prints what upstream's
+//! 404209511203, reduced; bs printed "ck end 1". Prints what upstream's
 //! ReleaseSafe build prints.
 const std = @import("std");
 const E = error{ Alpha, Beta, Gamma };

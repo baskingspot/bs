@@ -1,4 +1,4 @@
-// An executable of C only: zap's start code calls this main, and the
+// An executable of C only: bs's start code calls this main, and the
 // 128-bit division is compiler_rt's __udivti3.
 #include <stdio.h>
 #include <stdlib.h>

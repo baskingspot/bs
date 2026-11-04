@@ -1,8 +1,8 @@
-//! `zap ast-check`: upstream's `zig ast-check`, copied from upstream 0.17.1's
+//! `bs ast-check`: upstream's `zig ast-check`, copied from upstream 0.17.1's
 //! src/main.zig (cmdAstCheck) without the `-t` text dump, which upstream
 //! also builds only with debug extensions. Tools such as zls run it to get
 //! AstGen's errors (unused locals and parameters). Copyright (c) Zig
-//! contributors. MIT licensed (see upstream/LICENSE).
+//! contributors. MIT licensed (see LICENSE-ZIG).
 
 const std = @import("std");
 const Io = std.Io;

@@ -1,4 +1,4 @@
-//! Inlining within a budget (docs/architecture.md): which calls of a
+//! Inlining within a budget (docs/slop/architecture.md): which calls of a
 //! function's IR are candidates, whether the function can itself be
 //! inlined, and splicing callee bodies into a caller's IR in the shape
 //! Sema gives inline calls. Target-independent; Emit schedules it.
@@ -471,7 +471,7 @@ const Hasher = struct {
         const data = ir.instructions.items(.data)[@backingInt(i)];
         const tag = ir.instructions.items(.tag)[@backingInt(i)];
         try h.word(h.number(i));
-        try h.word(@intFromEnum(tag));
+        try h.word(@backingInt(tag));
         switch (tag) {
             .unreach, .trap, .breakpoint, .dbg_inline_end, .ret_addr, .frame_addr => {},
             .arg => {

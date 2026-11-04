@@ -2,7 +2,7 @@
 //! first built into the shared SSA form (`../Ssa.zig`), whose blocks this
 //! file emits in layout order. Values still lower through per-instruction
 //! code, but scalar values get registers from linear scan and the rest
-//! share stack slots by lifetime (step 2 of docs/architecture.md,
+//! share stack slots by lifetime (step 2 of docs/slop/architecture.md,
 //! "Optimizing backend"; see "Registers" below).
 //!
 //! Frame: `push rbp; mov rbp, rsp`, the callee-saved registers the function
@@ -11,7 +11,7 @@
 //! (positive offsets from rsp).
 //!
 //! Calling conventions:
-//! - `.auto` (zap to zap; see `autoClass`): arguments of up to 8 bytes in
+//! - `.auto` (bs to bs; see `autoClass`): arguments of up to 8 bytes in
 //!   rdi, rsi, rdx, rcx, r8, r9, of 9 to 16 bytes in two consecutive ones
 //!   (never split with the stack), f16/f32/f64 in xmm0-xmm7; the rest, and
 //!   what does not fit, at 8-byte aligned offsets of the outgoing area,
@@ -420,7 +420,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
 
 /// Whether `-ffuzz` instruments the function: in a module with `-ffuzz`
 /// (never compiler_rt or the fuzzer's own family), not naked, and not after
-/// `@disableInstrumentation()` (docs/architecture.md, "Fuzzing").
+/// `@disableInstrumentation()` (docs/slop/architecture.md, "Fuzzing").
 fn instrumented(emit: *Emit, ir: *const Ir) bool {
     const ip = &emit.zcu.ip;
     const func = ip.keyPayload(.func, ir.func);
@@ -499,7 +499,7 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
     const nav = ip.getNav(ip.keyPayload(.func, cg.ir.func).owner_nav);
     const tree = try cg.emit.zcu.fe.tree(@fromBackingInt(nav.file));
     const decl = cg.emit.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst);
-    try cg.emit.addError(nav.file, tree.nodeToSpan(decl.src_node), "zap codegen: " ++ fmt, args);
+    try cg.emit.addError(nav.file, tree.nodeToSpan(decl.src_node), "bs codegen: " ++ fmt, args);
     return error.CodegenFail;
 }
 
@@ -1901,7 +1901,7 @@ fn genSplit(cg: *CodeGen, inst: Inst.Index, q: u32) Error!void {
 }
 
 /// Copy elision decided from the IR before liveness (step 2 of the
-/// optimizing backend's successors in docs/architecture.md):
+/// optimizing backend's successors in docs/slop/architecture.md):
 /// - Return value: in a function that returns through memory, an `alloc`
 ///   of the result type whose load every `ret` returns (the load being
 ///   the last value of the `ret`'s block, so nothing else reads it) is the
@@ -2754,7 +2754,7 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
 
 /// Calls panic handler `target` from cold code through a chain of stubs,
 /// one per call the backend inlined that is open here, so that the stack
-/// trace shows the frames those calls would have had (docs/architecture.md,
+/// trace shows the frames those calls would have had (docs/slop/architecture.md,
 /// "Synthetic panic frames"): the call itself is at the outermost such
 /// call's site, in its caller, and the stubs after the epilogue
 /// (`emitStubs`) are at each next site inward, the last at the check.
@@ -4619,7 +4619,7 @@ fn atomicRmw(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
 // ---------------------------------------------------------------------------
 // Inline assembly
 //
-// Templates use AT&T syntax, as upstream's x86_64 backend parses them. zap
+// Templates use AT&T syntax, as upstream's x86_64 backend parses them. bs
 // assembles the instructions that system-call stubs and entry points use.
 // Operands with `{reg}` constraints are loaded into (or stored from) that
 // register; `X`, `i`, and `n` inputs are substituted into the template as
@@ -4798,7 +4798,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
             cg.outermost_frame = true;
             return;
         }
-        return cg.fail("zap does not support the assembler directive '{s}' yet", .{line});
+        return cg.fail("bs does not support the assembler directive '{s}' yet", .{line});
     }
     const sp = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
     const mnemonic = line[0..sp];
@@ -4807,7 +4807,7 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
         // A jump to a local label.
         const label = try cg.localLabel(locals, arg, line);
         if (std.mem.eql(u8, mnemonic, "jmp")) return cg.e.jmp(.{ .label = label });
-        const cond = asmCond(mnemonic[1..]) orelse return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line});
+        const cond = asmCond(mnemonic[1..]) orelse return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
         return cg.e.jcc(cond, .{ .label = label });
     }
     // The address of a local label: `leaq 0f(%rip), %rdx`.
@@ -4883,7 +4883,7 @@ fn asmOperand(cg: *CodeGen, tok_in: []const u8, names: *const std.StringHashMapU
         const v = std.fmt.parseInt(i64, tok[1..], 0) catch return cg.fail("bad asm immediate '{s}'", .{tok});
         return .{ .imm = v };
     }
-    return cg.fail("zap does not support asm operand '{s}' yet", .{tok});
+    return cg.fail("bs does not support asm operand '{s}' yet", .{tok});
 }
 
 /// An AT&T memory operand: `%fs:disp`, `disp(%base)`, or
@@ -4955,7 +4955,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
             .imm => |v| if (ops[1] == .mem) return e.mov(suffix_size orelse return cg.fail("asm 'mov' needs a size suffix: '{s}'", .{line}), .{ .mem = m.mem }, .{ .imm = v }),
             else => {},
         }
-        return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line});
+        return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
     }
     if (ops.len == 0) {
         if (eql(u8, mnemonic, "syscall")) return e.syscall();
@@ -5004,12 +5004,12 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
                 'w' => .word,
                 'l' => .dword,
                 'q' => .qword,
-                else => return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line}),
+                else => return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line}),
             };
             const src: Encoder.Rm = switch (ops[0]) {
                 .reg => |r| .{ .reg = r.reg },
-                .mem => |m| if (m.fs) return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line}) else .{ .mem = m.mem },
-                .imm, .sym => return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line}),
+                .mem => |m| if (m.fs) return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line}) else .{ .mem = m.mem },
+                .imm, .sym => return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line}),
             };
             return e.crc32(dst.size, src_size, dst.reg, src);
         }
@@ -5047,7 +5047,7 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         };
         if (eql(u8, base, "xchg") and ops[0] == .reg) return e.xchg(size, .{ .reg = dst.reg }, ops[0].reg.reg);
     }
-    return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line});
+    return cg.fail("bs does not support this inline assembly instruction yet: '{s}'", .{line});
 }
 
 // ---------------------------------------------------------------------------
@@ -5113,8 +5113,8 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
         else if (ip.keyTag(u.val) == .extern_var)
             .{ .key = undefined, .off = 0, .ext = ip.keyPayload(.extern_var, u.val).name }
         else
-        // A local constant declared `align(n)` keeps its alignment.
-        .{ .key = try emit.uavKey(u.val, if (u.orig_ty == .none) 0 else explicitAlignment(ip, u.orig_ty)), .off = 0 },
+            // A local constant declared `align(n)` keeps its alignment.
+            .{ .key = try emit.uavKey(u.val, if (u.orig_ty == .none) 0 else explicitAlignment(ip, u.orig_ty)), .off = 0 },
         .field => |f| blk: {
             var parent = try ptrTarget(emit, f.base);
             const container = Type.ptrInfo(ip, ip.typeOf(f.base)).child;
@@ -5490,7 +5490,7 @@ fn cClassCtx(cg: *CodeGen, ty: Index, is_ret: bool) CClass {
         },
     }
     // Aggregates and vectors: each eightbyte gets the class of the fields
-    // in it (psABI 3.2.3), as upstream's `classifySystemV`. zap's target
+    // in it (psABI 3.2.3), as upstream's `classifySystemV`. bs's target
     // has no AVX, so anything over two eightbytes is in memory.
     const size = Type.abiSize(ip, ty);
     if (size > 16) return .memory;
@@ -6023,7 +6023,6 @@ fn cRet(cg: *CodeGen, operand: Ref) Error!void {
     }
 }
 
-
 // ---------------------------------------------------------------- Win64 calls
 
 /// How the Win64 convention passes a value, as upstream's
@@ -6118,7 +6117,7 @@ fn winCallResult(cg: *CodeGen, ret_ty: Index, dst: ?Mem) Error!void {
 }
 
 /// The callee side of the Win64 convention: saves the registers it
-/// preserves that zap's code may use (rsi, rdi, xmm6-xmm15; the others
+/// preserves that bs's code may use (rsi, rdi, xmm6-xmm15; the others
 /// are callee-saved in SysV too), and gives each `arg` a home, spilling
 /// register arguments to slots and copying by-reference ones.
 fn setupWinParams(cg: *CodeGen) Error!void {

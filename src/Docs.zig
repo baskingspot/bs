@@ -5,13 +5,13 @@
 //! in the compilation's graph, and `main.wasm`, the viewer.
 //!
 //! The viewer is the same for every project: lib/docs/wasm compiled for
-//! wasm32 in ReleaseSmall. zap has no wasm backend, so zap's build compiles
-//! it with the upstream zig that builds zap, from zap's default zig lib
+//! wasm32 in ReleaseSmall. bs has no wasm backend, so bs's build compiles
+//! it with the upstream zig that builds bs, from bs's default zig lib
 //! directory, and embeds it (`docs_wasm`). With another lib directory
 //! (`--zig-lib-dir`), the html and js come from that directory and the
 //! viewer stays the embedded one.
 //!
-//! Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
+//! Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 const std = @import("std");
 const Io = std.Io;

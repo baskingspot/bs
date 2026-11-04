@@ -1,4 +1,4 @@
-//! The project `zig build test-build` builds with `zap build` (check.sh).
+//! The project `zig build test-build` builds with `bs build` (check.sh).
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        // As ghostty's: zap accepts it and says so in builtin.unwind_tables.
+        // As ghostty's: bs accepts it and says so in builtin.unwind_tables.
         .unwind_tables = .sync,
         .imports = &.{.{ .name = "greet", .module = b.createModule(.{
             .root_source_file = b.path("src/greet.zig"),
@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
             .fuzz = false,
         }) }},
     });
-    // A Debug step that asks for LLVM and PIE: zap builds it with its
+    // A Debug step that asks for LLVM and PIE: bs builds it with its
     // own backend, static and non-PIE.
     const exe = b.addExecutable(.{ .name = "hello", .root_module = mod, .use_llvm = true });
     exe.pie = true;
@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }) }));
-    // A shared library: -fPIC, which zap's cache does not take; its
+    // A shared library: -fPIC, which bs's cache does not take; its
     // inputs record still makes a build with no change a cache hit.
     b.installArtifact(b.addLibrary(.{ .name = "shared", .linkage = .dynamic, .root_module = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) }));
     // A C header translated to Zig, imported by a program that links
-    // glibc: `zap translate-c --listen=-`.
+    // glibc: `bs translate-c --listen=-`.
     const tc = b.addTranslateC(.{
         .root_source_file = b.path("c/shape.h"),
         .target = target,

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Lists std's public declarations that older releases had and 0.17 lacks,
 to seed the migration table in src/diag.zig (see "Diagnostics" in
-docs/architecture.md).
+docs/slop/architecture.md).
 
 Usage: std_removed.py OLD_LIB_STD... NEW_LIB_STD
 
 Each argument is a release's lib/std directory, for example
-zig-0.11.0/lib/std ... upstream/lib/std. A declaration is keyed as zap names
+zig-0.11.0/lib/std ... upstream/lib/std. A declaration is keyed as bs names
 its container: the file's path under lib/std without `.zig`, with `/` as
 `.` (`mem`, `Io.Dir`, `std` for std.zig), then the declaration's name.
 Only file-level `pub` declarations are compared; members of generic types

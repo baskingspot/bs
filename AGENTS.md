@@ -1,6 +1,6 @@
-# zap
+# bs
 
-zap is an independent Zig compiler aimed at Go-class compile speed. It does
+bs is an independent Zig compiler aimed at Go-class compile speed. It does
 not track upstream: it compiles exactly one pinned Zig release (currently
 0.17.1) and the std library shipped with it.
 
@@ -28,27 +28,27 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   generation, with `builtin.mode == .safe` and upstream's
   ReleaseSafe defaults (safety on, no error return traces), so std and the
   program take the same paths as upstream's ReleaseSafe build. ReleaseFast
-  and ReleaseSmall stay refused on the command line; in `zap build` steps
+  and ReleaseSmall stay refused on the command line; in `bs build` steps
   they get the same treatment (their `builtin.mode`, safety off, same code
   generation) once a real project's build needs it.
 - C interop is in scope: `-lc`, `@cImport`, and C and C++ source files.
   translate-c (upstream's Aro-based Zig program in `lib/compiler/translate-c`)
-  is built by zap itself, so `@cImport` needs no LLVM. C and C++ source files
+  is built by bs itself, so `@cImport` needs no LLVM. C and C++ source files
   are compiled by the user's upstream `zig cc`/`zig c++` (Clang), and C++
   links against libc++ and libc++abi built from the zig lib directory's
-  sources as upstream builds them; zap never compiles C or C++ itself.
+  sources as upstream builds them; bs never compiles C or C++ itself.
   musl (`-target x86_64-linux-musl -lc`, libc built from the zig lib
   directory's sources through upstream Clang) follows when a target needs
   it.
 - Out of scope unless the user asks: other targets, ReleaseFast and
-  ReleaseSmall, LLVM, the C backend, a C or C++ compiler inside zap.
+  ReleaseSmall, LLVM, the C backend, a C or C++ compiler inside bs.
 - CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`
-  (zap compiles and runs the build runner and serves its compile steps over the
+  (bs compiles and runs the build runner and serves its compile steps over the
   `--listen=-` compiler protocol).
-- zap's main users are coding agents. Shape compile errors for them, not for
+- bs's main users are coding agents. Shape compile errors for them, not for
   humans: exact locations, the facts an agent needs to fix the error, and
-  fixes where zap knows them, in a form a program can parse.
-- zap may reject more than upstream: extra compile errors that catch real
+  fixes where bs knows them, in a form a program can parse.
+- bs may reject more than upstream: extra compile errors that catch real
   mistakes are allowed. Everything else upstream accepts must still mean the
   same, and upstream's std and `test/behavior` must still compile, since
   they are the conformance measure.
@@ -57,7 +57,7 @@ not track upstream: it compiles exactly one pinned Zig release (currently
 
 - Frontend: reuse `std.zig.Ast` (`Ast.parse`) and `std.zig.AstGen.generate` to
   produce ZIR. Do not fork or reimplement them.
-- Everything after ZIR is zap's own code: semantic analysis and comptime
+- Everything after ZIR is bs's own code: semantic analysis and comptime
   (Sema), the typed IR, the backends, and the linkers.
 - Speed comes from architecture, not micro-tuning:
   - a per-declaration cache persisted on disk across runs, keyed by ZIR
@@ -72,7 +72,7 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   harder to change once other code depends on them.
 - Compile-time speed is a feature. Track it with benchmarks against upstream
   `zig` 0.17.1 Debug builds (self-hosted x86_64 backend), and do not land
-  regressions without saying so. Track the speed of the code zap generates
+  regressions without saying so. Track the speed of the code bs generates
   against upstream Debug and ReleaseSafe builds the same way, and report
   each backend change's compile-time cost next to its run-time win.
 
@@ -80,26 +80,26 @@ not track upstream: it compiles exactly one pinned Zig release (currently
 
 - `.agents/setup` installs upstream `zig` 0.17.1 on `PATH` in orbs. On a Mac
   satellite it leaves the owner's `zig` alone; use
-  `~/.cache/zap/zig-aarch64-macos-0.17.1/zig` there. It also symlinks
+  `~/.cache/bs/zig-aarch64-macos-0.17.1/zig` there. It also symlinks
   that release's source tree at `upstream/` (gitignored), which contains
   `upstream/src/Sema.zig`, `upstream/test/behavior/` and more.
 - Upstream `zig` 0.17.1 is the oracle. When semantics are unclear, write a
-  small program and compare zap's behavior and output with upstream's. Do not
+  small program and compare bs's behavior and output with upstream's. Do not
   guess from memory.
-- Conformance measure: the share of `upstream/test/behavior` that zap compiles
+- Conformance measure: the share of `upstream/test/behavior` that bs compiles
   and passes on each target. Keep that number visible. Measure it with
-  `tools/conformance/run.py` (see `docs/architecture.md`).
+  `tools/conformance/run.py` (see `docs/slop/architecture.md`).
 - Upstream is MIT licensed. Copying upstream code is allowed, but keep the
   upstream copyright notice with the copied code. Never send changes upstream;
   Zig does not accept LLM-authored contributions.
 
 ## Development
 
-- zap is written in Zig 0.17.1. Build with `zig build`; test with `zig build test`.
-- `docs/architecture.md` fixes the boundaries between stages (analysis units,
+- bs is written in Zig 0.17.1. Build with `zig build`; test with `zig build test`.
+- `docs/slop/architecture.md` fixes the boundaries between stages (analysis units,
   InternPool stable hashes, typed IR, Atoms, cache model). Follow it, and
   update it in the same change when a boundary moves.
-- Time zap built with `-Doptimize=ReleaseFast`; a Debug build of zap is about
-  10x slower and says nothing about zap's speed.
+- Time bs built with `-Doptimize=ReleaseFast`; a Debug build of bs is about
+  10x slower and says nothing about bs's speed.
 - Linux work runs in orbs. Verify aarch64-macos output on a real Mac (a Mac
   satellite for this project), not by inspection alone.

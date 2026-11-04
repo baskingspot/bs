@@ -2,7 +2,7 @@
 //! stdout: "1\n0\n42\n3\n16\n"
 // `@reduce` of a vector bitcast from a load, which the reduce reads in
 // place (`Home.view`), as ghostty's bitset `@reduce(.Or, masks)` does;
-// zap took it for a fused `firstTrue` select and crashed. The last two
+// bs took it for a fused `firstTrue` select and crashed. The last two
 // lines are the fused select itself.
 const rt = @import("rt.zig");
 pub const panic = rt.panic;

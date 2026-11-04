@@ -1,5 +1,5 @@
 //! ELF relocatable objects and archives as link inputs (x86_64-linux;
-//! "Object, archive and shared-library inputs" in docs/architecture.md).
+//! "Object, archive and shared-library inputs" in docs/slop/architecture.md).
 //! Objects are read in place. Each allocated section becomes one Atom, or
 //! one per entry for mergeable sections, so the link stays one pass over
 //! atoms and nothing downstream knows an atom came from C.
@@ -469,7 +469,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
             sym.st_shndx < o.shdrs.len and !o.discarded[sym.st_shndx])
         {
             if (!in.dynamic) {
-                try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: zap links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: {s}", .{ o.path, o.symName(sym) }));
+                try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: bs links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: {s}", .{ o.path, o.symName(sym) }));
                 continue;
             }
             const ifunc = try in.ifuncAtoms(o, @intCast(s_index));
@@ -632,7 +632,7 @@ fn Converter(comptime Ctx: type) type {
             const sh = o.shdrs[index];
             const name = o.sectionName(index);
             if (std.mem.startsWith(u8, name, ".ctors") or std.mem.startsWith(u8, name, ".dtors")) {
-                return c.fail("{s}: zap does not link section '{s}' (legacy constructors and destructors); compile with .init_array", .{ o.path, name });
+                return c.fail("{s}: bs does not link section '{s}' (legacy constructors and destructors); compile with .init_array", .{ o.path, name });
             }
             const arena = c.in.arena;
             if (sh.sh_flags & elf.SHF_MERGE != 0 and sh.sh_type != elf.SHT_NOBITS) {
@@ -698,7 +698,7 @@ fn Converter(comptime Ctx: type) type {
                 // Only an allocated .eh_frame is the unwinder's.
                 if ((kind == .eh_frame) != (sh.sh_flags & elf.SHF_ALLOC != 0)) continue;
                 if (sh.sh_flags & elf.SHF_COMPRESSED != 0) {
-                    try c.fail("{s}: zap does not link compressed debug sections ('{s}') yet; compile without -gz", .{ o.path, name });
+                    try c.fail("{s}: bs does not link compressed debug sections ('{s}') yet; compile without -gz", .{ o.path, name });
                     continue;
                 }
                 c.input_of[i] = @intCast(c.sections.items.len);
@@ -840,7 +840,7 @@ fn Converter(comptime Ctx: type) type {
                 if (std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little) != 0) {
                     while (ri < relas.len and relas[ri].r_offset < off + 8) ri += 1;
                     if (ri == relas.len or relas[ri].r_offset != off + 8 or relas[ri].r_type() != @backingInt(elf.R_X86_64.PC32))
-                        return c.fail("{s}: the FDE at offset {d} of .eh_frame is not PC-relative, which zap does not link yet", .{ o.path, off });
+                        return c.fail("{s}: the FDE at offset {d} of .eh_frame is not PC-relative, which bs does not link yet", .{ o.path, off });
                     drop = switch (try c.inputTarget(relas[ri].r_sym(), relas[ri].r_addend)) {
                         .atom => false,
                         else => true,
@@ -886,7 +886,7 @@ fn Converter(comptime Ctx: type) type {
             for (relocs.items) |r| switch (r.kind) {
                 .pc32, .abs64, .abs32 => {},
                 else => if (r.addend != 0 or (r.kind != .const32 and r.kind != .const64))
-                    return c.fail("{s}: .eh_frame references a dropped section or a shared library's symbol, which zap does not link yet", .{o.path}),
+                    return c.fail("{s}: .eh_frame references a dropped section or a shared library's symbol, which bs does not link yet", .{o.path}),
             };
         }
 
@@ -942,7 +942,7 @@ fn Converter(comptime Ctx: type) type {
             if (try c.ctx.rtExport(name)) |key| return .{ .key = key, .offset = 0 };
             // The image's own handle, which C++ code passes to
             // `__cxa_atexit` and `__cxa_thread_atexit`: crtbegin.o defines
-            // it, which zap does not link, so the linker does, as lld.
+            // it, which bs does not link, so the linker does, as lld.
             // Only its address matters, which must be in the image.
             if (std.mem.eql(u8, name, "__dso_handle")) {
                 const key: SymbolKey = .fromName("obj:__dso_handle");
@@ -998,7 +998,7 @@ fn Converter(comptime Ctx: type) type {
                 .TLSDESC_CALL => return 0,
                 .GOTPC32_TLSDESC => {
                     if (c.isTlsModuleBase(r.r_sym())) {
-                        try c.fail("{s}: zap does not link _TLS_MODULE_BASE_ into shared objects yet; recompile with -mtls-dialect=gnu", .{o.path});
+                        try c.fail("{s}: bs does not link _TLS_MODULE_BASE_ into shared objects yet; recompile with -mtls-dialect=gnu", .{o.path});
                         return 0;
                     }
                     const t = try c.target(r.r_sym(), 0) orelse return 0;
@@ -1201,7 +1201,7 @@ fn Converter(comptime Ctx: type) type {
                     try c.add(off + 8, .x86_64_pc32, .{ .key = try c.tlsSlot(t), .offset = 0 }, -4);
                     return 1;
                 },
-                else => try c.fail("{s}: zap does not link relocation R_X86_64_{s} against {s}, which a shared library defines, yet", .{ o.path, @tagName(ty), o.symName(sym) }),
+                else => try c.fail("{s}: bs does not link relocation R_X86_64_{s} against {s}, which a shared library defines, yet", .{ o.path, @tagName(ty), o.symName(sym) }),
             }
             return 0;
         }
@@ -1211,7 +1211,7 @@ fn Converter(comptime Ctx: type) type {
         fn copied(c: *C, index: u32, sym: elf.Elf64_Sym) !?SymbolKey {
             const o = c.o;
             if (try c.ctx.copySym(o.symName(sym))) |key| return key;
-            try c.fail("{s}: section '{s}' takes the address of {s}, a function a shared library defines, without the GOT (non-PIC code does), which zap does not link yet; compile it with -fPIC", .{ o.path, o.sectionName(index), o.symName(sym) });
+            try c.fail("{s}: section '{s}' takes the address of {s}, a function a shared library defines, without the GOT (non-PIC code does), which bs does not link yet; compile it with -fPIC", .{ o.path, o.sectionName(index), o.symName(sym) });
             return null;
         }
 
@@ -1233,11 +1233,11 @@ fn Converter(comptime Ctx: type) type {
         }
 
         /// Whether thread-local `t`, which relocation `r` names, is another
-        /// module's in a shared object, which zap does not link yet, after
+        /// module's in a shared object, which bs does not link yet, after
         /// reporting it.
         fn sharedTlsImport(c: *C, r: elf.Elf64_Rela, t: Target) !bool {
             if (!c.in.shared or !t.import) return false;
-            try c.fail("{s}: zap does not import thread-local {s} into shared objects yet", .{ c.o.path, c.o.symName(c.o.syms[r.r_sym()]) });
+            try c.fail("{s}: bs does not import thread-local {s} into shared objects yet", .{ c.o.path, c.o.symName(c.o.syms[r.r_sym()]) });
             return true;
         }
 
@@ -1293,7 +1293,7 @@ fn Converter(comptime Ctx: type) type {
 
         fn unsupported(c: *C, index: u32, ty: u32) Allocator.Error!void {
             const name = if (std.enums.fromInt(elf.R_X86_64, ty)) |t| @tagName(t) else "unknown";
-            try c.fail("{s}: zap does not link relocation R_X86_64_{s} ({d}) in section '{s}' yet", .{ c.o.path, name, ty, c.o.sectionName(index) });
+            try c.fail("{s}: bs does not link relocation R_X86_64_{s} ({d}) in section '{s}' yet", .{ c.o.path, name, ty, c.o.sectionName(index) });
         }
 
         fn writable(c: *C, bytes: []const u8, copy: *?[]u8) Allocator.Error![]u8 {

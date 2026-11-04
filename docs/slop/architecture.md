@@ -1,6 +1,6 @@
-# zap architecture
+# bs architecture
 
-This document fixes the boundaries between zap's stages so that the speed
+This document fixes the boundaries between bs's stages so that the speed
 features in AGENTS.md (the on-disk per-declaration cache, parallel analysis of
 function bodies, the bytecode comptime evaluator, fast SSA backends, and write-once
 linkers) can land later without redesigning the stages. AGENTS.md holds the
@@ -11,7 +11,7 @@ it when a boundary changes.
 
 ```
 source ──Ast.parse──▶ AST ──AstGen──▶ ZIR            (std.zig, per file, parallel, cached)
-ZIR ──Sema──▶ InternPool (types, values)             (zap, per analysis unit)
+ZIR ──Sema──▶ InternPool (types, values)             (bs, per analysis unit)
             └▶ typed IR (one function at a time)
 typed IR ──CodeGen──▶ Atom (machine code + symbolic relocations)   (per function, parallel, cached)
 Atoms ──Linker──▶ ELF / Mach-O, written once
@@ -26,7 +26,7 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
 - Files are discovered and lowered from a work queue: lowering a file
   reveals its imports. File indices are assigned afterwards, breadth-first
   in import order from the root, so they do not depend on thread timing.
-- ZIR is cached on disk per file, in `<cache>/zap/zir/`. Every file's
+- ZIR is cached on disk per file, in `<cache>/bs/zir/`. Every file's
   ZIR is in the global cache, keyed by content, so that a project's ZIR
   outlives its local cache and its worktrees and copies share it; each
   cache's index holds the stats of its own files: the local cache's the
@@ -52,7 +52,7 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
     hide behind an unchanged stat. A record whose ZIR is gone (trimmed, or
     in a local cache from before ZIR moved to the global one) is a probe
     miss: the file is hashed, and lowered if no ZIR has its content.
-  - Trimming: the global cache's ZIR counts toward `ZAP_CACHE_MAX_SIZE`
+  - Trimming: the global cache's ZIR counts toward `BS_CACHE_MAX_SIZE`
     and goes with the store's packs (`Store.maintain`): unused for 5 days
     by its mtime, or least recently used first past the limit. The
     store's maintenance runs daily, whenever its packs alone pass the
@@ -85,8 +85,8 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
   as guesses; guessed files it no longer imports are dropped when files are
   numbered, and a missing file is an error only if it is reachable. Sources and ASTs are not kept: `Frontend.tree`/`source` reload and
   reparse a file when an error in it is rendered.
-- Measured (2026-11-02, orb: 2 cores / 4 threads Xeon 2.6 GHz, zap
-  ReleaseFast, hello world, 559 files, `ZAP_FRONTEND_TIMING=1`): before the
+- Measured (2026-11-02, orb: 2 cores / 4 threads Xeon 2.6 GHz, bs
+  ReleaseFast, hello world, 559 files, `BS_FRONTEND_TIMING=1`): before the
   cache, every build spent 0.56–0.66 s here on one thread. Now a cold build
   (empty caches) takes 0.22–0.25 s, a warm build 5–6 ms, and a build after a
   one-line edit to `std/debug.zig` about 7.5 ms (9.7 ms before the guesses,
@@ -95,7 +95,7 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
   edit build the edited file's own lowering (about 5 ms for `debug.zig`) is
   the critical path. std's
   cached ZIR takes 41 MB.
-- Project ZIR in the global cache (2026-11-04, `bench/bench.py`, zap
+- Project ZIR in the global cache (2026-11-04, `bench/bench.py`, bs
   ReleaseFast, median of 10, cold 5): a cold-local build (empty local
   cache) no longer lowers the project's files. Before → after: vaxis
   226 → 98 ms, the zig workload 3.95 → 3.32 s; with lazy donor builds,
@@ -163,7 +163,7 @@ type two keys, or two types one. (It must still tell distinct types apart:
 their declarations' keys extend it.) The *display name* is separate from the
 key and follows upstream's form (`Parent__struct_<n>`), because `@typeName`
 results are observable and `test/behavior` checks them. Upstream's `n` counts
-anonymous types in analysis order; zap's is the type's instruction (an
+anonymous types in analysis order; bs's is the type's instruction (an
 anonymous struct literal's too) relative to the declaration, like the key, so
 that an edit above a declaration renames none of its types: nothing that
 reads a type's name records a dependency on it. A `comptime` block's types
@@ -182,7 +182,7 @@ F(comptime T: type) type { return struct { const S = struct {}; const t:
 T = 0; }; }` makes one `S` for `F(u8)` and `F(u16)`), or one made by an
 inline or comptime call whose uncaptured arguments differ. Upstream names
 such a type after its first creator, so the name depends on analysis
-order. zap names it after the *least* creator by key, so that every build,
+order. bs names it after the *least* creator by key, so that every build,
 in any order, names it the same, clean or edit (built 2026-11-04, in
 three parts):
 
@@ -251,7 +251,7 @@ three parts):
     for `effects` references: a memoized call offers again on a hit,
     but a body that the comptime evaluator lowered has folded the
     call away. The creator, and so the name, does not, so
-    `ZAP_CACHE_VERIFY` checks names through the atoms' names, not each
+    `BS_CACHE_VERIFY` checks names through the atoms' names, not each
     node's offers.
   - *Replay* (`Replay.contributeNames`, first in `finalizeNames`). The
     nodes a build *keeps* are the live ones whose units it did not
@@ -288,7 +288,7 @@ three parts):
     read a name that changed has an out-of-date result: if one did (for
     a type the build does not have: if the name it read contains a
     listed type's old name), the build is built again in full
-    (`error.NamesFullBuild`, `ZAP_CACHE_REPLAY=off` for that build).
+    (`error.NamesFullBuild`, `BS_CACHE_REPLAY=off` for that build).
     Adding `F(u16)` back above renames `S` (test/run/edit_type_names.zig);
     an edit above an anonymous struct renames the type its generic
     instance makes (test/run/edit_type_rename.zig, ghostty's unigen
@@ -305,7 +305,7 @@ three parts):
   passes them to the linker beside the records (`LinkInput.names`,
   `Pack.LinkAtoms.names`), as it passes debug paths. So the store
   reuses an entry whatever its atoms are called, and an edit that
-  renames a type rewrites nodes, not records. `ZAP_CACHE_VERIFY`
+  renames a type rewrites nodes, not records. `BS_CACHE_VERIFY`
   compares each atom's name and parent with a full build's.
 
 When a unit reads another unit's result (a declaration's value, a type's
@@ -496,7 +496,7 @@ memo first, then asks the evaluator (`bcCall`), then walks
 `cold` (counting walker runs), `ready` (a lowered `Zcu.Bytecode`), or `off`,
 keyed by the function's stable hash or the specialization's.
 A function is lowered after `Zcu.comptime_eval_threshold` walker runs (4;
-`ZAP_COMPTIME_EVAL=n` sets it, 0 turns the evaluator off), so code that
+`BS_COMPTIME_EVAL=n` sets it, 0 turns the evaluator off), so code that
 runs once at comptime (most of it) never pays for lowering. `comptime`
 blocks, declaration initializers, and functions called once run once
 each and stay with the walker, except for their long loops, which the
@@ -744,7 +744,7 @@ dependency declarations, field name lookups, and enum literal coercion.
 **Measured (large aggregate literals: `dep_cache` and `name_cache`, see
 "Analysis units"; callgrind instructions for the whole build, against
 origin/main 9d936c3).** libvaxis text_input 2.606 G → 1.901 G (−27%);
-`table_0_stage2` alone 102–110 → 41–51 ms (`ZAP_UNIT_TIMING`, 5 runs),
+`table_0_stage2` alone 102–110 → 41–51 ms (`BS_UNIT_TIMING`, 5 runs),
 and libvaxis's Sema 319–450 → 216–267 ms; a synthetic 47 k-row table of
 the same shape 21.8 k → 7.4 k instructions a row; hello 883 M → 871 M
 (−1.4%); binary.zig unchanged within noise (Sema 5.49–5.81 s before,
@@ -795,7 +795,7 @@ comptime arguments are run-time values in the lowered code (uucode's
   copy; results of those sizes come back in rax or xmm0 (f128, 16-byte
   integers and vectors in xmm0), others through a result pointer in rcx,
   returned in rax. A variadic callee also gets each float argument in
-  its position's GPR. Functions zap defines with it save rsi, rdi, and
+  its position's GPR. Functions bs defines with it save rsi, rdi, and
   xmm6-15 in frame slots with plain moves (they are not in the unwind
   info, which only records pushed GPRs). A variadic one stores rcx,
   rdx, r8, and r9 in its caller's home area, so its arguments are in
@@ -804,12 +804,12 @@ comptime arguments are run-time values in the lowered code (uucode's
   `@cVaArg` reads the next slot (through the pointer for a value passed
   by reference, which upstream does not support yet; an f32 as the f64
   C promotes it to). Measured by upstream's test/c_abi (`run.py --c-abi`).
-  Zap-to-zap calls (`.auto`) pass every argument in
+  Bs-to-bs calls (`.auto`) pass every argument in
   memory at 8-byte aligned offsets of the caller's outgoing area, return
   1-, 2-, 4-, and 8-byte results in rax, and return anything else through a
   result pointer in rdi. The caller's error return trace pointer goes in
   r9 (as upstream's last argument register); the callee keeps it in a
-  frame slot. Nothing outside zap observes `.auto`, so this can
+  frame slot. Nothing outside bs observes `.auto`, so this can
   change when a register allocator wants a different one.
 - Numerics: f32 and f64 use scalar SSE2 and f80 uses x87, as upstream
   does. f16 and f128 arithmetic, operations SSE2 lacks (rounding, fmod,
@@ -831,7 +831,7 @@ comptime arguments are run-time values in the lowered code (uucode's
   `FullPanic(defaultPanic)`. std is always loaded, as upstream analyzes
   it; `Frontend.Options.load_std` is off only in tests without a lib
   directory. std-free test programs declare a minimal root `panic`
-  (`test/run/rt.zig`, `tools/conformance/zap_runner.zig`).
+  (`test/run/rt.zig`, `tools/conformance/bs_runner.zig`).
 - Output is an **Atom**, defined in `src/link/Atom.zig`:
   - stable symbol key and name, section kind, alignment. The key is the
     identity; the name is for the symbol table, upstream's qualified
@@ -883,7 +883,7 @@ comptime arguments are run-time values in the lowered code (uucode's
   tlvp page21/pageoff12, which reach a thread-local's descriptor (Mach-O
   TLV, whose thunk returns the variable's address). aarch64
   link-time values that fit 16 bits, such as error codes, go into a `movz`
-  or `movk` imm16 field (`aarch64_movw_value16`, Mach-O only, since zap
+  or `movk` imm16 field (`aarch64_movw_value16`, Mach-O only, since bs
   links its own output); wider ones are loaded from a constant Atom.
 - Atoms contain no InternPool indices. Constants a function needs (string
   literals, anonymous values) become their own Atoms with content-hash symbol
@@ -918,7 +918,7 @@ one function's typed IR, and the output is still one Atom and one
 `Atom.Debug`, per function, cached as today.
 
 **What the current backend costs.** Measured on libvaxis's text_input
-(main 8fe40fe, ReleaseFast zap): 2,432 functions, 295k IR instructions,
+(main 8fe40fe, ReleaseFast bs): 2,432 functions, 295k IR instructions,
 3.09 MB of code, and 48–51 ms in `CodeGen.generate` with ZIR warm (the
 lead measured about 92 ms of backend in a full build). That is about
 170 ns and 10.5 bytes of code per IR instruction. Function sizes, in IR
@@ -937,7 +937,7 @@ KB), 25k instructions, and its frame is 34 KB. In it:
 | overflow bit materialized with `setb`/`seto` | 347 | overflow from flags (pass 5) |
 
 Upstream Debug's code is 1.9–2.2× smaller on the largest functions
-(`Vaxis.render`, `Parser.parse`, `sort.block.block`) and zap's binaries
+(`Vaxis.render`, `Parser.parse`, `sort.block.block`) and bs's binaries
 run 0.83–1.28× as long as upstream Debug's, 2.6–21.6× as long as
 upstream ReleaseSafe's (`bench/runtime.py`, below).
 
@@ -1194,7 +1194,7 @@ layout order of pass 4:
   is allocated. aarch64 (from the Mac thread's constraints): general
   x0–x15 (caller-saved, x8 the indirect result register) and x19–x28
   (callee-saved); never x18 (platform), x29 (frame pointer), x30 (link
-  register), or x16/x17 (clobbered by zap's import stubs and by
+  register), or x16/x17 (clobbered by bs's import stubs and by
   `___chkstk_darwin`; usable only as scratch inside one lowered
   instruction); float/vector v0–v31, of which only the low 64 bits of
   v8–v15 are callee-saved, so a 128-bit value live across a call is
@@ -1209,8 +1209,8 @@ layout order of pass 4:
   x16, x17, and NZCV. compiler_rt calls follow the C convention.
 
 **The `.auto` calling convention** follows from this, and stays private
-to zap (nothing outside zap calls an `.auto` function, so it changes
-freely; every caller and callee is regenerated together because zap's
+to bs (nothing outside bs calls an `.auto` function, so it changes
+freely; every caller and callee is regenerated together because bs's
 identity is in every cache key):
 
 - Arguments are classified like the C convention's register part:
@@ -1349,13 +1349,13 @@ reductions native (`vector.native` answers by `cpu`). AVX changes the
 vector ABI and is a separate decision. Results are the same bits at
 every level; `-mcpu` is part of the cache key (`cacheTarget`).
 
-Compare zap with upstream bit for bit at a pinned CPU: `zig run
--fno-llvm -mcpu=baseline` (or `x86_64_v2`) against zap at the same
+Compare bs with upstream bit for bit at a pinned CPU: `zig run
+-fno-llvm -mcpu=baseline` (or `x86_64_v2`) against bs at the same
 level. Upstream's default is the native CPU, and with AVX its Debug
 backend lowers some vector operations differently: on an AVX host the
 f64 `@reduce(.Min/.Max/.Add/.Mul)` of 16 lanes in a mixed NaN, infinity
 and signed-zero test gives other bits than its own baseline build, which
-zap matches.
+bs matches.
 
 **aarch64 NEON (planned, with the aarch64 backend).** `vector.native`
 keeps its target-neutral signature; its aarch64 arm (now `false`) gets
@@ -1409,7 +1409,7 @@ index type (`@Vector(16, u4)` for 16 lanes) and reduces with `.Min`;
 CodeGen fuses that pair (`fuseIndexSelect`: an iota and a splat of at
 least the last index) into a `bsf` of the predicate's bits, and
 `lastTrue`'s `.Max` with 0 into `bsr`. So `mem.indexOfScalarPos` and
-`splitScalar`, on `zap build`'s hot path, scan 16 bytes with
+`splitScalar`, on `bs build`'s hot path, scan 16 bytes with
 `pcmpeqb`, `pmovmskb` and `bsf`, as upstream's Debug backend does.
 
 NEON maps onto the same interface: 128-bit `v` registers for vectors of
@@ -1418,13 +1418,13 @@ produce lane masks too, gathered to bits with a `ushr`/`addv` sequence
 (no `movemask`), and it orders 64-bit lanes natively (`cmgt`, `cmhi`),
 so its `native` answers may be broader than x86_64's.
 
-Measured (orb, 4 vCPU, ReleaseFast zap against main e89b24b,
+Measured (orb, 4 vCPU, ReleaseFast bs against main e89b24b,
 2026-11-04; best of 3):
 
 - The fuzzer's `PcBitsetIterator.next` takes 68 instructions per call
   on its 64-byte path, against 253; the compare itself is 23. A loop of
   25.6 M calls runs 3.1 ns per call against 11.3 (upstream Debug: 197).
-  `zap build test --fuzz=3M --seed=1` of a `key=` parser test runs 6.2 s
+  `bs build test --fuzz=3M --seed=1` of a `key=` parser test runs 6.2 s
   against 10.6 s (upstream LLVM, its build cached: 6.4 s).
 - `splitScalar` over 64 MiB of 40- to 120-byte lines: 26 ms per pass
   against 137 (upstream Debug 238, ReleaseSafe 15).
@@ -1484,7 +1484,7 @@ Flags are one implicit value on both architectures, never allocatable,
 never spilled (see pass 5). Link-time values (error codes): x86_64 patches
 them into an instruction's immediate field (`value16`/`value32`); aarch64 needs an instruction form for
 them, and the cheapest is a new relocation kind that writes a link-time
-value into a `movz` imm16 field (zap links its own output, so no external
+value into a `movz` imm16 field (bs links its own output, so no external
 linker must understand it), which makes an error compare `movz` + `cmp`
 instead of `adrp` + `ldr` + `cmp`. Decide before aarch64 lowering depends
 on either (relocation kinds are append-only). Decided and built as
@@ -1568,8 +1568,8 @@ build, the passes, and the debug info treat them as Sema's inline calls
   `noreturn` function (safety checks, `@panic`, `unreachable`), which
   also excludes `try` adding to an error return trace, so every function
   on a panic stack keeps its own frame without synthetic frames. A
-  function with `@trap` never inlines. `ZAP_INLINE=<budget>` sets the
-  budget (`0` turns inlining off) and `ZAP_INLINE_SAFE=1` selects safe; a
+  function with `@trap` never inlines. `BS_INLINE=<budget>` sets the
+  budget (`0` turns inlining off) and `BS_INLINE_SAFE=1` selects safe; a
   non-default setting gets its own cache target (`main.cacheTarget`).
 - **When.** On the Sema thread, as Sema hands a function to the sink
   (`Emit.functionOwned`), before CodeGen gets it: `inline.scan` finds the
@@ -1613,7 +1613,7 @@ build, the passes, and the debug info treat them as Sema's inline calls
     replay decides it with `Emit.inlineFate`, which loads or analyzes `f`
     first; if `f` cannot be decided now the caller is analyzed again. A
     caller that is red only through `func_inline` re-runs Sema, since IR
-    is not cached. `ZAP_CACHE_CHECK` covers the edge without changes.
+    is not cached. `BS_CACHE_CHECK` covers the edge without changes.
 - **Getting the body on an edit build.** When a caller is analyzed and an
   inlinable `f` was loaded from the cache, Sema analyzes `f` again
   (`Emit.inlineBody`) and its own callees are inlined into it, without
@@ -1626,7 +1626,7 @@ build, the passes, and the debug info treat them as Sema's inline calls
   Storing IR in the cache instead would freeze an IR encoding and add
   store bytes for every inlinable function; it is the fallback if
   edit-build profiles ever show the re-analysis.
-- **Cost and win** (4-core orb, ReleaseFast zap, cache off, medians):
+- **Cost and win** (4-core orb, ReleaseFast bs, cache off, medians):
   run time against inlining off, safe / full: sort −10% / −23%, hash −7% /
   −15%, nbody −13% / −12%, fmt 0 / +6%, fib and sieve unchanged. The zig
   workload's cold build costs +3.3% / +4.8% (9.29 s off), std's test
@@ -1690,7 +1690,7 @@ build, the passes, and the debug info treat them as Sema's inline calls
   (std's handlers take theirs in registers), and the stubs stop growing
   near `epilogue`'s 16 bits. `zig build test` compares
   `test/run/panic_inlined.zig`'s and `panic_trace.zig`'s traces with
-  those of the same programs built with `ZAP_INLINE=0`. Limit: a hardware
+  those of the same programs built with `BS_INLINE=0`. Limit: a hardware
   fault (a segfault from a bad pointer, a division trap) in inlined code
   has no stub, so the signal handler's trace shows the callee's line
   under the caller's name and loses the inlined callers. aarch64's
@@ -1812,7 +1812,7 @@ are `-ffuzz` coverage points, are only learned from.
   of that walk is undone and the body walked again without them, so a
   loop is walked at most twice, and loops nested in a walk with
   candidates take none.
-- **Turning it off.** `ZAP_PROVE=off` keeps every check (its own cache
+- **Turning it off.** `BS_PROVE=off` keeps every check (its own cache
   target, `+noprove`). A program whose output or panic differs between
   on and off has found a bug in a proof, with no oracle needed. The
   soundness argument for each rule is next to it in `prove.zig`; the run
@@ -1845,13 +1845,13 @@ long pole afterwards.
 
 Measuring it:
 
-- `ZAP_TIMING=1` prints a second line with each stage that exists so far,
+- `BS_TIMING=1` prints a second line with each stage that exists so far,
   summed over functions, per IR instruction (`Emit.CodeGenStats`).
-- `ZAP_BENCH_CODEGEN=n` makes zap keep a copy of every function's IR
+- `BS_BENCH_CODEGEN=n` makes bs keep a copy of every function's IR
   during analysis and then run the backend over all of it n more times,
   each into a fresh Emit, printing the fastest run's stages, code bytes
   per IR instruction, and frame bytes per function. `zig build
-  bench-codegen` does that for the hello workload with a ReleaseFast zap;
+  bench-codegen` does that for the hello workload with a ReleaseFast bs;
   for libvaxis, set the variable on bench.py's build-exe command line.
   Deterministic enough for A/B comparisons in one session, and callgrind
   instruction counts of the same binary are exact.
@@ -1862,7 +1862,7 @@ Measuring it:
 Generated-code baseline (main 8fe40fe, `python3 bench/runtime.py`,
 medians of 5 runs on the 4-core orb):
 
-| Program | zap | upstream Debug | upstream ReleaseSafe | zap / Debug | zap / ReleaseSafe |
+| Program | bs | upstream Debug | upstream ReleaseSafe | bs / Debug | bs / ReleaseSafe |
 |---|---:|---:|---:|---:|---:|
 | fib | 188 ms | 154 ms | 72 ms | 1.22× | 2.6× |
 | sieve | 497 ms | 417 ms | 117 ms | 1.19× | 4.2× |
@@ -1879,7 +1879,7 @@ dominated by small std functions (hashing, vector arithmetic, the
 
 #### Landing it
 
-Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
+Each step keeps conformance at 2170/2170 and `BS_CACHE_CHECK` clean:
 
 1. SSA construction and emission with no optimization: every op lowers
    through a fallback that is today's per-instruction code (operands in
@@ -1923,7 +1923,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    callee-saved registers a function uses are pushed after `mov rbp,
    rsp`, as the design fixes; until step 3's unwind record, the CFI did
    not describe them.
-   On libvaxis text_input (`ZAP_BENCH_CODEGEN=10`): 10.46 → 6.49 code
+   On libvaxis text_input (`BS_BENCH_CODEGEN=10`): 10.46 → 6.49 code
    bytes per IR instruction, 992 → 708 frame bytes per function, and
    146–151 → 184–190 ns per IR instruction (liveness and allocation 49,
    emission 124 instead of 137). Callgrind on hello: `CodeGen.generate`
@@ -1978,11 +1978,11 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    Error unions get their error code written through the padding before
    the payload (up to 8 bytes), so whole-word reads forward from the
    store. Against step 3 (main 4a5232b), libvaxis text_input
-   (`ZAP_BENCH_CODEGEN=10`, two runs): 6.26 → 5.58 code bytes per IR
+   (`BS_BENCH_CODEGEN=10`, two runs): 6.26 → 5.58 code bytes per IR
    instruction, 210–218 → 234–238 ns per IR instruction (build +4 for
    `place`, liveness and allocation +4 for the dead-code sweep, emission
-   +12, of which shortening is about half); std's tests (`zap test
-   upstream/lib/std/std.zig --test-no-exec`, `ZAP_CACHE=off`): 7.8–8.3 →
+   +12, of which shortening is about half); std's tests (`bs test
+   upstream/lib/std/std.zig --test-no-exec`, `BS_CACHE=off`): 7.8–8.3 →
    8.0–8.4 s, 6.70 → 6.03 code bytes per IR instruction.
    `bench/runtime.py`, same session: fib 135 → 128 ms, sieve 316 → 303,
    sort 448 → 421, hash 300 → 297, nbody 457 → 456, fmt 155 → 149. What
@@ -2015,13 +2015,13 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    loads and block results of other aggregates of 1, 2, 4, or 8 bytes
    (`inGprBytes`: their bytes, extended like a load); code that reads
    one from memory takes a copy (`memOf`). Against
-   main 40b29a8, libvaxis text_input (`ZAP_BENCH_CODEGEN=10`, three
+   main 40b29a8, libvaxis text_input (`BS_BENCH_CODEGEN=10`, three
    runs, idle): 5.58 → 5.15 code bytes per IR instruction, 698 → 687
    frame bytes per function, 210–211 → 212–224 ns per IR instruction
    (allocation 54.5 → 64–68, emission 139–140 → 132–139); the encoder
    now counts the branches before each label when binding it instead of
    searching for them, which pays back part of shortening. std's tests
-   (`ZAP_CACHE=off`, `ZAP_TIMING=1`): 292 → 285 ns per IR instruction
+   (`BS_CACHE=off`, `BS_TIMING=1`): 292 → 285 ns per IR instruction
    (allocation 63 → 71, emission 211 → 197), 6.03 → 5.63 code bytes per
    IR instruction, wall time 6.53–6.58 → 6.55–6.60 s. `bench/runtime.py`,
    same session: fib 123 → 118 ms, sieve 268 → 137, sort 370 → 291,
@@ -2183,7 +2183,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
 5. aarch64 lowering, ABI, and encoder relaxation on the same layer (Mac
    thread).
 6. DWARF variable locations; then leaf inlining with the cache edge.
-   *DWARF types and variables: paused by the owner, 2026-11-03.* zap
+   *DWARF types and variables: paused by the owner, 2026-11-03.* bs
    keeps line tables, CFI, function names and inlined frames, the
    debuggability the scope asks for; types and variables mostly serve
    interactive debugger sessions, which agents rarely use, and would
@@ -2495,7 +2495,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   --debug-dump=frames-interp` (the same rows as upstream's FDEs), and
   std.debug's own unwinder
   (`Dwarf.SelfUnwinder` through PT_GNU_EH_FRAME, both its search-table and
-  sorted-FDE lookups) walking a trapped zap process's stack from a ptrace
+  sorted-FDE lookups) walking a trapped bs process's stack from a ptrace
   harness, and on a synthetic stack in a unit test. Cost on bench-link:
   about 3M more instructions per debug emit (40 bytes per function; 406.4M
   → 415.5M for three single-thread emits), within wall-clock noise; none
@@ -2583,7 +2583,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   entries whose compact encoding defers to DWARF), as do libunwind and
   lldb. `.frame_pointer` is UNWIND_ARM64_MODE_FRAME (`stp x29, x30, [sp,
   #-16]!; mov x29, sp`), as LLVM encodes such functions; `.none` and
-  `.outermost` get no encoding (dyld calls `main`, so no zap frame is
+  `.outermost` get no encoding (dyld calls `main`, so no bs frame is
   outermost). Entries are regular second-level pages, one per chunk of
   2048 debug entries: an entry where a function starts unless it
   continues the previous encoding, and an encoding-0 entry where a run of
@@ -2638,7 +2638,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   (2026-11-03; 12.4 ms with the shared mapping; ELF, with DWARF:
   13.3 ms). SHA-256 of the 27 MiB output alone takes 8.8 ms on one thread,
   most of the gap to stripped ELF; the rest is the extra relocations.
-- Relocatable objects (`zap build-obj`, x86_64-linux;
+- Relocatable objects (`bs build-obj`, x86_64-linux;
   `src/link/ElfObject.zig`, built 2026-11-03) come from the same Atoms.
   The object is the executable image `Elf.emit` lays out (with no entry,
   and imports resolved to 0), kept at the same file offsets, plus a new
@@ -2651,7 +2651,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   linker mis-sizes the output's .debug_str otherwise).
   - Symbols: a section symbol per section; a LOCAL symbol per atom, valued
     at its section offset; a GLOBAL symbol per export (`Emit` collects
-    `Zcu.exports`; one per name; zap has no export linkage yet, so all are
+    `Zcu.exports`; one per name; bs has no export linkage yet, so all are
     strong), which replaces the atom's local symbol when the names match;
     an undefined GLOBAL or WEAK symbol per import. In an object, an
     `extern` that the compilation does not export is imported
@@ -2682,7 +2682,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
     a panic in its code prints upstream-style stack traces through both
     objects' frames. `zig build test` checks the upstream link and the
     panic trace (test/obj).
-  - Cost (ReleaseFast zap, orb, cache off, a copy of the program whose
+  - Cost (ReleaseFast bs, orb, cache off, a copy of the program whose
     code an export reaches): hello, link stage 6.5–8.3 ms for the object
     against 3.1–4.3 ms for the executable, in a 230 ms build; libvaxis
     text_input, 8.7–10.1 ms against 4.6–6.0 ms, in a 560 ms build.
@@ -2690,7 +2690,7 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
     ("Roots and output kinds" below). An object's exports and imports are
     sorted by name, so that the object is a function of its atoms, as the
     link order is.
-- `zap run` builds the executable into `<cache>/zap/o/<hash>/<name>`, the
+- `bs run` builds the executable into `<cache>/bs/o/<hash>/<name>`, the
   hash of the working directory, std's directory, and the command line
   before `--`, so a rerun relinks in place through the cache, then
   replaces itself with the program (execve, as upstream does) with the
@@ -2704,7 +2704,7 @@ Scope: x86_64-linux. `build-obj -fPIC`/`-fPIE` and `build-lib -fPIC`
 upstream zig, `cc` and `ld`; `build-lib -dynamic` produces a shared
 object that a C program and an upstream-built program load. `build-exe`
 stays static and non-PIE whatever `-fPIE` says (decided 2026-11-03,
-above), so zap's own executable link sees none of this.
+above), so bs's own executable link sees none of this.
 
 **What is position-dependent today** (surveyed 2026-11-03):
 - Code reaches every symbol RIP-relative (`x86_64_pc32`). No code atom
@@ -2712,14 +2712,14 @@ above), so zap's own executable link sees none of this.
   tests, and inline assembly has no symbol operands.
 - An `extern` is read from an 8-byte slot (`Emit.lowerExternSlots`: a
   .rodata atom holding an `x86_64_abs64` to the definition, or in an
-  object to an import). The slots are zap's GOT already: code loads a
+  object to an import). The slots are bs's GOT already: code loads a
   slot RIP-relative and calls through it, so no PLT is needed for them.
 - Imports are the only symbols another module can preempt. Every
   reference from Zig code to Zig code, exported functions and variables
   included, binds inside the image, as upstream's: an upstream `-dynamic`
   library calls its own `export fn foo` with a direct `call foo` and
   reads its exported variable with `lea exported_data(%rip)`, and
-  reaches only `extern` functions through the PLT. zap does the same, so
+  reaches only `extern` functions through the PLT. bs does the same, so
   exports need no GOT entries and cannot be interposed from inside.
 - Data pointers are `x86_64_abs64` in .rodata and .data atoms.
 - Thread-locals use local-exec (`x86_64_tpoff32`) only.
@@ -2758,7 +2758,7 @@ object (`-fPIC`, `-dynamic`), *pie* code that ends up in an executable.
   (`data16 lea rdi, [rip + x@tlsgd]; data16 data16 rex.W call
   __tls_get_addr@plt`, R_X86_64_TLSGD, the padded 16 bytes linkers
   relax), a call like local-dynamic's. Weak thread-local externs stay
-  `[unsupported]`, and so do imports into zap's shared objects, which
+  `[unsupported]`, and so do imports into bs's shared objects, which
   would need a GOT pair with DTPMOD64/DTPOFF64 against the symbol.
   In an executable with object, archive or C inputs (`Emit.has_inputs`,
   built 2026-11-04), a name no export has binds to an input object's
@@ -2784,7 +2784,7 @@ object (`-fPIC`, `-dynamic`), *pie* code that ends up in an executable.
   saves per access, for no gain over treating the access as a call.
 - `@extern` with `.relocation = .pcrel` (IR `extern_pcrel`, built
   2026-11-03): `lea dst, [rip + sym]`, with no slot. std.pie reads
-  `_DYNAMIC` so (zap reports `zig_backend = .stage2_x86_64`, so std.pie
+  `_DYNAMIC` so (bs reports `zig_backend = .stage2_x86_64`, so std.pie
   takes upstream's self-hosted path, not its inline assembly), in the
   start code of a `-fPIE` object whose root has `main`: a static PIE
   relocates itself, and the slot's own RELATIVE relocation is not yet
@@ -2891,7 +2891,7 @@ names, before layout, and Elf fills in the exports' values after it.
   the copy loop instantiated with a comptime flag); the rest of the
   dynamic sections are written serially.
 - `.symtab`, debug info and unwind tables are as in the executable.
-- Checked (2026-11-03): test/obj/lib.zig as zap's shared object, loaded
+- Checked (2026-11-03): test/obj/lib.zig as bs's shared object, loaded
   by test/obj/main.zig linked against it by upstream (`-lc -rdynamic`)
   and by a C program with dlopen/dlsym (test/obj/dl.c), both in `zig
   build test`; by hand, a library with thread-locals written from two
@@ -2900,7 +2900,7 @@ names, before layout, and Elf fills in the exports' values after it.
   `std.DynLib`. A panic in the library prints the same partial trace as
   upstream's library (neither finds the library's unwind info).
 
-**Objects, checked** (2026-11-03): a zap `-fPIC` object links into
+**Objects, checked** (2026-11-03): a bs `-fPIC` object links into
 shared objects with `cc -shared`, `ld -shared` and upstream `zig
 build-lib -dynamic`, and into PIEs with `cc -pie` (which relaxes the
 local-dynamic sequences to `mov rax, fs:0`) and upstream `zig build-exe
@@ -2921,7 +2921,7 @@ hand also with `cc -no-pie`, `cc -pie` (pie and pic objects) and `cc
 -shared` with a C host's `__thread` variable. test/run/extern_tls.zig
 covers an executable's own export.
 
-**Executables do not slow down.** zap's own executable link never sees
+**Executables do not slow down.** bs's own executable link never sees
 the new kinds, since `build-exe` is not pic. The `.data.rel.ro` decision
 and the dynamic records run only for pic and pie images. The relocation
 loop takes a comptime flag for them, so the static loop compiles as
@@ -2957,18 +2957,18 @@ local-dynamic TLS and `_DYNAMIC`). The manifest and `linkFrom` side is
 the cache thread's, with `build-lib -dynamic` as its first user, then
 `-lc` executables. The new
 relocation kinds need no format bump: the store seed and the compilation
-key include the zap binary's identity, and `atoms.check` rejects unknown
+key include the bs binary's identity, and `atoms.check` rejects unknown
 kinds.
 
 **Checks.**
-- A zap `-fPIC` object: exported functions and data, a table of data
+- A bs `-fPIC` object: exported functions and data, a table of data
   pointers, a thread-local written from two threads, an extern the host
   defines, and a panic trace through its frames. It is linked into
   shared objects with `cc -shared`, `ld -shared` and upstream `zig
   build-lib -dynamic`, and into PIEs with `cc -pie` and upstream `zig
   build-exe -fPIE`, then loaded and run. The same `-fPIC` archive is
   linked with `cc -shared -Wl,--whole-archive`.
-- A zap shared object, loaded by a C program (`-l` at link time, and
+- A bs shared object, loaded by a C program (`-l` at link time, and
   `dlopen`/`dlsym`) and by an upstream-built Zig program. readelf finds
   no TEXTREL, no relocation kinds other than the four above, and RELRO
   covering `.data.rel.ro`, `.dynamic` and `.got`.
@@ -2988,7 +2988,7 @@ kinds.
 ### Object, archive and shared-library inputs (milestone 9, linker side; designed 2026-11-04, for review)
 
 Scope: x86_64-linux. ELF relocatable objects (`.o`) and archives (`.a`)
-become link inputs of zap's executables, objects and shared objects,
+become link inputs of bs's executables, objects and shared objects,
 alongside Zig's atoms. Shared libraries (`.so`) as inputs come last.
 Mach-O inputs get a design of their own later. The C thread's design
 ("C interop") produces the objects (upstream `zig cc` per C source) and
@@ -3037,7 +3037,7 @@ and worktrees, so the store and donors can dedup. Input sections map to
 - Non-allocated sections are dropped (`.comment`, `.note.*`, `.group`,
   `.llvm_addrsig`), except `.eh_frame` and `.debug_*`, which are copied
   (see "Unwind and debug info" below). An
-  object without `.note.GNU-stack` does not make zap's stack executable.
+  object without `.note.GNU-stack` does not make bs's stack executable.
 
 **Symbols and resolution.** An object's global symbol is a name for
 (section atom, offset). One table maps names to definitions: Zig's
@@ -3067,7 +3067,7 @@ thread-locals through TPOFF32 (checked). With `-lc` it compiles C as
 symbol or a local becomes (section atom, value + addend).
 - R_X86_64_64 → `x86_64_abs64`. PC32 → `x86_64_pc32`. New appended
   kinds `x86_64_abs32` (32, checked to fit u32) and `x86_64_abs32s` (32S,
-  i32) are for non-PIE code in zap's non-PIE executables. PC64 → new
+  i32) are for non-PIE code in bs's non-PIE executables. PC64 → new
   `x86_64_pc64`.
 - PLT32 → `x86_64_pc32` to the definition when there is one. To an
   import, it goes to a *PLT stub atom*: an 8-byte `jmp [rip + slot]`
@@ -3135,7 +3135,7 @@ symbol or a local becomes (section atom, value + addend).
   needs them. Upstream's C flags under `-lc` (`-fPIC`) produce none, but
   GCC's `-fPIE`, Debian `cc`'s default, does: it reads `stdout` with
   R_X86_64_PC32 and relies on a copy relocation (checked 2026-11-04; the
-  design first said it read through the GOT). zap makes them for glibc's
+  design first said it read through the GOT). bs makes them for glibc's
   data objects (abilists gives their sizes): a zero-fill .bss atom of the
   object's size takes the import's key, so every reference to the import,
   Zig's extern slot included, uses the copy; the import leaves the
@@ -3146,7 +3146,7 @@ symbol or a local becomes (section atom, value + addend).
   defines them at the copy too, since glibc's start code sets
   `__environ`. Upstream's link against its abilists stubs (`-target
   x86_64-linux-gnu`) misses those aliases and leaves `environ` null; its
-  native link against the system's libc.so.6 gets them, as zap does. A
+  native link against the system's libc.so.6 gets them, as bs does. A
   function's address taken without the GOT (R_X86_64_32 in non-PIC code)
   would need a canonical PLT entry and is still an error.
 
@@ -3172,13 +3172,13 @@ directories for `lib<name>.a` (and `.so` in stage C).
 **Unwind and debug info (stage B; built 2026-11-04).** The inputs'
 `.eh_frame` and `.debug_*` sections are not atoms: `ElfInput.convert`
 turns each into an `Elf.InputSection` (kind, bytes, relocations), and
-Elf copies them after zap's own part of each output section, in input
+Elf copies them after bs's own part of each output section, in input
 order, applying their relocations, one parallel task per section. So
 C frames get file:line in std's traces and gdb, and std's unwinder steps
 through them.
 - Relocations (`Elf.InputReloc`): `abs32`/`abs64` against atoms
   (addresses), `offset32`/`offset64` against another input section of
-  the same object (its offset in its output section: zap's part, the
+  the same object (its offset in its output section: bs's part, the
   sections of that kind before it, plus the addend), `dtpoff32`/
   `dtpoff64` for thread-locals' DWARF locations, `pc32` in .eh_frame,
   and constants. A reference to what the link dropped (a later COMDAT
@@ -3191,13 +3191,13 @@ through them.
   is copied in place. Every FDE's initial location must be a PC32
   relocation at offset 8 (pcrel sdata4, as GCC and Clang write on
   x86_64), from which the linker takes the function's address for
-  .eh_frame_hdr. The input records go after zap's FDEs, before the
-  terminator, and their search-table entries after zap's; with any,
+  .eh_frame_hdr. The input records go after bs's FDEs, before the
+  terminator, and their search-table entries after bs's; with any,
   the linker gathers the whole table after the copy and sorts it, since
-  C functions can lie among zap's.
-- `.debug_*`: zap writes .debug_abbrev, .debug_info, .debug_rnglists,
+  C functions can lie among bs's.
+- `.debug_*`: bs writes .debug_abbrev, .debug_info, .debug_rnglists,
   .debug_line and .debug_str; each input section of those kinds follows
-  zap's part, and the kinds only inputs bring (.debug_ranges, .debug_loc,
+  bs's part, and the kinds only inputs bring (.debug_ranges, .debug_loc,
   .debug_loclists, .debug_str_offsets, .debug_addr, .debug_line_str,
   .debug_aranges, .debug_frame, .debug_names, .debug_macro, the pubnames
   kinds) get headers and names of their own after .debug_str, only when
@@ -3216,7 +3216,7 @@ through them.
   initializer give upstream's result. The C thread keeps the committed
   test with its `-lc++`.
 - `__dso_handle`, which C++ passes to `__cxa_atexit`: crtbegin.o defines
-  it, which zap does not link, so when nothing else does, the
+  it, which bs does not link, so when nothing else does, the
   resolution (after compiler_rt, before shared libraries) defines it as
   an 8-byte rodata atom, as lld defines it; only its address in the
   image matters. The `-lc` C object test registers an exit handler with
@@ -3226,7 +3226,7 @@ through them.
 - Tests: the C object test (test/link_input/ub.c) checks the trace's
   `ub.c:2:34` line and the Zig caller's frame below it; the COMDAT test's
   assembly has FDEs, so the dropped copy's FDE is dropped; an Elf unit
-  test places a C function between two of zap's and checks the sorted
+  test places a C function between two of bs's and checks the sorted
   search table and the relocated debug sections.
 
 **Shared libraries as inputs (stage C; built 2026-11-04).** A `.so`
@@ -3247,7 +3247,7 @@ thread's abilists imports. No bytes come from it.
 - `Glibc.dynamicOptions` puts the given `.so` files that are alive in
   DT_NEEDED, in input order and before glibc's libraries, as upstream's
   linker keeps them (`Object.markLive`, `SharedObject.markLive`; fixed
-  2026-11-04, when zap listed every one): a library is alive when a
+  2026-11-04, when bs listed every one): a library is alive when a
   strong reference resolves to it, from the compilation's imports and
   copies or from a live library's undefined symbols (`ElfShared.undefs`),
   transitively. Weak references from C keep no library alive, and a weak
@@ -3259,13 +3259,13 @@ thread's abilists imports. No bytes come from it.
   definitions, Zig's and its objects', that a needed library names
   (references or defines), unless hidden, as upstream's
   `SharedObject.markImportExports`, so the loader binds the library to
-  it (fixed with the liveness: zap exported none, and a library
+  it (fixed with the liveness: bs exported none, and a library
   calling back into the program failed at run time). glibc's libraries,
-  which zap knows only from abilists, name nothing here. `-rdynamic`,
+  which bs knows only from abilists, name nothing here. `-rdynamic`,
   which exports every definition, is still accepted and ignored.
   `-needed-l`, which would keep a library regardless, is `[unsupported]`. Upstream's native link lists libm, libc
   and ld-linux first; its `-target x86_64-linux-gnu` link lists them
-  last, as zap does.
+  last, as bs does.
 - Copy relocations: a non-PIC or PIE C object reading `.so` data gets a
   copy like glibc's `stdout`, sized from the `.so`'s symbol; the
   library's other names at that address (its aliases) are defined at
@@ -3289,7 +3289,7 @@ thread's abilists imports. No bytes come from it.
   The cache writes the same RUNPATH (`Incremental.runpath`).
 - Cached (2026-11-04): `.so` files are link-only manifest inputs after
   the objects (`Incremental.link_shared`, keyed `:link:<path>`, in the
-  compilation key as `--zap-link-input=`). CodeGen depends on them only
+  compilation key as `--bs-link-input=`). CodeGen depends on them only
   through `exportTarget`, whose `importKey(name)` is the same whichever
   library defines a name, so atoms depend on whether some library
   defines a name, not which. A relink, numbered or keyed with objects,
@@ -3304,7 +3304,7 @@ thread's abilists imports. No bytes come from it.
   with a `-fPIE` C object: cold, unchanged, a deleted output, a Zig edit
   (lazy), a relink from a lazy build's log, a rebuilt library with the
   same symbols (eager), and a library that drops an imported name.
-- Test: `run zap link of a shared library` builds `libshared.so` with
+- Test: `run bs link of a shared library` builds `libshared.so` with
   upstream `zig cc -shared` and a version script, and links a Zig main
   and a `-fPIE` C object against it with `-lc -lshared -L`; it checks
   versioned calls, a copy relocation and its alias.
@@ -3355,7 +3355,7 @@ differs from the design above:
   The cache's first step (2026-11-04): the objects and archives are
   link-only manifest inputs (`Incremental.link_objects`, keyed
   `:link:<path>`, with their resolved paths in the compilation key as
-  `--zap-link-input=`), which no node depends on and replay ignores.
+  `--bs-link-input=`), which no node depends on and replay ignores.
   Their atoms and glibc data copies are owned by `Emit.Owner.input`,
   which `groupByOwner` puts after the link's own atoms and the record
   leaves out. Step 2 (2026-11-04): an edit build whose objects and
@@ -3381,7 +3381,7 @@ differs from the design above:
   archive member, a Zig edit (lazy), a relink from a lazy build's log,
   and a `-lc` program with a C object calling glibc and a Zig export,
   and copying glibc data: each byte-identical to a build without the
-  cache, with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`.
+  cache, with `BS_CACHE_VERIFY` and `BS_CACHE_CHECK`.
 - A C GOT slot is content-addressed by its target, not shared with the
   Zig extern slot of the same name.
 - With `-lc`, names nothing else defines are glibc's imports
@@ -3398,7 +3398,7 @@ differs from the design above:
   resolve as Zig exports, before compiler_rt and glibc, as upstream's
   order has them. One difference: upstream builds compiler_rt with the
   trapping panic, so its `__stack_chk_fail` stops on an illegal
-  instruction, where zap's, analyzed in the program, panics with
+  instruction, where bs's, analyzed in the program, panics with
   "stack smashing detected".
 - Init and fini arrays: `.preinit_array*`, `.init_array*` and
   `.fini_array*` sections (by type) become atoms of three new
@@ -3424,7 +3424,7 @@ differs from the design above:
   destructor, with and without `-lc`), a COMDAT pair written in
   assembly (in both orders), GCC `-fPIE` code reading `stdout` and
   `environ`, and an archive passed with `-l`/`-L`.
-- Timing (2026-11-04, ReleaseFast zap, `ZAP_CACHE=off`, against
+- Timing (2026-11-04, ReleaseFast bs, `BS_CACHE=off`, against
   upstream with a fresh local cache; objects from upstream `zig cc -c`,
   linked with `-lc` and a small Zig main that calls them): SQLite
   3.50.4's amalgamation, one 18 MB object with 148k relocations in
@@ -3436,7 +3436,7 @@ differs from the design above:
   became Wyhash.
 
 **Stages and checks.**
-1. A: objects and archives into zap's static and `-lc` executables (the
+1. A: objects and archives into bs's static and `-lc` executables (the
    latter once the C thread's step 1 lands): sections, symbols,
    relocations with GOT and PLT atoms and the relaxations, merged
    strings, COMDAT, COMMON, init/fini arrays. Tests, each run and
@@ -3457,7 +3457,7 @@ differs from the design above:
 translate-c turns `extern const char x[];` into a container-level
 `pub const x: [*c]const u8 = @extern([*c]const u8, .{ .name = "x" });`
 (wuffs has 97, which ghostty compares against at run time). Upstream
-makes the address a comptime-known pointer to an extern Nav. zap's
+makes the address a comptime-known pointer to an extern Nav. bs's
 value model:
 - InternPool `extern_var { name, ty, site }`, which appears only as a
   pointer's `uav` base, as `extern_func` does. `site` is a stable string:
@@ -3550,12 +3550,12 @@ value model:
   and links it into every binary (about 5,400 symbols even in a no-std
   program); it is 3.9 s of upstream's cold hello world, and editing any std
   file it imports rebuilds it.
-- zap makes compiler_rt a module of the same compilation instead, analyzed
+- bs makes compiler_rt a module of the same compilation instead, analyzed
   lazily like everything else: when CodeGen or Sema needs a helper (for
   example `__udivti3`, float conversions, f128 arithmetic), it references the
   helper's declaration in the compiler_rt module, and only that function and
   what it reaches are analyzed, generated, and cached. compiler_rt's
-  `comptime` export blocks are not analyzed; zap maps helper symbol names to
+  `comptime` export blocks are not analyzed; bs maps helper symbol names to
   their declarations (upstream names the function after its symbol, e.g.
   `pub fn __udivti3` in `compiler_rt/udivmod.zig`).
 - Mechanism: `compiler_rt` is a module rooted at `lib/compiler_rt.zig`
@@ -3619,13 +3619,13 @@ value model:
 - compiler_rt bodies are analyzed without runtime safety, ignoring
   `@setRuntimeSafety`, because upstream builds compiler_rt in a release mode
   and its code relies on that (for example wrapping `-=` in `fmodq`).
-  `builtin.is_test` is shared with the program, so under `zap test`
-  compiler_rt sees `is_test = true`; it reads it only in declarations zap
+  `builtin.is_test` is shared with the program, so under `bs test`
+  compiler_rt sees `is_test = true`; it reads it only in declarations bs
   does not analyze (exports, its panic handler) and in `@setRuntimeSafety`
-  arguments, which zap ignores there.
+  arguments, which bs ignores there.
 - `@memcpy`, `@memset`, and `@memmove` are inlined by CodeGen
   (`rep movsb`, `rep stosb`, and a direction check for overlap), not calls.
-- Consequence: zap binaries contain only the compiler_rt symbols they use.
+- Consequence: bs binaries contain only the compiler_rt symbols they use.
   Code that calls compiler_rt or `memcpy` by name gets them through the same
   lazy reference, so it still links.
 
@@ -3634,7 +3634,7 @@ value model:
 Decided (2026-11-02): a Go-style content-addressed cache at declaration
 granularity.
 
-- **Unit cache key** = hash(zap version, target and options, the unit's
+- **Unit cache key** = hash(bs version, target and options, the unit's
   stable key, its declaration's `src_hash`, and for instantiations the stable
   hashes of its comptime arguments).
 - **Entry** = the unit's result (serialized canonically, referencing other
@@ -3643,7 +3643,7 @@ granularity.
 - **Change detection.** AstGen already computes a 128-bit hash per
   declaration from its source bytes and starting column, independent of its
   line (`Zir.Inst.Declaration.src_hash`; `fields_hash` for container fields).
-  That is each unit's own-code hash; zap does not hash ZIR itself.
+  That is each unit's own-code hash; bs does not hash ZIR itself.
 - **Edit-rebuilds are push-based.** A per-project manifest, one mmap-able
   file, holds last build's units, their result hashes, and the dependency
   graph with reverse edges. A rebuild stats the input files, re-lowers only
@@ -3664,7 +3664,7 @@ granularity.
   - The global store holds entries in immutable packs, git-style: each
     build writes its new entries as one pack file with a sorted key index,
     and lookups binary-search the mapped indexes of all packs. Concurrent
-    zap processes need no locks to write, and old packs are removed by age.
+    bs processes need no locks to write, and old packs are removed by age.
     Only a project's first build and units re-analyzed after an edit touch
     it. (Go's one file per entry was measured and rejected, below.)
   - The project's local cache holds the manifest and a pack: one file with
@@ -3691,12 +3691,12 @@ payload until Sema serializes one. `src/Incremental.zig` connects it to a
 compilation (see "Integration" below).
 
 ```
-<global cache>/zap/store/<32 hex>.zsp       Store packs (shared by all projects)
-<global cache>/zap/store/lock               flock held by maintenance (merging, trimming)
-<global cache>/zap/store/trim               when packs were last trimmed
-<global cache>/zap/zir/<32 hex>             every file's ZIR, by content (Frontend); trimmed with the packs
-<local cache>/zap/c/trim                    when compilation directories were last scanned
-<local cache>/zap/c/<32 hex>/               one compilation, keyed by root, target, options, output
+<global cache>/bs/store/<32 hex>.zsp       Store packs (shared by all projects)
+<global cache>/bs/store/lock               flock held by maintenance (merging, trimming)
+<global cache>/bs/store/trim               when packs were last trimmed
+<global cache>/bs/zir/<32 hex>             every file's ZIR, by content (Frontend); trimmed with the packs
+<local cache>/bs/c/trim                    when compilation directories were last scanned
+<local cache>/bs/c/<32 hex>/               one compilation, keyed by root, target, options, output
     lock          flock held by the build that owns the directory; its mtime is the last use
     <32 hex>.zsp  base packs: hard links to the store packs holding the last build's Atoms
     manifest      base: mapped, pointer-free, replaced whole
@@ -3878,7 +3878,7 @@ it and can flush every CPU's TLB.
 
 ### Integration (`src/Incremental.zig`; built 2026-11-02)
 
-- **Compilation key**: the zap binary's identity (inode, size, mtime), the
+- **Compilation key**: the bs binary's identity (inode, size, mtime), the
   target, the working directory, the zig lib directory, and the command
   line. The store seed, part of every store key, is the binary's identity
   and the target only, so store entries are shared across projects.
@@ -3888,7 +3888,7 @@ it and can flush every CPU's TLB.
   link the records in place from the packs (`Pack.LinkAtoms`) with the manifest's
   numbered symbols, entry, and error codes. Frontend, Sema, and CodeGen do not run. A
   conformance unit loading 562 files (std in test mode): 0.64–0.9 ms in
-  zap (0.4–0.6 of it the stats), 2 ms wall, against 14–19 ms for a full build.
+  bs (0.4–0.6 of it the stats), 2 ms wall, against 14–19 ms for a full build.
   The generated 24.5k-atom program below relinks in 5.2–7.6 ms (5.3 ms
   steady), against 7.4–9.5 (7.9 steady) when it decoded first.
   If the output still has the inode, size, and mtime the last link left
@@ -3896,7 +3896,7 @@ it and can flush every CPU's TLB.
   successful link and deleted before each link starts), the build does
   not link at all and leaves the output untouched, so a `zig build`
   runner neither copies nor rehashes it: hello takes 0.8 ms in the cache.
-  `zap run` (`renew_output`) still renews its program's mtime, which
+  `bs run` (`renew_output`) still renews its program's mtime, which
   trimming reads as its last use.
 - **Recording** (`startRecord` once Emit has its atoms, alongside the
   link; `finishRecord` places the manifest only if the link succeeded, so
@@ -3956,7 +3956,7 @@ it and can flush every CPU's TLB.
   counting sort instead of two lists per node, and atom contents were
   hashed with Wyhash instead of SipHash. 630 nodes take 1.3–1.9 ms.
 - **Memory of recording** (2026-11-04, the `zig` workload, ReleaseFast,
-  peak RSS): analysis ends near 990 MB and `ZAP_CACHE=off` peaks at
+  peak RSS): analysis ends near 990 MB and `BS_CACHE=off` peaks at
   1.04 GB. Recording peaked at 1.46 GB with an empty store and 1.68 GB
   with a warm one: the store lookup read every node's entry header through
   the pack mappings, which kept 230 MB of pack pages resident, and the
@@ -3974,21 +3974,21 @@ it and can flush every CPU's TLB.
   manifest's sections), which the store's writer and the write need.
 - **Error codes**: the last build's names are assigned first
   (`seedErrors`), so codes stay stable across builds.
-- **Prediction check** (`ZAP_CACHE_CHECK=1`): compares a build's nodes with
+- **Prediction check** (`BS_CACHE_CHECK=1`): compares a build's nodes with
   the last manifest. The seeds are the nodes whose `src_hash` changed and
   the source-computed nodes whose result changed; every node whose result
   changed must be reachable from them over the last manifest's reverse
   edges. This is the set an edit build will re-analyze.
-- `ZAP_CACHE_TIMING=1` prints the cache's time; `ZAP_CACHE=off` disables
+- `BS_CACHE_TIMING=1` prints the cache's time; `BS_CACHE=off` disables
   it.
-- **Size limits and trimming**. `ZAP_CACHE_MAX_SIZE` (bytes, or a number
+- **Size limits and trimming**. `BS_CACHE_MAX_SIZE` (bytes, or a number
   with K, M, G, or T; default 4G) limits the global cache and, separately,
   a project's local cache, each counted once per inode. The global cache
   shares its limit (`cache.globalShares`): the store (packs, donors and
   ZIR) gets three quarters, and its compilation directories (those of
-  `zap run` and of builds outside a project, whose local cache is the
-  global one), `zap run`'s programs and the tools in `zap/o` (the
-  translate-c and build runner executables, one per zap identity, and
+  `bs run` and of builds outside a project, whose local cache is the
+  global one), `bs run`'s programs and the tools in `bs/o` (the
+  translate-c and build runner executables, one per bs identity, and
   the C++ runtime libraries) a quarter. Before, each had the whole limit,
   and the tools none: an orb's global cache reached 5.8 GB against 4 GB.
   Every build applies the global limits when they are due (a stat each
@@ -3996,17 +3996,17 @@ it and can flush every CPU's TLB.
   at most once a minute, the store at least every 10 minutes. Past it, the least recently used go, down to three
   quarters: store packs by mtime in `commit`'s maintenance, compilation
   directories by their lock's mtime in `cache.maintainCompilations`,
-  skipping those a build holds. Store packs that this zap cannot read
-  (another zap's pack format, or damaged) count and go by mtime like the
-  rest, but are not deleted for being unreadable: two zap versions can
-  share a store. `zap run`'s program directories (`zap/o/<hash>`) count
+  skipping those a build holds. Store packs that this bs cannot read
+  (another bs's pack format, or damaged) count and go by mtime like the
+  rest, but are not deleted for being unreadable: two bs versions can
+  share a store. `bs run`'s program directories (`bs/o/<hash>`) count
   and go with the compilation directories, by the program's mtime, which
-  every run renews by relinking it, so a program run daily stays. `zap
-  translate-c`'s records (`zap/tc/<key>`) count with their outputs
+  every run renews by relinking it, so a program run daily stays. `bs
+  translate-c`'s records (`bs/tc/<key>`) count with their outputs
   (`o/<key>/`) and go the same way, by the record's mtime, which every
   hit renews; eviction deletes the record first, so that a half-deleted
-  translation is a miss. `zap
-  test` deletes its binary (`zap/tmp`) once it ran; ones a killed build
+  translation is a miss. `bs
+  test` deletes its binary (`bs/tmp`) once it ran; ones a killed build
   left go after a day. A store pack that a compilation directory
   links keeps its space until the directory goes, which is why the local
   limit counts the links. The local scan runs after a build that started
@@ -4017,7 +4017,7 @@ it and can flush every CPU's TLB.
   4-core orb, overlapping the manifest's 8 ms). Directories unused for 5
   days go regardless. The cache can pass the limit only by the packs of
   builds still in flight (and by directories in use, which are never
-  deleted). Measured with conformance runs by successive zap builds (a
+  deleted). Measured with conformance runs by successive bs builds (a
   new identity each, `-j 16`), sampling `du` every second: with the
   default 4G, six runs peak at 3.85 GB (before, when the scan ran before
   the build's own pack was written: 4.47 GB after six); with 1G and two
@@ -4032,19 +4032,19 @@ it and can flush every CPU's TLB.
 - **Why the cache grew without bound** (measured 2026-11-03): a
   conformance run with an empty cache writes 696 MB that stays (653 MB in
   114 compilation directories, of which the x86_64 unit's are a 555 MB
-  store pack and a 79 MB manifest; 56 MB of ZIR), and zap writes 1.36 GB
+  store pack and a 79 MB manifest; 56 MB of ZIR), and bs writes 1.36 GB
   in all with the test binaries. A warm run writes 0 bytes to the cache.
-  But the store seed and compilation keys include zap's own identity,
-  so every rebuilt zap writes everything again under new names, and
+  But the store seed and compilation keys include bs's own identity,
+  so every rebuilt bs writes everything again under new names, and
   nothing was deleted for 5 days: 650 MB per rebuild-and-run, about 40 GB
   over a few days of compiler work. Merges could rewrite the large pack
   (above), and the old compilation directories' hard links kept merged and
   trimmed packs' space in use.
 - **Caches that still filled disks after the limit landed** (42–43 GB,
   with 1.1 and 2.3 GB packs in compilation directories, linked up to 27
-  times): every one of those builds ran a zap built from a tree without
+  times): every one of those builds ran a bs built from a tree without
   the limit (bases 775ce0b and 08a7029, before 7c31921). The 2.3 GB packs
-  were store merges of several zap builds' x86_64 packs, which the limit
+  were store merges of several bs builds' x86_64 packs, which the limit
   now bounds, and their many links were directories pinning a big pack
   for a few entries, which re-putting entries (above) now prevents.
 - **Writes that fail** (a full disk, say) cost reuse, not the build: a
@@ -4061,7 +4061,7 @@ it and can flush every CPU's TLB.
   compilation whose atoms had other names was reused, the manifest's atom
   references took this build's lengths, and the next relink failed its
   record check and rebuilt from scratch: the conformance x86_64 unit (204k
-  atoms) took 15 s on every warm run instead of 0.5 s. `ZAP_CACHE_TIMING`
+  atoms) took 15 s on every warm run instead of 0.5 s. `BS_CACHE_TIMING`
   now says why a build does not relink.
 - **Touched but unchanged inputs**: when inputs' stats changed but their
   contents' hashes did not (a touch, a checkout, or an input too new to
@@ -4102,7 +4102,7 @@ order (`namespace`), or if the name it looks up appeared, disappeared,
 or changed `pub` (`namespace_name`); a changed embedded file's node is a
 seed, and without the old ZIR every node of the input is. Recording the
 sources costs nothing measurable and 8 bytes a node plus the looked-up
-names (libvaxis: manifest 2.94 to 3.22 MB). `ZAP_CACHE_CHECK` computes
+names (libvaxis: manifest 2.94 to 3.22 MB). `BS_CACHE_CHECK` computes
 the seeds this way and checks that they reach every changed result:
 conformance after edits to three std files (a body in `mem.zig`, a
 comment in `debug.zig`, a new declaration and a default in `fmt.zig`)
@@ -4159,7 +4159,7 @@ Two things Sema must add, both narrow:
   referenced drop out of the link instead of lingering in the pack. A
   function is also reached when a unit resolves its inferred error set,
   which analyzes and emits its body: replay reaches it through the
-  `func_ies` dependency the same way. `ZAP_CACHE_CHECK` verifies that
+  `func_ies` dependency the same way. `BS_CACHE_CHECK` verifies that
   the recorded graph reaches every function the build analyzed from the
   analysis roots (comptime declarations, exports, tests); every recorded
   conformance unit passes, including x86_64's 184k functions. Function
@@ -4226,7 +4226,7 @@ once, where store payloads would repeat `[]const u8` in every entry.
   to one, cycles, and items nested deeper than 1000. Such a result is not
   stored and its unit is re-analyzed in every edit build that reaches it.
   None occur in conformance or the std tests.
-- `ZAP_CACHE_CHECK` decodes every recorded result from its words alone,
+- `BS_CACHE_CHECK` decodes every recorded result from its words alone,
   rebuilding each item from its key (`ip.find` instead of the hash
   shortcut, container types, functions, and declarations found by their
   locators), and checks that it yields this build's exact indices and
@@ -4306,9 +4306,9 @@ once, where store payloads would repeat `[]const u8` in every entry.
   namespace. Across files upstream follows its scan order, which comes from
   its work set, not a rule: `findOutdatedToAnalyze` takes functions first
   and then the first ready unit, and `clearOutdatedState` swap-removes it,
-  so the most recently queued unit moves to the front. zap does not
+  so the most recently queued unit moves to the front. bs does not
   reproduce that, so file order can differ (libvaxis's `widgets.Table`
-  tests run before `vxfw.vxfw`'s in zap and last in upstream).
+  tests run before `vxfw.vxfw`'s in bs and last in upstream).
 
 **Error codes and inferred error sets.** Codes stay append-only per
 compilation (`seedErrors` assigns the manifest's names first), so a name's
@@ -4406,7 +4406,7 @@ the format replay freezes can grow without a new graph:
   units skip lowering, which has no effect on the output except through
   memo entries: a red unit near the branch quota can succeed or fail
   differently in an edit build than in a full build, the memo's existing
-  order dependence (as upstream's), which `ZAP_CACHE_VERIFY` may flag
+  order dependence (as upstream's), which `BS_CACHE_VERIFY` may flag
   only at the quota. Call counts differ between edit and full builds
   (green units make no calls), so lowering happens at different points and
   the recorded edge sets differ; both cover what the walker read.
@@ -4431,7 +4431,7 @@ ample). `record` takes it from `Zcu.conditional_deps`, and a plain edge
 to the same node wins. Reverse edges are plain node indices: both kinds
 invalidate.
 
-**Roots and output kinds** (`zap build-obj` and `build-lib`, built
+**Roots and output kinds** (`bs build-obj` and `build-lib`, built
 2026-11-03). Reach already starts from what `record` gathers (namespace
 roots, exports, tests, `comptime` declarations), not from the entry, so
 an object's exports are its roots with no change there. What the relink
@@ -4466,17 +4466,17 @@ needs besides the atoms is in the manifest (ZAPMAN12):
 - Checked by test/obj/cache.sh: cold, relink, lazy edit, an import that
   goes (eager fallback), an export that comes back, and an import that
   becomes weak (fallback, then a relink), for build-obj and build-lib, each byte-identical to a build without the cache and checked
-  with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`.
+  with `BS_CACHE_VERIFY` and `BS_CACHE_CHECK`.
 
 **Step 4a as built** (2026-11-03). An edit build is a full build in which
 green units are loaded instead of analyzed; `record` then writes a whole
 new manifest and pack from the Zcu and Emit, as a full build does. That
 leaves the Delta, instruction maps across log records, and the numbered
 relink to step 4b, which makes the edit build lazy as well; 4a's output
-and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
+and manifest are a full build's, which `BS_CACHE_VERIFY` checks.
 
 - `src/Replay.zig` owns it. `Incremental.beginReplay` creates it after
-  `seedErrors` if the compilation has a manifest (`ZAP_CACHE_REPLAY=off`
+  `seedErrors` if the compilation has a manifest (`BS_CACHE_REPLAY=off`
   turns it off): changed inputs, the seeds and their instruction maps
   (`seeds.compute`), and the outdated set. The Zcu hook is as above:
   `ensureNavVal`, `ensureStructLayout`, `ensureStructDefaults`,
@@ -4533,14 +4533,14 @@ and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
   and code reading `@typeName` went stale.
 - The error name table is written in code order, not use order, so that
   its atom does not depend on which units were loaded.
-- `zap test` replays too: the test list is sorted (above).
+- `bs test` replays too: the test list is sorted (above).
 - Known limits: a unit is red, not loaded, if a result or dependency
-  cannot be made (`ZAP_CACHE_CHECK` prints each one; none in hello or
+  cannot be made (`BS_CACHE_CHECK` prints each one; none in hello or
   conformance). Two declarations that take each other's addresses, one
   of them outdated and red while the other loads, can report a false
   dependency loop, since the loading one has no type yet.
-- `ZAP_CACHE_VERIFY=1`: after an edit build that replayed, zap builds the
-  same command again in full in a child (`ZAP_CACHE_VERIFY=full`: no
+- `BS_CACHE_VERIFY=1`: after an edit build that replayed, bs builds the
+  same command again in full in a child (`BS_CACHE_VERIFY=full`: no
   relink, no replay), whose `record` compares its nodes with the edit
   build's manifest (set by hand with an input changed since that
   manifest, `full` fails saying so rather than compare with an older
@@ -4559,10 +4559,10 @@ and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
   unit: after the unit's build it prepends a line to its file, adds a
   statement to its first test, and appends a declaration, builds,
   restores the file and builds again, both verified with
-  `ZAP_CACHE_CHECK` on.
+  `BS_CACHE_CHECK` on.
 
 **Step 4b as built** (2026-11-03). An edit build is lazy by default
-(`ZAP_CACHE_REPLAY=eager` selects 4a): it loads only what analysis reads,
+(`BS_CACHE_REPLAY=eager` selects 4a): it loads only what analysis reads,
 records only what changed, and links from the manifest.
 
 - *The walk.* `Zcu.analyzeAll` starts `Replay.startWalk` from the root
@@ -4574,7 +4574,7 @@ records only what changed, and links from the manifest.
   exported and test declarations), `defaults` (a struct's layout to its
   defaults, which analysis queues), `func` from exported, test and compiler_rt declarations
   to their functions, and the link's own requests on the link node.
-  `ZAP_CACHE_CHECK` checks that reach finds every node with atoms. A node
+  `BS_CACHE_CHECK` checks that reach finds every node with atoms. A node
   the walk reaches that no edit reached is live and is not loaded. An
   outdated one goes to analysis (`ensure*`, `queueFunc`, a namespace's
   scan), which decides it, and the walk goes on from it if it is green.
@@ -4618,12 +4618,12 @@ records only what changed, and links from the manifest.
   unit being analyzed, data with the address of a link input's symbol
   (`Emit.inputs_deferred`), or a change in the link's inputs outside the atoms
   (external symbols, whether the error name table is written, and new
-  error names while it is). `ZAP_CACHE_TIMING` says why.
-- `ZAP_CACHE_VERIFY` compares a full build with the edit build's manifest
+  error names while it is). `BS_CACHE_TIMING` says why.
+- `BS_CACHE_VERIFY` compares a full build with the edit build's manifest
   as before, and also requires the full build's nodes to be neither
   `stale` nor, with atoms, `unlinked` there. Nodes only in the edit
   build's manifest count only if they are linked.
-- Known gaps: `zap test` skips `populateTestFunctions` in a lazy build,
+- Known gaps: `bs test` skips `populateTestFunctions` in a lazy build,
   since the test list is as linked (adding or removing a test falls
   back). Inputs touched without a change are rehashed until the next
   build that records them. The own pack grows with each record until the
@@ -4650,7 +4650,7 @@ analyzing everything.
 
 - *Publishing.* After every full record (a cold or eager build), once the
   manifest is placed, `publishDonor` hard-links it and the store packs it
-  names into `<global cache>/zap/store/donors/<donor key>-<random>/`,
+  names into `<global cache>/bs/store/donors/<donor key>-<random>/`,
   built under a `tmp-` name and renamed into place, so readers see only
   complete donors. Every atom of a full record is in a store pack, so the
   donor needs nothing from the compilation's directory, and its links keep
@@ -4665,20 +4665,20 @@ analyzing everything.
   of 80 programs, most sharing one key, evicted every program's own
   donor, so each next first build replayed a neighbour's eagerly:
   ghostty-vt-test 11.4 s instead of 0.18 s lazily.)
-- *The donor key* (`donorKey`): the store seed (zap and the target), the
+- *The donor key* (`donorKey`): the store seed (bs and the target), the
   std directory, and the options Zcu reads without recording a dependency
   (`-fsingle-threaded`, which decides whether declarations are
   threadlocal, test filters, and the root module's `-M` name, which
   `@src()` and messages show while its files are keyed `=root:` or
   `=main:` in every compilation), whether the build links an object,
   which CodeGen reads (an object imports what it does not define), and
-  whether a test build tests std itself (`zap test <lib>/std/std.zig`,
+  whether a test build tests std itself (`bs test <lib>/std/std.zig`,
   `Frontend.testsStd`). Only the module under test has tests among its
   roots, so that decides which of std's containers have effects
-  (`Sema.noteEffects`): a std container that a `zap test main.zig` donor
+  (`Sema.noteEffects`): a std container that a `bs test main.zig` donor
   evaluated has no `effects` reference, and a std test build that loaded
   it green would record a graph that misses the container's tests
-  (`ZAP_CACHE_CHECK` reports them as not reached).
+  (`BS_CACHE_CHECK` reports them as not reached).
   Everything else (the builtin module, root and modules, every file) is
   an input the replay checks. Options that change code without changing
   builtin.zig (`-fPIC`, `-ffuzz`) must join the key, or the store seed as
@@ -4709,7 +4709,7 @@ analyzing everything.
   files, the same file under another module name. The root module and
   the module under test are named by role, `=root` and `=main`, which no
   `-M` name can spell (`--dep` and diagnostics use the `-M` name), so a
-  `zap test` of a file never matches the `zap build-exe` of it as its
+  `bs test` of a file never matches the `bs build-exe` of it as its
   root module, and no other module's keys are theirs. A module's root file is
   keyed `<module>:` without its path (`Zcu.fileKey`), so the donor's root
   file is this build's root file, changed, and std's `@import("root")` in
@@ -4750,7 +4750,7 @@ analyzing everything.
   global cache), ReleaseFast, median of 10, eager → lazy: hello 71 → 14
   ms, zig workload 3710 → 673 ms, a fresh zls worktree 459 → 54 ms,
   vaxis 223 → 130 ms. Each output is byte-identical to a build without the
-  cache, and ZAP_CACHE_VERIFY reports 0 differences. What remains on the
+  cache, and BS_CACHE_VERIFY reports 0 differences. What remains on the
   zig workload is mostly the frontend (584 ms): cold-local empties the
   local cache, which holds the project files' ZIR.
 - *Output.* The link order is a function of the atoms (`groupByOwner`), so
@@ -4765,7 +4765,7 @@ analyzing everything.
   linked packs the store no longer has, trims donors by last use (the
   manifest's mtime, renewed at most hourly when used) and age with the
   packs, and deletes `tmp-` directories older than an hour.
-  `ZAP_CACHE_DONOR=off` turns publishing and use off.
+  `BS_CACHE_DONOR=off` turns publishing and use off.
 - *Why a whole graph, not per-unit lookups.* A unit's result names other
   items by the manifest's item table, so an entry per unit would have to
   carry its items' closure, and a first build would look up and check
@@ -4773,12 +4773,12 @@ analyzing everything.
   file, red-green is the replay's, and nothing new is serialized.
 - *What it cannot reuse.* Knowledge spread over several projects: a build
   replays one donor, so std units that only a third project analyzed are
-  analyzed again, and a donor with another builtin module (`zap test`
+  analyzed again, and a donor with another builtin module (`bs test`
   after `build-exe`) turns most of std red. Whatever reads codes or other
   build-wide state through a path the graph does not record.
 - *What first builds found.* A donor replays a history that a full build
   of this program never had, so it shows recordings that depend on
-  analysis order. `ZAP_CACHE_VERIFY` on first builds found two, both
+  analysis order. `BS_CACHE_VERIFY` on first builds found two, both
   fixed in Sema: anonymous types keyed under the generic instance that
   made them first (above), and memo hits that did not refer to the
   functions the memoized call referred to (`Zcu.Memo.funcs`), so only the
@@ -4834,17 +4834,17 @@ shares nothing across projects and ties the file format to in-memory layout.
 
 ### Where a cold build's time goes (measured 2026-11-03)
 
-`ZAP_TIMING=1` prints wall time per stage. `ZAP_UNIT_TIMING=n` prints the
+`BS_TIMING=1` prints wall time per stage. `BS_UNIT_TIMING=n` prints the
 n analysis units that took longest, each without the units it analyzed in
 turn (timed from `Sema.create` to `Sema.destroy`). CodeGen runs inside
 `Zcu.analyzeAll` (Emit times `CodeGen.generate`); "Sema" is the rest of
 `analyzeAll`. (The table predates parallel CodeGen: since then "CodeGen"
 is the Sema thread's time waiting for and merging the workers' output,
-and with `ZAP_THREADS=1` the same as before.) "Record" is the wait for the cache after the link. ReleaseFast
-zap, 4-core orb, page cache warm; "ZIR warm" means std's ZIR was in the
+and with `BS_THREADS=1` the same as before.) "Record" is the wait for the cache after the link. ReleaseFast
+bs, 4-core orb, page cache warm; "ZIR warm" means std's ZIR was in the
 global cache but the compilation's directory was empty.
 
-| Program | Frontend | Sema | CodeGen | Emit | Link | Record | Total in zap |
+| Program | Frontend | Sema | CodeGen | Emit | Link | Record | Total in bs |
 |---|---|---|---|---|---|---|---|
 | hello (std), ZIR warm | 4.8–5.0 | 114–119 | 41–43 | 1.1 | 3.2–3.7 | 10.5–14 | 175–183 ms |
 | hello (std), all cold | 173–196 | 150–163 | 45–50 | 1.1–1.2 | 3.5–3.9 | 12–13 | 389–419 ms |
@@ -4877,8 +4877,8 @@ on binary.zig.
 ### Sema on upstream's compiler (measured 2026-11-03)
 
 bench.py's `zig` workload (upstream's src/main.zig without LLVM) is the
-largest program zap builds: 144 k units, of which 80 k are function bodies
-(6.9 s of 9.1 s of Sema, `ZAP_UNIT_TIMING=0`) and 51 k declarations
+largest program bs builds: 144 k units, of which 80 k are function bodies
+(6.9 s of 9.1 s of Sema, `BS_UNIT_TIMING=0`) and 51 k declarations
 (2.0 s). One declaration, x86_64 `Lower.zig`'s `mnemonic_table`, took
 1.1 s; the next largest units are 0.1–0.2 s (x86_64 CodeGen's 170 k-line
 `genBody`, `Encoding.mnemonic_to_encodings_map`, aarch64's instruction
@@ -5050,8 +5050,8 @@ serial and unchanged. `Zcu.analyzeAll` hands each function's IR, owned, to
 `Emit.functionOwned`, which queues it as a job for a pool of CodeGen
 workers (`Emit.Pool`), each generating into its own worker Emit: its own
 arena, atoms, debug entries, owners, content-atom uses, unit references,
-SSA scratch, constant memo, and content-atom set. `ZAP_THREADS=n` runs
-Sema plus n−1 workers (default: one per CPU); `ZAP_THREADS=1` generates
+SSA scratch, constant memo, and content-atom set. `BS_THREADS=n` runs
+Sema plus n−1 workers (default: one per CPU); `BS_THREADS=1` generates
 each function on the Sema thread into the same worker Emit, with the
 same merge, which is the serial path for A/B runs. The output is
 byte-identical for every n.
@@ -5107,7 +5107,7 @@ byte-identical for every n.
   the workers finish theirs: before loads were jobs, an edit build merged
   after nearly every function it generated (the next loaded unit), and
   waking a worker for each one made vaxis's edit-lib build 118 → 174 ms.
-- *Measured* (ReleaseFast zap, this orb: 4 vCPUs on 2 cores, default 3
+- *Measured* (ReleaseFast bs, this orb: 4 vCPUs on 2 cores, default 3
   workers, against origin/main b30a515 in the same session; bench.py
   medians):
 
@@ -5118,10 +5118,10 @@ byte-identical for every n.
   | vaxis, cold-local | 549–561 ms | 485–493 ms |
   | vaxis, cold | 716 ms | 677 ms |
   | zig workload, cold | 13.73 s | 10.89 s |
-  | std tests (`zap test lib/std/std.zig --test-no-exec`, cache off) | 8.31 s | 7.22 s |
+  | std tests (`bs test lib/std/std.zig --test-no-exec`, cache off) | 8.31 s | 7.22 s |
   | vaxis, edit-root / edit-lib | 111 / 109–112 ms | 104 / 107–114 ms |
 
-  `ZAP_TIMING`: on hello the Sema thread spends 1.4 ms in CodeGen
+  `BS_TIMING`: on hello the Sema thread spends 1.4 ms in CodeGen
   instead of 74 ms; on the zig workload, Sema plus CodeGen goes from
   11.5 s (8.65 + 2.89) to 8.7 s (CodeGen 45 ms). What is left is Sema
   itself, which runs a few percent slower next to busy workers (std:
@@ -5135,20 +5135,20 @@ byte-identical for every n.
   workers running, each unmap interrupts the other cores to flush their
   TLBs, while page faults and unmaps contend on the address space's
   lock: munmap was a quarter of the samples. `main` therefore gives a
-  ReleaseSafe zap SafeAllocator over SmpAllocator, which keeps the
+  ReleaseSafe bs SafeAllocator over SmpAllocator, which keeps the
   double-free, mismatch and footer checks but lets freed memory be
   reused; a write after free no longer faults. std's tests
-  (`ZAP_CACHE=off`, 4-core orb, two runs each), ReleaseSafe zap: one
+  (`BS_CACHE=off`, 4-core orb, two runs each), ReleaseSafe bs: one
   thread 14.1–14.3 → 10.5 s, four threads 16.9–17.1 → 8.9–9.3 s, system
   time at four threads 10.3–10.4 → 0.9 s, RSS unchanged (761 → 764 MB).
-  A ReleaseFast zap compiles the same allocator choice as before: one
+  A ReleaseFast bs compiles the same allocator choice as before: one
   thread 7.75–7.80 vs 7.78–8.26 s, four 6.73–6.83 vs 6.64–7.24 s (noise).
 - *Debug.* std.start's SafeAllocator also records a 7-frame stack trace
-  per allocation in Debug, which was three quarters of a Debug zap's
+  per allocation in Debug, which was three quarters of a Debug bs's
   time (a link-input build 5.4 → 1.8 s), and `zig build test` runs a
-  Debug zap. `main` gives a Debug zap the same SafeAllocator over the
+  Debug bs. `main` gives a Debug bs the same SafeAllocator over the
   page allocator, so a write after free still faults, without the
-  traces; `ZAP_ALLOC_TRACES=<frames>` records them again to find where a
+  traces; `BS_ALLOC_TRACES=<frames>` records them again to find where a
   leaked or doubly freed block came from. Over SmpAllocator, as
   ReleaseSafe, would save another 13% of `zig build test` (174 → 151 s
   after an edit, system time 114 → 64 s) at the cost of that fault.
@@ -5173,7 +5173,7 @@ state, replay, the stages, and what stays serial. The expected gains
 follow here.
 
 **Step 2, expected gains.** Measured after step 1 (2026-11-03,
-ReleaseFast zap, cold, `ZAP_THREADS=4` on the 4-vCPU orb, with temporary
+ReleaseFast bs, cold, `BS_THREADS=4` on the 4-vCPU orb, with temporary
 timers around each `analyzeAll` category). "Bodies" is
 `Sema.analyzeFuncBody` together with the
 declarations and types resolved from inside it, which is the work step 2
@@ -5243,7 +5243,7 @@ thread can land them on their own:
    `const S = struct { p: *const anyopaque }; var x: S = .{ .p =
    @ptrCast(&y) }; var y = &x;` with `export fn f() usize { return
    @intFromPtr(&x); }` and `export fn g() usize { return @intFromPtr(&y);
-   }`. zap accepts it when f's export comes first and reports
+   }`. bs accepts it when f's export comes first and reports
    "dependency loop detected" when g's comes first. Upstream accepts both.
    It also removes a result difference: the partial path drops an
    explicit alignment equal to the natural one, while the full path keeps
@@ -5255,7 +5255,7 @@ thread can land them on their own:
    types, and `Type.comptimeOnly` then reads `info.field_types` at status
    `none` or `field_types_wip`. In parallel that is a data race. It is
    also a bug now: with `const S = struct { t: type }; const F = fn (S)
-   void;`, `F == fn (S) void` is false in zap if F was interned before S's
+   void;`, `F == fn (S) void` is false in bs if F was interned before S's
    fields resolved, and true upstream. All of the `comptimeOnly` cycles
    measured below come from this site.
 
@@ -5350,7 +5350,7 @@ in, the measurements above say that almost never happens.
     reader's answer depends on the same thing. So a parallel build stops
     at the first such event and reruns with one Sema thread. With one
     worker the native stack is the logical stack and the queue order is
-    fixed, so that run gives exactly what a `ZAP_SEMA_THREADS=1` build
+    fixed, so that run gives exactly what a `BS_SEMA_THREADS=1` build
     gives, including whether a cycle that a partial read could resolve
     succeeds. A one-thread build never needs this rerun. Discarding the
     parallel run also discards what a unit did before it failed:
@@ -5433,7 +5433,7 @@ analysis:
      plain, so no result depends on a dependee reached only through a
      conditional edge. The rule: stop persisting conditional edges.
      Stage A drops them, runs `--edit-verify`, and asserts under
-     `ZAP_CACHE_VERIFY` that an executed read is never only conditional.
+     `BS_CACHE_VERIFY` that an executed read is never only conditional.
      Memo entries where the first insert wins then differ only in
      conditional flags, which nothing reads. The lowering trigger may stay
      timing-dependent.
@@ -5468,7 +5468,7 @@ analysis:
      follow code order. Upstream's order is an interning artifact: for
      `const E = error{ Zeta, Alpha, Mid }; const F = error{ Mid, Beta };`,
      upstream's `@typeInfo(…).error_set` gives Alpha Mid Zeta for E and Mid
-     Beta for F, and zap today gives Mid Zeta Alpha (code order).
+     Beta for F, and bs today gives Mid Zeta Alpha (code order).
      Conformance does depend on it, though: sorting by name bytes breaks
      behavior's type_info.zig (`error{ One, Two } || error{Three}` must
      list One, Two, Three) and cast.zig's peer-type sets with Three.
@@ -5524,7 +5524,7 @@ analysis:
    and the serial result is the answer. If a parallel build stays under
    real plus shadow, a one-thread build stays under too: each of its
    extra misses executes and counts what the hit recorded. So parallel
-   and serial builds agree, and zap never rejects what one thread would
+   and serial builds agree, and bs never rejects what one thread would
    accept. One thread needs no shadow counter (decided by the lead,
    2026-11-03).
 8. *Exports, tests and compiler_rt requests.* They become locked
@@ -5623,7 +5623,7 @@ claims. Green checks of independent units then run in parallel.
 - *Record and verification.* `record` reads frozen Zcu and Emit state
   after analysis, and its inputs are sorted (rule 2), so a schedule
   cannot change the manifest. `--edit-verify` (which matches nodes by
-  key) and `ZAP_CACHE_CHECK` work unchanged. Error set types stop
+  key) and `BS_CACHE_CHECK` work unchanged. Error set types stop
   depending on code order (rule 5); `.err` refs still carry codes, which
   the verify child seeds from the same manifest.
 - *Global first-build reuse* (the cache thread's next step, a donor
@@ -5648,8 +5648,8 @@ claims. Green checks of independent units then run in parallel.
 **Step 2, stages.** Each stage lands on its own and must meet these
 checks:
 - the output and the cache's records are byte-identical across
-  `ZAP_THREADS` values and `ZAP_SCHED_FUZZ` seeds;
-- conformance is unchanged with `ZAP_CACHE_CHECK=1`: behavior with
+  `BS_THREADS` values and `BS_SCHED_FUZZ` seeds;
+- conformance is unchanged with `BS_CACHE_CHECK=1`: behavior with
   `--edit-verify` and with `--default-runner`, and `--std`;
 - the ThreadSanitizer build reports nothing with fuzzing on;
 - bench.py cold, cold-local and edit numbers before and after.
@@ -5670,7 +5670,7 @@ A. *Determinism, serially.* Rules 1–8 and the reruns they need, on one
      replay offers the kept units' candidates. (3) Link: atom records
      stop carrying names, and loaded atoms are named from final names
      at link time.
-   - `ZAP_SCHED_FUZZ` gains two Sema modes. One shuffles the function
+   - `BS_SCHED_FUZZ` gains two Sema modes. One shuffles the function
      queue and the order in which roots are queued. The other eagerly
      resolves random idle units at random points, as another worker
      would. A fuzzed serial build exposes the order dependences that
@@ -5687,7 +5687,7 @@ B. *Thread identity, still one analysis thread.* `Zcu.tid` becomes a
    of passing the tid (expected: none).
 C. *Bodies on the pool, cold builds.* Claim words, the wait graph and
    the logical stack, deques with stealing, and Sema followed by CodeGen
-   on one worker. Enabled by `ZAP_SEMA_THREADS` (default 1). A build with
+   on one worker. Enabled by `BS_SEMA_THREADS` (default 1). A build with
    a manifest still analyzes on one thread. The fuzzer adds yields and
    sleeps at claims, waits and steals. TSan runs over conformance. Serial
    reruns (loops, quota failures) come with this stage. So does the
@@ -5762,15 +5762,15 @@ on the generated program), emit, the link, and today's `record`.
 Reruns (loops, quota failures, provisional codes) repeat the whole
 compilation rather than a serial tail.
 
-**Checking it.** `ZAP_THREADS=1` runs everything inline (built for step
+**Checking it.** `BS_THREADS=1` runs everything inline (built for step
 1, where it means CodeGen on the Sema thread). The output
 binary and the manifest's atom order must be byte-identical across thread
 counts and runs, and conformance must not change. A debug option that
 shuffles the work queue and adds random yields at claim points exposes
-order dependence, and ThreadSanitizer builds of zap check the shared
+order dependence, and ThreadSanitizer builds of bs check the shared
 state. Built for step 1:
 
-- `ZAP_SCHED_FUZZ=<seed>` (`Emit.Pool.fuzz`): random sleeps (up to 0.5
+- `BS_SCHED_FUZZ=<seed>` (`Emit.Pool.fuzz`): random sleeps (up to 0.5
   ms) and yields where workers take jobs and after the Sema thread hands
   one over, a random batch length (1–32), and merges that randomly wait
   for workers instead of generating the jobs not handed over yet. Which
@@ -5778,40 +5778,40 @@ state. Built for step 1:
   which `mergeOut`'s deduplication relies on, so step 1 does not shuffle
   the queue itself.
 - `zig build -Dsanitize-thread -Doptimize=ReleaseFast`: a
-  ThreadSanitizer build of zap, linked with libc so that the allocator is
+  ThreadSanitizer build of bs, linked with libc so that the allocator is
   malloc, which ThreadSanitizer intercepts. (std's SafeAllocator, the
   ReleaseSafe default, hands freed memory to other threads in ways it
   cannot see: a ReleaseSafe build reported about 460 false races on
   libvaxis, every one a new allocation reusing memory another thread
   freed.)
 - Results (2026-11-03, origin/main 40b29a8 plus these options): the
-  ThreadSanitizer build with `ZAP_THREADS=4` and `ZAP_SCHED_FUZZ`
+  ThreadSanitizer build with `BS_THREADS=4` and `BS_SCHED_FUZZ`
   reported no race on hello, libvaxis text_input, the zig workload, std's
   tests (3351/3351), and behavior with `--edit-verify` and
-  `ZAP_CACHE_CHECK=1` (2067/2067 in 112 files). The x86_64 file's
+  `BS_CACHE_CHECK=1` (2067/2067 in 112 files). The x86_64 file's
   edit-verify run needs about 8.1 GB under ThreadSanitizer (the edit
-  build and its `ZAP_CACHE_VERIFY=full` child together; 7.65 GB for the
+  build and its `BS_CACHE_VERIFY=full` child together; 7.65 GB for the
   larger), so it ran on a 31 GB orb against origin/main 9c65ff1: 103/103,
-  no race, no edit-verify difference. With a ReleaseFast zap, all
+  no race, no edit-verify difference. With a ReleaseFast bs, all
   113 behavior test binaries and the four workloads' outputs are
-  byte-identical between `ZAP_THREADS=1` and `ZAP_THREADS=4` with
-  `ZAP_SCHED_FUZZ` (several seeds).
-- For step 2 (see its stages): `ZAP_SCHED_FUZZ` also shuffles Sema's
+  byte-identical between `BS_THREADS=1` and `BS_THREADS=4` with
+  `BS_SCHED_FUZZ` (several seeds).
+- For step 2 (see its stages): `BS_SCHED_FUZZ` also shuffles Sema's
   function queue and root order (stage A, serially), then yields and
   sleeps at claims, waits and steals (stage C). Every stage compares the
   output and the cache's records across thread counts and seeds.
 
-## The command line and `zap build` (built 2026-11-03)
+## The command line and `bs build` (built 2026-11-03)
 
-- zap is a drop-in for `zig build-exe`, `build-obj`, `build-lib`, `run`,
+- bs is a drop-in for `zig build-exe`, `build-obj`, `build-lib`, `run`,
   `test` and `build`, and for the two commands build steps and tools run
   on the compiler: `fmt` (`b.addFmt`; upstream's src/fmt.zig, copied) and
   `env` (zls's tests read the lib directory from it). `main.parseOptions` sorts every option upstream accepts, and
   every one upstream's build runner passes, into four classes:
   implemented (`-M`/`--dep`, `--name`, `-femit-bin`, `--cache-dir`,
   `-fsingle-threaded`, `-freference-trace`, `--listen=-`, ...); ignored,
-  because it changes nothing zap does (link layout, C-only settings,
-  settings zap always has: `-static`, `-fno-PIE`, ...);
+  because it changes nothing bs does (link layout, C-only settings,
+  settings bs always has: `-static`, `-fno-PIE`, ...);
   unsupported, which makes the compile fail with an `[unsupported]`
   diagnostic naming the option and the way out; and unknown, also
   `[unsupported]`. Response files (`@file`, which the runner writes for
@@ -5821,7 +5821,7 @@ state. Built for step 1:
   per module, as upstream's: each `-M` takes those given since the last
   one, a module without its own takes them from the module that first
   depends on it (`main.inheritFlags`), and std, builtin and the test
-  runner take the root module's. ReleaseSafe compiles with zap's one code
+  runner take the root module's. ReleaseSafe compiles with bs's one code
   generation, safety checks included; it changes what upstream's
   ReleaseSafe changes in meaning: `builtin.mode == .safe`, and error
   tracing and Valgrind client requests off unless asked for. A module
@@ -5836,7 +5836,7 @@ state. Built for step 1:
   `CSource.Flags.optimize`), taken like the other C module options from
   the module or else the root module.
 - **ReleaseFast and ReleaseSmall** are `[unsupported]` on the command
-  line, and accepted in `zap build`'s steps (`--listen=-`), whose build
+  line, and accepted in `bs build`'s steps (`--listen=-`), whose build
   scripts may ask for them (supermd builds its translate-c tool
   ReleaseFast). They compile with the same code generation, with
   `builtin.mode` `.fast` or `.small`, error tracing and Valgrind off, and
@@ -5846,16 +5846,16 @@ state. Built for step 1:
   IR with no dependency recording it, so a root module without them
   salts the store seed with `=nosafety`. Their C sources get `-DNDEBUG`,
   `-O2` or `-Os`, and no UBSan, as upstream's.
-- **Backend flags.** zap generates the same code in Debug and ReleaseSafe,
+- **Backend flags.** bs generates the same code in Debug and ReleaseSafe,
   where upstream's choice of backend changes nothing a program means. So `-fllvm`, `-flld` and their
-  `-fno-` forms are accepted without a word and zap compiles with its own
+  `-fno-` forms are accepted without a word and bs compiles with its own
   backend and linker. `builtin.zig_backend` is upstream's Debug default for
   the target, whatever the flags say: `.stage2_x86_64` on x86_64-linux,
   `.stage2_llvm` on aarch64-macos. Example: uucode's `build.zig` builds its
-  Unicode table generator with `.use_llvm = true` in Debug; under `zap
-  build` that step compiles with zap, and libvaxis needs no `-Dllvm=false`.
+  Unicode table generator with `.use_llvm = true` in Debug; under `bs
+  build` that step compiles with bs, and libvaxis needs no `-Dllvm=false`.
   The same rule covers `-fPIE` and `-fPIC` on executables (linuxwave's
-  `.pie = true`): zap links them static and non-PIE, which changes no
+  `.pie = true`): bs links them static and non-PIE, which changes no
   program meaning, only address randomization, and
   `builtin.position_independent_code`/`_executable` stay false (true would
   make std's start code relocate a binary that has no relocations). On
@@ -5864,27 +5864,27 @@ state. Built for step 1:
   `-funwind-tables`,
   `-fasync-unwind-tables` and `-fno-unwind-tables` set
   `builtin.unwind_tables` as upstream does (ghostty asks for `.sync`);
-  zap emits asynchronous tables for each, which serve every request.
+  bs emits asynchronous tables for each, which serve every request.
   ReleaseFast and ReleaseSmall, C, C++ and assembly sources,
-  and system libraries stay `[unsupported]`; `-lc` links glibc and `zap
-  translate-c` translates headers (see "C interop"). zap never hands a step to upstream zig.
-- **`zap build`** (`src/BuildRunner.zig`) does what upstream's `zig build`
-  does, with zap as the compiler. It compiles upstream's build runner,
-  `<zig lib>/compiler/Maker.zig`, with zap in ReleaseSafe as upstream
-  does, into `<global cache>/zap/o/<hash>/maker`, the hash taken from
-  zap's identity (`Incremental.compilationKey`'s store seed), the zig lib
-  directory and the mode. ReleaseSafe is zap's one code generation, but
+  and system libraries stay `[unsupported]`; `-lc` links glibc and `bs
+  translate-c` translates headers (see "C interop"). bs never hands a step to upstream zig.
+- **`bs build`** (`src/BuildRunner.zig`) does what upstream's `zig build`
+  does, with bs as the compiler. It compiles upstream's build runner,
+  `<zig lib>/compiler/Maker.zig`, with bs in ReleaseSafe as upstream
+  does, into `<global cache>/bs/o/<hash>/maker`, the hash taken from
+  bs's identity (`Incremental.compilationKey`'s store seed), the zig lib
+  directory and the mode. ReleaseSafe is bs's one code generation, but
   std takes its ReleaseSafe paths: the runner's `SafeAllocator` captures
   no stack trace per allocation (in Debug, DWARF unwinding on every
   allocation was the largest item of a no-change build's runner time),
   no error return traces, and upstream's `.info` log level. The compile runs from that directory so
   its key, which includes the working directory, is the same for every
   project, and a build that changed nothing reuses it without relinking.
-  zap then replaces itself with `maker build --zig-lib=<lib> --zig=<zap>
+  bs then replaces itself with `maker build --zig-lib=<lib> --zig=<bs>
   --global-cache=<global> --seed=<random> <user args>`. The runner
   compiles `build.zig` (with `configurer.zig`) and every compile step by
-  running zap with `--listen=-`.
-- **The compiler protocol** (`main.serve`, std's `std.zig.Server`): zap
+  running bs with `--listen=-`.
+- **The compiler protocol** (`main.serve`, std's `std.zig.Server`): bs
   sends `zig_version` and the step's `config` (static, no libc), then
   answers each `update` with `file_system_inputs` (every file the build
   read, as `PathPrefix` + sub path relative to the zig lib dir, local or
@@ -5900,11 +5900,11 @@ state. Built for step 1:
   belongs to the compilation's cache directory, which can recompute its
   digest: trimming the compilation is to delete it too (cache owner, not
   built yet; nothing scans `o/`, which upstream's outputs share).
-  zap also creates `<local cache>/tmp`, which upstream's compiler creates
+  bs also creates `<local cache>/tmp`, which upstream's compiler creates
   and the runner writes into.
-- **Inputs under zap's own lib directory are not reported.** Of the
+- **Inputs under bs's own lib directory are not reported.** Of the
   `file_system_inputs`, files of the pinned release's lib directory, the
-  one zap was built with, are left out (`main.prefixInputs`); they are
+  one bs was built with, are left out (`main.prefixInputs`); they are
   about 700 of a configure script's 720 (std and std.Build). The runner
   records the configure script's inputs in its configuration cache
   manifest: it stats them on every build, and when the build script
@@ -5912,22 +5912,22 @@ state. Built for step 1:
   monstar's pkg-config) it hashes every one of them again on every build.
   It also records each compile step's inputs for `--watch`. Nobody edits
   the pinned lib directory, so the runner gains nothing from them: with
-  them, the runner's own time in a no-change `zap build` of ziggy was
+  them, the runner's own time in a no-change `bs build` of ziggy was
   58 ms, without them 8 ms (bench/README.md). This is the
   trust the runner's stamp already places in that directory (an edit
   there needs `--zig-lib`, ZIG_LIB_DIR, or a cleared cache to be seen);
   with another lib directory, every input is reported, as upstream does.
 - **Errors over the protocol** travel as std's `ErrorBundle`, built by
-  `diag.toBundle` from zap's diagnostic records, and the runner renders
+  `diag.toBundle` from bs's diagnostic records, and the runner renders
   them in upstream's format: the message is prefixed with the code
   (`[type-mismatch] ...`), notes keep their source lines, call frames are
   notes worded as upstream's ("called inline here"), and the reference
   trace keeps upstream's limit (`-freference-trace=n`, else two frames for
-  the first error that has a trace) and its hidden-frame count. A step zap
+  the first error that has a trace) and its hidden-frame count. A step bs
   cannot build answers every update with one `[unsupported]` error, so the
   runner reports it as that step's failure and builds the rest; commands
-  zap does not implement (`cc`, `test-obj`, ...) are
-  served the same way. Without `--listen=-`, zap renders with its own
+  bs does not implement (`cc`, `test-obj`, ...) are
+  served the same way. Without `--listen=-`, bs renders with its own
   renderer (`--error-format`).
 - **Libraries and docs.** `build-lib` (static, upstream's default) writes
   a GNU ar archive of the library's object with a `/SYM64/` index of its
@@ -5939,35 +5939,35 @@ state. Built for step 1:
   directory, `sources.tar` with the .zig files of the module graph (byte
   for byte upstream's), and the viewer `main.wasm`. The viewer is
   lib/docs/wasm compiled for wasm32 in ReleaseSmall, the same for every
-  project, and zap has no wasm backend: zap's `build.zig` compiles it once
-  with the upstream zig that builds zap, from the zig lib directory baked
-  into zap, and zap embeds it (identical to upstream's). A build with
+  project, and bs has no wasm backend: bs's `build.zig` compiles it once
+  with the upstream zig that builds bs, from the zig lib directory baked
+  into bs, and bs embeds it (identical to upstream's). A build with
   another `--zig-lib-dir` takes the html and js from that directory and
   keeps the embedded viewer. zig-clap needs it: its test compile emits
   docs (`getEmittedDocs`) for every step.
-- **`--watch`** is upstream's runner keeping each compile step's zap alive
+- **`--watch`** is upstream's runner keeping each compile step's bs alive
   and sending an `update` per rebuild; each update compiles as a CLI build
   does, through the on-disk cache. There is no in-memory session (owner's
   decision, 2026-11-03): replay's lazy edit builds are as fast one-shot as
   upstream's in-process session. `zig build --watch` panics on Linux older
-  than 6.5 (bench/README.md), for the runner zap builds too, so it is not
+  than 6.5 (bench/README.md), for the runner bs builds too, so it is not
   tested on the orbs.
-- Measured (2026-11-03, orb, zap ReleaseFast, bench.py vaxis `zig-build`,
+- Measured (2026-11-03, orb, bs ReleaseFast, bench.py vaxis `zig-build`,
   details in bench/README.md): first build of a project with the runner
   cached 2.37 s (upstream 6.51 s), edit 139–144 ms (1.19–1.20 s), no edit
   38 ms (24 ms: the Debug runner is slower than upstream's ReleaseSafe
   one); the build.zig compile 0.69 s first, 1.7 ms unchanged, 0.21 s
   after an edit (upstream 1.2 s, 6.7 ms, 1.2 s). Compiling the runner is
-  once per zap binary, about 3 s (upstream: once per global cache, 75 s
-  with LLVM). zap's own repository builds with `zap build`, and
-  `zap build test` passes the same 169 steps and 47 of 48 unit tests (1
+  once per bs binary, about 3 s (upstream: once per global cache, 75 s
+  with LLVM). bs's own repository builds with `bs build`, and
+  `bs build test` passes the same 169 steps and 47 of 48 unit tests (1
   skipped) as `zig build test`; its oracle steps find upstream zig on
   PATH when the build's compiler is not a zig release.
 
 ## Fuzzing (designed and built 2026-11-03; x86_64-linux)
 
-Goal: upstream 0.17.1's built-in fuzzer works with zap on x86_64-linux:
-`-ffuzz`, `std.testing.fuzz`, and `zig build test --fuzz` under `zap
+Goal: upstream 0.17.1's built-in fuzzer works with bs on x86_64-linux:
+`-ffuzz`, `std.testing.fuzz`, and `zig build test --fuzz` under `bs
 build`. Agents fuzz to find a crash, then minimize and fix it.
 
 **How upstream does it.** `zig build test --fuzz[=n]` runs the tests
@@ -5987,9 +5987,9 @@ shows as coverage. Upstream's self-hosted x86_64 backend, its Linux Debug
 default, does not instrument: `--fuzz` there fails with "pcs_len was
 zero". Measured (orb, `zig build test --fuzz=30M -Dllvm`, fresh cache):
 upstream's LLVM build finds a planted out-of-bounds write behind a
-`key=zap!` prefix after 6.7 M runs, about 20 s.
+`key=bs!` prefix after 6.7 M runs, about 20 s.
 
-**zap's design.**
+**bs's design.**
 
 - **Command line.** `-ffuzz` and `-fno-fuzz` are per module, as
   upstream's: each `-M` takes the last one before it, and a root file
@@ -6004,12 +6004,12 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   it in for `__sancov_lowest_stack`, which LLVM's stack-depth
   instrumentation names, and then fails on the
   `runner_*` callbacks only the test runner defines). One difference:
-  zap has one `builtin` per family, so `builtin.fuzz` is the main
+  bs has one `builtin` per family, so `builtin.fuzz` is the main
   module's in every module, where upstream gives each module its own.
   `zig build --fuzz` passes `-ffuzz` ahead of the root module and a
   module's `.fuzz` ahead of its `-M`. `-ffuzz` on `build-obj` and
   `build-lib`, and for aarch64-macos, is `[unsupported]` for now.
-- **The fuzzer is a module family, not a second compilation.** zap
+- **The fuzzer is a module family, not a second compilation.** bs
   compiles `<zig lib>/fuzzer.zig` in the same compilation as the program,
   but as its own *module family*: the root `=root@fuzzer` (fuzzer.zig), its
   own `=std@fuzzer` (std's files again) and `=builtin@fuzzer` (output mode
@@ -6032,7 +6032,7 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   fuzzer.zig's `export fn`, and fuzzer.zig's `extern fn runner_test_run`
   to the test runner's. Unit keys stay unique because module names do:
   the family's names hold an '=', which no `-M` name can.
-  Why not a separate compilation linked in: zap's linker does not read
+  Why not a separate compilation linked in: bs's linker does not read
   objects, and a second Zcu would need its own cache manifest, relink
   path, error numbering and symbol-key salt. As a family, the fuzzer gets
   the per-declaration cache, parallel CodeGen, edit builds and debug info
@@ -6097,13 +6097,13 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
 - **Cost when off**: one flag test per function in CodeGen and per
   `place`, and the linker's per-section arrays grow from 6 to 8 entries;
   no extra atoms, sections, analysis or format bytes.
-- **`zap build`.** The runner's fuzz rebuild passes `-ffuzz` and zap
+- **`bs build`.** The runner's fuzz rebuild passes `-ffuzz` and bs
   builds it; the test binary runs as upstream's does. `--fuzz` without a
   limit also serves upstream's web UI, whose wasm client (lib/build-web)
   the runner compiles with the build's compiler for wasm32
-  (`buildClientWasm`), which zap does not target. As with the docs
-  viewer, zap's build compiles the client with upstream zig
-  (ReleaseFast, stripped: 0.4 MB) and embeds it; zap answers that one
+  (`buildClientWasm`), which bs does not target. As with the docs
+  viewer, bs's build compiles the client with upstream zig
+  (ReleaseFast, stripped: 0.4 MB) and embeds it; bs answers that one
   command (`build-exe -target wasm32-freestanding --name build-web`
   with root `build-web/main.zig`, over `--listen=-`) by writing it to
   `<cache dir>/o/<digest>/build-web.wasm` (src/BuildWeb.zig). With
@@ -6122,15 +6122,15 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   `pmovmskb`, four of each for 64 bytes); `cmpBytes` remains for
   targets whose backend does not (aarch64, until NEON lowering).
 
-**Measured** (orb, 4 vCPU, ReleaseFast zap, 2026-11-04):
+**Measured** (orb, 4 vCPU, ReleaseFast bs, 2026-11-04):
 
-- Finding bugs: `zap build test --fuzz=60M` finds the `key=zap!`
+- Finding bugs: `bs build test --fuzz=60M` finds the `key=bs!`
   overflow above in 3 tries out of 3, after 14.0 M, 13.7 M and 3.3 M runs
   (131, 107 and 25 s); upstream LLVM finds it after 6.7 M, 8.5 M and
-  6.2 M runs, 18 to 27 s. A `zap` prefix (test/build/hello,
+  6.2 M runs, 18 to 27 s. A `bs` prefix (test/build/hello,
   `zig build test-build`) falls after 0.14 M to 1.8 M runs, a few
   seconds (upstream LLVM: 0.28 M). The test has 9 522 points, against
-  upstream's 10 172 (19 787 before Sema marked user branches). zap runs
+  upstream's 10 172 (19 787 before Sema marked user branches). bs runs
   about 130 k inputs/s against upstream LLVM's 335 k/s (90 k/s with
   twice the points, 10 k/s before `cmpBytes`). The rest is backend code
   quality: `PcBitsetIterator.next` still takes 43% of the fuzzer's time,
@@ -6141,7 +6141,7 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   ReleaseFast, as upstream's; upstream LLVM 8.3 s. `PcBitsetIterator.next`
   is 54% of the fuzzer process's time, `SafeAllocator.init` (two 16 KiB
   copies of the allocator per input) 11%, `isFresh` 10%.
-- Compile time, `zap test` of that test, cache off: 0.16 s plain, 0.34 s
+- Compile time, `bs test` of that test, cache off: 0.16 s plain, 0.34 s
   with `-ffuzz` (the fuzzer's family analyzes std's code a second time;
   86 MB against 48 MB peak). A rebuild with nothing changed takes 0.00 s
   either way, and an edit of a function body 0.01 to 0.03 s. Upstream
@@ -6174,10 +6174,10 @@ compile.
   runs as `zig translate-c <flags> <file.h> --listen=-`: the step's output
   is `<local cache>/o/<digest>/<name>.zig`, and the compile steps that use
   it import it as an ordinary module (`-M<name>=<that path>`). So the
-  second goal is `zap translate-c`, not a Sema feature: Sema does not
-  change, and zap keeps its migration hint for `@cImport`. Upstream builds
+  second goal is `bs translate-c`, not a Sema feature: Sema does not
+  change, and bs keeps its migration hint for `@cImport`. Upstream builds
   translate-c with LLVM in ReleaseFast the first time it runs (53 s on
-  the orb); zap builds it in Debug in 1.35 s (corpus, cold local cache).
+  the orb); bs builds it in Debug in 1.35 s (corpus, cold local cache).
 - **`-lc`, native target** (no `-target`; `--verbose-link`): upstream asks
   the system C compiler (`LibCInstallation.findNative`, which runs `cc`)
   and links the system's `crt1.o crti.o crtbegin.o crtend.o crtn.o`,
@@ -6241,7 +6241,7 @@ Options:
    stubs (there is no command for it; scraping `--verbose-link` of a dummy
    build). Needs upstream zig for every `-lc` program, even pure Zig ones,
    and a full upstream compile the first time.
-3. *zap, from the zig lib directory* (recommended): what upstream does for
+3. *bs, from the zig lib directory* (recommended): what upstream does for
    `-target x86_64-linux-gnu`, without Clang:
    - **No libc.so.** The linker resolves imports against `abilists` (the
      data upstream generates its stubs from; the parser is upstream's
@@ -6252,7 +6252,7 @@ Options:
      `fmod` too). The library gets a DT_NEEDED (libc.so.6 always, others
      when used) and the import its `.gnu.version_r` entry. Strong names in
      none of them are undefined, as today.
-   - **No crt1.o, crti.o, crtn.o.** zap's own glibc start file, Zig with
+   - **No crt1.o, crti.o, crtn.o.** bs's own glibc start file, Zig with
      inline assembly in std.start's style (`.cfi_undefined %rip`, `%[x:P]`
      symbol operands), generated like `builtin.zig` and added as an
      analysis root when linking glibc: it exports `_start`, which does what
@@ -6270,13 +6270,13 @@ Options:
      `__dso_handle`, which the file defines hidden), `__pthread_atfork`,
      `__stack_chk_fail_local`, and the stat/mknod wrappers for glibc ≤
      2.32. std references none of them; C objects may. *As built*
-     (C++ milestone): zap compiles libc_nonshared.a from upstream's own
+     (C++ milestone): bs compiles libc_nonshared.a from upstream's own
      glibc sources with upstream `zig cc`, as it does libc++, and links
      it only when a glibc executable has C inputs (see "Runtime
      libraries" in the C++ section). Programs without C inputs need no
      Clang and get none of these functions, as before.
    - **Headers** for translate-c and C sources: `lib/libc/include` for the
-     target (`std.zig.LibCDirs.detectFromBuilding`, which zap calls as it
+     target (`std.zig.LibCDirs.detectFromBuilding`, which bs calls as it
      is) and `-D__GLIBC_MINOR__=N`, as upstream's bundled glibc. System
      headers of other libraries still come from the native include and
      library paths (`std.zig.system.NativePaths.detect`, as upstream does
@@ -6290,14 +6290,14 @@ Options:
    symbols and versions at run time; crt code and headers from the zig
    lib directory instead of `/usr`. It needs no C compiler and no files
    from the system, cross-compiles from macOS, and step 1 needs no object
-   reader. The cost: zap owns about a hundred lines of start code, and
+   reader. The cost: bs owns about a hundred lines of start code, and
    musl stays `[unsupported]`. If the owner prefers option 1, step 1
    grows by the object, archive, script and shared-object readers that
    step 3 needs anyway, and option 3 remains its fallback.
 
 **`builtin`** follows upstream's text for the target (`abi`, `link_mode`,
 glibc version, `dynamic_linker`, `link_libc`,
-`position_independent_code = true`). zap's code stays executable code
+`position_independent_code = true`). bs's code stays executable code
 (local-exec thread-locals, absolute addresses), as it is for
 `build-exe -fPIE`: the output is a non-PIE executable, where that changes
 nothing a program means. `-lc` on aarch64-macos changes nothing (libSystem
@@ -6306,7 +6306,7 @@ is always linked); `-target x86_64-linux[-musl] -lc` and
 `-target x86_64-linux-gnu`.
 
 **The link** (`Elf.Options.dynamic` with an executable kind, on the `pic`
-branch's `ElfDynamic`): ET_EXEC at zap's usual base (upstream's 16 MiB
+branch's `ElfDynamic`): ET_EXEC at bs's usual base (upstream's 16 MiB
 changes nothing a program means); PT_PHDR, PT_INTERP,
 the three PT_LOADs, PT_DYNAMIC, PT_TLS, PT_GNU_RELRO, PT_GNU_EH_FRAME,
 PT_GNU_STACK. Zig code reaches every extern through an 8-byte slot
@@ -6327,24 +6327,24 @@ so static links compile as before.
 
 ### Decision 2: how translated files and headers enter the cache
 
-- **The translate-c binary** is built by zap like the build runner:
+- **The translate-c binary** is built by bs like the build runner:
   `<zig lib>/compiler/translate-c/main.zig` with the `aro` module, Debug,
-  into `<global cache>/zap/o/<hash>/translate-c`, the hash taken from
-  zap's identity and the zig lib directory, compiled through zap's own
+  into `<global cache>/bs/o/<hash>/translate-c`, the hash taken from
+  bs's identity and the zig lib directory, compiled through bs's own
   cache from a fixed directory, so every project shares it and a later
   use costs a stat. It runs as a child, `--zig-integration` (errors come
   back as an ErrorBundle on stdout), with upstream's arguments.
-- **A translation record** per translation, `<local cache>/zap/tc/<key>`
+- **A translation record** per translation, `<local cache>/bs/tc/<key>`
   (small, one file; written through a temporary file and renamed). The
-  key hashes the translate-c binary's contents (not zap's identity: a
-  new zap that builds the same binary keeps the records), the source path and the arguments that reach Aro (target, glibc version,
+  key hashes the translate-c binary's contents (not bs's identity: a
+  new bs that builds the same binary keeps the records), the source path and the arguments that reach Aro (target, glibc version,
   include directories, defines, flags, in order); file contents are not
   in it. The record holds every file Aro read (the source and each header
   from its `-MD` depfile) with its stat (inode, size, mtime, under the
   frontend index's racy-mtime rule) and content hash, and the output's
   content hash.
 - **The output** is `<local cache>/o/<key>/<name>.zig` and the digest
-  zap reports is the key, so it does not move when a header changes. The
+  bs reports is the key, so it does not move when a header changes. The
   compile step that imports it keeps its command line, hence its
   compilation key, and builds an edit build of one changed file (upstream
   reports a digest of the contents; its compile step then sees a new
@@ -6362,7 +6362,7 @@ so static links compile as before.
   use it. Nothing new in the manifest, the store or the donor key: a
   donor's translated module is matched by its file key (`<module>:` for a
   root) and compared by content like any file.
-- **C objects** (step 3) use the same record shape (`<local cache>/zap/cc/
+- **C objects** (step 3) use the same record shape (`<local cache>/bs/cc/
   <key>` with the object next to it), keyed by the upstream zig binary's
   identity instead of translate-c's. The compilation's manifest lists the
   objects among its inputs (path and content hash), so a no-edit build
@@ -6376,31 +6376,31 @@ so static links compile as before.
   needs nothing: `-lc` changes `builtin.zig`, which replay checks like
   any input, and import resolution happens at link time.
 
-### Decision 3: how `zap build` routes C
+### Decision 3: how `bs build` routes C
 
-- **Compile steps stay zap's.** A step whose command line has C sources
+- **Compile steps stay bs's.** A step whose command line has C sources
   (`-cflags ... --`, `.c`, `.S`, `.s` files, modules without a Zig root),
   objects or archives (`.o`, `.a`), or libraries (`-lc`, `-l<name>`) is
-  built by the same `zap build-*`: Zig through zap, each C source by
+  built by the same `bs build-*`: Zig through bs, each C source by
   spawning upstream `zig clang` with the flags upstream's `addCCArgs`
-  builds (copied: the list above, for zap's target and baseline CPU), up
-  to the job count at once and while Sema runs, then one link by zap.
-  Debug C calls `__ubsan_handle_*`, which zap provides from upstream's
+  builds (copied: the list above, for bs's target and baseline CPU), up
+  to the job count at once and while Sema runs, then one link by bs.
+  Debug C calls `__ubsan_handle_*`, which bs provides from upstream's
   `lib/ubsan_rt.zig`, analyzed lazily as a module like compiler_rt.
   Libraries of C only (libyaml, BearSSL, cmark-gfm) are `build-lib`
-  steps: zap compiles their sources and writes the archive with
+  steps: bs compiles their sources and writes the archive with
   `Archive.zig`, indexing the objects' global symbols.
-- **TranslateC steps** run `zap translate-c ... --listen=-`, served as
+- **TranslateC steps** run `bs translate-c ... --listen=-`, served as
   above. The CLI form prints the file to stdout, as upstream.
-- **`zap cc`, `zap c++`, `zap ar`, `zap ranlib`** (build scripts run them
-  as `b.graph.zig_exe`, which is zap under `zap build`) exec upstream
-  `zig` with the same arguments: they are Clang and LLVM tools, which zap
+- **`bs cc`, `bs c++`, `bs ar`, `bs ranlib`** (build scripts run them
+  as `b.graph.zig_exe`, which is bs under `bs build`) exec upstream
+  `zig` with the same arguments: they are Clang and LLVM tools, which bs
   never runs itself. `objcopy` stays `[unsupported]` until needed.
-- **Finding upstream zig**: `ZAP_ZIG`, else `zig` on PATH, else
-  `~/.cache/zap/zig-<host>-0.17.1/zig`, accepted only if it reports
+- **Finding upstream zig**: `BS_ZIG`, else `zig` on PATH, else
+  `~/.cache/bs/zig-<host>-0.17.1/zig`, accepted only if it reports
   0.17.1 (checked once per binary, by stat, in the global cache). Without
   one, a step with C fails with one `[unsupported]` diagnostic saying C
-  sources need upstream zig 0.17.1 and where zap looked. Pure Zig and
+  sources need upstream zig 0.17.1 and where bs looked. Pure Zig and
   `-lc`-only programs never look.
 - **The config message** reports `link_libc` and `link_mode = .dynamic`
   for such steps, as upstream.
@@ -6419,7 +6419,7 @@ the executable kind, abilists imports with versions, PT_INTERP, DT_NEEDED,
 reviewing. The link thread takes, after its PIE work, the input side of
 step 3: ELF relocatable objects and archives as link inputs (their
 sections become atoms; their relocations, including GOTPCREL(X), PLT32
-and TLS models, against zap's and other objects' symbols; PLT stubs and
+and TLS models, against bs's and other objects' symbols; PLT stubs and
 copy relocations for C code that calls or reads imports directly;
 `.init_array`, COMDAT groups, mergeable strings, `.eh_frame`), and shared
 libraries as inputs. To be agreed with that thread.
@@ -6430,7 +6430,7 @@ libraries as inputs. To be agreed with that thread.
   libraries: the builtin text, the start file, abilists and the dynamic
   link are all behind that, and the static relocation loop compiles as
   before (comptime flag). Each step reports std's compile time against
-  main (`ZAP_CACHE=off zap test lib/std/std.zig --zig-lib-dir upstream/lib
+  main (`BS_CACHE=off bs test lib/std/std.zig --zig-lib-dir upstream/lib
   --test-no-exec`, interleaved runs) and the compile time of `-lc`
   programs against upstream (on the orb, upstream's native `-lc` hello:
   4.3 s with an empty global cache, 0.38 s warm).
@@ -6455,7 +6455,7 @@ libraries as inputs. To be agreed with that thread.
   imports versioned through .gnu.version and .gnu.version_r
   (`Glibc.sharedObjectOptions`), no PT_INTERP or DT_DEBUG, no copies
   (data goes through the GOT), and imports through PLT stubs and GOT
-  slots as in any zap shared object; a name neither its shared libraries
+  slots as in any bs shared object; a name neither its shared libraries
   nor glibc define is imported unversioned, for the program that loads
   it. A glibc newer than abilists' newest links against the newest,
   with upstream's warning. Over `--listen=-`, the config message reports
@@ -6483,7 +6483,7 @@ libraries as inputs. To be agreed with that thread.
   libc.so.6 and the libraries used in DT_NEEDED, and gives each import
   its version. A hello world's 96 imports bind to the same versions as
   upstream's native `-lc` build on the orb (upstream imports three more:
-  `__tls_get_addr`, `getrandom`, `sendfile`, which zap's lazy analysis
+  `__tls_get_addr`, `getrandom`, `sendfile`, which bs's lazy analysis
   does not reach).
 - **Elf** (`Options.dynamic` with `interp`): imports take stand-in
   addresses outside the image (`exe_import_base`), so an absolute
@@ -6510,17 +6510,17 @@ libraries as inputs. To be agreed with that thread.
   which numbered atoms keep; a unit test links an executable keyed and
   numbered, compares the bytes and runs it under ld.so). It
   takes the glibc the build loaded, or reads abilists (0.6 ms) for a
-  relink without CodeGen. `Job.compile_args` gains `--zap-glibc=<version>`
+  relink without CodeGen. `Job.compile_args` gains `--bs-glibc=<version>`
   (not `full_args`), so the compilation key covers the native version,
   and `donorKey` hashes it: CodeGen resolves names glibc defines to
   imports. The store seed stays: store entries match by their atoms'
   hashes. Tests: test/run/libc_edit.zig (edit builds with
-  `ZAP_CACHE_VERIFY`, then a relink from the manifest after the output
+  `BS_CACHE_VERIFY`, then a relink from the manifest after the output
   is deleted, which reads abilists, compared byte for byte with a full
   build) and test/run/libc_donor.zig (`donor-libc`: static and `-lc`
   builds of one program into one global cache, in both orders, and
   neither replays the other). Edit builds of the corpus thread's `-lc`
-  projects (`zap build test`, a one-line body edit, compile step):
+  projects (`bs build test`, a one-line body edit, compile step):
   libxev 0.20 → 0.03 s, zio 0.69 → 0.06 s, zedis 0.31–0.38 → 0.05 s,
   tokamak 1.0 → 0.035 s (upstream 0.7, 1, 1 and 2 s).
 - **Checks**: `run.py --std --libc` 3350/3350 (upstream 3350 pass, 37
@@ -6529,16 +6529,16 @@ libraries as inputs. To be agreed with that thread.
   `stdout`, a callback, malloc, threads and thread-locals, an exit
   status), compared with upstream's `-target x86_64-linux-gnu -lc`
   build; a panic's stack trace through libc's frames matches upstream's,
-  with zap's start code as the outermost frame.
-- **Found on the way**: zap passes a slice to a variadic function, which
+  with bs's start code as the outermost frame.
+- **Found on the way**: bs passes a slice to a variadic function, which
   upstream rejects ("cannot pass '[:0]const u8' to variadic function"):
-  zap has no extern-type validation (`validateExtern`) for variadic
+  bs has no extern-type validation (`validateExtern`) for variadic
   arguments or C-callconv parameters. It accepts more than upstream;
   it is Sema's to fix.
 
 ### Step 2 as built (2026-11-04)
 
-- **`zap translate-c`** (`src/TranslateC.zig`): the CLI prints the
+- **`bs translate-c`** (`src/TranslateC.zig`): the CLI prints the
   translation, as upstream; `--listen=-` answers each update with
   `file_system_inputs` (the source and every header) and `emit_digest`,
   or with translate-c's ErrorBundle, passed through as it came. Options:
@@ -6546,11 +6546,11 @@ libraries as inputs. To be agreed with that thread.
   `-iquote`/`-idirafter`/`-D`/`-U` and the like (passed to Aro in order),
   the cache and lib directories; `-O` is ignored (headers see Debug's
   macros, as the code they go into), `-cflags ... --` too, as upstream.
-  Targets: x86_64-linux only, since zap builds the translate-c binary
+  Targets: x86_64-linux only, since bs builds the translate-c binary
   with its x86_64 backend.
 - **Aro's arguments** are upstream's (`Compilation.translateC`, read from
-  the argv upstream's zig passes its translate-c binary) for zap's
-  target: `-mcpu` is zap's CPU (the baseline unless `-mcpu` says
+  the argv upstream's zig passes its translate-c binary) for bs's
+  target: `-mcpu` is bs's CPU (the baseline unless `-mcpu` says
   otherwise), so CPU feature macros are its; the triple is the native
   one without `-target` (glibc's
   ABI and detected version, with or without `-lc`, as upstream's native
@@ -6567,23 +6567,23 @@ libraries as inputs. To be agreed with that thread.
   `c.h` without `-lc`) and for `-target x86_64-linux-gnu.2.36 -lc`
   (stdio.h).
 - **The binary**: `<zig lib>/compiler/translate-c/main.zig` with `aro`,
-  Debug, compiled by zap from `<global cache>/zap/o/<hash>/` like the
+  Debug, compiled by bs from `<global cache>/bs/o/<hash>/` like the
   build runner (`BuildRunner.compileTool`, `toolUnchanged`).
-- **Records** (`<local cache>/zap/tc/<key>`): a header (magic
+- **Records** (`<local cache>/bs/tc/<key>`): a header (magic
   `ZAPTC002`, the output's hash, counts), one 48-byte entry per file
   (inode, size, mtime or racy, path length, content hash), then the
   absolute paths. The key (`ToolRecord.key` over the binary's content
   hash, kept in `translate-c.hash` beside it and recomputed when the
   binary's stat stamp changes, Aro's arguments and the source's absolute
-  path, the working directory and the zig lib directory; not zap's
-  identity, since zap's code generation reaches the output only through
+  path, the working directory and the zig lib directory; not bs's
+  identity, since bs's code generation reaches the output only through
   the binary) names the output,
   `<local cache>/o/<key>/<stem>.zig`, and is the digest. A hit stats the
   files, rehashes those whose stats changed, and rewrites the record when
   only stats changed, else touches it (its mtime is its last use, for
-  trimming). A miss translates into `zap/tmp`, moves the output into
+  trimming). A miss translates into `bs/tmp`, moves the output into
   place only when its bytes changed, then replaces the record. Trimming
-  `zap/tc` and `o/<key>` under the local cache's cap is the cache
+  `bs/tc` and `o/<key>` under the local cache's cap is the cache
   thread's (maintain), by the record's mtime.
 - **Checks**: test/build/hello's `shape` step (a `b.addTranslateC` with
   `-lc`, an include directory and a macro, imported by a `-lc`
@@ -6620,9 +6620,9 @@ libraries as inputs. To be agreed with that thread.
   pieces follow each other without padding or zero terminators, which
   LLD reads as the end of the section. `.llvm_addrsig` is dropped. A C
   object only (no Zig module) is merged the same way. Upstream also
-  dedupes merged strings and rebuilds .eh_frame; zap's output links to
+  dedupes merged strings and rebuilds .eh_frame; bs's output links to
   the same program (test/link_input/merge*: upstream's linker, LLD with
-  C++ COMDATs and exceptions, and zap's) and keeps C and Zig lines in
+  C++ COMDATs and exceptions, and bs's) and keeps C and Zig lines in
   traces. The cache relinks the Zig object and merges again
   (`Incremental.linkFrom`; test/obj/cache.sh).
 - **Shared libraries with inputs** (`build-lib -dynamic` with object or
@@ -6647,7 +6647,7 @@ libraries as inputs. To be agreed with that thread.
   static ones bind the library's own. Refused with a diagnostic: non-PIC relocations
   (R_X86_64_32, 32S, TPOFF32, GOTTPOFF), Clang's `_TLS_MODULE_BASE_`
   descriptors, and another module's thread-locals. Upstream also
-  exports ubsan_rt's handlers (weak); zap does not. Shared libraries
+  exports ubsan_rt's handlers (weak); bs does not. Shared libraries
   are not cached, so there is no relink (test/link_input/so_*).
 - **Assembly sources** (2026-11-04, libsodium's `addAssemblyFile`), as
   upstream's `FileExt`: `.S` (`assembly_with_cpp`) takes C's arguments
@@ -6658,7 +6658,7 @@ libraries as inputs. To be agreed with that thread.
   the assembler's CPU features, and writes no depfile, so its record
   holds the source alone (an `.include` it reads is not an input, as
   upstream's cache has none either). The command lines equal upstream's
-  `--verbose-cc` apart from the CPU (zap's baseline).
+  `--verbose-cc` apart from the CPU (bs's baseline).
 - **Static libraries** (2026-11-04), as upstream's: the archive holds
   the Zig object (`<root stem>.o`), then the object inputs (named after
   their files, as given), then one member per C source (`<stem>.o`),
@@ -6672,7 +6672,7 @@ libraries as inputs. To be agreed with that thread.
   file (`-M<name>`, which `zig build` passes for a library of C only)
   holds C sources and no Zig module, and `--dep`s on it are dropped; as
   the root module, or with C files and no module at all, it makes a
-  library of C only (`Options.c_only`): zap compiles the C, analyzes no
+  library of C only (`Options.c_only`): bs compiles the C, analyzes no
   Zig, and writes the archive of the objects, named after `--name` or
   the first C file. Object inputs alone, with no root and no C (libvaxis's
   C API library, 2026-11-04), make the same kind of library or object:
@@ -6680,7 +6680,7 @@ libraries as inputs. To be agreed with that thread.
   first object, and every build writes it again from them, so there is
   no cache entry to relink (test/obj/cache.sh). Libraries do not root ubsan_rt or ssp; an executable
   that links them does. The member headers' mode is `0` and odd sizes are
-  padded with a zero byte, as upstream's (zap wrote `644` and `\n`
+  padded with a zero byte, as upstream's (bs wrote `644` and `\n`
   before), so an archive of C is upstream's byte for
   byte for the same CPU with upstream's own linker (`-fno-llvm
   -fno-lld`); a library of C only under `zig build` links with LLD by
@@ -6690,15 +6690,15 @@ libraries as inputs. To be agreed with that thread.
 - **Executables of C only** (libxml2's xmllint): a rootless root
   module, or C files and no module, in `build-exe` or `run` with `-lc`
   (`Options.c_exe`). Upstream analyzes no Zig and links glibc's crt1.o;
-  zap's start code is Zig (`Builtin.glibc_start`), so the root file is
-  zap's `Builtin.c_main` (`<global>/zap/c_main/<hash>/c_main.zig`),
+  bs's start code is Zig (`Builtin.glibc_start`), so the root file is
+  bs's `Builtin.c_main` (`<global>/bs/c_main/<hash>/c_main.zig`),
   which declares `_start` so that std's start code exports neither
   `_start` nor `main`. glibc_start.zig calls C's `main`, and the build
   roots compiler_rt and ubsan_rt as any executable with C does, and
   caches like one. Without `-lc` it stays `[unsupported]`, since C has
   no `_start` of its own.
 - **Clang's arguments** (`CSource.zig`) are upstream's `addCCArgs` for
-  zap's target and the baseline CPU, in Debug: the triple from the glibc
+  bs's target and the baseline CPU, in Debug: the triple from the glibc
   version (native: detected, with or without `-lc`, as upstream's native
   target; `x86_64-linux`: no libc), `-fPIC` with `-lc`
   (`requiresPic`), glibc's headers from the zig lib directory (decision
@@ -6706,14 +6706,14 @@ libraries as inputs. To be agreed with that thread.
   backend for Zig has none, which turns it off for the compilation's C
   too; step 4 has the exceptions), the sanitizer flags of `sanitize_c`, every CPU feature, then
   `global_cc_argv`, the module's `cc_argv` and the file's `-cflags`.
-  zap leaves out `--serialize-diagnostics` and reads Clang's text
+  bs leaves out `--serialize-diagnostics` and reads Clang's text
   errors instead (`-fno-caret-diagnostics`: `path:line:col: error:`,
   with notes), which become ordinary diagnostics. The objects are byte
   for byte upstream's for `-target x86_64-linux-gnu.2.36 -lc
   -mcpu=baseline` and for the native target without `-lc`; upstream's
   native `-lc` reads the system's `/usr/include` instead (decision 1).
-- **Running**: upstream zig is `ZAP_ZIG`, else `zig` on PATH, else
-  `~/.cache/zap/zig-0.17.1/zig` or `zig-<host>-0.17.1/zig`; its
+- **Running**: upstream zig is `BS_ZIG`, else `zig` on PATH, else
+  `~/.cache/bs/zig-0.17.1/zig` or `zig-<host>-0.17.1/zig`; its
   version is checked (`zig version`, 5 ms) only when something must
   compile. The compiles start before the frontend, on up to the CPU
   count of tasks (`Io.Group.concurrent`, each running `zig clang`), and
@@ -6723,8 +6723,8 @@ libraries as inputs. To be agreed with that thread.
 - **Records**: as translate-c's (`ToolRecord.zig`, shared): the key
   covers upstream zig's path and stat, Clang's arguments without the
   depfile and output paths, the source's absolute path, the working
-  directory and the zig lib directory, and not zap's identity, so a new
-  zap keeps the objects (SDL3's 473 took 37 s to compile again). zap
+  directory and the zig lib directory, and not bs's identity, so a new
+  bs keeps the objects (SDL3's 473 took 37 s to compile again). bs
   writes no file Clang reads: everything else Clang reads (the source,
   every header, libc's and libc++'s from the lib directory included) is
   in the depfile, so in the record by content. The runtime libraries
@@ -6732,7 +6732,7 @@ libraries as inputs. To be agreed with that thread.
   are keyed by upstream zig's identity and their compiles' arguments,
   trusting the lib directory's sources by path as the build runner does;
   the object
-  is `<local cache>/o/<key>/<stem>.o`, the record `zap/tc/<key>`, so the
+  is `<local cache>/o/<key>/<stem>.o`, the record `bs/tc/<key>`, so the
   cache's trimming covers both. A build whose C files and headers all
   stat as recorded runs no Clang; a header edit recompiles the files
   that read it.
@@ -6750,16 +6750,16 @@ libraries as inputs. To be agreed with that thread.
   A library of C only (`c_only`) has no Zig to cache and stays outside
   `Incremental`; when no source compiles, it keeps its archive if the
   archive and every object stat as when it was written (a stamp of
-  their paths, inodes, sizes and mtimes at `<local>/zap/car/<key>`),
-  as upstream's cache hit does: SDL3's unchanged `zap build` went from
+  their paths, inodes, sizes and mtimes at `<local>/bs/car/<key>`),
+  as upstream's cache hit does: SDL3's unchanged `bs build` went from
   0.85 s to 0.07 s (upstream 0.06 s), since writing its 70 MB archive
   dominated. The records' checks share one stat per file
   (`ToolRecord.Stats`; SDL3's 473 records list 190k headers), and a
   build reports each file the C read once.
-- **Batch summary** (`CSource.Summary`, `<local>/zap/cb/<key>`): when
+- **Batch summary** (`CSource.Summary`, `<local>/bs/cb/<key>`): when
   every source's object is done, the build writes the objects' paths
   and the distinct files all records list, each with its stat. The key
-  covers zap's identity (zap turns the options into the records' keys),
+  covers bs's identity (bs turns the options into the records' keys),
   upstream zig's, the working and lib directories, the target's common
   Clang arguments, the options and every source. A build whose files
   all stat as summarized takes the objects without computing Clang's
@@ -6770,7 +6770,7 @@ libraries as inputs. To be agreed with that thread.
   records' mtimes, by which the cache trims, get renewed. An executable
   whose link is unchanged reports the records' inputs without reading
   the objects. SDL3's lib step went from 47 ms to 13 ms, and its
-  unchanged `zap build example` from 0.09 s to 0.023 s (upstream
+  unchanged `bs build example` from 0.09 s to 0.023 s (upstream
   0.042 s). test/link_input/cache.sh checks a `-lc` program with a C
   source: cold, unchanged, a C edit, a touched source and a Zig edit;
   and a library of C only: unchanged (from the summary), a header edit,
@@ -6796,7 +6796,7 @@ libraries as inputs. To be agreed with that thread.
 
 ### Step 4: C++, as built (2026-11-04; approved in AGENTS.md aba67e5)
 
-zap compiles no C++ either: `.C`, `.cc`, `.cpp`, `.cxx`, `.c++` and
+bs compiles no C++ either: `.C`, `.cc`, `.cpp`, `.cxx`, `.c++` and
 `.stub` sources (upstream's `FileExt.cpp`) go to upstream `zig clang`
 like C sources (`CSource.Lang`), with the same records, cache inputs and
 diagnostics.
@@ -6813,13 +6813,13 @@ diagnostics.
   directory after libc's. All 83 command lines of a `-lc++` executable
   (libc++, libc++abi, libunwind and the user's source) equal upstream's
   `--verbose-cc` for `-target x86_64-linux-gnu -lc++` apart from the
-  CPU features (zap's baseline) and, natively, the libc include
+  CPU features (bs's baseline) and, natively, the libc include
   directories (decision 1); monstar's simdutf, highway and ghostty-vt's
   `src/simd/*.cpp` match the same way.
 - **Stack protector**: as upstream's `Module.create`, a C or C++ source
   gets `-fstack-protector-strong --param ssp-buffer-size=4` when the
   compilation links libc and its Zig code has no self-hosted backend: a
-  library of C only (`c_only`), or `-fllvm`, which zap otherwise
+  library of C only (`c_only`), or `-fllvm`, which bs otherwise
   ignores; a module's `-fstack-protector`/`-fno-stack-protector` wins.
   Otherwise `-fno-stack-protector`, as before.
 - **Native include directories** (upstream's
@@ -6831,7 +6831,7 @@ diagnostics.
 - **`-lc++`**, and `-lstdc++`, `-lc++abi`, `-lsupc++` (upstream's
   `is_libcpp_lib_name`), imply `-lc` and set `builtin.link_libcpp` and
   the `--listen=-` configuration's `link_libcpp`/`link_libunwind`. An
-  executable (and `zap test`/`run`) links libc++.a, libc++abi.a and
+  executable (and `bs test`/`run`) links libc++.a, libc++abi.a and
   libunwind.a; a static library or object only takes the flags, as
   upstream links the runtime libraries only into executables and shared
   libraries. Like C sources, `-lc++` roots ubsan_rt and ssp.
@@ -6841,16 +6841,16 @@ diagnostics.
   sanitizer, function and data sections, asynchronous unwind tables,
   then the library's own defines and visibility). They compile in the
   same Clang batch as the user's sources, at
-  `<global>/zap/tmp/<lib>-<random>/`, and `Batch.wait` writes
-  `<global>/zap/o/<key>/lib<name>.a` (`Archive.write`, atomically) and
+  `<global>/bs/tmp/<lib>-<random>/`, and `Batch.wait` writes
+  `<global>/bs/o/<key>/lib<name>.a` (`Archive.write`, atomically) and
   removes the directory. The key hashes upstream zig's identity, the
-  library name and every compile's arguments, not zap's identity (a new
-  zap builds the same library), and trusts the lib directory, as the
+  library name and every compile's arguments, not bs's identity (a new
+  bs builds the same library), and trusts the lib directory, as the
   build runner's translate-c does. A build whose archives exist runs
   nothing for them. The archives follow the C objects as link inputs
   (`ElfInput.addArchive`; `Emit.sync`) and as the cache's
   `link_objects`, so an unchanged rebuild stats them and skips the link.
-  Upstream links them as `libunwind libc++ <objects> libc++abi`; zap's
+  Upstream links them as `libunwind libc++ <objects> libc++abi`; bs's
   archives resolve as one group (`ElfInput.pull` loops until nothing more
   is pulled), so the order does not change which members load.
 - **libc_nonshared.a** (`CSource.nonshared_lib`, from upstream's
@@ -6868,7 +6868,7 @@ diagnostics.
   test/link_input/cxx.cpp throws through three frames with a
   `std::string` cleanup, catches by type, reads `typeid(...).name()`,
   and has a static constructor and `thread_local` values with dynamic
-  initializers; build.zig's "zap build-exe -lc++ with a C++ source"
+  initializers; build.zig's "bs build-exe -lc++ with a C++ source"
   expects upstream's output.
 - **Cost** (ReleaseFast, test/link_input's `cxx_main.zig` with `cxx.cpp`,
   `-lc++ -target x86_64-linux-gnu`, against upstream): empty caches
@@ -6886,8 +6886,8 @@ diagnostics.
    `baseline/std-x86_64-linux-gnu-libc.json`). Tests: a `-lc` program
    calling libc functions and reading `environ` and `stdout`, under
    `test/run`, compared with upstream.
-2. `zap translate-c` (CLI and `--listen=-`), the translate-c binary, the
-   translation records; a `b.addTranslateC` project under `zap build`,
+2. `bs translate-c` (CLI and `--listen=-`), the translate-c binary, the
+   translation records; a `b.addTranslateC` project under `bs build`,
    including a header edit (one rebuild, no rebuild when unchanged).
 3. C sources through upstream `zig clang`, ubsan_rt, `.o`/`.a` inputs
    (with the link thread), system libraries, C-only libraries,
@@ -6896,28 +6896,28 @@ diagnostics.
    Ghostty's app) move into the corpus as they build.
 
 Each step's branch passes `zig build test test-upstream test-build`,
-conformance with `ZAP_CACHE_CHECK=1` (behavior `--edit-verify`, std, and
+conformance with `BS_CACHE_CHECK=1` (behavior `--edit-verify`, std, and
 from step 1 std with `-lc`), the std compile-time comparison with main,
 and `zig build -Dtarget=aarch64-macos`.
 
 ## `builtin` and conformance
 
-- zap generates the `builtin` module itself. It reports
+- bs generates the `builtin` module itself. It reports
   `zig_backend = .stage2_x86_64` on x86_64-linux so std and
   `test/behavior` take the same paths they take for upstream's self-hosted
   backend, which is also the benchmark baseline. The aarch64-macos choice is
   made at milestone 5.
 - Conformance is measured per test: the number of `upstream/test/behavior`
-  tests zap compiles and passes, divided by the number upstream 0.17.1 passes
+  tests bs compiles and passes, divided by the number upstream 0.17.1 passes
   on the same target with the same backend.
-- `tools/conformance/run.py` measures it: it builds zap, prints one summary
+- `tools/conformance/run.py` measures it: it builds bs, prints one summary
   line per target, and writes a per-file, per-test JSON breakdown to
   `.zig-cache/conformance/<target>.json`. `run.py --upstream` recomputes the
   committed upstream baseline, `tools/conformance/baseline/<target>.json`.
   The `-target` is upstream's test-matrix entry: `x86_64-linux-none` (no libc,
   baseline CPU, self-hosted backend) and `aarch64-macos-none` (Debug default
   there is LLVM).
-- Each file `behavior.zig` imports is its own unit: one `zap test` compile and
+- Each file `behavior.zig` imports is its own unit: one `bs test` compile and
   one run, in parallel with the others, so a compile error, crash, or timeout
   costs only that file. The root is a generated `behavior.zig` wrapper next to
   a `behavior` symlink, so namespaces and test names (`behavior.basic.test.x`)
@@ -6928,21 +6928,21 @@ and `zig build -Dtarget=aarch64-macos`.
   `behavior.zig` at once and checks that the per-file results are identical.
 - The harness passes the compiler a test runner with `--test-runner`
   (default `tools/conformance/test_runner.zig`) and parses only the runner's
-  `@zap-test` line protocol on stdout, documented in that file. A test that
+  `@bs-test` line protocol on stdout, documented in that file. A test that
   crashes or times out is recorded and the binary is rerun with
-  `--start=<next>`. Until zap compiles the default runner, which mirrors
+  `--start=<next>`. Until bs compiles the default runner, which mirrors
   upstream's per-test setup (`testing.allocator`, `testing.io`), it can use a
   smaller runner that speaks the same protocol; tests are matched to the
-  baseline by name, so zap must produce upstream's test names.
-- `run.py --default-runner` measures `zap test` as a drop-in for `zig test`:
-  no `--test-runner`, so zap builds upstream's own
+  baseline by name, so bs must produce upstream's test names.
+- `run.py --default-runner` measures `bs test` as a drop-in for `zig test`:
+  no `--test-runner`, so bs builds upstream's own
   `lib/compiler/test_runner.zig`. The binary runs as `zig test` runs it and
   its terminal output (`1/9 name...OK`, leak reports, the summary line) is
   parsed; after a crash or timeout, the remaining tests run one at a time
   through the runner's `--listen=-` protocol (`std.zig.Server`, as
   `zig build test` drives it). Report both numbers.
 - `run.py --std` is the next measure: upstream's std tests,
-  `upstream/lib/std/std.zig` built as one `zap test` unit with the default
+  `upstream/lib/std/std.zig` built as one `bs test` unit with the default
   runner, `--zig-lib-dir upstream/lib` (the source tree; the binary
   release's `lib/` lacks std's testdata), and the same `-target`, as
   `zig build test-std` builds its Debug entry. When the root is
@@ -6957,8 +6957,8 @@ and `zig build -Dtarget=aarch64-macos`.
 
 ## Diagnostics (designed 2026-11-03, accepted by the owner; being built)
 
-Two owner decisions (AGENTS.md) shape this section: zap's main users are
-coding agents, so compile errors are shaped for them; and zap may reject
+Two owner decisions (AGENTS.md) shape this section: bs's main users are
+coding agents, so compile errors are shaped for them; and bs may reject
 more than upstream, as long as everything else upstream accepts keeps its
 meaning and upstream's std and `test/behavior` still compile. `zig build`
 integration comes after it.
@@ -6969,13 +6969,13 @@ The owner's review (2026-11-03) settled:
 2. Upstream's wording stays where it's clear; the code, candidates,
    hints, notes and fixes are added around it.
 3. Fail early, as upstream: no recovery. A failed unit still fails its
-   dependents silently. More compile cycles are fine because zap is
+   dependents silently. More compile cycles are fine because bs is
    fast, and the cache change below makes each cycle cheap. (AstGen
    errors first stopped the build before Sema. Upstream does that only
-   when a file cannot be lowered, so since 2026-11-04 zap analyzes
+   when a file cannot be lowered, so since 2026-11-04 bs analyzes
    after the others too, with replay; see "AstGen" below.)
 4. No error limit.
-5. No zap-only checks and no `-fanalyze-unreferenced` for now. Their
+5. No bs-only checks and no `-fanalyze-unreferenced` for now. Their
    measurements stay below as background, marked not adopted.
 6. A failing build commits the manifest for the units that succeeded, so
    the build after an error isn't cold.
@@ -6984,7 +6984,7 @@ The owner's review (2026-11-03) settled:
 
 A three-function program with three independent mistakes an agent makes in
 0.17 (`std.io`, `std.ArrayList(u8).init(gpa)`, returning a `usize` as
-`u32`) shows the problems. Both upstream and zap:
+`u32`) shows the problems. Both upstream and bs:
 
 - **report one error per build.** `main` calls `try greet()`, so `main`
   depends on `greet`'s inferred error set. `greet` fails, so `main` fails,
@@ -6996,7 +6996,7 @@ A three-function program with three independent mistakes an agent makes in
 - **spend tokens on noise.** Upstream adds a reference trace through
   `std/start.zig` (four frames plus "2 reference(s) hidden"), a caret line
   per location, and a note "struct declared here" pointing at
-  `std.zig:1:1`, whose source line is `pub const AutoHashMap = ...`. zap
+  `std.zig:1:1`, whose source line is `pub const AutoHashMap = ...`. bs
   prints three "called inline here" notes through `start.zig` instead.
   Upstream's output for the three errors (one build each) is 642 tokens
   (o200k tokenizer).
@@ -7015,7 +7015,7 @@ named the replacement.
 
 The accepted form carries more facts (candidates, a migration hint, the
 declaration of `n`, a fix, a user-code reference) in 304 tokens for the
-same three errors. Since zap fails early as upstream does, they still
+same three errors. Since bs fails early as upstream does, they still
 take three builds; the listing shows them together:
 
 ```
@@ -7050,11 +7050,11 @@ The same three records as JSON lines are 428 tokens (cl100k: 633, 301 and
   `--error-format=json` with byte and line/column spans and suggestions
   graded by applicability (`MachineApplicable`, `MaybeIncorrect`,
   `HasPlaceholders`, `Unspecified`); `cargo fix` applies only the first
-  kind. zap takes all of this. The human rendering (ASCII art,
+  kind. bs takes all of this. The human rendering (ASCII art,
   multi-line labels) costs tokens without adding facts.
 - **Go**: compiler errors are one `file:line:col: message` line each, and
   the compiler rejects some things other languages only warn about
-  (unused imports and variables), which is the precedent for zap's extra
+  (unused imports and variables), which is the precedent for bs's extra
   errors. `go vet` analyzers report `Diagnostic{Pos, End, Category,
   Message, SuggestedFixes []{Message, TextEdits}, Related}`, and `go
   test` runs only a high-confidence subset of vet automatically. Checks
@@ -7062,12 +7062,12 @@ The same three records as JSON lines are 428 tokens (cl100k: 633, 301 and
 - **Elm**: every error says what it found, what it expected, and what to
   try ("These names seem close though:" with candidates, plus "Hint:" lines
   that teach the language), and `--report=json` exposes the same content.
-  zap takes the candidates and hints, not the conversational prose.
+  bs takes the candidates and hints, not the conversational prose.
 - **TypeScript**: numeric codes (`TS2322`), a compact non-pretty mode
   (`file(3,5): error TS2322: ...`), an elaboration chain for nested type
   mismatches ("Type 'X' is not assignable to type 'Y'. Property 'z' is
   missing..."), `relatedInformation` locations, and code fixes served
-  by the language service. zap takes the chain for nested mismatches
+  by the language service. bs takes the chain for nested mismatches
   (a field of a struct literal, a parameter of a function type) and the
   related locations.
 
@@ -7092,7 +7092,7 @@ because:
   and agent harnesses that parse upstream's output keep working.
 
 JSON is for programs: harnesses that apply fixes, editors, and a later
-`zap fix`.
+`bs fix`.
 
 **Text grammar.** One error is a header line followed by indented detail
 lines, each starting with a keyword:
@@ -7159,7 +7159,7 @@ ignore unknown keys.
    printed in full once may be referred to by name in the same error.
 7. No color unless stderr is a terminal (upstream's `.auto` already does
    this).
-8. Long explanations live behind `zap explain <code>` (a paragraph, an
+8. Long explanations live behind `bs explain <code>` (a paragraph, an
    example, the usual fix), not in the output.
 
 ### The diagnostic record
@@ -7246,7 +7246,7 @@ An error's kind follows from its wording, so the code comes from the
 format string, not the call site: `Zcu.addError` and `Sema.fail` look it
 up at comptime in `diag.format_codes` (`diag.formatCode`), which costs
 nothing at run time and leaves the call sites unchanged. Formats starting
-with "zap " (what zap does not support yet) are `unsupported`. The rare
+with "bs " (what bs does not support yet) are `unsupported`. The rare
 format that needs another code passes it explicitly (`Sema.failCode`,
 `Zcu.addErrorCode`); ZON's errors take their inner message's code that
 way. A unit test tokenizes Sema.zig, Zcu.zig and Emit.zig and fails on any
@@ -7296,12 +7296,12 @@ code.
   `fs.cwd`, `mem.page_size`. The table (`diag.migrations`) starts with
   the most used public ones: 43 API entries, a `*` entry per container
   whose misses share one answer (`os`, `posix`, `lang.Type`), and 14
-  builtins. Every replacement was compiled with upstream 0.17 and zap.
+  builtins. Every replacement was compiled with upstream 0.17 and bs.
   Not yet covered: `usingnamespace` and `async`, which are parse errors,
   and arity-change patterns such as `list.append(x)` on an unmanaged
   list.
 
-**Fixes zap knows**, first set (step 5, built):
+**Fixes bs knows**, first set (step 5, built):
 
 | error | fix | applicability |
 |---|---|---|
@@ -7324,12 +7324,12 @@ read and parsed again (as for its candidates), and only when the line
 AstGen reported is unchanged in it. Sema's are computed when the error is
 made, from the file's AST, and travel in `Zcu.ErrorMsg.fix`; each one
 checks that its span is exactly one expression (`diag.isExpression`)
-before wrapping it. Under `zap build` every edit becomes a location-less
+before wrapping it. Under `bs build` every edit becomes a location-less
 note in the error bundle, worded as the text line.
 
-Reaching upstream's messages for these errors also took four checks zap
+Reaching upstream's messages for these errors also took four checks bs
 lacked, all upstream's: a call statement's ignored result (`f();` with
-an error union or a non-void value; zap checked only non-call
+an error union or a non-void value; bs checked only non-call
 expressions), `_ = f();` on an error union ("error union is discarded"),
 `if (x) {} else |err|` with a non-void payload ("error union payload is
 ignored"), and error-set switches without `else` ("unhandled error value"
@@ -7339,7 +7339,7 @@ notes; `anyerror` needs `else`). The enum case gained upstream's
 ### Where errors come from, and what changes
 
 - **AstGen** errors are upstream's AstGen unchanged. Frontend collects them
-  as ErrorBundles (`loadAll`'s bundle and `late_errors`). zap converts each
+  as ErrorBundles (`loadAll`'s bundle and `late_errors`). bs converts each
   message into a Diagnostic: its code from the format table, its fix from
   the table above. As upstream, the build stops before Sema only when a
   file could not be lowered (`Zir.loweringFailed`: a syntax error, an
@@ -7363,7 +7363,7 @@ notes; `anyerror` needs `else`). The enum case gained upstream's
   and only strings for facts, and it bakes absolute line and column in at
   creation. It stays as the input format for AstGen's errors, and it
   becomes the output for `--listen` (`std.zig.Server`, which `zig build`
-  uses) when zap gets that mode with `zig build` integration. In that
+  uses) when bs gets that mode with `zig build` integration. In that
   output the code becomes a message prefix (`[no-member] ...`), and facts
   and fixes become notes.
 - **No recovery.** A failed function fails its dependents silently, as
@@ -7385,14 +7385,14 @@ an agent waits for most. The change:
   too. Failed units are few, so this costs little and needs no serialized
   form for failures.
 - **A unit that succeeded has no diagnostics**, so no result entry stores
-  any. (If zap-only checks are adopted later, their diagnostics would be
+  any. (If bs-only checks are adopted later, their diagnostics would be
   stored in the unit's result entry with declaration-relative `Loc`s and
   replayed when it loads green.)
 - **A no-edit rebuild of a failing build** is an edit build with no seeds.
   It loads every green unit, re-analyzes only the failed ones, and prints
   the same diagnostics. There is no relink.
 - **AstGen errors** are already in the ZIR cache entry, keyed by content.
-- `ZAP_CACHE_CHECK` also compares replayed diagnostics with a fresh
+- `BS_CACHE_CHECK` also compares replayed diagnostics with a fresh
   build's, as rendered text, byte for byte.
 
 **How it meets replay step 4b** (agreed with the cache thread; to be
@@ -7423,9 +7423,9 @@ built after 4b lands):
 - Error order needs nothing: `zcu.errors` is sorted by unit key and
   position, so the same failed set prints in the same order.
 
-### Extra errors: zap-only checks (not adopted; background)
+### Extra errors: bs-only checks (not adopted; background)
 
-The owner decided against zap-only checks for now (2026-11-03). This
+The owner decided against bs-only checks for now (2026-11-03). This
 subsection keeps the framework that was proposed and the measurements
 behind it, for when the question comes back.
 
@@ -7433,7 +7433,7 @@ behind it, for when the question comes back.
 file's AST and the InternPool, and runs right after Sema produces that IR,
 in the same worker, before CodeGen. Each check lives in its own file in
 `src/check/` and reports `Diagnostic`s with its own code. The header
-names it as zap-only (`error[leak-on-error, zap-only]`) so that an agent
+names it as bs-only (`error[leak-on-error, bs-only]`) so that an agent
 or a person knows why upstream accepts the program. Checks:
 
 - run only on **checked modules**: modules given on the command line (the
@@ -7453,12 +7453,12 @@ or a person knows why upstream accepts the program. Checks:
   There are no suppression comments: ZIR doesn't see comments, and
   suppressions rot.
 - must cost under 2% of Sema time on the libvaxis workload (a linear
-  pass over IR), measured with `ZAP_TIMING`.
+  pass over IR), measured with `BS_TIMING`.
 
 The bar for making a check an error: zero findings on `test/behavior`, on
 libvaxis, and on upstream's compiler source (the bench workloads), except
 real bugs, and few on std (out of scope, but measured with
-`ZAP_CHECK_ALL=1` as a precision report). Go makes the same choice for
+`BS_CHECK_ALL=1` as a precision report). Go makes the same choice for
 the vet checks `go test` runs.
 
 **Candidates, measured** on std (563 files, 483 k lines), the compiler
@@ -7539,40 +7539,40 @@ user modules (non-generic functions only) was proposed and not adopted.
 
 ### Testing
 
-- **Corpus**: `test/diag/<case>.zig`, one mistake per file, with zap's
+- **Corpus**: `test/diag/<case>.zig`, one mistake per file, with bs's
   exact stderr in a trailing comment block (`// error`, an optional
   `// args: --error-format=json`, then the expected lines; see
   `addDiagTests` in build.zig). `zig build test` runs
-  `zap build-exe -fno-emit-bin <case>` from `test/diag` and compares
+  `bs build-exe -fno-emit-bin <case>` from `test/diag` and compares
   stderr exactly. `zig build test-upstream` checks that upstream rejects
   every case too.
 - **Fixes round-trip**: applying every `exact` fix must give a program
   that compiles, or that fails with the case's next expected error.
   `python3 tools/diag/roundtrip.py [--all] test/diag/*.zig` checks it
   (`--all` adds `maybe` and placeholder fixes): no error may remain or
-  appear at an edited place, by zap's and by upstream's account, and no
+  appear at an edited place, by bs's and by upstream's account, and no
   syntax error anywhere. New errors elsewhere are ones the fixed errors
   hid, since AstGen errors stop Sema. It needs Python, so `zig build
-  test` does not run it yet; `zap fix` (step 8) will let it.
+  test` does not run it yet; `bs fix` (step 8) will let it.
 - **Cache**: the corpus runs twice in one cache directory, the second time
   as a no-edit rebuild and then after an edit above each error. Output
-  must be byte-identical, with `ZAP_CACHE_CHECK=1`.
+  must be byte-identical, with `BS_CACHE_CHECK=1`.
 - **Parity with upstream**: `run.py --compile-errors` runs upstream's
   `test/cases/compile_errors` (1017 files; 994 apply to x86_64-linux) and
-  counts cases where zap reports the same error lines (location and
-  message), and those with the same locations. With a ReleaseSafe zap,
+  counts cases where bs reports the same error lines (location and
+  message), and those with the same locations. With a ReleaseSafe bs,
   step 1 (c0f7c7d) gave 338 exact, 431 at the same locations (exact
   included), 416 different, 132 accepted, and 15 crashes. After the crash
   fixes (08d7c40): 365 exact, 466 at the same locations, 397 different,
   131 accepted, and no crashes. The location share is the number to
   raise. Crashes come first: a crash is the worst diagnostic.
   Like upstream's case harness, run.py compiles each case as `tmp.zig`
-  (its types are `tmp.T`) and reads zap's JSON lines. Call frames count
+  (its types are `tmp.T`) and reads bs's JSON lines. Call frames count
   as upstream's "called inline/at comptime here" notes, and notes outside
   the case file compare by message only, as upstream's `:?:?: note:`
   lines do. Measured that way, with the lookup facts of step 3: 404
   exact (336 with notes), 489 at the same locations, 374 different, 131
-  accepted, no crashes. Before the harness change, the same zap measured
+  accepted, no crashes. Before the harness change, the same bs measured
   373 exact (294 with notes) and 486 at the same locations.
 
 ### Steps
@@ -7595,18 +7595,18 @@ unchanged:
 4. The migration and pattern table. (Started: the first set above.)
 5. Fixes, first set. (Done: the table above, and
    `tools/diag/roundtrip.py`, which applies a file's fixes round after
-   round and checks with zap and upstream that no error is left or made
+   round and checks with bs and upstream that no error is left or made
    at an edited place; all 33 corpus fixes pass.)
 6. The cache: failing builds commit the manifest for the units that
    succeeded.
-7. Alongside: `run.py --compile-errors`, and fixing zap's crashes and
+7. Alongside: `run.py --compile-errors`, and fixing bs's crashes and
    wrong locations on upstream's compile-error cases. (Harness done; no
    crashes left.)
-8. Later: `zap explain` and `zap fix` (applies exact fixes).
+8. Later: `bs explain` and `bs fix` (applies exact fixes).
 
 ## Deliberate differences from upstream
 
-Upstream 0.17.1 is the oracle, but where it computes a wrong value zap
+Upstream 0.17.1 is the oracle, but where it computes a wrong value bs
 computes the right one instead of copying the bug:
 
 - *`extern threadlocal` that a shared library defines.* Zig 0.17.0's
@@ -7615,7 +7615,7 @@ computes the right one instead of copying the bug:
   undefined import as if the variable were in the executable's own TLS
   block: for test/link_input/so_tls_main.zig's `so_tls` it emits `mov
   rax, fs:0; sub rax, 0x40028; lea rax, [rax - 0x1204200]`, and the read
-  segfaults. Upstream with LLVM, and zap, read it initial-exec through a
+  segfaults. Upstream with LLVM, and bs, read it initial-exec through a
   slot the loader writes (R_X86_64_TPOFF64; "Thread-locals imported from
   shared libraries"), and print the right values. C objects' accesses to
   the same variable were never affected.
@@ -7627,7 +7627,7 @@ computes the right one instead of copying the bug:
   `min(2, 1)` is 2. Its `.Add`, `.Sub` and `.Nand` on 65- to 127-bit
   integers leave the bits above the width unwrapped, and it fails to
   compile 128-bit `@atomicLoad` and `@atomicStore` (an error and a
-  crash). zap gives LLVM ReleaseFast's results for all of them: loads
+  crash). bs gives LLVM ReleaseFast's results for all of them: loads
   are a `cmpxchg16b` of zero with zero and stores a `cmpxchg16b` loop,
   as LLVM lowers them. `@atomicRmw` arithmetic on f80 and f128, which
   upstream allows and miscomputes, stays refused.
@@ -7640,18 +7640,18 @@ computes the right one instead of copying the bug:
   absorb them: with -fno-llvm `term` sits at `0xb4(%rsp)` and the
   overflow lands on slots already dead (the handle's copy, the return
   value before it is stored, the 0xaa fill byte), and with LLVM on
-  padding. In zap's frame the next slot is the spilled result pointer
+  padding. In bs's frame the next slot is the spilled result pointer
   (`-0x28(%rbp)`), which becomes `0x7f0000000000` and faults on the
   store of the result: libvaxis's example-c-tty (a forked child in
-  `PosixTty.makeRaw`, through the C API) segfaults under zap and passes
-  under both upstream backends. zap does not lay out frames to absorb
+  `PosixTty.makeRaw`, through the C API) segfaults under bs and passes
+  under both upstream backends. bs does not lay out frames to absorb
   an out-of-bounds write; the corpus marks the step as expected to
   fail (tools/corpus/manifest.json).
 
-Where upstream supports more than zap generates code for, zap narrows
+Where upstream supports more than bs generates code for, bs narrows
 the choice instead of failing:
 
-- *CPU models and features.* zap accepts x86_64 CPU models and features
+- *CPU models and features.* bs accepts x86_64 CPU models and features
   up to x86-64-v2 (SSE4.2, `src/cpu.zig`), puts them in `builtin.cpu` as
   upstream does, and keys the cache on them. The default is the
   baseline CPU, also where upstream defaults to the native one (no
@@ -7661,7 +7661,7 @@ the choice instead of failing:
   (`pclmul`), is refused with a message naming the features. Only
   `-mcpu=native` is clamped: the host's model becomes `x86_64_v2` when
   the host has all of its instructions, else `x86_64`, plus the host's
-  features zap accepts; std takes its SSE paths, as upstream's on a CPU
+  features bs accepts; std takes its SSE paths, as upstream's on a CPU
   without AVX.
   With `cx16` (x86-64-v2) 128-bit atomics are allowed, as upstream
   (`Sema.atomicElemType`), and lowered with `lock cmpxchg16b`

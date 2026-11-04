@@ -21,7 +21,7 @@
 //! replaced together; `decode` returns them separately, and the caller
 //! sets `Debug.atom` to the atom's index in the link.
 //!
-//! Records are host-endian; both of zap's targets are little-endian hosts.
+//! Records are host-endian; both of bs's targets are little-endian hosts.
 
 const std = @import("std");
 const builtin = @import("builtin");

@@ -2,10 +2,10 @@
 //! limit serves. Upstream's runner compiles lib/build-web for wasm32 with
 //! the build's compiler (`buildClientWasm` in
 //! lib/compiler/Maker/WebServer.zig) over `--listen=-`, and reads the
-//! binary from `<cache dir>/o/<digest>/build-web.wasm`. zap has no wasm
-//! backend, so zap's build compiles the client with upstream zig from zap's
+//! binary from `<cache dir>/o/<digest>/build-web.wasm`. bs has no wasm
+//! backend, so bs's build compiles the client with upstream zig from bs's
 //! default zig lib directory and embeds it (`build_web_wasm`), as
-//! `-femit-docs` embeds the docs viewer (src/Docs.zig), and zap answers
+//! `-femit-docs` embeds the docs viewer (src/Docs.zig), and bs answers
 //! that one command with it.
 
 const std = @import("std");

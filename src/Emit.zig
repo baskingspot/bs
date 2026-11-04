@@ -8,7 +8,7 @@
 //! generating into its own worker Emit. Their output is merged into the
 //! main Emit in the order Sema handed the functions over, which makes the
 //! result that of generating each function right after its analysis
-//! (see "Parallel function bodies" in docs/architecture.md).
+//! (see "Parallel function bodies" in docs/slop/architecture.md).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -70,7 +70,7 @@ uses_error_names: bool = false,
 failed: bool = false,
 /// The entry symbol, once `finish` found it.
 entry: ?SymbolKey = null,
-/// Whether the output is a relocatable object (`zap build-obj`): it needs
+/// Whether the output is a relocatable object (`bs build-obj`): it needs
 /// no entry, its exports are symbols for other objects, and symbols it
 /// does not define are imported from them.
 obj: bool = false,
@@ -79,7 +79,7 @@ obj: bool = false,
 /// local-dynamic model; `.pie` and `.none` use local-exec. `.pic` and
 /// `.pie` images put .rodata with absolute addresses in .data.rel.ro.
 pic: enum { none, pic, pie } = .none,
-/// Whether the output is a shared object (`zap build-lib -dynamic`), with
+/// Whether the output is a shared object (`bs build-lib -dynamic`), with
 /// `obj` set too: it needs no entry, its exports are its dynamic symbols,
 /// and symbols that neither it nor compiler_rt defines are imported from
 /// the modules that load it.
@@ -89,7 +89,7 @@ soname: ?[]const u8 = null,
 /// `--stack`: the executable's main thread stack size.
 stack_size: u64 = 16 * 1024 * 1024,
 /// `-ffuzz`: CodeGen instruments the main module family's functions with
-/// coverage points (docs/architecture.md, "Fuzzing").
+/// coverage points (docs/slop/architecture.md, "Fuzzing").
 fuzz: bool = false,
 /// An executable that links glibc (`-lc`): names neither the compilation
 /// nor compiler_rt exports resolve to glibc's symbols, imported.
@@ -164,9 +164,9 @@ error_values: std.ArrayList(Elf.Value) = .empty,
 input_symbols: []const Elf.LocalSymbol = &.{},
 /// Their unwind and debug sections (`Elf.Options.input_sections`).
 input_sections: []const Elf.InputSection = &.{},
-/// Time spent in `CodeGen.generate`, for `ZAP_TIMING`.
+/// Time spent in `CodeGen.generate`, for `BS_TIMING`.
 codegen_ns: u64 = 0,
-/// `ZAP_BENCH_CODEGEN`: a copy of every function's IR, which
+/// `BS_BENCH_CODEGEN`: a copy of every function's IR, which
 /// `benchCodegen` generates again after analysis.
 bench_irs: ?std.ArrayList(Ir) = null,
 /// The SSA form of the function being generated, reused for the next.
@@ -177,10 +177,10 @@ rewrite_scratch: rewrite.Scratch = .{},
 sroa_scratch: sroa.Scratch = .{},
 /// `prove.run`'s arrays, on a worker, reused for the next function.
 prove_scratch: prove.Scratch = .{},
-/// Whether `prove.run` removes the checks it proves (`ZAP_PROVE=off`
+/// Whether `prove.run` removes the checks it proves (`BS_PROVE=off`
 /// turns it off, to compare a program's behavior with and without).
 prove_on: bool = true,
-/// Per-stage backend time and size, for `ZAP_TIMING` and bench-codegen.
+/// Per-stage backend time and size, for `BS_TIMING` and bench-codegen.
 codegen_stats: CodeGenStats = .{},
 /// The CodeGen workers, on the main Emit (`startPool`).
 pool: ?*Pool = null,
@@ -268,11 +268,11 @@ pub const Pool = struct {
     workers: []Emit,
     threads: usize = 0,
     group: std.Io.Group = .init,
-    /// `ZAP_SCHED_FUZZ=<seed>`: random delays and yields where workers take
+    /// `BS_SCHED_FUZZ=<seed>`: random delays and yields where workers take
     /// jobs and the Sema thread hands them over, random batch lengths, and
     /// merges that sometimes wait for workers instead of generating the
     /// jobs not handed over yet. The output must not change; a difference
-    /// from `ZAP_THREADS=1` is a dependence on timing. Which worker takes
+    /// from `BS_THREADS=1` is a dependence on timing. Which worker takes
     /// which job varies, but each worker's jobs stay ascending, which the
     /// merge relies on (`mergeOut`).
     fuzz: ?u64 = null,
@@ -848,7 +848,7 @@ fn submit(emit: *Emit, ir_in: Ir, exports: ExportsView) !void {
     if (pool.fuzz != null) fuzzDelay(pool.io, pool.fuzz_rng.random());
 }
 
-/// Under `ZAP_SCHED_FUZZ`: sometimes sleeps up to half a millisecond,
+/// Under `BS_SCHED_FUZZ`: sometimes sleeps up to half a millisecond,
 /// sometimes yields.
 fn fuzzDelay(io: std.Io, random: std.Random) void {
     switch (random.uintLessThan(u8, 8)) {
@@ -1196,7 +1196,7 @@ pub fn addError(emit: *Emit, file_index: u32, span: std.zig.Ast.Span, comptime f
     });
 }
 
-/// `ZAP_BENCH_CODEGEN=n`: generates every function captured during
+/// `BS_BENCH_CODEGEN=n`: generates every function captured during
 /// analysis again, `runs` times, each into a fresh Emit, and prints the
 /// fastest run's stages. Code generation reads the Zcu without changing
 /// what a later build of the same functions produces.
@@ -1263,7 +1263,7 @@ pub fn finish(emit: *Emit) !bool {
     if (emit.failed) return false;
     emit.entry = entry;
     if (entry == null and !emit.obj) {
-        try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap requires the root file to export '_start' (std.start is not supported yet)", .{});
+        try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "bs requires the root file to export '_start' (std.start is not supported yet)", .{});
         return false;
     }
 
@@ -1296,11 +1296,11 @@ pub fn finish(emit: *Emit) !bool {
 
 /// The name of a declaration's atom until `nameAtoms`: CodeGen runs while
 /// analysis can still rename the types names come from
-/// (docs/architecture.md, "Type names").
+/// (docs/slop/architecture.md, "Type names").
 pub const name_later: []const u8 = "(named later)";
 
 /// Names the atoms of declarations and functions, those this build made
-/// and those it loaded, from the final names (docs/architecture.md, "Type
+/// and those it loaded, from the final names (docs/slop/architecture.md, "Type
 /// names"). A function's symbol name is upstream's: the declaration's
 /// qualified name, with `__func_` and a stable hash for an instance of a
 /// generic function (upstream numbers them by InternPool index), or its
@@ -1558,7 +1558,7 @@ pub const TlsTarget = struct {
 /// binds `name`'s slot to (an input object's), through `externAddrKey`,
 /// as a constant's address of extern data. An executable imports a shared
 /// library's thread-local, through a content-addressed slot the loader
-/// writes (TPOFF64; ElfInput's `tlsSlot` is the same atom). zap's shared
+/// writes (TPOFF64; ElfInput's `tlsSlot` is the same atom). bs's shared
 /// objects import no thread-locals.
 pub fn tlsTarget(emit: *Emit, name: []const u8) !TlsTarget {
     if (try emit.userExport(name)) |key| return .{ .key = key, .local = true };
@@ -1573,7 +1573,7 @@ pub fn tlsTarget(emit: *Emit, name: []const u8) !TlsTarget {
         return .{ .key = externAddrKey(name), .local = true };
     }
     if (emit.shared)
-        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap does not import thread-local symbols into shared objects yet: {s}", .{name})
+        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "bs does not import thread-local symbols into shared objects yet: {s}", .{name})
     else
         try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
     return error.CodegenFail;
@@ -2045,7 +2045,7 @@ pub fn errorKeyFromName(name: []const u8) SymbolKey {
 /// A `[:0]const u8` per error code, for `@errorName` at runtime. It is
 /// built after every function is lowered, when the set of errors the
 /// program uses is known; codes stay symbolic everywhere else.
-pub const error_name_table: SymbolKey = .fromName("__zap_error_names");
+pub const error_name_table: SymbolKey = .fromName("__bs_error_names");
 
 fn emitErrorNameTable(emit: *Emit) !void {
     const ip = &emit.zcu.ip;
@@ -2072,7 +2072,7 @@ fn emitErrorNameTable(emit: *Emit) !void {
     refs.sort();
     try emit.addAtom(.{
         .key = error_name_table,
-        .name = "__zap_error_names",
+        .name = "__bs_error_names",
         .section = .rodata,
         .alignment = .@"8",
         .bytes = bytes,

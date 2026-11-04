@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run-time benchmarks on real programs: the speed of the code zap generates
+"""Run-time benchmarks on real programs: the speed of the code bs generates
 where microbenchmarks can mislead.
 
-Each workload builds a real program with zap and, unless --no-upstream, with
+Each workload builds a real program with bs and, unless --no-upstream, with
 upstream zig 0.17.1 in Debug (self-hosted x86_64 backend) and ReleaseSafe
 (LLVM), checks that the builds print the same output, and reports the
 median wall time of each:
@@ -38,7 +38,7 @@ import bench  # noqa: E402  (the vaxis checkout and its module flags)
 
 WORKLOADS = ["zig-fmt", "zig-sema", "vaxis", "zls-test"]
 MODES = {
-    "zap": [],
+    "bs": [],
     "Debug": ["-fno-llvm", "-fno-lld"],
     "ReleaseSafe": ["-OReleaseSafe"],
 }
@@ -48,16 +48,16 @@ def build(argv, cwd, out):
     if os.path.exists(out):
         os.remove(out)
     t0 = time.perf_counter()
-    r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=dict(os.environ, ZAP_CACHE="off"))
+    r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=dict(os.environ, BS_CACHE="off"))
     if r.returncode != 0:
         sys.exit(f"build failed in {cwd}: {' '.join(argv)}\n{r.stdout[-4000:]}{r.stderr[-4000:]}")
     return time.perf_counter() - t0
 
 
 def with_mode(argv, mode):
-    """`argv` (a build-exe or test command line) for `mode`: zap's as is,
+    """`argv` (a build-exe or test command line) for `mode`: bs's as is,
     upstream's with its optimize mode and backend."""
-    if mode == "zap":
+    if mode == "bs":
         return argv
     res = [w for w in argv if not w.startswith("-O")]
     return res[:2] + MODES[mode] + res[2:]
@@ -72,7 +72,7 @@ class Workload:
 
     def run_once(self, binary):
         """Runs the program once; returns (seconds, output to compare)."""
-        with tempfile.TemporaryDirectory(prefix="zap-rw-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="bs-rw-") as tmp:
             argv = [binary if a == "{bin}" else a.replace("{tmp}", tmp) for a in self.run_argv]
             t0 = time.perf_counter()
             r = subprocess.run(argv, cwd=self.run_cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
@@ -104,7 +104,7 @@ class ZigCompiler(Workload):
 
     # Both zig workloads share the compiler's build.
     key = "zig"
-    modes = ["zap", "Debug"]
+    modes = ["bs", "Debug"]
 
 
 class ZigFmt(ZigCompiler):
@@ -203,20 +203,20 @@ def fmt_s(s):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--compiler", default="zig-out/bin/zap", help="zap binary (default: zig-out/bin/zap)")
+    ap.add_argument("--compiler", default="zig-out/bin/bs", help="bs binary (default: zig-out/bin/bs)")
     ap.add_argument("--zig", default="zig", help="upstream zig 0.17.1 (default: zig on PATH)")
     ap.add_argument("--workloads", default=",".join(WORKLOADS), help="comma-separated subset of " + ",".join(WORKLOADS))
     ap.add_argument("--runs", type=int, default=5, help="runs per binary (default 5)")
-    ap.add_argument("--no-upstream", action="store_true", help="time only zap's builds")
+    ap.add_argument("--no-upstream", action="store_true", help="time only bs's builds")
     ap.add_argument("--work", default=os.path.join(BENCH_DIR, ".work", "realworld"),
                     help="work directory; keeps upstream's builds (default: bench/.work/realworld)")
     ap.add_argument("--out", help="write PATH.json")
     args = ap.parse_args()
 
-    zap = os.path.abspath(args.compiler)
+    bs = os.path.abspath(args.compiler)
     zig = shutil.which(args.zig) or args.zig
     os.makedirs(args.work, exist_ok=True)
-    all_modes = ["zap"] if args.no_upstream else list(MODES)
+    all_modes = ["bs"] if args.no_upstream else list(MODES)
     results = {}
     built = {}
     for wname in args.workloads.split(","):
@@ -228,8 +228,8 @@ def main():
         for mode in modes:
             out = os.path.join(args.work, "bin", f"{w.key}-{mode}")
             os.makedirs(os.path.dirname(out), exist_ok=True)
-            compiler = zap if mode == "zap" else zig
-            if (w.key, mode) not in built and (mode == "zap" or not os.path.exists(out)):
+            compiler = bs if mode == "bs" else zig
+            if (w.key, mode) not in built and (mode == "bs" or not os.path.exists(out)):
                 print(f"building {w.key} with {mode}...", file=sys.stderr, flush=True)
                 built[(w.key, mode)] = build(w.build_argv(compiler, mode, out), w.cwd, out)
             times = []
@@ -247,16 +247,16 @@ def main():
         return f"{fmt_s(r[m]['median'])} (min {fmt_s(r[m]['min'])})" if m in r else "-"
 
     def ratio(r, m):
-        return f"{r['zap']['median'] / r[m]['median']:.2f}x" if m in r else "-"
+        return f"{r['bs']['median'] / r[m]['median']:.2f}x" if m in r else "-"
 
-    header = "| workload | " + " | ".join(all_modes) + "".join(f" | zap / {m}" for m in all_modes[1:]) + " |"
+    header = "| workload | " + " | ".join(all_modes) + "".join(f" | bs / {m}" for m in all_modes[1:]) + " |"
     print(header)
     print("|" + "---|" * (header.count("|") - 1))
     for wname, r in results.items():
         print(f"| {wname} | " + " | ".join(cell(r, m) for m in all_modes) + "".join(f" | {ratio(r, m)}" for m in all_modes[1:]) + " |")
     if args.out:
         with open(args.out, "w") as f:
-            json.dump({"compiler": zap, "runs": args.runs, "results": results}, f, indent=1)
+            json.dump({"compiler": bs, "runs": args.runs, "results": results}, f, indent=1)
 
 
 if __name__ == "__main__":

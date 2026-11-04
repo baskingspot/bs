@@ -1,6 +1,6 @@
 //! exit: 0
 //! stdout: "4\n18446744073709551612\n60\n18446744073709551614\n18446744073709551613\n18446744073709551615\n2\n52\n18446744073709551615\n1\n0\n1\n1\n0\n2\n300\n1\n0\n5\n1\n9\n34\n6\n"
-//! The rewrite rules (docs/architecture.md, "Rewrite rules") fold what
+//! The rewrite rules (docs/slop/architecture.md, "Rewrite rules") fold what
 //! inlining makes constant: each helper below is inlined into `main` with
 //! constant arguments, and the folded results must be what the operations
 //! compute at run time. The values are chosen where a plausible wrong fold

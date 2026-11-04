@@ -35,7 +35,7 @@ namespaces: std.ArrayList(Namespace) = .empty,
 /// persists them yet; the on-disk cache (milestone 6) will.
 deps: std.AutoArrayHashMapUnmanaged(AnalUnit, []const Dependee) = .empty,
 /// For units some of whose `deps` only the comptime evaluator's lowering
-/// read (see "Comptime evaluator" in docs/architecture.md): the indices of
+/// read (see "Comptime evaluator" in docs/slop/architecture.md): the indices of
 /// those, ascending. Such an edge counts for invalidation, but the unit
 /// does not resolve its dependee itself. Arena-allocated.
 conditional_deps: std.AutoHashMapUnmanaged(AnalUnit, []const u32) = .empty,
@@ -123,9 +123,9 @@ comptime_alloc_refs: std.AutoHashMapUnmanaged(InternPool.Index, bool) = .empty,
 /// the walker evaluates the same literals again and again.
 string_literals: std.StringHashMapUnmanaged(InternPool.Index) = .empty,
 /// Walker runs of a function before it is lowered for the comptime
-/// evaluator; 0 turns the evaluator off (`ZAP_COMPTIME_EVAL`).
+/// evaluator; 0 turns the evaluator off (`BS_COMPTIME_EVAL`).
 comptime_eval_threshold: u32 = 4,
-/// `ZAP_UNIT_TIMING=n`: analysis time per unit, for `printUnitTiming`.
+/// `BS_UNIT_TIMING=n`: analysis time per unit, for `printUnitTiming`.
 unit_timing: ?UnitTiming = null,
 /// Errors each function instance returns, for inferred error sets.
 /// Arena-allocated.
@@ -145,7 +145,7 @@ embed_files: std.StringArrayHashMapUnmanaged(EmbedFile) = .empty,
 /// declaration; `analyzeAll` resolves each to its declaration (`.none`
 /// until then) and queues a function's body.
 rt_helpers: std.StringArrayHashMapUnmanaged(InternPool.NavIndex) = .empty,
-/// `zap test`: collect the main module's tests into `builtin.test_functions`.
+/// `bs test`: collect the main module's tests into `builtin.test_functions`.
 is_test: bool = false,
 /// `-fsingle-threaded`: `threadlocal` variables are ordinary globals, as
 /// upstream (std's start code sets up no thread pointer then).
@@ -157,7 +157,7 @@ cpu: std.Target.Cpu = @import("cpu.zig").baseline,
 link_libc: bool = false,
 /// `-lc++`: `extern "c++"` and `extern "unwind"` declarations may be used.
 link_libcpp: bool = false,
-/// `zap test --test-filter`: keep only named tests whose fqn contains one.
+/// `bs test --test-filter`: keep only named tests whose fqn contains one.
 test_filters: []const []const u8 = &.{},
 /// Test declarations to run, in discovery order.
 test_functions: std.ArrayList(InternPool.NavIndex) = .empty,
@@ -172,7 +172,7 @@ compile_logs: std.ArrayList(CompileLog) = .empty,
 effect_uses: std.AutoArrayHashMapUnmanaged(EffectUse, void) = .empty,
 /// Each unit's candidate names for the types it made (`offerName`),
 /// including those a memo hit made again, for the cache: an edit build
-/// offers the loaded units' candidates again (docs/architecture.md, "Type
+/// offers the loaded units' candidates again (docs/slop/architecture.md, "Type
 /// names"). The value is the template, in `arena`.
 name_offers: std.AutoArrayHashMapUnmanaged(NameOffer, InternPool.Template) = .empty,
 /// Which types' names each unit's analysis rendered into a value
@@ -212,7 +212,7 @@ pub const Export = struct {
     unit: ?AnalUnit,
     /// From `@export`'s options; an `export` declaration is strong and
     /// default. Objects and shared objects write them (see
-    /// "Position-independent code" in docs/architecture.md).
+    /// "Position-independent code" in docs/slop/architecture.md).
     linkage: std.lang.GlobalLinkage = .strong,
     visibility: std.lang.SymbolVisibility = .default,
 };
@@ -407,7 +407,7 @@ pub const Namespace = struct {
     /// a namespace inside a function (`maybe_generic`) through a capture,
     /// so a nested type never finds a name in such a namespace by walking
     /// up. Skipping them makes the parent the same whichever instance of
-    /// an enclosing generic type created the type (docs/architecture.md,
+    /// an enclosing generic type created the type (docs/slop/architecture.md,
     /// "Type names").
     parent: u32,
     /// Whether the type's ZIR is inside a function declaration (or test),
@@ -1040,7 +1040,7 @@ pub fn internNamed(zcu: *Zcu, key: InternPool.Key, name: NameCandidate) !InternP
 /// Offers container type or named tuple `ty` name `name`: the type takes
 /// it if its creator is less than the creator of the name it has, so that
 /// every build names a type the same however its analysis is ordered
-/// (docs/architecture.md, "Type names").
+/// (docs/slop/architecture.md, "Type names").
 pub fn offerName(zcu: *Zcu, ty: InternPool.Index, name: NameCandidate) !void {
     const cur = zcu.ip.nameOf(ty);
     if (name.creator >= cur.creator) return;
@@ -1194,7 +1194,7 @@ pub const UnitTiming = struct {
     }
 };
 
-/// Prints the `ZAP_UNIT_TIMING` slowest units to stderr.
+/// Prints the `BS_UNIT_TIMING` slowest units to stderr.
 pub fn printUnitTiming(zcu: *Zcu) void {
     const t = if (zcu.unit_timing) |*t| t else return;
     const C = struct {
@@ -1508,7 +1508,7 @@ pub fn compilerRtExport(name: []const u8) ?RtExport {
 }
 
 /// The files analysis starts from: builtin, std (whose start code imports
-/// the root module), under `zap test` the module under test, with
+/// the root module), under `bs test` the module under test, with
 /// `-ffuzz` the fuzzer's root (for its exports) and its std, and with C
 /// objects ubsan_rt and compiler_rt's stack protector (for theirs).
 pub fn rootFiles(zcu: *Zcu) [7]?u32 {
@@ -1579,7 +1579,7 @@ fn sinkFunction(zcu: *Zcu, sink: anytype, ir: Ir) !void {
 /// hands its requests over there), which are analyzed in turn.
 pub fn analyzeAll(zcu: *Zcu, sink: anytype) !void {
     // Upstream's analysis roots: std (whose start code imports the root
-    // module) and, under `zap test`, the module under test.
+    // module) and, under `bs test`, the module under test.
     for (zcu.rootFiles()) |root| if (root) |f| {
         _ = try zcu.fileRootType(f);
     };

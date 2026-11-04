@@ -3,7 +3,7 @@
 //! Layout follows upstream's ABI for the two supported targets, which are
 //! both 64-bit (`usize` is 64 bits, pointers are 8 bytes). Struct fields are
 //! laid out in declaration order; auto-layout field order is not observable
-//! by the subset zap compiles yet.
+//! by the subset bs compiles yet.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -37,7 +37,7 @@ pub const Class = enum {
     undefined,
     @"opaque",
     @"anyframe",
-    /// zap-modeled `std.lang` types.
+    /// bs-modeled `std.lang` types.
     special,
 };
 
@@ -578,7 +578,7 @@ pub fn packedFieldBitOffset(ip: *const InternPool, ty: Index, i: usize) u16 {
 }
 
 /// The number of bits `ty` occupies in a packed struct, or null if it
-/// cannot be a packed struct field (zap does not support pointers there).
+/// cannot be a packed struct field (bs does not support pointers there).
 pub fn packedBits(ip: *const InternPool, ty: Index) ?u16 {
     if (ty == .bool_type) return 1;
     return switch (class(ip, ty)) {

@@ -1,4 +1,4 @@
-// Bool vectors of 65 to 128 elements between C and Zig (build.zig, "zap
+// Bool vectors of 65 to 128 elements between C and Zig (build.zig, "bs
 // build-exe with C bool vectors"): one GPR per element, the rest on the
 // stack, with all, some, or none of the GPRs left, both ways.
 #include <stdbool.h>

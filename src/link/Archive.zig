@@ -1,4 +1,4 @@
-//! Static libraries (`zap build-lib`, the default static linkage): a GNU ar
+//! Static libraries (`bs build-lib`, the default static linkage): a GNU ar
 //! archive of the library's relocatable objects, as upstream writes it: a
 //! `/SYM64/` symbol index of the objects' defined global and weak symbols
 //! (empty when they have none), then the members: the Zig object, named
@@ -118,7 +118,7 @@ fn readAt(comptime T: type, bytes: []const u8, offset: u64) !T {
 
 /// An archive given as a link input, read in place: its symbol index, and
 /// members on demand (see "Object, archive and shared-library inputs" in
-/// docs/architecture.md).
+/// docs/slop/architecture.md).
 pub const Reader = struct {
     bytes: []const u8,
     /// Each indexed symbol's name and its member's header offset.

@@ -1,4 +1,4 @@
-// The Win64 convention (ms_abi) between C and Zig (build.zig, "zap
+// The Win64 convention (ms_abi) between C and Zig (build.zig, "bs
 // build-exe with Win64 calls"): by-reference structs and results, mixed
 // positions, a 16-byte integer, variadic calls, and Zig functions C calls
 // directly and through a pointer, variadic ones too.

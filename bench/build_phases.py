@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""`zig build` (or `zap build`) of real projects, timed per scenario and split
+"""`zig build` (or `bs build`) of real projects, timed per scenario and split
 into phases.
 
 Scenarios, each with the global cache warm (the build runner compiled, the
 packages fetched):
 
 - first:      a first build of the project: empty local cache, no zig-out.
-              zap's may replay donors from its global store, which the
-              warm-up build filled; first-nodonor (zap only) turns them off
-              (ZAP_CACHE_DONOR=off).
+              bs's may replay donors from its global store, which the
+              warm-up build filled; first-nodonor (bs only) turns them off
+              (BS_CACHE_DONOR=off).
 - noop:       nothing changed since the last build.
 - edit-zig:   a one-line function-body edit to one of the project's Zig sources.
 - edit-build: the same edit to the first statement of `pub fn build` in build.zig.
@@ -17,7 +17,7 @@ Phases come from the process tree (`perf record -a` of the scheduler's exec,
 fork and exit events; low overhead, unlike strace, which slows upstream's
 threaded compiler down eightfold):
 
-- startup:    `zig build`/`zap build` until it execs the build runner.
+- startup:    `zig build`/`bs build` until it execs the build runner.
 - configurer: compiling build.zig (the compile that runs before the configure
               script) and running the configure script.
 - compile:    compile steps (the compiler's processes), minus the above.
@@ -26,13 +26,13 @@ threaded compiler down eightfold):
 
 Projects are checked out once under bench/.work/phases/src and copied per
 compiler. The vaxis workload is bench.py's (its wrapper build of the
-text_input example); zap is this repository at HEAD; the corpus projects are
+text_input example); bs is this repository at HEAD; the corpus projects are
 tools/corpus/manifest.json's pinned commits; monstar is the C acceptance
 target. Median wall time of `--runs` runs (`--edit-runs` for first and the
 edits); the phases are of the fastest of three more runs, recorded with perf.
 
     python3 bench/build_phases.py                          # upstream zig
-    python3 bench/build_phases.py --zap zig-out/bin/zap    # zap
+    python3 bench/build_phases.py --bs zig-out/bin/bs    # bs
 """
 
 import argparse
@@ -63,7 +63,7 @@ MANIFEST = os.path.join(REPO_DIR, "tools", "corpus", "manifest.json")
 # projects not named here take their steps and edit from the manifest.
 PROJECTS = {
     "vaxis": ("wrapper", ("../libvaxis/src/Vaxis.zig", "    var started: bool = false;")),
-    "zap": (".", ("src/main.zig", "    const raw_args = try init.minimal.args.toSlice(arena);")),
+    "bs": (".", ("src/main.zig", "    const raw_args = try init.minimal.args.toSlice(arena);")),
     "zf": (".", ("src/tui/main.zig", "    const io = init.io;")),
     "ziggy": (".", ("src/main.zig", "    const io = init.io;")),
     "tls.zig": (".", ("src/handshake_client.zig", "        h.max_client_record_len = h.output.end;")),
@@ -71,7 +71,7 @@ PROJECTS = {
     "monstar": (".", ("src/main.zig", "    const args = try init.minimal.args.toSlice(arena);")),
 }
 SCENARIOS = ["first", "noop", "edit-zig", "edit-build"]
-ZAP_SCENARIOS = ["first", "first-nodonor", "noop", "edit-zig", "edit-build"]
+BS_SCENARIOS = ["first", "first-nodonor", "noop", "edit-zig", "edit-build"]
 PHASES = ["startup", "configurer", "maker", "compile", "run"]
 
 
@@ -89,7 +89,7 @@ def checkout(name, zig):
         v = bench.Vaxis(os.path.join(WORK, "src"), "zig", zig)
         v.setup()
         return v.dir
-    if name == "zap":
+    if name == "bs":
         shutil.rmtree(src, ignore_errors=True)
         os.makedirs(src)
         archive = subprocess.run(["git", "archive", "HEAD"], cwd=REPO_DIR, stdout=subprocess.PIPE, check=True).stdout
@@ -265,20 +265,20 @@ def phases(data, compiler):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--zap", help="time `zap build` with this zap (default: upstream `zig build`)")
+    ap.add_argument("--bs", help="time `bs build` with this bs (default: upstream `zig build`)")
     ap.add_argument("--zig", default="zig", help="upstream zig 0.17.0, for setup and the baseline")
     ap.add_argument("--projects", default=",".join(PROJECTS),
                     help="comma-separated; `corpus` adds every tools/corpus project")
-    ap.add_argument("--scenarios", help=f"default: {','.join(SCENARIOS)} (zap: {','.join(ZAP_SCENARIOS)})")
+    ap.add_argument("--scenarios", help=f"default: {','.join(SCENARIOS)} (bs: {','.join(BS_SCENARIOS)})")
     ap.add_argument("--runs", type=int, default=10)
     ap.add_argument("--edit-runs", type=int, default=5)
     ap.add_argument("--phase-runs", type=int, default=3, help="perf-recorded runs per scenario")
     ap.add_argument("--keep-going", action="store_true", help="record a failing build and go on")
     ap.add_argument("--out", help="report path without extension (default: bench/results/<date>-build-phases-<compiler>)")
     args = ap.parse_args()
-    compiler = os.path.abspath(args.zap) if args.zap else args.zig
-    which = "zap" if args.zap else "zig"
-    args.scenarios = args.scenarios or ",".join(ZAP_SCENARIOS if args.zap else SCENARIOS)
+    compiler = os.path.abspath(args.bs) if args.bs else args.zig
+    which = "bs" if args.bs else "zig"
+    args.scenarios = args.scenarios or ",".join(BS_SCENARIOS if args.bs else SCENARIOS)
     out = args.out or os.path.join(BENCH_DIR, "results", f"{time.strftime('%Y-%m-%d')}-build-phases-{which}")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=os.path.join(WORK, f"global-{which}"))
@@ -316,7 +316,7 @@ def measure(name, args, compiler, which, env, results):
     argv = [compiler, "build", *steps_of(name)]
     zig_path, zig_anchor, zig_suffix = zig_edit_of(name, os.path.join(dest, sub))
 
-    nodonor = dict(env, ZAP_CACHE_DONOR="off")
+    nodonor = dict(env, BS_CACHE_DONOR="off")
     scen_env = env
 
     def build(trace=None):

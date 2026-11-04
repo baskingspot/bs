@@ -2,7 +2,7 @@
 //!
 //! Every item is deduplicated by its `Key` and carries a 128-bit stable hash
 //! computed from its contents and the stable hashes of the items it refers
-//! to, never from indices (see docs/architecture.md). Indices are an
+//! to, never from indices (see docs/slop/architecture.md). Indices are an
 //! in-memory detail.
 //!
 //! Concurrency: each thread appends to its own `Local` shard (selected by the
@@ -37,7 +37,7 @@ tid_width: u5,
 tid_shift: u5,
 local_mask: u32,
 /// Global error set: error name to error value. Error values are an
-/// in-memory detail; Atoms refer to errors by name (see docs/architecture.md).
+/// in-memory detail; Atoms refer to errors by name (see docs/slop/architecture.md).
 errors_mutex: Io.Mutex = .init,
 error_names: std.ArrayList(String) = .empty,
 error_map: std.AutoHashMapUnmanaged(String, u32) = .empty,
@@ -195,8 +195,8 @@ pub const Index = enum(u32) {
     bool_true,
     bool_false,
     empty_tuple,
-    // zap-specific static items follow the ones shared with ZIR.
-    /// `std.lang.CallingConvention`, which zap models directly until it
+    // bs-specific static items follow the ones shared with ZIR.
+    /// `std.lang.CallingConvention`, which bs models directly until it
     /// analyzes `std.lang` (milestone 3).
     calling_convention_type,
     /// `std.lang.Clobbers`, modeled directly for the same reason.
@@ -238,7 +238,7 @@ pub const NameIndex = enum(u32) { none = std.math.maxInt(u32), _ };
 /// The display name of a container type or a named tuple, as upstream's
 /// `@typeName` renders it. Creators can name one type differently (a type
 /// that does not capture what tells its creators apart), and the name is
-/// the candidate of the least creator (docs/architecture.md, "Type
+/// the candidate of the least creator (docs/slop/architecture.md, "Type
 /// names"), so it can change while analysis runs: read it through
 /// `print.zig`'s renderers, on the Sema thread or after analysis.
 pub const TypeName = struct {
@@ -477,7 +477,7 @@ pub const ContainerType = struct {
     /// Stable key, used for the stable hash and the `type_layout` unit key.
     /// The fully qualified name for declared types; for anonymous types the
     /// enclosing declaration's key, the relative ZIR offset, and the
-    /// captures' stable hashes (see docs/architecture.md).
+    /// captures' stable hashes (see docs/slop/architecture.md).
     key: String,
     info: ContainerInfoIndex,
 };
@@ -648,7 +648,7 @@ pub const Key = union(enum) {
     aggregate: Aggregate,
     func: Func,
     /// A function declared `extern`, defined by the export of `name`
-    /// (zap links statically, so another part of the program).
+    /// (bs links statically, so another part of the program).
     extern_func: ExternFunc,
     /// Data defined by the symbol `name`, of type `ty`, outside the
     /// compilation's values: the link binds it (an export, an input

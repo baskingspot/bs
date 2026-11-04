@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: index out of bounds: index 18446744073709551615, len 4\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): `i +% 1 <=
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): `i +% 1 <=
 //! len` does not give `i < len`, since `+%` wraps: with `i` the largest
 //! `usize`, `i +% 1` is 0, so `a[i]` keeps its check.
 const rt = @import("rt.zig");

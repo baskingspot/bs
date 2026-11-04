@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Conformance harness: upstream Zig 0.17.1's test/behavior, compiled by zap.
+"""Conformance harness: upstream Zig 0.17.1's test/behavior, compiled by bs.
 
-The measure, per target: the behavior tests zap compiles and passes, divided by
+The measure, per target: the behavior tests bs compiles and passes, divided by
 the tests upstream zig 0.17.1 passes on that target with its default Debug
 backend. Upstream's per-test results are committed in baseline/<target>.json.
 
-    tools/conformance/run.py              # build zap, run it on every target this host can run
+    tools/conformance/run.py              # build bs, run it on every target this host can run
     tools/conformance/run.py --upstream   # recompute baseline/<target>.json with upstream zig
 
 Each run prints one summary line per target to stdout and writes a per-file,
-per-test JSON breakdown (zap: .zig-cache/conformance/<target>.json).
+per-test JSON breakdown (bs: .zig-cache/conformance/<target>.json).
 
 Every file that upstream/test/behavior.zig imports is compiled and run on its
 own (see "units" below), so one file that fails to compile or crashes does not
@@ -18,8 +18,8 @@ upstream's own test step reports (for example "behavior.basic.test.truncate"),
 which is what the compiler puts in builtin.test_functions.
 
 The compiler builds each unit with the test runner given by --test-runner
-(default: test_runner.zig for upstream, zap_runner.zig for zap); results are parsed from the
-runner's "@zap-test" line protocol, documented in test_runner.zig, so any
+(default: test_runner.zig for upstream, bs_runner.zig for bs); results are parsed from the
+runner's "@bs-test" line protocol, documented in test_runner.zig, so any
 runner that speaks it works. A crash or timeout marks the running test and
 the binary is rerun with --start=<next index> to run the rest.
 
@@ -43,15 +43,15 @@ baseline/std-<target>-gnu-libc.json.
 With --c-abi, the measure is upstream's C ABI tests instead:
 test/c_abi/main.zig with cfuncs.c (-std=c99), linked against glibc
 (-lc, -target <arch>-linux-gnu), built and run like --std, as upstream's
-test-c-abi step builds its self-hosted entry (which uses musl, which zap
+test-c-abi step builds its self-hosted entry (which uses musl, which bs
 does not link), and compared with baseline/c-abi-<target>.json.
 
 With --compile-errors, the measure is diagnostics instead: every case in
 upstream's test/cases/compile_errors that applies to the target, compiled
-by zap as upstream's case harness compiles it: as a root file named
+by bs as upstream's case harness compiles it: as a root file named
 tmp.zig, so that its types are named `tmp.T`, in a module named root
 (`-Mroot=`), with build-obj, or build-exe
-or test when the case says so. A case is "exact" when zap reports the same
+or test when the case says so. A case is "exact" when bs reports the same
 error lines (location and message) as the case expects, "same location"
 when only the messages differ, and otherwise "different", "accepted" (no
 error), "crash" or "timeout". Notes are compared separately.
@@ -80,7 +80,7 @@ UPSTREAM_LIB = REPO / "upstream" / "lib"
 BASELINE_DIR = HERE / "baseline"
 FORMAT = 1
 
-# zap's targets, the `-target` both compilers get, and the host that can run
+# bs's targets, the `-target` both compilers get, and the host that can run
 # the test binaries (platform.system(), platform.machine()). The zig targets
 # match upstream's own test matrix entries in test/tests.zig, whose Debug
 # builds use the default backend: self-hosted x86_64 on x86_64-linux, LLVM on
@@ -92,7 +92,7 @@ TARGETS = {
 
 ROOT_UNIT = "behavior.zig"
 ROOT_TEST_RE = re.compile(r"^behavior\.(test\.|test_\d+$)")
-PROTOCOL_PREFIX = "@zap-test "
+PROTOCOL_PREFIX = "@bs-test "
 TEST_OUTCOMES = ("pass", "skip", "fail", "leak", "crash", "timeout", "not_run")
 LOG_LIMIT = 4000
 STATUS_LABELS = {
@@ -360,7 +360,7 @@ def run_unit(bin_path, owns, args, workdir):
 
 # ---------------------------------------------------------------- default runner
 #
-# Upstream's lib/compiler/test_runner.zig speaks no @zap-test protocol. Run as
+# Upstream's lib/compiler/test_runner.zig speaks no @bs-test protocol. Run as
 # `zig test` runs it (no arguments, stderr not a terminal), it writes
 # "<i>/<n> <name>..." before each test and "OK", "SKIP" or "FAIL (<error>)"
 # after it; testing.allocator reports leaks after the result, and the run
@@ -563,8 +563,8 @@ def run_unit_default(bin_path, owns, args, workdir):
 def edit_verify(compiler, unit, cfg, args, workdir):
     """--edit-verify: after the unit's first build, edits its file and builds
     it again, then restores it and builds once more, each an edit build
-    that zap checks against a full build (ZAP_CACHE_VERIFY) with its
-    dependency checks on (ZAP_CACHE_CHECK). The edits move every line,
+    that bs checks against a full build (BS_CACHE_VERIFY) with its
+    dependency checks on (BS_CACHE_CHECK). The edits move every line,
     change a test's body, and add a declaration. Returns the last build's
     binary and a failure, if any."""
     path = workdir / "units" / unit[: -len(".zig")] / "behavior" / unit
@@ -574,8 +574,8 @@ def edit_verify(compiler, unit, cfg, args, workdir):
         if re.match(r"^test\b.*\{\s*$", line):
             lines.insert(i + 1, "    _ = 0;\n")
             break
-    edited = "// zap edit-verify\n" + "".join(lines) + "\npub const zap_edit_probe: u32 = 1;\n"
-    env = dict(os.environ, ZAP_CACHE_VERIFY="1", ZAP_CACHE_CHECK="1")
+    edited = "// bs edit-verify\n" + "".join(lines) + "\npub const bs_edit_probe: u32 = 1;\n"
+    env = dict(os.environ, BS_CACHE_VERIFY="1", BS_CACHE_CHECK="1")
     result = None, None
     for text in (edited, original):
         path.write_text(text)
@@ -752,19 +752,19 @@ def upstream_target(zig, cfg, args, workdir):
     )
 
 
-# ---------------------------------------------------------------- zap mode
+# ---------------------------------------------------------------- bs mode
 
 
-def build_zap(workdir, zig):
-    prefix = workdir / "zap"
+def build_bs(workdir, zig):
+    prefix = workdir / "bs"
     argv = [zig, "build", "-Doptimize=ReleaseSafe", "-p", str(prefix)]
     proc = subprocess.run(argv, cwd=REPO, capture_output=True, text=True)
     if proc.returncode != 0:
-        sys.exit(f"error: building zap failed:\n{proc.stderr}")
-    return prefix / "bin" / ("zap.exe" if os.name == "nt" else "zap")
+        sys.exit(f"error: building bs failed:\n{proc.stderr}")
+    return prefix / "bin" / ("bs.exe" if os.name == "nt" else "bs")
 
 
-def zap_target(zap, cfg, args, workdir):
+def bs_target(bs, cfg, args, workdir):
     baseline_path = BASELINE_DIR / f"{cfg['name']}.json"
     if not baseline_path.exists():
         print(f"{cfg['name']}: no baseline; run with --upstream on a {cfg['name']} host first")
@@ -773,31 +773,31 @@ def zap_target(zap, cfg, args, workdir):
     units = list(baseline["files"])
     if args.files:
         units = [u for u in units if u in args.files]
-    files = run_units(zap, units, cfg, args, workdir)
+    files = run_units(bs, units, cfg, args, workdir)
     backend = pop_backends(files)
 
     passed = expected = extra = unknown = 0
     for unit in units:
         r = files[unit]
         upstream_tests = baseline["files"][unit]["tests"]
-        zap_tests = r["tests"]
-        # Upstream's tests come first, in upstream order, with zap's outcome;
+        bs_tests = r["tests"]
+        # Upstream's tests come first, in upstream order, with bs's outcome;
         # tests upstream did not report follow.
         merged = {}
         for key, up in upstream_tests.items():
-            got = zap_tests.get(key, "not_run")
-            merged[key] = {"upstream": up, "zap": got}
+            got = bs_tests.get(key, "not_run")
+            merged[key] = {"upstream": up, "bs": got}
             if up == "pass":
                 expected += 1
                 passed += got == "pass"
             elif got == "pass":
                 extra += 1
-        for key, got in zap_tests.items():
+        for key, got in bs_tests.items():
             if key not in upstream_tests:
-                merged[key] = {"upstream": "absent", "zap": got}
+                merged[key] = {"upstream": "absent", "bs": got}
                 unknown += 1
         r["tests"] = merged
-        r["pass"] = sum(1 for t in merged.values() if t["upstream"] == "pass" and t["zap"] == "pass")
+        r["pass"] = sum(1 for t in merged.values() if t["upstream"] == "pass" and t["bs"] == "pass")
         r["of"] = sum(1 for t in merged.values() if t["upstream"] == "pass")
 
     statuses = count_statuses(files)
@@ -806,7 +806,7 @@ def zap_target(zap, cfg, args, workdir):
         "format": FORMAT,
         "target": cfg["name"],
         "zig_target": cfg["zig_target"],
-        "compiler": str(zap),
+        "compiler": str(bs),
         "test_runner": "default" if args.default_runner else str(args.test_runner),
         "backend": backend,
         "baseline": {"compiler": baseline["compiler"], "backend": baseline["backend"]},
@@ -912,18 +912,18 @@ def std_target(compiler, cfg, args, workdir):
             f"compiled in {compile_s:.1f}s -> {rel(out_path)}"
         )
         return
-    # Upstream's tests first, in upstream order, with zap's outcome.
+    # Upstream's tests first, in upstream order, with bs's outcome.
     merged = {}
     passed = expected = 0
     for key, up in baseline["tests"].items():
         got = r["tests"].get(key, "not_run")
-        merged[key] = {"upstream": up, "zap": got}
+        merged[key] = {"upstream": up, "bs": got}
         if up == "pass":
             expected += 1
             passed += got == "pass"
     for key, got in r["tests"].items():
         if key not in merged:
-            merged[key] = {"upstream": "absent", "zap": got}
+            merged[key] = {"upstream": "absent", "bs": got}
     unknown = sum(1 for t in merged.values() if t["upstream"] == "absent")
     pct = 100.0 * passed / expected if expected else 0.0
     data["summary"] = {"pass": passed, "of": expected, "percent": round(pct, 2), "unknown_tests": unknown}
@@ -962,7 +962,7 @@ def parse_case(path):
             cfg[m.group(1)] = m.group(2)
         elif text:
             # Upstream names the case file itself as 'tmp.zig:' when the
-            # errors span several files; zap_lines() writes it as ':'.
+            # errors span several files; bs_lines() writes it as ':'.
             if text.startswith("tmp.zig:"):
                 text = text[len("tmp.zig"):]
             # Some cases omit the leading ':' before the line.
@@ -980,8 +980,8 @@ def case_applies(cfg, target):
     return all(b in ("auto", "selfhosted", "stage2") for b in cfg.get("backend", "auto").split(","))
 
 
-def zap_lines(stderr, case_name):
-    """zap's diagnostics (--error-format=json) as upstream-style
+def bs_lines(stderr, case_name):
+    """bs's diagnostics (--error-format=json) as upstream-style
     ':line:col: error: msg' lines. Notes in the case file keep their
     location; notes elsewhere become '?: note: msg', as other_note() turns
     upstream's ':?:?: note:' and bare 'note:' lines. Call-site frames are
@@ -1018,13 +1018,13 @@ def zap_lines(stderr, case_name):
 
 def other_note(line):
     """Upstream's note outside the case file (':?:?: note:' or a bare
-    'note:'), as zap_lines() writes one; None for other lines."""
+    'note:'), as bs_lines() writes one; None for other lines."""
     m = re.match(r"^(?::\?:\?: |: )?note: (.*)$", line)
     return f"?: note: {m.group(1)}" if m else None
 
 
 def crash_frame(stderr):
-    """The first frame of a crash's stack trace in zap's own source."""
+    """The first frame of a crash's stack trace in bs's own source."""
     for ln in stderr.splitlines():
         m = re.search(r"/src/(\S+?\.zig:\d+):\d+: 0x[0-9a-f]+ in", ln)
         if m:
@@ -1065,7 +1065,7 @@ def run_case(compiler, path, cfg, expected, args, workdir):
     elif code == 0:
         r["status"] = "accepted"
     else:
-        errors, notes = zap_lines(err, root.name)
+        errors, notes = bs_lines(err, root.name)
         r["got"] = list(errors)
         for e in filter(any_loc, exp_errors):
             tail = e[e.index(" error: "):]
@@ -1086,11 +1086,11 @@ def run_case(compiler, path, cfg, expected, args, workdir):
 
 
 def compile_errors_target(compiler, cfg, args, workdir):
-    """--compile-errors: upstream's compile-error cases, compiled by zap."""
+    """--compile-errors: upstream's compile-error cases, compiled by bs."""
     if args.upstream:
-        sys.exit("error: --compile-errors measures zap; the cases' expectations are upstream's")
+        sys.exit("error: --compile-errors measures bs; the cases' expectations are upstream's")
     # Failing builds record nothing worth reusing across cases.
-    os.environ["ZAP_CACHE"] = "off"
+    os.environ["BS_CACHE"] = "off"
     cases = []
     for path in sorted(CASES_DIR.rglob("*.zig")):
         parsed = parse_case(path)
@@ -1139,16 +1139,16 @@ def compile_errors_target(compiler, cfg, args, workdir):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--upstream", action="store_true", help="compute the upstream baseline with zig instead of running zap")
+    p.add_argument("--upstream", action="store_true", help="compute the upstream baseline with zig instead of running bs")
     p.add_argument("--target", action="append", choices=sorted(TARGETS), help="target to run (repeatable; default: all)")
-    p.add_argument("--zap", type=Path, help="zap executable (default: build zap with -Doptimize=ReleaseSafe)")
-    p.add_argument("--zig", default="zig", help="upstream zig 0.17.1, used for --upstream and to build zap (default: zig on PATH)")
-    p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, zap_runner.zig for zap until zap compiles test_runner.zig)")
-    p.add_argument("--default-runner", action="store_true", help="zap only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `zap test` without --test-runner does")
+    p.add_argument("--bs", type=Path, help="bs executable (default: build bs with -Doptimize=ReleaseSafe)")
+    p.add_argument("--zig", default="zig", help="upstream zig 0.17.1, used for --upstream and to build bs (default: zig on PATH)")
+    p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, bs_runner.zig for bs until bs compiles test_runner.zig)")
+    p.add_argument("--default-runner", action="store_true", help="bs only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `bs test` without --test-runner does")
     p.add_argument("--std", action="store_true", help="measure upstream's std tests (lib/std/std.zig, default runner) instead of test/behavior")
     p.add_argument("--libc", action="store_true", help="with --std: link glibc (-lc, -target <arch>-linux-gnu), baseline/std-<target>-gnu-libc.json")
     p.add_argument("--c-abi", action="store_true", help="measure upstream's test/c_abi (main.zig with cfuncs.c, -lc, -target <arch>-linux-gnu) instead of test/behavior, against baseline/c-abi-<target>.json")
-    p.add_argument("--compile-errors", action="store_true", help="zap only: measure diagnostics on upstream's test/cases/compile_errors instead of test/behavior")
+    p.add_argument("--compile-errors", action="store_true", help="bs only: measure diagnostics on upstream's test/cases/compile_errors instead of test/behavior")
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
     p.add_argument("--compile-timeout", type=float, default=300, help="seconds per file compile")
@@ -1156,12 +1156,12 @@ def main():
     p.add_argument("--workdir", type=Path, default=REPO / ".zig-cache" / "conformance", help="scratch directory")
     p.add_argument("--out", type=Path, help="JSON output path (only with one --target)")
     p.add_argument("--keep-binaries", action="store_true", help="keep test binaries in the workdir")
-    p.add_argument("--edit-verify", action="store_true", help="zap only: after each file's build, edit it and build again, then restore it and build once more, checking each edit build against a full build (ZAP_CACHE_VERIFY, ZAP_CACHE_CHECK); a difference fails the file as edit_verify_failed")
+    p.add_argument("--edit-verify", action="store_true", help="bs only: after each file's build, edit it and build again, then restore it and build once more, checking each edit build against a full build (BS_CACHE_VERIFY, BS_CACHE_CHECK); a difference fails the file as edit_verify_failed")
     p.add_argument("-v", "--verbose", action="store_true", help="print each file's result to stderr")
     args = p.parse_args()
 
     if args.test_runner is None:
-        args.test_runner = HERE / ("test_runner.zig" if args.upstream else "zap_runner.zig")
+        args.test_runner = HERE / ("test_runner.zig" if args.upstream else "bs_runner.zig")
     args.test_runner = args.test_runner.resolve()
     args.workdir = args.workdir.resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
@@ -1178,7 +1178,7 @@ def main():
         if args.upstream:
             compiler = shutil.which(args.zig) or sys.exit(f"error: {args.zig} not found")
         else:
-            compiler = args.zap.resolve() if args.zap else build_zap(args.workdir, args.zig)
+            compiler = args.bs.resolve() if args.bs else build_bs(args.workdir, args.zig)
     try:
         for name in targets:
             cfg = dict(TARGETS[name], name=name)
@@ -1191,7 +1191,7 @@ def main():
             elif args.upstream:
                 upstream_target(compiler, cfg, args, args.workdir)
             else:
-                zap_target(compiler, cfg, args, args.workdir)
+                bs_target(compiler, cfg, args, args.workdir)
             sys.stdout.flush()
     except KeyboardInterrupt:
         kill_all()

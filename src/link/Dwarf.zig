@@ -62,7 +62,7 @@ pub const Unit = struct {
 
 /// .debug_str. Names are inline strings, but readers such as std.debug
 /// require the section.
-pub const str = "zap\x00";
+pub const str = "bs\x00";
 
 /// Abbreviation codes.
 const abbrev_cu = 1;

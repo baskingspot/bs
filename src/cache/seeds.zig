@@ -215,7 +215,7 @@ const NameIndex = struct {
 };
 
 // Copied from upstream `src/Zcu.zig` (Copyright (c) Zig contributors, MIT;
-// see upstream/LICENSE), unchanged but for this file's names.
+// see LICENSE-ZIG), unchanged but for this file's names.
 pub fn mapOldZirToNew(
     gpa: Allocator,
     old_zir: *const Zir,

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Finds the zap commit that introduced a finding (tools/mchunt).
+"""Finds the bs commit that introduced a finding (tools/mchunt).
 
-    python3 tools/mchunt/bisect_zap.py tools/mchunt/.work/found/miscompile-1234
-    python3 tools/mchunt/bisect_zap.py repro.zig --bad-config zap --good HEAD~50
+    python3 tools/mchunt/bisect_bs.py tools/mchunt/.work/found/miscompile-1234
+    python3 tools/mchunt/bisect_bs.py repro.zig --bad-config bs --good HEAD~50
 
-Builds zap (Debug, which takes seconds instead of minutes) at each step
+Builds bs (Debug, which takes seconds instead of minutes) at each step
 in a worktree under .work/bisect-tree and runs the finding's program
 (reduced.zig when there is one) under the failing configuration. A
-commit is bad when zap still disagrees with upstream, good when zap
-compiles the program and agrees, and skipped otherwise (zap does not
+commit is bad when bs still disagrees with upstream, good when bs
+compiles the program and agrees, and skipped otherwise (bs does not
 build, or rejects the program for another reason). Without --good, it
 searches back from --bad (default origin/main) for a good commit.
 """
@@ -32,8 +32,8 @@ def git(*args, cwd=TREE, check=True):
 
 
 def build(sha):
-    dest = os.path.join(H.WORK, "zapdbg", sha)
-    binp = os.path.join(dest, "bin", "zap")
+    dest = os.path.join(H.WORK, "bsdbg", sha)
+    binp = os.path.join(dest, "bin", "bs")
     if os.path.exists(binp):
         return binp
     git("checkout", "--quiet", "--detach", sha)
@@ -46,11 +46,11 @@ def build(sha):
 
 
 def verdict(sha, src, cfg, up):
-    """'bad', 'good' or 'skip' for zap at `sha`."""
-    zap = build(sha)
-    if zap is None:
-        return "skip", "zap does not build"
-    tools = H.Tools(zap)
+    """'bad', 'good' or 'skip' for bs at `sha`."""
+    bs = build(sha)
+    if bs is None:
+        return "skip", "bs does not build"
+    tools = H.Tools(bs)
     scratch = H.new_scratch("bisect-")
     try:
         o = H.run_config(tools, cfg, src, scratch)
@@ -66,7 +66,7 @@ def verdict(sha, src, cfg, up):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("target", help="finding directory or .zig file")
-    ap.add_argument("--bad-config", default=None, help="failing configuration (default: from the finding, else zap)")
+    ap.add_argument("--bad-config", default=None, help="failing configuration (default: from the finding, else bs)")
     ap.add_argument("--bad", default="origin/main")
     ap.add_argument("--good")
     args = ap.parse_args()
@@ -76,9 +76,9 @@ def main():
         prog = os.path.join(args.target, "reduced.zig")
         if not os.path.exists(prog):
             prog = os.path.join(args.target, "orig.zig")
-        cfgname = args.bad_config or ("zap" if "zap" in meta["bad"] else meta["bad"][0])
+        cfgname = args.bad_config or ("bs" if "bs" in meta["bad"] else meta["bad"][0])
     else:
-        meta, prog, cfgname = None, args.target, args.bad_config or "zap"
+        meta, prog, cfgname = None, args.target, args.bad_config or "bs"
     cfg = H.BY_NAME[cfgname]
     if not os.path.isdir(TREE):
         git("worktree", "add", "--detach", TREE, "origin/main", cwd=H.REPO_DIR)

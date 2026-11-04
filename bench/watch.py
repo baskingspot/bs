@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Edit-to-artifact latency of `zig build --watch` against `zap build --watch`.
+"""Edit-to-artifact latency of `zig build --watch` against `bs build --watch`.
 
 For each project and compiler: copy the pristine checkout (bench/build_phases.py's
 checkout), warm the compiler's own global cache with one plain build, empty the
@@ -21,11 +21,11 @@ lands while an earlier build (tests, extra rebuilds) is still running, and the
 first build is timed under --watch. Needs Linux 6.5 or later: upstream's runner
 (lib/compiler/Maker/Watch.zig) uses `name_to_handle_at` with `AT_HANDLE_FID`,
 and on older kernels it panics after the first build, under `zig build` and
-`zap build` alike.
+`bs build` alike.
 
-    python3 bench/watch.py --zap zig-out/bin/zap
-    python3 bench/watch.py --zap zig-out/bin/zap --extra=-fincremental
-    python3 bench/watch.py --zap zig-out/bin/zap --projects zls --bp-steps   # zls's install+test
+    python3 bench/watch.py --bs zig-out/bin/bs
+    python3 bench/watch.py --bs zig-out/bin/bs --extra=-fincremental
+    python3 bench/watch.py --bs zig-out/bin/bs --projects zls --bp-steps   # zls's install+test
 
 `--protocol` measures, on any kernel, what a watch rebuild asks of the
 compiler alone: the artifact's compile step (its command line from `build
@@ -34,12 +34,12 @@ edit, as under `--watch`; the time is from the update to the compiler's answer,
 without change detection, the debounce, run steps or the install. `--extra`
 arguments that start with `-f` (such as `-fincremental`) go to the compile step.
 
-    python3 bench/watch.py --zap zig-out/bin/zap --protocol
-    python3 bench/watch.py --zap zig-out/bin/zap --protocol --extra=-fincremental
+    python3 bench/watch.py --bs zig-out/bin/bs --protocol
+    python3 bench/watch.py --bs zig-out/bin/bs --protocol --extra=-fincremental
 
 Works with either version of build_phases.py (with or without steps_of,
 zig_edit_of and the three-argument Edit). The 2026-11-04 timbot numbers used the
-zap-build-watch version, whose build.zig edit appends to the `pub fn build(` line.
+bs-build-watch version, whose build.zig edit appends to the `pub fn build(` line.
 Scratch files and logs go to bench/.work/watch_bench.
 """
 import argparse
@@ -71,7 +71,7 @@ def load_build_phases():
 
 BP = load_build_phases()
 WORK = os.path.join(BENCH_DIR, ".work", "watch_bench")
-ZIG = ZAP = None  # set from the command line
+ZIG = BS = None  # set from the command line
 
 
 def steps_of(name):
@@ -183,14 +183,14 @@ def sha(path):
 def run(name, which, args, tag):
     sub = BP["PROJECTS"][name][0]
     src = BP["checkout"](name, ZIG)
-    compiler = ZAP if which == "zap" else ZIG
+    compiler = BS if which == "bs" else ZIG
     dest = os.path.join(WORK, which, name)
     shutil.rmtree(dest, ignore_errors=True)
     shutil.copytree(src, dest, symlinks=True, ignore=lambda d, names: [
         n for n in names if n in (".zig-cache", "zig-out") or (d == src and n in ("cache", "build-cache"))])
     cwd = os.path.join(dest, sub)
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=os.path.join(WORK, f"global-{which}"))
-    if os.sep in ZIG:  # zap finds its lib directory through the zig on PATH
+    if os.sep in ZIG:  # bs finds its lib directory through the zig on PATH
         env["PATH"] = os.path.dirname(ZIG) + os.pathsep + env["PATH"]
     steps = steps_of(name) if args.bp_steps else []
     r = subprocess.run([compiler, "build", *steps], cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -294,7 +294,7 @@ def protocol(name, which, args):
     import bench  # CompilerServer
     sub = BP["PROJECTS"][name][0]
     src = BP["checkout"](name, ZIG)
-    compiler = ZAP if which == "zap" else ZIG
+    compiler = BS if which == "bs" else ZIG
     dest = os.path.join(WORK, which, name)
     shutil.rmtree(dest, ignore_errors=True)
     shutil.copytree(src, dest, symlinks=True, ignore=lambda d, names: [
@@ -336,12 +336,12 @@ def med(rows, key):
 
 
 def main():
-    global ZIG, ZAP
+    global ZIG, BS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--zap", required=True, help="the zap binary (built with -Doptimize=ReleaseFast)")
+    ap.add_argument("--bs", required=True, help="the bs binary (built with -Doptimize=ReleaseFast)")
     ap.add_argument("--zig", default="zig", help="upstream zig, for setup and the baseline")
     ap.add_argument("--projects", default="vaxis,zls,monstar")
-    ap.add_argument("--compilers", default="zig,zap")
+    ap.add_argument("--compilers", default="zig,bs")
     ap.add_argument("--edits", type=int, default=7)
     ap.add_argument("--settle", type=float, default=2.0)
     ap.add_argument("--bp-steps", action="store_true", help="build build_phases.steps_of(name), as bench/watch.py")
@@ -351,7 +351,7 @@ def main():
     ap.add_argument("--protocol", action="store_true", help="time only the compile step's updates over --listen=-")
     args = ap.parse_args()
     ZIG = os.path.abspath(args.zig) if os.sep in args.zig else args.zig
-    ZAP = os.path.abspath(args.zap)
+    BS = os.path.abspath(args.bs)
     out = os.path.join(WORK, f"results-{args.tag}.json")
     allres = {}
     for name in args.projects.split(","):

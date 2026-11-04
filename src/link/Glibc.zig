@@ -2,11 +2,11 @@
 //! directory's `libc/glibc/abilists`, the data upstream generates its glibc
 //! stub libraries from. A dynamically linked executable's imports resolve
 //! against it instead of against `libc.so` files (see "C interop" in
-//! docs/architecture.md).
+//! docs/slop/architecture.md).
 //!
 //! The format and the choice of each symbol's version follow upstream's
 //! `src/libs/glibc.zig` (`loadMetaData`, `buildSharedObjects`).
-//! Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
+//! Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

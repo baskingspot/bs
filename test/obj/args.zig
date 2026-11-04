@@ -1,4 +1,4 @@
-// For `zap run`: prints its arguments and exits with their count + 40.
+// For `bs run`: prints its arguments and exits with their count + 40.
 const std = @import("std");
 
 pub fn main(init: std.process.Init) !u8 {

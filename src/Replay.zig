@@ -1,5 +1,5 @@
 //! An edit build's use of the last build's results (see "Edit builds:
-//! replaying cached results" in docs/architecture.md). Zcu asks `load*`
+//! replaying cached results" in docs/slop/architecture.md). Zcu asks `load*`
 //! before it analyzes a unit; a green unit's result is written into the
 //! Zcu instead, and its function's atoms come from the pack.
 //!
@@ -106,9 +106,9 @@ dead: std.DynamicBitSetUnmanaged = .{},
 /// function they inline are in a changed input (`Incremental.refreshDebug`).
 refresh: std.DynamicBitSetUnmanaged = .{},
 stats: Stats = .{},
-/// `ZAP_CACHE_CHECK`: print each green unit that could not be loaded.
+/// `BS_CACHE_CHECK`: print each green unit that could not be loaded.
 check: bool = false,
-/// `ZAP_CACHE_TIMING`: say why the build is built again in full.
+/// `BS_CACHE_TIMING`: say why the build is built again in full.
 timing: bool = false,
 /// By stable hash, each type the manifest's units offered names
 /// (`contributeNames`): its recorded name, from the offer that won, and
@@ -860,7 +860,7 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
     try r.emit.endLoad();
 }
 
-/// Counts a green unit that could not be loaded, which `ZAP_CACHE_CHECK`
+/// Counts a green unit that could not be loaded, which `BS_CACHE_CHECK`
 /// prints: something its result or dependencies name could not be found
 /// or made in this build.
 fn noteMiss(r: *Replay, unit: Zcu.AnalUnit, what: []const u8) void {
@@ -1213,7 +1213,7 @@ pub fn keepsNavData(r: *Replay, nav: InternPool.NavIndex) !bool {
 /// Offers the types this build has the candidate names that the units it
 /// kept without analyzing them offered when they were analyzed
 /// (`Manifest.typeNames`), before `Zcu.finalizeNames` settles them, so
-/// that each type gets the name a full build gives it (docs/architecture.md,
+/// that each type gets the name a full build gives it (docs/slop/architecture.md,
 /// "Type names in the cache"). Then lists in `renamed` the types whose
 /// name, or the offer that gives it, differs from when it was recorded:
 /// one this build has, or one whose least creator left. Each type's

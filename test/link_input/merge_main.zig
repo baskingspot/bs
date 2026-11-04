@@ -1,4 +1,4 @@
-//! Links the object `zap build-obj` merged from merge_lib.zig, merge.c and
+//! Links the object `bs build-obj` merged from merge_lib.zig, merge.c and
 //! tls.c.
 const std = @import("std");
 extern fn z(x: c_int) c_int;

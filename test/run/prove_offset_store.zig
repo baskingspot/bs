@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: index out of bounds: index 76, len 64\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): `i + 32 <
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): `i + 32 <
 //! len` describes the `i` loaded there, not the value stored to `i`
 //! after it, so `s[i..][0..16]` keeps its checks.
 const rt = @import("rt.zig");

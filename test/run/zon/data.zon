@@ -1,5 +1,5 @@
 .{
-    .name = "zap",
+    .name = "bs",
     .version = .{ 0, 17, 0 },
     .tags = .{ .fast, .debug },
     .ratio = 1.5,

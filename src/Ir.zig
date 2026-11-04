@@ -1,5 +1,5 @@
 //! The typed IR of one function instance, produced by Sema and consumed by
-//! CodeGen, then freed. Never persisted (see docs/architecture.md).
+//! CodeGen, then freed. Never persisted (see docs/slop/architecture.md).
 //!
 //! Flat arrays in SSA form, like upstream AIR: an instruction's operands are
 //! other instructions or InternPool values. Control flow is structured:
@@ -397,7 +397,7 @@ pub const Inst = struct {
         dbg_inline_end,
 
         /// Only in a body lowered for the comptime evaluator (see
-        /// docs/architecture.md, "Comptime"), never in CodeGen's IR.
+        /// docs/slop/architecture.md, "Comptime"), never in CodeGen's IR.
         /// `no_op`: one backward branch against the evaluation's branch
         /// quota, where the ZIR walker counts one (an inline call, an
         /// `inline` loop iteration, a comptime call made while lowering).
@@ -459,7 +459,7 @@ pub const CondBr = struct {
     else_body_len: u32,
     cover: Cover,
 
-    /// Which arms `-ffuzz` makes coverage points (docs/architecture.md,
+    /// Which arms `-ffuzz` makes coverage points (docs/slop/architecture.md,
     /// "Fuzzing"): those of branches the user wrote, as upstream's
     /// `then_cov`/`else_cov`; none for branches Sema adds itself.
     pub const Cover = packed struct(u32) {
@@ -620,7 +620,8 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
     return switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
         .arg => data.arg.ty,
         .alloc, .c_va_start, .err_return_trace => data.ty,
-        .c_va_arg, .c_va_copy,
+        .c_va_arg,
+        .c_va_copy,
         .load,
         .not,
         .intcast,

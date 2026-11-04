@@ -11,8 +11,17 @@ export var frames: usize = 400;
 pub const std_options: std.Options = .{ .log_level = .info };
 
 const words = [_][]const u8{
-    "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dogs", "café", "naïve", "résumé",
-    "漢字", "かな", "한글", "🙂", "👩‍💻", "🚀", "terminal", "render", "cells", "graphemes", "width",
+    "the",      "quick",  "brown", "fox",       "jumps", "over", "lazy", "dogs",
+    "café",
+    "naïve",
+    "résumé",
+    "漢字",
+    "かな",
+    "한글",
+    "🙂",
+    "👩‍💻",
+    "🚀",
+    "terminal", "render", "cells", "graphemes", "width",
 };
 
 pub fn main(init: std.process.Init) !void {

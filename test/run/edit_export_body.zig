@@ -3,7 +3,7 @@
 //! rebuild-replace: "return 7;" "return 8;"
 //! Edit builds that generate a function again which an `@export` names,
 //! while the unit that exports it stays green: the function's atom keeps
-//! the export's name, as a full build names it (ZAP_CACHE_VERIFY).
+//! the export's name, as a full build names it (BS_CACHE_VERIFY).
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 

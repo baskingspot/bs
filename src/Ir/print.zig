@@ -719,7 +719,7 @@ const PtrKind = enum { lvalue, rvalue };
 /// anything else as its derivation from a declaration or address.
 fn printPtr(cx: Ctx, ptr_val: InternPool.Index, want_kind: ?PtrKind, w: *Writer, level: u8) Writer.Error!void {
     if (cx.ip.keyTag(ptr_val) == .undef) return w.writeAll("undefined");
-    // zap derives a many-pointer to a constant's first element through
+    // bs derives a many-pointer to a constant's first element through
     // `elem` 0; upstream points at the constant itself.
     var base = cx.ip.keyPayload(.ptr, ptr_val);
     while (base.byte_offset == 0) switch (base.base) {

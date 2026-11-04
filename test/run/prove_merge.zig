@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: index out of bounds: index 5, len 3\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): after the
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): after the
 //! `if`, `i` is 0 on one path and 5 on the other, so `s[i]` keeps its
 //! check although `s.len >= 1` is known and the last store walked was 0.
 const rt = @import("rt.zig");

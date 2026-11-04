@@ -1,5 +1,5 @@
 /* C calling compiler_rt's soft-float, 128-bit integer and atomic helpers,
- * which zap generates from upstream's compiler_rt (build.zig,
+ * which bs generates from upstream's compiler_rt (build.zig,
  * `addLinkInputTests`): f128 and f16 conversions, comparisons and
  * arithmetic, 128-bit division, a lock-based atomic, and function
  * multiversioning's CPU model. */

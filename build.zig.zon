@@ -1,7 +1,7 @@
 .{
-    .name = .zap,
+    .name = .bs,
     .version = "0.0.0",
-    .fingerprint = 0x8ac41f4e15ab0cc9,
+    .fingerprint = 0xdf1e3b5c1cc8641c,
     .minimum_zig_version = "0.17.1",
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

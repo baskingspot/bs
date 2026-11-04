@@ -1,4 +1,4 @@
-//! Imports from a shared library zap links against (build.zig,
+//! Imports from a shared library bs links against (build.zig,
 //! `addLinkInputTests`); upstream's link prints the same.
 const std = @import("std");
 extern fn shared_get() c_int;

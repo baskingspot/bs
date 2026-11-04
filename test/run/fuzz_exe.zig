@@ -2,7 +2,7 @@
 //! stdout: "1\n7\n"
 //! flags: -ffuzz
 //! A non-test executable built with -ffuzz links and runs, as upstream's
-//! default build does: zap instruments it but links no fuzzer, whose
+//! default build does: bs instruments it but links no fuzzer, whose
 //! `runner_*` callbacks only the test runner defines.
 const rt = @import("rt.zig");
 pub const panic = rt.panic;

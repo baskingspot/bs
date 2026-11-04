@@ -1,5 +1,5 @@
 //! Peephole rewrites of a function's IR before CodeGen
-//! (docs/architecture.md, "Rewrite rules"): a table of rules, pattern →
+//! (docs/slop/architecture.md, "Rewrite rules"): a table of rules, pattern →
 //! replacement over the IR's operations, applied in one forward walk.
 //! An instruction's operands are rewritten before the instruction itself
 //! is matched, so a chain of folds (`n - 1` of a constant `n`, then its
@@ -82,7 +82,7 @@ const by_tag: [@typeInfo(Tag).@"enum".field_names.len][]const Rule = blk: {
     @setEvalBranchQuota(10_000);
     var lists: [@typeInfo(Tag).@"enum".field_names.len][]const Rule = @splat(&.{});
     for (rules) |rule| for (rule.tags) |t| {
-        lists[@intFromEnum(t)] = lists[@intFromEnum(t)] ++ .{rule};
+        lists[@backingInt(t)] = lists[@backingInt(t)] ++ .{rule};
     };
     break :blk lists;
 };
@@ -294,7 +294,7 @@ const Walker = struct {
             .add_with_overflow, .sub_with_overflow, .mul_with_overflow => return w.overflowConst(inst, tag, data),
             else => {},
         }
-        const list = by_tag[@intFromEnum(tag)];
+        const list = by_tag[@backingInt(tag)];
         if (list.len == 0) return null;
         const unary = switch (tag) {
             .not, .intcast, .trunc, .int_from_bool => true,

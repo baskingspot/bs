@@ -1,7 +1,7 @@
 //! signal: ABRT
 //! stdout: "21\n8\n610\n"
 //! stderr: "panic: index out of bounds: index 3, len 3\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): the checks
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): the checks
 //! in `sum`, `twice`, and `fib` are proven and go, and the results stay.
 //! In `grow`, `i < s.len` holds before the loop, but the loop's store to
 //! `i` reaches its start again, so the check of `s[i]` stays and fails on

@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: index out of bounds: index 49, len 48\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): the walk
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): the walk
 //! assuming `i < len` at the loop's start fails at the back edge, where
 //! the exit test gives only `i <= len`, and the body is walked again
 //! without it. Facts from the failed walk must not survive into the

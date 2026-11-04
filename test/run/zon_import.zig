@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "zap17\n2\n15\n65\n1\n253\n9\n42\n1\n6\n16\n1000\n1\n2\n7\n137\nzap7\n1\n2\nbb3\n"
+//! stdout: "bs17\n2\n15\n65\n1\n253\n9\n42\n1\n6\n16\n1000\n1\n2\n7\n137\nbs7\n1\n2\nbb3\n"
 //! `@import` of ZON files, with a result type (structs with defaults,
 //! arrays, slices, tuples, unions, enums, optionals, integers, floats with
 //! inf and nan) and without one (anonymous structs and tuples of comptime

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Real-world corpus: build pinned Zig projects with zap and upstream zig.
+"""Real-world corpus: build pinned Zig projects with bs and upstream zig.
 
 For each project in manifest.json this clones the pinned commit, runs
 upstream `zig build --verbose` once to fetch dependencies, run code
 generators, and record each compile step's command line, then builds the
 manifest's targets from those command lines with upstream zig (Debug,
-self-hosted x86_64 backend) and with zap, runs the results, and compares
+self-hosted x86_64 backend) and with bs, runs the results, and compares
 them. Results go to .work/results.json and a Markdown scoreboard. See
 tools/corpus/README.md.
 """
@@ -122,12 +122,12 @@ def strip_common(words, cache_dir, out):
             pass
         elif w.startswith("-O"):
             # Every build is Debug: the baseline is upstream Debug, and
-            # zap has no other mode. (Some build scripts force a release
+            # bs has no other mode. (Some build scripts force a release
             # mode on their build-time tools.)
             res.append("-Odebug")
         elif w in ("--cache-dir", "--global-cache-dir", "--zig-lib-dir"):
             # The recording zig's lib dir: each compiler uses its own, so
-            # zap gets the std it was built for and upstream its release's.
+            # bs gets the std it was built for and upstream its release's.
             i += 1
         else:
             res.append(w)
@@ -187,7 +187,7 @@ def translate(compiler, words, cmds, cache_dir, src):
 
 
 def compile_argv(compiler, words, cache_dir, out):
-    """The command line of a target for either compiler: zap takes all of
+    """The command line of a target for either compiler: bs takes all of
     upstream's flags."""
     rest = strip_common(words, cache_dir, out)
     # The baseline is upstream's Debug default on x86_64-linux: the
@@ -290,9 +290,9 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
         argv = compile_argv(comp, target_words, cache, out)
         r = {"argv": shlex.join(argv)}
         # A cold build without donors: a donor (another compilation's
-        # result in zap's global store) makes the time depend on what the
+        # result in bs's global store) makes the time depend on what the
         # store holds.
-        env = dict(os.environ, ZAP_CACHE_DONOR="off") if which == "zap" else None
+        env = dict(os.environ, BS_CACHE_DONOR="off") if which == "bs" else None
         secs, code, output = timed(argv, src, env)
         # More samples (`--samples`): the median, each from an empty local
         # cache.
@@ -309,8 +309,8 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
             r["output"] = output[-20000:]
             result[which] = r
             continue
-        if which == "zap" and args.donors:
-            # zap's real first build in a fresh checkout: an empty local
+        if which == "bs" and args.donors:
+            # bs's real first build in a fresh checkout: an empty local
             # cache, with donors, which find the build just made in the
             # global store. The translated headers stay.
             donor = []
@@ -357,9 +357,9 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
         if edit and not args.no_edit:
             path = os.path.join(src, edit[0])
             env = None
-            if which == "zap" and args.cache_check:
+            if which == "bs" and args.cache_check:
                 # Check the edit build against a full build (not timed).
-                env = dict(os.environ, ZAP_CACHE_VERIFY="1", ZAP_CACHE_CHECK="1")
+                env = dict(os.environ, BS_CACHE_VERIFY="1", BS_CACHE_CHECK="1")
             # Each sample a new edit of the last build.
             edits = []
             for k in range(args.samples):
@@ -382,22 +382,22 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
 
 
 def compare(res, tgt):
-    """One verdict: ok, or what differs between zap and upstream."""
-    z, u = res.get("zap"), res.get("zig")
+    """One verdict: ok, or what differs between bs and upstream."""
+    z, u = res.get("bs"), res.get("zig")
     if u is None or z is None:
         return "not built"
     if u["compile_exit"] != 0:
         return "upstream fails to compile"
     if z["compile_exit"] != 0:
-        return "zap: compile error" if z["compile_exit"] == 1 else f"zap: crash ({z['compile_exit']})"
+        return "bs: compile error" if z["compile_exit"] == 1 else f"bs: crash ({z['compile_exit']})"
     if z["run"] == "skipped":
-        return f"zap: edit build failed: {z['edit_error']}" if z.get("edit_error") else "compiles (not run)"
+        return f"bs: edit build failed: {z['edit_error']}" if z.get("edit_error") else "compiles (not run)"
     if z["run"] != u["run"]:
-        return f"zap: run differs ({z['run']} vs {u['run']})"
+        return f"bs: run differs ({z['run']} vs {u['run']})"
     if tgt.get("compare_stdout", True) and z["stdout_sha"] != u["stdout_sha"]:
-        return "zap: stdout differs"
+        return "bs: stdout differs"
     if z.get("edit_error"):
-        return f"zap: edit build failed: {z['edit_error']}"
+        return f"bs: edit build failed: {z['edit_error']}"
     return "ok"
 
 
@@ -407,12 +407,12 @@ def fmt_s(s):
 
 def write_scoreboard(results, manifest, path):
     """One row per target: the verdict, both runs, and both build times."""
-    donors = any((r.get("zap") or {}).get("cold_local_donor") for r in results)
-    lines = ["| Project | Target | Verdict | upstream run | zap run | cold-local zig / zap |"
-             + (" cold-local zig / zap with donors |" if donors else "") + " edit zig / zap |",
+    donors = any((r.get("bs") or {}).get("cold_local_donor") for r in results)
+    lines = ["| Project | Target | Verdict | upstream run | bs run | cold-local zig / bs |"
+             + (" cold-local zig / bs with donors |" if donors else "") + " edit zig / bs |",
              "|---|---|---|---|---|---:|" + ("---:|" if donors else "") + "---:|"]
     for res in results:
-        u, z = res.get("zig") or {}, res.get("zap") or {}
+        u, z = res.get("zig") or {}, res.get("bs") or {}
 
         def cell(r):
             return (r.get("run") or r.get("error") or "–").replace("|", "\\|")[:90]
@@ -433,21 +433,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--projects", help="comma-separated project names (default: all)")
     ap.add_argument("--targets", help="comma-separated target names (default: all)")
-    ap.add_argument("--zap", default=os.path.join(REPO_DIR, "zig-out", "bin", "zap"))
+    ap.add_argument("--bs", default=os.path.join(REPO_DIR, "zig-out", "bin", "bs"))
     ap.add_argument("--zig", default="zig")
     ap.add_argument("--refresh", action="store_true", help="rerun zig build --verbose to re-record commands")
     ap.add_argument("--list", action="store_true", help="only record and list each project's compile commands")
-    ap.add_argument("--zap-only", action="store_true", help="skip the upstream builds (reuse their last results)")
+    ap.add_argument("--bs-only", action="store_true", help="skip the upstream builds (reuse their last results)")
     ap.add_argument("--no-edit", action="store_true", help="skip the edit builds")
     ap.add_argument("--no-run", action="store_true", help="build only; do not run what was built")
     ap.add_argument("--samples", type=int, default=1,
                     help="time each cold-local and edit build this many times and keep the median (default 1)")
     ap.add_argument("--donors", action="store_true",
-                    help="also time zap's cold-local build with donors (cold_local_donor)")
+                    help="also time bs's cold-local build with donors (cold_local_donor)")
     ap.add_argument("--results", default="results",
                     help="name of the results and scoreboard files in .work (default: results, scoreboard)")
     ap.add_argument("--cache-check", action="store_true",
-                    help="zap's edit builds check themselves against full builds (ZAP_CACHE_VERIFY, ZAP_CACHE_CHECK)")
+                    help="bs's edit builds check themselves against full builds (BS_CACHE_VERIFY, BS_CACHE_CHECK)")
     args = ap.parse_args()
 
     with open(os.path.join(CORPUS_DIR, "manifest.json")) as f:
@@ -460,7 +460,7 @@ def main():
         with open(results_path) as f:
             old = {(r["project"], r["target"]): r for r in json.load(f)}
     os.makedirs(WORK, exist_ok=True)
-    compilers = [("zap", os.path.abspath(args.zap))] + ([] if args.zap_only else [("zig", args.zig)])
+    compilers = [("bs", os.path.abspath(args.bs))] + ([] if args.bs_only else [("zig", args.zig)])
     for proj in projects:
         log(f"{proj['name']} {proj['commit'][:12]}")
         src, cmds = setup(proj, args.zig, args.refresh)
@@ -476,7 +476,7 @@ def main():
                 log(f"  no recorded command for {tgt['name']}; rerun with --refresh")
                 continue
             res = build_target(proj, src, words, cmds, tgt, compilers, args)
-            if args.zap_only and (proj["name"], tgt["name"]) in old:
+            if args.bs_only and (proj["name"], tgt["name"]) in old:
                 res["zig"] = old[(proj["name"], tgt["name"])].get("zig")
             res["verdict"] = compare(res, tgt)
             log(f"  => {res['verdict']}")

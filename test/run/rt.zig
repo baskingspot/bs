@@ -41,7 +41,7 @@ pub fn exit(code: u8) noreturn {
 
 /// A minimal panic handler for programs without std, with the API of
 /// `std.debug.FullPanic` and its messages: writes `panic: <message>` to
-/// stderr and raises SIGABRT. A program selects it, under zap and upstream
+/// stderr and raises SIGABRT. A program selects it, under bs and upstream
 /// alike, with `pub const panic = rt.panic;` in its root file.
 pub const panic = struct {
     pub fn call(msg: []const u8, _: ?usize) noreturn {

@@ -1,4 +1,4 @@
-//! Calls into C objects and archives that zap links (build.zig,
+//! Calls into C objects and archives that bs links (build.zig,
 //! `addLinkInputTests`), and is called back from them; upstream's link of
 //! the same inputs prints the same.
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! Loads the shared library `zap build-lib -dynamic` links from
+//! Loads the shared library `bs build-lib -dynamic` links from
 //! so_lib.zig, merge.c, tls.c and so_desc.c: its exports, its C globals,
 //! and its thread-locals on two threads.
 const std = @import("std");

@@ -1,7 +1,7 @@
 //! An x86_64 ELF shared library (`.so`) as a link input: the symbols it
 //! defines for other modules, which an executable imports from it, and the
 //! soname its DT_NEEDED names ("Object, archive and shared-library inputs"
-//! in docs/architecture.md). Read in place.
+//! in docs/slop/architecture.md). Read in place.
 
 const std = @import("std");
 const elf = std.elf;

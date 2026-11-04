@@ -1,17 +1,17 @@
-//! `zap translate-c`: translates a C header (or source) to Zig with
-//! upstream's translate-c (`lib/compiler/translate-c`, on Aro), which zap
-//! builds itself, as `zap build` does the build runner. `b.addTranslateC`
-//! runs it as `zap translate-c <flags> <file> --listen=-` and imports the
+//! `bs translate-c`: translates a C header (or source) to Zig with
+//! upstream's translate-c (`lib/compiler/translate-c`, on Aro), which bs
+//! builds itself, as `bs build` does the build runner. `b.addTranslateC`
+//! runs it as `bs translate-c <flags> <file> --listen=-` and imports the
 //! output, `<local cache>/o/<digest>/<stem>.zig`, as a module.
 //!
 //! The arguments that reach Aro are upstream's (`Compilation.translateC`
-//! with `addCommonCCArgs(.aro)`) for zap's target: Debug, the baseline
+//! with `addCommonCCArgs(.aro)`) for bs's target: Debug, the baseline
 //! CPU, and with `-lc` glibc's headers from the zig lib directory, as
-//! zap's `-lc` links (docs/architecture.md, "C interop").
+//! bs's `-lc` links (docs/slop/architecture.md, "C interop").
 //!
-//! A translation record, `<local cache>/zap/tc/<key>`, lists every file
+//! A translation record, `<local cache>/bs/tc/<key>`, lists every file
 //! Aro read (from its `-MD` depfile) with its stat and content hash, and
-//! the output's hash. The key covers zap, the translate-c binary, the
+//! the output's hash. The key covers bs, the translate-c binary, the
 //! working directory, the source path and the arguments, not the files'
 //! contents, so the output stays at one path across header edits, and a
 //! build whose files all stat as recorded runs nothing.
@@ -54,9 +54,9 @@ const cc_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
     .{"-I"}, .{"-isystem"}, .{"-iquote"}, .{"-idirafter"}, .{"-iframework"}, .{"-F"}, .{"-D"}, .{"-include"}, .{"--embed-dir"},
 });
 
-/// Options of `zig translate-c` that change nothing zap translates.
+/// Options of `zig translate-c` that change nothing bs translates.
 const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
-    .{"-fno-PIC"}, .{"-fPIC"}, .{"-fno-PIE"}, .{"-fPIE"}, .{"-fsingle-threaded"}, .{"-fno-single-threaded"},
+    .{"-fno-PIC"},          .{"-fPIC"},                .{"-fno-PIE"},      .{"-fPIE"},            .{"-fsingle-threaded"}, .{"-fno-single-threaded"},
     .{"-freference-trace"}, .{"-fno-reference-trace"}, .{"-fstack-check"}, .{"-fno-stack-check"},
 });
 const ignored_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
@@ -95,7 +95,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
             while (i + 1 < args.len and !std.mem.eql(u8, args[i + 1], "--")) i += 1;
             i += 1;
         } else if (std.mem.startsWith(u8, arg, "-O")) {
-            // zap builds only Debug, so headers see Debug's macros (no
+            // bs builds only Debug, so headers see Debug's macros (no
             // NDEBUG), as the code they are compiled into.
             if (arg.len == 2) i += 1;
         } else if (std.mem.startsWith(u8, arg, "-l")) {
@@ -116,11 +116,11 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
         } else if (std.mem.startsWith(u8, arg, "-I") or std.mem.startsWith(u8, arg, "-D") or std.mem.startsWith(u8, arg, "-U")) {
             try cc_args.append(arena, arg);
         } else if (ignored_flags.has(arg)) {
-            // Changes nothing zap translates.
+            // Changes nothing bs translates.
         } else if (ignored_flags_with_arg.has(arg)) {
             _ = next(args, &i);
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            main.setUnsupported(&opts, arena, "zap does not support the option '{s}' for translate-c", .{arg});
+            main.setUnsupported(&opts, arena, "bs does not support the option '{s}' for translate-c", .{arg});
         } else if (source == null) {
             source = arg;
         } else {
@@ -131,7 +131,7 @@ fn parse(init: std.process.Init, args: []const []const u8) !Request {
     var native_includes: []const []const u8 = &.{};
     if (std.mem.eql(u8, target, "native")) {
         if (!(@import("builtin").cpu.arch == .x86_64 and @import("builtin").os.tag == .linux))
-            main.setUnsupported(&opts, arena, "zap translates C only for x86_64-linux so far ('native'); pass -target x86_64-linux", .{})
+            main.setUnsupported(&opts, arena, "bs translates C only for x86_64-linux so far ('native'); pass -target x86_64-linux", .{})
         else if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
             if (native.abi.isGnu()) opts.glibc_version = native.os.version_range.linux.glibc;
             if (named_libs) if (std.zig.system.NativePaths.detect(arena, io, &native, init.environ_map)) |paths| {
@@ -264,13 +264,13 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     // last so that the key does not depend on them.
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{
-        exe,                                              "--zig-integration",
+        exe,                                                    "--zig-integration",
         try std.fmt.allocPrint(arena, "--zig-lib={s}", .{lib}), "--",
-        "-x",                                             "c",
-        "-isystem",                                       try std.fs.path.join(arena, &.{ lib, "compiler", "aro", "include" }),
-        "-fno-PIE",                                       if (req.link_libc) "-fPIC" else "-fno-PIC",
-        "-gdwarf-4",                                      "-gdwarf32",
-        "-fno-lto",                                       "-fhosted",
+        "-x",                                                   "c",
+        "-isystem",                                             try std.fs.path.join(arena, &.{ lib, "compiler", "aro", "include" }),
+        "-fno-PIE",                                             if (req.link_libc) "-fPIC" else "-fno-PIC",
+        "-gdwarf-4",                                            "-gdwarf32",
+        "-fno-lto",                                             "-fhosted",
         "-nostdinc",
     });
     const query_text = if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "x86_64-linux-gnu.{f}", .{v}) else "x86_64-linux-none";
@@ -287,8 +287,8 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     try argv.appendSlice(arena, &.{ "-O0", "-target", try target.zigTriple(arena), try mcpuArg(arena, &target) });
     try argv.appendSlice(arena, req.cc_args);
 
-    // The key: the binary's contents, which zap's code generation makes
-    // (a new zap that builds the same bytes keeps the records), the working
+    // The key: the binary's contents, which bs's code generation makes
+    // (a new bs that builds the same bytes keeps the records), the working
     // directory and the arguments.
     var key_args: std.ArrayList([]const u8) = .empty;
     try key_args.appendSlice(arena, argv.items[1..]);
@@ -296,7 +296,7 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     const key = try ToolRecord.key(arena, io, "translate-c", &std.fmt.bytesToHex(@as([16]u8, @bitCast(exe_hash)), .lower), lib, key_args.items);
     const digest: [16]u8 = @bitCast(key);
     const hex = std.fmt.bytesToHex(digest, .lower);
-    const record_path = try std.fs.path.join(arena, &.{ local, "zap", "tc", &hex });
+    const record_path = try std.fs.path.join(arena, &.{ local, "bs", "tc", &hex });
     const out_dir = try std.fs.path.join(arena, &.{ local, "o", &hex });
     const out_path = try std.fs.path.join(arena, &.{ out_dir, try std.fmt.allocPrint(arena, "{s}.zig", .{std.fs.path.stem(source)}) });
 
@@ -306,9 +306,9 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
         .miss => |h| old_output = h,
     };
 
-    // Translate into the local cache's `zap/tmp`, then move the output
+    // Translate into the local cache's `bs/tmp`, then move the output
     // into place.
-    const tmp_dir = try std.fs.path.join(arena, &.{ local, "zap", "tmp" });
+    const tmp_dir = try std.fs.path.join(arena, &.{ local, "bs", "tmp" });
     try cwd.createDirPath(io, tmp_dir);
     var rand: [8]u8 = undefined;
     io.random(&rand);
@@ -361,8 +361,8 @@ fn mcpuArg(arena: std.mem.Allocator, target: *const std.Target) ![]const u8 {
     return buf.items;
 }
 
-/// Builds translate-c once per zap binary and zig lib directory, into
-/// `<global cache>/zap/o/<hash>/translate-c`, as the build runner, and
+/// Builds translate-c once per bs binary and zig lib directory, into
+/// `<global cache>/bs/o/<hash>/translate-c`, as the build runner, and
 /// returns its path and the hash of its contents, kept beside it in
 /// `translate-c.hash` while the binary stats as the stamp says.
 fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, trusted: bool) !struct { []const u8, cache.Hash } {
@@ -370,21 +370,20 @@ fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, tru
     const io = init.io;
     const seed, _ = try Incremental.compilationKey(arena, io, &.{}, lib, "x86_64-linux");
     const dir_hash = cache.hash(3, try std.mem.concat(arena, u8, &.{ std.mem.asBytes(&seed), lib }));
-    const dir = try std.fmt.allocPrint(arena, "{s}/zap/o/{x:0>32}", .{ global, dir_hash });
+    const dir = try std.fmt.allocPrint(arena, "{s}/bs/o/{x:0>32}", .{ global, dir_hash });
     const exe = try std.fs.path.join(arena, &.{ dir, "translate-c" });
     const stamp = try std.fs.path.join(arena, &.{ dir, "translate-c.stat" });
     const hash_path = try std.fs.path.join(arena, &.{ dir, "translate-c.hash" });
     if (trusted and BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h };
     try Io.Dir.cwd().createDirPath(io, dir);
     try BuildRunner.compileTool(init, dir, &.{
-        "zap",           "build-exe",
-        "--dep",         "aro",
-        try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/translate-c/main.zig", .{lib}),
-        try std.fmt.allocPrint(arena, "-Maro={s}/compiler/aro/aro.zig", .{lib}),
-        "--name",        "translate-c",
-        "--zig-lib-dir", lib,
-        "--cache-dir",   global,
-        "--global-cache-dir", global,
+        "bs",                                                                              "build-exe",
+        "--dep",                                                                           "aro",
+        try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/translate-c/main.zig", .{lib}), try std.fmt.allocPrint(arena, "-Maro={s}/compiler/aro/aro.zig", .{lib}),
+        "--name",                                                                          "translate-c",
+        "--zig-lib-dir",                                                                   lib,
+        "--cache-dir",                                                                     global,
+        "--global-cache-dir",                                                              global,
     }, "Compiling translate-c (first time setup)", "translate-c", try std.fmt.allocPrint(arena, "{s}/compiler/translate-c/main.zig", .{lib}), try std.fmt.allocPrint(arena, "{s}/compiler", .{lib}));
     // The binary's contents, hashed again only when it changed.
     if (BuildRunner.toolUnchanged(io, exe, stamp)) if (readHash(io, hash_path)) |h| return .{ exe, h };

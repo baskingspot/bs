@@ -40,7 +40,7 @@ pub fn main() void {
 //   note addrspace.zig:12:12: address space 'gs' cannot cast into address space 'generic'
 //   note addrspace.zig:11:34: function return type declared here: fn derived(p: *addrspace(.gs) S) *u32 {
 //   ref: main addrspace.zig:22:10 (+3 std frames)
-// addrspace.zig:16:13: error[unsupported]: zap does not support memory accesses through pointers in address space 'fs' yet
+// addrspace.zig:16:13: error[unsupported]: bs does not support memory accesses through pointers in address space 'fs' yet
 //   | return p.*;
 //   ref: main addrspace.zig:23:10 (+3 std frames)
 // 4 errors

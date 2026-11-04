@@ -8,7 +8,7 @@
 //! stderr-contains: " in callMain ("
 
 // A panic in an inlined call names the callee and its line, as upstream.
-// zap first builds this without the marked line, then rebuilds with it:
+// bs first builds this without the marked line, then rebuilds with it:
 // `check` moves down a line but `main`, which it is inlined into, does
 // not change, so a reused `main` must still report `check`'s new line.
 const std = @import("std");

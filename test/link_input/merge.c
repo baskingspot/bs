@@ -1,4 +1,4 @@
-// Merged into an object with merge_lib.zig by `zap build-obj`
+// Merged into an object with merge_lib.zig by `bs build-obj`
 // (link/ElfMerge.zig).
 int c_counter = 5;
 static int helper(int v) { return v + 1; }

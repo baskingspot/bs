@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: index out of bounds: index 100, len 4\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): code after a
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): code after a
 //! block sees only the stores before the `br` that left it. `blk` is left
 //! only by `break :blk`, before `v = 3`, so `a[v]` keeps its check.
 const rt = @import("rt.zig");

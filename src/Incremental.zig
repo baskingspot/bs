@@ -1,5 +1,5 @@
 //! Connects a compilation to the on-disk cache (`cache.zig`, "The on-disk
-//! cache" in docs/architecture.md).
+//! cache" in docs/slop/architecture.md).
 //!
 //! - A build whose inputs did not change since the last successful one
 //!   relinks from the cached Atoms and skips the frontend, Sema, and
@@ -52,9 +52,9 @@ global: Io.Dir,
 /// `<local cache>`, whose compilation directories `record` trims.
 local: Io.Dir,
 /// The size limit of the store and of the local cache's compilation
-/// directories (`ZAP_CACHE_MAX_SIZE`).
+/// directories (`BS_CACHE_MAX_SIZE`).
 max_bytes: u64 = cache.default_max_bytes,
-/// Whether the local cache is the global one (`zap run`, a build outside
+/// Whether the local cache is the global one (`bs run`, a build outside
 /// a project): its compilation directories then share the global cache's
 /// limit with the store (`cache.globalShares`).
 local_is_global: bool = false,
@@ -62,7 +62,7 @@ local_is_global: bool = false,
 dir: Io.Dir,
 lock: Io.File,
 /// Identifies the compiler and target: part of every store key, so store
-/// entries are shared by every project built by the same zap for the same
+/// entries are shared by every project built by the same bs for the same
 /// target.
 store_seed: Hash,
 /// The target's architecture, whose unwind records cached atoms must have.
@@ -76,7 +76,7 @@ prev: ?Manifest = null,
 /// What a donor's compilation must share with this one besides inputs
 /// (`donorKey`).
 donor_key: Hash,
-/// `ZAP_CACHE_DONOR=off` turns off publishing and using donors.
+/// `BS_CACHE_DONOR=off` turns off publishing and using donors.
 donors: bool = true,
 /// The name of the donor `prev` is, if it is one.
 donor: ?[donor_name_len]u8 = null,
@@ -85,9 +85,9 @@ donor: ?[donor_name_len]u8 = null,
 donor_tag: [16]u8 = @splat('0'),
 /// What `donorTag` takes from the command: the subcommand and `--name`.
 donor_tag_seed: u64,
-/// `ZAP_CACHE_TIMING`: print where the cache's time goes.
+/// `BS_CACHE_TIMING`: print where the cache's time goes.
 timing: bool,
-/// `ZAP_CACHE_CHECK`: check that the last manifest's reverse edges predict
+/// `BS_CACHE_CHECK`: check that the last manifest's reverse edges predict
 /// every result this build changed, and that the recorded references
 /// reach every function. A gap fails the build (`finishRecord`).
 check: bool = false,
@@ -132,9 +132,9 @@ shared: ?[]const ElfShared = null,
 /// Such an executable's DT_RUNPATH (`Options.runpath` in main.zig).
 runpath: ?[]const u8 = null,
 /// Whether a build that does not relink renews the output's mtime, as a
-/// relink would: `zap run`'s programs are trimmed by it.
+/// relink would: `bs run`'s programs are trimmed by it.
 renew_output: bool = false,
-/// `ZAP_CACHE_VERIFY`: `replay` checks an edit build that loaded units
+/// `BS_CACHE_VERIFY`: `replay` checks an edit build that loaded units
 /// by building again in full (`full`, the build's own environment then),
 /// which compares its nodes with the edit build's (`verifyNodes`).
 verify: enum { off, replay, full } = .off,
@@ -148,7 +148,7 @@ recording: ?Io.Future(anyerror!Recorded) = null,
 replay: ?*Replay = null,
 
 /// Opens and locks the directory of the compilation that `args` (the
-/// command line after `zap`) describes, run from the current directory.
+/// command line after `bs`) describes, run from the current directory.
 /// `zig_lib_dir` is the std that compilation uses; `root_name` is
 /// `Frontend.Options.root_name`; `tests_std` is whether it tests the std
 /// module itself (`Frontend.testsStd`).
@@ -190,9 +190,9 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
 /// the compilation that `args` describes from the current directory (see
 /// `open`).
 pub fn compilationKey(gpa: Allocator, io: Io, args: []const []const u8, zig_lib_dir: []const u8, target: []const u8) !struct { Hash, Hash } {
-    // The compiler's identity: a rebuilt zap must not reuse what an older
+    // The compiler's identity: a rebuilt bs must not reuse what an older
     // one cached. The ctime too, which only the kernel sets: a different
-    // zap copied over this file in place, keeping its inode, with the same
+    // bs copied over this file in place, keeping its inode, with the same
     // size and its mtime restored (`cp` then `touch -d`, `rsync
     // --inplace -t`), matches on the other three.
     const exe = try std.process.openExecutable(io, .{});
@@ -201,7 +201,7 @@ pub fn compilationKey(gpa: Allocator, io: Io, args: []const []const u8, zig_lib_
     const st = try exe_stat;
     var id: std.ArrayList(u8) = .empty;
     defer id.deinit(gpa);
-    try id.print(gpa, "zap\x00{d}\x00{d}\x00{d}\x00{d}\x00{s}\x00", .{ st.inode, st.size, st.mtime.toNanoseconds(), st.ctime.toNanoseconds(), target });
+    try id.print(gpa, "bs\x00{d}\x00{d}\x00{d}\x00{d}\x00{s}\x00", .{ st.inode, st.size, st.mtime.toNanoseconds(), st.ctime.toNanoseconds(), target });
     const store_seed = cache.hash(0, id.items);
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
@@ -387,7 +387,7 @@ pub fn isLinkInput(key: []const u8) bool {
 
 /// Links manifest `m`'s live atoms from the packs into `sub_path`, and
 /// records the output's stat (`noteOutput`). Returns null, saying why
-/// under `ZAP_CACHE_TIMING`, if the packs or the manifest are damaged.
+/// under `BS_CACHE_TIMING`, if the packs or the manifest are damaged.
 fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const u8) !?Linked {
     const gpa = inc.gpa;
     const io = inc.io;
@@ -814,7 +814,7 @@ fn noLink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) ?Lin
 }
 
 /// Returns false for `relinkIfUnchanged`, saying why under
-/// `ZAP_CACHE_TIMING`.
+/// `BS_CACHE_TIMING`.
 fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bool {
     if (inc.timing) std.debug.print("cache: not relinking: " ++ fmt ++ "\n", args);
     return false;
@@ -822,8 +822,8 @@ fn noRelink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) bo
 
 /// Makes this an edit build: analysis loads the units the edits since the
 /// last build left green from it (see "Edit builds: replaying cached
-/// results" in docs/architecture.md). Call after `seedErrors`, before
-/// analysis. `mode` is `ZAP_CACHE_REPLAY`: `off` turns it off, `eager`
+/// results" in docs/slop/architecture.md). Call after `seedErrors`, before
+/// analysis. `mode` is `BS_CACHE_REPLAY`: `off` turns it off, `eager`
 /// loads every green node it can before analysis instead of only those
 /// the build reaches.
 pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emit, mode: []const u8) !void {
@@ -860,7 +860,7 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
 /// each in a directory with hard links to the store packs it names
 /// (`publishDonor`), which a first build replays (`useDonor`). Inside the
 /// store's directory, so that its maintenance counts and trims them.
-const donors_path = "zap/store/" ++ Store.donors_dir;
+const donors_path = "bs/store/" ++ Store.donors_dir;
 /// `<donor key, 32 hex digits>-<the program's tag (`donorTag`), 16 hex
 /// digits><16 random hex digits>`.
 const donor_name_len = 65;
@@ -873,7 +873,7 @@ const donor_renew_ns = std.time.ns_per_hour;
 
 /// What another compilation must share with this one for its graph to be
 /// replayed here, beyond what the graph checks itself (inputs and
-/// red-green): zap and the target (`store_seed`), the std, and options
+/// red-green): bs and the target (`store_seed`), the std, and options
 /// Zcu reads without recording a dependency: `-fsingle-threaded` (whether
 /// declarations are threadlocal), test filters (which tests exist), the
 /// root module's `-M` name (`Frontend.displayName`: `@src()` and messages
@@ -918,7 +918,7 @@ fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, r
         // -lc and its glibc version (`Job.compile_args`): CodeGen resolves
         // names glibc defines to imports instead of compiler_rt
         // (`Emit.exportTarget`).
-        if (std.mem.startsWith(u8, a, "--zap-glibc=")) {
+        if (std.mem.startsWith(u8, a, "--bs-glibc=")) {
             h.update("\x00glibc\x00");
             h.update(a);
         }
@@ -1823,8 +1823,8 @@ fn finishRecordFallible(inc: *Incremental, linked: bool) !void {
         // a gap; the gaps are printed above.
         r.discard(inc);
         if (inc.verify == .full) {
-            std.debug.print("error: ZAP_CACHE_VERIFY: the edit build's nodes differ from a full build's\n", .{});
-        } else std.debug.print("error: ZAP_CACHE_CHECK found gaps in the recorded dependencies or references\n", .{});
+            std.debug.print("error: BS_CACHE_VERIFY: the edit build's nodes differ from a full build's\n", .{});
+        } else std.debug.print("error: BS_CACHE_CHECK found gaps in the recorded dependencies or references\n", .{});
         std.process.exit(1);
     }
     const waited = ms(t0, now(inc.io));
@@ -1850,14 +1850,14 @@ fn finishRecordFallible(inc: *Incremental, linked: bool) !void {
     }
 }
 
-/// `ZAP_CACHE_VERIFY`: builds again in full in a child zap, which compares
+/// `BS_CACHE_VERIFY`: builds again in full in a child bs, which compares
 /// its nodes with this edit build's manifest, and exits if they differ.
 fn verifyReplay(inc: *Incremental) !void {
     const io = inc.io;
     const env = inc.verify_environ.?;
-    const old = env.get("ZAP_CACHE_VERIFY") orelse "1";
-    try env.put("ZAP_CACHE_VERIFY", "full");
-    defer env.put("ZAP_CACHE_VERIFY", old) catch {};
+    const old = env.get("BS_CACHE_VERIFY") orelse "1";
+    try env.put("BS_CACHE_VERIFY", "full");
+    defer env.put("BS_CACHE_VERIFY", old) catch {};
     const argv = try inc.gpa.dupe([]const u8, inc.verify_argv);
     defer inc.gpa.free(argv);
     const self = try std.process.executablePathAlloc(io, inc.gpa);
@@ -1872,7 +1872,7 @@ fn verifyReplay(inc: *Incremental) !void {
         .exited => |code| if (code == 0) return,
         else => {},
     }
-    std.debug.print("error: ZAP_CACHE_VERIFY: the full build of this edit build failed or differed\n", .{});
+    std.debug.print("error: BS_CACHE_VERIFY: the full build of this edit build failed or differed\n", .{});
     std.process.exit(1);
 }
 
@@ -1985,7 +1985,7 @@ pub fn endReplay(inc: *Incremental) void {
 }
 
 /// Why `recordDelta` falls back to an eager build, under
-/// `ZAP_CACHE_TIMING`.
+/// `BS_CACHE_TIMING`.
 fn lazyFallback(inc: *const Incremental, comptime fmt: []const u8, args: anytype) error{Fallback} {
     if (inc.timing) std.debug.print("cache: building again eagerly: " ++ fmt ++ "\n", args);
     return error.Fallback;
@@ -2673,7 +2673,7 @@ const Recorded = struct {
     /// frees an async result aligned past its Future's alignment with the
     /// wrong alignment.)
     empty_pack: ?[@sizeOf(Hash)]u8,
-    /// For `ZAP_CACHE_TIMING`.
+    /// For `BS_CACHE_TIMING`.
     report: []const u8,
 
     fn discard(r: *Recorded, inc: *Incremental) void {
@@ -3483,7 +3483,7 @@ fn maintainLocal(inc: *const Incremental) void {
 }
 
 /// The global cache's limit, for every build, whether or not it wrote a
-/// store pack: its compilation directories and tools (`zap/o`: the
+/// store pack: its compilation directories and tools (`bs/o`: the
 /// translate-c and build runner executables, the C++ runtime libraries)
 /// at most once a minute, and the store with its donors and ZIR when its
 /// scan is due (`Store.maintainStale`). A stat each when nothing is due.
@@ -3492,7 +3492,7 @@ fn maintainGlobal(inc: *const Incremental) void {
     const t0 = now(io);
     const shares = cache.globalShares(inc.max_bytes);
     _ = cache.maintainCompilations(inc.gpa, io, inc.global, shares.compilations, false) catch null;
-    var dir = inc.global.openDir(io, "zap/store", .{ .iterate = true }) catch return;
+    var dir = inc.global.openDir(io, "bs/store", .{ .iterate = true }) catch return;
     defer dir.close(io);
     const r = Store.maintainStale(inc.gpa, io, dir, shares.store) orelse return;
     if (inc.timing) std.debug.print("cache: global store maintained: deleted {d}, evicted {d}, merged {d}, in {d:.2} ms\n", .{ r.deleted, r.evicted, r.merged, ms(t0, now(io)) });
@@ -3697,7 +3697,7 @@ fn checkPrediction(inc: *Incremental, r: *const Recorder, fe: *const Frontend) v
     };
 }
 
-/// `ZAP_CACHE_CHECK`: computes the seeds from the changed inputs' ZIR, as
+/// `BS_CACHE_CHECK`: computes the seeds from the changed inputs' ZIR, as
 /// an edit build will (`seeds.zig`), and checks that every node whose
 /// result this build changed is reachable from them over the last
 /// manifest's reverse edges.
@@ -3809,7 +3809,7 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
     });
 }
 
-/// `ZAP_CACHE_CHECK`: checks that the recorded graph reaches every function
+/// `BS_CACHE_CHECK`: checks that the recorded graph reaches every function
 /// this build analyzed, from the units analysis starts from, over
 /// dependencies and references. A build that loads units from the cache
 /// queues functions only along references, so a function this misses
@@ -3833,7 +3833,7 @@ pub fn reachNext(deps: []const u32, refs: []const Manifest.Ref, next: *std.Array
     };
 }
 
-/// `ZAP_CACHE_CHECK`: that `reach` from the root files' namespaces and the
+/// `BS_CACHE_CHECK`: that `reach` from the root files' namespaces and the
 /// link's own atoms reaches exactly the nodes with atoms, which is what an
 /// edit build links without loading the units that did not change.
 fn checkReach(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *const Manifest.Builder) bool {
@@ -3878,7 +3878,7 @@ fn checkReach(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *const 
     return missed == 0;
 }
 
-/// `ZAP_CACHE_CHECK`: decodes every encoded result from its words alone,
+/// `BS_CACHE_CHECK`: decodes every encoded result from its words alone,
 /// rebuilding each item from its key rather than finding it by hash, and
 /// checks that it is this build's result: the same InternPool indices, and
 /// the same scalars. That is what an edit build relies on when it loads a
@@ -4043,7 +4043,7 @@ fn loadMakes(zcu: *Zcu, use: Zcu.EffectUse) bool {
     return false;
 }
 
-/// `ZAP_CACHE_VERIFY=full`: whether this full build's nodes are those of
+/// `BS_CACHE_VERIFY=full`: whether this full build's nodes are those of
 /// the edit build that wrote `prev`: the same nodes with the same results,
 /// source hashes, dependencies, references and atom records. (Not the
 /// output's bytes: the link lays atoms out in analysis order, which an
@@ -4051,7 +4051,7 @@ fn loadMakes(zcu: *Zcu, use: Zcu.EffectUse) bool {
 fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder, emit: *const Emit, debug_of: []const ?*const Atom.Debug) !bool {
     const gpa = inc.gpa;
     const m = if (inc.prev) |*m| m else return true;
-    // The child of `ZAP_CACHE_VERIFY=1` runs once the edit build wrote
+    // The child of `BS_CACHE_VERIFY=1` runs once the edit build wrote
     // its manifest, so every input is as the manifest has it. Set by
     // hand after an edit, `full` would compare with the build before it.
     {
@@ -4061,7 +4061,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         for (changed.items) |i| {
             if (try inc.sameContents(m, i)) continue;
             _, const path = m.input(i);
-            std.debug.print("cache verify: {s} changed since the last build; ZAP_CACHE_VERIFY=full only compares a full build with a manifest of the same inputs (set ZAP_CACHE_VERIFY=1 to verify an edit build)\n", .{path});
+            std.debug.print("cache verify: {s} changed since the last build; BS_CACHE_VERIFY=full only compares a full build with a manifest of the same inputs (set BS_CACHE_VERIFY=1 to verify an edit build)\n", .{path});
             return false;
         }
     }

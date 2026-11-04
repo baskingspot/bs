@@ -71,7 +71,7 @@ fn printWithoutNumbers(n: []const u8) void {
     while (i < n.len) : (i += 1) {
         rt.print(n[i..][0..1]);
         if ((n[i] == '_' and i + 1 < n.len and std.ascii.isDigit(n[i + 1])) or std.mem.endsWith(u8, n[0 .. i + 1], "__func_")) {
-            // zap numbers a `comptime` block's types `<ordinal>_<offset>`.
+            // bs numbers a `comptime` block's types `<ordinal>_<offset>`.
             while (i + 1 < n.len and (std.ascii.isHex(n[i + 1]) or (n[i + 1] == '_' and i + 2 < n.len and std.ascii.isDigit(n[i + 2])))) i += 1;
         }
     }

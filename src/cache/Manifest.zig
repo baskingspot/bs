@@ -104,7 +104,7 @@ debug_files: []const u32,
 debug_atoms: []const u32,
 /// Each atom reference's symbol name, parallel to `atom_refs`: the
 /// records keep none, so that a loaded atom takes its type's final name
-/// (docs/architecture.md, "Type names").
+/// (docs/slop/architecture.md, "Type names").
 atom_names: []const AtomName,
 atom_name_bytes: []const u8,
 files: []const StrRef,
@@ -704,7 +704,7 @@ fn SectionType(comptime s: Section) type {
 }
 
 /// Maps the manifest in `dir` and applies its log, or returns null if
-/// there is none or it is not one this zap wrote.
+/// there is none or it is not one this bs wrote.
 pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
     var map = try cache.mapFile(io, dir, "manifest") orelse return null;
     errdefer map.destroy(io);
@@ -2399,7 +2399,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         try t.expectEqual(2, try b.addErrorName("Overflow", 0xe2));
         b.entry = 0xa1;
         b.output = .lib;
-        try b.addLinkSymbol(.@"export", 0xa1, "zap_add", 0);
+        try b.addLinkSymbol(.@"export", 0xa1, "bs_add", 0);
         try b.addLinkSymbol(.import, 0xb0, "c_twice", 1);
         try b.write(io, tmp.dir, 0xabc);
     }

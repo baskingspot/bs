@@ -1,5 +1,5 @@
 //! Storage for the on-disk cache of analysis results and Atoms (see "The
-//! on-disk cache" in docs/architecture.md). This is the storage layer only:
+//! on-disk cache" in docs/slop/architecture.md). This is the storage layer only:
 //! it knows keys, hashes, dependency edges, and Atoms, not Sema.
 //!
 //! - `Store`: the global store, immutable packs of entries with sorted key
@@ -13,10 +13,10 @@
 //!
 //! Layout:
 //!
-//!   <global cache>/zap/store/<32 hex>.zsp       Store packs
-//!   <local cache>/zap/c/<32 hex>/               one compilation (`compilationDir`)
+//!   <global cache>/bs/store/<32 hex>.zsp       Store packs
+//!   <local cache>/bs/c/<32 hex>/               one compilation (`compilationDir`)
 //!       lock, manifest, manifest.log, pack
-//!   <local cache>/zap/tc/<32 hex>               a translate-c record, whose
+//!   <local cache>/bs/tc/<32 hex>               a translate-c record, whose
 //!   <local cache>/o/<32 hex>/                   output is in `o/<same hex>`
 //!
 //! Files are written once to an unnamed temporary file and linked or
@@ -43,7 +43,7 @@ pub const Hash = u128;
 pub fn compilationDir(io: Io, local_cache: Io.Dir, key: Hash) !Io.Dir {
     const hex = std.fmt.hex(key);
     var buf: [64]u8 = undefined;
-    const sub_path = std.fmt.bufPrint(&buf, "zap/c/{s}", .{&hex}) catch unreachable;
+    const sub_path = std.fmt.bufPrint(&buf, "bs/c/{s}", .{&hex}) catch unreachable;
     return local_cache.createDirPathOpen(io, sub_path, .{ .open_options = .{ .iterate = true } });
 }
 
@@ -74,12 +74,12 @@ pub fn lock(io: Io, dir: Io.Dir) !Io.File {
 pub const max_unused_compilation_ns = 5 * std.time.ns_per_day;
 
 /// The default size limit of the global cache (`globalShares`) and of a
-/// project's local cache; `ZAP_CACHE_MAX_SIZE` overrides it.
+/// project's local cache; `BS_CACHE_MAX_SIZE` overrides it.
 pub const default_max_bytes: u64 = 4 << 30;
 
 /// How the global cache's limit is shared: the store (packs, donors,
-/// ZIR) gets three quarters, and the compilation directories, `zap run`'s
-/// programs and the tools under `<global>/zap/o` a quarter, so that the
+/// ZIR) gets three quarters, and the compilation directories, `bs run`'s
+/// programs and the tools under `<global>/bs/o` a quarter, so that the
 /// two together stay within it. A local cache that is not the global one
 /// has the whole limit for its compilation directories.
 pub fn globalShares(max_bytes: u64) struct { store: u64, compilations: u64 } {
@@ -110,15 +110,15 @@ pub fn parseSize(text: []const u8) ?u64 {
 /// `max_unused_compilation_ns`, then the least recently used while the
 /// directories total more than `max_bytes`, down to three quarters of it.
 /// A file hard-linked into several directories counts once, against the
-/// most recently used. `zap run`'s program directories (`zap/o`) count
+/// most recently used. `bs run`'s program directories (`bs/o`) count
 /// and go the same way, by the program's mtime, which every run renews by
 /// relinking it or, when nothing changed, by touching it
 /// (`Incremental.renew_output`); one is not locked, so a run that relinks the least
 /// recently used program at the moment it goes fails, and the next run
-/// builds it again. `zap translate-c`'s records (`zap/tc/<key>`) count
+/// builds it again. `bs translate-c`'s records (`bs/tc/<key>`) count
 /// with their outputs (`o/<key>/`) and go the same way, by the record's
 /// mtime, which every hit renews; the record goes first, so a half-deleted
-/// translation is a miss. Test binaries in `zap/tmp` that a killed build left
+/// translation is a miss. Test binaries in `bs/tmp` that a killed build left
 /// go after a day. Runs at most once a minute, so that it costs a build
 /// a few stats, and with `force`, which `Incremental` passes for a build
 /// that started a directory. `Incremental` runs it once the build's new
@@ -126,8 +126,8 @@ pub fn parseSize(text: []const u8) ?u64 {
 pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir, max_bytes: u64, force: bool) !?MaintainResult {
     const now = Io.Clock.real.now(io);
     // Made if missing: a global cache whose only entries are tools in
-    // `zap/o` keeps its stamp here too.
-    var c = try local_cache.createDirPathOpen(io, "zap/c", .{ .open_options = .{ .iterate = true } });
+    // `bs/o` keeps its stamp here too.
+    var c = try local_cache.createDirPathOpen(io, "bs/c", .{ .open_options = .{ .iterate = true } });
     defer c.close(io);
     if (c.statFile(io, "trim", .{})) |stat| {
         if (!force and stat.mtime.durationTo(now).toNanoseconds() < compilations_scan_ns) return null;
@@ -136,18 +136,18 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
         else => |e| return e,
     }
     try c.writeFile(io, .{ .sub_path = "trim", .data = "" });
-    // `zap run`'s programs, one directory per compilation.
-    var o: ?Io.Dir = local_cache.openDir(io, "zap/o", .{ .iterate = true }) catch null;
+    // `bs run`'s programs, one directory per compilation.
+    var o: ?Io.Dir = local_cache.openDir(io, "bs/o", .{ .iterate = true }) catch null;
     defer if (o) |*d| d.close(io);
-    // `zap translate-c`'s records.
-    var tc: ?Io.Dir = local_cache.openDir(io, "zap/tc", .{ .iterate = true }) catch null;
+    // `bs translate-c`'s records.
+    var tc: ?Io.Dir = local_cache.openDir(io, "bs/tc", .{ .iterate = true }) catch null;
     defer if (tc) |*d| d.close(io);
     trimTemporary(io, local_cache, now);
 
     const File = struct { inode: u64, size: u64 };
     const Kind = enum { compilation, run, translation };
     const Entry = struct {
-        /// `zap/c/<name>`, `zap/o/<name>`, or `zap/tc/<name>`.
+        /// `bs/c/<name>`, `bs/o/<name>`, or `bs/tc/<name>`.
         name_buf: [32]u8,
         name_len: u8,
         kind: Kind,
@@ -279,12 +279,12 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
     return result;
 }
 
-/// Temporary files in `zap/tmp` (test binaries, deleted once they ran)
+/// Temporary files in `bs/tmp` (test binaries, deleted once they ran)
 /// older than this were left by a build that was killed.
 const max_temporary_ns = std.time.ns_per_day;
 
 fn trimTemporary(io: Io, local_cache: Io.Dir, now: Io.Timestamp) void {
-    var tmp = local_cache.openDir(io, "zap/tmp", .{ .iterate = true }) catch return;
+    var tmp = local_cache.openDir(io, "bs/tmp", .{ .iterate = true }) catch return;
     defer tmp.close(io);
     var it = tmp.iterate();
     while (it.next(io) catch null) |e| {
@@ -372,7 +372,7 @@ test "maintainCompilations evicts the least recently used unlocked directories p
     // 1100 bytes against a limit of 900: down to 675 takes a (300) and,
     // skipping b, c (500).
     try t.expectEqual(2, (try maintainCompilations(gpa, io, tmp.dir, 900, false)).?.deleted);
-    var c = try tmp.dir.openDir(io, "zap/c", .{});
+    var c = try tmp.dir.openDir(io, "bs/c", .{});
     defer c.close(io);
     for (names, [_]bool{ false, true, false }) |key, kept| {
         const hex = std.fmt.hex(key);
@@ -396,8 +396,8 @@ test "maintainCompilations counts translate-c records with their outputs and evi
     const new = std.fmt.hex(@as(Hash, 0x2e3));
     for ([_][]const u8{ &old, &new }, [_]i64{ 6 * std.time.ns_per_day, std.time.ns_per_hour }) |hex, age| {
         var buf: [64]u8 = undefined;
-        const record = try std.fmt.bufPrint(&buf, "zap/tc/{s}", .{hex});
-        try tmp.dir.createDirPath(io, "zap/tc");
+        const record = try std.fmt.bufPrint(&buf, "bs/tc/{s}", .{hex});
+        try tmp.dir.createDirPath(io, "bs/tc");
         try tmp.dir.writeFile(io, .{ .sub_path = record, .data = &(@as([10]u8, @splat(0))) });
         try tmp.dir.setTimestamps(io, record, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-age)) } });
         var buf2: [64]u8 = undefined;
@@ -413,9 +413,9 @@ test "maintainCompilations counts translate-c records with their outputs and evi
     try t.expectEqual(1, r.deleted);
     try t.expectEqual(r.bytes - 110, r.bytes_after);
     var buf: [64]u8 = undefined;
-    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "zap/tc/{s}", .{&old}), .{}));
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "bs/tc/{s}", .{&old}), .{}));
     try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "o/{s}", .{&old}), .{}));
-    _ = try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "zap/tc/{s}", .{&new}), .{});
+    _ = try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "bs/tc/{s}", .{&new}), .{});
     _ = try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "o/{s}/x.zig", .{&new}), .{});
 }
 

@@ -1,7 +1,7 @@
 //! C and C++ source files, compiled by upstream's Clang (`zig clang`) with
-//! the arguments upstream's `Compilation.addCCArgs` gives them for zap's
-//! target and the baseline CPU, in Debug (docs/architecture.md, "C
-//! interop"). zap never compiles C or C++ itself. With `-lc++`, an
+//! the arguments upstream's `Compilation.addCCArgs` gives them for bs's
+//! target and the baseline CPU, in Debug (docs/slop/architecture.md, "C
+//! interop"). bs never compiles C or C++ itself. With `-lc++`, an
 //! executable also links libc++, libc++abi and libunwind, which this file
 //! builds from the zig lib directory's sources as upstream's
 //! `libs/libcxx.zig` and `libs/libunwind.zig` do, once per configuration,
@@ -10,8 +10,8 @@
 //! The compiles start before analysis and run while Sema does; the build
 //! adds their objects to its link inputs at its first sync point
 //! (`Emit.sync`), before it pulls archive members and compiler_rt for
-//! them. Each object has a record in `<local cache>/zap/tc/` (ToolRecord),
-//! keyed by zap, upstream zig, the arguments and the source, which lists
+//! them. Each object has a record in `<local cache>/bs/tc/` (ToolRecord),
+//! keyed by bs, upstream zig, the arguments and the source, which lists
 //! the headers Clang read: a build whose files all stat as recorded runs
 //! nothing.
 
@@ -45,7 +45,7 @@ pub const Lang = enum {
     assembly,
 
     /// The language of a source file argument, by its extension, or null
-    /// if it is not one zap compiles.
+    /// if it is not one bs compiles.
     pub fn ofPath(path: []const u8) ?Lang {
         const ext = std.fs.path.extension(path);
         if (std.mem.eql(u8, ext, ".c")) return .c;
@@ -127,7 +127,7 @@ pub const Options = struct {
     /// libc_nonshared.a (`atexit` and the others glibc's libc.so lacks)
     /// and link it last, as upstream does.
     libc_nonshared: bool = false,
-    /// Where the runtime libraries go: `<global>/zap/o/<key>/`.
+    /// Where the runtime libraries go: `<global>/bs/o/<key>/`.
     global_cache: []const u8 = "",
     single_threaded: bool = false,
     /// Upstream's default stack protector for the compilation's C: with
@@ -202,7 +202,7 @@ pub const Batch = struct {
             done,
             /// Clang failed, with its stderr.
             failed: []const u8,
-            /// zap could not run it.
+            /// bs could not run it.
             err: []const u8,
         } = .pending,
         /// The files Clang read, zero-separated.
@@ -290,7 +290,7 @@ pub const Batch = struct {
             return;
         }
         // Warnings print as upstream's `zig cc` would; upstream's build
-        // drops them, so only `ZAP_CC_WARNINGS` shows them.
+        // drops them, so only `BS_CC_WARNINGS` shows them.
         j.inputs = try ToolRecord.commit(arena, io, .{
             .record_path = j.record_path,
             .out_path = j.out_path,
@@ -438,13 +438,13 @@ pub fn hitInputs(b: *const Batch, arena: std.mem.Allocator) ![]const u8 {
     return inputs.items;
 }
 
-/// A batch's summary, `<local cache>/zap/cb/<key>`: its sources' objects
+/// A batch's summary, `<local cache>/bs/cb/<key>`: its sources' objects
 /// in order, then every file their records list, each once, with the
 /// stats (inode, size, mtime) they had when a build found every object
 /// done. A build whose files all still stat so takes the objects without
 /// computing Clang's arguments or reading a record (SDL3: 473 records
-/// listing 190k files, a few thousand distinct). The key covers zap,
-/// since zap's code turns the options into the records' keys, upstream
+/// listing 190k files, a few thousand distinct). The key covers bs,
+/// since bs's code turns the options into the records' keys, upstream
 /// zig, the working and lib directories, the target's common Clang
 /// arguments, the options and every source.
 /// A summary older than `renew_ns` is not used, so that a build checks
@@ -456,9 +456,9 @@ const Summary = struct {
     const Entry = extern struct { inode: u64, size: u64, mtime: i64, path_len: u32, _pad: u32 = 0 };
 
     fn path(arena: std.mem.Allocator, io: Io, cwd: []const u8, local: []const u8, lib: []const u8, zig_id: []const u8, common: Common, sources: []const CSource, o: Options) ![]const u8 {
-        _, const zap_key = try @import("Incremental.zig").compilationKey(arena, io, &.{}, lib, "c batch");
+        _, const bs_key = try @import("Incremental.zig").compilationKey(arena, io, &.{}, lib, "c batch");
         var h: std.crypto.hash.Blake3 = .init(.{});
-        h.update(std.mem.asBytes(&zap_key));
+        h.update(std.mem.asBytes(&bs_key));
         h.update(zig_id);
         h.update(cwd);
         std.hash.autoHashStrat(&h, common, .DeepRecursive);
@@ -466,7 +466,7 @@ const Summary = struct {
         std.hash.autoHashStrat(&h, sources, .DeepRecursive);
         var key: [16]u8 = undefined;
         h.final(&key);
-        return std.fs.path.join(arena, &.{ local, "zap", "cb", &std.fmt.bytesToHex(key, .lower) });
+        return std.fs.path.join(arena, &.{ local, "bs", "cb", &std.fmt.bytesToHex(key, .lower) });
     }
 
     /// Appends file `p` with its stat, unless its mtime is too new to
@@ -572,20 +572,20 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         const first = runtime.items.len;
         if (is_nonshared) try nonsharedJobs(ra, &runtime, common, lib, o) else try runtimeJobs(ra, &runtime, rl, common, lib, o);
         // Keyed by upstream zig and every compile's arguments, which name
-        // the lib directory's sources; not by zap, whose rebuilds do not
+        // the lib directory's sources; not by bs, whose rebuilds do not
         // change the library.
         var h: std.ArrayList(u8) = .empty;
-        try h.print(s, "zap c++ runtime 1\x00{s}\x00{s}\x00", .{ zig_id, rl.name });
+        try h.print(s, "bs c++ runtime 1\x00{s}\x00{s}\x00", .{ zig_id, rl.name });
         for (runtime.items[first..]) |rj| for (rj.argv) |a| try h.print(s, "{s}\x00", .{a});
         const hex = std.fmt.bytesToHex(@as([16]u8, @bitCast(cache.hash(2, h.items))), .lower);
-        const path = try std.fs.path.join(ra, &.{ o.global_cache, "zap", "o", &hex, try std.fmt.allocPrint(s, "lib{s}.a", .{rl.name}) });
+        const path = try std.fs.path.join(ra, &.{ o.global_cache, "bs", "o", &hex, try std.fmt.allocPrint(s, "lib{s}.a", .{rl.name}) });
         if (Io.Dir.cwd().access(io, path, .{})) |_| {
             runtime.shrinkRetainingCapacity(first);
             try archives.append(ra, .{ .path = path });
         } else |_| {
             var rand: [8]u8 = undefined;
             io.random(&rand);
-            const tmp_dir = try std.fs.path.join(ra, &.{ o.global_cache, "zap", "tmp", try std.fmt.allocPrint(s, "{s}-{s}", .{ rl.name, &std.fmt.bytesToHex(rand, .lower) }) });
+            const tmp_dir = try std.fs.path.join(ra, &.{ o.global_cache, "bs", "tmp", try std.fmt.allocPrint(s, "{s}-{s}", .{ rl.name, &std.fmt.bytesToHex(rand, .lower) }) });
             try Io.Dir.cwd().createDirPath(io, tmp_dir);
             try archives.append(ra, .{ .path = path, .tmp_dir = tmp_dir, .first = sources.len + first, .len = runtime.items.len - first });
         }
@@ -600,7 +600,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     if (sources.len != 0) {
         b.summary_path = try Summary.path(ra, io, cwd_path, local, lib, zig_id, common, sources, o);
         b.summary_hit = try Summary.check(b, ra, sources);
-        if (b.summary_hit and environ.get("ZAP_CACHE_TIMING") != null)
+        if (b.summary_hit and environ.get("BS_CACHE_TIMING") != null)
             std.debug.print("cache: {d} C objects from the batch summary\n", .{sources.len});
     }
     if (!b.summary_hit) for (sources, b.jobs[0..sources.len]) |src, *j| {
@@ -648,7 +648,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .argv = argv.items,
             .dep_at = dep_at,
             .depfile = src.lang != .assembly,
-            .record_path = try std.fs.path.join(arena, &.{ local, "zap", "tc", &hex }),
+            .record_path = try std.fs.path.join(arena, &.{ local, "bs", "tc", &hex }),
             .out_path = try std.fs.path.join(arena, &.{ local, "o", &hex, try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(src.path)}) }),
             .start_ns = start_ns,
         };
@@ -681,7 +681,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     b.zig = if (misses == 0) .{ .path = "" } else if (zig.found) |p|
         if (try checkZig(s, io, p)) |msg| .{ .missing = try gpa.dupe(u8, msg) } else .{ .path = try gpa.dupe(u8, p) }
     else
-        .{ .missing = try std.fmt.allocPrint(gpa, "compiling C sources needs upstream zig 0.17.1; zap looked for it in ZAP_ZIG, as 'zig' on PATH, and in {s}", .{zig.looked}) };
+        .{ .missing = try std.fmt.allocPrint(gpa, "compiling C sources needs upstream zig 0.17.1; bs looked for it in BS_ZIG, as 'zig' on PATH, and in {s}", .{zig.looked}) };
     b.misses = misses;
     const workers = @min(misses, std.Thread.getCpuCount() catch 1);
     for (0..workers) |_| b.group.concurrent(io, Batch.worker, .{b}) catch break;
@@ -882,7 +882,7 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
 
 // The C++ runtime libraries, as upstream's `src/libs/libcxx.zig` and
 // `src/libs/libunwind.zig` build them for x86_64-linux-gnu.
-// Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
+// Copyright (c) Zig contributors. MIT licensed (see LICENSE-ZIG).
 
 const RuntimeLib = struct {
     /// `lib<name>.a`.
@@ -1001,7 +1001,7 @@ const unwind_files = [_][]const u8{
 /// glibc's libc_nonshared.a, as upstream's `src/libs/glibc.zig` builds it
 /// for x86_64-linux-gnu: the functions glibc's libc.so leaves to every
 /// executable (`atexit` calls `__cxa_atexit` with its `__dso_handle`).
-/// Upstream builds and links it with every glibc executable; zap only
+/// Upstream builds and links it with every glibc executable; bs only
 /// with C inputs, since Zig code references none of its functions.
 const nonshared_lib: RuntimeLib = .{ .name = "c_nonshared", .dir = "libc/glibc", .files = &.{
     "stdlib/atexit.c",
@@ -1013,9 +1013,9 @@ const nonshared_lib: RuntimeLib = .{ .name = "c_nonshared", .dir = "libc/glibc",
 /// For glibc 2.32 and older: the stat functions, which libc.so versions
 /// only from 2.33 on.
 const nonshared_stat_files = [_][]const u8{
-    "io/stat-2.32.c",     "io/fstat-2.32.c",   "io/lstat-2.32.c",   "io/stat64-2.32.c",
-    "io/fstat64-2.32.c",  "io/lstat64-2.32.c", "io/fstatat-2.32.c", "io/fstatat64-2.32.c",
-    "io/mknodat-2.32.c",  "io/mknod-2.32.c",
+    "io/stat-2.32.c",    "io/fstat-2.32.c",   "io/lstat-2.32.c",   "io/stat64-2.32.c",
+    "io/fstat64-2.32.c", "io/lstat64-2.32.c", "io/fstatat-2.32.c", "io/fstatat64-2.32.c",
+    "io/mknodat-2.32.c", "io/mknod-2.32.c",
 };
 
 /// Appends libc_nonshared.a's compiles, with upstream's flags: its
@@ -1033,16 +1033,26 @@ fn nonsharedJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), comm
     var includes: std.ArrayList([]const u8) = .empty;
     for ([_][]const u8{
         try join(arena, &.{ g, "include" }),
-        try join(arena, &.{ linux, "x86_64" }),                try join(arena, &.{ linux, "x86" }),
-        try join(arena, &.{ sd, "x86_64", "nptl" }),           try join(arena, &.{ sd, "x86", "nptl" }),
-        try join(arena, &.{ linux, "generic" }),               try join(arena, &.{ linux, "include" }),
-        linux,                                                 try join(arena, &.{ sd, "nptl" }),
-        try join(arena, &.{ sd, "pthread" }),                  try join(arena, &.{ sd, "unix", "sysv" }),
-        try join(arena, &.{ sd, "unix", "x86_64" }),           try join(arena, &.{ sd, "unix", "x86" }),
-        try join(arena, &.{ sd, "unix" }),                     try join(arena, &.{ sd, "x86_64" }),
-        try join(arena, &.{ sd, "x86" }),                      try join(arena, &.{ sd, "generic" }),
-        g,                                                     try join(arena, &.{ lib, "libc", "include", "x86_64-linux-gnu" }),
-        try join(arena, &.{ lib, "libc", "include", "generic-glibc" }), try join(arena, &.{ lib, "libc", "include", "x86_64-linux-any" }),
+        try join(arena, &.{ linux, "x86_64" }),
+        try join(arena, &.{ linux, "x86" }),
+        try join(arena, &.{ sd, "x86_64", "nptl" }),
+        try join(arena, &.{ sd, "x86", "nptl" }),
+        try join(arena, &.{ linux, "generic" }),
+        try join(arena, &.{ linux, "include" }),
+        linux,
+        try join(arena, &.{ sd, "nptl" }),
+        try join(arena, &.{ sd, "pthread" }),
+        try join(arena, &.{ sd, "unix", "sysv" }),
+        try join(arena, &.{ sd, "unix", "x86_64" }),
+        try join(arena, &.{ sd, "unix", "x86" }),
+        try join(arena, &.{ sd, "unix" }),
+        try join(arena, &.{ sd, "x86_64" }),
+        try join(arena, &.{ sd, "x86" }),
+        try join(arena, &.{ sd, "generic" }),
+        g,
+        try join(arena, &.{ lib, "libc", "include", "x86_64-linux-gnu" }),
+        try join(arena, &.{ lib, "libc", "include", "generic-glibc" }),
+        try join(arena, &.{ lib, "libc", "include", "x86_64-linux-any" }),
         try join(arena, &.{ lib, "libc", "include", "any-linux-any" }),
     }) |d| try includes.appendSlice(arena, &.{ "-I", d });
     for ([3][]const []const u8{ nonshared_lib.files, if (old_stat) &nonshared_stat_files else &.{}, if (old_init) &.{"csu/elf-init-2.33.c"} else &.{} }) |files| for (files) |file| {
@@ -1065,11 +1075,11 @@ fn nonsharedJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), comm
         try argv.appendSlice(arena, &.{ "-w", "-std=gnu11", "-fgnu89-inline", "-fmerge-all-constants", "-frounding-math", "-fno-common", "-fmath-errno", "-ftls-model=initial-exec", "-Qunused-arguments" });
         try argv.appendSlice(arena, includes.items);
         try argv.appendSlice(arena, &.{
-            "-DNO_INITFINI",                          "-D_LIBC_REENTRANT",
-            "-include",                               try join(arena, &.{ g, "include", "libc-modules.h" }),
-            "-DMODULE_NAME=libc",                     "-include",
+            "-DNO_INITFINI",                                       "-D_LIBC_REENTRANT",
+            "-include",                                            try join(arena, &.{ g, "include", "libc-modules.h" }),
+            "-DMODULE_NAME=libc",                                  "-include",
             try join(arena, &.{ g, "include", "libc-symbols.h" }), "-DPIC",
-            "-DLIBC_NONSHARED=1",                     "-DTOP_NAMESPACE=glibc",
+            "-DLIBC_NONSHARED=1",                                  "-DTOP_NAMESPACE=glibc",
         });
         try out.append(arena, .{ .argv = argv.items, .dep_at = dep_at });
     };
@@ -1136,11 +1146,11 @@ fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Ru
 
 const Found = struct { found: ?[]const u8, looked: []const u8 };
 
-/// Upstream zig: `ZAP_ZIG`, else `zig` on PATH, else where `.agents/setup`
+/// Upstream zig: `BS_ZIG`, else `zig` on PATH, else where `.agents/setup`
 /// installs it.
 fn findZig(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map) Found {
     const cwd = Io.Dir.cwd();
-    if (environ.get("ZAP_ZIG")) |p| return .{ .found = p, .looked = p };
+    if (environ.get("BS_ZIG")) |p| return .{ .found = p, .looked = p };
     if (environ.get("PATH")) |path| {
         var it = std.mem.tokenizeScalar(u8, path, ':');
         while (it.next()) |dir| {
@@ -1148,13 +1158,13 @@ fn findZig(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             if (cwd.access(io, p, .{ .execute = true })) |_| return .{ .found = p, .looked = p } else |_| {}
         }
     }
-    const home = environ.get("HOME") orelse return .{ .found = null, .looked = "~/.cache/zap" };
+    const home = environ.get("HOME") orelse return .{ .found = null, .looked = "~/.cache/bs" };
     const host = @tagName(@import("builtin").cpu.arch) ++ "-" ++ @tagName(@import("builtin").os.tag);
     for ([_][]const u8{ "zig-0.17.1", "zig-" ++ host ++ "-0.17.1" }) |sub| {
-        const p = std.fs.path.join(arena, &.{ home, ".cache", "zap", sub, "zig" }) catch continue;
+        const p = std.fs.path.join(arena, &.{ home, ".cache", "bs", sub, "zig" }) catch continue;
         if (cwd.access(io, p, .{ .execute = true })) |_| return .{ .found = p, .looked = p } else |_| {}
     }
-    return .{ .found = null, .looked = std.fs.path.join(arena, &.{ home, ".cache", "zap", "zig-" ++ host ++ "-0.17.1" }) catch "~/.cache/zap" };
+    return .{ .found = null, .looked = std.fs.path.join(arena, &.{ home, ".cache", "bs", "zig-" ++ host ++ "-0.17.1" }) catch "~/.cache/bs" };
 }
 
 /// Null when `zig` is upstream's 0.17.1, else why not.
@@ -1163,7 +1173,7 @@ fn checkZig(arena: std.mem.Allocator, io: Io, zig: []const u8) !?[]const u8 {
         return try std.fmt.allocPrint(arena, "compiling C sources needs upstream zig 0.17.1; unable to run '{s}': {t}", .{ zig, err });
     const version = std.mem.trim(u8, res.stdout, " \n");
     if (res.term.success() and std.mem.eql(u8, version, "0.17.1")) return null;
-    return try std.fmt.allocPrint(arena, "compiling C sources needs upstream zig 0.17.1; '{s}' is version '{s}' (set ZAP_ZIG to upstream 0.17.1)", .{ zig, version });
+    return try std.fmt.allocPrint(arena, "compiling C sources needs upstream zig 0.17.1; '{s}' is version '{s}' (set BS_ZIG to upstream 0.17.1)", .{ zig, version });
 }
 
 /// Clang's errors and their notes, as diagnostics: `path:line:col: error:

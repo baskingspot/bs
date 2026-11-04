@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: index out of bounds: index 5, len 3\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): in the else
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): in the else
 //! side, `i` is still 5, whatever the then side stored, so `s[i]` keeps
 //! its check although `s.len >= 1` is known.
 const rt = @import("rt.zig");

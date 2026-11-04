@@ -27,7 +27,7 @@ test "unwind tables" {
     try std.testing.expectEqual(.sync, @import("builtin").unwind_tables);
 }
 
-// `zap build test --fuzz` finds the planted crash (check.sh).
+// `bs build test --fuzz` finds the planted crash (check.sh).
 test "fuzz" {
     try std.testing.fuzz({}, struct {
         fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {

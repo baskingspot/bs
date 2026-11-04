@@ -1,4 +1,4 @@
-//! Relocatable x86_64 ELF objects (ET_REL, `zap build-obj`) from the same
+//! Relocatable x86_64 ELF objects (ET_REL, `bs build-obj`) from the same
 //! Atoms as an executable.
 //!
 //! The object is the image `Elf.emit` lays out, with its section contents

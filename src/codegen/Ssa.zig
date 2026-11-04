@@ -1,5 +1,5 @@
 //! The shared SSA form of one function, which every architecture's backend
-//! lowers (docs/architecture.md, "Optimizing backend").
+//! lowers (docs/slop/architecture.md, "Optimizing backend").
 //!
 //! A function is a list of basic blocks in layout order; a block is a list
 //! of values followed by a terminator. Step 1 of the design builds the
@@ -280,7 +280,7 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
 /// slots of their own.
 ///
 /// With `cover` (`-ffuzz`), it also picks the coverage points (`covered`;
-/// docs/architecture.md, "Fuzzing"): the entry, and each arm of a `branch`
+/// docs/slop/architecture.md, "Fuzzing"): the entry, and each arm of a `branch`
 /// that Sema marked (`Ir.CondBr.cover`, the branches the user wrote) and
 /// that is not cold. Switch cases get none, as upstream's. A covered block
 /// is not bypassed.

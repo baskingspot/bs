@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: index out of bounds: index 18446744073709551611, len 64\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): `i +% 32 <
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): `i +% 32 <
 //! len` gives no bound on `i + 16`, since `+%` wraps: with `i` 20 below
 //! the largest `usize`, `i +% 32` is 11, so `s[i..][0..16]` keeps its
 //! checks.

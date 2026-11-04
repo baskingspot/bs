@@ -92,7 +92,7 @@ fn main() callconv(.c) noreturn {
     rt.printInt(bitsOf(-1) catch 0);
     // Extern function declarations resolve to exports of their name.
     rt.printInt(api_add(4, 2));
-    rt.printInt(zap_add(1, 3));
+    rt.printInt(bs_add(1, 3));
     // A comptime-known @extern function pointer: called, held at runtime,
     // and stored in data.
     rt.printInt(add_ptr(2, 5));
@@ -124,19 +124,19 @@ fn bitsOf(x: i32) error{X}!u32 {
 // same program defines.
 const api_add = struct {
     comptime {
-        @export(&addImpl, .{ .name = "zap_add", .linkage = .weak });
+        @export(&addImpl, .{ .name = "bs_add", .linkage = .weak });
     }
-    extern fn zap_add(a: u32, b: u32) u32;
-}.zap_add;
+    extern fn bs_add(a: u32, b: u32) u32;
+}.bs_add;
 fn addImpl(a: u32, b: u32) callconv(.c) u32 {
     return a * 10 + b;
 }
-extern fn zap_add(a: u32, b: u32) u32;
+extern fn bs_add(a: u32, b: u32) u32;
 
 var word_buf: [8]u8 align(4) = .{ 1, 0, 0, 0, 2, 0, 0, 0 };
 fn wordsOf(b: []u8) ?[]u32 {
     return @ptrCast(@alignCast(b));
 }
-const add_ptr = @extern(*const fn (u32, u32) callconv(.c) u32, .{ .name = "zap_add" });
+const add_ptr = @extern(*const fn (u32, u32) callconv(.c) u32, .{ .name = "bs_add" });
 const AddTable = struct { f: *const fn (u32, u32) callconv(.c) u32 };
 var add_table: AddTable = .{ .f = add_ptr };

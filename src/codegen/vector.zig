@@ -1,5 +1,5 @@
 //! Which vector operations a backend lowers natively, in SIMD registers
-//! (docs/architecture.md, "Vectors"). Sema asks `native` before emitting
+//! (docs/slop/architecture.md, "Vectors"). Sema asks `native` before emitting
 //! an operation on whole vectors; for the rest it scalarizes, so a backend
 //! sees only the vector operations it answers true for here. The answers
 //! follow what upstream's Debug backend lowers natively on the same
@@ -116,7 +116,7 @@ pub fn native(cpu: *const std.Target.Cpu, ip: *const InternPool, op: Op, ty: Ind
     switch (cpu.arch) {
         .x86_64 => {},
         // TODO(aarch64-rebased): NEON answers, with the aarch64
-        // backend's lowering (docs/architecture.md, "Vectors").
+        // backend's lowering (docs/slop/architecture.md, "Vectors").
         else => return false,
     }
     // SSE4.2 orders 64-bit integers (pcmpgtq); SSE2 only in many

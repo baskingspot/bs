@@ -1,6 +1,6 @@
 //! Units' results, serialized so that an edit build can load a green
 //! unit's result instead of analyzing it (see "Serialized results" in
-//! docs/architecture.md). Unlike the rest of `cache/`, this part knows the
+//! docs/slop/architecture.md). Unlike the rest of `cache/`, this part knows the
 //! InternPool.
 //!
 //! A manifest holds one item table for all its results: every InternPool
@@ -487,7 +487,7 @@ pub const GeneratedTag = struct {
     values: []const Index,
 };
 
-/// Why a decode failed, for `ZAP_CACHE_CHECK`.
+/// Why a decode failed, for `BS_CACHE_CHECK`.
 pub const Miss = struct {
     id: u32 = 0,
     tag: KeyTag = .int_type,
@@ -1060,7 +1060,7 @@ pub fn decodeSubject(d: anytype, words: []const u32) !?Subject {
 }
 
 // ---------------------------------------------------------------------------
-// Type names (docs/architecture.md, "Type names" and "Type names in the
+// Type names (docs/slop/architecture.md, "Type names" and "Type names in the
 // cache")
 
 /// A unit's candidate names for the types it made (`Zcu.name_offers`) and

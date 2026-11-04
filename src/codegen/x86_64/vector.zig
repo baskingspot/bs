@@ -1,5 +1,5 @@
 //! x86_64 lowering of the vector operations that `../vector.zig` accepts:
-//! SSE2 on XMM registers, 16 bytes of lanes at a time (docs/architecture.md,
+//! SSE2 on XMM registers, 16 bytes of lanes at a time (docs/slop/architecture.md,
 //! "Vectors").
 //!
 //! Values: a vector of up to 16 bytes of lanes lives in an XMM register
@@ -555,7 +555,7 @@ fn packTree(cg: *CodeGen, operand: Ref, s: Shape, out: shared.Lane, first: u32, 
     const e = &cg.e;
     if (count == 1) return loadChunk(cg, r, operand, first);
     const in = wider(out);
-    const b: Xmm = @enumFromInt(@intFromEnum(r) + 1);
+    const b: Xmm = @fromBackingInt(@intCast(@backingInt(r) + 1));
     try packTree(cg, operand, s, in, first, count / 2, r);
     // The right half, or the left again when it is all padding.
     const right = first + count / 2 < s.chunks();

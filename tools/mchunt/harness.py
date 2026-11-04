@@ -21,7 +21,7 @@ RUN_TIMEOUT = 10
 
 
 class Config:
-    """`kind` is "zig" (upstream) or "zap"."""
+    """`kind` is "zig" (upstream) or "bs"."""
 
     def __init__(self, name, kind, mode="Debug", env=None):
         self.name, self.kind, self.mode, self.env = name, kind, mode, env or {}
@@ -32,18 +32,18 @@ class Config:
 # and takes ~15 s per program).
 UP_DEBUG = Config("zig", "zig")
 UP_SAFE = Config("zig-safe", "zig", "ReleaseSafe")
-ZAP_DEBUG = Config("zap", "zap")
-ZAP_SAFE = Config("zap-safe", "zap", "ReleaseSafe")
-ZAP_NOINLINE = Config("zap-noinline", "zap", env={"ZAP_INLINE": "0"})
-ZAP_INLINE_SAFE = Config("zap-inline-safe", "zap", env={"ZAP_INLINE_SAFE": "1"})
-ALWAYS = [ZAP_DEBUG, ZAP_SAFE, ZAP_NOINLINE]
-TRIAGE = [UP_SAFE, ZAP_INLINE_SAFE]
-BY_NAME = {c.name: c for c in [UP_DEBUG, UP_SAFE, ZAP_DEBUG, ZAP_SAFE, ZAP_NOINLINE, ZAP_INLINE_SAFE]}
+BS_DEBUG = Config("bs", "bs")
+BS_SAFE = Config("bs-safe", "bs", "ReleaseSafe")
+BS_NOINLINE = Config("bs-noinline", "bs", env={"BS_INLINE": "0"})
+BS_INLINE_SAFE = Config("bs-inline-safe", "bs", env={"BS_INLINE_SAFE": "1"})
+ALWAYS = [BS_DEBUG, BS_SAFE, BS_NOINLINE]
+TRIAGE = [UP_SAFE, BS_INLINE_SAFE]
+BY_NAME = {c.name: c for c in [UP_DEBUG, UP_SAFE, BS_DEBUG, BS_SAFE, BS_NOINLINE, BS_INLINE_SAFE]}
 
 
 class Tools:
-    def __init__(self, zap=None, zig=None):
-        self.zap = os.path.abspath(zap or os.path.join(REPO_DIR, "zig-out", "bin", "zap"))
+    def __init__(self, bs=None, zig=None):
+        self.bs = os.path.abspath(bs or os.path.join(REPO_DIR, "zig-out", "bin", "bs"))
         self.zig = zig or shutil.which("zig") or "zig"
 
 
@@ -94,9 +94,9 @@ def normalize(stderr):
 def compile_prog(tools, cfg, src, out, cache_dir):
     env = dict(os.environ)
     env.update(cfg.env)
-    if cfg.kind == "zap":
-        env["ZAP_CACHE"] = "off"
-        argv = [tools.zap, "build-exe", src, f"-femit-bin={out}"]
+    if cfg.kind == "bs":
+        env["BS_CACHE"] = "off"
+        argv = [tools.bs, "build-exe", src, f"-femit-bin={out}"]
     else:
         argv = [tools.zig, "build-exe", src, f"-femit-bin={out}", "--cache-dir", cache_dir]
     if cfg.mode != "Debug":

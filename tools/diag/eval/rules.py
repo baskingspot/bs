@@ -200,7 +200,7 @@ MIGRATIONS = [
     R("math-absint", [(r"const magnitude = @abs\(x\);", "const magnitude = try std.math.absInt(x);")], [["@abs"]], seeds=["misc"], since="0.12"),
     R("meta-int", [(r"return @Int\(\.unsigned, bits\);", "return std.meta.Int(.unsigned, bits);")], [["@Int"]], seeds=["misc"], since="0.17"),
 
-    # build.zig (std.Build), configured through `zap build`
+    # build.zig (std.Build), configured through `bs build`
     R("build-exe-root-source", [(r'b\.addExecutable\(\.\{ \.name = "app", \.root_module = mod \}\)',
                                  L('b.addExecutable(.{ .name = "app", .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize })'))],
       [["root_module"], ["createModule"]], seeds=["build_exe"], since="0.15"),

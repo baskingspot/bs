@@ -1,6 +1,6 @@
 //! Relocatable links (`ld -r`): one x86_64 ET_REL from several, for
-//! `zap build-obj` with object inputs or C sources, as upstream's
-//! `flushObject` merges its Zig object with them (docs/architecture.md,
+//! `bs build-obj` with object inputs or C sources, as upstream's
+//! `flushObject` merges its Zig object with them (docs/slop/architecture.md,
 //! "Relocatable links").
 //!
 //! The inputs stay as they are, not converted to Atoms: sections with the
@@ -627,7 +627,7 @@ fn invalid(arena: Allocator, diag: *[]const u8, o: *const Object, what: []const 
 }
 
 fn unsupported(arena: Allocator, diag: *[]const u8, comptime fmt: []const u8, args: anytype) Error {
-    diag.* = try std.fmt.allocPrint(arena, "zap does not merge this object yet: " ++ fmt, args);
+    diag.* = try std.fmt.allocPrint(arena, "bs does not merge this object yet: " ++ fmt, args);
     return error.UnsupportedObject;
 }
 

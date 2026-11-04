@@ -1,6 +1,6 @@
 # Real-world corpus
 
-`tools/corpus/run.py` builds pinned, pure-Zig projects with zap and with
+`tools/corpus/run.py` builds pinned, pure-Zig projects with bs and with
 upstream zig 0.17.1, runs what they build, and compares the two. It finds
 the bugs real programs hit that `test/behavior` and std's tests miss.
 
@@ -8,17 +8,17 @@ the bugs real programs hit that `test/behavior` and std's tests miss.
 zig build -Doptimize=ReleaseFast
 python3 tools/corpus/run.py                      # every project and target
 python3 tools/corpus/run.py --projects zls,z2d --targets test
-python3 tools/corpus/run.py --zap-only --no-edit # quick check after a fix
+python3 tools/corpus/run.py --bs-only --no-edit # quick check after a fix
 ```
 
-Options: `--zap PATH`, `--zig PATH`, `--refresh` (record the compile
-commands again), `--list` (record and list them only), `--zap-only` (keep
+Options: `--bs PATH`, `--zig PATH`, `--refresh` (record the compile
+commands again), `--list` (record and list them only), `--bs-only` (keep
 the last upstream results), `--no-edit` (skip the edit builds), `--no-run`
-(build only), `--cache-check` (zap's edit builds check themselves against
-a full build with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`; not timed),
+(build only), `--cache-check` (bs's edit builds check themselves against
+a full build with `BS_CACHE_VERIFY` and `BS_CACHE_CHECK`; not timed),
 `--samples N` (time each cold-local and edit build N times and keep the
-median), `--donors` (also time zap's cold-local build with donors, which
-find the build just made in the global store: zap's first build in a
+median), `--donors` (also time bs's cold-local build with donors, which
+find the build just made in the global store: bs's first build in a
 fresh checkout), `--results NAME` (write `.work/NAME.json` and
 `.work/NAME.md` instead of `results.json` and `scoreboard.md`).
 `bench/scoreboard.py` runs it with `--no-run --donors --samples 3`.
@@ -51,24 +51,24 @@ fresh checkout), `--results NAME` (write `.work/NAME.json` and
   types), and prints every compile step's command line; the commands are
   kept in `.work/commands/`.
 - Each target is then built from its recorded command line, by upstream
-  zig and by zap, from the project's directory:
+  zig and by bs, from the project's directory:
   - The build-system plumbing goes (`--listen=-`, the cache directories,
     the recording zig's `--zig-lib-dir`: each compiler uses its own lib
     directory, so the commands survive a move to another Zig release);
     each build gets an empty local cache and the user's global cache
     (`cold-local`) and emits to `.work/out/`. Tests add `--test-no-exec`.
-    zap's cold build runs with `ZAP_CACHE_DONOR=off`: a first build that
+    bs's cold build runs with `BS_CACHE_DONOR=off`: a first build that
     replays a donor from the global store takes a time that depends on
     what the store holds.
   - Every build is Debug: a release `-O` some build scripts force on their
     build-time tools becomes `-Odebug`, and upstream's `-fllvm` becomes
     `-fno-llvm`, so the baseline is upstream's Debug default on x86_64-linux
     (the self-hosted backend).
-  - zap gets the same command line as upstream: it takes every flag the
+  - bs gets the same command line as upstream: it takes every flag the
     corpus's build scripts pass.
   - A module that is a translated C header (`b.addTranslateC`, recorded
     from upstream's `translate-c` command) is translated again by each
-    compiler, `zig translate-c` or `zap translate-c`, into the build's
+    compiler, `zig translate-c` or `bs translate-c`, into the build's
     local cache, and that time counts in the cold build.
 - Both binaries run from the same path (programs print `argv[0]`). A test
   binary's verdict is its exit status and summary line (`All N tests
@@ -76,52 +76,52 @@ fresh checkout), `--results NAME` (write `.work/NAME.json` and
 - The edit build appends `std.mem.doNotOptimizeAway(@as(u32, N));` to the
   target's `edit` line and rebuilds with the same cache: a full rebuild for
   upstream (`zig build-exe` caches nothing of the Zig compilation without
-  `--listen`), an incremental one for zap.
+  `--listen`), an incremental one for bs.
 - Results go to `.work/results.json` and `.work/scoreboard.md`.
 
 ## Scope
 
-zap compiles no C, so only targets that build without C sources are in the
-corpus. Linking glibc (`-lc`) and translating C headers (`zap translate-c`)
+bs compiles no C, so only targets that build without C sources are in the
+corpus. Linking glibc (`-lc`) and translating C headers (`bs translate-c`)
 are in: libxev, zio, zedis and tokamak link libc, and tokamak translates
 its `src/c.h`. Projects that need C sources or other C libraries are
 listed under `excluded` in the manifest with the reason.
 
 ## Scoreboard
 
-2026-11-04, zap at main e97f36a plus c17b8ae (the inline-call fix that
+2026-11-04, bs at main e97f36a plus c17b8ae (the inline-call fix that
 libxev's tests need; ReleaseFast), upstream zig 0.17.0 (its results from
 the run on main 4f846d0), on a 4-core orb. All 83 targets of 33 projects
-compile with zap. 81 behave as upstream's build does: same exit status,
+compile with bs. 81 behave as upstream's build does: same exit status,
 same stdout, same test summary. Two differ, each with a `note` in the
-manifest: tokamak's test panics under zap on illegal behavior in
+manifest: tokamak's test panics under bs on illegal behavior in
 tokamak's own `meta.transmute` (an `@alignCast` of an align(1) value's
 address) that upstream's build survives only by its stack layout, and
 upstream's build of zio's coro-demo overflows the 64 KiB coroutine stack
-the demo allocates, where zap's fits. Some tests fail under both
+the demo allocates, where bs's fits. Some tests fail under both
 compilers: ghostty-vt-test (tinyio's realPathFile), zbor (an ECDSA
 vector), zig-hpke (an ML-KEM vector) and tokamak (http.client's
 AddressInUse, with the alignment bug patched out). "not run" marks a
 target that needs the network, a terminal, or a server's clients.
 
 Times are one sample each: cold-local is an empty local cache with a warm
-global cache (zap without donors); edit is the rebuild after a one-line
+global cache (bs without donors); edit is the rebuild after a one-line
 edit. Geometric-mean speedups: 1.9x cold-local over 83 targets (123.7 s
 vs 65.9 s in total) and 28.6x on edit builds over 45 (91.6 s vs 2.4 s);
 the libc projects' edit builds gain 21.3x over their 6 targets. ghostty's
 props-unigen and symbols-unigen edit builds are lazy again (35 ms and
 44 ms) now that atoms are named at link time, and their symbols match a
 full build's. Single samples spike by 0.5–2 s on different targets from
-run to run: the zap rows of the eleven projects that spiked in the first
+run to run: the bs rows of the eleven projects that spiked in the first
 run come from a second run, and zf, zlinter's
 require_fmt_unit_test_coverage, zul and linuxwave's main-tests still
 carry a spike, which is most of the drop from 2.0x. Timed directly
 against main 1037019, zls, symbols-unigen and std compile in the same
 time, and ghostty-vt-test 3–5% slower. tokamak's first cold build with
-a new zap binary includes building zap's translate-c (3.3–5.8 s); the
+a new bs binary includes building bs's translate-c (3.3–5.8 s); the
 table's 1.59 s is from a later run.
 
-| Project | Target | Verdict | upstream run | zap run | cold-local zig / zap | edit zig / zap |
+| Project | Target | Verdict | upstream run | bs run | cold-local zig / bs | edit zig / bs |
 |---|---|---|---|---|---:|---:|
 | zls | zls | ok | exit 0 | exit 0 | 2.80 s / 1.55 s (1.8x) | 2.97 s / 76 ms (38.9x) |
 | zls | lsp-codegen | ok | exit 0 | exit 0 | 885 ms / 507 ms (1.7x) | 1.07 s / 46 ms (23.2x) |
@@ -199,10 +199,10 @@ table's 1.59 s is from a later run.
 | libxev | xev | ok | not run | not run | 395 ms / 191 ms (2.1x) | – / – |
 | zio | test | ok | exit 0, 817 of 817 tests passed | exit 0, 817 of 817 tests passed | 2.08 s / 1.26 s (1.7x) | 2.11 s / 149 ms (14.1x) |
 | zio | hello-world | ok | exit 0 | exit 0 | 803 ms / 428 ms (1.9x) | 767 ms / 67 ms (11.5x) |
-| zio | coro-demo | zap: run differs (exit 0 vs exit signal 6) | exit signal 6 | exit 0 | 585 ms / 266 ms (2.2x) | – / – |
+| zio | coro-demo | bs: run differs (exit 0 vs exit signal 6) | exit signal 6 | exit 0 | 585 ms / 266 ms (2.2x) | – / – |
 | zio | mutex-demo | ok | exit 0 | exit 0 | 869 ms / 488 ms (1.8x) | – / – |
 | zio | ev-demo | ok | exit 0 | exit 0 | 722 ms / 394 ms (1.8x) | – / – |
 | zio | producer-consumer | ok | exit 0 | exit 0 | 908 ms / 645 ms (1.4x) | – / – |
 | zedis | test-unit | ok | exit 0, All 384 tests passed. | exit 0, All 384 tests passed. | 1.23 s / 719 ms (1.7x) | 1.27 s / 52 ms (24.5x) |
 | zedis | zedis | ok | not run | not run | 1.21 s / 772 ms (1.6x) | 1.20 s / 54 ms (22.5x) |
-| tokamak | test | zap: run differs (exit signal 6, no summary vs exit 1, 88 passed; 0 skipped; 1 failed.) | exit 1, 88 passed; 0 skipped; 1 failed. | exit signal 6, no summary | 2.88 s / 1.59 s (1.8x) | 2.87 s / 44 ms (65.3x) |
+| tokamak | test | bs: run differs (exit signal 6, no summary vs exit 1, 88 passed; 0 skipped; 1 failed.) | exit 1, 88 passed; 0 skipped; 1 failed. | exit signal 6, no summary | 2.88 s / 1.59 s (1.8x) | 2.87 s / 44 ms (65.3x) |

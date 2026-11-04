@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile-time benchmark harness for zap and upstream zig.
+"""Compile-time benchmark harness for bs and upstream zig.
 
 Times Debug builds of fixed workloads with a chosen compiler binary and writes
 a Markdown report plus machine-readable JSON. See bench/README.md.
@@ -48,7 +48,7 @@ CORE_SCENARIOS = ["cold", "cold-local", "warm", "edit-root", "edit-lib"]
 
 MODES = {
     "build-exe": "plain `zig build-exe` command with -M/--dep module flags",
-    "zig-build": "`zig build` (`zap build`) of the same executable through upstream's build runner",
+    "zig-build": "`zig build` (`bs build`) of the same executable through upstream's build runner",
 }
 
 # Appended to the anchor line for each edit. It keeps the line count, so only
@@ -631,7 +631,7 @@ def render_markdown(report):
     m, c = report["machine"], report["compiler"]
     lines = [f"# Compile-time benchmark: {c.get('version') or c['path']}", ""]
     lines += [f"Generated {report['generated']} by `bench/bench.py` "
-              f"(zap {report['harness_commit'] or 'uncommitted'}).", ""]
+              f"(bs {report['harness_commit'] or 'uncommitted'}).", ""]
     lines += ["## Machine and compiler", ""]
     lines += [f"- Machine: {m.get('note') or ''} {m.get('cpu_model')}, {m['logical_cpus']} logical CPUs, "
               f"{m.get('mem_total_gib')} GiB RAM, {m['os']} {m['kernel']} {m['arch']}".replace("  ", " ")]
@@ -700,7 +700,7 @@ def render_markdown(report):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--compiler", default="zig", help="compiler binary to time (zig or zap; default: zig on PATH)")
+    ap.add_argument("--compiler", default="zig", help="compiler binary to time (zig or bs; default: zig on PATH)")
     ap.add_argument("--setup-zig", default="zig",
                     help="upstream zig 0.17.1 used to prepare workloads (fetch, generate); never timed")
     ap.add_argument("--workloads", default=",".join(WORKLOADS), help="comma-separated: " + ",".join(WORKLOADS))
@@ -716,7 +716,7 @@ def main():
     ap.add_argument("--out", default=None, help="output path without extension (default bench/results/<date>-<compiler>)")
     ap.add_argument("--machine-note", default="", help="free-form machine description for the report")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
-                    help="environment for every timed build, such as ZAP_CACHE_DONOR=off (repeatable)")
+                    help="environment for every timed build, such as BS_CACHE_DONOR=off (repeatable)")
     args = ap.parse_args()
     extra_env = dict(e.split("=", 1) for e in args.env)
 

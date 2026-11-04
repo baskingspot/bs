@@ -1,6 +1,6 @@
 //! exit: 0
 //! stdout: "2931\n10\n7\n3\n4\n4\n2\n4\n18446744073709551611\n5\n1\n2\n104\n255\n"
-//! Scalar replacement (docs/architecture.md, "Rewrite rules") splits the
+//! Scalar replacement (docs/slop/architecture.md, "Rewrite rules") splits the
 //! local structs below into one local per field. The values are chosen
 //! where a plausible wrong split differs: a copy that shares its fields'
 //! locals with the original, a store of a struct to memory it was loaded

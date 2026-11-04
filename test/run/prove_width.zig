@@ -1,6 +1,6 @@
 //! signal: ABRT
 //! stderr: "panic: integer overflow\n"
-//! Proving checks (docs/architecture.md, "Proving checks"): facts compare
+//! Proving checks (docs/slop/architecture.md, "Proving checks"): facts compare
 //! values, whatever their width. `@as(i16, x) < 130` bounds the `i8` `x`
 //! by 129, not by 130 read as an `i8` (-126), so `x + 1` keeps its check.
 const rt = @import("rt.zig");

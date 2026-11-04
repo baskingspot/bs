@@ -43,7 +43,7 @@ files: std.ArrayList(File) = .empty,
 /// Maps `"<module index>:<sub_path>"` to its file.
 file_map: std.StringHashMapUnmanaged(File.Index) = .empty,
 modules: std.ArrayList(Module) = .empty,
-/// The module whose tests `zap test` runs; `root` outside of tests.
+/// The module whose tests `bs test` runs; `root` outside of tests.
 main_module: Module.Index = .root,
 /// `Options.root_name`: what `displayName` calls `main_module`.
 root_name: []const u8 = "root",
@@ -62,7 +62,7 @@ any_error_tracing: bool = true,
 /// the main std and builtin. compiler_rt's `ssp_sub_path` is a root then
 /// too, for `__stack_chk_fail` and `__stack_chk_guard`.
 ubsan_rt: ?Module.Index = null,
-/// What `loadAll` and `loadFile` did, for `ZAP_FRONTEND_TIMING`.
+/// What `loadAll` and `loadFile` did, for `BS_FRONTEND_TIMING`.
 stats: Stats = .{},
 /// AstGen errors in files `loadFile` loaded, for the caller to report
 /// with its own.
@@ -186,7 +186,7 @@ pub const Stats = struct {
 };
 
 pub const Options = struct {
-    /// Root source file of the root module (the test runner under `zap test`).
+    /// Root source file of the root module (the test runner under `bs test`).
     root_src_path: []const u8,
     /// The root module's directory when it is not the root file's own:
     /// upstream roots translate-c, whose root file imports `../util.zig`,
@@ -194,12 +194,12 @@ pub const Options = struct {
     root_dir: ?[]const u8 = null,
     /// Directory holding the generated `builtin.zig`.
     builtin_dir: []const u8,
-    /// `zap test` only: root source file of the module under test.
+    /// `bs test` only: root source file of the module under test.
     main_src_path: ?[]const u8 = null,
     /// Whether `loadAll` loads std, which upstream always analyzes. Off only
     /// in tests that have no lib directory.
     load_std: bool = true,
-    /// The `-M` name of the root module, or under `zap test` of the module
+    /// The `-M` name of the root module, or under `bs test` of the module
     /// under test, which `--dep`s name it by; its `--dep`s; and the other
     /// modules.
     root_name: []const u8 = "root",
@@ -214,7 +214,7 @@ pub const Options = struct {
     optimize: std.lang.Optimize = .debug,
     /// With `-ffuzz` on an executable: the directory of the fuzzer's
     /// generated `builtin.zig`. The fuzzer (`<lib>/fuzzer.zig`) then joins
-    /// the compilation as a module family of its own (docs/architecture.md,
+    /// the compilation as a module family of its own (docs/slop/architecture.md,
     /// "Fuzzing").
     fuzzer_builtin_dir: ?[]const u8 = null,
     /// The executable links C objects: their runtimes join the
@@ -239,8 +239,8 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     errdefer fe.deinit();
     // The root module and the module under test are named by their roles,
     // not their `-M` name (`root_name`): cache keys name modules
-    // (`Zcu.fileKey`), and the root file of a `zap test` must not stand
-    // for the root module of a `zap build-exe`, which `@import("root")`
+    // (`Zcu.fileKey`), and the root file of a `bs test` must not stand
+    // for the root module of a `bs build-exe`, which `@import("root")`
     // finds. The names start with '=', which no `-M` name can hold, so no
     // other module's keys are theirs.
     if (options.root_dir) |dir| try fe.modules.append(gpa, .{
@@ -286,7 +286,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
                 const eq = std.mem.indexOfScalar(u8, spec, '=');
                 const name = if (eq) |e| spec[0..e] else spec;
                 const target = if (eq) |e| spec[e + 1 ..] else spec;
-                // By `-M` name: under `zap test` no `--dep` names the test
+                // By `-M` name: under `bs test` no `--dep` names the test
                 // runner.
                 const main: usize = @backingInt(f_fe.main_module);
                 const idx = if (std.mem.eql(u8, target, root_name)) main else for (f_fe.modules.items, 0..) |m, k| {
@@ -479,8 +479,8 @@ pub const CacheDirs = struct {
 /// else `ZIG_GLOBAL_CACHE_DIR`, else `$XDG_CACHE_HOME/zig` or
 /// `~/.cache/zig`; `--cache-dir`, else `ZIG_LOCAL_CACHE_DIR`, else the
 /// `.zig-cache` next to the nearest `build.zig` above the working directory,
-/// else (and always for `zig run`) the global cache. zap's files live in a
-/// `zap/` subdirectory of each, apart from upstream's.
+/// else (and always for `zig run`) the global cache. bs's files live in a
+/// `bs/` subdirectory of each, apart from upstream's.
 pub fn resolveCacheDirs(
     arena: Allocator,
     io: Io,
@@ -564,7 +564,7 @@ fn blobCache(fe: *const Frontend) ?*const CacheDir {
     return null;
 }
 
-/// Cache layout, in `<cache dir>/zap/zir/`:
+/// Cache layout, in `<cache dir>/bs/zir/`:
 /// - `<32 hex digits>`: the ZIR of one source text, named by `hashSource`.
 ///   Written once to a temporary file and linked into place; never changed
 ///   but for its mtime, which a build that maps it renews once a day, so
@@ -586,7 +586,7 @@ const CacheDir = struct {
     /// its mtime renewed when it is mapped.
     renew_before_ns: i96,
 
-    const sub_path = "zap" ++ std.fs.path.sep_str ++ "zir";
+    const sub_path = "bs" ++ std.fs.path.sep_str ++ "zir";
 
     /// Opens the cache in `path`, or warns and returns null if it cannot
     /// (a full disk, for one): the build goes on without it.
@@ -1008,7 +1008,7 @@ comptime {
 /// which took 5% of a cold build's CPU time. Also the content hash of the
 /// cache manifest's source inputs (`File.content_hash`).
 pub fn hashSource(src: []const u8) Hash {
-    const salt = comptime std.hash.Wyhash.hash(0, "zap zir " ++ builtin.zig_version_string);
+    const salt = comptime std.hash.Wyhash.hash(0, "bs zir " ++ builtin.zig_version_string);
     const lo = std.hash.Wyhash.hash(salt, src);
     const hi = std.hash.Wyhash.hash(salt ^ 0x9e3779b97f4a7c15, src);
     return @bitCast([2]u64{ lo, hi });
@@ -1289,7 +1289,7 @@ pub fn loadAll(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip) !bool {
         roots[n] = .{ .module = .std, .sub_path = fe.module(.std).root_file };
         n += 1;
     }
-    // `zap test` also analyzes the module under test.
+    // `bs test` also analyzes the module under test.
     if (fe.main_module != .root) {
         roots[n] = .{ .module = fe.main_module, .sub_path = fe.module(fe.main_module).root_file };
         n += 1;
@@ -1471,11 +1471,11 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
     return ok;
 }
 
-/// A file's key in the stat index, salted like `hashSource`: a zap built
+/// A file's key in the stat index, salted like `hashSource`: a bs built
 /// with another Zig release (another AstGen) keeps its own entries rather
 /// than taking this one's content hash for a file it hashes differently.
 fn pathHash(mod: *const Module, sub_path: []const u8) u64 {
-    var h: std.hash.Wyhash = .init(comptime std.hash.Wyhash.hash(0, "zap zir " ++ builtin.zig_version_string));
+    var h: std.hash.Wyhash = .init(comptime std.hash.Wyhash.hash(0, "bs zir " ++ builtin.zig_version_string));
     h.update(mod.abs_root_dir.?);
     h.update("/");
     h.update(sub_path);
@@ -1683,7 +1683,7 @@ fn fatalFile(path: []const u8, err: anyerror) noreturn {
     std.process.fatal("unable to load '{s}': {t}", .{ path, err });
 }
 
-/// Prints `stats` to stderr (`ZAP_FRONTEND_TIMING=1`).
+/// Prints `stats` to stderr (`BS_FRONTEND_TIMING=1`).
 pub fn printStats(fe: *const Frontend) void {
     const s = fe.stats;
     const ms = struct {
@@ -1864,7 +1864,7 @@ test "drops the ZIR of edited sources once no build maps it" {
     for (&hashes, sources) |*h, s| h.* = hashSource(s);
     var fe0 = try build(tmp.dir, base, global, "a", sources[0]);
     fe0.deinit();
-    var zir = try tmp.dir.openDir(io, "global/zap/zir", .{});
+    var zir = try tmp.dir.openDir(io, "global/bs/zir", .{});
     defer zir.close(io);
     // The edit marks the old ZIR as unused for two days.
     var fe1 = try build(tmp.dir, base, global, "a", sources[1]);

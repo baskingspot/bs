@@ -1,4 +1,4 @@
-//! A shared library that links glibc (`zap build-lib -dynamic -lc`):
+//! A shared library that links glibc (`bs build-lib -dynamic -lc`):
 //! Zig code using std's C allocator and glibc, with a C source
 //! (so_libc.c); so_libc_main.zig loads it.
 const std = @import("std");
