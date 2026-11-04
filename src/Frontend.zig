@@ -503,7 +503,8 @@ pub fn resolveCacheDirs(
 /// Trims the ZIR caches (`CacheDir.trim`). Best effort; `Incremental`
 /// runs it beside the link.
 pub fn trimCaches(fe: *const Frontend) void {
-    for (&fe.caches) |*c| if (c.*) |*cd| cd.trim(fe.gpa, fe.io) catch {};
+    const blobs = fe.blobCache() orelse return;
+    for (&fe.caches) |*c| if (c.*) |*cd| cd.trim(fe.gpa, fe.io, blobs) catch {};
 }
 
 pub fn enableCache(fe: *Frontend, dirs: CacheDirs) !void {
@@ -531,7 +532,7 @@ pub fn loadOldZir(fe: *const Frontend, index: File.Index, content_hash: Hash) Al
     const cd = fe.blobCache() orelse return null;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(fe.gpa);
-    const zir, const mapping, _ = cd.loadZir(fe.gpa, fe.io, content_hash, &buf) catch |err| switch (err) {
+    const zir, const mapping, _ = cd.loadZir(fe.gpa, fe.io, content_hash, &buf, false) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
@@ -629,7 +630,7 @@ const CacheDir = struct {
     /// whose index entry names deleted ZIR lowers the file again. In the
     /// global cache it deletes only the other files: the ZIR there is
     /// every project's, and goes with the store's packs (`Store.maintain`).
-    fn trim(cd: *const CacheDir, gpa: Allocator, io: Io) !void {
+    fn trim(cd: *const CacheDir, gpa: Allocator, io: Io, blobs: *const CacheDir) !void {
         const now = Io.Clock.real.now(io);
         if (cd.dir.statFile(io, "trim", .{})) |stat| {
             if (stat.mtime.durationTo(now).toNanoseconds() < std.time.ns_per_day) return;
@@ -637,16 +638,20 @@ const CacheDir = struct {
         try cd.dir.writeFile(io, .{ .sub_path = "trim", .data = "" });
         var named: std.AutoHashMapUnmanaged(Hash, void) = .empty;
         defer named.deinit(gpa);
-        if (!cd.global) {
+        {
             var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_bytes = &.{}, .global = false, .renew_before_ns = 0 };
             try index.loadIndex(gpa, io);
             defer gpa.free(index.index_bytes);
-            try named.ensureTotalCapacity(gpa, @intCast(index.index.len));
-            for (index.index) |e| named.putAssumeCapacity(e.content_hash, {});
+            cd.sweepSuperseded(gpa, io, blobs, index.index, &.{}, now) catch {};
+            if (!cd.global) {
+                try named.ensureTotalCapacity(gpa, @intCast(index.index.len));
+                for (index.index) |e| named.putAssumeCapacity(e.content_hash, {});
+            }
         }
         var it = cd.dir.iterate();
         while (try it.next(io)) |e| {
-            if (e.kind != .file or std.mem.eql(u8, e.name, "index") or std.mem.eql(u8, e.name, "trim")) continue;
+            if (e.kind != .file or std.mem.eql(u8, e.name, "index") or std.mem.eql(u8, e.name, "trim") or
+                std.mem.eql(u8, e.name, "superseded")) continue;
             var hash: Hash = undefined;
             if (e.name.len == 2 * hash.len) {
                 if (std.fmt.hexToBytes(&hash, e.name)) |_| {
@@ -675,12 +680,70 @@ const CacheDir = struct {
         return &cd.index[i];
     }
 
+    /// Deletes the ZIR of the sources that edits replaced, once no build
+    /// uses it, so that a file edited all day does not keep a copy per
+    /// edit in the global cache. `new` are the content hashes that this
+    /// build's index updates replaced; `index` is the index now, whose
+    /// sources stay. Each new one's ZIR file in `blobs` gets an mtime of
+    /// two days before `now`, which every build that maps it afterwards
+    /// renews (`loadZir`); it goes on the `superseded` list with `now`.
+    /// An earlier entry's file whose mark is still there an hour later
+    /// (`superseded_grace_ns`) is deleted. A worktree that still has that
+    /// source and has not built since lowers it again, which costs time,
+    /// not correctness. A renewed, missing or reindexed one leaves the list.
+    fn sweepSuperseded(cd: *const CacheDir, gpa: Allocator, io: Io, blobs: *const CacheDir, index: []const IndexEntry, new: []const Hash, now: Io.Timestamp) !void {
+        var named: std.AutoHashMapUnmanaged(Hash, void) = .empty;
+        defer named.deinit(gpa);
+        try named.ensureTotalCapacity(gpa, @intCast(index.len));
+        for (index) |e| named.putAssumeCapacity(e.content_hash, {});
+        const now_ns: i64 = @intCast(now.toNanoseconds());
+        const old_bytes = cd.dir.readFileAllocOptions(io, "superseded", gpa, .limited(1 << 24), .of(Superseded), null) catch |err| switch (err) {
+            error.FileNotFound => try gpa.alignedAlloc(u8, .of(Superseded), 0),
+            error.OutOfMemory => return error.OutOfMemory,
+            else => |e| return e,
+        };
+        defer gpa.free(old_bytes);
+        const old: []const Superseded = @ptrCast(old_bytes[0 .. old_bytes.len / @sizeOf(Superseded) * @sizeOf(Superseded)]);
+        var keep: std.ArrayList(Superseded) = .empty;
+        defer keep.deinit(gpa);
+        for (old) |e| {
+            if (named.contains(e.content_hash)) continue;
+            const name = std.fmt.bytesToHex(e.content_hash, .lower);
+            const stat = blobs.dir.statFile(io, &name, .{}) catch continue;
+            // Renewed since it was marked.
+            if (stat.mtime.toNanoseconds() >= e.at_ns - std.time.ns_per_day) continue;
+            if (now_ns - e.at_ns >= superseded_grace_ns) {
+                blobs.dir.deleteFile(io, &name) catch {};
+                continue;
+            }
+            try keep.append(gpa, e);
+        }
+        for (new) |h| {
+            if (named.contains(h)) continue;
+            const name = std.fmt.bytesToHex(h, .lower);
+            blobs.dir.setTimestamps(io, &name, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-2 * std.time.ns_per_day)) } }) catch continue;
+            try keep.append(gpa, .{ .content_hash = h, .at_ns = now_ns });
+        }
+        if (keep.items.len == old.len and new.len == 0) return;
+        if (keep.items.len == 0) {
+            cd.dir.deleteFile(io, "superseded") catch {};
+            return;
+        }
+        var af = try cd.dir.createFileAtomic(io, "superseded", .{ .replace = true });
+        defer af.deinit(io);
+        var w = af.file.writerStreaming(io, &.{});
+        w.interface.writeAll(@ptrCast(keep.items)) catch return w.err.?;
+        w.interface.flush() catch return w.err.?;
+        try af.replace(io);
+    }
+
     /// Writes the index merged with `updates` (sorted by `path_hash`, no
-    /// duplicates). Concurrent builds race benignly: the last rename wins and
-    /// the loser's entries are relearned by hashing.
-    fn writeIndex(cd: *const CacheDir, gpa: Allocator, io: Io, updates: []const IndexEntry) !void {
-        var merged: std.ArrayList(IndexEntry) = try .initCapacity(gpa, cd.index.len + updates.len);
-        defer merged.deinit(gpa);
+    /// duplicates) into `merged`, and appends to `superseded` the content
+    /// hashes that updates replaced with others. Concurrent builds race
+    /// benignly: the last rename wins and the loser's entries are relearned
+    /// by hashing.
+    fn writeIndex(cd: *const CacheDir, gpa: Allocator, io: Io, updates: []const IndexEntry, merged: *std.ArrayList(IndexEntry), superseded: *std.ArrayList(Hash)) !void {
+        try merged.ensureTotalCapacity(gpa, cd.index.len + updates.len);
         var i: usize = 0;
         var j: usize = 0;
         while (i < cd.index.len or j < updates.len) {
@@ -688,7 +751,10 @@ const CacheDir = struct {
                 merged.appendAssumeCapacity(cd.index[i]);
                 i += 1;
             } else {
-                if (i < cd.index.len and cd.index[i].path_hash == updates[j].path_hash) i += 1;
+                if (i < cd.index.len and cd.index[i].path_hash == updates[j].path_hash) {
+                    if (!std.mem.eql(u8, &cd.index[i].content_hash, &updates[j].content_hash)) try superseded.append(gpa, cd.index[i].content_hash);
+                    i += 1;
+                }
                 merged.appendAssumeCapacity(updates[j]);
                 j += 1;
             }
@@ -707,7 +773,10 @@ const CacheDir = struct {
     /// and summary are read into `buf` rather than through the mapping, so
     /// the frontend faults in no page of it; the returned summary's names
     /// point into `buf`.
-    fn loadZir(cd: *const CacheDir, gpa: Allocator, io: Io, hash: Hash, buf: *std.ArrayList(u8)) !struct { Zir, ?Io.File.MemoryMap, Summary } {
+    /// `renew`: renew the file's mtime if it is older than
+    /// `renew_before_ns`, as for every use but comparing an edited file's
+    /// old ZIR, which must not keep superseded ZIR alive (`sweepSuperseded`).
+    fn loadZir(cd: *const CacheDir, gpa: Allocator, io: Io, hash: Hash, buf: *std.ArrayList(u8), renew: bool) !struct { Zir, ?Io.File.MemoryMap, Summary } {
         const name = std.fmt.bytesToHex(hash, .lower);
         const f = try cd.dir.openFile(io, &name, .{});
         defer f.close(io);
@@ -715,7 +784,7 @@ const CacheDir = struct {
         const stat = try f.stat(io);
         const len = stat.size;
         if (layout.total != len) return error.CorruptCache;
-        if (stat.mtime.toNanoseconds() < cd.renew_before_ns) f.setTimestampsNow(io) catch {};
+        if (renew and stat.mtime.toNanoseconds() < cd.renew_before_ns) f.setTimestampsNow(io) catch {};
         var mm: Io.File.MemoryMap = try .create(io, f, .{
             .len = @intCast(len),
             .protection = .{ .read = true },
@@ -821,6 +890,17 @@ const CacheDir = struct {
 
 const index_magic = "ZAPZIX01".*;
 const blob_magic = "ZAPZIR01".*;
+
+/// A `superseded` list record (`CacheDir.sweepSuperseded`).
+const Superseded = extern struct {
+    content_hash: Hash,
+    /// When it was superseded, in real-clock nanoseconds.
+    at_ns: i64,
+    unused: u64 = 0,
+};
+
+/// How long superseded ZIR that no build mapped since stays.
+const superseded_grace_ns = std.time.ns_per_hour;
 
 const IndexHeader = extern struct {
     magic: [8]u8 = index_magic,
@@ -1367,8 +1447,17 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
                 return a.path_hash < b.path_hash;
             }
         }.lessThan);
-        cd.writeIndex(gpa, io, updates.items) catch |err| if (!fe.zir_save_failed.swap(true, .monotonic))
-            std.log.warn("unable to write ZIR cache index: {t}; not reporting further failures", .{err});
+        var merged: std.ArrayList(IndexEntry) = .empty;
+        defer merged.deinit(gpa);
+        var superseded: std.ArrayList(Hash) = .empty;
+        defer superseded.deinit(gpa);
+        cd.writeIndex(gpa, io, updates.items, &merged, &superseded) catch |err| {
+            if (!fe.zir_save_failed.swap(true, .monotonic))
+                std.log.warn("unable to write ZIR cache index: {t}; not reporting further failures", .{err});
+            continue;
+        };
+        // Best effort: what it misses goes with the store's packs.
+        if (superseded.items.len != 0) cd.sweepSuperseded(gpa, io, fe.blobCache().?, merged.items, superseded.items, Io.Clock.real.now(io)) catch {};
     }
 
     const end = Io.Clock.awake.now(io);
@@ -1412,7 +1501,7 @@ fn probeFile(fe: *Frontend, job: *Job, buf: *std.ArrayList(u8)) !union(enum) {
             else => return .miss,
         } };
     }
-    f.zir, f.mapping, const summary = blobs.loadZir(fe.gpa, fe.io, entry.content_hash, buf) catch |err| switch (err) {
+    f.zir, f.mapping, const summary = blobs.loadZir(fe.gpa, fe.io, entry.content_hash, buf, true) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .miss,
     };
@@ -1451,7 +1540,7 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
             .mtime = if (mtime >= l.start_ns - IndexEntry.racy_window_ns) IndexEntry.racy_mtime else mtime,
             .content_hash = f.content_hash,
         };
-        if (fe.blobCache().?.loadZir(gpa, io, f.content_hash, buf)) |loaded| {
+        if (fe.blobCache().?.loadZir(gpa, io, f.content_hash, buf, true)) |loaded| {
             f.zir, f.mapping, const summary = loaded;
             job.how = .content_hit;
             job.loaded = true;
@@ -1469,7 +1558,7 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
     if (cache != null) {
         const blobs = fe.blobCache().?;
         if (blobs.saveZir(gpa, io, f.content_hash, &zir, summary)) |_| {
-            if (blobs.loadZir(gpa, io, f.content_hash, buf)) |loaded| {
+            if (blobs.loadZir(gpa, io, f.content_hash, buf, true)) |loaded| {
                 f.zir, f.mapping, _ = loaded;
                 job.loaded = true;
                 return summary;
@@ -1722,4 +1811,76 @@ test "reuses cached ZIR, drops stale guessed imports, and reports errors in cach
     try std.testing.expectEqual(0, again.fe.stats.lowered);
     try std.testing.expectEqual(0, again.fe.stats.guessed);
     try std.testing.expectEqual(edit_errors, try again.errorCount());
+}
+
+test "drops the ZIR of edited sources once no build maps it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const t = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const old: Io.File.SetTimestamp = .{ .new = .fromNanoseconds(1_000_000_000 * std.time.ns_per_s) };
+    const sources = [_][]const u8{ "pub const x = 1;\n", "pub const x = 2;\n", "pub const x = 3;\n" };
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/main.zig", .data = sources[1] });
+    try tmp.dir.setTimestamps(io, "b/main.zig", .{ .modify_timestamp = old });
+    const base = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(base);
+    const global = try std.fs.path.join(gpa, &.{ base, "global" });
+    defer gpa.free(global);
+
+    // `a/main.zig` at `sources[i]`, built with its own local cache.
+    const build = struct {
+        fn build(dir: std.Io.Dir, b: []const u8, g: []const u8, sub: []const u8, src: ?[]const u8) !Frontend {
+            const path = try std.fmt.allocPrint(gpa, "{s}/main.zig", .{sub});
+            defer gpa.free(path);
+            if (src) |s| {
+                try dir.writeFile(io, .{ .sub_path = path, .data = s });
+                // Old enough that the index trusts it, and another stat per source.
+                try dir.setTimestamps(io, path, .{ .modify_timestamp = .{ .new = .fromNanoseconds((1_000_000_000 + @as(i96, s[14])) * std.time.ns_per_s) } });
+            }
+            const root = try std.fs.path.join(gpa, &.{ b, path });
+            defer gpa.free(root);
+            const local = try std.fs.path.join(gpa, &.{ b, sub, "local" });
+            defer gpa.free(local);
+            var fe: Frontend = try .init(gpa, io, "/nonexistent", .{ .root_src_path = root, .builtin_dir = "/nonexistent", .load_std = false });
+            errdefer fe.deinit();
+            try fe.enableCache(.{ .local = local, .global = g });
+            var errors: std.zig.ErrorBundle.Wip = try .init(gpa);
+            defer errors.deinit();
+            try t.expect(try fe.loadAll(&errors));
+            return fe;
+        }
+    }.build;
+    var hashes: [3]Hash = undefined;
+    for (&hashes, sources) |*h, s| h.* = hashSource(s);
+    var fe0 = try build(tmp.dir, base, global, "a", sources[0]);
+    fe0.deinit();
+    var zir = try tmp.dir.openDir(io, "global/zap/zir", .{});
+    defer zir.close(io);
+    // The edit marks the old ZIR as unused for two days.
+    var fe1 = try build(tmp.dir, base, global, "a", sources[1]);
+    defer fe1.deinit();
+    const now = Io.Clock.real.now(io);
+    const marked = try zir.statFile(io, &std.fmt.bytesToHex(hashes[0], .lower), .{});
+    try t.expect(marked.mtime.durationTo(now).toNanoseconds() > std.time.ns_per_day);
+    // A worktree with the next source maps its ZIR, then the source is
+    // superseded too: that renews it, so it stays; the first goes an hour
+    // after it was superseded.
+    var fe2 = try build(tmp.dir, base, global, "a", sources[2]);
+    defer fe2.deinit();
+    var other = try build(tmp.dir, base, global, "b", null);
+    defer other.deinit();
+    try t.expectEqual(1, other.stats.content_hits);
+    const cd = &fe2.caches[@backingInt(CacheKind.local)].?;
+    var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_bytes = &.{}, .global = false, .renew_before_ns = 0 };
+    try index.loadIndex(gpa, io);
+    defer gpa.free(index.index_bytes);
+    try cd.sweepSuperseded(gpa, io, fe2.blobCache().?, index.index, &.{}, now.addDuration(.fromNanoseconds(2 * std.time.ns_per_hour)));
+    try t.expectError(error.FileNotFound, zir.statFile(io, &std.fmt.bytesToHex(hashes[0], .lower), .{}));
+    _ = try zir.statFile(io, &std.fmt.bytesToHex(hashes[1], .lower), .{});
+    _ = try zir.statFile(io, &std.fmt.bytesToHex(hashes[2], .lower), .{});
+    // Both left the list: one deleted, one renewed.
+    try t.expectError(error.FileNotFound, cd.dir.statFile(io, "superseded", .{}));
 }

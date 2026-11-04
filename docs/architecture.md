@@ -57,6 +57,19 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
     by its mtime, or least recently used first past the limit. The
     store's maintenance runs daily and whenever its packs alone pass the
     limit, so a day's new ZIR can pass it until then.
+  - Superseded ZIR goes sooner (`CacheDir.sweepSuperseded`): when a build's
+    index update replaces a file's content hash, the old ZIR file's mtime
+    is set two days back and its hash goes on that cache's `superseded`
+    list. Any build that maps it afterwards renews the mtime, as for any
+    use. A later index update (or the daily trim) deletes a listed file
+    whose mark is still there an hour after it was superseded, and drops
+    renewed, missing and reindexed ones from the list. A worktree that
+    still has that source but did not build within the hour lowers it
+    again: a cost, not a wrong result. Comparing an edited file's old ZIR
+    with its new (`loadOldZir`, the seeds) does not renew it. The marked
+    mtime also makes superseded ZIR the first to go past the size limit.
+  - `superseded` (both caches): `Superseded` records (content hash,
+    when), replaced whole.
 - A file is first *probed*: stat it and, if the index matches, read the
   blob's header with one `pread` and map the rest without touching it. A
   probe miss reads and hashes the source; a known content hash is mapped,
