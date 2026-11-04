@@ -267,6 +267,13 @@ pub const Reloc = extern struct {
         x86_64_dtpmod64_sym,
         x86_64_dtpoff64_sym,
         x86_64_tlsdesc_sym,
+        /// A shared object's 64-bit address of its exported S, which an
+        /// executable or an earlier library may preempt: the loader writes
+        /// S's address plus the field's own contents, a little-endian i64
+        /// (ELF R_X86_64_64 against S, addend the field). S + A must be the
+        /// address of an export with default visibility. In data, GOT
+        /// slots, and the slots PLT stubs jump through.
+        x86_64_abs64_sym,
     };
 };
 

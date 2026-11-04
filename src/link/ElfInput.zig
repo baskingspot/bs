@@ -1051,6 +1051,18 @@ fn Converter(comptime Ctx: type) type {
                 else => {},
             };
             if (t.import) return c.importReloc(index, relas, k, bytes, copy);
+            // A shared object reaches its exports with default visibility
+            // through the loader, so that a definition in the executable
+            // or an earlier library preempts them, as upstream's: -fPIC
+            // code addresses them through the GOT and calls them through
+            // the PLT for that. Others bind here.
+            if (c.in.shared) switch (@as(R, @fromBackingInt(@intCast(ty)))) {
+                .@"64", .PLT32, .GOTPCREL, .GOTPCRELX, .REX_GOTPCRELX => if (try c.preemptible(r.r_sym())) {
+                    try c.preemptReloc(index, r, t, bytes, copy);
+                    return 0;
+                },
+                else => {},
+            };
             switch (@as(R, @fromBackingInt(@intCast(ty)))) {
                 .@"64" => try c.add(off, .x86_64_abs64, t, r.r_addend),
                 .PC32, .PLT32 => try c.add(off, .x86_64_pc32, t, r.r_addend),
@@ -1082,7 +1094,7 @@ fn Converter(comptime Ctx: type) type {
                             return 0;
                         }
                     }
-                    try c.add(off, .x86_64_pc32, .{ .key = try c.slot(t), .offset = 0 }, r.r_addend);
+                    try c.add(off, .x86_64_pc32, .{ .key = try c.slot(t, .x86_64_abs64), .offset = 0 }, r.r_addend);
                 },
                 // Every thread-local of an executable is its own: the
                 // dynamic models relax to local exec, as ld relaxes them.
@@ -1174,11 +1186,11 @@ fn Converter(comptime Ctx: type) type {
             const ty: R = @fromBackingInt(@intCast(r.r_type()));
             switch (ty) {
                 .@"64" => try c.add(off, .x86_64_abs64, t, r.r_addend),
-                .GOTPCREL, .GOTPCRELX, .REX_GOTPCRELX => try c.add(off, .x86_64_pc32, .{ .key = try c.slot(t), .offset = 0 }, r.r_addend),
+                .GOTPCREL, .GOTPCRELX, .REX_GOTPCRELX => try c.add(off, .x86_64_pc32, .{ .key = try c.slot(t, .x86_64_abs64), .offset = 0 }, r.r_addend),
                 .PLT32, .PC32 => {
                     const op = if (off >= 1) bytes[@intCast(off - 1)] else 0;
                     if (ty == .PLT32 or op == 0xe8 or op == 0xe9) {
-                        try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t), .offset = 0 }, r.r_addend);
+                        try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t, .x86_64_abs64), .offset = 0 }, r.r_addend);
                         return 0;
                     }
                     try c.add(off, .x86_64_pc32, .{ .key = try c.copied(index, sym) orelse return 0, .offset = 0 }, r.r_addend);
@@ -1215,11 +1227,12 @@ fn Converter(comptime Ctx: type) type {
             return null;
         }
 
-        /// A stub that jumps through `t`'s slot (`jmp [rip + slot]`),
-        /// content-addressed, so all calls to one import share it.
-        fn stub(c: *C, t: Target) Allocator.Error!SymbolKey {
+        /// A stub that jumps through `t`'s slot (`jmp [rip + slot]`, the
+        /// slot's relocation of `kind`), content-addressed, so all calls
+        /// to one target share it.
+        fn stub(c: *C, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
-            const targets = try arena.dupe(SymbolKey, &.{try c.slot(t)});
+            const targets = try arena.dupe(SymbolKey, &.{try c.slot(t, kind)});
             const relocs = try arena.dupe(Atom.Reloc, &.{.init(2, .x86_64_pc32, 0, -4)});
             const code: []const u8 = &.{ 0xff, 0x25, 0, 0, 0, 0 };
             const key: SymbolKey = .fromContents(.text, .@"8", code, targets, relocs);
@@ -1241,17 +1254,37 @@ fn Converter(comptime Ctx: type) type {
             return true;
         }
 
-        /// Whether symbol `s`, a thread-local the shared object defines,
-        /// is one it exports with default visibility
-        /// (`Inputs.dynamicExports`), which an executable may preempt.
+        /// Whether symbol `s`, which the shared object defines, is one it
+        /// exports with default visibility (`Inputs.dynamicExports`),
+        /// which an executable may preempt. Indirect functions and the Zig
+        /// code's exports bind locally.
         fn preemptible(c: *C, s: u32) !bool {
             const sym = c.o.syms[s];
             if (s < c.o.first_global or sym.st_bind() == elf.STB_LOCAL) return false;
             const name = c.o.symName(sym);
             if (try c.ctx.zigExport(name) != null) return false;
-            const d = c.in.defs.get(name) orelse return false;
+            const d = c.in.defs.get(name) orelse return c.in.commons.contains(name);
+            const def = c.in.objects.items[d.object].syms[d.sym];
             // STV_DEFAULT 0.
-            return c.in.objects.items[d.object].syms[d.sym].st_other & 3 == 0;
+            return def.st_other & 3 == 0 and def.st_type() != elf.STT_GNU_IFUNC;
+        }
+
+        /// Converts relocation `r` against `t`, an export another module
+        /// may preempt (`preemptible`): an address in data is the
+        /// loader's, against the export, with the relocation's addend in
+        /// the field; a GOT load reads a slot the loader fills; a call
+        /// jumps through such a slot.
+        fn preemptReloc(c: *C, index: u32, r: elf.Elf64_Rela, t: Target, bytes: []const u8, copy: *?[]u8) !void {
+            const off = r.r_offset;
+            switch (@as(elf.R_X86_64, @fromBackingInt(@intCast(r.r_type())))) {
+                .@"64" => {
+                    if (off + 8 > bytes.len) return c.unsupported(index, r.r_type());
+                    std.mem.writeInt(i64, (try c.writable(bytes, copy))[@intCast(off)..][0..8], r.r_addend, .little);
+                    try c.add(off, .x86_64_abs64_sym, t, 0);
+                },
+                .PLT32 => try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t, .x86_64_abs64_sym), .offset = 0 }, r.r_addend),
+                else => try c.add(off, .x86_64_pc32, .{ .key = try c.slot(t, .x86_64_abs64_sym), .offset = 0 }, r.r_addend),
+            }
         }
 
         /// A shared object's 16-byte pair for its thread-local `t`, which
@@ -1305,15 +1338,16 @@ fn Converter(comptime Ctx: type) type {
 
         /// An 8-byte slot holding `t`'s address, for GOT-relative code that
         /// cannot be relaxed: content-addressed, so references to one
-        /// target share it.
-        fn slot(c: *C, t: Target) Allocator.Error!SymbolKey {
+        /// target share it. `kind` is `.x86_64_abs64`, or
+        /// `.x86_64_abs64_sym` for an export the loader may preempt.
+        fn slot(c: *C, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
             const arena = c.in.arena;
             const targets = try arena.dupe(SymbolKey, &.{t.key});
             const off = std.math.cast(i32, t.offset) orelse {
                 try c.fail("{s}: GOT entry offset out of range", .{c.o.path});
                 return t.key;
             };
-            const relocs = try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, off)});
+            const relocs = try arena.dupe(Atom.Reloc, &.{.init(0, kind, 0, off)});
             const zeros: []const u8 = &@as([8]u8, @splat(0));
             const key: SymbolKey = .fromContents(.rodata, .@"8", zeros, targets, relocs);
             try c.atoms.append(arena, .{ .key = key, .name = "", .section = .rodata, .alignment = .@"8", .bytes = zeros, .targets = targets, .relocs = relocs });

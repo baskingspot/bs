@@ -7012,7 +7012,19 @@ libraries as inputs. To be agreed with that thread.
   `x86_64_tlsdesc_sym`: DTPMOD64/DTPOFF64 or TLSDESC against the
   .dynsym symbol), so an executable that defines the same thread-local
   preempts it (test/link_input/so_preempt.c); hidden, protected and
-  static ones bind the library's own. Refused with a diagnostic: non-PIC relocations
+  static ones bind the library's own. The objects' functions and data
+  of default visibility bind through their exports the same way (lld's
+  default, no -Bsymbolic; 2026-11-04, fmt's exceptions, whose typeinfo
+  the executable defines too): a PLT32 call goes through a stub and a
+  slot, a GOT load reads a slot, unrelaxed, and an R_X86_64_64 in data
+  stays one against the symbol (`x86_64_abs64_sym`, the addend in the
+  field), so an executable's definition wins
+  (test/link_input/so_interpose.c). Zig exports and indirect functions
+  bind locally, as do PC32 references, which lld refuses against such
+  symbols. The relocation names the export at the target's address, so
+  of two names at one address (C++'s C1/C2 constructors, `alias`) it may
+  name the other one; only an executable that defines one of them and
+  not the other can tell. Refused with a diagnostic: non-PIC relocations
   (R_X86_64_32, 32S, TPOFF32, GOTTPOFF), Clang's `_TLS_MODULE_BASE_`
   descriptors, and another module's thread-locals. Upstream also
   exports ubsan_rt's handlers (weak); bs does not. Shared libraries

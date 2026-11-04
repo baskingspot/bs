@@ -1585,7 +1585,7 @@ fn LinkOf(comptime Input: type) type {
         plt_end: u64 = 0,
         /// In a shared object: the .dynsym index of each export with
         /// default visibility, by address, for relocations against
-        /// exported thread-locals (`tlsSymType`).
+        /// its own exports (`symType`).
         export_syms: std.AutoHashMapUnmanaged(u64, u32) = .empty,
         rela_off: u64 = 0,
         /// With numbered symbols, where each is (see `unset`).
@@ -1962,6 +1962,8 @@ fn LinkOf(comptime Input: type) type {
                 // A shared object's module ID, for `__tls_get_addr`, and
                 // its TLS descriptors.
                 .x86_64_dtpmod64, .x86_64_tlsdesc, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_tlsdesc_sym => return l.exe_imports == null,
+                // A shared object's references to its own exports.
+                .x86_64_abs64_sym => return l.exe_imports == null,
                 // Every image's indirect functions.
                 .x86_64_irelative => return true,
                 else => return false,
@@ -2272,11 +2274,12 @@ fn LinkOf(comptime Input: type) type {
                         if (place.section == @backingInt(Atom.Section.text)) return l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name, .target = a.targets[r.info.target] });
                         const t = res[r.info.target];
                         const v = t +% @as(u64, @bitCast(@as(i64, r.addend)));
-                        const rec: elf.Elf64.Rela = if (tlsSymType(r.info.kind)) |ty| rec: {
+                        const rec: elf.Elf64.Rela = if (symType(r.info.kind)) |ty| rec: {
                             // Against the export, which the loader may
                             // bind to another module's definition.
                             const sym = l.export_syms.get(v) orelse return l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name, .target = a.targets[r.info.target] });
-                            break :rec .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(ty), .sym = sym }, .addend = 0 };
+                            const addend = if (ty == .@"64") std.mem.readInt(i64, a.bytes[r.offset..][0..8], .little) else 0;
+                            break :rec .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(ty), .sym = sym }, .addend = addend };
                         } else if (r.info.kind == .x86_64_dtpmod64)
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.DTPMOD64), .sym = 0 }, .addend = 0 }
                         else if (r.info.kind == .x86_64_tlsdesc)
@@ -2548,7 +2551,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
             .x86_64_tpoff32 => try tpoff32(a, r, dst, s, tls, diag),
             .x86_64_tpoff64 => try tpoff64(a, r, dst, s, tls, diag),
             // The loader's (`needsDynamicReloc`).
-            .x86_64_dtpmod64, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym => @memset(try relocField(a, dst, r.offset, 8, diag), 0),
+            .x86_64_dtpmod64, .x86_64_dtpmod64_sym, .x86_64_dtpoff64_sym, .x86_64_abs64_sym => @memset(try relocField(a, dst, r.offset, 8, diag), 0),
             .x86_64_tlsdesc_sym => @memset(try relocField(a, dst, r.offset, 16, diag), 0),
             .x86_64_tlsdesc => {
                 if (s < tls.start or s >= tls.end) return invalidReloc(a, diag);
@@ -2608,19 +2611,20 @@ noinline fn tpoff64(a: *const Atom, r: Atom.Reloc, dst: []u8, s: u64, tls: *cons
 
 /// Whether `a` holds an absolute address, which a position-independent
 /// image's loader must write.
-/// The dynamic relocation type of a relocation against an exported
-/// thread-local, or null for another kind.
-fn tlsSymType(kind: Atom.Reloc.Kind) ?elf.R_X86_64 {
+/// The dynamic relocation type of a relocation against an export, or null
+/// for another kind.
+fn symType(kind: Atom.Reloc.Kind) ?elf.R_X86_64 {
     return switch (kind) {
         .x86_64_dtpmod64_sym => .DTPMOD64,
         .x86_64_dtpoff64_sym => .DTPOFF64,
         .x86_64_tlsdesc_sym => .TLSDESC,
+        .x86_64_abs64_sym => .@"64",
         else => null,
     };
 }
 
 fn hasAbs(a: *const Atom) bool {
-    for (a.relocs) |r| if (r.info.kind == .x86_64_abs64) return true;
+    for (a.relocs) |r| if (r.info.kind == .x86_64_abs64 or r.info.kind == .x86_64_abs64_sym) return true;
     return false;
 }
 
