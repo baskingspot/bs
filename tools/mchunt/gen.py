@@ -225,6 +225,13 @@ class Gen:
             self.enums.append(self.make_enum(i))
         for i in range(r.randint(1, 4)):
             self.structs.append(self.make_struct(i))
+        # An .auto struct over 16 bytes (passed by reference) for s_byref.
+        big = self.make_struct(len(self.structs))
+        big.layout = "auto"
+        big.fields = [(f, t) for f, t in big.fields if not isinstance(t, Struct) or t.layout != "packed"]
+        big.fields.append((f"f{len(big.fields) + 9}", Array(self.pick([U64, Int(True, 64), U32]), self.r.randint(3, 5))))
+        self.big = big
+        self.structs.append(big)
 
     def make_enum(self, i):
         n = self.r.randint(2, 6)
@@ -1859,7 +1866,22 @@ class Gen:
             return self.s_live(ctx)
         kind, name, t, g = self.pick(self.byref)
         if kind == "bv":
-            self.sink(ctx, f"{name}({g})", U64)
+            # The argument is the global the callee writes, or a constant.
+            arg = g if self.chance(0.75) else ("KB" if t is self.big and self.chance(0.5) else self.global_init(t))
+            self.sink(ctx, f"{name}({arg})", U64)
+            return
+        if kind == "fw":
+            self.sink(ctx, f"{name}({g}, {self.r.randint(0, 3)})", U64)
+            return
+        if kind == "many":
+            big = self.big.name()
+            locs = [p for p in self.paths(ctx, lambda x: x.name() == big, depth=1)]
+            aggs = ["gB", "KB", f"@as({big}, {self.global_init(self.big)})"] + \
+                   [self.render_path(ctx, p[0]) for p in locs]
+            ints = [self.int_expr(ctx, pt, 1) for pt in name[1]]
+            a = [self.pick(["gB", self.pick(aggs)]) for _ in range(3)]
+            args = [ints[0], ints[1], a[0], ints[2], ints[3], ints[4], a[1], ints[5], ints[6], ints[7], a[2]]
+            self.sink(ctx, f"{name[0]}({', '.join(args)})", U64)
             return
         locs = [p for p in self.paths(ctx, lambda x: x.name() == t.name(), writable=True, depth=1)
                 if not self.in_packed(p[0])]
@@ -1898,6 +1920,28 @@ class Gen:
             out.append(f"    return {digest('s', t)};")
             out.append("}")
             self.byref.append(("bv", name, t, g.name))
+        big, bt = self.big, self.big.name()
+        if any(k == "bv" and g_ == "gB" for k, _, _, g_ in self.byref):
+            # Forwarded: the by-reference argument passes on down a chain,
+            # and the last callee writes where it came from.
+            out.append(f"fn fwB(s: {bt}, n: u8) u64 {{")
+            out.append(f"    if (n == 0) return bv_gB(s);")
+            out.append(f"    return fwB(s, n - 1) *% 3 +% ({digest('s', big)});")
+            out.append("}")
+            self.byref.append(("fw", "fwB", big, "gB"))
+        # More arguments than there are argument registers.
+        its = [U64, U32, Int(True, 16), Int(False, 8), U64, Int(False, 16), Int(True, 32), U64]
+        e, et = self.pick(self.leaves("gB", big))
+        p_ = [f"mb{j}: {t.name()}" for j, t in enumerate(its)]
+        ps = ", ".join(p_[:2] + [f"mbs1: {bt}"] + p_[2:5] + [f"mbs2: {bt}"] + p_[5:] + [f"mbs3: {bt}"])
+        out.append(f"fn manyB({ps}) u64 {{")
+        out.append(f"    const d = ({digest('mbs1', big)}) ^ (({digest('mbs2', big)}) *% 3) ^ (({digest('mbs3', big)}) *% 5);")
+        out.append(f"    {e} +%= {self.lit(et)};")
+        out.append(f"    mix(d);")
+        sums = " +% ".join(self.to_u64(f"mb{j}", t) for j, t in enumerate(its))
+        out.append(f"    return (d *% 7) ^ ({digest('mbs1', big)}) ^ ({digest('mbs3', big)}) ^ ({sums});")
+        out.append("}")
+        self.byref.append(("many", ("manyB", its), big, None))
         tys = list(self.structs) + [Array(self.rand_int_type(), self.r.randint(2, 4))]
         for i, t in enumerate(tys):
             lv = self.leaves("r", t)
@@ -2481,6 +2525,13 @@ class Gen:
             v.used = True
             self.globals.append(v)
             out.append(f"var g{i}: {t.name()} = {self.global_init(t)};")
+        # A global of the big struct, and a comptime constant of it.
+        v = Var("gB", self.big, "global")
+        self.rt_names.add("gB")
+        v.used = True
+        self.globals.append(v)
+        out.append(f"var gB: {self.big.name()} = {self.global_init(self.big)};")
+        out.append(f"const KB: {self.big.name()} = {self.global_init(self.big)};")
         for i in range(self.r.randint(0, 3)):
             t = self.rand_int_type()
             v = Var(f"K{i}", t, "cglobal", ro=True, ct=True)

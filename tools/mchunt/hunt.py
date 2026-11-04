@@ -84,6 +84,13 @@ def signature(cls, bad, up, res):
     return f"{cls}|{','.join(bad)}|{up.kind()}|{first.kind()}"
 
 
+def worker_init(boost, ref_env):
+    """Settings a fork-server worker does not inherit."""
+    gen.BOOST.update(boost)
+    if ref_env:
+        H.set_ref_env(ref_env)
+
+
 def check(seed, tools, size, branch=None, base=None, text=None):
     """Runs one seed. Returns a small record; saves findings. For a
     branch campaign, `base` is bs from origin/main: a finding is run
@@ -421,8 +428,14 @@ def main():
     if args.follow:
         threading.Thread(target=follower, daemon=True).start()
 
-    hunt = cf.ProcessPoolExecutor(args.jobs)
-    red = cf.ProcessPoolExecutor(args.reducers)
+    # Workers come from a fork server: a worker forked from this process
+    # would inherit the pipe of whatever subprocess the follower thread
+    # is running, and the follower would never see that pipe close.
+    import multiprocessing as mp
+    ctx = mp.get_context("forkserver")
+    init = (worker_init, (dict(gen.BOOST), H.ORACLE.env if H.ORACLE.kind == "bs" else None))
+    hunt = cf.ProcessPoolExecutor(args.jobs, mp_context=ctx, initializer=init[0], initargs=init[1])
+    red = cf.ProcessPoolExecutor(args.reducers, mp_context=ctx, initializer=init[0], initargs=init[1])
     pending = set()
     reductions = set()
     last = time.time()
