@@ -1003,14 +1003,17 @@ comptime {
     if (data_has_safety_tag) assert(@sizeOf(HackDataLayout) == @sizeOf(Zir.Inst.Data));
 }
 
-/// Names cached ZIR: two seeded Wyhash passes, salted with the Zig version
-/// whose AstGen produced it. Not cryptographic; twice as fast as Blake3,
-/// which took 5% of a cold build's CPU time. Also the content hash of the
-/// cache manifest's source inputs (`File.content_hash`).
+/// The seed of the hashes that name cached ZIR and index it by path: the
+/// Zig version whose AstGen produced it.
+const zir_salt = std.hash.Wyhash.hash(0, "bs zir " ++ builtin.zig_version_string);
+
+/// Names cached ZIR: two seeded Wyhash passes, salted with `zir_salt`. Not
+/// cryptographic; twice as fast as Blake3, which took 5% of a cold build's
+/// CPU time. Also the content hash of the cache manifest's source inputs
+/// (`File.content_hash`).
 pub fn hashSource(src: []const u8) Hash {
-    const salt = comptime std.hash.Wyhash.hash(0, "bs zir " ++ builtin.zig_version_string);
-    const lo = std.hash.Wyhash.hash(salt, src);
-    const hi = std.hash.Wyhash.hash(salt ^ 0x9e3779b97f4a7c15, src);
+    const lo = std.hash.Wyhash.hash(zir_salt, src);
+    const hi = std.hash.Wyhash.hash(zir_salt ^ 0x9e3779b97f4a7c15, src);
     return @bitCast([2]u64{ lo, hi });
 }
 
@@ -1471,11 +1474,11 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
     return ok;
 }
 
-/// A file's key in the stat index, salted like `hashSource`: a bs built
+/// A file's key in the stat index, salted with `zir_salt`: a bs built
 /// with another Zig release (another AstGen) keeps its own entries rather
 /// than taking this one's content hash for a file it hashes differently.
 fn pathHash(mod: *const Module, sub_path: []const u8) u64 {
-    var h: std.hash.Wyhash = .init(comptime std.hash.Wyhash.hash(0, "bs zir " ++ builtin.zig_version_string));
+    var h: std.hash.Wyhash = .init(zir_salt);
     h.update(mod.abs_root_dir.?);
     h.update("/");
     h.update(sub_path);
