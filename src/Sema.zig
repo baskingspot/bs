@@ -2371,15 +2371,17 @@ fn addSafetyCheck(sema: *Sema, block: *Block, ok: Ref, id: PanicId, lhs: Ref, rh
     _ = try sema.addInst(&ok_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
     var inner = block.child();
     defer inner.deinitInsts();
-    try sema.addCondBr(&inner, ok, ok_block.instructions.items, fail_block.instructions.items);
+    try sema.addCondBr(&inner, ok, ok_block.instructions.items, fail_block.instructions.items, .{});
     const payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(inner.instructions.items.len) });
     try sema.appendBody(inner.instructions.items);
     sema.ir_insts.items(.data)[@backingInt(block_inst)].ty_pl.payload = payload;
     try block.instructions.append(sema.gpa, block_inst);
 }
 
-fn addCondBr(sema: *Sema, block: *Block, cond: Ref, then_body: []const Ir.Inst.Index, else_body: []const Ir.Inst.Index) !void {
-    const payload = try sema.addExtra(Ir.CondBr{ .then_body_len = @intCast(then_body.len), .else_body_len = @intCast(else_body.len) });
+/// `cover`: the arms of a branch the user wrote, which `-ffuzz` makes
+/// coverage points; `.{}` for a branch Sema adds itself.
+fn addCondBr(sema: *Sema, block: *Block, cond: Ref, then_body: []const Ir.Inst.Index, else_body: []const Ir.Inst.Index, cover: Ir.CondBr.Cover) !void {
+    const payload = try sema.addExtra(Ir.CondBr{ .then_body_len = @intCast(then_body.len), .else_body_len = @intCast(else_body.len), .cover = cover });
     try sema.appendBody(then_body);
     try sema.appendBody(else_body);
     _ = try sema.addInst(block, .{ .tag = .cond_br, .data = .{ .pl_op = .{ .operand = cond, .payload = payload } } });
@@ -3215,7 +3217,7 @@ fn zirCondbr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) CompileError!?[]
     var else_block = parent.condChild();
     defer else_block.deinitInsts();
     try sema.analyzeBodyInner(&else_block, else_body);
-    try sema.addCondBr(parent, cond, then_block.instructions.items, else_block.instructions.items);
+    try sema.addCondBr(parent, cond, then_block.instructions.items, else_block.instructions.items, .both);
     return null;
 }
 
@@ -3343,7 +3345,7 @@ fn addIfElse(sema: *Sema, block: *Block, block_inst: Ir.Inst.Index, cond: Ref, t
     for ([_]*Block{ then, else_ }) |b| _ = try sema.addInst(b, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
     var inner = block.child();
     defer inner.deinitInsts();
-    try sema.addCondBr(&inner, cond, then.instructions.items, else_.instructions.items);
+    try sema.addCondBr(&inner, cond, then.instructions.items, else_.instructions.items, .{});
     try sema.addBlock(block, block_inst, .void_type, inner.instructions.items);
 }
 
@@ -8117,7 +8119,7 @@ fn select(sema: *Sema, block: *Block, ty: Index, cond: Ref, a: Ref, b: Ref) Comp
     _ = try sema.addInst(&else_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = b } } });
     var inner = block.child();
     defer inner.deinitInsts();
-    try sema.addCondBr(&inner, cond, then_block.instructions.items, else_block.instructions.items);
+    try sema.addCondBr(&inner, cond, then_block.instructions.items, else_block.instructions.items, .{});
     try sema.addBlock(block, block_inst, ty, inner.instructions.items);
     return block_inst.toRef();
 }
@@ -9530,9 +9532,9 @@ fn zirBoolBr(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_or: bool) Com
     var inner = parent.child();
     defer inner.deinitInsts();
     if (is_or) {
-        try sema.addCondBr(&inner, lhs, short_block.instructions.items, rhs_block.instructions.items);
+        try sema.addCondBr(&inner, lhs, short_block.instructions.items, rhs_block.instructions.items, .both);
     } else {
-        try sema.addCondBr(&inner, lhs, rhs_block.instructions.items, short_block.instructions.items);
+        try sema.addCondBr(&inner, lhs, rhs_block.instructions.items, short_block.instructions.items, .both);
     }
     try sema.addBlock(parent, block_inst, .bool_type, inner.instructions.items);
     // `x and false` is false and `x or true` is true whatever `x`, as
@@ -12982,7 +12984,7 @@ fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_ptr: bool) Compi
     try sema.analyzeBodyInner(&err_block, body);
     var inner = parent.child();
     defer inner.deinitInsts();
-    try sema.addCondBr(&inner, is_non_err, ok_block.instructions.items, err_block.instructions.items);
+    try sema.addCondBr(&inner, is_non_err, ok_block.instructions.items, err_block.instructions.items, .{ .@"else" = true });
     try sema.addBlock(parent, block_inst, .void_type, inner.instructions.items);
     if (is_ptr) {
         // As upstream's runtime `try_ptr`, the result keeps the operand
@@ -13083,7 +13085,7 @@ fn zirSwitchBlockErrUnion(sema: *Sema, parent: *Block, inst: Zir.Inst.Index) Com
         const chosen = if (v == .bool_true) &then_block else &else_block;
         try outer.instructions.appendSlice(gpa, chosen.instructions.items);
     } else {
-        try sema.addCondBr(&outer, cond, then_block.instructions.items, else_block.instructions.items);
+        try sema.addCondBr(&outer, cond, then_block.instructions.items, else_block.instructions.items, .both);
     }
     return sema.resolveBlock(parent, src, &outer, &label.merges);
 }
@@ -13729,7 +13731,7 @@ fn peerUnionCapture(sema: *Sema, block: *Block, src: Src, items: []const Index, 
         const val = try sema.addStructField(&then, .struct_field_val, info.field_types[fields[k]], operand, fields[k]);
         const coerced = try sema.coerce(&then, peer, val, src);
         _ = try sema.addInst(&then, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = coerced } } });
-        try sema.addCondBr(&b, eq, then.instructions.items, chain);
+        try sema.addCondBr(&b, eq, then.instructions.items, chain, .{});
         chain = try sema.arena.dupe(Ir.Inst.Index, b.instructions.items);
     }
     try sema.addBlock(block, block_inst, peer, chain);
@@ -13807,7 +13809,7 @@ fn switchAsCondBrs(sema: *Sema, block: *Block, src: Src, cases: []const SwitchCa
     var else_block = block.condChild();
     defer else_block.deinitInsts();
     try sema.switchAsCondBrs(&else_block, src, cases[1..], else_case, cond_operand, operand, capture_inst, switch_inst);
-    try sema.addCondBr(block, cond, then_block.instructions.items, else_block.instructions.items);
+    try sema.addCondBr(block, cond, then_block.instructions.items, else_block.instructions.items, .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -17658,7 +17660,7 @@ fn vectorMapLoop(sema: *Sema, block: *Block, src: Src, len: u32, result_ty: Inde
     var else_block = block.child();
     defer else_block.deinitInsts();
     _ = try sema.addInst(&else_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
-    try sema.addCondBr(&loop_block, in_range, then_block.instructions.items, else_block.instructions.items);
+    try sema.addCondBr(&loop_block, in_range, then_block.instructions.items, else_block.instructions.items, .{});
 
     const loop_payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(loop_block.instructions.items.len) });
     try sema.appendBody(loop_block.instructions.items);
@@ -17869,7 +17871,7 @@ fn reduceLoop(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand: 
     var else_block = block.child();
     defer else_block.deinitInsts();
     _ = try sema.addInst(&else_block, .{ .tag = .br, .data = .{ .br = .{ .block_inst = block_inst, .operand = .void_value } } });
-    try sema.addCondBr(&loop_block, in_range, then_block.instructions.items, else_block.instructions.items);
+    try sema.addCondBr(&loop_block, in_range, then_block.instructions.items, else_block.instructions.items, .{});
 
     const loop_payload = try sema.addExtra(Ir.Block{ .body_len = @intCast(loop_block.instructions.items.len) });
     try sema.appendBody(loop_block.instructions.items);

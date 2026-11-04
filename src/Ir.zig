@@ -417,6 +417,18 @@ pub const Block = struct {
 pub const CondBr = struct {
     then_body_len: u32,
     else_body_len: u32,
+    cover: Cover,
+
+    /// Which arms `-ffuzz` makes coverage points (docs/architecture.md,
+    /// "Fuzzing"): those of branches the user wrote, as upstream's
+    /// `then_cov`/`else_cov`; none for branches Sema adds itself.
+    pub const Cover = packed struct(u32) {
+        then: bool = false,
+        @"else": bool = false,
+        _: u30 = 0,
+
+        pub const both: Cover = .{ .then = true, .@"else" = true };
+    };
 };
 
 /// Trailing: for each case: `items_len`, `body_len`, items (`Ref`, comptime

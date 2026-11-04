@@ -4787,16 +4787,19 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   the per-declaration cache, parallel CodeGen, edit builds and debug info
   for free; the cost is analyzing the std code fuzzer.zig reaches a
   second time, once per project (it is cached like any other unit).
-- **Coverage points**, decided per function in the shared SSA layer
+- **Coverage points**, upstream's set. Sema marks the arms of the
+  branches the user wrote (`Ir.CondBr.cover`, upstream's
+  `then_cov`/`else_cov`): both arms of a ZIR `condbr` (`if`, `while`,
+  `orelse`, `catch`), of `and`/`or`, and of the error check of
+  `catch |e| switch`, and the error arm of `try`. Branches Sema adds
+  itself (safety checks, error-trace bookkeeping, `select`, switches
+  lowered as chains, vector loops) and switch cases get none, as
+  upstream's. The shared SSA layer turns the marks into points
   (`Ssa.place` with `cover`), so aarch64 reuses them: the function's
-  entry, and each successor block of a `branch` or `switch_br` whose
-  arms are all hot. A branch with a cold arm (a safety check, `@panic`,
-  `unreachable`) gets none: its failing side ends the run, and its other
-  side tells the fuzzer nothing its predecessor does not. This matches
-  upstream's choice, which marks Sema's safety checks `.none`; zap also
-  instruments switch cases, which upstream leaves out, because a case
-  is often the only branch a byte-dispatch loop has. A covered block is
-  never bypassed by pass 3 (an empty arm keeps a block of its own). Not
+  entry, and each marked arm that is not cold. A cold arm (a call of a
+  noreturn function, such as `@panic`) ends the run, so its counter
+  would tell the fuzzer nothing. A covered block is never bypassed by
+  pass 3 (an empty arm keeps a block of its own). Not
   instrumented: compiler_rt, the fuzzer's family, naked functions, and
   functions that call `@disableInstrumentation()` (the test runner's,
   `std.testing.Smith`'s helpers), which Sema records on the IR
@@ -4856,21 +4859,19 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   the same compare. SSE2 (`pcmpeqb`/`pmovmskb`) would be ten times
   shorter again but needs vector registers in the backend.
 
-**Measured** (orb, 4 vCPU, ReleaseFast zap, 2026-11-03):
+**Measured** (orb, 4 vCPU, ReleaseFast zap, 2026-11-04):
 
-- Finding bugs: `zap build test --fuzz=30M` finds the `key=zap!`
-  overflow above after 5.3 M and 4.5 M runs, about a minute, and missed
-  it in a third try cut off at 300 s (26 M runs); upstream LLVM finds it
-  after 6.7 M, 8.5 M and 6.2 M runs, 18 to 27 s. A `zap` prefix
-  (test/build/hello, `zig build test-build`) falls after 0.2 M to 0.6 M
-  runs, a few seconds (upstream LLVM: 0.28 M).
-  zap runs about 90 k inputs/s against upstream LLVM's 335 k/s: before
-  `cmpBytes` it ran 10 k/s. The rest is backend code quality (the
-  fuzzer's own code, `isFresh`, `SafeAllocator.init`) and zap having
-  about twice upstream's points (19 787 against 10 172 in the same test;
-  switch cases are 2 400 of them; the rest is probably branches Sema
-  adds itself, which upstream marks uninstrumented and zap's IR cannot
-  tell apart yet), each a counter the fuzzer reads per run.
+- Finding bugs: `zap build test --fuzz=60M` finds the `key=zap!`
+  overflow above in 3 tries out of 3, after 14.0 M, 13.7 M and 3.3 M runs
+  (131, 107 and 25 s); upstream LLVM finds it after 6.7 M, 8.5 M and
+  6.2 M runs, 18 to 27 s. A `zap` prefix (test/build/hello,
+  `zig build test-build`) falls after 0.14 M to 1.8 M runs, a few
+  seconds (upstream LLVM: 0.28 M). The test has 9 522 points, against
+  upstream's 10 172 (19 787 before Sema marked user branches). zap runs
+  about 130 k inputs/s against upstream LLVM's 335 k/s (90 k/s with
+  twice the points, 10 k/s before `cmpBytes`). The rest is backend code
+  quality: `PcBitsetIterator.next` still takes 43% of the fuzzer's time,
+  `SafeAllocator.init` 18% and `isFresh` 9%.
 - Compile time, `zap test` of that test, cache off: 0.16 s plain, 0.34 s
   with `-ffuzz` (the fuzzer's family analyzes std's code a second time;
   86 MB against 48 MB peak). A rebuild with nothing changed takes 0.00 s

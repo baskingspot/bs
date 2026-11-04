@@ -266,9 +266,10 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
 /// slots of their own.
 ///
 /// With `cover` (`-ffuzz`), it also picks the coverage points (`covered`;
-/// docs/architecture.md, "Fuzzing"): the entry, and every successor of a
-/// `branch` or `switch_br` whose successors are all hot; a branch with a
-/// cold side (a safety check) gets none. A covered block is not bypassed.
+/// docs/architecture.md, "Fuzzing"): the entry, and each arm of a `branch`
+/// that Sema marked (`Ir.CondBr.cover`, the branches the user wrote) and
+/// that is not cold. Switch cases get none, as upstream's. A covered block
+/// is not bypassed.
 pub fn place(f: *Func, gpa: Allocator, ir: *const Ir, cover: bool) Allocator.Error!void {
     const n = f.blocks.items.len;
     f.order.clearRetainingCapacity();
@@ -287,16 +288,11 @@ pub fn place(f: *Func, gpa: Allocator, ir: *const Ir, cover: bool) Allocator.Err
         for (f.layout.items) |block| {
             const term = f.blocks.items[@backingInt(block)].term;
             switch (term.tag) {
-                .branch => if (!f.endsCold(ir, term.succ[0]) and !f.endsCold(ir, term.succ[1])) {
-                    covered[term.succ[0]] = true;
-                    covered[term.succ[1]] = true;
-                },
-                .switch_br => {
-                    const cases_len = ir.extraData(Ir.SwitchBr, datas[@backingInt(term.inst)].pl_op.payload).data.cases_len;
-                    for (f.switchCases(term, cases_len)) |c| {
-                        if (!f.endsCold(ir, @backingInt(c))) covered[@backingInt(c)] = true;
+                .branch => {
+                    const arms = ir.extraData(Ir.CondBr, datas[@backingInt(term.inst)].pl_op.payload).data.cover;
+                    for (term.succ, [2]bool{ arms.then, arms.@"else" }) |succ, on| {
+                        if (on and !f.endsCold(ir, succ)) covered[succ] = true;
                     }
-                    if (!f.endsCold(ir, term.succ[1])) covered[term.succ[1]] = true;
                 },
                 else => {},
             }
@@ -1102,20 +1098,20 @@ test "blocks follow the structured IR's layout" {
     defer insts.deinit(gpa);
     // Instructions: 0 arg, 1 block, 2 loop, 3 cond_br, 4 br, 5 repeat, 6 ret.
     const extra = [_]u32{
-        1, 1, 4, 5, // 0: cond_br: then { br }, else { repeat }
-        1, 3, // 4: loop body { cond_br }
-        1, 2, // 6: block body { loop }
-        3, 0, 1, 6, // 8: main body { arg, block, ret }
+        1, 1, 0, 4, 5, // 0: cond_br: then { br }, else { repeat }
+        1, 3, // 5: loop body { cond_br }
+        1, 2, // 7: block body { loop }
+        3, 0, 1, 6, // 9: main body { arg, block, ret }
     };
     const c = Inst.Index.toRef(@fromBackingInt(0));
     try insts.append(gpa, .{ .tag = .arg, .data = .{ .arg = .{ .ty = .bool_type, .index = 0 } } });
-    try insts.append(gpa, .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = 6 } } });
-    try insts.append(gpa, .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = 4 } } });
+    try insts.append(gpa, .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = 7 } } });
+    try insts.append(gpa, .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = 5 } } });
     try insts.append(gpa, .{ .tag = .cond_br, .data = .{ .pl_op = .{ .operand = c, .payload = 0 } } });
     try insts.append(gpa, .{ .tag = .br, .data = .{ .br = .{ .block_inst = @fromBackingInt(1), .operand = .void_value } } });
     try insts.append(gpa, .{ .tag = .repeat, .data = .{ .repeat = .{ .loop_inst = @fromBackingInt(2) } } });
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = .void_value } });
-    const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 8 };
+    const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 9 };
     var f: Func = .{};
     defer f.deinit(gpa);
     try f.build(gpa, &ir);
@@ -1174,23 +1170,23 @@ test "liveness extends over loops and ignores clobbers on paths that end" {
     var insts: std.MultiArrayList(Inst) = .empty;
     defer insts.deinit(gpa);
     const extra = [_]u32{
-        2, 2, 5, 6, 7, 8, // 0: cond_br: then { not, br }, else { breakpoint, trap }
-        1, 4, // 6: loop body { cond_br }
-        1, 3, // 8: block body { loop }
-        4, 0, 1, 2, 9, // 10: main body { arg, arg, block, ret }
+        2, 2, 0, 5, 6, 7, 8, // 0: cond_br: then { not, br }, else { breakpoint, trap }
+        1, 4, // 7: loop body { cond_br }
+        1, 3, // 9: block body { loop }
+        4, 0, 1, 2, 9, // 11: main body { arg, arg, block, ret }
     };
     const ref = Inst.Index.toRef;
     try insts.append(gpa, .{ .tag = .arg, .data = .{ .arg = .{ .ty = .bool_type, .index = 0 } } });
     try insts.append(gpa, .{ .tag = .arg, .data = .{ .arg = .{ .ty = .u64_type, .index = 1 } } });
-    try insts.append(gpa, .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = 8 } } });
-    try insts.append(gpa, .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = 6 } } });
+    try insts.append(gpa, .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = .void_type, .payload = 9 } } });
+    try insts.append(gpa, .{ .tag = .loop, .data = .{ .ty_pl = .{ .ty = .noreturn_type, .payload = 7 } } });
     try insts.append(gpa, .{ .tag = .cond_br, .data = .{ .pl_op = .{ .operand = ref(@fromBackingInt(0)), .payload = 0 } } });
     try insts.append(gpa, .{ .tag = .not, .data = .{ .ty_op = .{ .ty = .u64_type, .operand = ref(@fromBackingInt(1)) } } });
     try insts.append(gpa, .{ .tag = .br, .data = .{ .br = .{ .block_inst = @fromBackingInt(2), .operand = .void_value } } });
     try insts.append(gpa, .{ .tag = .breakpoint, .data = .{ .no_op = {} } });
     try insts.append(gpa, .{ .tag = .trap, .data = .{ .no_op = {} } });
     try insts.append(gpa, .{ .tag = .ret, .data = .{ .un_op = .void_value } });
-    const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 10 };
+    const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 11 };
     var f: Func = .{};
     defer f.deinit(gpa);
     try f.build(gpa, &ir);
