@@ -1728,6 +1728,8 @@ fn matchFormat(fmt: []const u8, msg: []const u8) bool {
 /// "every AstGen error format has a code" test checks this list against
 /// AstGen.zig itself.
 const astgen_codes = [_]struct { []const u8, Code }{
+    // The frontend's, for an imported file it cannot read.
+    .{ "unable to load \"{s}\": {s}", .@"bad-import" },
     .{ "unused block label", .@"unused-label" },
     .{ "unused for loop label", .@"unused-label" },
     .{ "unused switch label", .@"unused-label" },

@@ -1239,15 +1239,26 @@ fn load(fe: *Frontend, roots: []const Root, indices: []?File.Index, errors: *std
         index.* = job.index;
     }
     var i: usize = 0;
+    var any_missing = false;
     while (i < order.items.len) : (i += 1) {
         const job = order.items[i];
-        if (job.missing) |err| fatalFile(job.file.display_path, err);
+        if (job.missing) |err| {
+            // As upstream, an imported file that cannot be read is an
+            // error at that file, with a note at the import.
+            const importer = for (order.items[0..i]) |o| {
+                if (std.mem.indexOfScalar(*Job, o.imports, job) != null) break o;
+            } else fatalFile(job.file.display_path, err);
+            try fe.addMissingFile(errors, importer, job, err);
+            any_missing = true;
+            continue;
+        }
         for (job.imports) |imp| {
             if (imp.index != null) continue;
             imp.index = @fromBackingInt(@intCast(base + order.items.len));
             order.appendAssumeCapacity(imp);
         }
     }
+    if (any_missing) return false;
     var existing: u32 = 0;
     var jit = l.jobs.valueIterator();
     while (jit.next()) |job| existing += @intFromBool(job.*.existing);
@@ -1430,23 +1441,79 @@ fn collectImports(fe: *const Frontend, f: *const File, names: []const u8) ![]Imp
     var it = std.mem.tokenizeScalar(u8, names, 0);
     while (it.next()) |name| {
         try list.ensureUnusedCapacity(gpa, 1);
-        const imp: Import = if (fe.depModule(f.module, name)) |m|
-            // A ZON module is Sema's to read, like a ZON file.
-            if (std.mem.endsWith(u8, fe.module(m).root_file, ".zon"))
-                continue
-            else
-                .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) }
-        else if (std.mem.endsWith(u8, name, ".zig")) .{
-            .module = f.module,
-            .sub_path = try std.fs.path.resolvePosix(gpa, &.{ std.fs.path.dirname(f.sub_path) orelse "", name }),
-        } else if (fe.familyModule(f.module, name)) |m|
-            .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) }
-        else
-            // TODO: ZON imports go through ZonGen, not AstGen.
-            continue;
-        list.appendAssumeCapacity(imp);
+        list.appendAssumeCapacity((try fe.resolveImport(f, name)) orelse continue);
     }
     return list.toOwnedSlice(gpa);
+}
+
+/// The file `@import(name)` in `f` loads, or null if the frontend leaves
+/// the import to Sema. `sub_path` is allocated with `gpa`.
+fn resolveImport(fe: *const Frontend, f: *const File, name: []const u8) !?Import {
+    const gpa = fe.gpa;
+    if (fe.depModule(f.module, name)) |m| {
+        // A ZON module is Sema's to read, like a ZON file.
+        if (std.mem.endsWith(u8, fe.module(m).root_file, ".zon")) return null;
+        return .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) };
+    }
+    if (std.mem.endsWith(u8, name, ".zig")) {
+        return .{ .module = f.module, .sub_path = try std.fs.path.resolvePosix(gpa, &.{ std.fs.path.dirname(f.sub_path) orelse "", name }) };
+    }
+    if (fe.familyModule(f.module, name)) |m| return .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) };
+    // TODO: ZON imports go through ZonGen, not AstGen.
+    return null;
+}
+
+/// Reports `job`, which `importer` imports, as a file that could not be
+/// read: upstream's error at the file, with a note at the import.
+fn addMissingFile(fe: *Frontend, errors: *std.zig.ErrorBundle.Wip, importer: *const Job, job: *const Job, err: anyerror) !void {
+    const gpa = fe.gpa;
+    const f = &importer.file;
+    // The import's token and name, as written.
+    const token: ?Ast.TokenIndex, const name: []const u8 = tok: {
+        const imports_index = f.zir.extra[@backingInt(Zir.ExtraIndex.imports)];
+        if (imports_index == 0) break :tok .{ null, job.file.sub_path };
+        const imports = f.zir.extraData(Zir.Inst.Imports, imports_index);
+        var extra_index = imports.end;
+        for (0..imports.data.imports_len) |_| {
+            const item = f.zir.extraData(Zir.Inst.Imports.Item, extra_index);
+            extra_index = item.end;
+            const item_name = f.zir.nullTerminatedString(item.data.name);
+            const imp = (try fe.resolveImport(f, item_name)) orelse continue;
+            defer gpa.free(imp.sub_path);
+            if (imp.module == job.file.module and std.mem.eql(u8, imp.sub_path, job.file.sub_path)) break :tok .{ item.data.token, item_name };
+        }
+        break :tok .{ null, job.file.sub_path };
+    };
+    const note_loc: std.zig.ErrorBundle.SourceLocationIndex = loc: {
+        const t = token orelse break :loc .none;
+        const src = Io.Dir.cwd().readFileAllocOptions(fe.io, f.display_path, gpa, .unlimited, .of(u8), 0) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => break :loc .none,
+        };
+        defer gpa.free(src);
+        var tokenizer: std.zig.Tokenizer = .init(src);
+        var tok = tokenizer.next();
+        for (0..t) |_| tok = tokenizer.next();
+        const lc = std.zig.findLineColumn(src, tok.loc.start);
+        break :loc try errors.addSourceLocation(.{
+            .src_path = try errors.addString(f.display_path),
+            .line = @intCast(lc.line),
+            .column = @intCast(lc.column),
+            .span_start = @intCast(tok.loc.start),
+            .span_main = @intCast(tok.loc.start),
+            .span_end = @intCast(tok.loc.end),
+            .source_line = try errors.addString(lc.source_line),
+        });
+    };
+    try errors.addRootErrorMessage(.{
+        .msg = try errors.printString("unable to load \"{s}\": {t}", .{ name, err }),
+        .src_loc = try errors.addSourceLocation(.{ .src_path = try errors.addString(job.file.display_path), .line = 0, .column = 0, .span_start = 0, .span_main = 0, .span_end = 0 }),
+        .notes_len = 1,
+    });
+    const notes_start = try errors.reserveNotes(1);
+    // Not one statement: adding the message can move `extra`.
+    const note = try errors.addErrorMessage(.{ .msg = try errors.addString("file imported here"), .src_loc = note_loc });
+    errors.extra.items[notes_start] = @backingInt(note);
 }
 
 fn fatalFile(path: []const u8, err: anyerror) noreturn {
