@@ -1234,6 +1234,8 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                     .holes = try sema.arena.dupe(InternPool.Template.Hole, &.{.{ .at = "@typeInfo(".len, .ty = sema.zcu.namespacePtr(info.namespace).owner_type }}),
                 } };
                 const tag_key = try std.fmt.allocPrint(sema.arena, "{s}@tag", .{ip.stringSlice(key.key)});
+                // It shares the union's namespace, whose declarations are
+                // not its own (`ownsNamespace`).
                 const tag_info = try ip.createContainerInfo(Zcu.tid, .{
                     .namespace = info.namespace,
                     .layout = .auto,
@@ -4848,7 +4850,7 @@ fn typeInfo(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!Index 
                 .{ "mode", try sema.enumValueByName(block, src, try sema.stdLangType(block, src, "Type.Enum.Mode"), if (info.nonexhaustive) "nonexhaustive" else "exhaustive") },
                 .{ "field_names", try sema.namesValue(info.field_names) },
                 .{ "field_values", try sema.sliceValue(.comptime_int_type, vals) },
-                .{ "decl_names", try sema.declNamesValue(info.namespace) },
+                .{ "decl_names", if (sema.ownsNamespace(ty)) try sema.declNamesValue(info.namespace) else try sema.namesValue(&.{}) },
             });
         },
         .@"struct", .tuple => blk: {
@@ -5122,10 +5124,17 @@ fn lookupName(sema: *Sema, block: *Block, src: Src, name: []const u8) CompileErr
     return sema.fail(block, src, "use of undeclared identifier '{s}'", .{name});
 }
 
+/// Whether container type `ty`'s namespace is its own: not so for a
+/// union's generated tag enum, which has no declarations, as upstream.
+fn ownsNamespace(sema: *Sema, ty: Index) bool {
+    return sema.zcu.namespacePtr(sema.ip.structInfo(ty).namespace).owner_type == ty;
+}
+
 /// Looks up a declaration of the namespace of container type `ty`.
 fn lookupInType(sema: *Sema, ty: Index, name: []const u8) !?InternPool.NavIndex {
     if (sema.ip.containerType(ty) == null) return null;
     const ns_index = sema.ip.structInfo(ty).namespace;
+    if (!sema.ownsNamespace(ty)) return null;
     const name_str = try sema.getString(name);
     try sema.declareDependency(.{ .namespace_name = .{ .namespace = ns_index, .name = name_str } });
     return sema.zcu.namespacePtr(ns_index).decls.get(name_str);

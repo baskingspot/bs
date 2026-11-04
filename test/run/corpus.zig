@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -155,6 +155,16 @@ fn passName(name: [:0]const u8) u64 {
     return cStrLen(name);
 }
 
+// tokamak (schema.zig, through std.json.Stringify): a union's generated
+// tag enum has none of the union's declarations.
+const Schema = union(enum) {
+    null,
+    array: u32,
+    pub fn jsonStringify(self: Schema) u32 {
+        return @intFromEnum(self);
+    }
+};
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -212,5 +222,7 @@ fn main() callconv(.c) noreturn {
     _ = &eof;
     rt.printInt(readWith(readCb, eof));
     rt.printInt(passName("tokamak"));
+    const Tag = @typeInfo(Schema).@"union".tag_type.?;
+    rt.printInt(@intFromBool(@hasDecl(Schema, "jsonStringify") and !@hasDecl(Tag, "jsonStringify")));
     rt.exit(0);
 }
