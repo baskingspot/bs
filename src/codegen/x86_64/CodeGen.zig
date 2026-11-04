@@ -1017,7 +1017,7 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
         .opt => |o| if (Type.optionalReprIsPtr(ip, Type.childType(ip, ty))) {
             if (o.val == .none) return .{ .imm = 0 };
             return cg.constLoc(o.val);
-        },
+        } else if (o.val == .none and cg.optInGpr(ty)) return .{ .imm = 0 },
         else => {},
     }
     return .{ .mem = Mem.sym(try cg.emit.uavKey(val, 0), 0) };
@@ -2903,12 +2903,25 @@ pub fn inGpr(cg: *CodeGen, ty: Index) bool {
         .bool => true,
         .int => Type.intInfo(ip, ty).bits -% 1 < 64,
         .pointer => !Type.isSlice(ip, ty),
-        .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, ty)),
+        .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, ty)) or cg.optInGpr(ty),
         // An error union of up to 8 bytes holds its bytes like a load: the
         // error code in the low 16 bits, the payload above.
         .error_set, .@"enum", .error_union => cg.passInRegs(ty),
         // A bool vector of up to 64 elements is its bits (`vector.isBits`).
         .vector => vector.isBits(ip, ty),
+        else => false,
+    };
+}
+
+/// Whether optional type `ty` is a flag after a bool, integer, or enum
+/// payload in up to 8 bytes in all, which lives in a general-purpose
+/// register as its bytes, zero-extended like a load: the payload in the
+/// low bytes, the flag at `Type.optionalFlagOffset`.
+fn optInGpr(cg: *CodeGen, ty: Index) bool {
+    const ip = cg.ip;
+    const child = Type.childType(ip, ty);
+    return switch (Type.class(ip, child)) {
+        .bool, .int, .@"enum" => !Type.optionalReprIsPayload(ip, child) and Type.hasRuntimeBits(ip, child) and cg.inGpr(child) and cg.passInRegs(ty),
         else => false,
     };
 }
@@ -3293,6 +3306,17 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
             } else if (cg.pairOf(data.un_op)) |p| {
                 // An optional slice: a null `ptr`.
                 try cg.e.@"test"(.qword, .{ .reg = p.lo }, .{ .reg = p.lo });
+            } else if (cg.optInGpr(opt_ty) and try cg.locOf(data.un_op) == .reg) {
+                // The flag above the payload's bytes (`optInGpr`).
+                const r = (try cg.locOf(data.un_op)).reg;
+                const flag: u6 = @intCast(8 * Type.optionalFlagOffset(ip, opt_ty));
+                if (flag < 31) {
+                    try cg.e.@"test"(.dword, .{ .reg = r }, .{ .imm = @as(i32, 1) << @intCast(flag) });
+                } else {
+                    try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = r });
+                    try cg.e.shift(.shr, .qword, .{ .reg = .rax }, flag);
+                    try cg.e.@"test"(.byte, .{ .reg = .rax }, .{ .reg = .rax });
+                }
             } else if (Type.optionalReprIsPayload(ip, child)) {
                 // A slice's `ptr` or an error code; zero is null.
                 const src = try cg.memOf(data.un_op);
@@ -4171,6 +4195,19 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.load(d, data.ty_op.operand);
                 return cg.setResult(inst, child, d);
             }
+            if (cg.optInGpr(cg.typeOf(data.ty_op.operand))) if (try cg.locOf(data.ty_op.operand) == .reg) {
+                // An optional in a register (`optInGpr`): its low bytes,
+                // extended.
+                const r = (try cg.locOf(data.ty_op.operand)).reg;
+                const d = cg.destReg(inst);
+                const size = Type.abiSize(ip, child);
+                if (size == 4 and !cg.signed(child)) {
+                    try cg.e.mov(.dword, .{ .reg = d }, .{ .reg = r });
+                } else if (cg.signed(child)) {
+                    try cg.e.movsx(.qword, d, sizeOf(size), .{ .reg = r });
+                } else try cg.e.movzx(.dword, d, sizeOf(size), .{ .reg = r });
+                return cg.setResult(inst, child, d);
+            };
             if (cg.passInRegs(child)) {
                 const src = try cg.memOf(data.ty_op.operand);
                 const d = cg.destReg(inst);
@@ -4195,9 +4232,25 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const opt_ty = data.ty_op.ty;
             if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
             if (cg.inGpr(opt_ty)) {
-                // An optional pointer is the pointer.
+                // An optional pointer is the pointer; another optional the
+                // payload's bytes and the flag above them (`optInGpr`).
                 const d = cg.destReg(inst);
                 try cg.load(d, data.ty_op.operand);
+                if (!Type.optionalReprIsPtr(ip, Type.childType(ip, opt_ty))) {
+                    const child = Type.childType(ip, opt_ty);
+                    switch (Type.abiSize(ip, child)) {
+                        1, 2 => |n| try cg.e.movzx(.dword, d, sizeOf(n), .{ .reg = d }),
+                        4 => try cg.e.mov(.dword, .{ .reg = d }, .{ .reg = d }),
+                        else => unreachable,
+                    }
+                    const flag: u6 = @intCast(8 * Type.optionalFlagOffset(ip, opt_ty));
+                    if (flag < 31) {
+                        try cg.e.alu(.@"or", .qword, .{ .reg = d }, .{ .imm = @as(i32, 1) << @intCast(flag) });
+                    } else {
+                        try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @as(i64, 1) << flag });
+                        try cg.e.alu(.@"or", .qword, .{ .reg = d }, .{ .reg = .rcx });
+                    }
+                }
                 return cg.setResult(inst, opt_ty, d);
             }
             const dst = try cg.resultMem(inst, opt_ty) orelse return;
