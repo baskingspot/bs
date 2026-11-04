@@ -80,6 +80,9 @@ win_save: ?i32 = null,
 /// not shared.
 copy_of: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 copy_private: std.AutoHashMapUnmanaged(u32, void) = .empty,
+/// `copy_of` allocs whose initializer is a by-reference argument: the
+/// alloc's value is the argument's pointer (`planCopies`).
+ref_alias: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// From `planCopies`: values whose slot is that of the block their `br`
 /// exits, by value.
 slot_alias: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -151,6 +154,7 @@ ovf_cc: Encoder.Cond = .o,
 /// Scratch for `.auto` argument classification (`argScratch`).
 arg_tys: std.ArrayList(Index) = .empty,
 arg_locs: std.ArrayList(AutoArg) = .empty,
+arg_refs: std.ArrayList(ArgRef) = .empty,
 /// Inline assembly marked the return address undefined (`.cfi_undefined
 /// %rip`): this is the outermost frame.
 outermost_frame: bool = false,
@@ -200,6 +204,10 @@ const Home = union(enum) {
     pair,
     /// The value is stored at `[rbp + off]`.
     slot: i32,
+    /// A memory-class `.auto` argument, passed by reference: the value is
+    /// the memory at `[reg]`, which does not change during the call (see
+    /// `autoArgs`).
+    ind: Reg,
     /// The value is the address `rbp + off` (an `alloc`).
     frame_addr: i32,
     /// The value is the address `base + off`, a register holding another
@@ -280,6 +288,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.dbg_open.deinit(gpa);
         cg.arg_tys.deinit(gpa);
         cg.arg_locs.deinit(gpa);
+        cg.arg_refs.deinit(gpa);
         cg.pair_spills.deinit(gpa);
         cg.split.deinit(gpa);
         cg.split_vals.deinit(gpa);
@@ -287,6 +296,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.arg_hints.deinit(gpa);
         cg.copy_of.deinit(gpa);
         cg.copy_private.deinit(gpa);
+        cg.ref_alias.deinit(gpa);
         cg.slot_alias.deinit(gpa);
         cg.in_place.deinit(gpa);
         cg.cold_starts.deinit(gpa);
@@ -552,8 +562,8 @@ const c_arg_regs = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
 /// How `.auto` passes a value of a type: in one or two general-purpose
 /// registers (the bytes of the value, as eightbytes; one register holds a
 /// 1-, 2-, 4-, or 8-byte value extended like a load), in an SSE register,
-/// or in memory (arguments in the outgoing area, results through a
-/// pointer in rdi).
+/// or in memory (arguments by reference, results through a pointer in
+/// rdi; see `autoArgs`).
 const AutoClass = enum { none, gpr, gpr_pair, sse, memory };
 
 fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
@@ -573,7 +583,14 @@ fn autoClassOf(ip: *const InternPool, ty: Index) AutoClass {
 
 /// Where the `.auto` convention puts each argument, in order, given the
 /// result type; the stack offsets are from the start of the outgoing area.
-const AutoArg = union(enum) { none, gpr: u8, gpr_pair: u8, sse: u8, stack: u32 };
+/// A memory-class argument is passed by reference (`ref`, or `ref_stack`
+/// when the registers are taken): a pointer to memory that holds the value
+/// and does not change during the call. Parameters do not change, so the
+/// callee reads the value there (`Home.ind`) instead of copying it. The
+/// caller passes a constant's own memory, a by-reference parameter's
+/// pointer, or else a copy in its outgoing area (`call`); so a comptime
+/// table passed by value is not copied at all.
+const AutoArg = union(enum) { none, gpr: u8, gpr_pair: u8, sse: u8, stack: u32, ref: u8, ref_stack: u32 };
 
 fn autoArgs(cg: *CodeGen, ret_ty: Index, tys: []const Index, locs: []AutoArg) u32 {
     var gp: u8 = @intFromBool(cg.autoClass(ret_ty) == .memory);
@@ -595,11 +612,21 @@ fn autoArgs(cg: *CodeGen, ret_ty: Index, tys: []const Index, locs: []AutoArg) u3
                 sse += 1;
                 break :blk .{ .sse = sse - 1 };
             } else .{ .stack = 0 },
-            .memory => .{ .stack = 0 },
+            .memory => if (gp < 6) blk: {
+                gp += 1;
+                break :blk .{ .ref = gp - 1 };
+            } else .{ .ref_stack = 0 },
         };
-        if (l.* == .stack) {
-            l.* = .{ .stack = stack };
-            stack += @intCast(std.mem.alignForward(u64, Type.abiSize(cg.ip, ty), 8));
+        switch (l.*) {
+            .stack => {
+                l.* = .{ .stack = stack };
+                stack += @intCast(std.mem.alignForward(u64, Type.abiSize(cg.ip, ty), 8));
+            },
+            .ref_stack => {
+                l.* = .{ .ref_stack = stack };
+                stack += 8;
+            },
+            else => {},
         }
     }
     return stack;
@@ -631,7 +658,10 @@ pub fn argsInRegs(ip: *const InternPool, fn_ty: Index) bool {
         .sse => if (sse < 8) {
             sse += 1;
         } else return false,
-        .memory => return false,
+        // By reference: the pointer takes a register, or the stack.
+        .memory => if (gp < 6) {
+            gp += 1;
+        } else return false,
     };
     return true;
 }
@@ -657,12 +687,36 @@ test argsInRegs {
     try std.testing.expect(try T.fits(&ip, &([_]Index{pair} ++ ints[0..4].*), .void_type, .auto));
     try std.testing.expect(!try T.fits(&ip, &(ints[0..5].* ++ [_]Index{pair}), .void_type, .auto));
     // Floats take the 8 SSE registers, beside the 6 general ones; an
-    // argument over 16 bytes goes in memory.
+    // argument over 16 bytes is passed by reference, its pointer in a
+    // general register or on the stack.
     const floats: [9]Index = @splat(.f64_type);
     try std.testing.expect(try T.fits(&ip, &(floats[0..8].* ++ ints[0..6].*), .void_type, .auto));
     try std.testing.expect(!try T.fits(&ip, floats[0..9], .void_type, .auto));
-    try std.testing.expect(!try T.fits(&ip, &.{big}, .void_type, .auto));
+    try std.testing.expect(try T.fits(&ip, &(ints[0..5].* ++ [_]Index{big}), .void_type, .auto));
+    try std.testing.expect(!try T.fits(&ip, &(ints[0..6].* ++ [_]Index{big}), .void_type, .auto));
     try std.testing.expect(!try T.fits(&ip, &.{}, .void_type, .c));
+}
+
+/// Where a by-reference argument's pointer comes from: a register
+/// holding it, or an address.
+const ArgRef = union(enum) { reg: Reg, addr: Mem };
+
+/// The memory a by-reference argument `ref` may be passed in without a
+/// copy, which nothing writes during the call: a constant's, a
+/// by-reference parameter's (`Home.ind`), or a value's slot. A value has
+/// no address anything else could write through, and its slot is not
+/// shared with the call's result (`Ssa.takeSlot` frees a slot only after
+/// its interval's end, the call).
+fn argRef(cg: *CodeGen, ref: Ref) Error!?ArgRef {
+    if (ref.toIndex()) |v| return switch (cg.homes[@backingInt(v)]) {
+        .ind => |r| .{ .reg = r },
+        .slot => |off| .{ .addr = Mem.at(.rbp, off) },
+        else => null,
+    };
+    return switch (try cg.constLoc(ref.toInterned().?)) {
+        .mem => |m| .{ .addr = m },
+        else => null,
+    };
 }
 
 /// Buffers for `n` argument types and locations, reused by every call.
@@ -791,6 +845,16 @@ fn setupParams(cg: *CodeGen) Error!void {
             .stack => |off| if (home != .reg and home != .regs and home != .xmm) {
                 cg.homes[@backingInt(inst)] = .{ .slot = 16 + @as(i32, @intCast(off)) };
             },
+            // The pointer stays in the register the argument got; without
+            // one, the value is copied in.
+            .ref => |r| if (home == .reg) {
+                moves[n_moves] = .{ .dst = home.reg, .src = c_arg_regs[r] };
+                n_moves += 1;
+                cg.homes[@backingInt(inst)] = .{ .ind = home.reg };
+            } else try cg.copyArgIn((try cg.resultMem(inst, ty)).?, .{ .reg = c_arg_regs[r] }, size),
+            .ref_stack => |off| if (home != .reg) {
+                try cg.copyArgIn((try cg.resultMem(inst, ty)).?, .{ .mem = Mem.at(.rbp, 16 + @as(i32, @intCast(off))) }, size);
+            },
         }
     }
     // A parallel move: each destination is written once its old value has
@@ -825,8 +889,43 @@ fn setupParams(cg: *CodeGen) Error!void {
             .xmm => |x| try cg.loadXmm(x, memVal(ty, Mem.at(.rbp, 16 + @as(i32, @intCast(off))))),
             else => {},
         },
+        .ref_stack => |off| switch (cg.homes[@backingInt(inst)]) {
+            .reg => |r| {
+                try cg.e.mov(.qword, .{ .reg = r }, .{ .mem = Mem.at(.rbp, 16 + @as(i32, @intCast(off))) });
+                cg.homes[@backingInt(inst)] = .{ .ind = r };
+            },
+            else => {},
+        },
         else => {},
     };
+}
+
+/// Copies a by-reference argument of `size` bytes from where `ptr` points
+/// to `dst`, in the prologue, keeping the argument registers: rsi, rdi,
+/// and rcx are saved in r10, r11, and rax, which are free there.
+fn copyArgIn(cg: *CodeGen, dst: Mem, ptr: union(enum) { reg: Reg, mem: Mem }, size: u64) Error!void {
+    const e = &cg.e;
+    try e.mov(.qword, .{ .reg = .r10 }, .{ .reg = .rsi });
+    try e.mov(.qword, .{ .reg = .r11 }, .{ .reg = .rdi });
+    try e.mov(.qword, .{ .reg = .rax }, .{ .reg = .rcx });
+    switch (ptr) {
+        .reg => |r| {
+            const src: Reg = switch (r) {
+                .rsi => .r10,
+                .rdi => .r11,
+                .rcx => .rax,
+                else => r,
+            };
+            try e.mov(.qword, .{ .reg = .rsi }, .{ .reg = src });
+        },
+        .mem => |m| try e.mov(.qword, .{ .reg = .rsi }, .{ .mem = m }),
+    }
+    try e.lea(.qword, .rdi, dst);
+    try e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(size) });
+    try e.repMovsb();
+    try e.mov(.qword, .{ .reg = .rsi }, .{ .reg = .r10 });
+    try e.mov(.qword, .{ .reg = .rdi }, .{ .reg = .r11 });
+    try e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rax });
 }
 
 pub fn sizeOf(bytes: u64) Size {
@@ -856,6 +955,7 @@ pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
         .fused, .pair, .view => unreachable, // read only by their users
         .dead => unreachable,
         .slot => |off| .{ .mem = Mem.at(.rbp, off) },
+        .ind => |r| .{ .mem = Mem.at(r, 0) },
         .frame_addr => |off| .{ .addr = Mem.at(.rbp, off) },
         .reg_addr => |a| .{ .addr = Mem.at(a.base, a.off) },
     };
@@ -935,7 +1035,9 @@ pub fn load(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
         .none => try cg.e.mov(.dword, .{ .reg = reg }, .{ .imm = 0 }),
         .reg => |r| if (r != reg) try cg.e.mov(.qword, .{ .reg = reg }, .{ .reg = r }),
         .imm => |v| try cg.e.mov(.qword, .{ .reg = reg }, .{ .imm = @bitCast(v) }),
-        .addr => |m| try cg.e.lea(.qword, reg, m),
+        .addr => |m| if (m.base == .reg and m.index == null and m.disp == 0) {
+            if (m.base.reg != reg) try cg.e.mov(.qword, .{ .reg = reg }, .{ .reg = m.base.reg });
+        } else try cg.e.lea(.qword, reg, m),
         .err => |name| try cg.loadError(reg, name),
         .mem => |m| try cg.loadMem(reg, m, ty),
     }
@@ -1266,7 +1368,19 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
             }
             return false;
         },
-        .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .loop, .breakpoint => return false,
+        // A copy of a by-reference argument is its pointer, folded into
+        // its users' addressing when the argument has a register.
+        .alloc => {
+            if (!cg.has_asm and cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(inst))) {
+                const live = cg.emit.ssa.live.slice();
+                live.items(.reg)[@backingInt(inst)] = RegClass.gpr.want();
+                live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+                const arg = cg.copy_of.get(@backingInt(inst)).?;
+                if (live.items(.reg)[arg] == Ssa.want_reg) cg.addr_base[@backingInt(inst)] = arg;
+            }
+            return false;
+        },
+        .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .loop, .breakpoint => return false,
         // A frame address takes no register and emits nothing; nor does
         // an address its users fold into their addressing.
         .struct_field_ptr, .ptr_elem_ptr, .ptr_add => if (cg.frameFoldable(inst.toRef()) or cg.addrFoldable(inst)) return false,
@@ -1373,7 +1487,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
         _ = cg.autoArgs(cg.fn_ty.return_type, tys, locs);
         const hint = live.items(.hint);
         for (args, locs) |inst, l| switch (l) {
-            .gpr => |r| hint[@backingInt(inst)][0] = allocIndex(c_arg_regs[r]),
+            .gpr, .ref => |r| hint[@backingInt(inst)][0] = allocIndex(c_arg_regs[r]),
             .gpr_pair => |r| hint[@backingInt(inst)] = .{ allocIndex(c_arg_regs[r]), allocIndex(c_arg_regs[r + 1]) },
             else => {},
         };
@@ -1415,6 +1529,14 @@ fn planRegisters(cg: *CodeGen) Error!void {
         }
     }
     try cg.planSplits();
+    // A by-reference argument's register holds a pointer, which `genSplit`
+    // would spill as the value.
+    if (cg.fn_ty.cc == .auto) for (ir.mainBody()) |inst| {
+        if (ir.instructions.items(.tag)[@backingInt(inst)] != .arg) break;
+        if (cg.autoClass(ir.instructions.items(.data)[@backingInt(inst)].arg.ty) == .memory) cg.split.unset(@backingInt(inst));
+    };
+    var aliases = cg.ref_alias.keyIterator();
+    while (aliases.next()) |a| cg.split.unset(a.*);
     cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split) & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
@@ -1504,6 +1626,11 @@ fn exemptArgs(cg: *CodeGen) Error!void {
         const tys, const locs = try cg.argScratch(args.len);
         for (args, tys) |arg, *ty| ty.* = cg.typeOf(arg);
         if (cg.autoArgs(extra.data.ret_ty, tys, locs) != 0) continue;
+        // A by-reference argument other than a constant may be copied to
+        // the outgoing area, which writes rsi, rdi, and rcx.
+        if (for (args, locs) |arg, l| {
+            if (l == .ref and arg.toInterned() == null) break true;
+        } else false) continue;
         const q = def[@backingInt(inst)];
         const own: [2]u32 = .{ cl[q][0] - cl[q - 1][0], cl[q][1] - cl[q - 1][1] };
         for (args, tys, locs) |arg, ty, l| {
@@ -1564,11 +1691,18 @@ fn exemptArgs(cg: *CodeGen) Error!void {
 /// (`exemptArgs`), so each register is written once no other argument
 /// left to load reads it; a cycle of register moves is broken with
 /// `xchg`.
-fn loadArgRegs(cg: *CodeGen, args: []const Ref, tys: []const Index, locs: []const AutoArg) Error!void {
-    const Move = struct { arg: Ref, ty: Index, lo: Reg, hi: ?Reg, src: ?Reg };
+fn loadArgRegs(cg: *CodeGen, args: []const Ref, tys: []const Index, locs: []const AutoArg, refs: []const ArgRef) Error!void {
+    const Move = struct { arg: Ref, ty: Index, lo: Reg, hi: ?Reg, src: ?Reg, addr: ?Mem = null };
     var moves: [6]Move = undefined;
     var n: usize = 0;
-    for (args, tys, locs) |arg, ty, l| switch (l) {
+    for (args, tys, locs, refs) |arg, ty, l, ref| switch (l) {
+        .ref => |r| {
+            moves[n] = switch (ref) {
+                .reg => |x| .{ .arg = arg, .ty = ty, .lo = c_arg_regs[r], .hi = null, .src = x },
+                .addr => |m| .{ .arg = arg, .ty = ty, .lo = c_arg_regs[r], .hi = null, .src = null, .addr = m },
+            };
+            n += 1;
+        },
         .gpr => |r| {
             const src: ?Reg = if (arg.toIndex()) |v| switch (cg.homes[@backingInt(v)]) {
                 .reg => |x| if (std.mem.indexOfScalar(Reg, &c_arg_regs, x) != null) x else null,
@@ -1610,6 +1744,8 @@ fn loadArgRegs(cg: *CodeGen, args: []const Ref, tys: []const Index, locs: []cons
             try cg.loadPair(m.lo, hi, m.arg);
         } else if (m.src) |r| {
             if (r != m.lo) try cg.e.mov(.qword, .{ .reg = m.lo }, .{ .reg = r });
+        } else if (m.addr) |a| {
+            try cg.e.lea(.qword, m.lo, a);
         } else try cg.loadGpr(m.lo, m.arg, m.ty);
         moves[k] = moves[n - 1];
         n -= 1;
@@ -1840,6 +1976,16 @@ fn planCopies(cg: *CodeGen) Error!void {
         if ((try cg.copy_private.getOrPut(gpa, @backingInt(v))).found_existing) continue;
         gop.value_ptr.* = @backingInt(v);
     }
+    // A copy of a by-reference argument is the argument's memory, which
+    // does not change during the call: the alloc is the argument's pointer.
+    if (cg.fn_ty.cc == .auto) {
+        var it = cg.copy_of.iterator();
+        while (it.next()) |e| {
+            const v = e.value_ptr.*;
+            if (v == no_copy or tags[v] != .arg or cg.autoClass(datas[v].arg.ty) != .memory) continue;
+            try cg.ref_alias.put(gpa, e.key_ptr.*, {});
+        }
+    }
     // Block results in memory: the value the block's only `br` passes is
     // computed in the block's slot (`slot_alias`), which is not shared.
     var brs: std.AutoArrayHashMapUnmanaged(u32, u32) = .empty;
@@ -2061,7 +2207,8 @@ fn frameFoldable(cg: *CodeGen, ref: Ref) bool {
         const i = cur.toIndex() orelse return false;
         const data = cg.ir.instructions.items(.data)[@backingInt(i)];
         switch (cg.ir.instructions.items(.tag)[@backingInt(i)]) {
-            .alloc => return data.ty != .none and cg.allocAlignment(data.ty) <= 16 and i != cg.rvo_alloc,
+            .alloc => return data.ty != .none and cg.allocAlignment(data.ty) <= 16 and i != cg.rvo_alloc and
+                !(cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(i))),
             .struct_field_ptr => {
                 const sf = cg.ir.extraData(Ir.StructField, data.ty_pl.payload).data;
                 const container = Type.ptrInfo(ip, cg.typeOf(sf.operand)).child;
@@ -2106,8 +2253,10 @@ fn foldFrame(cg: *CodeGen, inst: Inst.Index, base: Ref, off: u64) bool {
 const no_base = std.math.maxInt(u32);
 
 /// The pointer that address `inst` (a `struct_field_ptr`, `ptr_elem_ptr`,
-/// or `ptr_add`) is an offset from.
+/// or `ptr_add`, or a copy of a by-reference argument, `ref_alias`) is an
+/// offset from.
 fn addrOperand(cg: *CodeGen, inst: Inst.Index) Ref {
+    if (cg.ir.instructions.items(.tag)[@backingInt(inst)] == .alloc) return Inst.Index.toRef(@fromBackingInt(cg.copy_of.get(@backingInt(inst)).?));
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
     // `StructField.operand` and `Bin.lhs` come first.
     return @fromBackingInt(cg.ir.extra[data.ty_pl.payload]);
@@ -2330,6 +2479,9 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
     if (!wanted) return .none;
     const ty = ir.typeOfIndex(inst, cg.ip);
     if (cg.inGpr(ty) or (tag == .load and cg.inGprBytes(ty))) return .gpr;
+    // The register holds the pointer to a by-reference argument
+    // (`Home.ind`).
+    if (tag == .arg and cg.autoClass(ty) == .memory) return .gpr;
     const pair = switch (tag) {
         .load, .slice, .slice_elem_val, .ptr_elem_val, .optional_payload, .wrap_optional, .wrap_errunion_payload, .wrap_errunion_err, .arg => true,
         // `.auto` returns a pair in rax and rdx.
@@ -2377,7 +2529,12 @@ fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
     var t: T = .{};
     Ssa.forEachOperand(ir, inst, &t);
     const first = t.first orelse return Ssa.no_tie;
-    return if (first.toIndex()) |i| @backingInt(i) else Ssa.no_tie;
+    const i = first.toIndex() orelse return Ssa.no_tie;
+    // A by-reference argument's register holds its address (`Home.ind`),
+    // whose memory the lowering may still read after writing the result.
+    if (ir.instructions.items(.tag)[@backingInt(i)] == .arg and cg.fn_ty.cc == .auto and
+        cg.autoClass(ir.instructions.items(.data)[@backingInt(i)].arg.ty) == .memory) return Ssa.no_tie;
+    return @backingInt(i);
 }
 
 /// The register to compute value `inst` in: its home, or rax for a value
@@ -2930,6 +3087,27 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .alloc => {
             // An inferred alloc whose initializer never completes.
             if (data.ty == .none) return;
+            if (cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(inst))) {
+                // In its register as an address (a `.reg` home is a
+                // promoted variable's), or in a slot like an over-aligned
+                // alloc's.
+                const arg = cg.copy_of.get(@backingInt(inst)).?;
+                if (cg.addr_base[@backingInt(inst)] != no_base and cg.homes[@backingInt(inst)] == .none and cg.homes[arg] == .ind) {
+                    cg.homes[@backingInt(inst)] = .{ .reg_addr = .{ .base = cg.homes[arg].ind, .off = 0 } };
+                    return;
+                }
+                const d = cg.destReg(inst);
+                switch (cg.homes[arg]) {
+                    .ind => |r| try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = r }),
+                    .slot => |off| try cg.e.lea(.qword, d, Mem.at(.rbp, off)),
+                    else => unreachable,
+                }
+                if (cg.homes[@backingInt(inst)] == .reg) {
+                    cg.homes[@backingInt(inst)] = .{ .reg_addr = .{ .base = d, .off = 0 } };
+                    return;
+                }
+                return cg.setResult(inst, data.ty, d);
+            }
             // A variable in registers.
             switch (cg.homes[@backingInt(inst)]) {
                 .reg, .regs, .xmm => return,
@@ -3000,6 +3178,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             // Built in place (`planDeferred`).
             if (cg.in_place.count() != 0) if (val.toIndex()) |v| if (cg.in_place.contains(@backingInt(v))) return;
             // A `*const` alloc that is its initializer's memory (`planCopies`).
+            if (cg.ref_alias.count() != 0) if (data.bin_op.lhs.toIndex()) |a| if (cg.ref_alias.contains(@backingInt(a))) return;
             if (cg.copy_of.count() != 0) if (data.bin_op.lhs.toIndex()) |a| if (val.toIndex()) |v| switch (cg.homes[@backingInt(a)]) {
                 .frame_addr => |off| if (cg.homes[@backingInt(v)] == .slot and cg.homes[@backingInt(v)].slot == off) return,
                 else => {},
@@ -4266,17 +4445,45 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     } else {
         const tys, const locs = try cg.argScratch(args.len);
         for (args, tys) |arg, *ty| ty.* = cg.typeOf(arg);
-        cg.out_args_size = @max(cg.out_args_size, cg.autoArgs(ret_ty, tys, locs));
+        // By-reference arguments that need a copy get it after the
+        // stack arguments.
+        var out = cg.autoArgs(ret_ty, tys, locs);
+        try cg.arg_refs.resize(cg.gpa, args.len);
+        const refs = cg.arg_refs.items;
         // The outgoing area first (copies use rax, rsi, rdi, and rcx), then
         // SSE registers (rax), then general registers. The arguments are
-        // in caller-saved registers only without stack arguments, and then
-        // only in those that pass them (`exemptArgs`).
-        for (args, locs) |arg, l| if (l == .stack) {
-            stack_args = true;
-            try cg.copyTo(Mem.at(.rsp, @intCast(l.stack)), arg);
+        // in caller-saved registers only without stack arguments or
+        // copies, and then only in those that pass them (`exemptArgs`).
+        for (args, tys, locs, refs) |arg, ty, l, *ref| switch (l) {
+            .stack => |off| {
+                stack_args = true;
+                try cg.copyTo(Mem.at(.rsp, @intCast(off)), arg);
+            },
+            .ref, .ref_stack => {
+                ref.* = try cg.argRef(arg) orelse copy: {
+                    out = std.mem.alignForward(u32, out, @intCast(@min(16, @max(8, Type.abiAlignment(ip, ty)))));
+                    const m = Mem.at(.rsp, @intCast(out));
+                    try cg.copyTo(m, arg);
+                    out += @intCast(Type.abiSize(ip, ty));
+                    break :copy .{ .addr = m };
+                };
+                if (l == .ref_stack) {
+                    stack_args = true;
+                    const slot: Mem = .at(.rsp, @intCast(l.ref_stack));
+                    switch (ref.*) {
+                        .reg => |r| try cg.e.mov(.qword, .{ .mem = slot }, .{ .reg = r }),
+                        .addr => |m| {
+                            try cg.e.lea(.qword, .rax, m);
+                            try cg.e.mov(.qword, .{ .mem = slot }, .{ .reg = .rax });
+                        },
+                    }
+                }
+            },
+            else => {},
         };
+        cg.out_args_size = @max(cg.out_args_size, std.mem.alignForward(u32, out, 8));
         for (args, locs) |arg, l| if (l == .sse) try cg.loadXmm(xmm_args[l.sse], try cg.valOf(arg));
-        try cg.loadArgRegs(args, tys, locs);
+        try cg.loadArgRegs(args, tys, locs, refs);
         if (ret_class == .memory) if (dst) |m| try cg.e.lea(.qword, .rdi, m);
     }
     if (!is_c and !is_win) try cg.loadTrace(.rax);

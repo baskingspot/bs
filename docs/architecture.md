@@ -1223,9 +1223,19 @@ identity is in every cache key):
   order; a pair takes two consecutive general registers, and a pair that
   does not fit entirely in registers goes on the stack, never split.
   Arguments that
-  do not fit, and memory-class arguments, go in the outgoing stack area as
-  today (the callee reads them in place, so a large struct is copied once
-  by the caller, as now).
+  do not fit go in the outgoing stack area. On x86_64, a memory-class
+  argument (over 16 bytes) goes by reference, as one more pointer
+  argument: memory holding the value that nothing writes during the call,
+  which the callee reads in place (`Home.ind`; a `*const` copy Sema makes
+  of the parameter is that memory too). Parameters are immutable, so this
+  is the same as a copy: the caller passes a constant's own memory (a
+  comptime table passed by value is not copied at all), a by-reference
+  parameter's pointer, or a value's slot (values have no address anything
+  could write through, and a slot is reused only after the call), and
+  copies anything else, such as a load whose memory the callee might
+  write, to its outgoing area. A parameter that gets no register is
+  copied in at entry. `test/run/byref.zig` checks the aliasing cases
+  (`f(g.*)` writing `g`, `s = f(s)`) against upstream's ReleaseSafe.
 - Results: scalars and pairs in rax/rdx (x0/x1), floats in xmm0 (v0);
   others through a result pointer passed in rdi (x8, the indirect result
   register, as Apple's C convention). Large aggregates stay in the
@@ -1921,7 +1931,8 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    `DW_CFA_offset` after its push in .eh_frame. `.auto` passes values of
    up to 8 bytes in rdi, rsi, rdx, rcx, r8, r9, values of 9 to 16 bytes
    in two consecutive ones (their bytes as eightbytes; a pair never splits
-   with the stack), f16, f32, and f64 in xmm0–xmm7, and the rest in the
+   with the stack), f16, f32, and f64 in xmm0–xmm7, larger values by
+   reference (a pointer; see the `.auto` calling convention above), and the rest in the
    outgoing area; results in rax (and rdx) or xmm0, larger ones through a
    pointer in rdi, which then takes the first argument register. The
    error return trace pointer is in rax; a function that neither reads it

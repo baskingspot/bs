@@ -598,6 +598,9 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
             }
         }
         count[v] = no_tie;
+        // Only a forwarded alloc keeps its store (read below); `fwd` of
+        // any other value is a forwarded load's.
+        if (fate[v] != .dead) fwd[v] = no_tie;
     }
     const crosses = live.items(.crosses);
     const end = live.items(.end);
