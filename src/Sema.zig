@@ -972,6 +972,26 @@ fn rootBlock(sema: *Sema, namespace: u32, src_base: Ast.Node.Index, is_comptime:
     };
 }
 
+/// As upstream's `handleExternLibName`: a declaration from libc needs
+/// `-lc`, and zap links neither libc++ nor libunwind.
+fn checkExternLibName(sema: *Sema, block: *Block, decl_src: Src, name: []const u8) CompileError!void {
+    // `-lc++` also links libunwind, as upstream's executables do.
+    const what = if (std.mem.eql(u8, name, "c"))
+        (if (sema.zcu.link_libc) return else "libc")
+    else if (std.mem.eql(u8, name, "c++") or std.mem.eql(u8, name, "stdc++") or std.mem.eql(u8, name, "c++abi") or std.mem.eql(u8, name, "supc++"))
+        (if (sema.zcu.link_libcpp) return else "libc++")
+    else if (std.mem.eql(u8, name, "unwind"))
+        (if (sema.zcu.link_libcpp) return else "libunwind")
+    else
+        return;
+    // The library name is the declaration's first string literal.
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    const first = tree.firstToken(decl_src.base);
+    var tok = first;
+    while (tree.tokenTag(tok) != .string_literal) tok += 1;
+    return sema.fail(block, .{ .base = decl_src.base, .loc = .{ .token = .init(first, tok) } }, "dependency on {s} must be explicitly specified in the build command", .{what});
+}
+
 pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!void {
     const nav = zcu.ip.getNav(nav_index);
     var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
@@ -1014,6 +1034,7 @@ pub fn analyzeNavVal(zcu: *Zcu, nav_index: InternPool.NavIndex) CompileError!voi
         try sema.resolveLayoutIfIdle(&block, src, decl_ty);
         if (Type.class(sema.ip, decl_ty) != .@"fn")
             try sema.checkExtern(&block, src.varTy(), decl_ty, .other, "extern variable cannot have type '{f}'", .{FmtType{ .ip = sema.ip, .ty = decl_ty, .decl_note = false }});
+        if (decl.lib_name != .empty) try sema.checkExternLibName(&block, src, sema.code.nullTerminatedString(decl.lib_name));
         return sema.finish();
     }
     // Within the value body, the `declaration` instruction refers to the type.

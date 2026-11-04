@@ -137,6 +137,10 @@ is_test: bool = false,
 /// `-fsingle-threaded`: `threadlocal` variables are ordinary globals, as
 /// upstream (std's start code sets up no thread pointer then).
 single_threaded: bool = false,
+/// `-lc`: `extern "c"` declarations may be used (`Sema.checkExternLibName`).
+link_libc: bool = false,
+/// `-lc++`: `extern "c++"` and `extern "unwind"` declarations may be used.
+link_libcpp: bool = false,
 /// `zap test --test-filter`: keep only named tests whose fqn contains one.
 test_filters: []const []const u8 = &.{},
 /// Test declarations to run, in discovery order.

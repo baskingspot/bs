@@ -685,6 +685,8 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     zcu.is_test = is_test;
     zcu.name_pins = pins.*;
     zcu.single_threaded = opts.single_threaded;
+    zcu.link_libc = opts.link_libc;
+    zcu.link_libcpp = opts.link_libcpp;
     zcu.test_filters = opts.test_filters;
     // `ZAP_COMPTIME_EVAL=n`: lower a function for the comptime evaluator
     // after n walker runs (0: never), for testing it.

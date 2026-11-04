@@ -1395,6 +1395,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "'@memcpy' arguments alias", .@"bad-operands" },
     .{ "@atomicLoad atomic ordering must not be release or acq_rel", .@"bad-operands" },
     .{ "cannot specify alignment of {s}", .@"bad-var-decl" },
+    .{ "dependency on {s} must be explicitly specified in the build command", .unsupported },
     .{ "non-extern variable with opaque type '{f}'", .@"bad-var-decl" },
     .{ "packed {t} fields cannot be aligned", .@"bad-container" },
     .{ "pointer value not based on parent struct", .@"bad-cast" },
