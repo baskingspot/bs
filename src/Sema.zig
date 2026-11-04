@@ -480,6 +480,9 @@ pub const Src = struct {
         /// The field name of the struct init field whose initializer is at
         /// `node` (upstream's `init_field_name`).
         init_name: Ast.Node.Offset,
+        /// The type of the array or struct initialization at `node`
+        /// (upstream's `node_offset_init_ty`).
+        init_ty: Ast.Node.Offset,
         /// The capture of the `for` loop input at `node` (upstream's
         /// `for_capture_from_input`).
         for_capture: Ast.Node.Offset,
@@ -640,6 +643,12 @@ pub const Src = struct {
                     };
                 }
                 return tree.nodeToSpan(input);
+            },
+            .init_ty => |off| {
+                const node = off.toAbsolute(src.base);
+                var buf: [2]Ast.Node.Index = undefined;
+                const ty_node = if (tree.fullArrayInit(&buf, node)) |a| a.ast.type_expr.unwrap() else if (tree.fullStructInit(&buf, node)) |si| si.ast.type_expr.unwrap() else null;
+                return tree.nodeToSpan(ty_node orelse node);
             },
             .var_ty => |off| {
                 const node = off.toAbsolute(src.base);
@@ -1429,13 +1438,22 @@ fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.Con
             offsets[i] = bits;
             bits += fb;
         }
+        // As upstream: the backing type at the container's argument, the
+        // bit widths at the declaration.
+        const arg_src: Src = .{ .base = cont_src.base, .loc = .{ .container_arg = .zero } };
         const backing: Index = if (explicit_backing != .none) blk: {
             const t = explicit_backing;
-            if (Type.class(ip, t) != .int) return sema.fail(block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(t)});
-            if (Type.intInfo(ip, t).bits != bits) return sema.fail(block, src, "backing integer type '{f}' has bit size {d} but the struct fields have a total bit size of {d}", .{ sema.fmtType(t), Type.intInfo(ip, t).bits, bits });
+            if (Type.class(ip, t) != .int) return sema.fail(block, arg_src, "expected backing integer type, found '{f}'", .{sema.fmtType(t)});
+            if (Type.intInfo(ip, t).bits != bits) {
+                const err = sema.fail(block, cont_src, "backing integer bit width does not match total bit width of fields", .{});
+                const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+                try sema.zcu.addNote(sema.file, arg_src.span(tree), "backing integer '{f}' has bit width '{d}'", .{ sema.fmtType(t), Type.intInfo(ip, t).bits });
+                try sema.zcu.addNote(sema.file, cont_src.span(tree), "struct fields have total bit width '{d}'", .{bits});
+                return err;
+            }
             break :blk t;
         } else blk: {
-            if (bits > std.math.maxInt(u16)) return sema.fail(block, src, "size of packed struct '{d}' exceeds maximum bit width of 65535", .{bits});
+            if (bits > std.math.maxInt(u16)) return sema.fail(block, cont_src, "packed struct bit width '{d}' exceeds maximum bit width of 65535", .{bits});
             break :blk try sema.intType(.unsigned, @intCast(bits));
         };
         info.field_offsets = offsets;
@@ -1599,6 +1617,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     defer block.deinitInsts();
     const src = block.nodeSrc(.zero);
     const cont_src: Src = if (reify_node == null) .{ .base = decl.src_node, .loc = .{ .node = .zero } } else src;
+    const arg_src: Src = if (reify_node == null) .{ .base = decl.src_node, .loc = .{ .container_arg = .zero } } else src;
     var kind: Zir.Inst.UnionDecl.Kind = undefined;
     var arg_ty: Index = .none;
     if (reify_node != null) {
@@ -1653,7 +1672,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
         // unions in Debug) a hidden integer safety tag.
         switch (kind) {
             .tagged_explicit => {
-                if (ip.keyTag(arg_ty) != .enum_type) return sema.fail(&block, src, "expected enum tag type, found '{f}'", .{sema.fmtType(arg_ty)});
+                if (ip.keyTag(arg_ty) != .enum_type) return sema.fail(&block, arg_src, "expected enum tag type, found '{f}'", .{sema.fmtType(arg_ty)});
                 try sema.resolveLayout(&block, src, arg_ty);
                 const tag_info = ip.structInfo(arg_ty);
                 // As upstream: a union field the enum lacks, an enum field the
@@ -1723,11 +1742,28 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                 for (types, field_bits, 0..) |ft, *b, i| b.* = sema.packedFieldBits(ft) orelse
                     return sema.failUnpackable(&block, cont_src.fieldSrc(@intCast(i), .type), "packed unions cannot contain fields of type '{f}'", ft);
                 const backing = if (arg_ty != .none) blk: {
-                    if (Type.class(ip, arg_ty) != .int) return sema.fail(&block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(arg_ty)});
-                    for (field_bits) |b| if (b != Type.intInfo(ip, arg_ty).bits) return sema.fail(&block, src, "field bit width does not match backing integer", .{});
+                    if (Type.class(ip, arg_ty) != .int) return sema.fail(&block, arg_src, "expected backing integer type, found '{f}'", .{sema.fmtType(arg_ty)});
+                    const backing_bits = Type.intInfo(ip, arg_ty).bits;
+                    for (field_bits, 0..) |b, i| if (b != backing_bits) {
+                        const ty_src = cont_src.fieldSrc(i, .type);
+                        const err = sema.fail(&block, ty_src, "field bit width does not match backing integer", .{});
+                        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+                        try sema.zcu.addNote(sema.file, ty_src.span(tree), "field type '{f}' has bit width '{d}'", .{ sema.fmtType(types[i]), b });
+                        try sema.zcu.addNote(sema.file, arg_src.span(tree), "backing integer '{f}' has bit width '{d}'", .{ sema.fmtType(arg_ty), backing_bits });
+                        try sema.zcu.addNote(sema.file, ty_src.span(tree), "all fields in a packed union must have the same bit width", .{});
+                        return err;
+                    };
                     break :blk arg_ty;
                 } else blk: {
-                    for (field_bits[1..]) |b| if (b != field_bits[0]) return sema.fail(&block, src, "field bit width does not match earlier field", .{});
+                    for (field_bits[1..], 1..) |b, i| if (b != field_bits[0]) {
+                        const ty_src = cont_src.fieldSrc(i, .type);
+                        const err = sema.fail(&block, ty_src, "field bit width does not match earlier field", .{});
+                        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+                        try sema.zcu.addNote(sema.file, ty_src.span(tree), "field type '{f}' has bit width '{d}'", .{ sema.fmtType(types[i]), b });
+                        try sema.zcu.addNote(sema.file, cont_src.fieldSrc(0, .type).span(tree), "other field type '{f}' has bit width '{d}'", .{ sema.fmtType(types[0]), field_bits[0] });
+                        try sema.zcu.addNote(sema.file, ty_src.span(tree), "all fields in a packed union must have the same bit width", .{});
+                        return err;
+                    };
                     break :blk try sema.intType(.unsigned, field_bits[0]);
                 };
                 info.tag_type = backing;
@@ -3376,7 +3412,18 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                         _ = try sema.addInst(block, .{ .tag = if (block.want_safety) .trap else .unreach, .data = .{ .no_op = {} } });
                         return;
                     }
-                    if (fn_ty.return_type == .noreturn_type) return sema.fail(block, src, "function declared 'noreturn' implicitly returns", .{});
+                    // As upstream: at the return type, with a note at the
+                    // closing brace.
+                    const base = Type.class(sema.ip, sema.unwrapOptEu(fn_ty.return_type));
+                    if (base != .void) {
+                        const ret_src: Src = .{ .base = block.src_base, .loc = .{ .fn_ret_ty = .zero } };
+                        const err = if (base == .noreturn)
+                            sema.fail(block, ret_src, "function declared '{f}' implicitly returns", .{sema.fmtType(fn_ty.return_type)})
+                        else
+                            sema.fail(block, ret_src, "function with non-void return type '{f}' implicitly returns", .{sema.fmtType(fn_ty.return_type)});
+                        try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "control flow reaches end of body here", .{});
+                        return err;
+                    }
                 }
                 const operand = if (tags[@backingInt(inst)] == .ret_node) data.un_node.operand else data.un_tok.operand;
                 const src = if (tags[@backingInt(inst)] == .ret_node) block.nodeSrc(data.un_node.src_node) else block.tokSrc(data.un_tok.src_tok);
@@ -3459,13 +3506,38 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
                 i += 1;
                 continue;
             },
+            .validate_array_init_ty => {
+                // As upstream: a type that takes no array initializer is
+                // reported at the type.
+                const extra = sema.code.extraData(Zir.Inst.ArrayInit, data.pl_node.payload_index).data;
+                const ty_src: Src = .{ .base = block.src_base, .loc = .{ .init_ty = data.pl_node.src_node } };
+                const ty = try sema.resolveType(block, ty_src, extra.ty);
+                switch (sema.ip.keyTag(ty)) {
+                    .array_type, .vector_type, .tuple_type => {},
+                    else => if (ty != .generic_poison_type)
+                        return sema.fail(block, ty_src, "type '{f}' does not support array initialization syntax", .{sema.fmtType(ty)}),
+                }
+                i += 1;
+                continue;
+            },
+            .validate_ref_ty => {
+                // As upstream: `&x` with a result type that is not a pointer.
+                const un_tok = data.un_tok;
+                const ty = try sema.resolveType(block, block.tokSrc(un_tok.src_tok), un_tok.operand);
+                if (ty != .generic_poison_type and Type.class(sema.ip, sema.unwrapOptEu(ty)) != .pointer) {
+                    const src = block.tokSrc(un_tok.src_tok);
+                    const err = sema.fail(block, src, "expected type '{f}', found pointer", .{sema.fmtType(ty)});
+                    try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "address-of operator always returns a pointer", .{});
+                    return err;
+                }
+                i += 1;
+                continue;
+            },
             .dbg_var_ptr,
             .dbg_var_val,
             .validate_struct_init_ty,
             .validate_struct_init_result_ty,
-            .validate_array_init_ty,
             .validate_array_init_result_ty,
-            .validate_ref_ty,
             .set_eval_branch_quota,
             => {
                 if (tags[@backingInt(inst)] == .set_eval_branch_quota) {
@@ -4188,7 +4260,12 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const extra = sema.code.extraData(Zir.Inst.As, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
             const dest = try sema.resolveType(block, src, extra.dest_type);
-            break :blk sema.coerce(block, dest, sema.resolveInst(extra.operand), src);
+            const operand = sema.resolveInst(extra.operand);
+            // A runtime amount stays as it is for a `comptime_int` operand;
+            // the shift reports it, as upstream.
+            if (tag == .as_shift_operand and dest == .comptime_int_type and sema.resolveValue(operand) == null and Type.isInt(sema.ip, sema.typeOf(operand)))
+                break :blk operand;
+            break :blk sema.coerce(block, dest, operand, src);
         },
 
         // Memory.
@@ -4666,9 +4743,10 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .field_type_ref => blk: {
             const extra = sema.code.extraData(Zir.Inst.FieldTypeRef, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const ty = try sema.resolveType(block, src, extra.container_type);
-            const name = try sema.resolveConstString(block, src, sema.resolveInst(extra.field_name));
-            break :blk .fromInterned(try sema.fieldTypeByName(block, src, ty, name));
+            const ty = try sema.resolveType(block, sema.callArgSrc(src, false, 0), extra.container_type);
+            const name_src = sema.callArgSrc(src, false, 1);
+            const name = try sema.resolveConstString(block, name_src, sema.resolveInst(extra.field_name));
+            break :blk .fromInterned(try sema.fieldTypeByName(block, name_src, ty, name));
         },
         .error_name => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
@@ -7901,7 +7979,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                 if (!sema.intFits(v, dest_ty)) return sema.fail(block, src, "type '{f}' cannot represent integer value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(v) });
                 return .fromInterned(try sema.retypeInt(v, dest_ty));
             }
-            if (dc == .comptime_int or sc == .comptime_int) return sema.fail(block, src, "unable to resolve comptime value", .{});
+            if (dc == .comptime_int or sc == .comptime_int) return sema.failNeededComptime(block, src, "value casted to 'comptime_int' must be comptime-known");
             const s = Type.intInfo(ip, src_ty);
             // A zero-bit integer has one possible value, so it is
             // comptime-known even at runtime, as upstream.
@@ -7914,7 +7992,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
             return null;
         } else if (sc == .float or sc == .comptime_float) {
             const v = val orelse {
-                if (dc == .comptime_int) return sema.fail(block, src, "unable to resolve comptime value", .{});
+                if (dc == .comptime_int) return sema.failNeededComptime(block, src, "value casted to 'comptime_int' must be comptime-known");
                 return null;
             };
             return .fromInterned(try sema.intFromFloat(block, src, v, dest_ty, .exact));
@@ -7928,13 +8006,13 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
                         return sema.fail(block, src, "type '{f}' cannot represent float value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(v) });
                     return .fromInterned(r);
                 }
-                if (dc == .comptime_float) return sema.fail(block, src, "unable to resolve comptime value", .{});
+                if (dc == .comptime_float) return sema.failNeededComptime(block, src, "value casted to 'comptime_float' must be comptime-known");
                 if (Type.floatBits(ip, dest_ty) >= Type.floatBits(ip, src_ty)) return try sema.addTyOp(block, .float_cast, dest_ty, inst);
                 return null;
             },
             .int, .comptime_int => {
                 const v = val orelse {
-                    if (dc == .comptime_float) return sema.fail(block, src, "unable to resolve comptime value", .{});
+                    if (dc == .comptime_float) return sema.failNeededComptime(block, src, "value casted to 'comptime_float' must be comptime-known");
                     const info = Type.intInfo(ip, src_ty);
                     if (info.bits - @intFromBool(info.signedness == .signed) <= Type.floatSignificandBits(ip, dest_ty))
                         return try sema.addTyOp(block, .float_from_int, dest_ty, inst);
@@ -9321,7 +9399,9 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
                         try q.divTrunc(&r, &try sema.bigValue(lv.?), &try sema.bigValue(rv.?));
                         break :blk r.eqlZero();
                     };
-                    if (!zero) return sema.fail(block, src, "remainder division with '{f}' and '{f}': signed integers and floats must use @rem or @mod", .{ sema.fmtType(ty), sema.fmtType(ty) });
+                    // At the first operand that may be negative, as upstream.
+                    const at: u32 = if (lv == null or sema.isUndef(lv.?) or sema.intSign(lv.?) < 0) 0 else 1;
+                    if (!zero) return sema.fail(block, src.operandSrc(at), "remainder division with '{f}' and '{f}': signed integers and floats must use @rem or @mod", .{ sema.fmtType(ty), sema.fmtType(ty) });
                 }
             }
         }
@@ -9668,7 +9748,7 @@ fn analyzeShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, lhs: Re
     if (sema.vectorLen(sema.typeOf(uncasted_rhs)) != null)
         return sema.fail(block, src, "mixed scalar and vector operands: '{f}' and '{f}'", .{ sema.fmtType(ty), sema.fmtType(sema.typeOf(uncasted_rhs)) });
     const class = Type.class(ip, ty);
-    if (class != .int and class != .comptime_int) return sema.fail(block, src, "bit shifting operation expected integer type, found '{f}'", .{sema.fmtType(ty)});
+    if (class != .int and class != .comptime_int) return sema.fail(block, src.operandSrc(0), "bit shifting operation expected integer type, found '{f}'", .{sema.fmtType(ty)});
     // `<<|` takes any integer amount; AstGen coerces the others' amounts.
     const sat = tag == .shl_sat;
     const left = tag != .shr and tag != .shr_exact;
@@ -9682,7 +9762,7 @@ fn analyzeShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, lhs: Re
             if (sat) return .fromInterned(try sema.undefValue(ty));
             return sema.fail(block, src.operandSrc(1), "use of undefined value here causes illegal behavior", .{});
         }
-        if (sema.intSign(v) < 0) return sema.fail(block, src, "shift by negative amount '{f}'", .{sema.fmtValue(v)});
+        if (sema.intSign(v) < 0) return sema.fail(block, src.operandSrc(1), "shift by negative amount '{f}'", .{sema.fmtValue(v)});
         const amount = sema.ip.intValue(u64, v) orelse std.math.maxInt(u64);
         if (!sat and class == .int and amount > 0 and amount >= Type.intInfo(ip, ty).bits)
             return sema.fail(block, src.operandSrc(1), "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
@@ -9753,7 +9833,7 @@ fn shlSat(sema: *Sema, block: *Block, src: Src, ty: Index, shift_ty: Index, lhs:
     } else {
         const rhs_ty = sema.typeOf(rhs);
         const r = Type.intInfo(ip, rhs_ty);
-        if (r.signedness == .signed) return sema.fail(block, src, "shift by signed type '{f}'", .{sema.fmtType(rhs_ty)});
+        if (r.signedness == .signed) return sema.fail(block, src.operandSrc(1), "shift by signed type '{f}'", .{sema.fmtType(rhs_ty)});
         const s_bits = Type.intInfo(ip, shift_ty).bits;
         var clamped = rhs;
         if (r.bits >= 64 or (@as(u64, 1) << @intCast(r.bits)) > bits) {
@@ -10090,7 +10170,8 @@ fn analyzeFloatArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Ta
             const neg = !sema.numCompare(lv.?, .gte, zero) or !sema.numCompare(rv.?, .gte, zero);
             if (!neg or sema.numCompare(r, .eq, zero)) return .fromInterned(r);
         }
-        return sema.fail(block, src, "remainder division with '{f}' and '{f}': signed integers and floats must use @rem or @mod", .{ sema.fmtType(lt), sema.fmtType(rt) });
+        const at: u32 = if (lv == null or sema.isUndef(lv.?) or !sema.numCompare(lv.?, .gte, zero)) 0 else 1;
+        return sema.fail(block, src.operandSrc(at), "remainder division with '{f}' and '{f}': signed integers and floats must use @rem or @mod", .{ sema.fmtType(lt), sema.fmtType(rt) });
     }
 
     // `/` of a `comptime_int` and a `comptime_float` must not depend on
@@ -10439,7 +10520,7 @@ fn analyzeFloatToInt(sema: *Sema, block: *Block, src: Src, dest_ty: Index, opera
     if (ty == .comptime_int_type) return sema.coerce(block, dest_ty, operand, src);
     if (class != .float and class != .comptime_float) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected float type, found '{f}'", .{sema.fmtType(ty)});
     if (sema.resolveValue(operand)) |v| return .fromInterned(try sema.intFromFloat(block, sema.callArgSrc(src, false, 0), v, dest_ty, mode));
-    if (dest_ty == .comptime_int_type) return sema.fail(block, src, "unable to resolve comptime value", .{});
+    if (dest_ty == .comptime_int_type) return sema.failNeededComptime(block, sema.callArgSrc(src, false, 0), "value casted to 'comptime_int' must be comptime-known");
     try sema.requireRuntime(block, src);
     return sema.analyzeIntFromFloat(block, src, operand, dest_ty, mode);
 }
@@ -10463,7 +10544,7 @@ fn analyzeFloatFromInt(sema: *Sema, block: *Block, src: Src, dest_ty: Index, ope
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
         return .fromInterned(try sema.floatValue(dest_ty, sema.toF128(v)));
     }
-    if (dc == .comptime_float) return sema.fail(block, src, "unable to resolve comptime value", .{});
+    if (dc == .comptime_float) return sema.failNeededComptime(block, sema.callArgSrc(src, false, 0), "value casted to 'comptime_float' must be comptime-known");
     try sema.requireRuntime(block, src);
     return sema.addTyOp(block, .float_from_int, dest_ty, operand);
 }
@@ -13933,7 +14014,7 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
         .vector_type => |v| {
             const index = try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1));
             if (v.len == 0) return sema.fail(block, src, "cannot index into empty vector", .{});
-            if (sema.resolveValue(index) == null) return sema.fail(block, src, "vector index not comptime known", .{});
+            if (sema.resolveValue(index) == null) return sema.fail(block, src.operandSrc(1), "vector index not comptime known", .{});
             try sema.boundsCheck(block, src, index, .fromInterned(try sema.intValue(.usize_type, v.len)), false);
             // Bool vectors are bit-packed; other vectors are laid out like arrays.
             if (v.child == .bool_type and sema.resolveValue(ptr) == null) {
@@ -14112,7 +14193,7 @@ fn elemVal(sema: *Sema, block: *Block, src: Src, lhs: Ref, uncasted_index: Ref, 
 fn runtimeElemAccess(sema: *Sema, block: *Block, src: Src, elem_ty: Index) CompileError!void {
     if (sema.bc != null and elem_ty == .comptime_int_type) return;
     if (try sema.isComptimeOnlyResolved(block, src, elem_ty))
-        return sema.fail(block, src, "values of type '{f}' must be comptime-known, but index value is runtime-known", .{sema.fmtType(elem_ty)});
+        return sema.fail(block, src.operandSrc(1), "values of type '{f}' must be comptime-known, but index value is runtime-known", .{sema.fmtType(elem_ty)});
 }
 
 fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
@@ -14265,7 +14346,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         if (sentinel_ref != .none) {
             const casted = try sema.coerce(block, elem_ty, sema.resolveInst(sentinel_ref), sentinel_src);
             const provided = try sema.resolveConstValue(block, sentinel_src, casted, "slice sentinel value must be comptime-known");
-            if (provided != ptr_sentinel) return sema.fail(block, src, "sentinel-terminated slicing of many-item pointer must match existing sentinel", .{});
+            if (provided != ptr_sentinel) return sema.fail(block, sentinel_src, "sentinel-terminated slicing of many-item pointer must match existing sentinel", .{});
         }
         return sema.analyzePtrArithmetic(block, src, true, many_obj, start);
     } else {
@@ -14312,7 +14393,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     if (start_val != null and end_val != null) {
         const sv = ip.intValue(u64, start_val.?).?;
         const ev = ip.intValue(u64, end_val.?).?;
-        if (sv > ev) return sema.fail(block, src, "start index {d} is larger than end index {d}", .{ sv, ev });
+        if (sv > ev) return sema.fail(block, start_src, "start index {d} is larger than end index {d}", .{ sv, ev });
     } else if (block.want_safety and !block.is_comptime and !start_zero) {
         const ok = try sema.addBinOp(block, .cmp_lte, start, end);
         try sema.addSafetyCheck(block, ok, .start_greater_than_end, start, end);
@@ -17435,7 +17516,8 @@ fn fieldCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         // A field holding a function (pointer) is called.
         try sema.resolveStructFields(block, src, container);
         if (ip.structInfo(container).fieldIndex(ip, name) != null) {
-            const callee = try sema.fieldVal(block, src, obj, name);
+            // Errors about the field point at the callee, as upstream.
+            const callee = try sema.fieldVal(block, src.callFunc(), obj, name);
             return sema.analyzeCall(block, src, callee, .none, args, modifier);
         }
     }
