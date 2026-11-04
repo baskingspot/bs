@@ -29,7 +29,11 @@ def bs_errors(bs, path):
     """bs's diagnostics for `path` (run from its directory), as dicts."""
     out = subprocess.run(
         [bs, "build-exe", "-target", "x86_64-linux", "-fno-emit-bin", "--error-format=json", os.path.basename(path)],
-        cwd=os.path.dirname(path), capture_output=True, text=True, env=dict(os.environ, BS_CACHE="off"),
+        cwd=os.path.dirname(path),
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, BS_CACHE="off"),
+        check=False,
     )
     diags = []
     for line in out.stdout.splitlines() + out.stderr.splitlines():
@@ -43,16 +47,22 @@ def bs_errors(bs, path):
 
 def upstream_errors(zig, path):
     """Upstream's errors for `path` as (byte offset, message)."""
-    out = subprocess.run([zig, "build-exe", "-fno-emit-bin", os.path.basename(path)],
-                         cwd=os.path.dirname(path), capture_output=True, text=True)
-    lines = open(path, "rb").read().split(b"\n")
+    out = subprocess.run(
+        [zig, "build-exe", "-fno-emit-bin", os.path.basename(path)],
+        cwd=os.path.dirname(path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    with open(path, "rb") as f:
+        lines = f.read().split(b"\n")
     errs = []
     for line in out.stderr.splitlines():
         head, sep, msg = line.partition(": error: ")
         if not sep:
             continue
         _, ln, col = head.rsplit(":", 2)
-        errs.append((sum(len(l) + 1 for l in lines[:int(ln) - 1]) + int(col) - 1, msg))
+        errs.append((sum(len(l) + 1 for l in lines[: int(ln) - 1]) + int(col) - 1, msg))
     return errs
 
 

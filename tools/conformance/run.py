@@ -232,7 +232,7 @@ def crash_log(stderr):
     lines = stderr.splitlines()
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].startswith(PROTOCOL_PREFIX + "start "):
-            lines = lines[i + 1:]
+            lines = lines[i + 1 :]
             break
     stderr = "\n".join(lines).strip()
     return stderr if len(stderr) <= 1500 else stderr[:1500] + "\n..."
@@ -252,7 +252,15 @@ def compile_unit(compiler, unit, cfg, args, workdir, env=None):
     if bin_path.exists():
         bin_path.unlink()
     editable = args.edit_verify and unit != ROOT_UNIT
-    argv = [str(compiler), "test", str(unit_root(unit, workdir, editable) if env is None else workdir / "units" / unit[: -len(".zig")] / "behavior.zig")]
+    argv = [
+        str(compiler),
+        "test",
+        str(
+            unit_root(unit, workdir, editable)
+            if env is None
+            else workdir / "units" / unit[: -len(".zig")] / "behavior.zig"
+        ),
+    ]
     if not args.default_runner:
         argv += ["--test-runner", str(args.test_runner)]
     argv += ["-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}"]
@@ -262,7 +270,11 @@ def compile_unit(compiler, unit, cfg, args, workdir, env=None):
     if code == 0 and not timed_out and bin_path.exists():
         return bin_path, None
     if env is not None:
-        return None, {"status": "edit_verify_failed", "log": describe_exit(code, timed_out, args.compile_timeout) + "\n" + tail(err + out), "tests": {}}
+        return None, {
+            "status": "edit_verify_failed",
+            "log": describe_exit(code, timed_out, args.compile_timeout) + "\n" + tail(err + out),
+            "tests": {},
+        }
     if timed_out:
         status = "compile_timeout"
     elif code < 0:
@@ -282,9 +294,7 @@ def run_unit(bin_path, owns, args, workdir):
     log = None
     start = 0
     while True:
-        code, out, err, timed_out = run_process(
-            [str(bin_path), f"--start={start}"], workdir, args.run_timeout
-        )
+        code, out, err, timed_out = run_process([str(bin_path), f"--start={start}"], workdir, args.run_timeout)
         current = None
         first_start = None
         count = None
@@ -292,7 +302,7 @@ def run_unit(bin_path, owns, args, workdir):
         for line in out.splitlines():
             if not line.startswith(PROTOCOL_PREFIX):
                 continue
-            parts = line[len(PROTOCOL_PREFIX):].split(" ", 2)
+            parts = line[len(PROTOCOL_PREFIX) :].split(" ", 2)
             kind = parts[0]
             try:
                 if kind == "v1":
@@ -369,7 +379,7 @@ def run_unit(bin_path, owns, args, workdir):
 
 CLIENT_EXIT, CLIENT_QUERY_TEST_METADATA, CLIENT_RUN_TEST = 0, 4, 5
 SERVER_ZIG_VERSION, SERVER_TEST_METADATA, SERVER_TEST_RESULTS, SERVER_TEST_STARTED = 0, 3, 4, 5
-TERMINAL_SUMMARY_RE = re.compile(r"^(All \d+ tests passed\.|\d+ passed; \d+ skipped; \d+ failed\.)", re.M)
+TERMINAL_SUMMARY_RE = re.compile(r"^(All \d+ tests passed\.|\d+ passed; \d+ skipped; \d+ failed\.)", re.MULTILINE)
 
 
 class ServerSession:
@@ -377,8 +387,12 @@ class ServerSession:
 
     def __init__(self, bin_path, workdir):
         self.proc = subprocess.Popen(
-            [str(bin_path), "--listen=-"], cwd=workdir, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+            [str(bin_path), "--listen=-"],
+            cwd=workdir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
         with _live_lock:
             _live.add(self.proc)
@@ -393,6 +407,7 @@ class ServerSession:
 
     def _read(self, n, deadline):
         import select
+
         fd = self.proc.stdout.fileno()
         while len(self.buf) < n:
             left = deadline - time.monotonic()
@@ -446,9 +461,9 @@ def query_test_names(bin_path, args, workdir):
             raise EOFError
         strings_len = int.from_bytes(body[0:4], "little")
         n = int.from_bytes(body[4:8], "little")
-        offs = [int.from_bytes(body[8 + 4 * i:12 + 4 * i], "little") for i in range(n)]
-        strings = body[8 + 8 * n:8 + 8 * n + strings_len]
-        names = [strings[o:strings.index(b"\0", o)].decode("utf-8", "replace") for o in offs]
+        offs = [int.from_bytes(body[8 + 4 * i : 12 + 4 * i], "little") for i in range(n)]
+        strings = body[8 + 8 * n : 8 + 8 * n + strings_len]
+        names = [strings[o : strings.index(b"\0", o)].decode("utf-8", "replace") for o in offs]
         s.close()
         return names, None
     except (EOFError, TimeoutError, OSError):
@@ -475,13 +490,13 @@ def parse_terminal(err, names):
         if k + 1 == len(starts):
             m = TERMINAL_SUMMARY_RE.search(seg)
             if m:
-                seg = seg[:m.start()]
+                seg = seg[: m.start()]
         m = re.search(r"(?:^|(?<=\.\.\.)|\n)(OK|SKIP|FAIL \((.*?)\))\n", seg)
         if not m:
             out[i] = (None, seg)
             continue
         if m.group(1) == "OK":
-            out[i] = ("leak" if "leaked" in seg[m.end():] else "pass", None)
+            out[i] = ("leak" if "leaked" in seg[m.end() :] else "pass", None)
         elif m.group(1) == "SKIP":
             out[i] = ("skip", None)
         else:
@@ -492,14 +507,20 @@ def parse_terminal(err, names):
 def run_unit_default(bin_path, owns, args, workdir):
     names, err = query_test_names(bin_path, args, workdir)
     if names is None:
-        return {"status": "incomplete", "log": "the test runner did not answer on --listen=-\n" + tail(err or ""), "tests": {}}
+        return {
+            "status": "incomplete",
+            "log": "the test runner did not answer on --listen=-\n" + tail(err or ""),
+            "tests": {},
+        }
     by_index = {}
-    code, out, err, timed_out = run_process([str(bin_path)], workdir, args.run_timeout)
+    code, _out, err, timed_out = run_process([str(bin_path)], workdir, args.run_timeout)
     parsed = parse_terminal(err, names)
     for i, (outcome, detail) in parsed.items():
         by_index[i] = [outcome, detail]
     status, log = "ok", None
-    finished = TERMINAL_SUMMARY_RE.search(err) is not None and len(parsed) == len(names) and all(o for o, _ in parsed.values())
+    finished = (
+        TERMINAL_SUMMARY_RE.search(err) is not None and len(parsed) == len(names) and all(o for o, _ in parsed.values())
+    )
     if not finished:
         how = describe_exit(code, timed_out, args.run_timeout)
         if not parsed or by_index[max(parsed)][0] is not None:
@@ -536,7 +557,10 @@ def run_unit_default(bin_path, owns, args, workdir):
                         status, log = "incomplete", "the test runner did not answer on --listen=-\n" + tail(serr)
                         break
                     code = s.proc.returncode
-                    by_index[current] = ["timeout" if timed else "crash", describe_exit(code, timed, args.run_timeout) + "\n" + tail(serr, 1500)]
+                    by_index[current] = [
+                        "timeout" if timed else "crash",
+                        describe_exit(code, timed, args.run_timeout) + "\n" + tail(serr, 1500),
+                    ]
                     start = current + 1
     tests, details = {}, {}
     for i in sorted(by_index):
@@ -677,13 +701,21 @@ def full_run(zig, cfg, args, workdir):
     bin_path = workdir / "bin" / cfg["name"] / "behavior-full.test"
     bin_path.parent.mkdir(parents=True, exist_ok=True)
     argv = [
-        str(zig), "test", str(UPSTREAM_TEST / "behavior.zig"),
-        "--test-runner", str(args.test_runner),
-        "-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}",
+        str(zig),
+        "test",
+        str(UPSTREAM_TEST / "behavior.zig"),
+        "--test-runner",
+        str(args.test_runner),
+        "-target",
+        cfg["zig_target"],
+        "--test-no-exec",
+        f"-femit-bin={bin_path}",
     ]
-    code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout * 4)
+    code, _out, err, timed_out = run_process(argv, workdir, args.compile_timeout * 4)
     if code != 0 or timed_out:
-        sys.exit(f"error: compiling all of behavior.zig failed ({describe_exit(code, timed_out, args.compile_timeout * 4)}):\n{tail(err)}")
+        sys.exit(
+            f"error: compiling all of behavior.zig failed ({describe_exit(code, timed_out, args.compile_timeout * 4)}):\n{tail(err)}"
+        )
     try:
         r = run_unit(bin_path, lambda _name: True, args, workdir)
     finally:
@@ -707,7 +739,7 @@ def upstream_target(zig, cfg, args, workdir):
     backend = pop_backends(files)
 
     per_file = {}
-    for unit, r in files.items():
+    for r in files.values():
         for key, outcome in r["tests"].items():
             per_file[key] = outcome
     mismatches = {}
@@ -718,7 +750,7 @@ def upstream_target(zig, cfg, args, workdir):
                 mismatches[key] = {"full_run": a, "per_file": b}
 
     counts = count_outcomes(per_file.values())
-    zig_version = subprocess.run([str(zig), "version"], capture_output=True, text=True).stdout.strip()
+    zig_version = subprocess.run([str(zig), "version"], capture_output=True, text=True, check=False).stdout.strip()
     data = {
         "format": FORMAT,
         "target": cfg["name"],
@@ -742,7 +774,9 @@ def upstream_target(zig, cfg, args, workdir):
     }
     out = args.out or BASELINE_DIR / f"{cfg['name']}.json"
     write_json(out, data)
-    check = "full-run cross-check identical" if not mismatches else f"full-run cross-check: {len(mismatches)} mismatches"
+    check = (
+        "full-run cross-check identical" if not mismatches else f"full-run cross-check: {len(mismatches)} mismatches"
+    )
     if args.files:
         check = "full-run cross-check skipped (--files)"
     print(
@@ -758,7 +792,7 @@ def upstream_target(zig, cfg, args, workdir):
 def build_bs(workdir, zig):
     prefix = workdir / "bs"
     argv = [zig, "build", "-Doptimize=ReleaseSafe", "-p", str(prefix)]
-    proc = subprocess.run(argv, cwd=REPO, capture_output=True, text=True)
+    proc = subprocess.run(argv, cwd=REPO, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         sys.exit(f"error: building bs failed:\n{proc.stderr}")
     return prefix / "bin" / ("bs.exe" if os.name == "nt" else "bs")
@@ -859,13 +893,28 @@ def std_target(compiler, cfg, args, workdir):
     bin_path.parent.mkdir(parents=True, exist_ok=True)
     bin_path.unlink(missing_ok=True)
     if args.c_abi:
-        sources = [str(UPSTREAM_TEST / "c_abi" / "main.zig"), "-cflags", "-std=c99", "--", str(UPSTREAM_TEST / "c_abi" / "cfuncs.c")]
+        sources = [
+            str(UPSTREAM_TEST / "c_abi" / "main.zig"),
+            "-cflags",
+            "-std=c99",
+            "--",
+            str(UPSTREAM_TEST / "c_abi" / "cfuncs.c"),
+        ]
     else:
         sources = [str(UPSTREAM_LIB / "std" / "std.zig")]
-    argv = [str(compiler), "test"] + sources + [
-        "--zig-lib-dir", str(UPSTREAM_LIB),
-        "-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}",
-    ] + (["-lc"] if gnu else [])
+    argv = (
+        [str(compiler), "test"]
+        + sources
+        + [
+            "--zig-lib-dir",
+            str(UPSTREAM_LIB),
+            "-target",
+            cfg["zig_target"],
+            "--test-no-exec",
+            f"-femit-bin={bin_path}",
+        ]
+        + (["-lc"] if gnu else [])
+    )
     if args.upstream:
         # A fresh cache, so that the baseline's compile time is a cold build.
         cache = workdir / f"{suite}-zig-cache"
@@ -901,7 +950,9 @@ def std_target(compiler, cfg, args, workdir):
     if "log" in r:
         data["log"] = r["log"]
     if args.upstream:
-        zig_version = subprocess.run([str(compiler), "version"], capture_output=True, text=True).stdout.strip()
+        zig_version = subprocess.run(
+            [str(compiler), "version"], capture_output=True, text=True, check=False
+        ).stdout.strip()
         data["compiler"] = f"zig {zig_version}"
         data["tests"] = r["tests"]
         out_path = args.out or baseline_path
@@ -954,7 +1005,7 @@ def parse_case(path):
     if at < 0:
         return None
     cfg, expected = {}, []
-    for ln in src[at + len("\n// error\n"):].splitlines():
+    for ln in src[at + len("\n// error\n") :].splitlines():
         # As upstream's manifest parser: `//` then optional whitespace.
         text = ln[2:].strip(" \t") if ln.startswith("//") else ""
         m = re.match(r"^(\w+)=(.*)$", text)
@@ -964,7 +1015,7 @@ def parse_case(path):
             # Upstream names the case file itself as 'tmp.zig:' when the
             # errors span several files; bs_lines() writes it as ':'.
             if text.startswith("tmp.zig:"):
-                text = text[len("tmp.zig"):]
+                text = text[len("tmp.zig") :]
             # Some cases omit the leading ':' before the line.
             elif re.match(r"^\d+:\d+: (error|note): ", text):
                 text = ":" + text
@@ -975,7 +1026,13 @@ def parse_case(path):
 def case_applies(cfg, target):
     targets = cfg.get("target", "native").split(",")
     arch_os = target.split("-")[:2]
-    if not any(t == "native" or t.split("-")[:2] == arch_os or t in ("x86_64-native", "native-linux") and arch_os == ["x86_64", "linux"] for t in targets):
+    if not any(
+        t == "native"
+        or t.split("-")[:2] == arch_os
+        or t in ("x86_64-native", "native-linux")
+        and arch_os == ["x86_64", "linux"]
+        for t in targets
+    ):
         return False
     return all(b in ("auto", "selfhosted", "stage2") for b in cfg.get("backend", "auto").split(","))
 
@@ -998,7 +1055,9 @@ def bs_lines(stderr, case_name):
         prefix = ":" if here(d) else os.path.basename(d.get("file", "")) + ":"
         # An error without a location (a dependency loop) is written as
         # upstream's case files write it.
-        errors.append(f"{prefix}{d['line']}:{d.get('col', 0)}: error: {d['msg']}" if "line" in d else f"error: {d['msg']}")
+        errors.append(
+            f"{prefix}{d['line']}:{d.get('col', 0)}: error: {d['msg']}" if "line" in d else f"error: {d['msg']}"
+        )
         times = lambda o: f" ({o['count']} times)" if o.get("count") else ""
         for n in d.get("notes", []):
             msg = n["msg"] + times(n)
@@ -1011,7 +1070,11 @@ def bs_lines(stderr, case_name):
                 # for the rest; run_case() matches either form.
                 notes.append(f"{os.path.basename(n['file'])}:{n['line']}:{n['col']}: note: {msg}")
         for c in d.get("calls", []):
-            msg = {"inline": "called inline here", "comptime": "called at comptime here", "generic": "generic function instantiated here"}[c["kind"]] + times(c)
+            msg = {
+                "inline": "called inline here",
+                "comptime": "called at comptime here",
+                "generic": "generic function instantiated here",
+            }[c["kind"]] + times(c)
             notes.append(f":{c['line']}:{c['col']}: note: {msg}" if here(c) else f"?: note: {msg}")
     return errors, notes
 
@@ -1050,17 +1113,23 @@ def run_case(compiler, path, cfg, expected, args, workdir):
     else:
         argv = [str(compiler), "build-obj", f"-Mroot={root}", f"-femit-bin={out_dir / 'case.o'}"]
     argv.append("--error-format=json")
-    code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
+    code, _out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
     shutil.rmtree(out_dir, ignore_errors=True)
     # Upstream's harness matches a line by its end, so ': error: msg' and
     # ':?:?: error: msg' match the error at any location.
     any_loc = lambda e: re.match(r"^(?::\?:\?:|:) error: ", e)
-    exp_errors = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "error" or e.startswith("error: ") or any_loc(e)]
-    exp_notes = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "note"] + [o for o in map(other_note, expected) if o]
+    exp_errors = [
+        e
+        for e in expected
+        if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "error" or e.startswith("error: ") or any_loc(e)
+    ]
+    exp_notes = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "note"] + [
+        o for o in map(other_note, expected) if o
+    ]
     r = {"expected": exp_errors}
     if timed_out:
         r["status"] = "timeout"
-    elif code < 0 or "panic: " in err and not re.search(r"^\S+:\d+:\d+: error", err, re.M):
+    elif code < 0 or "panic: " in err and not re.search(r"^\S+:\d+:\d+: error", err, re.MULTILINE):
         r["status"], r["crash"] = "crash", crash_frame(err)
     elif code == 0:
         r["status"] = "accepted"
@@ -1068,7 +1137,7 @@ def run_case(compiler, path, cfg, expected, args, workdir):
         errors, notes = bs_lines(err, root.name)
         r["got"] = list(errors)
         for e in filter(any_loc, exp_errors):
-            tail = e[e.index(" error: "):]
+            tail = e[e.index(" error: ") :]
             for i, g in enumerate(errors):
                 if g.endswith(tail) and not any_loc(g) and g not in exp_errors:
                     errors[i] = e
@@ -1105,7 +1174,10 @@ def compile_errors_target(compiler, cfg, args, workdir):
             name, r = f.result()
             results[name] = r
             if args.verbose:
-                print(f"  {name}: {r['status']}{' ' + r.get('crash', '') if r['status'] == 'crash' else ''}", file=sys.stderr)
+                print(
+                    f"  {name}: {r['status']}{' ' + r.get('crash', '') if r['status'] == 'crash' else ''}",
+                    file=sys.stderr,
+                )
     counts = {}
     for r in results.values():
         counts[r["status"]] = counts.get(r["status"], 0) + 1
@@ -1139,16 +1211,46 @@ def compile_errors_target(compiler, cfg, args, workdir):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--upstream", action="store_true", help="compute the upstream baseline with zig instead of running bs")
-    p.add_argument("--target", action="append", choices=sorted(TARGETS), help="target to run (repeatable; default: all)")
+    p.add_argument(
+        "--upstream", action="store_true", help="compute the upstream baseline with zig instead of running bs"
+    )
+    p.add_argument(
+        "--target", action="append", choices=sorted(TARGETS), help="target to run (repeatable; default: all)"
+    )
     p.add_argument("--bs", type=Path, help="bs executable (default: build bs with -Doptimize=ReleaseSafe)")
-    p.add_argument("--zig", default="zig", help="upstream zig 0.17.1, used for --upstream and to build bs (default: zig on PATH)")
-    p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, bs_runner.zig for bs until bs compiles test_runner.zig)")
-    p.add_argument("--default-runner", action="store_true", help="bs only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `bs test` without --test-runner does")
-    p.add_argument("--std", action="store_true", help="measure upstream's std tests (lib/std/std.zig, default runner) instead of test/behavior")
-    p.add_argument("--libc", action="store_true", help="with --std: link glibc (-lc, -target <arch>-linux-gnu), baseline/std-<target>-gnu-libc.json")
-    p.add_argument("--c-abi", action="store_true", help="measure upstream's test/c_abi (main.zig with cfuncs.c, -lc, -target <arch>-linux-gnu) instead of test/behavior, against baseline/c-abi-<target>.json")
-    p.add_argument("--compile-errors", action="store_true", help="bs only: measure diagnostics on upstream's test/cases/compile_errors instead of test/behavior")
+    p.add_argument(
+        "--zig", default="zig", help="upstream zig 0.17.1, used for --upstream and to build bs (default: zig on PATH)"
+    )
+    p.add_argument(
+        "--test-runner",
+        type=Path,
+        help="test runner passed to the compiler (default: test_runner.zig for --upstream, bs_runner.zig for bs until bs compiles test_runner.zig)",
+    )
+    p.add_argument(
+        "--default-runner",
+        action="store_true",
+        help="bs only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `bs test` without --test-runner does",
+    )
+    p.add_argument(
+        "--std",
+        action="store_true",
+        help="measure upstream's std tests (lib/std/std.zig, default runner) instead of test/behavior",
+    )
+    p.add_argument(
+        "--libc",
+        action="store_true",
+        help="with --std: link glibc (-lc, -target <arch>-linux-gnu), baseline/std-<target>-gnu-libc.json",
+    )
+    p.add_argument(
+        "--c-abi",
+        action="store_true",
+        help="measure upstream's test/c_abi (main.zig with cfuncs.c, -lc, -target <arch>-linux-gnu) instead of test/behavior, against baseline/c-abi-<target>.json",
+    )
+    p.add_argument(
+        "--compile-errors",
+        action="store_true",
+        help="bs only: measure diagnostics on upstream's test/cases/compile_errors instead of test/behavior",
+    )
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
     p.add_argument("--compile-timeout", type=float, default=300, help="seconds per file compile")
@@ -1156,7 +1258,11 @@ def main():
     p.add_argument("--workdir", type=Path, default=REPO / ".zig-cache" / "conformance", help="scratch directory")
     p.add_argument("--out", type=Path, help="JSON output path (only with one --target)")
     p.add_argument("--keep-binaries", action="store_true", help="keep test binaries in the workdir")
-    p.add_argument("--edit-verify", action="store_true", help="bs only: after each file's build, edit it and build again, then restore it and build once more, checking each edit build against a full build (BS_CACHE_VERIFY, BS_CACHE_CHECK); a difference fails the file as edit_verify_failed")
+    p.add_argument(
+        "--edit-verify",
+        action="store_true",
+        help="bs only: after each file's build, edit it and build again, then restore it and build once more, checking each edit build against a full build (BS_CACHE_VERIFY, BS_CACHE_CHECK); a difference fails the file as edit_verify_failed",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="print each file's result to stderr")
     args = p.parse_args()
 

@@ -42,6 +42,7 @@ zig_edit_of and the three-argument Edit). The 2026-11-04 timbot numbers used the
 bs-build-watch version, whose build.zig edit appends to the `pub fn build(` line.
 Scratch files and logs go to bench/.work/watch_bench.
 """
+
 import argparse
 import hashlib
 import json
@@ -65,7 +66,7 @@ def load_build_phases():
     if src.endswith("\nmain()"):  # older build_phases.py calls main() unguarded
         src = src[: -len("main()")]
     ns = {"__file__": path, "__name__": "build_phases"}
-    exec(compile(src, path, "exec"), ns)
+    exec(compile(src, path, "exec"), ns)  # noqa: S102 (our own build_phases.py)
     return ns
 
 
@@ -87,6 +88,7 @@ def edits_of(name, cwd):
     path, anchor = BP["PROJECTS"][name][1]
     return path, lambda p: Edit(p, anchor), lambda p: Edit(p, None)
 
+
 ARTIFACTS = {"vaxis": "zig-out/bin/example-text_input", "zls": "zig-out/bin/zls", "monstar": "zig-out/bin/monstar"}
 
 
@@ -98,8 +100,15 @@ class Watcher:
         self.artifact = artifact
         self.log = open(log_path, "w")
         self.t_spawn = time.perf_counter()
-        self.p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, start_new_session=True)
+        self.p = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         self.alive = True
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._poll, daemon=True).start()
@@ -186,15 +195,28 @@ def run(name, which, args, tag):
     compiler = BS if which == "bs" else ZIG
     dest = os.path.join(WORK, which, name)
     shutil.rmtree(dest, ignore_errors=True)
-    shutil.copytree(src, dest, symlinks=True, ignore=lambda d, names: [
-        n for n in names if n in (".zig-cache", "zig-out") or (d == src and n in ("cache", "build-cache"))])
+    shutil.copytree(
+        src,
+        dest,
+        symlinks=True,
+        ignore=lambda d, names: [
+            n for n in names if n in (".zig-cache", "zig-out") or (d == src and n in ("cache", "build-cache"))
+        ],
+    )
     cwd = os.path.join(dest, sub)
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=os.path.join(WORK, f"global-{which}"))
     if os.sep in ZIG:  # bs finds its lib directory through the zig on PATH
         env["PATH"] = os.path.dirname(ZIG) + os.pathsep + env["PATH"]
     steps = steps_of(name) if args.bp_steps else []
-    r = subprocess.run([compiler, "build", *steps], cwd=cwd, env=env, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True)
+    r = subprocess.run(
+        [compiler, "build", *steps],
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
     if r.returncode:
         sys.exit(f"{which} {name} warm build failed:\n{r.stdout[-3000:]}")
     for d in (".zig-cache", "zig-out"):
@@ -203,8 +225,9 @@ def run(name, which, args, tag):
     zig_path, zig_edit, build_edit = edits_of(name, cwd)
     os.makedirs(os.path.join(WORK, "logs"), exist_ok=True)
     log = os.path.join(WORK, "logs", f"{tag}-{which}-{name}.log")
-    w = Watcher([compiler, "build", *steps, "--watch", "--summary", "new", *args.extra.split()], cwd, env, log,
-                artifact)
+    w = Watcher(
+        [compiler, "build", *steps, "--watch", "--summary", "new", *args.extra.split()], cwd, env, log, artifact
+    )
     res = {"log": log, "problems": []}
     try:
         s = w.wait_summary(0, 600)
@@ -214,8 +237,10 @@ def run(name, which, args, tag):
             return res
         time.sleep(args.settle)
         a = w.art_after(0)
-        res["first"] = {"summary_ms": (s[0] - w.t_spawn) * 1000,
-                        "artifact_ms": (a[0] - w.t_spawn) * 1000 if a else None}
+        res["first"] = {
+            "summary_ms": (s[0] - w.t_spawn) * 1000,
+            "artifact_ms": (a[0] - w.t_spawn) * 1000 if a else None,
+        }
         extra = w.summaries_after(s[0])
         if extra:
             res["problems"].append(f"first build: {len(extra)} extra rebuild(s) with no edit")
@@ -231,20 +256,28 @@ def run(name, which, args, tag):
                     t0 = time.perf_counter()
                     s = w.wait_summary(t0, args.timeout)
                     if s is None:
-                        res["problems"].append(f"{scen} #{i}: no rebuild within {args.timeout} s"
-                                               + ("" if w.alive else f" (process exited {w.p.poll()})"))
+                        res["problems"].append(
+                            f"{scen} #{i}: no rebuild within {args.timeout} s"
+                            + ("" if w.alive else f" (process exited {w.p.poll()})")
+                        )
                         break
                     time.sleep(args.settle)
                     a = w.art_after(t0)
                     extra = w.summaries_after(s[0])
                     h = sha(artifact)
-                    rows.append({"summary_ms": (s[0] - t0) * 1000,
-                                 "artifact_ms": (a[0] - t0) * 1000 if a and a[0] <= s[0] + 0.05 else None,
-                                 "artifact_changed": h != prev_hash, "extra_rebuilds": len(extra),
-                                 "summary": s[1]})
+                    rows.append(
+                        {
+                            "summary_ms": (s[0] - t0) * 1000,
+                            "artifact_ms": (a[0] - t0) * 1000 if a and a[0] <= s[0] + 0.05 else None,
+                            "artifact_changed": h != prev_hash,
+                            "extra_rebuilds": len(extra),
+                            "summary": s[1],
+                        }
+                    )
                     if extra:
-                        res["problems"].append(f"{scen} #{i}: {len(extra)} extra rebuild(s): "
-                                               + " | ".join(l for _, l in extra))
+                        res["problems"].append(
+                            f"{scen} #{i}: {len(extra)} extra rebuild(s): " + " | ".join(l for _, l in extra)
+                        )
                     if scen == "edit-zig" and h == prev_hash:
                         res["problems"].append(f"{scen} #{i}: artifact unchanged after edit")
                     prev_hash = h
@@ -265,18 +298,28 @@ def run(name, which, args, tag):
             for k in range(2):
                 marker = f"watch-marker-{int(time.time() * 1000)}"
                 w.note(f"semantic build.zig edit: install {marker}")
-                open(bz, "w").write("\n".join(lines[:i] + [
-                    f'    b.getInstallStep().dependOn(&b.addInstallFile(b.path("build.zig"), "{marker}").step);']
-                    + lines[i:]))
+                open(bz, "w").write(
+                    "\n".join(
+                        lines[:i]
+                        + [f'    b.getInstallStep().dependOn(&b.addInstallFile(b.path("build.zig"), "{marker}").step);']
+                        + lines[i:]
+                    )
+                )
                 t0 = time.perf_counter()
                 s = w.wait_summary(t0, args.timeout)
                 time.sleep(args.settle)
                 ok = os.path.exists(os.path.join(cwd, "zig-out", marker))
-                res.setdefault("marker", []).append({"applied": ok, "summary_ms": (s[0] - t0) * 1000 if s else None,
-                                                     "extra_rebuilds": len(w.summaries_after(s[0])) if s else None})
+                res.setdefault("marker", []).append(
+                    {
+                        "applied": ok,
+                        "summary_ms": (s[0] - t0) * 1000 if s else None,
+                        "extra_rebuilds": len(w.summaries_after(s[0])) if s else None,
+                    }
+                )
                 if not ok:
-                    res["problems"].append(f"build.zig marker edit #{k}: zig-out/{marker} not installed"
-                                           + ("" if s else " (no rebuild)"))
+                    res["problems"].append(
+                        f"build.zig marker edit #{k}: zig-out/{marker} not installed" + ("" if s else " (no rebuild)")
+                    )
         finally:
             open(bz, "w").write(orig)
             t0 = time.perf_counter()
@@ -292,20 +335,34 @@ def run(name, which, args, tag):
 def protocol(name, which, args):
     """The compile step's update times over --listen=-, one process for every edit."""
     import bench  # CompilerServer
+
     sub = BP["PROJECTS"][name][0]
     src = BP["checkout"](name, ZIG)
     compiler = BS if which == "bs" else ZIG
     dest = os.path.join(WORK, which, name)
     shutil.rmtree(dest, ignore_errors=True)
-    shutil.copytree(src, dest, symlinks=True, ignore=lambda d, names: [
-        n for n in names if n in (".zig-cache", "zig-out") or (d == src and n in ("cache", "build-cache"))])
+    shutil.copytree(
+        src,
+        dest,
+        symlinks=True,
+        ignore=lambda d, names: [
+            n for n in names if n in (".zig-cache", "zig-out") or (d == src and n in ("cache", "build-cache"))
+        ],
+    )
     cwd = os.path.join(dest, sub)
     env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=os.path.join(WORK, f"global-{which}"))
     if os.sep in ZIG:
         env["PATH"] = os.path.dirname(ZIG) + os.pathsep + env["PATH"]
     steps = steps_of(name) if args.bp_steps else []
-    out = subprocess.run([compiler, "build", *steps, "--verbose"], cwd=cwd, env=env, check=True,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout
+    out = subprocess.run(
+        [compiler, "build", *steps, "--verbose"],
+        cwd=cwd,
+        env=env,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).stdout
     want = f"--name {os.path.basename(ARTIFACTS[name])} "
     line = next((l for l in out.splitlines() if want in l and "--listen=-" in l), None)
     if line is None:
@@ -359,18 +416,26 @@ def main():
             if args.protocol:
                 r = allres[f"{which}/{name}"] = protocol(name, which, args)
                 t = r["update_ms"]
-                print(f"{which:4} {name:8} update after an edit: median {statistics.median(t):.1f} ms "
-                      f"(min {min(t):.1f}, max {max(t):.1f})", flush=True)
+                print(
+                    f"{which:4} {name:8} update after an edit: median {statistics.median(t):.1f} ms "
+                    f"(min {min(t):.1f}, max {max(t):.1f})",
+                    flush=True,
+                )
                 json.dump(allres, open(out, "w"), indent=1)
                 continue
             r = run(name, which, args, args.tag)
             allres[f"{which}/{name}"] = r
             f = r.get("first", {})
-            print(f"{which:4} {name:8} first {f.get('artifact_ms')} / {f.get('summary_ms')} ms | "
-                  + " | ".join(f"{s} art {med(r.get(s, []), 'artifact_ms')} sum {med(r.get(s, []), 'summary_ms')} "
-                               "[" + ", ".join("%.0f" % x["summary_ms"] for x in r.get(s, [])) + "]"
-                               for s in ("edit-zig", "edit-build"))
-                  + (f" | PROBLEMS: {r['problems']}" if r["problems"] else ""), flush=True)
+            print(
+                f"{which:4} {name:8} first {f.get('artifact_ms')} / {f.get('summary_ms')} ms | "
+                + " | ".join(
+                    f"{s} art {med(r.get(s, []), 'artifact_ms')} sum {med(r.get(s, []), 'summary_ms')} "
+                    "[" + ", ".join("{:.0f}".format(x["summary_ms"]) for x in r.get(s, [])) + "]"
+                    for s in ("edit-zig", "edit-build")
+                )
+                + (f" | PROBLEMS: {r['problems']}" if r["problems"] else ""),
+                flush=True,
+            )
             json.dump(allres, open(out, "w"), indent=1)
     print("wrote", out)
 

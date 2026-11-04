@@ -21,11 +21,12 @@ how often the old releases' std writes `<last part of container>.<name>`
 lists the releases that had it. The replacement text in the table is written by hand and checked
 against 0.17's std.
 """
+
 import os
 import re
 import sys
 
-DECL = re.compile(r"^pub (?:const|var|fn|inline fn|extern fn) ([A-Za-z_][A-Za-z0-9_]*)", re.M)
+DECL = re.compile(r"^pub (?:const|var|fn|inline fn|extern fn) ([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
 
 
 def decls(lib_std):
@@ -38,7 +39,8 @@ def decls(lib_std):
             rel = os.path.relpath(path, lib_std)[: -len(".zig")]
             container = "std" if rel == "std" else rel.replace(os.sep, ".")
             try:
-                src = open(path, encoding="utf-8", errors="replace").read()
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    src = fh.read()
             except OSError:
                 continue
             for name in DECL.findall(src):
@@ -55,7 +57,8 @@ def uses(lib_std, keys):
     for root, _, files in os.walk(lib_std):
         for f in files:
             if f.endswith(".zig"):
-                src = open(os.path.join(root, f), encoding="utf-8", errors="replace").read()
+                with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
+                    src = fh.read()
                 for text in word.findall(src):
                     for key in by_text.get(text, ()):
                         counts[key] += 1
@@ -65,7 +68,7 @@ def uses(lib_std, keys):
 def outermost_missing(key, containers):
     """`key` itself if its container exists, else the outermost missing
     container as (parent, name)."""
-    container, name = key
+    container, _name = key
     parts = container.split(".") if container != "std" else []
     for i in range(len(parts)):
         prefix = ".".join(parts[: i + 1])

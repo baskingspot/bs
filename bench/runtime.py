@@ -24,7 +24,7 @@ PROGRAMS = ["fib", "sieve", "sort", "hash", "nbody", "fmt"]
 
 def build(argv, cwd):
     t0 = time.perf_counter()
-    r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+    r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
     elapsed = time.perf_counter() - t0
     if r.returncode != 0:
         sys.exit(f"build failed: {' '.join(argv)}\n{r.stdout}{r.stderr}")
@@ -36,7 +36,7 @@ def run(binary, runs):
     output = None
     for _ in range(runs):
         t0 = time.perf_counter()
-        r = subprocess.run([binary], capture_output=True, text=True)
+        r = subprocess.run([binary], capture_output=True, text=True, check=False)
         times.append(time.perf_counter() - t0)
         if r.returncode != 0:
             sys.exit(f"{binary} exited with {r.returncode}:\n{r.stderr}")
@@ -90,8 +90,10 @@ def main():
     lines = [
         "# Run-time benchmarks",
         "",
-        f"Median wall time of {args.runs} runs; `{os.path.basename(bs)}` against upstream zig 0.17.1. "
-        f"{args.machine_note}, {os.cpu_count()} CPUs.",
+        (
+            f"Median wall time of {args.runs} runs; `{os.path.basename(bs)}` against upstream zig 0.17.1. "
+            f"{args.machine_note}, {os.cpu_count()} CPUs."
+        ),
         "",
         "| Program | " + " | ".join(names) + (" | bs / Debug | bs / ReleaseSafe |" if len(names) == 3 else " |"),
         "|---|" + "---:|" * (len(names) + (2 if len(names) == 3 else 0)),

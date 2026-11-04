@@ -30,11 +30,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import ClassVar
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(BENCH_DIR)
 sys.path.insert(0, BENCH_DIR)
-import bench  # noqa: E402  (the vaxis checkout and its module flags)
+import bench
 
 WORKLOADS = ["zig-fmt", "zig-sema", "vaxis", "zls-test"]
 MODES = {
@@ -48,7 +49,7 @@ def build(argv, cwd, out):
     if os.path.exists(out):
         os.remove(out)
     t0 = time.perf_counter()
-    r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=dict(os.environ, BS_CACHE="off"))
+    r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=dict(os.environ, BS_CACHE="off"), check=False)
     if r.returncode != 0:
         sys.exit(f"build failed in {cwd}: {' '.join(argv)}\n{r.stdout[-4000:]}{r.stderr[-4000:]}")
     return time.perf_counter() - t0
@@ -64,7 +65,7 @@ def with_mode(argv, mode):
 
 
 class Workload:
-    modes = list(MODES)
+    modes: ClassVar[list[str]] = list(MODES)
 
     def __init__(self, work, zig):
         self.work = work
@@ -75,7 +76,9 @@ class Workload:
         with tempfile.TemporaryDirectory(prefix="bs-rw-") as tmp:
             argv = [binary if a == "{bin}" else a.replace("{tmp}", tmp) for a in self.run_argv]
             t0 = time.perf_counter()
-            r = subprocess.run(argv, cwd=self.run_cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            r = subprocess.run(
+                argv, cwd=self.run_cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False
+            )
             elapsed = time.perf_counter() - t0
         if r.returncode != 0:
             sys.exit(f"{' '.join(argv)} exited with {r.returncode}:\n{r.stderr[-4000:]}")
@@ -96,15 +99,32 @@ class ZigCompiler(Workload):
         self.lib = os.path.join(REPO_DIR, "upstream", "lib")
 
     def build_argv(self, compiler, mode, out):
-        return with_mode([compiler, "build-exe", "--stack", "48234496", "-fno-sanitize-thread", "-Odebug",
-                          "--dep", "build_options", "-Mroot=src/main.zig", "-Mbuild_options=build_options.zig",
-                          "--name", "zig", f"-femit-bin={out}",
-                          "--cache-dir", os.path.join(self.work, "cache", mode, "local"),
-                          "--global-cache-dir", os.path.join(self.work, "cache", mode, "global")], mode)
+        return with_mode(
+            [
+                compiler,
+                "build-exe",
+                "--stack",
+                "48234496",
+                "-fno-sanitize-thread",
+                "-Odebug",
+                "--dep",
+                "build_options",
+                "-Mroot=src/main.zig",
+                "-Mbuild_options=build_options.zig",
+                "--name",
+                "zig",
+                f"-femit-bin={out}",
+                "--cache-dir",
+                os.path.join(self.work, "cache", mode, "local"),
+                "--global-cache-dir",
+                os.path.join(self.work, "cache", mode, "global"),
+            ],
+            mode,
+        )
 
     # Both zig workloads share the compiler's build.
     key = "zig"
-    modes = ["bs", "Debug"]
+    modes: ClassVar[list[str]] = ["bs", "Debug"]
 
 
 class ZigFmt(ZigCompiler):
@@ -122,8 +142,18 @@ class ZigSema(ZigCompiler):
     def setup(self):
         super().setup()
         self.run_cwd = self.cwd
-        self.run_argv = ["{bin}", "build-exe", "-fno-emit-bin", os.path.join(BENCH_DIR, "workloads", "hello", "hello.zig"),
-                         "--zig-lib-dir", self.lib, "--cache-dir", "{tmp}", "--global-cache-dir", "{tmp}"]
+        self.run_argv = [
+            "{bin}",
+            "build-exe",
+            "-fno-emit-bin",
+            os.path.join(BENCH_DIR, "workloads", "hello", "hello.zig"),
+            "--zig-lib-dir",
+            self.lib,
+            "--cache-dir",
+            "{tmp}",
+            "--global-cache-dir",
+            "{tmp}",
+        ]
 
 
 class Vaxis(Workload):
@@ -144,7 +174,9 @@ class Vaxis(Workload):
             if w in ("--cache-dir", "--global-cache-dir", "--name"):
                 i += 2
                 continue
-            res.append("-Mroot=" + os.path.join(BENCH_DIR, "realworld", "vaxis_render.zig") if w.startswith("-Mroot=") else w)
+            res.append(
+                "-Mroot=" + os.path.join(BENCH_DIR, "realworld", "vaxis_render.zig") if w.startswith("-Mroot=") else w
+            )
             i += 1
         self.flags = res
         self.cwd = cmd["cwd"]
@@ -152,9 +184,19 @@ class Vaxis(Workload):
         self.run_argv = ["{bin}"]
 
     def build_argv(self, compiler, mode, out):
-        return with_mode([compiler, "build-exe", *self.flags, f"-femit-bin={out}",
-                          "--cache-dir", os.path.join(self.work, "cache", mode, "local"),
-                          "--global-cache-dir", os.path.join(self.work, "cache", mode, "global")], mode)
+        return with_mode(
+            [
+                compiler,
+                "build-exe",
+                *self.flags,
+                f"-femit-bin={out}",
+                "--cache-dir",
+                os.path.join(self.work, "cache", mode, "local"),
+                "--global-cache-dir",
+                os.path.join(self.work, "cache", mode, "global"),
+            ],
+            mode,
+        )
 
 
 class ZlsTest(Workload):
@@ -165,9 +207,12 @@ class ZlsTest(Workload):
         corpus = os.path.join(REPO_DIR, "tools", "corpus", ".work")
         cmds = os.path.join(corpus, "commands", "zls.json")
         if not os.path.exists(cmds):
-            subprocess.run([sys.executable, os.path.join(REPO_DIR, "tools", "corpus", "run.py"), "--projects", "zls",
-                            "--list"], check=True)
-        words = json.load(open(cmds))["test"]
+            subprocess.run(
+                [sys.executable, os.path.join(REPO_DIR, "tools", "corpus", "run.py"), "--projects", "zls", "--list"],
+                check=True,
+            )
+        with open(cmds) as f:
+            words = json.load(f)["test"]
         res = []
         i = 2
         while i < len(words):
@@ -184,8 +229,18 @@ class ZlsTest(Workload):
         self.run_argv = ["{bin}"]
 
     def build_argv(self, compiler, mode, out):
-        return with_mode([compiler, "test", *self.flags, "--test-no-exec", f"-femit-bin={out}",
-                          "--cache-dir", os.path.join(self.work, "cache", mode, "local")], mode)
+        return with_mode(
+            [
+                compiler,
+                "test",
+                *self.flags,
+                "--test-no-exec",
+                f"-femit-bin={out}",
+                "--cache-dir",
+                os.path.join(self.work, "cache", mode, "local"),
+            ],
+            mode,
+        )
 
     def output(self, text):
         # The summary line; the per-test lines' order is the same, but their
@@ -208,8 +263,11 @@ def main():
     ap.add_argument("--workloads", default=",".join(WORKLOADS), help="comma-separated subset of " + ",".join(WORKLOADS))
     ap.add_argument("--runs", type=int, default=5, help="runs per binary (default 5)")
     ap.add_argument("--no-upstream", action="store_true", help="time only bs's builds")
-    ap.add_argument("--work", default=os.path.join(BENCH_DIR, ".work", "realworld"),
-                    help="work directory; keeps upstream's builds (default: bench/.work/realworld)")
+    ap.add_argument(
+        "--work",
+        default=os.path.join(BENCH_DIR, ".work", "realworld"),
+        help="work directory; keeps upstream's builds (default: bench/.work/realworld)",
+    )
     ap.add_argument("--out", help="write PATH.json")
     args = ap.parse_args()
 
@@ -253,7 +311,12 @@ def main():
     print(header)
     print("|" + "---|" * (header.count("|") - 1))
     for wname, r in results.items():
-        print(f"| {wname} | " + " | ".join(cell(r, m) for m in all_modes) + "".join(f" | {ratio(r, m)}" for m in all_modes[1:]) + " |")
+        print(
+            f"| {wname} | "
+            + " | ".join(cell(r, m) for m in all_modes)
+            + "".join(f" | {ratio(r, m)}" for m in all_modes[1:])
+            + " |"
+        )
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"compiler": bs, "runs": args.runs, "results": results}, f, indent=1)

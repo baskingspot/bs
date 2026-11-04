@@ -30,13 +30,22 @@ WORK = os.path.join(CORPUS_DIR, ".work")
 # Appended to the edit line: keeps the line count, and differs per edit.
 EDIT_SUFFIX = " std.mem.doNotOptimizeAway(@as(u32, {n}));"
 
+
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
 def sh(argv, cwd, env=None, timeout=None, check=True):
-    p = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                       errors="replace", timeout=timeout)
+    p = subprocess.run(
+        argv,
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
     if check and p.returncode != 0:
         sys.exit(f"{shlex.join(argv)} failed in {cwd}:\n{p.stdout}\n{p.stderr}")
     return p
@@ -45,8 +54,11 @@ def sh(argv, cwd, env=None, timeout=None, check=True):
 def setup(proj, zig, refresh):
     """Clone, fetch, generate; return the recorded commands by target name."""
     src = os.path.join(WORK, "src", proj["name"])
-    proj["fetched"] = {"src": src, "zig_lib": os.path.join(REPO_DIR, "upstream", "lib"),
-                       "gen": os.path.join(WORK, "gen", proj["name"])}
+    proj["fetched"] = {
+        "src": src,
+        "zig_lib": os.path.join(REPO_DIR, "upstream", "lib"),
+        "gen": os.path.join(WORK, "gen", proj["name"]),
+    }
     if "copy" in proj:
         # A directory of this checkout, such as upstream's own tools in
         # upstream/lib/compiler: copied so that edits leave it alone, plus
@@ -92,7 +104,7 @@ def setup(proj, zig, refresh):
         for line in p.stderr.splitlines():
             if not line.startswith("info(verbose): "):
                 continue
-            words = shlex.split(line[len("info(verbose): "):])
+            words = shlex.split(line[len("info(verbose): ") :])
             if len(words) >= 2 and words[1] == "translate-c":
                 # A translated header, which each compiler translates
                 # itself for the targets that import it (`translate`).
@@ -164,7 +176,7 @@ def translate(compiler, words, cmds, cache_dir, src):
     by_stem = {}
     for key, tc in cmds.items():
         if key.startswith("translate-c:"):
-            stem = os.path.splitext(os.path.basename(key[len("translate-c:"):]))[0] + ".zig"
+            stem = os.path.splitext(os.path.basename(key[len("translate-c:") :]))[0] + ".zig"
             if stem in by_stem:
                 sys.exit(f"two translated headers are named {stem}")
             by_stem[stem] = tc
@@ -175,7 +187,7 @@ def translate(compiler, words, cmds, cache_dir, src):
             continue
         tc = by_stem[os.path.basename(m.group(2))]
         argv = [compiler, "translate-c", *strip_translate(tc), "--cache-dir", cache_dir]
-        p = subprocess.run(argv, cwd=src, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+        p = subprocess.run(argv, cwd=src, capture_output=True, text=True, errors="replace", check=False)
         if p.returncode != 0:
             return None, p.stdout + p.stderr
         out = os.path.join(cache_dir, "translated", os.path.basename(m.group(2)))
@@ -208,8 +220,16 @@ def clear_cache(cache):
 def timed(argv, cwd, env=None, timeout=1800):
     t = time.monotonic()
     try:
-        p = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                           errors="replace", timeout=timeout)
+        p = subprocess.run(
+            argv,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
         return time.monotonic() - t, p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired:
         return time.monotonic() - t, None, "timeout"
@@ -220,16 +240,28 @@ def first_error(output):
     return (lines[0] if lines else output.strip().splitlines()[-1] if output.strip() else "")[:300]
 
 
-TEST_SUMMARY = re.compile(r"^(?:\x1b\[[0-9;]*m)*(All \d+ tests passed\.|\d+ passed; \d+ skipped; \d+ failed\.|\d+ of \d+ tests passed)", re.M)
+TEST_SUMMARY = re.compile(
+    r"^(?:\x1b\[[0-9;]*m)*(All \d+ tests passed\.|\d+ passed; \d+ skipped; \d+ failed\.|\d+ of \d+ tests passed)",
+    re.MULTILINE,
+)
 
 
 def run_binary(path, args, cwd, timeout):
     try:
-        p = subprocess.run([path, *args], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=timeout)
+        p = subprocess.run(
+            [path, *args],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
     except subprocess.TimeoutExpired as e:
-        return {"exit": "timeout", "stdout": (e.stdout or b"").decode(errors="replace"),
-                "stderr": (e.stderr or b"").decode(errors="replace")}
+        return {
+            "exit": "timeout",
+            "stdout": (e.stdout or b"").decode(errors="replace"),
+            "stderr": (e.stderr or b"").decode(errors="replace"),
+        }
     code = p.returncode if p.returncode >= 0 else f"signal {-p.returncode}"
     return {"exit": code, "stdout": p.stdout.decode(errors="replace"), "stderr": p.stderr.decode(errors="replace")}
 
@@ -248,7 +280,7 @@ def apply_edit(path, line, n):
     if at < 0 or text.find(line, at + 1) >= 0:
         sys.exit(f"edit line not found exactly once in {path}: {line!r}")
     with open(path, "w") as f:
-        f.write(text[:at + len(line)] + EDIT_SUFFIX.format(n=n) + text[at + len(line):])
+        f.write(text[: at + len(line)] + EDIT_SUFFIX.format(n=n) + text[at + len(line) :])
     return text
 
 
@@ -285,7 +317,12 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
         target_words, output = translate(comp, words, cmds, cache, src)
         tc_secs = time.monotonic() - t
         if target_words is None:
-            result[which] = {"cold_local": tc_secs, "compile_exit": 1, "error": first_error(output), "output": output[-20000:]}
+            result[which] = {
+                "cold_local": tc_secs,
+                "compile_exit": 1,
+                "error": first_error(output),
+                "output": output[-20000:],
+            }
             continue
         argv = compile_argv(comp, target_words, cache, out)
         r = {"argv": shlex.join(argv)}
@@ -408,9 +445,12 @@ def fmt_s(s):
 def write_scoreboard(results, manifest, path):
     """One row per target: the verdict, both runs, and both build times."""
     donors = any((r.get("bs") or {}).get("cold_local_donor") for r in results)
-    lines = ["| Project | Target | Verdict | upstream run | bs run | cold-local zig / bs |"
-             + (" cold-local zig / bs with donors |" if donors else "") + " edit zig / bs |",
-             "|---|---|---|---|---|---:|" + ("---:|" if donors else "") + "---:|"]
+    lines = [
+        "| Project | Target | Verdict | upstream run | bs run | cold-local zig / bs |"
+        + (" cold-local zig / bs with donors |" if donors else "")
+        + " edit zig / bs |",
+        "|---|---|---|---|---|---:|" + ("---:|" if donors else "") + "---:|",
+    ]
     for res in results:
         u, z = res.get("zig") or {}, res.get("bs") or {}
 
@@ -419,12 +459,32 @@ def write_scoreboard(results, manifest, path):
 
         def ratio(a, b):
             return f" ({a / b:.1f}x)" if a and b else ""
-        donor = " {} / {}{} |".format(fmt_s(u.get("cold_local")), fmt_s(z.get("cold_local_donor")),
-                                      ratio(u.get("cold_local"), z.get("cold_local_donor"))) if donors else ""
-        lines.append("| {} | {} | {} | {} | {} | {} / {}{} |{} {} / {}{} |".format(
-            res["project"], res["target"], res["verdict"].replace("|", "\\|"), cell(u), cell(z),
-            fmt_s(u.get("cold_local")), fmt_s(z.get("cold_local")), ratio(u.get("cold_local"), z.get("cold_local")),
-            donor, fmt_s(u.get("edit")), fmt_s(z.get("edit")), ratio(u.get("edit"), z.get("edit"))))
+
+        donor = (
+            " {} / {}{} |".format(
+                fmt_s(u.get("cold_local")),
+                fmt_s(z.get("cold_local_donor")),
+                ratio(u.get("cold_local"), z.get("cold_local_donor")),
+            )
+            if donors
+            else ""
+        )
+        lines.append(
+            "| {} | {} | {} | {} | {} | {} / {}{} |{} {} / {}{} |".format(
+                res["project"],
+                res["target"],
+                res["verdict"].replace("|", "\\|"),
+                cell(u),
+                cell(z),
+                fmt_s(u.get("cold_local")),
+                fmt_s(z.get("cold_local")),
+                ratio(u.get("cold_local"), z.get("cold_local")),
+                donor,
+                fmt_s(u.get("edit")),
+                fmt_s(z.get("edit")),
+                ratio(u.get("edit"), z.get("edit")),
+            )
+        )
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -440,14 +500,25 @@ def main():
     ap.add_argument("--bs-only", action="store_true", help="skip the upstream builds (reuse their last results)")
     ap.add_argument("--no-edit", action="store_true", help="skip the edit builds")
     ap.add_argument("--no-run", action="store_true", help="build only; do not run what was built")
-    ap.add_argument("--samples", type=int, default=1,
-                    help="time each cold-local and edit build this many times and keep the median (default 1)")
-    ap.add_argument("--donors", action="store_true",
-                    help="also time bs's cold-local build with donors (cold_local_donor)")
-    ap.add_argument("--results", default="results",
-                    help="name of the results and scoreboard files in .work (default: results, scoreboard)")
-    ap.add_argument("--cache-check", action="store_true",
-                    help="bs's edit builds check themselves against full builds (BS_CACHE_VERIFY, BS_CACHE_CHECK)")
+    ap.add_argument(
+        "--samples",
+        type=int,
+        default=1,
+        help="time each cold-local and edit build this many times and keep the median (default 1)",
+    )
+    ap.add_argument(
+        "--donors", action="store_true", help="also time bs's cold-local build with donors (cold_local_donor)"
+    )
+    ap.add_argument(
+        "--results",
+        default="results",
+        help="name of the results and scoreboard files in .work (default: results, scoreboard)",
+    )
+    ap.add_argument(
+        "--cache-check",
+        action="store_true",
+        help="bs's edit builds check themselves against full builds (BS_CACHE_VERIFY, BS_CACHE_CHECK)",
+    )
     args = ap.parse_args()
 
     with open(os.path.join(CORPUS_DIR, "manifest.json")) as f:
@@ -466,7 +537,11 @@ def main():
         src, cmds = setup(proj, args.zig, args.refresh)
         if args.list:
             for name, words in cmds.items():
-                print(f"{proj['name']}: {name}" if words[1] == "translate-c" else f"{proj['name']}: {words[1]} --name {name}")
+                print(
+                    f"{proj['name']}: {name}"
+                    if words[1] == "translate-c"
+                    else f"{proj['name']}: {words[1]} --name {name}"
+                )
             continue
         for tgt in proj["targets"]:
             if args.targets and tgt["name"] not in args.targets.split(","):
@@ -488,7 +563,8 @@ def main():
     with open(results_path, "w") as f:
         json.dump(results, f, indent=1)
     write_scoreboard(results, manifest, scoreboard_path)
-    print(open(scoreboard_path).read())
+    with open(scoreboard_path) as f:
+        print(f.read())
 
 
 if __name__ == "__main__":

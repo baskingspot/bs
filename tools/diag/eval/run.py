@@ -53,13 +53,13 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, HERE)
-import rules  # noqa: E402
+import rules
 
 SEEDS = os.path.join(HERE, "seeds")
 
 
 def run(cmd, cwd, env=None):
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, timeout=300)
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, timeout=300, check=False)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -133,11 +133,11 @@ def zig_unescape(text):
             continue
         e = chr(b[i + 1])
         if e == "x":
-            out.append(int(b[i + 2:i + 4], 16))
+            out.append(int(b[i + 2 : i + 4], 16))
             i += 4
         elif e == "u":
             end = b.index(b"}", i)
-            out += chr(int(b[i + 3:end], 16)).encode()
+            out += chr(int(b[i + 3 : end], 16)).encode()
             i = end + 1
         else:
             out += {"n": b"\n", "r": b"\r", "t": b"\t"}.get(e, e.encode())
@@ -165,7 +165,7 @@ def parse_bundle_text(text, d):
         if not diags:
             continue
         if line.startswith("note: candidates: "):
-            diags[-1]["candidates"] = line[len("note: candidates: "):].split(", ")
+            diags[-1]["candidates"] = line[len("note: candidates: ") :].split(", ")
             continue
         m = fix_re.match(line)
         if m:
@@ -179,7 +179,11 @@ def parse_bundle_text(text, d):
             edit = {"file": path, "span": span, "text": zig_unescape(body)}
             fixes = diags[-1]["fixes"]
             # Consecutive edits of one kind belong to one fix.
-            if fixes and fixes[-1]["applicability"] == ("exact" if kind == "fix" else "maybe") and fixes[-1].get("_open"):
+            if (
+                fixes
+                and fixes[-1]["applicability"] == ("exact" if kind == "fix" else "maybe")
+                and fixes[-1].get("_open")
+            ):
                 fixes[-1]["edits"].append(edit)
             else:
                 fixes.append({"applicability": "exact" if kind == "fix" else "maybe", "edits": [edit], "_open": True})
@@ -245,8 +249,14 @@ def score(case, seed_src, cc, show):
         if up_code == 0:
             return {"id": case.id, "dropped": "upstream accepts"}
         bs_code, bs_text = cc.bs_text(d, fname)
-        r = {"id": case.id, "rule": case.rule.id, "category": case.rule.category, "since": case.rule.since,
-             "seed": case.seed, "lines": case.lines}
+        r = {
+            "id": case.id,
+            "rule": case.rule.id,
+            "category": case.rule.category,
+            "since": case.rule.since,
+            "seed": case.seed,
+            "lines": case.lines,
+        }
         if bs_code == 0:
             r["accept"] = "bs accepts"
             return r
@@ -255,23 +265,39 @@ def score(case, seed_src, cc, show):
         up_errs = upstream_errors(up_text, fname)
         lines = set(case.lines)
         # The first error points at a changed line, itself or by a note.
-        r["bs_loc"] = bool(diags) and any(x.get("file") == fname and x.get("line") in lines for x in [diags[0]] + diags[0].get("notes", []))
+        r["bs_loc"] = bool(diags) and any(
+            x.get("file") == fname and x.get("line") in lines for x in [diags[0]] + diags[0].get("notes", [])
+        )
         r["up_loc"] = bool(up_errs) and any(ln in lines for ln in [up_errs[0][0]] + up_errs[0][2])
         r["bs_facts"] = has_facts(bs_text, case.facts)
         r["up_facts"] = has_facts(up_text, case.facts)
-        r["bs_first"] = (f"{diags[0].get('file')}:{diags[0].get('line')}: {diags[0]['msg']}" if diags else "")
-        r["up_first"] = (f"{fname}:{up_errs[0][0]}: {up_errs[0][1]}" if up_errs else up_text.strip().split("\n")[0])
+        r["bs_first"] = f"{diags[0].get('file')}:{diags[0].get('line')}: {diags[0]['msg']}" if diags else ""
+        r["up_first"] = f"{fname}:{up_errs[0][0]}: {up_errs[0][1]}" if up_errs else up_text.strip().split("\n")[0]
         if case.answer:
             r["cand"] = any(case.answer in x.get("candidates", []) for x in diags)
         # A fix of an error on a changed line, or one that edits a changed
         # line (a `var` at the declaration for an error at the use).
         # An error raised in std can carry a fix in the case's file.
-        edit_lines = lambda x: {case.src.count("\n", 0, e["span"][0]) + 1 for f in x.get("fixes", []) for e in f["edits"] if e.get("file") == fname}
-        at = [x for x in diags if x.get("fixes") and ((x in main_diags and x.get("line") in lines) or edit_lines(x) & lines)]
+        edit_lines = lambda x: {
+            case.src.count("\n", 0, e["span"][0]) + 1
+            for f in x.get("fixes", [])
+            for e in f["edits"]
+            if e.get("file") == fname
+        }
+        at = [
+            x
+            for x in diags
+            if x.get("fixes") and ((x in main_diags and x.get("line") in lines) or edit_lines(x) & lines)
+        ]
         if at:
             src = case.src
             for _ in range(5):
-                fixes = [f for x in cc.bs_json(d, fname) for f in x.get("fixes", []) if f["applicability"] != "placeholder" and all(e.get("file") == fname for e in f["edits"])]
+                fixes = [
+                    f
+                    for x in cc.bs_json(d, fname)
+                    for f in x.get("fixes", [])
+                    if f["applicability"] != "placeholder" and all(e.get("file") == fname for e in f["edits"])
+                ]
                 if not fixes:
                     break
                 src = apply_fixes(src, fixes)
@@ -323,7 +349,9 @@ def report(results):
         fixes = [r for r in scored if "fix" in r]
         good = sum(r["fix"] in ("restored", "compiles") for r in fixes)
         part = sum(r["fix"] == "partial" for r in fixes)
-        print(f"{cat:<13}{n:>6}  {zl:>5} / {ul:<5}  {zf:>5} / {uf:<5}  {sum(r['cand'] for r in cand):>3}/{len(cand):<3}  {good:>7} / {part:<3} / {len(fixes):<6}")
+        print(
+            f"{cat:<13}{n:>6}  {zl:>5} / {ul:<5}  {zf:>5} / {uf:<5}  {sum(r['cand'] for r in cand):>3}/{len(cand):<3}  {good:>7} / {part:<3} / {len(fixes):<6}"
+        )
     bad = [r for r in kept if "accept" in r]
     if bad:
         print("\nbs accepts what upstream rejects:")
@@ -378,7 +406,10 @@ def main():
         for name, src in seeds.items():
             d = tempfile.mkdtemp(prefix="bs-eval-seed-")
             write_case(d, name, src)
-            for who, (code, out) in (("upstream", cc.upstream(d, seed_file(name))), ("bs", cc.bs_text(d, seed_file(name)))):
+            for who, (code, out) in (
+                ("upstream", cc.upstream(d, seed_file(name))),
+                ("bs", cc.bs_text(d, seed_file(name))),
+            ):
                 if code != 0:
                     sys.exit(f"seed {name} does not compile with {who}:\n{out}")
             shutil.rmtree(d)

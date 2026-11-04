@@ -28,8 +28,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         obj = os.path.join(tmp, "crt.o")
         subprocess.run(
-            ["zig", "build-obj", "-target", "x86_64-linux-gnu", "-ODebug", "--name", "crt",
-             f"-femit-bin={obj}", src],
+            ["zig", "build-obj", "-target", "x86_64-linux-gnu", "-ODebug", "--name", "crt", f"-femit-bin={obj}", src],
             check=True,
         )
         out = subprocess.run(["readelf", "-sW", obj], check=True, capture_output=True, text=True).stdout
@@ -45,7 +44,7 @@ def main() -> None:
         if bind in ("GLOBAL", "WEAK"):
             exports.append((name, ndx, addr))
         elif bind == "LOCAL" and name.startswith("compiler_rt."):
-            by_addr[ndx, addr].append(name[len("compiler_rt."):])
+            by_addr[ndx, addr].append(name[len("compiler_rt.") :])
     rows = []
     for name, ndx, addr in sorted(exports):
         impl = by_addr.get((ndx, addr), [])

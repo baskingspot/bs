@@ -92,7 +92,7 @@ def rmtree(path):
 
 def run_checked(argv, cwd, env=None):
     log(f"  $ {shlex.join(argv)}  (in {cwd})")
-    p = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    p = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
     if p.returncode != 0:
         sys.exit(f"command failed ({p.returncode}): {shlex.join(argv)}\n{p.stdout[-4000:]}")
     return p.stdout
@@ -113,8 +113,10 @@ def run_timed(argv, cwd, env):
         p.returncode = os.waitstatus_to_exitcode(status)
         if p.returncode != 0:
             out.seek(0)
-            sys.exit(f"build failed ({p.returncode}): {shlex.join(argv)} (in {cwd})\n"
-                     f"{out.read()[-4000:].decode(errors='replace')}")
+            sys.exit(
+                f"build failed ({p.returncode}): {shlex.join(argv)} (in {cwd})\n"
+                f"{out.read()[-4000:].decode(errors='replace')}"
+            )
     return {"wall_s": wall, "cpu_s": ru.ru_utime + ru.ru_stime, "maxrss_kb": ru.ru_maxrss}
 
 
@@ -164,8 +166,9 @@ class CompilerServer:
 
     def __init__(self, argv, cwd, env):
         self.stderr = tempfile.TemporaryFile()
-        self.p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=self.stderr)
+        self.p = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr
+        )
         self.argv = argv
 
     def _read_exact(self, n, timeout=900):
@@ -277,8 +280,17 @@ class Hello(Workload):
         self.commands = {
             "build-exe": {
                 "cwd": self.dir,
-                "argv": [self.compiler, "build-exe", "hello.zig", "--zig-lib-dir", "zig-lib",
-                         "--cache-dir", "cache/local", "--global-cache-dir", "cache/global"],
+                "argv": [
+                    self.compiler,
+                    "build-exe",
+                    "hello.zig",
+                    "--zig-lib-dir",
+                    "zig-lib",
+                    "--cache-dir",
+                    "cache/local",
+                    "--global-cache-dir",
+                    "cache/global",
+                ],
                 "local_cache": os.path.join(self.dir, "cache/local"),
                 "global_cache": os.path.join(self.dir, "cache/global"),
                 "output": os.path.join(self.dir, "hello"),
@@ -287,12 +299,14 @@ class Hello(Workload):
         }
         self.edits = {
             "root": (os.path.join(self.dir, "hello.zig"), '    std.debug.print("Hello, world!\\n", .{});'),
-            "lib": (os.path.join(lib, "std", "debug.zig"),
-                    "    stderr.file_writer.interface.print(fmt, args) catch return;"),
+            "lib": (
+                os.path.join(lib, "std", "debug.zig"),
+                "    stderr.file_writer.interface.print(fmt, args) catch return;",
+            ),
         }
 
     def check_output(self, path):
-        p = subprocess.run([path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p = subprocess.run([path], capture_output=True, text=True, check=False)
         if p.returncode != 0 or "Hello, world!" not in p.stderr:
             sys.exit(f"{path} did not print the greeting: rc={p.returncode} stderr={p.stderr!r}")
 
@@ -310,17 +324,20 @@ class Vaxis(Workload):
         gen = os.path.join(self.dir, "gen")
         setup_cache = os.path.join(self.work, "setup-cache")
         setup_env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=os.path.join(setup_cache, "global"))
-        if not (os.path.exists(os.path.join(gen, "tables.zig"))
-                and os.path.isdir(os.path.join(src, "zig-pkg", UUCODE_PKG))):
+        if not (
+            os.path.exists(os.path.join(gen, "tables.zig")) and os.path.isdir(os.path.join(src, "zig-pkg", UUCODE_PKG))
+        ):
             # Fetch the pinned dependencies into libvaxis/zig-pkg and run uucode's
             # table generator once with libvaxis's own build, then keep the
             # generated modules so the timed build-exe command needs no build system.
             local = os.path.join(setup_cache, "vaxis-local")
             rmtree(local)
-            out = run_checked([self.setup_zig, "build", "-Dllvm=false", "--verbose", "--cache-dir", local],
-                              src, setup_env)
-            line = next((ln for ln in out.splitlines()
-                         if "build-exe" in ln and "--name example-text_input" in ln), None)
+            out = run_checked(
+                [self.setup_zig, "build", "-Dllvm=false", "--verbose", "--cache-dir", local], src, setup_env
+            )
+            line = next(
+                (ln for ln in out.splitlines() if "build-exe" in ln and "--name example-text_input" in ln), None
+            )
             if line is None:
                 sys.exit("could not find the example's build-exe command in zig build --verbose output")
             rmtree(gen)
@@ -333,23 +350,57 @@ class Vaxis(Workload):
         for f in ("build.zig", "build.zig.zon"):
             shutil.copy(os.path.join(BENCH_DIR, "workloads", "vaxis-build", f), wrapper)
         if not os.path.isdir(os.path.join(wrapper, "zig-pkg", UUCODE_PKG)):
-            run_checked([self.setup_zig, "build", "--cache-dir", os.path.join(setup_cache, "wrapper-local")],
-                        wrapper, setup_env)
+            run_checked(
+                [self.setup_zig, "build", "--cache-dir", os.path.join(setup_cache, "wrapper-local")], wrapper, setup_env
+            )
 
         u = f"zig-pkg/{UUCODE_PKG}/src"
         argv = [
-            self.compiler, "build-exe",
-            "--dep", "vaxis", "-Mroot=examples/text_input.zig",
-            "--dep", "zigimg", "--dep", "uucode", "-Mvaxis=src/main.zig",
+            self.compiler,
+            "build-exe",
+            "--dep",
+            "vaxis",
+            "-Mroot=examples/text_input.zig",
+            "--dep",
+            "zigimg",
+            "--dep",
+            "uucode",
+            "-Mvaxis=src/main.zig",
             f"-Mzigimg=zig-pkg/{ZIGIMG_PKG}/zigimg.zig",
-            "--dep", "types.zig", "--dep", "config.zig", "--dep", "tables", f"-Muucode={u}/root.zig",
+            "--dep",
+            "types.zig",
+            "--dep",
+            "config.zig",
+            "--dep",
+            "tables",
+            f"-Muucode={u}/root.zig",
             f"-Mtypes.zig={u}/types.zig",
-            "--dep", "types.zig", "--dep", "storage.zig", f"-Mconfig.zig={u}/config.zig",
-            "--dep", "config.zig", "--dep", "storage.zig", "--dep", "build_config", "-Mtables=../gen/tables.zig",
-            "--dep", "config.zig", f"-Mstorage.zig={u}/storage.zig",
-            "--dep", "config.zig", "--dep", "storage.zig", "-Mbuild_config=../gen/build_config.zig",
-            "--name", "example-text_input",
-            "--cache-dir", "../cache/local", "--global-cache-dir", "../cache/global",
+            "--dep",
+            "types.zig",
+            "--dep",
+            "storage.zig",
+            f"-Mconfig.zig={u}/config.zig",
+            "--dep",
+            "config.zig",
+            "--dep",
+            "storage.zig",
+            "--dep",
+            "build_config",
+            "-Mtables=../gen/tables.zig",
+            "--dep",
+            "config.zig",
+            f"-Mstorage.zig={u}/storage.zig",
+            "--dep",
+            "config.zig",
+            "--dep",
+            "storage.zig",
+            "-Mbuild_config=../gen/build_config.zig",
+            "--name",
+            "example-text_input",
+            "--cache-dir",
+            "../cache/local",
+            "--global-cache-dir",
+            "../cache/global",
         ]
         self.commands = {
             "build-exe": {
@@ -395,9 +446,24 @@ class ZigCompiler(Workload):
         self.commands = {
             "build-exe": {
                 "cwd": self.dir,
-                "argv": [self.compiler, "build-exe", "--stack", "48234496", "-fno-sanitize-thread", "-Odebug",
-                         "--dep", "build_options", "-Mroot=src/main.zig", "-Mbuild_options=build_options.zig",
-                         "--name", "zig", "--cache-dir", "cache/local", "--global-cache-dir", "cache/global"],
+                "argv": [
+                    self.compiler,
+                    "build-exe",
+                    "--stack",
+                    "48234496",
+                    "-fno-sanitize-thread",
+                    "-Odebug",
+                    "--dep",
+                    "build_options",
+                    "-Mroot=src/main.zig",
+                    "-Mbuild_options=build_options.zig",
+                    "--name",
+                    "zig",
+                    "--cache-dir",
+                    "cache/local",
+                    "--global-cache-dir",
+                    "cache/global",
+                ],
                 "local_cache": os.path.join(self.dir, "cache/local"),
                 "global_cache": os.path.join(self.dir, "cache/global"),
                 "output": os.path.join(self.dir, "zig"),
@@ -412,7 +478,7 @@ class ZigCompiler(Workload):
         }
 
     def check_output(self, path):
-        p = subprocess.run([path, "version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        p = subprocess.run([path, "version"], capture_output=True, text=True, check=False)
         if p.returncode != 0 or p.stdout.strip() != "0.17.1":
             sys.exit(f"{path} version did not print 0.17.1: rc={p.returncode} stdout={p.stdout!r}")
 
@@ -432,8 +498,19 @@ class StdTests(Workload):
         self.commands = {
             "build-exe": {
                 "cwd": self.dir,
-                "argv": [self.compiler, "test", "zig-lib/std/std.zig", "--zig-lib-dir", "zig-lib", "--test-no-exec",
-                         "-femit-bin=std-test", "--cache-dir", "cache/local", "--global-cache-dir", "cache/global"],
+                "argv": [
+                    self.compiler,
+                    "test",
+                    "zig-lib/std/std.zig",
+                    "--zig-lib-dir",
+                    "zig-lib",
+                    "--test-no-exec",
+                    "-femit-bin=std-test",
+                    "--cache-dir",
+                    "cache/local",
+                    "--global-cache-dir",
+                    "cache/global",
+                ],
                 "local_cache": os.path.join(self.dir, "cache/local"),
                 "global_cache": os.path.join(self.dir, "cache/global"),
                 "output": os.path.join(self.dir, "std-test"),
@@ -445,8 +522,10 @@ class StdTests(Workload):
         # hello's, in std/debug.zig, which much of std calls.
         self.edits = {
             "root": (os.path.join(lib, "std", "mem.zig"), '    try testing.expect(eql(u8, "abcd", "abcd"));'),
-            "lib": (os.path.join(lib, "std", "debug.zig"),
-                    "    stderr.file_writer.interface.print(fmt, args) catch return;"),
+            "lib": (
+                os.path.join(lib, "std", "debug.zig"),
+                "    stderr.file_writer.interface.print(fmt, args) catch return;",
+            ),
         }
 
 
@@ -465,21 +544,29 @@ def json_from_zon(text):
 def compiler_info(compiler, work):
     info = {"path": shutil.which(compiler) or compiler}
     info["realpath"] = os.path.realpath(info["path"])
-    p = subprocess.run([compiler, "version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    p = subprocess.run([compiler, "version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
     info["version"] = p.stdout.strip() if p.returncode == 0 else None
     # Which backend does a default Debug build use? Ask the compiled program.
     probe = os.path.join(work, "probe")
     rmtree(probe)
     os.makedirs(probe)
     with open(os.path.join(probe, "probe.zig"), "w") as f:
-        f.write('const std = @import("std");\nconst builtin = @import("builtin");\n'
-                'pub fn main() void {\n'
-                '    std.debug.print("{t} {t} {t}\\n", .{ builtin.zig_backend, builtin.mode, builtin.object_format });\n'
-                '}\n')
-    p = subprocess.run([compiler, "build-exe", "probe.zig", "--cache-dir", "c", "--global-cache-dir", "g"],
-                       cwd=probe, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        f.write(
+            'const std = @import("std");\nconst builtin = @import("builtin");\n'
+            "pub fn main() void {\n"
+            '    std.debug.print("{t} {t} {t}\\n", .{ builtin.zig_backend, builtin.mode, builtin.object_format });\n'
+            "}\n"
+        )
+    p = subprocess.run(
+        [compiler, "build-exe", "probe.zig", "--cache-dir", "c", "--global-cache-dir", "g"],
+        cwd=probe,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
     if p.returncode == 0:
-        r = subprocess.run(["./probe"], cwd=probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        r = subprocess.run(["./probe"], cwd=probe, capture_output=True, text=True, check=False)
         backend, mode, ofmt = (r.stderr.split() + [None] * 3)[:3]
         info.update(default_backend=backend, default_mode=mode, object_format=ofmt)
     else:
@@ -489,8 +576,14 @@ def compiler_info(compiler, work):
 
 
 def machine_info(note):
-    info = {"note": note, "logical_cpus": os.cpu_count(), "kernel": platform.release(),
-            "os": platform.system(), "arch": platform.machine(), "python": platform.python_version()}
+    info = {
+        "note": note,
+        "logical_cpus": os.cpu_count(),
+        "kernel": platform.release(),
+        "os": platform.system(),
+        "arch": platform.machine(),
+        "python": platform.python_version(),
+    }
     try:
         with open("/proc/cpuinfo") as f:
             m = re.search(r"model name\s*:\s*(.*)", f.read())
@@ -620,40 +713,65 @@ def bench_scenario(wl, mode, scenario, runs, counter):
 
 def skip_reason(mode, scenario):
     if mode == "zig-build" and scenario.startswith("incr-") and not scenario.startswith("incr-cli-"):
-        return ("In-process incremental through `zig build` needs `--watch`, which the harness does not drive; "
-                "on Linux older than 6.5 it panics after the first build anyway (lib/compiler/Maker/Watch.zig "
-                "calls name_to_handle_at with AT_HANDLE_FID, the kernel returns EINVAL, std.posix treats that "
-                "as unreachable). The build-exe incr-* rows use the same compiler protocol `--watch` uses")
+        return (
+            "In-process incremental through `zig build` needs `--watch`, which the harness does not drive; "
+            "on Linux older than 6.5 it panics after the first build anyway (lib/compiler/Maker/Watch.zig "
+            "calls name_to_handle_at with AT_HANDLE_FID, the kernel returns EINVAL, std.posix treats that "
+            "as unreachable). The build-exe incr-* rows use the same compiler protocol `--watch` uses"
+        )
     return None
 
 
 def render_markdown(report):
     m, c = report["machine"], report["compiler"]
     lines = [f"# Compile-time benchmark: {c.get('version') or c['path']}", ""]
-    lines += [f"Generated {report['generated']} by `bench/bench.py` "
-              f"(bs {report['harness_commit'] or 'uncommitted'}).", ""]
+    lines += [
+        f"Generated {report['generated']} by `bench/bench.py` (bs {report['harness_commit'] or 'uncommitted'}).",
+        "",
+    ]
     lines += ["## Machine and compiler", ""]
-    lines += [f"- Machine: {m.get('note') or ''} {m.get('cpu_model')}, {m['logical_cpus']} logical CPUs, "
-              f"{m.get('mem_total_gib')} GiB RAM, {m['os']} {m['kernel']} {m['arch']}".replace("  ", " ")]
+    lines += [
+        f"- Machine: {m.get('note') or ''} {m.get('cpu_model')}, {m['logical_cpus']} logical CPUs, "
+        f"{m.get('mem_total_gib')} GiB RAM, {m['os']} {m['kernel']} {m['arch']}".replace("  ", " ")
+    ]
     lines += [f"- Compiler: `{c['realpath']}`, version `{c.get('version')}`"]
-    lines += [f"- Default Debug build (no backend flags) reports `builtin.zig_backend = .{c.get('default_backend')}`, "
-              f"mode `{c.get('default_mode')}`, object format `{c.get('object_format')}`"]
+    lines += [
+        (
+            f"- Default Debug build (no backend flags) reports `builtin.zig_backend = .{c.get('default_backend')}`, "
+            f"mode `{c.get('default_mode')}`, object format `{c.get('object_format')}`"
+        )
+    ]
     cal = report.get("calibration_s", {})
-    lines += [f"- CPU calibration (fixed pure-Python loop, best of 5, lower is faster): "
-              f"{fmt_time(cal.get('start'))} before the benchmarks, {fmt_time(cal.get('end'))} after"]
-    lines += [f"- Runs: {report['runs']} per scenario, {report['cold_runs']} for cold build-exe, "
-              f"{report['build_cold_runs']} for cold zig build"]
+    lines += [
+        (
+            f"- CPU calibration (fixed pure-Python loop, best of 5, lower is faster): "
+            f"{fmt_time(cal.get('start'))} before the benchmarks, {fmt_time(cal.get('end'))} after"
+        )
+    ]
+    lines += [
+        (
+            f"- Runs: {report['runs']} per scenario, {report['cold_runs']} for cold build-exe, "
+            f"{report['build_cold_runs']} for cold zig build"
+        )
+    ]
     if report.get("env"):
         lines += [f"- Environment: `{' '.join(f'{k}={v}' for k, v in report['env'].items())}`"]
     lines += [""]
-    lines += ["Wall time is the median over the runs with min–max and sample standard deviation. "
-              "CPU is user+sys of the whole process tree. Peak RSS is the largest single process in "
-              "the tree (median over runs). For in-process incremental rows, time is per update and "
-              "RSS/CPU cover the whole compiler session, including its initial full build.", ""]
+    lines += [
+        (
+            "Wall time is the median over the runs with min–max and sample standard deviation. "
+            "CPU is user+sys of the whole process tree. Peak RSS is the largest single process in "
+            "the tree (median over runs). For in-process incremental rows, time is per update and "
+            "RSS/CPU cover the whole compiler session, including its initial full build."
+        ),
+        "",
+    ]
     for wname, w in report["workloads"].items():
         lines += [f"## {wname}: {w['description']}", ""]
-        lines += ["| Mode | Scenario | Runs | Median | Min–max | Stdev | CPU | Peak RSS |",
-                  "|---|---|---:|---:|---:|---:|---:|---:|"]
+        lines += [
+            "| Mode | Scenario | Runs | Median | Min–max | Stdev | CPU | Peak RSS |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+        ]
         for r in report["results"]:
             if r["workload"] != wname:
                 continue
@@ -663,17 +781,21 @@ def render_markdown(report):
                 cpu_txt = f"{fmt_time(r['extra']['session_cpu_s'])} (session)"
             else:
                 cpu_txt = fmt_time(cpu)
-            lines.append(f"| {r['mode']} | {r['scenario']} | {s['n']} | **{fmt_time(s['median_s'])}** | "
-                         f"{fmt_time(s['min_s'])}–{fmt_time(s['max_s'])} | {fmt_time(s['stdev_s'])} | "
-                         f"{cpu_txt} | {fmt_rss(s['maxrss_median_kb'])} |")
+            lines.append(
+                f"| {r['mode']} | {r['scenario']} | {s['n']} | **{fmt_time(s['median_s'])}** | "
+                f"{fmt_time(s['min_s'])}–{fmt_time(s['max_s'])} | {fmt_time(s['stdev_s'])} | "
+                f"{cpu_txt} | {fmt_rss(s['maxrss_median_kb'])} |"
+            )
         skipped = [r for r in report["skipped"] if r["workload"] == wname]
         for r in skipped:
             lines.append(f"| {r['mode']} | {r['scenario']} | – | not measured | | | | |")
         lines.append("")
         incr = [r for r in report["results"] if r["workload"] == wname and "initial_update_s" in r["extra"]]
         for r in incr:
-            lines.append(f"- `{r['mode']} {r['scenario']}`: the session's first update (a full build) "
-                         f"took {fmt_time(r['extra']['initial_update_s'])}.")
+            lines.append(
+                f"- `{r['mode']} {r['scenario']}`: the session's first update (a full build) "
+                f"took {fmt_time(r['extra']['initial_update_s'])}."
+            )
         for reason in dict.fromkeys(r["reason"] for r in skipped):
             names = ", ".join(f"`{r['mode']} {r['scenario']}`" for r in skipped if r["reason"] == reason)
             lines.append(f"- Not measured: {names}. {reason}.")
@@ -682,41 +804,74 @@ def render_markdown(report):
         lines += ["Commands (run from the working directory shown, relative to the harness work dir):", ""]
         for mode, cmd in w["commands"].items():
             env = " ".join(f"{k}={v}" for k, v in cmd.get("env", {}).items())
-            lines += [f"- {mode}, in `{cmd['cwd']}`:", "", "  ```sh",
-                      f"  {(env + ' ') if env else ''}{shlex.join(cmd['argv'])}", "  ```", ""]
-        lines += ["Edits (the anchor line gets ` std.mem.doNotOptimizeAway(@as(u32, N));` appended, "
-                  "with a new N for every build):", ""]
+            lines += [
+                f"- {mode}, in `{cmd['cwd']}`:",
+                "",
+                "  ```sh",
+                f"  {(env + ' ') if env else ''}{shlex.join(cmd['argv'])}",
+                "  ```",
+                "",
+            ]
+        lines += [
+            (
+                "Edits (the anchor line gets ` std.mem.doNotOptimizeAway(@as(u32, N));` appended, "
+                "with a new N for every build):"
+            ),
+            "",
+        ]
         for which, e in w["edits"].items():
             lines.append(f"- {which}: `{e['file']}` line {e['line']}: `{e['anchor'].strip()}`")
         lines.append("")
     lines += ["## Scenarios", ""]
     for k, v in SCENARIOS.items():
         lines.append(f"- `{k}`: {v}")
-    lines += ["", "In-process incremental rows append `-fincremental --listen=-` to the build-exe command and "
-              "send compiler-protocol `update` messages, as `zig build --watch` does; `incr-cli-*` rows append "
-              "`-fincremental` only.", ""]
+    lines += [
+        "",
+        (
+            "In-process incremental rows append `-fincremental --listen=-` to the build-exe command and "
+            "send compiler-protocol `update` messages, as `zig build --watch` does; `incr-cli-*` rows append "
+            "`-fincremental` only."
+        ),
+        "",
+    ]
     return "\n".join(lines)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--compiler", default="zig", help="compiler binary to time (zig or bs; default: zig on PATH)")
-    ap.add_argument("--setup-zig", default="zig",
-                    help="upstream zig 0.17.1 used to prepare workloads (fetch, generate); never timed")
+    ap.add_argument(
+        "--setup-zig",
+        default="zig",
+        help="upstream zig 0.17.1 used to prepare workloads (fetch, generate); never timed",
+    )
     ap.add_argument("--workloads", default=",".join(WORKLOADS), help="comma-separated: " + ",".join(WORKLOADS))
-    ap.add_argument("--modes", default=None,
-                    help="comma-separated: build-exe,zig-build (default: both)")
-    ap.add_argument("--scenarios", default=None,
-                    help="comma-separated, or 'core' (default: all for zig, core otherwise): " + ",".join(SCENARIOS))
+    ap.add_argument("--modes", default=None, help="comma-separated: build-exe,zig-build (default: both)")
+    ap.add_argument(
+        "--scenarios",
+        default=None,
+        help="comma-separated, or 'core' (default: all for zig, core otherwise): " + ",".join(SCENARIOS),
+    )
     ap.add_argument("--runs", type=int, default=10, help="runs per warm/edit scenario (default 10)")
     ap.add_argument("--cold-runs", type=int, default=5, help="runs per cold build-exe scenario (default 5)")
-    ap.add_argument("--build-cold-runs", type=int, default=3,
-                    help="runs per cold zig build scenario (default 3; each rebuilds the build runner)")
+    ap.add_argument(
+        "--build-cold-runs",
+        type=int,
+        default=3,
+        help="runs per cold zig build scenario (default 3; each rebuilds the build runner)",
+    )
     ap.add_argument("--work-dir", default=os.path.join(BENCH_DIR, ".work"), help="scratch dir (default bench/.work)")
-    ap.add_argument("--out", default=None, help="output path without extension (default bench/results/<date>-<compiler>)")
+    ap.add_argument(
+        "--out", default=None, help="output path without extension (default bench/results/<date>-<compiler>)"
+    )
     ap.add_argument("--machine-note", default="", help="free-form machine description for the report")
-    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
-                    help="environment for every timed build, such as BS_CACHE_DONOR=off (repeatable)")
+    ap.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="environment for every timed build, such as BS_CACHE_DONOR=off (repeatable)",
+    )
     args = ap.parse_args()
     extra_env = dict(e.split("=", 1) for e in args.env)
 
@@ -741,16 +896,22 @@ def main():
     counter = edit_counter()
     report = {
         "schema": 1,
-        "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-        "harness_commit": subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_DIR,
-                                         stdout=subprocess.PIPE, text=True).stdout.strip() or None,
+        "generated": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "harness_commit": subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=REPO_DIR, stdout=subprocess.PIPE, text=True, check=False
+        ).stdout.strip()
+        or None,
         "machine": machine_info(args.machine_note),
         "compiler": cinfo,
-        "runs": args.runs, "cold_runs": args.cold_runs, "build_cold_runs": args.build_cold_runs,
+        "runs": args.runs,
+        "cold_runs": args.cold_runs,
+        "build_cold_runs": args.build_cold_runs,
         "env": extra_env,
         "scenario_descriptions": SCENARIOS,
         "calibration_s": {"start": calibrate()},
-        "workloads": {}, "results": [], "skipped": [],
+        "workloads": {},
+        "results": [],
+        "skipped": [],
     }
     for wname in args.workloads.split(","):
         wl = WORKLOADS[wname](work, compiler, setup_zig, extra_env)
@@ -759,13 +920,22 @@ def main():
         wmodes = [m for m in modes if m in wl.commands]
         report["workloads"][wname] = {
             "description": wl.description,
-            "commands": {m: {"cwd": os.path.relpath(wl.commands[m]["cwd"], work),
-                             "argv": [os.path.basename(wl.commands[m]["argv"][0])] + wl.commands[m]["argv"][1:],
-                             **({"env": wl.commands[m]["env"]} if "env" in wl.commands[m] else {})}
-                         for m in wmodes},
-            "edits": {k: {"file": os.path.relpath(path, work), "anchor": anchor,
-                          "line": Editor(path, anchor, counter).line_index + 1}
-                      for k, (path, anchor) in wl.edits.items()},
+            "commands": {
+                m: {
+                    "cwd": os.path.relpath(wl.commands[m]["cwd"], work),
+                    "argv": [os.path.basename(wl.commands[m]["argv"][0])] + wl.commands[m]["argv"][1:],
+                    **({"env": wl.commands[m]["env"]} if "env" in wl.commands[m] else {}),
+                }
+                for m in wmodes
+            },
+            "edits": {
+                k: {
+                    "file": os.path.relpath(path, work),
+                    "anchor": anchor,
+                    "line": Editor(path, anchor, counter).line_index + 1,
+                }
+                for k, (path, anchor) in wl.edits.items()
+            },
         }
         if wname == "vaxis":
             report["workloads"][wname]["libvaxis"] = {"url": VAXIS_URL, "commit": VAXIS_COMMIT, "patched": False}
@@ -773,8 +943,7 @@ def main():
             for scenario in scenarios:
                 reason = skip_reason(mode, scenario)
                 if reason:
-                    report["skipped"].append({"workload": wname, "mode": mode, "scenario": scenario,
-                                              "reason": reason})
+                    report["skipped"].append({"workload": wname, "mode": mode, "scenario": scenario, "reason": reason})
                     continue
                 runs = args.runs
                 if scenario == "cold":
@@ -782,15 +951,27 @@ def main():
                 log(f"== {wname} {mode} {scenario} x{runs}")
                 results, extra = bench_scenario(wl, mode, scenario, runs, counter)
                 stats = summarize(results)
-                log(f"   median {fmt_time(stats['median_s'])} "
-                    f"[{fmt_time(stats['min_s'])}–{fmt_time(stats['max_s'])}] rss {fmt_rss(stats['maxrss_median_kb'])}")
-                report["results"].append({"workload": wname, "mode": mode, "scenario": scenario,
-                                          "runs": results, "stats": stats, "extra": extra})
+                log(
+                    f"   median {fmt_time(stats['median_s'])} "
+                    f"[{fmt_time(stats['min_s'])}–{fmt_time(stats['max_s'])}] rss {fmt_rss(stats['maxrss_median_kb'])}"
+                )
+                report["results"].append(
+                    {
+                        "workload": wname,
+                        "mode": mode,
+                        "scenario": scenario,
+                        "runs": results,
+                        "stats": stats,
+                        "extra": extra,
+                    }
+                )
 
     report["calibration_s"]["end"] = calibrate()
     out = args.out or os.path.join(
-        BENCH_DIR, "results",
-        f"{datetime.date.today().isoformat()}-{os.path.basename(compiler)}-{cinfo.get('version') or 'unknown'}")
+        BENCH_DIR,
+        "results",
+        f"{datetime.date.today().isoformat()}-{os.path.basename(compiler)}-{cinfo.get('version') or 'unknown'}",
+    )
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out + ".json", "w") as f:
         json.dump(report, f, indent=1)

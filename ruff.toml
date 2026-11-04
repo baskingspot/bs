@@ -1,0 +1,17 @@
+# The Python here is tooling: harnesses for the tests, the conformance
+# measure, and the benchmarks. Lines run long, as in the Zig sources.
+line-length = 120
+
+# tools/mchunt is a miscompile hunter: a test driver, exempt from the org's
+# lint rule (see AGENTS.md).
+extend-exclude = ["tools/mchunt"]
+
+# The scripts here are short-lived: a file opened for one read or write is
+# closed when the process exits, so SIM115's with-blocks add nothing.
+[lint]
+extend-ignore = ["SIM115"]
+
+# build_phases.py defines build() and fresh() inside its per-project loop and
+# calls them only within that iteration, so late binding cannot bite.
+[lint.per-file-ignores]
+"bench/build_phases.py" = ["B023"]

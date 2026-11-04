@@ -49,7 +49,7 @@ BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(BENCH_DIR)
 WORK = os.path.join(BENCH_DIR, ".work", "phases")
 sys.path.insert(0, BENCH_DIR)
-import bench  # noqa: E402  (the vaxis checkout)
+import bench
 
 EDIT_SUFFIX = " std.mem.doNotOptimizeAway(@as(u32, {n}));"
 # For an edit appended to a function's header line: valid in any function
@@ -76,7 +76,7 @@ PHASES = ["startup", "configurer", "maker", "compile", "run"]
 
 
 def run_checked(argv, cwd, env=None):
-    r = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    r = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
     if r.returncode != 0:
         raise Failed(f"failed in {cwd}: {' '.join(argv)}\n{r.stdout[-4000:]}")
     return r.stdout
@@ -112,8 +112,7 @@ def checkout(name, zig):
 def corpus():
     """tools/corpus's projects that are git repositories with a build.zig, by name
     (zig-compiler is upstream's own lib/compiler, whose builds are timed elsewhere)."""
-    return {p["name"]: p for p in json.load(open(MANIFEST))["projects"]
-            if p.get("url", "").startswith("https://")}
+    return {p["name"]: p for p in json.load(open(MANIFEST))["projects"] if p.get("url", "").startswith("https://")}
 
 
 # Manifest steps that fail under upstream zig too: zlinter's CLI
@@ -147,11 +146,18 @@ def zig_edit_of(name, src):
             return t["edit"][0], t["edit"][1], EDIT_SUFFIX
     # No edit in the manifest: the header of the first function of the
     # project's likeliest root file.
-    files = [f for f in ("src/main.zig", "src/root.zig", "src/lib.zig", f"src/{name}.zig", f"{name}.zig")
-             if os.path.exists(os.path.join(src, f))]
+    files = [
+        f
+        for f in ("src/main.zig", "src/root.zig", "src/lib.zig", f"src/{name}.zig", f"{name}.zig")
+        if os.path.exists(os.path.join(src, f))
+    ]
     for top in ("src", "lib"):
-        files += sorted(os.path.relpath(os.path.join(d, f), src) for d, _, fs in os.walk(os.path.join(src, top))
-                        for f in fs if f.endswith(".zig"))
+        files += sorted(
+            os.path.relpath(os.path.join(d, f), src)
+            for d, _, fs in os.walk(os.path.join(src, top))
+            for f in fs
+            if f.endswith(".zig")
+        )
     files += sorted(f for f in os.listdir(src) if f.endswith(".zig") and f != "build.zig")
     for f in files:
         lines = open(os.path.join(src, f)).read().split("\n")
@@ -203,16 +209,24 @@ def subtract(iv, cut):
     for a, b in iv:
         segs = [[a, b]]
         for c, d in cut:
-            segs = [s for x, y in segs for s in ([[x, y]] if d <= x or c >= y else
-                                                 ([[x, c]] if c > x else []) + ([[d, y]] if d < y else []))]
+            segs = [
+                s
+                for x, y in segs
+                for s in ([[x, y]] if d <= x or c >= y else ([[x, c]] if c > x else []) + ([[d, y]] if d < y else []))
+            ]
         out += segs
     return out
 
 
 def phases(data, compiler):
     """The phases of the build `perf record` wrote to `data`."""
-    text = subprocess.run(["perf", "script", "-i", data, "-F", "comm,pid,tid,time,event,trace"],
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout
+    text = subprocess.run(
+        ["perf", "script", "-i", data, "-F", "comm,pid,tid,time,event,trace"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    ).stdout
     compiler = os.path.realpath(shutil.which(compiler) or compiler)
     tgid_of, parent, execs, exits = {}, {}, {}, {}
     root = t0 = t_maker = t_end = None
@@ -267,14 +281,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bs", help="time `bs build` with this bs (default: upstream `zig build`)")
     ap.add_argument("--zig", default="zig", help="upstream zig 0.17.0, for setup and the baseline")
-    ap.add_argument("--projects", default=",".join(PROJECTS),
-                    help="comma-separated; `corpus` adds every tools/corpus project")
+    ap.add_argument(
+        "--projects", default=",".join(PROJECTS), help="comma-separated; `corpus` adds every tools/corpus project"
+    )
     ap.add_argument("--scenarios", help=f"default: {','.join(SCENARIOS)} (bs: {','.join(BS_SCENARIOS)})")
     ap.add_argument("--runs", type=int, default=10)
     ap.add_argument("--edit-runs", type=int, default=5)
     ap.add_argument("--phase-runs", type=int, default=3, help="perf-recorded runs per scenario")
     ap.add_argument("--keep-going", action="store_true", help="record a failing build and go on")
-    ap.add_argument("--out", help="report path without extension (default: bench/results/<date>-build-phases-<compiler>)")
+    ap.add_argument(
+        "--out", help="report path without extension (default: bench/results/<date>-build-phases-<compiler>)"
+    )
     args = ap.parse_args()
     compiler = os.path.abspath(args.bs) if args.bs else args.zig
     which = "bs" if args.bs else "zig"
@@ -310,8 +327,14 @@ def measure(name, args, compiler, which, env, results):
     src = checkout(name, args.zig)
     dest = os.path.join(WORK, which, name)
     shutil.rmtree(dest, ignore_errors=True)
-    shutil.copytree(src, dest, symlinks=True, ignore=lambda d, names: [
-        n for n in names if n in (".zig-cache", "zig-out") or (d == src and n in ("cache", "build-cache"))])
+    shutil.copytree(
+        src,
+        dest,
+        symlinks=True,
+        ignore=lambda d, names: [
+            n for n in names if n in (".zig-cache", "zig-out") or (d == src and n in ("cache", "build-cache"))
+        ],
+    )
     cwd = os.path.join(dest, sub)
     argv = [compiler, "build", *steps_of(name)]
     zig_path, zig_anchor, zig_suffix = zig_edit_of(name, os.path.join(dest, sub))
@@ -320,10 +343,29 @@ def measure(name, args, compiler, which, env, results):
     scen_env = env
 
     def build(trace=None):
-        a = (["perf", "record", "-q", "-a", "-e", "sched:sched_process_exec", "-e", "sched:sched_process_exit",
-              "-e", "sched:sched_process_fork", "-o", trace, "--"] if trace else []) + argv
+        a = (
+            [
+                "perf",
+                "record",
+                "-q",
+                "-a",
+                "-e",
+                "sched:sched_process_exec",
+                "-e",
+                "sched:sched_process_exit",
+                "-e",
+                "sched:sched_process_fork",
+                "-o",
+                trace,
+                "--",
+            ]
+            if trace
+            else []
+        ) + argv
         t = time.perf_counter()
-        r = subprocess.run(a, cwd=cwd, env=scen_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        r = subprocess.run(
+            a, cwd=cwd, env=scen_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False
+        )
         if r.returncode != 0 and not (name in FAILING and FAILING[name] in r.stdout and " 1 fail " in r.stdout):
             raise Failed(f"{name}: {' '.join(argv)} failed:\n{r.stdout[-4000:]}")
         return time.perf_counter() - t
@@ -344,8 +386,11 @@ def measure(name, args, compiler, which, env, results):
             time.sleep(3)  # Past the caches' windows for too-new timestamps.
             before = lambda: None
         else:
-            edit = (Edit(os.path.join(cwd, zig_path), zig_anchor, zig_suffix) if scen == "edit-zig" else
-                    Edit(os.path.join(cwd, "build.zig"), None, HEADER_SUFFIX))
+            edit = (
+                Edit(os.path.join(cwd, zig_path), zig_anchor, zig_suffix)
+                if scen == "edit-zig"
+                else Edit(os.path.join(cwd, "build.zig"), None, HEADER_SUFFIX)
+            )
             before = edit.edit
         try:
             n = args.runs if scen == "noop" else args.edit_runs
@@ -364,25 +409,35 @@ def measure(name, args, compiler, which, env, results):
             if edit:
                 edit.restore()
                 build()
-        res[scen] = {"median_ms": statistics.median(times) * 1000, "times_ms": [t * 1000 for t in times],
-                     "phases_ms": {k: v * 1000 for k, v in min(split, key=lambda s: s["total"]).items()}}
+        res[scen] = {
+            "median_ms": statistics.median(times) * 1000,
+            "times_ms": [t * 1000 for t in times],
+            "phases_ms": {k: v * 1000 for k, v in min(split, key=lambda s: s["total"]).items()},
+        }
         ph = res[scen]["phases_ms"]
-        print(f"{name:8} {scen:10} {res[scen]['median_ms']:9.1f} ms | "
-              + " ".join(f"{k} {ph[k]:.1f}" for k in PHASES), flush=True)
+        print(
+            f"{name:8} {scen:10} {res[scen]['median_ms']:9.1f} ms | " + " ".join(f"{k} {ph[k]:.1f}" for k in PHASES),
+            flush=True,
+        )
 
 
 def write_report(out, which, compiler, results):
     with open(out + ".md", "w") as f:
-        f.write(f"# `{which} build` phases ({compiler})\n\nMedian wall time (ms); phases (ms) of the fastest "
-                "perf-recorded run.\n\n| project | scenario | median | " + " | ".join(PHASES) + " |\n"
-                "|---|---|---:|" + "---:|" * len(PHASES) + "\n")
+        f.write(
+            f"# `{which} build` phases ({compiler})\n\nMedian wall time (ms); phases (ms) of the fastest "
+            "perf-recorded run.\n\n| project | scenario | median | " + " | ".join(PHASES) + " |\n"
+            "|---|---|---:|" + "---:|" * len(PHASES) + "\n"
+        )
         for name, res in results.items():
             if "failed" in res:
                 f.write(f"| {name} | failed | | | | | | |\n")
                 continue
-            for scen, r in res.items():
-                f.write(f"| {name} | {scen} | {r['median_ms']:.1f} | "
-                        + " | ".join(f"{r['phases_ms'][k]:.1f}" for k in PHASES) + " |\n")
+            f.writelines(
+                f"| {name} | {scen} | {r['median_ms']:.1f} | "
+                + " | ".join(f"{r['phases_ms'][k]:.1f}" for k in PHASES)
+                + " |\n"
+                for scen, r in res.items()
+            )
     print(f"wrote {out}.md")
 
 
