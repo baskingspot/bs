@@ -1,5 +1,5 @@
 //! exit: 7
-//! stdout: "55\n144\n25\n42\n9\n1099511627776\n2\n700\n20\n6\n5\n4\npow2\n13\n99\n48\n3\n7\n31\n1234\n7\n500\n1891\n11\n66\n"
+//! stdout: "55\n144\n25\n42\n9\n1099511627776\n2\n700\n20\n6\n5\n4\npow2\n13\n99\n48\n3\n7\n31\n1234\n7\n500\n1891\n11\n66\n0\n"
 const std = @import("std");
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
@@ -154,13 +154,18 @@ fn main() callconv(.c) noreturn {
     rt.printInt(json_len);
     rt.printInt(@intFromBool(std.mem.eql(u8, &views[0], "\x00Babcxy\x00")) + 2 * @as(u64, @intFromBool(std.mem.eql(u8, &views[1], "\x00\x00abc\x00\x00\x00"))) + 8);
     rt.printInt(views[0][1]);
+    rt.printInt(@intFromBool(@hasDecl(@typeInfo(Tagged).@"union".tag_type.?, "x")));
     rt.exit(@intCast(@bitSizeOf(u7)));
 }
 
 // As upstream, a comptime declaration may compute runtime values nothing
-// needs.
+// needs, and a union's generated tag enum has no declarations.
 var lazy_rt: u32 = 5;
 comptime {
     _ = lazy_rt;
     _ = lazy_rt + 1;
 }
+const Tagged = union(enum) {
+    a: u8,
+    pub const x = 1;
+};
