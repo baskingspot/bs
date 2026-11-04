@@ -13303,6 +13303,14 @@ fn fillReified(sema: *Sema, ty: Index) Allocator.Error!void {
     info.status = .have_field_types;
 }
 
+/// As upstream's `checkCallConvSupportsVarArgs`; the note lists x86_64's
+/// conventions, the only target zap generates code for so far.
+fn failVarArgsCc(sema: *Sema, block: *Block, src: Src, cc: InternPool.CallingConvention) CompileError {
+    const err = sema.fail(block, src, "variadic function does not support '{s}' calling convention", .{@tagName(cc)});
+    try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "supported calling conventions: 'x86_64_sysv', 'x86_64_x32', 'x86_64_win'", .{});
+    return err;
+}
+
 /// `@Fn(param_types, param_attrs, return_type, attrs)`.
 fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) CompileError!Ref {
     const ip = sema.ip;
@@ -13335,7 +13343,7 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
         else => unreachable,
     };
     const is_var_args = try sema.structFieldValue(attrs, "varargs") == .bool_true;
-    if (is_var_args and cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
+    if (is_var_args and cc != .c) return sema.failVarArgsCc(block, sema.callArgSrc(src, false, 3), cc);
     var is_generic = false;
     for (params) |pt| if ((try sema.isComptimeOnlyResolved(block, src, pt))) {
         is_generic = true;
@@ -16991,7 +16999,7 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     }
     if (is_noinline and cc == .@"inline") return sema.fail(block, cc_src, "'noinline' function cannot have calling convention 'inline'", .{});
     if (is_var_args) {
-        if (cc != .c) return sema.fail(block, src, "variadic function does not support '.{s}' calling convention", .{@tagName(cc)});
+        if (cc != .c) return sema.failVarArgsCc(block, .{ .base = src.base, .loc = .{ .fn_param = .{ .node = data.src_node, .index = @intCast(params.len) } } }, cc);
     }
 
     // Errors about a parameter or the return type point at it, as upstream.
