@@ -1160,11 +1160,12 @@ link-time value is ever needed in code.
   working. Saved callee-saved registers need more than today's
   `Atom.Debug.Frame` could say, so the function's unwind information
   became a small record (built 2026-11-03: `Atom.unwind`, an
-  `Atom.Unwind` of `kind`, `saved`, and `stack_size`; Mach-O ORs `saved`
-  into UNWIND_ARM64_MODE_FRAME): frame kind (none, frame pointer, outermost), a
-  stack size (u16, in 16-byte units, reserved now for aarch64's
-  FRAMELESS leaves, `0x02000000 | size / 16 << 12`, which may come
-  later), and a saved-register mask whose bits and layout each architecture fixes
+  `Atom.Unwind` of `kind`, `saved`, `epilogue`, and `probes`; Mach-O ORs `saved`
+  into UNWIND_ARM64_MODE_FRAME): frame kind (none, frame pointer, outermost),
+  where the epilogue's `ret` is (u16, its distance from the end of the
+  code, so the record stays 6 bytes and `Atom` 96; 0 for none), the
+  length of the stack probes that end the code (u8; 0 for none), and a
+  saved-register mask whose bits and layout each architecture fixes
   (x86_64: rbx, r12–r15, pushed in that order below rbp, giving each a
   `DW_CFA_offset`; aarch64: compact unwind's pair bits, x19/x20 = 0x1
   through x27/x28 = 0x10 and d8/d9 = 0x100 through d14/d15 = 0x800, which
@@ -1826,18 +1827,32 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
   instruction of the prologue unwinds right, and with `Unwind.epilogue`
   (x86_64 CodeGen has one epilogue per function, at the end of its code,
   which other returns jump to, as upstream's backend does) a
-  `DW_CFA_def_cfa rsp, 8` row at its `ret`, upstream's epilogue row. The
-  saved registers' rules stay: their slots below rsp keep the values the
-  pops restored, in the red zone that signal delivery skips; all share one CIE in an
+  `DW_CFA_def_cfa rsp, 8` row at its `ret`, upstream's epilogue row. At
+  the `ret` the saved registers' rules stay: their slots below rsp keep
+  the values the pops restored, in the red zone that signal delivery
+  skips. Code may follow the `ret` (`Unwind.epilogue` is its distance
+  from the end): first frameless stubs (CodeGen's synthetic inline
+  frames, 5-byte `call`s with the CFA at rsp+8 and rbp and the saved
+  registers holding the physical frame's values), for which the FDE adds
+  `DW_CFA_restore` of rbp and each saved register after the `def_cfa`, since
+  their slots are no longer just below rsp, and the CIE's unspecified rule
+  is the same-value one std and gdb apply; then the out-of-line stack
+  probes (`Unwind.probes` bytes), which run in the body's frame, so a
+  `DW_CFA_remember_state` before the `def_cfa` and a
+  `DW_CFA_restore_state` at the probes' start bring the body's rules
+  back. A function with neither keeps its FDE as before (built
+  2026-11-04; an FDE with stubs or probes takes up to 64 bytes, the
+  others up to 48 as before). All FDEs share one CIE in an
   allocated .eh_frame, with an entry each in .eh_frame_hdr's sorted
   search table; naked functions (`.none`) get none. Both sections are
-  sized for every entry, at the largest FDE, before the entries are read,
+  sized for every entry, at the largest FDE (48 bytes, or 64 for as many
+  entries as layOut counted atoms with code after their `ret`), before the entries are read,
   so they need no pass before section placement; the debug layout pass
   sizes each chunk's FDEs, and the same chunked debug tasks as the rest
   write them; the room FDEs do not use stays zero after each section. Not described:
-  the `ret` of a function whose frame exceeds a page (its out-of-line
-  stack probes follow the epilogue, so `epilogue` is false; gdb's
-  epilogue sniffer covers it), functions without `Debug` (runtime
+  the `ret` of a function whose frame exceeds a page, until CodeGen sets
+  `probes` (it leaves `epilogue` 0 there for now; gdb's epilogue sniffer
+  covers it), functions without `Debug` (runtime
   helpers), and naked functions other than an outermost one.
   Verified with gdb (its dwarf2 unwinder, at
   entry, after the push, in the body, and at the epilogue's `ret`), `readelf

@@ -83,7 +83,7 @@ const Header = extern struct {
     result_hash: Hash,
 };
 
-const pack_magic = "ZAPSTP04".*;
+const pack_magic = "ZAPSTP05".*;
 const pack_ext = ".zsp";
 /// Donors (`Incremental.publishDonor`): directories each holding a
 /// compilation's manifest and links to the packs it names. `maintain`

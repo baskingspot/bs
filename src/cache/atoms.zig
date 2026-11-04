@@ -48,11 +48,11 @@ const Header = extern struct {
     alignment: u8,
     has_debug: bool,
     /// `Atom.unwind`, for every atom: its kind (`Atom.Unwind.Kind`, checked
-    /// when decoding), saved registers, stack size, and epilogue.
+    /// when decoding), saved registers, epilogue, and probes.
     unwind_kind: u8,
     unwind_saved: u16,
-    unwind_stack_size: u16,
-    unwind_epilogue: u8,
+    unwind_epilogue: u16,
+    unwind_probes: u8,
     unused: [11]u8 = @splat(0),
 };
 
@@ -157,8 +157,8 @@ pub fn encode(atom: *const Atom, debug: ?*const Atom.Debug, out: []u8) void {
         .has_debug = debug != null,
         .unwind_kind = @backingInt(atom.unwind.kind),
         .unwind_saved = atom.unwind.saved,
-        .unwind_stack_size = atom.unwind.stack_size,
-        .unwind_epilogue = @intFromBool(atom.unwind.epilogue),
+        .unwind_epilogue = atom.unwind.epilogue,
+        .unwind_probes = atom.unwind.probes,
     };
     var w: std.Io.Writer = .fixed(out);
     w.writeAll(std.mem.asBytes(&header)) catch unreachable;
@@ -201,8 +201,7 @@ pub fn check(bytes: []align(alignment) const u8, arch: Atom.Unwind.Arch) ?usize 
     if (std.enums.fromInt(Atom.Section, h.section) == null) return null;
     if (h.alignment > std.math.maxInt(std.math.Log2Int(usize))) return null;
     const kind = std.enums.fromInt(Atom.Unwind.Kind, h.unwind_kind) orelse return null;
-    if (h.unwind_epilogue > 1) return null;
-    if (!Atom.Unwind.valid(.{ .kind = kind, .epilogue = h.unwind_epilogue != 0, .saved = h.unwind_saved, .stack_size = h.unwind_stack_size }, arch)) return null;
+    if (!Atom.Unwind.valid(.{ .kind = kind, .epilogue = h.unwind_epilogue, .probes = h.unwind_probes, .saved = h.unwind_saved }, arch)) return null;
     var end: usize = @sizeOf(Header) + 16 * @as(usize, h.targets_len) + @sizeOf(Atom.Reloc) * @as(usize, h.relocs_len);
     end += @as(usize, h.bytes_len) + h.name_len;
     if (h.has_debug) {
@@ -305,7 +304,7 @@ pub inline fn view(rec: [*]align(alignment) const u8) struct { atom: Atom, debug
         .zero_fill = @as(u64, h.zero_fill_hi) << 32 | h.zero_fill_lo,
         .targets = targets[0..h.targets_len],
         .relocs = relocs[0..h.relocs_len],
-        .unwind = .{ .kind = @fromBackingInt(h.unwind_kind), .epilogue = h.unwind_epilogue != 0, .saved = h.unwind_saved, .stack_size = h.unwind_stack_size },
+        .unwind = .{ .kind = @fromBackingInt(h.unwind_kind), .epilogue = h.unwind_epilogue, .probes = h.unwind_probes, .saved = h.unwind_saved },
     }, .debug = debug };
 }
 
@@ -362,7 +361,7 @@ test "atoms round-trip through records" {
             .bytes = &.{ 0xe8, 0, 0, 0, 0, 0xc3 },
             .targets = &.{callee},
             .relocs = &.{.init(1, .x86_64_pc32, 0, -4)},
-            .unwind = .{ .kind = .frame_pointer, .epilogue = true, .saved = 0x13 },
+            .unwind = .{ .kind = .frame_pointer, .epilogue = 1, .saved = 0x13 },
         },
         // More than 4 GiB of zero fill: the high half must survive.
         .{ .key = .fromName("big"), .name = "test:big", .section = .bss, .alignment = .@"8", .zero_fill = (5 << 32) + 3 },
@@ -408,8 +407,9 @@ test "atoms round-trip through records" {
     try std.testing.expectEqual(copy.len, off);
     // A truncated record is an error, not an out-of-bounds read.
     try std.testing.expectError(error.CorruptAtom, decode(copy[0 .. encodedLen(&atoms[0], &debug[0]) - 16], .x86_64));
-    // So is a bad section, alignment, unwind kind, or epilogue flag, saved
-    // registers the architecture does not have or with no frame pointer, or debug
+    // So is a bad section, alignment, unwind kind, probes not after the
+    // epilogue's `ret`, saved registers the architecture does not have or
+    // with no frame pointer, or debug
     // lengths that overrun the record (atom 0's debug header is at 64 +
     // 16 + 12).
     const len0 = encodedLen(&atoms[0], &debug[0]);

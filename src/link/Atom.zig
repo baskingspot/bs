@@ -357,12 +357,10 @@ pub const Debug = struct {
 /// A function's unwind information (see `Atom.unwind`).
 pub const Unwind = extern struct {
     kind: Kind,
-    /// With `frame_pointer`: the function's one epilogue ends its code, so
-    /// its last instruction is the `ret` after the frame pointer's restore
-    /// (x86_64: `pop rbp; ret`, after which the CFA is rsp + 8). CodeGen
-    /// returns from elsewhere by jumping to it. False when the function
-    /// never returns.
-    epilogue: bool = false,
+    /// With `frame_pointer` and an epilogue: the length of the out-of-line
+    /// stack probes that end the code, which run in the body's frame;
+    /// 0 for none.
+    probes: u8 = 0,
     /// The callee-saved registers the prologue saves, with `frame_pointer`
     /// only; the bits and the prologue are each architecture's (see
     /// `savedBits`):
@@ -372,8 +370,17 @@ pub const Unwind = extern struct {
     /// - aarch64: compact unwind's register pairs, x19/x20 0x1 through
     ///   x27/x28 0x10 and d8/d9 0x100 through d14/d15 0x800.
     saved: u16 = 0,
-    /// Reserved for aarch64's frameless leaves, in 16-byte units; 0.
-    stack_size: u16 = 0,
+    /// With `frame_pointer`: the distance from the function's one
+    /// epilogue's `ret` to the end of the code, so the `ret` is at offset
+    /// `size - epilogue`; 0 when the function never returns. The epilogue
+    /// is the frame pointer's restore and `ret` (x86_64: `pop rbp; ret`,
+    /// after which the CFA is rsp + 8); CodeGen returns from elsewhere by
+    /// jumping to it. After the `ret` come frameless stubs, if any (the
+    /// CFA is rsp + 8 and the frame pointer and saved registers hold the
+    /// physical frame's values, as at the `ret`), then the `probes`. 1 is
+    /// a function that ends with its `ret`. Counted from the end so that
+    /// the record stays 6 bytes and `Atom` 96.
+    epilogue: u16 = 0,
 
     pub const none: Unwind = .{ .kind = .none };
     pub const frame_pointer: Unwind = .{ .kind = .frame_pointer };
@@ -403,12 +410,13 @@ pub const Unwind = extern struct {
         };
     }
 
-    /// Whether `u` is one `arch` can describe: saved registers only with
-    /// a frame pointer and an epilogue only with a frame pointer, and
-    /// only `arch`'s saved registers.
+    /// Whether `u` is one `arch` can describe: saved registers, an
+    /// epilogue and probes only with a frame pointer, probes only after
+    /// the epilogue's `ret`, and only `arch`'s saved registers.
     pub fn valid(u: Unwind, arch: Arch) bool {
         if (u.saved & ~savedBits(arch) != 0) return false;
-        return (u.saved == 0 and !u.epilogue) or u.kind == .frame_pointer;
+        if (u.probes != 0 and u.epilogue <= u.probes) return false;
+        return (u.saved == 0 and u.epilogue == 0) or u.kind == .frame_pointer;
     }
 };
 

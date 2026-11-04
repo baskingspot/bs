@@ -626,6 +626,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var n_syms: u32 = 1;
     var strtab_len: u64 = 1;
     var max_targets: usize = 0;
+    var n_long_fdes: u64 = 0;
     for (chunks) |*c| {
         for (&sizes, &aligns, &c.bases, &c.lead_gaps, c.sizes, c.aligns) |*size, *alignment, *chunk_base, *lead_gap, chunk_size, chunk_align| {
             chunk_base.* = chunk_align.forward(size.*);
@@ -638,6 +639,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         n_syms += c.n_syms;
         strtab_len += c.str_len;
         max_targets = @max(max_targets, c.max_targets);
+        n_long_fdes += c.n_long_fdes;
     }
     // A shared object's dynamic tables, and the atoms of its exports.
     var dyn_arena: std.heap.ArenaAllocator = .init(gpa);
@@ -748,9 +750,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     // The coverage PC table, if any, follows .rodata in the R segment.
     starts[pcs] = aligns[pcs].forward(rodata_end);
     const pcs_end = starts[pcs] + sizes[pcs];
-    // Room for an FDE per debug entry, and the terminator.
+    // Room for an FDE per debug entry, and the terminator. Each entry's
+    // atom is a distinct one (`Dwarf.layOutDebug` checks that they
+    // ascend), so at most `n_long_fdes` FDEs exceed the short bound.
     const eh_off = std.mem.alignForward(u64, pcs_end, 8);
-    const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.max_fde_size + 4 else 0;
+    const eh_room = if (has_cfi) Dwarf.cie.len + n_debug * Dwarf.max_short_fde_size + @min(n_debug, n_long_fdes) * (Dwarf.max_fde_size - Dwarf.max_short_fde_size) + 4 else 0;
     const hdr_off = eh_off + eh_room;
     const hdr_room = if (has_cfi) Dwarf.eh_frame_hdr_size + n_debug * Dwarf.eh_frame_hdr_entry_size else 0;
     const r_end = if (has_cfi) hdr_off + hdr_room else pcs_end;
@@ -1152,6 +1156,9 @@ const Chunk = struct {
     n_syms: u32,
     str_len: u32,
     max_targets: u32,
+    /// The atoms with code after their epilogue's `ret`, whose FDEs can
+    /// exceed `Dwarf.max_short_fde_size`.
+    n_long_fdes: u32,
     /// In a shared object, the atoms' absolute relocations, each of which
     /// is a dynamic relocation.
     n_rela: u32,
@@ -1391,6 +1398,7 @@ fn LinkOf(comptime Input: type) type {
                 .n_syms = 0,
                 .str_len = 0,
                 .max_targets = 0,
+                .n_long_fdes = 0,
                 .n_rela = 0,
                 .bases = undefined,
                 .lead_gaps = undefined,
@@ -1443,6 +1451,7 @@ fn LinkOf(comptime Input: type) type {
                 c.n_syms += 1;
                 if (a.name.len > 0) c.str_len += @intCast(a.name.len + 1);
                 c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
+                c.n_long_fdes += @intFromBool(a.unwind.epilogue > 1);
                 if (dynamic) {
                     for (a.relocs) |r| c.n_rela += @intFromBool(l.needsDynamicReloc(a, r));
                 }
@@ -2758,8 +2767,11 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
         // Saves rbx, r13, and r15: `push rbx` at 4, `push r13` at 5, and
         // `push r15` at 7, after `push rbp; mov rbp, rsp`; ends with its
         // epilogue's `ret`.
-        .{ .key = .fromName("g"), .name = "g", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .{ .kind = .frame_pointer, .epilogue = true, .saved = 0x15 } },
+        .{ .key = .fromName("g"), .name = "g", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .{ .kind = .frame_pointer, .epilogue = 1, .saved = 0x15 } },
         .{ .key = .fromName("_start"), .name = "_start", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .outermost },
+        // Saves rbx and r12 (prologue ends at 7); its `ret` is at 40, then
+        // frameless stubs until 50, then 14 bytes of stack probes.
+        .{ .key = .fromName("k"), .name = "k", .section = .text, .alignment = .@"16", .bytes = &code, .unwind = .{ .kind = .frame_pointer, .epilogue = 24, .probes = 14, .saved = 0x3 } },
     };
     const debug = [_]Atom.Debug{
         .{ .atom = 1, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{} },
@@ -2767,6 +2779,7 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
         .{ .atom = 3, .file = "a.zig", .name = "f", .base_line = 0, .lines = &.{} },
         .{ .atom = 4, .file = "a.zig", .name = "g", .base_line = 0, .lines = &.{} },
         .{ .atom = 5, .file = "a.zig", .name = "_start", .base_line = 0, .lines = &.{} },
+        .{ .atom = 6, .file = "a.zig", .name = "k", .base_line = 0, .lines = &.{} },
     };
     const out = try emit(gpa, io, &atoms, .{ .entry = key, .debug = &debug });
     defer gpa.free(out);
@@ -2775,11 +2788,14 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
     const naked = f + code.len;
     const g = text + 96;
     const start = g + code.len;
-    // Three FDEs, g's with its three saved registers and its epilogue; the
-    // duplicate and the naked function leave their room unused.
+    const k = start + code.len;
+    // Four FDEs, g's with its three saved registers and its epilogue, k's
+    // with its stubs' and probes' rows; the duplicate and the naked
+    // function leave their room unused.
     try std.testing.expectEqual(40, Dwarf.fdeSize(atoms[4].unwind, code.len));
-    try std.testing.expectEqual(Dwarf.cie.len + 2 * Dwarf.fde_size + 40 + 4, testSection(out, ".eh_frame").?.size);
-    try std.testing.expectEqual(Dwarf.eh_frame_hdr_size + 3 * Dwarf.eh_frame_hdr_entry_size, testSection(out, ".eh_frame_hdr").?.size);
+    try std.testing.expectEqual(48, Dwarf.fdeSize(atoms[6].unwind, code.len));
+    try std.testing.expectEqual(Dwarf.cie.len + 2 * Dwarf.fde_size + 40 + 48 + 4, testSection(out, ".eh_frame").?.size);
+    try std.testing.expectEqual(Dwarf.eh_frame_hdr_size + 4 * Dwarf.eh_frame_hdr_entry_size, testSection(out, ".eh_frame_hdr").?.size);
 
     // Set up the way std.debug.SelfInfo does from PT_GNU_EH_FRAME.
     const base = 0x200000;
@@ -2791,7 +2807,7 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
     const Unwind = std.debug.Dwarf.Unwind;
     const header: Unwind.EhFrameHeader = try .parse(phdr.vaddr, out[phdr.offset..][0..phdr.filesz], 8, .little);
     try std.testing.expectEqual(testSectionAddr(out, ".eh_frame"), header.eh_frame_vaddr);
-    try std.testing.expectEqual(3, header.search_table.?.fde_count);
+    try std.testing.expectEqual(4, header.search_table.?.fde_count);
     // Through the search table, and through the FDEs sorted while parsing
     // all of .eh_frame, which is what std.debug.SelfInfo asks for.
     for ([_]bool{ false, true }) |sort_fdes| {
@@ -2873,6 +2889,36 @@ test "std.debug unwinds frame-pointer frames through .eh_frame_hdr and stops at 
             try std.testing.expectEqual(0xfb, unwinder.cpu_state.gprs.get(.rbx));
             try std.testing.expectEqual(0xf13, unwinder.cpu_state.gprs.get(.r13));
             try std.testing.expectEqual(0xf15, unwinder.cpu_state.gprs.get(.r15));
+        }
+        // k: in the body and its probes, the saved registers are in their
+        // slots; at its `ret` too, just below rsp; in a stub, rsp is deeper
+        // and they hold the frame's own values (rbp the frame's, not its
+        // caller's), which unwinding a stub must keep.
+        var k_stack: [6]u64 = .{ 0xfc, 0xfb, 0x1111, 0x2222, 0, 0 };
+        var stub_stack: [8]u64 = .{ 0x3333, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead };
+        const k_cases = [_]struct { pc: u64, rsp: u64, rbp: u64, ra: u64, new_rsp: u64, new_rbp: u64, rbx: u64, r12: u64 }{
+            .{ .pc = k + 20, .rsp = at(&k_stack, 0), .rbp = at(&k_stack, 2), .ra = 0x2222, .new_rsp = at(&k_stack, 4), .new_rbp = 0x1111, .rbx = 0xfb, .r12 = 0xfc },
+            .{ .pc = k + 40, .rsp = at(&k_stack, 3), .rbp = 0x1111, .ra = 0x2222, .new_rsp = at(&k_stack, 4), .new_rbp = 0x1111, .rbx = 0xfb, .r12 = 0xfc },
+            .{ .pc = k + 41, .rsp = @intFromPtr(&stub_stack), .rbp = at(&k_stack, 2), .ra = 0x3333, .new_rsp = @intFromPtr(&stub_stack[1]), .new_rbp = at(&k_stack, 2), .rbx = 0xb, .r12 = 0xc },
+            .{ .pc = k + 49, .rsp = @intFromPtr(&stub_stack), .rbp = at(&k_stack, 2), .ra = 0x3333, .new_rsp = @intFromPtr(&stub_stack[1]), .new_rbp = at(&k_stack, 2), .rbx = 0xb, .r12 = 0xc },
+            .{ .pc = k + 50, .rsp = at(&k_stack, 0) - 64, .rbp = at(&k_stack, 2), .ra = 0x2222, .new_rsp = at(&k_stack, 4), .new_rbp = 0x1111, .rbx = 0xfb, .r12 = 0xfc },
+            .{ .pc = k + code.len - 1, .rsp = at(&k_stack, 0), .rbp = at(&k_stack, 2), .ra = 0x2222, .new_rsp = at(&k_stack, 4), .new_rbp = 0x1111, .rbx = 0xfb, .r12 = 0xfc },
+        };
+        for (k_cases) |c| {
+            var ctx: std.debug.cpu_context.Native = .{ .gprs = .initFill(0) };
+            ctx.gprs.set(.rip, c.pc);
+            ctx.gprs.set(.rsp, c.rsp);
+            ctx.gprs.set(.rbp, c.rbp);
+            ctx.gprs.set(.rbx, if (c.pc == k + 40) 0xfb else 0xb);
+            ctx.gprs.set(.r12, if (c.pc == k + 40) 0xfc else 0xc);
+            var unwinder: std.debug.Dwarf.SelfUnwinder = .init(&ctx);
+            defer unwinder.deinit();
+            const rules = try unwinder.computeRules(gpa, &unwind, 0, null);
+            try std.testing.expectEqual(c.ra, try unwinder.next(gpa, &rules));
+            try std.testing.expectEqual(c.new_rsp, unwinder.cpu_state.gprs.get(.rsp));
+            try std.testing.expectEqual(c.new_rbp, unwinder.cpu_state.gprs.get(.rbp));
+            try std.testing.expectEqual(c.rbx, unwinder.cpu_state.gprs.get(.rbx));
+            try std.testing.expectEqual(c.r12, unwinder.cpu_state.gprs.get(.r12));
         }
         // The outermost frame ends the stack: no return address.
         for ([_]u64{ start, start + 1, start + code.len - 1 }) |pc| {

@@ -3294,7 +3294,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
 }
 
 fn contentsHash(a: *const Atom) Hash {
-    const unwind = @as(u64, @intFromBool(a.unwind.epilogue)) << 40 | @as(u64, @backingInt(a.unwind.kind)) << 32 | @as(u64, a.unwind.saved) << 16 | a.unwind.stack_size;
+    const unwind = @as(u64, a.unwind.probes) << 40 | @as(u64, a.unwind.epilogue) << 24 | @as(u64, @backingInt(a.unwind.kind)) << 16 | a.unwind.saved;
     var h = cache.hash(unwind << 16 | @as(u64, @backingInt(a.section)) << 8 | @backingInt(a.alignment), a.bytes);
     h = h *% 31 +% cache.hash(a.zero_fill, @ptrCast(a.relocs));
     return h *% 31 +% cache.hash(a.relocs.len, @ptrCast(a.targets));

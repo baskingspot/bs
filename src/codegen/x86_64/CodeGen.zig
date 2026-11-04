@@ -328,7 +328,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
         // `cg.saved` has `Atom.Unwind.saved`'s x86_64 bits: the prologue
         // pushes `alloc_regs`' callee-saved ones in that order.
-        .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else .{ .kind = .frame_pointer, .epilogue = epilogue_last, .saved = @intCast(cg.saved) },
+        .unwind = if (cg.outermost_frame) .outermost else if (naked) .none else .{ .kind = .frame_pointer, .epilogue = @intFromBool(epilogue_last), .saved = @intCast(cg.saved) },
     }, debug);
     if (cover) try emit.addCoverage(try emit.funcKey(ir.func), cg.cover_pcs.items);
 }

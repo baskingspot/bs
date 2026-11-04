@@ -503,7 +503,7 @@ fn generate(arena: std.mem.Allocator, rand: std.Random, keys: []const Atom.Symbo
             line += rand.intRangeAtMost(u32, 1, 3);
         }
         try debug.append(arena, .{ .atom = @intCast(atoms.items.len), .file = files[i % files.len], .name = name[std.mem.lastIndexOfScalar(u8, name, ':').? + 1 ..], .base_line = rand.uintLessThan(u32, 5000), .lines = lines.bytes.items });
-        try atoms.append(arena, .{ .key = keys[i], .name = name, .section = .text, .alignment = .@"16", .bytes = bytes, .targets = try arena.dupe(Atom.SymbolKey, targets.keys()), .relocs = relocs.items, .unwind = .{ .kind = .frame_pointer, .epilogue = true } });
+        try atoms.append(arena, .{ .key = keys[i], .name = name, .section = .text, .alignment = .@"16", .bytes = bytes, .targets = try arena.dupe(Atom.SymbolKey, targets.keys()), .relocs = relocs.items, .unwind = .{ .kind = .frame_pointer, .epilogue = 1 } });
     }
     // Constants: 8..128 bytes; every fourth one is emitted twice, as two
     // functions producing the same content-addressed constant would.
