@@ -7585,22 +7585,22 @@ fn zirHasDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
 
 fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.ContainerKind) CompileError!Ref {
     const code = sema.code;
-    const src_node: Ast.Node.Index, const name_strategy: Zir.Inst.NameStrategy, const decl_captures: []const Zir.Inst.Capture = switch (kind) {
+    const src_node: Ast.Node.Index, const name_strategy: Zir.Inst.NameStrategy, const decl_captures: []const Zir.Inst.Capture, const capture_names: []const Zir.NullTerminatedString = switch (kind) {
         .@"struct" => blk: {
             const d = code.getStructDecl(inst);
-            break :blk .{ d.src_node, d.name_strategy, d.captures };
+            break :blk .{ d.src_node, d.name_strategy, d.captures, d.capture_names };
         },
         .@"enum" => blk: {
             const d = code.getEnumDecl(inst);
-            break :blk .{ d.src_node, d.name_strategy, d.captures };
+            break :blk .{ d.src_node, d.name_strategy, d.captures, d.capture_names };
         },
         .@"union" => blk: {
             const d = code.getUnionDecl(inst);
-            break :blk .{ d.src_node, d.name_strategy, d.captures };
+            break :blk .{ d.src_node, d.name_strategy, d.captures, d.capture_names };
         },
         .@"opaque" => blk: {
             const d = code.getOpaqueDecl(inst);
-            break :blk .{ d.src_node, d.name_strategy, d.captures };
+            break :blk .{ d.src_node, d.name_strategy, d.captures, d.capture_names };
         },
     };
     const src: Src = .{ .base = src_node, .loc = .{ .node_abs = src_node } };
@@ -7620,6 +7620,17 @@ fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.
             .decl_val => |name| try sema.intern(.{ .nav_capture = .{ .nav = try sema.lookupName(block, src, sema.zirString(name)), .by_ref = false } }),
             .decl_ref => |name| try sema.intern(.{ .nav_capture = .{ .nav = try sema.lookupName(block, src, sema.zirString(name)), .by_ref = true } }),
         };
+        // As upstream, a type outlives the comptime variables of the
+        // analysis that creates it.
+        switch (cap.unwrap()) {
+            .instruction, .instruction_load => if (sema.bc == null and sema.refersToComptimeAlloc(out.*)) {
+                const err = sema.fail(block, src, "captured value contains reference to comptime var", .{});
+                const name = sema.zirString(capture_names[out - captures.ptr]);
+                try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "'{s}' points to a comptime var, which is not available after the analysis that declares it", .{name});
+                return err;
+            },
+            else => {},
+        }
     }
     const name = try sema.typeName(block, name_strategy, inst, kind, captures);
     const ty = try sema.createContainerType(kind, sema.file, inst, captures, name.name, name.key, block.namespace, null);
