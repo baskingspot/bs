@@ -4842,11 +4842,17 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
 - **Cost when off**: one flag test per function in CodeGen and per
   `place`, and the linker's per-section arrays grow from 6 to 8 entries;
   no extra atoms, sections, analysis or format bytes.
-- **`zap build`.** Nothing zap-specific: the runner's fuzz rebuild passes
-  `-ffuzz` and zap builds it; the test binary runs as upstream's does.
-  `--fuzz` without a limit also serves upstream's web UI, whose wasm
-  client the runner compiles with the build's compiler for wasm32, which
-  zap does not target; fuzzing and crash reports work without it.
+- **`zap build`.** The runner's fuzz rebuild passes `-ffuzz` and zap
+  builds it; the test binary runs as upstream's does. `--fuzz` without a
+  limit also serves upstream's web UI, whose wasm client (lib/build-web)
+  the runner compiles with the build's compiler for wasm32
+  (`buildClientWasm`), which zap does not target. As with the docs
+  viewer, zap's build compiles the client with upstream zig
+  (ReleaseFast, stripped: 0.4 MB) and embeds it; zap answers that one
+  command (`build-exe -target wasm32-freestanding --name build-web`
+  with root `build-web/main.zig`, over `--listen=-`) by writing it to
+  `<cache dir>/o/<digest>/build-web.wasm` (src/BuildWeb.zig). With
+  another `--zig-lib-dir` the client stays the embedded one.
 - **The fuzzer's hot loop.** Each run, the fuzzer reads the counters 64
   at a time (`PcBitsetIterator.next`:
   `@as(@Vector(64, u8), @splat(0)) != counters[0..64].*`). Sema maps a

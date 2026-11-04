@@ -4,6 +4,7 @@ const Io = std.Io;
 const build_options = @import("build_options");
 const diag = @import("diag.zig");
 const Frontend = @import("Frontend.zig");
+const BuildWeb = @import("BuildWeb.zig");
 const Zcu = @import("Zcu.zig");
 const Ir = @import("Ir.zig");
 const Emit = @import("Emit.zig");
@@ -170,7 +171,10 @@ pub fn main(init_std: std.process.Init) !void {
     } else fatal("unknown command: {s}", .{cmd});
 
     const opts = try parseOptions(arena, init.io, command, args[2..]);
-    if (opts.listen) return serve(init, args, opts);
+    if (opts.listen) {
+        if (BuildWeb.matches(&opts)) return BuildWeb.serve(init, &opts);
+        return serve(init, args, opts);
+    }
     if (opts.unsupported) |msg| {
         printDiagnostics(init.io, &.{.{ .code = .unsupported, .loc = null, .msg = msg }}, opts.error_format) catch {};
         std.process.exit(1);

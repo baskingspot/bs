@@ -34,6 +34,10 @@ pub fn build(b: *std.Build) void {
     // The autodocs viewer `-femit-docs` writes (src/Docs.zig).
     const docs_wasm = docsWasm(b, zig_lib_dir);
     exe_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
+    // The build runner's web UI client, which `zig build --fuzz` serves
+    // (src/BuildWeb.zig).
+    const build_web_wasm = buildWebWasm(b, zig_lib_dir);
+    exe_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
 
     const exe = b.addExecutable(.{ .name = "zap", .root_module = exe_mod });
     // Comptime evaluation recurses on the native stack: a 1000-deep
@@ -87,6 +91,7 @@ pub fn build(b: *std.Build) void {
     });
     bench_zap_mod.addOptions("build_options", options);
     bench_zap_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
+    bench_zap_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
     const bench_zap = b.addExecutable(.{ .name = "zap", .root_module = bench_zap_mod });
     bench_zap.stack_size = exe.stack_size;
     const bench_codegen_run = b.addRunArtifact(bench_zap);
@@ -668,6 +673,31 @@ fn docsWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
     cmd.addPrefixedFileArg("-Mroot=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "main.zig" }) });
     cmd.addPrefixedFileArg("-MWalk=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "Walk.zig" }) });
     return cmd.addPrefixedOutputFileArg("-femit-bin=", "main.wasm");
+}
+
+/// lib/build-web of `zig_lib_dir` compiled as upstream's build runner
+/// compiles it for its web UI (`buildClientWasm` in
+/// lib/compiler/Maker/WebServer.zig): wasm32, ReleaseFast, the same CPU
+/// features and modules, but stripped. Upstream zig builds it, as
+/// `docsWasm`.
+fn buildWebWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{
+        upstreamZig(b), "build-exe",
+        "-target",      "wasm32-freestanding",
+        "-mcpu",        "baseline+atomics+bulk_memory+multivalue+mutable_globals+nontrapping_fptoint+reference_types+sign_ext",
+        "-OReleaseFast", "-fno-entry",
+        "-rdynamic",    "-fsingle-threaded",
+        // Without its DWARF: 0.4 MB in zap instead of 2.4 MB.
+        "-fstrip",      "--name",
+        "build-web",
+        "--dep",        "Walk",
+        "--dep",        "html_render",
+    });
+    cmd.addPrefixedFileArg("-Mroot=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "build-web", "main.zig" }) });
+    cmd.addPrefixedFileArg("-MWalk=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "Walk.zig" }) });
+    cmd.addArgs(&.{ "--dep", "Walk" });
+    cmd.addPrefixedFileArg("-Mhtml_render=", .{ .cwd_relative = b.pathJoin(&.{ zig_lib_dir, "docs", "wasm", "html_render.zig" }) });
+    return cmd.addPrefixedOutputFileArg("-femit-bin=", "build-web.wasm");
 }
 
 /// Upstream zig, the oracle the tests compare zap with: the zig running
