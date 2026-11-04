@@ -2431,7 +2431,7 @@ fn rewriteKept(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32, final
     defer debug.deinit(gpa);
     var moved = false;
     for (m.atoms(i)) |ref| {
-        const dec = rp.pack.decode(ref, rp.arch) catch return error.Fallback;
+        const dec = rp.pack.decode(ref, rp.arch) catch |err| return inc.lazyFallback("a kept function's atom could not be decoded: {t}", .{err});
         if (dec.debug) |dbg| {
             var copy = dbg;
             copy.atom = @intCast(atoms.items.len);
@@ -2440,7 +2440,8 @@ fn rewriteKept(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32, final
                 copy.base_line = l;
             };
             if (refresh and copy.inlines.len != 0) {
-                copy.inlines = try rp.refreshInlines(&copy) orelse return error.Fallback;
+                copy.inlines = try rp.refreshInlines(&copy) orelse
+                    return inc.lazyFallback("a kept function inlines a callee in a changed file that has no declaration yet: {s}", .{copy.name});
                 if (copy.inlines.ptr != dbg.inlines.ptr) moved = true;
             }
             try debug.append(gpa, copy);

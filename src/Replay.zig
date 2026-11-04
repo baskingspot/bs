@@ -608,9 +608,22 @@ fn debugPath(d: *const Atom.Debug, file: u32) []const u8 {
     return it.next() orelse "";
 }
 
-/// Whether the file with display path `path` changed, or is unknown.
+/// Whether the file with display path `path` changed, or is unknown. A
+/// file the frontend has not loaded (compiler_rt's load on demand) is the
+/// last build's input at that path, whose contents `create` checked.
 fn isChangedPath(r: *Replay, path: []const u8) bool {
-    for (r.zcu.fe.files.items, 0..) |*f, i| if (std.mem.eql(u8, f.display_path, path)) return r.isChangedFile(@intCast(i));
+    const fe = r.zcu.fe;
+    for (fe.files.items, 0..) |*f, i| if (std.mem.eql(u8, f.display_path, path)) return r.isChangedFile(@intCast(i));
+    var path_buf: std.ArrayList(u8) = .empty;
+    defer path_buf.deinit(r.gpa);
+    for (fe.modules.items) |*mod| {
+        const dir = mod.root_dir;
+        if (path.len <= dir.len or !std.mem.startsWith(u8, path, dir) or path[dir.len] != std.fs.path.sep) continue;
+        path_buf.clearRetainingCapacity();
+        path_buf.print(r.gpa, "{s}{c}{s}", .{ mod.abs_root_dir orelse dir, std.fs.path.sep, path[dir.len + 1 ..] }) catch return true;
+        const input = r.by_path.get(path_buf.items) orelse continue;
+        return r.maps.maps.contains(input);
+    }
     return true;
 }
 
