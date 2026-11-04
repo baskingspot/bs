@@ -835,6 +835,19 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         takes(b, &donor.step, 15);
         test_step.dependOn(&donor.step);
     }
+    // A compiler_rt edit without its old ZIR: test/run/edit_rt_old_zir.sh.
+    {
+        const rt = b.addSystemCommand(&.{"sh"});
+        rt.setName("zap compiler_rt edit without old ZIR");
+        rt.addFileArg(b.path("test/run/edit_rt_old_zir.sh"));
+        rt.addArtifactArg(zap);
+        _ = rt.addOutputDirectoryArg("work");
+        rt.addArg(defaultZigLibDir(b));
+        rt.addDirectoryArg(std_zir);
+        rt.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &rt.step, 15);
+        test_step.dependOn(&rt.step);
+    }
 
     const zap_run = b.addRunArtifact(zap);
     zap_run.setName("zap run args");

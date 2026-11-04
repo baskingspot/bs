@@ -51,6 +51,11 @@ state: []State,
 maps: seeds.InstMaps = .{},
 /// Changed inputs `lateMap` tried to map.
 late_mapped: std.AutoHashMapUnmanaged(u32, void) = .empty,
+/// Whether `lateMap` failed for one, whose old ZIR was gone (the global
+/// cache's maintenance can evict superseded ZIR at any time): its nodes'
+/// subjects cannot be made, which a lazy build cannot express, so it
+/// builds again eagerly (`Incremental.finishLazy`).
+late_unmapped: bool = false,
 /// Nodes in compiler_rt files not loaded yet that an edit reached, which
 /// `settle` walks once their file loads (`walkNode`).
 rt_waiting: std.ArrayList(u32) = .empty,
@@ -1566,11 +1571,16 @@ fn lateMap(r: *Replay, input: u32) ?seeds.InstMap {
     const file = r.fileOf(input) orelse return null;
     if ((r.late_mapped.getOrPut(r.gpa, input) catch return null).found_existing) return null;
     const in, _ = r.m.input(input);
-    var old = (r.zcu.fe.loadOldZir(@fromBackingInt(file), @bitCast(in.content_hash)) catch return null) orelse return null;
+    const loaded = r.zcu.fe.loadOldZir(@fromBackingInt(file), @bitCast(in.content_hash)) catch null;
+    var old = loaded orelse {
+        r.late_unmapped = true;
+        return null;
+    };
     defer old.deinit(r.zcu.fe);
     var map: seeds.InstMap = .empty;
     seeds.mapOldZirToNew(r.gpa, &old.zir, &r.zcu.file(file).zir, &map) catch {
         map.deinit(r.gpa);
+        r.late_unmapped = true;
         return null;
     };
     return map;

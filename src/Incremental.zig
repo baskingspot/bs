@@ -1851,6 +1851,10 @@ pub fn finishLazy(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *cons
         if (inc.timing) std.debug.print("cache: building again eagerly: a declaration's data takes the address of a link input's symbol\n", .{});
         return inc.fallBack();
     }
+    if (r.late_unmapped) {
+        if (inc.timing) std.debug.print("cache: building again eagerly: a compiler_rt file that loaded late has no old ZIR to map\n", .{});
+        return inc.fallBack();
+    }
     const gpa = inc.gpa;
     const io = inc.io;
     if (inc.timing) r.printStats();
