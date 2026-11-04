@@ -3456,7 +3456,9 @@ analyzing everything.
 - *The donor key* (`donorKey`): the store seed (zap and the target), the
   std directory, and the options Zcu reads without recording a dependency
   (`-fsingle-threaded`, which decides whether declarations are
-  threadlocal, and test filters). Everything else (the builtin module,
+  threadlocal, test filters, and the root module's `-M` name, which
+  `@src()` and messages show while its files are keyed `=root:` or
+  `=main:` in every compilation). Everything else (the builtin module,
   root and modules, every file) is an input the replay checks.
 - *Choosing.* `useDonor` runs after the frontend: among the donors of
   this compilation's key, it takes the one whose builtin module is this
@@ -3477,7 +3479,11 @@ analyzing everything.
   whose key names no file here and does not hold here (`inputKeyHolds`:
   its module is missing, or puts the key at another path) is a changed
   input with no new ZIR, so all its nodes are seeds: another project's
-  files, the same file under another module name. A module's root file is
+  files, the same file under another module name. The root module and
+  the module under test are named by role, `=root` and `=main`, which no
+  `-M` name can spell (`--dep` and diagnostics use the `-M` name), so a
+  `zap test` of a file never matches the `zap build-exe` of it as its
+  root module, and no other module's keys are theirs. A module's root file is
   keyed `<module>:` without its path (`Zcu.fileKey`), so the donor's root
   file is this build's root file, changed, and std's `@import("root")` in
   a donor's result names this build's root struct; whether its

@@ -43,6 +43,8 @@ file_map: std.StringHashMapUnmanaged(File.Index) = .empty,
 modules: std.ArrayList(Module) = .empty,
 /// The module whose tests `zap test` runs; `root` outside of tests.
 main_module: Module.Index = .root,
+/// `Options.root_name`: what `displayName` calls `main_module`.
+root_name: []const u8 = "root",
 /// See `Options.load_std`.
 load_std: bool,
 /// The root module of the fuzzer's family (`Options.fuzzer_builtin_dir`),
@@ -166,14 +168,15 @@ pub const Options = struct {
 };
 
 pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
-    var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir, .load_std = options.load_std };
+    var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir, .load_std = options.load_std, .root_name = options.root_name };
     errdefer fe.deinit();
     // The root module and the module under test are named by their roles,
     // not their `-M` name (`root_name`): cache keys name modules
     // (`Zcu.fileKey`), and the root file of a `zap test` must not stand
     // for the root module of a `zap build-exe`, which `@import("root")`
-    // finds.
-    try fe.addModule("root", options.root_src_path, .local);
+    // finds. The names start with '=', which no `-M` name can hold, so no
+    // other module's keys are theirs.
+    try fe.addModule("=root", options.root_src_path, .local);
     try fe.modules.append(gpa, .{
         .name = "std",
         .root_dir = try std.fs.path.join(gpa, &.{ zig_lib_dir, "std" }),
@@ -205,7 +208,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
             fe.main_module = .std;
         } else {
             fe.main_module = @fromBackingInt(@intCast(fe.modules.items.len));
-            try fe.addModule("main", path, .local);
+            try fe.addModule("=main", path, .local);
         }
     }
     const first_extra = fe.modules.items.len;
@@ -287,6 +290,17 @@ fn freeFile(gpa: Allocator, io: Io, f: *File) void {
 
 pub fn file(fe: *const Frontend, index: File.Index) *const File {
     return &fe.files.items[@backingInt(index)];
+}
+
+/// A module's name as upstream shows it (in diagnostics and `@src()`):
+/// its `-M` name, and "root" for the test runner.
+pub fn displayName(fe: *const Frontend, index: Module.Index) []const u8 {
+    if (index == fe.main_module) return fe.root_name;
+    if (index == .root) return "root";
+    const name = fe.module(index).name;
+    // The fuzzer's family (`std@fuzzer`), named as in upstream's separate
+    // compilation of it.
+    return name[0 .. std.mem.indexOfScalar(u8, name, '@') orelse name.len];
 }
 
 pub fn module(fe: *const Frontend, index: Module.Index) *const Module {

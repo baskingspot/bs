@@ -40,7 +40,8 @@ parsed as with --default-runner and compared with baseline/std-<target>.json.
 With --compile-errors, the measure is diagnostics instead: every case in
 upstream's test/cases/compile_errors that applies to the target, compiled
 by zap as upstream's case harness compiles it: as a root file named
-tmp.zig, so that its types are named `tmp.T`, with build-obj, or build-exe
+tmp.zig, so that its types are named `tmp.T`, in a module named root
+(`-Mroot=`), with build-obj, or build-exe
 or test when the case says so. A case is "exact" when zap reports the same
 error lines (location and message) as the case expects, "same location"
 when only the messages differ, and otherwise "different", "accepted" (no
@@ -992,15 +993,16 @@ def crash_frame(stderr):
 def run_case(compiler, path, cfg, expected, args, workdir):
     out_dir = workdir / "compile-errors" / path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Upstream's harness compiles each case as tmp.zig.
+    # Upstream's harness compiles each case as tmp.zig, in a module named
+    # root.
     root = out_dir / "tmp.zig"
     shutil.copyfile(path, root)
     if cfg.get("is_test") == "true":
-        argv = [str(compiler), "test", "--test-no-exec", str(root), f"-femit-bin={out_dir / 'case.test'}"]
+        argv = [str(compiler), "test", "--test-no-exec", f"-Mroot={root}", f"-femit-bin={out_dir / 'case.test'}"]
     elif cfg.get("output_mode", "Obj").lower() == "exe":
-        argv = [str(compiler), "build-exe", str(root), f"-femit-bin={out_dir / 'case'}"]
+        argv = [str(compiler), "build-exe", f"-Mroot={root}", f"-femit-bin={out_dir / 'case'}"]
     else:
-        argv = [str(compiler), "build-obj", str(root), f"-femit-bin={out_dir / 'case.o'}"]
+        argv = [str(compiler), "build-obj", f"-Mroot={root}", f"-femit-bin={out_dir / 'case.o'}"]
     argv.append("--error-format=json")
     code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
     shutil.rmtree(out_dir, ignore_errors=True)

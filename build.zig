@@ -576,21 +576,42 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     const mods_bin = mods.addPrefixedOutputFileArg("-femit-bin=", "modules");
     const mods_run = std.Build.Step.Run.create(b, "run modules");
     mods_run.addFileArg(mods_bin);
-    mods_run.addCheck(.{ .expect_stdout_exact = "zap 3 0.17.0-dev 31 31\n" });
+    mods_run.addCheck(.{ .expect_stdout_exact = "zap 3 0.17.0-dev 31 31 app\n" });
     mods_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&mods_run.step);
 
-    // A module under test that imports itself by its `-M` name. Named
-    // "root" like upstream's test runner; the cache check fails if the two
-    // modules share a cache key.
+    // `@src()` names the root module by its `-M` name; a second build
+    // (`zap run` without `-M`) shares the first one's global cache, so it
+    // takes the first as its donor if the donor key lets it.
+    const src_app = b.addRunArtifact(zap);
+    src_app.setName("zap run @src module app");
+    src_app.addArg("run");
+    src_app.addPrefixedFileArg("-Mapp=", b.path("test/obj/mod/srcmod.zig"));
+    src_app.addArg("--global-cache-dir");
+    const src_cache = src_app.addOutputDirectoryArg("src-module-cache");
+    src_app.addCheck(.{ .expect_stdout_exact = "app\n" });
+    const src_stem = b.addRunArtifact(zap);
+    src_stem.setName("zap run @src module stem");
+    src_stem.addArg("run");
+    src_stem.addFileArg(b.path("test/obj/mod/srcmod.zig"));
+    src_stem.addArg("--global-cache-dir");
+    src_stem.addDirectoryArg(src_cache);
+    src_stem.addCheck(.{ .expect_stdout_exact = "srcmod\n" });
+    test_step.dependOn(&src_stem.step);
+
+    // A module under test that imports itself by its `-M` name. It is
+    // named "root" like upstream's test runner, and another module "main";
+    // the cache check fails if a module shares a cache key with the test
+    // runner or the module under test.
     const self_test = b.addRunArtifact(zap);
     self_test.setName("zap test self import");
     self_test.setEnvironmentVariable("ZAP_CACHE_CHECK", "1");
-    self_test.addArgs(&.{ "test", "--dep", "self=root" });
+    self_test.addArgs(&.{ "test", "--dep", "self=root", "--dep", "main" });
     self_test.addPrefixedFileArg("-Mroot=", b.path("test/obj/mod/self.zig"));
+    self_test.addPrefixedFileArg("-Mmain=", b.path("test/obj/mod/seven.zig"));
     self_test.addArg("--global-cache-dir");
     _ = self_test.addOutputDirectoryArg("self-test-cache");
-    self_test.addCheck(.{ .expect_stderr_match = "All 1 tests passed." });
+    self_test.addCheck(.{ .expect_stderr_match = "All 2 tests passed." });
     self_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&self_test.step);
 }

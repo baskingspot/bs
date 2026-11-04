@@ -315,7 +315,7 @@ pub const Job = struct {
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
-        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.cacheTarget(), env.get("ZAP_CACHE_TIMING") != null) catch |err| {
+        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.opts.root_name, job.cacheTarget(), env.get("ZAP_CACHE_TIMING") != null) catch |err| {
             std.log.warn("unable to use the cache: {t}", .{err});
             return null;
         };
@@ -989,6 +989,7 @@ fn setUnsupported(opts: *Options, arena: std.mem.Allocator, comptime fmt: []cons
 pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in: []const []const u8) !Options {
     var args = args_in;
     var root: ?[]const u8 = null;
+    var positional_root = false;
     var opts: Options = .{ .command = command, .root_src_path = undefined };
     var test_filters: std.ArrayList([]const u8) = .empty;
     var deps: std.ArrayList([]const u8) = .empty;
@@ -1150,6 +1151,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
                 setUnsupported(&opts, arena, "zap does not compile C, C++, or assembly sources ('{s}'); build this step with upstream zig", .{arg});
         } else if (root == null) {
             root = arg;
+            positional_root = true;
             opts.root_deps = try deps.toOwnedSlice(arena);
         } else {
             fatal("unexpected extra parameter: {s}", .{arg});
@@ -1160,6 +1162,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     opts.root_src_path = root orelse if (opts.unsupported != null) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
     opts.modules = modules.items;
+    // As upstream, a root file given without `-M` names its module "test"
+    // under `zap test`, else after the file (not `--name`).
+    if (positional_root) opts.root_name = if (command == .@"test") "test" else std.fs.path.stem(opts.root_src_path);
     // As upstream: a `--dep` names one module.
     for (modules.items, 0..) |m, k| {
         const prev = if (std.mem.eql(u8, m.name, opts.root_name)) opts.root_src_path else for (modules.items[0..k]) |p| {

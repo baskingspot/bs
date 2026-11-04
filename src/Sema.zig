@@ -752,7 +752,7 @@ pub fn populateTestFunctions(zcu: *Zcu) CompileError!void {
                 if (na.file == root or nb.file == root) return na.file == root;
                 const fa = z.file(na.file);
                 const fb = z.file(nb.file);
-                if (fa.module != fb.module) return std.mem.lessThan(u8, z.fe.module(fa.module).name, z.fe.module(fb.module).name);
+                if (fa.module != fb.module) return std.mem.lessThan(u8, z.fe.displayName(fa.module), z.fe.displayName(fb.module));
                 return std.mem.lessThan(u8, fa.sub_path, fb.sub_path);
             }
             if (na.namespace != nb.namespace) {
@@ -4588,20 +4588,7 @@ fn zirBuiltinSrc(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Co
     if (func == .none) return sema.fail(block, src, "@src outside function", .{});
     const fn_name = ip.stringSlice(ip.getNav(ip.keyPayload(.func, func).owner_nav).name);
     const file = sema.zcu.file(sema.file);
-    // Upstream's module names: `test` for the module under test, the root
-    // file's stem for a build-exe root.
-    const fe = sema.zcu.fe;
-    const module = fe.module(file.module);
-    const module_name = if (fe.main_module != .root and file.module == fe.main_module)
-        "test"
-    else if (file.module == .root and fe.main_module == .root)
-        std.fs.path.stem(module.root_file)
-    else if (std.mem.indexOfScalar(u8, module.name, '@')) |at|
-        // The fuzzer's family (`std@fuzzer`), named as in upstream's
-        // separate compilation of it.
-        module.name[0..at]
-    else
-        module.name;
+    const module_name = sema.zcu.fe.displayName(file.module);
     const strings = [_][]const u8{ module_name, file.sub_path, fn_name };
     var vals: [3]Index = undefined;
     for (strings, &vals) |bytes, *v| {
@@ -5518,7 +5505,7 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     else if (std.mem.endsWith(u8, path, ".zon"))
         return .fromInterned(try sema.importZon(block, src, path, null, extra.res_ty))
     else
-        return sema.fail(block, src, "no module named '{s}' available within module '{s}'", .{ path, fe.module(this_file.module).name });
+        return sema.fail(block, src, "no module named '{s}' available within module '{s}'", .{ path, fe.displayName(this_file.module) });
     return .fromInterned(try sema.fileRootType(key));
 }
 

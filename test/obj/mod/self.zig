@@ -7,3 +7,7 @@ pub const answer: u32 = 42;
 test "a module imports itself by name" {
     try std.testing.expectEqual(42, @import("self").answer);
 }
+
+test "a module is named main" {
+    try std.testing.expectEqual(7, @import("main").seven);
+}

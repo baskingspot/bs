@@ -97,8 +97,9 @@ replay: ?*Replay = null,
 
 /// Opens and locks the directory of the compilation that `args` (the
 /// command line after `zap`) describes, run from the current directory.
-/// `zig_lib_dir` is the std that compilation uses.
-pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, target: []const u8, timing: bool) !Incremental {
+/// `zig_lib_dir` is the std that compilation uses; `root_name` is
+/// `Frontend.Options.root_name`.
+pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, root_name: []const u8, target: []const u8, timing: bool) !Incremental {
     const build_start = Io.Clock.real.now(io);
     const store_seed, const key = try compilationKey(gpa, io, args, zig_lib_dir, target);
 
@@ -117,7 +118,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .dir = dir,
         .lock = lock,
         .store_seed = store_seed,
-        .donor_key = try donorKey(gpa, io, store_seed, zig_lib_dir, args),
+        .donor_key = try donorKey(gpa, io, store_seed, zig_lib_dir, root_name, args),
         .arch = if (std.mem.startsWith(u8, target, "aarch64")) .aarch64 else .x86_64,
         .build_start = build_start,
         .timing = timing,
@@ -386,12 +387,18 @@ const donor_renew_ns = std.time.ns_per_hour;
 /// replayed here, beyond what the graph checks itself (inputs and
 /// red-green): zap and the target (`store_seed`), the std, and options
 /// Zcu reads without recording a dependency: `-fsingle-threaded` (whether
-/// declarations are threadlocal) and test filters (which tests exist).
+/// declarations are threadlocal), test filters (which tests exist), and
+/// the root module's `-M` name (`Frontend.displayName`: `@src()` and
+/// messages show it; the root module's own name, which keys its files,
+/// is the same in every compilation so that `@import("root")` carries
+/// over).
 /// The builtin module is an input, so a donor whose builtin differs is
 /// valid, but loses most of std; `useDonor` ranks those last.
-fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, args: []const []const u8) !Hash {
+fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, root_name: []const u8, args: []const []const u8) !Hash {
     var h: std.hash.Wyhash = .init(0x646f6e6f72);
     h.update(std.mem.asBytes(&store_seed));
+    h.update(root_name);
+    h.update("\x00");
     // Resolved: `--zig-lib-dir zig-lib` names another std in another
     // directory.
     if (Io.Dir.cwd().realPathFileAlloc(io, zig_lib_dir, gpa)) |lib| {
