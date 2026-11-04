@@ -1076,13 +1076,19 @@ const max_insn_len = 16;
 /// instructions without operands that have no method of their own.
 /// Allocates a stack frame of `size` bytes, more than a page, touching each
 /// page first, then jumps to `resume_at`: upstream's probe sequences, so a
-/// frame cannot step over a guard page. Below 5 pages, unrolled:
-///   test [rsp - 4096 * k], esp   (each k with 4096 * k < size)
+/// frame cannot step over a guard page, except that each probe writes the
+/// frame's not yet used memory where upstream's `test` reads it. A read
+/// of an untouched stack page maps the shared zero page, and the frame's
+/// first write to it then copies it and flushes every thread's TLB: a
+/// multithreaded program (the build runner's Fetch workers, each with a
+/// 64 KiB `undefined` buffer) pays inter-processor interrupts per page.
+/// Below 5 pages, unrolled:
+///   mov [rsp - 4096 * k], esp   (each k with 4096 * k < size)
 ///   sub rsp, size
 /// otherwise a loop, with r10 (upstream's linker scratch register, which
 /// carries no argument):
 ///   mov r10d, size; sub rsp, r10
-///   1: test [rsp + r10 - 4096], esp; sub r10, 4096; jae 1b
+///   1: mov [rsp + r10 - 4096], esp; sub r10, 4096; jae 1b
 pub fn probedFrameAlloc(e: *Encoder, size: u32, resume_at: u32) !void {
     const page = 4096;
     assert(size > page);
@@ -1090,7 +1096,7 @@ pub fn probedFrameAlloc(e: *Encoder, size: u32, resume_at: u32) !void {
     if (size < 5 * page) {
         var off: u32 = page;
         while (off < size) : (off += page) {
-            e.bytes(&.{ 0x85, 0xa4, 0x24 });
+            e.bytes(&.{ 0x89, 0xa4, 0x24 });
             e.int(i32, -@as(i32, @intCast(off)));
         }
         e.bytes(&.{ 0x48, 0x81, 0xec });
@@ -1099,7 +1105,7 @@ pub fn probedFrameAlloc(e: *Encoder, size: u32, resume_at: u32) !void {
         e.bytes(&.{ 0x41, 0xba });
         e.int(u32, size);
         e.bytes(&.{ 0x4c, 0x29, 0xd4 });
-        e.bytes(&.{ 0x42, 0x85, 0xa4, 0x14 });
+        e.bytes(&.{ 0x42, 0x89, 0xa4, 0x14 });
         e.int(i32, -page);
         e.bytes(&.{ 0x49, 0x81, 0xea });
         e.int(u32, page);
