@@ -2055,7 +2055,12 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
      promotion gave a register and a move of their own.
    - Frame addresses: a field pointer, or an element pointer with a
      constant index, of an alloc in the frame is itself a frame address
-     (`Home.frame_addr`): no register, no code.
+     (`Home.frame_addr`): no register, no code. Of a pointer that wants
+     a general-purpose register, it is a register address
+     (`Home.reg_addr`, `addrFoldable`): its users address `[base + off]`,
+     and the base's interval grows over theirs (and crosses what they
+     cross) right after liveness; if the base gets no register, the
+     pointer is computed as before.
    - Initializers and results (`planCopies`, before liveness): a `*const`
      alloc stored to once with a value that always lives in memory is that
      memory when the value is in place first (an argument in the incoming

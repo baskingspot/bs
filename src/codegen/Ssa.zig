@@ -149,6 +149,12 @@ pub const want_reg: u8 = 0xfe;
 pub const want_pair: u8 = 0xfd;
 /// Like `want_reg`, for a value in a floating-point register.
 pub const want_float: u8 = 0xfc;
+/// For an address its users may read as an offset from another value
+/// (`allocate`'s `fold`): no register if that value has one or is itself
+/// folded, else like `want_reg`. Not one of the `want` markers.
+pub const want_fold: u8 = 0xfb;
+/// What `allocate` leaves for a `want_fold` value that took no register.
+pub const folded: u8 = 0xfa;
 
 /// Whether `r` is one of the `want` markers.
 pub fn wants(r: u8) bool {
@@ -616,6 +622,9 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
             crosses[w] = crosses[w] or crosses[l] or cl[end[w]][0] != cl[def[w]][0] or cl[def[l]][1] != cl[def[w]][1];
         }
     }
+    // The architecture may lengthen intervals too, before they decide
+    // what may share a register.
+    ctx.lengthenIntervals();
     // After forwarding, which lengthens the intervals of values stored.
     for (f.var_loads.items) |l| {
         const v = datas[l].ty_op.operand.toIndex().?;
@@ -986,8 +995,11 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// their registers through their last use, so a result shares a register
 /// only with its tied operand or, for a load of a promoted variable, with
 /// the variable (`Live.share`). A free register the value's `hint` names
-/// comes before the others. Returns the mask of registers used.
-pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32) u32 {
+/// comes before the others. A `want_fold` value takes no register when
+/// the value `fold` gives for it has one, which is then never evicted, or
+/// is itself folded. Returns
+/// the mask of registers used.
+pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32) u32 {
     const total = n + n_float;
     assert(total <= max_regs);
     const gprs: u32 = (@as(u32, 1) << @intCast(n)) - 1;
@@ -1030,6 +1042,18 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32) u32 {
     var used: u32 = 0;
     for (f.values.items(.inst)) |inst_index| {
         const inst = @backingInt(inst_index);
+        if (reg[inst] == want_fold) {
+            const b = fold[inst];
+            if (reg[b] < total) {
+                // An evicted value would be in memory for its whole
+                // interval, under the folded value's users too.
+                held[reg[b]] = @max(held[reg[b]], end[b]);
+                reg[inst] = folded;
+                continue;
+            }
+            reg[inst] = if (reg[b] == folded) folded else want_reg;
+            if (reg[inst] == folded) continue;
+        }
         if (!wants(reg[inst])) continue;
         var j: u8 = 0;
         while (j < active_len) {

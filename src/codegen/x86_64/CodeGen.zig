@@ -57,6 +57,9 @@ ir: *const Ir,
 e: Encoder,
 fn_ty: InternPool.FuncType,
 homes: []Home,
+/// Per pointer `base + off` folded into its users' addressing
+/// (`addrFoldable`): the value its address is based on, else `no_base`.
+addr_base: []u32,
 ssa: *const Ssa,
 /// Each SSA block's label, by block index.
 labels: []Encoder.Label,
@@ -180,6 +183,9 @@ const Home = union(enum) {
     slot: i32,
     /// The value is the address `rbp + off` (an `alloc`).
     frame_addr: i32,
+    /// The value is the address `base + off`, a register holding another
+    /// value (`addrFoldable`).
+    reg_addr: struct { base: Reg, off: i32 },
     /// A load read in place by its only user (see `planDeferred`): the
     /// value is the memory its pointer points to.
     deferred,
@@ -239,12 +245,14 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         .e = .init(gpa),
         .fn_ty = ip.keyPayload(.func_type, func.ty),
         .homes = try gpa.alloc(Home, ir.instructions.len),
+        .addr_base = try gpa.alloc(u32, ir.instructions.len),
         .ssa = &emit.ssa,
         .labels = try gpa.alloc(Encoder.Label, emit.ssa.blocks.items.len),
     };
     defer {
         cg.e.deinit();
         gpa.free(cg.homes);
+        gpa.free(cg.addr_base);
         gpa.free(cg.labels);
         cg.dbg_inlines.deinit(gpa);
         cg.dbg_inline_names.deinit(gpa);
@@ -266,6 +274,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     }
     if (cover) cg.cover_key = Emit.coverageKeys(try emit.funcKey(ir.func))[0];
     @memset(cg.homes, .none);
+    @memset(cg.addr_base, no_base);
     try cg.planRegisters();
     // Inline assembly may compute offsets in the code itself.
     cg.e.shorten = !cg.has_asm;
@@ -825,6 +834,7 @@ pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
         .dead => unreachable,
         .slot => |off| .{ .mem = Mem.at(.rbp, off) },
         .frame_addr => |off| .{ .addr = Mem.at(.rbp, off) },
+        .reg_addr => |a| .{ .addr = Mem.at(a.base, a.off) },
     };
     return cg.constLoc(ref.toInterned().?);
 }
@@ -1217,8 +1227,9 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
             return false;
         },
         .alloc, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .loop, .breakpoint => return false,
-        // A frame address takes no register and emits nothing.
-        .struct_field_ptr, .ptr_elem_ptr, .ptr_add => if (cg.frameFoldable(inst.toRef())) return false,
+        // A frame address takes no register and emits nothing; nor does
+        // an address its users fold into their addressing.
+        .struct_field_ptr, .ptr_elem_ptr, .ptr_add => if (cg.frameFoldable(inst.toRef()) or cg.addrFoldable(inst)) return false,
         else => {},
     }
     const class: RegClass = if (cg.has_asm) .none else cg.wantsReg(inst);
@@ -1347,14 +1358,14 @@ fn planRegisters(cg: *CodeGen) Error!void {
             hint[wi][0] = hint_rax;
         }
     }
-    cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved) & callee_saved;
+    cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base) & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
         switch (fate[i]) {
             .normal => {
                 const r = reg[i];
-                if (r == Ssa.no_reg) {
+                if (r == Ssa.no_reg or r == Ssa.folded) {
                     if (live.items(.hint)[i][0] == hint_rax) cg.homes[i] = .{ .reg = .rax };
                     continue;
                 }
@@ -1546,6 +1557,8 @@ pub fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, at: u32) vo
     if (!found) return;
     const ptr = datas[li].ty_op.operand;
     if (ptr.toIndex()) |p0| {
+        // A folded address keeps its base, not itself, alive.
+        if (cg.addr_base[@backingInt(p0)] != no_base) return;
         var p = @backingInt(p0);
         // A variable `Ssa.plan` may keep in a register (a 16-byte vector)
         // has no memory to read.
@@ -1682,7 +1695,8 @@ fn frameFoldable(cg: *CodeGen, ref: Ref) bool {
 }
 
 /// Gives pointer `inst`, `base + off`, the frame address it is if `base`
-/// is one; returns whether it did.
+/// is one, or the register address it is if `addrFoldable` chose it and
+/// `base` got a register; returns whether it did.
 fn foldFrame(cg: *CodeGen, inst: Inst.Index, base: Ref, off: u64) bool {
     const b = base.toIndex() orelse return false;
     switch (cg.homes[@backingInt(b)]) {
@@ -1690,7 +1704,117 @@ fn foldFrame(cg: *CodeGen, inst: Inst.Index, base: Ref, off: u64) bool {
             cg.homes[@backingInt(inst)] = .{ .frame_addr = o + @as(i32, @intCast(off)) };
             return true;
         },
-        else => return false,
+        .reg => |r| if (cg.addr_base[@backingInt(inst)] != no_base and cg.homes[@backingInt(inst)] == .none) {
+            cg.homes[@backingInt(inst)] = .{ .reg_addr = .{ .base = r, .off = @intCast(off) } };
+            return true;
+        },
+        .reg_addr => |a| if (cg.addr_base[@backingInt(inst)] != no_base and cg.homes[@backingInt(inst)] == .none) {
+            cg.homes[@backingInt(inst)] = .{ .reg_addr = .{ .base = a.base, .off = a.off + @as(i32, @intCast(off)) } };
+            return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+const no_base = std.math.maxInt(u32);
+
+/// The pointer that address `inst` (a `struct_field_ptr`, `ptr_elem_ptr`,
+/// or `ptr_add`) is an offset from.
+fn addrOperand(cg: *CodeGen, inst: Inst.Index) Ref {
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    // `StructField.operand` and `Bin.lhs` come first.
+    return @fromBackingInt(cg.ir.extra[data.ty_pl.payload]);
+}
+
+/// Whether pointer `inst`, a constant offset from another pointer in a
+/// general-purpose register (or from one such pointer itself folded), is
+/// folded into its users' addressing: it takes no register, and its users
+/// address `[base + off]`, so the base lives as long as they do
+/// (`lengthenIntervals`). Records the base in `addr_base`. For `liveness`,
+/// in layout order, where the base's register class is already known. If
+/// the base gets no register after all, the pointer is computed as usual.
+fn addrFoldable(cg: *CodeGen, inst: Inst.Index) bool {
+    if (cg.has_asm) return false;
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    const base: Ref, const off: u64 = switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .struct_field_ptr => blk: {
+            const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+            const container = Type.ptrInfo(ip, cg.typeOf(sf.operand)).child;
+            break :blk .{ sf.operand, Type.fieldOffset(ip, container, sf.index) };
+        },
+        else => blk: {
+            const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+            const k = cg.constIndex(bin.rhs) orelse return false;
+            break :blk .{ bin.lhs, k *% Type.abiSize(ip, Type.ptrInfo(ip, data.ty_pl.ty).child) };
+        },
+    };
+    if (off > 1 << 30) return false;
+    const b = @backingInt(base.toIndex() orelse return false);
+    const root = if (cg.addr_base[b] != no_base) cg.addr_base[b] else b;
+    if (cg.emit.ssa.live.items(.reg)[root] != Ssa.want_reg) return false;
+    cg.addr_base[@backingInt(inst)] = root;
+    return true;
+}
+
+/// In `Ssa.plan`, after forwarding: each folded address (`addrFoldable`)
+/// gets `want_fold`, and the pointer it is an offset from (or the value
+/// that pointer forwards) in `addr_base`, for `Ssa.allocate`; that
+/// pointer, and each folded one between it and the register that holds
+/// them, lives as long as the address. An address whose register holder
+/// would then cross a clobber point it did not cross before wants a
+/// register of its own instead: the holder would need one that survives
+/// calls, which are few.
+pub fn lengthenIntervals(cg: *CodeGen) void {
+    const f = cg.ssa;
+    const live = f.live.slice();
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const reg = live.items(.reg);
+    const fwd = live.items(.fwd);
+    const fate = live.items(.fate);
+    const cl = f.clobbers.items;
+    for (f.values.items(.inst)) |inst| {
+        const v = @backingInt(inst);
+        if (cg.addr_base[v] == no_base) continue;
+        if (fate[v] == .dead) {
+            cg.addr_base[v] = no_base;
+            continue;
+        }
+        const b = @backingInt(cg.addrOperand(inst).toIndex().?);
+        // The register holder: the first pointer up the chain that is
+        // not folded, through forwarded loads.
+        var h = b;
+        while (true) {
+            if (fwd[h] != Ssa.no_tie) h = fwd[h];
+            if (cg.addr_base[h] == no_base) break;
+            h = @backingInt(cg.addrOperand(@fromBackingInt(h)).toIndex().?);
+        }
+        const e = @max(end[h], end[v]);
+        if (!crosses[h] and (crosses[v] or cl[e][0] != cl[def[h]][0])) {
+            cg.addr_base[v] = no_base;
+            reg[v] = Ssa.want_reg;
+            live.items(.tie)[v] = cg.tiedOperand(inst);
+            continue;
+        }
+        // A folded link whose own base gets no register holds the
+        // address itself (`Ssa.allocate`), so it crosses what the
+        // address's users cross.
+        var x = b;
+        while (true) {
+            if (fwd[x] != Ssa.no_tie) x = fwd[x];
+            end[x] = @max(end[x], end[v]);
+            crosses[x] = crosses[x] or crosses[v] or cl[end[x]][0] != cl[def[x]][0];
+            if (cg.addr_base[x] == no_base) break;
+            x = @backingInt(cg.addrOperand(@fromBackingInt(x)).toIndex().?);
+        }
+        reg[v] = Ssa.want_fold;
+        // For a register of its own after all.
+        live.items(.tie)[v] = cg.tiedOperand(inst);
+        cg.addr_base[v] = if (fwd[b] != Ssa.no_tie) fwd[b] else b;
     }
 }
 
