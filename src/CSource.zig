@@ -60,6 +60,8 @@ pub const Flags = struct {
     no_builtin: ?bool = null,
     pic: ?bool = null,
     stack_protector: ?bool = null,
+    /// The module's `-O` (`main.parseOptions` sets it): Debug or ReleaseSafe.
+    optimize: ?std.lang.Optimize = null,
 
     pub fn inherit(f: Flags, root: Flags) Flags {
         var r = f;
@@ -420,7 +422,9 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         var argv: std.ArrayList([]const u8) = .empty;
         const dep_at = try appendArgs(arena, &argv, common, src.path, .{
             .lang = src.lang,
-            .sanitize_c = src.flags.sanitize_c orelse .full,
+            .optimize = src.flags.optimize orelse .debug,
+            // As upstream's `Module.create`: trapping in ReleaseSafe.
+            .sanitize_c = src.flags.sanitize_c orelse @as(std.zig.SanitizeC, if (src.flags.optimize == .safe) .trap else .full),
             .red_zone = src.flags.red_zone orelse true,
             .no_builtin = src.flags.no_builtin orelse false,
             .stack_protector = o.link_libc and (src.flags.stack_protector orelse o.stack_protector),
@@ -596,9 +600,9 @@ fn commonArgs(arena: std.mem.Allocator, target: *const std.Target, lib: []const 
 /// as upstream's `addCCArgs` reads them.
 const Mode = struct {
     lang: Lang,
-    /// The runtime libraries' optimization (`compilerRtOptMode`), else
-    /// Debug.
-    fast: bool = false,
+    /// The module's optimization (Debug or ReleaseSafe), or the runtime
+    /// libraries' (`compilerRtOptMode`: ReleaseFast).
+    optimize: std.lang.Optimize = .debug,
     sanitize_c: std.zig.SanitizeC,
     red_zone: bool,
     no_builtin: bool,
@@ -629,7 +633,11 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
     const dep_at = argv.items.len;
     try argv.appendSlice(arena, &.{ "-fhosted", "-nostdinc" });
     if (m.lang == .cpp) try argv.append(arena, "-nostdinc++");
-    if (m.fast) try argv.append(arena, "-DNDEBUG");
+    switch (m.optimize) {
+        .debug => {},
+        .safe => try argv.append(arena, "-D_FORTIFY_SOURCE=2"),
+        .fast, .small => try argv.append(arena, "-DNDEBUG"),
+    }
     if (m.link_libc) try argv.append(arena, common.glibc_minor);
     if (m.libcpp) {
         try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libcxx", "include" }), "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libcxxabi", "include" }) });
@@ -641,13 +649,17 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
     if (m.libunwind) try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libunwind", "include" }) });
     if (m.lang != .asm_cpp) {
         try argv.append(arena, "-fno-spell-checking");
-        if (m.fast) try argv.append(arena, "-Werror=date-time");
+        if (m.optimize != .debug) try argv.append(arena, "-Werror=date-time");
         switch (m.sanitize_c) {
             .off => {},
             .trap => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fsanitize-trap=undefined" }),
             .full => try argv.appendSlice(arena, &.{ "-fsanitize=undefined", "-fno-sanitize=vptr", "-fno-sanitize=function" }),
         }
-        try argv.append(arena, if (m.fast) "-O2" else "-O0");
+        try argv.append(arena, switch (m.optimize) {
+            .debug => "-O0",
+            .safe, .fast => "-O2",
+            .small => "-Os",
+        });
     }
     try argv.appendSlice(arena, &.{ if (m.red_zone) "-mred-zone" else "-mno-red-zone", "-fno-omit-frame-pointer" });
     // Upstream's Debug backend for Zig code has no stack protector, which
@@ -805,7 +817,7 @@ fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Ru
         var argv: std.ArrayList([]const u8) = .empty;
         const dep_at = try appendArgs(arena, &argv, common, path, .{
             .lang = lang,
-            .fast = true,
+            .optimize = .fast,
             .sanitize_c = .off,
             .red_zone = true,
             .no_builtin = false,

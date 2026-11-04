@@ -5147,8 +5147,10 @@ state. Built for step 1:
   dependency recording it, so it salts the store seed (`cacheTarget`:
   `=notrace`, and `=<module>:<mode><t|n><v|n>` for each module with a
   builtin of its own). ReleaseFast and ReleaseSmall stay `[unsupported]`.
-  C sources compile as in Debug (`-O0`, full UBSan) whatever their
-  module's mode.
+  C sources of a ReleaseSafe module get upstream's flags for the mode
+  (`-O2`, `-D_FORTIFY_SOURCE=2`, `-Werror=date-time`, UBSan in trap mode;
+  `CSource.Flags.optimize`), taken like the other C module options from
+  the module or else the root module.
 - **Backend flags.** zap generates the same code in Debug and ReleaseSafe,
   where upstream's choice of backend changes nothing a program means. So `-fllvm`, `-flld` and their
   `-fno-` forms are accepted without a word and zap compiles with its own

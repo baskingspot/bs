@@ -1495,6 +1495,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             try deps.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "-M")) {
             const spec = arg[2..];
+            c_flags.optimize = mode.optimize;
             // A module without a root source file holds C sources: no Zig
             // module, and `--dep`s on it name nothing.
             const eq = std.mem.indexOfScalar(u8, spec, '=');
@@ -1707,6 +1708,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // A root file given by position owns what no -M took, as upstream's;
     // so does a library of C only.
     if (positional_root or (opts.c_only and c_owned == 0)) {
+        c_flags.optimize = mode.optimize;
         root_c_flags = c_flags;
         const module_cc = try cc_argv.toOwnedSlice(arena);
         for (c_files.items[c_owned..]) |*f| {
