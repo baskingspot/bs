@@ -1340,6 +1340,8 @@ fn LinkOf(comptime Input: type) type {
                     // Coverage atoms come only from `-ffuzz`, which is
                     // x86_64-linux only for now.
                     .sancov_cntrs, .sancov_pcs => unreachable,
+                    // Init and fini arrays come only from ELF objects.
+                    .preinit_array, .init_array, .fini_array => unreachable,
                 };
                 c.n_fixups[s] += n_abs;
                 var off = a.alignment.forward(c.sizes[s]);

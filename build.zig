@@ -967,6 +967,27 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);
 
+    // Constructors run in priority order across two objects, before main;
+    // the destructor runs only with -lc, whose exit runs the fini array.
+    var ctors: [2]std.Build.LazyPath = undefined;
+    for (&ctors, [_][]const u8{ "-USECOND", "-DSECOND" }, 0..) |*o, def, i| {
+        const cc_ctor = b.addSystemCommand(&.{ zig, "cc", "-fPIC", def, "-c" });
+        cc_ctor.addFileArg(b.path("test/link_input/ctor.c"));
+        o.* = cc_ctor.addPrefixedOutputFileArg("-o", b.fmt("ctor{d}.o", .{i}));
+    }
+    for ([_][]const []const u8{ &.{"build-exe"}, &.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" } }, [_][]const u8{ "", "fini\n" }) |args, fini| {
+        const ctor_exe = b.addRunArtifact(zap);
+        ctor_exe.addArgs(args);
+        ctor_exe.addFileArg(b.path("test/link_input/ctor_main.zig"));
+        for (ctors) |o| ctor_exe.addFileArg(o);
+        ctor_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, b.fmt("run zap link of C constructors{s}", .{if (fini.len == 0) "" else " with -lc"}));
+        r.addFileArg(ctor_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addCheck(.{ .expect_stderr_exact = b.fmt("{{ 101, 150, 200, 1, 2 }}\n{s}", .{fini}) });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
+
     // Undefined behavior and a smashed stack in C reach ubsan_rt's and the
     // stack protector's panics.
     const ub = b.addSystemCommand(&.{ zig, "cc", "-fstack-protector-all", "-fno-sanitize=bounds", "-c" });

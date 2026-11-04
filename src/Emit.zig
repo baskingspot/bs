@@ -804,7 +804,9 @@ const InputResolver = struct {
         return r.emit.userExport(name);
     }
 
+    /// compiler_rt's, and the bounds of the init and fini arrays.
     pub fn rtExport(r: InputResolver, name: []const u8) !?SymbolKey {
+        if (arrayBound(name)) |key| return key;
         if (Zcu.compilerRtExport(name) == null) return null;
         return r.emit.rtExport(name);
     }
@@ -1358,7 +1360,7 @@ fn lowerExternSlots(emit: *Emit) !bool {
         const target = if (emit.inputs) |in| if (try emit.userExport(name)) |key| key else if (try in.lookup(name)) |t| obj: {
             addend = std.math.cast(i32, t.offset) orelse return error.Overflow;
             break :obj t.key;
-        } else sectionBound(name) orelse try emit.exportTarget(name) else if (emit.shared)
+        } else sectionBound(name) orelse arrayBound(name) orelse try emit.exportTarget(name) else if (emit.shared)
             try emit.userExport(name) orelse try emit.rtExport(name) orelse
                 if (std.mem.eql(u8, name, "_DYNAMIC")) ElfDynamic.dynamic_key else try emit.useImport(name, .{ .weak = weak })
         else if (emit.obj)
@@ -1393,6 +1395,18 @@ fn sectionBound(name: []const u8) ?SymbolKey {
     inline for (.{ .{ Atom.Section.sancov_cntrs, "__sancov_cntrs" }, .{ Atom.Section.sancov_pcs, "__sancov_pcs1" } }) |s| {
         if (std.mem.eql(u8, name, "__start_" ++ s[1])) return .sectionBound(s[0], .start);
         if (std.mem.eql(u8, name, "__stop_" ++ s[1])) return .sectionBound(s[0], .stop);
+    }
+    return null;
+}
+
+/// The bound of an init or fini array the linker defines as `name`
+/// (`__init_array_start` and the others). Only with object inputs, which
+/// are what fill the arrays: without them std.start's weak references
+/// stay null, and its outputs stay as they were.
+fn arrayBound(name: []const u8) ?SymbolKey {
+    inline for (.{ Atom.Section.preinit_array, Atom.Section.init_array, Atom.Section.fini_array }) |s| {
+        if (std.mem.eql(u8, name, "__" ++ @tagName(s) ++ "_start")) return .sectionBound(s, .start);
+        if (std.mem.eql(u8, name, "__" ++ @tagName(s) ++ "_end")) return .sectionBound(s, .stop);
     }
     return null;
 }

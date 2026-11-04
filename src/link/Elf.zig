@@ -174,8 +174,9 @@ pub const NumberedValue = struct { symbol: u32, value: u64 };
 
 /// The sections whose start and end the linker defines as symbols
 /// (`Atom.SymbolKey.sectionBound`), which the fuzzer finds the coverage
-/// arrays by (`__start___sancov_cntrs` and the others).
-pub const bound_sections = [_]Atom.Section{ .sancov_cntrs, .sancov_pcs };
+/// arrays by (`__start___sancov_cntrs` and the others) and the start code
+/// the init array (`__init_array_start` and `__init_array_end`).
+pub const bound_sections = [_]Atom.Section{ .sancov_cntrs, .sancov_pcs, .preinit_array, .init_array, .fini_array };
 pub const no_bound = std.math.maxInt(u32);
 
 /// The keys of the section bounds: each section's start, then its end.
@@ -441,14 +442,17 @@ const exe_import_base: u64 = 0xffff_0000_0000_0000;
 
 /// Section header index of each output section. The allocated sections'
 /// headers come in layout order: .rodata, .text, .tdata and .tbss if
-/// present, .data.rel.ro if present, .data, .bss, then __sancov_pcs1 and
+/// present, .data.rel.ro if present, .preinit_array, .init_array and
+/// .fini_array if any is not empty, .data, .bss, then __sancov_pcs1 and
 /// __sancov_cntrs if present (`-ffuzz`; their addresses are after .rodata
 /// and after .bss). Then .eh_frame and .eh_frame_hdr and the debug
 /// sections, if present, then .symtab, .strtab, and .shstrtab.
-fn shndxOf(has_tls: bool, has_relro: bool) [n_sections]u16 {
+fn shndxOf(has_tls: bool, has_relro: bool, has_arrays: bool) [n_sections]u16 {
     const t: u16 = @intFromBool(has_tls);
     const r: u16 = @intFromBool(has_relro);
-    return .{ 2, 1, 3 + 2 * t + r, 4 + 2 * t + r, 3, 4, 6 + 2 * t + r, 5 + 2 * t + r, 3 + 2 * t };
+    const a: u16 = 3 * @as(u16, @intFromBool(has_arrays));
+    const d = 3 + 2 * t + r;
+    return .{ 2, 1, d + a, d + a + 1, 3, 4, d + a + 3, d + a + 2, d, d + 1, d + 2, 3 + 2 * t };
 }
 /// Output sections: one per `Atom.Section`, with the same index, then
 /// .data.rel.ro, where a position-independent image puts the .rodata atoms
@@ -456,10 +460,10 @@ fn shndxOf(has_tls: bool, has_relro: bool) [n_sections]u16 {
 const n_sections = std.enums.values(Atom.Section).len + 1;
 const data_rel_ro = n_sections - 1;
 /// Padding within each section: int3 in code, zeros elsewhere.
-const fills = [n_sections]u8{ 0xcc, 0, 0, 0, 0, 0, 0, 0, 0 };
+const fills = [n_sections]u8{ 0xcc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 /// Sections with no bytes in the file.
-const zero_fill = [n_sections]bool{ false, false, false, true, false, true, true, false, false };
-const sym_types = [n_sections]elf.STT{ .FUNC, .OBJECT, .OBJECT, .OBJECT, .TLS, .TLS, .OBJECT, .OBJECT, .OBJECT };
+const zero_fill = [n_sections]bool{ false, false, false, true, false, true, true, false, false, false, false, false };
+const sym_types = [n_sections]elf.STT{ .FUNC, .OBJECT, .OBJECT, .OBJECT, .TLS, .TLS, .OBJECT, .OBJECT, .OBJECT, .OBJECT, .OBJECT, .OBJECT };
 
 /// The TLS segment's addresses [start, end), and the thread pointer, the
 /// end rounded up to the segment's alignment, as if the segment were the
@@ -505,7 +509,8 @@ const value_tag = 1 << 31;
 const import_tag = unset - (1 << 20);
 /// Section names. Outputs without debug info keep the prefix up to the
 /// names they use.
-const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00.data.rel.ro\x00.dynsym\x00.dynstr\x00.hash\x00.gnu.hash\x00.rela.dyn\x00.plt\x00.dynamic\x00.got\x00.interp\x00.gnu.version\x00.gnu.version_r\x00";
+const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00.data.rel.ro\x00.dynsym\x00.dynstr\x00.hash\x00.gnu.hash\x00.rela.dyn\x00.plt\x00.dynamic\x00.got\x00.interp\x00.gnu.version\x00.gnu.version_r\x00.preinit_array\x00.init_array\x00.fini_array\x00";
+const shstrtab_no_arrays = shstrtab[0..shName(".preinit_array")];
 const shstrtab_no_exe = shstrtab[0..shName(".interp")];
 const shstrtab_no_dyn = shstrtab[0..shName(".dynsym")];
 const shstrtab_no_relro = shstrtab[0..shName(".data.rel.ro")];
@@ -544,6 +549,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const tbss = @backingInt(Atom.Section.tbss);
     const cntrs = @backingInt(Atom.Section.sancov_cntrs);
     const pcs = @backingInt(Atom.Section.sancov_pcs);
+    const preinit = @backingInt(Atom.Section.preinit_array);
+    const init = @backingInt(Atom.Section.init_array);
+    const fini = @backingInt(Atom.Section.fini_array);
 
     const n_chunks = std.math.divCeil(usize, n_atoms, chunk_len) catch unreachable;
     const n_threads = @max(1, @min(n_chunks, options.threads orelse std.Thread.getCpuCount() catch 1));
@@ -715,7 +723,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
     const has_sancov = sizes[cntrs] > 0 or sizes[pcs] > 0;
     const has_relro = sizes[data_rel_ro] > 0;
-    const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls or sizes[cntrs] > 0 or has_relro or has_dyn;
+    const n_arrays = @as(u64, @intFromBool(sizes[preinit] > 0)) + @intFromBool(sizes[init] > 0) + @intFromBool(sizes[fini] > 0);
+    const has_arrays = n_arrays > 0;
+    const has_rw = sizes[data] > 0 or sizes[bss] > 0 or has_tls or sizes[cntrs] > 0 or has_relro or has_arrays or has_dyn;
     const has_cfi = n_debug > 0;
     // Which program headers are written, of all the linker writes, in
     // order: PHDR; the R, RX, and RW LOADs; DYNAMIC; TLS; GNU_RELRO;
@@ -776,7 +786,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     starts[tbss] = aligns[tbss].forward(tdata_end);
     const tls_end = starts[tbss] + sizes[tbss];
     starts[data_rel_ro] = aligns[data_rel_ro].forward(tls_end);
-    const relro_end = starts[data_rel_ro] + sizes[data_rel_ro];
+    // The init and fini arrays are read-only once loaded, like .data.rel.ro.
+    starts[preinit] = aligns[preinit].forward(starts[data_rel_ro] + sizes[data_rel_ro]);
+    starts[init] = aligns[init].forward(starts[preinit] + sizes[preinit]);
+    starts[fini] = aligns[fini].forward(starts[init] + sizes[init]);
+    const relro_end = starts[fini] + sizes[fini];
     // A shared object's .dynamic and .got end PT_GNU_RELRO, which ends
     // on a page boundary so that the loader protects all of it.
     var dynamic_off: u64 = 0;
@@ -785,7 +799,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var data_floor = relro_end;
     if (dyn) |*t| {
         dynamic_off = std.mem.alignForward(u64, relro_end, 8);
-        got_off = dynamic_off + ElfDynamic.dynamicCount(t, dyn_opts.?.*) * @sizeOf(elf.Elf64_Dyn);
+        got_off = dynamic_off + ElfDynamic.dynamicCount(t, dyn_opts.?.*, n_arrays) * @sizeOf(elf.Elf64_Dyn);
         got_size = if (exe_dyn) 0 else 16 * @as(u64, @intFromBool(has_tls)) + 8 * n_imports;
         data_floor = std.mem.alignForward(u64, got_off + got_size, page_size);
     }
@@ -804,8 +818,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     if (numbered != null and mem_end >= value_tag) return error.OutOfMemory;
     for (&l.section_addrs, starts) |*sa, st| sa.* = base + st;
     l.base = base;
-    l.shndx = shndxOf(has_tls, has_relro);
-    l.sym_bias = .{ 0, 0, 0, 0, base + tls_start, base + tls_start, 0, 0, 0 };
+    l.shndx = shndxOf(has_tls, has_relro, has_arrays);
+    l.sym_bias = .{ 0, 0, 0, 0, base + tls_start, base + tls_start, 0, 0, 0, 0, 0, 0 };
     // The section bounds the linker defines.
     for (bound_sections, 0..) |sec, i| {
         const start = starts[@backingInt(sec)];
@@ -880,9 +894,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
     const strtab_off = symtab_off + @as(u64, n_syms) * @sizeOf(elf.Elf64.Sym);
     const shstrtab_off = strtab_off + strtab_len;
-    const shstr = if (exe_dyn) shstrtab else if (has_dyn) shstrtab_no_exe else if (has_relro) shstrtab_no_dyn else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
+    const shstr = if (has_arrays) shstrtab else if (exe_dyn) shstrtab_no_arrays else if (has_dyn) shstrtab_no_exe else if (has_relro) shstrtab_no_dyn else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + 8 * @as(u16, @intFromBool(has_dyn)) + 3 * @as(u16, @intFromBool(exe_dyn));
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 3 * @as(u16, @intFromBool(has_arrays)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + 8 * @as(u16, @intFromBool(has_dyn)) + 3 * @as(u16, @intFromBool(exe_dyn));
     l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     switch (l.target) {
         .memory => |buf| {
@@ -917,6 +931,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     try l.fill(text_end, tls_start - text_end);
     // .tbss's room in the file is zeros.
     try l.fill(tdata_end, starts[data_rel_ro] - tdata_end);
+    for ([_]usize{ data_rel_ro, preinit, init }, [_]usize{ preinit, init, fini }) |a, b| try l.fill(starts[a] + sizes[a], starts[b] - (starts[a] + sizes[a]));
     try l.fill(relro_end, starts[data] - relro_end);
     try l.fill(str_off + str_size, symtab_off - (str_off + str_size));
     try l.fill(symtab_off, @sizeOf(elf.Elf64.Sym));
@@ -976,7 +991,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         }
         try l.put(rela_off + (n_rela - tail.len) * @sizeOf(elf.Elf64.Rela), std.mem.sliceAsBytes(tail));
         try l.put(plt_off, plt);
-        const dynamic = try a.alloc(u8, ElfDynamic.dynamicCount(t, d.*) * @sizeOf(elf.Elf64_Dyn));
+        const dynamic = try a.alloc(u8, ElfDynamic.dynamicCount(t, d.*, n_arrays) * @sizeOf(elf.Elf64_Dyn));
         ElfDynamic.writeDynamic(dynamic, t, d.*, .{
             .dynsym = base + dynsym_off,
             .dynstr = base + dynstr_off,
@@ -986,6 +1001,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             .rela_size = n_rela * @sizeOf(elf.Elf64.Rela),
             .versym = base + versym_off,
             .verneed = base + verneed_off,
+            .arrays = .{
+                .{ .addr = base + starts[preinit], .size = sizes[preinit] },
+                .{ .addr = base + starts[init], .size = sizes[init] },
+                .{ .addr = base + starts[fini], .size = sizes[fini] },
+            },
         });
         try l.put(dynamic_off, dynamic);
         // The GOT is zeros until the loader fills it.
@@ -1077,6 +1097,11 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName(".tdata"), .PROGBITS, .{ .ALLOC = true, .WRITE = true, .TLS = true }, base, starts[tdata], sizes[tdata], aligns[tdata]),
         shdr(shName(".tbss"), .NOBITS, .{ .ALLOC = true, .WRITE = true, .TLS = true }, base, starts[tbss], sizes[tbss], aligns[tbss]),
     };
+    const array_shdrs = [_]elf.Elf64.Shdr{
+        shdr(shName(".preinit_array"), .PREINIT_ARRAY, .{ .ALLOC = true, .WRITE = true }, base, starts[preinit], sizes[preinit], aligns[preinit]),
+        shdr(shName(".init_array"), .INIT_ARRAY, .{ .ALLOC = true, .WRITE = true }, base, starts[init], sizes[init], aligns[init]),
+        shdr(shName(".fini_array"), .FINI_ARRAY, .{ .ALLOC = true, .WRITE = true }, base, starts[fini], sizes[fini], aligns[fini]),
+    };
     const sancov_shdrs = [_]elf.Elf64.Shdr{
         shdr(shName("__sancov_pcs1"), .PROGBITS, .{ .ALLOC = true }, base, starts[pcs], sizes[pcs], aligns[pcs]),
         shdr(shName("__sancov_cntrs"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[cntrs], sizes[cntrs], aligns[cntrs]),
@@ -1129,6 +1154,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName(".text"), .PROGBITS, .{ .ALLOC = true, .EXECINSTR = true }, base, starts[text], sizes[text], aligns[text]),
     } ++ tls_shdrs ++ [_]elf.Elf64.Shdr{
         shdr(shName(".data.rel.ro"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data_rel_ro], sizes[data_rel_ro], aligns[data_rel_ro]),
+    } ++ array_shdrs ++ [_]elf.Elf64.Shdr{
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
     } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ dyn_shdrs ++ exe_shdrs ++ [_]elf.Elf64.Shdr{
@@ -1138,7 +1164,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     };
     var sh_buf: [shdrs.len * @sizeOf(elf.Elf64.Shdr)]u8 = undefined;
     var sh_at: usize = 0;
-    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ has_dyn, dyn_shdrs.len }, .{ exe_dyn, exe_shdrs.len }, .{ true, 3 } };
+    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ has_arrays, array_shdrs.len }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ has_dyn, dyn_shdrs.len }, .{ exe_dyn, exe_shdrs.len }, .{ true, 3 } };
     var group: usize = 0;
     var group_end: usize = present[0][1];
     for (shdrs, 0..) |s, i| {

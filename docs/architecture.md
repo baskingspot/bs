@@ -2497,8 +2497,8 @@ and worktrees, so the store and donors can dedup. Input sections map to
 - SHF_WRITE → data (`.data.rel.ro*` too: correct, if less hardened);
 - other SHF_ALLOC → rodata;
 - `.init_array*`, `.fini_array*`, `.preinit_array` → three new
-  `Atom.Section` values (appended). They are RW with `x86_64_abs64`
-  entries, ordered by their priority suffix as ld orders them. The
+  `Atom.Section` values (appended; built, see below). They are RW
+  with `x86_64_abs64` entries, ordered by their priority suffix as ld orders them. The
   linker defines `__init_array_start`/`__init_array_end` and the others
   as section bounds, as for the sancov sections, and dynamic executables
   get DT_INIT_ARRAY/DT_FINI_ARRAY and their sizes from
@@ -2680,9 +2680,29 @@ differs from the design above:
   trapping panic, so its `__stack_chk_fail` stops on an illegal
   instruction, where zap's, analyzed in the program, panics with
   "stack smashing detected".
-- Not yet: init and fini arrays (an error names the section), the
-  symbol side list for .symtab, `-l`/`-L`, copy relocations, and a COMDAT
-  test.
+- Init and fini arrays: `.preinit_array*`, `.init_array*` and
+  `.fini_array*` sections (by type) become atoms of three new
+  `Atom.Section` values, ordered by priority (`.init_array.<n>` by `n`,
+  then the plain ones, stable, as ld's SORT_BY_INIT_PRIORITY), laid out
+  after .data.rel.ro inside RELRO. The linker defines their bounds
+  (`Elf.bound_sections`); Emit resolves `__init_array_start` and the
+  others to them only with inputs, so std.start's weak references stay
+  null and other outputs stay byte-identical. Dynamic executables get
+  DT_INIT_ARRAY, DT_FINI_ARRAY, DT_PREINIT_ARRAY and their sizes. As
+  upstream, a static executable's std.start runs the init array and
+  nothing runs the fini array; with `-lc`, ld.so runs both. `.ctors` and
+  `.dtors` are an error.
+- `-l<name>`/`-L<dir>` find `lib<name>.so` or `lib<name>.a` in the `-L`
+  directories by upstream's search strategies (`-search_*`, `-static`,
+  `-dynamic`). A shared library found first, or a name not found there,
+  is `[unsupported]`: `.so` inputs are stage C, and upstream also
+  searches the native library directories (`std.zig.system.NativePaths`)
+  when there are `-l` names, which zap does not yet.
+- Tests: a constructor test (priorities across two objects, a
+  destructor, with and without `-lc`), and an archive passed with
+  `-l`/`-L`.
+- Not yet: the symbol side list for .symtab, copy relocations, a COMDAT
+  test, and timing SQLite and zlib links against upstream.
 
 **Stages and checks.**
 1. A: objects and archives into zap's static and `-lc` executables (the

@@ -378,6 +378,12 @@ fn sectionOf(o: *const Object, index: usize) ?Atom.Section {
         elf.SHT_NOTE, elf.SHT_GROUP, elf.SHT_X86_64_UNWIND => return null,
         else => {},
     }
+    switch (sh.sh_type) {
+        elf.SHT_PREINIT_ARRAY => return .preinit_array,
+        elf.SHT_INIT_ARRAY => return .init_array,
+        elf.SHT_FINI_ARRAY => return .fini_array,
+        else => {},
+    }
     if (sh.sh_flags & elf.SHF_TLS != 0) return if (sh.sh_type == elf.SHT_NOBITS) .tbss else .tdata;
     if (sh.sh_type == elf.SHT_NOBITS) return .bss;
     if (sh.sh_flags & elf.SHF_EXECINSTR != 0) return .text;
@@ -429,9 +435,48 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
             .zero_fill = common.size,
         });
     }
+    try sortArrays(arena, atoms.items, c.arrays.items);
     if (weak_used) try values.append(arena, .{ .key = undefined_weak_key, .value = 0 });
     try values.appendSlice(arena, c.abs_values.items);
     return .{ .atoms = atoms.items, .values = values.items };
+}
+
+const ArrayAtom = struct { atom: u32, priority: u32 };
+
+/// An init or fini array section's priority: `.init_array.<n>` is `n`,
+/// and the plain `.init_array` comes after every numbered one, as in ld's
+/// SORT_BY_INIT_PRIORITY.
+fn priority(name: []const u8) ?u32 {
+    const dot = std.mem.indexOfScalarPos(u8, name, 1, '.') orelse return 1 << 16;
+    const n = std.fmt.parseInt(u16, name[dot + 1 ..], 10) catch return null;
+    return n;
+}
+
+/// Orders the atoms of each init and fini array by priority, keeping the
+/// input order among equal ones, within the places those atoms hold in
+/// `atoms`.
+fn sortArrays(arena: Allocator, atoms: []Atom, arrays: []const ArrayAtom) !void {
+    if (arrays.len == 0) return;
+    const sorted = try arena.alloc(ArrayAtom, arrays.len);
+    const moved = try arena.alloc(Atom, arrays.len);
+    for ([_]Atom.Section{ .preinit_array, .init_array, .fini_array }) |kind| {
+        var n: usize = 0;
+        for (arrays) |e| if (atoms[e.atom].section == kind) {
+            sorted[n] = e;
+            n += 1;
+        };
+        std.sort.insertion(ArrayAtom, sorted[0..n], {}, struct {
+            fn lessThan(_: void, x: ArrayAtom, y: ArrayAtom) bool {
+                return x.priority < y.priority;
+            }
+        }.lessThan);
+        for (sorted[0..n], moved[0..n]) |e, *m| m.* = atoms[e.atom];
+        var k: usize = 0;
+        for (arrays) |e| if (atoms[e.atom].section == kind) {
+            atoms[e.atom] = moved[k];
+            k += 1;
+        };
+    }
 }
 
 fn Converter(comptime Ctx: type) type {
@@ -447,6 +492,8 @@ fn Converter(comptime Ctx: type) type {
         names: []u32 = &.{},
         /// How each global name the objects reference resolved.
         resolved: std.StringHashMapUnmanaged(?Target) = .empty,
+        /// The init and fini arrays' atoms, in input order.
+        arrays: std.ArrayList(ArrayAtom) = .empty,
 
         const C = @This();
 
@@ -460,10 +507,8 @@ fn Converter(comptime Ctx: type) type {
             const kind = sectionOf(o, index) orelse return;
             const sh = o.shdrs[index];
             const name = o.sectionName(index);
-            if (std.mem.startsWith(u8, name, ".init_array") or std.mem.startsWith(u8, name, ".fini_array") or std.mem.startsWith(u8, name, ".preinit_array") or
-                std.mem.eql(u8, name, ".ctors") or std.mem.eql(u8, name, ".dtors"))
-            {
-                return c.fail("{s}: zap does not link section '{s}' (constructors and destructors) yet", .{ o.path, name });
+            if (std.mem.startsWith(u8, name, ".ctors") or std.mem.startsWith(u8, name, ".dtors")) {
+                return c.fail("{s}: zap does not link section '{s}' (legacy constructors and destructors); compile with .init_array", .{ o.path, name });
             }
             const arena = c.in.arena;
             if (sh.sh_flags & elf.SHF_MERGE != 0 and sh.sh_type != elf.SHT_NOBITS) {
@@ -491,6 +536,13 @@ fn Converter(comptime Ctx: type) type {
                 }
                 if (copy) |b| bytes = b;
                 c.list.sort();
+            }
+            switch (kind) {
+                .preinit_array, .init_array, .fini_array => try c.arrays.append(arena, .{
+                    .atom = @intCast(c.atoms.items.len),
+                    .priority = priority(name) orelse return c.fail("{s}: section '{s}' has an invalid priority", .{ o.path, name }),
+                }),
+                else => {},
             }
             try c.atoms.append(arena, .{
                 .key = sectionKey(o, index),

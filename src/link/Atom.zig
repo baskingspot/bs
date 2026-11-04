@@ -72,8 +72,9 @@ pub const SymbolKey = enum(u128) {
     }
 
     /// The linker-defined start or end of an output section, which
-    /// `@extern` names `__start_<name>`/`__stop_<name>`. Only the
-    /// coverage sections have them.
+    /// `@extern` names `__start_<name>`/`__stop_<name>`, or
+    /// `__init_array_start`/`__init_array_end` and the like. Only the
+    /// coverage sections and the init and fini arrays have them.
     pub fn sectionBound(section: Section, bound: enum { start, stop }) SymbolKey {
         var buf: [64]u8 = undefined;
         return .fromName(std.fmt.bufPrint(&buf, "section.{t}.{t}", .{ section, bound }) catch unreachable);
@@ -101,6 +102,15 @@ pub const Section = enum(u8) {
     /// order and defines its start and end (`SymbolKey.sectionBound`).
     sancov_cntrs,
     sancov_pcs,
+    /// Arrays of function addresses the start code runs before `main`
+    /// (`.preinit_array`, then `.init_array`) and at exit (`.fini_array`),
+    /// from C objects (docs/architecture.md, "Object, archive and
+    /// shared-library inputs"). The linker keeps each section's atoms in
+    /// input order, so its producer orders them by priority, and defines
+    /// its start and end (`__init_array_start` and the others).
+    preinit_array,
+    init_array,
+    fini_array,
 
     /// Whether atoms in the section are zero-filled, with no `bytes`.
     pub fn isZeroFill(s: Section) bool {

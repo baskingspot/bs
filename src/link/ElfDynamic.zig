@@ -319,17 +319,23 @@ pub const Addresses = struct {
     rela_size: u64,
     versym: u64 = 0,
     verneed: u64 = 0,
+    /// The address and size of .preinit_array, .init_array and
+    /// .fini_array, which the loader runs. Empty ones get no entries.
+    arrays: [3]Array = @splat(.{}),
+
+    pub const Array = struct { addr: u64 = 0, size: u64 = 0 };
 };
 
-/// The number of .dynamic entries `writeDynamic` writes.
-pub fn dynamicCount(t: *const Tables, o: Options) u64 {
+/// The number of .dynamic entries `writeDynamic` writes, with `n_arrays`
+/// of `Addresses.arrays` not empty.
+pub fn dynamicCount(t: *const Tables, o: Options, n_arrays: u64) u64 {
     const exe: u64 = if (o.executable()) 1 + 3 * @as(u64, @intFromBool(t.verneed_count > 0)) else 0;
-    return 12 + @as(u64, @intFromBool(t.soname != null)) + t.needed.len + exe;
+    return 12 + @as(u64, @intFromBool(t.soname != null)) + t.needed.len + exe + 2 * n_arrays;
 }
 
 /// The size of the largest .dynamic `writeDynamic` writes without
 /// libraries.
-const max_fixed_entries = 17;
+const max_fixed_entries = 23;
 
 pub fn writeDynamic(out: []u8, t: *const Tables, o: Options, a: Addresses) void {
     var at: usize = 0;
@@ -367,10 +373,17 @@ pub fn writeDynamic(out: []u8, t: *const Tables, o: Options, a: Addresses) void 
         fixed[n] = .{ elf.DT_DEBUG, 0 };
         n += 1;
     }
+    var n_arrays: u64 = 0;
+    for (a.arrays, [_][2]i64{ .{ elf.DT_PREINIT_ARRAY, elf.DT_PREINIT_ARRAYSZ }, .{ elf.DT_INIT_ARRAY, elf.DT_INIT_ARRAYSZ }, .{ elf.DT_FINI_ARRAY, elf.DT_FINI_ARRAYSZ } }) |arr, tags| {
+        if (arr.size == 0) continue;
+        fixed[n..][0..2].* = .{ .{ tags[0], arr.addr }, .{ tags[1], arr.size } };
+        n += 2;
+        n_arrays += 1;
+    }
     fixed[n..][0..3].* = .{ .{ elf.DT_FLAGS, elf.DF_BIND_NOW }, .{ elf.DT_FLAGS_1, elf.DF_1_NOW }, .{ elf.DT_NULL, 0 } };
     n += 3;
     for (fixed[0..n]) |e| put(out, &at, e[0], e[1]);
-    std.debug.assert(at == dynamicCount(t, o) * @sizeOf(elf.Elf64_Dyn));
+    std.debug.assert(at == dynamicCount(t, o, n_arrays) * @sizeOf(elf.Elf64_Dyn));
 }
 
 /// The GNU hash of `name` (DJB).
