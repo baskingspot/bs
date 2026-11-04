@@ -158,16 +158,20 @@ sed -i 's/fns\[i\](-3)/fns[i](-5)/' lc.zig
 build "inputs changed, first $work/lc.zig" "lc 5 4"
 lazy "-lc: a function's constant changed"
 
-# A library of C only: an unchanged build keeps the archive, and a header
-# edit after it still compiles again and writes the archive.
+# A library of C only: an unchanged build keeps the archive and takes the
+# objects from the batch summary, and a header edit after it still
+# compiles again and writes the archive. The files are older than the
+# racy window, so that the first build writes the summary.
 printf '#define LIBV 1\n' >libv.h
 printf '#include "libv.h"\nint libv_a(void) { return LIBV; }\n' >libv_a.c
 printf '#include "libv.h"\nint libv_b(void) { return LIBV + 1; }\n' >libv_b.c
-clib() { "$zap" build-lib libv_a.c libv_b.c --cache-dir local --global-cache-dir global -femit-bin=libv.a >log 2>&1 || fail "C library: $1"; }
+touch -d '1 minute ago' libv.h libv_a.c libv_b.c
+clib() { ZAP_CACHE_TIMING=1 "$zap" build-lib libv_a.c libv_b.c --cache-dir local --global-cache-dir global -femit-bin=libv.a >log 2>&1 || fail "C library: $1"; }
 clib "first build"
 first=$(stat -c %i libv.a)
 clib "no change"
 [ "$(stat -c %i libv.a)" = "$first" ] || fail "C library: an unchanged build wrote the archive"
+grep -qF "cache: 2 C objects from the batch summary" log || fail "C library: an unchanged build did not use the batch summary"
 sed -i 's/LIBV 1/LIBV 7/' libv.h
 clib "header edit"
 objdump -d libv.a | grep -A4 '<libv_a>:' | grep -qF '$0x7' || fail "C library: the header edit is not in the archive"

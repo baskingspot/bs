@@ -6464,10 +6464,26 @@ libraries as inputs. To be agreed with that thread.
   0.85 s to 0.07 s (upstream 0.06 s), since writing its 70 MB archive
   dominated. The records' checks share one stat per file
   (`ToolRecord.Stats`; SDL3's 473 records list 190k headers), and a
-  build reports each file the C read once. test/link_input/cache.sh
-  checks a `-lc` program with a C source: cold, unchanged, a C edit, a
-  touched source and a Zig edit; and a library of C only: unchanged, a
-  header edit, a deleted archive.
+  build reports each file the C read once.
+- **Batch summary** (`CSource.Summary`, `<local>/zap/cb/<key>`): when
+  every source's object is done, the build writes the objects' paths
+  and the distinct files all records list, each with its stat. The key
+  covers zap's identity (zap turns the options into the records' keys),
+  upstream zig's, the working and lib directories, the target's common
+  Clang arguments, the options and every source. A build whose files
+  all stat as summarized takes the objects without computing Clang's
+  arguments or reading a record; any difference falls back to the
+  records. Input files newer than the racy window keep the summary
+  from being written (objects are renamed into place, so their inodes
+  change), and a summary older than an hour is ignored, so that the
+  records' mtimes, by which the cache trims, get renewed. An executable
+  whose link is unchanged reports the records' inputs without reading
+  the objects. SDL3's lib step went from 47 ms to 13 ms, and its
+  unchanged `zap build example` from 0.09 s to 0.023 s (upstream
+  0.042 s). test/link_input/cache.sh checks a `-lc` program with a C
+  source: cold, unchanged, a C edit, a touched source and a Zig edit;
+  and a library of C only: unchanged (from the summary), a header edit,
+  a deleted archive.
 - **Runtime**: Debug C calls `__ubsan_handle_*` and, with `-lc`,
   glibc; C sources root ubsan_rt and ssp (`Frontend.Options.c_runtimes`)
   as object inputs do, and their glibc references resolve as an object's

@@ -620,6 +620,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_
         const old = Io.Dir.cwd().readFile(io, sp, &buf) catch "";
         if (old.len == 16 and std.mem.readInt(u128, buf[0..16], .little) == stamp) {
             if (inputs) |list| try appendCInputs(arena, list, try CSource.hitInputs(b, arena));
+            b.writeSummary();
             return .{ .ok = .{ .cache_hit = true } };
         }
     };
@@ -723,7 +724,11 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
             _, const path = m.input(@intCast(n));
             try appendInput(arena, list, path);
         };
-        if (inputs) |list| if (c_batch) |b| try appendCInputs(arena, list, (try b.wait()).inputs);
+        // Nothing compiled: the records' inputs, without reading the objects.
+        if (c_batch) |b| {
+            if (inputs) |list| try appendCInputs(arena, list, try CSource.hitInputs(b, arena));
+            b.writeSummary();
+        }
         return .{ .ok = .{ .cache_hit = true } };
     };
 

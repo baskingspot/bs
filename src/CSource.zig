@@ -159,6 +159,13 @@ pub const Batch = struct {
     /// `wait`'s result, which later attempts of the build reuse.
     result_arena: std.heap.ArenaAllocator,
     result: ?Result = null,
+    /// The batch's summary (`Summary`): where it goes, whether this build
+    /// took the sources' objects from it instead of their records, and
+    /// then the files they read, each once, zero-separated.
+    summary_path: []const u8 = "",
+    summary_hit: bool = false,
+    summary_inputs: []const u8 = "",
+    start_ns: i96 = 0,
 
     const Zig = union(enum) { path: []const u8, missing: []const u8 };
 
@@ -295,6 +302,7 @@ pub const Batch = struct {
         var objects: std.ArrayList(Object) = .empty;
         var errors: std.ArrayList(diag.Diagnostic) = .empty;
         var inputs: std.ArrayList(u8) = .empty;
+        try inputs.appendSlice(arena, b.summary_inputs);
         for (b.jobs) |*j| {
             if (j.inputs.len != 0) {
                 if (inputs.items.len != 0) try inputs.append(arena, 0);
@@ -329,7 +337,42 @@ pub const Batch = struct {
             try archives.append(arena, .{ .path = a.path, .bytes = bytes, .member = std.fs.path.basename(a.path) });
         }
         b.result = .{ .objects = objects.items, .archives = archives.items, .errors = errors.items, .inputs = inputs.items };
+        if (errors.items.len == 0) b.writeSummary();
         return &b.result.?;
+    }
+
+    /// Writes the batch's summary (`Summary`) when every source's object is
+    /// done and no file is too new to trust its mtime; else the next build
+    /// checks the records. Best effort.
+    pub fn writeSummary(b: *Batch) void {
+        b.writeSummaryOrFail() catch {};
+    }
+
+    fn writeSummaryOrFail(b: *Batch) !void {
+        if (b.summary_hit or b.summary_path.len == 0) return;
+        const io = b.io;
+        var arena_state: std.heap.ArenaAllocator = .init(b.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var entries: std.ArrayList(Summary.Entry) = .empty;
+        var paths: std.ArrayList(u8) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var objects: u32 = 0;
+        // Objects need no racy window: a changed one is renamed into place,
+        // a new inode.
+        for (b.jobs) |j| if (j.archive == null) {
+            if (j.state != .done) return;
+            try Summary.add(arena, io, null, &entries, &paths, j.out_path);
+            objects += 1;
+        };
+        for (b.jobs) |j| if (j.archive == null) {
+            var it = std.mem.splitScalar(u8, j.inputs, 0);
+            while (it.next()) |p| if (p.len != 0 and !(try seen.getOrPut(arena, p)).found_existing)
+                try Summary.add(arena, io, b.start_ns, &entries, &paths, p);
+        };
+        const header: Summary.Header = .{ .objects = objects, .files = @intCast(entries.items.len), .paths_len = @intCast(paths.items.len) };
+        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(b.summary_path).?);
+        try cache.writeReplace(io, Io.Dir.cwd(), b.summary_path, &.{ std.mem.asBytes(&header), std.mem.sliceAsBytes(entries.items), paths.items });
     }
 
     /// Archives a runtime library's objects into the global cache, unless
@@ -374,6 +417,7 @@ pub fn archiveStamp(b: *const Batch, arena: std.mem.Allocator, archive_path: []c
 /// The files the sources read, zero-separated, as `wait` reports them,
 /// for a batch that compiled nothing.
 pub fn hitInputs(b: *const Batch, arena: std.mem.Allocator) ![]const u8 {
+    if (b.summary_hit) return b.summary_inputs;
     var inputs: std.ArrayList(u8) = .empty;
     for (b.jobs) |j| if (j.inputs.len != 0) {
         if (inputs.items.len != 0) try inputs.append(arena, 0);
@@ -381,6 +425,95 @@ pub fn hitInputs(b: *const Batch, arena: std.mem.Allocator) ![]const u8 {
     };
     return inputs.items;
 }
+
+/// A batch's summary, `<local cache>/zap/cb/<key>`: its sources' objects
+/// in order, then every file their records list, each once, with the
+/// stats (inode, size, mtime) they had when a build found every object
+/// done. A build whose files all still stat so takes the objects without
+/// computing Clang's arguments or reading a record (SDL3: 473 records
+/// listing 190k files, a few thousand distinct). The key covers zap,
+/// since zap's code turns the options into the records' keys, upstream
+/// zig, the working and lib directories, the target's common Clang
+/// arguments, the options and every source.
+/// A summary older than `renew_ns` is not used, so that a build checks
+/// the records again and renews their mtimes, by which the cache trims.
+const Summary = struct {
+    const magic = "ZAPCB001".*;
+    const renew_ns = std.time.ns_per_hour;
+    const Header = extern struct { magic: [8]u8 = magic, objects: u32, files: u32, paths_len: u32, _pad: u32 = 0 };
+    const Entry = extern struct { inode: u64, size: u64, mtime: i64, path_len: u32, _pad: u32 = 0 };
+
+    fn path(arena: std.mem.Allocator, io: Io, cwd: []const u8, local: []const u8, lib: []const u8, zig_id: []const u8, common: Common, sources: []const CSource, o: Options) ![]const u8 {
+        _, const zap_key = try @import("Incremental.zig").compilationKey(arena, io, &.{}, lib, "c batch");
+        var h: std.crypto.hash.Blake3 = .init(.{});
+        h.update(std.mem.asBytes(&zap_key));
+        h.update(zig_id);
+        h.update(cwd);
+        std.hash.autoHashStrat(&h, common, .DeepRecursive);
+        std.hash.autoHashStrat(&h, o, .DeepRecursive);
+        std.hash.autoHashStrat(&h, sources, .DeepRecursive);
+        var key: [16]u8 = undefined;
+        h.final(&key);
+        return std.fs.path.join(arena, &.{ local, "zap", "cb", &std.fmt.bytesToHex(key, .lower) });
+    }
+
+    /// Appends file `p` with its stat, unless its mtime is too new to
+    /// trust (ToolRecord's racy window).
+    fn add(arena: std.mem.Allocator, io: Io, start_ns: ?i96, entries: *std.ArrayList(Entry), paths: *std.ArrayList(u8), p: []const u8) !void {
+        const st = try Io.Dir.cwd().statFile(io, p, .{});
+        if (start_ns) |ns| if (st.mtime.toNanoseconds() >= ns - 2 * std.time.ns_per_s) return error.RacyMtime;
+        try entries.append(arena, .{ .inode = @intCast(st.inode), .size = st.size, .mtime = @intCast(st.mtime.toNanoseconds()), .path_len = @intCast(p.len) });
+        try paths.appendSlice(arena, p);
+    }
+
+    /// Takes the sources' objects from the summary if every file stats as
+    /// it records.
+    fn check(b: *Batch, arena: std.mem.Allocator, sources: []const CSource) !bool {
+        const io = b.io;
+        const cwd = Io.Dir.cwd();
+        const st = cwd.statFile(io, b.summary_path, .{}) catch return false;
+        if (b.start_ns - st.mtime.toNanoseconds() > renew_ns) return false;
+        const bytes = cwd.readFileAlloc(io, b.summary_path, arena, .limited(64 << 20)) catch return false;
+        if (bytes.len < @sizeOf(Header)) return false;
+        const header = std.mem.bytesToValue(Header, bytes[0..@sizeOf(Header)]);
+        const entries_end = @sizeOf(Header) + @as(usize, header.files) * @sizeOf(Entry);
+        if (!std.mem.eql(u8, &header.magic, &magic) or header.objects != sources.len or header.files < header.objects or
+            bytes.len != entries_end + header.paths_len) return false;
+        const entries = try arena.alloc(Entry, header.files);
+        @memcpy(std.mem.sliceAsBytes(entries), bytes[@sizeOf(Header)..entries_end]);
+        const paths = bytes[entries_end..];
+        var at: usize = 0;
+        for (entries) |e| {
+            if (e.path_len > paths.len - at) return false;
+            const fst = cwd.statFile(io, paths[at..][0..e.path_len], .{}) catch return false;
+            at += e.path_len;
+            if (e.inode != fst.inode or e.size != fst.size or e.mtime != fst.mtime.toNanoseconds()) return false;
+        }
+        at = 0;
+        for (entries[0..header.objects], sources, b.jobs[0..sources.len]) |e, src, *j| {
+            j.* = .{
+                .arena = j.arena,
+                .source = src.path,
+                .abs_source = src.path,
+                .argv = &.{},
+                .dep_at = 0,
+                .record_path = "",
+                .out_path = paths[at..][0..e.path_len],
+                .start_ns = b.start_ns,
+                .state = .done,
+            };
+            at += e.path_len;
+        }
+        var inputs: std.ArrayList(u8) = .empty;
+        for (entries[header.objects..]) |e| {
+            if (inputs.items.len != 0) try inputs.append(arena, 0);
+            try inputs.appendSlice(arena, paths[at..][0..e.path_len]);
+            at += e.path_len;
+        }
+        b.summary_inputs = inputs.items;
+        return true;
+    }
+};
 
 pub const Object = struct {
     path: []const u8,
@@ -451,7 +584,14 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
 
     var misses: usize = 0;
     var stats: ToolRecord.Stats = .empty;
-    for (sources, b.jobs[0..sources.len]) |src, *j| {
+    b.start_ns = start_ns;
+    if (sources.len != 0) {
+        b.summary_path = try Summary.path(ra, io, cwd_path, local, lib, zig_id, common, sources, o);
+        b.summary_hit = try Summary.check(b, ra, sources);
+        if (b.summary_hit and environ.get("ZAP_CACHE_TIMING") != null)
+            std.debug.print("cache: {d} C objects from the batch summary\n", .{sources.len});
+    }
+    if (!b.summary_hit) for (sources, b.jobs[0..sources.len]) |src, *j| {
         const arena = j.arena.allocator();
         var argv: std.ArrayList([]const u8) = .empty;
         const dep_at = try appendArgs(arena, &argv, common, src.path, .{
@@ -507,7 +647,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .miss => |h| j.old_output = h,
         };
         misses += 1;
-    }
+    };
     for (archives.items, 0..) |a, ai| if (a.len != 0) for (runtime.items[a.first - sources.len ..][0..a.len], b.jobs[a.first..][0..a.len]) |rj, *j| {
         j.* = .{
             .arena = j.arena,
