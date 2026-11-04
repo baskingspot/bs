@@ -1160,9 +1160,10 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     exe.addFileArg(b.path("test/link_input/libc_main.zig"));
     exe.addFileArg(libc_o);
     exe.setEnvironmentVariable("ZAP_CACHE", "off");
+    exe.setEnvironmentVariable("ZAP_ZIG", zig);
     const run = std.Build.Step.Run.create(b, "run zap -lc link of a C object");
     run.addFileArg(exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
-    run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye\n" });
+    run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
     run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&run.step);
@@ -1176,7 +1177,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     src_exe.setEnvironmentVariable("ZAP_ZIG", zig);
     const src_run = std.Build.Step.Run.create(b, "run zap -lc build of a C source");
     src_run.addFileArg(src_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
-    src_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye\n" });
+    src_run.addCheck(.{ .expect_stdout_exact = "x=21 twice=42 len=3\nbye from atexit\nbye\n" });
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);

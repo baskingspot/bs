@@ -551,7 +551,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // again with the first attempt's final names (`Zcu.finalizeNames`).
     var pins: ?*const Zcu.NamePins = null;
     // C sources compile while the build analyzes, once for every attempt.
-    const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0 or cxxRuntime(&job.opts)) try startC(init, job) else null;
+    const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0 or cxxRuntime(&job.opts) or libcNonshared(&job.opts)) try startC(init, job) else null;
     defer if (c_batch) |b| CSource.destroy(b);
     if (job.opts.c_only) return compileCOnly(init, c_batch.?, out_path, inputs);
     // The C objects are link-only inputs of the cache, after the object
@@ -608,6 +608,14 @@ fn cxxRuntime(opts: *const Options) bool {
     return opts.link_libcpp and opts.command != .build_obj and opts.command != .build_lib;
 }
 
+/// Whether the build links glibc's libc_nonshared.a: an executable linking
+/// glibc with C inputs, which may call its functions (`atexit`); Zig code
+/// calls none of them.
+fn libcNonshared(opts: *const Options) bool {
+    return opts.link_libc and opts.glibc_version != null and opts.command != .build_obj and opts.command != .build_lib and
+        (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp);
+}
+
 /// Starts compiling the job's C sources (CSource.zig).
 fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     const opts = &job.opts;
@@ -624,6 +632,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .link_libc = opts.link_libc,
         .link_libcpp = opts.link_libcpp,
         .cxx_runtime = cxxRuntime(opts),
+        .libc_nonshared = libcNonshared(opts),
         .global_cache = job.cache_dirs.global,
         .single_threaded = opts.single_threaded,
         .stack_protector = opts.c_only or opts.use_llvm,
@@ -647,7 +656,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // build links, so the build cannot be the last one.
     const c_compiling = if (c_batch) |b| b.misses != 0 else false;
     if (inc_opt) |i| i.link_objects_pending = c_compiling;
-    if (inc_opt) |i| if (!c_compiling and try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
+    if (inc_opt) |i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
         // The C objects come after the arguments' link inputs. They are
         // the records' outputs; the build reports the C sources and their
         // headers instead, as a full build does.

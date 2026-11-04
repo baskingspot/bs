@@ -116,7 +116,11 @@ pub const Options = struct {
     /// An executable with `-lc++`: build (or find) the C++ runtime
     /// libraries and link them (`Batch.Result.archives`).
     cxx_runtime: bool = false,
-    /// Where the C++ runtime libraries go: `<global>/zap/o/<key>/`.
+    /// An executable linking glibc with C inputs: build (or find) glibc's
+    /// libc_nonshared.a (`atexit` and the others glibc's libc.so lacks)
+    /// and link it last, as upstream does.
+    libc_nonshared: bool = false,
+    /// Where the runtime libraries go: `<global>/zap/o/<key>/`.
     global_cache: []const u8 = "",
     single_threaded: bool = false,
     /// Upstream's default stack protector for the compilation's C: with
@@ -390,9 +394,11 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     // compile.
     var runtime: std.ArrayList(RuntimeJob) = .empty;
     var archives: std.ArrayList(Batch.Archive) = .empty;
-    if (o.cxx_runtime) for (runtime_libs) |rl| {
+    for (runtime_libs ++ [_]RuntimeLib{nonshared_lib}) |rl| {
+        const is_nonshared = std.mem.eql(u8, rl.name, nonshared_lib.name);
+        if (!(if (is_nonshared) o.libc_nonshared and zig.found != null else o.cxx_runtime)) continue;
         const first = runtime.items.len;
-        try runtimeJobs(ra, &runtime, rl, common, lib, o);
+        if (is_nonshared) try nonsharedJobs(ra, &runtime, common, lib, o) else try runtimeJobs(ra, &runtime, rl, common, lib, o);
         // Keyed by upstream zig and every compile's arguments, which name
         // the lib directory's sources; not by zap, whose rebuilds do not
         // change the library.
@@ -411,7 +417,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             try Io.Dir.cwd().createDirPath(io, tmp_dir);
             try archives.append(ra, .{ .path = path, .tmp_dir = tmp_dir, .first = sources.len + first, .len = runtime.items.len - first });
         }
-    };
+    }
     b.archives = archives.items;
     b.jobs = try gpa.alloc(Batch.Job, sources.len + runtime.items.len);
     for (b.jobs) |*j| j.arena = .init(gpa);
@@ -801,6 +807,83 @@ const unwind_files = [_][]const u8{
     "src/UnwindRegistersSave.S",
     "src/gcc_personality_v0.c",
 };
+
+/// glibc's libc_nonshared.a, as upstream's `src/libs/glibc.zig` builds it
+/// for x86_64-linux-gnu: the functions glibc's libc.so leaves to every
+/// executable (`atexit` calls `__cxa_atexit` with its `__dso_handle`).
+/// Upstream builds and links it with every glibc executable; zap only
+/// with C inputs, since Zig code references none of its functions.
+const nonshared_lib: RuntimeLib = .{ .name = "c_nonshared", .dir = "libc/glibc", .files = &.{
+    "stdlib/atexit.c",
+    "stdlib/at_quick_exit.c",
+    "sysdeps/pthread/pthread_atfork.c",
+    "debug/stack_chk_fail_local.c",
+} };
+
+/// For glibc 2.32 and older: the stat functions, which libc.so versions
+/// only from 2.33 on.
+const nonshared_stat_files = [_][]const u8{
+    "io/stat-2.32.c",     "io/fstat-2.32.c",   "io/lstat-2.32.c",   "io/stat64-2.32.c",
+    "io/fstat64-2.32.c",  "io/lstat64-2.32.c", "io/fstatat-2.32.c", "io/fstatat64-2.32.c",
+    "io/mknodat-2.32.c",  "io/mknod-2.32.c",
+};
+
+/// Appends libc_nonshared.a's compiles, with upstream's flags: its
+/// sub-compilation's (ReleaseFast, PIC, no sanitizer or stack protector,
+/// no libc), then glibc's own build flags.
+fn nonsharedJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), common: Common, lib: []const u8, o: Options) !void {
+    const join = std.fs.path.join;
+    const v = o.glibc_version.?;
+    const old_stat = v.order(.{ .major = 2, .minor = 32, .patch = 0 }) != .gt;
+    const old_init = v.order(.{ .major = 2, .minor = 33, .patch = 0 }) != .gt;
+    const g = try join(arena, &.{ lib, "libc", "glibc" });
+    const sd = try join(arena, &.{ g, "sysdeps" });
+    const linux = try join(arena, &.{ sd, "unix", "sysv", "linux" });
+    // `add_include_dirs` for x86_64-linux-gnu.
+    var includes: std.ArrayList([]const u8) = .empty;
+    for ([_][]const u8{
+        try join(arena, &.{ g, "include" }),
+        try join(arena, &.{ linux, "x86_64" }),                try join(arena, &.{ linux, "x86" }),
+        try join(arena, &.{ sd, "x86_64", "nptl" }),           try join(arena, &.{ sd, "x86", "nptl" }),
+        try join(arena, &.{ linux, "generic" }),               try join(arena, &.{ linux, "include" }),
+        linux,                                                 try join(arena, &.{ sd, "nptl" }),
+        try join(arena, &.{ sd, "pthread" }),                  try join(arena, &.{ sd, "unix", "sysv" }),
+        try join(arena, &.{ sd, "unix", "x86_64" }),           try join(arena, &.{ sd, "unix", "x86" }),
+        try join(arena, &.{ sd, "unix" }),                     try join(arena, &.{ sd, "x86_64" }),
+        try join(arena, &.{ sd, "x86" }),                      try join(arena, &.{ sd, "generic" }),
+        g,                                                     try join(arena, &.{ lib, "libc", "include", "x86_64-linux-gnu" }),
+        try join(arena, &.{ lib, "libc", "include", "generic-glibc" }), try join(arena, &.{ lib, "libc", "include", "x86_64-linux-any" }),
+        try join(arena, &.{ lib, "libc", "include", "any-linux-any" }),
+    }) |d| try includes.appendSlice(arena, &.{ "-I", d });
+    for ([3][]const []const u8{ nonshared_lib.files, if (old_stat) &nonshared_stat_files else &.{}, if (old_init) &.{"csu/elf-init-2.33.c"} else &.{} }) |files| for (files) |file| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        const dep_at = try appendArgs(arena, &argv, common, try join(arena, &.{ g, file }), .{
+            .lang = .c,
+            .optimize = .fast,
+            .sanitize_c = .off,
+            .red_zone = true,
+            .no_builtin = false,
+            .pic = true,
+            .pie = false,
+            .function_sections = false,
+            .data_sections = false,
+            .unwind_tables = o.unwind_tables,
+            .link_libc = false,
+            .libcpp = false,
+            .libunwind = false,
+        });
+        try argv.appendSlice(arena, &.{ "-w", "-std=gnu11", "-fgnu89-inline", "-fmerge-all-constants", "-frounding-math", "-fno-common", "-fmath-errno", "-ftls-model=initial-exec", "-Qunused-arguments" });
+        try argv.appendSlice(arena, includes.items);
+        try argv.appendSlice(arena, &.{
+            "-DNO_INITFINI",                          "-D_LIBC_REENTRANT",
+            "-include",                               try join(arena, &.{ g, "include", "libc-modules.h" }),
+            "-DMODULE_NAME=libc",                     "-include",
+            try join(arena, &.{ g, "include", "libc-symbols.h" }), "-DPIC",
+            "-DLIBC_NONSHARED=1",                     "-DTOP_NAMESPACE=glibc",
+        });
+        try out.append(arena, .{ .argv = argv.items, .dep_at = dep_at });
+    };
+}
 
 const RuntimeJob = struct { argv: []const []const u8, dep_at: usize };
 

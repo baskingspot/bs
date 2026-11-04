@@ -16,4 +16,7 @@ int cmp(const void *x, const void *y) { return *(const int *)x - *(const int *)y
 extern void *__dso_handle;
 int __cxa_atexit(void (*f)(void *), void *arg, void *dso);
 static void bye(void *s) { puts(s); fflush(stdout); }
-void c_atexit(void) { __cxa_atexit(bye, "bye", &__dso_handle); }
+// `atexit` is not in glibc's libc.so: libc_nonshared.a defines it, which
+// zap links into -lc executables with C inputs, as upstream does.
+static void bye_atexit(void) { puts("bye from atexit"); fflush(stdout); }
+void c_atexit(void) { __cxa_atexit(bye, "bye", &__dso_handle); atexit(bye_atexit); }

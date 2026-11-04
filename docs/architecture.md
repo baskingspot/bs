@@ -5784,7 +5784,12 @@ Options:
      `at_quick_exit` (calling `__cxa_atexit`/`__cxa_at_quick_exit` with
      `__dso_handle`, which the file defines hidden), `__pthread_atfork`,
      `__stack_chk_fail_local`, and the stat/mknod wrappers for glibc ≤
-     2.32. std references none of them; C objects may.
+     2.32. std references none of them; C objects may. *As built*
+     (C++ milestone): zap compiles libc_nonshared.a from upstream's own
+     glibc sources with upstream `zig cc`, as it does libc++, and links
+     it only when a glibc executable has C inputs (see "Runtime
+     libraries" in the C++ section). Programs without C inputs need no
+     Clang and get none of these functions, as before.
    - **Headers** for translate-c and C sources: `lib/libc/include` for the
      target (`std.zig.LibCDirs.detectFromBuilding`, which zap calls as it
      is) and `-D__GLIBC_MINOR__=N`, as upstream's bundled glibc. System
@@ -6254,6 +6259,16 @@ diagnostics.
   Upstream links them as `libunwind libc++ <objects> libc++abi`; zap's
   archives resolve as one group (`ElfInput.pull` loops until nothing more
   is pulled), so the order does not change which members load.
+- **libc_nonshared.a** (`CSource.nonshared_lib`, from upstream's
+  `src/libs/glibc.zig`): `atexit`, `at_quick_exit`, `pthread_atfork`,
+  `__stack_chk_fail_local`, and for older glibc the stat and mknod
+  wrappers (≤ 2.32) and `__libc_csu_init`/`__libc_csu_fini` (≤ 2.33),
+  compiled from `lib/libc/glibc` with upstream's flags and include
+  directories, built and cached like the runtime libraries above. A glibc
+  executable links it when it has C inputs (C or C++ sources, objects,
+  archives, `-lc++`); upstream links it into every glibc executable, but
+  Zig code calls none of its functions, so a pure Zig `-lc` program keeps
+  needing no Clang. SDL's `libSDL3.a` calls `atexit`.
 - **Exceptions** need the objects' `.eh_frame` and `.gcc_except_table`
   and `__dso_handle`, which are the link thread's stage B (`c-frames`).
   test/link_input/cxx.cpp throws through three frames with a

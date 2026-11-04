@@ -235,6 +235,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     const io = inc.io;
     const t0 = now(io);
     const m = if (inc.prev) |*m| m else return inc.noRelink("no manifest", .{});
+    if (inc.link_objects_pending) return inc.noRelink("C objects are compiling", .{});
     // Set by a first attempt that builds again (`LazyFallback`,
     // `NamesRerun`): the donor's output is another compilation's.
     if (inc.donor != null) return inc.noRelink("the manifest is a donor's", .{});
