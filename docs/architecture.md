@@ -3835,7 +3835,9 @@ and manifest are a full build's, which `ZAP_CACHE_VERIFY` checks.
 - `ZAP_CACHE_VERIFY=1`: after an edit build that replayed, zap builds the
   same command again in full in a child (`ZAP_CACHE_VERIFY=full`: no
   relink, no replay), whose `record` compares its nodes with the edit
-  build's manifest: the same nodes with the same kinds, source hashes,
+  build's manifest (set by hand with an input changed since that
+  manifest, `full` fails saying so rather than compare with an older
+  build): the same nodes with the same kinds, source hashes,
   results, dependencies (by key and kind), references, and atom records
   byte for byte (so `base_line`s too). Not the output's bytes: a lazy
   build links in manifest order with its new nodes last. A difference

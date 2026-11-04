@@ -3401,6 +3401,25 @@ fn loadMakes(zcu: *Zcu, use: Zcu.EffectUse) bool {
 fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder, emit: *const Emit, debug_of: []const ?*const Atom.Debug) !bool {
     const gpa = inc.gpa;
     const m = if (inc.prev) |*m| m else return true;
+    // The child of `ZAP_CACHE_VERIFY=1` runs once the edit build wrote
+    // its manifest, so every input is as the manifest has it. Set by
+    // hand after an edit, `full` would compare with the build before it.
+    {
+        var changed: std.ArrayList(u32) = .empty;
+        defer changed.deinit(gpa);
+        try m.changedInputs(gpa, inc.io, &changed);
+        for (changed.items) |i| {
+            const in, const path = m.input(i);
+            const same = same: {
+                const src = Io.Dir.cwd().readFileAlloc(inc.io, path, gpa, .unlimited) catch break :same false;
+                defer gpa.free(src);
+                break :same @as(Hash, @bitCast(Frontend.hashSource(src))) == in.content_hash;
+            };
+            if (same) continue;
+            std.debug.print("cache verify: {s} changed since the last build; ZAP_CACHE_VERIFY=full only compares a full build with a manifest of the same inputs (set ZAP_CACHE_VERIFY=1 to verify an edit build)\n", .{path});
+            return false;
+        }
+    }
     var pack: Pack = try .open(inc.io, inc.dir);
     defer pack.close(gpa, inc.io);
     for (0..m.bases.len) |i| _ = try pack.addBase(gpa, inc.io, inc.dir, m.basePack(i));
