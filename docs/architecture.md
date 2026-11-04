@@ -5719,21 +5719,32 @@ libraries as inputs. To be agreed with that thread.
   cache's trimming covers both. A build whose C files and headers all
   stat as recorded runs no Clang; a header edit recompiles the files
   that read it.
-- **Not cached yet**: a build with C sources skips zap's on-disk cache,
-  as one with `.o`/`.a` inputs does, until the manifest records inputs
-  of the object kind (the cache thread's part); every build of such a
-  program analyzes and generates its Zig again, while its C objects come
-  from their records.
+- **Cached**: the records' objects are link-only manifest inputs
+  (`Incremental.link_objects`), after the `.o`/`.a` arguments, as
+  `ElfInput` takes them; their paths stay out of the compilation key,
+  since a record's object path is not part of the program. An edited
+  source keeps its object's path, so while any record missed
+  (`Batch.misses`) the build skips `relinkIfUnchanged`, which would
+  otherwise take the old object for the last build's, and replays
+  eagerly as any build with link inputs does. A build whose records all
+  hit and whose inputs are unchanged skips the link. On a hit the build
+  reports the C sources and headers as its inputs, not the objects.
+  A library of C only (`c_only`) has no Zig to cache and stays outside
+  `Incremental`. test/link_input/cache.sh checks a `-lc` program with a
+  C source: cold, unchanged, a C edit, a touched source and a Zig edit.
 - **Runtime**: Debug C calls `__ubsan_handle_*` and, with `-lc`,
   glibc; C sources root ubsan_rt and ssp (`Frontend.Options.c_runtimes`)
   as object inputs do, and their glibc references resolve as an object's
   (the link thread's `obj-inputs2`).
 - **Cost** (ReleaseFast, test/link_input's `libc_main.zig` with
-  `libc.c` and `-lc`): cold 0.58 s against upstream's 0.78 s with a warm
-  global cache; unchanged 0.16 s (0.41 s), a C edit 0.16 s (0.41 s),
-  since Clang runs while Sema does; a Zig edit 0.17 s (0.33 s), a full
-  Zig build until the cache takes C objects. std's compile time does not
-  change (5.96 s against main's 6.20 s).
+  `libc.c` and `-lc`), medians against upstream's with warm global
+  caches: unchanged 0.003 s (upstream 0.35 s); a C edit 0.085 s (0.35 s),
+  since Clang runs while the Zig code replays; a Zig edit 0.084 s
+  (0.33 s); a new local cache 0.086 s (0.35 s), from a donor. Before
+  the cache took C objects these were 0.14 to 0.19 s, full Zig builds.
+  A build with empty caches pays the recording, 0.33 s against 0.29 s
+  without it. std's compile time does not change (5.93 s against main's
+  5.83 s, within noise).
 - **Checks**: build.zig's `addLinkInputTests` builds test/link_input's
   `lib.c`, `tls.c` and `tlsie.c` as C sources (`-cflags`, `-fPIC`) with
   the archives of the `zig cc` variant, and `libc.c` as the C source of

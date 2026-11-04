@@ -100,6 +100,8 @@ pub const Batch = struct {
     next: std.atomic.Value(usize) = .init(0),
     /// Upstream zig, or why there is none.
     zig: Zig,
+    /// How many sources Clang compiles: those whose record missed.
+    misses: usize = 0,
     paths: diag.Paths,
     verbose: bool,
     /// `wait`'s result, which later attempts of the build reuse.
@@ -239,6 +241,14 @@ pub const Batch = struct {
     }
 };
 
+/// Where the objects are, in command-line order, compiled or not yet:
+/// a record's output keeps its path across edits of the source.
+pub fn objectPaths(b: *const Batch, arena: std.mem.Allocator) ![]const []const u8 {
+    const paths = try arena.alloc([]const u8, b.jobs.len);
+    for (paths, b.jobs) |*p, j| p.* = try arena.dupe(u8, j.out_path);
+    return paths;
+}
+
 pub const Object = struct {
     path: []const u8,
     bytes: []const u8,
@@ -321,6 +331,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
         if (try checkZig(s, io, p)) |msg| .{ .missing = try gpa.dupe(u8, msg) } else .{ .path = try gpa.dupe(u8, p) }
     else
         .{ .missing = try std.fmt.allocPrint(gpa, "compiling C sources needs upstream zig 0.17.0; zap looked for it in ZAP_ZIG, as 'zig' on PATH, and in {s}", .{zig.looked}) };
+    b.misses = misses;
     const workers = @min(misses, std.Thread.getCpuCount() catch 1);
     for (0..workers) |_| b.group.concurrent(io, Batch.worker, .{b}) catch break;
     return b;

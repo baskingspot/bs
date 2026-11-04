@@ -403,9 +403,10 @@ pub const Job = struct {
         const env = job.environ_map;
         // The numbered link has no position-independent layout yet (`Elf`);
         // -fPIE and -dynamic imply -fPIC (and -lc on objects and
-        // libraries). Builds with C sources or shared library inputs skip
-        // it until the manifest keeps them.
-        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and job.opts.shared_libs.len == 0 and job.opts.c_sources.len == 0 and
+        // libraries). A library of C only has no Zig to cache; its
+        // objects have their records. Builds with shared library inputs
+        // skip it until the manifest keeps them.
+        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and job.opts.shared_libs.len == 0 and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -468,6 +469,11 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0) try startC(init, job) else null;
     defer if (c_batch) |b| CSource.destroy(b);
     if (job.opts.c_only) return compileCOnly(init, c_batch.?, out_path, inputs);
+    // The C objects are link-only inputs of the cache, after the object
+    // and archive arguments, as `ElfInput` takes them.
+    if (c_batch) |b| if (inc_opt) |i| {
+        i.link_objects = try std.mem.concat(init.arena.allocator(), []const u8, &.{ job.link_objects, try CSource.objectPaths(b, init.arena.allocator()) });
+    };
     while (true) return compileReplaying(init, job, inc_opt, out_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
         error.LazyFallback => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
@@ -540,11 +546,23 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const env = init.environ_map;
     var stages: Stages = .{ .io = init.io, .last = .now(init.io, .awake) };
     stages.on = env.get("ZAP_TIMING") != null;
-    if (inc_opt) |i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
+    // While Clang compiles a C source, its object is not yet what the
+    // build links, so the build cannot be the last one.
+    const c_compiling = if (c_batch) |b| b.misses != 0 else false;
+    if (inc_opt) |i| if (!c_compiling and try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
+        // The C objects come after the arguments' link inputs. They are
+        // the records' outputs; the build reports the C sources and their
+        // headers instead, as a full build does.
+        var link_inputs: usize = 0;
         if (inputs) |list| if (i.prev) |*m| for (0..m.inputCount()) |n| {
+            if (Incremental.isLinkInput(m.inputKey(@intCast(n)))) {
+                link_inputs += 1;
+                if (link_inputs > job.link_objects.len) continue;
+            }
             _, const path = m.input(@intCast(n));
             try appendInput(arena, list, path);
         };
+        if (inputs) |list| if (c_batch) |b| try appendCInputs(arena, list, (try b.wait()).inputs);
         return .{ .ok = .{ .cache_hit = true } };
     };
 
