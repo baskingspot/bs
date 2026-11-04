@@ -15756,7 +15756,7 @@ fn analyzeCall(
         }
     }
     if (callee_fn_ty.cc == .auto) sema.has_error_trace = true;
-    const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len) });
+    const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len), .flags = .{ .never_inline = modifier == .never_inline } });
     try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(call_args));
     return sema.endIfNoReturn(block, try sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = .fromInterned(callee_func), .payload = payload } } }));
 }

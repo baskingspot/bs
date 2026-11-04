@@ -444,6 +444,13 @@ pub const Call = struct {
     /// the callee's own (`inferred_error_set_type`).
     ret_ty: InternPool.Index,
     args_len: u32,
+    flags: Flags = .{},
+
+    pub const Flags = packed struct(u32) {
+        /// `@call(.never_inline, ...)`: CodeGen must not inline the callee.
+        never_inline: bool = false,
+        _: u31 = 0,
+    };
 };
 
 pub const Bin = struct {
