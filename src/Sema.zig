@@ -7026,6 +7026,7 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     else if (std.mem.endsWith(u8, path, ".zig")) blk: {
         const dir = std.fs.path.dirname(this_file.sub_path) orelse "";
         const sub = try std.fs.path.resolvePosix(sema.arena, &.{ dir, path });
+        if (std.mem.eql(u8, sub, "..") or std.mem.startsWith(u8, sub, "../")) return sema.fail(block, src, "import of file outside module path", .{});
         const key = try std.fmt.allocPrint(sema.arena, "{d}:{s}", .{ @backingInt(this_file.module), sub });
         const file_index = fe.file_map.get(key) orelse return sema.fail(block, src, "unable to find '{s}'", .{path});
         break :blk @backingInt(file_index);

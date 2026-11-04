@@ -1470,7 +1470,13 @@ fn resolveImport(fe: *const Frontend, f: *const File, name: []const u8) !?Import
         return .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) };
     }
     if (std.mem.endsWith(u8, name, ".zig")) {
-        return .{ .module = f.module, .sub_path = try std.fs.path.resolvePosix(gpa, &.{ std.fs.path.dirname(f.sub_path) orelse "", name }) };
+        const sub_path = try std.fs.path.resolvePosix(gpa, &.{ std.fs.path.dirname(f.sub_path) orelse "", name });
+        // A path outside the module is Sema's error, at the import.
+        if (std.mem.eql(u8, sub_path, "..") or std.mem.startsWith(u8, sub_path, "../")) {
+            gpa.free(sub_path);
+            return null;
+        }
+        return .{ .module = f.module, .sub_path = sub_path };
     }
     if (fe.familyModule(f.module, name)) |m| return .{ .module = m, .sub_path = try gpa.dupe(u8, fe.module(m).root_file) };
     // TODO: ZON imports go through ZonGen, not AstGen.

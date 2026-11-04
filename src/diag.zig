@@ -1395,6 +1395,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "embed of file outside package path: '{s}'", .@"bad-import" },
     .{ "file path name cannot be empty", .@"bad-import" },
     .{ "import of file outside module path: '{s}'", .@"bad-import" },
+    .{ "import of file outside module path", .@"bad-import" },
     .{ "no module named '{s}' available within module '{s}'", .@"bad-import" },
     .{ "std.lang.{s} requires the std module", .@"bad-import" },
     .{ "unable to find '{s}'", .@"bad-import" },
