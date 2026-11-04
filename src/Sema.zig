@@ -480,6 +480,9 @@ pub const Src = struct {
         /// The field name of the struct init field whose initializer is at
         /// `node` (upstream's `init_field_name`).
         init_name: Ast.Node.Offset,
+        /// The capture of the `for` loop input at `node` (upstream's
+        /// `for_capture_from_input`).
+        for_capture: Ast.Node.Offset,
         /// The type of the variable declared at `node`, or its name if it
         /// has no type (upstream's `node_offset_var_decl_ty`).
         var_ty: Ast.Node.Offset,
@@ -620,6 +623,24 @@ pub const Src = struct {
                 return tree.tokensToSpan(tree.firstToken(node) - 3, tree.lastToken(node), tree.nodeMainToken(node) - 2);
             },
             .init_name => |off| return tree.tokenToSpan(tree.firstToken(off.toAbsolute(src.base)) - 2),
+            .for_capture => |off| {
+                // As upstream: the loop is found by scanning the tree.
+                const input = off.toAbsolute(src.base);
+                for (tree.nodes.items(.tag), 0..) |t, n| {
+                    if (t != .for_simple and t != .@"for") continue;
+                    const f = tree.fullFor(@fromBackingInt(@intCast(n))).?;
+                    const index = std.mem.indexOfScalar(Ast.Node.Index, f.ast.inputs, input) orelse continue;
+                    var count = index;
+                    var tok = f.payload_token;
+                    while (true) : (tok += 1) switch (tree.tokenTag(tok)) {
+                        .comma => count -= 1,
+                        .identifier => if (count == 0) return tree.tokensToSpan(tok, tok + 1, tok),
+                        .asterisk => if (count == 0) return tree.tokensToSpan(tok, tok + 2, tok),
+                        else => return tree.nodeToSpan(input),
+                    };
+                }
+                return tree.nodeToSpan(input);
+            },
             .var_ty => |off| {
                 const node = off.toAbsolute(src.base);
                 const v = tree.fullVarDecl(node) orelse return tree.nodeToSpan(node);
@@ -691,10 +712,10 @@ pub const Src = struct {
                     // A `for`'s inputs.
                     .for_simple, .@"for" => {
                         const inputs = tree.fullFor(node).?.ast.inputs;
-                        const first = tree.firstToken(inputs[0]);
-                        const start = tree.tokenStart(first);
+                        if (o.index > 0 and o.index < inputs.len) return tree.nodeToSpan(inputs[o.index]);
+                        const first = tree.nodeToSpan(inputs[0]);
                         const last = tree.lastToken(inputs[inputs.len - 1]);
-                        return .{ .start = start, .main = start, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)) };
+                        return .{ .start = first.start, .main = first.main, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)) };
                     },
                     .error_union, .merge_error_sets, .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .array_access => {
                         const lhs, const rhs = tree.nodeData(node).node_and_node;
@@ -13955,7 +13976,16 @@ fn elemPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref, 
 fn elemPtrOneLayer(sema: *Sema, block: *Block, src: Src, ptr: Ref, uncasted_index: Ref) CompileError!Ref {
     const ip = sema.ip;
     const ptr_ty = sema.typeOf(ptr);
-    if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src, "pointer capture of non pointer type '{f}'", .{sema.fmtType(ptr_ty)});
+    if (Type.class(ip, ptr_ty) != .pointer) {
+        // As upstream: at the capture, with a hint at the input.
+        const off = src.nodeOffset() orelse return sema.fail(block, src, "pointer capture of non pointer type '{f}'", .{sema.fmtType(ptr_ty)});
+        const err = sema.fail(block, .{ .base = src.base, .loc = .{ .for_capture = off } }, "pointer capture of non pointer type '{f}'", .{sema.fmtType(ptr_ty)});
+        switch (Type.class(ip, ptr_ty)) {
+            .array, .vector, .tuple => try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "consider using '&' here", .{}),
+            else => {},
+        }
+        return err;
+    }
     switch (Type.ptrInfo(ip, ptr_ty).flags.size) {
         .one => return sema.elemPtr(block, src, ptr, uncasted_index, false),
         .many, .c => return sema.elemPtrOfManyPtr(block, src, ptr, try sema.coerce(block, .usize_type, uncasted_index, src.operandSrc(1))),
@@ -14139,6 +14169,8 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     // ends where the object does.
     var ptr_sentinel: Index = .none;
     var many_obj: Ref = .none;
+    // What the length is of, for the bounds error.
+    var len_of: enum { array, slice, single } = .array;
     switch (ip.indexToKey(child)) {
         .array_type => |a| {
             elem_ty = a.child;
@@ -14156,6 +14188,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                 .one => {
                     // `*T` slices like `*[1]T`, as upstream.
                     if (ip.keyTag(cp.child) != .array_type) {
+                        len_of = .single;
                         const arr_ty = try sema.intern(.{ .array_type = .{ .len = 1, .child = cp.child } });
                         obj = try sema.coerce(block, try sema.ptrType(.{ .child = arr_ty, .flags = .{ .is_const = cp.flags.is_const, .is_volatile = cp.flags.is_volatile, .alignment = cp.flags.alignment } }), obj, src);
                     }
@@ -14166,6 +14199,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                     base = try sema.coercePtrTo(block, obj, try sema.ptrType(.{ .child = a.child, .flags = .{ .size = .many, .is_const = is_const } }));
                 },
                 .slice => {
+                    len_of = .slice;
                     elem_ty = cp.child;
                     ptr_sentinel = cp.sentinel;
                     len = try sema.sliceLen(block, obj);
@@ -14193,6 +14227,26 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     const start_src = if (tag == .slice_length) src else src.operandSrc(1);
     const end_src = if (tag == .slice_length) src else src.operandSrc(2);
     const sentinel_src = if (tag == .slice_length) src else src.operandSrc(3);
+    // As upstream: a single-item pointer slices only as [0..0], [0..1] or
+    // [1..1], with comptime-known bounds.
+    if (len_of == .single and len_ref == .none) {
+        if (end_ref == .none) return sema.fail(block, src, "slice of single-item pointer must be bounded", .{});
+        const reason = "slice of single-item pointer must have comptime-known bounds";
+        const sv = sema.resolveValue(sema.resolveInst(start_ref)) orelse return sema.failNeededComptime(block, start_src, reason);
+        const ev = sema.resolveValue(sema.resolveInst(end_ref)) orelse return sema.failNeededComptime(block, end_src, reason);
+        if (sema.isUndef(sv)) return sema.fail(block, start_src, "use of undefined value here causes illegal behavior", .{});
+        if (sema.isUndef(ev)) return sema.fail(block, end_src, "use of undefined value here causes illegal behavior", .{});
+        const bounds_msg = "slice of single-item pointer must have bounds [0..0], [0..1], or [1..1]";
+        if (sema.intOrder(sv, ev) != .eq) {
+            const start_bad = sema.intSign(sv) != 0;
+            if (start_bad or (ip.intValue(u64, ev) orelse 2) != 1) {
+                const at = if (start_bad) start_src else end_src;
+                const err = sema.fail(block, at, bounds_msg, .{});
+                try sema.zcu.addNote(sema.file, at.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "expected '{d}', found '{f}'", .{ @intFromBool(!start_bad), sema.fmtValue(if (start_bad) sv else ev) });
+                return err;
+            }
+        }
+    }
     const start = try sema.coerce(block, .usize_type, sema.resolveInst(start_ref), start_src);
     if (sema.resolveValue(start)) |v| if (sema.isUndef(v)) return sema.fail(block, start_src, "use of undefined value here causes illegal behavior", .{});
     var end: Ref = undefined;
@@ -14229,6 +14283,17 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         // object; the sentinel check then reads the containing memory.
         const both_known = sema.resolveValue(end) != null and sema.resolveValue(len) != null;
         const end_s = if (slice_sentinel == .none or both_known) end else try sema.analyzeArithmetic(block, src, .add, end, .fromInterned(.one_usize));
+        // As upstream: a comptime-known end past the object, at the end.
+        if (both_known and !sema.isUndef(sema.resolveValue(end).?) and !sema.isUndef(sema.resolveValue(len).?)) {
+            const ev = ip.intValue(u64, sema.resolveValue(end).?).?;
+            const lv = ip.intValue(u64, sema.resolveValue(len).?).?;
+            const sentinel_label: []const u8 = if (ptr_sentinel != .none) " +1 (sentinel)" else "";
+            if (ev > lv + @intFromBool(ptr_sentinel != .none)) return switch (len_of) {
+                .array => sema.fail(block, end_src, "end index {d} out of bounds for array of length {d}{s}", .{ ev, lv, sentinel_label }),
+                .slice => sema.fail(block, end_src, "end index {d} out of bounds for slice of length {d}{s}", .{ ev, lv, sentinel_label }),
+                .single => sema.fail(block, end_src, "end index {d} out of bounds for slice of single-item pointer", .{ev}),
+            };
+        }
         try sema.boundsCheck(block, src, end_s, len_s, true);
     }
     const start_val = sema.resolveValue(start);
@@ -14356,6 +14421,7 @@ fn zirForLen(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
     // and the other lengths are checked against it at runtime.
     var len: Ref = .none;
     var len_known = false;
+    var len_input: u32 = 0;
     var runtime_lens: std.ArrayList(Ref) = .empty;
     var i: usize = 0;
     while (i < args.len) : (i += 2) {
@@ -14365,10 +14431,28 @@ fn zirForLen(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         const this_len = if (b == .none) blk: {
             const obj = sema.resolveInst(a);
             const ty = sema.typeOf(obj);
-            if (Type.class(sema.ip, ty) == .pointer) switch (Type.ptrInfo(sema.ip, ty).flags.size) {
-                .many, .c => continue,
-                .one, .slice => {},
+            const ip = sema.ip;
+            const indexable = switch (Type.class(ip, ty)) {
+                .array, .vector, .tuple => true,
+                .pointer => switch (Type.ptrInfo(ip, ty).flags.size) {
+                    .many, .c => continue,
+                    .slice => true,
+                    .one => switch (Type.class(ip, Type.ptrInfo(ip, ty).child)) {
+                        .array, .vector, .tuple => true,
+                        else => false,
+                    },
+                },
+                else => false,
             };
+            if (!indexable) {
+                // As upstream: at the operand, with what a for loop takes.
+                const arg_src = src.operandSrc(@intCast(i / 2));
+                const err = sema.fail(block, arg_src, "type '{f}' is not indexable and not a range", .{sema.fmtType(ty)});
+                const span = arg_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+                try sema.zcu.addNote(sema.file, span, "for loop operand must be a range, array, slice, tuple, or vector", .{});
+                if (Type.class(ip, ty) == .error_union) try sema.zcu.addNote(sema.file, span, "consider using 'try', 'catch', or 'if'", .{});
+                return err;
+            }
             break :blk try sema.coerce(block, .usize_type, try sema.fieldVal(block, src, obj, "len"), src);
         } else blk: {
             const start = try sema.coerce(block, .usize_type, sema.resolveInst(a), src);
@@ -14378,17 +14462,34 @@ fn zirForLen(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         };
         if (try sema.resolveDefinedValue(block, src, this_len)) |v| {
             if (len_known) {
-                if (v != sema.resolveValue(len).?) return sema.fail(block, src, "non-matching for loop lengths", .{});
+                const known = sema.resolveValue(len).?;
+                if (v != known) {
+                    // As upstream: each length at its operand.
+                    const err = sema.fail(block, src, "non-matching for loop lengths", .{});
+                    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+                    try sema.zcu.addNote(sema.file, src.operandSrc(len_input).span(tree), "length {f} here", .{sema.fmtValue(known)});
+                    try sema.zcu.addNote(sema.file, src.operandSrc(@intCast(i / 2)).span(tree), "length {f} here", .{sema.fmtValue(v)});
+                    return err;
+                }
             } else {
                 if (len != .none) try runtime_lens.append(sema.arena, len);
                 len = this_len;
                 len_known = true;
+                len_input = @intCast(i / 2);
             }
             continue;
         }
         if (len == .none) len = this_len else try runtime_lens.append(sema.arena, this_len);
     }
-    if (len == .none) return sema.fail(block, src, "unbounded for loop", .{});
+    if (len == .none) {
+        // As upstream: a note at each unbounded operand.
+        const err = sema.fail(block, src, "unbounded for loop", .{});
+        const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+        i = 0;
+        while (i < args.len) : (i += 2) if (args[i] != .none and args[i + 1] == .none)
+            try sema.zcu.addNote(sema.file, src.operandSrc(@intCast(i / 2)).span(tree), "type '{f}' has no upper bound", .{sema.fmtType(sema.typeOf(sema.resolveInst(args[i])))});
+        return err;
+    }
     if (block.want_safety) for (runtime_lens.items) |l| {
         const ok = try sema.analyzeCmp(block, src, .eq, len, l);
         try sema.addSafetyCheck(block, ok, .for_len_mismatch, .none, .none);
