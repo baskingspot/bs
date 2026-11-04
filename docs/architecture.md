@@ -7287,6 +7287,16 @@ computes the right one instead of copying the bug:
   sign combination). Runtime `|` was never affected. Found by
   `tools/mchunt`, whose generator keeps wide `|` at run time so that the
   difference does not show up as a mismatch.
+- *`extern threadlocal` that a shared library defines.* Zig 0.17.0's
+  self-hosted x86_64 backend reaches every thread-local of a non-PIC
+  executable local-exec, and its linker resolves that reference to the
+  undefined import as if the variable were in the executable's own TLS
+  block: for test/link_input/so_tls_main.zig's `so_tls` it emits `mov
+  rax, fs:0; sub rax, 0x40028; lea rax, [rax - 0x1204200]`, and the read
+  segfaults. Upstream with LLVM, and zap, read it initial-exec through a
+  slot the loader writes (R_X86_64_TPOFF64; "Thread-locals imported from
+  shared libraries"), and print the right values. C objects' accesses to
+  the same variable were never affected.
 
 ## Known regressions and limitations
 
