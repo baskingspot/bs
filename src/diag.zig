@@ -1119,6 +1119,16 @@ pub fn tryFix(arena: std.mem.Allocator, tree: *const Ast, start: u32, end: u32, 
     return try rawFix(arena, .maybe, &.{.{ .start = start, .end = start, .text = text }});
 }
 
+/// Swaps keyword `from` at offset `at` for `to`: `orelse` for a `catch` of
+/// an optional, `catch` for an `orelse` of an error union. Null when `at`
+/// is not that keyword, or for a `catch` with an error capture, whose body
+/// needs the error.
+pub fn keywordFix(arena: std.mem.Allocator, tree: *const Ast, at: u32, from: std.zig.Token.Tag, to: []const u8) !?RawFix {
+    const tok = tokenAt(tree, at) orelse return null;
+    if (tree.tokenTag(tok) != from or (tok + 1 < tree.tokens.len and tree.tokenTag(tok + 1) == .pipe)) return null;
+    return try rawFix(arena, .maybe, &.{.{ .start = at, .end = tokenEnd(tree, tok), .text = to }});
+}
+
 /// Whether `start..end` is exactly the span of an expression node.
 fn isExpression(tree: *const Ast, start: u32, end: u32) bool {
     const first = tokenAt(tree, start) orelse return false;
