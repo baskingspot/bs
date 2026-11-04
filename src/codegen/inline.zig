@@ -332,7 +332,7 @@ const Copier = struct {
             .min_float, .max_float, .min_int, .max_int, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => data.bin_op = .{ .lhs = c.ref(data.bin_op.lhs), .rhs = c.ref(data.bin_op.rhs) },
             .atomic_store, .ptr_elem_val, .slice_elem_val, .array_elem_val, .set_union_tag, .memcpy, .memmove, .memset => data.bin_op = .{ .lhs = c.ref(data.bin_op.lhs), .rhs = c.ref(data.bin_op.rhs) },
             .add_with_overflow, .sub_with_overflow, .mul_with_overflow, .ptr_elem_ptr, .slice_elem_ptr, .slice, .ptr_add => data.ty_pl.payload = try c.payload(Ir.Bin, data.ty_pl.payload),
-            .mul_add, .vector_store_elem => data.pl_op = .{ .operand = c.ref(data.pl_op.operand), .payload = try c.payload(Ir.Bin, data.pl_op.payload) },
+            .mul_add, .vector_store_elem, .select => data.pl_op = .{ .operand = c.ref(data.pl_op.operand), .payload = try c.payload(Ir.Bin, data.pl_op.payload) },
             .struct_field_ptr, .struct_field_val, .union_init => data.ty_pl.payload = try c.payload(Ir.StructField, data.ty_pl.payload),
             .atomic_rmw => data.ty_pl.payload = try c.payload(Ir.AtomicRmw, data.ty_pl.payload),
             .cmpxchg => data.ty_pl.payload = try c.payload(Ir.Cmpxchg, data.ty_pl.payload),
@@ -518,7 +518,7 @@ const Hasher = struct {
                 try h.index(data.ty_pl.ty);
                 try h.payload(Ir.Bin, data.ty_pl.payload);
             },
-            .mul_add, .vector_store_elem => {
+            .mul_add, .vector_store_elem, .select => {
                 try h.ref(data.pl_op.operand);
                 try h.payload(Ir.Bin, data.pl_op.payload);
             },

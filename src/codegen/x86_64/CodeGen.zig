@@ -257,8 +257,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     const func = ip.keyPayload(.func, ir.func);
     const gpa = emit.gpa;
     const t0 = std.Io.Timestamp.now(emit.zcu.io, .awake);
-    try emit.ssa.build(gpa, ir);
     const cover = emit.fuzz and instrumented(emit, ir);
+    try emit.ssa.build(gpa, ir, .{ .ip = ip, .gpr = selectable, .cover = cover });
     try emit.ssa.place(gpa, ir, cover);
     const t1 = std.Io.Timestamp.now(emit.zcu.io, .awake);
     var t2 = t1;
@@ -2921,7 +2921,7 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
         .wrap_errunion_payload => !Type.hasRuntimeBits(cg.ip, cg.typeOf(data.ty_op.operand)) or cg.passInRegs(cg.typeOf(data.ty_op.operand)),
         .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => true,
         .call, .atomic_load, .atomic_rmw, .ret_addr, .frame_addr, .extern_ptr, .extern_pcrel, .err_return_trace, .save_err_return_trace_index, .tls_ptr, .extern_tls, .get_union_tag => true,
-        .slice, .wrap_optional => true,
+        .slice, .wrap_optional, .select => true,
         else => false,
     };
     if (!wanted) return .none;
@@ -2961,6 +2961,11 @@ fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
         }
     };
     const ir = cg.ir;
+    // `genSelect` writes the false value first.
+    if (ir.instructions.items(.tag)[@backingInt(inst)] == .select) {
+        const rhs = ir.extraData(Ir.Bin, ir.instructions.items(.data)[@backingInt(inst)].pl_op.payload).data.rhs;
+        return if (rhs.toIndex()) |i| @backingInt(i) else Ssa.no_tie;
+    }
     if (ir.instructions.items(.tag)[@backingInt(inst)] == .struct_field_val) {
         // The value of an addition or subtraction with overflow that
         // writes its fields (`Ssa.Fate.pair`) is computed over the left
@@ -4053,6 +4058,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
 
         .is_null, .is_non_null, .is_err, .is_non_err => try cg.genCond(inst),
+        .select => try cg.genSelect(inst, data),
         .optional_payload => {
             const child = data.ty_op.ty;
             if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
@@ -4491,6 +4497,67 @@ fn scaleAdd(cg: *CodeGen, reg: Reg, index: Reg, size: u64) Error!void {
     if (size == 0) return;
     if (size != 1) try cg.e.imul(.qword, index, .{ .reg = index }, @intCast(size));
     try cg.e.alu(.add, .qword, .{ .reg = reg }, .{ .reg = index });
+}
+
+/// Whether `Ssa.build` may make a select of type `ty` (`genSelect`): a
+/// value in one general-purpose register (`inGpr`).
+fn selectable(ip: *const InternPool, ty: Index) bool {
+    return switch (Type.class(ip, ty)) {
+        .bool => true,
+        .int => Type.intInfo(ip, ty).bits -% 1 < 64,
+        .pointer => !Type.isSlice(ip, ty),
+        .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, ty)),
+        .error_set, .@"enum" => switch (Type.abiSize(ip, ty)) {
+            1, 2, 4, 8 => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// `select(cond, a, b)`: the flags for `cond`, then `b` and a `cmov` of
+/// `a`, which leave the flags alone; `setcc` when `a` and `b` are the
+/// constants 1 and 0 (or `true` and `false`), in either order. The flags
+/// come first because the result may take a register of the condition's
+/// operands, whose intervals end at the condition.
+fn genSelect(cg: *CodeGen, inst: Inst.Index, data: Ir.Inst.Data) Error!void {
+    const bin = cg.ir.extraData(Ir.Bin, data.pl_op.payload).data;
+    const cond = data.pl_op.operand;
+    const ty = cg.typeOf(bin.lhs);
+    const fused = if (cond.toIndex()) |c| cg.homes[@backingInt(c)] == .fused else false;
+    const cc: Encoder.Cond = if (fused) try cg.condFlags(cond.toIndex().?) else cc: {
+        const r = try cg.regOf(cond, .rax);
+        try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
+        break :cc .ne;
+    };
+    const d = cg.destReg(inst);
+    const ka = cg.constBit(bin.lhs);
+    const kb = cg.constBit(bin.rhs);
+    if (ka != null and kb != null and ka.? != kb.?) {
+        try cg.e.setcc(if (ka.?) cc else cc.negate(), .{ .reg = d });
+        try cg.e.movzx(.dword, d, .byte, .{ .reg = d });
+        return cg.setResult(inst, ty, d);
+    }
+    const src: Reg = switch (try cg.locOf(bin.lhs)) {
+        .reg => |r| r,
+        else => src: {
+            try cg.load(.r11, bin.lhs);
+            break :src .r11;
+        },
+    };
+    try cg.load(d, bin.rhs);
+    if (src != d) try cg.e.cmov(cc, .qword, d, .{ .reg = src });
+    try cg.setResult(inst, ty, d);
+}
+
+/// For constant `ref` 0 or 1 (`false` or `true`): whether it is 1.
+fn constBit(cg: *CodeGen, ref: Ref) ?bool {
+    const v = ref.toInterned() orelse return null;
+    if (v == .bool_true) return true;
+    if (v == .bool_false) return false;
+    if (Type.class(cg.ip, cg.ip.typeOf(v)) != .int) return null;
+    const x = cg.ip.intValue(u64, v) orelse return null;
+    return if (x <= 1) x == 1 else null;
 }
 
 /// A condition as a bool, unless its branch computes it.

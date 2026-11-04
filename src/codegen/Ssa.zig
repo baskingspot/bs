@@ -247,8 +247,20 @@ pub fn switchCases(f: *const Func, term: Term, len: usize) []const Block.Index {
     return f.extra.items[term.succ[0]..][0..len];
 }
 
-/// Builds `f` from `ir`, replacing what it held.
-pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
+/// What `build` needs to turn blocks into selects (docs/architecture.md,
+/// "Selects"): whether the architecture selects a value of type `ty` in a
+/// general-purpose register, and whether the function gets coverage
+/// points (`-ffuzz`), which keep the branches the user wrote.
+pub const Selects = struct {
+    ip: *const InternPool,
+    gpr: *const fn (ip: *const InternPool, ty: InternPool.Index) bool,
+    cover: bool,
+};
+
+/// Builds `f` from `ir`, replacing what it held. With `selects`, a block
+/// whose `cond_br` arms only exit it with values computed cheaply becomes
+/// a `select` in `ir` (`Builder.select`).
+pub fn build(f: *Func, gpa: Allocator, ir: *const Ir, selects: ?Selects) Allocator.Error!void {
     f.values.clearRetainingCapacity();
     f.blocks.clearRetainingCapacity();
     f.layout.clearRetainingCapacity();
@@ -259,7 +271,7 @@ pub fn build(f: *Func, gpa: Allocator, ir: *const Ir) Allocator.Error!void {
     try f.targets.appendNTimes(gpa, .none, ir.instructions.len);
     // At most one value per IR instruction.
     try f.values.ensureTotalCapacity(gpa, ir.instructions.len);
-    var b: Builder = .{ .f = f, .gpa = gpa, .ir = ir };
+    var b: Builder = .{ .f = f, .gpa = gpa, .ir = ir, .selects = selects };
     try b.body(ir.mainBody());
     const tags = ir.instructions.items(.tag);
     f.has_asm = for (f.values.items(.inst)) |inst| {
@@ -447,8 +459,8 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
 ///   `pair`: the fields' intervals start at the operation, which writes
 ///   them. Its bit is `fused` when only its block's branch tests it, if
 ///   nothing between sets the flags and `ctx.ovfFlagsOnly(tag, bits)`.
-/// - A condition only its block's branch reads is `fused` if
-///   `ctx.fusable(inst)`.
+/// - A condition only its block's branch, or a select right after it,
+///   reads is `fused` if `ctx.fusable(inst)`.
 /// - Arguments are all moved at the entry, so an unused one, whose interval
 ///   ends there, takes no register.
 /// - Promotion: a non-volatile alloc whose type is in a general-purpose
@@ -572,13 +584,13 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                     if (count[v] != no_tie and bin.rhs != bin.lhs) count[v] -%= 1;
                     if (count[v] != no_tie) fwd[v] = if (fwd[v] == no_tie and bin.rhs.toIndex() != null) i else no_fwd;
                 },
-                else => if (cond != null and cond.? == inst and uses[i] == 1 and ctx.fusable(inst)) {
+                else => if (uses[i] == 1 and ((cond != null and cond.? == inst) or selectsNext(ir, values[k + 1 ..], inst)) and ctx.fusable(inst)) {
                     fate[i] = .fused;
                     reg[i] = no_reg;
                     // So is the condition a `not` negates, in this block
                     // and read only by it: the branch tests the negated
                     // flags.
-                    if (tags[i] == .not) if (datas[i].ty_op.operand.toIndex()) |x| {
+                    if (tags[i] == .not and cond != null and cond.? == inst) if (datas[i].ty_op.operand.toIndex()) |x| {
                         const xi = @backingInt(x);
                         if (uses[xi] == 1 and fate[xi] == .normal and tags[xi] != .not and def[xi] > 2 * b.start and ctx.fusable(x)) {
                             fate[xi] = .fused;
@@ -846,7 +858,7 @@ pub fn removable(ir: *const Ir, ip: *const InternPool, inst: Inst.Index) bool {
         .div_trunc, .div_floor, .div_ceil, .rem, .mod => true,
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => true,
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float, .min_int, .max_int => true,
-        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => true,
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .select => true,
         .intcast, .trunc, .float_cast, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => true,
         .int_from_bool, .int_from_ptr, .ptr_from_int, .ret_addr, .frame_addr, .save_err_return_trace_index => true,
         .struct_field_ptr, .struct_field_val, .ptr_elem_ptr, .slice_elem_ptr, .ptr_add, .slice_ptr, .slice_len, .slice => true,
@@ -965,7 +977,7 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
             ctx.use(at(extra, data.ty_pl.payload));
             ctx.use(at(extra, data.ty_pl.payload + 1));
         },
-        .mul_add, .vector_store_elem => {
+        .mul_add, .vector_store_elem, .select => {
             ctx.use(&data.pl_op.operand);
             ctx.use(at(extra, data.pl_op.payload));
             ctx.use(at(extra, data.pl_op.payload + 1));
@@ -1255,6 +1267,45 @@ pub fn takenCase(ir: *const Ir, data: Inst.Data) ?[]const Inst.Index {
     return taken orelse ir.bodySlice(i, extra.data.else_body_len);
 }
 
+/// How many values each arm of a select may compute (`Builder.select`).
+const max_speculated = 2;
+
+/// Whether value `inst` may run on a path that did not compute it: it has
+/// no effect, cannot fault, and is one cheap instruction on values in
+/// general-purpose registers.
+fn speculable(ir: *const Ir, sel: Selects, inst: Inst.Index) bool {
+    const data = ir.instructions.items(.data)[@backingInt(inst)];
+    const ip = sel.ip;
+    const operand = switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
+        .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr => data.bin_op.lhs,
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => data.bin_op.lhs,
+        .not, .intcast, .trunc => data.ty_op.operand,
+        .int_from_bool => return true,
+        else => return false,
+    };
+    return sel.gpr(ip, ir.typeOf(operand, ip)) and sel.gpr(ip, ir.typeOfIndex(inst, ip));
+}
+
+/// Whether `next` starts with a select of condition `cond`.
+fn selectsNext(ir: *const Ir, next: []const Inst.Index, cond: Inst.Index) bool {
+    if (next.len == 0 or ir.instructions.items(.tag)[@backingInt(next[0])] != .select) return false;
+    return ir.instructions.items(.data)[@backingInt(next[0])].pl_op.operand == cond.toRef();
+}
+
+/// Whether value `inst` reads `operand`.
+fn reads(ir: *const Ir, inst: Inst.Index, operand: Inst.Index) bool {
+    const R = struct {
+        operand: Inst.Index,
+        found: bool = false,
+        pub fn use(r: *@This(), ref: Inst.Ref) void {
+            if (ref.toIndex() == r.operand) r.found = true;
+        }
+    };
+    var r: R = .{ .operand = operand };
+    forEachOperand(ir, inst, &r);
+    return r.found;
+}
+
 const Builder = struct {
     f: *Func,
     gpa: Allocator,
@@ -1266,6 +1317,7 @@ const Builder = struct {
     last: Inst.Index = undefined,
     /// The innermost loop being built.
     loop: u32 = no_loop,
+    selects: ?Selects,
 
     fn newBlock(b: *Builder) Allocator.Error!Block.Index {
         try b.f.blocks.append(b.gpa, .{ .start = 0, .len = 0, .term = undefined });
@@ -1295,6 +1347,70 @@ const Builder = struct {
         b.cur = .none;
     }
 
+    /// Branch elimination, as Go's `branchelim`: block `inst`, whose body
+    /// ends in a `cond_br` whose arms each compute at most
+    /// `max_speculated` cheap values (`speculable`) and exit the block with
+    /// one, becomes `select(cond, then value, else value)` in place, after
+    /// the body's other values and both arms' values, which now always
+    /// run. The condition moves next to the select when nothing else reads
+    /// it, so the select can fuse it. Only for results the architecture
+    /// selects in a register; not for a constant condition (only its taken
+    /// arm is built) nor for a branch the user wrote when it is a coverage
+    /// point. A mispredicted branch costs about 15 cycles; a select, the
+    /// arms' few instructions.
+    fn select(b: *Builder, sel: Selects, inst: Inst.Index) Allocator.Error!bool {
+        const ir = b.ir;
+        const tags = ir.instructions.items(.tag);
+        const datas = ir.instructions.items(.data);
+        const extra = ir.extraData(Ir.Block, datas[@backingInt(inst)].ty_pl.payload);
+        const insts = ir.bodySlice(extra.end, extra.data.body_len);
+        if (insts.len == 0 or tags[@backingInt(insts[insts.len - 1])] != .cond_br) return false;
+        if (!sel.gpr(sel.ip, datas[@backingInt(inst)].ty_pl.ty)) return false;
+        const cb = datas[@backingInt(insts[insts.len - 1])].pl_op;
+        if (cb.operand.toInterned() != null) return false;
+        const x = ir.extraData(Ir.CondBr, cb.payload);
+        if (sel.cover and (x.data.cover.then or x.data.cover.@"else")) return false;
+        const arms: [2][]const Inst.Index = .{
+            ir.bodySlice(x.end, x.data.then_body_len),
+            ir.bodySlice(x.end + x.data.then_body_len, x.data.else_body_len),
+        };
+        var vals: [2]Inst.Ref = undefined;
+        for (arms, &vals) |arm, *v| {
+            if (arm.len == 0) return false;
+            const last = arm[arm.len - 1];
+            if (tags[@backingInt(last)] != .br or datas[@backingInt(last)].br.block_inst != inst) return false;
+            v.* = datas[@backingInt(last)].br.operand;
+            var n: u32 = 0;
+            for (arm[0 .. arm.len - 1]) |a| {
+                if (tags[@backingInt(a)] == .dbg_stmt) continue;
+                n += 1;
+                if (n > max_speculated or !speculable(ir, sel, a)) return false;
+            }
+        }
+        // The condition moves after the arms' values when it is the body's
+        // last value and they do not read it.
+        const cond = cb.operand.toIndex().?;
+        const prefix = insts[0 .. insts.len - 1];
+        var j = prefix.len;
+        while (j != 0 and tags[@backingInt(prefix[j - 1])] == .dbg_stmt) j -= 1;
+        var moves = j != 0 and prefix[j - 1] == cond;
+        for (arms) |arm| for (arm) |a| if (reads(ir, a, cond)) {
+            moves = false;
+        };
+        for (prefix, 0..) |p, k| if (!moves or k != j - 1) try b.instruction(p);
+        for (arms) |arm| for (arm[0 .. arm.len - 1]) |a| if (tags[@backingInt(a)] != .dbg_stmt) try b.instruction(a);
+        if (moves) try b.instruction(cond);
+        // The `cond_br`'s first two payload words become the select's
+        // operands; its bodies are no longer read.
+        const words = @constCast(ir.extra);
+        words[cb.payload] = @backingInt(vals[0]);
+        words[cb.payload + 1] = @backingInt(vals[1]);
+        tags[@backingInt(inst)] = .select;
+        datas[@backingInt(inst)] = .{ .pl_op = .{ .operand = cb.operand, .payload = cb.payload } };
+        try b.instruction(inst);
+        return true;
+    }
+
     /// A body that is not empty ends with an instruction that does not
     /// return; if that one is a value, it ends its block. An empty body
     /// leaves its block open, to fall through into the next one.
@@ -1309,6 +1425,7 @@ const Builder = struct {
         const data = ir.instructions.items(.data)[@backingInt(inst)];
         switch (ir.instructions.items(.tag)[@backingInt(inst)]) {
             .block => {
+                if (b.selects) |sel| if (try b.select(sel, inst)) return;
                 // The value holds the block's result, which each `br` writes.
                 try b.value(inst);
                 const extra = ir.extraData(Ir.Block, data.ty_pl.payload);
@@ -1410,7 +1527,7 @@ test "blocks follow the structured IR's layout" {
     const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 9 };
     var f: Func = .{};
     defer f.deinit(gpa);
-    try f.build(gpa, &ir);
+    try f.build(gpa, &ir, null);
 
     // entry [arg, block, loop] -fallthrough-> header [] -branch-> then
     // [] -jump-> exit, else [] -jump-> header; exit [] ret.
@@ -1446,7 +1563,7 @@ test "an empty body falls through" {
     const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 1 };
     var f: Func = .{};
     defer f.deinit(gpa);
-    try f.build(gpa, &ir);
+    try f.build(gpa, &ir, null);
 
     const L = f.layout.items;
     try std.testing.expectEqual(2, L.len);
@@ -1485,7 +1602,7 @@ test "liveness extends over loops and ignores clobbers on paths that end" {
     const ir: Ir = .{ .instructions = insts.slice(), .extra = &extra, .func = .none, .main_block = 11 };
     var f: Func = .{};
     defer f.deinit(gpa);
-    try f.build(gpa, &ir);
+    try f.build(gpa, &ir, null);
     try f.live.resize(gpa, ir.instructions.len);
 
     // Clobber points: the breakpoint, which is on the path that traps,

@@ -416,6 +416,12 @@ pub const Inst = struct {
         /// `operand` through the ZIR `break` (or `break_inline`)
         /// instruction `payload`, whose target the walker runs.
         comptime_exit,
+
+        /// Only in CodeGen's IR, made by `Ssa.build` from a `block` whose
+        /// `cond_br` arms only exit it (docs/architecture.md, "Selects").
+        /// `pl_op` with `Bin`: `lhs` if `operand` (a `bool`) is true, else
+        /// `rhs`; both are computed.
+        select,
     };
 
     pub const Data = union {
@@ -684,6 +690,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .min_int, .max_int => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),
         .mul_add => ir.typeOf(data.pl_op.operand, ip),
+        .select => ir.typeOf(ir.extraData(Bin, data.pl_op.payload).data.lhs, ip),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => .bool_type,
         .int_from_bool => .u1_type,
         .int_from_ptr, .ret_addr, .frame_addr, .save_err_return_trace_index => .usize_type,

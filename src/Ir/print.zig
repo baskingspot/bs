@@ -124,6 +124,14 @@ const Printer = struct {
                 try w.writeAll(", ");
                 try p.ref(bin.rhs);
             },
+            .select => {
+                const bin = ir.extraData(Ir.Bin, data.pl_op.payload).data;
+                try p.ref(data.pl_op.operand);
+                try w.writeAll(", ");
+                try p.ref(bin.lhs);
+                try w.writeAll(", ");
+                try p.ref(bin.rhs);
+            },
             .mul_add => {
                 const bin = ir.extraData(Ir.Bin, data.pl_op.payload).data;
                 try p.ref(bin.lhs);
