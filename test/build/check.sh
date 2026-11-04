@@ -121,9 +121,13 @@ expect "note: candidates: Io"
 expect "note: hint: std.io is now std.Io"
 sed -i 's/std.io.print/std.debug.print/' src/main.zig
 
+# ReleaseSafe: -Osafe on the root module, which greet inherits.
+"$zap" build run -Doptimize=ReleaseSafe >"$work/log" 2>&1 || fail "zap build run in ReleaseSafe"
+expect " 2 safe"
+
 # A step zap does not build fails with a diagnostic, not a crash.
 if "$zap" build -Doptimize=ReleaseFast >"$work/log" 2>&1; then fail "zap build succeeded in ReleaseFast"; fi
-expect "error: [unsupported] zap builds only Debug ('-Ofast')"
+expect "error: [unsupported] zap builds only Debug and ReleaseSafe ('-Ofast')"
 
 # build.zig itself fails to compile.
 line=$(($(wc -l <build.zig) + 1))

@@ -148,6 +148,10 @@ pub fn build(b: *std.Build) void {
 ///                               the same, with the donor built at this
 ///                               program's path, so that the replay loads
 ///                               the functions in the root file too
+///   //! flags: <arguments>      extra arguments for both compilers,
+///                               separated by spaces (such as
+///                               `-OReleaseSafe`); not with the rebuild
+///                               and donor headers
 ///
 /// `test` builds each with zap and checks it; `test-upstream` does the same
 /// with upstream zig, so every program is checked against the oracle.
@@ -196,6 +200,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             /// `donor-libc`: built with and without `-lc`, in either order,
             /// into one global cache; neither replays the other as a donor.
             donor_libc: bool = false,
+            flags: std.ArrayList([]const u8) = .empty,
         } = .{};
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
@@ -212,6 +217,9 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 expect.stderr_contains.append(b.allocator, bytes) catch @panic("OOM");
             } else if (std.mem.eql(u8, key, "libc")) {
                 expect.libc = std.mem.eql(u8, value, "true");
+            } else if (std.mem.eql(u8, key, "flags")) {
+                var flags = std.mem.tokenizeScalar(u8, value, ' ');
+                while (flags.next()) |f| expect.flags.append(b.allocator, f) catch @panic("OOM");
             } else if (std.mem.eql(u8, key, "donor-libc")) {
                 expect.donor_libc = std.mem.eql(u8, value, "true");
             } else if (std.mem.eql(u8, key, "donor-without") or std.mem.eql(u8, key, "donor-here-without")) {
@@ -234,11 +242,14 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             }
         }
         if (expect.exit == null and expect.signal == null) std.debug.panic("{s}: missing '//! exit:' or '//! signal:' header", .{src_path});
+        if (expect.flags.items.len != 0 and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null or expect.donor_without != null or expect.donor_libc))
+            std.debug.panic("{s}: '//! flags:' works only without the rebuild and donor headers", .{src_path});
 
         for ([_]bool{ false, true }) |upstream| {
             const compile = if (upstream) blk: {
                 const r = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-fno-llvm", "-fno-lld" });
                 if (expect.libc) r.addArgs(&.{ "-target", "x86_64-linux-gnu", "-lc" });
+                r.addArgs(expect.flags.items);
                 r.addFileArg(b.path(src_path));
                 break :blk r;
             } else if (expect.rebuild_without.items.len != 0 or expect.lib_edit != null) blk: {
@@ -363,6 +374,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             } else blk: {
                 const r = b.addRunArtifact(zap);
                 r.addArgs(if (expect.libc) &.{ "build-exe", "-target", "x86_64-linux-gnu", "-lc" } else &.{ "build-exe", "-target", "x86_64-linux" });
+                r.addArgs(expect.flags.items);
                 r.addFileArg(b.path(src_path));
                 break :blk r;
             };

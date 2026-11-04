@@ -394,7 +394,10 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   non-`.auto` function that calls one creates its own at entry
   (`set_err_return_trace`). With no liveness pass, a save that no restore
   uses is marked unused by Sema and has no code. Off in compiler_rt (built in
-  a release mode upstream) and without std.
+  a release mode upstream), without std, and in modules whose error tracing
+  is off (`Frontend.Module.error_tracing`: `-fno-error-tracing`, and
+  ReleaseSafe's default, as upstream's). When no module traces (upstream's
+  `any_error_tracing`), non-`.auto` functions set up no trace either.
 - Target-independent, and precise enough to interpret. The bytecode comptime
   evaluator (milestone 6) runs lowered function bodies; it runs this IR
   directly (it may move to a denser encoding derived from it), and it does
@@ -874,9 +877,9 @@ upstream ReleaseSafe's (`bench/runtime.py`, below).
   not of the SSA form or the allocator: nothing below assumes memory
   operations stay put, so a later mode can relax it.
 - **A pass list per mode.** The driver runs the pass list of the build's
-  mode. There is one mode today (`builtin.mode` stays `.debug`); a
-  ReleaseSafe mode may follow milestone 7 (`builtin.mode == .safe`, with
-  more passes, including ones that move code). Passes read and write only
+  mode. There is one pass list today, which ReleaseSafe builds
+  (`builtin.mode == .safe`) share; ReleaseSafe may get its own after
+  milestone 7, with more passes, including ones that move code. Passes read and write only
   the SSA, so a mode adds or drops passes without changing the others.
 - **Room for facts.** The default mode's longer-term target is Go-level
   code, about 1.2–2× behind GCC and Clang, after inlining and a few more
@@ -5124,13 +5127,30 @@ state. Built for step 1:
   implemented (`-M`/`--dep`, `--name`, `-femit-bin`, `--cache-dir`,
   `-fsingle-threaded`, `-freference-trace`, `--listen=-`, ...); ignored,
   because it changes nothing zap does (link layout, C-only settings,
-  settings zap always has: `-ODebug`, `-static`, `-fno-PIE`, ...);
+  settings zap always has: `-static`, `-fno-PIE`, ...);
   unsupported, which makes the compile fail with an `[unsupported]`
   diagnostic naming the option and the way out; and unknown, also
   `[unsupported]`. Response files (`@file`, which the runner writes for
   long command lines) are expanded where an option is expected.
-- **Backend flags.** zap builds only Debug, where upstream's choice of
-  backend changes nothing a program means. So `-fllvm`, `-flld` and their
+- **ReleaseSafe.** `-O` (`-ODebug`, `-OReleaseSafe`, `-Osafe`, `-O safe`,
+  ...), `-ferror-tracing` and `-fvalgrind` with their `-fno-` forms are
+  per module, as upstream's: each `-M` takes those given since the last
+  one, a module without its own takes them from the module that first
+  depends on it (`main.inheritFlags`), and std, builtin and the test
+  runner take the root module's. ReleaseSafe compiles with zap's one code
+  generation, safety checks included; it changes what upstream's
+  ReleaseSafe changes in meaning: `builtin.mode == .safe`, and error
+  tracing and Valgrind client requests off unless asked for. A module
+  whose three settings differ from the root module's gets a builtin of its
+  own, `=builtin@<dir>` (`Frontend.ModuleArg.builtin_dir`), as upstream
+  gives each set of module options one. Error tracing changes IR with no
+  dependency recording it, so it salts the store seed (`cacheTarget`:
+  `=notrace`, and `=<module>:<mode><t|n><v|n>` for each module with a
+  builtin of its own). ReleaseFast and ReleaseSmall stay `[unsupported]`.
+  C sources compile as in Debug (`-O0`, full UBSan) whatever their
+  module's mode.
+- **Backend flags.** zap generates the same code in Debug and ReleaseSafe,
+  where upstream's choice of backend changes nothing a program means. So `-fllvm`, `-flld` and their
   `-fno-` forms are accepted without a word and zap compiles with its own
   backend and linker. `builtin.zig_backend` is upstream's Debug default for
   the target, whatever the flags say: `.stage2_x86_64` on x86_64-linux,
@@ -5148,7 +5168,7 @@ state. Built for step 1:
   `-fasync-unwind-tables` and `-fno-unwind-tables` set
   `builtin.unwind_tables` as upstream does (ghostty asks for `.sync`);
   zap emits asynchronous tables for each, which serve every request.
-  Release modes (`-O` other than Debug), C, C++ and assembly sources,
+  ReleaseFast and ReleaseSmall, C, C++ and assembly sources,
   and system libraries stay `[unsupported]`; `-lc` links glibc and `zap
   translate-c` translates headers (see "C interop"). zap never hands a step to upstream zig.
 - **`zap build`** (`src/BuildRunner.zig`) does what upstream's `zig build`

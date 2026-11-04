@@ -149,9 +149,9 @@ bc_block: ?*Block = null,
 /// `has_error_trace`: an `.auto` function gets one from its caller; another
 /// needs one set up at entry once it calls an `.auto` function.
 has_error_trace: bool = false,
-/// Whether `func` keeps error return traces: as upstream's module option,
-/// on with std, except in compiler_rt (built in a release mode) and naked
-/// functions (which have no frame).
+/// Whether `func` keeps error return traces: as upstream's module option
+/// (`Frontend.Module.error_tracing`), with std, except in compiler_rt
+/// (built in a release mode) and naked functions (which have no frame).
 error_tracing: bool = false,
 /// The error return trace's index on entry to the function or inline call
 /// being analyzed (`save_err_return_trace_index`), or `.none`.
@@ -1784,7 +1784,8 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     const last_arg_index = block.instructions.items.len;
     sema.has_error_trace = fn_ty.cc == .auto;
     const has_std = zcu.moduleRootFile(.std) != null;
-    sema.error_tracing = has_std and fn_ty.cc != .naked and zcu.file(nav.file).module != .compiler_rt;
+    const module = zcu.file(nav.file).module;
+    sema.error_tracing = has_std and fn_ty.cc != .naked and module != .compiler_rt and zcu.fe.module(module).error_tracing;
     sema.err_ret_index_on_entry = try sema.analyzeSaveErrRetIndex(&block);
     block.error_return_trace_index = sema.err_ret_index_on_entry;
 
@@ -1792,8 +1793,9 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
         error.ComptimeBreak, error.ComptimeReturn => unreachable,
         else => |e| return e,
     };
-    // Even without tracing (compiler_rt), `.auto` callees may push.
-    if (sema.has_error_trace and fn_ty.cc != .auto and fn_ty.cc != .naked and has_std) try sema.setupErrorReturnTrace(&block, last_arg_index);
+    // Even without tracing (compiler_rt), `.auto` callees may push, unless
+    // no module traces (upstream's `any_error_tracing`).
+    if (sema.has_error_trace and fn_ty.cc != .auto and fn_ty.cc != .naked and has_std and zcu.fe.any_error_tracing) try sema.setupErrorReturnTrace(&block, last_arg_index);
     if (fn_ty.cc == .naked) {
         // A naked function falls off its end into whatever follows.
     }

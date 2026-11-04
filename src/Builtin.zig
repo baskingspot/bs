@@ -1,8 +1,8 @@
 //! The generated `builtin` module: `@import("builtin")`.
 //!
 //! The text follows upstream Zig 0.17.0's `src/Builtin.zig` output for zap's
-//! one Linux configuration: x86_64-linux-none, Debug, the self-hosted x86_64
-//! backend, static linking.
+//! one Linux configuration: x86_64-linux-none, Debug or ReleaseSafe, the
+//! self-hosted x86_64 backend, static linking.
 //! Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
 
 const std = @import("std");
@@ -20,6 +20,10 @@ pub const Options = struct {
     unwind_tables: std.lang.UnwindTables = .async,
     /// `-ffuzz`.
     fuzz: bool = false,
+    /// `-O`, `-ferror-tracing` and `-fvalgrind`, resolved (`main.Options`).
+    optimize: std.lang.Optimize = .debug,
+    error_tracing: bool = true,
+    valgrind: bool = true,
     /// `-fPIC` and `-fPIE` on objects and libraries (see
     /// "Position-independent code" in docs/architecture.md).
     pic: bool = false,
@@ -163,11 +167,11 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     \\pub const object_format: std.Target.ObjectFormat = .elf;
     \\/// Deprecated, to be removed after 0.18.0
     \\pub const mode = optimize;
-    \\pub const optimize: std.lang.Optimize = .debug;
+    \\pub const optimize: std.lang.Optimize = .{s};
     \\pub const link_libc = {s};
     \\pub const link_libcpp = {s};
-    \\pub const have_error_return_tracing = true;
-    \\pub const valgrind_support = true;
+    \\pub const have_error_return_tracing = {s};
+    \\pub const valgrind_support = {s};
     \\pub const sanitize_thread = false;
     \\pub const fuzz = {s};
     \\pub const position_independent_code = {s};
@@ -188,8 +192,11 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
         glibc.minor,
         glibc.patch,
         if (libc) ".init(\"/lib64/ld-linux-x86-64.so.2\")" else ".none",
+        @tagName(opts.optimize),
         if (libc) "true" else "false",
         if (opts.link_libcpp) "true" else "false",
+        if (opts.error_tracing) "true" else "false",
+        if (opts.valgrind) "true" else "false",
         if (opts.fuzz) "true" else "false",
         if (opts.pic or libc) "true" else "false",
         if (opts.pie) "true" else "false",

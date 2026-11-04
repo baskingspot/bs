@@ -51,6 +51,10 @@ load_std: bool,
 /// whose `=std@fuzzer` and `=builtin@fuzzer` follow it. Their names hold
 /// an '=', which no `-M` name can, so no other module's keys are theirs.
 fuzzer_root: ?Module.Index = null,
+/// Whether any module has `error_tracing`, as upstream's
+/// `Config.any_error_tracing`: only then do functions other than `.auto`
+/// ones set up a trace for their `.auto` callees.
+any_error_tracing: bool = true,
 /// With `Options.c_runtimes`: the module of `<lib>/ubsan_rt.zig`, whose
 /// `__ubsan_handle_*` exports `zig cc`'s Debug objects call. It shares
 /// the main std and builtin. compiler_rt's `ssp_sub_path` is a root then
@@ -85,6 +89,12 @@ pub const Module = struct {
     builtin_mod: Index = .builtin,
     /// `-ffuzz`: CodeGen instruments the module's functions.
     fuzz: bool = false,
+    /// `-ferror-tracing` as resolved (`main.Options.error_tracing`): Sema
+    /// saves, pushes and restores error return traces in the module's
+    /// functions.
+    error_tracing: bool = true,
+    /// `name` is `gpa`'s (an extra builtin's, `ModuleArg.builtin_dir`).
+    owned_name: bool = false,
 
     pub const Index = enum(u32) {
         root,
@@ -108,6 +118,15 @@ pub const ModuleArg = struct {
     /// Its `-ffuzz` or `-fno-fuzz`, if any; after `main.parseOptions`, the
     /// flag it inherits otherwise.
     fuzz: ?bool = null,
+    /// Its `-O`, `-ferror-tracing` and `-fvalgrind` (or their negations),
+    /// as `fuzz`.
+    optimize: ?std.lang.Optimize = null,
+    error_tracing: ?bool = null,
+    valgrind: ?bool = null,
+    /// The directory of its own generated `builtin.zig`, when those
+    /// differ from the root module's, as upstream gives each set of
+    /// module options a builtin of its own.
+    builtin_dir: ?[]const u8 = null,
 };
 
 pub const File = struct {
@@ -174,6 +193,8 @@ pub const Options = struct {
     /// `-ffuzz` on the main module, which std, builtin and the test runner
     /// inherit.
     fuzz: bool = false,
+    /// `-ferror-tracing` on the main module, inherited as `fuzz`.
+    error_tracing: bool = true,
     /// With `-ffuzz` on an executable: the directory of the fuzzer's
     /// generated `builtin.zig`. The fuzzer (`<lib>/fuzzer.zig`) then joins
     /// the compilation as a module family of its own (docs/architecture.md,
@@ -256,6 +277,36 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     // and the test runner; each other module's resolved by `main`.
     for ([_]Module.Index{ .root, .std, .builtin, fe.main_module }) |m| fe.modules.items[@backingInt(m)].fuzz = options.fuzz;
     for (options.modules, first_extra..) |m, k| fe.modules.items[k].fuzz = m.fuzz orelse options.fuzz;
+    // Error tracing likewise.
+    for ([_]Module.Index{ .root, .std, .builtin, fe.main_module }) |m| fe.modules.items[@backingInt(m)].error_tracing = options.error_tracing;
+    fe.any_error_tracing = options.error_tracing;
+    for (options.modules, first_extra..) |m, k| {
+        const et = m.error_tracing orelse options.error_tracing;
+        fe.modules.items[k].error_tracing = et;
+        fe.any_error_tracing = fe.any_error_tracing or et;
+    }
+    // Modules with a builtin of their own (`ModuleArg.builtin_dir`): one
+    // `=builtin@<n>` module per directory. Its name holds an '=', which no
+    // `-M` name can, and follows from the directory, which the builtin's
+    // content names, so equal builtins have equal keys in every build.
+    for (options.modules, first_extra..) |m, k| {
+        const dir = m.builtin_dir orelse continue;
+        const existing = for (fe.modules.items[first_extra + options.modules.len ..], first_extra + options.modules.len..) |b, bk| {
+            if (std.mem.eql(u8, b.root_dir, dir)) break bk;
+        } else null;
+        const b = existing orelse b: {
+            const bk = fe.modules.items.len;
+            try fe.modules.append(gpa, .{
+                .name = try std.fmt.allocPrint(gpa, "=builtin@{s}", .{std.fs.path.basename(dir)}),
+                .root_dir = try gpa.dupe(u8, dir),
+                .root_file = try gpa.dupe(u8, "builtin.zig"),
+                .cache = .global,
+                .owned_name = true,
+            });
+            break :b bk;
+        };
+        fe.modules.items[k].builtin_mod = @fromBackingInt(@intCast(b));
+    }
     if (options.fuzzer_builtin_dir) |dir| {
         const root: Module.Index = @fromBackingInt(@intCast(fe.modules.items.len));
         const family: [3]Module.Index = .{ @fromBackingInt(@backingInt(root) + 1), root, @fromBackingInt(@backingInt(root) + 2) };
@@ -271,7 +322,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     }
     if (options.c_runtimes) {
         fe.ubsan_rt = @fromBackingInt(@intCast(fe.modules.items.len));
-        try fe.modules.append(gpa, .{ .name = "=ubsan_rt", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "ubsan_rt.zig"), .cache = .global });
+        try fe.modules.append(gpa, .{ .name = "=ubsan_rt", .root_dir = try gpa.dupe(u8, zig_lib_dir), .root_file = try gpa.dupe(u8, "ubsan_rt.zig"), .cache = .global, .error_tracing = options.error_tracing });
     }
     return fe;
 }
@@ -297,6 +348,7 @@ pub fn deinit(fe: *Frontend) void {
     fe.file_map.deinit(gpa);
     for (fe.modules.items) |m| {
         gpa.free(m.root_dir);
+        if (m.owned_name) gpa.free(m.name);
         gpa.free(m.root_file);
         if (m.abs_root_dir) |p| gpa.free(p);
         gpa.free(m.deps);

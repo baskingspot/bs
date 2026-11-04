@@ -1,4 +1,5 @@
 pub const word = "hello";
+pub const mode = @import("builtin").mode;
 
 /// The fuzz test calls it; build.zig builds this module with
 /// `.fuzz = false`, so `--fuzz` leaves its branch uninstrumented (check.sh).

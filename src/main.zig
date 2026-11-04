@@ -84,6 +84,12 @@ pub const Options = struct {
     /// runner inherit, and `builtin.fuzz` reports; other modules have
     /// theirs in `modules`.
     root_fuzz: bool = false,
+    /// The root module's `-O` (Debug or ReleaseSafe), `-ferror-tracing`
+    /// and `-fvalgrind`, resolved as upstream's: std and the test runner
+    /// inherit them, other modules have theirs in `modules`.
+    optimize: std.lang.Optimize = .debug,
+    error_tracing: bool = true,
+    valgrind: bool = true,
     /// `-funwind-tables`, `-fasync-unwind-tables`, `-fno-unwind-tables`:
     /// only what `builtin.unwind_tables` says (Builtin.Options).
     unwind_tables: std.lang.UnwindTables = .async,
@@ -279,12 +285,21 @@ pub fn main(init_std: std.process.Init) !void {
 /// modules that fuzz gets store entries of its own: `+fuzz`, then each
 /// module whose flag differs from the root module's, as `+name` or
 /// `-name` (`-root` if the root module does not fuzz).
+/// Error tracing off in the root module (`-fno-error-tracing`,
+/// ReleaseSafe's default) likewise, as `=notrace`; and each module whose
+/// `-O`, `-ferror-tracing` or `-fvalgrind` differs from the root module's,
+/// and so has a builtin of its own that no node key names, as
+/// `=<name>:<mode>` with `t` or `n` for tracing and `v` or `n` for
+/// Valgrind. ('=' is in no module's name.)
 /// Atoms inlined other than by default (`inlining`) get entries of their
 /// own too, as `+inline<budget>` and `s` for the safe variant.
 fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.process.Environ.Map) ![]const u8 {
     const inl = inlining(env);
     const default_inl = inl.budget == inline_ir.budget and !inl.safe;
-    if (!opts.fuzz and default_inl) return "x86_64-linux";
+    const same_modes = for (opts.modules) |m| {
+        if (m.optimize.? != opts.optimize or m.error_tracing.? != opts.error_tracing or m.valgrind.? != opts.valgrind) break false;
+    } else true;
+    if (!opts.fuzz and default_inl and opts.error_tracing and same_modes) return "x86_64-linux";
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(arena, "x86_64-linux");
     if (opts.fuzz) {
@@ -293,6 +308,11 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
         for (opts.modules) |m| {
             if (m.fuzz.? != opts.root_fuzz) try s.print(arena, "{c}{s}", .{ @as(u8, if (m.fuzz.?) '+' else '-'), m.name });
         }
+    }
+    if (!opts.error_tracing) try s.appendSlice(arena, "=notrace");
+    for (opts.modules) |m| {
+        if (m.optimize.? == opts.optimize and m.error_tracing.? == opts.error_tracing and m.valgrind.? == opts.valgrind) continue;
+        try s.print(arena, "={s}:{t}{c}{c}", .{ m.name, m.optimize.?, "nt"[@intFromBool(m.error_tracing.?)], "nv"[@intFromBool(m.valgrind.?)] });
     }
     if (!default_inl) try s.print(arena, "+inline{d}{s}", .{ inl.budget, if (inl.safe) "s" else "" });
     return s.items;
@@ -338,7 +358,7 @@ pub const Job = struct {
             .local_is_global = command == .run,
         });
         const is_test = command == .@"test";
-        const builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), .{
+        const builtin_opts: Builtin.Options = .{
             .output_mode = switch (command) {
                 .build_obj => .Obj,
                 .build_lib => .Lib,
@@ -348,12 +368,27 @@ pub const Job = struct {
             .single_threaded = opts.single_threaded,
             .unwind_tables = opts.unwind_tables,
             .fuzz = opts.root_fuzz,
+            .optimize = opts.optimize,
+            .error_tracing = opts.error_tracing,
+            .valgrind = opts.valgrind,
             .pic = opts.pic,
             .pie = opts.pie,
             .dynamic = opts.dynamic,
             .glibc = if (opts.link_libc) opts.glibc_version else null,
             .link_libcpp = opts.link_libcpp,
-        });
+        };
+        const builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), builtin_opts);
+        // A module whose `-O`, `-ferror-tracing` or `-fvalgrind` differs
+        // from the root module's gets a builtin of its own, as upstream's.
+        const modules = try arena.dupe(Frontend.ModuleArg, opts.modules);
+        for (modules) |*m| {
+            if (m.optimize.? == opts.optimize and m.error_tracing.? == opts.error_tracing and m.valgrind.? == opts.valgrind) continue;
+            var o = builtin_opts;
+            o.optimize, o.error_tracing, o.valgrind = .{ m.optimize.?, m.error_tracing.?, m.valgrind.? };
+            m.builtin_dir = try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), o);
+        }
+        var job_opts = opts;
+        job_opts.modules = modules;
         // An executable that fuzzes links the fuzzer, whose module family
         // has a builtin of its own, as upstream's separate compilation of
         // it (a static library) does. As upstream's, a non-test executable
@@ -388,7 +423,7 @@ pub const Job = struct {
             }
         }
         return .{
-            .opts = opts,
+            .opts = job_opts,
             .zig_lib_dir = zig_lib_dir,
             .cache_dirs = cache_dirs,
             .builtin_dir = builtin_dir,
@@ -603,6 +638,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .root_deps = opts.root_deps,
         .modules = opts.modules,
         .fuzz = opts.root_fuzz,
+        .error_tracing = opts.error_tracing,
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
         // Only executables link the C runtimes; a library's C objects
         // reach them when an executable links the library, as upstream's.
@@ -1225,11 +1261,11 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fno-llvm"},                        .{"-fno-lld"},                  .{"-fnew-linker"},          .{"-fno-new-linker"},
     .{"-fallow-so-scripts"},               .{"-fno-allow-so-scripts"},     .{"-fentry"},               .{"-fno-strip"},
     .{"-fstack-check"},                    .{"-fno-stack-check"},          .{"-fstack-protector"},     .{"-fno-stack-protector"},
-    .{"-fno-omit-frame-pointer"},          .{"-ferror-tracing"},           .{"-fno-sanitize-thread"},
-    .{"-fvalgrind"},                       .{"-fno-PIC"},                  .{"-fno-PIE"},              .{"-fbuiltin"},
+    .{"-fno-omit-frame-pointer"},          .{"-fno-sanitize-thread"},
+    .{"-fno-PIC"},                  .{"-fno-PIE"},              .{"-fbuiltin"},
     .{"-fno-builtin"},                     .{"-mred-zone"},                .{"-mno-red-zone"},         .{"-fno-sanitize-c"},
     .{"-fsanitize-c=trap"},                .{"-fsanitize-c=full"},         .{"-fsanitize-c"},          .{"-gdwarf32"},
-    .{"-gdwarf64"},                        .{"-ODebug"},                   .{"-Odebug"},
+    .{"-gdwarf64"},
     .{"--no-dynamic-linker"},              .{"--debug-compile-errors"},    .{"--debug-incremental"},
     .{"--verbose-air"},                    .{"--verbose-llvm-ir"},         .{"--verbose-link"},
     .{"--verbose-llvm-cpu-features"},      .{"--time-report"},             .{"-fformatted-panics"},    .{"-fno-formatted-panics"},
@@ -1272,9 +1308,7 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-fno-entry", "zap does not build executables without an entry point yet ('-fno-entry')" },
     .{ "-fstrip", "zap does not strip debug info yet ('-fstrip'); remove '.strip = true'" },
     .{ "-fomit-frame-pointer", "zap always keeps frame pointers ('-fomit-frame-pointer'); remove '.omit_frame_pointer = true'" },
-    .{ "-fno-error-tracing", "zap always has error return traces ('-fno-error-tracing'); remove '.error_tracing = false'" },
     .{ "-fsanitize-thread", "zap has no ThreadSanitizer ('-fsanitize-thread'); build this step with upstream zig" },
-    .{ "-fno-valgrind", "zap always emits Valgrind client requests ('-fno-valgrind'); remove '.valgrind = false'" },
     .{ "-femit-asm", "zap does not emit assembly ('-femit-asm')" },
     .{ "-femit-implib", "zap does not emit import libraries ('-femit-implib')" },
     .{ "-femit-llvm-bc", "zap has no LLVM backend ('-femit-llvm-bc')" },
@@ -1319,6 +1353,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // the last one left.
     var fuzz: ?bool = null;
     var root_fuzz: ?bool = null;
+    // So are `-O`, `-ferror-tracing` and `-fvalgrind`.
+    var mode: Mode = .{};
+    var root_mode: Mode = .{};
     // C, as upstream's: `-I`, `-D` and the like collect in `cc_argv`, which
     // the next `-M` takes, with the C files given since the last one and
     // the module's C options; what is left after the last `-M` applies to
@@ -1422,6 +1459,18 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             fuzz = true;
         } else if (std.mem.eql(u8, arg, "-fno-fuzz")) {
             fuzz = false;
+        } else if (std.mem.eql(u8, arg, "-ferror-tracing") or std.mem.eql(u8, arg, "-fno-error-tracing")) {
+            mode.error_tracing = arg[2] == 'e';
+        } else if (std.mem.eql(u8, arg, "-fvalgrind") or std.mem.eql(u8, arg, "-fno-valgrind")) {
+            mode.valgrind = arg[2] == 'v';
+        } else if (std.mem.eql(u8, arg, "-O") or (std.mem.startsWith(u8, arg, "-O") and !std.mem.eql(u8, arg, "-ObjC"))) {
+            const v = if (arg.len == 2) nextArg(args, &i, arg) else arg[2..];
+            const o = std.lang.Optimize.fromString(v) orelse fatal("unrecognized optimization mode: '{s}'", .{v});
+            // zap compiles ReleaseSafe with its one code generation, with
+            // upstream's builtin and defaults for the mode; it removes no
+            // safety checks.
+            if (o == .fast or o == .small) setUnsupported(&opts, arena, "zap builds only Debug and ReleaseSafe ('{s}'); use -OReleaseSafe or build this step with upstream zig", .{arg});
+            mode.optimize = o;
         } else if (std.mem.eql(u8, arg, "-funwind-tables")) {
             opts.unwind_tables = .sync;
         } else if (std.mem.eql(u8, arg, "-fasync-unwind-tables")) {
@@ -1457,14 +1506,25 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
                 } else try rootless.append(arena, spec);
                 deps.clearRetainingCapacity();
                 fuzz = null;
+                mode = .{};
             } else if (root == null and !rootless_root) {
                 root = spec[eq.? + 1 ..];
                 opts.root_name = spec[0..eq.?];
                 opts.root_deps = try deps.toOwnedSlice(arena);
                 root_fuzz = fuzz;
+                root_mode = mode;
                 root_c_flags = c_flags;
-            } else try modules.append(arena, .{ .name = spec[0..eq.?], .path = spec[eq.? + 1 ..], .deps = try deps.toOwnedSlice(arena), .fuzz = fuzz });
+            } else try modules.append(arena, .{
+                .name = spec[0..eq.?],
+                .path = spec[eq.? + 1 ..],
+                .deps = try deps.toOwnedSlice(arena),
+                .fuzz = fuzz,
+                .optimize = mode.optimize,
+                .error_tracing = mode.error_tracing,
+                .valgrind = mode.valgrind,
+            });
             fuzz = null;
+            mode = .{};
             // The module's C files, arguments and options.
             const module_cc = try cc_argv.toOwnedSlice(arena);
             for (c_files.items[c_owned..]) |*f| {
@@ -1531,8 +1591,6 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             opts.data_sections = true;
         } else if (std.mem.startsWith(u8, arg, "-ofmt=")) {
             if (!std.mem.eql(u8, arg, "-ofmt=elf")) setUnsupported(&opts, arena, "zap emits ELF on Linux only ('{s}')", .{arg});
-        } else if (std.mem.startsWith(u8, arg, "-O")) {
-            setUnsupported(&opts, arena, "zap builds only Debug ('{s}'); drop the release mode (-Doptimize, --release) or build this step with upstream zig", .{arg});
         } else if (std.mem.startsWith(u8, arg, "-l") and glibc_libs.has(arg[2..])) {
             opts.link_libc = true;
         } else if (std.mem.startsWith(u8, arg, "-l") and libcpp_names.has(arg[2..])) {
@@ -1677,12 +1735,20 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
         for (modules.items) |*m| m.deps = try dropDeps(arena, m.deps, rootless.items);
     }
     opts.root_fuzz = root_fuzz orelse fuzz orelse false;
+    // As upstream's `Config.resolve` and `Module.create`: error tracing and
+    // Valgrind client requests are on in Debug and off in ReleaseSafe
+    // unless asked for.
+    // Those after the last `-M` belong to no module, unless the root file
+    // is given by position.
+    if (positional_root) root_mode = mode;
+    opts.optimize = root_mode.optimize orelse .debug;
+    opts.error_tracing = root_mode.error_tracing orelse (opts.optimize == .debug);
+    opts.valgrind = root_mode.valgrind orelse (opts.optimize == .debug);
     const seen = try arena.alloc(bool, modules.items.len);
     @memset(seen, false);
-    inheritFuzz(modules.items, seen, opts.root_deps, opts.root_fuzz);
-    for (modules.items) |*m| {
-        if (m.fuzz == null) m.fuzz = opts.root_fuzz; // no module depends on it
-    }
+    const root_flags: Inherited = .{ .fuzz = opts.root_fuzz, .optimize = opts.optimize, .error_tracing = opts.error_tracing, .valgrind = opts.valgrind };
+    inheritFlags(modules.items, seen, opts.root_deps, root_flags);
+    for (modules.items) |*m| inherit(m, root_flags); // no module depends on it
     opts.fuzz = opts.root_fuzz or for (modules.items) |m| {
         if (m.fuzz.?) break true;
     } else false;
@@ -1701,19 +1767,36 @@ fn dropDeps(arena: std.mem.Allocator, deps: []const []const u8, names: []const [
     return kept.items;
 }
 
-/// `-ffuzz` per module, as upstream's `Module.create`: a module without
-/// its own flag takes that of the module that first depends on it, depth
-/// first from the root module, whose `deps` and flag are given. `seen`
-/// has a slot per module.
-fn inheritFuzz(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []const u8, parent: bool) void {
+/// A module's `-O`, `-ferror-tracing` and `-fvalgrind`, as given.
+const Mode = struct {
+    optimize: ?std.lang.Optimize = null,
+    error_tracing: ?bool = null,
+    valgrind: ?bool = null,
+};
+
+/// The per-module flags a module passes to those that depend on it.
+const Inherited = struct { fuzz: bool, optimize: std.lang.Optimize, error_tracing: bool, valgrind: bool };
+
+fn inherit(m: *Frontend.ModuleArg, parent: Inherited) void {
+    m.fuzz = m.fuzz orelse parent.fuzz;
+    m.optimize = m.optimize orelse parent.optimize;
+    m.error_tracing = m.error_tracing orelse parent.error_tracing;
+    m.valgrind = m.valgrind orelse parent.valgrind;
+}
+
+/// Per-module flags (`-ffuzz`, `-O`, ...), as upstream's `Module.create`:
+/// a module without its own flag takes that of the module that first
+/// depends on it, depth first from the root module, whose `deps` and
+/// flags are given. `seen` has a slot per module.
+fn inheritFlags(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []const u8, parent: Inherited) void {
     for (deps) |spec| {
         const name = if (std.mem.indexOfScalar(u8, spec, '=')) |e| spec[e + 1 ..] else spec;
         for (modules, seen) |*m, *s| {
             if (!std.mem.eql(u8, m.name, name)) continue;
             if (s.*) break;
             s.* = true;
-            m.fuzz = m.fuzz orelse parent;
-            inheritFuzz(modules, seen, m.deps, m.fuzz.?);
+            inherit(m, parent);
+            inheritFlags(modules, seen, m.deps, .{ .fuzz = m.fuzz.?, .optimize = m.optimize.?, .error_tracing = m.error_tracing.?, .valgrind = m.valgrind.? });
             break;
         }
     }

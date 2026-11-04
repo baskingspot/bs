@@ -3,8 +3,11 @@ const greet = @import("greet");
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    std.debug.print("{s} {d}\n", .{ greet.word, args.len - 1 });
+    std.debug.print("{s} {d}{s}\n", .{ greet.word, args.len - 1, mode });
 }
+
+/// greet's mode, which greet inherits from this module, unless Debug.
+const mode = if (greet.mode == .debug) "" else " " ++ @tagName(greet.mode);
 
 fn add(a: u32, b: u32) u32 {
     return a + b;
