@@ -1186,7 +1186,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // (upstream's own linker cannot link those; LLD's output prints the
     // same), and GCC's, static and with -lc.
     {
-        const expect_tls = "main: 507 9 5 9 true\nset: 2121 31 21 31 true\nthread: 507 9 5 9 false\nafter: 2121 31 21 31 true\n";
+        const expect_tls = "main: 507 9 5 9 true\nset: 2121 31 21 31 true\nthread: 507 9 5 9 true\nafter: 2121 31 21 31 true\n";
         const tls_variants = [_]struct { name: []const u8, cc: []const []const u8, lc: bool }{
             .{ .name = "zig cc", .cc = &.{ zig, "cc" }, .lc = false },
             .{ .name = "cc -fPIC", .cc = &.{ cc orelse "", "-fPIC" }, .lc = false },

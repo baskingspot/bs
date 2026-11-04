@@ -2575,8 +2575,14 @@ object (`-fPIC`, `-dynamic`), *pie* code that ends up in an executable.
   __tls_get_addr@plt`, R_X86_64_TLSGD, the padded 16 bytes linkers
   relax), a call like local-dynamic's. Weak thread-local externs stay
   `[unsupported]`, and so do imports into zap's shared objects, which
-  would need a GOT pair with DTPMOD64/DTPOFF64 against the symbol;
-  executables have no imports.
+  would need a GOT pair with DTPMOD64/DTPOFF64 against the symbol.
+  In an executable with object, archive or C inputs (`Emit.has_inputs`,
+  built 2026-11-04), a name no export has binds to an input object's
+  definition, as a constant's address of extern data does: the code
+  relocates to `externAddrKey(name)` (local-exec), and the unit requests
+  the name's slot, which the link binds and aliases (archive pulls,
+  replay and relinks as for other externs). A definition that is not a
+  thread-local fails the link's TPOFF32 range check.
 - The sequence is a call: in pic mode `CodeGen.clobbers` returns true for
   `tls_ptr`, so the allocator keeps nothing in rsi, rdi, r8 or r9 across
   it, as for calls; rax, rcx, rdx, r10 and r11 are scratch already, and no

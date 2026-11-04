@@ -842,6 +842,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     const threads: usize = if (env.get("ZAP_THREADS")) |v| std.fmt.parseInt(usize, v, 10) catch 1 else std.Thread.getCpuCount() catch 1;
     // `ZAP_SCHED_FUZZ=<seed>`: perturb the workers' timing (`Emit.Pool.fuzz`).
     const fuzz: ?u64 = if (env.get("ZAP_SCHED_FUZZ")) |v| std.fmt.parseInt(u64, v, 10) catch 1 else null;
+    emit.has_inputs = !emit.obj and !emit.shared and (opts.link_inputs.len != 0 or c_batch != null);
     try emit.startPool(@max(threads, 1) - 1, fuzz);
     const sema_node = prog.start("Analyze and Generate Code", 0);
     if (inc_opt) |i| try i.beginReplay(&fe, &zcu, &emit, replay_mode);

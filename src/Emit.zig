@@ -106,6 +106,10 @@ inputs: ?*ElfInput = null,
 /// `needs_inputs` and the build goes eager (`Incremental.finishLazy`).
 inputs_deferred: bool = false,
 needs_inputs: bool = false,
+/// An executable with object, archive or C inputs, eager or lazy, set
+/// before the workers start: an `extern threadlocal` may name one of the
+/// inputs' (`tlsTarget`).
+has_inputs: bool = false,
 /// C sources compiling while the build analyzes (CSource.zig): the first
 /// `sync` waits for them and adds their objects to `inputs`, before it
 /// pulls archive members and compiler_rt for them.
@@ -509,6 +513,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
         w.shared = emit.shared;
         w.glibc = emit.glibc;
         w.shared_libs = emit.shared_libs;
+        w.has_inputs = emit.has_inputs;
     }
     const pool = try gpa.create(Pool);
     pool.* = .{ .io = io, .workers = workers, .fuzz = fuzz };
@@ -1449,11 +1454,18 @@ pub const TlsTarget = struct {
 };
 
 /// The thread-local an `extern threadlocal` names: the compilation's
-/// export of that name, or in an object an import, which the final link
-/// resolves. zap's executables and shared objects import no thread-locals.
+/// export of that name; in an object an import, which the final link
+/// resolves; in an executable with link inputs, the definition the link
+/// binds `name`'s slot to (an input object's), through `externAddrKey`,
+/// as a constant's address of extern data. zap's executables and shared
+/// objects import no thread-locals.
 pub fn tlsTarget(emit: *Emit, name: []const u8) !TlsTarget {
     if (try emit.userExport(name)) |key| return .{ .key = key, .local = true };
     if (emit.obj and !emit.shared) return .{ .key = try emit.useImport(name, .{ .tls = true }), .local = false };
+    if (emit.has_inputs) {
+        _ = try emit.useExtern(name, false);
+        return .{ .key = externAddrKey(name), .local = true };
+    }
     if (emit.shared)
         try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap does not import thread-local symbols into shared objects yet: {s}", .{name})
     else
