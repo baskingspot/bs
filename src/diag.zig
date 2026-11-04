@@ -1533,6 +1533,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "division by zero here causes illegal behavior", .@"division-by-zero" },
     .{ "evaluation exceeded {d} backwards branches", .@"eval-limit" },
     .{ "inline call depth exceeded", .@"eval-limit" },
+    .{ "inline call is recursive", .@"eval-limit" },
     .{ "error set of type '{f}' is ignored", .@"ignored-value" },
     .{ "error union of type '{f}' is ignored", .@"ignored-value" },
     .{ "error set is discarded", .@"ignored-value" },

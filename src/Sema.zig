@@ -386,6 +386,8 @@ pub const Block = struct {
                 /// A runtime call of an inline function: returns break to this
         /// block. Null for comptime calls.
         merges: ?*Merges = null,
+        /// The runtime inline call this one is in, if any.
+        parent: ?*const Inlining = null,
     };
 
     pub const Param = struct {
