@@ -25,6 +25,7 @@ const Ref = Ir.Inst.Ref;
 const Type = @import("Type.zig");
 const Zcu = @import("Zcu.zig");
 const print = @import("Ir/print.zig");
+const vector = @import("codegen/vector.zig");
 
 const Sema = @This();
 
@@ -9957,6 +9958,7 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
         // which it never is, so `/` on vectors of signed integers is not an
         // error there: it divides by truncation (zigimg's jpeg decoder).
         const signed_div = tag == .div and Type.class(ip, elem_ty) == .int and Type.intInfo(ip, elem_ty).signedness == .signed;
+        if (try sema.vectorArith(block, tag, ty, lhs, rhs)) |r| return r;
         return sema.vectorMap(block, src, len, ty, &.{ lhs, rhs }, VectorArith{ .tag = if (signed_div) .div_trunc else tag, .elem_ty = elem_ty });
     }
     const is_bool = ty == .bool_type;
@@ -10538,6 +10540,7 @@ fn analyzeBoolNot(sema: *Sema, block: *Block, src: Src, uncasted: Ref) CompileEr
     const ty = sema.typeOf(uncasted);
     if (sema.vectorLen(ty) != null and Type.childType(sema.ip, ty) != .bool_type)
         return sema.fail(block, src.operandSrc(0), "boolean not operation on type '{f}'", .{sema.fmtType(ty)});
+    if (try sema.vectorNot(block, uncasted)) |r| return r;
     if (try sema.vectorUnary(block, src, uncasted, analyzeBoolNot)) |r| return r;
     const operand = try sema.coerce(block, .bool_type, uncasted, src.operandSrc(0));
     if (sema.resolveValue(operand)) |v| {
@@ -10552,6 +10555,7 @@ fn analyzeBitNot(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileErro
     const scalar_ty = if (sema.vectorLen(operand_ty) != null) Type.childType(sema.ip, operand_ty) else operand_ty;
     if (scalar_ty != .bool_type and Type.class(sema.ip, scalar_ty) != .int)
         return sema.fail(block, src.operandSrc(0), "bitwise not operation on type '{f}'", .{sema.fmtType(operand_ty)});
+    if (try sema.vectorNot(block, operand)) |r| return r;
     if (try sema.vectorUnary(block, src, operand, analyzeBitNot)) |r| return r;
     const ty = sema.typeOf(operand);
     if (ty == .bool_type) return sema.analyzeBoolNot(block, src, operand);
@@ -11467,6 +11471,10 @@ fn analyzeCmp(sema: *Sema, block: *Block, src: Src, op: std.math.CompareOperator
         const len = sema.vectorLen(ty).?;
         const l = try sema.vectorOperand(block, src, ty, lhs);
         const r = try sema.vectorOperand(block, src, ty, rhs);
+        if (try sema.vectorNative(block, .{ .cmp = op }, ty, &.{ l, r })) {
+            const payload = try sema.addExtra(Ir.VectorCmp{ .lhs = l, .rhs = r, .op = @backingInt(op) });
+            return sema.addInst(block, .{ .tag = .cmp_vector, .data = .{ .ty_pl = .{ .ty = try sema.vectorType(len, .bool_type), .payload = payload } } });
+        }
         if ((op == .eq or op == .neq) and !block.is_comptime and sema.bc == null)
             if (try sema.cmpBytes(block, src, op == .eq, ty, len, l, r)) |res| return res;
         return sema.vectorMap(block, src, len, try sema.vectorType(len, .bool_type), &.{ l, r }, VectorCmp{ .op = op, .elem_ty = Type.childType(ip, ty) });
@@ -20827,11 +20835,74 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref, 
 // ---------------------------------------------------------------------------
 // Vectors
 //
-// Vector operations are scalarized here: each element is extracted (folded
+// Vector operations that the target's backend lowers natively
+// (`codegen/vector.zig`) are emitted on whole vectors, one IR instruction
+// each. The others are scalarized here: each element is extracted (folded
 // when comptime-known, else `array_elem_val`), the scalar operation is
 // analyzed with its usual checks, and the results are reassembled with
-// `aggregate_init`. A scalarized lowering is what Debug needs; CodeGen sees
-// vectors only as values in memory.
+// `aggregate_init`.
+
+/// The architecture `codegen/vector.zig` answers for: zap's one Sema
+/// target so far.
+const vector_arch: std.Target.Cpu.Arch = .x86_64;
+
+/// Whether `op` on `operands`, of vector type `ty`, is emitted as one
+/// instruction on whole vectors: the backend lowers it natively, it runs
+/// at runtime (not in a comptime block, nor in a body lowered for the
+/// comptime evaluator, which runs scalar IR), at least one operand is
+/// runtime-known, every operand has type `ty`, and none has undefined
+/// elements, which the scalarized operations fold.
+fn vectorNative(sema: *Sema, block: *Block, op: vector.Op, ty: Index, operands: []const Ref) CompileError!bool {
+    if (block.is_comptime or sema.bc != null) return false;
+    if (!vector.native(vector_arch, sema.ip, op, ty)) return false;
+    var runtime = false;
+    for (operands) |o| {
+        if (sema.typeOf(o) != ty) return false;
+        if (try sema.hasUndefElem(o)) return false;
+        if (sema.resolveValue(o) == null) runtime = true;
+    }
+    return runtime;
+}
+
+/// Whether vector or scalar `ref` is comptime-known with an undefined
+/// element.
+fn hasUndefElem(sema: *Sema, ref: Ref) CompileError!bool {
+    const v = sema.resolveValue(ref) orelse return false;
+    if (sema.isUndef(v)) return true;
+    const len = sema.vectorLen(sema.typeOf(ref)) orelse return false;
+    for (0..len) |i| if (sema.isUndef(try sema.elemValue(v, @intCast(i)))) return true;
+    return false;
+}
+
+/// Binary operation `tag` on vectors `lhs` and `rhs` of type `ty` as one
+/// instruction (`vectorNative`), or null.
+fn vectorArith(sema: *Sema, block: *Block, tag: Zir.Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) CompileError!?Ref {
+    const float = Type.class(sema.ip, Type.childType(sema.ip, ty)) == .float;
+    const op: vector.Op, const ir_tag: Ir.Inst.Tag = switch (tag) {
+        .bit_and => .{ .bit_and, .bit_and },
+        .bit_or => .{ .bit_or, .bit_or },
+        .xor => .{ .xor, .xor },
+        .addwrap => .{ .add_wrap, .add_wrap },
+        .add_unsafe => if (float) .{ .add_float, .add_float } else .{ .add_wrap, .add_wrap },
+        .subwrap => .{ .sub_wrap, .sub_wrap },
+        .mulwrap => .{ .mul_wrap, .mul_wrap },
+        .add => if (float) .{ .add_float, .add_float } else return null,
+        .sub => if (float) .{ .sub_float, .sub_float } else return null,
+        .mul => if (float) .{ .mul_float, .mul_float } else return null,
+        .div => if (float) .{ .div_float, .div_float } else return null,
+        else => return null,
+    };
+    if (!try sema.vectorNative(block, op, ty, &.{ lhs, rhs })) return null;
+    return try sema.addBinOp(block, ir_tag, lhs, rhs);
+}
+
+/// `~operand` or `!operand` on a vector as one instruction
+/// (`vectorNative`), or null.
+fn vectorNot(sema: *Sema, block: *Block, operand: Ref) CompileError!?Ref {
+    const ty = sema.typeOf(operand);
+    if (sema.vectorLen(ty) == null or !try sema.vectorNative(block, .not, ty, &.{operand})) return null;
+    return try sema.addTyOp(block, .not, ty, operand);
+}
 
 fn vectorType(sema: *Sema, len: u32, child: Index) !Index {
     return sema.intern(.{ .vector_type = .{ .len = len, .child = child } });
@@ -21146,6 +21217,20 @@ fn zirReduce(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
         unreachable;
     if (is_float and (tag == .bit_and or tag == .bit_or or tag == .xor))
         return sema.fail(block, src, "@reduce operation '{s}' requires integer or boolean operand; found '{f}'", .{ op, sema.fmtType(ty) });
+    const red_op: Ir.ReduceOp = switch (tag) {
+        .bit_and => .@"and",
+        .bit_or => .@"or",
+        .xor => .xor,
+        .min => .min,
+        .max => .max,
+        .add, .addwrap => .add,
+        .mul, .mulwrap => .mul,
+        else => unreachable,
+    };
+    if (try sema.vectorNative(block, .{ .reduce = red_op }, ty, &.{operand})) {
+        const payload = try sema.addExtra(Ir.Reduce{ .operand = operand, .op = @backingInt(red_op) });
+        return sema.addInst(block, .{ .tag = .reduce, .data = .{ .ty_pl = .{ .ty = elem_ty, .payload = payload } } });
+    }
     if (len >= vector_loop_min_len and !block.is_comptime and sema.vectorLoopable(&.{operand}))
         return sema.reduceLoop(block, src, tag, operand, len);
     // A left fold, in element order.
@@ -21206,6 +21291,15 @@ fn zirSelect(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstData) C
     const vec_ty = try sema.vectorType(len, elem_ty);
     const a = try sema.coerce(block, vec_ty, sema.resolveInst(extra.a), src);
     const b = try sema.coerce(block, vec_ty, sema.resolveInst(extra.b), src);
+    // As `vectorNative`; a runtime predicate selects between comptime-known
+    // vectors too.
+    const runtime = sema.resolveValue(pred) == null or sema.resolveValue(a) == null or sema.resolveValue(b) == null;
+    if (runtime and !block.is_comptime and sema.bc == null and vector.native(vector_arch, ip, .select, vec_ty) and
+        !try sema.hasUndefElem(pred) and !try sema.hasUndefElem(a) and !try sema.hasUndefElem(b))
+    {
+        const payload = try sema.addExtra(Ir.Select{ .pred = pred, .a = a, .b = b });
+        return sema.addInst(block, .{ .tag = .select, .data = .{ .ty_pl = .{ .ty = vec_ty, .payload = payload } } });
+    }
     const Op = struct {
         elem_ty: Index,
         fn call(op: @This(), s: *Sema, blk: *Block, sr: Src, e: []const Ref) CompileError!Ref {
@@ -21248,6 +21342,14 @@ fn zirShuffle(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     }.f;
     const a, const a_len = try operand(sema, block, src, elem_ty, extra.a);
     const b, const b_len = try operand(sema, block, src, elem_ty, extra.b);
+    const res_ty = try sema.vectorType(mask_len, elem_ty);
+    // On whole vectors (`vectorNative`) when the operands are vectors the
+    // backend handles as the result; an undefined `b` is one of `a`'s type.
+    const native = !block.is_comptime and sema.bc == null and a_len != 0 and
+        (sema.resolveValue(a) == null or (b_len != 0 and sema.resolveValue(b) == null)) and
+        vector.native(vector_arch, ip, .shuffle, res_ty) and vector.native(vector_arch, ip, .shuffle, sema.typeOf(a)) and
+        (b_len == 0 or vector.native(vector_arch, ip, .shuffle, sema.typeOf(b))) and
+        !try sema.hasUndefElem(a) and (b_len == 0 or !try sema.hasUndefElem(b));
     const elems = try sema.arena.alloc(Ref, mask_len);
     for (elems, 0..) |*e, i| {
         const m = try sema.elemValue(mask_val, i);
@@ -21267,9 +21369,15 @@ fn zirShuffle(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
                 try sema.zcu.addNote(sema.file, sema.callArgSrc(src, false, 2).span(tree), "use '~@as(u32, {d})' to index into second vector given here", .{idx});
             return err;
         }
-        e.* = try sema.vectorElem(block, if (from_a) a else b, idx);
+        if (!native) e.* = try sema.vectorElem(block, if (from_a) a else b, idx);
     }
-    return sema.aggregate(block, src, try sema.vectorType(mask_len, elem_ty), elems);
+    if (native) {
+        const mask = try sema.coerce(block, try sema.vectorType(mask_len, .i32_type), .fromInterned(mask_val), src);
+        const b_op = if (b_len != 0) b else Ref.fromInterned(try sema.undefValue(sema.typeOf(a)));
+        const payload = try sema.addExtra(Ir.Shuffle{ .a = a, .b = b_op, .mask = mask.toInterned().? });
+        return sema.addInst(block, .{ .tag = .shuffle, .data = .{ .ty_pl = .{ .ty = res_ty, .payload = payload } } });
+    }
+    return sema.aggregate(block, src, res_ty, elems);
 }
 
 // ---------------------------------------------------------------------------

@@ -814,15 +814,11 @@ comptime arguments are run-time values in the lowered code (uucode's
   as 64-bit limbs, normalized like narrow integers (the bits above the width
   are sign or zero copies); CodeGen operates on them limb by limb, inline
   except for 128-bit division (`__udivti3` and friends).
-- Vectors are scalarized in Sema: an element-wise operation extracts each
-  element (`array_elem_val`, or folded when comptime-known), applies the
-  scalar operation with its usual safety checks, and rebuilds the vector
-  with `aggregate_init`. CodeGen sees vectors only as values in memory,
-  laid out as upstream's x86_64 backend lays them out without AVX: bool
-  vectors bit-packed (element i is bit i % 8 of byte i / 8), other vectors
-  like arrays, aligned to 16. No IR instruction is vector-specific, so a
-  backend that wants SIMD can recognize the pattern or add instructions
-  later without changing Sema's results.
+- Vector operations that the backend lowers in SIMD registers stay whole
+  vectors in the IR; Sema scalarizes the rest (see "Vectors" below). In
+  memory, vectors are laid out as upstream's x86_64 backend lays them
+  out without AVX: bool vectors bit-packed (element i is bit i % 8 of
+  byte i / 8), other vectors like arrays, aligned to 16.
 - Panics are calls, as upstream: `@panic` and each failed safety check
   call the matching function of `std.lang.panic` (`integerOverflow`,
   `outOfBounds(index, len)`, `call(msg, null)`, ...), then `unreach`.
@@ -1012,11 +1008,14 @@ architecture deciding the floating-point cases:
   `unwrap_errunion_*`, and `optional_payload` become free renames.
 - **memory**: everything else: larger structs, arrays, unions, f80,
   f128 (whose compiler_rt calls take it in xmm or q registers, loaded
-  from and stored to the slot by the C ABI module), vectors, and
-  integers over 128 bits. The SSA value is the address of a frame slot holding the value, which is written once by the instruction
+  from and stored to the slot by the C ABI module), vectors other than
+  those of up to 16 bytes of lanes (which are float class, in an XMM
+  register, see "Vectors") and bool vectors of up to 64 elements (which
+  are general, their bits), and integers over 128 bits. The SSA value is the address of a frame slot holding the value, which is written once by the instruction
   that defines it and read by its users; field reads are loads from that
-  address. Wide integers, f80/f128, and vectors keep today's limb-wise
-  and compiler_rt lowerings, operating on these addresses.
+  address. Wide integers and f80/f128 keep today's limb-wise and
+  compiler_rt lowerings, and longer vectors are processed 16 bytes at a
+  time, operating on these addresses.
 
 **Narrow integers.** A register holding an integer narrower than the
 register (u3, i7, u8, u16, and u32 on 64-bit registers) has unspecified
@@ -1244,6 +1243,89 @@ identity is in every cache key):
 Today's `.auto` passes every argument in memory and returns most values
 through memory; fib, which is almost only calls, runs 1.22× as long as
 upstream Debug's.
+
+#### Vectors (built 2026-11-04, x86_64 SSE2)
+
+Explicit `@Vector` code is lowered to SIMD registers, as upstream's Debug
+backend does, not scalarized. The split has three parts:
+
+- **Which operations** (`src/codegen/vector.zig`, target-neutral):
+  `native(arch, ip, op, ty)` says whether the backend for `arch` lowers
+  `op` on vectors of type `ty` in SIMD registers. Lanes are integers of
+  8, 16, 32 or 64 bits, f32 and f64; bool vectors are bits. Sema asks it
+  before emitting an operation on whole vectors (`vectorNative`: runtime
+  code only, not comptime blocks or bodies for the comptime evaluator, at
+  least one runtime operand, no undefined elements, which the scalar
+  path folds). Everything it answers false for is scalarized as before:
+  each element is extracted (`array_elem_val`, or folded when
+  comptime-known), the scalar operation is analyzed with its usual
+  safety checks, and the results are reassembled with `aggregate_init`.
+  So an answer may change only together with the backend. Sema's
+  architecture is a constant (`Sema.vector_arch`, x86_64) until Sema
+  gets target plumbing; aarch64 answers false until NEON lowering lands.
+- **The IR**: the existing element-wise tags (`add_wrap`, `sub_wrap`,
+  `mul_wrap`, `bit_and`, `bit_or`, `xor`, `not`, `add_float` ...
+  `div_float`) carry vector operands, and four tags are vector-only:
+  `cmp_vector` (a bool vector), `reduce`, `select`, and `shuffle` (whose
+  mask is a comptime `@Vector(n, i32)`, negative lanes taken from `b`).
+  Loads, stores, bitcasts and `aggregate_init` (a splat) are the usual
+  tags on vector types.
+- **x86_64 lowering** (`src/codegen/x86_64/vector.zig`, called from
+  CodeGen's `genInst` and `planDeferred`): a vector of up to 16 bytes of
+  lanes is float class, so it lives in an XMM register like an f64
+  (spilled to a 16-byte slot) and is passed in one in `.auto` calls
+  (`autoClass`); longer ones, up to 128 bytes, live in memory and each
+  operation processes them 16 bytes at a time in xmm0–xmm5. A bool
+  vector of up to 64 elements is its bits in a general register (in
+  memory the bit-packed layout is the same bits). A load whose only user
+  is a vector operation, or a bitcast of one, is read in place by that
+  operation (`Home.deferred`, `Home.view`), so
+  `@as(@Vector(64, u8), @splat(0)) != p[0..64].*` is four
+  `movdqu`/`pcmpeqb`/`pmovmskb` triples and no copies. The lowerings
+  use only rax, rcx, rdx, r10, r11 and xmm0–xmm5, so none is a clobber
+  point: a vector variable stays in xmm8–xmm15 across them, as a loop's
+  accumulator does.
+
+What the x86_64 backend lowers natively, at baseline SSE2 (zap accepts
+only `-mcpu=baseline` today): wrapping add and subtract and bitwise ops on
+integer lanes, multiply on 16- and 32-bit lanes (`pmullw`; `pmuludq`
+twice), float add, subtract, multiply and divide, compares to bool
+vectors (unsigned through sign-flipped `pcmpgt`; floats with `cmpps`;
+64-bit lanes only `==`/`!=`, which SSE2 lacks the ordering compare for),
+`@select` (the predicate's bits spread to a lane mask), `@shuffle`
+(`pshufd` when one operand's 32- or 64-bit lanes are permuted, else lane
+by lane through memory), `@reduce` with `and`, `or`, `xor` and `+` on
+integer lanes, `@splat`, and bitwise ops and `and`/`or`/`xor` reductions
+on bool vectors. Upstream's Debug backend scalarizes compares, selects and
+shuffles; doing them here keeps results bit for bit (the same lanes,
+padding never observable). Still scalarized: shifts, overflow and
+saturating arithmetic, division and remainder of integers, `@min`/`@max`,
+float reductions (a left fold, in element order, as upstream), integer
+`min`/`max`/`*` reductions, other lane widths, and anything longer than
+128 bytes or 64 bools. With SSE4.1 (`-mcpu` features, once zap accepts
+them) `pmulld`, `pminsd`/`pmaxsd`, `pcmpeqq` and `pblendvb` would replace
+the SSE2 sequences; AVX changes the vector ABI and is a separate decision.
+
+NEON maps onto the same interface: 128-bit `v` registers for vectors of
+up to 16 bytes, and the same chunking for longer ones. Its compares
+produce lane masks too, gathered to bits with a `ushr`/`addv` sequence
+(no `movemask`), and it orders 64-bit lanes natively (`cmgt`, `cmhi`),
+so its `native` answers may be broader than x86_64's.
+
+Measured (orb, 4 vCPU, ReleaseFast zap against main 13942f5,
+2026-11-04): the fuzzer's `PcBitsetIterator.next` takes 72 instructions
+per call on its 64-byte path, against 258 (79 of them stack accesses);
+the compare itself is 23. A loop of 25.6 M calls runs 3.3 ns per call
+against 12.5 (upstream Debug: 197). `zap build test --fuzz=3M --seed=1`
+of a `key=` parser test runs 6.3 s against 10.7 s (upstream LLVM, its
+build cached: 6.4 s). `mem.indexOfScalar` and `mem.eql` over 4 KiB run
+3.5x faster (0.05 s against 0.17 s; upstream Debug 0.35 s), and an
+f32x4 multiply-add loop with a u32x4 accumulator 35x (0.08 s against
+2.8 s; upstream Debug 0.19 s, ReleaseSafe 0.035 s). Of the behavior
+files, only x86_64.zig runs long enough to measure: 182 ms against
+198 ms. Compile time does not change (cache off, medians of 5: std's
+tests 5.12 s against 5.17 s, x86_64.zig 8.63 s against 8.77 s,
+vector.zig 0.17 s both).
 
 #### What is per architecture
 
@@ -5733,8 +5815,10 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   elements (multiples of 8) as u64 words (`cmpBytes`: xor, a carry-free
   "byte is nonzero" test, and a multiply that gathers the eight top bits),
   in every build: std's `mem.eql`, `indexOfScalar` and `countScalar` use
-  the same compare. SSE2 (`pcmpeqb`/`pmovmskb`) would be ten times
-  shorter again but needs vector registers in the backend.
+  the same compare. Since the backend lowers vectors in XMM registers
+  ("Vectors" above), runtime compares go there instead (`pcmpeqb`/
+  `pmovmskb`, four of each for 64 bytes); `cmpBytes` remains for
+  targets whose backend does not (aarch64, until NEON lowering).
 
 **Measured** (orb, 4 vCPU, ReleaseFast zap, 2026-11-04):
 

@@ -158,6 +158,32 @@ pub const Inst = struct {
         cmp_gt,
         cmp_neq,
 
+        // Vectors. Where `codegen/vector.zig` says the target's backend
+        // lowers an operation natively, Sema emits it on whole vectors:
+        // `add_wrap`, `sub_wrap`, `mul_wrap`, `bit_and`, `bit_or`, `xor`,
+        // `not`, and the float arithmetic element by element on operands of
+        // one vector type, `load`, `store`, and `bitcast` on the whole
+        // value, and the instructions below. Other vector operations are
+        // scalarized by Sema.
+
+        /// `ty_pl` with `VectorCmp`: compares two vectors element by
+        /// element; the result, of bool vector type `ty`, has element `i`
+        /// set if `lhs[i] op rhs[i]` (with float NaNs as for `cmp_*`).
+        cmp_vector,
+        /// `ty_pl` with `Reduce`: the vector's elements folded with `op`,
+        /// of element type `ty`, left to right in element order (which
+        /// float `add` and `mul` observe; float `min` and `max` are
+        /// `min_float` and `max_float`).
+        reduce,
+        /// `ty_pl` with `Select`: the vector of type `ty` whose element `i`
+        /// is `a[i]` where bool vector `pred` has element `i` set, else
+        /// `b[i]`.
+        select,
+        /// `ty_pl` with `Shuffle`: the vector of type `ty` whose element
+        /// `i` is `a[m]` for a mask element `m >= 0`, `b[~m]` for `m < 0`,
+        /// and undefined for an undefined mask element.
+        shuffle,
+
         /// `ty_op`: integer conversion that preserves the value (checked by
         /// Sema when it might not).
         intcast,
@@ -466,6 +492,43 @@ pub const Bin = struct {
     rhs: Inst.Ref,
 };
 
+pub const VectorCmp = struct {
+    lhs: Inst.Ref,
+    rhs: Inst.Ref,
+    /// A `std.math.CompareOperator`.
+    op: u32,
+
+    pub fn operator(x: VectorCmp) std.math.CompareOperator {
+        return @fromBackingInt(@intCast(x.op));
+    }
+};
+
+pub const ReduceOp = enum(u32) { @"and", @"or", xor, min, max, add, mul };
+
+pub const Reduce = struct {
+    operand: Inst.Ref,
+    /// A `ReduceOp`.
+    op: u32,
+
+    pub fn operation(x: Reduce) ReduceOp {
+        return @fromBackingInt(x.op);
+    }
+};
+
+pub const Select = struct {
+    pred: Inst.Ref,
+    a: Inst.Ref,
+    b: Inst.Ref,
+};
+
+pub const Shuffle = struct {
+    a: Inst.Ref,
+    /// May be an undefined value when the mask only selects from `a`.
+    b: Inst.Ref,
+    /// The mask: a comptime-known `@Vector(n, i32)`.
+    mask: InternPool.Index,
+};
+
 pub const AtomicRmw = struct {
     ptr: Inst.Ref,
     operand: Inst.Ref,
@@ -603,6 +666,10 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .tls_ptr,
         .atomic_rmw,
         .cmpxchg,
+        .cmp_vector,
+        .reduce,
+        .select,
+        .shuffle,
         => data.ty_pl.ty,
         .store, .atomic_store, .set_union_tag, .set_err_return_trace, .memcpy, .memmove, .memset, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .vector_store_elem, .breakpoint, .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect => .void_type,
         .comptime_exit => .noreturn_type,

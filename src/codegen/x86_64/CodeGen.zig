@@ -42,6 +42,7 @@ const Atom = @import("../../link/Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
 const Ssa = @import("../Ssa.zig");
+const vector = @import("vector.zig");
 const Reg = Encoder.Reg;
 const Mem = Encoder.Mem;
 const Size = Encoder.Size;
@@ -184,6 +185,10 @@ const Home = union(enum) {
     /// Nothing reads the value and computing it has no effect: it is not
     /// emitted (pass 2).
     dead,
+    /// A bitcast to a vector of a deferred load, read in place by its only
+    /// user, a vector operation (`vector.deferOperands`): the value is the
+    /// load's memory.
+    view,
 };
 
 const Regs = struct { lo: Reg, hi: Reg };
@@ -457,7 +462,7 @@ fn fail(cg: *CodeGen, comptime fmt: []const u8, args: anytype) Error {
 // ---------------------------------------------------------------------------
 // Frame and homes
 
-fn allocSlot(cg: *CodeGen, size: u64, alignment: u64) Error!i32 {
+pub fn allocSlot(cg: *CodeGen, size: u64, alignment: u64) Error!i32 {
     if (alignment > 16) return cg.fail("stack values aligned to more than 16 bytes", .{});
     cg.slots_size = std.mem.alignForward(u32, cg.slots_size + @as(u32, @intCast(size)), @intCast(@max(alignment, 1)));
     return -@as(i32, @intCast(cg.slots_size));
@@ -495,7 +500,7 @@ fn slotFor(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!Home {
 /// The memory of a result slot, or of the store that is the value's only
 /// user (`in_place`), with r10 as the base if its pointer is not in a
 /// register.
-fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
+pub fn resultMem(cg: *CodeGen, inst: Inst.Index, ty: Index) Error!?Mem {
     if (cg.in_place.count() != 0) if (cg.in_place.get(@backingInt(inst))) |ptr| return try cg.ptrMem(ptr);
     return switch (try cg.slotFor(inst, ty)) {
         .slot => |off| Mem.at(.rbp, off),
@@ -523,6 +528,7 @@ fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
         16, 32, 64 => .sse,
         else => .memory,
     };
+    if (vector.inXmm(ip, ty)) return .sse;
     // Runtime IR has no comptime-only types, so size 0 means no bits.
     const size = Type.abiSize(ip, ty);
     return if (size == 0) .none else if (size <= 8) .gpr else if (size <= 16) .gpr_pair else .memory;
@@ -719,14 +725,14 @@ fn setupParams(cg: *CodeGen) Error!void {
                 try cg.e.mov(.qword, .{ .reg = p.lo }, .{ .mem = m });
                 try cg.e.mov(.qword, .{ .reg = p.hi }, .{ .mem = offsetMem(m, 8) });
             },
-            .xmm => |x| try cg.e.movs(cg.sseType(ty).?, .{ .reg = x }, .{ .mem = Mem.at(.rbp, 16 + @as(i32, @intCast(off))) }),
+            .xmm => |x| try cg.loadXmm(x, memVal(ty, Mem.at(.rbp, 16 + @as(i32, @intCast(off))))),
             else => {},
         },
         else => {},
     };
 }
 
-fn sizeOf(bytes: u64) Size {
+pub fn sizeOf(bytes: u64) Size {
     return switch (bytes) {
         1 => .byte,
         2 => .word,
@@ -739,18 +745,18 @@ fn sizeOf(bytes: u64) Size {
 // ---------------------------------------------------------------------------
 // Operands
 
-fn typeOf(cg: *CodeGen, ref: Ref) Index {
+pub fn typeOf(cg: *CodeGen, ref: Ref) Index {
     return cg.ir.typeOf(ref, cg.ip);
 }
 
-fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
+pub fn locOf(cg: *CodeGen, ref: Ref) Error!Loc {
     if (ref.toIndex()) |inst| return switch (cg.homes[@backingInt(inst)]) {
         .none => .none,
         .reg => |r| .{ .reg = r },
         .regs => |p| .{ .mem = try cg.spillPair(inst, p) },
         .xmm => |x| .{ .mem = try cg.spillXmm(inst, x) },
         .deferred => .{ .mem = try cg.deferredMem(cg.ir.instructions.items(.data)[@backingInt(inst)].ty_op.operand) },
-        .fused, .pair => unreachable, // read only by their users
+        .fused, .pair, .view => unreachable, // read only by their users
         .dead => unreachable,
         .slot => |off| .{ .mem = Mem.at(.rbp, off) },
         .frame_addr => |off| .{ .addr = Mem.at(.rbp, off) },
@@ -808,7 +814,7 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
 }
 
 /// The 64-bit extended bits of an integer value.
-fn intBits(ip: *const InternPool, val: Index) u64 {
+pub fn intBits(ip: *const InternPool, val: Index) u64 {
     if (ip.intValue(u64, val)) |v| return v;
     if (ip.intValue(i64, val)) |v| return @bitCast(v);
     unreachable; // wider than 64 bits; rejected before codegen
@@ -823,7 +829,7 @@ fn signed(cg: *CodeGen, ty: Index) bool {
 
 /// Loads a value of at most 8 bytes into `reg`, zero- or sign-extended to 64
 /// bits by its type.
-fn load(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
+pub fn load(cg: *CodeGen, reg: Reg, ref: Ref) Error!void {
     const ty = cg.typeOf(ref);
     if (cg.xmmOf(ref)) |x| return cg.e.movFromXmm(sizeOf(Type.abiSize(cg.ip, ty)), .{ .reg = reg }, x);
     switch (try cg.locOf(ref)) {
@@ -863,7 +869,7 @@ fn storeReg(cg: *CodeGen, m: Mem, reg: Reg, size: u64) Error!void {
     }
 }
 
-fn offsetMem(m: Mem, off: u64) Mem {
+pub fn offsetMem(m: Mem, off: u64) Mem {
     var r = m;
     r.disp += @intCast(off);
     return r;
@@ -945,7 +951,7 @@ fn fillMem(cg: *CodeGen, dst: Mem, size: u64, byte: u8) Error!void {
 
 /// The memory holding value `ref`, materializing a register-only constant
 /// into a scratch slot if needed.
-fn memOf(cg: *CodeGen, ref: Ref) Error!Mem {
+pub fn memOf(cg: *CodeGen, ref: Ref) Error!Mem {
     switch (try cg.locOf(ref)) {
         .mem => |m| return m,
         else => {
@@ -973,9 +979,10 @@ fn spillPair(cg: *CodeGen, inst: Inst.Index, p: Regs) Error!Mem {
 /// reads it from memory, as `spillPair` does.
 fn spillXmm(cg: *CodeGen, inst: Inst.Index, x: Encoder.Xmm) Error!Mem {
     const gop = try cg.pair_spills.getOrPut(cg.gpa, @backingInt(inst));
-    if (!gop.found_existing) gop.value_ptr.* = try cg.allocSlot(8, 8);
+    const size = Type.abiSize(cg.ip, cg.ir.typeOfIndex(inst, cg.ip));
+    if (!gop.found_existing) gop.value_ptr.* = try cg.allocSlot(@max(size, 8), @max(size, 8));
     const m = Mem.at(.rbp, gop.value_ptr.*);
-    try cg.storeXmm(m, x, Type.abiSize(cg.ip, cg.ir.typeOfIndex(inst, cg.ip)));
+    try cg.storeXmm(m, x, size);
     return m;
 }
 
@@ -993,7 +1000,7 @@ fn deferredMem(cg: *CodeGen, ptr: Ref) Error!Mem {
 }
 
 /// The register holding `ref` if it is a value in one (`Home.xmm`).
-fn xmmOf(cg: *CodeGen, ref: Ref) ?Encoder.Xmm {
+pub fn xmmOf(cg: *CodeGen, ref: Ref) ?Encoder.Xmm {
     const inst = ref.toIndex() orelse return null;
     return switch (cg.homes[@backingInt(inst)]) {
         .xmm => |x| x,
@@ -1161,9 +1168,10 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         // Local- and general-dynamic TLS call `__tls_get_addr`.
         .tls_ptr, .extern_tls => cg.emit.pic == .pic,
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => !cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)),
-        .store => !cg.passInRegs(cg.typeOf(data.bin_op.rhs)),
+        // A value in an XMM register is stored with one instruction.
+        .store => !cg.passInRegs(cg.typeOf(data.bin_op.rhs)) and !cg.inFloat(cg.typeOf(data.bin_op.rhs)),
         .call, .atomic_rmw => true,
-        else => !want,
+        else => !want and !vector.lowers(cg, inst),
     };
 }
 
@@ -1423,7 +1431,7 @@ fn planDeferred(cg: *CodeGen) Error!void {
                     for (ir.refSlice(extra.end, extra.data.args_len)) |arg| cg.deferLoad(arg, values[0..k], f.live.items(.def)[@backingInt(u)]);
                 },
                 .store => try cg.storeInPlace(u, values[0..k]),
-                else => {},
+                else => vector.deferOperands(cg, u, values[0..k]),
             }
         }
         const b = f.blocks.items[@backingInt(block)];
@@ -1436,7 +1444,7 @@ fn planDeferred(cg: *CodeGen) Error!void {
 /// Defers load `arg` (`planDeferred`) if it is one of the last `before`
 /// values with only values that write no memory after it, and its only
 /// user is at position `at`.
-fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, at: u32) void {
+pub fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, at: u32) void {
     const ir = cg.ir;
     const f = cg.ssa;
     const tags = ir.instructions.items(.tag);
@@ -1469,6 +1477,9 @@ fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, at: u32) void {
     const ptr = datas[li].ty_op.operand;
     if (ptr.toIndex()) |p0| {
         var p = @backingInt(p0);
+        // A variable `Ssa.plan` may keep in a register (a 16-byte vector)
+        // has no memory to read.
+        if (tags[p] == .alloc and Ssa.wants(live.items(.reg)[p])) return;
         if (fwd[p] != Ssa.no_tie) p = fwd[p];
         if (share[p] != Ssa.no_tie or fate[p] != .normal) return;
         end[p] = @max(end[p], at);
@@ -1626,6 +1637,8 @@ pub fn inGpr(cg: *CodeGen, ty: Index) bool {
         // An error union of up to 8 bytes holds its bytes like a load: the
         // error code in the low 16 bits, the payload above.
         .error_set, .@"enum", .error_union => cg.passInRegs(ty),
+        // A bool vector of up to 64 elements is its bits (`vector.isBits`).
+        .vector => vector.isBits(ip, ty),
         else => false,
     };
 }
@@ -1675,10 +1688,14 @@ const RegClass = enum {
     }
 };
 
-/// Whether `ty`'s values live in an XMM register when they get one: f32
-/// and f64.
+/// Whether `ty`'s values live in an XMM register when they get one: f32,
+/// f64, and vectors of up to 16 bytes of lanes (`vector.inXmm`).
 pub fn inFloat(cg: *CodeGen, ty: Index) bool {
-    return Type.class(cg.ip, ty) == .float and cg.sseType(ty) != null;
+    return switch (Type.class(cg.ip, ty)) {
+        .float => cg.sseType(ty) != null,
+        .vector => vector.inXmm(cg.ip, ty),
+        else => false,
+    };
 }
 
 /// Whether value `inst` is computed by code that leaves it in a register
@@ -1688,6 +1705,12 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
     const ir = cg.ir;
     const data = ir.instructions.items(.data)[@backingInt(inst)];
     const tag = ir.instructions.items(.tag)[@backingInt(inst)];
+    // Vector operations compute vectors in XMM registers and bool vectors
+    // and reductions in GPRs.
+    if (vector.lowers(cg, inst)) {
+        const ty = ir.typeOfIndex(inst, cg.ip);
+        return if (cg.inFloat(ty)) .float else if (cg.inGpr(ty)) .gpr else .none;
+    }
     // f32 and f64 results of the lowerings that compute them in an XMM
     // register (`setXmm`) or a GPR (`setResult`), without calls.
     switch (tag) {
@@ -1695,7 +1718,14 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
         .float_cast => return if (cg.inFloat(data.ty_op.ty) and cg.inFloat(cg.typeOf(data.ty_op.operand))) .float else .none,
         .float_from_int => return if (cg.inFloat(data.ty_op.ty) and Type.intInfo(cg.ip, cg.typeOf(data.ty_op.operand)).bits <= 64) .float else .none,
         .load, .struct_field_val, .ptr_elem_val, .slice_elem_val, .arg, .call => if (cg.inFloat(ir.typeOfIndex(inst, cg.ip))) {
-            return if (tag == .arg and cg.fn_ty.cc != .auto) .none else .float;
+            if (tag == .arg and cg.fn_ty.cc != .auto) return .none;
+            // Vectors: loads, and `.auto` arguments and results.
+            if (Type.class(cg.ip, ir.typeOfIndex(inst, cg.ip)) == .vector) return switch (tag) {
+                .load, .arg => .float,
+                .call => if (cg.calleeCc(data) == .auto) .float else .none,
+                else => .none,
+            };
+            return .float;
         },
         else => {},
     }
@@ -1732,6 +1762,13 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
     return if (pair and cg.inPair(ty)) .pair else .none;
 }
 
+/// The calling convention of call `data`'s callee.
+fn calleeCc(cg: *CodeGen, data: Inst.Data) InternPool.CallingConvention {
+    const callee_fn_ty = cg.typeOf(data.pl_op.operand);
+    const callee_ty = if (Type.class(cg.ip, callee_fn_ty) == .pointer) Type.ptrInfo(cg.ip, callee_fn_ty).child else callee_fn_ty;
+    return cg.ip.keyPayload(.func_type, callee_ty).cc;
+}
+
 /// The operand whose register value `inst`'s lowering may write its result
 /// to: the first, which every lowering reads before it writes the result
 /// (it reads the others first, or they are in memory).
@@ -1750,7 +1787,7 @@ fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
 
 /// The register to compute value `inst` in: its home, or rax for a value
 /// kept in memory.
-fn destReg(cg: *CodeGen, inst: Inst.Index) Reg {
+pub fn destReg(cg: *CodeGen, inst: Inst.Index) Reg {
     return switch (cg.homes[@backingInt(inst)]) {
         .reg => |r| r,
         else => .rax,
@@ -1759,7 +1796,7 @@ fn destReg(cg: *CodeGen, inst: Inst.Index) Reg {
 
 /// Moves value `inst` of type `ty`, computed in `reg` and extended to 64
 /// bits, to its home.
-fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void {
+pub fn setResult(cg: *CodeGen, inst: Inst.Index, ty: Index, reg: Reg) Error!void {
     switch (cg.homes[@backingInt(inst)]) {
         .reg => |r| if (r != reg) try cg.e.mov(.qword, .{ .reg = r }, .{ .reg = reg }),
         .xmm => |x| try cg.e.movToXmm(sizeOf(Type.abiSize(cg.ip, ty)), x, .{ .reg = reg }),
@@ -2336,6 +2373,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             }
             if (cg.varReg(data.ty_op.operand)) |r| return cg.setResult(inst, ty, r);
             if (cg.varXmm(data.ty_op.operand)) |x| return cg.setXmm(inst, ty, x);
+            // A vector.
+            if (cg.xmmOf(inst.toRef())) |x| if (!cg.passInRegs(ty)) return cg.e.movups(.{ .reg = x }, .{ .mem = try cg.ptrMem(data.ty_op.operand) });
             if (cg.pairOf(data.ty_op.operand)) |_| {
                 // A variable in registers.
                 if (cg.pairOf(inst.toRef())) |d| return cg.loadRegs(d, data.ty_op.operand);
@@ -2379,6 +2418,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
 
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
             const ty = cg.typeOf(data.bin_op.lhs);
+            if (ip.keyTag(ty) == .vector_type) return vector.gen(cg, inst, tag, data);
             if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
             switch (tag) {
@@ -2397,11 +2437,17 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try cg.genWide(inst, tag, data)
         else
             try cg.overflowOp(inst, tag, data),
-        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float => try cg.genFloat(inst, tag, data),
+        .add_float, .sub_float, .mul_float, .div_float => if (ip.keyTag(cg.typeOf(data.bin_op.lhs)) == .vector_type)
+            try vector.gen(cg, inst, tag, data)
+        else
+            try cg.genFloat(inst, tag, data),
+        .cmp_vector, .reduce, .select, .shuffle => try vector.gen(cg, inst, tag, data),
+        .min_float, .max_float, .neg_float, .abs_float => try cg.genFloat(inst, tag, data),
         .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .floor, .ceil, .round, .trunc_float => try cg.genFloat(inst, tag, data),
         .mul_add, .float_cast, .float_from_int, .int_from_float => try cg.genFloat(inst, tag, data),
         .not => {
             const ty = data.ty_op.ty;
+            if (ip.keyTag(ty) == .vector_type) return vector.gen(cg, inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
             const d = cg.destReg(inst);
             try cg.load(d, data.ty_op.operand);
@@ -2533,6 +2579,8 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .intcast, .trunc, .bitcast, .ptr_from_int => {
             const ty = data.ty_op.ty;
+            if (cg.homes[@backingInt(inst)] == .view) return;
+            if (tag == .bitcast and vector.lowers(cg, inst)) return vector.gen(cg, inst, tag, data);
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(cg.typeOf(data.ty_op.operand))) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
             if (cg.passInRegs(ty) and cg.passInRegs(cg.typeOf(data.ty_op.operand))) {
                 const d = cg.destReg(inst);
@@ -2850,9 +2898,10 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         },
         .aggregate_init => {
             const ty = data.ty_pl.ty;
-            const dst = try cg.resultMem(inst, ty) orelse return;
             const extra = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
             const elems = ir.refSlice(extra.end, extra.data.len);
+            if (elems.len != 0 and vector.lowers(cg, inst)) return vector.gen(cg, inst, tag, data);
+            const dst = try cg.resultMem(inst, ty) orelse return;
             if (ip.keyTag(ty) == .vector_type and ip.keyPayload(.vector_type, ty).child == .bool_type) {
                 // Bit-packed: element i is bit i % 8 of byte i / 8.
                 try cg.fillMem(dst, Type.abiSize(ip, ty), 0);
@@ -4489,7 +4538,7 @@ fn fmtType(cg: *CodeGen, ty: Index) FmtType {
 /// A value as an operand: its type and where it can be read.
 const Val = struct { ty: Index, loc: Loc };
 
-fn valOf(cg: *CodeGen, ref: Ref) Error!Val {
+pub fn valOf(cg: *CodeGen, ref: Ref) Error!Val {
     if (cg.xmmOf(ref)) |x| return .{ .ty = cg.typeOf(ref), .loc = .{ .xmm = x } };
     return .{ .ty = cg.typeOf(ref), .loc = try cg.locOf(ref) };
 }
@@ -4528,7 +4577,7 @@ fn valMem(cg: *CodeGen, v: Val) Error!Mem {
 }
 
 /// Loads a value of 2, 4, 8, or 16 bytes into the low bits of `x`. Uses rax.
-fn loadXmm(cg: *CodeGen, x: Encoder.Xmm, v: Val) Error!void {
+pub fn loadXmm(cg: *CodeGen, x: Encoder.Xmm, v: Val) Error!void {
     const size = Type.abiSize(cg.ip, v.ty);
     if (v.loc == .xmm) {
         if (v.loc.xmm != x) try cg.e.movups(.{ .reg = x }, .{ .reg = v.loc.xmm });

@@ -824,6 +824,7 @@ pub fn removable(ir: *const Ir, ip: *const InternPool, inst: Inst.Index) bool {
         .is_null, .is_non_null, .is_err, .is_non_err, .optional_payload, .wrap_optional => true,
         .unwrap_errunion_payload, .unwrap_errunion_err, .wrap_errunion_payload, .wrap_errunion_err => true,
         .aggregate_init, .union_init, .get_union_tag, .array_elem_val => true,
+        .cmp_vector, .reduce, .select, .shuffle => true,
         .load => !Type.ptrInfo(ip, ir.typeOf(data.ty_op.operand, ip)).flags.is_volatile,
         else => false,
     };
@@ -946,7 +947,12 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
             ctx.use(at(extra, data.ty_pl.payload));
             ctx.use(at(extra, data.ty_pl.payload + 1));
         },
-        .cmpxchg => for (0..3) |k| ctx.use(at(extra, data.ty_pl.payload + k)),
+        .cmpxchg, .select => for (0..3) |k| ctx.use(at(extra, data.ty_pl.payload + k)),
+        .cmp_vector, .shuffle => {
+            ctx.use(at(extra, data.ty_pl.payload));
+            ctx.use(at(extra, data.ty_pl.payload + 1));
+        },
+        .reduce => ctx.use(at(extra, data.ty_pl.payload)),
         .aggregate_init => {
             const x = ir.extraData(Ir.Aggregate, data.ty_pl.payload);
             for (0..x.data.len) |k| ctx.use(at(extra, x.end + k));

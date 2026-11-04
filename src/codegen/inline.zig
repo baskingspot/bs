@@ -336,6 +336,10 @@ const Copier = struct {
             .struct_field_ptr, .struct_field_val, .union_init => data.ty_pl.payload = try c.payload(Ir.StructField, data.ty_pl.payload),
             .atomic_rmw => data.ty_pl.payload = try c.payload(Ir.AtomicRmw, data.ty_pl.payload),
             .cmpxchg => data.ty_pl.payload = try c.payload(Ir.Cmpxchg, data.ty_pl.payload),
+            .cmp_vector => data.ty_pl.payload = try c.payload(Ir.VectorCmp, data.ty_pl.payload),
+            .reduce => data.ty_pl.payload = try c.payload(Ir.Reduce, data.ty_pl.payload),
+            .select => data.ty_pl.payload = try c.payload(Ir.Select, data.ty_pl.payload),
+            .shuffle => data.ty_pl.payload = try c.payload(Ir.Shuffle, data.ty_pl.payload),
             .aggregate_init => {
                 const extra = from.extraData(Ir.Aggregate, data.ty_pl.payload);
                 data.ty_pl.payload = try c.payload(Ir.Aggregate, data.ty_pl.payload);
@@ -529,6 +533,16 @@ const Hasher = struct {
             .cmpxchg => {
                 try h.index(data.ty_pl.ty);
                 try h.payload(Ir.Cmpxchg, data.ty_pl.payload);
+            },
+            inline .cmp_vector, .reduce, .select, .shuffle => |t| {
+                try h.index(data.ty_pl.ty);
+                try h.payload(switch (t) {
+                    .cmp_vector => Ir.VectorCmp,
+                    .reduce => Ir.Reduce,
+                    .select => Ir.Select,
+                    .shuffle => Ir.Shuffle,
+                    else => unreachable,
+                }, data.ty_pl.payload);
             },
             .aggregate_init => {
                 const extra = ir.extraData(Ir.Aggregate, data.ty_pl.payload);

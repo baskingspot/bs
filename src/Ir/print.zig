@@ -160,6 +160,40 @@ const Printer = struct {
                 try w.writeAll(", ");
                 try p.ref(x.new);
             },
+            .cmp_vector => {
+                const x = ir.extraData(Ir.VectorCmp, data.ty_pl.payload).data;
+                try p.ty(data.ty_pl.ty);
+                try w.print(", {t}, ", .{x.operator()});
+                try p.ref(x.lhs);
+                try w.writeAll(", ");
+                try p.ref(x.rhs);
+            },
+            .reduce => {
+                const x = ir.extraData(Ir.Reduce, data.ty_pl.payload).data;
+                try p.ty(data.ty_pl.ty);
+                try w.print(", {t}, ", .{x.operation()});
+                try p.ref(x.operand);
+            },
+            .select => {
+                const x = ir.extraData(Ir.Select, data.ty_pl.payload).data;
+                try p.ty(data.ty_pl.ty);
+                try w.writeAll(", ");
+                try p.ref(x.pred);
+                try w.writeAll(", ");
+                try p.ref(x.a);
+                try w.writeAll(", ");
+                try p.ref(x.b);
+            },
+            .shuffle => {
+                const x = ir.extraData(Ir.Shuffle, data.ty_pl.payload).data;
+                try p.ty(data.ty_pl.ty);
+                try w.writeAll(", ");
+                try p.ref(x.a);
+                try w.writeAll(", ");
+                try p.ref(x.b);
+                try w.writeAll(", ");
+                try p.ref(.fromInterned(x.mask));
+            },
             .extern_ptr, .extern_pcrel, .extern_tls => {
                 try p.ty(data.ty_pl.ty);
                 try w.print(", \"{s}\"", .{p.ip.stringSlice(@fromBackingInt(data.ty_pl.payload))});
