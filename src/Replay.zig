@@ -34,6 +34,7 @@ const Tag = Incremental.Tag;
 const Index = InternPool.Index;
 
 const Replay = @This();
+pub var loadexp: bool = false;
 
 gpa: Allocator,
 io: Io,
@@ -121,6 +122,8 @@ dead: std.DynamicBitSetUnmanaged = .{},
 /// function they inline are in a changed input (`Incremental.refreshDebug`).
 refresh: std.DynamicBitSetUnmanaged = .{},
 stats: Stats = .{},
+dbg_depth: u32 = 0,
+dbg_counts: [4][8]u32 = @splat(@splat(0)),
 /// `ZAP_CACHE_CHECK`: print each green unit that could not be loaded.
 check: bool = false,
 /// `ZAP_CACHE_TIMING`: say why the build is built again in full.
@@ -466,6 +469,16 @@ pub fn destroy(r: *Replay) void {
 
 pub fn printStats(r: *const Replay) void {
     const s = r.stats;
+    {
+        var used: u32 = 0;
+        var total: u32 = 0;
+        for (r.zcu.ip.locals) |*l| for (l.navs.ptr.raw[0..l.navs.len.raw]) |n| {
+            total += 1;
+            if (n.status != .unresolved or n.ty_status != .unresolved) used += 1;
+        };
+        std.debug.print("DBG types {d} navs {d} total navs {d} used {d}\n", .{ Zcu.dbg_types, Zcu.dbg_navs, total, used });
+    }
+    std.debug.print("DBG loads by ensure depth x unit tag (nav_val,type_layout,func,comptime,defaults): {any}\n", .{r.dbg_counts});
     std.debug.print("cache: replayed {d} units ({d} functions) from the last build; analyzed {d} again ({d} changed, {d} not decodable) and {d} new; {d} inputs changed, {d} seeds reach {d} of {d} nodes; setup {d:.2} ms\n", .{
         s.loaded, s.loaded_funcs, s.red, s.red_changed, s.misses, s.new, s.changed_inputs, s.seeds, s.outdated, r.m.nodeCount(), @as(f64, @floatFromInt(s.setup_ns)) / 1e6,
     });
@@ -849,7 +862,7 @@ fn greenNode(r: *Replay, unit: Zcu.AnalUnit) !?Green {
             .func, .link, .comptime_decl => return r.redAt(g),
             else => {},
         }
-        if (r.lazy and !materialize and !r.outdated.isSet(d)) continue;
+        if (r.lazy and (!materialize or (loadexp and unit == .nav_val)) and !r.outdated.isSet(d)) continue;
         const dep = try r.dependee(d, dtag) orelse {
             r.noteMiss(unit, @tagName(dtag));
             return r.redAt(g);
@@ -920,6 +933,7 @@ fn resolveRefs(r: *Replay, g: Green, is_func: bool) !?[]Ref {
 /// A green unit in a lazy build: it is live, and its result is in the
 /// Zcu if `loaded`.
 fn commitLazy(r: *Replay, g: Green, loaded: bool) !void {
+    r.dbg_counts[@min(r.dbg_depth, 3)][@intFromEnum(std.meta.activeTag(g.unit))] += 1;
     r.deps.shrinkRetainingCapacity(g.deps_start);
     r.state[g.node] = .green;
     if (loaded) r.loaded.set(g.node);
@@ -1052,6 +1066,8 @@ fn decodeDependee(r: *Replay, d: u32, tag: Tag) !?Zcu.Dependee {
 /// Brings `dep` up to date as analysis would before reading it.
 fn ensure(r: *Replay, dep: Zcu.Dependee) bool {
     const zcu = r.zcu;
+    r.dbg_depth += 1;
+    defer r.dbg_depth -= 1;
     switch (dep) {
         .nav_val => |nav| zcu.ensureNavVal(nav) catch return false,
         .nav_ty => |nav| zcu.ensureNavTy(nav) catch return false,

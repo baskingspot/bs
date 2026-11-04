@@ -528,6 +528,7 @@ pub const Job = struct {
             return null;
         };
         i.check = env.get("ZAP_CACHE_CHECK") != null;
+        @import("Replay.zig").loadexp = env.get("ZAP_LOADEXP") != null;
         i.donors = !std.mem.eql(u8, env.get("ZAP_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
         i.link_objects = job.link_objects;

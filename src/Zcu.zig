@@ -858,6 +858,8 @@ pub fn fileRootType(zcu: *Zcu, file_index: u32) !InternPool.Index {
     return ty;
 }
 
+pub var dbg_types: u32 = 0;
+pub var dbg_navs: u32 = 0;
 pub const ContainerKind = enum { @"struct", @"enum", @"union", @"opaque" };
 
 /// The end of a container type's stable key: the stable hashes of its
@@ -924,6 +926,8 @@ pub fn createContainerType(
 
     const ns_index: u32 = @intCast(zcu.namespaces.items.len);
     si.namespace = ns_index;
+    dbg_types += 1;
+    dbg_navs += @intCast(decls.len);
     const in_fn = parent_ns != Namespace.none and (zcu.namespaces.items[parent_ns].in_fn or zcu.inFnDecl(parent_ns, inst));
     const arena = zcu.arena.allocator();
     // The caller's names may live in a Sema arena.
@@ -949,6 +953,11 @@ pub fn createContainerType(
     // protector's when it is a root (`Frontend.ubsan_rt`).
     const f = zcu.file(file_index);
     const skip_comptime = f.module == .compiler_rt and !(zcu.fe.ubsan_rt != null and std.mem.eql(u8, f.sub_path, @import("Frontend.zig").ssp_sub_path));
+    var key_buf: std.ArrayList(u8) = .empty;
+    defer key_buf.deinit(zcu.gpa);
+    try key_buf.ensureTotalCapacity(zcu.gpa, key.len + 64);
+    key_buf.appendSliceAssumeCapacity(key);
+    key_buf.appendSliceAssumeCapacity(key_sep);
     for (decls) |decl_inst| {
         const d = zir.getDeclaration(decl_inst);
         const simple: []const u8 = switch (d.kind) {
@@ -968,7 +977,10 @@ pub fn createContainerType(
             },
             .@"const", .@"var" => zir.nullTerminatedString(d.name),
         };
-        const decl_key = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ key, key_sep, simple });
+        // Interned at once: built in one buffer for the whole namespace.
+        key_buf.shrinkRetainingCapacity(key.len + 1);
+        try key_buf.appendSlice(zcu.gpa, simple);
+        const decl_key = key_buf.items;
         var hasher: InternPool.Hasher = .init("nav");
         hasher.bytes(decl_key);
         const nav = try ip.createNav(tid, .{
