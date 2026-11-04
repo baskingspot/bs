@@ -275,12 +275,12 @@ MIGRATIONS = [
         seeds=["files"],
         since="0.16",
     ),
-    R("fs-cwd", [(r"std\.Io\.Dir\.cwd\(\)", "std.fs.cwd()")], [["Io.Dir"]], seeds=["files"], since="0.16"),
+    R("fs-cwd", [(r"std\.Io\.Dir\.cwd\(\)", "std.fs.cwd()")], [["Io.Dir"]], seeds=["files", "wave"], since="0.16"),
     R(
         "file-close-noio",
         [(r"file\.close\(io\)", "file.close()")],
         [["io: Io", "init.io"]],
-        seeds=["files"],
+        seeds=["files", "wave"],
         since="0.16",
     ),
     R("file-stat-noio", [(r"file\.stat\(io\)", "file.stat()")], [["io: Io", "init.io"]], seeds=["files"], since="0.16"),
@@ -377,7 +377,7 @@ MIGRATIONS = [
             (r"buffer\.toOwnedSlice\(allocator\)", "buffer.toOwnedSlice()"),
         ],
         [[".empty"], ["allocator"]],
-        seeds=["test_wave"],
+        seeds=["test_wave", "wave"],
         since="0.15",
     ),
     R(
@@ -397,8 +397,41 @@ MIGRATIONS = [
         "endian-case",
         [(r"std\.builtin\.Endian\.little", "std.builtin.Endian.Little")],
         [[".little", '"little"']],
-        seeds=["test_wave"],
+        seeds=["test_wave", "wave"],
         since="0.12",
+    ),
+    R(
+        "stdout-getstdout-wave",
+        [(r"std\.Io\.File\.stdout\(\)\.writer\(io, &write_buffer\)", "std.io.getStdOut().writer()")],
+        [["Io.File"], ["stdout"]],
+        seeds=["wave"],
+        since="0.15",
+    ),
+    R(
+        "stdin-getstdin-wave",
+        [
+            (
+                r"var read_buffer: \[1024\]u8 = undefined;\n            var stdin_reader = std\.Io\.File\.stdin\(\)\.reader\(io, &read_buffer\);",
+                "var stdin_reader = std.io.getStdIn().reader();",
+            )
+        ],
+        [["Io.File"], ["stdin"]],
+        seeds=["wave"],
+        since="0.15",
+    ),
+    R(
+        "dir-openfile-noio",
+        [(r"std\.Io\.Dir\.cwd\(\)\.openFile\(io, path, ", "std.fs.cwd().openFile(path, ")],
+        [["Io.Dir"]],
+        seeds=["wave"],
+        since="0.16",
+    ),
+    R(
+        "reader-readallalloc",
+        [(r"reader\.readAlloc\(allocator, len\)", "reader.readAllAlloc(allocator, len)")],
+        [["allocRemaining", "readAlloc"]],
+        seeds=["wave"],
+        since="0.15",
     ),
     R(
         "format-old-signature",
