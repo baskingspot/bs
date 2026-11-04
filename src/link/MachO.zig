@@ -108,6 +108,10 @@ pub const Options = struct {
     /// As `Elf.Options.aliases`; with `symbols`, `Symbols.aliases` numbers
     /// them.
     aliases: []const Elf.Alias = &.{},
+    /// Symbols within atoms, after the atoms' own: the functions and
+    /// objects of C inputs, whose sections are atoms. Not with `symbols`,
+    /// nor in thread-local atoms, whose place is their descriptor's.
+    local_symbols: []const Elf.LocalSymbol = &.{},
 };
 
 /// `Elf.Symbols` with the imports numbered too.
@@ -246,8 +250,8 @@ const sig_page_size = 0x1000;
 const stub_size = 12;
 
 /// Output sections, in layout order.
-const Sect = enum(u4) { text, stubs, text_const, unwind_info, got, data_const, data, thread_vars, thread_data, thread_bss, bss };
-const n_sects = 11;
+const Sect = enum(u4) { text, stubs, text_const, unwind_info, got, mod_init_func, data_const, data, thread_vars, thread_data, thread_bss, bss };
+const n_sects = 12;
 const Seg = enum(u2) { text, data_const, data };
 const sect_info = [n_sects]struct { seg: Seg, name: []const u8, flags: u32 }{
     .{ .seg = .text, .name = "__text", .flags = macho.S_REGULAR | macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS },
@@ -255,6 +259,7 @@ const sect_info = [n_sects]struct { seg: Seg, name: []const u8, flags: u32 }{
     .{ .seg = .text, .name = "__const", .flags = macho.S_REGULAR },
     .{ .seg = .text, .name = "__unwind_info", .flags = macho.S_REGULAR },
     .{ .seg = .data_const, .name = "__got", .flags = macho.S_NON_LAZY_SYMBOL_POINTERS },
+    .{ .seg = .data_const, .name = "__mod_init_func", .flags = macho.S_MOD_INIT_FUNC_POINTERS },
     .{ .seg = .data_const, .name = "__const", .flags = macho.S_REGULAR },
     .{ .seg = .data, .name = "__data", .flags = macho.S_REGULAR },
     .{ .seg = .data, .name = "__thread_vars", .flags = macho.S_THREAD_LOCAL_VARIABLES },
@@ -269,6 +274,7 @@ const stubs = @backingInt(Sect.stubs);
 const text_const = @backingInt(Sect.text_const);
 const unwind_info = @backingInt(Sect.unwind_info);
 const got = @backingInt(Sect.got);
+const mod_init_func = @backingInt(Sect.mod_init_func);
 const data_const = @backingInt(Sect.data_const);
 const data = @backingInt(Sect.data);
 const thread_vars = @backingInt(Sect.thread_vars);
@@ -331,7 +337,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
     const numbered = options.symbols;
-    if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len or s.imports.len != options.imports.len or s.aliases.len != options.aliases.len) return error.InvalidSymbols;
+    if (numbered) |s| if (s.atoms.len != n_atoms or s.entry >= s.len or s.imports.len != options.imports.len or s.aliases.len != options.aliases.len or options.local_symbols.len != 0) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms + options.aliases.len, n_partitions) else .empty;
     defer symbols.deinit();
     // With numbered symbols, each number's address, import, or value.
@@ -395,8 +401,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var strtab_len: u64 = 1;
     var max_targets: usize = 0;
     const n_imports: u32 = std.math.cast(u32, options.imports.len) orelse return error.OutOfMemory;
-    // Fixups in address order: GOT slots, then __DATA_CONST,__const, then
-    // __data, the descriptors' binds, and __thread_data, each section's in
+    // Fixups in address order: GOT slots, __mod_init_func, __DATA_CONST,__const,
+    // then __data, the descriptors' binds, and __thread_data, each section's in
     // chunk order.
     var n_fixups: [n_sects]u64 = @splat(0);
     n_fixups[got] = n_imports;
@@ -449,6 +455,22 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         };
         try checkEntry(&l, entry_index, options.entry, diag);
     }
+    // The local symbols' atoms, while `symbols` maps keys to atoms.
+    const local_atoms = try gpa.alloc(u32, options.local_symbols.len);
+    defer gpa.free(local_atoms);
+    const local_str = strtab_len;
+    for (options.local_symbols, local_atoms) |ls, *atom| {
+        atom.* = @intCast(symbols.get(ls.atom) orelse {
+            diag.* = .{ .atom = ls.name, .target = ls.atom };
+            return error.UndefinedSymbol;
+        });
+        if (ls.offset > input.atom(atom.*).size() or places[atom.*].section == thread_vars) {
+            diag.* = .{ .atom = ls.name, .target = ls.atom };
+            return error.InvalidSymbols;
+        }
+        strtab_len += 1 + ls.name.len + 1;
+    }
+    const n_locals = std.math.add(u32, n_atom_syms, @intCast(local_atoms.len)) catch return error.OutOfMemory;
 
     var values: SymbolTable = .empty;
     defer values.deinit();
@@ -571,7 +593,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const linkedit_vm = seg_mem_end[last_seg];
 
     // __LINKEDIT contents.
-    const fixups_seg = [3]bool{ false, n_fixups[got] + n_fixups[data_const] > 0, n_fixups[data] + n_fixups[thread_vars] + n_fixups[thread_data] > 0 };
+    const fixups_seg = [3]bool{ false, n_fixups[got] + n_fixups[mod_init_func] + n_fixups[data_const] > 0, n_fixups[data] + n_fixups[thread_vars] + n_fixups[thread_data] > 0 };
     const cf = ChainedFixupsLayout.init(n_segs, seg_present, fixups_seg, seg_start, seg_mem_end, bind_imports);
     const fixups_off = linkedit_off;
     const trie_off = fixups_off + cf.size;
@@ -594,7 +616,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     }
     const func_starts_size = std.mem.alignForward(u64, func_starts_len + 1, 8);
     const symtab_off = func_starts_off + func_starts_size;
-    const n_syms: u32 = n_atom_syms + 1 + n_bind_imports;
+    const n_syms: u32 = n_locals + 1 + n_bind_imports;
     const indirect_off = symtab_off + @as(u64, n_syms) * @sizeOf(macho.nlist_64);
     const n_indirect = 2 * n_imports;
     const strtab_off = indirect_off + @as(u64, n_indirect) * 4;
@@ -673,6 +695,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             .{ starts[text_const], starts[text_const] + sizes[text_const] },
             .{ starts[unwind_info], starts[unwind_info] + sizes[unwind_info] },
             .{ starts[got], starts[got] + sizes[got] },
+            .{ starts[mod_init_func], starts[mod_init_func] + sizes[mod_init_func] },
             .{ starts[data_const], starts[data_const] + sizes[data_const] },
             .{ starts[data], starts[data] + sizes[data] },
             .{ starts[thread_vars], starts[thread_vars] + sizes[thread_vars] },
@@ -734,13 +757,20 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     cf.write(buf, fixups_off, fixups, bind_imports);
     @memcpy(buf[trie_off..][0..exports_trie.len], exports_trie);
 
-    // Symbols after the atoms': __mh_execute_header (exported), then the
-    // imports (undefined), and their names.
+    // Symbols after the atoms': those within atoms, __mh_execute_header
+    // (exported), then the imports (undefined), and their names.
     {
         var sym_off = symtab_off + @as(u64, n_atom_syms) * @sizeOf(macho.nlist_64);
-        var str_off = strtab_len - (mh_execute_header.len + 1);
-        for (bind_imports) |imp| str_off -= 1 + imp.name.len + 1;
+        var str_off = local_str;
         buf[strtab_off] = 0;
+        for (options.local_symbols, local_atoms) |ls, atom| {
+            writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_SECT, sect_index[places[atom].section], 0, l.atomAddr(atom) + ls.offset));
+            sym_off += @sizeOf(macho.nlist_64);
+            buf[strtab_off + str_off] = '_';
+            @memcpy(buf[strtab_off + str_off + 1 ..][0..ls.name.len], ls.name);
+            buf[strtab_off + str_off + 1 + ls.name.len] = 0;
+            str_off += 1 + ls.name.len + 1;
+        }
         writeStruct(buf[sym_off..], nlist(@intCast(str_off), macho.N_SECT | macho.N_EXT, 1, macho.REFERENCED_DYNAMICALLY, base));
         sym_off += @sizeOf(macho.nlist_64);
         @memcpy(buf[strtab_off + str_off ..][0..mh_execute_header.len], mh_execute_header);
@@ -756,7 +786,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             str_off += 1 + imp.name.len + 1;
             // Indirect symbols: the stubs' entries, then the GOT's.
             if (i == n_imports) break;
-            const sym_index = n_atom_syms + 1 + @as(u32, @intCast(i));
+            const sym_index = n_locals + 1 + @as(u32, @intCast(i));
             std.mem.writeInt(u32, buf[indirect_off + 4 * i ..][0..4], sym_index, .little);
             std.mem.writeInt(u32, buf[indirect_off + 4 * (n_imports + i) ..][0..4], sym_index, .little);
         }
@@ -819,10 +849,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     w.put(macho.symtab_command{ .symoff = @intCast(symtab_off), .nsyms = n_syms, .stroff = @intCast(strtab_off), .strsize = @intCast(strtab_len) });
     w.put(macho.dysymtab_command{
         .ilocalsym = 0,
-        .nlocalsym = n_atom_syms,
-        .iextdefsym = n_atom_syms,
+        .nlocalsym = n_locals,
+        .iextdefsym = n_locals,
         .nextdefsym = 1,
-        .iundefsym = n_atom_syms + 1,
+        .iundefsym = n_locals + 1,
         .nundefsym = n_bind_imports,
         .indirectsymoff = if (n_indirect > 0) @intCast(indirect_off) else 0,
         .nindirectsyms = n_indirect,
@@ -1395,7 +1425,7 @@ fn LinkOf(comptime Input: type) type {
                     continue;
                 }
                 var n_abs: u32 = 0;
-                if (a.section == .rodata or a.section == .data or a.section == .tdata) {
+                if (a.section == .rodata or a.section == .data or a.section == .tdata or a.section == .init_array) {
                     for (a.relocs) |r| n_abs += @intFromBool(r.info.kind == .aarch64_abs64);
                 }
                 var s: u4 = switch (a.section) {
@@ -1408,8 +1438,10 @@ fn LinkOf(comptime Input: type) type {
                     // Coverage atoms come only from `-ffuzz`, which is
                     // x86_64-linux only for now.
                     .sancov_cntrs, .sancov_pcs => unreachable,
-                    // Init and fini arrays come only from ELF objects.
-                    .preinit_array, .init_array, .fini_array => unreachable,
+                    // Initializers come from C objects' __mod_init_func;
+                    // the other arrays only from ELF objects.
+                    .init_array => mod_init_func,
+                    .preinit_array, .fini_array => unreachable,
                 };
                 c.n_fixups[s] += n_abs;
                 var off = a.alignment.forward(c.sizes[s]);
@@ -1786,7 +1818,7 @@ fn LinkOf(comptime Input: type) type {
                         std.mem.writeInt(u32, field[0..4], v, .little);
                     },
                     .aarch64_abs64 => {
-                        if ((sect != data_const and sect != data and sect != thread_data) or p & 3 != 0) return invalid;
+                        if ((sect != mod_init_func and sect != data_const and sect != data and sect != thread_data) or p & 3 != 0) return invalid;
                         const v = switch (t.kind) {
                             .addr => rebase: {
                                 const target = @as(i128, t.v) + addend - base_address;
