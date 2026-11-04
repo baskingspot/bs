@@ -1539,6 +1539,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "runtime value contains reference to comptime var", .@"comptime-var-escape" },
     .{ "dependency loop detected", .@"dependency-loop" },
     .{ "unable to resolve inferred error set", .@"dependency-loop" },
+    .{ "cannot resolve inferred error set of generic function type '{f}'", .@"bad-type" },
     .{ "division by zero here causes illegal behavior", .@"division-by-zero" },
     .{ "evaluation exceeded {d} backwards branches", .@"eval-limit" },
     .{ "inline call depth exceeded", .@"eval-limit" },

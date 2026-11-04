@@ -1967,6 +1967,10 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
 
     for (fn_ty.param_types) |pt| try sema.resolveLayout(&block, block.nodeSrc(.zero), pt);
     try sema.resolveLayout(&block, block.nodeSrc(.zero), fn_ty.return_type);
+    // A generic function has no runtime body; asking for one can only
+    // mean resolving its inferred error set, as upstream says.
+    if (fn_ty.is_generic and func.generic_owner == .none)
+        return sema.fail(&block, block.nodeSrc(.zero), "cannot resolve inferred error set of generic function type '{f}'", .{sema.fmtType(func.ty)});
 
     const fn_info = sema.code.getFnInfo(func.zir_inst);
     // `comptime_args` is indexed by ZIR parameter; only runtime parameters
