@@ -3,11 +3,14 @@
 # copy in a scratch directory and checks what the build runner reports.
 #   $1 zap  $2 test/build/hello  $3 scratch directory
 #   $4 the build web client zap embeds (build-web.wasm)
+#   $5 the part to check, each its own build step: build, which compiles
+#      the build runner into the global cache, then shape, fuzz and misc
+#      at once, each in its own copy
 set -eu
 unset ZIG_LOCAL_CACHE_DIR ZIG_LIB_DIR
 rm -rf "$3"
 mkdir -p "$3"
-zap=$(realpath "$1") src=$(realpath "$2") work=$(realpath "$3") wasm=$(realpath "$4")
+zap=$(realpath "$1") src=$(realpath "$2") work=$(realpath "$3") wasm=$(realpath "$4") part=$5
 cp -r "$src" "$work/hello"
 cd "$work/hello"
 
@@ -18,6 +21,8 @@ fail() {
 }
 expect() { grep -qF -- "$1" "$work/log" || fail "expected '$1'"; }
 
+case $part in
+build)
 # A full build: the configurer, the exe (which asks for LLVM), the install.
 "$zap" build --summary all >"$work/log" 2>&1 || fail "zap build"
 [ "$(./zig-out/bin/hello x 2>&1)" = "hello 1" ] || fail "zig-out/bin/hello prints 'hello 1'"
@@ -33,7 +38,9 @@ expect "compile exe hello debug native cached"
 expect "hello 2"
 "$zap" build test --summary all >"$work/log" 2>&1 || fail "zap build test"
 expect "run test 4 pass (4 total)"
+;;
 
+shape)
 # A C header translated to Zig (`zap translate-c --listen=-`), in a program
 # that links glibc. A header edit translates again; a header touched but
 # unchanged is a cache hit.
@@ -45,7 +52,9 @@ expect "triangle 4 40"
 touch c/shape.h
 "$zap" build shape --summary all >"$work/log" 2>&1 || fail "zap build shape (header touched)"
 expect "translate-c cached"
+;;
 
+fuzz)
 # Fuzzing: the runner rebuilds the tests with -ffuzz, zap instruments them
 # and links upstream's fuzzer, which finds the crash planted in "fuzz".
 # As upstream's, the runner exits 0 after reporting a crash. The runner
@@ -89,7 +98,9 @@ curl -sf -o "$work/main.wasm" "http://127.0.0.1:$port/main.wasm" || fail "GET /m
 [ "$(sha256sum <"$work/main.wasm")" = "$(sha256sum <"$wasm")" ] || fail "the served main.wasm is zap's embedded client"
 kill -- -$web
 trap - EXIT
+;;
 
+misc)
 # Docs: upstream's viewer, its page, and the modules' sources.
 "$zap" build docs >"$work/log" 2>&1 || fail "zap build docs"
 for f in index.html main.js main.wasm sources.tar; do [ -s "zig-out/docs/$f" ] || fail "zig-out/docs/$f"; done
@@ -134,3 +145,8 @@ line=$(($(wc -l <build.zig) + 1))
 echo "fn unused() void { const y = 1; }" >>build.zig
 if "$zap" build >"$work/log" 2>&1; then fail "zap build succeeded with a broken build.zig"; fi
 expect "build.zig:$line:26: error: [unused] unused local constant"
+;;
+*)
+    fail "unknown part '$part'"
+    ;;
+esac

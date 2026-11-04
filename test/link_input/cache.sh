@@ -5,11 +5,16 @@
 # builds check themselves against full builds (ZAP_CACHE_VERIFY,
 # ZAP_CACHE_CHECK). C sources' objects are link inputs the same way.
 #   $1 zap  $2 upstream zig  $3 test/link_input  $4 scratch directory
+#   $5 the part to check, each its own build step, so that they run at once:
+#      objects, c-sources, lc-objects, shared, shared-objects
+#   $6 a global cache holding std's ZIR, which the empty one starts from
 set -eu
 unset ZIG_LOCAL_CACHE_DIR ZIG_GLOBAL_CACHE_DIR ZAP_CACHE ZAP_CACHE_VERIFY ZAP_CACHE_CHECK
 rm -rf "$4"
 mkdir -p "$4"
-zap=$(realpath "$1") zig=$2 src=$(realpath "$3") work=$(realpath "$4")
+zap=$(realpath "$1") zig=$2 src=$(realpath "$3") work=$(realpath "$4") part=$5
+mkdir -p "$work/global/zap"
+cp -r "$6/zap/zir" "$work/global/zap"
 cd "$work"
 cp "$src"/main.zig "$src"/lib.c "$src"/tls.c "$src"/tlsie.c "$src"/a1.c "$src"/a2.c "$src"/libc.c "$src"/libc_main.zig "$src"/copy.c .
 export ZAP_ZIG="$zig"
@@ -32,14 +37,16 @@ objects() {
 }
 
 # $1 what the build must say (ZAP_CACHE_TIMING), $2 what the program
-# prints; the build's log stays in cached.log.
-args="build-exe main.zig lib.o tls.o tlsie.o liba1.a -la2 -L."
+# prints; the build's log stays in cached.log. The build without the cache
+# runs once per set of inputs: a build that changed none compares with the
+# last one's bytes.
 build() {
     ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 ZAP_CACHE_VERIFY=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail "$1"
     cp log cached.log
     grep -qF -- "$1" log || fail "expected '$1'"
-    ZAP_CACHE=off "$zap" $args --global-cache-dir global -femit-bin=full >log 2>&1 || fail "$1: without the cache"
-    cmp -s main full || fail "$1: the output differs from a build without the cache"
+    full=full-$( (echo "$args"; cat ./*.zig ./*.c ./*.o ./*.a ./*.so 2>/dev/null) | sha256sum | cut -c1-16)
+    [ -f "$full" ] || ZAP_CACHE=off "$zap" $args --global-cache-dir global -femit-bin="$full" >log 2>&1 || fail "$1: without the cache"
+    cmp -s main "$full" || fail "$1: the output differs from a build without the cache"
     ./main >out 2>&1 || fail "$1: the program failed"
     grep -qF -- "$2" out || fail "$1: the program printed '$(cat out)'"
 }
@@ -54,6 +61,9 @@ eager() {
     ! grep -qF "from the manifest" cached.log || fail "$1: expected an eager edit build"
 }
 
+case $part in
+objects)
+args="build-exe main.zig lib.o tls.o tlsie.o liba1.a -la2 -L."
 objects
 build "no manifest" "hello from C"
 build "not relinking" "hello from C"
@@ -105,13 +115,15 @@ ZAP_CACHE_TIMING=1 "$zap" $args --cache-dir local --global-cache-dir global -fem
 grep -qF "no input changed; relinked" log || fail "expected a relink from the log"
 cmp -s main edited || fail "the relink from the log differs from the edit build's output"
 ./main >out 2>&1 && grep -qF -- "?" out || fail "the relink from the log lost the edit"
+;;
 
+c-sources)
 # C sources: their records' objects are the link inputs. An edited source
 # keeps its object's path, so the build must not take the old object for
 # the last build's while Clang compiles the new one.
 args="build-exe libc_main.zig libc.c -lc"
-rm -rf local
-build "first build" "x=21 twice=42"
+# A cold first build: the global cache has no donor yet.
+build "cache: recorded" "x=21 twice=42"
 build "not relinking" "x=21 twice=42"
 sed -i 's/x=%d/X=%d/' libc.c
 # The Zig code replays, eagerly: the object is not the manifest's yet.
@@ -145,11 +157,12 @@ build "no input changed; relinked" "lc 3 4"
 sed -i 's/fns\[i\](-3)/fns[i](-5)/' lc.zig
 build "inputs changed, first $work/lc.zig" "lc 5 4"
 lazy "-lc: a function's constant changed"
+;;
 
+lc-objects)
 # -lc with objects: a C object's glibc imports, its reference to a Zig
 # export, and the executable's copies of glibc data that GCC's -fPIE reads
 # PC-relative.
-cp "$src"/libc.c "$src"/libc_main.zig .
 args="build-exe -lc -target x86_64-linux-gnu libc_main.zig libc.o copy.o"
 lc_objects() {
     "$zig" cc -fPIC -c libc.c -o libc.o
@@ -169,7 +182,9 @@ if command -v gcc >/dev/null; then
     build "inputs changed, first $work/libc.o" "X=22 twice=44"
     eager "-lc: an object changed"
 fi
+;;
 
+shared | shared-objects)
 # Shared libraries: link-only inputs too, after the objects. A relink
 # parses them again for the dynamic tables; a changed one replays eagerly.
 cp "$src"/shared.c "$src"/shared.map "$src"/shared_main.zig "$src"/shared_user.c .
@@ -185,9 +200,16 @@ pub fn main() void {
 }
 ZIG
 so
+;;
+*)
+    fail "unknown part '$part'"
+    ;;
+esac
+
+case $part in
+shared)
 # Without objects: the numbered relink.
 args="build-exe -lc -lshared -L. so_main.zig"
-rm -rf local
 build "no manifest" "42 42"
 build "not relinking" "42 42"
 rm main
@@ -215,15 +237,14 @@ if ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 "$zap" $args --cache-dir local --global-
 fi
 grep -qF "shared_twice" log || fail ".so: the error does not name the dropped symbol"
 ! grep -qiE "panic|unreachable" log || fail ".so: a dropped symbol crashed zap"
-cp "$src"/shared.c "$src"/shared.map .
-so
+;;
 
+shared-objects)
 # With objects: the keyed relink, whose C object reads the library's data
 # PC-relative (GCC's -fPIE), so the executable copies it.
 if command -v gcc >/dev/null; then
     gcc -fPIE -c shared_user.c -o shared_user.o
     args="build-exe -lc -lshared -L. shared_main.zig shared_user.o"
-    rm -rf local
     build "no manifest" "42 143 42 143"
     rm main
     build "no input changed; relinked" "42 143 42 143"
@@ -235,3 +256,5 @@ if command -v gcc >/dev/null; then
     build "inputs changed, first $work/libshared.so" "42 143 44 143"
     eager ".so with objects: the library changed"
 fi
+;;
+esac

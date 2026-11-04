@@ -52,14 +52,28 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run zap").dependOn(&run_cmd.step);
 
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
+    // After zap, as one of its users (`spreadZapUsers`), so that it does
+    // not hold a worker when zap's users start.
+    unit_tests.step.dependOn(&exe.step);
+    takes(b, &unit_tests.step, 7);
     const test_step = b.step("test", "Run zap's unit tests and run tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     const upstream_step = b.step("test-upstream", "Run the run tests with upstream zig, the oracle");
-    addRunTests(b, exe, test_step, upstream_step);
-    addObjAndRunTests(b, exe, test_step);
-    addLinkInputTests(b, exe, test_step);
-    addDiagTests(b, exe, test_step, upstream_step);
-    addBuildTest(b, exe, build_web_wasm);
+    // A global cache holding the ZIR of the std files that every build
+    // lowers, which the tests that need an empty global cache start from
+    // instead of spending 5 s of CPU each on AstGen.
+    const zir = b.addRunArtifact(exe);
+    zir.setName("zap: global cache with std's ZIR");
+    zir.addArgs(&.{ "build-exe", "-fno-emit-bin", "-target", "x86_64-linux" });
+    zir.addFileArg(b.path("test/run/corpus.zig"));
+    zir.addArg("--global-cache-dir");
+    const std_zir = zir.addOutputDirectoryArg("global");
+    addRunTests(b, exe, test_step, upstream_step, std_zir);
+    addObjAndRunTests(b, exe, test_step, std_zir);
+    const translate_c = addLinkInputTests(b, exe, test_step, std_zir);
+    addDiagTests(b, exe, test_step, upstream_step, std_zir);
+    const build_test_step = addBuildTest(b, exe, build_web_wasm, translate_c);
+    spreadZapUsers(b, &exe.step, &zir.step, &.{ test_step, build_test_step });
 
     // Always ReleaseFast: a Debug build of zap says nothing about its speed.
     const bench_link = b.addExecutable(.{ .name = "bench-link", .root_module = b.createModule(.{
@@ -171,7 +185,7 @@ fn addFlags(b: *std.Build, r: *std.Build.Step.Run, flags: []const []const u8, sr
     if (!modules) r.addFileArg(b.path(src_path));
 }
 
-fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step) void {
+fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const io = b.graph.io;
     const host = b.graph.host.result;
     const host_runs_zap_output = host.cpu.arch == .x86_64 and host.os.tag == .linux;
@@ -348,6 +362,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                     \\log="$4.d/log"
                     \\fail() {{ cat "$log" >&2; exit 1; }}
                     \\nodonor() {{ if grep -q "replaying donor" "$log"; then echo "a build replayed a donor built with other libc settings" >&2; fail; fi; }}
+                    \\mkdir -p "$4.d/g1/zap" "$4.d/g2/zap"; cp -r "$6/zap/zir" "$4.d/g1/zap"; cp -r "$6/zap/zir" "$4.d/g2/zap"
                     \\{[static]s} --global-cache-dir "$4.d/g1" --cache-dir "$4.d/l1" "$4.d/a/{[file]s}" -femit-bin="$4.d/s1" 2>"$4.d/log" || fail
                     \\ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[libc]s} --global-cache-dir "$4.d/g1" --cache-dir "$4.d/l2" "$4.d/a/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
                     \\nodonor
@@ -372,6 +387,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                     \\cp "$3" "$4.d/a/rt.zig"
                     \\cp "$3" "$4.d/b/rt.zig"
                     \\cp "$1" "$4.d/{[donor_dir]s}/{[file]s}"
+                    \\mkdir -p "$4.d/g/zap"; cp -r "$6/zap/zir" "$4.d/g/zap"
                     \\log="$4.d/log"
                     \\fail() {{ cat "$log" >&2; exit 1; }}
                     \\{[zap]s} --cache-dir "$4.d/la" "$4.d/{[donor_dir]s}/{[file]s}" -femit-bin="$4.d/a/out" 2>"$4.d/log" || fail
@@ -425,9 +441,15 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 break :blk r;
             };
             compile.addFileInput(b.path("test/run/rt.zig"));
+            if (!upstream) {
+                const uses_std = std.mem.indexOf(u8, source, "@import(\"std\")") != null;
+                const edits = expect.rebuild_without.items.len != 0 or expect.lib_edit != null;
+                takes(b, &compile.step, if (edits) (if (uses_std) 10 else 1) else if (expect.donor_libc) 12 else if (expect.donor_without != null) (if (uses_std) 8 else 2) else if (uses_std) 2 else 1);
+            }
             const bin = if (!upstream and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null or expect.donor_without != null or expect.donor_libc)) bin: {
                 const out = compile.addOutputFileArg(name);
                 compile.addArtifactArg(zap);
+                compile.addDirectoryArg(std_zir);
                 break :bin out;
             } else compile.addPrefixedOutputFileArg("-femit-bin=", name);
             // CodeGen on worker threads gives the same output as on the
@@ -517,7 +539,7 @@ fn isThreadChecked(file: []const u8) bool {
 /// `test` runs `zap build-exe -fno-emit-bin <file>` from test/diag and
 /// checks stderr and exit status 1; `test-upstream` checks that upstream
 /// zig rejects the program too.
-fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step) void {
+fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, upstream_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const io = b.graph.io;
     b.dependOnDirectoryContents(b.path("test/diag"));
     var dir = b.root.openDir(io, "test/diag", .{ .iterate = true }) catch |err|
@@ -573,6 +595,7 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
         run.setEnvironmentVariable("ZAP_CACHE", "off");
         run.addCheck(.{ .expect_stderr_exact = expected.items });
         run.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        takes(b, &run.step, 2);
         test_step.dependOn(&run.step);
         if (earlier) |text| {
             // The same errors from an edit build, whose cache holds the
@@ -582,6 +605,7 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
             const edit = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
                 \\set -e
                 \\before=$(realpath "$1"); now=$(realpath "$2"); zap=$(realpath "$4")
+                \\mkdir -p "$3/g/zap"; cp -r "$5/zap/zir" "$3/g/zap"
                 \\cd "$3"
                 \\cp "$before" {[file]s}
                 \\"$zap" build-exe -target x86_64-linux {[file]s} -femit-bin=out --cache-dir l --global-cache-dir g{[args]s} 2>log || {{ cat log >&2; exit 2; }}
@@ -593,6 +617,7 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
             edit.addFileArg(b.path(src_path));
             _ = edit.addOutputDirectoryArg("edit");
             edit.addArtifactArg(zap);
+            edit.addDirectoryArg(std_zir);
             // Every line but the reference traces, whose frames for units
             // loaded green the edit build lacks (docs/architecture.md).
             var edit_lines = std.mem.splitScalar(u8, expected.items, '\n');
@@ -600,6 +625,7 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
                 if (line.len != 0 and !std.mem.startsWith(u8, line, "  ref: ")) edit.addCheck(.{ .expect_stderr_match = b.fmt("{s}\n", .{line}) });
             }
             edit.addCheck(.{ .expect_term = .{ .exited = 1 } });
+            takes(b, &edit.step, 5);
             test_step.dependOn(&edit.step);
         }
 
@@ -617,7 +643,7 @@ fn addDiagTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Bui
 /// stack trace needs the object's debug info, and edited through the cache
 /// as an object and a library (test/obj/cache.sh). `zap run`: test/obj/args.zig,
 /// whose arguments and exit status must pass through.
-fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, std_zir: std.Build.LazyPath) void {
     const host = b.graph.host.result;
     if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
     const obj = b.addRunArtifact(zap);
@@ -783,14 +809,19 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     }
 
     // build-obj and build-lib through the cache: test/obj/cache.sh.
-    const cache = b.addSystemCommand(&.{"sh"});
-    cache.setName("zap build-obj and build-lib cache");
-    cache.addFileArg(b.path("test/obj/cache.sh"));
-    cache.addArtifactArg(zap);
-    cache.addFileArg(b.path("test/obj/lib.zig"));
-    _ = cache.addOutputDirectoryArg("work");
-    cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
-    test_step.dependOn(&cache.step);
+    for ([_][]const u8{ "build-obj", "build-lib" }) |cmd| {
+        const cache = b.addSystemCommand(&.{"sh"});
+        cache.setName(b.fmt("zap {s} cache", .{cmd}));
+        cache.addFileArg(b.path("test/obj/cache.sh"));
+        cache.addArtifactArg(zap);
+        cache.addFileArg(b.path("test/obj/lib.zig"));
+        _ = cache.addOutputDirectoryArg("work");
+        cache.addArg(cmd);
+        cache.addDirectoryArg(std_zir);
+        cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &cache.step, 25);
+        test_step.dependOn(&cache.step);
+    }
 
     const zap_run = b.addRunArtifact(zap);
     zap_run.setName("zap run args");
@@ -801,6 +832,7 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     zap_run.addArgs(&.{ "--", "a", "b c", "" });
     zap_run.addCheck(.{ .expect_stdout_exact = "[a][b c][]\n" });
     zap_run.addCheck(.{ .expect_term = .{ .exited = 43 } });
+    takes(b, &zap_run.step, 5);
     test_step.dependOn(&zap_run.step);
 
     // Modules rooted at a ZON file and at a plain file.
@@ -828,6 +860,7 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     src_app.addArg("--global-cache-dir");
     const src_cache = src_app.addOutputDirectoryArg("src-module-cache");
     src_app.addCheck(.{ .expect_stdout_exact = "app\n" });
+    takes(b, &src_app.step, 5);
     const src_stem = b.addRunArtifact(zap);
     src_stem.setName("zap run @src module stem");
     src_stem.addArg("run");
@@ -851,6 +884,7 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     _ = self_test.addOutputDirectoryArg("self-test-cache");
     self_test.addCheck(.{ .expect_stderr_match = "All 2 tests passed." });
     self_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    takes(b, &self_test.step, 5);
     test_step.dependOn(&self_test.step);
 
     // Testing std itself after testing a file that uses std, in one global
@@ -880,20 +914,90 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
 
 /// `zap build` end to end: test/build/check.sh builds test/build/hello
 /// with zap as the build runner's compiler, in the default global cache,
-/// where zap keeps the build runner it compiles once per zap binary.
-fn addBuildTest(b: *std.Build, zap: *std.Build.Step.Compile, build_web_wasm: std.Build.LazyPath) void {
+/// where zap keeps the build runner it compiles once per zap binary. Its
+/// first part compiles the runner; the others wait for it and run at once,
+/// shape after `translate_c` has compiled translate-c there.
+fn addBuildTest(b: *std.Build, zap: *std.Build.Step.Compile, build_web_wasm: std.Build.LazyPath, translate_c: ?*std.Build.Step) *std.Build.Step {
     const host = b.graph.host.result;
     const step = b.step("test-build", "Check `zap build` end to end on test/build/hello");
-    if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
-    const run = b.addSystemCommand(&.{"sh"});
-    run.setName("zap build test/build/hello");
-    run.addFileArg(b.path("test/build/check.sh"));
-    run.addArtifactArg(zap);
-    run.addDirectoryArg(b.path("test/build/hello"));
-    _ = run.addOutputDirectoryArg("work");
-    run.addFileArg(build_web_wasm);
-    run.addCheck(.{ .expect_term = .{ .exited = 0 } });
-    step.dependOn(&run.step);
+    if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return step;
+    var first: ?*std.Build.Step = null;
+    for ([_][]const u8{ "build", "shape", "fuzz", "misc" }, [_]u32{ 32, 5, 20, 8 }) |part, seconds| {
+        const run = b.addSystemCommand(&.{"sh"});
+        run.setName(b.fmt("zap build test/build/hello ({s})", .{part}));
+        run.addFileArg(b.path("test/build/check.sh"));
+        run.addArtifactArg(zap);
+        run.addDirectoryArg(b.path("test/build/hello"));
+        _ = run.addOutputDirectoryArg("work");
+        run.addFileArg(build_web_wasm);
+        run.addArg(part);
+        run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &run.step, seconds);
+        if (first) |f| run.step.dependOn(f) else first = &run.step;
+        if (std.mem.eql(u8, part, "shape")) if (translate_c) |tc| run.step.dependOn(tc);
+        step.dependOn(&run.step);
+    }
+    return step;
+}
+
+/// The build runner starts a ready step on a worker thread only while one
+/// of its `-j` workers (default: one fewer than the CPUs) is free, and
+/// otherwise runs it at once in the thread that made it ready. When zap is
+/// built, that one thread would make the few hundred steps that run zap
+/// ready and run most of them itself, one after another, while the other
+/// workers sat idle (measured: 1.4 steps busy on average on 4 CPUs).
+/// Instead each step that runs zap waits for one of `-j` gates, which wait
+/// for zap and then `first`, so that each gate's thread runs its share,
+/// dealt heaviest first to the gate with the least work so far by `takes`
+/// (the runner shuffles the order each gate runs them in). Their waits on zap and `first` move to the gate: the thread
+/// that finished either would run the step otherwise. (A step that waits
+/// for another of them, as test/build's parts do, runs on that one's
+/// thread.)
+fn spreadZapUsers(b: *std.Build, zap: *std.Build.Step, first: *std.Build.Step, roots: []const *std.Build.Step) void {
+    const Step = std.Build.Step;
+    const workers = @max(1, (std.Thread.getCpuCount() catch 1) -| 1);
+    const gates = b.allocator.alloc(*Step, workers) catch @panic("OOM");
+    const loads = b.allocator.alloc(usize, workers) catch @panic("OOM");
+    for (gates, loads, 0..) |*g, *load, i| {
+        const gate = b.allocator.create(Step.TopLevel) catch @panic("OOM");
+        gate.* = .{ .step = .init(.{ .tag = .top_level, .name = b.fmt("zap users {d}", .{i}), .owner = b }), .description = "" };
+        gate.step.dependOn(first);
+        g.* = &gate.step;
+        load.* = 0;
+    }
+    var seen: std.AutoArrayHashMapUnmanaged(*Step, void) = .empty;
+    var users: std.ArrayList(*Step) = .empty;
+    for (roots) |r| seen.put(b.allocator, r, {}) catch @panic("OOM");
+    var i: usize = 0;
+    while (i < seen.count()) : (i += 1) {
+        const s = seen.keys()[i];
+        for (s.dependencies.items) |d| seen.put(b.allocator, d, {}) catch @panic("OOM");
+        if (s != first and std.mem.indexOfScalar(*Step, s.dependencies.items, zap) != null) users.append(b.allocator, s) catch @panic("OOM");
+    }
+    std.mem.sort(*Step, users.items, {}, struct {
+        fn heavier(_: void, x: *Step, y: *Step) bool {
+            return stepSeconds(x) > stepSeconds(y);
+        }
+    }.heavier);
+    for (users.items) |s| {
+        const least = std.mem.indexOfMin(usize, loads);
+        for (s.dependencies.items) |*d| {
+            if (d.* == zap or d.* == first) d.* = gates[least];
+        }
+        loads[least] += stepSeconds(s);
+    }
+}
+
+/// About how many seconds a step that runs zap takes with a Debug zap on a
+/// 4-CPU orb, where it is more than 1, for `spreadZapUsers`.
+var step_seconds: std.AutoHashMapUnmanaged(*std.Build.Step, u32) = .empty;
+
+fn takes(b: *std.Build, s: *std.Build.Step, seconds: u32) void {
+    step_seconds.put(b.allocator, s, seconds) catch @panic("OOM");
+}
+
+fn stepSeconds(s: *std.Build.Step) u32 {
+    return step_seconds.get(s) orelse 1;
 }
 
 fn defaultZigLibDir(b: *std.Build) []const u8 {
@@ -955,9 +1059,10 @@ fn buildWebWasm(b: *std.Build, zig_lib_dir: []const u8) std.Build.LazyPath {
 /// upstream's `zig cc` and the system's `cc` compile them, non-PIC and
 /// -fPIC, and the program must print what upstream's link of the same
 /// inputs prints.
-fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+/// Returns the step that compiles translate-c with zap first.
+fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Build.Step, std_zir: std.Build.LazyPath) ?*std.Build.Step {
     const host = b.graph.host.result;
-    if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return;
+    if (host.cpu.arch != .x86_64 or host.os.tag != .linux) return null;
     const expect = "44 108 12 gamma hello from C 0 4 9 copied\nthread 712\n712 4 23\nextern data data 30 30\nextern data data 23 111 1\n";
     const zig = upstreamZig(b);
     const cc = b.findProgram(.{ .names = &.{"cc"} });
@@ -1151,6 +1256,7 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     tc_native.setCwd(b.path("."));
     tc_native.setEnvironmentVariable("NIX_CFLAGS_COMPILE", "-isystem test/link_input/tc_native/sys");
     tc_native.addCheck(.{ .expect_stdout_match = "pub extern fn tcn_native() c_int;" });
+    takes(b, &tc_native.step, 13);
     test_step.dependOn(&tc_native.step);
     // SysV aggregates between Zig and C both ways: INTEGER, SSE and mixed
     // eightbytes, odd sizes, MEMORY, registers running out, a function
@@ -1307,16 +1413,23 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&r.step);
     }
 
-    // Objects and archives through the cache: test/link_input/cache.sh.
-    const cache = b.addSystemCommand(&.{"sh"});
-    cache.setName("zap build-exe with link inputs, cached");
-    cache.addFileArg(b.path("test/link_input/cache.sh"));
-    cache.addArtifactArg(zap);
-    cache.addArg(zig);
-    cache.addDirectoryArg(b.path("test/link_input"));
-    _ = cache.addOutputDirectoryArg("work");
-    cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
-    test_step.dependOn(&cache.step);
+    // Objects and archives through the cache: test/link_input/cache.sh,
+    // whose parts run at once.
+    for ([_][]const u8{ "objects", "c-sources", "lc-objects", "shared", "shared-objects" }) |part| {
+        const cache = b.addSystemCommand(&.{"sh"});
+        cache.setName(b.fmt("zap build-exe with link inputs, cached ({s})", .{part}));
+        cache.addFileArg(b.path("test/link_input/cache.sh"));
+        cache.addArtifactArg(zap);
+        cache.addArg(zig);
+        cache.addDirectoryArg(b.path("test/link_input"));
+        _ = cache.addOutputDirectoryArg("work");
+        cache.addArg(part);
+        cache.addDirectoryArg(std_zir);
+        cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &cache.step, if (std.mem.eql(u8, part, "objects")) 38 else 18);
+        test_step.dependOn(&cache.step);
+    }
+    return &tc_native.step;
 }
 
 fn upstreamZig(b: *std.Build) []const u8 {
