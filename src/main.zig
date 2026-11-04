@@ -224,6 +224,23 @@ pub fn main(init_std: std.process.Init) !void {
     }
 }
 
+/// The target as the cache keys it, salting the store seed and so the
+/// compilation and donor keys. Instrumented atoms (`-ffuzz`) differ from
+/// plain ones, and no node key holds a module's flag, so each set of
+/// modules that fuzz gets store entries of its own: `+fuzz`, then each
+/// module whose flag differs from the root module's, as `+name` or
+/// `-name` (`-root` if the root module does not fuzz).
+fn cacheTarget(arena: std.mem.Allocator, opts: *const Options) ![]const u8 {
+    if (!opts.fuzz) return "x86_64-linux";
+    var s: std.ArrayList(u8) = .empty;
+    try s.appendSlice(arena, "x86_64-linux+fuzz");
+    if (!opts.root_fuzz) try s.appendSlice(arena, "-root");
+    for (opts.modules) |m| {
+        if (m.fuzz.? != opts.root_fuzz) try s.print(arena, "{c}{s}", .{ @as(u8, if (m.fuzz.?) '+' else '-'), m.name });
+    }
+    return s.items;
+}
+
 /// What one compilation needs besides its output path, resolved from the
 /// options.
 pub const Job = struct {
@@ -233,6 +250,8 @@ pub const Job = struct {
     builtin_dir: []const u8,
     /// The fuzzer's `builtin` (`-ffuzz` on an executable), else null.
     fuzzer_builtin_dir: ?[]const u8,
+    /// The target as the cache keys it (`cacheTarget`).
+    cache_target: []const u8,
     /// The command line that keys the compilation in the cache.
     compile_args: []const []const u8,
     stem: []const u8,
@@ -292,6 +311,7 @@ pub const Job = struct {
             .cache_dirs = cache_dirs,
             .builtin_dir = builtin_dir,
             .fuzzer_builtin_dir = fuzzer_builtin_dir,
+            .cache_target = try cacheTarget(arena, &opts),
             .compile_args = compile_args.items,
             .stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path),
             .run_test = is_test and !opts.test_no_exec and !opts.listen,
@@ -300,12 +320,6 @@ pub const Job = struct {
             .io = init_.io,
             .gpa = init_.gpa,
         };
-    }
-
-    /// The target as the cache keys it: instrumented atoms (`-ffuzz`)
-    /// differ from plain ones, so they get store entries of their own.
-    fn cacheTarget(job: *const Job) []const u8 {
-        return if (job.opts.fuzz) "x86_64-linux+fuzz" else "x86_64-linux";
     }
 
     fn zapLocal(job: *const Job, arena: std.mem.Allocator) []const u8 {
@@ -323,7 +337,7 @@ pub const Job = struct {
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
-        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.opts.root_name, job.cacheTarget(), env.get("ZAP_CACHE_TIMING") != null) catch |err| {
+        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.opts.root_name, job.cache_target, env.get("ZAP_CACHE_TIMING") != null) catch |err| {
             std.log.warn("unable to use the cache: {t}", .{err});
             return null;
         };
@@ -683,7 +697,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
     var out_path: ?[]const u8 = null;
     var docs_path: ?[]const u8 = null;
     if (job) |*j| {
-        _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.cacheTarget());
+        _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.cache_target);
         digest = Incremental.outputDigest(key);
         const name = try outputName(arena, opts.command, opts.dynamic, j.stem);
         out_path = switch (opts.emit_bin) {
@@ -1212,10 +1226,34 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         fatal("unable to add module \"{s}\": already exists as '{s}'", .{ m.name, prev });
     }
     opts.root_fuzz = root_fuzz orelse fuzz orelse false;
+    const seen = try arena.alloc(bool, modules.items.len);
+    @memset(seen, false);
+    inheritFuzz(modules.items, seen, opts.root_deps, opts.root_fuzz);
+    for (modules.items) |*m| {
+        if (m.fuzz == null) m.fuzz = opts.root_fuzz; // no module depends on it
+    }
     opts.fuzz = opts.root_fuzz or for (modules.items) |m| {
-        if (m.fuzz == true) break true;
+        if (m.fuzz.?) break true;
     } else false;
     return opts;
+}
+
+/// `-ffuzz` per module, as upstream's `Module.create`: a module without
+/// its own flag takes that of the module that first depends on it, depth
+/// first from the root module, whose `deps` and flag are given. `seen`
+/// has a slot per module.
+fn inheritFuzz(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []const u8, parent: bool) void {
+    for (deps) |spec| {
+        const name = if (std.mem.indexOfScalar(u8, spec, '=')) |e| spec[e + 1 ..] else spec;
+        for (modules, seen) |*m, *s| {
+            if (!std.mem.eql(u8, m.name, name)) continue;
+            if (s.*) break;
+            s.* = true;
+            m.fuzz = m.fuzz orelse parent;
+            inheritFuzz(modules, seen, m.deps, m.fuzz.?);
+            break;
+        }
+    }
 }
 
 /// Only the x86_64-linux backend exists so far; refuses aarch64-macos

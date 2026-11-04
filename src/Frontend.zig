@@ -100,7 +100,8 @@ pub const ModuleArg = struct {
     path: []const u8,
     /// `name` or `name=module`.
     deps: []const []const u8,
-    /// Its `-ffuzz` or `-fno-fuzz`, if any.
+    /// Its `-ffuzz` or `-fno-fuzz`, if any; after `main.parseOptions`, the
+    /// flag it inherits otherwise.
     fuzz: ?bool = null,
 };
 
@@ -242,26 +243,10 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
     }.f;
     fe.modules.items[@backingInt(fe.main_module)].deps = try resolve(&fe, options.root_name, options.root_deps);
     for (options.modules, first_extra..) |m, k| fe.modules.items[k].deps = try resolve(&fe, options.root_name, m.deps);
-    // `-ffuzz` per module, as upstream's `Module.create`: a module's own
-    // flag, else that of the module that first depends on it, depth first
-    // from the main module.
-    for ([_]Module.Index{ .root, .std, .builtin }) |m| fe.modules.items[@backingInt(m)].fuzz = options.fuzz;
-    const Inherit = struct {
-        fn visit(f_fe: *Frontend, explicit: []const ModuleArg, first: usize, m: Module.Index, parent: bool, seen: []bool) void {
-            const k = @backingInt(m);
-            if (seen[k]) return;
-            seen[k] = true;
-            const mod = &f_fe.modules.items[k];
-            mod.fuzz = if (k >= first) explicit[k - first].fuzz orelse parent else parent;
-            for (mod.deps) |d| visit(f_fe, explicit, first, d.module, mod.fuzz, seen);
-        }
-    };
-    const seen = try gpa.alloc(bool, fe.modules.items.len);
-    defer gpa.free(seen);
-    @memset(seen, false);
-    for ([_]Module.Index{ .root, .std, .builtin, .compiler_rt }) |m| seen[@backingInt(m)] = true;
-    seen[@backingInt(fe.main_module)] = false;
-    Inherit.visit(&fe, options.modules, first_extra, fe.main_module, options.fuzz, seen);
+    // `-ffuzz` per module: the main module's flag for it, std, builtin
+    // and the test runner; each other module's resolved by `main`.
+    for ([_]Module.Index{ .root, .std, .builtin, fe.main_module }) |m| fe.modules.items[@backingInt(m)].fuzz = options.fuzz;
+    for (options.modules, first_extra..) |m, k| fe.modules.items[k].fuzz = m.fuzz orelse options.fuzz;
     if (options.fuzzer_builtin_dir) |dir| {
         const root: Module.Index = @fromBackingInt(@intCast(fe.modules.items.len));
         const family: [3]Module.Index = .{ @fromBackingInt(@backingInt(root) + 1), root, @fromBackingInt(@backingInt(root) + 2) };

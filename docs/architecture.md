@@ -4869,7 +4869,11 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   (`Elf.Symbols.bounds`). Objects do not get the sections yet.
 - **Cache.** Instrumented atoms differ from plain ones, so the store
   seed and the compilation key include the flag (the target string gets
-  `+fuzz`). The donor key hashes the store seed, so fuzz and plain builds
+  `+fuzz`). No node key holds a module's flag, so the target string also
+  names each module whose effective flag differs from the main module's
+  (`+lib`, `-lib`, `-root`): builds with different sets of fuzzing
+  modules share no store entries and never donate to each other. The
+  donor key hashes the store seed, so fuzz and plain builds
   never donate to each other. The fuzzer's `=std@fuzzer` files have the
   same paths as `std`'s; the replay tells them apart because it matches
   inputs by key (`<module>:<path>`), so an edit of a std file outdates
