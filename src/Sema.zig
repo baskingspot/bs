@@ -500,6 +500,11 @@ pub const Src = struct {
         /// Element `index` of the array initialization at `node`
         /// (upstream's `init_elem` for arrays).
         init_elem: struct { node: Ast.Node.Offset, index: u32 },
+        /// Element `index / 2` of the left (even `index`) or right (odd)
+        /// operand of the `++` at `node`: that element if the operand is
+        /// an array initialization, else the operand (upstream's
+        /// `array_cat_lhs` and `array_cat_rhs`).
+        cat_elem: struct { node: Ast.Node.Offset, index: u32 },
         /// The type of the array or struct initialization at `node`
         /// (upstream's `node_offset_init_ty`).
         init_ty: Ast.Node.Offset,
@@ -634,6 +639,16 @@ pub const Src = struct {
                 const init = tree.fullArrayInit(&buf, node) orelse return tree.nodeToSpan(node);
                 return tree.nodeToSpan(if (a.index < init.ast.elements.len) init.ast.elements[a.index] else node);
             },
+            .cat_elem => |a| {
+                const node = a.node.toAbsolute(src.base);
+                if (tree.nodeTag(node) != .array_cat) return tree.nodeToSpan(node);
+                const lhs, const rhs = tree.nodeData(node).node_and_node;
+                const operand = if (a.index % 2 == 0) lhs else rhs;
+                var buf: [2]Ast.Node.Index = undefined;
+                const init = tree.fullArrayInit(&buf, operand) orelse return tree.nodeToSpan(operand);
+                const i = a.index / 2;
+                return tree.nodeToSpan(if (i < init.ast.elements.len) init.ast.elements[i] else operand);
+            },
             .call_arg => |a| {
                 const node = a.node.toAbsolute(src.base);
                 var buf: [2]Ast.Node.Index = undefined;
@@ -767,7 +782,7 @@ pub const Src = struct {
                         const last = tree.lastToken(inputs[inputs.len - 1]);
                         return .{ .start = first.start, .main = first.main, .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)) };
                     },
-                    .error_union, .merge_error_sets, .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .array_access => {
+                    .error_union, .merge_error_sets, .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat, .div, .mod, .shl, .shl_sat, .shr, .bit_and, .bit_or, .bit_xor, .array_cat, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .assign_add, .assign_add_wrap, .assign_add_sat, .assign_sub, .assign_sub_wrap, .assign_sub_sat, .assign_mul, .assign_mul_wrap, .assign_mul_sat, .assign_div, .assign_mod, .assign_shl, .assign_shl_sat, .assign_shr, .assign_bit_and, .assign_bit_or, .assign_bit_xor, .array_access => {
                         const lhs, const rhs = tree.nodeData(node).node_and_node;
                         return tree.nodeToSpan(if (o.index == 0) lhs else rhs);
                     },
@@ -16891,16 +16906,19 @@ fn zirArrayCat(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             try sema.tupleField(block, rhs, @intCast(i - a.types.len));
         return sema.aggregate(block, src, ty, elems);
     }
-    const l = try sema.arrayCatInfo(block, src, lhs, rhs_ty) orelse
-        return sema.fail(block, src, "expected indexable; found '{f}'", .{sema.fmtType(lhs_ty)});
-    const r = try sema.arrayCatInfo(block, src, rhs, lhs_ty) orelse
-        return sema.fail(block, src, "expected indexable; found '{f}'", .{sema.fmtType(rhs_ty)});
+    // Errors about an operand point at it, as upstream.
+    const lhs_src = src.operandSrc(0);
+    const rhs_src = src.operandSrc(1);
+    const l = try sema.arrayCatInfo(block, lhs_src, lhs, rhs_ty) orelse
+        return sema.fail(block, lhs_src, "expected indexable; found '{f}'", .{sema.fmtType(lhs_ty)});
+    const r = try sema.arrayCatInfo(block, rhs_src, rhs, lhs_ty) orelse
+        return sema.fail(block, rhs_src, "expected indexable; found '{f}'", .{sema.fmtType(rhs_ty)});
     const elem_ty = try sema.peerPair(block, src, l.elem, r.elem);
     // Both sentinels must agree; a lone sentinel is kept.
     var sentinel: Index = .none;
     if (l.sentinel != .none or r.sentinel != .none) {
-        const ls: Index = if (l.sentinel == .none) .none else sema.resolveValue(try sema.coerce(block, elem_ty, .fromInterned(l.sentinel), src)).?;
-        const rs: Index = if (r.sentinel == .none) .none else sema.resolveValue(try sema.coerce(block, elem_ty, .fromInterned(r.sentinel), src)).?;
+        const ls: Index = if (l.sentinel == .none) .none else sema.resolveValue(try sema.coerce(block, elem_ty, .fromInterned(l.sentinel), lhs_src)).?;
+        const rs: Index = if (r.sentinel == .none) .none else sema.resolveValue(try sema.coerce(block, elem_ty, .fromInterned(r.sentinel), rhs_src)).?;
         sentinel = if (ls == .none) rs else if (rs == .none or rs == ls) ls else .none;
     }
     const len = l.len + r.len;
@@ -16908,8 +16926,8 @@ fn zirArrayCat(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
     const is_ptr = Type.class(ip, lhs_ty) == .pointer or Type.class(ip, rhs_ty) == .pointer;
     // Comptime strings concatenate as bytes, not element by element.
     if (elem_ty == .u8_type and len != 0) bytes: {
-        const lb = try sema.aggregateBytes(try sema.catValue(block, src, lhs, l.len) orelse break :bytes) orelse break :bytes;
-        const rb = try sema.aggregateBytes(try sema.catValue(block, src, rhs, r.len) orelse break :bytes) orelse break :bytes;
+        const lb = try sema.aggregateBytes(try sema.catValue(block, lhs_src, lhs, l.len) orelse break :bytes) orelse break :bytes;
+        const rb = try sema.aggregateBytes(try sema.catValue(block, rhs_src, rhs, r.len) orelse break :bytes) orelse break :bytes;
         const buf = try sema.arena.alloc(u8, @intCast(len + @intFromBool(sentinel != .none)));
         @memcpy(buf[0..lb.len], lb);
         @memcpy(buf[lb.len..][0..rb.len], rb);
@@ -16918,8 +16936,8 @@ fn zirArrayCat(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         return if (is_ptr) sema.analyzeRef(block, src, result) else result;
     }
     const elems = try sema.arena.alloc(Ref, @intCast(len + @intFromBool(sentinel != .none)));
-    try sema.catElems(block, src, lhs, elem_ty, elems[0..@intCast(l.len)]);
-    try sema.catElems(block, src, rhs, elem_ty, elems[@intCast(l.len)..@intCast(len)]);
+    try sema.catElems(block, src, 0, lhs, elem_ty, elems[0..@intCast(l.len)]);
+    try sema.catElems(block, src, 1, rhs, elem_ty, elems[@intCast(l.len)..@intCast(len)]);
     if (sentinel != .none) elems[@intCast(len)] = .fromInterned(sentinel);
     const result = try sema.aggregate(block, src, result_ty, elems);
     return if (is_ptr) sema.analyzeRef(block, src, result) else result;
@@ -16992,14 +17010,19 @@ fn aggregateBytes(sema: *Sema, val: Index) !?[]const u8 {
 }
 
 /// The elements of `++` operand `operand`, coerced to `elem_ty`.
-fn catElems(sema: *Sema, block: *Block, src: Src, operand: Ref, elem_ty: Index, out: []Ref) CompileError!void {
-    const val = try sema.catValue(block, src, operand, out.len);
+/// The elements of `++` operand `side` (0 for the left one) at `src`,
+/// coerced to `elem_ty`.
+fn catElems(sema: *Sema, block: *Block, src: Src, side: u1, operand: Ref, elem_ty: Index, out: []Ref) CompileError!void {
+    const operand_src = src.operandSrc(side);
+    const val = try sema.catValue(block, operand_src, operand, out.len);
+    const off = src.nodeOffset();
     for (out, 0..) |*e, i| {
         const elem: Ref = if (val) |v|
             .fromInterned(try sema.elemValue(v, i))
         else
-            try sema.elemVal(block, src, operand, .fromInterned(try sema.intValue(.usize_type, i)), false);
-        e.* = try sema.coerce(block, elem_ty, elem, src);
+            try sema.elemVal(block, operand_src, operand, .fromInterned(try sema.intValue(.usize_type, i)), false);
+        const elem_src: Src = if (off) |o| .{ .base = src.base, .loc = .{ .cat_elem = .{ .node = o, .index = @intCast(i * 2 + side) } } } else operand_src;
+        e.* = try sema.coerce(block, elem_ty, elem, elem_src);
     }
 }
 
