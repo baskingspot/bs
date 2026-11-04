@@ -5973,6 +5973,15 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     }
     // Each thread has its own copy of a threadlocal variable, at an offset
     // from the thread pointer.
+    // As upstream, that offset is not comptime-known.
+    if (nav.is_threadlocal and block.is_comptime and !block.is_typeof) {
+        // In a container-level initializer, upstream fails where it needs
+        // the whole initializer's value.
+        const in_init = sema.owner_nav != .none and sema.owner == .nav_val and
+            block.src_base == sema.code.getDeclaration(sema.ip.getNav(sema.owner_nav).zir_inst).src_node;
+        const at: Src = if (in_init) .{ .base = block.src_base, .loc = .var_init } else src;
+        return sema.failNeededComptime(block, at, block.comptime_reason orelse "the address of a threadlocal variable is runtime-known");
+    }
     if (nav.is_threadlocal and !block.is_comptime) {
         return sema.addInst(block, .{ .tag = .tls_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(nav_index) } } });
     }
