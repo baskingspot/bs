@@ -28,6 +28,13 @@ pub const Op = union(enum) {
     sub_float,
     mul_float,
     div_float,
+    /// `@min` and `@max`: `min_int`/`max_int` or `min_float`/`max_float`.
+    min,
+    max,
+    /// Float `-x`, `@abs`, and `@sqrt`.
+    neg,
+    abs,
+    sqrt,
     cmp: std.math.CompareOperator,
     reduce: Ir.ReduceOp,
     select,
@@ -112,14 +119,19 @@ pub fn native(arch: std.Target.Cpu.Arch, ip: *const InternPool, op: Op, ty: Inde
         .add_wrap, .sub_wrap, .bit_and, .bit_or, .xor, .not => !l.isFloat(),
         // SSE2 multiplies 16-bit lanes, and 32-bit ones through pmuludq.
         .mul_wrap => l == .i16 or l == .i32,
-        .add_float, .sub_float, .mul_float, .div_float => l.isFloat(),
-        // A bool vector result lives in a general-purpose register. SSE2
-        // orders 64-bit integers only in many instructions.
+        .add_float, .sub_float, .mul_float, .div_float, .neg, .abs, .sqrt => l.isFloat(),
+        // SSE2 orders 64-bit integers only in many instructions.
+        .min, .max => l != .i64,
+        // A bool vector result lives in a general-purpose register;
+        // 64-bit lanes only compare equal, as for `min`.
         .cmp => |c| len <= max_bools and (l != .i64 or c == .eq or c == .neq),
         .select => len <= max_bools,
+        // Float reductions are left folds, whose order a tree would
+        // change.
         .reduce => |r| switch (r) {
             .@"and", .@"or", .xor, .add => !l.isFloat(),
-            .min, .max, .mul => false,
+            .min, .max => !l.isFloat() and l != .i64,
+            .mul => l == .i16 or l == .i32,
         },
         .shuffle => true,
     };

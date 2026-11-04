@@ -161,8 +161,9 @@ pub const Inst = struct {
         // Vectors. Where `codegen/vector.zig` says the target's backend
         // lowers an operation natively, Sema emits it on whole vectors:
         // `add_wrap`, `sub_wrap`, `mul_wrap`, `bit_and`, `bit_or`, `xor`,
-        // `not`, and the float arithmetic element by element on operands of
-        // one vector type, `load`, `store`, and `bitcast` on the whole
+        // `not`, and the float arithmetic (`add_float` ... `max_float`,
+        // `neg_float`, `abs_float`, `sqrt`) element by element on operands
+        // of one vector type, `load`, `store`, and `bitcast` on the whole
         // value, and the instructions below. Other vector operations are
         // scalarized by Sema.
 
@@ -175,6 +176,11 @@ pub const Inst = struct {
         /// float `add` and `mul` observe; float `min` and `max` are
         /// `min_float` and `max_float`).
         reduce,
+        /// `bin_op`: `@min` and `@max` of integer vectors, element by
+        /// element. (Sema lowers scalar integer `@min` and `@max` to a
+        /// compare and a select.)
+        min_int,
+        max_int,
         /// `ty_pl` with `Select`: the vector of type `ty` whose element `i`
         /// is `a[i]` where bool vector `pred` has element `i` set, else
         /// `b[i]`.
@@ -674,7 +680,7 @@ pub fn typeOfIndex(ir: *const Ir, inst: Inst.Index, ip: *const InternPool) Inter
         .store, .atomic_store, .set_union_tag, .set_err_return_trace, .memcpy, .memmove, .memset, .dbg_stmt, .dbg_inline_begin, .dbg_inline_end, .vector_store_elem, .breakpoint, .comptime_tick, .comptime_quota, .comptime_dep, .comptime_effect => .void_type,
         .comptime_exit => .noreturn_type,
         .add_wrap, .sub_wrap, .mul_wrap, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .bit_and, .bit_or, .xor, .shl, .shr => ir.typeOf(data.bin_op.lhs, ip),
-        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float => ir.typeOf(data.bin_op.lhs, ip),
+        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .min_int, .max_int => ir.typeOf(data.bin_op.lhs, ip),
         .neg_float, .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .abs_float, .floor, .ceil, .round, .trunc_float => ir.typeOf(data.un_op, ip),
         .mul_add => ir.typeOf(data.pl_op.operand, ip),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .is_null, .is_non_null, .is_err, .is_non_err => .bool_type,

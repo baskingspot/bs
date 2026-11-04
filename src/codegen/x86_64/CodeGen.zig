@@ -2441,9 +2441,12 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             try vector.gen(cg, inst, tag, data)
         else
             try cg.genFloat(inst, tag, data),
-        .cmp_vector, .reduce, .select, .shuffle => try vector.gen(cg, inst, tag, data),
-        .min_float, .max_float, .neg_float, .abs_float => try cg.genFloat(inst, tag, data),
-        .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .floor, .ceil, .round, .trunc_float => try cg.genFloat(inst, tag, data),
+        .cmp_vector, .reduce, .select, .shuffle, .min_int, .max_int => try vector.gen(cg, inst, tag, data),
+        .min_float, .max_float, .neg_float, .abs_float, .sqrt => if (vector.lowers(cg, inst))
+            try vector.gen(cg, inst, tag, data)
+        else
+            try cg.genFloat(inst, tag, data),
+        .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .floor, .ceil, .round, .trunc_float => try cg.genFloat(inst, tag, data),
         .mul_add, .float_cast, .float_from_int, .int_from_float => try cg.genFloat(inst, tag, data),
         .not => {
             const ty = data.ty_op.ty;

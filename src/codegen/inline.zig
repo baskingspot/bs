@@ -329,7 +329,7 @@ const Copier = struct {
             .unwrap_errunion_payload, .unwrap_errunion_err, .unwrap_errunion_payload_ptr, .unwrap_errunion_err_ptr, .errunion_payload_ptr_set => data.ty_op.operand = c.ref(data.ty_op.operand),
             .wrap_errunion_payload, .wrap_errunion_err, .get_union_tag, .tag_name => data.ty_op.operand = c.ref(data.ty_op.operand),
             .store, .add_wrap, .sub_wrap, .mul_wrap, .add_float, .sub_float, .mul_float, .div_float, .div_trunc, .div_floor, .div_ceil, .rem, .mod => data.bin_op = .{ .lhs = c.ref(data.bin_op.lhs), .rhs = c.ref(data.bin_op.rhs) },
-            .min_float, .max_float, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => data.bin_op = .{ .lhs = c.ref(data.bin_op.lhs), .rhs = c.ref(data.bin_op.rhs) },
+            .min_float, .max_float, .min_int, .max_int, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => data.bin_op = .{ .lhs = c.ref(data.bin_op.lhs), .rhs = c.ref(data.bin_op.rhs) },
             .atomic_store, .ptr_elem_val, .slice_elem_val, .array_elem_val, .set_union_tag, .memcpy, .memmove, .memset => data.bin_op = .{ .lhs = c.ref(data.bin_op.lhs), .rhs = c.ref(data.bin_op.rhs) },
             .add_with_overflow, .sub_with_overflow, .mul_with_overflow, .ptr_elem_ptr, .slice_elem_ptr, .slice, .ptr_add => data.ty_pl.payload = try c.payload(Ir.Bin, data.ty_pl.payload),
             .mul_add, .vector_store_elem => data.pl_op = .{ .operand = c.ref(data.pl_op.operand), .payload = try c.payload(Ir.Bin, data.pl_op.payload) },
@@ -510,7 +510,7 @@ const Hasher = struct {
                 try h.index(data.ty_op.ty);
                 try h.ref(data.ty_op.operand);
             },
-            .store, .add_wrap, .sub_wrap, .mul_wrap, .add_float, .sub_float, .mul_float, .div_float, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .min_float, .max_float, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .atomic_store, .ptr_elem_val, .slice_elem_val, .array_elem_val, .set_union_tag, .memcpy, .memmove, .memset => {
+            .store, .add_wrap, .sub_wrap, .mul_wrap, .add_float, .sub_float, .mul_float, .div_float, .div_trunc, .div_floor, .div_ceil, .rem, .mod, .min_float, .max_float, .min_int, .max_int, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq, .atomic_store, .ptr_elem_val, .slice_elem_val, .array_elem_val, .set_union_tag, .memcpy, .memmove, .memset => {
                 try h.ref(data.bin_op.lhs);
                 try h.ref(data.bin_op.rhs);
             },

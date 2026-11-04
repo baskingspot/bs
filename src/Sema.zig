@@ -10510,6 +10510,11 @@ fn analyzeNegateWrap(sema: *Sema, block: *Block, src: Src, operand: Ref) Compile
 }
 
 fn negate(sema: *Sema, block: *Block, src: Src, operand: Ref, wrap: bool) CompileError!Ref {
+    if (sema.vectorLen(sema.typeOf(operand)) != null) {
+        const float = Type.class(sema.ip, Type.childType(sema.ip, sema.typeOf(operand))) == .float;
+        if (float and !wrap) if (try sema.vectorUnaryOp(block, .neg, .neg_float, operand)) |r| return r;
+        if (!float and wrap) if (try sema.vectorUnaryOp(block, .neg, .sub_wrap, operand)) |r| return r;
+    }
     if (try sema.vectorUnary(block, src, operand, if (wrap) analyzeNegateWrap else analyzeNegate)) |r| return r;
     const ty = sema.typeOf(operand);
     switch (Type.class(sema.ip, ty)) {
@@ -10883,6 +10888,8 @@ fn analyzeFloatArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Ta
 /// `@abs`: integers become unsigned of the same width.
 fn analyzeAbs(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!Ref {
     const ip = sema.ip;
+    if (sema.vectorLen(sema.typeOf(operand)) != null and Type.class(ip, Type.childType(ip, sema.typeOf(operand))) == .float)
+        if (try sema.vectorUnaryOp(block, .abs, .abs_float, operand)) |r| return r;
     if (try sema.vectorUnary(block, src, operand, analyzeAbs)) |r| return r;
     const ty = sema.typeOf(operand);
     switch (Type.class(ip, ty)) {
@@ -10932,6 +10939,8 @@ fn analyzeFloatNegate(sema: *Sema, block: *Block, src: Src, operand: Ref) Compil
 /// `@sqrt`, `@sin`, ..., `@round`, and `@abs` of a float.
 fn analyzeFloatUnary(sema: *Sema, block: *Block, src: Src, op: Ir.Inst.Tag, operand: Ref) CompileError!Ref {
     const ty = sema.typeOf(operand);
+    if (op == .sqrt and sema.vectorLen(ty) != null and Type.class(sema.ip, Type.childType(sema.ip, ty)) == .float)
+        if (try sema.vectorUnaryOp(block, .sqrt, .sqrt, operand)) |r| return r;
     if (sema.vectorLen(ty)) |len| return sema.vectorMap(block, src, len, .none, &.{operand}, struct {
         op: Ir.Inst.Tag,
         fn call(o: @This(), s: *Sema, b: *Block, sr: Src, e: []const Ref) CompileError!Ref {
@@ -20890,10 +20899,27 @@ fn vectorArith(sema: *Sema, block: *Block, tag: Zir.Inst.Tag, ty: Index, lhs: Re
         .sub => if (float) .{ .sub_float, .sub_float } else return null,
         .mul => if (float) .{ .mul_float, .mul_float } else return null,
         .div => if (float) .{ .div_float, .div_float } else return null,
+        .min => if (float) .{ .min, .min_float } else .{ .min, .min_int },
+        .max => if (float) .{ .max, .max_float } else .{ .max, .max_int },
         else => return null,
     };
     if (!try sema.vectorNative(block, op, ty, &.{ lhs, rhs })) return null;
     return try sema.addBinOp(block, ir_tag, lhs, rhs);
+}
+
+/// Float `-operand`, `@abs` or `@sqrt` (`op`, as IR tag `tag`), or integer
+/// `-%operand` (`.neg`, `.sub_wrap`), on a vector as one instruction
+/// (`vectorNative`), or null.
+fn vectorUnaryOp(sema: *Sema, block: *Block, op: vector.Op, tag: Ir.Inst.Tag, operand: Ref) CompileError!?Ref {
+    const ty = sema.typeOf(operand);
+    if (sema.vectorLen(ty) == null) return null;
+    if (tag == .sub_wrap) {
+        const zero = try sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .repeated_elem = try sema.intValue(Type.childType(sema.ip, ty), 0) } } });
+        if (!try sema.vectorNative(block, .sub_wrap, ty, &.{ .fromInterned(zero), operand })) return null;
+        return try sema.addBinOp(block, .sub_wrap, .fromInterned(zero), operand);
+    }
+    if (!try sema.vectorNative(block, op, ty, &.{operand})) return null;
+    return try sema.addUnOp(block, tag, operand);
 }
 
 /// `~operand` or `!operand` on a vector as one instruction

@@ -1265,9 +1265,10 @@ backend does, not scalarized. The split has three parts:
   gets target plumbing; aarch64 answers false until NEON lowering lands.
 - **The IR**: the existing element-wise tags (`add_wrap`, `sub_wrap`,
   `mul_wrap`, `bit_and`, `bit_or`, `xor`, `not`, `add_float` ...
-  `div_float`) carry vector operands, and four tags are vector-only:
-  `cmp_vector` (a bool vector), `reduce`, `select`, and `shuffle` (whose
-  mask is a comptime `@Vector(n, i32)`, negative lanes taken from `b`).
+  `max_float`, `neg_float`, `abs_float`, `sqrt`) carry vector operands,
+  and six tags are vector-only: `min_int` and `max_int`, `cmp_vector`
+  (a bool vector), `reduce`, `select`, and `shuffle` (whose mask is a
+  comptime `@Vector(n, i32)`, negative lanes taken from `b`).
   Loads, stores, bitcasts and `aggregate_init` (a splat) are the usual
   tags on vector types.
 - **x86_64 lowering** (`src/codegen/x86_64/vector.zig`, called from
@@ -1287,24 +1288,31 @@ backend does, not scalarized. The split has three parts:
   accumulator does.
 
 What the x86_64 backend lowers natively, at baseline SSE2 (zap accepts
-only `-mcpu=baseline` today): wrapping add and subtract and bitwise ops on
-integer lanes, multiply on 16- and 32-bit lanes (`pmullw`; `pmuludq`
-twice), float add, subtract, multiply and divide, compares to bool
+only `-mcpu=baseline` today): wrapping add, subtract and negate and
+bitwise ops on integer lanes, multiply on 16- and 32-bit lanes
+(`pmullw`; `pmuludq` twice), `@min`/`@max` on 8- to 32-bit lanes
+(`pminub`, `pminsw`, the other signedness with sign bits flipped,
+32-bit lanes compare and blend), float add, subtract, multiply, divide,
+negate, `@abs` and `@sqrt`, float `@min`/`@max` (`minps` with the
+scalar lowering's NaN rule: `rhs` where `lhs` is NaN), compares to bool
 vectors (unsigned through sign-flipped `pcmpgt`; floats with `cmpps`;
 64-bit lanes only `==`/`!=`, which SSE2 lacks the ordering compare for),
 `@select` (the predicate's bits spread to a lane mask), `@shuffle`
 (`pshufd` when one operand's 32- or 64-bit lanes are permuted, else lane
-by lane through memory), `@reduce` with `and`, `or`, `xor` and `+` on
-integer lanes, `@splat`, and bitwise ops and `and`/`or`/`xor` reductions
-on bool vectors. Upstream's Debug backend scalarizes compares, selects and
+by lane through memory), `@reduce` on integer lanes with `and`, `or`,
+`xor`, `+`, `min` and `max` (not 64-bit lanes) and `*` (16- and 32-bit
+lanes), as a tree of halves with the padding lanes set to the
+identity, `@splat`, and bitwise ops and `and`/`or`/`xor` reductions on
+bool vectors. Upstream's Debug backend scalarizes compares, selects and
 shuffles; doing them here keeps results bit for bit (the same lanes,
 padding never observable). Still scalarized: shifts, overflow and
-saturating arithmetic, division and remainder of integers, `@min`/`@max`,
-float reductions (a left fold, in element order, as upstream), integer
-`min`/`max`/`*` reductions, other lane widths, and anything longer than
-128 bytes or 64 bools. With SSE4.1 (`-mcpu` features, once zap accepts
-them) `pmulld`, `pminsd`/`pmaxsd`, `pcmpeqq` and `pblendvb` would replace
-the SSE2 sequences; AVX changes the vector ABI and is a separate decision.
+saturating arithmetic, division and remainder of integers, 64-bit
+`@min`/`@max`, float reductions (a left fold, in element order, as
+upstream; a tree would change the rounding and which zero `@min`
+returns), other lane widths, and anything longer than 128 bytes or 64
+bools. With SSE4.1 (`-mcpu` features, once zap accepts them) `pmulld`,
+`pminsd`/`pmaxsd`, `pcmpeqq` and `pblendvb` would replace the SSE2
+sequences; AVX changes the vector ABI and is a separate decision.
 
 NEON maps onto the same interface: 128-bit `v` registers for vectors of
 up to 16 bytes, and the same chunking for longer ones. Its compares

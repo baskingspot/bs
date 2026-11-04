@@ -816,7 +816,7 @@ pub fn removable(ir: *const Ir, ip: *const InternPool, inst: Inst.Index) bool {
         // Sema's checks keep integer divisors non-zero and quotients in range.
         .div_trunc, .div_floor, .div_ceil, .rem, .mod => true,
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => true,
-        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float => true,
+        .add_float, .sub_float, .mul_float, .div_float, .min_float, .max_float, .neg_float, .abs_float, .min_int, .max_int => true,
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => true,
         .intcast, .trunc, .float_cast, .bitcast, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => true,
         .int_from_bool, .int_from_ptr, .ptr_from_int, .ret_addr, .frame_addr, .save_err_return_trace_index => true,
@@ -924,7 +924,7 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
             ctx.use(&data.bin_op.lhs);
             ctx.use(&data.bin_op.rhs);
         },
-        .min_float, .max_float, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+        .min_float, .max_float, .min_int, .max_int, .bit_and, .bit_or, .xor, .shl, .shr, .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
             ctx.use(&data.bin_op.lhs);
             ctx.use(&data.bin_op.rhs);
         },
