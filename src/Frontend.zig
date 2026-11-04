@@ -317,6 +317,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         });
         for (fe.modules.items[@backingInt(root)..]) |*m| {
             m.std_mod, m.root_mod, m.builtin_mod = family;
+            m.error_tracing = false; // ReleaseFast, as upstream builds it
         }
         fe.fuzzer_root = root;
     }

@@ -403,6 +403,10 @@ pub const Job = struct {
                 .is_test = false,
                 .single_threaded = opts.single_threaded,
                 .unwind_tables = opts.unwind_tables,
+                // Upstream builds it in ReleaseFast (`compilerRtOptMode`).
+                .optimize = .fast,
+                .error_tracing = false,
+                .valgrind = false,
             })
         else
             null;

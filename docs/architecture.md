@@ -5360,13 +5360,17 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   compiles `<zig lib>/fuzzer.zig` in the same compilation as the program,
   but as its own *module family*: the root `=root@fuzzer` (fuzzer.zig), its
   own `=std@fuzzer` (std's files again) and `=builtin@fuzzer` (output mode
-  `Lib`, `is_test` and `fuzz` false). Every module names the modules that
+  `Lib`, `is_test` and `fuzz` false, ReleaseFast without error tracing
+  or valgrind, as upstream builds it with `compilerRtOptMode`). Every
+  module names the modules that
   `@import("std")`, `@import("root")` and `@import("builtin")` resolve to
   (`Frontend.Module.std_mod`, `root_mod`, `builtin_mod`; the main ones
   for every module but the fuzzer's). So fuzzer.zig gets what upstream's
   separate compilation gives it: its `std_options` (its log goes to its
   own file), its panic handler, `std.lang` types of its own std, and std
-  code that is not instrumented. Sema reads the family wherever it names
+  code that is not instrumented. As in compiler_rt, Sema adds no safety
+  checks to the family's functions (`@setRuntimeSafety(true)` still adds
+  them) and pushes no error return traces there. Sema reads the family wherever it names
   std, root or builtin itself: imports, `@embedFile` of a module name,
   `std.lang` lookups (`stdLangDecl`), the panic handler's namespace, and
   the `@typeInfo` memo key (each family's `std.lang.Type` differs).
@@ -5475,7 +5479,13 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   about 130 k inputs/s against upstream LLVM's 335 k/s (90 k/s with
   twice the points, 10 k/s before `cmpBytes`). The rest is backend code
   quality: `PcBitsetIterator.next` still takes 43% of the fuzzer's time,
-  `SafeAllocator.init` 18% and `isFresh` 9%.
+  `SafeAllocator.init` 18% and `isFresh` 9%. Re-measured 2026-11-04 on
+  main 5d9b337 (`key=` test, `--fuzz=3M --seed=1`, 10 725 points, runner
+  start included): 15.3 s, about 210 k/s, after the backend's `@splat`
+  and copy work; 14.2 s (about 227 k/s) with the fuzzer's family built
+  ReleaseFast, as upstream's; upstream LLVM 8.3 s. `PcBitsetIterator.next`
+  is 54% of the fuzzer process's time, `SafeAllocator.init` (two 16 KiB
+  copies of the allocator per input) 11%, `isFresh` 10%.
 - Compile time, `zap test` of that test, cache off: 0.16 s plain, 0.34 s
   with `-ffuzz` (the fuzzer's family analyzes std's code a second time;
   86 MB against 48 MB peak). A rebuild with nothing changed takes 0.00 s

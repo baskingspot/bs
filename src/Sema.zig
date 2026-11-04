@@ -159,8 +159,8 @@ has_error_trace: bool = false,
 error_tracing: bool = false,
 /// Whether `func`'s returns push onto the error return trace: as upstream,
 /// in every module once any module traces (`any_error_tracing`), with std,
-/// except in compiler_rt (built in a release mode upstream, with no
-/// tracing) and naked functions (which have no frame).
+/// except in compiler_rt and the fuzzer's family (built in ReleaseFast
+/// upstream, with no tracing) and naked functions (which have no frame).
 pushes_traces: bool = false,
 /// The error return trace's index on entry to the function or inline call
 /// being analyzed (`save_err_return_trace_index`), or `.none`.
@@ -1916,8 +1916,10 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     var block = sema.rootBlock(nav.namespace, decl.src_node, false);
     defer block.deinitInsts();
     const gpa = zcu.gpa;
-    // Upstream builds compiler_rt in a release mode: no safety checks.
-    if (zcu.file(nav.file).module == .compiler_rt) block.want_safety = false;
+    // Upstream builds compiler_rt and the fuzzer (`-ffuzz`; its module
+    // family has a std of its own) in ReleaseFast: no safety checks.
+    const module = zcu.file(nav.file).module;
+    if (module == .compiler_rt or zcu.fe.module(module).std_mod != .std) block.want_safety = false;
 
     for (fn_ty.param_types) |pt| try sema.resolveLayout(&block, block.nodeSrc(.zero), pt);
     try sema.resolveLayout(&block, block.nodeSrc(.zero), fn_ty.return_type);
@@ -1951,7 +1953,7 @@ pub fn analyzeFuncBody(zcu: *Zcu, func_index: Index) CompileError!Ir {
     const last_arg_index = block.instructions.items.len;
     sema.has_error_trace = fn_ty.cc == .auto;
     const has_std = zcu.moduleRootFile(.std) != null;
-    sema.pushes_traces = has_std and fn_ty.cc != .naked and zcu.file(nav.file).module != .compiler_rt and zcu.fe.any_error_tracing;
+    sema.pushes_traces = has_std and fn_ty.cc != .naked and module != .compiler_rt and zcu.fe.module(module).std_mod == .std and zcu.fe.any_error_tracing;
     sema.error_tracing = sema.moduleTraces(nav.file);
     sema.err_ret_index_on_entry = try sema.analyzeSaveErrRetIndex(&block);
     block.error_return_trace_index = sema.err_ret_index_on_entry;
