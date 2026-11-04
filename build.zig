@@ -1572,6 +1572,22 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     vb_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&vb_run.step);
 
+    // Assembly sources: `.S` through the preprocessor (an include and a
+    // `-D` from `-cflags`), `.s` as is, as upstream passes them to Clang.
+    const asm_exe = b.addRunArtifact(zap);
+    asm_exe.setName("zap build-exe with assembly sources");
+    asm_exe.addArg("build-exe");
+    asm_exe.addFileArg(b.path("test/link_input/asm_main.zig"));
+    asm_exe.addArgs(&.{ "-cflags", "-DASM_EXTRA=100", "--" });
+    asm_exe.addFileArg(b.path("test/link_input/asm_cpp.S"));
+    asm_exe.addFileArg(b.path("test/link_input/asm_plain.s"));
+    asm_exe.setEnvironmentVariable("ZAP_ZIG", zig);
+    const asm_run = std.Build.Step.Run.create(b, "run zap build with assembly sources");
+    asm_run.addFileArg(asm_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    asm_run.addCheck(.{ .expect_stderr_exact = "142 42\n" });
+    asm_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&asm_run.step);
+
     // GCC's -fPIE reads glibc's data PC-relative: the executable copies
     // `stdout` and `environ` (with its aliases, which glibc's start code
     // sets), and glibc, C and Zig all use the copies.

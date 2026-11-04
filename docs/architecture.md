@@ -6434,7 +6434,7 @@ libraries as inputs. To be agreed with that thread.
   default). A root file given by position takes what is left; else what
   is left is `global_cc_argv`. `-cflags ... --` applies to the C files
   after it. `-ffunction-sections`, `-fdata-sections`, `-fPIE` and
-  `--verbose-cc` are global. Assembly sources stay `[unsupported]`.
+  `--verbose-cc` are global.
 - **Relocatable links** (`build-obj` with object inputs or C sources,
   built 2026-11-04; `link/ElfMerge.zig`), as upstream's `flushObject`:
   the Zig object (written by `ElfObject` as before), then the object
@@ -6481,6 +6481,16 @@ libraries as inputs. To be agreed with that thread.
   descriptors, and another module's thread-locals. Upstream also
   exports ubsan_rt's handlers (weak); zap does not. Shared libraries
   are not cached, so there is no relink (test/link_input/so_*).
+- **Assembly sources** (2026-11-04, libsodium's `addAssemblyFile`), as
+  upstream's `FileExt`: `.S` (`assembly_with_cpp`) takes C's arguments
+  up to the code generation flags, without the C-only ones
+  (`-fno-caret-diagnostics`, `-fno-spell-checking`, the sanitizer, `-O`),
+  and both the compiler's and the assembler's CPU features; `.s`
+  (`assembly`) takes only the target, PIC, debug-info and LTO flags and
+  the assembler's CPU features, and writes no depfile, so its record
+  holds the source alone (an `.include` it reads is not an input, as
+  upstream's cache has none either). The command lines equal upstream's
+  `--verbose-cc` apart from the CPU (zap's baseline).
 - **Static libraries** (2026-11-04), as upstream's: the archive holds
   the Zig object (`<root stem>.o`), then the object inputs (named after
   their files, as given), then one member per C source (`<stem>.o`),

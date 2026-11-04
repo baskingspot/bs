@@ -16,7 +16,7 @@ zap=$(realpath "$1") zig=$2 src=$(realpath "$3") work=$(realpath "$4") part=$5
 mkdir -p "$work/global/zap"
 cp -r "$6/zap/zir" "$work/global/zap"
 cd "$work"
-cp "$src"/main.zig "$src"/lib.c "$src"/tls.c "$src"/tlsie.c "$src"/a1.c "$src"/a2.c "$src"/libc.c "$src"/libc_main.zig "$src"/copy.c .
+cp "$src"/main.zig "$src"/lib.c "$src"/tls.c "$src"/tlsie.c "$src"/a1.c "$src"/a2.c "$src"/libc.c "$src"/libc_main.zig "$src"/copy.c "$src"/asm_main.zig "$src"/asm.h "$src"/asm_cpp.S "$src"/asm_plain.s .
 export ZAP_ZIG="$zig"
 
 fail() {
@@ -44,7 +44,7 @@ build() {
     ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 ZAP_CACHE_VERIFY=1 "$zap" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail "$1"
     cp log cached.log
     grep -qF -- "$1" log || fail "expected '$1'"
-    full=full-$( (echo "$args"; cat ./*.zig ./*.c ./*.o ./*.a ./*.so 2>/dev/null) | sha256sum | cut -c1-16)
+    full=full-$( (echo "$args"; cat ./*.zig ./*.c ./*.h ./*.S ./*.s ./*.o ./*.a ./*.so 2>/dev/null) | sha256sum | cut -c1-16)
     [ -f "$full" ] || ZAP_CACHE=off "$zap" $args --global-cache-dir global -femit-bin="$full" >log 2>&1 || fail "$1: without the cache"
     cmp -s main "$full" || fail "$1: the output differs from a build without the cache"
     ./main >out 2>&1 || fail "$1: the program failed"
@@ -135,6 +135,16 @@ touch libc.c
 build "not relinking" "X=21 twice=42"
 sed -i 's/return 2 \* x/return 3 * x/' libc_main.zig
 build "inputs changed, first $work/libc_main.zig" "X=21 twice=63"
+
+# Assembly: `.S` records its include from the depfile; `.s` has none, so
+# its record holds the source alone, and an edit to either compiles again.
+args="build-exe asm_main.zig asm_cpp.S asm_plain.s"
+build "cache: recorded" "42 42"
+build "not relinking" "42 42"
+sed -i 's/imul %rsi, %rax/imul %rsi, %rax\n\tadd $1, %rax/' asm_plain.s
+build "0 inputs changed" "42 43"
+sed -i 's/ASM_ADD 40/ASM_ADD 50/' asm.h
+build "0 inputs changed" "52 43"
 
 # -lc alone: a lazy edit links from the manifest by number, and binds a
 # function's constant's glibc addresses as the slots.

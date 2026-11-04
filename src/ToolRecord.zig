@@ -136,7 +136,7 @@ pub fn check(arena: std.mem.Allocator, io: Io, record_path: []const u8, out_path
 pub const Commit = struct {
     record_path: []const u8,
     out_path: []const u8,
-    /// Where the tool wrote the output and its depfile.
+    /// Where the tool wrote the output and its depfile (empty if none).
     tmp_out: []const u8,
     dep_path: []const u8,
     /// The source's absolute path, recorded first.
@@ -152,8 +152,9 @@ pub const Commit = struct {
 pub fn commit(arena: std.mem.Allocator, io: Io, c: Commit) ![]const u8 {
     const cwd = Io.Dir.cwd();
     const cwd_path = try std.process.currentPathAlloc(io, arena);
-    // Every file the tool read, from the depfile: the source, then headers.
-    const dep = try cwd.readFileAlloc(io, c.dep_path, arena, .unlimited);
+    // Every file the tool read, from the depfile: the source, then
+    // headers. Without one (`dep_path` empty), the source alone.
+    const dep = if (c.dep_path.len == 0) "" else try cwd.readFileAlloc(io, c.dep_path, arena, .unlimited);
     var paths: std.ArrayList([]const u8) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var it: std.Build.Cache.DepTokenizer = .{ .bytes = dep };

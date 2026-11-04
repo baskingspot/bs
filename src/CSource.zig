@@ -38,7 +38,11 @@ lang: Lang = .c,
 pub const Lang = enum {
     c,
     cpp,
+    /// `.S`: assembly through the C preprocessor.
     asm_cpp,
+    /// `.s`: assembly as is, without include directories, defines or a
+    /// depfile, as upstream's `.assembly`.
+    assembly,
 
     /// The language of a source file argument, by its extension, or null
     /// if it is not one zap compiles.
@@ -46,6 +50,8 @@ pub const Lang = enum {
         const ext = std.fs.path.extension(path);
         if (std.mem.eql(u8, ext, ".c")) return .c;
         for ([_][]const u8{ ".C", ".cc", ".cpp", ".cxx", ".stub", ".c++" }) |e| if (std.mem.eql(u8, ext, e)) return .cpp;
+        if (std.mem.eql(u8, ext, ".S")) return .asm_cpp;
+        if (std.mem.eql(u8, ext, ".s")) return .assembly;
         return null;
     }
 };
@@ -180,6 +186,9 @@ pub const Batch = struct {
         /// go at `dep_at` and the end.
         argv: []const []const u8,
         dep_at: usize,
+        /// Whether Clang writes a depfile; not for `.s` sources, whose
+        /// records hold only the source.
+        depfile: bool = true,
         /// Empty for a C++ runtime library's source, which has no record.
         record_path: []const u8,
         out_path: []const u8,
@@ -259,7 +268,7 @@ pub const Batch = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(arena, zig);
         try argv.appendSlice(arena, j.argv[1..j.dep_at]);
-        try argv.appendSlice(arena, &.{ "-MD", "-MV", "-MF", dep_path });
+        if (j.depfile) try argv.appendSlice(arena, &.{ "-MD", "-MV", "-MF", dep_path });
         try argv.appendSlice(arena, j.argv[j.dep_at..]);
         try argv.appendSlice(arena, &.{ "-c", "-o", tmp_out });
         if (b.verbose) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});
@@ -286,7 +295,7 @@ pub const Batch = struct {
             .record_path = j.record_path,
             .out_path = j.out_path,
             .tmp_out = tmp_out,
-            .dep_path = dep_path,
+            .dep_path = if (j.depfile) dep_path else "",
             .source = j.abs_source,
             .old_output = j.old_output,
             .start_ns = j.start_ns,
@@ -638,6 +647,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .abs_source = abs_source,
             .argv = argv.items,
             .dep_at = dep_at,
+            .depfile = src.lang != .assembly,
             .record_path = try std.fs.path.join(arena, &.{ local, "zap", "tc", &hex }),
             .out_path = try std.fs.path.join(arena, &.{ local, "o", &hex, try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(src.path)}) }),
             .start_ns = start_ns,
@@ -811,10 +821,17 @@ const Mode = struct {
 /// features, and returns where the depfile arguments go.
 fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common: Common, path: []const u8, m: Mode) !usize {
     try argv.appendSlice(arena, &.{ "zig", "clang", path, "--no-default-config" });
-    if (m.lang != .asm_cpp) try argv.append(arena, "-fno-caret-diagnostics");
+    const assembly = m.lang == .asm_cpp or m.lang == .assembly;
+    if (!assembly) try argv.append(arena, "-fno-caret-diagnostics");
     try argv.appendSlice(arena, &.{ "-target", common.triple });
     try argv.appendSlice(arena, &.{ if (m.pie) "-fPIE" else "-fno-PIE", if (m.pic) "-fPIC" else "-fno-PIC", "-gdwarf-4", "-gdwarf32", "-fno-lto" });
     const dep_at = argv.items.len;
+    // Assembly as is takes no preprocessor or code generation flags, only
+    // the assembler's CPU features.
+    if (m.lang == .assembly) {
+        try argv.appendSlice(arena, common.asm_features);
+        return dep_at;
+    }
     try argv.appendSlice(arena, &.{ "-fhosted", "-nostdinc" });
     if (m.lang == .cpp) try argv.append(arena, "-nostdinc++");
     switch (m.optimize) {
@@ -831,7 +848,7 @@ fn appendArgs(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), common
     if (m.link_libc) try argv.appendSlice(arena, common.libc_includes);
     if (m.native) try argv.appendSlice(arena, common.native_includes);
     if (m.libunwind) try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ common.lib, "libunwind", "include" }) });
-    if (m.lang != .asm_cpp) {
+    if (!assembly) {
         try argv.append(arena, "-fno-spell-checking");
         if (m.optimize != .debug) try argv.append(arena, "-Werror=date-time");
         switch (m.sanitize_c) {
@@ -1095,7 +1112,7 @@ fn runtimeJobs(arena: std.mem.Allocator, out: *std.ArrayList(RuntimeJob), rl: Ru
             switch (lang) {
                 .c => try argv.appendSlice(arena, &.{ "-std=c99", "-fexceptions" }),
                 .cpp => try argv.appendSlice(arena, &.{ "-fno-exceptions", "-fno-rtti" }),
-                .asm_cpp => {},
+                .asm_cpp, .assembly => {},
             }
             try argv.appendSlice(arena, &.{ "-w", "-I", try join(arena, &.{ lib, "libunwind", "include" }), "-D_LIBUNWIND_HIDE_SYMBOLS", "-Wa,--noexecstack", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-fvisibility-global-new-delete=force-hidden", "-D_LIBUNWIND_IS_NATIVE_ONLY" });
             // The compilation's own mode, which is Debug.
