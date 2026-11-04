@@ -1297,6 +1297,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "type '{f}' not a function", .@"bad-call" },
     .{ "unable to call function with naked calling convention", .@"bad-call" },
     .{ "variadic function does not support '.{s}' calling convention", .@"bad-call" },
+    .{ "calling convention '{s}' only available on architectures {s}", .@"bad-fn-type" },
     .{ "@bitCast size mismatch: destination type '{f}' has {d} bits but source type '{f}' has {d} bits", .@"bad-cast" },
     .{ "@ptrCast discards const qualifier", .@"bad-cast" },
     .{ "bit-pointer cannot refer to value of type '{f}'", .@"bad-cast" },

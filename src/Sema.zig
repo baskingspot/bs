@@ -4364,7 +4364,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const src = block.nodeSrc(data.un_node.src_node);
             const result_ty = try sema.resolveType(block, src, data.un_node.operand);
             if (tag != .struct_init_empty_ref_result) {
-                const base = sema.unwrapOptEu(result_ty);
+                const base = try sema.structInitType(block, src, sema.unwrapOptEu(result_ty));
                 break :blk sema.coerce(block, result_ty, try sema.structInitEmpty(block, src, base), src);
             }
             const ptr_ty = sema.unwrapOptEu(result_ty);
@@ -4400,7 +4400,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .struct_init_field_type => blk: {
             const extra = sema.code.extraData(Zir.Inst.FieldType, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const ty = sema.unwrapOptEu(try sema.resolveType(block, src, extra.container_type));
+            const ty = try sema.structInitType(block, src, sema.unwrapOptEu(try sema.resolveType(block, src, extra.container_type)));
             const key: NameKey = .{ .file = sema.file, .name = extra.name_start, .ty = ty, .kind = .field_type };
             if (sema.nameCacheGet(key)) |v| break :blk .fromInterned(@fromBackingInt(v));
             // The type is referenced from the field's value, and errors
@@ -7437,9 +7437,44 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
         .@"inline"
     else if (std.mem.eql(u8, name, "x86_64_sysv"))
         .c
-    else
+    else {
+        // As upstream, a convention of another architecture is an error.
+        if (std.meta.stringToEnum(std.lang.CallingConvention.Tag, name)) |tag| {
+            const archs = std.Target.Cpu.Arch.fromCallingConvention(tag);
+            if (std.mem.indexOfScalar(std.Target.Cpu.Arch, archs, .x86_64) == null) {
+                var list: std.Io.Writer.Allocating = .init(sema.arena);
+                for (archs, 0..) |arch, i| list.writer.print("{s}'{t}'", .{ if (i == 0) "" else ", ", arch }) catch return error.OutOfMemory;
+                return sema.fail(block, src, "calling convention '{s}' only available on architectures {s}", .{ name, list.written() });
+            }
+        }
         return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{name});
+    };
     return .fromInterned(try sema.intern(.{ .calling_convention = cc }));
+}
+
+/// The calling convention a value of std's `std.lang.CallingConvention`
+/// union names: its tag, as `callingConventionValue` maps it, with the
+/// options its payload has by default (`incoming_stack_alignment` null).
+fn callingConventionOfUnion(sema: *Sema, block: *Block, src: Src, val: Index) CompileError!InternPool.CallingConvention {
+    const ip = sema.ip;
+    const u = ip.keyPayload(.un, val);
+    const name = sema.enumTagName(u.tag).?;
+    const payload_ty = ip.typeOf(u.val);
+    if (ip.keyTag(payload_ty) == .struct_type) {
+        const info = ip.structInfo(payload_ty);
+        for (info.field_defaults, 0..) |d, i| if (d == .none or try sema.fieldValue(u.val, @intCast(i)) != d)
+            return sema.fail(block, src, "zap does not support options of calling convention '{s}' yet", .{name});
+    }
+    return ip.keyPayload(.calling_convention, (try sema.callingConventionValue(block, src, name)).toInterned().?);
+}
+
+/// The type a struct initializer with result type `ty` initializes: zap's
+/// `calling_convention_type`, which `callconv` expressions have as their
+/// result type, stands for std's `std.lang.CallingConvention` union, so
+/// `.{ .x86_64_sysv = .{} }` initializes that (`callingConventionOfUnion`).
+fn structInitType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!Index {
+    if (ty != .calling_convention_type) return ty;
+    return (try sema.stdLangDecl(block, src, "CallingConvention")).toInterned().?;
 }
 
 fn coerce(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) CompileError!Ref {
@@ -13296,10 +13331,7 @@ fn zirReifyFn(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) Compi
     const cc_val = try sema.structFieldValue(attrs, "callconv");
     const cc: InternPool.CallingConvention = switch (ip.indexToKey(cc_val)) {
         .calling_convention => |c| c,
-        .un => |u| blk: {
-            const tag = sema.enumTagName(u.tag).?;
-            break :blk if (std.mem.eql(u8, tag, "auto")) .auto else if (std.mem.eql(u8, tag, "x86_64_sysv")) .c else if (std.mem.eql(u8, tag, "naked")) .naked else if (std.mem.eql(u8, tag, "inline")) .@"inline" else return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{tag});
-        },
+        .un => try sema.callingConventionOfUnion(block, src, cc_val),
         else => unreachable,
     };
     const is_var_args = try sema.structFieldValue(attrs, "varargs") == .bool_true;
@@ -15547,7 +15579,7 @@ fn zirStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
         i = e.end;
         const ft_data = sema.code.instructions.items(.data)[@backingInt(e.data.field_type)].pl_node;
         const ft = sema.code.extraData(Zir.Inst.FieldType, ft_data.payload_index).data;
-        if (ty == .none) ty = try sema.resolveType(block, src, ft.container_type);
+        if (ty == .none) ty = try sema.structInitType(block, src, try sema.resolveType(block, src, ft.container_type));
         item.* = .{ .name = sema.zirString(ft.name_start), .name_start = ft.name_start, .init = sema.resolveInst(e.data.init), .src = .{ .base = block.src_base, .loc = .{ .init_field = ft_data.src_node } } };
     }
     // A defined value, so that `asm` can tell it from `undefined`.
@@ -16947,8 +16979,8 @@ fn zirFunc(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
                 // A value of std's own `std.lang.CallingConvention` union
                 // (e.g. a typed `const`), which zap models as a special
                 // type; only its payload-free tags are supported.
-                .un => |u| if (ip.typeOf(v) == (try sema.stdLangDecl(block, src, "CallingConvention")).toInterned().? and sema.enumTagName(u.tag) != null)
-                    ip.keyPayload(.calling_convention, (try sema.callingConventionValue(block, src, sema.enumTagName(u.tag).?)).toInterned().?)
+                .un => if (ip.typeOf(v) == (try sema.stdLangDecl(block, src, "CallingConvention")).toInterned().?)
+                    try sema.callingConventionOfUnion(block, cc_src, v)
                 else
                     return sema.fail(block, cc_src, "expected calling convention, found '{f}'", .{sema.fmtType(ip.typeOf(v))}),
                 else => return sema.fail(block, cc_src, "expected calling convention, found '{f}'", .{sema.fmtType(ip.typeOf(v))}),
