@@ -9577,6 +9577,7 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
     if (cb == .null and ca == .pointer and Type.ptrInfo(ip, a).flags.size == .c) return a;
     if (ca == .null) return if (cb == .optional) b else sema.optType(b);
     if (cb == .null) return if (ca == .optional) a else sema.optType(a);
+    if (ca == .optional and cb == .optional) return sema.optType(try sema.peerPair(block, src, Type.childType(ip, a), Type.childType(ip, b)));
     if (ca == .optional and cb != .optional) return sema.optType(try sema.peerPair(block, src, Type.childType(ip, a), b));
     if (cb == .optional and ca != .optional) return sema.optType(try sema.peerPair(block, src, a, Type.childType(ip, b)));
     if (ca == .vector or cb == .vector) {
@@ -9665,8 +9666,8 @@ fn peerPair(sema: *Sema, block: *Block, src: Src, a: Index, b: Index) CompileErr
     if (ca == .pointer and cb == .pointer) {
         // A C pointer wins over other pointers to its element type.
         if (try sema.peerCPtr(a, b)) |t| return t;
-        if (sema.ptrCoercibleInPlace(a, b)) return b;
-        if (sema.ptrCoercibleInPlace(b, a)) return a;
+        if (sema.ptrCoercibleInPlace(a, b)) return sema.withPeerAlignment(b, a, b);
+        if (sema.ptrCoercibleInPlace(b, a)) return sema.withPeerAlignment(a, a, b);
         if (try sema.peerPtrs(a, b)) |t| return t;
         // A pointer to a tuple (`&.{ 'x', 'y' }`) is a pointer to an array
         // of the other peer's elements.
@@ -9738,6 +9739,18 @@ fn peerAlignment(sema: *Sema, a: InternPool.PtrType, b: InternPool.PtrType) ?u6 
     const x = sema.ptrAlignment(a) orelse return null;
     const y = sema.ptrAlignment(b) orelse return null;
     return @intCast(std.math.log2_int(u64, @min(x, y)) + 1);
+}
+
+/// Pointer type `chosen`, which peers `a` and `b` coerce to, with their
+/// merged alignment, as upstream's pointer strategies merge it: explicit
+/// if either peer's is, even when it equals the natural alignment.
+fn withPeerAlignment(sema: *Sema, chosen: Index, a: Index, b: Index) !Index {
+    const ip = sema.ip;
+    const alignment = sema.peerAlignment(Type.ptrInfo(ip, a), Type.ptrInfo(ip, b)) orelse return chosen;
+    var info = Type.ptrInfo(ip, chosen);
+    if (info.flags.alignment == alignment) return chosen;
+    info.flags.alignment = alignment;
+    return sema.ptrType(info);
 }
 
 /// The peer of a C pointer and another pointer to its element type (or

@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "97\n1\n1\n1\n1\n1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\nerror{Foo}!?[*:0]const u8\nerror{Foo}!?[*:0]const u8\n?[*:0]const u8\n[*c]c_int\n[*c]c_int\n[*c]const u8\n[*c]const u8\n[3]*const u8\n[*:0]align(2) const volatile u8\n[3]i32\n[]const u8\n[]const u8\nstruct { u32, i16 }\n232\n232\n12502050\n1\n1\n1\n1\n1\n2\n"
+//! stdout: "97\n1\n1\n1\n1\n1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\nerror{Foo}!?[*:0]const u8\nerror{Foo}!?[*:0]const u8\n?[*:0]const u8\n[*c]c_int\n[*c]c_int\n[*c]const u8\n[*c]const u8\n[3]*const u8\n[*:0]align(2) const volatile u8\n[3]i32\n[]const u8\n[]const u8\nstruct { u32, i16 }\n*align(4) u32\n?*align(4) u32\n*align(1) anyopaque\n232\n232\n12502050\n1\n1\n1\n1\n1\n2\n"
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 pub export fn _start() callconv(.naked) noreturn { asm volatile ("call %[main:P]" : : [main] "X" (&main)); }
@@ -131,7 +131,13 @@ fn peerTypes() void {
     var s: [:0]const u8 = "abc";
     var m: [*:0]align(4) const u8 = @ptrFromInt(0x1000);
     var v: *align(2) volatile [3:0]u8 = @ptrFromInt(0x1000);
-    _ = .{ &a, &b, &c, &cp, &cu, &k, &ar, &pa, &pc, &s, &m, &v };
+    var pu: *u32 = @ptrFromInt(0x1000);
+    var p8: *align(8) u32 = @ptrFromInt(0x1000);
+    var op: ?*u32 = null;
+    var op8: ?*align(8) u32 = null;
+    var ao: *anyopaque = @ptrFromInt(0x1000);
+    var ao8: *align(8) anyopaque = @ptrFromInt(0x1000);
+    _ = .{ &a, &b, &c, &cp, &cu, &k, &ar, &pa, &pc, &s, &m, &v, &pu, &p8, &op, &op8, &ao, &ao8 };
     pt(@TypeOf(a, b, c));
     pt(@TypeOf(c, b, a));
     pt(@TypeOf(b, c));
@@ -145,6 +151,10 @@ fn peerTypes() void {
     pt(@TypeOf(s, &.{ @as(u8, 'x'), @as(u8, 'y') }));
     pt(@TypeOf(s, &.{}));
     pt(@TypeOf(.{ 1, 2 }, .{ @as(u32, 3), @as(i16, 4) }));
+    // The merged alignment is explicit if either peer's is.
+    pt(@TypeOf(pu, p8));
+    pt(@TypeOf(op, op8));
+    pt(@TypeOf(ao, ao8));
 }
 
 // ps.zig
