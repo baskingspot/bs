@@ -348,10 +348,12 @@ def main():
     fresh = not os.path.exists(seen_path)
     # Queued and running campaigns survive a restart (a running one starts over).
     queue_path = os.path.join(H.WORK, "queue.json")
-    queue = [tuple(x) for x in json.load(open(queue_path))] if os.path.exists(queue_path) else []
+    queue = [tuple(x) for x in json.load(open(queue_path))] if args.branches and os.path.exists(queue_path) else []
     rebuilt["campaign"] = None
 
     def save_queue():
+        if not args.branches:
+            return  # another hunter owns the campaigns
         c = rebuilt["campaign"]
         cur = [(c["branch"], c["sha"])] if c is not None else []
         json.dump(cur + queue, open(queue_path, "w"))
