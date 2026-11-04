@@ -36,7 +36,7 @@ pub fn main() void {}
 //   ref: struct_defaults.foo.S struct_defaults.zig:6:15 <- foo struct_defaults.zig:7:18
 // struct_defaults.zig:13:17: error[not-accessible]: 'y' not accessible outside function scope
 //   | y: u8 = y,
-//   ref: struct_defaults.entry.Thing struct_defaults.zig:12:19 <- entry struct_defaults.zig:15:17
+//   ref: struct_defaults.entry.Thing struct_defaults.zig:12:19 <- entry struct_defaults.zig:15:21
 // struct_defaults.zig:21:29: error[type-mismatch]: expected type 'u32', found '*const [11:0]u8'
 //   | const Z = struct { z: u32 = default_z };
 //   ref: struct_defaults.Z struct_defaults.zig:21:11 <- bar struct_defaults.zig:24:18

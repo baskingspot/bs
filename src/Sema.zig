@@ -4389,7 +4389,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const ty = sema.unwrapOptEu(try sema.resolveType(block, src, extra.container_type));
             const key: NameKey = .{ .file = sema.file, .name = extra.name_start, .ty = ty, .kind = .field_type };
             if (sema.nameCacheGet(key)) |v| break :blk .fromInterned(@fromBackingInt(v));
-            // Errors about the name point at it, as upstream.
+            // The type is referenced from the field's value, and errors
+            // about the name point at the name, as upstream.
+            if (sema.ip.keyTag(ty) == .struct_type) try sema.resolveStructFields(block, src, ty);
             const name_src: Src = .{ .base = src.base, .loc = .{ .init_name = data.pl_node.src_node } };
             const ft = try sema.fieldTypeByName(block, name_src, ty, sema.zirString(extra.name_start));
             try sema.nameCachePut(key, @backingInt(ft));
