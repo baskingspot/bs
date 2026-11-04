@@ -85,6 +85,12 @@ const Header = extern struct {
     payload_len: u64,
     src_hash: Hash,
     result_hash: Hash,
+
+    /// Whether it is an entry's header, of an entry `len` bytes long.
+    fn fits(h: *const Header, len: u64) bool {
+        return std.mem.eql(u8, &h.magic, &entry_magic) and
+            @sizeOf(Header) + @sizeOf(Dep) * @as(u64, h.deps_len) + h.atoms_bytes + h.payload_len == len;
+    }
 };
 
 const pack_magic = "ZAPSTP05".*;
@@ -139,6 +145,8 @@ const trim_interval_ns = std.time.ns_per_day;
 
 const PackFile = struct {
     name: [32 + pack_ext.len]u8,
+    /// Open for `peek`, which reads entry headers without touching `map`.
+    file: Io.File,
     map: Io.File.MemoryMap,
     created: i64,
     order: i64,
@@ -160,6 +168,11 @@ const PackFile = struct {
             if (k < key) lo = mid + 1 else if (k > key) hi = mid else return mid;
         }
         return null;
+    }
+
+    fn close(p: *PackFile, io: Io) void {
+        p.map.destroy(io);
+        p.file.close(io);
     }
 
     fn entryBytes(p: *const PackFile, i: usize) []align(16) const u8 {
@@ -228,7 +241,7 @@ const OtherPack = struct { name: [32 + pack_ext.len]u8, size: u64, mtime: Io.Tim
 fn loadPacks(gpa: Allocator, io: Io, dir: Io.Dir, others: *std.ArrayList(OtherPack)) ![]PackFile {
     var packs: std.ArrayList(PackFile) = .empty;
     errdefer {
-        for (packs.items) |*p| p.map.destroy(io);
+        for (packs.items) |*p| p.close(io);
         packs.deinit(gpa);
     }
     var it = dir.iterate();
@@ -256,7 +269,8 @@ fn openPack(io: Io, dir: Io.Dir, name: []const u8) !?PackFile {
         error.FileNotFound => return null,
         else => |e| return e,
     };
-    defer f.close(io);
+    var keep = false;
+    defer if (!keep) f.close(io);
     const stat = try f.stat(io);
     if (stat.size < @sizeOf(PackHeader) + PackHeader.indexLen(0)) return null;
     var map = try cache.mapOpenFile(io, f, stat.size, false);
@@ -274,6 +288,7 @@ fn openPack(io: Io, dir: Io.Dir, name: []const u8) !?PackFile {
     const fanout_off = locs_off + h.count * @sizeOf(Loc);
     var p: PackFile = .{
         .name = undefined,
+        .file = f,
         .map = map,
         .created = h.created,
         .order = h.order,
@@ -288,6 +303,7 @@ fn openPack(io: Io, dir: Io.Dir, name: []const u8) !?PackFile {
         return null;
     }
     @memcpy(&p.name, name);
+    keep = true;
     return p;
 }
 
@@ -295,7 +311,7 @@ fn openPack(io: Io, dir: Io.Dir, name: []const u8) !?PackFile {
 /// `get` are invalid afterwards.
 pub fn close(store: *Store, gpa: Allocator, io: Io) void {
     store.refreshUsed(io);
-    for (store.packs) |*p| p.map.destroy(io);
+    for (store.packs) |*p| p.close(io);
     gpa.free(store.packs);
     store.forward.deinit(gpa);
     store.dir.close(io);
@@ -399,21 +415,50 @@ pub fn get(store: *Store, gpa: Allocator, io: Io, key: Key) Allocator.Error!?Ent
         const bytes = p.entryBytes(i);
         if (bytes.len < @sizeOf(Header)) return null;
         const e: Entry = .{ .bytes = bytes, .pack = @intCast(pack_index), .offset = @as(u64, p.locs[i].offset16) * 16 };
-        const h = e.header();
-        if (!std.mem.eql(u8, &h.magic, &entry_magic) or
-            @sizeOf(Header) + @sizeOf(Dep) * @as(u64, h.deps_len) + h.atoms_bytes + h.payload_len != bytes.len)
-        {
-            return null;
-        }
-        if (!p.used.load(.monotonic)) p.used.store(true, .monotonic);
-        if (store.opened.toNanoseconds() - p.created > copy_forward_ns) {
-            store.forward_mutex.lockUncancelable(io);
-            defer store.forward_mutex.unlock(io);
-            try store.forward.append(gpa, .{ .key = key, .bytes = bytes });
-        }
+        if (!e.header().fits(bytes.len)) return null;
+        try store.noteUse(gpa, io, p, key, bytes);
         return e;
     }
     return null;
+}
+
+/// What `get` finds for `key`, but with the entry's header read from the
+/// pack file instead of its mapping, so that a lookup of every unit of a
+/// build (`Incremental.record`) maps in no pack page: it made a warm-store
+/// record's resident memory 230 MB larger on the zig workload. Thread-safe.
+pub fn peek(store: *Store, gpa: Allocator, io: Io, key: Key) Allocator.Error!?Peeked {
+    for (store.packs, 0..) |*p, pack_index| {
+        const i = p.find(key) orelse continue;
+        const loc = p.locs[i];
+        const offset = @as(u64, loc.offset16) * 16;
+        if (loc.len < @sizeOf(Header)) return null;
+        var h: Header = undefined;
+        const n = p.file.readPositionalAll(io, std.mem.asBytes(&h), offset) catch return null;
+        if (n != @sizeOf(Header) or !h.fits(loc.len)) return null;
+        try store.noteUse(gpa, io, p, key, p.entryBytes(i));
+        return .{ .pack = @intCast(pack_index), .offset = offset, .result_hash = h.result_hash, .deps_len = h.deps_len, .atoms_len = h.atoms_len, .atoms_bytes = h.atoms_bytes };
+    }
+    return null;
+}
+
+pub const Peeked = struct {
+    pack: u32,
+    offset: u64,
+    result_hash: Hash,
+    deps_len: u32,
+    atoms_len: u32,
+    atoms_bytes: u64,
+};
+
+/// Marks pack `p` used, and queues the entry to be copied forward if the
+/// pack is old.
+fn noteUse(store: *Store, gpa: Allocator, io: Io, p: *PackFile, key: Key, bytes: []align(16) const u8) Allocator.Error!void {
+    if (!p.used.load(.monotonic)) p.used.store(true, .monotonic);
+    if (store.opened.toNanoseconds() - p.created > copy_forward_ns) {
+        store.forward_mutex.lockUncancelable(io);
+        defer store.forward_mutex.unlock(io);
+        try store.forward.append(gpa, .{ .key = key, .bytes = bytes });
+    }
 }
 
 pub const Contents = struct {
@@ -790,7 +835,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
     defer others.deinit(gpa);
     const packs = try loadPacks(gpa, io, dir, &others);
     defer {
-        for (packs) |*p| p.map.destroy(io);
+        for (packs) |*p| p.close(io);
         gpa.free(packs);
     }
     // Every pack, readable (`live`) or not (`OtherPack`), as candidates

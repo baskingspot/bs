@@ -3574,6 +3574,23 @@ it and can flush every CPU's TLB.
   of byte-wise Wyhash, edges and atoms went to two flat arrays grouped by
   counting sort instead of two lists per node, and atom contents were
   hashed with Wyhash instead of SipHash. 630 nodes take 1.3–1.9 ms.
+- **Memory of recording** (2026-11-04, the `zig` workload, ReleaseFast,
+  peak RSS): analysis ends near 990 MB and `ZAP_CACHE=off` peaks at
+  1.04 GB. Recording peaked at 1.46 GB with an empty store and 1.68 GB
+  with a warm one: the store lookup read every node's entry header through
+  the pack mappings, which kept 230 MB of pack pages resident, and the
+  graph's tables and the words the manifest had copied lived until the
+  record ended, through the manifest's write. Now `Store.peek` reads the
+  headers with `pread` (lookups 38 → 93 ms on a warm store, all 135k
+  atoms' nodes hits; an empty store finds no key and reads nothing),
+  `collect` frees its item maps once every item is listed, `makeNodes`
+  frees the pairs and item arrays `group` consumed, and `freeTables`
+  frees the rest but the nodes before the manifest is written: 1.32 GB
+  empty, 1.33 GB warm. Build time is unchanged within noise (empty store
+  10.94 → 10.91 s, warm store without a donor 10.85 → 10.95 s, median of
+  5). What remains above analysis is the graph's nodes and per-item info
+  (about 150 MB) and the manifest builder (about 105 MB, the 134 MB
+  manifest's sections), which the store's writer and the write need.
 - **Error codes**: the last build's names are assigned first
   (`seedErrors`), so codes stay stable across builds.
 - **Prediction check** (`ZAP_CACHE_CHECK=1`): compares a build's nodes with

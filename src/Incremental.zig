@@ -2606,7 +2606,30 @@ const Graph = struct {
 
     fn deinit(g: *Graph) void {
         const gpa = g.r.gpa;
+        g.freeTables();
         g.r.deinit();
+        gpa.free(g.debug_of);
+    }
+
+    /// Frees all but the nodes (with their `deps` and `atoms`) and the
+    /// atoms' debug info, which the store's writer reads until it commits
+    /// (`Putter`): once the manifest has the nodes, `record` needs nothing
+    /// else, and writing the manifest is its peak.
+    fn freeTables(g: *Graph) void {
+        const gpa = g.r.gpa;
+        const r = &g.r;
+        r.map.clearAndFree(gpa);
+        r.units.clearAndFree(gpa);
+        r.dependees.clearAndFree(gpa);
+        r.unit_list.clearAndFree(gpa);
+        r.dependee_list.clearAndFree(gpa);
+        r.dependee_producer.clearAndFree(gpa);
+        gpa.free(r.unit_info);
+        r.unit_info = &.{};
+        gpa.free(r.dependee_info);
+        r.dependee_info = &.{};
+        r.edges.clearAndFree(gpa);
+        r.atom_pairs.clearAndFree(gpa);
         gpa.free(g.atom_units);
         gpa.free(g.dep_units);
         gpa.free(g.dep_refs);
@@ -2620,7 +2643,7 @@ const Graph = struct {
         g.root_ns_items.deinit(gpa);
         gpa.free(g.root_nodes);
         gpa.free(g.reach_nodes);
-        gpa.free(g.debug_of);
+        g.* = .{ .r = g.r, .debug_of = g.debug_of };
     }
 
     fn collect(g: *Graph, io: Io, zcu: *Zcu, emit: *const Emit) !void {
@@ -2742,6 +2765,9 @@ const Graph = struct {
             if (ty != .none) try g.root_ns_items.append(gpa, try r.addDependee(.{ .namespace = ip.structInfo(ty).namespace }));
         };
         try r.prepare(io);
+        // Every item is listed: free the tables that found them.
+        r.units.clearAndFree(gpa);
+        r.dependees.clearAndFree(gpa);
     }
 
     fn makeNodes(g: *Graph, io: Io, zcu: *Zcu, emit: *const Emit) !void {
@@ -2803,6 +2829,13 @@ const Graph = struct {
             for (emit.link_content_uses.items) |key| try r.edges.append(gpa, .{ index, Recorder.edge(r.map.get(@backingInt(key)).?, false) });
         }
         try r.group();
+        // Grouped into the nodes, and every node made.
+        r.edges.clearAndFree(gpa);
+        r.atom_pairs.clearAndFree(gpa);
+        inline for (.{ "atom_units", "dep_units", "dep_refs", "use_units" }) |field| {
+            gpa.free(@field(g, field));
+            @field(g, field) = &.{};
+        }
 
         // Each atom's debug info, and the atoms' hashes as their owners'
         // results where nothing else is.
@@ -3086,6 +3119,11 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     }
     if (inc.check and !checkReach(gpa, r, root_nodes, &b)) inc.check_failed.store(true, .monotonic);
     if (inc.verify == .full and !try inc.verifyNodes(r, &b, emit, debug_of)) inc.check_failed.store(true, .monotonic);
+    // Copied into the manifest.
+    g.freeTables();
+    node_refs.clearAndFree(gpa);
+    result_words.clearAndFree(gpa);
+    name_words.clearAndFree(gpa);
     for (base_names.items) |name| _ = try b.addBasePack(name);
     b.items = enc.words.items;
     b.item_starts = enc.starts.items;
@@ -3374,9 +3412,9 @@ const Putter = struct {
             for (p.nodes[lo..hi], p.where[lo..hi]) |*n, *w| {
                 if (n.atoms.len == 0) continue;
                 const len = p.entryLen(n);
-                if (try p.store.get(p.inc.gpa, p.inc.io, storeKey(p.inc.store_seed, n.key, n.src_hash))) |e| {
-                    if (e.resultHash() == n.exact_hash and e.atomCount() == n.atoms.len and e.deps().len == n.deps.len and
-                        e.atomsBytes() == len - Store.atomsOffset(n.deps.len))
+                if (try p.store.peek(p.inc.gpa, p.inc.io, storeKey(p.inc.store_seed, n.key, n.src_hash))) |e| {
+                    if (e.result_hash == n.exact_hash and e.atoms_len == n.atoms.len and e.deps_len == n.deps.len and
+                        e.atoms_bytes == len - Store.atomsOffset(n.deps.len))
                     {
                         w.* = .{ .hit = .{ .pack = e.pack, .offset = e.offset } };
                         continue;
