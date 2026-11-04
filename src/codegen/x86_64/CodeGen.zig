@@ -1694,7 +1694,11 @@ fn exemptArgs(cg: *CodeGen) Error!void {
 /// left to load reads it; a cycle of register moves is broken with
 /// `xchg`.
 fn loadArgRegs(cg: *CodeGen, args: []const Ref, tys: []const Index, locs: []const AutoArg, refs: []const ArgRef) Error!void {
-    const Move = struct { arg: Ref, ty: Index, lo: Reg, hi: ?Reg, src: ?Reg, addr: ?Mem = null };
+    // `src`/`src_hi`: registers holding the value; `reads`: registers an
+    // address the value is computed from is based on (an argument
+    // register that another move may write first).
+    // `saved`: where a value routed out of a cycle waits (below).
+    const Move = struct { arg: Ref, ty: Index, lo: Reg, hi: ?Reg, src: ?Reg, src_hi: ?Reg = null, addr: ?Mem = null, reads: ?Reg = null, saved: ?Mem = null };
     var moves: [6]Move = undefined;
     var n: usize = 0;
     for (args, tys, locs, refs) |arg, ty, l, ref| switch (l) {
@@ -1706,15 +1710,27 @@ fn loadArgRegs(cg: *CodeGen, args: []const Ref, tys: []const Index, locs: []cons
             n += 1;
         },
         .gpr => |r| {
-            const src: ?Reg = if (arg.toIndex()) |v| switch (cg.homes[@backingInt(v)]) {
-                .reg => |x| if (std.mem.indexOfScalar(Reg, &c_arg_regs, x) != null) x else null,
-                else => null,
-            } else null;
-            moves[n] = .{ .arg = arg, .ty = ty, .lo = c_arg_regs[r], .hi = null, .src = src };
+            moves[n] = .{ .arg = arg, .ty = ty, .lo = c_arg_regs[r], .hi = null, .src = null };
+            if (arg.toIndex()) |v| switch (cg.homes[@backingInt(v)]) {
+                .reg => |x| moves[n].src = x,
+                .reg_addr => |ra| moves[n].reads = ra.base,
+                else => {},
+            };
             n += 1;
         },
         .gpr_pair => |r| {
             moves[n] = .{ .arg = arg, .ty = ty, .lo = c_arg_regs[r], .hi = c_arg_regs[r + 1], .src = null };
+            if (cg.pairOf(arg)) |p| {
+                moves[n].src = p.lo;
+                moves[n].src_hi = p.hi;
+            } else if (arg.toIndex()) |v| if (cg.homes[@backingInt(v)] == .deferred) {
+                const ptr = cg.ir.instructions.items(.data)[@backingInt(v)].ty_op.operand;
+                if (ptr.toIndex()) |pi| switch (cg.homes[@backingInt(pi)]) {
+                    .reg => |x| moves[n].reads = x,
+                    .reg_addr => |ra| moves[n].reads = ra.base,
+                    else => {},
+                };
+            };
             n += 1;
         },
         else => {},
@@ -1722,28 +1738,59 @@ fn loadArgRegs(cg: *CodeGen, args: []const Ref, tys: []const Index, locs: []cons
     while (n > 0) {
         const k = for (moves[0..n], 0..) |m, k| {
             const blocked = for (moves[0..n], 0..) |o, j| {
-                if (j != k and o.src != null and (o.src.? == m.lo or o.src.? == m.hi)) break true;
+                if (j == k) continue;
+                const read = [_]?Reg{ o.src, o.src_hi, o.reads };
+                if (std.mem.indexOfScalar(?Reg, &read, m.lo) != null) break true;
+                if (m.hi != null and std.mem.indexOfScalar(?Reg, &read, m.hi) != null) break true;
             } else false;
             if (!blocked) break k;
         } else {
             // Every move left writes a register another one reads, so
-            // some register moves form a cycle. Swap one into place; what
-            // read either register reads the other.
-            const k = for (moves[0..n], 0..) |m, k| {
-                if (m.src != null) break k;
-            } else unreachable;
-            const m = moves[k];
-            try cg.e.xchg(.qword, .{ .reg = m.lo }, m.src.?);
-            moves[k] = moves[n - 1];
-            n -= 1;
-            for (moves[0..n]) |*o| {
-                if (o.src == m.lo) o.src = m.src else if (o.src == m.src) o.src = m.lo;
+            // some moves form a cycle. Compute a value read through an
+            // address first, as its lowering reads the base from the
+            // value's home, and keep it in a slot (loading the others may
+            // use r11); else swap a register move into place (what read
+            // either register reads the other).
+            const routed = for (moves[0..n]) |m| {
+                if (m.reads != null) break true;
+            } else false;
+            const swap: ?usize = if (routed) null else for (moves[0..n], 0..) |m, k| {
+                if (m.src != null and m.src_hi == null) break k;
+            } else null;
+            if (swap) |k| {
+                const m = moves[k];
+                try cg.e.xchg(.qword, .{ .reg = m.lo }, m.src.?);
+                moves[k] = moves[n - 1];
+                n -= 1;
+                for (moves[0..n]) |*o| for ([_]*?Reg{ &o.src, &o.src_hi, &o.reads }) |x| {
+                    if (x.* == m.lo) x.* = m.src else if (x.* == m.src) x.* = m.lo;
+                };
+                continue;
             }
+            const m = &moves[
+                for (moves[0..n], 0..) |o, k| {
+                    if (o.reads != null) break k;
+                } else 0
+            ];
+            const slot = Mem.at(.rbp, try cg.allocSlot(16, 8));
+            if (m.hi) |_| {
+                try cg.loadPair(.r10, .rax, m.arg);
+                try cg.e.mov(.qword, .{ .mem = offsetMem(slot, 8) }, .{ .reg = .rax });
+            } else try cg.loadGpr(.r10, m.arg, m.ty);
+            try cg.e.mov(.qword, .{ .mem = slot }, .{ .reg = .r10 });
+            m.saved = slot;
+            m.reads = null;
             continue;
         };
         const m = moves[k];
-        if (m.hi) |hi| {
-            try cg.loadPair(m.lo, hi, m.arg);
+        if (m.saved) |slot| {
+            try cg.e.mov(.qword, .{ .reg = m.lo }, .{ .mem = slot });
+            if (m.hi) |hi| try cg.e.mov(.qword, .{ .reg = hi }, .{ .mem = offsetMem(slot, 8) });
+        } else if (m.hi) |hi| {
+            if (m.src_hi) |sh| {
+                if (m.lo != m.src.?) try cg.e.mov(.qword, .{ .reg = m.lo }, .{ .reg = m.src.? });
+                if (hi != sh) try cg.e.mov(.qword, .{ .reg = hi }, .{ .reg = sh });
+            } else try cg.loadPair(m.lo, hi, m.arg);
         } else if (m.src) |r| {
             if (r != m.lo) try cg.e.mov(.qword, .{ .reg = m.lo }, .{ .reg = r });
         } else if (m.addr) |a| {
