@@ -3607,6 +3607,34 @@ fn intValueAa(sema: *Sema, ty: Index) !Index {
 }
 
 /// Whether a comptime-known integer fits in integer type `ty`.
+/// "cannot represent integer value", for comptime-known integer `val` that
+/// does not fit integer type `ty`, with a note on `ty`'s range, the
+/// smallest type that holds `val`, and `@truncate` for its low bits.
+noinline fn failIntRange(sema: *Sema, block: *Block, src: Src, ty: Index, val: Index) CompileError {
+    const err = sema.fail(block, src, "type '{f}' cannot represent integer value '{f}'", .{ sema.fmtType(ty), sema.fmtValue(val) });
+    const info = Type.intInfo(sema.ip, ty);
+    var space: [2]std.math.big.Limb = undefined;
+    const v = sema.ip.intToBig(val, &space);
+    // The type's range, as big integers: `ty` can be u128 or wider.
+    var bounds: [2]std.math.big.int.Mutable = undefined;
+    for (&bounds, [_]std.math.big.int.TwosCompIntLimit{ .min, .max }) |*b, limit| {
+        b.* = .{ .limbs = try sema.arena.alloc(std.math.big.Limb, std.math.big.int.calcTwosCompLimbCount(info.bits)), .len = undefined, .positive = undefined };
+        b.setTwosCompIntLimit(limit, info.signedness, info.bits);
+    }
+    const signedness: std.lang.Signedness = if (v.positive) info.signedness else .signed;
+    const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+    try sema.zcu.addNote(sema.file, src.span(tree), "'{f}' holds {f} to {f}; the smallest integer type that holds {f} is {c}{d}; @truncate keeps its low {d} bits", .{
+        sema.fmtType(ty),
+        bounds[0].toConst(),
+        bounds[1].toConst(),
+        v,
+        @as(u8, if (signedness == .signed) 'i' else 'u'),
+        @max(1, v.bitCountTwosComp() + @intFromBool(v.positive and signedness == .signed)),
+        info.bits,
+    });
+    return err;
+}
+
 fn intFits(sema: *Sema, val: Index, ty: Index) bool {
     if (ty == .comptime_int_type) return true;
     const info = Type.intInfo(sema.ip, ty);
@@ -8571,7 +8599,7 @@ fn coerceInner(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src) 
         .int, .comptime_int => if (sc == .int or sc == .comptime_int) {
             if (val) |v| {
                 if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
-                if (!sema.intFits(v, dest_ty)) return sema.fail(block, src, "type '{f}' cannot represent integer value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(v) });
+                if (!sema.intFits(v, dest_ty)) return sema.failIntRange(block, src, dest_ty, v);
                 return .fromInterned(try sema.retypeInt(v, dest_ty));
             }
             if (dc == .comptime_int or sc == .comptime_int) return sema.failNeededComptime(block, src, "value casted to 'comptime_int' must be comptime-known");
@@ -17481,7 +17509,7 @@ fn analyzeIntCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand:
     if (!Type.isInt(ip, src_ty) and src_ty != .comptime_int_type) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected integer type, found '{f}'", .{sema.fmtType(src_ty)});
     if (sema.resolveValue(operand)) |v| {
         if (sema.isUndef(v)) return .fromInterned(try sema.undefValue(dest_ty));
-        if (!sema.intFits(v, dest_ty)) return sema.fail(block, sema.callArgSrc(src, false, 0), "type '{f}' cannot represent integer value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(v) });
+        if (!sema.intFits(v, dest_ty)) return sema.failIntRange(block, sema.callArgSrc(src, false, 0), dest_ty, v);
         return .fromInterned(try sema.retypeInt(v, dest_ty));
     }
     try sema.requireRuntime(block, src);
