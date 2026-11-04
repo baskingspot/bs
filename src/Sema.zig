@@ -3285,7 +3285,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
             .check_comptime_control_flow => {
                 // As upstream: a `continue` of an inline loop cannot be
                 // inside runtime control flow within the loop.
-                if (!block.is_comptime) {
+                if (!block.is_comptime and block.runtime_depth != 0) {
                     const target = data.un_node.operand.toIndex().?;
                     var b: ?*Block = block;
                     while (b) |cb| : (b = cb.parent) {
@@ -7379,6 +7379,11 @@ const CoerceCtx = union(enum) {
 
 fn coerceCtx(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref, src: Src, ctx: CoerceCtx) CompileError!Ref {
     if (try sema.coerceInner(block, dest_ty, inst, src)) |r| return r;
+    return sema.failCoerce(block, src, dest_ty, inst, ctx);
+}
+
+/// Out of line: `coerceCtx` runs on every coercion.
+noinline fn failCoerce(sema: *Sema, block: *Block, src: Src, dest_ty: Index, inst: Ref, ctx: CoerceCtx) CompileError {
     const ip = sema.ip;
     var actual = sema.typeOf(inst);
     // A function coerces to a pointer as `&f`, so upstream names `&f`'s
@@ -9014,9 +9019,13 @@ fn requireRuntimeLoad(sema: *Sema, block: *Block, src: Src) CompileError!void {
 
 /// Fails at the first undefined one of the comptime-known operands `lv`
 /// and `rv` of the operator at `src`, as upstream.
-fn failUndefOperand(sema: *Sema, block: *Block, src: Src, lv: ?Index, rv: ?Index) CompileError!void {
-    for ([_]?Index{ lv, rv }, 0..) |v, i| if (v) |val| if (sema.isUndef(val))
-        return sema.fail(block, src.operandSrc(@intCast(i)), "use of undefined value here causes illegal behavior", .{});
+inline fn failUndefOperand(sema: *Sema, block: *Block, src: Src, lv: ?Index, rv: ?Index) CompileError!void {
+    if (lv) |v| if (sema.isUndef(v)) return sema.failUndefAt(block, src.operandSrc(0));
+    if (rv) |v| if (sema.isUndef(v)) return sema.failUndefAt(block, src.operandSrc(1));
+}
+
+noinline fn failUndefAt(sema: *Sema, block: *Block, src: Src) CompileError {
+    return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
 }
 
 fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, uncasted_lhs: Ref, uncasted_rhs: Ref) CompileError!Ref {
@@ -11283,14 +11292,14 @@ fn sliceToArrayPtr(sema: *Sema, block: *Block, src: Src, slice: Index) CompileEr
 
 /// A comptime alloc for a variable declared in `block`.
 fn createComptimeVar(sema: *Sema, block: *Block, ty: Index, is_const: bool) !Index {
-    const ptr = try sema.createComptimeAlloc(ty, is_const);
-    sema.comptime_allocs.getPtr(sema.ip.keyPayload(.ptr, ptr).base.comptime_alloc).?.runtime_depth = block.runtime_depth;
-    return ptr;
+    return sema.createComptimeAllocAt(ty, is_const, block.runtime_depth);
 }
 
 /// As upstream: a comptime variable is not stored to from inside runtime
 /// control flow that its declaration is outside of.
 fn checkComptimeVarStore(sema: *Sema, block: *Block, src: Src, ptr: Index) CompileError!void {
+    // Outside runtime control flow no store can be deeper than its variable.
+    if (block.runtime_depth == 0) return;
     const ip = sema.ip;
     var p = ptr;
     const id = while (true) switch (ip.keyPayload(.ptr, p).base) {
@@ -11310,11 +11319,16 @@ fn checkComptimeVarStore(sema: *Sema, block: *Block, src: Src, ptr: Index) Compi
 }
 
 fn createComptimeAlloc(sema: *Sema, ty: Index, is_const: bool) !Index {
+    return sema.createComptimeAllocAt(ty, is_const, std.math.maxInt(u32));
+}
+
+fn createComptimeAllocAt(sema: *Sema, ty: Index, is_const: bool, runtime_depth: u32) !Index {
     const id = sema.ip.next_comptime_alloc.fetchAdd(1, .monotonic);
     try sema.comptime_allocs.put(sema.gpa, id, .{
         .ty = ty,
         .val = if (ty == .none) .none else try sema.undefValue(ty),
         .is_const = is_const,
+        .runtime_depth = runtime_depth,
     });
     const ptr_ty = try sema.ptrType(.{ .child = if (ty == .none) .generic_poison_type else ty });
     return sema.intern(.{ .ptr = .{ .ty = ptr_ty, .base = .{ .comptime_alloc = id } } });
@@ -14642,12 +14656,14 @@ fn analyzeSwitch(sema: *Sema, parent: *Block, src: Src, inst: Zir.Inst.Index, op
         // A union switches over its fields, whatever its tag type.
         if (info.nonexhaustive and !sb.has_under and !is_union) return sema.fail(parent, src, "switch on non-exhaustive enum must include 'else' or '_' prong or both", .{});
         var missing: std.ArrayList(u32) = .empty;
-        for (info.field_defaults, 0..) |fv, fi| {
+        // The items are distinct named values, so as many items as fields
+        // name them all.
+        if (info.nonexhaustive or seen.values.count() != info.field_defaults.len) for (info.field_defaults, 0..) |fv, fi| {
             const tv = try sema.intern(.{ .enum_tag = .{ .ty = operand_ty, .int = fv } });
             for (cases.items) |c| {
                 if (std.mem.indexOfScalar(Index, c.items, tv) != null) break;
             } else try missing.append(sema.arena, @intCast(fi));
-        }
+        };
         if (missing.items.len != 0) return sema.failSwitchEnum(parent, src, operand_ty, if (is_union) sema.typeOf(operand) else null, missing.items);
     } else if (else_case == null) switch (Type.class(ip, operand_ty)) {
         .error_set => if (try sema.errorSetNames(parent, src, operand_ty)) |names| {
