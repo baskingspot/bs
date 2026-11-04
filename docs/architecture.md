@@ -1309,10 +1309,23 @@ padding never observable). Still scalarized: shifts, overflow and
 saturating arithmetic, division and remainder of integers, 64-bit
 `@min`/`@max`, float reductions (a left fold, in element order, as
 upstream; a tree would change the rounding and which zero `@min`
-returns), other lane widths, and anything longer than 128 bytes or 64
-bools. With SSE4.1 (`-mcpu` features, once zap accepts them) `pmulld`,
+returns), integers wider than 64 bits, f16, f80 and f128, and anything
+longer than 128 bytes or 64 bools. With SSE4.1 (`-mcpu` features, once zap accepts them) `pmulld`,
 `pminsd`/`pmaxsd`, `pcmpeqq` and `pblendvb` would replace the SSE2
 sequences; AVX changes the vector ABI and is a separate decision.
+
+Narrow integers (`u4`, `i24`) sit in their ABI-size lane, extended as
+in memory, so the operations that keep lanes extended treat them as
+that lane: bitwise ops, compares, `@select`, `@shuffle`, `@min`/`@max`
+and their reductions, and `~` of signed lanes (`vector.narrow`). Their
+vectors stay memory class, so their ABI and bitcasts do not change.
+`std.simd.firstTrue` relies on this: it selects from an iota of the
+index type (`@Vector(16, u4)` for 16 lanes) and reduces with `.Min`;
+CodeGen fuses that pair (`fuseIndexSelect`: an iota and a splat of at
+least the last index) into a `bsf` of the predicate's bits, and
+`lastTrue`'s `.Max` with 0 into `bsr`. So `mem.indexOfScalarPos` and
+`splitScalar`, on `zap build`'s hot path, scan 16 bytes with
+`pcmpeqb`, `pmovmskb` and `bsf`, as upstream's Debug backend does.
 
 NEON maps onto the same interface: 128-bit `v` registers for vectors of
 up to 16 bytes, and the same chunking for longer ones. Its compares
@@ -1320,20 +1333,25 @@ produce lane masks too, gathered to bits with a `ushr`/`addv` sequence
 (no `movemask`), and it orders 64-bit lanes natively (`cmgt`, `cmhi`),
 so its `native` answers may be broader than x86_64's.
 
-Measured (orb, 4 vCPU, ReleaseFast zap against main 13942f5,
-2026-11-04): the fuzzer's `PcBitsetIterator.next` takes 72 instructions
-per call on its 64-byte path, against 258 (79 of them stack accesses);
-the compare itself is 23. A loop of 25.6 M calls runs 3.3 ns per call
-against 12.5 (upstream Debug: 197). `zap build test --fuzz=3M --seed=1`
-of a `key=` parser test runs 6.3 s against 10.7 s (upstream LLVM, its
-build cached: 6.4 s). `mem.indexOfScalar` and `mem.eql` over 4 KiB run
-3.5x faster (0.05 s against 0.17 s; upstream Debug 0.35 s), and an
-f32x4 multiply-add loop with a u32x4 accumulator 35x (0.08 s against
-2.8 s; upstream Debug 0.19 s, ReleaseSafe 0.035 s). Of the behavior
-files, only x86_64.zig runs long enough to measure: 182 ms against
-198 ms. Compile time does not change (cache off, medians of 5: std's
-tests 5.12 s against 5.17 s, x86_64.zig 8.63 s against 8.77 s,
-vector.zig 0.17 s both).
+Measured (orb, 4 vCPU, ReleaseFast zap against main e89b24b,
+2026-11-04; best of 3):
+
+- The fuzzer's `PcBitsetIterator.next` takes 68 instructions per call
+  on its 64-byte path, against 253; the compare itself is 23. A loop of
+  25.6 M calls runs 3.1 ns per call against 11.3 (upstream Debug: 197).
+  `zap build test --fuzz=3M --seed=1` of a `key=` parser test runs 6.2 s
+  against 10.6 s (upstream LLVM, its build cached: 6.4 s).
+- `splitScalar` over 64 MiB of 40- to 120-byte lines: 26 ms per pass
+  against 137 (upstream Debug 238, ReleaseSafe 15).
+  `indexOfScalarPos` over 64 MiB: 6.4 ms against 62 (Debug 138,
+  ReleaseSafe 2.1). `indexOfScalar` and `eql` over 4 KiB: 4x.
+- An f32x4 multiply-add loop with a u32x4 accumulator: 0.08 s against
+  2.85 s (upstream Debug 0.19 s, ReleaseSafe 0.035 s).
+- Of the behavior files, only x86_64.zig runs long enough to measure:
+  178 ms against 195 ms.
+- Compile time does not change (cache off, medians of 5): std's tests
+  5.12 s against 5.16 s, x86_64.zig 8.66 s against 8.72 s, vector.zig
+  0.174 s both.
 
 #### What is per architecture
 

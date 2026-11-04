@@ -68,17 +68,19 @@ pub const Lane = enum {
 };
 
 /// The lane of vector type `ty`'s elements, if they have one: integers of
-/// 8, 16, 32, or 64 bits, f32, f64, and bool.
+/// up to 64 bits, f32, f64, and bool. An integer narrower than its lane
+/// (`narrow`: a `u4` in a byte lane, as vectors lay it out in memory) is
+/// held extended to the lane, as narrow integers are in memory.
 pub fn lane(ip: *const InternPool, ty: Index) ?Lane {
     if (ip.keyTag(ty) != .vector_type) return null;
     const child = ip.keyPayload(.vector_type, ty).child;
     if (child == .bool_type) return .bool;
     return switch (Type.class(ip, child)) {
-        .int => switch (Type.intInfo(ip, child).bits) {
-            8 => .i8,
-            16 => .i16,
-            32 => .i32,
-            64 => .i64,
+        .int => if (Type.intInfo(ip, child).bits == 0 or Type.intInfo(ip, child).bits > 64) null else switch (Type.abiSize(ip, child)) {
+            1 => .i8,
+            2 => .i16,
+            4 => .i32,
+            8 => .i64,
             else => null,
         },
         .float => switch (Type.floatBits(ip, child)) {
@@ -88,6 +90,16 @@ pub fn lane(ip: *const InternPool, ty: Index) ?Lane {
         },
         else => null,
     };
+}
+
+/// Whether vector type `ty`'s integer elements are narrower than their
+/// lane (`lane`). Operations on such lanes must keep them extended, so
+/// only those that do are native: bitwise ops, compares, `@select`,
+/// `@shuffle`, `@min`/`@max`, and reductions with them.
+pub fn narrow(ip: *const InternPool, ty: Index) bool {
+    const child = ip.keyPayload(.vector_type, ty).child;
+    if (Type.class(ip, child) != .int) return false;
+    return Type.intInfo(ip, child).bits != 8 * Type.abiSize(ip, child);
 }
 
 /// The longest vectors lowered natively: in bytes of lanes, and in bits of
@@ -115,6 +127,13 @@ pub fn native(arch: std.Target.Cpu.Arch, ip: *const InternPool, op: Op, ty: Inde
         };
     }
     if (len * l.bytes() > max_bytes) return false;
+    if (narrow(ip, ty)) switch (op) {
+        .bit_and, .bit_or, .xor, .cmp, .select, .shuffle, .min, .max => {},
+        // `~` keeps sign-extended lanes extended, not zero-extended ones.
+        .not => if (Type.intInfo(ip, ip.keyPayload(.vector_type, ty).child).signedness == .unsigned) return false,
+        .reduce => |r| if (r == .add or r == .mul) return false,
+        else => return false,
+    };
     return switch (op) {
         .add_wrap, .sub_wrap, .bit_and, .bit_or, .xor, .not => !l.isFloat(),
         // SSE2 multiplies 16-bit lanes, and 32-bit ones through pmuludq.

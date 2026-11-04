@@ -66,9 +66,11 @@ pub fn shape(ip: *const InternPool, ty: Index) ?Shape {
 }
 
 /// Whether `ty`'s values live in one XMM register when they get one.
+/// Vectors of narrow integers (`../vector.zig`) stay in memory, where
+/// their layout is settled.
 pub fn inXmm(ip: *const InternPool, ty: Index) bool {
     const s = shape(ip, ty) orelse return false;
-    return s.bytes() <= 16;
+    return s.bytes() <= 16 and !shared.narrow(ip, ty);
 }
 
 /// Whether `ty` is a bool vector kept as its bits (`../vector.zig`).
@@ -130,6 +132,7 @@ fn readsChunks(cg: *CodeGen, inst: Inst.Index) bool {
 /// the load's memory covers the vector's chunks. `before` are the values
 /// before `inst` in its block.
 pub fn deferOperands(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index) void {
+    if (cg.ir.instructions.items(.tag)[@backingInt(inst)] == .reduce) fuseIndexSelect(cg, inst, before);
     if (!readsChunks(cg, inst)) return;
     const T = struct {
         cg: *CodeGen,
@@ -169,6 +172,73 @@ pub fn deferOperands(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index)
     Ssa.forEachOperand(cg.ir, inst, T{ .cg = cg, .before = before, .at = pos });
 }
 
+/// For `deferOperands`: `@reduce(.Min, @select(T, pred, iota, @splat(m)))`
+/// with `m` at least the last index is the index of `pred`'s first set
+/// bit, or `m` (`std.simd.firstTrue`); `.Max` with `m` 0 is the last set
+/// bit's, or 0 (`lastTrue`). The select, whose only user is the reduce
+/// right after it, is not emitted (`Home.view`), and `reduceIndex` scans
+/// `pred`'s bits instead.
+fn fuseIndexSelect(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index) void {
+    const ip = cg.ip;
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    const x = ir.extraData(Ir.Reduce, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload).data;
+    const op = x.operation();
+    if (op != .min and op != .max) return;
+    const si = x.operand.toIndex() orelse return;
+    const ii = @backingInt(si);
+    if (tags[ii] != .select) return;
+    const live = cg.ssa.live.slice();
+    if (live.items(.uses)[ii] != 1 or live.items(.fate)[ii] != .normal or cg.homes[ii] != .none) return;
+    const adjacent = for (0..@min(before.len, 8)) |j| {
+        const v = before[before.len - 1 - j];
+        if (v == si) break true;
+        switch (tags[@backingInt(v)]) {
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            else => break false,
+        }
+    } else false;
+    if (!adjacent) return;
+    const sel = ir.extraData(Ir.Select, ir.instructions.items(.data)[ii].ty_pl.payload).data;
+    const ty = cg.typeOf(x.operand);
+    if (!isBits(ip, cg.typeOf(sel.pred)) or Type.intInfo(ip, Type.childType(ip, ty)).signedness != .unsigned) return;
+    const a = sel.a.toInterned() orelse return;
+    const b = sel.b.toInterned() orelse return;
+    const len = ip.keyPayload(.vector_type, ty).len;
+    if (ip.keyTag(a) != .aggregate) return;
+    switch (ip.keyPayload(.aggregate, a).storage) {
+        .elems => |elems| for (elems, 0..) |el, i| {
+            if (ip.keyTag(el) != .int or ip.intValue(u64, el) != i) return;
+        },
+        else => return,
+    }
+    const m = splatBits(cg, b) orelse return;
+    if (if (op == .min) m < len - 1 else m != 0) return;
+    if (sel.pred.toIndex()) |p| {
+        const end = live.items(.end);
+        end[@backingInt(p)] = @max(end[@backingInt(p)], live.items(.def)[@backingInt(inst)]);
+    }
+    cg.homes[ii] = .view;
+    live.items(.reg)[ii] = Ssa.no_reg;
+}
+
+/// `reduce` of a select fused by `fuseIndexSelect`: bsf or bsr of the
+/// predicate's bits, `m` when none is set.
+fn reduceIndex(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, operand: Ref) Error!void {
+    const ir = cg.ir;
+    const e = &cg.e;
+    const sel = ir.extraData(Ir.Select, ir.instructions.items(.data)[@backingInt(operand.toIndex().?)].ty_pl.payload).data;
+    const len = cg.ip.keyPayload(.vector_type, cg.typeOf(operand)).len;
+    const d = cg.destReg(inst);
+    try cg.load(.rax, sel.pred);
+    try andImm(cg, .rax, lenMask(len));
+    try e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @bitCast(splatBits(cg, sel.b.toInterned().?).?) });
+    try e.bitScan(op == .max, .qword, .rax, .{ .reg = .rax });
+    try e.cmov(.e, .qword, .rax, .{ .reg = .rcx });
+    if (d != .rax) try e.mov(.qword, .{ .reg = d }, .{ .reg = .rax });
+    try cg.setResult(inst, ty, d);
+}
+
 pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error!void {
     const ip = cg.ip;
     switch (tag) {
@@ -179,9 +249,11 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
         .reduce => {
             const x = cg.ir.extraData(Ir.Reduce, data.ty_pl.payload).data;
             if (isBits(ip, cg.typeOf(x.operand))) return reduceBits(cg, inst, x.operation(), x.operand);
+            if (x.operand.toIndex()) |o| if (cg.homes[@backingInt(o)] == .view) return reduceIndex(cg, inst, data.ty_pl.ty, x.operation(), x.operand);
             try reduce(cg, inst, data.ty_pl.ty, x.operation(), x.operand);
         },
         .select => {
+            if (cg.homes[@backingInt(inst)] == .view) return; // read by its reduce
             const x = cg.ir.extraData(Ir.Select, data.ty_pl.payload).data;
             try select(cg, inst, data.ty_pl.ty, x.pred, x.a, x.b);
         },
@@ -275,8 +347,9 @@ fn chunk(cg: *CodeGen, ref: Ref, k: u32) Error!Chunk {
     const ip = cg.ip;
     if (ref.toInterned()) |v| {
         const ty = ip.typeOf(v);
-        if (splatBits(cg, v)) |bits| {
+        if (splatBits(cg, v)) |all_bits| {
             const lb = shape(ip, ty).?.lane.bytes();
+            const bits = all_bits & lenMask(lb * 8);
             if (bits == 0) return .zero;
             if (bits == lenMask(lb * 8)) return .ones;
         }
@@ -948,6 +1021,7 @@ fn splat(cg: *CodeGen, inst: Inst.Index, ty: Index, elem: Ref) Error!void {
         try cg.loadXmm(r, try cg.valOf(elem));
     } else {
         try cg.load(.rax, elem);
+        if (shared.narrow(cg.ip, ty)) try cg.normalize(.rax, cg.typeOf(elem));
         try e.movToXmm(if (s.lane == .i64) .qword else .dword, r, .{ .reg = .rax });
     }
     switch (s.lane) {

@@ -185,9 +185,10 @@ const Home = union(enum) {
     /// Nothing reads the value and computing it has no effect: it is not
     /// emitted (pass 2).
     dead,
-    /// A bitcast to a vector of a deferred load, read in place by its only
-    /// user, a vector operation (`vector.deferOperands`): the value is the
-    /// load's memory.
+    /// Read in place by its only user, a vector operation
+    /// (`vector.deferOperands`): a bitcast to a vector of a deferred load,
+    /// whose value is the load's memory, or a select of indices that its
+    /// reduce scans the predicate's bits for.
     view,
 };
 
@@ -1066,7 +1067,7 @@ fn intFits(src: Type.IntInfo, dst: Type.IntInfo) bool {
 
 /// Truncates the 64-bit value in `reg` to integer type `ty` and extends it
 /// back, so it is normalized.
-fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
+pub fn normalize(cg: *CodeGen, reg: Reg, ty: Index) Error!void {
     if (!Type.isInt(cg.ip, ty)) return; // bools stay 0 or 1
     const info = Type.intInfo(cg.ip, ty);
     if (info.bits >= 64) return;
