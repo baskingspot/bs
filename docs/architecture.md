@@ -2897,7 +2897,15 @@ symbol or a local becomes (section atom, value + addend).
   `lea rdi, [rip + x@tlsld]; call __tls_get_addr` to the 12-byte padded
   `mov rax, fs:0`, with each DTPOFF32 becoming `x86_64_tpoff32` on the
   offset; IE's `mov reg, [rip + x@gottpoff]` to `mov reg, imm32`
-  (`x86_64_tpoff32`); TPOFF32 as is. In a shared object, GD and LD stay
+  (`x86_64_tpoff32`); TPOFF32 as is. TLS descriptors
+  (`-mtls-dialect=gnu2`, GCC's default in nixpkgs; built 2026-11-04):
+  GOTPC32_TLSDESC's `lea rax, [rip + x@tlsdesc]` becomes `mov rax,
+  imm32` (`x86_64_tpoff32`) and TLSDESC_CALL's `call [rax]` the nop
+  `xchg ax, ax`, in static and dynamic executables alike;
+  `_TLS_MODULE_BASE_` (Clang's local-dynamic base) becomes `mov rax, 0`,
+  so its DTPOFF32 offsets become TPOFF32 ones, as after LD. Upstream's
+  own linker leaves `_TLS_MODULE_BASE_` undefined; LLD links it. In a
+  shared object, GD and LD stay
   (`x86_64_tlsgd`/`x86_64_tlsld`, the GOT pairs made by ElfDynamic). IE
   in a shared object, and thread-locals imported from shared libraries,
   are `[unsupported]` until something needs them.

@@ -909,6 +909,43 @@ fn Converter(comptime Ctx: type) type {
                 try c.fail("{s}: relocation at offset {d} past the end of section '{s}'", .{ o.path, off, o.sectionName(index) });
                 return 0;
             }
+            // TLS descriptors (-mtls-dialect=gnu2, GCC's default in some
+            // distributions): `lea rax, [rip + x@tlsdesc]; call [rax]`
+            // leaves x's offset from the thread pointer in rax. Every
+            // thread-local of an executable is its own, so the lea becomes
+            // `mov rax, x@tpoff` and the call a 2-byte nop, as ld relaxes
+            // them. `_TLS_MODULE_BASE_`, the local-dynamic form's base,
+            // becomes 0: its DTPOFF32 offsets become TPOFF32 ones, as
+            // after a relaxed TLSLD.
+            if (ty == @backingInt(R.TLSDESC_CALL)) {
+                if (off + 2 > bytes.len or !std.mem.eql(u8, bytes[@intCast(off)..][0..2], &.{ 0xff, 0x10 })) {
+                    try c.unsupported(index, ty);
+                    return 0;
+                }
+                // The lea of the import reports it.
+                if (try c.tlsDescImport(r, false)) return 0;
+                (try c.writable(bytes, copy))[@intCast(off)..][0..2].* = .{ 0x66, 0x90 };
+                return 0;
+            }
+            if (ty == @backingInt(R.GOTPC32_TLSDESC)) {
+                // lea r64, [rip + disp32], with r64 rax in practice.
+                const rex = if (off >= 3) bytes[@intCast(off - 3)] else 0;
+                const modrm = if (off >= 3) bytes[@intCast(off - 1)] else 0;
+                if ((rex != 0x48 and rex != 0x4c) or bytes[@intCast(off - 2)] != 0x8d or modrm & 0xc7 != 0x05) {
+                    try c.unsupported(index, ty);
+                    return 0;
+                }
+                if (try c.tlsDescImport(r, true)) return 0;
+                const b = try c.writable(bytes, copy);
+                b[@intCast(off - 3)..][0..3].* = .{ if (rex == 0x4c) 0x49 else 0x48, 0xc7, 0xc0 | (modrm >> 3 & 7) };
+                if (c.isTlsModuleBase(r.r_sym())) {
+                    b[@intCast(off)..][0..4].* = @splat(0);
+                    return 0;
+                }
+                const t = try c.target(r.r_sym(), 0) orelse return 0;
+                try c.add(off, .x86_64_tpoff32, t, 0);
+                return 0;
+            }
             const t = try c.target(r.r_sym(), r.r_addend) orelse return 0;
             if (t.import) {
                 try c.importReloc(index, r, bytes);
@@ -1048,6 +1085,24 @@ fn Converter(comptime Ctx: type) type {
             const key: SymbolKey = .fromContents(.text, .@"8", code, targets, relocs);
             try c.atoms.append(arena, .{ .key = key, .name = "", .section = .text, .alignment = .@"8", .bytes = code, .targets = targets, .relocs = relocs });
             return key;
+        }
+
+        /// Whether `s` is `_TLS_MODULE_BASE_`, which the linker defines.
+        fn isTlsModuleBase(c: *C, s: u32) bool {
+            return s < c.o.syms.len and std.mem.eql(u8, c.o.symName(c.o.syms[s]), "_TLS_MODULE_BASE_");
+        }
+
+        /// Whether a TLS descriptor relocation `r` names a shared library's
+        /// thread-local, which zap does not link yet (or an undefined
+        /// symbol), after reporting it if `report`.
+        fn tlsDescImport(c: *C, r: elf.Elf64_Rela, report: bool) !bool {
+            if (c.isTlsModuleBase(r.r_sym())) return false;
+            const t = try c.target(r.r_sym(), 0) orelse return true;
+            if (!t.import) return false;
+            if (!report) return true;
+            const name = c.o.symName(c.o.syms[r.r_sym()]);
+            try c.fail("{s}: zap does not link thread-local {s}, which a shared library defines, yet", .{ c.o.path, name });
+            return true;
         }
 
         /// Whether relocation `k + 1` is the call to `__tls_get_addr` at

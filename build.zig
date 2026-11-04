@@ -1181,6 +1181,36 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);
+    // Thread-locals through TLS descriptors (-mtls-dialect=gnu2), which
+    // the link relaxes to local-exec: Clang's, with _TLS_MODULE_BASE_
+    // (upstream's own linker cannot link those; LLD's output prints the
+    // same), and GCC's, static and with -lc.
+    {
+        const expect_tls = "main: 507 9 5 9 true\nset: 2121 31 21 31 true\nthread: 507 9 5 9 false\nafter: 2121 31 21 31 true\n";
+        const tls_variants = [_]struct { name: []const u8, cc: []const []const u8, lc: bool }{
+            .{ .name = "zig cc", .cc = &.{ zig, "cc" }, .lc = false },
+            .{ .name = "cc -fPIC", .cc = &.{ cc orelse "", "-fPIC" }, .lc = false },
+            .{ .name = "cc -fPIC", .cc = &.{ cc orelse "", "-fPIC" }, .lc = true },
+        };
+        for (tls_variants) |v| {
+            if (v.cc[0].len == 0) continue;
+            const obj = b.addSystemCommand(v.cc);
+            obj.addArgs(&.{ "-mtls-dialect=gnu2", "-c" });
+            obj.addFileArg(b.path("test/link_input/tlsdesc.c"));
+            const tls_exe = b.addRunArtifact(zap);
+            tls_exe.setName(b.fmt("zap build-exe{s} with a {s} -mtls-dialect=gnu2 object", .{ if (v.lc) " -lc" else "", v.name }));
+            tls_exe.addArg("build-exe");
+            if (v.lc) tls_exe.addArgs(&.{ "-lc", "-target", "x86_64-linux-gnu" });
+            tls_exe.addFileArg(b.path("test/link_input/tlsdesc_main.zig"));
+            tls_exe.addFileArg(obj.addPrefixedOutputFileArg("-o", "tlsdesc.o"));
+            tls_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+            const tls_run = std.Build.Step.Run.create(b, b.fmt("run zap{s} link of a {s} -mtls-dialect=gnu2 object", .{ if (v.lc) " -lc" else "", v.name }));
+            tls_run.addFileArg(tls_exe.addPrefixedOutputFileArg("-femit-bin=", "tlsdesc"));
+            tls_run.addCheck(.{ .expect_stderr_exact = expect_tls });
+            tls_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+            test_step.dependOn(&tls_run.step);
+        }
+    }
     // An executable of C only, as upstream builds one: its main is C's.
     {
         const cexe = b.addRunArtifact(zap);
