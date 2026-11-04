@@ -409,6 +409,11 @@ fn quoted(msg: []const u8) ?[]const u8 {
 /// first); every replacement is checked against 0.17's std.
 const migrations = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "std", "io", "std.io is now std.Io: take `init: std.process.Init` in main, then `var w = std.Io.File.stdout().writer(init.io, &buffer);`, print with `w.interface.print(...)` and `w.interface.flush()`; std.debug.print writes to stderr without io" },
+    .{ "std", "io.AnyWriter", "std.io.AnyWriter is now `*std.Io.Writer`: take `w: *std.Io.Writer` and pass `&file_writer.interface`, or `&aw.writer` of a std.Io.Writer.Allocating" },
+    .{ "std", "io.GenericWriter", "std.io.GenericWriter is now `*std.Io.Writer`: take `w: *std.Io.Writer` and pass `&file_writer.interface`, or `&aw.writer` of a std.Io.Writer.Allocating" },
+    .{ "std", "io.AnyReader", "std.io.AnyReader is now `*std.Io.Reader`: take `r: *std.Io.Reader` and pass `&file_reader.interface`, or `&reader` of `var reader: std.Io.Reader = .fixed(bytes);`" },
+    .{ "std", "io.fixedBufferStream", "use `var w: std.Io.Writer = .fixed(&buf);` to write into a buffer (`w.buffered()` is what was written), or `var r: std.Io.Reader = .fixed(bytes);` to read from one" },
+    .{ "std", "io.getStdIn", "std.io is now std.Io: take `init: std.process.Init` in main, then `var r = std.Io.File.stdin().reader(init.io, &buffer);` and read lines with `r.interface.takeDelimiter('\\n')`" },
     .{ "std", "rand", "std.rand is now std.Random" },
     .{ "std", "net", "std.net is now std.Io.net" },
     .{ "std", "ChildProcess", "std.ChildProcess is now std.process.Child" },
@@ -416,9 +421,9 @@ const migrations = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "std", "BoundedArray", "std.BoundedArray was removed: use `std.ArrayList(T).initBuffer(&buffer)` with appendBounded and appendSliceBounded" },
     .{ "std", "fifo", "std.fifo was removed: use std.Deque, or std.Io.Reader and std.Io.Writer for byte streams" },
     .{ "std", "event", "std.event was removed: concurrency goes through std.Io" },
-    .{ "fs", "cwd", "std.fs.cwd() is now std.Io.Dir.cwd(), and its methods take io: `std.Io.Dir.cwd().openFile(io, path, .{})`" },
-    .{ "fs", "Dir", "std.fs.Dir is now std.Io.Dir; its methods take io" },
-    .{ "fs", "File", "std.fs.File is now std.Io.File; its methods take io (`file.close(io)`)" },
+    .{ "fs", "cwd", "std.fs.cwd() is now std.Io.Dir.cwd(), and its methods take io: `std.Io.Dir.cwd().openFile(io, path, .{})`, with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "fs", "Dir", "std.fs.Dir is now std.Io.Dir; its methods take io, with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "fs", "File", "std.fs.File is now std.Io.File; its methods take io (`file.close(io)`, `std.Io.File.stdout().writer(io, &buffer)`), with io from main's `init: std.process.Init` (`init.io`)" },
     .{ "fs", "realpathAlloc", "use `std.Io.Dir.cwd().realPathFileAlloc(io, path, gpa)`" },
     .{ "fs", "openFileAbsolute", "use `std.Io.Dir.openFileAbsolute(io, path, .{})`" },
     .{ "fs", "createFileAbsolute", "use `std.Io.Dir.createFileAbsolute(io, path, .{})`" },
@@ -433,12 +438,25 @@ const migrations = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "mem", "writeIntBig", "use `std.mem.writeInt(T, buffer, value, .big)`" },
     .{ "mem", "trimRight", "std.mem.trimRight is now std.mem.trimEnd" },
     .{ "mem", "trimLeft", "std.mem.trimLeft is now std.mem.trimStart" },
+    .{ "mem", "tokenize", "std.mem.tokenize is now std.mem.tokenizeAny (split at any of the delimiter bytes), tokenizeSequence (at the whole delimiter) or tokenizeScalar (at one byte)" },
+    .{ "mem", "split", "std.mem.split is now std.mem.splitSequence (split at the whole delimiter), splitAny (at any of the delimiter bytes) or splitScalar (at one byte)" },
     .{ "mem", "copy", "use @memcpy for non-overlapping slices, or std.mem.copyForwards" },
     .{ "mem", "set", "use `@memset(slice, value)`" },
     .{ "meta", "Int", "use the builtin `@Int(.unsigned, bits)`" },
     .{ "crypto", "random", "std.crypto.random was replaced by std.Io: `io.random(&buffer)`" },
     .{ "heap", "GeneralPurposeAllocator", "std.heap.GeneralPurposeAllocator is now std.heap.DebugAllocator(.{}); in main, init.gpa from std.process.Init is one already" },
-    .{ "time", "sleep", "use `io.sleep(.fromMilliseconds(ms), .awake)` (std.Io.sleep)" },
+    .{ "time", "sleep", "use `try io.sleep(.fromMilliseconds(ms), .awake)` (std.Io.sleep), with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "time", "timestamp", "use `std.Io.Clock.now(.real, io).toSeconds()`, with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "time", "milliTimestamp", "use `std.Io.Clock.now(.real, io).toMilliseconds()`, with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "time", "microTimestamp", "use `std.Io.Clock.now(.real, io).toMicroseconds()`, with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "time", "nanoTimestamp", "use `std.Io.Clock.now(.real, io).toNanoseconds()`, with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "time", "Timer", "std.time.Timer was removed: take `const start = std.Io.Clock.now(.awake, io);`, then `start.durationTo(std.Io.Clock.now(.awake, io)).toNanoseconds()`, with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "time", "Instant", "std.time.Instant was removed: take `const start = std.Io.Clock.now(.awake, io);`, then `start.durationTo(std.Io.Clock.now(.awake, io))`, with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "Thread", "sleep", "use `try io.sleep(.fromMilliseconds(ms), .awake)` (std.Io.sleep), with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "Thread", "Mutex", "std.Thread.Mutex is now std.Io.Mutex: `var mutex: std.Io.Mutex = .init;`, then `try mutex.lock(io)` and `mutex.unlock(io)`, with io from main's `init: std.process.Init` (`init.io`)" },
+    .{ "Thread", "*", "std.Thread keeps spawn, join and detach; its synchronization moved to std.Io (std.Io.Mutex, Condition, RwLock, Semaphore, Event for ResetEvent, Group for WaitGroup and Pool), and its methods take io" },
+    .{ "sort", "sort", "use `std.mem.sort(T, items, context, lessThan)`" },
+    .{ "math", "absInt", "use the builtin `@abs(x)`, which cannot fail and returns the unsigned type" },
     .{ "process", "argsAlloc", "arguments come from main: take `init: std.process.Init`, then `var it = init.minimal.args.iterate();`" },
     .{ "process", "args", "arguments come from main: take `init: std.process.Init`, then `var it = init.minimal.args.iterate();`" },
     .{ "fmt", "format", "print through a writer (`w.print(fmt, args)`, std.Io.Writer), or use std.fmt.bufPrint or std.fmt.allocPrint" },
@@ -446,10 +464,14 @@ const migrations = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "json", "stringifyAlloc", "use `std.json.Stringify.valueAlloc(gpa, value, .{})`" },
     .{ "debug", "warn", "std.debug.warn is now std.debug.print" },
     .{ "os", "exit", "use std.process.exit" },
+    .{ "os", "getenv", "environment variables come from main: take `init: std.process.Init`, then `init.environ_map.get(\"NAME\")`" },
+    .{ "posix", "getenv", "environment variables come from main: take `init: std.process.Init`, then `init.environ_map.get(\"NAME\")`" },
     .{ "os", "*", "std.os keeps only OS-specific APIs (std.os.linux, std.os.windows): POSIX wrappers moved to std.posix, files and sockets to std.Io" },
     .{ "posix", "close", "close files with `file.close(io)` (std.Io.File) and directories with `dir.close(io)`" },
     .{ "posix", "*", "std.posix lost its file and socket functions to std.Io: files are std.Io.File and std.Io.Dir, sockets std.Io.net; raw Linux syscalls are in std.os.linux" },
-    .{ "array_list.Aligned", "init", "std.ArrayList is unmanaged: `var list: std.ArrayList(T) = .empty;`, then pass the allocator to each call (`list.append(gpa, x)`, `list.deinit(gpa)`); std.array_list.Managed keeps the old API" },
+    .{ "array_list.Aligned", "init", "std.ArrayList is unmanaged: `var list: std.ArrayList(T) = .empty;`, then pass the allocator to each call (`list.append(gpa, x)`, `list.deinit(gpa)`); std.array_list.Managed keeps the old API; to print into a byte buffer, use std.Io.Writer.Allocating" },
+    .{ "array_list.Aligned", "writer", "std.ArrayList has no writer: print into `var aw: std.Io.Writer.Allocating = .init(gpa);` through `&aw.writer`, then take the bytes with `aw.written()` or `try aw.toOwnedSlice()`" },
+    .{ "@typeInfo(lang.Type).@\"union\".tag_type.?", "*", "@typeInfo's tags are lowercase: .int, .float, .pointer, .comptime_int, .@\"struct\", .@\"enum\", .@\"union\", .@\"fn\"" },
     .{ "lang.Type", "*", "@typeInfo's fields are lowercase: .int, .pointer, .@\"struct\", .@\"enum\", .@\"union\", .@\"fn\"" },
 };
 
@@ -461,14 +483,30 @@ const migration_map = std.StaticStringMap([]const u8).initComptime(kvs: {
 });
 
 /// The migration hint for a failed lookup of `name` in the container
-/// zap prints as `container` (generic arguments are ignored).
-pub fn migrationHint(container: []const u8, name: []const u8) ?[]const u8 {
+/// zap prints as `container` (generic arguments are ignored), where the
+/// source goes on to access `next` (`AnyWriter` in `std.io.AnyWriter`):
+/// a hint for `name.next` wins over one for `name`.
+pub fn migrationHint(container: []const u8, name: []const u8, next: ?[]const u8) ?[]const u8 {
     const base = container[0 .. std.mem.indexOfScalar(u8, container, '(') orelse container.len];
     var buf: [256]u8 = undefined;
-    const exact = std.fmt.bufPrint(&buf, "{s}\x00{s}", .{ base, name }) catch return null;
-    if (migration_map.get(exact)) |h| return h;
-    const any = std.fmt.bufPrint(&buf, "{s}\x00*", .{base}) catch return null;
-    return migration_map.get(any);
+    if (next) |n| {
+        const path = std.fmt.bufPrint(&buf, "{s}\x00{s}.{s}", .{ base, name, n }) catch return null;
+        if (migration_map.get(path)) |h| return h;
+    }
+    // The whole name first (`@typeInfo(lang.Type).@"union".tag_type.?`).
+    for ([_][]const u8{ container, base }) |c| for ([_][]const u8{ name, "*" }) |n| {
+        const key = std.fmt.bufPrint(&buf, "{s}\x00{s}", .{ c, n }) catch return null;
+        if (migration_map.get(key)) |h| return h;
+    };
+    return null;
+}
+
+/// The name of a field access that starts at byte `offset` (`.name`).
+pub fn nextName(source: []const u8, offset: u32) ?[]const u8 {
+    if (offset >= source.len or source[offset] != '.') return null;
+    var end = offset + 1;
+    while (end < source.len and (std.ascii.isAlphanumeric(source[end]) or source[end] == '_')) end += 1;
+    return if (end > offset + 1) source[offset + 1 .. end] else null;
 }
 
 /// What replaced builtins of older releases (`@intToEnum`), by name with
@@ -495,12 +533,16 @@ pub fn builtinHint(name: []const u8) ?[]const u8 {
 }
 
 test migrationHint {
-    try std.testing.expect(migrationHint("std", "io") != null);
+    try std.testing.expect(migrationHint("std", "io", null) != null);
     // Generic arguments are ignored, and `*` covers a container.
-    try std.testing.expect(std.mem.startsWith(u8, migrationHint("array_list.Aligned(u8,null)", "init").?, "std.ArrayList is unmanaged"));
-    try std.testing.expect(std.mem.startsWith(u8, migrationHint("os", "fd_t").?, "std.os keeps"));
-    try std.testing.expectEqual(null, migrationHint("mem", "eql"));
-    try std.testing.expectEqual(null, migrationHint("array_list.Alignedd", "init"));
+    try std.testing.expect(std.mem.startsWith(u8, migrationHint("array_list.Aligned(u8,null)", "init", null).?, "std.ArrayList is unmanaged"));
+    try std.testing.expect(std.mem.startsWith(u8, migrationHint("os", "fd_t", null).?, "std.os keeps"));
+    try std.testing.expectEqual(null, migrationHint("mem", "eql", null));
+    try std.testing.expectEqual(null, migrationHint("array_list.Alignedd", "init", null));
+    // The name accessed next picks a hint for the path.
+    try std.testing.expect(std.mem.startsWith(u8, migrationHint("std", "io", "AnyWriter").?, "std.io.AnyWriter"));
+    try std.testing.expect(std.mem.startsWith(u8, migrationHint("std", "io", "getStdOut").?, "std.io is now"));
+    try std.testing.expect(migrationHint("@typeInfo(lang.Type).@\"union\".tag_type.?", "Int", null) != null);
 }
 
 /// Primitive names an identifier can mean without a declaration.

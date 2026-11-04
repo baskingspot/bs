@@ -2119,8 +2119,16 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
             }
         }
     };
+    const diag = @import("diag.zig");
     const last = &zcu.errors.items[zcu.errors.items.len - 1];
-    last.hint = @import("diag.zig").migrationHint(try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)}), name);
+    // The name accessed after the missing one (`AnyWriter` in
+    // `std.io.AnyWriter`), for a hint about that path.
+    const source = try zcu.fe.source(@fromBackingInt(sema.file));
+    const next: ?[]const u8 = if (last.span.end <= source.len) if (diag.nameIn(source[last.span.start..last.span.end], name)) |at|
+        diag.nextName(source, last.span.start + at + @as(u32, @intCast(name.len)))
+    else
+        null else null;
+    last.hint = diag.migrationHint(try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)}), name, next);
     try sema.attachCandidates(names.items, name, which == .fields);
 }
 
