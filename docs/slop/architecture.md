@@ -2330,8 +2330,17 @@ as the result of an inlined call's block) becomes a store per field. A
 inline-call argument holding one) is not split: forwarding (above)
 reads that memory instead. A
 block exited by one `br` that ends it is that `br`'s value, and its `br`
-then writes nothing. Instructions are inserted by appending them and
-rebuilding the bodies once, only in functions with something to split.
+then writes nothing. A struct whose address is also passed to calls (a
+method that was not inlined, SipHash's `self.round` in `final`, also
+through a `*const` parameter alloc or an `@call` argument tuple holding
+it) is split too and keeps its memory: at each point where other code may
+read or write that memory (a call, or a load or store through a pointer
+not derived from an alloc, an argument or a constant), the fields are
+stored to it before and loaded back after. Only points after the first
+such call (from the start of its outermost loop) and inside the alloc's
+scope count; before them no other code has the address. Instructions
+are inserted by appending them and rebuilding the bodies once, only in
+functions with something to split.
 
 #### Switches
 
