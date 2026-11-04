@@ -1800,7 +1800,13 @@ are `-ffuzz` coverage points, are only learned from.
   `x` by the maximum of the fact's type less one), from `x < y` for
   `x + 1 <= y`, and back from `x + 1 <= y` for `x < y` only when the
   addition cannot have wrapped (an overflow operation whose check the
-  walk passed, not `+%`). An overflow check of an addition, subtraction, or
+  walk passed, not `+%`). A block exited only with constants is bounded
+  by them, and a wrapping addition or subtraction whose operands' bounds
+  keep the result within its own type by the sum or difference of
+  theirs (two levels deep). A check of `a and b` (a switch prong's
+  range) holds when both do; when only `a` is proven, the check tests
+  `b` alone (`digitToChar`'s `10...35` prong after `0...9` checks
+  `digit <= 35`). An overflow check of an addition, subtraction, or
   unsigned multiplication goes when its operands' bounds exclude
   overflow, or for `a - b` when `b <= a` holds (`i + 1` after `i < len`,
   `n - 1` after `n >= 2`); the operation's value read then becomes the

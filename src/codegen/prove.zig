@@ -51,6 +51,9 @@ pub const Scratch = struct {
     value: std.ArrayList(Term) = .empty,
     facts: std.ArrayList(Fact) = .empty,
     exits: std.ArrayList(Exit) = .empty,
+    /// Per integer `block` exited only with constants so far: their
+    /// bounds; `poisoned` once exited with another value.
+    results: std.AutoHashMapUnmanaged(u32, Walker.Range) = .empty,
     exit_facts: std.ArrayList(Fact) = .empty,
     /// Variables and `*const` allocs stored, in walk order, so a merge
     /// can forget them.
@@ -77,6 +80,7 @@ pub const Scratch = struct {
         s.facts.deinit(gpa);
         s.exits.deinit(gpa);
         s.exit_facts.deinit(gpa);
+        s.results.deinit(gpa);
         s.stored.deinit(gpa);
         s.loads.deinit(gpa);
         s.exact.deinit(gpa);
@@ -184,6 +188,7 @@ pub fn run(gpa: Allocator, ip: *const InternPool, ir: *Ir, scratch: *Scratch) Al
     try scratch.value.resize(gpa, n);
     scratch.facts.clearRetainingCapacity();
     scratch.exits.clearRetainingCapacity();
+    scratch.results.clearRetainingCapacity();
     scratch.exit_facts.clearRetainingCapacity();
     scratch.stored.clearRetainingCapacity();
     try scratch.loads.resize(gpa, n);
@@ -382,7 +387,10 @@ const Walker = struct {
             .repeat => if (w.spec) |*sp| if (sp.loop == data.repeat.loop_inst and sp.ok) {
                 sp.ok = w.repeatHolds();
             },
-            .br => try w.exitTo(data.br.block_inst),
+            .br => {
+                try w.exitTo(data.br.block_inst);
+                try w.result(data.br.block_inst, data.br.operand);
+            },
             .cond_br => {
                 const x = ir.extraData(Ir.CondBr, data.pl_op.payload);
                 const then_body = ir.bodySlice(x.end, x.data.then_body_len);
@@ -405,6 +413,18 @@ const Walker = struct {
                     try w.changing(ii);
                     ir.instructions.items(.data)[ii].pl_op.operand = .fromInterned(if (c) .bool_true else .bool_false);
                     return w.body(if (c) then_body else else_body);
+                };
+                // A check of `a and b` (a switch prong's range) with `a`
+                // proven checks `b` alone.
+                if (check) if (cond.toIndex()) |ci| if (ir.instructions.items(.tag)[@backingInt(ci)] == .bit_and) {
+                    const both = ir.instructions.items(.data)[@backingInt(ci)].bin_op;
+                    if (w.decide(both.lhs) == true) {
+                        try w.changing(ii);
+                        ir.instructions.items(.data)[ii].pl_op.operand = both.rhs;
+                    } else if (w.decide(both.rhs) == true) {
+                        try w.changing(ii);
+                        ir.instructions.items(.data)[ii].pl_op.operand = both.lhs;
+                    }
                 };
                 const depth = s.facts.items.len;
                 const from = s.stored.items.len;
@@ -476,6 +496,27 @@ const Walker = struct {
             return;
         }
     }
+
+    /// A `br` exiting `block` with `operand`: the bounds of the block's
+    /// value.
+    fn result(w: *Walker, block: Inst.Index, operand: Inst.Ref) Allocator.Error!void {
+        _ = w.intInfo(block.toRef()) orelse return;
+        const t = w.term(operand);
+        const gop = try w.s.results.getOrPut(w.gpa, @backingInt(block));
+        if (!t.isConst()) {
+            gop.value_ptr.* = poisoned;
+            return;
+        }
+        const v = t.value();
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .lo = v, .hi = v };
+        } else if (gop.value_ptr.lo <= gop.value_ptr.hi) {
+            gop.value_ptr.lo = @min(gop.value_ptr.lo, v);
+            gop.value_ptr.hi = @max(gop.value_ptr.hi, v);
+        }
+    }
+
+    const poisoned: Range = .{ .lo = 1, .hi = 0 };
 
     /// The value `r` is, as a term.
     fn term(w: *const Walker, r: Inst.Ref) Term {
@@ -861,6 +902,11 @@ const Walker = struct {
         const ir = w.ir;
         const data = ir.instructions.items(.data)[@backingInt(i)];
         switch (ir.instructions.items(.tag)[@backingInt(i)]) {
+            .bit_and => {
+                const both = w.decide(data.bin_op.lhs) == true and w.decide(data.bin_op.rhs) == true;
+                w.checked_op = null;
+                return if (both) true else null;
+            },
             .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => |tag| {
                 const lhs = data.bin_op.lhs;
                 const rhs = data.bin_op.rhs;
@@ -946,14 +992,42 @@ const Walker = struct {
     /// cast has a value within them too), narrowed by each fact on `t` with
     /// a constant on the other side, and by `t < u` to one less than the
     /// largest value of `u`'s type (the fact's, not `info`), and `u < t`
-    /// likewise.
+    /// likewise. A block exited only with constants (all its `br`s are
+    /// walked before its value is used) has their bounds. A wrapping
+    /// addition or subtraction whose operands' bounds keep the exact
+    /// result within its own type (not `info`, which may be wider) computed
+    /// the exact result, so it has the exact result's bounds.
     fn range(w: *const Walker, t: Term, info: Type.IntInfo) Range {
+        return w.rangeIn(t, info, 2);
+    }
+
+    fn rangeIn(w: *const Walker, t: Term, info: Type.IntInfo, depth: u8) Range {
         if (t.isConst()) {
             const v = t.value();
             return .{ .lo = v, .hi = v };
         }
         const signed = info.signedness == .signed;
         var r = limits(info);
+        if (t.tag == .inst) {
+            const ir = w.ir;
+            const data = ir.instructions.items(.data)[t.a];
+            switch (ir.instructions.items(.tag)[t.a]) {
+                .block => if (w.s.results.get(t.a)) |b| if (b.lo <= b.hi) {
+                    r = .{ .lo = @max(r.lo, b.lo), .hi = @min(r.hi, b.hi) };
+                },
+                .add_wrap, .sub_wrap => |tag| if (depth > 0) if (w.intInfo(@as(Inst.Index, @fromBackingInt(@intCast(t.a))).toRef())) |own| {
+                    const a = w.rangeIn(w.term(data.bin_op.lhs), own, depth - 1);
+                    const b = w.rangeIn(w.term(data.bin_op.rhs), own, depth - 1);
+                    const exact: Range = if (tag == .add_wrap)
+                        .{ .lo = a.lo + b.lo, .hi = a.hi + b.hi }
+                    else
+                        .{ .lo = a.lo - b.hi, .hi = a.hi - b.lo };
+                    const lim = limits(own);
+                    if (exact.lo >= lim.lo and exact.hi <= lim.hi) r = .{ .lo = @max(r.lo, exact.lo), .hi = @min(r.hi, exact.hi) };
+                },
+                else => {},
+            }
+        }
         for (w.recent()) |f| {
             if (f.signed != signed) continue;
             const lim = limits(.{ .signedness = info.signedness, .bits = f.bits });
