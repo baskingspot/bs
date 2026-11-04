@@ -10772,6 +10772,11 @@ fn analyzeFloatArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Ta
         // operands are comptime-known and the remainder is zero or both are
         // non-negative.
         const zero = try sema.floatValue(ty, @as(f128, 0));
+        // Optimized, the remainder itself is illegal first, as upstream.
+        if (lv != null and rv != null and block.float_optimized) {
+            try sema.failUndefOperand(block, src, lv.?, rv.?);
+            if (sema.isFloatZero(rv.?)) return sema.fail(block, src.operandSrc(1), "division by zero here causes illegal behavior", .{});
+        }
         if (lv != null and rv != null and !sema.isUndef(lv.?) and !sema.isUndef(rv.?)) {
             const r = try sema.foldFloat(.rem, ty, lv.?, rv.?);
             const neg = !sema.numCompare(lv.?, .gte, zero) or !sema.numCompare(rv.?, .gte, zero);
@@ -10805,8 +10810,12 @@ fn analyzeFloatArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Ta
         else => false,
     };
     // Floats divide by zero to infinities and NaNs, except `comptime_float`
-    // and `@divExact`, for which it is illegal.
-    const allow_div_zero = !is_div or (ty != .comptime_float_type and tag != .div_exact);
+    // and `@divExact`, for which it is illegal, and under
+    // `@setFloatMode(.optimized)`, as upstream.
+    const allow_div_zero = switch (tag) {
+        .rem, .mod => !block.float_optimized,
+        else => !is_div or (ty != .comptime_float_type and tag != .div_exact and !block.float_optimized),
+    };
     const can_be_ib = !allow_div_zero or tag == .div_exact;
 
     if (lv != null and rv != null) {
@@ -10831,6 +10840,10 @@ fn analyzeFloatArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Ta
     }
     try sema.requireRuntime(block, src);
     if (ty == .comptime_float_type) return sema.fail(block, src, "unable to resolve comptime value", .{});
+    if (block.float_optimized and (is_div or tag == .rem or tag == .mod) and rv == null and block.want_safety) {
+        const ok = try sema.addBinOp(block, .cmp_neq, rhs, .fromInterned(try sema.floatValue(ty, @as(f128, 0))));
+        try sema.addSafetyCheck(block, ok, .divide_by_zero, .none, .none);
+    }
     const result = try sema.addBinOp(block, op, lhs, rhs);
     if (tag == .div_exact and block.want_safety) {
         // Upstream's check: the truncated quotient is integral.
