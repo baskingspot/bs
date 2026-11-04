@@ -103,3 +103,37 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   10x slower and says nothing about bs's speed.
 - Linux work runs in orbs. Verify aarch64-macos output on a real Mac (a Mac
   satellite for this project), not by inspection alone.
+- The justfile is the command interface: `just test`, `just lint`,
+  `just ziglint`, `just conformance`, and `just ci`, which runs what CI
+  blocks on. Outside an orb, `nix develop` provides the toolchain (the flake
+  fetches the same official Zig build as `.agents/setup`; keep the two in
+  step). Run `just fmt` before you commit.
+
+## House conventions
+
+bs lives in the baskingspot org and follows its shape, with these
+exceptions, which are deliberate:
+
+- It is a program, not a library: the README does not follow the library
+  template, and there is no docs site yet.
+- The README has no LLM-disclosure footer.
+- It does not use the org's `zig` Nix module, because bs pins one exact Zig
+  release and nixpkgs may not carry it.
+- The org's ast-grep house rules (`baskingspot-lint`) are library-API rules
+  and do not run here. ziglint runs with line length (Z024) off, and CI shows
+  it without blocking until its findings are worked down.
+
+The rest is the org's:
+
+- Commits are signed, and the subject is one line, `area: summary`. A body
+  says why when the subject cannot. Do not rewrite pushed history. GitHub
+  rejects an unsigned commit on `main`.
+- Format and lint every language that ships or that CI depends on: `zig fmt`
+  for Zig, ruff for Python, shellcheck for shell. `just lint` runs them.
+  `tools/mchunt/` is a test driver and is exempt.
+- Pin every GitHub Action by SHA with a version comment. The workflows call
+  the shared ones in `baskingspot/gh-actions`.
+- Design notes, research, and analysis written by agents go in
+  `docs/slop/`. The README is for people and does not link there.
+- The repository's GitHub settings come from `baskingspot/.github`. Do not
+  change them by hand.
