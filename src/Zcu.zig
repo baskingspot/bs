@@ -850,9 +850,25 @@ pub fn internNamed(zcu: *Zcu, key: InternPool.Key, name: NameCandidate) !InternP
 pub fn offerName(zcu: *Zcu, ty: InternPool.Index, name: NameCandidate) !void {
     const cur = zcu.ip.nameOf(ty);
     if (name.creator >= cur.creator) return;
-    if (cur.read and cur.pinned == null and !cur.template.eql(name.template)) zcu.name_read_changed = true;
+    // A read name changed if it renders differently: an edit build offers
+    // a type made from a result, whose recorded name has no holes, the
+    // template it was rendered from (`Replay.contributeNames`).
+    const before = if (cur.read and cur.pinned == null) try nameAlloc(&zcu.ip, ty, zcu.gpa) else null;
+    defer if (before) |b| zcu.gpa.free(b);
     cur.creator = name.creator;
     cur.template = try zcu.dupeTemplate(name.template);
+    if (before) |b| {
+        const after = try nameAlloc(&zcu.ip, ty, zcu.gpa);
+        defer zcu.gpa.free(after);
+        if (!std.mem.eql(u8, b, after)) zcu.name_read_changed = true;
+    }
+}
+
+fn nameAlloc(ip: *const InternPool, ty: InternPool.Index, gpa: Allocator) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    print.writeTypeName(ip, ty, &aw.writer, .render) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
 }
 
 pub fn dupeTemplate(zcu: *Zcu, t: InternPool.Template) !InternPool.Template {

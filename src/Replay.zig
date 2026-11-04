@@ -20,6 +20,7 @@ const inline_ir = @import("codegen/inline.zig");
 const Manifest = cache.Manifest;
 const Pack = cache.Pack;
 const results = cache.results;
+const print = @import("Ir/print.zig");
 const seeds = cache.seeds;
 const Hash = cache.Hash;
 const Frontend = @import("Frontend.zig");
@@ -89,6 +90,12 @@ refresh: std.DynamicBitSetUnmanaged = .{},
 stats: Stats = .{},
 /// `ZAP_CACHE_CHECK`: print each green unit that could not be loaded.
 check: bool = false,
+/// `ZAP_CACHE_TIMING`: say why the build is built again in full.
+timing: bool = false,
+/// By stable hash, each type the manifest's units offered names
+/// (`contributeNames`): its recorded name, from the offer that won, and
+/// the least creator's offer among the units this build kept.
+type_names: std.AutoArrayHashMapUnmanaged(InternPool.Hash, NameEntry) = .empty,
 /// For a donor's replay (`Incremental.useDonor`): the source paths this
 /// build's debug info can name (`Atom.Debug.file`, `unit`, `files`). A
 /// donor's function whose debug info names another path (the same source
@@ -100,6 +107,17 @@ debug_paths_files: usize = 0,
 const no_file = std.math.maxInt(u32);
 
 pub const State = enum(u8) { unknown, green, red };
+
+pub const NameEntry = struct {
+    won: ?[]const u8 = null,
+    /// The creator of the offer that won.
+    won_creator: InternPool.Hash = 0,
+    best: ?results.Names.Offer = null,
+    /// The base nodes whose offers `collectOffers` reads: the least kept
+    /// creator's and the winner's.
+    best_node: u32 = std.math.maxInt(u32),
+    won_node: u32 = std.math.maxInt(u32),
+};
 
 pub const Stats = struct {
     seeds: u32 = 0,
@@ -241,6 +259,7 @@ pub fn destroy(r: *Replay) void {
     r.visited.deinit(gpa);
     r.walk_stack.deinit(gpa);
     r.loaded.deinit(gpa);
+    r.type_names.deinit(gpa);
     r.data_refs.deinit(gpa);
     r.dead.deinit(gpa);
     r.refresh.deinit(gpa);
@@ -687,6 +706,7 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
     try zcu.recordDeps(unit, r.deps.items[g.deps_start..], &.{});
     r.deps.shrinkRetainingCapacity(g.deps_start);
     r.state[g.node] = .green;
+    r.loaded.set(g.node);
     r.stats.loaded += 1;
     const emit = r.emit;
     const saved = emit.owner;
@@ -1004,14 +1024,193 @@ pub fn keepsNavData(r: *Replay, nav: InternPool.NavIndex) !bool {
 // ---------------------------------------------------------------------------
 // Resolving items that name source
 
-/// The file input `input` is in this build, if it is loaded.
-/// Offers the names the loaded units' analysis offered last time
-/// (`Zcu.offerName`), for the types this build has, before
-/// `Zcu.finalizeNames` settles them. Not recorded yet: a type made from a
-/// result keeps its recorded name (`Resolver.container`).
+/// Offers the types this build has the candidate names that the units it
+/// kept without analyzing them offered when they were analyzed
+/// (`Manifest.typeNames`), before `Zcu.finalizeNames` settles them, so
+/// that each type gets the name a full build gives it (docs/architecture.md,
+/// "Type names in the cache"). Then returns `error.NamesFullBuild` if a
+/// type's name differs from the one it had when it was recorded, which
+/// atoms from the pack still carry, or may differ: one whose least creator
+/// left. Each type's recorded name is in its least creator's offer.
 pub fn contributeNames(r: *Replay, zcu: *Zcu) !void {
-    _ = r;
-    _ = zcu;
+    const gpa = r.gpa;
+    const ip = &zcu.ip;
+    const Names = results.Names;
+    const types = &r.type_names;
+    const t0 = std.Io.Clock.awake.now(r.io);
+    defer if (r.timing) std.debug.print("cache: contributed type names of {d} types in {d:.2} ms\n", .{ types.count(), @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(r.io)).toNanoseconds())) / 1e6 });
+    // The types that matter: those this build has, and those whose
+    // winning offer is in a node the build did not keep (its least
+    // creator may have left). Most of the manifest's are neither.
+    var wanted: std.AutoArrayHashMapUnmanaged(InternPool.Hash, void) = .empty;
+    defer wanted.deinit(gpa);
+    for (0..ip.locals.len) |local| for (ip.localNames(local)) |name| {
+        if (name.ty != .none) try wanted.put(gpa, ip.stableHash(name.ty), {});
+    };
+    // Nodes the build did not keep: the analyzed ones, and the dead.
+    // A lazy build keeps the nodes its walk reached but the red ones; an
+    // eager one, those it loaded.
+    {
+        const n = r.m.nodeCount();
+        var it = (if (r.lazy) r.visited else r.loaded).iterator(.{ .kind = .unset });
+        while (it.next()) |i| if (i < n) try r.addOrphans(&wanted, @intCast(i));
+        if (r.lazy) for (r.state, 0..) |st, i| if (st == .red and r.visited.isSet(i)) try r.addOrphans(&wanted, @intCast(i));
+    }
+    // The log's nodes' offers, by type: the index has only the base's.
+    var changed: std.AutoHashMapUnmanaged(InternPool.Hash, std.ArrayList(u32)) = .empty;
+    defer {
+        var it = changed.valueIterator();
+        while (it.next()) |l| l.deinit(gpa);
+        changed.deinit(gpa);
+    }
+    {
+        var it = r.m.overlay.nodes.iterator();
+        while (it.next()) |e| {
+            var reader: Names.Reader = .init(e.value_ptr.names);
+            while (reader.nextOffer()) |o| {
+                const gop = try changed.getOrPut(gpa, o.ty);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(gpa, e.key_ptr.*);
+            }
+        }
+    }
+    try r.collectOffers(wanted.keys(), &changed);
+    // A hole whose type this build does not have takes its recorded name,
+    // from the type's winning offer.
+    var hole_types: std.ArrayList(InternPool.Hash) = .empty;
+    defer hole_types.deinit(gpa);
+    for (types.values()) |e| if (e.best) |b| for (0..b.holeCount()) |k| {
+        const hole = b.hole(k)[1];
+        if (!types.contains(hole)) try hole_types.append(gpa, hole);
+    };
+    try r.collectOffers(hole_types.items, &changed);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    var holes: std.ArrayList(InternPool.Template.Hole) = .empty;
+    defer holes.deinit(gpa);
+    for (types.keys(), types.values()) |h, e| {
+        const best = e.best orelse continue;
+        const ty = try ip.indexOfHash(h) orelse continue;
+        // A type that names a hole and that this build does not have
+        // goes in by its recorded name.
+        bytes.clearRetainingCapacity();
+        holes.clearRetainingCapacity();
+        var from: usize = 0;
+        for (0..best.holeCount()) |k| {
+            const at, const hole_hash = best.hole(k);
+            try bytes.appendSlice(gpa, best.bytes[from..at]);
+            from = at;
+            if (try ip.indexOfHash(hole_hash)) |hole_ty| {
+                try holes.append(gpa, .{ .at = @intCast(bytes.items.len), .ty = hole_ty });
+            } else {
+                const name = if (types.get(hole_hash)) |he| he.won else null;
+                try bytes.appendSlice(gpa, name orelse return r.fullBuild("a type's name has a hole that is unknown"));
+            }
+        }
+        try bytes.appendSlice(gpa, best.bytes[from..]);
+        try zcu.offerName(ty, .{ .creator = best.creator, .template = .{ .bytes = bytes.items, .holes = holes.items } });
+    }
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    for (types.keys(), types.values()) |h, e| {
+        const won = e.won orelse continue;
+        if (try ip.indexOfHash(h)) |ty| {
+            // The same creator names it the same, with the same holes,
+            // whose own names are checked here too.
+            if (ip.nameOf(ty).creator == e.won_creator) continue;
+            aw.clearRetainingCapacity();
+            print.writeTypeName(ip, ty, &aw.writer, .render) catch return error.OutOfMemory;
+            if (!std.mem.eql(u8, aw.written(), won)) return r.fullBuild("a type's name changed");
+        } else if (e.best) |b| {
+            // Absent, so nothing in this build offered it a name: its
+            // least creator is a kept unit's, the same as last time
+            // unless the one whose name won left.
+            if (b.won.len == 0) return r.fullBuild("a type's least creator left");
+        }
+    }
+}
+
+/// The final name of the type with stable hash `ty`, which this build
+/// does not have, for `contributeNames`' caller: its recorded name, which
+/// the build keeps (or it builds again in full), or null if no unit
+/// offered it a name.
+pub fn finalName(r: *const Replay, ty: InternPool.Hash) ?[]const u8 {
+    const e = r.type_names.get(ty) orelse return null;
+    return e.won;
+}
+
+/// Gathers into `type_names` the offers the manifest's nodes made the
+/// types with stable hashes `tys`: each one's recorded name, and the kept
+/// nodes' least creator's offer. Reads each node once: one node may offer
+/// names to thousands of types.
+fn collectOffers(r: *Replay, tys: []const InternPool.Hash, changed_offers: *const std.AutoHashMapUnmanaged(InternPool.Hash, std.ArrayList(u32))) !void {
+    const gpa = r.gpa;
+    const m = r.m;
+    const changed = &m.overlay.nodes;
+    var nodes: std.AutoArrayHashMapUnmanaged(u32, void) = .empty;
+    defer nodes.deinit(gpa);
+    for (tys) |ty| {
+        const gop = try r.type_names.getOrPut(gpa, ty);
+        if (gop.found_existing) continue;
+        gop.value_ptr.* = .{};
+        const e = gop.value_ptr;
+        // The base's offers through its index, least creator first, then
+        // the log's nodes.
+        var best: ?u32 = null;
+        var won: ?u32 = null;
+        for (m.typeNameNodes(ty)) |t| {
+            if (changed.count() != 0 and changed.contains(t.node)) continue;
+            if (won == null and t.won != 0) won = t.node;
+            if (best == null and r.keeps(t.node)) best = t.node;
+            if (best != null and won != null) break;
+        }
+        if (best) |n| {
+            e.best_node = n;
+            try nodes.put(gpa, n, {});
+        }
+        if (won) |n| {
+            e.won_node = n;
+            try nodes.put(gpa, n, {});
+        }
+        if (changed_offers.get(ty)) |log_nodes| for (log_nodes.items) |n| try nodes.put(gpa, n, {});
+    }
+    for (nodes.keys()) |n| {
+        const in_log = changed.count() != 0 and changed.contains(n);
+        const kept = r.keeps(n);
+        var reader: results.Names.Reader = .init(m.typeNames(n));
+        while (reader.nextOffer()) |o| {
+            const e = r.type_names.getPtr(o.ty) orelse continue;
+            if (!in_log and e.best_node != n and e.won_node != n) continue;
+            if (o.won.len != 0) {
+                e.won = o.won;
+                e.won_creator = o.creator;
+            }
+            if (!kept) continue;
+            if (e.best) |b| {
+                if (o.creator < b.creator) e.best = o;
+            } else e.best = o;
+        }
+    }
+}
+
+/// Adds to `wanted` the types whose winning offer is node `i`'s.
+fn addOrphans(r: *const Replay, wanted: *std.AutoArrayHashMapUnmanaged(InternPool.Hash, void), i: u32) !void {
+    var reader: results.Names.Reader = .init(r.m.typeNames(i));
+    while (reader.nextOffer()) |o| if (o.won.len != 0) try wanted.put(r.gpa, o.ty, {});
+}
+
+/// Whether node `i` is live and its unit was not analyzed in this build:
+/// its type names are as recorded (`contributeNames`).
+fn keeps(r: *const Replay, i: u32) bool {
+    if (!r.lazy) return r.loaded.isSet(i);
+    return r.visited.isSet(i) and r.state[i] != .red and !r.dead.isSet(i);
+}
+
+/// Until atoms from the pack are named at link time, a build in which a
+/// type's name changed builds again in full (main).
+fn fullBuild(r: *const Replay, why: []const u8) error{NamesFullBuild} {
+    if (r.timing) std.debug.print("cache: building again in full: {s}\n", .{why});
+    return error.NamesFullBuild;
 }
 
 pub fn fileOf(r: *Replay, input: u32) ?u32 {
@@ -1062,10 +1261,10 @@ pub fn mapInst(r: *Replay, input: u32, inst: Zir.Inst.Index) ?Zir.Inst.Index {
 
 /// Creates the items that name source, as analysis would, without
 /// resolving anything (see "Serialized results").
-/// A type made from a result keeps the name the recording build gave it,
-/// whatever this build's creators offer, as the least creator would.
+/// A type made from a result has the name the recording build gave it
+/// until a creator offers one (`contributeNames`).
 fn recordedName(name: []const u8) Zcu.NameCandidate {
-    return .{ .creator = 0, .template = .{ .bytes = name } };
+    return .{ .creator = std.math.maxInt(InternPool.Hash), .template = .{ .bytes = name } };
 }
 
 const Resolver = struct {

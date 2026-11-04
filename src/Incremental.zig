@@ -403,6 +403,7 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
         },
     };
     r.check = inc.check;
+    r.timing = inc.timing;
     inc.replay = r;
     zcu.replay = r;
     emit.lazy = lazy;
@@ -1537,6 +1538,11 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     for (r.unit_info, item_results[0..r.unit_info.len]) |info, res| result_of[info.node] = res;
     for (r.dependee_info, item_results[r.unit_info.len..]) |info, res| result_of[info.node] = res;
     try d.addItems(enc.words.items, enc.starts.items);
+    var name_words: std.ArrayList(u32) = .empty;
+    defer name_words.deinit(gpa);
+    const names_of = try gpa.alloc([2]u32, nodes.len);
+    defer gpa.free(names_of);
+    try encodeNames(r, rp, &name_words, names_of);
 
     // Which nodes are live now: those the walk reached, and those written
     // with what they depend on.
@@ -1605,6 +1611,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
             .source_name = n.source_name,
             .result = result_words.items[res.result[0]..][0..res.result[1]],
             .subject = result_words.items[res.subject[0]..][0..res.subject[1]],
+            .names = name_words.items[names_of[ni][0]..][0..names_of[ni][1]],
             .flags = .{ .unlinked = n.atoms.len != 0 and !live.isSet(f) },
         };
         if (f < n_prev) try d.update(f, init) else _ = try d.addNode(init);
@@ -2371,6 +2378,11 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     for (r.dependee_info, item_results[r.unit_info.len..]) |info, res| result_of[info.node] = res;
     if (inc.check and !checkResults(gpa, zcu, r, &enc, result_words.items, result_of, encoded.unencodable)) inc.check_failed.store(true, .monotonic);
     const t2 = now(io);
+    var name_words: std.ArrayList(u32) = .empty;
+    defer name_words.deinit(gpa);
+    const names_of = try gpa.alloc([2]u32, r.nodes.items.len);
+    defer gpa.free(names_of);
+    try encodeNames(r, inc.replay, &name_words, names_of);
     var committing = io.async(Putter.writePack, .{ putter, io, entries.items, end, new_name != null });
     defer if (committing.cancel(io)) |_| {} else |_| {};
 
@@ -2426,6 +2438,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             .source_name = n.source_name,
             .result = result_words.items[res.result[0]..][0..res.result[1]],
             .subject = result_words.items[res.subject[0]..][0..res.subject[1]],
+            .names = name_words.items[names_of[ni][0]..][0..names_of[ni][1]],
         });
     }
     if (inc.check and !checkReach(gpa, r, root_nodes, &b)) inc.check_failed.store(true, .monotonic);
@@ -2582,6 +2595,58 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
     }
     e.ms = ms(t0, now(io));
     return e;
+}
+
+/// Each unit node's type names (`results.Names`) in `words`, its range in
+/// `ranges` (by node index): the offers and name reads its analysis made
+/// in this build. A unit an eager edit build loaded made none, and keeps
+/// the manifest's: its candidates are the same as when it was analyzed.
+fn encodeNames(r: *const Recorder, replay: ?*const Replay, words: *std.ArrayList(u32), ranges: [][2]u32) !void {
+    const gpa = r.gpa;
+    const zcu = r.zcu;
+    @memset(ranges, .{ 0, 0 });
+    const Lists = struct { offers: std.ArrayList(u32) = .empty, reads: std.ArrayList(InternPool.Index) = .empty };
+    var by_unit: std.AutoHashMapUnmanaged(Zcu.AnalUnit, Lists) = .empty;
+    defer {
+        var it = by_unit.valueIterator();
+        while (it.next()) |l| {
+            l.offers.deinit(gpa);
+            l.reads.deinit(gpa);
+        }
+        by_unit.deinit(gpa);
+    }
+    for (zcu.name_offers.keys(), 0..) |o, i| {
+        const gop = try by_unit.getOrPut(gpa, o.unit);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        try gop.value_ptr.offers.append(gpa, @intCast(i));
+    }
+    for (zcu.name_reads.keys()) |rd| {
+        const gop = try by_unit.getOrPut(gpa, rd.unit);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        try gop.value_ptr.reads.append(gpa, rd.ty);
+    }
+    const loaded_from: ?*const Replay = if (replay) |rp| if (rp.lazy) null else rp else null;
+    var offers: std.ArrayList(Zcu.NameOffer) = .empty;
+    defer offers.deinit(gpa);
+    var templates: std.ArrayList(InternPool.Template) = .empty;
+    defer templates.deinit(gpa);
+    for (r.unit_list.items, r.unit_info) |unit, info| {
+        const start = words.items.len;
+        if (by_unit.get(unit)) |l| {
+            offers.clearRetainingCapacity();
+            templates.clearRetainingCapacity();
+            for (l.offers.items) |i| {
+                try offers.append(gpa, zcu.name_offers.keys()[i]);
+                try templates.append(gpa, zcu.name_offers.values()[i]);
+            }
+            try results.Names.encode(gpa, &zcu.ip, words, offers.items, templates.items, l.reads.items);
+        } else if (loaded_from) |rp| {
+            const old = rp.m.find(r.nodes.items[info.node].key) orelse continue;
+            if (!rp.loaded.isSet(old)) continue;
+            try words.appendSlice(gpa, rp.m.typeNames(old));
+        }
+        ranges[info.node] = .{ @intCast(start), @intCast(words.items.len - start) };
+    }
 }
 
 /// The local cache's size limit and trimming (`Store.commit` maintains the

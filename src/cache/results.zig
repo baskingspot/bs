@@ -1047,3 +1047,125 @@ pub fn decodeSubject(d: anytype, words: []const u32) !?Subject {
         .embed_file => .{ .embed_file = c.bytes() },
     };
 }
+
+// ---------------------------------------------------------------------------
+// Type names (docs/architecture.md, "Type names" and "Type names in the
+// cache")
+
+/// A unit's candidate names for the types it made (`Zcu.name_offers`) and
+/// the types whose names its analysis read (`Zcu.name_reads`), for an edit
+/// build to offer again for a unit it does not analyze. Types are named by
+/// stable hash, not by item, so that the words stand alone: an edit build
+/// copies a loaded unit's, and finds what they name only if it exists.
+///
+/// The words: the offers' count, then each offer: the type's stable hash,
+/// the creator, the type's final name if the offer won (else empty), the
+/// template's bytes, and its holes' count and holes (each: the offset and
+/// the stable hash of the type whose name goes there); then the reads'
+/// count and each read: the type's stable hash and how `@typeName`
+/// renders it (any type, not only a named one). Empty if
+/// the unit offered and read nothing.
+pub const Names = struct {
+    pub const Offer = struct {
+        ty: Hash,
+        creator: Hash,
+        /// The type's final name in the build that recorded the offer if
+        /// the offer was its least creator's, else empty.
+        won: []const u8,
+        bytes: []const u8,
+        /// `hole_count` holes: each an offset and a stable hash.
+        holes: []const u32,
+
+        pub fn holeCount(o: Offer) usize {
+            return o.holes.len / 5;
+        }
+
+        pub fn hole(o: Offer, i: usize) struct { u32, Hash } {
+            return .{ o.holes[5 * i], @bitCast(o.holes[5 * i + 1 ..][0..4].*) };
+        }
+    };
+
+    pub const Read = struct { ty: Hash, name: []const u8 };
+
+    /// Appends a unit's names to `out`: `offers` (its `Zcu.name_offers`
+    /// entries) and `reads` (the types of its `Zcu.name_reads` entries),
+    /// once names are final.
+    pub fn encode(gpa: Allocator, ip: *const InternPool, out: *std.ArrayList(u32), offers: []const Zcu.NameOffer, templates: []const InternPool.Template, reads: []const Index) !void {
+        if (offers.len == 0 and reads.len == 0) return;
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try out.append(gpa, @intCast(offers.len));
+        for (offers, templates) |o, t| {
+            try appendHash(gpa, out, ip.stableHash(o.ty));
+            try appendHash(gpa, out, o.creator);
+            aw.clearRetainingCapacity();
+            if (ip.nameOf(o.ty).creator == o.creator) try renderName(ip, o.ty, &aw);
+            try appendBytes(gpa, out, aw.written());
+            try appendBytes(gpa, out, t.bytes);
+            try out.append(gpa, @intCast(t.holes.len));
+            for (t.holes) |h| {
+                try out.append(gpa, h.at);
+                try appendHash(gpa, out, ip.stableHash(h.ty));
+            }
+        }
+        try out.append(gpa, @intCast(reads.len));
+        for (reads) |ty| {
+            try appendHash(gpa, out, ip.stableHash(ty));
+            const name = try print.typeAlloc(ip, ty, gpa);
+            defer gpa.free(name);
+            try appendBytes(gpa, out, name);
+        }
+    }
+
+    fn renderName(ip: *const InternPool, ty: Index, aw: *std.Io.Writer.Allocating) !void {
+        print.writeTypeName(ip, ty, &aw.writer, .render) catch return error.OutOfMemory;
+    }
+
+    fn appendHash(gpa: Allocator, out: *std.ArrayList(u32), h: Hash) !void {
+        const words: [4]u32 = @bitCast(h);
+        try out.appendSlice(gpa, &words);
+    }
+
+    /// Reads names that `encode` wrote.
+    pub const Reader = struct {
+        c: Cursor,
+        offers_left: u32,
+        reads_left: u32 = 0,
+
+        pub fn init(words: []const u32) Reader {
+            if (words.len == 0) return .{ .c = .{ .words = words, .at = 0 }, .offers_left = 0 };
+            var c: Cursor = .{ .words = words, .at = 0 };
+            const n = c.next();
+            const reads: u32 = if (n == 0) c.next() else 0;
+            return .{ .c = c, .offers_left = n, .reads_left = reads };
+        }
+
+        fn hash(r: *Reader) Hash {
+            defer r.c.at += 4;
+            return @bitCast(r.c.words[r.c.at..][0..4].*);
+        }
+
+        pub fn nextOffer(r: *Reader) ?Offer {
+            if (r.offers_left == 0) return null;
+            r.offers_left -= 1;
+            const ty = r.hash();
+            const creator = r.hash();
+            const won = r.c.bytes();
+            const bytes = r.c.bytes();
+            const n_holes = r.c.next();
+            const holes = r.c.words[r.c.at..][0 .. 5 * n_holes];
+            r.c.at += holes.len;
+            if (r.offers_left == 0) r.reads_left = r.c.next();
+            return .{ .ty = ty, .creator = creator, .won = won, .bytes = bytes, .holes = holes };
+        }
+
+        /// After the offers.
+        pub fn nextRead(r: *Reader) ?Read {
+            std.debug.assert(r.offers_left == 0);
+            if (r.reads_left == 0) return null;
+            r.reads_left -= 1;
+            const ty = r.hash();
+            return .{ .ty = ty, .name = r.c.bytes() };
+        }
+    };
+};

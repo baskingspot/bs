@@ -65,6 +65,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const cache = @import("../cache.zig");
 const Pack = @import("Pack.zig");
+const result_codec = @import("results.zig");
 const Hash = cache.Hash;
 pub const NumberedAtom = @import("../link/Elf.zig").NumberedAtom;
 
@@ -139,6 +140,14 @@ result_starts: []const u32,
 /// Each base node's subject, the same way.
 subjects: []const u32,
 subject_starts: []const u32,
+/// Each base node's type name offers and reads (`results.Names`), the same
+/// way.
+type_names: []const u32,
+type_name_starts: []const u32,
+/// The base nodes' type name offers (`typeNameNodes`), sorted by type and
+/// creator, so that an edit build finds a type's least creator without
+/// reading every node that offers it.
+type_name_index: []const TypeNameRef,
 strings: []const u8,
 overlay: Overlay,
 
@@ -229,6 +238,23 @@ pub const LinkSymbol = extern struct {
     flags: u32 = 0,
 
     pub const Kind = enum(u32) { @"export", import, _ };
+};
+
+/// A node's offer of a name to a type (`type_name_index`), by the type's
+/// stable hash and the creator.
+pub const TypeNameRef = extern struct {
+    ty: Hash,
+    creator: Hash,
+    node: u32,
+    /// Whether the offer won: it has the type's recorded name.
+    won: u32,
+    unused: [2]u32 = @splat(0),
+
+    fn lessThan(_: void, a: TypeNameRef, b: TypeNameRef) bool {
+        if (a.ty != b.ty) return a.ty < b.ty;
+        if (a.creator != b.creator) return a.creator < b.creator;
+        return a.node < b.node;
+    }
 };
 
 /// Something a unit requested that is not a dependency: what loading the
@@ -405,11 +431,11 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, strings };
+const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN12".*;
-const log_magic = "ZAPMLG05".*;
+const magic = "ZAPMAN13".*;
+const log_magic = "ZAPMLG06".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
 
@@ -434,7 +460,7 @@ const LogHeader = extern struct {
 
 /// One build's changes. The body: `n_nodes` node changes (each a
 /// `NodeDelta`, then its dependencies, atom references, numbered atoms,
-/// debug files, target run, references, result and subject, each padded
+/// debug files, target run, references, result, subject and names, each padded
 /// to 16 bytes), `n_inputs` `InputDelta`s, `n_errors` `StrRef`s and as
 /// many error symbols, `n_symbols` new `Symbol`s, `n_files` new debug
 /// files' `StrRef`s, `n_ref_names` reference names' `StrRef`s, the
@@ -488,6 +514,8 @@ const NodeDelta = extern struct {
     source: Source,
     /// `len` 0 if none.
     source_name: StrRef,
+    names_len: u32,
+    unused2: [12]u8 = @splat(0),
 };
 
 /// A node's new flags, the rest of it unchanged.
@@ -507,10 +535,11 @@ comptime {
     std.debug.assert(@sizeOf(Node) == 80);
     std.debug.assert(@sizeOf(Input) == 64);
     std.debug.assert(@sizeOf(RecordHeader) == 64);
-    std.debug.assert(@sizeOf(NodeDelta) == 96);
+    std.debug.assert(@sizeOf(NodeDelta) == 112);
     std.debug.assert(@sizeOf(Symbol) == 24);
     std.debug.assert(@sizeOf(InputDelta) == 80);
     std.debug.assert(@sizeOf(LinkSymbol) == 32);
+    std.debug.assert(@sizeOf(TypeNameRef) == 48);
 }
 
 /// The log, applied. Slices point into `buf`.
@@ -555,6 +584,7 @@ const Overlay = struct {
         refs: []const Ref,
         result: []const u32,
         subject: []const u32,
+        names: []const u32,
         flags: Flags,
         source: Source,
         source_name: ?[]const u8,
@@ -596,7 +626,8 @@ fn SectionType(comptime s: Section) type {
         .atom_refs => Pack.AtomRef,
         .inputs => Input,
         .error_names, .bases, .files, .ref_names => StrRef,
-        .ref_starts, .items, .item_starts, .results, .result_starts, .subjects, .subject_starts => u32,
+        .ref_starts, .items, .item_starts, .results, .result_starts, .subjects, .subject_starts, .type_names, .type_name_starts => u32,
+        .type_name_index => TypeNameRef,
         .refs => Ref,
         .sources => Source,
         .source_names => SourceName,
@@ -642,7 +673,9 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
         m.sources.len != m.nodes.len or
         m.result_starts.len != m.nodes.len + 1 or m.result_starts[m.nodes.len] != m.results.len or
         m.subject_starts.len != m.nodes.len + 1 or m.subject_starts[m.nodes.len] != m.subjects.len or
+        m.type_name_starts.len != m.nodes.len + 1 or m.type_name_starts[m.nodes.len] != m.type_names.len or
         (m.item_starts.len != 0 and m.item_starts[m.item_starts.len - 1] >= m.items.len)) return corrupt(io, &map);
+    for (m.type_name_index) |t| if (t.node >= m.nodes.len) return corrupt(io, &map);
     for (m.link_symbols) |ls| {
         if (ls.name.off > m.strings.len or ls.name.len > m.strings.len - ls.name.off or ls.flags > 7) return corrupt(io, &map);
     }
@@ -705,6 +738,7 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
         const node_refs = r.take(Ref, d[0].refs_len);
         const node_result = r.take(u32, d[0].result_len);
         const node_subject = r.take(u32, d[0].subject_len);
+        const node_names = r.take(u32, d[0].names_len);
         try o.targets.appendSlice(gpa, node_targets);
         const index = d[0].index;
         if (index == m.nodeCount()) {
@@ -720,6 +754,7 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
             .refs = node_refs,
             .result = node_result,
             .subject = node_subject,
+            .names = node_names,
             .flags = d[0].flags,
             .source = d[0].source,
             .source_name = null,
@@ -880,6 +915,30 @@ pub fn subject(m: *const Manifest, index: u32) []const u32 {
     if (m.overlay.nodes.get(index)) |s| return s.subject;
     if (index >= m.nodes.len) return &.{};
     return m.subjects[m.subject_starts[index]..m.subject_starts[index + 1]];
+}
+
+/// The base nodes' offers of a name to the type with stable hash `ty`,
+/// least creator first; nodes the log changed may be among them, with
+/// their old offers.
+pub fn typeNameNodes(m: *const Manifest, ty: Hash) []const TypeNameRef {
+    const index = m.type_name_index;
+    var lo: usize = 0;
+    var hi: usize = index.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (index[mid].ty < ty) lo = mid + 1 else hi = mid;
+    }
+    var end = lo;
+    while (end < index.len and index[end].ty == ty) end += 1;
+    return index[lo..end];
+}
+
+/// Node `index`'s type name offers and reads (`results.Names`), or empty,
+/// as `result`.
+pub fn typeNames(m: *const Manifest, index: u32) []const u32 {
+    if (m.overlay.nodes.get(index)) |s| return s.names;
+    if (index >= m.nodes.len) return &.{};
+    return m.type_names[m.type_name_starts[index]..m.type_name_starts[index + 1]];
 }
 
 /// The result items: the base's, then the log's.
@@ -1150,6 +1209,8 @@ pub const NodeInit = struct {
     /// manifest's result items.
     result: []const u32 = &.{},
     subject: []const u32 = &.{},
+    /// The unit's type name offers and reads (`results.Names`).
+    names: []const u32 = &.{},
     flags: Flags = .{},
 };
 
@@ -1281,6 +1342,7 @@ pub const Delta = struct {
             .subject_len = @intCast(n.subject.len),
             .source = n.source,
             .source_name = if (n.source_name) |name| try d.addString(name) else .{ .off = 0, .len = 0 },
+            .names_len = @intCast(n.names.len),
         };
         try appendPadded(gpa, &d.nodes, std.mem.asBytes(&delta));
         try appendPadded(gpa, &d.nodes, @ptrCast(n.deps));
@@ -1291,6 +1353,7 @@ pub const Delta = struct {
         try appendPadded(gpa, &d.nodes, @ptrCast(n.refs));
         try appendPadded(gpa, &d.nodes, @ptrCast(n.result));
         try appendPadded(gpa, &d.nodes, @ptrCast(n.subject));
+        try appendPadded(gpa, &d.nodes, @ptrCast(n.names));
         d.targets_len += delta.targets_len;
         d.n_nodes += 1;
     }
@@ -1457,6 +1520,8 @@ pub const Builder = struct {
     results: std.ArrayList(u32) = .empty,
     subject_ranges: std.ArrayList([2]u32) = .empty,
     subjects: std.ArrayList(u32) = .empty,
+    name_ranges: std.ArrayList([2]u32) = .empty,
+    names: std.ArrayList(u32) = .empty,
     /// The results' item table, owned by the caller (or the base, or
     /// `owned_items` when the base's log added to it).
     items: []const u32 = &.{},
@@ -1500,6 +1565,8 @@ pub const Builder = struct {
         b.results.deinit(gpa);
         b.subject_ranges.deinit(gpa);
         b.subjects.deinit(gpa);
+        b.name_ranges.deinit(gpa);
+        b.names.deinit(gpa);
         b.owned_items.deinit(gpa);
         b.owned_item_starts.deinit(gpa);
         b.strings.deinit(gpa);
@@ -1535,17 +1602,22 @@ pub const Builder = struct {
         try b.source_names.appendSlice(gpa, base.source_names);
         try b.results.appendSlice(gpa, base.results);
         try b.subjects.appendSlice(gpa, base.subjects);
+        try b.names.appendSlice(gpa, base.type_names);
         try b.result_ranges.ensureTotalCapacity(gpa, base.nodeCount());
         try b.subject_ranges.ensureTotalCapacity(gpa, base.nodeCount());
+        try b.name_ranges.ensureTotalCapacity(gpa, base.nodeCount());
         for (0..base.nodes.len) |i| {
             const changed = base.overlay.nodes.contains(@intCast(i));
             const r = base.result_starts[i];
             b.result_ranges.appendAssumeCapacity(.{ r, if (changed) 0 else base.result_starts[i + 1] - r });
             const sj = base.subject_starts[i];
             b.subject_ranges.appendAssumeCapacity(.{ sj, if (changed) 0 else base.subject_starts[i + 1] - sj });
+            const nm = base.type_name_starts[i];
+            b.name_ranges.appendAssumeCapacity(.{ nm, if (changed) 0 else base.type_name_starts[i + 1] - nm });
         }
         b.result_ranges.appendNTimesAssumeCapacity(.{ 0, 0 }, base.nodeCount() - base.nodes.len);
         b.subject_ranges.appendNTimesAssumeCapacity(.{ 0, 0 }, base.nodeCount() - base.nodes.len);
+        b.name_ranges.appendNTimesAssumeCapacity(.{ 0, 0 }, base.nodeCount() - base.nodes.len);
         const o = &base.overlay;
         if (o.item_starts.items.len == 0 and o.item_overrides.count() == 0) {
             b.items = base.items;
@@ -1590,6 +1662,8 @@ pub const Builder = struct {
             try b.results.appendSlice(gpa, s.result);
             b.subject_ranges.items[e.key_ptr.*] = .{ @intCast(b.subjects.items.len), @intCast(s.subject.len) };
             try b.subjects.appendSlice(gpa, s.subject);
+            b.name_ranges.items[e.key_ptr.*] = .{ @intCast(b.names.items.len), @intCast(s.names.len) };
+            try b.names.appendSlice(gpa, s.names);
             b.nodes.items[e.key_ptr.*] = .{
                 .key = s.delta.key,
                 .result_hash = s.delta.result_hash,
@@ -1677,6 +1751,8 @@ pub const Builder = struct {
         try b.results.appendSlice(gpa, n.result);
         try b.subject_ranges.append(gpa, .{ @intCast(b.subjects.items.len), @intCast(n.subject.len) });
         try b.subjects.appendSlice(gpa, n.subject);
+        try b.name_ranges.append(gpa, .{ @intCast(b.names.items.len), @intCast(n.names.len) });
+        try b.names.appendSlice(gpa, n.names);
         return index;
     }
 
@@ -1716,6 +1792,8 @@ pub const Builder = struct {
         try b.results.appendSlice(b.gpa, n.result);
         b.subject_ranges.items[index] = .{ @intCast(b.subjects.items.len), @intCast(n.subject.len) };
         try b.subjects.appendSlice(b.gpa, n.subject);
+        b.name_ranges.items[index] = .{ @intCast(b.names.items.len), @intCast(n.names.len) };
+        try b.names.appendSlice(b.gpa, n.names);
     }
 
     /// Reserves room for `n_atoms` more atom references with `n_targets` more
@@ -1887,6 +1965,18 @@ pub const Builder = struct {
         var compacted_subjects: std.ArrayList(u32) = .empty;
         defer compacted_subjects.deinit(gpa);
         const node_subjects = try inNodeOrder(gpa, b.subject_ranges.items, b.subjects.items, subject_starts, &compacted_subjects);
+        const name_starts = try gpa.alloc(u32, nodes.len + 1);
+        defer gpa.free(name_starts);
+        var compacted_names: std.ArrayList(u32) = .empty;
+        defer compacted_names.deinit(gpa);
+        const node_names = try inNodeOrder(gpa, b.name_ranges.items, b.names.items, name_starts, &compacted_names);
+        var name_index: std.ArrayList(TypeNameRef) = .empty;
+        defer name_index.deinit(gpa);
+        for (0..nodes.len) |i| {
+            var reader: result_codec.Names.Reader = .init(node_names[name_starts[i]..name_starts[i + 1]]);
+            while (reader.nextOffer()) |o| try name_index.append(gpa, .{ .ty = o.ty, .creator = o.creator, .node = @intCast(i), .won = @intFromBool(o.won.len != 0) });
+        }
+        std.mem.sortUnstable(TypeNameRef, name_index.items, {}, TypeNameRef.lessThan);
         const numbered = try gpa.alloc(NumberedAtom, ref_count);
         defer gpa.free(numbered);
         const targets = try gpa.alloc(u32, target_count);
@@ -2050,6 +2140,9 @@ pub const Builder = struct {
             @ptrCast(node_subjects),
             @ptrCast(subject_starts),
             @ptrCast(b.link_symbols.items),
+            @ptrCast(node_names),
+            @ptrCast(name_starts),
+            @ptrCast(name_index.items),
             b.strings.items,
         };
         const zeros: [16]u8 = @splat(0);
@@ -2108,6 +2201,10 @@ pub const Builder = struct {
 };
 
 test "manifest round-trip, lookups, reverse edges, log records, and folding" {
+    // One offer each for the type with stable hash 0x77 (`results.Names`):
+    // creator, no recorded name, the template "S", no holes, no reads.
+    const names_1 = [_]u32{ 1, 0x77, 0, 0, 0, 1, 0, 0, 0, 0, 1, 'S', 0, 0 };
+    const names_4 = [_]u32{ 1, 0x77, 0, 0, 0, 2, 0, 0, 0, 0, 1, 'S', 0, 0 };
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2135,7 +2232,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         const memcpy = try b.addRefName("memcpy");
         _ = try b.addNode(.{ .key = 101, .result_hash = 2, .src_hash = 7, .deps = &.{0}, .atoms = &.{.init(32, 64)}, .symbols = &.{
             .{ .key = 0xa1, .targets = &.{ 0xa3, 0xe1 }, .file = "a.zig" },
-        }, .refs = &.{ .{ .kind = .func, .value = 3 }, .{ .kind = .ext, .value = memcpy }, .{ .kind = .err, .value = 2 }, .{ .kind = .error_names, .value = 0 } }, .source = .{ .input = 0, .inst = 12 }, .result = &.{ 7, 8, 9 } });
+        }, .refs = &.{ .{ .kind = .func, .value = 3 }, .{ .kind = .ext, .value = memcpy }, .{ .kind = .err, .value = 2 }, .{ .kind = .error_names, .value = 0 } }, .source = .{ .input = 0, .inst = 12 }, .result = &.{ 7, 8, 9 }, .names = &names_1 });
         // Node 2's dependency on node 0 is conditional.
         _ = try b.addNode(.{ .key = 102, .result_hash = 3, .deps = &.{ 1, Edge.init(0, .conditional), 3 }, .source = .{ .input = 0, .inst = 0 }, .source_name = "x", .result = &.{5} });
         b.items = &.{ 1, 2, 3, 4, 5, 6 };
@@ -2218,7 +2315,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
         }, .refs = &.{ .{ .kind = .rt, .value = try d.addRefName("compiler_rt:x") }, .{ .kind = .nav, .value = 0 } } });
         try d.update(4, .{ .key = 104, .result_hash = 6, .deps = &.{2}, .atoms = &.{.init(208, 16)}, .symbols = &.{
             .{ .key = 0xa4, .targets = &.{ 0xa2, 0xe3 }, .file = "a.zig" },
-        }, .refs = &.{.{ .kind = .ext_weak, .value = try d.addRefName("memcpy") }}, .result = &.{ 70, 71 }, .subject = &.{72}, .source = .{ .input = 1, .inst = 5 }, .flags = .{ .stale = true } });
+        }, .refs = &.{.{ .kind = .ext_weak, .value = try d.addRefName("memcpy") }}, .result = &.{ 70, 71 }, .subject = &.{72}, .names = &names_4, .source = .{ .input = 1, .inst = 5 }, .flags = .{ .stale = true } });
         // A new result item after the base's two, and the first replaced;
         // a node's source and another's flags, the rest of them as they
         // were.
@@ -2250,9 +2347,18 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             try t.expectEqualSlices(u32, &.{3}, m3.deps(2));
             // A node the log changed has no result; the others keep theirs.
             try t.expectEqualSlices(u32, &.{ 7, 8, 9 }, m3.result(1));
+            try t.expectEqualSlices(u32, &names_1, m3.typeNames(1));
             try t.expectEqualSlices(u32, &.{}, m3.result(2));
             try t.expectEqualSlices(u32, &.{ 70, 71 }, m3.result(4));
             try t.expectEqualSlices(u32, &.{72}, m3.subject(4));
+            try t.expectEqualSlices(u32, &names_4, m3.typeNames(4));
+            // The index is the base's: node 4 is in the log until a fold.
+            const offers = m3.typeNameNodes(0x77);
+            try t.expectEqual(@as(usize, if (m3.overlay.len == 0) 2 else 1), offers.len);
+            try t.expectEqual(1, offers[0].creator);
+            try t.expectEqual(1, offers[0].node);
+            if (m3.overlay.len == 0) try t.expectEqual(4, offers[1].node);
+            try t.expectEqual(0, m3.typeNameNodes(0x76).len);
             const items = m3.resultItems();
             try t.expectEqual(3, m3.itemCount());
             for ([_]u32{ 30, 6, 20 }, 0..) |first, id| {

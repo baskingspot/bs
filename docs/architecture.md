@@ -184,16 +184,61 @@ below):
   such a namespace, and skipping them makes the parent the same for every
   creator, with the `namespace_name` dependencies lookups record. Nothing
   about parents depends on creators any more.
-- *The cache* (part 2, the cache's): Sema records each unit's offers
-  (`Zcu.name_offers`) and the types whose names it rendered into a value
-  (`Zcu.name_reads`), and memo entries carry both (`Zcu.Memo.names`,
-  `name_reads`), offered and noted again on a hit. Part 2 persists them,
-  offers a loaded unit's candidates in `Replay.contributeNames` (called
-  first by `finalizeNames`), and re-analyzes a loaded reader whose name
-  changed. Until then a type made from a result keeps its recorded name
-  (creator 0), and a type a loaded creator would name keeps a live
-  creator's name: `F(u8).S` above prints `F(u16).S` after an edit that
-  adds `F(u16)` back, if `F(u8)`'s declaration is loaded.
+- *The cache* (part 2, built 2026-11-04). Sema records each unit's
+  offers (`Zcu.name_offers`) and the types whose names it rendered into
+  a value (`Zcu.name_reads`), and memo entries carry both
+  (`Zcu.Memo.names`, `name_reads`), offered and noted again on a hit.
+  - *Records.* Each unit's node keeps them in its `type_names`
+    (`Manifest.typeNames`, ZAPMAN13; `results.Names`): per offer the
+    type's stable hash, the creator, the template with each hole as the
+    stable hash of the type named there, and the type's final name if
+    the offer was the least creator's (it *won*); per read the type's
+    stable hash and rendered name. Types go by stable hash, not by
+    result item, so a record stands alone and an eager edit build or a
+    donor's replay copies a loaded unit's record as it is: the unit
+    offered nothing in this build, and would offer the same if
+    analyzed.
+    The manifest also indexes the base's offers by type and creator
+    (`type_name_index`, rebuilt when it is written), so that replay
+    reads only the records it needs: for each type the build has, and
+    each type whose winning offer is in a node it did not keep, the
+    least kept creator's record and the winning one's.
+    Which unit offers a candidate can depend on analysis order, as
+    for `effects` references: a memoized call offers again on a hit,
+    but a body that the comptime evaluator lowered has folded the
+    call away. The creator, and so the name, does not, so
+    `ZAP_CACHE_VERIFY` checks names through the atoms' records, not
+    each node's offers.
+  - *Replay* (`Replay.contributeNames`, first in `finalizeNames`). The
+    nodes a build *keeps* are the live ones whose units it did not
+    analyze: those an eager build loaded, or those a lazy build's walk
+    reached and did not analyze. For each type this build has, the
+    least creator among the kept nodes' offers is offered again, with
+    each hole's type if this build has it and its recorded name
+    otherwise. A type made from a result starts with its recorded name
+    and the greatest creator, so any offer replaces it. Analyzed units
+    offered as they ran, so every creator a full build would have
+    counts, whatever this build loaded.
+  - *Names that change.* Atoms from the pack keep the names they were
+    recorded with until part 3. So if a type's final name differs from
+    its recorded one (the name in a won offer), or the type is absent
+    and its least kept creator's offer did not win last time (the one
+    that did left), the build is built again in full
+    (`error.NamesFullBuild`, `ZAP_CACHE_REPLAY=off` for that build).
+    That only happens when an edit changes which creator names a type
+    whose creators disagree: adding `F(u16)` back above renames `S`,
+    and builds in full (test/run/edit_type_names.zig). Every won offer
+    of a type therefore has the same name: a name change rewrites the
+    whole manifest. A read whose name changed is one of those, so a
+    loaded reader needs no check until part 3, which drops the full
+    build for a check of the kept nodes' reads.
+  - `Replay.finalName(hash)` gives a type this build does not have its
+    final name, for part 3 to name atoms after a parent type that is
+    absent: its recorded name, which a build that does not build again
+    in full keeps.
+  - `offerName` compares a read name by its rendering, not its
+    template: a type made from a result has its recorded name without
+    holes until its creators' offers arrive.
 - *Part 3* (link): atom records stop carrying names, and loaded atoms
   are named from final names at link time.
 
@@ -4618,9 +4663,9 @@ A. *Determinism, serially.* Rules 1–8 and the reruns they need, on one
    types that two creators name differently. Drop conditional edges
    (rule 3).
    - *Creator-independent type names* (item 4), in three parts:
-     (1) Sema/Zcu, built 2026-11-04 (see "Type names"). (2) The cache:
-     each unit's and memo entry's offers and name reads persist, and
-     replay offers the loaded units' candidates. (3) Link: atom records
+     (1) Sema/Zcu, built 2026-11-04 (see "Type names"). (2) The cache,
+     built 2026-11-04: each unit's offers and name reads persist, and
+     replay offers the kept units' candidates. (3) Link: atom records
      stop carrying names, and loaded atoms are named from final names
      at link time.
    - `ZAP_SCHED_FUZZ` gains two Sema modes. One shuffles the function
