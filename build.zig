@@ -51,7 +51,20 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     b.step("run", "Run bs").dependOn(&run_cmd.step);
 
-    const unit_tests = b.addTest(.{ .root_module = exe_mod });
+    // The unit tests' module: bs's, plus inputs upstream zig cross-compiles
+    // for the readers' tests, which bs itself does not embed.
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .link_libc = if (sanitize_thread) true else null,
+    });
+    test_mod.addOptions("build_options", options);
+    test_mod.addAnonymousImport("docs_wasm", .{ .root_source_file = docs_wasm });
+    test_mod.addAnonymousImport("build_web_wasm", .{ .root_source_file = build_web_wasm });
+    addMachOInputs(b, test_mod);
+    const unit_tests = b.addTest(.{ .root_module = test_mod });
     // After bs, as one of its users (`spreadBsUsers`), so that it does
     // not hold a worker when bs's users start.
     unit_tests.step.dependOn(&exe.step);
@@ -1089,6 +1102,27 @@ fn takes(b: *std.Build, s: *std.Build.Step, seconds: u32) void {
 
 fn stepSeconds(s: *std.Build.Step) u32 {
     return step_seconds.get(s) orelse 1;
+}
+
+/// Mach-O inputs for src/link/MachOInput.zig's and Archive.zig's tests,
+/// as upstream's Clang and llvm-ar write them for aarch64-macos: an object
+/// and a Darwin archive of two more, as the imports `macho_input_main.o`
+/// and `macho_input_lib.a`.
+fn addMachOInputs(b: *std.Build, m: *std.Build.Module) void {
+    const zig = upstreamZig(b);
+    var objs: [3]std.Build.LazyPath = undefined;
+    for ([_][]const u8{ "main", "member", "other" }, [_][]const u8{ "main.o", "macho_input_long_member_name.o", "other.o" }, &objs) |stem, out, *obj| {
+        const cc = b.addSystemCommand(&.{ zig, "cc", "-target", "aarch64-macos", "-O2", "-c" });
+        cc.addFileArg(b.path(b.fmt("test/link_input/macho_{s}.c", .{stem})));
+        cc.addArg("-o");
+        obj.* = cc.addOutputFileArg(out);
+    }
+    const ar = b.addSystemCommand(&.{ zig, "ar", "--format=darwin", "rcs" });
+    const lib = ar.addOutputFileArg("lib.a");
+    ar.addFileArg(objs[1]);
+    ar.addFileArg(objs[2]);
+    m.addAnonymousImport("macho_input_main.o", .{ .root_source_file = objs[0] });
+    m.addAnonymousImport("macho_input_lib.a", .{ .root_source_file = lib });
 }
 
 fn defaultZigLibDir(b: *std.Build) []const u8 {

@@ -2479,6 +2479,7 @@ test {
     _ = @import("codegen/x86_64/Encoder.zig");
     _ = @import("codegen/x86_64/CodeGen.zig");
     _ = @import("link/MachO.zig");
+    _ = @import("link/MachOInput.zig");
     _ = @import("codegen/aarch64/Encoder.zig");
     _ = @import("codegen/Ssa.zig");
     _ = @import("codegen/rewrite.zig");

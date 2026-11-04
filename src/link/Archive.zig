@@ -301,3 +301,21 @@ test Reader {
     try std.testing.expectEqualStrings("b.o", db.name);
     try std.testing.expectEqualStrings("xy", db.bytes);
 }
+
+test "Darwin archive from upstream's llvm-ar" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // test/link_input/macho_member.c and macho_other.c for aarch64-macos,
+    // as `zig ar --format=darwin rcs` archives them (build.zig's
+    // `addMachOInputs`): a `#1/12` `__.SYMDEF` table and a `#1/36` name.
+    const lib = @embedFile("macho_input_lib.a");
+    const ar: Reader = try .init(arena, lib);
+    try std.testing.expectEqual(3, ar.symbols.len);
+    for (ar.symbols, [_][]const u8{ "_first", "_second", "_unpulled" }, [_][]const u8{ "macho_input_long_member_name.o", "macho_input_long_member_name.o", "other.o" }) |sym, name, member| {
+        try std.testing.expectEqualStrings(name, sym.name);
+        const m = try ar.member(sym.member);
+        try std.testing.expectEqualStrings(member, m.name);
+        try std.testing.expectEqual(std.macho.MH_MAGIC_64, std.mem.readInt(u32, m.bytes[0..4], .little));
+    }
+}

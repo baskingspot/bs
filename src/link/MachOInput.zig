@@ -853,3 +853,93 @@ fn Converter(comptime Ctx: type) type {
         }
     };
 }
+
+test "objects and a Darwin archive from upstream's Clang and llvm-ar" {
+    const testing = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // test/link_input/macho_*.c, compiled for aarch64-macos by build.zig's
+    // `addMachOInputs`; Archive.zig's tests check the archive itself.
+    const lib = @embedFile("macho_input_lib.a");
+    var in: Inputs = .{ .arena = arena };
+    try in.addObject("main.o", @embedFile("macho_input_main.o"));
+    try in.addArchive("lib.a", lib);
+    const Ctx = struct {
+        fn zigExport(_: @This(), _: []const u8) !?SymbolKey {
+            return null;
+        }
+        fn rtExport(_: @This(), _: []const u8) !?SymbolKey {
+            return null;
+        }
+        fn importSym(_: @This(), _: []const u8, _: bool) !?SymbolKey {
+            return null;
+        }
+    };
+    // `second` pulls its member; nothing references `unpulled`.
+    try testing.expectEqual(1, try in.pull(&.{}, Ctx{}));
+    try testing.expectEqual(2, in.objects.items.len);
+    try testing.expectEqualStrings("lib.a(macho_input_long_member_name.o)", in.objects.items[1].path);
+
+    const c = try in.convert(Ctx{});
+    try testing.expectEqual(0, in.errors.items.len);
+    const second = (try in.lookup("second")).?;
+    try testing.expectEqual(4, second.offset);
+    var text: ?Atom = null;
+    var init_array: ?Atom = null;
+    var data: ?Atom = null;
+    for (c.atoms) |a| switch (a.section) {
+        .text => if (a.bytes.len > 0) {
+            try testing.expect(text == null);
+            text = a;
+        },
+        .init_array => init_array = a,
+        .data => data = a,
+        else => return error.TestUnexpectedResult,
+    };
+    // The member's `__data`, named after its first symbol.
+    try testing.expectEqualStrings("first", data.?.name);
+    try testing.expectEqual(second.key, data.?.key);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 41, 0, 0, 0 }, data.?.bytes);
+    // main.o's `__text` starts with the static constructor, which names
+    // it; the other functions are symbols within it.
+    try testing.expectEqualStrings("init", text.?.name);
+    var helper: ?u64 = null;
+    var read_second: ?u64 = null;
+    for (c.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, "helper")) helper = sym.offset;
+        if (std.mem.eql(u8, sym.name, "read_second")) read_second = sym.offset;
+        if (std.mem.eql(u8, sym.name, "helper") or std.mem.eql(u8, sym.name, "read_second"))
+            try testing.expectEqual(text.?.key, sym.atom);
+    }
+    try testing.expect(helper.? > 0 and read_second.? > 0);
+    // `__mod_init_func` becomes an init_array entry pointing at `init`.
+    try testing.expectEqual(1, init_array.?.relocs.len);
+    const entry = init_array.?.relocs[0];
+    try testing.expectEqual(.aarch64_abs64, entry.info.kind);
+    try testing.expectEqual(text.?.key, init_array.?.targets[entry.info.target]);
+    try testing.expectEqual(0, entry.addend);
+    // Both functions load `second` through the GOT, and the loads target
+    // the member's data atom 4 bytes in; `read_second` calls `helper`.
+    var got_loads: usize = 0;
+    var calls: usize = 0;
+    for (text.?.relocs) |r| {
+        const target = text.?.targets[r.info.target];
+        switch (r.info.kind) {
+            .aarch64_got_load_page21, .aarch64_got_load_pageoff12 => {
+                try testing.expectEqual(second.key, target);
+                try testing.expectEqual(4, r.addend);
+                got_loads += 1;
+            },
+            .aarch64_branch26 => {
+                try testing.expectEqual(text.?.key, target);
+                try testing.expectEqual(helper.?, @as(u64, @intCast(r.addend)));
+                try testing.expect(r.offset >= read_second.? and r.offset < helper.?);
+                calls += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(4, got_loads);
+    try testing.expectEqual(1, calls);
+}

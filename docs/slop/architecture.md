@@ -3783,7 +3783,15 @@ comparison); running needs the Mac.
 program (a main and test/link_input-style lib.c: a constructor, a
 thread-local, cstrings, a table of pointers, printf and strlen) links
 through them in the orb. Emit and the command line take the inputs once
-the aarch64 backend is on main. Differences from the design above:
+the aarch64 backend is on main. The unit tests read real inputs:
+build.zig's `addMachOInputs` has upstream's Clang compile
+test/link_input/macho_*.c for aarch64-macos and `zig ar
+--format=darwin` archive two of them, and Archive.zig's and
+MachOInput.zig's tests embed the results (BSD names, the `__.SYMDEF`
+table, a constructor, a static function, and GOT loads of a symbol 4
+bytes into another member's data atom). The test module adds those
+imports, so bs itself does not depend on them. Differences from the
+design above:
 - A thread-local template's atom is named after its descriptor's
   symbol (`_x`, not `_x$tlv$init`), since the writer puts the atom's
   symbol at its own descriptor, as ld64 does.
