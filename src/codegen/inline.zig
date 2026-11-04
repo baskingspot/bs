@@ -28,7 +28,8 @@ pub const Site = struct {
 
 pub const Scan = struct {
     /// Instructions with code outside cold bodies (those ending in
-    /// `unreach` or `trap`: safety checks, `unreachable`).
+    /// `unreach` or `trap`: safety checks, `unreachable`), but for the
+    /// ones `Scanner.free` leaves out.
     size: u32 = 0,
     /// Whether the function could be spliced into a caller once its
     /// candidate calls are inlined: an `.auto`, non-`noinline` function
@@ -145,8 +146,28 @@ const Scanner = struct {
                 },
                 else => {},
             }
-            if (!cold) s.out.size += 1;
+            if (!cold and !free(ir, tag, data)) s.out.size += 1;
         }
+    }
+
+    /// Whether the size leaves an instruction out: `block`s and their
+    /// `br`s, which labeled blocks, switches and inline calls add and
+    /// which mostly emit no code, and a field of an overflow operation's
+    /// result, which reads one of its two registers. With them counted,
+    /// leaves such as `std.fmt.digitToChar` measured over the budget on
+    /// code that prove mostly removes.
+    fn free(ir: *const Ir, tag: Inst.Tag, data: Inst.Data) bool {
+        return switch (tag) {
+            .block, .br => true,
+            .struct_field_val => {
+                const op = ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand.toIndex() orelse return false;
+                return switch (ir.instructions.items(.tag)[@backingInt(op)]) {
+                    .add_with_overflow, .sub_with_overflow, .mul_with_overflow => true,
+                    else => false,
+                };
+            },
+            else => false,
+        };
     }
 
     fn call(s: *Scanner, inst: Inst.Index, cold: bool) Allocator.Error!void {
