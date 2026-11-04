@@ -338,6 +338,23 @@ GENERIC = [
     Generic("missing-try", "error-union", lambda m: [["'try'", "`try`"]],
             lambda src: re.finditer(r"(?<=[=(] )try |^(\s+)try ", src, re.M),
             lambda src, m, k: _replace(src, m.start(), m.end(), m.group(1) or "")),
+    # `fn parse(s: []const u8) !u32 {` -> `... u32 {`: try or an error
+    # return in a function that cannot return errors.
+    Generic("missing-bang", "error-union", lambda m: [["!" + m.group(1)]],
+            lambda src: re.finditer(r"^\s*(?:pub )?fn \w+\([^()]*\) !([\w.]+) \{", src, re.M),
+            lambda src, m, k: _replace(src, m.start(1) - 1, m.start(1), "")),
+    # `parse(s) catch 0` -> `parse(s) orelse 0`
+    Generic("orelse-error", "error-union", lambda m: [["'catch'", '"catch"']],
+            lambda src: re.finditer(r"[\w)\]]+ catch (?!\|)[^;\n,]*", src),
+            lambda src, m, k: _replace(src, m.start(), m.end(), m.group(0).replace(" catch ", " orelse ", 1))),
+    # `map.get(k) orelse 0` -> `map.get(k) catch 0`
+    Generic("catch-optional", "optional", lambda m: [["orelse"]],
+            lambda src: re.finditer(r"[\w)\]]+ orelse [^;\n,]*", src),
+            lambda src, m, k: _replace(src, m.start(), m.end(), m.group(0).replace(" orelse ", " catch ", 1))),
+    # `const n = std.mem.trim(...)` -> `const n = try std.mem.trim(...)`
+    Generic("extra-try", "error-union", lambda m: [["omitting 'try'", "remove 'try'"]],
+            lambda src: re.finditer(r"(?<== )std\.(?:mem|ascii|math)\.\w+\(", src),
+            lambda src, m, k: _replace(src, m.start(), m.start(), "try ")),
     Generic("missing-unwrap", "optional", lambda m: [[".?", "orelse"]],
             lambda src: re.finditer(r"(\))\.\?", src),
             lambda src, m, k: _replace(src, m.start() + 1, m.end(), "")),
