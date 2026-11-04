@@ -1075,8 +1075,9 @@ pub fn offsetMem(m: Mem, off: u64) Mem {
     return r;
 }
 
-/// Copies the value `ref` (of `size` bytes) to `dst`. Uses rax, and for
-/// large values rsi, rdi, and rcx; `dst` must not be based on those.
+/// Copies the value `ref` (of `size` bytes) to `dst`. Uses rax and xmm0,
+/// and for large values rsi, rdi, and rcx (`copyMem`); `dst` must not be
+/// based on those.
 fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
     const ty = cg.typeOf(ref);
     const size = Type.abiSize(cg.ip, ty);
@@ -1106,8 +1107,24 @@ fn copyTo(cg: *CodeGen, dst: Mem, ref: Ref) Error!void {
     }
 }
 
+/// The largest copy `copyMem` makes with moves, without `rep movsb`,
+/// which costs about as much as 30 moves to start.
+const copy_inline_max = 256;
+
+/// Copies `size` bytes. Uses rax and xmm0, which hold no value between
+/// instructions (values live in xmm8-xmm15, and SSE arguments are loaded
+/// after the copies a call makes), and above `copy_inline_max` bytes rsi,
+/// rdi and rcx.
 fn copyMem(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
-    if (size > 128) {
+    if (size >= 32 and size <= copy_inline_max) {
+        var off: u64 = 0;
+        while (size - off >= 16) : (off += 16) {
+            try cg.e.movups(.{ .reg = .xmm0 }, .{ .mem = offsetMem(src, off) });
+            try cg.e.movups(.{ .mem = offsetMem(dst, off) }, .{ .reg = .xmm0 });
+        }
+        return cg.copyTail(offsetMem(dst, off), offsetMem(src, off), size - off);
+    }
+    if (size > copy_inline_max) {
         try cg.e.lea(.qword, .rsi, src);
         try cg.e.lea(.qword, .rdi, dst);
         try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(size) });
@@ -1127,9 +1144,9 @@ fn copyTail(cg: *CodeGen, dst: Mem, src: Mem, size: u64) Error!void {
     }
 }
 
-/// Above 128 bytes, `rep stosb`, as `copyMem` uses `rep movsb` (upstream
-/// always fills undefined memory with it); so its callers already allow
-/// rdi and rcx to be clobbered there.
+/// Above 128 bytes, `rep stosb` (upstream always fills undefined memory
+/// with it); its callers allow rdi and rcx to be clobbered there (a store
+/// of such a value is a clobber point, see `clobbers`).
 fn fillMem(cg: *CodeGen, dst: Mem, size: u64, byte: u8) Error!void {
     if (size > 128) {
         try cg.e.lea(.qword, .rdi, dst);
@@ -1398,8 +1415,19 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         // Local- and general-dynamic TLS call `__tls_get_addr`.
         .tls_ptr, .extern_tls => cg.emit.pic == .pic,
         .add_with_overflow, .sub_with_overflow, .mul_with_overflow => !cg.inGpr(cg.typeOf(ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs)),
-        // A value in an XMM register is stored with one instruction.
-        .store => !cg.passInRegs(cg.typeOf(data.bin_op.rhs)) and !cg.inFloat(cg.typeOf(data.bin_op.rhs)),
+        // A value in an XMM register is stored with one instruction; one
+        // in memory is copied through rax and xmm0 up to
+        // `copy_inline_max` bytes (`copyMem`), and filled up to 128
+        // (`fillMem`).
+        .store => store: {
+            const ty = cg.typeOf(data.bin_op.rhs);
+            if (cg.passInRegs(ty) or cg.inFloat(ty)) break :store false;
+            const size = Type.abiSize(cg.ip, ty);
+            const undef = if (data.bin_op.rhs.toInterned()) |v| cg.ip.keyTag(v) == .undef else false;
+            break :store size > @as(u64, if (undef) 128 else copy_inline_max);
+        },
+        // A value in memory is copied to its slot (`copyMem`).
+        .load => !want and Type.abiSize(cg.ip, data.ty_op.ty) > copy_inline_max,
         .call, .atomic_rmw => true,
         // Its fields are copied through rax.
         .aggregate_init => switch (cg.ip.keyTag(data.ty_pl.ty)) {
