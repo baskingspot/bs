@@ -1707,6 +1707,23 @@ stays a cold block. Integers over 64 bits and floats are left alone (a
 float compare of `x` with itself is false for NaN). Most matches come
 from inlining, where a parameter becomes the caller's constant.
 
+Before the rules, scalar replacement (`src/codegen/sroa.zig`, Go's
+"decompose") splits each local struct or tuple of at most 8 scalar
+fields (integers and enums up to 64 bits, `f32`, `f64`, `bool`,
+pointers, slices) whose address is used only for field pointers, whole
+loads, and whole stores into one local per field, which CodeGen then
+keeps in a register. A field pointer becomes its field's local (as a
+substitution the rule walk applies); a whole store becomes a store of
+each field; a whole load becomes the fields' loads and an
+`aggregate_init`, whose field reads a rule folds. Two neighbors make the
+split structs' values flow without memory: a load of such a struct from
+other memory, used only by field reads and stores, becomes its fields'
+loads; and a store of a split struct's load to other memory (directly, or
+as the result of an inlined call's block) becomes a store per field. A
+block exited by one `br` that ends it is that `br`'s value, and its `br`
+then writes nothing. Instructions are inserted by appending them and
+rebuilding the bodies once, only in functions with something to split.
+
 #### Proving checks
 
 Built on the IR, after the rewrite rules (`src/codegen/prove.zig`), as

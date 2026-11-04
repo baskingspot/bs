@@ -21,6 +21,7 @@ const Inst = Ir.Inst;
 const Tag = Inst.Tag;
 const Type = @import("../Type.zig");
 const Ssa = @import("Ssa.zig");
+const sroa = @import("sroa.zig");
 
 /// What an operand must be for a rule to match.
 const Pat = enum {
@@ -93,13 +94,27 @@ pub const Stats = struct {
     branches: u32 = 0,
 };
 
+pub const Scratch = struct {
+    words: std.ArrayList(u32) = .empty,
+    brs: std.ArrayList(Inst.Index) = .empty,
+
+    pub fn deinit(s: *Scratch, gpa: Allocator) void {
+        s.words.deinit(gpa);
+        s.brs.deinit(gpa);
+    }
+};
+
 /// Applies `rules` to `ir`, interning new constants on `tid`. `scratch`
-/// is kept for the next function.
-pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratch: *std.ArrayList(u32)) Allocator.Error!Stats {
+/// is kept for the next function. `seeds` are instructions already
+/// replaced (`sroa.run`).
+pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratch: *Scratch, seeds: []const sroa.Seed) Allocator.Error!Stats {
     const n = ir.instructions.len;
-    try scratch.resize(gpa, 4 * n);
-    const words = scratch.items;
+    try scratch.words.resize(gpa, 4 * n);
+    scratch.brs.clearRetainingCapacity();
+    const words = scratch.words.items;
     var w: Walker = .{
+        .gpa = gpa,
+        .brs = &scratch.brs,
         .ip = ip,
         .tid = tid,
         .ir = ir,
@@ -108,7 +123,15 @@ pub fn run(gpa: Allocator, ip: *InternPool, tid: InternPool.Tid, ir: *Ir, scratc
         .val = @ptrCast(words[3 * n ..][0..n]),
     };
     @memset(w.info, .{ .subst = .none, .root = no_root });
+    for (seeds) |seed| w.info[@backingInt(seed.inst)].subst = seed.ref;
     try w.body(ir.mainBody());
+    // A replaced block's `br`s write no result: its value no longer keeps
+    // theirs alive.
+    const datas = ir.instructions.items(.data);
+    for (scratch.brs.items) |br| {
+        const b = &datas[@backingInt(br)].br;
+        if (w.info[@backingInt(b.block_inst)].subst != .none) b.operand = .void_value;
+    }
     return w.stats;
 }
 
@@ -132,6 +155,9 @@ const Info = extern struct {
 const Const = struct { bits: u64, info: Type.IntInfo };
 
 const Walker = struct {
+    gpa: Allocator,
+    /// The `br`s with a value.
+    brs: *std.ArrayList(Inst.Index),
     ip: *InternPool,
     tid: InternPool.Tid,
     ir: *Ir,
@@ -187,14 +213,19 @@ const Walker = struct {
         switch (tag) {
             .block => {
                 const x = ir.extraData(Ir.Block, data.ty_pl.payload);
-                try w.body(ir.bodySlice(x.end, x.data.body_len));
-                // A block every `br` exits with the same value defined
-                // before it (an inlined call's constant result) is that
-                // value.
+                const insts = ir.bodySlice(x.end, x.data.body_len);
+                try w.body(insts);
+                // A block every `br` exits with the same value is that
+                // value: one defined before it (an inlined call's constant
+                // result), or one its body ends exiting with (an inlined
+                // call's result), which dominates every `br`.
                 const r = w.info[ii].subst;
                 w.info[ii].subst = .none;
                 if (r == .none or r == mixed or data.ty_pl.ty == .void_type) return;
-                if (r.toIndex()) |d| if (w.pos[@backingInt(d)] >= w.pos[ii]) return;
+                if (r.toIndex()) |d| if (w.pos[@backingInt(d)] >= w.pos[ii]) {
+                    const last = @backingInt(insts[insts.len - 1]);
+                    if (ir.instructions.items(.tag)[last] != .br or ir.instructions.items(.data)[last].br.block_inst != inst) return;
+                };
                 w.info[ii].subst = r;
                 w.stats.folds += 1;
             },
@@ -203,6 +234,7 @@ const Walker = struct {
                 try w.body(ir.bodySlice(x.end, x.data.body_len));
             },
             .br => {
+                if (data.br.operand.toInterned() == null) try w.brs.append(w.gpa, inst);
                 const b = &w.info[@backingInt(data.br.block_inst)].subst;
                 if (b.* == .none) b.* = data.br.operand else if (b.* != data.br.operand) b.* = mixed;
             },
@@ -254,7 +286,7 @@ const Walker = struct {
     fn match(w: *Walker, inst: Inst.Index, tag: Tag, data: Inst.Data) Allocator.Error!?Inst.Ref {
         const ip = w.ip;
         switch (tag) {
-            .struct_field_val => return try w.overflowField(data) orelse w.constField(data),
+            .struct_field_val => return try w.overflowField(data) orelse w.constField(data) orelse w.initField(data),
             .slice_ptr, .slice_len, .optional_payload, .unwrap_errunion_payload => return w.constPart(tag, data.ty_op.operand),
             .is_null, .is_non_null, .is_err, .is_non_err => return w.constPart(tag, data.un_op),
             .array_elem_val => return w.constElem(data.bin_op.lhs, data.bin_op.rhs),
@@ -401,6 +433,23 @@ const Walker = struct {
             },
             else => return null,
         }
+    }
+
+    /// A field of an `aggregate_init` of a struct or tuple.
+    fn initField(w: *Walker, data: Inst.Data) ?Inst.Ref {
+        const ir = w.ir;
+        const sf = ir.extraData(Ir.StructField, data.ty_pl.payload).data;
+        const i = @backingInt(sf.operand.toIndex() orelse return null);
+        if (ir.instructions.items(.tag)[i] != .aggregate_init) return null;
+        const agg = ir.instructions.items(.data)[i].ty_pl;
+        switch (w.ip.keyTag(agg.ty)) {
+            .struct_type => if (Type.isPackedStruct(w.ip, agg.ty)) return null,
+            .tuple_type => {},
+            else => return null,
+        }
+        const x = ir.extraData(Ir.Aggregate, agg.payload);
+        if (x.data.len != Type.fieldCount(w.ip, agg.ty)) return null;
+        return ir.refSlice(x.end, x.data.len)[sf.index];
     }
 
     /// A field of a constant struct or tuple.

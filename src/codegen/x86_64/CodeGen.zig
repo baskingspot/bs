@@ -1236,6 +1236,11 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         // A value in an XMM register is stored with one instruction.
         .store => !cg.passInRegs(cg.typeOf(data.bin_op.rhs)) and !cg.inFloat(cg.typeOf(data.bin_op.rhs)),
         .call, .atomic_rmw => true,
+        // Its fields are copied through rax.
+        .aggregate_init => switch (cg.ip.keyTag(data.ty_pl.ty)) {
+            .struct_type, .tuple_type => Type.abiSize(cg.ip, data.ty_pl.ty) > 128,
+            else => !want and !vector.lowers(cg, inst),
+        },
         else => !want and !vector.lowers(cg, inst),
     };
 }

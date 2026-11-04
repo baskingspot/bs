@@ -33,6 +33,7 @@ const Ssa = @import("codegen/Ssa.zig");
 const inline_ir = @import("codegen/inline.zig");
 const rewrite = @import("codegen/rewrite.zig");
 const prove = @import("codegen/prove.zig");
+const sroa = @import("codegen/sroa.zig");
 const Sema = @import("Sema.zig");
 const cache = @import("cache.zig");
 
@@ -167,7 +168,9 @@ bench_irs: ?std.ArrayList(Ir) = null,
 /// The SSA form of the function being generated, reused for the next.
 ssa: Ssa = .{},
 /// `rewrite.run`'s arrays, reused for the next function.
-rewrite_scratch: std.ArrayList(u32) = .empty,
+rewrite_scratch: rewrite.Scratch = .{},
+/// `sroa.run`'s, likewise.
+sroa_scratch: sroa.Scratch = .{},
 /// `prove.run`'s arrays, on a worker, reused for the next function.
 prove_scratch: prove.Scratch = .{},
 /// Whether `prove.run` removes the checks it proves (`ZAP_PROVE=off`
@@ -358,6 +361,10 @@ pub const CodeGenStats = struct {
     prove_ns: u64 = 0,
     checks: u64 = 0,
     proven: u64 = 0,
+    /// Scalar replacement (`sroa.run`, on the Sema thread), and the
+    /// structs it split into their fields.
+    sroa_ns: u64 = 0,
+    splits: u64 = 0,
     /// Building the SSA form from the IR.
     build_ns: u64 = 0,
     /// Liveness and register allocation.
@@ -382,13 +389,16 @@ pub const CodeGenStats = struct {
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.f;
-        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), prove {d:.1} ms ({d:.1} ns/IR, {d} of {d} checks proven), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
+        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), sroa {d:.1} ms ({d:.1} ns/IR, {d} splits), prove {d:.1} ms ({d:.1} ns/IR, {d} of {d} checks proven), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
             label,
             s.functions,
             s.ir_insts,
             ms(s.rewrite_ns),
             per(s.rewrite_ns, s.ir_insts),
             s.folds,
+            ms(s.sroa_ns),
+            per(s.sroa_ns, s.ir_insts),
+            s.splits,
             ms(s.prove_ns),
             per(s.prove_ns, s.ir_insts),
             s.proven,
@@ -468,6 +478,7 @@ pub fn deinit(emit: *Emit) void {
     emit.ssa.deinit(gpa);
     emit.rewrite_scratch.deinit(gpa);
     emit.prove_scratch.deinit(gpa);
+    emit.sroa_scratch.deinit(gpa);
     if (emit.bench_irs) |*irs| {
         for (irs.items) |*ir| ir.deinit(gpa);
         irs.deinit(gpa);
@@ -797,8 +808,11 @@ fn submit(emit: *Emit, ir_in: Ir, exports: ExportsView) !void {
     var ir = ir_in;
     {
         const t0 = std.Io.Timestamp.now(zcu.io, .awake);
-        const st = try rewrite.run(emit.gpa, &zcu.ip, Zcu.tid, &ir, &emit.rewrite_scratch);
-        emit.codegen_stats.rewrite_ns += @intCast(t0.durationTo(.now(zcu.io, .awake)).nanoseconds);
+        emit.codegen_stats.splits += try sroa.run(emit.gpa, &zcu.ip, Zcu.tid, &ir, &emit.sroa_scratch);
+        const t1 = std.Io.Timestamp.now(zcu.io, .awake);
+        emit.codegen_stats.sroa_ns += @intCast(t0.durationTo(t1).nanoseconds);
+        const st = try rewrite.run(emit.gpa, &zcu.ip, Zcu.tid, &ir, &emit.rewrite_scratch, emit.sroa_scratch.seeds.items);
+        emit.codegen_stats.rewrite_ns += @intCast(t1.durationTo(.now(zcu.io, .awake)).nanoseconds);
         emit.codegen_stats.folds += st.folds + st.branches;
     }
     if (emit.bench_irs) |*irs| {
