@@ -831,8 +831,16 @@ fn ensure(r: *Replay, dep: Zcu.Dependee) bool {
         .struct_defaults => |ty| zcu.ensureStructDefaults(ty) catch return false,
         .func_ies => |func| _ = zcu.ensureFuncIes(func) catch return false,
         // Decided now, analyzing the function out of order if needed; when
-        // that cannot happen now, the reader is analyzed again.
-        .func_inline => |func| if ((r.emit.inlineFate(func) catch return false) != .fate) return false,
+        // that cannot happen now, the reader is analyzed again. Out of
+        // order, speculatively: the reader is in progress, which analysis
+        // never is when it decides inlining (after the reader's body), so a
+        // loop back to it (an inferred error set it reads) ends the
+        // speculation instead of failing the callee.
+        .func_inline => |func| {
+            zcu.speculating += 1;
+            defer zcu.speculating -= 1;
+            if ((r.emit.inlineFate(func) catch return false) != .fate) return false;
+        },
         .func_body, .namespace_name, .namespace, .embed_file => {},
     }
     return true;

@@ -589,7 +589,15 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
             },
             .yes => |y| y,
         };
-        const body = try emit.inlineBody(site.callee) orelse {
+        const body = emit.inlineBody(site.callee) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // As for a busy fate.
+            error.Busy => if (mode == .generate_or_defer) {
+                try zcu.ready_irs.append(gpa, ir);
+                ir_owned = false;
+                return false;
+            } else null,
+        } orelse {
             all = false;
             continue;
         };
@@ -672,8 +680,10 @@ pub fn inlineFate(emit: *Emit, func: Index) Allocator.Error!FateResult {
 
 /// The inlinable body of `func`, whose fate is `yes`; for one loaded from
 /// the cache, Sema analyzes it again (as it did, and recording nothing
-/// new) and its own callees are inlined into it. Null if that failed.
-fn inlineBody(emit: *Emit, func: Index) Allocator.Error!?u32 {
+/// new) and its own callees are inlined into it. Null if that failed;
+/// `error.Busy` if it would have to wait for a speculation (a replay
+/// deciding a fate while the reader is in progress, `Replay.ensure`).
+fn inlineBody(emit: *Emit, func: Index) error{ OutOfMemory, Busy }!?u32 {
     const yes = emit.inline_fates.get(func).?.yes;
     if (yes.body != no_body) return yes.body;
     // What Sema records is the cache's already, which a lazy build reads
@@ -688,6 +698,7 @@ fn inlineBody(emit: *Emit, func: Index) Allocator.Error!?u32 {
     }
     const ir = Sema.analyzeFuncBody(zcu, func) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.Speculation => return error.Busy,
         else => return null,
     };
     _ = try emit.inlineProcess(ir, .body);
