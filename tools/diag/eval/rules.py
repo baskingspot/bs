@@ -359,8 +359,29 @@ MIGRATIONS = [
         "rand",
         [(r"std\.Random\.DefaultPrng", "std.rand.DefaultPrng")],
         [["std.Random"]],
-        seeds=["random"],
+        seeds=["random", "test_ulid"],
         since="0.12",
+    ),
+    R(
+        "rand-random-type",
+        [(r"random: std\.Random\)", "random: std.rand.Random)")],
+        [["std.Random"]],
+        seeds=["test_ulid"],
+        since="0.12",
+    ),
+    R(
+        "format-old-signature",
+        [
+            (
+                r"pub fn format\(self: Self, writer: \*std\.Io\.Writer\) std\.Io\.Writer\.Error!void \{\n",
+                L(
+                    "pub fn format(\n        self: Self,\n        comptime fmt: []const u8,\n        options: std.fmt.FormatOptions,\n        writer: anytype,\n    ) !void {\n        _ = fmt;\n        _ = options;\n"
+                ),
+            )
+        ],
+        [["*std.Io.Writer"], ["{f}"]],
+        seeds=["test_ulid"],
+        since="0.15",
     ),
     R(
         "timestamp",
