@@ -690,6 +690,17 @@ pub fn repStosb(e: *Encoder) !void {
     try e.code.appendSlice(e.gpa, &.{ 0xf3, 0xaa });
 }
 
+/// `rep stos{w,d,q}`: stores ax, eax or rax to rcx words, dwords or
+/// qwords at [rdi].
+pub fn repStos(e: *Encoder, size: Size) !void {
+    try e.code.appendSlice(e.gpa, switch (size) {
+        .byte => &.{ 0xf3, 0xaa },
+        .word => &.{ 0x66, 0xf3, 0xab },
+        .dword => &.{ 0xf3, 0xab },
+        .qword => &.{ 0xf3, 0x48, 0xab },
+    });
+}
+
 /// `std` (true) or `cld` (false): sets or clears the direction flag.
 pub fn setDirection(e: *Encoder, backward: bool) !void {
     try e.code.append(e.gpa, if (backward) 0xfd else 0xfc);

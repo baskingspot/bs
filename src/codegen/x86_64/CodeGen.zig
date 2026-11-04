@@ -2778,19 +2778,55 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 try cg.load(.rax, elem);
                 return cg.e.repStosb();
             }
-            // Store the first element, then let an overlapping forward
-            // `rep movsb` replicate it through the rest.
+            switch (Type.abiSize(ip, elem_ty)) {
+                2, 4, 8 => |size| {
+                    _ = try cg.memDest(.rdi, .rcx, data.bin_op.lhs);
+                    try cg.load(.rax, elem);
+                    return cg.e.repStos(sizeOf(size));
+                },
+                else => {},
+            }
+            // Store the first element, then copy what is stored until it
+            // spans 512 bytes, then let one overlapping forward `rep movsb`
+            // repeat that. (At a distance under 512 bytes, an overlapping
+            // `rep movsb` leaves the fast-string path.)
             const elem_size = try cg.memDest(.r8, .r9, data.bin_op.lhs);
             const done = try cg.e.newLabel();
+            const double = try cg.e.newLabel();
+            const half = try cg.e.newLabel();
+            const rest = try cg.e.newLabel();
             try cg.e.@"test"(.qword, .{ .reg = .r9 }, .{ .reg = .r9 });
             try cg.e.jcc(.e, .{ .label = done });
             if (elem.toInterned()) |v| if (ip.keyTag(v) == .undef) {
                 try cg.fillMem(Mem.at(.r8, 0), elem_size, 0xaa);
             } else try cg.copyTo(Mem.at(.r8, 0), elem) else try cg.copyTo(Mem.at(.r8, 0), elem);
+            // rdx: the bytes to fill; r10: the bytes stored, a multiple of
+            // the element's size.
+            try cg.e.imul(.qword, .rdx, .{ .reg = .r9 }, @intCast(elem_size));
+            try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .imm = @intCast(elem_size) });
+            cg.e.bind(double);
+            try cg.e.alu(.cmp, .qword, .{ .reg = .r10 }, .{ .reg = .rdx });
+            try cg.e.jcc(.ae, .{ .label = done });
+            try cg.e.alu(.cmp, .qword, .{ .reg = .r10 }, .{ .imm = 512 });
+            try cg.e.jcc(.ae, .{ .label = rest });
+            // min(stored, left) bytes, not overlapping.
+            try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rdx });
+            try cg.e.alu(.sub, .qword, .{ .reg = .rcx }, .{ .reg = .r10 });
+            try cg.e.alu(.cmp, .qword, .{ .reg = .rcx }, .{ .reg = .r10 });
+            try cg.e.jcc(.be, .{ .label = half });
+            try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .r10 });
+            cg.e.bind(half);
             try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .reg = .r8 });
-            try cg.e.lea(.qword, .rdi, Mem.at(.r8, @intCast(elem_size)));
-            try cg.e.lea(.qword, .rcx, Mem.at(.r9, -1));
-            try cg.e.imul(.qword, .rcx, .{ .reg = .rcx }, @intCast(elem_size));
+            try cg.e.lea(.qword, .rdi, .{ .base = .{ .reg = .r8 }, .index = .{ .reg = .r10, .scale = .@"1" } });
+            try cg.e.repMovsb();
+            try cg.e.mov(.qword, .{ .reg = .r10 }, .{ .reg = .rdi });
+            try cg.e.alu(.sub, .qword, .{ .reg = .r10 }, .{ .reg = .r8 });
+            try cg.e.jmp(.{ .label = double });
+            cg.e.bind(rest);
+            try cg.e.mov(.qword, .{ .reg = .rsi }, .{ .reg = .r8 });
+            try cg.e.lea(.qword, .rdi, .{ .base = .{ .reg = .r8 }, .index = .{ .reg = .r10, .scale = .@"1" } });
+            try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rdx });
+            try cg.e.alu(.sub, .qword, .{ .reg = .rcx }, .{ .reg = .r10 });
             try cg.e.repMovsb();
             cg.e.bind(done);
         },
