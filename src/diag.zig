@@ -356,8 +356,9 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
         const code = classifyAstGen(msg);
         var candidates: []const []const u8 = &.{};
         var fixes: []const Fix = &.{};
+        var hint: ?[]const u8 = if (code == .@"unknown-builtin") if (quoted(msg)) |name| builtinHint(name) else null else null;
         const needs_file = switch (code) {
-            .undeclared, .unused, .@"unused-label", .@"never-mutated", .@"pointless-discard", .@"unknown-builtin" => true,
+            .undeclared, .unused, .@"unused-label", .@"never-mutated", .@"pointless-discard", .@"unknown-builtin", .@"arg-count", .@"bad-capture" => true,
             else => false,
         };
         if (needs_file and m.src_loc != .none) facts: {
@@ -384,8 +385,8 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
             };
             if (try astGenFix(arena, tree, code, msg, sl.span_main, candidates)) |raw|
                 fixes = try arena.dupe(Fix, &.{try paths.fix(arena, path, tree.source, raw)});
+            if (try astGenHint(arena, tree, code, msg, sl.span_main)) |h| hint = h;
         }
-        const hint: ?[]const u8 = if (code == .@"unknown-builtin") if (quoted(msg)) |name| builtinHint(name) else null else null;
         try out.append(arena, .{ .code = code, .loc = try bundleLoc(arena, paths, bundle, m.src_loc), .msg = msg, .count = m.count, .notes = notes, .candidates = candidates, .hint = hint, .fixes = fixes });
     }
 }
@@ -962,7 +963,27 @@ fn astGenFix(arena: std.mem.Allocator, tree: *const Ast, code: Code, msg: []cons
                 return try rawFix(arena, .exact, &.{.{ .start = line_start, .end = line_end + 1, .text = "" }});
             return try rawFix(arena, .exact, &.{.{ .start = start, .end = end, .text = "" }});
         },
-        .@"unknown-builtin" => return builtinFix(arena, tree, tok),
+        .@"unknown-builtin" => {
+            const n_args, const template = builtin_rewrites.get(tree.tokenSlice(tok)) orelse return null;
+            return builtinFix(arena, tree, tok, n_args, template);
+        },
+        .@"arg-count" => {
+            // A cast written with its type first, as before 0.11.
+            const name = tree.tokenSlice(tok);
+            if (!result_type_casts.has(name) or !std.mem.eql(u8, msg, "expected 1 argument, found 2")) return null;
+            return builtinFix(arena, tree, tok, 2, try std.mem.concat(arena, u8, &.{ "@as({0}, ", name, "({1}))" }));
+        },
+        .@"bad-capture" => {
+            if (!std.mem.eql(u8, msg, "extra capture in for loop")) return null;
+            // A for loop's index captured without its `0..` input, as
+            // before 0.11: the input goes before the inputs' `)`.
+            var open = tok;
+            while (open > 0 and tree.tokenTag(open) != .pipe) open -= 1;
+            if (open == 0 or tree.tokenTag(open - 1) != .r_paren) return null;
+            const before = open - 2;
+            const at = tokenEnd(tree, before);
+            return try rawFix(arena, .exact, &.{.{ .start = at, .end = at, .text = if (tree.tokenTag(before) == .comma) " 0.." else ", 0.." }});
+        },
         .undeclared => return renameFix(arena, tree.source, tree.tokenStart(tok), tokenEnd(tree, tok), candidates),
         else => return null,
     }
@@ -1227,9 +1248,33 @@ const builtin_rewrites = std.StaticStringMap(struct { u8, []const u8 }).initComp
     .{ "@errSetCast", .{ 2, "@as({0}, @errorCast({1}))" } },
 });
 
-/// Rewrites a call of a renamed builtin (`builtin_rewrites`) at `tok`.
-fn builtinFix(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenIndex) !?RawFix {
-    const n_args, const template = builtin_rewrites.get(tree.tokenSlice(tok)) orelse return null;
+/// Casts that took their type as their first argument before 0.11 and
+/// take it from the result type now; checked against 0.17's builtins.
+const result_type_casts = std.StaticStringMap(void).initComptime(.{
+    .{"@intCast"},      .{"@truncate"},     .{"@bitCast"},   .{"@floatCast"}, .{"@ptrCast"},
+    .{"@enumFromInt"},  .{"@floatFromInt"}, .{"@intFromFloat"}, .{"@ptrFromInt"}, .{"@errorCast"},
+});
+
+/// The hint for AstGen error `code` with message `msg` at byte `main` of
+/// `tree`'s source: how the code was written before 0.11.
+fn astGenHint(arena: std.mem.Allocator, tree: *const Ast, code: Code, msg: []const u8, main: u32) !?[]const u8 {
+    const tok = tokenAt(tree, main) orelse return null;
+    switch (code) {
+        .@"arg-count" => {
+            const name = tree.tokenSlice(tok);
+            if (!result_type_casts.has(name) or !std.mem.eql(u8, msg, "expected 1 argument, found 2")) return null;
+            return try std.fmt.allocPrint(arena, "since 0.11, {0s} takes its type from the result type: `@as(T, {0s}(x))`, or give the destination a type (`const y: T = {0s}(x);`)", .{name});
+        },
+        .@"bad-capture" => if (std.mem.eql(u8, msg, "extra capture in for loop"))
+            return "since 0.11, a for loop's index is an input of its own: `for (items, 0..) |item, i|`",
+        else => {},
+    }
+    return null;
+}
+
+/// Rewrites a call at `tok` of a builtin with `n_args` arguments as
+/// `template`, where `{0}` and `{1}` stand for the arguments.
+fn builtinFix(arena: std.mem.Allocator, tree: *const Ast, tok: Ast.TokenIndex, n_args: u8, template: []const u8) !?RawFix {
     if (tree.tokenTag(tok + 1) != .l_paren) return null;
     // The arguments' byte ranges, split at top-level commas.
     var args: [2][2]u32 = undefined;
