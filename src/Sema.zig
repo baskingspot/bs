@@ -780,7 +780,7 @@ pub fn populateTestFunctions(zcu: *Zcu) CompileError!void {
     for (elems, zcu.test_functions.items) |*e, test_nav| {
         const t = ip.getNav(test_nav);
         if (t.status != .resolved) return;
-        const name = ip.stringSlice(t.fqn);
+        const name = try print.navNameAlloc(ip, test_nav, sema.arena);
         const name_ptr = try sema.stringLiteral(name);
         const many = try sema.intern(.{ .ptr = .{ .ty = .manyptr_const_u8_type, .base = ip.keyPayload(.ptr, name_ptr).base } });
         const name_val = try sema.intern(.{ .slice = .{ .ty = .slice_const_u8_type, .ptr = many, .len = try sema.intValue(.usize_type, name.len) } });
@@ -1228,7 +1228,11 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                         next += 1;
                     }
                 }
-                const tag_name = try std.fmt.allocPrint(sema.arena, "@typeInfo({s}).@\"union\".tag_type.?", .{ip.stringSlice(key.name)});
+                // Named after the union, whose layout alone makes it.
+                const tag_name: Zcu.NameCandidate = .{ .creator = 0, .template = .{
+                    .bytes = try sema.arena.dupe(u8, "@typeInfo().@\"union\".tag_type.?"),
+                    .holes = try sema.arena.dupe(InternPool.Template.Hole, &.{.{ .at = "@typeInfo(".len, .ty = sema.zcu.namespacePtr(info.namespace).owner_type }}),
+                } };
                 const tag_key = try std.fmt.allocPrint(sema.arena, "{s}@tag", .{ip.stringSlice(key.key)});
                 const tag_info = try ip.createContainerInfo(Zcu.tid, .{
                     .namespace = info.namespace,
@@ -1240,14 +1244,14 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                     .size = Type.abiSize(ip, int_ty),
                     .alignment = Type.abiAlignment(ip, int_ty),
                 });
-                info.tag_type = try sema.intern(.{ .enum_type = .{
+                info.tag_type = try sema.zcu.internNamed(.{ .enum_type = .{
                     .file = key.file,
                     .zir_inst = key.zir_inst,
                     .captures = key.captures,
-                    .name = try sema.getString(tag_name),
+                    .name = undefined,
                     .key = try sema.getString(tag_key),
                     .info = tag_info,
-                } });
+                } }, tag_name);
             },
             .auto => info.tag_type = try sema.intType(.unsigned, if (n == 0) 0 else std.math.log2_int_ceil(usize, n)),
             .@"extern" => {},
@@ -1588,8 +1592,9 @@ const FmtType = struct {
     ty: Index,
     /// Whether `fail` notes where the type is declared.
     decl_note: bool = true,
+    /// Analysis reads the names it renders (`print.Names.read`).
     pub fn format(f: FmtType, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try print.printType(f.ip, f.ty, w);
+        try print.printTypeIn(f.ip, f.ty, w, .read);
     }
 };
 
@@ -1601,7 +1606,7 @@ const FmtValue = struct {
     ip: *const InternPool,
     val: Index,
     pub fn format(f: FmtValue, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try print.printValue(f.ip, f.val, w);
+        try print.printValueIn(f.ip, f.val, w, 3, .read);
     }
 };
 
@@ -1790,11 +1795,48 @@ fn fileRootType(sema: *Sema, file_index: u32) CompileError!Index {
     return ty;
 }
 
-fn createContainerType(sema: *Sema, kind: Zcu.ContainerKind, file_index: u32, inst: Zir.Inst.Index, captures: []const Index, fqn: []const u8, key: []const u8, parent_ns: u32, reified_layout: ?std.lang.Type.ContainerLayout) CompileError!Index {
+fn createContainerType(sema: *Sema, kind: Zcu.ContainerKind, file_index: u32, inst: Zir.Inst.Index, captures: []const Index, name: Zcu.NameCandidate, key: []const u8, parent_ns: u32, reified_layout: ?std.lang.Type.ContainerLayout) CompileError!Index {
     try sema.bcRefuse();
-    const ty = try sema.zcu.createContainerType(kind, file_index, inst, captures, fqn, key, parent_ns, reified_layout);
+    const ty = try sema.zcu.createContainerType(kind, file_index, inst, captures, name, key, parent_ns, reified_layout);
     try sema.noteEffects(ty, false);
+    try sema.noteNameOffer(ty, name);
     return ty;
+}
+
+/// Interns named tuple `key` (an anonymous struct literal's type), offering
+/// it `name`.
+fn internNamed(sema: *Sema, key: InternPool.Key, name: Zcu.NameCandidate) CompileError!Index {
+    // A lowered body would make the type once, not on each run.
+    try sema.bcRefuse();
+    const ty = try sema.zcu.internNamed(key, name);
+    try sema.noteNameOffer(ty, name);
+    return ty;
+}
+
+/// Records in `Zcu.name_offers` that this unit offered type `ty` name
+/// `name`, and so does a unit that reuses the memoizable call in progress.
+fn noteNameOffer(sema: *Sema, ty: Index, name: Zcu.NameCandidate) Allocator.Error!void {
+    const zcu = sema.zcu;
+    const cur = zcu.ip.nameOf(ty);
+    const offer: Zcu.MemoName = .{
+        .ty = ty,
+        .creator = name.creator,
+        // The type's own copy, if the candidate is its name.
+        .template = if (cur.creator == name.creator) cur.template else try zcu.dupeTemplate(name.template),
+    };
+    if (sema.memo_start) |start| _ = try sema.memoCollect(.{ .name = offer }, start);
+    const gop = try zcu.name_offers.getOrPut(zcu.gpa, .{ .unit = sema.owner, .ty = ty, .creator = name.creator });
+    if (!gop.found_existing) gop.value_ptr.* = offer.template;
+}
+
+/// Records in `Zcu.name_reads` that this unit rendered type `ty`'s name
+/// into a value, and so does a unit that reuses the memoizable call in
+/// progress.
+fn noteNameRead(sema: *Sema, ty: Index) CompileError!void {
+    // A lowered body would read it once, not on each run.
+    try sema.bcRefuse();
+    if (sema.memo_start) |start| _ = try sema.memoCollect(.{ .name_read = ty }, start);
+    try sema.zcu.name_reads.put(sema.gpa, .{ .unit = sema.owner, .ty = ty }, {});
 }
 
 /// Records in `Zcu.effect_uses` that this unit evaluated container type
@@ -1875,7 +1917,7 @@ fn declareDep(sema: *Sema, dependee: Zcu.Dependee, conditional: bool) !void {
             const m = sema.memo_dep_cache[h];
             if (m != 0 and m - 1 >= start and m - 1 < sema.memo_deps.items.len) switch (sema.memo_deps.items[m - 1]) {
                 .dep => |d| if (std.meta.eql(d.dependee, dependee) and (conditional or !d.conditional)) return,
-                .body, .effect, .func => {},
+                .body, .effect, .func, .name, .name_read => {},
             };
         } else if (slot.* != 0) {
             const i = slot.* - 1;
@@ -1945,6 +1987,10 @@ const MemoCollected = union(enum) {
     body: *const Zcu.Bytecode,
     effect: Index,
     func: Index,
+    /// A name it offered (`noteNameOffer`).
+    name: Zcu.MemoName,
+    /// A type whose name it read (`noteNameRead`).
+    name_read: Index,
 };
 
 /// Returns the entry's position in `memo_deps`.
@@ -1972,6 +2018,8 @@ fn memoCollect(sema: *Sema, entry: MemoCollected, start: u32) !u32 {
             if (gop.found_existing and gop.value_ptr.* >= start) return gop.value_ptr.*;
             gop.value_ptr.* = len;
         },
+        // Rare: kept as they come.
+        .name, .name_read => {},
     }
     try sema.memo_deps.append(gpa, entry);
     return len;
@@ -2000,7 +2048,7 @@ fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.MemoDep {
             for (b.deps) |d| try S.add(&out, &index, sema.gpa, sema.arena, .{ .dependee = d, .conditional = true });
             for (b.entry_deps) |i| try S.add(&out, &index, sema.gpa, sema.arena, .{ .dependee = b.deps[i], .conditional = false });
         },
-        .effect, .func => {},
+        .effect, .func, .name, .name_read => {},
     };
     return sema.zcu.arena.allocator().dupe(Zcu.MemoDep, out.items);
 }
@@ -2010,7 +2058,7 @@ fn memoDeps(sema: *Sema, start: u32) ![]const Zcu.MemoDep {
 fn memoEffects(sema: *Sema, start: u32) ![]const Index {
     var out: std.ArrayList(Index) = .empty;
     for (sema.memo_deps.items[start..]) |e| switch (e) {
-        .dep, .func => {},
+        .dep, .func, .name, .name_read => {},
         .body => |b| for (b.entry_effects) |i| if (std.mem.indexOfScalar(Index, out.items, b.effects[i]) == null) try out.append(sema.arena, b.effects[i]),
         .effect => |ty| if (std.mem.indexOfScalar(Index, out.items, ty) == null) try out.append(sema.arena, ty),
     };
@@ -2031,11 +2079,28 @@ fn memoFuncs(sema: *Sema, start: u32) ![]const Index {
     return out;
 }
 
+/// The names that the memoizable call whose entries start at `start`
+/// offered, and the types whose names it read, for its memo entry.
+fn memoNames(sema: *Sema, start: u32) !struct { []const Zcu.MemoName, []const Index } {
+    var names: std.ArrayList(Zcu.MemoName) = .empty;
+    var reads: std.ArrayList(Index) = .empty;
+    for (sema.memo_deps.items[start..]) |e| switch (e) {
+        .name => |n| try names.append(sema.arena, n),
+        .name_read => |ty| try reads.append(sema.arena, ty),
+        else => {},
+    };
+    const arena = sema.zcu.arena.allocator();
+    return .{ try arena.dupe(Zcu.MemoName, names.items), try arena.dupe(Index, reads.items) };
+}
+
 /// Reuses memo entry `memo`: declares what its call read and notes the
-/// containers with effects it evaluated.
+/// containers with effects it evaluated, the names it offered, and the
+/// names it read.
 fn memoHit(sema: *Sema, memo: Zcu.Memo) CompileError!Index {
     for (memo.deps) |d| try sema.declareDep(d.dependee, d.conditional);
     for (memo.effects) |ty| try sema.noteEffects(ty, true);
+    for (memo.names) |n| try sema.noteNameOffer(n.ty, .{ .creator = n.creator, .template = n.template });
+    for (memo.name_reads) |ty| try sema.noteNameRead(ty);
     // A lowered body would not refer to them on each run, as
     // `queueFuncRef` refuses.
     if (memo.funcs.len != 0) try sema.bcRefuse();
@@ -4005,6 +4070,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .type_name => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
             const ty = try sema.resolveType(block, src, data.un_node.operand);
+            try sema.noteNameRead(ty);
             break :blk .fromInterned(try sema.stringLiteral(try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)})));
         },
         .offset_of, .bit_offset_of => blk: {
@@ -4704,7 +4770,8 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
     const scope = sema.memoEnter();
     defer sema.memoLeave(scope);
     const result = try sema.typeInfo(block, src, ty);
-    try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.start), .effects = try sema.memoEffects(scope.start), .funcs = try sema.memoFuncs(scope.start) });
+    const names = try sema.memoNames(scope.start);
+    try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.start), .effects = try sema.memoEffects(scope.start), .funcs = try sema.memoFuncs(scope.start), .names = names[0], .name_reads = names[1] });
     return .fromInterned(result);
 }
 
@@ -5641,13 +5708,12 @@ const Zon = struct {
                 }
                 const ast_node = @backingInt(node.getAstNode(z.zoir));
                 const stem = z.path[if (std.mem.lastIndexOfScalar(u8, z.path, '/')) |k| k + 1 else 0..];
-                const ty = try sema.intern(.{ .tuple_type = .{
+                const ty = try sema.internNamed(.{ .tuple_type = .{
                     .types = types,
                     .values = values,
                     .names = names,
                     .site = try sema.getString(try std.fmt.allocPrint(sema.arena, "{s}#zon{d}", .{ z.key, ast_node })),
-                    .name = try sema.getString(try std.fmt.allocPrint(sema.arena, "{s}__struct_{d}", .{ stem, ast_node })),
-                } });
+                } }, .{ .creator = 0, .template = .{ .bytes = try std.fmt.allocPrint(sema.arena, "{s}__struct_{d}", .{ stem, ast_node }) } });
                 return sema.intern(.{ .aggregate = .{ .ty = ty, .storage = .{ .elems = values } } });
             },
         }
@@ -5977,45 +6043,52 @@ fn zirContainerDecl(sema: *Sema, block: *Block, inst: Zir.Inst.Index, kind: Zcu.
         };
     }
     const name = try sema.typeName(block, name_strategy, inst, kind, captures);
-    const ty = try sema.createContainerType(kind, sema.file, inst, captures, name.display, name.key, block.namespace, null);
+    const ty = try sema.createContainerType(kind, sema.file, inst, captures, name.name, name.key, block.namespace, null);
     return .fromInterned(ty);
 }
 
 const TypeName = struct {
-    /// Upstream's `@typeName`.
-    display: []const u8,
+    /// Upstream's `@typeName`, as this creator gives it.
+    name: Zcu.NameCandidate,
     /// Stable key (see "Analysis units" in docs/architecture.md).
     key: []const u8,
 };
 
-/// The names of a new type, following `strategy`.
+/// The names of a new type, following `strategy`. The display name is a
+/// candidate (`Zcu.offerName`), its creator the stable hash of what names
+/// it: the declaration, the call, or what `anonTypeParent` names it after.
 fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Zir.Inst.Index, kind: Zcu.ContainerKind, captures: []const Index) Allocator.Error!TypeName {
     const ip = sema.ip;
+    var b: print.TemplateBuilder = .init(sema.arena);
+    const w = &b.aw.writer;
     switch (strategy) {
         .parent => if (sema.owner_nav != .none and block.inlining == null) {
             var aw: std.Io.Writer.Allocating = .init(sema.arena);
             sema.writeTypePath(&aw.writer, sema.owner_nav) catch return error.OutOfMemory;
             Zcu.writeCaptures(ip, &aw.writer, captures) catch return error.OutOfMemory;
-            return .{ .display = ip.stringSlice(ip.getNav(sema.owner_nav).fqn), .key = aw.written() };
+            print.writeNavName(ip, sema.owner_nav, w, b.names()) catch return error.OutOfMemory;
+            return .{ .name = .{ .creator = ip.getNav(sema.owner_nav).hash, .template = b.finish() }, .key = aw.written() };
         },
         .func => if (block.inlining) |inlining| {
-            var aw: std.Io.Writer.Allocating = .init(sema.arena);
-            const nav = ip.getNav(ip.keyPayload(.func, inlining.func).owner_nav);
-            const w = &aw.writer;
-            w.print("{s}(", .{ip.stringSlice(nav.fqn)}) catch return error.OutOfMemory;
+            const nav = ip.keyPayload(.func, inlining.func).owner_nav;
+            var h: InternPool.Hasher = .init("type name of a call");
+            h.int(InternPool.Hash, ip.getNav(nav).hash);
+            print.writeNavName(ip, nav, w, b.names()) catch return error.OutOfMemory;
+            w.writeAll("(") catch return error.OutOfMemory;
             var first = true;
             for (inlining.args) |arg| {
                 if (arg == .none) continue;
                 if (!first) w.writeAll(",") catch return error.OutOfMemory;
                 first = false;
-                (if (ip.isType(arg)) print.printType(ip, arg, w) else print.printValueDepth(ip, arg, w, 1)) catch return error.OutOfMemory;
+                h.int(InternPool.Hash, ip.stableHash(arg));
+                (if (ip.isType(arg)) print.printTypeIn(ip, arg, w, b.names()) else print.printValueIn(ip, arg, w, 1, b.names())) catch return error.OutOfMemory;
             }
             w.writeAll(")") catch return error.OutOfMemory;
-            return .{ .display = aw.written(), .key = try sema.anonTypeKey(block, inst, captures) };
+            return .{ .name = .{ .creator = h.final(), .template = b.finish() }, .key = try sema.anonTypeKey(block, inst, captures) };
         },
         .anon, .dbg_var => {},
     }
-    const parent = try sema.anonTypeParent(block);
+    const creator = try sema.anonTypeParent(block, &b);
     // `const T = struct {...};` in a function body: named after the local.
     const var_name: ?[]const u8 = if (strategy == .dbg_var) blk: {
         const tags = sema.code.instructions.items(.tag);
@@ -6026,33 +6099,55 @@ fn typeName(sema: *Sema, block: *Block, strategy: Zir.Inst.NameStrategy, inst: Z
         };
         break :blk null;
     } else null;
-    const display = if (var_name) |n|
-        try std.fmt.allocPrint(sema.arena, "{s}.{s}", .{ parent, n })
+    (if (var_name) |n|
+        w.print(".{s}", .{n})
     else
-        try std.fmt.allocPrint(sema.arena, "{s}__{t}_{f}", .{ parent, kind, sema.anonTypeNumber(block, inst) });
-    return .{ .display = display, .key = try sema.anonTypeKey(block, inst, captures) };
+        w.print("__{t}_{f}", .{ kind, sema.anonTypeNumber(block, inst) })) catch return error.OutOfMemory;
+    return .{ .name = .{ .creator = creator, .template = b.finish() }, .key = try sema.anonTypeKey(block, inst, captures) };
 }
 
-/// The name an anonymous type made in `block` is numbered under, as
-/// upstream's `type_fqn_ctx`: the function being analyzed (an instance of
-/// a generic function by its symbol name, see CodeGen), called inline, or
-/// whose signature a call evaluates, else the declaration, else the
-/// container whose fields are being resolved, else `<namespace>.comptime`.
-fn anonTypeParent(sema: *Sema, block: *const Block) Allocator.Error![]const u8 {
+/// Writes the name an anonymous type made in `block` is numbered under
+/// into `b`, as upstream's `type_fqn_ctx`: the function being analyzed (an
+/// instance of a generic function by its symbol name, see CodeGen), called
+/// inline, or whose signature a call evaluates, else the declaration, else
+/// the container whose fields are being resolved, else
+/// `<namespace>.comptime`. Returns the stable hash of what it names it
+/// after, the candidate's creator.
+fn anonTypeParent(sema: *Sema, block: *const Block, b: *print.TemplateBuilder) Allocator.Error!InternPool.Hash {
     const ip = sema.ip;
-    if (block.inlining) |inlining| return ip.stringSlice(ip.getNav(ip.keyPayload(.func, inlining.func).owner_nav).fqn);
-    if (block.signature != .none) return ip.stringSlice(ip.getNav(ip.keyPayload(.func, block.signature).owner_nav).fqn);
-    if (sema.func != .none) {
-        const func = ip.keyPayload(.func, sema.func);
-        const fqn = ip.stringSlice(ip.getNav(func.owner_nav).fqn);
-        if (func.generic_owner == .none) return fqn;
-        return std.fmt.allocPrint(sema.arena, "{s}__func_{x:0>8}", .{ fqn, @as(u32, @truncate(ip.stableHash(sema.func))) });
+    const w = &b.aw.writer;
+    const nav: InternPool.NavIndex = if (block.inlining) |inlining|
+        ip.keyPayload(.func, inlining.func).owner_nav
+    else if (block.signature != .none)
+        ip.keyPayload(.func, block.signature).owner_nav
+    else if (sema.func != .none)
+        ip.keyPayload(.func, sema.func).owner_nav
+    else
+        sema.owner_nav;
+    if (nav != .none) {
+        print.writeNavName(ip, nav, w, b.names()) catch return error.OutOfMemory;
+        if (block.inlining == null and block.signature == .none and sema.func != .none and ip.keyPayload(.func, sema.func).generic_owner != .none) {
+            w.print("__func_{x:0>8}", .{@as(u32, @truncate(ip.stableHash(sema.func)))}) catch return error.OutOfMemory;
+            return ip.stableHash(sema.func);
+        }
+        return ip.getNav(nav).hash;
     }
-    if (sema.owner_nav != .none) return ip.stringSlice(ip.getNav(sema.owner_nav).fqn);
-    return switch (sema.owner) {
-        .type_layout, .struct_defaults => |ty| ip.stringSlice(ip.containerType(ty).?.name),
-        else => std.fmt.allocPrint(sema.arena, "{s}.comptime", .{sema.zcu.namespacePtr(block.namespace).fqn}),
-    };
+    switch (sema.owner) {
+        .type_layout, .struct_defaults => |ty| {
+            b.hole(ty) catch return error.OutOfMemory;
+            var h: InternPool.Hasher = .init("type name of fields");
+            h.int(InternPool.Hash, ip.stableHash(ty));
+            return h.final();
+        },
+        else => {
+            const owner = sema.zcu.namespacePtr(block.namespace).owner_type;
+            b.hole(owner) catch return error.OutOfMemory;
+            w.writeAll(".comptime") catch return error.OutOfMemory;
+            var h: InternPool.Hasher = .init("type name of comptime");
+            h.int(InternPool.Hash, ip.stableHash(owner));
+            return h.final();
+        },
+    }
 }
 
 /// The number in `<parent>__struct_<n>` of an anonymous type made by
@@ -11715,7 +11810,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         }
         const captures = [_]Index{ tag_ty, mode, try sema.namesValue(names), try sema.intern(.{ .aggregate = .{ .ty = try sema.intern(.{ .array_type = .{ .len = n, .child = tag_ty } }), .storage = .{ .elems = values } } }) };
         const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, &captures);
-        const ty = try sema.createContainerType(kind, sema.file, inst, &captures, name.display, name.key, block.namespace, .auto);
+        const ty = try sema.createContainerType(kind, sema.file, inst, &captures, name.name, name.key, block.namespace, .auto);
         try sema.fillReified(ty);
         return .fromInterned(ty);
     }
@@ -11768,7 +11863,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
             return sema.fail(block, src, "comptime field without default initialization value", .{});
     }
     const name = try sema.typeName(block, @fromBackingInt(@intCast(ext.small)), inst, kind, captures.items);
-    const ty = try sema.createContainerType(kind, sema.file, inst, captures.items, name.display, name.key, block.namespace, layout);
+    const ty = try sema.createContainerType(kind, sema.file, inst, captures.items, name.name, name.key, block.namespace, layout);
     try sema.fillReified(ty);
     return .fromInterned(ty);
 }
@@ -13998,15 +14093,16 @@ fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: As
         sema.zcu.unitKey(sema.owner, &site.writer) catch return error.OutOfMemory;
     }
     site.writer.print("#lit{d}", .{@backingInt(src_node)}) catch return error.OutOfMemory;
-    const name = try std.fmt.allocPrint(sema.arena, "{s}__struct_{f}", .{ try sema.anonTypeParent(block), sema.anonTypeNumber(block, inst) });
+    var b: print.TemplateBuilder = .init(sema.arena);
+    const creator = try sema.anonTypeParent(block, &b);
+    b.aw.writer.print("__struct_{f}", .{sema.anonTypeNumber(block, inst)}) catch return error.OutOfMemory;
 
-    const ty = try sema.intern(.{ .tuple_type = .{
+    const ty = try sema.internNamed(.{ .tuple_type = .{
         .types = types,
         .values = values,
         .names = names,
         .site = try sema.getString(site.written()),
-        .name = try sema.getString(name),
-    } });
+    } }, .{ .creator = creator, .template = b.finish() });
     return sema.aggregate(block, src, ty, inits);
 }
 
@@ -15906,7 +16002,8 @@ fn callComptime(sema: *Sema, caller: *Block, src: Src, func: Index, args: []cons
         },
     };
     if (memoizable and !sema.refersToComptimeAlloc(result)) {
-        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.?.start), .effects = try sema.memoEffects(scope.?.start), .funcs = try sema.memoFuncs(scope.?.start) });
+        const names = try sema.memoNames(scope.?.start);
+        try sema.zcu.comptime_memo.put(sema.gpa, key, .{ .result = result, .deps = try sema.memoDeps(scope.?.start), .effects = try sema.memoEffects(scope.?.start), .funcs = try sema.memoFuncs(scope.?.start), .names = names[0], .name_reads = names[1] });
     } else if (sema.bc) |bc| if (bc.depth == 0) try sema.bcRefuse();
     return result;
 }

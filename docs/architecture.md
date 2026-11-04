@@ -132,6 +132,71 @@ on an edit above the block while their key stayed: the block is analyzed
 again in every edit build, but a function of the type is loaded with its
 old symbol name.)
 
+#### Type names
+
+A type's identity can be shared by creators that would name it
+differently: a type that captures nothing that tells them apart (`fn
+F(comptime T: type) type { return struct { const S = struct {}; const t:
+T = 0; }; }` makes one `S` for `F(u8)` and `F(u16)`), or one made by an
+inline or comptime call whose uncaptured arguments differ. Upstream names
+such a type after its first creator, so the name depends on analysis
+order. zap names it after the *least* creator by key, so that every build,
+in any order, names it the same (built 2026-11-04, part 1 of the three
+below):
+
+- *Candidates.* Every container type and named tuple (an anonymous struct
+  literal's type) has a mutable name slot (`InternPool.TypeName`, the
+  `name` of `ContainerType` and `TupleType`). Each creation offers a
+  candidate (`Zcu.offerName`): its creator, the stable hash of what names
+  the type (the declaration's `Nav.hash` for `.parent` names and for
+  anonymous types in a non-generic function, inline call, signature, or
+  declaration; `stableHash(func)` of a generic instance; the callee's
+  hash and the arguments' for `.func` names; the type's for field
+  expressions; the namespace owner's for `comptime` blocks), and a
+  *template*: the name with holes where other types' names go. The slot
+  keeps the candidate with the least creator.
+- *Rendering.* Names are rendered when read (`print.writeTypeName`,
+  `writeNavName`), not stored: `Nav.parent` replaces `Nav.fqn`, a
+  declaration's name is its parent type's and its own, and a nested
+  type's template has a hole for its parent's name. So when `S` is
+  renamed, its declarations, its nested types and their functions'
+  symbols follow. `Namespace.fqn` is gone.
+- *Reads.* Analysis reads a name when it renders it into a value
+  (`@typeName`) or into an error message (`print.Names.read`, Sema's
+  `fmtType`, and test filters). A read marks the slots it rendered. If a
+  marked slot's name changes afterwards, `Zcu.finalizeNames` returns the
+  final names, keyed by stable hash, and main redoes the build with them
+  pinned (`TypeName.pinned`); a pinned slot renders its pin. A type that
+  only the second attempt makes and reads is not pinned. Measured on main
+  459e1fe: types with conflicting creators number 56 on the std tests,
+  108 on the zig workload and 5 on libvaxis, and no `@typeName` read
+  is of one, so a build is redone essentially never
+  (test/run/type_names.zig forces one).
+- *Atom names.* CodeGen runs while names can still change, on workers,
+  so a function's or declaration's atom is named in `Emit.finish`
+  (`Emit.nameAtoms`), after `finalizeNames`. A loaded unit's atoms keep
+  the name their record has.
+- *Parents.* A type's namespace's parent is the nearest enclosing
+  namespace that is not inside a function (`Namespace.parent`,
+  `Namespace.in_fn`). AstGen tunnels every reference to a declaration of
+  a namespace inside a function through a capture (`found_needs_tunnel =
+  ns.maybe_generic`), so a lookup from a nested type never finds a name in
+  such a namespace, and skipping them makes the parent the same for every
+  creator, with the `namespace_name` dependencies lookups record. Nothing
+  about parents depends on creators any more.
+- *The cache* (part 2, the cache's): Sema records each unit's offers
+  (`Zcu.name_offers`) and the types whose names it rendered into a value
+  (`Zcu.name_reads`), and memo entries carry both (`Zcu.Memo.names`,
+  `name_reads`), offered and noted again on a hit. Part 2 persists them,
+  offers a loaded unit's candidates in `Replay.contributeNames` (called
+  first by `finalizeNames`), and re-analyzes a loaded reader whose name
+  changed. Until then a type made from a result keeps its recorded name
+  (creator 0), and a type a loaded creator would name keeps a live
+  creator's name: `F(u8).S` above prints `F(u16).S` after an edit that
+  adds `F(u16)` back, if `F(u8)`'s declaration is loaded.
+- *Part 3* (link): atom records stop carrying names, and loaded atoms
+  are named from final names at link time.
+
 When a unit reads another unit's result (a declaration's value, a type's
 layout, a function's signature) it goes through one Sema function that records
 the dependency. Sema records dependencies from the first skeleton onward, even
@@ -4191,49 +4256,12 @@ analysis:
      timing-dependent.
    - *`branch_quotas`* (rule 7).
 4. *Anonymous type names.* Names come from ZIR offsets and comptime
-   ordinals (`typeName`, `anonTypeNumber`), not counters. One order
-   dependence remains: a container's identity is file, ZIR instruction
-   and captures (its key, a path and the captures, follows it), so when
-   two creators would name the same type differently, the first creator
-   names it, and its parent namespace is the first creator's. An edit
-   build has the same problem today: a type made by a loaded unit keeps
-   the name from the build that recorded it. It happens, in upstream too: with `fn
-   F(comptime x: u32) type { _ = x; return struct {}; }`, `F(1) == F(2)`,
-   and both print `a.F(2)` if `F(2)` was created first (an inline
-   function behaves the same). No name can come from the key alone, since
-   the key lacks the uncaptured arguments, and adding them would break
-   upstream's type identity. The rule: the name is a CAS-min by the
-   creator's key. Comptime `@typeName` reads and error-message renderings
-   of the name are recorded, and if the final name differs from one that
-   was read, the build reruns, as for provisional codes.
-   - *Measured* (main 459e1fe, a counter in `createContainerType`):
-     types whose creators give different names number 56 on the std
-     tests, 108 on the zig workload and 5 on libvaxis
-     (`meta.FieldEnum(...)`, `hash_map.Custom(...).KV`,
-     `crypto.sha2.Sha2x32(...).Options`). Comptime `@typeName` reads
-     of container types number 10, 3 and 0, and none is of such a
-     type, so a read that the final name contradicts would be rare.
-   - *Where names go.* Symbol names are not computed at `finish`:
-     `createContainerType` copies the type's name into its namespace's
-     `fqn` and every declaration's `Nav.fqn`, nested anonymous types
-     take their name from those (`anonTypeParent`), CodeGen names a
-     function's atom from `Nav.fqn` while lowering it on a worker, and
-     Emit names data from it. Atom records keep those names. So a min
-     that changes after creation must reach stored names, atoms and
-     records, unless they are computed late from the type's final name.
-   - *Edit builds* need the creators that are live: a loaded unit
-     creates nothing, so each creator unit, and each memo entry whose
-     call created a type, must record its candidate for replay to
-     contribute. A type made only by loaded units' locators otherwise
-     keeps the name from the build that recorded it. Repro:
-     `@typeName(F(u8).S)` prints `F(u16).S` after `F(u16)` is removed
-     from main, while a clean build prints `F(u8).S`.
-   - *Parent namespace.* The winning creator also gives the type's
-     parent namespace, through which declarations inside the type look
-     names up. When the type is declared in a generic type's namespace
-     (`Custom(...).KV`), a later smaller creator changes what such a
-     lookup finds, so a lookup through a parent that loses is a read
-     like a name read.
+   ordinals (`typeName`, `anonTypeNumber`), not counters. A type two
+   creators would name differently is named after the least creator by
+   key, and a read of a name that then changes redoes the build with
+   names pinned: see "Type names" under "Analysis units" (part 1 built
+   2026-11-04). The parent namespace no longer depends on creators.
+   Parts 2 (the cache) and 3 (link-time names) remain.
 5. *Error codes and error sets.*
    - *Codes.* The last build's codes are seeded first (`seedErrors`,
      unchanged). A name with no seeded code gets a provisional code when
@@ -4468,17 +4496,11 @@ A. *Determinism, serially.* Rules 1–8 and the reruns they need, on one
    types that two creators name differently. Drop conditional edges
    (rule 3).
    - *Creator-independent type names* (item 4), in three parts:
-     (1) Sema/Zcu, about 3–4 days: a shared type's name and parent
-     namespace become the min by creator key within a build; `Nav.fqn`,
-     `Namespace.fqn` and anonymous type names are computed from the
-     final name instead of copied; comptime name reads and lookups
-     through a parent that then loses are recorded, and if one changes,
-     the build reruns once with names pinned. (2) The cache, about 2
-     days: each creator unit and each memo entry whose call created a
-     type records its candidate, and replay contributes the candidates
-     of loaded units. (3) Link and CodeGen, about 1–2 days: atom and
-     symbol names come from final names at link time and stay out of
-     atom records. Until then, see "Known regressions and limitations".
+     (1) Sema/Zcu, built 2026-11-04 (see "Type names"). (2) The cache:
+     each unit's and memo entry's offers and name reads persist, and
+     replay offers the loaded units' candidates. (3) Link: atom records
+     stop carrying names, and loaded atoms are named from final names
+     at link time.
    - `ZAP_SCHED_FUZZ` gains two Sema modes. One shuffles the function
      queue and the order in which roots are queued. The other eagerly
      resolves random idle units at random points, as another worker
@@ -5546,23 +5568,22 @@ unchanged:
 
 ## Known regressions and limitations
 
-- *A type's name after an edit (since the on-disk cache).* A type with
-  more than one possible creator (one ZIR instruction and equal
-  captures, reached from instances that differ in what it does not
-  capture) is named, and given its parent namespace, by the first
-  creator, as upstream. An edit build can keep the name from the build
-  that recorded it, where a clean build names it after the first
-  creator left. Repro: `fn F(comptime T: type) type { return struct {
-  const S = struct { fn f() void {} }; const t: T = 0; }; }`; main calls
-  `F(u16).S.f()` and `F(u8).S.f()` and prints `@typeName(F(u8).S)`.
-  After the edit that removes the `F(u16)` call, the edit build prints
-  `main.F(u16).S`, while a clean build and upstream print `main.F(u8).S`,
-  and `S.f`'s symbol name is stale the same way. Measured on main
-  459e1fe: such types number 56 on the std tests, 108 on the zig
-  workload and 5 on libvaxis; comptime `@typeName` reads of them number
-  0 on all three, so the visible effect is a display or symbol name
-  after such an edit. The fix is part of parallel Sema stage A (step 2,
-  item 4 and stage A), which needs order-independent clean builds.
+- *A type's name after an edit (since the on-disk cache; being fixed).*
+  A clean build names a type that creators would name differently after
+  the least creator by key, in any analysis order ("Type names", part 1
+  built). An edit build does not see the candidates of loaded creators
+  until part 2: with `fn F(comptime T: type) type { return struct {
+  const S = struct { fn f() void {} }; const t: T = 0; }; }`, main calling
+  `F(u16).S.f()` and `F(u8).S.f()` and printing `@typeName(F(u8).S)`, a
+  clean build prints `main.F(u8).S` (`F(u8)`'s declaration has the
+  lesser key; upstream prints its first creator's name, `main.F(u16).S`),
+  but the edit build that adds the `F(u16)` call back to a build without
+  it prints `main.F(u16).S`, the live creator's name, and `S.f`'s symbol
+  name follows. The edit that removes the call, which kept the stale
+  name before part 1, is right now. Such types number 56 on the std
+  tests, 108 on the zig workload and 5 on libvaxis (main 459e1fe), and
+  no `@typeName` reads one. Part 2 (the cache) and part 3 (link-time
+  names for loaded atoms) fix the rest.
 - *Speculative function-type reads.* A function type reads its
   by-value parameters' field types speculatively (`Zcu.speculating`); in
   a real cycle the result depends on analysis order. It aborts 0 times

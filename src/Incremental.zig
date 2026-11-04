@@ -1338,9 +1338,15 @@ fn dropLog(inc: *Incremental, len: u64) void {
 
 /// Ends the lazy replay, for the caller to build again eagerly.
 fn fallBack(inc: *Incremental) error{LazyFallback} {
+    inc.endReplay();
+    return error.LazyFallback;
+}
+
+/// Ends the replay of a build that the caller builds again
+/// (`Zcu.finalizeNames`).
+pub fn endReplay(inc: *Incremental) void {
     if (inc.replay) |r| r.destroy();
     inc.replay = null;
-    return error.LazyFallback;
 }
 
 /// Why `recordDelta` falls back to an eager build, under

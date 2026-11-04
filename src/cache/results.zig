@@ -30,6 +30,7 @@ const Allocator = std.mem.Allocator;
 const Zir = std.zig.Zir;
 const InternPool = @import("../InternPool.zig");
 const Zcu = @import("../Zcu.zig");
+const print = @import("../Ir/print.zig");
 const Index = InternPool.Index;
 const Hash = InternPool.Hash;
 pub const Items = @import("Manifest.zig").Items;
@@ -118,6 +119,14 @@ pub const Encoder = struct {
         @memset(dest[bytes.len..], 0);
     }
 
+    /// The final name of container type or named tuple `ty`.
+    fn pushName(e: *Encoder, ty: Index) !void {
+        var aw: std.Io.Writer.Allocating = .init(e.gpa);
+        defer aw.deinit();
+        print.writeTypeName(&e.zcu.ip, ty, &aw.writer, .render) catch return error.OutOfMemory;
+        try e.pushBytes(aw.written());
+    }
+
     fn pushString(e: *Encoder, s: InternPool.String) !void {
         try e.pushBytes(e.zcu.ip.stringSlice(s));
     }
@@ -190,7 +199,7 @@ pub const Encoder = struct {
                 try e.push(@intCast(t.names.len));
                 for (t.names) |n| try e.pushString(n);
                 try e.pushString(t.site);
-                try e.pushString(t.name);
+                if (t.names.len != 0) try e.pushName(index) else try e.pushBytes("");
                 break :blk true;
             },
             .error_set_type => |names| blk: {
@@ -347,7 +356,7 @@ pub const Encoder = struct {
         const parent = e.zcu.namespacePtr(info.namespace).parent;
         if (!try e.pushRef(if (parent == Zcu.Namespace.none) .none else e.zcu.namespacePtr(parent).owner_type)) return false;
         if (!try e.pushRefs(c.captures)) return false;
-        try e.pushString(c.name);
+        try e.pushName(index);
         try e.pushString(c.key);
         if (generated_tag) {
             if (!try e.pushRef(e.zcu.namespacePtr(info.namespace).owner_type) or !try e.pushRef(info.tag_type)) return false;
@@ -372,7 +381,7 @@ pub const Lookup = struct {
             .file = c.file,
             .zir_inst = c.zir_inst,
             .captures = c.captures,
-            .name = try ip.getString(Zcu.tid, c.name),
+            .name = undefined,
             .key = try ip.getString(Zcu.tid, c.key),
             .info = undefined,
         };
@@ -406,6 +415,11 @@ pub const Lookup = struct {
 
     /// Lookups intern nothing new but strings.
     pub fn intern(l: Lookup, key: InternPool.Key) !?Index {
+        return l.zcu.ip.find(key);
+    }
+
+    pub fn namedTuple(l: Lookup, key: InternPool.Key, name: []const u8) !?Index {
+        _ = name;
         return l.zcu.ip.find(key);
     }
 };
@@ -632,14 +646,15 @@ pub fn Decoder(comptime Resolver: type) type {
                     defer d.gpa.free(names);
                     for (names) |*n| n.* = try d.string(c);
                     const site = try d.string(c);
-                    const name = try d.string(c);
-                    return d.intern(.{ .tuple_type = .{
+                    const name = c.bytes();
+                    const key: InternPool.Key = .{ .tuple_type = .{
                         .types = d.scratch.items[types..values],
                         .values = d.scratch.items[values..],
                         .names = names,
                         .site = site,
-                        .name = name,
-                    } });
+                    } };
+                    if (names.len == 0) return d.intern(key);
+                    return d.resolver.namedTuple(key, name);
                 },
                 .error_set_type => {
                     const names = try d.gpa.alloc(InternPool.String, c.next());

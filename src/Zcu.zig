@@ -20,6 +20,7 @@ const Ir = @import("Ir.zig");
 const Replay = @import("Replay.zig");
 const Sema = @import("Sema.zig");
 const diag = @import("diag.zig");
+const print = @import("Ir/print.zig");
 
 const Zcu = @This();
 
@@ -128,11 +129,35 @@ errors: std.ArrayList(ErrorMsg) = .empty,
 /// makes an edit build analyze such a unit again rather than load it,
 /// unless loading it makes the type anyway (see `Incremental.record`).
 effect_uses: std.AutoArrayHashMapUnmanaged(EffectUse, void) = .empty,
+/// Each unit's candidate names for the types it made (`offerName`),
+/// including those a memo hit made again, for the cache: an edit build
+/// offers the loaded units' candidates again (docs/architecture.md, "Type
+/// names"). The value is the template, in `arena`.
+name_offers: std.AutoArrayHashMapUnmanaged(NameOffer, InternPool.Template) = .empty,
+/// Which types' names each unit's analysis rendered into a value
+/// (`@typeName`), for the cache, which must analyze such a unit again if a
+/// name it read changed.
+name_reads: std.AutoArrayHashMapUnmanaged(NameRead, void) = .empty,
+/// Whether a name that analysis read changed afterwards (`offerName`).
+name_read_changed: bool = false,
+/// In a build redone because one did, the final names of the first
+/// attempt, by type stable hash; types get them as `TypeName.pinned`.
+name_pins: ?*const NamePins = null,
 /// In an edit build, the last build's results: each `ensure*` and the
 /// function queue load a unit from it, if it is green, before analyzing it.
 replay: ?*Replay = null,
 /// Owns diagnostic text and namespace tables.
 arena: std.heap.ArenaAllocator,
+
+/// A type's name as one creator would give it (`InternPool.TypeName`).
+pub const NameCandidate = struct {
+    creator: InternPool.Hash,
+    template: InternPool.Template,
+};
+
+pub const NameOffer = struct { unit: AnalUnit, ty: InternPool.Index, creator: InternPool.Hash };
+pub const NameRead = struct { unit: AnalUnit, ty: InternPool.Index };
+pub const NamePins = std.AutoHashMapUnmanaged(InternPool.Hash, []const u8);
 
 pub const Export = struct {
     target: union(enum) {
@@ -173,7 +198,15 @@ pub const Memo = struct {
     /// The functions the call referred to, which a unit that reuses the
     /// result refers to too (`func_refs`).
     funcs: []const InternPool.Index,
+    /// The names the call offered, which a unit that reuses the result
+    /// offers too (`name_offers`).
+    names: []const MemoName = &.{},
+    /// The types whose names the call read (`name_reads`).
+    name_reads: []const InternPool.Index = &.{},
 };
+
+/// A name offer (`name_offers`), its template in `arena`.
+pub const MemoName = struct { ty: InternPool.Index, creator: InternPool.Hash, template: InternPool.Template };
 
 pub const MemoDep = struct {
     dependee: Dependee,
@@ -336,9 +369,8 @@ pub const Namespace = struct {
     /// Whether the type's ZIR is inside a function declaration (or test),
     /// as AstGen's `within_fn`.
     in_fn: bool = false,
+    /// The type it belongs to, whose name prefixes its declarations'.
     owner_type: InternPool.Index,
-    /// Display name prefix of declarations in this namespace.
-    fqn: []const u8,
     /// Stable key prefix of declarations in this namespace.
     key: []const u8,
     /// `key` without the captures of any type, its own or an enclosing
@@ -411,6 +443,8 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.phase_deps.deinit(gpa);
     zcu.nav_ptrs.deinit(gpa);
     zcu.effect_uses.deinit(gpa);
+    zcu.name_offers.deinit(gpa);
+    zcu.name_reads.deinit(gpa);
     var bodies = zcu.comptime_bodies.valueIterator();
     while (bodies.next()) |b| switch (b.*) {
         .ready => |r| r.destroy(gpa),
@@ -583,7 +617,7 @@ fn unitName(zcu: *const Zcu, arena: Allocator, unit: AnalUnit) ![]const u8 {
     return switch (unit) {
         .nav_val => |nav| ip.stringSlice(ip.getNav(nav).name),
         .func => |func| ip.stringSlice(ip.getNav(ip.keyPayload(.func, func).owner_nav).name),
-        .type_layout, .struct_defaults => |ty| try arena.dupe(u8, ip.stringSlice((ip.containerType(ty) orelse return "type").name)),
+        .type_layout, .struct_defaults => |ty| if (ip.containerType(ty) == null) "type" else try print.typeAlloc(ip, ty, arena),
         .comptime_decl => "comptime",
     };
 }
@@ -594,7 +628,7 @@ fn unitName(zcu: *const Zcu, arena: Allocator, unit: AnalUnit) ![]const u8 {
 /// The root struct type of a file, creating it (and its namespace) on first use.
 pub fn fileRootType(zcu: *Zcu, file_index: u32) !InternPool.Index {
     if (zcu.file_root_types.items[file_index] != .none) return zcu.file_root_types.items[file_index];
-    const ty = try zcu.createContainerType(.@"struct", file_index, .main_struct_inst, &.{}, try zcu.fileFqn(file_index), try zcu.fileKey(file_index), Namespace.none, null);
+    const ty = try zcu.createContainerType(.@"struct", file_index, .main_struct_inst, &.{}, .{ .creator = 0, .template = .{ .bytes = try zcu.fileFqn(file_index) } }, try zcu.fileKey(file_index), Namespace.none, null);
     zcu.file_root_types.items[file_index] = ty;
     return ty;
 }
@@ -613,8 +647,8 @@ pub fn writeCaptures(ip: *const InternPool, w: *std.Io.Writer, captures: []const
     try w.writeAll(")");
 }
 
-/// Interns a declared container type of `kind` with display name `fqn` and
-/// stable key `key`, which ends with the type's captures
+/// Interns a declared container type of `kind`, offering it name `name`
+/// (`offerName`), with stable key `key`, which ends with the type's captures
 /// (`writeCaptures`). If it is new, creates its namespace and declarations
 /// and queues its `comptime` and exported declarations. A type made by
 /// `@Struct`, `@Union`, or `@Enum` passes its `reified_layout`; it has no
@@ -625,7 +659,7 @@ pub fn createContainerType(
     file_index: u32,
     inst: Zir.Inst.Index,
     captures: []const InternPool.Index,
-    fqn: []const u8,
+    name: NameCandidate,
     key: []const u8,
     parent_ns: u32,
     reified_layout: ?std.lang.Type.ContainerLayout,
@@ -644,23 +678,22 @@ pub fn createContainerType(
         },
         .@"opaque" => .{ zir.getOpaqueDecl(inst).decls, .auto },
     };
-    const name = try ip.getString(tid, fqn);
     // Look up first so an existing type keeps its namespace.
     const info = try ip.createContainerInfo(tid, .{ .namespace = Namespace.none, .layout = layout });
     const container: InternPool.ContainerType = .{
         .file = file_index,
         .zir_inst = inst,
         .captures = captures,
-        .name = name,
+        .name = undefined,
         .key = try ip.getString(tid, key),
         .info = info,
     };
-    const ty = try ip.get(tid, switch (kind) {
+    const ty = try zcu.internNamed(switch (kind) {
         .@"struct" => .{ .struct_type = container },
         .@"enum" => .{ .enum_type = container },
         .@"union" => .{ .union_type = container },
         .@"opaque" => .{ .opaque_type = container },
-    });
+    }, name);
     const si = ip.structInfo(ty);
     if (si.namespace != Namespace.none) return ty;
 
@@ -679,7 +712,6 @@ pub fn createContainerType(
         .parent = if (parent_ns != Namespace.none and zcu.namespaces.items[parent_ns].in_fn) zcu.namespaces.items[parent_ns].parent else parent_ns,
         .in_fn = in_fn,
         .owner_type = ty,
-        .fqn = try arena.dupe(u8, fqn),
         .key = ns_key,
         .path = ns_key[0 .. key.len - caps.written().len],
     });
@@ -707,13 +739,12 @@ pub fn createContainerType(
             },
             .@"const", .@"var" => zir.nullTerminatedString(d.name),
         };
-        const decl_fqn = try std.fmt.allocPrint(arena, "{s}.{s}", .{ fqn, simple });
         const decl_key = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ key, key_sep, simple });
         var hasher: InternPool.Hasher = .init("nav");
         hasher.bytes(decl_key);
         const nav = try ip.createNav(tid, .{
             .name = try ip.getString(tid, simple),
-            .fqn = try ip.getString(tid, decl_fqn),
+            .parent = ty,
             .key = try ip.getString(tid, decl_key),
             .file = file_index,
             .zir_inst = decl_inst,
@@ -734,6 +765,10 @@ pub fn createContainerType(
                 // Upstream's filter semantics: unnamed tests always run;
                 // named ones only if their fqn contains some filter.
                 if (d.kind != .unnamed_test and zcu.test_filters.len > 0) {
+                    var aw: std.Io.Writer.Allocating = .init(zcu.gpa);
+                    defer aw.deinit();
+                    print.writeNavName(ip, nav, &aw.writer, .read) catch return error.OutOfMemory;
+                    const decl_fqn = aw.written();
                     for (zcu.test_filters) |filter| {
                         if (std.mem.indexOf(u8, decl_fqn, filter) != null) break;
                     } else continue;
@@ -744,6 +779,70 @@ pub fn createContainerType(
     }
     zcu.namespaces.items[ns_index].effects = zcu.comptime_decls.count() + zcu.exports.items.len + zcu.test_functions.items.len != effects;
     return ty;
+}
+
+/// Interns `key`, a container type or named tuple whose `name` is to be
+/// filled in, and offers it `name` (`offerName`).
+pub fn internNamed(zcu: *Zcu, key: InternPool.Key, name: NameCandidate) !InternPool.Index {
+    const ip = &zcu.ip;
+    const slot = try ip.createName(tid, .{ .creator = name.creator, .template = name.template });
+    var k = key;
+    switch (k) {
+        .struct_type, .enum_type, .union_type, .opaque_type => |*c| c.name = slot,
+        .tuple_type => |*t| t.name = slot,
+        else => unreachable,
+    }
+    const ty = try ip.get(tid, k);
+    const named = ip.nameOf(ty);
+    if (named != ip.typeName(slot)) {
+        try zcu.offerName(ty, name);
+        return ty;
+    }
+    named.ty = ty;
+    named.template = try zcu.dupeTemplate(name.template);
+    if (zcu.name_pins) |pins| named.pinned = pins.get(ip.stableHash(ty));
+    return ty;
+}
+
+/// Offers container type or named tuple `ty` name `name`: the type takes
+/// it if its creator is less than the creator of the name it has, so that
+/// every build names a type the same however its analysis is ordered
+/// (docs/architecture.md, "Type names").
+pub fn offerName(zcu: *Zcu, ty: InternPool.Index, name: NameCandidate) !void {
+    const cur = zcu.ip.nameOf(ty);
+    if (name.creator >= cur.creator) return;
+    if (cur.read and cur.pinned == null and !cur.template.eql(name.template)) zcu.name_read_changed = true;
+    cur.creator = name.creator;
+    cur.template = try zcu.dupeTemplate(name.template);
+}
+
+pub fn dupeTemplate(zcu: *Zcu, t: InternPool.Template) !InternPool.Template {
+    const arena = zcu.arena.allocator();
+    return .{ .bytes = try arena.dupe(u8, t.bytes), .holes = try arena.dupe(InternPool.Template.Hole, t.holes) };
+}
+
+/// Settles the names of the types analysis made, which nothing may change
+/// afterwards: an edit build first offers the loaded units' candidates.
+/// Returns the names to pin if analysis read a name that then changed and
+/// the build must be redone (in `pin_arena`), else null.
+pub fn finalizeNames(zcu: *Zcu, pin_arena: Allocator) !?*const NamePins {
+    if (zcu.replay) |r| try r.contributeNames(zcu);
+    if (!zcu.name_read_changed) return null;
+    // Redone builds pin every type the first attempt made; one that only
+    // the second attempt makes and reads, after which it is renamed, is
+    // left as it is (not seen yet).
+    if (zcu.name_pins != null) return null;
+    const pins = try pin_arena.create(NamePins);
+    pins.* = .empty;
+    const ip = &zcu.ip;
+    var aw: std.Io.Writer.Allocating = .init(pin_arena);
+    for (0..ip.locals.len) |local| for (ip.localNames(local)) |name| {
+        if (name.ty == .none) continue;
+        aw.clearRetainingCapacity();
+        print.writeTypeName(ip, name.ty, &aw.writer, .render) catch return error.OutOfMemory;
+        try pins.put(pin_arena, ip.stableHash(name.ty), try pin_arena.dupe(u8, aw.written()));
+    };
+    return pins;
 }
 
 /// Whether ZIR instruction `inst`, of a type made in namespace `ns_index`

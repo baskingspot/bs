@@ -364,16 +364,25 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     const n_inputs = if (inputs) |list| list.items.len else 0;
     // A lazy edit build whose changes the cache cannot record builds again
     // eagerly (`Incremental.finishLazy`).
-    return compileReplaying(init, job, inc_opt, out_path, prog, inputs, init.environ_map.get("ZAP_CACHE_REPLAY") orelse "") catch |err| switch (err) {
+    var replay_mode = init.environ_map.get("ZAP_CACHE_REPLAY") orelse "";
+    // A build whose analysis read a type name that then changed builds
+    // again with the first attempt's final names (`Zcu.finalizeNames`).
+    var pins: ?*const Zcu.NamePins = null;
+    while (true) return compileReplaying(init, job, inc_opt, out_path, prog, inputs, replay_mode, &pins) catch |err| switch (err) {
         error.LazyFallback => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
-            return compileReplaying(init, job, inc_opt, out_path, prog, inputs, "eager");
+            replay_mode = "eager";
+            continue;
+        },
+        error.NamesRerun => {
+            if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
+            continue;
         },
         else => |e| return e,
     };
 }
 
-fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8) !Outcome {
+fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins) !Outcome {
     const arena = init.arena.allocator();
     const opts = job.opts;
     const env = init.environ_map;
@@ -430,6 +439,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         appendInput(arena, list, path_buf.items) catch {};
     };
     zcu.is_test = is_test;
+    zcu.name_pins = pins.*;
     zcu.single_threaded = opts.single_threaded;
     zcu.test_filters = opts.test_filters;
     // `ZAP_COMPTIME_EVAL=n`: lower a function for the comptime evaluator
@@ -480,6 +490,11 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     stages.markSplit("sema", "codegen", emit.codegen_ns);
     sema_node.end();
     zcu.printUnitTiming();
+    if (try zcu.finalizeNames(arena)) |p| {
+        pins.* = p;
+        if (inc_opt) |i| i.endReplay();
+        return error.NamesRerun;
+    }
     // A lazy edit build leaves the test list as the last build linked it.
     if (is_test and !(if (zcu.replay) |r| r.lazy else false)) @import("Sema.zig").populateTestFunctions(&zcu) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

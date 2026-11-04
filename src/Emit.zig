@@ -19,6 +19,7 @@ const Type = @import("Type.zig");
 const Zcu = @import("Zcu.zig");
 const Diag = @import("diag.zig");
 const Atom = @import("link/Atom.zig");
+const print = @import("Ir/print.zig");
 const SymbolKey = Atom.SymbolKey;
 const Elf = @import("link/Elf.zig");
 const ElfObject = @import("link/ElfObject.zig");
@@ -715,6 +716,7 @@ pub fn finish(emit: *Emit) !bool {
     if (emit.lazy) {
         try emit.lowerNavs();
         if (emit.failed) return false;
+        try emit.nameAtoms();
         try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
         return true;
     }
@@ -740,6 +742,7 @@ pub fn finish(emit: *Emit) !bool {
         return false;
     }
 
+    try emit.nameAtoms();
     try groupByOwner(emit.gpa, &emit.atoms, &emit.atom_owners, &emit.debug);
     // An object's symbols by name, not in the order analysis or the
     // cache's loading found them, so that the object is a function of its
@@ -764,6 +767,55 @@ pub fn finish(emit: *Emit) !bool {
         try emit.error_values.append(emit.gpa, .{ .key = errorKey(ip, name), .value = try ip.errorValue(name) });
     }
     return true;
+}
+
+/// The name of a declaration's atom until `nameAtoms`: CodeGen runs while
+/// analysis can still rename the types names come from
+/// (docs/architecture.md, "Type names").
+pub const name_later: []const u8 = "(named later)";
+
+/// Names the atoms of declarations and functions made this build from the
+/// final names. A function's symbol name is upstream's: the declaration's
+/// qualified name, with `__func_` and a stable hash for an instance of a
+/// generic function (upstream numbers them by InternPool index), or its
+/// export name. Names may repeat, like upstream's local symbols; the
+/// atom's key is its identity.
+fn nameAtoms(emit: *Emit) !void {
+    const ip = &emit.zcu.ip;
+    const arena = emit.allocator();
+    // The last export of a declaration names its function.
+    var exported: std.AutoHashMapUnmanaged(InternPool.NavIndex, InternPool.String) = .empty;
+    defer exported.deinit(emit.gpa);
+    for (emit.zcu.exports.items) |x| if (x.target == .nav) try exported.put(emit.gpa, x.target.nav, x.name);
+    // Declarations share their parents' names.
+    var parents: std.AutoHashMapUnmanaged(Index, []const u8) = .empty;
+    defer parents.deinit(emit.gpa);
+    var aw: std.Io.Writer.Allocating = .init(emit.gpa);
+    defer aw.deinit();
+    for (emit.atoms.items, emit.atom_owners.items) |*atom, owner| {
+        if (atom.name.ptr != name_later.ptr) continue;
+        const nav_index, const func_index: Index = switch (owner.unit) {
+            .nav_val => |nav| .{ nav, .none },
+            .func => |f| .{ ip.keyPayload(.func, f).owner_nav, f },
+            else => unreachable,
+        };
+        const generic = func_index != .none and ip.keyPayload(.func, func_index).generic_owner != .none;
+        if (func_index != .none and !generic) if (exported.get(nav_index)) |name| {
+            atom.name = ip.stringSlice(name);
+            continue;
+        };
+        const nav = ip.getNav(nav_index);
+        const gop = try parents.getOrPut(emit.gpa, nav.parent);
+        if (!gop.found_existing) {
+            aw.clearRetainingCapacity();
+            print.writeTypeName(ip, nav.parent, &aw.writer, .render) catch return error.OutOfMemory;
+            gop.value_ptr.* = try arena.dupe(u8, aw.written());
+        }
+        atom.name = if (generic)
+            try std.fmt.allocPrint(arena, "{s}.{s}__func_{x:0>8}", .{ gop.value_ptr.*, ip.stringSlice(nav.name), @as(u32, @truncate(ip.stableHash(func_index))) })
+        else
+            try std.fmt.allocPrint(arena, "{s}.{s}", .{ gop.value_ptr.*, ip.stringSlice(nav.name) });
+    }
 }
 
 /// Links the atoms `finish` prepared into `sub_path`. Returns false, after
@@ -1396,7 +1448,7 @@ fn lowerNav(emit: *Emit, nav_index: InternPool.NavIndex) !void {
     refs.sort();
     try emit.addAtom(.{
         .key = .fromName(try emit.unitName(.{ .nav_val = nav_index })),
-        .name = ip.stringSlice(nav.fqn),
+        .name = name_later,
         .section = if (nav.is_threadlocal) .tdata else if (nav.is_const) .rodata else .data,
         .alignment = .fromByteUnits(if (nav.alignment != 0) nav.alignment else Type.abiAlignment(ip, ty)),
         .bytes = bytes,

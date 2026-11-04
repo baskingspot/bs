@@ -942,6 +942,15 @@ pub fn keepsNavData(r: *Replay, nav: InternPool.NavIndex) !bool {
 // Resolving items that name source
 
 /// The file input `input` is in this build, if it is loaded.
+/// Offers the names the loaded units' analysis offered last time
+/// (`Zcu.offerName`), for the types this build has, before
+/// `Zcu.finalizeNames` settles them. Not recorded yet: a type made from a
+/// result keeps its recorded name (`Resolver.container`).
+pub fn contributeNames(r: *Replay, zcu: *Zcu) !void {
+    _ = r;
+    _ = zcu;
+}
+
 pub fn fileOf(r: *Replay, input: u32) ?u32 {
     if (input >= r.input_files.len) return null;
     if (r.input_files[input] == 0) {
@@ -990,6 +999,12 @@ pub fn mapInst(r: *Replay, input: u32, inst: Zir.Inst.Index) ?Zir.Inst.Index {
 
 /// Creates the items that name source, as analysis would, without
 /// resolving anything (see "Serialized results").
+/// A type made from a result keeps the name the recording build gave it,
+/// whatever this build's creators offer, as the least creator would.
+fn recordedName(name: []const u8) Zcu.NameCandidate {
+    return .{ .creator = 0, .template = .{ .bytes = name } };
+}
+
 const Resolver = struct {
     r: *Replay,
 
@@ -1020,14 +1035,14 @@ const Resolver = struct {
                 .size = t.size,
                 .alignment = t.alignment,
             });
-            return try zcu.ip.get(Zcu.tid, .{ .enum_type = .{
+            return try zcu.internNamed(.{ .enum_type = .{
                 .file = file,
                 .zir_inst = inst,
                 .captures = try zcu.ip.arena(Zcu.tid).dupe(Index, c.captures),
-                .name = try zcu.ip.getString(Zcu.tid, c.name),
+                .name = undefined,
                 .key = try zcu.ip.getString(Zcu.tid, c.key),
                 .info = info,
-            } });
+            } }, recordedName(c.name));
         }
         const ck: Zcu.ContainerKind = switch (kind) {
             .struct_type => if (opcode == .struct_decl or opcode == .reify_struct) .@"struct" else return null,
@@ -1044,7 +1059,7 @@ const Resolver = struct {
             if (c.captures.len < 2) return null;
             zcu.ensureStructLayout(zcu.ip.typeOf(c.captures[1])) catch return null;
         }
-        const ty = try zcu.createContainerType(ck, file, inst, c.captures, c.name, c.key, parent_ns, c.reified_layout);
+        const ty = try zcu.createContainerType(ck, file, inst, c.captures, recordedName(c.name), c.key, parent_ns, c.reified_layout);
         // A reified type's fields come from its captures, as `@Struct` and
         // the like make them.
         if (c.reified_layout != null) try Sema.fillReifiedInfo(zcu, ty);
@@ -1073,5 +1088,9 @@ const Resolver = struct {
 
     pub fn intern(res: Resolver, key: InternPool.Key) !?Index {
         return try res.r.zcu.ip.get(Zcu.tid, key);
+    }
+
+    pub fn namedTuple(res: Resolver, key: InternPool.Key, name: []const u8) !?Index {
+        return try res.r.zcu.internNamed(key, recordedName(name));
     }
 };

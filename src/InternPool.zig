@@ -233,14 +233,51 @@ pub const String = enum(u32) {
 
 pub const NavIndex = enum(u32) { none = std.math.maxInt(u32), _ };
 pub const ContainerInfoIndex = enum(u32) { _ };
+pub const NameIndex = enum(u32) { none = std.math.maxInt(u32), _ };
+
+/// The display name of a container type or a named tuple, as upstream's
+/// `@typeName` renders it. Creators can name one type differently (a type
+/// that does not capture what tells its creators apart), and the name is
+/// the candidate of the least creator (docs/architecture.md, "Type
+/// names"), so it can change while analysis runs: read it through
+/// `print.zig`'s renderers, on the Sema thread or after analysis.
+pub const TypeName = struct {
+    /// The type it names; `.none` while the type is being interned.
+    ty: Index = .none,
+    /// Stable hash of the creator whose candidate this is: the least so far.
+    creator: Hash,
+    template: Template,
+    /// Whether analysis rendered the name (`print.Names.read`): if the
+    /// name changes afterwards, the build is redone with names pinned.
+    read: bool = false,
+    /// The final name of the last attempt, which a redone build renders.
+    pinned: ?[]const u8 = null,
+};
+
+/// A name with holes where other types' names go, rendered when read, so
+/// that renaming a type renames the types and declarations named after it.
+pub const Template = struct {
+    bytes: []const u8,
+    holes: []const Hole = &.{},
+
+    /// The name of container type or named tuple `ty` goes at `at`.
+    pub const Hole = struct { at: u32, ty: Index };
+
+    pub fn eql(a: Template, b: Template) bool {
+        if (!std.mem.eql(u8, a.bytes, b.bytes) or a.holes.len != b.holes.len) return false;
+        for (a.holes, b.holes) |x, y| if (x.at != y.at or x.ty != y.ty) return false;
+        return true;
+    }
+};
 
 pub const Nav = struct {
     /// Simple name of the declaration.
     name: String,
-    /// Fully qualified display name, for example `root:main.zig:Point.init`.
-    fqn: String,
-    /// Stable unit key. Equal to `fqn` except inside anonymous and generic
-    /// types, whose keys are not their display names.
+    /// The type whose namespace contains it. Its qualified display name is
+    /// the parent's name, a dot, and `name` (`print.writeNavName`).
+    parent: Index,
+    /// Stable unit key. Equal to the display name except inside anonymous
+    /// and generic types, whose keys are not their display names.
     key: String,
     file: u32,
     /// The `declaration` ZIR instruction.
@@ -427,8 +464,9 @@ pub const ContainerType = struct {
     zir_inst: Zir.Inst.Index,
     /// Values captured from enclosing scopes; part of the type's identity.
     captures: []const Index,
-    /// Display name, as upstream's `@typeName` renders it.
-    name: String,
+    /// Display name, as upstream's `@typeName` renders it. Not part of the
+    /// identity: an existing type keeps its own.
+    name: NameIndex,
     /// Stable key, used for the stable hash and the `type_layout` unit key.
     /// The fully qualified name for declared types; for anonymous types the
     /// enclosing declaration's key, the relative ZIR offset, and the
@@ -449,7 +487,7 @@ pub const TupleType = struct {
     /// node offset), and the type's name (`Parent__struct_<n>`).
     names: []const String = &.{},
     site: String = .empty,
-    name: String = .empty,
+    name: NameIndex = .none,
 };
 
 pub const FuncType = struct {
@@ -736,7 +774,8 @@ const Local = struct {
     limbs: List([]const Limb) = .{},
     navs: List(*Nav) = .{},
     structs: List(*ContainerInfo) = .{},
-    /// Owns string bytes, limbs, navs, and struct infos.
+    names: List(*TypeName) = .{},
+    /// Owns string bytes, limbs, navs, struct infos, and names.
     arena: std.heap.ArenaAllocator,
     /// Integers this thread interned recently, direct-mapped by type and
     /// value: `get` answers most integer keys (the walker's literals,
@@ -868,6 +907,7 @@ pub fn deinit(ip: *InternPool) void {
         l.limbs.deinit(gpa);
         l.navs.deinit(gpa);
         l.structs.deinit(gpa);
+        l.names.deinit(gpa);
         l.arena.deinit();
     }
     for (ip.shards) |*s| {
@@ -974,6 +1014,36 @@ pub fn structInfo(ip: *const InternPool, ty: Index) *ContainerInfo {
     });
     const u = ip.unwrapIndex(item.extra[item.data + 3]);
     return u.local.structs.view()[u.index];
+}
+
+/// A name for a type about to be interned (`ContainerType.name`,
+/// `TupleType.name`); the caller keeps `name`'s memory alive.
+pub fn createName(ip: *InternPool, tid: Tid, name: TypeName) !NameIndex {
+    const local = &ip.locals[@backingInt(tid)];
+    const ptr = try local.arena.allocator().create(TypeName);
+    ptr.* = name;
+    const i = try local.names.append(ip.gpa, ptr);
+    return @fromBackingInt(ip.wrap(tid, i));
+}
+
+/// The names thread `local` made, for the thread that made them or after.
+pub fn localNames(ip: *const InternPool, local: usize) []const *TypeName {
+    const l = &ip.locals[local].names;
+    return l.view()[0..l.len.load(.acquire)];
+}
+
+pub fn typeName(ip: *const InternPool, name: NameIndex) *TypeName {
+    const u = ip.unwrapIndex(@backingInt(name));
+    return u.local.names.view()[u.index];
+}
+
+/// The name of container type or named tuple `ty`.
+pub fn nameOf(ip: *const InternPool, ty: Index) *TypeName {
+    return ip.typeName(switch (ip.indexToKey(ty)) {
+        .struct_type, .enum_type, .union_type, .opaque_type => |c| c.name,
+        .tuple_type => |t| t.name,
+        else => unreachable,
+    });
 }
 
 /// The container key of a declared struct, enum, union, or opaque type.
@@ -1327,7 +1397,7 @@ inline fn decodeItem(ip: *const InternPool, comptime tag: Tag, index: Index, ite
             const c: ContainerType = .{
                 .file = extra[d],
                 .zir_inst = @fromBackingInt(extra[d + 1]),
-                .name = I.s(extra[d + 2]),
+                .name = @fromBackingInt(extra[d + 2]),
                 .info = @fromBackingInt(extra[d + 3]),
                 .key = I.s(extra[d + 5]),
                 .captures = @ptrCast(extra[d + 6 ..][0..extra[d + 4]]),
@@ -1348,7 +1418,7 @@ inline fn decodeItem(ip: *const InternPool, comptime tag: Tag, index: Index, ite
                 .values = @ptrCast(extra[d + 2 + len ..][0..len]),
                 .names = if (named) @ptrCast(extra[rest..][0..len]) else &.{},
                 .site = if (named) @fromBackingInt(extra[rest + len]) else .empty,
-                .name = if (named) @fromBackingInt(extra[rest + len + 1]) else .empty,
+                .name = if (named) @fromBackingInt(extra[rest + len + 1]) else .none,
             } };
         },
         .type_func => blk: {
