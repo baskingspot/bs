@@ -129,6 +129,44 @@ python3 bench/scoreboard.py --from-json bench/results/<date>-scoreboard.json \
 
 `--findings FILE` ends the report with a hand-written Markdown section.
 
+## `zap build` per scenario and phase (2026-11-04)
+
+Report: [`results/2026-11-04-build-phases.md`](results/2026-11-04-build-phases.md)
+(JSON next to it), from `bench/build_phases.py`: libvaxis (the wrapper
+above), zf, ziggy, tls.zig, zls, monstar (C and C++) and zap's own
+repository; each project's global cache warm. Median wall time, upstream
+zig 0.17.0 against zap before (13942f5) and after the zap-build-speed
+branch:
+
+| | first | no change | edit a .zig | edit build.zig |
+|---|---:|---:|---:|---:|
+| vaxis | 6.78 s / 1.10 s / 0.94 s | 29.7 / 34.3 / 9.3 ms | 1.19 s / 83 / 63 ms | 1.28 s / 115 / 61 ms |
+| ziggy | 3.81 s / 1.03 s / 0.85 s | 60.6 / 82.6 / 22.4 ms | 1.52 s / 140 / 73 ms | 1.36 s / 130 / 75 ms |
+| tls.zig | 9.94 s / 1.37 s / 1.18 s | 40.4 / 50.1 / 13.2 ms | 10.1 s / 274 / 202 ms | 1.22 s / 146 / 70 ms |
+| zls | 5.43 s / 1.77 s / 1.35 s | 26.7 / 33.4 / 10.8 ms | 3.06 s / 158 / 107 ms | 1.37 s / 154 / 80 ms |
+| monstar | 58.3 s / 16.0 s / 12.4 s | 179 / 689 / 158 ms | 31.5 s / 826 / 300 ms | 2.01 s / 722 / 210 ms |
+| zap | 17.9 s / 13.5 s / 12.6 s | 82.8 / 89.7 / 40.1 ms | 5.85 s / 288 / 228 ms | 1.40 s / 144 / 89 ms |
+
+- **Before, a no-change build lost to upstream** on every project but zf
+  (vaxis 34 ms against 30, monstar 689 against 179): the runner, which
+  zap built in Debug, spent most of its time capturing a DWARF-unwound
+  stack trace for every allocation, as Debug's `SafeAllocator` does. zap
+  now builds the runner in ReleaseSafe, as upstream does.
+- **Projects whose build script cannot be cached** (ziggy runs `git
+  describe`, monstar pkg-config, zap's own build.zig a process) rehash
+  every input of the configure script on every build; 700 of the 720 are
+  std and std.Build files of zap's pinned lib directory, which zap no
+  longer reports to the runner (docs/architecture.md, "Inputs under zap's
+  own lib directory"). The runner's phase on ziggy went 58 → 8 ms.
+- What is left of the runner phase (5–6 ms on a small project, upstream's
+  5–6 ms) is the runner's code, which zap compiles with its own code
+  generation: std's SipHash runs 4.7x, Wyhash 3.2x and
+  `mem.splitScalar` (bool-vector `simd.firstTrue`, scalarized) 10x slower
+  than upstream's ReleaseSafe build on a 64 MiB microbenchmark.
+- Startup is 0.5 ms against upstream's 7–8 ms (zap's check that the
+  runner is current against upstream's runner compilation's cache check),
+  and a cached compile step answers in about 2 ms against upstream's 7.
+
 ## Running
 
 ```sh
@@ -141,6 +179,12 @@ python3 bench/bench.py --compiler zig-out/bin/zap --machine-note "Amp orb, 4 vCP
 ```
 
 Useful options: `--workloads hello,vaxis,zig,std`, `--modes build-exe,zig-build`,
+
+`bench/build_phases.py` times `zig build`/`zap build` (`--zap PATH`) of
+real projects per scenario and splits each into phases with `perf`
+(needs `perf` and `kernel.perf_event_paranoid=-1`; see its docstring).
+
+Useful options: `--workloads hello,vaxis,zig`, `--modes build-exe,zig-build`,
 `--scenarios core` or a comma-separated list, `--runs`, `--cold-runs`,
 `--build-cold-runs`, `--env KEY=VALUE` (for every timed build, such as
 `ZAP_CACHE_DONOR=off`), `--out PATH` (without extension). Both modes run by
