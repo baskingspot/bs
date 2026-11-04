@@ -167,6 +167,40 @@ branch:
   runner is current against upstream's runner compilation's cache check),
   and a cached compile step answers in about 2 ms against upstream's 7.
 
+## C projects under `zap build` (2026-11-04)
+
+Upstream zig / zap, seconds, each project's global cache warm: cold-local
+(no `.zig-cache` or `zig-out`), then the median of three no-change builds,
+Zig edits (a `pub const` appended to the named file) and C edits (a
+comment appended to one vendored C file), measured with a scratch script
+in an orb (4 vCPU). The step each build runs is in parentheses.
+
+| project (step) | cold-local | no change | Zig edit | C edit |
+|---|---:|---:|---:|---:|
+| supermd (test; cmark-gfm, translate-c) | 69.15 / 1.03 | 0.09 / 0.02 | 1.66 / 0.32 | 1.94 / 0.41 |
+| zzz (all; BearSSL) | 12.48 / 3.88 | 0.11 / 0.09 | 3.70 / 0.20 | 3.68 / 0.17 |
+| zigmod (install; zlib, libyaml, translate-c) | 13.04 / 5.77 | 0.07 / 0.07 | 2.30 / 0.10 | 2.19 / 0.17 |
+| libxml2 (install; C-only library and executables) | 5.96 / 2.76 | 0.04 / 0.04 | n/a | 0.76 / 0.78 |
+| SDL3 (example; a 473-file C library) | 81.68 / 36.09 | 0.042 / 0.023 | 0.81 / 0.26 | 1.51 / 0.68 |
+| raylib (examples; C library, 213 C executables linking X11 and GL) | 52.19 / 36.93 | 4.96 / 2.50 | n/a | 39.64 / 5.62 |
+| raylib-zig (examples; Zig bindings over raylib) | 38.13 / 11.65 | 1.37 / 0.80 | 1.48 / 0.74 | n/a |
+
+- The first five rows are upstream 0.17.0 against zap 6667349 with
+  clib-cache; their no-change cells for supermd and SDL3 are reruns on
+  later mains (ReleaseSafe runner, a3a5737; SDL3's batch summary,
+  sdl-nochange). raylib and raylib-zig are upstream 0.17.1 against
+  d47bcde with static-l and cptr-int. raylib-zig takes raylib from a
+  package tarball, so it has no C edit.
+- **raylib's no-change builds are the build runner's `pkg-config`.**
+  The runner runs `pkg-config` for each system library of each compile
+  step (about 7,500 runs for raylib's 213 executables), as upstream's does;
+  zap runs upstream's runner unpatched, so both pay it. zap's own
+  processes take 0.45 s of the 2.50 s (2.5 ms median per step).
+- Cold builds win mostly in the build runner and the translate-c tool,
+  which upstream builds with LLVM. C edits win where upstream also
+  recompiles the Zig step, and on raylib, where an edit to the library
+  relinks all 213 executables.
+
 ## Running
 
 ```sh
