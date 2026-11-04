@@ -5292,7 +5292,12 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
   module (upstream's `Module.create` parent); std, builtin and the test
   runner take the main module's. CodeGen instruments the functions of
   modules with the flag (never compiler_rt or the fuzzer's family). If
-  any module has it, an executable links the fuzzer. One difference:
+  any module has it, a test links the fuzzer. A non-test executable is
+  instrumented but links no fuzzer, as upstream's default backend builds
+  one (its ELF linker leaves libfuzzer.a out; upstream's LLVM build pulls
+  it in for `__sancov_lowest_stack`, which LLVM's stack-depth
+  instrumentation names, and then fails on the
+  `runner_*` callbacks only the test runner defines). One difference:
   zap has one `builtin` per family, so `builtin.fuzz` is the main
   module's in every module, where upstream gives each module its own.
   `zig build --fuzz` passes `-ffuzz` ahead of the root module and a

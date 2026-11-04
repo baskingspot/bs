@@ -389,12 +389,13 @@ pub const Job = struct {
         }
         var job_opts = opts;
         job_opts.modules = modules;
-        // An executable that fuzzes links the fuzzer, whose module family
-        // has a builtin of its own, as upstream's separate compilation of
-        // it (a static library) does. As upstream's, a non-test executable
-        // fails to link: only the test runner provides the `runner_*`
-        // functions the fuzzer calls back.
-        const fuzzer_builtin_dir: ?[]const u8 = if (opts.fuzz and command != .build_obj and command != .build_lib)
+        // A test that fuzzes links the fuzzer, whose module family has a
+        // builtin of its own, as upstream's separate compilation of it (a
+        // static library) does. Only the test runner references the
+        // fuzzer and provides the `runner_*` functions it calls back, so
+        // a non-test executable links without it, as upstream's default
+        // backend links one (its linker leaves libfuzzer.a out).
+        const fuzzer_builtin_dir: ?[]const u8 = if (opts.fuzz and is_test)
             try Builtin.writeToCache(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }), .{
                 .output_mode = .Lib,
                 .is_test = false,
