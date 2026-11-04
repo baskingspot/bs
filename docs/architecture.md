@@ -4724,7 +4724,10 @@ after its Sema on the worker that claimed it.
 **Step 2, the logical stack and dependency loops.** Today "in progress"
 means "on my native stack", and code relies on that in these places:
 - `ensure*` returns `error.DependencyLoop`, which `Sema.depLoop` reports
-  at the innermost requester.
+  at the innermost requester. Its error lists the loop's requests from
+  `Zcu.dep_stack`, which is per compilation. In parallel it becomes per
+  worker; a loop is a hit on the logical stack, reported by the serial
+  rerun below, so the report never needs another worker's stack.
 - `errorSetNames` turns a `DependencyLoop` from `ensureFuncIes` into its
   own error, "unable to resolve inferred error set" (a failing reader).
 - `navRef` reads `nav.ty` of a resolving declaration (gone with
