@@ -80,10 +80,23 @@ operand, a branch, a builtin's argument or a literal, fixing the unused
 and never-mutated errors Zig reports after each edit. A 300-line program
 typically reduces to 10–30 lines in 10–30 minutes.
 
-## Following main
+## Following main and branches
 
 `--follow` builds bs from `origin/main` in a worktree under
 `.work/tree` (binaries cached per commit in `.work/bs/<sha>/`), checks
 for a new `origin/main` every 10 minutes, and when it moves rebuilds,
 rechecks every saved finding (marking fixed ones with `fixed_in` in
 their `meta.json`) and hunts with the new binary.
+
+With `--branches 'm7-*'`, every head of a matching branch that appears
+or moves while the hunter runs (the heads present on its first run are
+the baseline; `--branches-now` takes them too) gets a campaign of
+`--branch-programs` programs (2500 by default) before main resumes.
+A finding on a branch is run again with bs from main: if main agrees
+with upstream it is the branch's regression (`branch-miscompile` and so
+on), and its reduction keeps main agreeing. Campaign results are
+appended to `.work/campaigns.log`.
+
+```sh
+python3 tools/mchunt/hunt.py --follow --branches 'm7-*' --skip-branch m7-inline-cost
+```

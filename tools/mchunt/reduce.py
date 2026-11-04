@@ -47,8 +47,10 @@ def first_error(detail):
 
 
 class Property:
-    def __init__(self, tools, bad, up_kind, bad_kind, control=None, cls="miscompile", err=""):
+    def __init__(self, tools, bad, up_kind, bad_kind, control=None, cls="miscompile", err="", base=None):
         self.tools, self.bad, self.up_kind, self.bad_kind = tools, H.BY_NAME[bad], up_kind, bad_kind
+        # A branch's regression: bs from main (`base`) must keep agreeing.
+        self.base = base
         self.control = H.BY_NAME[control] if control else None
         self.cls, self.err = cls, err
         self.cache = {}
@@ -85,6 +87,10 @@ class Property:
             return False
         if self.control is not None:
             c = H.run_config(self.tools, self.control, src, self.scratch)
+            if c.key() != up.key():
+                return False
+        if self.base is not None:
+            c = H.run_config(self.base, self.bad, src, self.scratch)
             if c.key() != up.key():
                 return False
         return True
@@ -498,7 +504,11 @@ def property_for(meta, tools):
             control = c
             break
     cls = meta["class"]
-    return Property(tools, bad, norm_kind(up), norm_kind(b), control, cls, first_error(b.detail) if not b.compiled() else "")
+    base = None
+    if cls.startswith("branch-"):
+        cls = cls[len("branch-"):]
+        base = H.Tools(meta["base_bs"], tools.zig)
+    return Property(tools, bad, norm_kind(up), norm_kind(b), control, cls, first_error(b.detail) if not b.compiled() else "", base)
 
 
 def reduce_finding(d, bs=None, zig=None, minutes=90):
