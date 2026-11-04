@@ -2582,7 +2582,10 @@ object (`-fPIC`, `-dynamic`), *pie* code that ends up in an executable.
   relocates to `externAddrKey(name)` (local-exec), and the unit requests
   the name's slot, which the link binds and aliases (archive pulls,
   replay and relinks as for other externs). A definition that is not a
-  thread-local fails the link's TPOFF32 range check.
+  thread-local fails the link's TPOFF32 range check. A name a shared
+  library defines as a thread-local is imported, and the code reads its
+  offset initial-exec from the same slot C objects use (`mov dst, fs:0;
+  add dst, [rip + slot]`, `Encoder.leaThreadLocalSlot`).
 - The sequence is a call: in pic mode `CodeGen.clobbers` returns true for
   `tls_ptr`, so the allocator keeps nothing in rsi, rdi, r8 or r9 across
   it, as for calls; rax, rcx, rdx, r10 and r11 are scratch already, and no
@@ -2913,8 +2916,21 @@ symbol or a local becomes (section atom, value + addend).
   own linker leaves `_TLS_MODULE_BASE_` undefined; LLD links it. In a
   shared object, GD and LD stay
   (`x86_64_tlsgd`/`x86_64_tlsld`, the GOT pairs made by ElfDynamic). IE
-  in a shared object, and thread-locals imported from shared libraries,
-  are `[unsupported]` until something needs them.
+  in a shared object is `[unsupported]` until something needs it.
+- Thread-locals imported from shared libraries (built 2026-11-04;
+  ElfShared keeps STT_TLS symbols, and the import is STT_TLS in
+  .dynsym): initial-exec through a content-addressed 8-byte slot
+  (`tlsSlot`) whose `x86_64_tpoff64` relocation becomes R_X86_64_TPOFF64
+  against the import, so the loader writes the offset (the slot moves
+  to .data.rel.ro, as other loader-written slots). IE's `mov/add reg,
+  [rip + x@gottpoff]` reads the slot as is; GD's 16 bytes become `mov
+  rax, fs:0; add rax, [rip + slot]`; TLSDESC's lea becomes `mov rax,
+  [rip + slot]` and its call the nop, as ld relaxes them in an
+  executable. Upstream's own linker keeps GD (DTPMOD64/DTPOFF64) and
+  TLSDESC (R_X86_64_TLSDESC) dynamic and turns IE into TPOFF64; its
+  self-hosted backend miscompiles a Zig `extern threadlocal` such a
+  library defines (LLVM's IE code works). No corpus project needs this
+  yet; libstdc++'s `__once_callable` is one such variable.
 - GOTPC32/GOTOFF64 (large model), SIZE32/64 and the rest fail with an
   error naming the object, section and kind.
 - Copy relocations: code that reads an import's data with PC32 or 32S

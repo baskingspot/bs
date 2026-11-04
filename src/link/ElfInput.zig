@@ -911,19 +911,19 @@ fn Converter(comptime Ctx: type) type {
             }
             // TLS descriptors (-mtls-dialect=gnu2, GCC's default in some
             // distributions): `lea rax, [rip + x@tlsdesc]; call [rax]`
-            // leaves x's offset from the thread pointer in rax. Every
-            // thread-local of an executable is its own, so the lea becomes
-            // `mov rax, x@tpoff` and the call a 2-byte nop, as ld relaxes
-            // them. `_TLS_MODULE_BASE_`, the local-dynamic form's base,
-            // becomes 0: its DTPOFF32 offsets become TPOFF32 ones, as
-            // after a relaxed TLSLD.
+            // leaves x's offset from the thread pointer in rax. An
+            // executable's own thread-locals are in its static block, so
+            // the lea becomes `mov rax, x@tpoff` (local-exec), a shared
+            // library's `mov rax, [rip + slot]` (initial-exec, `tlsSlot`),
+            // and the call a 2-byte nop, as ld relaxes them.
+            // `_TLS_MODULE_BASE_`, the local-dynamic form's base, becomes
+            // 0: its DTPOFF32 offsets become TPOFF32 ones, as after a
+            // relaxed TLSLD.
             if (ty == @backingInt(R.TLSDESC_CALL)) {
                 if (off + 2 > bytes.len or !std.mem.eql(u8, bytes[@intCast(off)..][0..2], &.{ 0xff, 0x10 })) {
                     try c.unsupported(index, ty);
                     return 0;
                 }
-                // The lea of the import reports it.
-                if (try c.tlsDescImport(r, false)) return 0;
                 (try c.writable(bytes, copy))[@intCast(off)..][0..2].* = .{ 0x66, 0x90 };
                 return 0;
             }
@@ -935,22 +935,23 @@ fn Converter(comptime Ctx: type) type {
                     try c.unsupported(index, ty);
                     return 0;
                 }
-                if (try c.tlsDescImport(r, true)) return 0;
                 const b = try c.writable(bytes, copy);
-                b[@intCast(off - 3)..][0..3].* = .{ if (rex == 0x4c) 0x49 else 0x48, 0xc7, 0xc0 | (modrm >> 3 & 7) };
                 if (c.isTlsModuleBase(r.r_sym())) {
-                    b[@intCast(off)..][0..4].* = @splat(0);
+                    b[@intCast(off - 3)..][0..7].* = .{ if (rex == 0x4c) 0x49 else 0x48, 0xc7, 0xc0 | (modrm >> 3 & 7), 0, 0, 0, 0 };
                     return 0;
                 }
                 const t = try c.target(r.r_sym(), 0) orelse return 0;
+                if (t.import) {
+                    b[@intCast(off - 2)] = 0x8b; // lea -> mov
+                    try c.add(off, .x86_64_pc32, .{ .key = try c.tlsSlot(t), .offset = 0 }, r.r_addend);
+                    return 0;
+                }
+                b[@intCast(off - 3)..][0..3].* = .{ if (rex == 0x4c) 0x49 else 0x48, 0xc7, 0xc0 | (modrm >> 3 & 7) };
                 try c.add(off, .x86_64_tpoff32, t, 0);
                 return 0;
             }
             const t = try c.target(r.r_sym(), r.r_addend) orelse return 0;
-            if (t.import) {
-                try c.importReloc(index, r, bytes);
-                return 0;
-            }
+            if (t.import) return c.importReloc(index, relas, k, bytes, copy);
             switch (@as(R, @fromBackingInt(@intCast(ty)))) {
                 .@"64" => try c.add(off, .x86_64_abs64, t, r.r_addend),
                 .PC32, .PLT32 => try c.add(off, .x86_64_pc32, t, r.r_addend),
@@ -1045,8 +1046,13 @@ fn Converter(comptime Ctx: type) type {
         /// the slot. Data the code reaches PC-relative or by a 32-bit
         /// address (GCC's -fPIE and non-PIC code) is copied into the
         /// executable (`ctx.copySym`), and every reference then uses the
-        /// copy.
-        fn importReloc(c: *C, index: u32, r: elf.Elf64_Rela, bytes: []const u8) !void {
+        /// copy. A thread-local is reached initial-exec, through a slot
+        /// the loader writes its offset from the thread pointer into
+        /// (`tlsSlot`): ld's relaxations of general-dynamic to
+        /// initial-exec. Returns how many relocations after `k` the
+        /// rewrite consumed, as `reloc`.
+        fn importReloc(c: *C, index: u32, relas: []align(1) const elf.Elf64_Rela, k: usize, bytes: []const u8, copy: *?[]u8) !usize {
+            const r = relas[k];
             const o = c.o;
             const off = r.r_offset;
             const sym = o.syms[r.r_sym()];
@@ -1058,12 +1064,33 @@ fn Converter(comptime Ctx: type) type {
                 .GOTPCREL, .GOTPCRELX, .REX_GOTPCRELX => try c.add(off, .x86_64_pc32, .{ .key = try c.slot(t), .offset = 0 }, r.r_addend),
                 .PLT32, .PC32 => {
                     const op = if (off >= 1) bytes[@intCast(off - 1)] else 0;
-                    if (ty == .PLT32 or op == 0xe8 or op == 0xe9) return c.add(off, .x86_64_pc32, .{ .key = try c.stub(t), .offset = 0 }, r.r_addend);
-                    try c.add(off, .x86_64_pc32, .{ .key = try c.copied(index, sym) orelse return, .offset = 0 }, r.r_addend);
+                    if (ty == .PLT32 or op == 0xe8 or op == 0xe9) {
+                        try c.add(off, .x86_64_pc32, .{ .key = try c.stub(t), .offset = 0 }, r.r_addend);
+                        return 0;
+                    }
+                    try c.add(off, .x86_64_pc32, .{ .key = try c.copied(index, sym) orelse return 0, .offset = 0 }, r.r_addend);
                 },
-                .@"32", .@"32S" => try c.add(off, if (ty == .@"32") .x86_64_abs32 else .x86_64_abs32s, .{ .key = try c.copied(index, sym) orelse return, .offset = 0 }, r.r_addend),
+                .@"32", .@"32S" => try c.add(off, if (ty == .@"32") .x86_64_abs32 else .x86_64_abs32s, .{ .key = try c.copied(index, sym) orelse return 0, .offset = 0 }, r.r_addend),
+                // mov or add reg, [rip + x@gottpoff]: the slot is the GOT
+                // entry, as is.
+                .GOTTPOFF => try c.add(off, .x86_64_pc32, .{ .key = try c.tlsSlot(t), .offset = 0 }, r.r_addend),
+                .TLSGD => {
+                    const gd = [_]u8{ 0x66, 0x48, 0x8d, 0x3d };
+                    if (off < 4 or off + 12 > bytes.len or !std.mem.eql(u8, bytes[@intCast(off - 4)..][0..4], &gd) or
+                        !std.mem.eql(u8, bytes[@intCast(off + 4)..][0..4], &.{ 0x66, 0x66, 0x48, 0xe8 }) or !c.callsTlsGetAddr(relas, k, off + 8))
+                    {
+                        try c.unsupported(index, @backingInt(ty));
+                        return 0;
+                    }
+                    const b = try c.writable(bytes, copy);
+                    // mov rax, fs:0; add rax, [rip + x@gottpoff]
+                    b[@intCast(off - 4)..][0..16].* = .{ 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x03, 0x05, 0, 0, 0, 0 };
+                    try c.add(off + 8, .x86_64_pc32, .{ .key = try c.tlsSlot(t), .offset = 0 }, -4);
+                    return 1;
+                },
                 else => try c.fail("{s}: zap does not link relocation R_X86_64_{s} against {s}, which a shared library defines, yet", .{ o.path, @tagName(ty), o.symName(sym) }),
             }
+            return 0;
         }
 
         /// The executable's copy of the data object `sym` names, or null
@@ -1090,19 +1117,6 @@ fn Converter(comptime Ctx: type) type {
         /// Whether `s` is `_TLS_MODULE_BASE_`, which the linker defines.
         fn isTlsModuleBase(c: *C, s: u32) bool {
             return s < c.o.syms.len and std.mem.eql(u8, c.o.symName(c.o.syms[s]), "_TLS_MODULE_BASE_");
-        }
-
-        /// Whether a TLS descriptor relocation `r` names a shared library's
-        /// thread-local, which zap does not link yet (or an undefined
-        /// symbol), after reporting it if `report`.
-        fn tlsDescImport(c: *C, r: elf.Elf64_Rela, report: bool) !bool {
-            if (c.isTlsModuleBase(r.r_sym())) return false;
-            const t = try c.target(r.r_sym(), 0) orelse return true;
-            if (!t.import) return false;
-            if (!report) return true;
-            const name = c.o.symName(c.o.syms[r.r_sym()]);
-            try c.fail("{s}: zap does not link thread-local {s}, which a shared library defines, yet", .{ c.o.path, name });
-            return true;
         }
 
         /// Whether relocation `k + 1` is the call to `__tls_get_addr` at
@@ -1139,6 +1153,19 @@ fn Converter(comptime Ctx: type) type {
                 return t.key;
             };
             const relocs = try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, off)});
+            const zeros: []const u8 = &@as([8]u8, @splat(0));
+            const key: SymbolKey = .fromContents(.rodata, .@"8", zeros, targets, relocs);
+            try c.atoms.append(arena, .{ .key = key, .name = "", .section = .rodata, .alignment = .@"8", .bytes = zeros, .targets = targets, .relocs = relocs });
+            return key;
+        }
+
+        /// An 8-byte slot holding import `t`'s offset from the thread
+        /// pointer, which the loader writes (TPOFF64): initial-exec code's
+        /// GOT entry, content-addressed as `slot`.
+        fn tlsSlot(c: *C, t: Target) Allocator.Error!SymbolKey {
+            const arena = c.in.arena;
+            const targets = try arena.dupe(SymbolKey, &.{t.key});
+            const relocs = try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_tpoff64, 0, 0)});
             const zeros: []const u8 = &@as([8]u8, @splat(0));
             const key: SymbolKey = .fromContents(.rodata, .@"8", zeros, targets, relocs);
             try c.atoms.append(arena, .{ .key = key, .name = "", .section = .rodata, .alignment = .@"8", .bytes = zeros, .targets = targets, .relocs = relocs });

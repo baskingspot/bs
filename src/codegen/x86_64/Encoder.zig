@@ -422,6 +422,17 @@ pub fn leaThreadLocalDynamic(e: *Encoder, dst: Reg, sym: SymbolKey, get_addr: Sy
 /// initial-exec model: `mov dst, fs:0; add dst, [rip + sym@gottpoff]`,
 /// the form linkers relax to local-exec when the executable defines it.
 pub fn leaThreadLocalInitial(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
+    return e.threadLocalFromSlot(dst, sym, .x86_64_gottpoff);
+}
+
+/// `leaThreadLocalInitial` through `slot`, an executable's own atom
+/// holding the variable's offset from the thread pointer: `mov dst, fs:0;
+/// add dst, [rip + slot]`.
+pub fn leaThreadLocalSlot(e: *Encoder, dst: Reg, slot: SymbolKey) !void {
+    return e.threadLocalFromSlot(dst, slot, .x86_64_pc32);
+}
+
+fn threadLocalFromSlot(e: *Encoder, dst: Reg, sym: SymbolKey, kind: Atom.Reloc.Kind) !void {
     try e.reserve();
     e.byte(0x64);
     e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
@@ -433,7 +444,7 @@ pub fn leaThreadLocalInitial(e: *Encoder, dst: Reg, sym: SymbolKey) !void {
     e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
     e.byte(0x03);
     e.byte(modrmByte(0b00, dst.low(), 0b101)); // [rip + disp32]
-    try e.reloc(.x86_64_gottpoff, sym, -4);
+    try e.reloc(kind, sym, -4);
     e.int(u32, 0);
 }
 

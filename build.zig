@@ -1393,6 +1393,32 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&r.step);
     }
 
+    // A shared library's thread-local, reached from Zig and from C objects
+    // of each TLS model (general-dynamic, descriptors, initial-exec), all
+    // through one initial-exec slot the loader writes (TPOFF64). Upstream
+    // prints the same with LLVM; its own backend miscompiles the Zig read.
+    {
+        const so = b.addSystemCommand(&.{ zig, "cc", "-shared", "-fPIC", "-Wl,-soname,libsotls.so" });
+        so.addFileArg(b.path("test/link_input/so_tls.c"));
+        const lib_dir = so.addPrefixedOutputFileArg("-o", "libsotls.so").dirname();
+        const so_exe = b.addRunArtifact(zap);
+        so_exe.addArgs(&.{ "build-exe", "-lc", "-lsotls" });
+        so_exe.addPrefixedDirectoryArg("-L", lib_dir);
+        so_exe.addFileArg(b.path("test/link_input/so_tls_main.zig"));
+        for ([_][]const []const u8{ &.{ "-fPIC", "-DSUFFIX=_gd" }, &.{ "-fPIC", "-mtls-dialect=gnu2", "-DSUFFIX=_desc" }, &.{ "-fPIC", "-ftls-model=initial-exec", "-DSUFFIX=_ie" } }, [_][]const u8{ "gd", "desc", "ie" }) |flags, name| {
+            const user = b.addSystemCommand(&.{ zig, "cc", "-c" });
+            user.addArgs(flags);
+            user.addFileArg(b.path("test/link_input/so_tls_user.c"));
+            so_exe.addFileArg(user.addPrefixedOutputFileArg("-o", b.fmt("so_tls_{s}.o", .{name})));
+        }
+        so_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, "run zap link of a shared library's thread-local");
+        r.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addCheck(.{ .expect_stderr_exact = "main: 3 3 3 3 103\nset: 1114 1114 1114 1114 1214\nthread: 3 3 3 3 103\nafter: 1114 1114 1114 1114 1214\n" });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
+
     // Constructors run in priority order across two objects, before main;
     // the destructor runs only with -lc, whose exit runs the fini array.
     var ctors: [2]std.Build.LazyPath = undefined;

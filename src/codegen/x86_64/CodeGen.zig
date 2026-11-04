@@ -2569,7 +2569,9 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             // module's variable: a call (`clobbers`). An executable has
             // its own variables in its static block, and finds another
             // module's through the GOT.
-            if (t.local) {
+            if (t.slot) {
+                try cg.e.leaThreadLocalSlot(d, t.key);
+            } else if (t.local) {
                 if (cg.emit.pic == .pic) try cg.e.leaThreadLocalDynamic(d, t.key, try cg.emit.tlsGetAddr()) else try cg.e.leaThreadLocal(d, t.key);
             } else switch (cg.emit.pic) {
                 .none => try cg.e.leaThreadLocal(d, t.key),

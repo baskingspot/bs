@@ -238,6 +238,12 @@ pub const Reloc = extern struct {
         /// sign-extended and checked to fit i32 (R_X86_64_32S).
         x86_64_abs32,
         x86_64_abs32s,
+        /// 64-bit offset of thread-local S from the thread pointer, in an
+        /// executable's slot for initial-exec code: S + A - TLS end for
+        /// the image's own S; for an import (a shared library's
+        /// thread-local, A = 0) the loader writes it (ELF
+        /// R_X86_64_TPOFF64).
+        x86_64_tpoff64,
     };
 };
 

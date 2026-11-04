@@ -24,6 +24,9 @@ pub const Symbol = struct {
     /// A data object, which non-PIC code may need copied into the
     /// executable, `size` bytes at `value` (where its aliases are too).
     object: bool,
+    /// A thread-local (STT_TLS), which an executable reaches through a
+    /// slot the loader writes its thread-pointer offset into (TPOFF64).
+    tls: bool = false,
     size: u64,
     value: u64,
 };
@@ -101,9 +104,6 @@ pub fn parse(arena: Allocator, path: []const u8, bytes: []const u8) Error!Shared
         }
         // Default or protected visibility.
         if (sym.st_other & 3 != 0 and sym.st_other & 3 != 3) continue;
-        // Thread-locals from shared libraries are not supported yet: such
-        // a name stays undefined.
-        if (sym.st_type() == elf.STT_TLS) continue;
         var version: ?[]const u8 = null;
         if (i < versym.len) {
             // Hidden (non-default) versions and local symbols do not bind
@@ -115,7 +115,7 @@ pub fn parse(arena: Allocator, path: []const u8, bytes: []const u8) Error!Shared
         if (name.len == 0) continue;
         const gop = try lib.symbols.getOrPut(arena, name);
         if (gop.found_existing) continue;
-        gop.value_ptr.* = .{ .version = version, .object = sym.st_type() == elf.STT_OBJECT, .size = sym.st_size, .value = sym.st_value };
+        gop.value_ptr.* = .{ .version = version, .object = sym.st_type() == elf.STT_OBJECT, .tls = sym.st_type() == elf.STT_TLS, .size = sym.st_size, .value = sym.st_value };
     }
     return lib;
 }

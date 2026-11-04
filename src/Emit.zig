@@ -897,7 +897,7 @@ const InputResolver = struct {
     /// With `-lc`, the shared libraries' and glibc's symbols, imported.
     pub fn importSym(r: InputResolver, name: []const u8, weak: bool) !?SymbolKey {
         if (!r.emit.libraryDefines(name)) return null;
-        return try r.emit.useImport(name, .{ .weak = weak });
+        return try r.emit.useImport(name, .{ .weak = weak, .tls = r.emit.sharedTls(name) });
     }
 
     /// The executable's copy of a shared library's data object `name`, an
@@ -1451,17 +1451,27 @@ pub const TlsTarget = struct {
     key: SymbolKey,
     /// Defined in the module the final link makes: the compilation's own.
     local: bool,
+    /// `key` is an executable's slot holding the variable's offset from
+    /// the thread pointer (a shared library's thread-local, initial-exec).
+    slot: bool = false,
 };
 
 /// The thread-local an `extern threadlocal` names: the compilation's
 /// export of that name; in an object an import, which the final link
 /// resolves; in an executable with link inputs, the definition the link
 /// binds `name`'s slot to (an input object's), through `externAddrKey`,
-/// as a constant's address of extern data. zap's executables and shared
+/// as a constant's address of extern data. An executable imports a shared
+/// library's thread-local, through a content-addressed slot the loader
+/// writes (TPOFF64; ElfInput's `tlsSlot` is the same atom). zap's shared
 /// objects import no thread-locals.
 pub fn tlsTarget(emit: *Emit, name: []const u8) !TlsTarget {
     if (try emit.userExport(name)) |key| return .{ .key = key, .local = true };
     if (emit.obj and !emit.shared) return .{ .key = try emit.useImport(name, .{ .tls = true }), .local = false };
+    if (!emit.obj and emit.sharedTls(name)) {
+        const imp = try emit.useImport(name, .{ .tls = true });
+        const zeros: [8]u8 = @splat(0);
+        return .{ .key = try emit.contentAtom(8, &zeros, &.{imp}, &.{.init(0, .x86_64_tpoff64, 0, 0)}), .local = false, .slot = true };
+    }
     if (emit.has_inputs) {
         _ = try emit.useExtern(name, false);
         return .{ .key = externAddrKey(name), .local = true };
@@ -1650,6 +1660,12 @@ pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
     if (emit.libraryDefines(name)) return try emit.useImport(name, .{});
     if (emit.shared) return try emit.useImport(name, .{});
     return null;
+}
+
+/// Whether one of an executable's shared libraries defines thread-local
+/// `name`.
+fn sharedTls(emit: *const Emit, name: []const u8) bool {
+    return if (Glibc.sharedSymbol(emit.shared_libs, name)) |s| s.sym.tls else false;
 }
 
 /// Whether an executable that links glibc imports `name`: one of its

@@ -595,6 +595,10 @@ const Tls = struct {
     ld_got: ?u64 = null,
     /// `Options.object`.
     object: bool = false,
+    /// An executable's imports' stand-ins (`Link.plt_start`): a
+    /// `x86_64_tpoff64` slot for one is the loader's to write.
+    imports_start: u64 = 0,
+    imports_end: u64 = 0,
 };
 /// Where pass 1 placed an atom.
 const Place = packed struct(u64) {
@@ -1047,6 +1051,10 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         // relocation; a PC-relative one overflows).
         l.plt_start = if (exe_dyn) exe_import_base else base + plt_off;
         l.plt_end = l.plt_start + n_imports * ElfDynamic.plt_entry_size;
+        if (exe_dyn) {
+            l.tls.imports_start = l.plt_start;
+            l.tls.imports_end = l.plt_end;
+        }
         l.rela_off = rela_off;
         // Imports resolve to their PLT stubs; absolute relocations to
         // them become symbol relocations.
@@ -1883,19 +1891,24 @@ fn LinkOf(comptime Input: type) type {
         }
 
         /// Whether absolute relocation `r` of `a` needs the loader: in a
-        /// shared object every one, in an executable those to imports.
+        /// shared object every one, in an executable those to imports,
+        /// and an executable's thread-pointer offsets of imports.
         fn needsDynamicReloc(l: *const Link, a: *const Atom, r: Atom.Reloc) bool {
-            if (r.info.kind != .x86_64_abs64) return false;
+            switch (r.info.kind) {
+                .x86_64_abs64 => {},
+                .x86_64_tpoff64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
+                else => return false,
+            }
             const imports = l.exe_imports orelse return true;
             return isImport(imports, a.targets[r.info.target]);
         }
 
-        /// In an executable, whether `a` holds an absolute address of an
-        /// import, which the loader writes.
+        /// In an executable, whether `a` holds an absolute address or a
+        /// thread-pointer offset of an import, which the loader writes.
         fn hasImportAbs(l: *const Link, a: *const Atom) bool {
             const imports = l.exe_imports orelse return false;
             for (a.relocs) |r| {
-                if (r.info.kind == .x86_64_abs64 and isImport(imports, a.targets[r.info.target])) return true;
+                if ((r.info.kind == .x86_64_abs64 or r.info.kind == .x86_64_tpoff64) and isImport(imports, a.targets[r.info.target])) return true;
             }
             return false;
         }
@@ -2187,7 +2200,7 @@ fn LinkOf(comptime Input: type) type {
                         const t = res[r.info.target];
                         const v = t +% @as(u64, @bitCast(@as(i64, r.addend)));
                         const rec: elf.Elf64.Rela = if (t >= l.plt_start and t < l.plt_end)
-                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.@"64"), .sym = @intCast(1 + (t - l.plt_start) / ElfDynamic.plt_entry_size) }, .addend = r.addend }
+                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(if (r.info.kind == .x86_64_tpoff64) elf.R_X86_64.TPOFF64 else elf.R_X86_64.@"64"), .sym = @intCast(1 + (t - l.plt_start) / ElfDynamic.plt_entry_size) }, .addend = r.addend }
                         else
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.RELATIVE), .sym = 0 }, .addend = @bitCast(v) };
                         writeStruct(out[rela][rela_at..], rec);
@@ -2428,6 +2441,7 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 std.mem.writeInt(i32, f, std.math.cast(i32, @as(i128, s) + r.addend) orelse return overflow(a, r, diag), .little);
             },
             .x86_64_tpoff32 => try tpoff32(a, r, dst, s, tls, diag),
+            .x86_64_tpoff64 => try tpoff64(a, r, dst, s, tls, diag),
             .x86_64_tlsld, .x86_64_dtpoff32 => try tlsDynamic(a, r, dst, p_base, s, tls, diag),
             // Only objects reach another module's thread-locals.
             .x86_64_gottpoff, .x86_64_tlsgd => if (!tls.object) return invalidReloc(a, diag),
@@ -2464,6 +2478,20 @@ noinline fn tpoff32(a: *const Atom, r: Atom.Reloc, dst: []u8, s: u64, tls: *cons
     }
     const v = @as(i64, @bitCast(s -% tls.tp)) +% r.addend;
     std.mem.writeInt(i32, f, std.math.cast(i32, v) orelse return overflow(a, r, diag), .little);
+}
+
+/// An executable's slot for initial-exec code: the image's own thread-local
+/// has its offset now; an import's is the loader's (`needsDynamicReloc`).
+noinline fn tpoff64(a: *const Atom, r: Atom.Reloc, dst: []u8, s: u64, tls: *const Tls, diag: *Diagnostic) Error!void {
+    const f = try relocField(a, dst, r.offset, 8, diag);
+    if (s >= tls.start and s < tls.end and !tls.object) {
+        std.mem.writeInt(i64, f, @as(i64, @bitCast(s -% tls.tp)) +% r.addend, .little);
+    } else if (s >= tls.imports_start and s < tls.imports_end and r.addend == 0) {
+        @memset(f, 0);
+    } else {
+        diag.* = .{ .atom = a.name, .target = a.targets[r.info.target] };
+        return error.InvalidRelocation;
+    }
 }
 
 /// Whether `a` holds an absolute address, which a position-independent

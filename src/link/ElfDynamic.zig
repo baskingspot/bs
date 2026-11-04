@@ -52,7 +52,8 @@ pub const Import = struct {
     /// (STV_HIDDEN, and R_X86_64_PC32 rather than PLT32). Only objects
     /// have hidden imports.
     hidden: bool = false,
-    /// A thread-local (STT_TLS). Only objects import thread-locals.
+    /// A thread-local (STT_TLS): in an executable, reached through slots
+    /// the loader writes with TPOFF64 relocations.
     tls: bool = false,
     /// In an executable: the symbol version the import binds to
     /// (`GLIBC_2.2.5`), or null for none, and the index in
@@ -310,7 +311,7 @@ pub fn writeSymbols(out: []u8, t: *const Tables, o: Options, defined: []const De
     syms[0] = std.mem.zeroes(elf.Elf64.Sym);
     for (o.imports, 1.., t.names[0..t.n_imports]) |imp, k, name| syms[k] = .{
         .name = name,
-        .info = .{ .type = .NOTYPE, .bind = if (imp.weak) .WEAK else .GLOBAL },
+        .info = .{ .type = if (imp.tls) .TLS else .NOTYPE, .bind = if (imp.weak) .WEAK else .GLOBAL },
         .other = .{ .visibility = .DEFAULT },
         .shndx = elf.SHN_UNDEF,
         .value = 0,
