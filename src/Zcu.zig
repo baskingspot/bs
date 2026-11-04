@@ -49,6 +49,11 @@ string_cache: []StringCacheEntry = &.{},
 /// The pointer `Sema.navRef` makes to each resolved declaration, which
 /// code takes again and again. Sema-only.
 nav_ptrs: std.AutoHashMapUnmanaged(InternPool.NavIndex, InternPool.Index) = .empty,
+/// The container types each tuple type holds by value, through arrays,
+/// optionals, error unions and tuples, each once, in the order a walk of
+/// its fields first meets them (`Sema.tupleContainers`): a ZON import's
+/// type can be a tuple of thousands of tuples. Sema-only.
+tuple_containers: std.AutoHashMapUnmanaged(InternPool.Index, []const InternPool.Index) = .empty,
 /// The const pointer `Sema.analyzeRef` makes to each comptime-known value:
 /// code evaluated again and again takes the same values' addresses
 /// (`@typeInfo(T).@"struct".fields`, a method call on a constant).
@@ -480,6 +485,7 @@ pub fn deinit(zcu: *Zcu) void {
     zcu.defaults_queue.deinit(gpa);
     zcu.phase_deps.deinit(gpa);
     zcu.nav_ptrs.deinit(gpa);
+    zcu.tuple_containers.deinit(gpa);
     zcu.uav_refs.deinit(gpa);
     zcu.ref_ptr_types.deinit(gpa);
     zcu.effect_uses.deinit(gpa);

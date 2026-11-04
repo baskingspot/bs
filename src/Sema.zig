@@ -3032,7 +3032,37 @@ fn resolveLayoutIfIdle(sema: *Sema, block: *Block, src: Src, ty: Index) CompileE
         .array_type => try sema.resolveLayoutIfIdle(block, src, ip.keyPayload(.array_type, ty).child),
         .opt_type => try sema.resolveLayoutIfIdle(block, src, ip.keyPayload(.opt_type, ty)),
         .error_union_type => try sema.resolveLayoutIfIdle(block, src, ip.keyPayload(.error_union_type, ty).payload_type),
-        .tuple_type => for (ip.keyPayload(.tuple_type, ty).types) |ft| try sema.resolveLayoutIfIdle(block, src, ft),
+        // Each container once: resolving one twice changes nothing.
+        .tuple_type => for (try sema.tupleContainers(ty)) |c| try sema.resolveLayoutIfIdle(block, src, c),
+        else => {},
+    }
+}
+
+/// `Zcu.tuple_containers` of tuple type `ty`.
+fn tupleContainers(sema: *Sema, ty: Index) Allocator.Error![]const Index {
+    const zcu = sema.zcu;
+    if (zcu.tuple_containers.get(ty)) |list| return list;
+    var list: std.ArrayList(Index) = .empty;
+    defer list.deinit(sema.gpa);
+    var seen: std.AutoHashMapUnmanaged(Index, void) = .empty;
+    defer seen.deinit(sema.gpa);
+    for (sema.ip.keyPayload(.tuple_type, ty).types) |ft| try sema.collectContainers(ft, &list, &seen);
+    const owned = try zcu.arena.allocator().dupe(Index, list.items);
+    try zcu.tuple_containers.put(sema.gpa, ty, owned);
+    return owned;
+}
+
+fn collectContainers(sema: *Sema, ty: Index, list: *std.ArrayList(Index), seen: *std.AutoHashMapUnmanaged(Index, void)) Allocator.Error!void {
+    const ip = sema.ip;
+    switch (ip.keyTag(ty)) {
+        .struct_type, .enum_type, .union_type => if (!(try seen.getOrPut(sema.gpa, ty)).found_existing) try list.append(sema.gpa, ty),
+        .array_type => try sema.collectContainers(ip.keyPayload(.array_type, ty).child, list, seen),
+        .opt_type => try sema.collectContainers(ip.keyPayload(.opt_type, ty), list, seen),
+        .error_union_type => try sema.collectContainers(ip.keyPayload(.error_union_type, ty).payload_type, list, seen),
+        // A nested tuple once, from its own list.
+        .tuple_type => if (!(try seen.getOrPut(sema.gpa, ty)).found_existing) for (try sema.tupleContainers(ty)) |c| {
+            if (!(try seen.getOrPut(sema.gpa, c)).found_existing) try list.append(sema.gpa, c);
+        },
         else => {},
     }
 }
