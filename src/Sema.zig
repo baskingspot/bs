@@ -8738,8 +8738,21 @@ fn sameScalarRepr(sema: *Sema, a: Index, b: Index) bool {
 fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (src == dst or sema.sameScalarRepr(src, dst)) return true;
     const ip = sema.ip;
+    // Error sets are error codes: a set reads as a superset of it, and an
+    // error union as one with a superset and a coercible payload, as
+    // upstream (`*const anyerror` from `*error{Foo}`).
+    if (Type.class(ip, src) == .error_set and Type.class(ip, dst) == .error_set) {
+        if (dst == .anyerror_type) return true;
+        const sn = ip.keyAs(.error_set_type, src) orelse return false;
+        const dn = ip.keyAs(.error_set_type, dst) orelse return false;
+        for (sn) |n| if (std.mem.indexOfScalar(InternPool.String, dn, n) == null) return false;
+        return true;
+    }
     const sk = ip.indexToKey(src);
     const dk = ip.indexToKey(dst);
+    if (sk == .error_union_type and dk == .error_union_type)
+        return sema.childCoercibleInMemory(sk.error_union_type.error_set_type, dk.error_union_type.error_set_type) and
+            sema.childCoercibleInMemory(sk.error_union_type.payload_type, dk.error_union_type.payload_type);
     if (sk == .opt_type and dk == .opt_type) {
         const sc = sk.opt_type;
         const dc = dk.opt_type;
@@ -8764,7 +8777,8 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (s.flags.size != d.flags.size) return false;
     if (s.flags.is_const and !d.flags.is_const) return false;
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
-    if (s.flags.is_allowzero != d.flags.is_allowzero) return false;
+    // Read only, a pointer may also allow zero.
+    if (s.flags.is_allowzero and !d.flags.is_allowzero) return false;
     if (@as(u32, @bitCast(s.packed_offset)) != @as(u32, @bitCast(d.packed_offset))) return false;
     if (s.flags.alignment != d.flags.alignment) {
         // The alignment may only decrease.
