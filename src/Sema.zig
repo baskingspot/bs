@@ -15972,23 +15972,23 @@ noinline fn failExpectedErrorUnion(sema: *Sema, block: *Block, src: Src, ty: Ind
     return err;
 }
 
-/// Whether `ref` is the result of a run-time call to a function outside
-/// std whose body has a `try` or a `return error.X`: its return type is
+/// The function, outside std, that `ref` is the result of a run-time call
+/// to, if its body has a `try` or a `return error.X`: its return type is
 /// missing a `!` (the "cannot return an error" fix), so the caller's `try`
 /// is right.
-fn callsErrorBody(sema: *Sema, ref: Ref) !bool {
-    const inst = ref.toIndex() orelse return false;
-    if (sema.ir_insts.items(.tag)[@backingInt(inst)] != .call) return false;
-    const callee = sema.resolveValue(sema.ir_insts.items(.data)[@backingInt(inst)].pl_op.operand) orelse return false;
-    const f = sema.ip.keyAs(.func, callee) orelse return false;
+fn callsErrorBody(sema: *Sema, ref: Ref) !?Index {
+    const inst = ref.toIndex() orelse return null;
+    if (sema.ir_insts.items(.tag)[@backingInt(inst)] != .call) return null;
+    const callee = sema.resolveValue(sema.ir_insts.items(.data)[@backingInt(inst)].pl_op.operand) orelse return null;
+    const f = sema.ip.keyAs(.func, callee) orelse return null;
     const nav = sema.ip.getNav(f.owner_nav);
     // std is not edited, so its return types stay.
-    if (sema.inLib(nav.file)) return false;
+    if (sema.inLib(nav.file)) return null;
     const tree = try sema.zcu.fe.tree(@fromBackingInt(nav.file));
     const node = sema.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_node;
     // The declaration's node is the prototype; the body's braces follow.
     var tok = tree.lastToken(node) + 1;
-    if (tree.tokenTag(tok) != .l_brace) return false;
+    if (tree.tokenTag(tok) != .l_brace) return null;
     var depth: usize = 0;
     while (tok < tree.tokens.len) : (tok += 1) switch (tree.tokenTag(tok)) {
         .l_brace => depth += 1,
@@ -15996,11 +15996,11 @@ fn callsErrorBody(sema: *Sema, ref: Ref) !bool {
             depth -= 1;
             if (depth == 0) break;
         },
-        .keyword_try => return true,
-        .keyword_return => if (tree.tokenTag(tok + 1) == .keyword_error) return true,
+        .keyword_try => return callee,
+        .keyword_return => if (tree.tokenTag(tok + 1) == .keyword_error) return callee,
         else => {},
     };
-    return false;
+    return null;
 }
 
 /// `try eu`, or with `is_ptr`, `(try eu).field` and the like: the operand
@@ -16020,7 +16020,9 @@ fn zirTry(sema: *Sema, parent: *Block, inst: Zir.Inst.Index, is_ptr: bool) Compi
         const operand_span = src.operandSrc(0).span(tree);
         try sema.zcu.addNote(sema.file, operand_span, "consider omitting 'try'", .{});
         // Delete the `try `, unless the callee is what lacks the `!`.
-        if (!try sema.callsErrorBody(eu)) sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(@import("diag.zig").RawEdit, &.{.{ .start = src.span(tree).main, .end = operand_span.start, .text = "" }}) };
+        if (try sema.callsErrorBody(eu)) |callee| {
+            if (try sema.fnTypeExprSrc(callee, null)) |loc| try sema.zcu.addDeclNote(loc.file, loc.span, "the function returns errors, but its return type has no '!'", .{});
+        } else sema.zcu.errors.items[sema.zcu.errors.items.len - 1].fix = .{ .applicability = .maybe, .edits = try sema.zcu.arena.allocator().dupe(@import("diag.zig").RawEdit, &.{.{ .start = src.span(tree).main, .end = operand_span.start, .text = "" }}) };
         return err;
     }
     const is_non_err = try sema.analyzeIsNonErr(parent, src, eu);

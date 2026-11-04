@@ -79,4 +79,5 @@ pub fn main() !void {
 // error_union.zig:43:22: error[operand-type]: expected error union type, found 'u8'
 //   | _ = try firstChar("zig");
 //   note error_union.zig:43:22: consider omitting 'try'
+//   note error_union.zig:7:29: the function returns errors, but its return type has no '!': fn firstChar(s: []const u8) u8 {
 // 8 errors
