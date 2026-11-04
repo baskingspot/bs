@@ -416,6 +416,19 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   escape is upstream's "runtime value contains reference to comptime var"
   error. Memoized comptime calls don't memoize when an argument or the result
   points into comptime-mutable memory.
+- Declarations (`Nav`s) are made when first looked up. Creating a
+  container type lists its named declarations in its namespace
+  (`Namespace.decls`, in ZIR order, `.none` for one not made yet, with
+  `decl_insts`) and makes only the exported and test ones, which are
+  effects; `Zcu.declNav` makes the others when a lookup or a cache
+  subject names them. A lazy zls edit build resolves 897 of the 8207
+  declarations its namespaces list. A nav's identity is its key
+  (`Namespace.decl_prefix` and its name), so the order navs are made in
+  changes no result. Readers that need only a declaration's name, key or
+  `pub` take them from the namespace and the ZIR without making it
+  (`Zcu.declKey`, `Zcu.declIsPub`): `@typeInfo`'s `decl_names`, the
+  `namespace` and `namespace_name` dependees' result hashes, and
+  `Replay.navByKey`.
 
 ### Typed IR (`Ir`)
 
@@ -5232,6 +5245,7 @@ sets them:
 | Struct defaults | `ContainerInfo.defaults_status` | the same field, atomic |
 | Function body and its inferred error set | `Zcu.funcs`: queued, in_progress, done, failed | a sharded map from function to a state word in per-worker chunked storage, so map growth never moves a word |
 | A container's namespace | `createContainerType` checks `si.namespace` and then creates it | a namespace phase in the ContainerInfo, claimed the same way. The ContainerInfo a losing creator made before its lookup is dropped |
+| A declaration's nav | `Zcu.declNav` checks the `decls` slot for `.none` and then makes it | CAS on the slot from `.none` to the new NavIndex; a losing creator's nav is left unused |
 | A file's root type | `file_root_types` slot, create-once | CAS on the slot. The array grows only at serial points (compiler_rt file loads) |
 | `comptime` declarations | `comptime_decls` (only `.queued` is written) and `analyzeAll`'s cursor | unchanged: only the coordinator analyzes them, still through claims for what they reach |
 

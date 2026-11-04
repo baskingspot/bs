@@ -78,9 +78,10 @@ dependees: []?Zcu.Dependee,
 unit_nodes: std.AutoHashMapUnmanaged(Zcu.AnalUnit, u32) = .empty,
 decoder: results.Decoder(Resolver),
 keyer: Incremental.Keyer,
-/// Declarations by `Atom.SymbolKey.fromName(nav.key)`, to refresh inlined
-/// callees' lines: those of the first `navs_indexed` namespaces.
-navs_by_key: std.AutoHashMapUnmanaged(Atom.SymbolKey, InternPool.NavIndex) = .empty,
+/// Declarations (their namespace and index in its `decls`) by
+/// `Atom.SymbolKey.fromName(nav.key)`, to refresh inlined callees' lines:
+/// those of the first `navs_indexed` namespaces.
+navs_by_key: std.AutoHashMapUnmanaged(Atom.SymbolKey, struct { ns: u32, i: u32 }) = .empty,
 navs_indexed: usize = 0,
 deps: std.ArrayList(Zcu.Dependee) = .empty,
 /// A lazy edit build (step 4b): green units are not loaded unless an
@@ -611,11 +612,15 @@ pub fn refreshInlines(r: *Replay, d: *const Atom.Debug) !?[]const Atom.Debug.Inl
 /// The declaration whose key is `key`, among the namespaces created so far.
 fn navByKey(r: *Replay, key: Atom.SymbolKey) !?InternPool.NavIndex {
     const zcu = r.zcu;
-    for (zcu.namespaces.items[r.navs_indexed..]) |*ns| for (ns.decls.values()) |n| {
-        try r.navs_by_key.put(r.gpa, .fromName(zcu.ip.stringSlice(zcu.ip.getNav(n).key)), n);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(r.gpa);
+    for (zcu.namespaces.items[r.navs_indexed..], r.navs_indexed..) |*ns, ns_index| for (0..ns.decls.count()) |i| {
+        const k = try zcu.declKey(r.gpa, ns, i, &buf);
+        try r.navs_by_key.put(r.gpa, .fromName(k), .{ .ns = @intCast(ns_index), .i = @intCast(i) });
     };
     r.navs_indexed = zcu.namespaces.items.len;
-    return r.navs_by_key.get(key);
+    const d = r.navs_by_key.get(key) orelse return null;
+    return try zcu.declNav(d.ns, d.i);
 }
 
 /// Path `file` of the files debug info `d` names: 0 is its own.

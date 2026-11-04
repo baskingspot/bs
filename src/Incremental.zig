@@ -1685,12 +1685,15 @@ pub const Keyer = struct {
             },
             .namespace_name => |nn| {
                 const ns = k.zcu.namespacePtr(nn.namespace);
+                var key: std.ArrayList(u8) = .empty;
+                defer key.deinit(k.zcu.gpa);
+                const found = ns.decls.getIndex(nn.name);
                 return .{
                     .key = try k.keyOf(.namespace_name, &.{ ns.key, ip.stringSlice(nn.name) }),
                     // Which declaration the name finds, if any, and
                     // whether it is `pub` (`@hasDecl`, and access from
                     // other files, read that).
-                    .result_hash = if (ns.decls.get(nn.name)) |nav| cache.hash(3, ip.stringSlice(ip.getNav(nav).key)) ^ @intFromBool(ip.getNav(nav).is_pub) else 0,
+                    .result_hash = if (found) |i| cache.hash(3, try k.zcu.declKey(k.zcu.gpa, ns, i, &key)) ^ @intFromBool(k.zcu.declIsPub(ns, i)) else 0,
                     .source = k.namespaceSource(ns),
                     .source_name = ip.stringSlice(nn.name),
                 };
@@ -1700,8 +1703,8 @@ pub const Keyer = struct {
                 // The names, and which are `pub`: `@typeInfo`'s
                 // `decl_names` lists only those.
                 var h: Hash = 0;
-                for (ns.decls.keys(), ns.decls.values()) |name, nav| {
-                    h = cache.hash(@as(u64, @truncate(h)) ^ @intFromBool(ip.getNav(nav).is_pub), ip.stringSlice(name)) ^ h;
+                for (ns.decls.keys(), 0..) |name, i| {
+                    h = cache.hash(@as(u64, @truncate(h)) ^ @intFromBool(k.zcu.declIsPub(ns, i)), ip.stringSlice(name)) ^ h;
                 }
                 return .{ .key = try k.keyOf(.namespace, &.{ns.key}), .result_hash = h, .source = k.namespaceSource(ns) };
             },

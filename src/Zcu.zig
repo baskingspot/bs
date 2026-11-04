@@ -417,12 +417,21 @@ pub const Namespace = struct {
     owner_type: InternPool.Index,
     /// Stable key prefix of declarations in this namespace.
     key: []const u8,
+    /// `key` and the separator before a declaration's name: its
+    /// declarations' keys are this and their names.
+    decl_prefix: []const u8,
     /// `key` without the captures of any type, its own or an enclosing
     /// one's: the declarations' path from the file, which the keys of the
     /// types they make extend with those types' own captures
     /// (`Sema.anonTypeKey`).
     path: []const u8,
+    /// Named declarations in ZIR order. `.none` for one not created yet:
+    /// a declaration's nav is made when it is first looked up
+    /// (`Zcu.declNav`), since most of a namespace's declarations are never
+    /// used. Exported ones are made at once.
     decls: std.AutoArrayHashMapUnmanaged(InternPool.String, InternPool.NavIndex) = .empty,
+    /// The `declaration` instruction of each of `decls`.
+    decl_insts: std.ArrayList(Zir.Inst.Index) = .empty,
     /// Whether creating it queued `comptime`, exported or test
     /// declarations: effects beyond the type itself.
     effects: bool = false,
@@ -472,7 +481,10 @@ pub fn init(gpa: Allocator, io: Io, fe: *Frontend) !Zcu {
 
 pub fn deinit(zcu: *Zcu) void {
     const gpa = zcu.gpa;
-    for (zcu.namespaces.items) |*ns| ns.decls.deinit(gpa);
+    for (zcu.namespaces.items) |*ns| {
+        ns.decls.deinit(gpa);
+        ns.decl_insts.deinit(gpa);
+    }
     zcu.namespaces.deinit(gpa);
     zcu.deps.deinit(gpa);
     if (zcu.unit_timing) |*t| t.ns.deinit(gpa);
@@ -878,8 +890,9 @@ pub fn writeCaptures(ip: *const InternPool, w: *std.Io.Writer, captures: []const
 
 /// Interns a declared container type of `kind`, offering it name `name`
 /// (`offerName`), with stable key `key`, which ends with the type's captures
-/// (`writeCaptures`). If it is new, creates its namespace and declarations
-/// and queues its `comptime` and exported declarations. A type made by
+/// (`writeCaptures`). If it is new, creates its namespace, lists its
+/// declarations (their navs are made on lookup, `declNav`), and queues its
+/// `comptime`, exported and test declarations. A type made by
 /// `@Struct`, `@Union`, or `@Enum` passes its `reified_layout`; it has no
 /// declarations.
 pub fn createContainerType(
@@ -931,7 +944,8 @@ pub fn createContainerType(
     const in_fn = parent_ns != Namespace.none and (zcu.namespaces.items[parent_ns].in_fn or zcu.inFnDecl(parent_ns, inst));
     const arena = zcu.arena.allocator();
     // The caller's names may live in a Sema arena.
-    const ns_key = try arena.dupe(u8, key);
+    const decl_prefix = try std.mem.concat(arena, u8, &.{ key, if (parent_ns == Namespace.none) ":" else "." });
+    const ns_key = decl_prefix[0..key.len];
     var caps: std.Io.Writer.Allocating = .init(zcu.gpa);
     defer caps.deinit();
     writeCaptures(ip, &caps.writer, captures) catch return error.OutOfMemory;
@@ -942,9 +956,9 @@ pub fn createContainerType(
         .in_fn = in_fn,
         .owner_type = ty,
         .key = ns_key,
+        .decl_prefix = decl_prefix,
         .path = ns_key[0 .. key.len - caps.written().len],
     });
-    const key_sep = if (parent_ns == Namespace.none) ":" else ".";
     const collect_tests = zcu.is_test and zcu.file(file_index).module == zcu.fe.main_module;
     const effects = zcu.comptime_decls.count() + zcu.exports.items.len + zcu.test_functions.items.len;
     var comptime_ordinal: u32 = 0;
@@ -970,48 +984,101 @@ pub fn createContainerType(
                 }
                 break :blk try std.fmt.allocPrint(arena, "{t}.{s}", .{ d.kind, zir.nullTerminatedString(d.name) });
             },
-            .@"const", .@"var" => zir.nullTerminatedString(d.name),
-        };
-        const decl_key = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ key, key_sep, simple });
-        var hasher: InternPool.Hasher = .init("nav");
-        hasher.bytes(decl_key);
-        const nav = try ip.createNav(tid, .{
-            .name = try ip.getString(tid, simple),
-            .parent = ty,
-            .key = try ip.getString(tid, decl_key),
-            .file = file_index,
-            .zir_inst = decl_inst,
-            .namespace = ns_index,
-            .hash = hasher.final(),
-            .is_pub = d.is_pub,
-            .has_type = d.type_body != null and d.linkage != .@"extern",
-            .linkage = d.linkage,
-            .is_const = d.kind != .@"var",
-            .is_threadlocal = d.is_threadlocal and !zcu.single_threaded,
-        });
-        switch (d.kind) {
             .@"const", .@"var" => {
-                try zcu.namespaces.items[ns_index].decls.put(zcu.gpa, ip.getNav(nav).name, nav);
-                if (d.linkage == .@"export") try zcu.exports.append(zcu.gpa, .{ .target = .{ .nav = nav }, .name = ip.getNav(nav).name, .unit = null });
-            },
-            else => {
-                // Upstream's filter semantics: unnamed tests always run;
-                // named ones only if their fqn contains some filter.
-                if (d.kind != .unnamed_test and zcu.test_filters.len > 0) {
-                    var aw: std.Io.Writer.Allocating = .init(zcu.gpa);
-                    defer aw.deinit();
-                    print.writeNavName(ip, nav, &aw.writer, .read) catch return error.OutOfMemory;
-                    const decl_fqn = aw.written();
-                    for (zcu.test_filters) |filter| {
-                        if (std.mem.indexOf(u8, decl_fqn, filter) != null) break;
-                    } else continue;
+                const ns = &zcu.namespaces.items[ns_index];
+                const decl_name = try ip.getString(tid, zir.nullTerminatedString(d.name));
+                // AstGen rejects duplicate names.
+                try ns.decls.putNoClobber(zcu.gpa, decl_name, .none);
+                try ns.decl_insts.append(zcu.gpa, decl_inst);
+                if (d.linkage == .@"export") {
+                    const nav = try zcu.declNav(ns_index, ns.decls.count() - 1);
+                    try zcu.exports.append(zcu.gpa, .{ .target = .{ .nav = nav }, .name = decl_name, .unit = null });
                 }
-                try zcu.test_functions.append(zcu.gpa, nav);
+                continue;
             },
+        };
+        const nav = try zcu.createDeclNav(ns_index, decl_inst, &d, simple);
+        // Upstream's filter semantics: unnamed tests always run; named
+        // ones only if their fqn contains some filter.
+        if (d.kind != .unnamed_test and zcu.test_filters.len > 0) {
+            var aw: std.Io.Writer.Allocating = .init(zcu.gpa);
+            defer aw.deinit();
+            print.writeNavName(ip, nav, &aw.writer, .read) catch return error.OutOfMemory;
+            const decl_fqn = aw.written();
+            for (zcu.test_filters) |filter| {
+                if (std.mem.indexOf(u8, decl_fqn, filter) != null) break;
+            } else continue;
         }
+        try zcu.test_functions.append(zcu.gpa, nav);
     }
     zcu.namespaces.items[ns_index].effects = zcu.comptime_decls.count() + zcu.exports.items.len + zcu.test_functions.items.len != effects;
     return ty;
+}
+
+/// The nav of declaration `i` of namespace `ns_index` (an index into its
+/// `decls`), created if it was not yet.
+pub fn declNav(zcu: *Zcu, ns_index: u32, i: usize) !InternPool.NavIndex {
+    const ns = &zcu.namespaces.items[ns_index];
+    if (ns.decls.values()[i] != .none) return ns.decls.values()[i];
+    const inst = ns.decl_insts.items[i];
+    const d = zcu.file(ns.file).zir.getDeclaration(inst);
+    const nav = try zcu.createDeclNav(ns_index, inst, &d, zcu.ip.stringSlice(ns.decls.keys()[i]));
+    // `createDeclNav` appends nothing to `namespaces`.
+    ns.decls.values()[i] = nav;
+    return nav;
+}
+
+/// The declaration named `name` in namespace `ns_index`, if any
+/// (`declNav`).
+pub fn findDecl(zcu: *Zcu, ns_index: u32, name: InternPool.String) !?InternPool.NavIndex {
+    const i = zcu.namespaces.items[ns_index].decls.getIndex(name) orelse return null;
+    return try zcu.declNav(ns_index, i);
+}
+
+/// Whether declaration `i` of namespace `ns` is `pub`, without creating
+/// its nav.
+pub fn declIsPub(zcu: *const Zcu, ns: *const Namespace, i: usize) bool {
+    const nav = ns.decls.values()[i];
+    if (nav != .none) return zcu.ip.getNav(nav).is_pub;
+    return zcu.file(ns.file).zir.getDeclaration(ns.decl_insts.items[i]).is_pub;
+}
+
+/// The stable key of declaration `i` of namespace `ns` (its nav's `key`),
+/// without creating its nav: built in `buf` if it has none.
+pub fn declKey(zcu: *const Zcu, gpa: Allocator, ns: *const Namespace, i: usize, buf: *std.ArrayList(u8)) ![]const u8 {
+    const nav = ns.decls.values()[i];
+    if (nav != .none) return zcu.ip.stringSlice(zcu.ip.getNav(nav).key);
+    buf.clearRetainingCapacity();
+    try buf.appendSlice(gpa, ns.decl_prefix);
+    try buf.appendSlice(gpa, zcu.ip.stringSlice(ns.decls.keys()[i]));
+    return buf.items;
+}
+
+fn createDeclNav(zcu: *Zcu, ns_index: u32, decl_inst: Zir.Inst.Index, d: *const Zir.Inst.Declaration.Unwrapped, simple: []const u8) !InternPool.NavIndex {
+    const ip = &zcu.ip;
+    const ns = &zcu.namespaces.items[ns_index];
+    var buf: [256]u8 = undefined;
+    const len = ns.decl_prefix.len + simple.len;
+    const decl_key = if (len <= buf.len) buf[0..len] else try zcu.gpa.alloc(u8, len);
+    defer if (len > buf.len) zcu.gpa.free(decl_key);
+    @memcpy(decl_key[0..ns.decl_prefix.len], ns.decl_prefix);
+    @memcpy(decl_key[ns.decl_prefix.len..], simple);
+    var hasher: InternPool.Hasher = .init("nav");
+    hasher.bytes(decl_key);
+    return ip.createNav(tid, .{
+        .name = try ip.getString(tid, simple),
+        .parent = ns.owner_type,
+        .key = try ip.getString(tid, decl_key),
+        .file = ns.file,
+        .zir_inst = decl_inst,
+        .namespace = ns_index,
+        .hash = hasher.final(),
+        .is_pub = d.is_pub,
+        .has_type = d.type_body != null and d.linkage != .@"extern",
+        .linkage = d.linkage,
+        .is_const = d.kind != .@"var",
+        .is_threadlocal = d.is_threadlocal and !zcu.single_threaded,
+    });
 }
 
 /// Interns `key`, a container type or named tuple whose `name` is to be
@@ -1542,7 +1609,7 @@ fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
     var parts = std.mem.splitScalar(u8, name, '.');
     const nav = while (true) {
         const part = parts.next().?;
-        const nav = zcu.namespaces.items[zcu.ip.structInfo(ty).namespace].decls.get(try zcu.ip.getString(tid, part)) orelse
+        const nav = try zcu.findDecl(zcu.ip.structInfo(ty).namespace, try zcu.ip.getString(tid, part)) orelse
             return zcu.addError(@backingInt(file_index), no_span, "compiler_rt has no declaration '{s}'", .{name});
         if (parts.peek() == null) break nav;
         zcu.ensureNavVal(nav) catch |err| switch (err) {

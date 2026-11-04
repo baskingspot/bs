@@ -1276,8 +1276,7 @@ pub fn populateTestFunctions(zcu: *Zcu) CompileError!void {
     }.lessThan);
     const builtin_file = zcu.moduleRootFile(.builtin) orelse return;
     if (zcu.file_root_types.items[builtin_file] == .none) return;
-    const ns = zcu.namespacePtr(ip.structInfo(zcu.file_root_types.items[builtin_file]).namespace);
-    const nav_index = ns.decls.get(try ip.getString(Zcu.tid, "test_functions")) orelse return;
+    const nav_index = try zcu.findDecl(ip.structInfo(zcu.file_root_types.items[builtin_file]).namespace, try ip.getString(Zcu.tid, "test_functions")) orelse return;
     const nav = ip.getNav(nav_index);
     if (nav.status != .resolved) return;
     var arena_state: std.heap.ArenaAllocator = .init(zcu.gpa);
@@ -2094,9 +2093,8 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
         if (ns_index != Zcu.Namespace.none and sema.ownsNamespace(ty)) {
             try sema.declareDependency(.{ .namespace = ns_index });
             const ns = zcu.namespacePtr(ns_index);
-            for (ns.decls.keys(), ns.decls.values()) |n, nav| {
-                const decl = ip.getNav(nav);
-                if (decl.is_pub or decl.file == sema.file) try names.append(sema.arena, ip.stringSlice(n));
+            for (ns.decls.keys(), 0..) |n, i| {
+                if (zcu.declIsPub(ns, i) or ns.file == sema.file) try names.append(sema.arena, ip.stringSlice(n));
             }
         }
     };
@@ -6062,13 +6060,12 @@ fn optValue(sema: *Sema, child_ty: Index, val: Index) !Index {
 /// `decl_names` of `@typeInfo`: the public declarations of a namespace.
 /// Observing all of them is a dependency on the namespace's name list.
 fn declNamesValue(sema: *Sema, ns_index: u32) !Index {
-    const ip = sema.ip;
     if (ns_index == Zcu.Namespace.none) return sema.namesValue(&.{});
     try sema.declareDependency(.{ .namespace = ns_index });
     var names: std.ArrayList(InternPool.String) = .empty;
     const ns = sema.zcu.namespacePtr(ns_index);
-    for (ns.decls.values()) |nav| {
-        if (ip.getNav(nav).is_pub) try names.append(sema.arena, ip.getNav(nav).name);
+    for (ns.decls.keys(), 0..) |name, i| {
+        if (sema.zcu.declIsPub(ns, i)) try names.append(sema.arena, name);
     }
     return sema.namesValue(names.items);
 }
@@ -6697,7 +6694,7 @@ fn lookupName(sema: *Sema, block: *Block, src: Src, name: []const u8) CompileErr
     while (ns_index != Zcu.Namespace.none) {
         const ns = sema.zcu.namespacePtr(ns_index);
         try sema.declareDependency(.{ .namespace_name = .{ .namespace = ns_index, .name = name_str } });
-        if (ns.decls.get(name_str)) |nav| return nav;
+        if (try sema.zcu.findDecl(ns_index, name_str)) |nav| return nav;
         ns_index = ns.parent;
     }
     return sema.fail(block, src, "use of undeclared identifier '{s}'", .{name});
@@ -6716,7 +6713,7 @@ fn lookupInType(sema: *Sema, ty: Index, name: []const u8) !?InternPool.NavIndex 
     if (!sema.ownsNamespace(ty)) return null;
     const name_str = try sema.getString(name);
     try sema.declareDependency(.{ .namespace_name = .{ .namespace = ns_index, .name = name_str } });
-    return sema.zcu.namespacePtr(ns_index).decls.get(name_str);
+    return sema.zcu.findDecl(ns_index, name_str);
 }
 
 fn zirDeclVal(sema: *Sema, block: *Block, inst: Zir.Inst.Index, is_ref: bool) CompileError!Ref {
@@ -22340,7 +22337,7 @@ fn testTypeHashes(source: []const u8, out: []InternPool.Hash) !void {
     try zcu.analyzeAll(&sink);
     try std.testing.expectEqual(0, zcu.errors.items.len);
     const ip = &zcu.ip;
-    const nav = zcu.namespaces.items[0].decls.get(try ip.getString(Zcu.tid, "T")).?;
+    const nav = (try zcu.findDecl(0, try ip.getString(Zcu.tid, "T"))).?;
     const elems = ip.keyPayload(.aggregate, ip.getNav(nav).val).storage.elems;
     for (out, elems) |*h, e| h.* = ip.stableHash(e);
 }

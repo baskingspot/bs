@@ -406,7 +406,7 @@ pub const Lookup = struct {
         const ns_index = ip.structInfo(owner_type).namespace;
         if (ns_index == Zcu.Namespace.none) return null;
         const s = try ip.getString(Zcu.tid, name);
-        if (l.zcu.namespacePtr(ns_index).decls.get(s)) |n| return n;
+        if (try l.zcu.findDecl(ns_index, s)) |n| return n;
         // Tests are not in `decls`.
         for (l.zcu.test_functions.items) |n| {
             const t = ip.getNav(n);
