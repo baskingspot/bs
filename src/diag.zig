@@ -469,6 +469,7 @@ const migrations = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "math", "absInt", "use the builtin `@abs(x)`, which cannot fail and returns the unsigned type" },
     .{ "process", "argsAlloc", "arguments come from main: take `init: std.process.Init`, then `var it = init.minimal.args.iterate();`" },
     .{ "process", "args", "arguments come from main: take `init: std.process.Init`, then `var it = init.minimal.args.iterate();`" },
+    .{ "fmt", "FormatOptions", "a format method is now `pub fn format(self: T, writer: *std.Io.Writer) std.Io.Writer.Error!void` with neither the format string nor the options, and is called by `{f}`" },
     .{ "fmt", "format", "print through a writer (`w.print(fmt, args)`, std.Io.Writer), or use std.fmt.bufPrint or std.fmt.allocPrint" },
     .{ "json", "stringify", "use `std.json.Stringify.value(value, .{}, writer)`" },
     .{ "json", "stringifyAlloc", "use `std.json.Stringify.valueAlloc(gpa, value, .{})`" },

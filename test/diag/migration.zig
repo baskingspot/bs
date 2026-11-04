@@ -18,11 +18,21 @@ fn info() bool {
     return @typeInfo(u8).Int.signedness == .unsigned;
 }
 
+const Point = struct {
+    x: u32,
+    pub fn format(self: Point, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("({d})", .{self.x});
+    }
+};
+
 pub fn main() void {
     stdout();
     list();
     cwd();
     _ = info();
+    std.debug.print("{f}\n", .{Point{ .x = 1 }});
 }
 
 // error
@@ -31,21 +41,26 @@ pub fn main() void {
 //   note std/std.zig:1:1: struct declared here
 //   candidates: Io
 //   hint: std.io is now std.Io: take `init: std.process.Init` in main, then `var w = std.Io.File.stdout().writer(init.io, &buffer);`, print with `w.interface.print(...)` and `w.interface.flush()`; std.debug.print writes to stderr without io
-//   ref: main migration.zig:22:11 (+3 std frames)
+//   ref: main migration.zig:31:11 (+3 std frames)
 // migration.zig:9:30: error[no-member]: struct 'array_list.Aligned(u8,null)' has no member named 'init'
 //   | var l = std.ArrayList(u8).init(std.heap.page_allocator);
 //   note std/array_list.zig:638:12: struct declared here: return struct {
 //   hint: std.ArrayList is unmanaged: `var list: std.ArrayList(T) = .empty;`, then pass the allocator to each call (`list.append(gpa, x)`, `list.deinit(gpa)`); std.array_list.Managed keeps the old API; to print into a byte buffer, use std.Io.Writer.Allocating
-//   ref: main migration.zig:23:9 (+3 std frames)
+//   ref: main migration.zig:32:9 (+3 std frames)
 // migration.zig:14:15: error[no-member]: root source file struct 'fs' has no member named 'cwd'
 //   | _ = std.fs.cwd();
 //   note std/fs.zig:1:1: struct declared here
 //   hint: std.fs.cwd() is now std.Io.Dir.cwd(), and its methods take io: `std.Io.Dir.cwd().openFile(io, path, .{})`, with io from main's `init: std.process.Init` (`init.io`)
-//   ref: main migration.zig:24:8 (+3 std frames)
+//   ref: main migration.zig:33:8 (+3 std frames)
 // migration.zig:18:26: error[no-field]: no field named 'Int' in union 'lang.Type'
 //   | return @typeInfo(u8).Int.signedness == .unsigned;
 //   note std/lang.zig:640:18: union declared here: pub const Type = union(enum) {
 //   candidates: int
 //   hint: @typeInfo's fields are lowercase: .int, .pointer, .@"struct", .@"enum", .@"union", .@"fn"
-//   ref: main migration.zig:25:13 (+3 std frames)
-// 4 errors
+//   ref: main migration.zig:34:13 (+3 std frames)
+// migration.zig:23:74: error[no-member]: root source file struct 'fmt' has no member named 'FormatOptions'
+//   | pub fn format(self: Point, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+//   note std/fmt.zig:1:1: struct declared here
+//   hint: a format method is now `pub fn format(self: T, writer: *std.Io.Writer) std.Io.Writer.Error!void` with neither the format string nor the options, and is called by `{f}`
+//   ref: main migration.zig:35:20 (+6 std frames)
+// 5 errors
