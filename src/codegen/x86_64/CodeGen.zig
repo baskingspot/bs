@@ -95,6 +95,9 @@ in_place: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
 /// From `planRotates`: `bit_or`s that are rotates, with what they rotate
 /// left and by how much, by value.
 rotates: std.AutoHashMapUnmanaged(u32, Rotate) = .empty,
+/// From `planMulWide`: factors of 128-bit products computed with one
+/// `mul` that `planMulWide` stopped computing (`Home.dead`), by value.
+mul_dead: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// rbp offset of the slot holding the error return trace pointer: an
 /// `.auto` function's from r9, another's from `set_err_return_trace`.
 /// Null in a function that has none, whose `.auto` calls pass null.
@@ -307,6 +310,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.slot_alias.deinit(gpa);
         cg.in_place.deinit(gpa);
         cg.rotates.deinit(gpa);
+        cg.mul_dead.deinit(gpa);
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
         cg.stub_chains.deinit(gpa);
@@ -1512,6 +1516,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
     }
     try cg.planDeferred();
     try cg.planRotates();
+    try cg.planMulWide();
     @memset(live.items(.hint), .{ Ssa.no_reg, Ssa.no_reg });
     for (cg.arg_hints.items) |h| live.items(.hint)[h.v][0] = h.r;
     if (cg.fn_ty.cc == .auto) {
@@ -2279,6 +2284,161 @@ fn shiftAmount(cg: *CodeGen, ref: Ref) ?u64 {
     };
 }
 
+/// A factor of a `mulWide` product: a value of at most 64 bits, or a
+/// constant.
+const Factor = union(enum) { ref: Ref, imm: u64 };
+
+/// The factors of `inst` if it is a `mul_wrap` of two unsigned values of
+/// at most 64 bits, widened to an unsigned 128-bit integer (Wyhash's
+/// `mum`, std.math.mulWide): one `mul` computes it, into rdx:rax, and its
+/// value lives in a register pair (`wantsReg`) instead of memory.
+fn mulWide(cg: *CodeGen, inst: Inst.Index) ?[2]Factor {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const ty = ir.typeOfIndex(inst, ip);
+    if (Type.class(ip, ty) != .int) return null;
+    const info = Type.intInfo(ip, ty);
+    if (info.signedness != .unsigned or info.bits != 128) return null;
+    const bin = ir.instructions.items(.data)[@backingInt(inst)].bin_op;
+    return .{ cg.factor(bin.lhs) orelse return null, cg.factor(bin.rhs) orelse return null };
+}
+
+fn factor(cg: *CodeGen, ref: Ref) ?Factor {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    if (ref.toInterned()) |v| {
+        if (ip.keyTag(v) != .int) return null;
+        return switch (ip.keyPayload(.int, v).storage) {
+            .u64 => |u| .{ .imm = u },
+            .i64 => |i| if (i >= 0) .{ .imm = @intCast(i) } else null,
+            .big => null,
+        };
+    }
+    const i = ref.toIndex().?;
+    if (ir.instructions.items(.tag)[@backingInt(i)] != .intcast) return null;
+    const src = ir.instructions.items(.data)[@backingInt(i)].ty_op.operand;
+    const src_ty = ir.typeOf(src, ip);
+    if (Type.class(ip, src_ty) != .int) return null;
+    const info = Type.intInfo(ip, src_ty);
+    if (info.signedness != .unsigned or info.bits > 64) return null;
+    return .{ .ref = ref };
+}
+
+/// If `inst` truncates a `mulWide` product, or that product shifted right
+/// by 64, to at most 64 bits: the product and whether it reads the high
+/// half.
+fn mulPart(cg: *CodeGen, inst: Inst.Index) ?struct { m: Inst.Index, hi: bool } {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const ty = datas[@backingInt(inst)].ty_op.ty;
+    if (Type.class(ip, ty) != .int or Type.intInfo(ip, ty).bits > 64) return null;
+    const o = datas[@backingInt(inst)].ty_op.operand.toIndex() orelse return null;
+    if (tags[@backingInt(o)] == .mul_wrap) return if (cg.mulWide(o) != null) .{ .m = o, .hi = false } else null;
+    if (tags[@backingInt(o)] != .shr) return null;
+    return .{ .m = cg.mulHigh(o) orelse return null, .hi = true };
+}
+
+/// If shift `inst` moves a `mulWide` product right by 64 bits: the
+/// product, whose high half is the low half of the result, so one move
+/// computes it and it wants a register pair.
+fn mulHigh(cg: *CodeGen, inst: Inst.Index) ?Inst.Index {
+    const ip = cg.ip;
+    const bin = cg.ir.instructions.items(.data)[@backingInt(inst)].bin_op;
+    const m = bin.lhs.toIndex() orelse return null;
+    if (cg.ir.instructions.items(.tag)[@backingInt(m)] != .mul_wrap or cg.mulWide(m) == null) return null;
+    const k = bin.rhs.toInterned() orelse return null;
+    if (ip.keyTag(k) != .int) return null;
+    switch (ip.keyPayload(.int, k).storage) {
+        .u64 => |u| if (u != 64) return null,
+        .i64 => |i| if (i != 64) return null,
+        .big => return null,
+    }
+    return m;
+}
+
+/// Before allocation: a `mulWide` product reads its factors' 64-bit
+/// values, so a widening `intcast` only it reads is not emitted, and the
+/// value cast lives until the product instead. A shift by 64 that only a
+/// `mulPart` truncation reads is not emitted either: the truncation reads
+/// the product's high half, which lives until it.
+fn planMulWide(cg: *CodeGen) Error!void {
+    const ir = cg.ir;
+    const f = cg.ssa;
+    const datas = ir.instructions.items(.data);
+    const live = f.live.slice();
+    const uses = live.items(.uses);
+    const fate = live.items(.fate);
+    const reg = live.items(.reg);
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const share = live.items(.share);
+    const cl = f.clobbers.items;
+    const extend = struct {
+        fn run(e: []u32, d: []const u32, c: []bool, clob: []const [2]u32, x: u32, to: u32) void {
+            e[x] = @max(e[x], to);
+            c[x] = c[x] or clob[to][0] != clob[d[x]][0] or clob[to][1] != clob[d[x]][1];
+        }
+    }.run;
+    for (f.values.items(.inst)) |v| {
+        const vi = @backingInt(v);
+        if (fate[vi] != .normal) continue;
+        switch (ir.instructions.items(.tag)[vi]) {
+            .mul_wrap => {
+                if (reg[vi] != Ssa.want_pair) continue;
+                const fs = cg.mulWide(v) orelse continue;
+                for (fs) |fa| {
+                    const c = (switch (fa) {
+                        .ref => |r| r,
+                        .imm => continue,
+                    }).toIndex().?;
+                    const ci = @backingInt(c);
+                    if (uses[ci] != 1 or fate[ci] != .normal or cg.homes[ci] != .none) continue;
+                    const src = datas[ci].ty_op.operand;
+                    if (src.toIndex()) |x| {
+                        const xi = @backingInt(x);
+                        if (fate[xi] != .normal or share[xi] != Ssa.no_tie) continue;
+                        extend(end, def, crosses, cl, xi, def[vi]);
+                    }
+                    fate[ci] = .dead;
+                    reg[ci] = Ssa.no_reg;
+                    cg.homes[ci] = .dead;
+                    try cg.mul_dead.put(cg.gpa, ci, {});
+                }
+            },
+            .trunc => {
+                if (reg[vi] != Ssa.want_reg) continue;
+                const part = cg.mulPart(v) orelse continue;
+                extend(end, def, crosses, cl, @backingInt(part.m), def[vi]);
+                if (!part.hi) continue;
+                const sh = @backingInt(datas[vi].ty_op.operand.toIndex().?);
+                if (uses[sh] != 1 or fate[sh] != .normal or cg.homes[sh] != .none) continue;
+                fate[sh] = .dead;
+                reg[sh] = Ssa.no_reg;
+                cg.homes[sh] = .dead;
+            },
+            else => {},
+        }
+    }
+}
+
+/// Loads `mulWide` factor `fa` into `r`.
+fn loadFactor(cg: *CodeGen, r: Reg, fa: Factor) Error!void {
+    switch (fa) {
+        .imm => |u| try cg.e.mov(.qword, .{ .reg = r }, .{ .imm = @bitCast(u) }),
+        .ref => |ref| {
+            const c = ref.toIndex().?;
+            // The value cast, if the cast is not emitted; else the low
+            // half of the cast.
+            if (cg.mul_dead.count() != 0 and cg.mul_dead.contains(@backingInt(c))) return cg.load(r, cg.ir.instructions.items(.data)[@backingInt(c)].ty_op.operand);
+            if (cg.pairOf(ref)) |p| return cg.e.mov(.qword, .{ .reg = r }, .{ .reg = p.lo });
+            try cg.e.mov(.qword, .{ .reg = r }, .{ .mem = try cg.memOf(ref) });
+        },
+    }
+}
+
 /// Whether pointers `a` and `b` to values of one type point to the same
 /// memory or to memory that does not overlap: elements of one array, or
 /// memory in different locals or global variables.
@@ -2840,6 +3000,10 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
         },
         else => {},
     }
+    // A 128-bit product of 64-bit values, and its halves (`mulWide`).
+    if (tag == .mul_wrap and cg.mulWide(inst) != null) return .pair;
+    if (tag == .trunc and cg.mulPart(inst) != null) return .gpr;
+    if (tag == .shr and cg.mulHigh(inst) != null) return .pair;
     const wanted = switch (tag) {
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => cg.inGpr(cg.typeOf(data.bin_op.lhs)),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.inGpr(cg.typeOf(data.bin_op.lhs)) or cg.inFloat(cg.typeOf(data.bin_op.lhs)),
@@ -3594,6 +3758,30 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
 
         .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => {
             const ty = cg.typeOf(data.bin_op.lhs);
+            if (tag == .mul_wrap) if (cg.mulWide(inst)) |fs| {
+                try cg.loadFactor(.rax, fs[0]);
+                try cg.loadFactor(.rcx, fs[1]);
+                try cg.e.unary(.mul, .qword, .{ .reg = .rcx });
+                if (cg.pairOf(inst.toRef())) |p| {
+                    try cg.e.mov(.qword, .{ .reg = p.lo }, .{ .reg = .rax });
+                    return cg.e.mov(.qword, .{ .reg = p.hi }, .{ .reg = .rdx });
+                }
+                const m = try cg.resultMem(inst, ty) orelse return;
+                try cg.e.mov(.qword, .{ .mem = m }, .{ .reg = .rax });
+                return cg.e.mov(.qword, .{ .mem = offsetMem(m, 8) }, .{ .reg = .rdx });
+            };
+            if (tag == .shr) if (cg.mulHigh(inst)) |m| {
+                if (cg.pairOf(m.toRef())) |p| {
+                    try cg.e.mov(.qword, .{ .reg = .rax }, .{ .reg = p.hi });
+                } else try cg.e.mov(.qword, .{ .reg = .rax }, .{ .mem = offsetMem(try cg.memOf(m.toRef()), 8) });
+                if (cg.pairOf(inst.toRef())) |p| {
+                    try cg.e.mov(.qword, .{ .reg = p.lo }, .{ .reg = .rax });
+                    return cg.e.alu(.xor, .dword, .{ .reg = p.hi }, .{ .reg = p.hi });
+                }
+                const d = try cg.resultMem(inst, ty) orelse return;
+                try cg.e.mov(.qword, .{ .mem = d }, .{ .reg = .rax });
+                return cg.e.mov(.qword, .{ .mem = offsetMem(d, 8) }, .{ .imm = 0 });
+            };
             if (ip.keyTag(ty) == .vector_type) return vector.gen(cg, inst, tag, data);
             if (cg.isFloat(ty)) return cg.genFloat(inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
@@ -3769,6 +3957,14 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .intcast, .trunc, .bitcast, .ptr_from_int => {
             const ty = data.ty_op.ty;
             if (cg.homes[@backingInt(inst)] == .view) return;
+            if (tag == .trunc) if (cg.mulPart(inst)) |part| {
+                const d = cg.destReg(inst);
+                if (cg.pairOf(part.m.toRef())) |p| {
+                    try cg.e.mov(.qword, .{ .reg = d }, .{ .reg = if (part.hi) p.hi else p.lo });
+                } else try cg.e.mov(.qword, .{ .reg = d }, .{ .mem = offsetMem(try cg.memOf(part.m.toRef()), if (part.hi) 8 else 0) });
+                try cg.normalize(d, ty);
+                return cg.setResult(inst, ty, d);
+            };
             if (tag != .ptr_from_int and vector.lowers(cg, inst)) return vector.gen(cg, inst, tag, data);
             if (tag != .ptr_from_int and (cg.isWideInt(ty) or cg.isWideInt(cg.typeOf(data.ty_op.operand))) and Type.isInt(ip, ty)) return cg.genWide(inst, tag, data);
             if (cg.passInRegs(ty) and cg.passInRegs(cg.typeOf(data.ty_op.operand))) {
