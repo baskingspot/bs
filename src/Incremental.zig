@@ -1589,13 +1589,13 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         else |_|
             return inc.lazyFallback("{s} is gone", .{path_buf.items});
     }
-    // Embedded files: by path.
+    // Embedded files: by path and key (`embedInput`).
     const embed_inputs = try gpa.alloc(u32, zcu.embed_files.count());
     defer gpa.free(embed_inputs);
     for (zcu.embed_files.values(), embed_inputs) |f, *ei| {
         try inputPath(gpa, &path_buf, fe, f.module, f.sub_path);
         const content_hash: Hash = @bitCast(Frontend.hashSource(f.bytes));
-        const known = rp.by_path.get(path_buf.items);
+        const known = embedInput(m, rp, path_buf.items, f.key);
         ei.* = known orelse n_inputs;
         if (known) |in| {
             if (m.input(in)[0].content_hash == content_hash) continue;
@@ -1845,6 +1845,18 @@ pub fn parseImportRef(ref_name: []const u8) ?struct { []const u8, Emit.ImportFla
     const digit = ref_name[ref_name.len - 1];
     if (digit < '0' or digit > '7') return null;
     return .{ ref_name[0 .. ref_name.len - 2], .fromBits(@intCast(digit - '0')) };
+}
+
+/// The input of the file embedded as `key` from `path`: its own, not that
+/// of a module's file at the same path (a file that embeds itself), which
+/// `Replay.by_path` finds first.
+fn embedInput(m: *const Manifest, rp: *const Replay, path: []const u8, key: []const u8) ?u32 {
+    const first = rp.by_path.get(path) orelse return null;
+    if (std.mem.eql(u8, m.inputKey(first), key)) return first;
+    for (first + 1..m.inputCount()) |i| {
+        if (std.mem.eql(u8, m.inputKey(@intCast(i)), key) and std.mem.eql(u8, m.input(@intCast(i))[1], path)) return @intCast(i);
+    }
+    return null;
 }
 
 /// Falls back if the link's inputs outside the atoms change with the live set:
