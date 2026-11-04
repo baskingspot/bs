@@ -2,7 +2,7 @@
 
 zap is an independent Zig compiler aimed at Go-class compile speed. It does
 not track upstream: it compiles exactly one pinned Zig release (currently
-0.17.0) and the std library shipped with it.
+0.17.1) and the std library shipped with it.
 
 ## Scope
 
@@ -71,19 +71,19 @@ not track upstream: it compiles exactly one pinned Zig release (currently
   especially in formats and interfaces (Atoms, cache entries, IR) that get
   harder to change once other code depends on them.
 - Compile-time speed is a feature. Track it with benchmarks against upstream
-  `zig` 0.17.0 Debug builds (self-hosted x86_64 backend), and do not land
+  `zig` 0.17.1 Debug builds (self-hosted x86_64 backend), and do not land
   regressions without saying so. Track the speed of the code zap generates
   against upstream Debug and ReleaseSafe builds the same way, and report
   each backend change's compile-time cost next to its run-time win.
 
 ## Upstream reference
 
-- `.agents/setup` installs upstream `zig` 0.17.0 on `PATH` in orbs. On a Mac
+- `.agents/setup` installs upstream `zig` 0.17.1 on `PATH` in orbs. On a Mac
   satellite it leaves the owner's `zig` alone; use
-  `~/.cache/zap/zig-aarch64-macos-0.17.0/zig` there. It also symlinks
+  `~/.cache/zap/zig-aarch64-macos-0.17.1/zig` there. It also symlinks
   that release's source tree at `upstream/` (gitignored), which contains
   `upstream/src/Sema.zig`, `upstream/test/behavior/` and more.
-- Upstream `zig` 0.17.0 is the oracle. When semantics are unclear, write a
+- Upstream `zig` 0.17.1 is the oracle. When semantics are unclear, write a
   small program and compare zap's behavior and output with upstream's. Do not
   guess from memory.
 - Conformance measure: the share of `upstream/test/behavior` that zap compiles
@@ -95,7 +95,7 @@ not track upstream: it compiles exactly one pinned Zig release (currently
 
 ## Development
 
-- zap is written in Zig 0.17.0. Build with `zig build`; test with `zig build test`.
+- zap is written in Zig 0.17.1. Build with `zig build`; test with `zig build test`.
 - `docs/architecture.md` fixes the boundaries between stages (analysis units,
   InternPool stable hashes, typed IR, Atoms, cache model). Follow it, and
   update it in the same change when a boundary moves.

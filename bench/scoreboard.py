@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The compile-time and run-time scoreboard against upstream zig 0.17.0.
+"""The compile-time and run-time scoreboard against upstream zig 0.17.1.
 
 One command runs every measurement the roadmap's scoreboard quotes, in one
 session, and writes bench/results/<date>-scoreboard.md and .json:
@@ -47,7 +47,7 @@ SCENARIOS = ["cold", "cold-local", "warm", "edit-root", "edit-lib"]
 LABELS = {
     "hello": "hello world",
     "vaxis": "libvaxis text_input example",
-    "zig": "upstream's zig 0.17.0 compiler (no LLVM)",
+    "zig": "upstream's zig 0.17.1 compiler (no LLVM)",
     "std": "`zig test lib/std/std.zig` (std's tests, --test-no-exec)",
 }
 SCENARIO_LABELS = {
@@ -196,16 +196,16 @@ def stats(report, scenario):
 
 def render(data):
     m, lines = data["machine"], []
-    lines += [f"# Scoreboard {data['date']}: zap {data['commit']} against upstream zig 0.17.0", ""]
+    lines += [f"# Scoreboard {data['date']}: zap {data['commit']} against upstream zig 0.17.1", ""]
     lines += [f"Machine: {m['cpu']}, {m['cpus']} logical CPUs, {m['mem_gib']} GiB, Linux {m['kernel']} "
-              f"({data['note']}). zap {data['commit']} built with `-Doptimize=ReleaseFast`; upstream zig 0.17.0 "
+              f"({data['note']}). zap {data['commit']} built with `-Doptimize=ReleaseFast`; upstream zig 0.17.1 "
               "Debug (self-hosted x86_64 backend and linker) unless a column says ReleaseSafe (LLVM). "
               f"Made by `python3 bench/scoreboard.py --zap <zap>` in one session ({data['started']} to "
               f"{data['finished']} UTC).", ""]
     if "bench" in data:
         b = data["bench"]
         cal = [r["calibration_s"][k] for w in b.values() for r in w.values() for k in ("start", "end")]
-        lines += ["## Compile time vs upstream zig 0.17.0 Debug", ""]
+        lines += ["## Compile time vs upstream zig 0.17.1 Debug", ""]
         lines += ["`bench/bench.py`, `build-exe` mode (std: `zig test`), each workload measured upstream, zap, "
                   "then zap without donors, back to back. Median wall time; runs per scenario: hello and vaxis "
                   "10 (cold 5), zig and std 5 (cold 3); peak RSS where it matters. cold-local is the first "
@@ -329,7 +329,7 @@ def render(data):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--zap", default=os.path.join(REPO_DIR, "zig-out", "bin", "zap"), help="zap, ReleaseFast")
-    ap.add_argument("--zig", default="zig", help="upstream zig 0.17.0 (default: zig on PATH)")
+    ap.add_argument("--zig", default="zig", help="upstream zig 0.17.1 (default: zig on PATH)")
     ap.add_argument("--parts", default="bench,corpus,runtime", help="comma-separated subset of bench,corpus,runtime")
     ap.add_argument("--note", default="Amp orb", help="describes the machine in the report")
     ap.add_argument("--out", default=None, help="output path without extension (default bench/results/<date>-scoreboard)")

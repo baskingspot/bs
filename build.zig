@@ -6,11 +6,11 @@ pub fn build(b: *std.Build) void {
 
     // zap compiles the std library of exactly one Zig release. By default it
     // uses the lib directory of the zig that builds zap, which `.agents/setup`
-    // pins to 0.17.0.
+    // pins to 0.17.1.
     const zig_lib_dir = b.option(
         []const u8,
         "zig-lib-dir",
-        "Default Zig 0.17.0 lib directory baked into zap (default: next to the building zig)",
+        "Default Zig 0.17.1 lib directory baked into zap (default: next to the building zig)",
     ) orelse defaultZigLibDir(b);
 
     const options = b.addOptions();

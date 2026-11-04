@@ -3,7 +3,7 @@
 where microbenchmarks can mislead.
 
 Each workload builds a real program with zap and, unless --no-upstream, with
-upstream zig 0.17.0 in Debug (self-hosted x86_64 backend) and ReleaseSafe
+upstream zig 0.17.1 in Debug (self-hosted x86_64 backend) and ReleaseSafe
 (LLVM), checks that the builds print the same output, and reports the
 median wall time of each:
 
@@ -203,7 +203,7 @@ def fmt_s(s):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--compiler", default="zig-out/bin/zap", help="zap binary (default: zig-out/bin/zap)")
-    ap.add_argument("--zig", default="zig", help="upstream zig 0.17.0 (default: zig on PATH)")
+    ap.add_argument("--zig", default="zig", help="upstream zig 0.17.1 (default: zig on PATH)")
     ap.add_argument("--workloads", default=",".join(WORKLOADS), help="comma-separated subset of " + ",".join(WORKLOADS))
     ap.add_argument("--runs", type=int, default=5, help="runs per binary (default 5)")
     ap.add_argument("--no-upstream", action="store_true", help="time only zap's builds")

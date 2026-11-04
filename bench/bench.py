@@ -378,7 +378,7 @@ class Vaxis(Workload):
 
 class ZigCompiler(Workload):
     name = "zig"
-    description = "upstream zig 0.17.0's compiler, src/main.zig without LLVM"
+    description = "upstream zig 0.17.1's compiler, src/main.zig without LLVM"
 
     def setup(self):
         # The build-exe command `zig build -Denable-llvm=false
@@ -702,7 +702,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--compiler", default="zig", help="compiler binary to time (zig or zap; default: zig on PATH)")
     ap.add_argument("--setup-zig", default="zig",
-                    help="upstream zig 0.17.0 used to prepare workloads (fetch, generate); never timed")
+                    help="upstream zig 0.17.1 used to prepare workloads (fetch, generate); never timed")
     ap.add_argument("--workloads", default=",".join(WORKLOADS), help="comma-separated: " + ",".join(WORKLOADS))
     ap.add_argument("--modes", default=None,
                     help="comma-separated: build-exe,zig-build (default: both)")

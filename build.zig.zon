@@ -2,6 +2,6 @@
     .name = .zap,
     .version = "0.0.0",
     .fingerprint = 0x8ac41f4e15ab0cc9,
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

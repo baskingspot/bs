@@ -647,8 +647,8 @@
   },
   {
    "name": "zig-compiler",
-   "url": "upstream/lib/compiler (Zig 0.17.0's own tools)",
-   "commit": "0.17.0",
+   "url": "upstream/lib/compiler (Zig 0.17.1's own tools)",
+   "commit": "0.17.1",
    "copy": "upstream/lib/compiler",
    "files": {
     "translate_c_root.zig": "pub const main = @import(\"translate-c/main.zig\").main;\n",

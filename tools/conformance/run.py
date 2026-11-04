@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Conformance harness: upstream Zig 0.17.0's test/behavior, compiled by zap.
+"""Conformance harness: upstream Zig 0.17.1's test/behavior, compiled by zap.
 
 The measure, per target: the behavior tests zap compiles and passes, divided by
-the tests upstream zig 0.17.0 passes on that target with its default Debug
+the tests upstream zig 0.17.1 passes on that target with its default Debug
 backend. Upstream's per-test results are committed in baseline/<target>.json.
 
     tools/conformance/run.py              # build zap, run it on every target this host can run
@@ -1142,7 +1142,7 @@ def main():
     p.add_argument("--upstream", action="store_true", help="compute the upstream baseline with zig instead of running zap")
     p.add_argument("--target", action="append", choices=sorted(TARGETS), help="target to run (repeatable; default: all)")
     p.add_argument("--zap", type=Path, help="zap executable (default: build zap with -Doptimize=ReleaseSafe)")
-    p.add_argument("--zig", default="zig", help="upstream zig 0.17.0, used for --upstream and to build zap (default: zig on PATH)")
+    p.add_argument("--zig", default="zig", help="upstream zig 0.17.1, used for --upstream and to build zap (default: zig on PATH)")
     p.add_argument("--test-runner", type=Path, help="test runner passed to the compiler (default: test_runner.zig for --upstream, zap_runner.zig for zap until zap compiles test_runner.zig)")
     p.add_argument("--default-runner", action="store_true", help="zap only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `zap test` without --test-runner does")
     p.add_argument("--std", action="store_true", help="measure upstream's std tests (lib/std/std.zig, default runner) instead of test/behavior")

@@ -5720,7 +5720,7 @@ state. Built for step 1:
 
 ## Fuzzing (designed and built 2026-11-03; x86_64-linux)
 
-Goal: upstream 0.17.0's built-in fuzzer works with zap on x86_64-linux:
+Goal: upstream 0.17.1's built-in fuzzer works with zap on x86_64-linux:
 `-ffuzz`, `std.testing.fuzz`, and `zig build test --fuzz` under `zap
 build`. Agents fuzz to find a crash, then minimize and fix it.
 
@@ -6151,10 +6151,10 @@ so static links compile as before.
   `zig` with the same arguments: they are Clang and LLVM tools, which zap
   never runs itself. `objcopy` stays `[unsupported]` until needed.
 - **Finding upstream zig**: `ZAP_ZIG`, else `zig` on PATH, else
-  `~/.cache/zap/zig-<host>-0.17.0/zig`, accepted only if it reports
-  0.17.0 (checked once per binary, by stat, in the global cache). Without
+  `~/.cache/zap/zig-<host>-0.17.1/zig`, accepted only if it reports
+  0.17.1 (checked once per binary, by stat, in the global cache). Without
   one, a step with C fails with one `[unsupported]` diagnostic saying C
-  sources need upstream zig 0.17.0 and where zap looked. Pure Zig and
+  sources need upstream zig 0.17.1 and where zap looked. Pure Zig and
   `-lc`-only programs never look.
 - **The config message** reports `link_libc` and `link_mode = .dynamic`
   for such steps, as upstream.
@@ -6401,7 +6401,7 @@ libraries as inputs. To be agreed with that thread.
   -mcpu=baseline` and for the native target without `-lc`; upstream's
   native `-lc` reads the system's `/usr/include` instead (decision 1).
 - **Running**: upstream zig is `ZAP_ZIG`, else `zig` on PATH, else
-  `~/.cache/zap/zig-0.17.0/zig` or `zig-<host>-0.17.0/zig`; its
+  `~/.cache/zap/zig-0.17.1/zig` or `zig-<host>-0.17.1/zig`; its
   version is checked (`zig version`, 5 ms) only when something must
   compile. The compiles start before the frontend, on up to the CPU
   count of tasks (`Io.Group.concurrent`, each running `zig clang`), and
@@ -6580,7 +6580,7 @@ and `zig build -Dtarget=aarch64-macos`.
   backend, which is also the benchmark baseline. The aarch64-macos choice is
   made at milestone 5.
 - Conformance is measured per test: the number of `upstream/test/behavior`
-  tests zap compiles and passes, divided by the number upstream 0.17.0 passes
+  tests zap compiles and passes, divided by the number upstream 0.17.1 passes
   on the same target with the same backend.
 - `tools/conformance/run.py` measures it: it builds zap, prints one summary
   line per target, and writes a per-file, per-test JSON breakdown to
@@ -6919,7 +6919,7 @@ format that needs another code passes it explicitly (`Sema.failCode`,
 way. A unit test tokenizes Sema.zig, Zcu.zig and Emit.zig and fails on any
 error format without a code, so a new format needs a table entry.
 AstGen has 186 error sites with 118 distinct formats; its codes come from
-a table of upstream's message formats (pinned at 0.17.0, so the table is
+a table of upstream's message formats (pinned at 0.17.1, so the table is
 complete), matched against the rendered message, and a test extracts
 every format string from `AstGen.zig` and checks that each one maps to a
 code.
@@ -7305,3 +7305,9 @@ computes the right one instead of copying the bug:
   a real cycle the result depends on analysis order. It aborts 0 times
   on the zig workload, std and libvaxis. Taking genericity out of the
   `func_type` key fixes it, a prerequisite of stage A (step 2, item 0).
+- *Function multiversioning stubs.* Zig 0.17.1's compiler_rt adds
+  `fmv.zig`, whose x86_64 part exports `__cpu_indicator_init` from a
+  nested struct and the data `__cpu_model` and `__cpu_features2`.
+  zap's compiler_rt table (`src/compiler_rt_exports.zig`) names only
+  top-level functions, so C code that calls `__builtin_cpu_supports` or
+  uses `target_clones` fails to link where upstream links it.

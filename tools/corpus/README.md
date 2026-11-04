@@ -1,7 +1,7 @@
 # Real-world corpus
 
 `tools/corpus/run.py` builds pinned, pure-Zig projects with zap and with
-upstream zig 0.17.0, runs what they build, and compares the two. It finds
+upstream zig 0.17.1, runs what they build, and compares the two. It finds
 the bugs real programs hit that `test/behavior` and std's tests miss.
 
 ```sh
@@ -37,7 +37,7 @@ fresh checkout), `--results NAME` (write `.work/NAME.json` and
   `output` file counts as part of its stdout. A `note` explains a known
   difference, such as a bug in the project that one compiler survives.
 - A project with `copy` instead of `url` is a directory of this checkout,
-  copied to `.work/src/`: `zig-compiler` is upstream 0.17.0's own tools in
+  copied to `.work/src/`: `zig-compiler` is upstream 0.17.1's own tools in
   `upstream/lib/compiler` (translate-c and resinator on Aro, Aro's tests,
   objcopy, objdump, reduce, std-docs). It has no build.zig, so the
   manifest gives its `commands` and the root `files` its modules need

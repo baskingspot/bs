@@ -1,6 +1,6 @@
 //! The generated `builtin` module: `@import("builtin")`.
 //!
-//! The text follows upstream Zig 0.17.0's `src/Builtin.zig` output for zap's
+//! The text follows upstream Zig 0.17.1's `src/Builtin.zig` output for zap's
 //! one Linux configuration: x86_64-linux-none, Debug or ReleaseSafe, the
 //! self-hosted x86_64 backend, static linking.
 //! Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
@@ -130,7 +130,7 @@ pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     return std.fmt.allocPrint(gpa,
     \\const std = @import("std");
     \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
-    \\pub const zig_version_string = "0.17.0";
+    \\pub const zig_version_string = "0.17.1";
     \\pub const zig_backend = std.lang.CompilerBackend.stage2_x86_64;
     \\
     \\pub const output_mode: std.lang.OutputMode = .{s};

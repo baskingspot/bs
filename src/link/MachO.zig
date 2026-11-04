@@ -86,7 +86,7 @@ pub const Options = struct {
     /// Code signing identifier; `link` defaults it to the output's file name.
     identifier: ?[]const u8 = null,
     /// LC_BUILD_VERSION minimum macOS, also recorded as the SDK version.
-    /// Zig 0.17.0's default minimum for aarch64-macos is 15.0.
+    /// Zig 0.17.1's default minimum for aarch64-macos is 15.0.
     min_os: std.SemanticVersion = .{ .major = 15, .minor = 0, .patch = 0 },
     /// Threads to link with, the calling thread included; null means one
     /// per CPU. The output is the same for any number.

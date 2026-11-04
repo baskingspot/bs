@@ -18,12 +18,12 @@ const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
 const CSource = @import("CSource.zig");
 
-pub const zig_version = "0.17.0";
+pub const zig_version = "0.17.1";
 
 const usage =
     \\Usage: zap [command] [options]
     \\
-    \\zap is a fast Debug-mode compiler for Zig 0.17.0.
+    \\zap is a fast Debug-mode compiler for Zig 0.17.1.
     \\
     \\Commands:
     \\  build            Build project from build.zig

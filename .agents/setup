@@ -5,17 +5,17 @@
 # x86_64-linux (orbs) and aarch64-macos (Mac satellites).
 set -euo pipefail
 
-ZIG_VERSION=0.17.0
-ZIG_SRC_SHA=b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd
+ZIG_VERSION=0.17.1
+ZIG_SRC_SHA=1e89bf06610b769a8c77676c6c8d54b093a0db60f4891f2f91014829012f0e24
 
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)
     ZIG_HOST=x86_64-linux
-    ZIG_BIN_SHA=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+    ZIG_BIN_SHA=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
     ;;
   Darwin-arm64)
     ZIG_HOST=aarch64-macos
-    ZIG_BIN_SHA=b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+    ZIG_BIN_SHA=75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d
     ;;
   *)
     echo "unsupported host: $(uname -s)-$(uname -m)" >&2
@@ -62,7 +62,7 @@ time fetch "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_VERSION.tar.xz" \
 
 # Orbs are disposable, so zig goes on PATH there. A Mac satellite is the
 # owner's own machine with its own zig; don't shadow it. Use
-# ~/.cache/zap/zig-aarch64-macos-0.17.0/zig explicitly there.
+# ~/.cache/zap/zig-aarch64-macos-$ZIG_VERSION/zig explicitly there.
 if [ "$ZIG_HOST" = x86_64-linux ]; then
   ln -sfn "$bin_dir/zig" "$HOME/.local/bin/zig"
 fi

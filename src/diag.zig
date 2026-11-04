@@ -1699,7 +1699,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "builtin @wasmMemoryGrow is available when targeting WebAssembly; targeted CPU architecture is {s}", .@"misplaced-builtin" },
 });
 
-/// The code of an AstGen message, by the upstream 0.17.0 format string it
+/// The code of an AstGen message, by the upstream 0.17.1 format string it
 /// was made from. Parse errors, which AstGen passes through as `{f}` or
 /// `{s}`, match none and are `syntax`.
 pub fn classifyAstGen(msg: []const u8) Code {
@@ -1731,7 +1731,7 @@ fn matchFormat(fmt: []const u8, msg: []const u8) bool {
     }
 }
 
-/// Upstream 0.17.0 AstGen's error format strings and their codes, the
+/// Upstream 0.17.1 AstGen's error format strings and their codes, the
 /// specific ones before the general ones they also match. The
 /// "every AstGen error format has a code" test checks this list against
 /// AstGen.zig itself.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run-time benchmarks: the speed of the code zap generates.
 
-Builds each program in bench/runtime/ with zap and with upstream zig 0.17.0
+Builds each program in bench/runtime/ with zap and with upstream zig 0.17.1
 in Debug (self-hosted x86_64 backend) and ReleaseSafe (LLVM), checks that
 all three print the same output, and reports the median wall time of each
 binary. See bench/README.md.
@@ -54,7 +54,7 @@ def fmt_ms(s):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--compiler", default="zig-out/bin/zap", help="zap binary (default: zig-out/bin/zap)")
-    ap.add_argument("--zig", default="zig", help="upstream zig 0.17.0 (default: zig on PATH)")
+    ap.add_argument("--zig", default="zig", help="upstream zig 0.17.1 (default: zig on PATH)")
     ap.add_argument("--programs", default=",".join(PROGRAMS), help="comma-separated subset of " + ",".join(PROGRAMS))
     ap.add_argument("--runs", type=int, default=5, help="runs per binary (default 5)")
     ap.add_argument("--no-upstream", action="store_true", help="time only zap's binaries")
@@ -90,7 +90,7 @@ def main():
     lines = [
         "# Run-time benchmarks",
         "",
-        f"Median wall time of {args.runs} runs; `{os.path.basename(zap)}` against upstream zig 0.17.0. "
+        f"Median wall time of {args.runs} runs; `{os.path.basename(zap)}` against upstream zig 0.17.1. "
         f"{args.machine_note}, {os.cpu_count()} CPUs.",
         "",
         "| Program | " + " | ".join(names) + (" | zap / Debug | zap / ReleaseSafe |" if len(names) == 3 else " |"),

@@ -525,7 +525,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     b.zig = if (misses == 0) .{ .path = "" } else if (zig.found) |p|
         if (try checkZig(s, io, p)) |msg| .{ .missing = try gpa.dupe(u8, msg) } else .{ .path = try gpa.dupe(u8, p) }
     else
-        .{ .missing = try std.fmt.allocPrint(gpa, "compiling C sources needs upstream zig 0.17.0; zap looked for it in ZAP_ZIG, as 'zig' on PATH, and in {s}", .{zig.looked}) };
+        .{ .missing = try std.fmt.allocPrint(gpa, "compiling C sources needs upstream zig 0.17.1; zap looked for it in ZAP_ZIG, as 'zig' on PATH, and in {s}", .{zig.looked}) };
     b.misses = misses;
     const workers = @min(misses, std.Thread.getCpuCount() catch 1);
     for (0..workers) |_| b.group.concurrent(io, Batch.worker, .{b}) catch break;
@@ -985,20 +985,20 @@ fn findZig(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     }
     const home = environ.get("HOME") orelse return .{ .found = null, .looked = "~/.cache/zap" };
     const host = @tagName(@import("builtin").cpu.arch) ++ "-" ++ @tagName(@import("builtin").os.tag);
-    for ([_][]const u8{ "zig-0.17.0", "zig-" ++ host ++ "-0.17.0" }) |sub| {
+    for ([_][]const u8{ "zig-0.17.1", "zig-" ++ host ++ "-0.17.1" }) |sub| {
         const p = std.fs.path.join(arena, &.{ home, ".cache", "zap", sub, "zig" }) catch continue;
         if (cwd.access(io, p, .{ .execute = true })) |_| return .{ .found = p, .looked = p } else |_| {}
     }
-    return .{ .found = null, .looked = std.fs.path.join(arena, &.{ home, ".cache", "zap", "zig-" ++ host ++ "-0.17.0" }) catch "~/.cache/zap" };
+    return .{ .found = null, .looked = std.fs.path.join(arena, &.{ home, ".cache", "zap", "zig-" ++ host ++ "-0.17.1" }) catch "~/.cache/zap" };
 }
 
-/// Null when `zig` is upstream's 0.17.0, else why not.
+/// Null when `zig` is upstream's 0.17.1, else why not.
 fn checkZig(arena: std.mem.Allocator, io: Io, zig: []const u8) !?[]const u8 {
     const res = std.process.run(arena, io, .{ .argv = &.{ zig, "version" } }) catch |err|
-        return try std.fmt.allocPrint(arena, "compiling C sources needs upstream zig 0.17.0; unable to run '{s}': {t}", .{ zig, err });
+        return try std.fmt.allocPrint(arena, "compiling C sources needs upstream zig 0.17.1; unable to run '{s}': {t}", .{ zig, err });
     const version = std.mem.trim(u8, res.stdout, " \n");
-    if (res.term.success() and std.mem.eql(u8, version, "0.17.0")) return null;
-    return try std.fmt.allocPrint(arena, "compiling C sources needs upstream zig 0.17.0; '{s}' is version '{s}' (set ZAP_ZIG to upstream 0.17.0)", .{ zig, version });
+    if (res.term.success() and std.mem.eql(u8, version, "0.17.1")) return null;
+    return try std.fmt.allocPrint(arena, "compiling C sources needs upstream zig 0.17.1; '{s}' is version '{s}' (set ZAP_ZIG to upstream 0.17.1)", .{ zig, version });
 }
 
 /// Clang's errors and their notes, as diagnostics: `path:line:col: error:

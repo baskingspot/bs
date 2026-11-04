@@ -6,7 +6,7 @@ it (`Zcu.compilerRtExport`).
 Upstream compiles lib/compiler_rt.zig for the target, in Debug, which keeps
 each function's own symbol (`compiler_rt.<file>.<decl>`) at the address of
 the names it exports, so the table follows upstream's conditions exactly.
-Run from the repository root with upstream `zig` 0.17.0 on PATH:
+Run from the repository root with upstream `zig` 0.17.1 on PATH:
 
     python3 tools/compiler_rt_exports.py
 """
@@ -20,6 +20,10 @@ import tempfile
 # Stack protector functions: the compilation roots compiler_rt/ssp.zig
 # when it links C objects (`Zcu.rootFiles`), so they are its own exports.
 SKIP_FILES = {"ssp.zig"}
+# Function multiversioning stubs (0.17.1's fmv.zig): `__cpu_indicator_init`
+# is declared in a nested struct, next to the data `__cpu_model` and
+# `__cpu_features2`, which this table cannot name. Not provided yet.
+SKIP_NESTED = {"fmv.x86.__cpu_indicator_init"}
 
 
 def main() -> None:
@@ -53,6 +57,8 @@ def main() -> None:
             file, decl = "", path[0]
         elif len(path) == 2:
             file, decl = path[0] + ".zig", path[1]
+        elif impl[0] in SKIP_NESTED:
+            continue
         else:
             sys.exit(f"{name}: implemented by a nested declaration ({impl[0]})")
         if file not in SKIP_FILES:

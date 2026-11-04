@@ -7,7 +7,7 @@
 //! are not reported), but not `std.testing.io`, so tests that use it crash
 //! under it, and it reports a failing test without its error name.
 //!
-//! Upstream zig 0.17.0 compiles it too, which keeps it honest.
+//! Upstream zig 0.17.1 compiles it too, which keeps it honest.
 
 const builtin = @import("builtin");
 const std = @import("std");
