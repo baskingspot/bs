@@ -1128,6 +1128,20 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     win_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&win_run.step);
 
+    // Bool vectors of 65 to 128 elements as C arguments, one GPR each.
+    const vb_exe = b.addRunArtifact(zap);
+    vb_exe.setName("zap build-exe with C bool vectors");
+    vb_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+    vb_exe.addFileArg(b.path("test/link_input/vecbool_main.zig"));
+    vb_exe.addFileArg(b.path("test/link_input/vecbool.c"));
+    vb_exe.setEnvironmentVariable("ZAP_ZIG", zig);
+    const vb_run = std.Build.Step.Run.create(b, "run zap build with C bool vectors");
+    vb_run.addFileArg(vb_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    vb_run.addCheck(.{ .expect_stdout_exact = "c_v 10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\nc_iv 1 2 3 4  10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\nc_v7 1 2 3 4 5 6 7  10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\nc_v 10010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010010011\n" });
+    vb_run.addCheck(.{ .expect_stderr_exact = "zig_v 01001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010\nzig_iv -1 -2 -3 -4 01001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010\nzig_v 01001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010010100101001010\n" });
+    vb_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&vb_run.step);
+
     // GCC's -fPIE reads glibc's data PC-relative: the executable copies
     // `stdout` and `environ` (with its aliases, which glibc's start code
     // sets), and glibc, C and Zig all use the copies.

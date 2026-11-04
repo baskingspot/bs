@@ -4600,8 +4600,11 @@ const Eb = enum { none, int, sse, sseup, x87, x87up, memory };
 /// - results only (`cRetClass`), vectors over 16 bytes as Clang returns
 ///   them without AVX: `xwords`, in xmm0 and on, 16 bytes each;
 ///   `qwords3`, three 8-byte elements in rax, rdx, and rcx (`.int`) or in
-///   xmm0, xmm1, and st0 (`.sse`).
-const CClass = union(enum) { none, int, int_pair, sse, agg: [2]Eb, x87, memory, xwords: u8, qwords3: Eb };
+///   xmm0, xmm1, and st0 (`.sse`);
+/// - arguments only, a bool vector of 65 to 128 elements as Clang passes
+///   it: `elems`, one element (0 or 1) per GPR while GPRs are left, the
+///   rest in 8-byte slots of the outgoing area.
+const CClass = union(enum) { none, int, int_pair, sse, agg: [2]Eb, x87, memory, xwords: u8, qwords3: Eb, elems: u8 };
 
 /// The class of a C argument of type `ty`.
 fn cClass(cg: *CodeGen, ty: Index) CClass {
@@ -4657,8 +4660,7 @@ fn cVectorClass(cg: *CodeGen, ty: Index, is_ret: bool) CClass {
     if (v.child == .bool_type) {
         if (v.len <= 32) return one_int;
         if (v.len <= 64) return .{ .agg = .{ .sse, .none } };
-        // Upstream passes up to 128 as one GPR per element, which zap
-        // does not.
+        if (v.len <= 128 and !is_ret) return .{ .elems = @intCast(v.len) };
         return .memory;
     }
     const float = Type.class(ip, v.child) == .float;
@@ -4758,7 +4760,7 @@ fn cRegCount(c: CClass) struct { gp: u8, sse: u8 } {
             .gp = @as(u8, @intFromBool(ebs[0] == .int)) + @intFromBool(ebs[1] == .int),
             .sse = @as(u8, @intFromBool(ebs[0] == .sse)) + @intFromBool(ebs[1] == .sse),
         },
-        .none, .x87, .memory, .xwords, .qwords3 => .{ .gp = 0, .sse = 0 },
+        .none, .x87, .memory, .xwords, .qwords3, .elems => .{ .gp = 0, .sse = 0 },
     };
 }
 
@@ -4770,8 +4772,18 @@ fn ebBytes(size: u64, i: usize) u64 {
 const xmm_args = [_]Encoder.Xmm{ .xmm0, .xmm1, .xmm2, .xmm3, .xmm4, .xmm5, .xmm6, .xmm7 };
 
 /// Where a C argument goes: its first GPR and XMM register (an `agg` takes
-/// them in eightbyte order), or its offset in the outgoing area.
-const CArgLoc = union(enum) { none, regs: struct { gp: u8, sse: u8 }, stack: u32 };
+/// them in eightbyte order), or its offset in the outgoing area; for an
+/// `elems` vector, its first GPR and the offset of its elements that do
+/// not fit the GPRs.
+const CArgLoc = union(enum) { none, regs: struct { gp: u8, sse: u8 }, stack: u32, elems: struct { gp: u8, stack: u32 } };
+
+/// Loads element `i` of the bool vector at `m`, a bit mask, into `reg`
+/// as 0 or 1.
+fn loadBoolElem(cg: *CodeGen, reg: Reg, m: Mem, i: u32) Error!void {
+    try cg.e.movzx(.dword, reg, .byte, .{ .mem = offsetMem(m, i / 8) });
+    if (i % 8 != 0) try cg.e.shift(.shr, .dword, .{ .reg = reg }, @intCast(i % 8));
+    try cg.e.alu(.@"and", .dword, .{ .reg = reg }, .{ .imm = 1 });
+}
 
 /// Places the arguments of a call to a C function: memory arguments in the
 /// outgoing area first (copies use rax, rsi, rdi, rcx), then SSE registers
@@ -4791,6 +4803,14 @@ fn cCallArgs(cg: *CodeGen, args: []const Val, ret_ty: Index, dst: ?Mem) Error!u8
             l.* = .none;
             continue;
         }
+        if (class == .elems) {
+            const regs = @min(class.elems, 6 - gp);
+            stack = std.mem.alignForward(u32, stack, 8);
+            l.* = .{ .elems = .{ .gp = gp, .stack = stack } };
+            gp += regs;
+            stack += 8 * @as(u32, class.elems - regs);
+            continue;
+        }
         const n = cRegCount(class);
         // A value that does not fit the registers left goes in memory
         // whole, and the registers stay for later arguments.
@@ -4805,15 +4825,24 @@ fn cCallArgs(cg: *CodeGen, args: []const Val, ret_ty: Index, dst: ?Mem) Error!u8
         stack += @intCast(std.mem.alignForward(u64, Type.abiSize(ip, a.ty), 8));
     }
     cg.out_args_size = @max(cg.out_args_size, stack);
-    for (args, locs) |a, l| if (l == .stack) {
-        try cg.copyMem(Mem.at(.rsp, @intCast(l.stack)), try cg.valMem(a), Type.abiSize(ip, a.ty));
+    for (args, locs) |a, l| switch (l) {
+        .stack => |off| try cg.copyMem(Mem.at(.rsp, @intCast(off)), try cg.valMem(a), Type.abiSize(ip, a.ty)),
+        .elems => |e| {
+            const m = try cg.valMem(a);
+            const len = cg.cClass(a.ty).elems;
+            for (@min(len, 6 - e.gp)..len, 0..) |i, j| {
+                try cg.loadBoolElem(.rax, m, @intCast(i));
+                try cg.e.mov(.qword, .{ .mem = Mem.at(.rsp, @intCast(e.stack + 8 * j)) }, .{ .reg = .rax });
+            }
+        },
+        else => {},
     };
     // The memory of the values read by eightbyte, before any argument
     // register is written (materializing one may use rdi and rcx).
     const mems = try cg.gpa.alloc(Mem, args.len);
     defer cg.gpa.free(mems);
-    for (args, locs, mems) |a, l, *m| if (l == .regs) switch (cg.cClass(a.ty)) {
-        .agg, .int_pair => m.* = try cg.valMem(a),
+    for (args, locs, mems) |a, l, *m| if (l != .none and l != .stack) switch (cg.cClass(a.ty)) {
+        .agg, .int_pair, .elems => m.* = try cg.valMem(a),
         else => {},
     };
     for (args, locs, mems) |a, l, m| if (l == .regs) switch (cg.cClass(a.ty)) {
@@ -4841,6 +4870,10 @@ fn cCallArgs(cg: *CodeGen, args: []const Val, ret_ty: Index, dst: ?Mem) Error!u8
             };
         },
         else => {},
+    };
+    for (args, locs, mems) |a, l, m| if (l == .elems) {
+        const len = cg.cClass(a.ty).elems;
+        for (l.elems.gp..@min(6, l.elems.gp + len), 0..) |r, i| try cg.loadBoolElem(c_arg_regs[r], m, @intCast(i));
     };
     if (sret) try cg.e.lea(.qword, .rdi, dst.?);
     return sse;
@@ -4898,6 +4931,7 @@ fn cCallResult(cg: *CodeGen, ret_ty: Index, dst: ?Mem) Error!void {
     const m = dst orelse return;
     switch (cg.cRetClass(ret_ty)) {
         .none, .memory => {},
+        .elems => unreachable,
         .xwords => |n| for (0..n) |i| try cg.e.movups(.{ .mem = offsetMem(m, 16 * i) }, .{ .reg = xmm_args[i] }),
         .qwords3 => |eb| if (eb == .int) {
             for ([_]Reg{ .rax, .rdx, .rcx }, 0..) |reg, i| try cg.e.mov(.qword, .{ .mem = offsetMem(m, 8 * i) }, .{ .reg = reg });
@@ -4936,6 +4970,27 @@ fn setupCParams(cg: *CodeGen) Error!void {
         const size = Type.abiSize(ip, ty);
         const class = cg.cClass(ty);
         if (class == .none) continue;
+        if (class == .elems) {
+            // Gather the elements into the vector's bit mask.
+            const m = Mem.at(.rbp, try cg.allocSlot(size, Type.abiAlignment(ip, ty)));
+            cg.homes[@backingInt(inst)] = .{ .slot = m.disp };
+            for (0..size / 8) |i| try cg.e.mov(.qword, .{ .mem = offsetMem(m, 8 * i) }, .{ .imm = 0 });
+            const regs = @min(class.elems, 6 - gp);
+            stack = std.mem.alignForward(u32, stack, 8);
+            for (0..class.elems) |i| {
+                if (i < regs) {
+                    try cg.e.mov(.dword, .{ .reg = .rax }, .{ .reg = c_arg_regs[gp + i] });
+                } else {
+                    try cg.e.mov(.dword, .{ .reg = .rax }, .{ .mem = Mem.at(.rbp, @intCast(16 + stack)) });
+                    stack += 8;
+                }
+                try cg.e.alu(.@"and", .dword, .{ .reg = .rax }, .{ .imm = 1 });
+                if (i % 8 != 0) try cg.e.shift(.shl, .dword, .{ .reg = .rax }, @intCast(i % 8));
+                try cg.e.alu(.@"or", .byte, .{ .mem = offsetMem(m, i / 8) }, .{ .reg = .rax });
+            }
+            gp += regs;
+            continue;
+        }
         const n = cRegCount(class);
         if ((n.gp == 0 and n.sse == 0) or gp + n.gp > 6 or sse + n.sse > 8) {
             stack = std.mem.alignForward(u32, stack, if (Type.abiAlignment(ip, ty) >= 16) 16 else 8);
@@ -5057,6 +5112,7 @@ fn cRet(cg: *CodeGen, operand: Ref) Error!void {
     const ty = cg.fn_ty.return_type;
     switch (cg.cRetClass(ty)) {
         .none => {},
+        .elems => unreachable,
         .int => try cg.load(.rax, operand),
         .xwords => |n| {
             const m = try cg.memOf(operand);

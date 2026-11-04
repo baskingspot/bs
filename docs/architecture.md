@@ -737,9 +737,10 @@ comptime arguments are run-time values in the lowered code (uucode's
   st0), larger vector arguments in memory. Everything else is MEMORY: on
   the stack as an argument, through a result pointer in rdi (returned in
   rax). `va_arg` gathers a register-class aggregate from the register
-  save area, which keeps all 16 bytes of each XMM register. Not done:
-  bool vectors of 65 to 128 elements as arguments (Clang passes one GPR
-  per element; zap passes them in memory). `.x86_64_win` (C's ms_abi,
+  save area, which keeps all 16 bytes of each XMM register. A bool
+  vector of 65 to 128 elements as an argument goes as Clang passes it:
+  each element, 0 or 1, in the next GPR while any are left, the rest in
+  8-byte slots on the stack (as a result it is MEMORY). `.x86_64_win` (C's ms_abi,
   `winClass`, after upstream's `classifyWindows`) passes each argument by
   position in rcx, rdx, r8, r9 or xmm0-3, the rest on the stack above
   the caller's 32-byte shadow space; values not of size 1, 2, 4, or 8
