@@ -395,6 +395,9 @@ fn sectionOf(o: *const Object, index: usize) ?Atom.Section {
 pub const Converted = struct {
     atoms: []const Atom,
     values: []const Elf.Value,
+    /// The objects' functions and objects within their sections' atoms,
+    /// for .symtab, except those that name their atom.
+    symbols: []const Elf.LocalSymbol,
 };
 
 /// Converts every loaded object into atoms. `ctx` resolves what the
@@ -406,6 +409,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
     const arena = in.arena;
     var atoms: std.ArrayList(Atom) = .empty;
     var values: std.ArrayList(Elf.Value) = .empty;
+    var symbols: std.ArrayList(Elf.LocalSymbol) = .empty;
     var weak_used = false;
     var c: Converter(@TypeOf(ctx)) = .{ .in = in, .ctx = ctx, .atoms = &atoms, .weak_used = &weak_used };
     // Two strong definitions of a name, one Zig's, are an error, as ld's.
@@ -423,7 +427,17 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
             const sym = o.syms[s];
             if (sym.st_value == 0 and sym.st_shndx != elf.SHN_UNDEF and sym.st_shndx < o.shdrs.len) c.names[sym.st_shndx] = @intCast(s);
         }
+        c.whole = try arena.realloc(c.whole, o.shdrs.len);
+        @memset(c.whole, false);
         for (0..o.shdrs.len) |i| try c.section(@intCast(i));
+        for (o.syms[1..], 1..) |sym, s_index| {
+            const ty = sym.st_type();
+            if (ty != elf.STT_FUNC and ty != elf.STT_OBJECT and ty != elf.STT_TLS) continue;
+            if (sym.st_shndx >= o.shdrs.len or !c.whole[sym.st_shndx] or c.names[sym.st_shndx] == s_index) continue;
+            const name = o.symName(sym);
+            if (name.len == 0) continue;
+            try symbols.append(arena, .{ .name = name, .atom = sectionKey(o, sym.st_shndx), .offset = sym.st_value, .size = sym.st_size });
+        }
     }
     for (in.commons.keys(), in.commons.values()) |name, common| {
         if (in.defs.contains(name)) continue;
@@ -438,7 +452,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
     try sortArrays(arena, atoms.items, c.arrays.items);
     if (weak_used) try values.append(arena, .{ .key = undefined_weak_key, .value = 0 });
     try values.appendSlice(arena, c.abs_values.items);
-    return .{ .atoms = atoms.items, .values = values.items };
+    return .{ .atoms = atoms.items, .values = values.items, .symbols = symbols.items };
 }
 
 const ArrayAtom = struct { atom: u32, priority: u32 };
@@ -490,6 +504,8 @@ fn Converter(comptime Ctx: type) type {
         list: Atom.RelocList = .{},
         /// Per section of `o`: the symbol naming its atom, or 0.
         names: []u32 = &.{},
+        /// Per section of `o`: whether it became one atom of its own.
+        whole: []bool = &.{},
         /// How each global name the objects reference resolved.
         resolved: std.StringHashMapUnmanaged(?Target) = .empty,
         /// The init and fini arrays' atoms, in input order.
@@ -544,6 +560,7 @@ fn Converter(comptime Ctx: type) type {
                 }),
                 else => {},
             }
+            c.whole[index] = true;
             try c.atoms.append(arena, .{
                 .key = sectionKey(o, index),
                 .name = c.atomName(index),

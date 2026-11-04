@@ -2692,6 +2692,11 @@ differs from the design above:
   upstream, a static executable's std.start runs the init array and
   nothing runs the fini array; with `-lc`, ld.so runs both. `.ctors` and
   `.dtors` are an error.
+- .symtab: each input function, object and thread-local symbol gets an
+  entry (`Elf.Options.local_symbols`: name, atom key, offset, size; type
+  and section from the atom's place), except the one that names its
+  atom. Keyed links only; a numbered link rejects them until the cache
+  relinks inputs.
 - `-l<name>`/`-L<dir>` find `lib<name>.so` or `lib<name>.a` in the `-L`
   directories by upstream's search strategies (`-search_*`, `-static`,
   `-dynamic`). A shared library found first, or a name not found there,
@@ -2701,8 +2706,8 @@ differs from the design above:
 - Tests: a constructor test (priorities across two objects, a
   destructor, with and without `-lc`), and an archive passed with
   `-l`/`-L`.
-- Not yet: the symbol side list for .symtab, copy relocations, a COMDAT
-  test, and timing SQLite and zlib links against upstream.
+- Not yet: copy relocations, a COMDAT test, and timing SQLite and zlib
+  links against upstream.
 
 **Stages and checks.**
 1. A: objects and archives into zap's static and `-lc` executables (the

@@ -128,6 +128,8 @@ uav_capturing: u32 = 0,
 export_lookups: u32 = 0,
 /// The error codes `finish` assigned, for `link`.
 error_values: std.ArrayList(Elf.Value) = .empty,
+/// The inputs' symbols within their atoms, for `link` (in `inputs`' arena).
+input_symbols: []const Elf.LocalSymbol = &.{},
 /// Time spent in `CodeGen.generate`, for `ZAP_TIMING`.
 codegen_ns: u64 = 0,
 /// `ZAP_BENCH_CODEGEN`: a copy of every function's IR, which
@@ -827,6 +829,7 @@ fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
     if (in.errors.items.len != 0) return false;
     for (converted.atoms) |atom| try emit.addAtom(atom);
     try emit.error_values.appendSlice(emit.gpa, converted.values);
+    emit.input_symbols = converted.symbols;
     return true;
 }
 
@@ -1139,7 +1142,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     // Source paths are as the compiler opened them, relative to the cwd.
     const cwd = try std.process.currentPathAlloc(io, emit.gpa);
     defer emit.gpa.free(cwd);
-    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none };
+    const options: Elf.Options = .{ .entry = emit.entry, .values = emit.error_values.items, .diag = &diag, .debug = emit.debug.items, .comp_dir = cwd, .stack_size = emit.stack_size, .pic = emit.pic != .none, .local_symbols = emit.input_symbols };
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
     defer emit.gpa.free(imports);
     for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };

@@ -107,6 +107,17 @@ pub const Options = struct {
     /// the fields: thread-local relocations to imports, which have no
     /// address here, leave their fields alone.
     object: bool = false,
+    /// .symtab entries within atoms, after the atoms' own: the functions
+    /// and objects of C inputs, whose sections are atoms. Each takes its
+    /// type and section from its atom's place. Not with `symbols`.
+    local_symbols: []const LocalSymbol = &.{},
+};
+
+pub const LocalSymbol = struct {
+    name: []const u8,
+    atom: SymbolKey,
+    offset: u64,
+    size: u64,
 };
 
 pub const FileWrites = enum {
@@ -559,7 +570,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const n_partitions = std.math.ceilPowerOfTwoAssert(usize, @min(n_threads, 8));
 
     const numbered = options.symbols;
-    if (numbered) |s| if (s.atoms.len != n_atoms or (options.entry != null and s.entry >= s.len)) return error.InvalidSymbols;
+    if (numbered) |s| if (s.atoms.len != n_atoms or (options.entry != null and s.entry >= s.len) or options.local_symbols.len != 0) return error.InvalidSymbols;
     if (numbered) |s| if (options.dynamic) |d| if (s.dynamic_imports.len != d.imports.len or s.dynamic_exports.len != d.exports.len) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
     defer symbols.deinit();
@@ -652,6 +663,23 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         strtab_len += c.str_len;
         max_targets = @max(max_targets, c.max_targets);
         n_long_fdes += c.n_long_fdes;
+    }
+    // The local symbols' atoms, while `symbols` maps keys to atoms.
+    const local_atoms = try gpa.alloc(u32, options.local_symbols.len);
+    defer gpa.free(local_atoms);
+    const local_sym = n_syms;
+    const local_str = strtab_len;
+    for (options.local_symbols, local_atoms) |ls, *atom| {
+        atom.* = @intCast(symbols.get(ls.atom) orelse {
+            diag.* = .{ .atom = ls.name, .target = ls.atom };
+            return error.UndefinedSymbol;
+        });
+        if (ls.offset > input.atom(atom.*).size()) {
+            diag.* = .{ .atom = ls.name, .target = ls.atom };
+            return error.InvalidSymbols;
+        }
+        n_syms = std.math.add(u32, n_syms, 1) catch return error.OutOfMemory;
+        strtab_len += ls.name.len + 1;
     }
     // A shared object's dynamic tables, and the atoms of its exports.
     var dyn_arena: std.heap.ArenaAllocator = .init(gpa);
@@ -1009,6 +1037,29 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         });
         try l.put(dynamic_off, dynamic);
         // The GOT is zeros until the loader fills it.
+    }
+    if (local_atoms.len != 0) {
+        const syms = try gpa.alloc(elf.Elf64.Sym, local_atoms.len);
+        defer gpa.free(syms);
+        const strs = try gpa.alloc(u8, strtab_len - local_str);
+        defer gpa.free(strs);
+        var at: usize = 0;
+        for (options.local_symbols, local_atoms, syms) |ls, atom, *sym| {
+            const p = places[atom];
+            sym.* = .{
+                .name = @intCast(local_str + at),
+                .info = .{ .type = sym_types[p.section], .bind = .LOCAL },
+                .other = .{ .visibility = .DEFAULT },
+                .shndx = l.shndx[p.section],
+                .value = l.atomAddr(atom) + ls.offset - l.sym_bias[p.section],
+                .size = ls.size,
+            };
+            @memcpy(strs[at..][0..ls.name.len], ls.name);
+            strs[at + ls.name.len] = 0;
+            at += ls.name.len + 1;
+        }
+        try l.put(symtab_off + @as(u64, local_sym) * @sizeOf(elf.Elf64.Sym), std.mem.sliceAsBytes(syms));
+        try l.put(strtab_off + local_str, strs);
     }
     if (has_debug) {
         try l.put(abbrev_off, &Dwarf.abbrev);
@@ -2237,6 +2288,23 @@ test "links and runs a program that writes from rodata and exits with 42" {
     const conflicting = [_]Atom{ atoms[0], .{ .key = start, .name = "other", .section = .text, .bytes = "\xc3" } };
     try std.testing.expectError(error.DuplicateSymbol, emit(gpa, io, &conflicting, .{ .entry = start, .diag = &diag }));
     try std.testing.expectEqualStrings("other", diag.atom);
+
+    // Symbols within atoms (`local_symbols`) are at their atom's address
+    // plus their offset, and leave the rest of the image alone.
+    var with_locals = options;
+    with_locals.local_symbols = &.{
+        .{ .name = "write_msg_tail", .atom = write_msg, .offset = 5, .size = 3 },
+        .{ .name = "status_hi", .atom = status, .offset = 2, .size = 2 },
+    };
+    const local_bytes = try emit(gpa, io, &atoms, with_locals);
+    defer gpa.free(local_bytes);
+    try std.testing.expectEqual(testSymbolAddr(local_bytes, "write_msg").? + 5, testSymbolAddr(local_bytes, "write_msg_tail").?);
+    try std.testing.expectEqual(testSymbolAddr(local_bytes, "status").? + 2, testSymbolAddr(local_bytes, "status_hi").?);
+    try std.testing.expectEqual(testSymbolAddr(bytes, "write_msg").?, testSymbolAddr(local_bytes, "write_msg").?);
+    const text_sh = testSection(bytes, ".text").?;
+    try std.testing.expectEqualSlices(u8, bytes[text_sh.offset..][0..text_sh.size], local_bytes[text_sh.offset..][0..text_sh.size]);
+    with_locals.local_symbols = &.{.{ .name = "past_end", .atom = status, .offset = 5, .size = 0 }};
+    try std.testing.expectError(error.InvalidSymbols, emit(gpa, io, &atoms, with_locals));
 }
 
 test "a shared object links the same with numbered symbols" {
