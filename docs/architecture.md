@@ -2704,10 +2704,10 @@ differs from the design above:
   searches the native library directories (`std.zig.system.NativePaths`)
   when there are `-l` names, which zap does not yet.
 - Tests: a constructor test (priorities across two objects, a
-  destructor, with and without `-lc`), and an archive passed with
-  `-l`/`-L`.
-- Not yet: copy relocations, a COMDAT test, and timing SQLite and zlib
-  links against upstream.
+  destructor, with and without `-lc`), a COMDAT pair written in
+  assembly (in both orders), and an archive passed with `-l`/`-L`.
+- Not yet: copy relocations, and timing SQLite and zlib links against
+  upstream.
 
 **Stages and checks.**
 1. A: objects and archives into zap's static and `-lc` executables (the

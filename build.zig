@@ -988,6 +988,27 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&r.step);
     }
 
+    // Two objects with the same COMDAT group, in both orders: the first
+    // object's copy is kept, and both objects reach it.
+    var comdats: [2]std.Build.LazyPath = undefined;
+    for (&comdats, [_][]const u8{ "comdat1.s", "comdat2.s" }) |*o, src| {
+        const as = b.addSystemCommand(&.{ zig, "cc", "-c" });
+        as.addFileArg(b.path(b.fmt("test/link_input/{s}", .{src})));
+        o.* = as.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{src[0..7]}));
+    }
+    for ([_][2]usize{ .{ 0, 1 }, .{ 1, 0 } }, [_][]const u8{ "11 11\n", "22 22\n" }) |order, expect_comdat| {
+        const comdat_exe = b.addRunArtifact(zap);
+        comdat_exe.addArg("build-exe");
+        comdat_exe.addFileArg(b.path("test/link_input/comdat_main.zig"));
+        for (order) |k| comdat_exe.addFileArg(comdats[k]);
+        comdat_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, b.fmt("run zap link of COMDAT groups ({d} first)", .{order[0] + 1}));
+        r.addFileArg(comdat_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addCheck(.{ .expect_stderr_exact = expect_comdat });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
+
     // Undefined behavior and a smashed stack in C reach ubsan_rt's and the
     // stack protector's panics.
     const ub = b.addSystemCommand(&.{ zig, "cc", "-fstack-protector-all", "-fno-sanitize=bounds", "-c" });
