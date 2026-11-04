@@ -6113,8 +6113,18 @@ libraries as inputs. To be agreed with that thread.
   byte for the same CPU with upstream's own linker (`-fno-llvm
   -fno-lld`); a library of C only under `zig build` links with LLD by
   default, which writes llvm-ar's format (a 32-bit `/` index). A rootless module other than the root
-  contributes its C files to any build; a rootless root module of an
-  executable or `build-lib -dynamic` is `[unsupported]`.
+  contributes its C files to any build; a rootless root module of
+  `build-lib -dynamic` is `[unsupported]`.
+- **Executables of C only** (libxml2's xmllint): a rootless root
+  module, or C files and no module, in `build-exe` or `run` with `-lc`
+  (`Options.c_exe`). Upstream analyzes no Zig and links glibc's crt1.o;
+  zap's start code is Zig (`Builtin.glibc_start`), so the root file is
+  zap's `Builtin.c_main` (`<global>/zap/c_main/<hash>/c_main.zig`),
+  which declares `_start` so that std's start code exports neither
+  `_start` nor `main`. glibc_start.zig calls C's `main`, and the build
+  roots compiler_rt and ubsan_rt as any executable with C does, and
+  caches like one. Without `-lc` it stays `[unsupported]`, since C has
+  no `_start` of its own.
 - **Clang's arguments** (`CSource.zig`) are upstream's `addCCArgs` for
   zap's target and the baseline CPU, in Debug: the triple from the glibc
   version (native: detected, with or without `-lc`, as upstream's native

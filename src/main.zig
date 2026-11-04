@@ -134,6 +134,9 @@ pub const Options = struct {
     /// A static library of C sources only (no Zig root module): its
     /// archive holds their objects, and zap analyzes no Zig.
     c_only: bool = false,
+    /// An executable of C sources only, linking glibc: its root file is
+    /// zap's (`Builtin.c_main`), and C defines `main`.
+    c_exe: bool = false,
     c_global_cc_argv: []const []const u8 = &.{},
     /// `std.zig.system.NativePaths`' include directories, which upstream's
     /// C takes after libc's when a native build names system libraries
@@ -410,6 +413,7 @@ pub const Job = struct {
         }
         var job_opts = opts;
         job_opts.modules = modules;
+        if (opts.c_exe) job_opts.root_src_path = try Builtin.writeCMain(arena, init_.io, try std.fs.path.join(arena, &.{ cache_dirs.global, "zap" }));
         // A test that fuzzes links the fuzzer, whose module family has a
         // builtin of its own, as upstream's separate compilation of it (a
         // static library) does. Only the test runner references the
@@ -462,7 +466,7 @@ pub const Job = struct {
             .compile_args = compile_args.items,
             .link_objects = link_objects,
             .link_shared = link_shared,
-            .stem = opts.name orelse if (is_test) "test" else if (opts.c_only) std.fs.path.stem(opts.c_sources[0].path) else std.fs.path.stem(opts.root_src_path),
+            .stem = opts.name orelse if (is_test) "test" else if (opts.c_only or opts.c_exe) std.fs.path.stem(opts.c_sources[0].path) else std.fs.path.stem(opts.root_src_path),
             .run_test = is_test and !opts.test_no_exec and !opts.listen,
             .environ_map = init_.environ_map,
             .full_args = args,
@@ -1713,17 +1717,22 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // shared library would need them linked into it.
     if (c_files.items.len != 0 and (command == .build_obj or (command == .build_lib and opts.dynamic)))
         setUnsupported(&opts, arena, "zap does not compile C sources into objects or shared libraries yet ('{s}'); build this step with upstream zig", .{c_files.items[0].path});
-    // C sources without any module: a library of C only, as upstream's.
-    if (root == null and !rootless_root and c_files.items.len != 0 and command == .build_lib) rootless_root = true;
+    // C sources without any module: a library or executable of C only, as
+    // upstream's.
+    if (root == null and !rootless_root and c_files.items.len != 0 and command != .build_obj and command != .@"test") rootless_root = true;
     if (root == null and rootless_root) {
-        if (command != .build_lib or opts.dynamic)
-            setUnsupported(&opts, arena, "zap builds modules without a Zig root source file only into static libraries of C ('-M{s}'); build this step with upstream zig", .{opts.root_name})
+        // An executable whose main is C's, as upstream's; zap needs glibc
+        // for its start code (`Builtin.glibc_start`).
+        if ((command == .build_exe or command == .run) and opts.link_libc and c_files.items.len != 0)
+            opts.c_exe = true
+        else if (command != .build_lib or opts.dynamic)
+            setUnsupported(&opts, arena, "zap builds modules without a Zig root source file only into static libraries of C and executables of C that link glibc ('-M{s}'); build this step with upstream zig", .{opts.root_name})
         else if (c_files.items.len == 0)
             setUnsupported(&opts, arena, "zap builds a library without a Zig root source file only from C sources ('-M{s}')", .{opts.root_name})
         else
             opts.c_only = true;
     }
-    opts.root_src_path = root orelse if (opts.unsupported != null or opts.c_only) "" else fatal("expected a root source file", .{});
+    opts.root_src_path = root orelse if (opts.unsupported != null or opts.c_only or opts.c_exe) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
     // As upstream: `-L` directories that do not exist are left out, and
     // `-l` names also search the native library directories, after them.
@@ -1758,8 +1767,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     if (unique_rpaths.count() != 0) opts.runpath = try std.mem.join(arena, ":", unique_rpaths.keys());
     opts.modules = modules.items;
     // A root file given by position owns what no -M took, as upstream's;
-    // so does a library of C only.
-    if (positional_root or (opts.c_only and c_owned == 0)) {
+    // so does a library or executable of C only.
+    if (positional_root or ((opts.c_only or opts.c_exe) and c_owned == 0)) {
         c_flags.optimize = mode.optimize;
         root_c_flags = c_flags;
         const module_cc = try cc_argv.toOwnedSlice(arena);

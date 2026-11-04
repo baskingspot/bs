@@ -1180,6 +1180,20 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);
+    // An executable of C only, as upstream builds one: its main is C's.
+    {
+        const cexe = b.addRunArtifact(zap);
+        cexe.setName("zap build-exe -lc with only C sources");
+        cexe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+        cexe.addFileArg(b.path("test/link_input/cmain.c"));
+        cexe.setEnvironmentVariable("ZAP_ZIG", zig);
+        const cexe_run = std.Build.Step.Run.create(b, "run zap -lc build of only C sources");
+        cexe_run.addFileArg(cexe.addPrefixedOutputFileArg("-femit-bin=", "cmain"));
+        cexe_run.addArg("5");
+        cexe_run.addCheck(.{ .expect_stdout_exact = "argc=2 q=478165905515354922\n" });
+        cexe_run.addCheck(.{ .expect_term = .{ .exited = 7 } });
+        test_step.dependOn(&cexe_run.step);
+    }
     // compiler_rt for C: f128 and f16 conversions, comparisons and
     // arithmetic, 128-bit division and lock-based atomics, which zap
     // generates from upstream's compiler_rt (baseline, so that f16 needs

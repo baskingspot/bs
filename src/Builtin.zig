@@ -92,6 +92,35 @@ pub const glibc_start =
     \\
 ;
 
+/// The root file of an executable whose main is C's (a module of C sources
+/// only, linking glibc). Upstream analyzes no Zig for it; zap's executables
+/// need a Zig root for the start code, compiler_rt and ubsan_rt. std's
+/// start code still runs, and declares `_start` unless the root does;
+/// `glibc_start.zig` exports it.
+pub const c_main =
+    \\//! zap's root file for an executable whose `main` is C's: glibc_start.zig
+    \\//! calls it, and std's start code exports neither `main` nor `_start`.
+    \\
+    \\pub const _start = {};
+    \\
+;
+
+/// Writes `c_main` to `<cache_dir>/c_main/<content hash>/c_main.zig` unless
+/// it is already there, and returns that path.
+pub fn writeCMain(gpa: Allocator, io: Io, cache_dir: []const u8) ![]u8 {
+    var hash: [16]u8 = undefined;
+    std.crypto.hash.Blake3.hash(c_main, &hash, .{});
+    const path = try std.fmt.allocPrint(gpa, "{s}/c_main/{x}/c_main.zig", .{ cache_dir, &hash });
+    errdefer gpa.free(path);
+    const cwd = Io.Dir.cwd();
+    if (cwd.access(io, path, .{})) |_| return path else |_| {}
+    var atomic = try cwd.createFileAtomic(io, path, .{ .make_path = true, .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, c_main);
+    try atomic.replace(io);
+    return path;
+}
+
 pub fn generate(gpa: Allocator, opts: Options) Allocator.Error![]u8 {
     const libc = opts.glibc != null;
     // Objects and static libraries with -lc stay static and take no start
