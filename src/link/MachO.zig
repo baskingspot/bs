@@ -1794,7 +1794,10 @@ fn LinkOf(comptime Input: type) type {
                             .import => if (r.info.kind == .aarch64_got_load_page21) l.got_addr + 8 * t.v else return invalid,
                             .value => return invalid,
                         };
-                        if (r.info.kind == .aarch64_got_load_page21 and addend != 0) return invalid;
+                        // An image's own target relaxes to its address, which
+                        // may be inside an atom (a C object's symbol in its
+                        // section); a GOT slot holds an import's address alone.
+                        if (r.info.kind == .aarch64_got_load_page21 and addend != 0 and t.kind != .addr) return invalid;
                         const pages = pageDelta(s +% @as(u64, @bitCast(addend)), p);
                         if (pages < -(1 << 20) or pages >= 1 << 20) return error.RelocationOverflow;
                         std.mem.writeInt(u32, field[0..4], patchAdrp(insn, pages), .little);
@@ -1808,11 +1811,11 @@ fn LinkOf(comptime Input: type) type {
                     },
                     .aarch64_got_load_pageoff12 => {
                         // ldr xt, [xn, #imm12 * 8]
-                        if (insn & 0xffc00000 != 0xf9400000 or addend != 0) return invalid;
+                        if (insn & 0xffc00000 != 0xf9400000 or (addend != 0 and t.kind != .addr)) return invalid;
                         const v: u32 = switch (t.kind) {
                             .import => ((insn & 0xffc003ff) | @as(u32, @intCast(((l.got_addr + 8 * t.v) & 0xfff) >> 3)) << 10),
-                            // Defined here: add xt, xn, #lo12(S).
-                            .addr => 0x91000000 | (insn & 0x3ff) | @as(u32, @intCast(t.v & 0xfff)) << 10,
+                            // Defined here: add xt, xn, #lo12(S + A).
+                            .addr => 0x91000000 | (insn & 0x3ff) | @as(u32, @intCast((t.v +% @as(u64, @bitCast(addend))) & 0xfff)) << 10,
                             .value => return invalid,
                         };
                         std.mem.writeInt(u32, field[0..4], v, .little);
