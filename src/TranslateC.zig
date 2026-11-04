@@ -24,6 +24,7 @@ const cache = @import("cache.zig");
 const Frontend = @import("Frontend.zig");
 const Incremental = @import("Incremental.zig");
 const BuildRunner = @import("BuildRunner.zig");
+const ToolRecord = @import("ToolRecord.zig");
 
 const Request = struct {
     source: []const u8,
@@ -225,34 +226,6 @@ const Result = struct {
     errors: ?[]const u8 = null,
 };
 
-/// The record of one translation: `Header`, `n` `Entry`s, then the paths.
-const record_magic = "ZAPTC001".*;
-const Header = extern struct {
-    magic: [8]u8 = record_magic,
-    output_hash: cache.Hash,
-    n: u32,
-    paths_len: u32,
-};
-const Entry = extern struct {
-    inode: u64,
-    size: u64,
-    /// Nanoseconds, or `racy_mtime` when the file was too new to trust.
-    mtime: i64,
-    path_len: u32,
-    _pad: u32 = 0,
-    hash: cache.Hash,
-
-    /// A file changed within the timestamp granularity of its last read
-    /// could change again without changing its mtime, so it is recorded
-    /// with this mtime and rehashed by the next build (Frontend's rule).
-    const racy_mtime = std.math.minInt(i64);
-    const racy_window_ns = 2 * std.time.ns_per_s;
-
-    fn matches(e: Entry, st: Io.File.Stat) bool {
-        return e.mtime != racy_mtime and e.inode == st.inode and e.size == st.size and e.mtime == st.mtime.toNanoseconds();
-    }
-};
-
 fn translate(init: std.process.Init, req: *const Request) !Result {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -310,7 +283,7 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     const out_path = try std.fs.path.join(arena, &.{ out_dir, try std.fmt.allocPrint(arena, "{s}.zig", .{std.fs.path.stem(source)}) });
 
     var old_output: ?cache.Hash = null;
-    if (try checkRecord(arena, io, record_path, out_path, start_ns)) |c| switch (c) {
+    if (try ToolRecord.check(arena, io, record_path, out_path, start_ns)) |c| switch (c) {
         .hit => |inputs| return .{ .digest = digest, .cache_hit = true, .out_path = out_path, .inputs = inputs },
         .miss => |h| old_output = h,
     };
@@ -347,113 +320,16 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
         return .{ .digest = digest, .cache_hit = false, .out_path = out_path, .inputs = source, .errors = body };
     }
 
-    // Every file Aro read, from the depfile: the source, then headers.
-    const dep = try cwd.readFileAlloc(io, dep_path, arena, .unlimited);
-    var paths: std.ArrayList([]const u8) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var it: std.Build.Cache.DepTokenizer = .{ .bytes = dep };
-    while (it.next()) |tok| switch (tok) {
-        .target, .target_must_resolve => {},
-        .prereq, .prereq_must_resolve => {
-            var buf: std.ArrayList(u8) = .empty;
-            if (tok == .prereq_must_resolve) try tok.resolve(arena, &buf);
-            const p = try std.fs.path.resolve(arena, &.{ cwd_path, if (tok == .prereq) tok.prereq else buf.items });
-            if (!(try seen.getOrPut(arena, p)).found_existing) try paths.append(arena, p);
-        },
-        else => main.fatal("translate-c wrote an invalid depfile '{s}'", .{dep_path}),
-    };
-    if (!seen.contains(source)) try paths.insert(arena, 0, source);
-
-    var entries: std.ArrayList(Entry) = .empty;
-    var path_bytes: std.ArrayList(u8) = .empty;
-    for (paths.items) |p| {
-        const f = try cwd.openFile(io, p, .{});
-        defer f.close(io);
-        const st = try f.stat(io);
-        const bytes = try arena.alloc(u8, st.size);
-        _ = try f.readPositionalAll(io, bytes, 0);
-        try entries.append(arena, entry(st, cache.hash(0, bytes), p.len, start_ns));
-        try path_bytes.appendSlice(arena, p);
-    }
-
-    // The output: left alone when its bytes did not change, so that its
-    // stat stays as the compile step that imports it recorded.
-    const output = try cwd.readFileAlloc(io, tmp_out, arena, .unlimited);
-    const output_hash = cache.hash(0, output);
-    const same = old_output == output_hash and same: {
-        const old = cwd.readFileAlloc(io, out_path, arena, .unlimited) catch break :same false;
-        break :same std.mem.eql(u8, old, output);
-    };
-    if (!same) {
-        try cwd.createDirPath(io, out_dir);
-        try cwd.rename(tmp_out, cwd, out_path, io);
-    }
-    // Then the record, so that a record never names an output that is not
-    // there.
-    try cwd.createDirPath(io, std.fs.path.dirname(record_path).?);
-    const header: Header = .{ .output_hash = output_hash, .n = @intCast(entries.items.len), .paths_len = @intCast(path_bytes.items.len) };
-    try cache.writeReplace(io, cwd, record_path, &.{ std.mem.asBytes(&header), std.mem.sliceAsBytes(entries.items), path_bytes.items });
-    return .{ .digest = digest, .cache_hit = false, .out_path = out_path, .inputs = try std.mem.join(arena, "\x00", paths.items) };
-}
-
-fn entry(st: Io.File.Stat, hash: cache.Hash, path_len: usize, start_ns: i96) Entry {
-    const mtime: i64 = @intCast(st.mtime.toNanoseconds());
-    return .{
-        .inode = @intCast(st.inode),
-        .size = st.size,
-        .mtime = if (mtime >= start_ns - Entry.racy_window_ns) Entry.racy_mtime else mtime,
-        .path_len = @intCast(path_len),
-        .hash = hash,
-    };
-}
-
-const Check = union(enum) {
-    /// The recorded files, zero-separated.
-    hit: []const u8,
-    /// The output's recorded hash.
-    miss: cache.Hash,
-};
-
-/// Compares the record's files with the file system: a hit when every
-/// file stats as recorded or, rehashed, has the recorded contents (the
-/// record then takes the new stats). Null without a usable record.
-fn checkRecord(arena: std.mem.Allocator, io: Io, record_path: []const u8, out_path: []const u8, start_ns: i96) !?Check {
-    const cwd = Io.Dir.cwd();
-    const rec = cwd.readFileAlloc(io, record_path, arena, .limited(64 << 20)) catch return null;
-    if (rec.len < @sizeOf(Header)) return null;
-    const header = std.mem.bytesToValue(Header, rec[0..@sizeOf(Header)]);
-    const entries_end = @sizeOf(Header) + @as(usize, header.n) * @sizeOf(Entry);
-    if (!std.mem.eql(u8, &header.magic, &record_magic) or rec.len != entries_end + header.paths_len) return null;
-    const entries = try arena.alloc(Entry, header.n);
-    @memcpy(std.mem.sliceAsBytes(entries), rec[@sizeOf(Header)..entries_end]);
-    const paths = rec[entries_end..];
-    _ = cwd.statFile(io, out_path, .{}) catch return .{ .miss = header.output_hash };
-    var inputs: std.ArrayList(u8) = .empty;
-    var changed = false;
-    var at: usize = 0;
-    for (entries) |*e| {
-        const p = paths[at..][0..e.path_len];
-        at += e.path_len;
-        if (inputs.items.len != 0) try inputs.append(arena, 0);
-        try inputs.appendSlice(arena, p);
-        const f = cwd.openFile(io, p, .{}) catch return .{ .miss = header.output_hash };
-        defer f.close(io);
-        const st = f.stat(io) catch return .{ .miss = header.output_hash };
-        if (e.matches(st)) continue;
-        const bytes = try arena.alloc(u8, st.size);
-        _ = f.readPositionalAll(io, bytes, 0) catch return .{ .miss = header.output_hash };
-        const h = cache.hash(0, bytes);
-        if (h != e.hash) return .{ .miss = header.output_hash };
-        e.* = entry(st, h, e.path_len, start_ns);
-        changed = true;
-    }
-    if (changed) {
-        cache.writeReplace(io, cwd, record_path, &.{ rec[0..@sizeOf(Header)], std.mem.sliceAsBytes(entries), paths }) catch {};
-    } else {
-        // The record's mtime is its last use, for trimming the cache.
-        cwd.setTimestampsNow(io, record_path, .{}) catch {};
-    }
-    return .{ .hit = inputs.items };
+    const inputs = ToolRecord.commit(arena, io, .{
+        .record_path = record_path,
+        .out_path = out_path,
+        .tmp_out = tmp_out,
+        .dep_path = dep_path,
+        .source = source,
+        .old_output = old_output,
+        .start_ns = start_ns,
+    }) catch |err| main.fatal("unable to record the translation of '{s}': {t}", .{ source, err });
+    return .{ .digest = digest, .cache_hit = false, .out_path = out_path, .inputs = inputs };
 }
 
 /// Upstream's `-mcpu`: the model and every feature, each `+` or `-`.
