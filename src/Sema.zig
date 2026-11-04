@@ -9979,7 +9979,12 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
             const rv = sema.resolveValue(rhs);
             if (lv != null and rv != null) try sema.failUndefOperand(block, src, lv, rv);
             const known = lv != null and rv != null;
-            if (tag == .div and !known) return sema.fail(block, src, "division with '{f}' and '{f}': signed integers must use @divTrunc, @divFloor, or @divExact", .{ sema.fmtType(ty), sema.fmtType(ty) });
+            if (tag == .div and !known) {
+                // A known operand is checked first, as upstream.
+                try sema.failUndefOperand(block, src, lv, rv);
+                if (rv != null and sema.intSign(rv.?) == 0) return sema.fail(block, src.operandSrc(1), "division by zero here causes illegal behavior", .{});
+                return sema.fail(block, src, "division with '{f}' and '{f}': signed integers must use @divTrunc, @divFloor, or @divExact", .{ sema.fmtType(ty), sema.fmtType(ty) });
+            }
             if (tag == .mod_rem) {
                 const maybe_negative = !known or sema.intSign(lv.?) < 0 or sema.intSign(rv.?) < 0;
                 if (maybe_negative) {
