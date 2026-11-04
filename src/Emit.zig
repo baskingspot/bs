@@ -32,6 +32,7 @@ const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const Ssa = @import("codegen/Ssa.zig");
 const inline_ir = @import("codegen/inline.zig");
 const rewrite = @import("codegen/rewrite.zig");
+const prove = @import("codegen/prove.zig");
 const Sema = @import("Sema.zig");
 const cache = @import("cache.zig");
 
@@ -163,6 +164,8 @@ bench_irs: ?std.ArrayList(Ir) = null,
 ssa: Ssa = .{},
 /// `rewrite.run`'s arrays, reused for the next function.
 rewrite_scratch: std.ArrayList(u32) = .empty,
+/// `prove.run`'s arrays, on a worker, reused for the next function.
+prove_scratch: prove.Scratch = .{},
 /// Per-stage backend time and size, for `ZAP_TIMING` and bench-codegen.
 codegen_stats: CodeGenStats = .{},
 /// The CodeGen workers, on the main Emit (`startPool`).
@@ -335,6 +338,11 @@ pub const CodeGenStats = struct {
     /// instructions and branches they folded.
     rewrite_ns: u64 = 0,
     folds: u64 = 0,
+    /// Proving checks (`prove.run`, on the workers), and the checks
+    /// proven.
+    prove_ns: u64 = 0,
+    checks: u64 = 0,
+    proven: u64 = 0,
     /// Building the SSA form from the IR.
     build_ns: u64 = 0,
     /// Liveness and register allocation.
@@ -359,13 +367,17 @@ pub const CodeGenStats = struct {
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.f;
-        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
+        std.debug.print("{s}: {d} functions, {d} IR instructions; rewrite {d:.1} ms ({d:.1} ns/IR, {d} folds), prove {d:.1} ms ({d:.1} ns/IR, {d} of {d} checks proven), ssa build {d:.1} ms ({d:.1} ns/IR), regalloc {d:.1} ms ({d:.1} ns/IR), emit {d:.1} ms ({d:.1} ns/IR), total {d:.1} ns/IR; {d:.2} code bytes/IR, {d:.0} frame bytes/function\n", .{
             label,
             s.functions,
             s.ir_insts,
             ms(s.rewrite_ns),
             per(s.rewrite_ns, s.ir_insts),
             s.folds,
+            ms(s.prove_ns),
+            per(s.prove_ns, s.ir_insts),
+            s.proven,
+            s.checks,
             ms(s.build_ns),
             per(s.build_ns, s.ir_insts),
             ms(s.alloc_ns),
@@ -440,6 +452,7 @@ pub fn deinit(emit: *Emit) void {
     emit.link_content_uses.deinit(gpa);
     emit.ssa.deinit(gpa);
     emit.rewrite_scratch.deinit(gpa);
+    emit.prove_scratch.deinit(gpa);
     if (emit.bench_irs) |*irs| {
         for (irs.items) |*ir| ir.deinit(gpa);
         irs.deinit(gpa);
@@ -929,6 +942,11 @@ fn generateFunction(emit: *Emit, ir: *const Ir) Allocator.Error!void {
     const io = emit.zcu.io;
     const t0 = std.Io.Timestamp.now(io, .awake);
     defer emit.codegen_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
+    // The IR is this job's own.
+    const st = try prove.run(emit.gpa, &emit.zcu.ip, @constCast(ir), &emit.prove_scratch);
+    emit.codegen_stats.prove_ns += @intCast(t0.durationTo(.now(io, .awake)).nanoseconds);
+    emit.codegen_stats.checks += st.checks;
+    emit.codegen_stats.proven += st.proven;
     CodeGen.generate(emit, ir) catch |err| switch (err) {
         error.CodegenFail => emit.failed = true,
         else => |e| return e,

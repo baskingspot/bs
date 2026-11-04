@@ -1148,8 +1148,9 @@ In this order, each with the measured reason it is there:
    known.
 
 Not in the list, on purpose: global value numbering, loop-invariant code
-motion, bounds-check elimination, strength reduction beyond what
-lowering's folding does, and scheduling. Each needs either analysis
+motion, strength reduction beyond what lowering's folding does, and
+scheduling. (Bounds-check elimination by proof, which moves nothing, is
+its own pass before the SSA: "Proving checks" below.) Each needs either analysis
 that does not fit the budget or code motion that hurts debugging; they
 can be measured later against the same benchmarks.
 
@@ -1512,6 +1513,44 @@ A `cond_br` whose condition became constant keeps only the taken body
 stays a cold block. Integers over 64 bits and floats are left alone (a
 float compare of `x` with itself is false for NaN). Most matches come
 from inlining, where a parameter becomes the caller's constant.
+
+#### Proving checks
+
+Built on the IR, after the rewrite rules (`src/codegen/prove.zig`), as
+Go's `prove` and `loopbce`: one forward walk per function on its CodeGen
+worker (`Emit.generateFunction`, before `CodeGen.generate`) keeps the
+integer comparisons known to hold at each point and removes a safety
+check whose condition they prove, by making its `cond_br`'s condition a
+constant (`Ssa.build` then builds only the passing side). Only Sema's
+own branches with a failing side (`unreach` or `trap`) are decided, and
+only toward the passing side; nothing moves, and user branches, which
+are `-ffuzz` coverage points, are only learned from.
+
+- **Values.** Facts relate values, not instructions. A load of a
+  variable (an alloc only loaded from and stored to, found by one scan
+  of the function first) is the value its last store stored when that is
+  known, else the variable at a version. The version changes at each
+  store, at each loop entry (a later store in the loop reaches the
+  loop's start through the back edge), and where paths that stored it
+  merge (after a `cond_br`, a `switch_br`, a loop, or a block that its
+  `br`s leave from more than one place). A `*const` alloc stored once is
+  its value, `slice_len` of equal slices are equal and of a `slice` its
+  length operand, and a widening `intcast` is its operand.
+- **Facts.** A branch's condition (a compare, `not`, the `and` of two
+  in its true side, the `or` of two in its false side) holds in the
+  side it leads to, negated in the other. What held at every `br` that
+  leaves a block holds after it, so a check passed holds for the rest of
+  its block (`s[i]` twice checks once) and an early return's negation
+  holds after it (`if (n < 2) return n;`). The 64 most recent facts are
+  searched, which keeps functions with thousands of checks linear.
+- **Proofs.** A compare follows from a fact on the same operands, from
+  constant bounds the facts give each operand (with `x < y` bounding
+  `x` by the type's maximum less one), and from `x < y` for `x + 1 <=
+  y` and back. An overflow check of an addition, subtraction, or
+  unsigned multiplication goes when its operands' bounds exclude
+  overflow, or for `a - b` when `b <= a` holds (`i + 1` after `i < len`,
+  `n - 1` after `n >= 2`); the operation's value read then becomes the
+  wrapping operation, so the overflow bit is not computed.
 
 #### Compile-time budget and how it is measured
 
