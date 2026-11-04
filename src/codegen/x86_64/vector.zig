@@ -184,7 +184,34 @@ pub fn deferOperands(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index)
     };
     const pos = cg.ssa.live.items(.def)[@backingInt(inst)];
     const bitcast = cg.ir.instructions.items(.tag)[@backingInt(inst)] == .bitcast;
+    // A bitcast that the next value, a vector operation, alone reads is
+    // better read in place by that operation (a `view`).
+    if (bitcast and cg.ssa.live.items(.uses)[@backingInt(inst)] == 1 and viewedByNext(cg, inst, before)) return;
     Ssa.forEachOperand(cg.ir, inst, T{ .cg = cg, .before = before, .at = pos, .bitcast = bitcast });
+}
+
+/// For `deferOperands`: whether the value after `inst` in its block
+/// (`before` are the ones before it) reads `inst` chunk by chunk.
+fn viewedByNext(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index) bool {
+    const all = cg.ssa.values.items(.inst);
+    var j = (@intFromPtr(before.ptr) - @intFromPtr(all.ptr)) / @sizeOf(Inst.Index) + before.len;
+    std.debug.assert(all[j] == inst);
+    const tags = cg.ir.instructions.items(.tag);
+    const next = while (j + 1 < all.len) {
+        j += 1;
+        if (tags[@backingInt(all[j])] != .dbg_stmt) break all[j];
+    } else return false;
+    if (!readsChunks(cg, next)) return false;
+    const T = struct {
+        inst: Inst.Index,
+        found: *bool,
+        pub fn use(t: @This(), ref: Ref) void {
+            if (ref.toIndex() == t.inst) t.found.* = true;
+        }
+    };
+    var found = false;
+    Ssa.forEachOperand(cg.ir, next, T{ .inst = inst, .found = &found });
+    return found;
 }
 
 /// For `deferOperands`: `@reduce(.Min, @select(T, pred, iota, @splat(m)))`
@@ -245,10 +272,18 @@ fn reduceIndex(cg: *CodeGen, inst: Inst.Index, ty: Index, op: Ir.ReduceOp, opera
     const sel = ir.extraData(Ir.Select, ir.instructions.items(.data)[@backingInt(operand.toIndex().?)].ty_pl.payload).data;
     const len = cg.ip.keyPayload(.vector_type, cg.typeOf(operand)).len;
     const d = cg.destReg(inst);
-    try cg.load(.rax, sel.pred);
-    try andImm(cg, .rax, lenMask(len));
+    // Bits filling their bytes are scanned where they are (see
+    // `bitsFlags`).
+    const src: Reg = if (exactBits(len)) if (sel.pred.toIndex()) |p| switch (cg.homes[@backingInt(p)]) {
+        .reg => |r| r,
+        else => .rax,
+    } else .rax else .rax;
+    if (src == .rax) {
+        try cg.load(.rax, sel.pred);
+        if (!exactBits(len)) try andImm(cg, .rax, lenMask(len));
+    }
     try e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @bitCast(splatBits(cg, sel.b.toInterned().?).?) });
-    try e.bitScan(op == .max, .qword, .rax, .{ .reg = .rax });
+    try e.bitScan(op == .max, .qword, .rax, .{ .reg = src });
     try e.cmov(.e, .qword, .rax, .{ .reg = .rcx });
     if (d != .rax) try e.mov(.qword, .{ .reg = d }, .{ .reg = .rax });
     try cg.setResult(inst, ty, d);
@@ -741,6 +776,8 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
     const n = s.perChunk();
     const biased = !s.lane.isFloat() and !signed and op != .eq and op != .neq;
     const sign: ?Mem = if (biased) try signMem(cg, s.lane) else null;
+    // One chunk's lane bits go straight to the result's register.
+    const t: Reg = if (s.chunks() == 1) d else .rcx;
     for (0..s.chunks()) |kk| {
         const k: u32 = @intCast(kk);
         try loadChunk(cg, .xmm0, a, k);
@@ -755,10 +792,10 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
                 // b < a, b <= a.
                 try loadChunk(cg, .xmm1, b, k);
                 try e.cmpp(s.float(), .xmm1, .{ .reg = .xmm0 }, pred);
-                try e.movmskp(s.float(), .rcx, .xmm1);
+                try e.movmskp(s.float(), t, .xmm1);
             } else {
                 try e.cmpp(s.float(), .xmm0, try srcChunk(cg, b, k, .xmm1), pred);
-                try e.movmskp(s.float(), .rcx, .xmm0);
+                try e.movmskp(s.float(), t, .xmm0);
             }
         } else {
             if ((op == .eq or op == .neq) and s.lane == .i64 and has(cg, .sse4_1)) {
@@ -787,19 +824,19 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
                 }
             }
             switch (s.lane) {
-                .i8 => try e.pmovmskb(.rcx, .xmm0),
+                .i8 => try e.pmovmskb(t, .xmm0),
                 .i16 => {
                     try e.pint(.packsswb, .xmm0, .{ .reg = .xmm0 });
-                    try e.pmovmskb(.rcx, .xmm0);
-                    try e.movzx(.dword, .rcx, .byte, .{ .reg = .rcx });
+                    try e.pmovmskb(t, .xmm0);
+                    try e.movzx(.dword, t, .byte, .{ .reg = t });
                 },
-                .i32 => try e.movmskp(.f32, .rcx, .xmm0),
-                .i64 => try e.movmskp(.f64, .rcx, .xmm0),
+                .i32 => try e.movmskp(.f32, t, .xmm0),
+                .i64 => try e.movmskp(.f64, t, .xmm0),
                 else => unreachable,
             }
         }
         if (k == 0) {
-            try e.mov(.dword, .{ .reg = d }, .{ .reg = .rcx });
+            if (t != d) try e.mov(.dword, .{ .reg = d }, .{ .reg = .rcx });
         } else {
             try e.shift(.shl, .qword, .{ .reg = .rcx }, @intCast(k * n));
             try e.alu(.@"or", .qword, .{ .reg = d }, .{ .reg = .rcx });
@@ -814,17 +851,75 @@ fn compare(cg: *CodeGen, inst: Inst.Index, ty: Index, op: std.math.CompareOperat
 
 /// `@reduce` of bool vector `operand`'s bits.
 fn reduceBits(cg: *CodeGen, inst: Inst.Index, op: Ir.ReduceOp, operand: Ref) Error!void {
+    if (cg.homes[@backingInt(inst)] == .fused) return; // read by its branch
+    const cc = try bitsFlags(cg, op, operand);
+    const d = cg.destReg(inst);
+    try cg.e.setcc(cc, .{ .reg = d });
+    try cg.e.movzx(.dword, d, .byte, .{ .reg = d });
+    try cg.setResult(inst, .bool_type, d);
+}
+
+/// For `CodeGen.fusable`: whether `inst` is an `@reduce(.Or)` or
+/// `@reduce(.And)` of a bool vector's bits, which a branch reads from the
+/// flags (`condFlags`).
+pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    const x = cg.ir.extraData(Ir.Reduce, data.ty_pl.payload).data;
+    return isBits(cg.ip, cg.typeOf(x.operand)) and (x.operation() == .@"or" or x.operation() == .@"and");
+}
+
+/// For `CodeGen.condFlags`: sets the flags for fused reduce `inst`
+/// (`fusable`) and returns the condition that is its result.
+pub fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    const x = cg.ir.extraData(Ir.Reduce, data.ty_pl.payload).data;
+    return bitsFlags(cg, x.operation(), x.operand);
+}
+
+/// Whether the bits of a bool vector of `len` lanes above the length are
+/// known 0: they are in a register, and a load of a vector whose bits fill
+/// its bytes zero-extends them, but other lengths may read padding from
+/// memory.
+fn exactBits(len: u32) bool {
+    return len == 8 or len == 16 or len == 32 or len == 64;
+}
+
+/// Sets the flags for `@reduce(op)` of bool vector `operand`'s bits and
+/// returns the condition that is its result. Uses rax, rcx and r11.
+fn bitsFlags(cg: *CodeGen, op: Ir.ReduceOp, operand: Ref) Error!Encoder.Cond {
     const e = &cg.e;
-    const mask = lenMask(cg.ip.keyPayload(.vector_type, cg.typeOf(operand)).len);
+    const len = cg.ip.keyPayload(.vector_type, cg.typeOf(operand)).len;
+    const mask = lenMask(len);
+    const exact = exactBits(len);
+    const size: Encoder.Size = if (len > 32) .qword else .dword;
+    // Bits already in a register are tested in place.
+    if (exact) if (operand.toIndex()) |o| if (cg.homes[@backingInt(o)] == .reg) {
+        const r = cg.homes[@backingInt(o)].reg;
+        switch (op) {
+            .@"or" => {
+                try e.@"test"(size, .{ .reg = r }, .{ .reg = r });
+                return .ne;
+            },
+            .@"and" => {
+                const imm: i32 = if (len >= 32) -1 else @intCast(mask);
+                try e.alu(.cmp, size, .{ .reg = r }, .{ .imm = imm });
+                return .e;
+            },
+            else => {},
+        }
+    };
     try cg.load(.rax, operand);
-    try andImm(cg, .rax, mask);
-    const cc: Encoder.Cond = switch (op) {
-        .@"or" => .ne,
-        .@"and" => blk: {
-            try xorImm(cg, .rax, mask);
-            break :blk .e;
+    if (!exact) try andImm(cg, .rax, mask);
+    switch (op) {
+        .@"or" => {
+            try e.@"test"(size, .{ .reg = .rax }, .{ .reg = .rax });
+            return .ne;
         },
-        .xor => blk: {
+        .@"and" => {
+            try xorImm(cg, .rax, mask);
+            return .e;
+        },
+        .xor => {
             // The parity of the bits, folded into the low byte.
             for ([_]u8{ 32, 16, 8 }) |sh| {
                 try e.mov(.qword, .{ .reg = .rcx }, .{ .reg = .rax });
@@ -832,15 +927,10 @@ fn reduceBits(cg: *CodeGen, inst: Inst.Index, op: Ir.ReduceOp, operand: Ref) Err
                 try e.alu(.xor, .qword, .{ .reg = .rax }, .{ .reg = .rcx });
             }
             try e.@"test"(.byte, .{ .reg = .rax }, .{ .reg = .rax });
-            break :blk .np;
+            return .np;
         },
         else => unreachable,
-    };
-    if (op != .xor) try e.@"test"(.qword, .{ .reg = .rax }, .{ .reg = .rax });
-    const d = cg.destReg(inst);
-    try e.setcc(cc, .{ .reg = d });
-    try e.movzx(.dword, d, .byte, .{ .reg = d });
-    try cg.setResult(inst, .bool_type, d);
+    }
 }
 
 /// `@reduce` of integer lanes: the chunks combined, the lanes past the

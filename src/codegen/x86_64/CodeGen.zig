@@ -1733,6 +1733,7 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => cg.scalarOperand(data.bin_op.lhs) or
             (cg.inFloat(cg.typeOf(data.bin_op.lhs)) and floatCc(cg.ir.instructions.items(.tag)[@backingInt(inst)]) != null),
         .is_err, .is_non_err, .is_null, .is_non_null => true,
+        .reduce => vector.fusable(cg, inst),
         else => false,
     };
 }
@@ -2005,6 +2006,7 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
     const tag = cg.ir.instructions.items(.tag)[@backingInt(inst)];
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
     switch (tag) {
+        .reduce => return vector.condFlags(cg, inst),
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
             if (data.bin_op.lhs.toIndex()) |bit| if (cg.homes[@backingInt(bit)] == .fused) {
                 // An overflow bit left in the flags.
