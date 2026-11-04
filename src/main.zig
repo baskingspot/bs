@@ -1089,6 +1089,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // An executable or shared library links the C objects and the C++
     // runtime libraries; a static library holds the objects as members.
     link_inputs.shared = emit.shared;
+    link_inputs.dynamic = glibc != null or emit.shared;
     if (c_batch) |b| if (!emit.obj or emit.shared) {
         emit.inputs = &link_inputs;
         emit.c_batch = b;

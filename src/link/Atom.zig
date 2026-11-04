@@ -254,6 +254,11 @@ pub const Reloc = extern struct {
         /// with no symbol and addend S + A minus the start of the TLS
         /// segment), for `lea rax, [rip + desc]; call [rax]`.
         x86_64_tlsdesc,
+        /// 64-bit address of GNU indirect function S's implementation,
+        /// which the loader gets by calling resolver S + A (ELF
+        /// R_X86_64_IRELATIVE, addend S + A), in an image the loader
+        /// relocates: the slot `jmp [rip + slot]` stubs read.
+        x86_64_irelative,
     };
 };
 

@@ -1901,6 +1901,8 @@ fn LinkOf(comptime Input: type) type {
                 // A shared object's module ID, for `__tls_get_addr`, and
                 // its TLS descriptors.
                 .x86_64_dtpmod64, .x86_64_tlsdesc => return l.exe_imports == null,
+                // Every image's indirect functions.
+                .x86_64_irelative => return true,
                 else => return false,
             }
             const imports = l.exe_imports orelse return true;
@@ -2207,6 +2209,8 @@ fn LinkOf(comptime Input: type) type {
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.DTPMOD64), .sym = 0 }, .addend = 0 }
                         else if (r.info.kind == .x86_64_tlsdesc)
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.TLSDESC), .sym = 0 }, .addend = @bitCast(v -% l.tls.start) }
+                        else if (r.info.kind == .x86_64_irelative)
+                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.IRELATIVE), .sym = 0 }, .addend = @bitCast(v) }
                         else if (t >= l.plt_start and t < l.plt_end)
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(if (r.info.kind == .x86_64_tpoff64) elf.R_X86_64.TPOFF64 else elf.R_X86_64.@"64"), .sym = @intCast(1 + (t - l.plt_start) / ElfDynamic.plt_entry_size) }, .addend = r.addend }
                         else
@@ -2436,7 +2440,9 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
                 const v = @as(i64, @bitCast(s -% (p_base + r.offset))) +% r.addend;
                 std.mem.writeInt(i32, f, std.math.cast(i32, v) orelse return overflow(a, r, diag), .little);
             },
-            .x86_64_abs64 => {
+            // The resolver's address until the loader calls it, as
+            // upstream writes it.
+            .x86_64_abs64, .x86_64_irelative => {
                 const f = try relocField(a, dst, r.offset, 8, diag);
                 std.mem.writeInt(u64, f, s +% @as(u64, @bitCast(@as(i64, r.addend))), .little);
             },

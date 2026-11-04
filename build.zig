@@ -1427,20 +1427,52 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         undef.addCheck(.{ .expect_term = .{ .exited = 1 } });
         test_step.dependOn(&undef.step);
     }
+    // GNU indirect functions: through a stub and a slot the loader fills
+    // (R_X86_64_IRELATIVE) in an executable linking glibc and in a shared
+    // library, as upstream's; refused in a static executable, where
+    // nothing would call the resolvers.
     {
-        // A GNU indirect function: refused, not linked as a plain function.
-        const ifunc = b.addRunArtifact(zap);
-        ifunc.setName("zap build-exe refuses a C object's GNU indirect function");
-        ifunc.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
-        ifunc.addFileArg(b.path("test/link_input/ifunc_main.zig"));
-        const o = b.addSystemCommand(&.{ zig, "cc", "-c" });
+        const expect_ifunc = "42 42 6 15 9 true true\n";
+        const o = b.addSystemCommand(&.{ zig, "cc", "-fPIC", "-c" });
         o.addFileArg(b.path("test/link_input/ifunc.c"));
-        ifunc.addFileArg(o.addPrefixedOutputFileArg("-o", "ifunc.o"));
-        ifunc.setEnvironmentVariable("ZAP_CACHE", "off");
-        _ = ifunc.addPrefixedOutputFileArg("-femit-bin=", "main");
-        ifunc.addCheck(.{ .expect_stderr_match = "ifunc.o: zap does not link GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) yet: c_triple;" });
-        ifunc.addCheck(.{ .expect_term = .{ .exited = 1 } });
-        test_step.dependOn(&ifunc.step);
+        const ifunc_o = o.addPrefixedOutputFileArg("-o", "ifunc.o");
+        const ifunc_exe = b.addRunArtifact(zap);
+        ifunc_exe.setName("zap build-exe -lc with GNU indirect functions");
+        ifunc_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+        ifunc_exe.addFileArg(b.path("test/link_input/ifunc_main.zig"));
+        ifunc_exe.addFileArg(ifunc_o);
+        ifunc_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        const ifunc_exe_run = std.Build.Step.Run.create(b, "run zap's link of GNU indirect functions");
+        ifunc_exe_run.addFileArg(ifunc_exe.addPrefixedOutputFileArg("-femit-bin=", "ifunc"));
+        ifunc_exe_run.addCheck(.{ .expect_stderr_exact = expect_ifunc });
+        ifunc_exe_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&ifunc_exe_run.step);
+        const ifunc_lib = b.addRunArtifact(zap);
+        ifunc_lib.setName("zap build-lib -dynamic with GNU indirect functions");
+        ifunc_lib.addArgs(&.{ "build-lib", "-dynamic", "--name", "zapifunc" });
+        ifunc_lib.addFileArg(b.path("test/link_input/ifunc_lib.zig"));
+        ifunc_lib.addFileArg(ifunc_o);
+        const ifunc_lib_file = ifunc_lib.addPrefixedOutputFileArg("-femit-bin=", "libzapifunc.so");
+        const ifunc_lib_host = b.addSystemCommand(&.{ zig, "build-exe", "-lc" });
+        ifunc_lib_host.addFileArg(b.path("test/link_input/ifunc_main.zig"));
+        ifunc_lib_host.addFileArg(ifunc_lib_file);
+        const ifunc_lib_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
+        ifunc_lib_run.setName("run ifunc_main (zap shared library with GNU indirect functions)");
+        ifunc_lib_run.addFileArg(ifunc_lib_file);
+        ifunc_lib_run.addFileArg(ifunc_lib_host.addPrefixedOutputFileArg("-femit-bin=", "ifunc_main"));
+        ifunc_lib_run.addCheck(.{ .expect_stderr_exact = expect_ifunc });
+        ifunc_lib_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&ifunc_lib_run.step);
+        const ifunc_static = b.addRunArtifact(zap);
+        ifunc_static.setName("zap build-exe refuses GNU indirect functions without libc");
+        ifunc_static.addArg("build-exe");
+        ifunc_static.addFileArg(b.path("test/link_input/ifunc_main.zig"));
+        ifunc_static.addFileArg(ifunc_o);
+        ifunc_static.setEnvironmentVariable("ZAP_CACHE", "off");
+        _ = ifunc_static.addPrefixedOutputFileArg("-femit-bin=", "ifunc");
+        ifunc_static.addCheck(.{ .expect_stderr_match = "ifunc.o: zap links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: c_triple\n" });
+        ifunc_static.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        test_step.dependOn(&ifunc_static.step);
     }
     {
         const dead = b.addRunArtifact(zap);

@@ -1833,7 +1833,7 @@ fn LinkOf(comptime Input: type) type {
                             std.mem.writeInt(u32, field[0..4], insn | @as(u32, @intCast(t.v & 0xfff)) << 10, .little);
                         }
                     },
-                    .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32, .x86_64_tlsld, .x86_64_dtpoff32, .x86_64_gottpoff, .x86_64_tlsgd, .x86_64_abs32, .x86_64_abs32s, .x86_64_tpoff64, .x86_64_dtpmod64, .x86_64_tlsdesc => return invalid,
+                    .x86_64_abs64, .x86_64_pc32, .x86_64_tpoff32, .x86_64_tlsld, .x86_64_dtpoff32, .x86_64_gottpoff, .x86_64_tlsgd, .x86_64_abs32, .x86_64_abs32s, .x86_64_tpoff64, .x86_64_dtpmod64, .x86_64_tlsdesc, .x86_64_irelative => return invalid,
                 }
             }
         }

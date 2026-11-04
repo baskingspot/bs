@@ -2944,11 +2944,19 @@ symbol or a local becomes (section atom, value + addend).
   (`x86_64_tlsgd`/`x86_64_tlsld`, the GOT pairs made by ElfDynamic). IE
   in a shared object is `[unsupported]` until something needs it.
 - GNU indirect functions (STT_GNU_IFUNC, from `__attribute__((ifunc))`
-  and `target_clones`) in a linked object are an error naming each one
-  (2026-11-04): they need IRELATIVE relocations, which the libc startup
-  (static) or the loader (dynamic) applies, and PLT/GOT entries for
-  calls and addresses; until then, linking them as plain functions
-  would call the resolver instead.
+  and `target_clones`; built 2026-11-04), as upstream's: each resolver
+  gets an 8-byte slot in .data whose `x86_64_irelative` relocation
+  becomes R_X86_64_IRELATIVE (no symbol, addend the resolver's address),
+  which the loader applies after the image's other relocations, and an
+  8-byte stub `jmp [rip + slot]` in .text, content-addressed
+  (`ElfInput.ifuncAtoms`). The function's symbol is the stub
+  (`symTarget`): calls, addresses taken by C and by Zig, and a shared
+  library's export all use it, so a pointer compares equal whoever took
+  it, as upstream's canonical PLT entry. Only images the loader
+  relocates take them (`Inputs.dynamic`: an executable linking glibc,
+  or a shared library); a static executable has no startup code that
+  would call the resolvers (glibc's static `apply_irel` is not linked),
+  so there they are an error naming each one.
 - Thread-locals imported from shared libraries (built 2026-11-04;
   ElfShared keeps STT_TLS symbols, and the import is STT_TLS in
   .dynsym): initial-exec through a content-addressed 8-byte slot

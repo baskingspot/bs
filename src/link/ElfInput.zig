@@ -39,6 +39,10 @@ errors: std.ArrayList([]const u8) = .empty,
 /// The output is a shared object (`build-lib -dynamic`): thread-locals
 /// keep their dynamic models, and absolute 32-bit addresses are errors.
 shared: bool = false,
+/// The loader relocates the output (an executable linking glibc, or a
+/// shared object): GNU indirect functions resolve through it
+/// (`ifuncAtoms`); otherwise they are errors.
+dynamic: bool = false,
 
 pub const Def = struct { object: u32, sym: u32, weak: bool };
 pub const Common = struct { size: u64, alignment: u64 };
@@ -295,10 +299,12 @@ pub const undefined_weak_key: SymbolKey = .fromName("obj:undefined-weak");
 /// addend only moves a section symbol's target, as lld's), or null for an
 /// absolute symbol.
 fn symTarget(in: *Inputs, o: *const Object, s: u32, addend: i64) Allocator.Error!?Target {
-    _ = in;
     const sym = o.syms[s];
     const shndx = sym.st_shndx;
     if (shndx == elf.SHN_ABS or shndx >= elf.SHN_LORESERVE or shndx == elf.SHN_UNDEF) return null;
+    // An indirect function is its stub, the address calls and pointers
+    // use, as upstream's canonical PLT entry.
+    if (sym.st_type() == elf.STT_GNU_IFUNC and in.dynamic) return .{ .key = (try in.ifuncAtoms(o, s)).stub.key, .offset = 0 };
     const sh = o.shdrs[shndx];
     const offset: u64 = sym.st_value;
     if (sh.sh_flags & elf.SHF_MERGE != 0) {
@@ -307,6 +313,23 @@ fn symTarget(in: *Inputs, o: *const Object, s: u32, addend: i64) Allocator.Error
         return .{ .key = piece.key, .offset = offset -% piece.start };
     }
     return .{ .key = sectionKey(o, shndx), .offset = offset };
+}
+
+/// GNU indirect function `s` of `o`: an 8-byte slot the loader fills
+/// with the address its resolver returns (`x86_64_irelative`), and the
+/// stub `jmp [rip + slot]` that stands for the function. Content-
+/// addressed, so the symbols of one resolver share them.
+fn ifuncAtoms(in: *Inputs, o: *const Object, s: u32) Allocator.Error!struct { slot: Atom, stub: Atom } {
+    const sym = o.syms[s];
+    const zeros: []const u8 = &@as([8]u8, @splat(0));
+    const jmp: []const u8 = &[_]u8{ 0xff, 0x25, 0, 0, 0, 0, 0xcc, 0xcc };
+    const slot_targets = try in.arena.dupe(SymbolKey, &.{sectionKey(o, sym.st_shndx)});
+    const slot_relocs = try in.arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_irelative, 0, @intCast(sym.st_value))});
+    const slot: Atom = .{ .key = .fromContents(.data, .@"8", zeros, slot_targets, slot_relocs), .name = "", .section = .data, .alignment = .@"8", .bytes = zeros, .targets = slot_targets, .relocs = slot_relocs };
+    const stub_targets = try in.arena.dupe(SymbolKey, &.{slot.key});
+    const stub_relocs = try in.arena.dupe(Atom.Reloc, &.{.init(2, .x86_64_pc32, 0, -4)});
+    const stub: Atom = .{ .key = .fromContents(.text, .@"8", jmp, stub_targets, stub_relocs), .name = o.symName(sym), .section = .text, .alignment = .@"8", .bytes = jmp, .targets = stub_targets, .relocs = stub_relocs };
+    return .{ .slot = slot, .stub = stub };
 }
 
 const Piece = struct { start: u64, end: u64, key: SymbolKey };
@@ -418,6 +441,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
     var symbols: std.ArrayList(Elf.LocalSymbol) = .empty;
     var sections: std.ArrayList(Elf.InputSection) = .empty;
     var weak_used = false;
+    var ifuncs: std.AutoHashMapUnmanaged(SymbolKey, void) = .empty;
     var c: Converter(@TypeOf(ctx)) = .{ .in = in, .ctx = ctx, .atoms = &atoms, .sections = &sections, .weak_used = &weak_used };
     // Two strong definitions of a name, one Zig's, are an error, as ld's.
     var defs = in.defs.iterator();
@@ -438,13 +462,19 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
         @memset(c.whole, false);
         for (0..o.shdrs.len) |i| try c.section(@intCast(i));
         try c.inputSections();
-        // GNU indirect functions (`ifunc`, `target_clones`) need their
-        // resolver called at startup (IRELATIVE), which zap does not do
-        // yet: refused rather than linked as plain functions.
-        for (o.syms[1..]) |sym| if (sym.st_type() == elf.STT_GNU_IFUNC and sym.st_shndx != elf.SHN_UNDEF and
+        // GNU indirect functions (`ifunc`, `target_clones`): their stubs
+        // and slots where the loader calls the resolvers, else refused
+        // rather than linked as the resolvers.
+        for (o.syms[1..], 1..) |sym, s_index| if (sym.st_type() == elf.STT_GNU_IFUNC and sym.st_shndx != elf.SHN_UNDEF and
             sym.st_shndx < o.shdrs.len and !o.discarded[sym.st_shndx])
         {
-            try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: zap does not link GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) yet: {s}; build this step with upstream zig", .{ o.path, o.symName(sym) }));
+            if (!in.dynamic) {
+                try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: zap links GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) only into executables that link libc and shared libraries, whose loader calls their resolvers: {s}", .{ o.path, o.symName(sym) }));
+                continue;
+            }
+            const ifunc = try in.ifuncAtoms(o, @intCast(s_index));
+            if ((try ifuncs.getOrPut(arena, ifunc.stub.key)).found_existing) continue;
+            try atoms.appendSlice(arena, &.{ ifunc.slot, ifunc.stub });
         };
         for (o.syms[1..], 1..) |sym, s_index| {
             const ty = sym.st_type();
