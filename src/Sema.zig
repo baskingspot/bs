@@ -123,6 +123,8 @@ comptime_field_ptrs: std.AutoHashMapUnmanaged(Index, void) = .empty,
 /// The errors `func` returns so far, for its inferred error set; published
 /// to `Zcu.inferred_errors` when its analysis ends. Arena-allocated.
 ies_names: std.ArrayList(InternPool.String) = .empty,
+/// `runtimeDummy`'s instruction for each type, in the arena.
+runtime_dummies: std.AutoHashMapUnmanaged(Index, Ref) = .empty,
 /// Whether `func`'s inferred error set took in `anyerror`.
 ies_anyerror: bool = false,
 /// For each runtime bool vector being initialized through a result pointer,
@@ -3350,6 +3352,21 @@ fn addBlock(sema: *Sema, block: *Block, block_inst: Ir.Inst.Index, ty: Index, bo
     try sema.appendBody(body);
     sema.ir_insts.set(@backingInt(block_inst), .{ .tag = .block, .data = .{ .ty_pl = .{ .ty = ty, .payload = payload } } });
     try block.instructions.append(sema.gpa, block_inst);
+}
+
+/// A runtime value of type `ty` in no block, for a comptime context that
+/// may use only its type, as upstream's dummy instructions. It is a valid
+/// instruction (a bitcast of `undefined` to its own type), so passes that
+/// walk every instruction need not tell it apart.
+fn runtimeDummy(sema: *Sema, ty: Index) !Ref {
+    // Only its type is read, so one per type serves a whole analysis.
+    const gop = try sema.runtime_dummies.getOrPut(sema.arena, ty);
+    if (!gop.found_existing) {
+        const undef: Ref = .fromInterned(try sema.undefValue(ty));
+        gop.value_ptr.* = @as(Ir.Inst.Index, @fromBackingInt(@intCast(sema.ir_insts.len))).toRef();
+        try sema.ir_insts.append(sema.gpa, .{ .tag = .bitcast, .data = .{ .ty_op = .{ .ty = ty, .operand = undef } } });
+    }
+    return gop.value_ptr.*;
 }
 
 fn reserveInst(sema: *Sema) !Ir.Inst.Index {
@@ -12159,7 +12176,9 @@ fn analyzeRef(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!R
         return .fromInterned(ptr);
     }
     const ptr_ty = try sema.refPtrType(ty);
-    try sema.requireRuntime(block, src);
+    // As upstream, a comptime `&` of a runtime value is allowed; only the
+    // result's type can be used (`[x.len]T` with an array `x`).
+    if (block.is_comptime and !block.discards_runtime) return sema.runtimeDummy(ptr_ty);
     try sema.resolveLayout(block, src, ty);
     const alloc = try sema.addInst(block, .{ .tag = .alloc, .data = .{ .ty = ptr_ty } });
     _ = try sema.addBinOp(block, .store, alloc, operand);
@@ -18823,7 +18842,10 @@ fn paramDeclaredComptime(sema: *Sema, func: Index, i: usize) bool {
 /// Maps the parameters of `func` (whose ZIR is current) to `args`, evaluating
 /// generic parameter types. `args` are coerced in `caller`. Runtime-known
 /// arguments map to undefined values of their type.
-fn mapCalleeParams(sema: *Sema, callee_block: *Block, caller: *Block, src: Src, func: Index, args: []Ref) CompileError!void {
+/// With `instantiating`, a runtime parameter of a generic instantiation is a
+/// runtime value even when its argument is comptime-known, as upstream:
+/// only comptime parameters reach the parameter and return types.
+fn mapCalleeParams(sema: *Sema, callee_block: *Block, caller: *Block, src: Src, func: Index, args: []Ref, instantiating: bool) CompileError!void {
     const ip = sema.ip;
     const f = ip.keyPayload(.func, func);
     const fn_ty = ip.keyPayload(.func_type, f.ty);
@@ -18842,8 +18864,16 @@ fn mapCalleeParams(sema: *Sema, callee_block: *Block, caller: *Block, src: Src, 
             .param_anytype, .param_anytype_comptime => {},
             else => continue,
         }
-        const val: Index = sema.resolveValue(args[i]) orelse try sema.undefValue(sema.typeOf(args[i]));
-        try sema.inst_map.put(sema.gpa, inst, .fromInterned(val));
+        const ty = sema.typeOf(args[i]);
+        const ref: Ref = if (instantiating and tag != .param_comptime and tag != .param_anytype_comptime and
+            !(try sema.isComptimeOnlyResolved(caller, src, ty)))
+            if (!Type.hasRuntimeBits(ip, ty) and (try sema.onePossibleValue(ty)) != null)
+                .fromInterned((try sema.onePossibleValue(ty)).?)
+            else
+                try sema.runtimeDummy(ty)
+        else
+            .fromInterned(sema.resolveValue(args[i]) orelse try sema.undefValue(ty));
+        try sema.inst_map.put(sema.gpa, inst, ref);
         i += 1;
     }
 }
@@ -19135,7 +19165,7 @@ fn walkComptimeCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []
     defer callee_block.deinitInsts();
     const arg_refs = try sema.arena.alloc(Ref, args.len);
     for (args, arg_refs) |a, *r| r.* = .fromInterned(a);
-    try sema.mapCalleeParams(&callee_block, caller, src, func, arg_refs);
+    try sema.mapCalleeParams(&callee_block, caller, src, func, arg_refs, false);
     var inlining: Block.Inlining = .{ .func = func, .ret_ty = try sema.calleeRetTy(&callee_block, func, null), .args = args };
     callee_block.inlining = &inlining;
     const fn_info = sema.code.getFnInfo(ip.keyPayload(.func, func).zir_inst);
@@ -20693,7 +20723,7 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref, 
         // As upstream, an error in the parameter or return types names
         // the call that instantiates them.
         const n = sema.zcu.errors.items.len;
-        sema.mapCalleeParams(&callee_block, caller, src, func, args) catch |err| return sema.noteCallSite(caller, src, n, err, .generic);
+        sema.mapCalleeParams(&callee_block, caller, src, func, args, true) catch |err| return sema.noteCallSite(caller, src, n, err, .generic);
         break :blk try sema.calleeRetTy(&callee_block, func, .{ .caller = caller, .src = src });
     };
     for (args, comptime_args, 0..) |a, *ca, k| {
@@ -21350,24 +21380,24 @@ test "dump: generic instances are shared and comptime calls fold" {
         \\fn t.f(u16) u16 callconv(.c) {
         \\  %0 = arg(u16, 0)
         \\  %1 = dbg_stmt(2:15)
-        \\  %2 = call(<fn (u16, u16) u16, t.max[u16]>, [%0, <u16, 55>])
-        \\  %3 = dbg_stmt(2:47)
-        \\  %4 = call(<fn (u16, u16) u16, t.max[u16]>, [<u16, 1>, %0])
-        \\  %5 = dbg_stmt(2:42)
-        \\  %6 = add_with_overflow(struct { u16, u1 }, %2, %4)
-        \\  %7 = struct_field_val(u16, %6, 0)
-        \\  %8 = struct_field_val(u1, %6, 1)
-        \\  %9 = cmp_eq(%8, <u1, 0>)
-        \\  %12 = block(void, {
-        \\    %14 = cond_br(%9, {
-        \\      %13 = br(%12, <void, void>)
+        \\  %3 = call(<fn (u16, u16) u16, t.max[u16]>, [%0, <u16, 55>])
+        \\  %4 = dbg_stmt(2:47)
+        \\  %5 = call(<fn (u16, u16) u16, t.max[u16]>, [<u16, 1>, %0])
+        \\  %6 = dbg_stmt(2:42)
+        \\  %7 = add_with_overflow(struct { u16, u1 }, %3, %5)
+        \\  %8 = struct_field_val(u16, %7, 0)
+        \\  %9 = struct_field_val(u1, %7, 1)
+        \\  %10 = cmp_eq(%9, <u1, 0>)
+        \\  %13 = block(void, {
+        \\    %15 = cond_br(%10, {
+        \\      %14 = br(%13, <void, void>)
         \\    }, {
-        \\      %10 = call(<fn () noreturn, t.panic.integerOverflow>, [])
-        \\      %11 = unreach()
+        \\      %11 = call(<fn () noreturn, t.panic.integerOverflow>, [])
+        \\      %12 = unreach()
         \\    })
         \\  })
-        \\  %15 = dbg_stmt(2:5)
-        \\  %16 = ret(%7)
+        \\  %16 = dbg_stmt(2:5)
+        \\  %17 = ret(%8)
         \\}
         \\fn t.max[u16](u16, u16) u16 {
         \\  %0 = arg(u16, 0)
