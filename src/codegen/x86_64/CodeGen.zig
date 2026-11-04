@@ -83,6 +83,9 @@ copy_private: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// `copy_of` allocs whose initializer is a by-reference argument: the
 /// alloc's value is the argument's pointer (`planCopies`).
 ref_alias: std.AutoHashMapUnmanaged(u32, void) = .empty,
+/// From `planConstAliases`: `*const` allocs initialized with a constant
+/// in memory that are that constant's memory.
+const_alias: std.AutoHashMapUnmanaged(u32, Index) = .empty,
 /// From `planCopies`: values whose slot is that of the block their `br`
 /// exits, by value.
 slot_alias: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -297,6 +300,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.copy_of.deinit(gpa);
         cg.copy_private.deinit(gpa);
         cg.ref_alias.deinit(gpa);
+        cg.const_alias.deinit(gpa);
         cg.slot_alias.deinit(gpa);
         cg.in_place.deinit(gpa);
         cg.cold_starts.deinit(gpa);
@@ -1371,6 +1375,11 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         // A copy of a by-reference argument is its pointer, folded into
         // its users' addressing when the argument has a register.
         .alloc => {
+            if (!cg.has_asm and cg.const_alias.count() != 0 and cg.const_alias.contains(@backingInt(inst))) {
+                const live = cg.emit.ssa.live.slice();
+                live.items(.reg)[@backingInt(inst)] = RegClass.gpr.want();
+                live.items(.tie)[@backingInt(inst)] = Ssa.no_tie;
+            }
             if (!cg.has_asm and cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(inst))) {
                 const live = cg.emit.ssa.live.slice();
                 live.items(.reg)[@backingInt(inst)] = RegClass.gpr.want();
@@ -1537,6 +1546,8 @@ fn planRegisters(cg: *CodeGen) Error!void {
     };
     var aliases = cg.ref_alias.keyIterator();
     while (aliases.next()) |a| cg.split.unset(a.*);
+    var consts = cg.const_alias.keyIterator();
+    while (consts.next()) |a| cg.split.unset(a.*);
     cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split) & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
@@ -1986,6 +1997,7 @@ fn planCopies(cg: *CodeGen) Error!void {
             try cg.ref_alias.put(gpa, e.key_ptr.*, {});
         }
     }
+    try cg.planConstAliases();
     // Block results in memory: the value the block's only `br` passes is
     // computed in the block's slot (`slot_alias`), which is not shared.
     var brs: std.AutoArrayHashMapUnmanaged(u32, u32) = .empty;
@@ -2208,7 +2220,8 @@ fn frameFoldable(cg: *CodeGen, ref: Ref) bool {
         const data = cg.ir.instructions.items(.data)[@backingInt(i)];
         switch (cg.ir.instructions.items(.tag)[@backingInt(i)]) {
             .alloc => return data.ty != .none and cg.allocAlignment(data.ty) <= 16 and i != cg.rvo_alloc and
-                !(cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(i))),
+                !(cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(i))) and
+                !(cg.const_alias.count() != 0 and cg.const_alias.contains(@backingInt(i))),
             .struct_field_ptr => {
                 const sf = cg.ir.extraData(Ir.StructField, data.ty_pl.payload).data;
                 const container = Type.ptrInfo(ip, cg.typeOf(sf.operand)).child;
@@ -2248,6 +2261,91 @@ fn foldFrame(cg: *CodeGen, inst: Inst.Index, base: Ref, off: u64) bool {
         else => {},
     }
     return false;
+}
+
+/// A `*const` alloc whose first use, in its own block, is its only store,
+/// of a constant that lives in memory, is that constant's memory
+/// (`const_alias`), as a copy of a by-reference argument is the
+/// argument's (`ref_alias`): a spliced call's parameter copy of a constant
+/// argument costs nothing, as the call itself does. The constant never
+/// changes, and the alloc's memory can be written only through a pointer
+/// derived from it (a `*const`, so only after a cast: `@constCast`), so
+/// any use of the alloc's pointer other than loads, field and element
+/// addresses read the same way, and call arguments (whose `*const`
+/// parameters are not written either) keeps the copy.
+fn planConstAliases(cg: *CodeGen) Error!void {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const f = cg.ssa;
+    const gpa = cg.gpa;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    // The allocs, and the pointers derived from them, with their alloc;
+    // each alloc's initializing store.
+    var from: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer from.deinit(gpa);
+    var init: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer init.deinit(gpa);
+    for (f.layout.items) |block| {
+        const insts = f.blockInsts(block);
+        for (insts, 0..) |a, k| {
+            if (tags[@backingInt(a)] != .alloc or datas[@backingInt(a)].ty == .none or a == cg.rvo_alloc) continue;
+            const info = Type.ptrInfo(ip, datas[@backingInt(a)].ty);
+            if (!info.flags.is_const or info.flags.is_volatile) continue;
+            // The alloc's first use: nothing reads it before the store.
+            const st = for (insts[k + 1 ..]) |i| {
+                if (tags[@backingInt(i)] != .dbg_stmt) break i;
+            } else continue;
+            if (tags[@backingInt(st)] != .store) continue;
+            const bin = datas[@backingInt(st)].bin_op;
+            if (bin.lhs != a.toRef()) continue;
+            const v = bin.rhs.toInterned() orelse continue;
+            // An `undefined` one is left to its store, which fills 0xaa.
+            if (ip.keyTag(v) == .undef) continue;
+            const ty = ip.typeOf(v);
+            if (Type.abiSize(ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty)) continue;
+            if (cg.allocAlignment(datas[@backingInt(a)].ty) > Type.abiAlignment(ip, ty)) continue;
+            try from.put(gpa, @backingInt(a), @backingInt(a));
+            try init.put(gpa, @backingInt(a), @backingInt(st));
+            try cg.const_alias.put(gpa, @backingInt(a), v);
+        }
+    }
+    if (from.count() == 0) return;
+    // Any other use of a pointer into the alloc keeps the copy.
+    const Check = struct {
+        cg: *CodeGen,
+        from: *const std.AutoHashMapUnmanaged(u32, u32),
+        pub fn use(c: @This(), r: Ref) void {
+            const i = r.toIndex() orelse return;
+            if (c.from.get(@backingInt(i))) |a| _ = c.cg.const_alias.remove(a);
+        }
+    };
+    const check: Check = .{ .cg = cg, .from = &from };
+    for (f.layout.items) |block| {
+        for (f.blockInsts(block)) |inst| {
+            const data = datas[@backingInt(inst)];
+            switch (tags[@backingInt(inst)]) {
+                .load, .call, .dbg_stmt => {},
+                .struct_field_ptr => {
+                    const base = ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand.toIndex() orelse continue;
+                    if (from.get(@backingInt(base))) |a| try from.put(gpa, @backingInt(inst), a);
+                },
+                .ptr_elem_ptr, .ptr_add => {
+                    const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+                    check.use(bin.rhs);
+                    const base = bin.lhs.toIndex() orelse continue;
+                    if (from.get(@backingInt(base))) |a| try from.put(gpa, @backingInt(inst), a);
+                },
+                .store => {
+                    const a = data.bin_op.lhs.toIndex();
+                    if (a == null or init.get(@backingInt(a.?)) != @backingInt(inst)) Ssa.forEachOperand(ir, inst, check);
+                },
+                else => Ssa.forEachOperand(ir, inst, check),
+            }
+        }
+        const t = f.blocks.items[@backingInt(block)].term;
+        if (t.tag == .jump or t.tag == .ret) Ssa.forEachOperand(ir, t.inst, check);
+    }
 }
 
 const no_base = std.math.maxInt(u32);
@@ -3087,6 +3185,17 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .alloc => {
             // An inferred alloc whose initializer never completes.
             if (data.ty == .none) return;
+            if (cg.const_alias.count() != 0) if (cg.const_alias.get(@backingInt(inst))) |v| {
+                // The constant's own memory, as an address in a register
+                // (a `.reg` home is a promoted variable's).
+                const d = cg.destReg(inst);
+                try cg.e.lea(.qword, d, try cg.memOf(.fromInterned(v)));
+                if (cg.homes[@backingInt(inst)] == .reg) {
+                    cg.homes[@backingInt(inst)] = .{ .reg_addr = .{ .base = d, .off = 0 } };
+                    return;
+                }
+                return cg.setResult(inst, data.ty, d);
+            };
             if (cg.ref_alias.count() != 0 and cg.ref_alias.contains(@backingInt(inst))) {
                 // In its register as an address (a `.reg` home is a
                 // promoted variable's), or in a slot like an over-aligned
@@ -3179,6 +3288,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             if (cg.in_place.count() != 0) if (val.toIndex()) |v| if (cg.in_place.contains(@backingInt(v))) return;
             // A `*const` alloc that is its initializer's memory (`planCopies`).
             if (cg.ref_alias.count() != 0) if (data.bin_op.lhs.toIndex()) |a| if (cg.ref_alias.contains(@backingInt(a))) return;
+            if (cg.const_alias.count() != 0) if (data.bin_op.lhs.toIndex()) |a| if (cg.const_alias.contains(@backingInt(a))) return;
             if (cg.copy_of.count() != 0) if (data.bin_op.lhs.toIndex()) |a| if (val.toIndex()) |v| switch (cg.homes[@backingInt(a)]) {
                 .frame_addr => |off| if (cg.homes[@backingInt(v)] == .slot and cg.homes[@backingInt(v)].slot == off) return,
                 else => {},

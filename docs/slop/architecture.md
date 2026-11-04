@@ -1603,7 +1603,14 @@ build, the passes, and the debug info treat them as Sema's inline calls
   CodeGen, a memory-class block with exactly one `br` computes its value
   in the block's own slot (`planCopies`, `slot_alias`); without that,
   inlining made nbody 26% slower. The rule is general and stays on with
-  inlining off.
+  inlining off. Likewise a `*const` alloc whose first use is its only
+  store, of a constant in memory, is the constant's own memory
+  (`planConstAliases`): a spliced callee's copy of a constant argument
+  is then free, as the call's by-reference argument was (a 2205-byte
+  comptime table, copied per call, made vaxis 30% slower). Any other use
+  of a pointer into the alloc than loads, field and element addresses,
+  and call arguments keeps the copy, so a write through `@constCast`
+  writes a copy as it does upstream (`test/run/inline_const_arg.zig`).
 - **The cache edge.** A dependee `func_inline: f`, appended to the
   dependee and manifest `Tag`s, with its producer edge to `f`'s `func`
   unit as `func_ies` has:
