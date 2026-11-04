@@ -96,11 +96,13 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
         // Sema emits these on vectors only when `shared.native` says so.
         .intcast, .trunc => ip.keyTag(data.ty_op.ty) == .vector_type,
         // Between 16-byte vectors in XMM registers, or one and a 16-byte
-        // value in memory (an array, a wide integer): one movdqu.
-        // (Smaller vectors move through a GPR as integers do.)
+        // value in memory (an array, a wide integer): one movdqu. Between
+        // a vector in an XMM register and an integer or array of 1, 2, 4,
+        // or 8 bytes in a general-purpose register: one movd or movq.
         .bitcast => blk: {
             const ty = data.ty_op.ty;
             const src_ty = cg.typeOf(data.ty_op.operand);
+            if ((inXmm(ip, src_ty) and inGpr(ip, ty)) or (inXmm(ip, ty) and inGpr(ip, src_ty))) break :blk true;
             if (Type.abiSize(ip, ty) != 16 or Type.abiSize(ip, src_ty) != 16) break :blk false;
             break :blk (inXmm(ip, ty) or inXmm(ip, src_ty)) and (inXmm(ip, ty) or inMem(cg, ty)) and (inXmm(ip, src_ty) or inMem(cg, src_ty));
         },
@@ -113,6 +115,29 @@ pub fn lowers(cg: *CodeGen, inst: Inst.Index) bool {
 /// registers.
 fn inMem(cg: *CodeGen, ty: Index) bool {
     return !inXmm(cg.ip, ty) and !cg.inPair(ty);
+}
+
+/// Whether values of type `ty` are an integer or an array of 1, 2, 4, or 8
+/// bytes, which live in a general-purpose register, extended as a load
+/// extends them (`CodeGen.normalize`).
+fn inGpr(ip: *const InternPool, ty: Index) bool {
+    return switch (Type.abiSize(ip, ty)) {
+        1, 2, 4, 8 => Type.isInt(ip, ty) or ip.keyTag(ty) == .array_type,
+        else => false,
+    };
+}
+
+/// For `CodeGen.storeInPlace`: whether bitcast `inst`, of a vector that an
+/// operation here computed to an array or integer in memory of the same
+/// size, writes the stored-to memory itself (`CodeGen.resultMem`): its
+/// operand gets its own register or slot (no `Home` yet), not memory the
+/// store may overlap.
+pub fn bitcastInPlace(cg: *CodeGen, inst: Inst.Index) bool {
+    const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
+    const x = data.ty_op.operand.toIndex() orelse return false;
+    if (shape(cg.ip, cg.typeOf(data.ty_op.operand)) == null or !lowers(cg, x)) return false;
+    if (Type.abiSize(cg.ip, data.ty_op.ty) != Type.abiSize(cg.ip, cg.typeOf(data.ty_op.operand))) return false;
+    return cg.homes[@backingInt(x)] == .none;
 }
 
 /// Whether `aggregate_init` `data` broadcasts one element to a vector of
@@ -326,7 +351,18 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
             try splat(cg, inst, data.ty_pl.ty, cg.ir.refSlice(extra.end, extra.data.len)[0]);
         },
         .bitcast => {
+            if (inGpr(ip, data.ty_op.ty)) return toGpr(cg, inst, data.ty_op.ty, data.ty_op.operand);
             const dst = try Dst.of(cg, inst, data.ty_op.ty);
+            if (inGpr(ip, cg.typeOf(data.ty_op.operand))) {
+                const r = dst.home orelse .xmm0;
+                const size: Encoder.Size = if (Type.abiSize(ip, cg.typeOf(data.ty_op.operand)) == 8) .qword else .dword;
+                const g = gprOf(cg, data.ty_op.operand) orelse g: {
+                    try cg.load(.rax, data.ty_op.operand);
+                    break :g .rax;
+                };
+                try cg.e.movToXmm(size, r, .{ .reg = g });
+                return dst.put(cg, r, 0);
+            }
             const r = dst.home orelse .xmm0;
             try loadChunk(cg, r, data.ty_op.operand, 0);
             try dst.put(cg, r, 0);
@@ -464,6 +500,38 @@ fn chunk(cg: *CodeGen, ref: Ref, k: u32) Error!Chunk {
             else => unreachable,
         },
     }
+}
+
+/// Bitcast of vector `operand`, which lives in an XMM register when it has
+/// one, to `ty`, an integer or array of 1, 2, 4, or 8 bytes (`inGpr`): its
+/// low bytes, extended as a load of `ty` extends them.
+fn toGpr(cg: *CodeGen, inst: Inst.Index, ty: Index, operand: Ref) Error!void {
+    const e = &cg.e;
+    const d = cg.destReg(inst);
+    const n = Type.abiSize(cg.ip, ty);
+    // A signed integer, or one narrower than its bytes, is extended from
+    // its bits afterwards; the rest are zero-extended.
+    const extend = Type.isInt(cg.ip, ty) and (Type.intInfo(cg.ip, ty).signedness == .signed or Type.intInfo(cg.ip, ty).bits != 8 * n);
+    switch (try chunk(cg, operand, 0)) {
+        .mem, .umem => |m| switch (n) {
+            8 => try e.mov(.qword, .{ .reg = d }, .{ .mem = m }),
+            4 => try e.mov(.dword, .{ .reg = d }, .{ .mem = m }),
+            else => try e.movzx(.dword, d, CodeGen.sizeOf(n), .{ .mem = m }),
+        },
+        else => |c| {
+            const x = switch (c) {
+                .reg => |x| x,
+                else => x: {
+                    try loadFrom(cg, .xmm0, c);
+                    break :x .xmm0;
+                },
+            };
+            try e.movFromXmm(if (n == 8) .qword else .dword, .{ .reg = d }, x);
+            if (n < 4 and !extend) try e.movzx(.dword, d, CodeGen.sizeOf(n), .{ .reg = d });
+        },
+    }
+    if (extend) try cg.normalize(d, ty);
+    return cg.setResult(inst, ty, d);
 }
 
 /// Loads chunk `k` of vector `ref` into `r`.

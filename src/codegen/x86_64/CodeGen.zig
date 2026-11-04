@@ -2113,7 +2113,7 @@ fn storeInPlace(cg: *CodeGen, st: Inst.Index, before: []const Inst.Index) Error!
     const bin = ir.instructions.items(.data)[@backingInt(st)].bin_op;
     const v = bin.rhs.toIndex() orelse return;
     const vi = @backingInt(v);
-    if (tags[vi] != .aggregate_init and tags[vi] != .union_init) return;
+    if (tags[vi] != .aggregate_init and tags[vi] != .union_init and !(tags[vi] == .bitcast and vector.bitcastInPlace(cg, v))) return;
     if (live.items(.uses)[vi] != 1 or live.items(.fate)[vi] != .normal) return;
     const prev = for (0..before.len) |j| {
         const x = before[before.len - 1 - j];
