@@ -702,6 +702,7 @@ const Overlay = struct {
             gpa.free(g.debug_files);
             gpa.free(g.debug_atoms);
             gpa.free(g.names);
+            gpa.free(g.fresh);
         }
         if (o.base_link_names) |n| gpa.free(n);
     }
@@ -1163,6 +1164,10 @@ pub const LinkInput = struct {
     targets: []const u32,
     targets_tail: []const u32,
     names: []const []const u8,
+    /// The `[start, end)` ranges of `refs` that come from the log rather
+    /// than the base, ascending: only those can be new since the base was
+    /// first linked (`Pack.LinkAtoms.trusted`).
+    fresh: []const [2]u32 = &.{},
 };
 
 /// Slices of the mapping when the log changed no node and no node is
@@ -1195,6 +1200,8 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
     defer debug_files.deinit(gpa);
     var names: std.ArrayList([]const u8) = try .initCapacity(gpa, m.atom_refs.len);
     defer names.deinit(gpa);
+    var fresh: std.ArrayList([2]u32) = .empty;
+    defer fresh.deinit(gpa);
     // The base's references are in node order: copy runs of base nodes
     // whole instead of one node at a time.
     var run_start: usize = 0;
@@ -1216,6 +1223,11 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
         if (st == null or !linked or st.?.atoms.len == 0) continue;
         try appendRun(gpa, m, &refs, &numbered, &debug_files, &names, run_start, run_end);
         run_start = run_end;
+        const at: u32 = @intCast(refs.items.len);
+        if (fresh.items.len != 0 and fresh.items[fresh.items.len - 1][1] == at)
+            fresh.items[fresh.items.len - 1][1] += @intCast(st.?.atoms.len)
+        else
+            try fresh.append(gpa, .{ at, at + @as(u32, @intCast(st.?.atoms.len)) });
         try refs.appendSlice(gpa, st.?.atoms);
         try numbered.appendSlice(gpa, st.?.numbered);
         try debug_files.appendSlice(gpa, st.?.debug_files);
@@ -1233,6 +1245,7 @@ pub fn linkInput(m: *Manifest, gpa: Allocator) !LinkInput {
         .targets = m.targets,
         .targets_tail = o.targets.items,
         .names = try names.toOwnedSlice(gpa),
+        .fresh = try fresh.toOwnedSlice(gpa),
     };
     o.gathered = g;
     return g;

@@ -371,6 +371,22 @@ pub fn noteOutput(inc: *const Incremental, out_dir: Io.Dir, sub_path: []const u8
     cache.writeReplace(io, inc.dir, output_name, &.{ std.mem.asBytes(&os), sub_path }) catch {};
 }
 
+/// The base manifest and pack whose atom records a link last checked
+/// whole (`Pack.LinkAtoms.trusted`).
+const checked_name = "checked";
+
+fn baseChecked(inc: *const Incremental, want: [2]Hash) bool {
+    var buf: [@sizeOf([2]Hash)]u8 = undefined;
+    const bytes = inc.dir.readFile(inc.io, checked_name, &buf) catch return false;
+    return bytes.len == buf.len and std.mem.eql(u8, bytes, std.mem.asBytes(&want));
+}
+
+/// Records that a link that succeeded checked every record of `ids`'
+/// base. Best effort.
+fn noteBaseChecked(inc: *const Incremental, ids: [2]Hash) void {
+    cache.writeReplace(inc.io, inc.dir, checked_name, &.{std.mem.asBytes(&ids)}) catch {};
+}
+
 /// Forgets the output's stat before a link replaces the output, so that
 /// a link that fails halfway does not leave it matching.
 fn forgetOutput(inc: *const Incremental) void {
@@ -404,6 +420,12 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     var input = try pack.linkAtoms(gpa, inc.arch, in.refs, in.debug_atoms, .{ .of = in.debug_files, .names = files });
     defer input.deinit(gpa);
     input.names = in.names;
+    const checked: [2]Hash = .{ m.id, m.pack_id };
+    if (inc.baseChecked(checked)) {
+        var trusted: std.DynamicBitSetUnmanaged = try .initFull(gpa, in.refs.len);
+        for (in.fresh) |r| trusted.setRangeValue(.{ .start = r[0], .end = r[1] }, false);
+        input.trusted = trusted;
+    }
     // An object's exports and imports; its imports are 0 in the image
     // (`ElfObject.linkInput`).
     var exports: std.ArrayList(ElfObject.Export) = .empty;
@@ -538,6 +560,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
         },
     };
     inc.noteOutput(out_dir, sub_path);
+    if (input.trusted == null) inc.noteBaseChecked(checked);
     return .{ .atoms = in.refs.len, .gathered = gathered };
 }
 
@@ -756,6 +779,7 @@ fn linkWithInputs(
         },
     };
     inc.noteOutput(out_dir, sub_path);
+    if (pack_atoms.trusted == null) inc.noteBaseChecked(.{ m.id, m.pack_id });
     return .{ .atoms = numbered.len + extra.items.len, .gathered = gathered };
 }
 
