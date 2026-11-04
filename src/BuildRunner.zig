@@ -62,7 +62,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     // is always checked.
     const stamp_path = try std.fs.path.join(arena, &.{ runner_dir, "maker.stat" });
     const trusted_lib = lib_override == null and env.get("ZIG_LIB_DIR") == null;
-    if (!(trusted_lib and runnerUnchanged(io, runner_path, stamp_path))) {
+    if (!(trusted_lib and toolUnchanged(io, runner_path, stamp_path))) {
         const root_path = try std.fs.path.join(arena, &.{ runner_dir, "root.zig" });
         const same = if (Io.Dir.cwd().readFileAlloc(io, root_path, arena, .limited(4096))) |old| std.mem.eql(u8, old, root_source) else |_| false;
         if (!same) {
@@ -71,8 +71,16 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
             try atomic.file.writeStreamingAll(io, root_source);
             try atomic.replace(io);
         }
-        try compileRunner(init, runner_dir, zig_lib_dir, global);
-        noteRunner(io, runner_path, stamp_path);
+        try compileTool(init, runner_dir, &.{
+            "zap",           "build-exe",
+            "--dep",         "maker",
+            "-Mroot=root.zig", try std.fmt.allocPrint(arena, "-Mmaker={s}/compiler/Maker.zig", .{zig_lib_dir}),
+            "--name",        "maker",
+            "--zig-lib-dir", zig_lib_dir,
+            "--cache-dir",   global,
+            "--global-cache-dir", global,
+        }, "Compiling build runner", "build runner", try std.fmt.allocPrint(arena, "{s}/compiler/Maker.zig", .{zig_lib_dir}));
+        noteTool(io, runner_path, stamp_path);
     }
 
     const self_exe = try std.process.executablePathAlloc(io, arena);
@@ -93,43 +101,35 @@ pub fn run(init: std.process.Init, args: []const []const u8) !void {
     main.fatal("the following command failed to execve with '{t}':\n{s}", .{ err, try std.mem.join(arena, " ", argv.items) });
 }
 
-/// Compiles the runner into `<runner_dir>/maker`, from that directory.
-fn compileRunner(init: std.process.Init, runner_dir: []const u8, zig_lib_dir: []const u8, global: []const u8) !void {
+/// Compiles one of upstream's programs that zap runs (the build runner,
+/// translate-c) with `compile_args`, from `dir`, where its binary goes.
+pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []const []const u8, progress: []const u8, what: []const u8, root: []const u8) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const cwd = try std.process.currentPathAlloc(io, arena);
     // Compiled from its own directory, so that the compilation's key (which
     // includes the working directory) is the same for every project.
-    try std.process.setCurrentPath(io, runner_dir);
-    const compile_args: []const []const u8 = &.{
-        "zap",           "build-exe",
-        "--dep",         "maker",
-        "-Mroot=root.zig", try std.fmt.allocPrint(arena, "-Mmaker={s}/compiler/Maker.zig", .{zig_lib_dir}),
-        "--name",        "maker",
-        "--zig-lib-dir", zig_lib_dir,
-        "--cache-dir",   global,
-        "--global-cache-dir", global,
-    };
+    try std.process.setCurrentPath(io, dir);
     const opts = try main.parseOptions(arena, io, .build_exe, compile_args[2..]);
     const job: main.Job = try .init(init, compile_args, opts);
     {
-        const prog = std.Progress.start(io, .{ .root_name = "Compiling build runner" });
+        const prog = std.Progress.start(io, .{ .root_name = progress });
         defer prog.end();
-        var inc = job.openCache("maker");
+        var inc = job.openCache(job.stem);
         defer if (inc) |*i| i.close();
-        switch (try main.compile(init, &job, if (inc) |*i| i else null, "maker", prog, null)) {
+        switch (try main.compile(init, &job, if (inc) |*i| i else null, job.stem, prog, null)) {
             .ok => {},
             .errors => |diags| {
                 main.printDiagnostics(io, diags, .text) catch {};
-                main.fatal("zap could not compile the build runner ({s}/compiler/Maker.zig)", .{zig_lib_dir});
+                main.fatal("zap could not compile the {s} ({s})", .{ what, root });
             },
-            .failed => main.fatal("zap could not link the build runner ({s}/compiler/Maker.zig)", .{zig_lib_dir}),
+            .failed => main.fatal("zap could not link the {s} ({s})", .{ what, root }),
         }
     }
     try std.process.setCurrentPath(io, cwd);
 }
 
-/// The runner's stat, as `noteRunner` recorded it after the last check.
+/// A tool's stat, as `noteTool` recorded it after the last check.
 const RunnerStat = extern struct { inode: u64, size: u64, mtime: i64 };
 
 fn runnerStat(io: Io, path: []const u8) ?RunnerStat {
@@ -137,7 +137,7 @@ fn runnerStat(io: Io, path: []const u8) ?RunnerStat {
     return .{ .inode = @intCast(st.inode), .size = st.size, .mtime = @intCast(st.mtime.toNanoseconds()) };
 }
 
-fn runnerUnchanged(io: Io, runner_path: []const u8, stamp_path: []const u8) bool {
+pub fn toolUnchanged(io: Io, runner_path: []const u8, stamp_path: []const u8) bool {
     var buf: [@sizeOf(RunnerStat)]u8 = undefined;
     const bytes = Io.Dir.cwd().readFile(io, stamp_path, &buf) catch return false;
     if (bytes.len != buf.len) return false;
@@ -145,8 +145,8 @@ fn runnerUnchanged(io: Io, runner_path: []const u8, stamp_path: []const u8) bool
     return std.mem.eql(u8, std.mem.asBytes(&now), bytes);
 }
 
-/// Records the stat of a runner that was just checked. Best effort.
-fn noteRunner(io: Io, runner_path: []const u8, stamp_path: []const u8) void {
+/// Records the stat of a tool that was just checked. Best effort.
+pub fn noteTool(io: Io, runner_path: []const u8, stamp_path: []const u8) void {
     const st = runnerStat(io, runner_path) orelse return;
     var atomic = Io.Dir.cwd().createFileAtomic(io, stamp_path, .{ .replace = true }) catch return;
     defer atomic.deinit(io);

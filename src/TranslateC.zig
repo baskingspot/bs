@@ -1,0 +1,495 @@
+//! `zap translate-c`: translates a C header (or source) to Zig with
+//! upstream's translate-c (`lib/compiler/translate-c`, on Aro), which zap
+//! builds itself, as `zap build` does the build runner. `b.addTranslateC`
+//! runs it as `zap translate-c <flags> <file> --listen=-` and imports the
+//! output, `<local cache>/o/<digest>/<stem>.zig`, as a module.
+//!
+//! The arguments that reach Aro are upstream's (`Compilation.translateC`
+//! with `addCommonCCArgs(.aro)`) for zap's target: Debug, the baseline
+//! CPU, and with `-lc` glibc's headers from the zig lib directory, as
+//! zap's `-lc` links (docs/architecture.md, "C interop").
+//!
+//! A translation record, `<local cache>/zap/tc/<key>`, lists every file
+//! Aro read (from its `-MD` depfile) with its stat and content hash, and
+//! the output's hash. The key covers zap, the translate-c binary, the
+//! working directory, the source path and the arguments, not the files'
+//! contents, so the output stays at one path across header edits, and a
+//! build whose files all stat as recorded runs nothing.
+
+const std = @import("std");
+const Io = std.Io;
+const build_options = @import("build_options");
+const main = @import("main.zig");
+const cache = @import("cache.zig");
+const Frontend = @import("Frontend.zig");
+const Incremental = @import("Incremental.zig");
+const BuildRunner = @import("BuildRunner.zig");
+
+const Request = struct {
+    source: []const u8,
+    link_libc: bool,
+    /// The target's glibc, which the target triple names: the native
+    /// system's without `-target`, as upstream's native target, with or
+    /// without `-lc`; null for `x86_64-linux(-none)`.
+    glibc_version: ?std.SemanticVersion,
+    /// The user's C flags (include directories, macros), in order.
+    cc_args: []const []const u8,
+    listen: bool,
+    zig_lib_dir: []const u8,
+    cache_dirs: Frontend.CacheDirs,
+    build_root: ?[]const u8,
+    unsupported: ?[]const u8,
+};
+
+/// C flags that take a parameter, passed to Aro as given.
+const cc_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
+    .{"-I"}, .{"-isystem"}, .{"-iquote"}, .{"-idirafter"}, .{"-iframework"}, .{"-F"}, .{"-D"}, .{"-include"}, .{"--embed-dir"},
+});
+
+/// Options of `zig translate-c` that change nothing zap translates.
+const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
+    .{"-fno-PIC"}, .{"-fPIC"}, .{"-fno-PIE"}, .{"-fPIE"}, .{"-fsingle-threaded"}, .{"-fno-single-threaded"},
+    .{"-freference-trace"}, .{"-fno-reference-trace"}, .{"-fstack-check"}, .{"-fno-stack-check"},
+});
+const ignored_flags_with_arg: std.StaticStringMap(void) = .initComptime(.{
+    .{"--name"}, .{"--color"}, .{"-mcpu"}, .{"--error-limit"}, .{"--debug-log"},
+});
+
+fn parse(init: std.process.Init, args: []const []const u8) !Request {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    var source: ?[]const u8 = null;
+    var cc_args: std.ArrayList([]const u8) = .empty;
+    var opts: main.Options = .{ .command = .build_exe, .root_src_path = "" };
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--listen=-")) {
+            opts.listen = true;
+        } else if (std.mem.eql(u8, arg, "-target")) {
+            opts.target = next(args, &i);
+        } else if (std.mem.eql(u8, arg, "--zig-lib-dir")) {
+            opts.zig_lib_dir = next(args, &i);
+        } else if (std.mem.eql(u8, arg, "--cache-dir")) {
+            opts.cache_dir = next(args, &i);
+        } else if (std.mem.eql(u8, arg, "--global-cache-dir")) {
+            opts.global_cache_dir = next(args, &i);
+        } else if (std.mem.eql(u8, arg, "--build-root")) {
+            opts.build_root = next(args, &i);
+        } else if (std.mem.eql(u8, arg, "-cflags")) {
+            // Flags for C source files, of which translate-c has none
+            // (upstream ignores them too).
+            while (i + 1 < args.len and !std.mem.eql(u8, args[i + 1], "--")) i += 1;
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "-O")) {
+            // zap builds only Debug, so headers see Debug's macros (no
+            // NDEBUG), as the code they are compiled into.
+            if (arg.len == 2) i += 1;
+        } else if (std.mem.startsWith(u8, arg, "-l")) {
+            // glibc's libraries link libc; other libraries (the build
+            // runner passes pkg-config's) change nothing translate-c reads.
+            if (main.isGlibcLib(arg[2..])) opts.link_libc = true;
+        } else if (std.mem.startsWith(u8, arg, "-needed-l") or std.mem.startsWith(u8, arg, "-weak-l") or
+            std.mem.startsWith(u8, arg, "-search_") or std.mem.eql(u8, arg, "-pthread"))
+        {
+            // Link options, which translate-c ignores, as upstream.
+        } else if (std.mem.eql(u8, arg, "-L") or std.mem.eql(u8, arg, "-rpath")) {
+            _ = next(args, &i);
+        } else if (std.mem.startsWith(u8, arg, "-L")) {
+            // A library directory, as above.
+        } else if (cc_flags_with_arg.has(arg)) {
+            try cc_args.appendSlice(arena, &.{ arg, next(args, &i) });
+        } else if (std.mem.startsWith(u8, arg, "-I") or std.mem.startsWith(u8, arg, "-D") or std.mem.startsWith(u8, arg, "-U")) {
+            try cc_args.append(arena, arg);
+        } else if (ignored_flags.has(arg)) {
+            // Changes nothing zap translates.
+        } else if (ignored_flags_with_arg.has(arg)) {
+            _ = next(args, &i);
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            main.setUnsupported(&opts, arena, "zap does not support the option '{s}' for translate-c", .{arg});
+        } else if (source == null) {
+            source = arg;
+        } else {
+            main.fatal("unexpected extra parameter: {s}", .{arg});
+        }
+    }
+    const target = opts.target orelse "native";
+    if (std.mem.eql(u8, target, "native")) {
+        if (!(@import("builtin").cpu.arch == .x86_64 and @import("builtin").os.tag == .linux))
+            main.setUnsupported(&opts, arena, "zap translates C only for x86_64-linux so far ('native'); pass -target x86_64-linux", .{})
+        else if (std.zig.system.resolveTargetQuery(io, .{})) |native| {
+            if (native.abi.isGnu()) opts.glibc_version = native.os.version_range.linux.glibc;
+        } else |_| {}
+        if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena, io);
+    } else {
+        // `checkTarget` takes `x86_64-linux-gnu` only with -lc; headers
+        // translate for it without.
+        const libc = opts.link_libc;
+        opts.link_libc = true;
+        main.checkTarget(&opts, arena, target);
+        opts.link_libc = libc;
+        if (opts.link_libc and opts.unsupported == null) main.resolveGlibc(&opts, arena, io);
+    }
+    return .{
+        .source = source orelse if (opts.unsupported != null) "" else main.fatal("expected a C source file to translate", .{}),
+        .link_libc = opts.link_libc,
+        .glibc_version = opts.glibc_version,
+        .cc_args = cc_args.items,
+        .listen = opts.listen,
+        .zig_lib_dir = opts.zig_lib_dir orelse init.environ_map.get("ZIG_LIB_DIR") orelse build_options.zig_lib_dir,
+        .cache_dirs = Frontend.resolveCacheDirs(arena, io, init.environ_map, .{ .local = opts.cache_dir, .global = opts.global_cache_dir }),
+        .build_root = opts.build_root,
+        .unsupported = opts.unsupported,
+    };
+}
+
+fn next(args: []const []const u8, i: *usize) []const u8 {
+    i.* += 1;
+    if (i.* >= args.len) main.fatal("expected parameter after {s}", .{args[i.* - 1]});
+    return args[i.*];
+}
+
+pub fn run(init: std.process.Init, args: []const []const u8) !void {
+    const req = try parse(init, args);
+    if (req.listen) return serve(init, &req);
+    if (req.unsupported) |msg| main.fatal("{s}", .{msg});
+    const r = try translate(init, &req);
+    const io = init.io;
+    if (r.errors) |body| {
+        var bundle = try std.zig.Server.allocErrorBundle(init.gpa, body);
+        defer bundle.deinit(init.gpa);
+        bundle.renderToStderr(io, .{}, std.zig.Color.settingFromEnvironment(init.environ_map)) catch {};
+        std.process.exit(1);
+    }
+    const contents = try Io.Dir.cwd().readFileAlloc(io, r.out_path, init.arena.allocator(), .unlimited);
+    try Io.File.stdout().writeStreamingAll(io, contents);
+}
+
+fn serve(init: std.process.Init, req: *const Request) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    var in_buf: [256]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var in = Io.File.stdin().readerStreaming(io, &in_buf);
+    var out = Io.File.stdout().writerStreaming(io, &out_buf);
+    var server: std.zig.Server = .{ .in = &in.interface, .out = &out.interface };
+    try server.serveStringMessage(.zig_version, main.zig_version);
+    try server.serveConfig(.{ .flags = .{
+        .output_mode = .Obj,
+        .link_mode = if (req.link_libc) .dynamic else .static,
+        .link_libc = req.link_libc,
+        .link_libcpp = false,
+        .link_libunwind = false,
+        .pie = false,
+    } });
+    while (true) {
+        const hdr = server.receiveMessage() catch |err| switch (err) {
+            error.EndOfStream => std.process.exit(0),
+            else => |e| return e,
+        };
+        switch (hdr.tag) {
+            .exit => std.process.exit(0),
+            .update => {
+                try server.in.discardAll(hdr.bytes_len);
+                if (req.unsupported) |msg| {
+                    try main.serveUnsupported(&server, init.gpa, msg);
+                    continue;
+                }
+                const r = try translate(init, req);
+                if (r.inputs.len != 0) {
+                    const prefixed = try main.prefixInputs(arena, io, r.inputs, .{
+                        .zig_lib_dir = req.zig_lib_dir,
+                        .cache_dirs = req.cache_dirs,
+                        .build_root = req.build_root,
+                    });
+                    try server.serveStringMessage(.file_system_inputs, prefixed);
+                }
+                if (r.errors) |body| {
+                    try server.serveStringMessage(.error_bundle, body);
+                } else {
+                    try server.serveEmitDigest(&r.digest, .{ .flags = .{ .cache_hit = r.cache_hit } });
+                }
+            },
+            else => main.fatal("unrecognized message from client: 0x{x}", .{@backingInt(hdr.tag)}),
+        }
+    }
+}
+
+const Result = struct {
+    digest: [16]u8,
+    cache_hit: bool,
+    out_path: []const u8,
+    /// The files Aro read, zero-separated, for `file_system_inputs`.
+    inputs: []const u8,
+    /// An ErrorBundle message body, when Aro reported errors.
+    errors: ?[]const u8 = null,
+};
+
+/// The record of one translation: `Header`, `n` `Entry`s, then the paths.
+const record_magic = "ZAPTC001".*;
+const Header = extern struct {
+    magic: [8]u8 = record_magic,
+    output_hash: cache.Hash,
+    n: u32,
+    paths_len: u32,
+};
+const Entry = extern struct {
+    inode: u64,
+    size: u64,
+    /// Nanoseconds, or `racy_mtime` when the file was too new to trust.
+    mtime: i64,
+    path_len: u32,
+    _pad: u32 = 0,
+    hash: cache.Hash,
+
+    /// A file changed within the timestamp granularity of its last read
+    /// could change again without changing its mtime, so it is recorded
+    /// with this mtime and rehashed by the next build (Frontend's rule).
+    const racy_mtime = std.math.minInt(i64);
+    const racy_window_ns = 2 * std.time.ns_per_s;
+
+    fn matches(e: Entry, st: Io.File.Stat) bool {
+        return e.mtime != racy_mtime and e.inode == st.inode and e.size == st.size and e.mtime == st.mtime.toNanoseconds();
+    }
+};
+
+fn translate(init: std.process.Init, req: *const Request) !Result {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const cwd_path = try std.process.currentPathAlloc(io, arena);
+    const cwd = Io.Dir.cwd();
+    const start_ns = Io.Clock.real.now(io).toNanoseconds();
+    const lib = try std.fs.path.resolve(arena, &.{ cwd_path, req.zig_lib_dir });
+    const global = try std.fs.path.resolve(arena, &.{ cwd_path, req.cache_dirs.global });
+    const local = req.cache_dirs.local;
+    const source = try std.fs.path.resolve(arena, &.{ cwd_path, req.source });
+
+    // As the build runner, translate-c from the pinned release's lib
+    // directory is trusted not to change.
+    const trusted = init.environ_map.get("ZIG_LIB_DIR") == null and
+        std.mem.eql(u8, lib, try std.fs.path.resolve(arena, &.{ cwd_path, build_options.zig_lib_dir }));
+    const exe = try ensureBinary(init, lib, global, trusted);
+    const exe_stat = try cwd.statFile(io, exe, .{});
+
+    // Upstream's arguments, with the depfile and output paths left for
+    // last so that the key does not depend on them.
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{
+        exe,                                              "--zig-integration",
+        try std.fmt.allocPrint(arena, "--zig-lib={s}", .{lib}), "--",
+        "-x",                                             "c",
+        "-isystem",                                       try std.fs.path.join(arena, &.{ lib, "compiler", "aro", "include" }),
+        "-fno-PIE",                                       if (req.link_libc) "-fPIC" else "-fno-PIC",
+        "-gdwarf-4",                                      "-gdwarf32",
+        "-fno-lto",                                       "-fhosted",
+        "-nostdinc",
+    });
+    const query_text = if (req.glibc_version) |v| try std.fmt.allocPrint(arena, "x86_64-linux-gnu.{f}", .{v}) else "x86_64-linux-none";
+    const query = try std.Target.Query.parse(.{ .arch_os_abi = query_text, .cpu_features = "baseline" });
+    const target = try std.zig.system.resolveTargetQuery(io, query);
+    if (req.link_libc) try argv.append(arena, try std.fmt.allocPrint(arena, "-D__GLIBC_MINOR__={d}", .{req.glibc_version.?.minor}));
+    try argv.appendSlice(arena, &.{ "-isystem", try std.fs.path.join(arena, &.{ lib, "include" }) });
+    if (req.link_libc) {
+        const dirs = try std.zig.LibCDirs.detectFromBuilding(arena, .{ .root_dir = .cwd(), .sub_path = lib }, &target);
+        for (dirs.libc_include_dir_list) |d| try argv.appendSlice(arena, &.{ "-isystem", d });
+    }
+    try argv.appendSlice(arena, &.{ "-O0", "-target", try target.zigTriple(arena), try mcpuArg(arena, &target) });
+    try argv.appendSlice(arena, req.cc_args);
+
+    // The key: zap, the binary (rebuilt in place when a zig lib directory
+    // under edit changes), the working directory and the arguments.
+    var key_args: std.ArrayList([]const u8) = .empty;
+    try key_args.append(arena, try std.fmt.allocPrint(arena, "{d}\x00{d}\x00{d}\x00{d}", .{ exe_stat.inode, exe_stat.size, exe_stat.mtime.toNanoseconds(), exe_stat.ctime.toNanoseconds() }));
+    try key_args.appendSlice(arena, argv.items[1..]);
+    try key_args.append(arena, source);
+    _, const key = try Incremental.compilationKey(arena, io, key_args.items, lib, "translate-c");
+    const digest: [16]u8 = @bitCast(key);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const record_path = try std.fs.path.join(arena, &.{ local, "zap", "tc", &hex });
+    const out_dir = try std.fs.path.join(arena, &.{ local, "o", &hex });
+    const out_path = try std.fs.path.join(arena, &.{ out_dir, try std.fmt.allocPrint(arena, "{s}.zig", .{std.fs.path.stem(source)}) });
+
+    var old_output: ?cache.Hash = null;
+    if (try checkRecord(arena, io, record_path, out_path, start_ns)) |c| switch (c) {
+        .hit => |inputs| return .{ .digest = digest, .cache_hit = true, .out_path = out_path, .inputs = inputs },
+        .miss => |h| old_output = h,
+    };
+
+    // Translate into the local cache's `zap/tmp`, then move the output
+    // into place.
+    const tmp_dir = try std.fs.path.join(arena, &.{ local, "zap", "tmp" });
+    try cwd.createDirPath(io, tmp_dir);
+    var rand: [8]u8 = undefined;
+    io.random(&rand);
+    const tmp_base = try std.fs.path.join(arena, &.{ tmp_dir, &std.fmt.bytesToHex(rand, .lower) });
+    const dep_path = try std.fmt.allocPrint(arena, "{s}-tc.d", .{tmp_base});
+    const tmp_out = try std.fmt.allocPrint(arena, "{s}-tc.zig", .{tmp_base});
+    defer cwd.deleteFile(io, dep_path) catch {};
+    defer cwd.deleteFile(io, tmp_out) catch {};
+    // The source as given, as upstream, so that diagnostics name it so.
+    try argv.appendSlice(arena, &.{ "-MD", "-MV", "-MF", dep_path, req.source, "-o", tmp_out });
+    if (init.environ_map.get("ZIG_VERBOSE_CC") != null) std.log.info("{f}", .{std.zig.SubprocessCommand{ .argv = argv.items }});
+    const res = std.process.run(arena, io, .{
+        .argv = argv.items,
+        .environ_map = init.environ_map,
+        .stdout_limit = .unlimited,
+        .stderr_limit = .unlimited,
+    }) catch |err| main.fatal("unable to run translate-c ({s}): {t}", .{ exe, err });
+    if (res.stderr.len != 0) try Io.File.stderr().writeStreamingAll(io, res.stderr);
+    if (!res.term.success()) main.fatal("translate-c failed ({f}) translating '{s}'", .{ res.term, source });
+    if (res.stdout.len != 0) {
+        // `--zig-integration` reports Aro's errors as one ErrorBundle
+        // message on stdout.
+        var reader: Io.Reader = .fixed(res.stdout);
+        const hdr = reader.takeStruct(std.zig.Server.Message.Header, .little) catch main.fatal("translate-c wrote an unreadable message", .{});
+        const body = reader.take(hdr.bytes_len) catch main.fatal("translate-c wrote a truncated message", .{});
+        if (hdr.tag != .error_bundle) main.fatal("unexpected message from translate-c: {t}", .{hdr.tag});
+        return .{ .digest = digest, .cache_hit = false, .out_path = out_path, .inputs = source, .errors = body };
+    }
+
+    // Every file Aro read, from the depfile: the source, then headers.
+    const dep = try cwd.readFileAlloc(io, dep_path, arena, .unlimited);
+    var paths: std.ArrayList([]const u8) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var it: std.Build.Cache.DepTokenizer = .{ .bytes = dep };
+    while (it.next()) |tok| switch (tok) {
+        .target, .target_must_resolve => {},
+        .prereq, .prereq_must_resolve => {
+            var buf: std.ArrayList(u8) = .empty;
+            if (tok == .prereq_must_resolve) try tok.resolve(arena, &buf);
+            const p = try std.fs.path.resolve(arena, &.{ cwd_path, if (tok == .prereq) tok.prereq else buf.items });
+            if (!(try seen.getOrPut(arena, p)).found_existing) try paths.append(arena, p);
+        },
+        else => main.fatal("translate-c wrote an invalid depfile '{s}'", .{dep_path}),
+    };
+    if (!seen.contains(source)) try paths.insert(arena, 0, source);
+
+    var entries: std.ArrayList(Entry) = .empty;
+    var path_bytes: std.ArrayList(u8) = .empty;
+    for (paths.items) |p| {
+        const f = try cwd.openFile(io, p, .{});
+        defer f.close(io);
+        const st = try f.stat(io);
+        const bytes = try arena.alloc(u8, st.size);
+        _ = try f.readPositionalAll(io, bytes, 0);
+        try entries.append(arena, entry(st, cache.hash(0, bytes), p.len, start_ns));
+        try path_bytes.appendSlice(arena, p);
+    }
+
+    // The output: left alone when its bytes did not change, so that its
+    // stat stays as the compile step that imports it recorded.
+    const output = try cwd.readFileAlloc(io, tmp_out, arena, .unlimited);
+    const output_hash = cache.hash(0, output);
+    const same = old_output == output_hash and same: {
+        const old = cwd.readFileAlloc(io, out_path, arena, .unlimited) catch break :same false;
+        break :same std.mem.eql(u8, old, output);
+    };
+    if (!same) {
+        try cwd.createDirPath(io, out_dir);
+        try cwd.rename(tmp_out, cwd, out_path, io);
+    }
+    // Then the record, so that a record never names an output that is not
+    // there.
+    try cwd.createDirPath(io, std.fs.path.dirname(record_path).?);
+    const header: Header = .{ .output_hash = output_hash, .n = @intCast(entries.items.len), .paths_len = @intCast(path_bytes.items.len) };
+    try cache.writeReplace(io, cwd, record_path, &.{ std.mem.asBytes(&header), std.mem.sliceAsBytes(entries.items), path_bytes.items });
+    return .{ .digest = digest, .cache_hit = false, .out_path = out_path, .inputs = try std.mem.join(arena, "\x00", paths.items) };
+}
+
+fn entry(st: Io.File.Stat, hash: cache.Hash, path_len: usize, start_ns: i96) Entry {
+    const mtime: i64 = @intCast(st.mtime.toNanoseconds());
+    return .{
+        .inode = @intCast(st.inode),
+        .size = st.size,
+        .mtime = if (mtime >= start_ns - Entry.racy_window_ns) Entry.racy_mtime else mtime,
+        .path_len = @intCast(path_len),
+        .hash = hash,
+    };
+}
+
+const Check = union(enum) {
+    /// The recorded files, zero-separated.
+    hit: []const u8,
+    /// The output's recorded hash.
+    miss: cache.Hash,
+};
+
+/// Compares the record's files with the file system: a hit when every
+/// file stats as recorded or, rehashed, has the recorded contents (the
+/// record then takes the new stats). Null without a usable record.
+fn checkRecord(arena: std.mem.Allocator, io: Io, record_path: []const u8, out_path: []const u8, start_ns: i96) !?Check {
+    const cwd = Io.Dir.cwd();
+    const rec = cwd.readFileAlloc(io, record_path, arena, .limited(64 << 20)) catch return null;
+    if (rec.len < @sizeOf(Header)) return null;
+    const header = std.mem.bytesToValue(Header, rec[0..@sizeOf(Header)]);
+    const entries_end = @sizeOf(Header) + @as(usize, header.n) * @sizeOf(Entry);
+    if (!std.mem.eql(u8, &header.magic, &record_magic) or rec.len != entries_end + header.paths_len) return null;
+    const entries = try arena.alloc(Entry, header.n);
+    @memcpy(std.mem.sliceAsBytes(entries), rec[@sizeOf(Header)..entries_end]);
+    const paths = rec[entries_end..];
+    _ = cwd.statFile(io, out_path, .{}) catch return .{ .miss = header.output_hash };
+    var inputs: std.ArrayList(u8) = .empty;
+    var changed = false;
+    var at: usize = 0;
+    for (entries) |*e| {
+        const p = paths[at..][0..e.path_len];
+        at += e.path_len;
+        if (inputs.items.len != 0) try inputs.append(arena, 0);
+        try inputs.appendSlice(arena, p);
+        const f = cwd.openFile(io, p, .{}) catch return .{ .miss = header.output_hash };
+        defer f.close(io);
+        const st = f.stat(io) catch return .{ .miss = header.output_hash };
+        if (e.matches(st)) continue;
+        const bytes = try arena.alloc(u8, st.size);
+        _ = f.readPositionalAll(io, bytes, 0) catch return .{ .miss = header.output_hash };
+        const h = cache.hash(0, bytes);
+        if (h != e.hash) return .{ .miss = header.output_hash };
+        e.* = entry(st, h, e.path_len, start_ns);
+        changed = true;
+    }
+    if (changed) {
+        cache.writeReplace(io, cwd, record_path, &.{ rec[0..@sizeOf(Header)], std.mem.sliceAsBytes(entries), paths }) catch {};
+    } else {
+        // The record's mtime is its last use, for trimming the cache.
+        cwd.setTimestampsNow(io, record_path, .{}) catch {};
+    }
+    return .{ .hit = inputs.items };
+}
+
+/// Upstream's `-mcpu`: the model and every feature, each `+` or `-`.
+fn mcpuArg(arena: std.mem.Allocator, target: *const std.Target) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(arena, "-mcpu={s}", .{target.cpu.model.name});
+    for (target.cpu.arch.allFeaturesList(), 0..) |feature, i| {
+        const on = target.cpu.features.isEnabled(@intCast(i));
+        try buf.print(arena, "{c}{s}", .{ "-+"[@intFromBool(on)], feature.name });
+    }
+    return buf.items;
+}
+
+/// Builds translate-c once per zap binary and zig lib directory, into
+/// `<global cache>/zap/o/<hash>/translate-c`, as the build runner, and
+/// returns its path.
+fn ensureBinary(init: std.process.Init, lib: []const u8, global: []const u8, trusted: bool) ![]const u8 {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const seed, _ = try Incremental.compilationKey(arena, io, &.{}, lib, "x86_64-linux");
+    const h = cache.hash(3, try std.mem.concat(arena, u8, &.{ std.mem.asBytes(&seed), lib }));
+    const dir = try std.fmt.allocPrint(arena, "{s}/zap/o/{x:0>32}", .{ global, h });
+    const exe = try std.fs.path.join(arena, &.{ dir, "translate-c" });
+    const stamp = try std.fs.path.join(arena, &.{ dir, "translate-c.stat" });
+    if (trusted and BuildRunner.toolUnchanged(io, exe, stamp)) return exe;
+    try Io.Dir.cwd().createDirPath(io, dir);
+    try BuildRunner.compileTool(init, dir, &.{
+        "zap",           "build-exe",
+        "--dep",         "aro",
+        try std.fmt.allocPrint(arena, "-Mroot={s}/compiler/translate-c/main.zig", .{lib}),
+        try std.fmt.allocPrint(arena, "-Maro={s}/compiler/aro/aro.zig", .{lib}),
+        "--name",        "translate-c",
+        "--zig-lib-dir", lib,
+        "--cache-dir",   global,
+        "--global-cache-dir", global,
+    }, "Compiling translate-c (first time setup)", "translate-c", try std.fmt.allocPrint(arena, "{s}/compiler/translate-c/main.zig", .{lib}));
+    BuildRunner.noteTool(io, exe, stamp);
+    return exe;
+}

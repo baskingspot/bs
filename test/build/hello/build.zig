@@ -30,6 +30,24 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }) }));
+    // A C header translated to Zig, imported by a program that links
+    // glibc: `zap translate-c --listen=-`.
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.path("c/shape.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tc.addIncludePath(b.path("c"));
+    tc.defineCMacro("SHAPE_SCALE", "10");
+    const shape = b.addExecutable(.{ .name = "shape", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/shape.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "c", .module = tc.createModule() }},
+    }) });
+    b.step("shape", "Run shape").dependOn(&b.addRunArtifact(shape).step);
     const tests = b.addTest(.{ .root_module = mod });
     const test_step = b.step("test", "Run hello's tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);

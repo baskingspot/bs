@@ -29,6 +29,7 @@ const usage =
     \\  build-lib        Create static library from source
     \\  run              Create executable and run immediately
     \\  test             Perform unit testing
+    \\  translate-c      Convert C code to Zig code
     \\  fmt              Reformat Zig source into canonical form
     \\  ast-check        Look for simple compile errors in any set of files
     \\  env              Print lib path, std path, cache directory, and version
@@ -126,7 +127,6 @@ pub const Options = struct {
 /// protocol when asked to.
 const unsupported_commands: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "test-obj", "zap does not build test objects yet ('test-obj'); build this step with upstream zig" },
-    .{ "translate-c", "zap does not translate C ('translate-c', '@cImport'); build this step with upstream zig" },
     .{ "cc", "zap does not compile C ('cc'); build this step with upstream zig" },
     .{ "c++", "zap does not compile C++ ('c++'); build this step with upstream zig" },
     .{ "objcopy", "zap does not implement 'objcopy'; run this step with upstream zig" },
@@ -154,6 +154,7 @@ pub fn main(init_std: std.process.Init) !void {
     if (raw_args.len < 2) fatalUsage();
     const cmd = raw_args[1];
     if (std.mem.eql(u8, cmd, "build")) return @import("BuildRunner.zig").run(init, raw_args[2..]);
+    if (std.mem.eql(u8, cmd, "translate-c")) return @import("TranslateC.zig").run(init, raw_args[2..]);
     const args = raw_args;
     const command: Command = if (std.mem.eql(u8, cmd, "build-exe"))
         .build_exe
@@ -766,7 +767,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
             .update => {
                 try server.in.discardAll(hdr.bytes_len);
                 const j = if (job) |*j| j else {
-                    try serveErrors(&server, init.gpa, &.{.{ .code = .unsupported, .loc = null, .msg = opts.unsupported.? }}, null);
+                    try serveUnsupported(&server, init.gpa, opts.unsupported.?);
                     continue;
                 };
                 var inputs: std.ArrayList(u8) = .empty;
@@ -774,7 +775,7 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
                 defer if (inc) |*i| i.close();
                 const outcome = try compile(init, j, if (inc) |*i| i else null, out_path, root_node, &inputs);
                 if (inputs.items.len != 0) {
-                    const prefixed = try prefixInputs(arena, io, inputs.items, j);
+                    const prefixed = try prefixInputs(arena, io, inputs.items, .{ .zig_lib_dir = j.zig_lib_dir, .cache_dirs = j.cache_dirs, .build_root = j.opts.build_root });
                     try server.serveStringMessage(.file_system_inputs, prefixed);
                 }
                 switch (outcome) {
@@ -819,6 +820,10 @@ fn serveFailure(init: std.process.Init, diags: []const diag.Diagnostic, output_m
     }
 }
 
+pub fn serveUnsupported(server: *std.zig.Server, gpa: std.mem.Allocator, msg: []const u8) !void {
+    try serveErrors(server, gpa, &.{.{ .code = .unsupported, .loc = null, .msg = msg }}, null);
+}
+
 fn serveErrors(server: *std.zig.Server, gpa: std.mem.Allocator, diags: []const diag.Diagnostic, ref_limit: ?u32) !void {
     var wip: std.zig.ErrorBundle.Wip = try .init(gpa);
     defer wip.deinit();
@@ -833,7 +838,7 @@ fn serveErrors(server: *std.zig.Server, gpa: std.mem.Allocator, diags: []const d
 /// lib, local cache, global cache, build root; else the working
 /// directory), as one prefix byte (`PathPrefix` + 1) and the sub path,
 /// separated by zero bytes.
-fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: *const Job) ![]const u8 {
+pub fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: struct { zig_lib_dir: []const u8, cache_dirs: Frontend.CacheDirs, build_root: ?[]const u8 }) ![]const u8 {
     const cwd = try std.process.currentPathAlloc(io, arena);
     const Prefix = std.zig.Server.Message.PathPrefix;
     const Root = struct { prefix: Prefix, path: []const u8 };
@@ -841,7 +846,7 @@ fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: *cons
     try roots.append(arena, .{ .prefix = .zig_lib, .path = try std.fs.path.resolve(arena, &.{ cwd, job.zig_lib_dir }) });
     try roots.append(arena, .{ .prefix = .local_cache, .path = try std.fs.path.resolve(arena, &.{ cwd, job.cache_dirs.local }) });
     try roots.append(arena, .{ .prefix = .global_cache, .path = try std.fs.path.resolve(arena, &.{ cwd, job.cache_dirs.global }) });
-    if (job.opts.build_root) |br| try roots.append(arena, .{ .prefix = .build_root, .path = try std.fs.path.resolve(arena, &.{ cwd, br }) });
+    if (job.build_root) |br| try roots.append(arena, .{ .prefix = .build_root, .path = try std.fs.path.resolve(arena, &.{ cwd, br }) });
     try roots.append(arena, .{ .prefix = .cwd, .path = cwd });
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, inputs, 0);
@@ -1064,7 +1069,7 @@ const unsupported_flags: std.StaticStringMap([]const u8) = .initComptime(.{
     .{ "-municode", "zap does not target Windows ('-municode')" },
 });
 
-fn setUnsupported(opts: *Options, arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+pub fn setUnsupported(opts: *Options, arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
     if (opts.unsupported == null) opts.unsupported = std.fmt.allocPrint(arena, fmt, args) catch fatal("out of memory", .{});
 }
 
@@ -1313,7 +1318,7 @@ fn inheritFuzz(modules: []Frontend.ModuleArg, seen: []bool, deps: []const []cons
 
 /// Only the x86_64-linux backend exists so far; refuses aarch64-macos
 /// rather than silently writing an x86_64 ELF.
-fn checkTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8) void {
+pub fn checkTarget(opts: *Options, arena: std.mem.Allocator, target: []const u8) void {
     const native_ok = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
     if (std.mem.eql(u8, target, "x86_64-linux") or std.mem.eql(u8, target, "x86_64-linux-none") or
         (std.mem.eql(u8, target, "native") and native_ok))
@@ -1363,13 +1368,17 @@ fn loadGlibc(init: std.process.Init, job: *const Job) !Glibc {
 /// `std.zig.target.isLibCLibName` for glibc).
 const glibc_libs: std.StaticStringMap(void) = .initComptime(.{ .{"c"}, .{"m"}, .{"rt"}, .{"pthread"}, .{"util"}, .{"resolv"}, .{"dl"} });
 
+pub fn isGlibcLib(name: []const u8) bool {
+    return glibc_libs.has(name);
+}
+
 /// Upstream's glibc version for `x86_64-linux-gnu` without one.
 const default_glibc: std.SemanticVersion = .{ .major = 2, .minor = 31, .patch = 0 };
 
 /// Settles the glibc a `-lc` build links: the target's version, or for the
 /// native target the system's, which upstream detects the same way. Other
 /// libcs are not supported.
-fn resolveGlibc(opts: *Options, arena: std.mem.Allocator, io: Io) void {
+pub fn resolveGlibc(opts: *Options, arena: std.mem.Allocator, io: Io) void {
     if (opts.glibc_version != null) return;
     const target = opts.target orelse "native";
     if (!std.mem.eql(u8, target, "native")) {

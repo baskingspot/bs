@@ -34,6 +34,18 @@ expect "hello 2"
 "$zap" build test --summary all >"$work/log" 2>&1 || fail "zap build test"
 expect "run test 4 pass (4 total)"
 
+# A C header translated to Zig (`zap translate-c --listen=-`), in a program
+# that links glibc. A header edit translates again; a header touched but
+# unchanged is a cache hit.
+"$zap" build shape --summary all >"$work/log" 2>&1 || fail "zap build shape"
+expect "triangle 3 30"
+echo '#define SHAPE_SIDES 4' >c/sides.h
+"$zap" build shape >"$work/log" 2>&1 || fail "zap build shape (header edit)"
+expect "triangle 4 40"
+touch c/shape.h
+"$zap" build shape --summary all >"$work/log" 2>&1 || fail "zap build shape (header touched)"
+expect "translate-c cached"
+
 # Fuzzing: the runner rebuilds the tests with -ffuzz, zap instruments them
 # and links upstream's fuzzer, which finds the crash planted in "fuzz".
 # As upstream's, the runner exits 0 after reporting a crash.

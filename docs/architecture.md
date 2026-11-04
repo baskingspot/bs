@@ -4721,8 +4721,8 @@ state. Built for step 1:
   `builtin.unwind_tables` as upstream does (ghostty asks for `.sync`);
   zap emits asynchronous tables for each, which serve every request.
   Release modes (`-O` other than Debug), C, C++ and assembly sources,
-  system libraries and translate-c stay `[unsupported]`; `-lc` links
-  glibc (see "C interop"). zap never hands a step to upstream zig.
+  and system libraries stay `[unsupported]`; `-lc` links glibc and `zap
+  translate-c` translates headers (see "C interop"). zap never hands a step to upstream zig.
 - **`zap build`** (`src/BuildRunner.zig`) does what upstream's `zig build`
   does, with zap as the compiler. It compiles upstream's build runner,
   `<zig lib>/compiler/Maker.zig`, with zap (Debug) into
@@ -4764,7 +4764,7 @@ state. Built for step 1:
   the first error that has a trace) and its hidden-frame count. A step zap
   cannot build answers every update with one `[unsupported]` error, so the
   runner reports it as that step's failure and builds the rest; commands
-  zap does not implement (`translate-c`, `cc`, `test-obj`, ...) are
+  zap does not implement (`cc`, `test-obj`, ...) are
   served the same way. Without `--listen=-`, zap renders with its own
   renderer (`--error-format`).
 - **Libraries and docs.** `build-lib` (static, upstream's default) writes
@@ -5329,6 +5329,51 @@ libraries as inputs. To be agreed with that thread.
   zap has no extern-type validation (`validateExtern`) for variadic
   arguments or C-callconv parameters. It accepts more than upstream;
   it is Sema's to fix.
+
+### Step 2 as built (2026-11-04)
+
+- **`zap translate-c`** (`src/TranslateC.zig`): the CLI prints the
+  translation, as upstream; `--listen=-` answers each update with
+  `file_system_inputs` (the source and every header) and `emit_digest`,
+  or with translate-c's ErrorBundle, passed through as it came. Options:
+  `-target`, `-lc` and glibc's other `-l` names, `-I`/`-isystem`/
+  `-iquote`/`-idirafter`/`-D`/`-U` and the like (passed to Aro in order),
+  the cache and lib directories; `-O` is ignored (headers see Debug's
+  macros, as the code they go into), `-cflags ... --` too, as upstream.
+  Targets: x86_64-linux only, since zap builds the translate-c binary
+  with its x86_64 backend.
+- **Aro's arguments** are upstream's (`Compilation.translateC`, read from
+  the argv upstream's zig passes its translate-c binary) for zap's
+  target: `-mcpu` is the baseline CPU, so CPU feature macros are the
+  baseline's; the triple is the native one without `-target` (glibc's
+  ABI and detected version, with or without `-lc`, as upstream's native
+  target), `x86_64-linux-none` for `-target x86_64-linux`. `-lc` adds
+  `-fPIC`, `-D__GLIBC_MINOR__` and glibc's headers from the zig lib
+  directory (`LibCDirs.detectFromBuilding`); the binary itself still adds
+  the native include paths (`/usr/include`), as upstream's does. Output
+  matches upstream's byte for byte for `-mcpu=baseline` (tokamak's
+  `c.h` without `-lc`) and for `-target x86_64-linux-gnu.2.36 -lc`
+  (stdio.h).
+- **The binary**: `<zig lib>/compiler/translate-c/main.zig` with `aro`,
+  Debug, compiled by zap from `<global cache>/zap/o/<hash>/` like the
+  build runner (`BuildRunner.compileTool`, `toolUnchanged`).
+- **Records** (`<local cache>/zap/tc/<key>`): a header (magic
+  `ZAPTC001`, the output's hash, counts), one 48-byte entry per file
+  (inode, size, mtime or racy, path length, content hash), then the
+  absolute paths. The key (`Incremental.compilationKey` over the binary's
+  stat, Aro's arguments and the source's absolute path, so zap, the
+  working directory and the zig lib directory too) names the output,
+  `<local cache>/o/<key>/<stem>.zig`, and is the digest. A hit stats the
+  files, rehashes those whose stats changed, and rewrites the record when
+  only stats changed, else touches it (its mtime is its last use, for
+  trimming). A miss translates into `zap/tmp`, moves the output into
+  place only when its bytes changed, then replaces the record. Trimming
+  `zap/tc` and `o/<key>` under the local cache's cap is the cache
+  thread's (maintain), by the record's mtime.
+- **Checks**: test/build/hello's `shape` step (a `b.addTranslateC` with
+  `-lc`, an include directory and a macro, imported by a `-lc`
+  program): a header edit translates again, a touched header is
+  `translate-c cached`.
 
 ### Steps and checks
 
