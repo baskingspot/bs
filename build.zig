@@ -307,7 +307,7 @@ fn addRunTests(b: *std.Build, bs: *std.Build.Step.Compile, test_step: *std.Build
                         std.debug.panic("{s}: unable to read {s}: {t}", .{ src_path, e.path, err });
                     const at = std.mem.indexOf(u8, lib_src, e.text) orelse std.debug.panic("{s}: rebuild-lib-without text not found", .{src_path});
                     _ = files.add("lib_before", b.fmt("{s}{s}", .{ lib_src[0..at], lib_src[at + e.text.len ..] }));
-                    lib_setup = b.fmt("rm -rf \"$4.d/lib\"; cp -rs {s} \"$4.d/lib\"; rm \"$4.d/lib/{s}\"\n", .{ lib_dir, e.path });
+                    lib_setup = b.fmt("chmod -R u+w \"$4.d/lib\" 2>/dev/null || :; rm -rf \"$4.d/lib\"; cp -rs {s} \"$4.d/lib\"; chmod -R u+w \"$4.d/lib\"; rm \"$4.d/lib/{s}\"\n", .{ lib_dir, e.path });
                     lib_flag = b.fmt(" --zig-lib-dir \"$4.d/lib\"", .{});
                     lib_before = b.fmt("cp \"$(dirname \"$1\")/lib_before\" \"$4.d/lib/{s}\"\n", .{e.path});
                     lib_after = b.fmt("cp {s}/{s} \"$4.d/lib/{s}\"\n", .{ lib_dir, e.path, e.path });

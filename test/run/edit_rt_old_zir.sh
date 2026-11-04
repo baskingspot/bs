@@ -8,6 +8,7 @@
 #   $4 a global cache holding std's ZIR, which the empty one starts from
 set -eu
 unset ZIG_LOCAL_CACHE_DIR ZIG_GLOBAL_CACHE_DIR BS_CACHE BS_CACHE_VERIFY BS_CACHE_CHECK BS_CACHE_DONOR
+chmod -R u+w "$2" 2>/dev/null || :
 rm -rf "$2"
 mkdir -p "$2"
 bs=$(realpath "$1") work=$(realpath "$2") lib=$(realpath "$3")
@@ -22,8 +23,10 @@ fail() {
 }
 
 cp -rs "$lib" lib
+chmod -R u+w lib
 rm lib/compiler_rt/fmod.zig
 cp "$lib/compiler_rt/fmod.zig" lib/compiler_rt/fmod.zig
+chmod u+w lib/compiler_rt/fmod.zig
 cat >m.zig <<'EOF'
 const std = @import("std");
 
