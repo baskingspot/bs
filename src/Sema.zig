@@ -9902,6 +9902,9 @@ fn analyzeShift(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, lhs: Re
             return sema.fail(block, src.operandSrc(1), "use of undefined value here causes illegal behavior", .{});
         }
         if (sema.intSign(v) < 0) return sema.fail(block, src.operandSrc(1), "shift by negative amount '{f}'", .{sema.fmtValue(v)});
+        // As upstream, a comptime_int shifts by at most 2^64 - 1 bits.
+        if (class == .comptime_int and sema.ip.intValue(u64, v) == null)
+            return sema.fail(block, src.operandSrc(1), "this implementation only supports comptime shift amounts of up to 2^{d} - 1 bits", .{64});
         const amount = sema.ip.intValue(u64, v) orelse std.math.maxInt(u64);
         if (!sat and class == .int and amount > 0 and amount >= Type.intInfo(ip, ty).bits)
             return sema.fail(block, src.operandSrc(1), "shift amount '{f}' is too large for operand type '{f}'", .{ sema.fmtValue(v), sema.fmtType(ty) });
