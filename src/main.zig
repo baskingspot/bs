@@ -942,9 +942,15 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     stages.on = env.get("BS_TIMING") != null;
     // While Clang compiles a C source, its object is not yet what the
     // build links, so the build cannot be the last one.
-    const c_compiling = if (c_batch) |b| b.misses != 0 else false;
+    var c_compiling = if (c_batch) |b| b.misses != 0 else false;
+    // When nothing but C sources changed, Clang's objects relink with the
+    // last build's atoms once they are done; else Clang runs while Sema
+    // does.
+    if (c_compiling) if (inc_opt) |i| if (try i.onlyLinkInputsMayChange()) {
+        if ((try c_batch.?.wait()).errors.len == 0) c_compiling = false;
+    };
     if (inc_opt) |i| i.link_objects_pending = c_compiling;
-    if (inc_opt) |i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
+    if (inc_opt) |i| if (try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?, true)) {
         // The C objects come after the arguments' link inputs. They are
         // the records' outputs; the build reports the C sources and their
         // headers instead, as a full build does.
@@ -957,7 +963,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
             _, const path = m.input(@intCast(n));
             try appendInput(arena, list, path);
         };
-        // Nothing compiled: the records' inputs, without reading the objects.
+        // The records' inputs, without reading the objects.
         if (c_batch) |b| {
             if (inputs) |list| try appendCInputs(arena, list, try CSource.hitInputs(b, arena));
             b.writeSummary();

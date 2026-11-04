@@ -72,21 +72,23 @@ build "not relinking" "hello from C"
 # A relink from the manifest converts the inputs again.
 rm main
 build "no input changed; relinked" "hello from C"
-# An object changed: built again, nothing to analyze.
+# An object changed: a declaration's data (`c_refs`) names its atoms,
+# which its relink cannot bind again, so it builds, with nothing to
+# analyze.
 sed -i 's/hello from C/HELLO from C/' lib.c
 objects
-build "inputs changed, first $work/lib.o" "HELLO from C"
+build "not relinking: UndefinedSymbol (atom 'main.c_refs')" "HELLO from C"
 eager "an object changed"
 # Data that the Zig code's comptime extern pointers name moves in its
 # section: the slots and the variable's data are bound again.
 sed -i 's|/\* PAD \*/|int c_pad[16] = {1};|' lib.c
 objects
-build "inputs changed, first $work/lib.o" "extern data data 30 30"
+build "not relinking: UndefinedSymbol (atom 'main.c_refs')" "extern data data 30 30"
 eager "extern data moved"
 # An archive's member changed.
 sed -i 's/1 + a2/2 + a2/' a1.c
 objects
-build "inputs changed, first $work/liba1.a" "HELLO from C"
+build "not relinking: UndefinedSymbol (atom 'main.fn_table')" "HELLO from C"
 # The Zig code changed.
 sed -i 's/{d} {d} {d}\\n", .{ c_tls()/{d} {d} {d}!\\n", .{ c_tls()/' main.zig
 build "inputs changed, first $work/main.zig" "HELLO from C"
@@ -128,9 +130,9 @@ args="build-exe libc_main.zig libc.c -lc"
 build "cache: recorded" "x=21 twice=42"
 build "not relinking" "x=21 twice=42"
 sed -i 's/x=%d/X=%d/' libc.c
-# The Zig code replays, eagerly: the object is not the manifest's yet.
-build "0 inputs changed" "X=21 twice=42"
-eager "a C source changed"
+# Only the C changed: once Clang is done, its object relinks with the
+# last build's atoms.
+build "1 link inputs changed and nothing else; relinked" "X=21 twice=42"
 build "not relinking" "X=21 twice=42"
 # Touched, not changed: the record hits, and the link is the last one.
 touch libc.c
@@ -139,14 +141,52 @@ sed -i 's/return 2 \* x/return 3 * x/' libc_main.zig
 build "inputs changed, first $work/libc_main.zig" "X=21 twice=63"
 
 # Assembly: `.S` records its include from the depfile; `.s` has none, so
-# its record holds the source alone, and an edit to either compiles again.
+# its record holds the source alone, and an edit to either compiles again
+# and relinks.
 args="build-exe asm_main.zig asm_cpp.S asm_plain.s"
 build "cache: recorded" "42 42"
 build "not relinking" "42 42"
 sed -i 's/imul %rsi, %rax/imul %rsi, %rax\n\tadd $1, %rax/' asm_plain.s
-build "0 inputs changed" "42 43"
+build "1 link inputs changed and nothing else; relinked" "42 43"
 sed -i 's/ASM_ADD 40/ASM_ADD 50/' asm.h
-build "0 inputs changed" "52 43"
+build "1 link inputs changed and nothing else; relinked" "52 43"
+
+# A C edit relinks from the manifest, with the Zig code's extern slots
+# bound again as a full build binds them: a data, a thread-local and a
+# function extern that move within their sections, and a C fmod that
+# comes before compiler_rt's. It builds when the C needs a compiler_rt
+# function the last build did not generate, or when a declaration's data
+# names C's data without a slot.
+cat >crelink.c <<'C'
+int c_pad = 1;
+int c_y = 7;
+__thread int c_tls = 5;
+long c_fn(long x) { return x + 1; }
+C
+cat >crelink.zig <<'ZIG'
+const std = @import("std");
+extern var c_y: c_int;
+extern threadlocal var c_tls: c_int;
+extern fn c_fn(c_long) c_long;
+extern fn fmod(f64, f64) f64;
+pub fn main() void {
+    std.debug.print("y={d} tls={d} fn={d} fmod={d}\n", .{ c_y, c_tls, c_fn(2), fmod(7, 3) });
+}
+ZIG
+args="build-exe -lc crelink.zig crelink.c"
+build "" "y=7 tls=5 fn=3 fmod=1"
+sed -i 's/x + 1/x + 2/' crelink.c
+build "1 link inputs changed and nothing else; relinked" "y=7 tls=5 fn=4 fmod=1"
+sed -i 's/^int c_y/int c_w = 3;\nint c_y/; s/^__thread int c_tls/__thread int c_tls0 = 1;\n__thread int c_tls/' crelink.c
+build "1 link inputs changed and nothing else; relinked" "y=7 tls=5 fn=4 fmod=1"
+echo 'double fmod(double a, double b) { (void)a; (void)b; return 42; }' >>crelink.c
+build "1 link inputs changed and nothing else; relinked" "y=7 tls=5 fn=4 fmod=42"
+sed -i 's/x + 2/(long)((__float128)x * 2) - x + 1/' crelink.c
+build "not relinking: a changed object needs a compiler_rt function" "y=7 tls=5 fn=3 fmod=42"
+sed -i 's/^pub fn main/var y_ptr: *c_int = \&c_y;\npub fn main/; s/c_y, c_tls/y_ptr.*, c_tls/' crelink.zig
+build "" "y=7 tls=5 fn=3 fmod=42"
+sed -i 's/- x + 1/- x + 2/' crelink.c
+build "not relinking: UndefinedSymbol" "y=7 tls=5 fn=4 fmod=42"
 
 # -lc alone: a lazy edit links from the manifest by number, and binds a
 # function's constant's glibc addresses as the slots.
@@ -212,8 +252,8 @@ if command -v gcc >/dev/null; then
     lazy "-lc: the Zig code changed"
     sed -i 's/x=%d/X=%d/' libc.c
     lc_objects
-    build "inputs changed, first $work/libc.o" "X=22 twice=44"
-    eager "-lc: an object changed"
+    # Only the object changed: it relinks with the last build's atoms.
+    build "1 link inputs changed and nothing else; relinked" "X=22 twice=44"
 fi
 ;;
 

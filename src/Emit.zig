@@ -1728,7 +1728,7 @@ pub fn externDataTarget(emit: *Emit, name: []const u8) !ExternTarget {
 
 /// The section bound the linker defines as `name` (`__start___sancov_cntrs`
 /// and the others), which an executable's `@extern` reaches.
-fn sectionBound(name: []const u8) ?SymbolKey {
+pub fn sectionBound(name: []const u8) ?SymbolKey {
     inline for (.{ .{ Atom.Section.sancov_cntrs, "__sancov_cntrs" }, .{ Atom.Section.sancov_pcs, "__sancov_pcs1" } }) |s| {
         if (std.mem.eql(u8, name, "__start_" ++ s[1])) return .sectionBound(s[0], .start);
         if (std.mem.eql(u8, name, "__stop_" ++ s[1])) return .sectionBound(s[0], .stop);

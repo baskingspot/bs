@@ -3417,11 +3417,20 @@ differs from the design above:
   objects again, pulls archive members for the live nodes' externs,
   converts them with the manifest's exports, compiler_rt keys and glibc,
   and appends their atoms and copies to the manifest's, in a keyed link
-  (C objects' local symbols need one). An edited object or archive, or
-  a C source whose record Clang is compiling (`link_objects_pending`),
-  makes the edit build eager (`linkInputsChanged`), which binds the
-  externs again and generates any compiler_rt function the object now
-  needs. A lazy build does not load the objects, so one that writes a
+  (C objects' local symbols need one). An edited object or archive,
+  with every other input unchanged, relinks the same way
+  (`relinkIfUnchanged` with changed link objects, 2026-11-04): the
+  extern slots are bound again as `Emit.lowerExternSlots` binds them
+  (`reboundSlots`: the compilation's export, the objects' definition at
+  its section atom's key and offset, which an object's contents name,
+  then a section bound, compiler_rt, an import, or 0 for a weak extern),
+  and it builds instead when a full build would bind one, or an object's
+  own reference, to a compiler_rt function or import the last build did
+  not generate, or when a declaration's data names an object's atom
+  without a slot (its old key is then undefined). Otherwise an edited
+  object, or a Zig edit together with it, makes the edit build eager
+  (`linkInputsChanged`), which binds the externs again and generates any
+  compiler_rt function the object now needs. A lazy build does not load the objects, so one that writes a
   declaration's data with the address of a symbol they may define
   (`Emit.externDataTarget`) builds again eagerly. A relink pulls members once with every extern, where a build
   pulls as externs arrive; the two agree while every extern reaches the
@@ -6860,11 +6869,14 @@ libraries as inputs. To be agreed with that thread.
   `ElfInput` takes them; their paths stay out of the compilation key,
   since a record's object path is not part of the program. An edited
   source keeps its object's path, so while any record missed
-  (`Batch.misses`) the build skips `relinkIfUnchanged`, which would
-  otherwise take the old object for the last build's, and replays
-  eagerly (`Incremental.link_objects_pending`), as after an edited
-  object. A build whose records all hit and whose inputs are unchanged
-  skips the link, and a Zig edit can then build lazily. On a hit the build
+  (`Batch.misses`) the build cannot take its object for the last
+  build's. When nothing but link objects changed
+  (`onlyLinkInputsMayChange`), the build waits for Clang and relinks
+  with the last build's atoms, as after an edited object (googletest's
+  C++ edit: 0.23 s to 0.15 s, a comment-only one to 0.05 s since the
+  object keeps its bytes; upstream 0.15–0.17 s); else Clang runs while the
+  Zig code replays eagerly (`Incremental.link_objects_pending`). A build
+  whose records all hit and whose inputs are unchanged skips the link, and a Zig edit can then build lazily. On a hit the build
   reports the C sources and headers as its inputs, not the objects.
   A library of C only (`c_only`) has no Zig to cache and stays outside
   `Incremental`; when no source compiles, it keeps its archive if the

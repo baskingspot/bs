@@ -119,6 +119,10 @@ link_objects: []const []const u8 = &.{},
 /// missed, and upstream's Clang is compiling it), so they may differ from
 /// the manifest's: the build replays eagerly, as after an edited object.
 link_objects_pending: bool = false,
+/// Set by `relinkIfUnchanged` when link objects have new contents:
+/// `linkWithInputs` then checks that the Zig code's bindings to them are
+/// what a full build would make.
+objects_changed: bool = false,
 /// Such an executable's shared library inputs, absolute, in command-line
 /// order: link-only inputs after `link_objects`. A relink parses them
 /// again for the dynamic tables (`loadShared`), and a build after one
@@ -250,8 +254,13 @@ fn ms(a: Io.Timestamp, b: Io.Timestamp) f64 {
 
 /// If no input changed since the last successful build, links its Atoms
 /// into `sub_path` and returns true. Otherwise returns false, and the
-/// caller builds.
-pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u8) !bool {
+/// caller builds. With `objects_may_change`, link inputs may have new
+/// contents (C sources compiled again): the link takes them as they are,
+/// resolving them from the manifest as `linkWithInputs` does, and fails,
+/// for an eager build to find out, if they need what the last build did
+/// not generate. The Zig code's output does not depend on them
+/// (`Emit.exportTarget` does not look at objects).
+pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u8, objects_may_change: bool) !bool {
     const gpa = inc.gpa;
     const io = inc.io;
     const t0 = now(io);
@@ -284,34 +293,84 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     // stats in the manifest's log after the relink.
     var restat: ?Manifest.Delta = null;
     defer if (restat) |*d| d.deinit();
+    var objects_changed: usize = 0;
     for (changed.items) |i| {
         const in, const path = m.input(i);
+        var hash = in.content_hash;
         if (!try inc.sameContents(m, i)) {
-            if (inc.timing) std.debug.print("cache: {d} inputs changed, first {s}\n", .{ changed.items.len, path });
-            return false;
+            if (!objects_may_change or inc.output != .exe or !inc.isLinkObject(m.inputKey(i))) {
+                if (inc.timing) std.debug.print("cache: {d} inputs changed, first {s}\n", .{ changed.items.len, path });
+                return false;
+            }
+            hash = try inc.contentHash(path) orelse return inc.noRelink("{s}: unreadable", .{path});
+            objects_changed += 1;
         }
         const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |err| return inc.noRelink("{s}: {t}", .{ path, err });
         if (restat == null) restat = .init(gpa, m);
-        try restat.?.setInput(i, path, m.inputKey(i), stat, in.content_hash, inc.build_start);
+        try restat.?.setInput(i, path, m.inputKey(i), stat, hash, inc.build_start);
     }
     const t1 = now(io);
     // Past the fold size, the inputs are rehashed until the next full build
     // writes a new base, so that the log stays bounded.
     defer if (restat) |*d| if (!m.shouldFold()) d.append(io, inc.dir) catch {};
-    if (inc.outputUnchanged(out_dir, sub_path)) {
+    if (objects_changed == 0 and inc.outputUnchanged(out_dir, sub_path)) {
         if (inc.timing) std.debug.print("cache: no input changed and the output is as the last link left it; not relinking ({d:.2} ms, {d} rehashed)\n", .{ ms(t0, now(io)), changed.items.len });
         return true;
     }
-    const linked = (try inc.linkFrom(m, out_dir, sub_path)) orelse return false;
+    inc.objects_changed = objects_changed != 0;
+    defer inc.objects_changed = false;
+    const linked = (try inc.linkFrom(m, out_dir, sub_path)) orelse {
+        // The changed objects' new stats must not reach the log: the
+        // build that follows records them itself.
+        if (restat) |*d| d.deinit();
+        restat = null;
+        return false;
+    };
+    if (objects_changed != 0) {
+        if (inc.timing) std.debug.print("cache: {d} link inputs changed and nothing else; relinked {d} atoms from the manifest in {d:.2} ms\n", .{ objects_changed, linked.atoms, ms(t0, now(io)) });
+        return true;
+    }
     if (inc.timing) std.debug.print("cache: no input changed; relinked {d} atoms in {d:.2} ms (manifest and {d} stats {d:.2}, {d} rehashed; packs mapped and input gathered {d:.2}, link {d:.2})\n", .{
         linked.atoms, ms(t0, now(io)), m.inputCount(), ms(t0, t1), changed.items.len, ms(t1, linked.gathered), ms(linked.gathered, now(io)),
     });
     return true;
 }
 
+/// Whether input key `key` names one of `link_objects`: not a shared
+/// library, whose symbols decide how the Zig code binds its externs.
+fn isLinkObject(inc: *const Incremental, key: []const u8) bool {
+    if (!isLinkInput(key)) return false;
+    for (inc.link_objects) |p| if (std.mem.eql(u8, key[link_input_prefix.len..], p)) return true;
+    return false;
+}
+
 /// Link-only input `n`: of `link_objects`, then of `link_shared`.
 fn linkPath(inc: *const Incremental, n: usize) []const u8 {
     return if (n < inc.link_objects.len) inc.link_objects[n] else inc.link_shared[n - inc.link_objects.len];
+}
+
+/// The content hash `sameContents` compares, of the file at `path`, or
+/// null if it cannot be read.
+fn contentHash(inc: *const Incremental, path: []const u8) !?Hash {
+    const src = Io.Dir.cwd().readFileAlloc(inc.io, path, inc.gpa, .unlimited) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => return null,
+    };
+    defer inc.gpa.free(src);
+    return @bitCast(Frontend.hashSource(src));
+}
+
+/// Whether every input of the last build but its link inputs has the
+/// contents it recorded, so that a build whose C sources compile again
+/// may relink once they are done (`relinkIfUnchanged`).
+pub fn onlyLinkInputsMayChange(inc: *const Incremental) !bool {
+    const m = if (inc.prev) |*m| m else return false;
+    if (inc.donor != null or inc.verify == .full or m.output != inc.output or inc.output != .exe) return false;
+    var changed: std.ArrayList(u32) = .empty;
+    defer changed.deinit(inc.gpa);
+    try m.changedInputs(inc.gpa, inc.io, &changed);
+    for (changed.items) |i| if (!inc.isLinkObject(m.inputKey(i)) and !try inc.sameContents(m, i)) return false;
+    return true;
 }
 
 /// Whether manifest `m`'s input `i`, whose stat changed, still has the
@@ -498,7 +557,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             return inc.noLink("export '{s}' has no symbol number", .{x.name});
     }
 
-    const aliases = try externAliases(arena, m, &input, in.numbered);
+    const aliases = try externAliases(arena, m, WithInputs{ .pack = &input, .extra = &.{}, .overrides = &.empty }, in.numbered);
     const numbered_aliases = try arena.alloc(Elf.NumberedAlias, aliases.len);
     for (numbered_aliases, aliases) |*n, a| n.* = .{
         .symbol = m.symbol(@backingInt(a.key)).?,
@@ -613,7 +672,7 @@ fn loadShared(inc: *const Incremental, arena: Allocator, maps: *std.ArrayList(Io
 /// manifest's references hold is a candidate; a manifest with no such
 /// key costs one lookup per name. A key only unlinked atoms still use
 /// may have no linked slot, and gets no alias.
-fn externAliases(arena: Allocator, m: *const Manifest, pack_atoms: *const Pack.LinkAtoms, numbered: []const Elf.NumberedAtom) ![]const Emit.Alias {
+fn externAliases(arena: Allocator, m: *const Manifest, pack_atoms: WithInputs, numbered: []const Elf.NumberedAtom) ![]const Emit.Alias {
     var slots: std.AutoArrayHashMapUnmanaged(u32, Atom.SymbolKey) = .empty;
     for (0..m.refNameCount()) |i| {
         const name = m.refName(@intCast(i));
@@ -677,16 +736,28 @@ fn linkWithInputs(
         shared: []const ElfShared,
         copies: *std.StringArrayHashMapUnmanaged(u64),
         arena: Allocator,
+        /// With changed objects: the manifest and its linked symbols, and
+        /// whether an object needs a compiler_rt function the last build
+        /// did not generate, which a full build's `sync` would request
+        /// (even for a weak reference, which would link as 0 here).
+        m: *const Manifest,
+        live: ?*const std.DynamicBitSetUnmanaged,
+        missing_rt: *bool,
 
         pub fn zigExport(r: @This(), name: []const u8) !?Atom.SymbolKey {
             return r.exports.get(name);
         }
 
-        pub fn rtExport(_: @This(), name: []const u8) !?Atom.SymbolKey {
+        pub fn rtExport(r: @This(), name: []const u8) !?Atom.SymbolKey {
             if (Emit.arrayBound(name)) |key| return key;
             const e = Zcu.compilerRtExport(name) orelse return null;
             var buf: [128]u8 = undefined;
-            return .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl));
+            const key: Atom.SymbolKey = .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl));
+            if (r.live) |live| {
+                const n = r.m.symbol(@backingInt(key));
+                if (n == null or !live.isSet(n.?)) r.missing_rt.* = true;
+            }
+            return key;
         }
 
         pub fn importSym(r: @This(), name: []const u8, weak: bool) !?Atom.SymbolKey {
@@ -711,7 +782,19 @@ fn linkWithInputs(
     var export_keys: std.StringHashMapUnmanaged(Atom.SymbolKey) = .empty;
     for (exports) |x| _ = try export_keys.getOrPutValue(arena, x.name, x.key);
     var copies: std.StringArrayHashMapUnmanaged(u64) = .empty;
-    const resolver: Resolver = .{ .exports = &export_keys, .glibc = glibc, .shared = shared, .copies = &copies, .arena = arena };
+    var live = try std.DynamicBitSetUnmanaged.initEmpty(arena, m.symbolLen());
+    for (numbered) |na| live.set(na.symbol);
+    var missing_rt = false;
+    const resolver: Resolver = .{
+        .exports = &export_keys,
+        .glibc = glibc,
+        .shared = shared,
+        .copies = &copies,
+        .arena = arena,
+        .m = m,
+        .live = if (inc.objects_changed) &live else null,
+        .missing_rt = &missing_rt,
+    };
     // The archive members the Zig code's externs pull: those of the
     // linked nodes and the link's own atoms.
     var externs: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -723,11 +806,15 @@ fn linkWithInputs(
     _ = try objects.pull(externs.keys(), resolver);
     const converted = try objects.convert(resolver);
     if (objects.errors.items.len != 0) return inc.noLink("{s}", .{objects.errors.items[0]});
+    var overrides: std.AutoHashMapUnmanaged(usize, Atom) = .empty;
+    if (inc.objects_changed) {
+        if (missing_rt) return inc.noLink("a changed object needs a compiler_rt function the last build did not generate", .{});
+        overrides = try reboundSlots(arena, m, pack_atoms, numbered, &live, &objects, &export_keys, imports, glibc, shared) orelse
+            return inc.noLink("a changed object binds an extern to what the last build did not generate", .{});
+    }
 
     // The converted atoms and the glibc data copies, without those whose
     // key an earlier atom has, as `groupByOwner` drops them.
-    var live = try std.DynamicBitSetUnmanaged.initEmpty(arena, m.symbolLen());
-    for (numbered) |na| live.set(na.symbol);
     var extra: std.ArrayList(Atom) = try .initCapacity(arena, converted.atoms.len + copies.count());
     extra.appendSliceAssumeCapacity(converted.atoms);
     for (copies.keys(), copies.values()) |name, size| extra.appendAssumeCapacity(.{
@@ -777,10 +864,10 @@ fn linkWithInputs(
         .stack_size = inc.stack_size,
         .local_symbols = converted.symbols,
         .input_sections = converted.sections,
-        .aliases = try externAliases(arena, m, pack_atoms, numbered),
+        .aliases = try externAliases(arena, m, WithInputs{ .pack = pack_atoms, .extra = &.{}, .overrides = &overrides }, numbered),
         .dynamic = if (glibc != null) &dynamic else null,
     };
-    Elf.linkInput(gpa, io, out_dir, sub_path, WithInputs{ .pack = pack_atoms, .extra = extra.items }, options) catch |err| switch (err) {
+    Elf.linkInput(gpa, io, out_dir, sub_path, WithInputs{ .pack = pack_atoms, .extra = extra.items, .overrides = &overrides }, options) catch |err| switch (err) {
         // A damaged pack or manifest, or objects that no longer fit it:
         // a build reports what is wrong.
         error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo, error.UndefinedSymbol, error.DuplicateSymbol, error.InvalidRelocation, error.RelocationOverflow, error.AlignmentTooLarge => return inc.noLink("{t} (atom '{s}')", .{ err, diag.atom }),
@@ -794,10 +881,86 @@ fn linkWithInputs(
     return .{ .atoms = numbered.len + extra.items.len, .gathered = gathered };
 }
 
+/// The Zig code's extern slots bound again against changed link objects,
+/// as `Emit.lowerExternSlots` binds them in a full build: the
+/// compilation's export, then the objects' definition (at its section
+/// atom's key, which an object's contents name, and offset), then a
+/// section bound, compiler_rt's function, a library's import, or nothing
+/// for a weak extern. Returns the slot atoms whose binding moved, by
+/// index into `numbered`, or null when a full build would bind one to
+/// something the last build did not generate (a compiler_rt function or
+/// import it lacks, or an undefined strong extern). A declaration's data
+/// that names an object's atom without a slot names its old key, which
+/// the link then does not find.
+fn reboundSlots(
+    arena: Allocator,
+    m: *const Manifest,
+    pack_atoms: *const Pack.LinkAtoms,
+    numbered: []const Elf.NumberedAtom,
+    live: *const std.DynamicBitSetUnmanaged,
+    objects: *ElfInput,
+    export_keys: *const std.StringHashMapUnmanaged(Atom.SymbolKey),
+    imports: []const ElfObject.Import,
+    glibc: ?*const Glibc,
+    shared: []const ElfShared,
+) !?std.AutoHashMapUnmanaged(usize, Atom) {
+    var overrides: std.AutoHashMapUnmanaged(usize, Atom) = .empty;
+    // The linked slots, by symbol number: their names (`useExtern`'s,
+    // `name` or `name\x00offset`).
+    var slots: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    for (0..m.refNameCount()) |i| {
+        const slot = m.refName(@intCast(i));
+        const n = m.symbol(@backingInt(Emit.externSlotKey(slot))) orelse continue;
+        try slots.put(arena, n, slot);
+    }
+    if (slots.count() == 0) return overrides;
+    var import_keys: std.AutoHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    for (imports) |imp| try import_keys.put(arena, imp.key, {});
+    for (numbered, 0..) |na, i| {
+        const slot = slots.get(na.symbol) orelse continue;
+        const a = pack_atoms.atom(i);
+        const nul = std.mem.indexOfScalar(u8, slot, 0);
+        const name = slot[0 .. nul orelse slot.len];
+        const off: i64 = if (nul) |z| std.fmt.parseInt(i64, slot[z + 1 ..], 10) catch return null else 0;
+        const target: ?Emit.ExternTarget = if (export_keys.get(name)) |k| .{ .key = k } else if (try objects.lookup(name)) |t|
+            .{ .key = t.key, .addend = @intCast(t.offset) }
+        else if (Emit.sectionBound(name) orelse Emit.arrayBound(name)) |k| .{ .key = k } else t: {
+            if (Zcu.compilerRtExport(name)) |e| {
+                var buf: [128]u8 = undefined;
+                const key: Atom.SymbolKey = .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl));
+                const n = m.symbol(@backingInt(key)) orelse return null;
+                if (!live.isSet(n)) return null;
+                break :t .{ .key = key };
+            }
+            if (glibc) |g| if (Glibc.sharedSymbol(shared, name) != null or g.get(name) != null) {
+                if (!import_keys.contains(Emit.importKey(name))) return null;
+                break :t .{ .key = Emit.importKey(name) };
+            };
+            break :t null;
+        };
+        const recorded: ?Emit.ExternTarget = if (a.relocs.len == 0) null else .{ .key = a.targets[a.relocs[0].info.target], .addend = a.relocs[0].addend };
+        const t = target orelse {
+            // A weak extern that nothing defines keeps its slot of 0; a
+            // strong one is a full build's error.
+            if (recorded != null) return null;
+            continue;
+        };
+        const addend = std.math.cast(i32, t.addend + off) orelse return null;
+        if (recorded) |r| if (r.key == t.key and r.addend == addend) continue;
+        var b = a;
+        b.targets = try arena.dupe(Atom.SymbolKey, &.{t.key});
+        b.relocs = try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, addend)});
+        try overrides.put(arena, i, b);
+    }
+    return overrides;
+}
+
 /// The manifest's atoms, then the link inputs' (`linkWithInputs`).
 const WithInputs = struct {
     pack: *const Pack.LinkAtoms,
     extra: []const Atom,
+    /// The manifest's atoms a relink replaces, by index (`reboundSlots`).
+    overrides: *const std.AutoHashMapUnmanaged(usize, Atom),
 
     pub inline fn len(s: WithInputs) usize {
         return s.pack.len() + s.extra.len;
@@ -808,6 +971,7 @@ const WithInputs = struct {
     }
 
     pub inline fn atom(s: WithInputs, i: usize) Atom {
+        if (s.overrides.count() != 0) if (s.overrides.get(i)) |a| return a;
         return if (i < s.pack.len()) s.pack.atom(i) else s.extra[i - s.pack.len()];
     }
 
