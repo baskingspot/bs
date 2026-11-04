@@ -10309,19 +10309,7 @@ fn foldArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, ty: I
         .sub, .subwrap, .sub_sat => try r.sub(&a, &b),
         .mul, .mulwrap, .mul_sat => try r.mul(&a, &b),
         .bit_and => try r.bitAnd(&a, &b),
-        .bit_or => if (a.isPositive() == b.isPositive()) try r.bitOr(&a, &b) else {
-            // std.math.big's bitOr is wrong when one operand is negative
-            // and the other positive (Zig 0.17.0: `@as(i128, -(1 << 100)) | 3`
-            // has 128 bits of garbage), and so is upstream's comptime `|`.
-            // a | b == ~(~a & ~b), where ~x == -(x + 1).
-            try a.addScalar(&a, 1);
-            a.negate();
-            try b.addScalar(&b, 1);
-            b.negate();
-            try r.bitAnd(&a, &b);
-            try r.addScalar(&r, 1);
-            r.negate();
-        },
+        .bit_or => try r.bitOr(&a, &b),
         .xor => try r.bitXor(&a, &b),
         .min => return if (a.order(b) == .gt) rv else lv,
         .max => return if (a.order(b) == .lt) rv else lv,
@@ -21526,8 +21514,8 @@ test "dump: runtime add gets an overflow check, comptime operands fold" {
 }
 
 test "dump: comptime | of a negative wide integer and a positive one" {
-    // std.math.big's bitOr gets this wrong in Zig 0.17.0, and so does
-    // upstream; the value is the two's complement result.
+    // Zig 0.17.0's std.math.big bitOr got this wrong, and so did upstream;
+    // 0.17.1 gives the two's complement result.
     try expectAnalysis(
         \\export fn f() i128 {
         \\    return @as(i128, -0x79e940e2f8cf7e4c913e2996) | 3;

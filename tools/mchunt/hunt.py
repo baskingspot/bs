@@ -2,7 +2,7 @@
 """Differential miscompile hunter for zap (see tools/mchunt/README.md).
 
 Generates random well-defined Zig programs (gen.py), compiles each with
-upstream zig 0.17.0 (Debug, the oracle) and with zap in several
+upstream zig 0.17.1 (Debug, the oracle) and with zap in several
 configurations, runs them, and compares what they print and how they
 exit. A mismatch is triaged (upstream ReleaseSafe as a second oracle,
 pass toggles), saved under .work/found/, and minimized (reduce.py).
@@ -220,7 +220,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1), help="hunting workers")
     ap.add_argument("--reducers", type=int, default=1, help="concurrent reductions")
     ap.add_argument("--zap", help="zap binary (default zig-out/bin/zap; with --follow, built from origin/main)")
-    ap.add_argument("--zig", help="upstream zig 0.17.0 (default: zig on PATH)")
+    ap.add_argument("--zig", help="upstream zig 0.17.1 (default: zig on PATH)")
     ap.add_argument("--seed", type=int, help="first seed (default: random)")
     ap.add_argument("--count", type=int, help="stop after this many programs")
     ap.add_argument("--hours", type=float, help="stop after this long")

@@ -487,11 +487,6 @@ class Gen:
         if op == "bit":
             o = self.pick(["&", "|", "^"])
             x, y = a(), self.rhs(ctx, t, d)
-            if o == "|" and t.bits > 64 and not (self.is_rt(x) or self.is_rt(y)):
-                # Zig 0.17's std.math.big `bitOr` is wrong for a negative
-                # multi-limb operand and a positive one, so upstream's
-                # comptime `|` is too: keep wide `|` at run time.
-                o = "^"
             return f"({x} {o} {y})"
         if op == "shift" and t.bits > 1:
             return self.shift(ctx, t, d)

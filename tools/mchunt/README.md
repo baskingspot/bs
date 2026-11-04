@@ -1,7 +1,7 @@
 # mchunt: differential miscompile hunter
 
 `tools/mchunt` generates random, well-defined Zig programs, compiles each
-with upstream zig 0.17.0 (Debug, the oracle) and with zap, runs both, and
+with upstream zig 0.17.1 (Debug, the oracle) and with zap, runs both, and
 compares what they print and how they exit. It looks for the miscompiles
 `test/behavior`, std's tests and `test/c_abi` miss: odd integer widths,
 wrapping, saturating and checked arithmetic, shifts, packed and extern
