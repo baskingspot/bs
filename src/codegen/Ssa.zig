@@ -100,6 +100,9 @@ pub const Live = struct {
     /// A clobber point (`liveness`) lies inside the interval, where the
     /// value is still needed afterwards.
     crosses: bool,
+    /// From `liveness`: its uses weighted by loop depth, 8 per level (up
+    /// to 6), which `allocate` keeps in registers first.
+    weight: u32,
     /// After `allocate`, for a value marked `want_pair` that got registers:
     /// the register of its high eightbyte (`reg` holds the low one); else
     /// `no_reg`.
@@ -373,6 +376,7 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
     const s = f.live.slice();
     @memset(s.items(.uses), 0);
     @memset(s.items(.crosses), false);
+    @memset(s.items(.weight), 0);
     // Prefix counts of the clobber points by position.
     try f.clobbers.resize(gpa, 2 * f.values.len + 3);
     const cl = f.clobbers.items;
@@ -395,7 +399,7 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
     }
     for (&f.slots.free) |*l| l.clearRetainingCapacity();
     f.slots.active.clearRetainingCapacity();
-    var w: LiveWalk = .{ .uses = s.items(.uses), .def = s.items(.def), .end = s.items(.end), .crosses = s.items(.crosses), .clobbers = cl, .loops = f.loops.items, .loop = no_loop, .pos = 0, .dead_start = null };
+    var w: LiveWalk = .{ .uses = s.items(.uses), .weight = s.items(.weight), .def = s.items(.def), .end = s.items(.end), .crosses = s.items(.crosses), .clobbers = cl, .loops = f.loops.items, .loop = no_loop, .pos = 0, .dead_start = null };
     const insts = f.values.items(.inst);
     const datas = ir.instructions.items(.data);
     const tags = ir.instructions.items(.tag);
@@ -886,6 +890,7 @@ pub fn valuePos(i: usize) u32 {
 
 const LiveWalk = struct {
     uses: []u32,
+    weight: []u32,
     def: []u32,
     end: []u32,
     crosses: []bool,
@@ -902,6 +907,10 @@ const LiveWalk = struct {
     fn use(w: *LiveWalk, ref: Inst.Ref) void {
         const inst = @backingInt(ref.toIndex() orelse return);
         w.uses[inst] += 1;
+        var depth: u32 = 0;
+        var q = w.loop;
+        while (q != no_loop and depth < 6) : (q = w.loops[q].parent) depth += 1;
+        w.weight[inst] +|= @as(u32, 1) << @intCast(3 * depth);
         if (w.dead_start) |start| {
             if (w.clobbers[w.pos][1] != w.clobbers[@max(start, w.def[inst])][1]) w.crosses[inst] = true;
         }
@@ -1035,6 +1044,7 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, 
     const crosses = s.items(.crosses);
     const share = s.items(.share);
     const hint = s.items(.hint);
+    const weight = s.items(.weight);
     var active: [max_regs]u32 = undefined;
     // Per register: the last end of the loads sharing it with its current
     // holder (`Live.share`), which may not be evicted before then. Loads
@@ -1143,22 +1153,35 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, 
             active_len += 1;
             continue;
         }
+        // Out of registers: a value used a loop level less often than the
+        // others goes to memory, else the one that ends last.
         var last: ?u8 = null;
         for (active[0..active_len], 0..) |a, k| {
             if (usable >> @intCast(reg[a]) & 1 == 0 or held[reg[a]] >= def[inst] or reg2[a] != no_reg or hint[a][1] == hint_pinned) continue;
-            if (last == null or end[a] > end[active[last.?]]) last = @intCast(k);
+            if (last == null or spillsBefore(weight, end, a, active[last.?])) last = @intCast(k);
         }
         const victim = if (last) |l| active[l] else {
             reg[inst] = no_reg;
             continue;
         };
-        if (end[victim] > end[inst]) {
+        if (spillsBefore(weight, end, victim, inst)) {
             reg[inst] = reg[victim];
             reg[victim] = no_reg;
             active[last.?] = inst;
         } else reg[inst] = no_reg;
     }
     return used;
+}
+
+/// Whether value `a` goes to memory before value `b` when registers run
+/// out: its uses weigh at most an eighth of `b`'s (a loop level less),
+/// or, unless `b`'s weigh that little against `a`'s, it ends later.
+fn spillsBefore(weight: []const u32, end: []const u32, a: u32, b: u32) bool {
+    const wa: u64 = weight[a];
+    const wb: u64 = weight[b];
+    if (8 * wa <= wb) return true;
+    if (8 * wb <= wa) return false;
+    return end[a] > end[b];
 }
 
 pub const max_regs = 32;
