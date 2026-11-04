@@ -10,9 +10,9 @@ set -eu
 unset ZIG_LOCAL_CACHE_DIR ZIG_GLOBAL_CACHE_DIR ZAP_CACHE ZAP_CACHE_VERIFY ZAP_CACHE_CHECK
 rm -rf "$3"
 mkdir -p "$3"
-zap=$(realpath "$1") src=$(realpath "$2") work=$(realpath "$3") cmd=$4
+zap=$(realpath "$1") src=$(realpath "$2") work=$(realpath "$3") cmd=$4 seed=$(realpath "$5")
 mkdir -p "$work/global/zap"
-cp -r "$5/zap/zir" "$work/global/zap"
+cp -r "$seed/zap/zir" "$work/global/zap"
 cd "$work"
 
 fail() {
@@ -21,13 +21,15 @@ fail() {
     exit 1
 }
 
-# $1 command, $2 output, $3 what the build must say (ZAP_CACHE_TIMING).
-# The build without the cache runs once per version of lib.zig.
+# $1 command, $2 output, $3 what the build must say (ZAP_CACHE_TIMING);
+# $inputs, more files to build with. The build without the cache runs once
+# per version of lib.zig and the inputs.
+inputs=
 build() {
-    ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 ZAP_CACHE_VERIFY=1 "$zap" "$1" lib.zig --cache-dir local --global-cache-dir global "-femit-bin=$2" >log 2>&1 || fail "$1 ($3)"
+    ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 ZAP_CACHE_VERIFY=1 "$zap" "$1" lib.zig $inputs --cache-dir local --global-cache-dir global "-femit-bin=$2" >log 2>&1 || fail "$1 ($3)"
     grep -qF -- "$3" log || fail "$1: expected '$3'"
-    full=full-$(sha256sum <lib.zig | cut -c1-16)-$2
-    [ -f "$full" ] || ZAP_CACHE=off "$zap" "$1" lib.zig "-femit-bin=$full" >log 2>&1 || fail "$1 without the cache"
+    full=full-$( (echo "$inputs"; cat lib.zig $inputs) | sha256sum | cut -c1-16)-$2
+    [ -f "$full" ] || ZAP_CACHE=off "$zap" "$1" lib.zig $inputs "-femit-bin=$full" >log 2>&1 || fail "$1 without the cache"
     cmp -s "$2" "$full" || fail "$1 ($3): the output differs from a build without the cache"
 }
 
@@ -52,3 +54,28 @@ build $cmd $out "external symbols changed"
 rm $out
 build $cmd $out "relinked"
 [ $cmd = build-obj ] || [ "$(ar t libx.a)" = "lib.o" ] || fail "libx.a holds lib.o"
+
+# As upstream's: a static library holds its object inputs as members after
+# the Zig object, then the C objects, and leaves archive inputs out, also
+# when it relinks or edits through the cache; an object leaves them out too.
+if [ $cmd = build-lib ]; then
+    printf 'export fn d_one() u32 { return 1; }\n' >d.zig
+    printf 'int c_two(void) { return 2; }\n' >c.c
+    ZAP_CACHE=off "$zap" build-obj d.zig --global-cache-dir global -femit-bin=d.o >log 2>&1 || fail "build-obj d.zig"
+    ZAP_CACHE=off "$zap" build-lib d.zig --global-cache-dir global -femit-bin=libd.a >log 2>&1 || fail "build-lib d.zig"
+    inputs="d.o libd.a c.c"
+    rm -rf local global
+    mkdir -p global/zap
+    cp -r "$seed/zap/zir" global/zap
+    cp "$src" lib.zig
+    build build-lib libx.a "recorded"
+    [ "$(ar t libx.a | tr '\n' ' ')" = "lib.o d.o c.o " ] || fail "libx.a holds lib.o, d.o and c.o"
+    rm libx.a
+    build build-lib libx.a "relinked"
+    sed 's/return counter + calls;/return counter + calls + 1;/' "$src" >lib.zig
+    build build-lib libx.a "linked 2"
+    [ "$(ar t libx.a | tr '\n' ' ')" = "lib.o d.o c.o " ] || fail "the edited libx.a holds lib.o, d.o and c.o"
+    ZAP_CACHE=off "$zap" build-obj lib.zig libd.a --global-cache-dir global -femit-bin=with-archive.o >log 2>&1 || fail "build-obj with an archive"
+    ZAP_CACHE=off "$zap" build-obj lib.zig --global-cache-dir global -femit-bin=without-archive.o >log 2>&1 || fail "build-obj"
+    cmp -s with-archive.o without-archive.o || fail "build-obj leaves archive inputs out"
+fi

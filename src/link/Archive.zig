@@ -3,7 +3,8 @@
 //! `/SYM64/` symbol index of the objects' defined global and weak symbols
 //! (empty when they have none), then the members: the Zig object, named
 //! after the root source file (`protobuf.o` for
-//! `-Mroot=src/protobuf.zig`), then one per C source (`add.o`), with a
+//! `-Mroot=src/protobuf.zig`), then the object inputs, named after their
+//! files, then one per C source (`add.o`), with a
 //! `//` name table for the names that do not fit the header; odd sizes
 //! are padded with a zero byte, as upstream pads them.
 //!

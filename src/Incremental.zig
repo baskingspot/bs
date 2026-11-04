@@ -436,7 +436,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     var maps: std.ArrayList(Io.File.MemoryMap) = .empty;
     defer for (maps.items) |*mm| mm.destroy(io);
     const shared: []const ElfShared = if (!exe_dyn) &.{} else inc.shared orelse (try inc.loadShared(arena, &maps)) orelse return null;
-    if (inc.link_objects.len != 0) return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, imports.items, glibc, shared, out_dir, sub_path, cwd, gathered);
+    if (inc.link_objects.len != 0 and inc.output == .exe) return inc.linkWithInputs(arena, &maps, m, &input, in.numbered, exports.items, imports.items, glibc, shared, out_dir, sub_path, cwd, gathered);
     if (glibc) |g| {
         dynamic = g.dynamicOptions(arena, imports.items, &.{}, shared) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
@@ -481,9 +481,15 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
         .lib => lib: {
             const obj = ElfObject.emitInput(gpa, io, input, options, symbols) catch |err| break :lib err;
             defer gpa.free(obj);
-            const member = try std.fmt.allocPrint(gpa, "{s}.o", .{inc.archive_stem});
-            defer gpa.free(member);
-            break :lib Archive.write(gpa, io, out_dir, sub_path, &.{.{ .name = member, .bytes = obj }});
+            // The Zig object, then the object inputs and the C objects
+            // as they are, as `compileReplaying` writes them.
+            const members = try arena.alloc(Archive.Input, 1 + inc.link_objects.len);
+            members[0] = .{ .name = try std.fmt.allocPrint(arena, "{s}.o", .{inc.archive_stem}), .bytes = obj };
+            for (members[1..], inc.link_objects) |*member, path| member.* = .{
+                .name = std.fs.path.basename(path),
+                .bytes = try inc.mapInput(arena, &maps, path) orelse return null,
+            };
+            break :lib Archive.write(gpa, io, out_dir, sub_path, members);
         },
         _ => unreachable,
     };
@@ -797,7 +803,7 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     inc.replay = r;
     zcu.replay = r;
     emit.lazy = r.lazy;
-    emit.inputs_deferred = r.lazy and inc.link_objects.len != 0;
+    emit.inputs_deferred = r.lazy and inc.link_objects.len != 0 and inc.output == .exe;
 }
 
 // ---------------------------------------------------------------------------

@@ -817,7 +817,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     if (inc_opt) |i| try i.beginReplay(&fe, &zcu, &emit, replay_mode);
     // A lazy edit build relinks from the manifest, which reads the
     // objects itself (`Incremental.linkFrom`).
-    if (opts.link_inputs.len != 0 and !(if (zcu.replay) |r| r.lazy else false)) {
+    if (opts.link_inputs.len != 0 and !emit.obj and !(if (zcu.replay) |r| r.lazy else false)) {
         for (opts.link_inputs) |path| {
             const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
                 fatal("unable to read '{s}': {t}", .{ path, err });
@@ -881,6 +881,10 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         const obj = try Io.Dir.cwd().readFileAlloc(init.io, link_path, arena, .unlimited);
         var members: std.ArrayList(Archive.Input) = .empty;
         try members.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(opts.root_src_path)}), .bytes = obj });
+        for (opts.link_inputs) |path| try members.append(arena, .{
+            .name = std.fs.path.basename(path),
+            .bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err| fatal("unable to read '{s}': {t}", .{ path, err }),
+        });
         if (c_batch) |b| for ((try b.wait()).objects) |o| try members.append(arena, .{ .name = o.member, .bytes = o.bytes });
         Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items) catch |err| {
             std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
@@ -1695,11 +1699,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             const ext = std.fs.path.extension(arg);
             if (CSource.Lang.ofPath(arg)) |lang| {
                 try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{}, .lang = lang });
-            } else if ((std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or isSharedLib(arg)) and command != .build_obj and command != .build_lib) {
+            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or (isSharedLib(arg) and command != .build_obj and command != .build_lib)) {
                 try link_inputs.append(arena, arg);
-            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a"))
-                setUnsupported(&opts, arena, "zap does not link object files into objects or libraries yet ('{s}'); build this step with upstream zig", .{arg})
-            else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib"))
+            } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or std.mem.eql(u8, ext, ".so") or std.mem.indexOf(u8, arg, ".so.") != null or std.mem.eql(u8, ext, ".obj") or std.mem.eql(u8, ext, ".lib"))
                 setUnsupported(&opts, arena, "zap does not link object files or libraries ('{s}'); build this step with upstream zig", .{arg})
             else
                 setUnsupported(&opts, arena, "zap does not compile C, C++, or assembly sources ('{s}'); build this step with upstream zig", .{arg});
@@ -1760,6 +1762,24 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     for (libs.items) |q| {
         link_inputs.items[q.at] = try q.find(arena, io, search_dirs.items) orelse
             fatal("unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
+    }
+    // As upstream, an object or a static library links nothing: it leaves
+    // archive inputs out, and a static library holds object inputs as
+    // members after its own object. Merging objects into an object (or a
+    // shared library) is a relocatable link zap does not do yet.
+    if (command == .build_obj or command == .build_lib) {
+        var kept: usize = 0;
+        for (link_inputs.items) |path| {
+            if (std.mem.eql(u8, std.fs.path.extension(path), ".a")) {
+                Io.Dir.cwd().access(io, path, .{}) catch fatal("{s}: file not found", .{path});
+                continue;
+            }
+            if (command == .build_obj or opts.dynamic)
+                setUnsupported(&opts, arena, "zap does not link object files into objects or shared libraries yet ('{s}'); build this step with upstream zig", .{path});
+            link_inputs.items[kept] = path;
+            kept += 1;
+        }
+        link_inputs.shrinkRetainingCapacity(kept);
     }
     // Shared libraries are imported from, not linked in.
     var objects: std.ArrayList([]const u8) = .empty;

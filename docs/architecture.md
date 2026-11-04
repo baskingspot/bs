@@ -6123,9 +6123,15 @@ libraries as inputs. To be agreed with that thread.
   sources in `build-obj` and `build-lib -dynamic` (which would need the
   objects linked into the output) stay `[unsupported]`.
 - **Static libraries** (2026-11-04), as upstream's: the archive holds
-  the Zig object (`<root stem>.o`), then one member per C source
-  (`<stem>.o`), with one symbol index over all of them
-  (`Archive.write` takes the members). A module without a root source
+  the Zig object (`<root stem>.o`), then the object inputs (named after
+  their files, as given), then one member per C source (`<stem>.o`),
+  with one symbol index over all of them (`Archive.write` takes the
+  members). Archive inputs of `build-lib` and `build-obj` are left out,
+  as upstream leaves them (a missing one is an error); object inputs of
+  `build-obj` and `build-lib -dynamic` need a relocatable link and stay
+  `[unsupported]`. A cached library relinks as its Zig object plus the
+  other members read again (`Incremental.linkFrom`); it does not link
+  them as an executable's inputs (built 2026-11-04). A module without a root source
   file (`-M<name>`, which `zig build` passes for a library of C only)
   holds C sources and no Zig module, and `--dep`s on it are dropped; as
   the root module, or with C files and no module at all, it makes a
