@@ -1306,6 +1306,8 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "calling convention '{s}' only available on architectures {s}", .@"bad-fn-type" },
     .{ "@bitCast size mismatch: destination type '{f}' has {d} bits but source type '{f}' has {d} bits", .@"bad-cast" },
     .{ "@ptrCast discards const qualifier", .@"bad-cast" },
+    .{ "cannot @bitCast to '{f}'", .@"bad-cast" },
+    .{ "cannot @bitCast from '{f}'", .@"bad-cast" },
     .{ "bit-pointer cannot refer to value of type '{f}'", .@"bad-cast" },
     .{ "cannot cast an error union type to error set", .@"bad-cast" },
     .{ "expected backing integer type, found '{f}'", .@"bad-cast" },

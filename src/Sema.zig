@@ -16495,6 +16495,7 @@ fn zirBitCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     const src = block.nodeSrc(data.src_node);
     const dest_ty = try sema.castDestType(block, src, extra.lhs, true);
     var operand = sema.resolveInst(extra.rhs);
+    try sema.checkBitCastTypes(block, src, dest_ty, sema.typeOf(operand));
     if (ip.keyTag(sema.typeOf(operand)) == .array_type and ip.keyPayload(.array_type, sema.typeOf(operand)).sentinel != .none) {
         // A source array's sentinel is part of its bits, as upstream:
         // cast the `[N:s]T` as the `[N+1]T` ending in `s`.
@@ -16519,6 +16520,56 @@ fn zirBitCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         if (sema.enumTagIndex(v) == null) return sema.fail(block, src, "enum '{f}' has no tag with value '{f}'", .{ sema.fmtType(dest_ty), sema.fmtValue(ip.keyPayload(.enum_tag, v).int) });
     };
     return result;
+}
+
+/// Upstream's checks that `@bitCast` at `src` accepts its destination and
+/// operand types: both need a bit representation, and pointers get the
+/// cast that converts them in a note.
+fn checkBitCastTypes(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand_ty: Index) CompileError!void {
+    const ip = sema.ip;
+    const operand_src = sema.callArgSrc(src, false, 0);
+    switch (Type.class(ip, Type.scalarType(ip, dest_ty))) {
+        .pointer, .optional => {
+            const err = sema.fail(block, src, "cannot @bitCast to '{f}'", .{sema.fmtType(dest_ty)});
+            const span = src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+            switch (Type.class(ip, operand_ty)) {
+                .int, .comptime_int => try sema.zcu.addNote(sema.file, span, "use @ptrFromInt to cast from '{f}'", .{sema.fmtType(operand_ty)}),
+                .pointer => try sema.zcu.addNote(sema.file, span, "use @ptrCast to cast from '{f}'", .{sema.fmtType(operand_ty)}),
+                else => {},
+            }
+            return err;
+        },
+        else => {},
+    }
+    if (!sema.hasBitRepresentation(dest_ty)) return sema.fail(block, src, "cannot @bitCast to '{f}'", .{sema.fmtType(dest_ty)});
+    switch (Type.class(ip, Type.scalarType(ip, operand_ty))) {
+        .pointer, .optional => {
+            const err = sema.fail(block, operand_src, "cannot @bitCast from '{f}'", .{sema.fmtType(operand_ty)});
+            const span = operand_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+            switch (Type.class(ip, dest_ty)) {
+                .int, .comptime_int => try sema.zcu.addNote(sema.file, span, "use @intFromPtr to cast to '{f}'", .{sema.fmtType(dest_ty)}),
+                .pointer => try sema.zcu.addNote(sema.file, span, "use @ptrCast to cast to '{f}'", .{sema.fmtType(dest_ty)}),
+                else => {},
+            }
+            return err;
+        },
+        else => {},
+    }
+    if (!sema.hasBitRepresentation(operand_ty)) return sema.fail(block, operand_src, "cannot @bitCast from '{f}'", .{sema.fmtType(operand_ty)});
+}
+
+/// Upstream's `Type.hasBitRepresentation`.
+fn hasBitRepresentation(sema: *Sema, ty: Index) bool {
+    const ip = sema.ip;
+    return switch (Type.class(ip, ty)) {
+        .void, .bool, .int, .float => true,
+        .@"enum" => sema.explicitIntTag(ty) and ip.structInfo(ty).tag_type != .noreturn_type,
+        .@"struct", .@"union" => Type.isPacked(ip, ty),
+        .pointer => Type.ptrInfo(ip, ty).flags.size != .slice,
+        .optional => Type.optionalReprIsPtr(ip, Type.childType(ip, ty)),
+        .array, .vector => sema.hasBitRepresentation(Type.childType(ip, ty)),
+        else => false,
+    };
 }
 
 fn bitCast(sema: *Sema, block: *Block, src: Src, dest_ty: Index, operand: Ref) CompileError!Ref {
