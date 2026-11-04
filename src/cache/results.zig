@@ -209,7 +209,7 @@ pub const Encoder = struct {
             },
             .func_type => |t| blk: {
                 if (!try e.pushRefs(t.param_types) or !try e.pushRef(t.return_type)) break :blk false;
-                try e.push(@as(u32, @backingInt(t.cc)) | @as(u32, @intFromBool(t.is_var_args)) << 8);
+                try e.push(@as(u32, @backingInt(t.cc)) | @as(u32, @intFromBool(t.is_var_args)) << 8 | @as(u32, t.stack_align) << 9);
                 try e.push(t.comptime_bits);
                 try e.push(t.noalias_bits);
                 break :blk true;
@@ -677,6 +677,7 @@ pub fn Decoder(comptime Resolver: type) type {
                         .return_type = ret,
                         .cc = @fromBackingInt(@intCast(@as(u8, @truncate(flags)))),
                         .is_var_args = flags & 1 << 8 != 0,
+                        .stack_align = @truncate(flags >> 9),
                         .comptime_bits = c.next(),
                         .noalias_bits = c.next(),
                     } };

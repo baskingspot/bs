@@ -26,7 +26,10 @@ pub fn dump(ir: *const Ir, ip: *const InternPool, w: *Writer) Writer.Error!void 
     }
     try w.writeAll(") ");
     try printType(ip, fn_ty.return_type, w);
-    if (fn_ty.cc != .auto) try w.print(" callconv(.{s})", .{@tagName(fn_ty.cc)});
+    if (fn_ty.cc != .auto) {
+        try w.writeAll(" ");
+        try printCallconv(fn_ty, w);
+    }
     try w.writeAll(" {\n");
     const p: Printer = .{ .ir = ir, .ip = ip, .w = w };
     try p.body(ir.mainBody(), 1);
@@ -505,11 +508,28 @@ fn typeIn(cx: Ctx, ty: InternPool.Index, w: *Writer) Writer.Error!void {
             }
             if (f.is_var_args) try w.writeAll(if (f.param_types.len == 0) "..." else ", ...");
             try w.writeAll(") ");
-            if (f.cc != .auto) try w.print("callconv(.{s}) ", .{@tagName(f.cc)});
+            if (f.cc != .auto) {
+                try printCallconv(f, w);
+                try w.writeAll(" ");
+            }
             try typeIn(cx, f.return_type, w);
         },
         else => try w.writeAll("<not a type>"),
     }
+}
+
+/// A function type's `callconv(...)`, as upstream prints it: the target's
+/// C convention with default options as `.c`, a convention without
+/// options by its tag, and one with options in full.
+fn printCallconv(f: InternPool.FuncType, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (f.cc) {
+        .auto, .naked, .@"inline" => return w.print("callconv(.{s})", .{@tagName(f.cc)}),
+        .c => if (f.stack_align == 0) return w.writeAll("callconv(.c)"),
+        .x86_64_win => {},
+    }
+    try w.print("callconv(.{{ .{s} = .{{ .incoming_stack_alignment = ", .{if (f.cc == .c) "x86_64_sysv" else @tagName(f.cc)});
+    if (f.stack_align == 0) try w.writeAll("null") else try w.print("{d}", .{@as(u64, 1) << @intCast(f.stack_align - 1)});
+    try w.writeAll(" } })");
 }
 
 /// Prints `val` as upstream's `Value.fmtValue` does (print_value.zig),

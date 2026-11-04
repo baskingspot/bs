@@ -501,6 +501,11 @@ pub const FuncType = struct {
     param_types: []const Index,
     return_type: Index,
     cc: CallingConvention = .auto,
+    /// The convention's `incoming_stack_alignment` option, as log2 + 1;
+    /// 0 when it is null. Only `.c` (`.x86_64_sysv`) and `.x86_64_win`
+    /// have it, and code generation ignores it, as upstream's own x86_64
+    /// backend does.
+    stack_align: u7 = 0,
     is_var_args: bool = false,
     /// Bit i set if parameter i is declared `comptime`, as upstream's key:
     /// a parameter of a comptime-only type is not, and whether calls
@@ -1304,7 +1309,7 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
             return .{ .tag = .type_tuple, .data = start };
         },
         .func_type => |t| {
-            const flags: u32 = @as(u32, @backingInt(t.cc)) | (@as(u32, @intFromBool(t.is_var_args)) << 8);
+            const flags: u32 = @as(u32, @backingInt(t.cc)) | (@as(u32, @intFromBool(t.is_var_args)) << 8) | (@as(u32, t.stack_align) << 9);
             const start = try ip.addExtra(local, &.{ @intCast(t.param_types.len), idx(t.return_type), flags, t.comptime_bits, t.noalias_bits });
             _ = try ip.addExtra(local, @ptrCast(t.param_types));
             return .{ .tag = .type_func, .data = start };
@@ -1477,6 +1482,7 @@ inline fn decodeItem(ip: *const InternPool, comptime tag: Tag, index: Index, ite
                 .return_type = I.i(extra[d + 1]),
                 .cc = @fromBackingInt(@as(u8, @truncate(flags))),
                 .is_var_args = (flags >> 8) & 1 != 0,
+                .stack_align = @truncate(flags >> 9),
                 .comptime_bits = extra[d + 3],
                 .noalias_bits = extra[d + 4],
             } };
@@ -1760,6 +1766,7 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
             ip.hashIndex(&h, t.return_type);
             h.int(u8, @backingInt(t.cc));
             h.int(u8, @intFromBool(t.is_var_args));
+            h.int(u8, t.stack_align);
             h.int(u32, t.comptime_bits);
             h.int(u32, t.noalias_bits);
         },
@@ -1973,6 +1980,7 @@ fn lookupHash(ip: *const InternPool, key: Key) u64 {
             h.int(u32, u.i(t.return_type));
             h.int(u8, @backingInt(t.cc));
             h.int(u8, @intFromBool(t.is_var_args));
+            h.int(u8, t.stack_align);
             h.int(u32, t.comptime_bits);
             h.int(u32, t.noalias_bits);
         },
@@ -2117,7 +2125,7 @@ inline fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
         .func_type => |x| {
             const y = b.func_type;
             return eqlIdx(Index, x.param_types, y.param_types) and x.return_type == y.return_type and
-                x.cc == y.cc and x.is_var_args == y.is_var_args and
+                x.cc == y.cc and x.stack_align == y.stack_align and x.is_var_args == y.is_var_args and
                 x.comptime_bits == y.comptime_bits and x.noalias_bits == y.noalias_bits;
         },
         .simple_value => |x| x == b.simple_value,
