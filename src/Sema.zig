@@ -325,6 +325,10 @@ pub const Block = struct {
     branch_src: ?Src = null,
     /// Inside `@TypeOf`'s operand: only the type of values matters.
     is_typeof: bool = false,
+    /// `@setFloatMode(.optimized)` is in effect. Float operations are the
+    /// same either way here; only `undefined` operands are treated
+    /// differently, as upstream.
+    float_optimized: bool = false,
     /// A `comptime` block in a runtime function body: as upstream, it may
     /// compute runtime-known values, whose instructions are dropped, as
     /// long as nothing comptime (a branch, a constant, its result) needs
@@ -408,6 +412,7 @@ pub const Block = struct {
             .want_safety = b.want_safety,
             .loop = b.loop,
             .is_typeof = b.is_typeof,
+            .float_optimized = b.float_optimized,
             .discards_runtime = b.discards_runtime,
             .error_return_trace_index = b.error_return_trace_index,
             .comptime_reason = b.comptime_reason,
@@ -4859,7 +4864,8 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         // in upstream's Debug backends, float operations are the same.
         .set_float_mode => blk: {
             const extra = sema.code.extraData(Zir.Inst.UnNode, ext.operand).data;
-            _ = try sema.resolveConstValue(block, block.nodeSrc(extra.node), sema.resolveInst(extra.operand), "operand to '@setFloatMode' must be comptime-known");
+            const mode = try sema.resolveConstValue(block, block.nodeSrc(extra.node), sema.resolveInst(extra.operand), "operand to '@setFloatMode' must be comptime-known");
+            if (sema.ip.keyTag(mode) == .enum_tag) block.float_optimized = std.mem.eql(u8, sema.enumTagName(mode) orelse "", "optimized");
             break :blk .void_value;
         },
         .reify_pointer_sentinel_ty => blk: {
@@ -8986,6 +8992,13 @@ fn analyzeArithmetic(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, un
     switch (tag) {
         .addwrap, .subwrap, .mulwrap, .add_sat, .sub_sat, .mul_sat => if (lhs_undef or rhs_undef) return .fromInterned(try sema.undefValue(ty)),
         .add, .sub, .mul => try sema.failUndefOperand(block, src, maybe_lv, maybe_rv),
+        // Division is illegal behavior on `undefined` unless a strict
+        // float division can yield NaN instead.
+        .div, .div_trunc, .div_floor, .div_ceil, .div_exact, .rem, .mod, .mod_rem => if ((lhs_undef or rhs_undef) and (maybe_lv == null or maybe_rv == null)) {
+            const scalar = if (sema.vectorLen(ty) != null) Type.childType(sema.ip, ty) else ty;
+            if (Type.class(sema.ip, scalar) == .float and !block.float_optimized) return .fromInterned(try sema.undefValue(ty));
+            try sema.failUndefOperand(block, src, maybe_lv, maybe_rv);
+        },
         else => {},
     }
     if (maybe_lv) |lv_raw| if (maybe_rv) |rv_raw| {
