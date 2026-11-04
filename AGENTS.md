@@ -7,25 +7,38 @@ not track upstream: it compiles exactly one pinned Zig release (currently
 ## Scope
 
 - Targets: `x86_64-linux` (static ELF first) and `aarch64-macos` (Mach-O,
-  dynamically linked against libSystem, ad-hoc code signed).
+  dynamically linked against libSystem, ad-hoc code signed). `aarch64-linux`
+  is queued as the third target once the aarch64 backend lands: it reuses
+  that backend and the ELF linker.
 - One optimization level, as in Go: no `-O` modes. Every build has Debug
   semantics (safety checks on, `builtin.mode == .debug`) and always-on
   optimization sized to compile fast (SSA, register allocation, inlining
   within a budget). Output stays debuggable: line tables, frame pointers,
-  inlined frames. LLVM-class optimization (vectorization, heavy loop work)
-  stays upstream's job; users run upstream `zig` for ReleaseFast and friends.
+  inlined frames. LLVM-class optimization (auto-vectorization, unrolling,
+  scheduling, heavy loop work) stays upstream's job; users run upstream
+  `zig` for ReleaseFast and friends. Explicit `@Vector` code is lowered to
+  SIMD registers (SSE/NEON), as upstream's Debug backend does, not
+  scalarized. Cheap analyses that remove provably redundant work (bounds
+  checks proven true, common subexpressions, invariant loads) are allowed
+  within the compile-time budget; safety checks are never removed unless
+  proven, and never move across source lines.
 - One exception: `-OReleaseSafe` (which `zig build` steps such as Ghostty's
   tool executables pass) is accepted and compiled with the same code
   generation, with `builtin.mode == .safe` and upstream's
   ReleaseSafe defaults (safety on, no error return traces), so std and the
   program take the same paths as upstream's ReleaseSafe build. ReleaseFast
-  and ReleaseSmall stay refused.
+  and ReleaseSmall stay refused on the command line; in `zap build` steps
+  they get the same treatment (their `builtin.mode`, safety off, same code
+  generation) once a real project's build needs it.
 - C interop is in scope: `-lc`, `@cImport`, and C and C++ source files.
   translate-c (upstream's Aro-based Zig program in `lib/compiler/translate-c`)
   is built by zap itself, so `@cImport` needs no LLVM. C and C++ source files
   are compiled by the user's upstream `zig cc`/`zig c++` (Clang), and C++
   links against libc++ and libc++abi built from the zig lib directory's
   sources as upstream builds them; zap never compiles C or C++ itself.
+  musl (`-target x86_64-linux-musl -lc`, libc built from the zig lib
+  directory's sources through upstream Clang) follows when a target needs
+  it.
 - Out of scope unless the user asks: other targets, ReleaseFast and
   ReleaseSmall, LLVM, the C backend, a C or C++ compiler inside zap.
 - CLI: drop-in for `zig build-exe`, `zig build-obj`, `zig run`, `zig test`, and `zig build`
