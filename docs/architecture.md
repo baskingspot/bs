@@ -2120,7 +2120,27 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
      can; a value whose tied user crosses a clobber point prefers a
      callee-saved register, which the user then takes over. On x86_64
      the value a `ret` returns in one register, when it is the block's
-     last value, is computed in rax.
+     last value, is computed in rax; so is a block result that the `ret`
+     of an otherwise empty block returns, and a value only a `br` to such
+     a block reads, computed last.
+   - Call arguments (`exemptArgs`): a value whose interval ends at an
+     `.auto` call that passes it in a register, with no stack arguments,
+     does not cross that call, and prefers the register that passes it;
+     the call orders the argument moves so that no register is written
+     before every argument left to load has read it, breaking cycles
+     with `xchg` (`loadArgRegs`).
+   - Splitting at clobber points (`planSplits`, `genSplit`): when more
+     values cross clobber points than callee-saved registers hold them,
+     a value may take a caller-saved register instead of memory for its
+     whole life if its clobber points, two moves each, cost less than its
+     uses read from memory, both weighted by 8 per enclosing loop. Each
+     clobber point it crosses stores it to its slot first, reads it from
+     there (as do loads sharing its register), and reloads it after,
+     unless the clobbering value's result is computed in its register
+     (`Live.share`). Not across clobbering terminators, and not for
+     bases of folded addresses.
+   - The value field of an addition or subtraction with overflow that
+     writes its fields is tied to the left operand.
    - Lowering: narrowing to 8, 16, or 32 bits is one `movzx`/`movsx`
      (from the operand's register for a cast) instead of a shift pair; a
      cast that cannot change the bits is a move, and of a constant the

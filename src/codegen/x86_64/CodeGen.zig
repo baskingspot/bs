@@ -124,8 +124,27 @@ cover_pcs: std.ArrayList(u32) = .empty,
 cold_open: std.ArrayList(OpenInline) = .empty,
 /// The function contains inline assembly, so no value gets a register.
 has_asm: bool = false,
-/// Per value in two registers that code read from memory: its slot.
+/// Per value in two registers that code read from memory, or in a
+/// register saved around clobber points (`split_vals`): its slot.
 pair_spills: std.AutoHashMapUnmanaged(u32, i32) = .empty,
+/// The values that may cross a clobber point in a register that does not
+/// survive it (`planSplits`), for `Ssa.allocate`.
+split: std.DynamicBitSetUnmanaged = .{},
+/// The values that got such a register: each clobber point they cross
+/// stores them to their slot first, and they are read from there and
+/// reloaded after it (`genSplit`). Loads that share such a value's
+/// register follow it (`of`, else the value itself). A value that does
+/// not change (not a variable or a block result) is stored once per block
+/// (`stored`, the last block that stored it).
+split_vals: std.ArrayList(struct { v: u32, of: u32, stored: u32 = no_base }) = .empty,
+/// The block `genBlock` emits.
+cur_block: u32 = 0,
+/// Scratch for `genSplit`: the values saved around the current clobber
+/// point, with their homes.
+split_now: std.ArrayList(struct { v: u32, home: Home, reload: bool }) = .empty,
+/// The call arguments that do not cross their call (`exemptArgs`), with
+/// the allocator index of the register they are passed in.
+arg_hints: std.ArrayList(struct { v: u32, r: u8 }) = .empty,
 /// The condition under which the last overflow operation whose bit its
 /// block's branch reads from the flags (`Home.fused`) overflowed.
 ovf_cc: Encoder.Cond = .o,
@@ -262,6 +281,10 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.arg_tys.deinit(gpa);
         cg.arg_locs.deinit(gpa);
         cg.pair_spills.deinit(gpa);
+        cg.split.deinit(gpa);
+        cg.split_vals.deinit(gpa);
+        cg.split_now.deinit(gpa);
+        cg.arg_hints.deinit(gpa);
         cg.copy_of.deinit(gpa);
         cg.copy_private.deinit(gpa);
         cg.slot_alias.deinit(gpa);
@@ -1050,15 +1073,32 @@ fn spillPair(cg: *CodeGen, inst: Inst.Index, p: Regs) Error!Mem {
     return m;
 }
 
+/// Stores value `inst`, which is in `r`, to its slot (`genSplit`).
+fn spillReg(cg: *CodeGen, inst: Inst.Index, r: Reg) Error!Mem {
+    const gop = try cg.pair_spills.getOrPut(cg.gpa, @backingInt(inst));
+    if (!gop.found_existing) gop.value_ptr.* = try cg.allocSlot(8, 8);
+    const m = Mem.at(.rbp, gop.value_ptr.*);
+    try cg.e.mov(.qword, .{ .mem = m }, .{ .reg = r });
+    return m;
+}
+
 /// Stores value `inst`, which is in `x`, to its spill slot for code that
 /// reads it from memory, as `spillPair` does.
 fn spillXmm(cg: *CodeGen, inst: Inst.Index, x: Encoder.Xmm) Error!Mem {
     const gop = try cg.pair_spills.getOrPut(cg.gpa, @backingInt(inst));
-    const size = Type.abiSize(cg.ip, cg.ir.typeOfIndex(inst, cg.ip));
+    const size = Type.abiSize(cg.ip, cg.heldType(inst));
     if (!gop.found_existing) gop.value_ptr.* = try cg.allocSlot(@max(size, 8), @max(size, 8));
     const m = Mem.at(.rbp, gop.value_ptr.*);
     try cg.storeXmm(m, x, size);
     return m;
+}
+
+/// The type of the value `inst`'s register holds: a promoted variable's
+/// (an `alloc`) is its pointee.
+fn heldType(cg: *CodeGen, inst: Inst.Index) Index {
+    const ty = cg.ir.typeOfIndex(inst, cg.ip);
+    if (cg.ir.instructions.items(.tag)[@backingInt(inst)] != .alloc) return ty;
+    return Type.ptrInfo(cg.ip, ty).child;
 }
 
 /// The memory pointer `ptr` points to, with r11 as the base if `ptr` is
@@ -1285,6 +1325,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
     // `clobbers` marks the values that want a register.
     try f.liveness(cg.gpa, ir, cg);
     cg.live = true;
+    if (!cg.has_asm) try cg.exemptArgs();
     try f.plan(cg.gpa, ir, cg.ip, cg);
     const fate = live.items(.fate);
     if (cg.has_asm) {
@@ -1316,6 +1357,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
     }
     try cg.planDeferred();
     @memset(live.items(.hint), .{ Ssa.no_reg, Ssa.no_reg });
+    for (cg.arg_hints.items) |h| live.items(.hint)[h.v][0] = h.r;
     if (cg.fn_ty.cc == .auto) {
         // Arguments prefer the registers they arrive in, which saves
         // their moves at the entry.
@@ -1345,20 +1387,35 @@ fn planRegisters(cg: *CodeGen) Error!void {
             const b = f.blocks.items[@backingInt(block)];
             if (b.term.tag != .ret) continue;
             const w = ir.instructions.items(.data)[@backingInt(b.term.inst)].un_op.toIndex() orelse continue;
-            const last = for (0..b.len) |k| {
-                const v = f.blockInsts(block)[b.len - 1 - k];
-                switch (tags[@backingInt(v)]) {
-                    .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
-                    else => break v,
-                }
-            } else continue;
+            const last = cg.lastValue(block);
             const wi = @backingInt(w);
-            if (last != w or reg[wi] != Ssa.want_reg or fate[wi] != .normal or live.items(.uses)[wi] != 1) continue;
+            if (reg[wi] != Ssa.want_reg or fate[wi] != .normal or live.items(.uses)[wi] != 1) continue;
+            if (last == w) {
+                reg[wi] = Ssa.no_reg;
+                hint[wi][0] = hint_rax;
+            } else if (tags[wi] == .block and last == null) {
+                // A block result returned by a block with nothing else is
+                // written by the `br`s right before they jump to it.
+                reg[wi] = Ssa.no_reg;
+                hint[wi][0] = hint_rax;
+            }
+        }
+        // So is a value only a `br` to such a block reads, computed last.
+        for (f.layout.items) |block| {
+            const b = f.blocks.items[@backingInt(block)];
+            if (b.term.tag != .jump or tags[@backingInt(b.term.inst)] != .br) continue;
+            const br = ir.instructions.items(.data)[@backingInt(b.term.inst)].br;
+            if (hint[@backingInt(br.block_inst)][0] != hint_rax) continue;
+            const w = br.operand.toIndex() orelse continue;
+            const wi = @backingInt(w);
+            if (reg[wi] != Ssa.want_reg or fate[wi] != .normal or live.items(.uses)[wi] != 1 or tags[wi] == .block) continue;
+            if (cg.lastValue(block) != w) continue;
             reg[wi] = Ssa.no_reg;
             hint[wi][0] = hint_rax;
         }
     }
-    cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base) & callee_saved;
+    try cg.planSplits();
+    cg.saved = f.allocate(alloc_regs.len, float_regs.len, callee_saved, cg.addr_base, &cg.split) & callee_saved;
     const reg2 = live.items(.reg2);
     for (f.values.items(.inst)) |inst| {
         const i = @backingInt(inst);
@@ -1374,6 +1431,335 @@ fn planRegisters(cg: *CodeGen) Error!void {
             .dead => cg.homes[i] = .dead,
             .fused => cg.homes[i] = .fused,
             .pair => cg.homes[i] = .pair,
+        }
+        // A value computed or loaded in a split variable's register
+        // (`Live.share`) that kept it when the variable was evicted later
+        // has no variable to be saved with: it is saved itself.
+        const sh = live.items(.share)[i];
+        const orphan = sh != Ssa.no_tie and reg[i] < alloc_regs.len + float_regs.len and reg[sh] != reg[i];
+        if (!cg.split.isSet(i) and !orphan) continue;
+        const keep = live.items(.crosses)[i] and switch (cg.homes[i]) {
+            .reg => |r| callee_saved >> @intCast(allocIndex(r)) & 1 == 0,
+            .xmm => true,
+            else => false,
+        };
+        if (keep) try cg.split_vals.append(cg.gpa, .{ .v = i, .of = i }) else cg.split.unset(i);
+    }
+    if (cg.split_vals.items.len == 0) return;
+    // A load that shares a promoted variable's register, or one forwarded
+    // from a value (whose home it takes when emitted), reads the same
+    // register.
+    const share = live.items(.share);
+    const fwd = live.items(.fwd);
+    for (f.values.items(.inst)) |inst| {
+        const i = @backingInt(inst);
+        if (fate[i] != .normal) continue;
+        const of = if (share[i] != Ssa.no_tie and reg[share[i]] == reg[i]) share[i] else if (fwd[i] != Ssa.no_tie) fwd[i] else continue;
+        if (cg.split.isSet(of)) try cg.split_vals.append(cg.gpa, .{ .v = i, .of = of });
+    }
+}
+
+/// The last value of `block` that is not a debug marker, if any.
+fn lastValue(cg: *CodeGen, block: Ssa.Block.Index) ?Inst.Index {
+    const values = cg.ssa.blockInsts(block);
+    const tags = cg.ir.instructions.items(.tag);
+    var k = values.len;
+    while (k > 0) {
+        k -= 1;
+        switch (tags[@backingInt(values[k])]) {
+            .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            else => return values[k],
+        }
+    }
+    return null;
+}
+
+/// A value in a register whose interval ends at an `.auto` call that
+/// passes it in a register, with every argument in a register, does not
+/// cross that call if it crosses no other clobber point: `call` reads the
+/// arguments before anything else writes the registers that do not
+/// survive it, ordering their moves (`loadArgRegs`). Such an argument
+/// prefers the register it is passed in (`arg_hints`). For `Ssa.plan`,
+/// which reads `crosses`.
+fn exemptArgs(cg: *CodeGen) Error!void {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const f = cg.ssa;
+    const live = f.live.slice();
+    const reg = live.items(.reg);
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const cl = f.clobbers.items;
+    const tags = ir.instructions.items(.tag);
+    cg.arg_hints.clearRetainingCapacity();
+    for (f.values.items(.inst)) |inst| {
+        if (tags[@backingInt(inst)] != .call) continue;
+        const data = ir.instructions.items(.data)[@backingInt(inst)];
+        const callee_fn_ty = cg.typeOf(data.pl_op.operand);
+        const callee_ty = ip.keyPayload(.func_type, if (Type.class(ip, callee_fn_ty) == .pointer) Type.ptrInfo(ip, callee_fn_ty).child else callee_fn_ty);
+        if (callee_ty.cc != .auto) continue;
+        const extra = ir.extraData(Ir.Call, data.pl_op.payload);
+        const args = ir.refSlice(extra.end, extra.data.args_len);
+        const tys, const locs = try cg.argScratch(args.len);
+        for (args, tys) |arg, *ty| ty.* = cg.typeOf(arg);
+        if (cg.autoArgs(extra.data.ret_ty, tys, locs) != 0) continue;
+        const q = def[@backingInt(inst)];
+        const own: [2]u32 = .{ cl[q][0] - cl[q - 1][0], cl[q][1] - cl[q - 1][1] };
+        for (args, tys, locs) |arg, ty, l| {
+            const v = @backingInt(arg.toIndex() orelse continue);
+            if (arg == data.pl_op.operand or end[v] != q or !crosses[v]) continue;
+            switch (l) {
+                .gpr => if (reg[v] != Ssa.want_reg or !cg.passInRegs(ty)) continue,
+                .sse => if (reg[v] != Ssa.want_float) continue,
+                else => continue,
+            }
+            if (cl[q][0] - own[0] != cl[def[v]][0]) continue;
+            try cg.arg_hints.append(cg.gpa, .{ .v = v, .r = if (l == .gpr) allocIndex(c_arg_regs[l.gpr]) else Ssa.no_reg });
+        }
+    }
+    if (cg.arg_hints.items.len == 0) return;
+    // A use in a block that does not continue crosses the clobber points
+    // before it there (`Ssa.liveness`); the call itself does not count.
+    const Uses = struct {
+        cg: *CodeGen,
+        start: u32,
+        pos: u32,
+        own: u32,
+        pub fn use(c: @This(), ref: Ref) void {
+            const v = @backingInt(ref.toIndex() orelse return);
+            const l = c.cg.ssa.live.slice();
+            if (l.items(.reg2)[v] != 0) return;
+            const cl2 = c.cg.ssa.clobbers.items;
+            const at = if (l.items(.end)[v] == c.pos) cl2[c.pos][1] - c.own else cl2[c.pos][1];
+            if (at != cl2[@max(c.start, l.items(.def)[v])][1]) l.items(.reg2)[v] = 1;
+        }
+    };
+    // `reg2` is free until `Ssa.plan`: 0 marks a candidate, 1 one that
+    // crosses a clobber point in a block that does not continue.
+    const reg2 = live.items(.reg2);
+    @memset(reg2, Ssa.no_reg);
+    for (cg.arg_hints.items) |h| reg2[h.v] = 0;
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        if (!Ssa.deadEnd(b.term.tag)) continue;
+        for (f.blockInsts(block), b.start..) |inst, idx| {
+            const q = Ssa.valuePos(idx);
+            Ssa.forEachOperand(ir, inst, Uses{ .cg = cg, .start = 2 * b.start + 1, .pos = q, .own = cl[q][1] - cl[q - 1][1] });
+        }
+    }
+    var n: usize = 0;
+    for (cg.arg_hints.items) |h| {
+        if (reg2[h.v] != 0) continue;
+        crosses[h.v] = false;
+        if (h.r == Ssa.no_reg) continue;
+        cg.arg_hints.items[n] = h;
+        n += 1;
+    }
+    cg.arg_hints.shrinkRetainingCapacity(n);
+}
+
+/// Loads the `.auto` arguments `args` that `locs` puts in general-purpose
+/// registers. An argument may be in one of those registers
+/// (`exemptArgs`), so each register is written once no other argument
+/// left to load reads it; a cycle of register moves is broken with
+/// `xchg`.
+fn loadArgRegs(cg: *CodeGen, args: []const Ref, tys: []const Index, locs: []const AutoArg) Error!void {
+    const Move = struct { arg: Ref, ty: Index, lo: Reg, hi: ?Reg, src: ?Reg };
+    var moves: [6]Move = undefined;
+    var n: usize = 0;
+    for (args, tys, locs) |arg, ty, l| switch (l) {
+        .gpr => |r| {
+            const src: ?Reg = if (arg.toIndex()) |v| switch (cg.homes[@backingInt(v)]) {
+                .reg => |x| if (std.mem.indexOfScalar(Reg, &c_arg_regs, x) != null) x else null,
+                else => null,
+            } else null;
+            moves[n] = .{ .arg = arg, .ty = ty, .lo = c_arg_regs[r], .hi = null, .src = src };
+            n += 1;
+        },
+        .gpr_pair => |r| {
+            moves[n] = .{ .arg = arg, .ty = ty, .lo = c_arg_regs[r], .hi = c_arg_regs[r + 1], .src = null };
+            n += 1;
+        },
+        else => {},
+    };
+    while (n > 0) {
+        const k = for (moves[0..n], 0..) |m, k| {
+            const blocked = for (moves[0..n], 0..) |o, j| {
+                if (j != k and o.src != null and (o.src.? == m.lo or o.src.? == m.hi)) break true;
+            } else false;
+            if (!blocked) break k;
+        } else {
+            // Every move left writes a register another one reads, so
+            // some register moves form a cycle. Swap one into place; what
+            // read either register reads the other.
+            const k = for (moves[0..n], 0..) |m, k| {
+                if (m.src != null) break k;
+            } else unreachable;
+            const m = moves[k];
+            try cg.e.xchg(.qword, .{ .reg = m.lo }, m.src.?);
+            moves[k] = moves[n - 1];
+            n -= 1;
+            for (moves[0..n]) |*o| {
+                if (o.src == m.lo) o.src = m.src else if (o.src == m.src) o.src = m.lo;
+            }
+            continue;
+        };
+        const m = moves[k];
+        if (m.hi) |hi| {
+            try cg.loadPair(m.lo, hi, m.arg);
+        } else if (m.src) |r| {
+            if (r != m.lo) try cg.e.mov(.qword, .{ .reg = m.lo }, .{ .reg = r });
+        } else try cg.loadGpr(m.lo, m.arg, m.ty);
+        moves[k] = moves[n - 1];
+        n -= 1;
+    }
+}
+
+/// Marks in `split` the values that may cross clobber points in a
+/// register that does not survive them, saved to their slot before each
+/// and reloaded after it (`genSplit`), when no surviving register is
+/// free: single registers, crossing no clobbering terminator (which would
+/// need the reload in its successors), no base of an address folded into
+/// its users (whose register the clobbering value may overwrite before
+/// reading them), and whose clobber points, two moves each, cost less
+/// than reading their uses from memory, each weighted by 8 per loop
+/// around it. Loads sharing a promoted variable's register ride on the
+/// variable. Nothing is marked when the surviving registers fit every
+/// crossing value.
+fn planSplits(cg: *CodeGen) Error!void {
+    const f = cg.ssa;
+    const gpa = cg.gpa;
+    const live = f.live.slice();
+    const reg = live.items(.reg);
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const cl = f.clobbers.items;
+    try cg.split.resize(gpa, cg.ir.instructions.len, false);
+    cg.split.unsetAll();
+    var n_gpr: u32 = 0;
+    var n_float: u32 = 0;
+    for (f.values.items(.inst)) |inst| {
+        const i = @backingInt(inst);
+        if (!crosses[i] or live.items(.fate)[i] != .normal) continue;
+        if (reg[i] == Ssa.want_reg) n_gpr += 1;
+        if (reg[i] == Ssa.want_float) n_float += 1;
+    }
+    if (n_gpr <= @popCount(callee_saved) and n_float == 0) return;
+    // Loop depths, by block; parents come before their loops.
+    const depth = try gpa.alloc(u8, f.loops.items.len);
+    defer gpa.free(depth);
+    for (f.loops.items, depth) |l, *d| d.* = if (l.parent == Ssa.no_loop) 1 else @min(depth[l.parent] + 1, 6);
+    const Weights = struct {
+        uses: []u64,
+        w: u64 = 0,
+        pub fn use(c: *@This(), ref: Ref) void {
+            if (ref.toIndex()) |x| c.uses[@backingInt(x)] += c.w;
+        }
+    };
+    var ws: Weights = .{ .uses = try gpa.alloc(u64, cg.ir.instructions.len) };
+    defer gpa.free(ws.uses);
+    @memset(ws.uses, 0);
+    // Prefix sums of the clobber points' weights by position, as
+    // `Ssa.Func.clobbers` counts them.
+    const wcl = try gpa.alloc(u64, cl.len);
+    defer gpa.free(wcl);
+    wcl[0] = 0;
+    var terms: std.ArrayList(u32) = .empty;
+    defer terms.deinit(gpa);
+    const datas = cg.ir.instructions.items(.data);
+    for (f.layout.items) |block| {
+        const b = f.blocks.items[@backingInt(block)];
+        const lp = f.block_loop.items[@backingInt(block)];
+        ws.w = @as(u64, 1) << @intCast(3 * @as(u32, if (lp == Ssa.no_loop) 0 else depth[lp]));
+        for (b.start..b.start + b.len + 1) |idx| {
+            const q = Ssa.valuePos(idx) - 1;
+            wcl[q] = wcl[q - 1] + if (cl[q][0] != cl[q - 1][0]) ws.w else 0;
+            if (idx == b.start + b.len) break;
+            wcl[q + 1] = wcl[q] + if (cl[q + 1][0] != cl[q][0]) ws.w else 0;
+            Ssa.forEachOperand(cg.ir, f.values.items(.inst)[idx], &ws);
+        }
+        const q = 2 * (b.start + b.len) + 1;
+        if (!std.meta.eql(cl[q], cl[q - 1])) try terms.append(gpa, q);
+        const t = datas[@backingInt(b.term.inst)];
+        switch (b.term.tag) {
+            .jump => if (cg.ir.instructions.items(.tag)[@backingInt(b.term.inst)] == .br) ws.use(t.br.operand),
+            .branch, .switch_br => ws.use(t.pl_op.operand),
+            .ret => ws.use(t.un_op),
+            .fallthrough, .noreturn, .unreach => {},
+        }
+        wcl[q + 1] = wcl[q];
+    }
+    var any = false;
+    for (f.values.items(.inst)) |inst| {
+        const i = @backingInt(inst);
+        if (!crosses[i] or live.items(.fate)[i] != .normal or live.items(.share)[i] != Ssa.no_tie) continue;
+        if (reg[i] != Ssa.want_reg and reg[i] != Ssa.want_float) continue;
+        if (2 * (wcl[end[i]] - wcl[def[i]]) > ws.uses[i] + 1) continue;
+        const k = std.sort.lowerBound(u32, terms.items, def[i] + 1, orderU32);
+        if (k < terms.items.len and terms.items[k] <= end[i]) continue;
+        cg.split.set(i);
+        any = true;
+    }
+    if (!any) return;
+    for (cg.addr_base) |b| if (b != no_base) cg.split.unset(b);
+}
+
+fn orderU32(a: u32, b: u32) std.math.Order {
+    return std.math.order(a, b);
+}
+
+/// Emits value `inst`, at position `q`, which may clobber the registers
+/// that do not survive calls, saving the values in `split_vals` whose
+/// intervals contain it: each is stored to its slot, read from there by
+/// `inst`, and reloaded after it unless this was its last use or `inst`
+/// does not return.
+fn genSplit(cg: *CodeGen, inst: Inst.Index, q: u32) Error!void {
+    const live = cg.ssa.live.slice();
+    const def = live.items(.def);
+    const end = live.items(.end);
+    cg.split_now.clearRetainingCapacity();
+    const tags = cg.ir.instructions.items(.tag);
+    for (cg.split_vals.items) |*sv| {
+        const v = sv.v;
+        if (def[v] >= q or end[v] < q) continue;
+        const home = cg.homes[v];
+        if (sv.of != v) {
+            // Once emitted, it holds the register of its value, which
+            // comes first in `split_vals`.
+            const of = for (cg.split_now.items) |o| {
+                if (o.v == sv.of) break o;
+            } else continue;
+            if (!std.meta.eql(home, of.home)) continue;
+            cg.homes[v] = cg.homes[sv.of];
+            try cg.split_now.append(cg.gpa, .{ .v = v, .home = home, .reload = false });
+            continue;
+        }
+        const fixed = tags[v] != .alloc and tags[v] != .block;
+        const m: Mem = if (fixed and sv.stored == cg.cur_block) .at(.rbp, cg.pair_spills.get(v).?) else switch (home) {
+            .reg => |r| try cg.spillReg(@fromBackingInt(v), r),
+            .xmm => |x| try cg.spillXmm(@fromBackingInt(v), x),
+            // Moved to memory by its lowering (a float block result).
+            else => continue,
+        };
+        if (fixed) sv.stored = cg.cur_block;
+        cg.homes[v] = .{ .slot = m.disp };
+        try cg.split_now.append(cg.gpa, .{ .v = v, .home = home, .reload = end[v] != q });
+    }
+    try cg.genInst(inst);
+    const returns = cg.ir.typeOfIndex(inst, cg.ip) != .noreturn_type;
+    // A result computed in a variable's register (`Live.share`) is the
+    // variable's new value.
+    const result = cg.homes[@backingInt(inst)];
+    for (cg.split_now.items) |s| {
+        cg.homes[s.v] = s.home;
+        if (!s.reload or !returns or std.meta.eql(s.home, result)) continue;
+        const m = Mem.at(.rbp, cg.pair_spills.get(s.v).?);
+        switch (s.home) {
+            .reg => |r| try cg.e.mov(.qword, .{ .reg = r }, .{ .mem = m }),
+            .xmm => |x| try cg.loadXmm(x, memVal(cg.heldType(@fromBackingInt(s.v)), m)),
+            else => unreachable,
         }
     }
 }
@@ -1974,8 +2360,22 @@ fn tiedOperand(cg: *CodeGen, inst: Inst.Index) u32 {
             if (t.first == null) t.first = ref;
         }
     };
+    const ir = cg.ir;
+    if (ir.instructions.items(.tag)[@backingInt(inst)] == .struct_field_val) {
+        // The value of an addition or subtraction with overflow that
+        // writes its fields (`Ssa.Fate.pair`) is computed over the left
+        // operand (`overflowArith`).
+        const sf = ir.extraData(Ir.StructField, ir.instructions.items(.data)[@backingInt(inst)].ty_pl.payload).data;
+        if (sf.index == 0) if (sf.operand.toIndex()) |op| switch (ir.instructions.items(.tag)[@backingInt(op)]) {
+            .add_with_overflow, .sub_with_overflow => {
+                const lhs = ir.extraData(Ir.Bin, ir.instructions.items(.data)[@backingInt(op)].ty_pl.payload).data.lhs;
+                return if (lhs.toIndex()) |i| @backingInt(i) else Ssa.no_tie;
+            },
+            else => {},
+        };
+    }
     var t: T = .{};
-    Ssa.forEachOperand(cg.ir, inst, &t);
+    Ssa.forEachOperand(ir, inst, &t);
     const first = t.first orelse return Ssa.no_tie;
     return if (first.toIndex()) |i| @backingInt(i) else Ssa.no_tie;
 }
@@ -2419,9 +2819,17 @@ fn keepSymbols(cg: *CodeGen, inst: Ir.Inst.Index) Error!void {
 
 fn genBlock(cg: *CodeGen, block: Ssa.Block.Index, next: Ssa.Block.Index) Error!void {
     cg.e.bind(cg.labels[@backingInt(block)]);
+    cg.cur_block = @backingInt(block);
     if (cg.ssa.covered.items[@backingInt(block)]) try cg.coverPoint(block == cg.ssa.layout.items[0]);
-    for (cg.ssa.blockInsts(block)) |inst| {
-        if (cg.homes[@backingInt(inst)] != .dead) try cg.genInst(inst) else try cg.keepSymbols(inst);
+    const b = cg.ssa.blocks.items[@backingInt(block)];
+    const cl = cg.ssa.clobbers.items;
+    for (cg.ssa.blockInsts(block), b.start..) |inst, idx| {
+        if (cg.homes[@backingInt(inst)] == .dead) {
+            try cg.keepSymbols(inst);
+            continue;
+        }
+        const q = Ssa.valuePos(idx);
+        if (cg.split_vals.items.len != 0 and !std.meta.eql(cl[q], cl[q - 1])) try cg.genSplit(inst, q) else try cg.genInst(inst);
     }
     try cg.genTerm(cg.ssa.blocks.items[@backingInt(block)].term, next);
 }
@@ -3425,6 +3833,9 @@ fn genCond(cg: *CodeGen, inst: Inst.Index) Error!void {
 /// to `ty`. `d` is not the register of an operand. Uses rcx.
 fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Error!void {
     const e = &cg.e;
+    // A 32-bit operation zero-extends its result: a u32 needs no
+    // normalizing.
+    const size: Size = if (Type.class(cg.ip, ty) == .int and !cg.signed(ty) and Type.intInfo(cg.ip, ty).bits == 32) .dword else .qword;
     switch (tag) {
         .shl, .shr => {
             const op: Encoder.ShiftOp = if (tag == .shl) .shl else if (cg.signed(ty)) .sar else .shr;
@@ -3434,19 +3845,19 @@ fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Err
             };
             if (count == null) try cg.load(.rcx, rhs);
             try cg.load(d, lhs);
-            try e.shift(op, .qword, .{ .reg = d }, count);
+            try e.shift(op, size, .{ .reg = d }, count);
         },
         .mul_wrap => {
             const src = try cg.srcOperand(rhs, .rcx);
             switch (src) {
-                .imm => |v| try e.imul(.qword, d, .{ .reg = try cg.regOf(lhs, d) }, @intCast(v)),
+                .imm => |v| try e.imul(size, d, .{ .reg = try cg.regOf(lhs, d) }, @intCast(v)),
                 .reg => |r| {
                     try cg.load(d, lhs);
-                    try e.imul(.qword, d, .{ .reg = r }, null);
+                    try e.imul(size, d, .{ .reg = r }, null);
                 },
                 .mem => |m| {
                     try cg.load(d, lhs);
-                    try e.imul(.qword, d, .{ .mem = m }, null);
+                    try e.imul(size, d, .{ .mem = m }, null);
                 },
             }
         },
@@ -3460,9 +3871,10 @@ fn intOp(cg: *CodeGen, d: Reg, tag: Inst.Tag, ty: Index, lhs: Ref, rhs: Ref) Err
                 .bit_or => .@"or",
                 .xor => .xor,
                 else => unreachable,
-            }, .qword, .{ .reg = d }, src);
+            }, size, .{ .reg = d }, src);
         },
     }
+    if (size == .dword) return;
     switch (tag) {
         .bit_and, .bit_or, .xor => {}, // stay extended
         else => try cg.normalize(d, ty),
@@ -3653,7 +4065,8 @@ fn overflowOp(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Er
     if (cond) |cc| {
         if (in_flags) {
             cg.ovf_cc = cc;
-        } else {
+        } else if (!pair or fields[1] != Ssa.no_tie) {
+            // A bit nothing reads is not computed.
             try cg.e.setcc(cc, .{ .reg = .r11 });
             try cg.e.movzx(.qword, .r11, .byte, .{ .reg = .r11 });
         }
@@ -3856,17 +4269,14 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         cg.out_args_size = @max(cg.out_args_size, cg.autoArgs(ret_ty, tys, locs));
         // The outgoing area first (copies use rax, rsi, rdi, and rcx), then
         // SSE registers (rax), then general registers. The arguments are
-        // not in caller-saved registers: a call is a clobber point.
+        // in caller-saved registers only without stack arguments, and then
+        // only in those that pass them (`exemptArgs`).
         for (args, locs) |arg, l| if (l == .stack) {
             stack_args = true;
             try cg.copyTo(Mem.at(.rsp, @intCast(l.stack)), arg);
         };
         for (args, locs) |arg, l| if (l == .sse) try cg.loadXmm(xmm_args[l.sse], try cg.valOf(arg));
-        for (args, tys, locs) |arg, ty, l| switch (l) {
-            .gpr => |r| try cg.loadGpr(c_arg_regs[r], arg, ty),
-            .gpr_pair => |r| try cg.loadPair(c_arg_regs[r], c_arg_regs[r + 1], arg),
-            else => {},
-        };
+        try cg.loadArgRegs(args, tys, locs);
         if (ret_class == .memory) if (dst) |m| try cg.e.lea(.qword, .rdi, m);
     }
     if (!is_c and !is_win) try cg.loadTrace(.rax);

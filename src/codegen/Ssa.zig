@@ -853,7 +853,7 @@ pub fn ovfBitCmp(ir: *const Ir, ip: *const InternPool, cmp: Inst.Index, bit: u32
 }
 
 /// Whether a block with this terminator ends the function's execution.
-fn deadEnd(tag: Term.Tag) bool {
+pub fn deadEnd(tag: Term.Tag) bool {
     return switch (tag) {
         .ret, .unreach, .noreturn => true,
         else => false,
@@ -997,9 +997,11 @@ pub fn forEachOperandPtr(ir: *const Ir, inst: Inst.Index, ctx: anytype) void {
 /// the variable (`Live.share`). A free register the value's `hint` names
 /// comes before the others. A `want_fold` value takes no register when
 /// the value `fold` gives for it has one, which is then never evicted, or
-/// is itself folded. Returns
-/// the mask of registers used.
-pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32) u32 {
+/// is itself folded. A crossing value in `split` may also take a register
+/// outside `survives` when none in it is free, which the architecture
+/// saves and restores around each clobber point it crosses. Returns the
+/// mask of registers used.
+pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32, split: *const std.DynamicBitSetUnmanaged) u32 {
     const total = n + n_float;
     assert(total <= max_regs);
     const gprs: u32 = (@as(u32, 1) << @intCast(n)) - 1;
@@ -1067,7 +1069,8 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32) 
         }
         const h = hint[inst];
         pending &= ~(regBit(h[0]) | regBit(h[1]));
-        const usable: u32 = (if (reg[inst] == want_float) floats else gprs) & if (crosses[inst]) survives else ~@as(u32, 0);
+        const splits = crosses[inst] and split.isSet(inst);
+        const usable: u32 = (if (reg[inst] == want_float) floats else gprs) & if (crosses[inst] and !splits) survives else ~@as(u32, 0);
         const v = share[inst];
         if (v != no_tie and reg[v] < total) {
             reg[inst] = reg[v];
@@ -1108,7 +1111,7 @@ pub fn allocate(f: *Func, n: u8, n_float: u8, survives: u32, fold: []const u32) 
             continue;
         }
         if (free & usable != 0) {
-            const cheap = if (h[0] == hint_saved and free & usable & survives != 0)
+            const cheap = if ((h[0] == hint_saved or splits) and free & usable & survives != 0)
                 free & usable & survives
             else if (free & usable & ~survives != 0 and !crosses[inst]) free & usable & ~survives else free & usable;
             const pick = if (cheap & ~pending != 0) cheap & ~pending else if (free & usable & ~pending != 0) free & usable & ~pending else cheap;
