@@ -90,7 +90,7 @@ func_refs: std.AutoArrayHashMapUnmanaged(FuncRef, void) = .empty,
 /// the reference trace of its errors.
 referenced_by: std.AutoHashMapUnmanaged(AnalUnit, Reference) = .empty,
 next_func: usize = 0,
-/// The inlinable functions (Emit, `codegen/inline.zig`): their size and
+/// The inlinable functions (Emit, `codegen/inline.zig`): their size, folds and
 /// the `func_inline` result hash. A function not here is not inlinable.
 inline_results: std.AutoHashMapUnmanaged(InternPool.Index, InlineResult) = .empty,
 /// The `func_inline` result of a function that is not inlinable is this
@@ -1347,7 +1347,7 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
     return true;
 }
 
-pub const InlineResult = struct { size: u32, hash: cache.Hash };
+pub const InlineResult = struct { size: u32, folds: @import("codegen/inline.zig").Folds, hash: cache.Hash };
 
 pub const FuncBody = union(enum) {
     /// Its analysis failed.

@@ -11,10 +11,22 @@ const Ir = @import("../Ir.zig");
 const Inst = Ir.Inst;
 const Zcu = @import("../Zcu.zig");
 const Zir = std.zig.Zir;
+const Type = @import("../Type.zig");
 
-/// The most instructions with hot code (`Scan.size`) an inlinable body
-/// has, after its own callees are inlined.
+/// The most instructions with hot code (`Scan.size`) a call inlines, after
+/// the callee's own callees are inlined and less what its constant
+/// arguments fold (`Site.cost`). A comptime callback's call (`Site.callback`)
+/// gets twice as many.
 pub const budget = 30;
+
+/// The largest body that is inlinable at all, whatever its arguments fold.
+pub fn cap(b: u32) u32 {
+    return 4 * b;
+}
+
+/// The parameters whose constant arguments are weighed (`Scan.folds`).
+pub const max_params = 8;
+pub const Folds = [max_params]u8;
 
 /// A call that may be inlined: a direct call of an `.auto` function, not
 /// `never_inline`, outside cold code. `line:column` is the call's statement
@@ -24,12 +36,42 @@ pub const Site = struct {
     callee: Index,
     line: u32,
     column: u32,
+    /// Bit k: argument k is a constant.
+    consts: u8 = 0,
+    /// Whether comptime parameters chose the callee (`chosen`).
+    callback: bool = false,
+    /// Per argument: the caller's parameter it is (as `Scanner.dep`), so
+    /// the callee's folds become the caller's when it is inlined.
+    params: [max_params]u8 = @splat(none),
+
+    /// The callee's size here: less what the constant arguments fold, but
+    /// never under 1 (its `ret`).
+    pub fn cost(site: Site, size: u32, folds: Folds) u32 {
+        var saved: u32 = 0;
+        for (folds, 0..) |f, k| {
+            if (site.consts >> @intCast(k) & 1 != 0) saved += f;
+        }
+        return @max(1, size -| saved);
+    }
+
+    pub fn limit(site: Site, b: u32) u32 {
+        return if (site.callback) 2 * b else b;
+    }
 };
+
+/// `Scanner.dep` of a value that depends on no parameter (or on more than
+/// one, or on something that does not fold).
+const none: u8 = 0xff;
 
 pub const Scan = struct {
     /// Instructions with code outside cold bodies (those ending in
     /// `unreach` or `trap`: safety checks, `unreachable`).
     size: u32 = 0,
+    /// Per parameter: the hot instructions the rewrite rules remove when
+    /// the argument is a constant: the operations on it that fold, and
+    /// the smaller side of each branch on them (saturating). Inlined
+    /// callees add theirs for the arguments that are parameters.
+    folds: Folds = @splat(0),
     /// Whether the function could be spliced into a caller once its
     /// candidate calls are inlined: an `.auto`, non-`noinline` function
     /// whose IR uses only instructions `splice` maps, and that calls
@@ -43,10 +85,15 @@ pub const Scan = struct {
 };
 
 /// Finds the candidate calls of `ir` (into `sites`, in IR order) and
-/// whether `ir`'s function could be inlined.
-pub fn scan(gpa: Allocator, zcu: *const Zcu, ir: *const Ir, sites: *std.ArrayList(Site)) Allocator.Error!Scan {
+/// whether `ir`'s function could be inlined. Folds are found while the
+/// size is at most `max_size` (past it the function is not inlinable).
+/// `scratch` is kept for the next function.
+pub fn scan(gpa: Allocator, zcu: *const Zcu, ir: *const Ir, sites: *std.ArrayList(Site), max_size: u32, scratch: *std.ArrayList(u8)) Allocator.Error!Scan {
     const start = sites.items.len;
-    var s: Scanner = .{ .gpa = gpa, .ip = &zcu.ip, .ir = ir, .sites = sites };
+    try scratch.resize(gpa, ir.instructions.len);
+    @memset(scratch.items, none);
+    var s: Scanner = .{ .gpa = gpa, .ip = &zcu.ip, .ir = ir, .sites = sites, .deps = scratch.items, .max_size = max_size };
+    defer s.chosen.deinit(gpa);
     s.out.inlinable = selfInlinable(zcu, ir.func);
     try s.body(ir.mainBody(), false);
     if (sites.items.len != start) {
@@ -84,11 +131,55 @@ fn selfInlinable(zcu: *const Zcu, func: Index) bool {
     return true;
 }
 
+/// The values comptime parameters of `func` chose: its instance's
+/// comptime arguments, the values its type captured (a function or type
+/// passed to the generic function that made it, as `std.sort`'s
+/// `lessThanFn`), and the types of parameters whose type the instance
+/// chose (`context: anytype`), or that they point to. A call of one of
+/// them, or of a function one of these types declares, is a comptime
+/// callback's (`Site.callback`): a generic function's hot operations,
+/// such as comparators, hash and equality contexts, and `swap`.
+fn chosen(ip: *const InternPool, func: Index, out: *std.ArrayList(Index), gpa: Allocator) Allocator.Error!void {
+    const f = ip.keyPayload(.func, func);
+    for (f.comptime_args) |a| if (a != .none) try out.append(gpa, a);
+    const parent = ip.getNav(f.owner_nav).parent;
+    if (parent != .none) try out.appendSlice(gpa, switch (ip.keyTag(parent)) {
+        .struct_type => ip.keyPayload(.struct_type, parent).captures,
+        .union_type => ip.keyPayload(.union_type, parent).captures,
+        .enum_type => ip.keyPayload(.enum_type, parent).captures,
+        .opaque_type => ip.keyPayload(.opaque_type, parent).captures,
+        else => &.{},
+    });
+    if (f.generic_owner == .none) return;
+    const generic = ip.keyPayload(.func_type, ip.keyPayload(.func, f.generic_owner).ty).param_types;
+    const params = ip.keyPayload(.func_type, f.ty).param_types;
+    if (generic.len != params.len) return;
+    for (generic, params) |g, p| {
+        if (g == p) continue;
+        try out.append(gpa, if (ip.keyTag(p) == .ptr_type) ip.keyPayload(.ptr_type, p).child else p);
+    }
+}
+
+/// `Scanner.dep` of a constant operand.
+const konst: u8 = 0xfe;
+/// Or'ed into `Scanner.dep` of a pointer into a `*const` alloc, which
+/// loads read the parameter through.
+const in_alloc: u8 = 0x40;
+
 const Scanner = struct {
     gpa: Allocator,
     ip: *const InternPool,
     ir: *const Ir,
     sites: *std.ArrayList(Site),
+    /// Per instruction: the parameter (below `max_params`) its value is
+    /// computed from, with constants, by operations the rewrite rules fold;
+    /// with `in_alloc` for a `*const` alloc that parameter initialized, and
+    /// field pointers into it; else `none`.
+    deps: []u8,
+    max_size: u32,
+    /// `chosen` of the function, found at its first candidate call.
+    chosen: std.ArrayList(Index) = .empty,
+    chosen_found: bool = false,
     out: Scan = .{},
     line: u32 = 0,
     column: u32 = 0,
@@ -106,7 +197,11 @@ const Scanner = struct {
                     s.column = data.dbg_stmt.column;
                     continue;
                 },
-                .arg, .dbg_inline_begin, .dbg_inline_end => continue,
+                .arg => {
+                    if (data.arg.index < max_params) s.deps[@backingInt(inst)] = @intCast(data.arg.index);
+                    continue;
+                },
+                .dbg_inline_begin, .dbg_inline_end => continue,
                 .save_err_return_trace_index => if (data.ty_pl.ty == .none) continue else {
                     s.out.inlinable = false;
                 },
@@ -120,8 +215,14 @@ const Scanner = struct {
                     const extra = ir.extraData(Ir.CondBr, data.pl_op.payload);
                     const then_body = ir.bodySlice(extra.end, extra.data.then_body_len);
                     const else_body = ir.bodySlice(extra.end + then_body.len, extra.data.else_body_len);
+                    const before = s.out.size;
                     try s.body(then_body, cold or isCold(ir, then_body));
+                    const then_size = s.out.size - before;
                     try s.body(else_body, cold or isCold(ir, else_body));
+                    const else_size = s.out.size - before - then_size;
+                    // A constant condition keeps one side (`Ssa.build`).
+                    const d = s.dep(data.pl_op.operand);
+                    if (!cold and d < max_params) s.fold(d, 1 + @min(then_size, else_size));
                 },
                 .switch_br => {
                     const extra = ir.extraData(Ir.SwitchBr, data.pl_op.payload);
@@ -143,17 +244,97 @@ const Scanner = struct {
                     s.out.panics = true;
                     s.out.inlinable = false;
                 },
-                else => {},
+                .store => if (!cold and s.out.inlinable and s.out.size <= s.max_size) if (data.bin_op.lhs.toIndex()) |p| {
+                    // The initializing store of a `*const` alloc.
+                    if (tags[@backingInt(p)] == .alloc and datas[@backingInt(p)].ty != .none and
+                        s.ip.keyPayload(.ptr_type, datas[@backingInt(p)].ty).flags.is_const)
+                    {
+                        const d = s.dep(data.bin_op.rhs);
+                        if (d < max_params) s.deps[@backingInt(p)] = d | in_alloc;
+                    }
+                },
+                // Only while the function may still be inlinable.
+                else => if (!cold and s.out.inlinable and s.out.size <= s.max_size) {
+                    const d = s.foldDep(tag, data);
+                    s.deps[@backingInt(inst)] = d;
+                    if (d < max_params) s.fold(d, 1);
+                },
             }
             if (!cold) s.out.size += 1;
         }
     }
 
+    fn fold(s: *Scanner, d: u8, n: u32) void {
+        const f = &s.out.folds[d];
+        f.* = @intCast(@min(255, @as(u32, f.*) + n));
+    }
+
+    fn dep(s: *const Scanner, r: Inst.Ref) u8 {
+        if (r == .none) return none;
+        if (r.toIndex()) |i| return s.deps[@backingInt(i)];
+        return konst;
+    }
+
+    /// Of operands that fold together: the one parameter they depend on.
+    fn both(s: *const Scanner, a: Inst.Ref, b: Inst.Ref) u8 {
+        const x = s.dep(a);
+        const y = s.dep(b);
+        if (x == konst) return y;
+        if (y == konst or x == y) return x;
+        return none;
+    }
+
+    /// Whether the rewrite rules evaluate operations on constants of `r`'s
+    /// type: integers up to 64 bits and bools.
+    fn evaluable(s: *const Scanner, r: Inst.Ref) bool {
+        const ty = s.ir.typeOf(r, s.ip);
+        return switch (Type.class(s.ip, ty)) {
+            .bool => true,
+            .int => Type.intInfo(s.ip, ty).bits <= 64,
+            else => false,
+        };
+    }
+
+    /// The parameter an instruction's value folds from (`deps`), as
+    /// `rewrite.zig` folds it once that parameter's argument is constant.
+    fn foldDep(s: *const Scanner, tag: Inst.Tag, data: Inst.Data) u8 {
+        const ir = s.ir;
+        const d: u8, const ref: Inst.Ref = switch (tag) {
+            // Vector and wide operands, which do not fold, are rare enough
+            // not to look up.
+            .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr, .div_trunc, .div_floor, .div_ceil, .rem, .mod => .{ s.both(data.bin_op.lhs, data.bin_op.rhs), .none },
+            .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => .{ s.both(data.bin_op.lhs, data.bin_op.rhs), data.bin_op.lhs },
+            .not, .intcast, .trunc => .{ s.dep(data.ty_op.operand), data.ty_op.operand },
+            .int_from_bool => .{ s.dep(data.un_op), .none },
+            .add_with_overflow, .sub_with_overflow, .mul_with_overflow => blk: {
+                const bin = ir.extraData(Ir.Bin, data.ty_pl.payload).data;
+                break :blk .{ s.both(bin.lhs, bin.rhs), .none };
+            },
+            .struct_field_val => .{ s.dep(ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand), .none },
+            // A field of the alloc is the field of the parameter.
+            .struct_field_ptr => {
+                const p = s.dep(ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand);
+                return if (p != none and p & in_alloc != 0 and p != konst) p else none;
+            },
+            .load => {
+                const p = s.dep(data.ty_op.operand);
+                return if (p != none and p & in_alloc != 0 and p != konst) p & ~in_alloc else none;
+            },
+            .slice_ptr, .slice_len, .optional_payload, .unwrap_errunion_payload => .{ s.dep(data.ty_op.operand), .none },
+            .is_null, .is_non_null, .is_err, .is_non_err => .{ s.dep(data.un_op), .none },
+            .array_elem_val => .{ s.both(data.bin_op.lhs, data.bin_op.rhs), .none },
+            else => return none,
+        };
+        if (d >= max_params) return none;
+        if (ref != .none and !s.evaluable(ref)) return none;
+        return d;
+    }
+
     fn call(s: *Scanner, inst: Inst.Index, cold: bool) Allocator.Error!void {
         const ip = s.ip;
         const data = s.ir.instructions.items(.data)[@backingInt(inst)].pl_op;
-        const extra = s.ir.extraData(Ir.Call, data.payload).data;
-        if (extra.ret_ty == .noreturn_type) {
+        const extra = s.ir.extraData(Ir.Call, data.payload);
+        if (extra.data.ret_ty == .noreturn_type) {
             s.out.panics = true;
             return;
         }
@@ -161,13 +342,30 @@ const Scanner = struct {
             s.out.inlinable = false;
             return;
         };
-        if (cold or extra.flags.never_inline or ip.keyTag(callee) != .func or
+        if (cold or extra.data.flags.never_inline or ip.keyTag(callee) != .func or
             ip.keyPayload(.func_type, ip.typeOf(callee)).cc != .auto)
         {
             s.out.inlinable = false;
             return;
         }
-        try s.sites.append(s.gpa, .{ .call = inst, .callee = callee, .line = s.line, .column = s.column });
+        var site: Site = .{ .call = inst, .callee = callee, .line = s.line, .column = s.column };
+        if (!s.chosen_found) {
+            try chosen(ip, s.ir.func, &s.chosen, s.gpa);
+            s.chosen_found = true;
+        }
+        if (s.chosen.items.len != 0) {
+            const parent = ip.getNav(ip.keyPayload(.func, callee).owner_nav).parent;
+            for (s.chosen.items) |c| if (c == callee or c == parent) {
+                site.callback = true;
+                break;
+            };
+        }
+        const args = s.ir.refSlice(extra.end, extra.data.args_len);
+        for (args[0..@min(args.len, max_params)], 0..) |a, k| switch (s.dep(a)) {
+            konst => site.consts |= @as(u8, 1) << @intCast(k),
+            else => |d| site.params[k] = d,
+        };
+        try s.sites.append(s.gpa, site);
     }
 };
 

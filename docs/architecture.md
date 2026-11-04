@@ -1321,10 +1321,35 @@ build, the passes, and the debug info treat them as Sema's inline calls
   uses only instructions the splice maps (no `@returnAddress`,
   `@frameAddress`, inline assembly, error return trace access). Its size is its instructions with code
   outside cold bodies, plus the sizes of the callees inlined into it
-  (mid-stack inlining); the budget is 30. A function whose callees are
-  not all inlined is not inlinable itself, so only leaves and functions
-  that become leaves inline, and every decision reads the callee's own
-  IR, the same in every build and schedule.
+  (mid-stack inlining). A call inlines the callee when that size, less
+  what the call's constant arguments fold (below), is at most the budget,
+  30, or twice that for a comptime callback's call. A function whose
+  callees are not all inlined is not inlinable itself, so only leaves and
+  functions that become leaves inline, and every decision reads the
+  callee's own result and the call, the same in every build and schedule.
+- **Cost model.** `inline.scan` weighs two things besides size, in the
+  walk it already makes:
+  - *Constant arguments.* Per parameter (the first 8), the callee's
+    *folds*: its hot instructions the rewrite rules remove once that
+    argument is a constant, that is the operations computed from it and
+    constants alone that `rewrite.zig` evaluates (integer and bool
+    arithmetic, compares, casts, overflow operations, field, `slice_len`
+    and payload reads of a constant, loads of a `*const` alloc it
+    initialized), plus, for each branch on such a value, the smaller of
+    its two sides. A call subtracts the folds of its constant arguments
+    from the callee's size. A callee's folds for an argument that is the
+    caller's parameter become the caller's when it is inlined, so a
+    constant reaching a leaf through a wrapper counts at the wrapper's
+    call.
+  - *Comptime callbacks.* A call whose callee comptime parameters chose
+    (`inline.chosen`): the callee, or the type declaring it, is a
+    comptime argument of the caller's instance, a value the caller's type
+    captured (`std.sort`'s `lessThanFn`, seen from its `Context`), or the
+    type a parameter's instance type chose (`context: anytype`, or what
+    it points to). These are a generic function's hot operations:
+    comparators, `swap`, hash and equality contexts.
+  A function is inlinable when some call could inline it: its size is at
+  most 4× the budget and, less all its folds, at most twice the budget.
 - **Variants.** *Full*, the default, inlines any such callee; synthetic
   panic frames (below) keep its panic traces complete. *Safe* also
   requires that the callee can start no panic: no call of a cold
@@ -1368,7 +1393,8 @@ build, the passes, and the debug info treat them as Sema's inline calls
     `f`'s declaration), its inlined callees' hashes, its size, and the
     variant (`Emit.inlineSalt`: budget and full/safe). A function that is
     not inlinable has the result `salt ^ 1`, so edits to a large `f` do
-    not touch its callers. The size is the node's one result word, and
+    not touch its callers. The size and the folds (8 bytes) are the
+    node's three result words, and
     every inlinable function's node is recorded, as an inferred error
     set's is, so a loaded function without one is not inlinable.
   - **Replay.** Loading a function reads its `func_inline` node back into

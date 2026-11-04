@@ -498,7 +498,7 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
     var inline_result: ?Zcu.InlineResult = null;
     if (zcu.inline_salt != 0) if (m.find(try r.keyer.keyOf(.func_inline, &.{try r.keyer.unitKeyString(unit)}))) |n| {
         const words = m.result(n);
-        if (words.len == 1) inline_result = .{ .size = words[0], .hash = m.node(n).result_hash };
+        if (words.len == 3) inline_result = .{ .size = words[0], .folds = @bitCast(words[1..3].*), .hash = m.node(n).result_hash };
     };
     if (r.lazy) {
         if (ies) |got| {
@@ -1035,7 +1035,7 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
             // callee's unit).
             const in_changed = switch (dtag) {
                 .func_body => r.inChangedInput(d),
-                .func_inline => try r.inlineMoved(d, inline_ir.budget),
+                .func_inline => try r.inlineMoved(d, inline_ir.cap(inline_ir.budget)),
                 else => continue,
             };
             if (!in_changed) continue;

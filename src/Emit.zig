@@ -212,6 +212,8 @@ inline_bodies: std.ArrayList(Ir) = .empty,
 /// The functions whose fate is being decided, which a cycle of calls
 /// reaches again.
 inline_active: std.ArrayList(Index) = .empty,
+/// `inline_ir.scan`'s array, reused for the next function.
+inline_scratch: std.ArrayList(u8) = .empty,
 
 /// The CodeGen workers. Sema hands each analyzed function over as a job
 /// (`functionOwned`); workers take jobs in order, and `mergeJobs` waits
@@ -261,6 +263,8 @@ const Fate = union(enum) {
     no,
     yes: struct {
         size: u32,
+        /// What constant arguments fold (`inline_ir.Scan.folds`).
+        folds: inline_ir.Folds,
         hash: cache.Hash,
         /// Index into `inline_bodies`, or `no_body` for a function loaded
         /// from the cache whose body no caller generated now needed yet.
@@ -456,6 +460,7 @@ pub fn deinit(emit: *Emit) void {
     for (emit.inline_bodies.items) |*b| b.deinit(gpa);
     emit.inline_bodies.deinit(gpa);
     emit.inline_active.deinit(gpa);
+    emit.inline_scratch.deinit(gpa);
     if (emit.pool) |pool| {
         stopWorkers(pool);
         for (pool.workers) |*w| w.deinit();
@@ -598,7 +603,7 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
 
     var sites: std.ArrayList(inline_ir.Site) = .empty;
     defer sites.deinit(gpa);
-    var s = try inline_ir.scan(gpa, zcu, &ir, &sites);
+    var s = try inline_ir.scan(gpa, zcu, &ir, &sites, inline_ir.cap(emit.inline_budget), &emit.inline_scratch);
     if (emit.inline_safe and s.panics) s.inlinable = false;
     // Every candidate call reads its callee's `func_inline`, inlined or
     // not: an edit that makes the callee inlinable changes the caller.
@@ -639,6 +644,12 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
             },
             .yes => |y| y,
         };
+        // Inlined where it fits once its constant arguments fold.
+        const cost = site.cost(yes.size, yes.folds);
+        if (cost > site.limit(emit.inline_budget)) {
+            all = false;
+            continue;
+        }
         const body = emit.inlineBody(site.callee) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // As for a busy fate.
@@ -651,12 +662,21 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
             all = false;
             continue;
         };
-        size += yes.size;
+        size += cost;
+        // The callee's folds for arguments that are this function's
+        // parameters are this function's.
+        for (site.params, yes.folds) |p, f| if (p < inline_ir.max_params) {
+            s.folds[p] = @intCast(@min(255, @as(u32, s.folds[p]) + f));
+        };
         callee_hash = cache.hash(@truncate(callee_hash), std.mem.asBytes(&yes.hash)) ^ callee_hash;
         try bodies.append(gpa, body);
         try splices.append(gpa, .{ .site = site, .body = undefined });
     }
-    const inlinable = all and size <= emit.inline_budget;
+    var foldable: u32 = 0;
+    for (s.folds) |f| foldable += f;
+    // Inlinable if some call could inline it: a callback's with all its
+    // arguments constant.
+    const inlinable = all and size <= inline_ir.cap(emit.inline_budget) and size -| foldable <= 2 * emit.inline_budget;
     // Of its own body, before the splices.
     const loaded = emit.inline_fates.contains(func);
     const own_hash: cache.Hash = if (inlinable and !loaded) try inline_ir.hashBody(gpa, &zcu.ip, &ir) else 0;
@@ -687,8 +707,8 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
             .rbrace_line = ir.rbrace_line,
             .rbrace_column = ir.rbrace_column,
         });
-        try emit.inline_fates.put(gpa, func, .{ .yes = .{ .size = size, .hash = hash, .body = @intCast(emit.inline_bodies.items.len - 1) } });
-        try zcu.inline_results.put(gpa, func, .{ .size = size, .hash = hash });
+        try emit.inline_fates.put(gpa, func, .{ .yes = .{ .size = size, .folds = s.folds, .hash = hash, .body = @intCast(emit.inline_bodies.items.len - 1) } });
+        try zcu.inline_results.put(gpa, func, .{ .size = size, .folds = s.folds, .hash = hash });
     } else try emit.inline_fates.put(gpa, func, .no);
     if (mode == .body) return true;
     ir_owned = false;
@@ -699,7 +719,9 @@ fn inlineProcess(emit: *Emit, ir_in: Ir, mode: ProcessMode) Allocator.Error!bool
 /// Mixed into every `func_inline` result, so a different budget or
 /// variant changes every caller's.
 fn inlineSalt(emit: *const Emit) cache.Hash {
-    return cache.hash(emit.inline_budget, if (emit.inline_safe) "safe" else "full");
+    // The cost model's version (`inline_ir.Site.cost`) too: results
+    // carry its folds.
+    return cache.hash(emit.inline_budget, if (emit.inline_safe) "safe/folds" else "full/folds");
 }
 
 /// Turns inlining on, with `budget` and the variant (`inline_safe`).
@@ -720,7 +742,7 @@ pub fn inlineFate(emit: *Emit, func: Index) Allocator.Error!FateResult {
         .failed => try emit.inline_fates.put(emit.gpa, func, .no),
         // Loaded from the cache: its recorded result.
         .done => try emit.inline_fates.put(emit.gpa, func, if (emit.zcu.inline_results.get(func)) |r|
-            .{ .yes = .{ .size = r.size, .hash = r.hash, .body = no_body } }
+            .{ .yes = .{ .size = r.size, .folds = r.folds, .hash = r.hash, .body = no_body } }
         else
             .no),
         .analyzed => |ir| if (!try emit.inlineProcess(ir, .generate_or_defer)) return .busy,

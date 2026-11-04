@@ -3233,10 +3233,12 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
             range.result = .{ @intCast(start), @intCast(words.items.len - start) };
             e.units += 1;
         }
-        // An inlinable function's size; none when it is not inlinable.
+        // An inlinable function's size and folds; none when it is not
+        // inlinable.
         if (d == .func_inline) if (zcu.inline_results.get(d.func_inline)) |res| {
-            range.result = .{ @intCast(words.items.len), 1 };
+            range.result = .{ @intCast(words.items.len), 3 };
             try words.append(gpa, res.size);
+            try words.appendSlice(gpa, &@as([2]u32, @bitCast(res.folds)));
         };
     }
     e.ms = ms(t0, now(io));
