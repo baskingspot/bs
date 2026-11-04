@@ -5033,11 +5033,12 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     // Bool vectors are bit-packed: load the vector, then the bit.
                     sema.elemVal(block, src, try sema.analyzeLoad(block, src, lhs), index, true)
                 else if (sema.resolveValue(index) == null and sema.resolveValue(lhs) != null and !sema.isUndef(sema.resolveValue(lhs).?) and
-                    try sema.comptimePtrRoot(sema.resolveValue(lhs).?) == .comptime_alloc and
+                    sema.refersToComptimeAlloc(sema.resolveValue(lhs).?) and
                     try sema.comptimeLoadOrNull(block, src, sema.resolveValue(lhs).?) != null)
-                    // As upstream: a runtime index into a `comptime var`
-                    // indexes its current value, since runtime code cannot
-                    // point into comptime memory.
+                    // As upstream: a runtime index into a `comptime var`,
+                    // or into a comptime field (`t.exp[i]` where `const t =
+                    // .{ .exp = exp }`), indexes its current value, since
+                    // runtime code cannot point into comptime memory.
                     sema.elemVal(block, src, .fromInterned((try sema.comptimeLoadOrNull(block, src, sema.resolveValue(lhs).?)).?), index, true)
                 else
                     sema.loadElem(block, src, lhs, index),

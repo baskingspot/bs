@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n41\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n2\n7\n1\n42\n39\n5\n1\n3\n1\n7\n99\n98\n1073742824\n4\n7\n1\n6\n41\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -283,6 +283,14 @@ noinline fn setAlloc(f: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) call
     return f;
 }
 
+// zig-libs: a comptime-built anonymous struct's array field (a comptime
+// field) is indexed at run time.
+const exp_table = blk: {
+    var exp: [4]u8 = .{ 0, 3, 6, 9 };
+    _ = &exp;
+    break :blk .{ .exp = exp };
+};
+
 // zig-libs (strRepeat): a comptime @bitCast of a nested array costs time
 // and memory linear in its length (quadratic ran out of memory).
 const repeat_grid: [30000][4]u8 = @splat("(?:)".*);
@@ -377,6 +385,9 @@ fn main() callconv(.c) noreturn {
     rt.printInt(@intCast(dbg.x));
     const alloc = setAlloc(&luaAlloc).?;
     rt.printInt(@intFromBool(alloc(null, null, 0, 16) == @as(*anyopaque, &lua_block) and alloc(null, null, 16, 0) == null));
+    var two_i: usize = 2;
+    _ = &two_i;
+    rt.printInt(exp_table.exp[two_i]);
     var last: usize = repeated.len - 1;
     _ = &last;
     rt.printInt(repeated[last]);
