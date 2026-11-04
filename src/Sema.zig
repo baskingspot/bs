@@ -15169,7 +15169,8 @@ fn zirForLen(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref 
             const start = try sema.coerce(block, .usize_type, sema.resolveInst(a), src);
             const end = try sema.coerce(block, .usize_type, sema.resolveInst(b), src);
             if (sema.resolveValue(start) == .zero_usize) break :blk end;
-            break :blk try sema.analyzeArithmetic(block, src, .sub, end, start);
+            // As upstream, the length's overflow is the range's.
+            break :blk try sema.analyzeArithmetic(block, src.operandSrc(@intCast(i / 2)), .sub, end, start);
         };
         if (try sema.resolveDefinedValue(block, src, this_len)) |v| {
             if (len_known) {
