@@ -280,7 +280,7 @@ pub fn main(init_std: std.process.Init) !void {
     if (run_test or (command == .run and opts.emit_bin == .default)) try Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path.?).?);
     var inc = job.openCache(out_path);
     defer if (inc) |*i| i.close();
-    switch (try compile(init, &job, if (inc) |*i| i else null, out_path, .none, null)) {
+    switch (try compile(init, &job, if (inc) |*i| i else null, out_path, null, .none, null)) {
         .ok => {},
         .errors => |diags| {
             printDiagnostics(init.io, diags, opts.error_format) catch {};
@@ -560,8 +560,8 @@ pub const Job = struct {
 
 pub const Outcome = union(enum) {
     /// `cache_hit`: the inputs had not changed and the output was relinked
-    /// from the cache.
-    ok: struct { cache_hit: bool },
+    /// from the cache. `at_alt`: the build wrote `alt_path`, not `out_path`.
+    ok: struct { cache_hit: bool, at_alt: bool = false },
     errors: []const diag.Diagnostic,
     /// Reported on stderr already (a failed link).
     failed,
@@ -569,8 +569,10 @@ pub const Outcome = union(enum) {
 
 /// Compiles `job` into `out_path` (nothing for null), with `inc` as the
 /// cache. `inputs`, if given, gets every source file the build read, as
-/// absolute paths separated by zero bytes.
-pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8)) !Outcome {
+/// absolute paths separated by zero bytes. With `alt_path`, a build that
+/// cannot leave `out_path` as it is writes its output there instead
+/// (`serve`).
+pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8)) !Outcome {
     // A build the cache cannot take answers a build of the same
     // compilation that changed nothing from its inputs record.
     var rec: ?InputsRecord = if (inc_opt == null and out_path != null and job.opts.pic and !job.opts.c_only and !job.opts.dump_ir and
@@ -590,13 +592,13 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // C sources compile while the build analyzes, once for every attempt.
     const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0 or cxxRuntime(&job.opts) or libcNonshared(&job.opts)) try startC(init, job) else null;
     defer if (c_batch) |b| CSource.destroy(b);
-    if (job.opts.c_only) return compileCOnly(init, job, c_batch.?, out_path, inputs);
+    if (job.opts.c_only) return compileCOnly(init, job, c_batch.?, out_path, alt_path, inputs);
     // The C objects are link-only inputs of the cache, after the object
     // and archive arguments, as `ElfInput` takes them.
     if (c_batch) |b| if (inc_opt) |i| {
         i.link_objects = try std.mem.concat(init.arena.allocator(), []const u8, &.{ job.link_objects, try CSource.objectPaths(b, init.arena.allocator()) });
     };
-    while (true) return compileReplaying(init, job, inc_opt, if (rec) |*r| r else null, out_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
+    while (true) return compileReplaying(init, job, inc_opt, if (rec) |*r| r else null, out_path, alt_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
         error.LazyFallback => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             replay_mode = "eager";
@@ -794,7 +796,7 @@ const InputsRecord = struct {
 /// archive stays when no source compiled and neither it nor an object
 /// changed since it was written (`CSource.archiveStamp`, kept under the
 /// compilation's key), as upstream's cache hit: SDL3's is 70 MB.
-fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_path: ?[]const u8, inputs: ?*std.ArrayList(u8)) !Outcome {
+fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_path: ?[]const u8, alt_path: ?[]const u8, inputs: ?*std.ArrayList(u8)) !Outcome {
     const arena = init.arena.allocator();
     const io = init.io;
     const stamp_path: ?[]const u8 = if (out_path != null) path: {
@@ -813,7 +815,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_
     const c = try b.wait();
     if (inputs) |list| try appendCInputs(arena, list, c.inputs);
     if (c.errors.len != 0) return .{ .errors = try dupeDiagnostics(arena, c.errors) };
-    const bin_path = out_path orelse return .{ .ok = .{ .cache_hit = false } };
+    const bin_path = alt_path orelse out_path orelse return .{ .ok = .{ .cache_hit = false } };
     const members = try arena.alloc(Archive.Input, c.objects.len);
     for (members, c.objects) |*m, o| m.* = .{ .name = o.member, .bytes = o.bytes };
     Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members) catch |err| {
@@ -831,7 +833,7 @@ fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_
             else => {},
         };
     };
-    return .{ .ok = .{ .cache_hit = false } };
+    return .{ .ok = .{ .cache_hit = false, .at_alt = alt_path != null } };
 }
 
 /// Appends the files the C sources read, each once: sources share most of
@@ -887,7 +889,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     });
 }
 
-fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, rec: ?*InputsRecord, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch) !Outcome {
+fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, rec: ?*InputsRecord, out_path: ?[]const u8, alt_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch) !Outcome {
     const arena = init.arena.allocator();
     const opts = job.opts;
     const env = init.environ_map;
@@ -1109,7 +1111,8 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         return .{ .errors = try dupeDiagnostics(arena, try std.mem.concat(arena, diag.Diagnostic, &.{ astgen_errors, sema_errors })) };
     }
     if (zcu.failed()) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
-    const bin_path = out_path orelse return .{ .ok = .{ .cache_hit = false } };
+    // A build that links writes `alt_path` if given: the inputs changed.
+    const bin_path = alt_path orelse out_path orelse return .{ .ok = .{ .cache_hit = false } };
     const link_node = prog.start("Link", 0);
     defer link_node.end();
     const ready = try emit.finish();
@@ -1151,7 +1154,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     stages.print();
     if (stages.on) emit.codegen_stats.print("zap: codegen");
     if (!linked) return .failed;
-    return .{ .ok = .{ .cache_hit = false } };
+    return .{ .ok = .{ .cache_hit = false, .at_alt = alt_path != null } };
 }
 
 /// Writes the docs directory (`-femit-docs`) at `path`; after a build that
@@ -1291,13 +1294,17 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
 
     const job: ?Job = if (opts.unsupported == null) try .init(init, args, opts) else null;
     // The output goes where the build runner looks for it:
-    // `<local cache>/o/<hex digest>/<binary name>`.
-    var digest: [16]u8 = undefined;
-    var out_path: ?[]const u8 = null;
-    var docs_path: ?[]const u8 = null;
+    // `<local cache>/o/<hex digest>/<binary name>`, in one of the
+    // compilation's two directories. `zig build --watch` watches the
+    // output that run steps execute, also while it builds: a build that
+    // wrote into that directory would look like a change once it is done,
+    // and run them again. So a build that cannot leave the last output as
+    // it is writes into the other directory, as upstream's outputs move to
+    // a new digest's directory when they change.
+    const Out = struct { digest: [16]u8, bin: ?[]const u8, docs: ?[]const u8 };
+    var outs: [2]Out = undefined;
     if (job) |*j| {
         _, const key = try Incremental.compilationKey(arena, io, j.compile_args, j.zig_lib_dir, j.cache_target);
-        digest = Incremental.outputDigest(key);
         const name = try outputName(arena, opts.command, opts.dynamic, j.stem);
         // A step without a binary (`-fno-emit-bin`, such as a `check`
         // step) still links one there when the cache can take the build:
@@ -1305,17 +1312,22 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
         // a linked output, and the runner sends such steps an update on
         // every build. The runner does not look at the binary.
         const hidden = opts.emit_bin == .none and j.cacheable();
-        out_path = switch (opts.emit_bin) {
-            .none => if (hidden) try std.fs.path.join(arena, &.{ j.cache_dirs.local, "o", &std.fmt.bytesToHex(digest, .lower), name }) else null,
-            .path => |p| p,
-            .default => try std.fs.path.join(arena, &.{ j.cache_dirs.local, "o", &std.fmt.bytesToHex(digest, .lower), name }),
-        };
-        if (opts.emit_bin == .default or hidden) try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(out_path.?).?);
-        docs_path = switch (opts.emit_docs) {
-            .none => null,
-            .path => |p| p,
-            .default => try std.fmt.allocPrint(arena, "{s}/o/{s}/{s}-docs", .{ j.cache_dirs.local, &std.fmt.bytesToHex(digest, .lower), j.stem }),
-        };
+        for (&outs, Incremental.outputDigests(key)) |*o, digest| {
+            const dir = try std.fs.path.join(arena, &.{ j.cache_dirs.local, "o", &std.fmt.bytesToHex(digest, .lower) });
+            o.* = .{
+                .digest = digest,
+                .bin = switch (opts.emit_bin) {
+                    .none => if (hidden) try std.fs.path.join(arena, &.{ dir, name }) else null,
+                    .path => |p| p,
+                    .default => try std.fs.path.join(arena, &.{ dir, name }),
+                },
+                .docs = switch (opts.emit_docs) {
+                    .none => null,
+                    .path => |p| p,
+                    .default => try std.fmt.allocPrint(arena, "{s}/{s}-docs", .{ dir, j.stem }),
+                },
+            };
+        }
         // Upstream's compiler creates the local cache's `tmp`, where the
         // build runner then writes the configuration without creating it.
         try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ j.cache_dirs.local, "tmp" }));
@@ -1336,16 +1348,32 @@ fn serve(init: std.process.Init, args: []const []const u8, opts: Options) !void 
                     try serveUnsupported(&server, init.gpa, opts.unsupported.?);
                     continue;
                 };
+                // The last output is the newer one: a build that leaves it
+                // as it is does not touch it.
+                var current: u1 = 0;
+                var alt_path: ?[]const u8 = null;
+                if (opts.emit_bin != .path) if (outs[0].bin) |a| {
+                    const b = outs[1].bin.?;
+                    const ta = if (Io.Dir.cwd().statFile(io, a, .{})) |st| st.mtime.toNanoseconds() else |_| null;
+                    const tb = if (Io.Dir.cwd().statFile(io, b, .{})) |st| st.mtime.toNanoseconds() else |_| null;
+                    if (tb != null and (ta == null or tb.? > ta.?)) current = 1;
+                    if (ta != null or tb != null) alt_path = outs[1 - current].bin;
+                    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(outs[current].bin.?).?);
+                    if (alt_path) |p| try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(p).?);
+                };
+                const out_path = outs[current].bin;
                 var inputs: std.ArrayList(u8) = .empty;
                 var inc = j.openCache(out_path);
                 defer if (inc) |*i| i.close();
-                const outcome = try compile(init, j, if (inc) |*i| i else null, out_path, root_node, &inputs);
+                const outcome = try compile(init, j, if (inc) |*i| i else null, out_path, alt_path, root_node, &inputs);
+                if (outcome == .ok and outcome.ok.at_alt) current = 1 - current;
+                const docs_path = outs[current].docs;
                 const prefixed = try prefixInputs(arena, io, inputs.items, .{ .zig_lib_dir = j.zig_lib_dir, .cache_dirs = j.cache_dirs, .build_root = j.opts.build_root });
                 if (prefixed.len != 0) try server.serveStringMessage(.file_system_inputs, prefixed);
                 switch (outcome) {
                     .ok => |r| {
                         if (docs_path) |p| try emitDocs(init, j, p, r.cache_hit);
-                        if (out_path != null or docs_path != null) try server.serveEmitDigest(&digest, .{ .flags = .{ .cache_hit = r.cache_hit } });
+                        if (out_path != null or docs_path != null) try server.serveEmitDigest(&outs[current].digest, .{ .flags = .{ .cache_hit = r.cache_hit } });
                         try server.serveErrorBundle(.error_bundle, .empty);
                     },
                     .errors => |diags| try serveErrors(&server, init.gpa, diags, opts.reference_trace),

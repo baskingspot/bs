@@ -98,7 +98,7 @@ pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []cons
         defer prog.end();
         var inc = job.openCache(job.stem);
         defer if (inc) |*i| i.close();
-        switch (try main.compile(init, &job, if (inc) |*i| i else null, job.stem, prog, null)) {
+        switch (try main.compile(init, &job, if (inc) |*i| i else null, job.stem, null, prog, null)) {
             .ok => {},
             .errors => |diags| {
                 main.printDiagnostics(io, diags, .text) catch {};

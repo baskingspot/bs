@@ -212,6 +212,13 @@ pub fn outputDigest(key: Hash) [16]u8 {
     return @bitCast(cache.hash(0x7a61702d6f7574, std.mem.asBytes(&key)));
 }
 
+/// `outputDigest`, then the digest of the compilation's second output
+/// directory, which a `zig build --watch` session alternates with the
+/// first (`serve` in main.zig): both belong to the compilation.
+pub fn outputDigests(key: Hash) [2][16]u8 {
+    return .{ outputDigest(key), @bitCast(cache.hash(0x7a61702d6f7577, std.mem.asBytes(&key))) };
+}
+
 pub fn close(inc: *Incremental) void {
     if (inc.recording) |*f| {
         var r = f.cancel(inc.io) catch null;
