@@ -19165,6 +19165,7 @@ fn analyzeCall(
                 if (arg_i >= fn_ty.param_types.len) {
                     try sema.inst_map.put(sema.gpa, zir_args.call_inst, .fromInterned(.generic_poison_type));
                     const arg = try sema.resolveInlineBody(block, body, zir_args.call_inst);
+                    if (sema.typeOf(arg) == .noreturn_type) return .unreachable_value;
                     if (sema.isErrorType(sema.typeOf(arg))) sema.any_arg_is_error = true;
                     args[arg_i] = try sema.coerceVarArg(block, sema.callArgSrc(src, first_arg != .none, arg_i), arg);
                     arg_i += 1;
@@ -19188,6 +19189,10 @@ fn analyzeCall(
                     ct_block.comptime_reason = "argument to comptime parameter must be comptime-known";
                 }
                 const arg = try sema.resolveInlineBody(if (ct_block.is_comptime) &ct_block else block, body, zir_args.call_inst);
+                // As upstream, an argument that does not return ends the
+                // call there: the rest of the arguments and the call itself
+                // are not analyzed.
+                if (sema.typeOf(arg) == .noreturn_type) return .unreachable_value;
                 if (sema.isErrorType(sema.typeOf(arg))) sema.any_arg_is_error = true;
                 args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerceCtx(block, param_ty, arg, sema.callArgSrc(src, first_arg != .none, arg_i), .{ .param = .{ .func = func, .index = arg_i } });
                 arg_i += 1;
