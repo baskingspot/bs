@@ -41,6 +41,8 @@ def classify(up, res):
     if not bad:
         return None, bad
     safe = res.get("zig-safe")
+    if (safe is None or not safe.compiled()) and "zig-llvm" in res:
+        safe = res["zig-llvm"]
     zd = res.get("bs")
     if safe is not None and safe.compiled() and safe.key() != up.key():
         # Upstream disagrees with itself: Debug (x86_64 backend) against
@@ -125,6 +127,8 @@ def check(seed, tools, size, branch=None, base=None, text=None):
             return rec
         for cfg in H.TRIAGE:
             res[cfg.name] = H.run_config(tools, cfg, src, scratch)
+        if "zig-safe" in res and not res["zig-safe"].compiled():
+            res["zig-llvm"] = H.run_config(tools, H.UP_LLVM, src, scratch)
         cls, bad = classify(up, res)
         if cls is None:
             rec["result"] = "flaky"

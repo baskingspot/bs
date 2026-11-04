@@ -23,8 +23,8 @@ RUN_TIMEOUT = 10
 class Config:
     """`kind` is "zig" (upstream) or "bs"."""
 
-    def __init__(self, name, kind, mode="Debug", env=None):
-        self.name, self.kind, self.mode, self.env = name, kind, mode, env or {}
+    def __init__(self, name, kind, mode="Debug", env=None, flags=()):
+        self.name, self.kind, self.mode, self.env, self.flags = name, kind, mode, env or {}, list(flags)
 
 
 # The oracle, the configurations every program runs under, and the ones
@@ -32,13 +32,16 @@ class Config:
 # and takes ~15 s per program).
 UP_DEBUG = Config("zig", "zig")
 UP_SAFE = Config("zig-safe", "zig", "ReleaseSafe")
+# The LLVM backend in Debug: the second oracle when ReleaseSafe's
+# optimizer crashes or times out on a program.
+UP_LLVM = Config("zig-llvm", "zig", flags=["-fllvm"])
 BS_DEBUG = Config("bs", "bs")
 BS_SAFE = Config("bs-safe", "bs", "ReleaseSafe")
 BS_NOINLINE = Config("bs-noinline", "bs", env={"BS_INLINE": "0"})
 BS_INLINE_SAFE = Config("bs-inline-safe", "bs", env={"BS_INLINE_SAFE": "1"})
 ALWAYS = [BS_DEBUG, BS_SAFE, BS_NOINLINE]
 TRIAGE = [UP_SAFE, BS_INLINE_SAFE]
-BY_NAME = {c.name: c for c in [UP_DEBUG, UP_SAFE, BS_DEBUG, BS_SAFE, BS_NOINLINE, BS_INLINE_SAFE]}
+BY_NAME = {c.name: c for c in [UP_DEBUG, UP_SAFE, UP_LLVM, BS_DEBUG, BS_SAFE, BS_NOINLINE, BS_INLINE_SAFE]}
 # What every configuration is compared with: upstream Debug, or with
 # set_ref_env, bs itself with a pass turned off (no upstream run at all).
 ORACLE = UP_DEBUG
@@ -114,6 +117,7 @@ def compile_prog(tools, cfg, src, out, cache_dir):
         argv = [tools.zig, "build-exe", src, f"-femit-bin={out}", "--cache-dir", cache_dir]
     if cfg.mode != "Debug":
         argv.append(f"-O{cfg.mode}")
+    argv += cfg.flags
     try:
         p = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                            errors="replace", timeout=COMPILE_TIMEOUT, cwd=os.path.dirname(src))

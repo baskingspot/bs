@@ -29,7 +29,8 @@ Every program runs under upstream `zig` Debug and three bs
 configurations: `bs` (Debug), `bs-safe` (`-OReleaseSafe`) and
 `bs-noinline` (`BS_INLINE=0`). A mismatch also runs upstream
 `-OReleaseSafe` (LLVM; ~15 s a program, so only then) and `bs` with
-`BS_INLINE_SAFE=1`. Which configurations disagree says where to look:
+`BS_INLINE_SAFE=1`; when ReleaseSafe's optimizer crashes or times out
+on the program, upstream Debug with `-fllvm` stands in for it. Which configurations disagree says where to look:
 only `bs` and `bs-safe` with inlining on points at the inliner or at
 the rewrite rules that run after it; every bs configuration points at
 lowering, register allocation or Sema.
