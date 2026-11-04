@@ -454,6 +454,15 @@ pub const Src = struct {
         // the tree for them. Each falls back to the node itself.
         /// Argument `index` of a call or builtin call.
         call_arg: struct { node: Ast.Node.Offset, index: u32 },
+        /// The operand of the pointer cast builtin at `node`, through
+        /// nested pointer casts (upstream's `node_offset_ptrcast_operand`).
+        cast_operand: Ast.Node.Offset,
+        /// The alignment, bit offset or host size of the pointer type at
+        /// `node`.
+        ptr_part: struct { node: Ast.Node.Offset, part: enum { @"align", bit_offset, host_size } },
+        /// Argument `index` of the `@call` at `node`: an element of its
+        /// argument tuple literal, or the tuple.
+        call_tuple_elem: struct { node: Ast.Node.Offset, index: u32 },
         /// The stored operand of an assignment or variable declaration.
         store_operand: Ast.Node.Offset,
         /// The destination of an assignment, or the node itself
@@ -552,6 +561,40 @@ pub const Src = struct {
             .node_abs => |n| tree.nodeToSpan(n),
             .token => |off| tree.tokenToSpan(off.toAbsolute(tree.firstToken(src.base))),
             .var_init => tree.nodeToSpan(if (tree.fullVarDecl(src.base)) |vd| vd.ast.init_node.unwrap() orelse src.base else src.base),
+            .cast_operand => |off| {
+                var node = off.toAbsolute(src.base);
+                while (true) {
+                    var buf: [2]Ast.Node.Index = undefined;
+                    const params = tree.builtinCallParams(&buf, node) orelse break;
+                    if (params.len != 1) break;
+                    const name = tree.tokenSlice(tree.nodeMainToken(node));
+                    const casts = [_][]const u8{ "@ptrCast", "@alignCast", "@addrSpaceCast", "@constCast", "@volatileCast" };
+                    for (casts) |c| {
+                        if (std.mem.eql(u8, name, c)) break;
+                    } else break;
+                    node = params[0];
+                }
+                return tree.nodeToSpan(node);
+            },
+            .ptr_part => |p| {
+                const node = p.node.toAbsolute(src.base);
+                const ptr = tree.fullPtrType(node) orelse return tree.nodeToSpan(node);
+                const part = switch (p.part) {
+                    .@"align" => ptr.ast.align_node,
+                    .bit_offset => ptr.ast.bit_range_start,
+                    .host_size => ptr.ast.bit_range_end,
+                };
+                return tree.nodeToSpan(part.unwrap() orelse node);
+            },
+            .call_tuple_elem => |a| {
+                const node = a.node.toAbsolute(src.base);
+                var buf: [2]Ast.Node.Index = undefined;
+                const params = tree.builtinCallParams(&buf, node) orelse return tree.nodeToSpan(node);
+                if (params.len != 3) return tree.nodeToSpan(node);
+                var ebuf: [2]Ast.Node.Index = undefined;
+                if (tree.fullArrayInit(&ebuf, params[2])) |init| if (a.index < init.ast.elements.len) return tree.nodeToSpan(init.ast.elements[a.index]);
+                return tree.nodeToSpan(params[2]);
+            },
             .call_arg => |a| {
                 const node = a.node.toAbsolute(src.base);
                 var buf: [2]Ast.Node.Index = undefined;
@@ -803,6 +846,11 @@ pub const Src = struct {
 
     /// The function expression of the call at `src`. Resolved only when
     /// rendered.
+    fn castOperand(src: Src) Src {
+        const off = src.nodeOffset() orelse return src;
+        return .{ .base = src.base, .loc = .{ .cast_operand = off } };
+    }
+
     fn callFunc(src: Src) Src {
         const off = src.nodeOffset() orelse return src;
         return .{ .base = src.base, .loc = .{ .call_func = off } };
@@ -1325,7 +1373,7 @@ fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.Con
         for (types, 0..) |ft, i| {
             try sema.resolveLayout(block, src, ft);
             const fb = sema.packedFieldBits(ft) orelse
-                return sema.failUnpackable(block, cont_src.fieldSrc(@intCast(i), .type), "structs", ft);
+                return sema.failUnpackable(block, cont_src.fieldSrc(@intCast(i), .type), "packed structs cannot contain fields of type '{f}'", ft);
             offsets[i] = bits;
             bits += fb;
         }
@@ -1619,7 +1667,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                 for (types) |ft| try sema.resolveLayout(&block, src, ft);
                 const field_bits = try sema.arena.alloc(u16, n);
                 for (types, field_bits, 0..) |ft, *b, i| b.* = sema.packedFieldBits(ft) orelse
-                    return sema.failUnpackable(&block, cont_src.fieldSrc(@intCast(i), .type), "unions", ft);
+                    return sema.failUnpackable(&block, cont_src.fieldSrc(@intCast(i), .type), "packed unions cannot contain fields of type '{f}'", ft);
                 const backing = if (arg_ty != .none) blk: {
                     if (Type.class(ip, arg_ty) != .int) return sema.fail(&block, src, "expected backing integer type, found '{f}'", .{sema.fmtType(arg_ty)});
                     for (field_bits) |b| if (b != Type.intInfo(ip, arg_ty).bits) return sema.fail(&block, src, "field bit width does not match backing integer", .{});
@@ -4045,7 +4093,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                 .optional => Type.optionalReprIsPtr(sema.ip, Type.childType(sema.ip, child)),
                 else => false,
             };
-            if (!ok) return sema.fail(block, src, "expected integer, float, bool, or pointer for the vector element type; found '{f}'", .{sema.fmtType(child)});
+            if (!ok) return sema.fail(block, sema.callArgSrc(src, false, 1), "expected integer, float, bool, or pointer for the vector element type; found '{f}'", .{sema.fmtType(child)});
             break :blk .fromInterned(try sema.vectorType(@intCast(len), child));
         },
         .anyframe_type => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(tag)),
@@ -4488,7 +4536,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             if (Type.class(sema.ip, ty) == .@"union") {
                 try sema.resolveLayout(block, src, ty);
                 const tag_ty = sema.ip.structInfo(ty).tag_type;
-                if (tag_ty == .none or sema.ip.keyTag(tag_ty) != .enum_type) return sema.fail(block, src, "untagged union '{f}' cannot be converted to integer", .{sema.fmtType(ty)});
+                if (tag_ty == .none or sema.ip.keyTag(tag_ty) != .enum_type) return sema.fail(block, sema.callArgSrc(src, false, 0), "untagged union '{f}' cannot be converted to integer", .{sema.fmtType(ty)});
                 operand = try sema.unionTag(block, src, operand);
                 ty = sema.typeOf(operand);
             }
@@ -4659,7 +4707,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     const i = std.fmt.parseInt(u32, name, 10) catch break :has false;
                     break :has i < t.types.len;
                 },
-                else => return sema.fail(block, src, "type '{f}' does not support '@hasField'", .{sema.fmtType(ty)}),
+                else => return sema.fail(block, sema.callArgSrc(src, false, 0), "type '{f}' does not support '@hasField'", .{sema.fmtType(ty)}),
             }));
         },
         else => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(tag)),
@@ -4951,7 +4999,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const operand_ty = sema.typeOf(operand);
             const is_opt = Type.class(ip, operand_ty) == .optional;
             const ptr_ty = if (is_opt) Type.childType(ip, operand_ty) else operand_ty;
-            if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src, "expected pointer type, found '{f}'", .{sema.fmtType(operand_ty)});
+            if (Type.class(ip, ptr_ty) != .pointer) return sema.fail(block, src.castOperand(), "expected pointer type, found '{f}'", .{sema.fmtType(operand_ty)});
             var info = Type.ptrInfo(ip, ptr_ty);
             const flags: Zir.Inst.FullPtrCastFlags = @bitCast(@as(u5, @truncate(ext.small)));
             if (flags.const_cast) info.flags.is_const = false;
@@ -5036,7 +5084,7 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
                     defer ip.errors_mutex.unlock(ip.io);
                     if (code == 0 or code >= ip.error_names.items.len) break :name null;
                     break :name ip.error_names.items[@intCast(code)];
-                } orelse break :blk sema.fail(block, src, "integer value '{d}' represents no error", .{code});
+                } orelse break :blk sema.fail(block, sema.callArgSrc(src, false, 0), "integer value '{d}' represents no error", .{code});
                 break :blk .fromInterned(try sema.intern(.{ .err = .{ .ty = .anyerror_type, .name = name } }));
             };
             // An error set of zero or one names has one code, as upstream.
@@ -5078,7 +5126,7 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].un_node;
     const src = block.nodeSrc(data.src_node);
     const name = try sema.resolveConstString(block, src, sema.resolveInst(data.operand));
-    if (name.len == 0) return sema.fail(block, src, "file path name cannot be empty", .{});
+    if (name.len == 0) return sema.fail(block, sema.callArgSrc(src, false, 0), "file path name cannot be empty", .{});
     const file = sema.zcu.file(sema.file);
     const fe = sema.zcu.fe;
     // A module name embeds that module's root file, as upstream.
@@ -5087,7 +5135,7 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
         try sema.bcRefuse();
         const index = sema.zcu.embedFile(m, fe.module(m).root_file) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return sema.fail(block, src, "unable to open '{s}': {t}", .{ name, err }),
+            else => return sema.fail(block, sema.callArgSrc(src, false, 0), "failed opening {q}: {t}", .{ name, err }),
         };
         try sema.declareDependency(.{ .embed_file = index });
         return .fromInterned(try sema.stringLiteral(sema.zcu.embed_files.values()[index].bytes));
@@ -5104,7 +5152,7 @@ fn zirEmbedFile(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     try sema.bcRefuse();
     const index = sema.zcu.embedFile(file.module, sub_path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return sema.fail(block, src, "unable to open '{s}': {t}", .{ name, err }),
+        else => return sema.fail(block, sema.callArgSrc(src, false, 0), "failed opening {q}: {t}", .{ name, err }),
     };
     try sema.declareDependency(.{ .embed_file = index });
     return .fromInterned(try sema.stringLiteral(sema.zcu.embed_files.values()[index].bytes));
@@ -5440,7 +5488,7 @@ fn analyzeBitOp(sema: *Sema, block: *Block, src: Src, tag: Zir.Inst.Tag, operand
             return s.analyzeBitOp(b, sr, o.tag, e[0]);
         }
     }{ .tag = tag });
-    if (Type.class(ip, ty) != .int) return sema.fail(block, src, "expected integer type, found '{f}'", .{sema.fmtType(ty)});
+    if (Type.class(ip, ty) != .int) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected integer or vector, found '{f}'", .{sema.fmtType(ty)});
     const info = Type.intInfo(ip, ty);
     if (tag == .byte_swap and info.bits % 8 != 0) return sema.fail(block, src, "@byteSwap requires the number of bits to be evenly divisible by 8, but '{f}' has {d} bits", .{ sema.fmtType(ty), info.bits });
     const result_ty = switch (tag) {
@@ -5566,17 +5614,14 @@ fn packedFieldBits(sema: *Sema, ty: Index) ?u16 {
     return Type.packedBits(ip, ty);
 }
 
-/// Fails at `src`, the type of a field of a packed struct or union (`what`
-/// is "structs" or "unions"), because `ty` has no bit-packed
-/// representation, with upstream's `explainWhyTypeIsUnpackable` notes
-/// (`fail` adds the declaration note).
-fn failUnpackable(sema: *Sema, block: *Block, src: Src, comptime what: []const u8, ty: Index) CompileError {
+/// Fails at `src` with message `fmt` about `ty` (a packed field's or a
+/// bit-pointer's type), which has no bit-packed representation, with
+/// upstream's `explainWhyTypeIsUnpackable` notes (`fail` adds the
+/// declaration note).
+fn failUnpackable(sema: *Sema, block: *Block, src: Src, comptime fmt: []const u8, ty: Index) CompileError {
     const ip = sema.ip;
     const zcu = sema.zcu;
-    const err = if (comptime std.mem.eql(u8, what, "structs"))
-        sema.fail(block, src, "packed structs cannot contain fields of type '{f}'", .{sema.fmtType(ty)})
-    else
-        sema.fail(block, src, "packed unions cannot contain fields of type '{f}'", .{sema.fmtType(ty)});
+    const err = sema.fail(block, src, fmt, .{sema.fmtType(ty)});
     const span = src.span(try zcu.fe.tree(@fromBackingInt(sema.file)));
     switch (Type.class(ip, ty)) {
         .type, .comptime_float, .comptime_int, .enum_literal, .undefined, .null => try zcu.addNote(sema.file, span, "comptime-only types have no bit-packed representation", .{}),
@@ -5721,7 +5766,7 @@ fn intFromPtr(sema: *Sema, block: *Block, src: Src, operand: Ref) CompileError!R
     // As upstream, a pointer or an optional pointer, not a slice.
     const ptr_ty = if (Type.class(sema.ip, ty) == .optional) Type.childType(sema.ip, ty) else ty;
     if (Type.class(sema.ip, ptr_ty) != .pointer or Type.isSlice(sema.ip, ptr_ty) or (ptr_ty != ty and !Type.optionalReprIsPtr(sema.ip, ptr_ty)))
-        return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(ty)});
+        return sema.fail(block, sema.callArgSrc(src, false, 0), "expected pointer, found '{f}'", .{sema.fmtType(ty)});
     const ptr = operand;
     if (sema.resolveValue(ptr)) |v0| {
         if (sema.isUndef(v0)) return .fromInterned(try sema.undefValue(.usize_type));
@@ -6021,15 +6066,18 @@ fn atomicElemType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!
 }
 
 /// The pointer operand of an atomic builtin, as a pointer to `elem_ty`.
-fn atomicPtr(sema: *Sema, block: *Block, src: Src, ref: Zir.Inst.Ref, is_const: bool) CompileError!struct { Ref, Index } {
+/// The pointer operand (argument 1) of the atomic builtin call at
+/// `call_src`, whose element type argument is argument 0.
+fn atomicPtr(sema: *Sema, block: *Block, call_src: Src, ref: Zir.Inst.Ref, is_const: bool) CompileError!struct { Ref, Index } {
     const ip = sema.ip;
+    const src = sema.callArgSrc(call_src, false, 1);
     const ptr = sema.resolveInst(ref);
     const ptr_ty = sema.typeOf(ptr);
     if (Type.class(ip, ptr_ty) != .pointer or Type.ptrInfo(ip, ptr_ty).flags.size != .one)
         return sema.fail(block, src, "expected single pointer, found '{f}'", .{sema.fmtType(ptr_ty)});
     const info = Type.ptrInfo(ip, ptr_ty);
     if (!is_const and info.flags.is_const) return sema.fail(block, src, "cannot assign to constant", .{});
-    try sema.atomicElemType(block, src, info.child);
+    try sema.atomicElemType(block, sema.callArgSrc(call_src, false, 0), info.child);
     return .{ ptr, info.child };
 }
 
@@ -6069,7 +6117,7 @@ fn zirAtomicStore(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const extra = sema.code.extraData(Zir.Inst.AtomicStore, data.payload_index).data;
     const src = block.nodeSrc(data.src_node);
-    const ptr, const elem_ty = try sema.atomicPtr(block, sema.callArgSrc(src, false, 1), extra.ptr, false);
+    const ptr, const elem_ty = try sema.atomicPtr(block, src, extra.ptr, false);
     const operand = try sema.coerce(block, elem_ty, sema.resolveInst(extra.operand), sema.callArgSrc(src, false, 2));
     switch (try sema.atomicOrder(block, sema.callArgSrc(src, false, 3), extra.ordering)) {
         .acquire, .acq_rel => return sema.fail(block, sema.callArgSrc(src, false, 3), "@atomicStore atomic ordering must not be acquire or acq_rel", .{}),
@@ -6089,7 +6137,7 @@ fn zirAtomicRmw(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].pl_node;
     const extra = sema.code.extraData(Zir.Inst.AtomicRmw, data.payload_index).data;
     const src = block.nodeSrc(data.src_node);
-    const ptr, const elem_ty = try sema.atomicPtr(block, sema.callArgSrc(src, false, 1), extra.ptr, false);
+    const ptr, const elem_ty = try sema.atomicPtr(block, src, extra.ptr, false);
     const op_ty = try sema.stdLangType(block, src, "AtomicRmwOp");
     const op_src = sema.callArgSrc(src, false, 2);
     const op_val = try sema.resolveConstValue(block, op_src, try sema.coerce(block, op_ty, sema.resolveInst(extra.operation), op_src), "'@atomicRmw' operation must be comptime-known");
@@ -6100,11 +6148,11 @@ fn zirAtomicRmw(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     const class = Type.class(ip, elem_ty);
     // Integers, packed structs, and pointers allow every operation.
     switch (class) {
-        .@"enum" => if (op != .Xchg) return sema.fail(block, src, "@atomicRmw with enum only allowed with .Xchg", .{}),
-        .bool => if (op != .Xchg) return sema.fail(block, src, "@atomicRmw with bool only allowed with .Xchg", .{}),
+        .@"enum" => if (op != .Xchg) return sema.fail(block, op_src, "@atomicRmw with enum only allowed with .Xchg", .{}),
+        .bool => if (op != .Xchg) return sema.fail(block, op_src, "@atomicRmw with bool only allowed with .Xchg", .{}),
         .float => switch (op) {
             .Xchg, .Add, .Sub, .Max, .Min => {},
-            else => return sema.fail(block, src, "@atomicRmw with float only allowed with .Xchg, .Add, .Sub, .Max, and .Min", .{}),
+            else => return sema.fail(block, op_src, "@atomicRmw with float only allowed with .Xchg, .Add, .Sub, .Max, and .Min", .{}),
         },
         else => {},
     }
@@ -6138,8 +6186,8 @@ fn zirCmpxchg(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     const ext = sema.code.instructions.items(.data)[@backingInt(inst)].extended;
     const extra = sema.code.extraData(Zir.Inst.Cmpxchg, ext.operand).data;
     const src = block.nodeSrc(extra.node);
-    const ptr, const elem_ty = try sema.atomicPtr(block, sema.callArgSrc(src, false, 1), extra.ptr, false);
-    if (Type.class(ip, elem_ty) == .float) return sema.fail(block, src, "expected bool, integer, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(elem_ty)});
+    const ptr, const elem_ty = try sema.atomicPtr(block, src, extra.ptr, false);
+    if (Type.class(ip, elem_ty) == .float) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected bool, integer, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(elem_ty)});
     const expected = try sema.coerce(block, elem_ty, sema.resolveInst(extra.expected_value), sema.callArgSrc(src, false, 2));
     const new = try sema.coerce(block, elem_ty, sema.resolveInst(extra.new_value), sema.callArgSrc(src, false, 3));
     const success_src = sema.callArgSrc(src, false, 4);
@@ -6247,7 +6295,7 @@ fn bitOffsetOf(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.Bin) Compil
             if (t.values[i] != .none) return sema.fail(block, src, "no offset available for comptime field", .{});
             return Type.fieldOffset(ip, ty, i) * 8;
         },
-        else => return sema.fail(block, src, "expected struct type, found '{f}'", .{sema.fmtType(ty)}),
+        else => return sema.fail(block, sema.callArgSrc(src, false, 0), "expected struct type, found '{f}'", .{sema.fmtType(ty)}),
     }
 }
 
@@ -6279,7 +6327,7 @@ fn fieldParentPtr(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.FieldPar
         else => return sema.fail(block, src, "expected struct or union type, found '{f}'", .{sema.fmtType(parent_ty)}),
     };
     const field_ptr = sema.resolveInst(extra.field_ptr);
-    if (Type.class(ip, sema.typeOf(field_ptr)) != .pointer) return sema.fail(block, src, "expected pointer, found '{f}'", .{sema.fmtType(sema.typeOf(field_ptr))});
+    if (Type.class(ip, sema.typeOf(field_ptr)) != .pointer) return sema.fail(block, sema.callArgSrc(src, false, 1), "expected pointer type, found '{f}'", .{sema.fmtType(sema.typeOf(field_ptr))});
     if (sema.resolveValue(field_ptr)) |v| if (!sema.isUndef(v)) {
         const k = ip.keyPayload(.ptr, v);
         const of_parent = k.base == .field and k.byte_offset == 0 and
@@ -7121,9 +7169,11 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         i += 2;
         if (host_size != 0) {
             try sema.resolveLayout(block, src, elem);
-            const bits = Type.packedBits(sema.ip, elem) orelse return sema.fail(block, src, "bit-pointer cannot refer to value of type '{f}'", .{sema.fmtType(elem)});
-            if (bit_offset >= host_size * 8) return sema.fail(block, src, "packed type '{f}' at bit offset {d} starts {d} bits after the end of a {d} byte host integer", .{ sema.fmtType(elem), bit_offset, bit_offset - host_size * 8, host_size });
-            if (bits > host_size * 8 - bit_offset) return sema.fail(block, src, "packed type '{f}' at bit offset {d} ends {d} bits after the end of a {d} byte host integer", .{ sema.fmtType(elem), bit_offset, bits - (host_size * 8 - bit_offset), host_size });
+            const elem_src: Src = .{ .base = src.base, .loc = .{ .array_elem = extra.data.src_node } };
+            const bit_src: Src = .{ .base = src.base, .loc = .{ .ptr_part = .{ .node = extra.data.src_node, .part = .bit_offset } } };
+            const bits = sema.packedFieldBits(elem) orelse return sema.failUnpackable(block, elem_src, "bit-pointer cannot refer to value of type '{f}'", elem);
+            if (bit_offset >= host_size * 8) return sema.fail(block, bit_src, "packed type '{f}' at bit offset {d} starts {d} bits after the end of a {d} byte host integer", .{ sema.fmtType(elem), bit_offset, bit_offset - host_size * 8, host_size });
+            if (bits > host_size * 8 - bit_offset) return sema.fail(block, bit_src, "packed type '{f}' at bit offset {d} ends {d} bits after the end of a {d} byte host integer", .{ sema.fmtType(elem), bit_offset, bits - (host_size * 8 - bit_offset), host_size });
         }
         packed_offset = .{ .bit_offset = @intCast(bit_offset), .host_size = @intCast(host_size) };
     }
@@ -13153,7 +13203,7 @@ fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) 
     const sentinel_opt = try sema.resolveConstValue(block, src, try sema.coerce(block, try sema.optType(elem_ty), sema.resolveInst(extra.sentinel), src), "pointer sentinel value must be comptime-known");
     if (sema.isUndef(sentinel_opt)) return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
     const sentinel = ip.keyPayload(.opt, sentinel_opt).val;
-    if (sentinel != .none and (size == .one or size == .c)) return sema.fail(block, src, "sentinels are only allowed on slices and unknown-length pointers", .{});
+    if (sentinel != .none and (size == .one or size == .c)) return sema.fail(block, sema.callArgSrc(src, false, 3), "sentinels are only allowed on slices and unknown-length pointers", .{});
     if (sentinel != .none) try sema.checkSentinelType(block, sema.callArgSrc(src, false, 3), elem_ty);
     return .fromInterned(try sema.ptrType(.{
         .child = elem_ty,
@@ -16343,7 +16393,7 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
     // upstream.
     if (sema.resolveValue(operand)) |v| if (sema.isUndef(v) and Type.class(ip, sema.typeOf(operand)) == .pointer and Type.class(ip, dest_ty) == .pointer) {
         const d = Type.ptrInfo(ip, dest_ty);
-        if (!d.flags.is_allowzero and d.flags.size != .c) return sema.fail(block, sema.callArgSrc(src, false, 0), "use of undefined value here causes illegal behavior", .{});
+        if (!d.flags.is_allowzero and d.flags.size != .c) return sema.fail(block, src.castOperand(), "use of undefined value here causes illegal behavior", .{});
     };
     const optPtr = struct {
         fn f(p_ip: *InternPool, ty: Index) bool {
@@ -16361,7 +16411,7 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
         const az = Type.ptrInfo(ip, dest_ty).flags.is_allowzero;
         if (sema.resolveValue(operand)) |v| {
             if (!sema.isUndef(v) and ip.keyPayload(.opt, v).val == .none) {
-                if (!az) return sema.fail(block, src, "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
+                if (!az) return sema.fail(block, src.castOperand(), "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
                 return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = dest_ty, .base = .int, .byte_offset = 0 } }));
             }
         } else if (block.want_safety and !az) {
@@ -16380,7 +16430,7 @@ fn analyzePtrCast(sema: *Sema, block: *Block, inst: Zir.Inst.Index, flags: Zir.I
             return sema.addTyOp(block, .bitcast, dest_ty, operand);
         }
         if (sema.resolveValue(operand)) |v| {
-            if (!sema.isUndef(v) and ip.keyPayload(.opt, v).val == .none) return sema.fail(block, src, "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
+            if (!sema.isUndef(v) and ip.keyPayload(.opt, v).val == .none) return sema.fail(block, src.castOperand(), "null pointer casted to type '{f}'", .{sema.fmtType(dest_ty)});
         } else if (block.want_safety and Type.class(ip, dest_ty) == .pointer and !Type.ptrInfo(ip, dest_ty).flags.is_allowzero) {
             try sema.requireRuntime(block, src);
             const ok = try sema.addUnOp(block, .is_non_null, operand);
@@ -16434,7 +16484,9 @@ fn pointerSizeString(size: std.lang.Type.Pointer.Size) []const u8 {
 fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCastFlags, dest_ty: Index, operand: Ref) CompileError!Ref {
     const ip = sema.ip;
     const src_ty = sema.typeOf(operand);
-    if (Type.class(sema.ip, dest_ty) != .pointer or Type.class(sema.ip, src_ty) != .pointer)
+    if (Type.class(sema.ip, src_ty) != .pointer)
+        return sema.fail(block, src.castOperand(), "expected pointer type, found '{f}'", .{sema.fmtType(src_ty)});
+    if (Type.class(sema.ip, dest_ty) != .pointer)
         return sema.failUnsupported(block, src, "pointer casts involving non-pointer types");
     const d = Type.ptrInfo(sema.ip, dest_ty);
     const s = Type.ptrInfo(sema.ip, src_ty);
@@ -16897,7 +16949,7 @@ fn zirBuiltinCall(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
     }
     const args_tuple = sema.resolveInst(extra.args);
     const args_ty = sema.typeOf(args_tuple);
-    if (ip.keyTag(args_ty) != .tuple_type) return sema.fail(block, src, "expected a tuple, found '{f}'", .{sema.fmtType(args_ty)});
+    if (ip.keyTag(args_ty) != .tuple_type) return sema.fail(block, sema.callArgSrc(src, false, 2), "expected a tuple, found '{f}'", .{sema.fmtType(args_ty)});
     const n = ip.keyPayload(.tuple_type, args_ty).types.len;
     const args = try sema.arena.alloc(Ref, n);
     for (args, 0..) |*a, k| a.* = try sema.tupleField(block, args_tuple, @intCast(k));
@@ -17107,7 +17159,7 @@ fn analyzeCall(
                     try sema.inst_map.put(sema.gpa, zir_args.call_inst, .fromInterned(.generic_poison_type));
                     const arg = try sema.resolveInlineBody(block, body, zir_args.call_inst);
                     if (sema.isErrorType(sema.typeOf(arg))) sema.any_arg_is_error = true;
-                    args[arg_i] = try sema.coerceVarArg(block, src, arg);
+                    args[arg_i] = try sema.coerceVarArg(block, sema.callArgSrc(src, first_arg != .none, arg_i), arg);
                     arg_i += 1;
                     continue;
                 }
@@ -17142,7 +17194,8 @@ fn analyzeCall(
                 try sema.genericParamType(block, src, func, args[0..arg_i])
             else
                 fn_ty.param_types[arg_i];
-            args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerceCtx(block, param_ty, arg, sema.callArgSrc(src, first_arg != .none, arg_i), .{ .param = .{ .func = func, .index = arg_i } });
+            const arg_src: Src = if (src.nodeOffset()) |off| .{ .base = src.base, .loc = .{ .call_tuple_elem = .{ .node = off, .index = @intCast(arg_i) } } } else src;
+            args[arg_i] = if (param_ty == .generic_poison_type) arg else try sema.coerceCtx(block, param_ty, arg, arg_src, .{ .param = .{ .func = func, .index = arg_i } });
             arg_i += 1;
         },
     }
