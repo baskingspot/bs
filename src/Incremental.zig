@@ -75,6 +75,11 @@ donor_key: Hash,
 donors: bool = true,
 /// The name of the donor `prev` is, if it is one.
 donor: ?[donor_name_len]u8 = null,
+/// The program's part of its donors' names (`donorTag`), set by
+/// `useDonor` and `startRecord`.
+donor_tag: [16]u8 = @splat('0'),
+/// What `donorTag` takes from the command: the subcommand and `--name`.
+donor_tag_seed: u64,
 /// `ZAP_CACHE_TIMING`: print where the cache's time goes.
 timing: bool,
 /// `ZAP_CACHE_CHECK`: check that the last manifest's reverse edges predict
@@ -162,6 +167,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .lock = lock,
         .store_seed = store_seed,
         .donor_key = try donorKey(gpa, io, store_seed, zig_lib_dir, root_name, tests_std, args),
+        .donor_tag_seed = donorTagSeed(args),
         .arch = if (std.mem.startsWith(u8, target, "aarch64")) .aarch64 else .x86_64,
         .build_start = build_start,
         .timing = timing,
@@ -814,10 +820,13 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
 /// (`publishDonor`), which a first build replays (`useDonor`). Inside the
 /// store's directory, so that its maintenance counts and trims them.
 const donors_path = "zap/store/" ++ Store.donors_dir;
-/// `<donor key, 32 hex digits>-<32 random hex digits>`.
+/// `<donor key, 32 hex digits>-<the program's tag (`donorTag`), 16 hex
+/// digits><16 random hex digits>`.
 const donor_name_len = 65;
-/// Donors kept per donor key; `publishDonor` deletes the oldest past it.
-const max_donors_per_key = 4;
+/// Donors kept per donor key, one per program; `publishDonor` deletes
+/// the oldest past it. Their space counts toward the store's cap like a
+/// pack's (`Store.maintain`); this only bounds `useDonor`'s scan.
+const max_donors_per_key = 128;
 /// A donor's manifest mtime is its last use, renewed at most this often.
 const donor_renew_ns = std.time.ns_per_hour;
 
@@ -878,6 +887,37 @@ fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, r
     return cache.hash(3, std.mem.asBytes(&h.final()));
 }
 
+/// Names the program among the donors of its donor key: a hash of the
+/// subcommand, `--name` (`donorTagSeed`), its main module and its other
+/// modules' names and root files, absolute. The same program built into
+/// another cache directory or output shares it, so that its newer donor
+/// replaces the older; a project's test and executable from one root
+/// file do not. The same project in another worktree does not either,
+/// but its donor is then the one that shares the most files.
+fn donorTag(inc: *const Incremental, fe: *const Frontend) [16]u8 {
+    var h: std.hash.Wyhash = .init(inc.donor_tag_seed);
+    const main = fe.module(fe.main_module);
+    for ([_][]const Frontend.Module{ main[0..1], fe.modules.items }) |mods| for (mods) |*mod| {
+        h.update(mod.name);
+        h.update("\x00");
+        h.update(mod.abs_root_dir orelse mod.root_dir);
+        h.update("\x00");
+        h.update(mod.root_file);
+        h.update("\x00");
+    };
+    return std.fmt.bytesToHex(std.mem.asBytes(&h.final()).*, .lower);
+}
+
+fn donorTagSeed(args: []const []const u8) u64 {
+    var h: std.hash.Wyhash = .init(0x746167);
+    if (args.len != 0) h.update(args[0]);
+    for (args, 0..) |a, i| if (std.mem.eql(u8, a, "--name") and i + 1 < args.len) {
+        h.update("\x00");
+        h.update(args[i + 1]);
+    };
+    return h.final();
+}
+
 fn linkOrCopy(from: Io.Dir, name: []const u8, to: Io.Dir, io: Io) !void {
     from.hardLink(name, to, name, io, .{}) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -896,6 +936,7 @@ fn linkOrCopy(from: Io.Dir, name: []const u8, to: Io.Dir, io: Io) !void {
 /// this build loads is what it shares with the donor, typically std.
 /// Without a donor, or if its packs cannot be linked, the build is cold.
 pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
+    inc.donor_tag = inc.donorTag(fe);
     if (inc.prev != null or !inc.donors or inc.verify == .full) return;
     const gpa = inc.gpa;
     const io = inc.io;
@@ -917,21 +958,43 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
         if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, key_buf.items);
         gop.value_ptr.* = @intCast(fi);
     }
-    const Candidate = struct { name: [donor_name_len]u8, m: Manifest, builtin: bool, lazy: bool, shared: u32, mtime: Io.Timestamp };
+    const Candidate = struct { name: [donor_name_len]u8, m: Manifest, builtin: bool, lazy: bool, own: bool, shared: u32, mtime: Io.Timestamp };
     var candidates: std.ArrayList(Candidate) = .empty;
     defer {
         for (candidates.items) |*c| c.m.close(gpa, io);
         candidates.deinit(gpa);
     }
     const prefix = std.fmt.hex(inc.donor_key);
+    // The program's own donor first: if it can be replayed lazily with
+    // the same builtin, nothing ranks above it, and the others' manifests
+    // stay closed (a key can hold many).
+    var names: std.ArrayList([donor_name_len]u8) = .empty;
+    defer names.deinit(gpa);
     var it = donors.iterate();
     while (it.next(io) catch null) |e| {
         if (e.kind != .directory or e.name.len != donor_name_len or !std.mem.startsWith(u8, e.name, &prefix)) continue;
-        var d = donors.openDir(io, e.name, .{}) catch continue;
+        try names.append(gpa, e.name[0..donor_name_len].*);
+        if (std.mem.eql(u8, e.name[33..49], &inc.donor_tag)) std.mem.swap([donor_name_len]u8, &names.items[0], &names.items[names.items.len - 1]);
+    }
+    for (names.items) |*name| {
+        const own = std.mem.eql(u8, name[33..49], &inc.donor_tag);
+        if (!own and candidates.items.len != 0) {
+            const first = &candidates.items[0];
+            if (first.own and first.builtin and first.lazy and first.shared != 0) break;
+        }
+        var d = donors.openDir(io, name, .{}) catch continue;
         defer d.close(io);
         const stat = d.statFile(io, "manifest", .{}) catch continue;
         var m = (Manifest.open(gpa, io, d) catch continue) orelse continue;
-        var c: Candidate = .{ .name = e.name[0..donor_name_len].*, .m = m, .builtin = false, .lazy = true, .shared = 0, .mtime = stat.mtime };
+        var c: Candidate = .{
+            .name = name.*,
+            .m = m,
+            .builtin = false,
+            .lazy = true,
+            .own = own,
+            .shared = 0,
+            .mtime = stat.mtime,
+        };
         for (0..m.inputCount()) |i| {
             const in, _ = m.input(@intCast(i));
             const fi = by_key.get(m.inputKey(@intCast(i))) orelse {
@@ -956,6 +1019,8 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
             if (a.builtin != b.builtin) return a.builtin;
             // One this build can replay lazily (`Replay.donorEager`).
             if (a.lazy != b.lazy) return a.lazy;
+            // This program's own, made from the same root file.
+            if (a.own != b.own) return a.own;
             if (a.shared != b.shared) return a.shared > b.shared;
             return a.mtime.compare(.gt, b.mtime);
         }
@@ -971,8 +1036,8 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
         } else true;
         if (!linked) continue;
         if (c.mtime.durationTo(Io.Clock.real.now(io)).toNanoseconds() > donor_renew_ns) d.setTimestampsNow(io, "manifest", .{}) catch {};
-        if (inc.timing) std.debug.print("cache: first build: replaying donor {s} ({d} of its {d} inputs are this build's, builtin {s}; {d} candidates) in {d:.2} ms\n", .{
-            &c.name, c.shared, c.m.inputCount(), if (c.builtin) "the same" else "different", candidates.items.len, ms(t0, now(io)),
+        if (inc.timing) std.debug.print("cache: first build: replaying donor {s}, {s} ({d} of its {d} inputs are this build's, builtin {s}; {d} candidates) in {d:.2} ms\n", .{
+            &c.name, if (c.own) "the program's own" else "another program's", c.shared, c.m.inputCount(), if (c.builtin) "the same" else "different", candidates.items.len, ms(t0, now(io)),
         });
         inc.prev = c.m;
         inc.donor = c.name;
@@ -1060,7 +1125,7 @@ fn publishDonor(inc: *Incremental, base_names: []const []const u8) !void {
     var rand: [16]u8 = undefined;
     io.random(&rand);
     var name: [donor_name_len]u8 = undefined;
-    _ = std.fmt.bufPrint(&name, "{s}-{s}", .{ &std.fmt.hex(inc.donor_key), &std.fmt.bytesToHex(rand, .lower) }) catch unreachable;
+    _ = std.fmt.bufPrint(&name, "{s}-{s}{s}", .{ &std.fmt.hex(inc.donor_key), &inc.donor_tag, &std.fmt.bytesToHex(rand[0..8].*, .lower) }) catch unreachable;
     var tmp_name: [Store.donor_tmp_prefix.len + 32]u8 = undefined;
     _ = std.fmt.bufPrint(&tmp_name, "{s}{s}", .{ Store.donor_tmp_prefix, &std.fmt.bytesToHex(rand, .lower) }) catch unreachable;
     {
@@ -1074,25 +1139,36 @@ fn publishDonor(inc: *Incremental, base_names: []const []const u8) !void {
         donors.deleteTree(io, &tmp_name) catch {};
         return err;
     };
-    // The oldest donors of this key past the limit.
+    // This program's older donors, which this one supersedes: they would
+    // take the slots of other programs' (a program's own donor is the one
+    // its first build in a fresh cache can replay lazily). Then
+    // the oldest donors of this key past the limit.
     const Old = struct { name: [donor_name_len]u8, mtime: Io.Timestamp };
     var same: std.ArrayList(Old) = .empty;
     defer same.deinit(gpa);
+    var superseded: std.ArrayList([donor_name_len]u8) = .empty;
+    defer superseded.deinit(gpa);
     var it = donors.iterate();
     while (it.next(io) catch null) |e| {
         if (e.kind != .directory or e.name.len != donor_name_len or !std.mem.startsWith(u8, e.name, name[0..32])) continue;
         var path: [donor_name_len + "/manifest".len]u8 = undefined;
         _ = std.fmt.bufPrint(&path, "{s}/manifest", .{e.name}) catch unreachable;
+        if (std.mem.eql(u8, e.name, &name)) continue;
+        if (std.mem.eql(u8, e.name[33..49], &inc.donor_tag)) {
+            try superseded.append(gpa, e.name[0..donor_name_len].*);
+            continue;
+        }
         const stat = donors.statFile(io, &path, .{}) catch continue;
         try same.append(gpa, .{ .name = e.name[0..donor_name_len].*, .mtime = stat.mtime });
     }
-    if (same.items.len <= max_donors_per_key) return;
+    for (superseded.items) |*o| donors.deleteTree(io, o) catch {};
+    if (same.items.len < max_donors_per_key) return;
     std.mem.sortUnstable(Old, same.items, {}, struct {
         fn newer(_: void, a: Old, b: Old) bool {
             return a.mtime.compare(.gt, b.mtime);
         }
     }.newer);
-    for (same.items[max_donors_per_key..]) |o| donors.deleteTree(io, &o.name) catch {};
+    for (same.items[max_donors_per_key - 1 ..]) |o| donors.deleteTree(io, &o.name) catch {};
 }
 
 /// Assigns the last build's error codes first, so that they keep their
@@ -1680,6 +1756,7 @@ fn defaultsResultHash(ip: *const InternPool, ty: InternPool.Index) Hash {
 /// discards it. `fe`, `zcu`, and `emit` must not change until then.
 pub fn startRecord(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) void {
     inc.forgetOutput();
+    inc.donor_tag = inc.donorTag(fe);
     if (inc.timing) if (inc.replay) |r| r.printStats();
     std.debug.assert(inc.recording == null);
     inc.recording = inc.io.async(record, .{ inc, fe, zcu, emit });

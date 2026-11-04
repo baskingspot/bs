@@ -823,6 +823,19 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&cache.step);
     }
 
+    // Donors kept per program: test/run/donor_own.sh.
+    {
+        const donor = b.addSystemCommand(&.{"sh"});
+        donor.setName("zap donor own");
+        donor.addFileArg(b.path("test/run/donor_own.sh"));
+        donor.addArtifactArg(zap);
+        _ = donor.addOutputDirectoryArg("work");
+        donor.addDirectoryArg(std_zir);
+        donor.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        takes(b, &donor.step, 15);
+        test_step.dependOn(&donor.step);
+    }
+
     const zap_run = b.addRunArtifact(zap);
     zap_run.setName("zap run args");
     zap_run.addArg("run");

@@ -4435,9 +4435,17 @@ analyzing everything.
   built under a `tmp-` name and renamed into place, so readers see only
   complete donors. Every atom of a full record is in a store pack, so the
   donor needs nothing from the compilation's directory, and its links keep
-  the packs alive when the store merges or trims them. The newest 4 per
-  donor key are kept. A lazy build does not publish: its atoms are in the
-  compilation's own pack.
+  the packs alive when the store merges or trims them. A donor's name
+  carries its program's tag (`donorTag`): a hash of the subcommand,
+  `--name`, and the main module's and every module's name and absolute
+  root file. A program's new donor replaces its older ones, so that a
+  project that records often does not take other projects' slots; the
+  newest 128 per donor key are kept, and the store's cap and trim bound
+  their space as they do the packs'. A lazy build does not publish: its
+  atoms are in the compilation's own pack. (With 4 per key, a corpus run
+  of 80 programs, most sharing one key, evicted every program's own
+  donor, so each next first build replayed a neighbour's eagerly:
+  ghostty-vt-test 11.4 s instead of 0.18 s lazily.)
 - *The donor key* (`donorKey`): the store seed (zap and the target), the
   std directory, and the options Zcu reads without recording a dependency
   (`-fsingle-threaded`, which decides whether declarations are
@@ -4458,9 +4466,11 @@ analyzing everything.
   `-ffuzz` does, when they land.
 - *Choosing.* `useDonor` runs after the frontend: among the donors of
   this compilation's key, it takes the one whose builtin module is this
-  build's, then one it can replay lazily (below), then the one sharing
-  the most input files (same path, same key, same content), then the
-  newest. It links the donor's packs into
+  build's, then one it can replay lazily (below), then the program's own
+  (same tag), then the one sharing the most input files (same path, same
+  key, same content), then the newest. The program's own donor is read
+  first; if it has this build's builtin and can be replayed lazily, the
+  others are not opened. It links the donor's packs into
   the compilation's directory from the donor's own links; if that fails
   (trimmed concurrently), it tries the next, and without one the build is
   cold. Ranking reads each candidate's input and path tables, well under
