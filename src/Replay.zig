@@ -53,6 +53,9 @@ changed: std.ArrayList(seeds.Changed) = .empty,
 /// Each input's file in this build, once looked up: its index + 1, or 0
 /// if not looked up yet, or `no_file`.
 input_files: []u32,
+/// How many of the frontend's files the `no_file` entries of
+/// `input_files` looked among: compiler_rt's files load during analysis.
+input_files_seen: usize = 0,
 /// Each file's input, once looked up.
 file_inputs: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 /// Inputs by path.
@@ -584,8 +587,24 @@ fn inputOf(r: *Replay, file: u32) ?u32 {
     Incremental.inputPath(r.gpa, &path_buf, r.zcu.fe, f.module, f.sub_path) catch return null;
     const i = r.by_path.get(path_buf.items) orelse return null;
     r.file_inputs.put(r.gpa, file, i) catch return null;
-    if (r.input_files[i] == 0) r.input_files[i] = file + 1;
+    if (r.input_files[i] == 0 or r.input_files[i] == no_file) r.input_files[i] = file + 1;
     return i;
+}
+
+/// Whether node `node` is in a compiler_rt file this build has not loaded
+/// yet. A unit that requested a compiler_rt helper reaches the helper's
+/// function and its file's root namespace (`Incremental.addRtReach`).
+/// Replaying the unit's request (its `rt` reference) brings both back
+/// once analysis resolves the request, which loads the file. Replay
+/// cannot load it itself: files load only when the pool drains, since
+/// CodeGen workers read `Frontend.files`.
+fn inUnloadedCompilerRt(r: *Replay, node: u32) bool {
+    const input = r.m.source(node).input;
+    if (input == Manifest.Source.no_input) return false;
+    const key = r.m.inputKey(input);
+    const name = r.zcu.fe.module(.compiler_rt).name;
+    if (!std.mem.startsWith(u8, key, name) or key.len == name.len or key[name.len] != ':') return false;
+    return r.fileOf(input) == null;
 }
 
 const Green = struct {
@@ -704,6 +723,7 @@ fn resolveRefs(r: *Replay, g: Green, is_func: bool) !?[]Ref {
     defer out.deinit(r.gpa);
     for (r.m.nodeRefs(g.node)) |ref| switch (ref.kind) {
         .func => {
+            if (r.inUnloadedCompilerRt(ref.value)) continue;
             const dep = try r.dependee(ref.value, .func) orelse return null;
             try out.append(r.gpa, .{ .func = dep.func_body });
         },
@@ -713,6 +733,7 @@ fn resolveRefs(r: *Replay, g: Green, is_func: bool) !?[]Ref {
             try out.append(r.gpa, .{ .nav = dep.nav_val });
         },
         .effects => {
+            if (r.inUnloadedCompilerRt(ref.value)) continue;
             const dep = try r.dependee(ref.value, .namespace) orelse return null;
             try out.append(r.gpa, .{ .effects = r.zcu.namespaces.items[dep.namespace].owner_type });
         },
@@ -1369,6 +1390,15 @@ fn fullBuild(r: *const Replay, why: []const u8) error{NamesFullBuild} {
 
 pub fn fileOf(r: *Replay, input: u32) ?u32 {
     if (input >= r.input_files.len) return null;
+    // Files loaded since the `no_file` entries looked (compiler_rt's) may
+    // be their inputs.
+    const files = r.zcu.fe.files.items.len;
+    if (files != r.input_files_seen) {
+        for (r.input_files) |*v| if (v.* == no_file) {
+            v.* = 0;
+        };
+        r.input_files_seen = files;
+    }
     if (r.input_files[input] == 0) {
         // Loaded since `create` (compiler_rt), or not at all.
         r.input_files[input] = no_file;

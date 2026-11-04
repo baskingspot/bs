@@ -3054,7 +3054,11 @@ value model:
   bodies"); it also keeps file loads away from running CodeGen workers,
   which read `Frontend.files`. `Zcu.analyzeAll` resolves each new request
   (the file's root type, the declaration by name, its value) and queues
-  the function like any other. Helpers are named by declaration,
+  the function like any other. A recorded unit that requested a helper
+  also reaches the helper's function and its file's root namespace
+  (`addRtReach`). Replay skips those two references while the helper's
+  file is not loaded yet, since only analysis may load it: the replayed
+  request brings them back. Helpers are named by declaration,
   not by exported symbol (`__cmptf2` serves `__lttf2`, `fmodq` is exported
   as `fmodf128`).
 - Externs and the link resolve names compiler_rt exports to its functions
