@@ -2301,7 +2301,11 @@ and worktrees, so the store and donors can dedup. Input sections map to
   entries, ordered by their priority suffix as ld orders them. The
   linker defines `__init_array_start`/`__init_array_end` and the others
   as section bounds, as for the sancov sections, and dynamic executables
-  get DT_INIT_ARRAY/DT_FINI_ARRAY.
+  get DT_INIT_ARRAY/DT_FINI_ARRAY and their sizes from
+  `ElfDynamic.writeDynamic`: from glibc 2.34 on, ld.so runs an
+  executable's init arrays from .dynamic, and the C thread's start file
+  passes null init and fini to `__libc_start_main`, as glibc's own crt1.o
+  does.
 - Non-allocated sections are dropped (`.comment`, `.note.*`, `.group`,
   `.llvm_addrsig`), except `.eh_frame` and `.debug_*` (stage B). An
   object without `.note.GNU-stack` does not make zap's stack executable.
