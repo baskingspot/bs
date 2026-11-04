@@ -144,11 +144,6 @@ error_values: std.ArrayList(Elf.Value) = .empty,
 input_symbols: []const Elf.LocalSymbol = &.{},
 /// Their unwind and debug sections (`Elf.Options.input_sections`).
 input_sections: []const Elf.InputSection = &.{},
-/// The range of `atoms` that `convertInputs` added: its `.link` atoms are
-/// the inputs' and glibc data copies, which the cache leaves out of its
-/// records (every build with inputs converts them again); others are
-/// CodeGen's, merged meanwhile.
-input_atoms: [2]u32 = .{ 0, 0 },
 /// Time spent in `CodeGen.generate`, for `ZAP_TIMING`.
 codegen_ns: u64 = 0,
 /// `ZAP_BENCH_CODEGEN`: a copy of every function's IR, which
@@ -376,6 +371,11 @@ pub const Owner = union(enum) {
     content,
     /// Code the link needs regardless of units (the error name table).
     link,
+    /// An executable's object and archive inputs, converted, and the
+    /// glibc data they copy (`convertInputs`): every build with inputs
+    /// converts them again, so the cache records none, and they link
+    /// last, where a relink from the cache appends them.
+    input,
 };
 
 const UavMemo = struct { key: SymbolKey, refs_start: u32, refs_len: u32, uses_start: u32, uses_len: u32 };
@@ -872,8 +872,8 @@ fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
     const converted = try in.convert(InputResolver{ .emit = emit });
     for (in.errors.items) |msg| try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{msg});
     if (in.errors.items.len != 0) return false;
-    emit.input_atoms[0] = @intCast(emit.atoms.items.len);
-    defer emit.input_atoms[1] = @intCast(emit.atoms.items.len);
+    emit.owner = .input;
+    defer emit.owner = .link;
     for (converted.atoms) |atom| try emit.addAtom(atom);
     for (emit.copies.keys(), emit.copies.values()) |name, size| try emit.addAtom(.{
         .key = importKey(name),
@@ -1096,7 +1096,9 @@ pub fn finish(emit: *Emit) !bool {
     // Before the declarations: a slot can request an exported one.
     if (!try emit.lowerExternSlots()) return false;
     if (emit.inputs) |in| if (!try emit.convertInputs(in)) return false;
-    if (emit.obj) try emit.findExports();
+    // An executable's too, with inputs: the cache resolves their
+    // references to Zig's exports again when it relinks.
+    if (emit.obj or emit.inputs != null) try emit.findExports();
     try emit.lowerNavs();
     if (emit.uses_error_names) try emit.emitErrorNameTable();
 
@@ -1177,7 +1179,7 @@ fn nameAtoms(emit: *Emit) !void {
                 .func => |f| if (atom.section == .text) .{ ip.keyPayload(.func, f).owner_nav, f } else continue,
                 else => continue,
             },
-            .content, .link => continue,
+            .content, .link, .input => continue,
         };
         const generic = func_index != .none and ip.keyPayload(.func, func_index).generic_owner != .none;
         if (func_index != .none and !generic) if (exported.get(nav_index)) |name| {
@@ -1265,7 +1267,7 @@ fn addRef(emit: *Emit, ref: @FieldType(UnitRef, "ref")) !void {
     switch (emit.owner) {
         .unit => |u| try emit.unit_refs.append(emit.gpa, .{ .unit = u, .ref = ref }),
         .link => try emit.link_refs.append(emit.gpa, ref),
-        .content => {},
+        .content, .input => {},
     }
     if (emit.uav_capturing != 0) try emit.uav_refs.append(emit.gpa, ref);
 }
@@ -1275,7 +1277,7 @@ fn addContentUse(emit: *Emit, key: SymbolKey) !void {
     switch (emit.owner) {
         .unit => |u| try emit.content_uses.append(emit.gpa, .{ .unit = u, .key = key }),
         .link => try emit.link_content_uses.append(emit.gpa, key),
-        .content => {},
+        .content, .input => {},
     }
     if (emit.uav_capturing != 0) try emit.uav_uses.append(emit.gpa, key);
 }
@@ -1478,7 +1480,7 @@ fn sectionBound(name: []const u8) ?SymbolKey {
 /// (`__init_array_start` and the others). Only with object inputs, which
 /// are what fill the arrays: without them std.start's weak references
 /// stay null, and its outputs stay as they were.
-fn arrayBound(name: []const u8) ?SymbolKey {
+pub fn arrayBound(name: []const u8) ?SymbolKey {
     inline for (.{ Atom.Section.preinit_array, Atom.Section.init_array, Atom.Section.fini_array }) |s| {
         if (std.mem.eql(u8, name, "__" ++ @tagName(s) ++ "_start")) return .sectionBound(s, .start);
         if (std.mem.eql(u8, name, "__" ++ @tagName(s) ++ "_end")) return .sectionBound(s, .stop);
@@ -1555,8 +1557,9 @@ fn appendAtom(emit: *Emit, atom: Atom) !void {
 }
 
 /// Reorders atoms so that each owner's are adjacent, owners sorted by the
-/// key of their first atom with the link's own atoms last, and drops atoms
-/// whose key an earlier one has, with their debug entries. The order is
+/// key of their first atom with the link's own atoms and then the inputs'
+/// last, and drops atoms whose key an earlier one has, with their debug
+/// entries. The order is
 /// then a function of the atoms and their owners, not of the order units
 /// were analyzed or loaded in, so a build that loads units from the cache
 /// links the same bytes as one that analyzes them all. That is also the
@@ -1565,7 +1568,7 @@ fn appendAtom(emit: *Emit, atom: Atom) !void {
 /// input positions, so a fresh link of any other order or with duplicates
 /// could differ from a relink in padding.
 pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.ArrayList(Owner), debug: *std.ArrayList(Atom.Debug)) !void {
-    const Group = union(enum) { unit: Zcu.AnalUnit, content: SymbolKey, link };
+    const Group = union(enum) { unit: Zcu.AnalUnit, content: SymbolKey, link, input };
     const dropped = std.math.maxInt(u32);
     const n = atoms.items.len;
     // Each atom's group.
@@ -1578,6 +1581,7 @@ pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.Ar
             .unit => |u| .{ .unit = u },
             .content => .{ .content = a.key },
             .link => .link,
+            .input => .input,
         });
         g.* = @intCast(gop.index);
     }
@@ -1597,9 +1601,9 @@ pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.Ar
             next[g] += 1;
         }
     }
-    // The groups by their atoms' keys, the link's last. Two owners whose
-    // atoms all have the same keys are told apart by owner, which only
-    // the dropping of duplicates below can see.
+    // The groups by their atoms' keys, the link's and the inputs' last.
+    // Two owners whose atoms all have the same keys are told apart by
+    // owner, which only the dropping of duplicates below can see.
     const order = try gpa.alloc(u32, groups.count());
     defer gpa.free(order);
     for (order, 0..) |*o, i| o.* = @intCast(i);
@@ -1612,6 +1616,7 @@ pub fn groupByOwner(gpa: Allocator, atoms: *std.ArrayList(Atom), owners: *std.Ar
         fn lessThan(c: @This(), x: u32, y: u32) bool {
             const gx = c.groups[x];
             const gy = c.groups[y];
+            if ((gx == .input) != (gy == .input)) return gy == .input;
             if ((gx == .link) != (gy == .link)) return gy == .link;
             const ax = c.by_group[c.starts[x]..c.starts[x + 1]];
             const ay = c.by_group[c.starts[y]..c.starts[y + 1]];

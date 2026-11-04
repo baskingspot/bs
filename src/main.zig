@@ -574,6 +574,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     // While Clang compiles a C source, its object is not yet what the
     // build links, so the build cannot be the last one.
     const c_compiling = if (c_batch) |b| b.misses != 0 else false;
+    if (inc_opt) |i| i.link_objects_pending = c_compiling;
     if (inc_opt) |i| if (!c_compiling and try i.relinkIfUnchanged(Io.Dir.cwd(), out_path.?)) {
         // The C objects come after the arguments' link inputs. They are
         // the records' outputs; the build reports the C sources and their
@@ -699,20 +700,6 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     }
     emit.shared_libs = shared_libs;
     var link_inputs: ElfInput = .{ .arena = arena };
-    if (opts.link_inputs.len != 0) {
-        for (opts.link_inputs) |path| {
-            const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
-                fatal("unable to read '{s}': {t}", .{ path, err });
-            const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
-            (if (is_archive) link_inputs.addArchive(path, bytes) else link_inputs.addObject(path, bytes)) catch |err| switch (err) {
-                error.OutOfMemory => |e| return e,
-                error.InvalidObject => fatal("'{s}' is not an x86_64 ELF relocatable object", .{path}),
-                error.InvalidArchive => fatal("'{s}' is not a valid archive", .{path}),
-                error.ThinArchive => fatal("zap does not link thin archives ('{s}') yet", .{path}),
-            };
-        }
-        emit.inputs = &link_inputs;
-    }
     // An executable links the C objects and the C++ runtime libraries; a
     // static library holds the objects as members.
     if (c_batch) |b| if (!emit.obj) {
@@ -734,6 +721,22 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     try emit.startPool(@max(threads, 1) - 1, fuzz);
     const sema_node = prog.start("Analyze and Generate Code", 0);
     if (inc_opt) |i| try i.beginReplay(&fe, &zcu, &emit, replay_mode);
+    // A lazy edit build relinks from the manifest, which reads the
+    // objects itself (`Incremental.linkFrom`).
+    if (opts.link_inputs.len != 0 and !(if (zcu.replay) |r| r.lazy else false)) {
+        for (opts.link_inputs) |path| {
+            const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
+                fatal("unable to read '{s}': {t}", .{ path, err });
+            const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
+            (if (is_archive) link_inputs.addArchive(path, bytes) else link_inputs.addObject(path, bytes)) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.InvalidObject => fatal("'{s}' is not an x86_64 ELF relocatable object", .{path}),
+                error.InvalidArchive => fatal("'{s}' is not a valid archive", .{path}),
+                error.ThinArchive => fatal("zap does not link thin archives ('{s}') yet", .{path}),
+            };
+        }
+        emit.inputs = &link_inputs;
+    }
     try zcu.analyzeAll(&emit);
     if (bench_runs != 0) try emit.benchCodegen(bench_runs);
     stages.markSplit("sema", "codegen", emit.codegen_ns);

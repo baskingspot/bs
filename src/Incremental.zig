@@ -38,6 +38,7 @@ const ElfObject = @import("link/ElfObject.zig");
 const ElfDynamic = @import("link/ElfDynamic.zig");
 const Glibc = @import("link/Glibc.zig");
 const Archive = @import("link/Archive.zig");
+const ElfInput = @import("link/ElfInput.zig");
 const Replay = @import("Replay.zig");
 
 const Incremental = @This();
@@ -98,10 +99,15 @@ glibc_lib_dir: []const u8 = "",
 glibc: ?*const Glibc = null,
 /// An executable's object and archive inputs, absolute, in command-line
 /// order: link-only inputs of the manifest (`link_input_prefix`), which
-/// no node depends on. Their atoms are not recorded, and a build with
-/// them replays eagerly, so that `Emit.finish` converts them and binds
-/// the externs again; with nothing changed it skips the link as any.
+/// no node depends on. Their atoms are not recorded: a relink converts
+/// them again (`linkWithInputs`), and a build after one changed replays
+/// eagerly (`linkInputsChanged`), so that `Emit.finish` binds the externs
+/// again.
 link_objects: []const []const u8 = &.{},
+/// Some of `link_objects` are still being made (a C source's record
+/// missed, and upstream's Clang is compiling it), so they may differ from
+/// the manifest's: the build replays eagerly, as after an edited object.
+link_objects_pending: bool = false,
 /// Such an executable's DT_RUNPATH (`Options.runpath` in main.zig).
 runpath: ?[]const u8 = null,
 /// Whether a build that does not relink renews the output's mtime, as a
@@ -242,12 +248,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     defer if (restat) |*d| d.deinit();
     for (changed.items) |i| {
         const in, const path = m.input(i);
-        const same = same: {
-            const src = Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch break :same false;
-            defer gpa.free(src);
-            break :same @as(Hash, @bitCast(Frontend.hashSource(src))) == in.content_hash;
-        };
-        if (!same) {
+        if (!try inc.sameContents(m, i)) {
             if (inc.timing) std.debug.print("cache: {d} inputs changed, first {s}\n", .{ changed.items.len, path });
             return false;
         }
@@ -263,14 +264,34 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         if (inc.timing) std.debug.print("cache: no input changed and the output is as the last link left it; not relinking ({d:.2} ms, {d} rehashed)\n", .{ ms(t0, now(io)), changed.items.len });
         return true;
     }
-    // The inputs' atoms and the externs bound to them are not recorded.
-    if (inc.link_objects.len != 0) return inc.noRelink("the link has object or archive inputs", .{});
-
     const linked = (try inc.linkFrom(m, out_dir, sub_path)) orelse return false;
     if (inc.timing) std.debug.print("cache: no input changed; relinked {d} atoms in {d:.2} ms (manifest and {d} stats {d:.2}, {d} rehashed; packs mapped and input gathered {d:.2}, link {d:.2})\n", .{
         linked.atoms, ms(t0, now(io)), m.inputCount(), ms(t0, t1), changed.items.len, ms(t1, linked.gathered), ms(linked.gathered, now(io)),
     });
     return true;
+}
+
+/// Whether manifest `m`'s input `i`, whose stat changed, still has the
+/// contents the manifest records.
+fn sameContents(inc: *const Incremental, m: *const Manifest, i: u32) !bool {
+    const in, const path = m.input(i);
+    const src = Io.Dir.cwd().readFileAlloc(inc.io, path, inc.gpa, .unlimited) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => return false,
+    };
+    defer inc.gpa.free(src);
+    return @as(Hash, @bitCast(Frontend.hashSource(src))) == in.content_hash;
+}
+
+/// Whether one of manifest `m`'s link-only inputs changed: its objects may
+/// then need compiler_rt functions the last build did not generate, or
+/// bind the externs elsewhere, which only an eager build finds out.
+fn linkInputsChanged(inc: *const Incremental, m: *const Manifest) !bool {
+    var changed: std.ArrayList(u32) = .empty;
+    defer changed.deinit(inc.gpa);
+    try m.changedInputs(inc.gpa, inc.io, &changed);
+    for (changed.items) |i| if (isLinkInput(m.inputKey(i)) and !try inc.sameContents(m, i)) return true;
+    return false;
 }
 
 /// The file in the compilation's directory that holds the stat the last
@@ -380,15 +401,16 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
     var dynamic: ElfDynamic.Options = .{};
     var dynamic_imports: []u32 = &.{};
     const exe_dyn = inc.output == .exe and inc.glibc_version != null;
-    if (exe_dyn) {
-        const g = inc.glibc orelse g: {
-            const path = try std.fs.path.join(arena, &.{ inc.glibc_lib_dir, Glibc.abilists_path });
-            const contents = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err|
-                return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
-            glibc_loaded = Glibc.load(gpa, contents, inc.glibc_version.?) catch |err|
-                return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
-            break :g &glibc_loaded.?;
-        };
+    const glibc: ?*const Glibc = if (!exe_dyn) null else inc.glibc orelse g: {
+        const path = try std.fs.path.join(arena, &.{ inc.glibc_lib_dir, Glibc.abilists_path });
+        const contents = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err|
+            return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
+        glibc_loaded = Glibc.load(gpa, contents, inc.glibc_version.?) catch |err|
+            return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
+        break :g &glibc_loaded.?;
+    };
+    if (inc.link_objects.len != 0) return inc.linkWithInputs(arena, m, &input, in.numbered, exports.items, imports.items, glibc, out_dir, sub_path, cwd, gathered);
+    if (glibc) |g| {
         dynamic = g.dynamicOptions(arena, imports.items, &.{}, &.{}) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.NotInGlibc => return inc.noLink("an import glibc does not define", .{}),
@@ -444,6 +466,203 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
 
 const Linked = struct { atoms: usize, gathered: Io.Timestamp };
 
+/// `linkFrom` for an executable with object and archive inputs, whose
+/// atoms the manifest does not hold: it converts them again, as
+/// `Emit.finish` does, and appends them to the manifest's atoms, where a
+/// full build's `groupByOwner` puts them (`Emit.Owner.input`). The objects
+/// are the last full build's (`linkInputsChanged`), so the manifest's
+/// extern slots, compiler_rt functions and imports are what they need.
+/// The link goes by key, which C objects' local symbols need; a keyed
+/// link of the same atoms gives the numbered one's bytes.
+fn linkWithInputs(
+    inc: *Incremental,
+    arena: Allocator,
+    m: *Manifest,
+    pack_atoms: *const Pack.LinkAtoms,
+    numbered: []const Elf.NumberedAtom,
+    exports: []const ElfObject.Export,
+    imports: []ElfObject.Import,
+    glibc: ?*const Glibc,
+    out_dir: Io.Dir,
+    sub_path: []const u8,
+    cwd: []const u8,
+    gathered: Io.Timestamp,
+) !?Linked {
+    const gpa = inc.gpa;
+    const io = inc.io;
+    var objects: ElfInput = .{ .arena = arena };
+    // Mapped, not read: the atoms point into them until the link returns.
+    var maps: std.ArrayList(Io.File.MemoryMap) = .empty;
+    defer for (maps.items) |*mm| mm.destroy(io);
+    for (inc.link_objects) |path| {
+        const bytes = bytes: {
+            const f = Io.Dir.cwd().openFile(io, path, .{}) catch |err| return inc.noLink("{s}: {t}", .{ path, err });
+            defer f.close(io);
+            const len = f.length(io) catch |err| return inc.noLink("{s}: {t}", .{ path, err });
+            if (len == 0) return inc.noLink("{s} is empty", .{path});
+            try maps.ensureUnusedCapacity(arena, 1);
+            maps.appendAssumeCapacity(cache.mapOpenFile(io, f, len, true) catch |err| return inc.noLink("{s}: {t}", .{ path, err }));
+            break :bytes maps.items[maps.items.len - 1].memory;
+        };
+        const is_archive = std.mem.startsWith(u8, bytes, "!<arch>\n") or std.mem.startsWith(u8, bytes, "!<thin>\n");
+        (if (is_archive) objects.addArchive(path, bytes) else objects.addObject(path, bytes)) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => return inc.noLink("{s}: {t}", .{ path, err }),
+        };
+    }
+    // How `Emit.InputResolver` resolves what the objects leave undefined,
+    // from the manifest.
+    const Resolver = struct {
+        exports: *const std.StringHashMapUnmanaged(Atom.SymbolKey),
+        glibc: ?*const Glibc,
+        copies: *std.StringArrayHashMapUnmanaged(u64),
+        arena: Allocator,
+
+        pub fn zigExport(r: @This(), name: []const u8) !?Atom.SymbolKey {
+            return r.exports.get(name);
+        }
+
+        pub fn rtExport(_: @This(), name: []const u8) !?Atom.SymbolKey {
+            if (Emit.arrayBound(name)) |key| return key;
+            const e = Zcu.compilerRtExport(name) orelse return null;
+            var buf: [128]u8 = undefined;
+            return .fromName(Zcu.compilerRtKey(&buf, e.file, e.decl));
+        }
+
+        pub fn importSym(r: @This(), name: []const u8, weak: bool) !?Atom.SymbolKey {
+            _ = weak;
+            const g = r.glibc orelse return null;
+            if (g.get(name) == null) return null;
+            return Emit.importKey(name);
+        }
+
+        pub fn copySym(r: @This(), name: []const u8) !?Atom.SymbolKey {
+            const sym = r.glibc.?.get(name).?;
+            if (!sym.object or sym.size == 0) return null;
+            try r.copies.put(r.arena, try r.arena.dupe(u8, name), sym.size);
+            return Emit.importKey(name);
+        }
+    };
+    var export_keys: std.StringHashMapUnmanaged(Atom.SymbolKey) = .empty;
+    for (exports) |x| _ = try export_keys.getOrPutValue(arena, x.name, x.key);
+    var copies: std.StringArrayHashMapUnmanaged(u64) = .empty;
+    const resolver: Resolver = .{ .exports = &export_keys, .glibc = glibc, .copies = &copies, .arena = arena };
+    // The archive members the Zig code's externs pull: those of the
+    // linked nodes and the link's own atoms.
+    var externs: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (0..m.nodeCount()) |i_usize| {
+        const i: u32 = @intCast(i_usize);
+        if (m.node(i).tag != @backingInt(Tag.link) and (m.atoms(i).len == 0 or m.flags(i).unlinked)) continue;
+        for (m.nodeRefs(i)) |ref| if (ref.kind == .ext or ref.kind == .ext_weak) try externs.put(arena, m.refName(ref.value), {});
+    }
+    _ = try objects.pull(externs.keys(), resolver);
+    const converted = try objects.convert(resolver);
+    if (objects.errors.items.len != 0) return inc.noLink("{s}", .{objects.errors.items[0]});
+
+    // The converted atoms and the glibc data copies, without those whose
+    // key an earlier atom has, as `groupByOwner` drops them.
+    var live = try std.DynamicBitSetUnmanaged.initEmpty(arena, m.symbolLen());
+    for (numbered) |na| live.set(na.symbol);
+    var extra: std.ArrayList(Atom) = try .initCapacity(arena, converted.atoms.len + copies.count());
+    extra.appendSliceAssumeCapacity(converted.atoms);
+    for (copies.keys(), copies.values()) |name, size| extra.appendAssumeCapacity(.{
+        .key = Emit.importKey(name),
+        .name = name,
+        .section = .bss,
+        .alignment = .fromByteUnits(@as(u64, 1) << @min(@ctz(size), 5)),
+        .zero_fill = size,
+    });
+    var seen: std.AutoHashMapUnmanaged(Atom.SymbolKey, void) = .empty;
+    var kept: usize = 0;
+    for (extra.items) |a| {
+        if (m.symbol(@backingInt(a.key))) |n| if (live.isSet(n)) continue;
+        if ((try seen.getOrPut(arena, a.key)).found_existing) continue;
+        extra.items[kept] = a;
+        kept += 1;
+    }
+    extra.shrinkRetainingCapacity(kept);
+
+    // The objects' link-time values, then the error codes (`Emit.finish`).
+    var values: std.ArrayList(Elf.Value) = try .initCapacity(arena, converted.values.len + m.errorCount());
+    values.appendSliceAssumeCapacity(converted.values);
+    for (1..m.errorCount() + 1) |code| values.appendAssumeCapacity(.{ .key = Emit.errorKeyFromName(m.errorName(@intCast(code))), .value = code });
+    var dynamic: ElfDynamic.Options = .{};
+    if (glibc) |g| {
+        // As `Emit.link`: the copied imports go to the end.
+        var n: usize = 0;
+        for (imports, 0..) |imp, i| if (!copies.contains(imp.name)) {
+            std.mem.swap(ElfObject.Import, &imports[n], &imports[i]);
+            n += 1;
+        };
+        // No shared libraries: builds with them skip the cache.
+        dynamic = g.dynamicOptions(arena, imports[0..n], imports[n..], &.{}) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.NotInGlibc => return inc.noLink("an import glibc does not define", .{}),
+        };
+        dynamic.runpath = inc.runpath;
+    }
+    var diag: Elf.Diagnostic = .{};
+    const options: Elf.Options = .{
+        .entry = @fromBackingInt(m.entry),
+        .values = values.items,
+        .diag = &diag,
+        .comp_dir = cwd,
+        .stack_size = inc.stack_size,
+        .local_symbols = converted.symbols,
+        .input_sections = converted.sections,
+        .dynamic = if (glibc != null) &dynamic else null,
+    };
+    Elf.linkInput(gpa, io, out_dir, sub_path, WithInputs{ .pack = pack_atoms, .extra = extra.items }, options) catch |err| switch (err) {
+        // A damaged pack or manifest, or objects that no longer fit it:
+        // a build reports what is wrong.
+        error.InvalidInput, error.InvalidSymbols, error.InvalidDebugInfo, error.UndefinedSymbol, error.DuplicateSymbol, error.InvalidRelocation, error.RelocationOverflow, error.AlignmentTooLarge => return inc.noLink("{t} (atom '{s}')", .{ err, diag.atom }),
+        else => {
+            std.debug.print("error: link failed: {t} (atom '{s}')\n", .{ err, diag.atom });
+            return err;
+        },
+    };
+    inc.noteOutput(out_dir, sub_path);
+    return .{ .atoms = numbered.len + extra.items.len, .gathered = gathered };
+}
+
+/// The manifest's atoms, then the link inputs' (`linkWithInputs`).
+const WithInputs = struct {
+    pack: *const Pack.LinkAtoms,
+    extra: []const Atom,
+
+    pub inline fn len(s: WithInputs) usize {
+        return s.pack.len() + s.extra.len;
+    }
+
+    pub inline fn check(s: WithInputs, i: usize) bool {
+        return i >= s.pack.len() or s.pack.check(i);
+    }
+
+    pub inline fn atom(s: WithInputs, i: usize) Atom {
+        return if (i < s.pack.len()) s.pack.atom(i) else s.extra[i - s.pack.len()];
+    }
+
+    pub inline fn debugLen(s: WithInputs) usize {
+        return s.pack.debugLen();
+    }
+
+    pub inline fn debugAtom(s: WithInputs, j: usize) u32 {
+        return s.pack.debugAtom(j);
+    }
+
+    pub inline fn debug(s: WithInputs, j: usize) Atom.Debug {
+        return s.pack.debug(j);
+    }
+
+    pub inline fn prefetch(s: WithInputs, i: usize, comptime keys: bool) void {
+        if (i < s.pack.len()) s.pack.prefetch(i, keys);
+    }
+
+    pub inline fn prefetchDebug(s: WithInputs, j: usize) void {
+        s.pack.prefetchDebug(j);
+    }
+};
+
 fn noLink(inc: *const Incremental, comptime fmt: []const u8, args: anytype) ?Linked {
     _ = inc.noRelink(fmt, args);
     return null;
@@ -466,9 +685,10 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     const m = if (inc.prev) |*m| m else return;
     if (std.mem.eql(u8, mode, "off") or inc.verify == .full) return;
     // A donor's build records in full: its log would be relative to
-    // another compilation's manifest.
-    // So is a build with link inputs: a lazy one links from the manifest.
-    const lazy = !std.mem.eql(u8, mode, "eager") and inc.donor == null and inc.link_objects.len == 0;
+    // another compilation's manifest. So does a build whose objects or
+    // archives changed (`linkInputsChanged`, `link_objects_pending`).
+    const lazy = !std.mem.eql(u8, mode, "eager") and inc.donor == null and
+        (inc.link_objects.len == 0 or (!inc.link_objects_pending and !try inc.linkInputsChanged(m)));
     const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -1465,7 +1685,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     for (zcu.exports.items) |e| if (e.unit != null) return inc.lazyFallback("an @export ran again", .{});
     for (emit.atom_owners.items) |owner| switch (owner) {
         .unit => |u| if (!zcu.deps.contains(u)) return inc.lazyFallback("a declaration's data is new", .{}),
-        .content, .link => {},
+        .content, .link, .input => {},
     };
 
     var g: Graph = .{ .r = .{ .gpa = gpa, .zcu = zcu } };
@@ -2198,7 +2418,7 @@ const Graph = struct {
         g.atom_units = try gpa.alloc(u32, emit.atoms.items.len);
         for (emit.atom_owners.items, g.atom_units) |owner, *u| u.* = switch (owner) {
             .unit => |unit| try r.addUnit(unit),
-            .content, .link => Recorder.no_node,
+            .content, .link, .input => Recorder.no_node,
         };
         g.dep_units = try gpa.alloc(u32, zcu.deps.count());
         g.dep_refs = try gpa.alloc(Recorder.Ref, n_edges);
@@ -2307,12 +2527,12 @@ const Graph = struct {
         // the output as this build did.
         const link_key = cache.hash(2, &.{@backingInt(Tag.link)});
         for (emit.atom_owners.items, emit.atoms.items, g.atom_units, 0..) |owner, atom, u, i| {
-            // The link inputs' atoms: converted again by every build.
-            if (owner == .link and i >= emit.input_atoms[0] and i < emit.input_atoms[1]) continue;
             const index = switch (owner) {
                 .unit => try r.unitNode(u),
                 .content => (try r.node(@backingInt(atom.key), .content))[0],
                 .link => (try r.node(link_key, .link))[0],
+                // Converted again by every build (`linkFrom`).
+                .input => continue,
             };
             r.atom_pairs.appendAssumeCapacity(.{ index, @intCast(i) });
         }
@@ -3409,13 +3629,8 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
         defer changed.deinit(gpa);
         try m.changedInputs(gpa, inc.io, &changed);
         for (changed.items) |i| {
-            const in, const path = m.input(i);
-            const same = same: {
-                const src = Io.Dir.cwd().readFileAlloc(inc.io, path, gpa, .unlimited) catch break :same false;
-                defer gpa.free(src);
-                break :same @as(Hash, @bitCast(Frontend.hashSource(src))) == in.content_hash;
-            };
-            if (same) continue;
+            if (try inc.sameContents(m, i)) continue;
+            _, const path = m.input(i);
             std.debug.print("cache verify: {s} changed since the last build; ZAP_CACHE_VERIFY=full only compares a full build with a manifest of the same inputs (set ZAP_CACHE_VERIFY=1 to verify an edit build)\n", .{path});
             return false;
         }

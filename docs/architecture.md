@@ -2792,11 +2792,10 @@ thread's abilists imports. No bytes come from it.
 - The conversion reruns on every build and relink: it is a scan plus
   slicing, with copies only for relaxed sequences. Its atoms are not
   stored in the pack.
-- Numbering in a relink: an object's definition of a name that Zig atoms
-  reference takes the manifest's existing number for that extern's key
-  (`m.symbol(key)`), so the Zig atoms' targets bind to it. That needs the
-  extern keys to stay a pure function of the name. Other object atoms
-  and names are numbered after the manifest's symbols.
+- A relink with inputs links by key, not by the manifest's numbers (as
+  built, step 2 below): C objects' local symbols need a keyed link, and
+  the manifest's extern slots already name the objects' atoms by key.
+  That needs the extern keys to stay a pure function of the name.
 - The donor key is unchanged: object arguments do not change Zig code.
 - If profiles show the conversion, store the converted atoms keyed by
   the inputs' hashes and the resolution.
@@ -2824,19 +2823,30 @@ differs from the design above:
   link-only manifest inputs (`Incremental.link_objects`, keyed
   `:link:<path>`, with their resolved paths in the compilation key as
   `--zap-link-input=`), which no node depends on and replay ignores.
-  Their atoms and glibc data copies are not recorded
-  (`Emit.input_atoms`). A build with inputs replays eagerly, so
-  `Emit.finish` pulls archive members, converts and binds the externs
-  again, and analysis generates any compiler_rt function an edited
-  object needs. A build in which nothing changed skips the link as any
-  does; there is no relink from the manifest. test/link_input/cache.sh
-  checks it: cold, unchanged, a deleted output, an edited object, an
-  edited archive member and a Zig edit, each byte-identical to a build
-  without the cache, with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`.
-  Next: relinks and lazy builds, with the extern binding and the
-  objects' compiler_rt requests (the link node's `rt` references) from
-  the manifest, and an eager build when an object needs a compiler_rt
-  function the manifest lacks.
+  Their atoms and glibc data copies are owned by `Emit.Owner.input`,
+  which `groupByOwner` puts after the link's own atoms and the record
+  leaves out. Step 2 (2026-11-04): an edit build whose objects and
+  archives did not change is lazy, and a deleted output relinks, both
+  from the manifest (`Incremental.linkWithInputs`): the link's own node
+  keeps the extern slots, compiler_rt requests (`rt` references) and
+  imports the last full build gave the same objects, and exports are
+  link symbols for such executables too, so the relink reads the
+  objects again, pulls archive members for the live nodes' externs,
+  converts them with the manifest's exports, compiler_rt keys and glibc,
+  and appends their atoms and copies to the manifest's, in a keyed link
+  (C objects' local symbols need one). An edited object or archive, or
+  a C source whose record Clang is compiling (`link_objects_pending`),
+  makes the edit build eager (`linkInputsChanged`), which binds the
+  externs again and generates any compiler_rt function the object now
+  needs. A relink pulls members once with every extern, where a build
+  pulls as externs arrive; the two agree while every extern reaches the
+  first sync, which only a compiler_rt function that references an
+  extern could break. test/link_input/cache.sh checks it: cold,
+  unchanged, a deleted output, an edited object (eager), an edited
+  archive member, a Zig edit (lazy), a relink from a lazy build's log,
+  and a `-lc` program with a C object calling glibc and a Zig export,
+  and copying glibc data: each byte-identical to a build without the
+  cache, with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`.
 - A C GOT slot is content-addressed by its target, not shared with the
   Zig extern slot of the same name.
 - With `-lc`, names nothing else defines are glibc's imports
@@ -5812,8 +5822,9 @@ libraries as inputs. To be agreed with that thread.
   source keeps its object's path, so while any record missed
   (`Batch.misses`) the build skips `relinkIfUnchanged`, which would
   otherwise take the old object for the last build's, and replays
-  eagerly as any build with link inputs does. A build whose records all
-  hit and whose inputs are unchanged skips the link. On a hit the build
+  eagerly (`Incremental.link_objects_pending`), as after an edited
+  object. A build whose records all hit and whose inputs are unchanged
+  skips the link, and a Zig edit can then build lazily. On a hit the build
   reports the C sources and headers as its inputs, not the objects.
   A library of C only (`c_only`) has no Zig to cache and stays outside
   `Incremental`. test/link_input/cache.sh checks a `-lc` program with a
