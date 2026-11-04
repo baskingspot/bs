@@ -324,8 +324,18 @@ pub const EmbedFile = struct {
 
 pub const Namespace = struct {
     file: u32,
-    /// Lexically enclosing namespace, or `none`.
+    /// The nearest lexically enclosing namespace that is not inside a
+    /// function, or `none` for a file's root. Lookups from this namespace
+    /// continue there: AstGen tunnels every reference to a declaration of
+    /// a namespace inside a function (`maybe_generic`) through a capture,
+    /// so a nested type never finds a name in such a namespace by walking
+    /// up. Skipping them makes the parent the same whichever instance of
+    /// an enclosing generic type created the type (docs/architecture.md,
+    /// "Type names").
     parent: u32,
+    /// Whether the type's ZIR is inside a function declaration (or test),
+    /// as AstGen's `within_fn`.
+    in_fn: bool = false,
     owner_type: InternPool.Index,
     /// Display name prefix of declarations in this namespace.
     fqn: []const u8,
@@ -656,6 +666,7 @@ pub fn createContainerType(
 
     const ns_index: u32 = @intCast(zcu.namespaces.items.len);
     si.namespace = ns_index;
+    const in_fn = parent_ns != Namespace.none and (zcu.namespaces.items[parent_ns].in_fn or zcu.inFnDecl(parent_ns, inst));
     const arena = zcu.arena.allocator();
     // The caller's names may live in a Sema arena.
     const ns_key = try arena.dupe(u8, key);
@@ -665,7 +676,8 @@ pub fn createContainerType(
     std.debug.assert(std.mem.endsWith(u8, key, caps.written()));
     try zcu.namespaces.append(zcu.gpa, .{
         .file = file_index,
-        .parent = parent_ns,
+        .parent = if (parent_ns != Namespace.none and zcu.namespaces.items[parent_ns].in_fn) zcu.namespaces.items[parent_ns].parent else parent_ns,
+        .in_fn = in_fn,
         .owner_type = ty,
         .fqn = try arena.dupe(u8, fqn),
         .key = ns_key,
@@ -732,6 +744,48 @@ pub fn createContainerType(
     }
     zcu.namespaces.items[ns_index].effects = zcu.comptime_decls.count() + zcu.exports.items.len + zcu.test_functions.items.len != effects;
     return ty;
+}
+
+/// Whether ZIR instruction `inst`, of a type made in namespace `ns_index`
+/// (not inside a function), is inside one of the namespace's function or
+/// test declarations. A declaration's instructions, nested ones included,
+/// run from its `declaration` instruction to the end of its value body;
+/// field expressions lie outside every declaration.
+fn inFnDecl(zcu: *Zcu, ns_index: u32, inst: Zir.Inst.Index) bool {
+    const ns = &zcu.namespaces.items[ns_index];
+    const zir = &zcu.file(ns.file).zir;
+    const owner = zcu.ip.containerType(ns.owner_type).?;
+    const decls: []const Zir.Inst.Index = switch (zir.instructions.items(.tag)[@backingInt(owner.zir_inst)]) {
+        .extended => switch (zir.instructions.items(.data)[@backingInt(owner.zir_inst)].extended.opcode) {
+            .struct_decl => zir.getStructDecl(owner.zir_inst).decls,
+            .enum_decl => zir.getEnumDecl(owner.zir_inst).decls,
+            .union_decl => zir.getUnionDecl(owner.zir_inst).decls,
+            .opaque_decl => zir.getOpaqueDecl(owner.zir_inst).decls,
+            else => return false,
+        },
+        else => return false,
+    };
+    // The last declaration that starts before `inst`.
+    var lo: usize = 0;
+    var hi: usize = decls.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (@backingInt(decls[mid]) < @backingInt(inst)) lo = mid + 1 else hi = mid;
+    }
+    if (lo == 0) return false;
+    const d = zir.getDeclaration(decls[lo - 1]);
+    const last = for ([_]?[]const Zir.Inst.Index{ d.value_body, d.type_body }) |b| {
+        if (b) |body| if (body.len != 0) break body[body.len - 1];
+    } else return false;
+    if (@backingInt(inst) > @backingInt(last)) return false;
+    return switch (d.kind) {
+        .unnamed_test, .@"test", .decltest => true,
+        .@"comptime", .@"var" => false,
+        .@"const" => for (d.value_body orelse return false) |i| switch (zir.instructions.items(.tag)[@backingInt(i)]) {
+            .func, .func_inferred, .func_fancy => break true,
+            else => {},
+        } else false,
+    };
 }
 
 pub fn namespacePtr(zcu: *Zcu, index: u32) *Namespace {
