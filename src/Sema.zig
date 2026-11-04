@@ -2644,6 +2644,17 @@ fn bcRequire(sema: *Sema, ready: bool) CompileError!void {
     return error.AnalysisFail;
 }
 
+/// In a body lowered for the evaluator, a compile error on a path that a
+/// comptime evaluation may never take (upstream analyzes only the paths it
+/// takes): the path aborts the run instead, and the walker, running the
+/// code again, reports the error where it reaches it. False outside such
+/// a body and in its comptime blocks, whose errors are real.
+fn bcDeferError(sema: *Sema, block: *Block) CompileError!bool {
+    if (sema.bc == null or block.is_comptime) return false;
+    _ = try sema.addInst(block, .{ .tag = .unreach, .data = .{ .no_op = {} } });
+    return true;
+}
+
 /// While lowering for the comptime evaluator, fails the lowering for good:
 /// the body does something the evaluator does not reproduce yet.
 fn bcRefuse(sema: *Sema) CompileError!void {
@@ -4003,6 +4014,7 @@ fn analyzeBodyInner(sema: *Sema, block: *Block, start_body: []const Zir.Inst.Ind
             },
             .compile_error => {
                 const src = block.nodeSrc(data.un_node.src_node);
+                if (try sema.bcDeferError(block)) return;
                 const msg = try sema.resolveConstString(block, sema.callArgSrc(src, false, 0), sema.resolveInst(data.un_node.operand));
                 return sema.fail(block, src, "{s}", .{msg});
             },
@@ -4469,7 +4481,16 @@ fn analyzeRet(sema: *Sema, b: *Block, operand_in: Ref, src: Src, operand_src: Sr
     }
     if (b.is_comptime) return sema.fail(b, src, "function called at runtime cannot return value at comptime", .{});
     try sema.recordInferredErrors(b, src, operand);
-    const coerced = try sema.coerceCtx(b, sema.fn_ret_ty, operand, operand_src, .{ .ret = sema.func });
+    const n_errors = sema.zcu.errors.items.len;
+    const coerced = sema.coerceCtx(b, sema.fn_ret_ty, operand, operand_src, .{ .ret = sema.func }) catch |err| {
+        // Such as a `try` in a comptime loop of a function that returns
+        // no error.
+        if (err == error.AnalysisFail) if (sema.bc) |bc| if (!bc.refused and !bc.not_ready) {
+            sema.zcu.errors.shrinkRetainingCapacity(n_errors);
+            if (try sema.bcDeferError(b)) return;
+        };
+        return err;
+    };
     try sema.validateRuntimeValue(b, operand_src, coerced);
     if (sema.isErrorType(sema.fn_ret_ty)) try sema.maybePushErrorTrace(b, src, coerced);
     _ = try sema.addUnOp(b, .ret, coerced);
@@ -8322,7 +8343,7 @@ noinline fn failTypeMismatch(sema: *Sema, block: *Block, src: Src, wanted: Index
     try sema.noteTypeDifference(span, wanted, actual);
     switch (ctx) {
         .none => {},
-        .ret => |func| if (!sema.isTestFunc(func)) if (try sema.fnTypeExprSrc(func, null)) |loc| {
+        .ret => |func| if (func != .none and !sema.isTestFunc(func)) if (try sema.fnTypeExprSrc(func, null)) |loc| {
             if (sema.isErrorType(actual) and !sema.isErrorType(wanted))
                 try sema.zcu.addDeclNote(loc.file, loc.span, "function cannot return an error", .{})
             else

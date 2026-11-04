@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "476\n6\n6765\n55\n258\n55\n18\n28739\n1228\n606\n179668\n88\n582\n708\n710\n"
+//! stdout: "476\n6\n6765\n55\n258\n55\n18\n28739\n1228\n606\n179668\n88\n582\n708\n710\n11200\n"
 // Comptime calls repeated often enough for zap's comptime evaluator to run
 // them from lowered IR instead of the ZIR walker; the results must be the
 // walker's (and upstream's).
@@ -223,5 +223,33 @@ fn main() callconv(.c) noreturn {
     rt.printInt(osr_table[3]);
     rt.printInt(comptime firstAbove(500000));
     rt.printInt(osr_abort);
+    rt.printInt(osr_untaken);
     rt.exit(0);
 }
+
+/// A loop of a function called from a declaration whose untaken paths
+/// would be compile errors: `try` in a function that returns no error, and
+/// `orelse @compileError`. Upstream analyzes only the paths taken.
+fn nextByte(it: *[]const u8) error{Short}!u8 {
+    if (it.len == 0) return error.Short;
+    const b = it.*[0];
+    it.* = it.*[1..];
+    return b;
+}
+fn byteWeight(k: u8) ?u32 {
+    return if (k < 8) k + 1 else null;
+}
+fn sumWeights() u32 {
+    @setEvalBranchQuota(100000);
+    var data: [700]u8 = undefined;
+    for (&data, 0..) |*d, i| d.* = @intCast(i % 7);
+    var it: []const u8 = &data;
+    var total: u32 = 0;
+    var n = it.len;
+    while (n > 0) : (n -= 1) {
+        const v = try nextByte(&it);
+        total += v * (byteWeight(v) orelse @compileError("no weight"));
+    }
+    return total;
+}
+const osr_untaken = sumWeights();

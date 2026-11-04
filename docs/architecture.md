@@ -527,6 +527,12 @@ section requires (no second semantic lowering): `bcLower` runs
 - keeps packed struct accesses as `struct_field_ptr`/`struct_field_val`
   rather than bit arithmetic, which comptime memory addresses directly;
 - does not queue runtime analysis of callees;
+- lowers a `@compileError` reached outside a `comptime` block, and a
+  return whose operand does not coerce to the return type (a `try` in a
+  function that returns no error), to `unreach`: comptime analysis
+  reaches only the paths an evaluation takes, so the error is the
+  walker's to report if a run gets there (the run aborts, and the walker
+  runs the code again);
 - refuses a runtime block that merges results of different types: the
   walker keeps the type of the branch it takes, where runtime analysis
   would resolve the peer type (`if (c) @as(u8, 1) else @as(u16, 2)` is a
