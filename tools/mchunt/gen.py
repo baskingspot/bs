@@ -1034,7 +1034,7 @@ class Gen:
             (1, "defer"), (1, "guard"), (1, "labeled"), (1, "inlinefor"), (1, "brk"), (1, "ret"),
             (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
             (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
-            (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"),
+            (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -1979,6 +1979,121 @@ class Gen:
             self.byref.append(("bp", name, t, None))
         self.huge_fns = {k_: n_ for k_, n_, t_, _ in self.byref if t_ is self.huge}
         out.append("")
+
+    def s_range(self, ctx):
+        """Values whose range a prover can know: blocks and switches yielding
+        only constants, +% and -% whose exact result stays in range, and
+        `a and b` bounds (also as switch prong ranges), with stores and
+        loops between the guard and the use. Near misses keep a check."""
+        a8, b8 = self.rt_int(ctx, Int(False, 8)), self.rt_int(ctx, Int(False, 8))
+        if a8 is None or b8 is None:
+            return self.s_prove(ctx)
+        ctx["fn"].risky = True
+        near = self.chance(0.35)
+        e = lambda s_: self.emit(ctx, s_)
+        u8 = Int(False, 8)
+        arr = self.fresh("ga")
+
+        def mkarr(n):
+            n = max(1, n)
+            e(f"var {arr}: [{n}]u16 = @splat({self.int_expr(ctx, Int(False, 16), 1)});")
+            e(f"{arr}[{self.r.randrange(n)}] +%= 1;")
+
+        def body(x, t=Int(False, 16)):
+            ctx["indent"] += 1
+            self.sink(ctx, x, t)
+            ctx["indent"] -= 1
+
+        k = self.r.randrange(7)
+        c = self.fresh("gc")
+        if k == 0:
+            # A labeled block yielding constants (or, near, one runtime value).
+            lo, hi = self.pick([(65, 97), (48, 57), (0, 9), (200, 255)])
+            b = self.fresh("gb")
+            e(f"const {c}: u8 = {b}: {{")
+            e(f"    if (({a8} & 1) == 0) break :{b} {lo};")
+            e(f"    if (({a8} & 2) == 0) break :{b} {(lo + hi) // 2};")
+            e(f"    break :{b} {b8 if near else hi};")
+            e("};")
+            # c - lo cannot underflow unless a br is not constant.
+            mkarr(hi - lo + 1)
+            self.sink(ctx, f"{arr}[{c} - {lo}]", Int(False, 16))
+        elif k == 1:
+            # A switch expression yielding constants, then arithmetic on it.
+            vals = sorted(self.r.sample(range(0, 40), 3))
+            e(f"const {c}: u8 = switch ({a8} % 4) {{ 0 => {vals[0]}, 1 => {vals[1]}, else => {vals[2]} }};")
+            mkarr(vals[2] + 1 - (1 if near else 0))
+            self.sink(ctx, f"{arr}[{c}]", Int(False, 16))
+            self.sink(ctx, f"{c} * 6 + {255 - 6 * vals[2] - (0 if not near else -1)}", u8)
+        elif k == 2:
+            # +% whose exact sum stays in u8, widened afterwards.
+            m = self.r.randint(2, 127)
+            x, y, z = self.fresh("gx"), self.fresh("gy"), self.fresh("gz")
+            e(f"const {x}: u8 = {a8} % {m if not near else 200};")
+            e(f"const {y}: u8 = {b8} % {m};")
+            e(f"const {z}: u8 = {x} +% {y};")
+            mkarr(2 * m - 1)
+            self.sink(ctx, f"{arr}[@as(usize, {z})]", Int(False, 16))
+            if self.chance(0.5):
+                # Two levels: (x +% y) -% small stays >= 0 only when x + y >= small.
+                w = self.fresh("gw")
+                e(f"const {w}: u8 = ({z} +% 1) -% 1;")
+                self.sink(ctx, f"{arr}[{w}]", Int(False, 16))
+        elif k == 3:
+            # -% that would go negative, and signed +%.
+            x, y, z = self.fresh("gx"), self.fresh("gy"), self.fresh("gz")
+            if self.chance(0.5):
+                e(f"const {x}: u8 = {a8} % 50 + 50;")
+                e(f"const {y}: u8 = {b8} % {80 if near else 50};")
+                e(f"const {z}: u8 = {x} -% {y};")   # in [1, 99] unless near
+                mkarr(100)
+                self.sink(ctx, f"{arr}[{z}]", Int(False, 16))
+            else:
+                e(f"const {x}: i8 = @as(i8, @intCast({a8} % 61)) - 30;")
+                e(f"const {y}: i8 = @as(i8, @intCast({b8} % {97 if near else 61})) - 30;")
+                e(f"const {z}: i8 = {x} +% {y};")   # in [-60, 60] unless near
+                mkarr(121)
+                self.sink(ctx, f"{arr}[@intCast(@as(i16, {z}) + 60)]", Int(False, 16))
+        elif k == 4:
+            # A prong range, and the same as an `and` of two compares.
+            lo, hi = sorted(self.r.sample(range(0, 120), 2))
+            hi = max(hi, lo + 1)
+            mkarr(hi - lo + (0 if near else 1))
+            if self.chance(0.5):
+                e(f"switch ({a8}) {{")
+                e(f"    {lo}...{hi} => mix({arr}[{a8} - {lo}]),")
+                e(f"    else => {{}},")
+                e("}")
+            else:
+                e(f"if ({a8} >= {lo} and {a8} <= {hi}) {{")
+                body(f"{arr}[{a8} - {lo}]")
+                e("}")
+        elif k == 5:
+            # One side of the `and` already known; a store between guard and use.
+            m = self.r.randint(10, 60)
+            x = self.fresh("gx")
+            e(f"var {x}: u8 = {a8} % {m};")
+            lo = self.r.randint(0, 5)
+            mkarr(m - lo)
+            e(f"if ({x} >= {lo} and {x} <= {m + 20}) {{")
+            ctx["indent"] += 1
+            if near:
+                e(f"{x} +%= 1;")
+            else:
+                e(f"{x} = {x};")
+            self.sink(ctx, f"{arr}[{x} - {lo}]", Int(False, 16))
+            ctx["indent"] -= 1
+            e("}")
+        else:
+            # A loop whose condition is an `and` of two bounds.
+            i = self.fresh("gi")
+            lo, n = self.r.randint(1, 4), self.r.randint(5, 12)
+            mkarr(n - lo + (0 if not near else -1))
+            e(f"var {i}: usize = {self.conv(a8, u8, USIZE)} % {n + 3};")
+            e(f"while ({i} >= {lo} and {i} < {n}) : ({i} += 1) {{")
+            body(f"{arr}[{i} - {lo}]")
+            e("}")
+            self.sink(ctx, i, USIZE)
 
     def s_wide(self, ctx):
         """64x64->128 widening multiplies and their halves, wide wrapping and
