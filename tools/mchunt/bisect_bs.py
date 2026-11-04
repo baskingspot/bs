@@ -37,9 +37,11 @@ def build(sha):
     if os.path.exists(binp):
         return binp
     git("checkout", "--quiet", "--detach", sha)
-    up = os.path.join(H.REPO_DIR, "upstream")
-    if os.path.exists(up) and not os.path.exists(os.path.join(TREE, "upstream")):
-        os.symlink(os.path.realpath(up), os.path.join(TREE, "upstream"))
+    up, link = os.path.join(H.REPO_DIR, "upstream"), os.path.join(TREE, "upstream")
+    if os.path.exists(up) and (not os.path.islink(link) or os.readlink(link) != os.path.realpath(up)):
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(os.path.realpath(up), link)
     p = subprocess.run(["zig", "build", "--prefix", dest], cwd=TREE, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True)
     return binp if p.returncode == 0 and os.path.exists(binp) else None

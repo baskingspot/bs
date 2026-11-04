@@ -186,15 +186,28 @@ def build_bs(sha, debug=False):
     binp = os.path.join(dest, "bin", "bs")
     if os.path.exists(binp):
         return binp
+    # Two hunters (say, against upstream and --ref-env) share the tree.
+    import fcntl
+    with open(os.path.join(H.WORK, "build.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(binp):
+            return binp
+        return _build_bs(sha, debug, dest, binp)
+
+
+def _build_bs(sha, debug, dest, binp):
     tree = os.path.join(H.WORK, "tree")
     if not os.path.isdir(tree):
         subprocess.run(["git", "-C", H.REPO_DIR, "worktree", "add", "--detach", tree, sha], check=True,
                        stdout=subprocess.DEVNULL)
     else:
         subprocess.run(["git", "-C", tree, "checkout", "--quiet", "--detach", sha], check=True)
-    up = os.path.join(H.REPO_DIR, "upstream")
-    if os.path.exists(up) and not os.path.exists(os.path.join(tree, "upstream")):
-        os.symlink(os.path.realpath(up), os.path.join(tree, "upstream"))
+    # upstream/ follows the checkout's (a new Zig release moves it).
+    up, link = os.path.join(H.REPO_DIR, "upstream"), os.path.join(tree, "upstream")
+    if os.path.exists(up) and (not os.path.islink(link) or os.readlink(link) != os.path.realpath(up)):
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(os.path.realpath(up), link)
     log(f"building bs {sha[:10]} ({'Debug' if debug else 'ReleaseFast'})")
     p = subprocess.run(["zig", "build", *([] if debug else ["-Doptimize=ReleaseFast"]), "--prefix", dest], cwd=tree,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
