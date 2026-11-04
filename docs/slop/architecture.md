@@ -3629,6 +3629,126 @@ value model:
   their section, a lazy edit of a function's constant, one that adds a
   new symbol to it (eager), and -lc alone, relinked by number.
 
+### Mach-O object and archive inputs (aarch64-macos; designed 2026-11-04, for review)
+
+The ELF design above, for `zig cc -target aarch64-macos -c` objects and
+Darwin archives linked into bs's aarch64-macos executables. Facts below
+are from clang 22's objects (`zig cc`, Debug: ubsan on, DWARF 4) and
+from upstream's link of a Zig main with such an object.
+
+**Reader.** `src/link/MachOInput.zig`, with ElfInput's shape and
+entry points (`addObject`, `addArchive`, `pull`, `lookup`, `convert`
+returning atoms, values, local symbols and input sections), so Emit's
+resolution order and the cache's link-only inputs carry over unchanged:
+Zig exports, then objects, then compiler_rt, then libSystem's imports.
+The writer stays in MachO.zig; the Mac thread's dylib output
+(milestone 8) touches the writer's dylib parts, and the two meet only
+at `MachO.link`'s entry and `Options`.
+- MH_OBJECT, CPU_TYPE_ARM64 only; a universal (fat) file contributes
+  its arm64 slice. `Archive.Reader` gains Darwin's format: BSD `#1/<n>`
+  long names and a `__.SYMDEF` / `__.SYMDEF SORTED` / `__.SYMDEF_64`
+  symbol table (`zig ar` and upstream's static libraries write it).
+- Names: Darwin's leading underscore is stripped on reading, since
+  atom and import names are platform-neutral and the writer adds it.
+
+**Sections to atoms.** One atom per section, keyed as ELF's, except
+where noted. bs does not dead-strip, so MH_SUBSECTIONS_VIA_SYMBOLS
+splits only what must be split.
+- `__TEXT,__text` and other S_ATTR_PURE_INSTRUCTIONS → `.text`;
+  `__TEXT,__const`, `__DATA,__const` → `.rodata` (the writer already
+  moves atoms with absolute addresses to `__DATA_CONST`); `__DATA,__data`
+  → `.data`; S_ZEROFILL → `.bss`.
+- S_CSTRING_LITERALS (`__cstring`) and S_4/8/16BYTE_LITERALS:
+  content-addressed pieces, as ELF's merged sections, so equal strings
+  merge across objects.
+- S_MOD_INIT_FUNC_POINTERS (`__mod_init_func`) → `.init_array`; the
+  writer gains `__DATA_CONST,__mod_init_func` (8-byte pointers, chained
+  rebases), which dyld runs. S_MOD_TERM_FUNC_POINTERS is an error, as
+  ld64's.
+- Thread-locals: S_THREAD_LOCAL_REGULAR/ZEROFILL (`__thread_data`,
+  `__thread_bss`) → `.tdata`/`.tbss`, split at their symbols
+  (`_x$tlv$init`), since the writer makes one descriptor per thread-local
+  atom. The object's own descriptors (S_THREAD_LOCAL_VARIABLES,
+  `__thread_vars`: thunk → `__tlv_bootstrap`, key, init → `_x$tlv$init`)
+  are not copied: a descriptor's symbol (`_x`) resolves to its init
+  atom, and the TLVP relocations to it become `aarch64_tlvp_*`, so C's
+  and Zig's thread-locals share the writer's descriptors.
+- Dropped: `__DWARF` (see debug info), `__LD,__compact_unwind` and
+  `__TEXT,__eh_frame` (see unwind), `__LLVM`, `__llvm_addrsig`,
+  `__apple_*` accelerator tables. Objective-C sections (`__objc_*`,
+  `__cfstring`) are an error.
+
+**Symbols.** N_SECT (external, private external, local), N_UNDF (COMMON
+when n_value > 0), N_ABS, N_WEAK_DEF and N_WEAK_REF (`n_desc`), and
+N_ALT_ENTRY (a second name inside its section's atom). N_INDR is an
+error. Local `l`/`ltmp` symbols are relocation anchors only; external
+and private-external functions and objects get `local_symbols` entries,
+as ELF's.
+
+**Relocations (ARM64).** A target is a symbol (`r_extern`) or a section
+ordinal, whose address is in the object's own section addresses (the
+offset into the target section's atom is `address - section.addr`).
+`ARM64_RELOC_ADDEND` carries the addend of the PAGE21, PAGEOFF12 or
+BRANCH26 after it; UNSIGNED keeps its addend in the field.
+- UNSIGNED, 8 bytes → `aarch64_abs64` (a chained rebase, or a bind for
+  an import); 4 bytes → an error until something needs it.
+- BRANCH26 → `aarch64_branch26` (an import goes to its stub, as
+  bs's own calls do); PAGE21/PAGEOFF12 → `aarch64_page21`/
+  `aarch64_pageoff12`; GOT_LOAD_PAGE21/PAGEOFF12 →
+  `aarch64_got_load_*` (the writer already relaxes an image's own
+  targets); TLVP_LOAD_PAGE21/PAGEOFF12 → `aarch64_tlvp_*`.
+- SUBTRACTOR + UNSIGNED (A - B): within one atom it is a constant the
+  converter writes; in `__eh_frame` see unwind; elsewhere an error.
+- POINTER_TO_GOT (4-byte pcrel, personality pointers): a
+  content-addressed GOT-like slot atom, as ELF's C GOT slots, and a new
+  32-bit PC-relative aarch64 kind, `aarch64_pc32`.
+- AUTHENTICATED_POINTER (arm64e) is an error.
+- C reaches libSystem data through the GOT (`___stderrp`), and calls it
+  through stubs; a direct PAGE21 to an import is an error, as ld64's.
+
+**Unwind (stage A2).** zig cc's Debug functions mostly use DWARF mode
+(compact encoding 0x03000000: ubsan's calls and the frame layout), so
+`__eh_frame` is needed, unlike for bs's own frames.
+- Each `__compact_unwind` entry (function, length, encoding,
+  personality, LSDA, the first and the last two by relocation) becomes
+  an input unwind record for the writer's `__unwind_info`, next to
+  bs's frames: personalities in its personality array (through their
+  GOT slots), LSDAs in its LSDA index (`__gcc_except_tab` atoms).
+- `__eh_frame` is copied as ELF's stage B copies `.eh_frame` (CIEs as
+  they are, FDEs whose function the link drops dropped; Mach-O's
+  pc_begin is a SUBTRACTOR pair against the FDE's own address, i.e.
+  pcrel), into a new `__TEXT,__eh_frame`, and a DWARF-mode entry's
+  encoding gets its FDE's offset in that section. A function with an
+  FDE and no compact entry gets a DWARF-mode entry.
+- Check: a throw caught across C++ frames on the Mac (libunwind reads
+  `__unwind_info` first).
+
+**Debug info (stage A3).** A Mach-O object's DWARF has no relocations
+for offsets into its own debug sections (DW_FORM_strp, the abbreviation
+offset, DW_AT_stmt_list, range and location offsets are relative to the
+object's sections; only addresses are relocated), so it cannot be
+concatenated as ELF's is. std.debug reads only the dSYM when one sits
+next to the executable (MachOFile.zig: debug map stabs are its
+fallback), so C lines must be in bs's dSYM: each input unit is copied
+with those offset fields rewritten, which needs a DIE walk over its
+abbreviations (the forms are few: strp, sec_offset, line_strp, and
+DWARF 5's strx through str_offsets_base). Until then, C frames unwind
+(stage A2) and show their symbols without lines.
+
+**Stages.**
+1. A1: objects and archives, sections, symbols, relocations, cstrings,
+   thread-locals, init funcs; C calling libSystem and Zig and back.
+   Tests on the Mac satellite, compared with upstream's link of the
+   same objects: test/link_input's lib.c-style objects built for
+   aarch64-macos, an archive, a constructor, a thread-local, a panic
+   in a callback.
+2. A2: unwind, as above, with C++ exceptions (with the C thread's
+   libc++ for the target).
+3. A3: debug info into the dSYM.
+The input code is verifiable in the orb up to the link (objects come
+from `zig cc -target aarch64-macos`, and upstream links them for
+comparison); running needs the Mac.
+
 ### compiler_rt (decided 2026-11-02)
 
 - Upstream compiles all of `lib/compiler_rt.zig` as a separate compilation
