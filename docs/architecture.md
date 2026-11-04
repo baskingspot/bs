@@ -5592,9 +5592,27 @@ libraries as inputs. To be agreed with that thread.
   default). A root file given by position takes what is left; else what
   is left is `global_cc_argv`. `-cflags ... --` applies to the C files
   after it. `-ffunction-sections`, `-fdata-sections`, `-fPIE` and
-  `--verbose-cc` are global. Other C, C++ and assembly sources, modules
-  without a Zig root, and C sources in `build-obj`/`build-lib` stay
-  `[unsupported]`.
+  `--verbose-cc` are global. Other C, C++ and assembly sources, and C
+  sources in `build-obj` and `build-lib -dynamic` (which would need the
+  objects linked into the output) stay `[unsupported]`.
+- **Static libraries** (2026-11-04), as upstream's: the archive holds
+  the Zig object (`<root stem>.o`), then one member per C source
+  (`<stem>.o`), with one symbol index over all of them
+  (`Archive.write` takes the members). A module without a root source
+  file (`-M<name>`, which `zig build` passes for a library of C only)
+  holds C sources and no Zig module, and `--dep`s on it are dropped; as
+  the root module, or with C files and no module at all, it makes a
+  library of C only (`Options.c_only`): zap compiles the C, analyzes no
+  Zig, and writes the archive of the objects, named after `--name` or
+  the first C file. Libraries do not root ubsan_rt or ssp; an executable
+  that links them does. The member headers' mode is `0` and odd sizes are
+  padded with a zero byte, as upstream's (zap wrote `644` and `\n`
+  before), so an archive of C is upstream's byte for
+  byte for the same CPU with upstream's own linker (`-fno-llvm
+  -fno-lld`); a library of C only under `zig build` links with LLD by
+  default, which writes llvm-ar's format (a 32-bit `/` index). A rootless module other than the root
+  contributes its C files to any build; a rootless root module of an
+  executable or `build-lib -dynamic` is `[unsupported]`.
 - **Clang's arguments** (`CSource.zig`) are upstream's `addCCArgs` for
   zap's target and the baseline CPU, in Debug: the triple from the glibc
   version (native: detected, with or without `-lc`, as upstream's native

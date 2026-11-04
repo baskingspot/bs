@@ -109,6 +109,9 @@ pub const Options = struct {
     /// compiled by upstream's Clang (CSource.zig), and the settings they
     /// share.
     c_sources: []const CSource = &.{},
+    /// A static library of C sources only (no Zig root module): its
+    /// archive holds their objects, and zap analyzes no Zig.
+    c_only: bool = false,
     c_global_cc_argv: []const []const u8 = &.{},
     c_pie: bool = false,
     function_sections: bool = false,
@@ -359,7 +362,7 @@ pub const Job = struct {
             .fuzzer_builtin_dir = fuzzer_builtin_dir,
             .cache_target = try cacheTarget(arena, &opts, init_.environ_map),
             .compile_args = compile_args.items,
-            .stem = opts.name orelse if (is_test) "test" else std.fs.path.stem(opts.root_src_path),
+            .stem = opts.name orelse if (is_test) "test" else if (opts.c_only) std.fs.path.stem(opts.c_sources[0].path) else std.fs.path.stem(opts.root_src_path),
             .run_test = is_test and !opts.test_no_exec and !opts.listen,
             .environ_map = init_.environ_map,
             .full_args = args,
@@ -442,6 +445,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // C sources compile while the build analyzes, once for every attempt.
     const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0) try startC(init, job) else null;
     defer if (c_batch) |b| CSource.destroy(b);
+    if (job.opts.c_only) return compileCOnly(init, c_batch.?, out_path, inputs);
     while (true) return compileReplaying(init, job, inc_opt, out_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
         error.LazyFallback => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
@@ -461,6 +465,27 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
         },
         else => |e| return e,
     };
+}
+
+/// A static library of C sources only: their objects in an archive.
+fn compileCOnly(init: std.process.Init, b: *CSource.Batch, out_path: ?[]const u8, inputs: ?*std.ArrayList(u8)) !Outcome {
+    const arena = init.arena.allocator();
+    const c = try b.wait();
+    if (inputs) |list| try appendCInputs(arena, list, c.inputs);
+    if (c.errors.len != 0) return .{ .errors = try dupeDiagnostics(arena, c.errors) };
+    const bin_path = out_path orelse return .{ .ok = .{ .cache_hit = false } };
+    const members = try arena.alloc(Archive.Input, c.objects.len);
+    for (members, c.objects) |*m, o| m.* = .{ .name = o.member, .bytes = o.bytes };
+    Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members) catch |err| {
+        std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
+        return .failed;
+    };
+    return .{ .ok = .{ .cache_hit = false } };
+}
+
+fn appendCInputs(arena: std.mem.Allocator, list: *std.ArrayList(u8), c_inputs: []const u8) !void {
+    var it = std.mem.splitScalar(u8, c_inputs, 0);
+    while (it.next()) |p| if (p.len != 0) try appendInput(arena, list, p);
 }
 
 /// Starts compiling the job's C sources (CSource.zig).
@@ -512,7 +537,9 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .modules = opts.modules,
         .fuzz = opts.root_fuzz,
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
-        .c_runtimes = opts.link_inputs.len != 0 or opts.c_sources.len != 0,
+        // Only executables link the C runtimes; a library's C objects
+        // reach them when an executable links the library, as upstream's.
+        .c_runtimes = opts.command != .build_obj and opts.command != .build_lib and (opts.link_inputs.len != 0 or opts.c_sources.len != 0),
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
@@ -606,10 +633,12 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         }
         emit.inputs = &link_inputs;
     }
-    if (c_batch) |b| {
+    // An executable links the C objects; a static library holds them as
+    // members.
+    if (c_batch) |b| if (!emit.obj) {
         emit.inputs = &link_inputs;
         emit.c_batch = b;
-    }
+    };
     // `ZAP_BENCH_CODEGEN=n`: time the backend over this build's functions
     // n more times (`zig build bench-codegen`).
     const bench_runs: u32 = if (env.get("ZAP_BENCH_CODEGEN")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
@@ -642,10 +671,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     };
     if (c_batch) |b| {
         const c = try b.wait();
-        if (inputs) |list| {
-            var it = std.mem.splitScalar(u8, c.inputs, 0);
-            while (it.next()) |p| if (p.len != 0) try appendInput(arena, list, p);
-        }
+        if (inputs) |list| try appendCInputs(arena, list, c.inputs);
         if (c.errors.len != 0) {
             const zig_errors = if (zcu.failed()) try zcu.diagnostics(arena, paths) else &.{};
             return .{ .errors = try dupeDiagnostics(arena, try std.mem.concat(arena, diag.Diagnostic, &.{ zig_errors, c.errors })) };
@@ -672,8 +698,10 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     if (linked and lazy_linked == null and archive) {
         defer Io.Dir.cwd().deleteFile(init.io, link_path) catch {};
         const obj = try Io.Dir.cwd().readFileAlloc(init.io, link_path, arena, .unlimited);
-        const member = try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(opts.root_src_path)});
-        Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, member, obj) catch |err| {
+        var members: std.ArrayList(Archive.Input) = .empty;
+        try members.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(opts.root_src_path)}), .bytes = obj });
+        if (c_batch) |b| for ((try b.wait()).objects) |o| try members.append(arena, .{ .name = o.member, .bytes = o.bytes });
+        Archive.write(init.gpa, init.io, Io.Dir.cwd(), bin_path, members.items) catch |err| {
             std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
             linked = false;
         };
@@ -1218,6 +1246,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     var c_owned: usize = 0;
     var c_flags: CSource.Flags = .{};
     var root_c_flags: ?CSource.Flags = null;
+    // The root module, or other modules, given without a root source file
+    // (`-M<name>`): C sources only.
+    var rootless_root = false;
+    var rootless: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     while (i < args.len) : (i +%= 1) {
         const arg = args[i];
@@ -1329,19 +1361,24 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             try deps.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "-M")) {
             const spec = arg[2..];
-            const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
-                // A module without a root source file holds C sources or
-                // link objects.
-                setUnsupported(&opts, arena, "zap does not build modules without a Zig root source file ('{s}'); build this step with upstream zig", .{arg});
-                continue;
-            };
-            if (root == null) {
-                root = spec[eq + 1 ..];
-                opts.root_name = spec[0..eq];
+            // A module without a root source file holds C sources: no Zig
+            // module, and `--dep`s on it name nothing.
+            const eq = std.mem.indexOfScalar(u8, spec, '=');
+            if (eq == null) {
+                if (root == null and !rootless_root) {
+                    rootless_root = true;
+                    opts.root_name = spec;
+                    root_c_flags = c_flags;
+                } else try rootless.append(arena, spec);
+                deps.clearRetainingCapacity();
+                fuzz = null;
+            } else if (root == null and !rootless_root) {
+                root = spec[eq.? + 1 ..];
+                opts.root_name = spec[0..eq.?];
                 opts.root_deps = try deps.toOwnedSlice(arena);
                 root_fuzz = fuzz;
                 root_c_flags = c_flags;
-            } else try modules.append(arena, .{ .name = spec[0..eq], .path = spec[eq + 1 ..], .deps = try deps.toOwnedSlice(arena), .fuzz = fuzz });
+            } else try modules.append(arena, .{ .name = spec[0..eq.?], .path = spec[eq.? + 1 ..], .deps = try deps.toOwnedSlice(arena), .fuzz = fuzz });
             fuzz = null;
             // The module's C files, arguments and options.
             const module_cc = try cc_argv.toOwnedSlice(arena);
@@ -1432,8 +1469,6 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         } else if (!std.mem.endsWith(u8, arg, ".zig")) {
             const ext = std.fs.path.extension(arg);
             if (std.mem.eql(u8, ext, ".c")) {
-                if (command == .build_obj or command == .build_lib)
-                    setUnsupported(&opts, arena, "zap does not compile C sources into objects or libraries yet ('{s}'); build this step with upstream zig", .{arg});
                 try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{} });
             } else if ((std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a")) and command != .build_obj and command != .build_lib) {
                 try link_inputs.append(arena, arg);
@@ -1462,7 +1497,21 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     if (opts.link_libc and opts.dynamic and command == .build_lib)
         setUnsupported(&opts, arena, "zap does not link shared libraries against glibc yet ('-dynamic' with '-lc'); build this step with upstream zig", .{});
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena, io);
-    opts.root_src_path = root orelse if (opts.unsupported != null) "" else fatal("expected a root source file", .{});
+    // A static library holds the C objects as members; an object or a
+    // shared library would need them linked into it.
+    if (c_files.items.len != 0 and (command == .build_obj or (command == .build_lib and opts.dynamic)))
+        setUnsupported(&opts, arena, "zap does not compile C sources into objects or shared libraries yet ('{s}'); build this step with upstream zig", .{c_files.items[0].path});
+    // C sources without any module: a library of C only, as upstream's.
+    if (root == null and !rootless_root and c_files.items.len != 0 and command == .build_lib) rootless_root = true;
+    if (root == null and rootless_root) {
+        if (command != .build_lib or opts.dynamic)
+            setUnsupported(&opts, arena, "zap builds modules without a Zig root source file only into static libraries of C ('-M{s}'); build this step with upstream zig", .{opts.root_name})
+        else if (c_files.items.len == 0)
+            setUnsupported(&opts, arena, "zap builds a library without a Zig root source file only from C sources ('-M{s}')", .{opts.root_name})
+        else
+            opts.c_only = true;
+    }
+    opts.root_src_path = root orelse if (opts.unsupported != null or opts.c_only) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
     for (libs.items) |q| {
         link_inputs.items[q.at] = try q.find(arena, io, lib_dirs.items) orelse {
@@ -1476,8 +1525,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     }
     opts.link_inputs = link_inputs.items;
     opts.modules = modules.items;
-    // A root file given by position owns what no -M took, as upstream's.
-    if (positional_root) {
+    // A root file given by position owns what no -M took, as upstream's;
+    // so does a library of C only.
+    if (positional_root or (opts.c_only and c_owned == 0)) {
         root_c_flags = c_flags;
         const module_cc = try cc_argv.toOwnedSlice(arena);
         for (c_files.items[c_owned..]) |*f| {
@@ -1486,7 +1536,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         }
         c_owned = c_files.items.len;
     }
-    if (c_owned != c_files.items.len) fatal("C source file '{s}' has no parent module", .{c_files.items[c_owned].path});
+    if (c_owned != c_files.items.len and opts.unsupported == null) fatal("C source file '{s}' has no parent module", .{c_files.items[c_owned].path});
     for (c_files.items) |*f| f.flags = f.flags.inherit(root_c_flags orelse .{});
     opts.c_sources = c_files.items;
     opts.c_global_cc_argv = cc_argv.items;
@@ -1500,6 +1550,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         } else continue;
         fatal("unable to add module \"{s}\": already exists as '{s}'", .{ m.name, prev });
     }
+    // `--dep`s on modules of C only name nothing.
+    if (rootless.items.len != 0) {
+        opts.root_deps = try dropDeps(arena, opts.root_deps, rootless.items);
+        for (modules.items) |*m| m.deps = try dropDeps(arena, m.deps, rootless.items);
+    }
     opts.root_fuzz = root_fuzz orelse fuzz orelse false;
     const seen = try arena.alloc(bool, modules.items.len);
     @memset(seen, false);
@@ -1511,6 +1566,18 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         if (m.fuzz.?) break true;
     } else false;
     return opts;
+}
+
+/// `deps` without those that name one of `names` (`[alias=]name`).
+fn dropDeps(arena: std.mem.Allocator, deps: []const []const u8, names: []const []const u8) ![]const []const u8 {
+    var kept: std.ArrayList([]const u8) = .empty;
+    for (deps) |spec| {
+        const name = if (std.mem.indexOfScalar(u8, spec, '=')) |e| spec[e + 1 ..] else spec;
+        for (names) |n| {
+            if (std.mem.eql(u8, n, name)) break;
+        } else try kept.append(arena, spec);
+    }
+    return kept.items;
 }
 
 /// `-ffuzz` per module, as upstream's `Module.create`: a module without

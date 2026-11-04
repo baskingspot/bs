@@ -394,7 +394,7 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
             defer gpa.free(obj);
             const member = try std.fmt.allocPrint(gpa, "{s}.o", .{inc.archive_stem});
             defer gpa.free(member);
-            break :lib Archive.write(gpa, io, out_dir, sub_path, member, obj);
+            break :lib Archive.write(gpa, io, out_dir, sub_path, &.{.{ .name = member, .bytes = obj }});
         },
         _ => unreachable,
     };

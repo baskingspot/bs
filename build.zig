@@ -915,7 +915,25 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&run.step);
         if (!std.mem.eql(u8, v.name, "zig cc")) continue;
         // The same sources given to zap, which compiles them with upstream's
-        // Clang (CSource.zig), with the archives of the first variant.
+        // Clang (CSource.zig), the archives too, as libraries of C only.
+        for (&archives, [_][]const u8{ "a1", "a2" }) |*a, stem| {
+            const lib_c = b.addRunArtifact(zap);
+            lib_c.setName(b.fmt("zap build-lib of {s}.c", .{stem}));
+            lib_c.addArgs(&.{ "build-lib", "-mcpu", "baseline", "--name", stem });
+            lib_c.addFileArg(b.path(b.fmt("test/link_input/{s}.c", .{stem})));
+            lib_c.setEnvironmentVariable("ZAP_ZIG", zig);
+            a.* = lib_c.addPrefixedOutputFileArg("-femit-bin=", b.fmt("lib{s}.a", .{stem}));
+        }
+        // Upstream's archive of the same C is the same bytes, with its own
+        // linker (with LLD, it writes llvm-ar's format).
+        const up_lib = b.addSystemCommand(&.{ zig, "build-lib", "-fno-llvm", "-fno-lld", "-mcpu", "baseline", "--name", "a1" });
+        up_lib.addFileArg(b.path("test/link_input/a1.c"));
+        const up_a1 = up_lib.addPrefixedOutputFileArg("-femit-bin=", "liba1.a");
+        const same = b.addSystemCommand(&.{"cmp"});
+        same.setName("zap's archive of C is upstream's");
+        same.addFileArg(archives[0]);
+        same.addFileArg(up_a1);
+        test_step.dependOn(&same.step);
         const src = b.addRunArtifact(zap);
         src.setName("zap build-exe with C sources");
         src.addArgs(&.{ "build-exe", "-cflags", "-fcommon", "--" });

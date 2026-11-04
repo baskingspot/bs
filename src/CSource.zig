@@ -228,7 +228,7 @@ pub const Batch = struct {
                         try errors.append(arena, .{ .loc = null, .msg = try std.fmt.allocPrint(arena, "unable to read the object of '{s}' ({s}): {t}", .{ j.source, j.out_path, err }) });
                         continue;
                     };
-                    try objects.append(arena, .{ .path = try arena.dupe(u8, j.out_path), .bytes = bytes });
+                    try objects.append(arena, .{ .path = try arena.dupe(u8, j.out_path), .bytes = bytes, .member = try arena.dupe(u8, std.fs.path.basename(j.out_path)) });
                 },
                 .failed => |stderr| try clangErrors(arena, paths, j.source, stderr, &errors),
                 .err => |msg| try errors.append(arena, .{ .loc = null, .msg = try arena.dupe(u8, msg) }),
@@ -239,7 +239,12 @@ pub const Batch = struct {
     }
 };
 
-pub const Object = struct { path: []const u8, bytes: []const u8 };
+pub const Object = struct {
+    path: []const u8,
+    bytes: []const u8,
+    /// Its name in a static library: the source's stem, `.o`.
+    member: []const u8,
+};
 
 /// Starts compiling `sources`: looks each up in its record, and runs Clang
 /// for the others on up to the CPU count of tasks while the caller goes on.

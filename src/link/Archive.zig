@@ -1,9 +1,11 @@
 //! Static libraries (`zap build-lib`, the default static linkage): a GNU ar
-//! archive holding the library's one relocatable object, as upstream
-//! writes it: a `/SYM64/` symbol index of the object's defined global and
-//! weak symbols (empty when it has none), then the member, named after the
-//! root source file (`protobuf.o` for `-Mroot=src/protobuf.zig`), with a
-//! `//` name table when the name does not fit the header.
+//! archive of the library's relocatable objects, as upstream writes it: a
+//! `/SYM64/` symbol index of the objects' defined global and weak symbols
+//! (empty when they have none), then the members: the Zig object, named
+//! after the root source file (`protobuf.o` for
+//! `-Mroot=src/protobuf.zig`), then one per C source (`add.o`), with a
+//! `//` name table for the names that do not fit the header; odd sizes
+//! are padded with a zero byte, as upstream pads them.
 //!
 //! `Reader` reads archives given as link inputs: GNU and BSD-style
 //! `ar` files with a `/` or `/SYM64/` symbol index and `//` long names.
@@ -13,12 +15,23 @@ const Io = std.Io;
 const elf = std.elf;
 const Allocator = std.mem.Allocator;
 
-/// Writes the archive of object `obj` (an ELF64 ET_REL) to `ar_path`.
-pub fn write(gpa: Allocator, io: Io, dir: Io.Dir, ar_path: []const u8, member_name: []const u8, obj: []const u8) !void {
+/// A member to write: its name, without the trailing `/`, and an ELF64
+/// ET_REL.
+pub const Input = struct { name: []const u8, bytes: []const u8 };
+
+/// Writes the archive of `members`, in order, to `ar_path`.
+pub fn write(gpa: Allocator, io: Io, dir: Io.Dir, ar_path: []const u8, members: []const Input) !void {
+    // Each member's symbols, and how many.
     var names: std.ArrayList(u8) = .empty;
     defer names.deinit(gpa);
+    const counts = try gpa.alloc(u64, members.len);
+    defer gpa.free(counts);
     var count: u64 = 0;
-    try definedSymbols(gpa, obj, &names, &count);
+    for (members, counts) |m, *c| {
+        const before = count;
+        try definedSymbols(gpa, m.bytes, &names, &count);
+        c.* = count - before;
+    }
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -28,25 +41,40 @@ pub fn write(gpa: Allocator, io: Io, dir: Io.Dir, ar_path: []const u8, member_na
     const index_start = out.items.len;
     try out.appendNTimes(gpa, 0, 8 + 8 * count);
     try out.appendSlice(gpa, names.items);
-    if (out.items.len % 2 != 0) try out.append(gpa, '\n');
+    if (out.items.len % 2 != 0) try out.append(gpa, 0);
 
-    // The member's name: `name/` in the header, or `/<offset>` into a
-    // `//` table of `name/\n` entries.
-    const short = member_name.len + 1 <= 16;
-    if (!short) {
-        try header(gpa, &out, "//", member_name.len + 2);
-        try out.appendSlice(gpa, member_name);
-        try out.appendSlice(gpa, "/\n");
-        if (out.items.len % 2 != 0) try out.append(gpa, '\n');
+    // The names that do not fit a header: `name/\n` entries of a `//`
+    // table, which the headers name as `/<offset>`.
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(gpa);
+    const long_at = try gpa.alloc(?usize, members.len);
+    defer gpa.free(long_at);
+    for (members, long_at) |m, *at| {
+        at.* = null;
+        if (m.name.len + 1 <= 16) continue;
+        at.* = long.items.len;
+        try long.appendSlice(gpa, m.name);
+        try long.appendSlice(gpa, "/\n");
     }
-    const member_offset = out.items.len;
-    var name_buf: [17]u8 = undefined;
-    try header(gpa, &out, if (short) try std.fmt.bufPrint(&name_buf, "{s}/", .{member_name}) else "/0", obj.len);
-    try out.appendSlice(gpa, obj);
-    if (out.items.len % 2 != 0) try out.append(gpa, '\n');
-
+    if (long.items.len != 0) {
+        try header(gpa, &out, "//", long.items.len);
+        try out.appendSlice(gpa, long.items);
+        if (out.items.len % 2 != 0) try out.append(gpa, 0);
+    }
+    var sym: u64 = 0;
+    for (members, long_at, counts) |m, at, c| {
+        const member_offset = out.items.len;
+        var name_buf: [17]u8 = undefined;
+        const name = if (at) |o| try std.fmt.bufPrint(&name_buf, "/{d}", .{o}) else try std.fmt.bufPrint(&name_buf, "{s}/", .{m.name});
+        try header(gpa, &out, name, m.bytes.len);
+        try out.appendSlice(gpa, m.bytes);
+        if (out.items.len % 2 != 0) try out.append(gpa, 0);
+        for (0..c) |_| {
+            std.mem.writeInt(u64, out.items[index_start + 8 + 8 * sym ..][0..8], member_offset, .big);
+            sym += 1;
+        }
+    }
     std.mem.writeInt(u64, out.items[index_start..][0..8], count, .big);
-    for (0..count) |i| std.mem.writeInt(u64, out.items[index_start + 8 + 8 * i ..][0..8], member_offset, .big);
 
     var atomic = try dir.createFileAtomic(io, ar_path, .{ .replace = true });
     defer atomic.deinit(io);
@@ -56,7 +84,7 @@ pub fn write(gpa: Allocator, io: Io, dir: Io.Dir, ar_path: []const u8, member_na
 
 /// A member header: name, mtime, uid, gid, mode, size, all space-padded.
 fn header(gpa: Allocator, out: *std.ArrayList(u8), name: []const u8, size: u64) !void {
-    try out.print(gpa, "{s: <16}{s: <12}{s: <6}{s: <6}{s: <8}{d: <10}`\n", .{ name, "0", "0", "0", "644", size });
+    try out.print(gpa, "{s: <16}{s: <12}{s: <6}{s: <6}{s: <8}{d: <10}`\n", .{ name, "0", "0", "0", "0", size });
 }
 
 /// Appends the NUL-terminated names of `obj`'s defined global and weak
