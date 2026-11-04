@@ -5,7 +5,8 @@
 //!
 //! A node's `Manifest.Source` names a ZIR instruction in the ZIR of its
 //! input's recorded content. That ZIR is still in the frontend's cache
-//! (named by the content hash; `Frontend.trimCaches` keeps a day of edits),
+//! (named by the content hash; the global cache keeps ZIR used within 5
+//! days, `Store.maintain`),
 //! so the old instruction maps to the new ZIR as upstream maps them
 //! (`mapOldZirToNew`: declarations by name, `comptime` blocks and unnamed
 //! tests by order, the containers inside a declaration by order). Then:

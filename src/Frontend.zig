@@ -31,8 +31,10 @@ gpa: Allocator,
 io: Io,
 /// Directory containing `std/std.zig` for the pinned Zig release.
 zig_lib_dir: []const u8,
-/// On-disk ZIR caches, indexed by `Module.cache`. Null entries (the default)
-/// keep everything in memory.
+/// On-disk ZIR caches, indexed by `Module.cache`, whose stat index each
+/// holds a module's files' stats. Every file's ZIR, keyed by content, is
+/// in the global one (`blobCache`). Null entries (the default) keep
+/// everything in memory.
 caches: [2]?CacheDir = .{ null, null },
 /// Set at the first failure to write ZIR or an index to a cache, which
 /// alone is reported.
@@ -77,8 +79,9 @@ pub const Module = struct {
     abs_root_dir: ?[:0]const u8 = null,
     /// `@import` names this module resolves to other modules (`--dep`).
     deps: []const Dep = &.{},
-    /// Which of `caches` holds this module's ZIR: std's files are shared by
-    /// every project through the global cache.
+    /// Which of `caches` indexes this module's files' stats: std's are
+    /// shared by every project through the global cache, a project's are
+    /// its own. Their ZIR is in the global cache either way (`blobCache`).
     cache: CacheKind,
     /// The modules `@import("std")`, `@import("root")`, and
     /// `@import("builtin")` name here: the main ones, except in the
@@ -493,9 +496,9 @@ pub fn enableCache(fe: *Frontend, dirs: CacheDirs) !void {
     const gpa = fe.gpa;
     const start = Io.Clock.awake.now(fe.io);
     defer fe.stats.open_ns = @intCast(start.durationTo(Io.Clock.awake.now(fe.io)).toNanoseconds());
-    fe.caches[@backingInt(CacheKind.local)] = try .openOrWarn(gpa, fe.io, dirs.local);
-    if (!std.mem.eql(u8, dirs.local, dirs.global))
-        fe.caches[@backingInt(CacheKind.global)] = try .openOrWarn(gpa, fe.io, dirs.global);
+    const same = std.mem.eql(u8, dirs.local, dirs.global);
+    fe.caches[@backingInt(CacheKind.local)] = try .openOrWarn(gpa, fe.io, dirs.local, same);
+    if (!same) fe.caches[@backingInt(CacheKind.global)] = try .openOrWarn(gpa, fe.io, dirs.global, true);
     for (fe.modules.items) |*m| {
         m.abs_root_dir = Io.Dir.cwd().realPathFileAlloc(fe.io, m.root_dir, gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -506,13 +509,12 @@ pub fn enableCache(fe: *Frontend, dirs: CacheDirs) !void {
 }
 
 /// ZIR an earlier build lowered from file `index`'s source when it had
-/// `content_hash`, from the file's module's cache, for comparing with the
-/// file's ZIR now (`seeds.zig`); null if the cache no longer has it.
+/// `content_hash`, from the cache of every file's ZIR (`blobCache`), for
+/// comparing with the file's ZIR now (`seeds.zig`); null if the cache no
+/// longer has it.
 pub fn loadOldZir(fe: *const Frontend, index: File.Index, content_hash: Hash) Allocator.Error!?OldZir {
-    const mod = fe.module(fe.file(index).module);
-    const cd: *const CacheDir = if (fe.caches[@backingInt(mod.cache)]) |*cd|
-        cd
-    else if (fe.caches[@backingInt(CacheKind.local)]) |*cd| cd else return null;
+    _ = index;
+    const cd = fe.blobCache() orelse return null;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(fe.gpa);
     const zir, const mapping, _ = cd.loadZir(fe.gpa, fe.io, content_hash, &buf) catch |err| switch (err) {
@@ -531,15 +533,28 @@ pub const OldZir = struct {
     }
 };
 
+/// The cache whose index holds `mod`'s files' stats.
 fn cacheFor(fe: *Frontend, mod: *const Module) ?*CacheDir {
     if (fe.caches[@backingInt(mod.cache)]) |*cd| return cd;
     if (fe.caches[@backingInt(CacheKind.local)]) |*cd| return cd;
     return null;
 }
 
+/// The cache that holds every file's ZIR: the global one, so that a
+/// project's ZIR outlives its local cache and its worktrees share it.
+/// The local one only if the global one cannot be opened.
+fn blobCache(fe: *const Frontend) ?*const CacheDir {
+    if (fe.caches[@backingInt(CacheKind.global)]) |*cd| return cd;
+    if (fe.caches[@backingInt(CacheKind.local)]) |*cd| return cd;
+    return null;
+}
+
 /// Cache layout, in `<cache dir>/zap/zir/`:
 /// - `<32 hex digits>`: the ZIR of one source text, named by `hashSource`.
-///   Written once to a temporary file and linked into place; never changed.
+///   Written once to a temporary file and linked into place; never changed
+///   but for its mtime, which a build that maps it renews once a day, so
+///   that the store's maintenance can count and evict it in the global
+///   cache (`Store.maintain`).
 /// - `index`: `IndexHeader` then `IndexEntry`s sorted by `path_hash`.
 ///   Rewritten through a temporary file when a build learns new stats.
 /// - `trim`: empty; its mtime is when `trim` last ran.
@@ -549,12 +564,18 @@ const CacheDir = struct {
     /// `index_bytes`, the whole index file.
     index: []const IndexEntry,
     index_bytes: []align(@alignOf(IndexEntry)) u8,
+    /// The global cache's: its ZIR is every project's, which the store's
+    /// maintenance counts and trims, not `trim`.
+    global: bool,
+    /// ZIR whose mtime is older than this (real clock, nanoseconds) has
+    /// its mtime renewed when it is mapped.
+    renew_before_ns: i96,
 
     const sub_path = "zap" ++ std.fs.path.sep_str ++ "zir";
 
     /// Opens the cache in `path`, or warns and returns null if it cannot
     /// (a full disk, for one): the build goes on without it.
-    fn openOrWarn(gpa: Allocator, io: Io, path: []const u8) Allocator.Error!?CacheDir {
+    fn openOrWarn(gpa: Allocator, io: Io, path: []const u8, global: bool) Allocator.Error!?CacheDir {
         const full = try std.fs.path.join(gpa, &.{ path, sub_path });
         defer gpa.free(full);
         const dir = Io.Dir.cwd().openDir(io, full, .{ .iterate = true }) catch |err| switch (err) {
@@ -567,7 +588,13 @@ const CacheDir = struct {
                 return null;
             },
         };
-        var cd: CacheDir = .{ .dir = dir, .index = &.{}, .index_bytes = &.{} };
+        var cd: CacheDir = .{
+            .dir = dir,
+            .index = &.{},
+            .index_bytes = &.{},
+            .global = global,
+            .renew_before_ns = Io.Clock.real.now(io).toNanoseconds() - std.time.ns_per_day,
+        };
         cd.loadIndex(gpa, io) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // Missing or unreadable: every file is rehashed and the index rewritten.
@@ -585,7 +612,9 @@ const CacheDir = struct {
     /// more than a day old, and other files left that long (temporary files
     /// of interrupted builds), at most once a day. That keeps the cache to
     /// the sources last seen at each path, plus a day of edits. A build
-    /// whose index entry names deleted ZIR lowers the file again.
+    /// whose index entry names deleted ZIR lowers the file again. In the
+    /// global cache it deletes only the other files: the ZIR there is
+    /// every project's, and goes with the store's packs (`Store.maintain`).
     fn trim(cd: *const CacheDir, gpa: Allocator, io: Io) !void {
         const now = Io.Clock.real.now(io);
         if (cd.dir.statFile(io, "trim", .{})) |stat| {
@@ -594,8 +623,8 @@ const CacheDir = struct {
         try cd.dir.writeFile(io, .{ .sub_path = "trim", .data = "" });
         var named: std.AutoHashMapUnmanaged(Hash, void) = .empty;
         defer named.deinit(gpa);
-        {
-            var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_bytes = &.{} };
+        if (!cd.global) {
+            var index: CacheDir = .{ .dir = cd.dir, .index = &.{}, .index_bytes = &.{}, .global = false, .renew_before_ns = 0 };
             try index.loadIndex(gpa, io);
             defer gpa.free(index.index_bytes);
             try named.ensureTotalCapacity(gpa, @intCast(index.index.len));
@@ -607,7 +636,7 @@ const CacheDir = struct {
             var hash: Hash = undefined;
             if (e.name.len == 2 * hash.len) {
                 if (std.fmt.hexToBytes(&hash, e.name)) |_| {
-                    if (named.contains(hash)) continue;
+                    if (cd.global or named.contains(hash)) continue;
                 } else |_| {}
             }
             const stat = cd.dir.statFile(io, e.name, .{}) catch continue;
@@ -669,8 +698,10 @@ const CacheDir = struct {
         const f = try cd.dir.openFile(io, &name, .{});
         defer f.close(io);
         const header, const layout, const summary = try readSummary(f, gpa, io, buf);
-        const len = try f.length(io);
+        const stat = try f.stat(io);
+        const len = stat.size;
         if (layout.total != len) return error.CorruptCache;
+        if (stat.mtime.toNanoseconds() < cd.renew_before_ns) f.setTimestampsNow(io) catch {};
         var mm: Io.File.MemoryMap = try .create(io, f, .{
             .len = @intCast(len),
             .protection = .{ .read = true },
@@ -1360,13 +1391,14 @@ fn probeFile(fe: *Frontend, job: *Job, buf: *std.ArrayList(u8)) !union(enum) {
     };
     job.stat = stat;
     const entry = cd.lookup(pathHash(mod, f.sub_path)) orelse return .miss;
+    const blobs = fe.blobCache().?;
     if (!entry.matches(stat)) {
-        return .{ .changed = cd.loadSummary(fe.gpa, fe.io, entry.content_hash, buf) catch |err| switch (err) {
+        return .{ .changed = blobs.loadSummary(fe.gpa, fe.io, entry.content_hash, buf) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .miss,
         } };
     }
-    f.zir, f.mapping, const summary = cd.loadZir(fe.gpa, fe.io, entry.content_hash, buf) catch |err| switch (err) {
+    f.zir, f.mapping, const summary = blobs.loadZir(fe.gpa, fe.io, entry.content_hash, buf) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .miss,
     };
@@ -1395,7 +1427,7 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
         },
     };
     f.content_hash = hashSource(src);
-    if (cache) |cd| {
+    if (cache != null) {
         const stat = job.stat.?;
         const mtime: i64 = @intCast(stat.mtime.toNanoseconds());
         job.index_update = .{
@@ -1405,7 +1437,7 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
             .mtime = if (mtime >= l.start_ns - IndexEntry.racy_window_ns) IndexEntry.racy_mtime else mtime,
             .content_hash = f.content_hash,
         };
-        if (cd.loadZir(gpa, io, f.content_hash, buf)) |loaded| {
+        if (fe.blobCache().?.loadZir(gpa, io, f.content_hash, buf)) |loaded| {
             f.zir, f.mapping, const summary = loaded;
             job.how = .content_hit;
             job.loaded = true;
@@ -1420,9 +1452,10 @@ fn lowerFile(fe: *Frontend, l: *Loader, job: *Job, arena_state: *std.heap.ArenaA
     const zir = try AstGen.generate(arena, ast);
     const summary: Summary = try .of(arena, &zir);
     job.how = .lowered;
-    if (cache) |cd| {
-        if (cd.saveZir(gpa, io, f.content_hash, &zir, summary)) |_| {
-            if (cd.loadZir(gpa, io, f.content_hash, buf)) |loaded| {
+    if (cache != null) {
+        const blobs = fe.blobCache().?;
+        if (blobs.saveZir(gpa, io, f.content_hash, &zir, summary)) |_| {
+            if (blobs.loadZir(gpa, io, f.content_hash, buf)) |loaded| {
                 f.zir, f.mapping, _ = loaded;
                 job.loaded = true;
                 return summary;

@@ -26,24 +26,37 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
 - Files are discovered and lowered from a work queue: lowering a file
   reveals its imports. File indices are assigned afterwards, breadth-first
   in import order from the root, so they do not depend on thread timing.
-- ZIR is cached on disk per file, in `<cache>/zap/zir/` of the local cache
-  (the root module) and the global cache (std, shared by every project).
+- ZIR is cached on disk per file, in `<cache>/zap/zir/`. Every file's
+  ZIR is in the global cache, keyed by content, so that a project's ZIR
+  outlives its local cache and its worktrees and copies share it; each
+  cache's index holds the stats of its own files: the local cache's the
+  project's modules', the global cache's std's (shared by every project).
   The directories are resolved like `zig build-exe`: `--cache-dir`,
   `ZIG_LOCAL_CACHE_DIR`, or the `.zig-cache` next to the nearest `build.zig`,
   else the global cache (always for `run`); `--global-cache-dir`,
   `ZIG_GLOBAL_CACHE_DIR`, or `~/.cache/zig`.
-  - `<32 hex digits>`: one source text's ZIR, named by a 128-bit hash of
-    the source salted with the Zig version. A header and the file's import
-    names and error flag come first, then the ZIR arrays at their natural
-    alignment, so the file is mapped and used in place. Written to an
-    unnamed temporary file and linked into place; never modified.
-  - `index`: sorted fixed-size records (path hash, inode, size, mtime,
-    content hash), read whole at startup and replaced through a temporary
-    file when a build learns new stats. Concurrent builds lose at most
-    each other's new records, which costs a rehash, not correctness.
-    A file modified within 2 s of the build's start is recorded with an
-    mtime that never matches, so a same-tick edit cannot hide behind an
-    unchanged stat.
+  - `<32 hex digits>` (global cache): one source text's ZIR, named by a
+    128-bit hash of the source salted with the Zig version. A header and
+    the file's import names and error flag come first, then the ZIR arrays
+    at their natural alignment, so the file is mapped and used in place.
+    Written to an unnamed temporary file and linked into place; never
+    modified but for its mtime, which a build that maps it renews once a
+    day (the `fstat` the mapping needs anyway tells when). The local cache
+    holds ZIR only if the global one cannot be opened.
+  - `index` (both caches): sorted fixed-size records (path hash, inode,
+    size, mtime, content hash), read whole at startup and replaced through
+    a temporary file when a build learns new stats. Concurrent builds lose
+    at most each other's new records, which costs a rehash, not
+    correctness. A file modified within 2 s of the build's start is
+    recorded with an mtime that never matches, so a same-tick edit cannot
+    hide behind an unchanged stat. A record whose ZIR is gone (trimmed, or
+    in a local cache from before ZIR moved to the global one) is a probe
+    miss: the file is hashed, and lowered if no ZIR has its content.
+  - Trimming: the global cache's ZIR counts toward `ZAP_CACHE_MAX_SIZE`
+    and goes with the store's packs (`Store.maintain`): unused for 5 days
+    by its mtime, or least recently used first past the limit. The
+    store's maintenance runs daily and whenever its packs alone pass the
+    limit, so a day's new ZIR can pass it until then.
 - A file is first *probed*: stat it and, if the index matches, read the
   blob's header with one `pread` and map the rest without touching it. A
   probe miss reads and hashes the source; a known content hash is mapped,
@@ -67,6 +80,16 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
   edit build the edited file's own lowering (about 5 ms for `debug.zig`) is
   the critical path. std's
   cached ZIR takes 41 MB.
+- Project ZIR in the global cache (2026-11-04, `bench/bench.py`, zap
+  ReleaseFast, median of 10, cold 5): a cold-local build (empty local
+  cache) no longer lowers the project's files. Before → after: vaxis
+  226 → 98 ms, the zig workload 3.95 → 3.32 s; with lazy donor builds,
+  hello 14 ms, vaxis 23 ms, the zig workload 155 ms and a fresh zls
+  worktree 31 ms. Cold builds (hello 374 / 368 ms, vaxis 618 / 585 ms,
+  zig 10.01 / 10.02 s), warm builds and edit builds of the root and of a
+  library file stay within noise. The global cache grows by the
+  project's ZIR: 70 MB for the zig workload (184 files, the largest
+  35 MB), 20 MB for vaxis, on 408 and 55 MB before.
 - ZON imports (`@import("x.zon")`) are not frontend files. Sema reads the
   file through the `@embedFile` path, so the importing unit depends on its
   bytes (`embed_file`), parses it with `Ast.parse(.zon)` and std's
@@ -3235,6 +3258,7 @@ compilation (see "Integration" below).
 <global cache>/zap/store/<32 hex>.zsp       Store packs (shared by all projects)
 <global cache>/zap/store/lock               flock held by maintenance (merging, trimming)
 <global cache>/zap/store/trim               when packs were last trimmed
+<global cache>/zap/zir/<32 hex>             every file's ZIR, by content (Frontend); trimmed with the packs
 <local cache>/zap/c/trim                    when compilation directories were last scanned
 <local cache>/zap/c/<32 hex>/               one compilation, keyed by root, target, options, output
     lock          flock held by the build that owns the directory; its mtime is the last use
@@ -3533,9 +3557,12 @@ it and can flush every CPU's TLB.
   the build's own pack was written: 4.47 GB after six); with 1G and two
   such runs at a time, three rounds peak at 1.01 GB (before: 1.50 GB). A
   limit below the working set cannot hold: two x86_64 units in use at
-  once are 1.1 GB. The ZIR caches are kept to the
-  sources their index names (one version per path) plus a day of edits
-  (`Frontend.trimCaches`, daily, also beside the store work).
+  once are 1.1 GB. The global cache's ZIR is
+  trimmed and evicted with the store's packs (the Frontend section); a
+  local cache's ZIR (written only when the global cache cannot be opened)
+  is kept to the sources its index names (one version per path) plus a
+  day of edits (`Frontend.trimCaches`, daily, also beside the store
+  work), which also deletes both caches' stale temporary files.
 - **Why the cache grew without bound** (measured 2026-11-03): a
   conformance run with an empty cache writes 696 MB that stays (653 MB in
   114 compilation directories, of which the x86_64 unit's are a 555 MB
@@ -3599,7 +3626,7 @@ container of a `type_layout`, `struct_defaults`, `namespace`, or
 `namespace_name` node (with the name it looks up, in `source_names`),
 the block of a `comptime_decl`; an `embed_file` node names its input
 only. The old ZIR is still in the frontend's cache, named by the
-recorded content hash (trimming keeps a day of edits), so upstream's
+recorded content hash (the global cache keeps ZIR used within 5 days), so upstream's
 `mapOldZirToNew` (declarations by name, `comptime` blocks and unnamed
 tests by order, the containers inside a declaration by order) maps each
 recorded instruction to the new ZIR. A node is a seed if its instruction

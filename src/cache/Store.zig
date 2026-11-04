@@ -31,6 +31,10 @@
 //! by the build's `commit`; live entries move to young packs and old packs
 //! fall out of use.
 //!
+//! The global cache's ZIR (`<global cache>/zap/zir/<32 hex>`, every
+//! project's, `Frontend`) counts and goes with the packs: each file is a
+//! candidate by its mtime, which a build that maps it renews daily.
+//!
 //! Pack file: `PackHeader`; entries, each 16-byte aligned (`Header`,
 //! `deps_len` `Dep`s, `atoms_len` atom records (`cache.atoms`,
 //! `atoms_bytes` long), `payload_len` payload bytes); then the index:
@@ -90,6 +94,8 @@ const pack_ext = ".zsp";
 /// trims them with the packs, by last use, counting the manifest and the
 /// linked packs the store itself no longer has.
 pub const donors_dir = "donors";
+/// The global cache's ZIR directory (`Frontend`), relative to the store.
+const zir_dir = ".." ++ std.fs.path.sep_str ++ "zir";
 /// A donor being written; `maintain` deletes one older than an hour.
 pub const donor_tmp_prefix = "tmp-";
 
@@ -751,6 +757,16 @@ fn maintainIfDue(store: *const Store, gpa: Allocator, io: Io, new_bytes: u64) vo
     _ = maintain(gpa, io, store.dir, .{ .trim = trim_due, .now = now, .max_bytes = store.max_bytes }) catch {};
 }
 
+const CandidateKind = enum { pack, donor, zir };
+
+fn deleteCandidate(io: Io, dir: Io.Dir, donors: ?Io.Dir, zir: ?Io.Dir, kind: CandidateKind, name: []const u8) !void {
+    switch (kind) {
+        .pack => try dir.deleteFile(io, name),
+        .donor => try donors.?.deleteTree(io, name),
+        .zir => try zir.?.deleteFile(io, name),
+    }
+}
+
 pub const MaintainOptions = struct {
     trim: bool,
     now: Io.Timestamp,
@@ -779,7 +795,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
     }
     // Every pack, readable (`live`) or not (`OtherPack`), as candidates
     // for deletion.
-    const Candidate = struct { name: []const u8, size: u64, mtime: Io.Timestamp, order: i64, live: ?*const PackFile, donor: bool = false };
+    const Candidate = struct { name: []const u8, size: u64, mtime: Io.Timestamp, order: i64, live: ?*const PackFile, kind: CandidateKind = .pack };
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(gpa);
     var live: std.ArrayList(*const PackFile) = .empty;
@@ -817,7 +833,26 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
                 .mtime = manifest.mtime,
                 .order = std.math.minInt(i64),
                 .live = null,
-                .donor = true,
+                .kind = .donor,
+            });
+        }
+    }
+    var zir: ?Io.Dir = dir.openDir(io, zir_dir, .{ .iterate = true }) catch null;
+    defer if (zir) |*d| d.close(io);
+    if (zir) |d| {
+        var it = d.iterate();
+        while (try it.next(io)) |e| {
+            var hash: [16]u8 = undefined;
+            if (e.kind != .file or e.name.len != 2 * hash.len) continue;
+            _ = std.fmt.hexToBytes(&hash, e.name) catch continue;
+            const st = d.statFile(io, e.name, .{}) catch continue;
+            try candidates.append(gpa, .{
+                .name = try arena_state.allocator().dupe(u8, e.name),
+                .size = st.size,
+                .mtime = st.mtime,
+                .order = std.math.minInt(i64),
+                .live = null,
+                .kind = .zir,
             });
         }
     }
@@ -825,7 +860,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
     var n_kept: usize = 0;
     for (candidates.items) |c| {
         if (options.trim and c.mtime.durationTo(options.now).toNanoseconds() > max_unused_ns) {
-            if (c.donor) donors.?.deleteTree(io, c.name) catch {} else dir.deleteFile(io, c.name) catch {};
+            deleteCandidate(io, dir, donors, zir, c.kind, c.name) catch {};
             result.deleted += 1;
             continue;
         }
@@ -848,7 +883,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
         const target = options.max_bytes - options.max_bytes / 4;
         for (candidates.items) |*c| {
             if (total <= target) break;
-            if (c.donor) donors.?.deleteTree(io, c.name) catch continue else dir.deleteFile(io, c.name) catch continue;
+            deleteCandidate(io, dir, donors, zir, c.kind, c.name) catch continue;
             total -= c.size;
             result.evicted += 1;
             c.live = null;
@@ -1114,9 +1149,31 @@ test "merges leave large packs alone, and the size limit evicts the least recent
     try t.expectEqual(0, (try maintain(gpa, io, store_dir, .{ .trim = false, .now = now, .max_bytes = 2 << 20 })).evicted);
     try t.expectEqual(1, (try maintain(gpa, io, store_dir, .{ .trim = false, .now = now, .max_bytes = 1 << 20 })).evicted);
     try t.expectError(error.FileNotFound, store_dir.statFile(io, other_name, .{}));
-    var store: Store = try .open(gpa, io, tmp.dir);
-    defer store.close(gpa, io);
-    try t.expectEqual(0, (try store.get(gpa, io, 100)).?.resultHash());
+    {
+        var store: Store = try .open(gpa, io, tmp.dir);
+        defer store.close(gpa, io);
+        try t.expectEqual(0, (try store.get(gpa, io, 100)).?.resultHash());
+    }
+    // The global cache's ZIR counts and goes with the packs, by mtime: an
+    // hour-old file is evicted before the newer packs, and one unused for
+    // `max_unused_ns` is trimmed. Its other files are not candidates.
+    try tmp.dir.createDirPath(io, "zap/zir");
+    var zd = try tmp.dir.openDir(io, "zap/zir", .{});
+    defer zd.close(io);
+    const zir_old = "0123456789abcdef0123456789abcdef";
+    const zir_new = "fedcba9876543210fedcba9876543210";
+    try zd.writeFile(io, .{ .sub_path = zir_old, .data = other_bytes });
+    try zd.setTimestamps(io, zir_old, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-std.time.ns_per_hour)) } });
+    try zd.writeFile(io, .{ .sub_path = zir_new, .data = "z" });
+    try zd.writeFile(io, .{ .sub_path = "index", .data = other_bytes });
+    try t.expectEqual(0, (try maintain(gpa, io, store_dir, .{ .trim = false, .now = now, .max_bytes = 2 << 20 })).evicted);
+    try t.expectEqual(1, (try maintain(gpa, io, store_dir, .{ .trim = false, .now = now, .max_bytes = 1 << 20 })).evicted);
+    try t.expectError(error.FileNotFound, zd.statFile(io, zir_old, .{}));
+    _ = try zd.statFile(io, zir_new, .{});
+    const later = now.addDuration(.fromNanoseconds(max_unused_ns + std.time.ns_per_s));
+    _ = try maintain(gpa, io, store_dir, .{ .trim = true, .now = later });
+    try t.expectError(error.FileNotFound, zd.statFile(io, zir_new, .{}));
+    _ = try zd.statFile(io, "index", .{});
 }
 
 test "a pack written in place reads back like a committed batch" {
