@@ -1442,6 +1442,19 @@ fn analyzeReifiedStructLayout(sema: *Sema, key: InternPool.ContainerType, info: 
 /// Computes the layout of a struct whose field types are known. `aligns`
 /// holds explicit field alignments (0 for none), or is empty.
 /// `cont_src` is the declaration, for errors about a field.
+/// Fails a field of opaque type `ty` at `src` in a struct or union, as
+/// upstream.
+fn failOpaqueField(sema: *Sema, block: *Block, src: Src, ty: Index, comptime container: enum { @"struct", @"union" }) CompileError {
+    const fmt_ty: FmtType = .{ .ip = sema.ip, .ty = ty, .decl_note = false };
+    const err = switch (container) {
+        .@"struct" => sema.fail(block, src, "cannot directly embed opaque type '{f}' in struct", .{fmt_ty}),
+        .@"union" => sema.fail(block, src, "cannot directly embed opaque type '{f}' in union", .{fmt_ty}),
+    };
+    try sema.zcu.addNote(sema.file, src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file))), "opaque types have unknown size", .{});
+    try sema.addDeclaredHereNote(ty);
+    return err;
+}
+
 fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.ContainerInfo, layout: std.lang.Type.ContainerLayout, explicit_backing: Index, offsets: []u64, aligns: []const u64) CompileError!void {
     const ip = sema.ip;
     const types = info.field_types;
@@ -1452,6 +1465,7 @@ fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.Con
         var bits: u64 = 0;
         for (types, 0..) |ft, i| {
             try sema.resolveLayout(block, src, ft);
+            if (Type.class(ip, ft) == .@"opaque") return sema.failOpaqueField(block, cont_src.fieldSrc(@intCast(i), .type), ft, .@"struct");
             const fb = sema.packedFieldBits(ft) orelse
                 return sema.failUnpackable(block, cont_src.fieldSrc(@intCast(i), .type), "packed structs cannot contain fields of type '{f}'", ft);
             offsets[i] = bits;
@@ -1489,6 +1503,7 @@ fn structLayout(sema: *Sema, block: *Block, cont_src: Src, info: *InternPool.Con
         var alignment: u64 = 1;
         for (types, field_aligns, order, 0..) |ft, *fa, *o, i| {
             offsets[i] = 0;
+            if (Type.class(ip, ft) == .@"opaque") return sema.failOpaqueField(block, cont_src.fieldSrc(@intCast(i), .type), ft, .@"struct");
             if (info.fieldIsComptime(i)) {
                 o.* = omitted;
                 continue;
@@ -1756,7 +1771,10 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
                 // Every field has the backing integer's bit width.
                 info.status = .layout_wip;
                 if (n == 0) return sema.fail(&block, src, "packed union has no fields", .{});
-                for (types) |ft| try sema.resolveLayout(&block, src, ft);
+                for (types, 0..) |ft, i| {
+                    try sema.resolveLayout(&block, src, ft);
+                    if (Type.class(ip, ft) == .@"opaque") return sema.failOpaqueField(&block, cont_src.fieldSrc(@intCast(i), .type), ft, .@"union");
+                }
                 const field_bits = try sema.arena.alloc(u16, n);
                 for (types, field_bits, 0..) |ft, *b, i| b.* = sema.packedFieldBits(ft) orelse
                     return sema.failUnpackable(&block, cont_src.fieldSrc(@intCast(i), .type), "packed unions cannot contain fields of type '{f}'", ft);
@@ -1807,6 +1825,7 @@ fn analyzeUnionLayout(sema: *Sema, key: InternPool.ContainerType, info: *InternP
     var comptime_state = false;
     for (types, 0..) |ft, i| {
         try sema.resolveLayout(&block, src, ft);
+        if (Type.class(ip, ft) == .@"opaque") return sema.failOpaqueField(&block, cont_src.fieldSrc(@intCast(i), .type), ft, .@"union");
         if (info.layout == .@"extern") try sema.checkExtern(&block, cont_src.fieldSrc(i, .type), ft, .union_field, "extern unions cannot contain fields of type '{f}'", .{FmtType{ .ip = ip, .ty = ft, .decl_note = false }});
         // As upstream, every field counts toward the size and alignment,
         // even one that cannot be active (`noreturn align(8)`).
@@ -7470,6 +7489,11 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         }
         packed_offset = .{ .bit_offset = @intCast(bit_offset), .host_size = @intCast(host_size) };
     }
+    if (data.size != .one) switch (Type.class(sema.ip, elem)) {
+        .@"fn" => return sema.fail(block, elem_src, "function pointers must be single pointers", .{}),
+        .@"opaque" => return sema.fail(block, elem_src, "indexable pointer to opaque type '{f}' not allowed", .{sema.fmtType(elem)}),
+        else => {},
+    };
     return .fromInterned(try sema.ptrType(.{
         .packed_offset = packed_offset,
         .child = elem,
