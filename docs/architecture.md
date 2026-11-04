@@ -2257,6 +2257,193 @@ reviewed by the hello thread, which owns CodeGen; the Sema thread
 reviews export linkage; the cache thread is consulted on the relocation
 kinds.
 
+### Object, archive and shared-library inputs (milestone 9, linker side; designed 2026-11-04, for review)
+
+Scope: x86_64-linux. ELF relocatable objects (`.o`) and archives (`.a`)
+become link inputs of zap's executables, objects and shared objects,
+alongside Zig's atoms. Shared libraries (`.so`) as inputs come last.
+Mach-O inputs get a design of their own later. The C thread's design
+("C interop") produces the objects (upstream `zig cc` per C source) and
+owns `-lc`, the start file and abilists. This section is what the
+linkers do with the objects. Today main.zig rejects `.o`, `.a` and `.so`
+arguments as `[unsupported]`.
+
+**Where conversion happens.** A new `src/link/ElfInput.zig` reads an
+object, or an archive member, mapped and zero-copy, and turns it into
+Atoms. The link stays one pass over atoms: nothing downstream knows an
+atom came from C. `Emit.finish` loads the inputs after analysis, resolves
+names across Zig and the objects (below), converts, and appends the
+atoms before the link. The cache's relink does the same from the input
+paths (the cache thread owns that part; see Cache).
+
+**Atoms: one per allocated input section.** Code within a section
+calls its static functions with no relocation, so a section cannot be
+split, and it is the unit. Upstream's Debug C flags include
+`-fno-function-sections -fno-data-sections` (checked with
+`--verbose-cc`), so an object's `.text` is one atom holding all of the
+translation unit's functions. The atom is named after the section's
+first global symbol, else after the section. Every function and object
+symbol of the input still gets its own entry in the output's .symtab,
+which debuggers and profilers read: through a side list in
+`Elf.Options` (name, atom key, offset, size, type), not through `Atom`,
+whose format stays as it is. The key is `fromName("obj:"
+++ the file's content hash ++ ":" ++ section index)`: stable across paths
+and worktrees, so the store and donors can dedup. Input sections map to
+`Atom.Section` by flags:
+- SHF_EXECINSTR → text;
+- SHF_TLS → tdata, or tbss if NOBITS;
+- NOBITS and COMMON symbols → bss (a COMMON symbol is one zero-fill atom
+  of its size and alignment; the largest wins, as ld);
+- SHF_WRITE → data (`.data.rel.ro*` too: correct, if less hardened);
+- other SHF_ALLOC → rodata;
+- `.init_array*`, `.fini_array*`, `.preinit_array` → three new
+  `Atom.Section` values (appended). They are RW with `x86_64_abs64`
+  entries, ordered by their priority suffix as ld orders them. The
+  linker defines `__init_array_start`/`__init_array_end` and the others
+  as section bounds, as for the sancov sections, and dynamic executables
+  get DT_INIT_ARRAY/DT_FINI_ARRAY.
+- Non-allocated sections are dropped (`.comment`, `.note.*`, `.group`,
+  `.llvm_addrsig`), except `.eh_frame` and `.debug_*` (stage B). An
+  object without `.note.GNU-stack` does not make zap's stack executable.
+
+**Symbols and resolution.** An object's global symbol is a name for
+(section atom, offset). One table maps names to definitions: Zig's
+exports, the loaded objects' globals, then archive members pulled on
+demand. It lives in Emit, next to `userExport`/`rtExport`, which already
+resolve externs by name. Rules, as ld's:
+- Two strong definitions of a name are an error that names both inputs.
+- A strong definition beats weak ones; among weak ones, the first in
+  input order wins.
+- An undefined name pulls the archive member whose symbol index defines
+  it. Pulling repeats over all archives until nothing changes (lld's
+  semantics, so archive order and cycles do not matter).
+- Then compiler_rt, as upstream links libcompiler_rt after the inputs.
+- Then shared libraries (abilists for `-lc`, `.so` inputs in stage C),
+  which give imports.
+- An undefined weak name is 0. A strong name still undefined is the
+  usual "undefined symbol" error, now saying which input referenced it.
+
+Zig externs keep their 8-byte slots. A slot's target becomes the object
+symbol's (atom key, offset), with the offset in the addend.
+
+**Relocations.** These are the kinds that upstream's C objects carry,
+and system `cc`'s (`-fPIE` by default on Debian). Without `-lc`, upstream
+compiles C as non-PIC: extern data comes through R_X86_64_32S and
+thread-locals through TPOFF32 (checked). With `-lc` it compiles C as
+`-fPIC`, because glibc requires PIC. Targets are atom keys plus addends; a reference to a section
+symbol or a local becomes (section atom, value + addend).
+- R_X86_64_64 → `x86_64_abs64`. PC32 → `x86_64_pc32`. New appended
+  kinds `x86_64_abs32` (32, checked to fit u32) and `x86_64_abs32s` (32S,
+  i32) are for non-PIE code in zap's non-PIE executables. PC64 → new
+  `x86_64_pc64`.
+- PLT32 → `x86_64_pc32` to the definition when there is one. To an
+  import, it goes to a *PLT stub atom*: an 8-byte `jmp [rip + slot]`
+  (text, content-addressed by the import's slot key) whose pc32 targets
+  the import's extern slot. PLT stubs are then ordinary atoms, and the
+  executable needs no linker-made PLT (the C thread's no-PLT rule holds
+  for Zig code; C calls to imports get stubs).
+- GOTPCREL, GOTPCRELX, REX_GOTPCRELX: the GOT entry is the target's
+  slot atom, the same kind of 8-byte rodata atom with an `x86_64_abs64`
+  that Zig externs use, content-addressed by (target, offset). So C and
+  Zig share one GOT entry per symbol, and an import's gets its GLOB_DAT
+  as Zig's do. When the target is defined in the image (always, except
+  imports) and the form is relaxable, ElfInput relaxes as ld does instead:
+  `mov reg, [rip + x@GOTPCREL]` becomes `lea reg, [rip + x]`, and `call`
+  or `jmp` through the GOT becomes `addr32 call x` or `jmp x; nop`. The
+  relocation is then `x86_64_pc32`.
+- TLS. In an executable every thread-local is the image's own, so
+  ElfInput relaxes the canonical sequences to local-exec as ld does:
+  GD's 16 bytes to `mov rax, fs:0; lea rax, [rax + x@tpoff]`; LD's
+  `lea rdi, [rip + x@tlsld]; call __tls_get_addr` to the 12-byte padded
+  `mov rax, fs:0`, with each DTPOFF32 becoming `x86_64_tpoff32` on the
+  offset; IE's `mov reg, [rip + x@gottpoff]` to `mov reg, imm32`
+  (`x86_64_tpoff32`); TPOFF32 as is. In a shared object, GD and LD stay
+  (`x86_64_tlsgd`/`x86_64_tlsld`, the GOT pairs made by ElfDynamic). IE
+  in a shared object, and thread-locals imported from shared libraries,
+  are `[unsupported]` until something needs them.
+- GOTPC32/GOTOFF64 (large model), SIZE32/64 and the rest fail with an
+  error naming the object, section and kind.
+- Copy relocations: only non-PIC code reading an import's data with PC32
+  or 32S needs them. Upstream's C flags under `-lc` (`-fPIC`) produce
+  none, and neither does Debian's `cc` default (`-fPIE`, which reads
+  through the GOT). Until an input needs
+  one, it is an error naming the symbol.
+
+**Merged sections.** SHF_MERGE|SHF_STRINGS sections (`.rodata.str1.1`,
+which clang always emits) split into one content-addressed atom per
+string (`SymbolKey.fromContents`). The linker's existing dedup then
+merges equal strings across objects, and with Zig's string constants
+when the section and alignment match. Fixed-size SHF_MERGE sections
+(`.rodata.cst8`/`cst16`) split per entry the same way. A relocation into
+a merged section's middle maps its offset to (the containing entry, the
+offset within it) by binary search.
+
+**COMDAT groups.** The first group with a given signature, in input
+order, is kept. Later groups' sections are dropped before conversion,
+and their symbols resolve to the kept group's by name. No "identical
+contents" check is made, as ld makes none.
+
+**Archives.** `Archive.zig` gains a reader: GNU and BSD `ar`, the `/` and
+`/SYM64/` symbol index, `//` long names. A member is parsed only when
+pulled. Thin archives are `[unsupported]`. `-l<name>` searches `-L`
+directories for `lib<name>.a` (and `.so` in stage C).
+
+**Unwind and debug info (stage B).**
+- `.eh_frame`: each FDE belongs to the section its pc_begin names. The
+  atom's unwind gains a kind `.raw` with the FDE's CIE and instructions,
+  copied. Elf's `.eh_frame` writer emits each distinct input CIE once,
+  and `.eh_frame_hdr` covers the copies, so std's unwinder and debuggers
+  step through C frames.
+- `.debug_*` (clang's DWARF 4): each input compile unit is copied as
+  opaque contributions to .debug_info/.debug_abbrev/.debug_line/
+  .debug_str/.debug_ranges/.debug_loc, after zap's units, with its
+  relocations against atom keys (addresses) and its own contributions
+  (offsets). This needs a second debug input list in `Elf.Options`, since
+  `Atom.Debug` is zap's line-program format.
+- Until stage B, C frames unwind by frame pointer (upstream builds Debug
+  C with `-fno-omit-frame-pointer`), and traces show their symbols
+  without lines. Whether std's unwinder falls back to frame pointers
+  without an FDE is to check first.
+
+**Shared libraries as inputs (stage C).** A `.so` contributes names, with
+their versions (`.dynsym`, `.gnu.version`, `.gnu.version_d`) and its
+DT_SONAME for DT_NEEDED, to the same resolution step as abilists. They
+become imports exactly like the C thread's abilists imports. No bytes
+come from it.
+
+**Cache** (the cache thread's side; to agree). The atoms are a function
+of the input files' bytes and of the resolution result (relaxations,
+which members are pulled, GOT and PLT atoms). Proposal for stage A:
+- Inputs are manifest inputs, hashed by content as source files are.
+- Conversion reruns on every build and relink: it is a scan plus
+  slicing, with copies only for relaxed sequences.
+- Its atoms are not stored in the pack, and the relink numbers them
+  after the manifest's symbols.
+- If profiles show the conversion, store the converted atoms keyed by
+  the inputs' hashes and the resolution.
+
+**Cost.** Nothing runs without object or library arguments: the reader,
+the name table and the conversion are all behind them. A link with
+inputs must stay dominated by copying bytes. Measure linking SQLite's
+amalgamation (one 9 MB object) and zlib's 15 objects, with a small Zig
+main, against upstream's link of the same objects.
+
+**Stages and checks.**
+1. A: objects and archives into zap's static and `-lc` executables (the
+   latter once the C thread's step 1 lands): sections, symbols,
+   relocations with GOT and PLT atoms and the relaxations, merged
+   strings, COMDAT, COMMON, init/fini arrays. Tests, each run and
+   compared with upstream's link of the same inputs: C objects from
+   upstream `zig cc -c` and from system `cc -c`, called from Zig and
+   calling Zig; a constructor; equal strings from two objects merged; an
+   archive whose members pull each other in a cycle; `-fPIC` C
+   thread-locals (GD, LD and IE relaxed); a COMDAT pair written in
+   assembly; a Zig panic in a callback the C code calls.
+2. B: `.eh_frame` and DWARF pass-through. Checks: gdb's `bt` and line
+   numbers through C frames, and std's stack trace through them.
+3. C: `.so` inputs (`-l<name>` against a library upstream built), and
+   copy relocations if an input needs them.
+
 ### compiler_rt (decided 2026-11-02)
 
 - Upstream compiles all of `lib/compiler_rt.zig` as a separate compilation
