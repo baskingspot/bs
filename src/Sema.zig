@@ -7534,17 +7534,25 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
         if (a == b or a == .generic_poison_type or b == .generic_poison_type) continue;
         if (Type.class(ip, a) == .pointer and Type.class(ip, b) == .pointer and sema.ptrCoercibleInPlace(b, a)) continue;
         if (sema.cPtrOptCoercibleInMemory(b, a) or sema.cPtrOptCoercibleInMemory(a, b)) continue;
+        // A parameter may take more errors than `dst`'s passes.
+        if (sema.errorCoercibleInMemory(b, a)) continue;
         return false;
     }
     if (s.return_type == d.return_type or s.return_type == .noreturn_type or s.return_type == .generic_poison_type) return true;
     if (sema.childCoercibleInMemory(s.return_type, d.return_type)) return true;
     const sr = ip.indexToKey(s.return_type);
     const dr = ip.indexToKey(d.return_type);
-    if (sr != .error_union_type or dr != .error_union_type) return false;
-    if (sr.error_union_type.payload_type != dr.error_union_type.payload_type) return false;
-    var set = sr.error_union_type.error_set_type;
+    // A returned error set, alone or in an error union with the same
+    // payload, may be a subset of `dst`'s.
+    var set, const dst_set = if (sr == .error_union_type and dr == .error_union_type) sets: {
+        if (sr.error_union_type.payload_type != dr.error_union_type.payload_type) return false;
+        break :sets .{ sr.error_union_type.error_set_type, dr.error_union_type.error_set_type };
+    } else if (Type.class(ip, s.return_type) == .error_set and Type.class(ip, d.return_type) == .error_set)
+        .{ s.return_type, d.return_type }
+    else
+        return false;
     if (set == .adhoc_inferred_error_set_type) set = try sema.intern(.{ .inferred_error_set_type = func });
-    return sema.errorSetCoercible(block, src_loc, set, dr.error_union_type.error_set_type, .none);
+    return sema.errorSetCoercible(block, src_loc, set, dst_set, .none);
 }
 
 /// Whether a function of type `src` can be called as a `dst` (through a
@@ -7560,15 +7568,27 @@ fn fnTypeCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     for (s.param_types, d.param_types) |a, b| {
         if (a == b) continue;
         if (Type.class(ip, a) == .pointer and Type.class(ip, b) == .pointer and sema.ptrCoercibleInPlace(b, a)) continue;
+        if (sema.errorCoercibleInMemory(b, a)) continue;
         return false;
     }
     if (s.return_type == d.return_type or s.return_type == .noreturn_type) return true;
-    const sr = ip.indexToKey(s.return_type);
-    const dr = ip.indexToKey(d.return_type);
-    if (sr != .error_union_type or dr != .error_union_type) return false;
-    if (!sema.payloadCoercibleInMemory(sr.error_union_type.payload_type, dr.error_union_type.payload_type)) return false;
-    const ss = sr.error_union_type.error_set_type;
-    const ds = dr.error_union_type.error_set_type;
+    return sema.errorCoercibleInMemory(s.return_type, d.return_type);
+}
+
+/// Whether an error set or error union `s` reads in place as a `d`: its
+/// errors are a subset of `d`'s, and an error union's payload reads in
+/// place as `d`'s. An inferred error set only matches itself or `anyerror`.
+fn errorCoercibleInMemory(sema: *Sema, s: Index, d: Index) bool {
+    const ip = sema.ip;
+    const sk = ip.indexToKey(s);
+    const dk = ip.indexToKey(d);
+    const ss, const ds = if (sk == .error_union_type and dk == .error_union_type) sets: {
+        if (!sema.payloadCoercibleInMemory(sk.error_union_type.payload_type, dk.error_union_type.payload_type)) return false;
+        break :sets .{ sk.error_union_type.error_set_type, dk.error_union_type.error_set_type };
+    } else if (Type.class(ip, s) == .error_set and Type.class(ip, d) == .error_set)
+        .{ s, d }
+    else
+        return false;
     if (ss == ds or ds == .anyerror_type) return true;
     const sn = ip.indexToKey(ss);
     const dn = ip.indexToKey(ds);

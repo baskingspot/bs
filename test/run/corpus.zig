@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -122,6 +122,29 @@ const WithConfig = struct {
     p: *const u64,
 };
 
+// zio (ev/backends/linux/epoll.zig): a function returning a smaller error
+// set coerces to a function type returning `anyerror`.
+const SockErr = error{ Refused, Reset };
+fn sockErr(code: u32) SockErr {
+    return if (code == 0) error.Refused else error.Reset;
+}
+fn handleErr(comptime toErr: fn (u32) anyerror, code: u32) anyerror {
+    return toErr(code);
+}
+
+// libxev (watcher/stream.zig): a callback whose parameter takes more errors
+// coerces to a callback type that passes fewer.
+fn readCb(r: error{ Eof, Reset, Canceled }!u32) u32 {
+    return r catch |e| switch (e) {
+        error.Eof => 1,
+        error.Reset => 2,
+        error.Canceled => 3,
+    };
+}
+fn readWith(comptime cb: *const fn (r: error{ Eof, Reset }!u32) u32, r: error{ Eof, Reset }!u32) u32 {
+    return cb(r);
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -173,5 +196,10 @@ fn main() callconv(.c) noreturn {
     _ = &wc;
     rt.printInt(wc.p.*);
     rt.printInt(wc.config.a);
+
+    rt.printInt(@intFromBool(handleErr(sockErr, 1) == error.Reset));
+    var eof: error{ Eof, Reset }!u32 = error.Reset;
+    _ = &eof;
+    rt.printInt(readWith(readCb, eof));
     rt.exit(0);
 }
