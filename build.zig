@@ -1022,7 +1022,8 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     // compiler_rt for C: f128 and f16 conversions, comparisons and
     // arithmetic, 128-bit division and lock-based atomics, which zap
     // generates from upstream's compiler_rt (baseline, so that f16 needs
-    // it too).
+    // it too). Two more objects reference a name nothing defines: one
+    // error names both.
     {
         const rt_c = b.addSystemCommand(&.{ zig, "cc", "-mcpu=baseline", "-Wno-atomic-alignment", "-c" });
         rt_c.addFileArg(b.path("test/link_input/rt.c"));
@@ -1038,6 +1039,23 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         rt_run.addCheck(.{ .expect_stderr_exact = "2.25 1 0 -6 0.375 1024 25 2.5\n" });
         rt_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&rt_run.step);
+        const undef = b.addRunArtifact(zap);
+        undef.setName("zap build-exe reports an undefined symbol once");
+        undef.addArg("build-exe");
+        undef.addFileArg(b.path("test/link_input/rt_main.zig"));
+        undef.addFileArg(rt_o);
+        for ([_][]const u8{ "undef1", "undef2" }) |name| {
+            const u = b.addSystemCommand(&.{ zig, "cc", b.fmt("-DUNDEF={s}", .{name}), "-c" });
+            u.addFileArg(b.path("test/link_input/undef.c"));
+            undef.addFileArg(u.addPrefixedOutputFileArg("-o", b.fmt("{s}.o", .{name})));
+        }
+        undef.setEnvironmentVariable("ZAP_CACHE", "off");
+        _ = undef.addPrefixedOutputFileArg("-femit-bin=", "main");
+        undef.addCheck(.{ .expect_stderr_match = "undef1.o, " });
+        undef.addCheck(.{ .expect_stderr_match = "undef2.o)\n" });
+        undef.addCheck(.{ .expect_stderr_match = "\n1 error\n" });
+        undef.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        test_step.dependOn(&undef.step);
     }
     // A C++ source with -lc++: libc++, libc++abi and libunwind built from
     // the lib directory as upstream builds them, exceptions through C++
