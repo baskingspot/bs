@@ -146,10 +146,11 @@ def bs_rev(path):
         return "?"
 
 
-def build_bs(sha):
-    """Builds bs at `sha` (ReleaseFast) in a worktree under .work and
-    returns the binary's path. Cached per commit."""
-    dest = os.path.join(H.WORK, "bs", sha)
+def build_bs(sha, debug=False):
+    """Builds bs at `sha` (ReleaseFast, or Debug, which builds in
+    seconds and runs ~10x slower) in a worktree under .work and returns
+    the binary's path. Cached per commit."""
+    dest = os.path.join(H.WORK, "bsdbg" if debug else "bs", sha)
     binp = os.path.join(dest, "bin", "bs")
     if os.path.exists(binp):
         return binp
@@ -162,8 +163,8 @@ def build_bs(sha):
     up = os.path.join(H.REPO_DIR, "upstream")
     if os.path.exists(up) and not os.path.exists(os.path.join(tree, "upstream")):
         os.symlink(os.path.realpath(up), os.path.join(tree, "upstream"))
-    log(f"building bs {sha[:10]} (ReleaseFast)")
-    p = subprocess.run(["zig", "build", "-Doptimize=ReleaseFast", "--prefix", dest], cwd=tree,
+    log(f"building bs {sha[:10]} ({'Debug' if debug else 'ReleaseFast'})")
+    p = subprocess.run(["zig", "build", *([] if debug else ["-Doptimize=ReleaseFast"]), "--prefix", dest], cwd=tree,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if p.returncode != 0 or not os.path.exists(binp):
         raise RuntimeError(f"building bs at {sha} failed:\n{p.stdout[-3000:]}")
@@ -171,7 +172,8 @@ def build_bs(sha):
 
 
 def origin_main():
-    subprocess.run(["git", "-C", H.REPO_DIR, "fetch", "--quiet", "origin", "main"], check=False)
+    # All branches: --branches watches them too.
+    subprocess.run(["git", "-C", H.REPO_DIR, "fetch", "--quiet", "--prune", "origin"], check=False)
     return subprocess.run(["git", "-C", H.REPO_DIR, "rev-parse", "origin/main"], stdout=subprocess.PIPE,
                           text=True).stdout.strip()
 
@@ -309,10 +311,19 @@ def main():
         if seen.get(b) != h:
             return  # superseded by a newer head
         t = H.Tools(build_bs(h), args.zig)
+        # The branch's regressions are against where it forked from main.
+        mb = subprocess.run(["git", "-C", H.REPO_DIR, "merge-base", h, "origin/main"], stdout=subprocess.PIPE,
+                            text=True).stdout.strip()
+        if mb == rebuilt["sha"]:
+            base = rebuilt["tools"]
+        elif os.path.exists(os.path.join(H.WORK, "bs", mb, "bin", "bs")):
+            base = H.Tools(build_bs(mb), args.zig)
+        else:
+            base = H.Tools(build_bs(mb, debug=True), args.zig)
         with lock:
-            rebuilt["campaign"] = {"branch": b, "sha": h, "tools": t, "left": args.branch_programs,
+            rebuilt["campaign"] = {"branch": b, "sha": h, "tools": t, "base": base, "left": args.branch_programs,
                                    "done": 0, "findings": [], "t0": time.time()}
-        log(f"campaign {b} {h[:10]}: {args.branch_programs} programs")
+        log(f"campaign {b} {h[:10]} (base {mb[:10]}): {args.branch_programs} programs")
 
     def follower():
         first = True
@@ -358,7 +369,7 @@ def main():
                     c = rebuilt["campaign"]
                     if c is not None and c["left"] > 0:
                         c["left"] -= 1
-                        fut = hunt.submit(check, seed, c["tools"], args.size, c["branch"], rebuilt["tools"])
+                        fut = hunt.submit(check, seed, c["tools"], args.size, c["branch"], c["base"])
                         fut.campaign = c
                     else:
                         fut = hunt.submit(check, seed, rebuilt["tools"], args.size)
