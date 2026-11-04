@@ -69,3 +69,44 @@ fi
 ln -sfn "$cache/zig-$ZIG_VERSION-src" "$repo_root/upstream"
 
 "$bin_dir/zig" version
+
+# monstar, a C acceptance target in tools/corpus, links the system's
+# Wayland, fontconfig, freetype, harfbuzz and xkbcommon and needs ncurses'
+# `tic`. It wants Wayland 1.25 and wayland-protocols 1.49, newer than
+# Debian 12's, so those two are built into /usr/local. Orbs only.
+WAYLAND_VERSION=1.25.0
+WAYLAND_SHA=c065f040afdff3177680600f249727e41a1afc22fccf27222f15f5306faa1f03
+WAYLAND_PROTOCOLS_VERSION=1.49
+WAYLAND_PROTOCOLS_SHA=ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14
+
+meson_install() { # url sha name [meson options...]
+  local url=$1 sha=$2 name=$3 src="$cache/$3"
+  shift 3
+  fetch "$url" "$sha" "$src"
+  rm -rf "$src/build"
+  meson setup "$src/build" "$src" --prefix=/usr/local "$@" >/dev/null
+  ninja -C "$src/build" >/dev/null
+  sudo ninja -C "$src/build" install >/dev/null
+}
+
+if [ "$ZIG_HOST" = x86_64-linux ] && command -v apt-get >/dev/null; then
+  missing=""
+  for p in meson ninja-build pkg-config libffi-dev libexpat1-dev libxml2-dev \
+    libfontconfig-dev libfreetype-dev libharfbuzz-dev libxkbcommon-dev ncurses-bin; do
+    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" || missing="$missing $p"
+  done
+  if [ -n "$missing" ]; then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing >/dev/null
+  fi
+  if [ "$(pkg-config --modversion wayland-client 2>/dev/null)" != "$WAYLAND_VERSION" ]; then
+    meson_install "https://gitlab.freedesktop.org/wayland/wayland/-/releases/$WAYLAND_VERSION/downloads/wayland-$WAYLAND_VERSION.tar.xz" \
+      "$WAYLAND_SHA" "wayland-$WAYLAND_VERSION" -Ddocumentation=false -Dtests=false
+    sudo ldconfig
+  fi
+  if [ "$(pkg-config --modversion wayland-protocols 2>/dev/null)" != "$WAYLAND_PROTOCOLS_VERSION" ]; then
+    meson_install "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/$WAYLAND_PROTOCOLS_VERSION/downloads/wayland-protocols-$WAYLAND_PROTOCOLS_VERSION.tar.xz" \
+      "$WAYLAND_PROTOCOLS_SHA" "wayland-protocols-$WAYLAND_PROTOCOLS_VERSION" -Dtests=false
+  fi
+  pkg-config --modversion wayland-client wayland-protocols
+fi
