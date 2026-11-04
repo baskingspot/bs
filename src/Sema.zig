@@ -9167,9 +9167,12 @@ fn ptrCoercibleInPlace(sema: *Sema, src_ty: Index, dest_ty: Index) bool {
     }
     const s_array: ?InternPool.ArrayType = if (ip.keyTag(s.child) == .array_type) ip.keyPayload(.array_type, s.child) else null;
     // C pointers coerce to and from single and many pointers of the same child.
-    if (s.flags.size == .c and d.flags.size != .slice) return s.child == d.child or d.child == .anyopaque_type or (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
+    // Differently named integers of the same bits are one (`i32` and
+    // `c_int`), as upstream's `coerceInMemoryAllowed`.
+    if (s.flags.size == .c and d.flags.size != .slice) return s.child == d.child or sema.sameScalarRepr(s.child, d.child) or d.child == .anyopaque_type or (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
     if (d.flags.size == .c and s.flags.size != .slice)
-        return s.child == d.child or d.child == .anyopaque_type or (s.flags.size == .one and s_array != null and s_array.?.child == d.child) or
+        return s.child == d.child or sema.sameScalarRepr(s.child, d.child) or d.child == .anyopaque_type or
+            (s.flags.size == .one and s_array != null and (s_array.?.child == d.child or sema.sameScalarRepr(s_array.?.child, d.child))) or
             (d.flags.is_const and sema.childCoercibleInMemory(s.child, d.child));
     if (s.flags.size == d.flags.size) {
         if (d.sentinel != .none and !sema.sentinelsMatch(s.sentinel, d.sentinel)) return false;

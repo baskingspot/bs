@@ -1,10 +1,12 @@
 //! exit: 0
-//! stdout: "1\n1\n1\n0\n1\n97\n111\n1\n1\n1\n1\n1\n1\n25\n23\n"
+//! stdout: "1\n1\n1\n0\n1\n97\n111\n1\n1\n1\n1\n1\n1\n25\n23\n7\n"
 //! C pointers compared with integers and in order, unwrapped like
 //! optionals, and read in place of optional pointers; slices of allowzero
 //! pointers; comptime pointer differences and equality by layout; C
 //! pointer peers; pointer arithmetic narrowing an explicit alignment;
-//! differences of array pointers; many-pointers to whole arrays.
+//! differences of array pointers; many-pointers to whole arrays; C
+//! pointers to and from differently named integers of the same bits
+//! (raylib-zig passes `[*c]i32` for `[*c]c_int`).
 const rt = @import("rt.zig");
 pub const panic = rt.panic;
 
@@ -75,10 +77,20 @@ fn main() callconv(.c) noreturn {
     // Under @TypeOf, dereferencing a null C pointer only names a type.
     comptime if (@TypeOf(@as([*c]u8, null).*) != u8) unreachable;
     comptime if (@TypeOf(&@as([*c]u8, null).*) != *u8) unreachable;
+    var int: i32 = 1;
+    var ints = [_]i32{ 2, 3 };
+    var cint: [*c]i32 = &int;
+    _ = &cint;
+    const back: *c_int = cint;
+    rt.printInt(@intCast(cInts(&int, @as([*c]i32, &ints)) + back.*));
     rt.exit(0);
 }
 
 var flag = true;
+
+fn cInts(a: [*c]c_int, b: [*c]c_int) c_int {
+    return a[0] + b[0] + b[1];
+}
 
 fn wholeArrays() u32 {
     var cases: [2][2]u32 = .{ .{ 0, 1 }, .{ 2, 3 } };
