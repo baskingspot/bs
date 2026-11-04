@@ -1108,9 +1108,10 @@ fn navTypePhase(sema: *Sema, block: *Block, src: Src, nav: *InternPool.Nav, decl
         break :blk try sema.analyzeAsType(block, src, ref);
     } else .none;
     if (decl.align_body) |body| {
-        const a_ref = try sema.coerce(block, .u32_type, try sema.resolveInlineBody(block, body, nav.zir_inst), src);
-        const a = sema.ip.intValue(u64, try sema.resolveConstValue(block, src, a_ref, "alignment must be comptime-known")).?;
-        if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, .{ .base = src.base, .loc = .{ .decl_align = .zero } }, "alignment value '{d}' is not a power of two", .{a});
+        const align_src: Src = .{ .base = src.base, .loc = .{ .decl_align = .zero } };
+        const a_ref = try sema.coerce(block, .u29_type, try sema.resolveInlineBody(block, body, nav.zir_inst), align_src);
+        const a = sema.ip.intValue(u64, try sema.resolveConstValue(block, align_src, a_ref, "alignment must be comptime-known")).?;
+        try sema.validateAlign(block, align_src, a);
         nav.alignment = a;
     }
     if (decl_ty != .none) nav.ty = decl_ty;
@@ -1391,10 +1392,16 @@ fn fieldDefault(sema: *Sema, block: *Block, src: Src, struct_inst: Zir.Inst.Inde
 
 /// A field's `align(n)`: a comptime-known power of two.
 fn resolveFieldAlign(sema: *Sema, block: *Block, src: Src, ref: Ref) CompileError!u64 {
-    const a_ref = try sema.coerce(block, .u32_type, ref, src);
+    const a_ref = try sema.coerce(block, .u29_type, ref, src);
     const a = sema.ip.intValue(u64, try sema.resolveConstValue(block, src, a_ref, "field alignment must be comptime-known")).?;
-    if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
+    try sema.validateAlign(block, src, a);
     return a;
+}
+
+/// Upstream's check of an alignment of `a` bytes.
+fn validateAlign(sema: *Sema, block: *Block, src: Src, a: u64) CompileError!void {
+    if (a == 0) return sema.fail(block, src, "alignment must be >= 1", .{});
+    if (!std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
 }
 
 /// The node of a `@Struct`, `@Union`, or `@Enum` instruction, or null if
@@ -4941,8 +4948,11 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
             const small: Zir.Inst.AllocExtended.Small = @bitCast(ext.small);
             const src = block.nodeSrc(extra.data.src_node);
             const alignment: u64 = if (small.has_align) blk2: {
-                const align_ref = try sema.coerce(block, .u29_type, sema.resolveInst(@fromBackingInt(sema.code.extra[extra.end + @intFromBool(small.has_type)])), src);
-                break :blk2 sema.ip.intValue(u64, try sema.resolveConstValue(block, src, align_ref, "alignment must be comptime-known")).?;
+                const align_src: Src = .{ .base = src.base, .loc = .{ .decl_align = extra.data.src_node } };
+                const align_ref = try sema.coerce(block, .u29_type, sema.resolveInst(@fromBackingInt(sema.code.extra[extra.end + @intFromBool(small.has_type)])), align_src);
+                const a = sema.ip.intValue(u64, try sema.resolveConstValue(block, align_src, align_ref, "alignment must be comptime-known")).?;
+                try sema.validateAlign(block, align_src, a);
+                break :blk2 a;
             } else 0;
             if (!small.has_type) {
                 const ref = try sema.allocInferred(block, small.is_const, small.is_comptime);
@@ -7387,7 +7397,9 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     const data = sema.code.instructions.items(.data)[@backingInt(inst)].ptr_type;
     const extra = sema.code.extraData(Zir.Inst.PtrType, data.payload_index);
     const src = block.nodeSrc(extra.data.src_node);
-    const elem = try sema.resolveType(block, .{ .base = src.base, .loc = .{ .array_elem = extra.data.src_node } }, extra.data.elem_type);
+    const elem_src: Src = .{ .base = src.base, .loc = .{ .array_elem = extra.data.src_node } };
+    const elem = try sema.resolveType(block, elem_src, extra.data.elem_type);
+    if (elem == .noreturn_type) return sema.fail(block, elem_src, "pointer to noreturn not allowed", .{});
     var i = extra.end;
     var sentinel: Index = .none;
     if (data.flags.has_sentinel) {
@@ -7399,9 +7411,10 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     }
     var alignment: u6 = 0;
     if (data.flags.has_align) {
-        const a = try sema.resolveInt(block, src, @fromBackingInt(sema.code.extra[i]), .u32_type, "pointer alignment must be comptime-known");
+        const align_src: Src = .{ .base = src.base, .loc = .{ .ptr_part = .{ .node = extra.data.src_node, .part = .@"align" } } };
+        const a = try sema.resolveInt(block, align_src, @fromBackingInt(sema.code.extra[i]), .u29_type, "pointer alignment must be comptime-known");
         i += 1;
-        if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
+        try sema.validateAlign(block, align_src, a);
         // As upstream, `*align(4) u32` is a type of its own, which coerces
         // to and from `*u32` in memory.
         alignment = @intCast(std.math.log2_int(u64, a) + 1);
@@ -7409,12 +7422,11 @@ fn zirPtrType(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
     if (data.flags.has_addrspace) return sema.failUnsupported(block, src, "address spaces");
     var packed_offset: InternPool.PtrType.PackedOffset = .{};
     if (data.flags.has_bit_range) {
-        const bit_offset = try sema.resolveInt(block, src, @fromBackingInt(sema.code.extra[i]), .u16_type, "bit offset must be comptime-known");
-        const host_size = try sema.resolveInt(block, src, @fromBackingInt(sema.code.extra[i + 1]), .u16_type, "host size must be comptime-known");
+        const bit_offset = try sema.resolveInt(block, .{ .base = src.base, .loc = .{ .ptr_part = .{ .node = extra.data.src_node, .part = .bit_offset } } }, @fromBackingInt(sema.code.extra[i]), .u16_type, "bit offset must be comptime-known");
+        const host_size = try sema.resolveInt(block, .{ .base = src.base, .loc = .{ .ptr_part = .{ .node = extra.data.src_node, .part = .host_size } } }, @fromBackingInt(sema.code.extra[i + 1]), .u16_type, "host size must be comptime-known");
         i += 2;
         if (host_size != 0) {
             try sema.resolveLayout(block, src, elem);
-            const elem_src: Src = .{ .base = src.base, .loc = .{ .array_elem = extra.data.src_node } };
             const bit_src: Src = .{ .base = src.base, .loc = .{ .ptr_part = .{ .node = extra.data.src_node, .part = .bit_offset } } };
             const bits = sema.packedFieldBits(elem) orelse return sema.failUnpackable(block, elem_src, "bit-pointer cannot refer to value of type '{f}'", elem);
             if (bit_offset >= host_size * 8) return sema.fail(block, bit_src, "packed type '{f}' at bit offset {d} starts {d} bits after the end of a {d} byte host integer", .{ sema.fmtType(elem), bit_offset, bit_offset - host_size * 8, host_size });
@@ -13421,7 +13433,7 @@ fn zirReifyContainer(sema: *Sema, block: *Block, inst: Zir.Inst.Index, ext: Zir.
         cv.* = .bool_false;
         if (ip.keyPayload(.opt, av.*).val != .none) {
             const bytes = ip.intValue(u64, ip.keyPayload(.opt, av.*).val).?;
-            if (bytes == 0 or !std.math.isPowerOfTwo(bytes)) return sema.fail(block, attrs_src, "alignment value '{d}' is not a power of two", .{bytes});
+            try sema.validateAlign(block, attrs_src, bytes);
             any_align = true;
         }
         d.* = .none;
@@ -13603,7 +13615,7 @@ fn zirReifyPointer(sema: *Sema, block: *Block, ext: Zir.Inst.Extended.InstData) 
     const align_val = try sema.structFieldValue(attrs, "align");
     if (ip.keyPayload(.opt, align_val).val != .none) {
         const a = ip.intValue(u64, ip.keyPayload(.opt, align_val).val).?;
-        if (a == 0 or !std.math.isPowerOfTwo(a)) return sema.fail(block, src, "alignment value '{d}' is not a power of two", .{a});
+        try sema.validateAlign(block, sema.callArgSrc(src, false, 1), a);
         alignment = @intCast(std.math.log2_int(u64, a) + 1);
     }
     const addr_space = ip.keyPayload(.opt, try sema.structFieldValue(attrs, "addrspace")).val;

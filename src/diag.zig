@@ -1469,6 +1469,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "enum field '{s}' missing from union", .@"bad-container" },
     .{ "union field order does not match tag enum field order", .@"bad-container" },
     .{ "alignment value '{d}' is not a power of two", .@"bad-type" },
+    .{ "alignment must be >= 1", .@"bad-type" },
     .{ "cannot reify pointer to '@TypeOf(null)'", .@"bad-type" },
     .{ "function pointers must be single pointers", .@"bad-type" },
     .{ "indexable pointer to opaque type '{f}' not allowed", .@"bad-type" },
