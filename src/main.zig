@@ -721,7 +721,7 @@ const InputsRecord = struct {
         const stat = cwd.statFile(io, out_path, .{}) catch return false;
         if (stat.inode != o.inode or stat.size != o.size or stat.mtime.toNanoseconds() != o.mtime) return false;
         if (renew) {
-            cwd.setTimestampsNow(io, out_path, .{}) catch return false;
+            cache.setTimestamps(io, cwd, out_path, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch return false;
             const renewed = cwd.statFile(io, out_path, .{}) catch return false;
             o.mtime = @intCast(renewed.mtime.toNanoseconds());
             @memcpy(bytes[pos..][0..@sizeOf(Output)], std.mem.asBytes(&o));
