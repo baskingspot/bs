@@ -483,6 +483,9 @@ pub const Src = struct {
         /// The field name of the struct init field whose initializer is at
         /// `node` (upstream's `init_field_name`).
         init_name: Ast.Node.Offset,
+        /// The `.name` field of the options literal, argument 1 of the
+        /// builtin call at `node` (upstream's `init_field_name`).
+        option_name: Ast.Node.Offset,
         /// Element `index` of the array initialization at `node`
         /// (upstream's `init_elem` for arrays).
         init_elem: struct { node: Ast.Node.Offset, index: u32 },
@@ -638,6 +641,20 @@ pub const Src = struct {
                 return tree.tokensToSpan(tree.firstToken(node) - 3, tree.lastToken(node), tree.nodeMainToken(node) - 2);
             },
             .init_name => |off| return tree.tokenToSpan(tree.firstToken(off.toAbsolute(src.base)) - 2),
+            .option_name => |off| {
+                const node = off.toAbsolute(src.base);
+                var buf: [2]Ast.Node.Index = undefined;
+                const params = tree.builtinCallParams(&buf, node) orelse return tree.nodeToSpan(node);
+                if (params.len < 2) return tree.nodeToSpan(node);
+                var ibuf: [2]Ast.Node.Index = undefined;
+                const init = tree.fullStructInit(&ibuf, params[1]) orelse return tree.nodeToSpan(params[1]);
+                for (init.ast.fields) |field| {
+                    const name_tok = tree.firstToken(field) - 2;
+                    if (std.mem.eql(u8, tree.tokenSlice(name_tok), "name"))
+                        return tree.tokensToSpan(name_tok - 1, tree.lastToken(field), tree.nodeMainToken(field) - 2);
+                }
+                return tree.nodeToSpan(params[1]);
+            },
             .for_capture => |off| {
                 // As upstream: the loop is found by scanning the tree.
                 const input = off.toAbsolute(src.base);
@@ -4822,7 +4839,13 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .field_type_ref => blk: {
             const extra = sema.code.extraData(Zir.Inst.FieldTypeRef, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const ty = try sema.resolveType(block, sema.callArgSrc(src, false, 0), extra.container_type);
+            const ty_src = sema.callArgSrc(src, false, 0);
+            // As upstream's fieldType: through optionals and error unions.
+            const ty = sema.unwrapOptEu(try sema.resolveType(block, ty_src, extra.container_type));
+            switch (Type.class(sema.ip, ty)) {
+                .@"struct", .@"union", .tuple, .special => {},
+                else => if (ty != .generic_poison_type) return sema.fail(block, ty_src, "expected struct or union; found '{f}'", .{sema.fmtType(ty)}),
+            }
             const name_src = sema.callArgSrc(src, false, 1);
             const name = try sema.resolveConstString(block, name_src, sema.resolveInst(extra.field_name));
             break :blk .fromInterned(try sema.fieldTypeByName(block, name_src, ty, name));
@@ -6261,7 +6284,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     const options = try sema.resolveConstValue(block, options_src, try sema.coerce(block, options_ty, sema.resolveInst(extra.options), options_src), "export options must be comptime-known");
     const name_val = try sema.fieldValue(options, ip.structInfo(options_ty).fieldIndex(ip, "name").?);
     const name = try sema.resolveConstString(block, options_src, .fromInterned(name_val));
-    if (name.len == 0) return sema.fail(block, options_src, "exported symbol name cannot be empty", .{});
+    if (name.len == 0) return sema.fail(block, if (src.nodeOffset()) |off| .{ .base = src.base, .loc = .{ .option_name = off } } else src, "exported symbol name cannot be empty", .{});
     const info = ip.structInfo(options_ty);
     const linkage: std.lang.GlobalLinkage = @enumFromInt(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "linkage").?)).int).?);
     const visibility: std.lang.SymbolVisibility = @enumFromInt(ip.intValue(u64, ip.keyPayload(.enum_tag, try sema.fieldValue(options, info.fieldIndex(ip, "visibility").?)).int).?);
@@ -6388,7 +6411,10 @@ fn atomicPtr(sema: *Sema, block: *Block, call_src: Src, ref: Zir.Inst.Ref, is_co
     const info = Type.ptrInfo(ip, ptr_ty);
     if (!is_const and info.flags.is_const) return sema.fail(block, src, "cannot assign to constant", .{});
     try sema.atomicElemType(block, sema.callArgSrc(call_src, false, 0), info.child);
-    return .{ ptr, info.child };
+    // As upstream's checkAtomicPtrOperand: the pointer coerces to one of
+    // natural alignment.
+    const want = try sema.ptrType(.{ .child = info.child, .flags = .{ .is_const = is_const, .is_volatile = info.flags.is_volatile, .is_allowzero = info.flags.is_allowzero } });
+    return .{ try sema.coerce(block, want, ptr, src), info.child };
 }
 
 /// `const a, const b = operand;`: the operand must be an array, vector, or
@@ -6636,6 +6662,12 @@ fn fieldParentPtr(sema: *Sema, block: *Block, src: Src, extra: Zir.Inst.FieldPar
         .tuple_type => try sema.structFieldIndex(block, sema.callArgSrc(src, false, 0), parent_ty, name),
         else => return sema.fail(block, src, "expected struct or union type, found '{f}'", .{sema.fmtType(parent_ty)}),
     };
+    const is_comptime_field = switch (ip.indexToKey(parent_ty)) {
+        .struct_type => ip.structInfo(parent_ty).fieldIsComptime(field_index),
+        .tuple_type => |t| t.values[field_index] != .none,
+        else => false,
+    };
+    if (is_comptime_field) return sema.fail(block, sema.callArgSrc(src, false, 0), "cannot get @fieldParentPtr of a comptime field", .{});
     const field_ptr = sema.resolveInst(extra.field_ptr);
     if (Type.class(ip, sema.typeOf(field_ptr)) != .pointer) return sema.fail(block, sema.callArgSrc(src, false, 1), "expected pointer type, found '{f}'", .{sema.fmtType(sema.typeOf(field_ptr))});
     if (sema.resolveValue(field_ptr)) |v| if (!sema.isUndef(v)) {
@@ -10659,7 +10691,13 @@ fn analyzeFloatToInt(sema: *Sema, block: *Block, src: Src, dest_ty: Index, opera
     const class = Type.class(ip, ty);
     // A comptime_int operand is already integral: every rounding mode
     // leaves it unchanged.
-    if (ty == .comptime_int_type) return sema.coerce(block, dest_ty, operand, src);
+    if (ty == .comptime_int_type) {
+        // As upstream, an out-of-range one fails as a float value would.
+        const v = sema.resolveValue(operand).?;
+        if (dest_ty != .comptime_int_type and !sema.isUndef(v) and !sema.intFits(v, dest_ty))
+            return sema.fail(block, sema.callArgSrc(src, false, 0), "float value '{f}' cannot be stored in integer type '{f}'", .{ sema.fmtValue(v), sema.fmtType(dest_ty) });
+        return sema.coerce(block, dest_ty, operand, src);
+    }
     if (class != .float and class != .comptime_float) return sema.fail(block, sema.callArgSrc(src, false, 0), "expected float type, found '{f}'", .{sema.fmtType(ty)});
     if (sema.resolveValue(operand)) |v| return .fromInterned(try sema.intFromFloat(block, sema.callArgSrc(src, false, 0), v, dest_ty, mode));
     if (dest_ty == .comptime_int_type) return sema.failNeededComptime(block, sema.callArgSrc(src, false, 0), "value casted to 'comptime_int' must be comptime-known");
@@ -20590,8 +20628,15 @@ fn zirShuffle(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref
         const k = ip.intValue(i64, (try sema.coerce(block, .i32_type, .fromInterned(m), src)).toInterned().?).?;
         const from_a = k >= 0;
         const idx: u32 = @intCast(if (from_a) k else ~k);
-        if (idx >= (if (from_a) a_len else b_len))
-            return sema.fail(block, src, "mask index '{d}' has out-of-bounds selection", .{i});
+        if (idx >= (if (from_a) a_len else b_len)) {
+            // As upstream: at the mask, with the operand it exceeds.
+            const err = sema.fail(block, sema.callArgSrc(src, false, 3), "mask element at index '{d}' selects out-of-bounds index", .{i});
+            const tree = try sema.zcu.fe.tree(@fromBackingInt(sema.file));
+            try sema.zcu.addNote(sema.file, sema.callArgSrc(src, false, if (from_a) 1 else 2).span(tree), "index '{d}' exceeds bounds of '{f}' given here", .{ idx, sema.fmtType(sema.typeOf(if (from_a) a else b)) });
+            if (from_a and idx < b_len)
+                try sema.zcu.addNote(sema.file, sema.callArgSrc(src, false, 2).span(tree), "use '~@as(u32, {d})' to index into second vector given here", .{idx});
+            return err;
+        }
         e.* = try sema.vectorElem(block, if (from_a) a else b, idx);
     }
     return sema.aggregate(block, src, try sema.vectorType(mask_len, elem_ty), elems);
