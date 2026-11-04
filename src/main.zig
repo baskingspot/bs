@@ -675,12 +675,16 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     var bundle = try errors.toOwnedBundle("");
     defer bundle.deinit(init.gpa);
     const paths: diag.Paths = try .init(arena, init.io, job.zig_lib_dir);
+    // As upstream, analysis goes on after AstGen's errors unless a file
+    // could not be lowered, so one build reports AstGen's errors and
+    // Sema's. Such a build emits nothing and records nothing.
+    var astgen_errors: []const diag.Diagnostic = &.{};
     if (bundle.errorMessageCount() > 0) {
         var diags: std.ArrayList(diag.Diagnostic) = .empty;
         try diag.fromBundle(arena, paths, bundle, &diags);
-        return .{ .errors = try dupeDiagnostics(arena, diags.items) };
+        if (!ok) return .{ .errors = try dupeDiagnostics(arena, diags.items) };
+        astgen_errors = diags.items;
     }
-    std.debug.assert(ok);
 
     var zcu: Zcu = try .init(init.gpa, init.io, &fe);
     defer zcu.deinit();
@@ -709,7 +713,10 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         var sink: DumpSink = .{ .w = &stdout.interface };
         try zcu.analyzeAll(&sink);
         try stdout.interface.flush();
-        if (zcu.failed()) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
+        if (zcu.failed() or astgen_errors.len != 0) {
+            const sema_errors = if (zcu.failed()) try zcu.diagnostics(arena, paths) else &.{};
+            return .{ .errors = try dupeDiagnostics(arena, try std.mem.concat(arena, diag.Diagnostic, &.{ astgen_errors, sema_errors })) };
+        }
         return .{ .ok = .{ .cache_hit = false } };
     }
     var emit: Emit = .init(init.gpa, &zcu);
@@ -810,8 +817,12 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         if (inputs) |list| try appendCInputs(arena, list, c.inputs);
         if (c.errors.len != 0) {
             const zig_errors = if (zcu.failed()) try zcu.diagnostics(arena, paths) else &.{};
-            return .{ .errors = try dupeDiagnostics(arena, try std.mem.concat(arena, diag.Diagnostic, &.{ zig_errors, c.errors })) };
+            return .{ .errors = try dupeDiagnostics(arena, try std.mem.concat(arena, diag.Diagnostic, &.{ astgen_errors, zig_errors, c.errors })) };
         }
+    }
+    if (astgen_errors.len != 0) {
+        const sema_errors = if (zcu.failed()) try zcu.diagnostics(arena, paths) else &.{};
+        return .{ .errors = try dupeDiagnostics(arena, try std.mem.concat(arena, diag.Diagnostic, &.{ astgen_errors, sema_errors })) };
     }
     if (zcu.failed()) return .{ .errors = try dupeDiagnostics(arena, try zcu.diagnostics(arena, paths)) };
     const bin_path = out_path orelse return .{ .ok = .{ .cache_hit = false } };

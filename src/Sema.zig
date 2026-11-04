@@ -5672,6 +5672,10 @@ fn zirExtended(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         // analyzes for x86_64 so far).
         .wasm_memory_size => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.UnNode, ext.operand).data.node), "builtin @wasmMemorySize is available when targeting WebAssembly; targeted CPU architecture is {s}", .{"x86_64"}),
         .wasm_memory_grow => sema.fail(block, block.nodeSrc(sema.code.extraData(Zir.Inst.BinNode, ext.operand).data.node), "builtin @wasmMemoryGrow is available when targeting WebAssembly; targeted CPU architecture is {s}", .{"x86_64"}),
+        // A declaration whose ZIR AstGen could not generate: AstGen
+        // reported it, so it fails, as do the units that read it, with no
+        // error of their own (upstream's `failTransitive`).
+        .astgen_error => error.AnalysisFail,
         else => sema.failUnsupported(block, block.nodeSrc(.zero), @tagName(ext.opcode)),
     };
 }

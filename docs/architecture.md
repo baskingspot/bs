@@ -6296,9 +6296,11 @@ The owner's review (2026-11-03) settled:
 2. Upstream's wording stays where it's clear; the code, candidates,
    hints, notes and fixes are added around it.
 3. Fail early, as upstream: no recovery. A failed unit still fails its
-   dependents silently, and AstGen errors still stop the build before
-   Sema. More compile cycles are fine because zap is fast, and the cache
-   change below makes each cycle cheap.
+   dependents silently. More compile cycles are fine because zap is
+   fast, and the cache change below makes each cycle cheap. (AstGen
+   errors first stopped the build before Sema. Upstream does that only
+   when a file cannot be lowered, so since 2026-11-04 zap analyzes
+   after the others too, with replay; see "AstGen" below.)
 4. No error limit.
 5. No zap-only checks and no `-fanalyze-unreferenced` for now. Their
    measurements stay below as background, marked not adopted.
@@ -6661,8 +6663,17 @@ notes; `anyerror` needs `else`). The enum case gained upstream's
 - **AstGen** errors are upstream's AstGen unchanged. Frontend collects them
   as ErrorBundles (`loadAll`'s bundle and `late_errors`). zap converts each
   message into a Diagnostic: its code from the format table, its fix from
-  the table above. Only the rendering changes: AstGen errors still stop
-  the build before Sema, as upstream.
+  the table above. As upstream, the build stops before Sema only when a
+  file could not be lowered (`Zir.loweringFailed`: a syntax error, an
+  unreadable import). Otherwise Sema runs and its errors follow
+  AstGen's: an agent gets "unused local constant" and the type errors
+  in one build. A declaration AstGen could not generate is an
+  `astgen_error` instruction, which fails the declaration and the units
+  that read it with no error of their own. Such a build replays like any
+  failing build and emits and records nothing. A one-line edit that adds
+  an unused variable to a std.debug.print program builds in 18–22 ms
+  (the stop-after-AstGen build took 15–19 ms); without a cache it is a
+  full analysis.
 - **Sema** errors go through `sema.fail`/`addNote` into `zcu.errors`,
   which are sorted by unit key and position at the end (see "Parallel
   function bodies"). `Zcu.renderErrors` and `main.renderErrors` turn them
