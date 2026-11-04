@@ -12607,6 +12607,21 @@ fn memRootValue(sema: *Sema, block: *Block, src: Src, base: InternPool.Ptr.BaseA
     };
 }
 
+/// As upstream's ptrCastFull: the length of `@ptrCast` of `src_len`
+/// elements of type `src_elem` to slice type `dest_ty`, when either element
+/// type is comptime-only. Nested arrays restructure, as comptime loads do.
+fn comptimeOnlyCastLen(sema: *Sema, block: *Block, src: Src, dest_ty: Index, src_ty: Index, src_elem: Index, src_len: u64, from_slice: bool) CompileError!u64 {
+    const sb = sema.arrayBase(src_elem);
+    const db = sema.arrayBase(Type.ptrInfo(sema.ip, dest_ty).child);
+    if (sb.ty != db.ty) return sema.fail(block, src, "cannot infer length of comptime-only '{f}' from incompatible '{f}'", .{ sema.fmtType(dest_ty), sema.fmtType(src_ty) });
+    const base = src_len * sb.len;
+    if (db.len == 0 or base % db.len != 0) return if (from_slice)
+        sema.fail(block, src, "slice length '{d}' does not divide exactly into destination elements", .{src_len})
+    else
+        sema.fail(block, src, "type '{f}' does not divide exactly into destination elements", .{sema.fmtType(Type.ptrInfo(sema.ip, src_ty).child)});
+    return base / db.len;
+}
+
 /// `ty` seen as nested arrays: the innermost element type and how many of
 /// them `ty` holds (sentinels aside).
 fn arrayBase(sema: *Sema, ty: Index) struct { ty: Index, len: u64 } {
@@ -17327,9 +17342,12 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
             .array_type => |a| .{ a.child, a.len }, // not the sentinel
             else => .{ s.child, 1 },
         };
+        const comptime_only = src_elem != d.child and (try sema.isComptimeOnlyResolved(block, src, src_elem) or try sema.isComptimeOnlyResolved(block, src, d.child));
+        const comptime_only_len = if (comptime_only) try sema.comptimeOnlyCastLen(block, src, dest_ty, src_ty, src_elem, src_len, false) else 0;
         const many = try sema.coercePtrTo(block, operand, try sema.elemValueType(dest_ty));
         // The same elements, of any size, keep their count.
         if (src_elem == d.child) return sema.makeSlice(block, dest_ty, many, .fromInterned(try sema.intValue(.usize_type, src_len)));
+        if (comptime_only) return sema.makeSlice(block, dest_ty, many, .fromInterned(try sema.intValue(.usize_type, comptime_only_len)));
         const bytes = src_len * Type.abiSize(ip, src_elem);
         const dsize = Type.abiSize(ip, d.child);
         if (dsize == 0 or bytes % dsize != 0) return sema.fail(block, src, "type '{f}' does not divide exactly into destination elements", .{sema.fmtType(s.child)});
@@ -17338,6 +17356,14 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
     if (d.flags.size == .slice) {
         try sema.resolveLayout(block, src, d.child);
         try sema.resolveLayout(block, src, s.child);
+        if (s.child != d.child and (try sema.isComptimeOnlyResolved(block, src, s.child) or try sema.isComptimeOnlyResolved(block, src, d.child))) {
+            // A comptime-only slice is comptime-known.
+            if (sema.resolveValue(try sema.sliceLen(block, operand))) |lv| if (ip.intValue(u64, lv)) |n| {
+                const len = try sema.comptimeOnlyCastLen(block, src, dest_ty, src_ty, s.child, n, true);
+                const many = try sema.coercePtrTo(block, try sema.slicePtr(block, operand), try sema.elemValueType(dest_ty));
+                return sema.makeSlice(block, dest_ty, many, .fromInterned(try sema.intValue(.usize_type, len)));
+            };
+        }
         const ssize = Type.abiSize(ip, s.child);
         const dsize = Type.abiSize(ip, d.child);
         if (ssize == dsize) return sema.coercePtrTo(block, operand, dest_ty);
@@ -17347,7 +17373,7 @@ fn ptrCastInner(sema: *Sema, block: *Block, src: Src, flags: Zir.Inst.FullPtrCas
         const len = try sema.sliceLen(block, operand);
         if (sema.resolveValue(len)) |lv| {
             const bytes = ip.intValue(u64, lv).? * ssize;
-            if (bytes % dsize != 0) return sema.fail(block, src, "slice length does not divide exactly into destination elements", .{});
+            if (bytes % dsize != 0) return sema.fail(block, src, "slice length '{d}' does not divide exactly into destination elements", .{ip.intValue(u64, lv).?});
             return sema.makeSlice(block, dest_ty, many, .fromInterned(try sema.intValue(.usize_type, bytes / dsize)));
         }
         try sema.requireRuntime(block, src);
