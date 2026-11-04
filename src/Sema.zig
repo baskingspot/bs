@@ -18978,7 +18978,7 @@ fn noteFnDeclared(sema: *Sema, nav_index: InternPool.NavIndex) CompileError!void
     const tree = try sema.zcu.fe.tree(@fromBackingInt(nav.file));
     var buf: [1]Ast.Node.Index = undefined;
     if (tree.fullFnProto(&buf, sema.zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_node)) |proto|
-        try sema.zcu.addNote(nav.file, tree.tokenToSpan(proto.ast.fn_token), "function declared here", .{});
+        try sema.zcu.addDeclNote(nav.file, tree.tokenToSpan(proto.ast.fn_token), "function declared here", .{});
 }
 
 /// Fails a runtime call at `src` in a naked function, as upstream.
