@@ -30,7 +30,9 @@ fresh checkout), `--results NAME` (write `.work/NAME.json` and
   0.17.0 or which CI builds with 0.17.0), the `zig build` steps that build
   its targets (`build`), and the targets: compile steps named by their
   `--name`, how to run each (`run`: arguments for an executable; tests run
-  without arguments), and an `edit` line for the edit build. Run arguments
+  without arguments), and an `edit` line for the edit build. Recording
+  anyzig's `test` step runs its tests, which download several Zig
+  releases (about 4 GB); delete ~/.local/share/anyzig afterwards. Run arguments
   and `cwd` may name `{src}` (the checkout), `{zig_lib}` (upstream's lib
   directory), `{gen}` (the generation cache, where code generators write)
   or a `fetch`ed package, and a glob there names its first match. A run's
@@ -50,7 +52,9 @@ fresh checkout), `--results NAME` (write `.work/NAME.json` and
   kept in `.work/commands/`.
 - Each target is then built from its recorded command line, by upstream
   zig and by zap, from the project's directory:
-  - The build-system plumbing goes (`--listen=-`, the cache directories);
+  - The build-system plumbing goes (`--listen=-`, the cache directories,
+    the recording zig's `--zig-lib-dir`: each compiler uses its own lib
+    directory, so the commands survive a move to another Zig release);
     each build gets an empty local cache and the user's global cache
     (`cold-local`) and emits to `.work/out/`. Tests add `--test-no-exec`.
     zap's cold build runs with `ZAP_CACHE_DONOR=off`: a first build that

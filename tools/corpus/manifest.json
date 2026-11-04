@@ -288,6 +288,9 @@
    "build": [
     [
      "install"
+    ],
+    [
+     "test"
     ]
    ],
    "targets": [
@@ -312,6 +315,9 @@
    "build": [
     [
      "install"
+    ],
+    [
+     "test"
     ]
    ],
    "targets": [

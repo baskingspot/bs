@@ -125,7 +125,9 @@ def strip_common(words, cache_dir, out):
             # zap has no other mode. (Some build scripts force a release
             # mode on their build-time tools.)
             res.append("-Odebug")
-        elif w in ("--cache-dir", "--global-cache-dir"):
+        elif w in ("--cache-dir", "--global-cache-dir", "--zig-lib-dir"):
+            # The recording zig's lib dir: each compiler uses its own, so
+            # zap gets the std it was built for and upstream its release's.
             i += 1
         else:
             res.append(w)
@@ -146,7 +148,7 @@ def strip_translate(words):
     res = []
     i = 2
     while i < len(words):
-        if words[i] in ("--cache-dir", "--global-cache-dir"):
+        if words[i] in ("--cache-dir", "--global-cache-dir", "--zig-lib-dir"):
             i += 1
         elif words[i] != "--listen=-":
             res.append(words[i])
