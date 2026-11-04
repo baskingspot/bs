@@ -719,10 +719,29 @@ comptime arguments are run-time values in the lowered code (uucode's
   linear scan and other values share stack slots by lifetime (steps 1 and
   2 of "Optimizing backend" below, accepted 2026-11-03, being built). The
   bullets here describe the code as it is until the rest lands.
-- Calling conventions: `.c` follows SysV for scalars: integers, bools, and
-  pointers in GPRs (16-byte integers in register pairs), f16, f32, f64, and
-  f128 in XMM registers, f80 in memory and returned in st0, and other values
-  in memory. Zap-to-zap calls (`.auto`) pass every argument in
+- Calling conventions: `.c` follows the SysV psABI (`cClass` in
+  CodeGen.zig, a port of upstream's `classifySystemV`, which follows
+  Clang): integers, bools, and pointers in GPRs (16-byte integers in
+  register pairs), f16, f32, f64, and f128 in XMM registers, f80 in
+  memory and returned in st0. Structs, unions, arrays, and vectors of up
+  to 16 bytes are classified per eightbyte (INTEGER or SSE, merged over
+  their fields; a packed container is its backing integer; an f16 field
+  or an x87 one puts the value in memory) and travel in the
+  next GPR or XMM register of each class, rax:rdx, xmm0:xmm1, or mixed as
+  results; a value that does not fit the registers left goes on the
+  stack whole. Vectors are classified by their elements' bytes, not
+  their 16-byte aligned size (up to 4 bytes INTEGER, up to 8 SSE, up to
+  16 one XMM register, `<1 x double>` arguments in memory); without AVX,
+  larger vector results come back as Clang returns them (32 and 64 bytes
+  in xmm0 and on, three 8-byte elements in rax, rdx, rcx or xmm0, xmm1,
+  st0), larger vector arguments in memory. Everything else is MEMORY: on
+  the stack as an argument, through a result pointer in rdi (returned in
+  rax). `va_arg` gathers a register-class aggregate from the register
+  save area, which keeps all 16 bytes of each XMM register. Not done:
+  bool vectors of 65 to 128 elements as arguments (Clang passes one GPR
+  per element; zap passes them in memory), and the `x86_64_win`
+  convention. Measured by upstream's test/c_abi (`run.py --c-abi`).
+  Zap-to-zap calls (`.auto`) pass every argument in
   memory at 8-byte aligned offsets of the caller's outgoing area, return
   1-, 2-, 4-, and 8-byte results in rax, and return anything else through a
   result pointer in rdi. The caller's error return trace pointer goes in

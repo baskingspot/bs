@@ -40,6 +40,12 @@ parsed as with --default-runner and compared with baseline/std-<target>.json.
 test-matrix entry for std with libc) and compares with
 baseline/std-<target>-gnu-libc.json.
 
+With --c-abi, the measure is upstream's C ABI tests instead:
+test/c_abi/main.zig with cfuncs.c (-std=c99), linked against glibc
+(-lc, -target <arch>-linux-gnu), built and run like --std, as upstream's
+test-c-abi step builds its self-hosted entry (which uses musl, which zap
+does not link), and compared with baseline/c-abi-<target>.json.
+
 With --compile-errors, the measure is diagnostics instead: every case in
 upstream's test/cases/compile_errors that applies to the target, compiled
 by zap as upstream's case harness compiles it: as a root file named
@@ -834,26 +840,35 @@ def std_target(compiler, cfg, args, workdir):
     """--std: upstream's std tests as one unit, built by `compiler`.
 
     With --libc, linked against glibc: `-lc` and the target's gnu ABI,
-    upstream's test-matrix entry for std with libc (`x86_64-linux-gnu`)."""
+    upstream's test-matrix entry for std with libc (`x86_64-linux-gnu`).
+    With --c-abi, upstream's test/c_abi instead, linked against glibc."""
+    suite = "c-abi" if args.c_abi else "std"
+    gnu = args.libc or args.c_abi
+    if gnu:
+        cfg = dict(cfg, zig_target=cfg["zig_target"].rsplit("-", 1)[0] + "-gnu")
     if args.libc:
-        cfg = dict(cfg, name=cfg["name"] + "-gnu-libc", zig_target=cfg["zig_target"].rsplit("-", 1)[0] + "-gnu")
-    baseline_path = BASELINE_DIR / f"std-{cfg['name']}.json"
+        cfg = dict(cfg, name=cfg["name"] + "-gnu-libc")
+    baseline_path = BASELINE_DIR / f"{suite}-{cfg['name']}.json"
     baseline = None
     if not args.upstream:
         if not baseline_path.exists():
-            print(f"{cfg['name']} std: no baseline; run with --upstream --std on a {cfg['name']} host first")
+            print(f"{cfg['name']} {suite}: no baseline; run with --upstream --{suite} on a {cfg['name']} host first")
             return
         baseline = json.loads(baseline_path.read_text())
-    bin_path = workdir / "bin" / cfg["name"] / "std.test"
+    bin_path = workdir / "bin" / cfg["name"] / f"{suite}.test"
     bin_path.parent.mkdir(parents=True, exist_ok=True)
     bin_path.unlink(missing_ok=True)
-    argv = [
-        str(compiler), "test", str(UPSTREAM_LIB / "std" / "std.zig"), "--zig-lib-dir", str(UPSTREAM_LIB),
+    if args.c_abi:
+        sources = [str(UPSTREAM_TEST / "c_abi" / "main.zig"), "-cflags", "-std=c99", "--", str(UPSTREAM_TEST / "c_abi" / "cfuncs.c")]
+    else:
+        sources = [str(UPSTREAM_LIB / "std" / "std.zig")]
+    argv = [str(compiler), "test"] + sources + [
+        "--zig-lib-dir", str(UPSTREAM_LIB),
         "-target", cfg["zig_target"], "--test-no-exec", f"-femit-bin={bin_path}",
-    ] + (["-lc"] if args.libc else [])
+    ] + (["-lc"] if gnu else [])
     if args.upstream:
         # A fresh cache, so that the baseline's compile time is a cold build.
-        cache = workdir / "std-zig-cache"
+        cache = workdir / f"{suite}-zig-cache"
         shutil.rmtree(cache, ignore_errors=True)
         argv += ["--cache-dir", str(cache / "local"), "--global-cache-dir", str(cache / "global")]
     timeout = args.compile_timeout * 4
@@ -871,7 +886,7 @@ def std_target(compiler, cfg, args, workdir):
     else:
         status = "compile_timeout" if timed_out else "compile_crash" if code < 0 else "compile_error"
         if args.upstream:
-            sys.exit(f"error: upstream failed to compile std's tests:\n{tail(err + out)}")
+            sys.exit(f"error: upstream failed to compile {suite}'s tests:\n{tail(err + out)}")
         r = {"status": status, "log": describe_exit(code, timed_out, timeout) + "\n" + tail(err + out), "tests": {}}
     counts = count_outcomes(r["tests"].values())
     data = {
@@ -892,7 +907,7 @@ def std_target(compiler, cfg, args, workdir):
         out_path = args.out or baseline_path
         write_json(out_path, data)
         print(
-            f"{cfg['name']} std: upstream zig {zig_version}: {counts['pass']} pass, {counts['skip']} skip, "
+            f"{cfg['name']} {suite}: upstream zig {zig_version}: {counts['pass']} pass, {counts['skip']} skip, "
             f"{len(r['tests']) - counts['pass'] - counts['skip']} fail of {len(r['tests'])} tests; "
             f"compiled in {compile_s:.1f}s -> {rel(out_path)}"
         )
@@ -916,12 +931,12 @@ def std_target(compiler, cfg, args, workdir):
     data["tests"] = merged
     if "details" in r:
         data["details"] = r["details"]
-    out_path = args.out or workdir / f"std-{cfg['name']}.json"
+    out_path = args.out or workdir / f"{suite}-{cfg['name']}.json"
     write_json(out_path, data)
     note = f"; {unknown} tests not in baseline" if unknown else ""
     status = "" if r["status"] == "ok" else f"; {STATUS_LABELS.get(r['status'], r['status'])}"
     print(
-        f"{cfg['name']} std: {passed}/{expected} std tests pass ({pct:.1f}% of upstream){status}{note}; "
+        f"{cfg['name']} {suite}: {passed}/{expected} {suite} tests pass ({pct:.1f}% of upstream){status}{note}; "
         f"compiled in {compile_s:.1f}s (upstream baseline {baseline['compile_seconds']:.1f}s) -> {rel(out_path)}"
     )
 
@@ -1121,6 +1136,7 @@ def main():
     p.add_argument("--default-runner", action="store_true", help="zap only: build with the compiler's default test runner (upstream's lib/compiler/test_runner.zig), as `zap test` without --test-runner does")
     p.add_argument("--std", action="store_true", help="measure upstream's std tests (lib/std/std.zig, default runner) instead of test/behavior")
     p.add_argument("--libc", action="store_true", help="with --std: link glibc (-lc, -target <arch>-linux-gnu), baseline/std-<target>-gnu-libc.json")
+    p.add_argument("--c-abi", action="store_true", help="measure upstream's test/c_abi (main.zig with cfuncs.c, -lc, -target <arch>-linux-gnu) instead of test/behavior, against baseline/c-abi-<target>.json")
     p.add_argument("--compile-errors", action="store_true", help="zap only: measure diagnostics on upstream's test/cases/compile_errors instead of test/behavior")
     p.add_argument("--files", nargs="+", help="only run these units, e.g. basic.zig behavior.zig")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="files compiled and run in parallel")
@@ -1159,7 +1175,7 @@ def main():
                 print(f"{name}: not run (needs an {name} host)")
             elif args.compile_errors:
                 compile_errors_target(compiler, cfg, args, args.workdir)
-            elif args.std:
+            elif args.std or args.c_abi:
                 std_target(compiler, cfg, args, args.workdir)
             elif args.upstream:
                 upstream_target(compiler, cfg, args, args.workdir)

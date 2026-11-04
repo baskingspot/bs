@@ -1085,6 +1085,23 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     tc_native.setEnvironmentVariable("NIX_CFLAGS_COMPILE", "-isystem test/link_input/tc_native/sys");
     tc_native.addCheck(.{ .expect_stdout_match = "pub extern fn tcn_native() c_int;" });
     test_step.dependOn(&tc_native.step);
+    // SysV aggregates between Zig and C both ways: INTEGER, SSE and mixed
+    // eightbytes, odd sizes, MEMORY, registers running out, a function
+    // pointer, and variadic aggregates. Upstream prints the same except
+    // `zig_va`, whose @cVaArg of aggregates its self-hosted backend gets
+    // wrong (32791); C's answer is 55.
+    const abi_exe = b.addRunArtifact(zap);
+    abi_exe.setName("zap build-exe with C aggregates");
+    abi_exe.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+    abi_exe.addFileArg(b.path("test/link_input/abi_main.zig"));
+    abi_exe.addFileArg(b.path("test/link_input/abi.c"));
+    abi_exe.setEnvironmentVariable("ZAP_ZIG", zig);
+    const abi_run = std.Build.Step.Run.create(b, "run zap build with C aggregates");
+    abi_run.addFileArg(abi_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+    abi_run.addCheck(.{ .expect_stdout_exact = "c_s16 1 2 0.5 1.5 4 5 6\nc_mix 7 0.5 3.25 9.5 10 11 12 13 14 15\nc_dsi 5 1 2 3 4 5 6 7 8 9\nptr 30 60\nzig_mix 103 101.5 102.25\nzig_dsi 0.75 1 2 3\nzig_va 55\n" });
+    abi_run.addCheck(.{ .expect_stderr_exact = "2 3 | 14 1 6.5 | 1.5 2.5 3.5 | 3 2 1 | 0.25 { 7, 8, 9 }\nc_va 55\nzig_s16 10 20 0.5 0.25 1 2 3\nzig_mix 3 1.5 2.25 4.5 { 1, 2, 3 } 4 5 6\nzig_dsi 9 1 2 3 4 5 6 7 8 9\n" });
+    abi_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&abi_run.step);
 
     // GCC's -fPIE reads glibc's data PC-relative: the executable copies
     // `stdout` and `environ` (with its aliases, which glibc's start code
