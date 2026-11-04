@@ -1335,6 +1335,48 @@ reductions native (`vector.native` answers by `cpu`). AVX changes the
 vector ABI and is a separate decision. Results are the same bits at
 every level; `-mcpu` is part of the cache key (`cacheTarget`).
 
+**aarch64 NEON (planned, with the aarch64 backend).** `vector.native`
+keeps its target-neutral signature; its aarch64 arm (now `false`) gets
+its own answers next to the x86_64 ones, and the backend's lowering goes
+in `src/codegen/aarch64/vector.zig` behind the same CodeGen hooks
+(`lowers`, `deferOperands`, `gen`). The IR needs no change: a bool vector
+is an IR type, not a register layout. x86_64 keeps one as bits in a
+general register because `pmovmskb` is one instruction; NEON has no
+move-mask, so aarch64 keeps compare results as lane masks in a V
+register and makes bits only where they are read as bits (a bitcast to
+an integer or a store): `and` with lane weights and
+`addv`/`addp`, or `shrn` to a 64-bit nibble mask. `@reduce(.Or/.And)`
+of a compare reads the mask with `umaxv`/`uminv` and needs no bits, and
+`std.simd.firstTrue` is `shrn`, `rbit`, `clz`. So `max_bools` (64, a
+general register) is x86-only. NEON is also wider in places: `mul` on
+8-bit lanes, ordering compares (`cmgt`/`cmhi`) and `@min`/`@max` on all
+lane widths (64-bit through `cmgt` and `bsl`), and `tbl` for any byte
+shuffle. Float reductions stay left folds, as on x86_64.
+
+What to lower first, by what the corpus and std run (ghostty's
+`terminal/stream.zig` escape scan, `simd/vt.zig`, and
+`terminal/snapshot/grid.zig`; std's `mem.indexOfScalarPos`,
+`splitScalar`, `tokenizeScalar`, `mem.eql` on bytes, `unicode`'s ASCII
+fast paths, `http.HeadParser`, `crypto.timing_safe.eql`, and ChaCha20,
+Salsa20, BLAKE3 and SHA-256 in TLS):
+
+1. 16-byte loads and stores, `@splat`, byte compares (`cmeq`, `cmhs`)
+   with `@reduce(.Or/.And)` and `firstTrue`/`lastTrue`, bitwise ops,
+   and bitcasts between 16-byte vectors, arrays and integers.
+2. 32-bit lanes: wrapping add, xor, `@shuffle` (`ext`, `rev64`, `tbl`)
+   for ChaCha20, Salsa20 and BLAKE3 rounds. Their rotates are shifts,
+   scalarized on x86_64 today; NEON `shl`/`ushr`/`sri` would make
+   shifts by a splat worth adding on both. SHA-256 on apple_m1 (which
+   has the sha2 feature) is inline assembly with `@Vector(4, u32)`
+   operands in V registers (`w` constraints), so asm operands of vector
+   type come with this step.
+3. 16-bit lanes (UTF-16 ASCII checks, ghostty's surrogate test), and
+   `@truncate` of a vector to bytes (`xtn`; scalarized on both today).
+4. f32 lanes for graphics and linear-algebra code (none on the checked
+   corpus's hot paths): add, subtract, multiply, divide, `@min`/`@max`,
+   compares.
+5. 64-bit lanes (ghostty's `@Vector(2, u64)` style fills and masks).
+
 Narrow integers (`u4`, `i24`) sit in their ABI-size lane, extended as
 in memory, so the operations that keep lanes extended treat them as
 that lane: bitwise ops, compares, `@select`, `@shuffle`, `@min`/`@max`
