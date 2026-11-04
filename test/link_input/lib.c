@@ -4,6 +4,9 @@ extern const char *zig_name;
 static int counter = 5;
 int c_common_var;
 const char *c_greeting = "hello from C";
+/* PAD */
+const char c_msg[] = "extern data";
+int c_arr[4] = {10, 20, 30, 40};
 struct pair { long a, b; } c_pairs[3] = {{1, 2}, {3, 4}, {5, 6}};
 static const char *strs[] = {"alpha", "beta", "gamma"};
 __attribute__((weak)) int c_weak_hook(void);

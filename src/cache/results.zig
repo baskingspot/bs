@@ -315,6 +315,12 @@ pub const Encoder = struct {
                 try e.push(@intFromBool(f.is_weak));
                 break :blk true;
             },
+            .extern_var => |v| blk: {
+                try e.pushString(v.name);
+                if (!try e.pushRef(v.ty)) break :blk false;
+                try e.pushString(v.site);
+                break :blk true;
+            },
             .calling_convention => |cc| blk: {
                 try e.push(@backingInt(cc));
                 break :blk true;
@@ -766,6 +772,11 @@ pub fn Decoder(comptime Resolver: type) type {
                 .extern_func => blk: {
                     const name = try d.string(c);
                     break :blk .{ .extern_func = .{ .name = name, .ty = try d.ref(c) orelse return null, .is_weak = c.next() != 0 } };
+                },
+                .extern_var => blk: {
+                    const name = try d.string(c);
+                    const ty = try d.ref(c) orelse return null;
+                    break :blk .{ .extern_var = .{ .name = name, .ty = ty, .site = try d.string(c) } };
                 },
                 .calling_convention => .{ .calling_convention = @fromBackingInt(@intCast(@as(u8, @intCast(c.next())))) },
                 .nav_capture => .{ .nav_capture = .{ .nav = try d.nav(c) orelse return null, .by_ref = c.next() != 0 } },

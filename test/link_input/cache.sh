@@ -65,6 +65,12 @@ sed -i 's/hello from C/HELLO from C/' lib.c
 objects
 build "inputs changed, first $work/lib.o" "HELLO from C"
 eager "an object changed"
+# Data that the Zig code's comptime extern pointers name moves in its
+# section: the slots and the variable's data are bound again.
+sed -i 's|/\* PAD \*/|int c_pad[16] = {1};|' lib.c
+objects
+build "inputs changed, first $work/lib.o" "extern data data 30 30"
+eager "extern data moved"
 # An archive's member changed.
 sed -i 's/1 + a2/2 + a2/' a1.c
 objects

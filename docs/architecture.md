@@ -2917,6 +2917,61 @@ differs from the design above:
 3. C: `.so` inputs (`-l<name>` against a library upstream built), and
    copy relocations if an input needs them. Built 2026-11-04.
 
+### Comptime pointers to extern data (built 2026-11-04)
+
+translate-c turns `extern const char x[];` into a container-level
+`pub const x: [*c]const u8 = @extern([*c]const u8, .{ .name = "x" });`
+(wuffs has 97, which ghostty compares against at run time). Upstream
+makes the address a comptime-known pointer to an extern Nav. zap's
+value model:
+- InternPool `extern_var { name, ty, site }`, which appears only as a
+  pointer's `uav` base, as `extern_func` does. `site` is a stable string:
+  `siteKey` (the declaration's key, `#ext` and the ZIR node offset, as
+  anonymous struct literals' `#lit`) for `@extern`, the declaration's key
+  for `&` of an `extern var`. So, as upstream's (whose Extern key has the
+  ZIR instruction), two `@extern` sites of one name compare unequal at
+  comptime, and one site equals itself.
+- Sema gives it, in comptime blocks only, for `@extern` of a non-weak,
+  non-thread-local, non-pcrel data pointer (or optional pointer) and for
+  `&` of an `extern var` that is not thread-local; run-time code keeps
+  `extern_ptr`. As upstream: field and element pointers, pointer
+  arithmetic, comparisons (with each other, `null`, and other pointers)
+  work; loads ("unable to resolve comptime value"), stores and
+  `@intFromPtr` at comptime are errors; `@export` of one is "export
+  target cannot be extern". `comptimeLoadStructuralKey` and
+  `memRootValue` treat the base as run-time memory. `@extern` now
+  checks its type as upstream does ("extern symbol cannot have type",
+  for a type that is not extern-compatible or a non-const pointer to a
+  function), and a thread-local or DLL import at comptime is upstream's
+  "unable to resolve comptime value".
+- Code (`constLoc`) reads the address from the symbol's extern slot, as
+  for `extern_func`. An address `off` bytes into the symbol has its own
+  slot, `useExtern("<name>\x00<off>")`: the name no symbol has carries
+  the offset through `Emit.externs`, the `ext` references and the
+  manifest unchanged, and `lowerExternSlots` adds it to the addend
+  (`pullInputs` wants the symbol's name).
+- Data (`lowerValue` in `lowerNav`, after analysis and the slots)
+  relocates directly to where the slots bind the name
+  (`Emit.externTarget`: an export, an input object's definition at its
+  offset, a section bound, compiler_rt's, a library's import, or in an
+  object an import). A declaration's data is then no longer a function
+  of its value alone: an edited object moves the definition, so a
+  `nav_val` node's store entry (`exact_hash`) mixes in its atoms'
+  relocations, and an eager build with inputs writes the new record. A
+  lazy build has no inputs, and falls back when the exports change.
+- Not yet: such an address in a constant that a function reads (a
+  content atom CodeGen writes while analysis runs, before the exports
+  and inputs are complete, and which an eager build loads with the
+  function): `[unsupported]`, "take the address at run time instead". A
+  data-only reference to a symbol that only an unpulled archive member
+  defines is "undefined symbol": archive members are pulled from the
+  slots' names during analysis. Weak and thread-local extern data at
+  comptime keep their old error.
+- Checks: test/run/extern_data.zig (exports as the definitions, two
+  chained edits, upstream the same), test/link_input/main.zig (C
+  objects' definitions, in code and data), and cache.sh's edit that
+  moves the definitions in their section.
+
 ### compiler_rt (decided 2026-11-02)
 
 - Upstream compiles all of `lib/compiler_rt.zig` as a separate compilation
@@ -3507,7 +3562,8 @@ once, where store payloads would repeat `[]const u8` in every entry.
   `simple_type`, `tuple_type`, `error_set_type`, `func_type`,
   `simple_value`, `undef`, `int`, `float` (exact bits), `err`,
   `error_union`, `enum_literal`, `enum_tag`, `un`, `slice`, `opt`,
-  `aggregate`, `extern_func`, `calling_convention`, `runtime_capture`.
+  `aggregate`, `extern_func`, `extern_var` (its site is a string),
+  `calling_convention`, `runtime_capture`.
 - Key kinds that name source, by ZIR instruction: the absolute
   instruction in the ZIR of the recorded input, which an edit build maps
   to the new ZIR with the same `mapOldZirToNew` map that computes the

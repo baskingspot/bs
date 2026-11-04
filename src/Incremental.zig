@@ -2633,7 +2633,20 @@ const Graph = struct {
                         n.result_hash = h;
                         n.exact_hash = h ^ cache.hash(5, std.mem.asBytes(&rest));
                     },
-                    else => n.exact_hash = n.result_hash,
+                    else => {
+                        n.exact_hash = n.result_hash;
+                        // A declaration's data follows from its value but
+                        // for the targets of addresses the link binds,
+                        // such as an input object's definition of an
+                        // extern symbol (`Emit.externDataTarget`), which
+                        // move without the value changing.
+                        var h: Hash = 0;
+                        for (n.atoms) |ai| {
+                            const a = &c.atoms[ai];
+                            if (a.relocs.len != 0) h = h *% 31 +% cache.hash(a.relocs.len, @ptrCast(a.targets)) +% cache.hash(0, @ptrCast(a.relocs));
+                        }
+                        if (h != 0) n.exact_hash ^= cache.hash(14, std.mem.asBytes(&h));
+                    },
                 };
             }
         }{ .nodes = r.nodes.items, .atoms = emit.atoms.items, .debug_of = g.debug_of });

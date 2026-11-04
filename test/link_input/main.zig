@@ -14,6 +14,12 @@ extern fn c_tls_ie2() c_int;
 extern fn a1(x: c_int) c_int;
 extern var c_greeting: [*:0]const u8;
 extern var c_common_var: c_int;
+// As translate-c declares `extern const char c_msg[];`: comptime-known
+// addresses the link binds to the object's definitions, read through
+// slots in code and written directly in a variable's data.
+const c_msg: [*c]const u8 = @extern([*c]const u8, .{ .name = "c_msg" });
+const c_arr2: *c_int = &@extern(*[4]c_int, .{ .name = "c_arr" })[2];
+var c_refs: struct { msg: [*c]const u8, arr: *c_int } = .{ .msg = c_msg + 7, .arr = c_arr2 };
 export fn zig_add(a: c_int, b: c_int) c_int {
     return a + b;
 }
@@ -32,4 +38,5 @@ pub fn main() void {
     }.f, .{}) catch unreachable;
     t.join();
     std.debug.print("{d} {d} {d}\n", .{ c_tls(), c_tls_ie2(), a1(5) });
+    std.debug.print("{s} {s} {d} {d}\n", .{ c_msg, c_refs.msg, c_arr2.*, c_refs.arr.* });
 }

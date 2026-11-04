@@ -785,6 +785,12 @@ fn constLoc(cg: *CodeGen, val: Index) Error!Loc {
             }
             if (ptrToZeroBit(ip, val)) return .{ .imm = 0xaaaaaaaaaaaaaaaa };
             const t = try ptrTarget(cg.emit, val);
+            // The address of extern data, or into it, is in its link slot.
+            if (t.ext) |n| {
+                const name = ip.stringSlice(n);
+                _ = try cg.emit.requestCompilerRtExport(name);
+                return .{ .mem = Mem.sym(try cg.emit.useExtern(try cg.emit.externSlotName(name, t.off), false), 0) };
+            }
             return .{ .addr = Mem.sym(t.key, @intCast(t.off)) };
         },
         .opt => |o| if (Type.optionalReprIsPtr(ip, Type.childType(ip, ty))) {
@@ -4119,7 +4125,14 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
 // ---------------------------------------------------------------------------
 // Constants
 
-const PtrTarget = struct { key: SymbolKey, off: i64 };
+const PtrTarget = struct {
+    key: SymbolKey,
+    off: i64,
+    /// For data an external symbol defines (`extern_var`), its name, and
+    /// `key` is unset: the caller binds it, through a slot in code
+    /// (`constLoc`) or directly in data (`lowerValue`).
+    ext: ?InternPool.String = null,
+};
 
 /// The explicit alignment in bytes of pointer type `ptr_ty`, or 0.
 fn explicitAlignment(ip: *const InternPool, ptr_ty: Index) u64 {
@@ -4148,7 +4161,7 @@ fn ptrToZeroBit(ip: *const InternPool, ptr: Index) bool {
                 return Type.class(ip, nav.ty) != .@"fn" and !Type.hasRuntimeBits(ip, nav.ty);
             },
             .uav => |u| return switch (ip.keyTag(u.val)) {
-                .func, .extern_func => false,
+                .func, .extern_func, .extern_var => false,
                 else => !Type.hasRuntimeBits(ip, ip.typeOf(u.val)),
             },
             else => return false,
@@ -4175,7 +4188,9 @@ pub fn ptrTarget(emit: *Emit, ptr: Index) Error!PtrTarget {
                 return error.CodegenFail;
             };
             break :blk .{ .key = key, .off = 0 };
-        } else
+        } else if (ip.keyTag(u.val) == .extern_var)
+            .{ .key = undefined, .off = 0, .ext = ip.keyPayload(.extern_var, u.val).name }
+        else
         // A local constant declared `align(n)` keeps its alignment.
         .{ .key = try emit.uavKey(u.val, if (u.orig_ty == .none) 0 else explicitAlignment(ip, u.orig_ty)), .off = 0 },
         .field => |f| blk: {
@@ -4273,7 +4288,10 @@ pub fn lowerValue(emit: *Emit, val: Index, out: []u8, relocs: *Atom.RelocList, b
             } else {
                 const t = try ptrTarget(emit, val);
                 @memset(out[0..8], 0);
-                try relocs.append(gpa, base_off, .x86_64_abs64, t.key, t.off);
+                if (t.ext) |name| {
+                    const b = try emit.externDataTarget(ip.stringSlice(name));
+                    try relocs.append(gpa, base_off, .x86_64_abs64, b.key, t.off + b.addend);
+                } else try relocs.append(gpa, base_off, .x86_64_abs64, t.key, t.off);
             }
         },
         .slice => |s| {

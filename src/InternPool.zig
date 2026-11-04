@@ -636,6 +636,14 @@ pub const Key = union(enum) {
     /// A function declared `extern`, defined by the export of `name`
     /// (zap links statically, so another part of the program).
     extern_func: ExternFunc,
+    /// Data defined by the symbol `name`, of type `ty`, outside the
+    /// compilation's values: the link binds it (an export, an input
+    /// object's definition, a library's). Appears only as a pointer's
+    /// `uav` base, which comptime cannot load through. `site` is the
+    /// stable key of the `@extern` call (its declaration's key and source
+    /// node offset) or of the `extern` declaration whose address it is,
+    /// so that, as upstream's, two sites' pointers compare unequal.
+    extern_var: ExternVar,
     calling_convention: CallingConvention,
     /// A container type's capture of declaration `nav` from an enclosing
     /// generic namespace (ZIR's `decl_val`/`decl_ref` captures). The
@@ -653,6 +661,12 @@ pub const ExternFunc = struct {
     name: String,
     ty: Index,
     is_weak: bool,
+};
+
+pub const ExternVar = struct {
+    name: String,
+    ty: Index,
+    site: String,
 };
 
 // ---------------------------------------------------------------------------
@@ -703,6 +717,7 @@ const Tag = enum(u8) {
     aggregate_repeated,
     func,
     extern_func,
+    extern_var,
     calling_convention,
     nav_capture_val,
     nav_capture_ref,
@@ -1329,6 +1344,7 @@ fn encode(ip: *InternPool, local: *Local, key: Key) !Item {
             return .{ .tag = .func, .data = start };
         },
         .extern_func => |f| return .{ .tag = .extern_func, .data = try ip.addExtra(local, &.{ @backingInt(f.name), idx(f.ty), @intFromBool(f.is_weak) }) },
+        .extern_var => |v| return .{ .tag = .extern_var, .data = try ip.addExtra(local, &.{ @backingInt(v.name), idx(v.ty), @backingInt(v.site) }) },
         .calling_convention => |cc| return .{ .tag = .calling_convention, .data = @backingInt(cc) },
     }
 }
@@ -1491,6 +1507,7 @@ inline fn decodeItem(ip: *const InternPool, comptime tag: Tag, index: Index, ite
             .comptime_args = @ptrCast(extra[d + 5 ..][0..extra[d + 4]]),
         } },
         .extern_func => .{ .extern_func = .{ .name = I.s(extra[d]), .ty = I.i(extra[d + 1]), .is_weak = extra[d + 2] != 0 } },
+        .extern_var => .{ .extern_var = .{ .name = I.s(extra[d]), .ty = I.i(extra[d + 1]), .site = I.s(extra[d + 2]) } },
         .calling_convention => .{ .calling_convention = @fromBackingInt(@as(u8, @truncate(d))) },
     };
 }
@@ -1544,6 +1561,7 @@ fn keyTagOf(tag: Tag) KeyTag {
         .aggregate_elems, .aggregate_bytes, .aggregate_repeated => .aggregate,
         .func => .func,
         .extern_func => .extern_func,
+        .extern_var => .extern_var,
         .calling_convention => .calling_convention,
         .nav_capture_val, .nav_capture_ref => .nav_capture,
         .runtime_capture => .runtime_capture,
@@ -1817,6 +1835,11 @@ pub fn hashKey(ip: *const InternPool, key: Key) Hash {
             ip.hashIndex(&h, f.ty);
             h.int(u8, @intFromBool(f.is_weak));
         },
+        .extern_var => |v| {
+            ip.hashString(&h, v.name);
+            ip.hashIndex(&h, v.ty);
+            ip.hashString(&h, v.site);
+        },
         .calling_convention => |cc| h.int(u8, @backingInt(cc)),
     }
     return h.final();
@@ -2022,6 +2045,11 @@ fn lookupHash(ip: *const InternPool, key: Key) u64 {
             h.int(u32, u.i(f.ty));
             h.int(u8, @intFromBool(f.is_weak));
         },
+        .extern_var => |v| {
+            h.int(u32, u.i(v.name));
+            h.int(u32, u.i(v.ty));
+            h.int(u32, u.i(v.site));
+        },
         .calling_convention => |cc| h.int(u8, @backingInt(cc)),
     }
     _ = ip;
@@ -2117,6 +2145,7 @@ inline fn keyEql(ip: *const InternPool, a: Key, b: Key) bool {
                 x.generic_owner == y.generic_owner and eqlIdx(Index, x.comptime_args, y.comptime_args);
         },
         .extern_func => |x| x.name == b.extern_func.name and x.ty == b.extern_func.ty and x.is_weak == b.extern_func.is_weak,
+        .extern_var => |x| x.name == b.extern_var.name and x.ty == b.extern_var.ty and x.site == b.extern_var.site,
         .calling_convention => |x| x == b.calling_convention,
     };
 }
@@ -2177,7 +2206,7 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
                 .aggregate_bytes,
                 .aggregate_repeated,
                 => @fromBackingInt(item.extra[d]),
-                .func, .extern_func => @fromBackingInt(item.extra[d + 1]),
+                .func, .extern_func, .extern_var => @fromBackingInt(item.extra[d + 1]),
                 .enum_literal => .enum_literal_type,
                 .calling_convention => .calling_convention_type,
                 .nav_capture_val, .nav_capture_ref, .runtime_capture => .generic_poison_type,

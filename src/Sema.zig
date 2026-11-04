@@ -5952,6 +5952,8 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
     const ptr_ty = try sema.ptrType(.{ .child = nav.ty, .flags = .{ .is_const = nav.is_const, .alignment = alignment } });
     // The address of an extern variable or function is known at link time.
     if (nav.linkage == .@"extern") {
+        // At comptime, a pointer the link binds; the declaration is its site.
+        if (block.is_comptime and !nav.is_threadlocal and isExternVar(sema.ip, nav)) return sema.externVarPtr(ptr_ty, nav.name, nav.key);
         if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
         return sema.addInst(block, .{ .tag = if (nav.is_threadlocal) .extern_tls else .extern_ptr, .data = .{ .ty_pl = .{ .ty = ptr_ty, .payload = @backingInt(nav.name) } } });
     }
@@ -5967,6 +5969,42 @@ fn navRef(sema: *Sema, block: *Block, src: Src, nav_index: InternPool.NavIndex) 
 
 fn isExternVar(ip: *const InternPool, nav: *const InternPool.Nav) bool {
     return nav.linkage == .@"extern" and ip.keyTag(nav.val) != .extern_func;
+}
+
+/// The stable key of a source site: the key of the declaration whose code
+/// it is in (the function's, for a function body or an inline call), then
+/// `#<kind><node>` with the ZIR node offset, which is relative to the
+/// declaration.
+fn siteKey(sema: *Sema, block: *Block, kind: []const u8, node: Ast.Node.Offset) !InternPool.String {
+    const ip = sema.ip;
+    var site: std.Io.Writer.Allocating = .init(sema.arena);
+    const owner_nav: InternPool.NavIndex = if (block.inlining) |inl|
+        ip.keyPayload(.func, inl.func).owner_nav
+    else switch (sema.owner) {
+        .func => |f| ip.keyPayload(.func, f).owner_nav,
+        else => sema.owner_nav,
+    };
+    if (owner_nav != .none) {
+        site.writer.writeAll(ip.stringSlice(ip.getNav(owner_nav).key)) catch return error.OutOfMemory;
+    } else {
+        sema.zcu.unitKey(sema.owner, &site.writer) catch return error.OutOfMemory;
+    }
+    site.writer.print("#{s}{d}", .{ kind, @backingInt(node) }) catch return error.OutOfMemory;
+    return sema.getString(site.written());
+}
+
+/// The comptime-known address of data that symbol `name` defines, of type
+/// `ptr_ty` (a non-slice pointer, or an optional one), as `@extern` or
+/// `&` of an `extern` variable at comptime give it. `site` tells sites
+/// apart (`InternPool.Key.extern_var`).
+fn externVarPtr(sema: *Sema, ptr_ty: Index, name: InternPool.String, site: InternPool.String) !Ref {
+    const ip = sema.ip;
+    const opt = Type.class(ip, ptr_ty) == .optional;
+    const pt = if (opt) Type.childType(ip, ptr_ty) else ptr_ty;
+    const v = try sema.intern(.{ .extern_var = .{ .name = name, .ty = Type.ptrInfo(ip, pt).child, .site = site } });
+    const ptr = try sema.intern(.{ .ptr = .{ .ty = pt, .base = .{ .uav = .{ .val = v, .orig_ty = pt } } } });
+    if (!opt) return .fromInterned(ptr);
+    return .fromInterned(try sema.intern(.{ .opt = .{ .ty = ptr_ty, .val = ptr } }));
 }
 
 /// `@export(&decl, .{ .name = ... })`: exports a declaration under a symbol
@@ -5995,6 +6033,7 @@ fn zirExport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
     const nav_index = switch (ip.keyPayload(.ptr, ptr_val).base) {
         .nav => |n| n,
         .uav => |v| {
+            if (ip.keyTag(v.val) == .extern_var) return sema.fail(block, src, "export target cannot be extern", .{});
             try sema.zcu.exports.append(sema.gpa, .{ .target = .{ .uav = v.val }, .name = try sema.getString(name), .unit = sema.owner, .linkage = linkage, .visibility = visibility });
             return;
         },
@@ -6028,6 +6067,21 @@ fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
     var ty = try sema.resolveType(block, src, extra.lhs);
     const ptr_ty = if (Type.class(ip, ty) == .optional) Type.childType(ip, ty) else ty;
     if (Type.class(ip, ptr_ty) != .pointer or Type.isSlice(ip, ptr_ty)) return sema.fail(block, src, "expected (optional) pointer", .{});
+    // As upstream: the symbol's type is extern-compatible, and a function
+    // is reached through a const pointer.
+    const ty_src = sema.callArgSrc(src, false, 0);
+    const elem_ty = Type.ptrInfo(ip, ptr_ty).child;
+    try sema.resolveLayout(block, ty_src, elem_ty);
+    const not_extern = !sema.validateExtern(elem_ty, .other);
+    if (not_extern or (Type.class(ip, elem_ty) == .@"fn" and !Type.ptrInfo(ip, ptr_ty).flags.is_const)) {
+        const err = sema.fail(block, ty_src, "extern symbol cannot have type '{f}'", .{sema.fmtType(ty)});
+        const span = ty_src.span(try sema.zcu.fe.tree(@fromBackingInt(sema.file)));
+        if (not_extern) {
+            try sema.zcu.addNote(sema.file, span, "pointer element type '{f}' is not extern compatible", .{sema.fmtType(elem_ty)});
+            try sema.explainWhyNotExtern(sema.file, span, elem_ty, .other);
+        } else try sema.zcu.addNote(sema.file, span, "pointer to extern function must be 'const'", .{});
+        return err;
+    }
     const options_ty = try sema.stdLangType(block, src, "ExternOptions");
     const options = try sema.resolveConstValue(block, src, try sema.coerce(block, options_ty, sema.resolveInst(extra.rhs), src), "extern options must be comptime-known");
     const info = ip.structInfo(options_ty);
@@ -6041,12 +6095,21 @@ fn zirBuiltinExtern(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
     if (is_weak and Type.class(ip, ty) != .optional) ty = try sema.optType(ty);
     const relocation = try sema.fieldValue(options, info.fieldIndex(ip, "relocation").?);
     const pcrel = ip.intValue(u64, ip.keyPayload(.enum_tag, relocation).int).? == @backingInt(std.lang.ExternOptions.Relocation.pcrel);
+    const dll_import = try sema.fieldValue(options, info.fieldIndex(ip, "is_dll_import").?) == .bool_true;
     // A function's address is a comptime-known pointer to the extern
     // function, which CodeGen reads from the slot the link fills.
     if (!is_weak and !pcrel and !is_tls and Type.class(ip, ty) == .pointer and Type.class(ip, Type.ptrInfo(ip, ty).child) == .@"fn") {
         const f = try sema.intern(.{ .extern_func = .{ .name = try sema.getString(name), .ty = Type.ptrInfo(ip, ty).child, .is_weak = false } });
         return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = ty, .base = .{ .uav = .{ .val = f, .orig_ty = ty } } } }));
     }
+    // Data's address at comptime is a pointer the link binds, which
+    // comptime cannot load through; each call site's is its own, as
+    // upstream's (its extern key has the ZIR instruction).
+    if (block.is_comptime and !is_weak and !pcrel and !is_tls and !dll_import)
+        return sema.externVarPtr(ty, try sema.getString(name), try sema.siteKey(block, "ext", extra.node));
+    // A thread-local's or a DLL import's address is not comptime-known,
+    // as upstream's.
+    if (block.is_comptime and (is_tls or dll_import)) if (block.comptime_reason) |r| return sema.failNeededComptime(block, src, r);
     if (block.is_comptime) return sema.fail(block, src, "unable to evaluate comptime expression: zap resolves extern symbols at link time", .{});
     return sema.addInst(block, .{ .tag = if (is_tls) .extern_tls else if (pcrel) .extern_pcrel else .extern_ptr, .data = .{ .ty_pl = .{ .ty = ty, .payload = @backingInt(try sema.getString(name)) } } });
 }
@@ -11765,7 +11828,8 @@ fn comptimeLoadStructuralKey(sema: *Sema, block: *Block, src: Src, key: InternPo
                 return sema.fail(block, src, "comptime variable is not accessible here", .{});
             break :blk try sema.loadAtOffset(try sema.allocValue(alloc), key, load_ty);
         },
-        .uav => |u| try sema.loadAtOffset(u.val, key, load_ty),
+        // An extern symbol's data is only known at run time.
+        .uav => |u| if (ip.keyTag(u.val) == .extern_var) null else try sema.loadAtOffset(u.val, key, load_ty),
         .nav => |n| blk: {
             try sema.ensureNavVal(block, src, n);
             const nav = ip.getNav(n);
@@ -12111,7 +12175,7 @@ fn memRootValue(sema: *Sema, block: *Block, src: Src, base: InternPool.Ptr.BaseA
     return switch (base) {
         .comptime_alloc => |id| try sema.allocValue(sema.comptime_allocs.getPtr(id) orelse
             return sema.fail(block, src, "comptime variable is not accessible here", .{})),
-        .uav => |u| u.val,
+        .uav => |u| if (sema.ip.keyTag(u.val) == .extern_var) null else u.val,
         .nav => |n| blk: {
             try sema.ensureNavVal(block, src, n);
             const nav = sema.ip.getNav(n);
@@ -15585,19 +15649,7 @@ fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: As
         if (v.* != .none and ip.keyTag(v.*) == .ptr and try sema.comptimePtrRoot(v.*) == .comptime_alloc) v.* = .none;
     }
 
-    var site: std.Io.Writer.Allocating = .init(sema.arena);
-    const owner_nav: InternPool.NavIndex = if (block.inlining) |inl|
-        ip.keyPayload(.func, inl.func).owner_nav
-    else switch (sema.owner) {
-        .func => |f| ip.keyPayload(.func, f).owner_nav,
-        else => sema.owner_nav,
-    };
-    if (owner_nav != .none) {
-        site.writer.writeAll(ip.stringSlice(ip.getNav(owner_nav).key)) catch return error.OutOfMemory;
-    } else {
-        sema.zcu.unitKey(sema.owner, &site.writer) catch return error.OutOfMemory;
-    }
-    site.writer.print("#lit{d}", .{@backingInt(src_node)}) catch return error.OutOfMemory;
+    const site = try sema.siteKey(block, "lit", src_node);
     var b: print.TemplateBuilder = .init(sema.arena);
     const creator = try sema.anonTypeParent(block, &b);
     b.aw.writer.print("__struct_{f}", .{sema.anonTypeNumber(block, inst)}) catch return error.OutOfMemory;
@@ -15606,7 +15658,7 @@ fn anonStructInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index, src_node: As
         .types = types,
         .values = values,
         .names = names,
-        .site = try sema.getString(site.written()),
+        .site = site,
     } }, .{ .creator = creator, .template = b.finish() });
     return sema.aggregate(block, src, ty, inits);
 }

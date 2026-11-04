@@ -545,6 +545,7 @@ fn valueIn(cx: Ctx, val: InternPool.Index, w: *Writer, level: u8) Writer.Error!v
         .aggregate => try printAggregate(cx, val, false, w, level),
         .func => |f| try w.print("(function '{s}')", .{cx.ip.stringSlice(cx.ip.getNav(f.owner_nav).name)}),
         .extern_func => |e| try w.print("(extern '{s}')", .{cx.ip.stringSlice(e.name)}),
+        .extern_var => |e| try w.print("(extern '{s}')", .{cx.ip.stringSlice(e.name)}),
         else => try typeIn(cx, val, w),
     }
 }

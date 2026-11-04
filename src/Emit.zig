@@ -816,7 +816,11 @@ pub fn sync(emit: *Emit, zcu: *Zcu) !void {
 /// and nothing else defines, so that analysis generates them.
 fn pullInputs(emit: *Emit, in: *ElfInput) !void {
     const ctx: InputResolver = .{ .emit = emit };
-    const first = try in.pull(emit.externs.keys(), ctx);
+    // The symbols, not their offset slots' names.
+    var wanted: std.ArrayList([]const u8) = .empty;
+    defer wanted.deinit(emit.gpa);
+    for (emit.externs.keys()) |slot| try wanted.append(emit.gpa, parseExternSlot(slot)[0]);
+    const first = try in.pull(wanted.items, ctx);
     if (first == emit.inputs_requested) return;
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(emit.gpa);
@@ -1250,7 +1254,9 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
 }
 
 /// The key of the 8-byte slot holding the address of external symbol
-/// `name`, requesting that `finish` write it.
+/// `name`, requesting that `finish` write it. A slot for an address
+/// `off` bytes into the symbol is named `name`, NUL, and `off` in decimal
+/// (`externSlotName`), a name no symbol has.
 pub fn useExtern(emit: *Emit, name: []const u8, weak: bool) !SymbolKey {
     try emit.syncPending();
     const gop = try emit.externs.getOrPut(emit.gpa, name);
@@ -1324,6 +1330,19 @@ pub fn useErrorNames(emit: *Emit) !void {
 fn externSlotKey(name: []const u8) SymbolKey {
     var buf: [256]u8 = undefined;
     return .fromName(std.fmt.bufPrint(&buf, "extern.{s}", .{name}) catch name);
+}
+
+/// The `useExtern` name of the slot for the address `off` bytes into
+/// symbol `name`.
+pub fn externSlotName(emit: *Emit, name: []const u8, off: i64) Allocator.Error![]const u8 {
+    if (off == 0) return name;
+    return std.fmt.allocPrint(emit.allocator(), "{s}\x00{d}", .{ name, off });
+}
+
+/// The symbol and offset of a `useExtern` name (`externSlotName`).
+fn parseExternSlot(slot: []const u8) struct { []const u8, i64 } {
+    const nul = std.mem.indexOfScalar(u8, slot, 0) orelse return .{ slot, 0 };
+    return .{ slot[0..nul], std.fmt.parseInt(i64, slot[nul + 1 ..], 10) catch unreachable };
 }
 
 /// The key relocations name an imported symbol by (see `useImport`).
@@ -1430,20 +1449,9 @@ fn lowerExternSlots(emit: *Emit) !bool {
             return std.mem.order(u8, c.names[a], c.names[b]) == .lt;
         }
     }{ .names = emit.externs.keys() });
-    for (emit.externs.keys(), emit.externs.values()) |name, weak| {
-        // An object's definition comes after the compilation's exports
-        // and before compiler_rt, at an offset in its section's atom.
-        var addend: i32 = 0;
-        const target = if (emit.inputs) |in| if (try emit.userExport(name)) |key| key else if (try in.lookup(name)) |t| obj: {
-            addend = std.math.cast(i32, t.offset) orelse return error.Overflow;
-            break :obj t.key;
-        } else sectionBound(name) orelse arrayBound(name) orelse try emit.exportTarget(name) else if (emit.shared)
-            try emit.userExport(name) orelse try emit.rtExport(name) orelse
-                if (std.mem.eql(u8, name, "_DYNAMIC")) ElfDynamic.dynamic_key else try emit.useImport(name, .{ .weak = weak })
-        else if (emit.obj)
-            try emit.userExport(name) orelse try emit.useImport(name, .{ .weak = weak })
-        else
-            sectionBound(name) orelse try emit.exportTarget(name);
+    for (emit.externs.keys(), emit.externs.values()) |slot, weak| {
+        const name, const off = parseExternSlot(slot);
+        const target = try emit.externTarget(name, weak);
         if (target == null and !weak) {
             try zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
             ok = false;
@@ -1451,11 +1459,11 @@ fn lowerExternSlots(emit: *Emit) !bool {
         }
         const bytes = try arena.alloc(u8, 8);
         @memset(bytes, 0);
-        const targets: []const SymbolKey = if (target) |t| try arena.dupe(SymbolKey, &.{t}) else &.{};
-        const relocs: []const Atom.Reloc = if (target != null) try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, addend)}) else &.{};
+        const targets: []const SymbolKey = if (target) |t| try arena.dupe(SymbolKey, &.{t.key}) else &.{};
+        const relocs: []const Atom.Reloc = if (target) |t| try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_abs64, 0, std.math.cast(i32, t.addend + off) orelse return error.Overflow)}) else &.{};
         try emit.addAtom(.{
-            .key = externSlotKey(name),
-            .name = try std.fmt.allocPrint(arena, "extern.{s}", .{name}),
+            .key = externSlotKey(slot),
+            .name = if (off == 0) try std.fmt.allocPrint(arena, "extern.{s}", .{name}) else try std.fmt.allocPrint(arena, "extern.{s}+{d}", .{ name, off }),
             .section = .rodata,
             .alignment = .@"8",
             .bytes = bytes,
@@ -1464,6 +1472,54 @@ fn lowerExternSlots(emit: *Emit) !bool {
         });
     }
     return ok;
+}
+
+pub const ExternTarget = struct { key: SymbolKey, addend: i64 = 0 };
+
+/// Where the link binds external symbol `name`, or null if nothing
+/// defines it: the compilation's export, an input object's definition
+/// (at an offset in its section's atom; after the exports and before
+/// compiler_rt), a section bound, compiler_rt's, or a library's; in an
+/// object, a symbol that is not exported is imported. Complete only once
+/// analysis is, and the inputs pulled.
+fn externTarget(emit: *Emit, name: []const u8, weak: bool) !?ExternTarget {
+    const key = if (emit.inputs) |in| if (try emit.userExport(name)) |key| key else if (try in.lookup(name)) |t|
+        return .{ .key = t.key, .addend = @intCast(t.offset) }
+    else
+        sectionBound(name) orelse arrayBound(name) orelse try emit.exportTarget(name)
+    else if (emit.shared)
+        try emit.userExport(name) orelse try emit.rtExport(name) orelse
+            if (std.mem.eql(u8, name, "_DYNAMIC")) ElfDynamic.dynamic_key else try emit.useImport(name, .{ .weak = weak })
+    else if (emit.obj)
+        try emit.userExport(name) orelse try emit.useImport(name, .{ .weak = weak })
+    else
+        sectionBound(name) orelse try emit.exportTarget(name);
+    return .{ .key = key orelse return null };
+}
+
+/// The relocation target of the address of external symbol `name` in a
+/// declaration's data, which `lowerNavs` writes once analysis is done (a
+/// lazy build has no inputs, and falls back if the exports change).
+/// Constants that functions read are written while analysis runs, so
+/// they reach such an address through a slot instead (`useExtern`).
+pub fn externDataTarget(emit: *Emit, name: []const u8) !ExternTarget {
+    const fail = switch (emit.owner) {
+        .unit => |u| u != .nav_val,
+        .content, .input => true,
+        .link => emit.analyzing,
+    };
+    if (fail) {
+        const reader = if (emit.owner == .unit and emit.owner.unit == .func)
+            try print.navNameAlloc(&emit.zcu.ip, emit.zcu.ip.keyPayload(.func, emit.owner.unit.func).owner_nav, emit.allocator())
+        else
+            "a function";
+        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap does not support the address of extern symbol {s} in a constant that {s} reads yet; take the address at run time instead", .{ name, reader });
+        return error.CodegenFail;
+    }
+    return try emit.externTarget(name, false) orelse {
+        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
+        return error.CodegenFail;
+    };
 }
 
 /// The section bound the linker defines as `name` (`__start___sancov_cntrs`
