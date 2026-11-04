@@ -73,9 +73,18 @@ pub fn lock(io: Io, dir: Io.Dir) !Io.File {
 /// those packs' disk space in use after the store trims them.
 pub const max_unused_compilation_ns = 5 * std.time.ns_per_day;
 
-/// The default size limit of each of the local cache's compilation
-/// directories and the global store; `ZAP_CACHE_MAX_SIZE` overrides it.
+/// The default size limit of the global cache (`globalShares`) and of a
+/// project's local cache; `ZAP_CACHE_MAX_SIZE` overrides it.
 pub const default_max_bytes: u64 = 4 << 30;
+
+/// How the global cache's limit is shared: the store (packs, donors,
+/// ZIR) gets three quarters, and the compilation directories, `zap run`'s
+/// programs and the tools under `<global>/zap/o` a quarter, so that the
+/// two together stay within it. A local cache that is not the global one
+/// has the whole limit for its compilation directories.
+pub fn globalShares(max_bytes: u64) struct { store: u64, compilations: u64 } {
+    return .{ .store = max_bytes - max_bytes / 4, .compilations = max_bytes / 4 };
+}
 
 /// `maintainCompilations` scans at most this often.
 const compilations_scan_ns = std.time.ns_per_min;
@@ -116,10 +125,9 @@ pub fn parseSize(text: []const u8) ?u64 {
 /// pack is written, so that it counts. Returns null if it did not run.
 pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir, max_bytes: u64, force: bool) !?MaintainResult {
     const now = Io.Clock.real.now(io);
-    var c = local_cache.openDir(io, "zap/c", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => |e| return e,
-    };
+    // Made if missing: a global cache whose only entries are tools in
+    // `zap/o` keeps its stamp here too.
+    var c = try local_cache.createDirPathOpen(io, "zap/c", .{ .open_options = .{ .iterate = true } });
     defer c.close(io);
     if (c.statFile(io, "trim", .{})) |stat| {
         if (!force and stat.mtime.durationTo(now).toNanoseconds() < compilations_scan_ns) return null;

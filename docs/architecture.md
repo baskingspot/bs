@@ -55,8 +55,10 @@ Atoms ──Linker──▶ ELF / Mach-O, written once
   - Trimming: the global cache's ZIR counts toward `ZAP_CACHE_MAX_SIZE`
     and goes with the store's packs (`Store.maintain`): unused for 5 days
     by its mtime, or least recently used first past the limit. The
-    store's maintenance runs daily and whenever its packs alone pass the
-    limit, so a day's new ZIR can pass it until then.
+    store's maintenance runs daily, whenever its packs alone pass the
+    limit, and at least every 10 minutes from any build, one that commits
+    no pack too (`Store.maintainStale`), so new ZIR and donors count
+    within minutes.
   - Superseded ZIR goes sooner (`CacheDir.sweepSuperseded`): when a build's
     index update replaces a file's content hash, the old ZIR file's mtime
     is set two days back and its hash goes on that cache's `superseded`
@@ -3797,9 +3799,18 @@ it and can flush every CPU's TLB.
 - `ZAP_CACHE_TIMING=1` prints the cache's time; `ZAP_CACHE=off` disables
   it.
 - **Size limits and trimming**. `ZAP_CACHE_MAX_SIZE` (bytes, or a number
-  with K, M, G, or T; default 4G) limits the global store's packs and,
-  separately, the local cache's compilation directories, each counted
-  once per inode. Past it, the least recently used go, down to three
+  with K, M, G, or T; default 4G) limits the global cache and, separately,
+  a project's local cache, each counted once per inode. The global cache
+  shares its limit (`cache.globalShares`): the store (packs, donors and
+  ZIR) gets three quarters, and its compilation directories (those of
+  `zap run` and of builds outside a project, whose local cache is the
+  global one), `zap run`'s programs and the tools in `zap/o` (the
+  translate-c and build runner executables, one per zap identity, and
+  the C++ runtime libraries) a quarter. Before, each had the whole limit,
+  and the tools none: an orb's global cache reached 5.8 GB against 4 GB.
+  Every build applies the global limits when they are due (a stat each
+  otherwise, `Incremental.maintainGlobal`): the compilation directories
+  at most once a minute, the store at least every 10 minutes. Past it, the least recently used go, down to three
   quarters: store packs by mtime in `commit`'s maintenance, compilation
   directories by their lock's mtime in `cache.maintainCompilations`,
   skipping those a build holds. Store packs that this zap cannot read

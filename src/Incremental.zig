@@ -54,6 +54,10 @@ local: Io.Dir,
 /// The size limit of the store and of the local cache's compilation
 /// directories (`ZAP_CACHE_MAX_SIZE`).
 max_bytes: u64 = cache.default_max_bytes,
+/// Whether the local cache is the global one (`zap run`, a build outside
+/// a project): its compilation directories then share the global cache's
+/// limit with the store (`cache.globalShares`).
+local_is_global: bool = false,
 /// The compilation's directory, locked by `lock` until `close`.
 dir: Io.Dir,
 lock: Io.File,
@@ -159,6 +163,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
     const lock = try cache.lock(io, dir);
     errdefer lock.close(io);
     const global = try Io.Dir.cwd().createDirPathOpen(io, dirs.global, .{});
+    const local_is_global = sameDir(io, local, global);
     var inc: Incremental = .{
         .gpa = gpa,
         .io = io,
@@ -172,6 +177,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .arch = if (std.mem.startsWith(u8, target, "aarch64")) .aarch64 else .x86_64,
         .build_start = build_start,
         .timing = timing,
+        .local_is_global = local_is_global,
     };
     inc.prev = Manifest.open(gpa, io, dir) catch |err| prev: {
         if (timing) std.debug.print("cache: unable to open the manifest: {t}\n", .{err});
@@ -225,6 +231,7 @@ pub fn close(inc: *Incremental) void {
         var r = f.cancel(inc.io) catch null;
         if (r) |*rec| rec.discard(inc);
     }
+    inc.maintainGlobal();
     if (inc.replay) |r| r.destroy();
     if (inc.prev) |*m| m.close(inc.gpa, inc.io);
     inc.global.close(inc.io);
@@ -3083,7 +3090,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
     // builds the manifest, so that they are never all in memory.
     var store: Store = try .open(gpa, io, inc.global);
     defer store.close(gpa, io);
-    store.max_bytes = inc.max_bytes;
+    store.max_bytes = cache.globalShares(inc.max_bytes).store;
     var pack: Pack = try .open(io, inc.dir);
     defer pack.close(gpa, io);
     const where = try gpa.alloc(Where, r.nodes.items.len);
@@ -3459,8 +3466,32 @@ fn encodeNames(r: *const Recorder, replay: ?*Replay, words: *std.ArrayList(u32),
 fn maintainLocal(inc: *const Incremental) void {
     // A new compilation directory is how the local cache grows.
     const t0 = now(inc.io);
-    const r = cache.maintainCompilations(inc.gpa, inc.io, inc.local, inc.max_bytes, inc.prev == null or inc.donor != null) catch null;
+    const limit = if (inc.local_is_global) cache.globalShares(inc.max_bytes).compilations else inc.max_bytes;
+    const r = cache.maintainCompilations(inc.gpa, inc.io, inc.local, limit, inc.prev == null or inc.donor != null) catch null;
     if (inc.timing) if (r) |m| std.debug.print("cache: local cache {d} directories, {d} MiB; deleted {d}, leaving {d} MiB, in {d:.2} ms beside the link\n", .{ m.scanned, m.bytes >> 20, m.deleted, m.bytes_after >> 20, ms(t0, now(inc.io)) });
+}
+
+/// The global cache's limit, for every build, whether or not it wrote a
+/// store pack: its compilation directories and tools (`zap/o`: the
+/// translate-c and build runner executables, the C++ runtime libraries)
+/// at most once a minute, and the store with its donors and ZIR when its
+/// scan is due (`Store.maintainStale`). A stat each when nothing is due.
+fn maintainGlobal(inc: *const Incremental) void {
+    const io = inc.io;
+    const t0 = now(io);
+    const shares = cache.globalShares(inc.max_bytes);
+    _ = cache.maintainCompilations(inc.gpa, io, inc.global, shares.compilations, false) catch null;
+    var dir = inc.global.openDir(io, "zap/store", .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    const r = Store.maintainStale(inc.gpa, io, dir, shares.store) orelse return;
+    if (inc.timing) std.debug.print("cache: global store maintained: deleted {d}, evicted {d}, merged {d}, in {d:.2} ms\n", .{ r.deleted, r.evicted, r.merged, ms(t0, now(io)) });
+}
+
+/// Whether `a` and `b` are the same directory.
+fn sameDir(io: Io, a: Io.Dir, b: Io.Dir) bool {
+    const sa = a.stat(io) catch return false;
+    const sb = b.stat(io) catch return false;
+    return sa.inode == sb.inode and sa.ctime.toNanoseconds() == sb.ctime.toNanoseconds();
 }
 
 /// Store packs at least this large are linked only if a build uses at

@@ -142,6 +142,17 @@ pub const used_refresh_ns = std.time.ns_per_hour;
 pub const max_unused_ns = 5 * std.time.ns_per_day;
 pub const copy_forward_ns = max_unused_ns / 2;
 const trim_interval_ns = std.time.ns_per_day;
+/// `maintainStale` and `commit` run `maintain` at least this often, so
+/// that what the packs' sizes do not show (donors, the global ZIR) is
+/// counted against the limit within minutes of being written.
+const scan_interval_ns = 10 * std.time.ns_per_min;
+
+/// Whether stamp file `name` in the store's directory is older than
+/// `interval_ns`, or missing.
+fn stampDue(dir: Io.Dir, io: Io, name: []const u8, now: Io.Timestamp, interval_ns: i96) bool {
+    const stat = dir.statFile(io, name, .{}) catch return true;
+    return stat.mtime.durationTo(now).toNanoseconds() >= interval_ns;
+}
 
 const PackFile = struct {
     name: [32 + pack_ext.len]u8,
@@ -791,14 +802,11 @@ fn writeSegments(gpa: Allocator, io: Io, f: Io.File, parts: []const *const Batch
 /// commit.
 fn maintainIfDue(store: *const Store, gpa: Allocator, io: Io, new_bytes: u64) void {
     const now = Io.Clock.real.now(io);
-    const trim_due = if (store.dir.statFile(io, "trim", .{})) |stat|
-        stat.mtime.durationTo(now).toNanoseconds() >= trim_interval_ns
-    else |_|
-        true;
+    const trim_due = stampDue(store.dir, io, "trim", now, trim_interval_ns);
     var bytes = new_bytes + store.other_bytes;
     for (store.packs) |*p| bytes += p.size;
     const n_packs = store.packs.len + @intFromBool(new_bytes != 0);
-    if (!trim_due and n_packs <= max_packs and bytes <= store.max_bytes) return;
+    if (!trim_due and !stampDue(store.dir, io, "scan", now, scan_interval_ns) and n_packs <= max_packs and bytes <= store.max_bytes) return;
     _ = maintain(gpa, io, store.dir, .{ .trim = trim_due, .now = now, .max_bytes = store.max_bytes }) catch {};
 }
 
@@ -810,6 +818,17 @@ fn deleteCandidate(io: Io, dir: Io.Dir, donors: ?Io.Dir, zir: ?Io.Dir, kind: Can
         .donor => try donors.?.deleteTree(io, name),
         .zir => try zir.?.deleteFile(io, name),
     }
+}
+
+/// `maintain`, if the daily trim or the scan (`scan_interval_ns`) is
+/// due: for builds that commit nothing to the store but write ZIR or use
+/// donors, so that the global cache's limit holds without a commit. One
+/// stat when nothing is due.
+pub fn maintainStale(gpa: Allocator, io: Io, dir: Io.Dir, max_bytes: u64) ?MaintainResult {
+    const now = Io.Clock.real.now(io);
+    const trim_due = stampDue(dir, io, "trim", now, trim_interval_ns);
+    if (!trim_due and !stampDue(dir, io, "scan", now, scan_interval_ns)) return null;
+    return maintain(gpa, io, dir, .{ .trim = trim_due, .now = now, .max_bytes = max_bytes }) catch null;
 }
 
 pub const MaintainOptions = struct {
@@ -829,6 +848,7 @@ pub fn maintain(gpa: Allocator, io: Io, dir: Io.Dir, options: MaintainOptions) !
     const lock_file = try dir.createFile(io, "lock", .{ .truncate = false });
     defer lock_file.close(io);
     if (!try lock_file.tryLock(io, .exclusive)) return .{};
+    try dir.writeFile(io, .{ .sub_path = "scan", .data = "" });
     var result: MaintainResult = .{};
     // Packs written since this build opened the store count too.
     var others: std.ArrayList(OtherPack) = .empty;
@@ -1219,6 +1239,37 @@ test "merges leave large packs alone, and the size limit evicts the least recent
     _ = try maintain(gpa, io, store_dir, .{ .trim = true, .now = later });
     try t.expectError(error.FileNotFound, zd.statFile(io, zir_new, .{}));
     _ = try zd.statFile(io, "index", .{});
+}
+
+test "the store's limit holds for ZIR written by builds that commit nothing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const t = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store_dir = try tmp.dir.createDirPathOpen(io, "zap/store", .{ .open_options = .{ .iterate = true } });
+    defer store_dir.close(io);
+    var zd = try tmp.dir.createDirPathOpen(io, "zap/zir", .{});
+    defer zd.close(io);
+    // No pack, so a commit's estimate sees nothing; 2 MiB of ZIR against a
+    // 1.5 MiB limit, the older file written an hour ago.
+    const bytes = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(bytes);
+    @memset(bytes, 'Z');
+    const now = Io.Clock.real.now(io);
+    const zir_old = "0123456789abcdef0123456789abcdef";
+    const zir_new = "fedcba9876543210fedcba9876543210";
+    try zd.writeFile(io, .{ .sub_path = zir_old, .data = bytes });
+    try zd.setTimestamps(io, zir_old, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-std.time.ns_per_hour)) } });
+    try zd.writeFile(io, .{ .sub_path = zir_new, .data = bytes });
+    // Due on the first build (no scan yet), not again within the interval.
+    try t.expectEqual(1, maintainStale(gpa, io, store_dir, 3 << 19).?.evicted);
+    try t.expectError(error.FileNotFound, zd.statFile(io, zir_old, .{}));
+    _ = try zd.statFile(io, zir_new, .{});
+    try zd.writeFile(io, .{ .sub_path = zir_old, .data = bytes });
+    try t.expectEqual(null, maintainStale(gpa, io, store_dir, 3 << 19));
+    try store_dir.setTimestamps(io, "scan", .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-scan_interval_ns)) } });
+    try t.expectEqual(1, maintainStale(gpa, io, store_dir, 3 << 19).?.evicted);
 }
 
 test "a pack written in place reads back like a committed batch" {
