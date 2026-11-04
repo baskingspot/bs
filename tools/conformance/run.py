@@ -996,7 +996,9 @@ def zap_lines(stderr, case_name):
             continue
         here = lambda o: os.path.basename(o.get("file", "")) == case_name
         prefix = ":" if here(d) else os.path.basename(d.get("file", "")) + ":"
-        errors.append(f"{prefix}{d.get('line', 0)}:{d.get('col', 0)}: error: {d['msg']}")
+        # An error without a location (a dependency loop) is written as
+        # upstream's case files write it.
+        errors.append(f"{prefix}{d['line']}:{d.get('col', 0)}: error: {d['msg']}" if "line" in d else f"error: {d['msg']}")
         times = lambda o: f" ({o['count']} times)" if o.get("count") else ""
         for n in d.get("notes", []):
             msg = n["msg"] + times(n)
@@ -1050,7 +1052,7 @@ def run_case(compiler, path, cfg, expected, args, workdir):
     argv.append("--error-format=json")
     code, out, err, timed_out = run_process(argv, workdir, args.compile_timeout)
     shutil.rmtree(out_dir, ignore_errors=True)
-    exp_errors = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "error"]
+    exp_errors = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "error" or e.startswith("error: ")]
     exp_notes = [e for e in expected if LOC_RE.match(e) and LOC_RE.match(e).group("kind") == "note"] + [o for o in map(other_note, expected) if o]
     r = {"expected": exp_errors}
     if timed_out:
