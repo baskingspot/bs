@@ -1576,6 +1576,28 @@ build, the passes, and the debug info treat them as Sema's inline calls
   panic frames remove the loss.
   Error return traces are unaffected: their return-site addresses
   already map to the callee's lines.
+- **Non-leaf callees (measured, not taken; branch `m7-inline-stubs`).**
+  Letting a body that keeps direct `.auto` register-argument calls
+  inline within a budget n, each kept call going through returning
+  stubs (`call next; ret`, one per open backend-inlined call) so traces
+  stay complete, measured against main 3a3fca3 (run time in callgrind
+  Ir, compile time as medians of 11 interleaved cold builds): at n = 16, std's test build +1.1% and the
+  zig workload +0.1%, IR +5–6%, binaries +9% (std tests) and +13% (zig);
+  hash −1.1%, fmt and the other runtime benchmarks 0, vaxis −0.25%, zig
+  fmt −1.2%, zls tests +2.8%. n = 20 costs +2% compile for −1.5% at best.
+  A prototype's n = 30 win (vaxis −1.8%, zls −5.4%, zig fmt −5%, hash and
+  fmt −4–5%) was illusory: it also inlined bodies with indirect (vtable)
+  and other-convention calls, whose traces lost the inlined frames, and
+  zls's share came from shorter traces, since its tests spend ~17% in
+  DebugAllocator's stack captures; with complete traces, each inlined
+  copy's stubs add distinct return pcs that miss SelfUnwinder's cache
+  (`computeRules`, `CacheEntry.populate`). fmt's hot callees are over any
+  budget (`Io.Writer.write` measures 114). What would change the answer:
+  a size measure under which small hot callees fit (one that discounts
+  the checks prove removes, for leaves like `std.fmt.digitToChar` at
+  36), indirect
+  calls through stubs (the stub calls r11) if vtable-heavy code shows a
+  win, or an unwinder whose cost does not grow with distinct pcs.
 - **Synthetic panic frames.** Only cold code changes. A panic call in
   cold code inside calls the backend inlined (`DbgInline.flags.backend`;
   Sema's inline calls lose their frame as upstream's do) calls a chain of
