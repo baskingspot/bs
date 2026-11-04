@@ -103,7 +103,7 @@ def check(seed, tools, size, branch=None, base=None, text=None):
             else:
                 first = next((l for l in up.detail.splitlines() if "error:" in l), "")
                 rec["result"] = "discard"
-                rec["why"] = first.split("error: ", 1)[-1][:60]
+                rec["why"] = first.split("error: ", 1)[-1][:60] or f"{up.status} (seed {seed})"
             return rec
         if up.status in ("timeout", "signal", "exit"):
             rec["result"] = "upstream-" + up.status
