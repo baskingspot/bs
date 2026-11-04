@@ -8830,11 +8830,13 @@ fn childCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (sk != .ptr_type or dk != .ptr_type) return false;
     const s = sk.ptr_type;
     const d = dk.ptr_type;
-    if (s.flags.size != d.flags.size) return false;
+    // Read only, a single or many pointer reads as a C pointer, which
+    // allows zero, as upstream.
+    if (s.flags.size != d.flags.size and !(d.flags.size == .c and (s.flags.size == .one or s.flags.size == .many))) return false;
     if (s.flags.is_const and !d.flags.is_const) return false;
     if (s.flags.is_volatile and !d.flags.is_volatile) return false;
     // Read only, a pointer may also allow zero.
-    if (s.flags.is_allowzero and !d.flags.is_allowzero) return false;
+    if ((s.flags.is_allowzero or s.flags.size == .c) and !(d.flags.is_allowzero or d.flags.size == .c)) return false;
     if (@as(u32, @bitCast(s.packed_offset)) != @as(u32, @bitCast(d.packed_offset))) return false;
     if (s.flags.alignment != d.flags.alignment) {
         // The alignment may only decrease.
