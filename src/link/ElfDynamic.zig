@@ -67,6 +67,8 @@ pub const Options = struct {
     imports: []const Import = &.{},
     /// DT_SONAME, or null for none.
     soname: ?[]const u8 = null,
+    /// DT_RUNPATH, directories separated by ':', or null for none.
+    runpath: ?[]const u8 = null,
     /// A dynamically linked executable (ET_EXEC) rather than a shared
     /// object: PT_INTERP names `interp`, each of `needed` gets a
     /// DT_NEEDED, imports carry versions (.gnu.version, .gnu.version_r),
@@ -97,6 +99,7 @@ pub const Tables = struct {
     /// Offset in `dynstr` of each symbol after the null one.
     names: []const u32,
     soname: ?u32,
+    runpath: ?u32 = null,
     hash: []const u8,
     gnu_hash: []const u8,
     /// An executable's: the offset in `dynstr` of each needed library, and
@@ -141,15 +144,17 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
     };
     std.mem.sort(u32, exports.items, Ctx{ .hashes = hashes, .n_buckets = n_buckets }, Ctx.lessThan);
 
-    // .dynstr: the null string, the soname, then the names.
+    // .dynstr: the null string, the soname and the runpath, then the
+    // names.
     var dynstr: std.ArrayList(u8) = .empty;
     try dynstr.append(arena, 0);
     var soname: ?u32 = null;
-    if (o.soname) |s| {
-        soname = @intCast(dynstr.items.len);
+    var runpath: ?u32 = null;
+    for ([_]?[]const u8{ o.soname, o.runpath }, [_]*?u32{ &soname, &runpath }) |str, off| if (str) |s| {
+        off.* = @intCast(dynstr.items.len);
         try dynstr.appendSlice(arena, s);
         try dynstr.append(arena, 0);
-    }
+    };
     const needed = try arena.alloc(u32, o.needed.len);
     for (needed, o.needed) |*off, lib| {
         off.* = @intCast(dynstr.items.len);
@@ -284,6 +289,7 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
         .dynstr = dynstr.items,
         .names = names,
         .soname = soname,
+        .runpath = runpath,
         .hash = std.mem.sliceAsBytes(hash),
         .gnu_hash = gnu,
     };
@@ -351,7 +357,7 @@ pub const Addresses = struct {
 /// of `Addresses.arrays` not empty.
 pub fn dynamicCount(t: *const Tables, o: Options, n_arrays: u64) u64 {
     const exe: u64 = if (o.executable()) 1 + 3 * @as(u64, @intFromBool(t.verneed_count > 0)) else 0;
-    return 12 + @as(u64, @intFromBool(t.soname != null)) + t.needed.len + exe + 2 * n_arrays;
+    return 12 + @as(u64, @intFromBool(t.soname != null)) + @intFromBool(t.runpath != null) + t.needed.len + exe + 2 * n_arrays;
 }
 
 /// The size of the largest .dynamic `writeDynamic` writes without
@@ -369,6 +375,7 @@ pub fn writeDynamic(out: []u8, t: *const Tables, o: Options, a: Addresses) void 
     }.f;
     for (t.needed) |lib| put(out, &at, elf.DT_NEEDED, lib);
     if (t.soname) |s| put(out, &at, elf.DT_SONAME, s);
+    if (t.runpath) |r| put(out, &at, elf.DT_RUNPATH, r);
     var fixed: [max_fixed_entries]struct { i64, u64 } = undefined;
     var n: usize = 0;
     for ([_]struct { i64, u64 }{

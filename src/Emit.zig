@@ -26,6 +26,7 @@ const ElfObject = @import("link/ElfObject.zig");
 const ElfDynamic = @import("link/ElfDynamic.zig");
 const Glibc = @import("link/Glibc.zig");
 const ElfInput = @import("link/ElfInput.zig");
+const ElfShared = @import("link/ElfShared.zig");
 const CSource = @import("CSource.zig");
 const CodeGen = @import("codegen/x86_64/CodeGen.zig");
 const Ssa = @import("codegen/Ssa.zig");
@@ -87,6 +88,10 @@ fuzz: bool = false,
 /// An executable that links glibc (`-lc`): names neither the compilation
 /// nor compiler_rt exports resolve to glibc's symbols, imported.
 glibc: ?*const Glibc = null,
+/// Such an executable's shared library inputs, whose symbols come before
+/// glibc's (`Glibc.dynamicOptions`), and its DT_RUNPATH.
+shared_libs: []const ElfShared = &.{},
+runpath: ?[]const u8 = null,
 /// An executable's object and archive inputs, which `sync` pulls archive
 /// members for and `finish` converts into atoms.
 inputs: ?*ElfInput = null,
@@ -98,7 +103,7 @@ c_batch: ?*CSource.Batch = null,
 imports: std.StringArrayHashMapUnmanaged(ImportFlags) = .empty,
 /// The imports the executable copies (R_X86_64_COPY) and their sizes, a
 /// subset of `imports`, for data C objects reach without the GOT.
-copies: std.StringArrayHashMapUnmanaged(u16) = .empty,
+copies: std.StringArrayHashMapUnmanaged(u64) = .empty,
 /// In an object, its exports, once `finish` found them.
 exports: std.ArrayList(ElfObject.Export) = .empty,
 /// What produced each atom, for the on-disk cache (`Incremental`).
@@ -467,6 +472,7 @@ pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
         w.pic = emit.pic;
         w.shared = emit.shared;
         w.glibc = emit.glibc;
+        w.shared_libs = emit.shared_libs;
     }
     const pool = try gpa.create(Pool);
     pool.* = .{ .io = io, .workers = workers, .fuzz = fuzz };
@@ -832,20 +838,24 @@ const InputResolver = struct {
         return r.emit.rtExport(name);
     }
 
-    /// With `-lc`, glibc's symbols, imported.
+    /// With `-lc`, the shared libraries' and glibc's symbols, imported.
     pub fn importSym(r: InputResolver, name: []const u8, weak: bool) !?SymbolKey {
-        const g = r.emit.glibc orelse return null;
-        if (g.get(name) == null) return null;
+        if (!r.emit.libraryDefines(name)) return null;
         return try r.emit.useImport(name, .{ .weak = weak });
     }
 
-    /// The executable's copy of glibc's data object `name`, an import
-    /// already (`importSym`), or null if it is not one. The copy takes
-    /// the import's key, so every reference to the import uses it.
+    /// The executable's copy of a shared library's data object `name`, an
+    /// import already (`importSym`), or null if it is not one. The copy
+    /// takes the import's key, so every reference to the import uses it.
     pub fn copySym(r: InputResolver, name: []const u8) !?SymbolKey {
-        const sym = r.emit.glibc.?.get(name).?;
-        if (!sym.object or sym.size == 0) return null;
-        try r.emit.copies.put(r.emit.gpa, r.emit.imports.getKey(name).?, sym.size);
+        const size: u64 = if (Glibc.sharedSymbol(r.emit.shared_libs, name)) |s|
+            if (s.sym.object) s.sym.size else 0
+        else s: {
+            const sym = r.emit.glibc.?.get(name).?;
+            break :s if (sym.object) sym.size else 0;
+        };
+        if (size == 0) return null;
+        try r.emit.copies.put(r.emit.gpa, r.emit.imports.getKey(name).?, size);
         return importKey(name);
     }
 };
@@ -1203,12 +1213,13 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         };
         var arena_state: std.heap.ArenaAllocator = .init(emit.gpa);
         defer arena_state.deinit();
-        const dynamic = g.dynamicOptions(arena_state.allocator(), imports[0..n_imports], imports[n_imports..]) catch |err| switch (err) {
+        var dynamic = g.dynamicOptions(arena_state.allocator(), imports[0..n_imports], imports[n_imports..], emit.shared_libs) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
-            // Imports in an executable come from glibc only (exportTarget,
-            // ElfInput).
+            // Imports in an executable come from the shared libraries and
+            // glibc only (`libraryDefines`).
             error.NotInGlibc => unreachable,
         };
+        dynamic.runpath = emit.runpath;
         var exe_options = options;
         exe_options.dynamic = &dynamic;
         break :exe Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, exe_options);
@@ -1363,10 +1374,10 @@ pub fn pcrelTarget(emit: *Emit, name: []const u8, weak: bool) !?SymbolKey {
     _ = try emit.requestCompilerRtExport(name);
     if (try emit.userExport(name) orelse try emit.rtExport(name)) |key| return key;
     if (weak) return null;
-    if (emit.glibc) |g| if (g.get(name) != null) {
-        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "PC-relative reference to imported symbol {s}, which glibc defines; reach it through an extern slot (drop '.relocation = .pcrel')", .{name});
+    if (emit.libraryDefines(name)) {
+        try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "PC-relative reference to imported symbol {s}, which a shared library defines; reach it through an extern slot (drop '.relocation = .pcrel')", .{name});
         return error.CodegenFail;
-    };
+    }
     try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});
     return error.CodegenFail;
 }
@@ -1480,9 +1491,16 @@ pub fn exportTarget(emit: *Emit, name: []const u8) !?SymbolKey {
     // compiler_rt before libc, as upstream: its `fmod` and `memcpy` stay
     // in the executable, and only names it lacks are imported.
     if (try emit.rtExport(name)) |key| return key;
-    if (emit.glibc) |g| if (g.get(name) != null) return try emit.useImport(name, .{});
+    if (emit.libraryDefines(name)) return try emit.useImport(name, .{});
     if (emit.shared) return try emit.useImport(name, .{});
     return null;
+}
+
+/// Whether an executable that links glibc imports `name`: one of its
+/// shared libraries or glibc defines it.
+fn libraryDefines(emit: *const Emit, name: []const u8) bool {
+    const g = emit.glibc orelse return false;
+    return Glibc.sharedSymbol(emit.shared_libs, name) != null or g.get(name) != null;
 }
 
 /// The compiler_rt function exported as `name`, requested, or null.

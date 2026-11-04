@@ -2649,11 +2649,49 @@ directories for `lib<name>.a` (and `.so` in stage C).
   without lines. Whether std's unwinder falls back to frame pointers
   without an FDE is to check first.
 
-**Shared libraries as inputs (stage C).** A `.so` contributes names, with
-their versions (`.dynsym`, `.gnu.version`, `.gnu.version_d`) and its
-DT_SONAME for DT_NEEDED, to the same resolution step as abilists. They
-become imports exactly like the C thread's abilists imports. No bytes
-come from it.
+**Shared libraries as inputs (stage C; built 2026-11-04).** A `.so`
+contributes names, with their versions (`.dynsym`, `.gnu.version`,
+`.gnu.version_d`) and its DT_SONAME for DT_NEEDED, to the same
+resolution step as abilists. They become imports exactly like the C
+thread's abilists imports. No bytes come from it.
+- `link/ElfShared.zig` reads an ET_DYN: each defined, global or weak,
+  default or protected, non-TLS `.dynsym` entry whose version is not
+  hidden becomes a name with its version (null for the base version, so
+  the import is unversioned, as ld writes zlib's), type, size and value.
+  `aliases` finds the objects at one address. The soname falls back to
+  the path, as ld's. A linker script (`libc.so`-style text) is an error.
+- Resolution order: Zig exports, then objects, then compiler_rt, then
+  the shared libraries in input order, then glibc (`Emit.libraryDefines`
+  answers for the last two; `exportTarget`, `InputResolver.importSym`
+  and the PC-relative import error use it).
+- `Glibc.dynamicOptions` puts every given `.so` in DT_NEEDED, in input
+  order and before glibc's libraries; zap does not drop unused ones,
+  and neither does upstream. Upstream's native link lists libm, libc
+  and ld-linux first; its `-target x86_64-linux-gnu` link lists them
+  last, as zap does.
+- Copy relocations: a non-PIC or PIE C object reading `.so` data gets a
+  copy like glibc's `stdout`, sized from the `.so`'s symbol; the
+  library's other names at that address (its aliases) are defined at
+  the copy too, so the library's own references bind to it.
+- `.so` inputs need `-lc` (`[unsupported]` otherwise): only the glibc
+  path writes a dynamic executable. Thread-locals from a `.so` are not
+  imported yet; such a name stays undefined.
+- Search: positional `.so` and `.so.N` paths are inputs. For `-l` names
+  on the native target without `--sysroot`, the directories of
+  `std.zig.system.NativePaths` follow the `-L` ones, as upstream's
+  `want_native_include_dirs`. `-L` directories that do not exist are
+  dropped (upstream warns). A name found nowhere is a fatal error, as
+  upstream's.
+- DT_RUNPATH: the `-rpath` arguments, then, on the native target, the
+  `-L` directories, deduplicated and joined with `:` (upstream's rule).
+  No RUNPATH without either, so other `-lc` outputs stay byte-identical.
+  The cache writes the same RUNPATH (`Incremental.runpath`); builds with
+  `.so` inputs skip the cache, as builds with objects did before
+  obj-inputs3.
+- Test: `run zap link of a shared library` builds `libshared.so` with
+  upstream `zig cc -shared` and a version script, and links a Zig main
+  and a `-fPIE` C object against it with `-lc -lshared -L`; it checks
+  versioned calls, a copy relocation and its alias.
 
 **Cache** (agreed with the cache thread, 2026-11-04).
 - Object files never influence analysis or CodeGen. Their paths are in
@@ -2752,11 +2790,8 @@ differs from the design above:
   atom. Keyed links only; a numbered link rejects them until the cache
   relinks inputs.
 - `-l<name>`/`-L<dir>` find `lib<name>.so` or `lib<name>.a` in the `-L`
-  directories by upstream's search strategies (`-search_*`, `-static`,
-  `-dynamic`). A shared library found first, or a name not found there,
-  is `[unsupported]`: `.so` inputs are stage C, and upstream also
-  searches the native library directories (`std.zig.system.NativePaths`)
-  when there are `-l` names, which zap does not yet.
+  directories (and the native ones; see stage C above) by upstream's
+  search strategies (`-search_*`, `-static`, `-dynamic`).
 - Tests: a constructor test (priorities across two objects, a
   destructor, with and without `-lc`), a COMDAT pair written in
   assembly (in both orders), GCC `-fPIE` code reading `stdout` and
@@ -2786,7 +2821,7 @@ differs from the design above:
 2. B: `.eh_frame` and DWARF pass-through. Checks: gdb's `bt` and line
    numbers through C frames, and std's stack trace through them.
 3. C: `.so` inputs (`-l<name>` against a library upstream built), and
-   copy relocations if an input needs them.
+   copy relocations if an input needs them. Built 2026-11-04.
 
 ### compiler_rt (decided 2026-11-02)
 

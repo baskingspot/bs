@@ -14,6 +14,7 @@ const Version = std.SemanticVersion;
 const Glibc = @This();
 const ElfObject = @import("ElfObject.zig");
 const ElfDynamic = @import("ElfDynamic.zig");
+const ElfShared = @import("ElfShared.zig");
 
 pub const Lib = struct {
     name: []const u8,
@@ -167,44 +168,64 @@ pub fn deinit(g: *Glibc) void {
 /// gives each its library and version. DT_NEEDED lists libc.so.6 always,
 /// as upstream, and the other libraries used, in upstream's link order.
 /// `copies` are the imports the executable copies instead (`Emit.copies`),
-/// which become its exports, each with the aliases `dataAliases` gives
-/// that nothing imports. Strings are allocated in `arena`.
-pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
+/// which become its exports, each with its aliases that nothing imports.
+/// A name one of the `shared` libraries defines comes from the first
+/// such library, before glibc. Strings are allocated in `arena`.
+pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, shared: []const ElfShared) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
     std.mem.sortUnstable(ElfObject.Import, imports, {}, struct {
         fn lt(_: void, a: ElfObject.Import, b: ElfObject.Import) bool {
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lt);
+    // The shared libraries come first, each needed whether used or not, as
+    // upstream links them; then glibc's.
+    var needed: std.ArrayList([]const u8) = .empty;
+    for (shared) |lib| try needed.append(arena, lib.soname);
     var used: [libs.len]bool = @splat(false);
     used[lib_c] = true;
-    for (imports) |imp| used[(g.get(imp.name) orelse return error.NotInGlibc).lib] = true;
-    for (copies) |c| used[(g.get(c.name) orelse return error.NotInGlibc).lib] = true;
-    var needed: std.ArrayList([]const u8) = .empty;
+    for ([_][]const ElfObject.Import{ imports, copies }) |list| for (list) |imp| {
+        if (sharedSymbol(shared, imp.name) == null) used[(g.get(imp.name) orelse return error.NotInGlibc).lib] = true;
+    };
     var lib_index: [libs.len]u32 = undefined;
     for (libs, used, &lib_index) |lib, u, *index| if (u) {
         index.* = @intCast(needed.items.len);
         try needed.append(arena, lib.soname);
     };
+    const Place = struct { version: ?[]const u8, library: u32 };
+    const place = struct {
+        fn f(gl: *const Glibc, a: Allocator, sh: []const ElfShared, li: *const [libs.len]u32, name: []const u8) !?Place {
+            if (sharedSymbol(sh, name)) |s| return .{ .version = s.sym.version, .library = s.lib };
+            const sym = gl.get(name) orelse return null;
+            return .{ .version = try gl.versionName(a, sym.version), .library = li[sym.lib] };
+        }
+    }.f;
     for (imports) |*imp| {
-        const sym = g.get(imp.name).?;
-        imp.version = try g.versionName(arena, sym.version);
-        imp.library = lib_index[sym.lib];
+        const p = (try place(g, arena, shared, &lib_index, imp.name)).?;
+        imp.version = p.version;
+        imp.library = p.library;
     }
-    // Each copy, then the other names glibc gives the same object, which
-    // its own code may use instead.
+    // Each copy, then the other names its library gives the same object,
+    // which the library's own code may use instead.
     var exports: std.ArrayList(ElfDynamic.Export) = .empty;
     for (copies) |c| {
         const name = c.name;
+        const aliases = if (sharedSymbol(shared, name)) |s| try shared[s.lib].aliases(arena, s.sym.value) else dataAliases(name);
         // The copy itself first: its relocation names it.
-        for ([_][]const []const u8{ &.{name}, dataAliases(name) }, [_]bool{ false, true }) |list, alias| for (list) |n| {
+        for ([_][]const []const u8{ &.{name}, aliases }, [_]bool{ false, true }) |list, alias| for (list) |n| {
             if (alias and (std.mem.eql(u8, n, name) or for (imports) |imp| {
                 if (std.mem.eql(u8, imp.name, n)) break true;
             } else false)) continue;
-            const sym = g.get(n) orelse continue;
-            try exports.append(arena, .{ .key = c.key, .name = n, .copy = .{ .version = try g.versionName(arena, sym.version), .library = lib_index[sym.lib], .alias = alias } });
+            const p = try place(g, arena, shared, &lib_index, n) orelse continue;
+            try exports.append(arena, .{ .key = c.key, .name = n, .copy = .{ .version = p.version, .library = p.library, .alias = alias } });
         };
     }
     return .{ .exports = exports.items, .imports = imports, .interp = interp, .needed = needed.items };
+}
+
+/// The first of `shared` that defines `name`, as the link resolves it.
+pub fn sharedSymbol(shared: []const ElfShared, name: []const u8) ?struct { lib: u32, sym: ElfShared.Symbol } {
+    for (shared, 0..) |lib, i| if (lib.symbols.get(name)) |sym| return .{ .lib = @intCast(i), .sym = sym };
+    return null;
 }
 
 pub fn get(g: *const Glibc, name: []const u8) ?Symbol {

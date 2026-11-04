@@ -1629,7 +1629,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "unbounded for loop", .@"unbounded-for" },
     .{ "use of undeclared identifier '{s}'", .undeclared },
     .{ "undefined symbol: {s}", .@"undefined-symbol" },
-    .{ "PC-relative reference to imported symbol {s}, which glibc defines; reach it through an extern slot (drop '.relocation = .pcrel')", .@"undefined-symbol" },
+    .{ "PC-relative reference to imported symbol {s}, which a shared library defines; reach it through an extern slot (drop '.relocation = .pcrel')", .@"undefined-symbol" },
     .{ "cannot dereference slice with undefined length", .@"undefined-value" },
     .{ "cannot dereference undefined value", .@"undefined-value" },
     .{ "use of slice with undefined length here causes illegal behavior", .@"undefined-value" },

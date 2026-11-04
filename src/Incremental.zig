@@ -102,6 +102,8 @@ glibc: ?*const Glibc = null,
 /// them replays eagerly, so that `Emit.finish` converts them and binds
 /// the externs again; with nothing changed it skips the link as any.
 link_objects: []const []const u8 = &.{},
+/// Such an executable's DT_RUNPATH (`Options.runpath` in main.zig).
+runpath: ?[]const u8 = null,
 /// Whether a build that does not relink renews the output's mtime, as a
 /// relink would: `zap run`'s programs are trimmed by it.
 renew_output: bool = false,
@@ -387,10 +389,11 @@ fn linkFrom(inc: *Incremental, m: *Manifest, out_dir: Io.Dir, sub_path: []const 
                 return inc.noLink("glibc's symbols ({s}): {t}", .{ path, err });
             break :g &glibc_loaded.?;
         };
-        dynamic = g.dynamicOptions(arena, imports.items, &.{}) catch |err| switch (err) {
+        dynamic = g.dynamicOptions(arena, imports.items, &.{}, &.{}) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.NotInGlibc => return inc.noLink("an import glibc does not define", .{}),
         };
+        dynamic.runpath = inc.runpath;
         dynamic_imports = try arena.alloc(u32, imports.items.len);
         for (dynamic_imports, imports.items) |*n, imp| n.* = m.symbol(@backingInt(imp.key)) orelse
             return inc.noLink("import '{s}' has no symbol number", .{imp.name});

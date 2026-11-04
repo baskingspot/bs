@@ -13,6 +13,7 @@ const Incremental = @import("Incremental.zig");
 const Builtin = @import("Builtin.zig");
 const Archive = @import("link/Archive.zig");
 const ElfInput = @import("link/ElfInput.zig");
+const ElfShared = @import("link/ElfShared.zig");
 const Docs = @import("Docs.zig");
 const Glibc = @import("link/Glibc.zig");
 const CSource = @import("CSource.zig");
@@ -105,6 +106,13 @@ pub const Options = struct {
     /// in command-line order (docs/architecture.md, "Object, archive and
     /// shared-library inputs").
     link_inputs: []const []const u8 = &.{},
+    /// Shared libraries (`.so`) the executable imports from, in
+    /// command-line order, given by path or found by `-l`.
+    shared_libs: []const []const u8 = &.{},
+    /// DT_RUNPATH of a dynamically linked executable, as upstream's: the
+    /// `-rpath` arguments, then for the native target the `-L`
+    /// directories, without repeats, joined with ':'; null for none.
+    runpath: ?[]const u8 = null,
     /// C source files, each with its module's C arguments and options,
     /// compiled by upstream's Clang (CSource.zig), and the settings they
     /// share.
@@ -203,7 +211,7 @@ pub fn main(init_std: std.process.Init) !void {
         std.process.exit(1);
     } else fatal("unknown command: {s}", .{cmd});
 
-    const opts = try parseOptions(arena, init.io, command, args[2..]);
+    const opts = try parseOptions(arena, init.io, init.environ_map, command, args[2..]);
     if (opts.listen) {
         if (BuildWeb.matches(&opts)) return BuildWeb.serve(init, &opts);
         return serve(init, args, opts);
@@ -395,9 +403,9 @@ pub const Job = struct {
         const env = job.environ_map;
         // The numbered link has no position-independent layout yet (`Elf`);
         // -fPIE and -dynamic imply -fPIC (and -lc on objects and
-        // libraries). Builds with C sources skip it until the manifest
-        // keeps their objects.
-        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and job.opts.c_sources.len == 0 and
+        // libraries). Builds with C sources or shared library inputs skip
+        // it until the manifest keeps them.
+        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and job.opts.shared_libs.len == 0 and job.opts.c_sources.len == 0 and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -412,6 +420,7 @@ pub const Job = struct {
         if (job.opts.link_libc and !job.opts.pic) {
             i.glibc_version = job.opts.glibc_version;
             i.glibc_lib_dir = job.zig_lib_dir;
+            i.runpath = job.opts.runpath;
         }
         i.output = switch (job.opts.command) {
             .build_obj => .obj,
@@ -632,6 +641,20 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     defer if (inc_opt) |i| {
         i.glibc = null;
     };
+    if (glibc != null) emit.runpath = opts.runpath;
+    const shared_libs = try arena.alloc(ElfShared, opts.shared_libs.len);
+    for (shared_libs, opts.shared_libs) |*lib, path| {
+        const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
+            fatal("unable to read '{s}': {t}", .{ path, err });
+        lib.* = ElfShared.parse(arena, path, bytes) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.InvalidShared => if (!std.mem.startsWith(u8, bytes, std.elf.MAGIC))
+                fatal("zap does not read linker scripts ('{s}') yet", .{path})
+            else
+                fatal("'{s}' is not an x86_64 ELF shared library", .{path}),
+        };
+    }
+    emit.shared_libs = shared_libs;
     var link_inputs: ElfInput = .{ .arena = arena };
     if (opts.link_inputs.len != 0) {
         for (opts.link_inputs) |path| {
@@ -1230,7 +1253,7 @@ pub fn setUnsupported(opts: *Options, arena: std.mem.Allocator, comptime fmt: []
     if (opts.unsupported == null) opts.unsupported = std.fmt.allocPrint(arena, fmt, args) catch fatal("out of memory", .{});
 }
 
-pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in: []const []const u8) !Options {
+pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.process.Environ.Map, command: Command, args_in: []const []const u8) !Options {
     var args = args_in;
     var root: ?[]const u8 = null;
     var positional_root = false;
@@ -1241,6 +1264,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     var libs: std.ArrayList(LibQuery) = .empty;
     var lib_dirs: std.ArrayList([]const u8) = .empty;
     var lib_search: LibQuery.Search = .{};
+    var rpaths: std.ArrayList([]const u8) = .empty;
+    var sysroot = false;
     var deps: std.ArrayList([]const u8) = .empty;
     var modules: std.ArrayList(Frontend.ModuleArg) = .empty;
     // `-ffuzz` and `-fno-fuzz` are per module, as upstream's: each `-M`
@@ -1417,6 +1442,13 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             try lib_dirs.append(arena, nextArg(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "-L")) {
             try lib_dirs.append(arena, arg[2..]);
+        } else if (std.mem.eql(u8, arg, "-rpath")) {
+            try rpaths.append(arena, nextArg(args, &i, arg));
+        } else if (std.mem.eql(u8, arg, "--sysroot")) {
+            // Only its effect on library search: upstream searches no
+            // native directories with one.
+            _ = nextArg(args, &i, arg);
+            sysroot = true;
         } else if (ignored_flags.has(arg)) {
             // Changes nothing zap does.
         } else if (ignored_flags_with_arg.has(arg)) {
@@ -1484,7 +1516,7 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             const ext = std.fs.path.extension(arg);
             if (std.mem.eql(u8, ext, ".c")) {
                 try c_files.append(arena, .{ .path = arg, .extra_flags = extra_cflags, .cc_argv = &.{}, .flags = .{} });
-            } else if ((std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a")) and command != .build_obj and command != .build_lib) {
+            } else if ((std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a") or isSharedLib(arg)) and command != .build_obj and command != .build_lib) {
                 try link_inputs.append(arena, arg);
             } else if (std.mem.eql(u8, ext, ".o") or std.mem.eql(u8, ext, ".a"))
                 setUnsupported(&opts, arena, "zap does not link object files into objects or libraries yet ('{s}'); build this step with upstream zig", .{arg})
@@ -1527,17 +1559,36 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     }
     opts.root_src_path = root orelse if (opts.unsupported != null or opts.c_only) "" else fatal("expected a root source file", .{});
     opts.test_filters = test_filters.items;
-    for (libs.items) |q| {
-        link_inputs.items[q.at] = try q.find(arena, io, lib_dirs.items) orelse {
-            setUnsupported(&opts, arena, "zap does not search the system's library directories yet ('-l{s}', not in the -L directories); build this step with upstream zig", .{q.name});
-            break;
-        };
-        if (!std.mem.endsWith(u8, link_inputs.items[q.at], ".a")) {
-            setUnsupported(&opts, arena, "zap does not link shared libraries yet ('-l{s}' is '{s}'); build this step with upstream zig", .{ q.name, link_inputs.items[q.at] });
-            break;
-        }
+    // As upstream: `-L` directories that do not exist are left out, and
+    // `-l` names also search the native library directories, after them.
+    var search_dirs: std.ArrayList([]const u8) = .empty;
+    for (lib_dirs.items) |dir| if (Io.Dir.cwd().access(io, dir, .{})) |_| try search_dirs.append(arena, dir) else |_| {};
+    const native = opts.target == null or std.mem.eql(u8, opts.target.?, "native");
+    const n_explicit_dirs = search_dirs.items.len;
+    if (libs.items.len != 0 and native and !sysroot) {
+        if (std.zig.system.resolveTargetQuery(io, .{})) |target| {
+            if (std.zig.system.NativePaths.detect(arena, io, &target, environ_map)) |paths| {
+                for (paths.lib_dirs.items) |dir| if (Io.Dir.cwd().access(io, dir, .{})) |_| try search_dirs.append(arena, dir) else |_| {};
+            } else |_| {}
+        } else |_| {}
     }
-    opts.link_inputs = link_inputs.items;
+    for (libs.items) |q| {
+        link_inputs.items[q.at] = try q.find(arena, io, search_dirs.items) orelse
+            fatal("unable to find library '-l{s}'; searched paths: {s}", .{ q.name, try std.mem.join(arena, " ", search_dirs.items) });
+    }
+    // Shared libraries are imported from, not linked in.
+    var objects: std.ArrayList([]const u8) = .empty;
+    var shared: std.ArrayList([]const u8) = .empty;
+    for (link_inputs.items) |path| try (if (isSharedLib(path)) &shared else &objects).append(arena, path);
+    opts.link_inputs = objects.items;
+    opts.shared_libs = shared.items;
+    if (shared.items.len != 0 and !opts.link_libc)
+        setUnsupported(&opts, arena, "zap links shared libraries only into executables that link libc ('{s}'); add -lc or build this step with upstream zig", .{shared.items[0]});
+    // DT_RUNPATH: as upstream's `rpath_list`, deduplicated.
+    if (native) try rpaths.appendSlice(arena, search_dirs.items[0..n_explicit_dirs]);
+    var unique_rpaths: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (rpaths.items) |r| try unique_rpaths.put(arena, r, {});
+    if (unique_rpaths.count() != 0) opts.runpath = try std.mem.join(arena, ":", unique_rpaths.keys());
     opts.modules = modules.items;
     // A root file given by position owns what no -M took, as upstream's;
     // so does a library of C only.
@@ -1658,6 +1709,12 @@ fn loadGlibc(init: std.process.Init, job: *const Job) !Glibc {
     // As upstream's warning.
     if (g.newest().order(want) == .lt) std.log.warn("zap cannot link new glibc version {f}; providing instead {f}", .{ want, g.newest() });
     return g;
+}
+
+/// Whether `path` names a shared library: `.so`, or a versioned `.so.1`.
+fn isSharedLib(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.mem.endsWith(u8, base, ".so") or std.mem.indexOf(u8, base, ".so.") != null;
 }
 
 /// A `-l` library, found as upstream's `link.resolveLibInput` finds one

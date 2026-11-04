@@ -1013,6 +1013,31 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&r.step);
     }
 
+    // A shared library found by -l and -L, with versioned symbols and a
+    // data object that C reads without the GOT (copied, with the alias
+    // the library's code uses). The native target puts the -L directory
+    // in DT_RUNPATH, so the program finds the library when it runs.
+    {
+        const so = b.addSystemCommand(&.{ zig, "cc", "-shared", "-fPIC" });
+        so.addFileArg(b.path("test/link_input/shared.c"));
+        so.addPrefixedFileArg("-Wl,--version-script=", b.path("test/link_input/shared.map"));
+        so.addArg("-Wl,-soname,libshared.so");
+        const lib_dir = so.addPrefixedOutputFileArg("-o", "libshared.so").dirname();
+        const user = b.addSystemCommand(if (cc) |gcc| &.{ gcc, "-fPIE", "-c" } else &.{ zig, "cc", "-c" });
+        user.addFileArg(b.path("test/link_input/shared_user.c"));
+        const so_exe = b.addRunArtifact(zap);
+        so_exe.addArgs(&.{ "build-exe", "-lc", "-lshared" });
+        so_exe.addPrefixedDirectoryArg("-L", lib_dir);
+        so_exe.addFileArg(b.path("test/link_input/shared_main.zig"));
+        so_exe.addFileArg(user.addPrefixedOutputFileArg("-o", "shared_user.o"));
+        so_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        const r = std.Build.Step.Run.create(b, "run zap link of a shared library");
+        r.addFileArg(so_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        r.addCheck(.{ .expect_stderr_exact = "42 143 42 143\n" });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
+
     // Constructors run in priority order across two objects, before main;
     // the destructor runs only with -lc, whose exit runs the fini array.
     var ctors: [2]std.Build.LazyPath = undefined;

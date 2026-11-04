@@ -110,7 +110,7 @@ pub fn compileTool(init: std.process.Init, dir: []const u8, compile_args: []cons
     // Compiled from its own directory, so that the compilation's key (which
     // includes the working directory) is the same for every project.
     try std.process.setCurrentPath(io, dir);
-    const opts = try main.parseOptions(arena, io, .build_exe, compile_args[2..]);
+    const opts = try main.parseOptions(arena, io, init.environ_map, .build_exe, compile_args[2..]);
     const job: main.Job = try .init(init, compile_args, opts);
     {
         const prog = std.Progress.start(io, .{ .root_name = progress });

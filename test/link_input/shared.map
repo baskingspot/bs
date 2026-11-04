@@ -1,0 +1,2 @@
+SHARED_1 { global: shared_get; shared_counter; shared_counter_alias; local: *; };
+SHARED_2 { global: shared_twice; } SHARED_1;
