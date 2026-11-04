@@ -1950,6 +1950,21 @@ fn sameInput(inc: *const Incremental, m: *const Manifest, in: u32, fe: *const Fr
     return rec.matches(stat);
 }
 
+/// Sets the flags of node `i`, which the lazy build did not write, as
+/// they are now, if they changed: linked if `live`, `reached`, and stale
+/// if an edit reached it and the build left it undecided.
+fn setFlags(rp: *const Replay, d: *Manifest.Delta, i: u32, live: *const std.DynamicBitSetUnmanaged, reached: *const std.DynamicBitSetUnmanaged, in_graph: *const std.DynamicBitSetUnmanaged) !void {
+    const m = rp.m;
+    const old = m.flags(i);
+    var flags = old;
+    flags.unlinked = m.atoms(i).len != 0 and !live.isSet(i);
+    flags.reached = reached.isSet(i);
+    if (rp.state[i] != .unknown or in_graph.isSet(i)) {
+        flags.stale = false;
+    } else if (rp.outdated.isSet(i) and !rp.dead.isSet(i)) flags.stale = true;
+    if (@as(u8, @bitCast(flags)) != @as(u8, @bitCast(old))) try d.setFlags(i, flags);
+}
+
 /// Truncates the manifest's log to `len` bytes, dropping the records
 /// appended since (0: no log).
 fn dropLog(inc: *Incremental, len: u64) void {
@@ -2072,20 +2087,17 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     // A function generated again that a unit left green exports
     // (`Replay.greenNode`): its atom's name would be the declaration's,
     // since `Emit.nameAtoms` names functions from this build's exports.
-    {
-        var exported = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
-        defer exported.deinit(gpa);
-        for (0..n_prev) |i| {
-            const refs = m.nodeRefs(@intCast(i));
-            for (refs) |ref| {
-                if (ref.kind != .analyze) continue;
-                for (refs) |fr| if (fr.kind == .func and fr.value < n_prev) exported.set(fr.value);
-                break;
-            }
-        }
-        for (nodes, final, write) |n, f, w| if (w and f < n_prev and n.tag == .func and exported.isSet(f))
-            return inc.lazyFallback("a function an @export names was generated again", .{});
-    }
+    for (nodes, final, write) |n, f, w| if (w and f < n_prev and n.tag == .func) {
+        for (m.rrefs(f)) |part| for (part) |p| {
+            const refs = m.nodeRefs(p);
+            const analyze = for (refs) |ref| {
+                if (ref.kind == .analyze) break true;
+            } else false;
+            if (!analyze) continue;
+            for (refs) |ref| if (ref.kind == .func and ref.value == f)
+                return inc.lazyFallback("a function an @export names was generated again", .{});
+        };
+    };
     // Tests or exports in a new namespace: as above.
     for (nodes, final, 0..) |n, f, ni| if (f >= n_prev and n.tag == .namespace) {
         for (node_refs.items[ref_starts[ni]..ref_starts[ni + 1]]) |nr| {
@@ -2196,9 +2208,35 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         for (n.deps) |e| live.set(final[Manifest.Edge.nodeOf(e)]);
     };
     if (inc.check) try inc.checkLiveReach(rp, nodes, final, write, node_refs.items, ref_starts, &live, &reached);
+    // The nodes this build's graph has: decided, written or not.
+    var in_graph = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    defer in_graph.deinit(gpa);
+    for (final) |f| if (f < n_prev) in_graph.set(f);
+
+    // The nodes whose flags may change. With nodes assumed reached
+    // (`Replay.assumeReached`), an assumed node that is still reached is
+    // still linked and not stale (reach and linking agree for nodes with
+    // atoms, which `ZAP_CACHE_CHECK` checks), so only the others, the
+    // assumed ones no longer reached, and those an edit reached or the
+    // build decided can change.
+    var check = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    defer check.deinit(gpa);
+    if (rp.assumed.bit_length == 0) {
+        check.setRangeValue(.{ .start = 0, .end = n_prev }, true);
+    } else {
+        const word_bits = @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt);
+        for (0..(n_prev + word_bits - 1) / word_bits) |w| {
+            const a = rp.assumed.masks[w];
+            check.masks[w] = rp.cone.masks[w] | rp.outdated.masks[w] | in_graph.masks[w] |
+                ((live.masks[w] | reached.masks[w]) & ~a) | (a & ~reached.masks[w]);
+        }
+        // Bits past `n_prev` in `live` and `reached` are new nodes'.
+        if (n_prev % word_bits != 0) check.masks[n_prev / word_bits] &= (@as(std.DynamicBitSetUnmanaged.MaskInt, 1) << @intCast(n_prev % word_bits)) - 1;
+        for (rp.state, 0..) |st, i| if (st != .unknown) check.set(i);
+    }
     // The link's inputs must not change: the symbols it resolves outside
     // the atoms, and the error name table.
-    try inc.checkLinkInputs(rp, &live, nodes, final, write, node_refs.items, ref_starts, &d);
+    try inc.checkLinkInputs(rp, &live, &check, nodes, final, write, node_refs.items, ref_starts, &d);
 
     // The nodes.
     var deps_buf: std.ArrayList(u32) = .empty;
@@ -2260,23 +2298,11 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     var written = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
     defer written.deinit(gpa);
     for (final, write) |f, w| if (w and f < n_prev) written.set(f);
-    // The nodes this build's graph has: decided, written or not.
-    var in_graph = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
-    defer in_graph.deinit(gpa);
-    for (final) |f| if (f < n_prev) in_graph.set(f);
-
     // The others' flags, and the sources and lines in changed inputs.
     for (0..n_prev) |i_usize| {
         const i: u32 = @intCast(i_usize);
         if (written.isSet(i)) continue;
-        const old = m.flags(i);
-        var flags = old;
-        flags.unlinked = m.atoms(i).len != 0 and !live.isSet(i);
-        flags.reached = reached.isSet(i);
-        if (rp.state[i] != .unknown or in_graph.isSet(i)) {
-            flags.stale = false;
-        } else if (rp.outdated.isSet(i) and !rp.dead.isSet(i)) flags.stale = true;
-        if (@as(u8, @bitCast(flags)) != @as(u8, @bitCast(old))) try d.setFlags(i, flags);
+        if (check.isSet(i)) try setFlags(rp, &d, i, &live, &reached, &in_graph);
         const src = m.source(i);
         if (src.input == Manifest.Source.no_input or src.inst == Manifest.Source.no_inst or src.input >= changed_input.bit_length or !changed_input.isSet(src.input)) continue;
         const inst = rp.mapInst(src.input, @fromBackingInt(src.inst));
@@ -2422,7 +2448,7 @@ fn embedInput(m: *const Manifest, rp: *const Replay, path: []const u8, key: []co
 /// the symbols it resolves outside the build (`ext`, `ext_weak`), an
 /// object's imports (`import`, with their flags; the manifest lists them),
 /// whether it writes the error name table, and if so, the error names.
-fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSetUnmanaged, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, d: *Manifest.Delta) !void {
+fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSetUnmanaged, check: *const std.DynamicBitSetUnmanaged, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, d: *Manifest.Delta) !void {
     const gpa = inc.gpa;
     const m = rp.m;
     const n_prev = m.nodeCount();
@@ -2451,6 +2477,22 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSe
     var new: Set = .{};
     var written = try std.DynamicBitSetUnmanaged.initEmpty(arena, n_prev);
     for (final, write) |f, w| if (w and f < n_prev) written.set(f);
+    // Only the nodes written or whose flags may change (`check`) can
+    // change the sets: without an external reference among them, they
+    // are the same.
+    const involved = involved: {
+        for (0..n_prev) |i_usize| {
+            const i: u32 = @intCast(i_usize);
+            if (!check.isSet(i) and !written.isSet(i)) continue;
+            for (m.nodeRefs(i)) |ref| if (externalRef(ref.kind) or ref.kind == .error_names) break :involved true;
+        }
+        for (nodes, write, 0..) |n, w, ni| {
+            if (!w or n.atoms.len == 0) continue;
+            for (node_refs[ref_starts[ni]..ref_starts[ni + 1]]) |nr| if (externalRef(nr.ref.kind) or nr.ref.kind == .error_names) break :involved true;
+        }
+        break :involved false;
+    };
+    if (!involved) return;
     for (0..n_prev) |i_usize| {
         const i: u32 = @intCast(i_usize);
         const is_link = m.node(i).tag == @backingInt(Tag.link);
@@ -3894,10 +3936,9 @@ fn reachedNow(inc: *Incremental, rp: *Replay, nodes: []const Node, final: []cons
     defer g.deinit(gpa);
     var reached = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
     errdefer reached.deinit(gpa);
-    {
-        var it = rp.visited.iterator(.{});
-        while (it.next()) |i| if (!g.isDead(@intCast(i))) reached.set(i);
-    }
+    const word_bits = @bitSizeOf(std.DynamicBitSetUnmanaged.MaskInt);
+    for (0..(n_prev + word_bits - 1) / word_bits) |w| reached.masks[w] = rp.visited.masks[w] & ~rp.dead.masks[w];
+    for (final, write) |f, w| if (w and f < n_prev and rp.visited.isSet(f)) reached.set(f);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
     var next: std.ArrayList(u32) = .empty;
@@ -3925,8 +3966,7 @@ fn reachedNow(inc: *Incremental, rp: *Replay, nodes: []const Node, final: []cons
     var walked = try reached.clone(gpa);
     defer walked.deinit(gpa);
     {
-        var it = assumed.iterator(.{});
-        while (it.next()) |i| walked.unset(i);
+        for (0..(n_prev + word_bits - 1) / word_bits) |w| walked.masks[w] &= ~assumed.masks[w];
         var wit = walked.iterator(.{});
         while (wit.next()) |x| {
             try g.next(gpa, @intCast(x), &next);
