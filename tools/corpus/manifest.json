@@ -983,7 +983,9 @@
   },
   {
    "name": "libxev",
-   "reason": "every artifact links libc (-lc)"
+   "url": "https://github.com/mitchellh/libxev",
+   "commit": "451a2bc03644c2b70fb28a808313d12989bfa8e3",
+   "reason": "every artifact links libc (-lc). On the libc branch, zap build test passes 142, skips 4, as upstream. Moves into the corpus once -lc is on main"
   },
   {
    "name": "zigmod",
@@ -991,7 +993,9 @@
   },
   {
    "name": "zio",
-   "reason": "links libc on Linux"
+   "url": "https://github.com/lalinsky/zio",
+   "commit": "d606d6d011bc8d8e2a02305b5201fd843f6fa0ad",
+   "reason": "links libc on Linux. On the libc branch, zap build test passes, as upstream. Moves into the corpus once -lc is on main"
   },
   {
    "name": "Avalanche",
@@ -999,11 +1003,15 @@
   },
   {
    "name": "zedis",
-   "reason": "links libc (-lc)"
+   "url": "https://github.com/barddoo/zedis",
+   "commit": "a2535a07ae4636ca26c37648285ccc4d5cb7680a",
+   "reason": "links libc (-lc). On the libc branch, zap build test passes 384/384, as upstream. Moves into the corpus once -lc is on main"
   },
   {
    "name": "tokamak",
-   "reason": "its tests link libc (-lc)"
+   "url": "https://github.com/cztomsik/tokamak",
+   "commit": "f8126fa183a4490e4181d105593df68ffe82018c",
+   "reason": "its tests link libc (-lc) and translate src/c.h. dom.document.test_0 panics under zap with 'incorrect alignment' in meta.transmute, which @alignCasts the address of an align(1) parameter to *const u128; upstream panics on the same code in a reduction and passes tokamak only by stack layout luck. With transmute copying bytes instead, zap and upstream give the same 88/89 (http.client fails with AddressInUse in both). Moves into the corpus once -lc and translate-c are on main"
   },
   {
    "name": "zware",
