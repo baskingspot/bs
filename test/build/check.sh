@@ -48,8 +48,17 @@ expect "translate-c cached"
 
 # Fuzzing: the runner rebuilds the tests with -ffuzz, zap instruments them
 # and links upstream's fuzzer, which finds the crash planted in "fuzz".
-# As upstream's, the runner exits 0 after reporting a crash.
-"$zap" build test --fuzz=5M >"$work/log" 2>&1 || true
+# As upstream's, the runner exits 0 after reporting a crash. The runner
+# passes --seed to the fuzzer, and a fresh run with a fixed seed takes the
+# same path every time. Seeds 1 and 3 find the crash in 0.68M and 0.78M
+# runs; across 60 other seeds it took 0.1M to 4.9M runs, and 5M missed
+# once. The second seed covers a change that moves the first one's path
+# past the limit.
+for seed in 1 3; do
+    rm -rf .zig-cache/f .zig-cache/v
+    "$zap" build test --fuzz=5M --seed=$seed >"$work/log" 2>&1 || true
+    grep -qF "panic: planted crash" "$work/log" && break
+done
 expect "panic: planted crash"
 expect "input saved to '.zig-cache/f/crash'"
 # Per-module -fno-fuzz: the runner passes greet's `.fuzz = false`, so the
