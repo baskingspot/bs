@@ -244,6 +244,16 @@ pub const Reloc = extern struct {
         /// thread-local, A = 0) the loader writes it (ELF
         /// R_X86_64_TPOFF64).
         x86_64_tpoff64,
+        /// 64-bit module ID of S's module, in a shared object's (module,
+        /// offset) pair for `__tls_get_addr`: written by the loader (ELF
+        /// R_X86_64_DTPMOD64 with no symbol, S being the module's own
+        /// thread-local). A must be 0.
+        x86_64_dtpmod64,
+        /// 16-byte TLS descriptor of S, the module's own thread-local, in
+        /// a shared object: written by the loader (ELF R_X86_64_TLSDESC
+        /// with no symbol and addend S + A minus the start of the TLS
+        /// segment), for `lea rax, [rip + desc]; call [rax]`.
+        x86_64_tlsdesc,
     };
 };
 

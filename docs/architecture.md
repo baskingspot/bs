@@ -6404,9 +6404,7 @@ libraries as inputs. To be agreed with that thread.
   default). A root file given by position takes what is left; else what
   is left is `global_cc_argv`. `-cflags ... --` applies to the C files
   after it. `-ffunction-sections`, `-fdata-sections`, `-fPIE` and
-  `--verbose-cc` are global. Assembly sources, and C
-  sources in `build-obj` and `build-lib -dynamic` (which would need the
-  objects linked into the output) stay `[unsupported]`.
+  `--verbose-cc` are global. Assembly sources stay `[unsupported]`.
 - **Relocatable links** (`build-obj` with object inputs or C sources,
   built 2026-11-04; `link/ElfMerge.zig`), as upstream's `flushObject`:
   the Zig object (written by `ElfObject` as before), then the object
@@ -6429,13 +6427,34 @@ libraries as inputs. To be agreed with that thread.
   C++ COMDATs and exceptions, and zap's) and keeps C and Zig lines in
   traces. The cache relinks the Zig object and merges again
   (`Incremental.linkFrom`; test/obj/cache.sh).
+- **Shared libraries with inputs** (`build-lib -dynamic` with object or
+  archive inputs or C sources, built 2026-11-04), as upstream's: the
+  objects are converted and linked as an executable's are
+  (`ElfInput.Inputs.shared`), archive members pulled as for an
+  executable, C sources compiled `-fPIC` (`CSource.Options.pic`), and
+  ubsan_rt linked in for them. The objects' default and protected
+  globals and commons are exported next to the Zig code's
+  (`ElfInput.dynamicExports`, at their offsets in their sections'
+  atoms), and names nothing defines are imported, as the Zig code's
+  are. Thread-locals keep the dynamic models: TLSGD addresses a 16-byte
+  (module, offset) pair the loader completes (R_X86_64_DTPMOD64,
+  `x86_64_dtpmod64`), TLSLD the module's pair, and a TLS descriptor
+  (GCC's `-mtls-dialect=gnu2`) a 16-byte descriptor (R_X86_64_TLSDESC
+  with no symbol, `x86_64_tlsdesc`) whose call stays. Each binds the
+  library's own definition, where upstream's linker lets an executable
+  preempt an exported thread-local (DTPMOD64/DTPOFF64 or TLSDESC
+  against the symbol). Refused with a diagnostic: non-PIC relocations
+  (R_X86_64_32, 32S, TPOFF32, GOTTPOFF), Clang's `_TLS_MODULE_BASE_`
+  descriptors, and another module's thread-locals. Upstream also
+  exports ubsan_rt's handlers (weak); zap does not. Shared libraries
+  are not cached, so there is no relink (test/link_input/so_*).
 - **Static libraries** (2026-11-04), as upstream's: the archive holds
   the Zig object (`<root stem>.o`), then the object inputs (named after
   their files, as given), then one member per C source (`<stem>.o`),
   with one symbol index over all of them (`Archive.write` takes the
   members). Archive inputs of `build-lib` and `build-obj` are left out,
   as upstream leaves them (a missing one is an error). Object inputs
-  and C sources of `build-obj` are merged into the object (below). A
+  and C sources of `build-obj` are merged into the object (above). A
   cached library relinks as its Zig object plus the
   other members read again (`Incremental.linkFrom`); it does not link
   them as an executable's inputs (built 2026-11-04). A module without a root source

@@ -1203,11 +1203,12 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         const d = dyn_opts.?;
         const a = dyn_arena.allocator();
         const defined = try a.alloc(ElfDynamic.Defined, dyn_exports.len);
-        for (defined, dyn_exports) |*def, atom| {
+        for (defined, dyn_exports, t.exports) |*def, atom, i| {
             const p = places[atom];
+            const x = d.exports[i];
             def.* = .{
-                .value = l.atomAddr(atom) - l.sym_bias[p.section],
-                .size = input.atom(atom).size(),
+                .value = l.atomAddr(atom) + x.offset - l.sym_bias[p.section],
+                .size = x.size orelse input.atom(atom).size(),
                 .shndx = l.shndx[p.section],
                 .type = sym_types[p.section],
             };
@@ -1897,6 +1898,9 @@ fn LinkOf(comptime Input: type) type {
             switch (r.info.kind) {
                 .x86_64_abs64 => {},
                 .x86_64_tpoff64 => return isImport(l.exe_imports orelse return false, a.targets[r.info.target]),
+                // A shared object's module ID, for `__tls_get_addr`, and
+                // its TLS descriptors.
+                .x86_64_dtpmod64, .x86_64_tlsdesc => return l.exe_imports == null,
                 else => return false,
             }
             const imports = l.exe_imports orelse return true;
@@ -2199,7 +2203,11 @@ fn LinkOf(comptime Input: type) type {
                         if (place.section == @backingInt(Atom.Section.text)) return l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name, .target = a.targets[r.info.target] });
                         const t = res[r.info.target];
                         const v = t +% @as(u64, @bitCast(@as(i64, r.addend)));
-                        const rec: elf.Elf64.Rela = if (t >= l.plt_start and t < l.plt_end)
+                        const rec: elf.Elf64.Rela = if (r.info.kind == .x86_64_dtpmod64)
+                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.DTPMOD64), .sym = 0 }, .addend = 0 }
+                        else if (r.info.kind == .x86_64_tlsdesc)
+                            .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.TLSDESC), .sym = 0 }, .addend = @bitCast(v -% l.tls.start) }
+                        else if (t >= l.plt_start and t < l.plt_end)
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(if (r.info.kind == .x86_64_tpoff64) elf.R_X86_64.TPOFF64 else elf.R_X86_64.@"64"), .sym = @intCast(1 + (t - l.plt_start) / ElfDynamic.plt_entry_size) }, .addend = r.addend }
                         else
                             .{ .offset = addr + r.offset, .info = .{ .type = @backingInt(elf.R_X86_64.RELATIVE), .sym = 0 }, .addend = @bitCast(v) };
@@ -2442,6 +2450,12 @@ inline fn applyRelocs(a: *const Atom, dst: []u8, p_base: u64, resolved: []const 
             },
             .x86_64_tpoff32 => try tpoff32(a, r, dst, s, tls, diag),
             .x86_64_tpoff64 => try tpoff64(a, r, dst, s, tls, diag),
+            // The loader's (`needsDynamicReloc`).
+            .x86_64_dtpmod64 => @memset(try relocField(a, dst, r.offset, 8, diag), 0),
+            .x86_64_tlsdesc => {
+                if (s < tls.start or s >= tls.end) return invalidReloc(a, diag);
+                @memset(try relocField(a, dst, r.offset, 16, diag), 0);
+            },
             .x86_64_tlsld, .x86_64_dtpoff32 => try tlsDynamic(a, r, dst, p_base, s, tls, diag),
             // Only objects reach another module's thread-locals.
             .x86_64_gottpoff, .x86_64_tlsgd => if (!tls.object) return invalidReloc(a, diag),

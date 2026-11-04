@@ -898,9 +898,12 @@ const InputResolver = struct {
         return r.emit.rtExport(name);
     }
 
-    /// With `-lc`, the shared libraries' and glibc's symbols, imported.
+    /// With `-lc`, the shared libraries' and glibc's symbols, imported. A
+    /// shared object imports every name nothing in it defines, as its
+    /// Zig code does (`exportTarget`).
     pub fn importSym(r: InputResolver, name: []const u8, weak: bool) !?SymbolKey {
-        if (!r.emit.libraryDefines(name)) return null;
+        if (r.emit.shared and std.mem.eql(u8, name, "_DYNAMIC")) return ElfDynamic.dynamic_key;
+        if (!r.emit.shared and !r.emit.libraryDefines(name)) return null;
         return try r.emit.useImport(name, .{ .weak = weak, .tls = r.emit.sharedTls(name) });
     }
 
@@ -941,6 +944,8 @@ fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
     try emit.error_values.appendSlice(emit.gpa, converted.values);
     emit.input_symbols = converted.symbols;
     emit.input_sections = converted.sections;
+    // A shared object exports the objects' globals too, as upstream's.
+    if (emit.shared) try emit.exports.appendSlice(emit.gpa, try in.dynamicExports(InputResolver{ .emit = emit }));
     return true;
 }
 
@@ -1591,13 +1596,13 @@ pub const ExternTarget = struct { key: SymbolKey, addend: i64 = 0 };
 /// object, a symbol that is not exported is imported. Complete only once
 /// analysis is, and the inputs pulled.
 fn externTarget(emit: *Emit, name: []const u8, weak: bool) !?ExternTarget {
-    const key = if (emit.inputs) |in| if (try emit.userExport(name)) |key| key else if (try in.lookup(name)) |t|
-        return .{ .key = t.key, .addend = @intCast(t.offset) }
-    else
-        sectionBound(name) orelse arrayBound(name) orelse try emit.exportTarget(name)
-    else if (emit.shared)
+    if (emit.inputs) |in| if (try emit.userExport(name) == null) if (try in.lookup(name)) |t|
+        return .{ .key = t.key, .addend = @intCast(t.offset) };
+    const key = if (emit.shared)
         try emit.userExport(name) orelse try emit.rtExport(name) orelse
             if (std.mem.eql(u8, name, "_DYNAMIC")) ElfDynamic.dynamic_key else try emit.useImport(name, .{ .weak = weak })
+    else if (emit.inputs != null)
+        try emit.userExport(name) orelse sectionBound(name) orelse arrayBound(name) orelse try emit.exportTarget(name)
     else if (emit.obj)
         try emit.userExport(name) orelse try emit.useImport(name, .{ .weak = weak })
     else

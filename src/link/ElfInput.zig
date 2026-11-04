@@ -16,6 +16,7 @@ const Atom = @import("Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 const Archive = @import("Archive.zig");
 const Elf = @import("Elf.zig");
+const ElfDynamic = @import("ElfDynamic.zig");
 
 const Inputs = @This();
 
@@ -35,6 +36,9 @@ groups: std.StringHashMapUnmanaged(void) = .empty,
 undefs: std.StringArrayHashMapUnmanaged(void) = .empty,
 /// Problems found while loading, as messages for the caller to report.
 errors: std.ArrayList([]const u8) = .empty,
+/// The output is a shared object (`build-lib -dynamic`): thread-locals
+/// keep their dynamic models, and absolute 32-bit addresses are errors.
+shared: bool = false,
 
 pub const Def = struct { object: u32, sym: u32, weak: bool };
 pub const Common = struct { size: u64, alignment: u64 };
@@ -466,6 +470,36 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
     if (weak_used) try values.append(arena, .{ .key = undefined_weak_key, .value = 0 });
     try values.appendSlice(arena, c.abs_values.items);
     return .{ .atoms = atoms.items, .values = values.items, .symbols = symbols.items, .sections = sections.items };
+}
+
+/// The objects' globals a shared object exports, after `convert`: those
+/// with default or protected visibility that the Zig code does not
+/// define (`skip`), at their place in their sections' atoms, sorted by
+/// name.
+pub fn dynamicExports(in: *Inputs, skip: anytype) ![]ElfDynamic.Export {
+    var out: std.ArrayList(ElfDynamic.Export) = .empty;
+    var it = in.defs.iterator();
+    while (it.next()) |d| {
+        const name = d.key_ptr.*;
+        if (try skip.zigExport(name) != null) continue;
+        const o = &in.objects.items[d.value_ptr.object];
+        const sym = o.syms[d.value_ptr.sym];
+        // STV_INTERNAL 1, STV_HIDDEN 2, STV_PROTECTED 3.
+        const vis = sym.st_other & 3;
+        if (vis == 1 or vis == 2) continue;
+        const t = try in.symTarget(o, d.value_ptr.sym, 0) orelse continue;
+        try out.append(in.arena, .{ .key = t.key, .name = name, .offset = t.offset, .size = sym.st_size, .weak = d.value_ptr.weak, .visibility = if (vis == 3) .protected else .default });
+    }
+    for (in.commons.keys(), in.commons.values()) |name, common| {
+        if (in.defs.contains(name) or try skip.zigExport(name) != null) continue;
+        try out.append(in.arena, .{ .key = commonKey(name), .name = name, .size = common.size });
+    }
+    std.mem.sortUnstable(ElfDynamic.Export, out.items, {}, struct {
+        fn lt(_: void, a: ElfDynamic.Export, b: ElfDynamic.Export) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+    return out.items;
 }
 
 const ArrayAtom = struct { atom: u32, priority: u32 };
@@ -927,6 +961,29 @@ fn Converter(comptime Ctx: type) type {
             // `_TLS_MODULE_BASE_`, the local-dynamic form's base, becomes
             // 0: its DTPOFF32 offsets become TPOFF32 ones, as after a
             // relaxed TLSLD.
+            //
+            // In a shared object the lea addresses the variable's descriptor
+            // (`tlsPair`), which the loader completes, and the call stays.
+            if (c.in.shared) switch (@as(R, @fromBackingInt(@intCast(ty)))) {
+                .TLSDESC_CALL => return 0,
+                .GOTPC32_TLSDESC => {
+                    if (c.isTlsModuleBase(r.r_sym())) {
+                        try c.fail("{s}: zap does not link _TLS_MODULE_BASE_ into shared objects yet; recompile with -mtls-dialect=gnu", .{o.path});
+                        return 0;
+                    }
+                    const t = try c.target(r.r_sym(), 0) orelse return 0;
+                    if (try c.sharedTlsImport(r, t)) return 0;
+                    try c.add(off, .x86_64_pc32, .{ .key = try c.tlsPair(t, .x86_64_tlsdesc), .offset = 0 }, r.r_addend);
+                    return 0;
+                },
+                .GOTTPOFF, .TPOFF32, .@"32", .@"32S" => {
+                    try c.fail("{s}: relocation R_X86_64_{s} in section '{s}' cannot be used in a shared object; recompile with -fPIC", .{
+                        o.path, @tagName(@as(R, @fromBackingInt(@intCast(ty)))), o.sectionName(index),
+                    });
+                    return 0;
+                },
+                else => {},
+            };
             if (ty == @backingInt(R.TLSDESC_CALL)) {
                 if (off + 2 > bytes.len or !std.mem.eql(u8, bytes[@intCast(off)..][0..2], &.{ 0xff, 0x10 })) {
                     try c.unsupported(index, ty);
@@ -959,6 +1016,10 @@ fn Converter(comptime Ctx: type) type {
                 return 0;
             }
             const t = try c.target(r.r_sym(), r.r_addend) orelse return 0;
+            if (t.import) switch (@as(R, @fromBackingInt(@intCast(ty)))) {
+                .TLSGD, .TLSLD, .DTPOFF32 => if (try c.sharedTlsImport(r, t)) return 0,
+                else => {},
+            };
             if (t.import) return c.importReloc(index, relas, k, bytes, copy);
             switch (@as(R, @fromBackingInt(@intCast(ty)))) {
                 .@"64" => try c.add(off, .x86_64_abs64, t, r.r_addend),
@@ -1013,6 +1074,13 @@ fn Converter(comptime Ctx: type) type {
                     try c.add(off, .x86_64_tpoff32, t, 0);
                 },
                 .TLSGD => {
+                    // In a shared object the module's own thread-local:
+                    // rdi points at a (module, offset) pair the loader
+                    // completes (`tlsPair`), and the call stays.
+                    if (c.in.shared) {
+                        try c.add(off, .x86_64_pc32, .{ .key = try c.tlsPair(t, .x86_64_dtpmod64), .offset = 0 }, r.r_addend);
+                        return 0;
+                    }
                     // data16 lea rdi, [rip + x@tlsgd]; data16 data16 rex.W
                     // call __tls_get_addr@plt
                     const gd = [_]u8{ 0x66, 0x48, 0x8d, 0x3d };
@@ -1029,6 +1097,12 @@ fn Converter(comptime Ctx: type) type {
                     return 1;
                 },
                 .TLSLD => {
+                    // In a shared object, the module's pair (`ElfDynamic`),
+                    // whatever thread-local of it names the module.
+                    if (c.in.shared) {
+                        try c.add(off, .x86_64_tlsld, .{ .key = t.key, .offset = 0 }, r.r_addend);
+                        return 0;
+                    }
                     // lea rdi, [rip + x@tlsld]; call __tls_get_addr@plt
                     if (off < 3 or off + 9 > bytes.len or !std.mem.eql(u8, bytes[@intCast(off - 3)..][0..3], &.{ 0x48, 0x8d, 0x3d }) or
                         bytes[@intCast(off + 4)] != 0xe8 or !c.callsTlsGetAddr(relas, k, off + 5))
@@ -1041,8 +1115,9 @@ fn Converter(comptime Ctx: type) type {
                     b[@intCast(off - 3)..][0..12].* = .{ 0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0 };
                     return 1;
                 },
-                // With rax the thread pointer after the relaxed TLSLD.
-                .DTPOFF32 => try c.add(off, .x86_64_tpoff32, t, r.r_addend),
+                // With rax the thread pointer after the relaxed TLSLD; in a
+                // shared object, the module's block.
+                .DTPOFF32 => try c.add(off, if (c.in.shared) .x86_64_dtpoff32 else .x86_64_tpoff32, t, r.r_addend),
                 else => try c.unsupported(index, ty),
             }
             return 0;
@@ -1125,6 +1200,38 @@ fn Converter(comptime Ctx: type) type {
         /// Whether `s` is `_TLS_MODULE_BASE_`, which the linker defines.
         fn isTlsModuleBase(c: *C, s: u32) bool {
             return s < c.o.syms.len and std.mem.eql(u8, c.o.symName(c.o.syms[s]), "_TLS_MODULE_BASE_");
+        }
+
+        /// Whether thread-local `t`, which relocation `r` names, is another
+        /// module's in a shared object, which zap does not link yet, after
+        /// reporting it.
+        fn sharedTlsImport(c: *C, r: elf.Elf64_Rela, t: Target) !bool {
+            if (!c.in.shared or !t.import) return false;
+            try c.fail("{s}: zap does not import thread-local {s} into shared objects yet", .{ c.o.path, c.o.symName(c.o.syms[r.r_sym()]) });
+            return true;
+        }
+
+        /// A shared object's 16-byte pair for its own thread-local `t`,
+        /// which the loader completes: with `.x86_64_dtpmod64`, the
+        /// (module, offset) pair `__tls_get_addr` takes, whose offset in
+        /// the module's block is known; with `.x86_64_tlsdesc`, its TLS
+        /// descriptor. Content-addressed, so references to one variable
+        /// share it.
+        fn tlsPair(c: *C, t: Target, kind: Atom.Reloc.Kind) Allocator.Error!SymbolKey {
+            const arena = c.in.arena;
+            const targets = try arena.dupe(SymbolKey, &.{t.key});
+            const off = std.math.cast(i32, t.offset) orelse {
+                try c.fail("{s}: thread-local offset out of range", .{c.o.path});
+                return t.key;
+            };
+            const relocs = if (kind == .x86_64_tlsdesc)
+                try arena.dupe(Atom.Reloc, &.{.init(0, .x86_64_tlsdesc, 0, off)})
+            else
+                try arena.dupe(Atom.Reloc, &.{ .init(0, .x86_64_dtpmod64, 0, 0), .init(8, .x86_64_dtpoff32, 0, off) });
+            const zeros: []const u8 = &@as([16]u8, @splat(0));
+            const key: SymbolKey = .fromContents(.data, .@"8", zeros, targets, relocs);
+            try c.atoms.append(arena, .{ .key = key, .name = "", .section = .data, .alignment = .@"8", .bytes = zeros, .targets = targets, .relocs = relocs });
+            return key;
         }
 
         /// Whether relocation `k + 1` is the call to `__tls_get_addr` at

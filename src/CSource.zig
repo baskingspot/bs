@@ -128,6 +128,9 @@ pub const Options = struct {
     /// libc, unless its Zig code goes through the self-hosted backend,
     /// which has none (`Module.create`): a library of C only, or `-fllvm`.
     stack_protector: bool = false,
+    /// A shared library's sources are position-independent, as upstream
+    /// requires (`requiresPIC`).
+    pic: bool = false,
     pie: bool,
     function_sections: bool,
     data_sections: bool,
@@ -607,8 +610,9 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .red_zone = src.flags.red_zone orelse true,
             .no_builtin = src.flags.no_builtin orelse false,
             .stack_protector = o.link_libc and (src.flags.stack_protector orelse o.stack_protector),
-            // glibc requires PIC (`requiresPic`); else the module's, default off.
-            .pic = o.link_libc or (src.flags.pic orelse false),
+            // glibc and shared libraries require PIC (`requiresPic`); else
+            // the module's, default off.
+            .pic = o.link_libc or o.pic or (src.flags.pic orelse false),
             .pie = o.pie,
             .function_sections = o.function_sections,
             .data_sections = o.data_sections,

@@ -918,6 +918,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
         .global_cache = job.cache_dirs.global,
         .single_threaded = opts.single_threaded,
         .stack_protector = opts.c_only or opts.use_llvm,
+        .pic = opts.dynamic,
         .pie = opts.c_pie,
         .function_sections = opts.function_sections,
         .data_sections = opts.data_sections,
@@ -976,7 +977,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
         // Only executables link the C runtimes; a library's C objects
         // reach them when an executable links the library, as upstream's.
-        .c_runtimes = opts.command != .build_obj and opts.command != .build_lib and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp),
+        .c_runtimes = ((opts.command != .build_obj and opts.command != .build_lib) or opts.dynamic) and (opts.link_inputs.len != 0 or opts.c_sources.len != 0 or opts.link_libcpp),
     });
     defer fe.deinit();
     try fe.enableCache(job.cache_dirs);
@@ -1084,9 +1085,10 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     emit.shared_libs = shared_libs;
     if (inc_opt) |i| i.shared = shared_libs;
     var link_inputs: ElfInput = .{ .arena = arena };
-    // An executable links the C objects and the C++ runtime libraries; a
-    // static library holds the objects as members.
-    if (c_batch) |b| if (!emit.obj) {
+    // An executable or shared library links the C objects and the C++
+    // runtime libraries; a static library holds the objects as members.
+    link_inputs.shared = emit.shared;
+    if (c_batch) |b| if (!emit.obj or emit.shared) {
         emit.inputs = &link_inputs;
         emit.c_batch = b;
     };
@@ -1108,7 +1110,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     if (inc_opt) |i| try i.beginReplay(&fe, &zcu, &emit, replay_mode);
     // A lazy edit build relinks from the manifest, which reads the
     // objects itself (`Incremental.linkFrom`).
-    if (opts.link_inputs.len != 0 and !emit.obj and !(if (zcu.replay) |r| r.lazy else false)) {
+    if (opts.link_inputs.len != 0 and (!emit.obj or emit.shared) and !(if (zcu.replay) |r| r.lazy else false)) {
         for (opts.link_inputs) |path| {
             const bytes = Io.Dir.cwd().readFileAlloc(init.io, path, arena, .unlimited) catch |err|
                 fatal("unable to read '{s}': {t}", .{ path, err });
@@ -2090,11 +2092,6 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     if (opts.link_libc and opts.dynamic and command == .build_lib)
         setUnsupported(&opts, arena, "zap does not link shared libraries against glibc yet ('-dynamic' with '-lc'); build this step with upstream zig", .{});
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena, io);
-    // A static library holds the C objects as members, and an object
-    // merges them (`ElfMerge`); a shared library would need them linked
-    // into it.
-    if (c_files.items.len != 0 and command == .build_lib and opts.dynamic)
-        setUnsupported(&opts, arena, "zap does not compile C sources into objects or shared libraries yet ('{s}'); build this step with upstream zig", .{c_files.items[0].path});
     // C sources without any module: a library or executable of C only, as
     // upstream's.
     if (root == null and !rootless_root and c_files.items.len != 0 and command != .@"test") rootless_root = true;
@@ -2133,8 +2130,8 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // As upstream, an object or a static library links nothing: it leaves
     // archive and shared library inputs out (`-l` names are still found).
     // A static library holds object inputs as members after its own
-    // object, and an object merges them (`ElfMerge`); linking them into a
-    // shared library is not done yet.
+    // object, an object merges them (`ElfMerge`), and a shared library
+    // links both, as an executable does.
     if (command == .build_obj or command == .build_lib) {
         // As upstream's `Config.resolve`, a library that links a shared
         // one without `-static` or `-dynamic` is shared.
@@ -2146,12 +2143,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
             setUnsupported(&opts, arena, "zap does not link libraries into shared libraries yet ('-l{s}'); build this step with upstream zig", .{libs.items[0].name});
         var kept: usize = 0;
         for (link_inputs.items) |path| {
-            if (std.mem.eql(u8, std.fs.path.extension(path), ".a") or (!opts.dynamic and isSharedLib(path))) {
+            if (!opts.dynamic and (std.mem.eql(u8, std.fs.path.extension(path), ".a") or isSharedLib(path))) {
                 Io.Dir.cwd().access(io, path, .{}) catch fatal("{s}: file not found", .{path});
                 continue;
             }
-            if (opts.dynamic)
-                setUnsupported(&opts, arena, "zap does not link object files into shared libraries yet ('{s}'); build this step with upstream zig", .{path});
             link_inputs.items[kept] = path;
             kept += 1;
         }

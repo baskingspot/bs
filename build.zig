@@ -1309,6 +1309,38 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         r.addCheck(.{ .expect_term = .{ .exited = 0 } });
         test_step.dependOn(&r.step);
     }
+    // build-lib -dynamic with a C source, a C object (general- and
+    // local-dynamic TLS) and an archive (TLS descriptors when GCC builds
+    // it), linked into one shared library as upstream links them, which
+    // exports the C globals; upstream links a program against it.
+    {
+        const tls_o = b.addSystemCommand(&.{ zig, "cc", "-fPIC", "-c" });
+        tls_o.addFileArg(b.path("test/link_input/tls.c"));
+        const desc_o = b.addSystemCommand(if (cc) |gcc| &.{ gcc, "-fPIC", "-mtls-dialect=gnu2", "-c" } else &.{ zig, "cc", "-fPIC", "-c" });
+        desc_o.addFileArg(b.path("test/link_input/so_desc.c"));
+        const desc_a = b.addSystemCommand(&.{ zig, "ar", "rcs" });
+        const desc_lib = desc_a.addOutputFileArg("libdesc.a");
+        desc_a.addFileArg(desc_o.addPrefixedOutputFileArg("-o", "so_desc.o"));
+        const zso_inputs = b.addRunArtifact(zap);
+        zso_inputs.setName("zap build-lib -dynamic with a C source, a C object and an archive");
+        zso_inputs.addArgs(&.{ "build-lib", "-dynamic", "--name", "zapinputs" });
+        zso_inputs.addFileArg(b.path("test/link_input/so_lib.zig"));
+        zso_inputs.addFileArg(b.path("test/link_input/merge.c"));
+        zso_inputs.addFileArg(tls_o.addPrefixedOutputFileArg("-o", "tls.o"));
+        zso_inputs.addFileArg(desc_lib);
+        zso_inputs.setEnvironmentVariable("ZAP_ZIG", zig);
+        const so_file = zso_inputs.addPrefixedOutputFileArg("-femit-bin=", "libzapinputs.so");
+        const so_host = b.addSystemCommand(&.{ zig, "build-exe", "-lc" });
+        so_host.addFileArg(b.path("test/link_input/so_main.zig"));
+        so_host.addFileArg(so_file);
+        const r = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
+        r.setName("run so_main (zap shared library with inputs)");
+        r.addFileArg(so_file);
+        r.addFileArg(so_host.addPrefixedOutputFileArg("-femit-bin=", "so_main"));
+        r.addCheck(.{ .expect_stderr_exact = "44 bee 6 712 810\nthread: 712 810\n" });
+        r.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&r.step);
+    }
     // An executable of C only, as upstream builds one: its main is C's.
     {
         const cexe = b.addRunArtifact(zap);

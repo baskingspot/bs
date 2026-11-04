@@ -20,10 +20,15 @@ const Allocator = std.mem.Allocator;
 const Atom = @import("Atom.zig");
 const SymbolKey = Atom.SymbolKey;
 
-/// A symbol the output defines for other modules: the atom `key`, as `name`.
+/// A symbol the output defines for other modules: the atom `key` (or a
+/// part of it), as `name`.
 pub const Export = struct {
     key: SymbolKey,
     name: []const u8,
+    /// Where in the atom the symbol is, and its size, if not the whole
+    /// atom: an input object's symbol in its section's atom.
+    offset: u64 = 0,
+    size: ?u64 = null,
     weak: bool = false,
     visibility: std.lang.SymbolVisibility = .default,
     /// In an executable: the atom is a copy of a library's data object,
