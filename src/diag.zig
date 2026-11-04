@@ -360,9 +360,13 @@ pub fn fromBundle(arena: std.mem.Allocator, paths: Paths, bundle: std.zig.ErrorB
         const code = classifyAstGen(msg);
         var candidates: []const []const u8 = &.{};
         var fixes: []const Fix = &.{};
-        var hint: ?[]const u8 = if (code == .@"unknown-builtin") if (quoted(msg)) |name| builtinHint(name) else null else null;
+        var hint: ?[]const u8 = switch (code) {
+            .@"unknown-builtin" => if (quoted(msg)) |name| builtinHint(name) else null,
+            .@"outside-function" => if (std.mem.eql(u8, msg, "'try' outside function scope")) "no function here can return the error: remove 'try', or handle the error with 'catch'" else null,
+            else => null,
+        };
         const needs_file = switch (code) {
-            .undeclared, .unused, .@"unused-label", .@"never-mutated", .@"pointless-discard", .@"unknown-builtin", .@"arg-count", .@"bad-capture" => true,
+            .undeclared, .unused, .@"unused-label", .@"never-mutated", .@"pointless-discard", .@"unknown-builtin", .@"arg-count", .@"bad-capture", .@"outside-function" => true,
             else => false,
         };
         if (needs_file and m.src_loc != .none) facts: {
@@ -1064,6 +1068,11 @@ fn astGenFix(arena: std.mem.Allocator, tree: *const Ast, code: Code, msg: []cons
             return try rawFix(arena, .exact, &.{.{ .start = at, .end = at, .text = if (tree.tokenTag(before) == .comma) " 0.." else ", 0.." }});
         },
         .undeclared => return renameFix(arena, tree.source, tree.tokenStart(tok), tokenEnd(tree, tok), candidates),
+        .@"outside-function" => {
+            // A container-level `try`: it goes, up to its operand.
+            if (tree.tokenTag(tok) != .keyword_try or !std.mem.eql(u8, msg, "'try' outside function scope")) return null;
+            return try rawFix(arena, .maybe, &.{.{ .start = tree.tokenStart(tok), .end = tree.tokenStart(tok + 1), .text = "" }});
+        },
         else => return null,
     }
 }
