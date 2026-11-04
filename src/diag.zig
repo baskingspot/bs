@@ -1342,20 +1342,15 @@ pub fn callArgument(tree: *const Ast, start: u32, end: u32, n_params: usize, par
 }
 
 /// Whether the function declaration around `tok` returns an error union,
-/// as its return type is written (`!T`, `E!T`).
+/// as its return type is written (`!T`, `E!T`), or is a test.
 pub fn fnReturnsError(tree: *const Ast, tok: Ast.TokenIndex) bool {
-    for (0..tree.nodes.len) |i| {
-        const node: Ast.Node.Index = @enumFromInt(i);
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        if (tok < tree.firstToken(node) or tok > tree.lastToken(node)) continue;
-        // The innermost: a function declared in a nested container.
-        if (enclosingFnBody(tree, tok) != tree.nodeData(node).node_and_node[1]) continue;
-        var buf: [1]Ast.Node.Index = undefined;
-        const proto = tree.fullFnProto(&buf, tree.nodeData(node).node_and_node[0]) orelse return false;
-        const ret = proto.ast.return_type.unwrap() orelse return false;
-        return tree.nodeTag(ret) == .error_union or tree.tokenTag(tree.firstToken(ret) - 1) == .bang;
-    }
-    return false;
+    const decl = enclosingFn(tree, tok) orelse return false;
+    // A test returns `anyerror!void`.
+    if (tree.nodeTag(decl) == .test_decl) return true;
+    var buf: [1]Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buf, tree.nodeData(decl).node_and_node[0]) orelse return false;
+    const ret = proto.ast.return_type.unwrap() orelse return false;
+    return tree.nodeTag(ret) == .error_union or tree.tokenTag(tree.firstToken(ret) - 1) == .bang;
 }
 
 /// The shift whose amount is the expression at `start..end`: its shifted
@@ -1591,17 +1586,26 @@ fn forCounter(tree: *const Ast, open: Ast.TokenIndex, name_start: Ast.TokenIndex
     return null;
 }
 
-/// The body of the innermost function declaration around `tok`.
+/// The body of the innermost function declaration or test around `tok`.
 fn enclosingFnBody(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.Node.Index {
+    const decl = enclosingFn(tree, tok) orelse return null;
+    return switch (tree.nodeTag(decl)) {
+        .fn_decl => tree.nodeData(decl).node_and_node[1],
+        else => tree.nodeData(decl).opt_token_and_node[1],
+    };
+}
+
+/// The innermost function declaration or test around `tok`.
+fn enclosingFn(tree: *const Ast, tok: Ast.TokenIndex) ?Ast.Node.Index {
     var best: ?Ast.Node.Index = null;
     var best_len: u32 = std.math.maxInt(u32);
     for (0..tree.nodes.len) |i| {
         const node: Ast.Node.Index = @enumFromInt(i);
-        if (tree.nodeTag(node) != .fn_decl) continue;
+        if (tree.nodeTag(node) != .fn_decl and tree.nodeTag(node) != .test_decl) continue;
         const first = tree.firstToken(node);
         const last = tree.lastToken(node);
         if (tok < first or tok > last or last - first >= best_len) continue;
-        best = tree.nodeData(node).node_and_node[1];
+        best = node;
         best_len = last - first;
     }
     return best;
