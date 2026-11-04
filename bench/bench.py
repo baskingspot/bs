@@ -382,7 +382,7 @@ class ZigCompiler(Workload):
 
     def setup(self):
         # The build-exe command `zig build -Denable-llvm=false
-        # -Dversion-string=0.17.0 --verbose` runs for the compiler, with its
+        # -Dversion-string=0.17.1 --verbose` runs for the compiler, with its
         # generated build_options module copied to workloads/zig.
         upstream_src = os.path.join(REPO_DIR, "upstream", "src")
         if not os.path.isdir(upstream_src):
@@ -413,8 +413,8 @@ class ZigCompiler(Workload):
 
     def check_output(self, path):
         p = subprocess.run([path, "version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if p.returncode != 0 or p.stdout.strip() != "0.17.0":
-            sys.exit(f"{path} version did not print 0.17.0: rc={p.returncode} stdout={p.stdout!r}")
+        if p.returncode != 0 or p.stdout.strip() != "0.17.1":
+            sys.exit(f"{path} version did not print 0.17.1: rc={p.returncode} stdout={p.stdout!r}")
 
 
 class StdTests(Workload):

@@ -118,7 +118,8 @@ python3 bench/scoreboard.py --zap /tmp/zap-rf/bin/zap --note "Amp orb, 4 vCPU"
 ```
 
 `--parts bench,corpus,runtime` runs a subset; `--from-json PATH` renders the
-report again from a run's JSON. After a change to donor builds lands, measure
+report again from a run's JSON. The JSON is saved after each part, and
+`--resume` continues an interrupted run with the parts still missing. After a change to donor builds lands, measure
 the donor-on rows again with the new zap (each workload's cold-local next to
 upstream's, and the corpus's zap columns) and add them to the same report:
 

@@ -326,6 +326,27 @@ def render(data):
     return "\n".join(lines)
 
 
+def save(data, out):
+    with open(out + ".json", "w") as f:
+        json.dump(data, f, indent=1)
+        f.write("\n")
+
+
+def measure(data, part, zap, zig, note, out):
+    """Runs one part and saves the report's JSON after it, so that
+    `--resume` can continue an interrupted run."""
+    if part == "bench":
+        data["bench"] = bench_part(zap, zig, note)
+    elif part == "corpus":
+        data["corpus"] = corpus_part(zap, zig)
+        data["corpus_samples"] = CORPUS_SAMPLES
+    elif part == "runtime":
+        data["runtime"] = runtime_part(zap, zig, note)
+    else:
+        sys.exit(f"unknown part {part}")
+    save(data, out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--zap", default=os.path.join(REPO_DIR, "zig-out", "bin", "zap"), help="zap, ReleaseFast")
@@ -334,6 +355,8 @@ def main():
     ap.add_argument("--note", default="Amp orb", help="describes the machine in the report")
     ap.add_argument("--out", default=None, help="output path without extension (default bench/results/<date>-scoreboard)")
     ap.add_argument("--from-json", help="render the report from an earlier run's JSON")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue an interrupted run: keep the parts its JSON (--out) holds, measure the rest")
     ap.add_argument("--add-donors", metavar="WHY",
                     help="with --from-json: measure the donor-on rows again with --zap (for example after a donor "
                          "change lands) and add them to the report; WHY says what changed")
@@ -345,6 +368,18 @@ def main():
     if args.from_json:
         with open(args.from_json) as f:
             data = json.load(f)
+    elif args.resume and os.path.exists(out + ".json"):
+        # An interrupted run: measure only the parts it has not saved.
+        with open(out + ".json") as f:
+            data = json.load(f)
+        zap = os.path.abspath(args.zap)
+        zig = subprocess.run(["which", args.zig], stdout=subprocess.PIPE, text=True).stdout.strip() or args.zig
+        now = lambda: datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+        for part in args.parts.split(","):
+            if part not in data:
+                measure(data, part, zap, zig, args.note, out)
+        data["finished"] = now()
+        save(data, out)
     else:
         zap = os.path.abspath(args.zap)
         zig = subprocess.run(["which", args.zig], stdout=subprocess.PIPE, text=True).stdout.strip() or args.zig
@@ -352,18 +387,10 @@ def main():
         now = lambda: datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
         data = {"date": datetime.date.today().isoformat(), "commit": git("rev-parse", "--short", "HEAD"),
                 "machine": machine(), "note": args.note, "started": now(), "zap": zap, "zig": zig}
-        parts = args.parts.split(",")
-        if "bench" in parts:
-            data["bench"] = bench_part(zap, zig, args.note)
-        if "corpus" in parts:
-            data["corpus"] = corpus_part(zap, zig)
-            data["corpus_samples"] = CORPUS_SAMPLES
-        if "runtime" in parts:
-            data["runtime"] = runtime_part(zap, zig, args.note)
+        for part in args.parts.split(","):
+            measure(data, part, zap, zig, args.note, out)
         data["finished"] = now()
-        with open(out + ".json", "w") as f:
-            json.dump(data, f, indent=1)
-            f.write("\n")
+        save(data, out)
     if args.add_donors:
         if not args.from_json:
             sys.exit("--add-donors needs --from-json")
@@ -374,15 +401,11 @@ def main():
         dn.update(commit=args.zap_commit or git("rev-parse", "--short", "HEAD"), why=args.add_donors,
                   started=started, finished=now())
         data["donors"] = dn
-        with open(out + ".json", "w") as f:
-            json.dump(data, f, indent=1)
-            f.write("\n")
+        save(data, out)
     if args.findings:
         with open(args.findings) as f:
             data["findings"] = f.read()
-        with open(out + ".json", "w") as f:
-            json.dump(data, f, indent=1)
-            f.write("\n")
+        save(data, out)
     with open(out + ".md", "w") as f:
         f.write(render(data))
     log(f"wrote {out}.md")

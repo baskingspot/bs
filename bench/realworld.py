@@ -87,10 +87,11 @@ class Workload:
 
 class ZigCompiler(Workload):
     def setup(self):
+        # Copied again every run: upstream/ follows the pinned release.
         d = os.path.join(self.work, "zig-src")
-        if not os.path.isdir(d):
-            shutil.copytree(os.path.join(REPO_DIR, "upstream", "src"), os.path.join(d, "src"))
-            shutil.copy(os.path.join(BENCH_DIR, "workloads", "zig", "build_options.zig"), d)
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.copytree(os.path.join(REPO_DIR, "upstream", "src"), os.path.join(d, "src"))
+        shutil.copy(os.path.join(BENCH_DIR, "workloads", "zig", "build_options.zig"), d)
         self.cwd = d
         self.lib = os.path.join(REPO_DIR, "upstream", "lib")
 

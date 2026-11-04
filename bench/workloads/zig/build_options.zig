@@ -34,11 +34,11 @@ pub const @"build.ValueInterpretMode" = enum (u1) {
     by_name = 1,
 };
 pub const value_interpret_mode: @"build.ValueInterpretMode" = .direct;
-pub const version: [:0]const u8 = "0.17.0";
+pub const version: [:0]const u8 = "0.17.1";
 pub const semver: @import("std").SemanticVersion = .{
     .major = 0,
     .minor = 17,
-    .patch = 0,
+    .patch = 1,
 };
 pub const enable_debug_extensions: bool = true;
 pub const enable_logging: bool = true;
