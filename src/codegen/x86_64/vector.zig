@@ -264,7 +264,10 @@ pub fn gen(cg: *CodeGen, inst: Inst.Index, tag: Inst.Tag, data: Inst.Data) Error
         .reduce => {
             const x = cg.ir.extraData(Ir.Reduce, data.ty_pl.payload).data;
             if (isBits(ip, cg.typeOf(x.operand))) return reduceBits(cg, inst, x.operation(), x.operand);
-            if (x.operand.toIndex()) |o| if (cg.homes[@backingInt(o)] == .view) return reduceIndex(cg, inst, data.ty_pl.ty, x.operation(), x.operand);
+            // A select fused by `fuseIndexSelect` (a bitcast of a load
+            // read in place is a `view` too).
+            if (x.operand.toIndex()) |o| if (cg.homes[@backingInt(o)] == .view and cg.ir.instructions.items(.tag)[@backingInt(o)] == .select)
+                return reduceIndex(cg, inst, data.ty_pl.ty, x.operation(), x.operand);
             try reduce(cg, inst, data.ty_pl.ty, x.operation(), x.operand);
         },
         .select => {
