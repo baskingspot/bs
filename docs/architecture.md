@@ -6395,7 +6395,7 @@ lines, each starting with a keyword:
   candidates: <name>, <name>, ...
   hint: <one line>
   fix[?] <path>:<line>:<col>-<line>:<col>: "<replacement text>"
-  call: <path>:<line>:<col> inline|comptime, ..., +<n> std
+  call: <path>:<line>:<col> inline|comptime|generic, ..., +<n> std
   ref: <fn> <path>:<line>:<col> <- <fn> <path>:<line>:<col> (+<n> std frames)
   in <n> instances: <comptime args of the first ones>
 ```
@@ -6496,7 +6496,9 @@ Locations stay absolute spans until rendered. Declaration-relative
 locations would matter only for diagnostics loaded from the cache, and the
 accepted design caches none: a failed unit is always re-analyzed.
 
-The call line (`call:`) collects the comptime and inline call-site frames.
+The call line (`call:`) collects the comptime and inline call-site frames,
+and the calls whose generic instantiation failed in its parameter or
+return types (`generic`, upstream's "generic function instantiated here").
 Frames in the zig lib directory print only as a count, and the line is
 omitted when every frame is in the lib directory.
 

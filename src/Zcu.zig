@@ -616,6 +616,7 @@ pub fn addCallFrame(zcu: *Zcu, file_index: u32, span: Ast.Span, kind: diag.CallK
     try zcu.appendNote(.{ .file = file_index, .span = span, .msg = switch (kind) {
         .@"inline" => "called inline here",
         .@"comptime" => "called at comptime here",
+        .generic => "generic function instantiated here",
     }, .call = kind });
 }
 

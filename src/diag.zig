@@ -127,7 +127,9 @@ pub const Note = struct {
     decl: bool = false,
 };
 
-pub const CallKind = enum { @"inline", @"comptime" };
+/// How a call frame entered its callee: an inline call, a comptime call,
+/// or a generic function's instantiation (its parameter and return types).
+pub const CallKind = enum { @"inline", @"comptime", generic };
 
 pub const Diagnostic = struct {
     code: Code = .unclassified,
@@ -620,6 +622,7 @@ pub fn toBundle(wip: *std.zig.ErrorBundle.Wip, diags: []const Diagnostic, ref_li
             const note_msg = if (n.call) |kind| try wip.addString(switch (kind) {
                 .@"inline" => "called inline here",
                 .@"comptime" => "called at comptime here",
+                .generic => "generic function instantiated here",
             }) else try wip.addString(n.msg);
             const note_loc: std.zig.ErrorBundle.SourceLocationIndex = if (n.loc) |l| try bundleSrcLoc(wip, l, 0) else .none;
             const index = try wip.addErrorMessage(.{ .msg = note_msg, .count = n.count, .src_loc = note_loc });

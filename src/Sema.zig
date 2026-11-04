@@ -18824,7 +18824,7 @@ fn inlineCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref, h
     }
     // With an inferred error set, the result's error set is what the
     // returns produce (see `analyzeRet`).
-    const ret_ty = try sema.calleeRetTy(&ct_block, src, func);
+    const ret_ty = try sema.calleeRetTy(&ct_block, func, null);
     i = 0;
     for (fn_info.param_body) |inst| {
         switch (sema.code.instructions.items(.tag)[@backingInt(inst)]) {
@@ -18932,16 +18932,22 @@ fn genericParamType(sema: *Sema, caller: *Block, src: Src, func: Index, prior: [
     unreachable;
 }
 
-fn calleeRetTy(sema: *Sema, callee_block: *Block, src: Src, func: Index) CompileError!Index {
+/// `instance` is the call instantiating generic `func`, which an error
+/// in the return type expression names (not one about the type it gives,
+/// as upstream).
+fn calleeRetTy(sema: *Sema, callee_block: *Block, func: Index, instance: ?struct { caller: *Block, src: Src }) CompileError!Index {
     const ip = sema.ip;
     const f = ip.keyPayload(.func, func);
     const ret = ip.keyPayload(.func_type, f.ty).return_type;
     if (ret != .generic_poison_type) return ret;
     const fn_info = sema.code.getFnInfo(f.zir_inst);
-    var ty = if (fn_info.ret_ty_body.len != 0)
-        try sema.analyzeAsType(callee_block, src, try sema.resolveInlineBody(callee_block, fn_info.ret_ty_body, f.zir_inst))
-    else
-        try sema.resolveType(callee_block, src, fn_info.ret_ty_ref);
+    // Errors in the return type are at the callee's, as upstream.
+    const ret_src: Src = .{ .base = callee_block.src_base, .loc = .{ .fn_ret_ty = .zero } };
+    const n = sema.zcu.errors.items.len;
+    var ty = sema.calleeRetTyExpr(callee_block, ret_src, f.zir_inst, fn_info) catch |err| {
+        const i = instance orelse return err;
+        return sema.noteCallSite(i.caller, i.src, n, err, .generic);
+    };
     // As for a declared return type, at the callee's.
     if (Type.class(ip, ty) == .@"opaque")
         return sema.fail(callee_block, .{ .base = callee_block.src_base, .loc = .{ .fn_ret_ty = .zero } }, "opaque return type '{s}{f}' not allowed", .{ if (fn_info.inferred_error_set) "!" else "", sema.fmtType(ty) });
@@ -18949,6 +18955,12 @@ fn calleeRetTy(sema: *Sema, callee_block: *Block, src: Src, func: Index) Compile
         ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = .adhoc_inferred_error_set_type, .payload_type = ty } });
     }
     return ty;
+}
+
+fn calleeRetTyExpr(sema: *Sema, callee_block: *Block, ret_src: Src, inst: Zir.Inst.Index, fn_info: Zir.FnInfo) CompileError!Index {
+    if (fn_info.ret_ty_body.len != 0)
+        return sema.analyzeAsType(callee_block, ret_src, try sema.resolveInlineBody(callee_block, fn_info.ret_ty_body, inst));
+    return sema.resolveType(callee_block, ret_src, fn_info.ret_ty_ref);
 }
 
 /// A memoizable computation in progress, whose dependencies `memoDeps`
@@ -19032,7 +19044,7 @@ fn walkComptimeCall(sema: *Sema, caller: *Block, src: Src, func: Index, args: []
     const arg_refs = try sema.arena.alloc(Ref, args.len);
     for (args, arg_refs) |a, *r| r.* = .fromInterned(a);
     try sema.mapCalleeParams(&callee_block, caller, src, func, arg_refs);
-    var inlining: Block.Inlining = .{ .func = func, .ret_ty = try sema.calleeRetTy(&callee_block, src, func), .args = args };
+    var inlining: Block.Inlining = .{ .func = func, .ret_ty = try sema.calleeRetTy(&callee_block, func, null), .args = args };
     callee_block.inlining = &inlining;
     const fn_info = sema.code.getFnInfo(ip.keyPayload(.func, func).zir_inst);
     sema.analyzeBodyInner(&callee_block, fn_info.body) catch |err| switch (err) {
@@ -19699,7 +19711,7 @@ fn bcLowerBody(sema: *Sema, func_index: Index, args: []const Index, params: *std
         };
         try sema.inst_map.put(gpa, inst, ref);
     }
-    const ret_ty = if (!fn_ty.is_generic) fn_ty.return_type else try sema.calleeRetTy(&ct, src, func_index);
+    const ret_ty = if (!fn_ty.is_generic) fn_ty.return_type else try sema.calleeRetTy(&ct, func_index, null);
     // Inferred error sets need the runtime body; `noreturn` functions
     // cannot return a value to the walker.
     if (ret_ty == .noreturn_type) return sema.bcRefuse();
@@ -20586,8 +20598,11 @@ fn instantiate(sema: *Sema, caller: *Block, src: Src, func: Index, args: []Ref, 
         defer saved.leave(sema);
         var callee_block = sema.calleeBlock(caller, func);
         defer callee_block.deinitInsts();
-        try sema.mapCalleeParams(&callee_block, caller, src, func, args);
-        break :blk try sema.calleeRetTy(&callee_block, src, func);
+        // As upstream, an error in the parameter or return types names
+        // the call that instantiates them.
+        const n = sema.zcu.errors.items.len;
+        sema.mapCalleeParams(&callee_block, caller, src, func, args) catch |err| return sema.noteCallSite(caller, src, n, err, .generic);
+        break :blk try sema.calleeRetTy(&callee_block, func, .{ .caller = caller, .src = src });
     };
     for (args, comptime_args, 0..) |a, *ca, k| {
         // An `anytype` argument of a comptime-only type is comptime.

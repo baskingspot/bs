@@ -1011,7 +1011,7 @@ def zap_lines(stderr, case_name):
                 # for the rest; run_case() matches either form.
                 notes.append(f"{os.path.basename(n['file'])}:{n['line']}:{n['col']}: note: {msg}")
         for c in d.get("calls", []):
-            msg = ("called inline here" if c["kind"] == "inline" else "called at comptime here") + times(c)
+            msg = {"inline": "called inline here", "comptime": "called at comptime here", "generic": "generic function instantiated here"}[c["kind"]] + times(c)
             notes.append(f":{c['line']}:{c['col']}: note: {msg}" if here(c) else f"?: note: {msg}")
     return errors, notes
 
