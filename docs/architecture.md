@@ -2580,6 +2580,13 @@ main, against upstream's link of the same objects.
   the function like any other. Helpers are named by declaration,
   not by exported symbol (`__cmptf2` serves `__lttf2`, `fmodq` is exported
   as `fmodf128`).
+- Externs and the link resolve names compiler_rt exports to its functions
+  (`Zcu.compilerRtExport`): the libm ones and, as upstream defines them
+  in every binary, `memcpy`, `memmove`, `memset`, `memcmp`, `bcmp` and
+  `strlen` (the Debug variants, `memcpyFast` and so on), which C objects
+  linked without libc call. The last four live in `lib/compiler_rt.zig`
+  itself, whose key has an empty file part (`compiler_rt::memcmp`, as
+  `Zcu.fileKey` names a module root).
 - compiler_rt bodies are analyzed without runtime safety, ignoring
   `@setRuntimeSafety`, because upstream builds compiler_rt in a release mode
   and its code relies on that (for example wrapping `-=` in `fmodq`).

@@ -675,10 +675,8 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
                 _ = try emit.useImport(name, flags);
             },
             .rt => {
-                const key = m.refName(o.value);
-                const rest = key["compiler_rt:compiler_rt/".len..];
-                const colon = std.mem.lastIndexOfScalar(u8, rest, ':').?;
-                _ = try emit.requestCompilerRt(rest[0..colon], rest[colon + 1 ..]);
+                const file, const name = Zcu.compilerRtKeyParts(m.refName(o.value));
+                _ = try emit.requestCompilerRt(file, name);
             },
             .error_names => try emit.useErrorNames(),
             .func, .nav, .analyze, .quota, .effects, .root => unreachable,

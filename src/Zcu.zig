@@ -1160,9 +1160,20 @@ pub fn queueFunc(zcu: *Zcu, func: InternPool.Index) !bool {
 }
 
 /// The stable key of compiler_rt function `name`, declared in
-/// `lib/compiler_rt/<file>`: the key of its function unit (its symbol).
+/// `lib/compiler_rt/<file>`, or with an empty `file_name` in
+/// `lib/compiler_rt.zig`, the module's root: the key of its function unit
+/// (its symbol), whose file part is empty for the root (`fileKey`).
 pub fn compilerRtKey(buf: *[128]u8, file_name: []const u8, name: []const u8) []const u8 {
+    if (file_name.len == 0) return std.fmt.bufPrint(buf, "compiler_rt::{s}", .{name}) catch unreachable;
     return std.fmt.bufPrint(buf, "compiler_rt:compiler_rt/{s}:{s}", .{ file_name, name }) catch unreachable;
+}
+
+/// The file and declaration names `compilerRtKey` made `key` from.
+pub fn compilerRtKeyParts(key: []const u8) struct { []const u8, []const u8 } {
+    const rest = key["compiler_rt:".len..];
+    const colon = std.mem.lastIndexOfScalar(u8, rest, ':').?;
+    const path = rest[0..colon];
+    return .{ if (std.mem.startsWith(u8, path, "compiler_rt/")) path["compiler_rt/".len..] else "", rest[colon + 1 ..] };
 }
 
 /// Requests compiler_rt function `key` (`compilerRtKey`) and returns the
@@ -1179,14 +1190,24 @@ pub fn requestCompilerRtKey(zcu: *Zcu, key: []const u8) ![]const u8 {
 
 pub const RtExport = struct { file: []const u8, decl: []const u8 };
 
-/// The compiler_rt function exporting libm symbol `name` (`sinf`,
-/// `__floorh`, `sqrtf128`, ...), or null if compiler_rt does not export
-/// `name`. For `@extern` references, which upstream resolves against the
-/// compiler_rt it links.
+/// The compiler_rt function exporting libm or libc symbol `name` (`sinf`,
+/// `__floorh`, `sqrtf128`, `memcpy`, ...), or null if compiler_rt does not
+/// export `name`. For `@extern` references, which upstream resolves
+/// against the compiler_rt it links. The memory functions are the ones
+/// upstream exports in Debug builds (not `.small`).
 pub fn compilerRtExport(name: []const u8) ?RtExport {
     const map = comptime blk: {
         const ops = .{ "sqrt", "sin", "cos", "tan", "exp", "exp2", "log", "log2", "log10", "fabs", "floor", "ceil", "round", "trunc", "fma", "fmin", "fmax", "fmod" };
-        var kvs: [ops.len * 5]struct { []const u8, RtExport } = undefined;
+        const libc = [_]struct { []const u8, RtExport }{
+            .{ "memcpy", .{ .file = "memcpy.zig", .decl = "memcpyFast" } },
+            .{ "memmove", .{ .file = "memmove.zig", .decl = "memmoveFast" } },
+            .{ "memset", .{ .file = "", .decl = "fastMemset" } },
+            .{ "memcmp", .{ .file = "", .decl = "memcmp" } },
+            .{ "bcmp", .{ .file = "", .decl = "bcmp" } },
+            .{ "strlen", .{ .file = "", .decl = "strlen" } },
+        };
+        var kvs: [ops.len * 5 + libc.len]struct { []const u8, RtExport } = undefined;
+        kvs[ops.len * 5 ..].* = libc;
         for (ops, 0..) |op, i| {
             const f = if (std.mem.eql(u8, op, "floor") or std.mem.eql(u8, op, "ceil")) "floor_ceil.zig" else op ++ ".zig";
             kvs[i * 5 ..][0..5].* = .{
@@ -1222,10 +1243,11 @@ fn resolveCompilerRt(zcu: *Zcu, key: []const u8) !void {
     const colon = std.mem.lastIndexOfScalar(u8, rest, ':').?;
     const name = rest[colon + 1 ..];
     // compiler_rt's files load on demand, like its analysis.
-    const file_index = zcu.fe.loadFile(.compiler_rt, rest[0..colon]) catch |err| switch (err) {
+    const sub_path = if (colon == 0) zcu.fe.module(.compiler_rt).root_file else rest[0..colon];
+    const file_index = zcu.fe.loadFile(.compiler_rt, sub_path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return zcu.addError(0, no_span, "unable to load compiler_rt file '{s}': {t}", .{ rest[0..colon], err }),
-    } orelse return zcu.addError(0, no_span, "compiler_rt file '{s}' not found", .{rest[0..colon]});
+        else => return zcu.addError(0, no_span, "unable to load compiler_rt file '{s}': {t}", .{ sub_path, err }),
+    } orelse return zcu.addError(0, no_span, "compiler_rt file '{s}' not found", .{sub_path});
     try zcu.file_root_types.appendNTimes(zcu.gpa, .none, zcu.fe.files.items.len - zcu.file_root_types.items.len);
     const ty = try zcu.fileRootType(@backingInt(file_index));
     const ns = zcu.ip.structInfo(ty).namespace;
