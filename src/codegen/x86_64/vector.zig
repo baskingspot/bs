@@ -190,7 +190,7 @@ pub fn deferOperands(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index)
             const data = c.ir.instructions.items(.data)[ii];
             switch (tags[ii]) {
                 .load => {
-                    c.deferLoad(ref, t.before, t.at);
+                    c.deferLoad(ref, t.before, &.{}, t.at);
                     // No register either.
                     if (c.homes[ii] == .deferred) live.items(.reg)[ii] = Ssa.no_reg;
                 },
@@ -201,7 +201,7 @@ pub fn deferOperands(cg: *CodeGen, inst: Inst.Index, before: []const Inst.Index)
                     // its own position, which a view would move here.
                     if (c.homes[@backingInt(l)] != .none) return;
                     if (Type.abiSize(ip, c.typeOf(data.ty_op.operand)) < Type.abiSize(ip, data.ty_op.ty)) return;
-                    c.deferLoad(data.ty_op.operand, t.before, t.at);
+                    c.deferLoad(data.ty_op.operand, t.before, &.{}, t.at);
                     if (c.homes[@backingInt(l)] != .deferred) return;
                     c.homes[ii] = .view;
                     live.items(.reg)[ii] = Ssa.no_reg;
