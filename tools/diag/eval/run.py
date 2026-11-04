@@ -6,7 +6,10 @@ tests what agents write: Zig against an older std (0.11 to 0.16 APIs in
 0.17 code), misspelled names, a missing `try`, and the like. It takes
 the seed programs in seeds/ (correct 0.17 code that zap and upstream
 compile), rewrites each one into mistakes by the rules in rules.py, and
-compiles every mistake with zap and with upstream zig.
+compiles every mistake with zap and with upstream zig. A seed named
+`build_*.zig` is a build.zig instead, configured with `build -l` next to
+a hello-world src/main.zig, so build scripts written against an older
+std.Build are scored through the `zap build` path.
 
 A case whose rewrite upstream still accepts is not a mistake and is
 dropped. For each remaining case it checks, for zap and for upstream:
@@ -40,6 +43,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +62,24 @@ def run(cmd, cwd, env=None):
     return p.returncode, p.stdout + p.stderr
 
 
+# A seed named `build_*` is a build.zig, configured (`build -l`) next to
+# this src/main.zig; the others are a main.zig, compiled.
+BUILD_MAIN = 'const std = @import("std");\npub fn main() void {\n    std.debug.print("hi\\n", .{});\n}\n'
+
+
+def seed_file(seed):
+    return "build.zig" if seed.startswith("build_") else "main.zig"
+
+
+def write_case(d, seed, src):
+    with open(os.path.join(d, seed_file(seed)), "w") as f:
+        f.write(src)
+    if seed_file(seed) == "build.zig":
+        os.makedirs(os.path.join(d, "src"), exist_ok=True)
+        with open(os.path.join(d, "src", "main.zig"), "w") as f:
+            f.write(BUILD_MAIN)
+
+
 class Compilers:
     def __init__(self, zap, zig, cache):
         self.zap = zap
@@ -65,8 +87,12 @@ class Compilers:
         self.cache = cache
         self.env = dict(os.environ, ZAP_CACHE="off")
 
-    def zap_json(self, d):
-        _, out = run([self.zap, "build-exe", "-fno-emit-bin", "--error-format=json", "main.zig"], d, self.env)
+    def zap_json(self, d, fname):
+        if fname == "build.zig":
+            # `zap build` renders upstream's text, with zap's facts as notes.
+            _, out = self.zap_text(d, fname)
+            return parse_bundle_text(out, d)
+        _, out = run([self.zap, "build-exe", "-fno-emit-bin", "--error-format=json", fname], d, self.env)
         diags = []
         for line in out.splitlines():
             if line.startswith("{"):
@@ -75,16 +101,88 @@ class Compilers:
                     diags.append(obj)
         return diags
 
-    def zap_text(self, d):
-        return run([self.zap, "build-exe", "-fno-emit-bin", "main.zig"], d, self.env)
+    def zap_text(self, d, fname):
+        if fname == "build.zig":
+            return run([self.zap, "build", "-l"], d, self.env)
+        return run([self.zap, "build-exe", "-fno-emit-bin", fname], d, self.env)
 
-    def upstream(self, d):
-        return run([self.zig, "build-exe", "-fno-emit-bin", "--cache-dir", self.cache, "main.zig"], d)
+    def upstream(self, d, fname):
+        if fname == "build.zig":
+            return run([self.zig, "build", "-l", "--cache-dir", os.path.join(d, ".zig-cache")], d)
+        return run([self.zig, "build-exe", "-fno-emit-bin", "--cache-dir", self.cache, fname], d)
 
 
-def upstream_errors(text):
+def zig_unescape(text):
+    """The bytes of the inside of a Zig string literal."""
+    out, i = bytearray(), 0
+    b = text.encode()
+    while i < len(b):
+        c = b[i]
+        if c != 0x5C:
+            out.append(c)
+            i += 1
+            continue
+        e = chr(b[i + 1])
+        if e == "x":
+            out.append(int(b[i + 2:i + 4], 16))
+            i += 4
+        elif e == "u":
+            end = b.index(b"}", i)
+            out += chr(int(b[i + 3:end], 16)).encode()
+            i = end + 1
+        else:
+            out += {"n": b"\n", "r": b"\r", "t": b"\t"}.get(e, e.encode())
+            i += 2
+    return out.decode()
+
+
+def parse_bundle_text(text, d):
+    """zap's diagnostics as `zap_json` gives them, from the upstream-style
+    text of `zap build`: errors and notes with a location, and the
+    candidates, hint and fixes it renders as notes without one. Fix spans
+    are byte offsets, found from line and column in the edited file."""
+    diags = []
+    fix_re = re.compile(r'^note: (fix\??) (\S+?):(\d+):(\d+)-(\d+):(\d+): "(.*)"$')
+    for line in text.splitlines():
+        m = re.match(r"^(\S+?):(\d+):(\d+): (error|note): (.*)$", line)
+        if m:
+            path, ln, _, kind, msg = m.groups()
+            if kind == "error":
+                msg = re.sub(r"^\[[a-z-]+\] ", "", msg)
+                diags.append({"file": path, "line": int(ln), "msg": msg, "notes": [], "fixes": []})
+            elif diags:
+                diags[-1]["notes"].append({"file": path, "line": int(ln), "msg": msg})
+            continue
+        if not diags:
+            continue
+        if line.startswith("note: candidates: "):
+            diags[-1]["candidates"] = line[len("note: candidates: "):].split(", ")
+            continue
+        m = fix_re.match(line)
+        if m:
+            kind, path, l1, c1, l2, c2, body = m.groups()
+            try:
+                src = open(os.path.join(d, path), "rb").read()
+            except OSError:
+                continue
+            starts = [0] + [i + 1 for i, ch in enumerate(src) if ch == 0x0A]
+            span = [starts[int(l1) - 1] + int(c1) - 1, starts[int(l2) - 1] + int(c2) - 1]
+            edit = {"file": path, "span": span, "text": zig_unescape(body)}
+            fixes = diags[-1]["fixes"]
+            # Consecutive edits of one kind belong to one fix.
+            if fixes and fixes[-1]["applicability"] == ("exact" if kind == "fix" else "maybe") and fixes[-1].get("_open"):
+                fixes[-1]["edits"].append(edit)
+            else:
+                fixes.append({"applicability": "exact" if kind == "fix" else "maybe", "edits": [edit], "_open": True})
+            continue
+        for f in diags[-1]["fixes"]:
+            f.pop("_open", None)
+    return diags
+
+
+def upstream_errors(text, fname="main.zig"):
     """(line, msg, note lines) of each error in upstream's output, with
-    lines in main.zig only (0 elsewhere)."""
+    lines in `fname` only (0 elsewhere)."""
     out = []
     for line in text.splitlines():
         for kind in (": error: ", ": note: "):
@@ -94,7 +192,7 @@ def upstream_errors(text):
         else:
             continue
         path, ln, _ = head.rsplit(":", 2) if head.count(":") >= 2 else (head, "0", "0")
-        ln = int(ln) if path.endswith("main.zig") and ln.isdigit() else 0
+        ln = int(ln) if path.endswith(fname) and ln.isdigit() else 0
         if kind == ": error: ":
             out.append((ln, msg, []))
         elif out:
@@ -131,40 +229,40 @@ def norm(src):
 def score(case, seed_src, cc, show):
     d = tempfile.mkdtemp(prefix="zap-eval-")
     try:
-        path = os.path.join(d, "main.zig")
-        with open(path, "w") as f:
-            f.write(case.src)
-        up_code, up_text = cc.upstream(d)
+        fname = seed_file(case.seed)
+        path = os.path.join(d, fname)
+        write_case(d, case.seed, case.src)
+        up_code, up_text = cc.upstream(d, fname)
         if up_code == 0:
             return {"id": case.id, "dropped": "upstream accepts"}
-        zap_code, zap_text = cc.zap_text(d)
+        zap_code, zap_text = cc.zap_text(d, fname)
         r = {"id": case.id, "rule": case.rule.id, "category": case.rule.category, "since": case.rule.since,
              "seed": case.seed, "lines": case.lines}
         if zap_code == 0:
             r["accept"] = "zap accepts"
             return r
-        diags = cc.zap_json(d)
-        main_diags = [x for x in diags if x.get("file") == "main.zig"]
-        up_errs = upstream_errors(up_text)
+        diags = cc.zap_json(d, fname)
+        main_diags = [x for x in diags if x.get("file") == fname]
+        up_errs = upstream_errors(up_text, fname)
         lines = set(case.lines)
         # The first error points at a changed line, itself or by a note.
-        r["zap_loc"] = bool(diags) and any(x.get("file") == "main.zig" and x.get("line") in lines for x in [diags[0]] + diags[0].get("notes", []))
+        r["zap_loc"] = bool(diags) and any(x.get("file") == fname and x.get("line") in lines for x in [diags[0]] + diags[0].get("notes", []))
         r["up_loc"] = bool(up_errs) and any(ln in lines for ln in [up_errs[0][0]] + up_errs[0][2])
         r["zap_facts"] = has_facts(zap_text, case.facts)
         r["up_facts"] = has_facts(up_text, case.facts)
         r["zap_first"] = (f"{diags[0].get('file')}:{diags[0].get('line')}: {diags[0]['msg']}" if diags else "")
-        r["up_first"] = (f"main.zig:{up_errs[0][0]}: {up_errs[0][1]}" if up_errs else up_text.strip().split("\n")[0])
+        r["up_first"] = (f"{fname}:{up_errs[0][0]}: {up_errs[0][1]}" if up_errs else up_text.strip().split("\n")[0])
         if case.answer:
             r["cand"] = any(case.answer in x.get("candidates", []) for x in diags)
         # A fix of an error on a changed line, or one that edits a changed
         # line (a `var` at the declaration for an error at the use).
-        # An error raised in std can carry a fix in main.zig.
-        edit_lines = lambda x: {case.src.count("\n", 0, e["span"][0]) + 1 for f in x.get("fixes", []) for e in f["edits"] if e.get("file") == "main.zig"}
+        # An error raised in std can carry a fix in the case's file.
+        edit_lines = lambda x: {case.src.count("\n", 0, e["span"][0]) + 1 for f in x.get("fixes", []) for e in f["edits"] if e.get("file") == fname}
         at = [x for x in diags if x.get("fixes") and ((x in main_diags and x.get("line") in lines) or edit_lines(x) & lines)]
         if at:
             src = case.src
             for _ in range(5):
-                fixes = [f for x in cc.zap_json(d) for f in x.get("fixes", []) if f["applicability"] != "placeholder" and all(e.get("file") == "main.zig" for e in f["edits"])]
+                fixes = [f for x in cc.zap_json(d, fname) for f in x.get("fixes", []) if f["applicability"] != "placeholder" and all(e.get("file") == fname for e in f["edits"])]
                 if not fixes:
                     break
                 src = apply_fixes(src, fixes)
@@ -173,11 +271,11 @@ def score(case, seed_src, cc, show):
             if norm(src) == norm(seed_src):
                 r["fix"] = "restored"
             else:
-                code, text = cc.upstream(d)
+                code, text = cc.upstream(d, fname)
                 edited = set(rules.changed_lines(case.src, src))
                 if code == 0:
                     r["fix"] = "compiles"
-                elif any(ln in edited for ln, _, _ in upstream_errors(text)):
+                elif any(ln in edited for ln, _, _ in upstream_errors(text, fname)):
                     # An error is left or made where a fix edited.
                     r["fix"] = "wrong"
                 else:
@@ -270,9 +368,8 @@ def main():
         # The seeds themselves must compile with both.
         for name, src in seeds.items():
             d = tempfile.mkdtemp(prefix="zap-eval-seed-")
-            with open(os.path.join(d, "main.zig"), "w") as f:
-                f.write(src)
-            for who, (code, out) in (("upstream", cc.upstream(d)), ("zap", cc.zap_text(d))):
+            write_case(d, name, src)
+            for who, (code, out) in (("upstream", cc.upstream(d, seed_file(name))), ("zap", cc.zap_text(d, seed_file(name)))):
                 if code != 0:
                     sys.exit(f"seed {name} does not compile with {who}:\n{out}")
             shutil.rmtree(d)
