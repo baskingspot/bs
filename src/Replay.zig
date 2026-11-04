@@ -638,7 +638,7 @@ const Ref = union(enum) {
 /// functions: other units' data is lowered again by Emit, which makes them.
 fn resolveRefs(r: *Replay, g: Green, is_func: bool) !?[]Ref {
     var out: std.ArrayList(Ref) = .empty;
-    errdefer out.deinit(r.gpa);
+    defer out.deinit(r.gpa);
     for (r.m.nodeRefs(g.node)) |ref| switch (ref.kind) {
         .func => {
             const dep = try r.dependee(ref.value, .func) orelse return null;
