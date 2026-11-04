@@ -490,10 +490,12 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
         };
         for (o.syms[1..], 1..) |sym, s_index| {
             const ty = sym.st_type();
-            if (ty != elf.STT_FUNC and ty != elf.STT_OBJECT and ty != elf.STT_TLS) continue;
+            // Assembly labels are STT_NOTYPE; the assembler's own `.L`
+            // labels stay out, as upstream's.
+            if (ty != elf.STT_FUNC and ty != elf.STT_OBJECT and ty != elf.STT_TLS and ty != elf.STT_NOTYPE) continue;
             if (sym.st_shndx >= o.shdrs.len or !c.whole[sym.st_shndx] or c.names[sym.st_shndx] == s_index) continue;
             const name = o.symName(sym);
-            if (name.len == 0) continue;
+            if (name.len == 0 or std.mem.startsWith(u8, name, ".L")) continue;
             try symbols.append(arena, .{ .name = name, .atom = sectionKey(o, sym.st_shndx), .offset = sym.st_value, .size = sym.st_size });
         }
     }
