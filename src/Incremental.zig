@@ -2193,6 +2193,10 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
     defer gpa.free(names_of);
     try encodeNames(r, rp, &name_words, names_of);
 
+    // Which nodes a walk from the roots reaches now, which also takes the
+    // assumed nodes no longer reached out of the walk's.
+    var reached = try inc.reachedNow(rp, nodes, final, write, node_refs.items, ref_starts, n_new);
+    defer reached.deinit(gpa);
     // Which nodes are live now: those the walk reached, and those written
     // with what they depend on.
     var live = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev + n_new);
@@ -2205,6 +2209,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         live.set(f);
         for (n.deps) |e| live.set(final[Manifest.Edge.nodeOf(e)]);
     };
+    if (inc.check) try inc.checkLiveReach(rp, nodes, final, write, node_refs.items, ref_starts, &live, &reached);
     // The link's inputs must not change: the symbols it resolves outside
     // the atoms, and the error name table.
     try inc.checkLinkInputs(rp, &live, nodes, final, write, node_refs.items, ref_starts, &d);
@@ -2261,7 +2266,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
             .result = result_words.items[res.result[0]..][0..res.result[1]],
             .subject = result_words.items[res.subject[0]..][0..res.subject[1]],
             .names = name_words.items[names_of[ni][0]..][0..names_of[ni][1]],
-            .flags = .{ .unlinked = n.atoms.len != 0 and !live.isSet(f) },
+            .flags = .{ .unlinked = n.atoms.len != 0 and !live.isSet(f), .reached = reached.isSet(f) },
         };
         if (f < n_prev) try d.update(f, init) else _ = try d.addNode(init);
         n_written += 1;
@@ -2281,6 +2286,7 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         const old = m.flags(i);
         var flags = old;
         flags.unlinked = m.atoms(i).len != 0 and !live.isSet(i);
+        flags.reached = reached.isSet(i);
         if (rp.state[i] != .unknown or in_graph.isSet(i)) {
             flags.stale = false;
         } else if (rp.outdated.isSet(i) and !rp.dead.isSet(i)) flags.stale = true;
@@ -3249,7 +3255,7 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             .names = name_words.items[names_of[ni][0]..][0..names_of[ni][1]],
         });
     }
-    if (inc.check and !checkReach(gpa, r, root_nodes, &b)) inc.check_failed.store(true, .monotonic);
+    if (!try markReached(gpa, r, root_nodes, &b, inc.check)) inc.check_failed.store(true, .monotonic);
     if (inc.verify == .full and !try inc.verifyNodes(r, &b, emit, debug_of)) inc.check_failed.store(true, .monotonic);
     // Copied into the manifest.
     g.freeTables();
@@ -3830,36 +3836,261 @@ pub fn reachNext(deps: []const u32, refs: []const Manifest.Ref, next: *std.Array
         const edge: Manifest.Edge = @bitCast(e);
         if (edge.kind == .plain) try next.append(gpa, edge.node);
     }
-    for (refs) |ref| switch (ref.kind) {
-        .func, .nav, .effects, .root, .defaults => try next.append(gpa, ref.value),
-        else => {},
-    };
+    for (refs) |ref| if (Manifest.reachRef(ref.kind)) try next.append(gpa, ref.value);
 }
 
 /// `BS_CACHE_CHECK`: that `reach` from the root files' namespaces and the
 /// link's own atoms reaches exactly the nodes with atoms, which is what an
 /// edit build links without loading the units that did not change.
-fn checkReach(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *const Manifest.Builder) bool {
+/// The edges a walk follows (`reachNext`) out of node `x` of the graph a
+/// lazy build leaves: a written node's new ones (`written_at`: its index
+/// in `nodes`, or none), a dead node's none, and any other's recorded
+/// ones; appended to `next` as manifest indices.
+const NewGraph = struct {
+    m: *const Manifest,
+    rp: *const Replay,
+    nodes: []const Node,
+    final: []const u32,
+    node_refs: []const NodeRef,
+    ref_starts: []const u32,
+    written_at: []const u32,
+
+    const none = std.math.maxInt(u32);
+
+    fn init(gpa: Allocator, rp: *const Replay, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, n_all: usize) !NewGraph {
+        const written_at = try gpa.alloc(u32, n_all);
+        @memset(written_at, none);
+        for (final, write, 0..) |f, w, ni| if (w) {
+            written_at[f] = @intCast(ni);
+        };
+        return .{ .m = rp.m, .rp = rp, .nodes = nodes, .final = final, .node_refs = node_refs, .ref_starts = ref_starts, .written_at = written_at };
+    }
+
+    fn deinit(g: *NewGraph, gpa: Allocator) void {
+        gpa.free(g.written_at);
+    }
+
+    fn next(g: *const NewGraph, gpa: Allocator, x: u32, out: *std.ArrayList(u32)) !void {
+        out.clearRetainingCapacity();
+        const ni = g.written_at[x];
+        if (ni != none) {
+            for (g.nodes[ni].deps) |e| {
+                const edge: Manifest.Edge = @bitCast(e);
+                if (edge.kind == .plain) try out.append(gpa, g.final[edge.node]);
+            }
+            for (g.node_refs[g.ref_starts[ni]..g.ref_starts[ni + 1]]) |nr| if (Manifest.reachRef(nr.ref.kind)) try out.append(gpa, g.final[nr.ref.value]);
+        } else if (x < g.m.nodeCount() and !g.rp.dead.isSet(x)) {
+            try reachNext(g.m.deps(x), g.m.nodeRefs(x), out, gpa);
+        }
+    }
+
+    fn isDead(g: *const NewGraph, x: u32) bool {
+        return x < g.m.nodeCount() and g.written_at[x] == none and g.rp.dead.isSet(x);
+    }
+};
+
+/// The nodes a walk from the roots reaches in the graph a lazy build
+/// leaves (`NewGraph`), as the `reached` flags record them: those the
+/// walk visited, and what the nodes it left to analysis and the nodes
+/// written reach now. Assumed nodes (`Replay.assumeReached`) that the
+/// walked ones no longer reach are taken out, of `Replay.visited` too: the
+/// candidates are those the walked nodes reached before but not now, and
+/// what they reach among the assumed; a candidate stays if it is reached
+/// now or another assumed node that stays reaches it. Falls back if one
+/// that goes offered type names, or named a node the walk visited (it may
+/// have been visited for it).
+fn reachedNow(inc: *Incremental, rp: *Replay, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, n_new: u32) !std.DynamicBitSetUnmanaged {
+    const gpa = inc.gpa;
+    const m = rp.m;
+    const n_prev = m.nodeCount();
+    const n_all = n_prev + n_new;
+    var g: NewGraph = try .init(gpa, rp, nodes, final, write, node_refs, ref_starts, n_all);
+    defer g.deinit(gpa);
+    var reached = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
+    errdefer reached.deinit(gpa);
+    {
+        var it = rp.visited.iterator(.{});
+        while (it.next()) |i| if (!g.isDead(@intCast(i))) reached.set(i);
+    }
+    var stack: std.ArrayList(u32) = .empty;
+    defer stack.deinit(gpa);
+    var next: std.ArrayList(u32) = .empty;
+    defer next.deinit(gpa);
+    // What the walk left to analysis, and the written nodes it visited,
+    // reach over their edges as they are now.
+    for (rp.unvisited.items) |x| if (!g.isDead(x) and !reached.isSet(x)) {
+        reached.set(x);
+        try stack.append(gpa, x);
+    };
+    for (final, write) |f, w| if (w and reached.isSet(f)) try stack.append(gpa, f);
+    while (stack.pop()) |x| {
+        try g.next(gpa, x, &next);
+        for (next.items) |t| if (!reached.isSet(t) and !g.isDead(t)) {
+            reached.set(t);
+            try stack.append(gpa, t);
+        };
+    }
+    if (rp.assumed.bit_length == 0) return reached;
+    const assumed = &rp.assumed;
+    // The assumed nodes the walked ones reach now, and those they reached
+    // before (the cone's recorded edges).
+    var entered = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    defer entered.deinit(gpa);
+    var walked = try reached.clone(gpa);
+    defer walked.deinit(gpa);
+    {
+        var it = assumed.iterator(.{});
+        while (it.next()) |i| walked.unset(i);
+        var wit = walked.iterator(.{});
+        while (wit.next()) |x| {
+            try g.next(gpa, @intCast(x), &next);
+            for (next.items) |t| if (t < n_prev and assumed.isSet(t)) entered.set(t);
+        }
+    }
+    var lost: std.ArrayList(u32) = .empty;
+    defer lost.deinit(gpa);
+    {
+        var it = rp.cone.iterator(.{});
+        while (it.next()) |x| {
+            next.clearRetainingCapacity();
+            try reachNext(m.deps(@intCast(x)), m.nodeRefs(@intCast(x)), &next, gpa);
+            for (next.items) |t| if (t < n_prev and assumed.isSet(t) and !entered.isSet(t)) try lost.append(gpa, t);
+        }
+    }
+    if (lost.items.len == 0) return reached;
+    // The candidates: what the lost entries reach among the assumed.
+    var cand = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+    defer cand.deinit(gpa);
+    for (lost.items) |t| if (!cand.isSet(t)) {
+        cand.set(t);
+        try stack.append(gpa, t);
+    };
+    var cands: std.ArrayList(u32) = .empty;
+    defer cands.deinit(gpa);
+    while (stack.pop()) |x| {
+        try cands.append(gpa, x);
+        if (g.written_at[x] != NewGraph.none) return inc.lazyFallback("a node taken as reached was written", .{});
+        next.clearRetainingCapacity();
+        try reachNext(m.deps(x), m.nodeRefs(x), &next, gpa);
+        for (next.items) |t| if (assumed.isSet(t) and !cand.isSet(t)) {
+            cand.set(t);
+            try stack.append(gpa, t);
+        };
+    }
+    // Those still reached: entered now, or named by an assumed node that
+    // is not a candidate (reverse edges are a superset: each is checked),
+    // and what they reach among the candidates.
+    for (cands.items) |x| {
+        const keep = entered.isSet(x) or keep: {
+            for ([_][2][]const u32{ m.rdeps(x), m.rrefs(x) }) |parts| for (parts) |part| for (part) |p| {
+                if (!assumed.isSet(p) or cand.isSet(p)) continue;
+                next.clearRetainingCapacity();
+                try reachNext(m.deps(p), m.nodeRefs(p), &next, gpa);
+                if (std.mem.indexOfScalar(u32, next.items, x) != null) break :keep true;
+            };
+            break :keep false;
+        };
+        if (keep) try stack.append(gpa, x);
+    }
+    while (stack.pop()) |x| {
+        if (!cand.isSet(x)) continue;
+        cand.unset(x);
+        next.clearRetainingCapacity();
+        try reachNext(m.deps(x), m.nodeRefs(x), &next, gpa);
+        for (next.items) |t| if (cand.isSet(t)) try stack.append(gpa, t);
+    }
+    // The rest are no longer reached.
+    var it = cand.iterator(.{});
+    while (it.next()) |x| {
+        if (m.typeNames(@intCast(x)).len != 0) return inc.lazyFallback("a type's name came from a unit no longer reached", .{});
+        // The walk entered the cone from it (`Replay.assumeReached`).
+        next.clearRetainingCapacity();
+        try reachNext(m.deps(@intCast(x)), m.nodeRefs(@intCast(x)), &next, gpa);
+        for (next.items) |t| if (!assumed.isSet(t) and rp.visited.isSet(t))
+            return inc.lazyFallback("a node no longer reached named one the walk went to", .{});
+        reached.unset(x);
+        rp.visited.unset(x);
+    }
+    return reached;
+}
+
+/// `BS_CACHE_CHECK` for a lazy build: the `reached` flags it records,
+/// and the nodes with atoms it links (`live`), against a full walk of the
+/// graph it leaves (`NewGraph`) from the roots.
+fn checkLiveReach(inc: *Incremental, rp: *const Replay, nodes: []const Node, final: []const u32, write: []const bool, node_refs: []const NodeRef, ref_starts: []const u32, live: *const std.DynamicBitSetUnmanaged, reached: *const std.DynamicBitSetUnmanaged) !void {
+    const gpa = inc.gpa;
+    const m = rp.m;
+    const n_all = live.bit_length;
+    var g: NewGraph = try .init(gpa, rp, nodes, final, write, node_refs, ref_starts, n_all);
+    defer g.deinit(gpa);
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_all);
+    defer seen.deinit(gpa);
+    var stack: std.ArrayList(u32) = .empty;
+    defer stack.deinit(gpa);
+    var next: std.ArrayList(u32) = .empty;
+    defer next.deinit(gpa);
+    for (rp.roots.items) |n| if (!seen.isSet(n)) {
+        seen.set(n);
+        try stack.append(gpa, n);
+    };
+    while (stack.pop()) |x| {
+        try g.next(gpa, x, &next);
+        for (next.items) |t| if (!seen.isSet(t) and !g.isDead(t)) {
+            seen.set(t);
+            try stack.append(gpa, t);
+        };
+    }
+    var differ: [4]usize = @splat(0);
+    for (0..n_all) |i_usize| {
+        const i: u32 = @intCast(i_usize);
+        const ni = g.written_at[i];
+        const has_atoms = if (ni != NewGraph.none) nodes[ni].atoms.len != 0 else i < m.nodeCount() and m.atoms(i).len != 0;
+        const full = seen.isSet(i);
+        for ([_]bool{ false, true }) |linked| {
+            if (linked and !has_atoms) continue;
+            const ours = if (linked) live.isSet(i) else reached.isSet(i);
+            if (ours == full) continue;
+            const k = @as(usize, @intFromBool(linked)) * 2 + @intFromBool(full);
+            differ[k] += 1;
+            if (differ[k] > 5) continue;
+            const tag: Tag = std.enums.fromInt(Tag, if (ni != NewGraph.none) @backingInt(nodes[ni].tag) else m.node(i).tag) orelse .link;
+            std.debug.print("cache check: {t} node {d} is {s} {s} but a full walk {s} it ({s}, {t})\n", .{
+                tag,                                            i,                                               if (linked) "linked" else "flagged reached", if (ours) "" else "not", if (full) "reaches" else "does not reach",
+                if (ni != NewGraph.none) "written" else "kept", if (i < rp.state.len) rp.state[i] else .unknown,
+            });
+        }
+    }
+    std.debug.print("cache check: lazy reach: flagged reached {d} extra, {d} missed; linked {d} extra, {d} missed\n", .{ differ[0], differ[1], differ[2], differ[3] });
+    if (differ[0] + differ[1] + differ[2] + differ[3] != 0) inc.check_failed.store(true, .monotonic);
+}
+
+/// Sets the `reached` flag of the nodes a walk from the roots reaches.
+/// With `check` (`BS_CACHE_CHECK`), also reports nodes with atoms that
+/// it does not reach, and functions without atoms that it does, and
+/// returns whether every node with atoms is reached.
+fn markReached(gpa: Allocator, r: *const Recorder, roots: []const u32, b: *Manifest.Builder, check: bool) !bool {
     const nodes = r.nodes.items;
-    var seen = std.DynamicBitSetUnmanaged.initEmpty(gpa, nodes.len) catch return true;
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(gpa, nodes.len);
     defer seen.deinit(gpa);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
     var next: std.ArrayList(u32) = .empty;
     defer next.deinit(gpa);
     const link = r.map.get(cache.hash(2, &.{@backingInt(Tag.link)}));
-    for (roots) |n| stack.append(gpa, n) catch return true;
-    if (link) |n| stack.append(gpa, n) catch return true;
+    try stack.appendSlice(gpa, roots);
+    if (link) |n| try stack.append(gpa, n);
     for (stack.items) |n| seen.set(n);
     while (stack.pop()) |n| {
         next.clearRetainingCapacity();
         const range = b.ref_ranges.items[n];
-        reachNext(nodes[n].deps, b.refs.items[range[0]..][0..range[1]], &next, gpa) catch return true;
+        try reachNext(nodes[n].deps, b.refs.items[range[0]..][0..range[1]], &next, gpa);
         for (next.items) |d| if (!seen.isSet(d)) {
             seen.set(d);
-            stack.append(gpa, d) catch return true;
+            try stack.append(gpa, d);
         };
     }
+    for (b.nodes.items, 0..) |*n, i| n.flags.reached = seen.isSet(i);
+    if (!check) return true;
     var with_atoms: usize = 0;
     var missed: usize = 0;
     var extra: usize = 0;

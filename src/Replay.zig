@@ -96,6 +96,19 @@ eager_why: ?[]const u8 = null,
 /// atoms the build links.
 visited: std.DynamicBitSetUnmanaged = .{},
 walk_stack: std.ArrayList(u32) = .empty,
+/// Where the walk started (`startWalk`): the root files' namespaces and
+/// the link's node.
+roots: std.ArrayList(u32) = .empty,
+/// Nodes the last build reached that the walk takes as reached without
+/// walking them (`assumeReached`), and the reached nodes it walks; empty
+/// if it walks everything.
+assumed: std.DynamicBitSetUnmanaged = .{},
+cone: std.DynamicBitSetUnmanaged = .{},
+/// The cone's nodes that assumed nodes name, which `startWalk` visits.
+entries: std.ArrayList(u32) = .empty,
+/// Nodes the walk reached and left to analysis (`walkNode`), which may
+/// not be visited again.
+unvisited: std.ArrayList(u32) = .empty,
 /// Green units whose results are in the Zcu.
 loaded: std.DynamicBitSetUnmanaged = .{},
 /// Declarations whose data a live node refers to (`walk`), which a red
@@ -160,6 +173,8 @@ pub const Stats = struct {
     red_changed: u32 = 0,
     new: u32 = 0,
     misses: u32 = 0,
+    /// Nodes taken as reached without walking them (`assumeReached`).
+    assumed: u32 = 0,
     setup_ns: u64 = 0,
 };
 
@@ -308,8 +323,84 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
             r.eager_why = "its pack could not be made";
         }
     };
+    if (r.lazy and !donor) try r.assumeReached();
     r.stats.setup_ns = @intCast(t0.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds);
     return r;
+}
+
+/// Marks visited, without walking them, the nodes the last build reached
+/// (`Manifest.Flags.reached`) that no edit can affect (`assumed`): all but
+/// the nodes the walk must decide or walk (`cone`), which are those
+/// outdated or in a changed input, the functions whose inlined callees'
+/// lines may have moved (`walkNode`), the namespaces whose roots are in
+/// the cone, and the nodes that request compiler_rt helpers in the cone.
+/// The walk then goes only where the edits are: it starts at the cone's
+/// nodes that an assumed node names (`entries`), as if the assumed node
+/// had been walked. `Incremental.recordDelta` takes out the assumed nodes
+/// no longer reached, and falls back if one named a cone node the walk
+/// took from it. Nothing is assumed when the cone is most of the graph.
+fn assumeReached(r: *Replay) !void {
+    const gpa = r.gpa;
+    const m = r.m;
+    const n = m.nodeCount();
+    var reached = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
+    defer reached.deinit(gpa);
+    for (0..n) |i| if (m.flags(@intCast(i)).reached) reached.set(i);
+    var cone = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
+    defer cone.deinit(gpa);
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(gpa);
+    for (0..n) |i_usize| {
+        const i: u32 = @intCast(i_usize);
+        if (!reached.isSet(i) or !(r.outdated.isSet(i) or r.inChangedInput(i))) continue;
+        cone.set(i);
+        try list.append(gpa, i);
+    }
+    // What the walk must also walk for them, in turn for what it adds.
+    var k: usize = 0;
+    while (k < list.items.len) : (k += 1) {
+        const x = list.items[k];
+        const tag = std.enums.fromInt(Tag, m.node(x).tag) orelse continue;
+        const rt = r.inUnloadedCompilerRt(x);
+        for (m.rrefs(x)) |part| for (part) |p| {
+            if (cone.isSet(p) or !reached.isSet(p)) continue;
+            if (!rt and m.node(p).tag != @backingInt(Tag.namespace)) continue;
+            cone.set(p);
+            try list.append(gpa, p);
+        };
+        if (tag != .func and tag != .func_inline and tag != .func_body) continue;
+        for (m.rdeps(x)) |part| for (part) |p| {
+            if (cone.isSet(p) or !reached.isSet(p)) continue;
+            const ptag = m.node(p).tag;
+            const inlines = if (tag == .func) ptag == @backingInt(Tag.func_inline) or ptag == @backingInt(Tag.func_body) else ptag == @backingInt(Tag.func);
+            if (!inlines) continue;
+            cone.set(p);
+            try list.append(gpa, p);
+        };
+    }
+    if (list.items.len > reached.count() / 2) return;
+    for (list.items) |x| reached.unset(x);
+    // The cone's nodes an assumed node names: where the walk starts, and
+    // the declarations whose data an assumed node refers to.
+    var next: std.ArrayList(u32) = .empty;
+    defer next.deinit(gpa);
+    for (list.items) |x| {
+        var entered = false;
+        for ([_][2][]const u32{ m.rdeps(x), m.rrefs(x) }) |parts| for (parts) |part| for (part) |p| {
+            if (!reached.isSet(p)) continue;
+            next.clearRetainingCapacity();
+            try Incremental.reachNext(m.deps(p), m.nodeRefs(p), &next, gpa);
+            if (std.mem.indexOfScalar(u32, next.items, x) != null) entered = true;
+            for (m.nodeRefs(p)) |ref| if (ref.kind == .nav and ref.value == x) r.data_refs.set(x);
+        };
+        if (entered) try r.entries.append(gpa, x);
+    }
+    r.assumed = reached;
+    reached = .{};
+    r.visited.setUnion(r.assumed);
+    r.cone = cone;
+    cone = .{};
+    r.stats.assumed = @intCast(r.assumed.count());
 }
 
 /// Why a donor's build must replay eagerly, or null if it can be lazy and
@@ -328,6 +419,11 @@ pub fn destroy(r: *Replay) void {
     r.pack.close(gpa, r.io);
     r.outdated.deinit(gpa);
     r.visited.deinit(gpa);
+    r.roots.deinit(gpa);
+    r.assumed.deinit(gpa);
+    r.cone.deinit(gpa);
+    r.unvisited.deinit(gpa);
+    r.entries.deinit(gpa);
     r.walk_stack.deinit(gpa);
     r.loaded.deinit(gpa);
     r.type_names.deinit(gpa);
@@ -369,7 +465,7 @@ pub fn printStats(r: *const Replay) void {
     std.debug.print("cache: replayed {d} units ({d} functions) from the last build; analyzed {d} again ({d} changed, {d} not decodable) and {d} new; {d} inputs changed, {d} seeds reach {d} of {d} nodes; setup {d:.2} ms\n", .{
         s.loaded, s.loaded_funcs, s.red, s.red_changed, s.misses, s.new, s.changed_inputs, s.seeds, s.outdated, r.m.nodeCount(), @as(f64, @floatFromInt(s.setup_ns)) / 1e6,
     });
-    if (r.lazy) std.debug.print("cache: the walk reached {d} nodes; {d} are gone\n", .{ r.visited.count(), r.dead.count() });
+    if (r.lazy) std.debug.print("cache: the walk reached {d} nodes ({d} without walking them); {d} are gone\n", .{ r.visited.count(), s.assumed, r.dead.count() });
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,9 +1096,16 @@ pub fn startWalk(r: *Replay) !void {
         const ty = zcu.file_root_types.items[f];
         if (ty == .none) continue;
         const info = try r.keyer.dependeeInfo(.{ .namespace = zcu.ip.structInfo(ty).namespace });
-        if (r.m.find(info.key)) |n| try r.visit(n);
+        if (r.m.find(info.key)) |n| {
+            try r.roots.append(r.gpa, n);
+            try r.visit(n);
+        }
     };
-    if (r.m.find(link_key)) |n| try r.visit(n);
+    if (r.m.find(link_key)) |n| {
+        try r.roots.append(r.gpa, n);
+        try r.visit(n);
+    }
+    for (r.entries.items) |n| try r.visit(n);
 }
 
 pub fn walking(r: *const Replay) bool {
@@ -1031,6 +1134,7 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
     // analysis decides it once the file loads.
     if (r.inUnloadedCompilerRt(n) and (r.outdated.isSet(n) or r.inChangedInput(n)) and r.state[n] == .unknown) {
         r.visited.unset(n);
+        try r.unvisited.append(r.gpa, n);
         try r.rt_waiting.append(r.gpa, n);
         return;
     }
@@ -1039,12 +1143,14 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
         // and walked on from then.
         .nav_val, .type_layout, .struct_defaults => {
             r.visited.unset(n);
+            try r.unvisited.append(r.gpa, n);
             const dep = try r.dependee(n, tag) orelse return r.die(n);
             _ = r.ensure(dep);
             return;
         },
         .func => {
             r.visited.unset(n);
+            try r.unvisited.append(r.gpa, n);
             const dep = try r.dependee(n, tag) orelse return r.die(n);
             _ = try r.zcu.queueFunc(dep.func_body);
             return;
@@ -1052,6 +1158,7 @@ fn walkNode(r: *Replay, n: u32, next: *std.ArrayList(u32)) !void {
         // Its namespace's scan makes it (below), and analysis decides.
         .comptime_decl => {
             r.visited.unset(n);
+            try r.unvisited.append(r.gpa, n);
             return;
         },
         else => {},
