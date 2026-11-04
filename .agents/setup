@@ -70,6 +70,13 @@ ln -sfn "$cache/zig-$ZIG_VERSION-src" "$repo_root/upstream"
 
 "$bin_dir/zig" version
 
+# `zig build` compiles its build runner into the global cache once per
+# cache, about 85 s on a 4-vCPU orb; compiling it here keeps it out of each
+# orb's first `zig build test`. Orbs only.
+if [ "$ZIG_HOST" = x86_64-linux ]; then
+  (cd "$repo_root" && time "$bin_dir/zig" build --help >/dev/null)
+fi
+
 # monstar, a C acceptance target in tools/corpus, links the system's
 # Wayland, fontconfig, freetype, harfbuzz and xkbcommon and needs ncurses'
 # `tic`. It wants Wayland 1.25 and wayland-protocols 1.49, newer than
