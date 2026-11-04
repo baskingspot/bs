@@ -10,6 +10,7 @@ const Ir = @import("Ir.zig");
 const Emit = @import("Emit.zig");
 const inline_ir = @import("codegen/inline.zig");
 const Incremental = @import("Incremental.zig");
+const cache = @import("cache.zig");
 const Builtin = @import("Builtin.zig");
 const Archive = @import("link/Archive.zig");
 const ElfInput = @import("link/ElfInput.zig");
@@ -551,7 +552,7 @@ pub const Job = struct {
             i.verify_environ = env;
         }
         if (env.get("ZAP_CACHE_MAX_SIZE")) |v| {
-            i.max_bytes = @import("cache.zig").parseSize(v) orelse fatal("invalid ZAP_CACHE_MAX_SIZE '{s}': expected bytes, or a number and K, M, G, or T", .{v});
+            i.max_bytes = cache.parseSize(v) orelse fatal("invalid ZAP_CACHE_MAX_SIZE '{s}': expected bytes, or a number and K, M, G, or T", .{v});
         }
         return i;
     }
@@ -570,6 +571,15 @@ pub const Outcome = union(enum) {
 /// cache. `inputs`, if given, gets every source file the build read, as
 /// absolute paths separated by zero bytes.
 pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8)) !Outcome {
+    // A build the cache cannot take answers a build of the same
+    // compilation that changed nothing from its inputs record.
+    var rec: ?InputsRecord = if (inc_opt == null and out_path != null and job.opts.pic and !job.opts.c_only and !job.opts.dump_ir and
+        !std.mem.eql(u8, job.environ_map.get("ZAP_CACHE") orelse "", "off")) InputsRecord.open(init.arena.allocator(), job) else null;
+    defer if (rec) |*r| r.close(init.io);
+    if (rec) |*r| {
+        if (try r.unchanged(init.arena.allocator(), init.io, out_path.?, job.opts.command == .run, inputs)) return .{ .ok = .{ .cache_hit = true } };
+        r.forget(init.io);
+    }
     const n_inputs = if (inputs) |list| list.items.len else 0;
     // A lazy edit build whose changes the cache cannot record builds again
     // eagerly (`Incremental.finishLazy`).
@@ -586,7 +596,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     if (c_batch) |b| if (inc_opt) |i| {
         i.link_objects = try std.mem.concat(init.arena.allocator(), []const u8, &.{ job.link_objects, try CSource.objectPaths(b, init.arena.allocator()) });
     };
-    while (true) return compileReplaying(init, job, inc_opt, out_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
+    while (true) return compileReplaying(init, job, inc_opt, if (rec) |*r| r else null, out_path, prog, inputs, replay_mode, &pins, c_batch) catch |err| switch (err) {
         error.LazyFallback => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             replay_mode = "eager";
@@ -607,6 +617,178 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
         else => |e| return e,
     };
 }
+
+/// The no-change skip of a build the cache cannot take: -fPIC (also
+/// implied by -fPIE, -dynamic, and -lc on libraries), which the numbered
+/// link cannot lay out (`Job.cacheable`). After a successful build,
+/// `<compilation dir>/inputs` records every file the build read, its link
+/// inputs and its output, each with its stat and content hash; a build of
+/// the same compilation (`Incremental.compilationKey`) that finds them
+/// unchanged answers from it without compiling, as upstream's cache hit.
+/// The record keeps no Atoms: nothing of such a build reaches the store,
+/// donors or replay.
+const InputsRecord = struct {
+    dir: Io.Dir,
+    lock: Io.File,
+    /// Before the build read anything (see `racy`).
+    start: Io.Timestamp,
+
+    const file_name = "inputs";
+    const magic = "zapinp1\n";
+    /// One input, followed by its path. `reported`: the build reports it
+    /// as an input (`file_system_inputs`); link inputs are not.
+    const Entry = extern struct { inode: u64, size: u64, mtime: i64, hash: Frontend.Hash, path_len: u32, reported: u32 };
+    /// The output, followed by its path.
+    const Output = extern struct { inode: u64, size: u64, mtime: i64, path_len: u64 };
+    /// The mtime of an input whose stat proves nothing: it changed so
+    /// close to the build's start that an edit in the same timestamp tick
+    /// could follow the read. The next check hashes it.
+    const racy_mtime = std.math.minInt(i64);
+
+    fn racy(r: *const InputsRecord, stat: Io.File.Stat) bool {
+        return stat.mtime.toNanoseconds() >= r.start.toNanoseconds() - 2 * std.time.ns_per_s;
+    }
+
+    /// Opens the compilation's directory under its lock, which is held until
+    /// `close`, as `Incremental.open`. Null if it cannot: the build then
+    /// builds, as without a record.
+    fn open(arena: std.mem.Allocator, job: *const Job) ?InputsRecord {
+        const io = job.io;
+        const start = Io.Clock.real.now(io);
+        _, const key = Incremental.compilationKey(arena, io, job.compile_args, job.zig_lib_dir, job.cache_target) catch return null;
+        const local = Io.Dir.cwd().createDirPathOpen(io, job.cache_dirs.local, .{}) catch return null;
+        defer local.close(io);
+        const dir = cache.compilationDir(io, local, key) catch return null;
+        const lock = cache.lock(io, dir) catch {
+            dir.close(io);
+            return null;
+        };
+        return .{ .dir = dir, .lock = lock, .start = start };
+    }
+
+    fn close(r: *InputsRecord, io: Io) void {
+        r.lock.close(io);
+        r.dir.close(io);
+    }
+
+    /// Deletes the record before the build writes its output, so that a
+    /// build that fails halfway leaves none that matches.
+    fn forget(r: *InputsRecord, io: Io) void {
+        r.dir.deleteFile(io, file_name) catch {};
+    }
+
+    /// Whether the record matches: every input has its recorded contents
+    /// and `out_path` its recorded stat. Then appends the reported inputs
+    /// to `inputs`, and with `renew` (`zap run`, whose programs are trimmed
+    /// by mtime) renews the output's mtime.
+    fn unchanged(r: *InputsRecord, arena: std.mem.Allocator, io: Io, out_path: []const u8, renew: bool, inputs: ?*std.ArrayList(u8)) !bool {
+        const cwd = Io.Dir.cwd();
+        const bytes = r.dir.readFileAlloc(io, file_name, arena, .unlimited) catch return false;
+        if (!std.mem.startsWith(u8, bytes, magic)) return false;
+        var pos: usize = magic.len;
+        var dirty = false;
+        const n_reported = if (inputs) |list| list.items.len else 0;
+        errdefer if (inputs) |list| list.shrinkRetainingCapacity(n_reported);
+        while (true) {
+            if (bytes.len - pos < @sizeOf(Entry)) return false;
+            var e = std.mem.bytesToValue(Entry, bytes[pos..][0..@sizeOf(Entry)]);
+            // An entry with an empty path ends the inputs.
+            if (e.path_len == 0) break;
+            if (bytes.len - pos - @sizeOf(Entry) < e.path_len) return false;
+            const path = bytes[pos + @sizeOf(Entry) ..][0..e.path_len];
+            const stat = cwd.statFile(io, path, .{}) catch return false;
+            if (e.mtime == racy_mtime or stat.inode != e.inode or stat.size != e.size or stat.mtime.toNanoseconds() != e.mtime) {
+                const src = cwd.readFileAlloc(io, path, arena, .unlimited) catch return false;
+                if (!std.mem.eql(u8, &Frontend.hashSource(src), &e.hash)) return false;
+                // The same contents under a new stat: the next check
+                // trusts the new one, unless it is still too new.
+                e.inode = @intCast(stat.inode);
+                e.size = stat.size;
+                e.mtime = if (r.racy(stat)) racy_mtime else @intCast(stat.mtime.toNanoseconds());
+                @memcpy(bytes[pos..][0..@sizeOf(Entry)], std.mem.asBytes(&e));
+                dirty = true;
+            }
+            if (e.reported != 0) if (inputs) |list| try appendInput(arena, list, path);
+            pos += @sizeOf(Entry) + e.path_len;
+        }
+        pos += @sizeOf(Entry);
+        if (bytes.len - pos < @sizeOf(Output)) return false;
+        var o = std.mem.bytesToValue(Output, bytes[pos..][0..@sizeOf(Output)]);
+        if (bytes.len - pos - @sizeOf(Output) != o.path_len or !std.mem.eql(u8, bytes[pos + @sizeOf(Output) ..], out_path)) return false;
+        const stat = cwd.statFile(io, out_path, .{}) catch return false;
+        if (stat.inode != o.inode or stat.size != o.size or stat.mtime.toNanoseconds() != o.mtime) return false;
+        if (renew) {
+            cwd.setTimestampsNow(io, out_path, .{}) catch return false;
+            const renewed = cwd.statFile(io, out_path, .{}) catch return false;
+            o.mtime = @intCast(renewed.mtime.toNanoseconds());
+            @memcpy(bytes[pos..][0..@sizeOf(Output)], std.mem.asBytes(&o));
+            dirty = true;
+        }
+        // Best effort: without it, the next check hashes those inputs again.
+        if (dirty) cache.writeReplace(io, r.dir, file_name, &.{bytes}) catch {};
+        return true;
+    }
+
+    /// Records the build that just wrote `out_path` successfully: the Zig
+    /// sources `fe` loaded and the files `zcu` embedded, with the contents
+    /// the build read; the files the C sources read (`c_inputs`, separated
+    /// by zero bytes); and the link inputs. Best effort.
+    fn write(r: *const InputsRecord, arena: std.mem.Allocator, io: Io, job: *const Job, fe: *const Frontend, zcu: *const Zcu, c_inputs: []const u8, out_path: []const u8) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.appendSlice(arena, magic);
+        var path_buf: std.ArrayList(u8) = .empty;
+        for (fe.files.items) |*f| {
+            try Incremental.inputPath(arena, &path_buf, fe, f.module, f.sub_path);
+            if (!try r.add(arena, io, &buf, path_buf.items, f.content_hash, true)) return;
+        }
+        for (zcu.embed_files.values()) |f| {
+            try Incremental.inputPath(arena, &path_buf, fe, f.module, f.sub_path);
+            if (!try r.add(arena, io, &buf, path_buf.items, Frontend.hashSource(f.bytes), true)) return;
+        }
+        // Files the build did not hash itself are hashed now. One that
+        // changed since the build started may not be what the build read:
+        // then there is no record, and the next build builds.
+        var it = std.mem.splitScalar(u8, c_inputs, 0);
+        while (it.next()) |path| if (path.len != 0) {
+            if (!try r.addHashed(arena, io, &buf, path, true)) return;
+        };
+        for ([_][]const []const u8{ job.link_objects, job.link_shared }) |paths| for (paths) |path| {
+            if (!try r.addHashed(arena, io, &buf, path, false)) return;
+        };
+        try buf.appendSlice(arena, std.mem.asBytes(&std.mem.zeroes(Entry)));
+        const stat = Io.Dir.cwd().statFile(io, out_path, .{}) catch return;
+        const o: Output = .{ .inode = @intCast(stat.inode), .size = stat.size, .mtime = @intCast(stat.mtime.toNanoseconds()), .path_len = out_path.len };
+        try buf.appendSlice(arena, std.mem.asBytes(&o));
+        try buf.appendSlice(arena, out_path);
+        cache.writeReplace(io, r.dir, file_name, &.{buf.items}) catch {};
+    }
+
+    /// Appends the entry of `path` with `hash`, its contents when the build
+    /// read it; false if it cannot be stat'ed.
+    fn add(r: *const InputsRecord, arena: std.mem.Allocator, io: Io, buf: *std.ArrayList(u8), path: []const u8, hash: Frontend.Hash, reported: bool) !bool {
+        const stat = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+        const e: Entry = .{
+            .inode = @intCast(stat.inode),
+            .size = stat.size,
+            .mtime = if (r.racy(stat)) racy_mtime else @intCast(stat.mtime.toNanoseconds()),
+            .hash = hash,
+            .path_len = @intCast(path.len),
+            .reported = @intFromBool(reported),
+        };
+        try buf.appendSlice(arena, std.mem.asBytes(&e));
+        try buf.appendSlice(arena, path);
+        return true;
+    }
+
+    /// `add` with the hash of `path`'s contents now; false if it changed
+    /// since the build started.
+    fn addHashed(r: *const InputsRecord, arena: std.mem.Allocator, io: Io, buf: *std.ArrayList(u8), path: []const u8, reported: bool) !bool {
+        const stat = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+        if (r.racy(stat)) return false;
+        const src = Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited) catch return false;
+        return r.add(arena, io, buf, path, Frontend.hashSource(src), reported);
+    }
+};
 
 /// A static library of C sources only: their objects in an archive. The
 /// archive stays when no source compiled and neither it nor an object
@@ -705,7 +887,7 @@ fn startC(init: std.process.Init, job: *const Job) !*CSource.Batch {
     });
 }
 
-fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch) !Outcome {
+fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, rec: ?*InputsRecord, out_path: ?[]const u8, prog: std.Progress.Node, inputs: ?*std.ArrayList(u8), replay_mode: []const u8, pins: *?*const Zcu.NamePins, c_batch: ?*CSource.Batch) !Outcome {
     const arena = init.arena.allocator();
     const opts = job.opts;
     const env = init.environ_map;
@@ -964,6 +1146,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         i.finishRecord(linked);
         if (linked) i.noteOutput(Io.Dir.cwd(), bin_path);
     };
+    if (rec) |r| if (linked) try r.write(arena, init.io, job, &fe, &zcu, if (c_batch) |b| (try b.wait()).inputs else "", bin_path);
     stages.mark("cache record (after the link)");
     stages.print();
     if (stages.on) emit.codegen_stats.print("zap: codegen");

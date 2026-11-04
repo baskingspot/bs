@@ -30,6 +30,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }) }));
+    // A shared library: -fPIC, which zap's cache does not take; its
+    // inputs record still makes a build with no change a cache hit.
+    b.installArtifact(b.addLibrary(.{ .name = "shared", .linkage = .dynamic, .root_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) }));
     // A C header translated to Zig, imported by a program that links
     // glibc: `zap translate-c --listen=-`.
     const tc = b.addTranslateC(.{

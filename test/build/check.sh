@@ -29,9 +29,20 @@ build)
 [ "$(ar t zig-out/lib/libanswer.a)" = "lib.o" ] || fail "zig-out/lib/libanswer.a holds lib.o"
 grep -q hello_answer zig-out/lib/libanswer.a || fail "libanswer.a's index names hello_answer"
 
-# Nothing changed: the compile step is a cache hit.
+# Nothing changed: the compile steps are cache hits, the shared library's
+# too, from its inputs record.
 "$zap" build --summary all >"$work/log" 2>&1 || fail "zap build (no change)"
 expect "compile exe hello debug native cached"
+expect "compile lib shared debug native cached"
+# A source the shared library reads changes: it compiles again. Touched
+# without a change, it is a hit.
+printf '\nexport fn hello_more() u32 {\n    return 1;\n}\n' >>src/lib.zig
+"$zap" build --summary all >"$work/log" 2>&1 || fail "zap build (library edit)"
+expect "compile lib shared debug native success"
+nm -D zig-out/lib/libshared.so | grep -q hello_more || fail "libshared.so exports hello_more"
+touch src/lib.zig
+"$zap" build --summary all >"$work/log" 2>&1 || fail "zap build (library touched)"
+expect "compile lib shared debug native cached"
 
 # Run and test steps; the test runner speaks the build runner's protocol.
 "$zap" build run >"$work/log" 2>&1 || fail "zap build run"

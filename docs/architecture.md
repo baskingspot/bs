@@ -3513,6 +3513,10 @@ compilation (see "Integration" below).
     manifest      base: mapped, pointer-free, replaced whole
     manifest.log  one checksummed record per build since the base
     pack          every Atom the last build linked, append-only
+    inputs        instead of all the above, for a -fPIC build, which the cache does
+                  not take: the files the last successful build read, its link
+                  inputs and output, with stats and content hashes; a build that
+                  finds them unchanged compiles nothing (`InputsRecord`, main.zig)
 ```
 
 - **Atom records** (`cache/atoms.zig`): 16-byte aligned, a 64-byte header,
