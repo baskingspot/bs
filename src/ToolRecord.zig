@@ -58,10 +58,16 @@ pub const Check = union(enum) {
     miss: cache.Hash,
 };
 
+/// The stats of files that `check` already read in this build, by path,
+/// for records that share headers: SDL3's 473 sources read 190k headers,
+/// a few thousand distinct.
+pub const Stats = std.StringHashMapUnmanaged(Io.File.Stat);
+
 /// Compares the record's files with the file system: a hit when every
 /// file stats as recorded or, rehashed, has the recorded contents (the
 /// record then takes the new stats). Null without a usable record.
-pub fn check(arena: std.mem.Allocator, io: Io, record_path: []const u8, out_path: []const u8, start_ns: i96) !?Check {
+/// `stats` keeps what it stats for later checks, in `stats_gpa`.
+pub fn check(arena: std.mem.Allocator, io: Io, record_path: []const u8, out_path: []const u8, start_ns: i96, stats_gpa: std.mem.Allocator, stats: ?*Stats) !?Check {
     const cwd = Io.Dir.cwd();
     const rec = cwd.readFileAlloc(io, record_path, arena, .limited(64 << 20)) catch return null;
     if (rec.len < @sizeOf(Header)) return null;
@@ -80,6 +86,17 @@ pub fn check(arena: std.mem.Allocator, io: Io, record_path: []const u8, out_path
         at += e.path_len;
         if (inputs.items.len != 0) try inputs.append(arena, 0);
         try inputs.appendSlice(arena, p);
+        if (stats) |m| {
+            const gop = try m.getOrPut(stats_gpa, p);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try stats_gpa.dupe(u8, p);
+                gop.value_ptr.* = cwd.statFile(io, p, .{}) catch {
+                    m.removeByPtr(gop.key_ptr);
+                    return .{ .miss = header.output_hash };
+                };
+            }
+            if (e.matches(gop.value_ptr.*)) continue;
+        }
         const f = cwd.openFile(io, p, .{}) catch return .{ .miss = header.output_hash };
         defer f.close(io);
         const st = f.stat(io) catch return .{ .miss = header.output_hash };

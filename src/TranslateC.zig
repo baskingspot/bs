@@ -293,7 +293,7 @@ fn translate(init: std.process.Init, req: *const Request) !Result {
     const out_path = try std.fs.path.join(arena, &.{ out_dir, try std.fmt.allocPrint(arena, "{s}.zig", .{std.fs.path.stem(source)}) });
 
     var old_output: ?cache.Hash = null;
-    if (try ToolRecord.check(arena, io, record_path, out_path, start_ns)) |c| switch (c) {
+    if (try ToolRecord.check(arena, io, record_path, out_path, start_ns, arena, null)) |c| switch (c) {
         .hit => |inputs| return .{ .digest = digest, .cache_hit = true, .out_path = out_path, .inputs = inputs },
         .miss => |h| old_output = h,
     };

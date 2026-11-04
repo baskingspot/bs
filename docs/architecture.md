@@ -6271,8 +6271,17 @@ libraries as inputs. To be agreed with that thread.
   skips the link, and a Zig edit can then build lazily. On a hit the build
   reports the C sources and headers as its inputs, not the objects.
   A library of C only (`c_only`) has no Zig to cache and stays outside
-  `Incremental`. test/link_input/cache.sh checks a `-lc` program with a
-  C source: cold, unchanged, a C edit, a touched source and a Zig edit.
+  `Incremental`; when no source compiles, it keeps its archive if the
+  archive and every object stat as when it was written (a stamp of
+  their paths, inodes, sizes and mtimes at `<local>/zap/car/<key>`),
+  as upstream's cache hit does: SDL3's unchanged `zap build` went from
+  0.85 s to 0.07 s (upstream 0.06 s), since writing its 70 MB archive
+  dominated. The records' checks share one stat per file
+  (`ToolRecord.Stats`; SDL3's 473 records list 190k headers), and a
+  build reports each file the C read once. test/link_input/cache.sh
+  checks a `-lc` program with a C source: cold, unchanged, a C edit, a
+  touched source and a Zig edit; and a library of C only: unchanged, a
+  header edit, a deleted archive.
 - **Runtime**: Debug C calls `__ubsan_handle_*` and, with `-lc`,
   glibc; C sources root ubsan_rt and ssp (`Frontend.Options.c_runtimes`)
   as object inputs do, and their glibc references resolve as an object's

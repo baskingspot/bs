@@ -355,6 +355,32 @@ pub fn objectPaths(b: *const Batch, arena: std.mem.Allocator) ![]const []const u
     return paths.items;
 }
 
+/// For a batch that compiled nothing (`misses == 0`): what its objects and
+/// the archive at `archive_path` are on disk (path, inode, size, mtime),
+/// or null if one is missing. An archive written from these objects keeps
+/// its stamp until one of them changes.
+pub fn archiveStamp(b: *const Batch, arena: std.mem.Allocator, archive_path: []const u8) !?cache.Hash {
+    var id: std.ArrayList(u8) = .empty;
+    for (b.jobs) |j| if (j.archive == null) {
+        const st = Io.Dir.cwd().statFile(b.io, j.out_path, .{}) catch return null;
+        try id.print(arena, "{s}\x00{d}\x00{d}\x00{d}\x00", .{ j.out_path, st.inode, st.size, st.mtime.toNanoseconds() });
+    };
+    const st = Io.Dir.cwd().statFile(b.io, archive_path, .{}) catch return null;
+    try id.print(arena, "{s}\x00{d}\x00{d}\x00{d}\x00", .{ archive_path, st.inode, st.size, st.mtime.toNanoseconds() });
+    return cache.hash(3, id.items);
+}
+
+/// The files the sources read, zero-separated, as `wait` reports them,
+/// for a batch that compiled nothing.
+pub fn hitInputs(b: *const Batch, arena: std.mem.Allocator) ![]const u8 {
+    var inputs: std.ArrayList(u8) = .empty;
+    for (b.jobs) |j| if (j.inputs.len != 0) {
+        if (inputs.items.len != 0) try inputs.append(arena, 0);
+        try inputs.appendSlice(arena, j.inputs);
+    };
+    return inputs.items;
+}
+
 pub const Object = struct {
     path: []const u8,
     bytes: []const u8,
@@ -423,6 +449,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
     for (b.jobs) |*j| j.arena = .init(gpa);
 
     var misses: usize = 0;
+    var stats: ToolRecord.Stats = .empty;
     for (sources, b.jobs[0..sources.len]) |src, *j| {
         const arena = j.arena.allocator();
         var argv: std.ArrayList([]const u8) = .empty;
@@ -471,7 +498,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, environ: *const std.process.Environ
             .out_path = try std.fs.path.join(arena, &.{ local, "o", &hex, try std.fmt.allocPrint(arena, "{s}.o", .{std.fs.path.stem(src.path)}) }),
             .start_ns = start_ns,
         };
-        if (try ToolRecord.check(arena, io, j.record_path, j.out_path, start_ns)) |c| switch (c) {
+        if (try ToolRecord.check(arena, io, j.record_path, j.out_path, start_ns, s, &stats)) |c| switch (c) {
             .hit => |inputs| {
                 j.inputs = inputs;
                 j.state = .done;

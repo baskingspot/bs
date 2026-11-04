@@ -553,7 +553,7 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     // C sources compile while the build analyzes, once for every attempt.
     const c_batch: ?*CSource.Batch = if (job.opts.c_sources.len != 0 or cxxRuntime(&job.opts) or libcNonshared(&job.opts)) try startC(init, job) else null;
     defer if (c_batch) |b| CSource.destroy(b);
-    if (job.opts.c_only) return compileCOnly(init, c_batch.?, out_path, inputs);
+    if (job.opts.c_only) return compileCOnly(init, job, c_batch.?, out_path, inputs);
     // The C objects are link-only inputs of the cache, after the object
     // and archive arguments, as `ElfInput` takes them.
     if (c_batch) |b| if (inc_opt) |i| {
@@ -581,9 +581,25 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
     };
 }
 
-/// A static library of C sources only: their objects in an archive.
-fn compileCOnly(init: std.process.Init, b: *CSource.Batch, out_path: ?[]const u8, inputs: ?*std.ArrayList(u8)) !Outcome {
+/// A static library of C sources only: their objects in an archive. The
+/// archive stays when no source compiled and neither it nor an object
+/// changed since it was written (`CSource.archiveStamp`, kept under the
+/// compilation's key), as upstream's cache hit: SDL3's is 70 MB.
+fn compileCOnly(init: std.process.Init, job: *const Job, b: *CSource.Batch, out_path: ?[]const u8, inputs: ?*std.ArrayList(u8)) !Outcome {
     const arena = init.arena.allocator();
+    const io = init.io;
+    const stamp_path: ?[]const u8 = if (out_path != null) path: {
+        _, const key = try Incremental.compilationKey(arena, io, job.compile_args, job.zig_lib_dir, "c archive");
+        break :path try std.fs.path.join(arena, &.{ job.zapLocal(arena), "car", &std.fmt.bytesToHex(@as([16]u8, @bitCast(key)), .lower) });
+    } else null;
+    if (b.misses == 0) if (stamp_path) |sp| if (try CSource.archiveStamp(b, arena, out_path.?)) |stamp| {
+        var buf: [16]u8 = undefined;
+        const old = Io.Dir.cwd().readFile(io, sp, &buf) catch "";
+        if (old.len == 16 and std.mem.readInt(u128, buf[0..16], .little) == stamp) {
+            if (inputs) |list| try appendCInputs(arena, list, try CSource.hitInputs(b, arena));
+            return .{ .ok = .{ .cache_hit = true } };
+        }
+    };
     const c = try b.wait();
     if (inputs) |list| try appendCInputs(arena, list, c.inputs);
     if (c.errors.len != 0) return .{ .errors = try dupeDiagnostics(arena, c.errors) };
@@ -594,12 +610,26 @@ fn compileCOnly(init: std.process.Init, b: *CSource.Batch, out_path: ?[]const u8
         std.log.err("unable to write the archive '{s}': {t}", .{ bin_path, err });
         return .failed;
     };
+    // Best effort: without the stamp, the next build writes the archive.
+    if (stamp_path) |sp| if (CSource.archiveStamp(b, arena, bin_path) catch null) |stamp| {
+        var bytes: [16]u8 = undefined;
+        std.mem.writeInt(u128, &bytes, stamp, .little);
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = &bytes, .flags = .{} }) catch |err| switch (err) {
+            error.FileNotFound => if (Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(sp).?)) |_| {
+                Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = &bytes, .flags = .{} }) catch {};
+            } else |_| {},
+            else => {},
+        };
+    };
     return .{ .ok = .{ .cache_hit = false } };
 }
 
+/// Appends the files the C sources read, each once: sources share most of
+/// their headers.
 fn appendCInputs(arena: std.mem.Allocator, list: *std.ArrayList(u8), c_inputs: []const u8) !void {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
     var it = std.mem.splitScalar(u8, c_inputs, 0);
-    while (it.next()) |p| if (p.len != 0) try appendInput(arena, list, p);
+    while (it.next()) |p| if (p.len != 0 and !(try seen.getOrPut(arena, p)).found_existing) try appendInput(arena, list, p);
 }
 
 /// Whether the build links the C++ runtime libraries: an executable with
