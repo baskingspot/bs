@@ -18678,7 +18678,7 @@ fn analyzeCall(
     const args = try sema.arena.alloc(Ref, total_args);
     var arg_i: usize = 0;
     if (first_arg != .none) {
-        args[0] = if (fn_ty.param_types[0] == .generic_poison_type) first_arg else try sema.coerce(block, fn_ty.param_types[0], first_arg, src);
+        args[0] = if (fn_ty.param_types[0] == .generic_poison_type) first_arg else try sema.coerceCtx(block, fn_ty.param_types[0], first_arg, sema.callArgSrc(src, true, 0), .{ .param = .{ .func = func, .index = 0 } });
         arg_i = 1;
     }
     switch (call_args_in) {
