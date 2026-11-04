@@ -249,7 +249,7 @@ pub fn main(init_std: std.process.Init) !void {
 /// own too, as `+inline<budget>` and `s` for the safe variant.
 fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.process.Environ.Map) ![]const u8 {
     const inl = inlining(env);
-    const default_inl = inl.budget == inline_ir.budget and inl.safe;
+    const default_inl = inl.budget == inline_ir.budget and !inl.safe;
     if (!opts.fuzz and default_inl) return "x86_64-linux";
     var s: std.ArrayList(u8) = .empty;
     try s.appendSlice(arena, "x86_64-linux");
@@ -266,10 +266,10 @@ fn cacheTarget(arena: std.mem.Allocator, opts: *const Options, env: *const std.p
 
 /// How calls are inlined (docs/architecture.md, "Inlining within a
 /// budget"): `ZAP_INLINE=<budget>` sets the budget, 0 turns inlining off,
-/// and `ZAP_INLINE_FULL=1` inlines callees that can panic too.
+/// and `ZAP_INLINE_SAFE=1` inlines only callees that cannot panic.
 fn inlining(env: *const std.process.Environ.Map) struct { budget: u32, safe: bool } {
     const budget = if (env.get("ZAP_INLINE")) |v| std.fmt.parseInt(u32, v, 10) catch fatal("invalid ZAP_INLINE '{s}': expected a number", .{v}) else inline_ir.budget;
-    return .{ .budget = budget, .safe = env.get("ZAP_INLINE_FULL") == null };
+    return .{ .budget = budget, .safe = env.get("ZAP_INLINE_SAFE") != null };
 }
 
 /// What one compilation needs besides its output path, resolved from the

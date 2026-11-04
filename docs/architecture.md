@@ -1211,16 +1211,15 @@ build, the passes, and the debug info treat them as Sema's inline calls
   not all inlined is not inlinable itself, so only leaves and functions
   that become leaves inline, and every decision reads the callee's own
   IR, the same in every build and schedule.
-- **Variants.** *Full* inlines any such callee. *Safe* (the default for
-  now) also requires that the callee can start no panic: no call of a
-  cold `noreturn` function (safety checks, `@panic`, `unreachable`) and
-  no trap, which also excludes `try` adding to an error return trace. A
-  panic then never starts in inlined code, so every function on a panic
-  stack keeps its own frame and traces stay complete. Synthetic panic frames
-  (below) keep full's traces complete too. `ZAP_INLINE=<budget>`
-  sets the budget (`0` turns inlining off) and `ZAP_INLINE_FULL=1`
-  selects full; a non-default setting gets its own cache target
-  (`Job.cacheTarget`).
+- **Variants.** *Full*, the default, inlines any such callee; synthetic
+  panic frames (below) keep its panic traces complete. *Safe* also
+  requires that the callee can start no panic: no call of a cold
+  `noreturn` function (safety checks, `@panic`, `unreachable`), which
+  also excludes `try` adding to an error return trace, so every function
+  on a panic stack keeps its own frame without synthetic frames. A
+  function with `@trap` never inlines. `ZAP_INLINE=<budget>` sets the
+  budget (`0` turns inlining off) and `ZAP_INLINE_SAFE=1` selects safe; a
+  non-default setting gets its own cache target (`main.cacheTarget`).
 - **When.** On the Sema thread, as Sema hands a function to the sink
   (`Emit.functionOwned`), before CodeGen gets it: `inline.scan` finds the
   candidate sites and the size, and `Emit.inlineFate` decides each
@@ -1284,7 +1283,9 @@ build, the passes, and the debug info treat them as Sema's inline calls
   19%. On the Sema thread the scan costs 90 ms on the zig workload, the
   body hashes 44 ms, and splicing 37 ms; the rest is CodeGen's 7% / 20%
   more IR. A call list from Sema would not save the scan: whether a call
-  is in cold code and the hot size both need the body structure.
+  is in cold code and the hot size both need the body structure. With
+  synthetic panic frames, full costs +5.3% on the zig workload (9.13 s
+  off) and std's test binary grows 24%; run times are unchanged.
 - **What users see.** std 0.17's stack traces print one frame per return
   address, named after the innermost inline range (`Dwarf.getSymbols`
   ignores inline callers, and `resolve_inline_callers` cannot help on
