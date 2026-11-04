@@ -524,7 +524,10 @@ const c_arg_regs = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
 const AutoClass = enum { none, gpr, gpr_pair, sse, memory };
 
 fn autoClass(cg: *CodeGen, ty: Index) AutoClass {
-    const ip = cg.ip;
+    return autoClassOf(cg.ip, ty);
+}
+
+fn autoClassOf(ip: *const InternPool, ty: Index) AutoClass {
     if (Type.class(ip, ty) == .float) return switch (Type.floatBits(ip, ty)) {
         16, 32, 64 => .sse,
         else => .memory,
@@ -567,6 +570,66 @@ fn autoArgs(cg: *CodeGen, ret_ty: Index, tys: []const Index, locs: []AutoArg) u3
         }
     }
     return stack;
+}
+
+/// Whether a call to a function of type `fn_ty` passes every argument in
+/// registers: its convention is `.auto` and `autoArgs` puts no argument
+/// on the stack (counting rdi for a result returned through memory, and
+/// no register for arguments without bits). For the inliner, which lets
+/// a callee keep only calls it can route through return stubs, whose
+/// pushed return addresses would shift rsp under an outgoing area.
+/// Variadic and other conventions give false. A generic instance's type
+/// lists exactly its runtime parameters, the arguments `call` passes.
+/// Pure: callable from the Sema thread. Counts as `autoArgs` does; change
+/// both together.
+pub fn argsInRegs(ip: *const InternPool, fn_ty: Index) bool {
+    const f = ip.keyPayload(.func_type, fn_ty);
+    if (f.cc != .auto or f.is_var_args) return false;
+    var gp: u8 = @intFromBool(autoClassOf(ip, f.return_type) == .memory);
+    var sse: u8 = 0;
+    for (f.param_types) |ty| switch (autoClassOf(ip, ty)) {
+        .none => {},
+        .gpr => if (gp < 6) {
+            gp += 1;
+        } else return false,
+        .gpr_pair => if (gp < 5) {
+            gp += 2;
+        } else return false,
+        .sse => if (sse < 8) {
+            sse += 1;
+        } else return false,
+        .memory => return false,
+    };
+    return true;
+}
+
+test argsInRegs {
+    var ip: InternPool = try .init(std.testing.allocator, std.testing.io, 1);
+    defer ip.deinit();
+    const big = try ip.get(.main, .{ .array_type = .{ .len = 3, .child = .u64_type } });
+    const pair = try ip.get(.main, .{ .array_type = .{ .len = 2, .child = .u64_type } });
+    const T = struct {
+        fn fits(p: *InternPool, params: []const Index, result: Index, cc: InternPool.CallingConvention) !bool {
+            return argsInRegs(p, try p.get(.main, .{ .func_type = .{ .param_types = params, .return_type = result, .cc = cc } }));
+        }
+    };
+    const ints: [7]Index = @splat(.u64_type);
+    try std.testing.expect(try T.fits(&ip, ints[0..6], .void_type, .auto));
+    try std.testing.expect(!try T.fits(&ip, ints[0..7], .void_type, .auto));
+    // A result in memory takes rdi.
+    try std.testing.expect(try T.fits(&ip, ints[0..5], big, .auto));
+    try std.testing.expect(!try T.fits(&ip, ints[0..6], big, .auto));
+    // Arguments without bits take no register; a pair needs two.
+    try std.testing.expect(try T.fits(&ip, &([_]Index{.void_type} ++ ints[0..6].*), .void_type, .auto));
+    try std.testing.expect(try T.fits(&ip, &([_]Index{pair} ++ ints[0..4].*), .void_type, .auto));
+    try std.testing.expect(!try T.fits(&ip, &(ints[0..5].* ++ [_]Index{pair}), .void_type, .auto));
+    // Floats take the 8 SSE registers, beside the 6 general ones; an
+    // argument over 16 bytes goes in memory.
+    const floats: [9]Index = @splat(.f64_type);
+    try std.testing.expect(try T.fits(&ip, &(floats[0..8].* ++ ints[0..6].*), .void_type, .auto));
+    try std.testing.expect(!try T.fits(&ip, floats[0..9], .void_type, .auto));
+    try std.testing.expect(!try T.fits(&ip, &.{big}, .void_type, .auto));
+    try std.testing.expect(!try T.fits(&ip, &.{}, .void_type, .c));
 }
 
 /// Buffers for `n` argument types and locations, reused by every call.

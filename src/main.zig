@@ -2167,6 +2167,7 @@ test {
     _ = @import("link/ElfInput.zig");
     _ = @import("link/Archive.zig");
     _ = @import("codegen/x86_64/Encoder.zig");
+    _ = @import("codegen/x86_64/CodeGen.zig");
     _ = @import("link/MachO.zig");
     _ = @import("codegen/aarch64/Encoder.zig");
     _ = @import("codegen/Ssa.zig");
