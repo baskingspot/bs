@@ -301,6 +301,21 @@ ZAP_CACHE=off valgrind --tool=callgrind --aspace-minaddr=0x100000000 \
   115,414) and emits a different binary. The counts are still useful for
   comparing changes, but they don't describe exactly the native workload.
 
+To profile a program zap compiled, rather than zap itself, build it with
+`-fno-valgrind`. zap enables valgrind support by default, as upstream
+Debug does, so `std.debug.inValgrind()` is true under callgrind, and std
+takes its valgrind paths: `std.mem.indexOfScalarPos` and `splitScalar`
+skip their vector loops (zig issue 17717) and become byte loops, which
+made zap's `splitScalar` look 35x slower than upstream ReleaseSafe (whose
+default is off) instead of 3.7x. Native wall times are unaffected:
+outside valgrind the check is false.
+
+```sh
+zig-out/bin/zap build-exe -fno-valgrind prog.zig -femit-bin=/tmp/prog
+valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out /tmp/prog
+callgrind_annotate --auto=yes /tmp/cg.out
+```
+
 The harness needs Python 3, git, network access on first use (to clone
 libvaxis and fetch its dependencies) and upstream zig 0.17.0 on `PATH`
 (`--setup-zig`), which prepares the workloads but is never timed. Scratch
@@ -374,6 +389,9 @@ compiler's reply, and their RSS and CPU cover the whole session.
 binaries print the same output, and reports the median wall time of each.
 Every program reads its problem size from an exported variable, so no
 compiler folds the work away.
+The timings are native, where valgrind support costs nothing; to profile
+one of these programs under callgrind, build it with `-fno-valgrind`
+("Profiling with valgrind").
 
 | Program | What it exercises |
 |---|---|
