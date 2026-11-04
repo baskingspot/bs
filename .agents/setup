@@ -87,7 +87,7 @@ WAYLAND_PROTOCOLS_VERSION=1.49
 WAYLAND_PROTOCOLS_SHA=ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14
 
 meson_install() { # url sha name [meson options...]
-  local url=$1 sha=$2 name=$3 src="$cache/$3"
+  local url=$1 sha=$2 src="$cache/$3"
   shift 3
   fetch "$url" "$sha" "$src"
   rm -rf "$src/build"
@@ -104,6 +104,7 @@ if [ "$ZIG_HOST" = x86_64-linux ] && command -v apt-get >/dev/null; then
   done
   if [ -n "$missing" ]; then
     sudo apt-get update -qq
+    # shellcheck disable=SC2086 # one word per package
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing >/dev/null
   fi
   if [ "$(pkg-config --modversion wayland-client 2>/dev/null)" != "$WAYLAND_VERSION" ]; then

@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2086 # $args and $cmd are argument lists, split on purpose
 # `zig build test`: build-obj and build-lib through the cache. Each build
 # of test/obj/lib.zig, edited in a scratch copy, must give the bytes of a
 # build without the cache, and edit builds check themselves against full

@@ -87,6 +87,7 @@ expect "input saved to '.zig-cache/f/crash'"
 bin=$(sed -n "s|^failed command: \(\./\.zig-cache/o/[0-9a-f]*/test\) .*|\1|p" "$work/log")
 [ -n "$bin" ] || fail "the log names the fuzz test binary"
 stores() {
+    # shellcheck disable=SC2016 # awk's program, not the shell's
     objdump -d --no-show-raw-insn "$bin" | awk -v f="^<$1>:\$" '$2 ~ f { on = 1; next } /^$/ { on = 0 } on' |
         grep -c 'movb   \$0x1,.*(%rip)' || true
 }

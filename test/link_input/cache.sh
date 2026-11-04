@@ -1,4 +1,6 @@
 #!/bin/sh
+# shellcheck disable=SC2086 # $args and $cmd are argument lists, split on purpose
+# shellcheck disable=SC2016 # $ in the sed and grep patterns is x86 assembly, not the shell's
 # `zig build test`: an executable with object and archive inputs through
 # the cache. The objects are link-only inputs: each build, edited in a
 # scratch copy, must give the bytes of a build without the cache, and edit
@@ -114,7 +116,7 @@ mv main edited
 BS_CACHE_TIMING=1 "$bs" $args --cache-dir local --global-cache-dir global -femit-bin=main >log 2>&1 || fail "a relink from the log"
 grep -qF "no input changed; relinked" log || fail "expected a relink from the log"
 cmp -s main edited || fail "the relink from the log differs from the edit build's output"
-./main >out 2>&1 && grep -qF -- "?" out || fail "the relink from the log lost the edit"
+{ ./main >out 2>&1 && grep -qF -- "?" out; } || fail "the relink from the log lost the edit"
 ;;
 
 c-sources)
