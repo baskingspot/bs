@@ -167,50 +167,76 @@ branch:
   runner is current against upstream's runner compilation's cache check),
   and a cached compile step answers in about 2 ms against upstream's 7.
 
-## `zap build --watch` against `zig build --watch`
+## `zap build --watch` against `zig build --watch` (2026-11-04)
 
-`bench/watch.py` times a watch rebuild: it starts `<compiler> build
---watch` on a project, waits for the first build, then saves the same
-one-line edit as build_phases.py ten times (a new value each time) and
-times each save until the installed artifact changes. That includes the
-runner's change detection, its debounce (50 ms unless `--debounce`), the
-compile step's update and the install. Projects, checkouts and caches are
-build_phases.py's (vaxis, zls and monstar by default). monstar links the
-system's Wayland (1.25), wayland-protocols (1.49), fontconfig, freetype,
-harfbuzz and xkbcommon; `.agents/setup` shows how orbs install them.
+`bench/watch.py` starts `<compiler> build --watch --summary new` on a
+project with the compiler's global cache warm and the project's local
+cache empty, and times the first build, then 7 one-line Zig edits and 7
+build.zig edits (build_phases.py's edits, a new value each time): from the
+save to the installed artifact changing, and to the build's summary. Each
+edit waits for the previous build's summary plus `--settle` seconds, and
+the harness reports extra rebuilds (a build no edit asked for), unchanged
+artifacts, and whether a build.zig edit that installs a new file is
+applied. Projects and checkouts are build_phases.py's (vaxis, zls and
+monstar). monstar links the system's Wayland (1.25), wayland-protocols
+(1.49), fontconfig, freetype, harfbuzz and xkbcommon; `.agents/setup`
+shows how orbs install them.
 
 It needs Linux 6.5 or later: upstream's runner (`Maker/Watch.zig`) calls
 `name_to_handle_at` with `AT_HANDLE_FID` and panics on older kernels,
 under `zig build --watch` and `zap build --watch` alike (Linux 6.1 on the
-orbs). On such a machine, from this repository with upstream zig 0.17.0 on
-PATH (`.agents/setup`):
+orbs). On such a machine, from this repository with upstream zig on PATH
+(`.agents/setup`):
 
 ```sh
 zig build -Doptimize=ReleaseFast
-python3 bench/watch.py --out bench/results/$(date +%F)-watch-zig
-python3 bench/watch.py --zap zig-out/bin/zap --out bench/results/$(date +%F)-watch-zap
-# Upstream's incremental compilation (`zig build --watch -fincremental`):
-python3 bench/watch.py --incremental --out bench/results/$(date +%F)-watch-zig-incr
-python3 bench/watch.py --zap zig-out/bin/zap --incremental --out bench/results/$(date +%F)-watch-zap-incr
-# Without the runner's 50 ms debounce:
-python3 bench/watch.py --debounce 0 --out bench/results/$(date +%F)-watch-zig-d0
-python3 bench/watch.py --zap zig-out/bin/zap --debounce 0 --out bench/results/$(date +%F)-watch-zap-d0
+python3 bench/watch.py --zap zig-out/bin/zap
+python3 bench/watch.py --zap zig-out/bin/zap --extra=-fincremental   # upstream's incremental compilation
+python3 bench/watch.py --zap zig-out/bin/zap --extra='--debounce 0'  # without the runner's 50 ms debounce
+python3 bench/watch.py --zap zig-out/bin/zap --projects zls --bp-steps  # zls's install and test steps
 ```
 
-Each run prints the median per project and writes the `.md`/`.json`
-report; build_phases.py sets the projects up on first use (network).
+Each run prints the medians per compiler and project and writes
+`bench/.work/watch_bench/results-<tag>.json`, with every build's log
+next to it.
 
-`--projects vaxis,zls` picks projects, `--edits N` the number of saves.
 `--protocol` measures on any kernel what a watch rebuild asks of the
 compiler alone: the artifact's compile step runs once with `--listen=-`
-and answers an `update` per edit, as under `--watch`; `--incremental`
-adds upstream's `-fincremental` to it:
+and answers an `update` per Zig edit, as it does under `--watch`, without
+change detection, the debounce, run steps or the install:
 
 ```sh
-python3 bench/watch.py --protocol
-python3 bench/watch.py --protocol --incremental
-python3 bench/watch.py --protocol --zap zig-out/bin/zap
+python3 bench/watch.py --zap zig-out/bin/zap --protocol
+python3 bench/watch.py --zap zig-out/bin/zap --protocol --extra=-fincremental
 ```
+
+timbot (Linux 7.2, 12 cores), upstream 0.17.0 against zap-build-watch
+5d93d33, default debounce, median of 7 (ms unless marked):
+
+| project | first build, zig / zap | .zig edit to artifact | build.zig edit to summary |
+|---|---:|---:|---:|
+| vaxis | 3.84 s / 0.28 s | 787 / 90 | 839 / 99 |
+| zls | 3.35 s / 0.17 s | 1868 / 114 | 864 / 108 |
+| monstar | 28.6 s / 7.08 s | 18.29 s / 167 | not seen by either |
+
+With `-fincremental`, upstream's .zig edits take vaxis 84 / zap 86, zls 90
+/ 108 and monstar 8.27 s / 162; its build.zig edits then take 3.2–4.1 s
+(the runner restarts after reconfiguring) against about 0.1 s for zap.
+With `--debounce 0`, zap's vaxis edit is 39 ms.
+
+That zap build still ran each run step that executes a rebuilt artifact
+a second time after every edit (zls's 25 `run analysis` steps, 220 ms
+later): it relinked outputs in place in their one directory, which the
+runner watches for those steps, so it saw the build's own write as a
+change. Now a build that changes the output writes it into the other of
+the compilation's two output directories (`serve` in src/main.zig), as
+upstream's outputs move to a new digest's directory.
+
+monstar's build.zig edits are missed by upstream's runner, for zig and
+zap alike: monstar's configuration runs pkg-config, which poisons it, and
+Maker.zig records `configure_source_files` only on a configuration cache
+hit or an unpoisoned miss (`options.src_files`, lines 1502 and 1642 in
+0.17.1), so the reconfigure step watches nothing. The runner stays unpatched.
 
 ## Running
 
