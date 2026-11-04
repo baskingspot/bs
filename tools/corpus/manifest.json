@@ -1034,6 +1034,11 @@
    "reason": "links libc and C sources (mimalloc, linenoise)"
   },
   {
+   "name": "monstar",
+   "url": "https://github.com/rockorager/monstar",
+   "reason": "C acceptance target (406c48eb, 2026-10-31): links libc and the system's wayland-client and wayland-cursor (.so, pkg-config), compiles two C sources, translates fontconfig, freetype2, harfbuzz and xkbcommon headers; needs wayland 1.25 and wayland-protocols 1.49. Moves into the corpus once zap links .so inputs"
+  },
+  {
    "name": "zig-json (nektro)",
    "url": "https://github.com/nektro/zig-json",
    "reason": "its test links libc"
