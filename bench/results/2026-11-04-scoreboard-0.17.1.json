@@ -1,0 +1,5820 @@
+{
+ "date": "2026-11-04",
+ "commit": "d47bcde",
+ "machine": {
+  "cpus": 4,
+  "kernel": "6.1.158+",
+  "cpu": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "mem_gib": 7.8
+ },
+ "note": "Amp orb, 4 vCPU",
+ "started": "2026-11-04 19:44",
+ "zap": "/tmp/zap-rf/bin/zap",
+ "zig": "/home/user/.local/bin/zig",
+ "bench": {
+  "hello": {
+   "zig": {
+    "schema": 1,
+    "generated": "2026-11-04T19:44:28+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/home/user/.local/bin/zig",
+     "realpath": "/home/user/.cache/zap/zig-0.17.1/zig",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 10,
+    "cold_runs": 5,
+    "build_cold_runs": 3,
+    "env": {},
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.1327429189987015,
+     "end": 0.13082172400027048
+    },
+    "workloads": {
+     "hello": {
+      "description": "hello world through std.debug.print",
+      "commands": {
+       "build-exe": {
+        "cwd": "hello",
+        "argv": [
+         "zig",
+         "build-exe",
+         "hello.zig",
+         "--zig-lib-dir",
+         "zig-lib",
+         "--cache-dir",
+         "cache/local",
+         "--global-cache-dir",
+         "cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "hello/hello.zig",
+        "anchor": "    std.debug.print(\"Hello, world!\\n\", .{});",
+        "line": 4
+       },
+       "lib": {
+        "file": "hello/zig-lib/std/debug.zig",
+        "anchor": "    stderr.file_writer.interface.print(fmt, args) catch return;",
+        "line": 330
+       }
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "cold",
+      "runs": [
+       {
+        "wall_s": 4.981347395994817,
+        "cpu_s": 5.473151,
+        "maxrss_kb": 300468
+       },
+       {
+        "wall_s": 5.154016860004049,
+        "cpu_s": 5.625122,
+        "maxrss_kb": 307912
+       },
+       {
+        "wall_s": 5.104328770990833,
+        "cpu_s": 5.588568,
+        "maxrss_kb": 304116
+       },
+       {
+        "wall_s": 5.226948794996133,
+        "cpu_s": 5.720455,
+        "maxrss_kb": 305140
+       },
+       {
+        "wall_s": 5.052340177993756,
+        "cpu_s": 5.54052,
+        "maxrss_kb": 305668
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 5.104328770990833,
+       "min_s": 4.981347395994817,
+       "max_s": 5.226948794996133,
+       "mean_s": 5.103796399995917,
+       "stdev_s": 0.09398190222084112,
+       "cpu_median_s": 5.588568,
+       "maxrss_median_kb": 305140,
+       "maxrss_max_kb": 307912
+      },
+      "extra": {}
+     },
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 0.45106278199818917,
+        "cpu_s": 0.8800680000000001,
+        "maxrss_kb": 131308
+       },
+       {
+        "wall_s": 0.4375429229985457,
+        "cpu_s": 0.867729,
+        "maxrss_kb": 131204
+       },
+       {
+        "wall_s": 0.431489499998861,
+        "cpu_s": 0.844685,
+        "maxrss_kb": 130820
+       },
+       {
+        "wall_s": 0.4330025219969684,
+        "cpu_s": 0.871572,
+        "maxrss_kb": 130936
+       },
+       {
+        "wall_s": 0.46633853900129907,
+        "cpu_s": 0.9217709999999999,
+        "maxrss_kb": 131052
+       },
+       {
+        "wall_s": 0.43592802199418657,
+        "cpu_s": 0.854229,
+        "maxrss_kb": 131504
+       },
+       {
+        "wall_s": 0.44092152500525117,
+        "cpu_s": 0.9034309999999999,
+        "maxrss_kb": 131428
+       },
+       {
+        "wall_s": 0.4465378099994268,
+        "cpu_s": 0.910913,
+        "maxrss_kb": 130884
+       },
+       {
+        "wall_s": 0.4668862819962669,
+        "cpu_s": 0.925429,
+        "maxrss_kb": 132012
+       },
+       {
+        "wall_s": 0.4418227529968135,
+        "cpu_s": 0.8889029999999999,
+        "maxrss_kb": 131336
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.44137213900103234,
+       "min_s": 0.431489499998861,
+       "max_s": 0.4668862819962669,
+       "mean_s": 0.44515326579858083,
+       "stdev_s": 0.012755567826950753,
+       "cpu_median_s": 0.8844855,
+       "maxrss_median_kb": 131256.0,
+       "maxrss_max_kb": 132012
+      },
+      "extra": {}
+     },
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "warm",
+      "runs": [
+       {
+        "wall_s": 0.4346283529885113,
+        "cpu_s": 0.8550259999999998,
+        "maxrss_kb": 131172
+       },
+       {
+        "wall_s": 0.48538910900242627,
+        "cpu_s": 0.9448,
+        "maxrss_kb": 132016
+       },
+       {
+        "wall_s": 0.44547267399320845,
+        "cpu_s": 0.8861169999999999,
+        "maxrss_kb": 131688
+       },
+       {
+        "wall_s": 0.44878795300610363,
+        "cpu_s": 0.881938,
+        "maxrss_kb": 132044
+       },
+       {
+        "wall_s": 0.43871743000636343,
+        "cpu_s": 0.8612169999999999,
+        "maxrss_kb": 132600
+       },
+       {
+        "wall_s": 0.44379854600992985,
+        "cpu_s": 0.8951939999999999,
+        "maxrss_kb": 130944
+       },
+       {
+        "wall_s": 0.4333450379926944,
+        "cpu_s": 0.850625,
+        "maxrss_kb": 131216
+       },
+       {
+        "wall_s": 0.4842281019955408,
+        "cpu_s": 0.969417,
+        "maxrss_kb": 132552
+       },
+       {
+        "wall_s": 0.43748724801116623,
+        "cpu_s": 0.8937689999999999,
+        "maxrss_kb": 131420
+       },
+       {
+        "wall_s": 0.4339675619994523,
+        "cpu_s": 0.8660019999999999,
+        "maxrss_kb": 131104
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.44125798800814664,
+       "min_s": 0.4333450379926944,
+       "max_s": 0.48538910900242627,
+       "mean_s": 0.4485822015005397,
+       "stdev_s": 0.019773309603766248,
+       "cpu_median_s": 0.8840275,
+       "maxrss_median_kb": 131554.0,
+       "maxrss_max_kb": 132600
+      },
+      "extra": {}
+     },
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "edit-root",
+      "runs": [
+       {
+        "wall_s": 0.43077523598913103,
+        "cpu_s": 0.853671,
+        "maxrss_kb": 131148
+       },
+       {
+        "wall_s": 0.44138553699303884,
+        "cpu_s": 0.8712709999999999,
+        "maxrss_kb": 130992
+       },
+       {
+        "wall_s": 0.45671216399932746,
+        "cpu_s": 0.9159789999999999,
+        "maxrss_kb": 130708
+       },
+       {
+        "wall_s": 0.46198066699435003,
+        "cpu_s": 0.898196,
+        "maxrss_kb": 131376
+       },
+       {
+        "wall_s": 0.42929394499515183,
+        "cpu_s": 0.8556029999999999,
+        "maxrss_kb": 131180
+       },
+       {
+        "wall_s": 0.44127961300546303,
+        "cpu_s": 0.8674029999999999,
+        "maxrss_kb": 131884
+       },
+       {
+        "wall_s": 0.44418486299400683,
+        "cpu_s": 0.909533,
+        "maxrss_kb": 131032
+       },
+       {
+        "wall_s": 0.4381605069938814,
+        "cpu_s": 0.861364,
+        "maxrss_kb": 131064
+       },
+       {
+        "wall_s": 0.43235532799735665,
+        "cpu_s": 0.865012,
+        "maxrss_kb": 131536
+       },
+       {
+        "wall_s": 0.4500128009967739,
+        "cpu_s": 0.9142919999999999,
+        "maxrss_kb": 131576
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.44133257499925094,
+       "min_s": 0.42929394499515183,
+       "max_s": 0.46198066699435003,
+       "mean_s": 0.4426140660958481,
+       "stdev_s": 0.01093912318838189,
+       "cpu_median_s": 0.8693369999999999,
+       "maxrss_median_kb": 131164.0,
+       "maxrss_max_kb": 131884
+      },
+      "extra": {}
+     },
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "edit-lib",
+      "runs": [
+       {
+        "wall_s": 4.346155841994914,
+        "cpu_s": 4.796609,
+        "maxrss_kb": 239300
+       },
+       {
+        "wall_s": 4.293241424995358,
+        "cpu_s": 4.754425,
+        "maxrss_kb": 236652
+       },
+       {
+        "wall_s": 4.4774737209954765,
+        "cpu_s": 4.9906939999999995,
+        "maxrss_kb": 241908
+       },
+       {
+        "wall_s": 4.17484161099128,
+        "cpu_s": 4.6065830000000005,
+        "maxrss_kb": 238408
+       },
+       {
+        "wall_s": 4.367481010995107,
+        "cpu_s": 4.815252,
+        "maxrss_kb": 238028
+       },
+       {
+        "wall_s": 4.398915037003462,
+        "cpu_s": 4.837648,
+        "maxrss_kb": 236856
+       },
+       {
+        "wall_s": 4.4404065489943605,
+        "cpu_s": 4.851135,
+        "maxrss_kb": 241360
+       },
+       {
+        "wall_s": 4.488623750992701,
+        "cpu_s": 4.970676,
+        "maxrss_kb": 237292
+       },
+       {
+        "wall_s": 4.305099183999118,
+        "cpu_s": 4.754846,
+        "maxrss_kb": 238576
+       },
+       {
+        "wall_s": 4.3508825180033455,
+        "cpu_s": 4.790805,
+        "maxrss_kb": 242180
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 4.359181764499226,
+       "min_s": 4.17484161099128,
+       "max_s": 4.488623750992701,
+       "mean_s": 4.364312064896512,
+       "stdev_s": 0.09441221042867588,
+       "cpu_median_s": 4.8059305000000005,
+       "maxrss_median_kb": 238492.0,
+       "maxrss_max_kb": 242180
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   },
+   "zap": {
+    "schema": 1,
+    "generated": "2026-11-04T19:45:55+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/tmp/zap-rf/bin/zap",
+     "realpath": "/tmp/zap-rf/bin/zap",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 10,
+    "cold_runs": 5,
+    "build_cold_runs": 3,
+    "env": {},
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.12567143900378142,
+     "end": 0.12713558199175168
+    },
+    "workloads": {
+     "hello": {
+      "description": "hello world through std.debug.print",
+      "commands": {
+       "build-exe": {
+        "cwd": "hello",
+        "argv": [
+         "zap",
+         "build-exe",
+         "hello.zig",
+         "--zig-lib-dir",
+         "zig-lib",
+         "--cache-dir",
+         "cache/local",
+         "--global-cache-dir",
+         "cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "hello/hello.zig",
+        "anchor": "    std.debug.print(\"Hello, world!\\n\", .{});",
+        "line": 4
+       },
+       "lib": {
+        "file": "hello/zig-lib/std/debug.zig",
+        "anchor": "    stderr.file_writer.interface.print(fmt, args) catch return;",
+        "line": 330
+       }
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "cold",
+      "runs": [
+       {
+        "wall_s": 0.44770705499104224,
+        "cpu_s": 1.169418,
+        "maxrss_kb": 57380
+       },
+       {
+        "wall_s": 0.4500713419984095,
+        "cpu_s": 1.190693,
+        "maxrss_kb": 57368
+       },
+       {
+        "wall_s": 0.4561587799980771,
+        "cpu_s": 1.1906109999999999,
+        "maxrss_kb": 57276
+       },
+       {
+        "wall_s": 0.45552408799994737,
+        "cpu_s": 1.19007,
+        "maxrss_kb": 57836
+       },
+       {
+        "wall_s": 0.4711848289880436,
+        "cpu_s": 1.236006,
+        "maxrss_kb": 57544
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.45552408799994737,
+       "min_s": 0.44770705499104224,
+       "max_s": 0.4711848289880436,
+       "mean_s": 0.45612921879510393,
+       "stdev_s": 0.009146982697208032,
+       "cpu_median_s": 1.1906109999999999,
+       "maxrss_median_kb": 57380,
+       "maxrss_max_kb": 57836
+      },
+      "extra": {}
+     },
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 0.030235161000746302,
+        "cpu_s": 0.048279999999999997,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.02450086500903126,
+        "cpu_s": 0.025705,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.01986878899333533,
+        "cpu_s": 0.021456999999999997,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.02089042100124061,
+        "cpu_s": 0.022125,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.020955856001819484,
+        "cpu_s": 0.022375,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.020169745999737643,
+        "cpu_s": 0.021538,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.020740474996273406,
+        "cpu_s": 0.022344,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.021724371006712317,
+        "cpu_s": 0.023267999999999997,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.02006686999811791,
+        "cpu_s": 0.021501,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.019747387996176258,
+        "cpu_s": 0.020974,
+        "maxrss_kb": 19228
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.02081544799875701,
+       "min_s": 0.019747387996176258,
+       "max_s": 0.030235161000746302,
+       "mean_s": 0.021889994200319052,
+       "stdev_s": 0.0032427373393255497,
+       "cpu_median_s": 0.022234499999999997,
+       "maxrss_median_kb": 19228.0,
+       "maxrss_max_kb": 19228
+      },
+      "extra": {}
+     },
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "warm",
+      "runs": [
+       {
+        "wall_s": 0.00168282599770464,
+        "cpu_s": 0.001548,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.0015751490136608481,
+        "cpu_s": 0.001406,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.0014375830069184303,
+        "cpu_s": 0.001316,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.0013576420024037361,
+        "cpu_s": 0.0012569999999999999,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.0013369499938562512,
+        "cpu_s": 0.001228,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.0013930580025771633,
+        "cpu_s": 0.001264,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.0013959619973320514,
+        "cpu_s": 0.001277,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.0013519549975171685,
+        "cpu_s": 0.0012389999999999999,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.0013711409992538393,
+        "cpu_s": 0.001242,
+        "maxrss_kb": 19228
+       },
+       {
+        "wall_s": 0.0014023510011611506,
+        "cpu_s": 0.001292,
+        "maxrss_kb": 19228
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.0013945099999546073,
+       "min_s": 0.0013369499938562512,
+       "max_s": 0.00168282599770464,
+       "mean_s": 0.0014304617012385278,
+       "stdev_s": 0.00011144592279692788,
+       "cpu_median_s": 0.0012705,
+       "maxrss_median_kb": 19228.0,
+       "maxrss_max_kb": 19228
+      },
+      "extra": {}
+     },
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "edit-root",
+      "runs": [
+       {
+        "wall_s": 0.02300849001039751,
+        "cpu_s": 0.024493,
+        "maxrss_kb": 22728
+       },
+       {
+        "wall_s": 0.02805994100344833,
+        "cpu_s": 0.029972,
+        "maxrss_kb": 21192
+       },
+       {
+        "wall_s": 0.025920379994204268,
+        "cpu_s": 0.027578,
+        "maxrss_kb": 21212
+       },
+       {
+        "wall_s": 0.027917636005440727,
+        "cpu_s": 0.029586999999999995,
+        "maxrss_kb": 21228
+       },
+       {
+        "wall_s": 0.024568377004470676,
+        "cpu_s": 0.026228999999999995,
+        "maxrss_kb": 21196
+       },
+       {
+        "wall_s": 0.025585167997633107,
+        "cpu_s": 0.02751,
+        "maxrss_kb": 21200
+       },
+       {
+        "wall_s": 0.026097034991835244,
+        "cpu_s": 0.027617,
+        "maxrss_kb": 21172
+       },
+       {
+        "wall_s": 0.026255625998601317,
+        "cpu_s": 0.027982,
+        "maxrss_kb": 21220
+       },
+       {
+        "wall_s": 0.025025417999131605,
+        "cpu_s": 0.026922,
+        "maxrss_kb": 21248
+       },
+       {
+        "wall_s": 0.02716564199363347,
+        "cpu_s": 0.028832999999999998,
+        "maxrss_kb": 21276
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.026008707493019756,
+       "min_s": 0.02300849001039751,
+       "max_s": 0.02805994100344833,
+       "mean_s": 0.025960371299879624,
+       "stdev_s": 0.0015443579600018043,
+       "cpu_median_s": 0.027597499999999997,
+       "maxrss_median_kb": 21216.0,
+       "maxrss_max_kb": 22728
+      },
+      "extra": {}
+     },
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "edit-lib",
+      "runs": [
+       {
+        "wall_s": 0.05268379299377557,
+        "cpu_s": 0.058905,
+        "maxrss_kb": 41652
+       },
+       {
+        "wall_s": 0.058340235002106056,
+        "cpu_s": 0.0634,
+        "maxrss_kb": 42088
+       },
+       {
+        "wall_s": 0.08193352501257323,
+        "cpu_s": 0.080302,
+        "maxrss_kb": 41764
+       },
+       {
+        "wall_s": 0.06863556300231721,
+        "cpu_s": 0.075724,
+        "maxrss_kb": 41692
+       },
+       {
+        "wall_s": 0.051640505000250414,
+        "cpu_s": 0.056909,
+        "maxrss_kb": 42268
+       },
+       {
+        "wall_s": 0.07032884799991734,
+        "cpu_s": 0.075836,
+        "maxrss_kb": 41900
+       },
+       {
+        "wall_s": 0.053862113985815085,
+        "cpu_s": 0.059227999999999996,
+        "maxrss_kb": 42108
+       },
+       {
+        "wall_s": 0.04960605798987672,
+        "cpu_s": 0.05473399999999999,
+        "maxrss_kb": 42020
+       },
+       {
+        "wall_s": 0.06297834300494287,
+        "cpu_s": 0.069328,
+        "maxrss_kb": 42340
+       },
+       {
+        "wall_s": 0.054821817990159616,
+        "cpu_s": 0.061120999999999995,
+        "maxrss_kb": 42228
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.056581026496132836,
+       "min_s": 0.04960605798987672,
+       "max_s": 0.08193352501257323,
+       "mean_s": 0.06048308019817341,
+       "stdev_s": 0.010368534326632177,
+       "cpu_median_s": 0.062260499999999996,
+       "maxrss_median_kb": 42054.0,
+       "maxrss_max_kb": 42340
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   },
+   "zap-nodonor": {
+    "schema": 1,
+    "generated": "2026-11-04T19:46:00+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/tmp/zap-rf/bin/zap",
+     "realpath": "/tmp/zap-rf/bin/zap",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 10,
+    "cold_runs": 5,
+    "build_cold_runs": 3,
+    "env": {
+     "ZAP_CACHE_DONOR": "off"
+    },
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.1410051749990089,
+     "end": 0.14276134799001738
+    },
+    "workloads": {
+     "hello": {
+      "description": "hello world through std.debug.print",
+      "commands": {
+       "build-exe": {
+        "cwd": "hello",
+        "argv": [
+         "zap",
+         "build-exe",
+         "hello.zig",
+         "--zig-lib-dir",
+         "zig-lib",
+         "--cache-dir",
+         "cache/local",
+         "--global-cache-dir",
+         "cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "hello/hello.zig",
+        "anchor": "    std.debug.print(\"Hello, world!\\n\", .{});",
+        "line": 4
+       },
+       "lib": {
+        "file": "hello/zig-lib/std/debug.zig",
+        "anchor": "    stderr.file_writer.interface.print(fmt, args) catch return;",
+        "line": 330
+       }
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "hello",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 0.20658704900415614,
+        "cpu_s": 0.35084899999999997,
+        "maxrss_kb": 55448
+       },
+       {
+        "wall_s": 0.2045627999905264,
+        "cpu_s": 0.340518,
+        "maxrss_kb": 54944
+       },
+       {
+        "wall_s": 0.22017410999978893,
+        "cpu_s": 0.357964,
+        "maxrss_kb": 55704
+       },
+       {
+        "wall_s": 0.2166169669944793,
+        "cpu_s": 0.354055,
+        "maxrss_kb": 54828
+       },
+       {
+        "wall_s": 0.2073956829990493,
+        "cpu_s": 0.346464,
+        "maxrss_kb": 54636
+       },
+       {
+        "wall_s": 0.23431756799982395,
+        "cpu_s": 0.375977,
+        "maxrss_kb": 55580
+       },
+       {
+        "wall_s": 0.20502480999857653,
+        "cpu_s": 0.326248,
+        "maxrss_kb": 55792
+       },
+       {
+        "wall_s": 0.20034183200914413,
+        "cpu_s": 0.32282,
+        "maxrss_kb": 55160
+       },
+       {
+        "wall_s": 0.20010567099961918,
+        "cpu_s": 0.32298499999999997,
+        "maxrss_kb": 55668
+       },
+       {
+        "wall_s": 0.22831052700348664,
+        "cpu_s": 0.364479,
+        "maxrss_kb": 55564
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.20699136600160273,
+       "min_s": 0.20010567099961918,
+       "max_s": 0.23431756799982395,
+       "mean_s": 0.21234370169986505,
+       "stdev_s": 0.011939250017521254,
+       "cpu_median_s": 0.3486565,
+       "maxrss_median_kb": 55506.0,
+       "maxrss_max_kb": 55792
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   }
+  },
+  "vaxis": {
+   "zig": {
+    "schema": 1,
+    "generated": "2026-11-04T19:46:10+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/home/user/.local/bin/zig",
+     "realpath": "/home/user/.cache/zap/zig-0.17.1/zig",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 10,
+    "cold_runs": 5,
+    "build_cold_runs": 3,
+    "env": {},
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.1290098890021909,
+     "end": 0.1273156239913078
+    },
+    "workloads": {
+     "vaxis": {
+      "description": "libvaxis 0620b34e091d examples/text_input.zig",
+      "commands": {
+       "build-exe": {
+        "cwd": "vaxis/libvaxis",
+        "argv": [
+         "zig",
+         "build-exe",
+         "--dep",
+         "vaxis",
+         "-Mroot=examples/text_input.zig",
+         "--dep",
+         "zigimg",
+         "--dep",
+         "uucode",
+         "-Mvaxis=src/main.zig",
+         "-Mzigimg=zig-pkg/zigimg-0.1.0-8_eo2sBLGACBebrhQZUwRliZNSUyDn6szp99eip_6-Rw/zigimg.zig",
+         "--dep",
+         "types.zig",
+         "--dep",
+         "config.zig",
+         "--dep",
+         "tables",
+         "-Muucode=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/root.zig",
+         "-Mtypes.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/types.zig",
+         "--dep",
+         "types.zig",
+         "--dep",
+         "storage.zig",
+         "-Mconfig.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/config.zig",
+         "--dep",
+         "config.zig",
+         "--dep",
+         "storage.zig",
+         "--dep",
+         "build_config",
+         "-Mtables=../gen/tables.zig",
+         "--dep",
+         "config.zig",
+         "-Mstorage.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/storage.zig",
+         "--dep",
+         "config.zig",
+         "--dep",
+         "storage.zig",
+         "-Mbuild_config=../gen/build_config.zig",
+         "--name",
+         "example-text_input",
+         "--cache-dir",
+         "../cache/local",
+         "--global-cache-dir",
+         "../cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "vaxis/libvaxis/examples/text_input.zig",
+        "anchor": "    const alloc = init.gpa;",
+        "line": 23
+       },
+       "lib": {
+        "file": "vaxis/libvaxis/src/Vaxis.zig",
+        "anchor": "    var started: bool = false;",
+        "line": 407
+       }
+      },
+      "libvaxis": {
+       "url": "https://github.com/rockorager/libvaxis",
+       "commit": "0620b34e091deaa6f64608922be3814147128dfb",
+       "patched": false
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "cold",
+      "runs": [
+       {
+        "wall_s": 5.810353443011991,
+        "cpu_s": 6.665614,
+        "maxrss_kb": 355572
+       },
+       {
+        "wall_s": 5.83965133500169,
+        "cpu_s": 6.734367,
+        "maxrss_kb": 354104
+       },
+       {
+        "wall_s": 5.762803291989258,
+        "cpu_s": 6.6610190000000005,
+        "maxrss_kb": 354608
+       },
+       {
+        "wall_s": 5.863544228996034,
+        "cpu_s": 6.738550999999999,
+        "maxrss_kb": 355284
+       },
+       {
+        "wall_s": 5.842755812001997,
+        "cpu_s": 6.7443599999999995,
+        "maxrss_kb": 350192
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 5.83965133500169,
+       "min_s": 5.762803291989258,
+       "max_s": 5.863544228996034,
+       "mean_s": 5.823821622200194,
+       "stdev_s": 0.03902434276788615,
+       "cpu_median_s": 6.734367,
+       "maxrss_median_kb": 354608,
+       "maxrss_max_kb": 355572
+      },
+      "extra": {}
+     },
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 1.3442035170010058,
+        "cpu_s": 2.0378499999999997,
+        "maxrss_kb": 192188
+       },
+       {
+        "wall_s": 1.3063526949990774,
+        "cpu_s": 2.1099419999999998,
+        "maxrss_kb": 191372
+       },
+       {
+        "wall_s": 1.2353929240052821,
+        "cpu_s": 1.9354779999999998,
+        "maxrss_kb": 192656
+       },
+       {
+        "wall_s": 1.2755556699994486,
+        "cpu_s": 2.025003,
+        "maxrss_kb": 191460
+       },
+       {
+        "wall_s": 1.2383365919959033,
+        "cpu_s": 1.909167,
+        "maxrss_kb": 192368
+       },
+       {
+        "wall_s": 1.2650239299982786,
+        "cpu_s": 1.924136,
+        "maxrss_kb": 191908
+       },
+       {
+        "wall_s": 1.2557445760030532,
+        "cpu_s": 1.991474,
+        "maxrss_kb": 191516
+       },
+       {
+        "wall_s": 1.2824840009998297,
+        "cpu_s": 1.946405,
+        "maxrss_kb": 191608
+       },
+       {
+        "wall_s": 1.2745771140034776,
+        "cpu_s": 2.0454179999999997,
+        "maxrss_kb": 191264
+       },
+       {
+        "wall_s": 1.3356961810059147,
+        "cpu_s": 2.0858809999999997,
+        "maxrss_kb": 191908
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 1.275066392001463,
+       "min_s": 1.2353929240052821,
+       "max_s": 1.3442035170010058,
+       "mean_s": 1.2813367200011272,
+       "stdev_s": 0.037259333786578516,
+       "cpu_median_s": 2.0082385,
+       "maxrss_median_kb": 191758.0,
+       "maxrss_max_kb": 192656
+      },
+      "extra": {}
+     },
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "warm",
+      "runs": [
+       {
+        "wall_s": 1.1684824910043972,
+        "cpu_s": 1.793307,
+        "maxrss_kb": 163788
+       },
+       {
+        "wall_s": 1.1830136959906667,
+        "cpu_s": 1.7969899999999999,
+        "maxrss_kb": 165244
+       },
+       {
+        "wall_s": 1.1817168529960327,
+        "cpu_s": 1.777686,
+        "maxrss_kb": 163312
+       },
+       {
+        "wall_s": 1.1303328380017774,
+        "cpu_s": 1.719004,
+        "maxrss_kb": 163032
+       },
+       {
+        "wall_s": 1.1319719269959023,
+        "cpu_s": 1.7539669999999998,
+        "maxrss_kb": 162292
+       },
+       {
+        "wall_s": 1.1993584190058755,
+        "cpu_s": 1.8501969999999999,
+        "maxrss_kb": 163936
+       },
+       {
+        "wall_s": 1.1683734609978274,
+        "cpu_s": 1.8157900000000002,
+        "maxrss_kb": 162608
+       },
+       {
+        "wall_s": 1.1094552009890322,
+        "cpu_s": 1.729575,
+        "maxrss_kb": 162060
+       },
+       {
+        "wall_s": 1.1069816819945117,
+        "cpu_s": 1.7453530000000002,
+        "maxrss_kb": 162496
+       },
+       {
+        "wall_s": 1.124051293998491,
+        "cpu_s": 1.726768,
+        "maxrss_kb": 163384
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 1.1501726939968648,
+       "min_s": 1.1069816819945117,
+       "max_s": 1.1993584190058755,
+       "mean_s": 1.1503737861974515,
+       "stdev_s": 0.03348217805633848,
+       "cpu_median_s": 1.7658265,
+       "maxrss_median_kb": 163172.0,
+       "maxrss_max_kb": 165244
+      },
+      "extra": {}
+     },
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "edit-root",
+      "runs": [
+       {
+        "wall_s": 1.1196947159914998,
+        "cpu_s": 1.734104,
+        "maxrss_kb": 162860
+       },
+       {
+        "wall_s": 1.1142711530119414,
+        "cpu_s": 1.746124,
+        "maxrss_kb": 162868
+       },
+       {
+        "wall_s": 1.1083321619953495,
+        "cpu_s": 1.713616,
+        "maxrss_kb": 163148
+       },
+       {
+        "wall_s": 1.0747074050013907,
+        "cpu_s": 1.700406,
+        "maxrss_kb": 163276
+       },
+       {
+        "wall_s": 1.1137006060016574,
+        "cpu_s": 1.7130189999999998,
+        "maxrss_kb": 162564
+       },
+       {
+        "wall_s": 1.093618946004426,
+        "cpu_s": 1.735953,
+        "maxrss_kb": 162728
+       },
+       {
+        "wall_s": 1.1138153539941413,
+        "cpu_s": 1.8127049999999998,
+        "maxrss_kb": 163216
+       },
+       {
+        "wall_s": 1.1437414829997579,
+        "cpu_s": 1.730279,
+        "maxrss_kb": 162272
+       },
+       {
+        "wall_s": 1.172110770989093,
+        "cpu_s": 1.79917,
+        "maxrss_kb": 164092
+       },
+       {
+        "wall_s": 1.1164899849973153,
+        "cpu_s": 1.7481229999999999,
+        "maxrss_kb": 163524
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 1.1140432535030413,
+       "min_s": 1.0747074050013907,
+       "max_s": 1.172110770989093,
+       "mean_s": 1.1170482580986572,
+       "stdev_s": 0.02624403759445796,
+       "cpu_median_s": 1.7350285,
+       "maxrss_median_kb": 163008.0,
+       "maxrss_max_kb": 164092
+      },
+      "extra": {}
+     },
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "edit-lib",
+      "runs": [
+       {
+        "wall_s": 1.1132625570025994,
+        "cpu_s": 1.7473709999999998,
+        "maxrss_kb": 163560
+       },
+       {
+        "wall_s": 1.1611405389994616,
+        "cpu_s": 1.806214,
+        "maxrss_kb": 162800
+       },
+       {
+        "wall_s": 1.1794295599975158,
+        "cpu_s": 1.834664,
+        "maxrss_kb": 163184
+       },
+       {
+        "wall_s": 1.1068303570064018,
+        "cpu_s": 1.786823,
+        "maxrss_kb": 164300
+       },
+       {
+        "wall_s": 1.1315237230010098,
+        "cpu_s": 1.7190779999999999,
+        "maxrss_kb": 164504
+       },
+       {
+        "wall_s": 1.1780372970097233,
+        "cpu_s": 1.891405,
+        "maxrss_kb": 163836
+       },
+       {
+        "wall_s": 1.115455388004193,
+        "cpu_s": 1.737882,
+        "maxrss_kb": 163348
+       },
+       {
+        "wall_s": 1.0907258770021144,
+        "cpu_s": 1.7274809999999998,
+        "maxrss_kb": 164080
+       },
+       {
+        "wall_s": 1.243346453004051,
+        "cpu_s": 1.9819499999999999,
+        "maxrss_kb": 163176
+       },
+       {
+        "wall_s": 1.1863240240054438,
+        "cpu_s": 1.9130310000000001,
+        "maxrss_kb": 163908
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 1.1463321310002357,
+       "min_s": 1.0907258770021144,
+       "max_s": 1.243346453004051,
+       "mean_s": 1.1506075775032514,
+       "stdev_s": 0.04721933057510927,
+       "cpu_median_s": 1.7965185,
+       "maxrss_median_kb": 163698.0,
+       "maxrss_max_kb": 164504
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   },
+   "zap": {
+    "schema": 1,
+    "generated": "2026-11-04T19:47:33+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/tmp/zap-rf/bin/zap",
+     "realpath": "/tmp/zap-rf/bin/zap",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 10,
+    "cold_runs": 5,
+    "build_cold_runs": 3,
+    "env": {},
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.12588104399037547,
+     "end": 0.1270844760001637
+    },
+    "workloads": {
+     "vaxis": {
+      "description": "libvaxis 0620b34e091d examples/text_input.zig",
+      "commands": {
+       "build-exe": {
+        "cwd": "vaxis/libvaxis",
+        "argv": [
+         "zap",
+         "build-exe",
+         "--dep",
+         "vaxis",
+         "-Mroot=examples/text_input.zig",
+         "--dep",
+         "zigimg",
+         "--dep",
+         "uucode",
+         "-Mvaxis=src/main.zig",
+         "-Mzigimg=zig-pkg/zigimg-0.1.0-8_eo2sBLGACBebrhQZUwRliZNSUyDn6szp99eip_6-Rw/zigimg.zig",
+         "--dep",
+         "types.zig",
+         "--dep",
+         "config.zig",
+         "--dep",
+         "tables",
+         "-Muucode=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/root.zig",
+         "-Mtypes.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/types.zig",
+         "--dep",
+         "types.zig",
+         "--dep",
+         "storage.zig",
+         "-Mconfig.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/config.zig",
+         "--dep",
+         "config.zig",
+         "--dep",
+         "storage.zig",
+         "--dep",
+         "build_config",
+         "-Mtables=../gen/tables.zig",
+         "--dep",
+         "config.zig",
+         "-Mstorage.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/storage.zig",
+         "--dep",
+         "config.zig",
+         "--dep",
+         "storage.zig",
+         "-Mbuild_config=../gen/build_config.zig",
+         "--name",
+         "example-text_input",
+         "--cache-dir",
+         "../cache/local",
+         "--global-cache-dir",
+         "../cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "vaxis/libvaxis/examples/text_input.zig",
+        "anchor": "    const alloc = init.gpa;",
+        "line": 23
+       },
+       "lib": {
+        "file": "vaxis/libvaxis/src/Vaxis.zig",
+        "anchor": "    var started: bool = false;",
+        "line": 407
+       }
+      },
+      "libvaxis": {
+       "url": "https://github.com/rockorager/libvaxis",
+       "commit": "0620b34e091deaa6f64608922be3814147128dfb",
+       "patched": false
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "cold",
+      "runs": [
+       {
+        "wall_s": 0.6938174909882946,
+        "cpu_s": 1.6866249999999998,
+        "maxrss_kb": 104760
+       },
+       {
+        "wall_s": 0.7121763400064083,
+        "cpu_s": 1.72108,
+        "maxrss_kb": 108380
+       },
+       {
+        "wall_s": 0.7012508119951235,
+        "cpu_s": 1.7290699999999999,
+        "maxrss_kb": 105404
+       },
+       {
+        "wall_s": 0.683676785993157,
+        "cpu_s": 1.660027,
+        "maxrss_kb": 105172
+       },
+       {
+        "wall_s": 0.6784818610030925,
+        "cpu_s": 1.665401,
+        "maxrss_kb": 103580
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.6938174909882946,
+       "min_s": 0.6784818610030925,
+       "max_s": 0.7121763400064083,
+       "mean_s": 0.6938806579972152,
+       "stdev_s": 0.013512004782292832,
+       "cpu_median_s": 1.6866249999999998,
+       "maxrss_median_kb": 105172,
+       "maxrss_max_kb": 108380
+      },
+      "extra": {}
+     },
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 0.037631726008839905,
+        "cpu_s": 0.060251,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.03427267199731432,
+        "cpu_s": 0.041256999999999995,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.03244872999493964,
+        "cpu_s": 0.039132,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.03262505900056567,
+        "cpu_s": 0.039276,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.03394461900461465,
+        "cpu_s": 0.04119199999999999,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.03506342899345327,
+        "cpu_s": 0.041321,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.03363326199178118,
+        "cpu_s": 0.040354,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.03410106599039864,
+        "cpu_s": 0.040794,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.033488425993709825,
+        "cpu_s": 0.039911999999999996,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.033140362007543445,
+        "cpu_s": 0.03995,
+        "maxrss_kb": 19036
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.03378894049819792,
+       "min_s": 0.03244872999493964,
+       "max_s": 0.037631726008839905,
+       "mean_s": 0.03403493509831605,
+       "stdev_s": 0.0014842815475967757,
+       "cpu_median_s": 0.040574,
+       "maxrss_median_kb": 19036.0,
+       "maxrss_max_kb": 19036
+      },
+      "extra": {}
+     },
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "warm",
+      "runs": [
+       {
+        "wall_s": 0.001846768005634658,
+        "cpu_s": 0.001681,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.0018013980006799102,
+        "cpu_s": 0.0016099999999999999,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.0016812230023788288,
+        "cpu_s": 0.00153,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.0016585580015089363,
+        "cpu_s": 0.0014709999999999999,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.0015325709973694757,
+        "cpu_s": 0.001402,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.0015194830048130825,
+        "cpu_s": 0.001388,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.0015205729869194329,
+        "cpu_s": 0.0013939999999999998,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.0015209849952952936,
+        "cpu_s": 0.001398,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.0014760850026505068,
+        "cpu_s": 0.001352,
+        "maxrss_kb": 19036
+       },
+       {
+        "wall_s": 0.001508272995124571,
+        "cpu_s": 0.001377,
+        "maxrss_kb": 19036
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.0015267779963323846,
+       "min_s": 0.0014760850026505068,
+       "max_s": 0.001846768005634658,
+       "mean_s": 0.0016065916992374697,
+       "stdev_s": 0.0001326640545082685,
+       "cpu_median_s": 0.0014,
+       "maxrss_median_kb": 19036.0,
+       "maxrss_max_kb": 19036
+      },
+      "extra": {}
+     },
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "edit-root",
+      "runs": [
+       {
+        "wall_s": 0.0351348539988976,
+        "cpu_s": 0.038085,
+        "maxrss_kb": 30788
+       },
+       {
+        "wall_s": 0.03771991899702698,
+        "cpu_s": 0.040975,
+        "maxrss_kb": 30964
+       },
+       {
+        "wall_s": 0.038862420988152735,
+        "cpu_s": 0.041804999999999995,
+        "maxrss_kb": 30896
+       },
+       {
+        "wall_s": 0.038312724995194,
+        "cpu_s": 0.041371,
+        "maxrss_kb": 30820
+       },
+       {
+        "wall_s": 0.036932383009116165,
+        "cpu_s": 0.039769,
+        "maxrss_kb": 30884
+       },
+       {
+        "wall_s": 0.03809771499072667,
+        "cpu_s": 0.041158,
+        "maxrss_kb": 30836
+       },
+       {
+        "wall_s": 0.03822536100051366,
+        "cpu_s": 0.041120000000000004,
+        "maxrss_kb": 30872
+       },
+       {
+        "wall_s": 0.038235834988881834,
+        "cpu_s": 0.041328000000000004,
+        "maxrss_kb": 30948
+       },
+       {
+        "wall_s": 0.0407889860071009,
+        "cpu_s": 0.042859999999999995,
+        "maxrss_kb": 30916
+       },
+       {
+        "wall_s": 0.04192697899998166,
+        "cpu_s": 0.044828,
+        "maxrss_kb": 30860
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.038230597994697746,
+       "min_s": 0.0351348539988976,
+       "max_s": 0.04192697899998166,
+       "mean_s": 0.03842371779755922,
+       "stdev_s": 0.0018793933162613962,
+       "cpu_median_s": 0.041243,
+       "maxrss_median_kb": 30878.0,
+       "maxrss_max_kb": 30964
+      },
+      "extra": {}
+     },
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "edit-lib",
+      "runs": [
+       {
+        "wall_s": 0.04764227599662263,
+        "cpu_s": 0.054792999999999994,
+        "maxrss_kb": 32216
+       },
+       {
+        "wall_s": 0.051716531001147814,
+        "cpu_s": 0.058673,
+        "maxrss_kb": 31676
+       },
+       {
+        "wall_s": 0.05022974900202826,
+        "cpu_s": 0.056936,
+        "maxrss_kb": 31768
+       },
+       {
+        "wall_s": 0.05105003900825977,
+        "cpu_s": 0.058087,
+        "maxrss_kb": 31688
+       },
+       {
+        "wall_s": 0.049544394001713954,
+        "cpu_s": 0.056943999999999995,
+        "maxrss_kb": 31784
+       },
+       {
+        "wall_s": 0.04984271198918577,
+        "cpu_s": 0.057577,
+        "maxrss_kb": 31804
+       },
+       {
+        "wall_s": 0.06301169499056414,
+        "cpu_s": 0.069961,
+        "maxrss_kb": 31968
+       },
+       {
+        "wall_s": 0.05040377400291618,
+        "cpu_s": 0.05848,
+        "maxrss_kb": 31952
+       },
+       {
+        "wall_s": 0.04850248200818896,
+        "cpu_s": 0.055289,
+        "maxrss_kb": 32000
+       },
+       {
+        "wall_s": 0.04925527100567706,
+        "cpu_s": 0.056968,
+        "maxrss_kb": 32064
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.050036230495607015,
+       "min_s": 0.04764227599662263,
+       "max_s": 0.06301169499056414,
+       "mean_s": 0.05111989230063045,
+       "stdev_s": 0.00434122176548896,
+       "cpu_median_s": 0.057272500000000004,
+       "maxrss_median_kb": 31878.0,
+       "maxrss_max_kb": 32216
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   },
+   "zap-nodonor": {
+    "schema": 1,
+    "generated": "2026-11-04T19:47:40+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/tmp/zap-rf/bin/zap",
+     "realpath": "/tmp/zap-rf/bin/zap",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 10,
+    "cold_runs": 5,
+    "build_cold_runs": 3,
+    "env": {
+     "ZAP_CACHE_DONOR": "off"
+    },
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.13065648099291138,
+     "end": 0.13082563799980562
+    },
+    "workloads": {
+     "vaxis": {
+      "description": "libvaxis 0620b34e091d examples/text_input.zig",
+      "commands": {
+       "build-exe": {
+        "cwd": "vaxis/libvaxis",
+        "argv": [
+         "zap",
+         "build-exe",
+         "--dep",
+         "vaxis",
+         "-Mroot=examples/text_input.zig",
+         "--dep",
+         "zigimg",
+         "--dep",
+         "uucode",
+         "-Mvaxis=src/main.zig",
+         "-Mzigimg=zig-pkg/zigimg-0.1.0-8_eo2sBLGACBebrhQZUwRliZNSUyDn6szp99eip_6-Rw/zigimg.zig",
+         "--dep",
+         "types.zig",
+         "--dep",
+         "config.zig",
+         "--dep",
+         "tables",
+         "-Muucode=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/root.zig",
+         "-Mtypes.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/types.zig",
+         "--dep",
+         "types.zig",
+         "--dep",
+         "storage.zig",
+         "-Mconfig.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/config.zig",
+         "--dep",
+         "config.zig",
+         "--dep",
+         "storage.zig",
+         "--dep",
+         "build_config",
+         "-Mtables=../gen/tables.zig",
+         "--dep",
+         "config.zig",
+         "-Mstorage.zig=zig-pkg/uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/src/storage.zig",
+         "--dep",
+         "config.zig",
+         "--dep",
+         "storage.zig",
+         "-Mbuild_config=../gen/build_config.zig",
+         "--name",
+         "example-text_input",
+         "--cache-dir",
+         "../cache/local",
+         "--global-cache-dir",
+         "../cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "vaxis/libvaxis/examples/text_input.zig",
+        "anchor": "    const alloc = init.gpa;",
+        "line": 23
+       },
+       "lib": {
+        "file": "vaxis/libvaxis/src/Vaxis.zig",
+        "anchor": "    var started: bool = false;",
+        "line": 407
+       }
+      },
+      "libvaxis": {
+       "url": "https://github.com/rockorager/libvaxis",
+       "commit": "0620b34e091deaa6f64608922be3814147128dfb",
+       "patched": false
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "vaxis",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 0.4398908430011943,
+        "cpu_s": 0.637866,
+        "maxrss_kb": 82152
+       },
+       {
+        "wall_s": 0.43018739399849437,
+        "cpu_s": 0.644063,
+        "maxrss_kb": 82764
+       },
+       {
+        "wall_s": 0.4261335049959598,
+        "cpu_s": 0.612951,
+        "maxrss_kb": 82712
+       },
+       {
+        "wall_s": 0.4012980239931494,
+        "cpu_s": 0.5892189999999999,
+        "maxrss_kb": 83016
+       },
+       {
+        "wall_s": 0.4077273800066905,
+        "cpu_s": 0.5833929999999999,
+        "maxrss_kb": 82516
+       },
+       {
+        "wall_s": 0.39708900298865046,
+        "cpu_s": 0.5816429999999999,
+        "maxrss_kb": 82048
+       },
+       {
+        "wall_s": 0.39588474501215387,
+        "cpu_s": 0.5781540000000001,
+        "maxrss_kb": 83044
+       },
+       {
+        "wall_s": 0.3891843970050104,
+        "cpu_s": 0.5733929999999999,
+        "maxrss_kb": 82656
+       },
+       {
+        "wall_s": 0.3870266729936702,
+        "cpu_s": 0.573676,
+        "maxrss_kb": 82684
+       },
+       {
+        "wall_s": 0.4115089330007322,
+        "cpu_s": 0.6014309999999999,
+        "maxrss_kb": 82920
+       }
+      ],
+      "stats": {
+       "n": 10,
+       "median_s": 0.40451270199991995,
+       "min_s": 0.3870266729936702,
+       "max_s": 0.4398908430011943,
+       "mean_s": 0.40859308969957053,
+       "stdev_s": 0.018109705209990685,
+       "cpu_median_s": 0.586306,
+       "maxrss_median_kb": 82698.0,
+       "maxrss_max_kb": 83044
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   }
+  },
+  "zig": {
+   "zig": {
+    "schema": 1,
+    "generated": "2026-11-04T19:47:51+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/home/user/.local/bin/zig",
+     "realpath": "/home/user/.cache/zap/zig-0.17.1/zig",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 5,
+    "cold_runs": 3,
+    "build_cold_runs": 3,
+    "env": {},
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.12548065300507005,
+     "end": 0.12679503500112332
+    },
+    "workloads": {
+     "zig": {
+      "description": "upstream zig 0.17.1's compiler, src/main.zig without LLVM",
+      "commands": {
+       "build-exe": {
+        "cwd": "zig",
+        "argv": [
+         "zig",
+         "build-exe",
+         "--stack",
+         "48234496",
+         "-fno-sanitize-thread",
+         "-Odebug",
+         "--dep",
+         "build_options",
+         "-Mroot=src/main.zig",
+         "-Mbuild_options=build_options.zig",
+         "--name",
+         "zig",
+         "--cache-dir",
+         "cache/local",
+         "--global-cache-dir",
+         "cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "zig/src/main.zig",
+        "anchor": "    if (args.len > 0) crash_report.zig_argv0 = args[0];",
+        "line": 207
+       },
+       "lib": {
+        "file": "zig/src/Sema.zig",
+        "anchor": "    const file_scope = block.getFileScope(zcu);",
+        "line": 16051
+       }
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "cold",
+      "runs": [
+       {
+        "wall_s": 28.498775789994397,
+        "cpu_s": 46.206272,
+        "maxrss_kb": 1394992
+       },
+       {
+        "wall_s": 29.487231684004655,
+        "cpu_s": 48.059803,
+        "maxrss_kb": 1394384
+       },
+       {
+        "wall_s": 29.73687586399319,
+        "cpu_s": 48.482726,
+        "maxrss_kb": 1403608
+       }
+      ],
+      "stats": {
+       "n": 3,
+       "median_s": 29.487231684004655,
+       "min_s": 28.498775789994397,
+       "max_s": 29.73687586399319,
+       "mean_s": 29.24096111266408,
+       "stdev_s": 0.6547593787340997,
+       "cpu_median_s": 48.059803,
+       "maxrss_median_kb": 1394992,
+       "maxrss_max_kb": 1403608
+      },
+      "extra": {}
+     },
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 26.801445636010612,
+        "cpu_s": 47.060068,
+        "maxrss_kb": 1306872
+       },
+       {
+        "wall_s": 27.308907630998874,
+        "cpu_s": 47.437186,
+        "maxrss_kb": 1300244
+       },
+       {
+        "wall_s": 26.89922579699487,
+        "cpu_s": 46.578041999999996,
+        "maxrss_kb": 1300368
+       },
+       {
+        "wall_s": 25.247798244003206,
+        "cpu_s": 43.24087,
+        "maxrss_kb": 1303776
+       },
+       {
+        "wall_s": 25.08255776700389,
+        "cpu_s": 42.742386,
+        "maxrss_kb": 1311924
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 26.801445636010612,
+       "min_s": 25.08255776700389,
+       "max_s": 27.308907630998874,
+       "mean_s": 26.26798701500229,
+       "stdev_s": 1.0262290021614273,
+       "cpu_median_s": 46.578041999999996,
+       "maxrss_median_kb": 1303776,
+       "maxrss_max_kb": 1311924
+      },
+      "extra": {}
+     },
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "warm",
+      "runs": [
+       {
+        "wall_s": 24.872422386004473,
+        "cpu_s": 42.252579,
+        "maxrss_kb": 1207436
+       },
+       {
+        "wall_s": 25.29566755599808,
+        "cpu_s": 43.600728000000004,
+        "maxrss_kb": 1206660
+       },
+       {
+        "wall_s": 25.13777998900332,
+        "cpu_s": 42.570105,
+        "maxrss_kb": 1209840
+       },
+       {
+        "wall_s": 25.046518365998054,
+        "cpu_s": 42.674118,
+        "maxrss_kb": 1211928
+       },
+       {
+        "wall_s": 26.077416587999323,
+        "cpu_s": 44.363977,
+        "maxrss_kb": 1209764
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 25.13777998900332,
+       "min_s": 24.872422386004473,
+       "max_s": 26.077416587999323,
+       "mean_s": 25.28596097700065,
+       "stdev_s": 0.4681881932694975,
+       "cpu_median_s": 42.674118,
+       "maxrss_median_kb": 1209764,
+       "maxrss_max_kb": 1211928
+      },
+      "extra": {}
+     },
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "edit-root",
+      "runs": [
+       {
+        "wall_s": 25.55664457999228,
+        "cpu_s": 43.755015,
+        "maxrss_kb": 1216200
+       },
+       {
+        "wall_s": 25.133701762999408,
+        "cpu_s": 42.956913,
+        "maxrss_kb": 1208548
+       },
+       {
+        "wall_s": 25.727231016004225,
+        "cpu_s": 43.948138,
+        "maxrss_kb": 1211324
+       },
+       {
+        "wall_s": 28.25123542000074,
+        "cpu_s": 47.723073,
+        "maxrss_kb": 1213316
+       },
+       {
+        "wall_s": 25.30557576099818,
+        "cpu_s": 43.533407999999994,
+        "maxrss_kb": 1208472
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 25.55664457999228,
+       "min_s": 25.133701762999408,
+       "max_s": 28.25123542000074,
+       "mean_s": 25.994877707998967,
+       "stdev_s": 1.2817560545120397,
+       "cpu_median_s": 43.755015,
+       "maxrss_median_kb": 1211324,
+       "maxrss_max_kb": 1216200
+      },
+      "extra": {}
+     },
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "edit-lib",
+      "runs": [
+       {
+        "wall_s": 25.513128626989783,
+        "cpu_s": 43.754387,
+        "maxrss_kb": 1212744
+       },
+       {
+        "wall_s": 25.55588747699221,
+        "cpu_s": 44.446917,
+        "maxrss_kb": 1227384
+       },
+       {
+        "wall_s": 25.311922638997203,
+        "cpu_s": 43.312576,
+        "maxrss_kb": 1221396
+       },
+       {
+        "wall_s": 25.957383198998286,
+        "cpu_s": 44.429037,
+        "maxrss_kb": 1215668
+       },
+       {
+        "wall_s": 25.428272652992746,
+        "cpu_s": 43.823988,
+        "maxrss_kb": 1216800
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 25.513128626989783,
+       "min_s": 25.311922638997203,
+       "max_s": 25.957383198998286,
+       "mean_s": 25.553318918994044,
+       "stdev_s": 0.24433508347866528,
+       "cpu_median_s": 43.823988,
+       "maxrss_median_kb": 1216800,
+       "maxrss_max_kb": 1227384
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   },
+   "zap": {
+    "schema": 1,
+    "generated": "2026-11-04T19:59:53+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/tmp/zap-rf/bin/zap",
+     "realpath": "/tmp/zap-rf/bin/zap",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 5,
+    "cold_runs": 3,
+    "build_cold_runs": 3,
+    "env": {},
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.1271377139928518,
+     "end": 0.12864155699207913
+    },
+    "workloads": {
+     "zig": {
+      "description": "upstream zig 0.17.1's compiler, src/main.zig without LLVM",
+      "commands": {
+       "build-exe": {
+        "cwd": "zig",
+        "argv": [
+         "zap",
+         "build-exe",
+         "--stack",
+         "48234496",
+         "-fno-sanitize-thread",
+         "-Odebug",
+         "--dep",
+         "build_options",
+         "-Mroot=src/main.zig",
+         "-Mbuild_options=build_options.zig",
+         "--name",
+         "zig",
+         "--cache-dir",
+         "cache/local",
+         "--global-cache-dir",
+         "cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "zig/src/main.zig",
+        "anchor": "    if (args.len > 0) crash_report.zig_argv0 = args[0];",
+        "line": 207
+       },
+       "lib": {
+        "file": "zig/src/Sema.zig",
+        "anchor": "    const file_scope = block.getFileScope(zcu);",
+        "line": 16051
+       }
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "cold",
+      "runs": [
+       {
+        "wall_s": 13.243972438998753,
+        "cpu_s": 21.479101,
+        "maxrss_kb": 1328508
+       },
+       {
+        "wall_s": 13.500167933001649,
+        "cpu_s": 21.978548999999997,
+        "maxrss_kb": 1317300
+       },
+       {
+        "wall_s": 12.958080063006491,
+        "cpu_s": 21.05213,
+        "maxrss_kb": 1322124
+       }
+      ],
+      "stats": {
+       "n": 3,
+       "median_s": 13.243972438998753,
+       "min_s": 12.958080063006491,
+       "max_s": 13.500167933001649,
+       "mean_s": 13.234073478335631,
+       "stdev_s": 0.27117947334860937,
+       "cpu_median_s": 21.479101,
+       "maxrss_median_kb": 1322124,
+       "maxrss_max_kb": 1328508
+      },
+      "extra": {}
+     },
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 0.24197177599126007,
+        "cpu_s": 0.49307999999999996,
+        "maxrss_kb": 339504
+       },
+       {
+        "wall_s": 0.24987333499302622,
+        "cpu_s": 0.47640499999999997,
+        "maxrss_kb": 338340
+       },
+       {
+        "wall_s": 0.24317677499493584,
+        "cpu_s": 0.467377,
+        "maxrss_kb": 339572
+       },
+       {
+        "wall_s": 0.22819461800099816,
+        "cpu_s": 0.4453039999999999,
+        "maxrss_kb": 341544
+       },
+       {
+        "wall_s": 0.2292420509911608,
+        "cpu_s": 0.43762900000000005,
+        "maxrss_kb": 340484
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.24197177599126007,
+       "min_s": 0.22819461800099816,
+       "max_s": 0.24987333499302622,
+       "mean_s": 0.2384917109942762,
+       "stdev_s": 0.009423221001970083,
+       "cpu_median_s": 0.467377,
+       "maxrss_median_kb": 339572,
+       "maxrss_max_kb": 341544
+      },
+      "extra": {}
+     },
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "warm",
+      "runs": [
+       {
+        "wall_s": 0.0028753229998983443,
+        "cpu_s": 0.002619,
+        "maxrss_kb": 23552
+       },
+       {
+        "wall_s": 0.0026401790091767907,
+        "cpu_s": 0.002415,
+        "maxrss_kb": 23552
+       },
+       {
+        "wall_s": 0.0028036150033585727,
+        "cpu_s": 0.0025429999999999997,
+        "maxrss_kb": 23552
+       },
+       {
+        "wall_s": 0.0027430829941295087,
+        "cpu_s": 0.0024749999999999998,
+        "maxrss_kb": 23552
+       },
+       {
+        "wall_s": 0.003023263008799404,
+        "cpu_s": 0.002742,
+        "maxrss_kb": 23552
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.0028036150033585727,
+       "min_s": 0.0026401790091767907,
+       "max_s": 0.003023263008799404,
+       "mean_s": 0.002817092603072524,
+       "stdev_s": 0.00014392229060080543,
+       "cpu_median_s": 0.0025429999999999997,
+       "maxrss_median_kb": 23552,
+       "maxrss_max_kb": 23552
+      },
+      "extra": {}
+     },
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "edit-root",
+      "runs": [
+       {
+        "wall_s": 0.3029389360017376,
+        "cpu_s": 0.524674,
+        "maxrss_kb": 548460
+       },
+       {
+        "wall_s": 0.39561898600368295,
+        "cpu_s": 0.607409,
+        "maxrss_kb": 547752
+       },
+       {
+        "wall_s": 0.39554432399745565,
+        "cpu_s": 0.598295,
+        "maxrss_kb": 547144
+       },
+       {
+        "wall_s": 0.41149186600523535,
+        "cpu_s": 0.6133109999999999,
+        "maxrss_kb": 546412
+       },
+       {
+        "wall_s": 0.41349500900832936,
+        "cpu_s": 0.6120869999999999,
+        "maxrss_kb": 545740
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.39561898600368295,
+       "min_s": 0.3029389360017376,
+       "max_s": 0.41349500900832936,
+       "mean_s": 0.3838178242032882,
+       "stdev_s": 0.0460020669687491,
+       "cpu_median_s": 0.607409,
+       "maxrss_median_kb": 547144,
+       "maxrss_max_kb": 548460
+      },
+      "extra": {}
+     },
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "edit-lib",
+      "runs": [
+       {
+        "wall_s": 0.6497516490053385,
+        "cpu_s": 0.9409719999999999,
+        "maxrss_kb": 567576
+       },
+       {
+        "wall_s": 0.6395917070040014,
+        "cpu_s": 0.939453,
+        "maxrss_kb": 571988
+       },
+       {
+        "wall_s": 0.6273607540060766,
+        "cpu_s": 0.904771,
+        "maxrss_kb": 570168
+       },
+       {
+        "wall_s": 0.677524661005009,
+        "cpu_s": 0.973347,
+        "maxrss_kb": 572824
+       },
+       {
+        "wall_s": 0.6421138629957568,
+        "cpu_s": 0.932213,
+        "maxrss_kb": 571920
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.6421138629957568,
+       "min_s": 0.6273607540060766,
+       "max_s": 0.677524661005009,
+       "mean_s": 0.6472685268032364,
+       "stdev_s": 0.018731144463484117,
+       "cpu_median_s": 0.939453,
+       "maxrss_median_kb": 571920,
+       "maxrss_max_kb": 572824
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   },
+   "zap-nodonor": {
+    "schema": 1,
+    "generated": "2026-11-04T20:00:44+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/tmp/zap-rf/bin/zap",
+     "realpath": "/tmp/zap-rf/bin/zap",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 5,
+    "cold_runs": 3,
+    "build_cold_runs": 3,
+    "env": {
+     "ZAP_CACHE_DONOR": "off"
+    },
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.12832866801181808,
+     "end": 0.1259170750126941
+    },
+    "workloads": {
+     "zig": {
+      "description": "upstream zig 0.17.1's compiler, src/main.zig without LLVM",
+      "commands": {
+       "build-exe": {
+        "cwd": "zig",
+        "argv": [
+         "zap",
+         "build-exe",
+         "--stack",
+         "48234496",
+         "-fno-sanitize-thread",
+         "-Odebug",
+         "--dep",
+         "build_options",
+         "-Mroot=src/main.zig",
+         "-Mbuild_options=build_options.zig",
+         "--name",
+         "zig",
+         "--cache-dir",
+         "cache/local",
+         "--global-cache-dir",
+         "cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "zig/src/main.zig",
+        "anchor": "    if (args.len > 0) crash_report.zig_argv0 = args[0];",
+        "line": 207
+       },
+       "lib": {
+        "file": "zig/src/Sema.zig",
+        "anchor": "    const file_scope = block.getFileScope(zcu);",
+        "line": 16051
+       }
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "zig",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 12.393101224995917,
+        "cpu_s": 18.627214,
+        "maxrss_kb": 1312364
+       },
+       {
+        "wall_s": 12.273665232991334,
+        "cpu_s": 18.553314,
+        "maxrss_kb": 1315272
+       },
+       {
+        "wall_s": 12.806997965002665,
+        "cpu_s": 19.413539999999998,
+        "maxrss_kb": 1323212
+       },
+       {
+        "wall_s": 12.115393868996762,
+        "cpu_s": 18.436802999999998,
+        "maxrss_kb": 1331404
+       },
+       {
+        "wall_s": 11.91059092299838,
+        "cpu_s": 18.492753999999998,
+        "maxrss_kb": 1327916
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 12.273665232991334,
+       "min_s": 11.91059092299838,
+       "max_s": 12.806997965002665,
+       "mean_s": 12.299949842997012,
+       "stdev_s": 0.3362019983739678,
+       "cpu_median_s": 18.553314,
+       "maxrss_median_kb": 1323212,
+       "maxrss_max_kb": 1331404
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   }
+  },
+  "std": {
+   "zig": {
+    "schema": 1,
+    "generated": "2026-11-04T20:01:53+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/home/user/.local/bin/zig",
+     "realpath": "/home/user/.cache/zap/zig-0.17.1/zig",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 5,
+    "cold_runs": 3,
+    "build_cold_runs": 3,
+    "env": {},
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.12925763399107382,
+     "end": 0.13114827800018247
+    },
+    "workloads": {
+     "std": {
+      "description": "std's own tests, `zig test lib/std/std.zig --test-no-exec`",
+      "commands": {
+       "build-exe": {
+        "cwd": "std",
+        "argv": [
+         "zig",
+         "test",
+         "zig-lib/std/std.zig",
+         "--zig-lib-dir",
+         "zig-lib",
+         "--test-no-exec",
+         "-femit-bin=std-test",
+         "--cache-dir",
+         "cache/local",
+         "--global-cache-dir",
+         "cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "std/zig-lib/std/mem.zig",
+        "anchor": "    try testing.expect(eql(u8, \"abcd\", \"abcd\"));",
+        "line": 817
+       },
+       "lib": {
+        "file": "std/zig-lib/std/debug.zig",
+        "anchor": "    stderr.file_writer.interface.print(fmt, args) catch return;",
+        "line": 330
+       }
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "cold",
+      "runs": [
+       {
+        "wall_s": 22.693773599006818,
+        "cpu_s": 30.669651,
+        "maxrss_kb": 1004408
+       },
+       {
+        "wall_s": 21.678195434011286,
+        "cpu_s": 29.39583,
+        "maxrss_kb": 998484
+       },
+       {
+        "wall_s": 22.040059416001895,
+        "cpu_s": 29.857995000000003,
+        "maxrss_kb": 986808
+       }
+      ],
+      "stats": {
+       "n": 3,
+       "median_s": 22.040059416001895,
+       "min_s": 21.678195434011286,
+       "max_s": 22.693773599006818,
+       "mean_s": 22.13734281634,
+       "stdev_s": 0.5147308007977867,
+       "cpu_median_s": 29.857995000000003,
+       "maxrss_median_kb": 998484,
+       "maxrss_max_kb": 1004408
+      },
+      "extra": {}
+     },
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 16.910605305005447,
+        "cpu_s": 24.577188,
+        "maxrss_kb": 901460
+       },
+       {
+        "wall_s": 17.241028927994194,
+        "cpu_s": 25.144099,
+        "maxrss_kb": 898308
+       },
+       {
+        "wall_s": 16.846968967001885,
+        "cpu_s": 24.631913,
+        "maxrss_kb": 903648
+       },
+       {
+        "wall_s": 16.69037623600161,
+        "cpu_s": 24.290545,
+        "maxrss_kb": 915996
+       },
+       {
+        "wall_s": 16.342828224005643,
+        "cpu_s": 23.867739,
+        "maxrss_kb": 898844
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 16.846968967001885,
+       "min_s": 16.342828224005643,
+       "max_s": 17.241028927994194,
+       "mean_s": 16.806361532001755,
+       "stdev_s": 0.32778315607892416,
+       "cpu_median_s": 24.577188,
+       "maxrss_median_kb": 901460,
+       "maxrss_max_kb": 915996
+      },
+      "extra": {}
+     },
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "warm",
+      "runs": [
+       {
+        "wall_s": 16.891698459992767,
+        "cpu_s": 24.828234,
+        "maxrss_kb": 902264
+       },
+       {
+        "wall_s": 17.017604170003324,
+        "cpu_s": 25.082182000000003,
+        "maxrss_kb": 901892
+       },
+       {
+        "wall_s": 16.88154651399236,
+        "cpu_s": 24.499533,
+        "maxrss_kb": 899464
+       },
+       {
+        "wall_s": 16.850596564996522,
+        "cpu_s": 24.411046,
+        "maxrss_kb": 901712
+       },
+       {
+        "wall_s": 17.931190511997556,
+        "cpu_s": 26.322623,
+        "maxrss_kb": 899832
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 16.891698459992767,
+       "min_s": 16.850596564996522,
+       "max_s": 17.931190511997556,
+       "mean_s": 17.114527244196506,
+       "stdev_s": 0.4609569031985758,
+       "cpu_median_s": 24.828234,
+       "maxrss_median_kb": 901712,
+       "maxrss_max_kb": 902264
+      },
+      "extra": {}
+     },
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "edit-root",
+      "runs": [
+       {
+        "wall_s": 21.659849358999054,
+        "cpu_s": 29.984638,
+        "maxrss_kb": 965440
+       },
+       {
+        "wall_s": 21.641406834009103,
+        "cpu_s": 29.731538999999998,
+        "maxrss_kb": 962772
+       },
+       {
+        "wall_s": 21.134508061993984,
+        "cpu_s": 28.831454,
+        "maxrss_kb": 962996
+       },
+       {
+        "wall_s": 20.87815030400816,
+        "cpu_s": 28.950618000000002,
+        "maxrss_kb": 959576
+       },
+       {
+        "wall_s": 22.342533728005947,
+        "cpu_s": 31.268848,
+        "maxrss_kb": 960604
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 21.641406834009103,
+       "min_s": 20.87815030400816,
+       "max_s": 22.342533728005947,
+       "mean_s": 21.53128965740325,
+       "stdev_s": 0.5636481573098062,
+       "cpu_median_s": 29.731538999999998,
+       "maxrss_median_kb": 962772,
+       "maxrss_max_kb": 965440
+      },
+      "extra": {}
+     },
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "edit-lib",
+      "runs": [
+       {
+        "wall_s": 21.20694907500001,
+        "cpu_s": 29.063615,
+        "maxrss_kb": 962416
+       },
+       {
+        "wall_s": 21.051233521007816,
+        "cpu_s": 28.979815000000002,
+        "maxrss_kb": 968576
+       },
+       {
+        "wall_s": 20.576465316000395,
+        "cpu_s": 28.561401,
+        "maxrss_kb": 960728
+       },
+       {
+        "wall_s": 21.03795944599551,
+        "cpu_s": 28.999919,
+        "maxrss_kb": 958476
+       },
+       {
+        "wall_s": 21.209936444996856,
+        "cpu_s": 29.366729999999997,
+        "maxrss_kb": 963984
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 21.051233521007816,
+       "min_s": 20.576465316000395,
+       "max_s": 21.209936444996856,
+       "mean_s": 21.016508760600118,
+       "stdev_s": 0.2593192802629167,
+       "cpu_median_s": 28.999919,
+       "maxrss_median_kb": 962416,
+       "maxrss_max_kb": 968576
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   },
+   "zap": {
+    "schema": 1,
+    "generated": "2026-11-04T20:10:43+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/tmp/zap-rf/bin/zap",
+     "realpath": "/tmp/zap-rf/bin/zap",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 5,
+    "cold_runs": 3,
+    "build_cold_runs": 3,
+    "env": {},
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.1354436810070183,
+     "end": 0.1366958269936731
+    },
+    "workloads": {
+     "std": {
+      "description": "std's own tests, `zig test lib/std/std.zig --test-no-exec`",
+      "commands": {
+       "build-exe": {
+        "cwd": "std",
+        "argv": [
+         "zap",
+         "test",
+         "zig-lib/std/std.zig",
+         "--zig-lib-dir",
+         "zig-lib",
+         "--test-no-exec",
+         "-femit-bin=std-test",
+         "--cache-dir",
+         "cache/local",
+         "--global-cache-dir",
+         "cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "std/zig-lib/std/mem.zig",
+        "anchor": "    try testing.expect(eql(u8, \"abcd\", \"abcd\"));",
+        "line": 817
+       },
+       "lib": {
+        "file": "std/zig-lib/std/debug.zig",
+        "anchor": "    stderr.file_writer.interface.print(fmt, args) catch return;",
+        "line": 330
+       }
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "cold",
+      "runs": [
+       {
+        "wall_s": 8.856913746989449,
+        "cpu_s": 12.341411,
+        "maxrss_kb": 771076
+       },
+       {
+        "wall_s": 9.08988259799662,
+        "cpu_s": 12.565743999999999,
+        "maxrss_kb": 772412
+       },
+       {
+        "wall_s": 9.06958264199784,
+        "cpu_s": 12.514363,
+        "maxrss_kb": 771104
+       }
+      ],
+      "stats": {
+       "n": 3,
+       "median_s": 9.06958264199784,
+       "min_s": 8.856913746989449,
+       "max_s": 9.08988259799662,
+       "mean_s": 9.00545966232797,
+       "stdev_s": 0.12904432872547106,
+       "cpu_median_s": 12.514363,
+       "maxrss_median_kb": 771104,
+       "maxrss_max_kb": 772412
+      },
+      "extra": {}
+     },
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 0.12190311000449583,
+        "cpu_s": 0.236287,
+        "maxrss_kb": 172796
+       },
+       {
+        "wall_s": 0.11251064999669325,
+        "cpu_s": 0.21128399999999997,
+        "maxrss_kb": 172368
+       },
+       {
+        "wall_s": 0.10643182999046985,
+        "cpu_s": 0.203133,
+        "maxrss_kb": 171984
+       },
+       {
+        "wall_s": 0.10708434600383043,
+        "cpu_s": 0.2066,
+        "maxrss_kb": 173084
+       },
+       {
+        "wall_s": 0.10465488600311801,
+        "cpu_s": 0.200922,
+        "maxrss_kb": 173392
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.10708434600383043,
+       "min_s": 0.10465488600311801,
+       "max_s": 0.12190311000449583,
+       "mean_s": 0.11051696439972147,
+       "stdev_s": 0.007008106900477498,
+       "cpu_median_s": 0.2066,
+       "maxrss_median_kb": 172796,
+       "maxrss_max_kb": 173392
+      },
+      "extra": {}
+     },
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "warm",
+      "runs": [
+       {
+        "wall_s": 0.0021150120010133833,
+        "cpu_s": 0.001911,
+        "maxrss_kb": 19448
+       },
+       {
+        "wall_s": 0.0019957869953941554,
+        "cpu_s": 0.001815,
+        "maxrss_kb": 19448
+       },
+       {
+        "wall_s": 0.0018429580086376518,
+        "cpu_s": 0.001674,
+        "maxrss_kb": 19448
+       },
+       {
+        "wall_s": 0.0018098970031132922,
+        "cpu_s": 0.00166,
+        "maxrss_kb": 19448
+       },
+       {
+        "wall_s": 0.0017794960003811866,
+        "cpu_s": 0.00165,
+        "maxrss_kb": 19448
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.0018429580086376518,
+       "min_s": 0.0017794960003811866,
+       "max_s": 0.0021150120010133833,
+       "mean_s": 0.0019086300017079338,
+       "stdev_s": 0.00014223789682228118,
+       "cpu_median_s": 0.001674,
+       "maxrss_median_kb": 19448,
+       "maxrss_max_kb": 19448
+      },
+      "extra": {}
+     },
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "edit-root",
+      "runs": [
+       {
+        "wall_s": 0.17332097300095484,
+        "cpu_s": 0.27435299999999996,
+        "maxrss_kb": 321648
+       },
+       {
+        "wall_s": 0.21269739601120818,
+        "cpu_s": 0.312907,
+        "maxrss_kb": 321632
+       },
+       {
+        "wall_s": 0.21944387999246828,
+        "cpu_s": 0.32188,
+        "maxrss_kb": 321664
+       },
+       {
+        "wall_s": 0.21702919800009113,
+        "cpu_s": 0.315741,
+        "maxrss_kb": 321084
+       },
+       {
+        "wall_s": 0.22232843699748628,
+        "cpu_s": 0.338201,
+        "maxrss_kb": 321680
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.21702919800009113,
+       "min_s": 0.17332097300095484,
+       "max_s": 0.22232843699748628,
+       "mean_s": 0.20896397680044174,
+       "stdev_s": 0.02023516184223311,
+       "cpu_median_s": 0.315741,
+       "maxrss_median_kb": 321648,
+       "maxrss_max_kb": 321680
+      },
+      "extra": {}
+     },
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "edit-lib",
+      "runs": [
+       {
+        "wall_s": 0.4595690099959029,
+        "cpu_s": 0.611387,
+        "maxrss_kb": 365228
+       },
+       {
+        "wall_s": 0.37699941599566955,
+        "cpu_s": 0.515986,
+        "maxrss_kb": 370132
+       },
+       {
+        "wall_s": 0.3890076100069564,
+        "cpu_s": 0.513891,
+        "maxrss_kb": 371848
+       },
+       {
+        "wall_s": 0.3779297219880391,
+        "cpu_s": 0.5184089999999999,
+        "maxrss_kb": 372976
+       },
+       {
+        "wall_s": 0.37903145400923677,
+        "cpu_s": 0.512133,
+        "maxrss_kb": 373320
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 0.37903145400923677,
+       "min_s": 0.37699941599566955,
+       "max_s": 0.4595690099959029,
+       "mean_s": 0.3965074423991609,
+       "stdev_s": 0.03558129337765671,
+       "cpu_median_s": 0.515986,
+       "maxrss_median_kb": 371848,
+       "maxrss_max_kb": 373320
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   },
+   "zap-nodonor": {
+    "schema": 1,
+    "generated": "2026-11-04T20:11:17+00:00",
+    "harness_commit": "d47bcde",
+    "machine": {
+     "note": "Amp orb, 4 vCPU",
+     "logical_cpus": 4,
+     "kernel": "6.1.158+",
+     "os": "Linux",
+     "arch": "x86_64",
+     "python": "3.11.6",
+     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+     "mem_total_gib": 7.8
+    },
+    "compiler": {
+     "path": "/tmp/zap-rf/bin/zap",
+     "realpath": "/tmp/zap-rf/bin/zap",
+     "version": "0.17.1",
+     "default_backend": "stage2_x86_64",
+     "default_mode": "debug",
+     "object_format": "elf"
+    },
+    "runs": 5,
+    "cold_runs": 3,
+    "build_cold_runs": 3,
+    "env": {
+     "ZAP_CACHE_DONOR": "off"
+    },
+    "scenario_descriptions": {
+     "cold": "empty local and global caches",
+     "cold-local": "empty local cache, warm global cache (compiler_rt, build runner)",
+     "warm": "rebuild, no change",
+     "edit-root": "rebuild after a one-line edit to a function body in the root file",
+     "edit-lib": "rebuild after a one-line edit to a function body in a library file",
+     "incr-cli-edit-root": "edit-root with -fincremental, one compiler process per build",
+     "incr-cli-edit-lib": "edit-lib with -fincremental, one compiler process per build",
+     "incr-edit-root": "edit-root, in-process incremental update (-fincremental, compiler kept alive)",
+     "incr-edit-lib": "edit-lib, in-process incremental update (-fincremental, compiler kept alive)"
+    },
+    "calibration_s": {
+     "start": 0.12551852100295946,
+     "end": 0.12570563500048593
+    },
+    "workloads": {
+     "std": {
+      "description": "std's own tests, `zig test lib/std/std.zig --test-no-exec`",
+      "commands": {
+       "build-exe": {
+        "cwd": "std",
+        "argv": [
+         "zap",
+         "test",
+         "zig-lib/std/std.zig",
+         "--zig-lib-dir",
+         "zig-lib",
+         "--test-no-exec",
+         "-femit-bin=std-test",
+         "--cache-dir",
+         "cache/local",
+         "--global-cache-dir",
+         "cache/global"
+        ]
+       }
+      },
+      "edits": {
+       "root": {
+        "file": "std/zig-lib/std/mem.zig",
+        "anchor": "    try testing.expect(eql(u8, \"abcd\", \"abcd\"));",
+        "line": 817
+       },
+       "lib": {
+        "file": "std/zig-lib/std/debug.zig",
+        "anchor": "    stderr.file_writer.interface.print(fmt, args) catch return;",
+        "line": 330
+       }
+      }
+     }
+    },
+    "results": [
+     {
+      "workload": "std",
+      "mode": "build-exe",
+      "scenario": "cold-local",
+      "runs": [
+       {
+        "wall_s": 8.420561496997834,
+        "cpu_s": 11.080400000000001,
+        "maxrss_kb": 770212
+       },
+       {
+        "wall_s": 8.54990469099721,
+        "cpu_s": 11.146063000000002,
+        "maxrss_kb": 766276
+       },
+       {
+        "wall_s": 8.55473026499385,
+        "cpu_s": 11.171282,
+        "maxrss_kb": 770404
+       },
+       {
+        "wall_s": 8.507174111990025,
+        "cpu_s": 10.961428999999999,
+        "maxrss_kb": 767428
+       },
+       {
+        "wall_s": 8.414667466990068,
+        "cpu_s": 10.934225000000001,
+        "maxrss_kb": 768936
+       }
+      ],
+      "stats": {
+       "n": 5,
+       "median_s": 8.507174111990025,
+       "min_s": 8.414667466990068,
+       "max_s": 8.55473026499385,
+       "mean_s": 8.489407606393797,
+       "stdev_s": 0.06813308834597571,
+       "cpu_median_s": 11.080400000000001,
+       "maxrss_median_kb": 768936,
+       "maxrss_max_kb": 770404
+      },
+      "extra": {}
+     }
+    ],
+    "skipped": []
+   }
+  }
+ },
+ "corpus": [
+  {
+   "project": "zls",
+   "target": "zls",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 1.6086316550063202,
+    "compile_exit": 0,
+    "cold_local_donor": 0.05228121501568239,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.09485428199695889
+   },
+   "zig": {
+    "cold_local": 2.908854658002383,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.9655965179990744
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zls",
+   "target": "lsp-codegen",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.47808639900176786,
+    "compile_exit": 0,
+    "cold_local_donor": 0.032113820998347364,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.05176011600997299
+   },
+   "zig": {
+    "cold_local": 0.9513737980014412,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.9726187330088578
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zls",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 1.5338981709937798,
+    "compile_exit": 0,
+    "cold_local_donor": 0.05914026699610986,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.08039610099513084
+   },
+   "zig": {
+    "cold_local": 2.770639274996938,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.735197893998702
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zls",
+   "target": "src test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.6216564130008919,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03292126199812628,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.03290568001102656
+   },
+   "zig": {
+    "cold_local": 1.2918678849964635,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.2970852939906763
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "ghostty",
+   "target": "ghostty-vt-test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 1.8825430309952935,
+    "compile_exit": -11,
+    "error": ""
+   },
+   "zig": {
+    "cold_local": 25.818126049998682,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 25.42289414300467
+   },
+   "verdict": "zap: crash (-11)"
+  },
+  {
+   "project": "ghostty",
+   "target": "props-unigen",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.3444812880043173,
+    "compile_exit": 0,
+    "cold_local_donor": 0.031031701000756584,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.03595662899897434
+   },
+   "zig": {
+    "cold_local": 0.8853040509857237,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.7754093050025403
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "ghostty",
+   "target": "symbols-unigen",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.34361258399439976,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03231621699524112,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.04188729698944371
+   },
+   "zig": {
+    "cold_local": 0.8951600190048339,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.7942718400008744
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "ghostty",
+   "target": "uucode_generate",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.43510985899774823,
+    "compile_exit": 0,
+    "cold_local_donor": 0.024766985996393487,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.0939218669955153
+   },
+   "zig": {
+    "cold_local": 0.903269241011003,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.8559005590068409
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "superhtml",
+   "target": "superhtml",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 1.4239581299916608,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03849274999811314,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.06056540099962149
+   },
+   "zig": {
+    "cold_local": 3.0222619880078128,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.997155021002982
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "superhtml",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 1.2481171219988028,
+    "compile_exit": 0,
+    "cold_local_donor": 0.039096520995371975,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.08116496998991352
+   },
+   "zig": {
+    "cold_local": 2.8447897600126453,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.7634744809911354
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "superhtml",
+   "target": "language-tag-parser",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.2909118119860068,
+    "compile_exit": 0,
+    "cold_local_donor": 0.023076320983818732,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.038401727011660114
+   },
+   "zig": {
+    "cold_local": 0.524016355004278,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.526515733989072
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "ziggy",
+   "target": "ziggy",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.7126563670026371,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03400341900123749,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.04636928500258364
+   },
+   "zig": {
+    "cold_local": 1.331436456006486,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.3945916429947829
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "ziggy",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.4924218550149817,
+    "compile_exit": 0,
+    "cold_local_donor": 0.030281825005658902,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.0495164079911774
+   },
+   "zig": {
+    "cold_local": 0.8723326550098136,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.8677514830051223
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "z2d",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.7337695699825417,
+    "compile_exit": 0,
+    "cold_local_donor": 0.032468087985762395,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.038195310000446625
+   },
+   "zig": {
+    "cold_local": 1.455574005987728,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.37148599801003
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zf",
+   "target": "zf",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.41404885800147895,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03665417000593152,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.0423090289987158
+   },
+   "zig": {
+    "cold_local": 1.3825860770011786,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.1178341750055552
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zf",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.25684626400470734,
+    "compile_exit": 0,
+    "cold_local_donor": 0.022535002004588023,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.02787403200636618
+   },
+   "zig": {
+    "cold_local": 0.523878452993813,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.5423987620015396
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-clap",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.3792532559891697,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02238430400029756,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.02547190000768751
+   },
+   "zig": {
+    "cold_local": 0.6447827839874662,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.6335422650008695
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-clap",
+   "target": "simple",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.24172223899222445,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02869240299332887,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.040606579001178034
+   },
+   "zig": {
+    "cold_local": 0.48077578900847584,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.46945731800224166
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-clap",
+   "target": "subcommands",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.23380497000471223,
+    "compile_exit": 0,
+    "cold_local_donor": 0.023333235003519803,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.03194247199280653
+   },
+   "zig": {
+    "cold_local": 0.4722908579860814,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.49550639200606383
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-clap",
+   "target": "usage",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.22303218900924549,
+    "compile_exit": 0,
+    "cold_local_donor": 0.020886964004603215,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.03215574500791263
+   },
+   "zig": {
+    "cold_local": 0.46639829098421615,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.4635282770032063
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "anyzig",
+   "target": "zig",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 1.651165511997533,
+    "compile_exit": 0,
+    "cold_local_donor": 0.035310314007801935,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.06496524800604675
+   },
+   "zig": {
+    "cold_local": 3.09542030900775,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 3.1182318509963807
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "anyzig",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.3499834410031326,
+    "compile_exit": 0,
+    "cold_local_donor": 0.04654184399987571,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.7198754960118094,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "zine",
+   "target": "translate-c",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 1.632590142005938,
+    "compile_exit": 0,
+    "cold_local_donor": 0.053144160003284924,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.0806159649946494
+   },
+   "zig": {
+    "cold_local": 2.9145667879929533,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.8761834589968203
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zine",
+   "target": "camera",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.2533308910060441,
+    "compile_exit": 0,
+    "cold_local_donor": 0.022110097997938283,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.033096597995609045
+   },
+   "zig": {
+    "cold_local": 0.4792054389981786,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.4833932309993543
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "protoc-gen-zig",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.4935420630063163,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02493716801109258,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 1.0664364419935737,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "tests",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.3692487489897758,
+    "compile_exit": 0,
+    "cold_local_donor": 0.026667147991247475,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.04019754000182729
+   },
+   "zig": {
+    "cold_local": 0.7570002819993533,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.8397046720056096
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "protobuf",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.37854537401290145,
+    "compile_exit": 0,
+    "cold_local_donor": 0.024277104006614536,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.6855523339909269,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "json",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.7245097340055509,
+    "compile_exit": 0,
+    "cold_local_donor": 0.031044528004713356,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.032103983001434244
+   },
+   "zig": {
+    "cold_local": 1.1815815009904327,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.208379561008769
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "alltypes",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.6510530600062339,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03538995000417344,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 1.5522803489875514,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-protobuf",
+   "target": "varints",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.4046792230074061,
+    "compile_exit": 0,
+    "cold_local_donor": 0.024673936000908725,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.7180449709849199,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "vulkan-zig",
+   "target": "vulkan-zig-generator",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.45530913599941414,
+    "compile_exit": 0,
+    "cold_local_donor": 0.025309826000011526,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.04841478000162169
+   },
+   "zig": {
+    "cold_local": 0.8063166229840135,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.8121135699911974
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "vulkan-zig",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.2703165550046833,
+    "compile_exit": 0,
+    "cold_local_donor": 0.026251443996443413,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5807595689984737,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "tls.zig",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 1.5767546810093336,
+    "compile_exit": 0,
+    "cold_local_donor": 0.029114924996974878,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.04148514999542385
+   },
+   "zig": {
+    "cold_local": 2.525701463004225,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.6374895359913353
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "tls.zig",
+   "target": "http_get",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.9711357360065449,
+    "compile_exit": 0,
+    "cold_local_donor": 0.028470656005083583,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 1.9970630010066088,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "tls.zig",
+   "target": "server",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 1.0744106769998325,
+    "compile_exit": 0,
+    "cold_local_donor": 0.0434420490055345,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 1.7754772959888214,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "zlinter",
+   "target": "no_unused_unit_test_coverage",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.4856891310046194,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02965023001888767,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.8553584390028846,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zlinter",
+   "target": "require_fmt_unit_test_coverage",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.512036577987601,
+    "compile_exit": 0,
+    "cold_local_donor": 0.028224950990988873,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.9225973589927889,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zlinter",
+   "target": "build_lint_builtin",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.28309226800047327,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02434076198551338,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.48702797600708436,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "zig-ecs",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.4062822770065395,
+    "compile_exit": 0,
+    "cold_local_donor": 0.025114856005529873,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.049778065003920346
+   },
+   "zig": {
+    "cold_local": 0.677705423993757,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.6966436889924807
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-minisign",
+   "target": "minizign",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.35708892600086983,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02539032899949234,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.6926595699915197,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-minisign",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.30130161499255337,
+    "compile_exit": 0,
+    "cold_local_donor": 0.026790835996507667,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.6706348090083338,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zalgebra",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.3585186279960908,
+    "compile_exit": 0,
+    "cold_local_donor": 0.024432685997453518,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5985565190057969,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-args",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.37051373498979956,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02941570698749274,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.7143693160032853,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-args",
+   "target": "demo",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.29421966899826657,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02751478999562096,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5358440339914523,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-args",
+   "target": "demo_verb",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.26991011400241405,
+    "compile_exit": 0,
+    "cold_local_donor": 0.024427986005321145,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5096254720119759,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zBench",
+   "target": "runner",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.2641907220095163,
+    "compile_exit": 0,
+    "cold_local_donor": 0.022612411019508727,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5304549309948925,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zBench",
+   "target": "statistics",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.26286352799797896,
+    "compile_exit": 0,
+    "cold_local_donor": 0.0241322279907763,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5639645679912064,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zBench",
+   "target": "platform",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.2570708139974158,
+    "compile_exit": 0,
+    "cold_local_donor": 0.0258622440014733,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5223778189974837,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zBench",
+   "target": "partial",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.25554445100715384,
+    "compile_exit": 0,
+    "cold_local_donor": 0.022853198010125197,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5377961409976706,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "linuxwave",
+   "target": "linuxwave",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.27999335300410166,
+    "compile_exit": 0,
+    "cold_local_donor": 0.032469638987095095,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5745302959985565,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "linuxwave",
+   "target": "wav-tests",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.32716639098362066,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02813294700172264,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5663234730018303,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "linuxwave",
+   "target": "gen-tests",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.274459726002533,
+    "compile_exit": 0,
+    "cold_local_donor": 0.040054672994301654,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5424136420188006,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "linuxwave",
+   "target": "file-tests",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.27012259799812455,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02713426099217031,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5459333259932464,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "linuxwave",
+   "target": "main-tests",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.30878929201571736,
+    "compile_exit": 0,
+    "cold_local_donor": 0.029787186009343714,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.6545817510050256,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zli",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.34441259400045965,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02604644100938458,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.6494537580147153,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-compiler",
+   "target": "translate-c",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 1.6467314920155331,
+    "compile_exit": 0,
+    "cold_local_donor": 0.05285550501139369,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.09219230999588035
+   },
+   "zig": {
+    "cold_local": 3.0316380180011038,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.944163704989478
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-compiler",
+   "target": "resinator",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 1.4000506960001076,
+    "compile_exit": 0,
+    "cold_local_donor": 0.046991126000648364,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.08081112799118273
+   },
+   "zig": {
+    "cold_local": 2.571040411989088,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.447487664001528
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-compiler",
+   "target": "resinator-test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.6700837039825274,
+    "compile_exit": 0,
+    "cold_local_donor": 0.04023792999214493,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 1.500418535011704,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-compiler",
+   "target": "aro-test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 1.2837204450042918,
+    "compile_exit": 0,
+    "cold_local_donor": 0.04481442001997493,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.16065506100130733
+   },
+   "zig": {
+    "cold_local": 2.3567614519852214,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.328758983989246
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-compiler",
+   "target": "objcopy",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.3376269890140975,
+    "compile_exit": 0,
+    "cold_local_donor": 0.031687228998634964,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5836617390013998,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-compiler",
+   "target": "objdump",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.3994132380030351,
+    "compile_exit": 0,
+    "cold_local_donor": 0.022588517007534392,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.7658743869978935,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-compiler",
+   "target": "reduce",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.633858462999342,
+    "compile_exit": 0,
+    "cold_local_donor": 0.031067976000485942,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 1.2177249740052503,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-compiler",
+   "target": "std-docs",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.5945703580073314,
+    "compile_exit": 0,
+    "cold_local_donor": 0.026321259007090703,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 1.0716927320027025,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zigimg",
+   "target": "zigimgtest",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.8405386500089662,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03933313699963037,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.057745586993405595
+   },
+   "zig": {
+    "cold_local": 1.6516437879909063,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.6230196640099166
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zeit",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.36092844199447427,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02390968300460372,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.03635324399510864
+   },
+   "zig": {
+    "cold_local": 0.7096280510013457,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.7105767899920465
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zbor",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.5709046179981669,
+    "compile_exit": 0,
+    "cold_local_donor": 0.027820660005090758,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.040207519006798975
+   },
+   "zig": {
+    "cold_local": 1.2309014210040914,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.2228787960048066
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "libvaxis",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.45074574499449227,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03604181499395054,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.04649390099802986
+   },
+   "zig": {
+    "cold_local": 1.3842116829764564,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.2076307230017846
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "libvaxis",
+   "target": "example-text_input",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.41716775798704475,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03666034698835574,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 1.2603071999910753,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "cache.zig",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.31178240101144183,
+    "compile_exit": 0,
+    "cold_local_donor": 0.0251410390046658,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.05003122799098492
+   },
+   "zig": {
+    "cold_local": 0.6358973519963911,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.6142706630052999
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zul",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 1.1769720150041394,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03330859499692451,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.0569023309944896
+   },
+   "zig": {
+    "cold_local": 2.3892616299999645,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.395937084002071
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "metrics.zig",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.43148438300704584,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02494658500654623,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.0443373150046682
+   },
+   "zig": {
+    "cold_local": 0.7736303170095198,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.7821711209981004
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zig-hpke",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.8552665649913251,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02510788598738145,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.03707224999379832
+   },
+   "zig": {
+    "cold_local": 1.6440579740010435,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.6217756230034865
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "libxev",
+   "target": "xev-test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.4018867940030759,
+    "compile_exit": 0,
+    "cold_local_donor": 0.02993388200411573,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.0633169790089596
+   },
+   "zig": {
+    "cold_local": 0.7598348140018061,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.7602008390094852
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "libxev",
+   "target": "xev",
+   "kind": "build-lib",
+   "zap": {
+    "cold_local": 0.19547505900845863,
+    "compile_exit": 0,
+    "cold_local_donor": 0.1953815390006639,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.4810234659962589,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "zio",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 1.2214641339960508,
+    "compile_exit": 0,
+    "cold_local_donor": 0.05108733598899562,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.1534013119962765
+   },
+   "zig": {
+    "cold_local": 2.1676246370043373,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.1216979069868103
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zio",
+   "target": "hello-world",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.39501057600136846,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03261499600193929,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.05663279000145849
+   },
+   "zig": {
+    "cold_local": 0.8054036849935073,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.7373743310017744
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zio",
+   "target": "coro-demo",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.22832509499858133,
+    "compile_exit": 0,
+    "cold_local_donor": 0.03184576200146694,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.5940922569861868,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zio",
+   "target": "mutex-demo",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.46046814901637845,
+    "compile_exit": 0,
+    "cold_local_donor": 0.04016605101060122,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.9413465679972433,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zio",
+   "target": "ev-demo",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.32601920000161044,
+    "compile_exit": 0,
+    "cold_local_donor": 0.244709694001358,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.6975265280052554,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zio",
+   "target": "producer-consumer",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.47660050200647675,
+    "compile_exit": 0,
+    "cold_local_donor": 0.031929517004755326,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "zig": {
+    "cold_local": 0.9728094300080556,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": ""
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zedis",
+   "target": "test-unit",
+   "kind": "test",
+   "zap": {
+    "cold_local": 0.7049143769982038,
+    "compile_exit": 0,
+    "cold_local_donor": 0.3453932580014225,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.05602509100572206
+   },
+   "zig": {
+    "cold_local": 1.2639175200019963,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.3624249269923894
+   },
+   "verdict": "compiles (not run)"
+  },
+  {
+   "project": "zedis",
+   "target": "zedis",
+   "kind": "build-exe",
+   "zap": {
+    "cold_local": 0.6143128849944333,
+    "compile_exit": 0,
+    "cold_local_donor": 0.0389248330029659,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.05174183700000867
+   },
+   "zig": {
+    "cold_local": 1.1614752680034144,
+    "compile_exit": 0,
+    "run": "not run",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 1.0791529170091962
+   },
+   "verdict": "ok"
+  },
+  {
+   "project": "tokamak",
+   "target": "test",
+   "kind": "test",
+   "zap": {
+    "cold_local": 1.7964133789937478,
+    "compile_exit": 0,
+    "cold_local_donor": 0.2855377980013145,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 0.04899547100649215
+   },
+   "zig": {
+    "cold_local": 2.8998233070014976,
+    "compile_exit": 0,
+    "run": "skipped",
+    "run_exit": null,
+    "stdout_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout": "",
+    "stderr": "",
+    "edit": 2.879988478991436
+   },
+   "verdict": "compiles (not run)"
+  }
+ ],
+ "corpus_samples": 3,
+ "runtime": {
+  "runtime": {
+   "runs": 5,
+   "machine_note": "Amp orb, 4 vCPU",
+   "results": {
+    "fib": {
+     "zap": {
+      "median_s": 0.11781971299205907,
+      "min_s": 0.11644052100018598,
+      "max_s": 0.11826744899735786,
+      "compile_s": 0.02180027599388268
+     },
+     "Debug": {
+      "median_s": 0.1898594809899805,
+      "min_s": 0.18844183698820416,
+      "max_s": 0.20665201800875366,
+      "compile_s": 0.44948002000455745
+     },
+     "ReleaseSafe": {
+      "median_s": 0.07124263000150677,
+      "min_s": 0.07088619600108359,
+      "max_s": 0.07160169100097846,
+      "compile_s": 17.987130617999355
+     }
+    },
+    "sieve": {
+     "zap": {
+      "median_s": 0.12538426200626418,
+      "min_s": 0.12432810799509753,
+      "max_s": 0.1362805500102695,
+      "compile_s": 0.031520730000920594
+     },
+     "Debug": {
+      "median_s": 0.45052223998936825,
+      "min_s": 0.42753862800600473,
+      "max_s": 0.5144856309925672,
+      "compile_s": 0.4360288200114155
+     },
+     "ReleaseSafe": {
+      "median_s": 0.11145626399957109,
+      "min_s": 0.10467199300182983,
+      "max_s": 0.11319817299954593,
+      "compile_s": 17.78502561399364
+     }
+    },
+    "sort": {
+     "zap": {
+      "median_s": 0.25387168700399343,
+      "min_s": 0.24996835699130315,
+      "max_s": 0.25716361599916127,
+      "compile_s": 0.02386320299410727
+     },
+     "Debug": {
+      "median_s": 0.5860739820054732,
+      "min_s": 0.5635225259902654,
+      "max_s": 0.600077303010039,
+      "compile_s": 0.44893416500417516
+     },
+     "ReleaseSafe": {
+      "median_s": 0.08914729599200655,
+      "min_s": 0.08890503000293393,
+      "max_s": 0.09497749799629673,
+      "compile_s": 19.354702582990285
+     }
+    },
+    "hash": {
+     "zap": {
+      "median_s": 0.3367345570004545,
+      "min_s": 0.3275006530020619,
+      "max_s": 0.3763717190013267,
+      "compile_s": 0.02069007299724035
+     },
+     "Debug": {
+      "median_s": 0.6854447469959268,
+      "min_s": 0.6779179680015659,
+      "max_s": 0.6978334750019712,
+      "compile_s": 0.4410701769957086
+     },
+     "ReleaseSafe": {
+      "median_s": 0.056021124008111656,
+      "min_s": 0.05208394399960525,
+      "max_s": 0.05889544000092428,
+      "compile_s": 18.220850009995047
+     }
+    },
+    "nbody": {
+     "zap": {
+      "median_s": 0.20112557501124684,
+      "min_s": 0.20005624899931718,
+      "max_s": 0.21134321499266662,
+      "compile_s": 0.022771860007196665
+     },
+     "Debug": {
+      "median_s": 0.4361755389982136,
+      "min_s": 0.4327342179894913,
+      "max_s": 0.45772523200139403,
+      "compile_s": 0.4703703449922614
+     },
+     "ReleaseSafe": {
+      "median_s": 0.02423215399903711,
+      "min_s": 0.020643823998398148,
+      "max_s": 0.02572048600995913,
+      "compile_s": 17.32839359198988
+     }
+    },
+    "fmt": {
+     "zap": {
+      "median_s": 0.1051885049964767,
+      "min_s": 0.10480730098788626,
+      "max_s": 0.15962532001140062,
+      "compile_s": 0.02100803700159304
+     },
+     "Debug": {
+      "median_s": 0.20103713301068638,
+      "min_s": 0.19988328000181355,
+      "max_s": 0.21453612300683744,
+      "compile_s": 0.4390736210043542
+     },
+     "ReleaseSafe": {
+      "median_s": 0.021405135994427837,
+      "min_s": 0.021125446990481578,
+      "max_s": 0.03126723399327602,
+      "compile_s": 18.211195839001448
+     }
+    }
+   }
+  },
+  "realworld": {
+   "compiler": "/tmp/zap-rf/bin/zap",
+   "runs": 5,
+   "results": {
+    "zig-fmt": {
+     "zap": {
+      "median": 2.383199293006328,
+      "min": 2.3582605379924644,
+      "max": 2.485824073999538
+     },
+     "Debug": {
+      "median": 4.09202753000136,
+      "min": 4.069447522997507,
+      "max": 4.14153666299535
+     }
+    },
+    "zig-sema": {
+     "zap": {
+      "median": 6.5272494810051285,
+      "min": 6.485445603000699,
+      "max": 6.786993405999965
+     },
+     "Debug": {
+      "median": 11.399927648002631,
+      "min": 11.252665332998731,
+      "max": 11.549336958996719
+     }
+    },
+    "vaxis": {
+     "zap": {
+      "median": 0.7500162710057339,
+      "min": 0.7421521289943485,
+      "max": 0.7595698539953446
+     },
+     "Debug": {
+      "median": 1.0742585510015488,
+      "min": 1.0524284450075356,
+      "max": 1.10833699000068
+     },
+     "ReleaseSafe": {
+      "median": 0.251244711005711,
+      "min": 0.2368132210103795,
+      "max": 0.3046838940063026
+     }
+    },
+    "zls-test": {
+     "zap": {
+      "median": 1.0780867470020894,
+      "min": 1.04720611499215,
+      "max": 1.2038981350051472
+     },
+     "Debug": {
+      "median": 1.543578463999438,
+      "min": 1.53837131500768,
+      "max": 1.6698713010118809
+     },
+     "ReleaseSafe": {
+      "median": 0.26683350099483505,
+      "min": 0.2624663699971279,
+      "max": 0.3071290709922323
+     }
+    }
+   }
+  }
+ },
+ "finished": "2026-11-04 20:39",
+ "findings": "## Findings\n\n- **Behavior on 0.17.1** (`tools/corpus/run.py`, every target built and run with both compilers): 80 of 83 targets match upstream. The other three:\n  - **ghostty ghostty-vt-test: zap crashes compiling it on d47bcde** (SIGSEGV; in ReleaseSafe, \"access of union field 'ty_pl' while field 'ty_op' is active\" in `vector.reduceIndex`). `@reduce` of a vector bitcast from a load reached the fused-`firstTrue` path, because the bitcast is also a `.view` operand. Minimal repro: `const v: @Vector(16, u8) = @bitCast(p.*); return @reduce(.Max, v);` with `p: *const [16]u8`. The vector thread's fix-reduce-view (78650d6, in the current batch) fixes it. With the same change, the target matches upstream (exit 1, 3004 passed, 102 skipped, 1 failed, in both builds) and times 25.82 s / 11.76 s cold-local (2.2x), 181 ms with donors (142x), and 25.42 s / 296 ms on the edit (86x). That row is left out of the corpus table above, which is d47bcde as it stands.\n  - **tokamak test** differs as before: zap's frame trips tokamak's own misaligned `meta.transmute` in dom.document.test_0 (manifest note). Upstream's single failure is now http.client.test_0 expecting `.ok` from a live HTTP request, which depends on the network, not on the compiler.\n  - **zio coro-demo** differs as before: upstream's Debug frames overflow the demo's 64 KiB coroutine stacks (manifest note).\n- **No target is slower with zap than with upstream.**\n- **std's debug.zig edit went from 1.77 s to 379 ms** with the cache thread's lazy-rt-inline fix; it now stays a lazy build. hello's same edit takes 57 ms.\n- **Against the 0.17.0 scoreboard** (same orb type, 13942f5 and 15abfd4 for donors), every row moved by noise only: hello 21 ms cold-local with donors (19 ms before), vaxis 34 ms (33), zig 242 ms (210), std 107 ms (98). Without donors, vaxis went from 511 to 405 ms. Corpus: 2.0x without donors, 28.6x with (28.2x), edit builds 23.5x (24.5x).\n- **Harness fixes for 0.17.1**:\n  - The corpus no longer passes the recording zig's `--zig-lib-dir`, so each compiler uses its own lib dir. This run's commands were already re-recorded with 0.17.1 (`--refresh`); only five projects that are no longer in the manifest kept 0.17.0 paths.\n  - anyzig's `test` and zine's `camera` targets were missing from 0.17.1's install-step recording, so their manifest entries now record the `test` step too. Recording anyzig's test step runs its tests, which download several Zig releases (about 4 GB under ~/.local/share/anyzig and the generation cache); delete them afterwards.\n  - bench's zig workload says 0.17.1 (build_options version), and realworld.py copies upstream's source again on every run. It used to keep its 0.17.0 copy and its 0.17.0 upstream binaries, which made this run fail at first.\n  - `bench/scoreboard.py` now saves its JSON after each part, and `--resume` continues an interrupted run.\n\n### Rerunning\n\n    zig build -Doptimize=ReleaseFast -p /tmp/zap-rf\n    python3 bench/scoreboard.py --zap /tmp/zap-rf/bin/zap --note \"Amp orb, 4 vCPU\" [--out PATH] [--resume]\n"
+}
