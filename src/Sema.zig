@@ -2119,11 +2119,20 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
             }
         }
     };
+    const last = &zcu.errors.items[zcu.errors.items.len - 1];
+    last.hint = @import("diag.zig").migrationHint(try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)}), name);
+    try sema.attachCandidates(names.items, name, which == .fields);
+}
+
+/// Gives the most recent error the names among `names` close to `name`,
+/// and a rename fix when one is the only close name and the error points
+/// at `name` with no migration hint.
+fn attachCandidates(sema: *Sema, names: []const []const u8, name: []const u8, fields: bool) !void {
+    const zcu = sema.zcu;
     const diag = @import("diag.zig");
     const last = &zcu.errors.items[zcu.errors.items.len - 1];
-    last.hint = diag.migrationHint(try std.fmt.allocPrint(sema.arena, "{f}", .{sema.fmtType(ty)}), name);
     var close: std.ArrayList([]const u8) = .empty;
-    try diag.closeNames(sema.arena, name, names.items, which == .fields, &close);
+    try diag.closeNames(sema.arena, name, names, fields, &close);
     if (close.items.len == 0) return;
     const arena = zcu.arena.allocator();
     const owned = try arena.alloc([]const u8, close.items.len);
@@ -2134,9 +2143,9 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
         const source = try zcu.fe.source(@fromBackingInt(sema.file));
         const at = if (last.span.end <= source.len) diag.nameIn(source[last.span.start..last.span.end], name) else null;
         if (at) |offset| {
-            if (which == .fields) {
+            if (fields) {
                 close.clearRetainingCapacity();
-                try diag.closeNames(sema.arena, name, names.items, false, &close);
+                try diag.closeNames(sema.arena, name, names, false, &close);
             }
             const start: u32 = last.span.start + offset;
             last.fix = try diag.renameFix(arena, source, start, start + @as(u32, @intCast(name.len)), close.items);
@@ -8120,6 +8129,14 @@ fn callingConventionValue(sema: *Sema, block: *Block, src: Src, name: []const u8
                 for (archs, 0..) |arch, i| list.writer.print("{s}'{t}'", .{ if (i == 0) "" else ", ", arch }) catch return error.OutOfMemory;
                 return sema.fail(block, src, "calling convention '{s}' only available on architectures {s}", .{ name, list.written() });
             }
+        }
+        if (std.meta.stringToEnum(std.lang.CallingConvention.Tag, name) == null) {
+            // As upstream; `.C` was 0.13's name for `.c`.
+            const err = sema.fail(block, src, "union 'lang.CallingConvention' has no member named '{s}'", .{name});
+            // The tags and the union's declarations (`.c`, `.winapi`).
+            const names = comptime [_][]const u8{ "c", "winapi", "kernel" } ++ std.meta.fieldNames(std.lang.CallingConvention.Tag)[0..].*;
+            try sema.attachCandidates(&names, name, false);
+            return err;
         }
         return sema.fail(block, src, "zap does not support calling convention '{s}' yet", .{name});
     };

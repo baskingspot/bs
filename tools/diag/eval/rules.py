@@ -216,7 +216,7 @@ MIGRATIONS = [
     R("intCast-2arg", [(r"const narrow: u16 = @intCast\(idx\);", "const narrow = @intCast(u16, idx);")], [["@as(u16, @intCast(", "result type"]], seeds=["casts"], since="0.11"),
     R("truncate-2arg", [(r"const small: u8 = @truncate\(big\);", "const small = @truncate(u8, big);")], [["@as(u8, @truncate(", "result type"]], seeds=["casts"], since="0.11"),
     R("bitCast-2arg", [(r"const bits: u32 = @bitCast\(@as\(f32, 1\.0\)\);", "const bits = @bitCast(u32, @as(f32, 1.0));")], [["@as(u32, @bitCast(", "result type"]], seeds=["casts"], since="0.11"),
-    R("callconv-C", [(r"callconv\(\.c\)", "callconv(.C)")], [[".c"]], seeds=["cabi"], since="0.14", answer="c"),
+    R("callconv-C", [(r"callconv\(\.c\)", "callconv(.C)")], [[".c", "candidates: c"]], seeds=["cabi"], since="0.14", answer="c"),
     R("setCold", [(r"@branchHint\(\.cold\);", "@setCold(true);")], [["@branchHint"]], seeds=["cabi"], since="0.14"),
     R("cImport", [(r"(const Pair = extern struct)", L('const c = @cImport(@cInclude("stdlib.h"));\n\nconst Pair = extern struct')),
                   (r'std\.debug\.print\("\{d\}\\n", \.\{addPair\(&p\)\}\);', L('std.debug.print("{d}\\n", .{c.abs(addPair(&p))});'))],
