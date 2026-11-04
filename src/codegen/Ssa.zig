@@ -406,12 +406,15 @@ pub fn liveness(f: *Func, gpa: Allocator, ir: *const Ir, ctx: anytype) Allocator
         const term_pos = 2 * (b.start + b.len) + 1;
         const term_data = datas[@backingInt(b.term.inst)];
         const cond: ?Inst.Index = if (b.term.tag == .branch) term_data.pl_op.operand.toIndex() else null;
+        // The condition a `not` negates may be fused into the branch with
+        // it (`plan`).
+        const negated: ?Inst.Index = if (cond) |c| if (tags[@backingInt(c)] == .not) datas[@backingInt(c)].ty_op.operand.toIndex() else null else null;
         for (b.start..b.start + b.len) |i| {
             const inst = insts[i];
             const p: u32 = @intCast(2 * i + 2);
             w.def[@backingInt(inst)] = p;
             w.end[@backingInt(inst)] = p;
-            w.pos = if (cond != null and cond.? == inst) term_pos else p;
+            w.pos = if ((cond != null and cond.? == inst) or (negated != null and negated.? == inst)) term_pos else p;
             forEachOperand(ir, inst, &w);
         }
         w.pos = term_pos;
@@ -572,6 +575,16 @@ pub fn plan(f: *Func, gpa: Allocator, ir: *const Ir, ip: *const InternPool, ctx:
                 else => if (cond != null and cond.? == inst and uses[i] == 1 and ctx.fusable(inst)) {
                     fate[i] = .fused;
                     reg[i] = no_reg;
+                    // So is the condition a `not` negates, in this block
+                    // and read only by it: the branch tests the negated
+                    // flags.
+                    if (tags[i] == .not) if (datas[i].ty_op.operand.toIndex()) |x| {
+                        const xi = @backingInt(x);
+                        if (uses[xi] == 1 and fate[xi] == .normal and tags[xi] != .not and def[xi] > 2 * b.start and ctx.fusable(x)) {
+                            fate[xi] = .fused;
+                            reg[xi] = no_reg;
+                        }
+                    };
                 },
             }
         }

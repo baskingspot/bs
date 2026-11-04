@@ -2841,6 +2841,7 @@ pub fn fusable(cg: *CodeGen, inst: Inst.Index) bool {
             (cg.inFloat(cg.typeOf(data.bin_op.lhs)) and floatCc(cg.ir.instructions.items(.tag)[@backingInt(inst)]) != null),
         .is_err, .is_non_err, .is_null, .is_non_null => true,
         .reduce => vector.fusable(cg, inst),
+        .not => cg.typeOf(data.ty_op.operand) == .bool_type,
         else => false,
     };
 }
@@ -3140,6 +3141,15 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
     const data = cg.ir.instructions.items(.data)[@backingInt(inst)];
     switch (tag) {
         .reduce => return vector.condFlags(cg, inst),
+        // The negated condition's flags if the branch computes it too
+        // (`Ssa.plan`), else a test of the bool.
+        .not => {
+            const x = data.ty_op.operand;
+            if (x.toIndex()) |xi| if (cg.homes[@backingInt(xi)] == .fused) return (try cg.condFlags(xi)).negate();
+            const r = try cg.regOf(x, .rax);
+            try cg.e.@"test"(.byte, .{ .reg = r }, .{ .reg = r });
+            return .e;
+        },
         .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
             if (data.bin_op.lhs.toIndex()) |bit| if (cg.homes[@backingInt(bit)] == .fused) {
                 // An overflow bit left in the flags.
@@ -3708,6 +3718,7 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
         .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .floor, .ceil, .round, .trunc_float => try cg.genFloat(inst, tag, data),
         .mul_add, .float_cast, .float_from_int, .int_from_float => try cg.genFloat(inst, tag, data),
         .not => {
+            if (cg.homes[@backingInt(inst)] == .fused) return;
             const ty = data.ty_op.ty;
             if (ip.keyTag(ty) == .vector_type) return vector.gen(cg, inst, tag, data);
             if (cg.isWideInt(ty)) return cg.genWide(inst, tag, data);
