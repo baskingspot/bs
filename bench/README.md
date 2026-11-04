@@ -231,3 +231,22 @@ python3 bench/runtime.py --compiler zig-out/bin/zap --machine-note "Amp orb, 4 v
 Options: `--programs fib,sort`, `--runs`, `--no-upstream` (zap only),
 `--zig PATH`, `--out PATH` (without extension). Baseline before the
 optimizing backend: [`results/2026-11-03-runtime-zap-8fe40fe.md`](results/2026-11-03-runtime-zap-8fe40fe.md).
+
+`bench/realworld.py` does the same for real programs, so an optimization is
+judged on more than the small programs above:
+
+| Workload | What runs |
+|---|---|
+| zig-fmt | upstream's compiler (built without LLVM by each compiler) running `zig fmt --check` over std |
+| zig-sema | the same binary analyzing hello.zig with an empty cache |
+| vaxis | libvaxis laying out and rendering text into memory ([`realworld/vaxis_render.zig`](realworld/vaxis_render.zig)) |
+| zls-test | the corpus's zls test suite |
+
+```sh
+python3 bench/realworld.py --compiler zig-out/bin/zap
+```
+
+Options: `--workloads vaxis,zls-test`, `--runs`, `--no-upstream`, `--out
+PATH.json`. Upstream's builds are kept in `bench/.work/realworld/bin` and
+reused; the compiler has no ReleaseSafe column, since LLVM needs more than an
+orb's 7 GB to build it.
