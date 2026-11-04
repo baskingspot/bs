@@ -14707,7 +14707,18 @@ fn checkSliceSentinel(sema: *Sema, block: *Block, src: Src, many: Ref, start_val
     if (start_val != null and end_val != null) if (sema.resolveValue(many)) |pv| if (try sema.comptimePtrRoot(pv) != .int) {
         const idx = ip.intValue(u64, end_val.?).? - ip.intValue(u64, start_val.?).?;
         const elem_ptr = try sema.ptrElemPtrVal(pv, idx);
-        if (try sema.comptimeLoadOrNull(block, src, elem_ptr)) |actual| {
+        const n = sema.zcu.errors.items.len;
+        const loaded = sema.comptimeLoadOrNull(block, src, elem_ptr) catch |err| {
+            // As upstream: a sentinel past the memory is the end index's
+            // fault.
+            const prefix = "exceeds bounds of containing decl of type ";
+            if (err != error.AnalysisFail or sema.zcu.errors.items.len != n + 1) return err;
+            const msg = sema.zcu.errors.items[n].msg;
+            const at = std.mem.indexOf(u8, msg, prefix) orelse return err;
+            _ = sema.zcu.errors.pop();
+            return sema.fail(block, src.operandSrc(2), "slice end index {d} exceeds bounds of containing decl of type {s}", .{ ip.intValue(u64, end_val.?).?, msg[at + prefix.len ..] });
+        };
+        if (loaded) |actual| {
             if (actual != sentinel) return sema.fail(block, src, "value in memory does not match slice sentinel", .{});
             return;
         }

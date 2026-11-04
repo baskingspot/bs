@@ -1640,6 +1640,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "index {d} outside array of length {d}", .@"out-of-bounds" },
     .{ "index {d} outside tuple of length {d}", .@"out-of-bounds" },
     .{ "mask element at index '{d}' selects out-of-bounds index", .@"out-of-bounds" },
+    .{ "slice end index {d} exceeds bounds of containing decl of type {s}", .@"out-of-bounds" },
     .{ "start index {d} is larger than end index {d}", .@"out-of-bounds" },
     .{ "@src outside function", .@"outside-function" },
     .{ "function declared outside of a declaration", .@"outside-function" },
