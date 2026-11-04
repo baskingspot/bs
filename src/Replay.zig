@@ -212,6 +212,8 @@ pub fn create(gpa: Allocator, io: Io, m: *const Manifest, dir: Io.Dir, arch: Ato
     // are outdated, whether or not the file is still on disk; inputs not
     // loaded yet whose key holds here are checked below.
     for (0..m.inputCount()) |i| {
+        // Link-only inputs: no node depends on them.
+        if (Incremental.isLinkInput(m.inputKey(@intCast(i)))) seen.set(i);
         if (seen.isSet(i) or try Incremental.inputKeyHolds(gpa, &path_buf, m, @intCast(i), fe)) continue;
         seen.set(i);
         try changed.append(gpa, .{ .input = @intCast(i), .file = null });

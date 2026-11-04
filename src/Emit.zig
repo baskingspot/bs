@@ -137,6 +137,11 @@ export_lookups: u32 = 0,
 error_values: std.ArrayList(Elf.Value) = .empty,
 /// The inputs' symbols within their atoms, for `link` (in `inputs`' arena).
 input_symbols: []const Elf.LocalSymbol = &.{},
+/// The range of `atoms` that `convertInputs` added: its `.link` atoms are
+/// the inputs' and glibc data copies, which the cache leaves out of its
+/// records (every build with inputs converts them again); others are
+/// CodeGen's, merged meanwhile.
+input_atoms: [2]u32 = .{ 0, 0 },
 /// Time spent in `CodeGen.generate`, for `ZAP_TIMING`.
 codegen_ns: u64 = 0,
 /// `ZAP_BENCH_CODEGEN`: a copy of every function's IR, which
@@ -851,6 +856,8 @@ fn convertInputs(emit: *Emit, in: *ElfInput) !bool {
     const converted = try in.convert(InputResolver{ .emit = emit });
     for (in.errors.items) |msg| try emit.zcu.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "{s}", .{msg});
     if (in.errors.items.len != 0) return false;
+    emit.input_atoms[0] = @intCast(emit.atoms.items.len);
+    defer emit.input_atoms[1] = @intCast(emit.atoms.items.len);
     for (converted.atoms) |atom| try emit.addAtom(atom);
     for (emit.copies.keys(), emit.copies.values()) |name, size| try emit.addAtom(.{
         .key = importKey(name),

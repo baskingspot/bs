@@ -299,6 +299,8 @@ pub const Job = struct {
     cache_target: []const u8,
     /// The command line that keys the compilation in the cache.
     compile_args: []const []const u8,
+    /// `opts.link_inputs`, absolute (`Incremental.link_objects`).
+    link_objects: []const []const u8,
     stem: []const u8,
     run_test: bool,
     environ_map: *std.process.Environ.Map,
@@ -354,6 +356,16 @@ pub const Job = struct {
         // The glibc version a -lc build links, which the arguments do not
         // spell for the native target. Keys only: `full_args` stay as given.
         if (opts.link_libc) try compile_args.append(arena, try std.fmt.allocPrint(arena, "--zap-glibc={f}", .{opts.glibc_version.?}));
+        // The files the object and library arguments name, which `-l`
+        // finds in the `-L` directories: the cache's link-only inputs.
+        const link_objects = try arena.alloc([]const u8, opts.link_inputs.len);
+        if (link_objects.len != 0) {
+            const cwd = try std.process.currentPathAlloc(init_.io, arena);
+            for (link_objects, opts.link_inputs) |*abs, path| {
+                abs.* = try std.fs.path.resolve(arena, &.{ cwd, path });
+                try compile_args.append(arena, try std.fmt.allocPrint(arena, "--zap-link-input={s}", .{abs.*}));
+            }
+        }
         return .{
             .opts = opts,
             .zig_lib_dir = zig_lib_dir,
@@ -362,6 +374,7 @@ pub const Job = struct {
             .fuzzer_builtin_dir = fuzzer_builtin_dir,
             .cache_target = try cacheTarget(arena, &opts, init_.environ_map),
             .compile_args = compile_args.items,
+            .link_objects = link_objects,
             .stem = opts.name orelse if (is_test) "test" else if (opts.c_only) std.fs.path.stem(opts.c_sources[0].path) else std.fs.path.stem(opts.root_src_path),
             .run_test = is_test and !opts.test_no_exec and !opts.listen,
             .environ_map = init_.environ_map,
@@ -382,10 +395,9 @@ pub const Job = struct {
         const env = job.environ_map;
         // The numbered link has no position-independent layout yet (`Elf`);
         // -fPIE and -dynamic imply -fPIC (and -lc on objects and
-        // libraries). Builds with object or archive inputs or C sources skip
-        // it until the manifest keeps them (the cache thread's part of
-        // stage A).
-        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and job.opts.link_inputs.len == 0 and job.opts.c_sources.len == 0 and
+        // libraries). Builds with C sources skip it until the manifest
+        // keeps their objects.
+        const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and job.opts.c_sources.len == 0 and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
@@ -396,6 +408,7 @@ pub const Job = struct {
         i.check = env.get("ZAP_CACHE_CHECK") != null;
         i.donors = !std.mem.eql(u8, env.get("ZAP_CACHE_DONOR") orelse "", "off");
         i.stack_size = job.opts.stack_size;
+        i.link_objects = job.link_objects;
         if (job.opts.link_libc and !job.opts.pic) {
             i.glibc_version = job.opts.glibc_version;
             i.glibc_lib_dir = job.zig_lib_dir;

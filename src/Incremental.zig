@@ -96,6 +96,12 @@ archive_stem: []const u8 = "",
 glibc_version: ?std.SemanticVersion = null,
 glibc_lib_dir: []const u8 = "",
 glibc: ?*const Glibc = null,
+/// An executable's object and archive inputs, absolute, in command-line
+/// order: link-only inputs of the manifest (`link_input_prefix`), which
+/// no node depends on. Their atoms are not recorded, and a build with
+/// them replays eagerly, so that `Emit.finish` converts them and binds
+/// the externs again; with nothing changed it skips the link as any.
+link_objects: []const []const u8 = &.{},
 /// Whether a build that does not relink renews the output's mtime, as a
 /// relink would: `zap run`'s programs are trimmed by it.
 renew_output: bool = false,
@@ -212,6 +218,18 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     if (inc.verify == .full) return inc.noRelink("verifying an edit build", .{});
     if (m.output != inc.output) return inc.noRelink("the manifest links another kind of output", .{});
     if (m.entry == 0 and inc.output == .exe) return inc.noRelink("no entry point", .{});
+    // The same link inputs, in order: a C source's object can move.
+    {
+        var n: usize = 0;
+        for (0..m.inputCount()) |i| {
+            const key = m.inputKey(@intCast(i));
+            if (!isLinkInput(key)) continue;
+            if (n == inc.link_objects.len or !std.mem.eql(u8, key[link_input_prefix.len..], inc.link_objects[n]))
+                return inc.noRelink("the link inputs are not the last build's", .{});
+            n += 1;
+        }
+        if (n != inc.link_objects.len) return inc.noRelink("the link inputs are not the last build's", .{});
+    }
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(gpa);
     try m.changedInputs(gpa, io, &changed);
@@ -243,6 +261,8 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
         if (inc.timing) std.debug.print("cache: no input changed and the output is as the last link left it; not relinking ({d:.2} ms, {d} rehashed)\n", .{ ms(t0, now(io)), changed.items.len });
         return true;
     }
+    // The inputs' atoms and the externs bound to them are not recorded.
+    if (inc.link_objects.len != 0) return inc.noRelink("the link has object or archive inputs", .{});
 
     const linked = (try inc.linkFrom(m, out_dir, sub_path)) orelse return false;
     if (inc.timing) std.debug.print("cache: no input changed; relinked {d} atoms in {d:.2} ms (manifest and {d} stats {d:.2}, {d} rehashed; packs mapped and input gathered {d:.2}, link {d:.2})\n", .{
@@ -289,6 +309,14 @@ pub fn noteOutput(inc: *const Incremental, out_dir: Io.Dir, sub_path: []const u8
 /// a link that fails halfway does not leave it matching.
 fn forgetOutput(inc: *const Incremental) void {
     inc.dir.deleteFile(inc.io, output_name) catch {};
+}
+
+/// The key prefix of a link-only input (`link_objects`): `:link:<path>`,
+/// which no module's file key has (a module name is not empty).
+pub const link_input_prefix = ":link:";
+
+pub fn isLinkInput(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, link_input_prefix);
 }
 
 /// Links manifest `m`'s live atoms from the packs into `sub_path`, and
@@ -436,7 +464,8 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     if (std.mem.eql(u8, mode, "off") or inc.verify == .full) return;
     // A donor's build records in full: its log would be relative to
     // another compilation's manifest.
-    const lazy = !std.mem.eql(u8, mode, "eager") and inc.donor == null;
+    // So is a build with link inputs: a lazy one links from the manifest.
+    const lazy = !std.mem.eql(u8, mode, "eager") and inc.donor == null and inc.link_objects.len == 0;
     const r = Replay.create(inc.gpa, inc.io, m, inc.dir, inc.arch, fe, zcu, emit, lazy, inc.donor != null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -2263,6 +2292,8 @@ const Graph = struct {
         // the output as this build did.
         const link_key = cache.hash(2, &.{@backingInt(Tag.link)});
         for (emit.atom_owners.items, emit.atoms.items, g.atom_units, 0..) |owner, atom, u, i| {
+            // The link inputs' atoms: converted again by every build.
+            if (owner == .link and i >= emit.input_atoms[0] and i < emit.input_atoms[1]) continue;
             const index = switch (owner) {
                 .unit => try r.unitNode(u),
                 .content => (try r.node(@backingInt(atom.key), .content))[0],
@@ -2615,6 +2646,15 @@ fn record(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit) 
             try b.addInput(path_buf.items, f.key, stat, content_hash, inc.build_start)
         else |_|
             try b.addUnstattedInput(path_buf.items, f.key, content_hash);
+    }
+    // Link-only inputs, by the same rule.
+    for (inc.link_objects) |path| {
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+        defer gpa.free(bytes);
+        key_buf.clearRetainingCapacity();
+        try key_buf.print(gpa, "{s}{s}", .{ link_input_prefix, path });
+        const stat = try Io.Dir.cwd().statFile(io, path, .{});
+        try b.addInput(path, key_buf.items, stat, @bitCast(Frontend.hashSource(bytes)), inc.build_start);
     }
     const t4 = now(io);
     // Every atom is in a store pack, so the pack's own records, which
@@ -3032,7 +3072,9 @@ fn checkPredictionFallible(inc: *Incremental, r: *const Recorder, fe: *const Fro
             continue;
         }
         // As `Replay.create`: an input whose key names no file here (a
-        // donor's) is changed; one this build did not read has no nodes.
+        // donor's) is changed; one this build did not read has no nodes,
+        // nor has a link-only one.
+        if (isLinkInput(m.inputKey(@intCast(j)))) continue;
         if (!try inputKeyHolds(gpa, &path_buf, m, @intCast(j), fe)) try changed.append(gpa, .{ .input = @intCast(j), .file = null });
     }
     var seed_list: std.ArrayList(u32) = .empty;

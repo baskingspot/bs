@@ -2666,8 +2666,8 @@ come from it.
 - Objects and archives are link-only manifest inputs: hashed by
   content, with the same stat and racy-mtime rule as source files, and
   no node depends on them. Changing one invalidates nothing, but it
-  blocks the skip-the-link fast path and forces a relink. The cache
-  thread adds the input flag.
+  blocks the skip-the-link fast path and forces a relink (built: see
+  below).
 - The conversion reruns on every build and relink: it is a scan plus
   slicing, with copies only for relaxed sequences. Its atoms are not
   stored in the pack.
@@ -2698,9 +2698,24 @@ differs from the design above:
 - compiler_rt functions that only the objects call must be generated, so
   `Emit.sync` pulls archive members for the objects' and the Zig
   externs' names as analysis goes, and requests compiler_rt for what
-  stays undefined. Object contents therefore do influence analysis, and
-  builds with inputs skip the cache until the manifest records which
-  compiler_rt functions the objects asked for (the cache thread's part).
+  stays undefined. Object contents therefore do influence analysis.
+  The cache's first step (2026-11-04): the objects and archives are
+  link-only manifest inputs (`Incremental.link_objects`, keyed
+  `:link:<path>`, with their resolved paths in the compilation key as
+  `--zap-link-input=`), which no node depends on and replay ignores.
+  Their atoms and glibc data copies are not recorded
+  (`Emit.input_atoms`). A build with inputs replays eagerly, so
+  `Emit.finish` pulls archive members, converts and binds the externs
+  again, and analysis generates any compiler_rt function an edited
+  object needs. A build in which nothing changed skips the link as any
+  does; there is no relink from the manifest. test/link_input/cache.sh
+  checks it: cold, unchanged, a deleted output, an edited object, an
+  edited archive member and a Zig edit, each byte-identical to a build
+  without the cache, with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`.
+  Next: relinks and lazy builds, with the extern binding and the
+  objects' compiler_rt requests (the link node's `rt` references) from
+  the manifest, and an eager build when an object needs a compiler_rt
+  function the manifest lacks.
 - A C GOT slot is content-addressed by its target, not shared with the
   Zig extern slot of the same name.
 - With `-lc`, names nothing else defines are glibc's imports

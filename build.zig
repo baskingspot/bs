@@ -1074,6 +1074,17 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         r.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
         test_step.dependOn(&r.step);
     }
+
+    // Objects and archives through the cache: test/link_input/cache.sh.
+    const cache = b.addSystemCommand(&.{"sh"});
+    cache.setName("zap build-exe with link inputs, cached");
+    cache.addFileArg(b.path("test/link_input/cache.sh"));
+    cache.addArtifactArg(zap);
+    cache.addArg(zig);
+    cache.addDirectoryArg(b.path("test/link_input"));
+    _ = cache.addOutputDirectoryArg("work");
+    cache.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&cache.step);
 }
 
 fn upstreamZig(b: *std.Build) []const u8 {
