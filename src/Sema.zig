@@ -6722,9 +6722,16 @@ fn atomicElemType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!
         else => false,
     };
     if (!ok) return sema.fail(block, src, "expected bool, integer, float, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(ty)});
-    const size = Type.abiSize(ip, ty);
-    // Zero-bit types (u0) fold: every value is the same.
-    if (size != 0 and size != 1 and size != 2 and size != 4 and size != 8) return sema.failUnsupported(block, src, "atomics on types of this size");
+    // As upstream's `atomicPtrAlignment`: x86_64 without cx16 (zap's
+    // baseline CPU) has 64-bit atomics at most.
+    const max_bits = 64;
+    switch (Type.class(ip, ty)) {
+        .float => if (Type.floatBits(ip, ty) > max_bits)
+            return sema.fail(block, src, "expected {d}-bit float type or smaller; found {d}-bit float type", .{ max_bits, Type.floatBits(ip, ty) }),
+        .int, .@"enum", .@"struct" => if (bitSize(ip, ty) > max_bits)
+            return sema.fail(block, src, "expected {d}-bit integer type or smaller; found {d}-bit integer type", .{ max_bits, bitSize(ip, ty) }),
+        else => {},
+    }
 }
 
 /// The pointer operand of an atomic builtin, as a pointer to `elem_ty`.
@@ -18499,12 +18506,6 @@ fn analyzeCall(
         if (ip.keyAs(.func, func)) |f| try sema.noteFnDeclared(f.owner_nav);
         return err;
     }
-    switch (modifier) {
-        .auto, .compile_time, .always_inline, .never_inline, .never_tail, .no_suspend => {},
-        // As in upstream's x86_64 backend, only comptime calls can be tail calls.
-        .always_tail => if (!block.is_comptime) return sema.failUnsupported(block, src, "runtime tail calls"),
-    }
-
     // Arguments are analyzed in the caller, with the call instruction
     // standing for the parameter type.
     const args = try sema.arena.alloc(Ref, total_args);
@@ -18608,6 +18609,7 @@ fn analyzeCall(
         try sema.requireRuntime(block, src);
         for (fn_ty.param_types) |pt| try sema.resolveLayout(block, src, pt);
         try sema.resolveLayout(block, src, ret_ty);
+        if (modifier == .always_tail) return sema.failTailCall(block, src);
         if (fn_ty.cc == .auto) sema.has_error_trace = true;
         const payload = try sema.addExtra(Ir.Call{ .ret_ty = ret_ty, .args_len = @intCast(args.len) });
         try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(args));
@@ -18685,10 +18687,18 @@ fn analyzeCall(
             call_ret_ty = try sema.intern(.{ .error_union_type = .{ .error_set_type = ies, .payload_type = eu.payload_type } });
         }
     }
+    if (modifier == .always_tail) return sema.failTailCall(block, src);
     if (callee_fn_ty.cc == .auto) sema.has_error_trace = true;
     const payload = try sema.addExtra(Ir.Call{ .ret_ty = call_ret_ty, .args_len = @intCast(call_args.len), .flags = .{ .never_inline = modifier == .never_inline } });
     try sema.ir_extra.appendSlice(sema.gpa, @ptrCast(call_args));
     return sema.endIfNoReturn(block, try sema.addInst(block, .{ .tag = .call, .data = .{ .pl_op = .{ .operand = .fromInterned(callee_func), .payload = payload } } }));
+}
+
+/// A runtime `@call(.always_tail, ...)`. Upstream's self-hosted backends
+/// support no tail calls (`target_util.supportsTailCall`); comptime and
+/// inline calls are not tail calls and get here only at runtime.
+fn failTailCall(sema: *Sema, block: *Block, src: Src) CompileError {
+    return sema.fail(block, src, "unable to perform tail call: compiler backend 'stage2_x86_64' does not support tail calls on target architecture 'x86_64' with the selected CPU feature flags", .{});
 }
 
 /// A call whose return type has no possible value other than `noreturn`
