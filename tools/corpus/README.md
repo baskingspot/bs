@@ -15,7 +15,13 @@ Options: `--zap PATH`, `--zig PATH`, `--refresh` (record the compile
 commands again), `--list` (record and list them only), `--zap-only` (keep
 the last upstream results), `--no-edit` (skip the edit builds), `--no-run`
 (build only), `--cache-check` (zap's edit builds check themselves against
-a full build with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`; not timed).
+a full build with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`; not timed),
+`--samples N` (time each cold-local and edit build N times and keep the
+median), `--donors` (also time zap's cold-local build with donors, which
+find the build just made in the global store: zap's first build in a
+fresh checkout), `--results NAME` (write `.work/NAME.json` and
+`.work/NAME.md` instead of `results.json` and `scoreboard.md`).
+`bench/scoreboard.py` runs it with `--no-run --donors --samples 3`.
 
 ## How it works
 

@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -193,6 +194,15 @@ def compile_argv(compiler, words, cache_dir, out):
     return [compiler, words[1], *rest]
 
 
+def clear_cache(cache):
+    """Empties a target's cache directory but for the translated headers
+    its command line names."""
+    for entry in os.listdir(cache):
+        if entry != "translated":
+            p = os.path.join(cache, entry)
+            shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+
+
 def timed(argv, cwd, env=None, timeout=1800):
     t = time.monotonic()
     try:
@@ -282,6 +292,14 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
         # store holds.
         env = dict(os.environ, ZAP_CACHE_DONOR="off") if which == "zap" else None
         secs, code, output = timed(argv, src, env)
+        # More samples (`--samples`): the median, each from an empty local
+        # cache.
+        cold = [secs]
+        while code == 0 and len(cold) < args.samples:
+            clear_cache(cache)
+            secs, code, output = timed(argv, src, env)
+            cold.append(secs)
+        secs = statistics.median(cold)
         r["cold_local"] = tc_secs + secs
         r["compile_exit"] = code
         if code != 0:
@@ -289,6 +307,18 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
             r["output"] = output[-20000:]
             result[which] = r
             continue
+        if which == "zap" and args.donors:
+            # zap's real first build in a fresh checkout: an empty local
+            # cache, with donors, which find the build just made in the
+            # global store. The translated headers stay.
+            donor = []
+            for _ in range(args.samples):
+                clear_cache(cache)
+                secs, code, output = timed(argv, src)
+                if code != 0:
+                    break
+                donor.append(secs)
+            r["cold_local_donor"] = tc_secs + statistics.median(donor) if code == 0 else None
         # Tests run without arguments; an executable runs only with the
         # manifest's "run" arguments.
         run_args = tgt.get("run", [] if is_test else None)
@@ -324,16 +354,23 @@ def build_target(proj, src, words, cmds, tgt, compilers, args):
         r["stderr"] = run["stderr"][-4000:]
         if edit and not args.no_edit:
             path = os.path.join(src, edit[0])
-            orig = apply_edit(path, edit[1], int(time.time()) % 100000)
             env = None
             if which == "zap" and args.cache_check:
                 # Check the edit build against a full build (not timed).
                 env = dict(os.environ, ZAP_CACHE_VERIFY="1", ZAP_CACHE_CHECK="1")
-            try:
-                secs, code, output = timed(argv, src, env)
-            finally:
-                with open(path, "w") as f:
-                    f.write(orig)
+            # Each sample a new edit of the last build.
+            edits = []
+            for k in range(args.samples):
+                orig = apply_edit(path, edit[1], int(time.time()) % 100000 + k)
+                try:
+                    secs, code, output = timed(argv, src, env)
+                finally:
+                    with open(path, "w") as f:
+                        f.write(orig)
+                if code != 0:
+                    break
+                edits.append(secs)
+            secs = statistics.median(edits) if code == 0 else None
             r["edit"] = secs if code == 0 else None
             if code != 0:
                 r["edit_error"] = first_error(output)
@@ -368,8 +405,10 @@ def fmt_s(s):
 
 def write_scoreboard(results, manifest, path):
     """One row per target: the verdict, both runs, and both build times."""
-    lines = ["| Project | Target | Verdict | upstream run | zap run | cold-local zig / zap | edit zig / zap |",
-             "|---|---|---|---|---|---:|---:|"]
+    donors = any((r.get("zap") or {}).get("cold_local_donor") for r in results)
+    lines = ["| Project | Target | Verdict | upstream run | zap run | cold-local zig / zap |"
+             + (" cold-local zig / zap with donors |" if donors else "") + " edit zig / zap |",
+             "|---|---|---|---|---|---:|" + ("---:|" if donors else "") + "---:|"]
     for res in results:
         u, z = res.get("zig") or {}, res.get("zap") or {}
 
@@ -378,10 +417,12 @@ def write_scoreboard(results, manifest, path):
 
         def ratio(a, b):
             return f" ({a / b:.1f}x)" if a and b else ""
-        lines.append("| {} | {} | {} | {} | {} | {} / {}{} | {} / {}{} |".format(
+        donor = " {} / {}{} |".format(fmt_s(u.get("cold_local")), fmt_s(z.get("cold_local_donor")),
+                                      ratio(u.get("cold_local"), z.get("cold_local_donor"))) if donors else ""
+        lines.append("| {} | {} | {} | {} | {} | {} / {}{} |{} {} / {}{} |".format(
             res["project"], res["target"], res["verdict"].replace("|", "\\|"), cell(u), cell(z),
             fmt_s(u.get("cold_local")), fmt_s(z.get("cold_local")), ratio(u.get("cold_local"), z.get("cold_local")),
-            fmt_s(u.get("edit")), fmt_s(z.get("edit")), ratio(u.get("edit"), z.get("edit"))))
+            donor, fmt_s(u.get("edit")), fmt_s(z.get("edit")), ratio(u.get("edit"), z.get("edit"))))
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -397,6 +438,12 @@ def main():
     ap.add_argument("--zap-only", action="store_true", help="skip the upstream builds (reuse their last results)")
     ap.add_argument("--no-edit", action="store_true", help="skip the edit builds")
     ap.add_argument("--no-run", action="store_true", help="build only; do not run what was built")
+    ap.add_argument("--samples", type=int, default=1,
+                    help="time each cold-local and edit build this many times and keep the median (default 1)")
+    ap.add_argument("--donors", action="store_true",
+                    help="also time zap's cold-local build with donors (cold_local_donor)")
+    ap.add_argument("--results", default="results",
+                    help="name of the results and scoreboard files in .work (default: results, scoreboard)")
     ap.add_argument("--cache-check", action="store_true",
                     help="zap's edit builds check themselves against full builds (ZAP_CACHE_VERIFY, ZAP_CACHE_CHECK)")
     args = ap.parse_args()
@@ -404,7 +451,8 @@ def main():
     with open(os.path.join(CORPUS_DIR, "manifest.json")) as f:
         manifest = json.load(f)
     projects = [p for p in manifest["projects"] if not args.projects or p["name"] in args.projects.split(",")]
-    results_path = os.path.join(WORK, "results.json")
+    results_path = os.path.join(WORK, args.results + ".json")
+    scoreboard_path = os.path.join(WORK, "scoreboard.md" if args.results == "results" else args.results + ".md")
     old = {}
     if os.path.exists(results_path):
         with open(results_path) as f:
@@ -437,8 +485,8 @@ def main():
     results = [old[k] for k in order if k in old]
     with open(results_path, "w") as f:
         json.dump(results, f, indent=1)
-    write_scoreboard(results, manifest, os.path.join(WORK, "scoreboard.md"))
-    print(open(os.path.join(WORK, "scoreboard.md")).read())
+    write_scoreboard(results, manifest, scoreboard_path)
+    print(open(scoreboard_path).read())
 
 
 if __name__ == "__main__":
