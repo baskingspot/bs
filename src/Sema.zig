@@ -81,6 +81,10 @@ dep_cache: [256]u32 = @splat(0),
 /// `memo_deps` (0 for none). An entry at or after `memo_start` is in the
 /// call's dependencies, and so in `deps`, at least as plain as it is there.
 memo_dep_cache: [256]u32 = @splat(0),
+/// Recent results of `fieldPtrAt` through an aggregate that is not
+/// packed, by a hash of the pointer type, field type and index: a
+/// function reaches the same few fields over and over.
+field_ptr_cache: [64]FieldPtrEntry = @splat(.{}),
 /// When this unit's analysis started, for `Zcu.unit_timing`.
 timer: [2]u64,
 /// What a name in the current file's ZIR resolved to in a type: each row
@@ -2988,7 +2992,10 @@ fn resolveLayout(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!v
     switch (ip.keyTag(ty)) {
         .struct_type, .enum_type, .union_type => {
             try sema.declareDependency(.{ .type_layout = ty });
-            const status = ip.structInfo(ty).status;
+            const info = ip.structInfo(ty);
+            const status = info.status;
+            // Resolved, and its defaults queued (`Zcu.ensureStructLayout`).
+            if (status == .have_layout and (info.defaults_status != .none or ip.keyTag(ty) != .struct_type)) return;
             try sema.bcRequire(status == .have_layout);
             if (status == .none) try sema.noteReference(.{ .type_layout = ty }, src);
             if (status == .have_layout) return sema.zcu.ensureStructLayout(ty);
@@ -13488,13 +13495,14 @@ fn unionFieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, i: u32, initial
 
 fn structFieldIndex(sema: *Sema, block: *Block, src: Src, ty: Index, name: []const u8) CompileError!u32 {
     const ip = sema.ip;
-    switch (ip.indexToKey(ty)) {
+    switch (ip.keyTag(ty)) {
         .struct_type => {
             try sema.resolveStructFields(block, src, ty);
             return ip.structInfo(ty).fieldIndex(ip, name) orelse
                 sema.withCandidates(sema.fail(block, src.fieldName(), "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) }), ty, name, .fields);
         },
-        .tuple_type => |t| {
+        .tuple_type => {
+            const t = ip.keyPayload(.tuple_type, ty);
             if (t.names.len != 0) {
                 for (t.names, 0..) |n, i| if (std.mem.eql(u8, ip.stringSlice(n), name)) return @intCast(i);
                 return sema.withCandidates(sema.fail(block, src.fieldName(), "no field named '{s}' in struct '{f}'", .{ name, sema.fmtType(ty) }), ty, name, .fields);
@@ -13545,7 +13553,7 @@ fn loadField(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) C
         if (ip.keyTag(pv) != .ptr) break :comptime_known;
         // What `fieldPtr` and `fieldPtrAt` check and resolve.
         const i = try sema.structFieldIndex(block, src, child, name);
-        if (ip.keyTag(child) == .struct_type) try sema.resolveLayout(block, src, child);
+        if (ip.keyTag(child) == .struct_type and ip.structInfo(child).status != .have_layout) try sema.resolveLayout(block, src, child);
         if (Type.comptimeFieldValue(ip, child, i) != .none) break :comptime_known;
         _ = try sema.fieldPtrAlignment(block, src, p.flags.alignment, child, i);
         if (try sema.comptimePtrRoot(pv) == .int) break :comptime_known;
@@ -13739,7 +13747,9 @@ fn fieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, name: []const u8) Co
         .type => return sema.fieldPtr(block, src, try sema.analyzeLoad(block, src, ptr), name),
         .@"struct", .tuple => {
             const i = try sema.structFieldIndex(block, src, child, name);
-            if (ip.keyTag(child) == .struct_type) try sema.resolveLayout(block, src, child);
+            // `structFieldIndex` resolved the layout unless it found the
+            // field types alone.
+            if (ip.keyTag(child) == .struct_type and ip.structInfo(child).status != .have_layout) try sema.resolveLayout(block, src, child);
             const cv = Type.comptimeFieldValue(ip, child, i);
             if (cv != .none) return sema.comptimeFieldPtr(p.flags.is_const, cv);
             return sema.fieldPtrAt(block, src, ptr, Type.fieldType(ip, child, i), i);
@@ -14400,11 +14410,27 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
         try sema.requireRuntime(block, src);
         return sema.packedFieldPtr(block, ptr, result_ty, i);
     }
-    const result_ty = try sema.ptrType(.{ .child = field_ty, .flags = .{
-        .is_const = p.flags.is_const,
-        .is_volatile = p.flags.is_volatile,
-        .alignment = try sema.fieldPtrAlignment(block, src, p.flags.alignment, p.child, i),
-    } });
+    const ptr_ty = sema.typeOf(ptr);
+    const entry = &sema.field_ptr_cache[@as(u32, @truncate(((@as(u64, @backingInt(ptr_ty)) *% 0x9E3779B97F4A7C15) +% (@as(u64, @backingInt(field_ty)) *% 0xC2B2AE3D27D4EB4F) +% i) >> 58))];
+    const result_ty = if (entry.ptr_ty == ptr_ty and entry.field_ty == field_ty and entry.index == i) hit: {
+        // The layouts `fieldPtrAlignment` read, declared again.
+        switch (ip.keyTag(p.child)) {
+            .struct_type, .union_type, .tuple_type => {
+                try sema.resolveLayout(block, src, p.child);
+                try sema.resolveLayout(block, src, field_ty);
+            },
+            else => {},
+        }
+        break :hit entry.result;
+    } else miss: {
+        const result_ty = try sema.ptrType(.{ .child = field_ty, .flags = .{
+            .is_const = p.flags.is_const,
+            .is_volatile = p.flags.is_volatile,
+            .alignment = try sema.fieldPtrAlignment(block, src, p.flags.alignment, p.child, i),
+        } });
+        entry.* = .{ .ptr_ty = ptr_ty, .field_ty = field_ty, .index = i, .result = result_ty };
+        break :miss result_ty;
+    };
     if (sema.resolveValue(ptr)) |pv| {
         if (try sema.comptimePtrRoot(pv) != .int) {
             return .fromInterned(try sema.intern(.{ .ptr = .{ .ty = result_ty, .base = .{ .field = .{ .base = pv, .index = i } } } }));
@@ -14413,6 +14439,13 @@ fn fieldPtrAt(sema: *Sema, block: *Block, src: Src, ptr: Ref, field_ty: Index, i
     try sema.requireRuntime(block, src);
     return sema.addStructField(block, .struct_field_ptr, result_ty, ptr, i);
 }
+
+const FieldPtrEntry = struct {
+    ptr_ty: Index = .none,
+    field_ty: Index = .none,
+    index: u32 = 0,
+    result: Index = .none,
+};
 
 /// A runtime bit pointer to field `i` of the packed struct or union `ptr`
 /// addresses: the same address, so a `bitcast`. A const local's field
