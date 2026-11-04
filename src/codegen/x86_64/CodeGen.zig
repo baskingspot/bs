@@ -89,6 +89,9 @@ slot_alias: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 /// From `planDeferred`: aggregates built in the memory of the store that
 /// is their only user, with the store's pointer, by value.
 in_place: std.AutoHashMapUnmanaged(u32, Ref) = .empty,
+/// From `planRotates`: `bit_or`s that are rotates, with what they rotate
+/// left and by how much, by value.
+rotates: std.AutoHashMapUnmanaged(u32, Rotate) = .empty,
 /// rbp offset of the slot holding the error return trace pointer: an
 /// `.auto` function's from r9, another's from `set_err_return_trace`.
 /// Null in a function that has none, whose `.auto` calls pass null.
@@ -299,6 +302,7 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.ref_alias.deinit(gpa);
         cg.slot_alias.deinit(gpa);
         cg.in_place.deinit(gpa);
+        cg.rotates.deinit(gpa);
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
         cg.stub_chains.deinit(gpa);
@@ -1498,6 +1502,7 @@ fn planRegisters(cg: *CodeGen) Error!void {
         return;
     }
     try cg.planDeferred();
+    try cg.planRotates();
     @memset(live.items(.hint), .{ Ssa.no_reg, Ssa.no_reg });
     for (cg.arg_hints.items) |h| live.items(.hint)[h.v][0] = h.r;
     if (cg.fn_ty.cc == .auto) {
@@ -2175,6 +2180,91 @@ fn planDeferred(cg: *CodeGen) Error!void {
             cg.deferLoad(datas[@backingInt(b.term.inst)].un_op, values, prev, 2 * (b.start + b.len) + 1);
         }
     }
+}
+
+const Rotate = struct { x: Ref, k: u8 };
+
+/// Before allocation: a `bit_or` of `x << k` and `x >> (bits - k)` on an
+/// unsigned 8-, 16-, 32- or 64-bit integer, with constant `k` (what
+/// std.math.rotl and rotr become once inlined with a constant amount), is
+/// a `rol` (`rotates`) when the shifts have no other user. The shifts are
+/// not emitted (`Home.dead`), so `x` lives until the rotate, which may
+/// compute in its register.
+fn planRotates(cg: *CodeGen) Error!void {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    const f = cg.ssa;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    const live = f.live.slice();
+    const uses = live.items(.uses);
+    const fate = live.items(.fate);
+    const reg = live.items(.reg);
+    const def = live.items(.def);
+    const end = live.items(.end);
+    const crosses = live.items(.crosses);
+    const cl = f.clobbers.items;
+    for (f.values.items(.inst)) |v| {
+        const vi = @backingInt(v);
+        if (tags[vi] != .bit_or or fate[vi] != .normal or reg[vi] != Ssa.want_reg) continue;
+        const ty = ir.typeOfIndex(v, ip);
+        if (Type.class(ip, ty) != .int) continue;
+        const info = Type.intInfo(ip, ty);
+        if (info.signedness != .unsigned) continue;
+        switch (info.bits) {
+            8, 16, 32, 64 => {},
+            else => continue,
+        }
+        const bin = datas[vi].bin_op;
+        const a = bin.lhs.toIndex() orelse continue;
+        const b = bin.rhs.toIndex() orelse continue;
+        const s, const r = if (tags[@backingInt(a)] == .shl and tags[@backingInt(b)] == .shr)
+            .{ a, b }
+        else if (tags[@backingInt(a)] == .shr and tags[@backingInt(b)] == .shl)
+            .{ b, a }
+        else
+            continue;
+        const sb = datas[@backingInt(s)].bin_op;
+        const rb = datas[@backingInt(r)].bin_op;
+        if (sb.lhs != rb.lhs) continue;
+        // A load sharing a variable's register holds its value only until
+        // its end (`Live.share`).
+        if (sb.lhs.toIndex()) |x| if (fate[@backingInt(x)] != .normal or live.items(.share)[@backingInt(x)] != Ssa.no_tie) continue;
+        for ([_]Inst.Index{ s, r }) |x| {
+            if (uses[@backingInt(x)] != 1 or fate[@backingInt(x)] != .normal or cg.homes[@backingInt(x)] != .none) break;
+        } else {
+            // The amounts' values, not their bits: both are unsigned.
+            const k1 = cg.shiftAmount(sb.rhs) orelse continue;
+            const k2 = cg.shiftAmount(rb.rhs) orelse continue;
+            if (k1 == 0 or k2 == 0 or k1 + k2 != info.bits) continue;
+            try cg.rotates.put(cg.gpa, vi, .{ .x = sb.lhs, .k = @intCast(k1) });
+            for ([_]Inst.Index{ s, r }) |x| {
+                fate[@backingInt(x)] = .dead;
+                reg[@backingInt(x)] = Ssa.no_reg;
+                cg.homes[@backingInt(x)] = .dead;
+            }
+            live.items(.tie)[vi] = Ssa.no_tie;
+            if (sb.lhs.toIndex()) |x| {
+                const xi = @backingInt(x);
+                end[xi] = @max(end[xi], def[vi]);
+                crosses[xi] = crosses[xi] or cl[def[vi]][0] != cl[def[xi]][0] or cl[def[vi]][1] != cl[def[xi]][1];
+                live.items(.tie)[vi] = xi;
+            }
+            continue;
+        }
+    }
+}
+
+/// A shift amount's value if it is a constant below 64.
+fn shiftAmount(cg: *CodeGen, ref: Ref) ?u64 {
+    const v = ref.toInterned() orelse return null;
+    if (cg.ip.keyTag(v) != .int) return null;
+    const k = cg.ip.keyPayload(.int, v);
+    return switch (k.storage) {
+        .u64 => |u| if (u < 64) u else null,
+        .i64 => |i| if (i >= 0 and i < 64) @intCast(i) else null,
+        else => null,
+    };
 }
 
 /// Whether pointers `a` and `b` to values of one type point to the same
@@ -3400,6 +3490,11 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             switch (tag) {
                 .add_wrap, .sub_wrap, .mul_wrap, .bit_and, .bit_or, .xor, .shl, .shr => {
                     const d = cg.destReg(inst);
+                    if (tag == .bit_or and cg.rotates.count() != 0) if (cg.rotates.get(@backingInt(inst))) |rot| {
+                        try cg.load(d, rot.x);
+                        try cg.e.shift(.rol, sizeOf(Type.intInfo(ip, ty).bits / 8), .{ .reg = d }, rot.k);
+                        return cg.setResult(inst, ty, d);
+                    };
                     try cg.intOp(d, tag, ty, data.bin_op.lhs, data.bin_op.rhs);
                     try cg.setResult(inst, ty, d);
                 },
