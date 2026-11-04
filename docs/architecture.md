@@ -2411,14 +2411,28 @@ DT_SONAME for DT_NEEDED, to the same resolution step as abilists. They
 become imports exactly like the C thread's abilists imports. No bytes
 come from it.
 
-**Cache** (the cache thread's side; to agree). The atoms are a function
-of the input files' bytes and of the resolution result (relaxations,
-which members are pulled, GOT and PLT atoms). Proposal for stage A:
-- Inputs are manifest inputs, hashed by content as source files are.
-- Conversion reruns on every build and relink: it is a scan plus
-  slicing, with copies only for relaxed sequences.
-- Its atoms are not stored in the pack, and the relink numbers them
-  after the manifest's symbols.
+**Cache** (agreed with the cache thread, 2026-11-04).
+- Object files never influence analysis or CodeGen. Their paths are in
+  the compilation key but their contents are not, so nothing before the
+  link may look at their symbols. For example, whether an extern binds
+  to an object or to compiler_rt is decided in the link (Emit.finish and
+  the relink), never in CodeGen. Otherwise an edited object would change
+  atoms whose keys stay the same. Zig code reaches every extern through
+  its slot, whose atom the link writes, so this holds by construction.
+- Objects and archives are link-only manifest inputs: hashed by
+  content, with the same stat and racy-mtime rule as source files, and
+  no node depends on them. Changing one invalidates nothing, but it
+  blocks the skip-the-link fast path and forces a relink. The cache
+  thread adds the input flag.
+- The conversion reruns on every build and relink: it is a scan plus
+  slicing, with copies only for relaxed sequences. Its atoms are not
+  stored in the pack.
+- Numbering in a relink: an object's definition of a name that Zig atoms
+  reference takes the manifest's existing number for that extern's key
+  (`m.symbol(key)`), so the Zig atoms' targets bind to it. That needs the
+  extern keys to stay a pure function of the name. Other object atoms
+  and names are numbered after the manifest's symbols.
+- The donor key is unchanged: object arguments do not change Zig code.
 - If profiles show the conversion, store the converted atoms keyed by
   the inputs' hashes and the resolution.
 
