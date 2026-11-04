@@ -103,6 +103,32 @@ ReleaseFast. Median wall time, peak RSS in parentheses.
   The edit appends a statement to the `pub fn build` line. This is the
   compile every `zig build` pays when its build script changed.
 
+## Scoreboard: one command
+
+`bench/scoreboard.py` runs everything the roadmap's scoreboard quotes in one
+session and writes `results/<date>-scoreboard.md` and `.json`: bench.py on
+hello, vaxis, zig and std (upstream Debug, zap, and zap without donors,
+workload by workload), the corpus harness over every target (build only,
+three samples, zap's cold-local without and with donors), runtime.py and
+realworld.py. About an hour on a 4 vCPU orb.
+
+```sh
+zig build -Doptimize=ReleaseFast -p /tmp/zap-rf
+python3 bench/scoreboard.py --zap /tmp/zap-rf/bin/zap --note "Amp orb, 4 vCPU"
+```
+
+`--parts bench,corpus,runtime` runs a subset; `--from-json PATH` renders the
+report again from a run's JSON. After a change to donor builds lands, measure
+the donor-on rows again with the new zap (each workload's cold-local next to
+upstream's, and the corpus's zap columns) and add them to the same report:
+
+```sh
+python3 bench/scoreboard.py --from-json bench/results/<date>-scoreboard.json \
+    --zap /tmp/zap-new/bin/zap --zap-commit <sha> --add-donors "Lazy donor builds landed."
+```
+
+`--findings FILE` ends the report with a hand-written Markdown section.
+
 ## Running
 
 ```sh
@@ -114,9 +140,10 @@ zig build -Doptimize=ReleaseFast
 python3 bench/bench.py --compiler zig-out/bin/zap --machine-note "Amp orb, 4 vCPU"
 ```
 
-Useful options: `--workloads hello,vaxis,zig`, `--modes build-exe,zig-build`,
+Useful options: `--workloads hello,vaxis,zig,std`, `--modes build-exe,zig-build`,
 `--scenarios core` or a comma-separated list, `--runs`, `--cold-runs`,
-`--build-cold-runs`, `--out PATH` (without extension). Both modes run by
+`--build-cold-runs`, `--env KEY=VALUE` (for every timed build, such as
+`ZAP_CACHE_DONOR=off`), `--out PATH` (without extension). Both modes run by
 default; with zap, `zig-build` times `zap build`, which compiles and runs
 upstream's build runner with zap as the compiler. With a compiler other
 than upstream zig the default scenarios are the core ones (cold,
@@ -172,6 +199,12 @@ files live in `bench/.work/` (gitignored); delete it to start over.
   The output check runs `zig version`. Both edits are in the root module
   (`src/main.zig`, `src/Sema.zig`), which is the compiler's only module
   besides std.
+
+- **std**: std's own tests, `zig test zig-lib/std/std.zig --test-no-exec`
+  against a private copy of the source tree's lib (`upstream/lib`, which
+  has the test data std's tests embed). std.zig has no function body, so
+  the root edit is a test in `std/mem.zig`; the library edit is hello's,
+  in `std/debug.zig`. build-exe mode only.
 
 The `zig-build` mode builds the same example through
 [`workloads/vaxis-build/`](workloads/vaxis-build/), a wrapper project that

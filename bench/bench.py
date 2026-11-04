@@ -222,10 +222,11 @@ class Workload:
     name = ""
     description = ""
 
-    def __init__(self, work, compiler, setup_zig):
+    def __init__(self, work, compiler, setup_zig, extra_env=None):
         self.work = work
         self.compiler = compiler
         self.setup_zig = setup_zig
+        self.extra_env = extra_env or {}
         self.dir = os.path.join(work, self.name)
 
     def modes(self):
@@ -240,12 +241,29 @@ class Workload:
         for k in list(env):
             if k.startswith("ZIG_"):
                 del env[k]
+        env.update(self.extra_env)
         env.update(self.commands[mode].get("env", {}))
         return env
 
     def check_output(self, path):
         if not os.access(path, os.X_OK):
             sys.exit(f"missing build output {path}")
+
+
+def private_lib(dir, lib_src):
+    """A private copy of zig lib dir `lib_src` in `dir`, so an edit can
+    touch std without changing the toolchain: std is copied, the rest
+    symlinked."""
+    lib = os.path.join(dir, "zig-lib")
+    rmtree(lib)
+    os.makedirs(lib)
+    for entry in sorted(os.listdir(lib_src)):
+        src = os.path.join(lib_src, entry)
+        if entry == "std":
+            shutil.copytree(src, os.path.join(lib, entry), symlinks=True)
+        else:
+            os.symlink(src, os.path.join(lib, entry))
+    return lib
 
 
 class Hello(Workload):
@@ -255,18 +273,7 @@ class Hello(Workload):
     def setup(self):
         os.makedirs(self.dir, exist_ok=True)
         shutil.copy(os.path.join(BENCH_DIR, "workloads", "hello", "hello.zig"), self.dir)
-        # A private zig lib dir so the library edit can touch std without
-        # changing the installed toolchain: std is copied, the rest symlinked.
-        lib_src = zig_env(self.setup_zig)["lib_dir"]
-        lib = os.path.join(self.dir, "zig-lib")
-        rmtree(lib)
-        os.makedirs(lib)
-        for entry in sorted(os.listdir(lib_src)):
-            src = os.path.join(lib_src, entry)
-            if entry == "std":
-                shutil.copytree(src, os.path.join(lib, entry), symlinks=True)
-            else:
-                os.symlink(src, os.path.join(lib, entry))
+        lib = private_lib(self.dir, zig_env(self.setup_zig)["lib_dir"])
         self.commands = {
             "build-exe": {
                 "cwd": self.dir,
@@ -410,7 +417,40 @@ class ZigCompiler(Workload):
             sys.exit(f"{path} version did not print 0.17.0: rc={p.returncode} stdout={p.stdout!r}")
 
 
-WORKLOADS = {"hello": Hello, "vaxis": Vaxis, "zig": ZigCompiler}
+class StdTests(Workload):
+    name = "std"
+    description = "std's own tests, `zig test lib/std/std.zig --test-no-exec`"
+
+    def setup(self):
+        os.makedirs(self.dir, exist_ok=True)
+        # The source tree's lib (`.agents/setup`), which has the test data
+        # files std's tests embed; a release's lib leaves them out.
+        lib_src = os.path.join(REPO_DIR, "upstream", "lib")
+        if not os.path.isdir(lib_src):
+            sys.exit(f"{lib_src} is missing; run .agents/setup")
+        lib = private_lib(self.dir, lib_src)
+        self.commands = {
+            "build-exe": {
+                "cwd": self.dir,
+                "argv": [self.compiler, "test", "zig-lib/std/std.zig", "--zig-lib-dir", "zig-lib", "--test-no-exec",
+                         "-femit-bin=std-test", "--cache-dir", "cache/local", "--global-cache-dir", "cache/global"],
+                "local_cache": os.path.join(self.dir, "cache/local"),
+                "global_cache": os.path.join(self.dir, "cache/global"),
+                "output": os.path.join(self.dir, "std-test"),
+                "name": "std-test",
+            },
+        }
+        # std.zig itself has no function body to edit, so the root edit is
+        # a test in std/mem.zig (runtime code only); the library edit is
+        # hello's, in std/debug.zig, which much of std calls.
+        self.edits = {
+            "root": (os.path.join(lib, "std", "mem.zig"), '    try testing.expect(eql(u8, "abcd", "abcd"));'),
+            "lib": (os.path.join(lib, "std", "debug.zig"),
+                    "    stderr.file_writer.interface.print(fmt, args) catch return;"),
+        }
+
+
+WORKLOADS = {"hello": Hello, "vaxis": Vaxis, "zig": ZigCompiler, "std": StdTests}
 
 
 def zig_env(zig):
@@ -602,7 +642,10 @@ def render_markdown(report):
     lines += [f"- CPU calibration (fixed pure-Python loop, best of 5, lower is faster): "
               f"{fmt_time(cal.get('start'))} before the benchmarks, {fmt_time(cal.get('end'))} after"]
     lines += [f"- Runs: {report['runs']} per scenario, {report['cold_runs']} for cold build-exe, "
-              f"{report['build_cold_runs']} for cold zig build", ""]
+              f"{report['build_cold_runs']} for cold zig build"]
+    if report.get("env"):
+        lines += [f"- Environment: `{' '.join(f'{k}={v}' for k, v in report['env'].items())}`"]
+    lines += [""]
     lines += ["Wall time is the median over the runs with min–max and sample standard deviation. "
               "CPU is user+sys of the whole process tree. Peak RSS is the largest single process in "
               "the tree (median over runs). For in-process incremental rows, time is per update and "
@@ -672,7 +715,10 @@ def main():
     ap.add_argument("--work-dir", default=os.path.join(BENCH_DIR, ".work"), help="scratch dir (default bench/.work)")
     ap.add_argument("--out", default=None, help="output path without extension (default bench/results/<date>-<compiler>)")
     ap.add_argument("--machine-note", default="", help="free-form machine description for the report")
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    help="environment for every timed build, such as ZAP_CACHE_DONOR=off (repeatable)")
     args = ap.parse_args()
+    extra_env = dict(e.split("=", 1) for e in args.env)
 
     work = os.path.abspath(args.work_dir)
     os.makedirs(work, exist_ok=True)
@@ -701,12 +747,13 @@ def main():
         "machine": machine_info(args.machine_note),
         "compiler": cinfo,
         "runs": args.runs, "cold_runs": args.cold_runs, "build_cold_runs": args.build_cold_runs,
+        "env": extra_env,
         "scenario_descriptions": SCENARIOS,
         "calibration_s": {"start": calibrate()},
         "workloads": {}, "results": [], "skipped": [],
     }
     for wname in args.workloads.split(","):
-        wl = WORKLOADS[wname](work, compiler, setup_zig)
+        wl = WORKLOADS[wname](work, compiler, setup_zig, extra_env)
         log(f"== setup {wname}")
         wl.setup()
         wmodes = [m for m in modes if m in wl.commands]
