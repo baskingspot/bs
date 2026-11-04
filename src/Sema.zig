@@ -7584,6 +7584,12 @@ fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: 
             if (Type.optionalReprIsPtr(ip, child) and Type.childType(ip, child) == .anyopaque_type and sema.isDoublePtr(Type.childType(ip, actual)))
                 return zcu.addNote(file, span, "cannot implicitly cast double pointer '{f}' to anyopaque pointer '{f}'", .{ sema.fmtType(actual), sema.fmtType(wanted) });
         }
+        // As upstream's coercion to an optional, which explains the
+        // failure to coerce to its child.
+        if (class == .optional and Type.class(ip, actual) != .optional and actual != .null_type) {
+            wanted = ip.keyPayload(.opt_type, wanted);
+            continue;
+        }
         if (class != Type.class(ip, actual)) return sema.noteDeclaredPair(wanted, actual);
         switch (class) {
             .int => {
@@ -7660,6 +7666,37 @@ fn noteTypeDifference(sema: *Sema, span: Ast.Span, wanted_ty: Index, actual_ty: 
                     a.flags.size = w.flags.size;
                 }
                 return sema.notePtrDifference(span, wanted, actual, w, a, false);
+            },
+            .@"fn" => {
+                // In the order of upstream's `coerceInMemoryAllowedFns`.
+                const w = ip.keyPayload(.func_type, wanted);
+                const a = ip.keyPayload(.func_type, actual);
+                if (w.is_var_args != a.is_var_args)
+                    return zcu.addNote(file, span, "{s}variadic function cannot cast into a {s}variadic function", .{ if (a.is_var_args) "" else "non-", if (w.is_var_args) "" else "non-" });
+                if (w.cc != a.cc) return zcu.addNote(file, span, "calling convention '{s}' cannot cast into calling convention '{s}'", .{ @tagName(a.cc), @tagName(w.cc) });
+                if (w.is_generic != a.is_generic)
+                    return zcu.addNote(file, span, "{s}generic function cannot cast into a {s}generic function", .{ if (a.is_generic) "" else "non-", if (w.is_generic) "" else "non-" });
+                const ret_ok = a.return_type == w.return_type or a.return_type == .noreturn_type or a.return_type == .generic_poison_type or
+                    sema.childCoercibleInMemory(a.return_type, w.return_type) or
+                    (ip.keyTag(a.return_type) == .error_union_type and ip.keyTag(w.return_type) == .error_union_type and
+                        ip.keyPayload(.error_union_type, a.return_type).payload_type == ip.keyPayload(.error_union_type, w.return_type).payload_type);
+                if (!ret_ok) {
+                    try zcu.addNote(file, span, "return type '{f}' cannot cast into return type '{f}'", .{ sema.fmtType(a.return_type), sema.fmtType(w.return_type) });
+                    wanted = w.return_type;
+                    actual = a.return_type;
+                    continue;
+                }
+                if (w.param_types.len != a.param_types.len)
+                    return zcu.addNote(file, span, "function with {d} parameters cannot cast into a function with {d} parameters", .{ a.param_types.len, w.param_types.len });
+                for (a.param_types, w.param_types, 0..) |ap, wp, i| {
+                    if (ap == wp or ap == .generic_poison_type or wp == .generic_poison_type or sema.paramPtrCoercible(wp, ap) or
+                        sema.cPtrOptCoercibleInMemory(wp, ap) or sema.cPtrOptCoercibleInMemory(ap, wp)) continue;
+                    try zcu.addNote(file, span, "parameter {d} '{f}' cannot cast into '{f}'", .{ i, sema.fmtType(ap), sema.fmtType(wp) });
+                    // The parameter casts the other way.
+                    wanted = ap;
+                    actual = wp;
+                    break;
+                } else return;
             },
             else => return sema.noteDeclaredPair(wanted, actual),
         }
@@ -8670,7 +8707,7 @@ fn fnTypeCoercible(sema: *Sema, block: *Block, src_loc: Src, func: Index, dst: I
             if (comptime_side == .generic_poison_type or !(try sema.isComptimeOnlyResolved(block, src_loc, comptime_side))) return false;
         }
         if (a == b or a == .generic_poison_type or b == .generic_poison_type) continue;
-        if (Type.class(ip, a) == .pointer and Type.class(ip, b) == .pointer and sema.ptrCoercibleInPlace(b, a)) continue;
+        if (sema.paramPtrCoercible(b, a)) continue;
         if (sema.cPtrOptCoercibleInMemory(b, a) or sema.cPtrOptCoercibleInMemory(a, b)) continue;
         // A parameter may take more errors than `dst`'s passes.
         if (sema.errorCoercibleInMemory(b, a)) continue;
@@ -8704,8 +8741,7 @@ fn fnTypeCoercibleInMemory(sema: *Sema, src: Index, dst: Index) bool {
     if (s.cc != d.cc or s.is_var_args != d.is_var_args or s.is_generic != d.is_generic or s.comptime_bits != d.comptime_bits or
         s.param_types.len != d.param_types.len or s.noalias_bits != d.noalias_bits) return false;
     for (s.param_types, d.param_types) |a, b| {
-        if (a == b) continue;
-        if (Type.class(ip, a) == .pointer and Type.class(ip, b) == .pointer and sema.ptrCoercibleInPlace(b, a)) continue;
+        if (a == b or sema.paramPtrCoercible(b, a)) continue;
         if (sema.errorCoercibleInMemory(b, a)) continue;
         return false;
     }
@@ -8736,6 +8772,18 @@ fn errorCoercibleInMemory(sema: *Sema, s: Index, d: Index) bool {
         return false;
     }
     return true;
+}
+
+/// Whether a function's parameter of pointer type `to` accepts what a
+/// `from` parameter is passed, in memory: as upstream, a C pointer may be
+/// null, so it does not pass as a pointer that is not allowzero.
+fn paramPtrCoercible(sema: *Sema, from: Index, to: Index) bool {
+    const ip = sema.ip;
+    if (Type.class(ip, from) != .pointer or Type.class(ip, to) != .pointer) return false;
+    const f = Type.ptrInfo(ip, from);
+    const t = Type.ptrInfo(ip, to);
+    if (f.flags.size == .c and t.flags.size != .c and !t.flags.is_allowzero) return false;
+    return sema.ptrCoercibleInPlace(from, to);
 }
 
 /// Whether a C pointer and an optional pointer (`[*c]const u8` and
