@@ -1692,9 +1692,24 @@ fn recordDelta(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const E
         const new_inst: u32 = if (inst) |x| @backingInt(x) else Manifest.Source.no_inst;
         if (new_inst != src.inst) try d.setSource(i, .{ .input = src.input, .inst = new_inst });
     }
+    // Green nodes whose lines moved; and nodes, linked or not, whose
+    // atoms are named after a type whose name changed or whose recorded
+    // winning offers changed, so that a node that comes back to life
+    // later has them right too.
     {
+        var rewrite = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n_prev);
+        defer rewrite.deinit(gpa);
         var it = rp.refresh.iterator(.{});
-        while (it.next()) |i| if (!written.isSet(i) and live.isSet(i) and m.atoms(@intCast(i)).len != 0) try inc.refreshDebug(rp, &d, @intCast(i));
+        while (it.next()) |i| if (i < n_prev and !written.isSet(i) and live.isSet(i) and m.atoms(@intCast(i)).len != 0) rewrite.set(i);
+        var finals: Finals = .empty;
+        defer finals.deinit(gpa);
+        if (rp.renamed.count() != 0) for (0..n_prev) |i_usize| {
+            const i: u32 = @intCast(i_usize);
+            if (written.isSet(i)) continue;
+            if (rp.offersRenamed(i) or try atomsRenamed(gpa, rp, &finals, i)) rewrite.set(i);
+        };
+        it = rewrite.iterator(.{});
+        while (it.next()) |i| try inc.rewriteKept(rp, &d, @intCast(i), &finals);
     }
     try inc.remapItems(rp, &d, &changed_input);
     for (m.errorCount() + 1..ip.error_names.items.len) |code| {
@@ -1873,21 +1888,56 @@ fn checkLinkInputs(inc: *Incremental, rp: *Replay, live: *const std.DynamicBitSe
     };
 }
 
-/// Gives the atoms of green function node `i` the lines CodeGen would now
-/// write: its declaration's, and its inlined callees', if they are in
-/// changed inputs (as `Replay.loadFunc` does for an eager build).
-fn refreshDebug(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32) !void {
+/// Types' final names by stable hash (`Replay.finalTypeName`), for
+/// `rewriteKept`.
+const Finals = std.AutoHashMapUnmanaged(Hash, ?[]const u8);
+
+fn finalOf(gpa: Allocator, rp: *Replay, finals: *Finals, ty: Hash) !?[]const u8 {
+    const gop = try finals.getOrPut(gpa, ty);
+    if (!gop.found_existing) gop.value_ptr.* = rp.finalTypeName(ty) catch |err| {
+        _ = finals.remove(ty);
+        return err;
+    };
+    return gop.value_ptr.*;
+}
+
+/// Atom `k` of node `i`'s name, renamed after its parent type's final
+/// name if that changed, or null if it did not.
+fn renamedAtom(gpa: Allocator, rp: *Replay, finals: *Finals, names: Manifest.AtomNames, k: usize) !?[]const u8 {
+    const an = names.names[k];
+    if (an.parentHash() == 0) return null;
+    const name = names.name(k);
+    const final = try finalOf(gpa, rp, finals, an.parentHash()) orelse return null;
+    if (an.prefix_len > name.len or std.mem.eql(u8, final, name[0..an.prefix_len])) return null;
+    return final;
+}
+
+fn atomsRenamed(gpa: Allocator, rp: *Replay, finals: *Finals, i: u32) !bool {
+    const names = rp.m.atomNames(i);
+    for (0..names.names.len) |k| if (try renamedAtom(gpa, rp, finals, names, k) != null) return true;
+    return false;
+}
+
+/// Writes green node `i` again if what a full build would record for it
+/// changed: the lines of its atoms' debug info, when it or a function it
+/// inlines is in a changed input (as `Replay.loadFunc` does for an eager
+/// build); its atoms' names, when a type they are named after was renamed;
+/// and its recorded winning type name offers (`Replay.renamed`).
+fn rewriteKept(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32, finals: *Finals) !void {
     const gpa = inc.gpa;
     const m = rp.m;
     var src = m.source(i);
+    const refresh = rp.refresh.isSet(i);
     var line: ?u32 = null;
-    if (src.input != Manifest.Source.no_input and rp.maps.maps.contains(src.input)) {
-        const inst = rp.mapInst(src.input, @fromBackingInt(src.inst)) orelse return;
-        const file = rp.fileOf(src.input) orelse return;
+    var moved_inst = false;
+    if (refresh and src.input != Manifest.Source.no_input and rp.maps.maps.contains(src.input)) blk: {
+        const inst = rp.mapInst(src.input, @fromBackingInt(src.inst)) orelse break :blk;
+        const file = rp.fileOf(src.input) orelse break :blk;
         const zir = &rp.zcu.file(file).zir;
-        if (zir.instructions.items(.tag)[@backingInt(inst)] != .declaration) return;
+        if (zir.instructions.items(.tag)[@backingInt(inst)] != .declaration) break :blk;
         line = zir.getDeclaration(inst).src_line;
         src.inst = @backingInt(inst);
+        moved_inst = true;
     }
     var atoms: std.ArrayList(Atom) = .empty;
     defer atoms.deinit(gpa);
@@ -1903,7 +1953,7 @@ fn refreshDebug(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32) !voi
                 moved = true;
                 copy.base_line = l;
             };
-            if (copy.inlines.len != 0) {
+            if (refresh and copy.inlines.len != 0) {
                 copy.inlines = try rp.refreshInlines(&copy) orelse return error.Fallback;
                 if (copy.inlines.ptr != dbg.inlines.ptr) moved = true;
             }
@@ -1911,21 +1961,45 @@ fn refreshDebug(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32) !voi
         }
         try atoms.append(gpa, dec.atom);
     }
-    if (!moved) return;
-    const refs = try gpa.alloc(Pack.AtomRef, atoms.items.len);
-    defer gpa.free(refs);
-    try rp.pack.append(gpa, inc.io, atoms.items, debug.items, refs);
+    // A function whose lines did not move keeps its instruction too, as
+    // before.
+    if (!moved and moved_inst) src = m.source(i);
+    const names = m.atomNames(i);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
     const symbols = try gpa.alloc(Manifest.AtomSymbols, atoms.items.len);
     defer gpa.free(symbols);
-    const names = m.atomNames(i);
-    for (symbols, atoms.items, names.names, 0..) |*s, a, an, k| s.* = .{
-        .key = @backingInt(a.key),
-        .targets = @ptrCast(a.targets),
-        .name = names.name(k),
-        .parent = an.parentHash(),
-        .prefix_len = an.prefix_len,
-    };
+    var renamed = false;
+    for (symbols, atoms.items, names.names, 0..) |*s, a, an, k| {
+        s.* = .{
+            .key = @backingInt(a.key),
+            .targets = @ptrCast(a.targets),
+            .name = names.name(k),
+            .parent = an.parentHash(),
+            .prefix_len = an.prefix_len,
+        };
+        if (rp.renamed.count() == 0) continue;
+        if (try renamedAtom(gpa, rp, finals, names, k)) |final| {
+            s.name = try std.mem.concat(arena.allocator(), u8, &.{ final, s.name[an.prefix_len..] });
+            s.prefix_len = @intCast(final.len);
+            renamed = true;
+        }
+    }
     for (debug.items) |dbg| symbols[dbg.atom].file = dbg.file;
+    var type_names = m.typeNames(i);
+    var rewritten: std.ArrayList(u32) = .empty;
+    defer rewritten.deinit(gpa);
+    var won_changed = false;
+    if (rp.offersRenamed(i)) {
+        try results.Names.rewriteWon(gpa, &rewritten, type_names, rp);
+        won_changed = !std.mem.eql(u32, rewritten.items, type_names);
+        if (won_changed) type_names = rewritten.items;
+    }
+    if (!moved and !renamed and !won_changed) return;
+    // Records keep no names: only moved lines need new ones.
+    const refs = try gpa.alloc(Pack.AtomRef, atoms.items.len);
+    defer gpa.free(refs);
+    if (moved) try rp.pack.append(gpa, inc.io, atoms.items, debug.items, refs) else @memcpy(refs, m.atoms(i));
     const n = m.node(i);
     try d.update(i, .{
         .key = n.key,
@@ -1940,8 +2014,9 @@ fn refreshDebug(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32) !voi
         .source_name = m.sourceName(i),
         .result = m.result(i),
         .subject = m.subject(i),
-        .names = m.typeNames(i),
-        .flags = .{},
+        .names = type_names,
+        // Changed flags come after the nodes (`Delta.setFlags`).
+        .flags = m.flags(i),
     });
 }
 
@@ -2665,7 +2740,7 @@ fn encodeResults(io: Io, r: *const Recorder, enc: *results.Encoder, words: *std.
 /// `ranges` (by node index): the offers and name reads its analysis made
 /// in this build. A unit an eager edit build loaded made none, and keeps
 /// the manifest's: its candidates are the same as when it was analyzed.
-fn encodeNames(r: *const Recorder, replay: ?*const Replay, words: *std.ArrayList(u32), ranges: [][2]u32) !void {
+fn encodeNames(r: *const Recorder, replay: ?*Replay, words: *std.ArrayList(u32), ranges: [][2]u32) !void {
     const gpa = r.gpa;
     const zcu = r.zcu;
     @memset(ranges, .{ 0, 0 });
@@ -2689,7 +2764,7 @@ fn encodeNames(r: *const Recorder, replay: ?*const Replay, words: *std.ArrayList
         if (!gop.found_existing) gop.value_ptr.* = .{};
         try gop.value_ptr.reads.append(gpa, rd.ty);
     }
-    const loaded_from: ?*const Replay = if (replay) |rp| if (rp.lazy) null else rp else null;
+    const loaded_from: ?*Replay = if (replay) |rp| if (rp.lazy) null else rp else null;
     var offers: std.ArrayList(Zcu.NameOffer) = .empty;
     defer offers.deinit(gpa);
     var templates: std.ArrayList(InternPool.Template) = .empty;
@@ -2707,7 +2782,10 @@ fn encodeNames(r: *const Recorder, replay: ?*const Replay, words: *std.ArrayList
         } else if (loaded_from) |rp| {
             const old = rp.m.find(r.nodes.items[info.node].key) orelse continue;
             if (!rp.loaded.isSet(old)) continue;
-            try words.appendSlice(gpa, rp.m.typeNames(old));
+            // Which offers won, and the names they gave, are this build's.
+            if (rp.renamed.count() != 0) {
+                try results.Names.rewriteWon(gpa, words, rp.m.typeNames(old), rp);
+            } else try words.appendSlice(gpa, rp.m.typeNames(old));
         }
         ranges[info.node] = .{ @intCast(start), @intCast(words.items.len - start) };
     }

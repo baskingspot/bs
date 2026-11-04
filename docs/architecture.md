@@ -145,8 +145,8 @@ T = 0; }; }` makes one `S` for `F(u8)` and `F(u16)`), or one made by an
 inline or comptime call whose uncaptured arguments differ. Upstream names
 such a type after its first creator, so the name depends on analysis
 order. zap names it after the *least* creator by key, so that every build,
-in any order, names it the same (built 2026-11-04, part 1 of the three
-below):
+in any order, names it the same, clean or edit (built 2026-11-04, in
+three parts):
 
 - *Candidates.* Every container type and named tuple (an anonymous struct
   literal's type) has a mutable name slot (`InternPool.TypeName`, the
@@ -225,28 +225,50 @@ below):
     and the greatest creator, so any offer replaces it. Analyzed units
     offered as they ran, so every creator a full build would have
     counts, whatever this build loaded.
-  - *Names that change.* Atoms from the pack keep the names they were
-    recorded with until part 3. So if a type's final name differs from
-    its recorded one (the name in a won offer), or the type is absent
-    and its least kept creator's offer did not win last time (the one
-    that did left), the build is built again in full
+  - *Names that change* (part 3, built 2026-11-04). Replay lists the
+    types whose name, or the creator that gives it, differs from the
+    recorded one (the name in a won offer): one this build has under
+    another creator, or with another template from a unit it analyzed
+    (an anonymous type's name numbers its instruction, so an edit above
+    it renames it), or one absent whose least kept creator's offer did
+    not win last time (the one that did left) (`Replay.renamed`). A type
+    whose holes were renamed is not listed: they are. Then the atoms
+    named after any type whose final name changed, and the recorded
+    winners of the listed types' offers, are out of date. An eager build
+    names every unit atom from the final names, and writes each loaded
+    unit's `type_names` again with this build's winners
+    (`results.Names.rewriteWon`, `Replay.wonName`). A lazy build stays
+    lazy: it compares every node's atoms' names with their parent types'
+    final names (`Replay.finalTypeName`) and rewrites the nodes whose
+    names or listed offers changed, linked or not, so that a node that
+    comes back to life later is right too (`Incremental.rewriteKept`,
+    which also refreshes moved lines); records stay. So the manifest's
+    won offers stay one per type. An absent type's final name is its
+    least kept creator's template with each hole's final name; a file's
+    root type, which no unit offers a name, is named from its file
+    (`Replay.finalName`, `InternPool.rootStructHash`). A kept unit that
+    read a name that changed has an out-of-date result: if one did (for
+    a type the build does not have: if the name it read contains a
+    listed type's old name), the build is built again in full
     (`error.NamesFullBuild`, `ZAP_CACHE_REPLAY=off` for that build).
-    That only happens when an edit changes which creator names a type
-    whose creators disagree: adding `F(u16)` back above renames `S`,
-    and builds in full (test/run/edit_type_names.zig). Every won offer
-    of a type therefore has the same name: a name change rewrites the
-    whole manifest. A read whose name changed is one of those, so a
-    loaded reader needs no check until part 3, which drops the full
-    build for a check of the kept nodes' reads.
-  - `Replay.finalName(hash)` gives a type this build does not have its
-    final name, for part 3 to name atoms after a parent type that is
-    absent: its recorded name, which a build that does not build again
-    in full keeps.
+    Adding `F(u16)` back above renames `S` (test/run/edit_type_names.zig);
+    an edit above an anonymous struct renames the type its generic
+    instance makes (test/run/edit_type_rename.zig, ghostty's unigen
+    edits): both edit builds stay lazy.
   - `offerName` compares a read name by its rendering, not its
     template: a type made from a result has its recorded name without
     holes until its creators' offers arrive.
-- *Part 3* (link): atom records stop carrying names, and loaded atoms
-  are named from final names at link time.
+- *Names in the manifest* (part 3). Atom records keep no symbol names
+  (`cache/atoms.zig` writes none); the manifest keeps each atom
+  reference's (`Manifest.atom_names`, `AtomName`, ZAPMAN14/ZAPMLG07):
+  the name, in `atom_name_bytes` (in its record's strings, for a node
+  the log changed; a written base keeps only live atoms' bytes), and the
+  stable hash of the type its first `prefix_len` bytes name. A relink
+  passes them to the linker beside the records (`LinkInput.names`,
+  `Pack.LinkAtoms.names`), as it passes debug paths. So the store
+  reuses an entry whatever its atoms are called, and an edit that
+  renames a type rewrites nodes, not records. `ZAP_CACHE_VERIFY`
+  compares each atom's name and parent with a full build's.
 
 When a unit reads another unit's result (a declaration's value, a type's
 layout, a function's signature) it goes through one Sema function that records
@@ -6378,22 +6400,6 @@ unchanged:
 
 ## Known regressions and limitations
 
-- *A type's name after an edit (since the on-disk cache; being fixed).*
-  A clean build names a type that creators would name differently after
-  the least creator by key, in any analysis order ("Type names", part 1
-  built). An edit build does not see the candidates of loaded creators
-  until part 2: with `fn F(comptime T: type) type { return struct {
-  const S = struct { fn f() void {} }; const t: T = 0; }; }`, main calling
-  `F(u16).S.f()` and `F(u8).S.f()` and printing `@typeName(F(u8).S)`, a
-  clean build prints `main.F(u8).S` (`F(u8)`'s declaration has the
-  lesser key; upstream prints its first creator's name, `main.F(u16).S`),
-  but the edit build that adds the `F(u16)` call back to a build without
-  it prints `main.F(u16).S`, the live creator's name, and `S.f`'s symbol
-  name follows. The edit that removes the call, which kept the stale
-  name before part 1, is right now. Such types number 56 on the std
-  tests, 108 on the zig workload and 5 on libvaxis (main 459e1fe), and
-  no `@typeName` reads one. Part 2 (the cache) and part 3 (link-time
-  names for loaded atoms) fix the rest.
 - *Speculative function-type reads.* A function type reads its
   by-value parameters' field types speculatively (`Zcu.speculating`); in
   a real cycle the result depends on analysis order. It aborts 0 times

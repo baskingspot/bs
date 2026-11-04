@@ -456,7 +456,8 @@ pub fn compile(init: std.process.Init, job: *const Job, inc_opt: ?*Incremental, 
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             continue;
         },
-        // An edit build in which a type's name changed (`Replay.contributeNames`).
+        // An edit build that kept a unit which read a type's name that
+        // changed (`Replay.contributeNames`).
         error.NamesFullBuild => {
             if (inputs) |list| list.shrinkRetainingCapacity(n_inputs);
             if (inc_opt) |i| i.endReplay();

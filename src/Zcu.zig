@@ -758,7 +758,9 @@ fn unitName(zcu: *const Zcu, arena: Allocator, unit: AnalUnit) ![]const u8 {
 /// The root struct type of a file, creating it (and its namespace) on first use.
 pub fn fileRootType(zcu: *Zcu, file_index: u32) !InternPool.Index {
     if (zcu.file_root_types.items[file_index] != .none) return zcu.file_root_types.items[file_index];
-    const ty = try zcu.createContainerType(.@"struct", file_index, .main_struct_inst, &.{}, .{ .creator = 0, .template = .{ .bytes = try zcu.fileFqn(file_index) } }, try zcu.fileKey(file_index), Namespace.none, null);
+    const key = try zcu.fileKey(file_index);
+    const ty = try zcu.createContainerType(.@"struct", file_index, .main_struct_inst, &.{}, .{ .creator = 0, .template = .{ .bytes = try zcu.fileFqn(file_index) } }, key, Namespace.none, null);
+    std.debug.assert(zcu.ip.stableHash(ty) == InternPool.rootStructHash(key));
     zcu.file_root_types.items[file_index] = ty;
     return ty;
 }

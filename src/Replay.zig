@@ -96,6 +96,15 @@ timing: bool = false,
 /// (`contributeNames`): its recorded name, from the offer that won, and
 /// the least creator's offer among the units this build kept.
 type_names: std.AutoArrayHashMapUnmanaged(InternPool.Hash, NameEntry) = .empty,
+/// The log's nodes' offers, by type (`collectOffers`): the manifest's
+/// index has only the base's.
+log_offers: std.AutoHashMapUnmanaged(InternPool.Hash, std.ArrayList(u32)) = .empty,
+/// By stable hash, the types whose names, or the offers that give them,
+/// differ from when they were recorded (`contributeNames`).
+renamed: std.AutoArrayHashMapUnmanaged(InternPool.Hash, void) = .empty,
+/// File root types by stable hash, which no unit offers names
+/// (`finalName`), made on first use.
+root_types: ?std.AutoHashMapUnmanaged(InternPool.Hash, u32) = null,
 /// For a donor's replay (`Incremental.useDonor`): the source paths this
 /// build's debug info can name (`Atom.Debug.file`, `unit`, `files`). A
 /// donor's function whose debug info names another path (the same source
@@ -117,6 +126,9 @@ pub const NameEntry = struct {
     /// creator's and the winner's.
     best_node: u32 = std.math.maxInt(u32),
     won_node: u32 = std.math.maxInt(u32),
+    /// `finalName`'s, once rendered.
+    final: ?[]const u8 = null,
+    rendering: bool = false,
 };
 
 pub const Stats = struct {
@@ -260,6 +272,13 @@ pub fn destroy(r: *Replay) void {
     r.walk_stack.deinit(gpa);
     r.loaded.deinit(gpa);
     r.type_names.deinit(gpa);
+    r.renamed.deinit(gpa);
+    if (r.root_types) |*m| m.deinit(gpa);
+    {
+        var it = r.log_offers.valueIterator();
+        while (it.next()) |l| l.deinit(gpa);
+        r.log_offers.deinit(gpa);
+    }
     r.data_refs.deinit(gpa);
     r.dead.deinit(gpa);
     r.refresh.deinit(gpa);
@@ -1045,10 +1064,15 @@ pub fn keepsNavData(r: *Replay, nav: InternPool.NavIndex) !bool {
 /// kept without analyzing them offered when they were analyzed
 /// (`Manifest.typeNames`), before `Zcu.finalizeNames` settles them, so
 /// that each type gets the name a full build gives it (docs/architecture.md,
-/// "Type names in the cache"). Then returns `error.NamesFullBuild` if a
-/// type's name differs from the one it had when it was recorded, which
-/// atoms from the pack still carry, or may differ: one whose least creator
-/// left. Each type's recorded name is in its least creator's offer.
+/// "Type names in the cache"). Then lists in `renamed` the types whose
+/// name, or the offer that gives it, differs from when it was recorded:
+/// one this build has, or one whose least creator left. Each type's
+/// recorded name is in its winning offer. The atoms named after them, or
+/// after types whose names have them, and the kept units' recorded
+/// winners are then out of date: an eager build writes them all again,
+/// a lazy one rewrites those (`Incremental.rewriteKept`). A kept unit
+/// that read a name that changed must be analyzed again: the build is
+/// built again in full (`error.NamesFullBuild`).
 pub fn contributeNames(r: *Replay, zcu: *Zcu) !void {
     const gpa = r.gpa;
     const ip = &zcu.ip;
@@ -1073,43 +1097,30 @@ pub fn contributeNames(r: *Replay, zcu: *Zcu) !void {
         while (it.next()) |i| if (i < n) try r.addOrphans(&wanted, @intCast(i));
         if (r.lazy) for (r.state, 0..) |st, i| if (st == .red and r.visited.isSet(i)) try r.addOrphans(&wanted, @intCast(i));
     }
-    // The log's nodes' offers, by type: the index has only the base's.
-    var changed: std.AutoHashMapUnmanaged(InternPool.Hash, std.ArrayList(u32)) = .empty;
-    defer {
-        var it = changed.valueIterator();
-        while (it.next()) |l| l.deinit(gpa);
-        changed.deinit(gpa);
-    }
     {
         var it = r.m.overlay.nodes.iterator();
         while (it.next()) |e| {
             var reader: Names.Reader = .init(e.value_ptr.names);
             while (reader.nextOffer()) |o| {
-                const gop = try changed.getOrPut(gpa, o.ty);
+                const gop = try r.log_offers.getOrPut(gpa, o.ty);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 try gop.value_ptr.append(gpa, e.key_ptr.*);
             }
         }
     }
-    try r.collectOffers(wanted.keys(), &changed);
-    // A hole whose type this build does not have takes its recorded name,
-    // from the type's winning offer.
-    var hole_types: std.ArrayList(InternPool.Hash) = .empty;
-    defer hole_types.deinit(gpa);
-    for (types.values()) |e| if (e.best) |b| for (0..b.holeCount()) |k| {
-        const hole = b.hole(k)[1];
-        if (!types.contains(hole)) try hole_types.append(gpa, hole);
-    };
-    try r.collectOffers(hole_types.items, &changed);
+    try r.collectOffers(wanted.keys());
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(gpa);
     var holes: std.ArrayList(InternPool.Template.Hole) = .empty;
     defer holes.deinit(gpa);
-    for (types.keys(), types.values()) |h, e| {
-        const best = e.best orelse continue;
+    // `finalName` may add entries: by index.
+    var ti: usize = 0;
+    while (ti < wanted.count()) : (ti += 1) {
+        const h = wanted.keys()[ti];
+        const best = types.get(h).?.best orelse continue;
         const ty = try ip.indexOfHash(h) orelse continue;
-        // A type that names a hole and that this build does not have
-        // goes in by its recorded name.
+        // A hole whose type this build does not have takes that type's
+        // final name, as text.
         bytes.clearRetainingCapacity();
         holes.clearRetainingCapacity();
         var from: usize = 0;
@@ -1120,47 +1131,166 @@ pub fn contributeNames(r: *Replay, zcu: *Zcu) !void {
             if (try ip.indexOfHash(hole_hash)) |hole_ty| {
                 try holes.append(gpa, .{ .at = @intCast(bytes.items.len), .ty = hole_ty });
             } else {
-                const name = if (types.get(hole_hash)) |he| he.won else null;
-                try bytes.appendSlice(gpa, name orelse return r.fullBuild("a type's name has a hole that is unknown"));
+                try bytes.appendSlice(gpa, try r.finalName(hole_hash) orelse return r.fullBuild("a type's name has a hole that is unknown"));
             }
         }
         try bytes.appendSlice(gpa, best.bytes[from..]);
         try zcu.offerName(ty, .{ .creator = best.creator, .template = .{ .bytes = bytes.items, .holes = holes.items } });
     }
+    // Types that analyzed units offered names: their templates may differ
+    // from the recorded ones under the same creator (an anonymous type's
+    // name has its instruction's index).
+    var fresh: std.AutoHashMapUnmanaged(InternPool.Index, void) = .empty;
+    defer fresh.deinit(gpa);
+    for (zcu.name_offers.keys()) |o| try fresh.put(gpa, o.ty, {});
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
-    for (types.keys(), types.values()) |h, e| {
-        const won = e.won orelse continue;
-        if (try ip.indexOfHash(h)) |ty| {
-            // The same creator names it the same, with the same holes,
-            // whose own names are checked here too.
-            if (ip.nameOf(ty).creator == e.won_creator) continue;
+    // A type whose holes' names changed is not listed: its holes are.
+    for (wanted.keys()) |h| {
+        const e = types.get(h).?;
+        const why: []const u8 = if (try ip.indexOfHash(h)) |ty| why: {
+            // A type that kept units offered names without one that won.
+            const won = e.won orelse break :why if (e.best != null) "no recorded winner" else continue;
+            // Another creator, even with the same name, leaves the offers'
+            // recorded winners out of date.
+            if (ip.nameOf(ty).creator != e.won_creator) break :why "another creator";
+            if (!fresh.contains(ty)) continue;
             aw.clearRetainingCapacity();
             print.writeTypeName(ip, ty, &aw.writer, .render) catch return error.OutOfMemory;
-            if (!std.mem.eql(u8, aw.written(), won)) return r.fullBuild("a type's name changed");
-        } else if (e.best) |b| {
+            if (!std.mem.eql(u8, aw.written(), won)) break :why "another template";
+            continue;
+        } else if (e.best) |b| why: {
             // Absent, so nothing in this build offered it a name: its
             // least creator is a kept unit's, the same as last time
-            // unless the one whose name won left.
-            if (b.won.len == 0) return r.fullBuild("a type's least creator left");
+            // unless the one whose name won left. (No kept unit offering
+            // it: no live unit makes it.)
+            if (b.won.len == 0) break :why "its least creator left";
+            continue;
+        } else continue;
+        if (r.timing and r.renamed.count() < 5) std.debug.print("cache: a type's name may have changed: {s} ({s})\n", .{ e.won orelse "?", why });
+        try r.renamed.put(gpa, h, {});
+    }
+    if (r.renamed.count() == 0) return;
+    try r.checkNameReads(zcu);
+}
+
+/// For a build in which names changed: returns `error.NamesFullBuild` if
+/// a unit it kept read a name that changed, whose result is then out of
+/// date.
+fn checkNameReads(r: *Replay, zcu: *Zcu) !void {
+    const ip = &zcu.ip;
+    var it = (if (r.lazy) r.visited else r.loaded).iterator(.{});
+    while (it.next()) |i| {
+        if (!r.keeps(@intCast(i))) continue;
+        var reader: results.Names.Reader = .init(r.m.typeNames(@intCast(i)));
+        while (reader.nextOffer()) |_| {}
+        while (reader.nextRead()) |rd| {
+            const ty = try ip.indexOfHash(rd.ty) orelse {
+                // A name renders the names of the named types in it, and
+                // so a renamed type's old name if it changed.
+                for (r.renamed.keys()) |h| {
+                    const old = r.type_names.get(h).?.won orelse return r.fullBuild("a kept unit read a name that may have changed");
+                    if (std.mem.indexOf(u8, rd.name, old) != null) return r.fullBuild("a kept unit read a name that may have changed");
+                }
+                continue;
+            };
+            const name = try print.typeAlloc(ip, ty, r.gpa);
+            defer r.gpa.free(name);
+            if (!std.mem.eql(u8, name, rd.name)) return r.fullBuild("a name that a kept unit read changed");
         }
     }
 }
 
+/// The name of the file root type with stable hash `ty`, if it is one.
+fn rootName(r: *Replay, ty: InternPool.Hash) !?[]const u8 {
+    const zcu = r.zcu;
+    if (r.root_types == null) {
+        r.root_types = .empty;
+        for (0..zcu.fe.files.items.len) |i| try r.root_types.?.put(r.gpa, InternPool.rootStructHash(try zcu.fileKey(@intCast(i))), @intCast(i));
+    }
+    const file = r.root_types.?.get(ty) orelse return null;
+    return try zcu.fileFqn(file);
+}
+
+/// The final name of the type with stable hash `ty`, whether this build
+/// has it or not; null if unknown (`finalName`).
+pub fn finalTypeName(r: *Replay, ty: InternPool.Hash) !?[]const u8 {
+    const ip = &r.zcu.ip;
+    if (try ip.indexOfHash(ty)) |index| {
+        var aw: std.Io.Writer.Allocating = .init(r.zcu.arena.allocator());
+        print.writeTypeName(ip, index, &aw.writer, .render) catch return error.OutOfMemory;
+        return aw.written();
+    }
+    return r.finalName(ty);
+}
+
+/// Whether node `i`'s recorded type name offers may be out of date: it
+/// offered a type in `renamed`.
+pub fn offersRenamed(r: *Replay, i: u32) bool {
+    var reader: results.Names.Reader = .init(r.m.typeNames(i));
+    while (reader.nextOffer()) |o| if (r.renamed.contains(o.ty)) return true;
+    return false;
+}
+
+/// For a kept unit's offer, in a build in which names changed: the type's
+/// final name if the offer gives it, else empty (`results.Names.rewriteWon`).
+pub fn wonName(r: *Replay, o: results.Names.Offer) ![]const u8 {
+    const ip = &r.zcu.ip;
+    if (try ip.indexOfHash(o.ty)) |ty| {
+        if (ip.nameOf(ty).creator != o.creator) return "";
+        var aw: std.Io.Writer.Allocating = .init(r.zcu.arena.allocator());
+        print.writeTypeName(ip, ty, &aw.writer, .render) catch return error.OutOfMemory;
+        return aw.written();
+    }
+    if (!r.type_names.contains(o.ty)) try r.collectOffers(&.{o.ty});
+    const best = r.type_names.get(o.ty).?.best orelse return "";
+    if (best.creator != o.creator) return "";
+    return try r.finalName(o.ty) orelse "";
+}
+
 /// The final name of the type with stable hash `ty`, which this build
-/// does not have, for `contributeNames`' caller: its recorded name, which
-/// the build keeps (or it builds again in full), or null if no unit
-/// offered it a name.
-pub fn finalName(r: *const Replay, ty: InternPool.Hash) ?[]const u8 {
-    const e = r.type_names.get(ty) orelse return null;
-    return e.won;
+/// does not have: its least kept creator's template, with each hole's
+/// final name, or its recorded name if no kept unit offered it one; null
+/// if no unit did, or a hole's name is unknown.
+pub fn finalName(r: *Replay, ty: InternPool.Hash) !?[]const u8 {
+    if (!r.type_names.contains(ty)) try r.collectOffers(&.{ty});
+    const e = r.type_names.getPtr(ty).?;
+    if (e.final) |f| return f;
+    const best = e.best orelse return e.won orelse try r.rootName(ty);
+    // Holes name other types, never the type itself.
+    if (e.rendering) return null;
+    e.rendering = true;
+    const ip = &r.zcu.ip;
+    var aw: std.Io.Writer.Allocating = .init(r.zcu.arena.allocator());
+    const w = &aw.writer;
+    var from: usize = 0;
+    for (0..best.holeCount()) |k| {
+        const at, const hole_hash = best.hole(k);
+        w.writeAll(best.bytes[from..at]) catch return error.OutOfMemory;
+        from = at;
+        if (try ip.indexOfHash(hole_hash)) |hole_ty| {
+            print.writeTypeName(ip, hole_ty, w, .render) catch return error.OutOfMemory;
+        } else {
+            const name = try r.finalName(hole_hash) orelse {
+                r.type_names.getPtr(ty).?.rendering = false;
+                return null;
+            };
+            w.writeAll(name) catch return error.OutOfMemory;
+        }
+    }
+    w.writeAll(best.bytes[from..]) catch return error.OutOfMemory;
+    // `finalName` may have grown the table.
+    const after = r.type_names.getPtr(ty).?;
+    after.rendering = false;
+    after.final = aw.written();
+    return after.final;
 }
 
 /// Gathers into `type_names` the offers the manifest's nodes made the
 /// types with stable hashes `tys`: each one's recorded name, and the kept
 /// nodes' least creator's offer. Reads each node once: one node may offer
 /// names to thousands of types.
-fn collectOffers(r: *Replay, tys: []const InternPool.Hash, changed_offers: *const std.AutoHashMapUnmanaged(InternPool.Hash, std.ArrayList(u32))) !void {
+fn collectOffers(r: *Replay, tys: []const InternPool.Hash) !void {
     const gpa = r.gpa;
     const m = r.m;
     const changed = &m.overlay.nodes;
@@ -1189,7 +1319,7 @@ fn collectOffers(r: *Replay, tys: []const InternPool.Hash, changed_offers: *cons
             e.won_node = n;
             try nodes.put(gpa, n, {});
         }
-        if (changed_offers.get(ty)) |log_nodes| for (log_nodes.items) |n| try nodes.put(gpa, n, {});
+        if (r.log_offers.get(ty)) |log_nodes| for (log_nodes.items) |n| try nodes.put(gpa, n, {});
     }
     for (nodes.keys()) |n| {
         const in_log = changed.count() != 0 and changed.contains(n);
@@ -1218,13 +1348,13 @@ fn addOrphans(r: *const Replay, wanted: *std.AutoArrayHashMapUnmanaged(InternPoo
 
 /// Whether node `i` is live and its unit was not analyzed in this build:
 /// its type names are as recorded (`contributeNames`).
-fn keeps(r: *const Replay, i: u32) bool {
+pub fn keeps(r: *const Replay, i: u32) bool {
     if (!r.lazy) return r.loaded.isSet(i);
     return r.visited.isSet(i) and r.state[i] != .red and !r.dead.isSet(i);
 }
 
-/// Until atoms from the pack are named at link time, a build in which a
-/// type's name changed builds again in full (main).
+/// A build in which a kept unit read a name that changed builds again in
+/// full (main).
 fn fullBuild(r: *const Replay, why: []const u8) error{NamesFullBuild} {
     if (r.timing) std.debug.print("cache: building again in full: {s}\n", .{why});
     return error.NamesFullBuild;

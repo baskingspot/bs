@@ -1117,6 +1117,26 @@ pub const Names = struct {
         }
     }
 
+    /// Appends `words`, names that `encode` wrote, to `out` with each
+    /// offer's `won` replaced by `context.wonName(offer)`: for a unit an edit
+    /// build kept in which another offer won, or a name changed.
+    pub fn rewriteWon(gpa: Allocator, out: *std.ArrayList(u32), words: []const u32, context: anytype) !void {
+        if (words.len == 0) return;
+        var r: Reader = .init(words);
+        if (r.offers_left == 0) return out.appendSlice(gpa, words);
+        try out.append(gpa, r.offers_left);
+        while (r.nextOffer()) |o| {
+            try appendHash(gpa, out, o.ty);
+            try appendHash(gpa, out, o.creator);
+            try appendBytes(gpa, out, try context.wonName(o));
+            try appendBytes(gpa, out, o.bytes);
+            try out.append(gpa, @intCast(o.holeCount()));
+            try out.appendSlice(gpa, o.holes);
+        }
+        // The reads, with their count.
+        try out.appendSlice(gpa, words[r.c.at - 1 ..]);
+    }
+
     fn renderName(ip: *const InternPool, ty: Index, aw: *std.Io.Writer.Allocating) !void {
         print.writeTypeName(ip, ty, &aw.writer, .render) catch return error.OutOfMemory;
     }

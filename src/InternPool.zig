@@ -1646,6 +1646,15 @@ fn hashString(ip: *const InternPool, hasher: *Hasher, s: String) void {
     hasher.bytes(ip.stringSlice(s));
 }
 
+/// The stable hash `hashKey` gives a file's root struct, whose stable
+/// key is `key` and which has no captures, without interning it.
+pub fn rootStructHash(key: []const u8) Hash {
+    var h: Hasher = .init("struct_type");
+    h.bytes(key);
+    h.int(u64, 0);
+    return h.final();
+}
+
 /// The stable hash of `key`, which is also its dedup hash.
 pub fn hashKey(ip: *const InternPool, key: Key) Hash {
     var h: Hasher = .init(@tagName(key));
