@@ -673,6 +673,15 @@ pub fn lockCmpxchg(e: *Encoder, size: Size, dst: Mem, src: Reg) !void {
     try e.lock0f(size, 0xb0, 0xb1, dst, src);
 }
 
+/// `lock cmpxchg16b [dst]`: if the 16 bytes at `dst` (16-byte aligned)
+/// equal rdx:rax, stores rcx:rbx there (ZF set); else loads them into
+/// rdx:rax (ZF clear).
+pub fn lockCmpxchg16b(e: *Encoder, dst: Mem) !void {
+    try e.reserve();
+    e.byte(0xf0);
+    try e.modRm(.{ .w = true }, &.{ 0x0f, 0xc7 }, 1, rmGpr(.{ .mem = dst }), 0);
+}
+
 /// `lock xadd [dst], src`: adds `src` to [dst] and leaves the old value
 /// in `src`.
 pub fn lockXadd(e: *Encoder, size: Size, dst: Mem, src: Reg) !void {
@@ -1536,7 +1545,9 @@ test "packed SSE instructions match GNU as" {
     try e.crc32(.dword, .word, .rcx, .{ .reg = .r9 });
     try e.crc32(.qword, .qword, .r11, .{ .mem = .at(.rdi, 8) });
     try e.crc32(.dword, .dword, .rdx, .{ .reg = .rbx });
-    const expected = "660ffcca66440f744de066410fefc766440ffbc3410f58d2660f59080fc2dc0166450fc25c24100466410f70d44ef20f70d3b1f3440f70cb00660f71d10866410f72f21f660f73db04660f73f20166410fd7c166440fd7d10f50ca66450f50de660f6f4df0f3450f7f4a08f30f6f0500000000660f3800ca66440f38404df066410f3837c766440f383fe3f2480f38f0c666f2410f38f1c9f24c0f38f15f08f20f38f1d3";
+    try e.lockCmpxchg16b(.at(.r10, 0));
+    try e.lockCmpxchg16b(.at(.rbp, -32));
+    const expected = "660ffcca66440f744de066410fefc766440ffbc3410f58d2660f59080fc2dc0166450fc25c24100466410f70d44ef20f70d3b1f3440f70cb00660f71d10866410f72f21f660f73db04660f73f20166410fd7c166440fd7d10f50ca66450f50de660f6f4df0f3450f7f4a08f30f6f0500000000660f3800ca66440f38404df066410f3837c766440f383fe3f2480f38f0c666f2410f38f1c9f24c0f38f15f08f20f38f1d3f0490fc70af0480fc74de0";
     var buf: [expected.len / 2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&buf, expected), e.code.items);
 }

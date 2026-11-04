@@ -43,6 +43,7 @@ const SymbolKey = Atom.SymbolKey;
 const Encoder = @import("Encoder.zig");
 const Ssa = @import("../Ssa.zig");
 const vector = @import("vector.zig");
+const atomic128 = @import("atomic128.zig");
 const Reg = Encoder.Reg;
 const Mem = Encoder.Mem;
 const Size = Encoder.Size;
@@ -2536,21 +2537,24 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
             const ty = data.ty_op.ty;
             const size = Type.abiSize(ip, ty);
             if (size == 0) return;
+            if (atomic128.is128(cg, ty)) return atomic128.load(cg, inst, data);
             try cg.load(.rcx, data.ty_op.operand);
             const d = cg.destReg(inst);
             try cg.loadMem(d, Mem.at(.rcx, 0), ty);
             try cg.setResult(inst, ty, d);
         },
         .atomic_store => {
+            if (atomic128.is128(cg, cg.typeOf(data.bin_op.rhs))) return atomic128.store(cg, data);
             const size = Type.abiSize(ip, cg.typeOf(data.bin_op.rhs));
             try cg.load(.rcx, data.bin_op.lhs);
             try cg.load(.rax, data.bin_op.rhs);
             try cg.e.xchg(sizeOf(size), .{ .mem = Mem.at(.rcx, 0) }, .rax);
         },
-        .atomic_rmw => try cg.atomicRmw(inst, data),
+        .atomic_rmw => if (atomic128.is128(cg, data.ty_pl.ty)) try atomic128.rmw(cg, inst, data) else try cg.atomicRmw(inst, data),
         .cmpxchg => {
             const x = ir.extraData(Ir.Cmpxchg, data.ty_pl.payload).data;
             const elem_ty = cg.typeOf(x.expected);
+            if (atomic128.is128(cg, elem_ty)) return atomic128.cmpxchg(cg, inst, data);
             const size = sizeOf(Type.abiSize(ip, elem_ty));
             try cg.load(.rcx, x.ptr);
             try cg.load(.rax, x.expected);

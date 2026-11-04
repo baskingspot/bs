@@ -7341,6 +7341,18 @@ computes the right one instead of copying the bug:
   shared libraries"), and print the right values. C objects' accesses to
   the same variable were never affected.
 
+- *128-bit atomics with cx16.* Upstream 0.17.1's Debug backends
+  (self-hosted and LLVM) compute `@atomicRmw(.Min)` on 128-bit integers
+  wrong: the self-hosted one picks the operand with `cmova`/`cmovg`
+  after `cmp`/`sbb`, whose ZF reflects only the high limb, so
+  `min(2, 1)` is 2. Its `.Add`, `.Sub` and `.Nand` on 65- to 127-bit
+  integers leave the bits above the width unwrapped, and it fails to
+  compile 128-bit `@atomicLoad` and `@atomicStore` (an error and a
+  crash). zap gives LLVM ReleaseFast's results for all of them: loads
+  are a `cmpxchg16b` of zero with zero and stores a `cmpxchg16b` loop,
+  as LLVM lowers them. `@atomicRmw` arithmetic on f80 and f128, which
+  upstream allows and miscomputes, stays refused.
+
 Where upstream supports more than zap generates code for, zap narrows
 the choice instead of failing:
 
@@ -7356,9 +7368,9 @@ the choice instead of failing:
   the host has all of its instructions, else `x86_64`, plus the host's
   features zap accepts; std takes its SSE paths, as upstream's on a CPU
   without AVX.
-  With `cx16` (x86-64-v2) upstream also allows 128-bit atomics; zap
-  keeps refusing them (`Sema.atomicElemType`'s 64-bit limit), since its
-  CodeGen has no `cmpxchg16b` lowering.
+  With `cx16` (x86-64-v2) 128-bit atomics are allowed, as upstream
+  (`Sema.atomicElemType`), and lowered with `lock cmpxchg16b`
+  (`codegen/x86_64/atomic128.zig`).
 
 ## Known regressions and limitations
 

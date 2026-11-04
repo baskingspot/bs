@@ -6781,9 +6781,9 @@ fn atomicElemType(sema: *Sema, block: *Block, src: Src, ty: Index) CompileError!
         else => false,
     };
     if (!ok) return sema.fail(block, src, "expected bool, integer, float, enum, packed struct, or pointer type; found '{f}'", .{sema.fmtType(ty)});
-    // As upstream's `atomicPtrAlignment`: x86_64 without cx16 (zap's
-    // baseline CPU) has 64-bit atomics at most.
-    const max_bits = 64;
+    // As upstream's `atomicPtrAlignment`: x86_64 has 128-bit atomics
+    // with cx16 (`-mcpu`; cmpxchg16b), else 64-bit ones at most.
+    const max_bits: u16 = if (sema.zcu.cpu.has(.x86, .cx16)) 128 else 64;
     switch (Type.class(ip, ty)) {
         .float => if (Type.floatBits(ip, ty) > max_bits)
             return sema.fail(block, src, "expected {d}-bit float type or smaller; found {d}-bit float type", .{ max_bits, Type.floatBits(ip, ty) }),
