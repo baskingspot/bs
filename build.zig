@@ -1291,6 +1291,21 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
         test_step.dependOn(&undef.step);
     }
     {
+        // A GNU indirect function: refused, not linked as a plain function.
+        const ifunc = b.addRunArtifact(zap);
+        ifunc.setName("zap build-exe refuses a C object's GNU indirect function");
+        ifunc.addArgs(&.{ "build-exe", "-lc", "-target", "x86_64-linux-gnu" });
+        ifunc.addFileArg(b.path("test/link_input/ifunc_main.zig"));
+        const o = b.addSystemCommand(&.{ zig, "cc", "-c" });
+        o.addFileArg(b.path("test/link_input/ifunc.c"));
+        ifunc.addFileArg(o.addPrefixedOutputFileArg("-o", "ifunc.o"));
+        ifunc.setEnvironmentVariable("ZAP_CACHE", "off");
+        _ = ifunc.addPrefixedOutputFileArg("-femit-bin=", "main");
+        ifunc.addCheck(.{ .expect_stderr_match = "ifunc.o: zap does not link GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) yet: c_triple;" });
+        ifunc.addCheck(.{ .expect_term = .{ .exited = 1 } });
+        test_step.dependOn(&ifunc.step);
+    }
+    {
         const dead = b.addRunArtifact(zap);
         dead.setName("zap build-exe links the data a discarded load reads");
         dead.addArg("build-exe");

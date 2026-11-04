@@ -434,6 +434,14 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
         @memset(c.whole, false);
         for (0..o.shdrs.len) |i| try c.section(@intCast(i));
         try c.inputSections();
+        // GNU indirect functions (`ifunc`, `target_clones`) need their
+        // resolver called at startup (IRELATIVE), which zap does not do
+        // yet: refused rather than linked as plain functions.
+        for (o.syms[1..]) |sym| if (sym.st_type() == elf.STT_GNU_IFUNC and sym.st_shndx != elf.SHN_UNDEF and
+            sym.st_shndx < o.shdrs.len and !o.discarded[sym.st_shndx])
+        {
+            try in.errors.append(arena, try std.fmt.allocPrint(arena, "{s}: zap does not link GNU indirect functions (STT_GNU_IFUNC, from __attribute__((ifunc)) or __attribute__((target_clones))) yet: {s}; build this step with upstream zig", .{ o.path, o.symName(sym) }));
+        };
         for (o.syms[1..], 1..) |sym, s_index| {
             const ty = sym.st_type();
             if (ty != elf.STT_FUNC and ty != elf.STT_OBJECT and ty != elf.STT_TLS) continue;

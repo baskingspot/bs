@@ -2941,6 +2941,12 @@ symbol or a local becomes (section atom, value + addend).
   shared object, GD and LD stay
   (`x86_64_tlsgd`/`x86_64_tlsld`, the GOT pairs made by ElfDynamic). IE
   in a shared object is `[unsupported]` until something needs it.
+- GNU indirect functions (STT_GNU_IFUNC, from `__attribute__((ifunc))`
+  and `target_clones`) in a linked object are an error naming each one
+  (2026-11-04): they need IRELATIVE relocations, which the libc startup
+  (static) or the loader (dynamic) applies, and PLT/GOT entries for
+  calls and addresses; until then, linking them as plain functions
+  would call the resolver instead.
 - Thread-locals imported from shared libraries (built 2026-11-04;
   ElfShared keeps STT_TLS symbols, and the import is STT_TLS in
   .dynsym): initial-exec through a content-addressed 8-byte slot
