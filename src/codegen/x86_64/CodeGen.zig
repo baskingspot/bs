@@ -333,15 +333,14 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
     if (cover) try emit.addCoverage(try emit.funcKey(ir.func), cg.cover_pcs.items);
 }
 
-/// Whether `-ffuzz` instruments the function: not in compiler_rt or the
-/// fuzzer's own module family, not naked, and not after
+/// Whether `-ffuzz` instruments the function: in a module with `-ffuzz`
+/// (never compiler_rt or the fuzzer's own family), not naked, and not after
 /// `@disableInstrumentation()` (docs/architecture.md, "Fuzzing").
 fn instrumented(emit: *Emit, ir: *const Ir) bool {
     const ip = &emit.zcu.ip;
     const func = ip.keyPayload(.func, ir.func);
     if (ir.disable_instrumentation or ip.keyPayload(.func_type, func.ty).cc == .naked) return false;
-    const module = emit.zcu.file(ip.getNav(func.owner_nav).file).module;
-    return module != .compiler_rt and emit.zcu.fe.module(module).std_mod == .std;
+    return emit.zcu.fe.module(emit.zcu.file(ip.getNav(func.owner_nav).file).module).fuzz;
 }
 
 /// A coverage point at the start of a covered block: its counter is set

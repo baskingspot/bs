@@ -71,9 +71,13 @@ pub const Options = struct {
     stack_size: u64 = 16 * 1024 * 1024,
     /// `-fsingle-threaded`.
     single_threaded: bool = false,
-    /// `-ffuzz`: instrument the program for upstream's fuzzer and link it
-    /// (docs/architecture.md, "Fuzzing").
+    /// `-ffuzz` on any module: instrument those modules for upstream's
+    /// fuzzer and link it (docs/architecture.md, "Fuzzing").
     fuzz: bool = false,
+    /// `-ffuzz` or `-fno-fuzz` on the root module, which std and the test
+    /// runner inherit, and `builtin.fuzz` reports; other modules have
+    /// theirs in `modules`.
+    root_fuzz: bool = false,
     /// `-funwind-tables`, `-fasync-unwind-tables`, `-fno-unwind-tables`:
     /// only what `builtin.unwind_tables` says (Builtin.Options).
     unwind_tables: std.lang.UnwindTables = .async,
@@ -257,7 +261,7 @@ pub const Job = struct {
             .is_test = is_test,
             .single_threaded = opts.single_threaded,
             .unwind_tables = opts.unwind_tables,
-            .fuzz = opts.fuzz,
+            .fuzz = opts.root_fuzz,
             .pic = opts.pic,
             .pie = opts.pie,
             .dynamic = opts.dynamic,
@@ -406,6 +410,7 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
         .root_name = opts.root_name,
         .root_deps = opts.root_deps,
         .modules = opts.modules,
+        .fuzz = opts.root_fuzz,
         .fuzzer_builtin_dir = job.fuzzer_builtin_dir,
     });
     defer fe.deinit();
@@ -950,7 +955,7 @@ const ignored_flags: std.StaticStringMap(void) = .initComptime(.{
     .{"-fno-llvm"},                        .{"-fno-lld"},                  .{"-fnew-linker"},          .{"-fno-new-linker"},
     .{"-fallow-so-scripts"},               .{"-fno-allow-so-scripts"},     .{"-fentry"},               .{"-fno-strip"},
     .{"-fstack-check"},                    .{"-fno-stack-check"},          .{"-fstack-protector"},     .{"-fno-stack-protector"},
-    .{"-fno-omit-frame-pointer"},          .{"-ferror-tracing"},           .{"-fno-sanitize-thread"},  .{"-fno-fuzz"},
+    .{"-fno-omit-frame-pointer"},          .{"-ferror-tracing"},           .{"-fno-sanitize-thread"},
     .{"-fvalgrind"},                       .{"-fno-PIC"},                  .{"-fno-PIE"},              .{"-fbuiltin"},
     .{"-fno-builtin"},                     .{"-mred-zone"},                .{"-mno-red-zone"},         .{"-fno-sanitize-c"},
     .{"-fsanitize-c=trap"},                .{"-fsanitize-c=full"},         .{"-fsanitize-c"},          .{"-gdwarf32"},
@@ -1019,6 +1024,11 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
     var test_filters: std.ArrayList([]const u8) = .empty;
     var deps: std.ArrayList([]const u8) = .empty;
     var modules: std.ArrayList(Frontend.ModuleArg) = .empty;
+    // `-ffuzz` and `-fno-fuzz` are per module, as upstream's: each `-M`
+    // takes the last one before it; a root file given by position takes
+    // the last one left.
+    var fuzz: ?bool = null;
+    var root_fuzz: ?bool = null;
     var i: usize = 0;
     while (i < args.len) : (i +%= 1) {
         const arg = args[i];
@@ -1096,7 +1106,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
             // Objects would need the coverage sections and their symbols.
             if (command == .build_obj or command == .build_lib)
                 setUnsupported(&opts, arena, "zap does not instrument objects or libraries for fuzzing yet ('-ffuzz'); fuzz an executable or a test", .{});
-            opts.fuzz = true;
+            fuzz = true;
+        } else if (std.mem.eql(u8, arg, "-fno-fuzz")) {
+            fuzz = false;
         } else if (std.mem.eql(u8, arg, "-funwind-tables")) {
             opts.unwind_tables = .sync;
         } else if (std.mem.eql(u8, arg, "-fasync-unwind-tables")) {
@@ -1131,7 +1143,9 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
                 root = spec[eq + 1 ..];
                 opts.root_name = spec[0..eq];
                 opts.root_deps = try deps.toOwnedSlice(arena);
-            } else try modules.append(arena, .{ .name = spec[0..eq], .path = spec[eq + 1 ..], .deps = try deps.toOwnedSlice(arena) });
+                root_fuzz = fuzz;
+            } else try modules.append(arena, .{ .name = spec[0..eq], .path = spec[eq + 1 ..], .deps = try deps.toOwnedSlice(arena), .fuzz = fuzz });
+            fuzz = null;
         } else if (std.mem.startsWith(u8, arg, "--error-format=")) {
             const v = arg["--error-format=".len..];
             opts.error_format = std.meta.stringToEnum(diag.Format, v) orelse fatal("invalid --error-format '{s}': expected 'text' or 'json'", .{v});
@@ -1197,6 +1211,10 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, command: Command, args_in:
         } else continue;
         fatal("unable to add module \"{s}\": already exists as '{s}'", .{ m.name, prev });
     }
+    opts.root_fuzz = root_fuzz orelse fuzz orelse false;
+    opts.fuzz = opts.root_fuzz or for (modules.items) |m| {
+        if (m.fuzz == true) break true;
+    } else false;
     return opts;
 }
 

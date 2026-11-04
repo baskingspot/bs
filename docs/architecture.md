@@ -4784,14 +4784,18 @@ upstream's LLVM build finds a planted out-of-bounds write behind a
 
 **zap's design.**
 
-- **Command line.** `-ffuzz` sets one flag for the compilation:
-  `builtin.fuzz = true`, every function of the program's module family
-  (below) except compiler_rt is instrumented, and an executable links the
-  fuzzer. Upstream's flag is per module; zap instruments every module,
-  which upstream's `zig build --fuzz` asks for anyway (it passes
-  `-ffuzz` ahead of the root module, and modules inherit it). `-fno-fuzz`
-  stays accepted and ignored (a module that opts out is instrumented
-  too; instrumentation is not semantics). `-ffuzz` on `build-obj` and
+- **Command line.** `-ffuzz` and `-fno-fuzz` are per module, as
+  upstream's: each `-M` takes the last one before it, and a root file
+  given by position the last one left. A module without either takes the
+  flag of the module that first depends on it, depth first from the main
+  module (upstream's `Module.create` parent); std, builtin and the test
+  runner take the main module's. CodeGen instruments the functions of
+  modules with the flag (never compiler_rt or the fuzzer's family). If
+  any module has it, an executable links the fuzzer. One difference:
+  zap has one `builtin` per family, so `builtin.fuzz` is the main
+  module's in every module, where upstream gives each module its own.
+  `zig build --fuzz` passes `-ffuzz` ahead of the root module and a
+  module's `.fuzz` ahead of its `-M`. `-ffuzz` on `build-obj` and
   `build-lib`, and for aarch64-macos, is `[unsupported]` for now.
 - **The fuzzer is a module family, not a second compilation.** zap
   compiles `<zig lib>/fuzzer.zig` in the same compilation as the program,
