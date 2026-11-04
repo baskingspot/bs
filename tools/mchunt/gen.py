@@ -1014,7 +1014,7 @@ class Gen:
             (10, "decl"), (9, "assign"), (6, "sink"), (4, "if"), (3, "while"), (3, "for"),
             (2, "switch"), (3, "callstmt"), (2, "ptr"), (2, "aggr"), (1, "slice"), (1, "opt"),
             (1, "defer"), (1, "guard"), (1, "labeled"), (1, "inlinefor"), (1, "brk"), (1, "ret"),
-            (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"),
+            (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -1366,6 +1366,163 @@ class Gen:
             self.sink(ctx, f"{arr}[{self.index(ctx, n, allow_oob=False)}]", et)
         if self.chance(0.3):
             self.sink(ctx, f"@as(u{n}, @bitCast({a} == {b}))", Int(False, n))
+
+    def rt_int(self, ctx, t):
+        """A runtime-known integer expression of type `t` (from a path),
+        or None."""
+        cands = [p for p in self.paths(ctx, lambda x: is_int(x)) if self.is_rt(p[2].name)]
+        if not cands:
+            return None
+        steps, ft, _ = self.pick(cands)
+        return self.conv(self.render_path(ctx, steps), ft, t)
+
+    def s_prove(self, ctx):
+        """A check next to the comparisons that decide it, or nearly do
+        (what a prover of safety checks reasons about). The near misses
+        must keep their check: they fire for some values."""
+        k = self.r.randrange(11)
+        t = self.pick([Int(False, 8), Int(True, 8), Int(False, 16), Int(True, 16), U32, Int(True, 32), U64,
+                       USIZE, Int(False, 5), Int(True, 7)])
+        x = self.rt_int(ctx, t)
+        if x is None:
+            return self.s_sink(ctx)
+        v = self.fresh("pv")
+        if self.chance(0.5):
+            self.emit(ctx, f"const {v}: {t.name()} = {x};")
+        else:
+            # A variable the prover tracks through its stores.
+            self.emit(ctx, f"var {v}: {t.name()} = {x};")
+            self.emit(ctx, f"{v} +%= {self.r.randint(0, 1) if t.max() >= 1 else 0};")
+        self.rt_names.add(v)
+        ctx["fn"].risky = True
+        n = t.name()
+        near = self.chance(0.35)
+        I = lambda: self.emit(ctx, "}")
+
+        def body(e, et=None):
+            ctx["indent"] += 1
+            self.sink(ctx, e, et or t)
+            ctx["indent"] -= 1
+
+        if k == 0:
+            # A bound on the widened value, the operation on the narrow one.
+            w = Int(t.signed, min(t.bits * 2, 64)) if t.bits < 64 else t
+            c = t.max() + (1 if near else 0)
+            self.emit(ctx, f"if (@as({w.name()}, {v}) < {self.bare(c)}) {{")
+            body(f"{v} + 1")
+            I()
+        elif k == 1:
+            # A bound, then a store, then the use.
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            self.emit(ctx, f"var {arr}: [{ln}]{n} = @splat({v});")
+            self.emit(ctx, f"_ = &{arr};")
+            self.emit(ctx, f"var {v}i: usize = {self.conv(v, t, USIZE)} % {ln};")
+            self.emit(ctx, f"if ({v}i < {ln}) {{")
+            ctx["indent"] += 1
+            if near:
+                self.emit(ctx, f"{v}i = {self.conv(self.rt_int(ctx, Int(False, 8)) or '0', Int(False, 8), USIZE)} % {ln + 2};")
+            else:
+                self.emit(ctx, f"{v}i = {self.conv(self.rt_int(ctx, Int(False, 8)) or '0', Int(False, 8), USIZE)} % {ln};")
+            self.sink(ctx, f"{arr}[{v}i]", t)
+            ctx["indent"] -= 1
+            I()
+        elif k == 2 and t.signed:
+            # Signed bounds: i < c does not keep i + d in range when c + d overflows.
+            c = self.r.randint(1, t.max())
+            d = t.max() - c + 1 + (1 if near else 0)  # v <= c - 1
+            self.emit(ctx, f"if ({v} < {self.bare(c)}) {{")
+            body(f"{v} + {self.bare(min(d, t.max()))}")
+            I()
+        elif k == 3:
+            # i > lo, then i - 1 (or i - 2 for a near miss).
+            lo = 0 if not t.signed else self.r.randint(t.min(), 0)
+            self.emit(ctx, f"if ({v} > {self.bare(lo)}) {{")
+            body(f"{v} - {2 if near else 1}")
+            I()
+        elif k == 4:
+            # A loop that moves its index inside the body.
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+            j = self.fresh("pj")
+            self.emit(ctx, f"var {j}: usize = 0;")
+            self.emit(ctx, f"while ({j} < {arr}.len) : ({j} += 1) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{arr}[{j}]", t)
+            self.emit(ctx, f"if (({self.conv(v, t, USIZE)} & {self.r.choice([1, 2, 3])}) == 0) {j} += 1;" if not near
+                      else f"{j} += 1;")
+            self.sink(ctx, f"{arr}[{j}]" if near else f"{arr}[@min({j}, {ln - 1})]", t)
+            ctx["indent"] -= 1
+            I()
+        elif k == 5:
+            # A fact on one path only.
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+            j = self.fresh("pj")
+            self.emit(ctx, f"var {j}: usize = {self.conv(v, t, USIZE)};")
+            self.emit(ctx, f"if ({self.bool_expr(ctx, 1)}) {{")
+            ctx["indent"] += 1
+            self.emit(ctx, f"if ({j} >= {ln}) {j} = 0;")
+            ctx["indent"] -= 1
+            self.emit(ctx, "} else {")
+            ctx["indent"] += 1
+            self.emit(ctx, f"{j} = {j} % {ln + (1 if near else 0)};")
+            ctx["indent"] -= 1
+            I()
+            self.sink(ctx, f"{arr}[{j}]", t)
+        elif k == 6 and not t.signed:
+            # i < n, then a[i -% 1] (wraps to huge at 0).
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+            j = self.fresh("pj")
+            self.emit(ctx, f"const {j}: usize = {self.conv(v, t, USIZE)};")
+            self.emit(ctx, f"if ({j} < {ln}) {{" if near else f"if ({j} < {ln} and {j} >= 1) {{")
+            body(f"{arr}[{j} -% 1]")
+            I()
+        elif k == 7:
+            # i + 1 < n proves a[i + 1], not a[i + 2].
+            arr = self.fresh("pa")
+            ln = self.r.randint(2, 8)
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+            j = self.fresh("pj")
+            self.emit(ctx, f"const {j}: usize = {self.conv(v, t, USIZE)} % {ln + 2};")
+            self.emit(ctx, f"if ({j} + 1 < {arr}.len) {{")
+            body(f"{arr}[{j} + {2 if near else 1}]")
+            I()
+        elif k == 8:
+            # A bound that keeps i * m in range, or just misses.
+            m = self.r.randint(2, 70)
+            c = t.max() // m + (2 if near else 1)  # v <= max / m keeps v * m in range
+            if c > t.max():
+                return self.s_sink(ctx)
+            self.emit(ctx, f"if ({v} < {self.bare(c)}{f' and {v} >= {self.bare(-(t.max() // m))}' if t.signed else ''}) {{")
+            body(f"{v} * {m}")
+            I()
+        elif k == 9:
+            # A bound for one array used on a shorter one.
+            a1, a2 = self.fresh("pa"), self.fresh("pa")
+            l1 = self.r.randint(2, 8)
+            l2 = l1 - (1 if near else 0)
+            self.emit(ctx, f"const {a1}: [{l1}]{n} = @splat({v});")
+            self.emit(ctx, f"const {a2}: [{l2}]{n} = @splat({v} ^ 1);")
+            j = self.fresh("pj")
+            self.emit(ctx, f"const {j}: usize = {self.conv(v, t, USIZE)} % {l1 + 1};")
+            self.emit(ctx, f"if ({j} < {a1}.len) {{")
+            body(f"{a1}[{j}] ^ {a2}[{j}]")
+            I()
+        else:
+            # i <= n proves nothing about a[i] when a.len == n.
+            arr = self.fresh("pa")
+            ln = self.r.randint(1, 8)
+            self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+            j = self.fresh("pj")
+            self.emit(ctx, f"const {j}: usize = {self.conv(v, t, USIZE)};")
+            self.emit(ctx, f"if ({j} {'<=' if near else '<'} {arr}.len) {{")
+            body(f"{arr}[{j}]")
+            I()
 
     def s_switch(self, ctx):
         if self.chance(0.3):
