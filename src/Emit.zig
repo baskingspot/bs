@@ -764,7 +764,10 @@ fn pullInputs(emit: *Emit, in: *ElfInput) !void {
     defer names.deinit(emit.gpa);
     try in.undefinedSince(emit.inputs_requested, &names, emit.gpa);
     emit.inputs_requested = in.objects.items.len;
-    for (names.items) |name| _ = try emit.rtExport(name);
+    // As the link's own requests (`.link` refs), which the cache's link
+    // node keeps, so an edit build can tell whether the inputs need more.
+    std.debug.assert(emit.owner == .link);
+    for (names.items) |name| _ = try emit.requestCompilerRtExport(name);
 }
 
 /// How names the objects reference but do not define resolve on the Zig
