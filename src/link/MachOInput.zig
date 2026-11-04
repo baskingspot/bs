@@ -510,9 +510,14 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
     for (in.objects.items) |*o| {
         c.o = o;
         for (1..o.sects.len) |i| try c.section(@intCast(i));
-        // Named places inside atoms, for the symbol table.
+        // Named places inside atoms, for the symbol table: functions and
+        // objects, static ones too, but not the assembler's labels
+        // (`ltmp0`, `l_.str`), which C names never start with, since
+        // they get Darwin's underscore.
         for (o.syms) |sym| {
-            if (sym.isStab() or sym.kind() != macho.N_SECT or !sym.isExternal()) continue;
+            if (sym.isStab() or sym.kind() != macho.N_SECT) continue;
+            const raw = o.symName(sym);
+            if (raw.len == 0 or raw[0] == 'l' or raw[0] == 'L') continue;
             const kind = sectionOf(o, sym.n_sect) orelse continue;
             if (kind == .tdata or kind == .tbss or o.pieces[sym.n_sect].len != 0) continue;
             const t = localTarget(o, sym.n_sect, sym.n_value) orelse continue;
@@ -530,6 +535,7 @@ pub fn convert(in: *Inputs, ctx: anytype) !Converted {
             .zero_fill = common.size,
         });
     }
+    try c.reportUndefined();
     if (weak_used) try values.append(arena, .{ .key = undefined_weak_key, .value = 0 });
     try values.appendSlice(arena, c.abs_values.items);
     return .{ .atoms = atoms.items, .values = values.items, .symbols = symbols.items };
@@ -545,8 +551,35 @@ fn Converter(comptime Ctx: type) type {
         abs_values: std.ArrayList(Elf.Value) = .empty,
         /// How each external name the objects reference resolved.
         resolved: std.StringHashMapUnmanaged(?Target) = .empty,
+        /// The strong names nothing defines, each with the objects that
+        /// reference it, in input order, for one error per name.
+        undefs: std.StringArrayHashMapUnmanaged(std.ArrayList([]const u8)) = .empty,
 
         const C = @This();
+
+        fn undefinedSymbol(c: *C, name: []const u8) Allocator.Error!void {
+            const gop = try c.undefs.getOrPut(c.in.arena, name);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            const objects = gop.value_ptr;
+            // Objects convert one at a time, so a repeat is the last one.
+            if (objects.items.len == 0 or objects.items[objects.items.len - 1].ptr != c.o.path.ptr) try objects.append(c.in.arena, c.o.path);
+        }
+
+        /// Reports `undefs` as `ElfInput` does.
+        fn reportUndefined(c: *C) Allocator.Error!void {
+            const max_listed = 8;
+            for (c.undefs.keys(), c.undefs.values()) |name, objects| {
+                var msg: std.ArrayList(u8) = .empty;
+                try msg.print(c.in.arena, "undefined symbol: {s} (referenced by ", .{name});
+                for (objects.items[0..@min(objects.items.len, max_listed)], 0..) |path, i| {
+                    if (i != 0) try msg.appendSlice(c.in.arena, ", ");
+                    try msg.appendSlice(c.in.arena, path);
+                }
+                if (objects.items.len > max_listed) try msg.print(c.in.arena, " and {d} more objects", .{objects.items.len - max_listed});
+                try msg.append(c.in.arena, ')');
+                try c.in.errors.append(c.in.arena, msg.items);
+            }
+        }
 
         /// A converted relocation, at an offset in its section.
         const Rel = struct { offset: u64, kind: Atom.Reloc.Kind, target: Target, addend: i64 };
@@ -678,7 +711,7 @@ fn Converter(comptime Ctx: type) type {
                     c.weak_used.* = true;
                     return .{ .key = undefined_weak_key, .offset = 0 };
                 }
-                try c.fail("undefined symbol: {s} (referenced by {s})", .{ name, o.path });
+                try c.undefinedSymbol(name);
                 return null;
             }
             switch (sym.kind()) {
