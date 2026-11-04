@@ -4904,7 +4904,9 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         // Initialization.
         .struct_init_empty, .struct_init_empty_result, .struct_init_empty_ref_result => blk: {
             const src = block.nodeSrc(data.un_node.src_node);
-            const result_ty = try sema.resolveType(block, src, data.un_node.operand);
+            // `T{}` names its type; the others take their result type.
+            const ty_src: Src = if (tag == .struct_init_empty) .{ .base = src.base, .loc = .{ .init_ty = data.un_node.src_node } } else src;
+            const result_ty = try sema.resolveType(block, ty_src, data.un_node.operand);
             if (tag != .struct_init_empty_ref_result) {
                 const base = try sema.structInitType(block, src, sema.unwrapOptEu(result_ty));
                 break :blk sema.coerce(block, result_ty, try sema.structInitEmpty(block, src, base), src);
