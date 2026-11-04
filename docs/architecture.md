@@ -4875,11 +4875,22 @@ byte-identical for every n.
   job of its worker to use it, its atom is in that job's output. A
   constant a worker finds in its memo was lowered by an earlier job of the
   same worker, which already made the requests the memo repeats.
-- *When it merges.* Before anything else writes to the main Emit: when a
-  unit the cache loads adds atoms or requests (`Replay` calls Emit's
-  methods, which merge first), at `analyzeAll`'s `sink.sync` when the
-  function queue is empty, and at `finish`. Whether jobs are pending is a
-  count, not timing, so merges happen at the same points for every n.
+- *When it merges.* Before anything else writes to the main Emit: at
+  `analyzeAll`'s `sink.sync` when the function queue is empty, before
+  `lowerNavs` and at `finish`. Whether jobs are pending is a count, not
+  timing, so merges happen at the same points for every n.
+- *Loaded units are jobs.* A unit the cache loads (`Replay.loadFunc`'s
+  atoms and constants, `Replay.commit`'s requests) writes into the pool's
+  last Emit, `loads`, between `Emit.beginLoad` and `endLoad`, which
+  queue its output as a job that is done already: workers skip it and the
+  merge moves it into the main Emit in job order, as it does a worker's.
+  It used to merge first, which in a build that loads and analyzes in
+  turn generated nearly every analyzed function on the Sema thread
+  (`mergeJobs` runs the jobs not handed over yet): an eager replay of
+  another program's donor spent 70–90 ms in that tail, against 1–4 ms
+  cold, and lost to a build without the donor. A load with no function
+  waiting for CodeGen merges at once, since that merge waits for nothing
+  and `loads` then never holds more than one window's atoms.
 - *What a worker must not change.* A worker reads the InternPool (items
   are published before the job is queued, and arrays retire rather than
   free), resolved declarations and layouts, ZIR and file paths. What would
@@ -4899,9 +4910,9 @@ byte-identical for every n.
   (`batch_len`) under one lock: waking a worker per function cost about
   as much as the CodeGen it moved (7 ms of hello's 150). A merge runs the
   jobs not handed over yet on the Sema thread, into its own Emit, while
-  the workers finish theirs: an edit build merges after nearly every
-  function it generates (the next loaded unit), and waking a worker for
-  each one made vaxis's edit-lib build 118 → 174 ms.
+  the workers finish theirs: before loads were jobs, an edit build merged
+  after nearly every function it generated (the next loaded unit), and
+  waking a worker for each one made vaxis's edit-lib build 118 → 174 ms.
 - *Measured* (ReleaseFast zap, this orb: 4 vCPUs on 2 cores, default 3
   workers, against origin/main b30a515 in the same session; bench.py
   medians):
@@ -5411,8 +5422,8 @@ claims. Green checks of independent units then run in parallel.
   drains, and with it the lazy Emit work (`lowerNavs`, `link_refs`, and
   the `ensureNavVal` that `keepsNavData` calls). `recordDelta` and
   `refreshDebug` append to the pack serially at the end, as now.
-- *Eager replay (4a).* `loadFunc` and `commit` write through
-  `emit.owner` into the main Emit after `syncPending`. In step 2 they
+- *Eager replay (4a).* `loadFunc` and `commit` write into the pool's
+  `loads` Emit as done jobs (`Emit.beginLoad`). In step 2 they
   write into the worker's Emit output with its own owner. The key sort
   at `finish` makes their position irrelevant.
 - *Record and verification.* `record` reads frozen Zcu and Emit state

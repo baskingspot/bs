@@ -562,20 +562,23 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
         if (got.is_anyerror) try zcu.anyerror_ies.put(zcu.gpa, func, {});
         if (!got.is_anyerror or got.names.len != 0) try zcu.inferred_errors.put(zcu.gpa, func, got.names);
     }
-    const emit = r.emit;
-    const saved = emit.owner;
-    defer emit.owner = saved;
-    emit.owner = .{ .unit = unit };
-    for (atoms.items) |a| {
-        if (a.debug) |d| try emit.addFunction(a.atom, d) else try emit.addAtom(a.atom);
-    }
-    // The constants the code uses, unless this build emitted them already.
-    for (content.items) |a| {
-        try emit.content_uses.append(emit.gpa, .{ .unit = unit, .key = a.key });
-        if ((try emit.content_keys.getOrPut(emit.gpa, a.key)).found_existing) continue;
-        emit.owner = .content;
-        defer emit.owner = .{ .unit = unit };
-        try emit.addAtom(a);
+    {
+        // A job of its own (`Emit.beginLoad`), merged in order with the
+        // functions CodeGen generates meanwhile.
+        const emit = r.emit.beginLoad(unit);
+        for (atoms.items) |a| {
+            if (a.debug) |d| try emit.addFunction(a.atom, d) else try emit.addAtom(a.atom);
+        }
+        // The constants the code uses, unless this build has them already;
+        // the merge keeps the first of each.
+        for (content.items) |a| {
+            try emit.content_uses.append(emit.gpa, .{ .unit = unit, .key = a.key });
+            if (r.emit.content_keys.contains(a.key)) continue;
+            emit.owner = .content;
+            defer emit.owner = .{ .unit = unit };
+            try emit.addAtom(a);
+        }
+        try r.emit.endLoad();
     }
     try r.commit(unit, g, refs);
     if (inline_result) |res| try zcu.inline_results.put(zcu.gpa, func, res);
@@ -833,10 +836,8 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
     r.state[g.node] = .green;
     r.loaded.set(g.node);
     r.stats.loaded += 1;
-    const emit = r.emit;
-    const saved = emit.owner;
-    defer emit.owner = saved;
-    emit.owner = .{ .unit = unit };
+    // A job of its own, as the atoms are (`Emit.beginLoad`).
+    const emit = r.emit.beginLoad(unit);
     for (refs) |ref| switch (ref) {
         .func => |func| _ = try zcu.queueFuncFrom(unit, func),
         .nav => |nav| _ = try emit.navKey(nav),
@@ -856,6 +857,7 @@ fn commit(r: *Replay, unit: Zcu.AnalUnit, g: Green, refs: []const Ref) !void {
             .func, .nav, .analyze, .quota, .effects, .root, .defaults => unreachable,
         },
     };
+    try r.emit.endLoad();
 }
 
 /// Counts a green unit that could not be loaded, which `ZAP_CACHE_CHECK`

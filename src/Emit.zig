@@ -228,7 +228,10 @@ inline_active: std.ArrayList(Index) = .empty,
 /// for all jobs handed over and merges their output in job order. Jobs not
 /// handed over yet when a merge comes, and with no threads every job, are
 /// generated on the Sema thread into its own Emit, `workers[threads]`; the
-/// merge is the same.
+/// merge is the same. A unit the cache loads is a job too, done when it is
+/// made: its output goes into the last Emit, `loads` (`beginLoad`), so a
+/// load does not wait for the jobs before it, and CodeGen stays parallel
+/// in a build that loads and analyzes units in turn.
 pub const Pool = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
@@ -244,6 +247,10 @@ pub const Pool = struct {
     /// over in batches (`batch_len`), since waking a worker costs about as
     /// much as a small function's CodeGen.
     batch: std.ArrayList(Job) = .empty,
+    /// The jobs in `batch` with IR to generate (not loads).
+    batch_irs: usize = 0,
+    /// Where the load being made (`beginLoad`) started in `loads`.
+    load_start: Marks = undefined,
     taken: usize = 0,
     /// Workers waiting for `work`.
     sleeping: usize = 0,
@@ -293,7 +300,8 @@ const Job = struct {
     /// it added to that worker's lists.
     worker: u32 = 0,
     out: Out = undefined,
-    /// A job in `batch` the Sema thread generated already (no threads).
+    /// A job the Sema thread generated already (no threads), or a load:
+    /// nothing for a worker to do.
     done: bool = false,
 };
 
@@ -504,8 +512,8 @@ fn stopWorkers(pool: *Pool) void {
 pub fn startPool(emit: *Emit, threads: usize, fuzz: ?u64) !void {
     const gpa = emit.gpa;
     const io = emit.zcu.io;
-    // One per thread, and the Sema thread's.
-    const workers = try gpa.alloc(Emit, threads + 1);
+    // One per thread, the Sema thread's, and the loads'.
+    const workers = try gpa.alloc(Emit, threads + 2);
     errdefer gpa.free(workers);
     for (workers) |*w| {
         w.* = .init(gpa, emit.zcu);
@@ -547,6 +555,11 @@ fn workerMain(pool: *Pool, index: usize) void {
         const i = pool.taken;
         pool.taken += 1;
         const job = pool.jobs.items[i];
+        if (job.done) {
+            pool.finished += 1;
+            if (pool.finished == pool.jobs.items.len) pool.idle.signal(io);
+            continue;
+        }
         pool.mutex.unlock(io);
         if (pool.fuzz != null) fuzzDelay(io, rng.random());
         const out = runJob(w, job.ir, job.exports);
@@ -812,7 +825,8 @@ fn submit(emit: *Emit, ir_in: Ir, exports: ExportsView) !void {
         return;
     }
     try pool.batch.append(emit.gpa, .{ .ir = ir, .exports = exports });
-    if (pool.batch.items.len >= pool.batch_target) try publish(pool, emit.gpa);
+    pool.batch_irs += 1;
+    if (pool.batch_irs >= pool.batch_target) try publish(pool, emit.gpa);
     if (pool.fuzz != null) fuzzDelay(pool.io, pool.fuzz_rng.random());
 }
 
@@ -834,6 +848,7 @@ fn publish(pool: *Pool, gpa: Allocator) !void {
     defer pool.mutex.unlock(pool.io);
     try pool.jobs.appendSlice(gpa, pool.batch.items);
     pool.batch.clearRetainingCapacity();
+    pool.batch_irs = 0;
     if (pool.fuzz != null) pool.batch_target = 1 + pool.fuzz_rng.random().uintLessThan(usize, 32);
     if (pool.sleeping != 0) pool.work.broadcast(pool.io);
 }
@@ -997,6 +1012,7 @@ fn mergeJobs(emit: *Emit) Allocator.Error!void {
     for (pool.jobs.items) |*job| try emit.mergeOut(&pool.workers[job.worker], job.out);
     for (pool.batch.items) |*job| try emit.mergeOut(&pool.workers[job.worker], job.out);
     pool.batch.clearRetainingCapacity();
+    pool.batch_irs = 0;
     pool.mutex.lockUncancelable(io);
     pool.jobs.clearRetainingCapacity();
     pool.taken = 0;
@@ -1074,9 +1090,47 @@ fn mergeOut(emit: *Emit, w: *const Emit, out: Out) Allocator.Error!void {
 }
 
 /// Merges CodeGen's pending output before the main Emit changes in
-/// another way (a unit the cache loads), as the serial order has it.
+/// another way, as the serial order has it.
 fn syncPending(emit: *Emit) Allocator.Error!void {
     if (emit.pool) |pool| if (pool.jobs.items.len + pool.batch.items.len != 0) try emit.mergeJobs();
+}
+
+/// Starts a job for unit `unit`, which the cache loads: returns the Emit
+/// its atoms and requests go to, with `unit` as owner, until `endLoad`.
+/// That is the pool's `loads` Emit, whose output `mergeOut` moves into
+/// this one in job order, as it does a worker's; without a pool, this
+/// Emit. Only the Sema thread loads.
+pub fn beginLoad(emit: *Emit, unit: Zcu.AnalUnit) *Emit {
+    const pool = emit.pool orelse {
+        emit.owner = .{ .unit = unit };
+        return emit;
+    };
+    const l = &pool.workers[pool.workers.len - 1];
+    l.owner = .{ .unit = unit };
+    pool.load_start = l.marks();
+    return l;
+}
+
+/// How many atoms loaded units' jobs hold before a merge waits for the
+/// functions handed over before them.
+const max_pending_loads = 8192;
+
+/// Ends the load `beginLoad` started: a job done already.
+pub fn endLoad(emit: *Emit) !void {
+    const pool = emit.pool orelse {
+        emit.owner = .link;
+        return;
+    };
+    const index: u32 = @intCast(pool.workers.len - 1);
+    const l = &pool.workers[index];
+    l.owner = .link;
+    const out: Out = .{ .start = pool.load_start, .end = l.marks(), .failed = false };
+    if (std.meta.eql(out.start, out.end)) return;
+    try pool.batch.append(emit.gpa, .{ .ir = undefined, .exports = undefined, .worker = index, .out = out, .done = true });
+    // With no function waiting for CodeGen the merge waits for nothing.
+    // Merging then, or once `loads` holds many atoms, keeps it from
+    // holding a whole build's.
+    if ((pool.jobs.items.len == 0 and pool.batch_irs == 0) or l.atoms.items.len >= max_pending_loads) try emit.mergeJobs();
 }
 
 /// The exports for a job handed over now: copied when they changed, so
@@ -2056,6 +2110,8 @@ pub fn uavKey(emit: *Emit, val: Index, alignment: u64) !SymbolKey {
 /// build leaves out those whose data the cache has
 /// (`Replay.keepsNavData`).
 pub fn lowerNavs(emit: *Emit) !void {
+    // The navs that loaded units' pending output requests (`beginLoad`).
+    try emit.syncPending();
     while (emit.navs_done < emit.navs.count()) {
         const nav = emit.navs.keys()[emit.navs_done];
         emit.navs_done += 1;
