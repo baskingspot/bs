@@ -5436,7 +5436,15 @@ libraries as inputs. To be agreed with that thread.
   (not `full_args`), so the compilation key covers the native version,
   and `donorKey` hashes it: CodeGen resolves names glibc defines to
   imports. The store seed stays: store entries match by their atoms'
-  hashes.
+  hashes. Tests: test/run/libc_edit.zig (edit builds with
+  `ZAP_CACHE_VERIFY`, then a relink from the manifest after the output
+  is deleted, which reads abilists, compared byte for byte with a full
+  build) and test/run/libc_donor.zig (`donor-libc`: static and `-lc`
+  builds of one program into one global cache, in both orders, and
+  neither replays the other). Edit builds of the corpus thread's `-lc`
+  projects (`zap build test`, a one-line body edit, compile step):
+  libxev 0.20 → 0.03 s, zio 0.69 → 0.06 s, zedis 0.31–0.38 → 0.05 s,
+  tokamak 1.0 → 0.035 s (upstream 0.7, 1, 1 and 2 s).
 - **Checks**: `run.py --std --libc` 3350/3350 (upstream 3350 pass, 37
   skip; compiled in 8.5 s against upstream's 17.8 s);
   test/run/libc.zig (functions, a variadic call, libm, `environ` and

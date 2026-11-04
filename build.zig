@@ -188,6 +188,9 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             donor_here: bool = false,
             /// Linked against glibc: `-target x86_64-linux-gnu -lc`.
             libc: bool = false,
+            /// `donor-libc`: built with and without `-lc`, in either order,
+            /// into one global cache; neither replays the other as a donor.
+            donor_libc: bool = false,
         } = .{};
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
@@ -204,6 +207,8 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 expect.stderr_contains.append(b.allocator, bytes) catch @panic("OOM");
             } else if (std.mem.eql(u8, key, "libc")) {
                 expect.libc = std.mem.eql(u8, value, "true");
+            } else if (std.mem.eql(u8, key, "donor-libc")) {
+                expect.donor_libc = std.mem.eql(u8, value, "true");
             } else if (std.mem.eql(u8, key, "donor-without") or std.mem.eql(u8, key, "donor-here-without")) {
                 expect.donor_without = std.zig.string_literal.parseAlloc(b.allocator, value) catch std.debug.panic("{s}: bad string", .{src_path});
                 expect.donor_here = key.len != "donor-without".len;
@@ -263,7 +268,18 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                     lib_after = b.fmt("cp {s}/{s} \"$4.d/lib/{s}\"\n", .{ lib_dir, e.path, e.path });
                 }
                 // Quiet unless a build fails: the checks print to stderr.
-                const zap_cmd = b.fmt("\"$5\" build-exe -target x86_64-linux \"$4.d/{s}\" -femit-bin=\"$4\"{s} 2>\"$4.d/log\" || {{ cat \"$4.d/log\" >&2; exit 1; }}", .{ file, lib_flag });
+                const target = if (expect.libc) "-target x86_64-linux-gnu -lc" else "-target x86_64-linux";
+                const zap_cmd = b.fmt("\"$5\" build-exe {s} \"$4.d/{s}\" -femit-bin=\"$4\"{s} 2>\"$4.d/log\" || {{ cat \"$4.d/log\" >&2; exit 1; }}", .{ target, file, lib_flag });
+                // With -lc, a relink from the manifest after the output is
+                // gone, which rebuilds the dynamic tables from abilists,
+                // must give a full build's bytes.
+                const relink_check = if (expect.libc) b.fmt(
+                    \\
+                    \\rm "$4"
+                    \\{[zap]s}
+                    \\ZAP_CACHE=off "$5" build-exe {[target]s} "$4.d/{[file]s}" -femit-bin="$4.d/full"
+                    \\cmp "$4" "$4.d/full" >&2
+                , .{ .zap = zap_cmd, .target = target, .file = file }) else "";
                 const r = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
                     \\set -e
                     \\mkdir -p "$4.d"
@@ -276,9 +292,36 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                     \\{[lib_before]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
                     \\cp "$2" "$4.d/{[file]s}"
                     \\{[lib_after]s}ZAP_CACHE_VERIFY=1 ZAP_CACHE_CHECK=1 {[zap]s}
-                    \\{[zap]s}
-                , .{ .setup = lib_setup, .file = file, .lib_before = lib_before, .lib_after = lib_after, .zap = zap_cmd }), "sh" });
+                    \\{[zap]s}{[relink_check]s}
+                , .{ .setup = lib_setup, .file = file, .lib_before = lib_before, .lib_after = lib_after, .zap = zap_cmd, .relink_check = relink_check }), "sh" });
                 r.addFileArg(before);
+                r.addFileArg(b.path(src_path));
+                r.addFileArg(b.path("test/run/rt.zig"));
+                break :blk r;
+            } else if (expect.donor_libc) blk: {
+                // Two global caches: static then -lc, and -lc then static.
+                // The donor key holds -lc and the glibc version, since
+                // CodeGen resolves glibc's names to imports.
+                const static = "\"$5\" build-exe -target x86_64-linux";
+                const libc = "\"$5\" build-exe -target x86_64-linux-gnu -lc";
+                const r = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
+                    \\set -e
+                    \\rm -rf "$4.d"
+                    \\mkdir -p "$4.d/a"
+                    \\cp "$3" "$4.d/a/rt.zig"
+                    \\cp "$1" "$4.d/a/{[file]s}"
+                    \\log="$4.d/log"
+                    \\fail() {{ cat "$log" >&2; exit 1; }}
+                    \\nodonor() {{ if grep -q "replaying donor" "$log"; then echo "a build replayed a donor built with other libc settings" >&2; fail; fi; }}
+                    \\{[static]s} --global-cache-dir "$4.d/g1" --cache-dir "$4.d/l1" "$4.d/a/{[file]s}" -femit-bin="$4.d/s1" 2>"$4.d/log" || fail
+                    \\ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[libc]s} --global-cache-dir "$4.d/g1" --cache-dir "$4.d/l2" "$4.d/a/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
+                    \\nodonor
+                    \\{[libc]s} --global-cache-dir "$4.d/g2" --cache-dir "$4.d/l3" "$4.d/a/{[file]s}" -femit-bin="$4.d/c2" 2>"$4.d/log" || fail
+                    \\ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[static]s} --global-cache-dir "$4.d/g2" --cache-dir "$4.d/l4" "$4.d/a/{[file]s}" -femit-bin="$4.d/s2" 2>"$4.d/log" || fail
+                    \\nodonor
+                    \\"$4.d/s2" 2>"$4.d/log" || fail
+                , .{ .file = file, .static = static, .libc = libc }), "sh" });
+                r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path(src_path));
                 r.addFileArg(b.path("test/run/rt.zig"));
                 break :blk r;
@@ -314,7 +357,7 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 break :blk r;
             };
             compile.addFileInput(b.path("test/run/rt.zig"));
-            const bin = if (!upstream and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null or expect.donor_without != null)) bin: {
+            const bin = if (!upstream and (expect.rebuild_without.items.len != 0 or expect.lib_edit != null or expect.donor_without != null or expect.donor_libc)) bin: {
                 const out = compile.addOutputFileArg(name);
                 compile.addArtifactArg(zap);
                 break :bin out;
