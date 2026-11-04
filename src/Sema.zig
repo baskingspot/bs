@@ -13127,7 +13127,9 @@ fn unionFieldPtr(sema: *Sema, block: *Block, src: Src, ptr: Ref, i: u32, initial
         else => false,
     } else false;
     if (sema.resolveValue(ptr)) |pv| if (!runtime_var and try sema.comptimePtrRoot(pv) != .int) {
-        if (!initializing and info.layout == .auto) if (try sema.comptimeLoadOrNull(block, src, pv)) |uv| if (ip.keyTag(uv) == .un) {
+        if (!initializing and info.layout == .auto) if (try sema.comptimeLoadOrNull(block, src, pv)) |uv| if (sema.isUndef(uv) and !block.is_typeof) {
+            return sema.fail(block, src, "use of undefined value here causes illegal behavior", .{});
+        } else if (ip.keyTag(uv) == .un) {
             const active = ip.keyPayload(.un, uv).tag;
             if (active != try sema.unionFieldTagValue(union_ty, i)) {
                 const active_i = for (0..info.field_names.len) |k| {
