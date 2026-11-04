@@ -433,13 +433,14 @@ fn hasChildren(inlines: []const Atom.Debug.Inline, k: usize) bool {
 /// unit's file table, `unit` being its index in chunk `c`'s units.
 const FileMap = struct {
     c: *const Chunk,
-    debug: *const Atom.Debug,
-    unit: u32,
+    /// The index in the chunk's `files` of each of the entry's local files
+    /// after the first (`Chunk.locals`).
+    locals: []const u32,
     file: u32,
 
     fn get(m: FileMap, local: u32) u32 {
         if (local == 0) return m.file;
-        return m.c.file_map[m.c.files.getIndex(.{ .unit = m.unit, .path = m.debug.localFile(local) }).?];
+        return m.c.file_map[m.locals[local - 1]];
     }
 };
 
@@ -612,6 +613,11 @@ pub const Chunk = struct {
     /// Units of the chunk's entries, in first-use order, and the chunk's
     /// part of each.
     units: std.StringArrayHashMapUnmanaged(UnitPart),
+    /// The index in `files` of each local file (`Atom.Debug.files`) of the
+    /// entries written, in order, so that writing them hashes no path;
+    /// `local_starts` has each such entry's start in it.
+    locals: std.ArrayList(u32),
+    local_starts: std.ArrayList(u32),
     // Filled in by `place`.
     /// FDEs in the chunks before this one, and their bytes.
     frame_base: u32,
@@ -619,11 +625,13 @@ pub const Chunk = struct {
     /// Index of each of `files` in its unit's file table.
     file_map: []u32,
 
-    pub const empty: Chunk = .{ .n_frames = 0, .frame_bytes = 0, .files = .empty, .units = .empty, .frame_base = 0, .frame_off = 0, .file_map = &.{} };
+    pub const empty: Chunk = .{ .n_frames = 0, .frame_bytes = 0, .files = .empty, .units = .empty, .locals = .empty, .local_starts = .empty, .frame_base = 0, .frame_off = 0, .file_map = &.{} };
 
     pub fn deinit(c: *Chunk, gpa: Allocator) void {
         c.files.deinit(gpa);
         c.units.deinit(gpa);
+        c.locals.deinit(gpa);
+        c.local_starts.deinit(gpa);
     }
 
     /// Bytes of the chunk's subprogram entries, range lists, line
@@ -715,12 +723,14 @@ pub fn layOutChunk(l: anytype, chunk: usize, task: usize, text: u3) void {
             files_by_addr.put(d.file, unit, @intCast(gop.index));
             break :index @as(u32, @intCast(gop.index));
         };
+        c.local_starts.append(l.gpa, @intCast(c.locals.items.len)) catch return l.fail(task, atom, error.OutOfMemory, .{});
         if (d.inlines.len > 0 or d.patches.len > 0 or d.files.len > 0) {
             if (!valid(d, l.input.atom(atom).bytes.len)) return l.fail(task, atom, error.InvalidDebugInfo, .{ .atom = l.input.atom(atom).name });
             var start: usize = 0;
             while (start < d.files.len) {
                 const path_end = std.mem.indexOfScalarPos(u8, d.files, start, 0).?;
-                _ = c.files.getOrPut(l.gpa, .{ .unit = unit, .path = d.files[start..path_end] }) catch return l.fail(task, atom, error.OutOfMemory, .{});
+                const gop = c.files.getOrPut(l.gpa, .{ .unit = unit, .path = d.files[start..path_end] }) catch return l.fail(task, atom, error.OutOfMemory, .{});
+                c.locals.append(l.gpa, @intCast(gop.index)) catch return l.fail(task, atom, error.OutOfMemory, .{});
                 start = path_end + 1;
             }
         }
@@ -866,6 +876,8 @@ pub const ChunkWriter = struct {
     unit_line: []u8 = &.{},
     run_start: u64 = 0,
     run_end: u64 = 0,
+    /// The entries written so far.
+    n: u32 = 0,
 
     /// Writes the entry `debug` of the `size`-byte function at `addr`,
     /// whose file is `file_of` (see `layOutChunk`) and whose symbol is
@@ -874,7 +886,8 @@ pub const ChunkWriter = struct {
         const k = file_of >> file_bits;
         if (k != w.k) w.switchUnit(k, addr);
         w.run_end = addr + size;
-        const files: FileMap = .{ .c = w.c, .debug = debug, .unit = k, .file = w.c.file_map[file_of & (1 << file_bits) - 1] };
+        const files: FileMap = .{ .c = w.c, .locals = w.c.locals.items[w.c.local_starts.items[w.n]..], .file = w.c.file_map[file_of & (1 << file_bits) - 1] };
+        w.n += 1;
         w.unit_info = w.unit_info[writeSubprogram(w.unit_info, debug, linkage_name, addr, size, files)..];
         w.unit_line = w.unit_line[writeSequence(w.unit_line, debug, addr, size, files)..];
     }
