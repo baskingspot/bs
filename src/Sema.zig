@@ -18499,7 +18499,12 @@ fn analyzeCall(
                 // evaluated at comptime.
                 var ct_block = block.child();
                 defer ct_block.deinitInsts();
-                if (arg_i < 32 and (fn_ty.comptime_bits >> @intCast(arg_i)) & 1 != 0) {
+                // A parameter of a comptime-only type is comptime too
+                // (`comptime_bits`), but its argument is evaluated at
+                // runtime and only needs to be comptime-known.
+                if (arg_i < 32 and (fn_ty.comptime_bits >> @intCast(arg_i)) & 1 != 0 and
+                    (func == .none or param_ty == .generic_poison_type or !Type.isComptimeOnly(ip, param_ty) or sema.paramDeclaredComptime(func, arg_i)))
+                {
                     ct_block.is_comptime = true;
                     ct_block.comptime_reason = "argument to comptime parameter must be comptime-known";
                 }
@@ -18731,6 +18736,25 @@ fn calleeBlock(sema: *Sema, parent: *Block, func: Index) Block {
         // its own, as upstream evaluates it lazily.
         .discards_runtime = parent.discards_runtime,
     };
+}
+
+/// Whether parameter `i` of `func` is declared `comptime`, which
+/// `comptime_bits` does not tell from being of a comptime-only type.
+fn paramDeclaredComptime(sema: *Sema, func: Index, i: usize) bool {
+    const ip = sema.ip;
+    const f = ip.keyPayload(.func, func);
+    const code = &sema.zcu.file(ip.getNav(f.owner_nav).file).zir;
+    var k: usize = 0;
+    for (code.getFnInfo(f.zir_inst).param_body) |inst| {
+        const tag = code.instructions.items(.tag)[@backingInt(inst)];
+        switch (tag) {
+            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {},
+            else => continue,
+        }
+        if (k == i) return tag == .param_comptime or tag == .param_anytype_comptime;
+        k += 1;
+    }
+    return false;
 }
 
 /// Maps the parameters of `func` (whose ZIR is current) to `args`, evaluating
