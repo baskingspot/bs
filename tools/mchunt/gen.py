@@ -167,6 +167,51 @@ DISABLED = set(filter(None, __import__("os").environ.get("MCHUNT_DISABLE", "").s
 BOOST = {k: float(v) for k, v in (x.split("=") for x in filter(None, __import__("os").environ.get("MCHUNT_BOOST", "").split(",")))}
 
 
+SE_DECL = [
+    "const SE = struct {",
+    "    a: u64,",
+    "    b: u32,",
+    "    c: u8,",
+    "    d: i16,",
+    "    e: [3]u16,",
+    "    inline fn mix(self: *SE, x: u64) void {",
+    "        self.a = (self.a ^ x) *% 0x100000001b3;",
+    "        self.b +%= @truncate(self.a >> 7);",
+    "        self.c ^= @truncate(x);",
+    "    }",
+    "    inline fn rounds(self: *SE, n: usize) void {",
+    "        var i: usize = 0;",
+    "        while (i < n) : (i += 1) {",
+    "            self.a = std.math.rotl(u64, self.a, 13) +% self.b;",
+    "            self.b ^= @truncate(self.a);",
+    "            self.d -%= 3;",
+    "            self.e[i % 3] +%= @truncate(self.a);",
+    "        }",
+    "    }",
+    "    fn step2(self: *SE, x: u32) void {",
+    "        self.mix(x);",
+    "        self.d = @bitCast(@as(u16, @truncate(self.a)) ^ self.e[1]);",
+    "    }",
+    "    noinline fn absorb(self: *SE, x: u32) void {",
+    "        self.b = self.b *% 31 +% x;",
+    "        self.e[2] -%= @truncate(x);",
+    "    }",
+    "    inline fn fold(self: *const SE) u64 {",
+    "        return self.a ^ (@as(u64, self.b) << 3) ^ (@as(u64, self.c) << 40) ^ @as(u64, @as(u16, @bitCast(self.d))) ^",
+    "            (@as(u64, self.e[0]) << 16) ^ (@as(u64, self.e[1]) << 32) ^ (@as(u64, self.e[2]) << 48);",
+    "    }",
+    "};",
+    "var gSEp: *SE = undefined;",
+    "noinline fn seBump(x: u32) void {",
+    "    gSEp.b +%= x;",
+    "    gSEp.e[0] ^= 0x5a5a;",
+    "}",
+    "noinline fn seRead(p: *const SE) u64 {",
+    "    return p.a +% p.b +% p.c;",
+    "}",
+]
+
+
 class Gen:
     def __init__(self, seed, size=1.0):
         self.r = random.Random(seed)
@@ -1035,6 +1080,7 @@ class Gen:
             (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
             (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
             (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
+            (2, "sroaesc"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -2316,6 +2362,57 @@ class Gen:
             e(f"const {r}: {t.name()} = if (!{c}) {a} else {b};")
             self.sink(ctx, r, t)
 
+    def s_sroaesc(self, ctx):
+        """A local SE worked through inlined methods taking `self: *SE`, in
+        loops, sometimes after its address escapes into a global or a
+        non-inlined call (SROA must keep it in memory then)."""
+        e = lambda s_: self.emit(ctx, s_)
+        n = self.fresh("se")
+        u64 = lambda: self.int_expr(ctx, U64, 1)
+        e(f"var {n}: SE = .{{ .a = {u64()}, .b = {self.int_expr(ctx, U32, 1)}, .c = {self.int_expr(ctx, Int(False, 8), 1)}, "
+          f".d = {self.int_expr(ctx, Int(True, 16), 1)}, .e = .{{ {', '.join(self.int_expr(ctx, Int(False, 16), 1) for _ in range(3))} }} }};")
+        who = n
+        if self.chance(0.4):
+            who = self.fresh("sp")
+            e(f"const {who}: *SE = &{n};")
+        escaped = False
+        for _ in range(self.r.randint(2, 5)):
+            k = self.r.randrange(8)
+            if k == 0:
+                e(f"{who}.mix({u64()});")
+            elif k == 1:
+                e(f"{who}.rounds({self.r.randint(0, 4) if self.chance(0.5) else f'@as(usize, {self.int_expr(ctx, Int(False, 2), 1)})'});")
+            elif k == 2:
+                i = self.fresh("si")
+                e(f"for (0..{self.r.randint(1, 6)}) |{i}| {{")
+                ctx["indent"] += 1
+                e(f"{who}.mix(@as(u64, {i}) *% {self.lit(U64)});")
+                if self.chance(0.5):
+                    e(f"if (({i} & 1) == 0) {who}.c +%= 1 else {who}.e[{i} % 3] ^= @truncate({who}.a);")
+                ctx["indent"] -= 1
+                e("}")
+            elif k == 3:
+                e(f"{who}.step2({self.int_expr(ctx, U32, 1)});")
+            elif k == 4 and not ctx["fn"].pure:
+                e(f"{who}.absorb({self.int_expr(ctx, U32, 1)});")
+            elif k == 5 and not ctx["fn"].pure:
+                # The address escapes into a global, and a call writes through it.
+                e(f"gSEp = &{n};")
+                e(f"seBump({self.int_expr(ctx, U32, 1)});")
+                escaped = True
+            elif k == 6 and not ctx["fn"].pure:
+                self.sink(ctx, f"seRead(&{n})", U64)
+            else:
+                cp = self.fresh("sq")
+                e(f"const {cp} = {n};")
+                e(f"{who}.mix({self.lit(U64)});")
+                self.sink(ctx, f"{cp}.fold()", U64)
+        if escaped and self.chance(0.5):
+            e(f"gSEp.d -%= 5;")
+        self.sink(ctx, f"{who}.fold()", U64)
+        if self.chance(0.3):
+            self.sink(ctx, f"@as(u64, {n}.e[{self.r.randint(0, 2)}])", U64)
+
     def s_bigcopy(self, ctx):
         """Whole copies of a 64-256 byte struct: into locals, globals and
         through pointers, by value into callees that write the source, and
@@ -3011,6 +3108,8 @@ class Gen:
         v.used = True
         self.globals.append(v)
         out.append(f"var gH: SH = {self.global_init(hs)};")
+        # A local struct worked through an inlined self pointer (s_sroaesc).
+        out.extend(SE_DECL)
         for i in range(self.r.randint(0, 3)):
             t = self.rand_int_type()
             v = Var(f"K{i}", t, "cglobal", ro=True, ct=True)
