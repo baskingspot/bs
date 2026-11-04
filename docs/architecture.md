@@ -4169,8 +4169,15 @@ analyzing everything.
   (`-fsingle-threaded`, which decides whether declarations are
   threadlocal, test filters, and the root module's `-M` name, which
   `@src()` and messages show while its files are keyed `=root:` or
-  `=main:` in every compilation), and whether the build links an object,
-  which CodeGen reads (an object imports what it does not define).
+  `=main:` in every compilation), whether the build links an object,
+  which CodeGen reads (an object imports what it does not define), and
+  whether a test build tests std itself (`zap test <lib>/std/std.zig`,
+  `Frontend.testsStd`). Only the module under test has tests among its
+  roots, so that decides which of std's containers have effects
+  (`Sema.noteEffects`): a std container that a `zap test main.zig` donor
+  evaluated has no `effects` reference, and a std test build that loaded
+  it green would record a graph that misses the container's tests
+  (`ZAP_CACHE_CHECK` reports them as not reached).
   Everything else (the builtin module, root and modules, every file) is
   an input the replay checks. Options that change code without changing
   builtin.zig (`-fPIC`, `-ffuzz`) must join the key, or the store seed as

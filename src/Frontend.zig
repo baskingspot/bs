@@ -206,6 +206,17 @@ pub const Options = struct {
     c_runtimes: bool = false,
 };
 
+/// Whether testing `main_src_path` tests the std module itself: as
+/// upstream, testing `<lib>/std/std.zig` makes std the module under test
+/// rather than loading a second copy of it.
+pub fn testsStd(gpa: Allocator, zig_lib_dir: []const u8, main_src_path: []const u8) !bool {
+    const resolved = try std.fs.path.resolve(gpa, &.{main_src_path});
+    defer gpa.free(resolved);
+    const std_root = try std.fs.path.resolve(gpa, &.{ zig_lib_dir, "std", "std.zig" });
+    defer gpa.free(std_root);
+    return std.mem.eql(u8, resolved, std_root);
+}
+
 pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !Frontend {
     var fe: Frontend = .{ .gpa = gpa, .io = io, .zig_lib_dir = zig_lib_dir, .load_std = options.load_std, .root_name = options.root_name };
     errdefer fe.deinit();
@@ -237,13 +248,7 @@ pub fn init(gpa: Allocator, io: Io, zig_lib_dir: []const u8, options: Options) !
         .cache = .global,
     });
     if (options.main_src_path) |path| {
-        // As upstream, testing `<lib>/std/std.zig` tests the std module
-        // itself rather than a second copy of it.
-        const resolved = try std.fs.path.resolve(gpa, &.{path});
-        defer gpa.free(resolved);
-        const std_root = try std.fs.path.resolve(gpa, &.{ zig_lib_dir, "std", "std.zig" });
-        defer gpa.free(std_root);
-        if (std.mem.eql(u8, resolved, std_root)) {
+        if (try testsStd(gpa, zig_lib_dir, path)) {
             fe.main_module = .std;
         } else {
             fe.main_module = @fromBackingInt(@intCast(fe.modules.items.len));

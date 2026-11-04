@@ -468,8 +468,10 @@ pub const Job = struct {
         const use_cache = out_path != null and !job.opts.dump_ir and !job.opts.pic and !job.opts.c_only and
             !std.mem.eql(u8, env.get("ZAP_CACHE") orelse "", "off");
         if (!use_cache) return null;
+        const tests_std = job.opts.command == .@"test" and
+            (Frontend.testsStd(job.gpa, job.zig_lib_dir, job.opts.root_src_path) catch fatal("out of memory", .{}));
         // A cache that cannot be opened (a full disk, say) costs reuse, not the build.
-        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.opts.root_name, job.cache_target, env.get("ZAP_CACHE_TIMING") != null) catch |err| {
+        var i = Incremental.open(job.gpa, job.io, job.cache_dirs, job.compile_args, job.zig_lib_dir, job.opts.root_name, tests_std, job.cache_target, env.get("ZAP_CACHE_TIMING") != null) catch |err| {
             std.log.warn("unable to use the cache: {t}", .{err});
             return null;
         };

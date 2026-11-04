@@ -140,8 +140,9 @@ replay: ?*Replay = null,
 /// Opens and locks the directory of the compilation that `args` (the
 /// command line after `zap`) describes, run from the current directory.
 /// `zig_lib_dir` is the std that compilation uses; `root_name` is
-/// `Frontend.Options.root_name`.
-pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, root_name: []const u8, target: []const u8, timing: bool) !Incremental {
+/// `Frontend.Options.root_name`; `tests_std` is whether it tests the std
+/// module itself (`Frontend.testsStd`).
+pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []const u8, zig_lib_dir: []const u8, root_name: []const u8, tests_std: bool, target: []const u8, timing: bool) !Incremental {
     const build_start = Io.Clock.real.now(io);
     const store_seed, const key = try compilationKey(gpa, io, args, zig_lib_dir, target);
 
@@ -160,7 +161,7 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .dir = dir,
         .lock = lock,
         .store_seed = store_seed,
-        .donor_key = try donorKey(gpa, io, store_seed, zig_lib_dir, root_name, args),
+        .donor_key = try donorKey(gpa, io, store_seed, zig_lib_dir, root_name, tests_std, args),
         .arch = if (std.mem.startsWith(u8, target, "aarch64")) .aarch64 else .x86_64,
         .build_start = build_start,
         .timing = timing,
@@ -817,15 +818,21 @@ const donor_renew_ns = std.time.ns_per_hour;
 /// in every compilation so that `@import("root")` carries over), and
 /// whether the build links an object (`build-obj`, `build-lib`), whose
 /// code CodeGen generates differently: a symbol the build does not export
-/// is an import, not compiler_rt's; and the glibc a `-lc` executable links,
-/// for the same reason.
+/// is an import, not compiler_rt's; the glibc a `-lc` executable links,
+/// for the same reason; and whether a test build tests std itself
+/// (`tests_std`): only the module under test has tests among its roots,
+/// so that decides which of std's containers have effects
+/// (`Sema.noteEffects`), and a donor's unit that evaluated one without
+/// them has no `effects` reference to its namespace, through which the
+/// recorded graph reaches the container's tests.
 /// The builtin module is an input, so a donor whose builtin differs is
 /// valid, but loses most of std; `useDonor` ranks those last.
-fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, root_name: []const u8, args: []const []const u8) !Hash {
+fn donorKey(gpa: Allocator, io: Io, store_seed: Hash, zig_lib_dir: []const u8, root_name: []const u8, tests_std: bool, args: []const []const u8) !Hash {
     var h: std.hash.Wyhash = .init(0x646f6e6f72);
     h.update(std.mem.asBytes(&store_seed));
     h.update(root_name);
     h.update("\x00");
+    if (tests_std) h.update("tests std\x00");
     // Resolved: `--zig-lib-dir zig-lib` names another std in another
     // directory.
     if (Io.Dir.cwd().realPathFileAlloc(io, zig_lib_dir, gpa)) |lib| {

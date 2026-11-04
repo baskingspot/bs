@@ -820,6 +820,30 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     self_test.addCheck(.{ .expect_stderr_match = "All 2 tests passed." });
     self_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&self_test.step);
+
+    // Testing std itself after testing a file that uses std, in one global
+    // cache: std's containers have tests among their roots only when std
+    // is the module under test, so the first build must not be the
+    // second's donor. If it were, `Allocating` would load green without
+    // the reference that reaches its test, and the cache check would fail.
+    const lib_dir = defaultZigLibDir(b);
+    const user_test = b.addRunArtifact(zap);
+    user_test.setName("zap test a std user");
+    user_test.addArgs(&.{ "test", "--zig-lib-dir", lib_dir, "--test-filter", "Allocating" });
+    user_test.addFileArg(b.path("test/obj/writer_test.zig"));
+    user_test.addArg("--global-cache-dir");
+    const std_cache = user_test.addOutputDirectoryArg("std-test-cache");
+    user_test.addCheck(.{ .expect_stderr_match = "All 1 tests passed." });
+    const std_test = b.addRunArtifact(zap);
+    std_test.setName("zap test std after a std user");
+    std_test.setEnvironmentVariable("ZAP_CACHE_CHECK", "1");
+    std_test.addArgs(&.{ "test", "--zig-lib-dir", lib_dir, "--test-filter", "Allocating" });
+    std_test.addFileArg(.{ .cwd_relative = b.pathJoin(&.{ lib_dir, "std", "std.zig" }) });
+    std_test.addArg("--global-cache-dir");
+    std_test.addDirectoryArg(std_cache);
+    std_test.addCheck(.{ .expect_stderr_match = "tests passed." });
+    std_test.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    test_step.dependOn(&std_test.step);
 }
 
 /// `zap build` end to end: test/build/check.sh builds test/build/hello
