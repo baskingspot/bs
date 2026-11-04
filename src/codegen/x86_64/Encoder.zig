@@ -32,8 +32,8 @@ shorten: bool = false,
 /// With `shorten`: `jmp` and `jcc` instructions to labels, by offset,
 /// candidates for the short form.
 branches: std.ArrayList(struct { at: u32, label: Label }) = .empty,
-/// With `shorten`: the rel32 fields of `leaLabel`s, which shortening
-/// patches again.
+/// With `shorten`: the rel32 fields of `leaLabel`s and of `call`s to
+/// labels, which shortening patches again.
 label_addrs: std.ArrayList(struct { at: u32, label: Label }) = .empty,
 /// After `finish` shortened branches: per branch, the bytes saved by the
 /// branches before it (one more entry for the total), for `mapOffset`.
@@ -736,6 +736,9 @@ pub fn jcc(e: *Encoder, cond: Cond, target: Target) !void {
 pub fn call(e: *Encoder, target: Target) !void {
     try e.reserve();
     e.byte(0xe8);
+    // Shortening moves the code between the call and its label (the
+    // panic stubs after the epilogue).
+    if (e.shorten and target == .label) try e.label_addrs.append(e.gpa, .{ .at = @intCast(e.code.items.len), .label = target.label });
     try e.rel32(target);
 }
 
@@ -1398,6 +1401,23 @@ test "branches in reach take the short form and the code after them moves" {
     try std.testing.expectEqual(3, e.refs.relocs.items[0].offset);
     try std.testing.expectEqual(9, e.mapOffset(16));
     try std.testing.expectEqual(9, e.lines.state.offset);
+}
+
+test "a call to a label stays on it when branches between them shorten" {
+    const gpa = std.testing.allocator;
+    var e: Encoder = .init(gpa);
+    defer e.deinit();
+    e.shorten = true;
+    const stub = try e.newLabel();
+    const out = try e.newLabel();
+    try e.call(.{ .label = stub }); // 0: e8 rel32 -> 12 -> 8
+    try e.jcc(.e, .{ .label = out }); // 5: 0f 84 rel32 -> 74 00
+    e.bind(out); // 11 -> 7
+    try e.int3(); // 11 -> 7
+    e.bind(stub); // 12 -> 8
+    try e.ret();
+    try e.finishShortened();
+    try std.testing.expectEqualSlices(u8, &.{ 0xe8, 0x03, 0, 0, 0, 0x74, 0x00, 0xcc, 0xc3 }, e.code.items);
 }
 
 test "bit scans, byte swaps, exchanges, and string ops match GNU as" {
