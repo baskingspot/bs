@@ -1494,7 +1494,7 @@ class Gen:
             I()
         elif k == 8:
             # A bound that keeps i * m in range, or just misses.
-            m = self.r.randint(2, 70)
+            m = self.r.randint(2, min(70, t.max()))
             c = t.max() // m + (2 if near else 1)  # v <= max / m keeps v * m in range
             if c > t.max():
                 return self.s_sink(ctx)
