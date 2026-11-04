@@ -6990,6 +6990,23 @@ unchanged:
    crashes left.)
 8. Later: `zap explain` and `zap fix` (applies exact fixes).
 
+## Deliberate differences from upstream
+
+Upstream 0.17.0 is the oracle, but where it computes a wrong value zap
+computes the right one instead of copying the bug:
+
+- *Comptime `|` of mixed-sign integers wider than 64 bits.* Zig 0.17.0's
+  `std.math.big.int` `bitOr` is wrong when one operand is negative and
+  has more than one limb and the other is positive, and upstream's Sema
+  folds comptime `|` with it. `@as(i96, 0x5df58149faadc6c8) |
+  -0x79e940e2f8cf7e4c913e2996` gives -431951942027799147472426825296150
+  upstream (not even an `i96`); the two's complement result is
+  -37729672316304194580555901206, which zap gives. `Sema.foldArithmetic`
+  folds a mixed-sign `|` as `~(~a & ~b)` (`bitAnd` is correct for every
+  sign combination). Runtime `|` was never affected. Found by
+  `tools/mchunt`, whose generator keeps wide `|` at run time so that the
+  difference does not show up as a mismatch.
+
 ## Known regressions and limitations
 
 - *Speculative function-type reads.* A function type reads its
