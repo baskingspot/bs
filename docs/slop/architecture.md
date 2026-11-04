@@ -3996,7 +3996,9 @@ it and can flush every CPU's TLB.
   at most once a minute, the store at least every 10 minutes. Past it, the least recently used go, down to three
   quarters: store packs by mtime in `commit`'s maintenance, compilation
   directories by their lock's mtime in `cache.maintainCompilations`,
-  skipping those a build holds. Store packs that this bs cannot read
+  skipping those a build holds, with their two output directories
+  (`o/<digest>`, `Incremental.outputDigests`), which count with them.
+  Store packs that this bs cannot read
   (another bs's pack format, or damaged) count and go by mtime like the
   rest, but are not deleted for being unreadable: two bs versions can
   share a store. `bs run`'s program directories (`bs/o/<hash>`) count

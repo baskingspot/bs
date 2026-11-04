@@ -136,6 +136,21 @@ pub fn parseSize(text: []const u8) ?u64 {
     return std.math.shlExact(u64, n, shift) catch null;
 }
 
+/// The output directories (`o/<digest>`, `Incremental.outputDigests`) of
+/// the compilation whose directory is `bs/c/<name>`, or null if `name`
+/// is not a key's hex digits.
+fn outputDirs(name: []const u8) ?[2][34]u8 {
+    var bytes: [16]u8 = undefined;
+    if (name.len != 32) return null;
+    _ = std.fmt.hexToBytes(&bytes, name) catch return null;
+    var dirs: [2][34]u8 = undefined;
+    for (&dirs, @import("Incremental.zig").outputDigests(std.mem.readInt(Hash, &bytes, .little))) |*d, digest| {
+        d[0..2].* = "o/".*;
+        d[2..].* = std.fmt.bytesToHex(digest, .lower);
+    }
+    return dirs;
+}
+
 /// Deletes compilation directories under `local_cache`, skipping those a
 /// build holds: those whose lock file (touched by `lock`) is older than
 /// `max_unused_compilation_ns`, then the least recently used while the
@@ -150,7 +165,9 @@ pub fn parseSize(text: []const u8) ?u64 {
 /// with their outputs (`o/<key>/`) and go the same way, by the record's
 /// mtime, which every hit renews; the record goes first, so a half-deleted
 /// translation is a miss. Programs and records, which have no lock, are
-/// kept over the limit while used within `in_use_grace_ns`. Test binaries in `bs/tmp` that a killed build left
+/// kept over the limit while used within `in_use_grace_ns`. A
+/// compilation's output directories (`o/<digest>`, both of
+/// `Incremental.outputDigests`) count with it and go after it. Test binaries in `bs/tmp` that a killed build left
 /// go after a day. Runs at most once a minute, so that it costs a build
 /// a few stats, and with `force`, which `Incremental` passes for a build
 /// that started a directory. `Incremental` runs it once the build's new
@@ -258,6 +275,17 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
                     }
                     entry.files.append(gpa_, .{ .inode = @intCast(stat.inode), .size = stat.size }) catch return;
                 }
+                // A compilation's outputs, in its two directories.
+                if (entry.kind == .compilation) for (outputDirs(entry.name()) orelse continue) |out| {
+                    var od = local.openDir(io_, &out, .{ .iterate = true }) catch continue;
+                    defer od.close(io_);
+                    var outs = od.iterate();
+                    while (outs.next(io_) catch null) |e| {
+                        if (e.kind != .file) continue;
+                        const stat = od.statFile(io_, e.name, .{}) catch continue;
+                        entry.files.append(gpa_, .{ .inode = @intCast(stat.inode), .size = stat.size }) catch return;
+                    }
+                };
             }
         }
     };
@@ -320,6 +348,7 @@ pub fn maintainCompilations(gpa: std.mem.Allocator, io: Io, local_cache: Io.Dir,
                 defer f.close(io);
                 if (!(f.tryLock(io, .exclusive) catch false)) continue;
                 c.deleteTree(io, e.name()) catch continue;
+                if (outputDirs(e.name())) |outs| for (outs) |out| local_cache.deleteTree(io, &out) catch {};
             },
             .translation => {
                 tc.?.deleteFile(io, e.name()) catch continue;
@@ -432,6 +461,42 @@ test "maintainCompilations evicts the least recently used unlocked directories p
         const hex = std.fmt.hex(key);
         if (kept) _ = try c.statFile(io, &hex, .{}) else try t.expectError(error.FileNotFound, c.statFile(io, &hex, .{}));
     }
+}
+
+test "maintainCompilations counts a compilation's two output directories and evicts them with it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const t = std.testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const now = Io.Clock.real.now(io);
+    // a, the least recently used, has 300 bytes in its directory and 200
+    // in its second output directory; b has 300 and 100 in its first.
+    const keys = [_]Hash{ 0xa, 0xb };
+    const outs = [_]struct { usize, usize }{ .{ 1, 200 }, .{ 0, 100 } };
+    var out_paths: [2][34]u8 = undefined;
+    for (keys, outs, &out_paths, 0..) |key, out, *p, i| {
+        var d = try compilationDir(io, tmp.dir, key);
+        defer d.close(io);
+        (try lock(io, d)).close(io);
+        try d.writeFile(io, .{ .sub_path = "manifest", .data = &(@as([300]u8, @splat(0))) });
+        const age: i64 = @intCast(2 - i);
+        try d.setTimestamps(io, "lock", .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-age * std.time.ns_per_hour)) } });
+        p.* = outputDirs(&std.fmt.hex(key)).?[out[0]];
+        var od = try tmp.dir.createDirPathOpen(io, &p.*, .{});
+        defer od.close(io);
+        const bytes = try gpa.alloc(u8, out[1]);
+        @memset(bytes, 0);
+        defer gpa.free(bytes);
+        try od.writeFile(io, .{ .sub_path = "bin", .data = bytes });
+    }
+    // 900 bytes against 800 (600 without the outputs): a goes, with its
+    // output, down to 400.
+    const r = (try maintainCompilations(gpa, io, tmp.dir, 800, false)).?;
+    try t.expectEqual(1, r.deleted);
+    try t.expectEqual(900, r.bytes);
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, &out_paths[0], .{}));
+    _ = try tmp.dir.statFile(io, &out_paths[1], .{});
 }
 
 test "maintainCompilations counts translate-c records with their outputs and evicts them by the record's mtime" {
