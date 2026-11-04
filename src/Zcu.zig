@@ -77,6 +77,9 @@ defaults_queue: std.ArrayList(InternPool.Index) = .empty,
 /// `func_inline`): a dependency loop then ends that instead of being
 /// reported (`error.Speculation`).
 speculating: u32 = 0,
+/// Whether the check of `std.lang.panic`'s handlers is running or found a
+/// bad one (`Sema.checkPanicHandlers`); a good result is memoized.
+panic_handlers: enum { idle, checking, bad } = .idle,
 /// What each unit in progress asked for, innermost last: the edges a
 /// dependency loop's error reports (`Sema.failDepLoop`).
 dep_stack: std.ArrayList(Sema.DepFrame) = .empty,

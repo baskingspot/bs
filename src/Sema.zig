@@ -3301,8 +3301,99 @@ fn panicNamespace(sema: *Sema, block: *Block) CompileError!Index {
         const val = try sema.navVal(block, src, nav);
         break :blk if (sema.typeOf(val) == .type_type) try sema.analyzeAsType(block, src, val) else null;
     } else null;
-    sema.panic_ns = root_panic orelse try sema.analyzeAsType(block, src, try sema.stdLangDecl(block, src, "panic"));
-    return sema.panic_ns;
+    const ns = root_panic orelse try sema.analyzeAsType(block, src, try sema.stdLangDecl(block, src, "panic"));
+    try sema.checkPanicHandlers(ns);
+    sema.panic_ns = ns;
+    return ns;
+}
+
+/// The handlers of `std.lang.panic` and the types they must coerce to,
+/// in upstream's order (`Zcu.StdLangDecl`, `getExpectedBuiltinFnType`).
+const panic_handlers = blk: {
+    const Params = enum { msg, generic2, err, len, len2, none };
+    const list = .{
+        .{ "call", .msg },                     .{ "sentinelMismatch", .generic2 },     .{ "unwrapError", .err },
+        .{ "outOfBounds", .len2 },             .{ "startGreaterThanEnd", .len2 },      .{ "inactiveUnionField", .generic2 },
+        .{ "sliceCastLenRemainder", .len },    .{ "reachedUnreachable", .none },       .{ "unwrapNull", .none },
+        .{ "castToNull", .none },              .{ "incorrectAlignment", .none },       .{ "invalidErrorCode", .none },
+        .{ "unexpectedErrorCode", .err },      .{ "integerOutOfBounds", .none },       .{ "integerOverflow", .none },
+        .{ "shlOverflow", .none },             .{ "shrOverflow", .none },              .{ "divideByZero", .none },
+        .{ "exactDivisionRemainder", .none },  .{ "integerPartOutOfBounds", .none },   .{ "corruptSwitch", .none },
+        .{ "shiftRhsTooBig", .none },          .{ "invalidEnumValue", .none },         .{ "forLenMismatch", .none },
+        .{ "copyLenMismatch", .none },         .{ "memcpyAlias", .none },              .{ "noreturnReturned", .none },
+        .{ "loadUninstantiableType", .none },
+    };
+    var out: [list.len]struct { []const u8, Params } = undefined;
+    for (&out, list) |*o, l| o.* = .{ l[0], l[1] };
+    break :blk out;
+};
+
+/// Upstream's `.panic` memoized state: the first panic emitted checks that
+/// `std.lang.panic` declares every handler, each coercing to its type,
+/// and reports the first bad one at its declaration. A bad result is kept
+/// for the compilation (`Zcu.panic_handlers`), so it is reported once and
+/// every other unit that emits a panic fails without an error of its own.
+/// A good one is memoized like a comptime call: every unit that emits a
+/// panic declares the check's dependencies, whichever ran it, so editing a
+/// handler runs the check again and the graph does not depend on analysis
+/// order. A failed unit is analyzed again by the next build, so the error
+/// comes back until the handler is fixed.
+fn checkPanicHandlers(sema: *Sema, ns: Index) CompileError!void {
+    const zcu = sema.zcu;
+    switch (zcu.panic_handlers) {
+        // A check in progress further up (a handler's value emits a
+        // panic) goes on.
+        .checking => return,
+        .bad => return error.AnalysisFail,
+        .idle => {},
+    }
+    const ip = sema.ip;
+    var hasher: InternPool.Hasher = .init("panic handlers");
+    hasher.int(InternPool.Hash, ip.stableHash(ns));
+    const key = hasher.final();
+    if (zcu.comptime_memo.get(key)) |memo| {
+        _ = try sema.memoHit(memo);
+        return;
+    }
+    const scope = sema.memoEnter();
+    defer sema.memoLeave(scope);
+    zcu.panic_handlers = .checking;
+    errdefer zcu.panic_handlers = .bad;
+    const opt_usize = try sema.optType(.usize_type);
+    for (panic_handlers) |h| {
+        const nav_index = (try sema.lookupInType(ns, h[0])) orelse {
+            const decl = sema.containerDecl(ns).?;
+            const tree = try zcu.fe.tree(@fromBackingInt(decl.file));
+            try zcu.addError(decl.file, tree.nodeToSpan(decl.node), "'std.lang.panic' missing '{s}'", .{h[0]});
+            return error.AnalysisFail;
+        };
+        const params: []const Index = switch (h[1]) {
+            .msg => &.{ .slice_const_u8_type, opt_usize },
+            .generic2 => &.{ .generic_poison_type, .generic_poison_type },
+            .err => &.{.anyerror_type},
+            .len => &.{.usize_type},
+            .len2 => &.{ .usize_type, .usize_type },
+            .none => &.{},
+        };
+        const fn_ty = try sema.intern(.{ .func_type = .{ .param_types = params, .return_type = .noreturn_type } });
+        // At the handler's declaration, in its file.
+        const nav = ip.getNav(nav_index);
+        const saved_code = sema.code;
+        const saved_file = sema.file;
+        defer {
+            sema.code = saved_code;
+            sema.file = saved_file;
+        }
+        sema.code = &zcu.file(nav.file).zir;
+        sema.file = nav.file;
+        var decl_block = sema.rootBlock(nav.namespace, sema.code.getDeclaration(nav.zir_inst).src_node, true);
+        defer decl_block.deinitInsts();
+        const decl_src = decl_block.nodeSrc(.zero);
+        _ = try sema.coerce(&decl_block, fn_ty, try sema.navVal(&decl_block, decl_src, nav_index), decl_src);
+    }
+    zcu.panic_handlers = .idle;
+    const names = try sema.memoNames(scope.start);
+    try zcu.comptime_memo.put(sema.gpa, key, .{ .result = .void_value, .deps = try sema.memoDeps(scope.start), .effects = try sema.memoEffects(scope.start), .funcs = try sema.memoFuncs(scope.start), .names = names[0], .name_reads = names[1] });
 }
 
 /// The `std.lang.panic` function for a panic without operands:
@@ -21700,8 +21791,15 @@ const Frontend = @import("Frontend.zig");
 /// call these handlers, as a root `panic` namespace overrides std's.
 const test_panic =
     \\
+    \\/// Every handler, as upstream requires of a panic namespace.
     \\pub const panic = struct {
-    \\    pub fn integerOverflow() noreturn {
+    \\    pub fn call(_: []const u8, _: ?usize) noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn unwrapError(_: anyerror) noreturn {
     \\        @trap();
     \\    }
     \\    pub fn outOfBounds(_: usize, _: usize) noreturn {
@@ -21710,7 +21808,73 @@ const test_panic =
     \\    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn {
     \\        @trap();
     \\    }
+    \\    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn sliceCastLenRemainder(_: usize) noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn reachedUnreachable() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn unwrapNull() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn castToNull() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn incorrectAlignment() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn invalidErrorCode() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn unexpectedErrorCode(_: anyerror) noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn integerOutOfBounds() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn integerOverflow() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn shlOverflow() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn shrOverflow() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn divideByZero() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn exactDivisionRemainder() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn integerPartOutOfBounds() noreturn {
+    \\        @trap();
+    \\    }
     \\    pub fn corruptSwitch() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn shiftRhsTooBig() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn invalidEnumValue() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn forLenMismatch() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn copyLenMismatch() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn memcpyAlias() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn noreturnReturned() noreturn {
+    \\        @trap();
+    \\    }
+    \\    pub fn loadUninstantiableType() noreturn {
     \\        @trap();
     \\    }
     \\};

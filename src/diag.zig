@@ -1739,6 +1739,7 @@ const format_codes: std.StaticStringMap(Code) = .initComptime(.{
     .{ "variadic function does not support '{s}' calling convention", .@"bad-call" },
     .{ "calling convention '{s}' only available on architectures {s}", .@"bad-fn-type" },
     .{ "calling convention '{s}' not supported by compiler backend 'stage2_x86_64'", .@"bad-fn-type" },
+    .{ "'std.lang.panic' missing '{s}'", .@"no-member" },
     .{ "calling convention incoming stack alignment '{d}' is not a power of two", .@"bad-fn-type" },
     .{ "first parameter of function with '{s}' calling convention must be a pointer type", .@"bad-fn-type" },
     .{ "second parameter of function with '{s}' calling convention must be a 64-bit integer", .@"bad-fn-type" },
