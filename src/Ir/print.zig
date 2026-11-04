@@ -370,7 +370,8 @@ fn typeIn(cx: Ctx, ty: InternPool.Index, w: *Writer) Writer.Error!void {
             .null => "@TypeOf(null)",
             .undefined => "@TypeOf(undefined)",
             .enum_literal => "@EnumLiteral()",
-            .generic_poison => "(generic poison)",
+            // Only a generic parameter or return type, as upstream prints it.
+            .generic_poison => "anytype",
             .adhoc_inferred_error_set => "(inferred error set)",
             else => @tagName(t),
         }),
