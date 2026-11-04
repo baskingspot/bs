@@ -366,7 +366,14 @@ the callee's body first. Early cutoff on the set keeps such callers green.
   only an item that is new computes its stable hash. Integers, the most
   common keys, first look in a small direct-mapped cache of the calling
   thread's (`Local.int_cache`), which needs no key hash. Most lookups
-  find an existing item. Field names are interned too, so a lookup by
+  find an existing item. Other keys first look in the thread's
+  `Local.recent`, direct-mapped by the lookup hash and checked against
+  the item, which skips the shard's lock and map on a hit. Items never
+  change, so neither cache needs invalidating, and an index another
+  thread created enters a thread's cache only after its lookup found it
+  under the shard lock. `get` itself stays small: aggregates (canonical
+  storage) and inserts (encoding and the stable hash) are out of line.
+  Field names are interned too, so a lookup by
   name in a container of more than a few fields
   compares string indices, not bytes.
 - Reads decode only what the caller uses. `indexToKey` builds a whole
@@ -5056,8 +5063,8 @@ Zcu.zig, InternPool.zig or Type.zig apart from `Type.codegen_worker`.
 | State | Today | Step 2 |
 |---|---|---|
 | Item and string storage (`Local` lists) | One writer per tid, lock-free readers (release/acquire `ptr`/`len`); old buffers retired, not freed. Only `.main` writes (`Zcu.tid`, `init(…, 1)`), and two OS threads have never written | Ready. `init` with workers + 1 locals, `Tid` per worker. Add `assert(tid < locals.len)` |
-| Dedup maps (`Shard`) | A mutex per shard, taken on every lookup, hits included; inserts encode the item under the lock | Correct now. Contention on hot keys (pointer and integer types) is measured in stage E. Per-worker lookup caches in front if needed |
-| `Local.int_cache` (the direct-mapped intern cache) | One 512-entry array per tid, plain reads and writes | Ready: per worker |
+| Dedup maps (`Shard`) | A mutex per shard, taken on every lookup that misses `Local.recent`; inserts encode the item under the lock | Correct now. Contention on hot keys (pointer and integer types) is measured in stage E |
+| `Local.int_cache`, `Local.recent` (the direct-mapped intern caches) | A 512-entry and a 1024-entry array per tid, plain reads and writes | Ready: per worker |
 | `Local.arena` | Per tid | Ready |
 | Stable hashes | Computed when an item is interned; never written after | Ready |
 | `errorValue`, `error_names` | `errors_mutex`; numbered by first use | Provisional codes (determinism rule 5) |

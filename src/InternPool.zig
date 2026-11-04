@@ -803,6 +803,10 @@ const Local = struct {
     /// value: `get` answers most integer keys (the walker's literals,
     /// indices, and arithmetic results) here without hashing the key.
     int_cache: [512]IntCacheEntry = @splat(.{}),
+    /// Keys this thread looked up or added recently, direct-mapped by
+    /// lookup hash: a hit is checked against the item and skips the
+    /// shard's lock and map. Items never change, so an entry stays valid.
+    recent: [1024]Entry = @splat(.{ .hash = 0, .index = .none }),
 };
 
 const IntCacheEntry = struct {
@@ -1151,47 +1155,66 @@ pub fn indexOfHash(ip: *InternPool, hash: Hash) Allocator.Error!?Index {
     return ip.by_hash.get(hash);
 }
 
-pub fn get(ip: *InternPool, tid: Tid, key_in: Key) Allocator.Error!Index {
-    var bytes_buf: std.ArrayList(u8) = .empty;
-    defer bytes_buf.deinit(ip.gpa);
+pub fn get(ip: *InternPool, tid: Tid, key: Key) Allocator.Error!Index {
     // Integers first look in this thread's cache.
-    const cached: ?IntCacheEntry = if (key_in == .int) switch (key_in.int.storage) {
-        .u64 => |v| .{ .ty = key_in.int.ty, .value = v },
-        .i64 => |v| .{ .ty = key_in.int.ty, .signed = true, .value = @bitCast(v) },
-        .big => null,
-    } else null;
-    const slot: ?*IntCacheEntry = if (cached) |c| blk: {
-        const h = (c.value ^ (@as(u64, @backingInt(c.ty)) << 32)) *% 0x9e3779b97f4a7c15;
-        const e = &ip.locals[@backingInt(tid)].int_cache[@intCast(h >> 55)];
-        if (e.ty == c.ty and e.value == c.value and e.signed == c.signed) return e.index;
-        break :blk e;
-    } else null;
-    const index = try ip.getUncached(tid, key_in, &bytes_buf);
-    if (slot) |e| {
-        e.* = cached.?;
-        e.index = index;
-    }
-    return index;
+    if (key == .int) switch (key.int.storage) {
+        .u64, .i64 => {
+            const signed = key.int.storage == .i64;
+            const value: u64 = switch (key.int.storage) {
+                .u64 => |v| v,
+                .i64 => |v| @bitCast(v),
+                .big => unreachable,
+            };
+            const h = (value ^ (@as(u64, @backingInt(key.int.ty)) << 32)) *% 0x9e3779b97f4a7c15;
+            const e = &ip.locals[@backingInt(tid)].int_cache[@intCast(h >> 55)];
+            if (e.ty == key.int.ty and e.value == value and e.signed == signed) return e.index;
+            const index = try ip.getUncached(tid, key);
+            e.* = .{ .ty = key.int.ty, .signed = signed, .value = value, .index = index };
+            return index;
+        },
+        .big => {},
+    };
+    if (key == .aggregate) return ip.getAggregate(tid, key.aggregate);
+    return ip.getUncached(tid, key);
 }
 
-fn getUncached(ip: *InternPool, tid: Tid, key_in: Key, bytes_buf: *std.ArrayList(u8)) Allocator.Error!Index {
-    const key = if (key_in == .aggregate) try ip.canonicalAggregate(tid, key_in.aggregate, bytes_buf) else key_in;
+/// An aggregate, in its canonical storage form.
+noinline fn getAggregate(ip: *InternPool, tid: Tid, a: Aggregate) Allocator.Error!Index {
+    var bytes_buf: std.ArrayList(u8) = .empty;
+    defer bytes_buf.deinit(ip.gpa);
+    const key = try ip.canonicalAggregate(tid, a, &bytes_buf);
+    return ip.getUncached(tid, key);
+}
+
+/// The dedup lookup, and an insert if `key` is new. The insert, much
+/// rarer than a hit, stays out of line so that a hit runs in a small
+/// frame.
+fn getUncached(ip: *InternPool, tid: Tid, key: Key) Allocator.Error!Index {
     const key_hash = ip.lookupHash(key);
+    const adapter: KeyAdapter = .{ .ip = ip, .key_hash = key_hash };
+    const recent = &ip.locals[@backingInt(tid)].recent[@intCast(key_hash >> 54)];
+    if (recent.index != .none and adapter.eql(key, recent.*)) return recent.index;
     const shard = ip.shardOf(key_hash);
     shard.mutex.lockUncancelable(ip.io);
     defer shard.mutex.unlock(ip.io);
-    const gop = try shard.map.getOrPutContextAdapted(ip.gpa, key, KeyAdapter{ .ip = ip, .key_hash = key_hash }, .{});
-    if (gop.found_existing) return gop.key_ptr.index;
-    errdefer _ = shard.map.removeContext(gop.key_ptr.*, .{});
+    const gop = try shard.map.getOrPutContextAdapted(ip.gpa, key, adapter, .{});
+    if (!gop.found_existing) {
+        errdefer _ = shard.map.removeContext(gop.key_ptr.*, .{});
+        gop.key_ptr.* = .{ .hash = key_hash, .index = try ip.insert(tid, &key) };
+    }
+    recent.* = gop.key_ptr.*;
+    return gop.key_ptr.index;
+}
+
+/// Adds new item `key` to thread `tid`'s local, with its stable hash.
+noinline fn insert(ip: *InternPool, tid: Tid, key: *const Key) Allocator.Error!Index {
     const local = &ip.locals[@backingInt(tid)];
-    const item = try ip.encode(local, key);
+    const item = try ip.encode(local, key.*);
     try local.hashes.ensureUnused(ip.gpa, 1);
     const i = try local.items.append(ip.gpa, item);
-    _ = try local.hashes.append(ip.gpa, ip.hashKey(key));
+    _ = try local.hashes.append(ip.gpa, ip.hashKey(key.*));
     assert(local.hashes.len.raw == local.items.len.raw);
-    const index: Index = @fromBackingInt(ip.wrap(tid, i));
-    gop.key_ptr.* = .{ .hash = key_hash, .index = index };
-    return index;
+    return @fromBackingInt(ip.wrap(tid, i));
 }
 
 /// Gives each array or vector value one storage form, as upstream does, so
