@@ -483,6 +483,9 @@ pub const Src = struct {
         /// The field name of the struct init field whose initializer is at
         /// `node` (upstream's `init_field_name`).
         init_name: Ast.Node.Offset,
+        /// Element `index` of the array initialization at `node`
+        /// (upstream's `init_elem` for arrays).
+        init_elem: struct { node: Ast.Node.Offset, index: u32 },
         /// The type of the array or struct initialization at `node`
         /// (upstream's `node_offset_init_ty`).
         init_ty: Ast.Node.Offset,
@@ -609,6 +612,12 @@ pub const Src = struct {
                 var ebuf: [2]Ast.Node.Index = undefined;
                 if (tree.fullArrayInit(&ebuf, params[2])) |init| if (a.index < init.ast.elements.len) return tree.nodeToSpan(init.ast.elements[a.index]);
                 return tree.nodeToSpan(params[2]);
+            },
+            .init_elem => |a| {
+                const node = a.node.toAbsolute(src.base);
+                var buf: [2]Ast.Node.Index = undefined;
+                const init = tree.fullArrayInit(&buf, node) orelse return tree.nodeToSpan(node);
+                return tree.nodeToSpan(if (a.index < init.ast.elements.len) init.ast.elements[a.index] else node);
             },
             .call_arg => |a| {
                 const node = a.node.toAbsolute(src.base);
@@ -8815,8 +8824,11 @@ fn coercePtr(sema: *Sema, block: *Block, dest_ty: Index, inst: Ref) CompileError
     if (s.flags.size == .one and d.flags.size == .slice and ip.keyTag(s.child) == .array_type) {
         const a = ip.keyPayload(.array_type, s.child);
         if (a.child != d.child and !sema.sameScalarRepr(a.child, d.child) and !(d.flags.is_const and sema.childCoercibleInMemory(a.child, d.child))) return null;
-        // A pointer to a zero-length array coerces to any slice, even a mutable one.
-        if (s.flags.is_const and !d.flags.is_const and a.len != 0) return null;
+        // A pointer to a zero-length array coerces to any slice, even a
+        // mutable one, as upstream, unless both have a sentinel (which is
+        // memory).
+        const len0 = a.len == 0 and (a.sentinel == .none or d.sentinel == .none);
+        if (s.flags.is_const and !d.flags.is_const and !len0) return null;
         if (a.len != 0 and !sema.ptrAlignOk(s, d)) return null;
         if (d.sentinel != .none and !sema.sentinelsMatch(a.sentinel, d.sentinel)) return null;
         const many_ty = try sema.ptrType(.{ .child = d.child, .sentinel = d.sentinel, .flags = .{ .size = .many, .is_const = d.flags.is_const, .is_volatile = d.flags.is_volatile } });
@@ -16200,27 +16212,34 @@ fn zirArrayInit(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!R
     return sema.arrayInitTyped(block, src, result_ty, args[1..]);
 }
 
+/// Element `k` of the array initialization at `src`, whose node offset is
+/// `off`.
+fn arrayElemSrc(src: Src, off: ?Ast.Node.Offset, k: usize) Src {
+    return if (off) |o| .{ .base = src.base, .loc = .{ .init_elem = .{ .node = o, .index = @intCast(k) } } } else src;
+}
+
 fn arrayInitTyped(sema: *Sema, block: *Block, src: Src, result_ty: Index, inits: []const Zir.Inst.Ref) CompileError!Ref {
     const ip = sema.ip;
     var ty = result_ty;
+    const off = src.nodeOffset();
     switch (ip.indexToKey(ty)) {
         .array_type => |a| {
             if (a.len != inits.len) return sema.fail(block, src, "expected {d} array elements; found {d}", .{ a.len, inits.len });
             const elems = try sema.arena.alloc(Ref, a.lenIncludingSentinel());
-            for (inits, 0..) |e, k| elems[k] = try sema.coerce(block, a.child, sema.resolveInst(e), src);
+            for (inits, 0..) |e, k| elems[k] = try sema.coerce(block, a.child, sema.resolveInst(e), arrayElemSrc(src, off, k));
             if (a.sentinel != .none) elems[a.len] = .fromInterned(a.sentinel);
             return sema.aggregate(block, src, ty, elems);
         },
         .vector_type => |v| {
             if (v.len != inits.len) return sema.fail(block, src, "expected {d} vector elements; found {d}", .{ v.len, inits.len });
             const elems = try sema.arena.alloc(Ref, v.len);
-            for (inits, elems) |e, *r| r.* = try sema.coerce(block, v.child, sema.resolveInst(e), src);
+            for (inits, elems, 0..) |e, *r, k| r.* = try sema.coerce(block, v.child, sema.resolveInst(e), arrayElemSrc(src, off, k));
             return sema.aggregate(block, src, ty, elems);
         },
         .tuple_type => |t| {
             if (t.types.len != inits.len) return sema.fail(block, src, "expected {d} tuple elements; found {d}", .{ t.types.len, inits.len });
             const elems = try sema.arena.alloc(Ref, inits.len);
-            for (inits, 0..) |e, k| elems[k] = try sema.coerce(block, t.types[k], sema.resolveInst(e), src);
+            for (inits, 0..) |e, k| elems[k] = try sema.coerce(block, t.types[k], sema.resolveInst(e), arrayElemSrc(src, off, k));
             return sema.aggregate(block, src, ty, elems);
         },
         else => {
