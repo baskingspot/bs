@@ -1091,6 +1091,10 @@ fn astGenFix(arena: std.mem.Allocator, tree: *const Ast, code: Code, msg: []cons
             return try rawFix(arena, .exact, &.{.{ .start = start, .end = end, .text = "" }});
         },
         .@"unknown-builtin" => {
+            // `@setCold(true)` first in its block; @branchHint must be.
+            if (std.mem.eql(u8, tree.tokenSlice(tok), "@setCold") and tok > 0 and tree.tokenTag(tok - 1) == .l_brace and
+                tree.tokenTag(tok + 1) == .l_paren and tree.tokenTag(tok + 3) == .r_paren and std.mem.eql(u8, tree.tokenSlice(tok + 2), "true"))
+                return try rawFix(arena, .exact, &.{.{ .start = tree.tokenStart(tok), .end = tokenEnd(tree, tok + 3), .text = "@branchHint(.cold)" }});
             const n_args, const template = builtin_rewrites.get(tree.tokenSlice(tok)) orelse return null;
             return builtinFix(arena, tree, tok, n_args, template);
         },
