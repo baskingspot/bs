@@ -940,6 +940,9 @@ const InputResolver = struct {
     /// import already (`importSym`), or null if it is not one. The copy
     /// takes the import's key, so every reference to the import uses it.
     pub fn copySym(r: InputResolver, name: []const u8) !?SymbolKey {
+        // A shared object copies nothing: its data references to another
+        // module's symbols go through the GOT.
+        if (r.emit.shared) return null;
         const size: u64 = if (Glibc.sharedSymbol(r.emit.shared_libs, name)) |s|
             if (s.sym.object) s.sym.size else 0
         else s: {
@@ -1352,7 +1355,7 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
     const imports = try emit.gpa.alloc(ElfObject.Import, emit.imports.count());
     defer emit.gpa.free(imports);
     for (imports, emit.imports.keys(), emit.imports.values()) |*imp, name, f| imp.* = .{ .key = importKey(name), .name = name, .weak = f.weak, .hidden = f.hidden, .tls = f.tls };
-    const result = if (emit.glibc) |g| exe: {
+    const result = if (if (emit.shared) null else emit.glibc) |g| exe: {
         // The copied imports, moved to the end, are the executable's own
         // symbols.
         var n_imports: usize = 0;
@@ -1380,7 +1383,13 @@ pub fn link(emit: *Emit, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !boo
         exe_options.dynamic = &dynamic;
         break :exe Elf.link(emit.gpa, io, dir, sub_path, emit.atoms.items, exe_options);
     } else if (emit.shared) shared: {
-        const dynamic: ElfDynamic.Options = .{ .exports = emit.exports.items, .imports = imports, .soname = emit.soname };
+        // With glibc, its libraries are needed and its symbols versioned.
+        var arena_state: std.heap.ArenaAllocator = .init(emit.gpa);
+        defer arena_state.deinit();
+        var dynamic: ElfDynamic.Options = if (emit.glibc) |g| try g.sharedObjectOptions(arena_state.allocator(), imports, emit.shared_libs) else .{ .imports = imports };
+        dynamic.exports = emit.exports.items;
+        dynamic.soname = emit.soname;
+        dynamic.runpath = emit.runpath;
         var shared_options = options;
         shared_options.base_address = 0;
         shared_options.dynamic = &dynamic;

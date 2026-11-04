@@ -6416,8 +6416,15 @@ libraries as inputs. To be agreed with that thread.
   accepted with `-lc`. Objects and static libraries with `-lc` are
   ordinary ones, as upstream's (static `link_mode`, no start code, externs
   left to the final link), but position-independent (upstream's
-  `requiresPIC` for glibc), as their builtin says; `build-lib -dynamic -lc` is `[unsupported]`
-  for now. A glibc newer than abilists' newest links against the newest,
+  `requiresPIC` for glibc), as their builtin says. `build-lib -dynamic
+  -lc` (built 2026-11-04) links glibc as an executable does, as an
+  ET_DYN: DT_NEEDED libc.so.6 and the other glibc libraries it uses,
+  imports versioned through .gnu.version and .gnu.version_r
+  (`Glibc.sharedObjectOptions`), no PT_INTERP or DT_DEBUG, no copies
+  (data goes through the GOT), and imports through PLT stubs and GOT
+  slots as in any zap shared object; a name neither its shared libraries
+  nor glibc define is imported unversioned, for the program that loads
+  it. A glibc newer than abilists' newest links against the newest,
   with upstream's warning. Over `--listen=-`, the config message reports
   `link_libc` and a dynamic link mode.
 - **`builtin`** (`Builtin.generate` with `glibc`): upstream's text for

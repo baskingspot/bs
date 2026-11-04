@@ -60,7 +60,7 @@ pub const Import = struct {
     /// A thread-local (STT_TLS): in an executable, reached through slots
     /// the loader writes with TPOFF64 relocations.
     tls: bool = false,
-    /// In an executable: the symbol version the import binds to
+    /// With glibc: the symbol version the import binds to
     /// (`GLIBC_2.2.5`), or null for none, and the index in
     /// `Options.needed` of the library that defines it.
     version: ?[]const u8 = null,
@@ -76,12 +76,14 @@ pub const Options = struct {
     /// DT_RUNPATH, directories separated by ':', or null for none.
     runpath: ?[]const u8 = null,
     /// A dynamically linked executable (ET_EXEC) rather than a shared
-    /// object: PT_INTERP names `interp`, each of `needed` gets a
-    /// DT_NEEDED, imports carry versions (.gnu.version, .gnu.version_r),
-    /// and the image is not position-independent. Its extern slots are
-    /// its GOT, so imports get neither PLT stubs nor GOT slots: only an
-    /// absolute relocation to an import needs the loader.
+    /// object: PT_INTERP names `interp`, and the image is not
+    /// position-independent. Its extern slots are its GOT, so imports get
+    /// neither PLT stubs nor GOT slots: only an absolute relocation to an
+    /// import needs the loader.
     interp: ?[]const u8 = null,
+    /// The libraries the image links (DT_NEEDED), which imports with a
+    /// version name (.gnu.version, .gnu.version_r): an executable's or a
+    /// shared object's that links glibc.
     needed: []const []const u8 = &.{},
 
     pub fn executable(o: *const Options) bool {
@@ -362,8 +364,9 @@ pub const Addresses = struct {
 /// The number of .dynamic entries `writeDynamic` writes, with `n_arrays`
 /// of `Addresses.arrays` not empty.
 pub fn dynamicCount(t: *const Tables, o: Options, n_arrays: u64) u64 {
-    const exe: u64 = if (o.executable()) 1 + 3 * @as(u64, @intFromBool(t.verneed_count > 0)) else 0;
-    return 12 + @as(u64, @intFromBool(t.soname != null)) + @intFromBool(t.runpath != null) + t.needed.len + exe + 2 * n_arrays;
+    const exe: u64 = @intFromBool(o.executable());
+    const versions: u64 = 3 * @as(u64, @intFromBool(t.verneed_count > 0));
+    return 12 + @as(u64, @intFromBool(t.soname != null)) + @intFromBool(t.runpath != null) + t.needed.len + exe + versions + 2 * n_arrays;
 }
 
 /// The size of the largest .dynamic `writeDynamic` writes without
@@ -398,11 +401,11 @@ pub fn writeDynamic(out: []u8, t: *const Tables, o: Options, a: Addresses) void 
         fixed[n] = e;
         n += 1;
     }
+    if (t.verneed_count > 0) {
+        fixed[n..][0..3].* = .{ .{ elf.DT_VERSYM, a.versym }, .{ elf.DT_VERNEED, a.verneed }, .{ elf.DT_VERNEEDNUM, t.verneed_count } };
+        n += 3;
+    }
     if (o.executable()) {
-        if (t.verneed_count > 0) {
-            fixed[n..][0..3].* = .{ .{ elf.DT_VERSYM, a.versym }, .{ elf.DT_VERNEED, a.verneed }, .{ elf.DT_VERNEEDNUM, t.verneed_count } };
-            n += 3;
-        }
         // Where the loader publishes `r_debug` for debuggers.
         fixed[n] = .{ elf.DT_DEBUG, 0 };
         n += 1;

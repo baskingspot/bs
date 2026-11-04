@@ -172,6 +172,22 @@ pub fn deinit(g: *Glibc) void {
 /// A name one of the `shared` libraries defines comes from the first
 /// such library, before glibc. Strings are allocated in `arena`.
 pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, shared: []const ElfShared) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
+    return g.options(arena, imports, copies, shared, true);
+}
+
+/// The dynamic tables of a shared object that links glibc, as
+/// `dynamicOptions`' for an executable, except that it copies nothing,
+/// has no interpreter, and imports a name neither the `shared` libraries
+/// nor glibc define unversioned, for the program that loads it to define.
+/// The caller adds the exports and the soname.
+pub fn sharedObjectOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, shared: []const ElfShared) Allocator.Error!ElfDynamic.Options {
+    return g.options(arena, imports, &.{}, shared, false) catch |err| switch (err) {
+        error.OutOfMemory => |e| e,
+        error.NotInGlibc => unreachable,
+    };
+}
+
+fn options(g: *const Glibc, arena: Allocator, imports: []ElfObject.Import, copies: []const ElfObject.Import, shared: []const ElfShared, executable: bool) error{ OutOfMemory, NotInGlibc }!ElfDynamic.Options {
     std.mem.sortUnstable(ElfObject.Import, imports, {}, struct {
         fn lt(_: void, a: ElfObject.Import, b: ElfObject.Import) bool {
             return std.mem.lessThan(u8, a.name, b.name);
@@ -184,7 +200,9 @@ pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Im
     var used: [libs.len]bool = @splat(false);
     used[lib_c] = true;
     for ([_][]const ElfObject.Import{ imports, copies }) |list| for (list) |imp| {
-        if (sharedSymbol(shared, imp.name) == null) used[(g.get(imp.name) orelse return error.NotInGlibc).lib] = true;
+        if (sharedSymbol(shared, imp.name) == null) used[
+            (g.get(imp.name) orelse if (executable) return error.NotInGlibc else continue).lib
+        ] = true;
     };
     var lib_index: [libs.len]u32 = undefined;
     for (libs, used, &lib_index) |lib, u, *index| if (u) {
@@ -200,7 +218,7 @@ pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Im
         }
     }.f;
     for (imports) |*imp| {
-        const p = (try place(g, arena, shared, &lib_index, imp.name)).?;
+        const p = try place(g, arena, shared, &lib_index, imp.name) orelse continue;
         imp.version = p.version;
         imp.library = p.library;
     }
@@ -219,7 +237,7 @@ pub fn dynamicOptions(g: *const Glibc, arena: Allocator, imports: []ElfObject.Im
             try exports.append(arena, .{ .key = c.key, .name = n, .copy = .{ .version = p.version, .library = p.library, .alias = alias } });
         };
     }
-    return .{ .exports = exports.items, .imports = imports, .interp = interp, .needed = needed.items };
+    return .{ .exports = exports.items, .imports = imports, .interp = if (executable) interp else null, .needed = needed.items };
 }
 
 /// The first of `shared` that defines `name`, as the link resolves it.

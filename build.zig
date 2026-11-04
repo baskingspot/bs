@@ -685,15 +685,29 @@ fn addObjAndRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     lc_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
     lc_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&lc_run.step);
-    // Shared libraries against glibc are not built yet: a diagnostic, not
-    // an executable in a .so's name.
-    const lc_so = b.addRunArtifact(zap);
-    lc_so.setName("zap build-lib -dynamic -lc (unsupported)");
-    lc_so.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "-fno-emit-bin" });
-    lc_so.addFileArg(b.path("test/obj/lib.zig"));
-    lc_so.addCheck(.{ .expect_stderr_match = "zap does not link shared libraries against glibc yet" });
-    lc_so.addCheck(.{ .expect_term = .{ .exited = 1 } });
-    test_step.dependOn(&lc_so.step);
+    // Shared libraries that link glibc: lib.zig, whose c_twice the program
+    // that loads it defines, and so_libc.zig with a C source, which call
+    // glibc through versioned imports; upstream links the programs.
+    for ([_][]const u8{ "test/obj/lib.zig", "test/link_input/so_libc.zig" }, [_][]const u8{ "test/obj/main.zig", "test/link_input/so_libc_main.zig" }, [_][]const u8{ "zaplc", "so_libc" }) |lib_src, main_src, name| {
+        const lc_so = b.addRunArtifact(zap);
+        lc_so.setName(b.fmt("zap build-lib -dynamic -lc {s}", .{std.fs.path.basename(lib_src)}));
+        lc_so.addArgs(&.{ "build-lib", "-dynamic", "-lc", "-target", "x86_64-linux-gnu", "--name", name });
+        lc_so.addFileArg(b.path(lib_src));
+        const with_c = std.mem.eql(u8, name, "so_libc");
+        if (with_c) lc_so.addFileArg(b.path("test/link_input/so_libc.c"));
+        lc_so.setEnvironmentVariable("ZAP_ZIG", upstreamZig(b));
+        const lc_so_file = lc_so.addPrefixedOutputFileArg("-femit-bin=", b.fmt("lib{s}.so", .{name}));
+        const lc_so_host = b.addSystemCommand(&.{ upstreamZig(b), "build-exe", "-lc", "-rdynamic" });
+        lc_so_host.addFileArg(b.path(main_src));
+        lc_so_host.addFileArg(lc_so_file);
+        const lc_so_run = b.addSystemCommand(&.{ "sh", "-c", "LD_LIBRARY_PATH=$(dirname \"$1\") exec \"$2\"", "sh" });
+        lc_so_run.setName(b.fmt("run {s} (zap shared library linking glibc)", .{std.fs.path.basename(main_src)}));
+        lc_so_run.addFileArg(lc_so_file);
+        lc_so_run.addFileArg(lc_so_host.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        if (with_c) lc_so_run.addCheck(.{ .expect_stderr_exact = "z[c7:1]\nz[c42:2]\n" }) else lc_so_run.addCheck(.{ .expect_stdout_exact = "20 7 41\n" });
+        lc_so_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&lc_so_run.step);
+    }
 
     // The same object built -fPIC, linked by upstream into a static PIE
     // (which relaxes local-dynamic TLS) and into a shared object that a

@@ -1057,9 +1057,9 @@ fn compileReplaying(init: std.process.Init, job: *const Job, inc_opt: ?*Incremen
     emit.stack_size = opts.stack_size;
     emit.fuzz = opts.fuzz;
     emit.prove_on = proving(job.environ_map);
-    // Only executables link glibc: an object or a static library with
-    // -lc is an ordinary one, as upstream's.
-    const links_glibc = opts.link_libc and opts.command != .build_obj and opts.command != .build_lib;
+    // Executables and shared libraries link glibc: an object or a static
+    // library with -lc is an ordinary one, as upstream's.
+    const links_glibc = opts.link_libc and opts.command != .build_obj and (opts.command != .build_lib or opts.dynamic);
     var glibc: ?Glibc = if (links_glibc) try loadGlibc(init, job) else null;
     defer if (glibc) |*g| g.deinit();
     if (glibc) |*g| emit.glibc = g;
@@ -2091,8 +2091,6 @@ pub fn parseOptions(arena: std.mem.Allocator, io: Io, environ_map: *const std.pr
     // position-independent, as their builtin says. zap links executables
     // itself, non-PIE.
     if (opts.link_libc and (command == .build_obj or command == .build_lib)) opts.pic = true;
-    if (opts.link_libc and opts.dynamic and command == .build_lib)
-        setUnsupported(&opts, arena, "zap does not link shared libraries against glibc yet ('-dynamic' with '-lc'); build this step with upstream zig", .{});
     if (opts.link_libc and opts.unsupported == null) resolveGlibc(&opts, arena, io);
     // C sources without any module: a library or executable of C only, as
     // upstream's; so are object inputs alone in a library or object.

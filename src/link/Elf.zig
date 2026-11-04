@@ -855,6 +855,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const dyn_opts = options.dynamic;
     const dyn: ?ElfDynamic.Tables = if (dyn_opts) |d| try ElfDynamic.tables(dyn_arena.allocator(), d.*) else null;
     const has_dyn = dyn != null;
+    // An executable's .gnu.version and .gnu.version_r, as before, and a
+    // shared object's that imports versioned symbols (glibc's).
+    const has_versions = exe_dyn or (if (dyn) |*t| t.verneed_count > 0 else false);
     const n_imports: u64 = if (dyn_opts) |d| d.imports.len else 0;
     var n_copies: u64 = 0;
     if (dyn_opts) |d| for (d.exports) |x| {
@@ -1123,7 +1126,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const symtab_off = std.mem.alignForward(u64, debug_end, 8);
     const strtab_off = symtab_off + @as(u64, n_syms) * @sizeOf(elf.Elf64.Sym);
     const shstrtab_off = strtab_off + strtab_len;
-    const shstr_fixed = if (has_arrays) shstrtab else if (exe_dyn) shstrtab_no_arrays else if (has_dyn) shstrtab_no_exe else if (has_relro) shstrtab_no_dyn else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
+    const shstr_fixed = if (has_arrays) shstrtab else if (exe_dyn or has_versions) shstrtab_no_arrays else if (has_dyn) shstrtab_no_exe else if (has_relro) shstrtab_no_dyn else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     // The names of the debug sections only inputs bring follow.
     const extra_kinds = std.enums.values(InputKind)[@backingInt(InputKind.first_extra)..];
     var extra_names: [extra_kinds.len]u32 = @splat(0);
@@ -1143,7 +1146,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shstr[name + 1 + @tagName(k).len] = 0;
     };
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 3 * @as(u16, @intFromBool(has_arrays)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + n_extra + 8 * @as(u16, @intFromBool(has_dyn)) + 3 * @as(u16, @intFromBool(exe_dyn));
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 3 * @as(u16, @intFromBool(has_arrays)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + n_extra + 8 * @as(u16, @intFromBool(has_dyn)) + @as(u16, @intFromBool(exe_dyn)) + 2 * @as(u16, @intFromBool(has_versions));
     l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     switch (l.target) {
         .memory => |buf| {
@@ -1227,6 +1230,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         if (exe_dyn) {
             try l.put(interp_off, d.interp.?);
             try l.fill(interp_off + interp_size - 1, 1);
+        }
+        if (has_versions) {
             try l.put(versym_off, t.versym);
             try l.put(verneed_off, t.verneed);
         }
@@ -1436,7 +1441,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const strtab_ndx = shnum - 2;
     // A shared object's sections go last among the allocated ones, so the
     // others keep their indices (`shndxOf`).
-    const dynsym_ndx: u32 = if (has_dyn) shnum - 3 - 8 - 3 * @as(u32, @intFromBool(exe_dyn)) else 0;
+    const dynsym_ndx: u32 = if (has_dyn) shnum - 3 - 8 - @as(u32, @intFromBool(exe_dyn)) - 2 * @as(u32, @intFromBool(has_versions)) else 0;
     const dyn_shdrs = blk: {
         const t = if (dyn) |*t| t else &ElfDynamic.Tables{ .exports = &.{}, .n_imports = 0, .dynstr = "", .names = &.{}, .soname = null, .hash = "", .gnu_hash = "" };
         var h = [_]elf.Elf64.Shdr{
@@ -1461,18 +1466,19 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         h[6].entsize = @sizeOf(elf.Elf64_Dyn);
         break :blk h;
     };
-    // An executable's, after the shared object's.
-    const exe_shdrs = blk: {
+    // An executable's, after the shared object's; then the symbol
+    // versions of an image that links glibc.
+    const interp_shdrs = [_]elf.Elf64.Shdr{shdr(shName(".interp"), .PROGBITS, .{ .ALLOC = true }, base, interp_off, interp_size, .@"1")};
+    const version_shdrs = blk: {
         const t = if (dyn) |*t| t else &ElfDynamic.Tables{ .exports = &.{}, .n_imports = 0, .dynstr = "", .names = &.{}, .soname = null, .hash = "", .gnu_hash = "" };
         var h = [_]elf.Elf64.Shdr{
-            shdr(shName(".interp"), .PROGBITS, .{ .ALLOC = true }, base, interp_off, interp_size, .@"1"),
             shdr(shName(".gnu.version"), .GNU_VERSYM, .{ .ALLOC = true }, base, versym_off, t.versym.len, .@"2"),
             shdr(shName(".gnu.version_r"), .GNU_VERNEED, .{ .ALLOC = true }, base, verneed_off, t.verneed.len, .@"8"),
         };
-        h[1].link = dynsym_ndx;
-        h[1].entsize = 2;
-        h[2].link = dynsym_ndx + 1;
-        h[2].info = t.verneed_count;
+        h[0].link = dynsym_ndx;
+        h[0].entsize = 2;
+        h[1].link = dynsym_ndx + 1;
+        h[1].info = t.verneed_count;
         break :blk h;
     };
     const shdrs = [_]elf.Elf64.Shdr{
@@ -1484,14 +1490,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     } ++ array_shdrs ++ [_]elf.Elf64.Shdr{
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
-    } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ extra_shdrs ++ dyn_shdrs ++ exe_shdrs ++ [_]elf.Elf64.Shdr{
+    } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ extra_shdrs ++ dyn_shdrs ++ interp_shdrs ++ version_shdrs ++ [_]elf.Elf64.Shdr{
         .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = n_syms, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
         nonAlloc(shName(".strtab"), .STRTAB, strtab_off, strtab_len),
         nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
     var sh_buf: [shdrs.len * @sizeOf(elf.Elf64.Shdr)]u8 = undefined;
     var sh_at: usize = 0;
-    const present = [_]Present{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ has_arrays, array_shdrs.len }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len } } ++ extra_present ++ [_]Present{ .{ has_dyn, dyn_shdrs.len }, .{ exe_dyn, exe_shdrs.len }, .{ true, 3 } };
+    const present = [_]Present{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ has_arrays, array_shdrs.len }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len } } ++ extra_present ++ [_]Present{ .{ has_dyn, dyn_shdrs.len }, .{ exe_dyn, interp_shdrs.len }, .{ has_versions, version_shdrs.len }, .{ true, 3 } };
     var group: usize = 0;
     var group_end: usize = present[0][1];
     for (shdrs, 0..) |s, i| {
