@@ -337,7 +337,8 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                     \\cp "$3" "$4.d/a/rt.zig"
                     \\cp "$3" "$4.d/b/rt.zig"
                     \\cp "$1" "$4.d/{[donor_dir]s}/{[file]s}"
-                    \\fail() {{ cat "$4.d/log" >&2; exit 1; }}
+                    \\log="$4.d/log"
+                    \\fail() {{ cat "$log" >&2; exit 1; }}
                     \\{[zap]s} --cache-dir "$4.d/la" "$4.d/{[donor_dir]s}/{[file]s}" -femit-bin="$4.d/a/out" 2>"$4.d/log" || fail
                     \\cp "$2" "$4.d/b/{[file]s}"
                     \\ZAP_CACHE_TIMING=1 ZAP_CACHE_CHECK=1 {[zap]s} --cache-dir "$4.d/lb" "$4.d/b/{[file]s}" -femit-bin="$4" 2>"$4.d/log" || fail
