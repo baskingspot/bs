@@ -1097,7 +1097,7 @@ pub fn clobbers(cg: *CodeGen, inst: Inst.Index) bool {
         // moves. (`Ssa.plan` promotes variables.)
         .block => {
             const ty = data.ty_pl.ty;
-            const class: RegClass = if (cg.has_asm) .none else if (cg.inGpr(ty)) .gpr else if (cg.inPair(ty)) .pair else if (cg.inFloat(ty)) .float else .none;
+            const class: RegClass = if (cg.has_asm) .none else if (cg.inGpr(ty) or cg.inGprBytes(ty)) .gpr else if (cg.inPair(ty)) .pair else if (cg.inFloat(ty)) .float else .none;
             if (class != .none) {
                 const live = cg.emit.ssa.live.slice();
                 live.items(.reg)[@backingInt(inst)] = class.want();
@@ -1545,6 +1545,18 @@ pub fn inGpr(cg: *CodeGen, ty: Index) bool {
     };
 }
 
+/// Whether a value of type `ty` that is not `inGpr` may still live in a
+/// general-purpose register as its bytes, extended like a load: a struct,
+/// tuple, array, union, or optional of 1, 2, 4, or 8 bytes. Only loads
+/// and block results get one; their users that read memory get a copy
+/// (`memOf`), as for `Home.regs`.
+fn inGprBytes(cg: *CodeGen, ty: Index) bool {
+    return switch (Type.class(cg.ip, ty)) {
+        .@"struct", .tuple, .array, .@"union", .optional => cg.passInRegs(ty),
+        else => false,
+    };
+}
+
 /// Whether integer, bool, or pointer operand `ref` takes the scalar paths.
 fn scalarOperand(cg: *CodeGen, ref: Ref) bool {
     const ty = cg.typeOf(ref);
@@ -1621,7 +1633,7 @@ fn wantsReg(cg: *CodeGen, inst: Inst.Index) RegClass {
     };
     if (!wanted) return .none;
     const ty = ir.typeOfIndex(inst, cg.ip);
-    if (cg.inGpr(ty)) return .gpr;
+    if (cg.inGpr(ty) or (tag == .load and cg.inGprBytes(ty))) return .gpr;
     const pair = switch (tag) {
         .load, .slice, .slice_elem_val, .ptr_elem_val, .optional_payload, .wrap_optional, .wrap_errunion_payload, .wrap_errunion_err, .arg => true,
         // `.auto` returns a pair in rax and rdx.
