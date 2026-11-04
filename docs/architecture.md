@@ -4551,6 +4551,35 @@ records only what changed, and links from the manifest.
   scan), which decides it, and the walk goes on from it if it is green.
   A namespace whose container or roots an edit reached is made again, so
   that its scan queues the roots as they are now.
+- *Walking only the edits' cone* (2026-11-04). Every node records
+  whether a walk from the roots reaches it (`Flags.reached`: a full
+  build's record sets it from reach, a lazy one's from `reachedNow`),
+  and the base holds the reverse of the references reach follows
+  (`rrefs`, beside the dependencies' `rdeps`). A lazy build walks only
+  the *cone* (`Replay.assumeReached`): the reached nodes that are
+  outdated or in a changed input, the functions that inline one of
+  those (whose lines the walk refreshes), the namespaces with roots in
+  it, and the requesters of compiler_rt helpers in it. Every other
+  reached node is *assumed*: marked visited without being walked; it is
+  neither outdated nor moved, so walking it would only follow its
+  recorded edges. The walk starts at the roots and at the cone's nodes
+  that an assumed node names (`entries`), as if that node had been
+  walked; a red declaration that an assumed node refers to has its data
+  lowered again as before (`data_refs`). On zls with a body edit in
+  Server.zig, 465 of 72,210 nodes are walked. Recording finds what is
+  reached now (`Incremental.reachedNow`): what the walk visited, plus
+  what the nodes it left to analysis and the written nodes reach over
+  their new edges; then the assumed nodes the cone's nodes reached
+  before but no longer do, and what they reach among the assumed, are
+  candidates, and those that a remaining assumed node or a walked node
+  still reaches stay. The rest are no longer reached and not linked. A
+  build falls back to eager if one that goes offered or read type names
+  (`contributeNames` counted it) or named a cone node the walk visited
+  (its entry may have been only that). With the cone past half the
+  reached nodes, or in a donor's build, it walks everything as before.
+  `ZAP_CACHE_CHECK` walks the graph the build leaves in full
+  (`checkLiveReach`) and requires the same `reached` flags and linked
+  nodes.
 - *Loading on demand.* A green unit's result is decoded only when
   analysis reads it (`ensureNavVal` and the rest). Writing a result into
   the Zcu first brings the unit's plain dependencies up to date, as

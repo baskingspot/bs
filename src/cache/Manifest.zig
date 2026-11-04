@@ -25,6 +25,10 @@
 //! is not a dependency (functions it queued, declarations' data, error
 //! codes, external symbols, compiler_rt helpers), so that a unit loaded
 //! from the cache requests the same and the build reaches the same units.
+//! The base also holds the reverse of the references a walk follows
+//! (`rrefs`, a superset as `rdeps` is), and each node's flags say whether
+//! a walk from the roots reaches it (`Flags.reached`), so that an edit
+//! build walks only what its edits can change (`Replay.assumeReached`).
 //!
 //! The store does not interpret nodes: a node is anything a unit can depend
 //! on (a declaration's value or type, a type's layout, a function body or
@@ -129,6 +133,10 @@ table: []const u32,
 /// dependents in `redges` at `rdeps_start` (node indices).
 edges: []const u32,
 redges: []const u32,
+/// The nodes whose references a walk follows (`reachRef`) name node `i`:
+/// `rref_nodes[rref_starts[i]..rref_starts[i + 1]]`, ascending.
+rref_starts: []const u32,
+rref_nodes: []const u32,
 atom_refs: []const Pack.AtomRef,
 inputs: []const Input,
 /// Error names in code order: the error with code `c` is `c - 1`.
@@ -185,7 +193,12 @@ pub const Flags = packed struct(u8) {
     /// It may be out of date: an edit reached it over reverse edges, and
     /// no build has checked it since. An edit build treats it as edited.
     stale: bool = false,
-    unused: u6 = 0,
+    /// A walk of the graph from the roots reaches it (`Incremental.
+    /// reachNext`): the build that left it analyzed or kept it. An edit
+    /// build takes the nodes no edit can affect as reached without walking
+    /// them (`Replay.create`).
+    reached: bool = false,
+    unused: u5 = 0,
 };
 
 pub const StrRef = extern struct { off: u32, len: u32 };
@@ -483,11 +496,11 @@ pub const Input = extern struct {
     }
 };
 
-const Section = enum { nodes, table, edges, redges, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, atom_names, atom_name_bytes, strings };
+const Section = enum { nodes, table, edges, redges, rref_starts, rref_nodes, atom_refs, inputs, error_names, bases, symbols, numbered, targets, error_symbols, debug_files, debug_atoms, files, ref_starts, refs, ref_names, sources, source_names, items, item_starts, results, result_starts, subjects, subject_starts, link_symbols, type_names, type_name_starts, type_name_index, atom_names, atom_name_bytes, strings };
 const SectionRange = extern struct { offset: u64, len: u64 };
 
-const magic = "ZAPMAN14".*;
-const log_magic = "ZAPMLG07".*;
+const magic = "ZAPMAN15".*;
+const log_magic = "ZAPMLG08".*;
 const record_magic: u32 = 0x5a524543;
 const log_name = "manifest.log";
 
@@ -607,6 +620,8 @@ const Overlay = struct {
     added_keys: std.AutoHashMapUnmanaged(Hash, u32) = .empty,
     /// Reverse edges of dependencies set in the log.
     rdeps: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty,
+    /// Reverse references set in the log, as `rdeps`.
+    rrefs: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty,
     inputs: std.AutoHashMapUnmanaged(u32, InputState) = .empty,
     added_inputs: u32 = 0,
     error_names: std.ArrayList([]const u8) = .empty,
@@ -658,6 +673,9 @@ const Overlay = struct {
         var it = o.rdeps.valueIterator();
         while (it.next()) |l| l.deinit(gpa);
         o.rdeps.deinit(gpa);
+        var rit = o.rrefs.valueIterator();
+        while (rit.next()) |l| l.deinit(gpa);
+        o.rrefs.deinit(gpa);
         o.inputs.deinit(gpa);
         o.error_names.deinit(gpa);
         o.error_symbols.deinit(gpa);
@@ -684,7 +702,7 @@ const Overlay = struct {
 fn SectionType(comptime s: Section) type {
     return switch (s) {
         .nodes => Node,
-        .table, .edges, .redges => u32,
+        .table, .edges, .redges, .rref_starts, .rref_nodes => u32,
         .atom_refs => Pack.AtomRef,
         .inputs => Input,
         .error_names, .bases, .files, .ref_names => StrRef,
@@ -734,6 +752,7 @@ pub fn open(gpa: Allocator, io: Io, dir: Io.Dir) !?Manifest {
         m.numbered.len != m.atom_refs.len or m.debug_files.len != m.atom_refs.len or m.atom_names.len != m.atom_refs.len or
         m.error_symbols.len != m.error_names.len or
         m.ref_starts.len != m.nodes.len + 1 or m.ref_starts[m.nodes.len] != m.refs.len or
+        m.rref_starts.len != m.nodes.len + 1 or m.rref_starts[m.nodes.len] != m.rref_nodes.len or
         m.sources.len != m.nodes.len or
         m.result_starts.len != m.nodes.len + 1 or m.result_starts[m.nodes.len] != m.results.len or
         m.subject_starts.len != m.nodes.len + 1 or m.subject_starts[m.nodes.len] != m.subjects.len or
@@ -838,6 +857,11 @@ fn applyRecord(m: *Manifest, gpa: Allocator, rest: []align(16) const u8) !?usize
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(gpa, index);
         }
+        for (node_refs) |ref| if (reachRef(ref.kind)) {
+            const gop = try o.rrefs.getOrPut(gpa, ref.value);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(gpa, index);
+        };
     }
     const input_deltas = r.take(InputDelta, rh.n_inputs);
     const errors = r.take(StrRef, rh.n_errors);
@@ -1057,6 +1081,23 @@ pub fn rdeps(m: *const Manifest, index: u32) [2][]const u32 {
     } else &.{};
     const logged: []const u32 = if (m.overlay.rdeps.get(index)) |l| l.items else &.{};
     return .{ base, logged };
+}
+
+/// The nodes whose references a walk follows name node `index`: the
+/// base's, then the log's. A superset, as `rdeps`.
+pub fn rrefs(m: *const Manifest, index: u32) [2][]const u32 {
+    const base: []const u32 = if (index < m.nodes.len) m.rref_nodes[m.rref_starts[index]..m.rref_starts[index + 1]] else &.{};
+    const logged: []const u32 = if (m.overlay.rrefs.get(index)) |l| l.items else &.{};
+    return .{ base, logged };
+}
+
+/// Whether a walk of the graph follows references of `kind` (`Incremental.
+/// reachNext`): what they name is part of the program if the node is.
+pub fn reachRef(kind: Ref.Kind) bool {
+    return switch (kind) {
+        .func, .nav, .effects, .root, .defaults => true,
+        else => false,
+    };
 }
 
 pub fn atoms(m: *const Manifest, index: u32) []const Pack.AtomRef {
@@ -2234,6 +2275,25 @@ pub const Builder = struct {
             }
         }
 
+        // Reverse references, the same way.
+        const rref_starts = try gpa.alloc(u32, nodes.len + 1);
+        defer gpa.free(rref_starts);
+        @memset(rref_starts, 0);
+        for (node_refs.items) |r| if (reachRef(r.kind)) {
+            rref_starts[r.value + 1] += 1;
+        };
+        for (1..rref_starts.len) |i| rref_starts[i] += rref_starts[i - 1];
+        const rrefs_out = try gpa.alloc(u32, rref_starts[nodes.len]);
+        defer gpa.free(rrefs_out);
+        {
+            const fill = try gpa.dupe(u32, rref_starts[0..nodes.len]);
+            defer gpa.free(fill);
+            for (0..nodes.len) |i| for (node_refs.items[ref_starts[i]..ref_starts[i + 1]]) |r| if (reachRef(r.kind)) {
+                rrefs_out[fill[r.value]] = @intCast(i);
+                fill[r.value] += 1;
+            };
+        }
+
         const debug_atoms = try debugAtoms(gpa, debug_files);
         defer gpa.free(debug_atoms);
 
@@ -2269,6 +2329,8 @@ pub const Builder = struct {
             @ptrCast(table),
             @ptrCast(edges),
             @ptrCast(redges),
+            @ptrCast(rref_starts),
+            @ptrCast(rrefs_out),
             @ptrCast(refs),
             @ptrCast(b.inputs.items),
             @ptrCast(b.error_names.items),
