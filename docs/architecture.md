@@ -3019,12 +3019,22 @@ value model:
   not by exported symbol (`__cmptf2` serves `__lttf2`, `fmodq` is exported
   as `fmodf128`).
 - Externs and the link resolve names compiler_rt exports to its functions
-  (`Zcu.compilerRtExport`): the libm ones and, as upstream defines them
-  in every binary, `memcpy`, `memmove`, `memset`, `memcmp`, `bcmp` and
-  `strlen` (the Debug variants, `memcpyFast` and so on), which C objects
-  linked without libc call. The last four live in `lib/compiler_rt.zig`
-  itself, whose key has an empty file part (`compiler_rt::memcmp`, as
-  `Zcu.fileKey` names a module root).
+  (`Zcu.compilerRtExport`): every function upstream's compiler_rt exports
+  for x86_64-linux, from src/compiler_rt_exports.zig, which
+  tools/compiler_rt_exports.py generates by compiling upstream's
+  compiler_rt in Debug and pairing each exported name with the function
+  symbol at its address. That covers what C objects call (soft float such
+  as `__eqtf2` and `__extendhfsf2`, 128-bit division, `__atomic_*`), the
+  libm functions, and, as upstream defines them in every binary,
+  `memcpy`, `memmove`, `memset`, `memcmp`, `bcmp` and `strlen` (the Debug
+  variants, `memcpyFast` and so on). The last four live in
+  `lib/compiler_rt.zig` itself, whose key has an empty file part
+  (`compiler_rt::memcmp`, as `Zcu.fileKey` names a module root). The
+  stack protector's functions are left out: builds with C objects root
+  compiler_rt/ssp.zig, so they are the compilation's own exports.
+  aarch64-macos exports the same set but for three x86 names
+  (`__gnu_h2f_ieee`, `__gnu_f2h_ieee`, `__zig_probe_stack`), which its
+  objects do not call.
 - compiler_rt bodies are analyzed without runtime safety, ignoring
   `@setRuntimeSafety`, because upstream builds compiler_rt in a release mode
   and its code relies on that (for example wrapping `-=` in `fmodq`).

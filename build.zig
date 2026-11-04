@@ -1019,6 +1019,26 @@ fn addLinkInputTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *st
     src_run.addCheck(.{ .expect_stderr_exact = "1 123\n" });
     src_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     test_step.dependOn(&src_run.step);
+    // compiler_rt for C: f128 and f16 conversions, comparisons and
+    // arithmetic, 128-bit division and lock-based atomics, which zap
+    // generates from upstream's compiler_rt (baseline, so that f16 needs
+    // it too).
+    {
+        const rt_c = b.addSystemCommand(&.{ zig, "cc", "-mcpu=baseline", "-Wno-atomic-alignment", "-c" });
+        rt_c.addFileArg(b.path("test/link_input/rt.c"));
+        const rt_o = rt_c.addPrefixedOutputFileArg("-o", "rt.o");
+        const rt_exe = b.addRunArtifact(zap);
+        rt_exe.setName("zap build-exe with a C object calling compiler_rt");
+        rt_exe.addArg("build-exe");
+        rt_exe.addFileArg(b.path("test/link_input/rt_main.zig"));
+        rt_exe.addFileArg(rt_o);
+        rt_exe.setEnvironmentVariable("ZAP_CACHE", "off");
+        const rt_run = std.Build.Step.Run.create(b, "run zap link of a C object calling compiler_rt");
+        rt_run.addFileArg(rt_exe.addPrefixedOutputFileArg("-femit-bin=", "main"));
+        rt_run.addCheck(.{ .expect_stderr_exact = "2.25 1 0 -6 0.375 1024 25 2.5\n" });
+        rt_run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+        test_step.dependOn(&rt_run.step);
+    }
     // A C++ source with -lc++: libc++, libc++abi and libunwind built from
     // the lib directory as upstream builds them, exceptions through C++
     // frames, RTTI, a static constructor and thread_local.
