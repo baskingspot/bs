@@ -435,6 +435,8 @@ pub const MemoryOutput = struct {
 };
 
 const page_size = 0x1000;
+/// An executable's imports' stand-in addresses (see `Link.plt_start`).
+const exe_import_base: u64 = 0xffff_0000_0000_0000;
 
 /// Section header index of each output section. The allocated sections'
 /// headers come in layout order: .rodata, .text, .tdata and .tbss if
@@ -498,7 +500,8 @@ const unset = std.math.maxInt(u32);
 const value_tag = 1 << 31;
 /// Section names. Outputs without debug info keep the prefix up to the
 /// names they use.
-const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00.data.rel.ro\x00.dynsym\x00.dynstr\x00.hash\x00.gnu.hash\x00.rela.dyn\x00.plt\x00.dynamic\x00.got\x00";
+const shstrtab = "\x00.rodata\x00.text\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.eh_frame\x00.eh_frame_hdr\x00.debug_abbrev\x00.debug_info\x00.debug_rnglists\x00.debug_line\x00.debug_str\x00.tdata\x00.tbss\x00__sancov_pcs1\x00__sancov_cntrs\x00.data.rel.ro\x00.dynsym\x00.dynstr\x00.hash\x00.gnu.hash\x00.rela.dyn\x00.plt\x00.dynamic\x00.got\x00.interp\x00.gnu.version\x00.gnu.version_r\x00";
+const shstrtab_no_exe = shstrtab[0..shName(".interp")];
 const shstrtab_no_dyn = shstrtab[0..shName(".dynsym")];
 const shstrtab_no_relro = shstrtab[0..shName(".data.rel.ro")];
 const shstrtab_no_sancov = shstrtab[0..shName("__sancov_pcs1")];
@@ -547,6 +550,20 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     if (numbered) |s| if (options.dynamic) |d| if (s.dynamic_imports.len != d.imports.len or s.dynamic_exports.len != d.exports.len) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
     defer symbols.deinit();
+    const exe_dyn = if (options.dynamic) |d| d.executable() else false;
+    // A dynamic executable's imports are keyed by SymbolKey
+    // (`exe_imports`); numbered links of one are not built yet.
+    if (numbered != null and exe_dyn) return error.InvalidSymbols;
+    const exe_imports: ?[]SymbolKey = if (exe_dyn) try gpa.alloc(SymbolKey, options.dynamic.?.imports.len) else null;
+    defer if (exe_imports) |k| gpa.free(k);
+    if (exe_imports) |keys_out| {
+        for (keys_out, options.dynamic.?.imports) |*k, imp| k.* = imp.key;
+        std.mem.sortUnstable(SymbolKey, keys_out, {}, struct {
+            fn lt(_: void, a: SymbolKey, b: SymbolKey) bool {
+                return @backingInt(a) < @backingInt(b);
+            }
+        }.lt);
+    }
     // With numbered symbols, each number's address or value.
     const addrs = try gpa.alloc(u32, if (numbered) |s| s.len else 0);
     defer gpa.free(addrs);
@@ -579,8 +596,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .n_partitions = n_partitions,
         .n_resolve_tasks = if (numbered == null) n_partitions else n_chunks,
         .numbered = numbered,
-        .pic = options.pic or options.dynamic != null,
+        .pic = options.pic or (options.dynamic != null and !exe_dyn),
         .dynamic = options.dynamic != null,
+        .exe_imports = exe_imports,
         .addrs = addrs,
         .places = places,
         .keys = keys,
@@ -684,7 +702,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     }
 
     // Section placement, as file offsets (for .bss, address - base).
-    const plt_size = n_imports * ElfDynamic.plt_entry_size;
+    // An executable's imports have no PLT stubs or GOT slots: its extern
+    // slots are its GOT.
+    const plt_size = if (exe_dyn) 0 else n_imports * ElfDynamic.plt_entry_size;
     const has_rx = sizes[text] > 0 or plt_size > 0;
     const has_tls = sizes[tdata] > 0 or sizes[tbss] > 0;
     const has_sancov = sizes[cntrs] > 0 or sizes[pcs] > 0;
@@ -693,8 +713,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const has_cfi = n_debug > 0;
     // Which program headers are written, of all the linker writes, in
     // order: PHDR; the R, RX, and RW LOADs; DYNAMIC; TLS; GNU_RELRO;
-    // GNU_EH_FRAME; GNU_STACK.
-    const ph_present = [_]bool{ true, true, has_rx, has_rw, has_dyn, has_tls, has_dyn, has_cfi, true };
+    // GNU_EH_FRAME; GNU_STACK; INTERP comes second.
+    const ph_present = [_]bool{ true, exe_dyn, true, has_rx, has_rw, has_dyn, has_tls, has_dyn, has_cfi, true };
     var phnum: u16 = 0;
     for (ph_present) |p| phnum += @intFromBool(p);
     const headers_end: u64 = @sizeOf(elf.Elf64.Ehdr) + phnum * @sizeOf(elf.Elf64.Phdr);
@@ -706,14 +726,20 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var hash_off: u64 = 0;
     var gnu_hash_off: u64 = 0;
     var rela_off: u64 = 0;
+    var versym_off: u64 = 0;
+    var verneed_off: u64 = 0;
+    const interp_off = headers_end;
+    const interp_size: u64 = if (exe_dyn) dyn_opts.?.interp.?.len + 1 else 0;
     var r_tables_end = headers_end;
     if (dyn) |*t| {
-        n_rela += @intFromBool(has_tls) + n_imports;
-        dynsym_off = std.mem.alignForward(u64, headers_end, 8);
+        if (!exe_dyn) n_rela += @intFromBool(has_tls) + n_imports;
+        dynsym_off = std.mem.alignForward(u64, interp_off + interp_size, 8);
         dynstr_off = dynsym_off + t.dynsymSize();
         hash_off = std.mem.alignForward(u64, dynstr_off + t.dynstr.len, 8);
         gnu_hash_off = std.mem.alignForward(u64, hash_off + t.hash.len, 8);
-        rela_off = std.mem.alignForward(u64, gnu_hash_off + t.gnu_hash.len, 8);
+        versym_off = std.mem.alignForward(u64, gnu_hash_off + t.gnu_hash.len, 2);
+        verneed_off = std.mem.alignForward(u64, versym_off + t.versym.len, 8);
+        rela_off = std.mem.alignForward(u64, verneed_off + t.verneed.len, 8);
         r_tables_end = rela_off + n_rela * @sizeOf(elf.Elf64.Rela);
     }
     var starts: [n_sections]u64 = undefined;
@@ -751,8 +777,8 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var data_floor = relro_end;
     if (dyn) |*t| {
         dynamic_off = std.mem.alignForward(u64, relro_end, 8);
-        got_off = dynamic_off + ElfDynamic.dynamicCount(t) * @sizeOf(elf.Elf64_Dyn);
-        got_size = 16 * @as(u64, @intFromBool(has_tls)) + 8 * n_imports;
+        got_off = dynamic_off + ElfDynamic.dynamicCount(t, dyn_opts.?.*) * @sizeOf(elf.Elf64_Dyn);
+        got_size = if (exe_dyn) 0 else 16 * @as(u64, @intFromBool(has_tls)) + 8 * n_imports;
         data_floor = std.mem.alignForward(u64, got_off + got_size, page_size);
     }
     starts[data] = aligns[data].forward(data_floor);
@@ -792,12 +818,15 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         .start = base + tls_start,
         .end = base + tls_end,
         .tp = base + tls_start + tls_align.forward(tls_end - tls_start),
-        .ld_got = if (has_dyn) base + got_off else if (options.pic) base + tls_start else null,
+        .ld_got = if (has_dyn and !exe_dyn) base + got_off else if (options.pic) base + tls_start else null,
         .object = options.object,
     };
     if (dyn_opts) |d| {
-        l.plt_start = base + plt_off;
-        l.plt_end = l.plt_start + plt_size;
+        // An executable's imports take addresses no atom has, which only
+        // tell them apart (an absolute relocation to one becomes a symbol
+        // relocation; a PC-relative one overflows).
+        l.plt_start = if (exe_dyn) exe_import_base else base + plt_off;
+        l.plt_end = l.plt_start + n_imports * ElfDynamic.plt_entry_size;
         l.rela_off = rela_off;
         // Imports resolve to their PLT stubs; absolute relocations to
         // them become symbol relocations.
@@ -841,9 +870,9 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const symtab_off = std.mem.alignForward(u64, str_off + str_size, 8);
     const strtab_off = symtab_off + @as(u64, n_syms) * @sizeOf(elf.Elf64.Sym);
     const shstrtab_off = strtab_off + strtab_len;
-    const shstr = if (has_dyn) shstrtab else if (has_relro) shstrtab_no_dyn else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
+    const shstr = if (exe_dyn) shstrtab else if (has_dyn) shstrtab_no_exe else if (has_relro) shstrtab_no_dyn else if (has_sancov) shstrtab_no_relro else if (has_tls) shstrtab_no_sancov else if (has_debug) shstrtab_no_tls else if (has_cfi) shstrtab_no_debug else shstrtab_no_cfi;
     const shoff = std.mem.alignForward(u64, shstrtab_off + shstr.len, 8);
-    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + 8 * @as(u16, @intFromBool(has_dyn));
+    const shnum: u16 = 8 + 2 * @as(u16, @intFromBool(has_tls)) + @as(u16, @intFromBool(has_relro)) + 2 * @as(u16, @intFromBool(has_sancov)) + 2 * @as(u16, @intFromBool(has_cfi)) + 5 * @as(u16, @intFromBool(has_debug)) + 8 * @as(u16, @intFromBool(has_dyn)) + 3 * @as(u16, @intFromBool(exe_dyn));
     l.target = try out.target(io, shoff + shnum * @sizeOf(elf.Elf64.Shdr));
     switch (l.target) {
         .memory => |buf| {
@@ -915,15 +944,21 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         try l.put(dynstr_off, t.dynstr);
         try l.put(hash_off, t.hash);
         try l.put(gnu_hash_off, t.gnu_hash);
-        const tail = try a.alloc(elf.Elf64.Rela, @intFromBool(has_tls) + n_imports);
+        if (exe_dyn) {
+            try l.put(interp_off, d.interp.?);
+            try l.fill(interp_off + interp_size - 1, 1);
+            try l.put(versym_off, t.versym);
+            try l.put(verneed_off, t.verneed);
+        }
+        const tail = try a.alloc(elf.Elf64.Rela, if (exe_dyn) 0 else @intFromBool(has_tls) + n_imports);
         var k: usize = 0;
-        if (has_tls) {
+        if (has_tls and !exe_dyn) {
             tail[0] = .{ .offset = base + got_off, .info = .{ .type = @backingInt(elf.R_X86_64.DTPMOD64), .sym = 0 }, .addend = 0 };
             k = 1;
         }
         const slots = got_off + 16 * @as(u64, @intFromBool(has_tls));
         const plt = try a.alloc(u8, plt_size);
-        for (0..n_imports) |i| {
+        for (0..if (exe_dyn) 0 else n_imports) |i| {
             const slot = base + slots + 8 * i;
             tail[k + i] = .{ .offset = slot, .info = .{ .type = @backingInt(elf.R_X86_64.GLOB_DAT), .sym = @intCast(1 + i) }, .addend = 0 };
             const stub = l.plt_start + i * ElfDynamic.plt_entry_size;
@@ -931,14 +966,16 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         }
         try l.put(rela_off + (n_rela - tail.len) * @sizeOf(elf.Elf64.Rela), std.mem.sliceAsBytes(tail));
         try l.put(plt_off, plt);
-        const dynamic = try a.alloc(u8, ElfDynamic.dynamicCount(t) * @sizeOf(elf.Elf64_Dyn));
-        ElfDynamic.writeDynamic(dynamic, t, .{
+        const dynamic = try a.alloc(u8, ElfDynamic.dynamicCount(t, d.*) * @sizeOf(elf.Elf64_Dyn));
+        ElfDynamic.writeDynamic(dynamic, t, d.*, .{
             .dynsym = base + dynsym_off,
             .dynstr = base + dynstr_off,
             .hash = base + hash_off,
             .gnu_hash = base + gnu_hash_off,
             .rela = base + rela_off,
             .rela_size = n_rela * @sizeOf(elf.Elf64.Rela),
+            .versym = base + versym_off,
+            .verneed = base + verneed_off,
         });
         try l.put(dynamic_off, dynamic);
         // The GOT is zeros until the loader fills it.
@@ -968,7 +1005,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     var head: [@sizeOf(elf.Elf64.Ehdr) + ph_present.len * @sizeOf(elf.Elf64.Phdr)]u8 = undefined;
     writeStruct(&head, elf.Elf64.Ehdr{
         .ident = .{ .class = .@"64", .data = .@"2LSB", .version = 1, .osabi = .NONE, .abiversion = 0 },
-        .type = if (has_dyn) .DYN else .EXEC,
+        .type = if (has_dyn and !exe_dyn) .DYN else .EXEC,
         .machine = .X86_64,
         .version = 1,
         .entry = entry_addr.?,
@@ -988,6 +1025,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const ph_size = phnum * @sizeOf(elf.Elf64.Phdr);
     const phdrs = [ph_present.len]struct { elf.PT, elf.PF, u64, u64, u64, u64, u64 }{
         .{ .PHDR, .{ .R = true }, @sizeOf(elf.Elf64.Ehdr), base + @sizeOf(elf.Elf64.Ehdr), ph_size, ph_size, 8 },
+        .{ .INTERP, .{ .R = true }, interp_off, base + interp_off, interp_size, interp_size, 1 },
         .{ .LOAD, .{ .R = true }, 0, base, r_end, r_end, page_size },
         .{ .LOAD, .{ .R = true, .X = true }, rx_start, base + rx_start, text_end - rx_start, text_end - rx_start, page_size },
         .{ .LOAD, .{ .R = true, .W = true }, rw_start, base + rw_start, file_end - rw_start, mem_end - rw_start, page_size },
@@ -1036,7 +1074,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const strtab_ndx = shnum - 2;
     // A shared object's sections go last among the allocated ones, so the
     // others keep their indices (`shndxOf`).
-    const dynsym_ndx: u32 = if (has_dyn) shnum - 3 - 8 else 0;
+    const dynsym_ndx: u32 = if (has_dyn) shnum - 3 - 8 - 3 * @as(u32, @intFromBool(exe_dyn)) else 0;
     const dyn_shdrs = blk: {
         const t = if (dyn) |*t| t else &ElfDynamic.Tables{ .exports = &.{}, .n_imports = 0, .dynstr = "", .names = &.{}, .soname = null, .hash = "", .gnu_hash = "" };
         var h = [_]elf.Elf64.Shdr{
@@ -1061,6 +1099,20 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         h[6].entsize = @sizeOf(elf.Elf64_Dyn);
         break :blk h;
     };
+    // An executable's, after the shared object's.
+    const exe_shdrs = blk: {
+        const t = if (dyn) |*t| t else &ElfDynamic.Tables{ .exports = &.{}, .n_imports = 0, .dynstr = "", .names = &.{}, .soname = null, .hash = "", .gnu_hash = "" };
+        var h = [_]elf.Elf64.Shdr{
+            shdr(shName(".interp"), .PROGBITS, .{ .ALLOC = true }, base, interp_off, interp_size, .@"1"),
+            shdr(shName(".gnu.version"), .GNU_VERSYM, .{ .ALLOC = true }, base, versym_off, t.versym.len, .@"2"),
+            shdr(shName(".gnu.version_r"), .GNU_VERNEED, .{ .ALLOC = true }, base, verneed_off, t.verneed.len, .@"8"),
+        };
+        h[1].link = dynsym_ndx;
+        h[1].entsize = 2;
+        h[2].link = dynsym_ndx + 1;
+        h[2].info = t.verneed_count;
+        break :blk h;
+    };
     const shdrs = [_]elf.Elf64.Shdr{
         std.mem.zeroes(elf.Elf64.Shdr),
         shdr(shName(".rodata"), .PROGBITS, .{ .ALLOC = true }, base, starts[rodata], sizes[rodata], aligns[rodata]),
@@ -1069,14 +1121,14 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
         shdr(shName(".data.rel.ro"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data_rel_ro], sizes[data_rel_ro], aligns[data_rel_ro]),
         shdr(shName(".data"), .PROGBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[data], sizes[data], aligns[data]),
         shdr(shName(".bss"), .NOBITS, .{ .ALLOC = true, .WRITE = true }, base, starts[bss], sizes[bss], aligns[bss]),
-    } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ dyn_shdrs ++ [_]elf.Elf64.Shdr{
+    } ++ sancov_shdrs ++ cfi_shdrs ++ debug_shdrs ++ dyn_shdrs ++ exe_shdrs ++ [_]elf.Elf64.Shdr{
         .{ .name = shName(".symtab"), .type = .SYMTAB, .flags = .{ .shf = .{} }, .addr = 0, .offset = symtab_off, .size = n_syms * @sizeOf(elf.Elf64.Sym), .link = strtab_ndx, .info = n_syms, .addralign = 8, .entsize = @sizeOf(elf.Elf64.Sym) },
         nonAlloc(shName(".strtab"), .STRTAB, strtab_off, strtab_len),
         nonAlloc(shName(".shstrtab"), .STRTAB, shstrtab_off, shstr.len),
     };
     var sh_buf: [shdrs.len * @sizeOf(elf.Elf64.Shdr)]u8 = undefined;
     var sh_at: usize = 0;
-    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ has_dyn, dyn_shdrs.len }, .{ true, 3 } };
+    const present = [_]struct { bool, usize }{ .{ true, 3 }, .{ has_tls, tls_shdrs.len }, .{ has_relro, 1 }, .{ true, 2 }, .{ has_sancov, sancov_shdrs.len }, .{ has_cfi, cfi_shdrs.len }, .{ has_debug, debug_shdrs.len }, .{ has_dyn, dyn_shdrs.len }, .{ exe_dyn, exe_shdrs.len }, .{ true, 3 } };
     var group: usize = 0;
     var group_end: usize = present[0][1];
     for (shdrs, 0..) |s, i| {
@@ -1139,6 +1191,11 @@ fn LinkOf(comptime Input: type) type {
         pic: bool,
         /// Whether `Options.dynamic` is set.
         dynamic: bool,
+        /// A dynamically linked executable's imports' keys, sorted
+        /// (`ElfDynamic.Options.executable`), else null: only absolute
+        /// relocations to them get .rela.dyn records, and only .rodata
+        /// atoms with such relocations go to .data.rel.ro.
+        exe_imports: ?[]const SymbolKey = null,
         /// In a shared object: the PLT stubs' addresses, one per import in
         /// .dynsym order after the null symbol, which imports resolve to;
         /// and .rela.dyn's file offset.
@@ -1368,7 +1425,7 @@ fn LinkOf(comptime Input: type) type {
                     l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name });
                     continue;
                 }
-                const s = if (pic and a.section == .rodata and hasAbs(a)) data_rel_ro else @backingInt(a.section);
+                const s = if (a.section == .rodata and ((pic and hasAbs(a)) or (dynamic and l.hasImportAbs(a)))) data_rel_ro else @backingInt(a.section);
                 const off = a.alignment.forward(c.sizes[s]);
                 p.* = .{
                     .offset = std.math.cast(u38, off) orelse {
@@ -1387,9 +1444,35 @@ fn LinkOf(comptime Input: type) type {
                 if (a.name.len > 0) c.str_len += @intCast(a.name.len + 1);
                 c.max_targets = @max(c.max_targets, @as(u32, @intCast(a.targets.len)));
                 if (dynamic) {
-                    for (a.relocs) |r| c.n_rela += @intFromBool(r.info.kind == .x86_64_abs64);
+                    for (a.relocs) |r| c.n_rela += @intFromBool(l.needsDynamicReloc(a, r));
                 }
             }
+        }
+
+        /// Whether absolute relocation `r` of `a` needs the loader: in a
+        /// shared object every one, in an executable those to imports.
+        fn needsDynamicReloc(l: *const Link, a: *const Atom, r: Atom.Reloc) bool {
+            if (r.info.kind != .x86_64_abs64) return false;
+            const imports = l.exe_imports orelse return true;
+            return isImport(imports, a.targets[r.info.target]);
+        }
+
+        /// In an executable, whether `a` holds an absolute address of an
+        /// import, which the loader writes.
+        fn hasImportAbs(l: *const Link, a: *const Atom) bool {
+            const imports = l.exe_imports orelse return false;
+            for (a.relocs) |r| {
+                if (r.info.kind == .x86_64_abs64 and isImport(imports, a.targets[r.info.target])) return true;
+            }
+            return false;
+        }
+
+        fn isImport(imports: []const SymbolKey, key: SymbolKey) bool {
+            return std.sort.binarySearch(SymbolKey, imports, key, struct {
+                fn order(k: SymbolKey, item: SymbolKey) std.math.Order {
+                    return std.math.order(@backingInt(k), @backingInt(item));
+                }
+            }.order) != null;
         }
 
         fn resolveAddrsAndLayOutDebug(l: *Link, task: usize, thread: usize) void {
@@ -1604,7 +1687,7 @@ fn LinkOf(comptime Input: type) type {
                     var diag: Diagnostic = .{};
                     applyRelocs(a, dst, addr, res, &l.tls, &diag) catch |err| return l.fail(chunk, i, err, diag);
                     if (dynamic) for (a.relocs) |r| {
-                        if (r.info.kind != .x86_64_abs64) continue;
+                        if (!l.needsDynamicReloc(a, r)) continue;
                         // Code must not need the loader to write it.
                         if (place.section == @backingInt(Atom.Section.text)) return l.fail(chunk, i, error.InvalidRelocation, .{ .atom = a.name, .target = a.targets[r.info.target] });
                         const t = res[r.info.target];

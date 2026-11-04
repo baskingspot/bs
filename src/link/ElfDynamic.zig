@@ -40,6 +40,11 @@ pub const Import = struct {
     hidden: bool = false,
     /// A thread-local (STT_TLS). Only objects import thread-locals.
     tls: bool = false,
+    /// In an executable: the symbol version the import binds to
+    /// (`GLIBC_2.2.5`), or null for none, and the index in
+    /// `Options.needed` of the library that defines it.
+    version: ?[]const u8 = null,
+    library: u32 = 0,
 };
 
 /// What makes an image a shared object.
@@ -48,6 +53,18 @@ pub const Options = struct {
     imports: []const Import = &.{},
     /// DT_SONAME, or null for none.
     soname: ?[]const u8 = null,
+    /// A dynamically linked executable (ET_EXEC) rather than a shared
+    /// object: PT_INTERP names `interp`, each of `needed` gets a
+    /// DT_NEEDED, imports carry versions (.gnu.version, .gnu.version_r),
+    /// and the image is not position-independent. Its extern slots are
+    /// its GOT, so imports get neither PLT stubs nor GOT slots: only an
+    /// absolute relocation to an import needs the loader.
+    interp: ?[]const u8 = null,
+    needed: []const []const u8 = &.{},
+
+    pub fn executable(o: *const Options) bool {
+        return o.interp != null;
+    }
 };
 
 /// The key of `_DYNAMIC`, the address of .dynamic, which the linker
@@ -68,6 +85,12 @@ pub const Tables = struct {
     soname: ?u32,
     hash: []const u8,
     gnu_hash: []const u8,
+    /// An executable's: the offset in `dynstr` of each needed library, and
+    /// .gnu.version and .gnu.version_r (empty without versioned imports).
+    needed: []const u32 = &.{},
+    versym: []const u8 = &.{},
+    verneed: []const u8 = &.{},
+    verneed_count: u32 = 0,
 
     pub fn symbolCount(t: *const Tables) u32 {
         return 1 + t.n_imports + @as(u32, @intCast(t.exports.len));
@@ -111,6 +134,12 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
     if (o.soname) |s| {
         soname = @intCast(dynstr.items.len);
         try dynstr.appendSlice(arena, s);
+        try dynstr.append(arena, 0);
+    }
+    const needed = try arena.alloc(u32, o.needed.len);
+    for (needed, o.needed) |*off, lib| {
+        off.* = @intCast(dynstr.items.len);
+        try dynstr.appendSlice(arena, lib);
         try dynstr.append(arena, 0);
     }
     const names = try arena.alloc(u32, n_syms - 1);
@@ -162,7 +191,73 @@ pub fn tables(arena: Allocator, o: Options) Allocator.Error!Tables {
         gnu_chain[k] = (h & ~@as(u32, 1)) | @intFromBool(last);
     }
 
+    // .gnu.version: one index per .dynsym entry (0 local, 1 global, 2.. a
+    // version needed); .gnu.version_r: per library with versioned imports,
+    // a Verneed and a Vernaux per version, indices in that order.
+    var versym: []u16 = &.{};
+    var verneed: std.ArrayList(u8) = .empty;
+    var verneed_count: u32 = 0;
+    const versioned = for (o.imports) |imp| {
+        if (imp.version != null) break true;
+    } else false;
+    if (versioned) {
+        versym = try arena.alloc(u16, n_syms);
+        @memset(versym, 1);
+        versym[0] = 0;
+        var next_index: u16 = 2;
+        var prev_need_at: usize = 0;
+        for (o.needed, needed, 0..) |_, file, lib| {
+            var versions: std.ArrayList([]const u8) = .empty;
+            for (o.imports, 1..) |imp, k| {
+                const v = imp.version orelse continue;
+                if (imp.library != lib) continue;
+                const vi = for (versions.items, 0..) |seen, j| {
+                    if (std.mem.eql(u8, seen, v)) break j;
+                } else blk: {
+                    try versions.append(arena, v);
+                    break :blk versions.items.len - 1;
+                };
+                versym[k] = next_index + @as(u16, @intCast(vi));
+            }
+            if (versions.items.len == 0) continue;
+            const need_at = verneed.items.len;
+            const need: elf.Verneed = .{
+                .version = 1,
+                .cnt = @intCast(versions.items.len),
+                .file = file,
+                .aux = @sizeOf(elf.Verneed),
+                .next = 0,
+            };
+            try verneed.appendSlice(arena, std.mem.asBytes(&need));
+            for (versions.items, 0..) |v, j| {
+                const name: u32 = @intCast(dynstr.items.len);
+                try dynstr.appendSlice(arena, v);
+                try dynstr.append(arena, 0);
+                const aux: elf.Vernaux = .{
+                    .hash = sysvHash(v),
+                    .flags = 0,
+                    .other = next_index + @as(u16, @intCast(j)),
+                    .name = name,
+                    .next = if (j + 1 < versions.items.len) @sizeOf(elf.Vernaux) else 0,
+                };
+                try verneed.appendSlice(arena, std.mem.asBytes(&aux));
+            }
+            next_index += @intCast(versions.items.len);
+            // Link the previous Verneed to this one.
+            if (verneed_count > 0) {
+                const prev_next: *align(1) u32 = @ptrCast(verneed.items[prev_need_at + @offsetOf(elf.Verneed, "next") ..][0..4]);
+                prev_next.* = @intCast(need_at - prev_need_at);
+            }
+            prev_need_at = need_at;
+            verneed_count += 1;
+        }
+    }
+
     return .{
+        .needed = needed,
+        .versym = std.mem.sliceAsBytes(versym),
+        .verneed = verneed.items,
+        .verneed_count = verneed_count,
         .exports = exports.items,
         .n_imports = n_imports,
         .dynstr = dynstr.items,
@@ -222,20 +317,33 @@ pub const Addresses = struct {
     gnu_hash: u64,
     rela: u64,
     rela_size: u64,
+    versym: u64 = 0,
+    verneed: u64 = 0,
 };
 
 /// The number of .dynamic entries `writeDynamic` writes.
-pub fn dynamicCount(t: *const Tables) u64 {
-    return 12 + @as(u64, @intFromBool(t.soname != null));
+pub fn dynamicCount(t: *const Tables, o: Options) u64 {
+    const exe: u64 = if (o.executable()) 1 + 3 * @as(u64, @intFromBool(t.verneed_count > 0)) else 0;
+    return 12 + @as(u64, @intFromBool(t.soname != null)) + t.needed.len + exe;
 }
 
-pub fn writeDynamic(out: []u8, t: *const Tables, a: Addresses) void {
-    var entries: [13]elf.Elf64_Dyn = undefined;
+/// The size of the largest .dynamic `writeDynamic` writes without
+/// libraries.
+const max_fixed_entries = 17;
+
+pub fn writeDynamic(out: []u8, t: *const Tables, o: Options, a: Addresses) void {
+    var at: usize = 0;
+    const put = struct {
+        fn f(buf: []u8, pos: *usize, tag: i64, val: u64) void {
+            const e: elf.Elf64_Dyn = .{ .d_tag = tag, .d_val = val };
+            @memcpy(buf[pos.*..][0..@sizeOf(elf.Elf64_Dyn)], std.mem.asBytes(&e));
+            pos.* += @sizeOf(elf.Elf64_Dyn);
+        }
+    }.f;
+    for (t.needed) |lib| put(out, &at, elf.DT_NEEDED, lib);
+    if (t.soname) |s| put(out, &at, elf.DT_SONAME, s);
+    var fixed: [max_fixed_entries]struct { i64, u64 } = undefined;
     var n: usize = 0;
-    if (t.soname) |s| {
-        entries[n] = .{ .d_tag = elf.DT_SONAME, .d_val = s };
-        n += 1;
-    }
     for ([_]struct { i64, u64 }{
         .{ elf.DT_HASH, a.hash },
         .{ elf.DT_GNU_HASH, a.gnu_hash },
@@ -246,15 +354,23 @@ pub fn writeDynamic(out: []u8, t: *const Tables, a: Addresses) void {
         .{ elf.DT_RELA, a.rela },
         .{ elf.DT_RELASZ, a.rela_size },
         .{ elf.DT_RELAENT, @sizeOf(elf.Elf64.Rela) },
-        .{ elf.DT_FLAGS, elf.DF_BIND_NOW },
-        .{ elf.DT_FLAGS_1, elf.DF_1_NOW },
-        .{ elf.DT_NULL, 0 },
     }) |e| {
-        entries[n] = .{ .d_tag = e[0], .d_val = e[1] };
+        fixed[n] = e;
         n += 1;
     }
-    std.debug.assert(n == dynamicCount(t));
-    @memcpy(out[0 .. n * @sizeOf(elf.Elf64_Dyn)], std.mem.sliceAsBytes(entries[0..n]));
+    if (o.executable()) {
+        if (t.verneed_count > 0) {
+            fixed[n..][0..3].* = .{ .{ elf.DT_VERSYM, a.versym }, .{ elf.DT_VERNEED, a.verneed }, .{ elf.DT_VERNEEDNUM, t.verneed_count } };
+            n += 3;
+        }
+        // Where the loader publishes `r_debug` for debuggers.
+        fixed[n] = .{ elf.DT_DEBUG, 0 };
+        n += 1;
+    }
+    fixed[n..][0..3].* = .{ .{ elf.DT_FLAGS, elf.DF_BIND_NOW }, .{ elf.DT_FLAGS_1, elf.DF_1_NOW }, .{ elf.DT_NULL, 0 } };
+    n += 3;
+    for (fixed[0..n]) |e| put(out, &at, e[0], e[1]);
+    std.debug.assert(at == dynamicCount(t, o) * @sizeOf(elf.Elf64_Dyn));
 }
 
 /// The GNU hash of `name` (DJB).

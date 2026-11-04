@@ -1,0 +1,234 @@
+//! glibc's dynamic symbols for one target version, read from the zig lib
+//! directory's `libc/glibc/abilists`, the data upstream generates its glibc
+//! stub libraries from. A dynamically linked executable's imports resolve
+//! against it instead of against `libc.so` files (see "C interop" in
+//! docs/architecture.md).
+//!
+//! The format and the choice of each symbol's version follow upstream's
+//! `src/libs/glibc.zig` (`loadMetaData`, `buildSharedObjects`).
+//! Copyright (c) Zig contributors. MIT licensed (see upstream/LICENSE).
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Version = std.SemanticVersion;
+const Glibc = @This();
+
+pub const Lib = struct {
+    name: []const u8,
+    soname: []const u8,
+    removed_in: ?Version = null,
+};
+
+/// abilists' libraries, in its order, which is upstream's link order: a
+/// name defined by several resolves to the first.
+pub const libs = [_]Lib{
+    .{ .name = "m", .soname = "libm.so.6" },
+    .{ .name = "c", .soname = "libc.so.6" },
+    .{ .name = "ld", .soname = "ld-linux-x86-64.so.2" },
+    .{ .name = "resolv", .soname = "libresolv.so.2" },
+    .{ .name = "pthread", .soname = "libpthread.so.0", .removed_in = .{ .major = 2, .minor = 34, .patch = 0 } },
+    .{ .name = "dl", .soname = "libdl.so.2", .removed_in = .{ .major = 2, .minor = 34, .patch = 0 } },
+    .{ .name = "rt", .soname = "librt.so.1", .removed_in = .{ .major = 2, .minor = 34, .patch = 0 } },
+    .{ .name = "util", .soname = "libutil.so.1", .removed_in = .{ .major = 2, .minor = 34, .patch = 0 } },
+};
+
+pub const lib_c: u8 = 1;
+pub const lib_ld: u8 = 2;
+
+pub const abilists_path = "libc/glibc/abilists";
+pub const interp = "/lib64/ld-linux-x86-64.so.2";
+
+/// A symbol as a reference binds to it at link time: its library and its
+/// default version at the target version (the newest one at or below it).
+pub const Symbol = struct {
+    lib: u8,
+    /// Index into `versions`.
+    version: u8,
+    object: bool,
+    /// Size in bytes, for objects.
+    size: u16,
+};
+
+arena: std.heap.ArenaAllocator,
+versions: []const Version,
+symbols: std.StringHashMapUnmanaged(Symbol),
+
+pub const Error = error{ OutOfMemory, InvalidAbilists, UnsupportedVersion };
+
+/// The newest version abilists lists, which a newer target links against.
+pub fn newest(g: *const Glibc) Version {
+    return g.versions[g.versions.len - 1];
+}
+
+/// Reads `contents` (abilists) for x86_64-linux-gnu at glibc `target`.
+pub fn load(gpa: Allocator, contents: []const u8, target: Version) Error!Glibc {
+    var g: Glibc = .{ .arena = .init(gpa), .versions = &.{}, .symbols = .empty };
+    errdefer g.arena.deinit();
+    const arena = g.arena.allocator();
+    var r: Reader = .{ .bytes = contents };
+
+    const n_libs = try r.byte();
+    for (0..n_libs) |i| {
+        const name = try r.string();
+        if (i >= libs.len or !std.mem.eql(u8, libs[i].name, name)) return error.InvalidAbilists;
+    }
+    const versions = try arena.alloc(Version, try r.byte());
+    for (versions) |*v| v.* = .{ .major = try r.byte(), .minor = try r.byte(), .patch = try r.byte() };
+    g.versions = versions;
+    // A target newer than the newest version abilists lists links against
+    // that one, as upstream (which warns; `newest` lets the caller).
+    if (versions.len == 0) return error.InvalidAbilists;
+    const target_ver: u8 = for (versions, 0..) |v, i| {
+        switch (v.order(target)) {
+            .eq => break @intCast(i),
+            .lt => continue,
+            .gt => return error.UnsupportedVersion,
+        }
+    } else @intCast(versions.len - 1);
+    const n_targets = try r.byte();
+    var target_index: ?u6 = null;
+    for (0..n_targets) |i| {
+        if (std.mem.eql(u8, try r.string(), "x86_64-linux-gnu")) target_index = @intCast(i);
+    }
+    const ti = target_index orelse return error.InvalidAbilists;
+
+    // Functions, then objects. A name's inclusions are consecutive; the
+    // last has the terminal bit. A library removed at or before the target
+    // version provides nothing.
+    var lib_ok: [libs.len]bool = undefined;
+    for (&lib_ok, libs) |*ok, lib| ok.* = if (lib.removed_in) |rem| target.order(rem) == .lt else true;
+    for ([_]bool{ false, true }) |object| {
+        const n = try r.int(u16);
+        var best: ?Symbol = null;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const name = try r.string();
+            while (true) {
+                const targets = try r.leb(u64);
+                const size: u16 = if (object) std.math.cast(u16, try r.leb(u64)) orelse return error.InvalidAbilists else 0;
+                var lib = try r.byte();
+                const terminal = lib & 0x80 != 0;
+                lib &= 0x7f;
+                if (lib >= libs.len) return error.InvalidAbilists;
+                const applies = lib_ok[lib] and targets & (@as(u64, 1) << ti) != 0;
+                while (true) {
+                    const b = try r.byte();
+                    const ver: u8 = b & 0x7f;
+                    // The earliest library in link order, then its newest
+                    // version not past the target.
+                    if (applies and ver <= target_ver) {
+                        if (best == null or lib < best.?.lib or (lib == best.?.lib and ver > best.?.version))
+                            best = .{ .lib = lib, .version = ver, .object = object, .size = size };
+                    }
+                    if (b & 0x80 != 0) break;
+                }
+                if (terminal) break;
+                i += 1;
+                if (i >= n) return error.InvalidAbilists;
+            }
+            if (best) |b| try g.symbols.put(arena, try arena.dupe(u8, name), b);
+            best = null;
+        }
+    }
+    return g;
+}
+
+pub fn deinit(g: *Glibc) void {
+    g.arena.deinit();
+}
+
+pub fn get(g: *const Glibc, name: []const u8) ?Symbol {
+    return g.symbols.get(name);
+}
+
+/// `GLIBC_2.2.5`, `GLIBC_2.34`.
+pub fn versionName(g: *const Glibc, arena: Allocator, index: u8) Allocator.Error![]const u8 {
+    const v = g.versions[index];
+    return if (v.patch == 0)
+        std.fmt.allocPrint(arena, "GLIBC_{d}.{d}", .{ v.major, v.minor })
+    else
+        std.fmt.allocPrint(arena, "GLIBC_{d}.{d}.{d}", .{ v.major, v.minor, v.patch });
+}
+
+const Reader = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    fn byte(r: *Reader) Error!u8 {
+        if (r.pos >= r.bytes.len) return error.InvalidAbilists;
+        r.pos += 1;
+        return r.bytes[r.pos - 1];
+    }
+
+    fn int(r: *Reader, comptime T: type) Error!T {
+        if (r.pos + @sizeOf(T) > r.bytes.len) return error.InvalidAbilists;
+        defer r.pos += @sizeOf(T);
+        return std.mem.readInt(T, r.bytes[r.pos..][0..@sizeOf(T)], .little);
+    }
+
+    fn string(r: *Reader) Error![]const u8 {
+        const end = std.mem.indexOfScalarPos(u8, r.bytes, r.pos, 0) orelse return error.InvalidAbilists;
+        defer r.pos = end + 1;
+        return r.bytes[r.pos..end];
+    }
+
+    fn leb(r: *Reader, comptime T: type) Error!T {
+        var result: T = 0;
+        var shift: u7 = 0;
+        while (true) {
+            const b = try r.byte();
+            if (shift >= @bitSizeOf(T)) return error.InvalidAbilists;
+            result |= @as(T, b & 0x7f) << @intCast(shift);
+            if (b & 0x80 == 0) return result;
+            shift += 7;
+        }
+    }
+};
+
+test load {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const build_options = @import("build_options");
+    const path = try std.fs.path.join(gpa, &.{ build_options.zig_lib_dir, abilists_path });
+    defer gpa.free(path);
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+    defer gpa.free(contents);
+
+    // As upstream's stubs bind them (readelf -V of `zig build-exe -lc
+    // -target x86_64-linux-gnu.<v>`).
+    var g231 = try load(gpa, contents, .{ .major = 2, .minor = 31, .patch = 0 });
+    defer g231.deinit();
+    var g236 = try load(gpa, contents, .{ .major = 2, .minor = 36, .patch = 0 });
+    defer g236.deinit();
+    var buf: [1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const expect = struct {
+        fn f(g: *const Glibc, a: Allocator, name: []const u8, lib: []const u8, version: []const u8) !void {
+            const s = g.get(name) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(lib, libs[s.lib].soname);
+            try std.testing.expectEqualStrings(version, try g.versionName(a, s.version));
+        }
+    }.f;
+    // memcpy has 2.2.5 and 2.14; the default is the newest.
+    try expect(&g231, fba.allocator(), "memcpy", "libc.so.6", "GLIBC_2.14");
+    // __libc_start_main gained 2.34, which a 2.31 target must not take.
+    try expect(&g231, fba.allocator(), "__libc_start_main", "libc.so.6", "GLIBC_2.2.5");
+    try expect(&g236, fba.allocator(), "__libc_start_main", "libc.so.6", "GLIBC_2.34");
+    // In libpthread before 2.34, in libc after.
+    try expect(&g231, fba.allocator(), "pthread_key_create", "libpthread.so.0", "GLIBC_2.2.5");
+    try expect(&g236, fba.allocator(), "pthread_key_create", "libc.so.6", "GLIBC_2.34");
+    try expect(&g236, fba.allocator(), "__tls_get_addr", "ld-linux-x86-64.so.2", "GLIBC_2.3");
+    try expect(&g236, fba.allocator(), "sin", "libm.so.6", "GLIBC_2.2.5");
+    const environ = g236.get("environ").?;
+    try std.testing.expect(environ.object and environ.size == 8);
+    try std.testing.expectEqual(null, g236.get("not_a_glibc_symbol"));
+    // Added in 2.32.
+    try std.testing.expect(g231.get("pthread_attr_setsigmask_np") == null);
+    try std.testing.expect(g236.get("pthread_attr_setsigmask_np") != null);
+    // Newer than abilists' newest: that one, as upstream.
+    var g99 = try load(gpa, contents, .{ .major = 2, .minor = 99, .patch = 0 });
+    defer g99.deinit();
+    try std.testing.expect(g99.newest().order(.{ .major = 2, .minor = 99, .patch = 0 }) == .lt);
+    try expect(&g99, fba.allocator(), "__libc_start_main", "libc.so.6", "GLIBC_2.34");
+    try std.testing.expectError(error.UnsupportedVersion, load(gpa, contents, .{ .major = 2, .minor = 0, .patch = 5 }));
+}
