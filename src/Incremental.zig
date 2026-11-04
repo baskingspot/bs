@@ -42,6 +42,7 @@ const ElfMerge = @import("link/ElfMerge.zig");
 const ElfInput = @import("link/ElfInput.zig");
 const ElfShared = @import("link/ElfShared.zig");
 const Replay = @import("Replay.zig");
+const build_options = @import("build_options");
 
 const Incremental = @This();
 
@@ -73,6 +74,10 @@ build_start: Io.Timestamp,
 /// The last successful build's manifest, if any; for a first build, the
 /// donor's (`useDonor`).
 prev: ?Manifest = null,
+/// The compilation's zig lib directory, resolved as the inputs' paths are,
+/// if it is bs's own (`trustedLib`): the check for changed inputs does not
+/// stat its files.
+trusted_lib: ?[:0]const u8 = null,
 /// What a donor's compilation must share with this one besides inputs
 /// (`donorKey`).
 donor_key: Hash,
@@ -185,12 +190,38 @@ pub fn open(gpa: Allocator, io: Io, dirs: Frontend.CacheDirs, args: []const []co
         .build_start = build_start,
         .timing = timing,
         .local_is_global = local_is_global,
+        .trusted_lib = try trustedLib(gpa, io, zig_lib_dir),
     };
     inc.prev = Manifest.open(gpa, io, dir) catch |err| prev: {
         if (timing) std.debug.print("cache: unable to open the manifest: {t}\n", .{err});
         break :prev null;
     };
     return inc;
+}
+
+/// `zig_lib_dir` resolved, if it is bs's own: the pinned release's, which
+/// bs owns and its users do not edit, so that a no-change build does not
+/// stat the hundreds of std and compiler_rt files it reads (the build
+/// runner's stamp trusts it the same way, BuildRunner.zig). Edit builds
+/// still notice a changed file there: the frontend hashes what it loads.
+/// Any other lib directory (`--zig-lib-dir`, ZIG_LIB_DIR) may be a source
+/// tree under edit and is checked in full.
+fn trustedLib(gpa: Allocator, io: Io, zig_lib_dir: []const u8) !?[:0]const u8 {
+    const lib = Io.Dir.cwd().realPathFileAlloc(io, zig_lib_dir, gpa) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => return null,
+    };
+    errdefer gpa.free(lib);
+    const pinned = Io.Dir.cwd().realPathFileAlloc(io, build_options.zig_lib_dir, gpa) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => null,
+    };
+    defer if (pinned) |p| gpa.free(p);
+    if (pinned == null or !std.mem.eql(u8, lib, pinned.?)) {
+        gpa.free(lib);
+        return null;
+    }
+    return lib;
 }
 
 /// The store seed (the compiler's identity and the target) and the key of
@@ -241,6 +272,7 @@ pub fn close(inc: *Incremental) void {
     inc.maintainGlobal();
     if (inc.replay) |r| r.destroy();
     if (inc.prev) |*m| m.close(inc.gpa, inc.io);
+    if (inc.trusted_lib) |p| inc.gpa.free(p);
     inc.global.close(inc.io);
     inc.local.close(inc.io);
     inc.lock.close(inc.io);
@@ -290,7 +322,7 @@ pub fn relinkIfUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u
     }
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(gpa);
-    try m.changedInputs(gpa, io, &changed);
+    try m.changedInputs(gpa, io, inc.trusted_lib, &changed);
     // Inputs whose stats changed but whose contents did not (touched,
     // checked out again, or too new to trust when recorded) get their new
     // stats in the manifest's log after the relink.
@@ -381,7 +413,7 @@ pub fn onlyLinkInputsMayChange(inc: *const Incremental) !bool {
     if (inc.donor != null or inc.verify == .full or m.output != inc.output or inc.output != .exe) return false;
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(inc.gpa);
-    try m.changedInputs(inc.gpa, inc.io, &changed);
+    try m.changedInputs(inc.gpa, inc.io, inc.trusted_lib, &changed);
     for (changed.items) |i| if (!inc.isLinkObject(m.inputKey(i)) and !try inc.sameContents(m, i)) return false;
     return true;
 }
@@ -404,7 +436,7 @@ fn sameContents(inc: *const Incremental, m: *const Manifest, i: u32) !bool {
 fn linkInputsChanged(inc: *const Incremental, m: *const Manifest) !bool {
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(inc.gpa);
-    try m.changedInputs(inc.gpa, inc.io, &changed);
+    try m.changedInputs(inc.gpa, inc.io, inc.trusted_lib, &changed);
     for (changed.items) |i| if (isLinkInput(m.inputKey(i)) and !try inc.sameContents(m, i)) return true;
     return false;
 }
@@ -4658,7 +4690,7 @@ fn verifyNodes(inc: *Incremental, r: *const Recorder, b: *const Manifest.Builder
     {
         var changed: std.ArrayList(u32) = .empty;
         defer changed.deinit(gpa);
-        try m.changedInputs(gpa, inc.io, &changed);
+        try m.changedInputs(gpa, inc.io, null, &changed);
         for (changed.items) |i| {
             if (try inc.sameContents(m, i)) continue;
             _, const path = m.input(i);

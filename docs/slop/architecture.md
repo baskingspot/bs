@@ -4219,6 +4219,14 @@ it and can flush every CPU's TLB.
   numbered symbols, entry, and error codes. Frontend, Sema, and CodeGen do not run. A
   conformance unit loading 562 files (std in test mode): 0.64–0.9 ms in
   bs (0.4–0.6 of it the stats), 2 ms wall, against 14–19 ms for a full build.
+  Inputs in bs's own lib directory (`Incremental.trusted_lib`: the
+  compilation's `zig_lib_dir` resolves to the pinned release's, the one
+  bs was built with) are not statted: that is the trust the build
+  runner's stamp and `main.prefixInputs` place in it, and it saves a
+  cached compile step of libvaxis's example 700 of its 860 stats. Edit builds
+  still see a changed file there (Replay compares the frontend's content
+  hashes, and its check of unloaded inputs stats every one); any other
+  lib directory is checked in full.
   The generated 24.5k-atom program below relinks in 5.2–7.6 ms (5.3 ms
   steady), against 7.4–9.5 (7.9 steady) when it decoded first.
   If the output still has the inode, size, and mtime the last link left

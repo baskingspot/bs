@@ -128,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
         var m = (try Manifest.open(gpa, io, dir)).?;
         const t2 = now(io);
         changed.clearRetainingCapacity();
-        try m.changedInputs(gpa, io, &changed);
+        try m.changedInputs(gpa, io, null, &changed);
         const t3 = now(io);
         if (changed.items.len != 0) @panic("inputs changed");
         m.close(gpa, io);

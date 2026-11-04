@@ -1356,10 +1356,13 @@ pub fn errorName(m: *const Manifest, code: u32) []const u8 {
 
 /// Stats every input and appends the indices of those that changed, or no
 /// longer exist, to `changed`. Paths are absolute or relative to the
-/// working directory, as recorded.
-pub fn changedInputs(m: *const Manifest, gpa: Allocator, io: Io, changed: *std.ArrayList(u32)) !void {
+/// working directory, as recorded. Inputs in directory `skip` (a resolved
+/// path, as the inputs' are), which the caller trusts not to change, are
+/// not statted.
+pub fn changedInputs(m: *const Manifest, gpa: Allocator, io: Io, skip: ?[]const u8, changed: *std.ArrayList(u32)) !void {
     for (0..m.inputCount()) |i| {
         const in, const path = m.input(@intCast(i));
+        if (skip) |dir| if (path.len > dir.len and path[dir.len] == '/' and std.mem.startsWith(u8, path, dir)) continue;
         const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
                 try changed.append(gpa, @intCast(i));
@@ -2555,10 +2558,17 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
     }
     var changed: std.ArrayList(u32) = .empty;
     defer changed.deinit(gpa);
-    try m.changedInputs(gpa, io, &changed);
+    try m.changedInputs(gpa, io, null, &changed);
     try t.expectEqual(0, changed.items.len);
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "aa" });
-    try m.changedInputs(gpa, io, &changed);
+    try m.changedInputs(gpa, io, null, &changed);
+    try t.expectEqualSlices(u32, &.{0}, changed.items);
+    // A trusted directory's inputs are not checked; a sibling whose name
+    // starts the same is not that directory.
+    changed.clearRetainingCapacity();
+    try m.changedInputs(gpa, io, base_path, &changed);
+    try t.expectEqual(0, changed.items.len);
+    try m.changedInputs(gpa, io, base_path[0 .. base_path.len - 1], &changed);
     try t.expectEqualSlices(u32, &.{0}, changed.items);
 
     // Two edit builds go to the log: node 2 now depends on node 3 only and

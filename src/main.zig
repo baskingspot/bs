@@ -1542,6 +1542,9 @@ pub fn prefixInputs(arena: std.mem.Allocator, io: Io, inputs: []const u8, job: s
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, inputs, 0);
     while (it.next()) |raw| {
+        // Most inputs are the lib directory's, as the build read them:
+        // absolute already, so left out before resolving each.
+        if (trusted_lib and raw.len > roots.items[0].path.len and std.mem.startsWith(u8, raw, roots.items[0].path) and raw[roots.items[0].path.len] == '/') continue;
         const abs = try std.fs.path.resolve(arena, &.{ cwd, raw });
         for (roots.items) |r| {
             if (abs.len > r.path.len and std.mem.startsWith(u8, abs, r.path) and abs[r.path.len] == '/') {
