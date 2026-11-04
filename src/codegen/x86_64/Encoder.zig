@@ -32,6 +32,9 @@ shorten: bool = false,
 /// With `shorten`: `jmp` and `jcc` instructions to labels, by offset,
 /// candidates for the short form.
 branches: std.ArrayList(struct { at: u32, label: Label }) = .empty,
+/// With `shorten`: the rel32 fields of `leaLabel`s, which shortening
+/// patches again.
+label_addrs: std.ArrayList(struct { at: u32, label: Label }) = .empty,
 /// After `finish` shortened branches: per branch, the bytes saved by the
 /// branches before it (one more entry for the total), for `mapOffset`.
 saved: std.ArrayList(u32) = .empty,
@@ -180,6 +183,7 @@ pub fn deinit(e: *Encoder) void {
     e.label_branches.deinit(e.gpa);
     e.fixups.deinit(e.gpa);
     e.branches.deinit(e.gpa);
+    e.label_addrs.deinit(e.gpa);
     e.saved.deinit(e.gpa);
     e.line_events.deinit(e.gpa);
 }
@@ -291,6 +295,7 @@ fn shortenBranches(e: *Encoder) Allocator.Error!void {
     var cursor: usize = 0;
     for (e.refs.relocs.items) |*r| r.offset = e.mapAscending(&cursor, r.offset);
     for (e.labels.items, before) |*l, n| l.* -= saved[n];
+    for (e.label_addrs.items) |a| e.patchRel32(e.mapOffset(a.at), e.labels.items[@backingInt(a.label)]);
 }
 
 pub fn newLabel(e: *Encoder) Allocator.Error!Label {
@@ -479,6 +484,27 @@ fn extend(e: *Encoder, dst_size: Size, dst: Reg, src_size: Size, src: Rm, op: u8
         else
             try e.gprRm(.qword, undefined, 0x63, .{ .reg = dst }, src, 0),
         .qword => unreachable,
+    }
+}
+
+/// `lea dst, [rip + label]` (inline asm's `leaq 0f(%rip)`).
+pub fn leaLabel(e: *Encoder, dst: Reg, label: Label) !void {
+    try e.reserve();
+    e.prefixes(.{ .w = true, .r = ext(@backingInt(dst)) }, .{});
+    e.byte(0x8d);
+    e.byte(modrmByte(0b00, dst.low(), 0b101)); // [rip + disp32]
+    if (e.shorten) try e.label_addrs.append(e.gpa, .{ .at = @intCast(e.code.items.len), .label = label });
+    try e.rel32(.{ .label = label });
+}
+
+/// `push imm32`, sign-extended to 64 bits.
+pub fn pushImm(e: *Encoder, v: i32) !void {
+    try e.reserve();
+    if (std.math.cast(i8, v)) |b| {
+        e.bytes(&.{ 0x6a, @bitCast(b) });
+    } else {
+        e.byte(0x68);
+        e.int(i32, v);
     }
 }
 

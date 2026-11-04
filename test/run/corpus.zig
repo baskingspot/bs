@@ -1,5 +1,5 @@
 //! exit: 0
-//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n"
+//! stdout: "*corpus.S\n*const corpus.S\n*corpus.S\n5\n42\n9\n1\n1\n1\n1\n1\n300\n20\n3\n2\n42\n7\n1\n2\n7\n1\n42\n"
 //! Reductions of bugs real projects hit (tools/corpus): each section names
 //! the project it came from.
 const rt = @import("rt.zig");
@@ -165,6 +165,27 @@ const Schema = union(enum) {
     }
 };
 
+// zio (coro/coroutines.zig): the address of a local label (past a branch
+// that shortens), `pushq $imm`, and a jump through memory.
+fn jumpViaLabel() callconv(.naked) void {
+    asm volatile (
+        \\ leaq 0f(%%rip), %%rdx
+        \\ pushq %%rdx
+        \\ pushq $40
+        \\ popq %%rax
+        \\ testq %%rax, %%rax
+        \\ jnz 1f
+        \\ ud2
+        \\1:
+        \\ addq $2, %%rax
+        \\ jmpq *0(%%rsp)
+        \\ ud2
+        \\0:
+        \\ popq %%rdx
+        \\ retq
+    );
+}
+
 fn main() callconv(.c) noreturn {
     var s: S = .{};
     const c: S = .{};
@@ -224,5 +245,7 @@ fn main() callconv(.c) noreturn {
     rt.printInt(passName("tokamak"));
     const Tag = @typeInfo(Schema).@"union".tag_type.?;
     rt.printInt(@intFromBool(@hasDecl(Schema, "jsonStringify") and !@hasDecl(Tag, "jsonStringify")));
+    const jump: *const fn () callconv(.c) u64 = @ptrCast(&jumpViaLabel);
+    rt.printInt(jump());
     rt.exit(0);
 }

@@ -3443,20 +3443,26 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
     const sp = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
     const mnemonic = line[0..sp];
     const arg = std.mem.trim(u8, line[sp..], " \t");
-    if (mnemonic[0] == 'j' and arg.len == 2 and std.ascii.isDigit(arg[0]) and (arg[1] == 'f' or arg[1] == 'b')) {
+    if (mnemonic[0] == 'j' and isLocalLabelRef(arg)) {
         // A jump to a local label.
-        const n = arg[0] - '0';
-        const label = if (arg[1] == 'b')
-            locals.back[n] orelse return cg.fail("asm refers to an undefined local label: '{s}'", .{line})
-        else
-            locals.fwd[n] orelse blk: {
-                const l = try cg.e.newLabel();
-                locals.fwd[n] = l;
-                break :blk l;
-            };
+        const label = try cg.localLabel(locals, arg, line);
         if (std.mem.eql(u8, mnemonic, "jmp")) return cg.e.jmp(.{ .label = label });
         const cond = asmCond(mnemonic[1..]) orelse return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line});
         return cg.e.jcc(cond, .{ .label = label });
+    }
+    // The address of a local label: `leaq 0f(%rip), %rdx`.
+    if (std.mem.eql(u8, mnemonic, "lea") or std.mem.eql(u8, mnemonic, "leaq")) lea: {
+        const comma = std.mem.indexOfScalar(u8, arg, ',') orelse break :lea;
+        const mem = std.mem.trim(u8, arg[0..comma], " \t");
+        const ref = for ([_][]const u8{ "(%rip)", "(%%rip)" }) |rip| {
+            if (std.mem.endsWith(u8, mem, rip)) break mem[0 .. mem.len - rip.len];
+        } else break :lea;
+        if (!isLocalLabelRef(ref)) break :lea;
+        const dst = switch (try cg.asmOperand(std.mem.trim(u8, arg[comma + 1 ..], " \t"), names, line)) {
+            .reg => |r| if (r.size == .qword) r.reg else break :lea,
+            else => break :lea,
+        };
+        return cg.e.leaLabel(dst, try cg.localLabel(locals, ref, line));
     }
     var operands: [2]AsmOperand = undefined;
     var n: usize = 0;
@@ -3467,6 +3473,20 @@ fn assembleStatement(cg: *CodeGen, line_in: []const u8, names: *const std.String
         n += 1;
     }
     try cg.asmInst(mnemonic, operands[0..n], line);
+}
+
+/// `1f` or `1b`: a reference to the next or the previous local label `1:`.
+fn isLocalLabelRef(arg: []const u8) bool {
+    return arg.len == 2 and std.ascii.isDigit(arg[0]) and (arg[1] == 'f' or arg[1] == 'b');
+}
+
+fn localLabel(cg: *CodeGen, locals: *LocalLabels, ref: []const u8, line: []const u8) Error!Encoder.Label {
+    const n = ref[0] - '0';
+    if (ref[1] == 'b') return locals.back[n] orelse cg.fail("asm refers to an undefined local label: '{s}'", .{line});
+    if (locals.fwd[n]) |l| return l;
+    const l = try cg.e.newLabel();
+    locals.fwd[n] = l;
+    return l;
 }
 
 fn asmCond(name: []const u8) ?Encoder.Cond {
@@ -3586,15 +3606,21 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
         if (eql(u8, mnemonic, "xgetbv")) return e.raw(&.{ 0x0f, 0x01, 0xd0 });
         if (eql(u8, mnemonic, "ret") or eql(u8, mnemonic, "retq")) return e.ret();
     } else if (ops.len == 1) {
-        if (eql(u8, mnemonic, "call") or eql(u8, mnemonic, "callq") or eql(u8, mnemonic, "jmp")) switch (ops[0]) {
+        if (eql(u8, mnemonic, "call") or eql(u8, mnemonic, "callq") or eql(u8, mnemonic, "jmp") or eql(u8, mnemonic, "jmpq")) switch (ops[0]) {
             .sym => |s| {
                 if (s.off != 0) return cg.fail("asm call with an offset: '{s}'", .{line});
                 return if (mnemonic[0] == 'c') e.call(.{ .sym = s.key }) else e.jmp(.{ .sym = s.key });
             },
             .reg => |r| return if (mnemonic[0] == 'c') e.callIndirect(.{ .reg = r.reg }) else e.jmpIndirect(.{ .reg = r.reg }),
-            .imm, .mem => {},
+            // `jmpq *16(%rcx)`
+            .mem => |m| if (!m.fs) return if (mnemonic[0] == 'c') e.callIndirect(.{ .mem = m.mem }) else e.jmpIndirect(.{ .mem = m.mem }),
+            .imm => {},
         };
-        if ((eql(u8, mnemonic, "push") or eql(u8, mnemonic, "pushq")) and ops[0] == .reg) return e.push(ops[0].reg.reg);
+        if (eql(u8, mnemonic, "push") or eql(u8, mnemonic, "pushq")) switch (ops[0]) {
+            .reg => |r| return e.push(r.reg),
+            .imm => |v| if (std.math.cast(i32, v)) |imm| return e.pushImm(imm),
+            .sym, .mem => {},
+        };
         if (ops[0] == .reg) {
             const unary_ops = [_]struct { []const u8, Encoder.UnaryOp }{
                 .{ "div", .div }, .{ "idiv", .idiv }, .{ "mul", .mul }, .{ "neg", .neg }, .{ "not", .not },
