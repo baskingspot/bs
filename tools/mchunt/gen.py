@@ -1445,7 +1445,7 @@ class Gen:
         """A check next to the comparisons that decide it, or nearly do
         (what a prover of safety checks reasons about). The near misses
         must keep their check: they fire for some values."""
-        k = self.r.randrange(16)
+        k = self.r.randrange(23)
         t = self.pick([Int(False, 8), Int(True, 8), Int(False, 16), Int(True, 16), U32, Int(True, 32), U64,
                        USIZE, Int(False, 5), Int(True, 7)])
         x = self.rt_int(ctx, t)
@@ -1651,6 +1651,8 @@ class Gen:
             self.emit(ctx, f"if ({j} {'<=' if near else '<'} {arr}.len) {{")
             body(f"{arr}[{j}]")
             I()
+        elif k >= 16:
+            self.prove_more(ctx, k, t, v, near, body, I)
         else:
             # i <= n proves nothing about a[i] when a.len == n.
             arr = self.fresh("pa")
@@ -1923,6 +1925,130 @@ class Gen:
             out.append("}")
             self.byref.append(("bp", name, t, None))
         out.append("")
+
+    def prove_more(self, ctx, k, t, v, near, body, I):
+        """More of s_prove: checked adds in compares, blocks left by a
+        break to an outer block, values merged into one const, undefined
+        then stored, and casts that change width or sign."""
+        n = t.name()
+        arr = self.fresh("pa")
+        ln = self.r.randint(1, 8)
+        self.emit(ctx, f"const {arr}: [{ln}]{n} = @splat({v});")
+        x = self.conv(v, t, USIZE)
+        j = self.fresh("pj")
+        e = lambda s_: self.emit(ctx, s_)
+        if k == 16:
+            # An overflow-checked add in the compare (the add's own check stays).
+            c = self.r.randint(1, 3)
+            e(f"const {j}: usize = {x};")
+            if self.chance(0.5):
+                e(f"if ({j} + {c} {'<=' if near else '<'} {arr}.len) {{")
+                body(f"{arr}[{j} + {c}]")
+            else:
+                ov = self.fresh("po")
+                e(f"const {ov} = @addWithOverflow({j}, {c});")
+                e(f"if ({ov}[1] == 0 and {ov}[0] {'<=' if near else '<'} {arr}.len) {{")
+                body(f"{arr}[{ov}[0]]")
+            I()
+        elif k == 17:
+            # Leaving an inner block with a break to the outer one: only
+            # paths that passed the check reach the use.
+            r, outer, inner = self.fresh("pr"), self.fresh("po"), self.fresh("pi")
+            e(f"const {j}: usize = {x};")
+            e(f"const {r}: {n} = {outer}: {{")
+            ctx["indent"] += 1
+            e(f"{inner}: {{")
+            ctx["indent"] += 1
+            leave = f"if (({j} & {self.r.randint(1, 3)}) == 0) break :{inner};"
+            check = f"if ({j} >= {arr}.len) break :{outer} {self.lit(t)};"
+            for line in ([leave, check] if near else [check, leave]):
+                e(line)
+            if self.chance(0.5):
+                e(f"if ({j} == {self.r.randrange(ln)}) break :{outer} {arr}[{j}];")
+            ctx["indent"] -= 1
+            e("}")
+            e(f"break :{outer} {arr}[{j}];")
+            ctx["indent"] -= 1
+            e("};")
+            self.sink(ctx, r, t)
+        elif k == 18:
+            # One const from two arms; both must bound it for the check to go.
+            cond = f"(({x}) & 1) == 0"
+            other = f"{x} % {ln + 1}" if near else f"{x} % {ln}"
+            w = self.r.random()
+            if w < 0.4:
+                e(f"const {j}: usize = if ({cond}) {x} % {ln} else {other};")
+                self.sink(ctx, f"{arr}[{j}]", t)
+            elif w < 0.7:
+                b = self.fresh("pb")
+                e(f"const {j}: usize = {b}: {{")
+                e(f"    if ({cond}) break :{b} {other};")
+                e(f"    break :{b} {x} % {ln};")
+                e("};")
+                self.sink(ctx, f"{arr}[{j}]", t)
+            else:
+                ja, jb, p = self.fresh("pj"), self.fresh("pj"), self.fresh("pp")
+                e(f"const {ja}: usize = {x} % {ln};")
+                e(f"const {jb}: usize = {other};")
+                e(f"const {p}: *const usize = if ({cond}) &{ja} else &{jb};")
+                self.sink(ctx, f"{arr}[{p}.*]", t)
+        elif k == 19:
+            # Undefined, then stored on every path.
+            e(f"var {j}: usize = undefined;")
+            if self.chance(0.5):
+                e(f"if ((({x}) & 2) == 0) {{")
+                e(f"    {j} = {x} % {ln};")
+                e("} else {")
+                e(f"    {j} = {x} % {ln + 1 if near else ln};")
+                e("}")
+                self.sink(ctx, f"{arr}[{j}]", t)
+            else:
+                e(f"{j} = {x};")
+                e(f"if ({j} {'<=' if near else '<'} {ln}) {{")
+                body(f"{arr}[{j}]")
+                I()
+        elif k == 20:
+            # Narrowing casts after a bound on the wider value.
+            self.sink(ctx, f"{arr}[0]", t)
+            if t.signed and t.bits > 2:
+                nt = Int(False, t.bits - 1)
+                lo = "-1" if near else "0"
+                e(f"if ({v} >= {lo} and {v} <= {nt.max()}) {{")
+                body(f"@as({nt.name()}, @intCast({v}))", nt)
+            elif not t.signed and t.bits > 1:
+                nt = Int(self.chance(0.3), t.bits - 1)
+                hi = nt.max() + (1 if near else 0)
+                e(f"if ({v} <= {hi}) {{")
+                body(f"@as({nt.name()}, @intCast({v}))", nt)
+            else:
+                e(f"if ({x} < {ln}) {{")
+                body(f"{arr}[{x}]")
+            I()
+        elif k == 21:
+            # Widened, shifted down, then used as an index.
+            wi = self.fresh("pw")
+            d = self.r.randint(0, 3)
+            e(f"const {wi}: i128 = @as(i128, {v}) - {d};")
+            e(f"if ({wi} >= {'-1' if near else '0'} and {wi} < {ln}) {{")
+            body(f"{arr}[@intCast({wi})]")
+            I()
+        else:
+            # Counting down to zero, or clamping.
+            if self.chance(0.5):
+                e(f"var {j}: usize = {x} % {ln + 1};")
+                if near:
+                    e(f"while ({j} > 0) : ({j} -= 1) {{")
+                    body(f"{arr}[{j}]")
+                else:
+                    e(f"while ({j} > 0) {{")
+                    ctx["indent"] += 1
+                    e(f"{j} -= 1;")
+                    self.sink(ctx, f"{arr}[{j}]", t)
+                    ctx["indent"] -= 1
+                I()
+            else:
+                e(f"const {j}: usize = @min({x}, {ln if near else ln - 1});")
+                self.sink(ctx, f"{arr}[{j}]", t)
 
     def s_switch(self, ctx):
         if self.chance(0.3):
