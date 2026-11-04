@@ -2113,6 +2113,8 @@ fn addCandidates(sema: *Sema, ty: Index, name: []const u8, which: CandidateNames
     // A mechanical rewrite of the removed name, where the error points at it.
     if (last.file == sema.file and last.span.end <= source.len) if (diag.nameIn(source[last.span.start..last.span.end], name)) |at| {
         if (try diag.migrationFix(zcu.arena.allocator(), container, name, source, last.span.start + at)) |fix| last.fix = fix;
+        if (last.fix == null and std.mem.indexOf(u8, container, "lang.Type") != null)
+            last.fix = try diag.typeInfoFix(zcu.arena.allocator(), name, names.items, last.span.start + at);
     };
 }
 

@@ -571,19 +571,61 @@ const migration_fixes = [_]struct { []const u8, []const u8, []const u8, []const 
     .{ "debug", "warn", "", "print" },
     .{ "mem", "trimRight", "", "trimEnd" },
     .{ "mem", "trimLeft", "", "trimStart" },
+    .{ "mem", "tokenize", "(", "tokenizeAny(" },
+    .{ "mem", "split", "(", "splitSequence(" },
+    .{ "json", "stringifyAlloc", "", "Stringify.valueAlloc" },
+    .{ "std", "rand", ".Random", "Random" },
+    .{ "std", "rand", "", "Random" },
+    .{ "os", "exit", "", "^std.process.exit" },
+    .{ "sort", "sort", "", "^std.mem.sort" },
+    .{ "meta", "Int", "", "^@Int" },
 };
 
 /// The fix for a failed lookup of `name` in `container` (as
 /// `migrationHint` takes it) at byte `start` of `source`, from
-/// `migration_fixes`.
+/// `migration_fixes`: the first entry whose text after the name matches.
+/// A replacement starting with `^` replaces the whole path, `std.os.exit`
+/// for `os` and `exit`, written as `std.<container>.<name>` in the source.
 pub fn migrationFix(arena: std.mem.Allocator, container: []const u8, name: []const u8, source: []const u8, start: u32) !?RawFix {
     const base = container[0 .. std.mem.indexOfScalar(u8, container, '(') orelse container.len];
     for (migration_fixes) |f| {
         if (!std.mem.eql(u8, f[0], base) or !std.mem.eql(u8, f[1], name)) continue;
         const end = start + name.len;
-        if (!std.mem.startsWith(u8, source[end..], f[2])) return null;
-        return try rawFix(arena, .exact, &.{.{ .start = start, .end = @intCast(end + f[2].len), .text = f[3] }});
+        if (!std.mem.startsWith(u8, source[end..], f[2])) continue;
+        var from = start;
+        var text = f[3];
+        if (text[0] == '^') {
+            text = text[1..];
+            // `<base>.` and, unless the container is std itself, `std.`.
+            const before = source[0..start];
+            if (!std.mem.endsWith(u8, before, ".") or !std.mem.endsWith(u8, before[0 .. before.len - 1], base)) return null;
+            from = @intCast(before.len - 1 - base.len);
+            if (!std.mem.eql(u8, base, "std")) {
+                if (!std.mem.endsWith(u8, source[0..from], "std.")) return null;
+                from -= 4;
+            }
+        }
+        return try rawFix(arena, .exact, &.{.{ .start = from, .end = @intCast(end + f[2].len), .text = text }});
     }
+    return null;
+}
+
+/// The fix for a failed lookup of `name`, a field or tag of @typeInfo's
+/// result spelled as before 0.14 (`.Struct`, `.ComptimeInt`), at byte
+/// `start` of `source`: its 0.14 spelling, when `names` (the fields) has it.
+pub fn typeInfoFix(arena: std.mem.Allocator, name: []const u8, names: []const []const u8, start: u32) !?RawFix {
+    if (name.len == 0 or !std.ascii.isUpper(name[0])) return null;
+    var snake: std.ArrayList(u8) = .empty;
+    for (name, 0..) |c, i| {
+        if (std.ascii.isUpper(c)) {
+            if (i != 0) try snake.append(arena, '_');
+            try snake.append(arena, std.ascii.toLower(c));
+        } else try snake.append(arena, c);
+    }
+    for (names) |n| if (std.mem.eql(u8, n, snake.items)) {
+        const text = if (std.zig.Token.getKeyword(n) != null) try std.fmt.allocPrint(arena, "@\"{s}\"", .{n}) else n;
+        return try rawFix(arena, .exact, &.{.{ .start = start, .end = @intCast(start + name.len), .text = text }});
+    };
     return null;
 }
 

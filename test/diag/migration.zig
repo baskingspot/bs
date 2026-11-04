@@ -63,6 +63,7 @@ pub fn main() void {
 //   note std/lang.zig:640:18: union declared here: pub const Type = union(enum) {
 //   candidates: int
 //   hint: @typeInfo's fields are lowercase: .int, .pointer, .@"struct", .@"enum", .@"union", .@"fn"
+//   fix migration.zig:18:26-18:29: "int"
 //   ref: main migration.zig:38:13 (+3 std frames)
 // migration.zig:23:74: error[no-member]: root source file struct 'fmt' has no member named 'FormatOptions'
 //   | pub fn format(self: Point, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
