@@ -1527,7 +1527,10 @@ Each step keeps conformance at 2170/2170 and `ZAP_CACHE_CHECK` clean:
    register there with a parallel move. Pairs (slices, error unions) still
    live in memory inside a function until the SSA has a pair class.
 4. Layout, fusion, overflow from flags, dead code, and branch shortening.
-   Built. `Ssa.place` (passes 3 and 4) bypasses blocks without values
+   Built. Functions start on a 64-byte boundary (a cache line), so a
+   function's speed does not depend on the sizes of the functions placed
+   before it; this costs about 4% of .text. `Ssa.place` (passes 3 and
+   4) bypasses blocks without values
    that only jump (a `repeat`, a `br` without a result, a fallthrough)
    and orders the rest for emission (`Ssa.order`): a block ending in a
    call of a noreturn function is cold and goes to the end, and a branch

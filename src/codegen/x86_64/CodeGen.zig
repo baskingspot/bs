@@ -347,8 +347,9 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         // Names can change until analysis ends (`Emit.nameAtoms`).
         .name = Emit.name_later,
         .section = .text,
-        // `fn f() align(n)` raises the alignment.
-        .alignment = .fromByteUnits(@max(16, nav.alignment)),
+        // A cache line, so that run time does not depend on the sizes of
+        // the functions before this one. `fn f() align(n)` raises it.
+        .alignment = .fromByteUnits(@max(64, nav.alignment)),
         .bytes = try arena.dupe(u8, cg.e.code.items),
         .targets = try arena.dupe(Atom.SymbolKey, cg.e.refs.targets.keys()),
         .relocs = try arena.dupe(Atom.Reloc, cg.e.refs.relocs.items),
