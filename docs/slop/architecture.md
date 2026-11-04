@@ -3723,17 +3723,45 @@ BRANCH26 after it; UNSIGNED keeps its addend in the field.
 - Check: a throw caught across C++ frames on the Mac (libunwind reads
   `__unwind_info` first).
 
-**Debug info (stage A3).** A Mach-O object's DWARF has no relocations
-for offsets into its own debug sections (DW_FORM_strp, the abbreviation
-offset, DW_AT_stmt_list, range and location offsets are relative to the
-object's sections; only addresses are relocated), so it cannot be
-concatenated as ELF's is. std.debug reads only the dSYM when one sits
-next to the executable (MachOFile.zig: debug map stabs are its
-fallback), so C lines must be in bs's dSYM: each input unit is copied
-with those offset fields rewritten, which needs a DIE walk over its
-abbreviations (the forms are few: strp, sec_offset, line_strp, and
-DWARF 5's strx through str_offsets_base). Until then, C frames unwind
-(stage A2) and show their symbols without lines.
+**Debug info (stage A3; decided 2026-11-04: rewrite into the dSYM).**
+A Mach-O object's DWARF has no relocations for offsets into its own
+debug sections (DW_FORM_strp, the abbreviation offset, DW_AT_stmt_list,
+range and location offsets are relative to the object's sections; only
+addresses are relocated), so it cannot be concatenated as ELF's is.
+Two ways to give C frames lines were compared:
+- *Debug map.* ld64's way, and upstream's: the executable's symbol
+  table gets N_SO/N_OSO/N_FUN stabs naming each C object, and
+  debuggers read the DWARF from the objects at run time. std.debug
+  (MachOFile.zig, `load` and `getDwarfForAddress`) follows N_OSO only
+  when no dSYM sits next to the executable, so bs's own DWARF would
+  move into a sidecar object with a symbol per function (std.debug's
+  `loadOFile` rejects a whole object over one duplicate name), and
+  every build with C inputs would write that second container. The
+  link copies no C DWARF at all. But lines then need the objects at
+  their recorded paths when the program runs: bs's C records live in
+  the cache, which trims entries unused for 5 days, a copied or
+  installed executable loses them, and lldb skips an object whose
+  mtime moved.
+- *Rewrite into the dSYM.* Each input unit is copied after bs's own
+  units with its section-offset fields rebased, which needs a DIE walk
+  over its abbreviations to find them (strp, sec_offset, ref_addr,
+  line_strp; DWARF 5 adds str_offsets tables and the line header's
+  forms). The walk produces sites to patch, which are applied as
+  relocations against the output's debug section starts, so the copy
+  is ELF stage B's input-section copy, and the sites can be cached per
+  object with the link-only inputs. Measured with a prototype walker
+  (ReleaseFast) over SQLite's amalgamation built with `zig cc -target
+  aarch64-macos -g`: 443 KB of __debug_info, 20,867 sites, 0.35 ms per
+  walk (1.26 GB/s); its __debug_line (2.9 MB) and __debug_str (96 KB)
+  are copied unchanged. The walk costs less than copying the bytes.
+Choice: the rewrite. The output stays self-contained like ELF's (the
+executable and its dSYM, nothing in the cache), builds without inputs
+keep their byte-identical dSYM, there is one DWARF container, and the
+link stays dominated by copying. Its risk is a form or vendor attribute
+the walker does not know; such a unit is dropped from the dSYM (its
+frames keep their symbols, without lines) rather than failing the link.
+Until A3, C frames unwind (stage A2) and show their symbols without
+lines. `__apple_*` accelerator tables are dropped either way.
 
 **Stages.**
 1. A1: objects and archives, sections, symbols, relocations, cstrings,
@@ -3748,6 +3776,22 @@ DWARF 5's strx through str_offsets_base). Until then, C frames unwind
 The input code is verifiable in the orb up to the link (objects come
 from `zig cc -target aarch64-macos`, and upstream links them for
 comparison); running needs the Mac.
+
+**A1 so far (2026-11-04).** `Archive.Reader` reads Darwin archives;
+`MachOInput` converts objects as above; MachO.zig gains
+`__DATA_CONST,__mod_init_func` and `Options.local_symbols`. A C-only
+program (a main and test/link_input-style lib.c: a constructor, a
+thread-local, cstrings, a table of pointers, printf and strlen) links
+through them in the orb. Emit and the command line take the inputs once
+the aarch64 backend is on main. Differences from the design above:
+- A thread-local template's atom is named after its descriptor's
+  symbol (`_x`, not `_x$tlv$init`), since the writer puts the atom's
+  symbol at its own descriptor, as ld64 does.
+- C++ on Mach-O keeps weak inline functions in `__text` (no COMDAT
+  sections), so whole-section atoms keep one copy per object; the
+  first definition wins and the others are dead code. Splitting
+  sections at their symbols (MH_SUBSECTIONS_VIA_SYMBOLS) would drop
+  them, when output size matters.
 
 ### compiler_rt (decided 2026-11-02)
 
