@@ -540,7 +540,9 @@ class Gen:
             if o == "shl":
                 if t.bits == 1:
                     return a()
-                sh = self.shift_amount(ctx, t, d)
+                # Upstream does not check @shlWithOverflow's amount (LLVM
+                # makes an oversized one poison), so it must stay in range.
+                sh = self.shift_amount(ctx, t, d, may_trap=False)
                 e = f"@shlWithOverflow({a()}, {sh})"
             else:
                 e = f"@{o}WithOverflow({a()}, {self.rhs(ctx, t, d)})"
@@ -676,7 +678,7 @@ class Gen:
         lbl, l, rr = self.fresh("b"), self.fresh("l"), self.fresh("r")
         return f"({lbl}: {{ const {l} = {x}; const {rr} = {y}; break :{lbl} if ({l} >= {rr}) {l} - {rr} else {rr} - {l}; }})"
 
-    def shift_amount(self, ctx, t, d):
+    def shift_amount(self, ctx, t, d, may_trap=True):
         lt = f"std.math.Log2Int({t.name()})"
         if pow2(t.bits) and self.chance(0.4):
             return self.bare(self.r.randrange(t.bits))
@@ -684,7 +686,7 @@ class Gen:
         e = self.conv(self.sub(ctx, st, d), st, U64)
         if pow2(t.bits):
             return f"@as({lt}, @truncate({e}))"
-        if self.chance(0.02) and self.trap_ok(ctx, e):
+        if may_trap and self.chance(0.02) and self.trap_ok(ctx, e):
             # May reach the bit width: the shift's safety check must fire.
             m = (1 << (t.bits - 1).bit_length()) - 1
             return f"@as({lt}, @intCast({e} & {m}))"
