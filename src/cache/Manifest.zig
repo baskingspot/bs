@@ -1821,6 +1821,7 @@ pub const Builder = struct {
         while (iit.next()) |e| {
             var in = e.value_ptr.input;
             in.path = try b.addString(e.value_ptr.path);
+            in.key = try b.addString(e.value_ptr.key);
             b.inputs.items[e.key_ptr.*] = in;
         }
         for (o.error_names.items) |name| try b.error_names.append(gpa, try b.addString(name));
@@ -2507,6 +2508,7 @@ test "manifest round-trip, lookups, reverse edges, log records, and folding" {
             try t.expectEqualStrings("Unexpected", m3.errorName(3));
             try t.expectEqual(2, m3.inputCount());
             try t.expectEqual(57, m3.input(1)[0].content_hash);
+            try t.expectEqualStrings("root:b.zig", m3.inputKey(1));
             try t.expectEqual(56, m3.input(0)[0].content_hash);
             // References, with names from the base and the log.
             try t.expectEqual(2, m3.refNameCount());
