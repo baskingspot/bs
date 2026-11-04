@@ -3028,6 +3028,21 @@ value model:
   defines is "undefined symbol": archive members are pulled from the
   slots' names during analysis. Weak and thread-local extern data at
   comptime keep their old error.
+- Linker aliases (built 2026-11-04, for the content-atom case above):
+  `Elf.Options.aliases` and `MachO.Options.aliases` name keys that
+  resolve as another key does, plus an addend (`Elf.Alias`), so a
+  content atom can relocate to a stable `extaddr.<name>` key whose
+  binding the link supplies. An alias of an atom is its address plus the
+  addend; of an import (addend 0 only) it is the import, with the same
+  dynamic relocation, bind or stand-in a direct reference gets, which an
+  ELF executable's import list (`exe_imports`) records for the layout's
+  counts; of a value the value (with an addend only in keyed ELF links); Mach-O
+  data cannot hold a value's abs64, as for direct references. Aliases
+  resolve after addresses (`resolveAliases`), all targets first, so an
+  alias of an alias is undefined. Numbered links number them in
+  `Symbols.aliases`, parallel to `Options.aliases`. A link without
+  aliases does no extra work. Checks: each linker's "an alias links as a
+  reference to its target" test, keyed and numbered, byte for byte.
 - Checks: test/run/extern_data.zig (exports as the definitions, two
   chained edits, upstream the same), test/link_input/main.zig (C
   objects' definitions, in code and data), and cache.sh's edit that

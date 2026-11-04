@@ -121,7 +121,20 @@ pub const Options = struct {
     /// applied. Each .eh_frame FDE gets a .eh_frame_hdr entry. Not with
     /// `symbols`.
     input_sections: []const InputSection = &.{},
+    /// Keys that resolve to another key's address plus an addend, for
+    /// data that must not depend on what its target binds to (`Alias`).
+    /// With `symbols`, `Symbols.aliases` numbers them, in this order.
+    aliases: []const Alias = &.{},
 };
+
+/// A key that resolves as `target` does, `addend` bytes on: to an atom's
+/// address, a value, or, with an addend of 0, an import, as a reference to
+/// `target` itself would. An alias of an alias, or of a key nothing
+/// defines, is an error.
+pub const Alias = struct { key: SymbolKey, target: SymbolKey, addend: i64 };
+
+/// `Options.aliases[i]`'s number and its target's (`Symbols.aliases`).
+pub const NumberedAlias = struct { symbol: u32, target: u32 };
 
 pub const LocalSymbol = struct {
     name: []const u8,
@@ -257,6 +270,8 @@ pub const Symbols = struct {
     dynamic_imports: []const u32 = &.{},
     dynamic_exports: []const u32 = &.{},
     dynamic: u32 = no_bound,
+    /// The numbers of `Options.aliases`, parallel to them.
+    aliases: []const NumberedAlias = &.{},
     entry: u32,
     /// Numbers are below this; numbers with no atom or value are
     /// undefined, which is an error only if a relocation uses one.
@@ -687,21 +702,38 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     const numbered = options.symbols;
     if (numbered) |s| if (s.atoms.len != n_atoms or (options.entry != null and s.entry >= s.len) or options.local_symbols.len != 0 or options.input_sections.len != 0) return error.InvalidSymbols;
     if (numbered) |s| if (options.dynamic) |d| if (s.dynamic_imports.len != d.imports.len or s.dynamic_exports.len != d.exports.len) return error.InvalidSymbols;
+    if (numbered) |s| if (s.aliases.len != options.aliases.len) return error.InvalidSymbols;
     var symbols: SymbolTable = if (numbered == null) try .init(n_atoms, n_partitions) else .empty;
     defer symbols.deinit();
     const exe_dyn = if (options.dynamic) |d| d.executable() else false;
     // Numbered imports' entries are `import_tag + i` (`numberedAddr`).
     if (numbered != null and exe_dyn and options.dynamic.?.imports.len > unset - import_tag) return error.InvalidSymbols;
-    const exe_imports: ?[]SymbolKey = if (exe_dyn) try gpa.alloc(SymbolKey, options.dynamic.?.imports.len) else null;
-    defer if (exe_imports) |k| gpa.free(k);
-    if (exe_imports) |keys_out| {
-        for (keys_out, options.dynamic.?.imports) |*k, imp| k.* = imp.key;
-        std.mem.sortUnstable(SymbolKey, keys_out, {}, struct {
-            fn lt(_: void, a: SymbolKey, b: SymbolKey) bool {
-                return @backingInt(a) < @backingInt(b);
+    const key_lt = struct {
+        fn lt(_: void, a: SymbolKey, b: SymbolKey) bool {
+            return @backingInt(a) < @backingInt(b);
+        }
+    }.lt;
+    // An executable's imports' keys, then the aliases of imports, which
+    // take their relocations.
+    var exe_imports_buf: []SymbolKey = &.{};
+    defer gpa.free(exe_imports_buf);
+    const exe_imports: ?[]SymbolKey = if (exe_dyn) keys: {
+        const imports = options.dynamic.?.imports;
+        exe_imports_buf = try gpa.alloc(SymbolKey, imports.len + options.aliases.len);
+        for (exe_imports_buf[0..imports.len], imports) |*k, imp| k.* = imp.key;
+        std.mem.sortUnstable(SymbolKey, exe_imports_buf[0..imports.len], {}, key_lt);
+        var n = imports.len;
+        for (options.aliases) |al| if (LinkOf(@TypeOf(input)).isImport(exe_imports_buf[0..imports.len], al.target)) {
+            if (al.addend != 0) {
+                diag.* = .{ .atom = "alias", .target = al.key };
+                return error.InvalidRelocation;
             }
-        }.lt);
-    }
+            exe_imports_buf[n] = al.key;
+            n += 1;
+        };
+        std.mem.sortUnstable(SymbolKey, exe_imports_buf[0..n], {}, key_lt);
+        break :keys exe_imports_buf[0..n];
+    } else null;
     // With numbered symbols, each number's address or value.
     const addrs = try gpa.alloc(u32, if (numbered) |s| s.len else 0);
     defer gpa.free(addrs);
@@ -875,7 +907,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
             diag.* = .{ .target = e };
             return error.UndefinedSymbol;
         };
-        values = try .init(options.values.len + 2 * bound_sections.len + n_imports + 1, 1);
+        values = try .init(options.values.len + 2 * bound_sections.len + n_imports + 1 + options.aliases.len, 1);
         for (options.values) |v| values.getOrPut(v.key).* = .{ .key = v.key, .value = v.value, .used = true };
     }
 
@@ -1036,6 +1068,7 @@ fn build(gpa: Allocator, io: std.Io, input: anytype, options: Options, out: anyt
     }
     try parallel(io, n_threads, l.n_resolve_tasks + n_debug_chunks, &l, Link.resolveAddrsAndLayOutDebug);
     try l.check(diag);
+    try l.resolveAliases(options.aliases, &values, diag);
     const entry_addr = if (options.entry == null) 0 else if (numbered) |s| l.numberedAddr(addrs[s.entry]) else symbols.get(options.entry.?).?;
     if (entry_addr == null) {
         diag.* = .{ .target = options.entry };
@@ -1609,6 +1642,68 @@ fn LinkOf(comptime Input: type) type {
             for (s.atoms[begin..end], begin..) |n, i| {
                 if (n.symbol >= l.addrs.len) return l.fail(task, i, error.InvalidSymbols, .{ .atom = l.input.atom(i).name });
                 l.addrs[n.symbol] = @intCast(l.atomAddr(i) - l.base);
+            }
+        }
+
+        /// Gives each alias its target's address or value plus its addend,
+        /// after `resolveAddrs`: in `addrs`, or as a value. All targets are
+        /// looked up before any alias is added, so an alias of an alias is
+        /// undefined.
+        fn resolveAliases(l: *Link, aliases: []const Alias, values: *const SymbolTable, diag: *Diagnostic) Error!void {
+            if (aliases.len == 0) return;
+            const resolved = try l.gpa.alloc(u64, aliases.len);
+            defer l.gpa.free(resolved);
+            for (aliases, resolved, 0..) |al, *out, i| {
+                const fail_diag: Diagnostic = .{ .atom = "alias", .target = al.target };
+                const v: u64 = if (l.numbered) |s| v: {
+                    const n = s.aliases[i];
+                    if (n.symbol >= l.addrs.len or n.target >= l.addrs.len) return error.InvalidSymbols;
+                    if (l.addrs[n.symbol] != unset) {
+                        diag.* = .{ .atom = "alias", .target = al.key };
+                        return error.DuplicateSymbol;
+                    }
+                    const e = l.addrs[n.target];
+                    if (e == unset) {
+                        diag.* = fail_diag;
+                        return error.UndefinedSymbol;
+                    }
+                    // Values and an executable's imports are table entries
+                    // an addend cannot move.
+                    if (e >= value_tag) {
+                        if (al.addend != 0) {
+                            diag.* = fail_diag;
+                            return error.InvalidRelocation;
+                        }
+                        out.* = e;
+                        continue;
+                    }
+                    break :v l.base + e;
+                } else v: {
+                    if (l.symbols.get(al.key) != null or values.get(al.key) != null) {
+                        diag.* = .{ .atom = "alias", .target = al.key };
+                        return error.DuplicateSymbol;
+                    }
+                    break :v l.symbols.get(al.target) orelse values.get(al.target) orelse {
+                        diag.* = fail_diag;
+                        return error.UndefinedSymbol;
+                    };
+                };
+                // An import's stub or stand-in: its relocations name it.
+                if (al.addend != 0 and v >= l.plt_start and v < l.plt_end) {
+                    diag.* = fail_diag;
+                    return error.InvalidRelocation;
+                }
+                const sum = @as(i128, v) + al.addend;
+                if (l.numbered != null) {
+                    const off = sum - l.base;
+                    if (off < 0 or off >= value_tag) return error.RelocationOverflow;
+                    out.* = @intCast(off);
+                } else out.* = @truncate(@as(u128, @bitCast(sum)));
+            }
+            for (aliases, resolved, 0..) |al, v, i| {
+                if (l.numbered) |s| {
+                    l.addrs[s.aliases[i].symbol] = @intCast(v);
+                } else values.getOrPut(al.key).* = .{ .key = al.key, .value = v, .used = true };
             }
         }
 
@@ -2769,6 +2864,79 @@ test "a dynamically linked executable links the same with numbered symbols and r
     defer gpa.free(result.stderr);
     try std.testing.expectEqualStrings("hi from ld.so\n", result.stdout);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, result.term);
+}
+
+test "an alias links as a reference to its target, with numbered symbols too" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const start: SymbolKey = .fromName("_start");
+    const msg: SymbolKey = .fromName("msg");
+    const puts: SymbolKey = .fromName("import.puts");
+    const v: SymbolKey = .fromName("value");
+    const msg_alias: SymbolKey = .fromName("extaddr.msg");
+    const puts_alias: SymbolKey = .fromName("extaddr.puts");
+    const v_alias: SymbolKey = .fromName("extaddr.value");
+    const zeros: [24]u8 = @splat(0);
+    // A constant holding an address inside `msg`, an import's address
+    // (a symbol relocation for the loader), and a value: through aliases,
+    // then directly.
+    const via: []const SymbolKey = &.{ msg_alias, puts_alias, v_alias };
+    const direct: []const SymbolKey = &.{ msg, puts, v };
+    const relocs = [2][3]Atom.Reloc{
+        .{ .init(0, .x86_64_abs64, 0, 1), .init(8, .x86_64_abs64, 1, 0), .init(16, .x86_64_abs64, 2, 0) },
+        .{ .init(0, .x86_64_abs64, 0, 4), .init(8, .x86_64_abs64, 1, 0), .init(16, .x86_64_abs64, 2, 0) },
+    };
+    var atoms: [2][3]Atom = undefined;
+    for (&atoms, [_][]const SymbolKey{ via, direct }, &relocs) |*set, targets, *set_relocs| set.* = .{
+        .{ .key = start, .name = "_start", .section = .text, .bytes = "\xcc" },
+        .{ .key = msg, .name = "msg", .section = .rodata, .bytes = "hi from ld.so\x00" },
+        .{ .key = .fromName("table"), .name = "table", .section = .rodata, .alignment = .@"8", .bytes = &zeros, .targets = targets, .relocs = set_relocs },
+    };
+    const dynamic: ElfDynamic.Options = .{
+        .imports = &.{.{ .key = puts, .name = "puts", .version = "GLIBC_2.2.5", .library = 0 }},
+        .interp = "/lib64/ld-linux-x86-64.so.2",
+        .needed = &.{"libc.so.6"},
+    };
+    const aliases = [_]Alias{
+        .{ .key = msg_alias, .target = msg, .addend = 3 },
+        .{ .key = puts_alias, .target = puts, .addend = 0 },
+        .{ .key = v_alias, .target = v, .addend = 0 },
+    };
+    const values = [_]Value{.{ .key = v, .value = 5 }};
+    const want = try emit(gpa, io, &atoms[1], .{ .entry = start, .dynamic = &dynamic, .values = &values });
+    defer gpa.free(want);
+    const got = try emit(gpa, io, &atoms[0], .{ .entry = start, .dynamic = &dynamic, .values = &values, .aliases = &aliases });
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(u8, want, got);
+
+    // Numbers: the atoms, the import, the value, then the aliases.
+    const numbering = [_]SymbolKey{ start, msg, .fromName("table"), puts, v, msg_alias, puts_alias, v_alias };
+    var numbered_atoms: [3]NumberedAtom = undefined;
+    var targets: std.ArrayList(u32) = .empty;
+    defer targets.deinit(gpa);
+    for (atoms[0], &numbered_atoms, 0..) |a, *n, i| {
+        n.* = .{ .symbol = @intCast(i), .targets = @intCast(targets.items.len) };
+        for (a.targets) |t| try targets.append(gpa, @intCast(std.mem.indexOfScalar(SymbolKey, &numbering, t).?));
+    }
+    const numbered = try emit(gpa, io, &atoms[0], .{ .entry = start, .dynamic = &dynamic, .aliases = &aliases, .symbols = .{
+        .atoms = &numbered_atoms,
+        .targets = targets.items,
+        .values = &.{.{ .symbol = 4, .value = 5 }},
+        .dynamic_imports = &.{3},
+        .aliases = &.{ .{ .symbol = 5, .target = 1 }, .{ .symbol = 6, .target = 3 }, .{ .symbol = 7, .target = 4 } },
+        .entry = 0,
+        .len = numbering.len,
+    } });
+    defer gpa.free(numbered);
+    try std.testing.expectEqualSlices(u8, want, numbered);
+
+    // An import's address cannot be moved, and an alias needs a target.
+    var moved = aliases;
+    moved[1].addend = 8;
+    try std.testing.expectError(error.InvalidRelocation, emit(gpa, io, &atoms[0], .{ .entry = start, .dynamic = &dynamic, .values = &values, .aliases = &moved }));
+    var dangling = aliases;
+    dangling[0].target = .fromName("nothing");
+    try std.testing.expectError(error.UndefinedSymbol, emit(gpa, io, &atoms[0], .{ .entry = start, .dynamic = &dynamic, .values = &values, .aliases = &dangling }));
 }
 
 test "thread-locals in .tdata and .tbss read back after static TLS setup" {
