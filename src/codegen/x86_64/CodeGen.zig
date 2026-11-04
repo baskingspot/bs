@@ -4182,6 +4182,22 @@ fn asmInst(cg: *CodeGen, mnemonic: []const u8, ops: []const AsmOperand, line: []
     } else if (ops[1] == .reg) {
         // AT&T order: source, destination.
         const dst = ops[1].reg;
+        // std's Crc32c with SSE4.2 (`-mcpu`): `crc32b %[byte], %[crc]`.
+        if (mnemonic.len == 6 and std.mem.startsWith(u8, mnemonic, "crc32")) {
+            const src_size: Size = switch (mnemonic[5]) {
+                'b' => .byte,
+                'w' => .word,
+                'l' => .dword,
+                'q' => .qword,
+                else => return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line}),
+            };
+            const src: Encoder.Rm = switch (ops[0]) {
+                .reg => |r| .{ .reg = r.reg },
+                .mem => |m| if (m.fs) return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line}) else .{ .mem = m.mem },
+                .imm, .sym => return cg.fail("zap does not support this inline assembly instruction yet: '{s}'", .{line}),
+            };
+            return e.crc32(dst.size, src_size, dst.reg, src);
+        }
         // A size suffix, unless it is part of the name (`shl`, `sub`).
         const known = [_][]const u8{ "mov", "add", "or", "and", "sub", "xor", "cmp", "test", "rol", "ror", "shl", "sal", "shr", "sar", "xchg" };
         const base = for (known) |k| {
