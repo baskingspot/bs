@@ -721,7 +721,11 @@ const CacheDir = struct {
         for (new) |h| {
             if (named.contains(h)) continue;
             const name = std.fmt.bytesToHex(h, .lower);
-            blobs.dir.setTimestamps(io, &name, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-2 * std.time.ns_per_day)) } }) catch continue;
+            // Through a handle: another process may have deleted it, and
+            // std's path-based setTimestamps takes ENOENT as unexpected.
+            const f = blobs.dir.openFile(io, &name, .{}) catch continue;
+            defer f.close(io);
+            f.setTimestamps(io, .{ .modify_timestamp = .{ .new = now.addDuration(.fromNanoseconds(-2 * std.time.ns_per_day)) } }) catch continue;
             try keep.append(gpa, .{ .content_hash = h, .at_ns = now_ns });
         }
         if (keep.items.len == old.len and new.len == 0) return;

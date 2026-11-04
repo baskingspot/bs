@@ -323,7 +323,7 @@ fn refreshUsed(store: *Store, io: Io) void {
     for (store.packs) |*p| {
         if (!p.used.swap(false, .monotonic)) continue;
         if (p.mtime.durationTo(store.opened).toNanoseconds() < used_refresh_ns) continue;
-        store.dir.setTimestampsNow(io, &p.name, .{}) catch {};
+        cache.setTimestamps(io, store.dir, &p.name, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {};
         p.mtime = store.opened;
     }
 }

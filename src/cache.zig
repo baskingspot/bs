@@ -47,6 +47,17 @@ pub fn compilationDir(io: Io, local_cache: Io.Dir, key: Hash) !Io.Dir {
     return local_cache.createDirPathOpen(io, sub_path, .{ .open_options = .{ .iterate = true } });
 }
 
+/// Sets the timestamps of the file at `sub_path`, which may be in a cache
+/// that another process trims: a file deleted meanwhile is
+/// `error.FileNotFound`. (std's path-based `Dir.setTimestamps` takes
+/// utimensat's ENOENT as unexpected, which a Debug build reports with a
+/// stack trace.)
+pub fn setTimestamps(io: Io, dir: Io.Dir, sub_path: []const u8, options: Io.File.SetTimestampsOptions) !void {
+    const f = try dir.openFile(io, sub_path, .{});
+    defer f.close(io);
+    try f.setTimestamps(io, options);
+}
+
 /// Takes the compilation's lock, held until the returned file is closed.
 /// Builds of one compilation take turns; the manifest and pack are only
 /// changed under it. The global store needs no lock.
@@ -398,6 +409,13 @@ test "maintainCompilations counts translate-c records with their outputs and evi
     try t.expectError(error.FileNotFound, tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "o/{s}", .{&old}), .{}));
     _ = try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "zap/tc/{s}", .{&new}), .{});
     _ = try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "o/{s}/x.zig", .{&new}), .{});
+}
+
+test "setTimestamps takes a file another process deleted as not found" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(error.FileNotFound, setTimestamps(io, tmp.dir, "gone", .{ .modify_timestamp = .now }));
 }
 
 test {

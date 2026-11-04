@@ -128,7 +128,7 @@ pub fn check(arena: std.mem.Allocator, io: Io, record_path: []const u8, out_path
         cache.writeReplace(io, cwd, record_path, &.{ rec[0..@sizeOf(Header)], std.mem.sliceAsBytes(entries), paths }) catch {};
     } else {
         // The record's mtime is its last use, for trimming the cache.
-        cwd.setTimestampsNow(io, record_path, .{}) catch {};
+        cache.setTimestamps(io, cwd, record_path, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {};
     }
     return .{ .hit = inputs.items };
 }

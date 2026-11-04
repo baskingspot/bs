@@ -349,7 +349,7 @@ fn outputUnchanged(inc: *Incremental, out_dir: Io.Dir, sub_path: []const u8) boo
     const stat = out_dir.statFile(io, sub_path, .{}) catch return false;
     if (stat.inode != want.inode or stat.size != want.size or stat.mtime.toNanoseconds() != want.mtime) return false;
     if (inc.renew_output) {
-        out_dir.setTimestampsNow(io, sub_path, .{}) catch return false;
+        cache.setTimestamps(io, out_dir, sub_path, .{ .access_timestamp = .now, .modify_timestamp = .now }) catch return false;
         inc.noteOutput(out_dir, sub_path);
     }
     return true;
@@ -1058,7 +1058,7 @@ pub fn useDonor(inc: *Incremental, fe: *const Frontend) !void {
             linkOrCopy(d, c.m.basePack(i), inc.dir, io) catch break false;
         } else true;
         if (!linked) continue;
-        if (c.mtime.durationTo(Io.Clock.real.now(io)).toNanoseconds() > donor_renew_ns) d.setTimestampsNow(io, "manifest", .{}) catch {};
+        if (c.mtime.durationTo(Io.Clock.real.now(io)).toNanoseconds() > donor_renew_ns) cache.setTimestamps(io, d, "manifest", .{ .access_timestamp = .now, .modify_timestamp = .now }) catch {};
         if (inc.timing) std.debug.print("cache: first build: replaying donor {s}, {s} ({d} of its {d} inputs are this build's, builtin {s}; {d} candidates) in {d:.2} ms\n", .{
             &c.name, if (c.own) "the program's own" else "another program's", c.shared, c.m.inputCount(), if (c.builtin) "the same" else "different", candidates.items.len, ms(t0, now(io)),
         });
