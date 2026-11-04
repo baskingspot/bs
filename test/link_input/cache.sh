@@ -80,6 +80,12 @@ sed -i 's/{d} {d} {d}\\n", .{ c_tls()/{d} {d} {d}!\\n", .{ c_tls()/' main.zig
 build "inputs changed, first $work/main.zig" "HELLO from C"
 lazy "the Zig code changed"
 grep -qF -- "!" out || fail "the Zig edit did not take"
+# An edit to data that a comptime extern pointer names: a lazy build
+# cannot bind it to the objects, which its relink converts, so it goes
+# eager.
+sed -i 's/.msg = c_msg + 7/.msg = c_msg + 6/' main.zig
+build "a declaration's data takes the address of a link input's symbol" "extern data  data 30 30"
+eager "the extern data's offset changed"
 # Without ZAP_CACHE_VERIFY, whose full build writes a new base, a lazy
 # edit build leaves a log; a relink from it links what the edit build did.
 sed -i 's/{d} {d} {d}!\\n"/{d} {d} {d}?\\n"/' main.zig

@@ -701,6 +701,7 @@ pub fn beginReplay(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *Emi
     inc.replay = r;
     zcu.replay = r;
     emit.lazy = lazy;
+    emit.inputs_deferred = lazy and inc.link_objects.len != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,6 +1591,10 @@ fn verifyReplay(inc: *Incremental) !void {
 pub fn finishLazy(inc: *Incremental, fe: *const Frontend, zcu: *Zcu, emit: *const Emit, out_dir: Io.Dir, sub_path: []const u8) !?bool {
     const r = inc.replay orelse return null;
     if (!r.lazy) return null;
+    if (emit.needs_inputs) {
+        if (inc.timing) std.debug.print("cache: building again eagerly: a declaration's data takes the address of a link input's symbol\n", .{});
+        return inc.fallBack();
+    }
     const gpa = inc.gpa;
     const io = inc.io;
     if (inc.timing) r.printStats();

@@ -95,6 +95,12 @@ runpath: ?[]const u8 = null,
 /// An executable's object and archive inputs, which `sync` pulls archive
 /// members for and `finish` converts into atoms.
 inputs: ?*ElfInput = null,
+/// A lazy edit build with link inputs, whose relink from the manifest
+/// converts them and binds the externs (`Incremental.linkFrom`): a
+/// declaration's data cannot bind to them here, so `externDataTarget` sets
+/// `needs_inputs` and the build goes eager (`Incremental.finishLazy`).
+inputs_deferred: bool = false,
+needs_inputs: bool = false,
 /// C sources compiling while the build analyzes (CSource.zig): the first
 /// `sync` waits for them and adds their objects to `inputs`, before it
 /// pulls archive members and compiler_rt for them.
@@ -1499,7 +1505,7 @@ fn externTarget(emit: *Emit, name: []const u8, weak: bool) !?ExternTarget {
 
 /// The relocation target of the address of external symbol `name` in a
 /// declaration's data, which `lowerNavs` writes once analysis is done (a
-/// lazy build has no inputs, and falls back if the exports change).
+/// lazy build with link inputs goes eager instead: `inputs_deferred`).
 /// Constants that functions read are written while analysis runs, so
 /// they reach such an address through a slot instead (`useExtern`).
 pub fn externDataTarget(emit: *Emit, name: []const u8) !ExternTarget {
@@ -1515,6 +1521,11 @@ pub fn externDataTarget(emit: *Emit, name: []const u8) !ExternTarget {
             "a function";
         try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "zap does not support the address of extern symbol {s} in a constant that {s} reads yet; take the address at run time instead", .{ name, reader });
         return error.CodegenFail;
+    }
+    if (emit.inputs_deferred) {
+        // Any key: the build does not link.
+        emit.needs_inputs = true;
+        return .{ .key = externSlotKey(name) };
     }
     return try emit.externTarget(name, false) orelse {
         try emit.addError(0, .{ .start = 0, .end = 0, .main = 0 }, "undefined symbol: {s}", .{name});

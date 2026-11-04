@@ -2847,7 +2847,9 @@ differs from the design above:
   a C source whose record Clang is compiling (`link_objects_pending`),
   makes the edit build eager (`linkInputsChanged`), which binds the
   externs again and generates any compiler_rt function the object now
-  needs. A relink pulls members once with every extern, where a build
+  needs. A lazy build does not load the objects, so one that writes a
+  declaration's data with the address of a symbol they may define
+  (`Emit.externDataTarget`) builds again eagerly. A relink pulls members once with every extern, where a build
   pulls as externs arrive; the two agree while every extern reaches the
   first sync, which only a compiler_rt function that references an
   extern could break. test/link_input/cache.sh checks it: cold,
@@ -3988,7 +3990,8 @@ records only what changed, and links from the manifest.
   `@export` left green names (`Emit.nameAtoms` would name its atom after
   the declaration), exported or test declarations added or
   removed, a declaration's data lowered for the first time without its
-  unit being analyzed, or a change in the link's inputs outside the atoms
+  unit being analyzed, data with the address of a link input's symbol
+  (`Emit.inputs_deferred`), or a change in the link's inputs outside the atoms
   (external symbols, whether the error name table is written, and new
   error names while it is). `ZAP_CACHE_TIMING` says why.
 - `ZAP_CACHE_VERIFY` compares a full build with the edit build's manifest
