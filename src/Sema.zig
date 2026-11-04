@@ -15333,10 +15333,15 @@ fn switchAsCondBrs(sema: *Sema, block: *Block, src: Src, cases: []const SwitchCa
         const eq = try sema.addBinOp(block, .cmp_eq, cond_operand, .fromInterned(item));
         cond = if (cond.toInterned() == .bool_false) eq else try sema.addBinOp(block, .bit_or, cond, eq);
     }
+    const cond_ty = sema.typeOf(cond_operand);
+    const is_int = c.ranges.len != 0 and Type.class(sema.ip, cond_ty) == .int;
     for (c.ranges) |r| {
-        const ge = try sema.addBinOp(block, .cmp_gte, cond_operand, .fromInterned(r[0]));
-        const le = try sema.addBinOp(block, .cmp_lte, cond_operand, .fromInterned(r[1]));
-        const in = try sema.addBinOp(block, .bit_and, ge, le);
+        // A bound at the type's end holds for every value (`0...9` on a
+        // u8): no compare.
+        const ge: ?Ref = if (is_int and r[0] == try sema.minIntValue(cond_ty)) null else try sema.addBinOp(block, .cmp_gte, cond_operand, .fromInterned(r[0]));
+        const le: ?Ref = if (is_int and r[1] == try sema.maxIntValue(cond_ty)) null else try sema.addBinOp(block, .cmp_lte, cond_operand, .fromInterned(r[1]));
+        const in: Ref = if (ge != null and le != null) try sema.addBinOp(block, .bit_and, ge.?, le.?) else ge orelse le orelse .fromInterned(.bool_true);
+        if (in.toInterned() == .bool_true) return sema.analyzeProng(block, c, operand, capture_inst, switch_inst);
         cond = if (cond.toInterned() == .bool_false) in else try sema.addBinOp(block, .bit_or, cond, in);
     }
     var then_block = block.condChild(src.operandSrc(0));
