@@ -339,6 +339,31 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
                 same.addFileArg(serial_bin);
                 test_step.dependOn(&same.step);
             }
+            // A panic in inlined code has the stack trace of the program
+            // built without inlining (docs/architecture.md, "Synthetic
+            // panic frames"), addresses aside.
+            if (!upstream and host_runs_zap_output and isTraceChecked(file)) {
+                const plain = b.addRunArtifact(zap);
+                plain.setName(b.fmt("compile {s} (ZAP_INLINE=0)", .{name}));
+                plain.addArgs(&.{ "build-exe", "-target", "x86_64-linux" });
+                plain.addFileArg(b.path(src_path));
+                plain.setEnvironmentVariable("ZAP_INLINE", "0");
+                plain.setEnvironmentVariable("ZAP_CACHE", "off");
+                const plain_bin = plain.addPrefixedOutputFileArg("-femit-bin=", name);
+                const same = b.addSystemCommand(&.{ "sh", "-c",
+                    \\set -e
+                    \\mask() { sed -E 's/0x[0-9a-f]+/0x?/g; s/thread [0-9]+/thread ?/'; }
+                    \\{ "$1" 2>&1 >/dev/null; } 2>/dev/null | mask >"$3.inlined" || true
+                    \\{ "$2" 2>&1 >/dev/null; } 2>/dev/null | mask >"$3.plain" || true
+                    \\diff "$3.plain" "$3.inlined" >&2
+                    \\touch "$3"
+                , "sh" });
+                same.setName(b.fmt("{s}: the trace matches ZAP_INLINE=0's", .{name}));
+                same.addFileArg(bin);
+                same.addFileArg(plain_bin);
+                _ = same.addOutputFileArg("trace");
+                test_step.dependOn(&same.step);
+            }
             if (!upstream and !host_runs_zap_output) {
                 // zap emits x86_64-linux executables; elsewhere only check
                 // that they compile.
@@ -354,6 +379,13 @@ fn addRunTests(b: *std.Build, zap: *std.Build.Step.Compile, test_step: *std.Buil
             (if (upstream) upstream_step else test_step).dependOn(&run.step);
         }
     }
+}
+
+fn isTraceChecked(file: []const u8) bool {
+    for ([_][]const u8{ "panic_inlined.zig", "panic_trace.zig" }) |f| {
+        if (std.mem.eql(u8, file, f)) return true;
+    }
+    return false;
 }
 
 fn isThreadChecked(file: []const u8) bool {

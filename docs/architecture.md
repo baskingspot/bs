@@ -1216,9 +1216,8 @@ build, the passes, and the debug info treat them as Sema's inline calls
   cold `noreturn` function (safety checks, `@panic`, `unreachable`) and
   no trap, which also excludes `try` adding to an error return trace. A
   panic then never starts in inlined code, so every function on a panic
-  stack keeps its own frame and traces stay complete. Full becomes the
-  default once synthetic panic frames (below) land and a kept trace test
-  matches a non-inlining build frame for frame. `ZAP_INLINE=<budget>`
+  stack keeps its own frame and traces stay complete. Synthetic panic frames
+  (below) keep full's traces complete too. `ZAP_INLINE=<budget>`
   sets the budget (`0` turns inlining off) and `ZAP_INLINE_FULL=1`
   selects full; a non-default setting gets its own cache target
   (`Job.cacheTarget`).
@@ -1291,34 +1290,39 @@ build, the passes, and the debug info treat them as Sema's inline calls
   ignores inline callers, and `resolve_inline_callers` cannot help on
   ELF), so a panic inside an inlined function would show the callee's
   line and lose its callers' frames. Debuggers show both (they read
-  `DW_TAG_inlined_subroutine`). Upstream Debug never inlines. The safe
-  variant avoids the loss; synthetic panic frames remove it for full.
+  `DW_TAG_inlined_subroutine`). Upstream Debug never inlines. Synthetic
+  panic frames remove the loss.
   Error return traces are unaffected: their return-site addresses
   already map to the callee's lines.
-- **Synthetic panic frames (next).** Only cold code changes. Where a
-  check in code inlined `d` levels deep fails, the cold path calls a
-  chain of small stubs placed after the function's epilogue instead of
-  calling the panic handler directly. The cold block's line row is the
-  outermost inline call site; each stub's row is the next call site
-  inward, and the innermost stub's row is the check's line; it calls the
-  handler. Each stub is a frameless region with CFI `CFA = rsp+8`
-  (`DW_CFA_restore` of rbp and the saved registers, from the link
-  thread's epilogue rows), so std's `SelfUnwinder` steps through them,
-  and the return addresses map to the innermost callee's line, then each
-  call site outward, then the real caller frames: every frame appears,
-  under the physical function's symbol with the right file and line.
-  The cold block does `sub rsp, 8` first when `d` is odd, so the handler
-  is entered with an aligned stack. The hot path is untouched; the cost
-  is a few bytes of cold code and CFI rows per inlined panic site and
-  depth. A function with `@trap` becomes non-inlinable (a trap has no
-  return address to stub), and a panic call with arguments
-  passed in memory keeps the direct call (its frame is lost; such
-  handlers are not std's). Limit: a hardware fault (a segfault from a bad
-  pointer, a division trap) in inlined code has no stub, so the signal
-  handler's trace shows the callee's line under the caller's frame and
-  loses the inlined callers. aarch64 stubs save the link register,
-  `str x30, [sp, #-16]!; bl next`, with the row `CFA = sp+16` and x30
-  at `CFA-16`.
+- **Synthetic panic frames.** Only cold code changes. A panic call in
+  cold code inside calls the backend inlined (`DbgInline.flags.backend`;
+  Sema's inline calls lose their frame as upstream's do) calls a chain of
+  stubs after the function's epilogue instead of the handler
+  (`CodeGen.panicThroughStubs`, `emitStubs`): one stub per backend call
+  open there, `call next` each, the last calling the handler. The call in
+  the cold block is at the outermost such call's site, in its caller;
+  stub k is at the site of backend call k + 1, inside copies of the
+  inline entries open from call k up to it, and the last stub is at the
+  check, so each return address maps to the line and name the uninlined
+  program's frame has. The copies nest, so the debug info stays a tree.
+  The stubs are frameless: `Atom.Unwind.epilogue` counts them after the
+  `ret`, where the CFA is rsp + 8 and rbp and the saved registers hold the
+  physical frame's values, so std's `SelfUnwinder` steps through them
+  into the physical frame. The cold block does `sub rsp, 8` first when
+  the depth is odd, so the handler is entered with an aligned stack. A
+  function with stubs and no return gets an epilogue for its frame
+  description. The hot path is untouched; the cost is 5 bytes per stub.
+  A panic call with arguments passed in memory keeps the direct call
+  (std's handlers take theirs in registers), and the stubs stop growing
+  near `epilogue`'s 16 bits. `zig build test` compares
+  `test/run/panic_inlined.zig`'s and `panic_trace.zig`'s traces with
+  those of the same programs built with `ZAP_INLINE=0`. Limit: a hardware
+  fault (a segfault from a bad pointer, a division trap) in inlined code
+  has no stub, so the signal handler's trace shows the callee's line
+  under the caller's name and loses the inlined callers. aarch64's
+  variant (for its own lowering): stubs save the link register,
+  `str x30, [sp, #-16]!; bl next`, with the row `CFA = sp+16` and x30 at
+  `CFA-16`.
 
 #### Compile-time budget and how it is measured
 

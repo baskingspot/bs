@@ -407,6 +407,14 @@ pub const Inst = struct {
 pub const DbgInline = struct {
     line: u32,
     column: u32,
+    flags: Flags = .{},
+
+    pub const Flags = packed struct(u32) {
+        /// Inlined by the backend (`codegen/inline.zig`), not by Sema: a
+        /// panic in it gets the synthetic frames of an uninlined call.
+        backend: bool = false,
+        _: u31 = 0,
+    };
 };
 
 pub const Block = struct {

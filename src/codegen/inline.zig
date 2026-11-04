@@ -138,7 +138,11 @@ const Scanner = struct {
                     try s.body(else_body, cold or isCold(ir, else_body));
                 },
                 .call => try s.call(inst, cold),
-                .trap => s.out.panics = true,
+                // A trap has no return address for synthetic frames.
+                .trap => {
+                    s.out.panics = true;
+                    s.out.inlinable = false;
+                },
                 else => {},
             }
             if (!cold) s.out.size += 1;
@@ -227,7 +231,7 @@ pub fn splice(gpa: Allocator, ir: *Ir, splices: []const Splice) Allocator.Error!
         const begin: Inst.Index = @fromBackingInt(base + n);
         const end: Inst.Index = @fromBackingInt(base + n + 1);
         const pos: u32 = @intCast(extra.items.len);
-        try extra.appendSlice(gpa, &.{ sp.site.line, sp.site.column });
+        try extra.appendSlice(gpa, &.{ sp.site.line, sp.site.column, @bitCast(Ir.DbgInline.Flags{ .backend = true }) });
         insts.set(@backingInt(begin), .{ .tag = .dbg_inline_begin, .data = .{ .dbg_inline = .{ .func = sp.site.callee, .payload = pos } } });
         insts.set(@backingInt(end), .{ .tag = .dbg_inline_end, .data = .{ .no_op = {} } });
         const payload: u32 = @intCast(extra.items.len);

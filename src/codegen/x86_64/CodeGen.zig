@@ -92,6 +92,13 @@ ret_label: ?Encoder.Label = null,
 ret_bound: bool = false,
 /// Where the epilogue's `ret` ends, before shortening.
 ret_end: u32 = 0,
+/// Panic calls in code the backend inlined, which call a chain of stubs
+/// emitted after the epilogue instead of the handler (`panicThroughStubs`),
+/// with the inlined calls open at each (`stub_open`), and the stubs'
+/// bytes so far.
+stub_chains: std.ArrayList(StubChain) = .empty,
+stub_open: std.ArrayList(OpenInline) = .empty,
+stub_bytes: u32 = 0,
 /// Emitting the cold blocks, after the others: their values get slots of
 /// their own (see `Ssa.place`).
 in_cold: bool = false,
@@ -134,7 +141,12 @@ dbg_open: std.ArrayList(OpenInline) = .empty,
 
 /// An inlined call whose end is not reached yet, and the caller's row to
 /// resume after it.
-const OpenInline = struct { index: u32, line: u32, column: u32 };
+const OpenInline = struct { index: u32, line: u32, column: u32, backend: bool = false };
+
+/// A panic call through stubs: the stubs' first label, the handler, the
+/// inlined calls open at the call (`stub_open[open_start..][0..open_len]`),
+/// and the row of the check, relative to the innermost.
+const StubChain = struct { label: Encoder.Label, target: SymbolKey, open_start: u32, open_len: u32, line: u32, column: u32 };
 
 const ColdStart = struct { line: u32, column: u32, open_start: u32, open_len: u32 };
 
@@ -234,6 +246,8 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         cg.slot_alias.deinit(gpa);
         cg.cold_starts.deinit(gpa);
         cg.cold_open.deinit(gpa);
+        cg.stub_chains.deinit(gpa);
+        cg.stub_open.deinit(gpa);
         cg.cover_pcs.deinit(gpa);
     }
     if (cover) cg.cover_key = Emit.coverageKeys(try emit.funcKey(ir.func))[0];
@@ -259,12 +273,15 @@ pub fn generate(emit: *Emit, ir: *const Ir) Error!void {
         try cg.setupParams();
     }
     try cg.emitBlocks();
-    if (cg.ret_label != null and !cg.ret_bound) {
+    // Stubs need the epilogue's frame description even in a function
+    // that never returns.
+    if ((cg.ret_label != null or cg.stub_chains.items.len != 0) and !cg.ret_bound) {
         // The last block does not return: the epilogue follows it, in the
         // function's own line table.
         if (cg.in_cold or cg.dbg_open.items.len != 0) try cg.e.switchLines(0, 0);
         try cg.epilogue();
     }
+    try cg.emitStubs();
     try cg.e.finishShortened();
     frame_patch = cg.e.mapOffset(@intCast(frame_patch));
     for (cg.cover_pcs.items) |*pc| pc.* = cg.e.mapOffset(pc.*);
@@ -401,7 +418,7 @@ fn beginInline(cg: *CodeGen, func: Index, site: Ir.DbgInline) Error!void {
         .high = @intCast(cg.e.code.items.len),
         .parent = if (cg.dbg_open.getLastOrNull()) |o| o.index else Atom.Debug.Inline.none,
     });
-    try cg.dbg_open.append(cg.gpa, .{ .index = index, .line = cg.dbg_line, .column = cg.dbg_column });
+    try cg.dbg_open.append(cg.gpa, .{ .index = index, .line = cg.dbg_line, .column = cg.dbg_column, .backend = site.flags.backend });
     try cg.e.switchLines(file, index + 1);
 }
 
@@ -1783,6 +1800,102 @@ fn condFlags(cg: *CodeGen, inst: Inst.Index) Error!Encoder.Cond {
     }
 }
 
+/// Calls panic handler `target` from cold code through a chain of stubs,
+/// one per call the backend inlined that is open here, so that the stack
+/// trace shows the frames those calls would have had (docs/architecture.md,
+/// "Synthetic panic frames"): the call itself is at the outermost such
+/// call's site, in its caller, and the stubs after the epilogue
+/// (`emitStubs`) are at each next site inward, the last at the check.
+/// Without such calls open, or past the stubs' room, calls `target`.
+fn panicThroughStubs(cg: *CodeGen, target: SymbolKey) Error!void {
+    const open = cg.dbg_open.items;
+    var first: ?usize = null;
+    var depth: u32 = 0;
+    for (open, 0..) |o, i| if (o.backend) {
+        if (first == null) first = i;
+        depth += 1;
+    };
+    // `Atom.Unwind.epilogue` counts the stubs and probes in 16 bits.
+    if (first == null or cg.stub_bytes + 5 * depth > 0xfe00) return cg.e.call(.{ .sym = target });
+    cg.stub_bytes += 5 * depth;
+    const b = first.?;
+    const label = try cg.e.newLabel();
+    try cg.stub_chains.append(cg.gpa, .{ .label = label, .target = target, .open_start = @intCast(cg.stub_open.items.len), .open_len = @intCast(open.len), .line = cg.dbg_line, .column = cg.dbg_column });
+    try cg.stub_open.appendSlice(cg.gpa, open);
+    // Each stub's call pushes 8 bytes; the handler is entered as from an
+    // aligned call.
+    if (depth % 2 == 1) try cg.e.alu(.sub, .qword, .{ .reg = .rsp }, .{ .imm = 8 });
+    // The call is the outermost inlined call's caller's: the inlined calls
+    // from there in end before it. No code that runs follows it.
+    const pc: u32 = @intCast(cg.e.code.items.len);
+    for (open[b..]) |o| cg.dbg_inlines.items[o.index].high = pc;
+    const site = cg.dbg_inlines.items[open[b].index];
+    if (b != 0) {
+        try cg.e.switchLines(cg.dbg_inlines.items[open[b - 1].index].file, open[b - 1].index + 1);
+    } else try cg.e.switchLines(0, 0);
+    cg.dbg_open.shrinkRetainingCapacity(b);
+    cg.dbg_line = site.call_line;
+    cg.dbg_column = site.call_column;
+    try cg.e.line(site.call_line, site.call_column);
+    try cg.e.call(.{ .label = label });
+}
+
+/// The stubs of the panic calls `panicThroughStubs` made, after the
+/// epilogue: frameless code whose CFA is rsp + 8 (`Atom.Unwind.epilogue`).
+/// Stub k is in entries copying the inlined calls open from the k-th
+/// backend-inlined call to the next one (from the function's own for the
+/// first), at the next one's site, and calls stub k + 1, which follows; the
+/// last is at the check and calls the handler.
+fn emitStubs(cg: *CodeGen) Error!void {
+    for (cg.stub_chains.items) |ch| {
+        cg.e.bind(ch.label);
+        const open = cg.stub_open.items[ch.open_start..][0..ch.open_len];
+        const clones_start = cg.dbg_inlines.items.len;
+        var parent: u32 = Atom.Debug.Inline.none;
+        var i: usize = 0;
+        while (i < open.len) {
+            // The entries up to the next backend-inlined call after `i`.
+            var end = i + 1;
+            while (end < open.len and !open[end].backend) end += 1;
+            if (i == 0) {
+                // The first stub's: those up to the second backend call.
+                end = 0;
+                var seen: u32 = 0;
+                while (end < open.len) : (end += 1) {
+                    if (open[end].backend) {
+                        seen += 1;
+                        if (seen == 2) break;
+                    }
+                }
+            }
+            const pc: u32 = @intCast(cg.e.code.items.len);
+            for (open[i..end]) |o| {
+                var copy = cg.dbg_inlines.items[o.index];
+                copy.low = pc;
+                copy.parent = parent;
+                parent = @intCast(cg.dbg_inlines.items.len);
+                try cg.dbg_inline_callees.append(cg.gpa, cg.dbg_inline_callees.items[o.index]);
+                try cg.dbg_inlines.append(cg.gpa, copy);
+            }
+            try cg.e.switchLines(cg.dbg_inlines.items[parent].file, parent + 1);
+            if (end < open.len) {
+                const site = cg.dbg_inlines.items[open[end].index];
+                try cg.e.line(site.call_line, site.call_column);
+                const next = try cg.e.newLabel();
+                try cg.e.call(.{ .label = next });
+                cg.e.bind(next);
+            } else {
+                try cg.e.line(ch.line, ch.column);
+                try cg.e.call(.{ .sym = ch.target });
+            }
+            i = end;
+        }
+        const end_pc: u32 = @intCast(cg.e.code.items.len);
+        for (cg.dbg_inlines.items[clones_start..]) |*in| in.high = end_pc;
+    }
+    if (cg.stub_chains.items.len != 0) try cg.e.switchLines(0, 0);
+}
+
 /// The function's epilogue, at `ret_label`: restores the saved registers
 /// and returns.
 fn epilogue(cg: *CodeGen) Error!void {
@@ -1840,7 +1953,7 @@ fn emitBlocks(cg: *CodeGen) Error!void {
             copy.high = pc;
             copy.parent = if (cg.dbg_open.getLastOrNull()) |p| p.index else Atom.Debug.Inline.none;
             try cg.dbg_inline_callees.append(cg.gpa, cg.dbg_inline_callees.items[o.index]);
-            try cg.dbg_open.append(cg.gpa, .{ .index = @intCast(cg.dbg_inlines.items.len), .line = o.line, .column = o.column });
+            try cg.dbg_open.append(cg.gpa, .{ .index = @intCast(cg.dbg_inlines.items.len), .line = o.line, .column = o.column, .backend = o.backend });
             try cg.dbg_inlines.append(cg.gpa, copy);
         }
         if (cg.dbg_open.getLastOrNull()) |o| {
@@ -3153,6 +3266,7 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     const in_pair = cg.pairOf(inst.toRef());
     const in_xmm = cg.xmmOf(inst.toRef());
     const dst = if (in_rax or in_pair != null or in_xmm != null) null else try cg.resultMem(inst, ret_ty);
+    var stack_args = false;
     if (is_c) {
         const vals = try cg.gpa.alloc(Val, args.len);
         defer cg.gpa.free(vals);
@@ -3165,7 +3279,10 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
         // The outgoing area first (copies use rax, rsi, rdi, and rcx), then
         // SSE registers (rax), then general registers. The arguments are
         // not in caller-saved registers: a call is a clobber point.
-        for (args, locs) |arg, l| if (l == .stack) try cg.copyTo(Mem.at(.rsp, @intCast(l.stack)), arg);
+        for (args, locs) |arg, l| if (l == .stack) {
+            stack_args = true;
+            try cg.copyTo(Mem.at(.rsp, @intCast(l.stack)), arg);
+        };
         for (args, locs) |arg, l| if (l == .sse) try cg.loadXmm(xmm_args[l.sse], try cg.valOf(arg));
         for (args, tys, locs) |arg, ty, l| switch (l) {
             .gpr => |r| try cg.loadGpr(c_arg_regs[r], arg, ty),
@@ -3183,7 +3300,11 @@ fn call(cg: *CodeGen, inst: Inst.Index, data: Inst.Data) Error!void {
     if (!is_c) try cg.loadTrace(.rax);
     if (callee_val) |f| {
         if (callee_ty.is_var_args) try cg.e.mov(.dword, .{ .reg = .rax }, .{ .imm = va_sse });
-        try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
+        // A panic in code the backend inlined, with its arguments in
+        // registers, gets the frames of the calls it was inlined from.
+        if (ret_ty == .noreturn_type and cg.in_cold and !is_c and !stack_args and !cg.outermost_frame) {
+            try cg.panicThroughStubs(try cg.emit.funcKey(f));
+        } else try cg.e.call(.{ .sym = try cg.emit.funcKey(f) });
     } else {
         // r11 is not an argument register in either convention.
         try cg.load(.r11, callee_ref);
