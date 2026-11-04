@@ -542,12 +542,14 @@ const Walker = struct {
             .{ .lo = 0, .hi = (@as(i128, 1) << bits) - 1 };
     }
 
+    /// A constant's value. `term` keeps its exact value (sign-extended
+    /// to 64 bits when negative), not its bits in `info`: a fact from a
+    /// widened compare (`@as(i16, x) < 130`, with `x: i8`) relates `x` to
+    /// a constant its own type cannot hold, and truncating 130 to an i8
+    /// made it -126. Facts and queries agree in signedness.
     fn value(t: Term, info: Type.IntInfo) i128 {
         const v = t.bits();
-        if (info.signedness == .unsigned) return v;
-        const bits: u7 = @intCast(info.bits);
-        const sh: u6 = @intCast(64 - @as(u7, bits));
-        return @as(i64, @bitCast(v << sh)) >> sh;
+        return if (info.signedness == .unsigned) v else @as(i64, @bitCast(v));
     }
 
     /// The bounds of `t` the facts give: constant bounds, and one less

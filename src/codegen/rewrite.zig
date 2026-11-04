@@ -352,8 +352,8 @@ const Walker = struct {
         const l = w.constOf(bin.lhs);
         const r = w.constOf(bin.rhs);
         const is = struct {
-            fn f(c: ?Const, v: u64) bool {
-                return if (c) |k| k.bits == v else false;
+            fn f(c: ?Const, v: i128) bool {
+                return if (c) |k| value(k) == v else false;
             }
         }.f;
         // The result, as an operand or 0; then the bit is 0.
@@ -517,7 +517,8 @@ fn matches(pat: Pat, c: ?Const, ref: Inst.Ref, other: Inst.Ref) bool {
         .any => true,
         .k => c != null,
         .zero => if (c) |k| k.bits == 0 else false,
-        .one => if (c) |k| k.bits == 1 else false,
+        // The value 1: an i1's only set bit is -1.
+        .one => if (c) |k| value(k) == 1 else false,
         .ones => if (c) |k| k.bits == truncate(std.math.maxInt(u64), k.info.bits) else false,
         .same => ref == other and ref.toIndex() != null,
     };
