@@ -2622,7 +2622,36 @@ fn genInst(cg: *CodeGen, inst: Inst.Index) Error!void {
                 }
                 return;
             }
-            for (elems, 0..) |elem, i| {
+            // A run of one element over 128 bytes (a `@splat`): copies of
+            // the element until they span 64 bytes, then copies of what is
+            // written until it spans 512, then one overlapping forward
+            // `rep movsb` repeats that. (Overlapping at a distance under
+            // 512 bytes leaves the fast-string path: 3x slower at 128.)
+            var first: usize = 0;
+            if (elems.len > 1 and ip.keyTag(ty) != .struct_type and ip.keyTag(ty) != .tuple_type) {
+                const elem_size = Type.abiSize(ip, cg.typeOf(elems[0]));
+                const run = for (elems, 0..) |elem, i| {
+                    if (elem != elems[0]) break i;
+                } else elems.len;
+                const total = run * elem_size;
+                if (total > 128) {
+                    var span: u64 = 0;
+                    while (span < 64) : (span += elem_size) try cg.copyTo(offsetMem(dst, span), elems[0]);
+                    while (span < 512 and span < total) {
+                        const n = @min(span, total - span);
+                        try cg.copyMem(offsetMem(dst, span), dst, n);
+                        span += n;
+                    }
+                    if (span < total) {
+                        try cg.e.lea(.qword, .rsi, dst);
+                        try cg.e.lea(.qword, .rdi, offsetMem(dst, span));
+                        try cg.e.mov(.qword, .{ .reg = .rcx }, .{ .imm = @intCast(total - span) });
+                        try cg.e.repMovsb();
+                    }
+                    first = run;
+                }
+            }
+            for (elems[first..], first..) |elem, i| {
                 const off = switch (ip.indexToKey(ty)) {
                     .array_type => |a| i * Type.abiSize(ip, a.child),
                     .vector_type => |v| i * Type.abiSize(ip, v.child),
