@@ -1034,7 +1034,7 @@ class Gen:
             (1, "defer"), (1, "guard"), (1, "labeled"), (1, "inlinefor"), (1, "brk"), (1, "ret"),
             (1, "statesw"), (2, "bce"), (2, "copy"), (2, "alias"), (2, "repeat"), (2, "vector"), (3, "prove"),
             (2, "sroa"), (2, "addr"), (1, "parent"), (2, "live"), (2, "byref"), (2, "window"),
-            (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"),
+            (2, "wide"), (2, "rot"), (2, "not"), (2, "bigcopy"), (2, "range"), (2, "optreg"),
         ]
         if d >= 3 or ctx["stmts"] > ctx["stmt_cap"]:
             w = [(10, "decl"), (9, "assign"), (6, "sink")]
@@ -1882,6 +1882,11 @@ class Gen:
         if kind == "fw":
             self.sink(ctx, f"{name}({g}, {self.r.randint(0, 3)})", U64)
             return
+        if kind == "perm":
+            ag = ["gB", "KB"]
+            self.sink(ctx, f"permB({self.int_expr(ctx, U64, 1)}, {self.pick(ag)}, {self.int_expr(ctx, U32, 1)}, "
+                           f"{self.pick(ag)}, {self.int_expr(ctx, Int(True, 16), 1)})", U64)
+            return
         if kind == "many":
             big = self.big.name()
             locs = [p for p in self.paths(ctx, lambda x: x.name() == big, depth=1)]
@@ -1978,6 +1983,18 @@ class Gen:
             out.append("}")
             self.byref.append(("bp", name, t, None))
         self.huge_fns = {k_: n_ for k_, n_, t_, _ in self.byref if t_ is self.huge}
+        # Small optionals: wrap, unwrap-or, map (s_optreg).
+        for o in self.opt_types():
+            tn, nm = o["t"], o["n"]
+            out.append(f"fn ow_{nm}(x: {tn}, c: bool) ?{tn} {{ return if (c) x else null; }}")
+            out.append(f"fn ou_{nm}(o: ?{tn}, d: {tn}) {tn} {{ return o orelse d; }}")
+            out.append(f"fn om_{nm}(o: ?{tn}) ?{tn} {{ const v = o orelse return null; return {o['step']('v')}; }}")
+        # Arguments forwarded in another order (the callee's registers are
+        # a permutation of the caller's).
+        out.append(f"fn permB(x: u64, s1: {bt}, y: u32, s2: {bt}, z: i16) u64 {{")
+        out.append(f"    return manyB(x, y, s2, z, @truncate(x), y, s1, @truncate(y), @bitCast(@as(u32, @truncate(x))), x +% 1, s2);")
+        out.append("}")
+        self.byref.append(("perm", "permB", big, None))
         out.append("")
 
     def s_range(self, ctx):
@@ -2095,11 +2112,87 @@ class Gen:
             e("}")
             self.sink(ctx, i, USIZE)
 
+    def opt_types(self):
+        """The small optional payloads s_optreg uses: name, type, a value
+        expression, a step (for om_ and loop accumulators), and a fold to u64."""
+        if getattr(self, "_opts", None) is not None:
+            return self._opts
+        en = self.enums[0]
+        errs = lambda v, other: f"switch ({v}) {{ error.Alpha => error.Beta, error.Beta => error.Gamma, {other} }}"
+        self._opts = [
+            {"n": "u4", "t": "u4", "val": lambda g, c: g.int_expr(c, Int(False, 4), 1), "step": lambda v: f"{v} +% 3",
+             "u64": lambda v: f"@as(u64, {v})"},
+            {"n": "u32", "t": "u32", "val": lambda g, c: g.int_expr(c, U32, 1), "step": lambda v: f"{v} *% 0x9E37 +% 1",
+             "u64": lambda v: f"@as(u64, {v})"},
+            {"n": "bool", "t": "bool", "val": lambda g, c: g.bool_expr(c, 1), "step": lambda v: f"!{v}",
+             "u64": lambda v: f"@as(u64, @intFromBool({v}))"},
+            {"n": "en", "t": en.ename, "val": lambda g, c: f"@as({en.ename}, .{g.pick(en.tags)[0]})",
+             "step": lambda v: f"switch ({v}) {{ {', '.join(f'.{a} => .{b}' for (a, _), (b, _) in zip(en.tags, en.tags[1:] + en.tags[:1]))} }}",
+             "u64": lambda v: self.to_u64(v, en)},
+            {"n": "ae", "t": "anyerror", "val": lambda g, c: f"@as(anyerror, error.{g.pick(ERRS)})",
+             "step": lambda v: errs(v, "else => error.Alpha"),
+             "u64": lambda v: f"@as(u64, switch ({v}) {{ error.Alpha => 11, error.Beta => 12, error.Gamma => 13, else => 14 }})"},
+            {"n": "es", "t": "E", "val": lambda g, c: f"@as(E, error.{g.pick(ERRS)})",
+             "step": lambda v: errs(v, "error.Gamma => error.Alpha"),
+             "u64": lambda v: f"@as(u64, switch ({v}) {{ error.Alpha => 21, error.Beta => 22, error.Gamma => 23 }})"},
+        ]
+        return self._opts
+
+    def s_optreg(self, ctx):
+        """Small optionals of ints, bools, enums and error sets: wrapped,
+        unwrapped, null-tested, passed, returned, and loop accumulators."""
+        o = self.pick(self.opt_types())
+        tn, nm = o["t"], o["n"]
+        e = lambda s_: self.emit(ctx, s_)
+        a, b = self.fresh("oa"), self.fresh("ob")
+        cond = self.bool_expr(ctx, 1)
+        if self.chance(0.5) or ctx["fn"].pure:
+            e(f"const {a}: ?{tn} = if ({cond}) @as({tn}, {o['val'](self, ctx)}) else null;")
+        else:
+            e(f"const {a}: ?{tn} = ow_{nm}({o['val'](self, ctx)}, {cond});")
+        k = self.r.randrange(5)
+        if k == 0:
+            v = self.fresh("ov")
+            e(f"if ({a}) |{v}| {{")
+            ctx["indent"] += 1
+            self.sink(ctx, o["u64"](v), U64)
+            ctx["indent"] -= 1
+            e("} else {")
+            ctx["indent"] += 1
+            self.sink(ctx, "@as(u8, 0x5a)", Int(False, 8))
+            ctx["indent"] -= 1
+            e("}")
+        elif k == 1:
+            self.sink(ctx, f"@as(u8, @intFromBool({a} {self.pick(['==', '!='])} null))", Int(False, 8))
+            self.sink(ctx, o["u64"](f"({a} orelse {o['val'](self, ctx)})"), U64)
+        elif k == 2 and not ctx["fn"].pure:
+            e(f"const {b}: ?{tn} = om_{nm}({a});")
+            self.sink(ctx, o["u64"](f"ou_{nm}({b}, {o['val'](self, ctx)})"), U64)
+            self.sink(ctx, f"@as(u8, @intFromBool({b} == null))", Int(False, 8))
+        elif k == 3:
+            # A loop accumulator.
+            i = self.fresh("oi")
+            e(f"var {b}: ?{tn} = {a};")
+            e(f"for (0..{self.r.randint(1, 5)}) |{i}| {{")
+            ctx["indent"] += 1
+            e(f"{b} = if ({b}) |v| (if (({i} & 1) == 0) @as(?{tn}, {o['step']('v')}) else null) else {o['val'](self, ctx)};")
+            ctx["indent"] -= 1
+            e("}")
+            self.sink(ctx, f"@as(u8, @intFromBool({b} != null))", Int(False, 8))
+            self.sink(ctx, o["u64"](f"({b} orelse {o['val'](self, ctx)})"), U64)
+        else:
+            # Unwrap with .? behind a null test.
+            e(f"if ({a} != null) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, o["u64"](f"{a}.?"), U64)
+            ctx["indent"] -= 1
+            e("}")
+
     def s_wide(self, ctx):
         """64x64->128 widening multiplies and their halves, wide wrapping and
         checked arithmetic, and u128 compares, shifts and division."""
         sg = self.chance(0.35)
-        h, w = (Int(True, 64), Int(True, 128)) if sg else (U64, Int(False, 128))
+        h, w = (Int(True, 64), Int(True, 128)) if sg else (self.pick([U64, U64, U32, Int(False, 17), Int(False, 48), Int(False, 63)]), Int(False, 128))
         a, b, p = self.fresh("xa"), self.fresh("xb"), self.fresh("xp")
         e = lambda x: self.emit(ctx, x)
         ae, be = self.int_expr(ctx, h, 1), self.int_expr(ctx, h, 1)
@@ -2163,7 +2256,38 @@ class Gen:
         e = lambda s_: self.emit(ctx, s_)
         op = self.pick(['<', '<=', '==', '!=', '>', '>='])
         e(f"const {c}: bool = {a} {op} {b};")
-        k = self.r.randrange(4)
+        k = self.r.randrange(6)
+        if k == 4:
+            # The overflow bit of an add/sub/mul.
+            ob = self.fresh("no")
+            e(f"const {ob} = @{self.pick(['add', 'sub', 'mul'])}WithOverflow({a}, {b});")
+            e(f"if (!({ob}[1] == 1)) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"{ob}[0]", t)
+            ctx["indent"] -= 1
+            e("} else {")
+            ctx["indent"] += 1
+            self.sink(ctx, f"@as(u8, @intFromBool({c}))", Int(False, 8))
+            ctx["indent"] -= 1
+            e("}")
+            return
+        if k == 5:
+            # Float compares that NaN makes false both ways.
+            f = self.fresh("nf")
+            ft = self.pick(["f32", "f64"])
+            nan = f"std.math.nan({ft})" if self.chance(0.5) else f"@as({ft}, 1.5)"
+            e(f"const {f}: {ft} = if ({c}) {nan} else @floatFromInt({self.conv(a, t, Int(True, 32))});")
+            fop = self.pick(['<', '<=', '==', '!=', '>', '>='])
+            e(f"if (!({f} {fop} @as({ft}, 2.0))) {{")
+            ctx["indent"] += 1
+            self.sink(ctx, f"@as(u8, @intFromBool(std.math.isNan({f})))", Int(False, 8))
+            ctx["indent"] -= 1
+            e("} else {")
+            ctx["indent"] += 1
+            self.sink(ctx, f"@as(u8, {self.r.randint(0, 200)})", Int(False, 8))
+            ctx["indent"] -= 1
+            e("}")
+            return
         if k == 0:
             e(f"if (!({a} {op} {b})) {{")
             self.block(ctx, 1)
