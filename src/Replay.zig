@@ -80,11 +80,13 @@ dependees: []?Zcu.Dependee,
 unit_nodes: std.AutoHashMapUnmanaged(Zcu.AnalUnit, u32) = .empty,
 decoder: results.Decoder(Resolver),
 keyer: Incremental.Keyer,
-/// Declarations (their namespace and index in its `decls`) by
-/// `Atom.SymbolKey.fromName(nav.key)`, to refresh inlined callees' lines:
-/// those of the first `navs_indexed` namespaces.
+/// Declarations in changed files (their namespace and index in its
+/// `decls`) by `Atom.SymbolKey.fromName(nav.key)`, to refresh inlined
+/// callees' lines: those of the first `navs_indexed` namespaces.
 navs_by_key: std.AutoHashMapUnmanaged(Atom.SymbolKey, struct { ns: u32, i: u32 }) = .empty,
 navs_indexed: usize = 0,
+/// `isChangedPath` by debug-info path, owning its keys.
+changed_paths: std.StringHashMapUnmanaged(bool) = .empty,
 deps: std.ArrayList(Zcu.Dependee) = .empty,
 /// A lazy edit build (step 4b): green units are not loaded unless an
 /// analysis reads them, and their functions' atoms stay in the pack; the
@@ -461,6 +463,9 @@ pub fn destroy(r: *Replay) void {
     r.decoder.deinit();
     r.keyer.deinit();
     r.navs_by_key.deinit(gpa);
+    var paths = r.changed_paths.keyIterator();
+    while (paths.next()) |k| gpa.free(k.*);
+    r.changed_paths.deinit(gpa);
     r.deps.deinit(gpa);
     gpa.destroy(r);
 }
@@ -696,13 +701,10 @@ pub fn refreshInlines(r: *Replay, d: *const Atom.Debug) !?[]const Atom.Debug.Inl
     const zcu = r.zcu;
     var out: ?[]Atom.Debug.Inline = null;
     for (d.inlines, 0..) |in, i| {
-        const nav_index = (try r.navByKey(d.inline_callees[i])) orelse {
-            if (r.isChangedPath(debugPath(d, in.file))) return null;
-            continue;
-        };
-        const nav = zcu.ip.getNav(nav_index);
-        if (!r.isChangedFile(nav.file)) continue;
-        const line = zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_line;
+        // A callee's declaration is in the file its inlined code is.
+        if (!try r.isChangedPathMemo(debugPath(d, in.file))) continue;
+        const decl = (try r.declByKey(d.inline_callees[i])) orelse return null;
+        const line = zcu.file(decl.file).zir.getDeclaration(decl.inst).src_line;
         if (line == in.base_line) continue;
         if (out == null) out = try r.emit.allocator().dupe(Atom.Debug.Inline, d.inlines);
         out.?[i].base_line = line;
@@ -710,18 +712,30 @@ pub fn refreshInlines(r: *Replay, d: *const Atom.Debug) !?[]const Atom.Debug.Inl
     return out orelse d.inlines;
 }
 
-/// The declaration whose key is `key`, among the namespaces created so far.
-fn navByKey(r: *Replay, key: Atom.SymbolKey) !?InternPool.NavIndex {
+/// The file and `declaration` instruction of the declaration in a
+/// changed file whose key is `key`, among the namespaces created so far.
+fn declByKey(r: *Replay, key: Atom.SymbolKey) !?struct { file: u32, inst: Zir.Inst.Index } {
     const zcu = r.zcu;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(r.gpa);
-    for (zcu.namespaces.items[r.navs_indexed..], r.navs_indexed..) |*ns, ns_index| for (0..ns.decls.count()) |i| {
-        const k = try zcu.declKey(r.gpa, ns, i, &buf);
-        try r.navs_by_key.put(r.gpa, .fromName(k), .{ .ns = @intCast(ns_index), .i = @intCast(i) });
-    };
+    for (zcu.namespaces.items[r.navs_indexed..], r.navs_indexed..) |*ns, ns_index| {
+        if (!r.isChangedFile(ns.file)) continue;
+        for (0..ns.decls.count()) |i| {
+            const k = try zcu.declKey(r.gpa, ns, i, &buf);
+            try r.navs_by_key.put(r.gpa, .fromName(k), .{ .ns = @intCast(ns_index), .i = @intCast(i) });
+        }
+    }
     r.navs_indexed = zcu.namespaces.items.len;
     const d = r.navs_by_key.get(key) orelse return null;
-    return try zcu.declNav(d.ns, d.i);
+    const ns = &zcu.namespaces.items[d.ns];
+    return .{ .file = ns.file, .inst = ns.decl_insts.items[d.i] };
+}
+
+fn isChangedPathMemo(r: *Replay, path: []const u8) !bool {
+    if (r.changed_paths.get(path)) |c| return c;
+    const c = r.isChangedPath(path);
+    try r.changed_paths.put(r.gpa, try r.gpa.dupe(u8, path), c);
+    return c;
 }
 
 /// Path `file` of the files debug info `d` names: 0 is its own.
