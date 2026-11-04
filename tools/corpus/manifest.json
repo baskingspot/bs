@@ -965,6 +965,130 @@
      ]
     }
    ]
+  },
+  {
+   "name": "libxev",
+   "url": "https://github.com/mitchellh/libxev",
+   "commit": "451a2bc03644c2b70fb28a808313d12989bfa8e3",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "xev-test",
+     "edit": [
+      "src/backend/io_uring.zig",
+      "        const nsec = @divFloor(self.cached_now.nsec, std.time.ns_per_ms);"
+     ]
+    },
+    {
+     "name": "xev"
+    }
+   ]
+  },
+  {
+   "name": "zio",
+   "url": "https://github.com/lalinsky/zio",
+   "commit": "d606d6d011bc8d8e2a02305b5201fd843f6fa0ad",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "examples"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/runtime.zig",
+      "        const affinity = @min(Executor.max_executors, std.Thread.getCpuCount() catch 1);"
+     ]
+    },
+    {
+     "name": "hello-world",
+     "run": [],
+     "edit": [
+      "src/runtime.zig",
+      "        const affinity = @min(Executor.max_executors, std.Thread.getCpuCount() catch 1);"
+     ]
+    },
+    {
+     "name": "coro-demo",
+     "run": [],
+     "note": "Upstream's build aborts here, zap's does not: the demo gives each coroutine a 64 KiB stack, and upstream's Debug frames fault below the committed part of it ('Coroutine stack overflow!', guard page fault false), while zap's smaller frames fit and the demo prints sum = 10."
+    },
+    {
+     "name": "mutex-demo",
+     "run": []
+    },
+    {
+     "name": "ev-demo",
+     "run": []
+    },
+    {
+     "name": "producer-consumer",
+     "run": []
+    }
+   ]
+  },
+  {
+   "name": "zedis",
+   "url": "https://github.com/barddoo/zedis",
+   "commit": "a2535a07ae4636ca26c37648285ccc4d5cb7680a",
+   "build": [
+    [
+     "install"
+    ],
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test-unit",
+     "edit": [
+      "src/commands/string.zig",
+      "    const new_value = try incr_decr(store, key, 1);"
+     ]
+    },
+    {
+     "name": "zedis",
+     "edit": [
+      "src/commands/string.zig",
+      "    const new_value = try incr_decr(store, key, 1);"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "tokamak",
+   "url": "https://github.com/cztomsik/tokamak",
+   "commit": "f8126fa183a4490e4181d105593df68ffe82018c",
+   "build": [
+    [
+     "test"
+    ]
+   ],
+   "targets": [
+    {
+     "name": "test",
+     "edit": [
+      "src/dom/parser.zig",
+      "                    const el = try doc.createElement(tag);"
+     ],
+     "note": "Bug in tokamak, not zap; reported here in upstream style, not patched. Title: meta.transmute reads through a misaligned pointer (dom.document.test_0 panics with 'incorrect alignment'). Where: src/meta.zig:221 `pub inline fn transmute(comptime T: type, val: anytype) T { const tmp: *const T = @ptrCast(@alignCast(&val)); return tmp.*; }`, called by src/dom/local_name.zig:14 `meta.transmute(u128, x)` with x a ShortString, an extern struct { len21: u8, buf: [15]u8 } of alignment 1. `&val` is only 1-aligned, so the @alignCast to *const u128 (alignment 16) is illegal behavior whenever the parameter's stack slot is not 16-aligned; the safety check panics. Upstream 0.17.0 Debug passes tokamak's test only because its frame happens to put that slot on a 16-byte boundary. Reproduction (panics under upstream 0.17.0 and zap alike): const ShortString = extern struct { len21: u8 = 1, buf: [15]u8 = @splat(0) }; inline fn transmute(comptime T: type, val: anytype) T { const tmp: *const T = @ptrCast(@alignCast(&val)); return tmp.*; } noinline fn parse(n: u8) u128 { var pad: [3]u8 = .{ n, n, n }; _ = &pad; return transmute(u128, ShortString{ .len21 = pad[1] }); } pub fn main() void { _ = parse(4); } Suggested fix: `return @bitCast(val)` where the sizes match, or copy the bytes: `var tmp: T = undefined; @memcpy(std.mem.asBytes(&tmp), std.mem.asBytes(&val)); return tmp;`. With the copy, zap and upstream give the same 88 passed, 1 failed (http.client: AddressInUse in both)."
+    }
+   ]
   }
  ],
  "excluded": [
@@ -982,36 +1106,12 @@
    "reason": "every artifact links libc (-lc)"
   },
   {
-   "name": "libxev",
-   "url": "https://github.com/mitchellh/libxev",
-   "commit": "451a2bc03644c2b70fb28a808313d12989bfa8e3",
-   "reason": "every artifact links libc (-lc). On the libc branch, zap build test passes 142, skips 4, as upstream. Moves into the corpus once -lc is on main"
-  },
-  {
    "name": "zigmod",
    "reason": "links libyaml (C) and libc"
   },
   {
-   "name": "zio",
-   "url": "https://github.com/lalinsky/zio",
-   "commit": "d606d6d011bc8d8e2a02305b5201fd843f6fa0ad",
-   "reason": "links libc on Linux. On the libc branch, zap build test passes, as upstream. Moves into the corpus once -lc is on main"
-  },
-  {
    "name": "Avalanche",
    "reason": "links libc"
-  },
-  {
-   "name": "zedis",
-   "url": "https://github.com/barddoo/zedis",
-   "commit": "a2535a07ae4636ca26c37648285ccc4d5cb7680a",
-   "reason": "links libc (-lc). On the libc branch, zap build test passes 384/384, as upstream. Moves into the corpus once -lc is on main"
-  },
-  {
-   "name": "tokamak",
-   "url": "https://github.com/cztomsik/tokamak",
-   "commit": "f8126fa183a4490e4181d105593df68ffe82018c",
-   "reason": "its tests link libc (-lc) and translate src/c.h. dom.document.test_0 panics under zap with 'incorrect alignment' in meta.transmute, which @alignCasts the address of an align(1) parameter to *const u128; upstream panics on the same code in a reduction and passes tokamak only by stack layout luck. With transmute copying bytes instead, zap and upstream give the same 88/89 (http.client fails with AddressInUse in both). Moves into the corpus once -lc and translate-c are on main"
   },
   {
    "name": "zware",

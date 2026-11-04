@@ -28,7 +28,8 @@ a full build with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`; not timed).
   and `cwd` may name `{src}` (the checkout), `{zig_lib}` (upstream's lib
   directory), `{gen}` (the generation cache, where code generators write)
   or a `fetch`ed package, and a glob there names its first match. A run's
-  `output` file counts as part of its stdout.
+  `output` file counts as part of its stdout. A `note` explains a known
+  difference, such as a bug in the project that one compiler survives.
 - A project with `copy` instead of `url` is a directory of this checkout,
   copied to `.work/src/`: `zig-compiler` is upstream 0.17.0's own tools in
   `upstream/lib/compiler` (translate-c and resinator on Aro, Aro's tests,
@@ -52,6 +53,10 @@ a full build with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`; not timed).
     (the self-hosted backend).
   - zap gets the same command line as upstream: it takes every flag the
     corpus's build scripts pass.
+  - A module that is a translated C header (`b.addTranslateC`, recorded
+    from upstream's `translate-c` command) is translated again by each
+    compiler, `zig translate-c` or `zap translate-c`, into the build's
+    local cache, and that time counts in the cold build.
 - Both binaries run from the same path (programs print `argv[0]`). A test
   binary's verdict is its exit status and summary line (`All N tests
   passed.`); an executable's is its exit status and stdout.
@@ -63,10 +68,11 @@ a full build with `ZAP_CACHE_VERIFY` and `ZAP_CACHE_CHECK`; not timed).
 
 ## Scope
 
-zap compiles neither C nor `@cImport`, so only targets that build without C
-are in the corpus: no C sources, no C libraries, no libc. Projects whose
-every artifact links libc or a C library are listed under `excluded` in the
-manifest with the reason.
+zap compiles no C, so only targets that build without C sources are in the
+corpus. Linking glibc (`-lc`) and translating C headers (`zap translate-c`)
+are in: libxev, zio, zedis and tokamak link libc, and tokamak translates
+its `src/c.h`. Projects that need C sources or other C libraries are
+listed under `excluded` in the manifest with the reason.
 
 ## Scoreboard
 

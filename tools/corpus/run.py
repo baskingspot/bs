@@ -92,6 +92,11 @@ def setup(proj, zig, refresh):
             if not line.startswith("info(verbose): "):
                 continue
             words = shlex.split(line[len("info(verbose): "):])
+            if len(words) >= 2 and words[1] == "translate-c":
+                # A translated header, which each compiler translates
+                # itself for the targets that import it (`translate`).
+                cmds.setdefault("translate-c:" + translate_source(words), words)
+                continue
             if len(words) < 2 or words[1] not in ("build-exe", "test", "build-obj", "build-lib"):
                 continue
             if "--name" not in words:
@@ -128,6 +133,54 @@ def strip_common(words, cache_dir, out):
     if words[1] == "test":
         res.append("--test-no-exec")
     return res
+
+
+def translate_source(words):
+    """The C file a recorded `translate-c` command translates."""
+    rest = strip_translate(words)
+    return next(w for w in rest if not w.startswith("-") and w.endswith((".h", ".c")))
+
+
+def strip_translate(words):
+    res = []
+    i = 2
+    while i < len(words):
+        if words[i] in ("--cache-dir", "--global-cache-dir"):
+            i += 1
+        elif words[i] != "--listen=-":
+            res.append(words[i])
+        i += 1
+    return res
+
+
+def translate(compiler, words, cmds, cache_dir, src):
+    """Translates the C headers a target imports with `compiler`, into
+    `cache_dir`, and returns the target's command line importing them.
+    upstream's build cache names a translation `<digest>/<stem>.zig`, so a
+    module root whose name is a translated header's stem is that header."""
+    by_stem = {}
+    for key, tc in cmds.items():
+        if key.startswith("translate-c:"):
+            stem = os.path.splitext(os.path.basename(key[len("translate-c:"):]))[0] + ".zig"
+            if stem in by_stem:
+                sys.exit(f"two translated headers are named {stem}")
+            by_stem[stem] = tc
+    res = list(words)
+    for i, w in enumerate(words):
+        m = re.match(r"-M([^=]+)=(.*)$", w)
+        if not m or os.path.basename(m.group(2)) not in by_stem or "/o/" not in m.group(2):
+            continue
+        tc = by_stem[os.path.basename(m.group(2))]
+        argv = [compiler, "translate-c", *strip_translate(tc), "--cache-dir", cache_dir]
+        p = subprocess.run(argv, cwd=src, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+        if p.returncode != 0:
+            return None, p.stdout + p.stderr
+        out = os.path.join(cache_dir, "translated", os.path.basename(m.group(2)))
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w") as f:
+            f.write(p.stdout)
+        res[i] = f"-M{m.group(1)}={out}"
+    return res, ""
 
 
 def compile_argv(compiler, words, cache_dir, out):
@@ -201,7 +254,7 @@ def expand(arg, proj):
     return arg
 
 
-def build_target(proj, src, words, tgt, compilers, args):
+def build_target(proj, src, words, cmds, tgt, compilers, args):
     name = tgt["name"]
     is_test = words[1] == "test"
     out_dir = os.path.join(WORK, "out", proj["name"])
@@ -214,11 +267,18 @@ def build_target(proj, src, words, tgt, compilers, args):
         shutil.rmtree(cache, ignore_errors=True)
         if os.path.exists(out):
             os.remove(out)
-        argv = compile_argv(comp, words, cache, out)
-        r = {"argv": shlex.join(argv)}
         log(f"  {which}: {name}")
+        # Translating the target's C headers counts in its cold build.
+        t = time.monotonic()
+        target_words, output = translate(comp, words, cmds, cache, src)
+        tc_secs = time.monotonic() - t
+        if target_words is None:
+            result[which] = {"cold_local": tc_secs, "compile_exit": 1, "error": first_error(output), "output": output[-20000:]}
+            continue
+        argv = compile_argv(comp, target_words, cache, out)
+        r = {"argv": shlex.join(argv)}
         secs, code, output = timed(argv, src)
-        r["cold_local"] = secs
+        r["cold_local"] = tc_secs + secs
         r["compile_exit"] = code
         if code != 0:
             r["error"] = first_error(output)
@@ -352,7 +412,7 @@ def main():
         src, cmds = setup(proj, args.zig, args.refresh)
         if args.list:
             for name, words in cmds.items():
-                print(f"{proj['name']}: {words[1]} --name {name}")
+                print(f"{proj['name']}: {name}" if words[1] == "translate-c" else f"{proj['name']}: {words[1]} --name {name}")
             continue
         for tgt in proj["targets"]:
             if args.targets and tgt["name"] not in args.targets.split(","):
@@ -361,7 +421,7 @@ def main():
             if words is None:
                 log(f"  no recorded command for {tgt['name']}; rerun with --refresh")
                 continue
-            res = build_target(proj, src, words, tgt, compilers, args)
+            res = build_target(proj, src, words, cmds, tgt, compilers, args)
             if args.zap_only and (proj["name"], tgt["name"]) in old:
                 res["zig"] = old[(proj["name"], tgt["name"])].get("zig")
             res["verdict"] = compare(res, tgt)
