@@ -427,7 +427,7 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
         if (debug) |*dbg| {
             if (!try r.knowsDebugPaths(dbg)) return r.miss(g, "debug paths");
             if (changed_file) dbg.base_line = zcu.file(owner.file).zir.getDeclaration(owner.zir_inst).src_line;
-            if (dbg.inlines.len != 0) dbg.inlines = try r.refreshInlines(dbg);
+            if (dbg.inlines.len != 0) dbg.inlines = try r.refreshInlines(dbg) orelse return r.miss(g, "inlined callee's line");
         }
         try atoms.append(r.gpa, .{ .atom = d.atom, .debug = debug });
     }
@@ -467,12 +467,17 @@ fn loadFuncFallible(r: *Replay, func: Index) !bool {
 }
 
 /// Inlined callees' base lines, for those in changed files, as CodeGen
-/// would now write them.
-pub fn refreshInlines(r: *Replay, d: *const Atom.Debug) ![]const Atom.Debug.Inline {
+/// would now write them; null if a callee in a changed file has no
+/// declaration in this build yet (one in a container a green unit makes,
+/// such as a struct in a test), whose line is then unknown.
+pub fn refreshInlines(r: *Replay, d: *const Atom.Debug) !?[]const Atom.Debug.Inline {
     const zcu = r.zcu;
     var out: ?[]Atom.Debug.Inline = null;
     for (d.inlines, 0..) |in, i| {
-        const nav_index = (try r.navByKey(d.inline_callees[i])) orelse continue;
+        const nav_index = (try r.navByKey(d.inline_callees[i])) orelse {
+            if (r.isChangedPath(debugPath(d, in.file))) return null;
+            continue;
+        };
         const nav = zcu.ip.getNav(nav_index);
         if (!r.isChangedFile(nav.file)) continue;
         const line = zcu.file(nav.file).zir.getDeclaration(nav.zir_inst).src_line;
@@ -491,6 +496,20 @@ fn navByKey(r: *Replay, key: Atom.SymbolKey) !?InternPool.NavIndex {
     };
     r.navs_indexed = zcu.namespaces.items.len;
     return r.navs_by_key.get(key);
+}
+
+/// Path `file` of the files debug info `d` names: 0 is its own.
+fn debugPath(d: *const Atom.Debug, file: u32) []const u8 {
+    if (file == 0) return d.file;
+    var it = std.mem.splitScalar(u8, d.files, 0);
+    for (1..file) |_| _ = it.next();
+    return it.next() orelse "";
+}
+
+/// Whether the file with display path `path` changed, or is unknown.
+fn isChangedPath(r: *Replay, path: []const u8) bool {
+    for (r.zcu.fe.files.items, 0..) |*f, i| if (std.mem.eql(u8, f.display_path, path)) return r.isChangedFile(@intCast(i));
+    return true;
 }
 
 fn isChangedFile(r: *Replay, file: u32) bool {

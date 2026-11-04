@@ -1840,7 +1840,7 @@ fn refreshDebug(inc: *Incremental, rp: *Replay, d: *Manifest.Delta, i: u32) !voi
                 copy.base_line = l;
             };
             if (copy.inlines.len != 0) {
-                copy.inlines = try rp.refreshInlines(&copy);
+                copy.inlines = try rp.refreshInlines(&copy) orelse return error.Fallback;
                 if (copy.inlines.ptr != dbg.inlines.ptr) moved = true;
             }
             try debug.append(gpa, copy);
