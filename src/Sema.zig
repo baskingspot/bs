@@ -788,6 +788,8 @@ pub const Src = struct {
                         const lhs, const rhs = tree.nodeData(node).node_and_node;
                         return tree.nodeToSpan(if (o.index == 0) lhs else rhs);
                     },
+                    // An array type's length.
+                    .array_type, .array_type_sentinel => return tree.nodeToSpan(tree.fullArrayType(node).?.ast.elem_count),
                     // A switch's operand.
                     .@"switch", .switch_comma => return tree.nodeToSpan(tree.nodeData(node).node_and_extra[0]),
                     // A slice's operand, start, end and sentinel.
@@ -4545,7 +4547,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .array_type => blk: {
             const extra = sema.code.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const len = try sema.resolveInt(block, src, extra.lhs, .usize_type, "array length must be comptime-known");
+            const len = try sema.resolveInt(block, src.operandSrc(0), extra.lhs, .usize_type, "array length must be comptime-known");
             const elem_src: Src = .{ .base = src.base, .loc = .{ .array_elem = data.pl_node.src_node } };
             const elem = try sema.resolveType(block, elem_src, extra.rhs);
             try sema.validateArrayElemType(block, elem_src, elem);
@@ -4554,7 +4556,7 @@ fn analyzeInst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Re
         .array_type_sentinel => blk: {
             const extra = sema.code.extraData(Zir.Inst.ArrayTypeSentinel, data.pl_node.payload_index).data;
             const src = block.nodeSrc(data.pl_node.src_node);
-            const len = try sema.resolveInt(block, src, extra.len, .usize_type, "array length must be comptime-known");
+            const len = try sema.resolveInt(block, src.operandSrc(0), extra.len, .usize_type, "array length must be comptime-known");
             const elem_src: Src = .{ .base = src.base, .loc = .{ .array_elem = data.pl_node.src_node } };
             const elem = try sema.resolveType(block, elem_src, extra.elem_type);
             try sema.validateArrayElemType(block, elem_src, elem);
