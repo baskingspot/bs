@@ -2009,13 +2009,16 @@ fn planCopies(cg: *CodeGen) Error!void {
 
 /// Before allocation, copies decided with liveness:
 /// - A load of a value that lives in memory whose only user is a later
-///   `.auto` call, or the `ret` of a function that returns through memory,
-///   in the same block, with nothing between that may write memory, is not
-///   copied to a slot of its own: the call or `ret` copies the value from
-///   where the load points (`Home.deferred`). The pointer then lives until
-///   that use. The call copies its arguments one at a time, and neither
-///   the outgoing area nor the caller's result memory overlaps the memory
-///   read.
+///   `.auto` call, a store, or the `ret` of a function that returns
+///   through memory, in the same block or the next one on its path (whose
+///   only predecessor it is), with nothing between that may write memory,
+///   is not copied to a slot of its own: the call, store or `ret` copies
+///   the value from where the load points (`Home.deferred`). The pointer
+///   then lives until that use. The call copies its arguments one at a
+///   time, and neither the outgoing area nor the caller's result memory
+///   overlaps the memory read. A store's destination must be the memory
+///   read or not overlap it (`sameOrDisjoint`): the copy goes forward,
+///   where upstream's ReleaseSafe build copies with `memmove`.
 /// - An aggregate or union in memory whose only user is a store right
 ///   after it is built in the stored-to memory (`in_place`). The store's
 ///   pointer is live across the aggregate's lowering, which clobbers, so
@@ -2030,7 +2033,43 @@ fn planDeferred(cg: *CodeGen) Error!void {
     const datas = ir.instructions.items(.data);
     const fate = f.live.items(.fate);
     const ret_deferred = cg.fn_ty.cc == .auto and cg.autoClass(cg.fn_ty.return_type) == .memory;
-    for (f.layout.items) |block| {
+    // Each block's predecessor when it has exactly one, after forwarding.
+    const pred = try cg.gpa.alloc(u32, 2 * f.blocks.items.len);
+    defer cg.gpa.free(pred);
+    const pos = pred[f.blocks.items.len..];
+    const none = std.math.maxInt(u32);
+    @memset(pred[0..f.blocks.items.len], none);
+    for (f.layout.items, 0..) |block, li| pos[@backingInt(block)] = @intCast(li);
+    for (f.blocks.items, 0..) |b, bi| {
+        // An empty block forwarded to its target emits nothing.
+        if (@backingInt(f.fwd.items[bi]) != bi) continue;
+        const t = b.term;
+        switch (t.tag) {
+            .jump, .fallthrough => cg.addPred(pred, t.succ[0], @intCast(bi)),
+            .branch => for (t.succ) |x| cg.addPred(pred, x, @intCast(bi)),
+            .switch_br => {
+                const extra = ir.extraData(Ir.SwitchBr, datas[@backingInt(t.inst)].pl_op.payload);
+                for (f.switchCases(t, extra.data.cases_len)) |c| cg.addPred(pred, @backingInt(c), @intCast(bi));
+                cg.addPred(pred, t.succ[1], @intCast(bi));
+            },
+            .noreturn, .ret, .unreach => {},
+        }
+    }
+    for (f.layout.items, 0..) |block, li| {
+        const b = f.blocks.items[@backingInt(block)];
+        // A load may also be read where it is used in the next block on
+        // its path, if that block's only predecessor, earlier in the
+        // layout, branches to it without writing memory.
+        const prev: []const Inst.Index = if (pred[@backingInt(block)] < none - 1 and pos[pred[@backingInt(block)]] < li) prev: {
+            const p: Ssa.Block.Index = @fromBackingInt(pred[@backingInt(block)]);
+            const t = f.blocks.items[@backingInt(p)].term;
+            if (t.tag == .jump) {
+                if (tags[@backingInt(t.inst)] != .br) break :prev &.{};
+                const ty = cg.typeOf(datas[@backingInt(t.inst)].br.operand);
+                if (Type.abiSize(cg.ip, ty) != 0 and !cg.passInRegs(ty)) break :prev &.{};
+            }
+            break :prev f.blockInsts(p);
+        } else &.{};
         const values = f.blockInsts(block);
         for (values, 0..) |u, k| {
             if (fate[@backingInt(u)] != .normal) continue;
@@ -2041,23 +2080,97 @@ fn planDeferred(cg: *CodeGen) Error!void {
                     const callee_ty = if (Type.class(cg.ip, callee_fn_ty) == .pointer) Type.ptrInfo(cg.ip, callee_fn_ty).child else callee_fn_ty;
                     if (cg.ip.keyPayload(.func_type, callee_ty).cc != .auto) continue;
                     const extra = ir.extraData(Ir.Call, data.pl_op.payload);
-                    for (ir.refSlice(extra.end, extra.data.args_len)) |arg| cg.deferLoad(arg, values[0..k], f.live.items(.def)[@backingInt(u)]);
+                    for (ir.refSlice(extra.end, extra.data.args_len)) |arg| cg.deferLoad(arg, values[0..k], prev, f.live.items(.def)[@backingInt(u)]);
                 },
-                .store => try cg.storeInPlace(u, values[0..k]),
+                .store => {
+                    const bin = datas[@backingInt(u)].bin_op;
+                    // Not the initializer of a `*const` alloc that is its
+                    // memory (`planCopies`), which needs a slot.
+                    if (bin.rhs.toIndex()) |l| if (tags[@backingInt(l)] == .load and !cg.copy_private.contains(@backingInt(l)) and
+                        cg.sameOrDisjoint(datas[@backingInt(l)].ty_op.operand, bin.lhs))
+                        cg.deferLoad(bin.rhs, values[0..k], prev, f.live.items(.def)[@backingInt(u)]);
+                    try cg.storeInPlace(u, values[0..k]);
+                },
                 else => vector.deferOperands(cg, u, values[0..k]),
             }
         }
-        const b = f.blocks.items[@backingInt(block)];
         if (ret_deferred and b.term.tag == .ret and tags[@backingInt(b.term.inst)] == .ret) {
-            cg.deferLoad(datas[@backingInt(b.term.inst)].un_op, values, 2 * (b.start + b.len) + 1);
+            cg.deferLoad(datas[@backingInt(b.term.inst)].un_op, values, prev, 2 * (b.start + b.len) + 1);
         }
     }
 }
 
+/// Whether pointers `a` and `b` to values of one type point to the same
+/// memory or to memory that does not overlap: elements of one array, or
+/// memory in different locals or global variables.
+fn sameOrDisjoint(cg: *CodeGen, a: Ref, b: Ref) bool {
+    if (a == b) return true;
+    const ir = cg.ir;
+    const tags = ir.instructions.items(.tag);
+    const datas = ir.instructions.items(.data);
+    if (a.toIndex()) |ai| if (b.toIndex()) |bi| {
+        const ta = tags[@backingInt(ai)];
+        if ((ta == .ptr_elem_ptr or ta == .slice_elem_ptr) and tags[@backingInt(bi)] == ta and
+            ir.extraData(Ir.Bin, datas[@backingInt(ai)].ty_pl.payload).data.lhs == ir.extraData(Ir.Bin, datas[@backingInt(bi)].ty_pl.payload).data.lhs)
+            return true;
+    };
+    const ra = cg.ptrRoot(a);
+    const rb = cg.ptrRoot(b);
+    if (ra == .none or rb == .none) return false;
+    return !std.meta.eql(ra, rb);
+}
+
+/// The object pointer `ref` points into, if `sameOrDisjoint` can tell:
+/// a local (an `alloc`) or a global variable or constant.
+const PtrRoot = union(enum) { none, alloc: u32, nav: InternPool.NavIndex, uav: Index };
+
+fn ptrRoot(cg: *CodeGen, ref: Ref) PtrRoot {
+    const ir = cg.ir;
+    const ip = cg.ip;
+    var cur = ref;
+    for (0..8) |_| {
+        if (cur.toInterned()) |v0| {
+            var v = v0;
+            for (0..8) |_| {
+                if (ip.keyTag(v) != .ptr) return .none;
+                switch (ip.keyPayload(.ptr, v).base) {
+                    .nav => |n| {
+                        // Extern declarations of one name are one object.
+                        const val = ip.getNav(n).val;
+                        if (val == .none or ip.keyTag(val) == .extern_var) return .none;
+                        return .{ .nav = n };
+                    },
+                    .uav => |u| return if (ip.keyTag(u.val) == .extern_var or ip.keyTag(u.val) == .extern_func) .none else .{ .uav = u.val },
+                    .field => |f| v = f.base,
+                    .elem => |el| v = el.base,
+                    else => return .none,
+                }
+            }
+            return .none;
+        }
+        const i = cur.toIndex() orelse return .none;
+        const data = ir.instructions.items(.data)[@backingInt(i)];
+        switch (ir.instructions.items(.tag)[@backingInt(i)]) {
+            .alloc => return .{ .alloc = @backingInt(i) },
+            .struct_field_ptr => cur = ir.extraData(Ir.StructField, data.ty_pl.payload).data.operand,
+            .ptr_elem_ptr, .ptr_add => cur = ir.extraData(Ir.Bin, data.ty_pl.payload).data.lhs,
+            else => return .none,
+        }
+    }
+    return .none;
+}
+
+/// Records `from` as a predecessor of block `to` (`planDeferred`):
+/// `pred` holds the only one, or `maxInt - 1` once there are several.
+fn addPred(cg: *CodeGen, pred: []u32, to: u32, from: u32) void {
+    const t = @backingInt(cg.ssa.fwd.items[to]);
+    pred[t] = if (pred[t] == std.math.maxInt(u32)) from else std.math.maxInt(u32) - 1;
+}
+
 /// Defers load `arg` (`planDeferred`) if it is one of the last `before`
-/// values with only values that write no memory after it, and its only
-/// user is at position `at`.
-pub fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, at: u32) void {
+/// values, or of the `prev` values that run before them, with only values
+/// that write no memory after it, and its only user is at position `at`.
+pub fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, prev: []const Inst.Index, at: u32) void {
     const ir = cg.ir;
     const f = cg.ssa;
     const tags = ir.instructions.items(.tag);
@@ -2078,11 +2191,14 @@ pub fn deferLoad(cg: *CodeGen, arg: Ref, before: []const Inst.Index, at: u32) vo
     const ty = datas[li].ty_op.ty;
     if (Type.abiSize(cg.ip, ty) == 0 or cg.passInRegs(ty) or cg.inPair(ty)) return;
     if (!Ssa.removable(ir, cg.ip, l)) return; // volatile
-    const found = for (0..@min(before.len, 32)) |j| {
-        const v = before[before.len - 1 - j];
+    const found = for (0..@min(before.len + prev.len, 32)) |j| {
+        const v = if (j < before.len) before[before.len - 1 - j] else prev[prev.len + before.len - 1 - j];
         if (v == l) break true;
         switch (tags[@backingInt(v)]) {
             .dbg_stmt, .dbg_inline_begin, .dbg_inline_end => {},
+            // A block's result is written by its `br`s, which are
+            // terminators.
+            .block => {},
             else => if (!Ssa.removable(ir, cg.ip, v)) break false,
         }
     } else false;
