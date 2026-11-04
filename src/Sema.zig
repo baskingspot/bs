@@ -13986,7 +13986,8 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
     var slice_len: Ref = .none;
     if (len_ref != .none) {
         slice_len = try sema.coerce(block, .usize_type, sema.resolveInst(len_ref), src);
-        end = try sema.analyzeArithmetic(block, src, .add, start, slice_len);
+        const start_is_zero = if (sema.resolveValue(start)) |v| ip.intValue(u64, v) == 0 else false;
+        end = if (start_is_zero) slice_len else try sema.analyzeArithmetic(block, src, .add, start, slice_len);
     } else if (end_ref != .none) {
         end = try sema.coerce(block, .usize_type, sema.resolveInst(end_ref), end_src);
         if (sema.resolveValue(end)) |v| if (sema.isUndef(v)) return sema.fail(block, end_src, "use of undefined value here causes illegal behavior", .{});
@@ -14028,11 +14029,13 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         break :blk ip.intValue(u64, lv).? == ip.intValue(u64, ev).?;
     };
     const result_sentinel: Index = if (slice_sentinel != .none) slice_sentinel else if (end_is_len) ptr_sentinel else .none;
+    // A start of 0 is at most any end and leaves the length the end.
+    const start_zero = if (start_val) |v| ip.intValue(u64, v).? == 0 else false;
     if (start_val != null and end_val != null) {
         const sv = ip.intValue(u64, start_val.?).?;
         const ev = ip.intValue(u64, end_val.?).?;
         if (sv > ev) return sema.fail(block, src, "start index {d} is larger than end index {d}", .{ sv, ev });
-    } else if (block.want_safety and !block.is_comptime) {
+    } else if (block.want_safety and !block.is_comptime and !start_zero) {
         const ok = try sema.addBinOp(block, .cmp_lte, start, end);
         try sema.addSafetyCheck(block, ok, .start_greater_than_end, start, end);
     }
@@ -14091,7 +14094,7 @@ fn zirSlice(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ref {
         return sema.addTyOp(block, .bitcast, result_ty, new_ptr);
     }
     const slice_ty = try sema.ptrType(.{ .child = elem_ty, .sentinel = result_sentinel, .flags = .{ .size = .slice, .is_const = is_const, .is_allowzero = is_allowzero, .alignment = result_align } });
-    const new_len = try sema.analyzeArithmetic(block, src, .subwrap, end, start);
+    const new_len = if (start_zero) end else try sema.analyzeArithmetic(block, src, .subwrap, end, start);
     return sema.makeSlice(block, slice_ty, new_ptr, new_len);
 }
 
@@ -19909,6 +19912,8 @@ test "dump: runtime add gets an overflow check, comptime operands fold" {
 }
 
 test "dump: slice indexing gets a bounds check" {
+    // Slicing from 0 checks no start against the end and takes the end
+    // as the length.
     try expectAnalysis(
         \\export fn f(s: [*]const u8, n: usize, i: usize) u8 {
         \\    return s[0..n][i];
@@ -19922,41 +19927,25 @@ test "dump: slice indexing gets a bounds check" {
         \\  %4 = store(%3, %0)
         \\  %5 = dbg_stmt(2:13)
         \\  %6 = load([*]const u8, %3)
-        \\  %7 = cmp_lte(<usize, 0>, %1)
-        \\  %10 = block(void, {
-        \\    %12 = cond_br(%7, {
-        \\      %11 = br(%10, <void, void>)
+        \\  %7 = slice([]const u8, %6, %1)
+        \\  %8 = alloc(*const []const u8)
+        \\  %9 = store(%8, %7)
+        \\  %10 = dbg_stmt(2:19)
+        \\  %11 = load([]const u8, %8)
+        \\  %12 = slice_len(usize, %11)
+        \\  %13 = cmp_lt(%2, %12)
+        \\  %16 = block(void, {
+        \\    %18 = cond_br(%13, {
+        \\      %17 = br(%16, <void, void>)
         \\    }, {
-        \\      %8 = call(<fn (usize, usize) noreturn, t.panic.startGreaterThanEnd>, [<usize, 0>, %1])
-        \\      %9 = unreach()
+        \\      %14 = call(<fn (usize, usize) noreturn, t.panic.outOfBounds>, [%2, %12])
+        \\      %15 = unreach()
         \\    })
         \\  })
-        \\  %13 = sub_wrap(%1, <usize, 0>)
-        \\  %14 = slice([]const u8, %6, %13)
-        \\  %15 = alloc(*const []const u8)
-        \\  %16 = store(%15, %14)
-        \\  %17 = dbg_stmt(2:19)
-        \\  %18 = load([]const u8, %15)
-        \\  %19 = slice_len(usize, %18)
-        \\  %20 = cmp_lt(%2, %19)
-        \\  %23 = block(void, {
-        \\    %25 = cond_br(%20, {
-        \\      %24 = br(%23, <void, void>)
-        \\    }, {
-        \\      %21 = call(<fn (usize, usize) noreturn, t.panic.outOfBounds>, [%2, %19])
-        \\      %22 = unreach()
-        \\    })
-        \\  })
-        \\  %26 = slice_elem_ptr(*const u8, %18, %2)
-        \\  %27 = load(u8, %26)
-        \\  %28 = dbg_stmt(2:5)
-        \\  %29 = ret(%27)
-        \\}
-        \\fn t.panic.startGreaterThanEnd(usize, usize) noreturn {
-        \\  %0 = arg(usize, 0)
-        \\  %1 = arg(usize, 1)
-        \\  %2 = dbg_stmt(2:9)
-        \\  %3 = trap()
+        \\  %19 = slice_elem_ptr(*const u8, %11, %2)
+        \\  %20 = load(u8, %19)
+        \\  %21 = dbg_stmt(2:5)
+        \\  %22 = ret(%20)
         \\}
         \\fn t.panic.outOfBounds(usize, usize) noreturn {
         \\  %0 = arg(usize, 0)
